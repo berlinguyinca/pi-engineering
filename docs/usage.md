@@ -34,6 +34,7 @@ The pipeline runs **asynchronously** with progress notifications:
 | Command        | Effect                                                        |
 | -------------- | ------------------------------------------------------------- |
 | `/engineer G`  | Full adaptive workflow (scout → implement → verify → review). |
+| `/tournament G [n]` | Candidate tournament: n independent implementations, verify+review each, promote the deterministic winner (default 3). |
 | `/review`      | Fresh independent review of the latest candidate.             |
 | `/challenge`   | Clean-room challenge of the current approach (fresh context, no prior reasoning). |
 | `/verify`      | Detect a verification profile and run it, recording evidence. |

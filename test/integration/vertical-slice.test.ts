@@ -255,6 +255,49 @@ test("clean-room challenge produces an independent assessment", async () => {
   }
 });
 
+test("candidate tournament verifies all, selects a deterministic winner, promotes it", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    let impl = 0;
+    let rev = 0;
+    const worker = new FakeWorkerExecutor({
+      scout: () => ({ status: "completed", summary: "s", claims: [], details: {}, evidence_refs: [], new_hypotheses: [], proposed_tasks: [] }),
+      implementer: async (req) => {
+        impl++;
+        if (impl === 1) {
+          await writeFile(join(req.cwd, "src", "add.js"), `export function add(a, b) {\n  return a + b;\n}\n`); // correct
+        } else if (impl === 2) {
+          await writeFile(join(req.cwd, "src", "add.js"), `export function add(a, b) {\n  return a - b;\n}\n`); // broken (fails test)
+        } else {
+          await writeFile(join(req.cwd, "src", "add.js"), `export function add(a, b) {\n  return a + b + 0;\n}\n`); // correct but sloppier
+        }
+        return { status: "completed", summary: "i", claims: [], details: {}, evidence_refs: [], new_hypotheses: [], proposed_tasks: [] };
+      },
+      reviewer: () => {
+        rev++;
+        // Only the third (sloppier) candidate gets a material finding.
+        const findings = rev === 2 ? [{ severity: "high", claim: "unnecessary +0 noise", evidence: "diff://src/add.js" }] : [];
+        return { status: "completed", summary: "r", claims: [], details: { findings }, evidence_refs: [], new_hypotheses: [], proposed_tasks: [] };
+      },
+    });
+    const rt = await EngineeringRuntime.open({ cwd: fixture.root, worker, verifier: new CommandVerifier() });
+    const report = await rt.tournament("Implement add(a, b) to return a + b", { n: 3 });
+    assert.equal(report.outcome, "promoted");
+    assert.equal(report.n_candidates, 3);
+    assert.equal(report.entries.length, 3);
+    assert.equal(report.incumbent_candidate!.id, report.entries.find((e) => e.winner)!.candidate.id);
+    // Winner is the clean first candidate (0 findings, smallest diff), not the sloppy one.
+    assert.equal(report.entries[0]!.winner, true);
+    const rejected = rt.ledger.listCandidates().filter((c) => c.status === "REJECTED");
+    assert.equal(rejected.length, 2, "two losers must be recorded as rejected");
+    // Main branch now contains the winner's clean implementation.
+    const mainContent = await readFile(join(fixture.root, "src", "add.js"), "utf-8");
+    assert.ok(mainContent.includes("return a + b;"), "promoted winner implementation present");
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
 function writeFile(p: string, content: string): Promise<void> {
   return import("node:fs/promises").then((fs) => fs.mkdir(p.split("/").slice(0, -1).join("/"), { recursive: true }).then(() => fs.writeFile(p, content)));
 }

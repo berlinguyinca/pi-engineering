@@ -105,6 +105,31 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  pi.registerCommand("tournament", {
+    description: "Run a candidate tournament: N independent implementations, verify+review each, promote the deterministic winner.",
+    handler: async (args, ctx) => {
+      if (!args.trim()) {
+        ctx.ui.notify("/tournament <goal> [n]", "error");
+        return;
+      }
+      const parts = args.trim().split(/\s+/);
+      const n = /\.\d+$/.test(parts[parts.length - 1]!) ? undefined : Number(parts.at(-1));
+      const nCandidates = Number.isInteger(n) && n! >= 2 ? n! : 3;
+      const goal = Number.isInteger(n) ? parts.slice(0, -1).join(" ") : args.trim();
+      const rt = await getRuntime(ctx);
+      ctx.ui.notify(`Running candidate tournament (${nCandidates} independent candidates)...`, "info");
+      const report = await rt.tournament(goal, { n: nCandidates });
+      const winner = report.entries.find((e) => e.winner);
+      const lines = [
+        `Work item ${report.work_item.id} [${report.work_item.status}] risk=${report.risk}`,
+        `Candidates: ${report.entries.map((e) => `${e.candidate.id}:${e.outcome.passed ? "pass" : "FAIL"}(${e.findings.length})`).join(" ")}`,
+        `Winner: ${winner?.candidate.id ?? "none"} (outcome: ${report.outcome})`,
+        `Evidence: ${report.evidence_ids.join(", ") || "none"}`,
+      ];
+      ctx.ui.notify(lines.join("\n"), report.outcome === "promoted" ? "info" : "error");
+    },
+  });
+
   pi.registerCommand("ledger", {
     description: "Show compact engineering state (work items, candidates, entities).",
     handler: async (args, ctx) => {

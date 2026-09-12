@@ -61,6 +61,25 @@ function materialFindings(ledger: Ledger, candidateId: string | null): string[] 
     .map((f) => `${f.id}: ${f.claim}`);
 }
 
+/** One tournament entrant and its independent assessment. */
+export interface TournamentEntry {
+  candidate: Candidate;
+  outcome: VerifyOutcome;
+  findings: string[];
+  winner: boolean;
+}
+
+export interface TournamentReport {
+  work_item: WorkItem;
+  risk: RiskLevel;
+  n_candidates: number;
+  entries: TournamentEntry[];
+  incumbent_candidate: Candidate | null;
+  evidence_ids: string[];
+  outcome: "promoted" | "failed" | "blocked";
+  telemetry: Telemetry;
+}
+
 export interface EngineeringRuntimeOptions {
   cwd: string;
   worker?: WorkerExecutor;
@@ -351,6 +370,97 @@ You must NOT inherit any prior candidate reasoning. Inspect the repository with 
   }
 
   // --------------------------------------------------------------- engineer
+
+  /**
+   * Candidate tournament (spec §12): spawn several INDEPENDENT implementations
+   * from the same base commit, verify + review each, then deterministically
+   * select and promote a winner. Falls back to a single candidate if N is 1.
+   * Deterministic and testable with FakeWorkerExecutor.
+   */
+  async tournament(goal: string, opts: { n?: number } = {}): Promise<TournamentReport> {
+    const n = Math.max(1, Math.min(opts.n ?? 3, 5));
+    const risk = classifyRisk(goal);
+    const actor = this.actor(newRunId(), "planner");
+    const wi = await this.ledger.createWorkItem(goal, risk, [this.cwd], actor);
+
+    if (!this.broker) {
+      await this.ledger.updateWorkItem(wi.id, { status: "BLOCKED" }, actor);
+      return {
+        work_item: wi, risk, n_candidates: n, entries: [], incumbent_candidate: null,
+        evidence_ids: [], outcome: "blocked", telemetry: this.telemetry,
+      };
+    }
+    const contextText = this.broker.renderContext(await this.broker.assembleContext(goal, ROLE_BUDGETS.implementer.targetTokens, []));
+
+    // Phase A: independent implementations (no parent lineage).
+    const entries: TournamentEntry[] = [];
+    const evidenceIds: string[] = [];
+    for (let i = 0; i < n; i++) {
+      const { candidate, worktreePath } = await this.createCandidateWorktree(wi, null, actor);
+      const task = `Independently implement the goal in this repository (candidate ${i + 1} of ${n}, take your own approach):\n"${goal}"\nRisk level: ${risk}. Make the smallest coherent change. Use the provided context and repository tools. Run a quick targeted check before finishing.`;
+      await this.implementIn(wi, candidate, worktreePath, task, contextText);
+      const { outcome, evidenceIds: ids } = await this.verify(wi, candidate, worktreePath);
+      evidenceIds.push(...ids);
+      if (this.git && worktreePath) {
+        await this.git.removeWorktree({ path: worktreePath, branch: candidate.branch }, { keepBranch: true }).catch(() => {});
+      }
+
+      if (!outcome.passed) {
+        await this.ledger.rejectCandidate(candidate.id, wi.id, `verification failed: ${outcome.failedStage}`, this.actor(newRunId(), "reviewer"));
+        await this.git?.deleteBranch(candidate.branch).catch(() => {});
+        entries.push({ candidate, outcome, findings: [], winner: false });
+        continue;
+      }
+
+      // Independent review of each survivor.
+      await this.review(wi, candidate, goal);
+      const findings = materialFindings(this.ledger, candidate.id);
+      entries.push({ candidate, outcome, findings, winner: false });
+    }
+
+    // Phase B: deterministic winner selection among verified survivors.
+    const survivors = entries.filter((e) => e.outcome.passed);
+    if (survivors.length === 0) {
+      await this.ledger.updateWorkItem(wi.id, { status: "FAILED" }, actor);
+      return {
+        work_item: wi, risk, n_candidates: n, entries, incumbent_candidate: null,
+        evidence_ids: evidenceIds, outcome: "failed", telemetry: this.telemetry,
+      };
+    }
+    // Score: fewest material findings, then fewest changed files, then stable id.
+    survivors.sort((a, b) => {
+      if (a.findings.length !== b.findings.length) return a.findings.length - b.findings.length;
+      const fa = a.candidate.changed_files?.length ?? 0;
+      const fb = b.candidate.changed_files?.length ?? 0;
+      if (fa !== fb) return fa - fb;
+      return a.candidate.id.localeCompare(b.candidate.id);
+    });
+    const winner = survivors[0]!;
+    winner.winner = true;
+
+    // Reject the losers (recorded, never silently dropped).
+    for (const e of survivors.slice(1)) {
+      await this.ledger.rejectCandidate(e.candidate.id, wi.id, `lost tournament to ${winner.candidate.id}`, this.actor(newRunId(), "reviewer"));
+      await this.git?.deleteBranch(e.candidate.branch).catch(() => {});
+    }
+
+    // Phase C: promote the winner via controlled merge.
+    const merge = this.git ? await this.git.mergeBranch(winner.candidate.branch) : { merged: true, conflict: false };
+    let outcome: TournamentReport["outcome"] = "failed";
+    let incumbent: Candidate | null = null;
+    if (merge.merged) {
+      await this.ledger.promoteCandidate(winner.candidate.id, wi.id, this.actor(newRunId(), "reviewer"));
+      incumbent = winner.candidate;
+      outcome = "promoted";
+      await this.git?.deleteBranch(winner.candidate.branch).catch(() => {});
+    } else {
+      await this.ledger.rejectCandidate(winner.candidate.id, wi.id, `merge conflict with incumbent`, this.actor(newRunId(), "reviewer"));
+      await this.git?.deleteBranch(winner.candidate.branch).catch(() => {});
+    }
+
+    await this.ledger.updateWorkItem(wi.id, { status: incumbent ? "COMPLETED" : "FAILED" }, actor);
+    return { work_item: wi, risk, n_candidates: n, entries, incumbent_candidate: incumbent, evidence_ids: evidenceIds, outcome, telemetry: this.telemetry };
+  }
 
   async engineer(goal: string): Promise<EngineerReport> {
     if (!this.git) {
