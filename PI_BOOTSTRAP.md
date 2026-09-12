@@ -24,11 +24,11 @@ It must work with a normal Pi installation in an ordinary Git repository.
 
 It MUST NOT require:
 
-* AutoSpec
-* InferWeave
-* GitHub
-* multiple models
-* distributed infrastructure
+- AutoSpec
+- InferWeave
+- GitHub
+- multiple models
+- distributed infrastructure
 
 Those capabilities will be optional adapters later.
 
@@ -51,28 +51,28 @@ Build enough functionality that a normal Pi coding session can:
 
 Implement the smallest coherent architecture supporting:
 
-* standalone Pi package metadata;
-* TypeScript project structure;
-* core runtime interfaces;
-* Engineering Ledger;
-* artifact/result storage abstraction;
-* bounded worker result protocol;
-* fresh-context worker execution;
-* Context Broker interfaces;
-* verification provider abstraction;
-* minimal Git/repository provider;
-* scout workflow;
-* reviewer workflow;
-* challenge workflow;
-* `/review`;
-* `/challenge`;
-* `/verify`;
-* `/ledger`;
-* `/context`;
-* unit tests;
-* fixture repositories;
-* end-to-end test of the complete vertical slice;
-* installation and usage documentation.
+- standalone Pi package metadata;
+- TypeScript project structure;
+- core runtime interfaces;
+- Engineering Ledger;
+- artifact/result storage abstraction;
+- bounded worker result protocol;
+- fresh-context worker execution;
+- Context Broker interfaces;
+- verification provider abstraction;
+- minimal Git/repository provider;
+- scout workflow;
+- reviewer workflow;
+- challenge workflow;
+- `/review`;
+- `/challenge`;
+- `/verify`;
+- `/ledger`;
+- `/context`;
+- unit tests;
+- fixture repositories;
+- end-to-end test of the complete vertical slice;
+- installation and usage documentation.
 
 ## Use Pi Itself
 
@@ -90,14 +90,14 @@ This project's primary goal includes reducing context footprint.
 
 Therefore:
 
-* do not propagate entire parent transcripts to workers;
-* workers receive only task-specific context;
-* worker responses must be bounded and structured;
-* large logs remain external artifacts;
-* tool output should be summarized with retrieval handles;
-* repository contents should be retrieved incrementally;
-* persistent engineering knowledge belongs in the ledger, not conversation history;
-* clean-room workers must genuinely start without inherited reasoning.
+- do not propagate entire parent transcripts to workers;
+- workers receive only task-specific context;
+- worker responses must be bounded and structured;
+- large logs remain external artifacts;
+- tool output should be summarized with retrieval handles;
+- repository contents should be retrieved incrementally;
+- persistent engineering knowledge belongs in the ledger, not conversation history;
+- clean-room workers must genuinely start without inherited reasoning.
 
 Track context/token usage where Pi APIs expose it.
 
@@ -116,16 +116,16 @@ Resolve uncertainty using, in order:
 
 Do not stop to ask about:
 
-* filenames;
-* directory placement;
-* type names;
-* implementation strategies;
-* refactoring;
-* test additions;
-* documentation changes;
-* reversible architectural choices;
-* dependencies that are clearly justified;
-* formatting or lint fixes.
+- filenames;
+- directory placement;
+- type names;
+- implementation strategies;
+- refactoring;
+- test additions;
+- documentation changes;
+- reversible architectural choices;
+- dependencies that are clearly justified;
+- formatting or lint fixes.
 
 If several reasonable options exist, choose the strongest one and continue.
 
@@ -137,4 +137,71 @@ If one part is blocked, record the blocker and continue everything independent o
 
 Do NOT yet implement:
 
-* full AutoSpec integration;
+- full AutoSpec integration;
+- InferWeave routing;
+- large-scale distributed scheduling;
+- complete candidate tournaments;
+- production CI dashboard;
+- custom LSP implementation when existing integrations can provide the capability.
+
+Design interfaces so these can be added without redesigning the core.
+
+## Verification
+
+Model confidence is not evidence.
+
+Before completion:
+
+- install dependencies;
+- build;
+- format;
+- type check;
+- run unit tests;
+- run integration tests;
+- run fixture/end-to-end tests;
+- verify that Pi can load the package;
+- exercise the commands in a real test repository;
+- launch a fresh-context independent review;
+- repair material findings;
+- rerun affected validation.
+
+Do not claim success while known material verification failures remain.
+
+## Git Behavior
+
+Use small coherent commits with conventional commit messages when appropriate.
+
+Do not destroy unrelated local work.
+
+Do not rewrite published history.
+
+Do not push or publish releases unless explicitly configured to do so.
+
+## Self-Dogfooding
+
+As soon as enough of Pi Engineering Runtime exists to safely use part of it, begin using those capabilities to assist further development of this repository.
+
+Examples:
+
+- use the ledger to record verified architectural facts;
+- use fresh workers for review;
+- use Context Broker abstractions when exploring this repository;
+- use verification APIs to validate subsequent implementation.
+
+Do not force dogfooding before a component is sufficiently trustworthy.
+
+## Completion Report
+
+Only after the milestone is complete or genuinely blocked, provide:
+
+- architecture implemented;
+- functionality demonstrated;
+- tests and validation evidence;
+- commits made;
+- specification requirements covered;
+- deviations and reasons;
+- current limitations;
+- remaining highest-priority work;
+- any genuine blockers.
+
+Start immediately.
