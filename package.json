@@ -1,0 +1,14 @@
+{
+  "name": "pi-engineering-runtime",
+  "version": "0.1.0",
+  "description": "Runtime/skill-pack that lets the pi coding agent drive engineering workflows autonomously.",
+  "license": "MIT",
+  "type": "module",
+  "keywords": ["pi-package"],
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "pi": {
+    "extensions": ["./extensions"]
+  }
+}
