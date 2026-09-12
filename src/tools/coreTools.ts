@@ -1,0 +1,179 @@
+import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
+import type { Actor } from "../core/types.ts";
+import { ArtifactStore } from "../artifacts/ArtifactStore.ts";
+import { ContextBroker } from "../context/ContextBroker.ts";
+import { Ledger } from "../ledger/Ledger.ts";
+
+/** Shared services bound to the current repository's runtime. */
+export interface CoreServices {
+  ledger: Ledger;
+  artifacts: ArtifactStore;
+  broker: ContextBroker | null;
+  currentWorkItemId: () => string | null;
+  actor: () => Actor;
+}
+
+/**
+ * The semantic tools the runtime exposes to both the interactive session and
+ * fresh-context workers (spec §10.3, §8.3 role tool schemas). They return compact
+ * summaries and artifact references rather than bulk content.
+ *
+ * `resolve(cwd)` returns the services for a working directory, so the same tool
+ * definitions work in the interactive session (resolved by the current cwd) and
+ * in worker sessions (bound to the runtime's fixed services).
+ */
+export function buildCoreTools(resolve: (cwd: string) => CoreServices | null | Promise<CoreServices | null>): ToolDefinition[] {
+  const servicesFor = (cwd: string): Promise<CoreServices | null> => Promise.resolve(resolve(cwd));
+  const ledgerRead = defineTool({
+    name: "ledger_read",
+    label: "Ledger Read",
+    description:
+      "Query the Engineering Ledger (facts, hypotheses, findings, decisions, requirements, candidates, evidence). Returns compact entity summaries.",
+    parameters: Type.Object({
+      kind: Type.Optional(
+        Type.String({
+          description: "Entity kind to filter: fact, hypothesis, finding, decision, requirement, invariant, candidate, evidence",
+        }),
+      ),
+      work_item_id: Type.Optional(Type.String({ description: "Work item to scope the query" })),
+      limit: Type.Optional(Type.Number({ description: "Max entities to return" })),
+    }),
+    async execute(_id, params, _sig, _onUpdate, ctx) {
+      const services = await servicesFor(ctx.cwd);
+      if (!services) return { content: [{ type: "text", text: "Engineering runtime not initialized for this directory." }], details: {} };
+      const wi = (params.work_item_id as string | undefined) ?? services.currentWorkItemId();
+      let entities = services.ledger.listEntities(undefined, wi ?? undefined);
+      if (params.kind) {
+        const k = String(params.kind);
+        if (k === "candidate" || k === "evidence") {
+          const rows = k === "candidate"
+            ? services.ledger.listCandidates(wi ?? undefined).map((c) => ({
+                id: c.id, work_item_id: c.work_item_id, status: c.status, branch: c.branch,
+                base_commit: c.base_commit, evidence_ids: c.evidence_ids, rejection_reason: c.rejection_reason,
+              }))
+            : services.ledger.listEvidence(wi ? undefined : undefined).map((e) => ({
+                id: e.id, type: e.type, status: e.status, trust: e.trust, exit_code: e.exit_code,
+                summary: e.summary, artifacts: e.artifacts,
+              }));
+          return { content: [{ type: "text", text: JSON.stringify(rows.slice(0, params.limit ?? 20), null, 2) }], details: { rows } };
+        }
+        entities = entities.filter((e) => e.kind === k);
+      }
+      const rows = entities.slice(-(params.limit ?? 20)).map((e) => ({
+        id: e.id, kind: e.kind, status: e.status, claim: e.claim.slice(0, 200),
+        evidence: e.evidence, confidence: e.confidence, severity: e.severity, candidate_id: e.candidate_id,
+      }));
+      return { content: [{ type: "text", text: JSON.stringify(rows, null, 2) }], details: { rows } };
+    },
+  });
+
+  const ledgerClaim = defineTool({
+    name: "ledger_claim",
+    label: "Ledger Claim",
+    description:
+      "Record an unverified hypothesis or an evidence-backed fact/finding into the Engineering Ledger. Hypotheses are never auto-promoted to facts.",
+    parameters: Type.Object({
+      kind: Type.Union([Type.Literal("fact"), Type.Literal("hypothesis"), Type.Literal("finding"), Type.Literal("decision")]),
+      claim: Type.String({ description: "The claim text" }),
+      evidence: Type.Optional(Type.String({ description: "Evidence reference, or omit if unverified" })),
+      severity: Type.Optional(Type.String({ description: "For findings: info, low, medium, high, critical" })),
+    }),
+    async execute(_id, params, _sig, _onUpdate, ctx) {
+      const services = await servicesFor(ctx.cwd);
+      if (!services) return { content: [{ type: "text", text: "Engineering runtime not initialized for this directory." }], details: {} };
+      const status = params.evidence ? "verified" : params.kind === "finding" ? "open" : "open";
+      const entity = await services.ledger.recordEntity(
+        params.kind as "fact" | "hypothesis" | "finding" | "decision",
+        String(params.claim),
+        status as never,
+        services.actor(),
+        services.currentWorkItemId(),
+        { evidence: params.evidence ? [String(params.evidence)] : [], severity: params.severity as never },
+      );
+      return {
+        content: [{ type: "text", text: `Recorded ${entity.kind} ${entity.id} (status ${entity.status}).` }],
+        details: { id: entity.id, kind: entity.kind, status: entity.status },
+      };
+    },
+  });
+
+  const artifactRead = defineTool({
+    name: "artifact_read",
+    label: "Artifact Read",
+    description:
+      "Lazily read a stored artifact (log, diff, report) by its artifact:// URI. Returns the full content on demand.",
+    parameters: Type.Object({
+      uri: Type.String({ description: "artifact:// URI to read" }),
+      max_chars: Type.Optional(Type.Number({ description: "Cap the returned content length" })),
+    }),
+    async execute(_id, params, _sig, _onUpdate, ctx) {
+      const services = await servicesFor(ctx.cwd);
+      if (!services) return { content: [{ type: "text", text: "Engineering runtime not initialized for this directory." }], details: {} };
+      const meta = services.artifacts.getByUri(String(params.uri));
+      if (!meta) return { content: [{ type: "text", text: "Artifact not found." }], details: { found: false }, isError: true };
+      let text = (await services.artifacts.readContentByUri(String(params.uri))) ?? "";
+      const cap = params.max_chars ? Number(params.max_chars) : 12000;
+      if (text.length > cap) text = `${text.slice(0, cap)}\n… [truncated]`;
+      return { content: [{ type: "text", text }], details: { uri: meta.uri, size: meta.size, summary: meta.summary } };
+    },
+  });
+
+  const repoSearch = defineTool({
+    name: "repo_search",
+    label: "Repo Search",
+    description: "Search the repository for symbols or text (bounded result set).",
+    parameters: Type.Object({
+      query: Type.String({ description: "Search term or pattern" }),
+      limit: Type.Optional(Type.Number({ description: "Max hits" })),
+    }),
+    async execute(_id, params, _sig, _onUpdate, ctx) {
+      const services = await servicesFor(ctx.cwd);
+      if (!services) return { content: [{ type: "text", text: "Engineering runtime not initialized for this directory." }], details: {} };
+      if (!services.broker) return { content: [{ type: "text", text: "Not a git repository." }], details: {} };
+      const hits = await services.broker.search(String(params.query), params.limit ?? 40);
+      const text = hits.length
+        ? hits.map((h) => `${h.path}:${h.line} — ${h.text}`).join("\n")
+        : "No matches.";
+      return { content: [{ type: "text", text }], details: { hits: hits.length } };
+    },
+  });
+
+  const symbol = defineTool({
+    name: "symbol",
+    label: "Symbol",
+    description: "Read a bounded slice of a repository file to inspect a symbol or context.",
+    parameters: Type.Object({
+      path: Type.String({ description: "File path relative to repo root" }),
+      offset: Type.Optional(Type.Number({ description: "Starting line (0-based)" })),
+      limit: Type.Optional(Type.Number({ description: "Number of lines" })),
+    }),
+    async execute(_id, params, _sig, _onUpdate, ctx) {
+      const services = await servicesFor(ctx.cwd);
+      if (!services) return { content: [{ type: "text", text: "Engineering runtime not initialized for this directory." }], details: {} };
+      if (!services.broker) return { content: [{ type: "text", text: "Not a git repository." }], details: {} };
+      const text = await services.broker.readSlice(String(params.path), params.offset ?? 0, params.limit ?? 120);
+      if (text === null) return { content: [{ type: "text", text: "File not found." }], details: { found: false }, isError: true };
+      return { content: [{ type: "text", text }], details: { path: params.path } };
+    },
+  });
+
+  const testsFor = defineTool({
+    name: "tests_for",
+    label: "Tests For",
+    description: "Discover test files relevant to given symbols.",
+    parameters: Type.Object({
+      symbols: Type.Array(Type.String()),
+      limit: Type.Optional(Type.Number()),
+    }),
+    async execute(_id, params, _sig, _onUpdate, ctx) {
+      const services = await servicesFor(ctx.cwd);
+      if (!services) return { content: [{ type: "text", text: "Engineering runtime not initialized for this directory." }], details: {} };
+      if (!services.broker) return { content: [{ type: "text", text: "Not a git repository." }], details: {} };
+      const tests = await services.broker.testsFor(params.symbols as string[], params.limit ?? 20);
+      return { content: [{ type: "text", text: tests.length ? tests.join("\n") : "No relevant tests found." }], details: { tests } };
+    },
+  });
+
+  return [ledgerRead, ledgerClaim, artifactRead, repoSearch, symbol, testsFor];
+}
