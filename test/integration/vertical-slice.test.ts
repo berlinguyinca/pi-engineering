@@ -124,6 +124,42 @@ test("vertical slice: material review findings trigger a fix round (risk-proport
   }
 });
 
+test("high-risk work runs a mandatory clean-room challenger (spec §12.2)", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    let challenged = false;
+    const worker = new FakeWorkerExecutor({
+      "clean-room-challenger": () => {
+        challenged = true;
+        return {
+          status: "completed",
+          summary: "Independent approach: rewrite add with early bounds checks.",
+          claims: [],
+          details: { assessment: "Independent approach confirmed; watch for overflow." },
+          evidence_refs: [],
+          new_hypotheses: [],
+          proposed_tasks: [],
+        };
+      },
+      implementer: async (req) => {
+        await writeFile(join(req.cwd, "src", "add.js"), `export function add(a, b) {\n  return a + b;\n}\n`);
+        return { status: "completed", summary: "implemented", claims: [], details: {}, evidence_refs: [], new_hypotheses: [], proposed_tasks: [] };
+      },
+      reviewer: () => ({ status: "completed", summary: "clean", claims: [], details: { findings: [] }, evidence_refs: [], new_hypotheses: [], proposed_tasks: [] }),
+    });
+    const rt = await EngineeringRuntime.open({ cwd: fixture.root, worker, verifier: new CommandVerifier() });
+    // "security" classifies the goal as high-risk.
+    const report = await rt.engineer("Harden add(a, b) against integer overflow for security");
+    assert.equal(report.risk, "high");
+    assert.equal(challenged, true, "high-risk work must run a clean-room challenger");
+    assert.ok(report.challenge_summary?.includes("Independent approach"));
+    const decisions = rt.ledger.listEntities("decision");
+    assert.ok(decisions.some((d) => d.claim.includes("clean-room challenge")), "challenge assessment should be recorded as a decision");
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
 test("clean-room challenge produces an independent assessment", async () => {
   const fixture = await makeFixtureRepo();
   try {

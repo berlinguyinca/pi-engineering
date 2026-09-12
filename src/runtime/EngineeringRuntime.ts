@@ -333,11 +333,28 @@ You must NOT inherit any prior candidate reasoning. Inspect the repository with 
       scoutSummary = scout?.summary ?? null;
     }
 
+    // Clean-room challenge (spec §12.2): mandatory for high-risk work, to escape
+    // anchoring and protect against a consensus built on a bad premise. The
+    // independent assessment is recorded as a ledger decision.
+    let challengeSummary: string | null = null;
+    if (risk === "high" && this.broker) {
+      const chal = await this.challenge(wi, goal, contextText);
+      if (chal) {
+        challengeSummary = chal.summary;
+        await this.ledger.recordEntity(
+          "decision",
+          `clean-room challenge: ${chal.assessment}`,
+          "open",
+          this.actor(newRunId(), "clean-room-challenger"),
+          wi.id,
+        );
+      }
+    }
+
     const maxRounds = 3;
     let parentId: string | null = null;
     let incumbent: Candidate | null = null;
     let reviewSummary: string | null = null;
-    let challengeSummary: string | null = null;
     let lastVerify: VerifyOutcome | null = null;
     const evidenceIds: string[] = [];
     let rounds = 0;
