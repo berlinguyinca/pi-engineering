@@ -51,6 +51,7 @@ export class PiWorkerExecutor implements WorkerExecutor {
   private readonly agentDir: string;
   private readonly customTools: ToolDefinition[];
   private readonly model: Model<any> | undefined;
+  private readonly allowModelNetwork: boolean;
   private modelRuntime: ModelRuntime | undefined;
   private runtimePromise: Promise<ModelRuntime> | undefined;
 
@@ -58,6 +59,12 @@ export class PiWorkerExecutor implements WorkerExecutor {
     this.agentDir = opts.agentDir ?? process.env.PI_AGENT_DIR ?? "~/.pi/agent";
     this.customTools = opts.customTools ?? [];
     this.model = opts.model;
+    this.allowModelNetwork = opts.allowModelNetwork ?? false;
+  }
+
+  /** Inject/refresh the semantic tools bound to a runtime (scout/reviewer/implementer sessions). */
+  setCustomTools(tools: ToolDefinition[]): void {
+    (this as unknown as { customTools: ToolDefinition[] }).customTools = tools;
   }
 
   private async getModelRuntime(): Promise<ModelRuntime> {
@@ -66,7 +73,7 @@ export class PiWorkerExecutor implements WorkerExecutor {
       const rt = await ModelRuntime.create({
         authPath: joinExpand(this.agentDir, "auth.json"),
         modelsPath: joinExpand(this.agentDir, "models.json"),
-        allowModelNetwork: false,
+        allowModelNetwork: this.allowModelNetwork,
       });
       await registerLocalProviders(rt).catch(() => {});
       return rt;
@@ -111,14 +118,33 @@ export class PiWorkerExecutor implements WorkerExecutor {
     try {
       let captured: WorkerResult | undefined;
       let lastAssistantError: string | undefined;
+      let toolCalls = 0;
+      let budgetExhausted = false;
 
-      // Capture worker_result via tool execution events (robust to message shape).
+      // Capture worker_result, count tool executions, and enforce the hard
+      // context-token budget (spec §10.6). Usage arrives on the final chunk of
+      // a message (message_end / message_update), so we check both.
+      const enforceBudget = (message: unknown): void => {
+        if (!req.maxContextTokens) return;
+        const m = message as { usage?: { totalTokens?: number } };
+        const total = m?.usage?.totalTokens;
+        if (typeof total === "number" && total > req.maxContextTokens && !budgetExhausted) {
+          budgetExhausted = true;
+          void session.abort();
+        }
+      };
       const unsubscribe = session.subscribe((event) => {
         if (event.type === "tool_execution_end" && event.toolName === "worker_result") {
           if (!event.isError) {
             const details = event.result?.details as WorkerResult | undefined;
             if (details?.status) captured = details;
           }
+        }
+        if (event.type === "tool_execution_start" && event.toolName !== "worker_result") {
+          toolCalls++;
+        }
+        if ((event.type === "message_end" || event.type === "message_update") && typeof event.message === "object") {
+          enforceBudget(event.message);
         }
       });
 
@@ -151,22 +177,28 @@ export class PiWorkerExecutor implements WorkerExecutor {
 
       const usage = this.collectUsage(session.messages);
       if (!captured) {
+        const reason = budgetExhausted
+          ? "Worker exceeded the hard context-token budget."
+          : timedOut
+            ? "Worker timed out."
+            : `Worker returned no worker_result.${lastAssistantError ? ` ${lastAssistantError}` : ""}`;
         return {
           result: {
             status: "failed",
-            summary: timedOut ? "Worker timed out." : `Worker returned no worker_result.${lastAssistantError ? ` ${lastAssistantError}` : ""}`,
+            summary: reason,
             claims: [],
             evidence_refs: [],
             new_hypotheses: [],
             proposed_tasks: [],
             details: {},
-            error: lastAssistantError ?? (timedOut ? "timeout" : "no-result"),
+            error: lastAssistantError ?? (budgetExhausted ? "budget-exhausted" : timedOut ? "timeout" : "no-result"),
           },
           usage,
-          error: lastAssistantError ?? (timedOut ? "timeout" : "no-result"),
+          error: lastAssistantError ?? (budgetExhausted ? "budget-exhausted" : timedOut ? "timeout" : "no-result"),
+          toolCalls,
         };
       }
-      return { result: captured, usage };
+      return { result: captured, usage, toolCalls };
     } finally {
       session.dispose();
     }

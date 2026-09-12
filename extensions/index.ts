@@ -145,7 +145,20 @@ export default function (pi: ExtensionAPI) {
       ctx.ui.notify("Detecting verification profile...", "info");
       const profile = await rt.verifier.detect(rt.cwd);
       const outcome = await rt.verifier.run(rt.cwd, profile, rt.artifacts);
+      // Record deterministic evidence into the ledger (linked to the latest
+      // work item / candidate so it is not discarded).
+      const wi = rt.ledger.listWorkItems().at(-1);
+      const actor = { type: "user" as const };
+      const evidenceIds: string[] = [];
+      for (const ev of outcome.evidence) {
+        const recorded = await rt.ledger.recordEvidence(
+          wi?.current_candidate_id ?? null, ev.type, ev.tool, ev.command, ev.exit_code, ev.status,
+          ev.summary, ev.artifacts, ev.trust, wi?.id ?? null, actor,
+        );
+        evidenceIds.push(recorded.id);
+      }
       const lines = [
+        evidenceIds.length ? `Evidence recorded: ${evidenceIds.join(", ")}` : "No evidence recorded.",
         `Profile: ${profile.name} (${profile.stages.map((s) => s.name).join(", ") || "none"})`,
         `Result: ${outcome.passed ? "PASSED" : "FAILED"}${outcome.failedStage ? ` at ${outcome.failedStage}` : ""}`,
         ...outcome.stages.map(

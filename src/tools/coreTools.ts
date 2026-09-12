@@ -1,6 +1,6 @@
 import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import type { Actor } from "../core/types.ts";
+import { isMachineEvidence, type Actor } from "../core/types.ts";
 import { ArtifactStore } from "../artifacts/ArtifactStore.ts";
 import { ContextBroker } from "../context/ContextBroker.ts";
 import { Ledger } from "../ledger/Ledger.ts";
@@ -82,14 +82,15 @@ export function buildCoreTools(resolve: (cwd: string) => CoreServices | null | P
     async execute(_id, params, _sig, _onUpdate, ctx) {
       const services = await servicesFor(ctx.cwd);
       if (!services) return { content: [{ type: "text", text: "Engineering runtime not initialized for this directory." }], details: {} };
-      const status = params.evidence ? "verified" : params.kind === "finding" ? "open" : "open";
+      const machine = isMachineEvidence(String(params.evidence));
+      const status = params.kind === "finding" ? "open" : machine ? "verified" : "open";
       const entity = await services.ledger.recordEntity(
         params.kind as "fact" | "hypothesis" | "finding" | "decision",
         String(params.claim),
         status as never,
         services.actor(),
         services.currentWorkItemId(),
-        { evidence: params.evidence ? [String(params.evidence)] : [], severity: params.severity as never },
+        { evidence: machine ? [String(params.evidence)] : [], severity: params.severity as never },
       );
       return {
         content: [{ type: "text", text: `Recorded ${entity.kind} ${entity.id} (status ${entity.status}).` }],

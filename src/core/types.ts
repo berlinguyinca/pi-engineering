@@ -31,6 +31,7 @@ export type EventType =
   | "decision.accepted"
   | "finding.created"
   | "finding.resolved"
+  | "entity.updated"
   | "evidence.recorded"
   | "verification.started"
   | "verification.completed"
@@ -56,6 +57,17 @@ export interface LedgerEvent {
 }
 
 export type ActorType = "agent" | "user" | "system";
+
+/**
+ * True only for machine-generated evidence references (stored artifacts,
+ * recorded evidence, test runs). Agent-authored text like "symbol://x" or a
+ * free-form note is NOT machine evidence, so claims citing it stay hypotheses
+ * (INV-006: hypotheses must never be silently promoted to facts).
+ */
+export function isMachineEvidence(ref: string | undefined | null): boolean {
+  if (!ref) return false;
+  return ref.startsWith("artifact://") || ref.startsWith("test-run://") || /^EVID-/i.test(ref);
+}
 
 export interface Actor {
   type: ActorType;
@@ -191,6 +203,7 @@ export interface LedgerEntity {
   confidence?: number;
   severity?: "info" | "low" | "medium" | "high" | "critical";
   candidate_id?: string;
+  work_item_id?: string;
   created_at: string;
 }
 
@@ -210,6 +223,25 @@ export interface WorkerResult {
   /** Role-specific payload (e.g. candidate_id for implementers). */
   details: Record<string, unknown>;
   error?: string;
+}
+
+/** Aggregate context/autonomy telemetry for a workflow run (spec §41). */
+export interface Telemetry {
+  /** Worker invocations per role. */
+  workers: Partial<Record<WorkerRole, number>>;
+  /** Total tool executions across all worker sessions. */
+  toolCalls: number;
+  /** Verification stages executed. */
+  verifyStages: number;
+  /** Evidence records created. */
+  evidence: number;
+  /** Worker invocations that returned blocked/failed (proxy for needing help). */
+  blockedOrFailedWorkers: number;
+  /** Aggregate worker token usage. */
+  inputTokens: number;
+  outputTokens: number;
+  contextTokens: number;
+  turns: number;
 }
 
 /** Token/usage accounting for a single worker invocation. */

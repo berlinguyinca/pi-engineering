@@ -70,10 +70,13 @@ test("vertical slice: scout -> implement -> verify -> review -> promote", async 
     const mainContent = await readFile(join(fixture.root, "src", "add.js"), "utf-8");
     assert.ok(mainContent.includes("a + b"), "promotion should merge the verified change into the working tree");
 
-    // The scout's claim was recorded as an unverified hypothesis (never a fact).
+    // The scout's claim was recorded as an open hypothesis (INV-006): its
+    // "symbol://add" evidence is agent-authored text, not machine evidence, so
+    // it must not be silently promoted to a verified fact.
     const hypotheses = rt.ledger.listEntities("hypothesis");
-    assert.ok(hypotheses.some((h) => h.claim.includes("add lives in src/add.js")));
-    assert.equal(hypotheses[0]?.status, "verified"); // evidence-backed claim
+    const h = hypotheses.find((x) => x.claim.includes("add lives in src/add.js"));
+    assert.ok(h, "scout claim should be recorded as a hypothesis");
+    assert.equal(h!.status, "open");
 
     // A fresh independent review ran.
     assert.ok(report.review_summary?.length, "review should have run");
@@ -124,6 +127,40 @@ test("vertical slice: material review findings trigger a fix round (risk-proport
   }
 });
 
+test("worker requests carry the role's hard context-token budget (spec §10.6)", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const seen: string[] = [];
+    const worker = new FakeWorkerExecutor(
+      {
+        scout: () => ({ status: "completed", summary: "s", claims: [], details: {}, evidence_refs: [], new_hypotheses: [], proposed_tasks: [] }),
+        implementer: async (req) => {
+          await writeFile(join(req.cwd, "src", "add.js"), `export function add(a, b) {\n  return a + b;\n}\n`);
+          return { status: "completed", summary: "i", claims: [], details: {}, evidence_refs: [], new_hypotheses: [], proposed_tasks: [] };
+        },
+        reviewer: () => ({ status: "completed", summary: "r", claims: [], details: { findings: [] }, evidence_refs: [], new_hypotheses: [], proposed_tasks: [] }),
+      },
+      undefined,
+    );
+    // Wrap to capture requests.
+    const captured = new Map<string, number>();
+    const wrapped = {
+      run: async (req: Parameters<typeof worker.run>[0]) => {
+        captured.set(req.role, req.maxContextTokens ?? -1);
+        seen.push(req.role);
+        return worker.run(req);
+      },
+    } as never;
+    const rt = await EngineeringRuntime.open({ cwd: fixture.root, worker: wrapped, verifier: new CommandVerifier() });
+    await rt.engineer("Implement add(a, b) to return a + b");
+        assert.equal(captured.get("scout"), 24000);
+    assert.equal(captured.get("implementer"), 40000);
+    assert.equal(captured.get("reviewer"), 24000);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
 test("high-risk work runs a mandatory clean-room challenger (spec §12.2)", async () => {
   const fixture = await makeFixtureRepo();
   try {
@@ -150,11 +187,45 @@ test("high-risk work runs a mandatory clean-room challenger (spec §12.2)", asyn
     const rt = await EngineeringRuntime.open({ cwd: fixture.root, worker, verifier: new CommandVerifier() });
     // "security" classifies the goal as high-risk.
     const report = await rt.engineer("Harden add(a, b) against integer overflow for security");
-    assert.equal(report.risk, "high");
+    assert.equal(report.risk, "critical");
     assert.equal(challenged, true, "high-risk work must run a clean-room challenger");
     assert.ok(report.challenge_summary?.includes("Independent approach"));
     const decisions = rt.ledger.listEntities("decision");
     assert.ok(decisions.some((d) => d.claim.includes("clean-room challenge")), "challenge assessment should be recorded as a decision");
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("persistent material findings fail the work item (no final-round bypass)", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const worker = new FakeWorkerExecutor({
+      scout: () => ({ status: "completed", summary: "s", claims: [], details: {}, evidence_refs: [], new_hypotheses: [], proposed_tasks: [] }),
+      implementer: async (req) => {
+        await writeFile(join(req.cwd, "src", "add.js"), `export function add(a, b) {\n  return a + b;\n}\n`);
+        return { status: "completed", summary: "implemented", claims: [], details: {}, evidence_refs: [], new_hypotheses: [], proposed_tasks: [] };
+      },
+      reviewer: () => ({
+        status: "completed",
+        summary: "always finds a material issue",
+        claims: [],
+        details: { findings: [{ severity: "high", claim: "edge case not handled", evidence: "diff://src/add.js" }] },
+        evidence_refs: [],
+        new_hypotheses: [],
+        proposed_tasks: [],
+      }),
+    });
+    const rt = await EngineeringRuntime.open({ cwd: fixture.root, worker, verifier: new CommandVerifier() });
+    const report = await rt.engineer("Implement add(a, b) to return a + b");
+    assert.equal(report.outcome, "failed", "must not promote with open material findings");
+    assert.equal(report.incumbent_candidate, null);
+    assert.equal(report.work_item.status, "FAILED");
+    const rejected = rt.ledger.listCandidates().filter((c) => c.status === "REJECTED");
+    assert.equal(rejected.length, 3, "all rounds should be rejected");
+    // Main branch must remain untouched (never merged a rejected candidate).
+    const mainContent = await readFile(join(fixture.root, "src", "add.js"), "utf-8");
+    assert.ok(mainContent.includes("not implemented"));
   } finally {
     await fixture.cleanup();
   }

@@ -12,12 +12,16 @@ export interface WorkerRequest {
   cwd: string;
   /** Wall-clock budget in ms. */
   timeoutMs?: number;
+  /** Hard context-token budget; the session is aborted once exceeded (spec §10.6). */
+  maxContextTokens?: number;
 }
 
 export interface WorkerRun {
   result: WorkerResult;
   usage: WorkerUsage | null;
   error?: string;
+  /** Number of tool executions performed by the worker session (context telemetry). */
+  toolCalls?: number;
 }
 
 /**

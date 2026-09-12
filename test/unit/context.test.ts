@@ -24,3 +24,18 @@ test("context broker assembles a bounded package from a repo", async () => {
     await fixture.cleanup();
   }
 });
+
+test("readSlice refuses paths that escape the repo root (path-traversal safety)", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const broker = await ContextBroker.open(fixture.root);
+    assert.ok(broker);
+    // In-repo slice works.
+    assert.ok((await broker.readSlice("src/add.js", 0, 3))?.includes("add"));
+    // Escape attempts return null.
+    assert.equal(await broker.readSlice("../../etc/passwd", 0, 5), null);
+    assert.equal(await broker.readSlice("/etc/passwd", 0, 5), null);
+  } finally {
+    await fixture.cleanup();
+  }
+});

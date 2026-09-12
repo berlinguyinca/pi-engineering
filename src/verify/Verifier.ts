@@ -56,6 +56,64 @@ function truncate(text: string, max: number): string {
   return text.length > max ? `${text.slice(0, max)}\n… [truncated]` : text;
 }
 
+/**
+ * Split an npm-style script into a command + args without invoking a shell.
+ * Handles single/double quotes and backslash escapes so quoted and globbed args
+ * are preserved (a naive whitespace split silently runs 0 tests, false-passing
+ * the gate). Globs are left literal; tools like `node --test` expand their own.
+ */
+export function tokenizeCommand(script: string): { command: string; args: string[] } {
+  const tokens: string[] = [];
+  let cur = "";
+  let inSingle = false;
+  let inDouble = false;
+  let escaping = false;
+  for (let i = 0; i < script.length; i++) {
+    const ch = script.charAt(i);
+    if (escaping) {
+      cur += ch;
+      escaping = false;
+      continue;
+    }
+    if (ch === "\\" && !inSingle) {
+      escaping = true;
+      continue;
+    }
+    if (ch === "'" && !inDouble) {
+      inSingle = !inSingle;
+      continue;
+    }
+    if (ch === '"' && !inSingle) {
+      inDouble = !inDouble;
+      continue;
+    }
+    if (/\s/.test(ch) && !inSingle && !inDouble) {
+      if (cur) {
+        tokens.push(cur);
+        cur = "";
+      }
+      continue;
+    }
+    cur += ch;
+  }
+  if (cur) tokens.push(cur);
+  if (tokens.length === 0) return { command: "echo", args: [] };
+  return { command: tokens[0]!, args: tokens.slice(1) };
+}
+
+/**
+ * Child-process env with the node test-runner IPC context stripped. When the
+ * runtime itself runs under `node --test`, spawned `node` commands inherit
+ * NODE_TEST_CONTEXT and would otherwise behave as test children (reporting
+ * over a stale IPC fd) instead of running as real commands — a silent false
+ * pass for verification. We never want that inheritance.
+ */
+function cleanEnv(): NodeJS.ProcessEnv {
+  const env = { ...process.env };
+  delete env.NODE_TEST_CONTEXT;
+  return env;
+}
+
 /** Deterministic verifier that runs detected shell commands. */
 export class CommandVerifier implements VerificationProvider {
   async detect(cwd: string): Promise<VerificationProfile> {
@@ -70,10 +128,11 @@ export class CommandVerifier implements VerificationProvider {
 
     const push = (name: string, script?: string): void => {
       if (!script) return;
+      const { command, args } = tokenizeCommand(script);
       stages.push({
         name,
-        command: script.trim().split(/\s+/)[0] ?? "echo",
-        args: script.trim().split(/\s+/).slice(1),
+        command,
+        args,
         required: true,
         timeoutMs: 300_000,
       });
@@ -107,6 +166,7 @@ export class CommandVerifier implements VerificationProvider {
           cwd: stage.cwd ?? cwd,
           timeout: stage.timeoutMs ?? 300_000,
           maxBuffer: 16 * 1024 * 1024,
+          env: cleanEnv(),
         });
         stdout = res.stdout;
         stderr = res.stderr;
@@ -120,7 +180,9 @@ export class CommandVerifier implements VerificationProvider {
       const finishedAt = new Date().toISOString();
       const passed = code === 0;
       const log = `$ ${stage.command} ${stage.args.join(" ")}\n--- stdout ---\n${stdout}\n--- stderr ---\n${stderr}`;
-      const artifactUri = (await store.put("verify", `${profile.name}-${stage.name}`, log, truncate(log, 500))).uri;
+      // Unique id so re-runs never overwrite content that prior Evidence records
+      // still reference (artifact integrity).
+      const artifactUri = (await store.put("verify", `${profile.name}-${stage.name}-${Date.now().toString(36)}`, log, truncate(log, 500))).uri;
 
       const summary: Record<string, unknown> = {
         stage: stage.name,

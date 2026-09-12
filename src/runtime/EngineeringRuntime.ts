@@ -6,10 +6,11 @@ import type {
   Actor,
   Candidate,
   RiskLevel,
+  Telemetry,
   WorkItem,
   WorkerRole,
 } from "../core/types.ts";
-import { ROLE_BUDGETS } from "../core/types.ts";
+import { ROLE_BUDGETS, isMachineEvidence } from "../core/types.ts";
 import { Ledger } from "../ledger/Ledger.ts";
 import { ArtifactStore } from "../artifacts/ArtifactStore.ts";
 import { ContextBroker } from "../context/ContextBroker.ts";
@@ -17,6 +18,7 @@ import { GitRepo } from "../git/GitRepo.ts";
 import { CommandVerifier, type VerificationProvider, type VerifyOutcome } from "../verify/Verifier.ts";
 import type { WorkerExecutor, WorkerRequest } from "../workers/WorkerExecutor.ts";
 import { PiWorkerExecutor } from "../workers/PiWorkerExecutor.ts";
+import { buildCoreTools } from "../tools/coreTools.ts";
 import { newRunId } from "../core/ids.ts";
 
 export interface EngineerReport {
@@ -30,6 +32,8 @@ export interface EngineerReport {
   evidence_ids: string[];
   rounds: number;
   outcome: "promoted" | "failed" | "blocked";
+  /** Aggregate context/autonomy telemetry for the run (spec §41). */
+  telemetry: Telemetry;
 }
 
 /** Read-only tool allowlist (scout/reviewer/challenger). */
@@ -39,8 +43,14 @@ const IMPLEMENT_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls"];
 
 function classifyRisk(goal: string): RiskLevel {
   if (/typo|spelling|doc\b|comment|readme|label|rename\s+variable|format/i.test(goal)) return "low";
-  if (/migrat|concurr|race|security|auth|schema|breaking|api\s+compat|payment|data\s+loss|critical/i.test(goal)) return "high";
+  if (/data\s+loss|payment|security|critical|auth|schema|breaking/i.test(goal)) return "critical";
+  if (/migrat|concurr|race|api\s+compat/i.test(goal)) return "high";
   return "medium";
+}
+
+/** Compact diff block for prior-attempt feedback (kept out of the main prompt). */
+function diffBlock(diff: string | null): string {
+  return diff ? `Prior diff:\n${diff.slice(0, 4000)}` : "Prior diff: none";
 }
 
 function materialFindings(ledger: Ledger, candidateId: string | null): string[] {
@@ -76,12 +86,24 @@ export class EngineeringRuntime {
   readonly workDir: string;
   readonly worker: WorkerExecutor;
   readonly verifier: VerificationProvider;
+  readonly telemetry: Telemetry;
 
   private constructor(opts: EngineeringRuntimeOptions) {
     this.cwd = opts.cwd;
     this.workDir = opts.workDir ?? "";
     this.worker = opts.worker ?? new PiWorkerExecutor({ model: opts.model, agentDir: opts.agentDir });
     this.verifier = opts.verifier ?? new CommandVerifier();
+    this.telemetry = {
+      workers: {},
+      toolCalls: 0,
+      verifyStages: 0,
+      evidence: 0,
+      blockedOrFailedWorkers: 0,
+      inputTokens: 0,
+      outputTokens: 0,
+      contextTokens: 0,
+      turns: 0,
+    };
     // Assigned by open().
     this.ledger = undefined as unknown as Ledger;
     this.artifacts = undefined as unknown as ArtifactStore;
@@ -102,6 +124,21 @@ export class EngineeringRuntime {
     rt.artifacts = artifacts;
     rt.broker = broker;
     rt.git = git;
+    // Bind the semantic tools (ledger_read, repo_search, ...) to THIS runtime so
+    // worker sessions get the tools their prompts require and always address the
+    // shared ledger/broker regardless of their cwd (a candidate worktree must not
+    // open a separate empty ledger).
+    if (rt.worker instanceof PiWorkerExecutor) {
+      rt.worker.setCustomTools(
+        buildCoreTools(() => ({
+          ledger: rt.ledger,
+          artifacts: rt.artifacts,
+          broker: rt.broker,
+          currentWorkItemId: () => rt.ledger.listWorkItems().at(-1)?.id ?? null,
+          actor: () => ({ type: "system" }),
+        })),
+      );
+    }
     return rt;
   }
 
@@ -123,24 +160,41 @@ export class EngineeringRuntime {
     },
   ) {
     const runId = newRunId();
-    const req: WorkerRequest = {
+    const budget = ROLE_BUDGETS[role];
+            const req: WorkerRequest = {
       role,
       task,
       tools: opts.tools,
       cwd: opts.cwd,
       context: opts.context,
       timeoutMs: opts.timeoutMs ?? 300_000,
+      maxContextTokens: budget?.hardMaxTokens,
     };
     const run = await this.worker.run(req);
-    // Record claims as ledger hypotheses (never silently promoted to facts).
+
+    // Accumulate context/autonomy telemetry.
+    this.telemetry.workers[role] = (this.telemetry.workers[role] ?? 0) + 1;
+    this.telemetry.toolCalls += run.toolCalls ?? 0;
+    if (run.result.status !== "completed") this.telemetry.blockedOrFailedWorkers++;
+    if (run.usage) {
+      this.telemetry.inputTokens += run.usage.input;
+      this.telemetry.outputTokens += run.usage.output;
+      this.telemetry.contextTokens = Math.max(this.telemetry.contextTokens, run.usage.contextTokens);
+      this.telemetry.turns += run.usage.turns;
+    }
+
+    // Record claims as ledger hypotheses (INV-006). Only machine evidence
+    // references mark a claim verified; agent-authored text stays an open
+    // hypothesis until confirmed by real verification output.
     for (const claim of run.result.claims) {
+      const machine = isMachineEvidence(claim.evidence);
       await this.ledger.recordEntity(
         "hypothesis",
         claim.claim,
-        claim.evidence && claim.evidence !== "agent-claim" ? "verified" : "open",
+        machine ? "verified" : "open",
         this.actor(runId, role),
         opts.wi.id,
-        { evidence: claim.evidence && claim.evidence !== "agent-claim" ? [claim.evidence] : [] },
+        { evidence: machine ? [claim.evidence!] : [] },
       );
     }
     for (const h of run.result.new_hypotheses) {
@@ -205,7 +259,9 @@ Use repo_search, symbol, ledger_read, and artifact_read. Do not edit files.`;
     });
     // Commit and capture diff (git only).
     if (this.git && worktreePath) {
-      const changed = await this.git.status();
+      // Check the worktree's own status (the main repo may have untracked
+      // .pi-eng/ state that must not be mistaken for implementer changes).
+      const changed = await this.git.statusIn(worktreePath);
       if (changed.trim()) {
         await this.git.commitAll(worktreePath, `${wi.id}: implementation candidate`);
         const head = await this.git.headCommitIn(worktreePath);
@@ -224,8 +280,10 @@ Use repo_search, symbol, ledger_read, and artifact_read. Do not edit files.`;
     const profile = await this.verifier.detect(cwd);
     const outcome = await this.verifier.run(cwd, profile, this.artifacts);
     const actor = this.actor(newRunId(), "reviewer");
+    this.telemetry.verifyStages += outcome.stages.length;
     const evidenceIds: string[] = [];
     for (const ev of outcome.evidence) {
+      this.telemetry.evidence++;
       const recorded = await this.ledger.recordEvidence(
         candidate.id, ev.type, ev.tool, ev.command, ev.exit_code, ev.status, ev.summary, ev.artifacts, ev.trust, wi.id, actor,
       );
@@ -246,35 +304,30 @@ Requirement: ${requirement}
 Candidate diff:
 ${diff.slice(0, 8000)}
 
-Report concrete findings with severity and evidence. If there are no material issues, call that out explicitly. You are a reviewer; you do not approve the work, you report findings. Use artifact_read to inspect logs if referenced.`;
+Report concrete findings. Return your findings EXACTLY as details.findings, an array of objects { severity, claim, evidence } where severity is one of info|low|medium|high|critical. If there are NO material issues, set details.findings to an EMPTY array. Do not put findings in the claims field. You are a reviewer; you do not approve the work, you report findings. Use artifact_read to inspect logs if referenced.`;
     const { run, runId } = await this.runWorker("reviewer", task, {
       cwd: this.cwd,
       tools: READ_ONLY_TOOLS,
       wi,
       timeoutMs: 240_000,
     });
-    // Convert reviewer claims with severity into findings.
+    // Findings come from the explicit details.findings contract; anything else
+    // is recorded as a (non-blocking) hypothesis so a malformed review never
+    // both invents blocking findings and silently promotes.
     const findingIds: string[] = [];
     const details = run.result.details as { findings?: Array<{ severity?: string; claim?: string; evidence?: string }> };
-    const findings = details?.findings ?? [];
-    if (findings.length > 0) {
-      for (const f of findings) {
-        const entity = await this.ledger.recordEntity(
-          "finding", f.claim ?? "(finding)", "open", this.actor(runId, "reviewer"), wi.id,
-          { severity: (f.severity as never) ?? "medium", evidence: f.evidence ? [f.evidence] : [], candidateId: candidate.id },
-        );
-        findingIds.push(entity.id);
-      }
-    } else {
-      // Fall back to worker claims.
-      for (const c of run.result.claims) {
-        const entity = await this.ledger.recordEntity("finding", c.claim, "open", this.actor(runId, "reviewer"), wi.id, {
-          severity: "medium",
-          evidence: c.evidence && c.evidence !== "agent-claim" ? [c.evidence] : [],
-          candidateId: candidate.id,
-        });
-        findingIds.push(entity.id);
-      }
+    for (const f of details?.findings ?? []) {
+      if (!f.claim) continue;
+      const entity = await this.ledger.recordEntity(
+        "finding", f.claim, "open", this.actor(runId, "reviewer"), wi.id,
+        { severity: (f.severity as never) ?? "medium", evidence: f.evidence ? [f.evidence] : [], candidateId: candidate.id },
+      );
+      findingIds.push(entity.id);
+    }
+    for (const c of run.result.claims) {
+      await this.ledger.recordEntity("hypothesis", c.claim, "open", this.actor(runId, "reviewer"), wi.id, {
+        evidence: isMachineEvidence(c.evidence) ? [c.evidence] : [],
+      });
     }
     return { summary: run.result.summary, findingIds };
   }
@@ -312,6 +365,7 @@ You must NOT inherit any prior candidate reasoning. Inspect the repository with 
         evidence_ids: [],
         rounds: 0,
         outcome: "blocked",
+        telemetry: this.telemetry,
       };
     }
     const risk = classifyRisk(goal);
@@ -337,7 +391,7 @@ You must NOT inherit any prior candidate reasoning. Inspect the repository with 
     // anchoring and protect against a consensus built on a bad premise. The
     // independent assessment is recorded as a ledger decision.
     let challengeSummary: string | null = null;
-    if (risk === "high" && this.broker) {
+    if ((risk === "high" || risk === "critical") && this.broker) {
       const chal = await this.challenge(wi, goal, contextText);
       if (chal) {
         challengeSummary = chal.summary;
@@ -358,6 +412,7 @@ You must NOT inherit any prior candidate reasoning. Inspect the repository with 
     let lastVerify: VerifyOutcome | null = null;
     const evidenceIds: string[] = [];
     let rounds = 0;
+    let feedback = "";
 
     for (let round = 0; round < maxRounds; round++) {
       rounds = round + 1;
@@ -365,7 +420,7 @@ You must NOT inherit any prior candidate reasoning. Inspect the repository with 
 
       const implTask = `Implement the goal in this repository:
 "${goal}"
-Risk level: ${risk}. Make the smallest coherent change. Use the provided context and repository tools. Run a quick targeted check (e.g. the project test command) before finishing.`;
+Risk level: ${risk}. Make the smallest coherent change. Use the provided context and repository tools. Run a quick targeted check (e.g. the project test command) before finishing.${feedback ? `\n\nPRIOR ATTEMPT FEEDBACK (repair these issues):\n${feedback}` : ""}`;
       const impl = await this.implementIn(wi, candidate, worktreePath, implTask, contextText);
 
       const { outcome, evidenceIds: ids, profile } = await this.verify(wi, candidate, worktreePath);
@@ -381,7 +436,8 @@ Risk level: ${risk}. Make the smallest coherent change. Use the provided context
       if (!outcome.passed) {
         await this.ledger.rejectCandidate(candidate.id, wi.id, `verification failed: ${outcome.failedStage}`, this.actor(newRunId(), "reviewer"));
         await this.git?.deleteBranch(candidate.branch).catch(() => {});
-        // Child candidate on next round.
+        // Child candidate on next round, with the failing evidence as feedback.
+        feedback = `${diffBlock(candidate.diff)}\nVerification failed at stage '${outcome.failedStage}' (exit ${outcome.stages.find((s) => !s.passed)?.exitCode ?? "?"}). Fix it.`;
         parentId = candidate.id;
         if (round === maxRounds - 1) break;
         continue;
@@ -392,7 +448,7 @@ Risk level: ${risk}. Make the smallest coherent change. Use the provided context
       reviewSummary = rev.summary;
       const findings = materialFindings(this.ledger, candidate.id);
 
-      if (findings.length === 0 || round === maxRounds - 1) {
+      if (findings.length === 0) {
         // Controlled, evidence-gated promotion (INV-003, INV-005): merge the
         // verified candidate into the incumbent branch, then record it.
         const merge = this.git ? await this.git.mergeBranch(candidate.branch) : { merged: true, conflict: false };
@@ -402,14 +458,24 @@ Risk level: ${risk}. Make the smallest coherent change. Use the provided context
           await this.git?.deleteBranch(candidate.branch).catch(() => {});
           break;
         }
-        // Merge conflict: keep the incumbent immutable, treat as a finding.
+        // Merge conflict: keep the incumbent immutable, treat as unresolved.
         await this.ledger.rejectCandidate(candidate.id, wi.id, `merge conflict with incumbent`, this.actor(newRunId(), "reviewer"));
         await this.git?.deleteBranch(candidate.branch).catch(() => {});
         if (round === maxRounds - 1) break;
         parentId = candidate.id;
         continue;
       }
+      // Material findings remain: reject this candidate (it did not pass review)
+      // and start a fix round; if rounds are exhausted, fail the work item.
+      // Never promote with open material findings.
       await this.git?.deleteBranch(candidate.branch).catch(() => {});
+      const rejectReason =
+        round === maxRounds - 1
+          ? `material findings unresolved after ${maxRounds} rounds`
+          : `material findings: ${findings.slice(0, 3).join("; ")}`;
+      await this.ledger.rejectCandidate(candidate.id, wi.id, rejectReason, this.actor(newRunId(), "reviewer"));
+      feedback = `${diffBlock(candidate.diff)}\nReviewer findings to fix:\n${findings.join("\n")}`;
+      if (round === maxRounds - 1) break;
       parentId = candidate.id;
     }
 
@@ -426,6 +492,7 @@ Risk level: ${risk}. Make the smallest coherent change. Use the provided context
       evidence_ids: evidenceIds,
       rounds,
       outcome: incumbent ? "promoted" : "failed",
+      telemetry: this.telemetry,
     };
   }
 }

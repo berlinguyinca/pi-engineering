@@ -141,6 +141,11 @@ export class Ledger {
       case "decision.accepted":
       case "finding.created":
       case "finding.resolved":
+      case "entity.updated": {
+        const e = p.entity as LedgerEntity;
+        this.entities.set(e.id, e);
+        break;
+      }
       case "requirement.created":
       case "invariant.created":
       case "test-obligation.created": {
@@ -312,6 +317,7 @@ export class Ledger {
       confidence: opts.confidence,
       severity: opts.severity,
       candidate_id: opts.candidateId,
+      work_item_id: workItemId ?? undefined,
       created_at: new Date().toISOString(),
     };
     const eventType = (kind === "finding"
@@ -336,13 +342,11 @@ export class Ledger {
   async updateEntityStatus(id: string, status: EntityStatus, workItemId: string | null, actor: Actor): Promise<void> {
     const e = this.entities.get(id);
     if (!e) return;
-    e.status = status;
-    await this.recordEntity(e.kind, e.claim, status, actor, workItemId, {
-      evidence: e.evidence,
-      confidence: e.confidence,
-      severity: e.severity,
-      candidateId: e.candidate_id,
-    });
+    // Update in place and emit a single in-place event so replay stays
+    // consistent (no duplicate entity with a fresh id).
+    const updated: LedgerEntity = { ...e, status, created_at: e.created_at };
+    this.entities.set(id, updated);
+    await this.emit("entity.updated", workItemId, actor, { entity: updated });
   }
 
   getEntity(id: string): LedgerEntity | undefined {
@@ -352,7 +356,7 @@ export class Ledger {
   listEntities(kind?: LedgerEntity["kind"], workItemId?: string): LedgerEntity[] {
     let out = [...this.entities.values()];
     if (kind) out = out.filter((e) => e.kind === kind);
-    if (workItemId) out = out.filter((e) => e.candidate_id || true);
+    if (workItemId) out = out.filter((e) => e.work_item_id === workItemId);
     return out.sort((a, b) => a.created_at.localeCompare(b.created_at));
   }
 

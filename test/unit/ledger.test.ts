@@ -80,6 +80,25 @@ test("ledger survives reload by replaying events (INV-001, AC-011)", async () =>
   }
 });
 
+test("entity status updates survive replay without duplication", async () => {
+  const dir = await tmpDir();
+  try {
+    const file = join(dir, "ledger.jsonl");
+    const ledger = await Ledger.create(file);
+    const wi = await ledger.createWorkItem("task", "medium", ["."], actor);
+    const finding = await ledger.recordEntity("finding", "a bug", "open", actor, wi.id, { severity: "high" });
+    await ledger.updateEntityStatus(finding.id, "resolved", wi.id, actor);
+
+    // Replay from the same file: exactly one finding, resolved.
+    const replay = await Ledger.create(file);
+    const findings = replay.listEntities("finding");
+    assert.equal(findings.length, 1, "must not create a duplicate entity on replay");
+    assert.equal(findings[0]!.status, "resolved");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("evidence is recorded and linked to a candidate", async () => {
   const dir = await tmpDir();
   try {

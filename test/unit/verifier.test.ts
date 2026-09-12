@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { CommandVerifier } from "../../src/verify/Verifier.ts";
+import { CommandVerifier, tokenizeCommand } from "../../src/verify/Verifier.ts";
 import { ArtifactStore } from "../../src/artifacts/ArtifactStore.ts";
 
 async function makeProject(files: Record<string, string>): Promise<string> {
@@ -43,6 +43,39 @@ test("verifier records passing evidence lazily (AC-010)", async () => {
     assert.equal(outcome.evidence[0]?.trust, "deterministic");
     assert.equal(outcome.evidence[0]?.status, "passed");
     assert.match(outcome.evidence[0]?.artifacts[0] ?? "", /^artifact:\/\/verify\//);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("tokenizeCommand preserves quoted and escaped args", () => {
+  assert.deepEqual(tokenizeCommand('node --test "test/a.test.js" "test/**/*.test.js"'), {
+    command: "node",
+    args: ["--test", "test/a.test.js", "test/**/*.test.js"],
+  });
+  assert.deepEqual(tokenizeCommand("node -e 'process.exit(1)'"), {
+    command: "node",
+    args: ["-e", "process.exit(1)"],
+  });
+  assert.deepEqual(tokenizeCommand('npm run --prefix "a b" test'), {
+    command: "npm",
+    args: ["run", "--prefix", "a b", "test"],
+  });
+});
+
+test("verifier runs quoted test args instead of silently passing (regression)", async () => {
+  const dir = await makeProject({
+    "package.json": JSON.stringify({ scripts: { test: 'node --test "fail.test.js"' } }),
+    "fail.test.js": 'import { test } from "node:test";\ntest("boom", () => { throw new Error("x"); });\n',
+  });
+  try {
+    const store = await ArtifactStore.create(join(dir, "..", "artifacts"));
+    const v = new CommandVerifier();
+    const profile = await v.detect(dir);
+    const outcome = await v.run(dir, profile, store);
+    // A naive whitespace split would run 0 tests and exit 0 (false pass).
+    assert.ok(!outcome.passed, "quoted failing test must fail verification");
+    assert.equal(outcome.failedStage, "test");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

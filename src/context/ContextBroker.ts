@@ -1,5 +1,5 @@
-import { readFile, readdir } from "node:fs/promises";
-import { join, relative } from "node:path";
+import { readFile } from "node:fs/promises";
+import { join, resolve, sep } from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { GitRepo } from "../git/GitRepo.ts";
@@ -99,9 +99,14 @@ export class ContextBroker {
     return hits;
   }
 
-  /** Read a bounded slice of a file (lazy, incremental retrieval). */
+  /**
+   * Read a bounded slice of a file (lazy, incremental retrieval).
+   * The path is resolved against the repo root and confined to it, so a
+   * worker-supplied path cannot escape the repository (path-traversal safety).
+   */
   async readSlice(filePath: string, offset = 0, limit = 100): Promise<string | null> {
-    const abs = join(this.repoRoot, filePath);
+    const abs = resolve(join(this.repoRoot, filePath));
+    if (!abs.startsWith(resolve(this.repoRoot) + sep)) return null;
     try {
       const content = await readFile(abs, "utf-8");
       const lines = content.split("\n");

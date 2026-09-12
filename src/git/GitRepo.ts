@@ -1,9 +1,16 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { mkdir } from "node:fs/promises";
+import { mkdir, rm } from "node:fs/promises";
 import { join } from "node:path";
 
 const exec = promisify(execFile);
+
+/** Short, stable, filesystem-safe hash of a path for unique worktree dirs. */
+function shortHash(input: string): string {
+  let h = 0;
+  for (let i = 0; i < input.length; i++) h = (h * 31 + input.charCodeAt(i)) | 0;
+  return Math.abs(h).toString(36);
+}
 
 export interface WorktreeInfo {
   path: string;
@@ -26,16 +33,22 @@ export interface GitResult {
 export class GitRepo {
   private readonly cwd: string;
   private readonly gitArgs: string[];
+  private readonly repoRoot: string;
 
-  private constructor(cwd: string) {
+  private constructor(cwd: string, repoRoot: string) {
     this.cwd = cwd;
-    this.gitArgs = ["-C", cwd];
+    this.repoRoot = repoRoot;
+    this.gitArgs = ["-C", repoRoot];
   }
 
   /** Returns a GitRepo if `cwd` is inside a git work tree, else null. */
   static async open(cwd: string): Promise<GitRepo | null> {
-    const repo = new GitRepo(cwd);
     try {
+      // Resolve the actual repository toplevel so a caller in a subdirectory
+      // (e.g. <repo>/src) still treats the whole repo as its root.
+      const { stdout } = await exec("git", ["-C", cwd, "rev-parse", "--show-toplevel"], { timeout: 120_000 });
+      if (!stdout.trim()) return null;
+      const repo = new GitRepo(cwd, stdout.trim());
       await repo.git(["rev-parse", "--is-inside-work-tree"]);
       return repo;
     } catch {
@@ -62,7 +75,7 @@ export class GitRepo {
   }
 
   get root(): string {
-    return this.cwd;
+    return this.repoRoot;
   }
 
   async headCommit(): Promise<string> {
@@ -93,22 +106,30 @@ export class GitRepo {
     return r.stdout;
   }
 
+  /** Working-tree status inside a specific path (e.g. a candidate worktree). */
+  async statusIn(path: string): Promise<string> {
+    const r = await this.git(["-C", path, "status", "--short"]);
+    return r.stdout;
+  }
+
   /**
    * Create an isolated worktree on a new branch at the given base commit.
    * (INV-004 candidate isolation.)
+   *
+   * The worktree path is derived from the repo root so that multiple repos (or
+   * parallel test fixtures) never collide. A stale leftover at the path is
+   * removed first (crash recovery).
    */
   async createWorktree(baseCommit: string, branch: string): Promise<WorktreeInfo> {
-    const path = join(this.cwd, "..", `pi-eng-${branch}`);
+    const path = join(this.cwd, "..", `pi-eng-${shortHash(this.cwd)}-${branch}`);
     await mkdir(join(this.cwd, ".."), { recursive: true }).catch(() => {});
-    // Clean up a stale worktree/branch if present (crash recovery).
+    // Crash recovery: clear any stale worktree or leftover directory at the path.
+    await this.git(["worktree", "remove", "--force", path]).catch(() => {});
+    await this.git(["branch", "-D", branch]).catch(() => {});
+    await this.git(["worktree", "prune"]);
+    await rm(path, { recursive: true, force: true }).catch(() => {});
     const add = await this.git(["worktree", "add", path, "-b", branch, baseCommit]);
-    if (add.code !== 0) {
-      // Retry after removing the stale branch.
-      await this.git(["branch", "-D", branch]).catch(() => {});
-      await this.git(["worktree", "prune"]);
-      const add2 = await this.git(["worktree", "add", path, "-b", branch, baseCommit]);
-      if (add2.code !== 0) throw new Error(`git worktree add failed: ${add2.stderr}`);
-    }
+    if (add.code !== 0) throw new Error(`git worktree add failed: ${add.stderr}`);
     return { path, branch };
   }
 

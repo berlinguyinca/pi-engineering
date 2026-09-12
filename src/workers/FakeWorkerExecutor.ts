@@ -48,6 +48,7 @@ export class FakeWorkerExecutor implements WorkerExecutor {
         },
         usage,
         error: "unhandled-role",
+        toolCalls: 0,
       };
     }
     const partial = await handler(req);
@@ -61,6 +62,6 @@ export class FakeWorkerExecutor implements WorkerExecutor {
       details: {},
       ...partial,
     };
-    return { result, usage };
+    return { result, usage, toolCalls: 0 };
   }
 }
