@@ -25,6 +25,10 @@ and the gap is called out here.
 | Review-completion gate (incomplete review ≠ clean review) | **Works** | integration: incomplete-review tests (engineer + tournament) |
 | Clean-room challenger for high/critical risk (§12.2) | **Works** | integration: challenger test |
 | Candidate tournaments (independent candidates, deterministic winner) | **Works** | integration: tournament test |
+| Configurable tournament strategy + clean-room finalist challenge | **Works** | integration: strategy + challenger tests |
+| Task DAG planning + execution (multi-step work items) | **Works** | `taskdag.test.ts`, `dag.test.ts` |
+| Verify profile caching + `/verify full` suite | **Works** | `verifier.test.ts` |
+| Lint/format gate (biome) | **Works** | `npm run lint` / `npm run format` |
 | Relevance-ranked context + scout-guided required files | **Works** | `context.test.ts`, integration: scout-required test |
 | Fresh-context review loop (fix rounds carry diff+findings feedback) | **Works** | integration: fix-round test |
 | `/commands` + semantic tools in pi | **Works** | `scripts/smoke-commands.ts`, `scripts/smoke-installed.ts` |
@@ -32,7 +36,8 @@ and the gap is called out here.
 
 **Verification evidence (last full run):**
 - `npx tsc --noEmit` — passes.
-- `npm test` — 49/49 passing (unit + integration).
+- `npm test` — 60/60 passing (unit + integration).
+- `npm run lint` (biome check) — clean.
 - Standalone install: pi's `ResourceLoader` discovers and loads the package
   extension with zero errors (`scripts/smoke-installed.ts`).
 - Real dogfood (`qwen3.8-27b`): `titleCase()` added to `src/transform.js`,
@@ -62,8 +67,8 @@ findings. All material (HIGH + MEDIUM) findings were fixed with regression tests
 LOW findings: fixed `ledger_read` evidence scoping and inaccurate merge-failure
 reason; removed an unused import. The remaining LOW items (no automated test for
 the real `PiWorkerExecutor` path — it requires a live model and is covered by the
-manual `scripts/smoke-*.ts`; `requiredFiles` context hook still unused) are
-documented limitations, not correctness defects.
+manual `scripts/smoke-*.ts`) is a
+documented limitation, not a correctness defect.
 
 ## Review-completion gate (recent fix)
 
@@ -82,37 +87,11 @@ review is never treated as a clean review. Covered by two regression tests.
 
 ## What is deliberately NOT built yet
 
-These are in the spec but intentionally deferred to keep the vertical slice
-reversible and small. They are the next candidates, in rough priority order.
-
-### 1. Task DAGs / multi-step work items
-
-Today a work item is a single goal implemented in one shot (with fix rounds).
-The spec allows decomposing a larger goal into dependent tasks with ordering.
-
-- **Why deferred:** single-slice is enough to prove the loop; dependency
-  scheduling adds orchestration complexity without new isolation/evidence value.
-- **What it needs:** a task planner that emits an ordered list of sub-goals, each
-  run through the existing pipeline, with dependency edges recorded in the ledger.
-
-### 2. Verify profile caching
-
-`Verifier.detect()` re-reads `package.json` and re-derives the profile on every
-call. Caching the profile per-repo (keyed on package.json content) would cut a
-small amount of work in multi-round runs.
-
-- **Why deferred:** negligible cost today; the vertical slice favors clarity.
-- **What it needs:** an in-memory (or `.pi-eng/`-persisted) cache keyed on the
-  detected inputs, invalidated on change.
-
-### 3. `/verify` full-suite mode
-
-`/verify` currently runs the detected profile (typecheck/test/build). A
-`/verify full` variant could additionally run lint + a broader test set and
-record all of it as evidence.
-
-- **Why deferred:** the evidence-recording path is in place; adding more stages
-  is profile configuration, not architecture.
+None of the deferred roadmap items remain — all are implemented (see below). The
+only spec provisions still out of scope are those excluded by the project
+constraint: multiple-model support, AutoSpec/InferWeave adapters, a hosted
+control plane, and a Go control plane. These are deliberate boundaries, not
+accidental gaps.
 
 ## Known limitations (honest)
 
@@ -123,9 +102,10 @@ record all of it as evidence.
 - **Promotion is a merge, not a squash.** The incumbent history accumulates one
   "implementation candidate" + one "promote" commit per accepted round. This is
   intentional (auditable lineage) but is noisier than a squash.
-- **No linting/formatting configured.** The project has no formatter/linter
-  wired into CI (out of the vertical slice's minimal scope). `tsc` + tests are
-  the gate. Adding `biome`/`prettier` is a small, safe improvement.
+- **Lint/format gate via biome.** `npm run lint` (biome check) + `npm run format`
+  are configured (2-space, 120 width). `noExplicitAny`/`noNonNullAssertion` are
+  disabled (the codebase intentionally uses them); everything else in the
+  recommended rule set is enforced.
 - **Real-model smoke scripts are not CI.** `scripts/dogfood.ts`, `smoke-worker.ts`
   etc. hit a live model and are excluded from the deterministic test suite by
   design. They are dev tools only.
@@ -199,29 +179,56 @@ findings all fixed with regression tests (punctuation keyword extraction,
 oversized-required truncation, segment-based ignores, scout-file dedupe,
 context-assembly error containment).
 
+## Task DAGs (implemented)
+
+**Milestone: multi-step work items (priority #3).** `plan(goal)` runs a planner
+worker that decomposes a large goal into a dependency-aware task DAG, recorded as
+ledger `Task` entities (title, kind, risk, `depends_on` edges resolved to real
+task ids, write `scope_paths`). `executePlan(planId)` topological-sorts the DAG
+(Kahn), records write-scope conflicts, and runs each task through the standard
+engineer pipeline in dependency order, blocking tasks whose dependencies failed
+and linking each executed task to its result work item. `/plan` + `/execute`
+commands expose it in pi. Pure helpers (`src/plan/taskDag.ts`: `topoSort`,
+`tasksConflict`, `blockedByFailure`) are unit-tested.
+
+Dogfood (real model, fresh fixture): a goal decomposed into **3 correctly-ordered
+tasks**, all executed through the pipeline, plan **COMPLETED**, **0 blocked/failed
+workers**, 5/5 fixture tests pass, 99 tool calls / 191.7k input tokens. Machine
+evidence: `test/unit/taskdag.test.ts` (5) + `test/integration/dag.test.ts` (2),
+60/60 tests pass, `tsc` clean.
+
+## Verify profile caching (implemented)
+
+`CommandVerifier.detect()` now caches per-repo keyed on cwd + package.json
+CONTENT (invalidated on change), saving a re-read + tokenize per verification
+call in multi-round runs. `clearCache()` for tests. Covered by a unit test.
+
+## `/verify` full suite (implemented)
+
+`detect(cwd, { full })` adds the repo's declared `lint` and `test:full`/`test:all`
+stages; `/verify full` runs the broader suite and records it all as evidence.
+`VerificationProvider` interface extended. Covered by a unit test.
+
+## Tournament refinements (implemented)
+
+`tournament(goal, { n, strategy, challengeFinalists })`:
+- **Configurable winner-selection strategy**: `findings` (default: fewest material
+  findings, then fewest files, then stable id) | `changes` | `stable`.
+- **Clean-room challenger pass** over the top two finalists (opt-in, high/critical
+  risk): an independent session inspects both diffs and may promote the runner-up;
+  the override is recorded as a decision.
+- **Parallel candidate execution remains deferred**: true parallelism needs
+  multiple workers/models, which the single-model project constraint excludes.
+
+Covered by two integration tests.
+
 ## Next slice
 
-**Task DAGs (priority #3).** The next highest-value slice: decompose a larger
-goal into an ordered list of dependent sub-goals, each run through the existing
-pipeline, with dependency edges recorded in the ledger. This increases the
-breadth of work items the runtime can accept and exercises the ledger's
-lineage model (`parent_id`). A close second is **verify-profile caching** (item
-2 below), a small token saver in multi-round runs.
-
-**Candidate tournaments:** already implemented as a vertical slice.
-`EngineeringRuntime.tournament(goal, { n })` spawns N independent candidates
-from the same base commit, verifies each, reviews each survivor, deterministically
-selects a winner (fewest material findings, then fewest changed files, then stable
-id), records the losers as rejected, and promotes the winner via the controlled
-merge. Covered by a deterministic integration test (`test/integration/vertical-slice.test.ts`:
-"candidate tournament ..."). Remaining tournament refinements:
-
-- Parallel candidate execution (today candidates are produced sequentially).
-- Configurable winner-selection strategy beyond the current deterministic sort.
-- A clean-room challenger pass across the finalists.
-
-A close second is **task DAGs (item 2)**, which increases the breadth of work
-items the runtime can accept.
+All roadmap items are now implemented. Remaining work is beyond the current
+roadmap and gated by the project constraint: task-DAG **parallel execution** and
+candidate **parallel execution** (both need multiple workers/models), plus the
+deliberately out-of-scope AutoSpec/InferWeave adapters, a hosted control plane,
+and a Go control plane.
 
 ## How to run the evidence yourself
 
