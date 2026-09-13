@@ -72,7 +72,12 @@ export class Scheduler {
    */
   schedule<T>(task: SchedulableTask<T>): Promise<ScheduledOutcome<T>> {
     return new Promise<ScheduledOutcome<T>>((resolve, reject) => {
-      this.queue.push({ task: task as SchedulableTask<unknown>, resolve, reject, enqueuedAt: Date.now() });
+      this.queue.push({
+        task: task as SchedulableTask<unknown>,
+        resolve: resolve as (v: ScheduledOutcome<unknown>) => void,
+        reject: reject as (e: unknown) => void,
+        enqueuedAt: Date.now(),
+      });
       this.pump();
     });
   }
