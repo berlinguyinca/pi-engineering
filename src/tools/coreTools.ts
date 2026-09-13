@@ -52,10 +52,19 @@ export function buildCoreTools(resolve: (cwd: string) => CoreServices | null | P
                 id: c.id, work_item_id: c.work_item_id, status: c.status, branch: c.branch,
                 base_commit: c.base_commit, evidence_ids: c.evidence_ids, rejection_reason: c.rejection_reason,
               }))
-            : services.ledger.listEvidence(wi ? undefined : undefined).map((e) => ({
-                id: e.id, type: e.type, status: e.status, trust: e.trust, exit_code: e.exit_code,
-                summary: e.summary, artifacts: e.artifacts,
-              }));
+            : // listEvidence filters by candidate id only; when scoped to a work
+              // item, resolve that item's candidate ids first so evidence rows
+              // are actually scoped to the work item (not the whole store).
+              (() => {
+                const candIds = wi ? new Set(services.ledger.listCandidates(wi).map((c) => c.id)) : null;
+                return services.ledger
+                  .listEvidence()
+                  .filter((e) => !candIds || (e.candidate_id != null && candIds.has(e.candidate_id)))
+                  .map((e) => ({
+                    id: e.id, type: e.type, status: e.status, trust: e.trust, exit_code: e.exit_code,
+                    summary: e.summary, artifacts: e.artifacts,
+                  }));
+              })();
           return { content: [{ type: "text", text: JSON.stringify(rows.slice(0, params.limit ?? 20), null, 2) }], details: { rows } };
         }
         entities = entities.filter((e) => e.kind === k);
@@ -82,7 +91,16 @@ export function buildCoreTools(resolve: (cwd: string) => CoreServices | null | P
     async execute(_id, params, _sig, _onUpdate, ctx) {
       const services = await servicesFor(ctx.cwd);
       if (!services) return { content: [{ type: "text", text: "Engineering runtime not initialized for this directory." }], details: {} };
-      const machine = isMachineEvidence(String(params.evidence));
+      const ref = params.evidence ? String(params.evidence) : undefined;
+      // A machine-prefixed reference only counts as verified evidence if it
+      // actually resolves in the artifact store. A fabricated artifact:// URI
+      // must NOT let an agent turn an unverified claim into a verified fact
+      // (INV-006). Non-artifact machine refs (test-run://, EVID-) stay trusted
+      // only as far as their prefix; the artifact case is the one we can prove.
+      let machine = isMachineEvidence(ref);
+      if (machine && ref?.startsWith("artifact://") && !services.artifacts.getByUri(ref)) {
+        machine = false;
+      }
       const status = params.kind === "finding" ? "open" : machine ? "verified" : "open";
       const entity = await services.ledger.recordEntity(
         params.kind as "fact" | "hypothesis" | "finding" | "decision",

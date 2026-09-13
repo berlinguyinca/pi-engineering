@@ -121,8 +121,14 @@ export class GitRepo {
    * removed first (crash recovery).
    */
   async createWorktree(baseCommit: string, branch: string): Promise<WorktreeInfo> {
-    const path = join(this.cwd, "..", `pi-eng-${shortHash(this.cwd)}-${branch}`);
-    await mkdir(join(this.cwd, ".."), { recursive: true }).catch(() => {});
+    // Place the worktree as a SIBLING of the repo root (outside the working
+    // tree). Deriving the path from `this.cwd` would, when the runtime is
+    // opened from a subdirectory, drop the worktree INSIDE the repo (visible
+    // as an untracked dir in the main tree). repoRoot is stable regardless of
+    // where the runtime was opened.
+    const parent = join(this.repoRoot, "..");
+    const path = join(parent, `pi-eng-${shortHash(this.repoRoot)}-${branch}`);
+    await mkdir(parent, { recursive: true }).catch(() => {});
     // Crash recovery: clear any stale worktree or leftover directory at the path.
     await this.git(["worktree", "remove", "--force", path]).catch(() => {});
     await this.git(["branch", "-D", branch]).catch(() => {});
@@ -152,15 +158,16 @@ export class GitRepo {
    * incumbent directly (INV-003); this is the runtime's evidence-gated merge.
    * Returns false (without mutating state) if the merge would conflict.
    */
-  async mergeBranch(branch: string): Promise<{ merged: boolean; conflict: boolean }> {
+  async mergeBranch(branch: string): Promise<{ merged: boolean; conflict: boolean; reason: string | null }> {
     const r = await this.git(["--no-pager", "merge", "--no-ff", "-m", `promote ${branch}`, branch]);
-    if (r.code === 0) return { merged: true, conflict: false };
+    if (r.code === 0) return { merged: true, conflict: false, reason: null };
     const conflicted = r.stdout.includes("CONFLICT") || r.stderr.includes("CONFLICT");
+    const reason = (r.stderr || r.stdout || "merge failed").split("\n")[0]?.slice(0, 200) ?? "merge failed";
     if (conflicted) {
       // Keep the incumbent immutable: abort the merge.
       await this.git(["merge", "--abort"]).catch(() => {});
     }
-    return { merged: false, conflict: conflicted };
+    return { merged: false, conflict: conflicted, reason };
   }
 
   async commitAll(path: string, message: string): Promise<void> {

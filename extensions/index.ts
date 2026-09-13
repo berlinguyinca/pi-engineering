@@ -3,6 +3,7 @@ import type { Model } from "@earendil-works/pi-ai/compat";
 import { EngineeringRuntime } from "../src/runtime/EngineeringRuntime.ts";
 import { buildCoreTools, type CoreServices } from "../src/tools/coreTools.ts";
 import { CommandVerifier } from "../src/verify/Verifier.ts";
+import { GitRepo } from "../src/git/GitRepo.ts";
 import { PiWorkerExecutor } from "../src/workers/PiWorkerExecutor.ts";
 
 /**
@@ -24,17 +25,30 @@ async function getRuntime(ctx: ExtensionCommandContext, worker?: EngineeringRunt
   return getRuntimeByCwd(worker ? worker.cwd : ctx.cwd, ctx.model);
 }
 
-/** Open (or reuse) the runtime for a working directory, lazily. */
+/**
+ * Open (or reuse) the runtime for a working directory, lazily.
+ *
+ * The cache is keyed by the repository ROOT (git toplevel), not the raw cwd:
+ * two cwd strings that point into the same repo (e.g. `<repo>` and
+ * `<repo>/src`) must share ONE runtime/ledger view, otherwise each holds a
+ * stale in-memory ledger over the same shared `.pi-eng/ledger.jsonl` file.
+ */
 async function getRuntimeByCwd(cwd: string, model?: Model<any>): Promise<EngineeringRuntime> {
-  const existing = runtimes.get(cwd);
+  const key = await repoCacheKey(cwd);
+  const existing = runtimes.get(key);
   if (existing) return existing;
   const rt = await EngineeringRuntime.open({
     cwd,
     verifier: new CommandVerifier(),
     model,
   });
-  runtimes.set(cwd, rt);
+  runtimes.set(key, rt);
   return rt;
+}
+
+async function repoCacheKey(cwd: string): Promise<string> {
+  const repo = await GitRepo.open(cwd).catch(() => null);
+  return repo ? repo.root : cwd;
 }
 
 /**

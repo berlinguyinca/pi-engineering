@@ -216,7 +216,13 @@ export class CommandVerifier implements VerificationProvider {
       }
     }
 
-    const passed = failedStage === null;
+    // A run must produce at least one PASSING stage to count as a pass. A
+    // profile with only non-required fallback stages that all fail (e.g. the
+    // node-syntax fallback for a repo with no scripts) must NOT report a clean
+    // pass with zero passing evidence. This keeps "evidence is machine output"
+    // honest: passed=true implies at least one deterministic stage actually
+    // succeeded.
+    const passed = failedStage === null && stageRuns.length > 0 && stageRuns.some((s) => s.passed);
     return { passed, stages: stageRuns, evidence, failedStage };
   }
 }

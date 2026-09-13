@@ -298,6 +298,34 @@ test("candidate tournament verifies all, selects a deterministic winner, promote
   }
 });
 
+test("implementer cannot neutralize its own verification gate by editing the worktree package.json (review HIGH #2)", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const worker = new FakeWorkerExecutor({
+      implementer: async (req) => {
+        // The implementer writes a BROKEN add() AND rewrites the worktree's
+        // test script to always pass, trying to neutralize the gate.
+        await writeFile(join(req.cwd, "src", "add.js"), `export function add(a, b) {\n  return a - b;\n}\n`);
+        await writeFile(join(req.cwd, "package.json"), JSON.stringify({ name: "f", version: "0.0.1", type: "module", scripts: { test: "node -e process.exit(0)" } }, null, 2));
+        return { status: "completed", summary: "implemented", claims: [], details: {}, evidence_refs: [], new_hypotheses: [], proposed_tasks: [] };
+      },
+      reviewer: () => ({ status: "completed", summary: "clean", claims: [], details: { findings: [] }, evidence_refs: [], new_hypotheses: [], proposed_tasks: [] }),
+      scout: () => ({ status: "completed", summary: "s", claims: [], details: {}, evidence_refs: [], new_hypotheses: [], proposed_tasks: [] }),
+    });
+    const rt = await EngineeringRuntime.open({ cwd: fixture.root, worker, verifier: new CommandVerifier() });
+    const report = await rt.engineer("Implement add(a, b) to return a + b");
+    // The gate profile comes from the MAIN repo (node --test), which runs the
+    // real test in the worktree and fails on the broken add(). So the candidate
+    // must fail verification even though the worktree test script is neutered.
+    assert.equal(report.outcome, "failed", "broken candidate must fail despite gamed worktree package.json");
+    assert.equal(report.incumbent_candidate, null);
+    const rejected = rt.ledger.listCandidates().filter((c) => c.status === "REJECTED");
+    assert.ok(rejected.length >= 1);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
 test("a review that fails to complete must not silently promote (INV-007)", async () => {
   const fixture = await makeFixtureRepo();
   try {

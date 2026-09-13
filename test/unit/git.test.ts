@@ -47,3 +47,27 @@ test("worktree isolation creates an isolated candidate branch (INV-004)", async 
     await fixture.cleanup();
   }
 });
+
+test("worktrees are created OUTSIDE the repo tree, even when opened from a subdir (review MED #3)", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    // Open the repo from a subdirectory, as a user might when running /engineer
+    // from <repo>/src.
+    const subdirRepo = (await GitRepo.open(join(fixture.root, "src")))!;
+    const head = await subdirRepo.headCommit();
+    const wt = await subdirRepo.createWorktree(head, "pi-eng-subdir-test");
+    try {
+      assert.ok(wt.path, "worktree should be created");
+      // The worktree must be a sibling of the repo root, NOT inside it (it must
+      // not appear as an untracked directory in the main working tree).
+      assert.ok(
+        !wt.path.startsWith(fixture.root + "/"),
+        `worktree ${wt.path} must not live inside the repo root ${fixture.root}`,
+      );
+    } finally {
+      await subdirRepo.removeWorktree(wt);
+    }
+  } finally {
+    await fixture.cleanup();
+  }
+});

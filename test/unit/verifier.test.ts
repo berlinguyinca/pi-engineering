@@ -81,6 +81,26 @@ test("verifier runs quoted test args instead of silently passing (regression)", 
   }
 });
 
+test("verifier never reports pass with zero passing stages (review HIGH #1)", async () => {
+  // Repo with no typecheck/test/build scripts -> detect falls back to a
+  // NON-required 'node --check index.js' stage, and index.js does not exist, so
+  // the only stage fails. This must NOT be reported as a clean pass.
+  const dir = await makeProject({
+    "package.json": JSON.stringify({}),
+  });
+  try {
+    const store = await ArtifactStore.create(join(dir, "..", "artifacts"));
+    const v = new CommandVerifier();
+    const profile = await v.detect(dir);
+    assert.equal(profile.stages[0]?.required, false, "fallback stage is non-required by design");
+    const outcome = await v.run(dir, profile, store);
+    assert.ok(!outcome.passed, "a run with zero passing stages must not pass");
+    assert.equal(outcome.evidence.filter((e) => e.status === "passed").length, 0);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("verifier fails a candidate whose required test fails (AC-005)", async () => {
   const dir = await makeProject({
     "package.json": JSON.stringify({ scripts: { test: "node -e process.exit(1)" } }),

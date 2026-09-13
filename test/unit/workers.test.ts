@@ -55,3 +55,36 @@ test("role prompts are compact and instruct bounded output", () => {
   assert.ok(prompt.includes("worker_result"));
   assert.match(WORKER_KICKOFF, /worker_result/);
 });
+
+test("worker_result enforces bounded output even for a chatty worker (review MED #6)", async () => {
+  const execute = workerResultTool.execute as unknown as (
+    id: string,
+    params: Record<string, unknown>,
+    signal?: AbortSignal,
+    onUpdate?: unknown,
+    ctx?: unknown,
+  ) => Promise<{ terminate: boolean; details: unknown }>;
+  const huge = "x".repeat(50_000);
+  const res = await execute(
+    "call-big",
+    {
+      status: "completed",
+      summary: huge,
+      claims: Array.from({ length: 100 }, (_, i) => ({ claim: huge, evidence: "agent-claim" })),
+      evidence_refs: Array.from({ length: 100 }, () => huge),
+      new_hypotheses: [],
+      proposed_tasks: [],
+    },
+    undefined,
+    undefined,
+    undefined,
+  );
+  const d = res.details as { summary: string; claims: unknown[]; evidence_refs: string[] };
+  // Bounded (not the raw 50k) — the truncation marker adds a few chars past the
+  // 4000 cap, so assert far below the input, not exactly at the cap.
+  assert.ok(d.summary.length < 5000, `summary must be bounded, was ${d.summary.length}`);
+  assert.ok(d.claims.length <= 20, "claims array must be capped");
+  assert.ok((d.claims[0] as { claim: string }).claim.length < 5000, "each claim must be capped");
+  assert.ok(d.evidence_refs.length <= 20, "evidence_refs must be capped");
+  assert.equal(res.terminate, true);
+});

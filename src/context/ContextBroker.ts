@@ -34,6 +34,11 @@ export interface SearchHit {
 
 const DEFAULT_IGNORES = [".git", "node_modules", "dist", "build", "out", ".pi-eng"];
 
+/** Escape regex metacharacters so goal keywords are searched as literals. */
+function escapeRegex(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 /** Rough token estimate: ~4 chars per token. */
 export function estimateTokens(text: string): number {
   return Math.ceil(text.length / 4);
@@ -71,19 +76,24 @@ export class ContextBroker {
     return files;
   }
 
-  /** Symbol/text search over the repo (git grep -E; bounded output). */
+  /** Symbol/text search over the repo (git grep; bounded output). */
   async search(query: string, limit = 40): Promise<SearchHit[]> {
     let out = "";
     try {
       const r = await exec(
         "git",
-        ["-C", this.repoRoot, "grep", "-n", "-E", "--no-color", "-I", "-e", query, "--", "."],
+        ["-C", this.repoRoot, "grep", "-n", "-E", "--no-color", "-I", "-e", escapeRegex(query), "--", "."],
         { maxBuffer: 4 * 1024 * 1024, timeout: 30_000 },
       );
       out = r.stdout;
-    } catch {
-      // git grep exits 1 when there are no matches.
-      return [];
+    } catch (err) {
+      // git grep exits 1 when there are no matches (normal -> empty). Any other
+      // non-zero exit is a real grep/pattern error and must NOT be silently
+      // swallowed as "no matches", which would yield an empty context package
+      // for a valid goal containing regex metacharacters.
+      const e = err as { code?: number };
+      if (e.code === 1) return [];
+      throw new Error(`git grep failed for query ${JSON.stringify(query)}: ${String(err)}`);
     }
     const hits: SearchHit[] = [];
     for (const line of out.split("\n")) {

@@ -1,6 +1,5 @@
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
-import { homedir } from "node:os";
 import type { Model } from "@earendil-works/pi-ai/compat";
 import type {
   Actor,
@@ -59,6 +58,12 @@ function materialFindings(ledger: Ledger, candidateId: string | null): string[] 
     .filter((f) => f.status === "open" && f.candidate_id === candidateId)
     .filter((f) => f.severity === "high" || f.severity === "medium" || f.severity === "critical")
     .map((f) => `${f.id}: ${f.claim}`);
+}
+
+/** Compact finding block fed back into the next implementer prompt (bounded). */
+function findingsBlock(findings: string[]): string {
+  const joined = findings.join("\n");
+  return joined.length > 8000 ? `${joined.slice(0, 8000)}\n… [truncated]` : joined;
 }
 
 /** One tournament entrant and its independent assessment. */
@@ -297,9 +302,15 @@ Use repo_search, symbol, ledger_read, and artifact_read. Do not edit files.`;
   }
 
   async verify(wi: WorkItem, candidate: Candidate, worktreePath: string | null) {
-    const cwd = worktreePath ?? this.cwd;
-    const profile = await this.verifier.detect(cwd);
-    const outcome = await this.verifier.run(cwd, profile, this.artifacts);
+    const runCwd = worktreePath ?? this.cwd;
+    // The verification PROFILE comes from the main working tree (the trusted
+    // repo owner's config), NOT from the candidate worktree. Otherwise the
+    // implementer worker could rewrite package.json in its own worktree (e.g.
+    // set "test": "true") and neutralize the very gate that is supposed to
+    // certify it (INV-003/005 integrity). Stages still RUN in the candidate
+    // worktree so they exercise the candidate's actual code.
+    const profile = await this.verifier.detect(this.cwd);
+    const outcome = await this.verifier.run(runCwd, profile, this.artifacts);
     const actor = this.actor(newRunId(), "reviewer");
     this.telemetry.verifyStages += outcome.stages.length;
     const evidenceIds: string[] = [];
@@ -499,7 +510,7 @@ You must NOT inherit any prior candidate reasoning. Inspect the repository with 
     }
 
     // Phase C: promote the winner via controlled merge.
-    const merge = this.git ? await this.git.mergeBranch(winner.candidate.branch) : { merged: true, conflict: false };
+    const merge = this.git ? await this.git.mergeBranch(winner.candidate.branch) : { merged: true, conflict: false, reason: null };
     let outcome: TournamentReport["outcome"] = "failed";
     let incumbent: Candidate | null = null;
     if (merge.merged) {
@@ -508,7 +519,7 @@ You must NOT inherit any prior candidate reasoning. Inspect the repository with 
       outcome = "promoted";
       await this.git?.deleteBranch(winner.candidate.branch).catch(() => {});
     } else {
-      await this.ledger.rejectCandidate(winner.candidate.id, wi.id, `merge conflict with incumbent`, this.actor(newRunId(), "reviewer"));
+      await this.ledger.rejectCandidate(winner.candidate.id, wi.id, merge.conflict ? `merge conflict with incumbent` : `merge failed: ${merge.reason ?? "unknown"}`, this.actor(newRunId(), "reviewer"));
       await this.git?.deleteBranch(winner.candidate.branch).catch(() => {});
     }
 
@@ -620,7 +631,7 @@ Risk level: ${risk}. Make the smallest coherent change. Use the provided context
       if (reviewCompleted && findings.length === 0) {
         // Controlled, evidence-gated promotion (INV-003, INV-005): merge the
         // verified candidate into the incumbent branch, then record it.
-        const merge = this.git ? await this.git.mergeBranch(candidate.branch) : { merged: true, conflict: false };
+        const merge = this.git ? await this.git.mergeBranch(candidate.branch) : { merged: true, conflict: false, reason: null };
         if (merge.merged) {
           await this.ledger.promoteCandidate(candidate.id, wi.id, this.actor(newRunId(), "reviewer"));
           incumbent = candidate;
@@ -628,7 +639,7 @@ Risk level: ${risk}. Make the smallest coherent change. Use the provided context
           break;
         }
         // Merge conflict: keep the incumbent immutable, treat as unresolved.
-        await this.ledger.rejectCandidate(candidate.id, wi.id, `merge conflict with incumbent`, this.actor(newRunId(), "reviewer"));
+        await this.ledger.rejectCandidate(candidate.id, wi.id, merge.conflict ? `merge conflict with incumbent` : `merge failed: ${merge.reason ?? "unknown"}`, this.actor(newRunId(), "reviewer"));
         await this.git?.deleteBranch(candidate.branch).catch(() => {});
         if (round === maxRounds - 1) break;
         parentId = candidate.id;
@@ -661,7 +672,7 @@ Risk level: ${risk}. Make the smallest coherent change. Use the provided context
       await this.ledger.rejectCandidate(candidate.id, wi.id, rejectReason, this.actor(newRunId(), "reviewer"));
       feedback = reviewBlocked
         ? `${diffBlock(candidate.diff)}\nIndependent review could not complete (context budget/timeout). The next candidate must be independently reviewed before promotion.`
-        : `${diffBlock(candidate.diff)}\nReviewer findings to fix:\n${findings.join("\n")}`;
+        : `${diffBlock(candidate.diff)}\nReviewer findings to fix:\n${findingsBlock(findings)}`;
       if (round === maxRounds - 1) break;
       parentId = candidate.id;
     }

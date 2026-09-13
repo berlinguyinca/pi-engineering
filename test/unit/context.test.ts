@@ -25,6 +25,22 @@ test("context broker assembles a bounded package from a repo", async () => {
   }
 });
 
+test("search treats goal keywords as literals, not regex (review MED #4)", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const broker = (await ContextBroker.open(fixture.root))!;
+    // 'add(' contains a regex metacharacter. It must be searched literally and
+    // must not be swallowed as an empty result set due to a git-grep regex error.
+    const hits = await broker.search("add(");
+    assert.ok(hits.length >= 1, `literal search for 'add(' should match, got ${hits.length}`);
+    // A goal whose keywords contain parens should still assemble context.
+    const pkg = await broker.assembleContext("implement add(a,b)", 4000, []);
+    assert.ok(pkg.totalTokens >= 0);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
 test("readSlice refuses paths that escape the repo root (path-traversal safety)", async () => {
   const fixture = await makeFixtureRepo();
   try {
