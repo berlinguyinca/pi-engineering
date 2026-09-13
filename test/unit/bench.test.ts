@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
+  type BenchmarkMetrics,
   autonomyRatio,
   evaluateBenchmark,
   runBenchmark,
   tokensPerTask,
-  type BenchmarkMetrics,
 } from "../../src/bench/Benchmark.ts";
 
 const good: BenchmarkMetrics = { tasksCompleted: 10, tasksAttempted: 10, durationMs: 1000, contextTokens: 20_000 };
@@ -13,7 +13,7 @@ const good: BenchmarkMetrics = { tasksCompleted: 10, tasksAttempted: 10, duratio
 test("bench: autonomyRatio and tokensPerTask", () => {
   assert.equal(autonomyRatio(good), 1);
   assert.equal(tokensPerTask(good), 2000);
-  assert.equal(tokensPerTask({ ...good, tasksCompleted: 0 }), Infinity);
+  assert.equal(tokensPerTask({ ...good, tasksCompleted: 0 }), Number.POSITIVE_INFINITY);
 });
 
 test("bench: evaluateBenchmark passes a good run", () => {

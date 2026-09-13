@@ -41,7 +41,7 @@ export interface BenchmarkVerdict {
 }
 
 export function tokensPerTask(m: BenchmarkMetrics): number {
-  return m.tasksCompleted > 0 ? m.contextTokens / m.tasksCompleted : Infinity;
+  return m.tasksCompleted > 0 ? m.contextTokens / m.tasksCompleted : Number.POSITIVE_INFINITY;
 }
 
 export function autonomyRatio(m: BenchmarkMetrics): number {

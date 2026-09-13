@@ -19,6 +19,7 @@ import { ROLE_BUDGETS, isMachineEvidence } from "../core/types.ts";
 import { GitRepo } from "../git/GitRepo.ts";
 import { Ledger } from "../ledger/Ledger.ts";
 import { tasksConflict, topoSort } from "../plan/taskDag.ts";
+import { Scheduler } from "../sched/Scheduler.ts";
 import { buildCoreTools } from "../tools/coreTools.ts";
 import { CommandVerifier, type VerificationProvider, type VerifyOutcome } from "../verify/Verifier.ts";
 import { PiWorkerExecutor } from "../workers/PiWorkerExecutor.ts";
@@ -205,6 +206,24 @@ export class EngineeringRuntime {
   readonly telemetry: Telemetry;
   readonly roadmapComplete: (() => Promise<boolean>) | null;
 
+  /**
+   * Serializes git mutations that touch the shared main repo (worktree create,
+   * promotion merge). Parallel DAG execution (M13) runs independent tasks'
+   * worker sessions concurrently but routes every repo-mutating git operation
+   * through this lock so concurrent tasks never race the shared index (the
+   * index.lock race that previously forced the DAG to be sequential).
+   */
+  private gitLock: Promise<unknown> = Promise.resolve();
+
+  private withGitLock<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.gitLock.then(fn);
+    this.gitLock = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
   private constructor(opts: EngineeringRuntimeOptions) {
     this.cwd = opts.cwd;
     this.workDir = opts.workDir ?? "";
@@ -360,6 +379,35 @@ Use repo_search, symbol, ledger_read, and artifact_read. Do not edit files.`;
 
   // ------------------------------------------------------------ implement
 
+  /**
+   * Parallel task-DAG wave computation (M13). Groups the dependency-ordered
+   * tasks into waves of tasks that are (a) independent (no dependency edge)
+   * and (b) write-scope-disjoint (no shared path), which may run concurrently.
+   * Returns waves in dependency order.
+   */
+  private static computeParallelWaves(tasks: Task[]): Task[][] {
+    const order = topoSort(tasks);
+    const byId = new Map(order.map((t) => [t.id, t]));
+    const waves: Task[][] = [];
+    const waveOf = new Map<string, number>();
+    for (const t of order) {
+      let wave = 0;
+      // This task must run after its dependencies' wave and after any
+      // write-conflicting task in a later-or-equal wave.
+      for (const dep of t.depends_on) {
+        wave = Math.max(wave, (waveOf.get(dep) ?? -1) + 1);
+      }
+      for (let w = 0; w < waves.length; w++) {
+        const conflict = waves[w]!.some((other) => tasksConflict(t, other));
+        if (conflict) wave = Math.max(wave, w + 1);
+      }
+      if (wave >= waves.length) waves.length = wave + 1;
+      (waves[wave] ??= []).push(t);
+      waveOf.set(t.id, wave);
+    }
+    return waves;
+  }
+
   private async createCandidateWorktree(
     wi: WorkItem,
     parentId: string | null,
@@ -384,6 +432,9 @@ Use repo_search, symbol, ledger_read, and artifact_read. Do not edit files.`;
     // (parallel tournament legs), so a readable per-workitem sequence is
     // suffixed with a random token rather than relied on for uniqueness.
     const branch = `pi-eng-${candidateSeq(this.ledger, wi.id)}-${newRunId().slice(4).toLowerCase()}`;
+    // Worktree creation is safe to run concurrently (each leg gets its own branch
+    // + worktree); only the promotion merge into the shared main branch must be
+    // serialized (see withGitLock around mergeBranch).
     const wt = await this.git.createWorktree(baseCommit, branch);
     const runId = newRunId();
     const candidate = await this.ledger.createCandidate(
@@ -933,9 +984,10 @@ Return details.winner_candidate_id set to "${a.id}" or "${b.id}" for your pick.`
       await this.git?.deleteBranch(e.candidate.branch).catch(() => {});
     }
 
-    // Phase C: promote the winner via controlled merge.
+    // Phase C: promote the winner via controlled merge. Serialized against other
+    // repo-mutating git operations (parallel DAG / tournaments).
     const merge = this.git
-      ? await this.git.mergeBranch(winner.candidate.branch)
+      ? await this.withGitLock(() => this.git!.mergeBranch(winner.candidate.branch))
       : { merged: true, conflict: false, reason: null };
     let outcome: TournamentReport["outcome"] = "failed";
     let incumbent: Candidate | null = null;
@@ -1104,7 +1156,10 @@ Goal: "${goal}"`;
    * Execution is sequential (single-model constraint) with write-scope conflict
    * detection recorded so conflicting tasks are never run concurrently.
    */
-  async executePlan(planWorkItemId: string): Promise<DagReport> {
+  async executePlan(
+    planWorkItemId: string,
+    opts: { parallel?: boolean; concurrency?: number } = {},
+  ): Promise<DagReport> {
     const actor = this.actor(newRunId(), "planner");
     const wi = this.ledger.getWorkItem(planWorkItemId);
     if (!wi) {
@@ -1178,29 +1233,32 @@ Goal: "${goal}"`;
     const failedSet = new Set<string>();
     const summaries: string[] = [];
     const seen = new Set<string>();
-    for (const t of order) {
+
+    // Parallel execution (M13): run independent, write-scope-disjoint tasks
+    // concurrently via the Scheduler. The git lock serializes repo mutations
+    // so concurrent tasks never race the shared index. When `parallel` is
+    // false, execution stays sequential (single-model-safe default).
+    const runTask = async (t: Task): Promise<void> => {
       seen.add(t.id);
       // Idempotent re-execution: never re-run a task that already finished.
       if (t.status === "completed") {
         completed.push(t.id);
         summaries.push(`${t.id} already completed (skipped)`);
-        continue;
+        return;
       }
       if (t.status === "failed" || t.status === "blocked") {
         failedSet.add(t.id);
         (t.status === "failed" ? failed : blocked).push(t.id);
         summaries.push(`${t.id} previously ${t.status} (skipped)`);
-        continue;
+        return;
       }
-      // A dependency failed (or was blocked): this task cannot run. Failures
-      // are discovered dynamically during execution, so we propagate per task;
-      // the static blockedByFailure helper covers the up-front analysis case.
+      // A dependency failed (or was blocked): this task cannot run.
       if (t.depends_on.some((d) => failedSet.has(d))) {
         await this.ledger.setTaskStatus(t.id, "blocked", wi.id, actor);
         failedSet.add(t.id);
         blocked.push(t.id);
         summaries.push(`${t.id} blocked (dependency failed)`);
-        continue;
+        return;
       }
       await this.ledger.setTaskStatus(t.id, "started", wi.id, actor);
       summaries.push(`running ${t.id}: ${t.title}`);
@@ -1216,6 +1274,23 @@ Goal: "${goal}"`;
         failedSet.add(t.id);
         failed.push(t.id);
         summaries.push(`${t.id} failed (${report.outcome})`);
+      }
+    };
+
+    if (opts.parallel) {
+      // Waves of independent, non-conflicting tasks run concurrently; waves are
+      // sequential in dependency order. Bounded by the scheduler's concurrency.
+      const waves = EngineeringRuntime.computeParallelWaves(tasks);
+      const scheduler = new Scheduler({ concurrency: opts.concurrency ?? 2 });
+      for (const wave of waves) {
+        const outcomes = await scheduler.scheduleAll(
+          wave.map((t) => ({ id: t.id, source: wi.id, run: () => runTask(t) })),
+        );
+        void outcomes;
+      }
+    } else {
+      for (const t of order) {
+        await runTask(t);
       }
     }
 
@@ -1390,9 +1465,10 @@ Risk level: ${risk}. Make the smallest coherent change. Use the provided context
 
       if (reviewCompleted && findings.length === 0) {
         // Controlled, evidence-gated promotion (INV-003, INV-005): merge the
-        // verified candidate into the incumbent branch, then record it.
+        // verified candidate into the incumbent branch, then record it. The merge
+        // is serialized through the git lock so parallel DAG legs cannot race it.
         const merge = this.git
-          ? await this.git.mergeBranch(candidate.branch)
+          ? await this.withGitLock(() => this.git!.mergeBranch(candidate.branch))
           : { merged: true, conflict: false, reason: null };
         if (merge.merged) {
           await this.ledger.promoteCandidate(candidate.id, wi.id, this.actor(newRunId(), "reviewer"));
