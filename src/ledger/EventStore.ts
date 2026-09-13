@@ -14,6 +14,9 @@ export class EventStore {
   private readonly events: LedgerEvent[] = [];
   private readonly byId = new Map<string, LedgerEvent>();
 
+  /** Serializes concurrent appends so file writes + in-memory updates stay ordered. */
+  private appendChain: Promise<void> = Promise.resolve();
+
   private constructor(file: string) {
     this.file = file;
   }
@@ -49,13 +52,21 @@ export class EventStore {
     }
   }
 
-  /** Append a single event; returns the stored event. */
+  /**
+   * Append a single event; returns the stored event. Writes are serialized
+   * through an internal promise chain so concurrent producers (e.g. parallel
+   * tournament candidates) never interleave file writes or reorder the
+   * in-memory event list.
+   */
   async append(event: LedgerEvent): Promise<LedgerEvent> {
-    await mkdir(dirname(this.file), { recursive: true });
-    const line = `${JSON.stringify(event)}\n`;
-    await appendFile(this.file, line, "utf-8");
-    this.events.push(event);
-    this.byId.set(event.event_id, event);
+    const op = this.appendChain.then(async () => {
+      await mkdir(dirname(this.file), { recursive: true });
+      await appendFile(this.file, `${JSON.stringify(event)}\n`, "utf-8");
+      this.events.push(event);
+      this.byId.set(event.event_id, event);
+    });
+    this.appendChain = op.catch(() => {});
+    await op;
     return event;
   }
 

@@ -551,6 +551,123 @@ test("clean-room challenger pass can promote the runner-up finalist (milestone)"
   }
 });
 
+test("a distinct reviewerWorker is used for the independent review (anchoring mitigation)", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const implementerCalls: string[] = [];
+    const reviewerCalls: string[] = [];
+    const worker = new FakeWorkerExecutor({
+      implementer: async (req) => {
+        implementerCalls.push(req.role);
+        await writeFile(join(req.cwd, "src", "add.js"), `export function add(a, b) {\n  return a + b;\n}\n`);
+        return {
+          status: "completed",
+          summary: "i",
+          claims: [],
+          details: {},
+          evidence_refs: [],
+          new_hypotheses: [],
+          proposed_tasks: [],
+        };
+      },
+    });
+    // A SEPARATE worker is supplied for review: it must be the one that runs the
+    // independent review (and any clean-room challenger), so implementer and
+    // reviewer never share a model/session (spec §12.2, §19.3).
+    const reviewerWorker = new FakeWorkerExecutor({
+      reviewer: () => ({
+        status: "completed",
+        summary: "clean",
+        claims: [],
+        details: { findings: [] },
+        evidence_refs: [],
+        new_hypotheses: [],
+        proposed_tasks: [],
+      }),
+      "clean-room-challenger": (req) => {
+        reviewerCalls.push("challenger");
+        return {
+          status: "completed",
+          summary: "c",
+          claims: [],
+          details: {},
+          evidence_refs: [],
+          new_hypotheses: [],
+          proposed_tasks: [],
+        };
+      },
+    });
+    const rt = await EngineeringRuntime.open({
+      cwd: fixture.root,
+      worker,
+      reviewerWorker,
+      verifier: new CommandVerifier(),
+    });
+    const report = await rt.tournament("migrate the API", { n: 2, challengeFinalists: true });
+    assert.equal(report.outcome, "promoted");
+    assert.equal(implementerCalls.length, 2, "implementer ran on the main worker");
+    // The main worker has no reviewer handler, so a review reaching it would
+    // fail; the fact that the tournament promoted proves review used reviewerWorker.
+    assert.equal(reviewerCalls.length, 1, "challenger ran on the distinct reviewer worker");
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("parallel tournament candidates run concurrently in isolated worktrees", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    let active = 0;
+    let maxActive = 0;
+    const worker = new FakeWorkerExecutor({
+      scout: () => ({
+        status: "completed",
+        summary: "s",
+        claims: [],
+        details: {},
+        evidence_refs: [],
+        new_hypotheses: [],
+        proposed_tasks: [],
+      }),
+      implementer: async (req) => {
+        active += 1;
+        maxActive = Math.max(maxActive, active);
+        await new Promise((resolve) => setTimeout(resolve, 20)); // yield so siblings enter
+        await writeFile(join(req.cwd, "src", "add.js"), `export function add(a, b) {\n  return a + b;\n}\n`);
+        active -= 1;
+        return {
+          status: "completed",
+          summary: "i",
+          claims: [],
+          details: {},
+          evidence_refs: [],
+          new_hypotheses: [],
+          proposed_tasks: [],
+        };
+      },
+      reviewer: () => ({
+        status: "completed",
+        summary: "clean",
+        claims: [],
+        details: { findings: [] },
+        evidence_refs: [],
+        new_hypotheses: [],
+        proposed_tasks: [],
+      }),
+    });
+    const rt = await EngineeringRuntime.open({ cwd: fixture.root, worker, verifier: new CommandVerifier() });
+    const report = await rt.tournament("Implement add", { n: 2, parallel: true });
+    assert.equal(report.outcome, "promoted");
+    assert.ok(maxActive >= 2, `candidates must overlap in the implement phase (maxActive=${maxActive})`);
+    // Both candidates recorded, no leftover branches.
+    assert.equal(rt.ledger.listCandidates().length, 2);
+    const mainContent = await readFile(join(fixture.root, "src", "add.js"), "utf-8");
+    assert.ok(mainContent.includes("return a + b;"), "promoted winner implementation present");
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
 test("implementer cannot neutralize its own verification gate by editing the worktree package.json (review HIGH #2)", async () => {
   const fixture = await makeFixtureRepo();
   try {

@@ -126,12 +126,17 @@ export default function (pi: ExtensionAPI) {
         return;
       }
       const parts = args.trim().split(/\s+/);
-      const n = /\.\d+$/.test(parts[parts.length - 1]!) ? undefined : Number(parts.at(-1));
+      const parallel = parts.includes("--parallel");
+      const cleaned = parts.filter((p) => p !== "--parallel");
+      const n = /\.\d+$/.test(cleaned[cleaned.length - 1]!) ? undefined : Number(cleaned.at(-1));
       const nCandidates = Number.isInteger(n) && n! >= 2 ? n! : 3;
-      const goal = Number.isInteger(n) ? parts.slice(0, -1).join(" ") : args.trim();
+      const goal = Number.isInteger(n) ? cleaned.slice(0, -1).join(" ") : cleaned.join(" ");
       const rt = await getRuntime(ctx);
-      ctx.ui.notify(`Running candidate tournament (${nCandidates} independent candidates)...`, "info");
-      const report = await rt.tournament(goal, { n: nCandidates });
+      ctx.ui.notify(
+        `Running candidate tournament (${nCandidates} independent candidates${parallel ? ", parallel" : ""})...`,
+        "info",
+      );
+      const report = await rt.tournament(goal, { n: nCandidates, parallel });
       const winner = report.entries.find((e) => e.winner);
       const lines = [
         `Work item ${report.work_item.id} [${report.work_item.status}] risk=${report.risk}`,

@@ -26,6 +26,8 @@ and the gap is called out here.
 | Clean-room challenger for high/critical risk (§12.2) | **Works** | integration: challenger test |
 | Candidate tournaments (independent candidates, deterministic winner) | **Works** | integration: tournament test |
 | Configurable tournament strategy + clean-room finalist challenge | **Works** | integration: strategy + challenger tests |
+| Parallel candidate execution (opt-in) + concurrency-safe ledger | **Works** | integration: parallel test; `eventstore.test.ts` |
+| Optional distinct reviewer worker (anchoring mitigation) | **Works** | integration: reviewerWorker test |
 | Task DAG planning + execution (multi-step work items) | **Works** | `taskdag.test.ts`, `dag.test.ts` |
 | Verify profile caching + `/verify full` suite | **Works** | `verifier.test.ts` |
 | Lint/format gate (biome) | **Works** | `npm run lint` / `npm run format` |
@@ -36,7 +38,7 @@ and the gap is called out here.
 
 **Verification evidence (last full run):**
 - `npx tsc --noEmit` — passes.
-- `npm test` — 63/63 passing (unit + integration).
+- `npm test` — 66/66 passing (unit + integration).
 - `npm run lint` (biome check) — clean.
 - Standalone install: pi's `ResourceLoader` discovers and loads the package
   extension with zero errors (`scripts/smoke-installed.ts`).
@@ -95,10 +97,11 @@ accidental gaps.
 
 ## Known limitations (honest)
 
-- **Single model assumption.** Workers run on whatever model the session uses.
-  The spec's "multiple models" provisions are out of scope by project constraint.
-  This means a reviewer and an implementer can share a failure mode (anchoring).
-  The clean-room challenger mitigates this for high/critical risk only.
+- **Single model default.** Workers run on whatever model the session uses.
+  Multiple models are not REQUIRED (project constraint), but an optional
+  separate `reviewerWorker` can be supplied for the review/challenger roles,
+  mitigating the anchoring failure mode where an implementer and reviewer share
+  a bias. The clean-room challenger also mitigates high/critical risk.
 - **Promotion is a merge, not a squash.** The incumbent history accumulates one
   "implementation candidate" + one "promote" commit per accepted round. This is
   intentional (auditable lineage) but is noisier than a squash.
@@ -195,7 +198,7 @@ Dogfood (real model, fresh fixture): a goal decomposed into **3 correctly-ordere
 tasks**, all executed through the pipeline, plan **COMPLETED**, **0 blocked/failed
 workers**, 5/5 fixture tests pass, 99 tool calls / 191.7k input tokens. Machine
 evidence: `test/unit/taskdag.test.ts` (5) + `test/integration/dag.test.ts` (2),
-63/63 tests pass, `tsc` clean.
+66/66 tests pass, `tsc` clean.
 
 ## Verify profile caching (implemented)
 
@@ -211,24 +214,48 @@ stages; `/verify full` runs the broader suite and records it all as evidence.
 
 ## Tournament refinements (implemented)
 
-`tournament(goal, { n, strategy, challengeFinalists })`:
+`tournament(goal, { n, strategy, challengeFinalists, parallel })`:
 - **Configurable winner-selection strategy**: `findings` (default: fewest material
   findings, then fewest files, then stable id) | `changes` | `stable`.
 - **Clean-room challenger pass** over the top two finalists (opt-in, high/critical
   risk): an independent session inspects both diffs and may promote the runner-up;
   the override is recorded as a decision.
-- **Parallel candidate execution remains deferred**: true parallelism needs
-  multiple workers/models, which the single-model project constraint excludes.
+- **Parallel candidate execution** (`parallel: true`; `/tournament ... --parallel`):
+  the independent candidates run concurrently via `Promise.all`, each in its own
+  isolated worktree with nothing merged into the main branch until the winner is
+  selected, so parallel execution is safe. The `EventStore` now serializes
+  concurrent appends, so parallel producers never corrupt the durable ledger.
+  Defaults to sequential (a single serial worker gains little); a concurrency-
+  capable worker or distinct reviewer worker realizes the benefit. A regression
+  test proves candidates overlap in the implement phase (concurrency counter).
 
-Covered by two integration tests.
+## Multi-model defense (implemented)
+
+`EngineeringRuntime.open({ cwd, worker, reviewerWorker })` accepts an **optional
+separate worker** for the independent-review and clean-room-challenger roles,
+mitigating the single-model anchoring failure mode where an implementer and
+reviewer share the same bias. When omitted it falls back to the single worker, so
+multiple models are OPTIONAL, never required (project constraint). A regression
+test proves the reviewer/challenger run on the distinct worker while the
+implementer stays on the main worker.
+
+Covered by 3 integration tests (strategy, challenger, reviewerWorker) + 1
+concurrency unit test (`eventstore.test.ts`). 66/66 tests pass, `tsc` clean,
+`npm run lint` clean.
 
 ## Next slice
 
-All roadmap items are now implemented. Remaining work is beyond the current
-roadmap and gated by the project constraint: task-DAG **parallel execution** and
-candidate **parallel execution** (both need multiple workers/models), plus the
-deliberately out-of-scope AutoSpec/InferWeave adapters, a hosted control plane,
-and a Go control plane.
+Remaining work is beyond the current roadmap and gated by the project
+constraint:
+- **Task-DAG parallel execution** — deferred with a concrete reason: each task's
+  `engineer()` promotes via a merge into the main branch, so running independent
+  tasks concurrently would race on `index.lock`/the main branch. Safe parallelism
+  requires tasks to accumulate on separate branches and merge sequentially.
+- **Candidate parallel execution by default** — available via `parallel: true`;
+  not default because a single serial worker gains nothing and concurrency
+  assumes a multi-worker/multi-model backend.
+- Deliberately out-of-scope: AutoSpec/InferWeave adapters, a hosted control
+  plane, and a Go control plane.
 
 ## How to run the evidence yourself
 

@@ -163,6 +163,15 @@ export interface TournamentReport {
 export interface EngineeringRuntimeOptions {
   cwd: string;
   worker?: WorkerExecutor;
+  /**
+   * Optional distinct worker for the independent review + clean-room challenger
+   * roles (spec §12.2, §19.3). Defaults to `worker`. Providing a different
+   * model/worker here mitigates the single-model anchoring failure mode where
+   * an implementer and reviewer share the same bias. This is OPTIONAL: the core
+   * must not REQUIRE multiple models (project constraint) and falls back to the
+   * single worker when omitted.
+   */
+  reviewerWorker?: WorkerExecutor;
   verifier?: VerificationProvider;
   model?: Model<any>;
   agentDir?: string;
@@ -184,6 +193,7 @@ export class EngineeringRuntime {
   readonly cwd: string;
   readonly workDir: string;
   readonly worker: WorkerExecutor;
+  readonly reviewerWorker: WorkerExecutor | null;
   readonly verifier: VerificationProvider;
   readonly telemetry: Telemetry;
 
@@ -191,6 +201,7 @@ export class EngineeringRuntime {
     this.cwd = opts.cwd;
     this.workDir = opts.workDir ?? "";
     this.worker = opts.worker ?? new PiWorkerExecutor({ model: opts.model, agentDir: opts.agentDir });
+    this.reviewerWorker = opts.reviewerWorker ?? null;
     this.verifier = opts.verifier ?? new CommandVerifier();
     this.telemetry = {
       workers: {},
@@ -227,17 +238,16 @@ export class EngineeringRuntime {
     // worker sessions get the tools their prompts require and always address the
     // shared ledger/broker regardless of their cwd (a candidate worktree must not
     // open a separate empty ledger).
-    if (rt.worker instanceof PiWorkerExecutor) {
-      rt.worker.setCustomTools(
-        buildCoreTools(() => ({
-          ledger: rt.ledger,
-          artifacts: rt.artifacts,
-          broker: rt.broker,
-          currentWorkItemId: () => rt.ledger.listWorkItems().at(-1)?.id ?? null,
-          actor: () => ({ type: "system" }),
-        })),
-      );
-    }
+    const tools = buildCoreTools(() => ({
+      ledger: rt.ledger,
+      artifacts: rt.artifacts,
+      broker: rt.broker,
+      currentWorkItemId: () => rt.ledger.listWorkItems().at(-1)?.id ?? null,
+      actor: () => ({ type: "system" }),
+    }));
+    if (rt.worker instanceof PiWorkerExecutor) rt.worker.setCustomTools(tools);
+    // A distinct reviewer worker also needs the shared-ledger tools bound.
+    if (rt.reviewerWorker instanceof PiWorkerExecutor) rt.reviewerWorker.setCustomTools(tools);
     return rt;
   }
 
@@ -256,6 +266,8 @@ export class EngineeringRuntime {
       context?: string;
       wi: WorkItem;
       timeoutMs?: number;
+      /** Override the worker (e.g. a distinct reviewer worker). Defaults to this.worker. */
+      worker?: WorkerExecutor;
     },
   ) {
     const runId = newRunId();
@@ -269,7 +281,8 @@ export class EngineeringRuntime {
       timeoutMs: opts.timeoutMs ?? 300_000,
       maxContextTokens: budget?.hardMaxTokens,
     };
-    const run = await this.worker.run(req);
+    const executor = opts.worker ?? this.worker;
+    const run = await executor.run(req);
 
     // Accumulate context/autonomy telemetry.
     this.telemetry.workers[role] = (this.telemetry.workers[role] ?? 0) + 1;
@@ -358,7 +371,10 @@ Use repo_search, symbol, ledger_read, and artifact_read. Do not edit files.`;
       return { candidate, worktreePath: null };
     }
     const baseCommit = await this.git.headCommit();
-    const branch = `pi-eng-${candidateSeq(this.ledger, wi.id)}`;
+    // The branch name must be unique even under concurrent candidate creation
+    // (parallel tournament legs), so a readable per-workitem sequence is
+    // suffixed with a random token rather than relied on for uniqueness.
+    const branch = `pi-eng-${candidateSeq(this.ledger, wi.id)}-${newRunId().slice(4).toLowerCase()}`;
     const wt = await this.git.createWorktree(baseCommit, branch);
     const runId = newRunId();
     const candidate = await this.ledger.createCandidate(
@@ -501,6 +517,7 @@ Report concrete findings. Return your findings EXACTLY as details.findings, an a
       tools: READ_ONLY_TOOLS,
       wi,
       timeoutMs: 240_000,
+      worker: this.reviewerWorker ?? undefined,
     });
     // Findings come from the explicit details.findings contract; anything else
     // is recorded as a (non-blocking) hypothesis so a malformed review never
@@ -592,6 +609,7 @@ You must NOT inherit any prior candidate reasoning. Inspect the repository with 
       context: contextText,
       wi,
       timeoutMs: 240_000,
+      worker: this.reviewerWorker ?? undefined,
     });
     const details = run.result.details as { assessment?: string };
     return { summary: run.result.summary, assessment: details?.assessment ?? run.result.summary };
@@ -623,12 +641,79 @@ Return details.winner_candidate_id set to "${a.id}" or "${b.id}" for your pick.`
       tools: READ_ONLY_TOOLS,
       wi,
       timeoutMs: 240_000,
+      worker: this.reviewerWorker ?? undefined,
     });
     if (run.result.status !== "completed") return null;
     const details = run.result.details as { winner_candidate_id?: string };
     const pick = details.winner_candidate_id;
     if (pick !== a.id && pick !== b.id) return null;
     return { winnerCandidateId: pick, summary: run.result.summary };
+  }
+
+  /**
+   * One parallel leg of a candidate tournament: create an isolated worktree,
+   * implement, verify, remove the worktree, and (for survivors) run the
+   * independent review. Runs entirely within its own candidate scope so it is
+   * safe to invoke concurrently via Promise.all (spec §12.1).
+   */
+  private async runTournamentCandidate(
+    wi: WorkItem,
+    goal: string,
+    index: number,
+    n: number,
+    risk: RiskLevel,
+    contextText: string,
+    actor: Actor,
+  ): Promise<{ entry: TournamentEntry; evidenceIds: string[] }> {
+    const { candidate, worktreePath } = await this.createCandidateWorktree(wi, null, actor);
+    const task = `Independently implement the goal in this repository (candidate ${index + 1} of ${n}, take your own approach):\n"${goal}"\nRisk level: ${risk}. Make the smallest coherent change. Use the provided context and repository tools. Run a quick targeted check before finishing.`;
+    await this.implementIn(wi, candidate, worktreePath, task, contextText);
+    const { outcome, evidenceIds } = await this.verify(wi, candidate, worktreePath);
+    if (this.git && worktreePath) {
+      await this.git
+        .removeWorktree({ path: worktreePath, branch: candidate.branch }, { keepBranch: true })
+        .catch(() => {});
+    }
+
+    if (!outcome.passed) {
+      await this.ledger.rejectCandidate(
+        candidate.id,
+        wi.id,
+        `verification failed: ${outcome.failedStage}`,
+        this.actor(newRunId(), "reviewer"),
+      );
+      await this.git?.deleteBranch(candidate.branch).catch(() => {});
+      return {
+        entry: { candidate, outcome, findings: [], reviewCompleted: false, winner: false },
+        evidenceIds,
+      };
+    }
+
+    // Independent review of each survivor (INV-007). A candidate whose review
+    // failed to complete is recorded as having no completed review and is
+    // ineligible to win, so a review infrastructure failure can never hand the
+    // tournament to an unreviewed candidate.
+    const rev = await this.reviewWithRetry(wi, candidate, goal);
+    if (!rev.completed) {
+      await this.ledger.recordEntity(
+        "finding",
+        `Independent review of ${candidate.id} failed to complete (context budget/timeout) after retries; candidate ineligible to win.`,
+        "open",
+        this.actor(newRunId(), "reviewer"),
+        wi.id,
+        { severity: "critical", candidateId: candidate.id },
+      );
+    }
+    return {
+      entry: {
+        candidate,
+        outcome,
+        findings: materialFindings(this.ledger, candidate.id),
+        reviewCompleted: rev.completed,
+        winner: false,
+      },
+      evidenceIds,
+    };
   }
 
   // --------------------------------------------------------------- engineer
@@ -641,11 +726,24 @@ Return details.winner_candidate_id set to "${a.id}" or "${b.id}" for your pick.`
    */
   async tournament(
     goal: string,
-    opts: { n?: number; strategy?: TournamentStrategy; challengeFinalists?: boolean } = {},
+    opts: {
+      n?: number;
+      strategy?: TournamentStrategy;
+      challengeFinalists?: boolean;
+      /**
+       * Run the independent candidates concurrently (default false). Safe
+       * because each candidate owns an isolated worktree and nothing is merged
+       * into the main branch until the winner is selected. A single serial
+       * worker gains little; a concurrency-capable worker / distinct reviewer
+       * worker benefits. Defaults to sequential to keep behavior conservative.
+       */
+      parallel?: boolean;
+    } = {},
   ): Promise<TournamentReport> {
     const n = Math.max(1, Math.min(opts.n ?? 3, 5));
     const strategy = opts.strategy ?? "findings";
     const challengeFinalists = opts.challengeFinalists ?? false;
+    const parallel = opts.parallel ?? false;
     const risk = classifyRisk(goal);
     const actor = this.actor(newRunId(), "planner");
     const wi = await this.ledger.createWorkItem(goal, risk, [this.cwd], actor);
@@ -665,50 +763,27 @@ Return details.winner_candidate_id set to "${a.id}" or "${b.id}" for your pick.`
     }
     const contextText = await this.safeContext(goal, ROLE_BUDGETS.implementer.targetTokens, []);
 
-    // Phase A: independent implementations (no parent lineage).
+    // Phase A: independent implementations (no parent lineage). Each candidate
+    // runs in its own isolated worktree and merges nothing into the main branch
+    // (only the winner is merged later), so candidates may be launched
+    // CONCURRENTLY when requested. Ledger writes are serialized by the
+    // EventStore so concurrent producers never corrupt the durable state.
     const entries: TournamentEntry[] = [];
     const evidenceIds: string[] = [];
-    for (let i = 0; i < n; i++) {
-      const { candidate, worktreePath } = await this.createCandidateWorktree(wi, null, actor);
-      const task = `Independently implement the goal in this repository (candidate ${i + 1} of ${n}, take your own approach):\n"${goal}"\nRisk level: ${risk}. Make the smallest coherent change. Use the provided context and repository tools. Run a quick targeted check before finishing.`;
-      await this.implementIn(wi, candidate, worktreePath, task, contextText);
-      const { outcome, evidenceIds: ids } = await this.verify(wi, candidate, worktreePath);
-      evidenceIds.push(...ids);
-      if (this.git && worktreePath) {
-        await this.git
-          .removeWorktree({ path: worktreePath, branch: candidate.branch }, { keepBranch: true })
-          .catch(() => {});
+    if (parallel) {
+      const phaseAResults = await Promise.all(
+        Array.from({ length: n }, (_, i) => this.runTournamentCandidate(wi, goal, i, n, risk, contextText, actor)),
+      );
+      for (const r of phaseAResults) {
+        entries.push(r.entry);
+        evidenceIds.push(...r.evidenceIds);
       }
-
-      if (!outcome.passed) {
-        await this.ledger.rejectCandidate(
-          candidate.id,
-          wi.id,
-          `verification failed: ${outcome.failedStage}`,
-          this.actor(newRunId(), "reviewer"),
-        );
-        await this.git?.deleteBranch(candidate.branch).catch(() => {});
-        entries.push({ candidate, outcome, findings: [], reviewCompleted: false, winner: false });
-        continue;
+    } else {
+      for (let i = 0; i < n; i++) {
+        const r = await this.runTournamentCandidate(wi, goal, i, n, risk, contextText, actor);
+        entries.push(r.entry);
+        evidenceIds.push(...r.evidenceIds);
       }
-
-      // Independent review of each survivor (INV-007). A candidate whose review
-      // failed to complete is recorded as having no completed review and is
-      // ineligible to win, so a review infrastructure failure can never hand the
-      // tournament to an unreviewed candidate.
-      const rev = await this.reviewWithRetry(wi, candidate, goal);
-      if (!rev.completed) {
-        await this.ledger.recordEntity(
-          "finding",
-          `Independent review of ${candidate.id} failed to complete (context budget/timeout) after retries; candidate ineligible to win.`,
-          "open",
-          this.actor(newRunId(), "reviewer"),
-          wi.id,
-          { severity: "critical", candidateId: candidate.id },
-        );
-      }
-      const findings = materialFindings(this.ledger, candidate.id);
-      entries.push({ candidate, outcome, findings, reviewCompleted: rev.completed, winner: false });
     }
 
     // Phase B: deterministic winner selection among verified survivors. Only
