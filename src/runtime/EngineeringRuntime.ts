@@ -665,55 +665,103 @@ Return details.winner_candidate_id set to "${a.id}" or "${b.id}" for your pick.`
     contextText: string,
     actor: Actor,
   ): Promise<{ entry: TournamentEntry; evidenceIds: string[] }> {
-    const { candidate, worktreePath } = await this.createCandidateWorktree(wi, null, actor);
-    const task = `Independently implement the goal in this repository (candidate ${index + 1} of ${n}, take your own approach):\n"${goal}"\nRisk level: ${risk}. Make the smallest coherent change. Use the provided context and repository tools. Run a quick targeted check before finishing.`;
-    await this.implementIn(wi, candidate, worktreePath, task, contextText);
-    const { outcome, evidenceIds } = await this.verify(wi, candidate, worktreePath);
-    if (this.git && worktreePath) {
-      await this.git
-        .removeWorktree({ path: worktreePath, branch: candidate.branch }, { keepBranch: true })
-        .catch(() => {});
-    }
+    let candidate: Candidate | null = null;
+    let worktreePath: string | null = null;
+    let branch: string | null = null;
+    try {
+      const cw = await this.createCandidateWorktree(wi, null, actor);
+      candidate = cw.candidate;
+      worktreePath = cw.worktreePath;
+      branch = candidate.branch;
+      const task = `Independently implement the goal in this repository (candidate ${index + 1} of ${n}, take your own approach):\n"${goal}"\nRisk level: ${risk}. Make the smallest coherent change. Use the provided context and repository tools. Run a quick targeted check before finishing.`;
+      await this.implementIn(wi, candidate, worktreePath, task, contextText);
+      const { outcome, evidenceIds } = await this.verify(wi, candidate, worktreePath);
+      if (this.git && worktreePath) {
+        await this.git
+          .removeWorktree({ path: worktreePath, branch: candidate.branch }, { keepBranch: true })
+          .catch(() => {});
+      }
 
-    if (!outcome.passed) {
-      await this.ledger.rejectCandidate(
-        candidate.id,
-        wi.id,
-        `verification failed: ${outcome.failedStage}`,
-        this.actor(newRunId(), "reviewer"),
-      );
-      await this.git?.deleteBranch(candidate.branch).catch(() => {});
+      if (!outcome.passed) {
+        await this.ledger.rejectCandidate(
+          candidate.id,
+          wi.id,
+          `verification failed: ${outcome.failedStage}`,
+          this.actor(newRunId(), "reviewer"),
+        );
+        await this.git?.deleteBranch(candidate.branch).catch(() => {});
+        return {
+          entry: { candidate, outcome, findings: [], reviewCompleted: false, winner: false },
+          evidenceIds,
+        };
+      }
+
+      // Independent review of each survivor (INV-007). A candidate whose review
+      // failed to complete is recorded as having no completed review and is
+      // ineligible to win, so a review infrastructure failure can never hand the
+      // tournament to an unreviewed candidate.
+      const rev = await this.reviewWithRetry(wi, candidate, goal);
+      if (!rev.completed) {
+        await this.ledger.recordEntity(
+          "finding",
+          `Independent review of ${candidate.id} failed to complete (context budget/timeout) after retries; candidate ineligible to win.`,
+          "open",
+          this.actor(newRunId(), "reviewer"),
+          wi.id,
+          { severity: "critical", candidateId: candidate.id },
+        );
+      }
       return {
-        entry: { candidate, outcome, findings: [], reviewCompleted: false, winner: false },
+        entry: {
+          candidate,
+          outcome,
+          findings: materialFindings(this.ledger, candidate.id),
+          reviewCompleted: rev.completed,
+          winner: false,
+        },
         evidenceIds,
       };
+    } catch (err) {
+      // PER-LEG ERROR ISOLATION: a throwing leg must never crash the whole
+      // tournament, orphan sibling legs, or leak git state (INV-003/004). We
+      // record the failure as a rejected candidate + a finding, clean up any
+      // created branch/worktree, and return a failed entry so the caller can
+      // continue with the surviving legs.
+      const msg = err instanceof Error ? err.message : String(err);
+      if (!candidate) {
+        candidate = await this.ledger.createCandidate(
+          wi.id,
+          "",
+          branch ?? `pi-eng-leg-${newRunId().slice(4).toLowerCase()}`,
+          null,
+          "implementer",
+          newRunId(),
+          null,
+          actor,
+        );
+      }
+      await this.ledger.rejectCandidate(candidate.id, wi.id, `candidate leg failed: ${msg}`, actor).catch(() => {});
+      if (branch && this.git) await this.git.deleteBranch(branch).catch(() => {});
+      if (worktreePath && branch && this.git) {
+        await this.git.removeWorktree({ path: worktreePath, branch }).catch(() => {});
+      }
+      await this.ledger
+        .recordEntity("finding", `tournament candidate leg failed: ${msg}`, "open", actor, wi.id, {
+          severity: "critical",
+          candidateId: candidate.id,
+        })
+        .catch(() => {});
+      return {
+        entry: {
+          candidate,
+          outcome: { passed: false, failedStage: "leg-error", stages: [], evidence: [] },
+          findings: [],
+          reviewCompleted: false,
+          winner: false,
+        },
+        evidenceIds: [],
+      };
     }
-
-    // Independent review of each survivor (INV-007). A candidate whose review
-    // failed to complete is recorded as having no completed review and is
-    // ineligible to win, so a review infrastructure failure can never hand the
-    // tournament to an unreviewed candidate.
-    const rev = await this.reviewWithRetry(wi, candidate, goal);
-    if (!rev.completed) {
-      await this.ledger.recordEntity(
-        "finding",
-        `Independent review of ${candidate.id} failed to complete (context budget/timeout) after retries; candidate ineligible to win.`,
-        "open",
-        this.actor(newRunId(), "reviewer"),
-        wi.id,
-        { severity: "critical", candidateId: candidate.id },
-      );
-    }
-    return {
-      entry: {
-        candidate,
-        outcome,
-        findings: materialFindings(this.ledger, candidate.id),
-        reviewCompleted: rev.completed,
-        winner: false,
-      },
-      evidenceIds,
-    };
   }
 
   // --------------------------------------------------------------- engineer

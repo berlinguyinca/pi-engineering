@@ -659,10 +659,67 @@ test("parallel tournament candidates run concurrently in isolated worktrees", as
     const report = await rt.tournament("Implement add", { n: 2, parallel: true });
     assert.equal(report.outcome, "promoted");
     assert.ok(maxActive >= 2, `candidates must overlap in the implement phase (maxActive=${maxActive})`);
-    // Both candidates recorded, no leftover branches.
+    // Both candidates recorded; the winner promoted, the loser rejected.
     assert.equal(rt.ledger.listCandidates().length, 2);
+    const statuses = rt.ledger.listCandidates().map((c) => c.status);
+    assert.ok(statuses.includes("PROMOTED"), `exactly one winner promoted (${statuses})`);
+    assert.ok(statuses.filter((s) => s === "REJECTED").length === 1, `one loser rejected (${statuses})`);
     const mainContent = await readFile(join(fixture.root, "src", "add.js"), "utf-8");
     assert.ok(mainContent.includes("return a + b;"), "promoted winner implementation present");
+    // INV-003/004: no leftover pi-eng-* branches after a parallel tournament.
+    const { execFileSync } = await import("node:child_process");
+    const branches = execFileSync("git", ["-C", fixture.root, "branch", "--format=%(refname:short)"])
+      .toString()
+      .trim()
+      .split("\n")
+      .filter(Boolean);
+    assert.ok(!branches.some((b) => b.startsWith("pi-eng-")), `no pi-eng-* branches should remain: ${branches}`);
+    // And no leftover worktrees beyond the main checkout.
+    const worktrees = execFileSync("git", ["-C", fixture.root, "worktree", "list"]).toString().trim().split("\n");
+    assert.equal(worktrees.length, 1, `no leftover candidate worktrees: ${worktrees}`);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("a throwing tournament leg is isolated and leaks no git state (parallel error isolation)", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const worker = new FakeWorkerExecutor({
+      implementer: async () => {
+        throw new Error("boom");
+      },
+      reviewer: () => ({
+        status: "completed",
+        summary: "clean",
+        claims: [],
+        details: { findings: [] },
+        evidence_refs: [],
+        new_hypotheses: [],
+        proposed_tasks: [],
+      }),
+    });
+    const rt = await EngineeringRuntime.open({ cwd: fixture.root, worker, verifier: new CommandVerifier() });
+    // Must NOT reject the promise or crash: each leg is isolated.
+    const report = await rt.tournament("Implement add", { n: 2, parallel: true });
+    assert.equal(report.outcome, "failed", "no survivor with all legs throwing");
+    assert.equal(report.entries.length, 2);
+    // Every leg is recorded and rejected (never left ELIGIBLE/CREATED).
+    const statuses = rt.ledger.listCandidates().map((c) => c.status);
+    assert.ok(
+      statuses.every((s) => s === "REJECTED"),
+      `all legs rejected (${statuses})`,
+    );
+    assert.ok(statuses.length === 2);
+    const { execFileSync } = await import("node:child_process");
+    const branches = execFileSync("git", ["-C", fixture.root, "branch", "--format=%(refname:short)"])
+      .toString()
+      .trim()
+      .split("\n")
+      .filter(Boolean);
+    assert.ok(!branches.some((b) => b.startsWith("pi-eng-")), `no leftover branches: ${branches}`);
+    const worktrees = execFileSync("git", ["-C", fixture.root, "worktree", "list"]).toString().trim().split("\n");
+    assert.equal(worktrees.length, 1, `no leftover worktrees: ${worktrees}`);
   } finally {
     await fixture.cleanup();
   }

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -16,6 +16,27 @@ function evt(id: string): LedgerEvent {
     payload: { claim: id },
   };
 }
+
+test("EventStore.inMemory() does not persist to disk", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-eng-evmem-"));
+  try {
+    const cwd = process.cwd();
+    process.chdir(dir);
+    try {
+      const store = EventStore.inMemory();
+      await store.append(evt("evt-a"));
+      await store.append(evt("evt-b"));
+      assert.equal(store.count(), 2);
+      // No literal ":memory:" file and no ledger file must appear in cwd.
+      const entries = await readdir(dir);
+      assert.deepEqual(entries, [], `in-memory store must not write files (${entries})`);
+    } finally {
+      process.chdir(cwd);
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
 
 test("EventStore serializes concurrent appends without loss or corruption (parallel-candidate safety)", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-eng-ev-"));

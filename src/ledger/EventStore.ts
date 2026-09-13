@@ -1,4 +1,4 @@
-import { appendFile, mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import type { LedgerEvent } from "../core/types.ts";
 
@@ -16,20 +16,23 @@ export class EventStore {
 
   /** Serializes concurrent appends so file writes + in-memory updates stay ordered. */
   private appendChain: Promise<void> = Promise.resolve();
+  /** True for in-memory stores (no persistence to disk). */
+  private readonly memoryOnly: boolean;
 
-  private constructor(file: string) {
+  private constructor(file: string, memoryOnly: boolean) {
     this.file = file;
+    this.memoryOnly = memoryOnly;
   }
 
   static async create(file: string): Promise<EventStore> {
-    const store = new EventStore(file);
+    const store = new EventStore(file, false);
     await store.load();
     return store;
   }
 
   /** In-memory store (no persistence) for tests and ephemeral use. */
   static inMemory(): EventStore {
-    return new EventStore(":memory:");
+    return new EventStore("", true);
   }
 
   private async load(): Promise<void> {
@@ -60,8 +63,10 @@ export class EventStore {
    */
   async append(event: LedgerEvent): Promise<LedgerEvent> {
     const op = this.appendChain.then(async () => {
-      await mkdir(dirname(this.file), { recursive: true });
-      await appendFile(this.file, `${JSON.stringify(event)}\n`, "utf-8");
+      if (!this.memoryOnly) {
+        await mkdir(dirname(this.file), { recursive: true });
+        await appendFile(this.file, `${JSON.stringify(event)}\n`, "utf-8");
+      }
       this.events.push(event);
       this.byId.set(event.event_id, event);
     });

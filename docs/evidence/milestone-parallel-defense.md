@@ -43,7 +43,31 @@ replay reconstructs the full event set.
 
 - `npm run typecheck` — clean.
 - `npm run lint` (biome) — clean.
-- `npm test` — **66/66 passing** (3 new integration + 1 new unit).
+- `npm test` — **68/68 passing**.
+
+## Fresh-context review + fixes
+
+A fresh reviewer session confirmed the core claims (EventStore serialization
+correct under 200 concurrent appends; branch names collision-safe; reviewerWorker
+routing + fallback correct; no JS data races on the concurrent path) and found
+three issues, all fixed with regression tests:
+
+- **(MED) parallel legs were not error-isolated** — a throwing leg crashed the
+  whole tournament, orphaned sibling legs, and leaked an `ELIGIBLE` candidate +
+  `pi-eng-*` branches + a worktree. Each leg now catches its own errors, records
+  a rejected candidate + finding, and cleans up its branch/worktree; the
+  tournament continues with survivors. Regression test (`a throwing tournament
+  leg is isolated and leaks no git state`) asserts all legs rejected and zero
+  leftover branches/worktrees.
+- **(MED) overclaimed test** — the parallel test now actually asserts one winner
+  PROMOTED, one loser REJECTED, zero leftover `pi-eng-*` branches, and exactly
+  one worktree.
+- **(LOW) `EventStore.inMemory()` persisted** to a literal `:memory:` file in
+  cwd; it is now truly in-memory. Regression test asserts no files are written.
+  Unused imports removed.
+
+Also hardened `/tournament --parallel` parsing (only a leading `--parallel`
+flag is treated as a flag, not a goal containing the token).
 
 ## Real-model dogfood
 

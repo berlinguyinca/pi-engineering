@@ -126,8 +126,10 @@ export default function (pi: ExtensionAPI) {
         return;
       }
       const parts = args.trim().split(/\s+/);
-      const parallel = parts.includes("--parallel");
-      const cleaned = parts.filter((p) => p !== "--parallel");
+      // Only a leading --parallel flag is treated as a flag; a goal that merely
+      // contains the token elsewhere is left intact.
+      const parallel = parts[0] === "--parallel";
+      const cleaned = parallel ? parts.slice(1) : parts;
       const n = /\.\d+$/.test(cleaned[cleaned.length - 1]!) ? undefined : Number(cleaned.at(-1));
       const nCandidates = Number.isInteger(n) && n! >= 2 ? n! : 3;
       const goal = Number.isInteger(n) ? cleaned.slice(0, -1).join(" ") : cleaned.join(" ");

@@ -38,7 +38,7 @@ and the gap is called out here.
 
 **Verification evidence (last full run):**
 - `npx tsc --noEmit` — passes.
-- `npm test` — 66/66 passing (unit + integration).
+- `npm test` — 68/68 passing (unit + integration).
 - `npm run lint` (biome check) — clean.
 - Standalone install: pi's `ResourceLoader` discovers and loads the package
   extension with zero errors (`scripts/smoke-installed.ts`).
@@ -198,7 +198,7 @@ Dogfood (real model, fresh fixture): a goal decomposed into **3 correctly-ordere
 tasks**, all executed through the pipeline, plan **COMPLETED**, **0 blocked/failed
 workers**, 5/5 fixture tests pass, 99 tool calls / 191.7k input tokens. Machine
 evidence: `test/unit/taskdag.test.ts` (5) + `test/integration/dag.test.ts` (2),
-66/66 tests pass, `tsc` clean.
+68/68 tests pass, `tsc` clean.
 
 ## Verify profile caching (implemented)
 
@@ -240,7 +240,7 @@ test proves the reviewer/challenger run on the distinct worker while the
 implementer stays on the main worker.
 
 Covered by 3 integration tests (strategy, challenger, reviewerWorker) + 1
-concurrency unit test (`eventstore.test.ts`). 66/66 tests pass, `tsc` clean,
+concurrency unit test (`eventstore.test.ts`). 68/68 tests pass, `tsc` clean.
 `npm run lint` clean.
 
 ## Next slice
