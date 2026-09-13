@@ -95,7 +95,7 @@ async function main() {
     findings: { critical: args.critical, high: args.high },
   });
 
-  await writeFile(manualPath, stringifyYaml(final, { indent: 2 }) + "\n");
+  await writeFile(manualPath, `${stringifyYaml(final, { indent: 2 })}\n`);
   console.log(`record-roadmap-evidence: wrote ${final.length} manual record(s) bound to ${head}`);
   for (const r of final) {
     console.log(`  - ${r.id} (${r.type}, ${r.status}, commit ${r.commit})`);
