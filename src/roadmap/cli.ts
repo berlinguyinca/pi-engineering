@@ -69,7 +69,7 @@ export async function runRoadmapStatus(opts: RoadmapCliOptions): Promise<Roadmap
   const result: RoadmapCheckResult = {
     roadmap: `${detail.roadmapId}@${detail.version}`,
     complete: detail.complete,
-    verified: detail.milestones.filter((e) => e.state === "VERIFIED").length,
+    verified: detail.milestones.filter((e) => e.milestone.required && e.state === "VERIFIED").length,
     required: detail.milestones.filter((m) => m.milestone.required).length,
     blockingMilestones: detail.milestones
       .filter((e) => e.milestone.required && e.state !== "VERIFIED")

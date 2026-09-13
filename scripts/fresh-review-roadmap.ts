@@ -50,7 +50,7 @@ const run = await worker.run({
   cwd: repo,
   context: "",
   maxContextTokens: 130000,
-  timeoutMs: 900_000,
+  timeoutMs: 1_500_000,
 });
 const r = run.result as WorkerResult;
 console.log("REVIEW STATUS:", r.status);

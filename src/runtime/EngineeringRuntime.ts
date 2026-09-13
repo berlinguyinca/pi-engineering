@@ -1110,6 +1110,17 @@ Goal: "${goal}"`;
     if (!wi) {
       throw new Error(`Unknown plan work item ${planWorkItemId}; run /plan first.`);
     }
+    if (this.roadmapComplete && (await this.roadmapComplete())) {
+      await this.ledger.updateWorkItem(wi.id, { status: "BLOCKED" }, actor);
+      return {
+        plan_work_item: wi,
+        tasks: [],
+        order: [],
+        outcome: "blocked",
+        summary: "Blocked: roadmap complete — autonomous stop (no new work invented).",
+        telemetry: this.telemetry,
+      };
+    }
     if (!this.git) {
       await this.ledger.updateWorkItem(wi.id, { status: "BLOCKED" }, actor);
       return {

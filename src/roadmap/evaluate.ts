@@ -44,6 +44,29 @@ export function milestoneRequiredTypes(m: MilestoneDef): EvidenceType[] {
   return [...set];
 }
 
+/**
+ * The evidence records a milestone must bind to: one per acceptance-criterion
+ * evidence ref (criterion-bound) plus one per verification.requires type that no
+ * criterion already covers (milestone-level). A record is "current" only if its
+ * id/criterionId matches one of these targets; records left over from an older
+ * target-id scheme are orphans and must not influence state.
+ */
+export function evidenceTargets(m: MilestoneDef): Array<{ id: string; criterionId?: string; type: EvidenceType }> {
+  const targets: Array<{ id: string; criterionId?: string; type: EvidenceType }> = [];
+  const covered = new Set<EvidenceType>();
+  for (const c of m.acceptance) {
+    for (const ref of c.evidence.required) {
+      targets.push({ id: `${m.id}:${c.id}`, criterionId: c.id, type: ref.type });
+      covered.add(ref.type);
+    }
+  }
+  for (const t of m.verification.requires) {
+    if (covered.has(t)) continue;
+    targets.push({ id: `${m.id}:${t}`, type: t });
+  }
+  return targets;
+}
+
 export async function evaluateMilestone(
   m: MilestoneDef,
   store: RoadmapEvidenceStore,
@@ -124,9 +147,16 @@ export async function evaluateMilestone(
   const hasAnyPassing = records.some((r) => r.status === "pass");
   // A FAILING record means verification was attempted and failed; the milestone
   // is BLOCKED, never demoted to IMPLEMENTED (which would lose the fact that
-  // verification ran and failed). Any failing record — fresh or stale — is the
-  // last known result for its type and must block.
-  const anyFail = records.some((r) => r.status === "fail");
+  // verification ran and failed). Only CURRENT target records count: orphaned
+  // fail records left over from an older target-id scheme (append-only store, no
+  // deletion) must not permanently block a milestone that now passes.
+  const validTargetIds = new Set(evidenceTargets(m).map((t) => t.id));
+  const validCriterionIds = new Set(m.acceptance.map((c) => c.id));
+  const anyFail = records.some(
+    (r) =>
+      r.status === "fail" &&
+      (validTargetIds.has(r.id) || (r.criterionId !== undefined && validCriterionIds.has(r.criterionId))),
+  );
   const allPassingFresh = missingEvidence.length === 0 && staleEvidence.length === 0;
   const failBlocker = anyFail ? "verification failed (a required check is failing)" : "";
   const depsOk = !m.dependsOn.some((d) => {

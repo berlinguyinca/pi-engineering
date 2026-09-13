@@ -13,7 +13,7 @@ import { join } from "node:path";
 import { parse as parseYaml } from "yaml";
 import { GitRepo } from "../git/GitRepo.ts";
 import { CHECKS, type Check, GENERATED_TYPES, MANUAL_TYPES, requiredTypes, runCheck } from "./checks.ts";
-import { type EvidenceFreshness, type FindingsBudget, evaluateAll } from "./evaluate.ts";
+import { type EvidenceFreshness, type FindingsBudget, evaluateAll, evidenceTargets } from "./evaluate.ts";
 import { RoadmapEvidenceStore } from "./evidence.ts";
 import { type GateStatusProvider, evaluateReleaseGate } from "./releaseGate.ts";
 import { parseRoadmap } from "./schema.ts";
@@ -176,21 +176,7 @@ export class RoadmapEngine {
    * criterion already covers (milestone-level). Each target binds to a concrete
    * evidence record, so acceptance criteria are not satisfied by type alone.
    */
-  static evidenceTargets(m: MilestoneDef): Array<{ id: string; criterionId?: string; type: EvidenceType }> {
-    const targets: Array<{ id: string; criterionId?: string; type: EvidenceType }> = [];
-    const covered = new Set<EvidenceType>();
-    for (const c of m.acceptance) {
-      for (const ref of c.evidence.required) {
-        targets.push({ id: `${m.id}:${c.id}`, criterionId: c.id, type: ref.type });
-        covered.add(ref.type);
-      }
-    }
-    for (const t of m.verification.requires) {
-      if (covered.has(t)) continue;
-      targets.push({ id: `${m.id}:${t}`, type: t });
-    }
-    return targets;
-  }
+  static evidenceTargets = evidenceTargets;
 
   /** (Re)generate deterministic evidence at HEAD for every required milestone target. */
   async refreshEvidence(): Promise<void> {
@@ -226,10 +212,12 @@ export class RoadmapEngine {
             status: res.status,
             commit,
             generatedAt: new Date().toISOString(),
-            // Impact invalidation covers the milestone scope AND the check's
-            // coverage paths, so e.g. a test-file change invalidates both the
-            // global gate and the per-milestone evidence (no divergence).
-            paths: [...new Set([...m.scope.paths, ...check.paths])],
+            // Per-milestone evidence is scoped to the milestone's OWN scope only
+            // (spec §10: avoid whole-roadmap revalidation on unrelated changes).
+            // A change to e.g. a test file is caught by the GLOBAL gate record
+            // (whose paths include the check's coverage), so completion cannot
+            // be declared from stale global evidence.
+            paths: m.scope.paths.length ? m.scope.paths : check.paths,
             proof: check.command.join(" "),
             source: "generated",
             summary:
@@ -326,7 +314,12 @@ export class RoadmapEngine {
     };
   }
 
-  /** Record a manual evidence record (dogfood/fresh_review) into the store + index. */
+  /**
+   * Record a manual evidence record (dogfood/fresh_review) into the runtime
+   * store. NOTE: the release gate reads manual evidence from the COMMITTED index
+   * (docs/roadmap/evidence.yaml), which is written by the process step
+   * scripts/record-roadmap-evidence.ts — this method alone cannot pass the gate.
+   */
   async recordManual(rec: Omit<RoadmapEvidence, "source">): Promise<void> {
     await this.store.put({ ...rec, source: "manual" });
   }

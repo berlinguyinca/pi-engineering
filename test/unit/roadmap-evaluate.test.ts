@@ -130,6 +130,23 @@ test("evaluate: STALE failing record still blocks (last known result is failure)
   assert.equal(e.state, "BLOCKED");
 });
 
+test("evaluate: ORPHANED fail record (old target-id scheme) does NOT block", async () => {
+  // A fail record whose id/criterionId matches no current evidence target (e.g.
+  // 'M01:typecheck' left over from a pre-criterion scheme) must not permanently
+  // BLOCK a milestone that now has fresh passing evidence for its real targets.
+  const pass = record(); // M01:M01-A1 (unit), current target, passing
+  const orphan = record({ id: "M01:typecheck", criterionId: undefined, type: "typecheck", status: "fail" });
+  const e = await evalM(milestone(), [pass, orphan], fresh, budget());
+  assert.equal(e.state, "VERIFIED");
+});
+
+test("evaluate: CURRENT-target fail record still blocks despite a passing sibling", async () => {
+  const pass = record(); // M01:M01-A1 passing
+  const fail = record({ id: "M01:M01-A1", criterionId: "M01-A1", status: "fail" });
+  const e = await evalM(milestone(), [pass, fail], fresh, budget());
+  assert.equal(e.state, "BLOCKED");
+});
+
 test("evaluate: unresolved findings block VERIFIED", async () => {
   const e = await evalM(milestone(), [record()], fresh, budget(1, 0));
   assert.notEqual(e.state, "VERIFIED");

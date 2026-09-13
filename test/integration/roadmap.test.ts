@@ -329,6 +329,23 @@ test("autonomous stop: engineer() refuses new work when roadmap is complete", as
   }
 });
 
+test("roadmapCompleteFor derivation: evaluate().complete is the gate's source of truth", async () => {
+  // The extension's roadmapCompleteFor returns engine.evaluate().complete; test
+  // that real derivation (not stubs) flips with repo state.
+  const complete = await setupRepo();
+  const incomplete = await setupRepo();
+  try {
+    await seedCompleteEvidence(complete);
+    const cEngine = await RoadmapEngine.open({ repoRoot: complete.root, ...complete.paths });
+    const iEngine = await RoadmapEngine.open({ repoRoot: incomplete.root, ...incomplete.paths });
+    assert.equal((await cEngine.evaluate()).complete, true);
+    assert.equal((await iEngine.evaluate()).complete, false);
+  } finally {
+    await complete.cleanup();
+    await incomplete.cleanup();
+  }
+});
+
 test("autonomous stop: engineer/tournament/plan all stop when roadmap complete", async () => {
   const setup = await setupRepo();
   try {
