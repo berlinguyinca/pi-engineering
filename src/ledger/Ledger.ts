@@ -223,6 +223,7 @@ export class Ledger {
       producer_run_id: producerRunId,
       producer_role: producerRole,
       diff: null,
+      diff_artifact_uri: null,
       changed_files: [],
       evidence_ids: [],
       rejection_reason: null,

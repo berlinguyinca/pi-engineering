@@ -140,6 +140,8 @@ export interface Candidate {
   producer_run_id: string | null;
   producer_role: WorkerRole;
   diff: string | null;
+  /** artifact:// URI to the full diff, read lazily via artifact_read (INV-001). */
+  diff_artifact_uri: string | null;
   changed_files: string[];
   evidence_ids: string[];
   rejection_reason: string | null;

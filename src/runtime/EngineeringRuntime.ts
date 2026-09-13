@@ -294,7 +294,12 @@ Use repo_search, symbol, ledger_read, and artifact_read. Do not edit files.`;
         const diff = await this.git.captureDiff(candidate.base_commit, head);
         const files = await this.git.changedFiles(candidate.base_commit, head);
         const diffArtifact = await this.artifacts.put("candidate", candidate.id, diff || "(empty diff)", `${files.length} file(s) changed`);
-        await this.ledger.changeCandidate(candidate.id, { diff: diff || null, changed_files: files }, wi.id, this.actor(run.runId, "implementer"));
+        await this.ledger.changeCandidate(
+          candidate.id,
+          { diff: diff || null, diff_artifact_uri: diffArtifact.uri, changed_files: files },
+          wi.id,
+          this.actor(run.runId, "implementer"),
+        );
         return { ...run, diff: diff || null, changedFiles: files, diffArtifactUri: diffArtifact.uri };
       }
     }
@@ -333,12 +338,23 @@ Use repo_search, symbol, ledger_read, and artifact_read. Do not edit files.`;
     requirement: string,
   ): Promise<{ summary: string; findingIds: string[]; completed: boolean }> {
     const diff = candidate.diff ?? "(no captured diff)";
+    // The full candidate diff stays OUT of the prompt as a lazily-retrieved
+    // artifact (artifact-backed large-output handling). Only a compact inline
+    // preview plus the artifact URI enter the reviewer's context, so a large
+    // diff no longer consumes the reviewer's hard token budget up front and the
+    // reviewer reads the rest on demand via artifact_read (INV-001).
+    const diffUri = await this.ensureDiffArtifact(candidate);
+    const preview = diff.length > 2000 ? `${diff.slice(0, 2000)}\n… [truncated; full diff in artifact]` : diff;
+    const files = candidate.changed_files?.length ? candidate.changed_files.join(", ") : "(unknown)";
     const task = `Independently review candidate ${candidate.id} for the work item:
 "${wi.goal}"
 Requirement: ${requirement}
 
-Candidate diff:
-${diff.slice(0, 8000)}
+Changed files: ${files}
+Candidate diff (compact preview):
+${preview}
+
+To inspect the COMPLETE candidate diff, call artifact_read with uri "${diffUri}". Always read the full diff artifact before judging.
 
 Report concrete findings. Return your findings EXACTLY as details.findings, an array of objects { severity, claim, evidence } where severity is one of info|low|medium|high|critical. If there are NO material issues, set details.findings to an EMPTY array. Do not put findings in the claims field. You are a reviewer; you do not approve the work, you report findings. Use artifact_read to inspect logs if referenced.`;
     const { run, runId } = await this.runWorker("reviewer", task, {
@@ -374,6 +390,22 @@ Report concrete findings. Return your findings EXACTLY as details.findings, an a
       });
     }
     return { summary: run.result.summary, findingIds, completed };
+  }
+
+  /**
+   * Ensure the candidate's full diff is stored as a lazily-readable artifact
+   * and return its `artifact://` URI. Candidates produced by `implementIn`
+   * already carry a `diff_artifact_uri`; this covers candidates reviewed
+   * directly (e.g. `/review`) whose artifact may be missing or predate artifact
+   * storage, and re-uses the stored artifact when present.
+   */
+  private async ensureDiffArtifact(candidate: Candidate): Promise<string> {
+    if (candidate.diff_artifact_uri && this.artifacts.getByUri(candidate.diff_artifact_uri)) {
+      return candidate.diff_artifact_uri;
+    }
+    const content = candidate.diff ?? "(no captured diff)";
+    const meta = await this.artifacts.put("candidate", candidate.id, content, "candidate diff (lazy)");
+    return meta.uri;
   }
 
   /**

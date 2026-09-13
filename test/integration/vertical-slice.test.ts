@@ -326,6 +326,55 @@ test("implementer cannot neutralize its own verification gate by editing the wor
   }
 });
 
+test("review keeps the full diff out of context behind a lazy artifact reference (milestone)", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const capturedTasks: string[] = [];
+    const worker = new FakeWorkerExecutor(
+      {
+        reviewer: () => ({
+          status: "completed",
+          summary: "clean",
+          claims: [],
+          details: { findings: [] },
+          evidence_refs: [],
+          new_hypotheses: [],
+          proposed_tasks: [],
+        }),
+      },
+      undefined,
+    );
+    const wrapped = {
+      run: async (req: Parameters<typeof worker.run>[0]) => {
+        if (req.role === "reviewer") capturedTasks.push(req.task);
+        return worker.run(req);
+      },
+    } as never;
+    const rt = await EngineeringRuntime.open({ cwd: fixture.root, worker: wrapped });
+    const wi = await rt.ledger.createWorkItem("review target", "medium", [fixture.root], { type: "system" });
+    const cand = await rt.ledger.createCandidate(wi.id, "abc", "b", null, "implementer", "run", null, { type: "system" });
+    // ~10k chars, far beyond the 2000-char preview, with a UNIQUE marker at the
+    // very end so we can prove the full body is not inlined into the prompt.
+    const bigDiff = "export const a = 1;\n".repeat(499) + "// UNIQUE_END_MARKER_9f3x\n";
+    await rt.ledger.changeCandidate(cand.id, { diff: bigDiff, changed_files: ["src/a.js"] }, wi.id, { type: "system" });
+
+    await rt.review(wi, cand, "must be correct");
+
+    const task = capturedTasks[0] ?? "";
+    assert.ok(!task.includes("UNIQUE_END_MARKER_9f3x"), "the full diff must NOT be inlined into the reviewer prompt");
+    assert.ok(task.length < bigDiff.length, `reviewer prompt (${task.length}) should be smaller than the diff (${bigDiff.length})`);
+    assert.ok(task.includes("artifact_read"), "reviewer must be instructed to read the diff artifact");
+    assert.match(task, /artifact:\/\/candidate\//);
+
+    // The full diff is retrievable lazily from the artifact store.
+    const meta = rt.artifacts.list("candidate").find((m) => m.id === cand.id);
+    assert.ok(meta, "the full diff should be stored as an artifact");
+    assert.equal(await rt.artifacts.readContent(meta!.category, meta!.id), bigDiff);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
 test("a review that fails to complete must not silently promote (INV-007)", async () => {
   const fixture = await makeFixtureRepo();
   try {
