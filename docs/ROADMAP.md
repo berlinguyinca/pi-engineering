@@ -29,6 +29,7 @@ and the gap is called out here.
 | Parallel candidate execution (opt-in) + concurrency-safe ledger | **Works** | integration: parallel test; `eventstore.test.ts` |
 | Optional distinct reviewer worker (anchoring mitigation) | **Works** | integration: reviewerWorker test |
 | Task DAG planning + execution (multi-step work items) | **Works** | `taskdag.test.ts`, `dag.test.ts` |
+| Verifiable roadmap completion (Roadmap 1.0) | **Works** | `roadmap check` exit 0; `roadmap-*.test.ts`; `docs/roadmap/` |
 | Verify profile caching + `/verify full` suite | **Works** | `verifier.test.ts` |
 | Lint/format gate (biome) | **Works** | `npm run lint` / `npm run format` |
 | Relevance-ranked context + scout-guided required files | **Works** | `context.test.ts`, integration: scout-required test |
@@ -89,11 +90,42 @@ review is never treated as a clean review. Covered by two regression tests.
 
 ## What is deliberately NOT built yet
 
-None of the deferred roadmap items remain — all are implemented (see below). The
-only spec provisions still out of scope are those excluded by the project
+**Roadmap 1.0 is complete** (12/12 required milestones VERIFIED; `roadmap check`
+exits 0). The one non-required milestone is deferred with an explicit reason:
+
+- **M13 Parallel Task DAG execution** — deferred because each task's
+  `engineer()` promotes via a merge into the main branch, so concurrent tasks
+  would race on `index.lock`/the main branch. Safe parallelism requires tasks to
+  accumulate on separate branches and merge sequentially — a distinct milestone.
+
+The only spec provisions still out of scope are those excluded by the project
 constraint: multiple-model support, AutoSpec/InferWeave adapters, a hosted
 control plane, and a Go control plane. These are deliberate boundaries, not
 accidental gaps.
+
+## Roadmap 1.0: verifiable completion (implemented)
+
+Completion is **derived from evidence, never declared by a model**. The
+structured Roadmap 1.0 lives in `docs/roadmap/roadmap.yaml` (12 required
+milestones + backlog). `pi-engineering roadmap check` runs the deterministic
+suites (unit/integration/typecheck/lint/package_load/roadmap_test), derives each
+milestone's state from evidence bound to commit SHAs + dependencies + freshness,
+and applies a release gate (all required VERIFIED + deterministic gates +
+`fresh_review` + `dogfood`). Evidence invalidation is impact-based via git
+pathspec (`changedPathsSince`): a relevant change flips a milestone to
+`NEEDS_REVERIFICATION`, and empty/unknown evidence commits or git errors are
+**never** treated as fresh. When the roadmap is complete, `/engineer`, `/plan`,
+`/tournament`, and `executePlan` refuse to invent new work (autonomous stop).
+
+```sh
+node scripts/pi-engineering.ts roadmap check   # exit 0 = complete
+node scripts/pi-engineering.ts roadmap status
+```
+
+Machine evidence: `roadmap check` exits **0** with `complete: true`, release gate
+**PASS**, 12/12 VERIFIED (M13 DEFERRED); 116 tests pass incl. schema/evaluate/
+invalidate/CLI/autonomous-stop/dogfood. See `docs/evidence/milestone-roadmap-completion.md`
+and the committed manual index `docs/roadmap/evidence.yaml`.
 
 ## Known limitations (honest)
 
@@ -245,12 +277,11 @@ concurrency unit test (`eventstore.test.ts`). 68/68 tests pass, `tsc` clean.
 
 ## Next slice
 
-Remaining work is beyond the current roadmap and gated by the project
-constraint:
-- **Task-DAG parallel execution** — deferred with a concrete reason: each task's
-  `engineer()` promotes via a merge into the main branch, so running independent
-  tasks concurrently would race on `index.lock`/the main branch. Safe parallelism
-  requires tasks to accumulate on separate branches and merge sequentially.
+Roadmap 1.0 is complete; the next slices are beyond the current release scope:
+- **M13 Parallel Task DAG execution** — deferred in `docs/roadmap/roadmap.yaml`
+  with a concrete reason (each task's `engineer()` promotes via a merge into
+  main, so concurrent tasks race on `index.lock`; safe parallelism needs
+  branch-based candidate accumulation + sequential controlled integration).
 - **Candidate parallel execution by default** — available via `parallel: true`;
   not default because a single serial worker gains nothing and concurrency
   assumes a multi-worker/multi-model backend.
@@ -264,4 +295,5 @@ npx tsc --noEmit
 npm test
 node scripts/smoke-installed.ts          # standalone package load
 node scripts/dogfood.ts <repo> <goal>    # real-model end-to-end (dev tool)
+node scripts/pi-engineering.ts roadmap check   # verifiable completion (exit 0)
 ```
