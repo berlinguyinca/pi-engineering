@@ -1,0 +1,43 @@
+# Continuous integration for pi-engineering-runtime.
+#
+# Spec (docs/specs/pi-engineering-verifiable-roadmap-completion-spec.md §20):
+# CI SHOULD run npm test, npm run typecheck, and npm run roadmap:check.
+# On a release candidate, roadmap:check MUST pass (all required milestones
+# VERIFIED, evidence fresh, no unresolved critical/high findings, dogfood
+# evidence present). `roadmap check` regenerates the deterministic evidence
+# store (gitignored) at the checked-out commit and reads the committed manual
+# index (docs/roadmap/evidence.yaml), so a complete commit passes here.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so evidence freshness (changedPathsSince) can diff
+          # against the recorded evidence commit rather than treating a
+          # shallow clone as stale.
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Lint
+        run: npm run lint
+      - name: Unit + integration tests
+        run: npm test
+      - name: Package-load + command smoke
+        run: npm run test:e2e
+      - name: Verifiable roadmap check (exit 0 = complete)
+        run: npm run roadmap:check

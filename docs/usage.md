@@ -34,12 +34,28 @@ The pipeline runs **asynchronously** with progress notifications:
 | Command        | Effect                                                        |
 | -------------- | ------------------------------------------------------------- |
 | `/engineer G`  | Full adaptive workflow (scout → implement → verify → review). |
-| `/tournament G [n]` | Candidate tournament: n independent implementations, verify+review each, promote the deterministic winner (default 3). |
+| `/tournament G [n]` | Candidate tournament: n independent implementations, verify+review each, promote the deterministic winner (default 3, `--parallel` opt-in). |
+| `/plan G`      | Decompose `G` into a dependency-aware task DAG (recorded in the ledger). |
+| `/execute [plan]` | Execute a planned task DAG in dependency order via the engineer pipeline. |
 | `/review`      | Fresh independent review of the latest candidate.             |
 | `/challenge`   | Clean-room challenge of the current approach (fresh context, no prior reasoning). |
-| `/verify`      | Detect a verification profile and run it, recording evidence. |
+| `/verify [full]` | Detect a verification profile and run it, recording evidence (`full` = lint + test:full). |
 | `/ledger [kind]` | Show work items + candidates + entities (optionally filter by `kind`, e.g. `/ledger finding`). |
 | `/context`     | Show active context usage, ledger size, artifact count, budgets. |
+| `/roadmap-status` | Show derived Roadmap 1.0 completion status for this repository. |
+
+## Verifiable roadmap completion
+
+`node scripts/pi-engineering.ts roadmap check` (or `npm run roadmap:check`)
+returns a machine verdict: **exit 0** when the roadmap is complete. Completion
+is **derived** from evidence bound to commit SHAs (unit/integration/typecheck/
+lint/package_load/roadmap_test) + dependencies + freshness + a release gate
+(deterministic suites + independent fresh-context review + dogfood). A relevant
+change invalidates evidence (`NEEDS_REVERIFICATION`); completion is never
+declared by a model. `roadmap status` prints the human summary. The structured
+definition lives in `docs/roadmap/roadmap.yaml`; model-dependent evidence is
+recorded by `node scripts/record-roadmap-evidence.ts --critical 0 --high 0`
+into `docs/roadmap/evidence.yaml`.
 
 ## Durable state
 
@@ -48,6 +64,7 @@ State lives in `<repoRoot>/.pi-eng/` and is git-ignored:
 ```
 .pi-eng/ledger.jsonl            append-only event stream (work items, candidates, entities)
 .pi-eng/artifacts/              candidate diffs, verification logs, scout context
+.pi-eng/roadmap/evidence.jsonl  regenerated roadmap evidence (bound to commit SHAs)
 ```
 
 The ledger is event-sourced and replayed on open, so **no run depends on the

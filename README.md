@@ -24,7 +24,10 @@ inspect repo ──▶ scout (fresh context) ──▶ bounded task context
 
 Material review findings trigger fix rounds; each fix runs as a *child*
 candidate in a fresh worktree. Nothing about a run depends on the interactive
-transcript surviving — all state is on disk in `.pi-eng/` (ledger + artifacts).
+transcript surviving — all state is on disk in `.pi-eng/` (ledger + artifacts +
+roadmap evidence). When the repository's Roadmap 1.0 is complete,
+`/engineer`, `/plan`, `/tournament`, and `/execute` refuse to invent new work
+(autonomous stop) — the runtime does not keep manufacturing work past "done".
 
 ## Install as a pi extension
 
@@ -34,14 +37,28 @@ pi install /absolute/path/to/pi-engineering-runtime
 
 ## Commands
 
-| Command       | Purpose                                                        |
-| ------------- | -------------------------------------------------------------- |
-| `/engineer G` | Run the full adaptive workflow for goal `G`                    |
-| `/review`     | Fresh-context independent review of the current candidate      |
-| `/challenge`  | Clean-room challenge of the current approach (no prior reasoning) |
-| `/verify`     | Run risk-appropriate verification, record deterministic evidence |
-| `/ledger [k]` | Show work items, candidates, and ledger entities (optionally filtered) |
-| `/context`    | Show context budget, sources, and worker usage                 |
+| Command            | Purpose                                                        |
+| ------------------ | -------------------------------------------------------------- |
+| `/engineer G`      | Run the full adaptive workflow for goal `G`                    |
+| `/tournament G [n]` | N independent implementations; verify+review each; promote the deterministic winner (default 3, `--parallel` opt-in) |
+| `/plan G`         | Decompose `G` into a dependency-aware task DAG (recorded in the ledger) |
+| `/execute [plan]` | Execute a planned task DAG in dependency order via the engineer pipeline |
+| `/review`         | Fresh-context independent review of the current candidate      |
+| `/challenge`      | Clean-room challenge of the current approach (no prior reasoning) |
+| `/verify [full]`  | Run risk-appropriate verification, record deterministic evidence (`full` = lint + test:full) |
+| `/ledger [k]`     | Show work items, candidates, and ledger entities (optionally filtered) |
+| `/context`        | Show context budget, sources, and worker usage                 |
+| `/roadmap-status` | Show derived Roadmap 1.0 completion status for this repository |
+
+`pi-engineering roadmap check` (also `npm run roadmap:check`) returns a
+**verifiable completion verdict**: exit **0** when every required milestone is
+VERIFIED with fresh evidence, the release gate passes (deterministic suites +
+independent fresh-context review + dogfood), and no unresolved critical/high
+findings remain. Completion is **derived from machine evidence bound to commit
+SHAs** — never declared by a model. `pi-engineering roadmap status` prints the
+human summary. See `docs/roadmap/roadmap.yaml` and
+`docs/specs/pi-engineering-verifiable-roadmap-completion-spec.md`. The roadmap
+engine is also exported as a public API from `src/index.ts`.
 
 ## Semantic tools
 
@@ -82,12 +99,13 @@ src/artifacts/       filesystem artifact store (artifact:// URIs)
 src/git/             worktree isolation + diff capture + controlled merge
 src/context/         bounded task-context broker (repo map + git grep)
 src/verify/          deterministic CommandVerifier + provider abstraction
+src/plan/            dependency-aware task DAG planning
+src/roadmap/         verifiable roadmap completion engine (check/status/evidence)
 src/workers/         role prompts + bounded worker_result tool + executors
-src/runtime/         EngineeringRuntime facade (scout/verify/review/challenge/engineer)
+src/runtime/         EngineeringRuntime facade (plan/engineer/tournament/review/challenge)
 src/tools/           semantic tools bound per-cwd
-scripts/             real-model smoke tests
-test/                unit + integration tests
-docs/specs/          authoritative design spec
+scripts/             real-model smoke tests + roadmap CLI + evidence recording
+.github/workflows/   CI (typecheck, lint, tests, package-load, roadmap:check)
 ```
 
 ## License

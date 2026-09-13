@@ -1,9 +1,13 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { test } from "node:test";
+import { promisify } from "node:util";
 import { GitRepo } from "../../src/git/GitRepo.ts";
 import { makeFixtureRepo } from "../fixtures/make-fixture.ts";
+
+const exec = promisify(execFile);
 
 test("git repo detection and head commit", async () => {
   const fixture = await makeFixtureRepo();
@@ -67,6 +71,80 @@ test("worktrees are created OUTSIDE the repo tree, even when opened from a subdi
     } finally {
       await subdirRepo.removeWorktree(wt);
     }
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("changedPathsSince: clean repo at HEAD is fresh (empty)", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const repo = (await GitRepo.open(fixture.root))!;
+    const head = await repo.headCommit();
+    assert.deepEqual(await repo.changedPathsSince(head, ["src/"]), []);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("changedPathsSince: uncommitted in-scope change is stale, out-of-scope is fresh", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const repo = (await GitRepo.open(fixture.root))!;
+    const head = await repo.headCommit();
+    await writeFile(join(fixture.root, "src", "add.js"), "export function add(a,b){return a+b;}\n");
+    assert.ok((await repo.changedPathsSince(head, ["src/"])).length > 0, "in-scope change must be stale");
+    assert.deepEqual(await repo.changedPathsSince(head, ["src/ledger/"]), [], "out-of-scope must be fresh");
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("changedPathsSince: committed change is detected", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const repo = (await GitRepo.open(fixture.root))!;
+    const head = await repo.headCommit();
+    await writeFile(join(fixture.root, "src", "add.js"), "export function add(a,b){return a+b;}\n");
+    await exec("git", ["-C", fixture.root, "add", "-A"]);
+    await exec("git", ["-C", fixture.root, "commit", "-q", "-m", "change"]);
+    assert.ok((await repo.changedPathsSince(head, ["src/"])).length > 0, "committed change must be stale");
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("changedPathsSince: empty commit is never fresh (fail-safe)", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const repo = (await GitRepo.open(fixture.root))!;
+    const changed = await repo.changedPathsSince("", ["src/"]);
+    assert.ok(changed.length > 0, "empty/placeholder commit must be stale, never fresh");
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("changedPathsSince: unknown commit (git error) is stale (fail-safe)", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const repo = (await GitRepo.open(fixture.root))!;
+    const changed = await repo.changedPathsSince("0000000000000000000000000000000000000000", ["src/"]);
+    assert.ok(changed.length > 0, "unknown commit (git error) must be stale, never fresh");
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("changedPathsSince: glob pathspec matches a new test file", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const repo = (await GitRepo.open(fixture.root))!;
+    const head = await repo.headCommit();
+    const { mkdir } = await import("node:fs/promises");
+    await mkdir(join(fixture.root, "test", "unit"), { recursive: true });
+    await writeFile(join(fixture.root, "test", "unit", "roadmap-x.test.ts"), "export const x = 1;\n");
+    assert.ok((await repo.changedPathsSince(head, ["test/unit/roadmap*"])).length > 0, "glob must match new file");
   } finally {
     await fixture.cleanup();
   }

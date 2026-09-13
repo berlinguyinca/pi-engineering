@@ -230,5 +230,26 @@ backlog:
     title: Hosted control plane / dashboard (optional)
   - id: B-106
     title: Go control plane (optional)
+  - id: B-107
+    title: "Verification-farm depth (spec §15.4-15.10): test-impact analysis, adversarial test generation, property-based tests, fuzzing, mutation/differential testing, performance evidence"
+    discovered_during: M12
+  - id: B-108
+    title: "Model routing / diversity (spec §21): capability-based routing, quota/capacity fallback, model diversity"
+    discovered_during: M12
+  - id: B-109
+    title: "Scheduling and backpressure (spec §22): scheduler, backpressure, fairness, speculative execution"
+    discovered_during: M12
+  - id: B-110
+    title: "Budget-manager escalation + marginal-value stopping (spec §23)"
+    discovered_during: M12
+  - id: B-111
+    title: "Security hardening (spec §29): secret handling, tool policy, untrusted-repository-instruction guardrails"
+    discovered_during: M12
+  - id: B-112
+    title: "Integration / merge queue (spec §31): promotion levels, integration rebase, conflict resolution"
+    discovered_during: M12
+  - id: B-113
+    title: "Repository intelligence / LSP integration (spec §26) after evaluating available integrations"
+    discovered_during: M12
 
 waivers: []

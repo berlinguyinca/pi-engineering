@@ -22,7 +22,18 @@ const mockPi: any = {
 
 extensionFactory(mockPi);
 
-const EXPECTED_COMMANDS = ["engineer", "ledger", "context", "verify", "review", "challenge"];
+const EXPECTED_COMMANDS = [
+  "engineer",
+  "tournament",
+  "plan",
+  "execute",
+  "ledger",
+  "context",
+  "verify",
+  "review",
+  "challenge",
+  "roadmap-status",
+];
 const EXPECTED_TOOLS = ["ledger_read", "ledger_claim", "artifact_read", "repo_search", "symbol", "tests_for"];
 
 for (const c of EXPECTED_COMMANDS) {

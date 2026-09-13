@@ -370,6 +370,28 @@ test("roadmap check: invalid roadmap -> exit 2", async () => {
   }
 });
 
+test("roadmap check: corrupt evidence store fails closed (exit 1), never crashes", async () => {
+  const setup = await setupRepo();
+  try {
+    await seedCompleteEvidence(setup);
+    // Corrupt the generated evidence store with garbage lines.
+    const fs = await import("node:fs/promises");
+    await fs.mkdir(join(setup.root, ".pi-eng/roadmap"), { recursive: true });
+    await fs.writeFile(setup.paths.evidenceFile, "{ this is not json }\n[[[[\nnot-a-record\n");
+    const { exitCode, text } = await runRoadmapCheck({
+      repoRoot: setup.root,
+      ...setup.paths,
+      json: false,
+      refresh: false,
+    });
+    // Corrupt/unparseable lines are ignored (fail-closed); the run must not
+    // throw and must not report complete.
+    assert.equal(exitCode, 1, text);
+  } finally {
+    await setup.cleanup();
+  }
+});
+
 test("roadmap check: not a git repo -> exit 3", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-eng-nogit-"));
   try {
