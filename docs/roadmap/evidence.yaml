@@ -2,8 +2,8 @@
   milestone: __global__
   type: dogfood
   status: pass
-  commit: 717cf742a180fc4f7c672ac359c08aafab7bfa5b
-  generatedAt: 2026-09-13T18:47:03.930Z
+  commit: 805cd77ab8618d68775440fbcfcfd52303642429
+  generatedAt: 2026-09-13T21:10:07.630Z
   paths:
     - src/
   proof: scripts/dogfood-roadmap.ts + real-repo roadmap check
@@ -12,11 +12,14 @@
   milestone: __global__
   type: fresh_review
   status: pass
-  commit: 717cf742a180fc4f7c672ac359c08aafab7bfa5b
-  generatedAt: 2026-09-13T18:47:03.930Z
+  commit: 805cd77ab8618d68775440fbcfcfd52303642429
+  generatedAt: 2026-09-13T21:10:07.630Z
   paths:
     - src/roadmap/
-  proof: scripts/fresh-review-roadmap.ts
+    - src/blackhole/
+    - src/benchmark/
+  proof: scripts/fresh-review-roadmap.ts + scripts/fresh-review-blackhole.ts +
+    scripts/fresh-review-blackhole-fixes.ts
   summary: fresh-context review at HEAD; unresolved findings 0 critical, 0 high
   findings:
     critical: 0
