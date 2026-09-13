@@ -223,3 +223,40 @@ At completion, report only:
 * recommended next milestone.
 
 Begin immediately.
+
+---
+
+## Milestone Report — Verifiable Roadmap Completion (Roadmap 1.0) — COMPLETE
+
+**Milestone selected and why:** M12 Verifiable Roadmap Completion — the final
+required milestone. It makes "done" a machine-derivable property (never a model
+declaration) and closes the loop on all prior work.
+
+**Functionality added:** structured Roadmap 1.0 (`docs/roadmap/roadmap.yaml`),
+evidence-derived milestone states, impact-based invalidation, release gate,
+`roadmap check|status` CLI + `/roadmap-status`, autonomous stop.
+
+**Dogfood result:** full lifecycle proven deterministically in a disposable repo
+(incomplete→1, verified→0, invalidated→1+NEEDS_REVERIFICATION, reverified→0,
+status complete, final check 0). The repo's own roadmap passes its gate.
+
+**Verification evidence:** `roadmap check` exit **0**, complete:true, release gate
+PASS, 12/12 VERIFIED (M13 DEFERRED); **116/116** tests; typecheck + biome clean.
+
+**Fresh-review findings:** six independent fresh-context review rounds; all material
+findings fixed with regression tests (manual whitelist, fail-safe freshness,
+no-review-fails, criterion binding, orphan-fail invariant, failing-refresh≠demote,
+autonomous-stop on all entry points, schema hardening). Final state: no HIGH.
+
+**Commits:** 10 (roadmap system `9a54771` + 9 fix/docs commits), pushed to `origin`.
+
+**Remaining limitation:** Task-DAG parallel execution (M13) deferred with an
+explicit reason (per-task `engineer()` promotes via merge into main → `index.lock`
+race; safe parallelism needs branch-based candidate accumulation + sequential
+integration). Also: the autonomous-stop gate is conservative on a fresh checkout
+(deterministic evidence is gitignored and regenerated locally), so it never blocks
+without local evidence — a deliberate fail-safe tradeoff.
+
+**Recommended next milestone:** M13 Parallel Task DAG execution, or a CI config
+(`roadmap:check` in CI, spec §20 SHOULD) and the deferred benchmark/autonomy/
+docs/e2e sub-gates (backlog B-102).
