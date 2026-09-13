@@ -99,8 +99,18 @@ src/artifacts/       filesystem artifact store (artifact:// URIs)
 src/git/             worktree isolation + diff capture + controlled merge
 src/context/         bounded task-context broker (repo map + git grep)
 src/verify/          deterministic CommandVerifier + provider abstraction
-src/plan/            dependency-aware task DAG planning
+src/verify/farm/     verification-farm depth (test-impact, adversarial, mutation, differential, perf)
+src/plan/            dependency-aware task DAG planning (+ parallel execution)
 src/roadmap/         verifiable roadmap completion engine (check/status/evidence)
+src/routing/         capability+quota model routing + separation-of-duties diversity
+src/sched/           weighted-fairness concurrency scheduler + backpressure
+src/budget/          token-budget escalation + marginal-value stopping
+src/security/        secret redaction, tool policy, prompt-injection guardrails
+src/merge/           integration & merge queue (candidate→integration→main)
+src/intel/           dependency-free repo symbol index (+ optional LSP seam)
+src/bench/           engineering benchmark with baseline gate
+src/adapters/        optional AutoSpec/InferWeave seams (empty by default)
+src/telemetry/       deterministic telemetry export for external control planes
 src/workers/         role prompts + bounded worker_result tool + executors
 src/runtime/         EngineeringRuntime facade (plan/engineer/tournament/review/challenge)
 src/tools/           semantic tools bound per-cwd

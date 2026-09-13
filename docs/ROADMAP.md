@@ -39,7 +39,7 @@ and the gap is called out here.
 
 **Verification evidence (last full run):**
 - `npx tsc --noEmit` — passes.
-- `npm test` — 68/68 passing (unit + integration).
+- `npm test` — 194/194 passing (unit + integration).
 - `npm run lint` (biome check) — clean.
 - Standalone install: pi's `ResourceLoader` discovers and loads the package
   extension with zero errors (`scripts/smoke-installed.ts`).
@@ -90,18 +90,17 @@ review is never treated as a clean review. Covered by two regression tests.
 
 ## What is deliberately NOT built yet
 
-**Roadmap 1.0 is complete** (12/12 required milestones VERIFIED; `roadmap check`
-exits 0). The one non-required milestone is deferred with an explicit reason:
-
-- **M13 Parallel Task DAG execution** — deferred because each task's
-  `engineer()` promotes via a merge into the main branch, so concurrent tasks
-  would race on `index.lock`/the main branch. Safe parallelism requires tasks to
-  accumulate on separate branches and merge sequentially — a distinct milestone.
+**Roadmap 1.0 is complete** (22/22 required milestones VERIFIED; `roadmap check`
+exits 0). The previously-deferred M13 Parallel Task DAG execution is now
+IMPLEMENTED and required (parallel waves + a runtime git lock that serializes
+promotion merges, eliminating the `index.lock` race). All backlog items
+B-101..B-104 and B-107..B-113 are also implemented as milestones M13-M22.
 
 The only spec provisions still out of scope are those excluded by the project
-constraint: multiple-model support, AutoSpec/InferWeave adapters, a hosted
-control plane, and a Go control plane. These are deliberate boundaries, not
-accidental gaps.
+constraint or requiring external infrastructure: AutoSpec/InferWeave adapters
+(optional seams exist, empty by default), a hosted control plane (core provides a
+telemtry export seam), and a Go control plane. These are deliberate boundaries,
+not accidental gaps.
 
 ## Roadmap 1.0: verifiable completion (implemented)
 
@@ -123,9 +122,11 @@ node scripts/pi-engineering.ts roadmap status
 ```
 
 Machine evidence: `roadmap check` exits **0** with `complete: true`, release gate
-**PASS**, 12/12 VERIFIED (M13 DEFERRED); 116 tests pass incl. schema/evaluate/
-invalidate/CLI/autonomous-stop/dogfood. See `docs/evidence/milestone-roadmap-completion.md`
-and the committed manual index `docs/roadmap/evidence.yaml`.
+**PASS**, 22/22 VERIFIED; 194 tests pass incl. schema/evaluate/invalidate/CLI/
+autonomous-stop/dogfood, routing, scheduling, budget, security, merge-queue, repo
+intel, verification-farm, benchmark, and parallel-DAG tests. See
+`docs/evidence/milestone-roadmap-completion.md` and the committed manual index
+`docs/roadmap/evidence.yaml`.
 
 ## Known limitations (honest)
 
@@ -275,18 +276,44 @@ Covered by 3 integration tests (strategy, challenger, reviewerWorker) + 1
 concurrency unit test (`eventstore.test.ts`). 68/68 tests pass, `tsc` clean.
 `npm run lint` clean.
 
+## Backlog implementation (M13-M22)
+
+The full backlog of spec provisions discovered during M12 is now implemented and
+verifiable as milestones M13-M22 (all REQUIRED, all VERIFIED):
+
+- **M13 Parallel Task DAG execution** — `executePlan(plan, { parallel })` runs
+  independent, write-scope-disjoint tasks concurrently (bounded by a scheduler)
+  in dependency waves; a runtime git lock serializes promotion merges into the
+  shared main branch so concurrent tasks never race `index.lock`. Worktree
+  creation stays concurrent (each leg owns a unique branch/worktree).
+- **M14 Model routing & diversity** (`src/routing/`) — capability+quota routing
+  with separation-of-duties diversity; degrades to a single model.
+- **M15 Scheduling & backpressure** (`src/sched/`) — weighted-deficit round-robin
+  concurrency limiter, backpressure, bounded speculative execution.
+- **M16 Budget management** (`src/budget/`) — token-budget escalation toward a
+  hard cap gated on marginal value + marginal-value stopping.
+- **M17 Security hardening** (`src/security/`) — secret redaction, tool
+  allow/deny policy, untrusted-repo prompt-injection guardrails (fail-closed).
+- **M18 Integration & merge queue** (`src/merge/`) — serialized
+  candidate→integration→main promotion with rebase + deterministic gate.
+- **M19 Repository intelligence** (`src/intel/`) — dependency-free symbol index
+  + optional LSP seam.
+- **M20 Verification farm** (`src/verify/farm/`) — test-impact analysis,
+  machine-gated adversarial test generation, property scaffolding (with vacuous
+  detection), mutation kill-rate, differential, performance-vs-baseline.
+- **M21 Engineering benchmark** (`src/bench/`) — autonomy/context/throughput
+  metrics compared to a baseline as an enforceable gate.
+- **M22 Optional adapter seams & telemetry** (`src/adapters/`, `src/telemetry/`)
+  — AutoSpec/InferWeave seams empty by default (core standalone) + a
+  deterministic telemetry export for external control planes.
+
 ## Next slice
 
-Roadmap 1.0 is complete; the next slices are beyond the current release scope:
-- **M13 Parallel Task DAG execution** — deferred in `docs/roadmap/roadmap.yaml`
-  with a concrete reason (each task's `engineer()` promotes via a merge into
-  main, so concurrent tasks race on `index.lock`; safe parallelism needs
-  branch-based candidate accumulation + sequential controlled integration).
-- **Candidate parallel execution by default** — available via `parallel: true`;
-  not default because a single serial worker gains nothing and concurrency
-  assumes a multi-worker/multi-model backend.
-- Deliberately out-of-scope: AutoSpec/InferWeave adapters, a hosted control
-  plane, and a Go control plane.
+Roadmap 1.0 (22/22) is complete. Remaining backlog is genuinely external
+infrastructure: a hosted control plane / dashboard (B-105) and a Go control
+plane (B-106). Candidate parallel execution is available via `parallel: true`
+but not default (a single serial worker gains nothing; concurrency assumes a
+multi-worker/multi-model backend).
 
 ## How to run the evidence yourself
 

@@ -260,3 +260,42 @@ without local evidence — a deliberate fail-safe tradeoff.
 **Recommended next milestone:** M13 Parallel Task DAG execution, or a CI config
 (`roadmap:check` in CI, spec §20 SHOULD) and the deferred benchmark/autonomy/
 docs/e2e sub-gates (backlog B-102).
+
+---
+
+## Milestone: Finish the whole backlog (M13 + B-101..B-113)
+
+**Goal:** implement every remaining roadmap milestone and backlog item, dogfood,
+fresh-review, fix findings, and fold the work into Roadmap 1.0 as verifiable,
+evidence-derived milestones.
+
+**Functionality added (all exported from `src/index.ts`):**
+- **M13 Parallel Task DAG execution** — `executePlan(plan, { parallel, concurrency })`
+  runs independent, write-scope-disjoint tasks concurrently via the scheduler in
+  dependency waves; `computeParallelWaves` + `scopesOverlap` detect
+  directory-vs-descendant write conflicts; a runtime `withGitLock` serializes
+  promotion merges so concurrent tasks never race `index.lock`.
+- **M14 Model routing & diversity** — `src/routing/ModelRouter.ts`.
+- **M15 Scheduling & backpressure** — `src/sched/Scheduler.ts`.
+- **M16 Budget management** — `src/budget/BudgetManager.ts`.
+- **M17 Security hardening** — `src/security/SecurityPolicy.ts`.
+- **M18 Integration & merge queue** — `src/merge/MergeQueue.ts`.
+- **M19 Repository intelligence** — `src/intel/RepoIntel.ts`.
+- **M20 Verification farm** — `src/verify/farm/*`.
+- **M21 Engineering benchmark** — `src/bench/Benchmark.ts`.
+- **M22 Optional adapter seams & telemetry** — `src/adapters/`, `src/telemetry/`.
+
+**Verification evidence:** `roadmap check` exit **0**, complete:true, release gate
+PASS, **22/22** VERIFIED; **194/194** tests; typecheck + biome clean; e2e clean.
+
+**Fresh-review findings:** `scripts/fresh-review-backlog.ts` found 5 material
+findings in the new modules (dead fallback field, unbounded speculative execution,
+non-weighted fairness, directory-vs-descendant write-scope race, vacuous property
+scaffold). All 5 fixed with regression tests and confirmed RESOLVED by
+`scripts/fresh-review-backlog-fixes.ts` (0 critical, 0 high).
+
+**Commits:** 11, pushed to `origin`.
+
+**Remaining (genuinely external):** B-105 hosted control plane / dashboard and
+B-106 Go control plane require external hosting + separate toolchains; core
+provides the telemetry export seam (M22) they would consume.

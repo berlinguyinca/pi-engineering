@@ -92,3 +92,53 @@ repo's own roadmap does not pass its gate until the process step runs.
 - `npm run lint` (biome) — clean.
 - `npm test` — **116/116 passing** (incl. 45 roadmap tests).
 - `node scripts/pi-engineering.ts roadmap check` — **exit 0**.
+
+## Backlog implementation (M13-M22)
+
+The full backlog discovered during M12 is implemented as verifiable milestones
+and folded into Roadmap 1.0 (now 22 required milestones, all VERIFIED):
+
+- **M13 Parallel Task DAG execution** — `executePlan(plan, { parallel })` runs
+  independent, write-scope-disjoint tasks concurrently in dependency waves
+  (bounded by the scheduler); a runtime `withGitLock` serializes promotion merges
+  into the shared main branch, eliminating the `index.lock` race that previously
+  forced sequential execution. `computeParallelWaves` groups topo order; write
+  scope conflicts (`tasksConflict`/`scopesOverlap`) detect directory-vs-descendant
+  overlap so a wave can never race.
+- **M14 Model routing & diversity** — `ModelRouter` capability+quota routing with
+  separation-of-duties diversity (independent roles prefer a provider other than
+  the implementer's) and graceful single-model degradation.
+- **M15 Scheduling & backpressure** — `Scheduler` weighted-deficit round-robin,
+  backpressure, and concurrency-bounded speculative execution.
+- **M16 Budget management** — `BudgetManager` token-budget escalation + marginal
+  value stopping.
+- **M17 Security hardening** — `SecurityPolicy` secret redaction, tool policy,
+  untrusted-repo prompt-injection guardrails (fail-closed).
+- **M18 Integration & merge queue** — `MergeQueue` serialized candidate→
+  integration→main promotion with rebase + deterministic gate.
+- **M19 Repository intelligence** — `RepoIntel` dependency-free symbol index +
+  optional LSP seam (core never depends on an LSP).
+- **M20 Verification farm** — test-impact analysis, machine-gated adversarial test
+  generation, property scaffolding (with vacuous detection), mutation kill-rate,
+  differential, performance-vs-baseline.
+- **M21 Engineering benchmark** — autonomy/context/throughput metrics vs baseline.
+- **M22 Optional adapter seams & telemetry** — AutoSpec/InferWeave seams empty by
+  default (core standalone) + deterministic telemetry export.
+
+### Fresh-context review of the backlog modules
+
+`scripts/fresh-review-backlog.ts` reviewed M13-M22 in a fresh context and found 5
+material findings: dead `RouteResult.fallback` field; unbounded/untested
+speculative execution; non-weighted fairness; exact-string write-scope conflict
+detection (directory vs descendant race); vacuous property-test scaffold. All 5
+were fixed with regression tests (`scripts/fresh-review-backlog-fixes.ts`
+confirmed each RESOLVED; 0 critical, 0 high).
+
+## Verification
+
+- `npm run typecheck` — clean.
+- `npm run lint` (biome) — clean.
+- `npm test` — **194/194 passing**.
+- `npm run test:e2e` — clean (10 commands, package load).
+- `node scripts/pi-engineering.ts roadmap check` — **exit 0**, `complete: true`,
+  22/22 VERIFIED, release gate **PASS**.
