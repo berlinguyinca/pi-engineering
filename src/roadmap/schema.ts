@@ -83,7 +83,14 @@ export function parseRoadmap(
     const mid = typeof m.id === "string" ? m.id : "";
     if (!mid) issues.push({ path: `${p}.id`, message: "milestone id is required" });
     const name = typeof m.name === "string" ? m.name : "";
+    const requiredExplicit = typeof m.required === "boolean";
     const required = m.required === true;
+    if (!requiredExplicit) {
+      issues.push({
+        path: `${p}.required`,
+        message: `milestone ${mid} must explicitly declare 'required: true|false' (no silent scope-shrink)`,
+      });
+    }
     const deferredReason = typeof m.deferred_reason === "string" ? m.deferred_reason : undefined;
     if (required && deferredReason) {
       issues.push({
@@ -136,6 +143,13 @@ export function parseRoadmap(
         validateType(t, `${p}.verification.requires`);
         requires.push(t as never);
       } else issues.push({ path: `${p}.verification.requires`, message: "requires must be strings" });
+    }
+
+    if (required && (acceptance.length === 0 || requires.length === 0)) {
+      issues.push({
+        path: `${p}`,
+        message: `required milestone ${mid} must declare at least one acceptance criterion and one verification.requires (no evidence = no verification)`,
+      });
     }
 
     milestones.push({

@@ -72,7 +72,7 @@ export interface RunResult {
 }
 
 /** Run a check command in the repo root, returning exit code + truncated output. */
-export async function runCheck(check: Check, cwd: string, timeoutMs = 600_000): Promise<RunResult> {
+export async function runCheck(check: { command: string[] }, cwd: string, timeoutMs = 600_000): Promise<RunResult> {
   const [cmd, ...args] = check.command;
   if (!cmd) return { status: "error", exitCode: -1, stdout: "", stderr: "empty command" };
   try {

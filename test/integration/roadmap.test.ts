@@ -92,7 +92,7 @@ async function seedCompleteEvidence(setup: Setup): Promise<void> {
       status: "pass",
       commit: head,
       generatedAt: new Date().toISOString(),
-      paths: [],
+      paths: ["src/", "test/"],
       proof: "test",
       source: "generated",
     });
@@ -145,7 +145,7 @@ test("roadmap check: missing dogfood evidence -> exit 1 (not complete)", async (
         status: "pass",
         commit: head,
         generatedAt: new Date().toISOString(),
-        paths: [],
+        paths: ["src/", "test/"],
         proof: "test",
         source: "generated",
       });
@@ -222,6 +222,27 @@ test("autonomous stop: engineer() refuses new work when roadmap is complete", as
     // No implementation/candidate was created.
     assert.equal(report.rounds, 0);
     assert.equal(report.incumbent_candidate, null);
+  } finally {
+    await setup.cleanup();
+  }
+});
+
+test("autonomous stop: engineer/tournament/plan all stop when roadmap complete", async () => {
+  const setup = await setupRepo();
+  try {
+    const { EngineeringRuntime } = await import("../../src/runtime/EngineeringRuntime.ts");
+    const { FakeWorkerExecutor } = await import("../../src/workers/FakeWorkerExecutor.ts");
+    const rt = await EngineeringRuntime.open({
+      cwd: setup.root,
+      worker: new FakeWorkerExecutor({}),
+      roadmapComplete: async () => true,
+    });
+    const eng = await rt.engineer("invent");
+    assert.equal(eng.outcome, "stopped");
+    const tour = await rt.tournament("invent", { n: 2 });
+    assert.equal(tour.outcome, "blocked");
+    const plan = await rt.plan("invent");
+    assert.equal(plan.outcome, "blocked");
   } finally {
     await setup.cleanup();
   }

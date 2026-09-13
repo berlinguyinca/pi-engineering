@@ -90,7 +90,7 @@ async function seedGlobals(root: string): Promise<void> {
       status: "pass",
       commit: head,
       generatedAt: new Date().toISOString(),
-      paths: [],
+      paths: ["src/", "test/"],
       proof: "seed",
       source: "generated",
     });

@@ -805,6 +805,20 @@ Return details.winner_candidate_id set to "${a.id}" or "${b.id}" for your pick.`
     const actor = this.actor(newRunId(), "planner");
     const wi = await this.ledger.createWorkItem(goal, risk, [this.cwd], actor);
 
+    if (this.roadmapComplete && (await this.roadmapComplete())) {
+      await this.ledger.updateWorkItem(wi.id, { status: "BLOCKED" }, actor);
+      return {
+        work_item: wi,
+        risk,
+        n_candidates: n,
+        entries: [],
+        incumbent_candidate: null,
+        evidence_ids: [],
+        outcome: "blocked",
+        telemetry: this.telemetry,
+      };
+    }
+
     if (!this.broker) {
       await this.ledger.updateWorkItem(wi.id, { status: "BLOCKED" }, actor);
       return {
@@ -963,6 +977,17 @@ Return details.winner_candidate_id set to "${a.id}" or "${b.id}" for your pick.`
    * executePlan(), which pushes each task through the standard pipeline.
    */
   async plan(goal: string): Promise<PlanReport> {
+    if (this.roadmapComplete && (await this.roadmapComplete())) {
+      const wi = await this.ledger.createWorkItem(goal, "medium", [this.cwd], this.actor(newRunId(), "planner"));
+      await this.ledger.updateWorkItem(wi.id, { status: "BLOCKED" }, this.actor(newRunId(), "planner"));
+      return {
+        plan_work_item: wi,
+        tasks: [],
+        summary: "Blocked: roadmap complete — autonomous stop (no new work invented).",
+        outcome: "blocked",
+        telemetry: this.telemetry,
+      };
+    }
     if (!this.git || !this.broker) {
       const wi = await this.ledger.createWorkItem(goal, "medium", [this.cwd], this.actor(newRunId(), "planner"));
       await this.ledger.updateWorkItem(wi.id, { status: "BLOCKED" }, this.actor(newRunId(), "planner"));

@@ -12,7 +12,7 @@ import { access } from "node:fs/promises";
 import { join } from "node:path";
 import { parse as parseYaml } from "yaml";
 import { GitRepo } from "../git/GitRepo.ts";
-import { GENERATED_TYPES, MANUAL_TYPES, checkFor, requiredTypes, runCheck } from "./checks.ts";
+import { CHECKS, type Check, GENERATED_TYPES, MANUAL_TYPES, requiredTypes, runCheck } from "./checks.ts";
 import { type EvidenceFreshness, type FindingsBudget, evaluateAll, milestoneRequiredTypes } from "./evaluate.ts";
 import { RoadmapEvidenceStore } from "./evidence.ts";
 import { type GateStatusProvider, evaluateReleaseGate } from "./releaseGate.ts";
@@ -36,6 +36,11 @@ export interface RoadmapEngineOptions {
   manualEvidencePath: string;
   /** Optional store override (used in tests to keep memory-only). */
   store?: RoadmapEvidenceStore;
+  /**
+   * Override deterministic check commands (used in tests to exercise the refresh
+   * path without running the real suite). Keyed by EvidenceType.
+   */
+  checksOverride?: Partial<Record<EvidenceType, { command: string[]; paths: string[] }>>;
 }
 
 export const ALL_EVIDENCE_TYPES: EvidenceType[] = [...GENERATED_TYPES, ...MANUAL_TYPES];
@@ -45,6 +50,7 @@ export class RoadmapEngine {
   private readonly roadmapPath: string;
   private readonly manualEvidencePath: string;
   store: RoadmapEvidenceStore;
+  private readonly checks: Record<string, { command: string[]; paths: string[] }>;
   private gitRepo!: GitRepo;
   private roadmap!: RoadmapDef;
   private readonly lastDeterministic = new Map<string, boolean>();
@@ -55,6 +61,7 @@ export class RoadmapEngine {
     this.roadmapPath = opts.roadmapPath;
     this.manualEvidencePath = opts.manualEvidencePath;
     this.store = opts.store ?? RoadmapEvidenceStore.inMemory();
+    this.checks = { ...CHECKS, ...opts.checksOverride };
   }
 
   static async open(opts: RoadmapEngineOptions): Promise<RoadmapEngine> {
@@ -111,6 +118,10 @@ export class RoadmapEngine {
     for (const d of docs) {
       const r = d as Partial<RoadmapEvidence>;
       if (!r.id || !r.type) continue;
+      // Manual evidence may only cover model-dependent types (dogfood,
+      // fresh_review). A hand-written record of a GENERATED type (e.g. unit)
+      // must never satisfy acceptance criteria without a real check run.
+      if (GENERATED_TYPES.includes(r.type as EvidenceType)) continue;
       // Only an explicit "pass" counts as passing; any other value (including
       // "error"/typos) is treated as NOT passing (fail-closed).
       const status = r.status === "pass" ? "pass" : "fail";
@@ -186,7 +197,7 @@ export class RoadmapEngine {
     const types = requiredTypes(this.roadmap.milestones).filter((t) => GENERATED_TYPES.includes(t));
     const commit = await this.gitRepo.headCommit();
     for (const type of types) {
-      const check = checkFor(type);
+      const check = this.checks[type];
       if (!check) continue;
       const res = await runCheck(check, this.repoRoot);
       this.lastDeterministic.set(type, res.status === "pass");
@@ -236,7 +247,12 @@ export class RoadmapEngine {
       deterministic: async (type) => {
         if (this.lastDeterministic.has(type)) return this.lastDeterministic.get(type) === true;
         const g = this.store.get(`__global__:${type}`);
-        return g?.status === "pass";
+        if (g?.status !== "pass") return false;
+        // Apply impact-based freshness to stored global records too, so a
+        // stale pass (from a change outside milestone scopes) cannot keep the
+        // no-refresh status/stop-gate claiming complete.
+        const changed = await this.gitRepo.changedPathsSince(g.commit, g.paths);
+        return changed.length === 0;
       },
       freshReview: async () => {
         const rec = this.manual
