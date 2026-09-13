@@ -123,9 +123,91 @@ test("executePlan blocks downstream tasks when a dependency fails", async () => 
     const t1 = finalTasks.find((t) => t.title === "implement add");
     const t2 = finalTasks.find((t) => t.title === "implement subtract");
     assert.ok(t1 && t2);
-    assert.equal(t1.status, "blocked"); // add failed (verification) -> recorded blocked
+    assert.equal(t1.status, "failed"); // add failed its own pipeline run
     assert.equal(t2.status, "blocked"); // subtract blocked because add failed
     assert.ok(!t2.result_work_item_id, "blocked task must not be linked to a result work item");
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("executePlan is idempotent: re-running does not re-execute completed tasks", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    let implInvocations = 0;
+    const worker = new FakeWorkerExecutor({
+      planner: () => ({
+        status: "completed",
+        summary: "planned",
+        details: {
+          tasks: [
+            {
+              title: "implement add",
+              kind: "implementation",
+              risk: "medium",
+              depends_on: [],
+              scope_paths: ["src/add.js"],
+            },
+          ],
+        },
+      }),
+      scout: () => ({ status: "completed", summary: "scouted", details: {} }),
+      implementer: async (req) => {
+        implInvocations += 1;
+        await writeFile(join(req.cwd, "src", "add.js"), `export function add(a, b) {\n  return a + b;\n}\n`);
+        return { status: "completed", summary: "implemented", details: {} };
+      },
+      reviewer: () => ({ status: "completed", summary: "clean", details: { findings: [] } }),
+    });
+    const rt = await EngineeringRuntime.open({ cwd: fixture.root, worker, verifier: new CommandVerifier() });
+    const plan = await rt.plan("add");
+    const first = await rt.executePlan(plan.plan_work_item.id);
+    assert.equal(first.outcome, "completed");
+    assert.equal(implInvocations, 1);
+    const link = rt.ledger.listTasks(plan.plan_work_item.id)[0]!.result_work_item_id;
+
+    const second = await rt.executePlan(plan.plan_work_item.id);
+    assert.equal(second.outcome, "completed");
+    assert.equal(implInvocations, 1, "completed task must not be re-executed");
+    const after = rt.ledger.listTasks(plan.plan_work_item.id)[0]!;
+    assert.equal(after.result_work_item_id, link, "result link must be preserved on re-run");
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("plan records a diagnostic when the planner returns more than 10 tasks or invalid deps", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const many = Array.from({ length: 12 }, (_, i) => ({
+      title: `task ${i}`,
+      kind: "implementation" as const,
+      risk: "low" as const,
+      depends_on: [999], // invalid index, dropped with a recorded finding
+      scope_paths: [`src/t${i}.js`],
+    }));
+    const worker = new FakeWorkerExecutor({
+      planner: () => ({ status: "completed", summary: "planned", details: { tasks: many } }),
+    });
+    const rt = await EngineeringRuntime.open({ cwd: fixture.root, worker, verifier: new CommandVerifier() });
+    const plan = await rt.plan("big goal");
+    assert.equal(plan.outcome, "planned");
+    assert.equal(plan.tasks.length, 10, "truncated to the 10-task cap");
+    const decisions = rt.ledger.listEntities("decision").filter((d) => d.claim.includes("truncated to 10"));
+    assert.ok(decisions.length >= 1, "truncation must be recorded as a decision, not silently dropped");
+    const findings = rt.ledger.listEntities("finding").filter((f) => f.claim.includes("invalid depends_on"));
+    assert.ok(findings.length >= 1, "invalid depends_on must be recorded as a finding");
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("executePlan throws on an unknown plan id", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const worker = new FakeWorkerExecutor({});
+    const rt = await EngineeringRuntime.open({ cwd: fixture.root, worker, verifier: new CommandVerifier() });
+    await assert.rejects(() => rt.executePlan("WI-does-not-exist"), /Unknown plan work item/);
   } finally {
     await fixture.cleanup();
   }

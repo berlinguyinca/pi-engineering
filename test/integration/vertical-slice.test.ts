@@ -875,6 +875,22 @@ test("tournament never promotes a candidate whose review did not complete (INV-0
     assert.equal(report.incumbent_candidate, null);
     assert.ok(report.entries.every((e) => e.reviewCompleted === false));
     assert.ok(report.entries.every((e) => e.winner === false));
+    // Regression (fresh-review MED): candidates that passed verification but
+    // whose review never completed must be recorded as REJECTED and their
+    // pi-eng-* branches deleted — never left dangling as ELIGIBLE (INV-003/004).
+    const { execFileSync } = await import("node:child_process");
+    for (const c of report.entries) {
+      const cand = rt.ledger.getCandidate(c.candidate.id);
+      assert.ok(cand, "candidate must still be recorded");
+      assert.notEqual(cand.status, "ELIGIBLE", `candidate ${c.candidate.id} must not be left ELIGIBLE`);
+      assert.equal(cand.rejection_reason, "review did not complete");
+    }
+    const branches = execFileSync("git", ["-C", fixture.root, "branch", "--format=%(refname:short)"])
+      .toString()
+      .trim()
+      .split("\n")
+      .filter(Boolean);
+    assert.ok(!branches.some((b) => b.startsWith("pi-eng-")), `no pi-eng-* branches should remain: ${branches}`);
   } finally {
     await fixture.cleanup();
   }

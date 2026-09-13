@@ -182,7 +182,13 @@ export default function (pi: ExtensionAPI) {
         return;
       }
       ctx.ui.notify("Executing task DAG (each task through scout->implement->verify->review)...", "info");
-      const report = await rt.executePlan(planId);
+      let report;
+      try {
+        report = await rt.executePlan(planId);
+      } catch (err) {
+        ctx.ui.notify(err instanceof Error ? err.message : String(err), "error");
+        return;
+      }
       const lines = [
         `Plan ${report.plan_work_item.id} [${report.plan_work_item.status}] outcome=${report.outcome}`,
         report.order.length

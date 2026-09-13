@@ -18,7 +18,7 @@ import type {
 import { ROLE_BUDGETS, isMachineEvidence } from "../core/types.ts";
 import { GitRepo } from "../git/GitRepo.ts";
 import { Ledger } from "../ledger/Ledger.ts";
-import { blockedByFailure, tasksConflict, topoSort } from "../plan/taskDag.ts";
+import { tasksConflict, topoSort } from "../plan/taskDag.ts";
 import { buildCoreTools } from "../tools/coreTools.ts";
 import { CommandVerifier, type VerificationProvider, type VerifyOutcome } from "../verify/Verifier.ts";
 import { PiWorkerExecutor } from "../workers/PiWorkerExecutor.ts";
@@ -81,22 +81,29 @@ function diffBlock(diff: string | null): string {
 /** Deterministic tournament winner-selection strategies. */
 export type TournamentStrategy = "findings" | "changes" | "stable";
 
+/** Locale-independent string compare (deterministic across ICU collations). */
+function idCompare(a: string, b: string): number {
+  if (a < b) return -1;
+  if (a > b) return 1;
+  return 0;
+}
+
 /** Compare two tournament survivors under the chosen deterministic strategy. */
 function selectionCompare(a: TournamentEntry, b: TournamentEntry, strategy: TournamentStrategy): number {
   const fa = a.candidate.changed_files?.length ?? 0;
   const fb = b.candidate.changed_files?.length ?? 0;
   switch (strategy) {
     case "stable":
-      return a.candidate.id.localeCompare(b.candidate.id);
+      return idCompare(a.candidate.id, b.candidate.id);
     case "changes":
       if (fa !== fb) return fa - fb;
       if (a.findings.length !== b.findings.length) return a.findings.length - b.findings.length;
-      return a.candidate.id.localeCompare(b.candidate.id);
+      return idCompare(a.candidate.id, b.candidate.id);
     default:
       // "findings" (default): fewest material findings, then fewest files.
       if (a.findings.length !== b.findings.length) return a.findings.length - b.findings.length;
       if (fa !== fb) return fa - fb;
-      return a.candidate.id.localeCompare(b.candidate.id);
+      return idCompare(a.candidate.id, b.candidate.id);
   }
 }
 
@@ -608,7 +615,7 @@ You must NOT inherit any prior candidate reasoning. Inspect the repository with 
 Candidate A: ${a.id} (changed ${a.changed_files?.length ?? 0} file(s)).
 Candidate B: ${b.id} (changed ${b.changed_files?.length ?? 0} file(s)).
 
-Inspect BOTH candidates' diffs with artifact_read (uri "${a.diff_artifact_uri}" and "${b.diff_artifact_uri}"), then judge which approach is better for correctness, minimality, and maintainability. Do not inherit prior reviewer reasoning.
+Inspect BOTH candidates' diffs with artifact_read (uri "${a.diff_artifact_uri ?? "(no captured diff)"}" and "${b.diff_artifact_uri ?? "(no captured diff)"}"), then judge which approach is better for correctness, minimality, and maintainability. Do not inherit prior reviewer reasoning.
 
 Return details.winner_candidate_id set to "${a.id}" or "${b.id}" for your pick.`;
     const { run } = await this.runWorker("clean-room-challenger", task, {
@@ -708,6 +715,19 @@ Return details.winner_candidate_id set to "${a.id}" or "${b.id}" for your pick.`
     // candidates with a completed independent review are eligible to win.
     const survivors = entries.filter((e) => e.outcome.passed && e.reviewCompleted);
     if (survivors.length === 0) {
+      // No eligible winner. Candidates that passed verification but whose review
+      // never completed are still recorded as rejected and their branches are
+      // cleaned up, so the worktree is never left with dangling ELIGIBLE
+      // candidates or stray pi-eng-* branches (INV-003/004).
+      for (const e of entries.filter((x) => x.outcome.passed && !x.reviewCompleted)) {
+        await this.ledger.rejectCandidate(
+          e.candidate.id,
+          wi.id,
+          `review did not complete`,
+          this.actor(newRunId(), "reviewer"),
+        );
+        await this.git?.deleteBranch(e.candidate.branch).catch(() => {});
+      }
       await this.ledger.updateWorkItem(wi.id, { status: "FAILED" }, actor);
       return {
         work_item: wi,
@@ -853,7 +873,34 @@ Goal: "${goal}"`;
       timeoutMs: 240_000,
     });
     const details = run.result.details as { tasks?: Array<PlannerTaskSpec> };
-    const specs = Array.isArray(details?.tasks) ? details.tasks.filter(isPlannerTaskSpec).slice(0, 10) : [];
+    const raw = Array.isArray(details?.tasks) ? details.tasks.filter(isPlannerTaskSpec) : [];
+    // Never silently drop planner output: record a diagnostic when tasks are
+    // truncated (cap of 10) or carry invalid dependency references.
+    if (raw.length > 10) {
+      await this.ledger.recordEntity(
+        "decision",
+        `plan: planner produced ${raw.length} tasks; truncated to 10 (spec §11 recommends 2-6). Extra tasks dropped.`,
+        "accepted",
+        actor,
+        wi.id,
+      );
+    }
+    for (let i = 0; i < raw.length; i++) {
+      const invalid = (raw[i]!.depends_on ?? []).filter(
+        (d) => !Number.isInteger(d) || d < 0 || d >= raw.length || d === i,
+      );
+      if (invalid.length) {
+        await this.ledger.recordEntity(
+          "finding",
+          `plan task ${i} (${raw[i]!.title}) had invalid depends_on ${JSON.stringify(invalid)}; those edges dropped.`,
+          "open",
+          actor,
+          wi.id,
+          { severity: "low" },
+        );
+      }
+    }
+    const specs = raw.slice(0, 10);
     if (specs.length === 0) {
       await this.ledger.updateWorkItem(wi.id, { status: "FAILED" }, actor);
       return {
@@ -904,14 +951,7 @@ Goal: "${goal}"`;
     const actor = this.actor(newRunId(), "planner");
     const wi = this.ledger.getWorkItem(planWorkItemId);
     if (!wi) {
-      return {
-        plan_work_item: undefined as unknown as WorkItem,
-        tasks: [],
-        order: [],
-        outcome: "blocked",
-        summary: `Unknown plan work item ${planWorkItemId}`,
-        telemetry: this.telemetry,
-      };
+      throw new Error(`Unknown plan work item ${planWorkItemId}; run /plan first.`);
     }
     if (!this.git) {
       await this.ledger.updateWorkItem(wi.id, { status: "BLOCKED" }, actor);
@@ -969,8 +1009,24 @@ Goal: "${goal}"`;
     const blocked: string[] = [];
     const failedSet = new Set<string>();
     const summaries: string[] = [];
+    const seen = new Set<string>();
     for (const t of order) {
-      // A dependency failed (or was blocked): this task cannot run.
+      seen.add(t.id);
+      // Idempotent re-execution: never re-run a task that already finished.
+      if (t.status === "completed") {
+        completed.push(t.id);
+        summaries.push(`${t.id} already completed (skipped)`);
+        continue;
+      }
+      if (t.status === "failed" || t.status === "blocked") {
+        failedSet.add(t.id);
+        (t.status === "failed" ? failed : blocked).push(t.id);
+        summaries.push(`${t.id} previously ${t.status} (skipped)`);
+        continue;
+      }
+      // A dependency failed (or was blocked): this task cannot run. Failures
+      // are discovered dynamically during execution, so we propagate per task;
+      // the static blockedByFailure helper covers the up-front analysis case.
       if (t.depends_on.some((d) => failedSet.has(d))) {
         await this.ledger.setTaskStatus(t.id, "blocked", wi.id, actor);
         failedSet.add(t.id);
@@ -987,7 +1043,8 @@ Goal: "${goal}"`;
         completed.push(t.id);
         summaries.push(`${t.id} completed -> ${report.work_item.id}`);
       } else {
-        await this.ledger.setTaskStatus(t.id, "blocked", wi.id, actor);
+        // The task's own pipeline run failed (not dependency-blocked).
+        await this.ledger.setTaskStatus(t.id, "failed", wi.id, actor);
         failedSet.add(t.id);
         failed.push(t.id);
         summaries.push(`${t.id} failed (${report.outcome})`);

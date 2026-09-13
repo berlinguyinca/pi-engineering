@@ -17,6 +17,7 @@ export type EventType =
   | "task.started"
   | "task.completed"
   | "task.blocked"
+  | "task.updated"
   | "agent.started"
   | "agent.completed"
   | "agent.failed"
@@ -158,7 +159,7 @@ export interface Task {
   title: string;
   kind: TaskKind;
   depends_on: string[];
-  status: "ready" | "started" | "completed" | "blocked" | "proposed";
+  status: "ready" | "started" | "completed" | "failed" | "blocked" | "proposed";
   scope_paths: string[];
   risk: RiskLevel;
   /** Work item produced when this task was executed (via the engineer pipeline). */

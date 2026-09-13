@@ -70,3 +70,41 @@ re-exported from `src/index.js`, covered by passing tests.
   `npm run format`. Safe fixes + formatting normalization applied across the
   codebase; `noExplicitAny`/`noNonNullAssertion` disabled (intentional style).
 - `npm run lint` — clean.
+
+## Fresh-context review + fixes (same batch)
+
+A brand-new reviewer session (no inherited reasoning) inspected the milestone.
+It confirmed the core is correct (topoSort cycle/unknown-dep, content-keyed
+verify cache, tournament strategy + challenger, gate integrity, model-agnostic
++dependency-clean) and found 3 MEDIUM + several LOW issues, all fixed with
+regression tests:
+
+- **(MED) tournament all-reviews-failed leak** — candidates that passed verify
+  but whose review never completed were left `ELIGIBLE` with dangling pi-eng-*
+  branches. Now rejected + branch-deleted before the early return; regression
+  test asserts no `ELIGIBLE` candidate and no leftover branches.
+- **(MED) executePlan re-runs completed tasks** — a second `executePlan(planId)`
+  re-invoked the implementer and orphaned the first result link. Now idempotent
+  (skips completed/blocked/failed tasks, preserves the result link); regression
+  test asserts a single implementer invocation.
+- **(MED) plan() silently dropped output** — invalid `depends_on` and >10-task
+  truncation now record a diagnostic (finding/decision) instead of vanishing;
+  regression test.
+- **(LOW) executePlan(unknown id)** now throws a clear error and the `/execute`
+  handler catches it instead of crashing on `undefined.id`; regression test.
+- **(LOW)** self-failure is now recorded as `failed` (not `blocked`), so it is
+  distinguishable from dependency-blocking in the ledger.
+- **(LOW)** unused `blockedByFailure` import removed from the runtime (dynamic
+  per-task propagation is the correct path; the static helper remains public
+  and unit-tested).
+- **(LOW)** verify cache comment corrected (it caches parse+build, not the file
+  read) and `test:full`/`lint` are now REQUIRED in the full profile so `/verify
+  full` cannot report PASSED while they are red.
+- **(LOW)** `challengeFinalists` no longer embeds `undefined` artifact URIs for
+  no-change candidates.
+- **(LOW)** verifier artifact ids gained a random suffix (no same-millisecond
+  collision); `selectionCompare` tie-break is now locale-independent.
+- **(LOW)** `Ledger.updateTask` emits a real `task.updated` event type instead
+  of misrepresenting field updates as `task.started`.
+
+After fixes: **63/63 tests pass**, `tsc` clean, `npm run lint` clean.

@@ -33,6 +33,12 @@ test("detect full includes lint + test:full stages (milestone)", async () => {
       full.stages.some((s) => s.name === "test:full"),
       "full profile must include test:full",
     );
+    // Regression (fresh-review): the full-only lint and test:full stages must be
+    // REQUIRED so /verify full cannot report PASSED while they are red.
+    const lint = full.stages.find((s) => s.name === "lint");
+    const testFull = full.stages.find((s) => s.name === "test:full");
+    assert.equal(lint?.required, true, "lint must be required in the full profile");
+    assert.equal(testFull?.required, true, "test:full must be required in the full profile");
     assert.equal(full.name, "detected-full");
   } finally {
     await rm(dir, { recursive: true, force: true });

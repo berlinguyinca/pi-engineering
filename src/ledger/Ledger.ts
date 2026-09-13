@@ -120,7 +120,8 @@ export class Ledger {
       }
       case "task.completed":
       case "task.started":
-      case "task.blocked": {
+      case "task.blocked":
+      case "task.updated": {
         const t = this.tasks.get(p.task_id as string);
         if (t) {
           if (typeof p.status === "string") t.status = p.status as Task["status"];
@@ -280,8 +281,8 @@ export class Ledger {
 
   /**
    * Update task fields (e.g. depends_on resolved after ids are generated, or
-   * link an executed task to its result work item). Emitted as a task.started
-   * event so the change is durable and replayed.
+   * link an executed task to its result work item). Emitted as a task.updated
+   * event so the audit log does not misrepresent field updates as task starts.
    */
   async updateTask(
     id: string,
@@ -291,7 +292,7 @@ export class Ledger {
   ): Promise<void> {
     const t = this.tasks.get(id);
     if (!t) return;
-    await this.emit("task.started", workItemId, actor, { task_id: id, ...changes });
+    await this.emit("task.updated", workItemId, actor, { task_id: id, ...changes });
   }
 
   getTask(id: string): Task | undefined {

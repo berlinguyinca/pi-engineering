@@ -119,8 +119,9 @@ function cleanEnv(): NodeJS.ProcessEnv {
 export class CommandVerifier implements VerificationProvider {
   /**
    * Per-repo profile cache, keyed on cwd + package.json CONTENT (not just
-   * cwd), so a profile is re-derived only when its inputs change. Saves a
-   * package.json read + tokenize per verification call in multi-round runs.
+   * cwd), so a profile is re-derived only when its inputs change. The key must
+   * read package.json to detect content changes, but once derived the JSON
+   * parse + profile build (stage/tool selection) are skipped on cache hits.
    */
   private readonly profileCache = new Map<string, VerificationProfile>();
 
@@ -179,8 +180,10 @@ export class CommandVerifier implements VerificationProvider {
     push("build", scripts.build);
     if (full) {
       // Broader suite: lint + an explicit full-test script, when declared.
+      // Both are required so /verify full cannot report PASSED while the
+      // declared full suite or linter is failing.
       push("lint", scripts.lint);
-      push("test:full", scripts["test:full"] ?? scripts["test:all"], false);
+      push("test:full", scripts["test:full"] ?? scripts["test:all"]);
     }
     if (stages.length === 0) {
       stages.push({
@@ -225,7 +228,12 @@ export class CommandVerifier implements VerificationProvider {
       // Unique id so re-runs never overwrite content that prior Evidence records
       // still reference (artifact integrity).
       const artifactUri = (
-        await store.put("verify", `${profile.name}-${stage.name}-${Date.now().toString(36)}`, log, truncate(log, 500))
+        await store.put(
+          "verify",
+          `${profile.name}-${stage.name}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
+          log,
+          truncate(log, 500),
+        )
       ).uri;
 
       const summary: Record<string, unknown> = {
