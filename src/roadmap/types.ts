@@ -144,6 +144,8 @@ export interface RoadmapEvaluation {
   milestones: MilestoneEvaluation[];
   releaseGate: ReleaseGateResult;
   complete: boolean;
+  /** Active waivers (spec §25: visible in status). */
+  waivers: WaiverDef[];
 }
 
 export type RoadmapCheckExitCode = 0 | 1 | 2 | 3;

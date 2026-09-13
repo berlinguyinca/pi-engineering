@@ -132,6 +132,30 @@ test("schema: invalid YAML is an issue", () => {
   assert.ok(issues.some((i) => i.message.includes("YAML parse error")));
 });
 
+test("schema: evidence type 'test' (a union member with no check, not manual) is rejected", () => {
+  // 'test' is in the EvidenceType union but is neither a generated check nor a
+  // manual type, and is not in ALL_EVIDENCE_TYPES; a roadmap requiring it must
+  // fail fast (exit 2), never silently become unsatisfiable (exit 1 forever).
+  const yaml = validYaml().replace("type: unit, id: e1", "type: test, id: e1");
+  const { roadmap, issues } = parseRoadmap(yaml, ALLOWED);
+  assert.equal(roadmap, null);
+  assert.ok(issues.some((i) => i.message.includes("evidence type")));
+});
+
+test("schema: required milestone cannot depend on a non-required milestone", () => {
+  const yaml = validYaml().replace(
+    "milestones:\n  - id: M01",
+    'milestones:\n  - id: M00\n    name: base\n    required: false\n    depends_on: []\n    scope: { paths: ["src/"] }\n    acceptance:\n      - id: M00-A1\n        description: d\n        evidence: { required: [ { type: unit, id: e0 } ] }\n    verification: { requires: [unit] }\n  - id: M01',
+  );
+  const yaml2 = yaml.replace(
+    'depends_on: []\n    scope: { paths: ["src/"] }\n    acceptance:\n      - id: M01-A1',
+    'depends_on: [M00]\n    scope: { paths: ["src/"] }\n    acceptance:\n      - id: M01-A1',
+  );
+  const { roadmap, issues } = parseRoadmap(yaml2, ALLOWED);
+  assert.equal(roadmap, null);
+  assert.ok(issues.some((i) => i.message.includes("cannot depend on non-required")));
+});
+
 test("schema: duplicate waiver ids are rejected", () => {
   const yaml = validYaml().replace(
     "waivers: []",

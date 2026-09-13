@@ -5,7 +5,8 @@
  * Validation is deterministic and model-free.
  */
 import { parse } from "yaml";
-import type { MilestoneDef, RoadmapDef } from "./types.ts";
+import { GENERATED_TYPES, MANUAL_TYPES } from "./checks.ts";
+import type { EvidenceType, MilestoneDef, RoadmapDef } from "./types.ts";
 
 export interface SchemaIssue {
   path: string;
@@ -50,6 +51,16 @@ export function parseRoadmap(
   const validateType = (type: string, path: string): void => {
     if (allowedEvidenceTypes && !allowedEvidenceTypes.has(type)) {
       issues.push({ path, message: `unknown evidence type "${type}"` });
+      return;
+    }
+    // A milestone must not require an evidence type that can never be satisfied:
+    // it must be a generated check OR a manual (model-dependent) type. Otherwise
+    // (e.g. the spec's generic 'test' with no check) it would be exit-1 forever.
+    if (!GENERATED_TYPES.includes(type as EvidenceType) && !MANUAL_TYPES.includes(type as EvidenceType)) {
+      issues.push({
+        path,
+        message: `evidence type "${type}" is neither a generated check nor a manual type; it can never be satisfied`,
+      });
     }
   };
   let doc: unknown;
@@ -170,6 +181,15 @@ export function parseRoadmap(
   for (const m of milestones) {
     for (const dep of m.dependsOn) {
       if (!byId.has(dep)) issues.push({ path: `${m.id}.depends_on`, message: `unknown dependency ${dep}` });
+      // A required milestone must not depend on a deferrable (non-required)
+      // milestone: a DEFERRED dep would count as satisfied for a required
+      // dependent, letting a required milestone verify on an unverified base.
+      else if (m.required && !byId.get(dep)!.required) {
+        issues.push({
+          path: `${m.id}.depends_on`,
+          message: `required milestone ${m.id} cannot depend on non-required (deferrable) milestone ${dep}`,
+        });
+      }
     }
   }
   const visiting = new Set<string>();

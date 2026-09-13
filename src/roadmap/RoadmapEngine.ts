@@ -285,6 +285,7 @@ export class RoadmapEngine {
       milestones: evaluations,
       releaseGate,
       complete,
+      waivers: this.roadmap.waivers,
     };
   }
 

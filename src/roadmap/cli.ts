@@ -31,6 +31,10 @@ function printHuman(result: RoadmapCheckResult, kind: "check" | "status"): strin
     for (const b of m.blockers) lines.push(`      \u2022 ${b}`);
   }
   for (const b of result.detail.releaseGate.blockers) lines.push(`  gate: ${b}`);
+  for (const w of result.detail.waivers)
+    lines.push(
+      `  waiver: ${w.id} -> ${w.milestone}${w.criterion ? `:${w.criterion}` : ""} (${w.reason || "no reason"})`,
+    );
   return lines.join("\n");
 }
 

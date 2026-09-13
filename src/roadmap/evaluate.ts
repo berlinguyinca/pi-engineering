@@ -144,19 +144,18 @@ export async function evaluateMilestone(
   if (missingEvidence.length > 0) blockers.push(`missing evidence: ${missingEvidence.join(", ")}`);
   if (!implementationExists) blockers.push("no implementation detected in scope");
 
-  const hasAnyPassing = records.some((r) => r.status === "pass");
-  // A FAILING record means verification was attempted and failed; the milestone
-  // is BLOCKED, never demoted to IMPLEMENTED (which would lose the fact that
-  // verification ran and failed). Only CURRENT target records count: orphaned
-  // fail records left over from an older target-id scheme (append-only store, no
-  // deletion) must not permanently block a milestone that now passes.
+  // Only CURRENT target records influence state: orphaned records left over from
+  // an older target-id scheme (append-only store, no deletion) must not affect a
+  // milestone that now has fresh evidence for its real targets.
   const validTargetIds = new Set(evidenceTargets(m).map((t) => t.id));
   const validCriterionIds = new Set(m.acceptance.map((c) => c.id));
-  const anyFail = records.some(
-    (r) =>
-      r.status === "fail" &&
-      (validTargetIds.has(r.id) || (r.criterionId !== undefined && validCriterionIds.has(r.criterionId))),
-  );
+  const isCurrent = (r: RoadmapEvidence): boolean =>
+    validTargetIds.has(r.id) || (r.criterionId !== undefined && validCriterionIds.has(r.criterionId));
+  const hasAnyPassing = records.some((r) => r.status === "pass" && isCurrent(r));
+  // A FAILING record means verification was attempted and failed; the milestone
+  // is BLOCKED, never demoted to IMPLEMENTED (which would lose the fact that
+  // verification ran and failed).
+  const anyFail = records.some((r) => r.status === "fail" && isCurrent(r));
   const allPassingFresh = missingEvidence.length === 0 && staleEvidence.length === 0;
   const failBlocker = anyFail ? "verification failed (a required check is failing)" : "";
   const depsOk = !m.dependsOn.some((d) => {

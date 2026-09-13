@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { RoadmapEngine } from "../../src/roadmap/RoadmapEngine.ts";
-import { runRoadmapCheck } from "../../src/roadmap/cli.ts";
+import { runRoadmapCheck, runRoadmapStatus } from "../../src/roadmap/cli.ts";
 import { makeFixtureRepo } from "../fixtures/make-fixture.ts";
 
 const SIMPLE = `roadmap:
@@ -115,6 +115,22 @@ async function seedCompleteEvidence(setup: Setup): Promise<void> {
     `- id: dogfood-1.0\n  milestone: __global__\n  type: dogfood\n  status: pass\n  commit: ${head}\n  generatedAt: ${new Date().toISOString()}\n  paths: ["src/"]\n  proof: "test"\n  summary: "seed"\n- id: review-1.0\n  milestone: __global__\n  type: fresh_review\n  status: pass\n  commit: ${head}\n  generatedAt: ${new Date().toISOString()}\n  paths: ["src/roadmap/"]\n  findings: { critical: 0, high: 0 }\n  proof: "test"\n  summary: "seed"\n`,
   );
 }
+
+test("roadmap status: complete roadmap -> exit 0", async () => {
+  const setup = await setupRepo();
+  try {
+    await seedCompleteEvidence(setup);
+    const { exitCode, text } = await runRoadmapStatus({
+      repoRoot: setup.root,
+      ...setup.paths,
+      json: false,
+      refresh: false,
+    });
+    assert.equal(exitCode, 0, text);
+  } finally {
+    await setup.cleanup();
+  }
+});
 
 test("roadmap check: complete roadmap -> exit 0", async () => {
   const setup = await setupRepo();
