@@ -417,6 +417,140 @@ test("candidate tournament verifies all, selects a deterministic winner, promote
   }
 });
 
+test("tournament winner-selection strategy is configurable (milestone)", async () => {
+  // Candidate A changes 2 files with 0 findings; candidate B changes 1 file
+  // with 1 finding. Under "findings" A wins; under "changes" B wins.
+  const run = async (strategy: "findings" | "changes") => {
+    const fixture = await makeFixtureRepo();
+    let impl = 0;
+    let rev = 0;
+    const worker = new FakeWorkerExecutor({
+      scout: () => ({
+        status: "completed",
+        summary: "s",
+        claims: [],
+        details: {},
+        evidence_refs: [],
+        new_hypotheses: [],
+        proposed_tasks: [],
+      }),
+      implementer: async (req) => {
+        impl++;
+        if (impl === 1) {
+          await writeFile(join(req.cwd, "src", "add.js"), `export function add(a, b) {\n  return a + b;\n}\n`);
+          await writeFile(join(req.cwd, "src", "extra.js"), "export const extra = 1;\n");
+        } else {
+          await writeFile(join(req.cwd, "src", "add.js"), `export function add(a, b) {\n  return a + b + 0;\n}\n`);
+        }
+        return {
+          status: "completed",
+          summary: "i",
+          claims: [],
+          details: {},
+          evidence_refs: [],
+          new_hypotheses: [],
+          proposed_tasks: [],
+        };
+      },
+      reviewer: () => {
+        rev++;
+        const findings = rev === 2 ? [{ severity: "medium", claim: "noise +0", evidence: "diff://src/add.js" }] : [];
+        return {
+          status: "completed",
+          summary: "r",
+          claims: [],
+          details: { findings },
+          evidence_refs: [],
+          new_hypotheses: [],
+          proposed_tasks: [],
+        };
+      },
+    });
+    const rt = await EngineeringRuntime.open({ cwd: fixture.root, worker, verifier: new CommandVerifier() });
+    const report = await rt.tournament("Implement add", { n: 2, strategy });
+    const winner = report.entries.find((e) => e.winner)!.candidate;
+    const filesChanged = winner.changed_files?.length ?? 0;
+    await fixture.cleanup();
+    return filesChanged;
+  };
+  assert.equal(await run("findings"), 2, "findings strategy prefers the 0-finding (2-file) candidate");
+  assert.equal(await run("changes"), 1, "changes strategy prefers the 1-file candidate");
+});
+
+test("clean-room challenger pass can promote the runner-up finalist (milestone)", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    let impl = 0;
+    let rev = 0;
+    const worker = new FakeWorkerExecutor({
+      scout: () => ({
+        status: "completed",
+        summary: "s",
+        claims: [],
+        details: {},
+        evidence_refs: [],
+        new_hypotheses: [],
+        proposed_tasks: [],
+      }),
+      implementer: async (req) => {
+        impl++;
+        if (impl === 1) {
+          // A: 2 files, 0 findings -> leader under "findings" strategy.
+          await writeFile(join(req.cwd, "src", "add.js"), `export function add(a, b) {\n  return a + b;\n}\n`);
+          await writeFile(join(req.cwd, "src", "extra.js"), "export const extra = 1;\n");
+        } else {
+          // B: 1 file, 1 finding -> runner-up.
+          await writeFile(join(req.cwd, "src", "add.js"), `export function add(a, b) {\n  return a + b;\n}\n`);
+        }
+        return {
+          status: "completed",
+          summary: "i",
+          claims: [],
+          details: {},
+          evidence_refs: [],
+          new_hypotheses: [],
+          proposed_tasks: [],
+        };
+      },
+      reviewer: () => {
+        rev++;
+        const findings = rev === 2 ? [{ severity: "medium", claim: "minor noise", evidence: "diff://src/add.js" }] : [];
+        return {
+          status: "completed",
+          summary: "r",
+          claims: [],
+          details: { findings },
+          evidence_refs: [],
+          new_hypotheses: [],
+          proposed_tasks: [],
+        };
+      },
+      "clean-room-challenger": (req) => {
+        // Challenger prefers the runner-up (Candidate B) over the leader.
+        const m = req.task.match(/Candidate B: (CAND-[A-Za-z0-9]+)/);
+        return {
+          status: "completed",
+          summary: "challenger prefers B",
+          claims: [],
+          details: { winner_candidate_id: m ? m[1] : "" },
+          evidence_refs: [],
+          new_hypotheses: [],
+          proposed_tasks: [],
+        };
+      },
+    });
+    const rt = await EngineeringRuntime.open({ cwd: fixture.root, worker, verifier: new CommandVerifier() });
+    // High-risk goal triggers the challenger pass over the top two finalists.
+    const report = await rt.tournament("migrate the API to a new contract", { n: 2, challengeFinalists: true });
+    const winner = report.entries.find((e) => e.winner)!.candidate;
+    // Under "findings", A (2 files, clean) leads; the challenger overrides and
+    // promotes the runner-up B (1 file).
+    assert.equal(winner.changed_files?.length ?? 0, 1, "challenger promotes the runner-up (1-file) candidate");
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
 test("implementer cannot neutralize its own verification gate by editing the worktree package.json (review HIGH #2)", async () => {
   const fixture = await makeFixtureRepo();
   try {

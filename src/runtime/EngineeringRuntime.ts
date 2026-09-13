@@ -78,6 +78,28 @@ function diffBlock(diff: string | null): string {
   return diff ? `Prior diff:\n${diff.slice(0, 4000)}` : "Prior diff: none";
 }
 
+/** Deterministic tournament winner-selection strategies. */
+export type TournamentStrategy = "findings" | "changes" | "stable";
+
+/** Compare two tournament survivors under the chosen deterministic strategy. */
+function selectionCompare(a: TournamentEntry, b: TournamentEntry, strategy: TournamentStrategy): number {
+  const fa = a.candidate.changed_files?.length ?? 0;
+  const fb = b.candidate.changed_files?.length ?? 0;
+  switch (strategy) {
+    case "stable":
+      return a.candidate.id.localeCompare(b.candidate.id);
+    case "changes":
+      if (fa !== fb) return fa - fb;
+      if (a.findings.length !== b.findings.length) return a.findings.length - b.findings.length;
+      return a.candidate.id.localeCompare(b.candidate.id);
+    default:
+      // "findings" (default): fewest material findings, then fewest files.
+      if (a.findings.length !== b.findings.length) return a.findings.length - b.findings.length;
+      if (fa !== fb) return fa - fb;
+      return a.candidate.id.localeCompare(b.candidate.id);
+  }
+}
+
 function materialFindings(ledger: Ledger, candidateId: string | null): string[] {
   return ledger
     .listEntities("finding")
@@ -568,6 +590,40 @@ You must NOT inherit any prior candidate reasoning. Inspect the repository with 
     return { summary: run.result.summary, assessment: details?.assessment ?? run.result.summary };
   }
 
+  /**
+   * Clean-room challenger pass over the top two tournament finalists: an
+   * independent session inspects both candidates' diffs (via artifact_read) and
+   * picks the better approach. Returns the chosen winner candidate id, or null
+   * if the challenger could not complete.
+   */
+  private async challengeFinalists(
+    wi: WorkItem,
+    goal: string,
+    a: Candidate,
+    b: Candidate,
+  ): Promise<{ winnerCandidateId: string; summary: string } | null> {
+    if (!this.broker) return null;
+    const task = `You are a clean-room challenger. Two candidate implementations competed for the goal:
+"${goal}"
+Candidate A: ${a.id} (changed ${a.changed_files?.length ?? 0} file(s)).
+Candidate B: ${b.id} (changed ${b.changed_files?.length ?? 0} file(s)).
+
+Inspect BOTH candidates' diffs with artifact_read (uri "${a.diff_artifact_uri}" and "${b.diff_artifact_uri}"), then judge which approach is better for correctness, minimality, and maintainability. Do not inherit prior reviewer reasoning.
+
+Return details.winner_candidate_id set to "${a.id}" or "${b.id}" for your pick.`;
+    const { run } = await this.runWorker("clean-room-challenger", task, {
+      cwd: this.cwd,
+      tools: READ_ONLY_TOOLS,
+      wi,
+      timeoutMs: 240_000,
+    });
+    if (run.result.status !== "completed") return null;
+    const details = run.result.details as { winner_candidate_id?: string };
+    const pick = details.winner_candidate_id;
+    if (pick !== a.id && pick !== b.id) return null;
+    return { winnerCandidateId: pick, summary: run.result.summary };
+  }
+
   // --------------------------------------------------------------- engineer
 
   /**
@@ -576,8 +632,13 @@ You must NOT inherit any prior candidate reasoning. Inspect the repository with 
    * select and promote a winner. Falls back to a single candidate if N is 1.
    * Deterministic and testable with FakeWorkerExecutor.
    */
-  async tournament(goal: string, opts: { n?: number } = {}): Promise<TournamentReport> {
+  async tournament(
+    goal: string,
+    opts: { n?: number; strategy?: TournamentStrategy; challengeFinalists?: boolean } = {},
+  ): Promise<TournamentReport> {
     const n = Math.max(1, Math.min(opts.n ?? 3, 5));
+    const strategy = opts.strategy ?? "findings";
+    const challengeFinalists = opts.challengeFinalists ?? false;
     const risk = classifyRisk(goal);
     const actor = this.actor(newRunId(), "planner");
     const wi = await this.ledger.createWorkItem(goal, risk, [this.cwd], actor);
@@ -659,14 +720,28 @@ You must NOT inherit any prior candidate reasoning. Inspect the repository with 
         telemetry: this.telemetry,
       };
     }
-    // Score: fewest material findings, then fewest changed files, then stable id.
-    survivors.sort((a, b) => {
-      if (a.findings.length !== b.findings.length) return a.findings.length - b.findings.length;
-      const fa = a.candidate.changed_files?.length ?? 0;
-      const fb = b.candidate.changed_files?.length ?? 0;
-      if (fa !== fb) return fa - fb;
-      return a.candidate.id.localeCompare(b.candidate.id);
-    });
+    // Score per the selected deterministic winner-selection strategy.
+    survivors.sort((a, b) => selectionCompare(a, b, strategy));
+
+    // Optional clean-room challenger pass across the top finalists (spec §12.2,
+    // §19.3). The challenger independently inspects the leading finalists' diffs
+    // and may promote the runner-up if the leader's approach is judged worse.
+    if (challengeFinalists && survivors.length >= 2 && (risk === "high" || risk === "critical")) {
+      const lead = survivors[0]!;
+      const runner = survivors[1]!;
+      const verdict = await this.challengeFinalists(wi, goal, lead.candidate, runner.candidate);
+      if (verdict && verdict.winnerCandidateId === runner.candidate.id) {
+        survivors[0] = runner;
+        survivors[1] = lead;
+        await this.ledger.recordEntity(
+          "decision",
+          `challenger selected ${runner.candidate.id} over ${lead.candidate.id} as tournament winner: ${verdict.summary.slice(0, 200)}`,
+          "accepted",
+          this.actor(newRunId(), "clean-room-challenger"),
+          wi.id,
+        );
+      }
+    }
     // Reject survivors whose review never completed (they lost to the winner or
     // were ineligible), keeping them recorded rather than silently dropped.
     for (const e of entries.filter((x) => !x.winner && x.outcome.passed && !x.reviewCompleted)) {
