@@ -30,7 +30,7 @@ and the gap is called out here.
 
 **Verification evidence (last full run):**
 - `npx tsc --noEmit` — passes.
-- `npm test` — 33/33 passing (unit + integration).
+- `npm test` — 39/39 passing (unit + integration).
 - Standalone install: pi's `ResourceLoader` discovers and loads the package
   extension with zero errors (`scripts/smoke-installed.ts`).
 - Real dogfood (`qwen3.8-27b`): `titleCase()` added to `src/transform.js`,
@@ -40,6 +40,28 @@ and the gap is called out here.
   records. The implementer also repaired a pre-existing broken `typecheck`
   script (a glob that `CommandVerifier` does not shell-expand) by enumerating
   files, so the promoted tree typechecks cleanly.
+
+## Fresh-review findings (addressed)
+
+An independent fresh-context architecture reviewer (`scripts/fresh-review.ts`)
+ran against the implementation and reported 2 HIGH, 5 MEDIUM, and 5 LOW
+findings. All material (HIGH + MEDIUM) findings were fixed with regression tests:
+
+| # | Severity | Finding | Fix | Test |
+| --- | --- | --- | --- | --- |
+| 1 | HIGH | Verification could pass with zero passing evidence (failing non-required fallback stage) | `VerifyOutcome.passed` now requires ≥1 passing stage | `verifier.test.ts` |
+| 2 | HIGH | Gate profile read from the candidate worktree, so the implementer could neutralize its own gate | Profile detected from the main repo; stages still run in the worktree | integration |
+| 3 | MED | Worktrees placed inside the main tree when opened from a subdirectory | Worktree path derived from `repoRoot` (sibling of the tree) | `git.test.ts` |
+| 4 | MED | `ContextBroker.search` swallowed git-grep regex errors as "no matches" | Goal keywords searched as literals; grep errors surfaced | `context.test.ts` |
+| 5 | MED | Per-cwd runtime cache → divergent ledger views over one `.pi-eng` file | Cache keyed by git toplevel | — (extension) |
+| 6 | MED | Unbounded `worker_result`; findings fed untruncated into next prompt | Schema caps + `maxItems`; findings truncated in feedback | `workers.test.ts` |
+| 7 | MED | `ledger_claim` could turn a fabricated `artifact://` URI into a verified fact | Verified only when the artifact reference resolves | `tools.test.ts` |
+
+LOW findings: fixed `ledger_read` evidence scoping and inaccurate merge-failure
+reason; removed an unused import. The remaining LOW items (no automated test for
+the real `PiWorkerExecutor` path — it requires a live model and is covered by the
+manual `scripts/smoke-*.ts`; `requiredFiles` context hook still unused) are
+documented limitations, not correctness defects.
 
 ## Review-completion gate (recent fix)
 
