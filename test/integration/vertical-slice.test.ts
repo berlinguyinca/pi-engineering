@@ -298,6 +298,79 @@ test("candidate tournament verifies all, selects a deterministic winner, promote
   }
 });
 
+test("a review that fails to complete must not silently promote (INV-007)", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    let reviewCalls = 0;
+    const worker = new FakeWorkerExecutor({
+      scout: () => ({ status: "completed", summary: "s", claims: [], details: {}, evidence_refs: [], new_hypotheses: [], proposed_tasks: [] }),
+      implementer: async (req) => {
+        await writeFile(join(req.cwd, "src", "add.js"), `export function add(a, b) {\n  return a + b;\n}\n`);
+        return { status: "completed", summary: "implemented", claims: [], details: {}, evidence_refs: [], new_hypotheses: [], proposed_tasks: [] };
+      },
+      // The reviewer times out / exceeds its budget on EVERY attempt: it returns
+      // a failed status with no findings (as the real executor does on abort).
+      reviewer: () => {
+        reviewCalls++;
+        return {
+          status: "failed",
+          summary: "Worker exceeded the hard context-token budget.",
+          claims: [],
+          details: {},
+          evidence_refs: [],
+          new_hypotheses: [],
+          proposed_tasks: [],
+        };
+      },
+    });
+    const rt = await EngineeringRuntime.open({ cwd: fixture.root, worker, verifier: new CommandVerifier() });
+    const report = await rt.engineer("Implement add(a, b) to return a + b");
+    // No candidate may be promoted without a completed independent review.
+    assert.equal(report.outcome, "failed", "must not promote with an incomplete review");
+    assert.equal(report.incumbent_candidate, null);
+    // The review was retried with fresh sessions but never completed.
+    assert.ok(reviewCalls >= 2, "incomplete reviews should be retried with a fresh session");
+    // A blocking (critical) finding was recorded.
+    const blocking = rt.ledger.listEntities("finding").filter((f) => f.severity === "critical");
+    assert.ok(blocking.length >= 1, "a critical finding should be recorded when review cannot complete");
+    // Main branch untouched.
+    const mainContent = await readFile(join(fixture.root, "src", "add.js"), "utf-8");
+    assert.ok(mainContent.includes("not implemented"));
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("tournament never promotes a candidate whose review did not complete (INV-007)", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const worker = new FakeWorkerExecutor({
+      implementer: async (req) => {
+        await writeFile(join(req.cwd, "src", "add.js"), `export function add(a, b) {\n  return a + b;\n}\n`);
+        return { status: "completed", summary: "i", claims: [], details: {}, evidence_refs: [], new_hypotheses: [], proposed_tasks: [] };
+      },
+      // Every review fails to complete (budget/timeout) on all candidates.
+      reviewer: () => ({
+        status: "failed",
+        summary: "budget",
+        claims: [],
+        details: {},
+        evidence_refs: [],
+        new_hypotheses: [],
+        proposed_tasks: [],
+      }),
+    });
+    const rt = await EngineeringRuntime.open({ cwd: fixture.root, worker, verifier: new CommandVerifier() });
+    const report = await rt.tournament("Implement add(a, b) to return a + b", { n: 2 });
+    assert.equal(report.outcome, "failed", "no winner may be promoted without a completed review");
+    assert.equal(report.incumbent_candidate, null);
+    assert.ok(report.entries.every((e) => e.reviewCompleted === false));
+    assert.ok(report.entries.every((e) => e.winner === false));
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
 function writeFile(p: string, content: string): Promise<void> {
   return import("node:fs/promises").then((fs) => fs.mkdir(p.split("/").slice(0, -1).join("/"), { recursive: true }).then(() => fs.writeFile(p, content)));
 }

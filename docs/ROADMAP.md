@@ -20,7 +20,8 @@ and the gap is called out here.
 | Fresh-context worker sessions, bounded structured results (INV-001) | **Works** | `test/unit/workers.test.ts`; real-model dogfood |
 | Role context-token budget enforcement | **Works** | `PiWorkerExecutor` abort on overflow; budget threading tests |
 | INV-006 machine-evidence gating | **Works** | `isMachineEvidence()` in claims path |
-| Independent review + no-promote-with-open-findings (INV-007) | **Works** | integration: "no final-round bypass" |
+| Independent review + no-promote-with-open-findings (INV-007) | **Works** | integration: "no final-round bypass", "review that fails to complete must not silently promote" |
+| Review-completion gate (incomplete review ≠ clean review) | **Works** | integration: incomplete-review tests (engineer + tournament) |
 | Clean-room challenger for high/critical risk (§12.2) | **Works** | integration: challenger test |
 | Candidate tournaments (independent candidates, deterministic winner) | **Works** | integration: tournament test |
 | Fresh-context review loop (fix rounds carry diff+findings feedback) | **Works** | integration: fix-round test |
@@ -29,13 +30,31 @@ and the gap is called out here.
 
 **Verification evidence (last full run):**
 - `npx tsc --noEmit` — passes.
-- `npm test` — 30/30 passing (unit + integration).
+- `npm test` — 33/33 passing (unit + integration).
 - Standalone install: pi's `ResourceLoader` discovers and loads the package
   extension with zero errors (`scripts/smoke-installed.ts`).
-- Real dogfood (`qwen3.8-flash-next`): `clamp()` implemented, reviewed,
-  promoted, merged into `main`, worktree cleaned, branch deleted — 1 round,
-  ~128s, 3 workers, 43 tool calls, 51.9k input / 8.2k output tokens, max worker
-  context 9.8k tokens (under the 10k scout budget), 10/10 tests pass.
+- Real dogfood (`qwen3.8-27b`): `titleCase()` added to `src/transform.js`,
+  exported from `src/index.js`, tested in `test/transform.test.js`, promoted and
+  merged — 2 rounds, ~438s, 4 workers (1 scout, 2 implementers, 1 reviewer),
+  71 tool calls, 130.6k input / 22.5k output tokens, 4 verify stages, 4 evidence
+  records. The implementer also repaired a pre-existing broken `typecheck`
+  script (a glob that `CommandVerifier` does not shell-expand) by enumerating
+  files, so the promoted tree typechecks cleanly.
+
+## Review-completion gate (recent fix)
+
+The first dogfood run exposed a real INV-007 violation: the independent reviewer
+hit its hard context-token budget (24k) mid-run and returned a **failed** status
+with no findings, and the runtime treated that as a clean review and promoted
+the candidate anyway. A candidate whose review did not complete was being
+promoted as if independently reviewed.
+
+**Fix:** `review()` now reports `completed: boolean`. `engineer()` and
+`tournament()` retry an incomplete review with a *fresh* reviewer session (fresh
+context discards the accumulated tokens that caused the overflow) and, if it
+still fails, record a blocking `critical` finding and **refuse to promote**
+(engineer) or make the candidate **ineligible to win** (tournament). A failed
+review is never treated as a clean review. Covered by two regression tests.
 
 ## What is deliberately NOT built yet
 
@@ -106,6 +125,12 @@ record all of it as evidence.
 - **Real-model smoke scripts are not CI.** `scripts/dogfood.ts`, `smoke-worker.ts`
   etc. hit a live model and are excluded from the deterministic test suite by
   design. They are dev tools only.
+- **Reviewer budget is tight.** The reviewer's 24k hard token budget (spec
+  §10.6) is easy to exceed when the reviewer reads files while reviewing the
+  inlined diff, which is what triggered the fix above. The retry-with-fresh-
+  context path keeps this safe, but a future slice could reduce pressure by
+  passing the diff as an `artifact://` reference (lazy `artifact_read`) instead
+  of inlining it, or by giving the reviewer a smaller slice.
 - **`pi -p` (print mode) hangs in this environment** regardless of the extension;
   confirmed as environmental, not caused by this package.
 

@@ -66,6 +66,8 @@ export interface TournamentEntry {
   candidate: Candidate;
   outcome: VerifyOutcome;
   findings: string[];
+  /** True only when an independent review COMPLETED for this candidate. */
+  reviewCompleted: boolean;
   winner: boolean;
 }
 
@@ -314,7 +316,11 @@ Use repo_search, symbol, ledger_read, and artifact_read. Do not edit files.`;
 
   // ----------------------------------------------------------------- review
 
-  async review(wi: WorkItem, candidate: Candidate, requirement: string): Promise<{ summary: string; findingIds: string[] }> {
+  async review(
+    wi: WorkItem,
+    candidate: Candidate,
+    requirement: string,
+  ): Promise<{ summary: string; findingIds: string[]; completed: boolean }> {
     const diff = candidate.diff ?? "(no captured diff)";
     const task = `Independently review candidate ${candidate.id} for the work item:
 "${wi.goal}"
@@ -333,8 +339,16 @@ Report concrete findings. Return your findings EXACTLY as details.findings, an a
     // Findings come from the explicit details.findings contract; anything else
     // is recorded as a (non-blocking) hypothesis so a malformed review never
     // both invents blocking findings and silently promotes.
+    const completed = run.result.status === "completed";
     const findingIds: string[] = [];
-    const details = run.result.details as { findings?: Array<{ severity?: string; claim?: string; evidence?: string }> };
+    // Only a COMPLETED review contributes findings. A review that timed out or
+    // hit the context budget returns a fallback failed result with empty
+    // details; treating that as a clean review would silently promote a
+    // candidate that was never independently reviewed (INV-007), so we surface
+    // `completed: false` and let the caller gate promotion on it.
+    const details = completed
+      ? (run.result.details as { findings?: Array<{ severity?: string; claim?: string; evidence?: string }> })
+      : {};
     for (const f of details?.findings ?? []) {
       if (!f.claim) continue;
       const entity = await this.ledger.recordEntity(
@@ -348,7 +362,27 @@ Report concrete findings. Return your findings EXACTLY as details.findings, an a
         evidence: isMachineEvidence(c.evidence) ? [c.evidence] : [],
       });
     }
-    return { summary: run.result.summary, findingIds };
+    return { summary: run.result.summary, findingIds, completed };
+  }
+
+  /**
+   * Run an independent review, retrying with a FRESH reviewer session when the
+   * review fails to complete (budget/timeout). Each retry is a brand-new
+   * session, so the accumulated context that caused the earlier overflow is
+   * discarded. Returns the last result (which may still be `completed: false`
+   * if every attempt failed).
+   */
+  private async reviewWithRetry(
+    wi: WorkItem,
+    candidate: Candidate,
+    requirement: string,
+    retries = 2,
+  ): Promise<{ summary: string; findingIds: string[]; completed: boolean }> {
+    let result = await this.review(wi, candidate, requirement);
+    for (let i = 0; i < retries && !result.completed; i++) {
+      result = await this.review(wi, candidate, requirement);
+    }
+    return result;
   }
 
   // -------------------------------------------------------------- challenge
@@ -408,18 +442,32 @@ You must NOT inherit any prior candidate reasoning. Inspect the repository with 
       if (!outcome.passed) {
         await this.ledger.rejectCandidate(candidate.id, wi.id, `verification failed: ${outcome.failedStage}`, this.actor(newRunId(), "reviewer"));
         await this.git?.deleteBranch(candidate.branch).catch(() => {});
-        entries.push({ candidate, outcome, findings: [], winner: false });
+        entries.push({ candidate, outcome, findings: [], reviewCompleted: false, winner: false });
         continue;
       }
 
-      // Independent review of each survivor.
-      await this.review(wi, candidate, goal);
+      // Independent review of each survivor (INV-007). A candidate whose review
+      // failed to complete is recorded as having no completed review and is
+      // ineligible to win, so a review infrastructure failure can never hand the
+      // tournament to an unreviewed candidate.
+      const rev = await this.reviewWithRetry(wi, candidate, goal);
+      if (!rev.completed) {
+        await this.ledger.recordEntity(
+          "finding",
+          `Independent review of ${candidate.id} failed to complete (context budget/timeout) after retries; candidate ineligible to win.`,
+          "open",
+          this.actor(newRunId(), "reviewer"),
+          wi.id,
+          { severity: "critical", candidateId: candidate.id },
+        );
+      }
       const findings = materialFindings(this.ledger, candidate.id);
-      entries.push({ candidate, outcome, findings, winner: false });
+      entries.push({ candidate, outcome, findings, reviewCompleted: rev.completed, winner: false });
     }
 
-    // Phase B: deterministic winner selection among verified survivors.
-    const survivors = entries.filter((e) => e.outcome.passed);
+    // Phase B: deterministic winner selection among verified survivors. Only
+    // candidates with a completed independent review are eligible to win.
+    const survivors = entries.filter((e) => e.outcome.passed && e.reviewCompleted);
     if (survivors.length === 0) {
       await this.ledger.updateWorkItem(wi.id, { status: "FAILED" }, actor);
       return {
@@ -435,6 +483,12 @@ You must NOT inherit any prior candidate reasoning. Inspect the repository with 
       if (fa !== fb) return fa - fb;
       return a.candidate.id.localeCompare(b.candidate.id);
     });
+    // Reject survivors whose review never completed (they lost to the winner or
+    // were ineligible), keeping them recorded rather than silently dropped.
+    for (const e of entries.filter((x) => !x.winner && x.outcome.passed && !x.reviewCompleted)) {
+      await this.ledger.rejectCandidate(e.candidate.id, wi.id, `review did not complete`, this.actor(newRunId(), "reviewer"));
+      await this.git?.deleteBranch(e.candidate.branch).catch(() => {});
+    }
     const winner = survivors[0]!;
     winner.winner = true;
 
@@ -553,12 +607,17 @@ Risk level: ${risk}. Make the smallest coherent change. Use the provided context
         continue;
       }
 
-      // Independent review (separation of duties, INV-007).
-      const rev = await this.review(wi, candidate, goal);
+      // Independent review (separation of duties, INV-007). A candidate must
+      // receive a COMPLETED independent review before it can be promoted; a
+      // review that timed out or hit its budget is retried with a fresh session
+      // and, if it still fails, treated as a blocking failure (never a clean
+      // review).
+      const rev = await this.reviewWithRetry(wi, candidate, goal);
       reviewSummary = rev.summary;
+      const reviewCompleted = rev.completed;
       const findings = materialFindings(this.ledger, candidate.id);
 
-      if (findings.length === 0) {
+      if (reviewCompleted && findings.length === 0) {
         // Controlled, evidence-gated promotion (INV-003, INV-005): merge the
         // verified candidate into the incumbent branch, then record it.
         const merge = this.git ? await this.git.mergeBranch(candidate.branch) : { merged: true, conflict: false };
@@ -575,16 +634,34 @@ Risk level: ${risk}. Make the smallest coherent change. Use the provided context
         parentId = candidate.id;
         continue;
       }
-      // Material findings remain: reject this candidate (it did not pass review)
-      // and start a fix round; if rounds are exhausted, fail the work item.
-      // Never promote with open material findings.
+      // Never promote with open material findings OR when the independent
+      // review could not complete: reject this candidate and start a fix round;
+      // if rounds are exhausted, fail the work item.
       await this.git?.deleteBranch(candidate.branch).catch(() => {});
-      const rejectReason =
-        round === maxRounds - 1
+      const reviewBlocked = !reviewCompleted;
+      if (reviewBlocked) {
+        // Record a blocking finding so the failure is visible in the ledger and
+        // materialFindings reflects it for any downstream caller.
+        await this.ledger.recordEntity(
+          "finding",
+          `Independent review of ${candidate.id} failed to complete (context budget/timeout) after retries; candidate not eligible for promotion.`,
+          "open",
+          this.actor(newRunId(), "reviewer"),
+          wi.id,
+          { severity: "critical", candidateId: candidate.id },
+        );
+      }
+      const rejectReason = reviewBlocked
+        ? round === maxRounds - 1
+          ? `independent review could not complete after ${maxRounds} rounds`
+          : `independent review did not complete; retrying with a fresh reviewer`
+        : round === maxRounds - 1
           ? `material findings unresolved after ${maxRounds} rounds`
           : `material findings: ${findings.slice(0, 3).join("; ")}`;
       await this.ledger.rejectCandidate(candidate.id, wi.id, rejectReason, this.actor(newRunId(), "reviewer"));
-      feedback = `${diffBlock(candidate.diff)}\nReviewer findings to fix:\n${findings.join("\n")}`;
+      feedback = reviewBlocked
+        ? `${diffBlock(candidate.diff)}\nIndependent review could not complete (context budget/timeout). The next candidate must be independently reviewed before promotion.`
+        : `${diffBlock(candidate.diff)}\nReviewer findings to fix:\n${findings.join("\n")}`;
       if (round === maxRounds - 1) break;
       parentId = candidate.id;
     }
