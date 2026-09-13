@@ -25,6 +25,33 @@ test("context broker assembles a bounded package from a repo", async () => {
   }
 });
 
+test("rankFiles ranks goal-relevant files first (milestone)", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const broker = (await ContextBroker.open(fixture.root))!;
+    const ranked = await broker.rankFiles(["add"], 10);
+    assert.ok(ranked.includes("src/add.js"), "src/add.js should rank as relevant to 'add'");
+    assert.ok(ranked.includes("test/add.test.js"), "test/add.test.js should rank as relevant to 'add'");
+    assert.equal(ranked[0], "src/add.js", "path match should rank first");
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("assembleContext includes content of relevant files, not only symbol one-liners (milestone)", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const broker = (await ContextBroker.open(fixture.root))!;
+    const pkg = await broker.assembleContext("implement add function", 4000, []);
+    // The relevant src/add.js should appear as a file item with real content.
+    const addFile = pkg.items.find((i) => i.kind === "file" && i.path === "src/add.js");
+    assert.ok(addFile, "relevant file content should be included as a file item");
+    assert.ok((addFile!.summary as string).includes("export function add"), "file item should carry content, not just a symbol line");
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
 test("search treats goal keywords as literals, not regex (review MED #4)", async () => {
   const fixture = await makeFixtureRepo();
   try {

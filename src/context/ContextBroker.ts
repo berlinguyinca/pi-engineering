@@ -137,6 +137,45 @@ export class ContextBroker {
     return [...testFiles];
   }
 
+  /**
+   * Rank repository files by relevance to the goal keywords: path substring
+   * matches (cheap, no content read) plus symbol-hit counts from git grep.
+   * Returns the top `limit` file paths, most-relevant first. This lets the
+   * context assembler pull in the *content* of the most relevant files up front
+   * (instead of only one-line symbol hits), so a worker does fewer tool
+   * round-trips to locate what it needs.
+   */
+  async rankFiles(keywords: string[], limit = 10): Promise<string[]> {
+    const paths = await this.repoMap(500);
+    const score = new Map<string, number>();
+    for (const p of paths) {
+      const lower = p.toLowerCase();
+      for (const kw of keywords) {
+        if (lower.includes(kw.toLowerCase())) score.set(p, (score.get(p) ?? 0) + 3);
+      }
+    }
+    // Symbol hits: a file containing several DISTINCT goal keywords is more
+    // relevant than one with many incidental matches of a single keyword
+    // (raw line frequency would over-weight a test file that repeats a symbol).
+    const lowerKw = keywords.map((k) => k.toLowerCase());
+    const hits = await this.search(keywords.join("|"), 200);
+    const byPath = new Map<string, Set<string>>();
+    for (const h of hits) {
+      const text = h.text.toLowerCase();
+      const matched = lowerKw.filter((kw) => text.includes(kw));
+      if (matched.length === 0) continue;
+      if (!byPath.has(h.path)) byPath.set(h.path, new Set());
+      for (const kw of matched) byPath.get(h.path)!.add(kw);
+    }
+    for (const [path, matchedKws] of byPath) {
+      score.set(path, (score.get(path) ?? 0) + Math.min(matchedKws.size, 5));
+    }
+    return [...score.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, limit)
+      .map(([p]) => p);
+  }
+
   /** Assemble a bounded context package for a task, filling the token budget in priority order. */
   async assembleContext(goal: string, targetTokens: number, required: string[]): Promise<ContextPackage> {
     const items: ContextItem[] = [];
@@ -164,10 +203,29 @@ export class ContextBroker {
       }
     }
 
-    // Symbol hits from the goal keywords.
     const keywords = goal.split(/\s+/).filter((w) => w.length >= 3).slice(0, 6);
-    const hits = await this.search(keywords.join("|"), 20);
     const seen = new Set(items.map((i) => i.id));
+
+    // Relevance-ranked file content: include the most relevant files' content
+    // slices (bounded by the token budget) so a worker has the actual code it
+    // needs up front, rather than re-fetching it with extra tool round-trips.
+    for (const rel of await this.rankFiles(keywords, 8)) {
+      if (seen.has(`file:${rel}`)) continue;
+      seen.add(`file:${rel}`);
+      const text = await this.readSlice(rel, 0, 60);
+      if (text === null) continue;
+      push({
+        id: `file:${rel}`,
+        kind: "file",
+        path: rel,
+        summary: text,
+        estimatedTokens: estimateTokens(text),
+        required: false,
+      });
+    }
+
+    // Symbol one-liners from the goal keywords (fill remaining budget).
+    const hits = await this.search(keywords.join("|"), 20);
     for (const hit of hits) {
       if (seen.has(`symbol:${hit.path}`)) continue;
       seen.add(`symbol:${hit.path}`);

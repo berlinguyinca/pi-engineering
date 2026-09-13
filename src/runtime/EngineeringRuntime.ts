@@ -238,11 +238,12 @@ export class EngineeringRuntime {
 
   // ------------------------------------------------------------------- scout
 
-  async scout(wi: WorkItem, goal: string, contextText: string): Promise<{ summary: string; artifactUri: string } | null> {
+  async scout(wi: WorkItem, goal: string, contextText: string): Promise<{ summary: string; artifactUri: string; relevantFiles: string[] } | null> {
     if (!this.broker) return null;
     const task = `Investigate this repository and recommend the smallest relevant change surface for the goal:
 "${goal}"
 Report: relevant symbols/files, architecture constraints, testing implications, and any risks.
+Also return the concrete files you think the implementer must touch as an array in details.relevant_files (paths relative to the repo root).
 Use repo_search, symbol, ledger_read, and artifact_read. Do not edit files.`;
     const { run, artifactUri } = await this.runWorker("scout", task, {
       cwd: this.cwd,
@@ -251,7 +252,11 @@ Use repo_search, symbol, ledger_read, and artifact_read. Do not edit files.`;
       wi,
       timeoutMs: 240_000,
     });
-    return { summary: run.result.summary, artifactUri };
+    const details = run.result.details as { relevant_files?: unknown };
+    const relevantFiles = Array.isArray(details?.relevant_files)
+      ? details.relevant_files.filter((f): f is string => typeof f === "string").slice(0, 10)
+      : [];
+    return { summary: run.result.summary, artifactUri, relevantFiles };
   }
 
   // ------------------------------------------------------------ implement
@@ -608,6 +613,15 @@ You must NOT inherit any prior candidate reasoning. Inspect the repository with 
     if (risk !== "low") {
       const scout = await this.scout(wi, goal, contextText);
       scoutSummary = scout?.summary ?? null;
+      // The scout identified a concrete change surface: re-assemble the
+      // implementer's context with those files as REQUIRED (content slices
+      // included), so the implementer starts with the right files instead of
+      // re-exploring the repo and burning tool round-trips.
+      const scoutFiles = scout?.relevantFiles ?? [];
+      if (scoutFiles.length && this.broker) {
+        const pkg = await this.broker.assembleContext(goal, ROLE_BUDGETS.implementer.targetTokens, scoutFiles);
+        contextText = this.broker.renderContext(pkg);
+      }
     }
 
     // Clean-room challenge (spec §12.2): mandatory for high-risk work, to escape

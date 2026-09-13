@@ -429,6 +429,38 @@ test("ensureDiffArtifact reuses a fresh artifact but rewrites a stale one (miles
   }
 });
 
+test("scout-identified files become required context for the implementer (milestone)", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const ctx = { scout: "", impl: "" };
+    const worker = new FakeWorkerExecutor({
+      scout: (req) => {
+        ctx.scout = req.context ?? "";
+        return {
+          status: "completed", summary: "s", claims: [],
+          details: { relevant_files: ["src/add.js"] },
+          evidence_refs: [], new_hypotheses: [], proposed_tasks: [],
+        };
+      },
+      implementer: async (req) => {
+        ctx.impl = req.context ?? "";
+        await writeFile(join(req.cwd, "src", "add.js"), `export function add(a, b) {\n  return a + b;\n}\n`);
+        return { status: "completed", summary: "i", claims: [], details: {}, evidence_refs: [], new_hypotheses: [], proposed_tasks: [] };
+      },
+      reviewer: () => ({ status: "completed", summary: "r", claims: [], details: { findings: [] }, evidence_refs: [], new_hypotheses: [], proposed_tasks: [] }),
+    });
+    const rt = await EngineeringRuntime.open({ cwd: fixture.root, worker, verifier: new CommandVerifier() });
+    const report = await rt.engineer("Implement add(a, b) to return a + b");
+    assert.equal(report.outcome, "promoted");
+    // The implementer's context was re-assembled with the scout's file as a
+    // REQUIRED item, so it carries that file's content.
+    assert.ok(ctx.impl.includes("not implemented"), "implementer context should include the scout-identified file's content");
+    assert.ok(ctx.impl !== ctx.scout, "implementer context should be re-assembled after the scout");
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
 test("a review that fails to complete must not silently promote (INV-007)", async () => {
   const fixture = await makeFixtureRepo();
   try {
