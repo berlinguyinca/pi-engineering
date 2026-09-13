@@ -36,7 +36,7 @@ and the gap is called out here.
 
 **Verification evidence (last full run):**
 - `npx tsc --noEmit` — passes.
-- `npm test` — 60/60 passing (unit + integration).
+- `npm test` — 63/63 passing (unit + integration).
 - `npm run lint` (biome check) — clean.
 - Standalone install: pi's `ResourceLoader` discovers and loads the package
   extension with zero errors (`scripts/smoke-installed.ts`).
@@ -195,7 +195,7 @@ Dogfood (real model, fresh fixture): a goal decomposed into **3 correctly-ordere
 tasks**, all executed through the pipeline, plan **COMPLETED**, **0 blocked/failed
 workers**, 5/5 fixture tests pass, 99 tool calls / 191.7k input tokens. Machine
 evidence: `test/unit/taskdag.test.ts` (5) + `test/integration/dag.test.ts` (2),
-60/60 tests pass, `tsc` clean.
+63/63 tests pass, `tsc` clean.
 
 ## Verify profile caching (implemented)
 

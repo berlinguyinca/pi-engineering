@@ -21,7 +21,7 @@ each task through the standard pipeline (spec §11, §19).
 ## Machine evidence
 
 - `npm run typecheck` — passes.
-- `npm test` — **60/60 passing**.
+- `npm test` — **63/63 passing** (after the fresh-review fixes).
 - New tests:
   - `test/unit/taskdag.test.ts`: topoSort ordering, cycle detection, unknown-dep
     detection, write-scope conflict detection, transitive block propagation (5).
