@@ -1,7 +1,7 @@
-import { test } from "node:test";
 import assert from "node:assert/strict";
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { test } from "node:test";
 import { GitRepo } from "../../src/git/GitRepo.ts";
 import { makeFixtureRepo } from "../fixtures/make-fixture.ts";
 
@@ -61,7 +61,7 @@ test("worktrees are created OUTSIDE the repo tree, even when opened from a subdi
       // The worktree must be a sibling of the repo root, NOT inside it (it must
       // not appear as an untracked directory in the main working tree).
       assert.ok(
-        !wt.path.startsWith(fixture.root + "/"),
+        !wt.path.startsWith(`${fixture.root}/`),
         `worktree ${wt.path} must not live inside the repo root ${fixture.root}`,
       );
     } finally {

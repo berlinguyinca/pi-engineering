@@ -1,15 +1,15 @@
-import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { promisify } from "node:util";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
+import { test } from "node:test";
+import { promisify } from "node:util";
 import { EngineeringRuntime } from "../../src/runtime/EngineeringRuntime.ts";
 
 const execFileAsync = promisify(execFile);
-import { FakeWorkerExecutor } from "../../src/workers/FakeWorkerExecutor.ts";
-import { CommandVerifier } from "../../src/verify/Verifier.ts";
 import { buildCoreTools } from "../../src/tools/coreTools.ts";
+import { CommandVerifier } from "../../src/verify/Verifier.ts";
+import { FakeWorkerExecutor } from "../../src/workers/FakeWorkerExecutor.ts";
 import { makeFixtureRepo } from "../fixtures/make-fixture.ts";
 
 /**
@@ -36,7 +36,15 @@ test("vertical slice: scout -> implement -> verify -> review -> promote", async 
       implementer: async (req) => {
         // The implementer genuinely edits the isolated worktree.
         await writeFile(join(req.cwd, "src", "add.js"), `export function add(a, b) {\n  return a + b;\n}\n`);
-        return { status: "completed", summary: "Implemented add.", claims: [], details: {}, evidence_refs: [], new_hypotheses: [], proposed_tasks: [] };
+        return {
+          status: "completed",
+          summary: "Implemented add.",
+          claims: [],
+          details: {},
+          evidence_refs: [],
+          new_hypotheses: [],
+          proposed_tasks: [],
+        };
       },
       reviewer: () => ({
         status: "completed",
@@ -95,17 +103,39 @@ test("vertical slice: material review findings trigger a fix round (risk-proport
   try {
     let reviewCalls = 0;
     const worker = new FakeWorkerExecutor({
-      scout: () => ({ status: "completed", summary: "s", claims: [], details: {}, evidence_refs: [], new_hypotheses: [], proposed_tasks: [] }),
+      scout: () => ({
+        status: "completed",
+        summary: "s",
+        claims: [],
+        details: {},
+        evidence_refs: [],
+        new_hypotheses: [],
+        proposed_tasks: [],
+      }),
       implementer: async (req) => {
         await writeFile(join(req.cwd, "src", "add.js"), `export function add(a, b) {\n  return a + b;\n}\n`);
-        return { status: "completed", summary: "implemented", claims: [], details: {}, evidence_refs: [], new_hypotheses: [], proposed_tasks: [] };
+        return {
+          status: "completed",
+          summary: "implemented",
+          claims: [],
+          details: {},
+          evidence_refs: [],
+          new_hypotheses: [],
+          proposed_tasks: [],
+        };
       },
       reviewer: () => {
         reviewCalls++;
         // First review finds a material issue; the fix round's review is clean.
         const findings =
           reviewCalls === 1
-            ? [{ severity: "high", claim: "Missing edge-case handling for negative inputs", evidence: "diff://src/add.js" }]
+            ? [
+                {
+                  severity: "high",
+                  claim: "Missing edge-case handling for negative inputs",
+                  evidence: "diff://src/add.js",
+                },
+              ]
             : [];
         return {
           status: "completed",
@@ -138,12 +168,36 @@ test("worker requests carry the role's hard context-token budget (spec §10.6)",
     const seen: string[] = [];
     const worker = new FakeWorkerExecutor(
       {
-        scout: () => ({ status: "completed", summary: "s", claims: [], details: {}, evidence_refs: [], new_hypotheses: [], proposed_tasks: [] }),
+        scout: () => ({
+          status: "completed",
+          summary: "s",
+          claims: [],
+          details: {},
+          evidence_refs: [],
+          new_hypotheses: [],
+          proposed_tasks: [],
+        }),
         implementer: async (req) => {
           await writeFile(join(req.cwd, "src", "add.js"), `export function add(a, b) {\n  return a + b;\n}\n`);
-          return { status: "completed", summary: "i", claims: [], details: {}, evidence_refs: [], new_hypotheses: [], proposed_tasks: [] };
+          return {
+            status: "completed",
+            summary: "i",
+            claims: [],
+            details: {},
+            evidence_refs: [],
+            new_hypotheses: [],
+            proposed_tasks: [],
+          };
         },
-        reviewer: () => ({ status: "completed", summary: "r", claims: [], details: { findings: [] }, evidence_refs: [], new_hypotheses: [], proposed_tasks: [] }),
+        reviewer: () => ({
+          status: "completed",
+          summary: "r",
+          claims: [],
+          details: { findings: [] },
+          evidence_refs: [],
+          new_hypotheses: [],
+          proposed_tasks: [],
+        }),
       },
       undefined,
     );
@@ -158,7 +212,7 @@ test("worker requests carry the role's hard context-token budget (spec §10.6)",
     } as never;
     const rt = await EngineeringRuntime.open({ cwd: fixture.root, worker: wrapped, verifier: new CommandVerifier() });
     await rt.engineer("Implement add(a, b) to return a + b");
-        assert.equal(captured.get("scout"), 24000);
+    assert.equal(captured.get("scout"), 24000);
     assert.equal(captured.get("implementer"), 40000);
     assert.equal(captured.get("reviewer"), 24000);
   } finally {
@@ -185,9 +239,25 @@ test("high-risk work runs a mandatory clean-room challenger (spec §12.2)", asyn
       },
       implementer: async (req) => {
         await writeFile(join(req.cwd, "src", "add.js"), `export function add(a, b) {\n  return a + b;\n}\n`);
-        return { status: "completed", summary: "implemented", claims: [], details: {}, evidence_refs: [], new_hypotheses: [], proposed_tasks: [] };
+        return {
+          status: "completed",
+          summary: "implemented",
+          claims: [],
+          details: {},
+          evidence_refs: [],
+          new_hypotheses: [],
+          proposed_tasks: [],
+        };
       },
-      reviewer: () => ({ status: "completed", summary: "clean", claims: [], details: { findings: [] }, evidence_refs: [], new_hypotheses: [], proposed_tasks: [] }),
+      reviewer: () => ({
+        status: "completed",
+        summary: "clean",
+        claims: [],
+        details: { findings: [] },
+        evidence_refs: [],
+        new_hypotheses: [],
+        proposed_tasks: [],
+      }),
     });
     const rt = await EngineeringRuntime.open({ cwd: fixture.root, worker, verifier: new CommandVerifier() });
     // "security" classifies the goal as high-risk.
@@ -196,7 +266,10 @@ test("high-risk work runs a mandatory clean-room challenger (spec §12.2)", asyn
     assert.equal(challenged, true, "high-risk work must run a clean-room challenger");
     assert.ok(report.challenge_summary?.includes("Independent approach"));
     const decisions = rt.ledger.listEntities("decision");
-    assert.ok(decisions.some((d) => d.claim.includes("clean-room challenge")), "challenge assessment should be recorded as a decision");
+    assert.ok(
+      decisions.some((d) => d.claim.includes("clean-room challenge")),
+      "challenge assessment should be recorded as a decision",
+    );
   } finally {
     await fixture.cleanup();
   }
@@ -206,10 +279,26 @@ test("persistent material findings fail the work item (no final-round bypass)", 
   const fixture = await makeFixtureRepo();
   try {
     const worker = new FakeWorkerExecutor({
-      scout: () => ({ status: "completed", summary: "s", claims: [], details: {}, evidence_refs: [], new_hypotheses: [], proposed_tasks: [] }),
+      scout: () => ({
+        status: "completed",
+        summary: "s",
+        claims: [],
+        details: {},
+        evidence_refs: [],
+        new_hypotheses: [],
+        proposed_tasks: [],
+      }),
       implementer: async (req) => {
         await writeFile(join(req.cwd, "src", "add.js"), `export function add(a, b) {\n  return a + b;\n}\n`);
-        return { status: "completed", summary: "implemented", claims: [], details: {}, evidence_refs: [], new_hypotheses: [], proposed_tasks: [] };
+        return {
+          status: "completed",
+          summary: "implemented",
+          claims: [],
+          details: {},
+          evidence_refs: [],
+          new_hypotheses: [],
+          proposed_tasks: [],
+        };
       },
       reviewer: () => ({
         status: "completed",
@@ -266,7 +355,15 @@ test("candidate tournament verifies all, selects a deterministic winner, promote
     let impl = 0;
     let rev = 0;
     const worker = new FakeWorkerExecutor({
-      scout: () => ({ status: "completed", summary: "s", claims: [], details: {}, evidence_refs: [], new_hypotheses: [], proposed_tasks: [] }),
+      scout: () => ({
+        status: "completed",
+        summary: "s",
+        claims: [],
+        details: {},
+        evidence_refs: [],
+        new_hypotheses: [],
+        proposed_tasks: [],
+      }),
       implementer: async (req) => {
         impl++;
         if (impl === 1) {
@@ -276,13 +373,30 @@ test("candidate tournament verifies all, selects a deterministic winner, promote
         } else {
           await writeFile(join(req.cwd, "src", "add.js"), `export function add(a, b) {\n  return a + b + 0;\n}\n`); // correct but sloppier
         }
-        return { status: "completed", summary: "i", claims: [], details: {}, evidence_refs: [], new_hypotheses: [], proposed_tasks: [] };
+        return {
+          status: "completed",
+          summary: "i",
+          claims: [],
+          details: {},
+          evidence_refs: [],
+          new_hypotheses: [],
+          proposed_tasks: [],
+        };
       },
       reviewer: () => {
         rev++;
         // Only the third (sloppier) candidate gets a material finding.
-        const findings = rev === 2 ? [{ severity: "high", claim: "unnecessary +0 noise", evidence: "diff://src/add.js" }] : [];
-        return { status: "completed", summary: "r", claims: [], details: { findings }, evidence_refs: [], new_hypotheses: [], proposed_tasks: [] };
+        const findings =
+          rev === 2 ? [{ severity: "high", claim: "unnecessary +0 noise", evidence: "diff://src/add.js" }] : [];
+        return {
+          status: "completed",
+          summary: "r",
+          claims: [],
+          details: { findings },
+          evidence_refs: [],
+          new_hypotheses: [],
+          proposed_tasks: [],
+        };
       },
     });
     const rt = await EngineeringRuntime.open({ cwd: fixture.root, worker, verifier: new CommandVerifier() });
@@ -311,11 +425,42 @@ test("implementer cannot neutralize its own verification gate by editing the wor
         // The implementer writes a BROKEN add() AND rewrites the worktree's
         // test script to always pass, trying to neutralize the gate.
         await writeFile(join(req.cwd, "src", "add.js"), `export function add(a, b) {\n  return a - b;\n}\n`);
-        await writeFile(join(req.cwd, "package.json"), JSON.stringify({ name: "f", version: "0.0.1", type: "module", scripts: { test: "node -e process.exit(0)" } }, null, 2));
-        return { status: "completed", summary: "implemented", claims: [], details: {}, evidence_refs: [], new_hypotheses: [], proposed_tasks: [] };
+        await writeFile(
+          join(req.cwd, "package.json"),
+          JSON.stringify(
+            { name: "f", version: "0.0.1", type: "module", scripts: { test: "node -e process.exit(0)" } },
+            null,
+            2,
+          ),
+        );
+        return {
+          status: "completed",
+          summary: "implemented",
+          claims: [],
+          details: {},
+          evidence_refs: [],
+          new_hypotheses: [],
+          proposed_tasks: [],
+        };
       },
-      reviewer: () => ({ status: "completed", summary: "clean", claims: [], details: { findings: [] }, evidence_refs: [], new_hypotheses: [], proposed_tasks: [] }),
-      scout: () => ({ status: "completed", summary: "s", claims: [], details: {}, evidence_refs: [], new_hypotheses: [], proposed_tasks: [] }),
+      reviewer: () => ({
+        status: "completed",
+        summary: "clean",
+        claims: [],
+        details: { findings: [] },
+        evidence_refs: [],
+        new_hypotheses: [],
+        proposed_tasks: [],
+      }),
+      scout: () => ({
+        status: "completed",
+        summary: "s",
+        claims: [],
+        details: {},
+        evidence_refs: [],
+        new_hypotheses: [],
+        proposed_tasks: [],
+      }),
     });
     const rt = await EngineeringRuntime.open({ cwd: fixture.root, worker, verifier: new CommandVerifier() });
     const report = await rt.engineer("Implement add(a, b) to return a + b");
@@ -357,11 +502,13 @@ test("review keeps the full diff out of context behind a lazy artifact reference
     } as never;
     const rt = await EngineeringRuntime.open({ cwd: fixture.root, worker: wrapped });
     const wi = await rt.ledger.createWorkItem("review target", "medium", [fixture.root], { type: "system" });
-    const cand = await rt.ledger.createCandidate(wi.id, "abc", "b", null, "implementer", "run", null, { type: "system" });
+    const cand = await rt.ledger.createCandidate(wi.id, "abc", "b", null, "implementer", "run", null, {
+      type: "system",
+    });
     // ~15k chars: beyond the 2000-char preview AND beyond artifact_read's
     // default 12,000-char slice, with a UNIQUE marker at the very end so we can
     // prove the full body is not inlined into the prompt.
-    const bigDiff = "export const a = 1;\n".repeat(750) + "// UNIQUE_END_MARKER_9f3x\n";
+    const bigDiff = `${"export const a = 1;\n".repeat(750)}// UNIQUE_END_MARKER_9f3x\n`;
     assert.ok(bigDiff.length > 12_000, `test diff should exceed the 12k slice cap, was ${bigDiff.length}`);
     await rt.ledger.changeCandidate(cand.id, { diff: bigDiff, changed_files: ["src/a.js"] }, wi.id, { type: "system" });
 
@@ -369,7 +516,10 @@ test("review keeps the full diff out of context behind a lazy artifact reference
 
     const task = capturedTasks[0] ?? "";
     assert.ok(!task.includes("UNIQUE_END_MARKER_9f3x"), "the full diff must NOT be inlined into the reviewer prompt");
-    assert.ok(task.length < bigDiff.length, `reviewer prompt (${task.length}) should be smaller than the diff (${bigDiff.length})`);
+    assert.ok(
+      task.length < bigDiff.length,
+      `reviewer prompt (${task.length}) should be smaller than the diff (${bigDiff.length})`,
+    );
     assert.ok(task.includes("artifact_read"), "reviewer must be instructed to read the diff artifact");
     assert.match(task, /artifact:\/\/candidate\//);
 
@@ -395,7 +545,9 @@ test("review keeps the full diff out of context behind a lazy artifact reference
     let reassembled = "";
     let offset = 0;
     for (let i = 0; i < 50; i++) {
-      const res = await execute("r", { uri: meta!.uri, offset, max_chars: 4000 }, undefined, undefined, { cwd: fixture.root });
+      const res = await execute("r", { uri: meta!.uri, offset, max_chars: 4000 }, undefined, undefined, {
+        cwd: fixture.root,
+      });
       reassembled += res.content[0]?.text ?? "";
       offset += 4000;
       if (offset >= bigDiff.length) break;
@@ -447,25 +599,51 @@ test("scout-identified files become required context for the implementer (milest
       scout: (req) => {
         ctx.scout = req.context ?? "";
         return {
-          status: "completed", summary: "s", claims: [],
+          status: "completed",
+          summary: "s",
+          claims: [],
           details: { relevant_files: ["docs/note.md"] },
-          evidence_refs: [], new_hypotheses: [], proposed_tasks: [],
+          evidence_refs: [],
+          new_hypotheses: [],
+          proposed_tasks: [],
         };
       },
       implementer: async (req) => {
         ctx.impl = req.context ?? "";
         await writeFile(join(req.cwd, "src", "add.js"), `export function add(a, b) {\n  return a + b;\n}\n`);
-        return { status: "completed", summary: "i", claims: [], details: {}, evidence_refs: [], new_hypotheses: [], proposed_tasks: [] };
+        return {
+          status: "completed",
+          summary: "i",
+          claims: [],
+          details: {},
+          evidence_refs: [],
+          new_hypotheses: [],
+          proposed_tasks: [],
+        };
       },
-      reviewer: () => ({ status: "completed", summary: "r", claims: [], details: { findings: [] }, evidence_refs: [], new_hypotheses: [], proposed_tasks: [] }),
+      reviewer: () => ({
+        status: "completed",
+        summary: "r",
+        claims: [],
+        details: { findings: [] },
+        evidence_refs: [],
+        new_hypotheses: [],
+        proposed_tasks: [],
+      }),
     });
     const rt = await EngineeringRuntime.open({ cwd: fixture.root, worker, verifier: new CommandVerifier() });
     const report = await rt.engineer("Implement add(a, b) to return a + b");
     assert.equal(report.outcome, "promoted");
     // docs/note.md was NOT in the scout's own (ranking-only) context...
-    assert.ok(!ctx.scout.includes("hello world notes"), "scout context should not already contain docs/note.md via ranking");
+    assert.ok(
+      !ctx.scout.includes("hello world notes"),
+      "scout context should not already contain docs/note.md via ranking",
+    );
     // ...but IS in the implementer's re-assembled (scout-required) context.
-    assert.ok(ctx.impl.includes("hello world notes"), "implementer context should carry the scout-identified required file's content");
+    assert.ok(
+      ctx.impl.includes("hello world notes"),
+      "implementer context should carry the scout-identified required file's content",
+    );
   } finally {
     await fixture.cleanup();
   }
@@ -476,10 +654,26 @@ test("a review that fails to complete must not silently promote (INV-007)", asyn
   try {
     let reviewCalls = 0;
     const worker = new FakeWorkerExecutor({
-      scout: () => ({ status: "completed", summary: "s", claims: [], details: {}, evidence_refs: [], new_hypotheses: [], proposed_tasks: [] }),
+      scout: () => ({
+        status: "completed",
+        summary: "s",
+        claims: [],
+        details: {},
+        evidence_refs: [],
+        new_hypotheses: [],
+        proposed_tasks: [],
+      }),
       implementer: async (req) => {
         await writeFile(join(req.cwd, "src", "add.js"), `export function add(a, b) {\n  return a + b;\n}\n`);
-        return { status: "completed", summary: "implemented", claims: [], details: {}, evidence_refs: [], new_hypotheses: [], proposed_tasks: [] };
+        return {
+          status: "completed",
+          summary: "implemented",
+          claims: [],
+          details: {},
+          evidence_refs: [],
+          new_hypotheses: [],
+          proposed_tasks: [],
+        };
       },
       // The reviewer times out / exceeds its budget on EVERY attempt: it returns
       // a failed status with no findings (as the real executor does on abort).
@@ -520,7 +714,15 @@ test("tournament never promotes a candidate whose review did not complete (INV-0
     const worker = new FakeWorkerExecutor({
       implementer: async (req) => {
         await writeFile(join(req.cwd, "src", "add.js"), `export function add(a, b) {\n  return a + b;\n}\n`);
-        return { status: "completed", summary: "i", claims: [], details: {}, evidence_refs: [], new_hypotheses: [], proposed_tasks: [] };
+        return {
+          status: "completed",
+          summary: "i",
+          claims: [],
+          details: {},
+          evidence_refs: [],
+          new_hypotheses: [],
+          proposed_tasks: [],
+        };
       },
       // Every review fails to complete (budget/timeout) on all candidates.
       reviewer: () => ({
@@ -545,5 +747,7 @@ test("tournament never promotes a candidate whose review did not complete (INV-0
 });
 
 function writeFile(p: string, content: string): Promise<void> {
-  return import("node:fs/promises").then((fs) => fs.mkdir(p.split("/").slice(0, -1).join("/"), { recursive: true }).then(() => fs.writeFile(p, content)));
+  return import("node:fs/promises").then((fs) =>
+    fs.mkdir(p.split("/").slice(0, -1).join("/"), { recursive: true }).then(() => fs.writeFile(p, content)),
+  );
 }

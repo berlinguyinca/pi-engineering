@@ -195,14 +195,7 @@ export type EntityStatus = "open" | "verified" | "rejected" | "resolved" | "acce
 
 export interface LedgerEntity {
   id: string;
-  kind:
-    | "requirement"
-    | "invariant"
-    | "fact"
-    | "hypothesis"
-    | "decision"
-    | "finding"
-    | "test-obligation";
+  kind: "requirement" | "invariant" | "fact" | "hypothesis" | "decision" | "finding" | "test-obligation";
   claim: string;
   status: EntityStatus;
   evidence: string[];

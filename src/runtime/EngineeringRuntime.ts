@@ -1,6 +1,9 @@
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import type { Model } from "@earendil-works/pi-ai/compat";
+import { ArtifactStore } from "../artifacts/ArtifactStore.ts";
+import { ContextBroker } from "../context/ContextBroker.ts";
+import { newRunId } from "../core/ids.ts";
 import type {
   Actor,
   Candidate,
@@ -12,17 +15,14 @@ import type {
   WorkItemStatus,
   WorkerRole,
 } from "../core/types.ts";
-import { topoSort, tasksConflict, blockedByFailure } from "../plan/taskDag.ts";
 import { ROLE_BUDGETS, isMachineEvidence } from "../core/types.ts";
-import { Ledger } from "../ledger/Ledger.ts";
-import { ArtifactStore } from "../artifacts/ArtifactStore.ts";
-import { ContextBroker } from "../context/ContextBroker.ts";
 import { GitRepo } from "../git/GitRepo.ts";
-import { CommandVerifier, type VerificationProvider, type VerifyOutcome } from "../verify/Verifier.ts";
-import type { WorkerExecutor, WorkerRequest } from "../workers/WorkerExecutor.ts";
-import { PiWorkerExecutor } from "../workers/PiWorkerExecutor.ts";
+import { Ledger } from "../ledger/Ledger.ts";
+import { blockedByFailure, tasksConflict, topoSort } from "../plan/taskDag.ts";
 import { buildCoreTools } from "../tools/coreTools.ts";
-import { newRunId } from "../core/ids.ts";
+import { CommandVerifier, type VerificationProvider, type VerifyOutcome } from "../verify/Verifier.ts";
+import { PiWorkerExecutor } from "../workers/PiWorkerExecutor.ts";
+import type { WorkerExecutor, WorkerRequest } from "../workers/WorkerExecutor.ts";
 
 export interface EngineerReport {
   work_item: WorkItem;
@@ -231,7 +231,7 @@ export class EngineeringRuntime {
   ) {
     const runId = newRunId();
     const budget = ROLE_BUDGETS[role];
-            const req: WorkerRequest = {
+    const req: WorkerRequest = {
       role,
       task,
       tools: opts.tools,
@@ -282,7 +282,11 @@ export class EngineeringRuntime {
 
   // ------------------------------------------------------------------- scout
 
-  async scout(wi: WorkItem, goal: string, contextText: string): Promise<{ summary: string; artifactUri: string; relevantFiles: string[] } | null> {
+  async scout(
+    wi: WorkItem,
+    goal: string,
+    contextText: string,
+  ): Promise<{ summary: string; artifactUri: string; relevantFiles: string[] } | null> {
     if (!this.broker) return null;
     const task = `Investigate this repository and recommend the smallest relevant change surface for the goal:
 "${goal}"
@@ -312,18 +316,42 @@ Use repo_search, symbol, ledger_read, and artifact_read. Do not edit files.`;
   ): Promise<{ candidate: Candidate; worktreePath: string } | { candidate: Candidate; worktreePath: null }> {
     if (!this.git) {
       // Non-git fallback: implement directly in cwd (no isolation).
-      const candidate = await this.ledger.createCandidate(wi.id, "", "working", null, "implementer", "run", parentId, actor);
+      const candidate = await this.ledger.createCandidate(
+        wi.id,
+        "",
+        "working",
+        null,
+        "implementer",
+        "run",
+        parentId,
+        actor,
+      );
       return { candidate, worktreePath: null };
     }
     const baseCommit = await this.git.headCommit();
     const branch = `pi-eng-${candidateSeq(this.ledger, wi.id)}`;
     const wt = await this.git.createWorktree(baseCommit, branch);
     const runId = newRunId();
-    const candidate = await this.ledger.createCandidate(wi.id, baseCommit, branch, wt.path, "implementer", runId, parentId, actor);
+    const candidate = await this.ledger.createCandidate(
+      wi.id,
+      baseCommit,
+      branch,
+      wt.path,
+      "implementer",
+      runId,
+      parentId,
+      actor,
+    );
     return { candidate, worktreePath: wt.path };
   }
 
-  private async implementIn(wi: WorkItem, candidate: Candidate, worktreePath: string | null, task: string, contextText: string) {
+  private async implementIn(
+    wi: WorkItem,
+    candidate: Candidate,
+    worktreePath: string | null,
+    task: string,
+    contextText: string,
+  ) {
     const cwd = worktreePath ?? this.cwd;
     const run = await this.runWorker("implementer", task, {
       cwd,
@@ -342,7 +370,12 @@ Use repo_search, symbol, ledger_read, and artifact_read. Do not edit files.`;
         const head = await this.git.headCommitIn(worktreePath);
         const diff = await this.git.captureDiff(candidate.base_commit, head);
         const files = await this.git.changedFiles(candidate.base_commit, head);
-        const diffArtifact = await this.artifacts.put("candidate", candidate.id, diff || "(no captured diff)", `${files.length} file(s) changed`);
+        const diffArtifact = await this.artifacts.put(
+          "candidate",
+          candidate.id,
+          diff || "(no captured diff)",
+          `${files.length} file(s) changed`,
+        );
         await this.ledger.changeCandidate(
           candidate.id,
           { diff: diff || null, diff_artifact_uri: diffArtifact.uri, changed_files: files },
@@ -371,11 +404,26 @@ Use repo_search, symbol, ledger_read, and artifact_read. Do not edit files.`;
     for (const ev of outcome.evidence) {
       this.telemetry.evidence++;
       const recorded = await this.ledger.recordEvidence(
-        candidate.id, ev.type, ev.tool, ev.command, ev.exit_code, ev.status, ev.summary, ev.artifacts, ev.trust, wi.id, actor,
+        candidate.id,
+        ev.type,
+        ev.tool,
+        ev.command,
+        ev.exit_code,
+        ev.status,
+        ev.summary,
+        ev.artifacts,
+        ev.trust,
+        wi.id,
+        actor,
       );
       evidenceIds.push(recorded.id);
     }
-    await this.ledger.changeCandidate(candidate.id, { status: outcome.passed ? "ELIGIBLE" : "VERIFYING" }, wi.id, actor);
+    await this.ledger.changeCandidate(
+      candidate.id,
+      { status: outcome.passed ? "ELIGIBLE" : "VERIFYING" },
+      wi.id,
+      actor,
+    );
     return { outcome, evidenceIds, profile };
   }
 
@@ -400,7 +448,11 @@ Use repo_search, symbol, ledger_read, and artifact_read. Do not edit files.`;
       // treat it as a review that could not complete so the candidate is never
       // promoted on an unreviewed basis (INV-007).
       const msg = err instanceof Error ? err.message : String(err);
-      return { summary: `Could not persist candidate diff artifact for review: ${msg}`, findingIds: [], completed: false };
+      return {
+        summary: `Could not persist candidate diff artifact for review: ${msg}`,
+        findingIds: [],
+        completed: false,
+      };
     }
     const preview = diff.length > 2000 ? `${diff.slice(0, 2000)}\n… [truncated; full diff in artifact]` : diff;
     const files = candidate.changed_files?.length ? candidate.changed_files.slice(0, 30).join(", ") : "(unknown)";
@@ -436,10 +488,11 @@ Report concrete findings. Return your findings EXACTLY as details.findings, an a
       : {};
     for (const f of details?.findings ?? []) {
       if (!f.claim) continue;
-      const entity = await this.ledger.recordEntity(
-        "finding", f.claim, "open", this.actor(runId, "reviewer"), wi.id,
-        { severity: (f.severity as never) ?? "medium", evidence: f.evidence ? [f.evidence] : [], candidateId: candidate.id },
-      );
+      const entity = await this.ledger.recordEntity("finding", f.claim, "open", this.actor(runId, "reviewer"), wi.id, {
+        severity: (f.severity as never) ?? "medium",
+        evidence: f.evidence ? [f.evidence] : [],
+        candidateId: candidate.id,
+      });
       findingIds.push(entity.id);
     }
     for (const c of run.result.claims) {
@@ -495,7 +548,11 @@ Report concrete findings. Return your findings EXACTLY as details.findings, an a
 
   // -------------------------------------------------------------- challenge
 
-  async challenge(wi: WorkItem, goal: string, contextText: string): Promise<{ summary: string; assessment: string } | null> {
+  async challenge(
+    wi: WorkItem,
+    goal: string,
+    contextText: string,
+  ): Promise<{ summary: string; assessment: string } | null> {
     if (!this.broker) return null;
     const task = `You are a clean-room challenger. From the original requirement ONLY, derive an independent approach for:
 "${goal}"
@@ -528,8 +585,14 @@ You must NOT inherit any prior candidate reasoning. Inspect the repository with 
     if (!this.broker) {
       await this.ledger.updateWorkItem(wi.id, { status: "BLOCKED" }, actor);
       return {
-        work_item: wi, risk, n_candidates: n, entries: [], incumbent_candidate: null,
-        evidence_ids: [], outcome: "blocked", telemetry: this.telemetry,
+        work_item: wi,
+        risk,
+        n_candidates: n,
+        entries: [],
+        incumbent_candidate: null,
+        evidence_ids: [],
+        outcome: "blocked",
+        telemetry: this.telemetry,
       };
     }
     const contextText = await this.safeContext(goal, ROLE_BUDGETS.implementer.targetTokens, []);
@@ -544,11 +607,18 @@ You must NOT inherit any prior candidate reasoning. Inspect the repository with 
       const { outcome, evidenceIds: ids } = await this.verify(wi, candidate, worktreePath);
       evidenceIds.push(...ids);
       if (this.git && worktreePath) {
-        await this.git.removeWorktree({ path: worktreePath, branch: candidate.branch }, { keepBranch: true }).catch(() => {});
+        await this.git
+          .removeWorktree({ path: worktreePath, branch: candidate.branch }, { keepBranch: true })
+          .catch(() => {});
       }
 
       if (!outcome.passed) {
-        await this.ledger.rejectCandidate(candidate.id, wi.id, `verification failed: ${outcome.failedStage}`, this.actor(newRunId(), "reviewer"));
+        await this.ledger.rejectCandidate(
+          candidate.id,
+          wi.id,
+          `verification failed: ${outcome.failedStage}`,
+          this.actor(newRunId(), "reviewer"),
+        );
         await this.git?.deleteBranch(candidate.branch).catch(() => {});
         entries.push({ candidate, outcome, findings: [], reviewCompleted: false, winner: false });
         continue;
@@ -579,8 +649,14 @@ You must NOT inherit any prior candidate reasoning. Inspect the repository with 
     if (survivors.length === 0) {
       await this.ledger.updateWorkItem(wi.id, { status: "FAILED" }, actor);
       return {
-        work_item: wi, risk, n_candidates: n, entries, incumbent_candidate: null,
-        evidence_ids: evidenceIds, outcome: "failed", telemetry: this.telemetry,
+        work_item: wi,
+        risk,
+        n_candidates: n,
+        entries,
+        incumbent_candidate: null,
+        evidence_ids: evidenceIds,
+        outcome: "failed",
+        telemetry: this.telemetry,
       };
     }
     // Score: fewest material findings, then fewest changed files, then stable id.
@@ -594,7 +670,12 @@ You must NOT inherit any prior candidate reasoning. Inspect the repository with 
     // Reject survivors whose review never completed (they lost to the winner or
     // were ineligible), keeping them recorded rather than silently dropped.
     for (const e of entries.filter((x) => !x.winner && x.outcome.passed && !x.reviewCompleted)) {
-      await this.ledger.rejectCandidate(e.candidate.id, wi.id, `review did not complete`, this.actor(newRunId(), "reviewer"));
+      await this.ledger.rejectCandidate(
+        e.candidate.id,
+        wi.id,
+        `review did not complete`,
+        this.actor(newRunId(), "reviewer"),
+      );
       await this.git?.deleteBranch(e.candidate.branch).catch(() => {});
     }
     const winner = survivors[0]!;
@@ -602,12 +683,19 @@ You must NOT inherit any prior candidate reasoning. Inspect the repository with 
 
     // Reject the losers (recorded, never silently dropped).
     for (const e of survivors.slice(1)) {
-      await this.ledger.rejectCandidate(e.candidate.id, wi.id, `lost tournament to ${winner.candidate.id}`, this.actor(newRunId(), "reviewer"));
+      await this.ledger.rejectCandidate(
+        e.candidate.id,
+        wi.id,
+        `lost tournament to ${winner.candidate.id}`,
+        this.actor(newRunId(), "reviewer"),
+      );
       await this.git?.deleteBranch(e.candidate.branch).catch(() => {});
     }
 
     // Phase C: promote the winner via controlled merge.
-    const merge = this.git ? await this.git.mergeBranch(winner.candidate.branch) : { merged: true, conflict: false, reason: null };
+    const merge = this.git
+      ? await this.git.mergeBranch(winner.candidate.branch)
+      : { merged: true, conflict: false, reason: null };
     let outcome: TournamentReport["outcome"] = "failed";
     let incumbent: Candidate | null = null;
     if (merge.merged) {
@@ -616,12 +704,26 @@ You must NOT inherit any prior candidate reasoning. Inspect the repository with 
       outcome = "promoted";
       await this.git?.deleteBranch(winner.candidate.branch).catch(() => {});
     } else {
-      await this.ledger.rejectCandidate(winner.candidate.id, wi.id, merge.conflict ? `merge conflict with incumbent` : `merge failed: ${merge.reason ?? "unknown"}`, this.actor(newRunId(), "reviewer"));
+      await this.ledger.rejectCandidate(
+        winner.candidate.id,
+        wi.id,
+        merge.conflict ? `merge conflict with incumbent` : `merge failed: ${merge.reason ?? "unknown"}`,
+        this.actor(newRunId(), "reviewer"),
+      );
       await this.git?.deleteBranch(winner.candidate.branch).catch(() => {});
     }
 
     await this.ledger.updateWorkItem(wi.id, { status: incumbent ? "COMPLETED" : "FAILED" }, actor);
-    return { work_item: wi, risk, n_candidates: n, entries, incumbent_candidate: incumbent, evidence_ids: evidenceIds, outcome, telemetry: this.telemetry };
+    return {
+      work_item: wi,
+      risk,
+      n_candidates: n,
+      entries,
+      incumbent_candidate: incumbent,
+      evidence_ids: evidenceIds,
+      outcome,
+      telemetry: this.telemetry,
+    };
   }
 
   // ------------------------------------------------------------------- DAG
@@ -637,7 +739,13 @@ You must NOT inherit any prior candidate reasoning. Inspect the repository with 
     if (!this.git || !this.broker) {
       const wi = await this.ledger.createWorkItem(goal, "medium", [this.cwd], this.actor(newRunId(), "planner"));
       await this.ledger.updateWorkItem(wi.id, { status: "BLOCKED" }, this.actor(newRunId(), "planner"));
-      return { plan_work_item: wi, tasks: [], summary: "Blocked: not a git repository.", outcome: "blocked", telemetry: this.telemetry };
+      return {
+        plan_work_item: wi,
+        tasks: [],
+        summary: "Blocked: not a git repository.",
+        outcome: "blocked",
+        telemetry: this.telemetry,
+      };
     }
     const risk = classifyRisk(goal);
     const actor = this.actor(newRunId(), "planner");
@@ -673,7 +781,13 @@ Goal: "${goal}"`;
     const specs = Array.isArray(details?.tasks) ? details.tasks.filter(isPlannerTaskSpec).slice(0, 10) : [];
     if (specs.length === 0) {
       await this.ledger.updateWorkItem(wi.id, { status: "FAILED" }, actor);
-      return { plan_work_item: wi, tasks: [], summary: run.result.summary, outcome: "failed", telemetry: this.telemetry };
+      return {
+        plan_work_item: wi,
+        tasks: [],
+        summary: run.result.summary,
+        outcome: "failed",
+        telemetry: this.telemetry,
+      };
     }
 
     // Create tasks, then resolve depends_on (indices) to real task ids.
@@ -695,7 +809,13 @@ Goal: "${goal}"`;
       actor,
       wi.id,
     );
-    return { plan_work_item: wi, tasks: created, summary: run.result.summary, outcome: "planned", telemetry: this.telemetry };
+    return {
+      plan_work_item: wi,
+      tasks: created,
+      summary: run.result.summary,
+      outcome: "planned",
+      telemetry: this.telemetry,
+    };
   }
 
   /**
@@ -709,16 +829,37 @@ Goal: "${goal}"`;
     const actor = this.actor(newRunId(), "planner");
     const wi = this.ledger.getWorkItem(planWorkItemId);
     if (!wi) {
-      return { plan_work_item: undefined as unknown as WorkItem, tasks: [], order: [], outcome: "blocked", summary: `Unknown plan work item ${planWorkItemId}`, telemetry: this.telemetry };
+      return {
+        plan_work_item: undefined as unknown as WorkItem,
+        tasks: [],
+        order: [],
+        outcome: "blocked",
+        summary: `Unknown plan work item ${planWorkItemId}`,
+        telemetry: this.telemetry,
+      };
     }
     if (!this.git) {
       await this.ledger.updateWorkItem(wi.id, { status: "BLOCKED" }, actor);
-      return { plan_work_item: wi, tasks: [], order: [], outcome: "blocked", summary: "Blocked: not a git repository.", telemetry: this.telemetry };
+      return {
+        plan_work_item: wi,
+        tasks: [],
+        order: [],
+        outcome: "blocked",
+        summary: "Blocked: not a git repository.",
+        telemetry: this.telemetry,
+      };
     }
-    let tasks = this.ledger.listTasks(wi.id);
+    const tasks = this.ledger.listTasks(wi.id);
     if (tasks.length === 0) {
       await this.ledger.updateWorkItem(wi.id, { status: "FAILED" }, actor);
-      return { plan_work_item: wi, tasks: [], order: [], outcome: "failed", summary: "No tasks in this plan. Run /plan first.", telemetry: this.telemetry };
+      return {
+        plan_work_item: wi,
+        tasks: [],
+        order: [],
+        outcome: "failed",
+        summary: "No tasks in this plan. Run /plan first.",
+        telemetry: this.telemetry,
+      };
     }
 
     let order: Task[];
@@ -880,7 +1021,11 @@ Goal: "${goal}"`;
 
     for (let round = 0; round < maxRounds; round++) {
       rounds = round + 1;
-      const { candidate, worktreePath } = await this.createCandidateWorktree(wi, parentId, this.actor(newRunId(), "implementer"));
+      const { candidate, worktreePath } = await this.createCandidateWorktree(
+        wi,
+        parentId,
+        this.actor(newRunId(), "implementer"),
+      );
 
       const implTask = `Implement the goal in this repository:
 "${goal}"
@@ -894,11 +1039,18 @@ Risk level: ${risk}. Make the smallest coherent change. Use the provided context
       // Clean up the worktree after verification, keeping the branch until the
       // promotion decision so a promoted candidate can be merged (INV-004).
       if (this.git && worktreePath) {
-        await this.git.removeWorktree({ path: worktreePath, branch: candidate.branch }, { keepBranch: true }).catch(() => {});
+        await this.git
+          .removeWorktree({ path: worktreePath, branch: candidate.branch }, { keepBranch: true })
+          .catch(() => {});
       }
 
       if (!outcome.passed) {
-        await this.ledger.rejectCandidate(candidate.id, wi.id, `verification failed: ${outcome.failedStage}`, this.actor(newRunId(), "reviewer"));
+        await this.ledger.rejectCandidate(
+          candidate.id,
+          wi.id,
+          `verification failed: ${outcome.failedStage}`,
+          this.actor(newRunId(), "reviewer"),
+        );
         await this.git?.deleteBranch(candidate.branch).catch(() => {});
         // Child candidate on next round, with the failing evidence as feedback.
         feedback = `${diffBlock(candidate.diff)}\nVerification failed at stage '${outcome.failedStage}' (exit ${outcome.stages.find((s) => !s.passed)?.exitCode ?? "?"}). Fix it.`;
@@ -920,7 +1072,9 @@ Risk level: ${risk}. Make the smallest coherent change. Use the provided context
       if (reviewCompleted && findings.length === 0) {
         // Controlled, evidence-gated promotion (INV-003, INV-005): merge the
         // verified candidate into the incumbent branch, then record it.
-        const merge = this.git ? await this.git.mergeBranch(candidate.branch) : { merged: true, conflict: false, reason: null };
+        const merge = this.git
+          ? await this.git.mergeBranch(candidate.branch)
+          : { merged: true, conflict: false, reason: null };
         if (merge.merged) {
           await this.ledger.promoteCandidate(candidate.id, wi.id, this.actor(newRunId(), "reviewer"));
           incumbent = candidate;
@@ -928,7 +1082,12 @@ Risk level: ${risk}. Make the smallest coherent change. Use the provided context
           break;
         }
         // Merge conflict: keep the incumbent immutable, treat as unresolved.
-        await this.ledger.rejectCandidate(candidate.id, wi.id, merge.conflict ? `merge conflict with incumbent` : `merge failed: ${merge.reason ?? "unknown"}`, this.actor(newRunId(), "reviewer"));
+        await this.ledger.rejectCandidate(
+          candidate.id,
+          wi.id,
+          merge.conflict ? `merge conflict with incumbent` : `merge failed: ${merge.reason ?? "unknown"}`,
+          this.actor(newRunId(), "reviewer"),
+        );
         await this.git?.deleteBranch(candidate.branch).catch(() => {});
         if (round === maxRounds - 1) break;
         parentId = candidate.id;
@@ -966,7 +1125,11 @@ Risk level: ${risk}. Make the smallest coherent change. Use the provided context
       parentId = candidate.id;
     }
 
-    await this.ledger.updateWorkItem(wi.id, { status: incumbent ? "COMPLETED" : "FAILED" }, this.actor(newRunId(), "planner"));
+    await this.ledger.updateWorkItem(
+      wi.id,
+      { status: incumbent ? "COMPLETED" : "FAILED" },
+      this.actor(newRunId(), "planner"),
+    );
 
     return {
       work_item: wi,

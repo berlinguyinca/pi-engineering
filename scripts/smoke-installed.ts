@@ -1,3 +1,5 @@
+import { dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 /**
  * Phase 3 standalone-install test: verify that Pi discovers and loads this
  * package from an *installed* project config (.pi/settings.json) — not from an
@@ -6,9 +8,12 @@
  *
  * Usage: node scripts/smoke-installed.ts <fixture-cwd>
  */
-import { createAgentSession, DefaultResourceLoader, getAgentDir, SessionManager } from "@earendil-works/pi-coding-agent";
-import { fileURLToPath } from "node:url";
-import { dirname } from "node:path";
+import {
+  DefaultResourceLoader,
+  SessionManager,
+  createAgentSession,
+  getAgentDir,
+} from "@earendil-works/pi-coding-agent";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const cwd = process.argv[2] ?? process.cwd();

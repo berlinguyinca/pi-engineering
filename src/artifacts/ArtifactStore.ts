@@ -1,5 +1,5 @@
-import { mkdir, readFile, writeFile, readdir, unlink } from "node:fs/promises";
-import { join, dirname } from "node:path";
+import { mkdir, readFile, readdir, unlink, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import type { ArtifactMeta } from "../core/types.ts";
 
 /**
@@ -65,12 +65,7 @@ export class ArtifactStore {
   }
 
   /** Store an artifact; content stays on disk, meta (incl. summary) is indexed. */
-  async put(
-    category: string,
-    id: string,
-    content: string,
-    summary: string,
-  ): Promise<ArtifactMeta> {
+  async put(category: string, id: string, content: string, summary: string): Promise<ArtifactMeta> {
     await mkdir(join(this.root, category), { recursive: true });
     const contentPath = this.contentPath(category, id);
     await writeFile(contentPath, content, "utf-8");

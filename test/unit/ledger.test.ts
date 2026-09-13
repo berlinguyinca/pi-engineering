@@ -1,8 +1,8 @@
-import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm, readFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { test } from "node:test";
 import { Ledger } from "../../src/ledger/Ledger.ts";
 
 const actor = { type: "system" as const };
@@ -29,7 +29,16 @@ test("candidate lifecycle: created -> promoted", async () => {
   try {
     const ledger = await Ledger.create(join(dir, "ledger.jsonl"));
     const wi = await ledger.createWorkItem("task", "high", ["."], actor);
-    const cand = await ledger.createCandidate(wi.id, "abc123", "pi-eng-x", "/tmp/wt", "implementer", "run1", null, actor);
+    const cand = await ledger.createCandidate(
+      wi.id,
+      "abc123",
+      "pi-eng-x",
+      "/tmp/wt",
+      "implementer",
+      "run1",
+      null,
+      actor,
+    );
     assert.equal(cand.status, "CREATED");
     assert.equal(ledger.getWorkItem(wi.id)?.current_candidate_id, cand.id);
 
@@ -46,12 +55,19 @@ test("entities are recorded with typed kinds", async () => {
   try {
     const ledger = await Ledger.create(join(dir, "ledger.jsonl"));
     const wi = await ledger.createWorkItem("task", "medium", ["."], actor);
-    const hyp = await ledger.recordEntity("hypothesis", "retry drops affinity", "open", actor, wi.id, { confidence: 0.6 });
+    const hyp = await ledger.recordEntity("hypothesis", "retry drops affinity", "open", actor, wi.id, {
+      confidence: 0.6,
+    });
     assert.equal(hyp.kind, "hypothesis");
     assert.equal(hyp.status, "open");
-    const find = await ledger.recordEntity("finding", "candidate breaks reconnect", "open", actor, wi.id, { severity: "high" });
+    const find = await ledger.recordEntity("finding", "candidate breaks reconnect", "open", actor, wi.id, {
+      severity: "high",
+    });
     assert.equal(find.severity, "high");
-    assert.deepEqual(ledger.listOpenFindings().map((f) => f.id), [find.id]);
+    assert.deepEqual(
+      ledger.listOpenFindings().map((f) => f.id),
+      [find.id],
+    );
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -105,7 +121,19 @@ test("evidence is recorded and linked to a candidate", async () => {
     const ledger = await Ledger.create(join(dir, "ledger.jsonl"));
     const wi = await ledger.createWorkItem("task", "medium", ["."], actor);
     const cand = await ledger.createCandidate(wi.id, "abc", "b", null, "implementer", "r", null, actor);
-    const ev = await ledger.recordEvidence(cand.id, "verify.test", "node", "node --test", 0, "passed", { passed: true }, ["artifact://verify/x"], "deterministic", wi.id, actor);
+    const ev = await ledger.recordEvidence(
+      cand.id,
+      "verify.test",
+      "node",
+      "node --test",
+      0,
+      "passed",
+      { passed: true },
+      ["artifact://verify/x"],
+      "deterministic",
+      wi.id,
+      actor,
+    );
     assert.equal(ev.trust, "deterministic");
     assert.deepEqual(ledger.getCandidate(cand.id)?.evidence_ids, [ev.id]);
   } finally {

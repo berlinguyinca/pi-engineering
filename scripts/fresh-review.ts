@@ -1,3 +1,4 @@
+import type { WorkerResult } from "../src/core/types.ts";
 /**
  * Phase 5 independent fresh review: run a genuinely fresh-context
  * architecture-reviewer worker against the pi-engineering-runtime
@@ -6,7 +7,6 @@
  */
 import { EngineeringRuntime } from "../src/runtime/EngineeringRuntime.ts";
 import { PiWorkerExecutor } from "../src/workers/PiWorkerExecutor.ts";
-import type { WorkerResult } from "../src/core/types.ts";
 
 const repo = "/home/wohlgemuth/IdeaProjects/pi-engineering-runtime";
 
@@ -40,7 +40,9 @@ const CHECKLIST = [
 
 const worker = new PiWorkerExecutor({});
 const rt = await EngineeringRuntime.open({ cwd: repo, worker });
-const wi = await rt.ledger.createWorkItem("Independent fresh review of pi-engineering-runtime", "high", [repo], { type: "system" });
+const wi = await rt.ledger.createWorkItem("Independent fresh review of pi-engineering-runtime", "high", [repo], {
+  type: "system",
+});
 
 const task = `Independently review the pi-engineering-runtime implementation in this repository, focusing on src/workers, src/context, src/verify, src/ledger, src/git, src/runtime, src/tools and extensions/. Read files efficiently and report findings; do not re-read the whole repo repeatedly. Keep each finding to severity + file/line + why + fix.
 

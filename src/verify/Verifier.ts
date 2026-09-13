@@ -1,9 +1,9 @@
 import { execFile } from "node:child_process";
-import { promisify } from "node:util";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
+import { promisify } from "node:util";
+import type { ArtifactStore } from "../artifacts/ArtifactStore.ts";
 import type { Evidence, EvidenceTrust } from "../core/types.ts";
-import { ArtifactStore } from "../artifacts/ArtifactStore.ts";
 
 const exec = promisify(execFile);
 
@@ -48,7 +48,8 @@ export interface VerifyOutcome {
  * (INV-006, AC-005).
  */
 export interface VerificationProvider {
-  detect(cwd: string): Promise<VerificationProfile>;
+  /** Detect the repo's verification profile. `full` adds a broader suite (lint + test:full). */
+  detect(cwd: string, opts?: { full?: boolean }): Promise<VerificationProfile>;
   run(cwd: string, profile: VerificationProfile, artifactStore: ArtifactStore): Promise<VerifyOutcome>;
 }
 
@@ -116,30 +117,71 @@ function cleanEnv(): NodeJS.ProcessEnv {
 
 /** Deterministic verifier that runs detected shell commands. */
 export class CommandVerifier implements VerificationProvider {
-  async detect(cwd: string): Promise<VerificationProfile> {
+  /**
+   * Per-repo profile cache, keyed on cwd + package.json CONTENT (not just
+   * cwd), so a profile is re-derived only when its inputs change. Saves a
+   * package.json read + tokenize per verification call in multi-round runs.
+   */
+  private readonly profileCache = new Map<string, VerificationProfile>();
+
+  private async cacheKey(
+    cwd: string,
+    full: boolean,
+  ): Promise<{ key: string; pkg: { scripts?: Record<string, string> } }> {
     let pkg: { scripts?: Record<string, string> } = {};
+    let content = "__missing__";
     try {
-      pkg = JSON.parse(await readFile(join(cwd, "package.json"), "utf-8")) as { scripts?: Record<string, string> };
+      content = await readFile(join(cwd, "package.json"), "utf-8");
+      pkg = JSON.parse(content) as { scripts?: Record<string, string> };
     } catch {
       pkg = {};
     }
+    return { key: `${cwd}\u0000${content}\u0000full:${full ? 1 : 0}`, pkg };
+  }
+
+  /** Invalidate the cache (e.g. after package.json changes). Primarily for tests. */
+  clearCache(): void {
+    this.profileCache.clear();
+  }
+
+  /**
+   * Detect a verification profile. With `full`, additionally include the repo's
+   * declared `lint` and `test:full` stages (a broader verification suite) so
+   * `/verify full` records more evidence than the default gate.
+   */
+  async detect(cwd: string, opts?: { full?: boolean }): Promise<VerificationProfile> {
+    const full = opts?.full ?? false;
+    const { key, pkg } = await this.cacheKey(cwd, full);
+    const cached = this.profileCache.get(key);
+    if (cached) return cached;
+    const profile = this.buildProfile(pkg, full);
+    this.profileCache.set(key, profile);
+    return profile;
+  }
+
+  private buildProfile(pkg: { scripts?: Record<string, string> }, full: boolean): VerificationProfile {
     const scripts = pkg.scripts ?? {};
     const stages: VerifyStage[] = [];
 
-    const push = (name: string, script?: string): void => {
+    const push = (name: string, script?: string, required = true): void => {
       if (!script) return;
       const { command, args } = tokenizeCommand(script);
       stages.push({
         name,
         command,
         args,
-        required: true,
+        required,
         timeoutMs: 300_000,
       });
     };
     push("typecheck", scripts.typecheck ?? scripts.check);
     push("test", scripts.test);
     push("build", scripts.build);
+    if (full) {
+      // Broader suite: lint + an explicit full-test script, when declared.
+      push("lint", scripts.lint);
+      push("test:full", scripts["test:full"] ?? scripts["test:all"], false);
+    }
     if (stages.length === 0) {
       stages.push({
         name: "node-syntax",
@@ -148,7 +190,7 @@ export class CommandVerifier implements VerificationProvider {
         required: false,
       });
     }
-    return { name: "detected", stages };
+    return { name: full ? "detected-full" : "detected", stages };
   }
 
   async run(cwd: string, profile: VerificationProfile, store: ArtifactStore): Promise<VerifyOutcome> {
@@ -175,14 +217,16 @@ export class CommandVerifier implements VerificationProvider {
         const e = err as NodeJS.ErrnoException & { stdout?: string; stderr?: string; code?: number };
         code = typeof e.code === "number" ? e.code : 1;
         stdout = (e.stdout as string) ?? "";
-        stderr = (e.stderr as string) ?? (e.message ?? String(e));
+        stderr = (e.stderr as string) ?? e.message ?? String(e);
       }
       const finishedAt = new Date().toISOString();
       const passed = code === 0;
       const log = `$ ${stage.command} ${stage.args.join(" ")}\n--- stdout ---\n${stdout}\n--- stderr ---\n${stderr}`;
       // Unique id so re-runs never overwrite content that prior Evidence records
       // still reference (artifact integrity).
-      const artifactUri = (await store.put("verify", `${profile.name}-${stage.name}-${Date.now().toString(36)}`, log, truncate(log, 500))).uri;
+      const artifactUri = (
+        await store.put("verify", `${profile.name}-${stage.name}-${Date.now().toString(36)}`, log, truncate(log, 500))
+      ).uri;
 
       const summary: Record<string, unknown> = {
         stage: stage.name,

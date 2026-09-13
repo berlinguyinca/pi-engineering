@@ -1,3 +1,4 @@
+import type { WorkerResult } from "../src/core/types.ts";
 /**
  * Fresh-context review of the Context Broker milestone: relevance ranking
  * (rankFiles), relevant-file content slices in assembleContext, and
@@ -5,7 +6,6 @@
  * reasoning inspects the change.
  */
 import { PiWorkerExecutor } from "../src/workers/PiWorkerExecutor.ts";
-import type { WorkerResult } from "../src/core/types.ts";
 
 const repo = "/home/wohlgemuth/IdeaProjects/pi-engineering-runtime";
 

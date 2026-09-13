@@ -56,7 +56,7 @@ export function buildSystemPrompt(role: WorkerRole, task: string, context?: stri
   parts.push("");
   parts.push("## Task");
   parts.push(task);
-  if (context && context.trim()) {
+  if (context?.trim()) {
     parts.push("");
     parts.push("## Verified context");
     parts.push(context.trim());

@@ -1,19 +1,19 @@
 import { homedir } from "node:os";
+import type { Model } from "@earendil-works/pi-ai/compat";
 import {
-  createAgentSession,
-  createExtensionRuntime,
   ModelRuntime,
+  type ResourceLoader,
   SessionManager,
   SettingsManager,
-  type ResourceLoader,
   type ToolDefinition,
+  createAgentSession,
+  createExtensionRuntime,
 } from "@earendil-works/pi-coding-agent";
-import type { Model } from "@earendil-works/pi-ai/compat";
 import type { WorkerResult, WorkerUsage } from "../core/types.ts";
 import type { WorkerExecutor, WorkerRequest, WorkerRun } from "./WorkerExecutor.ts";
-import { buildSystemPrompt, WORKER_KICKOFF } from "./prompts.ts";
-import { workerResultTool } from "./workerResultTool.ts";
 import { registerLocalProviders } from "./localProviders.ts";
+import { WORKER_KICKOFF, buildSystemPrompt } from "./prompts.ts";
+import { workerResultTool } from "./workerResultTool.ts";
 
 /** A minimal resource loader that supplies only the role prompt (context firewall). */
 function roleResourceLoader(systemPrompt: string): ResourceLoader {
@@ -217,7 +217,14 @@ export class PiWorkerExecutor implements WorkerExecutor {
       if (msg.role !== "assistant") continue;
       const m = msg as { usage?: Record<string, unknown>; model?: string };
       const u = m.usage as
-        | { input?: number; output?: number; cacheRead?: number; cacheWrite?: number; totalTokens?: number; cost?: { total?: number } }
+        | {
+            input?: number;
+            output?: number;
+            cacheRead?: number;
+            cacheWrite?: number;
+            totalTokens?: number;
+            cost?: { total?: number };
+          }
         | undefined;
       if (!u) continue;
       input += u.input ?? 0;

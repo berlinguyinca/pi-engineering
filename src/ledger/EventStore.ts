@@ -1,4 +1,4 @@
-import { mkdir, readFile, appendFile, rename, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import type { LedgerEvent } from "../core/types.ts";
 
@@ -52,7 +52,7 @@ export class EventStore {
   /** Append a single event; returns the stored event. */
   async append(event: LedgerEvent): Promise<LedgerEvent> {
     await mkdir(dirname(this.file), { recursive: true });
-    const line = JSON.stringify(event) + "\n";
+    const line = `${JSON.stringify(event)}\n`;
     await appendFile(this.file, line, "utf-8");
     this.events.push(event);
     this.byId.set(event.event_id, event);

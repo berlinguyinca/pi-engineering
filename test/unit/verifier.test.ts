@@ -1,10 +1,10 @@
-import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { CommandVerifier, tokenizeCommand } from "../../src/verify/Verifier.ts";
+import { test } from "node:test";
 import { ArtifactStore } from "../../src/artifacts/ArtifactStore.ts";
+import { CommandVerifier, tokenizeCommand } from "../../src/verify/Verifier.ts";
 
 async function makeProject(files: Record<string, string>): Promise<string> {
   const dir = await mkdtemp(join(tmpdir(), "pi-eng-ver-"));
@@ -13,6 +13,57 @@ async function makeProject(files: Record<string, string>): Promise<string> {
   }
   return dir;
 }
+
+test("detect full includes lint + test:full stages (milestone)", async () => {
+  const dir = await makeProject({
+    "package.json": JSON.stringify({
+      scripts: { test: "node --test", lint: "eslint .", "test:full": "node --test --test-reporter=spec" },
+    }),
+  });
+  try {
+    const v = new CommandVerifier();
+    const normal = await v.detect(dir);
+    const full = await v.detect(dir, { full: true });
+    assert.ok(!normal.stages.some((s) => s.name === "lint"), "normal profile must not include lint");
+    assert.ok(
+      full.stages.some((s) => s.name === "lint"),
+      "full profile must include lint",
+    );
+    assert.ok(
+      full.stages.some((s) => s.name === "test:full"),
+      "full profile must include test:full",
+    );
+    assert.equal(full.name, "detected-full");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("detect caches per-repo and invalidates when package.json changes (milestone)", async () => {
+  const dir = await makeProject({
+    "package.json": JSON.stringify({ scripts: { test: "node --test" } }),
+  });
+  try {
+    const v = new CommandVerifier();
+    const p1 = await v.detect(dir);
+    assert.deepEqual(
+      p1.stages.map((s) => s.name),
+      ["test"],
+    );
+    // Same content: served from cache (same object identity proves no re-read).
+    assert.equal(await v.detect(dir), p1, "unchanged package.json must return the cached profile");
+    // Content changed: cache invalidated, profile re-derived.
+    await writeFile(
+      join(dir, "package.json"),
+      JSON.stringify({ scripts: { test: "node --test", build: "node --check index.js" } }),
+    );
+    const p2 = await v.detect(dir);
+    assert.notEqual(p2, p1, "changed package.json must produce a fresh profile");
+    assert.ok(p2.stages.some((s) => s.name === "build"));
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
 
 test("detect reads test/build scripts from package.json", async () => {
   const dir = await makeProject({
@@ -31,7 +82,7 @@ test("detect reads test/build scripts from package.json", async () => {
 
 test("verifier records passing evidence lazily (AC-010)", async () => {
   const dir = await makeProject({
-    "package.json": JSON.stringify({ scripts: { test: "node -e \"process.exit(0)\"" } }),
+    "package.json": JSON.stringify({ scripts: { test: 'node -e "process.exit(0)"' } }),
   });
   try {
     const store = await ArtifactStore.create(join(dir, "..", "artifacts"));

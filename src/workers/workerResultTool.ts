@@ -12,8 +12,7 @@ import type { WorkerResult } from "../core/types.ts";
 export const workerResultTool = defineTool({
   name: "worker_result",
   label: "Worker Result",
-  description:
-    "Return your final bounded structured result. Use this as your LAST action when your task is complete.",
+  description: "Return your final bounded structured result. Use this as your LAST action when your task is complete.",
   promptSnippet: "Emit your final bounded structured result as a terminating tool result",
   promptGuidelines: [
     "Call worker_result as your final action when the task is complete.",
@@ -45,9 +44,7 @@ export const workerResultTool = defineTool({
       description: "Suggested follow-up tasks",
       maxItems: 20,
     }),
-    details: Type.Optional(
-      Type.Any({ description: "Role-specific structured payload, e.g. candidate_id" }),
-    ),
+    details: Type.Optional(Type.Any({ description: "Role-specific structured payload, e.g. candidate_id" })),
   }),
 
   async execute(_toolCallId, params) {

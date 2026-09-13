@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
-import { promisify } from "node:util";
 import { mkdir, rm } from "node:fs/promises";
 import { join } from "node:path";
+import { promisify } from "node:util";
 
 const exec = promisify(execFile);
 
@@ -68,7 +68,7 @@ export class GitRepo {
       const e = err as NodeJS.ErrnoException & { code?: number; stdout?: string; stderr?: string };
       return {
         stdout: (e.stdout as string) ?? "",
-        stderr: (e.stderr as string) ?? (e.message ?? String(e)),
+        stderr: (e.stderr as string) ?? e.message ?? String(e),
         code: typeof e.code === "number" ? e.code : 1,
       };
     }

@@ -1,11 +1,16 @@
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 /**
  * Smoke test: load the package extension through Pi's ResourceLoader and confirm
  * it registers without errors. This mirrors how `pi install`/`-e` loads the
  * package, without needing an interactive session.
  */
-import { createAgentSession, DefaultResourceLoader, getAgentDir, SessionManager } from "@earendil-works/pi-coding-agent";
-import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
+import {
+  DefaultResourceLoader,
+  SessionManager,
+  createAgentSession,
+  getAgentDir,
+} from "@earendil-works/pi-coding-agent";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const extensionPath = join(here, "..", "extensions", "index.ts");

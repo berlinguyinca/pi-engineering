@@ -1,10 +1,10 @@
-import { test } from "node:test";
 import assert from "node:assert/strict";
-import { writeFile, readFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { test } from "node:test";
 import { EngineeringRuntime } from "../../src/runtime/EngineeringRuntime.ts";
-import { FakeWorkerExecutor } from "../../src/workers/FakeWorkerExecutor.ts";
 import { CommandVerifier } from "../../src/verify/Verifier.ts";
+import { FakeWorkerExecutor } from "../../src/workers/FakeWorkerExecutor.ts";
 import { makeFixtureRepo } from "../fixtures/make-fixture.ts";
 
 test("plan + executePlan runs a dependency-ordered task DAG through the pipeline", async () => {
@@ -16,8 +16,20 @@ test("plan + executePlan runs a dependency-ordered task DAG through the pipeline
         summary: "planned 2 tasks",
         details: {
           tasks: [
-            { title: "implement add to return the sum", kind: "implementation", risk: "medium", depends_on: [], scope_paths: ["src/add.js"] },
-            { title: "implement subtract to return the difference", kind: "implementation", risk: "medium", depends_on: [0], scope_paths: ["src/subtract.js"] },
+            {
+              title: "implement add to return the sum",
+              kind: "implementation",
+              risk: "medium",
+              depends_on: [],
+              scope_paths: ["src/add.js"],
+            },
+            {
+              title: "implement subtract to return the difference",
+              kind: "implementation",
+              risk: "medium",
+              depends_on: [0],
+              scope_paths: ["src/subtract.js"],
+            },
           ],
         },
       }),
@@ -27,7 +39,10 @@ test("plan + executePlan runs a dependency-ordered task DAG through the pipeline
         if (body.includes("add")) {
           await writeFile(join(req.cwd, "src", "add.js"), `export function add(a, b) {\n  return a + b;\n}\n`);
         } else if (body.includes("subtract")) {
-          await writeFile(join(req.cwd, "src", "subtract.js"), `export function subtract(a, b) {\n  return a - b;\n}\n`);
+          await writeFile(
+            join(req.cwd, "src", "subtract.js"),
+            `export function subtract(a, b) {\n  return a - b;\n}\n`,
+          );
         }
         return { status: "completed", summary: "implemented", details: {} };
       },
@@ -45,7 +60,10 @@ test("plan + executePlan runs a dependency-ordered task DAG through the pipeline
 
     const dag = await rt.executePlan(plan.plan_work_item.id);
     assert.equal(dag.outcome, "completed");
-    assert.deepEqual(dag.order.map((t) => t.id), [t1.id, t2.id]);
+    assert.deepEqual(
+      dag.order.map((t) => t.id),
+      [t1.id, t2.id],
+    );
     // Both tasks completed and linked to result work items.
     const finalTasks = rt.ledger.listTasks(plan.plan_work_item.id);
     for (const t of finalTasks) {
@@ -71,8 +89,20 @@ test("executePlan blocks downstream tasks when a dependency fails", async () => 
         summary: "planned",
         details: {
           tasks: [
-            { title: "implement add", kind: "implementation", risk: "medium", depends_on: [], scope_paths: ["src/add.js"] },
-            { title: "implement subtract", kind: "implementation", risk: "medium", depends_on: [0], scope_paths: ["src/subtract.js"] },
+            {
+              title: "implement add",
+              kind: "implementation",
+              risk: "medium",
+              depends_on: [],
+              scope_paths: ["src/add.js"],
+            },
+            {
+              title: "implement subtract",
+              kind: "implementation",
+              risk: "medium",
+              depends_on: [0],
+              scope_paths: ["src/subtract.js"],
+            },
           ],
         },
       }),

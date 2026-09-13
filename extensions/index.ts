@@ -1,9 +1,9 @@
-import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import type { Model } from "@earendil-works/pi-ai/compat";
-import { EngineeringRuntime } from "../src/runtime/EngineeringRuntime.ts";
-import { buildCoreTools, type CoreServices } from "../src/tools/coreTools.ts";
-import { CommandVerifier } from "../src/verify/Verifier.ts";
+import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { GitRepo } from "../src/git/GitRepo.ts";
+import { EngineeringRuntime } from "../src/runtime/EngineeringRuntime.ts";
+import { type CoreServices, buildCoreTools } from "../src/tools/coreTools.ts";
+import { CommandVerifier } from "../src/verify/Verifier.ts";
 import { PiWorkerExecutor } from "../src/workers/PiWorkerExecutor.ts";
 
 /**
@@ -75,9 +75,7 @@ function formatWorkItems(rt: EngineeringRuntime): string {
   if (w.length === 0) return "No work items yet.";
   const lines = w.map((wi) => {
     const candidates = rt.ledger.listCandidates(wi.id);
-    const incumbent = wi.incumbent_candidate_id
-      ? rt.ledger.getCandidate(wi.incumbent_candidate_id)
-      : undefined;
+    const incumbent = wi.incumbent_candidate_id ? rt.ledger.getCandidate(wi.incumbent_candidate_id) : undefined;
     return `- ${wi.id} [${wi.status}] risk=${wi.risk}\n    goal: ${wi.goal}\n    candidates: ${candidates.length}, incumbent: ${incumbent ? incumbent.id : "none"}`;
   });
   return lines.join("\n");
@@ -120,7 +118,8 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("tournament", {
-    description: "Run a candidate tournament: N independent implementations, verify+review each, promote the deterministic winner.",
+    description:
+      "Run a candidate tournament: N independent implementations, verify+review each, promote the deterministic winner.",
     handler: async (args, ctx) => {
       if (!args.trim()) {
         ctx.ui.notify("/tournament <goal> [n]", "error");
@@ -145,7 +144,8 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("plan", {
-    description: "Decompose a goal into a dependency-aware task DAG (recorded in the ledger), then run /execute to execute it.",
+    description:
+      "Decompose a goal into a dependency-aware task DAG (recorded in the ledger), then run /execute to execute it.",
     handler: async (args, ctx) => {
       if (!args.trim()) {
         ctx.ui.notify("/plan <goal>", "error");
@@ -158,7 +158,10 @@ export default function (pi: ExtensionAPI) {
         `Plan work item ${report.plan_work_item.id} [${report.plan_work_item.status}] outcome=${report.outcome}`,
         report.tasks.length
           ? report.tasks
-              .map((t) => `- ${t.id} [${t.risk}] ${t.title}${t.depends_on.length ? ` (after ${t.depends_on.join(", ")})` : ""}`)
+              .map(
+                (t) =>
+                  `- ${t.id} [${t.risk}] ${t.title}${t.depends_on.length ? ` (after ${t.depends_on.join(", ")})` : ""}`,
+              )
               .join("\n")
           : "No tasks produced.",
         report.summary ? `Planner: ${report.summary.slice(0, 300)}` : "",
@@ -169,7 +172,8 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("execute", {
-    description: "Execute a planned task DAG (from /plan) in dependency order, running each task through the engineer pipeline.",
+    description:
+      "Execute a planned task DAG (from /plan) in dependency order, running each task through the engineer pipeline.",
     handler: async (args, ctx) => {
       const rt = await getRuntime(ctx);
       const planId = args.trim() || rt.ledger.listWorkItems().at(-1)?.id;
@@ -224,11 +228,16 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("verify", {
-    description: "Run risk-appropriate verification and record deterministic evidence.",
-    handler: async (_args, ctx) => {
+    description:
+      "Run risk-appropriate verification and record deterministic evidence. Use '/verify full' for a broader suite (lint + test:full).",
+    handler: async (args, ctx) => {
       const rt = await getRuntime(ctx);
-      ctx.ui.notify("Detecting verification profile...", "info");
-      const profile = await rt.verifier.detect(rt.cwd);
+      const full = /\bfull\b/.test(args.trim());
+      ctx.ui.notify(
+        full ? "Detecting FULL verification profile (lint + test:full)..." : "Detecting verification profile...",
+        "info",
+      );
+      const profile = await rt.verifier.detect(rt.cwd, { full });
       const outcome = await rt.verifier.run(rt.cwd, profile, rt.artifacts);
       // Record deterministic evidence into the ledger (linked to the latest
       // work item / candidate so it is not discarded).
@@ -237,8 +246,17 @@ export default function (pi: ExtensionAPI) {
       const evidenceIds: string[] = [];
       for (const ev of outcome.evidence) {
         const recorded = await rt.ledger.recordEvidence(
-          wi?.current_candidate_id ?? null, ev.type, ev.tool, ev.command, ev.exit_code, ev.status,
-          ev.summary, ev.artifacts, ev.trust, wi?.id ?? null, actor,
+          wi?.current_candidate_id ?? null,
+          ev.type,
+          ev.tool,
+          ev.command,
+          ev.exit_code,
+          ev.status,
+          ev.summary,
+          ev.artifacts,
+          ev.trust,
+          wi?.id ?? null,
+          actor,
         );
         evidenceIds.push(recorded.id);
       }
@@ -285,7 +303,8 @@ export default function (pi: ExtensionAPI) {
       }
       ctx.ui.notify("Spawning clean-room challenger (no prior reasoning)...", "info");
       const result = await rt.challenge(
-        rt.ledger.listWorkItems().at(-1) ?? (await rt.ledger.createWorkItem(goal, "medium", [rt.cwd], { type: "user" })),
+        rt.ledger.listWorkItems().at(-1) ??
+          (await rt.ledger.createWorkItem(goal, "medium", [rt.cwd], { type: "user" })),
         goal,
         "",
       );

@@ -1,6 +1,6 @@
-import { test } from "node:test";
 import assert from "node:assert/strict";
-import { id, newWorkItemId, newCandidateId } from "../../src/core/ids.ts";
+import { test } from "node:test";
+import { id, newCandidateId, newWorkItemId } from "../../src/core/ids.ts";
 
 test("ids are unique and prefixed", () => {
   const a = id("WI");

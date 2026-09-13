@@ -1,7 +1,7 @@
-import { test } from "node:test";
 import assert from "node:assert/strict";
-import { topoSort, tasksConflict, blockedByFailure } from "../../src/plan/taskDag.ts";
+import { test } from "node:test";
 import type { Task } from "../../src/core/types.ts";
+import { blockedByFailure, tasksConflict, topoSort } from "../../src/plan/taskDag.ts";
 
 function t(id: string, depends_on: string[], scope_paths: string[] = []): Task {
   return {
@@ -19,13 +19,7 @@ function t(id: string, depends_on: string[], scope_paths: string[] = []): Task {
 
 test("topoSort returns dependencies before dependents", () => {
   // T2/T3/T4 depend on T1; T5 depends on T2 and T3.
-  const tasks = [
-    t("T2", ["T1"]),
-    t("T1", []),
-    t("T4", ["T1"]),
-    t("T5", ["T2", "T3"]),
-    t("T3", ["T1"]),
-  ];
+  const tasks = [t("T2", ["T1"]), t("T1", []), t("T4", ["T1"]), t("T5", ["T2", "T3"]), t("T3", ["T1"])];
   const order = topoSort(tasks);
   const pos = new Map(order.map((x, i) => [x.id, i]));
   for (const task of tasks) {

@@ -1,9 +1,9 @@
-import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { promisify } from "node:util";
-import { writeFile, mkdir } from "node:fs/promises";
+import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { test } from "node:test";
+import { promisify } from "node:util";
 import { ContextBroker, estimateTokens } from "../../src/context/ContextBroker.ts";
 import { makeFixtureRepo } from "../fixtures/make-fixture.ts";
 
@@ -39,7 +39,10 @@ test("flagship goal with punctuation yields a non-empty context package (review 
     // package is not empty and the relevant file is ranked in.
     const pkg = await broker.assembleContext("Implement add(a, b) to return a + b", 4000, []);
     assert.ok(pkg.items.length > 0, "punctuated goal should produce a non-empty package");
-    assert.ok(pkg.items.some((i) => i.path === "src/add.js"), "relevant src/add.js should be included");
+    assert.ok(
+      pkg.items.some((i) => i.path === "src/add.js"),
+      "relevant src/add.js should be included",
+    );
     assert.ok(pkg.totalTokens <= 4000);
   } finally {
     await fixture.cleanup();
@@ -100,7 +103,10 @@ test("assembleContext includes content of relevant files, not only symbol one-li
     // The relevant src/add.js should appear as a file item with real content.
     const addFile = pkg.items.find((i) => i.kind === "file" && i.path === "src/add.js");
     assert.ok(addFile, "relevant file content should be included as a file item");
-    assert.ok((addFile!.summary as string).includes("export function add"), "file item should carry content, not just a symbol line");
+    assert.ok(
+      (addFile!.summary as string).includes("export function add"),
+      "file item should carry content, not just a symbol line",
+    );
   } finally {
     await fixture.cleanup();
   }
@@ -113,7 +119,10 @@ test("searchAny matches any of several literal keywords (review HIGH: join('|') 
     // Multi-keyword: a file matching ANY keyword must be found (not the literal
     // text 'add|sum' which exists nowhere).
     const hits = await broker.searchAny(["add", "sum"]);
-    assert.ok(hits.some((h) => h.path === "src/add.js"), "searchAny must find add.js for keyword 'add'");
+    assert.ok(
+      hits.some((h) => h.path === "src/add.js"),
+      "searchAny must find add.js for keyword 'add'",
+    );
     const literal = await broker.search("add|sum");
     assert.equal(literal.length, 0, "single search() must treat 'add|sum' as literal text (no matches)");
     assert.equal((await broker.searchAny([])).length, 0, "empty keywords yield no hits");

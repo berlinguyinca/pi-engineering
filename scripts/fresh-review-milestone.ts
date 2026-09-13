@@ -1,3 +1,4 @@
+import type { WorkerResult } from "../src/core/types.ts";
 /**
  * Fresh-context review of the artifact-backed lazy diff-retrieval milestone.
  *
@@ -6,7 +7,6 @@
  * stored as an artifact:// reference and read lazily via artifact_read.
  */
 import { PiWorkerExecutor } from "../src/workers/PiWorkerExecutor.ts";
-import type { WorkerResult } from "../src/core/types.ts";
 
 const repo = "/home/wohlgemuth/IdeaProjects/pi-engineering-runtime";
 

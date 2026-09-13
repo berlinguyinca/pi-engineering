@@ -7,7 +7,9 @@ import { EngineeringRuntime } from "../src/runtime/EngineeringRuntime.ts";
 import { PiWorkerExecutor } from "../src/workers/PiWorkerExecutor.ts";
 
 const cwd = process.argv[2];
-const goal = process.argv[3] ?? "Add a clamp(value, min, max) function to src/math.js that clamps value into [min, max], export it from src/index.js, and add a passing test in test/math.test.js";
+const goal =
+  process.argv[3] ??
+  "Add a clamp(value, min, max) function to src/math.js that clamps value into [min, max], export it from src/index.js, and add a passing test in test/math.test.js";
 if (!cwd) {
   console.error("usage: node scripts/dogfood.ts <repo> [goal]");
   process.exit(2);

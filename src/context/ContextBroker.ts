@@ -1,6 +1,6 @@
+import { execFile } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { join, resolve, sep } from "node:path";
-import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { GitRepo } from "../git/GitRepo.ts";
 

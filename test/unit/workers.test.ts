@@ -1,12 +1,20 @@
-import { test } from "node:test";
 import assert from "node:assert/strict";
+import { test } from "node:test";
 import { FakeWorkerExecutor } from "../../src/workers/FakeWorkerExecutor.ts";
+import { WORKER_KICKOFF, buildSystemPrompt } from "../../src/workers/prompts.ts";
 import { workerResultTool } from "../../src/workers/workerResultTool.ts";
-import { buildSystemPrompt, WORKER_KICKOFF } from "../../src/workers/prompts.ts";
 
 test("fake executor returns a bounded structured result for a role", async () => {
   const worker = new FakeWorkerExecutor({
-    scout: () => ({ status: "completed", summary: "scanned repo", claims: [], details: {}, evidence_refs: [], new_hypotheses: [], proposed_tasks: [] }),
+    scout: () => ({
+      status: "completed",
+      summary: "scanned repo",
+      claims: [],
+      details: {},
+      evidence_refs: [],
+      new_hypotheses: [],
+      proposed_tasks: [],
+    }),
   });
   const run = await worker.run({ role: "scout", task: "scan", tools: ["read"], cwd: "/tmp", context: "" });
   assert.equal(run.result.status, "completed");

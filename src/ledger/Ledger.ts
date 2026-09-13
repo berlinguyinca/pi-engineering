@@ -1,3 +1,4 @@
+import { newCandidateId, newEntityId, newEventId, newEvidenceId, newTaskId, newWorkItemId } from "../core/ids.ts";
 import type {
   Actor,
   Candidate,
@@ -13,14 +14,6 @@ import type {
   WorkerRole,
 } from "../core/types.ts";
 import { EventStore } from "./EventStore.ts";
-import {
-  newCandidateId,
-  newEntityId,
-  newEventId,
-  newEvidenceId,
-  newTaskId,
-  newWorkItemId,
-} from "../core/ids.ts";
 
 /**
  * The Engineering Ledger (spec §9): durable, event-sourced shared memory.
@@ -168,12 +161,7 @@ export class Ledger {
 
   // ---------------------------------------------------------------- work items
 
-  async createWorkItem(
-    goal: string,
-    risk: RiskLevel,
-    repositories: string[],
-    actor: Actor,
-  ): Promise<WorkItem> {
+  async createWorkItem(goal: string, risk: RiskLevel, repositories: string[], actor: Actor): Promise<WorkItem> {
     const now = new Date().toISOString();
     const wi: WorkItem = {
       id: newWorkItemId(),
@@ -285,8 +273,6 @@ export class Ledger {
     return task;
   }
 
-
-
   async setTaskStatus(id: string, status: Task["status"], workItemId: string, actor: Actor): Promise<void> {
     const type = status === "completed" ? "task.completed" : status === "blocked" ? "task.blocked" : "task.started";
     await this.emit(type, workItemId, actor, { task_id: id, status });
@@ -297,7 +283,12 @@ export class Ledger {
    * link an executed task to its result work item). Emitted as a task.started
    * event so the change is durable and replayed.
    */
-  async updateTask(id: string, changes: Partial<Pick<Task, "depends_on" | "scope_paths" | "result_work_item_id">>, workItemId: string, actor: Actor): Promise<void> {
+  async updateTask(
+    id: string,
+    changes: Partial<Pick<Task, "depends_on" | "scope_paths" | "result_work_item_id">>,
+    workItemId: string,
+    actor: Actor,
+  ): Promise<void> {
     const t = this.tasks.get(id);
     if (!t) return;
     await this.emit("task.started", workItemId, actor, { task_id: id, ...changes });
@@ -338,21 +329,23 @@ export class Ledger {
       work_item_id: workItemId ?? undefined,
       created_at: new Date().toISOString(),
     };
-    const eventType = (kind === "finding"
-      ? status === "resolved"
-        ? "finding.resolved"
-        : "finding.created"
-      : kind === "hypothesis"
-        ? status === "rejected"
-          ? "hypothesis.rejected"
-          : "hypothesis.created"
-        : kind === "fact"
-          ? "fact.verified"
-          : kind === "decision"
-            ? status === "accepted"
-              ? "decision.accepted"
-              : "decision.proposed"
-            : `${kind}.created`) as LedgerEvent["type"];
+    const eventType = (
+      kind === "finding"
+        ? status === "resolved"
+          ? "finding.resolved"
+          : "finding.created"
+        : kind === "hypothesis"
+          ? status === "rejected"
+            ? "hypothesis.rejected"
+            : "hypothesis.created"
+          : kind === "fact"
+            ? "fact.verified"
+            : kind === "decision"
+              ? status === "accepted"
+                ? "decision.accepted"
+                : "decision.proposed"
+              : `${kind}.created`
+    ) as LedgerEvent["type"];
     await this.emit(eventType, workItemId, actor, { entity });
     return entity;
   }
@@ -417,10 +410,11 @@ export class Ledger {
       const c = this.candidates.get(candidateId);
       if (c) {
         c.evidence_ids = [...c.evidence_ids, ev.id];
-        if (workItemId) await this.emit("candidate.changed", workItemId, actor, {
-          candidate_id: candidateId,
-          changes: { evidence_ids: c.evidence_ids },
-        });
+        if (workItemId)
+          await this.emit("candidate.changed", workItemId, actor, {
+            candidate_id: candidateId,
+            changes: { evidence_ids: c.evidence_ids },
+          });
       }
     }
     return ev;
