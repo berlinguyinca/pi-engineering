@@ -488,7 +488,7 @@ You must NOT inherit any prior candidate reasoning. Inspect the repository with 
         evidence_ids: [], outcome: "blocked", telemetry: this.telemetry,
       };
     }
-    const contextText = this.broker.renderContext(await this.broker.assembleContext(goal, ROLE_BUDGETS.implementer.targetTokens, []));
+    const contextText = await this.safeContext(goal, ROLE_BUDGETS.implementer.targetTokens, []);
 
     // Phase A: independent implementations (no parent lineage).
     const entries: TournamentEntry[] = [];
@@ -580,6 +580,26 @@ You must NOT inherit any prior candidate reasoning. Inspect the repository with 
     return { work_item: wi, risk, n_candidates: n, entries, incumbent_candidate: incumbent, evidence_ids: evidenceIds, outcome, telemetry: this.telemetry };
   }
 
+  /**
+   * Assemble + render the context package, degrading to an empty package (and
+   * a ledger note) rather than aborting the whole run if the broker fails — a
+   * context failure must not silently block otherwise-valid engineering work.
+   */
+  private async safeContext(goal: string, targetTokens: number, required: string[]): Promise<string> {
+    if (!this.broker) return "";
+    try {
+      const pkg = await this.broker.assembleContext(goal, targetTokens, required);
+      return this.broker.renderContext(pkg);
+    } catch (err) {
+      const note = `context assembly failed: ${String(err)}`;
+      await this.ledger.recordEntity("decision", note, "open", this.actor(newRunId(), "planner"), null).catch(() => {});
+      console.warn(note);
+      return `# Task context (0 tokens, budget ${targetTokens})
+(context assembly failed; worker must rely on tools)
+`;
+    }
+  }
+
   async engineer(goal: string): Promise<EngineerReport> {
     if (!this.git) {
       return {
@@ -601,12 +621,7 @@ You must NOT inherit any prior candidate reasoning. Inspect the repository with 
     await this.ledger.recordEntity("requirement", goal, "open", this.actor(newRunId(), "planner"), wi.id);
 
     // Assemble bounded task context.
-    const requiredFiles: string[] = [];
-    let contextText = "";
-    if (this.broker) {
-      const pkg = await this.broker.assembleContext(goal, ROLE_BUDGETS.implementer.targetTokens, requiredFiles);
-      contextText = this.broker.renderContext(pkg);
-    }
+    let contextText = await this.safeContext(goal, ROLE_BUDGETS.implementer.targetTokens, []);
 
     // Scout (medium+).
     let scoutSummary: string | null = null;
@@ -617,10 +632,9 @@ You must NOT inherit any prior candidate reasoning. Inspect the repository with 
       // implementer's context with those files as REQUIRED (content slices
       // included), so the implementer starts with the right files instead of
       // re-exploring the repo and burning tool round-trips.
-      const scoutFiles = scout?.relevantFiles ?? [];
+      const scoutFiles = [...new Set(scout?.relevantFiles ?? [])];
       if (scoutFiles.length && this.broker) {
-        const pkg = await this.broker.assembleContext(goal, ROLE_BUDGETS.implementer.targetTokens, scoutFiles);
-        contextText = this.broker.renderContext(pkg);
+        contextText = await this.safeContext(goal, ROLE_BUDGETS.implementer.targetTokens, scoutFiles);
       }
     }
 

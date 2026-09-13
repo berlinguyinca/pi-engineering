@@ -1,7 +1,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { writeFile, mkdir } from "node:fs/promises";
+import { join } from "node:path";
 import { ContextBroker, estimateTokens } from "../../src/context/ContextBroker.ts";
 import { makeFixtureRepo } from "../fixtures/make-fixture.ts";
+
+const exec = promisify(execFile);
 
 test("token estimation is deterministic", () => {
   assert.equal(estimateTokens("abcd"), 1);
@@ -20,6 +26,54 @@ test("context broker assembles a bounded package from a repo", async () => {
     assert.ok(hits.length >= 1);
     const tests = await broker.testsFor(["add"]);
     assert.ok(tests.some((t) => t.includes("add.test.js")));
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("flagship goal with punctuation yields a non-empty context package (review HIGH F2)", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const broker = (await ContextBroker.open(fixture.root))!;
+    // 'add(a, b)' must yield the keyword 'add' (punctuation stripped), so the
+    // package is not empty and the relevant file is ranked in.
+    const pkg = await broker.assembleContext("Implement add(a, b) to return a + b", 4000, []);
+    assert.ok(pkg.items.length > 0, "punctuated goal should produce a non-empty package");
+    assert.ok(pkg.items.some((i) => i.path === "src/add.js"), "relevant src/add.js should be included");
+    assert.ok(pkg.totalTokens <= 4000);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("oversized required file is truncated, not silently dropped (review MED F3)", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    await writeFile(join(fixture.root, "big.txt"), "x".repeat(8000));
+    const broker = (await ContextBroker.open(fixture.root))!;
+    const pkg = await broker.assembleContext("implement add", 400, ["big.txt"]);
+    const big = pkg.items.find((i) => i.path === "big.txt");
+    assert.ok(big, "required big.txt must be present (truncated), not silently dropped");
+    assert.equal(big.truncated, true);
+    assert.ok(pkg.totalTokens <= 400, "package must stay within budget");
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("repoMap matches ignore tokens against path segments, not substrings (review MED F4)", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    // 'distribution' merely contains the ignore token 'dist'; it must survive.
+    await writeFile(join(fixture.root, "src", "distribution.ts"), "export const x = 1;\n");
+    await mkdir(join(fixture.root, "src", "dist"), { recursive: true });
+    await writeFile(join(fixture.root, "src", "dist", "bundle.js"), "// ignored\n");
+    await exec("git", ["-C", fixture.root, "add", "-A"]);
+    await exec("git", ["-C", fixture.root, "commit", "-qm", "add files"]);
+    const broker = (await ContextBroker.open(fixture.root))!;
+    const map = await broker.repoMap(200);
+    assert.ok(map.includes("src/distribution.ts"), "distribution.ts must not be dropped by the 'dist' ignore token");
+    assert.ok(!map.includes("src/dist/bundle.js"), "a real dist/ directory must still be ignored");
   } finally {
     await fixture.cleanup();
   }
@@ -47,6 +101,22 @@ test("assembleContext includes content of relevant files, not only symbol one-li
     const addFile = pkg.items.find((i) => i.kind === "file" && i.path === "src/add.js");
     assert.ok(addFile, "relevant file content should be included as a file item");
     assert.ok((addFile!.summary as string).includes("export function add"), "file item should carry content, not just a symbol line");
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("searchAny matches any of several literal keywords (review HIGH: join('|') was escaped as a literal)", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const broker = (await ContextBroker.open(fixture.root))!;
+    // Multi-keyword: a file matching ANY keyword must be found (not the literal
+    // text 'add|sum' which exists nowhere).
+    const hits = await broker.searchAny(["add", "sum"]);
+    assert.ok(hits.some((h) => h.path === "src/add.js"), "searchAny must find add.js for keyword 'add'");
+    const literal = await broker.search("add|sum");
+    assert.equal(literal.length, 0, "single search() must treat 'add|sum' as literal text (no matches)");
+    assert.equal((await broker.searchAny([])).length, 0, "empty keywords yield no hits");
   } finally {
     await fixture.cleanup();
   }

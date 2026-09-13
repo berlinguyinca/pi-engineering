@@ -17,7 +17,7 @@ and the gap is called out here.
 | Artifact store (`artifact://` URIs, lazy reads) | **Works** | `test/unit/artifacts.test.ts` |
 | Artifact-backed lazy candidate-diff review (no inline diff) | **Works** | integration: lazy-diff + stale-artifact tests; `artifact_read` pagination |
 | Worktree isolation + controlled promote-merge (INV-003/004/005) | **Works** | `test/unit/git.test.ts`; integration tests |
-| Deterministic verification (`CommandVerifier`) | **Works** | `test/unit/verifier.test.ts` (30 tests passing) |
+| Deterministic verification (`CommandVerifier`) | **Works** | `test/unit/verifier.test.ts` |
 | Fresh-context worker sessions, bounded structured results (INV-001) | **Works** | `test/unit/workers.test.ts`; real-model dogfood |
 | Role context-token budget enforcement | **Works** | `PiWorkerExecutor` abort on overflow; budget threading tests |
 | INV-006 machine-evidence gating | **Works** | `isMachineEvidence()` in claims path |
@@ -25,13 +25,14 @@ and the gap is called out here.
 | Review-completion gate (incomplete review ≠ clean review) | **Works** | integration: incomplete-review tests (engineer + tournament) |
 | Clean-room challenger for high/critical risk (§12.2) | **Works** | integration: challenger test |
 | Candidate tournaments (independent candidates, deterministic winner) | **Works** | integration: tournament test |
+| Relevance-ranked context + scout-guided required files | **Works** | `context.test.ts`, integration: scout-required test |
 | Fresh-context review loop (fix rounds carry diff+findings feedback) | **Works** | integration: fix-round test |
 | `/commands` + semantic tools in pi | **Works** | `scripts/smoke-commands.ts`, `scripts/smoke-installed.ts` |
 | Real-model end-to-end dogfood | **Works** | `scripts/dogfood.ts`; see below |
 
 **Verification evidence (last full run):**
 - `npx tsc --noEmit` — passes.
-- `npm test` — 39/39 passing (unit + integration).
+- `npm test` — 49/49 passing (unit + integration).
 - Standalone install: pi's `ResourceLoader` discovers and loads the package
   extension with zero errors (`scripts/smoke-installed.ts`).
 - Real dogfood (`qwen3.8-27b`): `titleCase()` added to `src/transform.js`,
@@ -84,24 +85,7 @@ review is never treated as a clean review. Covered by two regression tests.
 These are in the spec but intentionally deferred to keep the vertical slice
 reversible and small. They are the next candidates, in rough priority order.
 
-### 1. Candidate tournaments (multiple candidate branches, then pick a winner)
-
-The spec describes tournaments where several independent candidates compete and
-a winner is selected. Today the runtime produces **one candidate per round** and
-promotes on clean verify+review.
-
-- **Why deferred:** tournaments require either multiple models (out of scope) or
-  multiple sequential implementations, which is compute-heavy and adds a
-  selection/arbitration step with its own risk. The single-candidate pipeline
-  proves all the isolation/evidence/promotion machinery a tournament needs.
-- **What it needs:** a `tournament()` orchestrator that spawns N candidate
-  branches from the same base, verifies+reviews each independently, then selects
-  the winner deterministically (e.g. fewest findings, then cleanest diff). The
-  candidate DAG already supports this (`parent_id` lineage exists).
-- **Risk:** selection criteria are easy to get wrong (silent bias). Must stay
-  deterministic and evidence-driven.
-
-### 2. Task DAGs / multi-step work items
+### 1. Task DAGs / multi-step work items
 
 Today a work item is a single goal implemented in one shot (with fix rounds).
 The spec allows decomposing a larger goal into dependent tasks with ordering.
@@ -111,7 +95,7 @@ The spec allows decomposing a larger goal into dependent tasks with ordering.
 - **What it needs:** a task planner that emits an ordered list of sub-goals, each
   run through the existing pipeline, with dependency edges recorded in the ledger.
 
-### 3. Verify profile caching
+### 2. Verify profile caching
 
 `Verifier.detect()` re-reads `package.json` and re-derives the profile on every
 call. Caching the profile per-repo (keyed on package.json content) would cut a
@@ -121,7 +105,7 @@ small amount of work in multi-round runs.
 - **What it needs:** an in-memory (or `.pi-eng/`-persisted) cache keyed on the
   detected inputs, invalidated on change.
 
-### 4. `/verify` full-suite mode
+### 3. `/verify` full-suite mode
 
 `/verify` currently runs the detected profile (typecheck/test/build). A
 `/verify full` variant could additionally run lint + a broader test set and
@@ -136,9 +120,6 @@ record all of it as evidence.
   The spec's "multiple models" provisions are out of scope by project constraint.
   This means a reviewer and an implementer can share a failure mode (anchoring).
   The clean-room challenger mitigates this for high/critical risk only.
-- **`requiredFiles` is currently always `[]`** in the runtime's context assembly.
-  The hook exists but no caller sets it yet; context is assembled from the whole
-  repo map + grep, not from an explicit required-file list.
 - **Promotion is a merge, not a squash.** The incumbent history accumulates one
   "implementation candidate" + one "promote" commit per accepted round. This is
   intentional (auditable lineage) but is noisier than a squash.
@@ -181,15 +162,51 @@ failure gating, empty-diff consistency; remaining test-gap items added).
 - **`pi -p` (print mode) hangs in this environment** regardless of the extension;
   confirmed as environmental, not caused by this package.
 
+## Relevance-ranked context + scout-guided required files (implemented)
+
+**Milestone: Context Broker improvements (priority #2).** The broker now ranks
+repository files by relevance to the goal and feeds the scout's identified
+change surface directly to the implementer.
+
+- **`rankFiles()`** scores files by goal-keyword path matches plus *distinct*
+goal symbols found via `git grep` (counting distinct keywords, not raw line
+frequency, so a test file that repeats one symbol is not over-weighted), with a
+deterministic non-test/shorter-path tie-break.
+- **`assembleContext()`** now includes content slices of the most relevant files
+(not just one-line symbol hits), bounded by the token budget, so a worker starts
+with the actual code it needs instead of re-fetching it with tool round-trips.
+- **Scout-guided required files:** `scout()` returns the concrete files it
+identifies (`details.relevant_files`); `engineer()` re-assembles the implementer
+context with those as REQUIRED, closing the previously-unused `requiredFiles`
+hook. Oversized required files are truncated (never silently dropped).
+- **Keyword extraction** now strips punctuation (`'Implement add(a, b)'` →
+keyword `add`), so a punctuated goal no longer yields an empty context package.
+- **Multi-keyword search** (`searchAny`) builds a safe per-keyword alternation;
+`search()` remains a literal single-query, so regex metacharacters in a goal are
+never treated as regex.
+- **Error containment:** a context-assembly failure degrades to an empty package
+plus a ledger note instead of aborting the run.
+
+Dogfood (real model, fresh fixture): **1 round**, promoted, **0 blocked/failed
+workers**, **30 tool calls**, **4/4 tests pass**, max worker context **11.6k**.
+Machine evidence: `test/unit/context.test.ts` (ranking order, relevant-file
+content, punctuated-goal non-empty package, oversized-required truncation,
+segment-based ignore matching, `searchAny` alternation) and the integration test
+("scout-identified files become required context for the implementer"), 49/49
+tests pass, `tsc` clean. Fresh-context review reported 1 HIGH (multi-keyword
+`search('a|b')` was escaped as a literal → fixed via `searchAny`), plus MEDIUM
+findings all fixed with regression tests (punctuation keyword extraction,
+oversized-required truncation, segment-based ignores, scout-file dedupe,
+context-assembly error containment).
+
 ## Next slice
 
-**Context Broker improvements (priority #2).** The next highest-value slice.
-Today the broker assembles context from goal-keyword `git grep` plus a bounded
-file list; it does not rank files by relevance to the actual change, does not
-reuse prior `assembleContext` results across rounds, and the `requiredFiles`
-hook is never populated. A small improvement — symbol-aware relevance ranking and
-caching the assembled package per-goal — would cut implementer context and tokens
-in multi-round runs, which dogfooding shows is the next real pain point.
+**Task DAGs (priority #3).** The next highest-value slice: decompose a larger
+goal into an ordered list of dependent sub-goals, each run through the existing
+pipeline, with dependency edges recorded in the ledger. This increases the
+breadth of work items the runtime can accept and exercises the ledger's
+lineage model (`parent_id`). A close second is **verify-profile caching** (item
+2 below), a small token saver in multi-round runs.
 
 **Candidate tournaments:** already implemented as a vertical slice.
 `EngineeringRuntime.tournament(goal, { n })` spawns N independent candidates

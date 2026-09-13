@@ -1,8 +1,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { EngineeringRuntime } from "../../src/runtime/EngineeringRuntime.ts";
+
+const execFileAsync = promisify(execFile);
 import { FakeWorkerExecutor } from "../../src/workers/FakeWorkerExecutor.ts";
 import { CommandVerifier } from "../../src/verify/Verifier.ts";
 import { buildCoreTools } from "../../src/tools/coreTools.ts";
@@ -433,12 +437,18 @@ test("scout-identified files become required context for the implementer (milest
   const fixture = await makeFixtureRepo();
   try {
     const ctx = { scout: "", impl: "" };
+    // A file with NO relevance to the 'add' goal: ranking would never select
+    // it, so if the implementer context carries its content it must have
+    // arrived via the scout->required path.
+    await writeFile(join(fixture.root, "docs", "note.md"), "# design note\n\nhello world notes\n");
+    await execFileAsync("git", ["-C", fixture.root, "add", "-A"]);
+    await execFileAsync("git", ["-C", fixture.root, "commit", "-qm", "add note"]);
     const worker = new FakeWorkerExecutor({
       scout: (req) => {
         ctx.scout = req.context ?? "";
         return {
           status: "completed", summary: "s", claims: [],
-          details: { relevant_files: ["src/add.js"] },
+          details: { relevant_files: ["docs/note.md"] },
           evidence_refs: [], new_hypotheses: [], proposed_tasks: [],
         };
       },
@@ -452,10 +462,10 @@ test("scout-identified files become required context for the implementer (milest
     const rt = await EngineeringRuntime.open({ cwd: fixture.root, worker, verifier: new CommandVerifier() });
     const report = await rt.engineer("Implement add(a, b) to return a + b");
     assert.equal(report.outcome, "promoted");
-    // The implementer's context was re-assembled with the scout's file as a
-    // REQUIRED item, so it carries that file's content.
-    assert.ok(ctx.impl.includes("not implemented"), "implementer context should include the scout-identified file's content");
-    assert.ok(ctx.impl !== ctx.scout, "implementer context should be re-assembled after the scout");
+    // docs/note.md was NOT in the scout's own (ranking-only) context...
+    assert.ok(!ctx.scout.includes("hello world notes"), "scout context should not already contain docs/note.md via ranking");
+    // ...but IS in the implementer's re-assembled (scout-required) context.
+    assert.ok(ctx.impl.includes("hello world notes"), "implementer context should carry the scout-identified required file's content");
   } finally {
     await fixture.cleanup();
   }

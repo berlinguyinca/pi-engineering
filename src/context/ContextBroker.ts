@@ -14,6 +14,8 @@ export interface ContextItem {
   summary: string;
   estimatedTokens: number;
   required: boolean;
+  /** True when a required file's slice was truncated to fit the remaining budget. */
+  truncated?: boolean;
 }
 
 /** A bounded context package assembled for a task (spec §10, §17.2). */
@@ -37,6 +39,21 @@ const DEFAULT_IGNORES = [".git", "node_modules", "dist", "build", "out", ".pi-en
 /** Escape regex metacharacters so goal keywords are searched as literals. */
 function escapeRegex(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * Derive searchable keywords from a goal by extracting alphanumeric runs
+ * (stripping punctuation). 'Implement add(a, b) to return a + b' yields
+ * ['Implement', 'add', 'to', 'return'] — NOT the broken token 'add(a,' that a
+ * whitespace split produces. Bounded and de-duplicated.
+ */
+function isTestPath(p: string): boolean {
+  return /(^|\/)test\//i.test(p) || /\.test\.|_test\./i.test(p) || /\/tests\//i.test(p);
+}
+
+function goalKeywords(goal: string, limit = 6): string[] {
+  const matches = goal.match(/[A-Za-z][A-Za-z0-9_]{1,}/g) ?? [];
+  return [...new Set(matches)].slice(0, limit);
 }
 
 /** Rough token estimate: ~4 chars per token. */
@@ -71,18 +88,22 @@ export class ContextBroker {
     const r = await exec("git", ["-C", this.repoRoot, "ls-files"], { maxBuffer: 64 * 1024 * 1024 });
     const files = r.stdout
       .split("\n")
-      .filter((f) => f.trim() && !DEFAULT_IGNORES.some((ig) => f.includes(ig)))
+      // Match ignore tokens against whole path SEGMENTS, not substrings, so a
+      // real file like "distribution.ts" is not dropped merely because its
+      // name contains "dist".
+      .filter((f) => f.trim() && !DEFAULT_IGNORES.some((ig) => f.split("/").some((seg) => seg === ig)))
       .slice(0, limit);
     return files;
   }
 
-  /** Symbol/text search over the repo (git grep; bounded output). */
-  async search(query: string, limit = 40): Promise<SearchHit[]> {
+  /** Run a git grep over the repo with an already-built ERE pattern. */
+  private async grep(pattern: string, limit: number): Promise<SearchHit[]> {
+    if (!pattern.trim()) return []; // an empty pattern would match every line
     let out = "";
     try {
       const r = await exec(
         "git",
-        ["-C", this.repoRoot, "grep", "-n", "-E", "--no-color", "-I", "-e", escapeRegex(query), "--", "."],
+        ["-C", this.repoRoot, "grep", "-n", "-E", "--no-color", "-I", "-e", pattern, "--", "."],
         { maxBuffer: 4 * 1024 * 1024, timeout: 30_000 },
       );
       out = r.stdout;
@@ -93,7 +114,7 @@ export class ContextBroker {
       // for a valid goal containing regex metacharacters.
       const e = err as { code?: number };
       if (e.code === 1) return [];
-      throw new Error(`git grep failed for query ${JSON.stringify(query)}: ${String(err)}`);
+      throw new Error(`git grep failed for pattern ${JSON.stringify(pattern)}: ${String(err)}`);
     }
     const hits: SearchHit[] = [];
     for (const line of out.split("\n")) {
@@ -107,6 +128,22 @@ export class ContextBroker {
       if (hits.length >= limit) break;
     }
     return hits;
+  }
+
+  /** Literal symbol/text search over the repo (single query, regex-safe). */
+  async search(query: string, limit = 40): Promise<SearchHit[]> {
+    return this.grep(escapeRegex(query), limit);
+  }
+
+  /**
+   * Search for ANY of several literal keywords, building a safe alternation by
+   * escaping each keyword individually (so 'a|b' matches files containing a
+   * OR b — never the literal text 'a|b').
+   */
+  async searchAny(keywords: string[], limit = 40): Promise<SearchHit[]> {
+    const kws = keywords.map((k) => k.trim()).filter(Boolean);
+    if (kws.length === 0) return [];
+    return this.grep(kws.map(escapeRegex).join("|"), limit);
   }
 
   /**
@@ -128,7 +165,7 @@ export class ContextBroker {
 
   /** Discover test files relevant to given symbols (name/ref matching). */
   async testsFor(symbols: string[], limit = 20): Promise<string[]> {
-    const hits = await this.search(symbols.join("|"), limit);
+    const hits = await this.searchAny(symbols, limit);
     const testFiles = new Set<string>();
     for (const h of hits) {
       if (/test|spec|__tests__/i.test(h.path)) testFiles.add(h.path);
@@ -158,7 +195,7 @@ export class ContextBroker {
     // relevant than one with many incidental matches of a single keyword
     // (raw line frequency would over-weight a test file that repeats a symbol).
     const lowerKw = keywords.map((k) => k.toLowerCase());
-    const hits = await this.search(keywords.join("|"), 200);
+    const hits = await this.searchAny(keywords, 200);
     const byPath = new Map<string, Set<string>>();
     for (const h of hits) {
       const text = h.text.toLowerCase();
@@ -171,7 +208,15 @@ export class ContextBroker {
       score.set(path, (score.get(path) ?? 0) + Math.min(matchedKws.size, 5));
     }
     return [...score.entries()]
-      .sort((a, b) => b[1] - a[1])
+      .sort((a, b) => {
+        if (b[1] !== a[1]) return b[1] - a[1];
+        // Tie-break: prefer non-test source files, then shorter paths, so
+        // ranking is deterministic and not an artifact of ls-files order.
+        const at = isTestPath(a[0]);
+        const bt = isTestPath(b[0]);
+        if (at !== bt) return at ? 1 : -1;
+        return a[0].length - b[0].length;
+      })
       .slice(0, limit)
       .map(([p]) => p);
   }
@@ -188,22 +233,38 @@ export class ContextBroker {
       return true;
     };
 
-    // Required files first.
+    // Required files first. If a required file's slice would exceed the
+    // remaining budget it is TRUNCATED (not silently dropped) so the
+    // "required context" guarantee holds even for large files.
     for (const rel of required) {
       const text = await this.readSlice(rel, 0, 300);
-      if (text !== null) {
+      if (text === null) continue;
+      const remaining = targetTokens - total;
+      const est = estimateTokens(text);
+      if (est > remaining && remaining > 0) {
+        const slice = text.slice(0, Math.max(0, Math.floor(remaining * 4)));
+        push({
+          id: `file:${rel}`,
+          kind: "file",
+          path: rel,
+          summary: slice,
+          estimatedTokens: estimateTokens(slice),
+          required: true,
+          truncated: true,
+        });
+      } else {
         push({
           id: `file:${rel}`,
           kind: "file",
           path: rel,
           summary: text,
-          estimatedTokens: estimateTokens(text),
+          estimatedTokens: est,
           required: true,
         });
       }
     }
 
-    const keywords = goal.split(/\s+/).filter((w) => w.length >= 3).slice(0, 6);
+    const keywords = goalKeywords(goal);
     const seen = new Set(items.map((i) => i.id));
 
     // Relevance-ranked file content: include the most relevant files' content
@@ -225,7 +286,7 @@ export class ContextBroker {
     }
 
     // Symbol one-liners from the goal keywords (fill remaining budget).
-    const hits = await this.search(keywords.join("|"), 20);
+    const hits = await this.searchAny(keywords, 20);
     for (const hit of hits) {
       if (seen.has(`symbol:${hit.path}`)) continue;
       seen.add(`symbol:${hit.path}`);
