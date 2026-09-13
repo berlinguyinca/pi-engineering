@@ -93,6 +93,9 @@ export async function runCheck(check: { command: string[] }, cwd: string, timeou
 export function requiredTypes(milestones: MilestoneDef[]): EvidenceType[] {
   const set = new Set<EvidenceType>();
   for (const m of milestones) {
+    // Deferred milestones are out of release scope and must not force their
+    // evidence types to run (and must not receive per-milestone records).
+    if (m.deferredReason) continue;
     for (const t of m.verification.requires) set.add(t);
     for (const c of m.acceptance) for (const r of c.evidence.required) set.add(r.type);
   }

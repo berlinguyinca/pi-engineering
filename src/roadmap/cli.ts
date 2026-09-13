@@ -34,10 +34,9 @@ function printHuman(result: RoadmapCheckResult, kind: "check" | "status"): strin
   return lines.join("\n");
 }
 
-export async function runRoadmapCheck(opts: RoadmapCliOptions): Promise<RoadmapCliResult> {
-  let engine: RoadmapEngine;
+async function openEngine(opts: RoadmapCliOptions): Promise<RoadmapEngine | RoadmapCliResult> {
   try {
-    engine = await RoadmapEngine.open({
+    return await RoadmapEngine.open({
       repoRoot: opts.repoRoot,
       roadmapPath: opts.roadmapPath,
       evidenceFile: opts.evidenceFile,
@@ -47,24 +46,25 @@ export async function runRoadmapCheck(opts: RoadmapCliOptions): Promise<RoadmapC
     const code = (err instanceof RoadmapError ? err.exitCode : 3) as RoadmapCheckExitCode;
     return { exitCode: code, text: opts.json ? JSON.stringify({ error: String(err), exitCode: code }) : String(err) };
   }
+}
+
+function isResult(r: RoadmapEngine | RoadmapCliResult): r is RoadmapCliResult {
+  return !(r instanceof RoadmapEngine);
+}
+
+export async function runRoadmapCheck(opts: RoadmapCliOptions): Promise<RoadmapCliResult> {
+  const opened = await openEngine(opts);
+  if (isResult(opened)) return opened;
+  const engine = opened;
   const result = await engine.check({ refresh: opts.refresh });
   const text = opts.json ? JSON.stringify(result, null, 2) : printHuman(result, "check");
   return { exitCode: result.exitCode as RoadmapCheckExitCode, text };
 }
 
 export async function runRoadmapStatus(opts: RoadmapCliOptions): Promise<RoadmapCliResult> {
-  let engine: RoadmapEngine;
-  try {
-    engine = await RoadmapEngine.open({
-      repoRoot: opts.repoRoot,
-      roadmapPath: opts.roadmapPath,
-      evidenceFile: opts.evidenceFile,
-      manualEvidencePath: opts.manualEvidencePath,
-    });
-  } catch (err) {
-    const code = (err instanceof RoadmapError ? err.exitCode : 3) as RoadmapCheckExitCode;
-    return { exitCode: code, text: opts.json ? JSON.stringify({ error: String(err), exitCode: code }) : String(err) };
-  }
+  const opened = await openEngine(opts);
+  if (isResult(opened)) return opened;
+  const engine = opened;
   const detail = await engine.evaluate();
   const result: RoadmapCheckResult = {
     roadmap: `${detail.roadmapId}@${detail.version}`,

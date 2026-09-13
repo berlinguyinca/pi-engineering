@@ -118,10 +118,11 @@ export class RoadmapEngine {
     for (const d of docs) {
       const r = d as Partial<RoadmapEvidence>;
       if (!r.id || !r.type) continue;
-      // Manual evidence may only cover model-dependent types (dogfood,
-      // fresh_review). A hand-written record of a GENERATED type (e.g. unit)
-      // must never satisfy acceptance criteria without a real check run.
-      if (GENERATED_TYPES.includes(r.type as EvidenceType)) continue;
+      // Manual evidence may ONLY be of a model-dependent type (dogfood,
+      // fresh_review). Whitelist MANUAL_TYPES so a hand-written record of any
+      // generated/other type (unit, integration, e2e, test, ...) can never
+      // satisfy acceptance criteria without a real check run.
+      if (!MANUAL_TYPES.includes(r.type as EvidenceType)) continue;
       // Only an explicit "pass" counts as passing; any other value (including
       // "error"/typos) is treated as NOT passing (fail-closed).
       const status = r.status === "pass" ? "pass" : "fail";

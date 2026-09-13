@@ -271,6 +271,15 @@ export function parseRoadmap(
     });
   }
 
+  assertUnique(waivers, (w) => w.id, "waiver", issues);
+  for (const w of waivers) {
+    if (!byId.has(w.milestone))
+      issues.push({
+        path: `waivers.${w.id}`,
+        message: `waiver.milestone references unknown milestone '${w.milestone}'`,
+      });
+  }
+
   if (issues.length > 0) return { roadmap: null, issues };
   return {
     roadmap: {

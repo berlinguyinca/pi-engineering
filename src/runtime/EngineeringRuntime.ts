@@ -1258,8 +1258,10 @@ Goal: "${goal}"`;
     // Autonomous stop: when the roadmap is complete, do NOT invent new work.
     // Completion is derived (roadmap check), never declared (roadmap spec §13).
     if (this.roadmapComplete && (await this.roadmapComplete())) {
+      const wi = await this.ledger.createWorkItem(goal, "medium", [this.cwd], this.actor(newRunId(), "planner"));
+      await this.ledger.updateWorkItem(wi.id, { status: "BLOCKED" }, this.actor(newRunId(), "planner"));
       return {
-        work_item: await this.ledger.createWorkItem(goal, "medium", [this.cwd], this.actor(newRunId(), "planner")),
+        work_item: wi,
         risk: "medium",
         incumbent_candidate: null,
         scout_summary: "Skipped: roadmap complete — autonomous stop (no new work invented).",

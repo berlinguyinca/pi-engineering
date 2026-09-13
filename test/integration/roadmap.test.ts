@@ -196,6 +196,69 @@ test("roadmap check: hand-written manual evidence of a GENERATED type is rejecte
   }
 });
 
+test("roadmap check: manual record of a non-manual type ('test') is rejected (whitelist)", async () => {
+  // 'test' is in ALL_EVIDENCE_TYPES but is neither a generated check nor a
+  // manual type; a hand-written record of it must not satisfy criteria.
+  const setup = await setupRepo();
+  try {
+    const engine = await RoadmapEngine.open({ repoRoot: setup.root, ...setup.paths });
+    const head = await engine.head();
+    for (const t of ["unit", "integration", "typecheck", "lint", "package_load"] as const) {
+      await engine.store.put({
+        id: `__global__:${t}`,
+        milestone: "__global__",
+        type: t,
+        status: "pass",
+        commit: head,
+        generatedAt: new Date().toISOString(),
+        paths: ["src/", "test/"],
+        proof: "test",
+        source: "generated",
+      });
+    }
+    // The only unit evidence is a hand-written 'test'-type manual record.
+    await writeFile(
+      setup.paths.manualEvidencePath,
+      `- id: fake-unit
+  milestone: M01
+  criterionId: M01-A1
+  type: test
+  status: pass
+  commit: ${head}
+  paths: ["src/"]
+  proof: "hand-written"
+- id: dogfood-1.0
+  milestone: __global__
+  type: dogfood
+  status: pass
+  commit: ${head}
+  paths: ["src/"]
+  proof: "test"
+- id: review-1.0
+  milestone: __global__
+  type: fresh_review
+  status: pass
+  commit: ${head}
+  paths: ["src/roadmap/"]
+  findings: { critical: 0, high: 0 }
+  proof: "test"
+`,
+    );
+    const { exitCode } = await runRoadmapCheck({
+      repoRoot: setup.root,
+      ...setup.paths,
+      json: false,
+      refresh: false,
+    });
+    assert.equal(exitCode, 1);
+    const detail = await engine.evaluate();
+    const m = detail.milestones.find((e) => e.milestone.id === "M01");
+    assert.notEqual(m?.state, "VERIFIED");
+  } finally {
+    await setup.cleanup();
+  }
+});
+
 test("roadmap check: stale fresh_review record fails the release gate", async () => {
   const setup = await setupRepo();
   try {

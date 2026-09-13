@@ -132,6 +132,23 @@ test("schema: invalid YAML is an issue", () => {
   assert.ok(issues.some((i) => i.message.includes("YAML parse error")));
 });
 
+test("schema: duplicate waiver ids are rejected", () => {
+  const yaml = validYaml().replace(
+    "waivers: []",
+    "waivers:\n  - id: w1\n    milestone: M01\n  - id: w1\n    milestone: M01",
+  );
+  const { roadmap, issues } = parseRoadmap(yaml, ALLOWED);
+  assert.equal(roadmap, null);
+  assert.ok(issues.some((i) => i.path.includes("waiver") && i.message.includes("duplicate")));
+});
+
+test("schema: waiver referencing an unknown milestone is rejected", () => {
+  const yaml = validYaml().replace("waivers: []", "waivers:\n  - id: w1\n    milestone: M99");
+  const { roadmap, issues } = parseRoadmap(yaml, ALLOWED);
+  assert.equal(roadmap, null);
+  assert.ok(issues.some((i) => i.path.includes("w1") && i.message.includes("unknown milestone")));
+});
+
 test("schema: release-gate gate values must be 'pass'", () => {
   const yaml = validYaml().replace("typecheck: pass", "typecheck: fail");
   const { roadmap, issues } = parseRoadmap(yaml, ALLOWED);
