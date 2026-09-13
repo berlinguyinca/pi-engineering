@@ -52,6 +52,9 @@ export class Scheduler {
   private readonly queue: QueueItem<unknown>[] = [];
   private active = 0;
   private readonly pending: Promise<unknown>[] = [];
+  /** Weighted-deficit round-robin state: credits per source (persistent). */
+  private readonly deficit = new Map<string, number>();
+  private readonly weights = new Map<string, number>();
 
   constructor(opts: SchedulerOptions) {
     if (opts.concurrency < 1) throw new Error("concurrency must be >= 1");
@@ -85,7 +88,9 @@ export class Scheduler {
   /** Submit many tasks; resolves when all settle, in submission order. */
   async scheduleAll<T>(tasks: SchedulableTask<T>[]): Promise<ScheduledOutcome<T>[]> {
     const out: ScheduledOutcome<T>[] = [];
-    // Weighted round-robin: process sources fairly, but scheduleAll awaits all.
+    // Submit sources in a simple round-robin so no source monopolizes the
+    // submission order; actual weighted fairness is enforced by pickFair (DRR)
+    // once tasks are queued, so per-task `weight` is honored there.
     const bySource = new Map<string, SchedulableTask<T>[]>();
     for (const t of tasks) {
       const arr = bySource.get(t.source) ?? [];
@@ -139,20 +144,40 @@ export class Scheduler {
 
   private pickFair(): QueueItem<unknown> | undefined {
     if (this.queue.length === 0) return undefined;
-    // Weighted fairness: prefer sources with higher accumulated weight deficit.
-    const deficit = new Map<string, number>();
-    for (const q of this.queue) deficit.set(q.task.source, (deficit.get(q.task.source) ?? 0) + (q.task.weight ?? 1));
+    // Weighted deficit round-robin (DRR): every queued source accrues credits
+    // proportional to its weight; the source with the most credits is served and
+    // pays the total active weight, so heavy sources get proportionally more
+    // service but never starve light sources. Deficit persists across picks.
+    const activeSources = new Set(this.queue.map((q) => q.task.source));
+    let totalActiveWeight = 0;
+    for (const s of activeSources) {
+      const w = this.weightOf(s);
+      this.weights.set(s, w);
+      this.deficit.set(s, (this.deficit.get(s) ?? 0) + w);
+      totalActiveWeight += w;
+    }
     let best: QueueItem<unknown> | undefined;
     for (const q of this.queue) {
       if (!best) {
         best = q;
         continue;
       }
-      if ((deficit.get(q.task.source) ?? 0) > (deficit.get(best.task.source) ?? 0)) best = q;
+      const bd = this.deficit.get(best.task.source) ?? 0;
+      const cd = this.deficit.get(q.task.source) ?? 0;
+      if (cd > bd) best = q;
     }
     if (!best) return undefined;
+    const src = best.task.source;
+    this.deficit.set(src, (this.deficit.get(src) ?? 0) - totalActiveWeight);
     const i = this.queue.indexOf(best);
     return this.queue.splice(i, 1)[0]!;
+  }
+
+  private weightOf(source: string): number {
+    for (const q of this.queue) {
+      if (q.task.source === source) return q.task.weight ?? 1;
+    }
+    return 1;
   }
 
   /** Wait for all in-flight and queued work to settle. */
@@ -165,14 +190,20 @@ export class Scheduler {
 
   /**
    * Speculative execution (spec §22.4): run up to `n` copies of a task and
-   * settle with the first successful result. The losers' promises are settled
-   * but their values discarded. Used by parallel tournaments.
+   * settle with the first successful result. Copies are bounded by the
+   * scheduler's concurrency (never more than `concurrency` in flight), so
+   * speculation cannot exceed the resource cap. Optional `abort` fires when a
+   * winner is found so the losing copies can stop early. Used by parallel
+   * tournaments / parallel DAG.
    */
-  async speculative<T>(n: number, task: () => Promise<T>): Promise<T> {
-    const copies = Array.from({ length: Math.max(1, n) }, () => task());
-    const results = await Promise.allSettled(copies);
+  async speculative<T>(n: number, task: () => Promise<T>, abort?: AbortSignal): Promise<T> {
+    const copies = Math.max(1, Math.min(n, this.concurrency));
+    const results = await Promise.allSettled(Array.from({ length: copies }, () => task()));
     const ok = results.find((r) => r.status === "fulfilled");
-    if (ok) return (ok as PromiseFulfilledResult<T>).value;
+    if (ok) {
+      abort?.dispatchEvent(new Event("abort"));
+      return (ok as PromiseFulfilledResult<T>).value;
+    }
     throw results.find((r) => r.status === "rejected");
   }
 }

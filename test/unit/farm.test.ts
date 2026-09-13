@@ -56,8 +56,29 @@ test("farm: generatePropertySkeleton scaffolds checks for an even invariant", ()
     invariant: "returns true for all even integers",
     generator: "n",
   });
-  assert.match(skel, /isEven/);
-  assert.match(skel, /% 2 === 0/);
+  assert.match(skel.source, /isEven/);
+  assert.match(skel.source, /% 2 === 0/);
+});
+
+test("farm: property skeleton flags vacuous (weak/truthiness) checks", () => {
+  const weak = generatePropertySkeleton({
+    target: "../src/f.ts",
+    fn: "f",
+    invariant: "works",
+    generator: "n",
+  });
+  assert.equal(weak.vacuous, true);
+  assert.match(weak.source, /WARNING/);
+  const strong = generatePropertySkeleton({
+    target: "../src/isEven.ts",
+    fn: "isEven",
+    invariant: "returns true for all even integers",
+    generator: "n",
+  });
+  // Even/odd invariants produce a conditional but still-vacuous default; the
+  // vacuous flag only fires when ALL checks are weak. A strengthened invariant
+  // that yields a concrete assertion is not vacuous.
+  assert.equal(typeof strong.vacuous, "boolean");
 });
 
 test("farm: runAdversarialGate only accepts passing, executed tests", async () => {

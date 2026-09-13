@@ -46,9 +46,26 @@ export function topoSort(tasks: Task[]): Task[] {
   return order.map((id) => byId.get(id)!);
 }
 
+/** Normalize a scope path: strip a trailing slash so dirs and files compare cleanly. */
+function norm(p: string): string {
+  return p.replace(/\/$/, "");
+}
+
+/**
+ * True when two scope paths overlap: equal, or one is a directory-prefix of the
+ * other (so `src/` conflicts with `src/foo.ts`, not just exact-string equality).
+ */
+export function scopesOverlap(a: string, b: string): boolean {
+  const x = norm(a);
+  const y = norm(b);
+  if (x === y) return true;
+  if (x.startsWith(`${y}/`) || y.startsWith(`${x}/`)) return true;
+  return false;
+}
+
 /** True when two tasks share an overlapping write scope (path-level conflict). */
 export function tasksConflict(a: Task, b: Task): boolean {
-  return a.scope_paths.some((p) => b.scope_paths.includes(p));
+  return a.scope_paths.some((p) => b.scope_paths.some((q) => scopesOverlap(p, q)));
 }
 
 /** Resolve the set of tasks that become un-runnable if `failed` are blocked. */

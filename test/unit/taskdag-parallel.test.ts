@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { Task } from "../../src/core/types.ts";
-import { tasksConflict, topoSort } from "../../src/plan/taskDag.ts";
+import { scopesOverlap, tasksConflict, topoSort } from "../../src/plan/taskDag.ts";
 import { EngineeringRuntime } from "../../src/runtime/EngineeringRuntime.ts";
 
 function t(id: string, depends_on: string[], scope_paths: string[]): Task {
@@ -92,6 +92,18 @@ test("parallel waves: preserve topological validity within and across waves", ()
 test("tasksConflict: shared scope path is a conflict", () => {
   assert.equal(tasksConflict(t("A", [], ["src/x.ts"]), t("B", [], ["src/x.ts"])), true);
   assert.equal(tasksConflict(t("A", [], ["src/x.ts"]), t("B", [], ["src/y.ts"])), false);
+});
+
+test("scopesOverlap: directory scope conflicts with a descendant file", () => {
+  assert.equal(scopesOverlap("src/", "src/foo.ts"), true, "directory vs descendant must conflict");
+  assert.equal(scopesOverlap("src/foo.ts", "src/foo.ts"), true);
+  assert.equal(scopesOverlap("src/foo.ts", "src/bar.ts"), false);
+  assert.equal(scopesOverlap("src", "src/foo.ts"), true, "trailing slash is normalized");
+});
+
+test("tasksConflict: directory vs descendant scope is a conflict (no parallel race)", () => {
+  assert.equal(tasksConflict(t("A", [], ["src/"]), t("B", [], ["src/foo.ts"])), true);
+  assert.equal(tasksConflict(t("A", [], ["src/"]), t("B", [], ["lib/"])), false);
 });
 
 test("topoSort: still orders dependencies first", () => {

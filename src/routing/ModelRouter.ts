@@ -107,11 +107,18 @@ export class ModelRouter {
    * for the implementer in the same run; independent roles avoid it when an
    * alternative eligible provider exists.
    */
+  /** The first registered provider satisfying a role's capabilities (quota ignored). */
+  private preferredFor(role: WorkerRoleName): ModelProvider | undefined {
+    const { requires } = ROLE_CAPABILITIES[role];
+    return this.providers.find((p) => requires.every((c) => p.capabilities.includes(c)));
+  }
+
   route(role: WorkerRoleName, implementerProviderId?: string): RouteResult | null {
     const eligible = this.eligibleFor(role);
     if (eligible.length === 0) return null;
     const { independent } = ROLE_CAPABILITIES[role];
     const diversify = independent && this.independentRoles.has(role) && implementerProviderId !== undefined;
+    const preferred = this.preferredFor(role);
     if (diversify) {
       const others = eligible.filter((p) => p.id !== implementerProviderId);
       if (others.length > 0) {
@@ -119,13 +126,23 @@ export class ModelRouter {
         return {
           provider: pick,
           diversified: true,
-          fallback: false,
+          fallback: preferred?.id !== pick.id,
           reason: `diversified away from implementer provider '${implementerProviderId}'`,
         };
       }
     }
     const pick = this.best(eligible);
-    return { provider: pick, diversified: false, fallback: false, reason: "best eligible provider" };
+    // Fallback when the preferred provider was ineligible/exhausted and a
+    // lower-preference provider had to serve.
+    const fallback = preferred?.id !== pick.id;
+    return {
+      provider: pick,
+      diversified: false,
+      fallback,
+      reason: fallback
+        ? `fallback: preferred '${preferred?.id}' unavailable; used '${pick.id}'`
+        : "best eligible provider",
+    };
   }
 
   /** Pick the provider with the highest remaining quota (ties → registration order). */

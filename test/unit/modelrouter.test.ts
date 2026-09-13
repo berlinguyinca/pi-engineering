@@ -49,7 +49,7 @@ test("router: quota exhaustion falls back to the next eligible provider", () => 
   r.consume("primary", 100); // exhaust primary
   const res = r.route("implementer")!;
   assert.equal(res.provider.id, "flash");
-  assert.equal(res.fallback, false); // primary was ineligible, so flash is the only pick
+  assert.equal(res.fallback, true); // preferred 'primary' was exhausted, so flash is a fallback
 });
 
 test("router: provider lacking a required capability is ineligible", () => {
@@ -64,6 +64,24 @@ test("router: consume clamps at zero and never goes negative", () => {
   r.consume("primary", 1000);
   assert.equal(r.providersSnapshot()[0]!.quota, 0);
   assert.equal(r.route("implementer"), null);
+});
+
+test("router: fallback is set when the preferred provider is exhausted", () => {
+  const a: ModelProvider = { id: "a", name: "A", capabilities: ["implement"], quota: 0 };
+  const b: ModelProvider = { id: "b", name: "B", capabilities: ["implement"], quota: 10 };
+  const r = new ModelRouter({ providers: [a, b] });
+  const res = r.route("implementer")!;
+  assert.equal(res.fallback, true, "preferred 'a' is exhausted, so 'b' is a fallback");
+  assert.equal(res.provider.id, "b");
+});
+
+test("router: no fallback when the preferred provider serves", () => {
+  const a: ModelProvider = { id: "a", name: "A", capabilities: ["implement"], quota: 10 };
+  const b: ModelProvider = { id: "b", name: "B", capabilities: ["implement"], quota: 10 };
+  const r = new ModelRouter({ providers: [a, b] });
+  const res = r.route("implementer")!;
+  assert.equal(res.fallback, false);
+  assert.equal(res.provider.id, "a");
 });
 
 test("router: ties break by highest remaining quota then registration order", () => {

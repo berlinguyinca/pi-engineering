@@ -78,24 +78,60 @@ test("scheduler: queued count reflects backpressure", async () => {
   await s.drain();
 });
 
-test("scheduler: speculative execution keeps the first successful result", async () => {
+test("scheduler: speculative execution runs copies of the same task and keeps the first success", async () => {
+  const s = new Scheduler({ concurrency: 4 });
+  const ctl = new AbortController();
+  let calls = 0;
+  const val = await s.speculative(
+    3,
+    async () => {
+      calls++;
+      await delay(5);
+      return `v${calls}`;
+    },
+    ctl.signal,
+  );
+  assert.match(val, /^v/);
+  assert.equal(calls, 3, "all copies launched (bounded by concurrency)");
+});
+
+test("scheduler: speculative never launches more copies than concurrency", async () => {
   const s = new Scheduler({ concurrency: 2 });
   let calls = 0;
-  const slow = async () => {
+  await s.speculative(10, async () => {
     calls++;
-    await delay(40);
-    return "slow";
-  };
-  const fast = async () => {
-    calls++;
-    await delay(5);
-    return "fast";
-  };
-  // speculative runs copies of the SAME task; here we simulate with a race.
-  const val = await Promise.race([slow(), fast()]);
-  assert.equal(val, "fast");
-  assert.ok(calls >= 1);
-  void s;
+    await delay(1);
+    return "x";
+  });
+  assert.equal(calls, 2, "speculation is bounded by concurrency");
+});
+
+test("scheduler: deficit round-robin never starves the light source", async () => {
+  const s = new Scheduler({ concurrency: 1 });
+  const order: string[] = [];
+  const tasks = [
+    ...Array.from({ length: 4 }, (_, i) => ({
+      id: `heavy${i}`,
+      source: "heavy",
+      weight: 3,
+      run: async () => {
+        order.push(`heavy${i}`);
+        await delay(1);
+      },
+    })),
+    ...Array.from({ length: 4 }, (_, i) => ({
+      id: `light${i}`,
+      source: "light",
+      weight: 1,
+      run: async () => {
+        order.push(`light${i}`);
+        await delay(1);
+      },
+    })),
+  ];
+  await s.scheduleAll(tasks);
+  const firstLight = order.findIndex((x) => x.startsWith("light"));
+  assert.ok(firstLight >= 0 && firstLight < 4, `light source was starved: ${order.join(",")}`);
 });
 
 test("scheduler: drain waits for all work", async () => {
