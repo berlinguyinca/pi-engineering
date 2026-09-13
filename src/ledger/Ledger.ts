@@ -130,7 +130,10 @@ export class Ledger {
       case "task.blocked": {
         const t = this.tasks.get(p.task_id as string);
         if (t) {
-          t.status = p.status as Task["status"];
+          if (typeof p.status === "string") t.status = p.status as Task["status"];
+          if (Array.isArray(p.depends_on)) t.depends_on = p.depends_on as string[];
+          if (Array.isArray(p.scope_paths)) t.scope_paths = p.scope_paths as string[];
+          if (typeof p.result_work_item_id === "string") t.result_work_item_id = p.result_work_item_id;
         }
         break;
       }
@@ -276,14 +279,28 @@ export class Ledger {
       status: "ready",
       scope_paths: scopePaths,
       risk,
+      result_work_item_id: null,
     };
     await this.emit("task.created", workItemId, actor, { task });
     return task;
   }
 
+
+
   async setTaskStatus(id: string, status: Task["status"], workItemId: string, actor: Actor): Promise<void> {
     const type = status === "completed" ? "task.completed" : status === "blocked" ? "task.blocked" : "task.started";
     await this.emit(type, workItemId, actor, { task_id: id, status });
+  }
+
+  /**
+   * Update task fields (e.g. depends_on resolved after ids are generated, or
+   * link an executed task to its result work item). Emitted as a task.started
+   * event so the change is durable and replayed.
+   */
+  async updateTask(id: string, changes: Partial<Pick<Task, "depends_on" | "scope_paths" | "result_work_item_id">>, workItemId: string, actor: Actor): Promise<void> {
+    const t = this.tasks.get(id);
+    if (!t) return;
+    await this.emit("task.started", workItemId, actor, { task_id: id, ...changes });
   }
 
   getTask(id: string): Task | undefined {

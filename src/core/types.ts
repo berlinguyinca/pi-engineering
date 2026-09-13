@@ -104,6 +104,7 @@ export type WorkItemStatus =
   | "COMPLETED"
   | "BLOCKED"
   | "FAILED"
+  | "PARTIAL"
   | "CANCELLED"
   | "NEEDS_HUMAN"
   | "BUDGET_EXHAUSTED";
@@ -152,6 +153,7 @@ export type TaskKind = "implementation" | "investigation" | "test" | "review";
 
 export interface Task {
   id: string;
+  /** The plan's parent work item this task belongs to. */
   work_item_id: string;
   title: string;
   kind: TaskKind;
@@ -159,6 +161,8 @@ export interface Task {
   status: "ready" | "started" | "completed" | "blocked" | "proposed";
   scope_paths: string[];
   risk: RiskLevel;
+  /** Work item produced when this task was executed (via the engineer pipeline). */
+  result_work_item_id: string | null;
 }
 
 export type EvidenceTrust = "authoritative" | "deterministic" | "observed" | "reviewed" | "unverified";

@@ -144,6 +144,52 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  pi.registerCommand("plan", {
+    description: "Decompose a goal into a dependency-aware task DAG (recorded in the ledger), then run /execute to execute it.",
+    handler: async (args, ctx) => {
+      if (!args.trim()) {
+        ctx.ui.notify("/plan <goal>", "error");
+        return;
+      }
+      const rt = await getRuntime(ctx);
+      ctx.ui.notify("Planning task DAG (planner worker)...", "info");
+      const report = await rt.plan(args.trim());
+      const lines = [
+        `Plan work item ${report.plan_work_item.id} [${report.plan_work_item.status}] outcome=${report.outcome}`,
+        report.tasks.length
+          ? report.tasks
+              .map((t) => `- ${t.id} [${t.risk}] ${t.title}${t.depends_on.length ? ` (after ${t.depends_on.join(", ")})` : ""}`)
+              .join("\n")
+          : "No tasks produced.",
+        report.summary ? `Planner: ${report.summary.slice(0, 300)}` : "",
+        `Run /execute ${report.plan_work_item.id} to execute this DAG.`,
+      ].filter(Boolean);
+      ctx.ui.notify(lines.join("\n"), report.outcome === "planned" ? "info" : "error");
+    },
+  });
+
+  pi.registerCommand("execute", {
+    description: "Execute a planned task DAG (from /plan) in dependency order, running each task through the engineer pipeline.",
+    handler: async (args, ctx) => {
+      const rt = await getRuntime(ctx);
+      const planId = args.trim() || rt.ledger.listWorkItems().at(-1)?.id;
+      if (!planId) {
+        ctx.ui.notify("/execute <plan-work-item-id>  (or run /plan first)", "error");
+        return;
+      }
+      ctx.ui.notify("Executing task DAG (each task through scout->implement->verify->review)...", "info");
+      const report = await rt.executePlan(planId);
+      const lines = [
+        `Plan ${report.plan_work_item.id} [${report.plan_work_item.status}] outcome=${report.outcome}`,
+        report.order.length
+          ? report.order.map((t) => `- ${t.id} [${t.status}] ${t.title}`).join("\n")
+          : "No tasks in DAG.",
+        report.summary ? report.summary.split("\n").slice(0, 20).join("\n") : "",
+      ].filter(Boolean);
+      ctx.ui.notify(lines.join("\n"), report.outcome === "completed" ? "info" : "error");
+    },
+  });
+
   pi.registerCommand("ledger", {
     description: "Show compact engineering state (work items, candidates, entities).",
     handler: async (args, ctx) => {

@@ -5,10 +5,14 @@ import type {
   Actor,
   Candidate,
   RiskLevel,
+  Task,
+  TaskKind,
   Telemetry,
   WorkItem,
+  WorkItemStatus,
   WorkerRole,
 } from "../core/types.ts";
+import { topoSort, tasksConflict, blockedByFailure } from "../plan/taskDag.ts";
 import { ROLE_BUDGETS, isMachineEvidence } from "../core/types.ts";
 import { Ledger } from "../ledger/Ledger.ts";
 import { ArtifactStore } from "../artifacts/ArtifactStore.ts";
@@ -39,6 +43,28 @@ export interface EngineerReport {
 const READ_ONLY_TOOLS = ["read", "grep", "find", "ls"];
 /** Implementation tool allowlist. */
 const IMPLEMENT_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls"];
+
+/** A planner's machine-readable task spec (spec §19.2). */
+interface PlannerTaskSpec {
+  title: string;
+  kind: TaskKind;
+  risk: RiskLevel;
+  depends_on: number[];
+  scope_paths: string[];
+}
+
+function isPlannerTaskSpec(v: unknown): v is PlannerTaskSpec {
+  if (typeof v !== "object" || v === null) return false;
+  const o = v as Record<string, unknown>;
+  return (
+    typeof o.title === "string" &&
+    typeof o.kind === "string" &&
+    (o.kind === "implementation" || o.kind === "investigation" || o.kind === "test" || o.kind === "review") &&
+    (o.risk === "low" || o.risk === "medium" || o.risk === "high" || o.risk === "critical") &&
+    (o.depends_on === undefined || Array.isArray(o.depends_on)) &&
+    (o.scope_paths === undefined || Array.isArray(o.scope_paths))
+  );
+}
 
 function classifyRisk(goal: string): RiskLevel {
   if (/typo|spelling|doc\b|comment|readme|label|rename\s+variable|format/i.test(goal)) return "low";
@@ -74,6 +100,24 @@ export interface TournamentEntry {
   /** True only when an independent review COMPLETED for this candidate. */
   reviewCompleted: boolean;
   winner: boolean;
+}
+
+export interface PlanReport {
+  plan_work_item: WorkItem;
+  tasks: Task[];
+  summary: string | null;
+  outcome: "planned" | "failed" | "blocked";
+  telemetry: Telemetry;
+}
+
+export interface DagReport {
+  plan_work_item: WorkItem;
+  tasks: Task[];
+  /** Tasks in dependency (topological) order. */
+  order: Task[];
+  outcome: "completed" | "partial" | "failed" | "blocked";
+  summary: string | null;
+  telemetry: Telemetry;
 }
 
 export interface TournamentReport {
@@ -578,6 +622,175 @@ You must NOT inherit any prior candidate reasoning. Inspect the repository with 
 
     await this.ledger.updateWorkItem(wi.id, { status: incumbent ? "COMPLETED" : "FAILED" }, actor);
     return { work_item: wi, risk, n_candidates: n, entries, incumbent_candidate: incumbent, evidence_ids: evidenceIds, outcome, telemetry: this.telemetry };
+  }
+
+  // ------------------------------------------------------------------- DAG
+
+  /**
+   * Decompose a large goal into an ordered, dependency-aware task DAG (spec
+   * §11, §19). A planner worker returns machine-readable tasks (title, kind,
+   * risk, depends_on indices, write scope); each is recorded in the ledger with
+   * its dependency edges resolved to task ids. The DAG is then runnable via
+   * executePlan(), which pushes each task through the standard pipeline.
+   */
+  async plan(goal: string): Promise<PlanReport> {
+    if (!this.git || !this.broker) {
+      const wi = await this.ledger.createWorkItem(goal, "medium", [this.cwd], this.actor(newRunId(), "planner"));
+      await this.ledger.updateWorkItem(wi.id, { status: "BLOCKED" }, this.actor(newRunId(), "planner"));
+      return { plan_work_item: wi, tasks: [], summary: "Blocked: not a git repository.", outcome: "blocked", telemetry: this.telemetry };
+    }
+    const risk = classifyRisk(goal);
+    const actor = this.actor(newRunId(), "planner");
+    const wi = await this.ledger.createWorkItem(goal, risk, [this.cwd], actor);
+    await this.ledger.recordEntity("requirement", goal, "open", actor, wi.id);
+    const contextText = await this.safeContext(goal, ROLE_BUDGETS.planner.targetTokens, []);
+
+    const task = `You are a task planner. Decompose the goal below into a dependency-aware task DAG.
+Each task is one independently-implementable unit that will later be run through the standard engineer pipeline (scout -> implement -> verify -> independent review) against the current repository, in the order you specify.
+
+Return EXACTLY as details.tasks an array of task objects with these fields:
+- "title": string (the concrete, self-contained goal for that task)
+- "kind": one of "implementation" | "investigation" | "test" | "review"
+- "risk": one of "low" | "medium" | "high" | "critical"
+- "depends_on": array of 0-based indices into this tasks array that must complete first (may be empty)
+- "scope_paths": array of files/directories the task will likely modify (for conflict detection)
+
+Rules:
+- Never put two tasks in parallel that write the same file (they conflict).
+- Each task must depend only on EARLIER tasks in the array.
+- Prefer a small number of coherent tasks (2-6) over many trivial ones.
+- The tasks must together cover the whole goal.
+
+Goal: "${goal}"`;
+    const { run } = await this.runWorker("planner", task, {
+      cwd: this.cwd,
+      tools: READ_ONLY_TOOLS,
+      context: contextText,
+      wi,
+      timeoutMs: 240_000,
+    });
+    const details = run.result.details as { tasks?: Array<PlannerTaskSpec> };
+    const specs = Array.isArray(details?.tasks) ? details.tasks.filter(isPlannerTaskSpec).slice(0, 10) : [];
+    if (specs.length === 0) {
+      await this.ledger.updateWorkItem(wi.id, { status: "FAILED" }, actor);
+      return { plan_work_item: wi, tasks: [], summary: run.result.summary, outcome: "failed", telemetry: this.telemetry };
+    }
+
+    // Create tasks, then resolve depends_on (indices) to real task ids.
+    const created: Task[] = [];
+    for (const s of specs) {
+      created.push(await this.ledger.createTask(wi.id, s.title, s.kind, s.risk, actor, s.scope_paths ?? [], []));
+    }
+    for (let i = 0; i < created.length; i++) {
+      const s = specs[i]!;
+      const deps = (s.depends_on ?? [])
+        .filter((d) => Number.isInteger(d) && d >= 0 && d < created.length && d !== i)
+        .map((d) => created[d]!.id);
+      if (deps.length) await this.ledger.updateTask(created[i]!.id, { depends_on: deps }, wi.id, actor);
+    }
+    await this.ledger.recordEntity(
+      "decision",
+      `plan: ${created.length} tasks decomposed for "${goal}" (${run.result.summary.slice(0, 160)})`,
+      "accepted",
+      actor,
+      wi.id,
+    );
+    return { plan_work_item: wi, tasks: created, summary: run.result.summary, outcome: "planned", telemetry: this.telemetry };
+  }
+
+  /**
+   * Execute a planned task DAG (spec §11). Runs each task through the standard
+   * engineer pipeline in dependency (topological) order, blocks tasks whose
+   * dependencies failed, and links each executed task to its result work item.
+   * Execution is sequential (single-model constraint) with write-scope conflict
+   * detection recorded so conflicting tasks are never run concurrently.
+   */
+  async executePlan(planWorkItemId: string): Promise<DagReport> {
+    const actor = this.actor(newRunId(), "planner");
+    const wi = this.ledger.getWorkItem(planWorkItemId);
+    if (!wi) {
+      return { plan_work_item: undefined as unknown as WorkItem, tasks: [], order: [], outcome: "blocked", summary: `Unknown plan work item ${planWorkItemId}`, telemetry: this.telemetry };
+    }
+    if (!this.git) {
+      await this.ledger.updateWorkItem(wi.id, { status: "BLOCKED" }, actor);
+      return { plan_work_item: wi, tasks: [], order: [], outcome: "blocked", summary: "Blocked: not a git repository.", telemetry: this.telemetry };
+    }
+    let tasks = this.ledger.listTasks(wi.id);
+    if (tasks.length === 0) {
+      await this.ledger.updateWorkItem(wi.id, { status: "FAILED" }, actor);
+      return { plan_work_item: wi, tasks: [], order: [], outcome: "failed", summary: "No tasks in this plan. Run /plan first.", telemetry: this.telemetry };
+    }
+
+    let order: Task[];
+    try {
+      order = topoSort(tasks);
+    } catch (err) {
+      await this.ledger.updateWorkItem(wi.id, { status: "FAILED" }, actor);
+      const msg = err instanceof Error ? err.message : String(err);
+      await this.ledger.recordEntity("finding", msg, "open", actor, wi.id, { severity: "critical" });
+      return { plan_work_item: wi, tasks, order: [], outcome: "failed", summary: msg, telemetry: this.telemetry };
+    }
+
+    // Record write-scope conflicts among tasks that are otherwise parallelizable
+    // (informational; execution is sequential under the single-model constraint).
+    for (const [i, a] of order.entries()) {
+      for (const b of order.slice(i + 1)) {
+        if (a.depends_on.includes(b.id) || b.depends_on.includes(a.id)) continue;
+        if (tasksConflict(a, b)) {
+          await this.ledger.recordEntity(
+            "decision",
+            `write-scope conflict: ${a.id} and ${b.id} both modify ${a.scope_paths.filter((p) => b.scope_paths.includes(p)).join(", ")}; will not run concurrently`,
+            "accepted",
+            actor,
+            wi.id,
+          );
+        }
+      }
+    }
+
+    const completed: string[] = [];
+    const failed: string[] = [];
+    const blocked: string[] = [];
+    const failedSet = new Set<string>();
+    const summaries: string[] = [];
+    for (const t of order) {
+      // A dependency failed (or was blocked): this task cannot run.
+      if (t.depends_on.some((d) => failedSet.has(d))) {
+        await this.ledger.setTaskStatus(t.id, "blocked", wi.id, actor);
+        failedSet.add(t.id);
+        blocked.push(t.id);
+        summaries.push(`${t.id} blocked (dependency failed)`);
+        continue;
+      }
+      await this.ledger.setTaskStatus(t.id, "started", wi.id, actor);
+      summaries.push(`running ${t.id}: ${t.title}`);
+      const report = await this.engineer(t.title);
+      if (report.outcome === "promoted") {
+        await this.ledger.setTaskStatus(t.id, "completed", wi.id, actor);
+        await this.ledger.updateTask(t.id, { result_work_item_id: report.work_item.id }, wi.id, actor);
+        completed.push(t.id);
+        summaries.push(`${t.id} completed -> ${report.work_item.id}`);
+      } else {
+        await this.ledger.setTaskStatus(t.id, "blocked", wi.id, actor);
+        failedSet.add(t.id);
+        failed.push(t.id);
+        summaries.push(`${t.id} failed (${report.outcome})`);
+      }
+    }
+
+    const status: WorkItemStatus =
+      completed.length === tasks.length ? "COMPLETED" : completed.length === 0 ? "FAILED" : "PARTIAL";
+    await this.ledger.updateWorkItem(wi.id, { status }, actor);
+    const outcome: DagReport["outcome"] =
+      status === "COMPLETED" ? "completed" : status === "FAILED" ? "failed" : "partial";
+    return {
+      plan_work_item: wi,
+      tasks: this.ledger.listTasks(wi.id),
+      order,
+      outcome,
+      summary: summaries.join("\n"),
+      telemetry: this.telemetry,
+    };
   }
 
   /**
