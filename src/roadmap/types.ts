@@ -117,6 +117,8 @@ export interface RoadmapEvidence {
   proof: string;
   source: "generated" | "manual";
   summary?: string;
+  /** Unresolved findings recorded by a fresh-review evidence record (release gate). */
+  findings?: { critical: number; high: number };
 }
 
 export interface MilestoneEvaluation {

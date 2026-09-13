@@ -98,8 +98,9 @@ async function seedCompleteEvidence(setup: Setup): Promise<void> {
     });
   }
   await engine.store.put({
-    id: "M01:unit",
+    id: "M01:M01-A1",
     milestone: "M01",
+    criterionId: "M01-A1",
     type: "unit",
     status: "pass",
     commit: head,
@@ -108,10 +109,10 @@ async function seedCompleteEvidence(setup: Setup): Promise<void> {
     proof: "test",
     source: "generated",
   });
-  // Manual dogfood evidence fresh at HEAD.
+  // Manual dogfood + fresh_review evidence fresh at HEAD (findings 0/0).
   await writeFile(
     setup.paths.manualEvidencePath,
-    `- id: dogfood-1.0\n  milestone: __global__\n  type: dogfood\n  status: pass\n  commit: ${head}\n  generatedAt: ${new Date().toISOString()}\n  paths: ["src/"]\n  proof: "test"\n  summary: "seed"\n`,
+    `- id: dogfood-1.0\n  milestone: __global__\n  type: dogfood\n  status: pass\n  commit: ${head}\n  generatedAt: ${new Date().toISOString()}\n  paths: ["src/"]\n  proof: "test"\n  summary: "seed"\n- id: review-1.0\n  milestone: __global__\n  type: fresh_review\n  status: pass\n  commit: ${head}\n  generatedAt: ${new Date().toISOString()}\n  paths: ["src/roadmap/"]\n  findings: { critical: 0, high: 0 }\n  proof: "test"\n  summary: "seed"\n`,
   );
 }
 
@@ -150,8 +151,9 @@ test("roadmap check: missing dogfood evidence -> exit 1 (not complete)", async (
       });
     }
     await engine.store.put({
-      id: "M01:unit",
+      id: "M01:M01-A1",
       milestone: "M01",
+      criterionId: "M01-A1",
       type: "unit",
       status: "pass",
       commit: head,

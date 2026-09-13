@@ -111,18 +111,25 @@ export class RoadmapEngine {
     for (const d of docs) {
       const r = d as Partial<RoadmapEvidence>;
       if (!r.id || !r.type) continue;
+      // Only an explicit "pass" counts as passing; any other value (including
+      // "error"/typos) is treated as NOT passing (fail-closed).
+      const status = r.status === "pass" ? "pass" : "fail";
+      const findingsRaw = r.findings as Partial<{ critical: number; high: number }> | undefined;
       out.push({
         id: r.id,
         milestone: r.milestone ?? "__global__",
         criterionId: r.criterionId,
         type: r.type as EvidenceType,
-        status: r.status === "fail" ? "fail" : "pass",
+        status,
         commit: r.commit ?? "",
         generatedAt: r.generatedAt ?? "",
         paths: Array.isArray(r.paths) ? (r.paths as string[]) : [],
         proof: r.proof ?? "",
         source: "manual",
         summary: r.summary,
+        findings: findingsRaw
+          ? { critical: Number(findingsRaw.critical ?? 0), high: Number(findingsRaw.high ?? 0) }
+          : undefined,
       });
     }
     this.manual = out;
@@ -152,10 +159,31 @@ export class RoadmapEngine {
     };
   }
 
-  /** (Re)generate deterministic evidence at HEAD for every required milestone type. */
+  /**
+   * The distinct evidence targets a milestone needs: one per acceptance-criterion
+   * evidence ref (criterion-bound) plus one per verification.requires type that no
+   * criterion already covers (milestone-level). Each target binds to a concrete
+   * evidence record, so acceptance criteria are not satisfied by type alone.
+   */
+  static evidenceTargets(m: MilestoneDef): Array<{ id: string; criterionId?: string; type: EvidenceType }> {
+    const targets: Array<{ id: string; criterionId?: string; type: EvidenceType }> = [];
+    const covered = new Set<EvidenceType>();
+    for (const c of m.acceptance) {
+      for (const ref of c.evidence.required) {
+        targets.push({ id: `${m.id}:${c.id}`, criterionId: c.id, type: ref.type });
+        covered.add(ref.type);
+      }
+    }
+    for (const t of m.verification.requires) {
+      if (covered.has(t)) continue;
+      targets.push({ id: `${m.id}:${t}`, type: t });
+    }
+    return targets;
+  }
+
+  /** (Re)generate deterministic evidence at HEAD for every required milestone target. */
   async refreshEvidence(): Promise<void> {
     const types = requiredTypes(this.roadmap.milestones).filter((t) => GENERATED_TYPES.includes(t));
-    const byId = new Map(this.roadmap.milestones.map((m) => [m.id, m]));
     const commit = await this.gitRepo.headCommit();
     for (const type of types) {
       const check = checkFor(type);
@@ -175,23 +203,25 @@ export class RoadmapEngine {
         source: "generated",
         summary: res.status === "pass" ? "exit 0" : `exit ${res.exitCode}: ${(res.stderr || res.stdout).slice(0, 160)}`,
       });
-      // Per-milestone records (paths scoped to milestone for impact invalidation).
+      // Per-milestone targets (paths scoped to milestone for impact invalidation).
       for (const m of this.roadmap.milestones) {
-        if (!milestoneRequiredTypes(m).includes(type)) continue;
-        void byId;
-        await this.store.put({
-          id: `${m.id}:${type}`,
-          milestone: m.id,
-          type,
-          status: res.status,
-          commit,
-          generatedAt: new Date().toISOString(),
-          paths: m.scope.paths.length ? m.scope.paths : check.paths,
-          proof: check.command.join(" "),
-          source: "generated",
-          summary:
-            res.status === "pass" ? "exit 0" : `exit ${res.exitCode}: ${(res.stderr || res.stdout).slice(0, 160)}`,
-        });
+        for (const target of RoadmapEngine.evidenceTargets(m)) {
+          if (target.type !== type) continue;
+          await this.store.put({
+            id: target.id,
+            milestone: m.id,
+            criterionId: target.criterionId,
+            type,
+            status: res.status,
+            commit,
+            generatedAt: new Date().toISOString(),
+            paths: m.scope.paths.length ? m.scope.paths : check.paths,
+            proof: check.command.join(" "),
+            source: "generated",
+            summary:
+              res.status === "pass" ? "exit 0" : `exit ${res.exitCode}: ${(res.stderr || res.stdout).slice(0, 160)}`,
+          });
+        }
       }
     }
   }
@@ -212,12 +242,13 @@ export class RoadmapEngine {
         const rec = this.manual
           .filter((r) => r.type === "fresh_review")
           .sort((a, b) => (a.generatedAt < b.generatedAt ? 1 : -1))[0];
-        if (!rec) return { critical: 0, high: 0 };
+        // Absence of a completed independent review never passes the gate.
+        if (!rec) return { critical: 1, high: 1 };
         const fresh =
           (await this.gitRepo.changedPathsSince(rec.commit, rec.paths.length ? rec.paths : ["src", "extensions"]))
             .length === 0;
         if (!fresh || rec.status !== "pass") return { critical: 1, high: 1 };
-        return { critical: 0, high: 0 };
+        return rec.findings ?? { critical: 0, high: 0 };
       },
       dogfood: async () => {
         const rec = this.manual

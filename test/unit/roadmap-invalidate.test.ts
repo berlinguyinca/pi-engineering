@@ -77,8 +77,9 @@ test("invalidate: relevant change makes evidence stale -> NEEDS_REVERIFICATION",
   try {
     const head = await engine.head();
     await engine.store.put({
-      id: "M01:unit",
+      id: "M01:M01-A1",
       milestone: "M01",
+      criterionId: "M01-A1",
       type: "unit",
       status: "pass",
       commit: head,
@@ -88,8 +89,9 @@ test("invalidate: relevant change makes evidence stale -> NEEDS_REVERIFICATION",
       source: "generated",
     });
     await engine.store.put({
-      id: "M02:unit",
+      id: "M02:M02-A1",
       milestone: "M02",
+      criterionId: "M02-A1",
       type: "unit",
       status: "pass",
       commit: head,
@@ -120,8 +122,9 @@ test("invalidate: regenerating evidence at new HEAD re-verifies", async () => {
   try {
     const head = await engine.head();
     await engine.store.put({
-      id: "M01:unit",
+      id: "M01:M01-A1",
       milestone: "M01",
+      criterionId: "M01-A1",
       type: "unit",
       status: "pass",
       commit: head,
@@ -138,8 +141,9 @@ test("invalidate: regenerating evidence at new HEAD re-verifies", async () => {
     // Re-record evidence at the new HEAD: fresh again.
     const newHead = await engine.head();
     await engine.store.put({
-      id: "M01:unit",
+      id: "M01:M01-A1",
       milestone: "M01",
+      criterionId: "M01-A1",
       type: "unit",
       status: "pass",
       commit: newHead,

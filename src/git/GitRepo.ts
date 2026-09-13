@@ -194,9 +194,16 @@ export class GitRepo {
    * `paths` matches everything.
    */
   async changedPathsSince(commit: string, paths: string[]): Promise<string[]> {
+    // Fail-safe: an empty/placeholder/unknown commit is never "fresh". Evidence
+    // MUST bind to a real commit SHA (roadmap spec §9); on any git error we treat
+    // the scope as changed (stale) rather than silently fresh.
+    if (!commit) return paths.length ? [...paths] : ["<unbound-evidence>"];
     const spec = paths.length ? ["--", ...paths] : [];
     const committed = await this.git(["diff", "--name-only", `${commit}..HEAD`, ...spec]);
     const uncommitted = await this.git(["status", "--porcelain", ...spec]);
+    if (committed.code !== 0 || uncommitted.code !== 0) {
+      return paths.length ? [...paths] : ["<git-error>"];
+    }
     const set = new Set<string>();
     // git diff --name-only prints bare filenames.
     if (committed.stdout) {

@@ -211,6 +211,10 @@ export function parseRoadmap(
     if (releaseGate.require.tests[k] !== "pass")
       issues.push({ path: `release_gate.require.tests.${k}`, message: "must be 'pass'" });
   }
+  for (const k of ["typecheck", "lint", "packageLoad"] as const) {
+    if (releaseGate.require[k] !== "pass")
+      issues.push({ path: `release_gate.require.${k}`, message: "must be 'pass'" });
+  }
 
   // Backlog.
   const backlog: RoadmapDef["backlog"] = [];

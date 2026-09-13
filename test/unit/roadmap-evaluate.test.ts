@@ -20,8 +20,9 @@ function milestone(over: Partial<MilestoneDef> = {}): MilestoneDef {
 
 function record(over: Partial<RoadmapEvidence> = {}): RoadmapEvidence {
   return {
-    id: "M01:unit",
+    id: "M01:M01-A1",
     milestone: "M01",
+    criterionId: "M01-A1",
     type: "unit",
     status: "pass",
     commit: "abc",
@@ -34,7 +35,7 @@ function record(over: Partial<RoadmapEvidence> = {}): RoadmapEvidence {
 }
 
 const fresh: EvidenceFreshness = {
-  isStale: async () => [],
+  isStale: async (_m, rec) => (rec.commit ? [] : ["<unbound-evidence>"]),
   implementationExists: async () => true,
 };
 const stale: EvidenceFreshness = {
@@ -59,7 +60,7 @@ async function evalM(m: MilestoneDef, records: RoadmapEvidence[], fr: EvidenceFr
 test("evaluate: implementation exists, no evidence -> IMPLEMENTED", async () => {
   const e = await evalM(milestone(), [], fresh, budget());
   assert.equal(e.state, "IMPLEMENTED");
-  assert.ok(e.missingEvidence.includes("unit"));
+  assert.ok(e.missingEvidence.includes("M01-A1:unit"));
 });
 
 test("evaluate: no implementation, no evidence -> NOT_STARTED", async () => {
@@ -73,10 +74,36 @@ test("evaluate: passing + fresh evidence -> VERIFIED", async () => {
   assert.equal(e.blockers.length, 0);
 });
 
+test("evaluate: criterion binding — wrong criterionId does NOT satisfy the criterion", async () => {
+  // A passing unit record bound to a DIFFERENT criterion must not satisfy M01-A1.
+  const e = await evalM(milestone(), [record({ id: "M01:OTHER", criterionId: "M01-OTHER" })], fresh, budget());
+  assert.notEqual(e.state, "VERIFIED");
+  assert.ok(e.missingEvidence.includes("M01-A1:unit"));
+});
+
+test("evaluate: partial evidence -> IN_PROGRESS", async () => {
+  // Two criteria, only one satisfied.
+  const m = milestone({
+    acceptance: [
+      { id: "M01-A1", description: "a", evidence: { required: [{ type: "unit", id: "e1" }] } },
+      { id: "M01-A2", description: "b", evidence: { required: [{ type: "integration", id: "e2" }] } },
+    ],
+    verification: { requires: ["unit", "integration"] },
+  });
+  const e = await evalM(m, [record({ id: "M01:M01-A1", criterionId: "M01-A1" })], fresh, budget());
+  assert.equal(e.state, "IN_PROGRESS");
+});
+
+test("evaluate: empty evidence commit is never fresh", async () => {
+  const e = await evalM(milestone(), [record({ commit: "" })], fresh, budget());
+  assert.notEqual(e.state, "VERIFIED");
+  assert.ok(e.staleEvidence.includes("M01-A1:unit"));
+});
+
 test("evaluate: stale evidence -> NEEDS_REVERIFICATION", async () => {
   const e = await evalM(milestone(), [record()], stale, budget());
   assert.equal(e.state, "NEEDS_REVERIFICATION");
-  assert.ok(e.staleEvidence.includes("unit"));
+  assert.ok(e.staleEvidence.includes("M01-A1:unit"));
 });
 
 test("evaluate: no implementation -> not verified even with evidence", async () => {
@@ -87,7 +114,7 @@ test("evaluate: no implementation -> not verified even with evidence", async () 
 test("evaluate: failing evidence record -> not verified", async () => {
   const e = await evalM(milestone(), [record({ status: "fail" })], fresh, budget());
   assert.notEqual(e.state, "VERIFIED");
-  assert.ok(e.missingEvidence.includes("unit"));
+  assert.ok(e.missingEvidence.includes("M01-A1:unit"));
 });
 
 test("evaluate: unresolved findings block VERIFIED", async () => {
@@ -123,7 +150,7 @@ test("evaluate: dependency not verified blocks downstream", async () => {
   };
   const store = RoadmapEvidenceStore.inMemory();
   // only M02 has evidence; M01 (its dep) has none.
-  await store.put(record({ id: "M02:unit", milestone: "M02" }));
+  await store.put(record({ id: "M02:M02-A1", criterionId: "M02-A1", milestone: "M02" }));
   const results = await evaluateAll(roadmap, store, fresh, async () => budget());
   const bEval = results.get("M02");
   assert.ok(bEval);

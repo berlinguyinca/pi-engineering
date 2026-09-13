@@ -43,9 +43,35 @@ async function getRuntimeByCwd(cwd: string, model?: Model<any>): Promise<Enginee
     cwd,
     verifier: new CommandVerifier(),
     model,
+    // Autonomous stop (roadmap spec §13, §33): when this repository's Roadmap
+    // 1.0 is complete, /engineer refuses to invent new work. The gate is derived
+    // from the roadmap engine (completion is never declared). If the repo has no
+    // roadmap, the gate is open.
+    roadmapComplete: roadmapCompleteFor(key),
   });
   runtimes.set(key, rt);
   return rt;
+}
+
+/**
+ * Returns a callback reporting whether the repository's Roadmap 1.0 is complete.
+ * Returns false (gate open) when the repo has no roadmap definition or the engine
+ * cannot be built (so normal engineering is never blocked by a broken setup).
+ */
+function roadmapCompleteFor(repoRoot: string): () => Promise<boolean> {
+  const roadmapPath = resolve(repoRoot, "docs/roadmap/roadmap.yaml");
+  const manualEvidencePath = resolve(repoRoot, "docs/roadmap/evidence.yaml");
+  const evidenceFile = resolve(repoRoot, ".pi-eng/roadmap/evidence.jsonl");
+  return async () => {
+    try {
+      const engine = await RoadmapEngine.open({ repoRoot, roadmapPath, manualEvidencePath, evidenceFile });
+      const detail = await engine.evaluate();
+      return detail.complete;
+    } catch {
+      // No/invalid roadmap: gate open (do not block engineering).
+      return false;
+    }
+  };
 }
 
 async function repoCacheKey(cwd: string): Promise<string> {
@@ -356,7 +382,7 @@ export default function (pi: ExtensionAPI) {
           lines.push(`- ${m.milestone.id} ${m.milestone.name}: ${m.state}`);
           for (const b of m.blockers.slice(0, 3)) lines.push(`    • ${b}`);
         }
-        ctx.ui.notify(lines.join("\n").slice(0, 1800), detail.complete ? "info" : "info");
+        ctx.ui.notify(lines.join("\n").slice(0, 1800), "info");
       } catch (err) {
         ctx.ui.notify(`roadmap error: ${String(err)}`, "error");
       }

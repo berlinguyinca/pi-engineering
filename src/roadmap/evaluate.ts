@@ -44,11 +44,6 @@ export function milestoneRequiredTypes(m: MilestoneDef): EvidenceType[] {
   return [...set];
 }
 
-/** Whether a milestone has a passing evidence record for a type (any of them). */
-function hasPassing(records: RoadmapEvidence[], type: EvidenceType): boolean {
-  return records.some((r) => r.type === type && r.status === "pass");
-}
-
 export async function evaluateMilestone(
   m: MilestoneDef,
   store: RoadmapEvidenceStore,
@@ -68,20 +63,44 @@ export async function evaluateMilestone(
     };
   }
   const records = store.byMilestone(m.id);
-  const required = milestoneRequiredTypes(m);
-  const missingEvidence = required.filter((t) => !hasPassing(records, t));
-
-  // Staleness: for each required type, a passing record may be stale.
+  const missingEvidence: string[] = [];
   const staleEvidence: string[] = [];
-  for (const t of required) {
-    const passing = records.filter((r) => r.type === t && r.status === "pass");
-    for (const rec of passing) {
-      const changed = await freshness.isStale(m, rec);
-      if (changed?.length) {
-        staleEvidence.push(t);
-        break;
+
+  // Criterion-level evidence (spec §11.2): every acceptance criterion's required
+  // evidence must have a passing + fresh record bound to THAT criterion. Type-only
+  // presence does not satisfy a criterion.
+  const criterionSatisfied = new Map<string, boolean>();
+  const coveredTypes = new Set<EvidenceType>();
+  for (const c of m.acceptance) {
+    let satisfied = true;
+    for (const ref of c.evidence.required) {
+      coveredTypes.add(ref.type);
+      const candidates = records.filter((r) => r.criterionId === c.id && r.type === ref.type);
+      const passing = candidates.find((r) => r.status === "pass");
+      if (!passing) {
+        missingEvidence.push(`${c.id}:${ref.type}`);
+        satisfied = false;
+        continue;
+      }
+      const changed = await freshness.isStale(m, passing);
+      if (changed.length) {
+        staleEvidence.push(`${c.id}:${ref.type}`);
+        satisfied = false;
       }
     }
+    criterionSatisfied.set(c.id, satisfied);
+  }
+
+  // Milestone-level evidence: verification.requires types no criterion covers.
+  for (const t of m.verification.requires) {
+    if (coveredTypes.has(t)) continue;
+    const passing = records.find((r) => r.type === t && !r.criterionId && r.status === "pass");
+    if (!passing) {
+      missingEvidence.push(t);
+      continue;
+    }
+    const changed = await freshness.isStale(m, passing);
+    if (changed.length) staleEvidence.push(t);
   }
 
   const implementationExists = await freshness.implementationExists(m);
@@ -102,7 +121,7 @@ export async function evaluateMilestone(
   if (missingEvidence.length > 0) blockers.push(`missing evidence: ${missingEvidence.join(", ")}`);
   if (!implementationExists) blockers.push("no implementation detected in scope");
 
-  const hasAnyPassing = required.some((t) => hasPassing(records, t));
+  const hasAnyPassing = records.some((r) => r.status === "pass");
   const allPassingFresh = missingEvidence.length === 0 && staleEvidence.length === 0;
   const depsOk = !m.dependsOn.some((d) => {
     const s = depStates.get(d);
@@ -118,6 +137,9 @@ export async function evaluateMilestone(
     state = "BLOCKED";
   } else if (allPassingFresh && implementationExists && depsOk && findingsOk) {
     state = "VERIFIED";
+  } else if (implementationExists && !allPassingFresh && hasAnyPassing) {
+    // Partial evidence present (some criteria met) but not complete.
+    state = "IN_PROGRESS";
   } else if (implementationExists) {
     state = "IMPLEMENTED";
   } else if (!depsOk) {
@@ -143,7 +165,6 @@ export async function evaluateAll(
 ): Promise<Map<string, MilestoneEvaluation>> {
   const byId = new Map(roadmap.milestones.map((m) => [m.id, m]));
   const result = new Map<string, MilestoneEvaluation>();
-  const stateOf = (id: string): MilestoneState => result.get(id)?.state ?? "NOT_STARTED";
   // Topological order (roadmap schema guarantees acyclicity).
   const visited = new Set<string>();
   const order: MilestoneDef[] = [];
@@ -161,7 +182,6 @@ export async function evaluateAll(
     const findings = await findingsProvider(m.id);
     const depStates = new Map([...result].map(([k, v]) => [k, v.state]));
     result.set(m.id, await evaluateMilestone(m, store, freshness, depStates, findings));
-    void stateOf;
   }
   return result;
 }

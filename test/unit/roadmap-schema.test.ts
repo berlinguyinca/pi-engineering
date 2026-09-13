@@ -131,3 +131,10 @@ test("schema: invalid YAML is an issue", () => {
   assert.equal(roadmap, null);
   assert.ok(issues.some((i) => i.message.includes("YAML parse error")));
 });
+
+test("schema: release-gate gate values must be 'pass'", () => {
+  const yaml = validYaml().replace("typecheck: pass", "typecheck: fail");
+  const { roadmap, issues } = parseRoadmap(yaml, ALLOWED);
+  assert.equal(roadmap, null);
+  assert.ok(issues.some((i) => i.path.includes("typecheck") && i.message.includes("'pass'")));
+});
