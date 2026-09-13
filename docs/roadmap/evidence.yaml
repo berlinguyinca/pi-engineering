@@ -2,8 +2,8 @@
   milestone: __global__
   type: dogfood
   status: pass
-  commit: 805cd77ab8618d68775440fbcfcfd52303642429
-  generatedAt: 2026-09-13T21:10:07.630Z
+  commit: 588f486e99831bf6b379f1c677686d9393d96c38
+  generatedAt: 2026-09-13T23:04:32.177Z
   paths:
     - src/
   proof: scripts/dogfood-roadmap.ts + real-repo roadmap check
@@ -12,8 +12,8 @@
   milestone: __global__
   type: fresh_review
   status: pass
-  commit: 805cd77ab8618d68775440fbcfcfd52303642429
-  generatedAt: 2026-09-13T21:10:07.630Z
+  commit: 588f486e99831bf6b379f1c677686d9393d96c38
+  generatedAt: 2026-09-13T23:04:32.177Z
   paths:
     - src/roadmap/
     - src/blackhole/
