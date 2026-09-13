@@ -46,7 +46,16 @@ export type EventType =
   | "budget.exhausted"
   | "merge.requested"
   | "merge.completed"
-  | "context.package.assembled";
+  | "context.package.assembled"
+  | "blackhole.lifecycle"
+  | "blackhole.package.validated"
+  | "blackhole.session.opened"
+  | "blackhole.session.closed"
+  | "blackhole.memory_worker"
+  | "blackhole.compacted"
+  | "blackhole.promotion.proposed"
+  | "blackhole.promotion.decided"
+  | "blackhole.recalled";
 
 export interface LedgerEvent {
   event_id: string;

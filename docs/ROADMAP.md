@@ -90,11 +90,12 @@ review is never treated as a clean review. Covered by two regression tests.
 
 ## What is deliberately NOT built yet
 
-**Roadmap 1.0 is complete** (22/22 required milestones VERIFIED; `roadmap check`
+**Roadmap 1.0 is complete** (23/23 required milestones VERIFIED; `roadmap check`
 exits 0). The previously-deferred M13 Parallel Task DAG execution is now
 IMPLEMENTED and required (parallel waves + a runtime git lock that serializes
 promotion merges, eliminating the `index.lock` race). All backlog items
-B-101..B-104 and B-107..B-113 are also implemented as milestones M13-M22.
+B-101..B-104 and B-107..B-113 are also implemented as milestones M13-M22, and
+M23 adds the optional Blackhole session-memory integration.
 
 The only spec provisions still out of scope are those excluded by the project
 constraint or requiring external infrastructure: AutoSpec/InferWeave adapters
@@ -122,9 +123,9 @@ node scripts/pi-engineering.ts roadmap status
 ```
 
 Machine evidence: `roadmap check` exits **0** with `complete: true`, release gate
-**PASS**, 22/22 VERIFIED; 194 tests pass incl. schema/evaluate/invalidate/CLI/
+**PASS**, 23/23 VERIFIED; 226 tests pass incl. schema/evaluate/invalidate/CLI/
 autonomous-stop/dogfood, routing, scheduling, budget, security, merge-queue, repo
-intel, verification-farm, benchmark, and parallel-DAG tests. See
+intel, verification-farm, benchmark, parallel-DAG, and blackhole integration tests. See
 `docs/evidence/milestone-roadmap-completion.md` and the committed manual index
 `docs/roadmap/evidence.yaml`.
 
@@ -307,9 +308,22 @@ verifiable as milestones M13-M22 (all REQUIRED, all VERIFIED):
   — AutoSpec/InferWeave seams empty by default (core standalone) + a
   deterministic telemetry export for external control planes.
 
+## M23 — Blackhole session memory integration
+
+M23 adds an **optional** per-session memory/context provider (`src/blackhole/`,
+`src/benchmark/`). It is disabled by default and fully backward compatible. It
+implements: pinned Blackhole version **0.5.4** with fail-closed drift detection;
+strict candidate/reviewer/challenger isolation keyed on candidate scope;
+EventStore-authoritative lifecycle events; evidence-gated promotion through the
+OpenViking durable-memory abstraction (no auto-promotion); background
+Observer/Reflector/Dropper workers at P3/P4 via the model router + scheduler;
+recall into worker context; session TTL GC; and a native-vs-Blackhole A/B
+benchmark that generates a report + **12 SVG plots** and preserves raw JSONL/CSV
+(`docs/evidence/blackhole/`). See `docs/evidence/milestone-blackhole.md`.
+
 ## Next slice
 
-Roadmap 1.0 (22/22) is complete. Remaining backlog is genuinely external
+Roadmap 1.0 (23/23) is complete. Remaining backlog is genuinely external
 infrastructure: a hosted control plane / dashboard (B-105) and a Go control
 plane (B-106). Candidate parallel execution is available via `parallel: true`
 but not default (a single serial worker gains nothing; concurrency assumes a

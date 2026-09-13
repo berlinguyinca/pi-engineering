@@ -49,6 +49,22 @@ pi install /absolute/path/to/pi-engineering-runtime
 | `/ledger [k]`     | Show work items, candidates, and ledger entities (optionally filtered) |
 | `/context`        | Show context budget, sources, and worker usage                 |
 | `/roadmap-status` | Show derived Roadmap 1.0 completion status for this repository |
+| `/blackhole [--dashboard]` | Show optional Blackhole session-memory status (disabled by default) |
+
+### Blackhole session memory (optional, off by default)
+
+`pi-blackhole` can act as an **optional per-session memory/context provider** (pinned to
+version **0.5.4**). It is fully backward compatible: when omitted or disabled the runtime
+behaves exactly as before (no sessions, no events). When enabled, each worker session gets
+an isolated session-local memory store; prior memory is recalled into worker context for
+context-efficiency; background Observer/Reflector/Dropper workers run at lower priority
+(P3/P4) via the model router + scheduler; and promoted durable memory flows through the
+OpenViking abstraction with an **evidence-gated promotion workflow** (never auto-promoted)
+that emits audit events to the authoritative EventStore.
+
+CLI: `pi-engineering blackhole status|validate|benchmark`. A native-vs-Blackhole A/B
+benchmark generates a report + **12 SVG plots** and preserves raw JSONL/CSV under
+`docs/evidence/blackhole/`. See `docs/specs/PI_BLACKHOLE_INTEGRATION_SPEC.md`.
 
 `pi-engineering roadmap check` (also `npm run roadmap:check`) returns a
 **verifiable completion verdict**: exit **0** when every required milestone is
@@ -111,6 +127,8 @@ src/intel/           dependency-free repo symbol index (+ optional LSP seam)
 src/bench/           engineering benchmark with baseline gate
 src/adapters/        optional AutoSpec/InferWeave seams (empty by default)
 src/telemetry/       deterministic telemetry export for external control planes
+src/blackhole/       optional per-session memory provider (pinned 0.5.4, builtin default)
+src/benchmark/       native-vs-Blackhole A/B benchmark (report + 12 SVG plots + raw data)
 src/workers/         role prompts + bounded worker_result tool + executors
 src/runtime/         EngineeringRuntime facade (plan/engineer/tournament/review/challenge)
 src/tools/           semantic tools bound per-cwd

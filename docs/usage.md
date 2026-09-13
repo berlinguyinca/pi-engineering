@@ -57,6 +57,26 @@ definition lives in `docs/roadmap/roadmap.yaml`; model-dependent evidence is
 recorded by `node scripts/record-roadmap-evidence.ts --critical 0 --high 0`
 into `docs/roadmap/evidence.yaml`.
 
+## Optional Blackhole session memory
+
+`pi-blackhole` is an **optional** per-session memory/context provider, pinned to
+**0.5.4**. It is disabled by default and backward compatible. When enabled it
+provides session-local memory with strict candidate isolation, recall into worker
+context, evidence-gated promotion through the OpenViking durable-memory
+abstraction (never auto-promoted), and lower-priority background memory workers.
+
+```sh
+node scripts/pi-engineering.ts blackhole status        # show manager state
+node scripts/pi-engineering.ts blackhole validate      # validate pinned version / provider
+node scripts/pi-engineering.ts blackhole benchmark     # A/B benchmark (report + 12 SVG plots + raw data)
+node scripts/pi-engineering.ts benchmark               # same as `blackhole benchmark`
+```
+
+Artifacts are written under `docs/evidence/blackhole/`. The benchmark is a
+deterministic, model-free simulator (see the report methodology note) — it
+validates the measurement pipeline and shows the expected direction of effect,
+not a measured model claim.
+
 ## Durable state
 
 State lives in `<repoRoot>/.pi-eng/` and is git-ignored:

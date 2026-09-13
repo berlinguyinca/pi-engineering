@@ -309,6 +309,30 @@ milestones:
         evidence: { required: [ { type: unit, id: adapter-seams } ] }
     verification: { requires: [unit] }
 
+  - id: M23
+    name: Blackhole Session Memory Integration
+    required: true
+    depends_on: [M02, M14, M15]
+    scope:
+      paths: ["src/blackhole/", "src/benchmark/"]
+    acceptance:
+      - id: M23-A1
+        description: Optional per-session memory provider (pi-blackhole pinned to 0.5.4, builtin fallback), strict candidate/reviewer/challenger isolation keyed by full session identity, and EventStore-authoritative lifecycle events.
+        evidence: { required: [ { type: unit, id: blackhole-session-isolation } ] }
+      - id: M23-A2
+        description: Memory-promotion workflow with evidence + audit events through the OpenViking durable-memory abstraction; no auto-promotion of speculative memory.
+        evidence: { required: [ { type: unit, id: blackhole-promotion } ] }
+      - id: M23-A3
+        description: Background Observer/Reflector/Dropper workers routed via ModelRouter at P3/P4 and scheduled with backpressure so they never preempt engineering work.
+        evidence: { required: [ { type: unit, id: blackhole-memory-workers } ] }
+      - id: M23-A4
+        description: Native-vs-Blackhole A/B benchmark generates a report and 12 SVG plots, preserves raw JSONL/CSV, and measures context efficiency, recall, autonomy, and throughput.
+        evidence: { required: [ { type: unit, id: blackhole-benchmark-plots } ] }
+      - id: M23-A5
+        description: Compaction-quality degradation is bounded (highest-priority content survives repeated compaction), and disabled behavior is backward compatible (no sessions/events).
+        evidence: { required: [ { type: unit, id: blackhole-compaction } ] }
+    verification: { requires: [unit, integration] }
+
 release_gate:
   require:
     all_required_milestones_verified: true

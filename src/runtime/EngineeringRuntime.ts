@@ -2,6 +2,7 @@ import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import type { Model } from "@earendil-works/pi-ai/compat";
 import { ArtifactStore } from "../artifacts/ArtifactStore.ts";
+import { BlackholeManager, type BlackholeManagerOptions } from "../blackhole/BlackholeManager.ts";
 import { ContextBroker } from "../context/ContextBroker.ts";
 import { newRunId } from "../core/ids.ts";
 import type {
@@ -185,6 +186,14 @@ export interface EngineeringRuntimeOptions {
    * means the gate is open (no autonomous stop).
    */
   roadmapComplete?: () => Promise<boolean>;
+  /**
+   * Optional Blackhole session-memory integration. When provided, each worker
+   * session gets an isolated per-session memory store, background memory
+   * workers can run, and promotion emits ledger events. Omitted or disabled
+   * leaves the runtime behaving exactly as before (backward compatible).
+   * The ledger is supplied by the runtime itself at open time.
+   */
+  blackhole?: Omit<BlackholeManagerOptions, "ledger">;
 }
 
 /**
@@ -205,6 +214,7 @@ export class EngineeringRuntime {
   readonly verifier: VerificationProvider;
   readonly telemetry: Telemetry;
   readonly roadmapComplete: (() => Promise<boolean>) | null;
+  blackhole: BlackholeManager | null;
 
   /**
    * Serializes git mutations that touch the shared main repo (worktree create,
@@ -231,6 +241,7 @@ export class EngineeringRuntime {
     this.reviewerWorker = opts.reviewerWorker ?? null;
     this.verifier = opts.verifier ?? new CommandVerifier();
     this.roadmapComplete = opts.roadmapComplete ?? null;
+    this.blackhole = null;
     this.telemetry = {
       workers: {},
       toolCalls: 0,
@@ -262,6 +273,7 @@ export class EngineeringRuntime {
     rt.artifacts = artifacts;
     rt.broker = broker;
     rt.git = git;
+    if (opts.blackhole) rt.blackhole = await BlackholeManager.open({ ...opts.blackhole, ledger: rt.ledger });
     // Bind the semantic tools (ledger_read, repo_search, ...) to THIS runtime so
     // worker sessions get the tools their prompts require and always address the
     // shared ledger/broker regardless of their cwd (a candidate worktree must not
@@ -296,6 +308,13 @@ export class EngineeringRuntime {
       timeoutMs?: number;
       /** Override the worker (e.g. a distinct reviewer worker). Defaults to this.worker. */
       worker?: WorkerExecutor;
+      /**
+       * Blackhole session scope. Tournament candidates share a work item but
+       * MUST have isolated working memory, so the memory identity keys on this
+       * (the candidate id) rather than the work item id. Defaults to the work
+       * item id (fine for non-tournament work).
+       */
+      sessionScope?: string;
     },
   ) {
     const runId = newRunId();
@@ -309,8 +328,51 @@ export class EngineeringRuntime {
       timeoutMs: opts.timeoutMs ?? 300_000,
       maxContextTokens: budget?.hardMaxTokens,
     };
+    // Open an isolated per-session memory store for this worker when Blackhole
+    // is enabled. The store is keyed by a STABLE session identity (project /
+    // work item / role / worker), so memory persists across fix rounds of the
+    // same candidate while concurrent candidates (distinct work item/worker),
+    // reviewers, and challengers (distinct role) never share working memory.
+    // Disabled ⇒ no store and no recall (backward compatible).
+    const sessionScope = opts.sessionScope ?? opts.wi.id;
+    const sessionStore = this.blackhole?.enabled
+      ? this.blackhole.openSessionFor({
+          project: this.cwd,
+          workItem: opts.wi.id,
+          role,
+          workerId: sessionScope,
+          runId: sessionScope,
+          sessionId: sessionScope,
+        })
+      : null;
+    // Realize in-session recall: prior memory from earlier runs of this same
+    // (work item, role, worker) is recalled and appended to the worker context,
+    // so repeated work is more context-efficient instead of recomputing from
+    // scratch. Strict isolation still holds because each candidate/reviewer/
+    // challenger has a disjoint session identity.
+    let effectiveContext = opts.context;
+    if (sessionStore) {
+      const recalled = sessionStore.recall(20);
+      if (recalled.length > 0) {
+        const memoryBlock = `\n\n[blackhole session memory]\n${recalled
+          .map((e) => `[${e.priority} ${e.kind}] ${e.text}`)
+          .join("\n")}`;
+        effectiveContext = (effectiveContext ?? "") + memoryBlock;
+        req.context = effectiveContext;
+      }
+    }
     const executor = opts.worker ?? this.worker;
     const run = await executor.run(req);
+    // After a completed worker, record the outcome into the session store and
+    // schedule a lower-priority background observer (P3) that never preempts
+    // engineering work. Fire-and-forget so a memory-worker failure never fails
+    // the engineering task.
+    if (this.blackhole?.enabled && run.result.status === "completed" && sessionStore) {
+      sessionStore.observe(run.result.summary, [runId], "P3");
+      void this.blackhole
+        .runMemoryWorker("observer", { project: this.cwd, workItem: opts.wi.id, role, workerId: opts.wi.id })
+        .catch(() => {});
+    }
 
     // Accumulate context/autonomy telemetry.
     this.telemetry.workers[role] = (this.telemetry.workers[role] ?? 0) + 1;
@@ -466,6 +528,8 @@ Use repo_search, symbol, ledger_read, and artifact_read. Do not edit files.`;
       context: contextText,
       wi,
       timeoutMs: 600_000,
+      // Blackhole isolation: each candidate gets its own memory scope.
+      sessionScope: candidate.id,
     });
     // Commit and capture diff (git only).
     if (this.git && worktreePath) {
@@ -580,6 +644,9 @@ Report concrete findings. Return your findings EXACTLY as details.findings, an a
       wi,
       timeoutMs: 240_000,
       worker: this.reviewerWorker ?? undefined,
+      // Blackhole isolation: a reviewer's memory scope is the candidate under
+      // review (distinct from the implementer's, and per-candidate).
+      sessionScope: candidate.id,
     });
     // Findings come from the explicit details.findings contract; anything else
     // is recorded as a (non-blocking) hypothesis so a malformed review never

@@ -57,3 +57,47 @@ export { AdapterRegistry } from "./adapters/Adapters.ts";
 export type { AutoSpecAdapter, InferWeaveAdapter } from "./adapters/Adapters.ts";
 export { exportTelemetry, formatTelemetry } from "./telemetry/TelemetryExport.ts";
 export type { TelemetrySnapshot } from "./telemetry/TelemetryExport.ts";
+export { BlackholeManager } from "./blackhole/BlackholeManager.ts";
+export type { BlackholeManagerOptions } from "./blackhole/BlackholeManager.ts";
+export { resolveBlackholeConfig } from "./blackhole/config.ts";
+export type { PartialBlackholeConfig, ConfigResult } from "./blackhole/config.ts";
+export { MemoryStore } from "./blackhole/MemoryStore.ts";
+export { newSessionIdentity, memoryWorkerIdentity } from "./blackhole/SessionStore.ts";
+export type { SessionIdentity, SessionContext } from "./blackhole/SessionStore.ts";
+export { InMemoryDurableMemory } from "./blackhole/OpenViking.ts";
+export type { DurableMemoryProvider, DurableMemoryRecord } from "./blackhole/OpenViking.ts";
+export { decidePromotion } from "./blackhole/promotion.ts";
+export type { PromotionDecision, PromotionOutcome } from "./blackhole/promotion.ts";
+export { validateBlackholePackage, tryLoadBlackholePackage } from "./blackhole/versioning.ts";
+export type { PackageValidation } from "./blackhole/versioning.ts";
+export { blackholeTelemetry, formatBlackholeTelemetry } from "./blackhole/telemetry.ts";
+export type { BlackholeTelemetry } from "./blackhole/telemetry.ts";
+export {
+  PINNED_BLACKHOLE_VERSION,
+  BLACKHOLE_ALLOWLIST,
+  sessionKey,
+} from "./blackhole/types.ts";
+export type {
+  BlackholeConfig,
+  BlackholeManagerState,
+  MemoryEntry,
+  MemoryPriority,
+  PromotionCandidate,
+  PromotionState,
+  MemoryWorkerRole,
+} from "./blackhole/types.ts";
+export { runExperiment } from "./benchmark/ExperimentRunner.ts";
+export type { ExperimentResult, ExperimentOptions, Workload } from "./benchmark/ExperimentRunner.ts";
+export { summarize } from "./benchmark/Metrics.ts";
+export type { RunMetrics, ConditionSummary, Condition } from "./benchmark/Metrics.ts";
+export { generatePlots } from "./benchmark/Plots.ts";
+export type { PlotSpec } from "./benchmark/Plots.ts";
+export { renderReport } from "./benchmark/Report.ts";
+export {
+  panelHealth,
+  panelPromotion,
+  panelDurable,
+  panelEntries,
+  renderPanels,
+} from "./blackhole/dashboard.ts";
+export type { DashboardPanel } from "./blackhole/dashboard.ts";

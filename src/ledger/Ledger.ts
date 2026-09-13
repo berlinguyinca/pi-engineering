@@ -53,6 +53,21 @@ export class Ledger {
 
   // ------------------------------------------------------------------ events
 
+  /**
+   * Public passthrough for emitting an arbitrary ledger event (used by
+   * optional adapters such as Blackhole so their lifecycle transitions are
+   * recorded in the authoritative EventStore). The EventStore remains the
+   * system of record; this only appends to it.
+   */
+  async emitEvent(
+    type: LedgerEvent["type"],
+    workItemId: string | null,
+    actor: Actor,
+    payload: Record<string, unknown>,
+  ): Promise<LedgerEvent> {
+    return this.emit(type, workItemId, actor, payload);
+  }
+
   private async emit(
     type: LedgerEvent["type"],
     workItemId: string | null,

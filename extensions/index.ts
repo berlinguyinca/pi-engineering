@@ -353,6 +353,28 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  pi.registerCommand("blackhole", {
+    description: "Show Blackhole session-memory status for this runtime (disabled by default).",
+    handler: async (args, ctx) => {
+      const rt = await getRuntime(ctx);
+      if (!rt.blackhole) {
+        ctx.ui.notify("Blackhole is not configured for this runtime (optional adapter).", "info");
+        return;
+      }
+      const { formatBlackholeTelemetry, blackholeTelemetry } = await import("../src/blackhole/telemetry.ts");
+      const { panelHealth, panelPromotion, panelDurable, panelEntries } = await import("../src/blackhole/dashboard.ts");
+      const t = blackholeTelemetry(rt.blackhole.state());
+      const durable = await rt.blackhole.durable.recallAll();
+      const panels = [panelHealth(t), panelPromotion(t), panelDurable(durable)];
+      const head = formatBlackholeTelemetry(t);
+      if (args.includes("--dashboard")) {
+        ctx.ui.notify(`${head}\n\n${panels.map((p) => `${p.title}: ${p.rows.length} row(s)`).join("\n")}`, "info");
+      } else {
+        ctx.ui.notify(head, "info");
+      }
+    },
+  });
+
   pi.registerCommand("roadmap-status", {
     description: "Show derived Roadmap 1.0 completion status for this repository.",
     handler: async (args, ctx) => {

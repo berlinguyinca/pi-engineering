@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="560" height="320" viewBox="0 0 560 320">
+<text x="280" y="16" text-anchor="middle" font-family="sans-serif" font-size="14" font-weight="bold">Input tokens per run</text>
+<text x="280" y="312" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#555">run</text>
+<text x="14" y="160" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#555" transform="rotate(-90 14 160)">input tokens</text>
+<line x1="56" y1="280" x2="544" y2="280" stroke="#999"/>
+<line x1="56" y1="24" x2="56" y2="280" stroke="#999"/>
+<text x="50" y="283" text-anchor="end" font-family="sans-serif" font-size="9" fill="#777">0</text>
+<text x="50" y="219" text-anchor="end" font-family="sans-serif" font-size="9" fill="#777">2006</text>
+<text x="50" y="155" text-anchor="end" font-family="sans-serif" font-size="9" fill="#777">4013</text>
+<text x="50" y="91" text-anchor="end" font-family="sans-serif" font-size="9" fill="#777">6019</text>
+<text x="50" y="27" text-anchor="end" font-family="sans-serif" font-size="9" fill="#777">8025</text>
+<path d="M56.0,240.6 L104.8,242.3 L153.6,237.7 L202.4,173.0 L251.2,160.9 L300.0,67.5 L348.8,24.0 L397.6,140.8 L446.4,172.8 L495.2,134.5 L544.0,106.0" fill="none" stroke="#d94f4f" stroke-width="2"/>
+<circle cx="56.0" cy="240.6" r="3.5" fill="#d94f4f"/>
+<circle cx="104.8" cy="242.3" r="3.5" fill="#d94f4f"/>
+<circle cx="153.6" cy="237.7" r="3.5" fill="#d94f4f"/>
+<circle cx="202.4" cy="173.0" r="3.5" fill="#d94f4f"/>
+<circle cx="251.2" cy="160.9" r="3.5" fill="#d94f4f"/>
+<circle cx="300.0" cy="67.5" r="3.5" fill="#d94f4f"/>
+<circle cx="348.8" cy="24.0" r="3.5" fill="#d94f4f"/>
+<circle cx="397.6" cy="140.8" r="3.5" fill="#d94f4f"/>
+<circle cx="446.4" cy="172.8" r="3.5" fill="#d94f4f"/>
+<circle cx="495.2" cy="134.5" r="3.5" fill="#d94f4f"/>
+<circle cx="544.0" cy="106.0" r="3.5" fill="#d94f4f"/>
+<path d="M56.0,239.8 L104.8,251.7 L153.6,255.3 L202.4,152.6 L251.2,186.6 L300.0,33.4 L348.8,102.6 L397.6,149.7 L446.4,192.9 L495.2,182.9 L544.0,212.9" fill="none" stroke="#2f7fd1" stroke-width="2"/>
+<circle cx="56.0" cy="239.8" r="3.5" fill="#2f7fd1"/>
+<circle cx="104.8" cy="251.7" r="3.5" fill="#2f7fd1"/>
+<circle cx="153.6" cy="255.3" r="3.5" fill="#2f7fd1"/>
+<circle cx="202.4" cy="152.6" r="3.5" fill="#2f7fd1"/>
+<circle cx="251.2" cy="186.6" r="3.5" fill="#2f7fd1"/>
+<circle cx="300.0" cy="33.4" r="3.5" fill="#2f7fd1"/>
+<circle cx="348.8" cy="102.6" r="3.5" fill="#2f7fd1"/>
+<circle cx="397.6" cy="149.7" r="3.5" fill="#2f7fd1"/>
+<circle cx="446.4" cy="192.9" r="3.5" fill="#2f7fd1"/>
+<circle cx="495.2" cy="182.9" r="3.5" fill="#2f7fd1"/>
+<circle cx="544.0" cy="212.9" r="3.5" fill="#2f7fd1"/>
+<rect x="394" y="24" width="150" height="34" fill="#fff" stroke="#ccc"/>
+<circle cx="406" cy="36" r="5" fill="#d94f4f"/>
+<text x="416" y="40" font-family="sans-serif" font-size="11">native</text>
+<circle cx="406" cy="51" r="5" fill="#2f7fd1"/>
+<text x="416" y="55" font-family="sans-serif" font-size="11">blackhole</text>
+</svg>
