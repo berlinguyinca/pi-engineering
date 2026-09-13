@@ -34,7 +34,7 @@ export interface EngineerReport {
   verification: VerifyOutcome | null;
   evidence_ids: string[];
   rounds: number;
-  outcome: "promoted" | "failed" | "blocked";
+  outcome: "promoted" | "failed" | "blocked" | "stopped";
   /** Aggregate context/autonomy telemetry for the run (spec §41). */
   telemetry: Telemetry;
 }
@@ -177,6 +177,13 @@ export interface EngineeringRuntimeOptions {
   agentDir?: string;
   /** Override the durable state directory (default: <repoRoot>/.pi-eng). */
   workDir?: string;
+  /**
+   * Autonomous-stop gate (spec §14.5, roadmap spec §13). When the roadmap is
+   * complete, `engineer()` refuses to invent new work. Returns true when the
+   * roadmap is complete (new autonomous work must stop). Optional: omitted
+   * means the gate is open (no autonomous stop).
+   */
+  roadmapComplete?: () => Promise<boolean>;
 }
 
 /**
@@ -196,6 +203,7 @@ export class EngineeringRuntime {
   readonly reviewerWorker: WorkerExecutor | null;
   readonly verifier: VerificationProvider;
   readonly telemetry: Telemetry;
+  readonly roadmapComplete: (() => Promise<boolean>) | null;
 
   private constructor(opts: EngineeringRuntimeOptions) {
     this.cwd = opts.cwd;
@@ -203,6 +211,7 @@ export class EngineeringRuntime {
     this.worker = opts.worker ?? new PiWorkerExecutor({ model: opts.model, agentDir: opts.agentDir });
     this.reviewerWorker = opts.reviewerWorker ?? null;
     this.verifier = opts.verifier ?? new CommandVerifier();
+    this.roadmapComplete = opts.roadmapComplete ?? null;
     this.telemetry = {
       workers: {},
       toolCalls: 0,
@@ -1210,6 +1219,23 @@ Goal: "${goal}"`;
   }
 
   async engineer(goal: string): Promise<EngineerReport> {
+    // Autonomous stop: when the roadmap is complete, do NOT invent new work.
+    // Completion is derived (roadmap check), never declared (roadmap spec §13).
+    if (this.roadmapComplete && (await this.roadmapComplete())) {
+      return {
+        work_item: await this.ledger.createWorkItem(goal, "medium", [this.cwd], this.actor(newRunId(), "planner")),
+        risk: "medium",
+        incumbent_candidate: null,
+        scout_summary: "Skipped: roadmap complete — autonomous stop (no new work invented).",
+        review_summary: null,
+        challenge_summary: null,
+        verification: null,
+        evidence_ids: [],
+        rounds: 0,
+        outcome: "stopped",
+        telemetry: this.telemetry,
+      };
+    }
     if (!this.git) {
       return {
         work_item: await this.ledger.createWorkItem(goal, "medium", [this.cwd], this.actor(newRunId(), "planner")),

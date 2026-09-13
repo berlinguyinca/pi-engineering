@@ -21,3 +21,12 @@ export type {
   TournamentReport,
   TournamentEntry,
 } from "./runtime/EngineeringRuntime.ts";
+export { RoadmapEngine, RoadmapError, ALL_EVIDENCE_TYPES } from "./roadmap/RoadmapEngine.ts";
+export { RoadmapEvidenceStore } from "./roadmap/evidence.ts";
+export { parseRoadmap } from "./roadmap/schema.ts";
+export { evaluateMilestone, evaluateAll, milestoneRequiredTypes } from "./roadmap/evaluate.ts";
+export { evaluateReleaseGate } from "./roadmap/releaseGate.ts";
+export { runCheck, CHECKS } from "./roadmap/checks.ts";
+export { runRoadmapCheck, runRoadmapStatus, defaultCliPaths } from "./roadmap/cli.ts";
+export type { RoadmapCliOptions, RoadmapCliResult } from "./roadmap/cli.ts";
+export type * from "./roadmap/types.ts";

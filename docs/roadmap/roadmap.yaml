@@ -1,0 +1,234 @@
+# pi-engineering-runtime — Roadmap 1.0 (verifiable roadmap completion model).
+#
+# This file is the single source of truth for Roadmap 1.0 scope. Completion is
+# DERIVED by `pi-engineering roadmap check` from evidence, dependencies, and
+# freshness — never declared. See the verifiable-roadmap-completion spec.
+#
+# Milestone semantics:
+#   required      : counts toward 1.0 completion; cannot be silently deferred.
+#   depends_on    : prerequisite milestone must be VERIFIED first.
+#   scope.paths   : path prefixes the milestone affects (impact invalidation).
+#   acceptance    : concrete criteria, each backed by machine evidence refs.
+#   verification.requires : evidence types that must pass for this milestone.
+#   deferred_reason       : only on non-required milestones (future backlog).
+
+roadmap:
+  id: pi-engineering-runtime
+  version: "1.0"
+  codename: standalone-engineering-runtime
+
+milestones:
+  - id: M01
+    name: Package Foundation
+    required: true
+    depends_on: []
+    scope:
+      paths: ["extensions/", "src/index.ts", "src/core/", "package.json", "tsconfig.json"]
+    acceptance:
+      - id: M01-A1
+        description: The package loads as a standalone Pi extension and registers its command + tool surface.
+        evidence: { required: [ { type: package_load, id: extension-loads } ] }
+      - id: M01-A2
+        description: The package typechecks and lints clean as a standalone TypeScript project.
+        evidence: { required: [ { type: typecheck, id: typecheck-clean } ] }
+    verification: { requires: [package_load, typecheck, lint] }
+
+  - id: M02
+    name: Engineering Ledger
+    required: true
+    depends_on: [M01]
+    scope:
+      paths: ["src/ledger/"]
+    acceptance:
+      - id: M02-A1
+        description: The ledger persists and replays work items, candidates, and tasks from a durable event source.
+        evidence: { required: [ { type: unit, id: ledger-events } ] }
+      - id: M02-A2
+        description: Concurrent writers cannot corrupt the ledger.
+        evidence: { required: [ { type: unit, id: eventstore-concurrent } ] }
+    verification: { requires: [unit] }
+
+  - id: M03
+    name: Fresh-Context Workers
+    required: true
+    depends_on: [M01]
+    scope:
+      paths: ["src/workers/"]
+    acceptance:
+      - id: M03-A1
+        description: Worker sessions run in fresh contexts and return bounded structured results under a token budget.
+        evidence: { required: [ { type: unit, id: workers-budget } ] }
+    verification: { requires: [unit] }
+
+  - id: M04
+    name: Artifact Store
+    required: true
+    depends_on: [M01]
+    scope:
+      paths: ["src/artifacts/", "src/workers/workerResultTool.ts"]
+    acceptance:
+      - id: M04-A1
+        description: Artifacts are stored and lazily read by artifact:// URI without loading full content into worker context.
+        evidence: { required: [ { type: unit, id: artifacts-lazy } ] }
+    verification: { requires: [unit] }
+
+  - id: M05
+    name: Context Broker
+    required: true
+    depends_on: [M04]
+    scope:
+      paths: ["src/context/"]
+    acceptance:
+      - id: M05-A1
+        description: Files are relevance-ranked and content slices are assembled within a bounded context budget.
+        evidence: { required: [ { type: unit, id: context-ranking } ] }
+    verification: { requires: [unit] }
+
+  - id: M06
+    name: Autonomy & Telemetry
+    required: true
+    depends_on: [M01]
+    scope:
+      paths: ["src/runtime/EngineeringRuntime.ts", "src/core/types.ts"]
+    acceptance:
+      - id: M06-A1
+        description: An end-to-end engineering run completes autonomously with zero operator prompts for a normal task.
+        evidence: { required: [ { type: integration, id: autonomy-vertical-slice } ] }
+    verification: { requires: [integration] }
+
+  - id: M07
+    name: Clean-Room Challenge
+    required: true
+    depends_on: [M03]
+    scope:
+      paths: ["src/runtime/EngineeringRuntime.ts"]
+    acceptance:
+      - id: M07-A1
+        description: A clean-room challenge produces an independent assessment without prior reasoning context.
+        evidence: { required: [ { type: integration, id: challenge-cleanroom } ] }
+    verification: { requires: [integration] }
+
+  - id: M08
+    name: Worktree Isolation
+    required: true
+    depends_on: [M02]
+    scope:
+      paths: ["src/git/", "src/runtime/EngineeringRuntime.ts"]
+    acceptance:
+      - id: M08-A1
+        description: Candidates run in isolated worktrees and promote via a controlled merge into main.
+        evidence: { required: [ { type: integration, id: worktree-isolation } ] }
+    verification: { requires: [unit, integration] }
+
+  - id: M09
+    name: Risk-Adaptive Orchestration
+    required: true
+    depends_on: [M03, M07]
+    scope:
+      paths: ["src/runtime/EngineeringRuntime.ts"]
+    acceptance:
+      - id: M09-A1
+        description: Promotion is gated on a completed independent review (no-promote-without-complete-review).
+        evidence: { required: [ { type: integration, id: review-gate } ] }
+      - id: M09-A2
+        description: An incomplete or failing review is never treated as a clean review.
+        evidence: { required: [ { type: integration, id: review-fail-not-clean } ] }
+    verification: { requires: [integration] }
+
+  - id: M10
+    name: Candidate Tournament
+    required: true
+    depends_on: [M08, M09]
+    scope:
+      paths: ["src/runtime/EngineeringRuntime.ts", "src/ledger/"]
+    acceptance:
+      - id: M10-A1
+        description: Multiple isolated candidates compete and a deterministic winner is promoted.
+        evidence: { required: [ { type: integration, id: tournament-deterministic } ] }
+      - id: M10-A2
+        description: Parallel candidates run concurrently and clean up their git state.
+        evidence: { required: [ { type: integration, id: tournament-parallel } ] }
+      - id: M10-A3
+        description: A throwing candidate leg is isolated and leaks no git state.
+        evidence: { required: [ { type: integration, id: tournament-leg-isolation } ] }
+    verification: { requires: [integration] }
+
+  - id: M11
+    name: Advanced Verification
+    required: true
+    depends_on: [M01]
+    scope:
+      paths: ["src/verify/"]
+    acceptance:
+      - id: M11-A1
+        description: Deterministic verification gates promotion, records evidence, and caches content-keyed results.
+        evidence: { required: [ { type: unit, id: verify-deterministic } ] }
+    verification: { requires: [unit] }
+
+  - id: M12
+    name: Verifiable Roadmap Completion
+    required: true
+    depends_on: [M01]
+    scope:
+      paths: ["src/roadmap/", "docs/roadmap/"]
+    acceptance:
+      - id: M12-A1
+        description: The roadmap engine parses and validates a versioned Roadmap 1.0 definition.
+        evidence: { required: [ { type: roadmap_test, id: roadmap-schema } ] }
+      - id: M12-A2
+        description: Milestone state is derived from evidence and dependencies, never declared.
+        evidence: { required: [ { type: roadmap_test, id: roadmap-evaluate } ] }
+      - id: M12-A3
+        description: Relevant changes invalidate stale evidence (NEEDS_REVERIFICATION).
+        evidence: { required: [ { type: roadmap_test, id: roadmap-invalidate } ] }
+      - id: M12-A4
+        description: roadmap check returns deterministic exit codes (0/1/2/3).
+        evidence: { required: [ { type: roadmap_test, id: roadmap-cli-exit-codes } ] }
+      - id: M12-A5
+        description: The roadmap system manages its own roadmap (dogfood) without requiring an LLM to declare completion.
+        evidence: { required: [ { type: roadmap_test, id: roadmap-dogfood } ] }
+    verification: { requires: [roadmap_test] }
+
+  - id: M13
+    name: Parallel Task DAG Execution
+    required: false
+    depends_on: [M10, M11]
+    deferred_reason: >-
+      Task-DAG parallelism requires branch-based candidate accumulation plus a
+      sequential controlled integration, because each task's engineer() merges
+      into main and concurrent tasks race on index.lock. Safe parallelism is a
+      distinct milestone; it is deliberately deferred out of Roadmap 1.0 scope.
+    scope:
+      paths: ["src/plan/", "src/runtime/EngineeringRuntime.ts"]
+    acceptance:
+      - id: M13-A1
+        description: Independent plan tasks execute concurrently without racing on the shared index.
+        evidence: { required: [ { type: integration, id: parallel-dag } ] }
+    verification: { requires: [integration] }
+
+release_gate:
+  require:
+    all_required_milestones_verified: true
+    tests: { unit: pass, integration: pass }
+    typecheck: pass
+    lint: pass
+    package_load: pass
+    fresh_review: { unresolved_critical: 0, unresolved_high: 0 }
+
+backlog:
+  - id: B-101
+    title: Multi-model default (distinct reviewer/challenger model by default)
+    discovered_during: M09
+  - id: B-102
+    title: Engineering benchmark suite with baseline comparison (DeepSeek-V4-Flash)
+    discovered_during: M12
+  - id: B-103
+    title: AutoSpec adapter (optional)
+  - id: B-104
+    title: InferWeave adapter (optional)
+  - id: B-105
+    title: Hosted control plane / dashboard (optional)
+  - id: B-106
+    title: Go control plane (optional)
+
+waivers: []

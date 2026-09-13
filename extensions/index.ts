@@ -1,6 +1,8 @@
+import { resolve } from "node:path";
 import type { Model } from "@earendil-works/pi-ai/compat";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { GitRepo } from "../src/git/GitRepo.ts";
+import { RoadmapEngine } from "../src/roadmap/RoadmapEngine.ts";
 import { EngineeringRuntime } from "../src/runtime/EngineeringRuntime.ts";
 import { type CoreServices, buildCoreTools } from "../src/tools/coreTools.ts";
 import { CommandVerifier } from "../src/verify/Verifier.ts";
@@ -322,6 +324,42 @@ export default function (pi: ExtensionAPI) {
         "",
       );
       ctx.ui.notify(`Challenger: ${result?.summary.slice(0, 600) ?? "no challenge produced"}`, "info");
+    },
+  });
+
+  pi.registerCommand("roadmap-status", {
+    description: "Show derived Roadmap 1.0 completion status for this repository.",
+    handler: async (args, ctx) => {
+      const repo = await GitRepo.open(ctx.cwd).catch(() => null);
+      if (!repo) {
+        ctx.ui.notify("Not inside a git work tree.", "error");
+        return;
+      }
+      const root = repo.root;
+      const roadmapPath = resolve(root, "docs/roadmap/roadmap.yaml");
+      const manualEvidencePath = resolve(root, "docs/roadmap/evidence.yaml");
+      const evidenceFile = resolve(root, ".pi-eng/roadmap/evidence.jsonl");
+      try {
+        const engine = await RoadmapEngine.open({
+          repoRoot: root,
+          roadmapPath,
+          manualEvidencePath,
+          evidenceFile,
+        });
+        const detail = await engine.evaluate();
+        const lines = [
+          `Roadmap ${detail.roadmapId}@${detail.version}`,
+          `complete: ${detail.complete}`,
+          `release gate: ${detail.releaseGate.pass ? "PASS" : "FAIL"}`,
+        ];
+        for (const m of detail.milestones) {
+          lines.push(`- ${m.milestone.id} ${m.milestone.name}: ${m.state}`);
+          for (const b of m.blockers.slice(0, 3)) lines.push(`    • ${b}`);
+        }
+        ctx.ui.notify(lines.join("\n").slice(0, 1800), detail.complete ? "info" : "info");
+      } catch (err) {
+        ctx.ui.notify(`roadmap error: ${String(err)}`, "error");
+      }
     },
   });
 

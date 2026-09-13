@@ -186,4 +186,33 @@ export class GitRepo {
     const r = await this.git(["diff", "--name-only", baseCommit, headCommit]);
     return r.stdout ? r.stdout.split("\n").filter(Boolean) : [];
   }
+
+  /**
+   * Files under `paths` that changed since `commit` (committed AND uncommitted).
+   * Used for impact-based roadmap-evidence invalidation (spec §10): conservative,
+   * path-scoped, and model-free. `paths` may be git pathspecs (globs). An empty
+   * `paths` matches everything.
+   */
+  async changedPathsSince(commit: string, paths: string[]): Promise<string[]> {
+    const spec = paths.length ? ["--", ...paths] : [];
+    const committed = await this.git(["diff", "--name-only", `${commit}..HEAD`, ...spec]);
+    const uncommitted = await this.git(["status", "--porcelain", ...spec]);
+    const set = new Set<string>();
+    // git diff --name-only prints bare filenames.
+    if (committed.stdout) {
+      for (const line of committed.stdout.split("\n")) {
+        const f = line.trim();
+        if (f) set.add(f);
+      }
+    }
+    // git status --porcelain prefixes each line with "XY " (2 status chars + space).
+    if (uncommitted.stdout) {
+      for (const line of uncommitted.stdout.split("\n")) {
+        if (!line.trim()) continue;
+        const file = line.slice(3).trim();
+        if (file) set.add(file);
+      }
+    }
+    return [...set];
+  }
 }

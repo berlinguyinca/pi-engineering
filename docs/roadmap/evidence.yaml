@@ -1,0 +1,22 @@
+# Committed manual evidence index for Roadmap 1.0.
+#
+# Deterministic evidence (unit/integration/typecheck/lint/package_load/roadmap_test)
+# is regenerated on demand by `pi-engineering roadmap check` and cached in the
+# gitignored .pi-eng/roadmap/evidence.jsonl. This file holds the MODEL-DEPENDENT
+# evidence that cannot run in CI: real-model dogfood runs and fresh-context
+# reviews. Each record is bound to the commit it was produced at; a relevant
+# change invalidates it (release-gate NEEDS_REVERIFICATION).
+#
+# Records are appended by the dogfood + fresh-review process, never hand-edited
+# to claim completion. An empty index is an honest "not yet verified" state.
+
+# - id: dogfood-1.0
+#   milestone: __global__
+#   type: dogfood
+#   status: pass
+#   commit: <full sha>
+#   generatedAt: <iso8601>
+#   paths: ["src/", "extensions/"]
+#   proof: "scripts/dogfood-roadmap.ts"
+#   summary: "..."
+[]
