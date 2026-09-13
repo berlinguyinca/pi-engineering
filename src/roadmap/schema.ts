@@ -205,6 +205,11 @@ export function parseRoadmap(
   const requireRaw = isPlainObject(rgRaw.require) ? rgRaw.require : {};
   const testsRaw = isPlainObject(requireRaw.tests) ? requireRaw.tests : {};
   const frRaw = isPlainObject(requireRaw.fresh_review) ? requireRaw.fresh_review : {};
+  if (requireRaw.all_required_milestones_verified === false)
+    issues.push({
+      path: "release_gate.require.all_required_milestones_verified",
+      message: "must be true (completion is not optional)",
+    });
   const releaseGate: RoadmapDef["release_gate"] = {
     require: {
       allRequiredMilestonesVerified: requireRaw.all_required_milestones_verified !== false,

@@ -132,6 +132,108 @@ test("roadmap check: complete roadmap -> exit 0", async () => {
   }
 });
 
+test("roadmap check: hand-written manual evidence of a GENERATED type is rejected", async () => {
+  // A manual YAML record claiming a generated check (unit) passed must not
+  // satisfy acceptance criteria without a real check run.
+  const setup = await setupRepo();
+  try {
+    const engine = await RoadmapEngine.open({ repoRoot: setup.root, ...setup.paths });
+    const head = await engine.head();
+    for (const t of ["unit", "integration", "typecheck", "lint", "package_load"] as const) {
+      await engine.store.put({
+        id: `__global__:${t}`,
+        milestone: "__global__",
+        type: t,
+        status: "pass",
+        commit: head,
+        generatedAt: new Date().toISOString(),
+        paths: ["src/", "test/"],
+        proof: "test",
+        source: "generated",
+      });
+    }
+    // The ONLY unit evidence is a hand-written manual record (no real run).
+    await writeFile(
+      setup.paths.manualEvidencePath,
+      `- id: fake-unit
+  milestone: M01
+  criterionId: M01-A1
+  type: unit
+  status: pass
+  commit: ${head}
+  paths: ["src/"]
+  proof: "hand-written"
+- id: dogfood-1.0
+  milestone: __global__
+  type: dogfood
+  status: pass
+  commit: ${head}
+  paths: ["src/"]
+  proof: "test"
+- id: review-1.0
+  milestone: __global__
+  type: fresh_review
+  status: pass
+  commit: ${head}
+  paths: ["src/roadmap/"]
+  findings: { critical: 0, high: 0 }
+  proof: "test"
+`,
+    );
+    const { exitCode } = await runRoadmapCheck({
+      repoRoot: setup.root,
+      ...setup.paths,
+      json: false,
+      refresh: false,
+    });
+    assert.equal(exitCode, 1);
+    const detail = await engine.evaluate();
+    const m = detail.milestones.find((e) => e.milestone.id === "M01");
+    assert.notEqual(m?.state, "VERIFIED");
+    assert.ok(m?.missingEvidence.includes("M01-A1:unit"));
+  } finally {
+    await setup.cleanup();
+  }
+});
+
+test("roadmap check: stale fresh_review record fails the release gate", async () => {
+  const setup = await setupRepo();
+  try {
+    await seedCompleteEvidence(setup);
+    // Point the fresh_review record at a stale commit so its freshness fails.
+    const engine = await RoadmapEngine.open({ repoRoot: setup.root, ...setup.paths });
+    const head = await engine.head();
+    await writeFile(
+      setup.paths.manualEvidencePath,
+      `- id: dogfood-1.0
+  milestone: __global__
+  type: dogfood
+  status: pass
+  commit: ${head}
+  paths: ["src/"]
+  proof: "test"
+- id: review-1.0
+  milestone: __global__
+  type: fresh_review
+  status: pass
+  commit: 0000000000000000000000000000000000000000
+  paths: ["src/roadmap/"]
+  findings: { critical: 0, high: 0 }
+  proof: "test"
+`,
+    );
+    const { exitCode, text } = await runRoadmapCheck({
+      repoRoot: setup.root,
+      ...setup.paths,
+      json: false,
+      refresh: false,
+    });
+    assert.equal(exitCode, 1, text);
+  } finally {
+    await setup.cleanup();
+  }
+});
+
 test("roadmap check: missing dogfood evidence -> exit 1 (not complete)", async () => {
   const setup = await setupRepo();
   try {

@@ -117,6 +117,19 @@ test("evaluate: failing evidence record -> not verified", async () => {
   assert.ok(e.missingEvidence.includes("M01-A1:unit"));
 });
 
+test("evaluate: fresh FAILING record -> BLOCKED, never demoted to IMPLEMENTED", async () => {
+  // A failing refresh must not erase that verification ran and failed.
+  const e = await evalM(milestone(), [record({ status: "fail" })], fresh, budget());
+  assert.equal(e.state, "BLOCKED");
+  assert.ok(e.blockers.some((b) => b.includes("verification failed")));
+});
+
+test("evaluate: STALE failing record still blocks (last known result is failure)", async () => {
+  // A stale failure is the last known result; BLOCKED, never IMPLEMENTED.
+  const e = await evalM(milestone(), [record({ status: "fail" })], stale, budget());
+  assert.equal(e.state, "BLOCKED");
+});
+
 test("evaluate: unresolved findings block VERIFIED", async () => {
   const e = await evalM(milestone(), [record()], fresh, budget(1, 0));
   assert.notEqual(e.state, "VERIFIED");

@@ -122,7 +122,13 @@ export async function evaluateMilestone(
   if (!implementationExists) blockers.push("no implementation detected in scope");
 
   const hasAnyPassing = records.some((r) => r.status === "pass");
+  // A FAILING record means verification was attempted and failed; the milestone
+  // is BLOCKED, never demoted to IMPLEMENTED (which would lose the fact that
+  // verification ran and failed). Any failing record — fresh or stale — is the
+  // last known result for its type and must block.
+  const anyFail = records.some((r) => r.status === "fail");
   const allPassingFresh = missingEvidence.length === 0 && staleEvidence.length === 0;
+  const failBlocker = anyFail ? "verification failed (a required check is failing)" : "";
   const depsOk = !m.dependsOn.some((d) => {
     const s = depStates.get(d);
     return s !== "VERIFIED" && s !== "DEFERRED";
@@ -130,7 +136,10 @@ export async function evaluateMilestone(
   const findingsOk = findings.critical <= 0 && findings.high <= 0;
 
   let state: MilestoneState;
-  if (staleEvidence.length > 0 && hasAnyPassing) {
+  if (anyFail) {
+    // Verification ran and failed; never demote to IMPLEMENTED.
+    state = "BLOCKED";
+  } else if (staleEvidence.length > 0 && hasAnyPassing) {
     // We had passing evidence; a relevant change invalidated it.
     state = "NEEDS_REVERIFICATION";
   } else if (depBlocked) {
@@ -148,6 +157,7 @@ export async function evaluateMilestone(
     state = "NOT_STARTED";
   }
 
+  if (failBlocker) blockers.push(failBlocker);
   if (!findingsOk) blockers.push(`unresolved findings: ${findings.critical} critical, ${findings.high} high`);
 
   return { milestone: m, state, blockers, missingEvidence, staleEvidence, unresolvedFindings: findings };

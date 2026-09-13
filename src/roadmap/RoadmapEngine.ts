@@ -13,7 +13,7 @@ import { join } from "node:path";
 import { parse as parseYaml } from "yaml";
 import { GitRepo } from "../git/GitRepo.ts";
 import { CHECKS, type Check, GENERATED_TYPES, MANUAL_TYPES, requiredTypes, runCheck } from "./checks.ts";
-import { type EvidenceFreshness, type FindingsBudget, evaluateAll, milestoneRequiredTypes } from "./evaluate.ts";
+import { type EvidenceFreshness, type FindingsBudget, evaluateAll } from "./evaluate.ts";
 import { RoadmapEvidenceStore } from "./evidence.ts";
 import { type GateStatusProvider, evaluateReleaseGate } from "./releaseGate.ts";
 import { parseRoadmap } from "./schema.ts";
@@ -226,7 +226,10 @@ export class RoadmapEngine {
             status: res.status,
             commit,
             generatedAt: new Date().toISOString(),
-            paths: m.scope.paths.length ? m.scope.paths : check.paths,
+            // Impact invalidation covers the milestone scope AND the check's
+            // coverage paths, so e.g. a test-file change invalidates both the
+            // global gate and the per-milestone evidence (no divergence).
+            paths: [...new Set([...m.scope.paths, ...check.paths])],
             proof: check.command.join(" "),
             source: "generated",
             summary:
