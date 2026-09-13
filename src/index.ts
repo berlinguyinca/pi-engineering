@@ -66,6 +66,9 @@ export { newSessionIdentity, memoryWorkerIdentity } from "./blackhole/SessionSto
 export type { SessionIdentity, SessionContext } from "./blackhole/SessionStore.ts";
 export { InMemoryDurableMemory } from "./blackhole/OpenViking.ts";
 export type { DurableMemoryProvider, DurableMemoryRecord } from "./blackhole/OpenViking.ts";
+export { SharedFileDurableMemory, OpenVikingProvider } from "./blackhole/durable.ts";
+export type { OpenVikingProviderOptions } from "./blackhole/durable.ts";
+export { buildDurableProvider } from "./blackhole/BlackholeManager.ts";
 export { decidePromotion } from "./blackhole/promotion.ts";
 export type { PromotionDecision, PromotionOutcome } from "./blackhole/promotion.ts";
 export { validateBlackholePackage, tryLoadBlackholePackage } from "./blackhole/versioning.ts";

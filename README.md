@@ -66,6 +66,12 @@ CLI: `pi-engineering blackhole status|validate|benchmark`. A native-vs-Blackhole
 benchmark generates a report + **12 SVG plots** and preserves raw JSONL/CSV under
 `docs/evidence/blackhole/`. See `docs/specs/PI_BLACKHOLE_INTEGRATION_SPEC.md`.
 
+**Sharing memory across workers:** the `durable` config selects the backing store for
+*evidence-promoted* knowledge (`memory` default, `shared-file` for several workers on
+one host / CI, `openviking` for the external cross-machine service). Each worker
+hydrates its context from shared durable memory on run, so promoted knowledge is
+consumed by later/other workers while session-local working memory stays isolated:
+
 `pi-engineering roadmap check` (also `npm run roadmap:check`) returns a
 **verifiable completion verdict**: exit **0** when every required milestone is
 VERIFIED with fresh evidence, the release gate passes (deterministic suites +
@@ -128,6 +134,7 @@ src/bench/           engineering benchmark with baseline gate
 src/adapters/        optional AutoSpec/InferWeave seams (empty by default)
 src/telemetry/       deterministic telemetry export for external control planes
 src/blackhole/       optional per-session memory provider (pinned 0.5.4, builtin default)
+src/blackhole/durable.ts  shared durable-memory providers (shared-file, OpenViking HTTP)
 src/benchmark/       native-vs-Blackhole A/B benchmark (report + 12 SVG plots + raw data)
 src/workers/         role prompts + bounded worker_result tool + executors
 src/runtime/         EngineeringRuntime facade (plan/engineer/tournament/review/challenge)

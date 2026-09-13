@@ -45,6 +45,13 @@ export interface EngineerReport {
 const READ_ONLY_TOOLS = ["read", "grep", "find", "ls"];
 /** Implementation tool allowlist. */
 const IMPLEMENT_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls"];
+/**
+ * Roles that may hydrate from SHARED durable memory. Independent reviewer and
+ * clean-room challenger are deliberately excluded (INV-007): they must not
+ * inherit prior candidate memory. Implementer/scout/planner may reuse promoted
+ * project knowledge (constraints, decisions, root causes).
+ */
+const HYDRATION_ROLES: readonly string[] = ["scout", "planner", "implementer"];
 
 /** A planner's machine-readable task spec (spec §19.2). */
 interface PlannerTaskSpec {
@@ -358,6 +365,27 @@ export class EngineeringRuntime {
           .map((e) => `[${e.priority} ${e.kind}] ${e.text}`)
           .join("\n")}`;
         effectiveContext = (effectiveContext ?? "") + memoryBlock;
+        req.context = effectiveContext;
+      }
+    }
+    // Hydrate from SHARED durable memory (OpenViking / shared file): surface
+    // evidence-promoted knowledge from OTHER workers/sessions so repeated or
+    // parallel engineering work is not recomputed from scratch. This is the
+    // cross-worker sharing read path. Provider failure degrades to nothing.
+    //
+    // INVARIANT: hydration is gated to non-independent roles. The independent
+    // reviewer and the clean-room challenger MUST NOT inherit prior candidate
+    // memory (INV-007), so they never read shared durable memory — otherwise
+    // promoted candidate knowledge (promotedFrom = candidate id) would leak
+    // into contexts whose prompts forbid prior reasoning.
+    if (this.blackhole?.enabled && HYDRATION_ROLES.includes(role)) {
+      const query = `${opts.wi.id} ${role} ${task.slice(0, 120)}`;
+      const shared = await this.blackhole.hydrate(query, 10);
+      if (shared.length > 0) {
+        const block = `\n\n[openviking durable memory]\n${shared
+          .map((r) => `[promoted ${r.promotedAt}] ${r.text}`)
+          .join("\n")}`;
+        effectiveContext = (effectiveContext ?? "") + block;
         req.context = effectiveContext;
       }
     }

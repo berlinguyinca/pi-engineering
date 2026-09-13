@@ -5,7 +5,13 @@
  * enabling it) turns on session memory only; disabling or omitting leaves the
  * runtime behaving exactly as before while still emitting lifecycle events.
  */
-import { BLACKHOLE_ALLOWLIST, type BlackholeConfig, type MemoryWorkerRole, PINNED_BLACKHOLE_VERSION } from "./types.ts";
+import {
+  BLACKHOLE_ALLOWLIST,
+  type BlackholeConfig,
+  type DurableStoreConfig,
+  type MemoryWorkerRole,
+  PINNED_BLACKHOLE_VERSION,
+} from "./types.ts";
 
 export interface PartialBlackholeConfig {
   enabled?: boolean;
@@ -14,6 +20,10 @@ export interface PartialBlackholeConfig {
   memoryWorkerConcurrency?: number;
   compactionThreshold?: number;
   sessionTtlMs?: number;
+  /** Backing store for promoted durable (shared) memory. Defaults to in-memory. */
+  durable?: DurableStoreConfig;
+  /** Bounded wait for shared-durable provider calls (default 5000ms). */
+  providerTimeoutMs?: number;
 }
 
 const DEFAULTS: Omit<BlackholeConfig, "version"> & { version: string } = {
@@ -24,6 +34,8 @@ const DEFAULTS: Omit<BlackholeConfig, "version"> & { version: string } = {
   autoPromotion: false,
   compactionThreshold: 200,
   sessionTtlMs: 30 * 60 * 1000,
+  durable: { kind: "memory" },
+  providerTimeoutMs: 5000,
 };
 
 export interface ConfigResult {
@@ -58,6 +70,17 @@ export function resolveBlackholeConfig(input?: PartialBlackholeConfig): ConfigRe
   if (compactionThreshold < 2) {
     throw new Error("compactionThreshold must be >= 2");
   }
+  const durable = input?.durable ?? DEFAULTS.durable;
+  if (durable.kind === "shared-file" && !durable.file) {
+    throw new Error("durable.kind='shared-file' requires a `file` path");
+  }
+  if (durable.kind === "openviking" && !durable.baseUrl) {
+    throw new Error("durable.kind='openviking' requires a `baseUrl`");
+  }
+  const providerTimeoutMs = input?.providerTimeoutMs ?? DEFAULTS.providerTimeoutMs;
+  if (providerTimeoutMs < 1) {
+    throw new Error("providerTimeoutMs must be >= 1");
+  }
   return {
     config: {
       enabled: input?.enabled ?? DEFAULTS.enabled,
@@ -67,6 +90,8 @@ export function resolveBlackholeConfig(input?: PartialBlackholeConfig): ConfigRe
       autoPromotion: false, // never auto-promote
       compactionThreshold,
       sessionTtlMs: input?.sessionTtlMs ?? DEFAULTS.sessionTtlMs,
+      durable,
+      providerTimeoutMs,
     },
     warnings,
   };

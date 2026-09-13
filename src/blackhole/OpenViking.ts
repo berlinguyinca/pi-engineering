@@ -40,9 +40,24 @@ export class InMemoryDurableMemory implements DurableMemoryProvider {
   }
 
   async search(query: string): Promise<DurableMemoryRecord[]> {
-    const q = query.toLowerCase();
-    return [...this.records.values()].filter(
-      (r) => r.text.toLowerCase().includes(q) || r.sourceRefs.some((s) => s.toLowerCase().includes(q)),
-    );
+    return searchDurable(query, [...this.records.values()]);
   }
+}
+
+/**
+ * Token-based relevance matcher shared by all durable providers. A record is
+ * relevant when ANY whitespace-delimited token in the query is a substring of
+ * the record's text or one of its source references. Token matching is far more
+ * useful than whole-string substring matching for short worker-context queries.
+ */
+export function searchDurable(query: string, records: DurableMemoryRecord[]): DurableMemoryRecord[] {
+  const tokens = query
+    .toLowerCase()
+    .split(/\s+/)
+    .filter((t) => t.length >= 2);
+  if (tokens.length === 0) return records;
+  return records.filter((r) => {
+    const hay = `${r.text.toLowerCase()} ${r.sourceRefs.join(" ").toLowerCase()}`;
+    return tokens.some((t) => hay.includes(t));
+  });
 }

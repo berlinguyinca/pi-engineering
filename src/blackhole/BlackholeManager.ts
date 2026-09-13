@@ -13,9 +13,10 @@ import type { ModelProvider, ModelRouter } from "../routing/ModelRouter.ts";
 import { Scheduler } from "../sched/Scheduler.ts";
 import type { BlackholeAdapter } from "./BlackholeAdapter.ts";
 import { MemoryStore } from "./MemoryStore.ts";
-import { type DurableMemoryProvider, InMemoryDurableMemory } from "./OpenViking.ts";
+import { type DurableMemoryProvider, type DurableMemoryRecord, InMemoryDurableMemory } from "./OpenViking.ts";
 import { type SessionContext, newSessionIdentity } from "./SessionStore.ts";
 import { resolveBlackholeConfig } from "./config.ts";
+import { OpenVikingProvider, SharedFileDurableMemory } from "./durable.ts";
 import {
   type MemoryStoreFactory,
   type MemoryWorkerOptions,
@@ -76,7 +77,7 @@ export class BlackholeManager {
     this.config = resolved.config;
     this.warnings = resolved.warnings;
     this.ledger = opts.ledger;
-    this.durable = opts.durable ?? new InMemoryDurableMemory();
+    this.durable = opts.durable ?? buildDurableProvider(resolved.config.durable);
     this.scheduler = new Scheduler({ concurrency: this.config.memoryWorkerConcurrency });
     this.providers = opts.providers ?? [];
     this.router = buildMemoryRouter(this.providers);
@@ -174,6 +175,26 @@ export class BlackholeManager {
     const key = sessionKey(identity);
     const entry = this.sessions.get(key);
     return entry ? entry.store.recall(limit) : [];
+  }
+
+  /**
+   * Hydrate a worker context from SHARED durable memory (the cross-worker
+   * knowledge surface). This is the read path that lets a later session consume
+   * evidence-promoted knowledge regardless of which worker/process produced it.
+   * Provider failure degrades to an empty result (never fails the worker).
+   */
+  async hydrate(query: string, limit = 10): Promise<DurableMemoryRecord[]> {
+    if (!this.config.enabled) return [];
+    // Bounded provider call: a hanging provider (no response, not an error) must
+    // never stall a worker, so race the search against a timeout and degrade to
+    // an empty hydration. Spec: provider outage must not block engineering work.
+    const timeoutMs = this.config.providerTimeoutMs;
+    try {
+      const results = await withTimeout(this.durable.search(query), timeoutMs, []);
+      return results.slice(0, limit);
+    } catch {
+      return [];
+    }
   }
 
   closeSession(store: MemoryStore): void {
@@ -280,6 +301,7 @@ export class BlackholeManager {
       enabled: this.config.enabled,
       version: this.config.version,
       provider: this.config.enabled ? (this.adapter?.kind ?? "builtin") : "disabled",
+      durableKind: this.durable.kind,
       sessions: this.sessions.size,
       activeSessions: stores.filter((s) => s.size > 0).length,
       entries: stores.reduce((acc, s) => acc + s.size, 0),
@@ -294,6 +316,41 @@ export class BlackholeManager {
 async function loadAdapter(config: BlackholeConfig): Promise<BlackholeAdapter> {
   const { loadBlackholeAdapter } = await import("./BlackholeAdapter.ts");
   return loadBlackholeAdapter(config);
+}
+
+/**
+ * Build the shared durable-memory provider from config. Defaults to in-memory.
+ * A provider instance passed via options overrides this entirely.
+ */
+/**
+ * Race a promise against a timeout; on timeout resolve with the fallback. The
+ * underlying provider promise is left running (it may reject later) but its
+ * result is ignored so a hang can never stall the caller.
+ */
+async function withTimeout<T>(p: Promise<T>, ms: number, fallback: T): Promise<T> {
+  if (ms <= 0) return p;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      p,
+      new Promise<T>((resolve) => {
+        timer = setTimeout(() => resolve(fallback), ms);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+export function buildDurableProvider(cfg: import("./types.ts").DurableStoreConfig): DurableMemoryProvider {
+  switch (cfg.kind) {
+    case "shared-file":
+      return new SharedFileDurableMemory(cfg.file);
+    case "openviking":
+      return new OpenVikingProvider({ baseUrl: cfg.baseUrl, token: cfg.token });
+    default:
+      return new InMemoryDurableMemory();
+  }
 }
 
 async function defaultInference(_role: MemoryWorkerRole, contextText: string): Promise<string> {

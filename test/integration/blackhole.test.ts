@@ -316,3 +316,121 @@ test("blackhole session isolation: parallel tournament candidates never share wo
     await fixture.cleanup();
   }
 });
+
+test("blackhole cross-worker sharing: a later runtime hydrates promoted memory from a shared file", async () => {
+  const { mkdtempSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const dir = mkdtempSync(join(tmpdir(), "bh-runtime-shared-"));
+  const file = join(dir, "durable.jsonl");
+  const fixture = await makeFixtureRepo();
+  try {
+    // Worker A's runtime promotes a durable fact.
+    const rtA = await EngineeringRuntime.open({
+      cwd: fixture.root,
+      worker: fakeWorker(),
+      verifier: new CommandVerifier(),
+      blackhole: { config: { enabled: true, durable: { kind: "shared-file", file } } },
+    });
+    const storeA = rtA.blackhole!.openSessionFor({
+      project: fixture.root,
+      workItem: "WI",
+      role: "implementer",
+      workerId: "A",
+      runId: "A",
+      sessionId: "A",
+    });
+    storeA.observe("the shared canonical fact is: use the adapter seam", ["evt:9"], "P1");
+    const candA = storeA.proposePromotion("adapter seam is canonical", ["evt:9"], "workerA", ["evt:9"]);
+    await rtA.blackhole!.decidePromotion(storeA, { action: "promote", candidateId: candA.id, decidedBy: "operator" });
+
+    // Worker B's runtime (separate manager) hydrates from the SAME file and the
+    // fact shows up in the shared-memory block of a worker run.
+    const rtB = await EngineeringRuntime.open({
+      cwd: fixture.root,
+      worker: fakeWorker(),
+      verifier: new CommandVerifier(),
+      blackhole: { config: { enabled: true, durable: { kind: "shared-file", file } } },
+    });
+    const hydrated = await rtB.blackhole!.hydrate("adapter seam", 10);
+    assert.ok(hydrated.some((r) => r.text.includes("adapter seam")));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    await fixture.cleanup();
+  }
+});
+
+test("blackhole hydration is gated: reviewer never receives shared durable memory (INV-007)", async () => {
+  const { mkdtempSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const dir = mkdtempSync(join(tmpdir(), "bh-hydrate-gate-"));
+  const file = join(dir, "durable.jsonl");
+  const fixture = await makeFixtureRepo();
+  try {
+    // Recording worker that captures the context each role actually receives.
+    const received: Record<string, string> = {};
+    const inner = new FakeWorkerExecutor({
+      implementer: (req) => {
+        received.implementer = req.context ?? "";
+        return {
+          status: "completed",
+          summary: "implemented",
+          claims: [],
+          details: {},
+          evidence_refs: [],
+          new_hypotheses: [],
+          proposed_tasks: [],
+        };
+      },
+      reviewer: (req) => {
+        received.reviewer = req.context ?? "";
+        return {
+          status: "completed",
+          summary: "review",
+          claims: [],
+          details: { findings: [] },
+          evidence_refs: [],
+          new_hypotheses: [],
+          proposed_tasks: [],
+        };
+      },
+    });
+    const recording = {
+      run: async (req: never) => {
+        const out = await inner.run(req);
+        return out;
+      },
+    };
+    const rt = await EngineeringRuntime.open({
+      cwd: fixture.root,
+      worker: recording as never,
+      reviewerWorker: recording as never,
+      verifier: new CommandVerifier(),
+      blackhole: { config: { enabled: true, durable: { kind: "shared-file", file } } },
+    });
+    // Promote a durable fact first so the shared store is non-empty.
+    const store = rt.blackhole!.openSessionFor({
+      project: fixture.root,
+      workItem: "WI",
+      role: "implementer",
+      workerId: "A",
+      runId: "A",
+      sessionId: "A",
+    });
+    const cand = store.proposePromotion("add function must handle negatives", ["evt:1"], "A", ["evt:1"]);
+    await rt.blackhole!.decidePromotion(store, { action: "promote", candidateId: cand.id, decidedBy: "op" });
+
+    await rt.engineer("add an add function");
+
+    // Implementer (allowed) receives the durable block; reviewer (excluded) does NOT.
+    assert.ok(received.implementer?.includes("[openviking durable memory]"), "implementer hydrates shared memory");
+    assert.ok(
+      !received.reviewer?.includes("[openviking durable memory]"),
+      "reviewer must not inherit shared memory (INV-007)",
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    await fixture.cleanup();
+  }
+});

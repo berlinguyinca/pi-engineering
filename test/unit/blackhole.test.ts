@@ -191,10 +191,200 @@ test("telemetry: snapshot reflects manager state", () => {
     compactions: 1,
     promotionCandidates: 2,
     promoted: 1,
+    durableKind: "memory",
     memoryWorkersRun: { observer: 1, reflector: 2, dropper: 0 },
   };
   const t = blackholeTelemetry(state);
   assert.equal(t.entries, 5);
   assert.equal(t.memoryWorkers.reflector, 2);
   assert.match(formatBlackholeTelemetry(t), /blackhole ENABLED/);
+});
+
+// ------------------------------------------------ shared durable providers
+
+test("shared-file durable: two manager instances (different processes) share promoted memory", async () => {
+  const { BlackholeManager } = await import("../../src/blackhole/BlackholeManager.ts");
+  const { Ledger } = await import("../../src/ledger/Ledger.ts");
+  const { MemoryStore } = await import("../../src/blackhole/MemoryStore.ts");
+  const { mkdtempSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const dir = mkdtempSync(join(tmpdir(), "bh-shared-"));
+  const file = join(dir, "durable.jsonl");
+  const mkLedger = () => Ledger.fromEvents([]);
+  try {
+    // worker A promotes knowledge
+    const mgrA = await BlackholeManager.open({
+      ledger: mkLedger(),
+      config: { enabled: true, durable: { kind: "shared-file", file } },
+    });
+    const storeA = mgrA.openSessionFor({
+      project: "p",
+      workItem: "w",
+      role: "implementer",
+      workerId: "A",
+      runId: "A",
+      sessionId: "A",
+    });
+    storeA.observe("the canonical constraint is integer-safety", ["evt:1"], "P1");
+    const candA = storeA.proposePromotion("integer-safety is mandatory", ["evt:1"], "workerA", ["evt:1"]);
+    await mgrA.decidePromotion(storeA, { action: "promote", candidateId: candA.id, decidedBy: "operator" });
+
+    // worker B (a separate manager reading the SAME shared file) recalls it
+    const mgrB = await BlackholeManager.open({
+      ledger: mkLedger(),
+      config: { enabled: true, durable: { kind: "shared-file", file } },
+    });
+    const hydrated = await mgrB.hydrate("integer-safety", 10);
+    assert.ok(
+      hydrated.some((r) => r.text.includes("integer-safety")),
+      "worker B recalls worker A's promoted knowledge",
+    );
+    assert.equal(mgrA.state().provider === "disabled" || mgrA.state().provider !== undefined, true);
+    assert.equal(mgrA.durable.kind, "shared-file");
+    assert.equal(mgrB.durable.kind, "shared-file");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("shared-file durable: session-local working memory is NOT shared (only promoted durable)", async () => {
+  const { SharedFileDurableMemory } = await import("../../src/blackhole/durable.ts");
+  const { mkdtempSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const dir = mkdtempSync(join(tmpdir(), "bh-shared2-"));
+  const file = join(dir, "durable.jsonl");
+  try {
+    const prov = new SharedFileDurableMemory(file);
+    await prov.store({
+      id: "dur-1",
+      text: "shared fact",
+      sourceRefs: ["e1"],
+      promotedFrom: "c1",
+      evidenceIds: ["e1"],
+      promotedAt: "2026-01-01T00:00:00Z",
+      promotedBy: "op",
+    });
+    assert.equal((await prov.recallAll()).length, 1);
+    const hits = await prov.search("fact");
+    assert.equal(hits.length, 1);
+    assert.equal((await prov.search("nope")).length, 0);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("openviking provider: maps DurableMemoryProvider onto an HTTP contract", async () => {
+  const { OpenVikingProvider } = await import("../../src/blackhole/durable.ts");
+  const calls: string[] = [];
+  const fetchFn = async (url: string, init?: { method?: string; body?: string; headers?: Record<string, string> }) => {
+    calls.push(`${init?.method ?? "GET"} ${url}`);
+    if (init?.method === "POST") return { ok: true, status: 201, text: async () => "" };
+    // recall/search return the stored records
+    return {
+      ok: true,
+      status: 200,
+      json: async () => [
+        {
+          id: "dur-1",
+          text: "shared fact",
+          sourceRefs: ["e1"],
+          promotedFrom: "c1",
+          evidenceIds: ["e1"],
+          promotedAt: "t",
+          promotedBy: "op",
+        },
+      ],
+    };
+  };
+  const prov = new OpenVikingProvider({ baseUrl: "http://ov.example", fetch: fetchFn as never });
+  await prov.store({
+    id: "x",
+    text: "t",
+    sourceRefs: [],
+    promotedFrom: "c",
+    evidenceIds: ["e"],
+    promotedAt: "t",
+    promotedBy: "op",
+  });
+  const all = await prov.recallAll();
+  assert.equal(all.length, 1);
+  const hits = await prov.search("fact");
+  assert.equal(hits.length, 1);
+  assert.ok(calls.some((c) => c.includes("/memory") && c.includes("POST")));
+  assert.ok(calls.some((c) => c.includes("/memory/search?q=")));
+});
+
+test("openviking provider: fails closed when unconfigured", async () => {
+  const { OpenVikingProvider } = await import("../../src/blackhole/durable.ts");
+  assert.throws(() => new OpenVikingProvider({ baseUrl: "" }), /baseUrl/);
+});
+
+test("blackhole manager: provider outage degrades hydration to empty (never fails worker)", async () => {
+  const { BlackholeManager } = await import("../../src/blackhole/BlackholeManager.ts");
+  const { Ledger } = await import("../../src/ledger/Ledger.ts");
+  const failing = {
+    kind: "failing",
+    store: async () => {
+      throw new Error("down");
+    },
+    recallAll: async () => {
+      throw new Error("down");
+    },
+    search: async () => {
+      throw new Error("down");
+    },
+  };
+  const mgr = await BlackholeManager.open({
+    ledger: Ledger.fromEvents([]),
+    config: { enabled: true },
+    durable: failing as never,
+  });
+  const hydrated = await mgr.hydrate("anything", 5);
+  assert.deepEqual(hydrated, []);
+});
+
+test("blackhole config: durable store kind is validated and defaulted", async () => {
+  const { resolveBlackholeConfig } = await import("../../src/blackhole/config.ts");
+  assert.deepEqual(resolveBlackholeConfig().config.durable, { kind: "memory" });
+  assert.throws(() => resolveBlackholeConfig({ durable: { kind: "shared-file", file: "" } }), /file/);
+  assert.throws(() => resolveBlackholeConfig({ durable: { kind: "openviking", baseUrl: "" } }), /baseUrl/);
+  const ok = resolveBlackholeConfig({ durable: { kind: "shared-file", file: "/tmp/x.jsonl" } }).config.durable;
+  assert.deepEqual(ok, { kind: "shared-file", file: "/tmp/x.jsonl" });
+});
+
+test("blackhole hydrate: a hanging provider is bounded by the timeout (never stalls a worker)", async () => {
+  const { BlackholeManager } = await import("../../src/blackhole/BlackholeManager.ts");
+  const { Ledger } = await import("../../src/ledger/Ledger.ts");
+  const hanging = {
+    kind: "hanging",
+    store: async () => {
+      await new Promise(() => {});
+    },
+    recallAll: async () => {
+      await new Promise(() => {});
+      return [];
+    },
+    search: async () => {
+      await new Promise(() => {});
+      return [];
+    },
+  };
+  const mgr = await BlackholeManager.open({
+    ledger: Ledger.fromEvents([]),
+    config: { enabled: true, providerTimeoutMs: 30 },
+    durable: hanging as never,
+  });
+  const started = Date.now();
+  const hydrated = await mgr.hydrate("anything", 5);
+  const elapsed = Date.now() - started;
+  assert.deepEqual(hydrated, []);
+  assert.ok(elapsed < 5000, `provider hang bounded by timeout (elapsed=${elapsed}ms)`);
+});
+
+test("blackhole config: providerTimeoutMs is validated and defaulted", async () => {
+  const { resolveBlackholeConfig } = await import("../../src/blackhole/config.ts");
+  assert.equal(resolveBlackholeConfig().config.providerTimeoutMs, 5000);
+  assert.throws(() => resolveBlackholeConfig({ providerTimeoutMs: 0 }), /providerTimeoutMs/);
 });

@@ -8,6 +8,7 @@ export interface BlackholeTelemetry {
   enabled: boolean;
   version: string;
   provider: BlackholeManagerState["provider"];
+  durableKind: string;
   sessions: number;
   activeSessions: number;
   entries: number;
@@ -22,6 +23,7 @@ export function blackholeTelemetry(state: BlackholeManagerState): BlackholeTelem
     enabled: state.enabled,
     version: state.version,
     provider: state.provider,
+    durableKind: state.durableKind,
     sessions: state.sessions,
     activeSessions: state.activeSessions,
     entries: state.entries,
@@ -34,7 +36,7 @@ export function blackholeTelemetry(state: BlackholeManagerState): BlackholeTelem
 
 export function formatBlackholeTelemetry(t: BlackholeTelemetry): string {
   const lines = [
-    `blackhole ${t.enabled ? "ENABLED" : "disabled"} (provider=${t.provider} version=${t.version})`,
+    `blackhole ${t.enabled ? "ENABLED" : "disabled"} (provider=${t.provider} durable=${t.durableKind} version=${t.version})`,
     `  sessions=${t.sessions} active=${t.activeSessions} entries=${t.entries} compactions=${t.compactions}`,
     `  promotions: candidates=${t.promotionCandidates} promoted=${t.promoted}`,
     `  memory workers: observer=${t.memoryWorkers.observer} reflector=${t.memoryWorkers.reflector} dropper=${t.memoryWorkers.dropper}`,

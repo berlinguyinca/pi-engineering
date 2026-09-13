@@ -77,6 +77,26 @@ deterministic, model-free simulator (see the report methodology note) — it
 validates the measurement pipeline and shows the expected direction of effect,
 not a measured model claim.
 
+### Sharing memory across several workers
+
+Only *evidence-promoted* knowledge is shared; session-local working memory stays
+strictly isolated per candidate/reviewer/challenger. The `durable` config selects
+the backing store for shared durable memory (default `memory` = single process):
+
+```ts
+// Several workers on one host / CI share promoted memory via an append-only JSONL file.
+blackhole: { config: { enabled: true, durable: { kind: "shared-file", file: "/shared/durable.jsonl" } } }
+
+// Cross-machine sharing via the external OpenViking service.
+blackhole: { config: { enabled: true, durable: { kind: "openviking", baseUrl: "https://openviking.example", token } } }
+```
+
+Each `runWorker` hydrates its context from shared durable memory on run, so a
+later/other worker consumes knowledge promoted by any earlier worker (spec:
+*"accepted promoted memories can be consumed by later sessions"*). Provider
+outage degrades hydration to an empty result and never fails the worker.
+`pi-engineering blackhole status` reports the active `durable` kind.
+
 ## Durable state
 
 State lives in `<repoRoot>/.pi-eng/` and is git-ignored:

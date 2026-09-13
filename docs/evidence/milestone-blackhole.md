@@ -18,6 +18,11 @@ behaving exactly as before when omitted or disabled (backward compatible).
     compaction with audit trail, promotion candidates).
   - `BlackholeAdapter.ts` — provider seam (builtin default; optional pi-blackhole).
   - `OpenViking.ts` — durable cross-session memory abstraction + in-memory default.
+  - `durable.ts` — **shared durable-memory providers** so several pi workers share
+    promoted knowledge: `SharedFileDurableMemory` (dependency-free append-only JSONL,
+    cross-process on one host / CI) and `OpenVikingProvider` (HTTP adapter for the
+    external cross-machine OpenViking service), plus `buildDurableProvider`. Config
+    `durable.kind` selects the backing store.
   - `promotion.ts` — evidence-gated promotion; **no auto-promotion**.
   - `memoryWorkers.ts` — Observer/Reflector/Dropper at P3/P4 via ModelRouter +
     Scheduler backpressure.
@@ -32,7 +37,10 @@ behaving exactly as before when omitted or disabled (backward compatible).
 - **Runtime integration** (`EngineeringRuntime.runWorker`): stable per-candidate
   session memory; recall is appended to worker context; background observer runs
   after completed work. Isolation is keyed on candidate id so tournament
-  candidates sharing a work item never share memory.
+  candidates sharing a work item never share memory. Each run also **hydrates** from
+  shared durable memory (via `BlackholeManager.hydrate`), so evidence-promoted
+  knowledge is consumed by later/other workers — completing the spec acceptance item
+  *"accepted promoted memories can be consumed by later sessions"*.
 - **CLI** (`pi-engineering blackhole status|validate|benchmark`) + `/blackhole`
   extension command + dashboard.
 
@@ -45,6 +53,16 @@ behaving exactly as before when omitted or disabled (backward compatible).
 - Fresh-context review (`scripts/fresh-review-blackhole.ts`) found 6 material
   findings; a focused re-review (`scripts/fresh-review-blackhole-fixes.ts`)
   confirmed all RESOLVED with 0 critical / 0 high.
+- Cross-worker sharing fresh review (`scripts/fresh-review-blackhole-sharing.ts`)
+  ran two rounds: round 1 found 1 HIGH (shared memory injected into the reviewer
+  and clean-room challenger, violating INV-007) and 1 HIGH (no timeout on provider
+  calls, so a hang could stall a worker). Both fixed — hydration is now gated to
+  non-independent roles (implementer/scout/planner) and provider calls are bounded
+  by `providerTimeoutMs`. Round 2 confirmed 0 critical / 0 high. Known accepted
+  limitations: the `OpenVikingProvider` is an adapter seam for external infra whose
+  wire contract must be reconciled with the real service (its CONTRACT NOTE says
+  so), and shared-file memory is a plain JSONL that a worker already holding
+  bash/write tools could edit directly (same boundary as editing any source file).
 
 ## Isolation & authority guarantees
 

@@ -75,6 +75,19 @@ export const MEMORY_WORKER_PRIORITIES = {
 
 export type MemoryWorkerRole = keyof typeof MEMORY_WORKER_PRIORITIES;
 
+/**
+ * Backing store for promoted durable (shared) memory.
+ *
+ *  - `memory`       — single-process in-memory (default; no sharing).
+ *  - `shared-file`  — append-only JSONL on a shared path; several workers on one
+ *                     host share promoted memory (dependency-free, CI-friendly).
+ *  - `openviking`   — the external OpenViking service for cross-machine sharing.
+ */
+export type DurableStoreConfig =
+  | { kind: "memory" }
+  | { kind: "shared-file"; file: string }
+  | { kind: "openviking"; baseUrl: string; token?: string };
+
 export type PromotionState = "proposed" | "accepted" | "rejected" | "promoted" | "superseded";
 
 export interface PromotionCandidate {
@@ -109,12 +122,19 @@ export interface BlackholeConfig {
   compactionThreshold: number;
   /** Session memory retention (ms) before idle sessions are closed. */
   sessionTtlMs: number;
+  /** Backing store for promoted durable (shared) memory. */
+  durable: DurableStoreConfig;
+  /** Bounded wait (ms) for a shared-durable provider call so a hanging provider
+   *  can never stall a worker (spec: provider outage must not block engineering). */
+  providerTimeoutMs: number;
 }
 
 export interface BlackholeManagerState {
   enabled: boolean;
   version: string;
   provider: "builtin" | "pi-blackhole" | "disabled";
+  /** Backing store for shared durable memory ("memory" | "shared-file" | "openviking"). */
+  durableKind: string;
   sessions: number;
   activeSessions: number;
   entries: number;

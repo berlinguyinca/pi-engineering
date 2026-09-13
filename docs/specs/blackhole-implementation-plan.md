@@ -25,6 +25,18 @@ Authoritative spec: `docs/specs/PI_BLACKHOLE_INTEGRATION_SPEC.md`.
    candidates carry evidence refs (ledger event/evidence/commit) and transition
    `proposed → accepted → promoted` (or rejected/superseded). Promoted durable memory
    goes through the OpenViking provider abstraction (in-memory durable default).
+5b. **Cross-worker sharing via shared durable memory.** The `durable` seam is the
+   shared knowledge surface. A configurable `durable.kind` selects the backing store:
+   `memory` (default, single-process), `shared-file` (append-only JSONL on a shared
+   path — several workers on one host / CI share promoted memory, dependency-free),
+   or `openviking` (HTTP adapter for the external OpenViking service; cross-machine).
+   `EngineeringRuntime.runWorker` **hydrates** each worker context from shared durable
+   memory (`BlackholeManager.hydrate`) so a later session consumes evidence-promoted
+   knowledge regardless of which worker/process produced it — completing the spec
+   acceptance item *"accepted promoted memories can be consumed by later sessions"*.
+   Session-local working memory stays strictly isolated; only the evidence-gated
+   promotion pipeline writes to shared durable memory. Provider outage degrades
+   hydration to an empty result (never fails a worker).
 6. **Backward compatibility.** All blackhole behavior is off by default; enabling it
    changes only session-memory behavior and emits events/telemetry.
 7. **A/B benchmark.** Paired native-vs-blackhole runs + compaction experiment; raw data
@@ -33,7 +45,9 @@ Authoritative spec: `docs/specs/PI_BLACKHOLE_INTEGRATION_SPEC.md`.
 
 ## Modules
 
-- `src/blackhole/{types,config,versioning,SessionStore,MemoryStore,BlackholeAdapter,memoryWorkers,OpenViking,promotion,BlackholeManager,telemetry,dashboard}.ts`
+- `src/blackhole/{types,config,versioning,SessionStore,MemoryStore,BlackholeAdapter,memoryWorkers,OpenViking,durable,promotion,BlackholeManager,telemetry,dashboard}.ts`
+- `src/blackhole/durable.ts` — shared providers: `SharedFileDurableMemory` (cross-process
+  JSONL), `OpenVikingProvider` (HTTP adapter for the external service), `buildDurableProvider`.
 - `src/benchmark/{Metrics,ExperimentRunner,Report,Plots}.ts`
 - Extend `src/core/types.ts` EventType; add `Ledger.emitEvent`.
 - Integrate session identity + lifecycle into `EngineeringRuntime`.
