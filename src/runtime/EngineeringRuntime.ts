@@ -293,7 +293,7 @@ Use repo_search, symbol, ledger_read, and artifact_read. Do not edit files.`;
         const head = await this.git.headCommitIn(worktreePath);
         const diff = await this.git.captureDiff(candidate.base_commit, head);
         const files = await this.git.changedFiles(candidate.base_commit, head);
-        const diffArtifact = await this.artifacts.put("candidate", candidate.id, diff || "(empty diff)", `${files.length} file(s) changed`);
+        const diffArtifact = await this.artifacts.put("candidate", candidate.id, diff || "(no captured diff)", `${files.length} file(s) changed`);
         await this.ledger.changeCandidate(
           candidate.id,
           { diff: diff || null, diff_artifact_uri: diffArtifact.uri, changed_files: files },
@@ -343,9 +343,18 @@ Use repo_search, symbol, ledger_read, and artifact_read. Do not edit files.`;
     // preview plus the artifact URI enter the reviewer's context, so a large
     // diff no longer consumes the reviewer's hard token budget up front and the
     // reviewer reads the rest on demand via artifact_read (INV-001).
-    const diffUri = await this.ensureDiffArtifact(candidate);
+    let diffUri: string;
+    try {
+      diffUri = await this.ensureDiffArtifact(candidate);
+    } catch (err) {
+      // A failure to persist the diff artifact must not yield a clean review:
+      // treat it as a review that could not complete so the candidate is never
+      // promoted on an unreviewed basis (INV-007).
+      const msg = err instanceof Error ? err.message : String(err);
+      return { summary: `Could not persist candidate diff artifact for review: ${msg}`, findingIds: [], completed: false };
+    }
     const preview = diff.length > 2000 ? `${diff.slice(0, 2000)}\n… [truncated; full diff in artifact]` : diff;
-    const files = candidate.changed_files?.length ? candidate.changed_files.join(", ") : "(unknown)";
+    const files = candidate.changed_files?.length ? candidate.changed_files.slice(0, 30).join(", ") : "(unknown)";
     const task = `Independently review candidate ${candidate.id} for the work item:
 "${wi.goal}"
 Requirement: ${requirement}
@@ -354,7 +363,7 @@ Changed files: ${files}
 Candidate diff (compact preview):
 ${preview}
 
-To inspect the COMPLETE candidate diff, call artifact_read with uri "${diffUri}". Always read the full diff artifact before judging.
+To inspect the COMPLETE candidate diff, call artifact_read with uri "${diffUri}". If the result is truncated, keep calling artifact_read with the reported offset (e.g. offset=<n>) until you have read the full diff. Always read the full diff artifact before judging.
 
 Report concrete findings. Return your findings EXACTLY as details.findings, an array of objects { severity, claim, evidence } where severity is one of info|low|medium|high|critical. If there are NO material issues, set details.findings to an EMPTY array. Do not put findings in the claims field. You are a reviewer; you do not approve the work, you report findings. Use artifact_read to inspect logs if referenced.`;
     const { run, runId } = await this.runWorker("reviewer", task, {
@@ -397,13 +406,20 @@ Report concrete findings. Return your findings EXACTLY as details.findings, an a
    * and return its `artifact://` URI. Candidates produced by `implementIn`
    * already carry a `diff_artifact_uri`; this covers candidates reviewed
    * directly (e.g. `/review`) whose artifact may be missing or predate artifact
-   * storage, and re-uses the stored artifact when present.
+   * storage. The stored content is VERIFIED against the candidate's current
+   * `diff` and re-written if stale, so the reviewer can never judge an artifact
+   * that diverges from the preview (a `Ledger.changeCandidate` that updates only
+   * `diff` would otherwise leave a stale artifact).
    */
   private async ensureDiffArtifact(candidate: Candidate): Promise<string> {
-    if (candidate.diff_artifact_uri && this.artifacts.getByUri(candidate.diff_artifact_uri)) {
-      return candidate.diff_artifact_uri;
-    }
     const content = candidate.diff ?? "(no captured diff)";
+    const uri = candidate.diff_artifact_uri;
+    if (uri) {
+      const meta = this.artifacts.getByUri(uri);
+      const stored = meta ? await this.artifacts.readContentByUri(uri) : undefined;
+      if (stored === content) return uri; // fresh
+    }
+    // Missing, stale, or content-verified-mismatched: (re)write the artifact.
     const meta = await this.artifacts.put("candidate", candidate.id, content, "candidate diff (lazy)");
     return meta.uri;
   }

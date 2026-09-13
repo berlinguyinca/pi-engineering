@@ -65,3 +65,36 @@ test("ledger_claim does not verify a claim citing a fabricated artifact URI (rev
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("artifact_read errors (not silently empty) when the content file is missing (milestone MED #2)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-eng-tools-"));
+  try {
+    const ledger = await Ledger.create(join(dir, "ledger.jsonl"));
+    const artifacts = await ArtifactStore.create(join(dir, "artifacts"));
+    const meta = await artifacts.put("candidate", "c1", "full diff", "diff");
+    // Corrupt: delete the content file, leaving only the metadata index.
+    const contentPath = join(artifacts.rootDir, "candidate", "c1.txt");
+    await rm(contentPath, { force: true });
+
+    const tools = buildCoreTools(async () => ({
+      ledger: ledger as never,
+      artifacts: artifacts as never,
+      broker: null as never,
+      currentWorkItemId: () => null,
+      actor: () => ({ type: "user" }),
+    }));
+    const artifactRead = tools[2]!;
+    const execute = artifactRead.execute as unknown as (
+      id: string,
+      params: { uri: string },
+      signal?: AbortSignal,
+      onUpdate?: unknown,
+      ctx?: { cwd: string },
+    ) => Promise<{ isError?: boolean; content: Array<{ type: string; text: string }> }>;
+    const res = await execute("r", { uri: meta.uri }, undefined, undefined, { cwd: "/tmp" });
+    assert.equal(res.isError, true, "a missing content file must surface as an error");
+    assert.match(res.content[0]?.text ?? "", /content file is missing/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});

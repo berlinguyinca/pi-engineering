@@ -15,6 +15,7 @@ and the gap is called out here.
 | --- | --- | --- |
 | Engineering Ledger (event-sourced, replay-on-open) | **Works** | `test/unit/ledger.test.ts`; durable `.pi-eng/ledger.jsonl` |
 | Artifact store (`artifact://` URIs, lazy reads) | **Works** | `test/unit/artifacts.test.ts` |
+| Artifact-backed lazy candidate-diff review (no inline diff) | **Works** | integration: lazy-diff + stale-artifact tests; `artifact_read` pagination |
 | Worktree isolation + controlled promote-merge (INV-003/004/005) | **Works** | `test/unit/git.test.ts`; integration tests |
 | Deterministic verification (`CommandVerifier`) | **Works** | `test/unit/verifier.test.ts` (30 tests passing) |
 | Fresh-context worker sessions, bounded structured results (INV-001) | **Works** | `test/unit/workers.test.ts`; real-model dogfood |
@@ -148,17 +149,49 @@ record all of it as evidence.
   etc. hit a live model and are excluded from the deterministic test suite by
   design. They are dev tools only.
 - **Reviewer budget is tight.** The reviewer's 24k hard token budget (spec
-  §10.6) is easy to exceed when the reviewer reads files while reviewing the
-  inlined diff, which is what triggered the fix above. The retry-with-fresh-
-  context path keeps this safe, but a future slice could reduce pressure by
-  passing the diff as an `artifact://` reference (lazy `artifact_read`) instead
-  of inlining it, or by giving the reviewer a smaller slice.
+  §10.6) can still be exceeded by a reviewer that reads many files, but the
+  primary context-pressure source — the inlined candidate diff — has been
+  removed (see artifact-backed lazy diff below), and the retry-with-fresh-
+  context path keeps an overflow from ever becoming a silent promotion.
+
+## Artifact-backed lazy candidate-diff retrieval (implemented)
+
+**Milestone: artifact-backed large-output handling and lazy retrieval**
+(priority #1). The full candidate diff is no longer inlined into the reviewer
+prompt. Candidate diffs are stored as `artifact://` references (a `diff_artifact_uri`
+on the candidate, set when a diff is captured) and the reviewer reads the full
+diff on demand via `artifact_read`, which now supports `offset` pagination so
+arbitrarily large diffs are fully retrievable without re-injecting them into the
+24k reviewer budget. `ensureDiffArtifact` verifies the stored content matches the
+candidate's current `diff` and rewrites it when stale, and treats a failed
+artifact write as a review that could not complete (never a silent clean review).
+
+Dogfood (real model, fresh fixture): max worker context dropped from **24.9k
+(overflowed the 24k reviewer budget → failed review)** to **11.7k**; **0 blocked
+or failed workers** (previously 1); **1 round**, promoted, **8/8 tests pass**;
+49 tool calls / 45.9k input / 10.2k output tokens. The review summary confirmed
+"The full diff was read" via the artifact. Machine evidence: `test/integration/vertical-slice.test.ts`
+("review keeps the full diff out of context behind a lazy artifact reference" +
+"ensureDiffArtifact reuses a fresh artifact but rewrites a stale one"), `test/unit/tools.test.ts`
+(artifact_read pagination + missing-content error), 42/42 tests pass, `tsc` clean.
+Fresh-context review of the milestone reported 1 HIGH (fixed via artifact_read
+pagination), 4 MEDIUM (fixed: stale-artifact verification, missing-content error,
+bounded changed-files list, roadmap/evidence), and 3 LOW (fixed: artifact-write
+failure gating, empty-diff consistency; remaining test-gap items added).
 - **`pi -p` (print mode) hangs in this environment** regardless of the extension;
   confirmed as environmental, not caused by this package.
 
 ## Next slice
 
-**Candidate tournaments (item 1 above): implemented as a vertical slice.**
+**Context Broker improvements (priority #2).** The next highest-value slice.
+Today the broker assembles context from goal-keyword `git grep` plus a bounded
+file list; it does not rank files by relevance to the actual change, does not
+reuse prior `assembleContext` results across rounds, and the `requiredFiles`
+hook is never populated. A small improvement — symbol-aware relevance ranking and
+caching the assembled package per-goal — would cut implementer context and tokens
+in multi-round runs, which dogfooding shows is the next real pain point.
+
+**Candidate tournaments:** already implemented as a vertical slice.
 `EngineeringRuntime.tournament(goal, { n })` spawns N independent candidates
 from the same base commit, verifies each, reviews each survivor, deterministically
 selects a winner (fewest material findings, then fewest changed files, then stable

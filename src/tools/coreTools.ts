@@ -121,20 +121,30 @@ export function buildCoreTools(resolve: (cwd: string) => CoreServices | null | P
     name: "artifact_read",
     label: "Artifact Read",
     description:
-      "Lazily read a stored artifact (log, diff, report) by its artifact:// URI. Returns the full content on demand.",
+      "Lazily read a stored artifact (log, diff, report) by its artifact:// URI. Large artifacts are returned in bounded slices; use offset to page through the rest on demand.",
     parameters: Type.Object({
       uri: Type.String({ description: "artifact:// URI to read" }),
-      max_chars: Type.Optional(Type.Number({ description: "Cap the returned content length" })),
+      offset: Type.Optional(Type.Number({ description: "Character offset to start reading from (for pagination)" })),
+      max_chars: Type.Optional(Type.Number({ description: "Cap the returned slice length" })),
     }),
     async execute(_id, params, _sig, _onUpdate, ctx) {
       const services = await servicesFor(ctx.cwd);
       if (!services) return { content: [{ type: "text", text: "Engineering runtime not initialized for this directory." }], details: {} };
       const meta = services.artifacts.getByUri(String(params.uri));
       if (!meta) return { content: [{ type: "text", text: "Artifact not found." }], details: { found: false }, isError: true };
-      let text = (await services.artifacts.readContentByUri(String(params.uri))) ?? "";
-      const cap = params.max_chars ? Number(params.max_chars) : 12000;
-      if (text.length > cap) text = `${text.slice(0, cap)}\n… [truncated]`;
-      return { content: [{ type: "text", text }], details: { uri: meta.uri, size: meta.size, summary: meta.summary } };
+      const text = await services.artifacts.readContentByUri(String(params.uri));
+      // A missing content file must surface as an error, not a silent empty
+      // result (a reviewer would otherwise judge an empty diff and could
+      // report no findings, enabling silent promotion).
+      if (text == null) {
+        return { content: [{ type: "text", text: "Artifact metadata exists but its content file is missing." }], details: { found: false }, isError: true };
+      }
+      const offset = params.offset ? Math.max(0, Number(params.offset)) : 0;
+      const cap = params.max_chars ? Math.max(1, Number(params.max_chars)) : 12000;
+      const slice = text.slice(offset, offset + cap);
+      const more = offset + cap < text.length;
+      const out = more ? `${slice}\n… [truncated; call artifact_read with offset=${offset + cap} to continue]` : slice;
+      return { content: [{ type: "text", text: out }], details: { uri: meta.uri, size: meta.size, summary: meta.summary, offset, more } };
     },
   });
 

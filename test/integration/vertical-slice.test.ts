@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { EngineeringRuntime } from "../../src/runtime/EngineeringRuntime.ts";
 import { FakeWorkerExecutor } from "../../src/workers/FakeWorkerExecutor.ts";
 import { CommandVerifier } from "../../src/verify/Verifier.ts";
+import { buildCoreTools } from "../../src/tools/coreTools.ts";
 import { makeFixtureRepo } from "../fixtures/make-fixture.ts";
 
 /**
@@ -353,9 +354,11 @@ test("review keeps the full diff out of context behind a lazy artifact reference
     const rt = await EngineeringRuntime.open({ cwd: fixture.root, worker: wrapped });
     const wi = await rt.ledger.createWorkItem("review target", "medium", [fixture.root], { type: "system" });
     const cand = await rt.ledger.createCandidate(wi.id, "abc", "b", null, "implementer", "run", null, { type: "system" });
-    // ~10k chars, far beyond the 2000-char preview, with a UNIQUE marker at the
-    // very end so we can prove the full body is not inlined into the prompt.
-    const bigDiff = "export const a = 1;\n".repeat(499) + "// UNIQUE_END_MARKER_9f3x\n";
+    // ~15k chars: beyond the 2000-char preview AND beyond artifact_read's
+    // default 12,000-char slice, with a UNIQUE marker at the very end so we can
+    // prove the full body is not inlined into the prompt.
+    const bigDiff = "export const a = 1;\n".repeat(750) + "// UNIQUE_END_MARKER_9f3x\n";
+    assert.ok(bigDiff.length > 12_000, `test diff should exceed the 12k slice cap, was ${bigDiff.length}`);
     await rt.ledger.changeCandidate(cand.id, { diff: bigDiff, changed_files: ["src/a.js"] }, wi.id, { type: "system" });
 
     await rt.review(wi, cand, "must be correct");
@@ -366,10 +369,61 @@ test("review keeps the full diff out of context behind a lazy artifact reference
     assert.ok(task.includes("artifact_read"), "reviewer must be instructed to read the diff artifact");
     assert.match(task, /artifact:\/\/candidate\//);
 
-    // The full diff is retrievable lazily from the artifact store.
+    // The full diff is retrievable lazily via the paginated artifact_read tool
+    // path (not just the raw store): page through the slices and reassemble.
     const meta = rt.artifacts.list("candidate").find((m) => m.id === cand.id);
     assert.ok(meta, "the full diff should be stored as an artifact");
+    const tools = buildCoreTools(async () => ({
+      ledger: rt.ledger as never,
+      artifacts: rt.artifacts as never,
+      broker: rt.broker as never,
+      currentWorkItemId: () => wi.id,
+      actor: () => ({ type: "user" }),
+    }));
+    const artifactRead = tools.find((t) => t.name === "artifact_read")!;
+    const execute = artifactRead.execute as unknown as (
+      id: string,
+      params: { uri: string; offset?: number; max_chars?: number },
+      signal?: AbortSignal,
+      onUpdate?: unknown,
+      ctx?: { cwd: string },
+    ) => Promise<{ content: Array<{ type: string; text: string }> }>;
+    let reassembled = "";
+    let offset = 0;
+    for (let i = 0; i < 50; i++) {
+      const res = await execute("r", { uri: meta!.uri, offset, max_chars: 4000 }, undefined, undefined, { cwd: fixture.root });
+      reassembled += res.content[0]?.text ?? "";
+      offset += 4000;
+      if (offset >= bigDiff.length) break;
+    }
+    assert.ok(reassembled.includes("UNIQUE_END_MARKER_9f3x"), "paged artifact_read must retrieve the full diff");
     assert.equal(await rt.artifacts.readContent(meta!.category, meta!.id), bigDiff);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("ensureDiffArtifact reuses a fresh artifact but rewrites a stale one (milestone MED #1)", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const rt = await EngineeringRuntime.open({ cwd: fixture.root, worker: new FakeWorkerExecutor({}) });
+    const wi = await rt.ledger.createWorkItem("t", "low", [fixture.root], { type: "system" });
+    const cand = await rt.ledger.createCandidate(wi.id, "abc", "b", null, "implementer", "r", null, { type: "system" });
+    const v1 = "first version\n".repeat(200);
+    await rt.ledger.changeCandidate(cand.id, { diff: v1, changed_files: ["a"] }, wi.id, { type: "system" });
+
+    const uri1 = await (rt as unknown as { ensureDiffArtifact(c: unknown): Promise<string> }).ensureDiffArtifact(cand);
+    assert.ok(uri1.startsWith("artifact://"));
+    const meta1 = rt.artifacts.getByUri(uri1)!;
+    assert.equal(await rt.artifacts.readContent(meta1.category, meta1.id), v1);
+
+    // A later diff-only update (no diff_artifact_uri change) must be detected as
+    // stale and the artifact rewritten, so the reviewer never sees stale code.
+    const v2 = "second version\n".repeat(200);
+    await rt.ledger.changeCandidate(cand.id, { diff: v2 }, wi.id, { type: "system" });
+    const uri2 = await (rt as unknown as { ensureDiffArtifact(c: unknown): Promise<string> }).ensureDiffArtifact(cand);
+    assert.equal(uri2, uri1, "the artifact is re-written at the same URI");
+    assert.equal(await rt.artifacts.readContent(meta1.category, meta1.id), v2);
   } finally {
     await fixture.cleanup();
   }
