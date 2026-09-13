@@ -191,20 +191,123 @@ milestones:
 
   - id: M13
     name: Parallel Task DAG Execution
-    required: false
+    required: true
     depends_on: [M10, M11]
-    deferred_reason: >-
-      Task-DAG parallelism requires branch-based candidate accumulation plus a
-      sequential controlled integration, because each task's engineer() merges
-      into main and concurrent tasks race on index.lock. Safe parallelism is a
-      distinct milestone; it is deliberately deferred out of Roadmap 1.0 scope.
     scope:
-      paths: ["src/plan/", "src/runtime/EngineeringRuntime.ts"]
+      paths: ["src/plan/", "src/runtime/EngineeringRuntime.ts", "src/sched/"]
     acceptance:
       - id: M13-A1
         description: Independent plan tasks execute concurrently without racing on the shared index.
         evidence: { required: [ { type: integration, id: parallel-dag } ] }
     verification: { requires: [integration] }
+
+  - id: M14
+    name: Model Routing & Diversity
+    required: true
+    depends_on: [M01]
+    scope:
+      paths: ["src/routing/"]
+    acceptance:
+      - id: M14-A1
+        description: Capability+quota routing selects a provider per role and diversifies independent roles away from the implementer when available (B-101/B-108).
+        evidence: { required: [ { type: unit, id: modelrouter-routing } ] }
+    verification: { requires: [unit] }
+
+  - id: M15
+    name: Scheduling & Backpressure
+    required: true
+    depends_on: [M01]
+    scope:
+      paths: ["src/sched/"]
+    acceptance:
+      - id: M15-A1
+        description: A weighted-fairness scheduler limits concurrency (backpressure), is fair across sources, and supports speculative execution (B-109).
+        evidence: { required: [ { type: unit, id: scheduler-backpressure } ] }
+    verification: { requires: [unit] }
+
+  - id: M16
+    name: Budget Management
+    required: true
+    depends_on: [M01]
+    scope:
+      paths: ["src/budget/"]
+    acceptance:
+      - id: M16-A1
+        description: Token budgets escalate toward a hard cap gated on marginal value and stop when marginal value collapses (B-110).
+        evidence: { required: [ { type: unit, id: budget-escalation } ] }
+    verification: { requires: [unit] }
+
+  - id: M17
+    name: Security Hardening
+    required: true
+    depends_on: [M01]
+    scope:
+      paths: ["src/security/"]
+    acceptance:
+      - id: M17-A1
+        description: Secret redaction, tool allow/deny policy, and untrusted-repo prompt-injection guardrails fail closed on high severity (B-111).
+        evidence: { required: [ { type: unit, id: security-hardening } ] }
+    verification: { requires: [unit] }
+
+  - id: M18
+    name: Integration & Merge Queue
+    required: true
+    depends_on: [M01]
+    scope:
+      paths: ["src/merge/"]
+    acceptance:
+      - id: M18-A1
+        description: Candidate->integration->main promotion serializes merges, rebases onto main, and enforces a deterministic gate (B-112).
+        evidence: { required: [ { type: unit, id: mergequeue-promotion } ] }
+    verification: { requires: [unit] }
+
+  - id: M19
+    name: Repository Intelligence
+    required: true
+    depends_on: [M01]
+    scope:
+      paths: ["src/intel/"]
+    acceptance:
+      - id: M19-A1
+        description: A dependency-free symbol index maps symbols to file+line without requiring an LSP (B-113).
+        evidence: { required: [ { type: unit, id: repointel-symbol } ] }
+    verification: { requires: [unit] }
+
+  - id: M20
+    name: Verification Farm
+    required: true
+    depends_on: [M11]
+    scope:
+      paths: ["src/verify/farm/"]
+    acceptance:
+      - id: M20-A1
+        description: "Verification depth beyond a single test run: test-impact analysis, adversarial (machine-gated) generation, property scaffolding, mutation kill-rate, differential, and performance-vs-baseline evidence (B-107)."
+        evidence: { required: [ { type: unit, id: farm-depth } ] }
+    verification: { requires: [unit] }
+
+  - id: M21
+    name: Engineering Benchmark
+    required: true
+    depends_on: [M11]
+    scope:
+      paths: ["src/bench/"]
+    acceptance:
+      - id: M21-A1
+        description: A benchmark records autonomy, context-efficiency, and throughput metrics and compares them to a baseline as an enforceable gate (B-102).
+        evidence: { required: [ { type: unit, id: bench-baseline } ] }
+    verification: { requires: [unit] }
+
+  - id: M22
+    name: Optional Adapter Seams & Telemetry
+    required: true
+    depends_on: [M01]
+    scope:
+      paths: ["src/adapters/", "src/telemetry/"]
+    acceptance:
+      - id: M22-A1
+        description: Optional AutoSpec/InferWeave adapter seams stay empty by default (core standalone), and a deterministic telemetry export feeds external control planes/dashboards (B-103/B-104/B-105-seam).
+        evidence: { required: [ { type: unit, id: adapter-seams } ] }
+    verification: { requires: [unit] }
 
 release_gate:
   require:
@@ -216,40 +319,16 @@ release_gate:
     fresh_review: { unresolved_critical: 0, unresolved_high: 0 }
 
 backlog:
-  - id: B-101
-    title: Multi-model default (distinct reviewer/challenger model by default)
-    discovered_during: M09
-  - id: B-102
-    title: Engineering benchmark suite with baseline comparison (DeepSeek-V4-Flash)
-    discovered_during: M12
-  - id: B-103
-    title: AutoSpec adapter (optional)
-  - id: B-104
-    title: InferWeave adapter (optional)
+  # B-101..B-104 and B-107..B-113 are IMPLEMENTED as milestones M13-M22 (see above).
+  # The two items below are genuinely external infrastructure that a standalone
+  # TypeScript package cannot deliver on its own (they require external hosting
+  # and separate build toolchains); core provides the telemetry seam (M22) that
+  # such a control plane would consume.
   - id: B-105
-    title: Hosted control plane / dashboard (optional)
+    title: "Hosted control plane / dashboard (external infra; core provides the telemetry export seam in M22)"
+    discovered_during: M12
   - id: B-106
-    title: Go control plane (optional)
-  - id: B-107
-    title: "Verification-farm depth (spec §15.4-15.10): test-impact analysis, adversarial test generation, property-based tests, fuzzing, mutation/differential testing, performance evidence"
-    discovered_during: M12
-  - id: B-108
-    title: "Model routing / diversity (spec §21): capability-based routing, quota/capacity fallback, model diversity"
-    discovered_during: M12
-  - id: B-109
-    title: "Scheduling and backpressure (spec §22): scheduler, backpressure, fairness, speculative execution"
-    discovered_during: M12
-  - id: B-110
-    title: "Budget-manager escalation + marginal-value stopping (spec §23)"
-    discovered_during: M12
-  - id: B-111
-    title: "Security hardening (spec §29): secret handling, tool policy, untrusted-repository-instruction guardrails"
-    discovered_during: M12
-  - id: B-112
-    title: "Integration / merge queue (spec §31): promotion levels, integration rebase, conflict resolution"
-    discovered_during: M12
-  - id: B-113
-    title: "Repository intelligence / LSP integration (spec §26) after evaluating available integrations"
+    title: "Go control plane (external infra; separate build toolchain, out of scope for the standalone TS package)"
     discovered_during: M12
 
 waivers: []

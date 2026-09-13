@@ -76,8 +76,9 @@ export function buildSymbolIndex(files: Array<{ path: string; content: string }>
     for (let i = 0; i < lines.length; i++) {
       for (const pat of SYMBOL_PATTERNS) {
         pat.re.lastIndex = 0;
-        let m: RegExpExecArray | null;
-        while ((m = pat.re.exec(lines[i]!)) !== null) {
+        for (;;) {
+          const m = pat.re.exec(lines[i]!);
+          if (!m) break;
           const symbol = m[1]!;
           const key = `${symbol}@${i + 1}`;
           const loc: SymbolLocation = { symbol, file: f.path, line: i + 1, kind: pat.kind };

@@ -70,9 +70,9 @@ export function impactedTests(
     }
     const base = p.replace(/\.(ts|tsx|js|jsx|mjs|cjs)$/, "");
     const candidates = [
-      base.replace(/^src\//, "test/") + ".test.ts",
-      base.replace(/^src\//, "test/") + ".spec.ts",
-      base + ".test.ts",
+      `${base.replace(/^src\//, "test/")}.test.ts`,
+      `${base.replace(/^src\//, "test/")}.spec.ts`,
+      `${base}.test.ts`,
     ];
     for (const c of candidates) {
       if (testFiles.some((t) => t.path === c)) {
@@ -88,8 +88,9 @@ export function impactedTests(
     const dir = t.path.includes("/") ? t.path.slice(0, t.path.lastIndexOf("/")) : "";
     const imports: string[] = [];
     const re = new RegExp(IMPORT_RE.source, "g");
-    let m: RegExpExecArray | null;
-    while ((m = re.exec(t.content)) !== null) {
+    for (;;) {
+      const m = re.exec(t.content);
+      if (!m) break;
       const spec = m[1]!;
       if (!spec.startsWith(".")) continue;
       imports.push(resolveImport(dir, spec));

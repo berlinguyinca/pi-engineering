@@ -30,3 +30,30 @@ export { runCheck, CHECKS } from "./roadmap/checks.ts";
 export { runRoadmapCheck, runRoadmapStatus, defaultCliPaths } from "./roadmap/cli.ts";
 export type { RoadmapCliOptions, RoadmapCliResult } from "./roadmap/cli.ts";
 export type * from "./roadmap/types.ts";
+export { ModelRouter, ROLE_CAPABILITIES } from "./routing/ModelRouter.ts";
+export type { ModelProvider, RouteResult, Capability, WorkerRoleName } from "./routing/ModelRouter.ts";
+export { Scheduler } from "./sched/Scheduler.ts";
+export type { SchedulableTask, ScheduledOutcome } from "./sched/Scheduler.ts";
+export { BudgetManager, DEFAULT_BUDGETS } from "./budget/BudgetManager.ts";
+export type { BudgetSpec, BudgetState, BudgetRole } from "./budget/BudgetManager.ts";
+export {
+  ToolPolicy,
+  redactSecrets,
+  scanUntrustedInstructions,
+  evaluateInstruction,
+  SECRET_PATTERNS,
+  SECRET_REDACTION,
+  INJECTION_MARKERS,
+} from "./security/SecurityPolicy.ts";
+export type { ToolPolicyOptions, InjectionFinding, GuardrailVerdict } from "./security/SecurityPolicy.ts";
+export { MergeQueue } from "./merge/MergeQueue.ts";
+export type { GitPrimitives, PromoteResult, PromotionLevel } from "./merge/MergeQueue.ts";
+export { buildSymbolIndex, symbolIndex, findSymbol, isSourceFile, NoopLspIntegration } from "./intel/RepoIntel.ts";
+export type { SymbolLocation, LspIntegration } from "./intel/RepoIntel.ts";
+export * from "./verify/farm/index.ts";
+export { runBenchmark, evaluateBenchmark } from "./bench/Benchmark.ts";
+export type { BenchmarkMetrics, BenchmarkBaseline, BenchmarkVerdict } from "./bench/Benchmark.ts";
+export { AdapterRegistry } from "./adapters/Adapters.ts";
+export type { AutoSpecAdapter, InferWeaveAdapter } from "./adapters/Adapters.ts";
+export { exportTelemetry, formatTelemetry } from "./telemetry/TelemetryExport.ts";
+export type { TelemetrySnapshot } from "./telemetry/TelemetryExport.ts";

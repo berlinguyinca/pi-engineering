@@ -58,7 +58,9 @@ test("scheduler: queued count reflects backpressure", async () => {
   const gate = (async () => {})(); // not used; just keep simple
   void gate;
   let release: (() => void) | undefined;
-  const blocker = new Promise<void>((r) => (release = r));
+  const blocker = new Promise<void>((r) => {
+    release = r;
+  });
   const first = s.schedule({
     id: "block",
     source: "a",

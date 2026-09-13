@@ -402,7 +402,9 @@ Use repo_search, symbol, ledger_read, and artifact_read. Do not edit files.`;
         if (conflict) wave = Math.max(wave, w + 1);
       }
       if (wave >= waves.length) waves.length = wave + 1;
-      (waves[wave] ??= []).push(t);
+      const target = waves[wave] ?? [];
+      target.push(t);
+      waves[wave] = target;
       waveOf.set(t.id, wave);
     }
     return waves;
