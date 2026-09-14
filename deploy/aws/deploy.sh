@@ -19,7 +19,9 @@ REGION="${REGION:-us-west-2}"
 HOSTED_ZONE_ID="${HOSTED_ZONE_ID:-Z2ANBWTR462YC8}"   # metabolomics.us
 DOMAIN="${DOMAIN:-viking.metabolomics.us}"
 VPC_ID="${VPC_ID:-vpc-1f8ec666}"
-SUBNET_ID="${SUBNET_ID:-subnet-e382339a}"            # us-west-2a public
+SUBNET_ID="${SUBNET_ID:-subnet-e382339a}"            # us-west-2a public (EC2)
+# ALB requires >=2 public subnets in different AZs.
+SUBNETS="${SUBNETS:-subnet-e382339a subnet-b779a9fc}"  # us-west-2a + us-west-2b
 KEY_NAME="${KEY_NAME:-wohlgemuth}"
 AMI="${AMI:-ami-04678417fc39d7171}"                  # Ubuntu 24.04 amd64
 INSTANCE_TYPE="${INSTANCE_TYPE:-t3.small}"
@@ -46,7 +48,7 @@ say "upload app to S3 ($BUCKET)"
 if ! aws s3api head-bucket --bucket "$BUCKET" --region "$REGION" >/dev/null 2>&1; then
   aws s3 mb "s3://$BUCKET" --region "$REGION"
 fi
-(cd "$SERVICE_DIR" && tar -czf /tmp/openviking.tar.gz .)
+(cd "$SERVICE_DIR" && tar --exclude=node_modules --exclude=.env -czf /tmp/openviking.tar.gz .)
 aws s3 cp /tmp/openviking.tar.gz "s3://$BUCKET/openviking/openviking.tar.gz" --region "$REGION"
 
 # ---------------------------------------------------------------------------
@@ -119,8 +121,14 @@ CERT_ARN=$(aws acm list-certificates --region "$REGION" --query "CertificateSumm
 if [ -z "$CERT_ARN" ] || [ "$CERT_ARN" = "None" ]; then
   CERT_ARN=$(aws acm request-certificate --domain-name "$DOMAIN" --validation-method DNS --region "$REGION" --query CertificateArn --output text)
 fi
-# create DNS validation records (idempotent)
-for rec in $(aws acm describe-certificate --certificate-arn "$CERT_ARN" --region "$REGION" --query 'Certificate.DomainValidationOptions[].ResourceRecord' --output json | jq -c '.[]'); do
+# create DNS validation records (idempotent); wait until ACM exposes them
+for i in $(seq 1 15); do
+  VRECS=$(aws acm describe-certificate --certificate-arn "$CERT_ARN" --region "$REGION" --query 'Certificate.DomainValidationOptions[].ResourceRecord' --output json 2>/dev/null || echo "[]")
+  [ "$(echo "$VRECS" | jq 'length')" -gt 0 ] && break
+  sleep 5
+  VRECS="[]"
+done
+for rec in $(echo "$VRECS" | jq -c '.[]'); do
   RNAME=$(echo "$rec" | jq -r .Name)
   RVALUE=$(echo "$rec" | jq -r .Value)
   aws route53 change-resource-record-sets --hosted-zone-id "$HOSTED_ZONE_ID" --change-batch "{
@@ -132,7 +140,7 @@ done
 say "ALB + target group + listeners"
 ALB_ARN=$(aws elbv2 describe-load-balancers --region "$REGION" --query "LoadBalancers[?contains(LoadBalancerName,'$NAME')].LoadBalancerArn" --output text 2>/dev/null || true)
 if [ -z "$ALB_ARN" ] || [ "$ALB_ARN" = "None" ]; then
-  ALB_ARN=$(aws elbv2 create-load-balancer --name "$NAME" --subnets "$SUBNET_ID" \
+  ALB_ARN=$(aws elbv2 create-load-balancer --name "$NAME" --subnets $SUBNETS \
     --security-groups "$SG_ALB" --scheme internet-facing --type application --region "$REGION" --query 'LoadBalancers[0].LoadBalancerArn' --output text)
 fi
 VPC_ID=$(aws ec2 describe-vpcs --vpc-ids "$VPC_ID" --region "$REGION" --query 'Vpcs[0].VpcId' --output text)
