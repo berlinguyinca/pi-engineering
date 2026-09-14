@@ -321,6 +321,67 @@ test("openviking provider: fails closed when unconfigured", async () => {
   assert.throws(() => new OpenVikingProvider({ baseUrl: "" }), /baseUrl/);
 });
 
+test("openviking provider: warns once on auth failure but still fail-closes to empty", async () => {
+  const { OpenVikingProvider } = await import("../../src/blackhole/durable.ts");
+  const warns: string[] = [];
+  const origWarn = console.warn;
+  console.warn = (...a: unknown[]) => warns.push(a.join(" "));
+  try {
+    const fetchFn = async () => ({ ok: false, status: 401, json: async () => [] }) as never;
+    const prov = new OpenVikingProvider({ baseUrl: "http://ov.example", fetch: fetchFn as never });
+    // repeated failures warn once per op+status, and always return [] (fail-closed)
+    assert.deepEqual(await prov.recallAll(), []);
+    assert.deepEqual(await prov.recallAll(), []);
+    const recallWarns = warns.filter((w) => w.includes("recall"));
+    assert.equal(recallWarns.length, 1, "recall warns once");
+    assert.match(recallWarns[0]!, /401/);
+    assert.match(recallWarns[0]!, /token/i);
+    assert.deepEqual(await prov.search("x"), []);
+    const searchWarns = warns.filter((w) => w.includes("search"));
+    assert.equal(searchWarns.length, 1, "search warns once");
+  } finally {
+    console.warn = origWarn;
+  }
+});
+
+test("openviking provider: warns once on network unreachable (fetch throws) and fail-closes", async () => {
+  const { OpenVikingProvider } = await import("../../src/blackhole/durable.ts");
+  const warns: string[] = [];
+  const origWarn = console.warn;
+  console.warn = (...a: unknown[]) => warns.push(a.join(" "));
+  try {
+    const fetchFn = async () => {
+      throw new Error("ECONNREFUSED");
+    };
+    const prov = new OpenVikingProvider({ baseUrl: "http://ov.example", fetch: fetchFn as never });
+    assert.deepEqual(await prov.recallAll(), []);
+    assert.deepEqual(await prov.recallAll(), []);
+    assert.equal(warns.length, 1, "warns once per unreachable outcome");
+    assert.match(warns[0]!, /unreachable/i);
+    assert.match(warns[0]!, /recall/);
+  } finally {
+    console.warn = origWarn;
+  }
+});
+
+test("openviking provider: warns once on a 200 with a non-array body and fail-closes", async () => {
+  const { OpenVikingProvider } = await import("../../src/blackhole/durable.ts");
+  const warns: string[] = [];
+  const origWarn = console.warn;
+  console.warn = (...a: unknown[]) => warns.push(a.join(" "));
+  try {
+    // e.g. an SSO/captive-portal proxy answering 200 with HTML, not a JSON array
+    const fetchFn = async () => ({ ok: true, status: 200, json: async () => ({ not: "an array" }) }) as never;
+    const prov = new OpenVikingProvider({ baseUrl: "http://ov.example", fetch: fetchFn as never });
+    assert.deepEqual(await prov.recallAll(), []);
+    assert.deepEqual(await prov.recallAll(), []);
+    assert.equal(warns.length, 1, "warns once per unexpected-body outcome");
+    assert.match(warns[0]!, /non-array body/i);
+  } finally {
+    console.warn = origWarn;
+  }
+});
+
 test("blackhole manager: provider outage degrades hydration to empty (never fails worker)", async () => {
   const { BlackholeManager } = await import("../../src/blackhole/BlackholeManager.ts");
   const { Ledger } = await import("../../src/ledger/Ledger.ts");
