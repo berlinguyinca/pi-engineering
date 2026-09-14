@@ -321,6 +321,26 @@ test("openviking provider: fails closed when unconfigured", async () => {
   assert.throws(() => new OpenVikingProvider({ baseUrl: "" }), /baseUrl/);
 });
 
+test("openviking provider: warns once on auth failure but still fail-closes to empty", async () => {
+  const { OpenVikingProvider } = await import("../../src/blackhole/durable.ts");
+  const warns: string[] = [];
+  const origWarn = console.warn;
+  console.warn = (...a: unknown[]) => warns.push(a.join(" "));
+  try {
+    const fetchFn = async () => ({ ok: false, status: 401, json: async () => [] }) as never;
+    const prov = new OpenVikingProvider({ baseUrl: "http://ov.example", fetch: fetchFn as never });
+    // repeated failures warn once, and always return [] (fail-closed)
+    assert.deepEqual(await prov.recallAll(), []);
+    assert.deepEqual(await prov.search("x"), []);
+    assert.deepEqual(await prov.recallAll(), []);
+    assert.equal(warns.length, 1, "warns once per baseUrl+status");
+    assert.match(warns[0]!, /401/);
+    assert.match(warns[0]!, /token/i);
+  } finally {
+    console.warn = origWarn;
+  }
+});
+
 test("blackhole manager: provider outage degrades hydration to empty (never fails worker)", async () => {
   const { BlackholeManager } = await import("../../src/blackhole/BlackholeManager.ts");
   const { Ledger } = await import("../../src/ledger/Ledger.ts");

@@ -69,6 +69,21 @@ export class SharedFileDurableMemory implements DurableMemoryProvider {
   }
 }
 
+/** Warn once per baseUrl+status so an operator isn't left with silent empty hydration. */
+const warnedAuth = new Set<string>();
+function warnAuthOnce(baseUrl: string, status: number): void {
+  const key = `${baseUrl}:${status}`;
+  if (warnedAuth.has(key)) return;
+  warnedAuth.add(key);
+  const hint =
+    status === 401 || status === 403
+      ? "Check the bearer token (PI_OPENVIKING_TOKEN / PI_OPENVIKING_TOKEN_FILE)."
+      : "Check the service is reachable and PI_OPENVIKING_BASE_URL is correct.";
+  console.warn(
+    `[pi-engineering-runtime] OpenViking ${baseUrl} returned ${status} on recall (fail-closed to empty). ${hint}`,
+  );
+}
+
 export interface OpenVikingEndpointPaths {
   promote: string;
   recall: string;
@@ -136,7 +151,10 @@ export class OpenVikingProvider implements DurableMemoryProvider {
 
   async recallAll(): Promise<DurableMemoryRecord[]> {
     const res = await this.fetchFn(`${this.baseUrl}${this.paths.recall}`, { headers: this.headers() });
-    if (!res.ok) return [];
+    if (!res.ok) {
+      warnAuthOnce(this.baseUrl, res.status);
+      return [];
+    }
     const data = (await res.json().catch(() => [])) as DurableMemoryRecord[];
     return Array.isArray(data) ? data : [];
   }
@@ -144,7 +162,10 @@ export class OpenVikingProvider implements DurableMemoryProvider {
   async search(query: string): Promise<DurableMemoryRecord[]> {
     const url = `${this.baseUrl}${this.paths.search}?q=${encodeURIComponent(query)}`;
     const res = await this.fetchFn(url, { headers: this.headers() });
-    if (!res.ok) return [];
+    if (!res.ok) {
+      warnAuthOnce(this.baseUrl, res.status);
+      return [];
+    }
     const data = (await res.json().catch(() => [])) as DurableMemoryRecord[];
     return Array.isArray(data) ? data : [];
   }
