@@ -11,6 +11,9 @@ import { RECOVERY_PROMPT, TOOL_TRANSITION_RULE, buildDegenerationEvent } from ".
 import { resolveGuardConfig } from "../src/guard/config.ts";
 import { RoadmapEngine } from "../src/roadmap/RoadmapEngine.ts";
 import { EngineeringRuntime } from "../src/runtime/EngineeringRuntime.ts";
+import { resolveStatusBarConfig } from "../src/status/config.ts";
+import { FooterController } from "../src/status/footer.ts";
+import { renderStatus } from "../src/status/layout.ts";
 import { type CoreServices, buildCoreTools } from "../src/tools/coreTools.ts";
 import { CommandVerifier } from "../src/verify/Verifier.ts";
 import { PiWorkerExecutor } from "../src/workers/PiWorkerExecutor.ts";
@@ -29,6 +32,11 @@ import { PiWorkerExecutor } from "../src/workers/PiWorkerExecutor.ts";
  */
 
 const runtimes = new Map<string, { runtime: EngineeringRuntime; memoryIdentity: string }>();
+
+// Live status bar: the harness owns the Pi footer through a single composable
+// controller (src/status/). One active controller per session.
+const statusBarConfig = resolveStatusBarConfig();
+let activeFooter: FooterController | null = null;
 
 async function getRuntime(ctx: ExtensionCommandContext, worker?: EngineeringRuntime): Promise<EngineeringRuntime> {
   return getRuntimeByCwd(worker ? worker.cwd : ctx.cwd, ctx.model);
@@ -235,6 +243,27 @@ ${RECOVERY_PROMPT}`;
       if (modified !== event.systemPrompt) {
         return { systemPrompt: modified };
       }
+    });
+  }
+
+  // ─── Live status bar: harness-owned Pi footer (spec §status-bar) ─────────
+  // The footer consumes structured harness telemetry state and streams live
+  // output TPS. It never runs git/network during render (git context is cached
+  // and invalidated on branch/cwd/model changes). `pi.on()` only exists in a
+  // real pi session, so guard like the Generation Guard block above.
+  if (statusBarConfig.enabled && typeof pi.on === "function") {
+    pi.on("session_start", (_event, ctx) => {
+      activeFooter?.dispose();
+      activeFooter = new FooterController({ ctx, config: statusBarConfig });
+    });
+
+    pi.on("message_start", () => activeFooter?.onMessageStart());
+    pi.on("message_update", (event) => activeFooter?.onMessageUpdate(event));
+    pi.on("message_end", (event) => activeFooter?.onMessageEnd(event));
+    pi.on("model_select", (event) => activeFooter?.onModelSelect(event.model));
+    pi.on("session_shutdown", () => {
+      activeFooter?.dispose();
+      activeFooter = null;
     });
   }
 
@@ -522,6 +551,34 @@ ${RECOVERY_PROMPT}`;
       } catch (err) {
         ctx.ui.notify(`roadmap error: ${String(err)}`, "error");
       }
+    },
+  });
+
+  pi.registerCommand("harness-status", {
+    description: "Show the fully resolved live status-bar state (cwd, repo, worktree, branch, model, TPS).",
+    handler: async (_args, ctx) => {
+      const footer = activeFooter;
+      if (!footer) {
+        ctx.ui.notify("Status bar disabled or not active in this session.", "info");
+        return;
+      }
+      const s = footer.state;
+      const t = footer.throughputSnapshot();
+      const lines = [
+        `cwd: ${s.cwd}`,
+        `repository: ${s.repository ?? "—"}`,
+        `repository root: ${s.repositoryRoot ?? "—"}`,
+        `worktree: ${s.worktree ?? "—"}`,
+        `branch/ref: ${s.branch ?? (s.detachedHead ? `@${s.detachedHead}` : "—")}`,
+        `provider: ${s.provider ?? "—"}`,
+        `model: ${s.model ?? "—"}`,
+        `TPS state: ${t.phase}`,
+        `TPS current: ${t.currentTokensPerSecond != null ? t.currentTokensPerSecond.toFixed(1) : "—"}`,
+        `TPS last completed: ${t.lastCompletedTokensPerSecond != null ? t.lastCompletedTokensPerSecond.toFixed(1) : "—"}`,
+        `output tokens: ${t.outputTokens ?? "—"}`,
+        `render: ${renderStatus(s, 120, statusBarConfig)}`,
+      ];
+      ctx.ui.notify(lines.join("\n"), "info");
     },
   });
 
