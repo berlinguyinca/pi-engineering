@@ -40,6 +40,8 @@ const expectedCommands = [
   "review",
   "challenge",
   "roadmap-status",
+  "remember",
+  "memory",
 ];
 const missingCommands = expectedCommands.filter((c) => !commands.has(c));
 const expectedTools = ["ledger_read", "ledger_claim", "artifact_read", "repo_search", "symbol", "tests_for"];

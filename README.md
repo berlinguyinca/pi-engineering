@@ -50,6 +50,45 @@ pi install /absolute/path/to/pi-engineering-runtime
 | `/context`        | Show context budget, sources, and worker usage                 |
 | `/roadmap-status` | Show derived Roadmap 1.0 completion status for this repository |
 | `/blackhole [--dashboard]` | Show optional Blackhole session-memory status (disabled by default) |
+| `/remember <text>` | Explicitly save a private Viking note (up to 4,000 characters) |
+| `/memory [query]` | Verify the memory connection, or search saved notes |
+| `/memory setup` | Configure or change the Viking host and access key |
+
+### Everyday memory
+
+On the first interactive Pi start after installing or updating this extension,
+the setup dialog asks you to confirm or change the Viking connection. Existing
+environment/token-file settings can be kept. Changed credentials are entered
+in a masked field and verified before they are saved. Settings and private key
+files live under `~/.pi/agent/engineering-memory/` (or the active
+`PI_CODING_AGENT_DIR`), outside the extension checkout. Updates preserve them.
+Cancelled setup can be retried with `/memory setup`; headless sessions never
+block for a dialog. The update command itself does not need an interactive
+credential hook: the check runs when Pi next loads the updated extension.
+
+```text
+/remember Calibration reports should use metric units.
+/memory calibration
+```
+
+Ordinary chat prompts automatically recall a small set of keyword-matching
+notes. The footer shows `Memory: ready`, match counts, or a specific connection
+failure. `/memory` distinguishes a healthy empty store from a rejected key.
+Automatic recall is ephemeral model context, inserted before the current user
+request; it is not copied into the saved transcript. Only `/remember` writes
+notes—normal conversations are not automatically uploaded or promoted.
+
+Saving requires a read/write device key. Read-only keys can recall but cannot
+save. Treat saved notes as user-provided reference information, not proof that
+claims were machine-verified. Independent review/challenge workers do not load
+these interactive hooks. Existing engineering-worker hydration is preserved.
+
+Confirmed profile settings override old shell host/key defaults. Set
+`PI_OPENVIKING_ENABLED=0` to disable all memory access for a launcher. A token
+file rotation is picked up by subsequent memory operations; changing host/key
+also refreshes the cached engineering runtime on the next engineering command.
+See [the feature design](docs/specs/2026-09-14-everyday-viking-memory.md) for limits
+and verification boundaries.
 
 ### Blackhole session memory (optional, off by default)
 
