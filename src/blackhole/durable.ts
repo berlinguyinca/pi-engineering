@@ -69,19 +69,20 @@ export class SharedFileDurableMemory implements DurableMemoryProvider {
   }
 }
 
-/** Warn once per baseUrl+status so an operator isn't left with silent empty hydration. */
+/** Warn once per baseUrl+op+outcome so an operator isn't left with silent empty hydration. */
 const warnedAuth = new Set<string>();
-function warnAuthOnce(baseUrl: string, status: number): void {
-  const key = `${baseUrl}:${status}`;
+function warnOpenViking(baseUrl: string, op: "recall" | "search", outcome: number | "unreachable"): void {
+  const key = `${baseUrl}:${op}:${outcome}`;
   if (warnedAuth.has(key)) return;
   warnedAuth.add(key);
   const hint =
-    status === 401 || status === 403
+    outcome === 401 || outcome === 403
       ? "Check the bearer token (PI_OPENVIKING_TOKEN / PI_OPENVIKING_TOKEN_FILE)."
-      : "Check the service is reachable and PI_OPENVIKING_BASE_URL is correct.";
-  console.warn(
-    `[pi-engineering-runtime] OpenViking ${baseUrl} returned ${status} on recall (fail-closed to empty). ${hint}`,
-  );
+      : outcome === "unreachable"
+        ? "Check the service is up and PI_OPENVIKING_BASE_URL is correct."
+        : "Check PI_OPENVIKING_BASE_URL and the service.";
+  const what = outcome === "unreachable" ? "is unreachable" : `returned ${outcome}`;
+  console.warn(`[pi-engineering-runtime] OpenViking ${baseUrl} ${what} on ${op} (fail-closed to empty). ${hint}`);
 }
 
 export interface OpenVikingEndpointPaths {
@@ -150,9 +151,15 @@ export class OpenVikingProvider implements DurableMemoryProvider {
   }
 
   async recallAll(): Promise<DurableMemoryRecord[]> {
-    const res = await this.fetchFn(`${this.baseUrl}${this.paths.recall}`, { headers: this.headers() });
+    let res: Response;
+    try {
+      res = await this.fetchFn(`${this.baseUrl}${this.paths.recall}`, { headers: this.headers() });
+    } catch {
+      warnOpenViking(this.baseUrl, "recall", "unreachable");
+      return [];
+    }
     if (!res.ok) {
-      warnAuthOnce(this.baseUrl, res.status);
+      warnOpenViking(this.baseUrl, "recall", res.status);
       return [];
     }
     const data = (await res.json().catch(() => [])) as DurableMemoryRecord[];
@@ -160,10 +167,16 @@ export class OpenVikingProvider implements DurableMemoryProvider {
   }
 
   async search(query: string): Promise<DurableMemoryRecord[]> {
-    const url = `${this.baseUrl}${this.paths.search}?q=${encodeURIComponent(query)}`;
-    const res = await this.fetchFn(url, { headers: this.headers() });
+    let res: Response;
+    try {
+      const url = `${this.baseUrl}${this.paths.search}?q=${encodeURIComponent(query)}`;
+      res = await this.fetchFn(url, { headers: this.headers() });
+    } catch {
+      warnOpenViking(this.baseUrl, "search", "unreachable");
+      return [];
+    }
     if (!res.ok) {
-      warnAuthOnce(this.baseUrl, res.status);
+      warnOpenViking(this.baseUrl, "search", res.status);
       return [];
     }
     const data = (await res.json().catch(() => [])) as DurableMemoryRecord[];
