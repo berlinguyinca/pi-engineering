@@ -8,6 +8,9 @@ import { EngineeringRuntime } from "../src/runtime/EngineeringRuntime.ts";
 import { type CoreServices, buildCoreTools } from "../src/tools/coreTools.ts";
 import { CommandVerifier } from "../src/verify/Verifier.ts";
 import { PiWorkerExecutor } from "../src/workers/PiWorkerExecutor.ts";
+import { GenerationGuard } from "../src/guard/GenerationGuard.ts";
+import { RECOVERY_PROMPT, TOOL_TRANSITION_RULE, buildDegenerationEvent } from "../src/guard/RecoveryController.ts";
+import { resolveGuardConfig } from "../src/guard/config.ts";
 
 /**
  * pi-engineering-runtime — extension entry point.
@@ -129,6 +132,95 @@ export default function (pi: ExtensionAPI) {
   // Semantic tools resolved against the runtime for the calling cwd.
   for (const tool of buildCoreTools(resolveServices)) {
     pi.registerTool(tool);
+  }
+
+  // ─── Generation Guard: interactive session (spec §6, §12) ────────────────
+  // Monitors streaming output in the main pi session for degeneration loops.
+  // On detection, aborts the current turn. The recovery prompt is injected
+  // via the next before_agent_start (the user re-submits or the harness
+  // auto-retries).
+  const interactiveGuardConfig = resolveGuardConfig();
+  if (interactiveGuardConfig.enabled) {
+    let interactiveGuard: GenerationGuard | null = null;
+    let interactiveGuardAborted = false;
+
+    // Reset the guard at the start of each agent turn.
+    pi.on("agent_start", async () => {
+      interactiveGuard = new GenerationGuard(interactiveGuardConfig);
+      interactiveGuardAborted = false;
+    });
+
+    // Feed streaming text to the guard.
+    pi.on("message_update", async (event, ctx) => {
+      if (!interactiveGuard || interactiveGuardAborted) return;
+      const msg = event.message as { role?: string; content?: unknown } | undefined;
+      if (msg?.role !== "assistant") return;
+
+      // Extract text from the message content.
+      let text = "";
+      if (typeof msg.content === "string") {
+        text = msg.content;
+      } else if (Array.isArray(msg.content)) {
+        for (const block of msg.content) {
+          if (typeof block === "object" && block !== null) {
+            const b = block as { type?: string; text?: string };
+            if (b.type === "text" && typeof b.text === "string") text += b.text;
+          }
+        }
+      }
+      if (!text) return;
+
+      const decision = interactiveGuard.feed(text);
+      if (decision.abort) {
+        interactiveGuardAborted = true;
+        // Abort the current generation.
+        ctx.abort();
+        // Notify the user.
+        ctx.ui.notify(
+          `GenerationGuard: aborted (${decision.reason}). The degenerate output was discarded. Re-submit your prompt to retry with recovery.`,
+          "error",
+        );
+        // Structured telemetry.
+        const model = ctx.model ? `${(ctx.model as { provider?: string }).provider ?? ""}/${(ctx.model as { id?: string }).id ?? "unknown"}` : "unknown";
+        const telemetryEvent = buildDegenerationEvent(
+          decision.reason!,
+          (ctx.model as { id?: string })?.id ?? "unknown",
+          "interactive",
+          0,
+          decision.diagnostics?.tokens_since_progress as number ?? 0,
+          0,
+          decision.diagnostics ?? {},
+        );
+        if (process.env.PI_GUARD_TELEMETRY !== "false") {
+          process.stderr.write(`[generation-guard] ${JSON.stringify(telemetryEvent)}\n`);
+        }
+      }
+    });
+
+    // Progress events reset the guard counters.
+    pi.on("tool_execution_start", async (event) => {
+      if (!interactiveGuard || interactiveGuardAborted) return;
+      if (event.toolName !== "worker_result") {
+        interactiveGuard.onProgress("tool_call");
+      }
+    });
+
+    // Inject the recovery prompt + Tool Transition Rule after an abort.
+    pi.on("before_agent_start", async (event, ctx) => {
+      let modified = event.systemPrompt;
+      // Always append the Tool Transition Rule to the system prompt (spec §15).
+      if (!modified.includes("Tool Transition Rule")) {
+        modified = modified + "\n\n" + TOOL_TRANSITION_RULE;
+      }
+      // After an abort, inject the recovery prompt.
+      if (interactiveGuardAborted) {
+        modified = modified + "\n\n" + RECOVERY_PROMPT;
+        interactiveGuardAborted = false; // Only inject once.
+      }
+      if (modified !== event.systemPrompt) {
+        return { systemPrompt: modified };
+      }
+    });
   }
 
   pi.registerCommand("engineer", {

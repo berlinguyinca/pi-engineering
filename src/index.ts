@@ -57,6 +57,33 @@ export { AdapterRegistry } from "./adapters/Adapters.ts";
 export type { AutoSpecAdapter, InferWeaveAdapter } from "./adapters/Adapters.ts";
 export { exportTelemetry, formatTelemetry } from "./telemetry/TelemetryExport.ts";
 export type { TelemetrySnapshot } from "./telemetry/TelemetryExport.ts";
+export {
+  GenerationGuard,
+  ModelDegenerationError,
+  normalizeSentence,
+  splitSentences,
+  RECOVERY_PROMPT,
+  TOOL_TRANSITION_RULE,
+  lowerReasoningEffort,
+  decideRecovery,
+  buildCompactedContext,
+  buildDegenerationEvent,
+  initialRecoveryTelemetry,
+  DEFAULT_GUARD_CONFIG,
+  resolveGuardConfig,
+} from "./guard/index.ts";
+export type {
+  GuardDecision,
+  GuardAbortReason,
+  ProgressEventType,
+  GenerationGuardState,
+  ReasoningEffort,
+  CompactionInput,
+  RecoveryDecision,
+  DegenerationEvent,
+  RecoveryTelemetry,
+  GenerationGuardConfig,
+} from "./guard/index.ts";
 export { BlackholeManager } from "./blackhole/BlackholeManager.ts";
 export type { BlackholeManagerOptions } from "./blackhole/BlackholeManager.ts";
 export { resolveBlackholeConfig } from "./blackhole/config.ts";
