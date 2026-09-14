@@ -11,6 +11,8 @@ function load(cwd: string) {
   const hooks = new Map<string, any[]>();
   const sent: any[] = [];
   const statuses: string[] = [];
+  const statusMap = new Map<string, string>();
+  let footer: { render(width: number): string[] } | undefined;
   extension({
     registerCommand: (name: string, command: any) => commands.set(name, command),
     registerTool: () => {},
@@ -21,7 +23,25 @@ function load(cwd: string) {
     cwd,
     hasUI: true,
     mode: "rpc",
-    ui: { notify: () => {}, setStatus: (_key: string, text: string) => statuses.push(text) },
+    ui: {
+      notify: () => {},
+      setStatus: (key: string, text: string) => {
+        statuses.push(text);
+        statusMap.set(key, text);
+      },
+      setFooter: (factory: any) => {
+        footer = factory?.(
+          { requestRender() {} },
+          { fg: (_color: string, text: string) => text },
+          {
+            getExtensionStatuses: () => statusMap,
+            onBranchChange: () => () => {},
+            getGitBranch: () => null,
+            getAvailableProviderCount: () => 0,
+          },
+        );
+      },
+    },
   } as unknown as ExtensionCommandContext;
   return {
     commands,
@@ -29,6 +49,7 @@ function load(cwd: string) {
     sent,
     statuses,
     ctx,
+    footer: () => footer,
     async emit(name: string, event: any = {}) {
       let result = { ...event };
       for (const handler of hooks.get(name) ?? []) {
@@ -46,6 +67,7 @@ test("full extension saves over HTTP and recalls in a fresh chat without persist
   const server = await startServer({ port: 0, token: "everyday-test" });
   const profile = await mkdtemp(join(tmpdir(), "everyday-memory-"));
   const previous = { ...process.env };
+  let second: ReturnType<typeof load> | undefined;
   try {
     process.env.PI_CODING_AGENT_DIR = profile;
     process.env.PI_OPENVIKING_BASE_URL = server.url;
@@ -55,7 +77,7 @@ test("full extension saves over HTTP and recalls in a fresh chat without persist
     await first.emit("session_start");
     await first.commands.get("remember").handler("Calibration reports use metric units.", first.ctx);
     assert.match(first.statuses.at(-1)!, /saved/);
-    const second = load(profile);
+    second = load(profile);
     await second.emit("session_start");
     const before = await second.emit("before_agent_start", {
       prompt: "Which units for calibration reports?",
@@ -70,11 +92,14 @@ test("full extension saves over HTTP and recalls in a fresh chat without persist
     assert.equal(context.messages.length, 2);
     assert.match(context.messages[0].content, /Calibration reports use metric units/);
     assert.equal(second.sent.length, 0);
+    assert.match(second.footer()!.render(100).join("\n"), /Memory: ready/);
     process.env.PI_OPENVIKING_TOKEN = "revoked-test-key";
     await second.emit("before_agent_start", { prompt: "calibration reports", systemPrompt: "" });
     assert.match(second.statuses.at(-1)!, /invalid or revoked/);
+    assert.match(second.footer()!.render(100).join("\n"), /invalid or revoked/);
     assert.deepEqual((await second.emit("context", { messages: input })).messages, input);
   } finally {
+    await second?.emit("session_shutdown");
     for (const key of Object.keys(process.env)) if (!(key in previous)) delete process.env[key];
     Object.assign(process.env, previous);
     await server.close();

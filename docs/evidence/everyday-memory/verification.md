@@ -1,15 +1,16 @@
 # Everyday memory verification — 2026-09-14
 
 Scope: everyday private-memory commands/hooks and update-time connection setup
-in the engineering harness, based on upstream commit `1716585`. No portal,
+in the engineering harness, initially based on upstream commit `1716585` and
+integrated with the subsequently accepted status-bar change `50ec1fb`. No portal,
 Cognito, worker prompt or server schema changes are part of this feature.
 
 ## Automated evidence
 
 - `npm run typecheck`: passed.
 - `npm run lint`: passed.
-- `npm test`: 375 passed, zero failed, one optional PostgreSQL test skipped.
-- `npm run test:e2e`: package loads with 13 commands and six existing core tools.
+- `npm test`: 420 passed, zero failed, one optional PostgreSQL test skipped.
+- `npm run test:e2e`: package loads with 14 commands and six existing core tools.
 - New strict transport tests preserve default worker fail-closed behavior while
   rejecting invalid authentication, malformed data, redirects and timeouts in
   interactive mode. No credential values or raw error bodies enter diagnostics.
@@ -56,6 +57,14 @@ The review is scoped to this feature delta and its interactions with existing
 worker isolation. It is not a new audit of every unrelated repository module.
 Final independent re-review: APPROVE; unresolved critical/high/medium/low counts
 all zero. The reviewer independently ran 73 targeted tests and fresh diagnostics.
+
+After the upstream status-bar change landed, CI exposed an incomplete UI test
+fixture and the new custom footer's omission of extension statuses. The footer
+now composes a width-bounded extension-status row, with memory first and the
+primary model/throughput row unchanged. Real HTTP integration verifies that
+readiness and rejected-key states are visible in the rendered footer. A separate
+independent review approved this three-file integration delta with zero findings
+and ten targeted tests plus diagnostics passing.
 
 ## Repository release evidence
 
