@@ -12,7 +12,8 @@
  * invalidated intentionally).
  */
 
-import type { ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
+import type { ExtensionContext, ReadonlyFooterDataProvider, Theme } from "@earendil-works/pi-coding-agent";
+import { truncateToWidth } from "@earendil-works/pi-tui";
 import type { StatusBarConfig } from "./config.ts";
 import { GitContextProvider } from "./git-context.ts";
 import { renderStatus } from "./layout.ts";
@@ -99,7 +100,7 @@ export class FooterController {
       });
       this.unsubs.push(un);
       return {
-        render: (width: number) => this.renderLine(width, theme),
+        render: (width: number) => this.renderLine(width, theme, footerData),
         invalidate: () => {},
         dispose: () => {},
       };
@@ -181,14 +182,22 @@ export class FooterController {
     this.ctx.ui.setFooter(undefined); // restore Pi's default footer
   }
 
-  private renderLine(width: number, theme: Theme): string[] {
+  private renderLine(width: number, theme: Theme, footerData: ReadonlyFooterDataProvider): string[] {
     let line = "";
     try {
       line = renderStatus(this.status.snapshot, width, this.config);
     } catch {
       line = "";
     }
-    return [theme.fg("muted", line)];
+    const lines = [theme.fg("muted", line)];
+    const statuses = [...footerData.getExtensionStatuses()];
+    if (statuses.length > 0) {
+      // Keep connection failures visible first, then preserve other extensions' order.
+      statuses.sort(([a], [b]) => Number(b === "openviking") - Number(a === "openviking"));
+      const extensions = statuses.map(([, text]) => text.replace(/[\r\n\t]+/g, " ")).join(" | ");
+      lines.push(theme.fg("muted", truncateToWidth(extensions, Math.max(0, width), "…")));
+    }
+    return lines;
   }
 
   private publishThroughput(): void {

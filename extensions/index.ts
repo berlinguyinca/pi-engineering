@@ -1,7 +1,10 @@
+import { createHash } from "node:crypto";
 import { resolve } from "node:path";
 import type { Model } from "@earendil-works/pi-ai/compat";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { resolveMemoryEnvironment } from "../src/blackhole/connectionSetup.ts";
 import { openVikingBlackholeOption } from "../src/blackhole/envConfig.ts";
+import { registerInteractiveMemory } from "../src/blackhole/interactiveMemory.ts";
 import { GitRepo } from "../src/git/GitRepo.ts";
 import { GenerationGuard } from "../src/guard/GenerationGuard.ts";
 import { RECOVERY_PROMPT, TOOL_TRANSITION_RULE, buildDegenerationEvent } from "../src/guard/RecoveryController.ts";
@@ -28,7 +31,7 @@ import { PiWorkerExecutor } from "../src/workers/PiWorkerExecutor.ts";
  * transcript surviving (INV-001).
  */
 
-const runtimes = new Map<string, EngineeringRuntime>();
+const runtimes = new Map<string, { runtime: EngineeringRuntime; memoryIdentity: string }>();
 
 // Live status bar: the harness owns the Pi footer through a single composable
 // controller (src/status/). One active controller per session.
@@ -49,13 +52,16 @@ async function getRuntime(ctx: ExtensionCommandContext, worker?: EngineeringRunt
  */
 async function getRuntimeByCwd(cwd: string, model?: Model<any>): Promise<EngineeringRuntime> {
   const key = await repoCacheKey(cwd);
+  const blackhole = openVikingBlackholeOption(resolveMemoryEnvironment());
+  const memoryIdentity = createHash("sha256")
+    .update(JSON.stringify(blackhole ?? null))
+    .digest("hex");
   const existing = runtimes.get(key);
-  if (existing) return existing;
+  if (existing?.memoryIdentity === memoryIdentity) return existing.runtime;
   // OpenViking connection from the environment. If PI_OPENVIKING_BASE_URL is
   // set, blackhole is enabled with the openviking durable store for EVERY repo
   // this extension runs in — set it once per install and all repos share the
   // deployed durable memory. Absent the env, blackhole stays off (unchanged).
-  const blackhole = openVikingBlackholeOption();
   const rt = await EngineeringRuntime.open({
     cwd,
     verifier: new CommandVerifier(),
@@ -67,7 +73,7 @@ async function getRuntimeByCwd(cwd: string, model?: Model<any>): Promise<Enginee
     roadmapComplete: roadmapCompleteFor(key),
     ...(blackhole ? { blackhole } : {}),
   });
-  runtimes.set(key, rt);
+  runtimes.set(key, { runtime: rt, memoryIdentity });
   return rt;
 }
 
@@ -137,6 +143,7 @@ function formatEntities(rt: EngineeringRuntime, kind?: string): string {
 }
 
 export default function (pi: ExtensionAPI) {
+  registerInteractiveMemory(pi);
   // Semantic tools resolved against the runtime for the calling cwd.
   for (const tool of buildCoreTools(resolveServices)) {
     pi.registerTool(tool);

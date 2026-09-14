@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { visibleWidth } from "@earendil-works/pi-tui";
 import { DEFAULT_STATUS_BAR_CONFIG, type StatusBarConfig } from "../../src/status/config.ts";
 import { FooterController } from "../../src/status/footer.ts";
 
@@ -10,6 +11,7 @@ interface Harness {
   setFooterUndefinedCount: number;
   branchUnsubCount: number;
   branchCbs: Array<() => void>;
+  extensionStatuses: Map<string, string>;
   footer: { render: (w: number) => string[] } | null;
   ctx: {
     cwd: string;
@@ -26,12 +28,14 @@ function makeHarness(cwd = "/nonexistent/repo"): Harness {
     setFooterUndefinedCount: 0,
     branchUnsubCount: 0,
     branchCbs: [],
+    extensionStatuses: new Map(),
     footer: null,
     ctx: null as never,
   };
   const tuiFake = { requestRender: () => h.renderCount++ };
   const themeFake = { fg: (_c: string, t: string) => t };
   const footerDataFake = {
+    getExtensionStatuses: () => h.extensionStatuses,
     onBranchChange: (cb: () => void) => {
       h.branchCbs.push(cb);
       return () => h.branchUnsubCount++;
@@ -59,6 +63,49 @@ function makeHarness(cwd = "/nonexistent/repo"): Harness {
 function fixedClock() {
   return () => 0;
 }
+
+test("lifecycle: extension statuses preserve the primary footer and prioritize memory", () => {
+  const h = makeHarness();
+  const controller = new FooterController({ ctx: h.ctx as never, config: cfg, now: fixedClock() });
+  try {
+    const original = h.footer!.render(120);
+    assert.equal(original.length, 1, "empty extension status map adds no row");
+    h.extensionStatuses.set("other", "Other: ready");
+    h.extensionStatuses.set("openviking", "Memory: connected");
+    const lines = h.footer!.render(120);
+    assert.equal(lines.length, 2, "memory must be visible in the custom footer");
+    assert.equal(lines[0], original[0], "primary model/throughput line must remain unchanged");
+    assert.match(lines[1]!, /^Memory: connected.*Other: ready$/);
+
+    h.extensionStatuses.set("openviking", "Memory: authentication failed");
+    const updated = h.footer!.render(120);
+    assert.match(updated[1]!, /^Memory: authentication failed/);
+    assert.ok(!updated[1]!.includes("connected"), "read current statuses on every render");
+    h.extensionStatuses.clear();
+    assert.deepEqual(h.footer!.render(120), original);
+  } finally {
+    controller.dispose();
+  }
+  assert.equal(h.setFooterUndefinedCount, 1);
+  assert.equal(h.branchUnsubCount, 1);
+});
+
+test("lifecycle: extension status row is bounded at narrow terminal widths", () => {
+  const h = makeHarness();
+  const controller = new FooterController({ ctx: h.ctx as never, config: cfg, now: fixedClock() });
+  h.extensionStatuses.set("other", "Other:\nready\r\nnow\tplease");
+  h.extensionStatuses.set("openviking", "\u001b[32mMemory: connected 界 🧠\u001b[0m");
+  try {
+    for (const width of [0, 1, 2, 8, 20, 40, 120]) {
+      const lines = h.footer!.render(width);
+      assert.equal(lines.length, 2);
+      assert.ok(visibleWidth(lines[1]!) <= width, `status row exceeds ${width} columns`);
+      assert.ok(!lines[1]!.includes("\n"), "extension statuses occupy one extra row");
+    }
+  } finally {
+    controller.dispose();
+  }
+});
 
 test("lifecycle: footer registers, renders state, and feeds events", async () => {
   const h = makeHarness();
