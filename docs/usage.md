@@ -116,7 +116,41 @@ docker compose up -d --build
 
 Because the service is stateless (all memory lives in the Postgres volume), you
 can later move it to AWS/Fly.io and keep the data. See
-`services/openviking/README.md`.
+`services/openviking/README.md`. The production deployment runs on the lab's
+whiteale server as an Apptainer container behind an nginx virtual host — see
+`docs/deployments/openviking-whiteale.md`.
+
+### Installing the connection anywhere pi is installed (no code edits)
+
+Any pi installation that loads this package's **extension** connects to a shared
+OpenViking automatically when the environment is set — no per-repo code. Set
+these once (e.g. in `~/.bashrc`, a systemd unit, or a `.env` the pi process
+loads):
+
+```sh
+export PI_OPENVIKING_BASE_URL=https://viking.metabolomics.us
+# Bearer token for the service — either inline, or from a file (secret hygiene):
+export PI_OPENVIKING_TOKEN=<token>
+# or: export PI_OPENVIKING_TOKEN_FILE=/path/to/token.txt
+# Optional: bounded wait for the provider (default 10000ms):
+export PI_OPENVIKING_PROVIDER_TIMEOUT_MS=10000
+# Optional: explicitly force the connection off:
+# export PI_OPENVIKING_ENABLED=0
+```
+
+When `PI_OPENVIKING_BASE_URL` is set, the extension passes
+`blackhole: { config: { enabled: true, durable: { kind: "openviking", ... } } }`
+into every `EngineeringRuntime` it opens, so all repos in that install share the
+deployed durable memory. Absent the env vars, blackhole stays off (backward
+compatible). Verify a connection with `/blackhole` in a pi session, or:
+
+```sh
+node scripts/pi-engineering.ts blackhole status
+```
+
+The resolver is `src/blackhole/envConfig.ts`; it is fail-closed (a malformed
+timeout falls back to the default; a missing token degrades recall to empty
+rather than crash).
 
 ## Durable state
 

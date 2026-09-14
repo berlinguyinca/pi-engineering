@@ -1,6 +1,7 @@
 import { resolve } from "node:path";
 import type { Model } from "@earendil-works/pi-ai/compat";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { openVikingBlackholeOption } from "../src/blackhole/envConfig.ts";
 import { GitRepo } from "../src/git/GitRepo.ts";
 import { RoadmapEngine } from "../src/roadmap/RoadmapEngine.ts";
 import { EngineeringRuntime } from "../src/runtime/EngineeringRuntime.ts";
@@ -39,6 +40,11 @@ async function getRuntimeByCwd(cwd: string, model?: Model<any>): Promise<Enginee
   const key = await repoCacheKey(cwd);
   const existing = runtimes.get(key);
   if (existing) return existing;
+  // OpenViking connection from the environment. If PI_OPENVIKING_BASE_URL is
+  // set, blackhole is enabled with the openviking durable store for EVERY repo
+  // this extension runs in — set it once per install and all repos share the
+  // deployed durable memory. Absent the env, blackhole stays off (unchanged).
+  const blackhole = openVikingBlackholeOption();
   const rt = await EngineeringRuntime.open({
     cwd,
     verifier: new CommandVerifier(),
@@ -48,6 +54,7 @@ async function getRuntimeByCwd(cwd: string, model?: Model<any>): Promise<Enginee
     // from the roadmap engine (completion is never declared). If the repo has no
     // roadmap, the gate is open.
     roadmapComplete: roadmapCompleteFor(key),
+    ...(blackhole ? { blackhole } : {}),
   });
   runtimes.set(key, rt);
   return rt;
