@@ -1,0 +1,17 @@
+{
+  "name": "openviking",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "OpenViking — cross-machine durable memory service (thin HTTP layer + PostgreSQL backing store). Serves the DurableMemoryProvider contract consumed by pi-engineering-runtime's OpenVikingProvider.",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/index.mjs",
+    "test": "node --test test/smoke.mjs"
+  },
+  "dependencies": {
+    "pg": "^8.13.1"
+  }
+}

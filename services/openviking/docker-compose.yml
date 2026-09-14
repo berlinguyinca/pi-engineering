@@ -1,0 +1,38 @@
+# Tier-1 OpenViking deployment (single host, e.g. a lab box).
+#
+#   cp .env.example .env          # set OPENVIKING_TOKEN + DB credentials
+#   docker compose up -d --build
+#
+# The service is stateless; all durable memory lives in the Postgres volume, so
+# you can move the container to another host and keep the data.
+services:
+  openviking:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "${OPENVIKING_PORT:-8080}:8080"
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-openviking}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-openviking}
+      OPENVIKING_TOKEN: "${OPENVIKING_TOKEN}"
+      OPENVIKING_LOG: "1"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-openviking}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-openviking}
+    volumes:
+      - openviking_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-openviking} -d ${POSTGRES_DB:-openviking}"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  openviking_pg:

@@ -47,9 +47,15 @@ behaving exactly as before when omitted or disabled (backward compatible).
 ## Evidence
 
 - Deterministic unit + integration tests: `test/unit/blackhole*.test.ts`,
-  `test/integration/blackhole.test.ts`.
+  `test/integration/blackhole.test.ts`, `test/integration/openviking.test.ts`.
 - A/B benchmark artifacts: `docs/evidence/blackhole/` (report.md, 12 plots,
   raw.jsonl, raw.csv).
+- **Tier-1 OpenViking service** (`services/openviking/`): a containerized, stateless
+  HTTP durable-memory service (PostgreSQL backing store; in-memory mode for dev/test)
+  serving the exact `DurableMemoryProvider` contract. `docker compose up` deploys it
+  on a single host; `test/integration/openviking.test.ts` validates the contract
+  end-to-end (store/recall/search/auth via the real `OpenVikingProvider`, plus an
+  opt-in Postgres round-trip test gated on `TEST_DATABASE_URL`).
 - Fresh-context review (`scripts/fresh-review-blackhole.ts`) found 6 material
   findings; a focused re-review (`scripts/fresh-review-blackhole-fixes.ts`)
   confirmed all RESOLVED with 0 critical / 0 high.

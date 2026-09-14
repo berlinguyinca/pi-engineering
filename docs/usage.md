@@ -97,6 +97,27 @@ later/other worker consumes knowledge promoted by any earlier worker (spec:
 outage degrades hydration to an empty result and never fails the worker.
 `pi-engineering blackhole status` reports the active `durable` kind.
 
+### Running the OpenViking service (tier-1)
+
+The `openviking` durable kind points workers at a shared HTTP service. A minimal
+containerized implementation lives at `services/openviking/` — a thin,
+stateless HTTP layer over a PostgreSQL backing store that serves exactly the
+contract `OpenVikingProvider` speaks (POST `/memory`, GET `/memory`,
+`GET /memory/search?q=`). Deploy on a single host (e.g. a lab box):
+
+```sh
+cd services/openviking
+cp .env.example .env     # set OPENVIKING_TOKEN + POSTGRES_PASSWORD
+# run the service standalone (in-memory, zero deps) for a quick check:
+node src/index.mjs
+# or run the durable Postgres-backed deployment:
+docker compose up -d --build
+```
+
+Because the service is stateless (all memory lives in the Postgres volume), you
+can later move it to AWS/Fly.io and keep the data. See
+`services/openviking/README.md`.
+
 ## Durable state
 
 State lives in `<repoRoot>/.pi-eng/` and is git-ignored:

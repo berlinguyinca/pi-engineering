@@ -89,10 +89,12 @@ export interface OpenVikingProviderOptions {
  *
  * CONTRACT NOTE: OpenViking is external infrastructure. This adapter targets a
  * generic REST contract (POST {base}/memory to promote, GET {base}/memory to
- * recall all, GET {base}/memory/search?q= to search). The concrete paths and
- * auth header MUST be reconciled with the real OpenViking service before use;
- * they are not validated against a live service here. Unconfigured (empty
- * baseUrl) ⇒ fails closed (recall returns nothing; store throws).
+ * recall all, GET {base}/memory/search?q= to search). A reference tier-1
+ * implementation of exactly this contract ships at `services/openviking/`
+ * (thin HTTP layer + PostgreSQL backing store; `docker compose up` deploys it
+ * on a single host). If a different OpenViking deployment is used, the concrete
+ * paths and auth header must be reconciled with that service. Unconfigured
+ * (empty baseUrl) ⇒ fails closed (recall returns nothing; store throws).
  */
 export class OpenVikingProvider implements DurableMemoryProvider {
   readonly kind = "openviking";
