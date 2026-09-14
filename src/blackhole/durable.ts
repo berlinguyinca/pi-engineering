@@ -71,7 +71,11 @@ export class SharedFileDurableMemory implements DurableMemoryProvider {
 
 /** Warn once per baseUrl+op+outcome so an operator isn't left with silent empty hydration. */
 const warnedAuth = new Set<string>();
-function warnOpenViking(baseUrl: string, op: "recall" | "search", outcome: number | "unreachable"): void {
+function warnOpenViking(
+  baseUrl: string,
+  op: "recall" | "search",
+  outcome: number | "unreachable" | "unexpected-body",
+): void {
   const key = `${baseUrl}:${op}:${outcome}`;
   if (warnedAuth.has(key)) return;
   warnedAuth.add(key);
@@ -80,8 +84,15 @@ function warnOpenViking(baseUrl: string, op: "recall" | "search", outcome: numbe
       ? "Check the bearer token (PI_OPENVIKING_TOKEN / PI_OPENVIKING_TOKEN_FILE)."
       : outcome === "unreachable"
         ? "Check the service is up and PI_OPENVIKING_BASE_URL is correct."
-        : "Check PI_OPENVIKING_BASE_URL and the service.";
-  const what = outcome === "unreachable" ? "is unreachable" : `returned ${outcome}`;
+        : outcome === "unexpected-body"
+          ? "The service returned a non-array body (e.g. an SSO/captive-portal page). Check PI_OPENVIKING_BASE_URL points at the OpenViking service."
+          : "Check PI_OPENVIKING_BASE_URL and the service.";
+  const what =
+    outcome === "unreachable"
+      ? "is unreachable"
+      : outcome === "unexpected-body"
+        ? "returned an unexpected (non-array) body"
+        : `returned ${outcome}`;
   console.warn(`[pi-engineering-runtime] OpenViking ${baseUrl} ${what} on ${op} (fail-closed to empty). ${hint}`);
 }
 
@@ -162,8 +173,12 @@ export class OpenVikingProvider implements DurableMemoryProvider {
       warnOpenViking(this.baseUrl, "recall", res.status);
       return [];
     }
-    const data = (await res.json().catch(() => [])) as DurableMemoryRecord[];
-    return Array.isArray(data) ? data : [];
+    const data = (await res.json().catch(() => [])) as unknown;
+    if (!Array.isArray(data)) {
+      warnOpenViking(this.baseUrl, "recall", "unexpected-body");
+      return [];
+    }
+    return data;
   }
 
   async search(query: string): Promise<DurableMemoryRecord[]> {
@@ -179,7 +194,11 @@ export class OpenVikingProvider implements DurableMemoryProvider {
       warnOpenViking(this.baseUrl, "search", res.status);
       return [];
     }
-    const data = (await res.json().catch(() => [])) as DurableMemoryRecord[];
-    return Array.isArray(data) ? data : [];
+    const data = (await res.json().catch(() => [])) as unknown;
+    if (!Array.isArray(data)) {
+      warnOpenViking(this.baseUrl, "search", "unexpected-body");
+      return [];
+    }
+    return data;
   }
 }

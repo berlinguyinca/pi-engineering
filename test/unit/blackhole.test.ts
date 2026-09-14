@@ -364,6 +364,24 @@ test("openviking provider: warns once on network unreachable (fetch throws) and 
   }
 });
 
+test("openviking provider: warns once on a 200 with a non-array body and fail-closes", async () => {
+  const { OpenVikingProvider } = await import("../../src/blackhole/durable.ts");
+  const warns: string[] = [];
+  const origWarn = console.warn;
+  console.warn = (...a: unknown[]) => warns.push(a.join(" "));
+  try {
+    // e.g. an SSO/captive-portal proxy answering 200 with HTML, not a JSON array
+    const fetchFn = async () => ({ ok: true, status: 200, json: async () => ({ not: "an array" }) }) as never;
+    const prov = new OpenVikingProvider({ baseUrl: "http://ov.example", fetch: fetchFn as never });
+    assert.deepEqual(await prov.recallAll(), []);
+    assert.deepEqual(await prov.recallAll(), []);
+    assert.equal(warns.length, 1, "warns once per unexpected-body outcome");
+    assert.match(warns[0]!, /non-array body/i);
+  } finally {
+    console.warn = origWarn;
+  }
+});
+
 test("blackhole manager: provider outage degrades hydration to empty (never fails worker)", async () => {
   const { BlackholeManager } = await import("../../src/blackhole/BlackholeManager.ts");
   const { Ledger } = await import("../../src/ledger/Ledger.ts");
