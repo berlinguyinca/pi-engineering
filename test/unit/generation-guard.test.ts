@@ -9,21 +9,21 @@ import { test } from "node:test";
 import {
   GenerationGuard,
   ModelDegenerationError,
+  initialGuardState,
   normalizeSentence,
   splitSentences,
-  initialGuardState,
 } from "../../src/guard/GenerationGuard.ts";
 import {
   RECOVERY_PROMPT,
   TOOL_TRANSITION_RULE,
+  buildCompactedContext,
+  buildDegenerationEvent,
+  decideRecovery,
+  initialRecoveryTelemetry,
   lowerReasoningEffort,
   reasoningEffortForRecovery,
-  buildCompactedContext,
-  decideRecovery,
-  buildDegenerationEvent,
   recordAbort,
   recordRetryOutcome,
-  initialRecoveryTelemetry,
 } from "../../src/guard/RecoveryController.ts";
 import { DEFAULT_GUARD_CONFIG, resolveGuardConfig } from "../../src/guard/config.ts";
 
@@ -273,15 +273,10 @@ test("Telemetry: recordRetryOutcome tracks success/failure", () => {
 });
 
 test("buildDegenerationEvent: produces structured event", () => {
-  const event = buildDegenerationEvent(
-    "repeated_sentence",
-    "deepseek-v4.1-flash",
-    "implementer",
-    0,
-    714,
-    812,
-    { repeat_count: 7, repeated_text: "let me look at the autospec repo" },
-  );
+  const event = buildDegenerationEvent("repeated_sentence", "deepseek-v4.1-flash", "implementer", 0, 714, 812, {
+    repeat_count: 7,
+    repeated_text: "let me look at the autospec repo",
+  });
   assert.equal(event.event, "model_generation_aborted");
   assert.equal(event.reason, "repeated_sentence");
   assert.equal(event.model, "deepseek-v4.1-flash");
@@ -325,7 +320,12 @@ test("Config: disabled guard never aborts", () => {
 // ─── Pre-action narration guard (spec §10) ──────────────────────────────────
 
 test("Excessive narration: triggers when narration exceeds budget with no tool calls", () => {
-  const config = { ...DEFAULT_GUARD_CONFIG, maxNarrationTokensBeforeAction: 50, maxReasoningTokensWithoutProgress: 99999, repeatedSentenceThreshold: 99 }; // Disable repeated-sentence to isolate narration detector
+  const config = {
+    ...DEFAULT_GUARD_CONFIG,
+    maxNarrationTokensBeforeAction: 50,
+    maxReasoningTokensWithoutProgress: 99999,
+    repeatedSentenceThreshold: 99,
+  }; // Disable repeated-sentence to isolate narration detector
   const guard = new GenerationGuard(config);
   // Feed ~150 tokens of VARIED narration (600 chars / 4) — no repetition
   const varied = [

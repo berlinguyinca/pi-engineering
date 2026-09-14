@@ -17,12 +17,12 @@ import { test } from "node:test";
 import { GenerationGuard } from "../../src/guard/GenerationGuard.ts";
 import {
   RECOVERY_PROMPT,
-  decideRecovery,
+  type RecoveryTelemetry,
   buildDegenerationEvent,
+  decideRecovery,
   initialRecoveryTelemetry,
   recordAbort,
   recordRetryOutcome,
-  type RecoveryTelemetry,
 } from "../../src/guard/RecoveryController.ts";
 import { DEFAULT_GUARD_CONFIG, type GenerationGuardConfig } from "../../src/guard/config.ts";
 
@@ -38,7 +38,7 @@ class FakeDegenerateStream {
   private toolCallAtChunk: number | null;
 
   constructor(repeatedSentence: string, count: number, toolCallAtChunk?: number) {
-    this.chunks = Array.from({ length: count }, () => repeatedSentence + " ");
+    this.chunks = Array.from({ length: count }, () => `${repeatedSentence} `);
     this.toolCallAtChunk = toolCallAtChunk ?? null;
   }
 
@@ -196,20 +196,12 @@ test("Integration: Full recovery exhaustion (all retries degenerate)", () => {
 });
 
 test("Integration: Telemetry event structure matches spec §21", () => {
-  const event = buildDegenerationEvent(
-    "repeated_sentence",
-    "deepseek-v4.1-flash",
-    "implementer",
-    0,
-    714,
-    812,
-    {
-      repeat_count: 7,
-      repeated_text: "let me look at the autospec repo's autonomous subsystem",
-      last_progress_event: "tool_result",
-      last_progress_age_tokens: 714,
-    },
-  );
+  const event = buildDegenerationEvent("repeated_sentence", "deepseek-v4.1-flash", "implementer", 0, 714, 812, {
+    repeat_count: 7,
+    repeated_text: "let me look at the autospec repo's autonomous subsystem",
+    last_progress_event: "tool_result",
+    last_progress_age_tokens: 714,
+  });
 
   assert.equal(event.event, "model_generation_aborted");
   assert.equal(event.reason, "repeated_sentence");
@@ -224,7 +216,7 @@ test("Integration: Telemetry event structure matches spec §21", () => {
   assert.equal(event.last_progress_event, "tool_result");
   assert.equal(event.last_progress_age_tokens, 714);
   // Must have a valid timestamp
-  assert.ok(!isNaN(Date.parse(event.timestamp)));
+  assert.ok(!Number.isNaN(Date.parse(event.timestamp)));
 });
 
 test("Integration: Normal generation passes through without abort", () => {
