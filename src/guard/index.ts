@@ -5,7 +5,13 @@
  * telemetry types.
  */
 
-export { GenerationGuard, ModelDegenerationError, normalizeSentence, splitSentences, initialGuardState } from "./GenerationGuard.ts";
+export {
+  GenerationGuard,
+  ModelDegenerationError,
+  normalizeSentence,
+  splitSentences,
+  initialGuardState,
+} from "./GenerationGuard.ts";
 export type { GuardDecision, GuardAbortReason, ProgressEventType, GenerationGuardState } from "./GenerationGuard.ts";
 export {
   RECOVERY_PROMPT,

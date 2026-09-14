@@ -71,21 +71,22 @@ export function resolveGuardConfig(overrides?: Partial<GenerationGuardConfig>): 
       cfg.enabled = env.PI_GUARD_ENABLED !== "false" && env.PI_GUARD_ENABLED !== "0";
     }
     if (env.PI_GUARD_SENTENCE_THRESHOLD) {
-      cfg.repeatedSentenceThreshold = parseInt(env.PI_GUARD_SENTENCE_THRESHOLD, 10) || cfg.repeatedSentenceThreshold;
+      cfg.repeatedSentenceThreshold =
+        Number.parseInt(env.PI_GUARD_SENTENCE_THRESHOLD, 10) || cfg.repeatedSentenceThreshold;
     }
     if (env.PI_GUARD_WINDOW) {
-      cfg.repeatedWindowSize = parseInt(env.PI_GUARD_WINDOW, 10) || cfg.repeatedWindowSize;
+      cfg.repeatedWindowSize = Number.parseInt(env.PI_GUARD_WINDOW, 10) || cfg.repeatedWindowSize;
     }
     if (env.PI_GUARD_MAX_REASONING_TOKENS) {
       cfg.maxReasoningTokensWithoutProgress =
-        parseInt(env.PI_GUARD_MAX_REASONING_TOKENS, 10) || cfg.maxReasoningTokensWithoutProgress;
+        Number.parseInt(env.PI_GUARD_MAX_REASONING_TOKENS, 10) || cfg.maxReasoningTokensWithoutProgress;
     }
     if (env.PI_GUARD_MAX_NARRATION_TOKENS) {
       cfg.maxNarrationTokensBeforeAction =
-        parseInt(env.PI_GUARD_MAX_NARRATION_TOKENS, 10) || cfg.maxNarrationTokensBeforeAction;
+        Number.parseInt(env.PI_GUARD_MAX_NARRATION_TOKENS, 10) || cfg.maxNarrationTokensBeforeAction;
     }
     if (env.PI_GUARD_MAX_RECOVERY) {
-      cfg.maxRecoveryAttempts = parseInt(env.PI_GUARD_MAX_RECOVERY, 10) || cfg.maxRecoveryAttempts;
+      cfg.maxRecoveryAttempts = Number.parseInt(env.PI_GUARD_MAX_RECOVERY, 10) || cfg.maxRecoveryAttempts;
     }
   }
 

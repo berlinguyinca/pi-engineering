@@ -3,14 +3,14 @@ import type { Model } from "@earendil-works/pi-ai/compat";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { openVikingBlackholeOption } from "../src/blackhole/envConfig.ts";
 import { GitRepo } from "../src/git/GitRepo.ts";
+import { GenerationGuard } from "../src/guard/GenerationGuard.ts";
+import { RECOVERY_PROMPT, TOOL_TRANSITION_RULE, buildDegenerationEvent } from "../src/guard/RecoveryController.ts";
+import { resolveGuardConfig } from "../src/guard/config.ts";
 import { RoadmapEngine } from "../src/roadmap/RoadmapEngine.ts";
 import { EngineeringRuntime } from "../src/runtime/EngineeringRuntime.ts";
 import { type CoreServices, buildCoreTools } from "../src/tools/coreTools.ts";
 import { CommandVerifier } from "../src/verify/Verifier.ts";
 import { PiWorkerExecutor } from "../src/workers/PiWorkerExecutor.ts";
-import { GenerationGuard } from "../src/guard/GenerationGuard.ts";
-import { RECOVERY_PROMPT, TOOL_TRANSITION_RULE, buildDegenerationEvent } from "../src/guard/RecoveryController.ts";
-import { resolveGuardConfig } from "../src/guard/config.ts";
 
 /**
  * pi-engineering-runtime — extension entry point.
@@ -181,13 +181,15 @@ export default function (pi: ExtensionAPI) {
           "error",
         );
         // Structured telemetry.
-        const model = ctx.model ? `${(ctx.model as { provider?: string }).provider ?? ""}/${(ctx.model as { id?: string }).id ?? "unknown"}` : "unknown";
+        const model = ctx.model
+          ? `${(ctx.model as { provider?: string }).provider ?? ""}/${(ctx.model as { id?: string }).id ?? "unknown"}`
+          : "unknown";
         const telemetryEvent = buildDegenerationEvent(
           decision.reason!,
           (ctx.model as { id?: string })?.id ?? "unknown",
           "interactive",
           0,
-          decision.diagnostics?.tokens_since_progress as number ?? 0,
+          (decision.diagnostics?.tokens_since_progress as number) ?? 0,
           0,
           decision.diagnostics ?? {},
         );
@@ -210,11 +212,15 @@ export default function (pi: ExtensionAPI) {
       let modified = event.systemPrompt;
       // Always append the Tool Transition Rule to the system prompt (spec §15).
       if (!modified.includes("Tool Transition Rule")) {
-        modified = modified + "\n\n" + TOOL_TRANSITION_RULE;
+        modified = `${modified}
+
+${TOOL_TRANSITION_RULE}`;
       }
       // After an abort, inject the recovery prompt.
       if (interactiveGuardAborted) {
-        modified = modified + "\n\n" + RECOVERY_PROMPT;
+        modified = `${modified}
+
+${RECOVERY_PROMPT}`;
         interactiveGuardAborted = false; // Only inject once.
       }
       if (modified !== event.systemPrompt) {

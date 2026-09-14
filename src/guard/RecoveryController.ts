@@ -12,8 +12,8 @@
  * contexts.
  */
 
+import { type GuardAbortReason, ModelDegenerationError } from "./GenerationGuard.ts";
 import type { GenerationGuardConfig } from "./config.ts";
-import { ModelDegenerationError, type GuardAbortReason } from "./GenerationGuard.ts";
 
 // ─── Recovery prompt (spec §14) ─────────────────────────────────────────────
 

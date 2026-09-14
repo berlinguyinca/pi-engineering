@@ -10,22 +10,22 @@ import {
   createExtensionRuntime,
 } from "@earendil-works/pi-coding-agent";
 import type { WorkerResult, WorkerUsage } from "../core/types.ts";
-import type { WorkerExecutor, WorkerRequest, WorkerRun } from "./WorkerExecutor.ts";
-import { registerLocalProviders } from "./localProviders.ts";
-import { WORKER_KICKOFF, buildSystemPrompt } from "./prompts.ts";
-import { TOOL_TRANSITION_RULE } from "../guard/RecoveryController.ts";
-import { workerResultTool } from "./workerResultTool.ts";
 import { GenerationGuard, type GuardAbortReason } from "../guard/GenerationGuard.ts";
+import { TOOL_TRANSITION_RULE } from "../guard/RecoveryController.ts";
 import {
+  type RecoveryTelemetry,
+  buildCompactedContext,
+  buildDegenerationEvent,
   decideRecovery,
   initialRecoveryTelemetry,
   recordAbort,
   recordRetryOutcome,
-  buildDegenerationEvent,
-  buildCompactedContext,
-  type RecoveryTelemetry,
 } from "../guard/RecoveryController.ts";
-import { resolveGuardConfig, type GenerationGuardConfig } from "../guard/config.ts";
+import { type GenerationGuardConfig, resolveGuardConfig } from "../guard/config.ts";
+import type { WorkerExecutor, WorkerRequest, WorkerRun } from "./WorkerExecutor.ts";
+import { registerLocalProviders } from "./localProviders.ts";
+import { WORKER_KICKOFF, buildSystemPrompt } from "./prompts.ts";
+import { workerResultTool } from "./workerResultTool.ts";
 
 /** A minimal resource loader that supplies only the role prompt (context firewall). */
 function roleResourceLoader(systemPrompt: string): ResourceLoader {
@@ -136,7 +136,9 @@ export class PiWorkerExecutor implements WorkerExecutor {
     }
 
     // Build the base system prompt with the Tool Transition Rule (spec §15).
-    const baseSystemPrompt = buildSystemPrompt(req.role, req.task, req.context) + "\n\n" + TOOL_TRANSITION_RULE;
+    const baseSystemPrompt = `${buildSystemPrompt(req.role, req.task, req.context)}
+
+${TOOL_TRANSITION_RULE}`;
 
     // Run the worker with the generation guard and recovery ladder.
     return this.runWithGuard(req, model, baseSystemPrompt, modelRuntime);
@@ -152,12 +154,14 @@ export class PiWorkerExecutor implements WorkerExecutor {
    */
   private async runWithGuard(
     req: WorkerRequest,
-    model: Model<any>,
-    systemPrompt: string,
+    initialModel: Model<any>,
+    initialPrompt: string,
     modelRuntime: ModelRuntime,
   ): Promise<WorkerRun> {
     const customTools = [...this.customTools, workerResultTool];
     const tools = [...new Set([...req.tools, ...customTools.map((t) => t.name)])];
+    let model: Model<any> = initialModel;
+    let systemPrompt: string = initialPrompt;
     let attempt = 0;
     let lastGuardReason: GuardAbortReason | undefined;
     let lastGuardDiagnostics: Record<string, unknown> = {};
@@ -205,7 +209,12 @@ export class PiWorkerExecutor implements WorkerExecutor {
       // Guard-triggered abort — enter the recovery ladder (spec §13).
       lastGuardReason = guardReason;
       lastGuardDiagnostics = guardDiagnostics;
-      recordAbort(this.recoveryTelemetry, guardReason!, this.estimateOutputTokens(session.messages), req.maxContextTokens ?? 32768);
+      recordAbort(
+        this.recoveryTelemetry,
+        guardReason!,
+        this.estimateOutputTokens(session.messages),
+        req.maxContextTokens ?? 32768,
+      );
 
       // Emit structured telemetry (spec §21).
       const telemetryEvent = buildDegenerationEvent(
@@ -213,7 +222,7 @@ export class PiWorkerExecutor implements WorkerExecutor {
         (model as { id?: string }).id ?? "unknown",
         req.role,
         attempt,
-        guardDiagnostics.tokens_since_progress as number ?? 0,
+        (guardDiagnostics.tokens_since_progress as number) ?? 0,
         this.estimateOutputTokens(session.messages),
         guardDiagnostics,
       );
@@ -261,7 +270,9 @@ export class PiWorkerExecutor implements WorkerExecutor {
         systemPrompt = buildCompactedWorkerPrompt(req, recovery.recoveryPrompt);
       } else if (recovery.recoveryPrompt) {
         // Attempt 1: append the recovery prompt to the existing system prompt.
-        systemPrompt = systemPrompt + "\n\n" + recovery.recoveryPrompt;
+        systemPrompt = `${systemPrompt}
+
+${recovery.recoveryPrompt}`;
       }
 
       // Use the fallback model if configured (spec §13, attempt 3).
@@ -510,10 +521,7 @@ function joinExpand(base: string, rel: string): string {
  * model needs to make progress: the task, the role, and the recovery
  * instruction. Verbose context from prior attempts is deliberately excluded.
  */
-function buildCompactedWorkerPrompt(
-  req: WorkerRequest,
-  recoveryPrompt: string | null,
-): string {
+function buildCompactedWorkerPrompt(req: WorkerRequest, recoveryPrompt: string | null): string {
   const parts: string[] = [];
   parts.push(`# Task`);
   parts.push(req.task);
@@ -526,7 +534,7 @@ function buildCompactedWorkerPrompt(
   // re-introducing the verbose context that may have contributed to the loop.
   if (req.context?.trim()) {
     const compactContext = req.context.trim();
-    const sliced = compactContext.length > 500 ? compactContext.slice(0, 500) + "… [truncated]" : compactContext;
+    const sliced = compactContext.length > 500 ? `${compactContext.slice(0, 500)}… [truncated]` : compactContext;
     parts.push(`# Context (compacted)`);
     parts.push(sliced);
     parts.push("");

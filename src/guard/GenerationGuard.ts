@@ -32,11 +32,7 @@ export interface GuardDecision {
   diagnostics?: Record<string, unknown>;
 }
 
-export type ProgressEventType =
-  | "tool_call"
-  | "structured_action"
-  | "final_answer_start"
-  | "state_change";
+export type ProgressEventType = "tool_call" | "structured_action" | "final_answer_start" | "state_change";
 
 // ─── Sentence normalization (spec §7.1) ──────────────────────────────────────
 
@@ -64,9 +60,7 @@ export function normalizeSentence(text: string): string {
 export function splitSentences(text: string): string[] {
   // Split on sentence boundaries: . ! ? followed by space or end
   const parts = text.split(/(?<=[.!?])\s+/);
-  return parts
-    .map((p) => p.trim())
-    .filter((p) => p.length > 0);
+  return parts.map((p) => p.trim()).filter((p) => p.length > 0);
 }
 
 // ─── Guard state ──────────────────────────────────────────────────────────────
