@@ -140,7 +140,9 @@ export default function (pi: ExtensionAPI) {
   // via the next before_agent_start (the user re-submits or the harness
   // auto-retries).
   const interactiveGuardConfig = resolveGuardConfig();
-  if (interactiveGuardConfig.enabled) {
+  // The interactive guard uses pi.on() which is only available in a real pi
+  // session (not in the smoke-test stub). Guard accordingly.
+  if (interactiveGuardConfig.enabled && typeof pi.on === "function") {
     let interactiveGuard: GenerationGuard | null = null;
     let interactiveGuardAborted = false;
 
