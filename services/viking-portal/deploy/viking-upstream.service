@@ -1,0 +1,16 @@
+[Unit]
+Description=Pinned upstream OpenViking for private Pi memories
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=viking-upstream
+Group=viking-upstream
+ExecStart=/usr/bin/apptainer exec --bind /etc/viking-upstream:/etc/viking-upstream:ro,/var/lib/viking-upstream:/data /opt/viking-upstream/openviking.sif openviking-server --config /etc/viking-upstream/ov.conf
+Restart=on-failure
+RestartSec=5
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

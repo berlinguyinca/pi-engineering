@@ -1,0 +1,22 @@
+[Unit]
+Description=Viking Cognito portal and Pi compatibility API
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=viking-portal
+Group=viking-portal
+WorkingDirectory=/opt/viking-portal
+EnvironmentFile=/etc/viking-portal/portal.env
+ExecStart=/usr/bin/node src/index.mjs
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

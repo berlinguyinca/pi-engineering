@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Viking · Memory & access</title><link rel="stylesheet" href="/style.css"><script src="/app.js" defer></script></head>
+<body>
+<header><a class="brand" href="/">Viking<span>Memory & access</span></a><div id="identity"></div><button id="logout" hidden>Sign out</button></header>
+<main>
+<section id="welcome"><p class="eyebrow">YOUR ENGINEERING MEMORY</p><h1>A shared account.<br>Your own memory.</h1><p>Sign in with your existing BinView account to browse your memories and connect your Pi clients.</p><a class="primary" href="/auth/login">Sign in with Cognito</a><p class="muted">Use an existing account. Your BinView browser session may require a separate sign-in here.</p></section>
+<p id="message" role="status" aria-live="polite"></p>
+<div id="workspace" hidden>
+<section><div class="section-heading"><div><p class="eyebrow">PRIVATE WORKSPACE</p><h1>Your memories</h1></div><span id="memory-count" class="badge"></span></div><form id="search-form"><label for="query">Search memory text and source references</label><div class="row"><input id="query" type="search" placeholder="Search your memories"><button type="submit">Search</button></div></form><div id="memories" aria-live="polite"></div></section>
+<section><p class="eyebrow">CONNECT PI</p><h2>Access keys</h2><p>Create one key per device. You can revoke it here at any time.</p>
+<form id="key-form"><div class="form-grid"><label>Device name<input name="name" required maxlength="100" placeholder="My laptop"></label><label>Expires after<select name="expiresInDays"><option value="7">7 days</option><option value="30" selected>30 days</option><option value="90">90 days</option></select></label><label>Permissions<select name="permissions"><option value="read-write">Read and write</option><option value="read">Read only</option></select></label></div><button type="submit">Create access key</button></form>
+<div id="new-key" class="secret" hidden><h3>Save your key now</h3><p>This is the only time its secret will be displayed. Store it in a private file on your Pi device.</p><label for="key-secret">Access key</label><input id="key-secret" readonly autocomplete="off"><button id="copy-key">Copy key</button><button id="dismiss-key">I saved it</button><p>Point Pi to the file containing your key:</p><pre id="pi-config"></pre></div>
+<div class="table-wrap"><table><thead><tr><th>Device</th><th>Permissions</th><th>Expires</th><th>Last used</th><th>Action</th></tr></thead><tbody id="keys"></tbody></table></div>
+</section></div>
+</main><footer>Private memories belong to your account. Legacy shared memories remain with the existing service.</footer>
+</body></html>

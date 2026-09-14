@@ -10,14 +10,14 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "node --test \"test/unit/**/*.test.ts\" \"test/integration/**/*.test.ts\"",
+    "test": "node --test \"test/unit/**/*.test.ts\" \"test/integration/**/*.test.ts\" \"services/viking-portal/test/*.test.mjs\"",
     "test:unit": "node --test \"test/unit/**/*.test.ts\"",
     "test:integration": "node --test \"test/integration/**/*.test.ts\"",
     "test:e2e": "node scripts/smoke-commands.ts && node scripts/smoke-load.ts",
     "test:roadmap": "node --test \"test/unit/roadmap*.test.ts\" \"test/integration/roadmap*.test.ts\"",
     "roadmap:check": "node scripts/pi-engineering.ts roadmap check",
     "roadmap:status": "node scripts/pi-engineering.ts roadmap status",
-    "lint": "biome check .",
+    "lint": "biome check . && biome check --config-path=services/viking-portal services/viking-portal",
     "format": "biome format --write .",
     "build": "tsc --noEmit"
   },

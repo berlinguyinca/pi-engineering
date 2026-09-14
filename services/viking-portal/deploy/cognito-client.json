@@ -1,0 +1,20 @@
+{
+  "UserPoolId": "us-west-2_GjtcM0PCp",
+  "ClientName": "viking-memory-portal",
+  "GenerateSecret": true,
+  "AllowedOAuthFlowsUserPoolClient": true,
+  "AllowedOAuthFlows": ["code"],
+  "AllowedOAuthScopes": ["openid", "email", "profile"],
+  "SupportedIdentityProviders": ["COGNITO"],
+  "CallbackURLs": ["https://viking.metabolomics.us/auth/callback"],
+  "LogoutURLs": ["https://viking.metabolomics.us/"],
+  "ReadAttributes": ["email", "email_verified", "sub"],
+  "WriteAttributes": ["email"],
+  "ExplicitAuthFlows": ["ALLOW_REFRESH_TOKEN_AUTH"],
+  "PreventUserExistenceErrors": "ENABLED",
+  "EnableTokenRevocation": true,
+  "AccessTokenValidity": 60,
+  "IdTokenValidity": 60,
+  "RefreshTokenValidity": 1,
+  "TokenValidityUnits": { "AccessToken": "minutes", "IdToken": "minutes", "RefreshToken": "days" }
+}
