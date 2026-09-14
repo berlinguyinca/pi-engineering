@@ -39,11 +39,21 @@ scp -q -i "$KEY" -r "$REPO_ROOT/services/openviking/src" \
 echo "    source staged at $BUILD_DIR"
 
 # ---- 2. build the Apptainer SIF --------------------------------------------
-if R "test -f $SIF"; then
-  echo "    SIF already exists at $SIF (skipping build)"
+# Rebuild when the source changes, not just when the SIF is missing: stamp a
+# hash of the local source we push (same files as step 1) and rebuild on drift,
+# so a re-run never ships a stale image.
+say "build Apptainer SIF if source changed"
+SRC_HASH=$(tar -cf - \
+  -C "$REPO_ROOT/services/openviking" src package.json package-lock.json \
+  -C "$REPO_ROOT/deploy/apptainer" openviking.def \
+  2>/dev/null | sha256sum | cut -d' ' -f1) || SRC_HASH=unknown
+CURRENT_SHA=$(R "test -f /opt/viking/.openviking.src.sha256 && cat /opt/viking/.openviking.src.sha256" | tr -d '[:space:]' || true)
+if [ -z "$CURRENT_SHA" ] || [ "$CURRENT_SHA" != "$SRC_HASH" ]; then
+  echo "    source changed (${CURRENT_SHA:-<none>} -> $SRC_HASH); rebuilding SIF"
+  R "cd $BUILD_DIR && sudo apptainer build $SIF openviking.def 2>&1 | tail -8"
+  R "echo $SRC_HASH | sudo tee /opt/viking/.openviking.src.sha256 >/dev/null"
 else
-  say "build Apptainer SIF (pull node:22-slim + npm install)"
-  R "cd $BUILD_DIR && sudo apptainer build $SIF openviking.def 2>&1 | tail -5"
+  echo "    SIF up to date (hash $SRC_HASH)"
 fi
 R "test -f $SIF && sudo apptainer inspect $SIF | head -8"
 
@@ -74,12 +84,11 @@ if [ -f "\$SECRETS" ]; then
 else
   umask 077
   TOKEN=\$(openssl rand -hex 32)
-  # reuse the role password just set for openviking, else generate + store it
-  PGPW=\$(sudo -u postgres psql -tAc "SELECT 'x'" >/dev/null 2>&1 && echo '')
-  PGPW=\$(sudo -u postgres psql -tAc "SELECT NULL" >/dev/null 2>&1; true)
-  # We can't read back a password we set, so store a fresh one here and apply it:
+  # Generate a fresh Postgres password, apply it to the role, and store the same
+  # value in the secrets file so DATABASE_URL stays consistent with the role.
   PGPW=\$(openssl rand -hex 24)
   sudo -u postgres psql -q -c "ALTER ROLE openviking PASSWORD '\$PGPW';"
+  sudo -u postgres psql -q -c "SELECT pg_reload_conf();" >/dev/null 2>&1 || true
   # secrets dir is root-owned, so write via sudo tee
   sudo tee "\$SECRETS" >/dev/null <<EOF
 OPENVIKING_TOKEN=\$TOKEN

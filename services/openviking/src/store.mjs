@@ -44,6 +44,16 @@ export class MemoryStore {
   async search(query) {
     return this.recallAll().then((all) => all.filter((r) => matchesTokens(r, query)));
   }
+
+  /** Cheap liveness probe (no full scan). */
+  async health() {
+    return true;
+  }
+
+  /** Cheap record count (no full scan). */
+  async count() {
+    return this.records.size;
+  }
 }
 
 /** PostgreSQL-backed store (tier-1 production). */
@@ -116,6 +126,18 @@ export class PostgresStore {
   async search(query) {
     const all = await this.recallAll();
     return all.filter((r) => matchesTokens(r, query));
+  }
+
+  /** Cheap liveness probe: run SELECT 1 against the pool (no full scan). */
+  async health() {
+    await this.pool.query("SELECT 1");
+    return true;
+  }
+
+  /** Cheap record count via SQL count(*) (no full scan). */
+  async count() {
+    const { rows } = await this.pool.query(`SELECT count(*) AS n FROM openviking_memory`);
+    return Number(rows[0]?.n ?? 0);
   }
 
   toRecord(row) {
