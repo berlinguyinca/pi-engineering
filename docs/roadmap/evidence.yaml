@@ -53,3 +53,30 @@
   findings:
     critical: 0
     high: 0
+- id: dogfood-everyday-memory-footer
+  milestone: __global__
+  type: dogfood
+  status: pass
+  commit: 7bf3d64f6e5d340877abfabaa22c4adc74ecadb7
+  generatedAt: 2026-09-14T23:34:47.156913+00:00
+  paths:
+    - src/
+    - extensions/
+    - test/
+  proof: docs/evidence/everyday-memory/verification.md
+  summary: Verified everyday-memory rollout plus integration with accepted status-bar change 50ec1fb; full suite and independent integration review passed.
+- id: fresh_review-everyday-memory-footer
+  milestone: __global__
+  type: fresh_review
+  status: pass
+  commit: 7bf3d64f6e5d340877abfabaa22c4adc74ecadb7
+  generatedAt: 2026-09-14T23:34:47.156913+00:00
+  paths:
+    - src/
+    - extensions/
+    - test/
+  proof: docs/evidence/everyday-memory/verification.md
+  summary: Verified everyday-memory rollout plus integration with accepted status-bar change 50ec1fb; full suite and independent integration review passed.
+  findings:
+    critical: 0
+    high: 0
