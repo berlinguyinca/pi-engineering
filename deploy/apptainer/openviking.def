@@ -1,0 +1,32 @@
+# OpenViking — Apptainer (Singularity) definition.
+#
+# Builds a stateless container that runs the OpenViking HTTP service (node) over
+# the host's local PostgreSQL. Built against the service files in the build dir
+# (src/, package.json, package-lock.json). The container holds no state: durable
+# memory lives in Postgres and credentials are injected via --env-file at runtime.
+#
+# Build:
+#   apptainer build /opt/viking/openviking.sif openviking.def
+#
+Bootstrap: docker
+From: node:22-slim
+
+%files
+    src              /opt/openviking/src
+    package.json     /opt/openviking/package.json
+    package-lock.json /opt/openviking/package-lock.json
+
+%post
+    apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+    cd /opt/openviking
+    npm install --omit=dev
+    rm -rf node_modules/.cache
+
+%environment
+    export NODE_ENV=production
+    export OPENVIKING_PORT=8090
+    export OPENVIKING_LOG=1
+
+%runscript
+    cd /opt/openviking
+    exec node src/index.mjs

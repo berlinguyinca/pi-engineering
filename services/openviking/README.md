@@ -40,11 +40,10 @@ docker compose up -d --build
 curl http://localhost:8080/health
 ```
 
-The service is stateless — all durable memory lives in the Postgres data volume
-(`./data/postgres`), so you can move the container to another host and keep the
-data. In production the `docker-compose.yml` uses a data volume whose
-`./data/secrets/.env` holds every credential and whose `./data/postgres` holds
-the durable memory (see `docs/deployments/openviking-aws.md`).
+The service is stateless — all durable memory lives in Postgres, so you can move
+the container to another host and keep the data. The `docker-compose.yml` uses a
+data volume whose `./data/secrets/.env` holds every credential and whose
+`./data/postgres` holds the durable memory (for a docker-compose deployment).
 
 ## Point pi workers at it
 
@@ -57,13 +56,15 @@ blackhole: {
 }
 ```
 
-## Production deployment (AWS)
+## Production deployment (whiteale, Apptainer)
 
-Live at `https://viking.metabolomics.us` (Route 53 → ALB → EC2 → docker compose
-over Postgres). See `docs/deployments/openviking-aws.md` for the architecture,
-data-volume layout (where the secrets/keys live), how to access the box, and how
-`status.metabolomics.us` can monitor it via `/health` + `/metrics`. The IaC is in
-`deploy/aws/` (`deploy.sh` / `teardown.sh` / `user-data.sh`).
+Live at `https://viking.metabolomics.us` (Route 53 → whiteale `128.120.143.172`
+→ nginx vhost → Apptainer container → host Postgres). See
+`docs/deployments/openviking-whiteale.md` for the architecture, data-volume
+layout (`/opt/viking/data/secrets/.env` holds every credential), how to access
+whiteale, and how `status.metabolomics.us` can monitor it via `/health` +
+`/metrics`. Deploy IaC is in `deploy/apptainer/` (`openviking.def` +
+`deploy-whiteale.sh`).
 
 ## Security notes (tier-1)
 
