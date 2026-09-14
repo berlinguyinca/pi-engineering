@@ -36,6 +36,11 @@ test("smoke: health + promote + recall + search + auth", async () => {
     // unauthenticated denied
     const denied = await fetch(`${srv.url}/memory`);
     assert.equal(denied.status, 401);
+
+    // metrics (Prometheus text format, unauthenticated)
+    const m = await (await fetch(`${srv.url}/metrics`)).text();
+    assert.match(m, /^openviking_up\{kind="memory".*\} 1/m);
+    assert.match(m, /openviking_requests_total\{method="POST",route="\/memory",status=201\} 1/);
   } finally {
     await srv.close();
   }

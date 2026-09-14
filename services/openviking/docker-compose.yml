@@ -1,20 +1,40 @@
-# Tier-1 OpenViking deployment (single host, e.g. a lab box).
+# OpenViking — production deployment (AWS EC2 / single host).
 #
-#   cp .env.example .env          # set OPENVIKING_TOKEN + DB credentials
+# DATA VOLUME LAYOUT (the "data volume" that persists across restarts and is
+# the place to find every key/password for this installation):
+#
+#   ./data/                          <- the data volume (bind mount; back this up)
+#     secrets/                       <- ALL credentials for this deployment
+#       .env                         <- OPENVIKING_TOKEN + POSTGRES_PASSWORD
+#       (any additional keys/certs you add down the line go here)
+#     postgres/                      <- PostgreSQL data files
+#     letsencrypt/                   <- TLS certs/state (if you run certbot)
+#     nginx/                         <- reverse-proxy config (if you front it)
+#
+# The service itself is stateless; ALL durable memory + credentials live under
+# ./data, so you can move the container to another host and keep everything.
+#
+# Bootstrap:
+#   mkdir -p data/secrets data/postgres
+#   cp .env.prod.example data/secrets/.env   # then fill in the values
 #   docker compose up -d --build
 #
-# The service is stateless; all durable memory lives in the Postgres volume, so
-# you can move the container to another host and keep the data.
+# TLS is terminated upstream (AWS ALB with an ACM certificate in production) so
+# this compose only exposes the plaintext service to the ALB on OPENVIKING_PORT.
 services:
   openviking:
     build: .
     restart: unless-stopped
-    ports:
-      - "${OPENVIKING_PORT:-8080}:8080"
+    env_file:
+      - ./data/secrets/.env
     environment:
       DATABASE_URL: postgres://${POSTGRES_USER:-openviking}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-openviking}
       OPENVIKING_TOKEN: "${OPENVIKING_TOKEN}"
+      OPENVIKING_PORT: "8080"
       OPENVIKING_LOG: "1"
+    ports:
+      # Published on the host for the ALB target group / health checks.
+      - "${OPENVIKING_PORT:-8080}:8080"
     depends_on:
       postgres:
         condition: service_healthy
@@ -24,15 +44,14 @@ services:
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-openviking}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB:-openviking}
     volumes:
-      - openviking_pg:/var/lib/postgresql/data
+      # Postgres data lives under the data volume so it persists and is backed up
+      # alongside the secrets folder.
+      - ./data/postgres:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-openviking} -d ${POSTGRES_DB:-openviking}"]
       interval: 5s
       timeout: 3s
       retries: 5
-
-volumes:
-  openviking_pg:

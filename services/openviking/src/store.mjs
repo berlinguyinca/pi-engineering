@@ -25,6 +25,7 @@ export function matchesTokens(record, query) {
 /** In-memory store (single process, dev/tests). */
 export class MemoryStore {
   constructor() {
+    this.kind = "memory";
     this.records = new Map();
   }
 
@@ -51,6 +52,7 @@ export class PostgresStore {
    * @param {string} url  postgres:// connection string
    */
   constructor(url) {
+    this.kind = "postgres";
     this.url = url;
     this.pool = null;
   }
