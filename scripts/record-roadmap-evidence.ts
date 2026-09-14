@@ -89,9 +89,9 @@ async function main() {
     status: "pass",
     commit: head,
     generatedAt: now,
-    paths: ["src/roadmap/", "src/blackhole/", "src/benchmark/"],
+    paths: ["src/roadmap/", "src/blackhole/", "src/benchmark/", "services/"],
     proof:
-      "scripts/fresh-review-roadmap.ts + scripts/fresh-review-blackhole.ts + scripts/fresh-review-blackhole-fixes.ts",
+      "scripts/fresh-review-roadmap.ts + scripts/fresh-review-blackhole.ts + scripts/fresh-review-blackhole-fixes.ts + scripts/fresh-review-openviking-service.ts",
     summary: `fresh-context review at HEAD; unresolved findings ${args.critical} critical, ${args.high} high`,
     findings: { critical: args.critical, high: args.high },
   });
