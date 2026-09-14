@@ -91,3 +91,18 @@ new personal keys unavailable until the portal route is restored.
 Memory/search and OAuth callback access logging are disabled so sensitive query
 context and authorization codes are not retained in nginx access logs. Other
 virtual hosts and scheduler authentication were not changed.
+
+## Services status page
+
+On 2026-09-14, the operator requested monitoring at
+https://status.metabolomics.us/status/services. Uptime Kuma monitor **178**,
+**OpenViking**, was added to the existing **Web vhosts** group 69. It checks
+`https://viking.metabolomics.us/portal-health` every 60 seconds with TLS validation
+and HTTP 200 required. A real heartbeat reported UP. Notifications are disabled;
+all prior page settings and monitor memberships were preserved.
+
+Before the supported Socket.IO API changes, a consistent SQLite backup was
+saved on the monitoring host at
+`/root/status-backups/before-openviking-20260914.db` with mode 600 and a successful
+integrity check. A private API snapshot is inside its uptime-kuma container at
+`/app/data/openviking-status-before-20260914.json`.

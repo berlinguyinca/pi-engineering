@@ -13,6 +13,15 @@ Inspection found Pi 0.85.1, one global profile, and the local package
 Its current code supports the portal API and environment/token-file settings.
 **No Pi binary upgrade or switch to the portal worktree is needed.**
 
+On 2026-09-14, this workstation was configured at the operator's request:
+`~/.config/pi/viking-env.sh` is sourced by `.bashrc`, `.profile` and the existing
+`.zshrc`; `~/.config/environment.d/60-viking-pi.conf` covers user services.
+The current user service manager and all three existing tmux sessions also have
+the environment for future processes/panes. The key file was created empty with
+mode 600 for the operator to fill. The shared fragment sets enabled to 1 and clears
+the direct-token override. Existing processes must be restarted after saving the
+key. Shell backups are under `~/.config/pi/backups/`.
+
 Save the key without putting it in command history (Bash):
 
 ```bash
