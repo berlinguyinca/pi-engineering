@@ -114,9 +114,10 @@ $("key-form").onsubmit = async (event) => {
   try {
     const values = new FormData(event.target);
     const scopes = values.get("permissions") === "read" ? ["memory:read"] : ["memory:read", "memory:write"];
+    const expiresInDays = values.get("expiresInDays") === "never" ? null : Number(values.get("expiresInDays"));
     const key = await api("/api/keys", {
       method: "POST",
-      body: JSON.stringify({ name: values.get("name"), scopes, expiresInDays: Number(values.get("expiresInDays")) }),
+      body: JSON.stringify({ name: values.get("name"), scopes, expiresInDays }),
     });
     $("key-secret").value = key.secret;
     $("new-key").hidden = false;

@@ -37,7 +37,9 @@ Cognito tokens and upstream root keys never enter browser storage.
 
 The portal stores personal key hashes and ownership in PostgreSQL. Random
 256-bit secrets are displayed once. Keys have a name, scopes (`memory:read`,
-`memory:write`), expiry (maximum 90 days), last-used timestamp and revocation.
+`memory:write`), expiry (1–90 days, or explicitly no expiry), last-used timestamp
+and revocation. The operator requested non-expiring keys during the rollout;
+`expiresInDays: null` represents that choice, while omission still means 30 days.
 Only browser sessions may manage keys. A device key cannot create more keys.
 An owner's stable ID derives from the configured issuer and verified subject.
 Revocation is checked on every request. Disabling Cognito users does not itself

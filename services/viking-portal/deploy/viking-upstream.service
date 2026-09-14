@@ -1,6 +1,6 @@
 [Unit]
 Description=Pinned upstream OpenViking for private Pi memories
-After=network-online.target
+After=network-online.target viking-ollama.service
 Wants=network-online.target
 
 [Service]

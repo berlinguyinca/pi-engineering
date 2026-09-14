@@ -5,6 +5,10 @@ the existing Pi `/memory` contract to upstream OpenViking **v0.4.20**, keeping a
 optional legacy lane for existing clients. It does not replace the live service
 merely by being installed.
 
+**Production activated 2026-09-14:** https://viking.metabolomics.us.
+See [deployment evidence](../../docs/deployments/viking-production-2026-09-14.md)
+and [local Pi setup](../../docs/deployments/viking-client-setup.md).
+
 ## Current integration facts
 
 - Existing scheduler pool: `us-west-2_GjtcM0PCp` in `us-west-2`.
@@ -25,7 +29,7 @@ merely by being installed.
 - `/auth/login`, `/auth/callback`, `POST /auth/logout`: Cognito authorization
   code + PKCE, validated RS256 ID tokens, server-side sessions and CSRF checks.
 - `/api/me`, `GET/POST /api/keys`, `DELETE /api/keys/{id}`: session-only key
-  management. Keys expire after 1–90 days, max 20 active per user. Secrets appear
+  management. Keys expire after 1–90 days or explicitly never expire, max 20 active per user. Secrets appear
   only at creation and persist only as SHA256 hashes.
 - `GET/POST /memory`, `GET /memory/search?q=`: the existing Pi envelope and
   keyword-search behavior. Device scopes are `memory:read` / `memory:write`.
@@ -55,9 +59,12 @@ access to another user's memories.
 Device keys are independent of Cognito sessions. **Disabling/deleting a Cognito
 user does not automatically revoke their keys.** For offboarding, revoke the
 owner's keys in the portal database as well; identify the owner with
-SHA256(issuer + NUL + sub). The bounded expiry is an additional limit, not an
+SHA256(issuer + NUL + sub). Expiry on dated keys is an additional limit, not an
 offboarding mechanism. Existing in-flight requests may finish after revocation;
-subsequent authentication is rejected.
+subsequent authentication is rejected. Non-expiring keys remain valid until
+revoked; choose **Never expires** in the UI or send `expiresInDays: null` to
+the key-creation API. Omitting expiry still defaults to 30 days. Existing keys'
+expiry dates are not changed by the additive nullable-expiry migration.
 
 New memory calls are limited to two per owner and eight globally. Retrieval
 rejects collections above 1,000 records or 8 MiB and has an operation deadline;
@@ -101,10 +108,10 @@ test-only Cognito redirect fixture. It does not prove real Cognito sign-in.
 
 ## Production activation and rollback
 
-The production services and AWS resources were not changed during implementation.
-Candidate image conversion and a temporary loopback startup were tested on the
-host under `/home/wohlgemuth/.cache/viking-portal-candidate`. A live browser
-sign-in is required before declaring Cognito integration complete.
+The initial implementation was staged without changing production. The operator
+subsequently approved activation, and confirmed real Cognito sign-in. The steps
+below document the rollout/rollback process; do not repeat resource creation
+against an already deployed installation.
 
 1. Back up the existing nginx vhost, `/opt/viking/openviking.sif`, secrets and
    `openviking` PostgreSQL database. Record current authenticated `/memory`

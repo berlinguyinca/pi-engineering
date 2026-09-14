@@ -109,7 +109,9 @@ try {
 
       const device = `${profile.name} Pi device`;
       await page.getByLabel("Device name").fill(device);
-      await page.getByLabel("Expires after").selectOption("7");
+      await page
+        .getByLabel("Expires after")
+        .selectOption(profile.name === "desktop" ? "never" : "7", { timeout: 3000 });
       await page.getByRole("button", { name: "Create access key" }).click();
       await expect(page.getByRole("heading", { name: "Save your key now" })).toBeVisible();
       const secret = await page.getByLabel("Access key", { exact: true }).inputValue();
@@ -123,7 +125,11 @@ try {
       for (const row of JSON.parse(listBody)) {
         assert.equal("secret" in row, false);
         assert.equal("secretHash" in row, false);
+        if (profile.name === "desktop") assert.equal(row.expiresAt, null);
+        else assert.ok(row.expiresAt);
       }
+      if (profile.name === "desktop")
+        await expect(page.locator("#keys tr").first().locator("td").nth(2)).toHaveText("Never");
       await expect(page.locator("#pi-config")).toContainText(`PI_OPENVIKING_BASE_URL='${origin}'`);
       await expect(page.locator("#pi-config")).toContainText('chmod 600 "$HOME/.config/pi/viking.key"');
       await page.getByRole("button", { name: "Copy key", exact: true }).click();

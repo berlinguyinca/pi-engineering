@@ -61,6 +61,37 @@ test("returned data cannot mutate persisted scope or authentication decisions", 
   assert.deepEqual(await store.authenticate(key.secret), { owner: "alice", scopes: ["memory:read"] });
 });
 
+for (const expiresInDays of [undefined, 1, 90, null]) {
+  test(`expiry ${String(expiresInDays)} is preserved and enforced`, async () => {
+    let now = base;
+    const store = new MemoryKeyStore({ now: () => now });
+    const key = await store.create("alice", { ...options, expiresInDays });
+    const expiresAt = expiresInDays === null ? null : new Date(base + (expiresInDays ?? 30) * 86400000).toISOString();
+    assert.equal(key.expiresAt, expiresAt);
+    assert.equal((await store.list("alice"))[0].expiresAt, expiresAt);
+    now = Date.parse("2126-09-14T00:00:00Z");
+    assert.deepEqual(
+      await store.authenticate(key.secret),
+      expiresInDays === null ? { owner: "alice", scopes: options.scopes } : null,
+    );
+    assert.equal(await store.revoke("alice", key.id), true);
+    assert.equal(await store.authenticate(key.secret), null);
+  });
+}
+
+test("never-expiring keys consume active quota until revoked", async () => {
+  let now = base;
+  const store = new MemoryKeyStore({ now: () => now });
+  const keys = await Promise.all(
+    Array.from({ length: 20 }, () => store.create("alice", { ...options, expiresInDays: null })),
+  );
+  now = Date.parse("2126-09-14T00:00:00Z");
+  await assert.rejects(store.create("alice", options), RangeError);
+  await assert.rejects(store.create("alice", { ...options, expiresInDays: null }), RangeError);
+  await store.revoke("alice", keys[0].id);
+  assert.equal((await store.create("alice", { ...options, expiresInDays: null })).expiresAt, null);
+});
+
 for (const [label, change] of [
   ["empty name", { name: "" }],
   ["blank name", { name: "   " }],
@@ -76,6 +107,9 @@ for (const [label, change] of [
   ["huge expiry", { expiresInDays: 91 }],
   ["NaN expiry", { expiresInDays: Number.NaN }],
   ["string expiry", { expiresInDays: "30" }],
+  ["string null expiry", { expiresInDays: "null" }],
+  ["boolean expiry", { expiresInDays: false }],
+  ["infinite expiry", { expiresInDays: Number.POSITIVE_INFINITY }],
 ]) {
   test(`rejects ${label}`, async () => {
     await assert.rejects(

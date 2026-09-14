@@ -9,7 +9,7 @@
   "CallbackURLs": ["https://viking.metabolomics.us/auth/callback"],
   "LogoutURLs": ["https://viking.metabolomics.us/"],
   "ReadAttributes": ["email", "email_verified", "sub"],
-  "WriteAttributes": ["email"],
+  "WriteAttributes": ["email", "family_name", "name"],
   "ExplicitAuthFlows": ["ALLOW_REFRESH_TOKEN_AUTH"],
   "PreventUserExistenceErrors": "ENABLED",
   "EnableTokenRevocation": true,
