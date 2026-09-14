@@ -65,8 +65,10 @@ rm -f /opt/viking/openviking.tar.gz
 
 echo "==> deploying with docker compose"
 cd /opt/viking
-# compose reads ./data/secrets/.env -> /opt/viking/data/secrets/.env
-docker compose up -d --build
+# Pass the secrets file as --env-file so compose substitutes POSTGRES_PASSWORD /
+# OPENVIKING_TOKEN in the compose file itself (env_file alone only injects vars
+# into containers, not into compose's own &{VAR} substitution).
+docker compose --env-file ./data/secrets/.env up -d --build
 
 echo "==> bootstrap complete"
 docker compose ps || true
