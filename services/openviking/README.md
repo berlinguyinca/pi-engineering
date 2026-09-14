@@ -13,6 +13,12 @@ in-memory for dev/tests).
 | GET    | `/memory`             | —                                     | all promoted records `[]`      |
 | GET    | `/memory/search`      | `?q=` (tokens)                        | relevant records `[]`          |
 | GET    | `/health`             | —                                     | `{ status: "ok" }`             |
+| GET    | `/metrics`            | — (Prometheus text format)            | `openviking_up`, `openviking_memory_records`, `openviking_requests_total` |
+
+`/metrics` is unauthenticated so external monitors (e.g. `status.metabolomics.us`)
+can scrape it. `openviking_up{kind,version,auth}` is 1 when serving,
+`openviking_memory_records` is the number of promoted records, and
+`openviking_requests_total{method,route,status}` counts traffic by route/status.
 
 If `OPENVIKING_TOKEN` is set, every request must send
 `Authorization: Bearer <token>` (this is exactly what `OpenVikingProvider`
@@ -34,9 +40,11 @@ docker compose up -d --build
 curl http://localhost:8080/health
 ```
 
-The service is stateless — all durable memory lives in the `openviking_pg`
-Postgres volume, so you can move the container to another host (e.g. off a lab
-box to AWS later) and keep the data.
+The service is stateless — all durable memory lives in the Postgres data volume
+(`./data/postgres`), so you can move the container to another host and keep the
+data. In production the `docker-compose.yml` uses a data volume whose
+`./data/secrets/.env` holds every credential and whose `./data/postgres` holds
+the durable memory (see `docs/deployments/openviking-aws.md`).
 
 ## Point pi workers at it
 
@@ -48,6 +56,14 @@ blackhole: {
   },
 }
 ```
+
+## Production deployment (AWS)
+
+Live at `https://viking.metabolomics.us` (Route 53 → ALB → EC2 → docker compose
+over Postgres). See `docs/deployments/openviking-aws.md` for the architecture,
+data-volume layout (where the secrets/keys live), how to access the box, and how
+`status.metabolomics.us` can monitor it via `/health` + `/metrics`. The IaC is in
+`deploy/aws/` (`deploy.sh` / `teardown.sh` / `user-data.sh`).
 
 ## Security notes (tier-1)
 

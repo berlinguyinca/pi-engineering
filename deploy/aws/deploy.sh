@@ -40,8 +40,7 @@ fi
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 SERVICE_DIR="$REPO_ROOT/services/openviking"
 
-say()  { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
-have() { aws "$@" >/dev/null 2>&1; }
+say() { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
 
 # ---------------------------------------------------------------------------
 say "upload app to S3 ($BUCKET)"
@@ -111,9 +110,19 @@ if [ -z "$EIP_ALLOC" ] || [ "$EIP_ALLOC" = "None" ]; then
   EIP_ALLOC=$(aws ec2 allocate-address --domain vpc --region "$REGION" --query AllocationId --output text)
   aws ec2 create-tags --resources "$EIP_ALLOC" --tags "Key=Name,Value=$NAME" --region "$REGION"
 fi
-aws ec2 associate-address --allocation-id "$EIP_ALLOC" --instance-id "$INSTANCE_ID" --region "$REGION" >/dev/null 2>&1 || true
+# Associate the EIP and VERIFY it stuck. (A prior association to a terminating
+# instance can silently fail, leaving the EIP detached — which breaks SSH.)
+for i in $(seq 1 10); do
+  aws ec2 associate-address --allocation-id "$EIP_ALLOC" --instance-id "$INSTANCE_ID" --region "$REGION" >/dev/null 2>&1
+  AS=$(aws ec2 describe-addresses --allocation-ids "$EIP_ALLOC" --region "$REGION" --query 'Addresses[0].AssociationId' --output text 2>/dev/null || echo None)
+  [ -n "$AS" ] && [ "$AS" != "None" ] && break
+  echo "    EIP association pending..."
+  sleep 10
+  AS="None"
+done
+[ -n "$AS" ] && [ "$AS" != "None" ] || { echo "ERROR: EIP association did not succeed"; exit 1; }
 EIP=$(aws ec2 describe-addresses --allocation-ids "$EIP_ALLOC" --region "$REGION" --query 'Addresses[0].PublicIp' --output text)
-echo "    EIP = $EIP"
+echo "    EIP = $EIP (associated)"
 
 # ---------------------------------------------------------------------------
 say "ACM certificate for $DOMAIN (DNS validation)"
