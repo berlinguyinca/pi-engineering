@@ -90,7 +90,7 @@ aws ec2 authorize-security-group-ingress --group-id "$SG_EC2" --protocol tcp --p
 # ---------------------------------------------------------------------------
 say "build user-data and launch EC2"
 sed -e "s|__BUCKET__|$BUCKET|g" -e "s|__REGION__|$REGION|g" "$REPO_ROOT/deploy/aws/user-data.sh" > /tmp/openviking-user-data.sh
-INSTANCE_ID=$(aws ec2 describe-instances --filters "Name=tag:$TAG" "Name=instance-state-name,Values=pending,running" --region "$REGION" --query 'Reservations[].Instances[0].InstanceId' --output text 2>/dev/null || true)
+INSTANCE_ID=$(aws ec2 describe-instances --filters "Name=tag:Name,Values=viking-openviking" "Name=instance-state-name,Values=pending,running" --region "$REGION" --query 'Reservations[].Instances[0].InstanceId' --output text 2>/dev/null || true)
 if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" = "None" ]; then
   INSTANCE_ID=$(aws ec2 run-instances \
     --image-id "$AMI" --instance-type "$INSTANCE_TYPE" --key-name "$KEY_NAME" \
@@ -169,8 +169,11 @@ if [ -z "$LISTENER_HTTPS" ] || [ "$LISTENER_HTTPS" = "None" ]; then
 fi
 LISTENER_HTTP=$(aws elbv2 describe-listeners --load-balancer-arn "$ALB_ARN" --region "$REGION" --query "Listeners[?Port==\`80\`].ListenerArn" --output text 2>/dev/null || true)
 if [ -z "$LISTENER_HTTP" ] || [ "$LISTENER_HTTP" = "None" ]; then
+  cat > /tmp/redirect-action.json <<'JSON'
+[{"Type":"redirect","RedirectConfig":{"Protocol":"HTTPS","Port":"443","Host":"#{host}","Path":"/#{path}","Query":"#{query}","StatusCode":"HTTP_301"}}]
+JSON
   aws elbv2 create-listener --load-balancer-arn "$ALB_ARN" --protocol HTTP --port 80 \
-    --default-actions "Type=redirect,RedirectConfig={Protocol=HTTPS,Port=443,Host=#{host},Path=/#{path},Query=#{query},StatusCode=HTTP_301}" --region "$REGION" >/dev/null
+    --default-actions file:///tmp/redirect-action.json --region "$REGION" >/dev/null
 fi
 
 # ---------------------------------------------------------------------------

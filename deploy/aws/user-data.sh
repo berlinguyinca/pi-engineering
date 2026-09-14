@@ -13,7 +13,18 @@ export DEBIAN_FRONTEND=noninteractive
 
 echo "==> installing docker + compose"
 apt-get update -y
-apt-get install -y ca-certificates curl awscli
+apt-get install -y ca-certificates curl unzip
+
+# AWS CLI v2. (The awscli apt package is NOT available on Ubuntu 24.04/noble,
+# so we install v2 from the official bundle. Needed to pull the app from S3.)
+if ! command -v aws >/dev/null 2>&1; then
+  echo "    installing AWS CLI v2"
+  curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+  unzip -q /tmp/awscliv2.zip -d /tmp
+  /tmp/aws/install --update >/dev/null
+  rm -rf /tmp/aws /tmp/awscliv2.zip
+fi
+
 install -m 0755 -d /etc/apt/keyrings
 curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
 chmod a+r /etc/apt/keyrings/docker.asc
