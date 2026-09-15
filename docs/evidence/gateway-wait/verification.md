@@ -1,0 +1,114 @@
+# Gateway-wait verification — 2026-09-15
+
+Scope: the model-gateway saturation path in the engineering harness — unbounded
+waiting for the interactive turn, `/gateway` visibility, context-safe model
+fallback — plus two supporting fixes (evidence-recorder path scoping, and a
+global `git worktree prune` removed from candidate isolation).
+
+Baseline: the last accepted manual evidence was recorded at `7bf3d64`. The delta
+since then also includes upstream `f22c75e` (transient-error recovery, #6) and
+`297b9ad` (generation guard, gateway backpressure, status bar, panel, #7), both
+already merged to `main` without refreshed evidence.
+
+## The defect
+
+Pi's agent loop calls `modelRuntime.streamSimple` (`pi-coding-agent
+core/sdk.js:194`) wrapped in `retryAssistantCall` (`pi-ai utils/retry.js`). That
+wrapper retries an assistant message whose `stopReason` is `"error"` at most
+`settings.retry.maxRetries` times — three by default — sleeping
+`baseDelayMs * 2 ** (attempt - 1)` and ignoring any wait the gateway advertised.
+`ExtensionAPI` exposes no accessor for that budget. A saturated gateway
+therefore ended the operator's turn with "Retry failed after 3 attempts" while
+every engineering worker, which runs with Pi's retry disabled and waits on the
+admission controller instead, eventually succeeded.
+
+## Automated evidence
+
+- `npm run typecheck`: passed.
+- `npm run lint`: passed.
+- `npm test`: 752 tests, 751 passed, zero failed, one optional PostgreSQL test
+  skipped.
+- `npm run test:e2e`: package loads with 16 commands and six core tools.
+- 40+ new tests covering the retry pump, the installer, admission scoping,
+  fallback selection and the `/gateway` report.
+- `test/integration/gateway-stream-retry-registry.test.ts` drives a real
+  `ModelRuntime`, not a double, through the same entry point Pi's agent loop
+  uses.
+- `test/integration/git-worktree-concurrency.test.ts` covers concurrent
+  worktree creation, a failed creation not wedging its neighbours, and removal
+  interleaved with creation.
+
+## Live use
+
+`node scripts/dogfood-gateway-wait.ts` passed all four phases.
+
+Phase 1 ran against the operator's own configured provider rather than a
+fixture: provider `metabolomics`, api `openai-completions`, base URL
+`https://llm.metabolomics.us/v1` — the gateway the reported 503s came from.
+Installing the wrapper succeeded, and all four models plus their availability
+survived it. That provider takes the extension-config install path, not the
+native-provider path.
+
+Phase 2 rode out ten consecutive `503 no worker for model` refusals with the
+synthesized wait escalating 5s → 10s → 20s → 40s → 60s and capping, ending
+`stopReason: stop` after eleven provider attempts. Pi's own budget would have
+surfaced a failure at the fourth.
+
+Phase 3 honoured an advertised `retry_after_ms` of 30000 exactly rather than
+substituting a backoff guess, and confirmed the queue position (30 of 100) is
+available to the status bar. Phase 4 confirmed that abort ends a hold and does
+not keep retrying behind the operator.
+
+`node scripts/dogfood-narrator.ts` passed, making the panel's narrator produce a
+real narrative from a live model for the first time — the one part of the panel
+that had never been observed working, and whose failures `Narrator` swallows by
+design. The first run exposed output cut mid-word at exactly 400 characters;
+narratives are now cut at a sentence boundary.
+
+`node scripts/dogfood-roadmap.ts` passed the incomplete → verified → invalidated
+→ reverified lifecycle in a disposable repository.
+
+## Defects found by testing against a real registry
+
+Unit tests against fake registries passed while three real defects stood:
+
+1. `registerProvider(id, config)` deletes a provider previously registered via
+   `registerNativeProvider` (`model-runtime.js:562`). Verified live: a built-in
+   keeps all fourteen of its models across the call, a native extension provider
+   loses every one, silently and with no composition error. The installer would
+   have emptied another extension's catalogue as a side effect of adding retry.
+2. The wait-escalation ladder was scoped to a single `pumpWithGatewayRetry`
+   call, so it restarted at the base wait on every tool round-trip.
+3. Resetting that ladder from the returned outcome landed one microtask after
+   the stream's result resolved — after the agent loop had already issued its
+   next call.
+
+## Independent review
+
+<!-- filled in from the re-review -->
+
+## Repository release evidence
+
+Manual `dogfood` and `fresh_review` records are recorded against the
+implementation commit with paths `src/`, `extensions/`, `test/` — the scope that
+actually spans this delta. `scripts/record-roadmap-evidence.ts` previously
+hardcoded the review scope to `src/roadmap/`, `src/blackhole/`, `src/benchmark/`
+and `services/`, which would have produced a record that passes the gate's
+freshness check indefinitely while covering none of this work; `--paths` is now
+required and a documentation-only scope is rejected.
+
+No gate, required milestone or validation assertion is disabled for this work.
+
+## Known limits
+
+The intermittent `could not open '.git/worktrees/…/HEAD'` failure in
+`dag-parallel` is **not** explained. `git worktree prune` was confirmed to
+destroy the administrative directory of freshly created sibling worktrees, and
+the resulting breakage was demonstrated directly, so the hazard is real and has
+been removed; `dag-parallel` then ran 20/20 clean. But the exact reported
+message was never reproduced, so this is a plausible mechanism rather than a
+diagnosis, and the flake should be treated as open.
+
+Model fallback has been exercised against its decision table in tests, including
+the operator's real four-model catalogue, but no live session has yet been
+driven through an actual mid-session model switch under sustained saturation.

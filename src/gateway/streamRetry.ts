@@ -44,6 +44,24 @@ function isTerminal(type: string | undefined): boolean {
   return type === "done" || type === "error";
 }
 
+/**
+ * Does this terminal event carry a failure?
+ *
+ * Not the same question as `type === "error"`. A provider may deliver a failed
+ * turn as a `done` event whose message has `stopReason: "error"`, and treating
+ * only the `error` SHAPE as a failure meant such a saturation was forwarded —
+ * completing the stream — and then left to Pi's own three-attempt budget, so
+ * the turn could still die on exactly the gateway this module exists to wait
+ * out. Withholding it instead is equally safe: nothing has reached the sink yet,
+ * which is the only condition a retry needs.
+ */
+function carriesFailure<E extends RetryableEvent, R extends RetryableResult>(event: E): boolean {
+  if (event.type === "error") return true;
+  if (event.type !== "done") return false;
+  const message = (event as { message?: R }).message;
+  return message?.stopReason === "error";
+}
+
 /** The slice of pi's assistant event we need to reason about. */
 export interface RetryableEvent {
   type?: string;
@@ -188,8 +206,10 @@ export async function pumpWithGatewayRetry<E extends RetryableEvent, R extends R
       for await (const event of inner) {
         if (isTerminal(event.type)) {
           // Terminal events resolve the stream, so they are always the last
-          // thing we forward — and an error one is held until we have decided.
-          if (event.type === "error" && !forwarded) {
+          // thing we forward — and a failing one is held until we have decided.
+          // Both shapes count: `type: "error"`, and `done` carrying a message
+          // whose stopReason is "error".
+          if (!forwarded && carriesFailure<E, R>(event)) {
             withheld = event;
             continue;
           }

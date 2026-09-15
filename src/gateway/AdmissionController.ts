@@ -49,7 +49,7 @@ export interface AdmissionControllerOptions {
   /** Injected monotonic clock (ms). Default Date.now. */
   now?: () => number;
   /** Injected sleeper. Default setTimeout-based. */
-  sleep?: (ms: number) => Promise<void>;
+  sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
   /** Injected jitter source in [0,1). Default Math.random. */
   random?: () => number;
   /** Structured observation sink (telemetry/notices). */
@@ -95,8 +95,28 @@ export interface AdmissionSlot {
   release(): void;
 }
 
-const defaultSleep = (ms: number): Promise<void> =>
-  ms <= 0 ? Promise.resolve() : new Promise((resolve) => setTimeout(resolve, ms));
+/**
+ * Sleep that really stops when the caller aborts.
+ *
+ * The timer must be CLEARED, not merely raced against: a pending `setTimeout`
+ * keeps Node's event loop alive, so an operator who pressed escape during a
+ * 60-second hold and then quit would watch pi sit there until the timer they
+ * already cancelled finally expired.
+ */
+const defaultSleep = (ms: number, signal?: AbortSignal): Promise<void> => {
+  if (ms <= 0 || signal?.aborted) return Promise.resolve();
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    function onAbort(): void {
+      clearTimeout(timer);
+      resolve();
+    }
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+};
 
 export class AdmissionController {
   private readonly configuredMax: number;
@@ -106,7 +126,7 @@ export class AdmissionController {
   private readonly jitterMs: number;
   private readonly successesToRelax: number;
   private readonly now: () => number;
-  private readonly sleep: (ms: number) => Promise<void>;
+  private readonly sleep: (ms: number, signal?: AbortSignal) => Promise<void>;
   private readonly random: () => number;
   private readonly onEvent: ((event: AdmissionEvent) => void) | undefined;
 
@@ -214,7 +234,11 @@ export class AdmissionController {
 
   /** Sleep, returning early (without throwing) if the caller is aborted. */
   private sleepOrAbort(ms: number, signal: AbortSignal | undefined): Promise<void> {
-    const sleeping = this.sleep(ms);
+    // The signal is handed to the sleep itself so the timer can be cleared.
+    // Racing a promise against the abort would resolve this caller promptly but
+    // leave the timer pending, and a pending timer keeps Node's event loop
+    // alive — an aborted 60s hold would delay process exit by the full 60s.
+    const sleeping = this.sleep(ms, signal);
     if (!signal) return sleeping;
     return new Promise<void>((resolve) => {
       let settled = false;
@@ -225,7 +249,6 @@ export class AdmissionController {
         resolve();
       };
       signal.addEventListener("abort", finish, { once: true });
-      // The timer is left to expire on its own; it holds nothing but itself.
       void sleeping.then(finish, finish);
     });
   }

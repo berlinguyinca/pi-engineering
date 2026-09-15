@@ -42,6 +42,7 @@ export type {
 export {
   DEFAULT_WAIT_MS,
   decideGatewayRetry,
+  isAccountWideRefusal,
   describeGatewayWait,
   parseGatewayWait,
   parseRetryAfterHeader,

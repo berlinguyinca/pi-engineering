@@ -9,7 +9,7 @@ import { registerInteractiveMemory } from "../src/blackhole/interactiveMemory.ts
 import { sharedAdmissionController, sharedGatewayConfig } from "../src/gateway/config.ts";
 import { type FallbackCandidate, chooseFallbackModel } from "../src/gateway/fallback.ts";
 import { installGatewayStreamRetry, installedGatewayStreamRetries } from "../src/gateway/installStreamRetry.ts";
-import { describeGatewayWait, parseGatewayWait } from "../src/gateway/signals.ts";
+import { describeGatewayWait, isAccountWideRefusal, parseGatewayWait } from "../src/gateway/signals.ts";
 import { renderGatewayReport } from "../src/gateway/statusReport.ts";
 import { GitRepo } from "../src/git/GitRepo.ts";
 import { GenerationGuard } from "../src/guard/GenerationGuard.ts";
@@ -367,7 +367,12 @@ ${RECOVERY_PROMPT}`;
     pi.on("after_provider_response", async (event) => {
       if (event.status !== 429) return;
       const signal = parseGatewayWait({ status: event.status, headers: event.headers });
-      if (signal?.retryable) admission.noteWait(signal);
+      // A 429 is a statement about the account, so it parks everyone. Scoped
+      // through the same predicate as the other two paths rather than by hand.
+      if (signal?.retryable) {
+        if (isAccountWideRefusal(signal)) admission.noteWait(signal);
+        else admission.noteObservedWait(signal);
+      }
     });
 
     // Pi's own session retry stops after `retry.maxRetries` (default 3),
@@ -380,13 +385,10 @@ ${RECOVERY_PROMPT}`;
     // Terminal assistant error: the only place `retry_after_ms` appears, since
     // it lives in the response BODY.
     //
-    // Scoped the same way as the wrapper below, which a fresh-context review
-    // caught this path contradicting: an advertised admission refusal speaks
-    // for the account and parks everyone, while a bare 503 speaks for one model
-    // and is only recorded. Arming a process-wide cooldown from a single
-    // model's outage stalls workers on models that are answering fine — the
-    // exact failure the wrapper's scoping exists to avoid, and a rule stated in
-    // one place and broken in another is not a rule.
+    // Scoped through `isAccountWideRefusal`, the same predicate the wrapper and
+    // `after_provider_response` use. Two fresh-context reviews caught this
+    // family of paths disagreeing with each other; a rule stated in one place
+    // and broken in another is not a rule, so all three now ask one function.
     pi.on("message_end", async (event, ctx) => {
       const msg = event.message as { role?: string; stopReason?: string; errorMessage?: string } | undefined;
       if (msg?.role !== "assistant" || msg.stopReason !== "error" || !msg.errorMessage) return;
@@ -461,17 +463,23 @@ ${RECOVERY_PROMPT}`;
         { provider: model.provider, api: model.api },
         {
           createStream: () => createAssistantMessageEventStream() as never,
-          // Scope decides which gate. An advertised admission refusal
-          // (`source: "body"` — `retry_after_ms`, `active_limit`, a queue
-          // position) speaks for the whole account, so it parks every caller in
-          // the process behind one cooldown. A bare `503 no worker for model`
-          // speaks for one model: parking workers on healthy models behind it
-          // would turn one model's outage into a runtime-wide stall. Either way
-          // the wait is emitted, so the footer keeps its spinner and countdown.
+          // Scope decides which gate, keyed on what the refusal is ABOUT. A
+          // 429 or an admission envelope speaks for the account — a shared
+          // queue, a concurrency ceiling — so it parks every caller behind one
+          // cooldown. A `503 no worker for model` speaks for one model, and
+          // parking workers on healthy models behind it would turn one model's
+          // outage into a runtime-wide stall. Either way the wait is emitted,
+          // so the footer keeps its spinner and countdown.
           hold: async (waitSignal, _attempt, abort) => {
             const opts = abort ? { signal: abort } : {};
-            if (waitSignal.source === "body") await admission.noteWaitAndSleep(waitSignal, opts);
+            if (isAccountWideRefusal(waitSignal)) await admission.noteWaitAndSleep(waitSignal, opts);
             else await admission.noteCallerWaitAndSleep(waitSignal, opts);
+          },
+          // "Consecutive" has to mean consecutive: without this the counter
+          // accumulated across a whole session and would eventually trip a
+          // fallback on unrelated, widely separated holds.
+          onProgress: () => {
+            consecutiveGatewayHolds = 0;
           },
           onHold: () => {
             consecutiveGatewayHolds++;

@@ -242,6 +242,21 @@ export type GatewayRetryDecision =
  * answer, and claiming it here would take a 503 away from the mechanism built
  * for it.
  */
+export function isAccountWideRefusal(signal: GatewayWaitSignal): boolean {
+  // 429 and the gateway's own admission envelope are statements about the
+  // ACCOUNT: a shared queue, a concurrency ceiling, a position in line. Holding
+  // every caller behind them is the point.
+  //
+  // A 5xx — `503 no worker for model` above all — is a statement about ONE
+  // model. Parking the whole process behind it stalls workers on models that
+  // are answering perfectly well.
+  //
+  // Keyed on what the refusal is ABOUT, not on where its number came from: an
+  // earlier version discriminated on `source === "body"`, which put a 429
+  // carrying only a `Retry-After` header on the wrong side of the line.
+  return signal.status === 429 || signal.type === "inference_admission" || signal.reason === "queue_timeout";
+}
+
 export function isGatewayAdmissionRefusal(errorText: string | undefined): boolean {
   if (!errorText) return false;
   const signal = parseGatewayWait({ text: errorText });

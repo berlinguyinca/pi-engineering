@@ -384,36 +384,48 @@ test("stream retry: a withheld error alone is not progress", async () => {
   assert.ok(h.seen[1]!.ms > h.seen[0]!.ms, "the ladder kept climbing through the retries");
 });
 
-test("stream retry: a terminal 'done' carrying an error is not retried behind the sink's back", () => {
-  // Found by fresh-context review. The retry guard tracked only NON-terminal
-  // events, while only `type: "error"` terminal events were withheld. A `done`
-  // event whose message failed therefore reached the sink — completing the
-  // stream, since AssistantMessageEventStream resolves on the first terminal
-  // event — and was then retried anyway. That retry's output is dropped by the
-  // completed stream, so it burns a provider call the operator never sees while
-  // the failure they DO see is already final.
+test("stream retry: a saturation delivered as 'done' is waited out like any other", () => {
+  // Found by fresh-context review. A provider may report a failed turn as a
+  // `done` event whose message has stopReason "error". Treating only the
+  // `error` SHAPE as a failure forwarded this one — completing the stream —
+  // and left the turn to Pi's three-attempt budget, so it could still die on
+  // exactly the gateway this module exists to wait out.
   const doneButFailed: Ev = { type: "done", message: { stopReason: "error", errorMessage: SATURATED } };
-  const s = scripted([[doneButFailed], [done()]]);
+  const s = scripted([[doneButFailed], [text("recovered"), done()]]);
   const out = sink();
   const h = holds();
 
-  return pumpWithGatewayRetry(s.open, out, { hold: h.hold }).then((outcome) => {
-    assert.equal(s.opened, 1, "the sink was already completed — a retry could not reach it");
-    assert.equal(h.seen.length, 0);
-    assert.equal(outcome.attempts, 1);
+  return pumpWithGatewayRetry(s.open, out, { hold: h.hold }).then(() => {
+    assert.equal(s.opened, 2, "the failure was retried, whichever shape it arrived in");
+    assert.equal(h.seen.length, 1);
+    assert.equal(out.ended?.stopReason, "stop");
+    assert.equal(
+      out.pushed.some((e) => e.message?.stopReason === "error"),
+      false,
+      "the withheld failure never reached the transcript",
+    );
   });
 });
 
-test("stream retry: emitting any terminal event commits the attempt", () => {
-  // The general form of the rule above: once anything reaches the sink, the
-  // attempt is the answer, whatever it says.
-  const s = scripted([
-    [{ type: "done", message: { stopReason: "error", errorMessage: "503 no worker for model" } }],
-    [done()],
-  ]);
+test("stream retry: a 'done' failure AFTER output is still not retried", () => {
+  // The transcript-safety rule is unchanged: once content is out, the attempt
+  // is the answer whatever shape its ending takes.
+  const doneButFailed: Ev = { type: "done", message: { stopReason: "error", errorMessage: SATURATED } };
+  const s = scripted([[text("partial"), doneButFailed], [done()]]);
+  const out = sink();
+
+  return pumpWithGatewayRetry(s.open, out, { hold: holds().hold }).then(() => {
+    assert.equal(s.opened, 1);
+    assert.equal(out.ended?.stopReason, "error");
+  });
+});
+
+test("stream retry: a successful 'done' is never withheld", () => {
+  const s = scripted([[text("hi"), done()]]);
   const out = sink();
   return pumpWithGatewayRetry(s.open, out, { hold: holds().hold }).then(() => {
-    assert.equal(out.pushed.length, 1);
-    assert.equal(out.endCalls, 1);
+    assert.equal(s.opened, 1);
+    assert.equal(out.ended?.stopReason, "stop");
+    assert.equal(out.pushed.at(-1)?.type, "done");
   });
 });

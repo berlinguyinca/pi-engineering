@@ -59,6 +59,11 @@ export interface InstallDeps<M, O> {
    */
   hold(signal: GatewayWaitSignal, attempt: number, abort: AbortSignal | undefined): Promise<void>;
   onHold?: GatewayStreamRetryOptions["onHold"];
+  /**
+   * Called when a stream first produces output. Exposed so a caller keeping its
+   * own consecutive-hold count resets it on the same evidence this module does.
+   */
+  onProgress?: () => void;
   /** Turn a thrown transport failure into an assistant error message. */
   errorMessage(model: M, error: unknown): RetryableResult;
   /** Read the turn's abort signal off the provider options. */
@@ -137,6 +142,7 @@ export function installGatewayStreamRetry<M, C, O>(
       // provider call before a `.then` on this pump would run.
       onProgress: () => {
         consecutiveHolds = 0;
+        deps.onProgress?.();
       },
       ...(deps.onHold ? { onHold: deps.onHold } : {}),
       ...(signal ? { signal } : {}),
