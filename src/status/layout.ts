@@ -14,7 +14,7 @@
 
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { StatusBarConfig } from "./config.ts";
-import type { HarnessStatusState, WaitState } from "./state.ts";
+import type { HarnessStatusState, TaskState, WaitState } from "./state.ts";
 
 const SEP = " │ ";
 
@@ -78,6 +78,10 @@ function renderUnsafe(state: HarnessStatusState, width: number, config: StatusBa
   if (config.showThroughput && throughputFull) {
     full.push({ text: throughputFull, priority: 5 });
     short.push({ text: throughputShort ?? throughputFull, priority: 5 });
+  }
+  if (config.showTask && state.task) {
+    full.push({ text: formatTask(state.task, 32), priority: 6 });
+    short.push({ text: formatTask(state.task, 0), priority: 6 });
   }
   if (config.showWait && state.wait) {
     const wait = formatWait(state.wait, nowMs);
@@ -161,6 +165,17 @@ function formatThroughput(state: HarnessStatusState, full: boolean, config: Stat
   if (rate == null) return null; // unavailable / nothing to show
   if (full) return `⚡ ${rate.toFixed(1)} t/s`;
   return `⚡${Math.round(rate)} t/s`;
+}
+
+/**
+ * "WI-12 implement · add retry to the gateway" — the abbreviated form drops the
+ * goal label, which is the first part worth losing under width pressure.
+ */
+function formatTask(task: TaskState, labelBudget: number): string {
+  const head = `${task.workItemId} ${task.phase}`;
+  if (labelBudget <= 0 || !task.label) return head;
+  const label = task.label.length > labelBudget ? task.label.slice(0, labelBudget).trimEnd() : task.label;
+  return `${head} · ${label}`;
 }
 
 /**

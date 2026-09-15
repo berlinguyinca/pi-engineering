@@ -184,3 +184,42 @@ test("wait: showWait=false hides the segment even while waiting", () => {
   });
   assert.doesNotMatch(renderStatus(s, 200, config, 0), /⏳/);
 });
+
+// ─── Task segment (the work item in flight) ─────────────────────────────────
+
+test("task: names the work item and phase", () => {
+  const s = state({ task: { workItemId: "WI-12", phase: "implement" } });
+  assert.match(renderStatus(s, 200, cfg, 0), /WI-12 implement/);
+});
+
+test("task: appends a truncated goal label when there is room", () => {
+  const s = state({
+    task: { workItemId: "WI-12", phase: "implement", label: "add retry to the gateway client for real" },
+  });
+  const line = renderStatus(s, 200, cfg, 0);
+  assert.match(line, /WI-12 implement · add retry to the gateway/);
+  assert.doesNotMatch(line, /for real/);
+});
+
+test("task: outlives model and throughput but not the wait", () => {
+  const s = state({
+    throughput: { phase: "streaming", currentTokensPerSecond: 247 },
+    task: { workItemId: "WI-12", phase: "implement" },
+    wait: { kind: "gateway", detail: "queue_timeout", untilMs: 30_000 },
+  });
+  const line = renderStatus(s, 50, cfg, 0);
+  assert.match(line, /WI-12 implement/);
+  assert.match(line, /gateway/);
+  assert.doesNotMatch(line, /qwen3\.8-27b/);
+  assert.ok(visibleWidth(line) <= 50, `line too wide: ${visibleWidth(line)}`);
+});
+
+test("task: no task renders no task segment", () => {
+  assert.doesNotMatch(renderStatus(state(), 200, cfg, 0), /WI-/);
+});
+
+test("task: showTask=false hides the segment", () => {
+  const config: StatusBarConfig = { ...DEFAULT_STATUS_BAR_CONFIG, showTask: false };
+  const s = state({ task: { workItemId: "WI-12", phase: "implement" } });
+  assert.doesNotMatch(renderStatus(s, 200, config, 0), /WI-12/);
+});
