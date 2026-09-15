@@ -25,7 +25,11 @@ function model(id: string, contextWindow: number, over: Partial<FallbackCandidat
   };
 }
 
-// The operator's actual catalogue.
+// Model ids from a real gateway, with context sizes chosen to exercise the
+// decision table. NOTE these are not that gateway's live numbers: it reports
+// 262,144 for deepseek-v4-flash, not 1,048,576. The local config said 1,048,576
+// and was wrong, which is what /refresh-models exists to fix — see
+// test/unit/models-catalog.test.ts for the real values.
 const FLASH = model("deepseek-v4-flash", 1_048_576);
 const QWEN_27B = model("qwen3.8-27b", 262_144);
 const QWEN_NEXT = model("qwen3.8-flash-next", 262_144);

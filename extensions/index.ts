@@ -16,6 +16,8 @@ import { GenerationGuard } from "../src/guard/GenerationGuard.ts";
 import { RECOVERY_PROMPT, TOOL_TRANSITION_RULE, buildDegenerationEvent } from "../src/guard/RecoveryController.ts";
 import { resolveGuardConfig } from "../src/guard/config.ts";
 import { guardFeedFor } from "../src/guard/streamText.ts";
+import { defaultModelsPath } from "../src/models/modelsConfig.ts";
+import { refreshProviderModels } from "../src/models/refresh.ts";
 import { PanelController } from "../src/panel/PanelController.ts";
 import { PanelState } from "../src/panel/PanelState.ts";
 import { readDiffContent, readFileContent } from "../src/panel/content.ts";
@@ -325,6 +327,56 @@ ${RECOVERY_PROMPT}`;
   // model caller in this process — the worker sessions AND this interactive
   // turn — behind one shared cooldown until the reported wait has elapsed.
   const gatewayConfig = sharedGatewayConfig();
+
+  // ─── /refresh-models: make the configured catalogue match the gateway ────
+  // Model configuration drifts silently and expensively. Measured against a
+  // live gateway, a working models.json had one model configured at 1,048,576
+  // tokens that the gateway caps at 262,144, another at 131,072 that actually
+  // accepts 250,112, and a model missing entirely. The over-statement is the
+  // damaging direction: Pi fills the context believing it fits, the request
+  // fails, and because Pi computes usage from the configured window, compaction
+  // fires far too late to save the turn.
+  pi.registerCommand("refresh-models", {
+    description: "Refresh models.json from the provider's gateway (names, context sizes). --dry-run to preview.",
+    handler: async (args: string, ctx: ExtensionCommandContext) => {
+      const argv = (args ?? "").trim().split(/\s+/).filter(Boolean);
+      const dryRun = argv.includes("--dry-run");
+      const pruneMissing = argv.includes("--prune");
+      const model = ctx.model;
+      const providerId = argv.find((a) => !a.startsWith("--")) ?? model?.provider;
+      if (!providerId) {
+        ctx.ui.notify("No provider to refresh. Select a model first, or pass a provider name.", "warning");
+        return;
+      }
+
+      // Resolve auth through the registry rather than reading the key here, so
+      // the credential is never handled by this extension directly.
+      let apiKey: string | undefined;
+      try {
+        const resolved = model ? await ctx.modelRegistry?.getApiKeyAndHeaders(model) : undefined;
+        if (resolved?.ok) apiKey = resolved.apiKey;
+      } catch {
+        // Fall through unauthenticated; the gateway decides whether that works.
+      }
+
+      try {
+        const result = await refreshProviderModels({
+          modelsPath: defaultModelsPath(),
+          providerId,
+          ...(apiKey ? { apiKey } : {}),
+          ...(dryRun ? { dryRun: true } : {}),
+          ...(pruneMissing ? { pruneMissing: true } : {}),
+          ...(ctx.signal ? { signal: ctx.signal } : {}),
+        });
+        ctx.ui.notify(result.lines.join("\n"), result.plan.dirty && !dryRun ? "info" : "info");
+      } catch (err) {
+        ctx.ui.notify(
+          `refresh-models failed: ${err instanceof Error ? err.message : String(err)}. Your configuration was not changed.`,
+          "error",
+        );
+      }
+    },
+  });
 
   // Registered outside the `pi.on` guard below: a command needs only
   // `registerCommand`, and burying it in there meant it never appeared in a
