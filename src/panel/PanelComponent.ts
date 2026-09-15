@@ -12,6 +12,7 @@ import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { PanelState } from "./PanelState.ts";
 import type { ContentView } from "./content.ts";
 import { DEFAULT_LAYOUT, type PanelLayout, type PanelTabId, stepTab, stepWidth } from "./layout.ts";
+import { type SearchState, findMatches, stepMatch } from "./search.ts";
 import { type PanelRow, type RowPayload, buildRows, clampSelection, renderTabBar } from "./tree.ts";
 
 /** Sections start open: the panel is most useful showing everything at once. */
@@ -24,6 +25,8 @@ const KEY_LEFT = "\x1b[D";
 const KEY_ESCAPE = "\x1b";
 const KEY_TAB = "\t";
 const KEY_SHIFT_TAB = "\x1b[Z";
+const KEY_BACKSPACE = "\x7f";
+const KEY_ENTER = "\r";
 
 export interface PanelComponentOptions {
   state: PanelState;
@@ -58,6 +61,9 @@ export class PanelComponent {
   private currentRows: PanelRow[] = [];
   private selection = 0;
   private content: ContentView | null = null;
+  private search: SearchState | null = null;
+  /** Committed matches, so `n`/`N` keep working after the prompt closes. */
+  private lastSearch: { matches: number[]; index: number } | null = null;
   private disposed = false;
 
   constructor(opts: PanelComponentOptions) {
@@ -132,6 +138,13 @@ export class PanelComponent {
       return;
     }
 
+    // While the prompt is open every key belongs to the query, so a tab or an
+    // arrow types/edits rather than navigating.
+    if (this.search) {
+      this.handleSearchInput(data);
+      return;
+    }
+
     switch (data) {
       case KEY_TAB:
         this.changeTab(1);
@@ -158,6 +171,15 @@ export class PanelComponent {
         return;
       case KEY_LEFT:
         this.collapse();
+        return;
+      case "/":
+        this.openSearch();
+        return;
+      case "n":
+        this.jumpMatch(1);
+        return;
+      case "N":
+        this.jumpMatch(-1);
         return;
       case KEY_ESCAPE:
         this.onClose?.();
@@ -189,7 +211,9 @@ export class PanelComponent {
       const glyph = row.glyph ? `${row.glyph} ` : "";
       return truncateToWidth(`${cursor}${indent}${glyph}${row.label}`, width, "…");
     });
-    return [renderTabBar(this.activeTab, width), ...body];
+    const lines = [renderTabBar(this.activeTab, width), ...body];
+    if (this.search) lines.push(truncateToWidth(`/${this.search.query}`, width, "…"));
+    return lines;
   }
 
   private renderContent(width: number): string[] {
@@ -226,6 +250,75 @@ export class PanelComponent {
     if (next === this.width) return;
     this.width = next;
     this.publishLayout();
+    this.requestRenderFn();
+  }
+
+  // ─── Search ───────────────────────────────────────────────────────────────
+
+  private openSearch(): void {
+    this.refreshRows();
+    this.search = { query: "", matches: [], index: -1, restoreSelection: this.selection };
+    this.requestRenderFn();
+  }
+
+  private handleSearchInput(data: string): void {
+    const search = this.search;
+    if (!search) return;
+
+    if (data === KEY_ESCAPE) {
+      // Cancelling restores the cursor: a search the operator abandoned must
+      // not have moved them.
+      this.selection = clampSelection(this.currentRows, search.restoreSelection);
+      this.search = null;
+      this.requestRenderFn();
+      return;
+    }
+    if (data === KEY_ENTER) {
+      this.commitSearch();
+      return;
+    }
+    if (data === KEY_BACKSPACE) {
+      search.query = search.query.slice(0, -1);
+      this.recomputeMatches();
+      return;
+    }
+    // Printable text only: control sequences are not query characters.
+    if (data.length === 1 && data >= " " && data !== "\x7f") {
+      search.query += data;
+      this.recomputeMatches();
+    }
+  }
+
+  private recomputeMatches(): void {
+    const search = this.search;
+    if (!search) return;
+    search.matches = findMatches(this.currentRows, search.query);
+    search.index = search.matches.length > 0 ? 0 : -1;
+    this.requestRenderFn();
+  }
+
+  /** Close the prompt, keeping the matches so `n`/`N` can walk them. */
+  private commitSearch(): void {
+    const search = this.search;
+    if (!search) return;
+    const target = search.matches[0];
+    if (target !== undefined) {
+      this.selection = clampSelection(this.currentRows, target);
+      this.lastSearch = { matches: search.matches, index: 0 };
+    }
+    this.search = null;
+    this.requestRenderFn();
+  }
+
+  private jumpMatch(direction: -1 | 1): void {
+    const last = this.lastSearch;
+    if (!last || last.matches.length === 0) return;
+    const next = stepMatch(last.matches, last.index, direction);
+    if (next < 0) return;
+    last.index = next;
+    const row = last.matches[next];
+    if (row === undefined) return;
+    this.selection = clampSelection(this.currentRows, row);
     this.requestRenderFn();
   }
 
