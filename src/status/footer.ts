@@ -14,10 +14,11 @@
 
 import type { ExtensionContext, ReadonlyFooterDataProvider, Theme } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth } from "@earendil-works/pi-tui";
+import type { AdmissionEvent } from "../gateway/AdmissionController.ts";
 import type { StatusBarConfig } from "./config.ts";
 import { GitContextProvider } from "./git-context.ts";
 import { renderStatus } from "./layout.ts";
-import { type HarnessStatusState, StatusState } from "./state.ts";
+import { type HarnessStatusState, StatusState, type TaskState, type WaitState } from "./state.ts";
 import { ThroughputTracker } from "./throughput.ts";
 
 interface ModelInfo {
@@ -28,6 +29,13 @@ interface ModelInfo {
 function modelInfo(model: { provider?: string; id?: string } | undefined): ModelInfo {
   return model ? { provider: model.provider, id: model.id } : {};
 }
+
+/**
+ * Countdown/spinner tick. Fast enough to animate the spinner (the layout
+ * derives its frame from the clock), slow enough that a multi-minute hold is
+ * not a render storm.
+ */
+const WAIT_TICK_MS = 250;
 
 /** Extract streamed text from a message_update assistant event. */
 function extractDelta(event: unknown): string {
@@ -68,6 +76,13 @@ export class FooterController {
   private disposed = false;
   private renderRequest: (() => void) | undefined;
   private renderTimer: ReturnType<typeof setTimeout> | null = null;
+  private waitTimer: ReturnType<typeof setInterval> | null = null;
+  /**
+   * The session's own model, tracked across `model_select`. `ctx.model` is a
+   * snapshot taken when the controller was constructed, so it goes stale the
+   * moment the user switches models mid-session.
+   */
+  private sessionModel: string | undefined;
   private lastRenderAt = 0;
   private readonly unsubs: Array<() => void> = [];
 
@@ -88,6 +103,7 @@ export class FooterController {
     });
 
     const m = modelInfo(opts.ctx.model);
+    this.sessionModel = m.id;
     this.status.set({ model: m.id, provider: m.provider });
 
     // Own the footer. This is the harness's single footer ownership point.
@@ -142,12 +158,94 @@ export class FooterController {
   onModelSelect(model: { provider?: string; id?: string } | undefined): void {
     if (this.disposed) return;
     const m = modelInfo(model);
+    this.sessionModel = m.id;
     this.throughput.reset();
     this.status.set({
       model: m.id,
       provider: m.provider,
       throughput: this.throughput.snapshot(),
     });
+    this.requestRender();
+  }
+
+  /**
+   * Translate a gateway admission event into footer wait state.
+   *
+   * Only `wait` events carry a deadline; clamp/relax change concurrency, which
+   * is not something the operator needs in the footer.
+   */
+  onGatewayEvent(event: AdmissionEvent): void {
+    if (this.disposed) return;
+    if (event.type !== "wait") return;
+    const signal = event.signal;
+    this.setWait({
+      kind: "gateway",
+      detail: signal.reason ?? signal.type ?? String(signal.status ?? 429),
+      untilMs: this.now() + event.waitMs,
+      // Queue depth is what the footer shows instead of the 429 body: it is
+      // the one number that says whether the hold is going anywhere.
+      ...(signal.queued !== undefined ? { queued: signal.queued } : {}),
+      ...(signal.queueLimit !== undefined ? { queueLimit: signal.queueLimit } : {}),
+    });
+  }
+
+  /** Publish (or clear) the wait, starting or stopping the countdown tick. */
+  setWait(wait: WaitState | undefined): void {
+    if (this.disposed) return;
+    this.status.set({ wait });
+    if (wait?.untilMs != null) this.startWaitTick();
+    else this.stopWaitTick();
+    this.requestRender();
+  }
+
+  /** Publish (or clear) the engineering task in flight. */
+  setTask(task: TaskState | undefined): void {
+    if (this.disposed) return;
+    this.status.set({ task });
+    this.requestRender();
+  }
+
+  /**
+   * Override the displayed model with the one actually producing tokens (a
+   * worker's model during an engineering run). Pass undefined to restore the
+   * session model, so the footer never keeps claiming a worker's model after
+   * the run is over.
+   */
+  setProducingModel(model: string | undefined): void {
+    if (this.disposed) return;
+    this.status.set({ model: model ?? this.sessionModel });
+    this.requestRender();
+  }
+
+  /**
+   * Clear the task, but only if `workItemId` is the one on display.
+   *
+   * Parallel tournament legs and DAG waves each own a runtime and each report
+   * their own settle, so an unconditional clear would blank the footer the
+   * moment the FIRST leg finished while the others were still running. The
+   * same guard covers a second run starting before the first one settles.
+   */
+  clearTask(workItemId: string): void {
+    if (this.disposed) return;
+    if (this.status.snapshot.task?.workItemId !== workItemId) return;
+    this.setTask(undefined);
+  }
+
+  /**
+   * Re-render the countdown; clears the wait once it has elapsed so the footer
+   * never shows a stale "0s" hold.
+   */
+  tickWait(): void {
+    if (this.disposed) return;
+    const wait = this.status.snapshot.wait;
+    if (!wait) {
+      this.stopWaitTick();
+      return;
+    }
+    if (wait.untilMs != null && this.now() >= wait.untilMs) {
+      this.status.set({ wait: undefined });
+      this.stopWaitTick();
+    }
     this.requestRender();
   }
 
@@ -176,6 +274,7 @@ export class FooterController {
     this.unsubs.length = 0;
     if (this.renderTimer) clearTimeout(this.renderTimer);
     this.renderTimer = null;
+    this.stopWaitTick();
     this.throughput.reset();
     this.git.invalidate();
     this.status.dispose();
@@ -185,7 +284,7 @@ export class FooterController {
   private renderLine(width: number, theme: Theme, footerData: ReadonlyFooterDataProvider): string[] {
     let line = "";
     try {
-      line = renderStatus(this.status.snapshot, width, this.config);
+      line = renderStatus(this.status.snapshot, width, this.config, this.now());
     } catch {
       line = "";
     }
@@ -198,6 +297,19 @@ export class FooterController {
       lines.push(theme.fg("muted", truncateToWidth(extensions, Math.max(0, width), "…")));
     }
     return lines;
+  }
+
+  /** One tick per second while a deadline is live: only the countdown moves. */
+  private startWaitTick(): void {
+    if (this.waitTimer) return;
+    this.waitTimer = setInterval(() => this.tickWait(), WAIT_TICK_MS);
+    this.waitTimer.unref?.();
+  }
+
+  private stopWaitTick(): void {
+    if (!this.waitTimer) return;
+    clearInterval(this.waitTimer);
+    this.waitTimer = null;
   }
 
   private publishThroughput(): void {

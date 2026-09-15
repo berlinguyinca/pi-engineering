@@ -14,7 +14,7 @@
 
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { StatusBarConfig } from "./config.ts";
-import type { HarnessStatusState } from "./state.ts";
+import type { HarnessStatusState, TaskState, WaitState } from "./state.ts";
 
 const SEP = " │ ";
 
@@ -29,15 +29,20 @@ export interface RenderSegment {
  * Render the status line. Returns a plain string (no ANSI); the footer layer
  * applies theme styling. Never throws — on any unexpected input returns "".
  */
-export function renderStatus(state: HarnessStatusState, width: number, config: StatusBarConfig): string {
+export function renderStatus(
+  state: HarnessStatusState,
+  width: number,
+  config: StatusBarConfig,
+  nowMs: number = Date.now(),
+): string {
   try {
-    return renderUnsafe(state, width, config);
+    return renderUnsafe(state, width, config, nowMs);
   } catch {
     return "";
   }
 }
 
-function renderUnsafe(state: HarnessStatusState, width: number, config: StatusBarConfig): string {
+function renderUnsafe(state: HarnessStatusState, width: number, config: StatusBarConfig, nowMs: number): string {
   const maxWidth = Math.max(0, width);
 
   const throughputFull = formatThroughput(state, true, config);
@@ -74,6 +79,15 @@ function renderUnsafe(state: HarnessStatusState, width: number, config: StatusBa
     full.push({ text: throughputFull, priority: 5 });
     short.push({ text: throughputShort ?? throughputFull, priority: 5 });
   }
+  if (config.showTask && state.task) {
+    full.push({ text: formatTask(state.task, 32), priority: 6 });
+    short.push({ text: formatTask(state.task, 0), priority: 6 });
+  }
+  if (config.showWait && state.wait) {
+    const wait = formatWait(state.wait, nowMs);
+    full.push({ text: wait, priority: 7 });
+    short.push({ text: wait, priority: 7 });
+  }
 
   // Progressive elision: try each stage until it fits.
   const stages: RenderSegment[][] = [];
@@ -84,13 +98,19 @@ function renderUnsafe(state: HarnessStatusState, width: number, config: StatusBa
   stages.push(short.filter((s) => s.priority >= 2));
   stages.push(short.filter((s) => s.priority >= 3));
   stages.push(short.filter((s) => s.priority >= 4));
+  // Then model, then throughput, then the task — the wait reason outlives all
+  // of them, because it is the only segment that explains an idle session.
+  stages.push(short.filter((s) => s.priority >= 5));
+  stages.push(short.filter((s) => s.priority >= 6));
+  stages.push(short.filter((s) => s.priority >= 7));
 
   for (const stage of stages) {
     const line = assemble(stage);
     if (visibleWidth(line) <= maxWidth) return line;
   }
 
-  // Irreducible core (model + tps). Truncate as a last resort so it never wraps.
+  // Irreducible core (the wait reason, else model + tps). Truncate as a last
+  // resort so the line never wraps.
   const core = assemble(stages[stages.length - 1]!);
   if (visibleWidth(core) <= maxWidth) return core;
   return truncateToWidth(core, maxWidth, "…");
@@ -145,6 +165,50 @@ function formatThroughput(state: HarnessStatusState, full: boolean, config: Stat
   if (rate == null) return null; // unavailable / nothing to show
   if (full) return `⚡ ${rate.toFixed(1)} t/s`;
   return `⚡${Math.round(rate)} t/s`;
+}
+
+/**
+ * "WI-12 implement · add retry to the gateway" — the abbreviated form drops the
+ * goal label, which is the first part worth losing under width pressure.
+ */
+function formatTask(task: TaskState, labelBudget: number): string {
+  const head = `${task.workItemId} ${task.phase}`;
+  if (labelBudget <= 0 || !task.label) return head;
+  const label = task.label.length > labelBudget ? task.label.slice(0, labelBudget).trimEnd() : task.label;
+  return `${head} · ${label}`;
+}
+
+/**
+ * "⏳ gateway 30s · queue_timeout" — rendered at the highest priority, so it is
+ * the last segment standing as the terminal narrows.
+ */
+/**
+ * Spinner frames for a hold. A still glyph reads as a hang, and a hold can now
+ * run for minutes (the gateway budget is unlimited), so the segment has to look
+ * alive. The frame is derived from the clock rather than an internal counter so
+ * `renderStatus` stays pure.
+ */
+const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const SPINNER_PERIOD_MS = 250;
+
+function spinnerFrame(nowMs: number): string {
+  const index = Math.floor(Math.max(0, nowMs) / SPINNER_PERIOD_MS) % SPINNER_FRAMES.length;
+  return SPINNER_FRAMES[index] ?? SPINNER_FRAMES[0]!;
+}
+
+function formatWait(wait: WaitState, nowMs: number): string {
+  const parts: string[] = [wait.kind];
+  if (wait.untilMs != null) {
+    const remainingMs = Math.max(0, wait.untilMs - nowMs);
+    parts.push(`${Math.ceil(remainingMs / 1000)}s`);
+  }
+  const head = parts.join(" ");
+  // Queue position beats the reason: it answers "is this moving?", which the
+  // reason ("queue_timeout") never does.
+  const detail =
+    wait.queued != null ? `queue ${wait.queued}${wait.queueLimit != null ? `/${wait.queueLimit}` : ""}` : wait.detail;
+  const spinner = spinnerFrame(nowMs);
+  return detail ? `${spinner} ${head} · ${detail}` : `${spinner} ${head}`;
 }
 
 let cachedHome: string | undefined;

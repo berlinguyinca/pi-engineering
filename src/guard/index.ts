@@ -10,8 +10,11 @@ export {
   ModelDegenerationError,
   normalizeSentence,
   splitSentences,
+  splitCompleteSentences,
   initialGuardState,
 } from "./GenerationGuard.ts";
+export { assistantMessageText, guardFeedFor } from "./streamText.ts";
+export type { GuardFeed } from "./streamText.ts";
 export type { GuardDecision, GuardAbortReason, ProgressEventType, GenerationGuardState } from "./GenerationGuard.ts";
 export {
   RECOVERY_PROMPT,
@@ -32,8 +35,12 @@ export type {
   DegenerationEvent,
   RecoveryTelemetry,
 } from "./RecoveryController.ts";
-export { DEFAULT_GUARD_CONFIG, resolveGuardConfig } from "./config.ts";
-export type { GenerationGuardConfig } from "./config.ts";
+export {
+  DEFAULT_GUARD_CONFIG,
+  DEFAULT_INTERACTIVE_MAX_NO_PROGRESS_TOKENS,
+  resolveGuardConfig,
+} from "./config.ts";
+export type { GenerationGuardConfig, GuardProfile } from "./config.ts";
 export {
   TransientError,
   classifyError,

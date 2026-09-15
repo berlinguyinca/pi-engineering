@@ -10,6 +10,9 @@ import {
   createExtensionRuntime,
 } from "@earendil-works/pi-coding-agent";
 import type { WorkerResult, WorkerUsage } from "../core/types.ts";
+import type { AdmissionController } from "../gateway/AdmissionController.ts";
+import { type GatewayAdmissionConfig, sharedAdmissionController, sharedGatewayConfig } from "../gateway/config.ts";
+import { decideGatewayRetry, parseGatewayWait } from "../gateway/signals.ts";
 import { GenerationGuard, type GuardAbortReason } from "../guard/GenerationGuard.ts";
 import { TOOL_TRANSITION_RULE } from "../guard/RecoveryController.ts";
 import {
@@ -22,6 +25,7 @@ import {
   recordRetryOutcome,
 } from "../guard/RecoveryController.ts";
 import { type GenerationGuardConfig, resolveGuardConfig } from "../guard/config.ts";
+import { guardFeedFor } from "../guard/streamText.ts";
 import {
   type BackoffConfig,
   TransientError,
@@ -71,6 +75,12 @@ export interface PiWorkerExecutorOptions {
    * against `model.id` in the runtime's model list.
    */
   fallbackModelId?: string;
+  /**
+   * Gateway admission control. Defaults to the process-wide controller, so
+   * every worker in this process shares one backoff and one concurrency clamp.
+   */
+  admission?: AdmissionController;
+  gatewayConfig?: GatewayAdmissionConfig;
   /** Transient error retry/backoff configuration. Defaults to spec values. */
   transientConfig?: BackoffConfig;
   /** Injectable sleep for transient retries (deterministic in tests). */
@@ -94,6 +104,8 @@ export class PiWorkerExecutor implements WorkerExecutor {
   private readonly guardConfig: GenerationGuardConfig;
   private readonly fallbackModel: Model<any> | undefined;
   private readonly fallbackModelId: string | undefined;
+  private readonly admission: AdmissionController;
+  private readonly gatewayConfig: GatewayAdmissionConfig;
   private readonly transientConfig: BackoffConfig;
   private readonly transientSleep: (ms: number) => Promise<void>;
   private readonly transientRand: () => number;
@@ -112,6 +124,8 @@ export class PiWorkerExecutor implements WorkerExecutor {
     this.guardConfig = opts.guardConfig ?? resolveGuardConfig();
     this.fallbackModel = opts.fallbackModel;
     this.fallbackModelId = opts.fallbackModelId;
+    this.admission = opts.admission ?? sharedAdmissionController();
+    this.gatewayConfig = opts.gatewayConfig ?? sharedGatewayConfig();
     this.transientConfig = opts.transientConfig ?? resolveTransientRetryConfig();
     this.transientSleep = opts.transientSleep ?? ((ms) => new Promise<void>((r) => setTimeout(r, ms)));
     this.transientRand = opts.transientRand ?? Math.random;
@@ -191,27 +205,63 @@ ${TOOL_TRANSITION_RULE}`;
     let lastGuardReason: GuardAbortReason | undefined;
     let lastGuardDiagnostics: Record<string, unknown> = {};
     let lastAssistantError: string | undefined;
+    // Gateway backpressure is NOT degeneration: waiting out a reported
+    // `retry_after_ms` is bounded separately from the recovery ladder, which
+    // would otherwise burn attempts lowering reasoning effort and swapping
+    // models in response to a queue timeout.
+    const admission = this.admission;
+    const gatewayConfig = this.gatewayConfig;
+    let gatewayRetries = 0;
 
     while (true) {
-      // Transient infrastructure errors (503, 429, network, timeout, compaction)
-      // are retried automatically with bounded exponential backoff + jitter. A
-      // fresh session is created per retry (the failed session is discarded).
-      const transientOutcome = await withTransientRetry({
-        fn: (retryAttempt) =>
-          this.runSingleAttempt(req, model, systemPrompt, modelRuntime, customTools, tools, attempt),
-        config: this.transientConfig,
-        sleep: this.transientSleep,
-        rand: this.transientRand,
-      });
+      // Two retry layers, with a clean ownership split:
+      //
+      //   * the ADMISSION slot is held across the whole transient retry, because
+      //     a 503 retried three times is still one worker's turn at the gateway.
+      //     Re-acquiring per transient attempt would make a flaky provider look
+      //     like concurrency pressure;
+      //   * TRANSIENT retry (503, network, timeout, compaction) backs off
+      //     exponentially inside the slot, with a fresh session per attempt;
+      //   * GATEWAY saturation (429 inference_admission) is deliberately NOT a
+      //     transient category — see classifyError. It is handled below, where
+      //     the gateway's own advertised wait is honoured process-wide.
+      const slot = gatewayConfig.enabled ? await admission.acquire() : null;
+      let transientOutcome: Awaited<
+        ReturnType<typeof withTransientRetry<Awaited<ReturnType<typeof this.runSingleAttempt>>>>
+      >;
+      try {
+        transientOutcome = await withTransientRetry({
+          fn: () => this.runSingleAttempt(req, model, systemPrompt, modelRuntime, customTools, tools, attempt),
+          config: this.transientConfig,
+          sleep: this.transientSleep,
+          rand: this.transientRand,
+        });
+      } finally {
+        slot?.release();
+      }
 
       if (transientOutcome.error) {
-        // Transient retries were exhausted (or a non-retryable transport error).
         const te = transientOutcome.error;
+        const detail = te instanceof Error ? te.message : String(te);
+
+        // A gateway admission refusal arrives here as a NON-retryable transient
+        // error (classifyError hands it over rather than backing off against a
+        // wait it cannot read). Honour the wait the gateway actually reported
+        // and retry the same attempt, process-wide.
+        if (gatewayConfig.enabled) {
+          const handover = decideGatewayRetry(detail, gatewayRetries, gatewayConfig.maxRetries);
+          if (handover.action === "wait") {
+            gatewayRetries++;
+            await admission.noteWaitAndSleep(handover.signal);
+            continue;
+          }
+        }
+
+        // Transient retries were exhausted (or a non-retryable transport error).
         const category = transientOutcome.category ?? "permanent";
         recordTransientError(this.transientTelemetry, category);
         recordTransientOutcome(this.transientTelemetry, false, category);
         const attempts = transientOutcome.attempts;
-        const detail = te instanceof Error ? te.message : String(te);
         return {
           result: {
             status: "failed",
@@ -228,8 +278,18 @@ ${TOOL_TRANSITION_RULE}`;
         };
       }
 
-      const { session, guardAborted, guardReason, guardDiagnostics, captured, toolCalls, budgetExhausted, timedOut } =
-        transientOutcome.value!;
+      const {
+        session,
+        guardAborted,
+        guardReason,
+        guardDiagnostics,
+        captured,
+        toolCalls,
+        budgetExhausted,
+        timedOut,
+        assistantError,
+      } = transientOutcome.value!;
+      if (assistantError) lastAssistantError = assistantError;
 
       session.dispose();
 
@@ -238,17 +298,40 @@ ${TOOL_TRANSITION_RULE}`;
         if (attempt > 0) {
           recordRetryOutcome(this.recoveryTelemetry, true, false);
         }
+        if (gatewayConfig.enabled) admission.noteSuccess();
         const usage = this.collectUsage(this.asMessages(session.messages));
         return { result: captured, usage, toolCalls };
       }
 
+      // Gateway saturation: honour the wait the gateway reported, hold every
+      // other model caller in this process behind the same cooldown, and retry
+      // the SAME attempt (no recovery-ladder escalation).
+      if (gatewayConfig.enabled) {
+        const decision = decideGatewayRetry(assistantError, gatewayRetries, gatewayConfig.maxRetries);
+        if (decision.action === "wait") {
+          gatewayRetries++;
+          await admission.noteWaitAndSleep(decision.signal);
+          continue;
+        }
+      }
+
       if (!guardAborted || !this.guardConfig.enabled) {
-        // Non-guard failure (timeout, budget, no-result) — no recovery ladder.
+        // Non-guard failure (timeout, budget, gateway, no-result) — no recovery ladder.
+        const gateway = lastAssistantError ? parseGatewayWait({ text: lastAssistantError }) : null;
         const reason = budgetExhausted
           ? "Worker exceeded the hard context-token budget."
           : timedOut
             ? "Worker timed out."
-            : `Worker returned no worker_result.${lastAssistantError ? ` ${lastAssistantError}` : ""}`;
+            : gateway
+              ? `Model gateway refused the request after ${gatewayRetries} honoured wait(s): ${lastAssistantError}`
+              : `Worker returned no worker_result.${lastAssistantError ? ` ${lastAssistantError}` : ""}`;
+        const error = budgetExhausted
+          ? "budget-exhausted"
+          : timedOut
+            ? "timeout"
+            : gateway
+              ? `gateway:${gateway.reason ?? gateway.type ?? gateway.status ?? "rate-limited"}`
+              : (lastAssistantError ?? "no-result");
         return {
           result: {
             status: "failed",
@@ -257,11 +340,11 @@ ${TOOL_TRANSITION_RULE}`;
             evidence_refs: [],
             new_hypotheses: [],
             proposed_tasks: [],
-            details: {},
-            error: lastAssistantError ?? (budgetExhausted ? "budget-exhausted" : timedOut ? "timeout" : "no-result"),
+            details: gateway ? { gateway_wait: gateway, gateway_retries: gatewayRetries } : {},
+            error,
           },
           usage: this.collectUsage(this.asMessages(session.messages)),
-          error: lastAssistantError ?? (budgetExhausted ? "budget-exhausted" : timedOut ? "timeout" : "no-result"),
+          error,
           toolCalls,
         };
       }
@@ -378,6 +461,8 @@ ${recovery.recoveryPrompt}`;
     toolCalls: number;
     budgetExhausted: boolean;
     timedOut: boolean;
+    /** Terminal provider/gateway error text, when the model call itself failed. */
+    assistantError?: string;
   }> {
     const resourceLoader = roleResourceLoader(systemPrompt);
     const sessionManager = SessionManager.inMemory(req.cwd);
@@ -406,6 +491,10 @@ ${recovery.recoveryPrompt}`;
     let guardAborted = false;
     let guardReason: GuardAbortReason | undefined;
     let guardDiagnostics: Record<string, unknown> = {};
+    // Two distinct error channels, both needed: `assistantError` is the
+    // assistant MESSAGE's error (stopReason "error" — where a gateway 429 body
+    // arrives), `promptError` is a THROWN transport failure.
+    let assistantError: string | undefined;
     let promptError: unknown = undefined;
 
     // Generation guard (spec §6-§12).
@@ -442,12 +531,19 @@ ${recovery.recoveryPrompt}`;
         event.message !== null
       ) {
         enforceBudget(event.message);
-        // Extract text content from the message for the guard.
-        const msg = event.message as { role?: string; content?: unknown };
+        const msg = event.message as { role?: string; content?: unknown; stopReason?: string; errorMessage?: string };
+        // A provider/gateway failure surfaces as a terminal assistant message
+        // rather than a throw. Keep the text so the caller can tell a rate
+        // limit from a degeneration.
+        if (msg.role === "assistant" && msg.stopReason === "error" && msg.errorMessage) {
+          assistantError = msg.errorMessage;
+        }
+        // `event.message` is the ACCUMULATED partial message; charge the guard
+        // the incremental delta the stream event carries (see guardFeedFor).
         if (msg.role === "assistant" && !guardAborted) {
-          const text = this.extractMessageText(msg.content);
-          if (text) {
-            const decision = guard.feed(text);
+          const feed = event.type === "message_update" ? guardFeedFor(event, msg.content) : null;
+          if (feed) {
+            const decision = feed.kind === "delta" ? guard.feed(feed.text) : guard.feedSnapshot(feed.text);
             if (decision.abort) {
               guardAborted = true;
               guardReason = decision.reason;
@@ -509,7 +605,17 @@ ${recovery.recoveryPrompt}`;
       }
     }
 
-    return { session, guardAborted, guardReason, guardDiagnostics, captured, toolCalls, budgetExhausted, timedOut };
+    return {
+      session,
+      guardAborted,
+      guardReason,
+      guardDiagnostics,
+      captured,
+      toolCalls,
+      budgetExhausted,
+      timedOut,
+      assistantError,
+    };
   }
 
   /** Cast session messages to the shape collectUsage expects. */

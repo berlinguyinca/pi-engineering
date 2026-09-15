@@ -62,6 +62,8 @@ export {
   ModelDegenerationError,
   normalizeSentence,
   splitSentences,
+  splitCompleteSentences,
+  guardFeedFor,
   RECOVERY_PROMPT,
   TOOL_TRANSITION_RULE,
   lowerReasoningEffort,
@@ -83,7 +85,54 @@ export type {
   DegenerationEvent,
   RecoveryTelemetry,
   GenerationGuardConfig,
+  GuardProfile,
+  GuardFeed,
 } from "./guard/index.ts";
+export {
+  AdmissionController,
+  DEFAULT_GATEWAY_CONFIG,
+  decideGatewayRetry,
+  describeGatewayWait,
+  parseGatewayWait,
+  parseRetryAfterHeader,
+  resolveGatewayConfig,
+  sharedAdmissionController,
+  sharedGatewayConfig,
+} from "./gateway/index.ts";
+export type {
+  AdmissionControllerOptions,
+  AdmissionEvent,
+  AdmissionSlot,
+  AdmissionStatus,
+  GatewayAdmissionConfig,
+  GatewayRetryDecision,
+  GatewayWaitInput,
+  GatewayWaitSignal,
+} from "./gateway/index.ts";
+export { PanelState } from "./panel/PanelState.ts";
+export type {
+  PanelFileEntry,
+  PanelFinding,
+  PanelRunView,
+  PanelSectionError,
+  PanelSpend,
+  PanelStateShape,
+  PanelWorkspaceView,
+} from "./panel/PanelState.ts";
+export { buildRows, clampSelection, SECTION_IDS } from "./panel/tree.ts";
+export type { PanelRow, RowPayload } from "./panel/tree.ts";
+export { LedgerFeeder } from "./panel/feeders/LedgerFeeder.ts";
+export { WorkspaceFeeder, parseGitStatusShort } from "./panel/feeders/WorkspaceFeeder.ts";
+export {
+  MAX_CONTENT_BYTES,
+  MAX_CONTENT_LINES,
+  readDiffContent,
+  readFileContent,
+  toContentView,
+} from "./panel/content.ts";
+export type { ContentView } from "./panel/content.ts";
+export { PanelComponent } from "./panel/PanelComponent.ts";
+export { PanelController, matchesChord } from "./panel/PanelController.ts";
 export { BlackholeManager } from "./blackhole/BlackholeManager.ts";
 export type { BlackholeManagerOptions } from "./blackhole/BlackholeManager.ts";
 export { resolveBlackholeConfig } from "./blackhole/config.ts";

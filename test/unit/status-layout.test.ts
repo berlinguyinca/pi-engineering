@@ -135,3 +135,120 @@ test("layout: outside a git repo omits repository/worktree/branch gracefully", (
   assert.ok(line.includes("qwen3.8-27b"));
   assert.ok(line.includes("⚡"));
 });
+
+// ─── Wait segment (why the runtime is idle) ─────────────────────────────────
+
+test("wait: renders a spinner, the reason and a countdown", () => {
+  const s = state({
+    throughput: { phase: "waiting" },
+    wait: { kind: "gateway", detail: "queue_timeout", untilMs: 30_000 },
+  });
+  assert.match(renderStatus(s, 200, cfg, 0), /[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] gateway 30s · queue_timeout/);
+});
+
+test("wait: the spinner advances with the clock so a long hold looks alive", () => {
+  const s = state({
+    throughput: { phase: "waiting" },
+    wait: { kind: "gateway", detail: "queue_timeout", untilMs: 300_000 },
+  });
+  const frameOf = (t: number) => /[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/.exec(renderStatus(s, 200, cfg, t))?.[0];
+  const frames = new Set([0, 250, 500, 750, 1_000].map(frameOf));
+  assert.ok(frames.size > 1, "a still spinner reads as a hang");
+});
+
+test("wait: queue depth replaces the reason — position, not an error dump", () => {
+  // The operator asked for "X/N in the queue", not the 429 body.
+  const s = state({
+    throughput: { phase: "waiting" },
+    wait: { kind: "gateway", detail: "queue_timeout", untilMs: 30_000, queued: 30, queueLimit: 100 },
+  });
+  const line = renderStatus(s, 200, cfg, 0);
+  assert.match(line, /gateway 30s · queue 30\/100/);
+  assert.doesNotMatch(line, /queue_timeout/, "the reason is noise once the position is known");
+});
+
+test("wait: a queue depth with no reported limit still shows the position", () => {
+  const s = state({
+    throughput: { phase: "waiting" },
+    wait: { kind: "gateway", detail: "queue_timeout", untilMs: 30_000, queued: 7 },
+  });
+  assert.match(renderStatus(s, 200, cfg, 0), /gateway 30s · queue 7/);
+});
+
+test("wait: countdown floors at 0s and never goes negative", () => {
+  const s = state({
+    throughput: { phase: "waiting" },
+    wait: { kind: "gateway", detail: "queue_timeout", untilMs: 1_000 },
+  });
+  assert.match(renderStatus(s, 200, cfg, 9_000), /[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] gateway 0s · queue_timeout/);
+});
+
+test("wait: a wait with no deadline renders without a countdown", () => {
+  const s = state({ throughput: { phase: "waiting" }, wait: { kind: "verify", detail: "npm test" } });
+  const line = renderStatus(s, 200, cfg, 0);
+  assert.match(line, /[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] verify · npm test/);
+  assert.doesNotMatch(line, /\d+s ·/);
+});
+
+test("wait: the wait segment is the last thing standing as width shrinks", () => {
+  const s = state({
+    throughput: { phase: "streaming", currentTokensPerSecond: 247 },
+    task: { workItemId: "WI-12", phase: "implement" },
+    wait: { kind: "gateway", detail: "queue_timeout", untilMs: 30_000 },
+  });
+  const narrow = renderStatus(s, 26, cfg, 0);
+  assert.match(narrow, /gateway/);
+  assert.ok(visibleWidth(narrow) <= 26, `line too wide: ${visibleWidth(narrow)}`);
+});
+
+test("wait: no wait state renders no wait segment", () => {
+  assert.doesNotMatch(renderStatus(state(), 200, cfg, 0), /[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/);
+});
+
+test("wait: showWait=false hides the segment even while waiting", () => {
+  const config: StatusBarConfig = { ...DEFAULT_STATUS_BAR_CONFIG, showWait: false };
+  const s = state({
+    throughput: { phase: "waiting" },
+    wait: { kind: "gateway", detail: "queue_timeout", untilMs: 30_000 },
+  });
+  assert.doesNotMatch(renderStatus(s, 200, config, 0), /[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/);
+});
+
+// ─── Task segment (the work item in flight) ─────────────────────────────────
+
+test("task: names the work item and phase", () => {
+  const s = state({ task: { workItemId: "WI-12", phase: "implement" } });
+  assert.match(renderStatus(s, 200, cfg, 0), /WI-12 implement/);
+});
+
+test("task: appends a truncated goal label when there is room", () => {
+  const s = state({
+    task: { workItemId: "WI-12", phase: "implement", label: "add retry to the gateway client for real" },
+  });
+  const line = renderStatus(s, 200, cfg, 0);
+  assert.match(line, /WI-12 implement · add retry to the gateway/);
+  assert.doesNotMatch(line, /for real/);
+});
+
+test("task: outlives model and throughput but not the wait", () => {
+  const s = state({
+    throughput: { phase: "streaming", currentTokensPerSecond: 247 },
+    task: { workItemId: "WI-12", phase: "implement" },
+    wait: { kind: "gateway", detail: "queue_timeout", untilMs: 30_000 },
+  });
+  const line = renderStatus(s, 50, cfg, 0);
+  assert.match(line, /WI-12 implement/);
+  assert.match(line, /gateway/);
+  assert.doesNotMatch(line, /qwen3\.8-27b/);
+  assert.ok(visibleWidth(line) <= 50, `line too wide: ${visibleWidth(line)}`);
+});
+
+test("task: no task renders no task segment", () => {
+  assert.doesNotMatch(renderStatus(state(), 200, cfg, 0), /WI-/);
+});
+
+test("task: showTask=false hides the segment", () => {
+  const config: StatusBarConfig = { ...DEFAULT_STATUS_BAR_CONFIG, showTask: false };
+  const s = state({ task: { workItemId: "WI-12", phase: "implement" } });
+  assert.doesNotMatch(renderStatus(s, 200, config, 0), /WI-12/);
+});

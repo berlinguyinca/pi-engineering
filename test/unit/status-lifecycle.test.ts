@@ -205,3 +205,193 @@ test("lifecycle: throughput coalesces renders via refreshMs (no per-token storm)
   assert.ok(h.renderCount - initial <= 2, `coalesced (got ${h.renderCount - initial} renders for 50 events)`);
   controller.dispose();
 });
+
+test("lifecycle: a gateway wait becomes footer wait state and clears when it expires", () => {
+  const h = makeHarness();
+  let now = 1_000;
+  const controller = new FooterController({ ctx: h.ctx as never, config: cfg, now: () => now });
+  try {
+    controller.onGatewayEvent({
+      type: "wait",
+      waitMs: 30_000,
+      concurrency: 3,
+      signal: { retryAfterMs: 30_000, retryable: true, source: "body", reason: "queue_timeout", status: 429 },
+    });
+
+    assert.equal(controller.state.wait?.kind, "gateway");
+    assert.equal(controller.state.wait?.detail, "queue_timeout");
+    assert.equal(controller.state.wait?.untilMs, 31_000);
+
+    now = 31_001;
+    controller.tickWait();
+    assert.equal(controller.state.wait, undefined, "an expired wait must clear itself");
+  } finally {
+    controller.dispose();
+  }
+});
+
+test("lifecycle: non-wait admission events do not set a wait", () => {
+  const h = makeHarness();
+  const controller = new FooterController({ ctx: h.ctx as never, config: cfg, now: fixedClock() });
+  try {
+    controller.onGatewayEvent({ type: "relax", concurrency: 3, previous: 2 });
+    assert.equal(controller.state.wait, undefined);
+  } finally {
+    controller.dispose();
+  }
+});
+
+test("lifecycle: dispose stops the wait countdown timer", () => {
+  const h = makeHarness();
+  const controller = new FooterController({ ctx: h.ctx as never, config: cfg, now: () => 0 });
+  controller.setWait({ kind: "gateway", detail: "queue_timeout", untilMs: 30_000 });
+  controller.dispose();
+  // A live interval would keep the event loop referenced and mutate disposed state.
+  controller.tickWait();
+  assert.equal(controller.state.wait?.detail, "queue_timeout", "disposed controller must not mutate state");
+});
+
+test("lifecycle: setTask publishes the task and clears it on settle", () => {
+  const h = makeHarness();
+  const controller = new FooterController({ ctx: h.ctx as never, config: cfg, now: fixedClock() });
+  try {
+    controller.setTask({ workItemId: "WI-12", phase: "implement", label: "add retry" });
+    assert.equal(controller.state.task?.workItemId, "WI-12");
+    assert.equal(controller.state.task?.phase, "implement");
+    controller.setTask(undefined);
+    assert.equal(controller.state.task, undefined);
+  } finally {
+    controller.dispose();
+  }
+});
+
+test("lifecycle: the producing model overrides the session model while a worker runs", () => {
+  const h = makeHarness();
+  const controller = new FooterController({ ctx: h.ctx as never, config: cfg, now: fixedClock() });
+  try {
+    assert.equal(controller.state.model, "m1");
+    controller.setProducingModel("haiku-4-5");
+    assert.equal(controller.state.model, "haiku-4-5");
+    controller.setProducingModel(undefined);
+    assert.equal(controller.state.model, "m1", "clearing restores the session model");
+  } finally {
+    controller.dispose();
+  }
+});
+
+test("lifecycle: a settling run does not clear a different run's task", () => {
+  const h = makeHarness();
+  const controller = new FooterController({ ctx: h.ctx as never, config: cfg, now: fixedClock() });
+  try {
+    // Parallel tournament legs each own a runtime and each emit "settled".
+    controller.setTask({ workItemId: "WI-1", phase: "implement" });
+    controller.setTask({ workItemId: "WI-2", phase: "implement" });
+
+    controller.clearTask("WI-1");
+    assert.equal(controller.state.task?.workItemId, "WI-2", "a stale settle must not clear the live task");
+
+    controller.clearTask("WI-2");
+    assert.equal(controller.state.task, undefined);
+  } finally {
+    controller.dispose();
+  }
+});
+
+test("lifecycle: clearing the producing model restores the CURRENT session model", () => {
+  const h = makeHarness();
+  const controller = new FooterController({ ctx: h.ctx as never, config: cfg, now: fixedClock() });
+  try {
+    controller.onModelSelect({ provider: "p", id: "m2" }); // user switched mid-session
+    controller.setProducingModel("haiku-4-5");
+    assert.equal(controller.state.model, "haiku-4-5");
+    controller.setProducingModel(undefined);
+    assert.equal(controller.state.model, "m2", "must restore the model selected during the session");
+  } finally {
+    controller.dispose();
+  }
+});
+
+test("lifecycle: a gateway wait carries the queue depth into the footer", () => {
+  // The operator asked to see their position, not the 429 body, so the depth
+  // the gateway reported has to survive the trip into wait state.
+  const h = makeHarness();
+  const controller = new FooterController({ ctx: h.ctx as never, config: cfg, now: () => 1_000 });
+  try {
+    controller.onGatewayEvent({
+      type: "wait",
+      waitMs: 30_000,
+      concurrency: 3,
+      signal: {
+        retryAfterMs: 30_000,
+        retryable: true,
+        source: "body",
+        reason: "queue_timeout",
+        status: 429,
+        queued: 28,
+        queueLimit: 100,
+      },
+    });
+    assert.equal(controller.state.wait?.queued, 28);
+    assert.equal(controller.state.wait?.queueLimit, 100);
+  } finally {
+    controller.dispose();
+  }
+});
+
+test("lifecycle: a gateway wait with no queue numbers omits them rather than guessing", () => {
+  const h = makeHarness();
+  const controller = new FooterController({ ctx: h.ctx as never, config: cfg, now: () => 1_000 });
+  try {
+    controller.onGatewayEvent({
+      type: "wait",
+      waitMs: 5_000,
+      concurrency: 3,
+      signal: { retryAfterMs: 5_000, retryable: true, source: "header" },
+    });
+    assert.equal(controller.state.wait?.queued, undefined);
+    assert.equal(controller.state.wait?.queueLimit, undefined);
+  } finally {
+    controller.dispose();
+  }
+});
+
+test("lifecycle: the spinner actually advances through the footer's own render path", () => {
+  // The layout test drives renderStatus directly with a synthetic clock, so it
+  // cannot see the footer's render coalescing. This one goes through the real
+  // path: the wait tick must be frequent enough, and the coalescing floor
+  // (refreshMs) low enough, that consecutive ticks land on different frames.
+  const h = makeHarness();
+  let now = 1_000;
+  const controller = new FooterController({
+    ctx: h.ctx as never,
+    config: { ...DEFAULT_STATUS_BAR_CONFIG, refreshMs: 150 },
+    now: () => now,
+  });
+  try {
+    controller.setWait({ kind: "gateway", detail: "queue_timeout", untilMs: 600_000, queued: 30, queueLimit: 100 });
+    const frames = new Set<string>();
+    for (let i = 0; i < 4; i++) {
+      now += 250; // one WAIT_TICK_MS
+      controller.tickWait();
+      const line = h.footer?.render(200).join("") ?? "";
+      const frame = /[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/.exec(line)?.[0];
+      if (frame) frames.add(frame);
+    }
+    assert.ok(frames.size >= 3, `spinner is throttled: only ${frames.size} distinct frames in 4 ticks`);
+  } finally {
+    controller.dispose();
+  }
+});
+
+test("lifecycle: the queue position reaches the rendered footer line", () => {
+  const h = makeHarness();
+  const controller = new FooterController({ ctx: h.ctx as never, config: cfg, now: () => 1_000 });
+  try {
+    controller.setWait({ kind: "gateway", detail: "queue_timeout", untilMs: 31_000, queued: 30, queueLimit: 100 });
+    const line = h.footer?.render(200).join("") ?? "";
+    assert.match(line, /queue 30\/100/);
+    assert.ok(visibleWidth(line) <= 200);
+  } finally {
+    controller.dispose();
+  }
+});

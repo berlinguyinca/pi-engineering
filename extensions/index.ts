@@ -5,10 +5,22 @@ import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-c
 import { resolveMemoryEnvironment } from "../src/blackhole/connectionSetup.ts";
 import { openVikingBlackholeOption } from "../src/blackhole/envConfig.ts";
 import { registerInteractiveMemory } from "../src/blackhole/interactiveMemory.ts";
+import { sharedAdmissionController, sharedGatewayConfig } from "../src/gateway/config.ts";
+import { describeGatewayWait, parseGatewayWait } from "../src/gateway/signals.ts";
 import { GitRepo } from "../src/git/GitRepo.ts";
 import { GenerationGuard } from "../src/guard/GenerationGuard.ts";
 import { RECOVERY_PROMPT, TOOL_TRANSITION_RULE, buildDegenerationEvent } from "../src/guard/RecoveryController.ts";
 import { resolveGuardConfig } from "../src/guard/config.ts";
+import { guardFeedFor } from "../src/guard/streamText.ts";
+import { PanelController } from "../src/panel/PanelController.ts";
+import { PanelState } from "../src/panel/PanelState.ts";
+import { readDiffContent, readFileContent } from "../src/panel/content.ts";
+import { LedgerFeeder } from "../src/panel/feeders/LedgerFeeder.ts";
+import { MemoryFeeder } from "../src/panel/feeders/MemoryFeeder.ts";
+import { WorkspaceFeeder } from "../src/panel/feeders/WorkspaceFeeder.ts";
+import { type PanelLayout, PanelLayoutStore } from "../src/panel/layout.ts";
+import { Narrator } from "../src/panel/narrator/Narrator.ts";
+import { createSummarize } from "../src/panel/narrator/summarize.ts";
 import { RoadmapEngine } from "../src/roadmap/RoadmapEngine.ts";
 import { EngineeringRuntime } from "../src/runtime/EngineeringRuntime.ts";
 import { resolveStatusBarConfig } from "../src/status/config.ts";
@@ -37,6 +49,43 @@ const runtimes = new Map<string, { runtime: EngineeringRuntime; memoryIdentity: 
 // controller (src/status/). One active controller per session.
 const statusBarConfig = resolveStatusBarConfig();
 let activeFooter: FooterController | null = null;
+/** Subscriptions bound to the session's lifetime (drained on shutdown). */
+const sessionUnsubscribes: Array<() => void> = [];
+
+// The engineering panel: one state + feeders per repository (keyed like the
+// runtime cache), and one controller per interactive session.
+interface PanelPlumbing {
+  state: PanelState;
+  ledger: LedgerFeeder;
+  workspace: WorkspaceFeeder;
+  memory: MemoryFeeder;
+}
+const panels = new Map<string, PanelPlumbing>();
+let activePanel: PanelController | null = null;
+/** Layout is an operator preference, so one store for the whole process. */
+const panelLayoutStore = new PanelLayoutStore();
+/**
+ * Panel input subscriptions, kept separate from `sessionUnsubscribes` on
+ * purpose: the footer's `session_start` drains its own array, and a shared
+ * array would make "does the hotkey still work?" depend on the order two
+ * independent handlers happen to be registered in.
+ */
+const panelUnsubscribes: Array<() => void> = [];
+
+/** Panel plumbing for a repo, created on first use. */
+function panelFor(key: string, rt: EngineeringRuntime): PanelPlumbing {
+  const existing = panels.get(key);
+  if (existing) return existing;
+  const state = new PanelState();
+  const created: PanelPlumbing = {
+    state,
+    ledger: new LedgerFeeder({ ledger: rt.ledger, state }),
+    workspace: new WorkspaceFeeder({ state, repo: rt.git }),
+    memory: new MemoryFeeder({ state, blackhole: rt.blackhole }),
+  };
+  panels.set(key, created);
+  return created;
+}
 
 async function getRuntime(ctx: ExtensionCommandContext, worker?: EngineeringRuntime): Promise<EngineeringRuntime> {
   return getRuntimeByCwd(worker ? worker.cwd : ctx.cwd, ctx.model);
@@ -71,9 +120,31 @@ async function getRuntimeByCwd(cwd: string, model?: Model<any>): Promise<Enginee
     // from the roadmap engine (completion is never declared). If the repo has no
     // roadmap, the gate is open.
     roadmapComplete: roadmapCompleteFor(key),
+    // Pipeline progress -> status footer. Best-effort and read-only: the
+    // runtime swallows anything thrown here, and the footer is the only
+    // consumer today (the panel will subscribe to the same events).
+    onPhase: (event) => {
+      // One event source, two surfaces: the footer summarises, the panel details.
+      panels.get(key)?.ledger.onPhase(event);
+      const footer = activeFooter;
+      if (!footer) return;
+      if (event.phase === "settled") {
+        // Guarded: concurrent runs (tournament legs, DAG waves) each settle.
+        footer.clearTask(event.workItemId);
+        footer.setProducingModel(undefined);
+        return;
+      }
+      footer.setTask({
+        workItemId: event.workItemId,
+        phase: event.phase,
+        ...(event.goal ? { label: event.goal } : {}),
+      });
+      if (event.model) footer.setProducingModel(event.model);
+    },
     ...(blackhole ? { blackhole } : {}),
   });
   runtimes.set(key, { runtime: rt, memoryIdentity });
+  panelFor(key, rt);
   return rt;
 }
 
@@ -154,7 +225,10 @@ export default function (pi: ExtensionAPI) {
   // On detection, aborts the current turn. The recovery prompt is injected
   // via the next before_agent_start (the user re-submits or the harness
   // auto-retries).
-  const interactiveGuardConfig = resolveGuardConfig();
+  // The interactive profile drops the pre-action narration budget: in this
+  // session the final answer IS prose, and nothing in the stream separates a
+  // long answer from narration until the turn is over.
+  const interactiveGuardConfig = resolveGuardConfig(undefined, "interactive");
   // The interactive guard uses pi.on() which is only available in a real pi
   // session (not in the smoke-test stub). Guard accordingly.
   if (interactiveGuardConfig.enabled && typeof pi.on === "function") {
@@ -173,21 +247,14 @@ export default function (pi: ExtensionAPI) {
       const msg = event.message as { role?: string; content?: unknown } | undefined;
       if (msg?.role !== "assistant") return;
 
-      // Extract text from the message content.
-      let text = "";
-      if (typeof msg.content === "string") {
-        text = msg.content;
-      } else if (Array.isArray(msg.content)) {
-        for (const block of msg.content) {
-          if (typeof block === "object" && block !== null) {
-            const b = block as { type?: string; text?: string };
-            if (b.type === "text" && typeof b.text === "string") text += b.text;
-          }
-        }
-      }
-      if (!text) return;
-
-      const decision = interactiveGuard.feed(text);
+      // `event.message` is the ACCUMULATED partial message, so feeding it
+      // would charge every token once per streaming event. Charge the delta
+      // the stream event carries instead (snapshot accounting is the fallback,
+      // and diffs internally).
+      const feed = guardFeedFor(event, msg.content);
+      if (!feed) return;
+      const decision =
+        feed.kind === "delta" ? interactiveGuard.feed(feed.text) : interactiveGuard.feedSnapshot(feed.text);
       if (decision.abort) {
         interactiveGuardAborted = true;
         // Abort the current generation.
@@ -246,6 +313,93 @@ ${RECOVERY_PROMPT}`;
     });
   }
 
+  // ─── Model-gateway backpressure (honour reported waits) ──────────────────
+  // Gateways in front of the model report exactly how long to stay away
+  // (`retry_after_ms`) and how many concurrent requests they will admit
+  // (`active_limit`). Pi's own auto-retry ignores both and backs off
+  // exponentially, so the runtime observes the refusals itself and parks every
+  // model caller in this process — the worker sessions AND this interactive
+  // turn — behind one shared cooldown until the reported wait has elapsed.
+  const gatewayConfig = sharedGatewayConfig();
+  if (gatewayConfig.enabled && typeof pi.on === "function") {
+    const admission = sharedAdmissionController();
+
+    // Status line + headers: what the transport saw (`Retry-After`), no body.
+    // Narrowed to 429: a transient 5xx is Pi's own retry to handle, and arming
+    // a process-wide cooldown on one flaky response would stall every caller.
+    pi.on("after_provider_response", async (event) => {
+      if (event.status !== 429) return;
+      const signal = parseGatewayWait({ status: event.status, headers: event.headers });
+      if (signal?.retryable) admission.noteWait(signal);
+    });
+
+    // Pi's own session retry stops after `retry.maxRetries` (default 3) and
+    // there is no accessor for it on the extension API, so the interactive turn
+    // can still surface a 429 after three honoured waits even though every
+    // worker now waits indefinitely. Say so once, with the fix, rather than
+    // letting the operator rediscover it each time.
+    let retryAdviceShown = false;
+    let gatewayHolds = 0;
+
+    // Terminal assistant error: the only place `retry_after_ms` appears, since
+    // it lives in the response BODY.
+    pi.on("message_end", async (event, ctx) => {
+      const msg = event.message as { role?: string; stopReason?: string; errorMessage?: string } | undefined;
+      if (msg?.role !== "assistant" || msg.stopReason !== "error" || !msg.errorMessage) return;
+      const signal = parseGatewayWait({ text: msg.errorMessage });
+      if (!signal?.retryable) return;
+      const waitMs = admission.noteWait(signal);
+      // The status bar owns this now: a spinner, the countdown and the queue
+      // position say everything the 429 body did, without a wall of warnings
+      // every 30 seconds. Notify only when there is no status bar to read.
+      if (!statusBarConfig.enabled) {
+        ctx.ui.notify(
+          `Model gateway is saturated — holding ${Math.round(waitMs / 1000)}s. ${describeGatewayWait(signal)}`,
+          "warning",
+        );
+      }
+      gatewayHolds++;
+      if (gatewayHolds >= 2 && !retryAdviceShown) {
+        retryAdviceShown = true;
+        ctx.ui.notify(
+          'Gateway saturation is being waited out. Engineering workers now wait indefinitely; this interactive turn still stops at Pi\'s own retry budget — raise it with `"retry": { "maxRetries": 100 }` in .pi/settings.json.',
+          "info",
+        );
+      }
+    });
+
+    // Hold the next provider request until the shared cooldown expires, so a
+    // re-submit (manual or automatic) does not walk straight back into the
+    // queue the gateway just asked us to leave alone.
+    //
+    // This fires for EVERY provider call, compaction and summarization
+    // included, so a hold must be visible: a silent multi-second stall in the
+    // user's own session would be worse than the 429 it prevents. The status
+    // bar carries that (spinner + countdown + queue position); the notify path
+    // is the fallback for a session running without one.
+    //
+    // The wait is unbounded by policy, so it is tied to the turn's own abort
+    // signal: escape ends the hold for this caller and leaves the cooldown
+    // standing for everyone else.
+    let noticeSilentUntil = 0;
+    pi.on("before_provider_request", async (_event, ctx) => {
+      const remaining = admission.cooldownRemainingMs();
+      if (remaining <= 0) return;
+      if (!statusBarConfig.enabled) {
+        const now = Date.now();
+        if (now >= noticeSilentUntil) {
+          noticeSilentUntil = now + remaining;
+          ctx.ui.notify(
+            `Waiting ${Math.ceil(remaining / 1000)}s for the model gateway — ${admission.describe()}`,
+            "warning",
+          );
+        }
+      }
+      const signal = ctx.signal;
+      await admission.awaitCooldown(signal ? { signal } : {});
+    });
+  }
+
   // ─── Live status bar: harness-owned Pi footer (spec §status-bar) ─────────
   // The footer consumes structured harness telemetry state and streams live
   // output TPS. It never runs git/network during render (git context is cached
@@ -253,8 +407,15 @@ ${RECOVERY_PROMPT}`;
   // real pi session, so guard like the Generation Guard block above.
   if (statusBarConfig.enabled && typeof pi.on === "function") {
     pi.on("session_start", (_event, ctx) => {
+      for (const un of sessionUnsubscribes.splice(0)) un();
       activeFooter?.dispose();
-      activeFooter = new FooterController({ ctx, config: statusBarConfig });
+      const footer = new FooterController({ ctx, config: statusBarConfig });
+      activeFooter = footer;
+      // The footer is a second consumer of admission events (telemetry owns the
+      // constructor hook), so it subscribes and gives the wait a countdown.
+      if (gatewayConfig.enabled) {
+        sessionUnsubscribes.push(sharedAdmissionController().subscribe((event) => footer.onGatewayEvent(event)));
+      }
     });
 
     pi.on("message_start", () => activeFooter?.onMessageStart());
@@ -262,10 +423,184 @@ ${RECOVERY_PROMPT}`;
     pi.on("message_end", (event) => activeFooter?.onMessageEnd(event));
     pi.on("model_select", (event) => activeFooter?.onModelSelect(event.model));
     pi.on("session_shutdown", () => {
+      for (const un of sessionUnsubscribes.splice(0)) un();
       activeFooter?.dispose();
       activeFooter = null;
     });
   }
+
+  // ─── Engineering panel ───────────────────────────────────────────────────
+  // `/panel` (or the configured chord) toggles a right-anchored overlay over
+  // the ledger's record of the run, falling back to the working tree when idle.
+  // Pi registers commands but not keybindings, so the chord is a raw input
+  // handler that consumes only its own key.
+  const panelChord = process.env.PI_PANEL_CHORD ?? "ctrl+p";
+
+  /** The slice of Pi's session UI the panel needs. */
+  interface PanelSessionUi {
+    custom?: unknown;
+    onTerminalInput?: (handler: (data: string) => { consume: true } | undefined) => () => void;
+    notify: (message: string, kind?: "info" | "warning" | "error") => void;
+  }
+
+  async function openPanel(ctx: {
+    cwd: string;
+    ui: { notify: (m: string, t?: "info" | "warning" | "error") => void };
+  }) {
+    const key = await repoCacheKey(ctx.cwd);
+    const rt = await getRuntimeByCwd(ctx.cwd).catch(() => null);
+    if (!rt) {
+      ctx.ui.notify("Panel unavailable: no engineering runtime for this directory.", "error");
+      return null;
+    }
+    // No refresh here: opening the overlay invalidates the cache and refreshes,
+    // so a second read would only race the first.
+    return { plumbing: panelFor(key, rt), rt };
+  }
+
+  /**
+   * Start the session narrator for a repo, at most once.
+   *
+   * Off by default (`PI_PANEL_NARRATOR`): it is the only part of the panel that
+   * spends money, so the operator opts in. It observes the panel's own state —
+   * the run view the ledger feeder already publishes — rather than reaching
+   * into the runtime for a second source of truth, and it is gated on the SAME
+   * admission controller as every other model call in this process.
+   */
+  const narrators = new Map<string, Narrator>();
+  function startNarrator(plumbing: PanelPlumbing, _rt: EngineeringRuntime): void {
+    if (process.env.PI_PANEL_NARRATOR !== "true") return;
+    const key = [...panels.entries()].find(([, value]) => value === plumbing)?.[0];
+    if (!key || narrators.has(key)) return;
+
+    const admission = sharedAdmissionController();
+    const narrator = new Narrator({
+      state: plumbing.state,
+      summarize: createSummarize(),
+      cooldownRemainingMs: () => admission.cooldownRemainingMs(),
+      acquire: () => admission.acquire(),
+    });
+    narrators.set(key, narrator);
+
+    // Deltas come from panel state, which the ledger feeder already keeps
+    // current. No transcript, no second pipeline.
+    //
+    // RUN files only, never the workspace: when a run settles the run view is
+    // cleared, and falling back to the working tree would present every tracked
+    // change as newly changed — the narrator would claim the session edited
+    // files it merely started displaying. The narrator narrates runs, and says
+    // nothing when idle.
+    const unsubscribe = plumbing.state.subscribe((snapshot) => {
+      const run = snapshot.run;
+      if (!run) return;
+      void narrator.observe({
+        ...(run.workItemId ? { workItemId: run.workItemId } : {}),
+        ...(run.goal ? { goal: run.goal } : {}),
+        ...(run.phase ? { phase: run.phase } : {}),
+        files: run.files.map((file) => file.path),
+      });
+    });
+    // The panel cache is process-wide and outlives a session, so without this
+    // a narrator opted into once would keep observing — and spending — in every
+    // later session, with no way to stop it.
+    panelUnsubscribes.push(() => {
+      unsubscribe();
+      narrator.dispose();
+      narrators.delete(key);
+    });
+  }
+
+  /** Resolve a selected row into a bounded content view. */
+  function openRowFor(rt: EngineeringRuntime, state: PanelState) {
+    return async (payload: { kind: string; path?: string; source?: string }) => {
+      if (payload.kind !== "file" || !payload.path) return undefined;
+      // A run's file is shown as the candidate diff when one was captured;
+      // the artifact URI travels, the body is fetched only to display it.
+      const candidateId = state.snapshot.run?.candidateId;
+      if (payload.source === "run" && candidateId) {
+        const candidate = rt.ledger.getCandidate(candidateId);
+        if (candidate?.diff_artifact_uri) {
+          return readDiffContent(rt.artifacts, candidate.diff_artifact_uri, payload.path);
+        }
+      }
+      return readFileContent(resolve(rt.cwd, payload.path), payload.path);
+    };
+  }
+
+  /**
+   * Build the session's controller and bind the chord.
+   *
+   * Called from `session_start` so the hotkey works without `/panel` first, and
+   * from `/panel` itself so a session whose `session_start` found no runtime
+   * (or has not finished its async lookup) still opens rather than reporting a
+   * UI problem that is not the real cause.
+   */
+  function createPanelController(
+    ctx: { ui: PanelSessionUi },
+    plumbing: PanelPlumbing,
+    rt: EngineeringRuntime,
+  ): PanelController {
+    const controller = new PanelController({
+      state: plumbing.state,
+      ui: ctx.ui as never,
+      chord: panelChord,
+      layout: panelLayoutStore.load(),
+      onLayoutChange: (layout: PanelLayout) => panelLayoutStore.save(layout),
+      onOpen: () => {
+        plumbing.workspace.invalidate();
+        void plumbing.workspace.refresh();
+        plumbing.ledger.refresh();
+        plumbing.memory.refresh();
+        // The narrator costs money, so it does not start until the panel has
+        // been opened at least once: a session that never opens /panel must
+        // not pay for summaries nobody reads.
+        startNarrator(plumbing, rt);
+      },
+      openRow: openRowFor(rt, plumbing.state),
+    });
+    if (typeof ctx.ui.onTerminalInput === "function") {
+      panelUnsubscribes.push(ctx.ui.onTerminalInput((data) => controller.handleTerminalInput(data)));
+    }
+    return controller;
+  }
+
+  // The overlay and the chord need a live session UI, which only exists in a
+  // real Pi run (the smoke-test stub has no pi.on).
+  if (typeof pi.on === "function") {
+    pi.on("session_start", async (_event, ctx) => {
+      for (const un of panelUnsubscribes.splice(0)) un();
+      activePanel?.dispose();
+      activePanel = null;
+      const key = await repoCacheKey(ctx.cwd);
+      const rt = await getRuntimeByCwd(ctx.cwd).catch(() => null);
+      // Not fatal: `/panel` retries the lookup and builds the controller then.
+      if (!rt) return;
+      activePanel = createPanelController(ctx as { ui: PanelSessionUi }, panelFor(key, rt), rt);
+    });
+
+    pi.on("session_shutdown", () => {
+      for (const un of panelUnsubscribes.splice(0)) un();
+      activePanel?.dispose();
+      activePanel = null;
+    });
+  }
+
+  pi.registerCommand("panel", {
+    description: "Toggle the engineering panel: changed files, reviews, models, and token spend.",
+    handler: async (_args, ctx) => {
+      const opened = await openPanel(ctx);
+      if (!opened) return;
+      if (!activePanel) {
+        const ui = ctx.ui as PanelSessionUi;
+        if (typeof ui.custom !== "function") {
+          ctx.ui.notify("Panel unavailable: this session has no interactive UI.", "error");
+          return;
+        }
+        activePanel = createPanelController({ ui }, opened.plumbing, opened.rt);
+      }
+      activePanel.toggle();
+    },
+  });
 
   pi.registerCommand("engineer", {
     description: "Run the adaptive engineering workflow for a goal (scout -> implement -> verify -> review).",

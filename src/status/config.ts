@@ -16,6 +16,10 @@ export interface StatusBarConfig {
   showBranch: boolean;
   showModel: boolean;
   showThroughput: boolean;
+  /** Show the engineering task in flight. */
+  showTask: boolean;
+  /** Show why the runtime is waiting. */
+  showWait: boolean;
 
   /** Rolling throughput window in ms (spec default 2500). */
   throughputWindowMs: number;
@@ -37,6 +41,8 @@ export const DEFAULT_STATUS_BAR_CONFIG: StatusBarConfig = {
   showBranch: true,
   showModel: true,
   showThroughput: true,
+  showTask: true,
+  showWait: true,
   throughputWindowMs: 2500,
   refreshMs: 150,
   gitCacheTtlMs: 30_000,
@@ -66,6 +72,8 @@ const ENV = {
   branch: "PI_STATUS_BAR_SHOW_BRANCH",
   model: "PI_STATUS_BAR_SHOW_MODEL",
   throughput: "PI_STATUS_BAR_SHOW_THROUGHPUT",
+  task: "PI_STATUS_BAR_SHOW_TASK",
+  wait: "PI_STATUS_BAR_SHOW_WAIT",
   windowMs: "PI_STATUS_BAR_WINDOW_MS",
   refreshMs: "PI_STATUS_BAR_REFRESH_MS",
   gitTtlMs: "PI_STATUS_BAR_GIT_TTL_MS",
@@ -82,6 +90,8 @@ export function resolveStatusBarConfig(env: Record<string, string | undefined> =
     showBranch: bool(env[ENV.branch], base.showBranch),
     showModel: bool(env[ENV.model], base.showModel),
     showThroughput: bool(env[ENV.throughput], base.showThroughput),
+    showTask: bool(env[ENV.task], base.showTask),
+    showWait: bool(env[ENV.wait], base.showWait),
     throughputWindowMs: int(env[ENV.windowMs], base.throughputWindowMs),
     refreshMs: int(env[ENV.refreshMs], base.refreshMs),
     gitCacheTtlMs: int(env[ENV.gitTtlMs], base.gitCacheTtlMs),

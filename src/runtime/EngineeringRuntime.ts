@@ -169,6 +169,36 @@ export interface TournamentReport {
   telemetry: Telemetry;
 }
 
+/** Worker roles that map onto a reportable pipeline phase. */
+const PHASE_FOR_ROLE: Partial<Record<WorkerRole, RuntimePhaseEvent["phase"]>> = {
+  scout: "scout",
+  implementer: "implement",
+  reviewer: "review",
+};
+
+/**
+ * Pipeline progress, for status surfaces (the footer today, the panel later).
+ *
+ * Emitted best-effort and synchronously: a listener is an observer, never a
+ * participant, so a throwing or slow one must not affect an engineering run.
+ */
+export interface RuntimePhaseEvent {
+  workItemId: string;
+  phase: "scout" | "implement" | "verify" | "review" | "settled";
+  /** The work item's goal, for a human-readable label. */
+  goal?: string;
+  /** Model that produced this phase, known only once a worker has run. */
+  model?: string;
+  /**
+   * Token/cost usage for this phase, when a worker reported it.
+   *
+   * Per-model spend is not persisted anywhere — WorkerUsage is folded into the
+   * runtime's aggregate telemetry and lost per model — so this event is the
+   * source the panel accumulates from.
+   */
+  usage?: { input: number; output: number; cost: number };
+}
+
 export interface EngineeringRuntimeOptions {
   cwd: string;
   worker?: WorkerExecutor;
@@ -201,6 +231,11 @@ export interface EngineeringRuntimeOptions {
    * The ledger is supplied by the runtime itself at open time.
    */
   blackhole?: Omit<BlackholeManagerOptions, "ledger">;
+  /**
+   * Optional progress hook for status surfaces. Best-effort: exceptions from a
+   * listener are swallowed so status rendering can never fail a run.
+   */
+  onPhase?: (event: RuntimePhaseEvent) => void;
 }
 
 /**
@@ -222,6 +257,10 @@ export class EngineeringRuntime {
   readonly telemetry: Telemetry;
   readonly roadmapComplete: (() => Promise<boolean>) | null;
   blackhole: BlackholeManager | null;
+  private readonly onPhase: ((event: RuntimePhaseEvent) => void) | null;
+  /** Work item whose phases are currently being reported (status surfaces only). */
+  private currentWorkItemId = "";
+  private currentPhaseGoal = "";
 
   /**
    * Serializes git mutations that touch the shared main repo (worktree create,
@@ -241,6 +280,16 @@ export class EngineeringRuntime {
     return run;
   }
 
+  /** Notify status surfaces of pipeline progress. Never throws into the run. */
+  private emitPhase(event: RuntimePhaseEvent): void {
+    if (!this.onPhase) return;
+    try {
+      this.onPhase(event);
+    } catch {
+      // A status listener is an observer, never a participant.
+    }
+  }
+
   private constructor(opts: EngineeringRuntimeOptions) {
     this.cwd = opts.cwd;
     this.workDir = opts.workDir ?? "";
@@ -248,6 +297,7 @@ export class EngineeringRuntime {
     this.reviewerWorker = opts.reviewerWorker ?? null;
     this.verifier = opts.verifier ?? new CommandVerifier();
     this.roadmapComplete = opts.roadmapComplete ?? null;
+    this.onPhase = opts.onPhase ?? null;
     this.blackhole = null;
     this.telemetry = {
       workers: {},
@@ -400,6 +450,22 @@ export class EngineeringRuntime {
       void this.blackhole
         .runMemoryWorker("observer", { project: this.cwd, workItem: opts.wi.id, role, workerId: opts.wi.id })
         .catch(() => {});
+    }
+
+    // Report the model that actually produced this phase. The executor picks
+    // the model (router, fallback ladder), so it is knowable only after the
+    // run — status surfaces show the session model until then.
+    if (run.usage?.model && this.currentWorkItemId) {
+      const phase = PHASE_FOR_ROLE[role];
+      if (phase) {
+        this.emitPhase({
+          workItemId: this.currentWorkItemId,
+          phase,
+          goal: this.currentPhaseGoal || undefined,
+          model: run.usage.model,
+          usage: { input: run.usage.input, output: run.usage.output, cost: run.usage.cost },
+        });
+      }
     }
 
     // Accumulate context/autonomy telemetry.
@@ -857,6 +923,7 @@ Return details.winner_candidate_id set to "${a.id}" or "${b.id}" for your pick.`
       // failed to complete is recorded as having no completed review and is
       // ineligible to win, so a review infrastructure failure can never hand the
       // tournament to an unreviewed candidate.
+      this.emitPhase({ workItemId: wi.id, phase: "review", goal });
       const rev = await this.reviewWithRetry(wi, candidate, goal);
       if (!rev.completed) {
         await this.ledger.recordEntity(
@@ -1427,6 +1494,22 @@ Goal: "${goal}"`;
   }
 
   async engineer(goal: string): Promise<EngineerReport> {
+    // The status surfaces must never be left showing a task that is over, so
+    // "settled" is emitted from a finally — a thrown run clears the footer too.
+    let workItemId = "";
+    try {
+      return await this.engineerInner(goal, (id, phaseGoal) => {
+        workItemId = id;
+        this.currentPhaseGoal = phaseGoal;
+      });
+    } finally {
+      if (workItemId) this.emitPhase({ workItemId, phase: "settled", goal });
+      this.currentWorkItemId = "";
+      this.currentPhaseGoal = "";
+    }
+  }
+
+  private async engineerInner(goal: string, onWorkItem: (id: string, goal: string) => void): Promise<EngineerReport> {
     // Autonomous stop: when the roadmap is complete, do NOT invent new work.
     // Completion is derived (roadmap check), never declared (roadmap spec §13).
     if (this.roadmapComplete && (await this.roadmapComplete())) {
@@ -1464,6 +1547,8 @@ Goal: "${goal}"`;
     const risk = classifyRisk(goal);
     const wi = await this.ledger.createWorkItem(goal, risk, [this.cwd], this.actor(newRunId(), "planner"));
     await this.ledger.recordEntity("requirement", goal, "open", this.actor(newRunId(), "planner"), wi.id);
+    this.currentWorkItemId = wi.id;
+    onWorkItem(wi.id, goal);
 
     // Assemble bounded task context.
     let contextText = await this.safeContext(goal, ROLE_BUDGETS.implementer.targetTokens, []);
@@ -1471,6 +1556,7 @@ Goal: "${goal}"`;
     // Scout (medium+).
     let scoutSummary: string | null = null;
     if (risk !== "low") {
+      this.emitPhase({ workItemId: wi.id, phase: "scout", goal });
       const scout = await this.scout(wi, goal, contextText);
       scoutSummary = scout?.summary ?? null;
       // The scout identified a concrete change surface: re-assemble the
@@ -1521,8 +1607,10 @@ Goal: "${goal}"`;
       const implTask = `Implement the goal in this repository:
 "${goal}"
 Risk level: ${risk}. Make the smallest coherent change. Use the provided context and repository tools. Run a quick targeted check (e.g. the project test command) before finishing.${feedback ? `\n\nPRIOR ATTEMPT FEEDBACK (repair these issues):\n${feedback}` : ""}`;
+      this.emitPhase({ workItemId: wi.id, phase: "implement", goal });
       const impl = await this.implementIn(wi, candidate, worktreePath, implTask, contextText);
 
+      this.emitPhase({ workItemId: wi.id, phase: "verify", goal });
       const { outcome, evidenceIds: ids, profile } = await this.verify(wi, candidate, worktreePath);
       evidenceIds.push(...ids);
       lastVerify = outcome;

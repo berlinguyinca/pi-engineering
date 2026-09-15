@@ -15,6 +15,8 @@
  * sleep so tests can exercise backoff and retry loops without sleeping.
  */
 
+import { isGatewayAdmissionRefusal } from "../gateway/signals.ts";
+
 export type TransientErrorCategory =
   | "rate_limit" // 429 — too many requests / caller_concurrency admission
   | "server_unavailable" // 503 — no worker for model / service unavailable
@@ -62,7 +64,24 @@ export function classifyError(error: unknown): ErrorClass {
 
   const has = (...needles: string[]) => needles.some((n) => msg.includes(n));
 
+  // A gateway admission refusal that advertises its own wait belongs to the
+  // admission controller, not here. Backing off exponentially against a 30s ask
+  // — which is what this layer would do, since extractRetryAfterMs reads only a
+  // header and this gateway puts `retry_after_ms` in the BODY — walks straight
+  // back into the queue that just refused us, and gives up after maxAttempts.
+  // Handing it over as non-retryable lets the worker loop honour the exact wait,
+  // process-wide and without a ceiling. See src/gateway/signals.ts.
+  if (isGatewayAdmissionRefusal(raw)) {
+    return {
+      category: "permanent",
+      retryable: false,
+      reason: "gateway admission refusal — handled by the admission controller",
+    };
+  }
+
   // 429 / rate limiting / concurrency admission (the user's "caller_concurrency").
+  // Still ours: a rate limit with no gateway envelope advertises no wait, so
+  // exponential backoff is the right answer.
   if (
     status === 429 ||
     has("too many requests", "rate limit", "rate limited", "caller_concurrency", "inference admission")
