@@ -15,7 +15,17 @@
  *     used to be.
  */
 
-import { chmodSync, copyFileSync, existsSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  copyFileSync,
+  existsSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { dirname, join } from "node:path";
 import type { ConfiguredModel } from "./catalogPlan.ts";
 
@@ -71,7 +81,16 @@ export function withProviderModels(config: ModelsConfig, providerId: string, mod
 export interface WriteResult {
   /** Path of the backup taken before writing, when the file already existed. */
   backupPath?: string;
+  /** Older backups removed to keep the credential-bearing set bounded. */
+  prunedBackups?: string[];
 }
+
+/**
+ * Backups to keep. Each one contains the API key, so an unbounded set is a
+ * slowly growing pile of credential copies; a handful is enough to recover from
+ * a bad refresh, which is all they are for.
+ */
+export const MAX_BACKUPS = 5;
 
 /** A filesystem-safe timestamp for backup filenames. */
 function stamp(now: Date): string {
@@ -98,8 +117,43 @@ export function writeModelsConfig(path: string, config: ModelsConfig, now: Date 
   }
 
   const tmp = join(dirname(path), `.models.json.tmp-${process.pid}-${Date.now()}`);
-  writeFileSync(tmp, `${JSON.stringify(config, null, 1)}\n`, { mode: 0o600 });
-  chmodSync(tmp, mode);
-  renameSync(tmp, path);
+  try {
+    writeFileSync(tmp, `${JSON.stringify(config, null, 1)}\n`, { mode: 0o600 });
+    chmodSync(tmp, mode);
+    renameSync(tmp, path);
+  } catch (err) {
+    // The temporary file holds the API key. Leaving one behind after a failed
+    // write is a stray credential copy nobody will think to look for.
+    rmSync(tmp, { force: true });
+    throw err;
+  }
+
+  const pruned = pruneBackups(path);
+  if (pruned.length > 0) result.prunedBackups = pruned;
   return result;
+}
+
+/** Remove all but the newest `MAX_BACKUPS` backups of `path`. */
+function pruneBackups(path: string): string[] {
+  const dir = dirname(path);
+  const prefix = `${path.slice(dir.length + 1)}.bak-`;
+  let names: string[];
+  try {
+    names = readdirSync(dir).filter((n) => n.startsWith(prefix));
+  } catch {
+    return [];
+  }
+  // Names embed a sortable timestamp, so lexical order is chronological.
+  const stale = names.sort().slice(0, Math.max(0, names.length - MAX_BACKUPS));
+  const removed: string[] = [];
+  for (const name of stale) {
+    const full = join(dir, name);
+    try {
+      rmSync(full, { force: true });
+      removed.push(full);
+    } catch {
+      // A backup we cannot remove is not worth failing a successful write over.
+    }
+  }
+  return removed;
 }

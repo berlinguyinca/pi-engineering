@@ -129,7 +129,11 @@ export function planCatalogUpdate(
 
     if (!current) {
       const { input, inferred } = inferInput(entry.id);
-      const inferredFields = ["maxTokens", "reasoning", ...(inferred ? ["input"] : [])];
+      // `cost` and `name` are fabricated too. A zero cost is a CLAIM that the
+      // model is free — true for a self-hosted gateway, but `/models` never
+      // said so, and an undeclared fabrication is the thing this field exists
+      // to prevent.
+      const inferredFields = ["maxTokens", "reasoning", "cost", "name", ...(inferred ? ["input"] : [])];
       next.push({
         id: entry.id,
         name: `${entry.id} (gateway)`,

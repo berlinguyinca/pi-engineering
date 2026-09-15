@@ -271,3 +271,35 @@ test("catalog: an empty catalogue is an error, never a reason to erase the confi
     /no usable models/,
   );
 });
+
+test("catalog: a string-valued context size is accepted", () => {
+  // Gateways differ; a JSON number is not guaranteed.
+  const models = parseGatewayModels({ data: [{ id: "m", ctx_per_request: "262144" }] });
+  assert.equal(models[0]?.contextWindow, 262_144);
+});
+
+test("catalog: per-request wins over the window field when both are present", () => {
+  // The precedence that keeps a session from being configured past what one
+  // call may send.
+  const models = parseGatewayModels({ data: [{ id: "m", ctx_per_request: 100, x_context_window: 999_999 }] });
+  assert.equal(models[0]?.contextWindow, 100);
+});
+
+test("catalog: x_context_window is used when no per-request limit is reported", () => {
+  const models = parseGatewayModels({ data: [{ id: "m", x_context_window: 4096 }] });
+  assert.equal(models[0]?.contextWindow, 4096);
+});
+
+test("catalog: a zero or negative context size is not usable", () => {
+  assert.deepEqual(parseGatewayModels({ data: [{ id: "m", ctx_per_request: 0 }] }), []);
+  assert.deepEqual(parseGatewayModels({ data: [{ id: "m", ctx_per_request: -1 }] }), []);
+});
+
+test("catalog: an added model declares its fabricated cost and name", () => {
+  // A zero cost is a claim the model is free. True here, but /models never said
+  // so, and an undeclared fabrication is what the inferred list exists to stop.
+  const plan = planCatalogUpdate([], parseGatewayModels(LIVE_PAYLOAD));
+  const change = plan.changes.find((c) => c.id === "qwen3.8-27b");
+  assert.ok(change?.inferred?.includes("cost"));
+  assert.ok(change?.inferred?.includes("name"));
+});

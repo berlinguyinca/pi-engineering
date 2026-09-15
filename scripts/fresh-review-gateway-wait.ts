@@ -57,6 +57,30 @@ const AREAS: Record<string, { files: string; requirements: string; inspect: stri
       "test gaps at the boundary",
     ].join(", "),
   },
+  models: {
+    files:
+      "src/models/gatewayCatalog.ts, src/models/catalogPlan.ts, src/models/modelsConfig.ts, src/models/health.ts, src/models/refresh.ts, and the /refresh-models command in extensions/index.ts. Tests: test/unit/models-catalog.test.ts, test/unit/models-config.test.ts, test/unit/models-health.test.ts, test/integration/models-refresh.test.ts.",
+    requirements: [
+      "models.json holds the operator's API key. A refresh must never widen its file mode, never lose the key, and never leave a truncated file.",
+      "Only providers.<id>.models may be replaced. Every other field, including keys this code does not model, must survive untouched.",
+      "The per-request context limit (ctx_per_request) is what bounds a single call; ctx_total is the gateway's aggregate across slots and must never be written as the context window.",
+      "A failed fetch, an empty catalogue, or a malformed config must leave the configuration exactly as it was.",
+      "Values the gateway does not report (modality, output limits) may be inferred but must be declared as inferred.",
+      "A model the gateway stopped listing is kept unless pruning is explicitly requested.",
+      "Re-running with nothing to change must not rewrite the file.",
+    ].join("\n"),
+    inspect: [
+      "any path that can lose or expose the API key",
+      "non-atomic or partial writes",
+      "file mode or ownership changes",
+      "silent loss of configuration fields",
+      "incorrect context sizes written to disk",
+      "unbounded or uncached network calls on hot paths",
+      "error handling that destroys configuration on failure",
+      "test gaps, especially behaviour no test would catch",
+      "unverifiable claims in comments",
+    ].join(", "),
+  },
   surface: {
     files: "src/status/ and src/panel/, plus their tests.",
     requirements: [

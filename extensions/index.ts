@@ -408,7 +408,7 @@ ${RECOVERY_PROMPT}`;
           ...(pruneMissing ? { pruneMissing: true } : {}),
           ...(ctx.signal ? { signal: ctx.signal } : {}),
         });
-        ctx.ui.notify(result.lines.join("\n"), result.plan.dirty && !dryRun ? "info" : "info");
+        ctx.ui.notify(result.lines.join("\n"), "info");
       } catch (err) {
         ctx.ui.notify(
           `refresh-models failed: ${err instanceof Error ? err.message : String(err)}. Your configuration was not changed.`,

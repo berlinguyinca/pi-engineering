@@ -2,8 +2,9 @@
 
 Scope: the model-gateway saturation path in the engineering harness — unbounded
 waiting for the interactive turn, `/gateway` visibility, context-safe model
-fallback — plus two supporting fixes (evidence-recorder path scoping, and a
-global `git worktree prune` removed from candidate isolation).
+fallback, and `/refresh-models` — plus two supporting fixes (evidence-recorder
+path scoping, and a global `git worktree prune` removed from candidate
+isolation).
 
 Baseline: the last accepted manual evidence was recorded at `7bf3d64`. The delta
 since then also includes upstream `f22c75e` (transient-error recovery, #6) and
@@ -132,6 +133,43 @@ fact the whole retry-safety rule rests on.
 The reviews are scoped to this delta and its interaction with the existing
 admission controller and transient-retry layers. They are not a fresh audit of
 every unrelated module.
+
+## Model catalogue refresh
+
+`/refresh-models` reads `GET {baseUrl}/models` and reconciles Pi's configured
+catalogue with what the gateway actually serves. Measured live against
+`https://llm.metabolomics.us/v1`, the configured catalogue had drifted:
+`deepseek-v4-flash` was set to 1,048,576 tokens against a real per-request limit
+of 262,144, `qwen3.8-27b-q4-250k` to 131,072 against 250,112, and
+`qwen3.8-27b-vision` was absent entirely.
+
+The over-statement is the damaging direction. Pi fills the context believing it
+fits, the request fails, and because Pi computes its usage percentage from the
+configured window, compaction fires far too late to save the turn.
+
+`ctx_per_request` is written, never `ctx_total`: this gateway reports both, and
+the total (2,359,296) is its aggregate across nine slots rather than a bound on
+one call.
+
+`models.json` holds the operator's API key, so the write preserves the file
+mode, is atomic through a same-directory rename, and leaves a timestamped
+backup. A malformed config is refused rather than replaced, and a failed fetch
+or an empty catalogue leaves the configuration exactly as it was. Values the
+gateway does not report — input modality, output limits — may be inferred but
+are reported as inferred rather than presented as read.
+
+## Gateway readiness
+
+The same endpoint reports `slots` and `x_state` per model, which explain a
+`503 no worker for model` better than any retry counter: the model that refuses
+is the one with no free slots. `/gateway` lists them and flags a model at zero
+capacity; fallback ranking places readiness above head-room, and spare capacity
+breaks ties below it. Readiness ranks but never vetoes, because the reading is a
+snapshot seconds old and treating "cold at the last poll" as disqualifying would
+refuse a fallback that would have worked. The probe is cached, coalesces
+concurrent callers, and backs off on failure rather than retrying — under
+saturation it is the first thing to fail, and hammering it would add load to the
+problem it describes.
 
 ## Repository release evidence
 

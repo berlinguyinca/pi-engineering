@@ -21,6 +21,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import {
+  MAX_BACKUPS,
   type ModelsConfig,
   providerBaseUrl,
   providerModels,
@@ -165,4 +166,62 @@ test("models config: a round trip through disk preserves the key and the models"
   } finally {
     s.cleanup();
   }
+});
+
+test("models config: a failed write leaves no key-bearing temp file behind", () => {
+  // The temp file holds the API key. One left after a failed write is a stray
+  // credential copy nobody will think to look for.
+  const s = scratch();
+  try {
+    writeFileSync(s.path, JSON.stringify(CONFIG), { mode: 0o600 });
+    // A value JSON.stringify refuses, so the write throws mid-operation.
+    const poison = { ...CONFIG, bad: 1n as unknown as number };
+    assert.throws(() => writeModelsConfig(s.path, poison as ModelsConfig));
+
+    assert.deepEqual(
+      readdirSync(s.dir).filter((f) => f.includes("tmp")),
+      [],
+    );
+    assert.deepEqual(readModelsConfig(s.path), CONFIG, "and the original is intact");
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("models config: backups are capped so credential copies do not pile up", () => {
+  const s = scratch();
+  try {
+    writeFileSync(s.path, JSON.stringify(CONFIG), { mode: 0o600 });
+    for (let i = 0; i < MAX_BACKUPS + 4; i++) {
+      writeModelsConfig(
+        s.path,
+        withProviderModels(CONFIG, "metabolomics", [{ id: `m${i}` }]),
+        new Date(Date.UTC(2026, 0, 1, 0, 0, i)),
+      );
+    }
+
+    const backups = readdirSync(s.dir).filter((f) => f.includes(".bak-"));
+    assert.equal(backups.length, MAX_BACKUPS, `expected ${MAX_BACKUPS} backups, found ${backups.length}`);
+    // The survivors must be the newest, or a rollback reaches for the wrong one.
+    assert.ok(backups.sort().at(-1)?.includes("20260101-000008"));
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("models config: a non-default file mode is preserved, not normalised to 0600", () => {
+  const s = scratch();
+  try {
+    writeFileSync(s.path, JSON.stringify(CONFIG), { mode: 0o600 });
+    chmodSync(s.path, 0o640);
+    writeModelsConfig(s.path, CONFIG);
+    assert.equal(statSync(s.path).mode & 0o777, 0o640, "the operator's chosen mode is theirs to choose");
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("models config: a non-array models field reads as empty rather than crashing", () => {
+  assert.deepEqual(providerModels({ providers: { p: { models: "nope" as unknown as [] } } }, "p"), []);
+  assert.deepEqual(providerModels({ providers: { p: { models: null as unknown as [] } } }, "p"), []);
 });

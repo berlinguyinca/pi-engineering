@@ -151,3 +151,85 @@ test("wiring: the gateway hooks are actually registered", () => {
     assert.ok((handlers.get(name) ?? []).length > 0, `${name} has no handler`);
   }
 });
+
+// ─── Command wiring ─────────────────────────────────────────────────────────
+// Both reviews flagged the commands as untested, and untested wiring is how a
+// scoping fix shipped unapplied earlier in this branch.
+
+/** Load the extension, capturing commands as well as event handlers. */
+function loadWithCommands(): Map<string, { handler: (args: string, ctx: unknown) => Promise<void> | void }> {
+  const commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<void> | void }>();
+  const pi = {
+    on: () => {},
+    registerCommand: (name: string, options: { handler: (args: string, ctx: unknown) => Promise<void> | void }) => {
+      commands.set(name, options);
+    },
+    registerTool: () => {},
+    registerShortcut: () => {},
+    registerFlag: () => {},
+    getFlag: () => undefined,
+    registerMessageRenderer: () => {},
+    registerMarkdownTransformer: () => {},
+    registerEntryRenderer: () => {},
+    setModel: async () => false,
+    events: { on: () => {}, emit: () => {} },
+  };
+  (extension as unknown as (pi: unknown) => void)(pi);
+  return commands;
+}
+
+function notifyingCtx() {
+  const notices: Array<{ text: string; level: string }> = [];
+  return {
+    notices,
+    ctx: {
+      ...ctxStub(),
+      ui: { ...ctxStub().ui, notify: (text: string, level: string) => notices.push({ text, level }) },
+    },
+  };
+}
+
+test("wiring: /gateway is registered and renders without a model or registry", async () => {
+  const commands = loadWithCommands();
+  const cmd = commands.get("gateway");
+  assert.ok(cmd, "/gateway must be registered");
+
+  const { ctx, notices } = notifyingCtx();
+  await cmd.handler("", ctx);
+
+  assert.equal(notices.length, 1);
+  // A session with nothing resolved yet must still get a usable report rather
+  // than an exception.
+  assert.match(notices[0]?.text ?? "", /Slots:/);
+  assert.match(notices[0]?.text ?? "", /Policy:/);
+});
+
+test("wiring: /refresh-models is registered and refuses without a provider", async () => {
+  const commands = loadWithCommands();
+  const cmd = commands.get("refresh-models");
+  assert.ok(cmd, "/refresh-models must be registered");
+
+  const { ctx, notices } = notifyingCtx();
+  // No model selected and no provider argument: the command must say so rather
+  // than guessing a provider and rewriting the operator's config against it.
+  await cmd.handler("", ctx);
+
+  assert.equal(notices.length, 1);
+  assert.equal(notices[0]?.level, "warning");
+  assert.match(notices[0]?.text ?? "", /No provider to refresh/);
+});
+
+test("wiring: a failing /refresh-models reports that nothing was changed", async () => {
+  const commands = loadWithCommands();
+  const cmd = commands.get("refresh-models");
+  assert.ok(cmd);
+
+  const { ctx, notices } = notifyingCtx();
+  // A provider that cannot be reached. The operator's first question is whether
+  // their configuration survived, so the answer belongs in the message.
+  await cmd.handler("provider-that-does-not-exist", { ...ctx, signal: AbortSignal.abort() });
+
+  assert.equal(notices.length, 1);
+  assert.equal(notices[0]?.level, "error");
+  assert.match(notices[0]?.text ?? "", /was not changed/);
+});
