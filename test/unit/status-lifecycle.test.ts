@@ -310,3 +310,47 @@ test("lifecycle: clearing the producing model restores the CURRENT session model
     controller.dispose();
   }
 });
+
+test("lifecycle: a gateway wait carries the queue depth into the footer", () => {
+  // The operator asked to see their position, not the 429 body, so the depth
+  // the gateway reported has to survive the trip into wait state.
+  const h = makeHarness();
+  const controller = new FooterController({ ctx: h.ctx as never, config: cfg, now: () => 1_000 });
+  try {
+    controller.onGatewayEvent({
+      type: "wait",
+      waitMs: 30_000,
+      concurrency: 3,
+      signal: {
+        retryAfterMs: 30_000,
+        retryable: true,
+        source: "body",
+        reason: "queue_timeout",
+        status: 429,
+        queued: 28,
+        queueLimit: 100,
+      },
+    });
+    assert.equal(controller.state.wait?.queued, 28);
+    assert.equal(controller.state.wait?.queueLimit, 100);
+  } finally {
+    controller.dispose();
+  }
+});
+
+test("lifecycle: a gateway wait with no queue numbers omits them rather than guessing", () => {
+  const h = makeHarness();
+  const controller = new FooterController({ ctx: h.ctx as never, config: cfg, now: () => 1_000 });
+  try {
+    controller.onGatewayEvent({
+      type: "wait",
+      waitMs: 5_000,
+      concurrency: 3,
+      signal: { retryAfterMs: 5_000, retryable: true, source: "header" },
+    });
+    assert.equal(controller.state.wait?.queued, undefined);
+    assert.equal(controller.state.wait?.queueLimit, undefined);
+  } finally {
+    controller.dispose();
+  }
+});

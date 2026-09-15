@@ -30,6 +30,13 @@ function modelInfo(model: { provider?: string; id?: string } | undefined): Model
   return model ? { provider: model.provider, id: model.id } : {};
 }
 
+/**
+ * Countdown/spinner tick. Fast enough to animate the spinner (the layout
+ * derives its frame from the clock), slow enough that a multi-minute hold is
+ * not a render storm.
+ */
+const WAIT_TICK_MS = 250;
+
 /** Extract streamed text from a message_update assistant event. */
 function extractDelta(event: unknown): string {
   if (!event || typeof event !== "object") return "";
@@ -175,6 +182,10 @@ export class FooterController {
       kind: "gateway",
       detail: signal.reason ?? signal.type ?? String(signal.status ?? 429),
       untilMs: this.now() + event.waitMs,
+      // Queue depth is what the footer shows instead of the 429 body: it is
+      // the one number that says whether the hold is going anywhere.
+      ...(signal.queued !== undefined ? { queued: signal.queued } : {}),
+      ...(signal.queueLimit !== undefined ? { queueLimit: signal.queueLimit } : {}),
     });
   }
 
@@ -291,7 +302,7 @@ export class FooterController {
   /** One tick per second while a deadline is live: only the countdown moves. */
   private startWaitTick(): void {
     if (this.waitTimer) return;
-    this.waitTimer = setInterval(() => this.tickWait(), 1000);
+    this.waitTimer = setInterval(() => this.tickWait(), WAIT_TICK_MS);
     this.waitTimer.unref?.();
   }
 

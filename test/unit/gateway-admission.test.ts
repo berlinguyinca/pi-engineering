@@ -339,3 +339,68 @@ test("a throwing subscriber cannot break admission control", () => {
   assert.doesNotThrow(() => controller.noteWait({ retryAfterMs: 5_000, retryable: true, source: "body" }));
   assert.equal(controller.cooldownRemainingMs(), 5_000);
 });
+
+// ─── Unbounded waiting (operator policy: wait, never fail on saturation) ─────
+
+test("the default retry budget is unlimited: saturation is waited out, not failed", () => {
+  const saved = { ...process.env };
+  try {
+    for (const key of Object.keys(process.env)) if (key.startsWith("PI_GATEWAY_")) delete process.env[key];
+    const cfg = resolveGatewayConfig();
+    assert.equal(cfg.maxRetries, Number.POSITIVE_INFINITY, "a 429 must never exhaust a worker's budget");
+    assert.equal(cfg.maxWaitMs, Number.POSITIVE_INFINITY, "a capped wait manufactures the next 429");
+  } finally {
+    process.env = saved;
+  }
+});
+
+test("an unlimited budget never gives up, however many waits have been spent", () => {
+  const decision = decideGatewayRetry(PRODUCTION_429, 10_000, Number.POSITIVE_INFINITY);
+  assert.equal(decision.action, "wait");
+});
+
+test("an explicit budget of zero still means zero (no sentinel collision with unlimited)", () => {
+  const saved = { ...process.env };
+  try {
+    process.env.PI_GATEWAY_MAX_RETRIES = "0";
+    assert.equal(resolveGatewayConfig().maxRetries, 0);
+    assert.equal(decideGatewayRetry(PRODUCTION_429, 0, 0).action, "give-up");
+  } finally {
+    process.env = saved;
+  }
+});
+
+test("a long advertised wait is honoured in full by default", () => {
+  // Clamping a 5-minute wait to 2 minutes only sends the retry into the same
+  // saturated queue and earns the same 429.
+  const { controller } = testController();
+  const armed = controller.noteWait({ retryAfterMs: 300_000, retryable: true, source: "body" });
+  assert.equal(armed, 300_000);
+});
+
+test("an unbounded wait is abortable: the operator's escape ends the hold", async () => {
+  const { controller } = testController();
+  const abort = new AbortController();
+  controller.noteWait({ retryAfterMs: 600_000, retryable: true, source: "body" });
+  abort.abort();
+  const waited = await controller.awaitCooldown({ signal: abort.signal });
+  assert.equal(waited, 0, "an already-aborted turn must not wait at all");
+  assert.ok(controller.cooldownRemainingMs() > 0, "the cooldown itself still stands for everyone else");
+});
+
+test("aborting mid-hold stops that caller without shortening the process-wide cooldown", async () => {
+  const now = 1_000;
+  const abort = new AbortController();
+  const controller = new AdmissionController({
+    maxConcurrency: 4,
+    jitterMs: 0,
+    now: () => now,
+    // A sleeper that never settles on its own: only the abort can end this.
+    sleep: () => new Promise<void>(() => {}),
+  });
+  controller.noteWait({ retryAfterMs: 600_000, retryable: true, source: "body" });
+  const pending = controller.awaitCooldown({ signal: abort.signal });
+  abort.abort();
+  assert.equal(await pending, 0);
+  assert.equal(controller.status().waiting, 0, "the waiter must be released from the ledger");
+});

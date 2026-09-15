@@ -31,7 +31,12 @@ export interface AdmissionControllerOptions {
    * first 429 is precisely when the runtime was overloading the gateway.
    */
   reservedSlots?: number;
-  /** Upper bound on a single honoured wait (a bad payload cannot park us forever). */
+  /**
+   * Upper bound on a single honoured wait. Unlimited by default: the operator's
+   * policy is to wait until the gateway has capacity rather than fail, and a
+   * clamped wait only re-enters the same saturated queue. Set a finite value to
+   * stop a bad payload parking the runtime.
+   */
   maxWaitMs?: number;
   /**
    * Random stagger added when releasing waiters, so a cooldown that expires
@@ -67,6 +72,16 @@ export interface AdmissionStatus {
   cooldownMs: number;
   /** The signal that produced the current cooldown, when any. */
   lastSignal?: GatewayWaitSignal;
+}
+
+/** Options shared by every call that may park the caller. */
+export interface AdmissionWaitOptions {
+  /**
+   * Abort the wait for THIS caller (the turn's own signal). The process-wide
+   * cooldown is unaffected: one operator pressing escape does not tell the
+   * gateway it has capacity again.
+   */
+  signal?: AbortSignal;
 }
 
 /** A held admission slot. Release is idempotent. */
@@ -106,7 +121,7 @@ export class AdmissionController {
     this.configuredMax = Math.max(1, opts.maxConcurrency);
     this.minConcurrency = Math.max(1, opts.minConcurrency ?? 1);
     this.reservedSlots = Math.max(0, opts.reservedSlots ?? 0);
-    this.maxWaitMs = Math.max(0, opts.maxWaitMs ?? 120_000);
+    this.maxWaitMs = Math.max(0, opts.maxWaitMs ?? Number.POSITIVE_INFINITY);
     this.jitterMs = Math.max(0, opts.jitterMs ?? 250);
     this.successesToRelax = Math.max(1, opts.successesToRelax ?? 3);
     this.now = opts.now ?? (() => Date.now());
@@ -166,14 +181,21 @@ export class AdmissionController {
    * slot across the request, but we can keep them off the wire while the
    * gateway is telling everyone to back off.
    */
-  async awaitCooldown(): Promise<number> {
+  async awaitCooldown(opts: AdmissionWaitOptions = {}): Promise<number> {
+    const signal = opts.signal;
     let waited = 0;
     this.waiting++;
     try {
       for (;;) {
+        // An unbounded wait needs a way out, or a saturated gateway becomes a
+        // wedged session. The turn's own abort signal (escape) is that way out:
+        // it releases THIS caller and leaves the cooldown standing for everyone
+        // else, because the gateway is still saturated either way.
+        if (signal?.aborted) return waited;
         const remaining = this.cooldownRemainingMs();
         if (remaining <= 0) break;
-        await this.sleep(remaining);
+        await this.sleepOrAbort(remaining, signal);
+        if (signal?.aborted) return waited;
         waited += remaining;
       }
     } finally {
@@ -183,13 +205,31 @@ export class AdmissionController {
     return waited;
   }
 
+  /** Sleep, returning early (without throwing) if the caller is aborted. */
+  private sleepOrAbort(ms: number, signal: AbortSignal | undefined): Promise<void> {
+    const sleeping = this.sleep(ms);
+    if (!signal) return sleeping;
+    return new Promise<void>((resolve) => {
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        signal.removeEventListener("abort", finish);
+        resolve();
+      };
+      signal.addEventListener("abort", finish, { once: true });
+      // The timer is left to expire on its own; it holds nothing but itself.
+      void sleeping.then(finish, finish);
+    });
+  }
+
   /**
    * Acquire an admission slot: waits for the cooldown to expire AND for a free
    * slot under the current concurrency limit.
    */
-  async acquire(): Promise<AdmissionSlot> {
+  async acquire(opts: AdmissionWaitOptions = {}): Promise<AdmissionSlot> {
     for (;;) {
-      await this.awaitCooldown();
+      await this.awaitCooldown(opts);
       if (this.active < this.effectiveLimit()) {
         this.active++;
         break;
@@ -247,9 +287,9 @@ export class AdmissionController {
    * Arm the cooldown and wait it out, holding no slot.
    * Used by a caller that just received the 429 and intends to retry.
    */
-  async noteWaitAndSleep(signal: GatewayWaitSignal): Promise<number> {
+  async noteWaitAndSleep(signal: GatewayWaitSignal, opts: AdmissionWaitOptions = {}): Promise<number> {
     this.noteWait(signal);
-    return this.awaitCooldown();
+    return this.awaitCooldown(opts);
   }
 
   /** Record a clean run: relaxes the clamp back toward the configured max. */

@@ -169,11 +169,18 @@ Pi's own auto-retry ignores both and backs off exponentially (1s, 2s, 4s against
 a 30s ask), so the runtime reads the refusal itself:
 
 * the reported `retry_after_ms` (body) or `Retry-After` (header) is honoured
-  as-is, capped by `PI_GATEWAY_MAX_WAIT_MS`;
+  **in full** — clamping a wait the gateway asked for only sends the retry back
+  into the same saturated queue and earns the same 429;
+* saturation is a wait, never a failure: the retry budget is **unlimited** by
+  default, so a worker keeps waiting until the gateway has capacity;
 * the cooldown is held **process-wide** — every model caller waits behind one
   gate, so parallel tournament legs stop hammering a queue that just refused
-  one of them, and the interactive session holds its next request too (every
-  hold is announced, so a wait is never a silent stall);
+  one of them, and the interactive session holds its next request too;
+* a hold is visible in the status bar (spinner, countdown, and your position in
+  the gateway's queue) rather than as repeated warnings, and **escape ends the
+  hold** for your turn — an unbounded wait you cannot cancel is a wedged
+  session, and one operator escaping does not tell the gateway it has capacity
+  again, so the cooldown stands for everyone else;
 * concurrency is capped at `PI_GATEWAY_MAX_CONCURRENCY` minus a slot reserved
   for your own interactive turn — held from the start, since the window before
   the first refusal is exactly when the gateway gets overloaded — and clamped
@@ -187,14 +194,35 @@ Waiting out backpressure is deliberately **separate** from the degeneration
 recovery ladder: a queue timeout is not a degeneration, and must not burn
 attempts lowering reasoning effort or swapping models.
 
+### The one limit this cannot remove
+
+The worker sessions run with Pi's own auto-retry disabled, so the unlimited
+budget above is the whole story for them: a scout, implementer, reviewer or
+tournament leg waits as long as it takes. Note the consequence — a worker's
+`timeoutMs` bounds one *attempt*, not the wait, so a permanently saturated
+gateway parks that worker indefinitely by design. Set `PI_GATEWAY_MAX_RETRIES`
+if you want a ceiling.
+
+Your **interactive** turn is different. Pi retries it itself and stops after
+`retry.maxRetries` (default 3), and the extension API exposes no accessor for
+that setting, so the runtime cannot raise it for you. Raise it yourself in
+`.pi/settings.json`:
+
+```json
+{ "retry": { "maxRetries": 100 } }
+```
+
+The runtime says this once per session, the second time it holds for a
+saturated gateway.
+
 | Variable | Default | Meaning |
 | -------- | ------- | ------- |
 | `PI_GATEWAY_ADMISSION_ENABLED` | `true` | Disable admission control entirely |
 | `PI_GATEWAY_MAX_CONCURRENCY` | `4` | Total concurrent model requests this runtime aims at |
 | `PI_GATEWAY_RESERVED_SLOTS` | `1` | Of that total, slots kept free for your interactive turn (so 3 worker sessions by default, held from the start) |
-| `PI_GATEWAY_MAX_WAIT_MS` | `120000` | Cap on a single honoured wait |
+| `PI_GATEWAY_MAX_WAIT_MS` | *none* | Cap on a single honoured wait; unset means the gateway's ask is honoured in full |
 | `PI_GATEWAY_JITTER_MS` | `250` | Release stagger window |
-| `PI_GATEWAY_MAX_RETRIES` | `4` | Gateway-wait retries per worker attempt |
+| `PI_GATEWAY_MAX_RETRIES` | *unlimited* | Gateway-wait retries per worker attempt; set a number to make workers give up |
 | `PI_GATEWAY_TELEMETRY` | `true` | Emit `[gateway-admission]` events on stderr |
 
 ## Engineering panel
@@ -247,11 +275,15 @@ contract and the mouse is a bonus.
 The footer answers "what is it doing, and why is nothing happening":
 
 ```
-⏳ gateway 30s · queue_timeout │ WI-12 implement │ opus-5 │ main │ ⚡247 t/s
+⠙ gateway 28s · queue 30/100 │ WI-12 implement │ opus-5 │ main │ ⚡247 t/s
 ```
 
-- **the wait** — why the runtime is idle, counting down. Fed from the gateway
-  admission controller, so a backoff is visible rather than looking like a hang.
+- **the wait** — why the runtime is idle: a spinner (a still glyph reads as a
+  hang, and a gateway hold can now run for minutes), the countdown, and your
+  position in the gateway's queue when it reports one — `queue 30/100` answers
+  "is this draining?", which `queue_timeout` never did. Waits with no queue
+  numbers fall back to the reason. Fed from the gateway admission controller,
+  which is why a backoff is a status line rather than a wall of warnings.
 - **the task** — the work item and pipeline phase currently in flight
   (`scout`, `implement`, `verify`, `review`), cleared when the run settles,
   including when it fails.

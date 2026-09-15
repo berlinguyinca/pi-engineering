@@ -323,6 +323,14 @@ ${RECOVERY_PROMPT}`;
       if (signal?.retryable) admission.noteWait(signal);
     });
 
+    // Pi's own session retry stops after `retry.maxRetries` (default 3) and
+    // there is no accessor for it on the extension API, so the interactive turn
+    // can still surface a 429 after three honoured waits even though every
+    // worker now waits indefinitely. Say so once, with the fix, rather than
+    // letting the operator rediscover it each time.
+    let retryAdviceShown = false;
+    let gatewayHolds = 0;
+
     // Terminal assistant error: the only place `retry_after_ms` appears, since
     // it lives in the response BODY.
     pi.on("message_end", async (event, ctx) => {
@@ -331,10 +339,23 @@ ${RECOVERY_PROMPT}`;
       const signal = parseGatewayWait({ text: msg.errorMessage });
       if (!signal?.retryable) return;
       const waitMs = admission.noteWait(signal);
-      ctx.ui.notify(
-        `Model gateway is saturated — holding ${Math.round(waitMs / 1000)}s. ${describeGatewayWait(signal)}`,
-        "warning",
-      );
+      // The status bar owns this now: a spinner, the countdown and the queue
+      // position say everything the 429 body did, without a wall of warnings
+      // every 30 seconds. Notify only when there is no status bar to read.
+      if (!statusBarConfig.enabled) {
+        ctx.ui.notify(
+          `Model gateway is saturated — holding ${Math.round(waitMs / 1000)}s. ${describeGatewayWait(signal)}`,
+          "warning",
+        );
+      }
+      gatewayHolds++;
+      if (gatewayHolds >= 2 && !retryAdviceShown) {
+        retryAdviceShown = true;
+        ctx.ui.notify(
+          'Gateway saturation is being waited out. Engineering workers now wait indefinitely; this interactive turn still stops at Pi\'s own retry budget — raise it with `"retry": { "maxRetries": 100 }` in .pi/settings.json.',
+          "info",
+        );
+      }
     });
 
     // Hold the next provider request until the shared cooldown expires, so a
@@ -342,21 +363,30 @@ ${RECOVERY_PROMPT}`;
     // queue the gateway just asked us to leave alone.
     //
     // This fires for EVERY provider call, compaction and summarization
-    // included, so a hold is always announced: a silent multi-second stall in
-    // the user's own session would be worse than the 429 it prevents.
+    // included, so a hold must be visible: a silent multi-second stall in the
+    // user's own session would be worse than the 429 it prevents. The status
+    // bar carries that (spinner + countdown + queue position); the notify path
+    // is the fallback for a session running without one.
+    //
+    // The wait is unbounded by policy, so it is tied to the turn's own abort
+    // signal: escape ends the hold for this caller and leaves the cooldown
+    // standing for everyone else.
     let noticeSilentUntil = 0;
     pi.on("before_provider_request", async (_event, ctx) => {
       const remaining = admission.cooldownRemainingMs();
       if (remaining <= 0) return;
-      const now = Date.now();
-      if (now >= noticeSilentUntil) {
-        noticeSilentUntil = now + remaining;
-        ctx.ui.notify(
-          `Waiting ${Math.ceil(remaining / 1000)}s for the model gateway — ${admission.describe()}`,
-          "warning",
-        );
+      if (!statusBarConfig.enabled) {
+        const now = Date.now();
+        if (now >= noticeSilentUntil) {
+          noticeSilentUntil = now + remaining;
+          ctx.ui.notify(
+            `Waiting ${Math.ceil(remaining / 1000)}s for the model gateway — ${admission.describe()}`,
+            "warning",
+          );
+        }
       }
-      await admission.awaitCooldown();
+      const signal = ctx.signal;
+      await admission.awaitCooldown(signal ? { signal } : {});
     });
   }
 

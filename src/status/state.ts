@@ -36,6 +36,14 @@ export interface WaitState {
   detail: string;
   /** Epoch ms when the wait is expected to end. Omitted when unknown. */
   untilMs?: number;
+  /**
+   * Requests queued ahead of us, as the gateway reported them. Rendered as a
+   * position rather than the 429 body: an operator watching a hold wants to
+   * know whether the queue is draining, not to read an error.
+   */
+  queued?: number;
+  /** The gateway's queue capacity, when it reports one. */
+  queueLimit?: number;
 }
 
 /** The engineering task currently in flight. */

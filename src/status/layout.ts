@@ -182,6 +182,20 @@ function formatTask(task: TaskState, labelBudget: number): string {
  * "⏳ gateway 30s · queue_timeout" — rendered at the highest priority, so it is
  * the last segment standing as the terminal narrows.
  */
+/**
+ * Spinner frames for a hold. A still glyph reads as a hang, and a hold can now
+ * run for minutes (the gateway budget is unlimited), so the segment has to look
+ * alive. The frame is derived from the clock rather than an internal counter so
+ * `renderStatus` stays pure.
+ */
+const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const SPINNER_PERIOD_MS = 250;
+
+function spinnerFrame(nowMs: number): string {
+  const index = Math.floor(Math.max(0, nowMs) / SPINNER_PERIOD_MS) % SPINNER_FRAMES.length;
+  return SPINNER_FRAMES[index] ?? SPINNER_FRAMES[0]!;
+}
+
 function formatWait(wait: WaitState, nowMs: number): string {
   const parts: string[] = [wait.kind];
   if (wait.untilMs != null) {
@@ -189,7 +203,12 @@ function formatWait(wait: WaitState, nowMs: number): string {
     parts.push(`${Math.ceil(remainingMs / 1000)}s`);
   }
   const head = parts.join(" ");
-  return wait.detail ? `⏳ ${head} · ${wait.detail}` : `⏳ ${head}`;
+  // Queue position beats the reason: it answers "is this moving?", which the
+  // reason ("queue_timeout") never does.
+  const detail =
+    wait.queued != null ? `queue ${wait.queued}${wait.queueLimit != null ? `/${wait.queueLimit}` : ""}` : wait.detail;
+  const spinner = spinnerFrame(nowMs);
+  return detail ? `${spinner} ${head} · ${detail}` : `${spinner} ${head}`;
 }
 
 let cachedHome: string | undefined;
