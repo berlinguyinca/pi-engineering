@@ -381,10 +381,9 @@ ${RECOVERY_PROMPT}`;
       }
       const lines = [describeUpdate(result.decision, { applied: result.applied })];
       if (result.observation?.upstream) {
+        const dirtyNote = result.observation.dirty ? " · uncommitted changes present" : "";
         lines.push(
-          `branch ${result.observation.branch} tracking ${result.observation.upstream}` +
-            ` · ${result.observation.ahead} ahead, ${result.observation.behind} behind` +
-            (result.observation.dirty ? " · uncommitted changes present" : ""),
+          `branch ${result.observation.branch} tracking ${result.observation.upstream} · ${result.observation.ahead} ahead, ${result.observation.behind} behind${dirtyNote}`,
         );
       }
       if (result.head) lines.push(`now at ${result.head.slice(0, 12)}`);
