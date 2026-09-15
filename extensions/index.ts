@@ -40,6 +40,8 @@ const runtimes = new Map<string, { runtime: EngineeringRuntime; memoryIdentity: 
 // controller (src/status/). One active controller per session.
 const statusBarConfig = resolveStatusBarConfig();
 let activeFooter: FooterController | null = null;
+/** Subscriptions bound to the active footer's lifetime (drained on shutdown). */
+const footerUnsubscribes: Array<() => void> = [];
 
 async function getRuntime(ctx: ExtensionCommandContext, worker?: EngineeringRuntime): Promise<EngineeringRuntime> {
   return getRuntimeByCwd(worker ? worker.cwd : ctx.cwd, ctx.model);
@@ -309,8 +311,15 @@ ${RECOVERY_PROMPT}`;
   // real pi session, so guard like the Generation Guard block above.
   if (statusBarConfig.enabled && typeof pi.on === "function") {
     pi.on("session_start", (_event, ctx) => {
+      for (const un of footerUnsubscribes.splice(0)) un();
       activeFooter?.dispose();
-      activeFooter = new FooterController({ ctx, config: statusBarConfig });
+      const footer = new FooterController({ ctx, config: statusBarConfig });
+      activeFooter = footer;
+      // The footer is a second consumer of admission events (telemetry owns the
+      // constructor hook), so it subscribes and gives the wait a countdown.
+      if (gatewayConfig.enabled) {
+        footerUnsubscribes.push(sharedAdmissionController().subscribe((event) => footer.onGatewayEvent(event)));
+      }
     });
 
     pi.on("message_start", () => activeFooter?.onMessageStart());
@@ -318,6 +327,7 @@ ${RECOVERY_PROMPT}`;
     pi.on("message_end", (event) => activeFooter?.onMessageEnd(event));
     pi.on("model_select", (event) => activeFooter?.onModelSelect(event.model));
     pi.on("session_shutdown", () => {
+      for (const un of footerUnsubscribes.splice(0)) un();
       activeFooter?.dispose();
       activeFooter = null;
     });

@@ -302,3 +302,40 @@ test("non-gateway failures fall through to the normal failure path", () => {
   assert.equal(decideGatewayRetry(undefined, 0, 4).action, "not-gateway");
   assert.equal(decideGatewayRetry("tool 'read' not found", 0, 4).action, "not-gateway");
 });
+
+// ─── Observers ──────────────────────────────────────────────────────────────
+
+test("subscribers receive admission events alongside the telemetry hook", () => {
+  const seen: string[] = [];
+  const hook: string[] = [];
+  const controller = new AdmissionController({
+    maxConcurrency: 4,
+    jitterMs: 0,
+    now: () => 1_000,
+    sleep: async () => {},
+    onEvent: (e) => hook.push(e.type),
+  });
+  const unsubscribe = controller.subscribe((e) => seen.push(e.type));
+
+  controller.noteWait({ retryAfterMs: 30_000, retryable: true, source: "body", activeLimit: 1 });
+  assert.deepEqual(hook, ["clamp", "wait"]);
+  assert.deepEqual(seen, ["clamp", "wait"]);
+
+  unsubscribe();
+  controller.noteWait({ retryAfterMs: 1_000, retryable: true, source: "body" });
+  assert.deepEqual(seen, ["clamp", "wait"], "unsubscribed listener must stop receiving");
+});
+
+test("a throwing subscriber cannot break admission control", () => {
+  const controller = new AdmissionController({
+    maxConcurrency: 4,
+    jitterMs: 0,
+    now: () => 1_000,
+    sleep: async () => {},
+  });
+  controller.subscribe(() => {
+    throw new Error("listener blew up");
+  });
+  assert.doesNotThrow(() => controller.noteWait({ retryAfterMs: 5_000, retryable: true, source: "body" }));
+  assert.equal(controller.cooldownRemainingMs(), 5_000);
+});

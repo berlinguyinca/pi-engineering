@@ -99,6 +99,8 @@ export class AdmissionController {
   private lastSignal: GatewayWaitSignal | undefined;
   /** Waiters parked on a free slot, resolved in FIFO order. */
   private readonly slotWaiters: Array<() => void> = [];
+  /** Event observers (the status footer, and anything else watching). */
+  private readonly listeners = new Set<(event: AdmissionEvent) => void>();
 
   constructor(opts: AdmissionControllerOptions) {
     this.configuredMax = Math.max(1, opts.maxConcurrency);
@@ -113,6 +115,33 @@ export class AdmissionController {
     this.onEvent = opts.onEvent;
     this.baseConcurrency = Math.max(this.minConcurrency, this.configuredMax - this.reservedSlots);
     this.concurrency = this.baseConcurrency;
+  }
+
+  /**
+   * Observe admission events. Returns an unsubscribe.
+   *
+   * The constructor's `onEvent` hook is a single slot already spent on
+   * telemetry, so additional consumers (the status footer) subscribe here.
+   */
+  subscribe(listener: (event: AdmissionEvent) => void): () => void {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
+
+  /** Emit to the constructor hook and every subscriber. Observers never participate. */
+  private emit(event: AdmissionEvent): void {
+    try {
+      this.onEvent?.(event);
+    } catch {
+      // A misbehaving telemetry hook must never break admission control.
+    }
+    for (const listener of this.listeners) {
+      try {
+        listener(event);
+      } catch {
+        // Same contract as StatusState: a broken observer is not our problem.
+      }
+    }
   }
 
   status(): AdmissionStatus {
@@ -206,11 +235,11 @@ export class AdmissionController {
       if (target < this.concurrency) {
         const previous = this.concurrency;
         this.concurrency = target;
-        this.onEvent?.({ type: "clamp", concurrency: target, previous, signal });
+        this.emit({ type: "clamp", concurrency: target, previous, signal });
       }
     }
 
-    this.onEvent?.({ type: "wait", waitMs, signal, concurrency: this.concurrency });
+    this.emit({ type: "wait", waitMs, signal, concurrency: this.concurrency });
     return waitMs;
   }
 
@@ -231,7 +260,7 @@ export class AdmissionController {
     this.consecutiveSuccesses = 0;
     const previous = this.concurrency;
     this.concurrency = Math.min(this.baseConcurrency, this.concurrency + 1);
-    this.onEvent?.({ type: "relax", concurrency: this.concurrency, previous });
+    this.emit({ type: "relax", concurrency: this.concurrency, previous });
     // The freed slot is real: let a parked caller take it.
     this.wakeOne();
   }

@@ -14,10 +14,11 @@
 
 import type { ExtensionContext, ReadonlyFooterDataProvider, Theme } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth } from "@earendil-works/pi-tui";
+import type { AdmissionEvent } from "../gateway/AdmissionController.ts";
 import type { StatusBarConfig } from "./config.ts";
 import { GitContextProvider } from "./git-context.ts";
 import { renderStatus } from "./layout.ts";
-import { type HarnessStatusState, StatusState } from "./state.ts";
+import { type HarnessStatusState, StatusState, type TaskState, type WaitState } from "./state.ts";
 import { ThroughputTracker } from "./throughput.ts";
 
 interface ModelInfo {
@@ -68,6 +69,7 @@ export class FooterController {
   private disposed = false;
   private renderRequest: (() => void) | undefined;
   private renderTimer: ReturnType<typeof setTimeout> | null = null;
+  private waitTimer: ReturnType<typeof setInterval> | null = null;
   private lastRenderAt = 0;
   private readonly unsubs: Array<() => void> = [];
 
@@ -151,6 +153,57 @@ export class FooterController {
     this.requestRender();
   }
 
+  /**
+   * Translate a gateway admission event into footer wait state.
+   *
+   * Only `wait` events carry a deadline; clamp/relax change concurrency, which
+   * is not something the operator needs in the footer.
+   */
+  onGatewayEvent(event: AdmissionEvent): void {
+    if (this.disposed) return;
+    if (event.type !== "wait") return;
+    const signal = event.signal;
+    this.setWait({
+      kind: "gateway",
+      detail: signal.reason ?? signal.type ?? String(signal.status ?? 429),
+      untilMs: this.now() + event.waitMs,
+    });
+  }
+
+  /** Publish (or clear) the wait, starting or stopping the countdown tick. */
+  setWait(wait: WaitState | undefined): void {
+    if (this.disposed) return;
+    this.status.set({ wait });
+    if (wait?.untilMs != null) this.startWaitTick();
+    else this.stopWaitTick();
+    this.requestRender();
+  }
+
+  /** Publish (or clear) the engineering task in flight. */
+  setTask(task: TaskState | undefined): void {
+    if (this.disposed) return;
+    this.status.set({ task });
+    this.requestRender();
+  }
+
+  /**
+   * Re-render the countdown; clears the wait once it has elapsed so the footer
+   * never shows a stale "0s" hold.
+   */
+  tickWait(): void {
+    if (this.disposed) return;
+    const wait = this.status.snapshot.wait;
+    if (!wait) {
+      this.stopWaitTick();
+      return;
+    }
+    if (wait.untilMs != null && this.now() >= wait.untilMs) {
+      this.status.set({ wait: undefined });
+      this.stopWaitTick();
+    }
+    this.requestRender();
+  }
+
   /** cwd change: re-resolve git + refresh. */
   onCwdChange(cwd: string): void {
     if (this.disposed) return;
@@ -176,6 +229,7 @@ export class FooterController {
     this.unsubs.length = 0;
     if (this.renderTimer) clearTimeout(this.renderTimer);
     this.renderTimer = null;
+    this.stopWaitTick();
     this.throughput.reset();
     this.git.invalidate();
     this.status.dispose();
@@ -185,7 +239,7 @@ export class FooterController {
   private renderLine(width: number, theme: Theme, footerData: ReadonlyFooterDataProvider): string[] {
     let line = "";
     try {
-      line = renderStatus(this.status.snapshot, width, this.config);
+      line = renderStatus(this.status.snapshot, width, this.config, this.now());
     } catch {
       line = "";
     }
@@ -198,6 +252,19 @@ export class FooterController {
       lines.push(theme.fg("muted", truncateToWidth(extensions, Math.max(0, width), "…")));
     }
     return lines;
+  }
+
+  /** One tick per second while a deadline is live: only the countdown moves. */
+  private startWaitTick(): void {
+    if (this.waitTimer) return;
+    this.waitTimer = setInterval(() => this.tickWait(), 1000);
+    this.waitTimer.unref?.();
+  }
+
+  private stopWaitTick(): void {
+    if (!this.waitTimer) return;
+    clearInterval(this.waitTimer);
+    this.waitTimer = null;
   }
 
   private publishThroughput(): void {

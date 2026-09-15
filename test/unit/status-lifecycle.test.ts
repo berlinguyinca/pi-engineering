@@ -205,3 +205,48 @@ test("lifecycle: throughput coalesces renders via refreshMs (no per-token storm)
   assert.ok(h.renderCount - initial <= 2, `coalesced (got ${h.renderCount - initial} renders for 50 events)`);
   controller.dispose();
 });
+
+test("lifecycle: a gateway wait becomes footer wait state and clears when it expires", () => {
+  const h = makeHarness();
+  let now = 1_000;
+  const controller = new FooterController({ ctx: h.ctx as never, config: cfg, now: () => now });
+  try {
+    controller.onGatewayEvent({
+      type: "wait",
+      waitMs: 30_000,
+      concurrency: 3,
+      signal: { retryAfterMs: 30_000, retryable: true, source: "body", reason: "queue_timeout", status: 429 },
+    });
+
+    assert.equal(controller.state.wait?.kind, "gateway");
+    assert.equal(controller.state.wait?.detail, "queue_timeout");
+    assert.equal(controller.state.wait?.untilMs, 31_000);
+
+    now = 31_001;
+    controller.tickWait();
+    assert.equal(controller.state.wait, undefined, "an expired wait must clear itself");
+  } finally {
+    controller.dispose();
+  }
+});
+
+test("lifecycle: non-wait admission events do not set a wait", () => {
+  const h = makeHarness();
+  const controller = new FooterController({ ctx: h.ctx as never, config: cfg, now: fixedClock() });
+  try {
+    controller.onGatewayEvent({ type: "relax", concurrency: 3, previous: 2 });
+    assert.equal(controller.state.wait, undefined);
+  } finally {
+    controller.dispose();
+  }
+});
+
+test("lifecycle: dispose stops the wait countdown timer", () => {
+  const h = makeHarness();
+  const controller = new FooterController({ ctx: h.ctx as never, config: cfg, now: () => 0 });
+  controller.setWait({ kind: "gateway", detail: "queue_timeout", untilMs: 30_000 });
+  controller.dispose();
+  // A live interval would keep the event loop referenced and mutate disposed state.
+  controller.tickWait();
+  assert.equal(controller.state.wait?.detail, "queue_timeout", "disposed controller must not mutate state");
+});
