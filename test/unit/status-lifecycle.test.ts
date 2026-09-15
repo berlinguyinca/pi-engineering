@@ -278,3 +278,35 @@ test("lifecycle: the producing model overrides the session model while a worker 
     controller.dispose();
   }
 });
+
+test("lifecycle: a settling run does not clear a different run's task", () => {
+  const h = makeHarness();
+  const controller = new FooterController({ ctx: h.ctx as never, config: cfg, now: fixedClock() });
+  try {
+    // Parallel tournament legs each own a runtime and each emit "settled".
+    controller.setTask({ workItemId: "WI-1", phase: "implement" });
+    controller.setTask({ workItemId: "WI-2", phase: "implement" });
+
+    controller.clearTask("WI-1");
+    assert.equal(controller.state.task?.workItemId, "WI-2", "a stale settle must not clear the live task");
+
+    controller.clearTask("WI-2");
+    assert.equal(controller.state.task, undefined);
+  } finally {
+    controller.dispose();
+  }
+});
+
+test("lifecycle: clearing the producing model restores the CURRENT session model", () => {
+  const h = makeHarness();
+  const controller = new FooterController({ ctx: h.ctx as never, config: cfg, now: fixedClock() });
+  try {
+    controller.onModelSelect({ provider: "p", id: "m2" }); // user switched mid-session
+    controller.setProducingModel("haiku-4-5");
+    assert.equal(controller.state.model, "haiku-4-5");
+    controller.setProducingModel(undefined);
+    assert.equal(controller.state.model, "m2", "must restore the model selected during the session");
+  } finally {
+    controller.dispose();
+  }
+});

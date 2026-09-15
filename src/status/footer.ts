@@ -70,6 +70,12 @@ export class FooterController {
   private renderRequest: (() => void) | undefined;
   private renderTimer: ReturnType<typeof setTimeout> | null = null;
   private waitTimer: ReturnType<typeof setInterval> | null = null;
+  /**
+   * The session's own model, tracked across `model_select`. `ctx.model` is a
+   * snapshot taken when the controller was constructed, so it goes stale the
+   * moment the user switches models mid-session.
+   */
+  private sessionModel: string | undefined;
   private lastRenderAt = 0;
   private readonly unsubs: Array<() => void> = [];
 
@@ -90,6 +96,7 @@ export class FooterController {
     });
 
     const m = modelInfo(opts.ctx.model);
+    this.sessionModel = m.id;
     this.status.set({ model: m.id, provider: m.provider });
 
     // Own the footer. This is the harness's single footer ownership point.
@@ -144,6 +151,7 @@ export class FooterController {
   onModelSelect(model: { provider?: string; id?: string } | undefined): void {
     if (this.disposed) return;
     const m = modelInfo(model);
+    this.sessionModel = m.id;
     this.throughput.reset();
     this.status.set({
       model: m.id,
@@ -194,8 +202,22 @@ export class FooterController {
    */
   setProducingModel(model: string | undefined): void {
     if (this.disposed) return;
-    this.status.set({ model: model ?? modelInfo(this.ctx.model).id });
+    this.status.set({ model: model ?? this.sessionModel });
     this.requestRender();
+  }
+
+  /**
+   * Clear the task, but only if `workItemId` is the one on display.
+   *
+   * Parallel tournament legs and DAG waves each own a runtime and each report
+   * their own settle, so an unconditional clear would blank the footer the
+   * moment the FIRST leg finished while the others were still running. The
+   * same guard covers a second run starting before the first one settles.
+   */
+  clearTask(workItemId: string): void {
+    if (this.disposed) return;
+    if (this.status.snapshot.task?.workItemId !== workItemId) return;
+    this.setTask(undefined);
   }
 
   /**

@@ -98,7 +98,10 @@ never more than once per configured interval.
 It runs through the **same admission gate as every other model call**, so the
 narrator can never compete with engineering work for a saturated gateway, and
 it is skipped entirely while a cooldown is active — a narrative update is never
-worth delaying a run.
+worth delaying a run. Note for the implementer: the gate is not automatic.
+`AdmissionController.acquire()` is called from `PiWorkerExecutor` only, so a
+narrator that reaches a model by any other path bypasses it silently. Route the
+narrator through the worker executor, or acquire a slot explicitly.
 
 It is **labeled as generated and never becomes evidence**. The narrative is
 displayed with its source and is never written to the ledger as a fact, claim,

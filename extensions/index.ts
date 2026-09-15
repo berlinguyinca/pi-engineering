@@ -83,7 +83,8 @@ async function getRuntimeByCwd(cwd: string, model?: Model<any>): Promise<Enginee
       const footer = activeFooter;
       if (!footer) return;
       if (event.phase === "settled") {
-        footer.setTask(undefined);
+        // Guarded: concurrent runs (tournament legs, DAG waves) each settle.
+        footer.clearTask(event.workItemId);
         footer.setProducingModel(undefined);
         return;
       }
