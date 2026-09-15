@@ -383,3 +383,37 @@ test("stream retry: a withheld error alone is not progress", async () => {
   assert.equal(progress, 1, "only the successful attempt counted as progress");
   assert.ok(h.seen[1]!.ms > h.seen[0]!.ms, "the ladder kept climbing through the retries");
 });
+
+test("stream retry: a terminal 'done' carrying an error is not retried behind the sink's back", () => {
+  // Found by fresh-context review. The retry guard tracked only NON-terminal
+  // events, while only `type: "error"` terminal events were withheld. A `done`
+  // event whose message failed therefore reached the sink — completing the
+  // stream, since AssistantMessageEventStream resolves on the first terminal
+  // event — and was then retried anyway. That retry's output is dropped by the
+  // completed stream, so it burns a provider call the operator never sees while
+  // the failure they DO see is already final.
+  const doneButFailed: Ev = { type: "done", message: { stopReason: "error", errorMessage: SATURATED } };
+  const s = scripted([[doneButFailed], [done()]]);
+  const out = sink();
+  const h = holds();
+
+  return pumpWithGatewayRetry(s.open, out, { hold: h.hold }).then((outcome) => {
+    assert.equal(s.opened, 1, "the sink was already completed — a retry could not reach it");
+    assert.equal(h.seen.length, 0);
+    assert.equal(outcome.attempts, 1);
+  });
+});
+
+test("stream retry: emitting any terminal event commits the attempt", () => {
+  // The general form of the rule above: once anything reaches the sink, the
+  // attempt is the answer, whatever it says.
+  const s = scripted([
+    [{ type: "done", message: { stopReason: "error", errorMessage: "503 no worker for model" } }],
+    [done()],
+  ]);
+  const out = sink();
+  return pumpWithGatewayRetry(s.open, out, { hold: holds().hold }).then(() => {
+    assert.equal(out.pushed.length, 1);
+    assert.equal(out.endCalls, 1);
+  });
+});

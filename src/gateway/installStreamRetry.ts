@@ -88,6 +88,11 @@ export function isGatewayStreamRetryInstalled(providerId: string, api: string): 
   return installed.has(`${providerId}:${api}`);
 }
 
+/** Every wrapped `provider:api` pair, for `/gateway` to report. */
+export function installedGatewayStreamRetries(): string[] {
+  return [...installed];
+}
+
 /**
  * Wrap `target`'s `streamSimple` so gateway saturation is waited out inside a
  * single Pi attempt. Idempotent per `(provider, api)`.

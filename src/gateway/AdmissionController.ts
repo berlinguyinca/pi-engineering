@@ -68,6 +68,12 @@ export interface AdmissionStatus {
   waiting: number;
   /** Effective concurrency limit right now. */
   concurrency: number;
+  /**
+   * The limit with no clamp applied — `maxConcurrency - reservedSlots`, not
+   * `maxConcurrency`. Reported because callers cannot derive it: comparing
+   * against the configured maximum makes every healthy session look clamped.
+   */
+  baseConcurrency: number;
   /** Milliseconds remaining on the process-wide cooldown (0 when open). */
   cooldownMs: number;
   /** The signal that produced the current cooldown, when any. */
@@ -164,6 +170,7 @@ export class AdmissionController {
       active: this.active,
       waiting: this.waiting,
       concurrency: this.concurrency,
+      baseConcurrency: this.baseConcurrency,
       cooldownMs: Math.max(0, this.cooldownUntil - this.now()),
       ...(this.lastSignal ? { lastSignal: this.lastSignal } : {}),
     };
@@ -279,6 +286,22 @@ export class AdmissionController {
       }
     }
 
+    this.emit({ type: "wait", waitMs, signal, concurrency: this.concurrency });
+    return waitMs;
+  }
+
+  /**
+   * Record a wait we are NOT acting on.
+   *
+   * Emits the signal so the status bar and telemetry see it, and remembers it
+   * as the last refusal, but arms no cooldown and applies no clamp. Used where
+   * a refusal is observed after the fact — a terminal assistant error — and the
+   * caller that hit it has already dealt with it, so parking the rest of the
+   * process would be a stall with nothing behind it.
+   */
+  noteObservedWait(signal: GatewayWaitSignal): number {
+    this.lastSignal = signal;
+    const waitMs = Math.min(signal.retryAfterMs, this.maxWaitMs);
     this.emit({ type: "wait", waitMs, signal, concurrency: this.concurrency });
     return waitMs;
   }

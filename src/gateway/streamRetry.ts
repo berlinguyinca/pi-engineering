@@ -158,9 +158,20 @@ export async function pumpWithGatewayRetry<E extends RetryableEvent, R extends R
   let progressed = false;
 
   for (let attempt = 1; ; attempt++) {
-    /** Any non-terminal event forwarded: from here a retry would duplicate. */
+    /**
+     * Anything at all reached the sink: from here a retry is both unsafe and
+     * pointless.
+     *
+     * Set by `emit`, never by the loop, because the dangerous case is a
+     * TERMINAL event. `AssistantMessageEventStream` completes on the first
+     * `done`/`error` and drops every later push, so once one is forwarded a
+     * retry cannot reach the transcript at all — it would burn a provider call
+     * whose output goes nowhere, while the operator sees the failure that was
+     * already delivered. Tracking only non-terminal events missed exactly that.
+     */
     let forwarded = false;
     const emit = (event: E): void => {
+      forwarded = true;
       if (!progressed) {
         progressed = true;
         opts.onProgress?.();
@@ -185,7 +196,6 @@ export async function pumpWithGatewayRetry<E extends RetryableEvent, R extends R
           emit(event);
           continue;
         }
-        forwarded = true;
         emit(event);
       }
       result = await inner.result();

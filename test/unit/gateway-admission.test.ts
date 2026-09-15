@@ -508,3 +508,40 @@ test("a caller-scoped wait can be abandoned with the turn's own signal", async (
   );
   assert.ok(Date.now() - started < 1_000, "escape must not wait out a 30s hold");
 });
+
+test("an observed wait is reported without parking anyone", async () => {
+  // The after-the-fact path: a terminal assistant error carrying a bare 503.
+  // The caller that hit it has already dealt with it, so the rest of the
+  // process must not be stalled — but the status bar should still see it.
+  const events: string[] = [];
+  const controller = new AdmissionController({
+    maxConcurrency: 4,
+    reservedSlots: 1,
+    maxWaitMs: Number.POSITIVE_INFINITY,
+    jitterMs: 0,
+    sleep: async () => {},
+    onEvent: (e) => events.push(e.type),
+  });
+  const signal = parseGatewayWait({ text: "503 no worker for model" });
+  assert.ok(signal);
+
+  const waitMs = controller.noteObservedWait(signal);
+
+  assert.equal(waitMs, signal.retryAfterMs);
+  assert.deepEqual(events, ["wait"], "the footer still gets its spinner");
+  assert.equal(controller.cooldownRemainingMs(), 0, "but nothing is parked");
+  assert.equal(controller.status().lastSignal?.status, 503, "and it is remembered as the last refusal");
+});
+
+test("an observed wait never clamps concurrency", () => {
+  const controller = new AdmissionController({
+    maxConcurrency: 4,
+    reservedSlots: 1,
+    maxWaitMs: Number.POSITIVE_INFINITY,
+    jitterMs: 0,
+    sleep: async () => {},
+  });
+  const before = controller.status().concurrency;
+  controller.noteObservedWait({ retryAfterMs: 5_000, retryable: true, source: "default", status: 503, activeLimit: 1 });
+  assert.equal(controller.status().concurrency, before);
+});

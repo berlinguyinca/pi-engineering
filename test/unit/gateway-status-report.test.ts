@@ -1,0 +1,134 @@
+/**
+ * The `/gateway` report.
+ *
+ * Two of these assertions carry the feature: the queue POSITION (being 30th of
+ * 100 is a wait, being 3rd is a hiccup) and the concurrency CLAMP, which is
+ * otherwise invisible — when the gateway reports `active_limit` the runtime
+ * silently shrinks its parallelism, and a run that went serial looks exactly
+ * like one that got slow.
+ */
+
+import assert from "node:assert/strict";
+import { test } from "node:test";
+import type { AdmissionStatus } from "../../src/gateway/AdmissionController.ts";
+import { parseGatewayWait } from "../../src/gateway/signals.ts";
+import { type GatewayReportConfig, renderGatewayReport } from "../../src/gateway/statusReport.ts";
+
+const CONFIG: GatewayReportConfig = {
+  enabled: true,
+  maxConcurrency: 4,
+  reservedSlots: 1,
+  maxWaitMs: Number.POSITIVE_INFINITY,
+  maxRetries: Number.POSITIVE_INFINITY,
+};
+
+const PRODUCTION_429 =
+  '429: {"active":4,"active_limit":4,"message":"inference admission: queue_timeout","queue_limit":100,"queued":30,' +
+  '"reason":"queue_timeout","request_id":"332ea9d2","retry_after_ms":30000,"scope":"agent","type":"inference_admission"}';
+
+/**
+ * Defaults mirror a real controller built from CONFIG: the unclamped limit is
+ * `maxConcurrency - reservedSlots` (3), not `maxConcurrency` (4). Using 4 here
+ * hid a bug where every healthy session was reported as clamped.
+ */
+function status(over: Partial<AdmissionStatus> = {}): AdmissionStatus {
+  return { active: 0, waiting: 0, concurrency: 3, baseConcurrency: 3, cooldownMs: 0, ...over };
+}
+
+test("gateway report: an open gateway says so plainly", () => {
+  const out = renderGatewayReport({ status: status(), config: CONFIG, installs: [] }).join("\n");
+  assert.match(out, /Open — no cooldown/);
+});
+
+test("gateway report: a hold shows how long is left", () => {
+  const out = renderGatewayReport({ status: status({ cooldownMs: 27_400 }), config: CONFIG, installs: [] }).join("\n");
+  assert.match(out, /Holding — 27s left/);
+});
+
+test("gateway report: the queue position is shown, not just that we are waiting", () => {
+  const signal = parseGatewayWait({ text: PRODUCTION_429 });
+  assert.ok(signal);
+  const out = renderGatewayReport({
+    status: status({ cooldownMs: 30_000, lastSignal: signal }),
+    config: CONFIG,
+    installs: [],
+  }).join("\n");
+
+  assert.match(out, /position 30\/100 in the queue/);
+  assert.match(out, /asked for 30s/);
+  assert.match(out, /332ea9d2/, "the request id is what support tickets are made of");
+});
+
+test("gateway report: a concurrency clamp is named, with what it fell from", () => {
+  const out = renderGatewayReport({
+    status: status({ concurrency: 1, active: 1 }),
+    config: CONFIG,
+    installs: [],
+  }).join("\n");
+
+  assert.match(out, /limit 1 \(clamped down from 3 by the gateway\)/);
+});
+
+test("gateway report: a healthy session is never described as clamped", () => {
+  // The reserve is not a clamp. A controller with maxConcurrency 4 and one
+  // reserved slot runs at 3 by design, and reporting that as "clamped down
+  // from 4" would fire the alarm on every session and teach the operator to
+  // ignore it.
+  const out = renderGatewayReport({ status: status(), config: CONFIG, installs: [] }).join("\n");
+  assert.doesNotMatch(out, /clamped/);
+  assert.match(out, /limit 3, 1 reserved for your turn/);
+});
+
+test("gateway report: a synthesized wait is distinguished from an advertised one", () => {
+  const signal = parseGatewayWait({ text: "503 no worker for model" });
+  assert.ok(signal);
+  const out = renderGatewayReport({ status: status({ lastSignal: signal }), config: CONFIG, installs: [] }).join("\n");
+
+  assert.match(out, /no wait advertised — using 5s/, "the operator should know when the number is ours, not theirs");
+});
+
+test("gateway report: a session without the wrapper is warned, not reassured", () => {
+  const out = renderGatewayReport({ status: status(), config: CONFIG, installs: [] }).join("\n");
+  assert.match(out, /NOT installed — this turn still stops at Pi's own retry budget/);
+});
+
+test("gateway report: installed providers are listed", () => {
+  const out = renderGatewayReport({
+    status: status(),
+    config: CONFIG,
+    installs: ["metabolomics:openai-completions"],
+  }).join("\n");
+  assert.match(out, /Unbounded waiting installed for: metabolomics:openai-completions/);
+});
+
+test("gateway report: context usage is shown, and an unknown count says so", () => {
+  const model = {
+    id: "deepseek-v4-flash",
+    provider: "metabolomics",
+    api: "openai-completions",
+    contextWindow: 1_048_576,
+  };
+  const known = renderGatewayReport({ status: status(), config: CONFIG, installs: [], model, contextTokens: 400_000 });
+  assert.match(known.join("\n"), /context 400000\/1048576/);
+
+  // Null is not zero: it is what Pi reports right after compaction, and it is
+  // also what blocks a model fallback.
+  const unknown = renderGatewayReport({ status: status(), config: CONFIG, installs: [], model, contextTokens: null });
+  assert.match(unknown.join("\n"), /context unknown of 1048576/);
+});
+
+test("gateway report: unlimited policy reads as unlimited, not Infinity", () => {
+  const out = renderGatewayReport({ status: status(), config: CONFIG, installs: [] }).join("\n");
+  assert.match(out, /wait cap unlimited, retry cap unlimited/);
+  assert.doesNotMatch(out, /Infinity/);
+});
+
+test("gateway report: a disabled controller does not pretend to be holding", () => {
+  const out = renderGatewayReport({
+    status: status(),
+    config: { ...CONFIG, enabled: false },
+    installs: [],
+  }).join("\n");
+  assert.match(out, /disabled/);
+  assert.doesNotMatch(out, /Slots:/);
+});
