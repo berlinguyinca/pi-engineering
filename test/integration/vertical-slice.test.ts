@@ -1075,3 +1075,117 @@ function writeFile(p: string, content: string): Promise<void> {
     fs.mkdir(p.split("/").slice(0, -1).join("/"), { recursive: true }).then(() => fs.writeFile(p, content)),
   );
 }
+
+/**
+ * The status footer (and later the panel) needs to know which phase the
+ * pipeline is in and which model produced it, without reading the transcript.
+ */
+test("vertical slice: engineer() reports each phase through onPhase and settles", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const worker = new FakeWorkerExecutor({
+      implementer: async (req) => {
+        await writeFile(join(req.cwd, "src", "add.js"), `export function add(a, b) {\n  return a + b;\n}\n`);
+        return {
+          status: "completed",
+          summary: "Implemented add.",
+          claims: [],
+          details: {},
+          evidence_refs: [],
+          new_hypotheses: [],
+          proposed_tasks: [],
+        };
+      },
+      reviewer: () => ({
+        status: "completed",
+        summary: "No material findings.",
+        claims: [],
+        details: { findings: [] },
+        evidence_refs: [],
+        new_hypotheses: [],
+        proposed_tasks: [],
+      }),
+    });
+
+    const phases: string[] = [];
+    const rt = await EngineeringRuntime.open({
+      cwd: fixture.root,
+      worker,
+      verifier: new CommandVerifier(),
+      onPhase: (e) => phases.push(e.phase),
+    });
+
+    await rt.engineer("Implement add(a, b) to return the sum of a and b");
+
+    assert.ok(phases.includes("implement"), `phases seen: ${phases.join(",")}`);
+    assert.equal(phases.at(-1), "settled", "the last phase must clear the footer");
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("vertical slice: onPhase settles even when the run throws", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const worker = new FakeWorkerExecutor({
+      implementer: async () => {
+        throw new Error("implementer exploded");
+      },
+    });
+    const phases: string[] = [];
+    const rt = await EngineeringRuntime.open({
+      cwd: fixture.root,
+      worker,
+      verifier: new CommandVerifier(),
+      onPhase: (e) => phases.push(e.phase),
+    });
+
+    await rt.engineer("Implement add(a, b)").catch(() => undefined);
+
+    assert.equal(phases.at(-1), "settled", "a failed run must still clear the footer");
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("vertical slice: a throwing onPhase listener cannot break a run", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const worker = new FakeWorkerExecutor({
+      implementer: async (req) => {
+        await writeFile(join(req.cwd, "src", "add.js"), `export function add(a, b) {\n  return a + b;\n}\n`);
+        return {
+          status: "completed",
+          summary: "Implemented add.",
+          claims: [],
+          details: {},
+          evidence_refs: [],
+          new_hypotheses: [],
+          proposed_tasks: [],
+        };
+      },
+      reviewer: () => ({
+        status: "completed",
+        summary: "No material findings.",
+        claims: [],
+        details: { findings: [] },
+        evidence_refs: [],
+        new_hypotheses: [],
+        proposed_tasks: [],
+      }),
+    });
+    const rt = await EngineeringRuntime.open({
+      cwd: fixture.root,
+      worker,
+      verifier: new CommandVerifier(),
+      onPhase: () => {
+        throw new Error("status listener blew up");
+      },
+    });
+
+    const report = await rt.engineer("Implement add(a, b) to return the sum of a and b");
+    assert.equal(report.outcome, "promoted");
+  } finally {
+    await fixture.cleanup();
+  }
+});

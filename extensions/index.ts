@@ -76,6 +76,24 @@ async function getRuntimeByCwd(cwd: string, model?: Model<any>): Promise<Enginee
     // from the roadmap engine (completion is never declared). If the repo has no
     // roadmap, the gate is open.
     roadmapComplete: roadmapCompleteFor(key),
+    // Pipeline progress -> status footer. Best-effort and read-only: the
+    // runtime swallows anything thrown here, and the footer is the only
+    // consumer today (the panel will subscribe to the same events).
+    onPhase: (event) => {
+      const footer = activeFooter;
+      if (!footer) return;
+      if (event.phase === "settled") {
+        footer.setTask(undefined);
+        footer.setProducingModel(undefined);
+        return;
+      }
+      footer.setTask({
+        workItemId: event.workItemId,
+        phase: event.phase,
+        ...(event.goal ? { label: event.goal } : {}),
+      });
+      if (event.model) footer.setProducingModel(event.model);
+    },
     ...(blackhole ? { blackhole } : {}),
   });
   runtimes.set(key, { runtime: rt, memoryIdentity });

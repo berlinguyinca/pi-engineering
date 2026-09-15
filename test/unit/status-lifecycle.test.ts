@@ -250,3 +250,31 @@ test("lifecycle: dispose stops the wait countdown timer", () => {
   controller.tickWait();
   assert.equal(controller.state.wait?.detail, "queue_timeout", "disposed controller must not mutate state");
 });
+
+test("lifecycle: setTask publishes the task and clears it on settle", () => {
+  const h = makeHarness();
+  const controller = new FooterController({ ctx: h.ctx as never, config: cfg, now: fixedClock() });
+  try {
+    controller.setTask({ workItemId: "WI-12", phase: "implement", label: "add retry" });
+    assert.equal(controller.state.task?.workItemId, "WI-12");
+    assert.equal(controller.state.task?.phase, "implement");
+    controller.setTask(undefined);
+    assert.equal(controller.state.task, undefined);
+  } finally {
+    controller.dispose();
+  }
+});
+
+test("lifecycle: the producing model overrides the session model while a worker runs", () => {
+  const h = makeHarness();
+  const controller = new FooterController({ ctx: h.ctx as never, config: cfg, now: fixedClock() });
+  try {
+    assert.equal(controller.state.model, "m1");
+    controller.setProducingModel("haiku-4-5");
+    assert.equal(controller.state.model, "haiku-4-5");
+    controller.setProducingModel(undefined);
+    assert.equal(controller.state.model, "m1", "clearing restores the session model");
+  } finally {
+    controller.dispose();
+  }
+});

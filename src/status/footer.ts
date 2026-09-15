@@ -187,6 +187,18 @@ export class FooterController {
   }
 
   /**
+   * Override the displayed model with the one actually producing tokens (a
+   * worker's model during an engineering run). Pass undefined to restore the
+   * session model, so the footer never keeps claiming a worker's model after
+   * the run is over.
+   */
+  setProducingModel(model: string | undefined): void {
+    if (this.disposed) return;
+    this.status.set({ model: model ?? modelInfo(this.ctx.model).id });
+    this.requestRender();
+  }
+
+  /**
    * Re-render the countdown; clears the wait once it has elapsed so the footer
    * never shows a stale "0s" hold.
    */

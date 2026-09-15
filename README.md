@@ -197,6 +197,40 @@ attempts lowering reasoning effort or swapping models.
 | `PI_GATEWAY_MAX_RETRIES` | `4` | Gateway-wait retries per worker attempt |
 | `PI_GATEWAY_TELEMETRY` | `true` | Emit `[gateway-admission]` events on stderr |
 
+## Live status bar
+
+The footer answers "what is it doing, and why is nothing happening":
+
+```
+⏳ gateway 30s · queue_timeout │ WI-12 implement │ opus-5 │ main │ ⚡247 t/s
+```
+
+- **the wait** — why the runtime is idle, counting down. Fed from the gateway
+  admission controller, so a backoff is visible rather than looking like a hang.
+- **the task** — the work item and pipeline phase currently in flight
+  (`scout`, `implement`, `verify`, `review`), cleared when the run settles,
+  including when it fails.
+- **the model** — the one actually producing tokens: a worker's model during a
+  run (the executor's choice, including a fallback), the session model otherwise.
+
+Segments are elided from the left as the terminal narrows; the wait reason is
+the last to go, because it is the only one that explains an apparently frozen
+session. The render path never runs git or network work, and redraws are
+coalesced rather than issued per token.
+
+`/harness-status` prints the fully resolved state.
+
+| Variable | Default | Meaning |
+| -------- | ------- | ------- |
+| `PI_STATUS_BAR_ENABLED` | `true` | Disable the footer entirely |
+| `PI_STATUS_BAR_SHOW_WAIT` | `true` | Show why the runtime is waiting |
+| `PI_STATUS_BAR_SHOW_TASK` | `true` | Show the engineering task in flight |
+| `PI_STATUS_BAR_SHOW_MODEL` | `true` | Show the producing model |
+| `PI_STATUS_BAR_SHOW_THROUGHPUT` | `true` | Show rolling output tokens/sec |
+| `PI_STATUS_BAR_SHOW_BRANCH` / `_REPOSITORY` / `_WORKTREE` / `_DIRECTORY` | `true` | Git and path segments |
+| `PI_STATUS_BAR_REFRESH_MS` | `150` | Redraw coalescing window |
+| `PI_STATUS_BAR_GIT_TTL_MS` | `30000` | How long cached git context is trusted |
+
 ## Semantic tools
 
 `ledger_read`, `ledger_claim`, `artifact_read`, `repo_search`, `symbol`,
