@@ -128,6 +128,7 @@ export function buildRows(
   state: Readonly<PanelStateShape>,
   expanded: ReadonlySet<string>,
   tab: PanelTabId = "files",
+  nowMs: number = Date.now(),
 ): PanelRow[] {
   const rows: PanelRow[] = [];
   const run = state.run;
@@ -179,7 +180,7 @@ export function buildRows(
     }
   }
 
-  if (tab === "session") rows.push(...sessionRows(state));
+  if (tab === "session") rows.push(...sessionRows(state, nowMs));
   if (tab === "memory") rows.push(...memoryRows(state));
 
   // Errors render alongside everything else: a broken feeder marks its own
@@ -218,17 +219,44 @@ function emptyLabel(tab: PanelTabId): string {
   }
 }
 
-/** The Session tab. Task 7 fills this with the generated narrative. */
-function sessionRows(_state: Readonly<PanelStateShape>): PanelRow[] {
+/**
+ * The Session tab: the generated narrative.
+ *
+ * Labeled as generated on its own line, and stamped with when it was last
+ * actually updated — a narrative whose last update failed stays put, and must
+ * say so rather than implying it is current.
+ */
+function sessionRows(state: Readonly<PanelStateShape>, nowMs: number): PanelRow[] {
+  const narrative = state.narrative;
+  if (!narrative) {
+    return [
+      {
+        depth: 0,
+        glyph: "",
+        label: "No session narrative yet.",
+        payload: { kind: "empty" },
+        selectable: false,
+      },
+    ];
+  }
   return [
+    { depth: 0, glyph: "", label: narrative.text, payload: { kind: "empty" }, selectable: false },
     {
       depth: 0,
       glyph: "",
-      label: "No session narrative yet.",
+      label: `— model-generated · updated ${formatAge(nowMs - narrative.updatedAt)}`,
       payload: { kind: "empty" },
       selectable: false,
     },
   ];
+}
+
+/** "just now" / "4m ago" / "2h ago". Never a fake precision. */
+function formatAge(ageMs: number): string {
+  if (ageMs < 60_000) return "just now";
+  const minutes = Math.floor(ageMs / 60_000);
+  if (minutes < 60) return `${minutes}m ago`;
+  return `${Math.floor(minutes / 60)}h ago`;
 }
 
 /**

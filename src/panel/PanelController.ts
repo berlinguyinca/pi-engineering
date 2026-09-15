@@ -10,6 +10,7 @@
 import { PanelComponent } from "./PanelComponent.ts";
 import type { PanelState } from "./PanelState.ts";
 import type { ContentView } from "./content.ts";
+import type { PanelLayout } from "./layout.ts";
 import type { RowPayload } from "./tree.ts";
 
 /** Below this many columns the overlay would crowd the chat rather than help. */
@@ -64,6 +65,10 @@ export interface PanelControllerOptions {
   onOpen?: () => void;
   /** Resolve a selected row into something to display. */
   openRow?: (payload: RowPayload) => Promise<ContentView | undefined> | ContentView | undefined;
+  /** Layout to open with; the panel remembers it across sessions. */
+  layout?: PanelLayout;
+  /** Called whenever the operator changes tab, width, or expansion. */
+  onLayoutChange?: (layout: PanelLayout) => void;
 }
 
 export class PanelController {
@@ -72,6 +77,8 @@ export class PanelController {
   private readonly chord: string;
   private readonly onOpen: (() => void) | undefined;
   private readonly openRowFn: PanelControllerOptions["openRow"];
+  private layout: PanelLayout | undefined;
+  private readonly onLayoutChange: ((layout: PanelLayout) => void) | undefined;
 
   private handle: OverlayHandleLike | null = null;
   private component: PanelComponent | null = null;
@@ -83,6 +90,8 @@ export class PanelController {
     this.chord = opts.chord ?? DEFAULT_CHORD;
     this.onOpen = opts.onOpen;
     this.openRowFn = opts.openRow;
+    this.layout = opts.layout;
+    this.onLayoutChange = opts.onLayoutChange;
   }
 
   isOpen(): boolean {
@@ -126,6 +135,13 @@ export class PanelController {
           requestRender: () => tui.requestRender(),
           onClose: () => this.close(),
           openRow: (payload) => void this.openSelection(payload),
+          ...(this.layout ? { layout: this.layout } : {}),
+          onLayoutChange: (layout) => {
+            // Held locally too, so re-opening within the session keeps the tab
+            // and width without a file read.
+            this.layout = layout;
+            this.onLayoutChange?.(layout);
+          },
         });
         return this.component;
       },
@@ -133,7 +149,7 @@ export class PanelController {
         overlay: true,
         overlayOptions: () => ({
           anchor: "top-right",
-          width: "35%",
+          width: `${this.layout?.widthPercent ?? 35}%`,
           minWidth: MIN_PANEL_COLUMNS,
           margin: 1,
           // Called every render cycle, so it stays a comparison and nothing more.

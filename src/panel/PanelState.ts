@@ -84,8 +84,23 @@ export interface PanelMemoryView {
   workers: { observer: number; reflector: number; dropper: number };
 }
 
+/**
+ * The generated session narrative.
+ *
+ * `generated` is always true and is rendered as a label: this is the panel's
+ * only model-authored content, and it must never be mistaken for a record.
+ * `updatedAt` is shown rather than assumed — a narrative whose last update
+ * failed stays put, and says when it was last actually current.
+ */
+export interface PanelNarrativeView {
+  text: string;
+  updatedAt: number;
+  generated: true;
+}
+
 export interface PanelStateShape {
   run?: PanelRunView;
+  narrative?: PanelNarrativeView;
   workspace?: PanelWorkspaceView;
   memory?: PanelMemoryView;
   errors: PanelSectionError[];

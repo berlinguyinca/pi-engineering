@@ -16,7 +16,11 @@ import { PanelController } from "../src/panel/PanelController.ts";
 import { PanelState } from "../src/panel/PanelState.ts";
 import { readDiffContent, readFileContent } from "../src/panel/content.ts";
 import { LedgerFeeder } from "../src/panel/feeders/LedgerFeeder.ts";
+import { MemoryFeeder } from "../src/panel/feeders/MemoryFeeder.ts";
 import { WorkspaceFeeder } from "../src/panel/feeders/WorkspaceFeeder.ts";
+import { type PanelLayout, PanelLayoutStore } from "../src/panel/layout.ts";
+import { Narrator } from "../src/panel/narrator/Narrator.ts";
+import { createSummarize } from "../src/panel/narrator/summarize.ts";
 import { RoadmapEngine } from "../src/roadmap/RoadmapEngine.ts";
 import { EngineeringRuntime } from "../src/runtime/EngineeringRuntime.ts";
 import { resolveStatusBarConfig } from "../src/status/config.ts";
@@ -50,8 +54,16 @@ const sessionUnsubscribes: Array<() => void> = [];
 
 // The engineering panel: one state + feeders per repository (keyed like the
 // runtime cache), and one controller per interactive session.
-const panels = new Map<string, { state: PanelState; ledger: LedgerFeeder; workspace: WorkspaceFeeder }>();
+interface PanelPlumbing {
+  state: PanelState;
+  ledger: LedgerFeeder;
+  workspace: WorkspaceFeeder;
+  memory: MemoryFeeder;
+}
+const panels = new Map<string, PanelPlumbing>();
 let activePanel: PanelController | null = null;
+/** Layout is an operator preference, so one store for the whole process. */
+const panelLayoutStore = new PanelLayoutStore();
 /**
  * Panel input subscriptions, kept separate from `sessionUnsubscribes` on
  * purpose: the footer's `session_start` drains its own array, and a shared
@@ -61,17 +73,15 @@ let activePanel: PanelController | null = null;
 const panelUnsubscribes: Array<() => void> = [];
 
 /** Panel plumbing for a repo, created on first use. */
-function panelFor(
-  key: string,
-  rt: EngineeringRuntime,
-): { state: PanelState; ledger: LedgerFeeder; workspace: WorkspaceFeeder } {
+function panelFor(key: string, rt: EngineeringRuntime): PanelPlumbing {
   const existing = panels.get(key);
   if (existing) return existing;
   const state = new PanelState();
-  const created = {
+  const created: PanelPlumbing = {
     state,
     ledger: new LedgerFeeder({ ledger: rt.ledger, state }),
     workspace: new WorkspaceFeeder({ state, repo: rt.git }),
+    memory: new MemoryFeeder({ state, blackhole: rt.blackhole }),
   };
   panels.set(key, created);
   return created;
@@ -448,6 +458,43 @@ ${RECOVERY_PROMPT}`;
     return { plumbing: panelFor(key, rt), rt };
   }
 
+  /**
+   * Start the session narrator for a repo, at most once.
+   *
+   * Off by default (`PI_PANEL_NARRATOR`): it is the only part of the panel that
+   * spends money, so the operator opts in. It observes the panel's own state —
+   * the run view the ledger feeder already publishes — rather than reaching
+   * into the runtime for a second source of truth, and it is gated on the SAME
+   * admission controller as every other model call in this process.
+   */
+  const narrators = new Map<string, Narrator>();
+  function startNarrator(plumbing: PanelPlumbing, _rt: EngineeringRuntime): void {
+    if (process.env.PI_PANEL_NARRATOR !== "true") return;
+    const key = [...panels.entries()].find(([, value]) => value === plumbing)?.[0];
+    if (!key || narrators.has(key)) return;
+
+    const admission = sharedAdmissionController();
+    const narrator = new Narrator({
+      state: plumbing.state,
+      summarize: createSummarize(),
+      cooldownRemainingMs: () => admission.cooldownRemainingMs(),
+      acquire: () => admission.acquire(),
+    });
+    narrators.set(key, narrator);
+
+    // Deltas come from panel state, which the ledger feeder already keeps
+    // current. No transcript, no second pipeline.
+    plumbing.state.subscribe((snapshot) => {
+      const run = snapshot.run;
+      void narrator.observe({
+        ...(run?.workItemId ? { workItemId: run.workItemId } : {}),
+        ...(run?.goal ? { goal: run.goal } : {}),
+        ...(run?.phase ? { phase: run.phase } : {}),
+        files: (run?.files ?? snapshot.workspace?.files ?? []).map((file) => file.path),
+      });
+    });
+  }
+
   /** Resolve a selected row into a bounded content view. */
   function openRowFor(rt: EngineeringRuntime, state: PanelState) {
     return async (payload: { kind: string; path?: string; source?: string }) => {
@@ -475,17 +522,24 @@ ${RECOVERY_PROMPT}`;
    */
   function createPanelController(
     ctx: { ui: PanelSessionUi },
-    plumbing: { state: PanelState; ledger: LedgerFeeder; workspace: WorkspaceFeeder },
+    plumbing: PanelPlumbing,
     rt: EngineeringRuntime,
   ): PanelController {
     const controller = new PanelController({
       state: plumbing.state,
       ui: ctx.ui as never,
       chord: panelChord,
+      layout: panelLayoutStore.load(),
+      onLayoutChange: (layout: PanelLayout) => panelLayoutStore.save(layout),
       onOpen: () => {
         plumbing.workspace.invalidate();
         void plumbing.workspace.refresh();
         plumbing.ledger.refresh();
+        plumbing.memory.refresh();
+        // The narrator costs money, so it does not start until the panel has
+        // been opened at least once: a session that never opens /panel must
+        // not pay for summaries nobody reads.
+        startNarrator(plumbing, rt);
       },
       openRow: openRowFor(rt, plumbing.state),
     });
