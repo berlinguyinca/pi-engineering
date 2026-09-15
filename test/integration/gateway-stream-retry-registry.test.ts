@@ -22,7 +22,11 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { ModelRegistry, ModelRuntime } from "@earendil-works/pi-coding-agent";
-import { installGatewayStreamRetry, resetGatewayStreamRetry } from "../../src/gateway/installStreamRetry.ts";
+import {
+  installGatewayStreamRetry,
+  isGatewayStreamRetryLive,
+  resetGatewayStreamRetry,
+} from "../../src/gateway/installStreamRetry.ts";
 
 const API = "anthropic-messages";
 
@@ -224,4 +228,64 @@ test("registry: wrapping a BUILT-IN provider keeps its whole catalogue", async (
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("registry: an abort during a hold ends the turn through the real runtime", async () => {
+  // The unit tests cover abort against a fake sink. This drives it through
+  // ModelRuntime.streamSimple, where the signal has to survive prepareRequest
+  // and reach the wrapper as `options.signal`.
+  await withRegistry([{ error: "503 no worker for model" }, {}], async ({ registry, runtime, calls }) => {
+    const aborter = new AbortController();
+    resetGatewayStreamRetry();
+    installGatewayStreamRetry(
+      registry as never,
+      { provider: "probe", api: API },
+      {
+        createStream: () => createAssistantMessageEventStream() as never,
+        hold: async () => {
+          aborter.abort();
+        },
+        errorMessage: (_m, error) => ({ stopReason: "error", errorMessage: String(error) }),
+        signalOf: (options) => (options as { signal?: AbortSignal } | undefined)?.signal,
+      },
+    );
+
+    const result = await runtime
+      .streamSimple(MODEL as never, { messages: [] } as never, { apiKey: "k", signal: aborter.signal })
+      .result();
+
+    assert.equal(result.stopReason, "aborted", "escape must end the turn, not restart it");
+    assert.equal(calls(), 1, "and must not keep retrying behind the operator");
+  });
+});
+
+test("registry: the provider's auth survives being wrapped", async () => {
+  // Models were already asserted. Auth was not — and a wrap that silently drops
+  // the login method leaves a provider that cannot authenticate, which no model
+  // count would reveal.
+  await withRegistry([{}], async ({ registry, runtime }) => {
+    const before = registry.getProvider("probe");
+    assert.ok(before?.auth?.apiKey, "fixture must start with an auth method");
+
+    resetGatewayStreamRetry();
+    assert.equal(install(registry, []), "installed");
+
+    const after = registry.getProvider("probe");
+    assert.ok(after?.auth?.apiKey, "the provider must still be able to authenticate");
+    assert.equal(typeof after?.auth?.apiKey?.login, "function", "and still able to log in");
+
+    // The end-to-end proof: a request still resolves auth and reaches the wire.
+    const result = await runtime.streamSimple(MODEL as never, { messages: [] } as never, { apiKey: "k" }).result();
+    assert.equal(result.stopReason, "stop");
+  });
+});
+
+test("registry: a live wrap is distinguishable from stale bookkeeping", async () => {
+  await withRegistry([{}], async ({ registry }) => {
+    resetGatewayStreamRetry();
+    assert.equal(isGatewayStreamRetryLive(registry as never, "probe"), false, "nothing installed yet");
+
+    install(registry, []);
+    assert.equal(isGatewayStreamRetryLive(registry as never, "probe"), true);
+  });
 });

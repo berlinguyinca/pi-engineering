@@ -99,6 +99,21 @@ export function installedGatewayStreamRetries(): string[] {
 }
 
 /**
+ * Is the wrapper still the provider's live stream handler?
+ *
+ * Distinct from `isGatewayStreamRetryInstalled`, which reports what this module
+ * did. Another extension registering the same provider afterwards replaces our
+ * handler without telling us, and reporting stale bookkeeping as live coverage
+ * would tell an operator they have unbounded waiting when they do not.
+ */
+export function isGatewayStreamRetryLive<M, C, O>(host: ProviderHost<M, C, O>, providerId: string): boolean {
+  const streamSimple = host.getProvider(providerId)?.streamSimple as
+    | (((...args: never[]) => unknown) & { __piEngineeringGatewayRetry?: boolean })
+    | undefined;
+  return streamSimple?.__piEngineeringGatewayRetry === true;
+}
+
+/**
  * Wrap `target`'s `streamSimple` so gateway saturation is waited out inside a
  * single Pi attempt. Idempotent per `(provider, api)`.
  */
@@ -129,6 +144,16 @@ export function installGatewayStreamRetry<M, C, O>(
   // stream that completes normally means capacity is back, so it resets.
   let consecutiveHolds = 0;
 
+  /**
+   * Marker so an installation can be VERIFIED rather than assumed.
+   *
+   * The `installed` set records what this module did, not what the registry
+   * currently holds: another extension re-registering the provider replaces our
+   * handler, and the set would still claim it is wrapped — leaving `/gateway`
+   * reporting unbounded waiting that is no longer installed.
+   */
+  const WRAPPED = "__piEngineeringGatewayRetry";
+
   const streamSimple = (model: M, context: C, options?: O) => {
     const out = deps.createStream();
     const signal = deps.signalOf?.(options);
@@ -156,6 +181,8 @@ export function installGatewayStreamRetry<M, C, O>(
     });
     return out;
   };
+
+  Object.defineProperty(streamSimple, WRAPPED, { value: true, enumerable: false });
 
   try {
     if (native) {

@@ -251,9 +251,11 @@ export function isAccountWideRefusal(signal: GatewayWaitSignal): boolean {
   // model. Parking the whole process behind it stalls workers on models that
   // are answering perfectly well.
   //
-  // Keyed on what the refusal is ABOUT, not on where its number came from: an
-  // earlier version discriminated on `source === "body"`, which put a 429
-  // carrying only a `Retry-After` header on the wrong side of the line.
+  // Keyed on what the refusal is ABOUT, not on where its number came from.
+  //
+  // Not to be confused with `isGatewayAdmissionRefusal`, which answers a
+  // different question — see its comment. This one decides WHO waits; that one
+  // decides WHICH LAYER owns the wait.
   return signal.status === 429 || signal.type === "inference_admission" || signal.reason === "queue_timeout";
 }
 

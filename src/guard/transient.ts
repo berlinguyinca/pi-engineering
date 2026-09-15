@@ -89,9 +89,19 @@ export function classifyError(error: unknown): ErrorClass {
     return { category: "rate_limit", retryable: true, retryAfterMs, reason: "rate-limit / concurrency admission" };
   }
 
-  // 503 no worker for model / service unavailable.
-  if (status === 503 || has("no worker", "service unavailable", "no available worker", "worker for model")) {
-    return { category: "server_unavailable", retryable: true, retryAfterMs, reason: "503 / no worker" };
+  // 503 no worker for model / service unavailable / provider overload.
+  //
+  // "overloaded" is Anthropic's 529 wording and appears in pi-ai's own
+  // retryable pattern list; without it here a text-only overload error fell
+  // through every branch and was classified PERMANENT, so a worker gave up on a
+  // failure that clears itself in seconds. Found by a boundary test written
+  // after a fresh-context review.
+  if (
+    status === 503 ||
+    status === 529 ||
+    has("no worker", "service unavailable", "no available worker", "worker for model", "overloaded")
+  ) {
+    return { category: "server_unavailable", retryable: true, retryAfterMs, reason: "503 / overloaded / no worker" };
   }
 
   // Other 5xx.

@@ -21,7 +21,12 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { resolveGatewayConfig } from "../../src/gateway/config.ts";
-import { decideGatewayRetry, parseGatewayWait } from "../../src/gateway/signals.ts";
+import {
+  decideGatewayRetry,
+  isAccountWideRefusal,
+  isGatewayAdmissionRefusal,
+  parseGatewayWait,
+} from "../../src/gateway/signals.ts";
 import { classifyError } from "../../src/guard/transient.ts";
 
 /** The verbatim production payload, as reported by the operator. */
@@ -60,4 +65,41 @@ test("boundary: a plain rate limit with no gateway envelope stays transient", ()
   const classified = classifyError(new Error("429 Too Many Requests"));
   assert.equal(classified.category, "rate_limit");
   assert.equal(classified.retryable, true);
+});
+
+test("boundary: an advertised wait is owned by the admission controller whatever carried it", () => {
+  // The two predicates answer different questions, and a fresh-context review
+  // found them disagreeing in a way that mattered: a rate limit reporting its
+  // wait in a header was handed to the layer that gives up after four attempts,
+  // reintroducing the exact "fails after N attempts" behaviour on the worker
+  // path that this subsystem removed from the interactive one.
+  const bodySeconds = '429: {"retry_after": 30, "message": "slow down"}';
+  assert.equal(parseGatewayWait({ text: bodySeconds })?.source, "body");
+  assert.equal(classifyError(new Error(bodySeconds)).retryable, false, "handed over, not retried here");
+});
+
+test("boundary: a refusal that advertises nothing still belongs to the transient layer", () => {
+  // No advertised wait means no instruction to honour, and a guess is what
+  // exponential backoff is for.
+  for (const text of ["503 no worker for model", "429 Too Many Requests", "overloaded, try again later"]) {
+    const signal = parseGatewayWait({ text });
+    assert.equal(signal?.source, "default", `${text} should synthesize its wait`);
+    assert.equal(classifyError(new Error(text)).retryable, true, `${text} should stay transient`);
+  }
+});
+
+test("boundary: the two discriminators answer different questions on purpose", () => {
+  // Ownership (which layer waits) is not scope (who waits). A bare 503 is owned
+  // by the transient layer AND is caller-scoped; an admission 429 is owned by
+  // the admission controller AND is account-wide. They coincide often enough
+  // that conflating them looks harmless, which is why this is pinned.
+  const bare503 = parseGatewayWait({ text: "503 no worker for model" });
+  assert.ok(bare503);
+  assert.equal(isGatewayAdmissionRefusal("503 no worker for model"), false, "ownership: transient layer");
+  assert.equal(isAccountWideRefusal(bare503), false, "scope: this caller only");
+
+  const admission = parseGatewayWait({ text: PRODUCTION_429 });
+  assert.ok(admission);
+  assert.equal(isGatewayAdmissionRefusal(PRODUCTION_429), true, "ownership: admission controller");
+  assert.equal(isAccountWideRefusal(admission), true, "scope: everyone");
 });

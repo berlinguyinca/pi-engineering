@@ -8,7 +8,11 @@ import { openVikingBlackholeOption } from "../src/blackhole/envConfig.ts";
 import { registerInteractiveMemory } from "../src/blackhole/interactiveMemory.ts";
 import { sharedAdmissionController, sharedGatewayConfig } from "../src/gateway/config.ts";
 import { type FallbackCandidate, chooseFallbackModel } from "../src/gateway/fallback.ts";
-import { installGatewayStreamRetry, installedGatewayStreamRetries } from "../src/gateway/installStreamRetry.ts";
+import {
+  installGatewayStreamRetry,
+  installedGatewayStreamRetries,
+  isGatewayStreamRetryLive,
+} from "../src/gateway/installStreamRetry.ts";
 import { describeGatewayWait, isAccountWideRefusal, parseGatewayWait } from "../src/gateway/signals.ts";
 import { renderGatewayReport } from "../src/gateway/statusReport.ts";
 import { GitRepo } from "../src/git/GitRepo.ts";
