@@ -89,8 +89,8 @@
   milestone: __global__
   type: dogfood
   status: pass
-  commit: a2f8a9ccd9f9bf8036dc20f3e50e1a1bf90231a9
-  generatedAt: 2026-09-15T22:14:29.254Z
+  commit: cf41813b1969455fa58e4cbb6d3f46ae385dade6
+  generatedAt: 2026-09-15T22:36:49.423Z
   paths: &a1
     - src/
     - extensions/
@@ -104,8 +104,8 @@
   milestone: __global__
   type: fresh_review
   status: pass
-  commit: a2f8a9ccd9f9bf8036dc20f3e50e1a1bf90231a9
-  generatedAt: 2026-09-15T22:14:29.254Z
+  commit: cf41813b1969455fa58e4cbb6d3f46ae385dade6
+  generatedAt: 2026-09-15T22:36:49.423Z
   paths: *a1
   proof: scripts/fresh-review-gateway-wait.ts gateway (x3) + models;
     docs/evidence/gateway-wait/verification.md

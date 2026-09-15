@@ -215,6 +215,22 @@ required and a documentation-only scope is rejected.
 
 No gate, required milestone or validation assertion is disabled for this work.
 
+### Evidence must be re-recorded after a squash merge
+
+Records bind to a commit SHA, and a squash merge creates a NEW commit while the
+branch commit is deleted with the branch. The recorded SHA is then absent from
+the target branch's history, `git diff <sha>..HEAD` fails, and
+`changedPathsSince` correctly fails safe by treating the scope as changed — so
+evidence that was accurate on the branch reads as stale on the trunk.
+
+This is invisible locally, because a clone that did the merge still holds the
+branch commit object and the diff resolves; CI clones fresh and does not. The
+first merge of this work passed its PR check and then failed on `main` for
+exactly this reason.
+
+So recording is a POST-merge step on the target branch, not a pre-merge step on
+the branch — or the merge must preserve the recorded commit.
+
 ## Known limits
 
 The intermittent `could not open '.git/worktrees/…/HEAD'` failure in
