@@ -52,6 +52,13 @@ const sessionUnsubscribes: Array<() => void> = [];
 // runtime cache), and one controller per interactive session.
 const panels = new Map<string, { state: PanelState; ledger: LedgerFeeder; workspace: WorkspaceFeeder }>();
 let activePanel: PanelController | null = null;
+/**
+ * Panel input subscriptions, kept separate from `sessionUnsubscribes` on
+ * purpose: the footer's `session_start` drains its own array, and a shared
+ * array would make "does the hotkey still work?" depend on the order two
+ * independent handlers happen to be registered in.
+ */
+const panelUnsubscribes: Array<() => void> = [];
 
 /** Panel plumbing for a repo, created on first use. */
 function panelFor(
@@ -389,6 +396,13 @@ ${RECOVERY_PROMPT}`;
   // handler that consumes only its own key.
   const panelChord = process.env.PI_PANEL_CHORD ?? "ctrl+p";
 
+  /** The slice of Pi's session UI the panel needs. */
+  interface PanelSessionUi {
+    custom?: unknown;
+    onTerminalInput?: (handler: (data: string) => { consume: true } | undefined) => () => void;
+    notify: (message: string, kind?: "info" | "warning" | "error") => void;
+  }
+
   async function openPanel(ctx: {
     cwd: string;
     ui: { notify: (m: string, t?: "info" | "warning" | "error") => void };
@@ -399,9 +413,9 @@ ${RECOVERY_PROMPT}`;
       ctx.ui.notify("Panel unavailable: no engineering runtime for this directory.", "error");
       return null;
     }
-    const plumbing = panelFor(key, rt);
-    void plumbing.workspace.refresh();
-    return { plumbing, rt };
+    // No refresh here: opening the overlay invalidates the cache and refreshes,
+    // so a second read would only race the first.
+    return { plumbing: panelFor(key, rt), rt };
   }
 
   /** Resolve a selected row into a bounded content view. */
@@ -421,33 +435,52 @@ ${RECOVERY_PROMPT}`;
     };
   }
 
+  /**
+   * Build the session's controller and bind the chord.
+   *
+   * Called from `session_start` so the hotkey works without `/panel` first, and
+   * from `/panel` itself so a session whose `session_start` found no runtime
+   * (or has not finished its async lookup) still opens rather than reporting a
+   * UI problem that is not the real cause.
+   */
+  function createPanelController(
+    ctx: { ui: PanelSessionUi },
+    plumbing: { state: PanelState; ledger: LedgerFeeder; workspace: WorkspaceFeeder },
+    rt: EngineeringRuntime,
+  ): PanelController {
+    const controller = new PanelController({
+      state: plumbing.state,
+      ui: ctx.ui as never,
+      chord: panelChord,
+      onOpen: () => {
+        plumbing.workspace.invalidate();
+        void plumbing.workspace.refresh();
+        plumbing.ledger.refresh();
+      },
+      openRow: openRowFor(rt, plumbing.state),
+    });
+    if (typeof ctx.ui.onTerminalInput === "function") {
+      panelUnsubscribes.push(ctx.ui.onTerminalInput((data) => controller.handleTerminalInput(data)));
+    }
+    return controller;
+  }
+
   // The overlay and the chord need a live session UI, which only exists in a
   // real Pi run (the smoke-test stub has no pi.on).
   if (typeof pi.on === "function") {
     pi.on("session_start", async (_event, ctx) => {
+      for (const un of panelUnsubscribes.splice(0)) un();
       activePanel?.dispose();
+      activePanel = null;
       const key = await repoCacheKey(ctx.cwd);
       const rt = await getRuntimeByCwd(ctx.cwd).catch(() => null);
+      // Not fatal: `/panel` retries the lookup and builds the controller then.
       if (!rt) return;
-      const plumbing = panelFor(key, rt);
-      const controller = new PanelController({
-        state: plumbing.state,
-        ui: ctx.ui as never,
-        chord: panelChord,
-        onOpen: () => {
-          plumbing.workspace.invalidate();
-          void plumbing.workspace.refresh();
-          plumbing.ledger.refresh();
-        },
-        openRow: openRowFor(rt, plumbing.state),
-      });
-      activePanel = controller;
-      if (typeof ctx.ui.onTerminalInput === "function") {
-        sessionUnsubscribes.push(ctx.ui.onTerminalInput((data) => controller.handleTerminalInput(data)));
-      }
+      activePanel = createPanelController(ctx as { ui: PanelSessionUi }, panelFor(key, rt), rt);
     });
 
     pi.on("session_shutdown", () => {
+      for (const un of panelUnsubscribes.splice(0)) un();
       activePanel?.dispose();
       activePanel = null;
     });
@@ -459,8 +492,12 @@ ${RECOVERY_PROMPT}`;
       const opened = await openPanel(ctx);
       if (!opened) return;
       if (!activePanel) {
-        ctx.ui.notify("Panel unavailable: this session has no interactive UI.", "error");
-        return;
+        const ui = ctx.ui as PanelSessionUi;
+        if (typeof ui.custom !== "function") {
+          ctx.ui.notify("Panel unavailable: this session has no interactive UI.", "error");
+          return;
+        }
+        activePanel = createPanelController({ ui }, opened.plumbing, opened.rt);
       }
       activePanel.toggle();
     },
