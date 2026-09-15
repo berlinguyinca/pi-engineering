@@ -129,6 +129,30 @@ test("tabs: the component opens on the persisted tab and width", () => {
   c.dispose();
 });
 
+test("tabs: a FIRST open, from a freshly loaded profile, shows section children", async () => {
+  // The seam the other tests miss: load() always returns a layout (defaults
+  // when there is no file), so a component-side "no layout means open
+  // everything" branch is unreachable in the real wiring. If the defaults do
+  // not carry the expansion, a first-ever open renders every section collapsed
+  // and the operator has to expand each one by hand.
+  const { mkdtemp, rm } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { PanelLayoutStore } = await import("../../src/panel/layout.ts");
+  const dir = await mkdtemp(join(tmpdir(), "pi-panel-first-open-"));
+  try {
+    const c = new PanelComponent({
+      state: seeded(),
+      requestRender: () => {},
+      layout: new PanelLayoutStore({ profileDir: dir }).load(),
+    });
+    assert.match(c.render(120).join("\n"), /signals\.ts/, "a first open must show the files, not just the headers");
+    c.dispose();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("tabs: a persisted expansion set is honoured on open", () => {
   const c = new PanelComponent({
     state: seeded(),

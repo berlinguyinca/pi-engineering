@@ -36,10 +36,19 @@ export const MIN_WIDTH_PERCENT = 20;
 export const MAX_WIDTH_PERCENT = 80;
 export const WIDTH_STEP_PERCENT = 5;
 
+/**
+ * Sections start open: the panel is most useful showing everything at once the
+ * first time it is opened.
+ *
+ * This lives in the DEFAULT rather than in the component, because `load()`
+ * always returns a layout — defaults when there is no file — so a component-side
+ * "no layout means open everything" branch is unreachable in the real wiring and
+ * a first-ever open would render every section collapsed.
+ */
 export const DEFAULT_LAYOUT: PanelLayout = {
   widthPercent: 35,
   tab: "files",
-  expanded: [],
+  expanded: ["files", "findings", "run", "spend", "workspace"],
 };
 
 export interface LayoutStoreOptions {

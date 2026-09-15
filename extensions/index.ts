@@ -484,14 +484,29 @@ ${RECOVERY_PROMPT}`;
 
     // Deltas come from panel state, which the ledger feeder already keeps
     // current. No transcript, no second pipeline.
-    plumbing.state.subscribe((snapshot) => {
+    //
+    // RUN files only, never the workspace: when a run settles the run view is
+    // cleared, and falling back to the working tree would present every tracked
+    // change as newly changed — the narrator would claim the session edited
+    // files it merely started displaying. The narrator narrates runs, and says
+    // nothing when idle.
+    const unsubscribe = plumbing.state.subscribe((snapshot) => {
       const run = snapshot.run;
+      if (!run) return;
       void narrator.observe({
-        ...(run?.workItemId ? { workItemId: run.workItemId } : {}),
-        ...(run?.goal ? { goal: run.goal } : {}),
-        ...(run?.phase ? { phase: run.phase } : {}),
-        files: (run?.files ?? snapshot.workspace?.files ?? []).map((file) => file.path),
+        ...(run.workItemId ? { workItemId: run.workItemId } : {}),
+        ...(run.goal ? { goal: run.goal } : {}),
+        ...(run.phase ? { phase: run.phase } : {}),
+        files: run.files.map((file) => file.path),
       });
+    });
+    // The panel cache is process-wide and outlives a session, so without this
+    // a narrator opted into once would keep observing — and spending — in every
+    // later session, with no way to stop it.
+    panelUnsubscribes.push(() => {
+      unsubscribe();
+      narrator.dispose();
+      narrators.delete(key);
     });
   }
 

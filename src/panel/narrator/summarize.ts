@@ -16,12 +16,24 @@ import type { Model } from "@earendil-works/pi-ai/compat";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { registerLocalProviders } from "../../workers/localProviders.ts";
 
+/** The slice of a ModelRuntime this adapter uses (injected in tests). */
+export interface SummarizeRuntime {
+  getAvailable(): Promise<readonly unknown[]>;
+  streamSimple(model: never, context: never): AsyncIterable<unknown> & { result(): Promise<unknown> };
+}
+
 export interface SummarizeOptions {
   /** Agent profile directory holding auth.json / models.json. */
   agentDir?: string;
   /** Pin the narrator's model. Defaults to the first available. */
   model?: Model<never>;
   allowModelNetwork?: boolean;
+  /**
+   * Inject the runtime. Without this the adapter builds a real `ModelRuntime`,
+   * which is exactly what a test must not do — and what would otherwise leave
+   * the only model-touching code in the panel unexercised.
+   */
+  runtime?: () => Promise<SummarizeRuntime>;
 }
 
 function joinExpand(base: string, file: string): string {
@@ -37,9 +49,10 @@ function joinExpand(base: string, file: string): string {
  */
 export function createSummarize(opts: SummarizeOptions = {}): (prompt: string) => Promise<string> {
   const agentDir = opts.agentDir ?? process.env.PI_AGENT_DIR ?? "~/.pi/agent";
-  let runtimePromise: Promise<ModelRuntime> | undefined;
+  let runtimePromise: Promise<SummarizeRuntime> | undefined;
 
-  const getRuntime = (): Promise<ModelRuntime> => {
+  const getRuntime = (): Promise<SummarizeRuntime> => {
+    if (opts.runtime) return opts.runtime();
     runtimePromise ??= (async () => {
       const runtime = await ModelRuntime.create({
         authPath: joinExpand(agentDir, "auth.json"),
@@ -47,7 +60,7 @@ export function createSummarize(opts: SummarizeOptions = {}): (prompt: string) =
         allowModelNetwork: opts.allowModelNetwork ?? false,
       });
       await registerLocalProviders(runtime).catch(() => {});
-      return runtime;
+      return runtime as unknown as SummarizeRuntime;
     })();
     return runtimePromise;
   };

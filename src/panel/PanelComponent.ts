@@ -16,9 +16,6 @@ import { DEFAULT_LAYOUT, type PanelLayout, type PanelTabId, stepTab, stepWidth }
 import { type SearchState, findMatches, stepMatch } from "./search.ts";
 import { type PanelRow, type RowPayload, buildRows, clampSelection, renderTabBar } from "./tree.ts";
 
-/** Sections start open: the panel is most useful showing everything at once. */
-const INITIALLY_EXPANDED = ["run", "files", "findings", "spend", "workspace"];
-
 const KEY_UP = "\x1b[A";
 const KEY_DOWN = "\x1b[B";
 const KEY_RIGHT = "\x1b[C";
@@ -79,12 +76,12 @@ export class PanelComponent {
     this.onClose = opts.onClose;
     this.onLayoutChange = opts.onLayoutChange;
     this.copyFn = opts.copy ?? ((text) => copyToTerminal(text));
-    const layout = opts.layout;
-    // With no persisted layout, sections start open: the panel is most useful
-    // showing everything at once the first time it is opened.
-    this.expanded = new Set<string>(layout ? layout.expanded : INITIALLY_EXPANDED);
-    this.activeTab = layout?.tab ?? DEFAULT_LAYOUT.tab;
-    this.width = layout?.widthPercent ?? DEFAULT_LAYOUT.widthPercent;
+    // The layout is the single source of truth for what is open, including the
+    // first-open defaults (see DEFAULT_LAYOUT.expanded).
+    const layout = opts.layout ?? DEFAULT_LAYOUT;
+    this.expanded = new Set<string>(layout.expanded);
+    this.activeTab = layout.tab;
+    this.width = layout.widthPercent;
     this.unsubscribe = this.state.subscribe(() => this.requestRenderFn());
     this.refreshRows();
   }
