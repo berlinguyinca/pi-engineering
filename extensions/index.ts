@@ -394,7 +394,7 @@ ${RECOVERY_PROMPT}`;
       if (msg?.role !== "assistant" || msg.stopReason !== "error" || !msg.errorMessage) return;
       const signal = parseGatewayWait({ text: msg.errorMessage });
       if (!signal?.retryable) return;
-      const waitMs = signal.source === "body" ? admission.noteWait(signal) : admission.noteObservedWait(signal);
+      const waitMs = isAccountWideRefusal(signal) ? admission.noteWait(signal) : admission.noteObservedWait(signal);
       // The status bar owns this now: a spinner, the countdown and the queue
       // position say everything the 429 body did, without a wall of warnings
       // every 30 seconds. Notify only when there is no status bar to read.

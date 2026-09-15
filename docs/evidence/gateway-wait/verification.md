@@ -85,7 +85,53 @@ Unit tests against fake registries passed while three real defects stood:
 
 ## Independent review
 
-<!-- filled in from the re-review -->
+Two fresh-context reviews were run against the implementation, each a new
+session with no inherited reasoning, reading the code and tests directly and
+running the suite itself. Both reported **zero critical and zero high**
+findings. A third confirmatory review was run after the second round of fixes.
+
+The first review (against the original implementation) found two genuine
+requirement-level defects:
+
+* the retry-safety flag tracked only NON-terminal events while only
+  `type: "error"` terminal events were withheld, so a `done` event carrying
+  `stopReason: "error"` was forwarded — completing the stream — and then retried
+  anyway, burning a provider call whose output the completed stream discards;
+* the `message_end` handler armed the process-wide cooldown for any retryable
+  signal including a bare 503, contradicting the scoping rule stated a few lines
+  away in the same file.
+
+Both were fixed. A third finding — that an in-stream hold is not abortable
+because the turn's signal travels on `context` rather than on the provider
+options — was checked against the installed package and is **incorrect**:
+`pi-agent-core/dist/agent-loop.js:195` passes `signal` inside the stream options
+object, which is exactly what the wrapper reads.
+
+The second review (against the fixed tree) reported no critical and no high
+findings, and three medium ones, all real and all fixed:
+
+* an aborted hold left its `setTimeout` pending, keeping Node's event loop alive
+  so an aborted 60-second wait delayed process exit by the full 60 seconds;
+* a saturation delivered as a `done` event with `stopReason: "error"` was still
+  not waited out — the first round's fix made that case safe (no duplicated
+  output) without making it correct;
+* the model-fallback counter was cumulative rather than consecutive, so widely
+  separated holds across a session could trip a spurious model switch.
+
+A low-severity finding — that the three scoping decisions
+(`after_provider_response`, `message_end`, and the pump's hold) disagreed about
+which refusals are account-wide — was also resolved: all three now share one
+predicate keyed on what a refusal is about rather than on where its wait came
+from.
+
+Both reviews independently confirmed, by reading the installed package rather
+than this repo's documentation, that pi's `AssistantMessageEventStream`
+completes on the first `done`/`error` event and drops every later push — the
+fact the whole retry-safety rule rests on.
+
+The reviews are scoped to this delta and its interaction with the existing
+admission controller and transient-retry layers. They are not a fresh audit of
+every unrelated module.
 
 ## Repository release evidence
 
