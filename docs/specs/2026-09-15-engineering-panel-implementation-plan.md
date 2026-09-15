@@ -53,7 +53,7 @@ export class PanelState {
 }
 ```
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Create `test/unit/panel-state.test.ts`:
 
@@ -120,21 +120,21 @@ test("panel state: dispose stops publication", () => {
 });
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `node --test test/unit/panel-state.test.ts`
 Expected: FAIL — `Cannot find module '../../src/panel/PanelState.ts'`.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 Create `src/panel/PanelState.ts` following `src/status/state.ts` exactly: a private `state`, a `Set` of listeners, `set()` that merges, compares with a `JSON.stringify` deep-equal and returns early when unchanged, notifies inside `try/catch` per listener, and a `disposed` flag checked in `set`. `noteError` filters that section out of `errors` and appends the new one; `clearError` filters it out. Initial state: `{ errors: [], updatedAt: 0 }`.
 
-- [ ] **Step 4: Run the test to verify it passes**
+- [x] **Step 4: Run the test to verify it passes**
 
 Run: `node --test test/unit/panel-state.test.ts`
 Expected: PASS.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
 ```bash
 npm run lint && npm run typecheck && npm test
@@ -171,7 +171,7 @@ export function buildRows(state: Readonly<PanelStateShape>, expanded: ReadonlySe
 export function clampSelection(rows: readonly PanelRow[], desired: number): number;
 ```
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Create `test/unit/panel-tree.test.ts`:
 
@@ -278,21 +278,21 @@ test("tree: clampSelection keeps the cursor on a selectable row", () => {
 });
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `node --test test/unit/panel-tree.test.ts`
 Expected: FAIL — `Cannot find module '../../src/panel/tree.ts'`.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 Create `src/panel/tree.ts`. `buildRows` appends, in order: the run header (`WI-12 · review · high`), then the `files`, `findings` and `spend` sections when `state.run` exists; then the workspace section when `state.workspace` exists; then one row per entry in `state.errors`; and an `{ kind: "empty" }` row when no run, no workspace and no errors produced anything. A section header is `selectable: true` with glyph `▾` when its id is in `expanded` and `▸` when not; children are emitted only when expanded. File rows use a one-letter change glyph (`A`/`M`/`D`/`R`/`?`). Finding rows render `severity · role · model · claim`. Spend rows render `model · in/out · $cost`. `clampSelection` returns -1 when no row is selectable, otherwise clamps into range and walks forward (then backward) to the nearest selectable row.
 
-- [ ] **Step 4: Run the test to verify it passes**
+- [x] **Step 4: Run the test to verify it passes**
 
 Run: `node --test test/unit/panel-tree.test.ts`
 Expected: PASS.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
 ```bash
 npm run lint && npm run typecheck && npm test
@@ -317,7 +317,7 @@ git commit -m "feat(panel): pure tree shaping from panel state"
 
 **Why the runtime change:** per-model spend is not persisted anywhere — `WorkerUsage` is folded into the runtime's aggregate `telemetry` and lost per model. The worker-run helper already reports `model` on the phase event; carrying `input`/`output`/`cost` alongside it is the smallest honest source for the spend section, and it needs no ledger schema change.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Create `test/unit/panel-ledger-feeder.test.ts`:
 
@@ -511,7 +511,7 @@ test("vertical slice: onPhase reports per-model usage for the spend view", async
 });
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `node --test test/unit/panel-ledger-feeder.test.ts`
 Expected: FAIL — `Cannot find module '../../src/panel/feeders/LedgerFeeder.ts'`.
@@ -527,7 +527,7 @@ recordEntity(kind, claim, status, actor, workItemId, opts?): Promise<LedgerEntit
 events(workItemId?): LedgerEvent[]   // { event_id, work_item_id, timestamp, actor, type, payload }
 ```
 
-- [ ] **Step 3: Extend the phase event**
+- [x] **Step 3: Extend the phase event**
 
 In `src/runtime/EngineeringRuntime.ts`, add to `RuntimePhaseEvent`:
 
@@ -548,7 +548,7 @@ and in the worker-run helper where `run.usage?.model` is already read, include i
         });
 ```
 
-- [ ] **Step 4: Write the feeder**
+- [x] **Step 4: Write the feeder**
 
 Create `src/panel/feeders/LedgerFeeder.ts`. It keeps `spendByModel: Map<string, PanelSpend>` and the active `workItemId`. `onPhase`:
 
@@ -579,12 +579,12 @@ the most recent actor, which is what the panel should show. Where an entity has
 no recorded event, leave `role`/`model` undefined rather than inventing a value
 — `tree.ts` already renders only what is present.
 
-- [ ] **Step 5: Run the tests to verify they pass**
+- [x] **Step 5: Run the tests to verify they pass**
 
 Run: `node --test test/unit/panel-ledger-feeder.test.ts test/integration/vertical-slice.test.ts`
 Expected: PASS.
 
-- [ ] **Step 6: Verify and commit**
+- [x] **Step 6: Verify and commit**
 
 ```bash
 npm run lint && npm run typecheck && npm test
@@ -606,7 +606,7 @@ git commit -m "feat(panel): ledger feeder with per-model spend"
   - `export function parseGitStatusShort(output: string): PanelFileEntry[]`
   - `class WorkspaceFeeder { constructor(opts: { state: PanelState; repo: GitRepo | null; now?: () => number; ttlMs?: number; contextUsage?: () => { tokens: number | null; percent: number | null } | undefined }); refresh(): Promise<void>; invalidate(): void; }`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Create `test/unit/panel-workspace-feeder.test.ts`:
 
@@ -704,21 +704,21 @@ test("workspace feeder: outside a git repo there is no error, just no files", as
 });
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `node --test test/unit/panel-workspace-feeder.test.ts`
 Expected: FAIL — module not found.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 Create `src/panel/feeders/WorkspaceFeeder.ts`. `parseGitStatusShort` splits lines, reads the two-character status field, maps `??` → untracked, `A` → added, `D` → deleted, `R` → renamed (taking the path after `->` and stripping surrounding quotes), anything else with a non-space code → modified, and skips blank lines. `refresh()` returns early when `now() - lastReadAt < ttlMs` and a previous read succeeded; otherwise reads branch + status inside `try/catch`, publishes `{ branch, files, contextTokens, contextPercent }`, and on failure calls `noteError("workspace", ...)` while leaving the previous `workspace` value in place. A null repo publishes an empty file list and no error. Default `ttlMs` is 30_000, matching `DEFAULT_STATUS_BAR_CONFIG.gitCacheTtlMs`.
 
-- [ ] **Step 4: Run the test to verify it passes**
+- [x] **Step 4: Run the test to verify it passes**
 
 Run: `node --test test/unit/panel-workspace-feeder.test.ts`
 Expected: PASS.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
 ```bash
 npm run lint && npm run typecheck && npm test
@@ -747,7 +747,7 @@ export async function readFileContent(absPath: string, title?: string): Promise<
 export async function readDiffContent(artifacts: { readContentByUri(uri: string): Promise<string | undefined> }, uri: string): Promise<ContentView>;
 ```
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Create `test/unit/panel-content.test.ts`:
 
@@ -809,21 +809,21 @@ test("content: an unreadable artifact reports an error", async () => {
 });
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `node --test test/unit/panel-content.test.ts`
 Expected: FAIL — module not found.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 Create `src/panel/content.ts`. `toContentView` splits on `\n`, drops a single trailing empty line, and caps at `MAX_CONTENT_LINES`, setting `truncated`. `readFileContent` stats the file first and refuses anything over `MAX_CONTENT_BYTES` with a `truncated` view containing the first chunk, catching every error into `{ lines: [], error }`. `readDiffContent` awaits `readContentByUri` inside `try/catch`, treating `undefined` as `{ error: "artifact not found" }`. Nothing here ever throws.
 
-- [ ] **Step 4: Run the test to verify it passes**
+- [x] **Step 4: Run the test to verify it passes**
 
 Run: `node --test test/unit/panel-content.test.ts`
 Expected: PASS.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
 ```bash
 npm run lint && npm run typecheck && npm test
@@ -867,7 +867,7 @@ export class PanelComponent {
 }
 ```
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Create `test/unit/panel-component.test.ts`:
 
@@ -989,12 +989,12 @@ test("component: escape at the top level closes the panel", () => {
 });
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `node --test test/unit/panel-component.test.ts`
 Expected: FAIL — module not found.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 Create `src/panel/PanelComponent.ts`. It subscribes to `PanelState` in the constructor (storing the unsubscribe, called in `dispose`) and calls `requestRender` on change. It keeps `expanded: Set<string>` (all section ids expanded initially), `selectedIndex`, and an optional `content: ContentView | null`.
 
@@ -1002,12 +1002,12 @@ Create `src/panel/PanelComponent.ts`. It subscribes to `PanelState` in the const
 
 `handleInput(data)` maps `\x1b[A`/`\x1b[B` to up/down, `\r`/`\n` and `\x1b[C` to expand-or-open (toggling `expanded` for a section row, calling `openRow` for file rows), `\x1b[D` to collapse, and `\x1b` to dismiss content (when showing) or call `onClose` (when not). Unknown input is ignored.
 
-- [ ] **Step 4: Run the test to verify it passes**
+- [x] **Step 4: Run the test to verify it passes**
 
 Run: `node --test test/unit/panel-component.test.ts`
 Expected: PASS.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
 ```bash
 npm run lint && npm run typecheck && npm test
@@ -1035,7 +1035,7 @@ git commit -m "feat(panel): panel component with keyboard navigation"
 
 **Why a raw input handler:** `ExtensionAPI` exposes `registerCommand` but no keybinding registration, so the hotkey is implemented with `ctx.ui.onTerminalInput`, which consumes only its configured chord and passes everything else through untouched.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Create `test/unit/panel-controller.test.ts`:
 
@@ -1104,12 +1104,12 @@ function fakeUi() {
 }
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `node --test test/unit/panel-controller.test.ts`
 Expected: FAIL — module not found.
 
-- [ ] **Step 3: Write the controller**
+- [x] **Step 3: Write the controller**
 
 Create `src/panel/PanelController.ts`. `matchesChord` maps `ctrl+<letter>` to its control code (`ctrl+p` → `\x10`, i.e. `String.fromCharCode(letter.charCodeAt(0) - 96)`) and returns false for the literal chord `"none"`. The controller holds the `OverlayHandle` captured through `onHandle`, opens with:
 
@@ -1146,20 +1146,20 @@ confirmed in `@earendil-works/pi-tui/dist/tui.d.ts`; it is called every render
 cycle, so it must stay cheap. `nonCapturing?: boolean` is also available if the
 panel should ever stop taking focus.
 
-- [ ] **Step 4: Run the test to verify it passes**
+- [x] **Step 4: Run the test to verify it passes**
 
 Run: `node --test test/unit/panel-controller.test.ts`
 Expected: PASS.
 
-- [ ] **Step 5: Wire it into the extension**
+- [x] **Step 5: Wire it into the extension**
 
 In `extensions/index.ts`: create one `PanelState` per repo alongside the runtime, construct the feeders, register `/panel`, and install the raw input handler in `session_start` (pushing its unsubscribe onto the existing `footerUnsubscribes` drain). Feed the same `onPhase` events already wired for the footer into `LedgerFeeder.onPhase`, and refresh the `WorkspaceFeeder` when the panel opens and on `agent_settled`.
 
-- [ ] **Step 6: Document and smoke-test**
+- [x] **Step 6: Document and smoke-test**
 
 Add a README section describing `/panel`, the keys (`↑↓`, `→`/`enter`, `←`, `esc`, `ctrl+p`), the fullscreen-only mouse caveat, and `PI_PANEL_CHORD` (default `ctrl+p`, `none` to disable). Add `panel` to the expected command list in `scripts/smoke-commands.ts`.
 
-- [ ] **Step 7: Verify and commit**
+- [x] **Step 7: Verify and commit**
 
 ```bash
 npm run lint && npm run typecheck && npm test && npm run test:e2e
