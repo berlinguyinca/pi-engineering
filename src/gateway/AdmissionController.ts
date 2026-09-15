@@ -49,7 +49,7 @@ export interface AdmissionControllerOptions {
   /** Injected monotonic clock (ms). Default Date.now. */
   now?: () => number;
   /** Injected sleeper. Default setTimeout-based. */
-  sleep?: (ms: number) => Promise<void>;
+  sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
   /** Injected jitter source in [0,1). Default Math.random. */
   random?: () => number;
   /** Structured observation sink (telemetry/notices). */
@@ -68,6 +68,12 @@ export interface AdmissionStatus {
   waiting: number;
   /** Effective concurrency limit right now. */
   concurrency: number;
+  /**
+   * The limit with no clamp applied — `maxConcurrency - reservedSlots`, not
+   * `maxConcurrency`. Reported because callers cannot derive it: comparing
+   * against the configured maximum makes every healthy session look clamped.
+   */
+  baseConcurrency: number;
   /** Milliseconds remaining on the process-wide cooldown (0 when open). */
   cooldownMs: number;
   /** The signal that produced the current cooldown, when any. */
@@ -89,8 +95,28 @@ export interface AdmissionSlot {
   release(): void;
 }
 
-const defaultSleep = (ms: number): Promise<void> =>
-  ms <= 0 ? Promise.resolve() : new Promise((resolve) => setTimeout(resolve, ms));
+/**
+ * Sleep that really stops when the caller aborts.
+ *
+ * The timer must be CLEARED, not merely raced against: a pending `setTimeout`
+ * keeps Node's event loop alive, so an operator who pressed escape during a
+ * 60-second hold and then quit would watch pi sit there until the timer they
+ * already cancelled finally expired.
+ */
+const defaultSleep = (ms: number, signal?: AbortSignal): Promise<void> => {
+  if (ms <= 0 || signal?.aborted) return Promise.resolve();
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    function onAbort(): void {
+      clearTimeout(timer);
+      resolve();
+    }
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+};
 
 export class AdmissionController {
   private readonly configuredMax: number;
@@ -100,7 +126,7 @@ export class AdmissionController {
   private readonly jitterMs: number;
   private readonly successesToRelax: number;
   private readonly now: () => number;
-  private readonly sleep: (ms: number) => Promise<void>;
+  private readonly sleep: (ms: number, signal?: AbortSignal) => Promise<void>;
   private readonly random: () => number;
   private readonly onEvent: ((event: AdmissionEvent) => void) | undefined;
 
@@ -164,6 +190,7 @@ export class AdmissionController {
       active: this.active,
       waiting: this.waiting,
       concurrency: this.concurrency,
+      baseConcurrency: this.baseConcurrency,
       cooldownMs: Math.max(0, this.cooldownUntil - this.now()),
       ...(this.lastSignal ? { lastSignal: this.lastSignal } : {}),
     };
@@ -207,7 +234,11 @@ export class AdmissionController {
 
   /** Sleep, returning early (without throwing) if the caller is aborted. */
   private sleepOrAbort(ms: number, signal: AbortSignal | undefined): Promise<void> {
-    const sleeping = this.sleep(ms);
+    // The signal is handed to the sleep itself so the timer can be cleared.
+    // Racing a promise against the abort would resolve this caller promptly but
+    // leave the timer pending, and a pending timer keeps Node's event loop
+    // alive — an aborted 60s hold would delay process exit by the full 60s.
+    const sleeping = this.sleep(ms, signal);
     if (!signal) return sleeping;
     return new Promise<void>((resolve) => {
       let settled = false;
@@ -218,7 +249,6 @@ export class AdmissionController {
         resolve();
       };
       signal.addEventListener("abort", finish, { once: true });
-      // The timer is left to expire on its own; it holds nothing but itself.
       void sleeping.then(finish, finish);
     });
   }
@@ -281,6 +311,51 @@ export class AdmissionController {
 
     this.emit({ type: "wait", waitMs, signal, concurrency: this.concurrency });
     return waitMs;
+  }
+
+  /**
+   * Record a wait we are NOT acting on.
+   *
+   * Emits the signal so the status bar and telemetry see it, and remembers it
+   * as the last refusal, but arms no cooldown and applies no clamp. Used where
+   * a refusal is observed after the fact — a terminal assistant error — and the
+   * caller that hit it has already dealt with it, so parking the rest of the
+   * process would be a stall with nothing behind it.
+   */
+  noteObservedWait(signal: GatewayWaitSignal): number {
+    this.lastSignal = signal;
+    const waitMs = Math.min(signal.retryAfterMs, this.maxWaitMs);
+    this.emit({ type: "wait", waitMs, signal, concurrency: this.concurrency });
+    return waitMs;
+  }
+
+  /**
+   * Honour a wait that speaks only for THIS caller.
+   *
+   * The distinction is the signal's scope, not its severity. A gateway
+   * admission refusal reports `active_limit`, a queue position and a `scope`:
+   * it speaks for the whole account, so `noteWait` parks every caller in the
+   * process behind one cooldown. A bare `503 no worker for model` speaks for
+   * one model. Arming the process-wide cooldown from that would stall workers
+   * on models that are answering perfectly well — and the longer the retry
+   * escalation runs, the longer the unrelated stall.
+   *
+   * So this emits the wait (the status bar still gets its spinner and
+   * countdown) and parks the caller, but touches neither `cooldownUntil` nor
+   * the concurrency clamp.
+   */
+  async noteCallerWaitAndSleep(signal: GatewayWaitSignal, opts: AdmissionWaitOptions = {}): Promise<number> {
+    this.lastSignal = signal;
+    const waitMs = Math.min(signal.retryAfterMs, this.maxWaitMs);
+    this.waiting++;
+    try {
+      this.emit({ type: "wait", waitMs, signal, concurrency: this.concurrency });
+      if (opts.signal?.aborted) return 0;
+      await this.sleepOrAbort(waitMs, opts.signal);
+    } finally {
+      this.waiting--;
+    }
+    return opts.signal?.aborted ? 0 : waitMs;
   }
 
   /**

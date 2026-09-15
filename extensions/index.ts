@@ -1,17 +1,28 @@
 import { createHash } from "node:crypto";
 import { resolve } from "node:path";
+import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import type { Model } from "@earendil-works/pi-ai/compat";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { resolveMemoryEnvironment } from "../src/blackhole/connectionSetup.ts";
 import { openVikingBlackholeOption } from "../src/blackhole/envConfig.ts";
 import { registerInteractiveMemory } from "../src/blackhole/interactiveMemory.ts";
 import { sharedAdmissionController, sharedGatewayConfig } from "../src/gateway/config.ts";
-import { describeGatewayWait, parseGatewayWait } from "../src/gateway/signals.ts";
+import { type FallbackCandidate, chooseFallbackModel } from "../src/gateway/fallback.ts";
+import {
+  installGatewayStreamRetry,
+  installedGatewayStreamRetries,
+  isGatewayStreamRetryLive,
+} from "../src/gateway/installStreamRetry.ts";
+import { describeGatewayWait, isAccountWideRefusal, parseGatewayWait } from "../src/gateway/signals.ts";
+import { renderGatewayReport } from "../src/gateway/statusReport.ts";
 import { GitRepo } from "../src/git/GitRepo.ts";
 import { GenerationGuard } from "../src/guard/GenerationGuard.ts";
 import { RECOVERY_PROMPT, TOOL_TRANSITION_RULE, buildDegenerationEvent } from "../src/guard/RecoveryController.ts";
 import { resolveGuardConfig } from "../src/guard/config.ts";
 import { guardFeedFor } from "../src/guard/streamText.ts";
+import { ModelHealthProvider } from "../src/models/health.ts";
+import { defaultModelsPath, providerBaseUrl, readModelsConfig } from "../src/models/modelsConfig.ts";
+import { refreshProviderModels } from "../src/models/refresh.ts";
 import { PanelController } from "../src/panel/PanelController.ts";
 import { PanelState } from "../src/panel/PanelState.ts";
 import { readDiffContent, readFileContent } from "../src/panel/content.ts";
@@ -321,6 +332,128 @@ ${RECOVERY_PROMPT}`;
   // model caller in this process — the worker sessions AND this interactive
   // turn — behind one shared cooldown until the reported wait has elapsed.
   const gatewayConfig = sharedGatewayConfig();
+
+  // Gateway-reported per-model readiness (`slots`, `x_state`). Built lazily and
+  // cached per provider: this is consulted on every hold, and holds arrive in
+  // bursts exactly when the gateway can least afford extra requests.
+  const healthProviders = new Map<string, ModelHealthProvider>();
+  const healthFor = async (ctx: { model?: Model<any>; modelRegistry?: unknown }): Promise<
+    ModelHealthProvider | undefined
+  > => {
+    const model = ctx.model;
+    if (!model) return undefined;
+    let provider = healthProviders.get(model.provider);
+    if (!provider) {
+      const baseUrl = model.baseUrl ?? providerBaseUrl(safeModelsConfig(), model.provider);
+      if (!baseUrl) return undefined;
+      let apiKey: string | undefined;
+      try {
+        const registry = ctx.modelRegistry as
+          | { getApiKeyAndHeaders?: (m: Model<any>) => Promise<{ ok: boolean; apiKey?: string }> }
+          | undefined;
+        const resolved = await registry?.getApiKeyAndHeaders?.(model);
+        if (resolved?.ok) apiKey = resolved.apiKey;
+      } catch {
+        // Unauthenticated probe; the gateway decides whether that is allowed.
+      }
+      provider = new ModelHealthProvider({ baseUrl, ...(apiKey ? { apiKey } : {}) });
+      healthProviders.set(model.provider, provider);
+    }
+    await provider.refresh();
+    return provider;
+  };
+
+  /** Read models.json without letting a malformed file break a command. */
+  function safeModelsConfig(): ReturnType<typeof readModelsConfig> {
+    try {
+      return readModelsConfig(defaultModelsPath());
+    } catch {
+      return {};
+    }
+  }
+
+  // ─── /refresh-models: make the configured catalogue match the gateway ────
+  // Model configuration drifts silently and expensively. Measured against a
+  // live gateway, a working models.json had one model configured at 1,048,576
+  // tokens that the gateway caps at 262,144, another at 131,072 that actually
+  // accepts 250,112, and a model missing entirely. The over-statement is the
+  // damaging direction: Pi fills the context believing it fits, the request
+  // fails, and because Pi computes usage from the configured window, compaction
+  // fires far too late to save the turn.
+  pi.registerCommand("refresh-models", {
+    description: "Refresh models.json from the provider's gateway (names, context sizes). --dry-run to preview.",
+    handler: async (args: string, ctx: ExtensionCommandContext) => {
+      const argv = (args ?? "").trim().split(/\s+/).filter(Boolean);
+      const dryRun = argv.includes("--dry-run");
+      const pruneMissing = argv.includes("--prune");
+      const model = ctx.model;
+      const providerId = argv.find((a) => !a.startsWith("--")) ?? model?.provider;
+      if (!providerId) {
+        ctx.ui.notify("No provider to refresh. Select a model first, or pass a provider name.", "warning");
+        return;
+      }
+
+      // Resolve auth through the registry rather than reading the key here, so
+      // the credential is never handled by this extension directly.
+      let apiKey: string | undefined;
+      try {
+        const resolved = model ? await ctx.modelRegistry?.getApiKeyAndHeaders(model) : undefined;
+        if (resolved?.ok) apiKey = resolved.apiKey;
+      } catch {
+        // Fall through unauthenticated; the gateway decides whether that works.
+      }
+
+      try {
+        const result = await refreshProviderModels({
+          modelsPath: defaultModelsPath(),
+          providerId,
+          ...(apiKey ? { apiKey } : {}),
+          ...(dryRun ? { dryRun: true } : {}),
+          ...(pruneMissing ? { pruneMissing: true } : {}),
+          ...(ctx.signal ? { signal: ctx.signal } : {}),
+        });
+        ctx.ui.notify(result.lines.join("\n"), "info");
+      } catch (err) {
+        ctx.ui.notify(
+          `refresh-models failed: ${err instanceof Error ? err.message : String(err)}. Your configuration was not changed.`,
+          "error",
+        );
+      }
+    },
+  });
+
+  // Registered outside the `pi.on` guard below: a command needs only
+  // `registerCommand`, and burying it in there meant it never appeared in a
+  // session without event support — nor in the package smoke test, which is
+  // how a missing command surface goes unnoticed.
+  // ─── /gateway: why are we waiting, and how badly ───────────────────────
+  pi.registerCommand("gateway", {
+    description: "Show model-gateway admission state: holds, queue position, concurrency clamp.",
+    handler: async (_args: string, ctx: ExtensionCommandContext) => {
+      const usage = ctx.getContextUsage?.();
+      const lines = renderGatewayReport({
+        status: sharedAdmissionController().status(),
+        config: {
+          enabled: gatewayConfig.enabled,
+          maxConcurrency: gatewayConfig.maxConcurrency,
+          reservedSlots: gatewayConfig.reservedSlots,
+          maxWaitMs: gatewayConfig.maxWaitMs,
+          maxRetries: gatewayConfig.maxRetries,
+        },
+        installs: installedGatewayStreamRetries(),
+        model: ctx.model
+          ? {
+              id: ctx.model.id,
+              provider: ctx.model.provider,
+              api: ctx.model.api,
+              contextWindow: ctx.model.contextWindow,
+            }
+          : undefined,
+        contextTokens: usage?.tokens ?? null,
+      });
+      ctx.ui.notify(lines.join("\n"), "info");
+    },
+  });
   if (gatewayConfig.enabled && typeof pi.on === "function") {
     const admission = sharedAdmissionController();
 
@@ -330,25 +463,34 @@ ${RECOVERY_PROMPT}`;
     pi.on("after_provider_response", async (event) => {
       if (event.status !== 429) return;
       const signal = parseGatewayWait({ status: event.status, headers: event.headers });
-      if (signal?.retryable) admission.noteWait(signal);
+      // A 429 is a statement about the account, so it parks everyone. Scoped
+      // through the same predicate as the other two paths rather than by hand.
+      if (signal?.retryable) {
+        if (isAccountWideRefusal(signal)) admission.noteWait(signal);
+        else admission.noteObservedWait(signal);
+      }
     });
 
-    // Pi's own session retry stops after `retry.maxRetries` (default 3) and
-    // there is no accessor for it on the extension API, so the interactive turn
-    // can still surface a 429 after three honoured waits even though every
-    // worker now waits indefinitely. Say so once, with the fix, rather than
-    // letting the operator rediscover it each time.
-    let retryAdviceShown = false;
-    let gatewayHolds = 0;
+    // Pi's own session retry stops after `retry.maxRetries` (default 3),
+    // ignores the wait the gateway advertised, and has no accessor on the
+    // extension API. The interactive turn used to die there — "Retry failed
+    // after 3 attempts" — while every worker waited happily. That budget is now
+    // bypassed by wrapping the provider's `streamSimple` (see below), so the
+    // advice notice that used to point operators at .pi/settings.json is gone.
 
     // Terminal assistant error: the only place `retry_after_ms` appears, since
     // it lives in the response BODY.
+    //
+    // Scoped through `isAccountWideRefusal`, the same predicate the wrapper and
+    // `after_provider_response` use. Two fresh-context reviews caught this
+    // family of paths disagreeing with each other; a rule stated in one place
+    // and broken in another is not a rule, so all three now ask one function.
     pi.on("message_end", async (event, ctx) => {
       const msg = event.message as { role?: string; stopReason?: string; errorMessage?: string } | undefined;
       if (msg?.role !== "assistant" || msg.stopReason !== "error" || !msg.errorMessage) return;
       const signal = parseGatewayWait({ text: msg.errorMessage });
       if (!signal?.retryable) return;
-      const waitMs = admission.noteWait(signal);
+      const waitMs = isAccountWideRefusal(signal) ? admission.noteWait(signal) : admission.noteObservedWait(signal);
       // The status bar owns this now: a spinner, the countdown and the queue
       // position say everything the 429 body did, without a wall of warnings
       // every 30 seconds. Notify only when there is no status bar to read.
@@ -356,14 +498,6 @@ ${RECOVERY_PROMPT}`;
         ctx.ui.notify(
           `Model gateway is saturated — holding ${Math.round(waitMs / 1000)}s. ${describeGatewayWait(signal)}`,
           "warning",
-        );
-      }
-      gatewayHolds++;
-      if (gatewayHolds >= 2 && !retryAdviceShown) {
-        retryAdviceShown = true;
-        ctx.ui.notify(
-          'Gateway saturation is being waited out. Engineering workers now wait indefinitely; this interactive turn still stops at Pi\'s own retry budget — raise it with `"retry": { "maxRetries": 100 }` in .pi/settings.json.',
-          "info",
         );
       }
     });
@@ -398,6 +532,172 @@ ${RECOVERY_PROMPT}`;
       const signal = ctx.signal;
       await admission.awaitCooldown(signal ? { signal } : {});
     });
+
+    // ─── Unbounded waiting for the interactive turn ────────────────────────
+    // Everything above holds the turn BEFORE a request and records the wait
+    // after one fails, but it cannot stop Pi from giving up: `retryAssistantCall`
+    // (pi-ai utils/retry.js) retries a failed assistant message `maxRetries`
+    // times — 3 by default — with its own exponential backoff, then surfaces
+    // "Retry failed after 3 attempts".
+    //
+    // `registerProvider(id, { api, streamSimple })` is the one seam that gets
+    // underneath that: `composeModelProvider` dispatches the agent's own
+    // provider call to the handler we supply (provider-composer.js:315-323), so
+    // a wait taken in there costs Pi nothing from its retry budget. Saturation
+    // becomes what it actually is — a slow request, not a failed one.
+    // Consecutive waits on the current model, the trigger for considering a
+    // stand-in. Reset whenever a stream actually produces output or the model
+    // changes.
+    let consecutiveGatewayHolds = 0;
+
+    const installStreamRetry = (ctx: { modelRegistry?: unknown; signal?: AbortSignal }, model?: Model<any>): void => {
+      const registry = ctx.modelRegistry as Parameters<typeof installGatewayStreamRetry>[0] | undefined;
+      if (!registry || typeof registry.registerProvider !== "function") return;
+      if (!model?.provider || !model?.api) return;
+      installGatewayStreamRetry(
+        registry,
+        { provider: model.provider, api: model.api },
+        {
+          createStream: () => createAssistantMessageEventStream() as never,
+          // Scope decides which gate, keyed on what the refusal is ABOUT. A
+          // 429 or an admission envelope speaks for the account — a shared
+          // queue, a concurrency ceiling — so it parks every caller behind one
+          // cooldown. A `503 no worker for model` speaks for one model, and
+          // parking workers on healthy models behind it would turn one model's
+          // outage into a runtime-wide stall. Either way the wait is emitted,
+          // so the footer keeps its spinner and countdown.
+          hold: async (waitSignal, _attempt, abort) => {
+            const opts = abort ? { signal: abort } : {};
+            if (isAccountWideRefusal(waitSignal)) await admission.noteWaitAndSleep(waitSignal, opts);
+            else await admission.noteCallerWaitAndSleep(waitSignal, opts);
+          },
+          // "Consecutive" has to mean consecutive: without this the counter
+          // accumulated across a whole session and would eventually trip a
+          // fallback on unrelated, widely separated holds.
+          onProgress: () => {
+            consecutiveGatewayHolds = 0;
+          },
+          onHold: () => {
+            consecutiveGatewayHolds++;
+            // Checked on a hold rather than on failure: by the time a turn
+            // fails the operator has already spent the wait this avoids. The
+            // in-flight request is left alone — a switch applies to the next
+            // one.
+            if (consecutiveGatewayHolds >= FALLBACK_AFTER_HOLDS) void considerFallback(latestCtx);
+          },
+          signalOf: (options) => (options as { signal?: AbortSignal } | undefined)?.signal,
+          errorMessage: (m, error) => ({
+            role: "assistant",
+            content: [],
+            api: (m as Model<any>).api,
+            provider: (m as Model<any>).provider,
+            model: (m as Model<any>).id,
+            usage: {
+              input: 0,
+              output: 0,
+              cacheRead: 0,
+              cacheWrite: 0,
+              totalTokens: 0,
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+            },
+            stopReason: "error",
+            errorMessage: error instanceof Error ? error.message : String(error),
+            timestamp: Date.now(),
+          }),
+        },
+      );
+    };
+
+    // Per (provider, api): `composeModelProvider` only dispatches to our
+    // handler when the model's api matches the one registered, so a switch to a
+    // model on a different api needs its own installation.
+    //
+    // Installing is idempotent, so all three hooks are belt-and-braces rather
+    // than redundancy: `session_start` is the normal path, `before_agent_start`
+    // covers a session whose `ctx.model` was not resolved yet (the type admits
+    // undefined), and `model_select` covers a mid-session switch. It has to
+    // land before the first provider call — `before_provider_request` fires
+    // from inside the provider's own stream call, which is already too late for
+    // that request.
+    pi.on("session_start", (_event, ctx) => {
+      latestCtx = ctx as ExtensionCommandContext;
+      installStreamRetry(ctx, ctx.model);
+    });
+    pi.on("before_agent_start", (_event, ctx) => {
+      latestCtx = ctx as ExtensionCommandContext;
+      installStreamRetry(ctx, ctx.model);
+    });
+    pi.on("model_select", (event, ctx) => {
+      latestCtx = ctx as ExtensionCommandContext;
+      // A switch — ours or the operator's — means the new model gets a clean
+      // ledger; otherwise one model's outage would keep pushing the next one
+      // toward a fallback it never earned.
+      consecutiveGatewayHolds = 0;
+      installStreamRetry(ctx, event.model);
+    });
+
+    // ─── Model fallback when one model has no workers ──────────────────────
+    // Waiting already keeps the turn alive; this is about not waiting longer
+    // than necessary when the same gateway is serving a healthy model.
+    //
+    // The decision is mostly a refusal (src/gateway/fallback.ts): moving a
+    // session to a model it no longer fits in does not degrade it, it ends it
+    // with a context overflow — trading a survivable wait for an unsurvivable
+    // error. So a switch needs a measured context size, and `getContextUsage()`
+    // reports null right after compaction, which is a refusal rather than a
+    // reason to guess.
+    const FALLBACK_AFTER_HOLDS = 3;
+
+    const toCandidate = (m: Model<any>, health?: ModelHealthProvider): FallbackCandidate => {
+      const reading = health?.get(m.id) ?? {};
+      return {
+        id: m.id,
+        provider: m.provider,
+        api: m.api,
+        contextWindow: m.contextWindow,
+        maxTokens: m.maxTokens,
+        reasoning: m.reasoning === true,
+        input: m.input ?? ["text"],
+        ...(reading.state !== undefined ? { state: reading.state } : {}),
+        ...(reading.slots !== undefined ? { slots: reading.slots } : {}),
+      };
+    };
+
+    /** The most recent session context, for the hold-driven fallback check. */
+    let latestCtx: ExtensionCommandContext | undefined;
+
+    const considerFallback = async (ctx: ExtensionCommandContext | undefined): Promise<void> => {
+      if (!ctx) return;
+      const current = ctx.model;
+      if (!current) return;
+      const registry = ctx.modelRegistry as { getAvailable?: () => Model<any>[] } | undefined;
+      const available = registry?.getAvailable?.() ?? [];
+      if (available.length < 2) return;
+
+      const usage = ctx.getContextUsage?.();
+      // Readiness makes the difference between swapping to a model that can
+      // serve and swapping to another one with no workers.
+      const health = await healthFor(ctx).catch(() => undefined);
+      const decision = chooseFallbackModel({
+        current: toCandidate(current, health),
+        available: available.map((m) => toCandidate(m, health)),
+        usedTokens: usage?.tokens ?? null,
+      });
+      if (decision.action !== "switch") return;
+
+      const target = available.find((m) => m.id === decision.model.id && m.provider === decision.model.provider);
+      if (!target) return;
+      // Announced, never silent: a model swap changes output quality, and an
+      // operator who cannot see it happen cannot account for what changed.
+      const switched = await pi.setModel(target);
+      if (switched) {
+        consecutiveGatewayHolds = 0;
+        ctx.ui.notify(
+          `${current.id} has no workers — switched to ${target.id} (${decision.reason}). /model to change back.`,
+          "info",
+        );
+      }
+    };
   }
 
   // ─── Live status bar: harness-owned Pi footer (spec §status-bar) ─────────

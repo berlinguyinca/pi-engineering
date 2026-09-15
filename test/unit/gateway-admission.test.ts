@@ -12,6 +12,7 @@ import { resolveGatewayConfig } from "../../src/gateway/config.ts";
 import {
   decideGatewayRetry,
   describeGatewayWait,
+  isAccountWideRefusal,
   parseGatewayWait,
   parseRetryAfterHeader,
 } from "../../src/gateway/signals.ts";
@@ -403,4 +404,199 @@ test("aborting mid-hold stops that caller without shortening the process-wide co
   abort.abort();
   assert.equal(await pending, 0);
   assert.equal(controller.status().waiting, 0, "the waiter must be released from the ledger");
+});
+
+// ─── Caller-scoped waits ────────────────────────────────────────────────────
+// A 429 admission refusal speaks for the whole account: `scope: "agent"`,
+// `active_limit`, a queue position. Holding every caller behind it is the point.
+//
+// A bare `503 no worker for model` speaks only for ONE model. The parser still
+// produces a signal, but with a synthesized wait, and arming the process-wide
+// cooldown from it would stall workers on models that are perfectly healthy —
+// the worse the escalation, the longer the unrelated stall.
+
+test("a caller-scoped wait holds the caller without arming the process cooldown", async () => {
+  const slept: number[] = [];
+  const controller = new AdmissionController({
+    maxConcurrency: 4,
+    reservedSlots: 1,
+    maxWaitMs: Number.POSITIVE_INFINITY,
+    jitterMs: 0,
+    sleep: async (ms) => {
+      slept.push(ms);
+    },
+  });
+  const signal = parseGatewayWait({ text: "503 no worker for model" });
+  assert.ok(signal);
+  assert.equal(signal.source, "default", "a synthesized wait, not one the gateway advertised");
+
+  const waited = await controller.noteCallerWaitAndSleep(signal);
+
+  assert.equal(waited, signal.retryAfterMs);
+  assert.deepEqual(slept, [signal.retryAfterMs], "the caller really waited");
+  assert.equal(controller.cooldownRemainingMs(), 0, "workers on other models must not be stalled by this");
+});
+
+test("a caller-scoped wait is still reported, so the status bar can show it", async () => {
+  const events: string[] = [];
+  const controller = new AdmissionController({
+    maxConcurrency: 4,
+    reservedSlots: 1,
+    maxWaitMs: Number.POSITIVE_INFINITY,
+    jitterMs: 0,
+    sleep: async () => {},
+    onEvent: (e) => events.push(e.type),
+  });
+  const signal = parseGatewayWait({ text: "503 no worker for model" });
+  assert.ok(signal);
+  await controller.noteCallerWaitAndSleep(signal);
+
+  assert.deepEqual(events, ["wait"], "the spinner and countdown come from this event");
+});
+
+test("a caller-scoped wait never clamps process concurrency", async () => {
+  const controller = new AdmissionController({
+    maxConcurrency: 4,
+    reservedSlots: 1,
+    maxWaitMs: Number.POSITIVE_INFINITY,
+    jitterMs: 0,
+    sleep: async () => {},
+  });
+  const before = controller.status().concurrency;
+  // active_limit is an account-wide statement; a caller-scoped wait must not
+  // act on it, or one model's outage would shrink the whole runtime.
+  await controller.noteCallerWaitAndSleep({
+    retryAfterMs: 5_000,
+    retryable: true,
+    source: "default",
+    status: 503,
+    activeLimit: 1,
+  });
+
+  assert.equal(controller.status().concurrency, before);
+  assert.equal(controller.cooldownRemainingMs(), 0);
+});
+
+test("an advertised admission refusal still arms the process-wide cooldown", async () => {
+  const controller = new AdmissionController({
+    maxConcurrency: 4,
+    reservedSlots: 1,
+    maxWaitMs: Number.POSITIVE_INFINITY,
+    jitterMs: 0,
+    sleep: async () => {},
+  });
+  const signal = parseGatewayWait({ text: PRODUCTION_429 });
+  assert.ok(signal);
+  controller.noteWait(signal);
+
+  assert.ok(controller.cooldownRemainingMs() > 0, "this one genuinely speaks for every caller");
+});
+
+test("a caller-scoped wait can be abandoned with the turn's own signal", async () => {
+  const aborter = new AbortController();
+  const controller = new AdmissionController({
+    maxConcurrency: 4,
+    reservedSlots: 1,
+    maxWaitMs: Number.POSITIVE_INFINITY,
+    jitterMs: 0,
+    sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+  });
+  aborter.abort();
+  const started = Date.now();
+  await controller.noteCallerWaitAndSleep(
+    { retryAfterMs: 30_000, retryable: true, source: "default", status: 503 },
+    { signal: aborter.signal },
+  );
+  assert.ok(Date.now() - started < 1_000, "escape must not wait out a 30s hold");
+});
+
+test("an observed wait is reported without parking anyone", async () => {
+  // The after-the-fact path: a terminal assistant error carrying a bare 503.
+  // The caller that hit it has already dealt with it, so the rest of the
+  // process must not be stalled — but the status bar should still see it.
+  const events: string[] = [];
+  const controller = new AdmissionController({
+    maxConcurrency: 4,
+    reservedSlots: 1,
+    maxWaitMs: Number.POSITIVE_INFINITY,
+    jitterMs: 0,
+    sleep: async () => {},
+    onEvent: (e) => events.push(e.type),
+  });
+  const signal = parseGatewayWait({ text: "503 no worker for model" });
+  assert.ok(signal);
+
+  const waitMs = controller.noteObservedWait(signal);
+
+  assert.equal(waitMs, signal.retryAfterMs);
+  assert.deepEqual(events, ["wait"], "the footer still gets its spinner");
+  assert.equal(controller.cooldownRemainingMs(), 0, "but nothing is parked");
+  assert.equal(controller.status().lastSignal?.status, 503, "and it is remembered as the last refusal");
+});
+
+test("an observed wait never clamps concurrency", () => {
+  const controller = new AdmissionController({
+    maxConcurrency: 4,
+    reservedSlots: 1,
+    maxWaitMs: Number.POSITIVE_INFINITY,
+    jitterMs: 0,
+    sleep: async () => {},
+  });
+  const before = controller.status().concurrency;
+  controller.noteObservedWait({ retryAfterMs: 5_000, retryable: true, source: "default", status: 503, activeLimit: 1 });
+  assert.equal(controller.status().concurrency, before);
+});
+
+test("an aborted hold clears its timer instead of pinning the event loop", async () => {
+  // Found by fresh-context review. Racing a promise against the abort resolves
+  // the caller promptly but leaves the timer pending, and a pending timer keeps
+  // Node alive: escape during a 60s hold, then quit, and pi sits there for the
+  // full 60s waiting on a timer nobody wants.
+  const aborter = new AbortController();
+  const controller = new AdmissionController({
+    maxConcurrency: 4,
+    reservedSlots: 1,
+    maxWaitMs: Number.POSITIVE_INFINITY,
+    jitterMs: 0,
+  });
+
+  const held = controller.noteCallerWaitAndSleep(
+    { retryAfterMs: 60_000, retryable: true, source: "default", status: 503 },
+    { signal: aborter.signal },
+  );
+  aborter.abort();
+  await held;
+
+  // A timer still pending here would hold the test runner open past this point.
+  const pending = process.getActiveResourcesInfo?.().filter((r) => r === "Timeout") ?? [];
+  assert.equal(pending.length, 0, `a cancelled hold left ${pending.length} timer(s) running`);
+});
+
+// ─── What a refusal is ABOUT decides who waits ──────────────────────────────
+
+test("scoping: an admission 429 speaks for the account", () => {
+  const signal = parseGatewayWait({ text: PRODUCTION_429 });
+  assert.ok(signal);
+  assert.equal(isAccountWideRefusal(signal), true);
+});
+
+test("scoping: a 429 carrying only a Retry-After header is still account-wide", () => {
+  // The earlier discriminator keyed on `source === "body"` and put this on the
+  // wrong side: a rate limit is about the account however it reports its wait.
+  const signal = parseGatewayWait({ status: 429, headers: { "retry-after": "12" } });
+  assert.ok(signal);
+  assert.equal(signal.source, "header");
+  assert.equal(isAccountWideRefusal(signal), true);
+});
+
+test("scoping: a bare 503 speaks for one model only", () => {
+  const signal = parseGatewayWait({ text: "503 no worker for model" });
+  assert.ok(signal);
+  assert.equal(isAccountWideRefusal(signal), false, "one model's outage must not stall the whole runtime");
+});
+
+test("scoping: a queue timeout is account-wide whatever status carries it", () => {
+  const signal = parseGatewayWait({ text: '{"reason":"queue_timeout","retry_after_ms":1000}' });
+  assert.ok(signal);
+  assert.equal(isAccountWideRefusal(signal), true);
 });

@@ -30,6 +30,8 @@ const stubPi: StubApi = {
 (extension as (pi: StubApi) => void)(stubPi);
 
 const expectedCommands = [
+  "gateway",
+  "refresh-models",
   "engineer",
   "tournament",
   "plan",

@@ -84,3 +84,36 @@ test("sanitize: empty or whitespace-only output is unusable", () => {
 test("sanitize: newlines are collapsed so the tab stays a short prose arc", () => {
   assert.equal(sanitizeNarrative("first line\n\nsecond line"), "first line second line");
 });
+
+test("narrative: over-long output is cut at a sentence, not mid-word", () => {
+  // The first live run returned exactly 400 characters ending "in the midst of
+  // th…", which reads as a panel bug rather than a long answer.
+  const a = "We began work on the gateway wait so a saturated gateway stops killing the interactive turn. ";
+  const b = "Then we moved to verifying the implementation across the admission controller and the pump. ";
+  const c = "We are currently in the midst of recording evidence for the release gate and it runs long.";
+  const clean = sanitizeNarrative(a + b + c, 200);
+
+  assert.ok(clean);
+  assert.doesNotMatch(clean, /…$/, "a sentence boundary was available");
+  assert.match(clean, /\.$/, "it ends on a full stop");
+  assert.ok(clean.length <= 200);
+});
+
+test("narrative: a run-on with no usable boundary still gets bounded", () => {
+  const runOn = `${"word ".repeat(200)}end`;
+  const clean = sanitizeNarrative(runOn, 120);
+
+  assert.ok(clean);
+  assert.equal(clean.length, 120);
+  assert.match(clean, /…$/, "no sentence boundary exists, so the character cut stands");
+});
+
+test("narrative: an early first sentence does not swallow the whole answer", () => {
+  // "Ok." followed by the real content must not become the narrative.
+  const text = `Ok. ${"detail ".repeat(60)}`;
+  const clean = sanitizeNarrative(text, 200);
+
+  assert.ok(clean);
+  assert.notEqual(clean, "Ok.", "a five-character first sentence is not a summary");
+  assert.ok(clean.length > 100);
+});
