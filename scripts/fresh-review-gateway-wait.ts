@@ -149,7 +149,10 @@ const run = await worker.run({
   cwd: repo,
   context: "",
   maxContextTokens: 400_000,
-  timeoutMs: 1_800_000,
+  // Generous on purpose: under gateway saturation a reviewer spends most of its
+  // wall clock waiting out advertised 30s holds rather than thinking, and a
+  // review killed mid-flight yields nothing at all.
+  timeoutMs: Number(process.env.PI_REVIEW_TIMEOUT_MS ?? 2_700_000),
 });
 
 const r = run.result as WorkerResult;
