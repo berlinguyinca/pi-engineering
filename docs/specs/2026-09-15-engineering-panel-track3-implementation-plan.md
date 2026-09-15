@@ -90,7 +90,7 @@ export function stepTab(current: PanelTabId, direction: -1 | 1): PanelTabId;
 
 Layout path: `<profileDir | $PI_CODING_AGENT_DIR | ~/.pi/agent>/engineering-panel/layout.json`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```ts
 import assert from "node:assert/strict";
@@ -209,12 +209,12 @@ test("layout: an unwritable profile drops the preference without throwing", () =
 });
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `npx tsx --test test/unit/panel-layout.test.ts`
 Expected: FAIL — `Cannot find module '../../src/panel/layout.ts'`
 
-- [ ] **Step 3: Implement `src/panel/layout.ts`**
+- [x] **Step 3: Implement `src/panel/layout.ts`**
 
 Mirror `src/blackhole/connectionSetup.ts`: `mkdirSync(dirname, {recursive:true})`, then
 `writeFileSync(tmp, body, { mode: 0o600, flag: "wx" })` followed by `renameSync(tmp, path)`,
@@ -223,11 +223,11 @@ every field on load (`widthPercent` clamped, `tab` checked against `PANEL_TABS`,
 `expanded` filtered to strings); anything unexpected falls back to that field's
 default rather than rejecting the whole file.
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `npx tsx --test test/unit/panel-layout.test.ts` → PASS (9 tests)
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/panel/layout.ts test/unit/panel-layout.test.ts
@@ -271,7 +271,7 @@ export class PanelComponent {
 
 Keys: `\t` next tab, `\x1b[Z` (shift+tab) previous, `<` and `>` step width.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```ts
 import assert from "node:assert/strict";
@@ -399,11 +399,11 @@ test("tabs: every tab respects the width contract at every width", () => {
 });
 ```
 
-- [ ] **Step 2: Run to verify it fails**
+- [x] **Step 2: Run to verify it fails**
 
 Run: `npx tsx --test test/unit/panel-tabs.test.ts` → FAIL (`renderTabBar` is not exported)
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 In `tree.ts`, give `buildRows` a `tab` parameter defaulting to `"files"` and
 branch the section list on it: Files → the existing files sections; Reviews →
@@ -420,11 +420,11 @@ on every change, and prepend `renderTabBar` to `renderTree`'s output.
 no-ops on `JSON.stringify` deep-equality, which does not compare Sets correctly.
 It stays a component field and is read out at persist time.
 
-- [ ] **Step 4: Run to verify they pass** → PASS (10 tests). Also re-run
+- [x] **Step 4: Run to verify they pass** → PASS (10 tests). Also re-run
 `npx tsx --test test/unit/panel-tree.test.ts test/unit/panel-component.test.ts` —
 the default `tab` argument must keep track 2's tests green.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/panel/tree.ts src/panel/PanelComponent.ts test/unit/panel-tabs.test.ts
@@ -452,7 +452,7 @@ export function findMatches(rows: readonly { label: string }[], query: string): 
 export function stepMatch(matches: readonly number[], current: number, direction: -1 | 1): number;
 ```
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```ts
 import assert from "node:assert/strict";
@@ -567,9 +567,9 @@ test("search: backspace edits the query", () => {
 });
 ```
 
-- [ ] **Step 2: Run to verify it fails** → FAIL (no `search.ts`)
+- [x] **Step 2: Run to verify it fails** → FAIL (no `search.ts`)
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 `findMatches`: return `[]` for a blank query; smartcase by testing `/[A-Z]/` on
 the query; use `String.prototype.includes` on the (optionally lowercased) label —
@@ -582,9 +582,9 @@ selection saved when `/` was pressed, `n`/`N` step. `renderTree` shows `/<query>
 as its last line while searching. Escape precedence: content view → search →
 close panel.
 
-- [ ] **Step 4: Run to verify they pass** → PASS (11 tests)
+- [x] **Step 4: Run to verify they pass** → PASS (11 tests)
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/panel/search.ts src/panel/PanelComponent.ts test/unit/panel-search.test.ts
@@ -613,7 +613,7 @@ export function copyToTerminal(text: string, sink?: CopySink): CopyResult;
 export function osc52(text: string): string;
 ```
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```ts
 import assert from "node:assert/strict";
@@ -701,9 +701,9 @@ test("clipboard: the copy result is shown to the operator", () => {
 });
 ```
 
-- [ ] **Step 2: Run to verify it fails** → FAIL (no `clipboard.ts`)
+- [x] **Step 2: Run to verify it fails** → FAIL (no `clipboard.ts`)
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 `copyToTerminal` defaults its sink to `{ isTTY: process.stdout.isTTY === true, write: (d) => process.stdout.write(d) }`.
 Return `{copied:false}` for a non-TTY, wrap the write in try/catch, and phrase the
@@ -714,9 +714,9 @@ In `PanelComponent`, add `copy?: (text: string) => CopyResult` to the options
 a `notice: string | null` field rendered as the last body line until the next
 keystroke.
 
-- [ ] **Step 4: Run to verify they pass** → PASS (7 tests)
+- [x] **Step 4: Run to verify they pass** → PASS (7 tests)
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/panel/clipboard.ts src/panel/PanelComponent.ts test/unit/panel-clipboard.test.ts
@@ -760,7 +760,7 @@ export class MemoryFeeder {
 }
 ```
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```ts
 import assert from "node:assert/strict";
@@ -846,9 +846,9 @@ test("memory: the tab reports this session's counts when enabled", () => {
 
 (Note: the two tests using `await import` must be declared `async`.)
 
-- [ ] **Step 2: Run to verify it fails** → FAIL (no `MemoryFeeder.ts`)
+- [x] **Step 2: Run to verify it fails** → FAIL (no `MemoryFeeder.ts`)
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 `refresh()` wraps everything in try/catch, calling `noteError("memory", msg)` on
 failure and `clearError("memory")` on success (both already exist on `PanelState`
@@ -856,9 +856,9 @@ from track 2). A null or disabled manager publishes `{enabled:false}` with zeroe
 counters; `tree.ts` renders "Blackhole memory is off" for that case and never
 prints the zeros.
 
-- [ ] **Step 4: Run to verify they pass** → PASS (6 tests)
+- [x] **Step 4: Run to verify they pass** → PASS (6 tests)
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/panel/feeders/MemoryFeeder.ts src/panel/PanelState.ts src/panel/tree.ts test/unit/panel-memory-feeder.test.ts
@@ -889,7 +889,7 @@ export function buildNarrativePrompt(deltas: readonly NarrativeDelta[], previous
 export function sanitizeNarrative(raw: string, maxChars?: number): string | undefined;
 ```
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```ts
 import assert from "node:assert/strict";
@@ -949,10 +949,10 @@ test("sanitize: empty or whitespace-only output is unusable", () => {
 });
 ```
 
-- [ ] **Step 2: Run to verify it fails** → FAIL (no `deltas.ts`)
-- [ ] **Step 3: Implement** — plain comparisons; `sanitizeNarrative` defaults `maxChars` to 400.
-- [ ] **Step 4: Run to verify they pass** → PASS (8 tests)
-- [ ] **Step 5: Commit**
+- [x] **Step 2: Run to verify it fails** → FAIL (no `deltas.ts`)
+- [x] **Step 3: Implement** — plain comparisons; `sanitizeNarrative` defaults `maxChars` to 400.
+- [x] **Step 4: Run to verify they pass** → PASS (8 tests)
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/panel/narrator/deltas.ts test/unit/panel-narrator-deltas.test.ts
@@ -999,7 +999,7 @@ export class Narrator {
 }
 ```
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```ts
 import assert from "node:assert/strict";
@@ -1135,9 +1135,9 @@ test("narrator: the narrative never reaches the ledger", async () => {
 });
 ```
 
-- [ ] **Step 2: Run to verify it fails** → FAIL (no `Narrator.ts`)
+- [x] **Step 2: Run to verify it fails** → FAIL (no `Narrator.ts`)
 
-- [ ] **Step 3: Implement the narrator**
+- [x] **Step 3: Implement the narrator**
 
 Order inside `observe`, and it matters:
 
@@ -1150,12 +1150,12 @@ Order inside `observe`, and it matters:
 7. record `previous = input` and `lastCallAt = now()` **only on success**, so a
    failed call retries on the next meaningful change rather than swallowing it
 
-- [ ] **Step 4: Render the Session tab**
+- [x] **Step 4: Render the Session tab**
 
 In `tree.ts`, the Session tab shows the narrative text, a `generated` label, and
 `updated <n>m ago` — or "no narrative yet" when absent.
 
-- [ ] **Step 5: Wire it in `extensions/index.ts`**
+- [x] **Step 5: Wire it in `extensions/index.ts`**
 
 - Load `PanelLayoutStore` at `session_start`; pass `layout` into `PanelComponent`
   and persist from `onLayoutChange`.
@@ -1170,13 +1170,13 @@ In `tree.ts`, the Session tab shows the narrative text, a `generated` label, and
 - Gate the whole narrator on `PI_PANEL_NARRATOR` (default off — it spends money;
   the operator opts in).
 
-- [ ] **Step 6: Run the full verification**
+- [x] **Step 6: Run the full verification**
 
 ```bash
 npm run lint && npm run typecheck && npm test && npm run test:e2e
 ```
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add -A
@@ -1189,12 +1189,12 @@ git commit -m "feat(panel): admission-gated session narrative and track 3 wiring
 
 Track 3 is complete when:
 
-- [ ] tabs cycle, and the active tab, width, and expansion survive a restart
+- [x] tabs cycle, and the active tab, width, and expansion survive a restart
       (Task 1's round-trip test goes through the file, not just the API)
-- [ ] `/`, `n`, `N` search the visible rows
-- [ ] `y` copies a row
-- [ ] the Memory tab reports this session's counts, and says Blackhole is off
+- [x] `/`, `n`, `N` search the visible rows
+- [x] `y` copies a row
+- [x] the Memory tab reports this session's counts, and says Blackhole is off
       when it is
-- [ ] the Session tab shows a narrative that is debounced, skipped during a
+- [x] the Session tab shows a narrative that is debounced, skipped during a
       gateway cooldown, labeled as generated, absent from the ledger, and left
       intact with its timestamp when an update fails

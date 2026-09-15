@@ -231,37 +231,92 @@ saturated gateway.
 is doing — and what it did:
 
 ```
-┌─ ENGINEERING ──────────┐
+┌─ ENGINEERING ───────────┐
+│[Files] Reviews  Tokens  │
 │ ● WI-12 · review · high │
 │ ▾ Changed files (2)     │
 │   A src/gateway/sig…    │
 │   M extensions/index.ts │
-│ ▾ Reviews (1)           │
-│   ✗ HIGH · reviewer ·   │
-│     opus-5 · retry loop │
-│ ▾ Tokens (1)            │
-│   opus-5 · 1000/200 tok │
+│ ▾ Working tree · main   │
+│   M README.md           │
 └─────────────────────────┘
 ```
 
-During an engineering run it reads the ledger: the work item and phase, the
-candidate's changed files, review findings with the **role and model that
+Five tabs, cycled with `tab`/`shift+tab`:
+
+| Tab | Content |
+| --- | ------- |
+| Files | changed files (candidate or working tree), opening into a bounded view |
+| Reviews | findings with severity, the reviewing role, and the model that produced them |
+| Tokens | spend grouped by model, plus your session's context usage |
+| Session | a running narrative of what this session has worked on |
+| Memory | what this session put into memory |
+
+During an engineering run the panel reads the ledger: the work item and phase,
+the candidate's changed files, review findings with the **role and model that
 produced them**, and token spend grouped by model. With no run active it shows
 the git working tree and your session's context usage, so it is never empty.
 
 Keys: `↑`/`↓` move, `→`/`enter` expands a section or opens a file, `←`
-collapses, `esc` returns from a file to the tree and closes the panel from the
-tree. Opening a file shows a **bounded** view — a candidate diff is read lazily
-by artifact URI, a working-tree file from disk, both capped rather than loaded
-whole, and neither is inlined into model context.
+collapses, `<`/`>` resize, `/` searches, `n`/`N` step matches, `y` copies the
+selected row and `Y` the visible body, `esc` closes a file view, then a search,
+then the panel. Opening a file shows a **bounded** view — a candidate diff is
+read lazily by artifact URI, a working-tree file from disk, both capped rather
+than loaded whole, and neither is inlined into model context.
 
-The panel is a read surface: it never writes to the ledger, never touches a
-worktree, and never starts model work. A failing git or unreadable artifact
+Search is smartcase (a lowercase query is case-insensitive; any uppercase makes
+it exact) and matches literally, so `config.ts` means what you typed.
+
+The active tab, the width, and which sections are expanded are remembered in
+your **agent profile** (`~/.pi/agent/engineering-panel/layout.json`, written
+owner-only) — not in the repository, so a panel width never lands in a
+project's git history.
+
+Copy goes out over OSC 52, which works over SSH and needs no dependency, but is
+**write-only**: the terminal never answers, so the panel says *"sent to
+terminal clipboard"* rather than claiming a copy it cannot confirm. Some
+terminals (and tmux without clipboard passthrough) discard it silently. In
+fullscreen mode Pi's own selection copy remains available alongside it.
+
+### Session narrative
+
+The Session tab answers "what have we actually been doing?" — a short prose arc
+such as *"started on a status-bar update, moved to gateway error handling, now
+working on the panel"*. It is the only generated content in the panel, and it
+carries three constraints:
+
+* it is fed **deltas** — new work items, phase transitions, newly changed files
+  — never a transcript, so its cost does not grow with the session, and it is
+  debounced;
+* it runs behind the **same admission gate** as every other model call, and is
+  **skipped entirely** while a gateway cooldown is active: a narrative is never
+  worth delaying a run, still less waiting out an unbounded backoff;
+* it is **labeled as generated and never becomes evidence** — it is not written
+  to the ledger, and nothing reads it back as input to a decision (INV-006).
+
+Failure is silent: no model, a refused gateway, or a failed summary leaves the
+previous narrative in place with its own timestamp, and the tab says when it was
+last updated rather than pretending to be current.
+
+It is **off by default** — it is the one part of the panel that spends money —
+and it does not start until you have opened the panel at least once.
+
+### Memory tab
+
+Reports what this session put into memory: entries recorded, promotion
+candidates, promotions to durable memory, compactions, and memory-worker runs,
+all read from Blackhole telemetry. Blackhole is off by default; when it is off
+the tab says so rather than showing zeros that look like a failure.
+
+The panel is a read surface: it never writes to the ledger and never touches a
+worktree. The session narrative is the single exception to "never starts model
+work", and is gated as described above. A failing git or unreadable artifact
 marks its own section and leaves the rest of the panel working.
 
 | Variable | Default | Meaning |
 | -------- | ------- | ------- |
 | `PI_PANEL_CHORD` | `ctrl+p` | Hotkey to toggle the panel; `none` disables it |
+| `PI_PANEL_NARRATOR` | *off* | Set to `true` to enable the generated session narrative |
 
 Two caveats worth knowing. Pi registers commands but not keybindings, so the
 chord is a raw input handler that consumes only its own key — set it to `none`
