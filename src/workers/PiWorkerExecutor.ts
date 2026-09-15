@@ -26,6 +26,17 @@ import {
 } from "../guard/RecoveryController.ts";
 import { type GenerationGuardConfig, resolveGuardConfig } from "../guard/config.ts";
 import { guardFeedFor } from "../guard/streamText.ts";
+import {
+  type BackoffConfig,
+  TransientError,
+  type TransientTelemetry,
+  classifyError,
+  initialTransientTelemetry,
+  recordTransientError,
+  recordTransientOutcome,
+  resolveTransientRetryConfig,
+  withTransientRetry,
+} from "../guard/transient.ts";
 import type { WorkerExecutor, WorkerRequest, WorkerRun } from "./WorkerExecutor.ts";
 import { registerLocalProviders } from "./localProviders.ts";
 import { WORKER_KICKOFF, buildSystemPrompt } from "./prompts.ts";
@@ -70,6 +81,12 @@ export interface PiWorkerExecutorOptions {
    */
   admission?: AdmissionController;
   gatewayConfig?: GatewayAdmissionConfig;
+  /** Transient error retry/backoff configuration. Defaults to spec values. */
+  transientConfig?: BackoffConfig;
+  /** Injectable sleep for transient retries (deterministic in tests). */
+  transientSleep?: (ms: number) => Promise<void>;
+  /** Injectable RNG for backoff jitter (deterministic in tests). */
+  transientRand?: () => number;
 }
 
 /**
@@ -89,10 +106,15 @@ export class PiWorkerExecutor implements WorkerExecutor {
   private readonly fallbackModelId: string | undefined;
   private readonly admission: AdmissionController;
   private readonly gatewayConfig: GatewayAdmissionConfig;
+  private readonly transientConfig: BackoffConfig;
+  private readonly transientSleep: (ms: number) => Promise<void>;
+  private readonly transientRand: () => number;
   private modelRuntime: ModelRuntime | undefined;
   private runtimePromise: Promise<ModelRuntime> | undefined;
   /** Aggregate recovery telemetry across all worker runs. */
   readonly recoveryTelemetry: RecoveryTelemetry = initialRecoveryTelemetry();
+  /** Aggregate transient-error retry telemetry across all worker runs. */
+  readonly transientTelemetry: TransientTelemetry = initialTransientTelemetry();
 
   constructor(opts: PiWorkerExecutorOptions = {}) {
     this.agentDir = opts.agentDir ?? process.env.PI_AGENT_DIR ?? "~/.pi/agent";
@@ -104,6 +126,9 @@ export class PiWorkerExecutor implements WorkerExecutor {
     this.fallbackModelId = opts.fallbackModelId;
     this.admission = opts.admission ?? sharedAdmissionController();
     this.gatewayConfig = opts.gatewayConfig ?? sharedGatewayConfig();
+    this.transientConfig = opts.transientConfig ?? resolveTransientRetryConfig();
+    this.transientSleep = opts.transientSleep ?? ((ms) => new Promise<void>((r) => setTimeout(r, ms)));
+    this.transientRand = opts.transientRand ?? Math.random;
   }
 
   /** Inject/refresh the semantic tools bound to a runtime (scout/reviewer/implementer sessions). */
@@ -189,13 +214,70 @@ ${TOOL_TRANSITION_RULE}`;
     let gatewayRetries = 0;
 
     while (true) {
+      // Two retry layers, with a clean ownership split:
+      //
+      //   * the ADMISSION slot is held across the whole transient retry, because
+      //     a 503 retried three times is still one worker's turn at the gateway.
+      //     Re-acquiring per transient attempt would make a flaky provider look
+      //     like concurrency pressure;
+      //   * TRANSIENT retry (503, network, timeout, compaction) backs off
+      //     exponentially inside the slot, with a fresh session per attempt;
+      //   * GATEWAY saturation (429 inference_admission) is deliberately NOT a
+      //     transient category — see classifyError. It is handled below, where
+      //     the gateway's own advertised wait is honoured process-wide.
       const slot = gatewayConfig.enabled ? await admission.acquire() : null;
-      let outcome: Awaited<ReturnType<typeof this.runSingleAttempt>>;
+      let transientOutcome: Awaited<
+        ReturnType<typeof withTransientRetry<Awaited<ReturnType<typeof this.runSingleAttempt>>>>
+      >;
       try {
-        outcome = await this.runSingleAttempt(req, model, systemPrompt, modelRuntime, customTools, tools, attempt);
+        transientOutcome = await withTransientRetry({
+          fn: () => this.runSingleAttempt(req, model, systemPrompt, modelRuntime, customTools, tools, attempt),
+          config: this.transientConfig,
+          sleep: this.transientSleep,
+          rand: this.transientRand,
+        });
       } finally {
         slot?.release();
       }
+
+      if (transientOutcome.error) {
+        const te = transientOutcome.error;
+        const detail = te instanceof Error ? te.message : String(te);
+
+        // A gateway admission refusal arrives here as a NON-retryable transient
+        // error (classifyError hands it over rather than backing off against a
+        // wait it cannot read). Honour the wait the gateway actually reported
+        // and retry the same attempt, process-wide.
+        if (gatewayConfig.enabled) {
+          const handover = decideGatewayRetry(detail, gatewayRetries, gatewayConfig.maxRetries);
+          if (handover.action === "wait") {
+            gatewayRetries++;
+            await admission.noteWaitAndSleep(handover.signal);
+            continue;
+          }
+        }
+
+        // Transient retries were exhausted (or a non-retryable transport error).
+        const category = transientOutcome.category ?? "permanent";
+        recordTransientError(this.transientTelemetry, category);
+        recordTransientOutcome(this.transientTelemetry, false, category);
+        const attempts = transientOutcome.attempts;
+        return {
+          result: {
+            status: "failed",
+            summary: `Worker failed after ${attempts} attempt(s): ${detail}`,
+            claims: [],
+            evidence_refs: [],
+            new_hypotheses: [],
+            proposed_tasks: [],
+            details: { transient_category: category, attempts },
+            error: `transient:${category}`,
+          },
+          usage: null,
+          error: `transient:${category}`,
+        };
+      }
+
       const {
         session,
         guardAborted,
@@ -206,7 +288,7 @@ ${TOOL_TRANSITION_RULE}`;
         budgetExhausted,
         timedOut,
         assistantError,
-      } = outcome;
+      } = transientOutcome.value!;
       if (assistantError) lastAssistantError = assistantError;
 
       session.dispose();
@@ -409,7 +491,11 @@ ${recovery.recoveryPrompt}`;
     let guardAborted = false;
     let guardReason: GuardAbortReason | undefined;
     let guardDiagnostics: Record<string, unknown> = {};
+    // Two distinct error channels, both needed: `assistantError` is the
+    // assistant MESSAGE's error (stopReason "error" — where a gateway 429 body
+    // arrives), `promptError` is a THROWN transport failure.
     let assistantError: string | undefined;
+    let promptError: unknown = undefined;
 
     // Generation guard (spec §6-§12).
     const guard = new GenerationGuard(this.guardConfig);
@@ -477,11 +563,35 @@ ${recovery.recoveryPrompt}`;
 
     try {
       await session.prompt(WORKER_KICKOFF);
-    } catch {
-      // Expected when the session is aborted by the guard or budget.
+    } catch (err) {
+      // Capture the error. An abort triggered by the guard/budget/timeout is
+      // EXPECTED (session.abort()) and not a transport failure. A rejection
+      // with none of those flags set is a real provider/transport error (503,
+      // 429, network, timeout) that the transient-recovery layer retries.
+      if (!guardAborted && !budgetExhausted && !timedOut) {
+        promptError = err;
+      }
     } finally {
       clearTimeout(timer);
       unsubscribe();
+    }
+
+    // Surface a retryable transport error so runWithGuard's withTransientRetry
+    // loop can backoff+retry. Permanent/unknown errors fall through and are
+    // reported as a failed worker below (no silent retry of non-transient bugs).
+    if (promptError !== undefined) {
+      const cls = classifyError(promptError);
+      if (cls.retryable) {
+        session.dispose();
+        throw new TransientError(
+          cls.category,
+          promptError instanceof Error ? promptError.message : String(promptError),
+          1,
+          {
+            cause: promptError,
+          },
+        );
+      }
     }
 
     // Fallback: scan messages for the worker_result tool result.

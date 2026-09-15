@@ -228,6 +228,26 @@ export type GatewayRetryDecision =
  * a queue timeout, and burning ladder attempts on it would mask real
  * degeneration later in the run.
  */
+/**
+ * Is this error a gateway admission refusal carrying a wait we can honour?
+ *
+ * The discriminator is `source === "body"`: the gateway told us, in the
+ * response body, exactly how long to stay away. Anything else — a bare 503, a
+ * plain `429 Too Many Requests` — gets a SYNTHESIZED default from
+ * `parseGatewayWait`, which is a guess, not an instruction.
+ *
+ * That distinction decides which retry layer owns the error. Only a
+ * body-advertised wait is worth honouring exactly and process-wide; for
+ * everything else the transient layer's exponential backoff is the right
+ * answer, and claiming it here would take a 503 away from the mechanism built
+ * for it.
+ */
+export function isGatewayAdmissionRefusal(errorText: string | undefined): boolean {
+  if (!errorText) return false;
+  const signal = parseGatewayWait({ text: errorText });
+  return signal?.source === "body" && signal.retryable;
+}
+
 export function decideGatewayRetry(
   errorText: string | undefined,
   retriesSoFar: number,

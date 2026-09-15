@@ -41,3 +41,22 @@ export {
   resolveGuardConfig,
 } from "./config.ts";
 export type { GenerationGuardConfig, GuardProfile } from "./config.ts";
+export {
+  TransientError,
+  classifyError,
+  backoffDelayMs,
+  withTransientRetry,
+  resolveTransientRetryConfig,
+  DEFAULT_TRANSIENT_RETRY_CONFIG,
+  initialTransientTelemetry,
+  recordTransientError,
+  recordTransientOutcome,
+} from "./transient.ts";
+export type {
+  TransientErrorCategory,
+  ErrorClass,
+  BackoffConfig,
+  RetryOutcome,
+  RetryOptions,
+  TransientTelemetry,
+} from "./transient.ts";
