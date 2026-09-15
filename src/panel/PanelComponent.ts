@@ -10,6 +10,7 @@
 
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { PanelState } from "./PanelState.ts";
+import { type CopyResult, copyToTerminal } from "./clipboard.ts";
 import type { ContentView } from "./content.ts";
 import { DEFAULT_LAYOUT, type PanelLayout, type PanelTabId, stepTab, stepWidth } from "./layout.ts";
 import { type SearchState, findMatches, stepMatch } from "./search.ts";
@@ -40,6 +41,8 @@ export interface PanelComponentOptions {
   layout?: PanelLayout;
   /** Called whenever the operator changes tab, width, or expansion. */
   onLayoutChange?: (layout: PanelLayout) => void;
+  /** Copy sink. Defaults to OSC 52 on stdout. */
+  copy?: (text: string) => CopyResult;
 }
 
 export class PanelComponent {
@@ -48,6 +51,7 @@ export class PanelComponent {
   private readonly openRow: ((payload: RowPayload) => void) | undefined;
   private readonly onClose: (() => void) | undefined;
   private readonly onLayoutChange: ((layout: PanelLayout) => void) | undefined;
+  private readonly copyFn: (text: string) => CopyResult;
   private readonly unsubscribe: () => void;
 
   /**
@@ -64,6 +68,8 @@ export class PanelComponent {
   private search: SearchState | null = null;
   /** Committed matches, so `n`/`N` keep working after the prompt closes. */
   private lastSearch: { matches: number[]; index: number } | null = null;
+  /** Transient one-line message (a copy result), cleared by the next keystroke. */
+  private notice: string | null = null;
   private disposed = false;
 
   constructor(opts: PanelComponentOptions) {
@@ -72,6 +78,7 @@ export class PanelComponent {
     this.openRow = opts.openRow;
     this.onClose = opts.onClose;
     this.onLayoutChange = opts.onLayoutChange;
+    this.copyFn = opts.copy ?? ((text) => copyToTerminal(text));
     const layout = opts.layout;
     // With no persisted layout, sections start open: the panel is most useful
     // showing everything at once the first time it is opened.
@@ -138,6 +145,9 @@ export class PanelComponent {
       return;
     }
 
+    // A notice belongs to the keystroke that produced it and nothing after.
+    if (this.notice && data !== "y" && data !== "Y") this.notice = null;
+
     // While the prompt is open every key belongs to the query, so a tab or an
     // arrow types/edits rather than navigating.
     if (this.search) {
@@ -171,6 +181,12 @@ export class PanelComponent {
         return;
       case KEY_LEFT:
         this.collapse();
+        return;
+      case "y":
+        this.copyRow();
+        return;
+      case "Y":
+        this.copyBody();
         return;
       case "/":
         this.openSearch();
@@ -213,6 +229,7 @@ export class PanelComponent {
     });
     const lines = [renderTabBar(this.activeTab, width), ...body];
     if (this.search) lines.push(truncateToWidth(`/${this.search.query}`, width, "…"));
+    if (this.notice) lines.push(truncateToWidth(this.notice, width, "…"));
     return lines;
   }
 
@@ -250,6 +267,28 @@ export class PanelComponent {
     if (next === this.width) return;
     this.width = next;
     this.publishLayout();
+    this.requestRenderFn();
+  }
+
+  // ─── Copy ─────────────────────────────────────────────────────────────────
+
+  /**
+   * Copy the selected row's VALUE, not its drawing: no cursor, no indent, no
+   * glyph. Pasting a row should paste the path, not the picture of it.
+   */
+  private copyRow(): void {
+    this.refreshRows();
+    const row = this.currentRows[this.selection];
+    if (!row) return;
+    this.notice = this.copyFn(row.label).message;
+    this.requestRenderFn();
+  }
+
+  /** Copy the visible body, one row per line, same rule. */
+  private copyBody(): void {
+    this.refreshRows();
+    const text = this.currentRows.map((row) => row.label).join("\n");
+    this.notice = this.copyFn(text).message;
     this.requestRenderFn();
   }
 
