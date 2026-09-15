@@ -10,7 +10,7 @@
 import { PanelComponent } from "./PanelComponent.ts";
 import type { PanelState } from "./PanelState.ts";
 import type { ContentView } from "./content.ts";
-import type { PanelLayout } from "./layout.ts";
+import type { PanelLayout, PanelLayoutPatch } from "./layout.ts";
 import type { RowPayload } from "./tree.ts";
 
 /** Below this many columns the overlay would crowd the chat rather than help. */
@@ -68,7 +68,13 @@ export interface PanelControllerOptions {
   /** Layout to open with; the panel remembers it across sessions. */
   layout?: PanelLayout;
   /** Called whenever the operator changes tab, width, or expansion. */
-  onLayoutChange?: (layout: PanelLayout) => void;
+  onLayoutChange?: (layout: PanelLayoutPatch) => void;
+  /**
+   * Called when the operator opens or closes the panel, so the preference
+   * outlives the session. Separate from `onLayoutChange` because that carries
+   * the component's fields and this one is the controller's.
+   */
+  onVisibilityChange?: (open: boolean) => void;
 }
 
 export class PanelController {
@@ -78,7 +84,8 @@ export class PanelController {
   private readonly onOpen: (() => void) | undefined;
   private readonly openRowFn: PanelControllerOptions["openRow"];
   private layout: PanelLayout | undefined;
-  private readonly onLayoutChange: ((layout: PanelLayout) => void) | undefined;
+  private readonly onLayoutChange: ((layout: PanelLayoutPatch) => void) | undefined;
+  private readonly onVisibilityChange: ((open: boolean) => void) | undefined;
 
   private handle: OverlayHandleLike | null = null;
   private component: PanelComponent | null = null;
@@ -92,6 +99,7 @@ export class PanelController {
     this.openRowFn = opts.openRow;
     this.layout = opts.layout;
     this.onLayoutChange = opts.onLayoutChange;
+    this.onVisibilityChange = opts.onVisibilityChange;
   }
 
   isOpen(): boolean {
@@ -111,6 +119,19 @@ export class PanelController {
   toggle(): void {
     if (this.open) this.close();
     else this.show();
+    // Only a toggle records a preference. `dispose()` closes the panel too, and
+    // a session ending is not the operator saying they want it shut.
+    this.onVisibilityChange?.(this.open);
+  }
+
+  /**
+   * Show the panel without recording a preference.
+   *
+   * Used to restore a remembered "open" at session start: that is honouring a
+   * choice already made, not making a new one.
+   */
+  restore(): void {
+    if (!this.open) this.show();
   }
 
   dispose(): void {
@@ -136,11 +157,14 @@ export class PanelController {
           onClose: () => this.close(),
           openRow: (payload) => void this.openSelection(payload),
           ...(this.layout ? { layout: this.layout } : {}),
-          onLayoutChange: (layout) => {
+          onLayoutChange: (patch) => {
             // Held locally too, so re-opening within the session keeps the tab
-            // and width without a file read.
-            this.layout = layout;
-            this.onLayoutChange?.(layout);
+            // and width without a file read. Open/closed is merged in here
+            // rather than taken from the component: the component draws the
+            // panel, it does not decide whether the panel exists, and letting a
+            // width nudge republish `open` would rewrite a deliberate close.
+            this.layout = { ...patch, open: this.layout?.open ?? true };
+            this.onLayoutChange?.(patch);
           },
         });
         return this.component;

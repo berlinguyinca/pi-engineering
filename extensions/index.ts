@@ -33,7 +33,7 @@ import { readDiffContent, readFileContent } from "../src/panel/content.ts";
 import { LedgerFeeder } from "../src/panel/feeders/LedgerFeeder.ts";
 import { MemoryFeeder } from "../src/panel/feeders/MemoryFeeder.ts";
 import { WorkspaceFeeder } from "../src/panel/feeders/WorkspaceFeeder.ts";
-import { type PanelLayout, PanelLayoutStore } from "../src/panel/layout.ts";
+import { type PanelLayout, type PanelLayoutPatch, PanelLayoutStore } from "../src/panel/layout.ts";
 import { Narrator } from "../src/panel/narrator/Narrator.ts";
 import { createSummarize } from "../src/panel/narrator/summarize.ts";
 import { RoadmapEngine } from "../src/roadmap/RoadmapEngine.ts";
@@ -918,7 +918,11 @@ ${RECOVERY_PROMPT}`;
       ui: ctx.ui as never,
       chord: panelChord,
       layout: panelLayoutStore.load(),
-      onLayoutChange: (layout: PanelLayout) => panelLayoutStore.save(layout),
+      // The patch carries width/tab/expansion; open/closed is the controller's,
+      // and is persisted separately when the panel is opened or closed.
+      onLayoutChange: (patch: PanelLayoutPatch) =>
+        panelLayoutStore.save({ ...patch, open: panelLayoutStore.load().open }),
+      onVisibilityChange: (open: boolean) => panelLayoutStore.save({ ...panelLayoutStore.load(), open }),
       onOpen: () => {
         plumbing.workspace.invalidate();
         void plumbing.workspace.refresh();
@@ -949,6 +953,23 @@ ${RECOVERY_PROMPT}`;
       // Not fatal: `/panel` retries the lookup and builds the controller then.
       if (!rt) return;
       activePanel = createPanelController(ctx as { ui: PanelSessionUi }, panelFor(key, rt), rt);
+
+      // Show it unless the operator turned it off. A panel that must be
+      // discovered is a panel nobody uses, and ambient awareness of the run is
+      // the point of it — but a remembered close is honoured, and
+      // PI_PANEL_AUTO_OPEN=0 disables the behaviour outright.
+      //
+      // `restore()` rather than `toggle()`: restoring a remembered choice is
+      // not the operator making a new one, and recording it as one would write
+      // the preference back every session whether they touched it or not.
+      const autoOpen = (process.env.PI_PANEL_AUTO_OPEN ?? "1").toLowerCase();
+      const autoOpenEnabled = autoOpen !== "0" && autoOpen !== "false" && autoOpen !== "off";
+      if (autoOpenEnabled && panelLayoutStore.load().open) {
+        const ui = ctx.ui as PanelSessionUi;
+        // An overlay needs somewhere to draw. A session without interactive UI
+        // gets nothing rather than an error it cannot act on.
+        if (typeof ui.custom === "function") activePanel.restore();
+      }
     });
 
     pi.on("session_shutdown", () => {

@@ -12,7 +12,14 @@ import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { PanelState } from "./PanelState.ts";
 import { type CopyResult, copyToTerminal } from "./clipboard.ts";
 import type { ContentView } from "./content.ts";
-import { DEFAULT_LAYOUT, type PanelLayout, type PanelTabId, stepTab, stepWidth } from "./layout.ts";
+import {
+  DEFAULT_LAYOUT,
+  type PanelLayout,
+  type PanelLayoutPatch,
+  type PanelTabId,
+  stepTab,
+  stepWidth,
+} from "./layout.ts";
 import { type SearchState, findMatches, stepMatch } from "./search.ts";
 import { type PanelRow, type RowPayload, buildRows, clampSelection, renderTabBar } from "./tree.ts";
 
@@ -37,7 +44,7 @@ export interface PanelComponentOptions {
   /** Layout to open with (tab, width, expansion). Defaults apply when omitted. */
   layout?: PanelLayout;
   /** Called whenever the operator changes tab, width, or expansion. */
-  onLayoutChange?: (layout: PanelLayout) => void;
+  onLayoutChange?: (layout: PanelLayoutPatch) => void;
   /** Copy sink. Defaults to OSC 52 on stdout. */
   copy?: (text: string) => CopyResult;
 }
@@ -47,7 +54,7 @@ export class PanelComponent {
   private readonly requestRenderFn: () => void;
   private readonly openRow: ((payload: RowPayload) => void) | undefined;
   private readonly onClose: (() => void) | undefined;
-  private readonly onLayoutChange: ((layout: PanelLayout) => void) | undefined;
+  private readonly onLayoutChange: ((layout: PanelLayoutPatch) => void) | undefined;
   private readonly copyFn: (text: string) => CopyResult;
   private readonly unsubscribe: () => void;
 
@@ -359,6 +366,7 @@ export class PanelComponent {
   }
 
   private publishLayout(): void {
+    // A patch, not a layout: open/closed belongs to the controller.
     this.onLayoutChange?.({ widthPercent: this.width, tab: this.activeTab, expanded: this.expandedIds });
   }
 
