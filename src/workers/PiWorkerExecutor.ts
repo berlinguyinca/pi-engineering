@@ -22,6 +22,17 @@ import {
   recordRetryOutcome,
 } from "../guard/RecoveryController.ts";
 import { type GenerationGuardConfig, resolveGuardConfig } from "../guard/config.ts";
+import {
+  type BackoffConfig,
+  TransientError,
+  type TransientTelemetry,
+  classifyError,
+  initialTransientTelemetry,
+  recordTransientError,
+  recordTransientOutcome,
+  resolveTransientRetryConfig,
+  withTransientRetry,
+} from "../guard/transient.ts";
 import type { WorkerExecutor, WorkerRequest, WorkerRun } from "./WorkerExecutor.ts";
 import { registerLocalProviders } from "./localProviders.ts";
 import { WORKER_KICKOFF, buildSystemPrompt } from "./prompts.ts";
@@ -60,6 +71,12 @@ export interface PiWorkerExecutorOptions {
    * against `model.id` in the runtime's model list.
    */
   fallbackModelId?: string;
+  /** Transient error retry/backoff configuration. Defaults to spec values. */
+  transientConfig?: BackoffConfig;
+  /** Injectable sleep for transient retries (deterministic in tests). */
+  transientSleep?: (ms: number) => Promise<void>;
+  /** Injectable RNG for backoff jitter (deterministic in tests). */
+  transientRand?: () => number;
 }
 
 /**
@@ -77,10 +94,15 @@ export class PiWorkerExecutor implements WorkerExecutor {
   private readonly guardConfig: GenerationGuardConfig;
   private readonly fallbackModel: Model<any> | undefined;
   private readonly fallbackModelId: string | undefined;
+  private readonly transientConfig: BackoffConfig;
+  private readonly transientSleep: (ms: number) => Promise<void>;
+  private readonly transientRand: () => number;
   private modelRuntime: ModelRuntime | undefined;
   private runtimePromise: Promise<ModelRuntime> | undefined;
   /** Aggregate recovery telemetry across all worker runs. */
   readonly recoveryTelemetry: RecoveryTelemetry = initialRecoveryTelemetry();
+  /** Aggregate transient-error retry telemetry across all worker runs. */
+  readonly transientTelemetry: TransientTelemetry = initialTransientTelemetry();
 
   constructor(opts: PiWorkerExecutorOptions = {}) {
     this.agentDir = opts.agentDir ?? process.env.PI_AGENT_DIR ?? "~/.pi/agent";
@@ -90,6 +112,9 @@ export class PiWorkerExecutor implements WorkerExecutor {
     this.guardConfig = opts.guardConfig ?? resolveGuardConfig();
     this.fallbackModel = opts.fallbackModel;
     this.fallbackModelId = opts.fallbackModelId;
+    this.transientConfig = opts.transientConfig ?? resolveTransientRetryConfig();
+    this.transientSleep = opts.transientSleep ?? ((ms) => new Promise<void>((r) => setTimeout(r, ms)));
+    this.transientRand = opts.transientRand ?? Math.random;
   }
 
   /** Inject/refresh the semantic tools bound to a runtime (scout/reviewer/implementer sessions). */
@@ -168,8 +193,43 @@ ${TOOL_TRANSITION_RULE}`;
     let lastAssistantError: string | undefined;
 
     while (true) {
+      // Transient infrastructure errors (503, 429, network, timeout, compaction)
+      // are retried automatically with bounded exponential backoff + jitter. A
+      // fresh session is created per retry (the failed session is discarded).
+      const transientOutcome = await withTransientRetry({
+        fn: (retryAttempt) =>
+          this.runSingleAttempt(req, model, systemPrompt, modelRuntime, customTools, tools, attempt),
+        config: this.transientConfig,
+        sleep: this.transientSleep,
+        rand: this.transientRand,
+      });
+
+      if (transientOutcome.error) {
+        // Transient retries were exhausted (or a non-retryable transport error).
+        const te = transientOutcome.error;
+        const category = transientOutcome.category ?? "permanent";
+        recordTransientError(this.transientTelemetry, category);
+        recordTransientOutcome(this.transientTelemetry, false, category);
+        const attempts = transientOutcome.attempts;
+        const detail = te instanceof Error ? te.message : String(te);
+        return {
+          result: {
+            status: "failed",
+            summary: `Worker failed after ${attempts} attempt(s): ${detail}`,
+            claims: [],
+            evidence_refs: [],
+            new_hypotheses: [],
+            proposed_tasks: [],
+            details: { transient_category: category, attempts },
+            error: `transient:${category}`,
+          },
+          usage: null,
+          error: `transient:${category}`,
+        };
+      }
+
       const { session, guardAborted, guardReason, guardDiagnostics, captured, toolCalls, budgetExhausted, timedOut } =
-        await this.runSingleAttempt(req, model, systemPrompt, modelRuntime, customTools, tools, attempt);
+        transientOutcome.value!;
 
       session.dispose();
 
@@ -346,6 +406,7 @@ ${recovery.recoveryPrompt}`;
     let guardAborted = false;
     let guardReason: GuardAbortReason | undefined;
     let guardDiagnostics: Record<string, unknown> = {};
+    let promptError: unknown = undefined;
 
     // Generation guard (spec §6-§12).
     const guard = new GenerationGuard(this.guardConfig);
@@ -406,11 +467,35 @@ ${recovery.recoveryPrompt}`;
 
     try {
       await session.prompt(WORKER_KICKOFF);
-    } catch {
-      // Expected when the session is aborted by the guard or budget.
+    } catch (err) {
+      // Capture the error. An abort triggered by the guard/budget/timeout is
+      // EXPECTED (session.abort()) and not a transport failure. A rejection
+      // with none of those flags set is a real provider/transport error (503,
+      // 429, network, timeout) that the transient-recovery layer retries.
+      if (!guardAborted && !budgetExhausted && !timedOut) {
+        promptError = err;
+      }
     } finally {
       clearTimeout(timer);
       unsubscribe();
+    }
+
+    // Surface a retryable transport error so runWithGuard's withTransientRetry
+    // loop can backoff+retry. Permanent/unknown errors fall through and are
+    // reported as a failed worker below (no silent retry of non-transient bugs).
+    if (promptError !== undefined) {
+      const cls = classifyError(promptError);
+      if (cls.retryable) {
+        session.dispose();
+        throw new TransientError(
+          cls.category,
+          promptError instanceof Error ? promptError.message : String(promptError),
+          1,
+          {
+            cause: promptError,
+          },
+        );
+      }
     }
 
     // Fallback: scan messages for the worker_result tool result.
