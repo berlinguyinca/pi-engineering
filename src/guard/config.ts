@@ -17,6 +17,15 @@ export interface GenerationGuardConfig {
   /** Progress / no-progress watchdogs. */
   maxReasoningTokensWithoutProgress: number;
   maxNarrationTokensBeforeAction: number;
+  /**
+   * Whether the pre-action narration budget is enforced.
+   *
+   * True for worker sessions, whose deliverable is a `worker_result` tool call
+   * — there, prose before the first action is by definition narration. False
+   * for interactive sessions, where the final answer is prose and nothing in
+   * the stream distinguishes it from narration until the turn is over.
+   */
+  narrationBudgetEnabled: boolean;
 
   /** Recovery ladder. */
   maxRecoveryAttempts: number;
@@ -40,6 +49,7 @@ export const DEFAULT_GUARD_CONFIG: GenerationGuardConfig = {
 
   maxReasoningTokensWithoutProgress: 1500,
   maxNarrationTokensBeforeAction: 600,
+  narrationBudgetEnabled: true,
 
   maxRecoveryAttempts: 3,
   lowerReasoningEffortOnRetry: true,
@@ -49,6 +59,25 @@ export const DEFAULT_GUARD_CONFIG: GenerationGuardConfig = {
   saveDegenerateText: true,
   maxSavedCharacters: 5000,
 };
+
+/**
+ * Which session the guard is protecting.
+ *
+ * `worker`   — fresh-context worker sessions (deliverable: a `worker_result`
+ *              tool call). Full detector set.
+ * `interactive` — the user's own Pi session (deliverable: the assistant's
+ *              prose answer). Repetition detection only, plus a far wider
+ *              no-progress backstop, because length alone does not
+ *              distinguish a long answer from a degenerate loop.
+ */
+export type GuardProfile = "worker" | "interactive";
+
+/**
+ * Interactive no-progress backstop (tokens). Deliberately far above any
+ * plausible single answer: it exists to stop an unbounded runaway, not to
+ * budget the reply.
+ */
+export const DEFAULT_INTERACTIVE_MAX_NO_PROGRESS_TOKENS = 12_000;
 
 /**
  * Resolve guard config from environment variables (for runtime tuning without
@@ -61,9 +90,19 @@ export const DEFAULT_GUARD_CONFIG: GenerationGuardConfig = {
  *   PI_GUARD_MAX_REASONING_TOKENS — int
  *   PI_GUARD_MAX_NARRATION_TOKENS — int
  *   PI_GUARD_MAX_RECOVERY         — int
+ *   PI_GUARD_NARRATION_BUDGET     — "true"/"false" (worker profile only)
+ *   PI_GUARD_INTERACTIVE_MAX_NO_PROGRESS_TOKENS — int
  */
-export function resolveGuardConfig(overrides?: Partial<GenerationGuardConfig>): GenerationGuardConfig {
+export function resolveGuardConfig(
+  overrides?: Partial<GenerationGuardConfig>,
+  profile: GuardProfile = "worker",
+): GenerationGuardConfig {
   const cfg: GenerationGuardConfig = { ...DEFAULT_GUARD_CONFIG };
+
+  if (profile === "interactive") {
+    cfg.narrationBudgetEnabled = false;
+    cfg.maxReasoningTokensWithoutProgress = DEFAULT_INTERACTIVE_MAX_NO_PROGRESS_TOKENS;
+  }
 
   if (typeof process !== "undefined" && process.env) {
     const env = process.env;
@@ -77,7 +116,10 @@ export function resolveGuardConfig(overrides?: Partial<GenerationGuardConfig>): 
     if (env.PI_GUARD_WINDOW) {
       cfg.repeatedWindowSize = Number.parseInt(env.PI_GUARD_WINDOW, 10) || cfg.repeatedWindowSize;
     }
-    if (env.PI_GUARD_MAX_REASONING_TOKENS) {
+    // Worker-oriented budget: the interactive profile has its own, far wider
+    // backstop (PI_GUARD_INTERACTIVE_MAX_NO_PROGRESS_TOKENS below), so tuning
+    // workers never tightens the user's own session.
+    if (env.PI_GUARD_MAX_REASONING_TOKENS && profile === "worker") {
       cfg.maxReasoningTokensWithoutProgress =
         Number.parseInt(env.PI_GUARD_MAX_REASONING_TOKENS, 10) || cfg.maxReasoningTokensWithoutProgress;
     }
@@ -87,6 +129,15 @@ export function resolveGuardConfig(overrides?: Partial<GenerationGuardConfig>): 
     }
     if (env.PI_GUARD_MAX_RECOVERY) {
       cfg.maxRecoveryAttempts = Number.parseInt(env.PI_GUARD_MAX_RECOVERY, 10) || cfg.maxRecoveryAttempts;
+    }
+    if (env.PI_GUARD_NARRATION_BUDGET !== undefined) {
+      cfg.narrationBudgetEnabled = env.PI_GUARD_NARRATION_BUDGET !== "false" && env.PI_GUARD_NARRATION_BUDGET !== "0";
+    }
+    // Interactive-specific override wins for the interactive profile so the
+    // shared PI_GUARD_MAX_REASONING_TOKENS can still tune worker sessions.
+    if (profile === "interactive" && env.PI_GUARD_INTERACTIVE_MAX_NO_PROGRESS_TOKENS) {
+      cfg.maxReasoningTokensWithoutProgress =
+        Number.parseInt(env.PI_GUARD_INTERACTIVE_MAX_NO_PROGRESS_TOKENS, 10) || cfg.maxReasoningTokensWithoutProgress;
     }
   }
 

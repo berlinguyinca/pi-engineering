@@ -10,6 +10,9 @@ import {
   createExtensionRuntime,
 } from "@earendil-works/pi-coding-agent";
 import type { WorkerResult, WorkerUsage } from "../core/types.ts";
+import type { AdmissionController } from "../gateway/AdmissionController.ts";
+import { type GatewayAdmissionConfig, sharedAdmissionController, sharedGatewayConfig } from "../gateway/config.ts";
+import { decideGatewayRetry, parseGatewayWait } from "../gateway/signals.ts";
 import { GenerationGuard, type GuardAbortReason } from "../guard/GenerationGuard.ts";
 import { TOOL_TRANSITION_RULE } from "../guard/RecoveryController.ts";
 import {
@@ -22,6 +25,7 @@ import {
   recordRetryOutcome,
 } from "../guard/RecoveryController.ts";
 import { type GenerationGuardConfig, resolveGuardConfig } from "../guard/config.ts";
+import { guardFeedFor } from "../guard/streamText.ts";
 import type { WorkerExecutor, WorkerRequest, WorkerRun } from "./WorkerExecutor.ts";
 import { registerLocalProviders } from "./localProviders.ts";
 import { WORKER_KICKOFF, buildSystemPrompt } from "./prompts.ts";
@@ -60,6 +64,12 @@ export interface PiWorkerExecutorOptions {
    * against `model.id` in the runtime's model list.
    */
   fallbackModelId?: string;
+  /**
+   * Gateway admission control. Defaults to the process-wide controller, so
+   * every worker in this process shares one backoff and one concurrency clamp.
+   */
+  admission?: AdmissionController;
+  gatewayConfig?: GatewayAdmissionConfig;
 }
 
 /**
@@ -77,6 +87,8 @@ export class PiWorkerExecutor implements WorkerExecutor {
   private readonly guardConfig: GenerationGuardConfig;
   private readonly fallbackModel: Model<any> | undefined;
   private readonly fallbackModelId: string | undefined;
+  private readonly admission: AdmissionController;
+  private readonly gatewayConfig: GatewayAdmissionConfig;
   private modelRuntime: ModelRuntime | undefined;
   private runtimePromise: Promise<ModelRuntime> | undefined;
   /** Aggregate recovery telemetry across all worker runs. */
@@ -90,6 +102,8 @@ export class PiWorkerExecutor implements WorkerExecutor {
     this.guardConfig = opts.guardConfig ?? resolveGuardConfig();
     this.fallbackModel = opts.fallbackModel;
     this.fallbackModelId = opts.fallbackModelId;
+    this.admission = opts.admission ?? sharedAdmissionController();
+    this.gatewayConfig = opts.gatewayConfig ?? sharedGatewayConfig();
   }
 
   /** Inject/refresh the semantic tools bound to a runtime (scout/reviewer/implementer sessions). */
@@ -166,10 +180,34 @@ ${TOOL_TRANSITION_RULE}`;
     let lastGuardReason: GuardAbortReason | undefined;
     let lastGuardDiagnostics: Record<string, unknown> = {};
     let lastAssistantError: string | undefined;
+    // Gateway backpressure is NOT degeneration: waiting out a reported
+    // `retry_after_ms` is bounded separately from the recovery ladder, which
+    // would otherwise burn attempts lowering reasoning effort and swapping
+    // models in response to a queue timeout.
+    const admission = this.admission;
+    const gatewayConfig = this.gatewayConfig;
+    let gatewayRetries = 0;
 
     while (true) {
-      const { session, guardAborted, guardReason, guardDiagnostics, captured, toolCalls, budgetExhausted, timedOut } =
-        await this.runSingleAttempt(req, model, systemPrompt, modelRuntime, customTools, tools, attempt);
+      const slot = gatewayConfig.enabled ? await admission.acquire() : null;
+      let outcome: Awaited<ReturnType<typeof this.runSingleAttempt>>;
+      try {
+        outcome = await this.runSingleAttempt(req, model, systemPrompt, modelRuntime, customTools, tools, attempt);
+      } finally {
+        slot?.release();
+      }
+      const {
+        session,
+        guardAborted,
+        guardReason,
+        guardDiagnostics,
+        captured,
+        toolCalls,
+        budgetExhausted,
+        timedOut,
+        assistantError,
+      } = outcome;
+      if (assistantError) lastAssistantError = assistantError;
 
       session.dispose();
 
@@ -178,17 +216,40 @@ ${TOOL_TRANSITION_RULE}`;
         if (attempt > 0) {
           recordRetryOutcome(this.recoveryTelemetry, true, false);
         }
+        if (gatewayConfig.enabled) admission.noteSuccess();
         const usage = this.collectUsage(this.asMessages(session.messages));
         return { result: captured, usage, toolCalls };
       }
 
+      // Gateway saturation: honour the wait the gateway reported, hold every
+      // other model caller in this process behind the same cooldown, and retry
+      // the SAME attempt (no recovery-ladder escalation).
+      if (gatewayConfig.enabled) {
+        const decision = decideGatewayRetry(assistantError, gatewayRetries, gatewayConfig.maxRetries);
+        if (decision.action === "wait") {
+          gatewayRetries++;
+          await admission.noteWaitAndSleep(decision.signal);
+          continue;
+        }
+      }
+
       if (!guardAborted || !this.guardConfig.enabled) {
-        // Non-guard failure (timeout, budget, no-result) — no recovery ladder.
+        // Non-guard failure (timeout, budget, gateway, no-result) — no recovery ladder.
+        const gateway = lastAssistantError ? parseGatewayWait({ text: lastAssistantError }) : null;
         const reason = budgetExhausted
           ? "Worker exceeded the hard context-token budget."
           : timedOut
             ? "Worker timed out."
-            : `Worker returned no worker_result.${lastAssistantError ? ` ${lastAssistantError}` : ""}`;
+            : gateway
+              ? `Model gateway refused the request after ${gatewayRetries} honoured wait(s): ${lastAssistantError}`
+              : `Worker returned no worker_result.${lastAssistantError ? ` ${lastAssistantError}` : ""}`;
+        const error = budgetExhausted
+          ? "budget-exhausted"
+          : timedOut
+            ? "timeout"
+            : gateway
+              ? `gateway:${gateway.reason ?? gateway.type ?? gateway.status ?? "rate-limited"}`
+              : (lastAssistantError ?? "no-result");
         return {
           result: {
             status: "failed",
@@ -197,11 +258,11 @@ ${TOOL_TRANSITION_RULE}`;
             evidence_refs: [],
             new_hypotheses: [],
             proposed_tasks: [],
-            details: {},
-            error: lastAssistantError ?? (budgetExhausted ? "budget-exhausted" : timedOut ? "timeout" : "no-result"),
+            details: gateway ? { gateway_wait: gateway, gateway_retries: gatewayRetries } : {},
+            error,
           },
           usage: this.collectUsage(this.asMessages(session.messages)),
-          error: lastAssistantError ?? (budgetExhausted ? "budget-exhausted" : timedOut ? "timeout" : "no-result"),
+          error,
           toolCalls,
         };
       }
@@ -318,6 +379,8 @@ ${recovery.recoveryPrompt}`;
     toolCalls: number;
     budgetExhausted: boolean;
     timedOut: boolean;
+    /** Terminal provider/gateway error text, when the model call itself failed. */
+    assistantError?: string;
   }> {
     const resourceLoader = roleResourceLoader(systemPrompt);
     const sessionManager = SessionManager.inMemory(req.cwd);
@@ -346,6 +409,7 @@ ${recovery.recoveryPrompt}`;
     let guardAborted = false;
     let guardReason: GuardAbortReason | undefined;
     let guardDiagnostics: Record<string, unknown> = {};
+    let assistantError: string | undefined;
 
     // Generation guard (spec §6-§12).
     const guard = new GenerationGuard(this.guardConfig);
@@ -381,12 +445,19 @@ ${recovery.recoveryPrompt}`;
         event.message !== null
       ) {
         enforceBudget(event.message);
-        // Extract text content from the message for the guard.
-        const msg = event.message as { role?: string; content?: unknown };
+        const msg = event.message as { role?: string; content?: unknown; stopReason?: string; errorMessage?: string };
+        // A provider/gateway failure surfaces as a terminal assistant message
+        // rather than a throw. Keep the text so the caller can tell a rate
+        // limit from a degeneration.
+        if (msg.role === "assistant" && msg.stopReason === "error" && msg.errorMessage) {
+          assistantError = msg.errorMessage;
+        }
+        // `event.message` is the ACCUMULATED partial message; charge the guard
+        // the incremental delta the stream event carries (see guardFeedFor).
         if (msg.role === "assistant" && !guardAborted) {
-          const text = this.extractMessageText(msg.content);
-          if (text) {
-            const decision = guard.feed(text);
+          const feed = event.type === "message_update" ? guardFeedFor(event, msg.content) : null;
+          if (feed) {
+            const decision = feed.kind === "delta" ? guard.feed(feed.text) : guard.feedSnapshot(feed.text);
             if (decision.abort) {
               guardAborted = true;
               guardReason = decision.reason;
@@ -424,7 +495,17 @@ ${recovery.recoveryPrompt}`;
       }
     }
 
-    return { session, guardAborted, guardReason, guardDiagnostics, captured, toolCalls, budgetExhausted, timedOut };
+    return {
+      session,
+      guardAborted,
+      guardReason,
+      guardDiagnostics,
+      captured,
+      toolCalls,
+      budgetExhausted,
+      timedOut,
+      assistantError,
+    };
   }
 
   /** Cast session messages to the shape collectUsage expects. */

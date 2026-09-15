@@ -121,6 +121,82 @@ human summary. See `docs/roadmap/roadmap.yaml` and
 `docs/specs/pi-engineering-verifiable-roadmap-completion-spec.md`. The roadmap
 engine is also exported as a public API from `src/index.ts`.
 
+## Generation guard
+
+Streaming output is watched for degeneration — a model looping on the same
+sentence, or generating without ever acting. The guard is fed the *incremental*
+stream delta, so a token is charged to its budgets exactly once; it measures
+each budget over the segment **since the last progress event**, so a turn that
+keeps calling tools is never charged for text it already paid for, and a loop
+that starts mid-turn is still caught.
+
+Two profiles, because the deliverable differs:
+
+| Profile | Deliverable | Detectors |
+| ------- | ----------- | --------- |
+| worker (`/engineer` scouts, implementers, reviewers) | a `worker_result` tool call | repetition, no-progress, pre-action narration budget |
+| interactive (your own Pi session) | the assistant's prose answer | repetition, plus a wide no-progress backstop |
+
+The pre-action narration budget is **off** interactively: there, prose *is* the
+answer, and nothing in the stream distinguishes a long answer from narration
+until the turn is over — enforcing it aborts healthy replies.
+
+Tuning (all optional):
+
+| Variable | Default | Meaning |
+| -------- | ------- | ------- |
+| `PI_GUARD_ENABLED` | `true` | Disable the guard entirely |
+| `PI_GUARD_SENTENCE_THRESHOLD` | `4` | Identical sentences within the window that count as a loop |
+| `PI_GUARD_WINDOW` | `8` | Rolling sentence window |
+| `PI_GUARD_MAX_REASONING_TOKENS` | `1500` | Worker no-progress budget, per segment |
+| `PI_GUARD_MAX_NARRATION_TOKENS` | `600` | Worker pre-action narration budget |
+| `PI_GUARD_NARRATION_BUDGET` | `true` | Enforce the narration budget (worker profile) |
+| `PI_GUARD_INTERACTIVE_MAX_NO_PROGRESS_TOKENS` | `12000` | Interactive no-progress backstop |
+| `PI_GUARD_MAX_RECOVERY` | `3` | Recovery-ladder attempts after a degeneration abort |
+| `PI_GUARD_TELEMETRY` | `true` | Emit `[generation-guard]` events on stderr |
+
+## Model-gateway backpressure
+
+A gateway in front of the model reports exactly how long to stay away and how
+many concurrent requests it will admit:
+
+```
+429: {"active":4,"active_limit":4,"reason":"queue_timeout","retry_after_ms":30000,
+      "scope":"agent","type":"inference_admission", …}
+```
+
+Pi's own auto-retry ignores both and backs off exponentially (1s, 2s, 4s against
+a 30s ask), so the runtime reads the refusal itself:
+
+* the reported `retry_after_ms` (body) or `Retry-After` (header) is honoured
+  as-is, capped by `PI_GATEWAY_MAX_WAIT_MS`;
+* the cooldown is held **process-wide** — every model caller waits behind one
+  gate, so parallel tournament legs stop hammering a queue that just refused
+  one of them, and the interactive session holds its next request too (every
+  hold is announced, so a wait is never a silent stall);
+* concurrency is capped at `PI_GATEWAY_MAX_CONCURRENCY` minus a slot reserved
+  for your own interactive turn — held from the start, since the window before
+  the first refusal is exactly when the gateway gets overloaded — and clamped
+  further when a gateway reports a smaller `active_limit`, relaxing back after
+  clean runs (never past the reserve);
+* waiters are released with a small random stagger, so an expiring cooldown
+  does not put every leg back on the wire in the same millisecond;
+* quota/billing refusals are classified as non-retryable and fail fast.
+
+Waiting out backpressure is deliberately **separate** from the degeneration
+recovery ladder: a queue timeout is not a degeneration, and must not burn
+attempts lowering reasoning effort or swapping models.
+
+| Variable | Default | Meaning |
+| -------- | ------- | ------- |
+| `PI_GATEWAY_ADMISSION_ENABLED` | `true` | Disable admission control entirely |
+| `PI_GATEWAY_MAX_CONCURRENCY` | `4` | Total concurrent model requests this runtime aims at |
+| `PI_GATEWAY_RESERVED_SLOTS` | `1` | Of that total, slots kept free for your interactive turn (so 3 worker sessions by default, held from the start) |
+| `PI_GATEWAY_MAX_WAIT_MS` | `120000` | Cap on a single honoured wait |
+| `PI_GATEWAY_JITTER_MS` | `250` | Release stagger window |
+| `PI_GATEWAY_MAX_RETRIES` | `4` | Gateway-wait retries per worker attempt |
+| `PI_GATEWAY_TELEMETRY` | `true` | Emit `[gateway-admission]` events on stderr |
+
 ## Semantic tools
 
 `ledger_read`, `ledger_claim`, `artifact_read`, `repo_search`, `symbol`,
@@ -165,6 +241,8 @@ src/plan/            dependency-aware task DAG planning (+ parallel execution)
 src/roadmap/         verifiable roadmap completion engine (check/status/evidence)
 src/routing/         capability+quota model routing + separation-of-duties diversity
 src/sched/           weighted-fairness concurrency scheduler + backpressure
+src/gateway/         model-gateway backpressure (honours reported retry_after_ms / active_limit)
+src/guard/           generation guard (degeneration detection + bounded recovery ladder)
 src/budget/          token-budget escalation + marginal-value stopping
 src/security/        secret redaction, tool policy, prompt-injection guardrails
 src/merge/           integration & merge queue (candidate→integration→main)

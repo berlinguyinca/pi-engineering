@@ -62,6 +62,8 @@ export {
   ModelDegenerationError,
   normalizeSentence,
   splitSentences,
+  splitCompleteSentences,
+  guardFeedFor,
   RECOVERY_PROMPT,
   TOOL_TRANSITION_RULE,
   lowerReasoningEffort,
@@ -83,7 +85,30 @@ export type {
   DegenerationEvent,
   RecoveryTelemetry,
   GenerationGuardConfig,
+  GuardProfile,
+  GuardFeed,
 } from "./guard/index.ts";
+export {
+  AdmissionController,
+  DEFAULT_GATEWAY_CONFIG,
+  decideGatewayRetry,
+  describeGatewayWait,
+  parseGatewayWait,
+  parseRetryAfterHeader,
+  resolveGatewayConfig,
+  sharedAdmissionController,
+  sharedGatewayConfig,
+} from "./gateway/index.ts";
+export type {
+  AdmissionControllerOptions,
+  AdmissionEvent,
+  AdmissionSlot,
+  AdmissionStatus,
+  GatewayAdmissionConfig,
+  GatewayRetryDecision,
+  GatewayWaitInput,
+  GatewayWaitSignal,
+} from "./gateway/index.ts";
 export { BlackholeManager } from "./blackhole/BlackholeManager.ts";
 export type { BlackholeManagerOptions } from "./blackhole/BlackholeManager.ts";
 export { resolveBlackholeConfig } from "./blackhole/config.ts";

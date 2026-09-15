@@ -5,10 +5,13 @@ import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-c
 import { resolveMemoryEnvironment } from "../src/blackhole/connectionSetup.ts";
 import { openVikingBlackholeOption } from "../src/blackhole/envConfig.ts";
 import { registerInteractiveMemory } from "../src/blackhole/interactiveMemory.ts";
+import { sharedAdmissionController, sharedGatewayConfig } from "../src/gateway/config.ts";
+import { describeGatewayWait, parseGatewayWait } from "../src/gateway/signals.ts";
 import { GitRepo } from "../src/git/GitRepo.ts";
 import { GenerationGuard } from "../src/guard/GenerationGuard.ts";
 import { RECOVERY_PROMPT, TOOL_TRANSITION_RULE, buildDegenerationEvent } from "../src/guard/RecoveryController.ts";
 import { resolveGuardConfig } from "../src/guard/config.ts";
+import { guardFeedFor } from "../src/guard/streamText.ts";
 import { RoadmapEngine } from "../src/roadmap/RoadmapEngine.ts";
 import { EngineeringRuntime } from "../src/runtime/EngineeringRuntime.ts";
 import { resolveStatusBarConfig } from "../src/status/config.ts";
@@ -154,7 +157,10 @@ export default function (pi: ExtensionAPI) {
   // On detection, aborts the current turn. The recovery prompt is injected
   // via the next before_agent_start (the user re-submits or the harness
   // auto-retries).
-  const interactiveGuardConfig = resolveGuardConfig();
+  // The interactive profile drops the pre-action narration budget: in this
+  // session the final answer IS prose, and nothing in the stream separates a
+  // long answer from narration until the turn is over.
+  const interactiveGuardConfig = resolveGuardConfig(undefined, "interactive");
   // The interactive guard uses pi.on() which is only available in a real pi
   // session (not in the smoke-test stub). Guard accordingly.
   if (interactiveGuardConfig.enabled && typeof pi.on === "function") {
@@ -173,21 +179,14 @@ export default function (pi: ExtensionAPI) {
       const msg = event.message as { role?: string; content?: unknown } | undefined;
       if (msg?.role !== "assistant") return;
 
-      // Extract text from the message content.
-      let text = "";
-      if (typeof msg.content === "string") {
-        text = msg.content;
-      } else if (Array.isArray(msg.content)) {
-        for (const block of msg.content) {
-          if (typeof block === "object" && block !== null) {
-            const b = block as { type?: string; text?: string };
-            if (b.type === "text" && typeof b.text === "string") text += b.text;
-          }
-        }
-      }
-      if (!text) return;
-
-      const decision = interactiveGuard.feed(text);
+      // `event.message` is the ACCUMULATED partial message, so feeding it
+      // would charge every token once per streaming event. Charge the delta
+      // the stream event carries instead (snapshot accounting is the fallback,
+      // and diffs internally).
+      const feed = guardFeedFor(event, msg.content);
+      if (!feed) return;
+      const decision =
+        feed.kind === "delta" ? interactiveGuard.feed(feed.text) : interactiveGuard.feedSnapshot(feed.text);
       if (decision.abort) {
         interactiveGuardAborted = true;
         // Abort the current generation.
@@ -243,6 +242,63 @@ ${RECOVERY_PROMPT}`;
       if (modified !== event.systemPrompt) {
         return { systemPrompt: modified };
       }
+    });
+  }
+
+  // ─── Model-gateway backpressure (honour reported waits) ──────────────────
+  // Gateways in front of the model report exactly how long to stay away
+  // (`retry_after_ms`) and how many concurrent requests they will admit
+  // (`active_limit`). Pi's own auto-retry ignores both and backs off
+  // exponentially, so the runtime observes the refusals itself and parks every
+  // model caller in this process — the worker sessions AND this interactive
+  // turn — behind one shared cooldown until the reported wait has elapsed.
+  const gatewayConfig = sharedGatewayConfig();
+  if (gatewayConfig.enabled && typeof pi.on === "function") {
+    const admission = sharedAdmissionController();
+
+    // Status line + headers: what the transport saw (`Retry-After`), no body.
+    // Narrowed to 429: a transient 5xx is Pi's own retry to handle, and arming
+    // a process-wide cooldown on one flaky response would stall every caller.
+    pi.on("after_provider_response", async (event) => {
+      if (event.status !== 429) return;
+      const signal = parseGatewayWait({ status: event.status, headers: event.headers });
+      if (signal?.retryable) admission.noteWait(signal);
+    });
+
+    // Terminal assistant error: the only place `retry_after_ms` appears, since
+    // it lives in the response BODY.
+    pi.on("message_end", async (event, ctx) => {
+      const msg = event.message as { role?: string; stopReason?: string; errorMessage?: string } | undefined;
+      if (msg?.role !== "assistant" || msg.stopReason !== "error" || !msg.errorMessage) return;
+      const signal = parseGatewayWait({ text: msg.errorMessage });
+      if (!signal?.retryable) return;
+      const waitMs = admission.noteWait(signal);
+      ctx.ui.notify(
+        `Model gateway is saturated — holding ${Math.round(waitMs / 1000)}s. ${describeGatewayWait(signal)}`,
+        "warning",
+      );
+    });
+
+    // Hold the next provider request until the shared cooldown expires, so a
+    // re-submit (manual or automatic) does not walk straight back into the
+    // queue the gateway just asked us to leave alone.
+    //
+    // This fires for EVERY provider call, compaction and summarization
+    // included, so a hold is always announced: a silent multi-second stall in
+    // the user's own session would be worse than the 429 it prevents.
+    let noticeSilentUntil = 0;
+    pi.on("before_provider_request", async (_event, ctx) => {
+      const remaining = admission.cooldownRemainingMs();
+      if (remaining <= 0) return;
+      const now = Date.now();
+      if (now >= noticeSilentUntil) {
+        noticeSilentUntil = now + remaining;
+        ctx.ui.notify(
+          `Waiting ${Math.ceil(remaining / 1000)}s for the model gateway — ${admission.describe()}`,
+          "warning",
+        );
+      }
+      await admission.awaitCooldown();
     });
   }
 

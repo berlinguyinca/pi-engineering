@@ -63,6 +63,25 @@ export function splitSentences(text: string): string[] {
   return parts.map((p) => p.trim()).filter((p) => p.length > 0);
 }
 
+/**
+ * Split text into COMPLETE sentences only — the trailing fragment of a
+ * still-streaming sentence is dropped.
+ *
+ * The guard is fed token-sized deltas, so the tail of the accumulated text is
+ * almost always a half-written sentence ("Let me inspect the reposi"). Feeding
+ * those fragments into the repetition window compares garbage against garbage
+ * and both misses real repeats and invents false ones, so only sentences that
+ * have actually been terminated are eligible for repetition detection.
+ */
+export function splitCompleteSentences(text: string): string[] {
+  const sentences = splitSentences(text);
+  if (sentences.length === 0) return sentences;
+  // The accumulated text ends mid-sentence unless its last non-space character
+  // terminates one.
+  if (!/[.!?]["')\]]?\s*$/.test(text)) sentences.pop();
+  return sentences;
+}
+
 // ─── Guard state ──────────────────────────────────────────────────────────────
 
 export interface GenerationGuardState {
@@ -111,12 +130,15 @@ export class GenerationGuard {
   private readonly fullText: string[];
   /** Number of sentences already processed into the window (to avoid re-processing). */
   private processedSentenceCount: number;
+  /** Length of the snapshot text already consumed by `feedSnapshot`. */
+  private consumedSnapshotLength: number;
 
   constructor(config: GenerationGuardConfig) {
     this.config = config;
     this.state = initialGuardState();
     this.fullText = [];
     this.processedSentenceCount = 0;
+    this.consumedSnapshotLength = 0;
   }
 
   /** Reset the guard for a new generation (new turn or retry). */
@@ -124,6 +146,7 @@ export class GenerationGuard {
     this.state = initialGuardState();
     this.fullText.length = 0;
     this.processedSentenceCount = 0;
+    this.consumedSnapshotLength = 0;
   }
 
   /** Set the current recovery attempt number. */
@@ -132,8 +155,14 @@ export class GenerationGuard {
   }
 
   /**
-   * Feed a chunk of streamed assistant text into the guard.
-   * Returns a GuardDecision indicating whether to abort.
+   * Feed an INCREMENTAL chunk (delta) of streamed assistant text into the
+   * guard. Returns a GuardDecision indicating whether to abort.
+   *
+   * Callers that only have the accumulated message (Pi's `message_update`
+   * carries the full partial message, not the delta) MUST use `feedSnapshot`
+   * instead — feeding cumulative text here counts every token once per
+   * streaming event, which inflates the budgets quadratically and aborts
+   * healthy generations within a few hundred real tokens.
    */
   feed(text: string): GuardDecision {
     if (!this.config.enabled) return { abort: false };
@@ -141,13 +170,14 @@ export class GenerationGuard {
     this.state.narrationTokens += Math.ceil(text.length / 4);
     this.state.tokensSinceProgress += Math.ceil(text.length / 4);
     this.fullText.push(text);
+    this.consumedSnapshotLength += text.length;
 
-    // Process only NEW sentences (since last feed) to avoid re-adding old ones
+    // Process only NEW, COMPLETE sentences (since last feed).
     const accumulated = this.fullText.join("");
-    const sentences = splitSentences(accumulated);
+    const sentences = splitCompleteSentences(accumulated);
     // Only process sentences beyond what we've already seen
     const newSentences = sentences.slice(this.processedSentenceCount);
-    this.processedSentenceCount = sentences.length;
+    this.processedSentenceCount = Math.max(this.processedSentenceCount, sentences.length);
 
     for (const raw of newSentences) {
       const normalized = normalizeSentence(raw);
@@ -173,6 +203,34 @@ export class GenerationGuard {
   }
 
   /**
+   * Feed the CUMULATIVE assistant text seen so far (a streaming snapshot).
+   *
+   * Only the part that has not been fed yet is charged to the budgets, so
+   * callers that receive Pi's accumulated partial message on every
+   * `message_update` account each token exactly once. A snapshot that is not a
+   * continuation of what we already consumed (a new assistant message in the
+   * same turn) starts a fresh segment rather than being re-charged.
+   */
+  feedSnapshot(snapshot: string): GuardDecision {
+    if (!this.config.enabled) return { abort: false };
+
+    const consumed = this.consumedSnapshotLength;
+    const isContinuation =
+      snapshot.length >= consumed && snapshot.startsWith(this.fullText.join("").slice(0, consumed));
+    if (!isContinuation) {
+      // A different assistant message: restart snapshot accounting without
+      // discarding the turn-level counters the detectors rely on.
+      this.fullText.length = 0;
+      this.processedSentenceCount = 0;
+      this.consumedSnapshotLength = 0;
+      return snapshot ? this.feed(snapshot) : { abort: false };
+    }
+    const delta = snapshot.slice(consumed);
+    if (!delta) return { abort: false };
+    return this.feed(delta);
+  }
+
+  /**
    * Record a progress event (tool call, structured action, etc.).
    * Resets the no-progress counters (spec §11).
    */
@@ -188,9 +246,11 @@ export class GenerationGuard {
     }
     this.state.hasProgress = true;
     this.state.tokensSinceProgress = 0;
-    // Clear the sentence window on progress (repetition before progress is what matters)
+    // Clear the sentence window on progress: each detector measures the
+    // segment SINCE the last progress event, so a turn that keeps acting is
+    // never charged for text it already paid for.
     this.state.sentenceWindow = [];
-    this.processedSentenceCount = splitSentences(this.fullText.join("")).length;
+    this.processedSentenceCount = splitCompleteSentences(this.fullText.join("")).length;
   }
 
   /** Get the accumulated text (for diagnostics). */
@@ -211,7 +271,10 @@ export class GenerationGuard {
    * progress event occurred between repetitions.
    */
   private checkRepeatedSentence(): GuardDecision {
-    if (this.state.hasProgress) return { abort: false };
+    // NOT gated on `hasProgress`: the window is cleared by `onProgress`, so it
+    // only ever holds sentences emitted since the last progress event. Gating
+    // on the latch would make the guard inert for the rest of a turn after its
+    // first tool call — exactly the mid-session loop it exists to catch.
     if (this.state.sentenceWindow.length < this.config.repeatedSentenceThreshold) return { abort: false };
 
     // Count occurrences of each sentence in the window
@@ -242,7 +305,8 @@ export class GenerationGuard {
    * and no tool/action/final-answer has occurred.
    */
   private checkNoProgress(): GuardDecision {
-    if (this.state.hasProgress) return { abort: false };
+    // Per-segment: `tokensSinceProgress` is reset by `onProgress`, so this is
+    // "tokens emitted since the last action", not "tokens in the turn".
     if (this.state.tokensSinceProgress <= this.config.maxReasoningTokensWithoutProgress) return { abort: false };
 
     return {
@@ -262,6 +326,11 @@ export class GenerationGuard {
    * final answer started.
    */
   private checkExcessiveNarration(): GuardDecision {
+    // Only meaningful where prose is NOT the deliverable (worker sessions must
+    // finish by calling `worker_result`). In an interactive session the final
+    // answer IS prose and no stream-time signal separates it from narration,
+    // so the budget is disabled there rather than aborting healthy answers.
+    if (!this.config.narrationBudgetEnabled) return { abort: false };
     if (this.state.hasProgress) return { abort: false };
     if (this.state.finalAnswerStarted) return { abort: false };
     if (this.state.toolCallCount > 0) return { abort: false };

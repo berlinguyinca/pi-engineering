@@ -1,0 +1,304 @@
+/**
+ * Model-gateway backpressure: signal parsing and process-wide admission.
+ *
+ * The fixture in the first test is a verbatim production payload — the one the
+ * runtime was ignoring while it kept re-queuing work against a saturated
+ * gateway.
+ */
+import assert from "node:assert/strict";
+import { test } from "node:test";
+import { AdmissionController } from "../../src/gateway/AdmissionController.ts";
+import { resolveGatewayConfig } from "../../src/gateway/config.ts";
+import {
+  decideGatewayRetry,
+  describeGatewayWait,
+  parseGatewayWait,
+  parseRetryAfterHeader,
+} from "../../src/gateway/signals.ts";
+
+const PRODUCTION_429 =
+  '429: {"active":4,"active_limit":4,"message":"inference admission: queue_timeout","queue_limit":100,"queued":30,"reason":"queue_timeout","request_id":"332ea9d2-6a34-4d06-ba7e-514081ccbdef","retry_after_ms":30000,"scope":"agent","type":"inference_admission"}';
+
+// ─── Signal parsing ─────────────────────────────────────────────────────────
+
+test("parses the reported wait and admission limits from a production 429", () => {
+  const signal = parseGatewayWait({ text: PRODUCTION_429 });
+  assert.ok(signal);
+  assert.equal(signal.retryAfterMs, 30_000);
+  assert.equal(signal.source, "body");
+  assert.equal(signal.retryable, true);
+  assert.equal(signal.status, 429);
+  assert.equal(signal.reason, "queue_timeout");
+  assert.equal(signal.type, "inference_admission");
+  assert.equal(signal.scope, "agent");
+  assert.equal(signal.activeLimit, 4);
+  assert.equal(signal.queued, 30);
+  assert.equal(signal.queueLimit, 100);
+  assert.equal(signal.requestId, "332ea9d2-6a34-4d06-ba7e-514081ccbdef");
+});
+
+test("describes a wait in one line", () => {
+  const signal = parseGatewayWait({ text: PRODUCTION_429 });
+  assert.ok(signal);
+  const text = describeGatewayWait(signal);
+  assert.match(text, /429/);
+  assert.match(text, /queue_timeout/);
+  assert.match(text, /30s/);
+});
+
+test("falls back to the Retry-After header when there is no body", () => {
+  const signal = parseGatewayWait({ status: 429, headers: { "Retry-After": "12" } });
+  assert.ok(signal);
+  assert.equal(signal.retryAfterMs, 12_000);
+  assert.equal(signal.source, "header");
+});
+
+test("parses an HTTP-date Retry-After against the injected clock", () => {
+  const now = Date.parse("2026-09-15T12:00:00Z");
+  const ms = parseRetryAfterHeader("Tue, 15 Sep 2026 12:00:45 GMT", now);
+  assert.equal(ms, 45_000);
+  // A date in the past clamps to zero rather than going negative.
+  assert.equal(parseRetryAfterHeader("Tue, 15 Sep 2026 11:59:00 GMT", now), 0);
+});
+
+test("a saturation status with no wait at all still yields a default wait", () => {
+  const signal = parseGatewayWait({ status: 503 });
+  assert.ok(signal);
+  assert.equal(signal.source, "default");
+  assert.ok(signal.retryAfterMs > 0);
+});
+
+test("quota and billing exhaustion is reported as NON-retryable", () => {
+  for (const text of [
+    '429: {"message":"You exceeded your current quota","type":"insufficient_quota"}',
+    "429 Too Many Requests: your credit balance is too low",
+  ]) {
+    const signal = parseGatewayWait({ text });
+    assert.ok(signal, text);
+    assert.equal(signal.retryable, false, text);
+  }
+});
+
+test("ordinary errors are not mistaken for backpressure", () => {
+  assert.equal(parseGatewayWait({ text: "400: invalid request: unknown tool" }), null);
+  assert.equal(parseGatewayWait({ text: "context window exceeded" }), null);
+  assert.equal(parseGatewayWait({ status: 200 }), null);
+  assert.equal(parseGatewayWait({}), null);
+});
+
+test("malformed payloads degrade instead of throwing", () => {
+  const signal = parseGatewayWait({ text: '429: {"retry_after_ms": not-json' });
+  assert.ok(signal);
+  assert.equal(signal.status, 429);
+  assert.equal(signal.source, "default");
+});
+
+test("a retry_after_ms reported as a string is honoured", () => {
+  const signal = parseGatewayWait({ text: '429: {"retry_after_ms":"1500","reason":"queue_timeout"}' });
+  assert.equal(signal?.retryAfterMs, 1500);
+});
+
+// ─── Admission control ──────────────────────────────────────────────────────
+
+/** A controller driven by a fake clock: `sleep` advances time, never waits. */
+function testController(opts: { maxConcurrency?: number; reservedSlots?: number; maxWaitMs?: number } = {}) {
+  let now = 1_000;
+  const sleeps: number[] = [];
+  const controller = new AdmissionController({
+    maxConcurrency: opts.maxConcurrency ?? 4,
+    reservedSlots: opts.reservedSlots ?? 0,
+    ...(opts.maxWaitMs !== undefined ? { maxWaitMs: opts.maxWaitMs } : {}),
+    jitterMs: 0,
+    now: () => now,
+    sleep: async (ms: number) => {
+      sleeps.push(ms);
+      now += ms;
+    },
+    random: () => 0,
+  });
+  return { controller, sleeps };
+}
+
+test("the reported wait is honoured exactly, not backed off exponentially", async () => {
+  const { controller, sleeps } = testController();
+  const signal = parseGatewayWait({ text: PRODUCTION_429 });
+  assert.ok(signal);
+
+  const waited = await controller.noteWaitAndSleep(signal);
+  assert.equal(waited, 30_000);
+  assert.deepEqual(sleeps, [30_000]);
+  assert.equal(controller.cooldownRemainingMs(), 0);
+});
+
+test("the cooldown is process-wide: every caller waits, not just the one that was refused", async () => {
+  const { controller, sleeps } = testController();
+  const signal = parseGatewayWait({ text: PRODUCTION_429 });
+  assert.ok(signal);
+
+  controller.noteWait(signal);
+  assert.equal(controller.cooldownRemainingMs(), 30_000);
+
+  // A caller that never saw the 429 is held too.
+  const slot = await controller.acquire();
+  assert.ok(sleeps.includes(30_000));
+  assert.equal(controller.cooldownRemainingMs(), 0);
+  slot.release();
+});
+
+test("a longer cooldown is never shortened by a later, smaller wait", () => {
+  const { controller } = testController();
+  controller.noteWait({ retryAfterMs: 30_000, retryable: true, source: "body" });
+  controller.noteWait({ retryAfterMs: 1_000, retryable: true, source: "body" });
+  assert.equal(controller.cooldownRemainingMs(), 30_000);
+});
+
+test("a single wait is capped so a bad payload cannot park the runtime", () => {
+  const { controller } = testController({ maxWaitMs: 5_000 });
+  const armed = controller.noteWait({ retryAfterMs: 86_400_000, retryable: true, source: "body" });
+  assert.equal(armed, 5_000);
+  assert.equal(controller.cooldownRemainingMs(), 5_000);
+});
+
+test("the interactive reserve applies from the start, before any gateway pushback", () => {
+  // The window before the first 429 is exactly when the runtime was
+  // overloading the gateway: 4 worker sessions PLUS the operator's own turn
+  // against an admission window of 4.
+  const { controller } = testController({ maxConcurrency: 4, reservedSlots: 1 });
+  assert.equal(controller.status().concurrency, 3);
+});
+
+test("concurrency is clamped to the gateway's active_limit, minus the interactive reserve", () => {
+  const { controller } = testController({ maxConcurrency: 8, reservedSlots: 1 });
+  assert.equal(controller.status().concurrency, 7);
+  const signal = parseGatewayWait({ text: PRODUCTION_429 });
+  assert.ok(signal);
+  controller.noteWait(signal);
+  // active_limit 4, one slot left for the operator's own turn.
+  assert.equal(controller.status().concurrency, 3);
+});
+
+test("relaxing never reclaims the interactive reserve", () => {
+  const { controller } = testController({ maxConcurrency: 4, reservedSlots: 1 });
+  controller.noteWait({ retryAfterMs: 0, retryable: true, source: "body", activeLimit: 1 });
+  assert.equal(controller.status().concurrency, 1);
+  for (let i = 0; i < 60; i++) controller.noteSuccess();
+  assert.equal(controller.status().concurrency, 3, "reserve stays held after recovery");
+});
+
+test("the clamp never drops below one slot", () => {
+  const { controller } = testController({ maxConcurrency: 4, reservedSlots: 2 });
+  controller.noteWait({ retryAfterMs: 0, retryable: true, source: "body", activeLimit: 1 });
+  assert.equal(controller.status().concurrency, 1);
+});
+
+test("slots are bounded by the clamp and released back", async () => {
+  const { controller } = testController({ maxConcurrency: 4 });
+  controller.noteWait({ retryAfterMs: 0, retryable: true, source: "body", activeLimit: 2 });
+  assert.equal(controller.status().concurrency, 2);
+
+  const a = await controller.acquire();
+  const b = await controller.acquire();
+  assert.equal(controller.status().active, 2);
+
+  let third = false;
+  const pending = controller.acquire().then((slot) => {
+    third = true;
+    return slot;
+  });
+  await Promise.resolve();
+  assert.equal(third, false, "a third caller must queue behind the clamp");
+
+  a.release();
+  const c = await pending;
+  assert.equal(third, true);
+  assert.equal(controller.status().active, 2);
+  b.release();
+  c.release();
+  assert.equal(controller.status().active, 0);
+});
+
+test("releasing a slot twice does not corrupt the count", async () => {
+  const { controller } = testController({ maxConcurrency: 1 });
+  const slot = await controller.acquire();
+  slot.release();
+  slot.release();
+  assert.equal(controller.status().active, 0);
+});
+
+test("the clamp relaxes back toward the configured maximum after clean runs", () => {
+  const { controller } = testController({ maxConcurrency: 4 });
+  controller.noteWait({ retryAfterMs: 0, retryable: true, source: "body", activeLimit: 1 });
+  assert.equal(controller.status().concurrency, 1);
+  for (let i = 0; i < 3; i++) controller.noteSuccess();
+  assert.equal(controller.status().concurrency, 2);
+  for (let i = 0; i < 3; i++) controller.noteSuccess();
+  assert.equal(controller.status().concurrency, 3);
+  for (let i = 0; i < 30; i++) controller.noteSuccess();
+  assert.equal(controller.status().concurrency, 4, "never exceeds the configured maximum");
+});
+
+test("a fresh wait restarts the relax countdown", () => {
+  const { controller } = testController({ maxConcurrency: 4 });
+  controller.noteWait({ retryAfterMs: 0, retryable: true, source: "body", activeLimit: 1 });
+  controller.noteSuccess();
+  controller.noteSuccess();
+  controller.noteWait({ retryAfterMs: 0, retryable: true, source: "body" });
+  controller.noteSuccess();
+  assert.equal(controller.status().concurrency, 1, "two pre-refusal successes must not count");
+});
+
+test("status and describe report the current hold", () => {
+  const { controller } = testController();
+  assert.equal(controller.describe(), null);
+  const signal = parseGatewayWait({ text: PRODUCTION_429 });
+  assert.ok(signal);
+  controller.noteWait(signal);
+  const status = controller.status();
+  assert.equal(status.cooldownMs, 30_000);
+  assert.equal(status.lastSignal?.requestId, "332ea9d2-6a34-4d06-ba7e-514081ccbdef");
+  assert.match(controller.describe() ?? "", /gateway backoff/);
+});
+
+// ─── Configuration ──────────────────────────────────────────────────────────
+
+test("gateway config is tunable from the environment", () => {
+  const saved = { ...process.env };
+  try {
+    process.env.PI_GATEWAY_MAX_CONCURRENCY = "2";
+    process.env.PI_GATEWAY_RESERVED_SLOTS = "0";
+    process.env.PI_GATEWAY_MAX_RETRIES = "7";
+    process.env.PI_GATEWAY_ADMISSION_ENABLED = "false";
+    const cfg = resolveGatewayConfig();
+    assert.equal(cfg.maxConcurrency, 2);
+    assert.equal(cfg.reservedSlots, 0);
+    assert.equal(cfg.maxRetries, 7);
+    assert.equal(cfg.enabled, false);
+  } finally {
+    process.env = saved;
+  }
+});
+
+// ─── Worker retry policy ────────────────────────────────────────────────────
+
+test("backpressure is retried outside the degeneration recovery ladder", () => {
+  const first = decideGatewayRetry(PRODUCTION_429, 0, 4);
+  assert.equal(first.action, "wait");
+  assert.equal(first.action === "wait" ? first.signal.retryAfterMs : 0, 30_000);
+});
+
+test("the gateway retry budget is finite", () => {
+  const spent = decideGatewayRetry(PRODUCTION_429, 4, 4);
+  assert.equal(spent.action, "give-up");
+  assert.equal(spent.action === "give-up" ? spent.reason : "", "retries-exhausted");
+});
+
+test("a hard quota refusal is never retried", () => {
+  const quota = decideGatewayRetry('429: {"type":"insufficient_quota"}', 0, 4);
+  assert.equal(quota.action, "give-up");
+  assert.equal(quota.action === "give-up" ? quota.reason : "", "non-retryable");
+});
+
+test("non-gateway failures fall through to the normal failure path", () => {
+  assert.equal(decideGatewayRetry(undefined, 0, 4).action, "not-gateway");
+  assert.equal(decideGatewayRetry("tool 'read' not found", 0, 4).action, "not-gateway");
+});

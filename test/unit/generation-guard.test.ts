@@ -127,8 +127,13 @@ test("Test 6: Final answer start prevents narration abort", () => {
   const guard = new GenerationGuard(config);
   // Signal final answer start
   guard.onProgress("final_answer_start");
-  // Long text should not trigger excessive_narration
-  const decision = guard.feed("This is the complete answer to the question. ".repeat(20));
+  // Long text should not trigger excessive_narration. The sentences must
+  // VARY: an answer that repeats one sentence twenty times is degenerate and
+  // is caught by the repetition detector regardless of the narration budget.
+  let decision = { abort: false } as ReturnType<GenerationGuard["feed"]>;
+  for (let i = 0; i < 20; i++) {
+    decision = guard.feed(`This is part ${i} of the complete answer to the question. `);
+  }
   assert.equal(decision.abort, false);
 });
 
@@ -347,7 +352,12 @@ test("Excessive narration: does NOT trigger when tool calls present", () => {
   const config = { ...DEFAULT_GUARD_CONFIG, maxNarrationTokensBeforeAction: 50 };
   const guard = new GenerationGuard(config);
   guard.onProgress("tool_call"); // A tool call occurred
-  const decision = guard.feed("Now let me analyze the results I got from the file. ".repeat(5));
+  // Varied sentences: the point here is the narration budget, and identical
+  // repeats would (correctly) trip the repetition detector instead.
+  let decision = { abort: false } as ReturnType<GenerationGuard["feed"]>;
+  for (let i = 0; i < 5; i++) {
+    decision = guard.feed(`Now let me analyze result ${i} that I got from the file. `);
+  }
   assert.equal(decision.abort, false);
 });
 
