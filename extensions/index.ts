@@ -19,6 +19,8 @@ import {
 } from "../src/gateway/installStreamRetry.ts";
 import { describeGatewayWait, isAccountWideRefusal, parseGatewayWait } from "../src/gateway/signals.ts";
 import { renderGatewayReport } from "../src/gateway/statusReport.ts";
+import { type InferweaveProvider, createInferweaveProvider, inferweaveConfigFromEnv } from "../src/context/provider.ts";
+import { contextReading, planModelSwitch } from "../src/context/usage.ts";
 import { GitRepo } from "../src/git/GitRepo.ts";
 import { GenerationGuard } from "../src/guard/GenerationGuard.ts";
 import { RECOVERY_PROMPT, TOOL_TRANSITION_RULE, buildDegenerationEvent } from "../src/guard/RecoveryController.ts";
@@ -161,6 +163,15 @@ function panelFor(key: string, rt: EngineeringRuntime): PanelPlumbing {
   ambientPanel = { key, state };
   return created;
 }
+
+// InferWeave capability integration (docs/specs/dynamic-context-capabilities).
+// One provider + one capability client per process: a fan-out of subagents must
+// not become a stampede on the gateway's /v1/models. Disabled unless
+// INFERWEAVE_BASE_URL is set, so the harness stays inert without a gateway.
+const inferweaveConfig = inferweaveConfigFromEnv();
+const inferweave: InferweaveProvider | null = inferweaveConfig.enabled
+  ? createInferweaveProvider(inferweaveConfig)
+  : null;
 
 async function getRuntime(ctx: ExtensionCommandContext, worker?: EngineeringRuntime): Promise<EngineeringRuntime> {
   return getRuntimeByCwd(worker ? worker.cwd : ctx.cwd, ctx.model);
@@ -887,6 +898,16 @@ ${RECOVERY_PROMPT}`;
   // output TPS. It never runs git/network during render (git context is cached
   // and invalidated on branch/cwd/model changes). `pi.on()` only exists in a
   // real pi session, so guard like the Generation Guard block above.
+  /** Publish the session's context usage against the model's resolved window. */
+  const publishContext = (ctx: ExtensionCommandContext): void => {
+    if (!activeFooter) return;
+    const usage = typeof ctx.getContextUsage === "function" ? ctx.getContextUsage() : undefined;
+    const modelId = ctx.model?.id;
+    const resolved = inferweave?.windowFor(modelId);
+    if (resolved) activeFooter.setCapabilityWindow(resolved.windowTokens, resolved.note);
+    if (usage && typeof usage.tokens === "number") activeFooter.setContextUsage(usage.tokens);
+  };
+
   if (statusBarConfig.enabled && typeof pi.on === "function") {
     pi.on("session_start", (_event, ctx) => {
       for (const un of sessionUnsubscribes.splice(0)) un();
@@ -906,6 +927,7 @@ ${RECOVERY_PROMPT}`;
           if (!ambientPanel) return undefined;
           return ambientPanel.key === cachedRepoKey(sessionCwd) ? ambientPanel.state : undefined;
         },
+        capabilityWindow: (modelId) => inferweave?.windowFor(modelId),
       });
       activeFooter = footer;
       // The footer is a second consumer of admission events (telemetry owns the
@@ -913,18 +935,91 @@ ${RECOVERY_PROMPT}`;
       if (gatewayConfig.enabled) {
         sessionUnsubscribes.push(sharedAdmissionController().subscribe((event) => footer.onGatewayEvent(event)));
       }
+      publishContext(ctx as unknown as ExtensionCommandContext);
     });
 
     pi.on("message_start", () => activeFooter?.onMessageStart());
     pi.on("message_update", (event) => activeFooter?.onMessageUpdate(event));
     pi.on("message_end", (event) => activeFooter?.onMessageEnd(event));
     pi.on("model_select", (event) => activeFooter?.onModelSelect(event.model));
+    // Usage moves with every turn, and the window must move with the model.
+    pi.on("agent_settled", (_event, ctx) => publishContext(ctx as unknown as ExtensionCommandContext));
     pi.on("session_shutdown", () => {
       for (const un of sessionUnsubscribes.splice(0)) un();
       activeFooter?.dispose();
       activeFooter = null;
     });
   }
+
+  // ─── Model switch guard (spec 02 §switching models) ───────────────────
+  // A switch to a narrower window must be made safe BEFORE the next request is
+  // dispatched. Pi's native compaction engine does the work; this only decides
+  // when it is required, and refuses to pretend a request that cannot fit will
+  // succeed. Pi's overflow recovery stays intact — this runs earlier.
+  if (inferweave && typeof pi.on === "function") {
+    pi.on("model_select", async (event, ctx) => {
+      const modelId = event.model?.id;
+      const target = inferweave.windowFor(modelId);
+      if (!target) return;
+      const usage = typeof ctx.getContextUsage === "function" ? ctx.getContextUsage() : undefined;
+      const used = usage && typeof usage.tokens === "number" ? usage.tokens : 0;
+      const previous = activeFooter?.state.context?.windowTokens ?? target.windowTokens;
+      const decision = planModelSwitch(used, previous, target.windowTokens, {
+        reserveOutputTokens: inferweave.resolved(modelId)?.maxTokens ?? 0,
+      });
+      if (decision.action === "none") return;
+      if (decision.action === "reject") {
+        ctx.ui.notify(
+          `cannot switch to ${modelId}: ${decision.reason} — pick a model whose window fits or compact first`,
+          "error",
+        );
+        return;
+      }
+      ctx.ui.notify(
+        `${modelId} window is ${contextReading(used, target.windowTokens).windowTokens} tokens; compacting ${decision.overflowTokens} before the next request`,
+        "info",
+      );
+      ctx.compact({ customInstructions: "Preserve task state, decisions, and open files; compress the rest." });
+    });
+  }
+
+  // ─── InferWeave capability provider (spec 02 / 07) ───────────────────
+  // Dynamic discovery through Pi's supported `refreshModels` hook: the gateway's
+  // guaranteed routable context becomes Pi's contextWindow, its advertised
+  // output maximum becomes maxTokens. No Pi core patch, no competing compaction.
+  if (inferweave) {
+    pi.registerProvider(inferweave.registration.name, inferweave.registration as never);
+  }
+
+  pi.registerCommand("iw-context", {
+    description: "Show model context capability: resolved window, provenance, leases, staleness.",
+    handler: async (args, ctx) => {
+      const modelId = args.trim() || ctx.model?.id;
+      const lines = inferweave
+        ? inferweave.diagnostics(modelId)
+        : [
+            "InferWeave integration is off. Set INFERWEAVE_BASE_URL (e.g. http://gw:8787/v1) to enable capability discovery.",
+            `Active model: ${ctx.model?.id ?? "unknown"}`,
+          ];
+      const usage = typeof ctx.getContextUsage === "function" ? ctx.getContextUsage() : undefined;
+      // `tokens` is null right after compaction, before the next LLM response;
+      // Pi's own `contextWindow` is the window it is enforcing, which is exactly
+      // what a capability discrepancy check wants to see.
+      const windowTokens =
+        inferweave?.windowFor(modelId)?.windowTokens ??
+        usage?.contextWindow ??
+        activeFooter?.state.context?.windowTokens ??
+        0;
+      if (typeof usage?.tokens === "number" && windowTokens > 0) {
+        lines.unshift(
+          `session: ${contextReading(usage.tokens, windowTokens).label} (Pi window ${usage.contextWindow})`,
+        );
+      } else if (windowTokens > 0) {
+        lines.unshift(`session: usage unknown; Pi window ${usage?.contextWindow ?? windowTokens}`);
+      }
+      ctx.ui.notify(lines.join("\n"), "info");
+    },
+  });
 
   // ─── Engineering panel ───────────────────────────────────────────────────
   // `/panel` (or the configured chord) toggles a right-anchored overlay over

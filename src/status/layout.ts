@@ -13,6 +13,7 @@
  */
 
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { contextReading } from "../context/usage.ts";
 import type { StatusBarConfig } from "./config.ts";
 import type { HarnessStatusState, TaskState, WaitState } from "./state.ts";
 
@@ -72,12 +73,21 @@ function renderUnsafe(state: HarnessStatusState, width: number, config: StatusBa
     }
   }
   if (config.showModel && state.model) {
-    full.push({ text: formatModel(state), priority: 4 });
-    short.push({ text: state.model, priority: 4 });
+    full.push({ text: formatModel(state), priority: 5 });
+    short.push({ text: state.model, priority: 5 });
+  }
+  // Context reading sits right after the model because it qualifies the model:
+  // the number Pi resolved for this id, and how much of it is in use. It is
+  // dropped before the model itself when width runs out.
+  if (config.showContext && state.context) {
+    const reading = contextReading(state.context.usedTokens, state.context.windowTokens);
+    const mark = state.context.note ? `~` : "";
+    full.push({ text: `${mark}${reading.label}`, priority: 4 });
+    short.push({ text: reading.label, priority: 4 });
   }
   if (config.showThroughput && throughputFull) {
-    full.push({ text: throughputFull, priority: 5 });
-    short.push({ text: throughputShort ?? throughputFull, priority: 5 });
+    full.push({ text: throughputFull, priority: 6 });
+    short.push({ text: throughputShort ?? throughputFull, priority: 6 });
   }
   if (config.showTask && state.task) {
     full.push({ text: formatTask(state.task, 32), priority: 6 });
@@ -93,16 +103,13 @@ function renderUnsafe(state: HarnessStatusState, width: number, config: StatusBa
   const stages: RenderSegment[][] = [];
   stages.push(full);
   stages.push(short);
-  // Drop directory, then repository, then worktree, then branch (keep model+tps).
+  // Drop directory, then repository, then worktree, then branch, then the
+  // context reading (model + tps are the irreducible core).
   stages.push(short.filter((s) => s.priority >= 1));
   stages.push(short.filter((s) => s.priority >= 2));
   stages.push(short.filter((s) => s.priority >= 3));
   stages.push(short.filter((s) => s.priority >= 4));
-  // Then model, then throughput, then the task — the wait reason outlives all
-  // of them, because it is the only segment that explains an idle session.
   stages.push(short.filter((s) => s.priority >= 5));
-  stages.push(short.filter((s) => s.priority >= 6));
-  stages.push(short.filter((s) => s.priority >= 7));
 
   for (const stage of stages) {
     const line = assemble(stage);

@@ -1,0 +1,28 @@
+{
+  "name": "InferWeave + Pi Dynamic Context Capability & Admission",
+  "date": "2026-09-14",
+  "version": "1.0",
+  "files": [
+    "00-overview-and-architecture.md",
+    "01-inferweave-capability-api.md",
+    "02-pi-provider-integration.md",
+    "03-admission-and-context-leases.md",
+    "04-routing-affinity-and-kv-cache.md",
+    "05-compaction-and-context-policy.md",
+    "06-observability-and-status.md",
+    "07-compatibility-fallbacks-and-security.md",
+    "08-testing-and-benchmarks.md",
+    "09-rollout-and-migrations.md",
+    "10-cross-repo-work-breakdown.md",
+    "11-api-and-config-examples.md",
+    "12-acceptance-criteria.md",
+    "IMPLEMENTATION_PROMPT.md",
+    "README.md",
+    "SOURCES.md"
+  ],
+  "primary_projects": [
+    "InferWeave",
+    "pi-engineering-harness"
+  ],
+  "purpose": "Replace fixed full-window session reservations with server-discovered context capabilities and request-scoped dynamic admission."
+}

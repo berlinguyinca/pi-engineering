@@ -15,6 +15,7 @@ export interface StatusBarConfig {
   showWorktree: boolean;
   showBranch: boolean;
   showModel: boolean;
+  showContext: boolean;
   showThroughput: boolean;
   /** Show the engineering task in flight. */
   showTask: boolean;
@@ -40,6 +41,7 @@ export const DEFAULT_STATUS_BAR_CONFIG: StatusBarConfig = {
   showWorktree: true,
   showBranch: true,
   showModel: true,
+  showContext: true,
   showThroughput: true,
   showTask: true,
   showWait: true,
@@ -71,6 +73,7 @@ const ENV = {
   worktree: "PI_STATUS_BAR_SHOW_WORKTREE",
   branch: "PI_STATUS_BAR_SHOW_BRANCH",
   model: "PI_STATUS_BAR_SHOW_MODEL",
+  context: "PI_STATUS_BAR_SHOW_CONTEXT",
   throughput: "PI_STATUS_BAR_SHOW_THROUGHPUT",
   task: "PI_STATUS_BAR_SHOW_TASK",
   wait: "PI_STATUS_BAR_SHOW_WAIT",
@@ -89,6 +92,7 @@ export function resolveStatusBarConfig(env: Record<string, string | undefined> =
     showWorktree: bool(env[ENV.worktree], base.showWorktree),
     showBranch: bool(env[ENV.branch], base.showBranch),
     showModel: bool(env[ENV.model], base.showModel),
+    showContext: bool(env[ENV.context], base.showContext),
     showThroughput: bool(env[ENV.throughput], base.showThroughput),
     showTask: bool(env[ENV.task], base.showTask),
     showWait: bool(env[ENV.wait], base.showWait),
