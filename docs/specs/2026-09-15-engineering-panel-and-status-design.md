@@ -7,13 +7,17 @@ happening — why the runtime is waiting.
 
 Two surfaces deliver this, both fed from one state layer:
 
-- a **toggleable overlay panel**, anchored right, with a keyboard-navigable
-  tree of changed files, reviews, and token spend;
+- a **toggleable overlay panel**, anchored right, with keyboard-navigable,
+  searchable, resizable tabs: changed files, reviews, token spend, a running
+  session narrative, and memory counts;
 - the **existing status footer**, extended to name the current task, the active
   model, and the reason for any wait.
 
-Delivery is two tracks. Track 1 (status footer) ships first and validates the
-state-feeding shape. Track 2 (panel) builds on the same state.
+Delivery is three tracks. Track 1 (status footer) ships first and validates the
+state-feeding shape. Track 2 (panel) builds on the same state: the overlay, the
+feeders, the tree, and the file view. Track 3 adds what makes the panel livable
+— tabs, persisted layout, search, copy, the memory readout, and the generated
+session narrative.
 
 ## Behavior — status footer (track 1)
 
@@ -66,6 +70,76 @@ diffs are read lazily through the artifact store by URI; working-tree files are
 read from disk. Both are capped and scrolled rather than loaded whole, and
 neither is inlined into model context.
 
+## Behavior — tabs
+
+The panel body is tabbed; `tab`/`shift+tab` cycle, and the active tab is
+remembered:
+
+| Tab | Content |
+| --- | ------- |
+| Files | changed files (candidate or working tree), opening into the content view |
+| Reviews | findings grouped by candidate: severity, reviewing role, model |
+| Tokens | spend grouped by model, for the run and for the session |
+| Session | the running narrative of what this session has worked on |
+| Memory | session memory counts, and what was promoted to durable memory |
+
+### Session narrative
+
+The Session tab answers "what have we actually been doing?" — a short prose
+arc such as *"started on a status-bar update, moved to gateway error handling,
+now working on the panel"*. It is model-generated, and it is the only generated
+content in the panel, so it carries three constraints:
+
+It is fed **deltas, not transcripts**: new work items, phase transitions,
+commits, and changed-file sets since the last update. A summary is requested
+only on meaningful events and is debounced, never per token or per turn, and
+never more than once per configured interval.
+
+It runs through the **same admission gate as every other model call**, so the
+narrator can never compete with engineering work for a saturated gateway, and
+it is skipped entirely while a cooldown is active — a narrative update is never
+worth delaying a run.
+
+It is **labeled as generated and never becomes evidence**. The narrative is
+displayed with its source and is never written to the ledger as a fact, claim,
+or hypothesis. Nothing downstream may read it back as input to a decision.
+
+Failure is silent: no model, a refused gateway, or a failed summary leaves the
+previous narrative in place with its timestamp, and the tab says when it was
+last updated rather than pretending to be current.
+
+### Memory readout
+
+The Memory tab reports what this session put into memory: entries recorded,
+promotion candidates, promotions to durable memory, and memory-worker runs.
+Every one of those counters already exists on the Blackhole manager state and is
+exposed by `blackholeTelemetry()`, so this is a read model like the rest of the
+panel. Blackhole is off by default; when it is off the tab says so rather than
+showing zeros that look like a failure.
+
+## Behavior — layout, search, and copy
+
+**Resizing and persistence.** The panel's width, the content view's split, the
+active tab, and which nodes are expanded are all adjustable and all remembered.
+Width adjusts with `<`/`>` in steps, bounded by the same floor and terminal-width
+rules as the default. Layout persists to the **agent profile**, not the
+repository — the same location and atomic, owner-only write used by the memory
+connection settings — so it survives extension updates and never lands in a
+project's git history. A corrupt or unreadable layout file degrades to defaults
+rather than failing the panel.
+
+**Vim-style search.** `/` opens a search prompt over the visible rows; `n` and
+`N` step through matches; `esc` cancels and restores the prior selection. Pi's
+TUI already ships the matching primitives (`findAltScreenSearchMatches`,
+`AltScreenSearchIndex`, and a search component), so the panel reuses them rather
+than carrying its own matcher, and inherits their match caching.
+
+**Copy.** `y` copies the selected row, and `Y` the visible body, to the system
+clipboard via OSC 52, which needs no dependency and works over SSH. In
+fullscreen mode Pi's own selection copy remains available alongside it. Where a
+terminal refuses OSC 52 the panel reports that the copy did not happen rather
+than silently doing nothing.
+
 ## Architecture
 
 State, feeders, rendering, and lifecycle are separate units, following the split
@@ -76,7 +150,13 @@ src/panel/
   PanelState.ts                structured state + subscribe/publish
   feeders/LedgerFeeder.ts      run view, derived from the ledger
   feeders/WorkspaceFeeder.ts   idle view: git status + session usage
+  feeders/MemoryFeeder.ts      blackhole telemetry -> memory counts
+  narrator/Narrator.ts         debounced, admission-gated session summariser
+  narrator/deltas.ts           pure: state changes -> the prompt's delta list
   tree.ts                      pure: PanelState -> renderable rows
+  search.ts                    pure: rows + query -> match positions
+  layout.ts                    persisted layout (width, tab, expansion)
+  clipboard.ts                 OSC 52 copy
   PanelComponent.ts            pi-tui Component: paint rows, move selection
   PanelController.ts           OverlayHandle lifecycle, toggle, focus, dispose
 ```
@@ -126,6 +206,14 @@ independent review and challenge; nothing here may change that.
 Panel content is not model context. Artifact URIs travel; artifact bodies do not
 enter any prompt as a side effect of being displayed.
 
+The session narrative is generated text, not a record. It is labeled as such,
+never written to the ledger, and never read back as input to any engineering
+decision — the ledger's separation of machine evidence from agent-authored
+claims (INV-006) is not weakened by a convenience summary.
+
+Persisted layout lives in the agent profile, holds no repository content and no
+credentials, and is written atomically with owner-only permissions.
+
 Guard against the render contract already established for the footer: no git,
 no network, no unbounded work while painting, and coalesced updates so a
 streaming run cannot cause a render storm.
@@ -143,6 +231,14 @@ operator's TUI mode, and the keyboard path is the contract.
 Overlay width is a percentage with a minimum floor, and the overlay suppresses
 itself on narrow terminals rather than crowding the chat.
 
+Clipboard access from a terminal program is not guaranteed: OSC 52 is the
+portable path and some terminals disable it. The panel reports a failed copy
+instead of pretending to have copied.
+
+The session narrative costs model calls. It is debounced, delta-fed, gated
+behind admission control, and can be turned off entirely; a panel that is
+expensive to keep open would not be kept open.
+
 ## Acceptance criteria
 
 Track 1 is complete when the footer names the current task during a run, names
@@ -154,6 +250,13 @@ Track 2 is complete when the overlay toggles and returns focus cleanly, renders
 the run tree and the idle tree from their respective feeders, opens both a
 candidate diff and a working-tree file in a bounded content view, and survives a
 failing feeder by degrading the affected section rather than the session.
+
+Track 3 is complete when tabs cycle and the active tab, width, and expansion
+survive a restart; `/`, `n`, `N` search the visible rows; `y` copies a row;
+the Memory tab reports this session's counts (and says so when Blackhole is
+off); and the Session tab shows a model-generated narrative that is debounced,
+skipped during a gateway cooldown, labeled as generated, absent from the
+ledger, and left intact with its timestamp when an update fails.
 
 ## Testing
 

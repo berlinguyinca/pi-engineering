@@ -41,7 +41,7 @@
 
 **Priority scheme (read this before editing `layout.ts`):** in the existing renderer a *lower* priority number is dropped *first*, and the elision stages filter `priority >= N`. Current numbers: directory 0, repository 1, worktree 2, branch 3, model 4, throughput 5. This task adds task 6 and wait 7, making the wait segment the irreducible core.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Append to `test/unit/status-layout.test.ts`:
 
@@ -109,12 +109,12 @@ test("showWait=false hides the segment even while waiting", () => {
 });
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `node --test test/unit/status-layout.test.ts`
 Expected: FAIL — `renderStatus` takes 3 arguments and knows nothing about `wait`; TypeScript also rejects `wait` on `HarnessStatusState`.
 
-- [ ] **Step 3: Add the state types**
+- [x] **Step 3: Add the state types**
 
 In `src/status/state.ts`, above `HarnessStatusState`:
 
@@ -148,7 +148,7 @@ Then add to `HarnessStatusState`, after `provider`:
   wait?: WaitState;
 ```
 
-- [ ] **Step 4: Add the config toggles**
+- [x] **Step 4: Add the config toggles**
 
 In `src/status/config.ts`: add `showTask: boolean;` and `showWait: boolean;` to `StatusBarConfig` (after `showModel`), add `showTask: true, showWait: true,` to `DEFAULT_STATUS_BAR_CONFIG`, add to `ENV`:
 
@@ -164,7 +164,7 @@ and to the object returned by `resolveStatusBarConfig`:
     showWait: bool(env[ENV.wait], base.showWait),
 ```
 
-- [ ] **Step 5: Render the segment**
+- [x] **Step 5: Render the segment**
 
 In `src/status/layout.ts`, change both signatures to accept the clock:
 
@@ -230,12 +230,12 @@ Import the type: change the existing type import to `import type { HarnessStatus
 
 Update the stale comment above the irreducible-core fallback to name the wait segment rather than model + tps.
 
-- [ ] **Step 6: Run the tests to verify they pass**
+- [x] **Step 6: Run the tests to verify they pass**
 
 Run: `node --test test/unit/status-layout.test.ts`
 Expected: PASS, including the pre-existing tests (the 4th parameter is optional, so no existing call site changes).
 
-- [ ] **Step 7: Verify and commit**
+- [x] **Step 7: Verify and commit**
 
 ```bash
 npm run lint && npm run typecheck && npm test
@@ -255,7 +255,7 @@ git commit -m "feat(status): render why the runtime is waiting"
 - Consumes: `TaskState`, `StatusBarConfig.showTask`, `renderStatus(state, width, config, nowMs)` from Task 1.
 - Produces: no new exports; the task segment renders at priority 6 (below wait, above throughput).
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```ts
 test("task segment names the work item and phase", () => {
@@ -298,12 +298,12 @@ test("no task renders no task segment", () => {
 });
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `node --test test/unit/status-layout.test.ts`
 Expected: FAIL — no task segment is rendered.
 
-- [ ] **Step 3: Render the segment**
+- [x] **Step 3: Render the segment**
 
 In `renderUnsafe`, after the throughput block and before the wait block:
 
@@ -329,12 +329,12 @@ function formatTask(task: TaskState, labelBudget: number): string {
 
 Extend the type import: `import type { HarnessStatusState, TaskState, WaitState } from "./state.ts";`
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `node --test test/unit/status-layout.test.ts`
 Expected: PASS.
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
 ```bash
 npm run lint && npm run typecheck && npm test
@@ -361,7 +361,7 @@ git commit -m "feat(status): render the engineering task in flight"
 
 **Why a `subscribe` is needed:** `AdmissionController` currently supports exactly one `onEvent` callback, and `sharedAdmissionController()` already spends it on telemetry. The footer is a second consumer, so the controller needs real multi-subscriber support; `onEvent` stays as the constructor-level hook.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Append to `test/unit/gateway-admission.test.ts`:
 
@@ -431,12 +431,12 @@ test("a gateway wait event becomes footer wait state and clears when it expires"
 });
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `node --test test/unit/gateway-admission.test.ts test/unit/status-lifecycle.test.ts`
 Expected: FAIL — `subscribe`, `onGatewayEvent`, and `tickWait` do not exist.
 
-- [ ] **Step 3: Add `subscribe` to the controller**
+- [x] **Step 3: Add `subscribe` to the controller**
 
 In `src/gateway/AdmissionController.ts`, add a field and method, and route every emission through one place:
 
@@ -468,7 +468,7 @@ In `src/gateway/AdmissionController.ts`, add a field and method, and route every
 
 Replace all three existing `this.onEvent?.({ ... })` calls (`clamp`, `wait`, `relax`) with `this.emit({ ... })`. Clear `this.listeners` in no new place — the controller is process-wide and outlives its observers, so unsubscribing is the observer's job.
 
-- [ ] **Step 4: Add wait handling to the footer**
+- [x] **Step 4: Add wait handling to the footer**
 
 In `src/status/footer.ts`, add a `waitTimer` field beside `renderTimer`, and:
 
@@ -530,7 +530,7 @@ Declare the field as `private waitTimer: ReturnType<typeof setInterval> | null =
       line = renderStatus(this.status.snapshot, width, this.config, this.now());
 ```
 
-- [ ] **Step 5: Wire it in the extension**
+- [x] **Step 5: Wire it in the extension**
 
 In `extensions/index.ts`, inside the `session_start` handler where `activeFooter` is created, subscribe the new footer to the shared controller and keep the unsubscribe so it dies with the session:
 
@@ -558,12 +558,12 @@ Declare `const footerUnsubscribes: Array<() => void> = [];` beside `activeFooter
 
 Note the ordering constraint: the gateway block currently sits *below* the status-bar block in the file, so hoist `const gatewayConfig = sharedGatewayConfig();` above the status-bar block, leaving one declaration used by both.
 
-- [ ] **Step 6: Run the tests to verify they pass**
+- [x] **Step 6: Run the tests to verify they pass**
 
 Run: `node --test test/unit/gateway-admission.test.ts test/unit/status-lifecycle.test.ts`
 Expected: PASS.
 
-- [ ] **Step 7: Verify and commit**
+- [x] **Step 7: Verify and commit**
 
 ```bash
 npm run lint && npm run typecheck && npm test && npm run test:e2e
@@ -590,7 +590,7 @@ git commit -m "feat(status): show gateway backoff in the footer with a live coun
   - `FooterController.setTask(task: TaskState | undefined): void`
   - `FooterController.setProducingModel(model: string | undefined): void`
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Append to `test/unit/status-lifecycle.test.ts`:
 
@@ -671,12 +671,12 @@ copy that body verbatim rather than the abbreviated version above if the run
 needs a real diff. This test only asserts on phases, so a no-op implementer is
 sufficient.
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `node --test test/unit/status-lifecycle.test.ts test/integration/vertical-slice.test.ts`
 Expected: FAIL — `setTask`, `setProducingModel`, and `onPhase` do not exist.
 
-- [ ] **Step 3: Add the runtime hook**
+- [x] **Step 3: Add the runtime hook**
 
 In `src/runtime/EngineeringRuntime.ts`, export the event type above `EngineeringRuntimeOptions`:
 
@@ -716,7 +716,7 @@ Store it on the instance, and add one private emitter used at each pipeline stag
 
 Call `this.emitPhase({ workItemId, phase: "scout", goal })` (and `"implement"`, `"verify"`, `"review"`) at the start of each stage inside `engineer()`, and `this.emitPhase({ workItemId, phase: "settled", goal })` in a `finally` so the footer clears even when the run throws.
 
-- [ ] **Step 4: Add the footer methods**
+- [x] **Step 4: Add the footer methods**
 
 In `src/status/footer.ts`:
 
@@ -741,7 +741,7 @@ In `src/status/footer.ts`:
 
 Import `TaskState`.
 
-- [ ] **Step 5: Wire it in the extension**
+- [x] **Step 5: Wire it in the extension**
 
 In `extensions/index.ts`, inside `getRuntimeByCwd`'s `EngineeringRuntime.open({ ... })` call, add:
 
@@ -759,12 +759,12 @@ In `extensions/index.ts`, inside `getRuntimeByCwd`'s `EngineeringRuntime.open({ 
     },
 ```
 
-- [ ] **Step 6: Run the tests to verify they pass**
+- [x] **Step 6: Run the tests to verify they pass**
 
 Run: `node --test test/unit/status-lifecycle.test.ts test/integration/vertical-slice.test.ts`
 Expected: PASS.
 
-- [ ] **Step 7: Document the new surface**
+- [x] **Step 7: Document the new surface**
 
 In `README.md`, in the status-bar section, show the new line and add the two env vars to the table:
 
@@ -775,7 +775,7 @@ In `README.md`, in the status-bar section, show the new line and add the two env
 | `PI_STATUS_BAR_SHOW_TASK` | `true` | Show the engineering task in flight |
 | `PI_STATUS_BAR_SHOW_WAIT` | `true` | Show why the runtime is waiting |
 
-- [ ] **Step 8: Verify and commit**
+- [x] **Step 8: Verify and commit**
 
 ```bash
 npm run lint && npm run typecheck && npm test && npm run test:e2e
