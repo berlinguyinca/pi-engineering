@@ -51,7 +51,9 @@ test("component: a very long path is truncated, not wrapped", () => {
   });
   const component = new PanelComponent({ state, requestRender: () => {} });
   const lines = component.render(40);
-  assert.equal(lines.length, component.rows.length, "one line per row: no wrapping");
+  // One line per row, plus the tab bar track 3 prepends. The invariant is that
+  // a long path costs exactly one line, never two.
+  assert.equal(lines.length, component.rows.length + 1, "one line per row: no wrapping");
   for (const line of lines) assert.ok(visibleWidth(line) <= 40);
   component.dispose();
 });

@@ -11,7 +11,8 @@
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { PanelState } from "./PanelState.ts";
 import type { ContentView } from "./content.ts";
-import { type PanelRow, type RowPayload, buildRows, clampSelection } from "./tree.ts";
+import { DEFAULT_LAYOUT, type PanelLayout, type PanelTabId, stepTab, stepWidth } from "./layout.ts";
+import { type PanelRow, type RowPayload, buildRows, clampSelection, renderTabBar } from "./tree.ts";
 
 /** Sections start open: the panel is most useful showing everything at once. */
 const INITIALLY_EXPANDED = ["run", "files", "findings", "spend", "workspace"];
@@ -21,6 +22,8 @@ const KEY_DOWN = "\x1b[B";
 const KEY_RIGHT = "\x1b[C";
 const KEY_LEFT = "\x1b[D";
 const KEY_ESCAPE = "\x1b";
+const KEY_TAB = "\t";
+const KEY_SHIFT_TAB = "\x1b[Z";
 
 export interface PanelComponentOptions {
   state: PanelState;
@@ -30,6 +33,10 @@ export interface PanelComponentOptions {
   openRow?: (payload: RowPayload) => void;
   /** Close the panel (escape with no content view open). */
   onClose?: () => void;
+  /** Layout to open with (tab, width, expansion). Defaults apply when omitted. */
+  layout?: PanelLayout;
+  /** Called whenever the operator changes tab, width, or expansion. */
+  onLayoutChange?: (layout: PanelLayout) => void;
 }
 
 export class PanelComponent {
@@ -37,9 +44,17 @@ export class PanelComponent {
   private readonly requestRenderFn: () => void;
   private readonly openRow: ((payload: RowPayload) => void) | undefined;
   private readonly onClose: (() => void) | undefined;
+  private readonly onLayoutChange: ((layout: PanelLayout) => void) | undefined;
   private readonly unsubscribe: () => void;
 
-  private expanded = new Set<string>(INITIALLY_EXPANDED);
+  /**
+   * Expansion lives here rather than in `PanelState` on purpose: it is a `Set`,
+   * and `PanelState.set()` no-ops on `JSON.stringify` equality, which does not
+   * compare Sets. The layout store reads it out through `onLayoutChange`.
+   */
+  private expanded: Set<string>;
+  private activeTab: PanelTabId;
+  private width: number;
   private currentRows: PanelRow[] = [];
   private selection = 0;
   private content: ContentView | null = null;
@@ -50,8 +65,30 @@ export class PanelComponent {
     this.requestRenderFn = opts.requestRender;
     this.openRow = opts.openRow;
     this.onClose = opts.onClose;
+    this.onLayoutChange = opts.onLayoutChange;
+    const layout = opts.layout;
+    // With no persisted layout, sections start open: the panel is most useful
+    // showing everything at once the first time it is opened.
+    this.expanded = new Set<string>(layout ? layout.expanded : INITIALLY_EXPANDED);
+    this.activeTab = layout?.tab ?? DEFAULT_LAYOUT.tab;
+    this.width = layout?.widthPercent ?? DEFAULT_LAYOUT.widthPercent;
     this.unsubscribe = this.state.subscribe(() => this.requestRenderFn());
     this.refreshRows();
+  }
+
+  /** The active tab. */
+  get tab(): PanelTabId {
+    return this.activeTab;
+  }
+
+  /** The overlay width the operator has chosen, as a percentage of columns. */
+  get widthPercent(): number {
+    return this.width;
+  }
+
+  /** Expanded section ids, for persistence. */
+  get expandedIds(): string[] {
+    return [...this.expanded].sort();
   }
 
   /** The rows currently shaped from state (test seam). */
@@ -96,6 +133,18 @@ export class PanelComponent {
     }
 
     switch (data) {
+      case KEY_TAB:
+        this.changeTab(1);
+        return;
+      case KEY_SHIFT_TAB:
+        this.changeTab(-1);
+        return;
+      case ">":
+        this.changeWidth(1);
+        return;
+      case "<":
+        this.changeWidth(-1);
+        return;
       case KEY_UP:
         this.move(-1);
         return;
@@ -134,12 +183,13 @@ export class PanelComponent {
 
   private renderTree(width: number): string[] {
     this.refreshRows();
-    return this.currentRows.map((row, index) => {
+    const body = this.currentRows.map((row, index) => {
       const cursor = index === this.selection ? "›" : " ";
       const indent = "  ".repeat(row.depth);
       const glyph = row.glyph ? `${row.glyph} ` : "";
       return truncateToWidth(`${cursor}${indent}${glyph}${row.label}`, width, "…");
     });
+    return [renderTabBar(this.activeTab, width), ...body];
   }
 
   private renderContent(width: number): string[] {
@@ -157,8 +207,30 @@ export class PanelComponent {
   // ─── Navigation ───────────────────────────────────────────────────────────
 
   private refreshRows(): void {
-    this.currentRows = buildRows(this.state.snapshot, this.expanded);
+    this.currentRows = buildRows(this.state.snapshot, this.expanded, this.activeTab);
     this.selection = clampSelection(this.currentRows, this.selection);
+  }
+
+  private changeTab(direction: -1 | 1): void {
+    this.activeTab = stepTab(this.activeTab, direction);
+    // A tab is a different row list, so the cursor starts at its top rather
+    // than landing on whatever index happened to be selected before.
+    this.selection = 0;
+    this.refreshRows();
+    this.publishLayout();
+    this.requestRenderFn();
+  }
+
+  private changeWidth(direction: -1 | 1): void {
+    const next = stepWidth(this.width, direction);
+    if (next === this.width) return;
+    this.width = next;
+    this.publishLayout();
+    this.requestRenderFn();
+  }
+
+  private publishLayout(): void {
+    this.onLayoutChange?.({ widthPercent: this.width, tab: this.activeTab, expanded: this.expandedIds });
   }
 
   private move(delta: number): void {
@@ -176,6 +248,7 @@ export class PanelComponent {
     if (row.payload.kind === "section") {
       this.expanded.add(row.payload.id);
       this.refreshRows();
+      this.publishLayout();
       this.requestRenderFn();
       return;
     }
@@ -188,6 +261,7 @@ export class PanelComponent {
     if (row.payload.kind === "section") {
       this.expanded.delete(row.payload.id);
       this.refreshRows();
+      this.publishLayout();
       this.requestRenderFn();
     }
   }

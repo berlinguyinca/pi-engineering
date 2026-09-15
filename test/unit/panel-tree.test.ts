@@ -33,20 +33,23 @@ const runState: PanelStateShape = {
 
 const allExpanded = new Set(["run", "files", "findings", "spend", "workspace"]);
 
-test("tree: a run renders work item, files, findings and spend", () => {
-  const rows = buildRows(runState, allExpanded);
-  const labels = rows.map((r) => r.label);
-  assert.ok(
-    labels.some((l) => l.includes("WI-12")),
-    labels.join("|"),
-  );
-  assert.ok(labels.some((l) => l.includes("src/gateway/signals.ts")));
-  assert.ok(labels.some((l) => l.includes("retry loop can spin")));
-  assert.ok(labels.some((l) => l.includes("opus-5")));
+test("tree: a run renders its work item, files, findings and spend across the tabs", () => {
+  // Track 3 split these across tabs: each tab is a different view of one state,
+  // and the run header orients every tab that describes a run.
+  const labelsOn = (tab: "files" | "reviews" | "tokens") =>
+    buildRows(runState, allExpanded, tab)
+      .map((r) => r.label)
+      .join("|");
+  for (const tab of ["files", "reviews", "tokens"] as const) {
+    assert.match(labelsOn(tab), /WI-12/, `${tab} tab lost the run header`);
+  }
+  assert.match(labelsOn("files"), /src\/gateway\/signals\.ts/);
+  assert.match(labelsOn("reviews"), /retry loop can spin/);
+  assert.match(labelsOn("tokens"), /opus-5/);
 });
 
 test("tree: a finding carries its severity, reviewing role and model", () => {
-  const rows = buildRows(runState, allExpanded);
+  const rows = buildRows(runState, allExpanded, "reviews");
   const finding = rows.find((r) => r.payload.kind === "finding");
   assert.ok(finding, "no finding row");
   assert.match(finding.label, /high/i);
@@ -64,6 +67,7 @@ test("tree: an unattributed finding renders without inventing a reviewer", () =>
       },
     },
     allExpanded,
+    "reviews",
   );
   const finding = rows.find((r) => r.payload.kind === "finding");
   assert.ok(finding);

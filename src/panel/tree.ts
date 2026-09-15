@@ -8,7 +8,9 @@
  * without a terminal.
  */
 
+import { truncateToWidth } from "@earendil-works/pi-tui";
 import type { PanelFileEntry, PanelFinding, PanelSpend, PanelStateShape } from "./PanelState.ts";
+import { PANEL_TABS, type PanelTabId } from "./layout.ts";
 
 export type RowPayload =
   | { kind: "section"; id: string }
@@ -29,6 +31,24 @@ export interface PanelRow {
 
 /** Collapsible section ids, in render order. */
 export const SECTION_IDS = ["files", "findings", "spend", "workspace"] as const;
+
+/** Human labels for the tab bar, in `PANEL_TABS` order. */
+const TAB_LABELS: Record<PanelTabId, string> = {
+  files: "Files",
+  reviews: "Reviews",
+  tokens: "Tokens",
+  session: "Session",
+  memory: "Memory",
+};
+
+/**
+ * The tab bar, as one line. Truncated like every other row: the panel never
+ * wraps, so a narrow panel shows the tabs that fit and nothing more.
+ */
+export function renderTabBar(active: PanelTabId, width: number): string {
+  const line = PANEL_TABS.map((tab) => (tab === active ? `[${TAB_LABELS[tab]}]` : ` ${TAB_LABELS[tab]} `)).join("");
+  return truncateToWidth(line, Math.max(0, width), "…");
+}
 
 const OPEN = "▾";
 const SHUT = "▸";
@@ -94,16 +114,26 @@ function spendRow(spend: PanelSpend): PanelRow {
 }
 
 /**
- * Build the rows for a state snapshot.
+ * Build the rows for a state snapshot, for one tab.
  *
  * Sections render whether or not they have children, so a run with no findings
  * yet reads as "reviewed nothing so far" rather than looking broken.
+ *
+ * The tab argument is not optional in spirit: each tab is a different view of
+ * the same state, and a caller that wants findings has to ask for the Reviews
+ * tab. It defaults to Files only so a caller with no tab concept still renders
+ * something sensible.
  */
-export function buildRows(state: Readonly<PanelStateShape>, expanded: ReadonlySet<string>): PanelRow[] {
+export function buildRows(
+  state: Readonly<PanelStateShape>,
+  expanded: ReadonlySet<string>,
+  tab: PanelTabId = "files",
+): PanelRow[] {
   const rows: PanelRow[] = [];
-
   const run = state.run;
-  if (run) {
+
+  // The run header orients every tab that describes a run.
+  if (run && tab !== "session" && tab !== "memory") {
     rows.push({
       depth: 0,
       glyph: "●",
@@ -111,35 +141,46 @@ export function buildRows(state: Readonly<PanelStateShape>, expanded: ReadonlySe
       payload: { kind: "section", id: "run" },
       selectable: true,
     });
-
-    rows.push(section("files", "Changed files", run.files.length, expanded));
-    if (expanded.has("files")) for (const file of run.files) rows.push(fileRow(file, "run"));
-
-    rows.push(section("findings", "Reviews", run.findings.length, expanded));
-    if (expanded.has("findings")) for (const finding of run.findings) rows.push(findingRow(finding));
-
-    rows.push(section("spend", "Tokens", run.spend.length, expanded));
-    if (expanded.has("spend")) for (const spend of run.spend) rows.push(spendRow(spend));
   }
 
-  const workspace = state.workspace;
-  if (workspace) {
-    const label = workspace.branch ? `Working tree · ${workspace.branch}` : "Working tree";
-    rows.push(section("workspace", label, workspace.files.length, expanded));
-    if (expanded.has("workspace")) {
-      for (const file of workspace.files) rows.push(fileRow(file, "workspace"));
-      if (workspace.contextTokens != null) {
-        const percent = workspace.contextPercent != null ? ` (${workspace.contextPercent}%)` : "";
-        rows.push({
-          depth: 1,
-          glyph: "·",
-          label: `context ${workspace.contextTokens} tok${percent}`,
-          payload: { kind: "spend", model: "context" },
-          selectable: false,
-        });
-      }
+  if (tab === "files") {
+    if (run) {
+      rows.push(section("files", "Changed files", run.files.length, expanded));
+      if (expanded.has("files")) for (const file of run.files) rows.push(fileRow(file, "run"));
+    }
+    const workspace = state.workspace;
+    if (workspace) {
+      const label = workspace.branch ? `Working tree · ${workspace.branch}` : "Working tree";
+      rows.push(section("workspace", label, workspace.files.length, expanded));
+      if (expanded.has("workspace")) for (const file of workspace.files) rows.push(fileRow(file, "workspace"));
     }
   }
+
+  if (tab === "reviews" && run) {
+    rows.push(section("findings", "Reviews", run.findings.length, expanded));
+    if (expanded.has("findings")) for (const finding of run.findings) rows.push(findingRow(finding));
+  }
+
+  if (tab === "tokens") {
+    if (run) {
+      rows.push(section("spend", "Tokens", run.spend.length, expanded));
+      if (expanded.has("spend")) for (const spend of run.spend) rows.push(spendRow(spend));
+    }
+    const workspace = state.workspace;
+    if (workspace?.contextTokens != null) {
+      const percent = workspace.contextPercent != null ? ` (${workspace.contextPercent}%)` : "";
+      rows.push({
+        depth: 0,
+        glyph: "·",
+        label: `context ${workspace.contextTokens} tok${percent}`,
+        payload: { kind: "spend", model: "context" },
+        selectable: false,
+      });
+    }
+  }
+
+  if (tab === "session") rows.push(...sessionRows(state));
+  if (tab === "memory") rows.push(...memoryRows(state));
 
   // Errors render alongside everything else: a broken feeder marks its own
   // section without taking the rest of the panel down with it.
@@ -157,13 +198,50 @@ export function buildRows(state: Readonly<PanelStateShape>, expanded: ReadonlySe
     rows.push({
       depth: 0,
       glyph: "",
-      label: "Nothing to show yet — run /engineer, or edit a file.",
+      label: emptyLabel(tab),
       payload: { kind: "empty" },
       selectable: false,
     });
   }
 
   return rows;
+}
+
+function emptyLabel(tab: PanelTabId): string {
+  switch (tab) {
+    case "reviews":
+      return "No reviews yet — findings appear here once a reviewer runs.";
+    case "tokens":
+      return "No spend recorded yet.";
+    default:
+      return "Nothing to show yet — run /engineer, or edit a file.";
+  }
+}
+
+/** The Session tab. Task 7 fills this with the generated narrative. */
+function sessionRows(_state: Readonly<PanelStateShape>): PanelRow[] {
+  return [
+    {
+      depth: 0,
+      glyph: "",
+      label: "No session narrative yet.",
+      payload: { kind: "empty" },
+      selectable: false,
+    },
+  ];
+}
+
+/** The Memory tab. Task 5 fills this from Blackhole telemetry. */
+function memoryRows(_state: Readonly<PanelStateShape>): PanelRow[] {
+  return [
+    {
+      depth: 0,
+      glyph: "",
+      label: "Memory counts unavailable.",
+      payload: { kind: "empty" },
+      selectable: false,
+    },
+  ];
 }
 
 /**
