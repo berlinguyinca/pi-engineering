@@ -354,3 +354,44 @@ test("lifecycle: a gateway wait with no queue numbers omits them rather than gue
     controller.dispose();
   }
 });
+
+test("lifecycle: the spinner actually advances through the footer's own render path", () => {
+  // The layout test drives renderStatus directly with a synthetic clock, so it
+  // cannot see the footer's render coalescing. This one goes through the real
+  // path: the wait tick must be frequent enough, and the coalescing floor
+  // (refreshMs) low enough, that consecutive ticks land on different frames.
+  const h = makeHarness();
+  let now = 1_000;
+  const controller = new FooterController({
+    ctx: h.ctx as never,
+    config: { ...DEFAULT_STATUS_BAR_CONFIG, refreshMs: 150 },
+    now: () => now,
+  });
+  try {
+    controller.setWait({ kind: "gateway", detail: "queue_timeout", untilMs: 600_000, queued: 30, queueLimit: 100 });
+    const frames = new Set<string>();
+    for (let i = 0; i < 4; i++) {
+      now += 250; // one WAIT_TICK_MS
+      controller.tickWait();
+      const line = h.footer?.render(200).join("") ?? "";
+      const frame = /[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/.exec(line)?.[0];
+      if (frame) frames.add(frame);
+    }
+    assert.ok(frames.size >= 3, `spinner is throttled: only ${frames.size} distinct frames in 4 ticks`);
+  } finally {
+    controller.dispose();
+  }
+});
+
+test("lifecycle: the queue position reaches the rendered footer line", () => {
+  const h = makeHarness();
+  const controller = new FooterController({ ctx: h.ctx as never, config: cfg, now: () => 1_000 });
+  try {
+    controller.setWait({ kind: "gateway", detail: "queue_timeout", untilMs: 31_000, queued: 30, queueLimit: 100 });
+    const line = h.footer?.render(200).join("") ?? "";
+    assert.match(line, /queue 30\/100/);
+    assert.ok(visibleWidth(line) <= 200);
+  } finally {
+    controller.dispose();
+  }
+});
