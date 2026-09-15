@@ -82,8 +82,28 @@ export interface GatewayStreamRetryOptions {
   maxAttempts?: number;
   /** Ceiling on a SYNTHESIZED wait. Advertised waits are honoured exactly. */
   maxEscalatedWaitMs?: number;
+  /**
+   * Consecutive saturated attempts that happened BEFORE this call, used to
+   * continue the escalation rather than restart it.
+   *
+   * The agent loop makes one provider call per tool round-trip, and an outage
+   * outlives a turn. Escalating from `attempt` alone would reset to the base
+   * wait on every call, which is the busy-wait the escalation exists to avoid.
+   * Read once at entry, so a hold taken during this call is not counted twice.
+   */
+  priorHolds?: number;
   /** Observe each hold (status bar, telemetry). */
   onHold?(info: { attempt: number; signal: GatewayWaitSignal; errorText: string }): void;
+  /**
+   * Called synchronously the first time anything reaches the sink — the gateway
+   * served us, so an escalation ladder can reset.
+   *
+   * Deliberately not the returned outcome: the caller learns that one microtask
+   * after `end()` resolves the stream's result, and the agent loop issues its
+   * next provider call in between. A reset that arrives late is a reset that
+   * never happens.
+   */
+  onProgress?(): void;
 }
 
 export interface GatewayStreamRetryOutcome {
@@ -91,6 +111,8 @@ export interface GatewayStreamRetryOutcome {
   attempts: number;
   /** How many times a wait was honoured. */
   holds: number;
+  /** How the stream finished. `"ok"` is what resets an escalation. */
+  settled: "ok" | "error" | "aborted";
 }
 
 /** Default ceiling for a wait we invented rather than were told. */
@@ -131,11 +153,20 @@ export async function pumpWithGatewayRetry<E extends RetryableEvent, R extends R
 ): Promise<GatewayStreamRetryOutcome> {
   const maxAttempts = opts.maxAttempts ?? Number.POSITIVE_INFINITY;
   const capMs = opts.maxEscalatedWaitMs ?? MAX_ESCALATED_WAIT_MS;
+  const priorHolds = opts.priorHolds ?? 0;
   let holds = 0;
+  let progressed = false;
 
   for (let attempt = 1; ; attempt++) {
     /** Any non-terminal event forwarded: from here a retry would duplicate. */
     let forwarded = false;
+    const emit = (event: E): void => {
+      if (!progressed) {
+        progressed = true;
+        opts.onProgress?.();
+      }
+      sink.push(event);
+    };
     /** A terminal error held back while a retry is still possible. */
     let withheld: E | undefined;
     let result: R | undefined;
@@ -151,11 +182,11 @@ export async function pumpWithGatewayRetry<E extends RetryableEvent, R extends R
             withheld = event;
             continue;
           }
-          sink.push(event);
+          emit(event);
           continue;
         }
         forwarded = true;
-        sink.push(event);
+        emit(event);
       }
       result = await inner.result();
     } catch (err) {
@@ -168,7 +199,7 @@ export async function pumpWithGatewayRetry<E extends RetryableEvent, R extends R
     const retryable = wait?.retryable === true && attempt < maxAttempts;
 
     if (retryable && wait) {
-      const held = waitFor(wait, attempt, capMs);
+      const held = waitFor(wait, attempt + priorHolds, capMs);
       opts.onHold?.({ attempt, signal: held, errorText: failure });
       holds++;
       await opts.hold(held, attempt);
@@ -177,7 +208,7 @@ export async function pumpWithGatewayRetry<E extends RetryableEvent, R extends R
       // interrupted, so callers never have to care when cancellation landed.
       if (opts.signal?.aborted) {
         sink.end(abortedFrom(result));
-        return { attempts: attempt, holds };
+        return { attempts: attempt, holds, settled: "aborted" };
       }
       continue;
     }
@@ -187,7 +218,8 @@ export async function pumpWithGatewayRetry<E extends RetryableEvent, R extends R
     if (thrown !== undefined) throw thrown;
     if (withheld) sink.push(withheld);
     sink.end(result);
-    return { attempts: attempt, holds };
+    const settled = isAbort ? "aborted" : result?.stopReason === "error" ? "error" : "ok";
+    return { attempts: attempt, holds, settled };
   }
 }
 

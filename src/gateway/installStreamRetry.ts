@@ -40,7 +40,13 @@ export interface ProviderLike<M, C, O> {
 export interface ProviderHost<M, C, O> {
   getProvider(providerId: string): ProviderLike<M, C, O> | undefined;
   getRegisteredProviderConfig?(providerId: string): Record<string, unknown> | undefined;
-  registerProvider(providerId: string, config: Record<string, unknown>): void;
+  /**
+   * Overloaded on a real `ModelRegistry`: `(id, config)` registers an extension
+   * config, `(provider)` registers a native provider. Both are used here.
+   */
+  registerProvider(providerId: string | ProviderLike<M, C, O>, config?: Record<string, unknown>): void;
+  /** Present on a real `ModelRegistry`; absent on minimal hosts. */
+  getRegisteredNativeProvider?(providerId: string): ProviderLike<M, C, O> | undefined;
 }
 
 export interface InstallDeps<M, O> {
@@ -94,17 +100,39 @@ export function installGatewayStreamRetry<M, C, O>(
   const key = `${target.provider}:${target.api}`;
   if (installed.has(key)) return "already-installed";
 
-  const base = host.getProvider(target.provider);
+  // A provider another extension registered via `registerNativeProvider` needs
+  // the other install path entirely: `registerProvider` DELETES it
+  // (model-runtime.js:562), which silently empties its model catalogue. Checked
+  // against a real registry, not assumed — a built-in keeps all its models
+  // across `registerProvider`, a native extension provider loses every one.
+  const native = host.getRegisteredNativeProvider?.(target.provider);
+  const base = native ?? host.getProvider(target.provider);
   if (!base) return "no-provider";
   // Captured BEFORE registration: this reference reaches the real transport.
   const baseStream = base.streamSimple?.bind(base);
   if (!baseStream) return "no-base-stream";
 
+  // Consecutive saturated attempts for THIS provider, across provider calls.
+  // The agent loop issues one call per tool round-trip and an outage outlives a
+  // turn, so an escalation scoped to a single call would restart at the base
+  // wait every few seconds — exactly the busy-wait it exists to prevent. A
+  // stream that completes normally means capacity is back, so it resets.
+  let consecutiveHolds = 0;
+
   const streamSimple = (model: M, context: C, options?: O) => {
     const out = deps.createStream();
     const signal = deps.signalOf?.(options);
     void pumpWithGatewayRetry(() => baseStream(model, context, options), out, {
-      hold: (waitSignal, attempt) => deps.hold(waitSignal, attempt, signal),
+      hold: (waitSignal, attempt) => {
+        consecutiveHolds++;
+        return deps.hold(waitSignal, attempt, signal);
+      },
+      priorHolds: consecutiveHolds,
+      // Synchronous, unlike the outcome: the agent loop starts its next
+      // provider call before a `.then` on this pump would run.
+      onProgress: () => {
+        consecutiveHolds = 0;
+      },
       ...(deps.onHold ? { onHold: deps.onHold } : {}),
       ...(signal ? { signal } : {}),
       ...(deps.maxEscalatedWaitMs != null ? { maxEscalatedWaitMs: deps.maxEscalatedWaitMs } : {}),
@@ -118,10 +146,20 @@ export function installGatewayStreamRetry<M, C, O>(
     return out;
   };
 
-  // Carry any existing extension config forward: registering replaces it.
-  const existing = host.getRegisteredProviderConfig?.(target.provider) ?? {};
   try {
-    host.registerProvider(target.provider, { ...existing, api: target.api, streamSimple });
+    if (native) {
+      // Re-register the SAME provider with only its transport swapped, so its
+      // models, auth and login flow are carried over untouched. Copying via the
+      // prototype keeps class-based providers working. `registerProvider` with
+      // a single provider argument is the native overload — the two-argument
+      // form is what would have deleted this provider.
+      const wrapped = Object.assign(Object.create(Object.getPrototypeOf(native) ?? null), native, { streamSimple });
+      host.registerProvider(wrapped);
+    } else {
+      // Carry any existing extension config forward: registering replaces it.
+      const existing = host.getRegisteredProviderConfig?.(target.provider) ?? {};
+      host.registerProvider(target.provider, { ...existing, api: target.api, streamSimple });
+    }
   } catch {
     // A rejected config must not take the session down — the operator keeps
     // Pi's own (shorter) retry rather than losing the provider entirely.

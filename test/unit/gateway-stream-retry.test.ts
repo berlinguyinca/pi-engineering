@@ -316,3 +316,70 @@ test("stream retry: maxAttempts is a usable ceiling for callers that want one", 
     true,
   );
 });
+
+test("stream retry: escalation continues from prior holds instead of restarting", async () => {
+  // The agent loop makes one provider call per tool round-trip, and a gateway
+  // outage outlives a turn. An escalation scoped to one call would drop back to
+  // the base wait every few seconds — the busy-wait it exists to prevent.
+  const s = scripted([[failed(SATURATED)], [done()]]);
+  const h = holds();
+  await pumpWithGatewayRetry(s.open, sink(), { hold: h.hold, priorHolds: 3 });
+
+  assert.equal(h.seen.length, 1);
+  assert.equal(h.seen[0]?.ms, 5_000 * 2 ** 3, "a fresh call must not restart the escalation");
+});
+
+test("stream retry: the outcome says how the stream settled, so callers can reset", async () => {
+  const ok = await pumpWithGatewayRetry(scripted([[done()]]).open, sink(), { hold: holds().hold });
+  assert.equal(ok.settled, "ok");
+
+  const bad = await pumpWithGatewayRetry(scripted([[failed("401 invalid api key")]]).open, sink(), {
+    hold: holds().hold,
+  });
+  assert.equal(bad.settled, "error");
+
+  const stopped = await pumpWithGatewayRetry(scripted([[aborted()]]).open, sink(), { hold: holds().hold });
+  assert.equal(stopped.settled, "aborted");
+});
+
+test("stream retry: progress is reported synchronously, before the result resolves", async () => {
+  // The reset this drives has to beat the agent loop's next provider call. If
+  // it were derived from the returned outcome it would land one microtask after
+  // `end()` — by which time the next call has already read a stale ladder.
+  const order: string[] = [];
+  const s = scripted([[failed(SATURATED)], [text("hi"), done()]]);
+  const out = sink();
+  const originalEnd = out.end;
+
+  await pumpWithGatewayRetry(
+    s.open,
+    {
+      push: out.push,
+      end: (r) => {
+        order.push("end");
+        originalEnd(r);
+      },
+    },
+    { hold: holds().hold, onProgress: () => order.push("progress") },
+  );
+
+  assert.deepEqual(order, ["progress", "end"], "progress must precede the settle, not follow it");
+});
+
+test("stream retry: progress fires once, not per event", async () => {
+  let progress = 0;
+  const s = scripted([[text("a"), text("b"), text("c"), done()]]);
+  await pumpWithGatewayRetry(s.open, sink(), { hold: holds().hold, onProgress: () => progress++ });
+  assert.equal(progress, 1);
+});
+
+test("stream retry: a withheld error alone is not progress", async () => {
+  // Otherwise the very failure being retried would reset the ladder.
+  let progress = 0;
+  const s = scripted([[failed(SATURATED)], [failed(SATURATED)], [done()]]);
+  const h = holds();
+  await pumpWithGatewayRetry(s.open, sink(), { hold: h.hold, onProgress: () => progress++ });
+
+  assert.equal(progress, 1, "only the successful attempt counted as progress");
+  assert.ok(h.seen[1]!.ms > h.seen[0]!.ms, "the ladder kept climbing through the retries");
+});

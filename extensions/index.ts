@@ -344,6 +344,15 @@ ${RECOVERY_PROMPT}`;
 
     // Terminal assistant error: the only place `retry_after_ms` appears, since
     // it lives in the response BODY.
+    //
+    // Note this arms the PROCESS-WIDE cooldown for any retryable signal,
+    // including a bare 503, where the stream wrapper below deliberately holds
+    // only its own caller. The two are not in conflict so much as differently
+    // scoped: by the time an error reaches `message_end` the wrapper has either
+    // declined to retry it or is not installed for this provider, so treating
+    // it as a broader "back off" is the conservative reading. Left as-is
+    // because narrowing it would send MORE traffic at a gateway that just
+    // failed a request.
     pi.on("message_end", async (event, ctx) => {
       const msg = event.message as { role?: string; stopReason?: string; errorMessage?: string } | undefined;
       if (msg?.role !== "assistant" || msg.stopReason !== "error" || !msg.errorMessage) return;

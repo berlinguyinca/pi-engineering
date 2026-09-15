@@ -225,3 +225,38 @@ test("install: a thrown transport failure becomes a terminal error, not an unhan
   assert.match(settled.errorMessage ?? "", /undefined is not a function/);
   assert.equal(stream.pushed.at(-1)?.type, "error", "pi expects a terminal event, never a rejected promise");
 });
+
+test("install: escalation climbs within a call and resets once one succeeds", async () => {
+  resetGatewayStreamRetry();
+  const waits: number[] = [];
+  const streams: Array<ReturnType<typeof fakeStream>> = [];
+  const fail = { type: "error", error: { stopReason: "error", errorMessage: SATURATED } } as Ev;
+  const ok = { type: "done", message: { stopReason: "stop" } } as Ev;
+  // Call 1 rides out two 503s; call 2 hits one more.
+  const h = makeHost([[fail], [fail], [ok], [fail], [ok]]);
+
+  installGatewayStreamRetry(
+    h.host,
+    { provider: "acme", api: "a" },
+    {
+      createStream: () => {
+        const s = fakeStream();
+        streams.push(s);
+        return s;
+      },
+      hold: async (sig: { retryAfterMs: number }) => {
+        waits.push(sig.retryAfterMs);
+      },
+      errorMessage: (_m: unknown, e: unknown) => ({ stopReason: "error", errorMessage: String(e) }),
+    },
+  );
+  const handler = h.registered[0]?.config.streamSimple as (m: unknown, c: unknown) => unknown;
+
+  handler({}, {});
+  assert.equal((await streams[0]!.settled).stopReason, "stop");
+  assert.deepEqual(waits, [5_000, 10_000], "a second failure in the same call waits longer");
+
+  handler({}, {});
+  assert.equal((await streams[1]!.settled).stopReason, "stop");
+  assert.equal(waits[2], 5_000, "a stream that completed means capacity is back — the ladder resets");
+});
