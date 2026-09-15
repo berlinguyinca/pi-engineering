@@ -87,9 +87,24 @@ export function buildNarrativePrompt(deltas: readonly NarrativeDelta[], previous
  *
  * Returns undefined for output that cannot be shown, so the caller keeps the
  * previous narrative rather than replacing it with nothing.
+ *
+ * Over-long output is cut back to the last complete sentence rather than at the
+ * character limit. The prompt asks for three sentences and models routinely
+ * give four, so a hard cut lands mid-word — the first live run produced
+ * "...currently in the midst of th…", which reads as a bug in the panel rather
+ * than a long answer. A cut that loses a whole sentence is honest; one that
+ * loses half a word looks broken. If no sentence boundary sits in the usable
+ * range (one unbroken run-on), fall back to the character cut.
  */
 export function sanitizeNarrative(raw: string, maxChars: number = DEFAULT_MAX_CHARS): string | undefined {
   const collapsed = raw.replace(/\s+/g, " ").trim();
   if (!collapsed) return undefined;
-  return collapsed.length > maxChars ? `${collapsed.slice(0, maxChars - 1)}…` : collapsed;
+  if (collapsed.length <= maxChars) return collapsed;
+
+  const window = collapsed.slice(0, maxChars);
+  const lastStop = Math.max(window.lastIndexOf(". "), window.lastIndexOf("! "), window.lastIndexOf("? "));
+  // Require the boundary to retain a useful amount, or a first sentence of five
+  // words would silently become the whole narrative.
+  if (lastStop >= Math.floor(maxChars / 2)) return window.slice(0, lastStop + 1).trim();
+  return `${collapsed.slice(0, maxChars - 1)}…`;
 }
