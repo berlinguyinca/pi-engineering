@@ -1,6 +1,10 @@
+import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { resolve } from "node:path";
+import { promisify } from "node:util";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
+
+const execFileAsync = promisify(execFile);
 import type { Model } from "@earendil-works/pi-ai/compat";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { resolveMemoryEnvironment } from "../src/blackhole/connectionSetup.ts";
@@ -38,6 +42,8 @@ import { resolveStatusBarConfig } from "../src/status/config.ts";
 import { FooterController } from "../src/status/footer.ts";
 import { renderStatus } from "../src/status/layout.ts";
 import { type CoreServices, buildCoreTools } from "../src/tools/coreTools.ts";
+import { checkForUpdate, shouldCheck } from "../src/update/selfUpdate.ts";
+import { describeUpdate } from "../src/update/versionCheck.ts";
 import { CommandVerifier } from "../src/verify/Verifier.ts";
 import { PiWorkerExecutor } from "../src/workers/PiWorkerExecutor.ts";
 
@@ -333,6 +339,59 @@ ${RECOVERY_PROMPT}`;
   // turn — behind one shared cooldown until the reported wait has elapsed.
   const gatewayConfig = sharedGatewayConfig();
 
+  // ─── Staying current ────────────────────────────────────────────────────
+  // An operator hit the exact failure this package had just fixed, and the
+  // giveaway was a notice in their session that the fix had DELETED — their Pi
+  // was loading a checkout from before the merge, and nothing said so. A fix
+  // that is installed but not loaded is worse than an unfixed bug: the evidence
+  // the operator reports comes from code that no longer exists.
+  //
+  // Auto-apply is on by default (PI_SELF_UPDATE=0 disables; PI_SELF_UPDATE=check
+  // reports without applying), but only ever as a strict fast-forward on a clean
+  // tracking branch — see src/update/versionCheck.ts for what it refuses.
+  const selfUpdateMode = (process.env.PI_SELF_UPDATE ?? "auto").toLowerCase();
+  const selfUpdateEnabled = selfUpdateMode !== "0" && selfUpdateMode !== "false" && selfUpdateMode !== "off";
+  const extensionRoot = resolve(new URL("..", import.meta.url).pathname);
+  let lastUpdateCheckAt: number | undefined;
+
+  const runGit = async (args: string[]) => {
+    const r = await execFileAsync("git", ["-C", extensionRoot, ...args], { timeout: 30_000 }).catch(
+      (err: { code?: number; stdout?: string; stderr?: string; message?: string }) => ({
+        code: typeof err.code === "number" ? err.code : 1,
+        stdout: err.stdout ?? "",
+        stderr: err.stderr ?? err.message ?? "",
+      }),
+    );
+    return { code: (r as { code?: number }).code ?? 0, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
+  };
+
+  const runSelfUpdate = async (apply: boolean) => {
+    lastUpdateCheckAt = Date.now();
+    return checkForUpdate({ cwd: extensionRoot, git: runGit, apply });
+  };
+
+  pi.registerCommand("update", {
+    description: "Check for and apply extension updates (fast-forward only, never over uncommitted work).",
+    handler: async (args: string, ctx: ExtensionCommandContext) => {
+      const check = (args ?? "").includes("--check");
+      const result = await runSelfUpdate(!check);
+      if (result.unavailable) {
+        ctx.ui.notify(`Update check unavailable: ${result.unavailable}`, "info");
+        return;
+      }
+      const lines = [describeUpdate(result.decision, { applied: result.applied })];
+      if (result.observation?.upstream) {
+        lines.push(
+          `branch ${result.observation.branch} tracking ${result.observation.upstream}` +
+            ` · ${result.observation.ahead} ahead, ${result.observation.behind} behind` +
+            (result.observation.dirty ? " · uncommitted changes present" : ""),
+        );
+      }
+      if (result.head) lines.push(`now at ${result.head.slice(0, 12)}`);
+      ctx.ui.notify(lines.join("\n"), result.decision.action === "report" ? "warning" : "info");
+    },
+  });
+
   // Gateway-reported per-model readiness (`slots`, `x_state`). Built lazily and
   // cached per provider: this is consulted on every hold, and holds arrive in
   // bursts exactly when the gateway can least afford extra requests.
@@ -622,6 +681,21 @@ ${RECOVERY_PROMPT}`;
     pi.on("session_start", (_event, ctx) => {
       latestCtx = ctx as ExtensionCommandContext;
       installStreamRetry(ctx, ctx.model);
+
+      // Deliberately not awaited: a session must never wait on a network call
+      // to start, and a failed check is silence rather than a notice.
+      if (selfUpdateEnabled && shouldCheck(lastUpdateCheckAt, Date.now())) {
+        void runSelfUpdate(selfUpdateMode !== "check")
+          .then((result) => {
+            if (result.unavailable) return;
+            // Only speak when there is something to act on. "You are up to
+            // date" every four hours is noise that trains the operator to
+            // ignore the one notice that matters.
+            if (result.decision.action === "current" || result.decision.action === "skip") return;
+            ctx.ui.notify(describeUpdate(result.decision, { applied: result.applied }), "info");
+          })
+          .catch(() => {});
+      }
     });
     pi.on("before_agent_start", (_event, ctx) => {
       latestCtx = ctx as ExtensionCommandContext;

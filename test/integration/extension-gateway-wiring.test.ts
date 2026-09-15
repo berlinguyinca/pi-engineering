@@ -233,3 +233,18 @@ test("wiring: a failing /refresh-models reports that nothing was changed", async
   assert.equal(notices[0]?.level, "error");
   assert.match(notices[0]?.text ?? "", /was not changed/);
 });
+
+test("wiring: /update is registered and reports without mutating anything", async () => {
+  const commands = loadWithCommands();
+  const cmd = commands.get("update");
+  assert.ok(cmd, "/update must be registered");
+
+  const { ctx, notices } = notifyingCtx();
+  await cmd.handler("--check", ctx);
+
+  assert.equal(notices.length, 1);
+  // Whatever this checkout's state, the command must produce a usable line
+  // rather than an exception or a wall of git output.
+  assert.ok((notices[0]?.text ?? "").length > 0);
+  assert.ok((notices[0]?.text ?? "").split("\n").length <= 4, "a notice, not a git transcript");
+});
