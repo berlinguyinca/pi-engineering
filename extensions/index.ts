@@ -1,11 +1,13 @@
 import { createHash } from "node:crypto";
 import { resolve } from "node:path";
+import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import type { Model } from "@earendil-works/pi-ai/compat";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { resolveMemoryEnvironment } from "../src/blackhole/connectionSetup.ts";
 import { openVikingBlackholeOption } from "../src/blackhole/envConfig.ts";
 import { registerInteractiveMemory } from "../src/blackhole/interactiveMemory.ts";
 import { sharedAdmissionController, sharedGatewayConfig } from "../src/gateway/config.ts";
+import { installGatewayStreamRetry } from "../src/gateway/installStreamRetry.ts";
 import { describeGatewayWait, parseGatewayWait } from "../src/gateway/signals.ts";
 import { GitRepo } from "../src/git/GitRepo.ts";
 import { GenerationGuard } from "../src/guard/GenerationGuard.ts";
@@ -333,13 +335,12 @@ ${RECOVERY_PROMPT}`;
       if (signal?.retryable) admission.noteWait(signal);
     });
 
-    // Pi's own session retry stops after `retry.maxRetries` (default 3) and
-    // there is no accessor for it on the extension API, so the interactive turn
-    // can still surface a 429 after three honoured waits even though every
-    // worker now waits indefinitely. Say so once, with the fix, rather than
-    // letting the operator rediscover it each time.
-    let retryAdviceShown = false;
-    let gatewayHolds = 0;
+    // Pi's own session retry stops after `retry.maxRetries` (default 3),
+    // ignores the wait the gateway advertised, and has no accessor on the
+    // extension API. The interactive turn used to die there — "Retry failed
+    // after 3 attempts" — while every worker waited happily. That budget is now
+    // bypassed by wrapping the provider's `streamSimple` (see below), so the
+    // advice notice that used to point operators at .pi/settings.json is gone.
 
     // Terminal assistant error: the only place `retry_after_ms` appears, since
     // it lives in the response BODY.
@@ -356,14 +357,6 @@ ${RECOVERY_PROMPT}`;
         ctx.ui.notify(
           `Model gateway is saturated — holding ${Math.round(waitMs / 1000)}s. ${describeGatewayWait(signal)}`,
           "warning",
-        );
-      }
-      gatewayHolds++;
-      if (gatewayHolds >= 2 && !retryAdviceShown) {
-        retryAdviceShown = true;
-        ctx.ui.notify(
-          'Gateway saturation is being waited out. Engineering workers now wait indefinitely; this interactive turn still stops at Pi\'s own retry budget — raise it with `"retry": { "maxRetries": 100 }` in .pi/settings.json.',
-          "info",
         );
       }
     });
@@ -398,6 +391,77 @@ ${RECOVERY_PROMPT}`;
       const signal = ctx.signal;
       await admission.awaitCooldown(signal ? { signal } : {});
     });
+
+    // ─── Unbounded waiting for the interactive turn ────────────────────────
+    // Everything above holds the turn BEFORE a request and records the wait
+    // after one fails, but it cannot stop Pi from giving up: `retryAssistantCall`
+    // (pi-ai utils/retry.js) retries a failed assistant message `maxRetries`
+    // times — 3 by default — with its own exponential backoff, then surfaces
+    // "Retry failed after 3 attempts".
+    //
+    // `registerProvider(id, { api, streamSimple })` is the one seam that gets
+    // underneath that: `composeModelProvider` dispatches the agent's own
+    // provider call to the handler we supply (provider-composer.js:315-323), so
+    // a wait taken in there costs Pi nothing from its retry budget. Saturation
+    // becomes what it actually is — a slow request, not a failed one.
+    const installStreamRetry = (ctx: { modelRegistry?: unknown; signal?: AbortSignal }, model?: Model<any>): void => {
+      const registry = ctx.modelRegistry as Parameters<typeof installGatewayStreamRetry>[0] | undefined;
+      if (!registry || typeof registry.registerProvider !== "function") return;
+      if (!model?.provider || !model?.api) return;
+      installGatewayStreamRetry(
+        registry,
+        { provider: model.provider, api: model.api },
+        {
+          createStream: () => createAssistantMessageEventStream() as never,
+          // Scope decides which gate. An advertised admission refusal
+          // (`source: "body"` — `retry_after_ms`, `active_limit`, a queue
+          // position) speaks for the whole account, so it parks every caller in
+          // the process behind one cooldown. A bare `503 no worker for model`
+          // speaks for one model: parking workers on healthy models behind it
+          // would turn one model's outage into a runtime-wide stall. Either way
+          // the wait is emitted, so the footer keeps its spinner and countdown.
+          hold: async (waitSignal, _attempt, abort) => {
+            const opts = abort ? { signal: abort } : {};
+            if (waitSignal.source === "body") await admission.noteWaitAndSleep(waitSignal, opts);
+            else await admission.noteCallerWaitAndSleep(waitSignal, opts);
+          },
+          signalOf: (options) => (options as { signal?: AbortSignal } | undefined)?.signal,
+          errorMessage: (m, error) => ({
+            role: "assistant",
+            content: [],
+            api: (m as Model<any>).api,
+            provider: (m as Model<any>).provider,
+            model: (m as Model<any>).id,
+            usage: {
+              input: 0,
+              output: 0,
+              cacheRead: 0,
+              cacheWrite: 0,
+              totalTokens: 0,
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+            },
+            stopReason: "error",
+            errorMessage: error instanceof Error ? error.message : String(error),
+            timestamp: Date.now(),
+          }),
+        },
+      );
+    };
+
+    // Per (provider, api): `composeModelProvider` only dispatches to our
+    // handler when the model's api matches the one registered, so a switch to a
+    // model on a different api needs its own installation.
+    //
+    // Installing is idempotent, so all three hooks are belt-and-braces rather
+    // than redundancy: `session_start` is the normal path, `before_agent_start`
+    // covers a session whose `ctx.model` was not resolved yet (the type admits
+    // undefined), and `model_select` covers a mid-session switch. It has to
+    // land before the first provider call — `before_provider_request` fires
+    // from inside the provider's own stream call, which is already too late for
+    // that request.
+    pi.on("session_start", (_event, ctx) => installStreamRetry(ctx, ctx.model));
+    pi.on("before_agent_start", (_event, ctx) => installStreamRetry(ctx, ctx.model));
+    pi.on("model_select", (event, ctx) => installStreamRetry(ctx, event.model));
   }
 
   // ─── Live status bar: harness-owned Pi footer (spec §status-bar) ─────────

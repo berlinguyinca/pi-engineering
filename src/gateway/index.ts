@@ -20,6 +20,21 @@ export {
 } from "./config.ts";
 export type { GatewayAdmissionConfig } from "./config.ts";
 export {
+  installGatewayStreamRetry,
+  isGatewayStreamRetryInstalled,
+  resetGatewayStreamRetry,
+} from "./installStreamRetry.ts";
+export type { InstallDeps, InstallResult, ProviderHost, ProviderLike } from "./installStreamRetry.ts";
+export { MAX_ESCALATED_WAIT_MS, pumpWithGatewayRetry } from "./streamRetry.ts";
+export type {
+  AttemptStream,
+  GatewayStreamRetryOptions,
+  GatewayStreamRetryOutcome,
+  RetrySink,
+  RetryableEvent,
+  RetryableResult,
+} from "./streamRetry.ts";
+export {
   DEFAULT_WAIT_MS,
   decideGatewayRetry,
   describeGatewayWait,

@@ -404,3 +404,107 @@ test("aborting mid-hold stops that caller without shortening the process-wide co
   assert.equal(await pending, 0);
   assert.equal(controller.status().waiting, 0, "the waiter must be released from the ledger");
 });
+
+// ─── Caller-scoped waits ────────────────────────────────────────────────────
+// A 429 admission refusal speaks for the whole account: `scope: "agent"`,
+// `active_limit`, a queue position. Holding every caller behind it is the point.
+//
+// A bare `503 no worker for model` speaks only for ONE model. The parser still
+// produces a signal, but with a synthesized wait, and arming the process-wide
+// cooldown from it would stall workers on models that are perfectly healthy —
+// the worse the escalation, the longer the unrelated stall.
+
+test("a caller-scoped wait holds the caller without arming the process cooldown", async () => {
+  const slept: number[] = [];
+  const controller = new AdmissionController({
+    maxConcurrency: 4,
+    reservedSlots: 1,
+    maxWaitMs: Number.POSITIVE_INFINITY,
+    jitterMs: 0,
+    sleep: async (ms) => {
+      slept.push(ms);
+    },
+  });
+  const signal = parseGatewayWait({ text: "503 no worker for model" });
+  assert.ok(signal);
+  assert.equal(signal.source, "default", "a synthesized wait, not one the gateway advertised");
+
+  const waited = await controller.noteCallerWaitAndSleep(signal);
+
+  assert.equal(waited, signal.retryAfterMs);
+  assert.deepEqual(slept, [signal.retryAfterMs], "the caller really waited");
+  assert.equal(controller.cooldownRemainingMs(), 0, "workers on other models must not be stalled by this");
+});
+
+test("a caller-scoped wait is still reported, so the status bar can show it", async () => {
+  const events: string[] = [];
+  const controller = new AdmissionController({
+    maxConcurrency: 4,
+    reservedSlots: 1,
+    maxWaitMs: Number.POSITIVE_INFINITY,
+    jitterMs: 0,
+    sleep: async () => {},
+    onEvent: (e) => events.push(e.type),
+  });
+  const signal = parseGatewayWait({ text: "503 no worker for model" });
+  assert.ok(signal);
+  await controller.noteCallerWaitAndSleep(signal);
+
+  assert.deepEqual(events, ["wait"], "the spinner and countdown come from this event");
+});
+
+test("a caller-scoped wait never clamps process concurrency", async () => {
+  const controller = new AdmissionController({
+    maxConcurrency: 4,
+    reservedSlots: 1,
+    maxWaitMs: Number.POSITIVE_INFINITY,
+    jitterMs: 0,
+    sleep: async () => {},
+  });
+  const before = controller.status().concurrency;
+  // active_limit is an account-wide statement; a caller-scoped wait must not
+  // act on it, or one model's outage would shrink the whole runtime.
+  await controller.noteCallerWaitAndSleep({
+    retryAfterMs: 5_000,
+    retryable: true,
+    source: "default",
+    status: 503,
+    activeLimit: 1,
+  });
+
+  assert.equal(controller.status().concurrency, before);
+  assert.equal(controller.cooldownRemainingMs(), 0);
+});
+
+test("an advertised admission refusal still arms the process-wide cooldown", async () => {
+  const controller = new AdmissionController({
+    maxConcurrency: 4,
+    reservedSlots: 1,
+    maxWaitMs: Number.POSITIVE_INFINITY,
+    jitterMs: 0,
+    sleep: async () => {},
+  });
+  const signal = parseGatewayWait({ text: PRODUCTION_429 });
+  assert.ok(signal);
+  controller.noteWait(signal);
+
+  assert.ok(controller.cooldownRemainingMs() > 0, "this one genuinely speaks for every caller");
+});
+
+test("a caller-scoped wait can be abandoned with the turn's own signal", async () => {
+  const aborter = new AbortController();
+  const controller = new AdmissionController({
+    maxConcurrency: 4,
+    reservedSlots: 1,
+    maxWaitMs: Number.POSITIVE_INFINITY,
+    jitterMs: 0,
+    sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+  });
+  aborter.abort();
+  const started = Date.now();
+  await controller.noteCallerWaitAndSleep(
+    { retryAfterMs: 30_000, retryable: true, source: "default", status: 503 },
+    { signal: aborter.signal },
+  );
+  assert.ok(Date.now() - started < 1_000, "escape must not wait out a 30s hold");
+});

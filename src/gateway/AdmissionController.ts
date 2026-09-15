@@ -284,6 +284,35 @@ export class AdmissionController {
   }
 
   /**
+   * Honour a wait that speaks only for THIS caller.
+   *
+   * The distinction is the signal's scope, not its severity. A gateway
+   * admission refusal reports `active_limit`, a queue position and a `scope`:
+   * it speaks for the whole account, so `noteWait` parks every caller in the
+   * process behind one cooldown. A bare `503 no worker for model` speaks for
+   * one model. Arming the process-wide cooldown from that would stall workers
+   * on models that are answering perfectly well — and the longer the retry
+   * escalation runs, the longer the unrelated stall.
+   *
+   * So this emits the wait (the status bar still gets its spinner and
+   * countdown) and parks the caller, but touches neither `cooldownUntil` nor
+   * the concurrency clamp.
+   */
+  async noteCallerWaitAndSleep(signal: GatewayWaitSignal, opts: AdmissionWaitOptions = {}): Promise<number> {
+    this.lastSignal = signal;
+    const waitMs = Math.min(signal.retryAfterMs, this.maxWaitMs);
+    this.waiting++;
+    try {
+      this.emit({ type: "wait", waitMs, signal, concurrency: this.concurrency });
+      if (opts.signal?.aborted) return 0;
+      await this.sleepOrAbort(waitMs, opts.signal);
+    } finally {
+      this.waiting--;
+    }
+    return opts.signal?.aborted ? 0 : waitMs;
+  }
+
+  /**
    * Arm the cooldown and wait it out, holding no slot.
    * Used by a caller that just received the 429 and intends to retry.
    */
