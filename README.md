@@ -197,6 +197,51 @@ attempts lowering reasoning effort or swapping models.
 | `PI_GATEWAY_MAX_RETRIES` | `4` | Gateway-wait retries per worker attempt |
 | `PI_GATEWAY_TELEMETRY` | `true` | Emit `[gateway-admission]` events on stderr |
 
+## Engineering panel
+
+`/panel`, or `ctrl+p`, toggles a right-anchored overlay showing what the runtime
+is doing — and what it did:
+
+```
+┌─ ENGINEERING ──────────┐
+│ ● WI-12 · review · high │
+│ ▾ Changed files (2)     │
+│   A src/gateway/sig…    │
+│   M extensions/index.ts │
+│ ▾ Reviews (1)           │
+│   ✗ HIGH · reviewer ·   │
+│     opus-5 · retry loop │
+│ ▾ Tokens (1)            │
+│   opus-5 · 1000/200 tok │
+└─────────────────────────┘
+```
+
+During an engineering run it reads the ledger: the work item and phase, the
+candidate's changed files, review findings with the **role and model that
+produced them**, and token spend grouped by model. With no run active it shows
+the git working tree and your session's context usage, so it is never empty.
+
+Keys: `↑`/`↓` move, `→`/`enter` expands a section or opens a file, `←`
+collapses, `esc` returns from a file to the tree and closes the panel from the
+tree. Opening a file shows a **bounded** view — a candidate diff is read lazily
+by artifact URI, a working-tree file from disk, both capped rather than loaded
+whole, and neither is inlined into model context.
+
+The panel is a read surface: it never writes to the ledger, never touches a
+worktree, and never starts model work. A failing git or unreadable artifact
+marks its own section and leaves the rest of the panel working.
+
+| Variable | Default | Meaning |
+| -------- | ------- | ------- |
+| `PI_PANEL_CHORD` | `ctrl+p` | Hotkey to toggle the panel; `none` disables it |
+
+Two caveats worth knowing. Pi registers commands but not keybindings, so the
+chord is a raw input handler that consumes only its own key — set it to `none`
+if it collides with something you use. And **clicking rows needs fullscreen TUI
+mode** (`--tui-mode fullscreen`): in regular mode the terminal owns its
+scrollback and pointer input is never delivered, so the keyboard is the
+contract and the mouse is a bonus.
+
 ## Live status bar
 
 The footer answers "what is it doing, and why is nothing happening":

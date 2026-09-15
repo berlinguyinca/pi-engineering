@@ -12,6 +12,11 @@ import { GenerationGuard } from "../src/guard/GenerationGuard.ts";
 import { RECOVERY_PROMPT, TOOL_TRANSITION_RULE, buildDegenerationEvent } from "../src/guard/RecoveryController.ts";
 import { resolveGuardConfig } from "../src/guard/config.ts";
 import { guardFeedFor } from "../src/guard/streamText.ts";
+import { PanelController } from "../src/panel/PanelController.ts";
+import { PanelState } from "../src/panel/PanelState.ts";
+import { readDiffContent, readFileContent } from "../src/panel/content.ts";
+import { LedgerFeeder } from "../src/panel/feeders/LedgerFeeder.ts";
+import { WorkspaceFeeder } from "../src/panel/feeders/WorkspaceFeeder.ts";
 import { RoadmapEngine } from "../src/roadmap/RoadmapEngine.ts";
 import { EngineeringRuntime } from "../src/runtime/EngineeringRuntime.ts";
 import { resolveStatusBarConfig } from "../src/status/config.ts";
@@ -40,8 +45,30 @@ const runtimes = new Map<string, { runtime: EngineeringRuntime; memoryIdentity: 
 // controller (src/status/). One active controller per session.
 const statusBarConfig = resolveStatusBarConfig();
 let activeFooter: FooterController | null = null;
-/** Subscriptions bound to the active footer's lifetime (drained on shutdown). */
-const footerUnsubscribes: Array<() => void> = [];
+/** Subscriptions bound to the session's lifetime (drained on shutdown). */
+const sessionUnsubscribes: Array<() => void> = [];
+
+// The engineering panel: one state + feeders per repository (keyed like the
+// runtime cache), and one controller per interactive session.
+const panels = new Map<string, { state: PanelState; ledger: LedgerFeeder; workspace: WorkspaceFeeder }>();
+let activePanel: PanelController | null = null;
+
+/** Panel plumbing for a repo, created on first use. */
+function panelFor(
+  key: string,
+  rt: EngineeringRuntime,
+): { state: PanelState; ledger: LedgerFeeder; workspace: WorkspaceFeeder } {
+  const existing = panels.get(key);
+  if (existing) return existing;
+  const state = new PanelState();
+  const created = {
+    state,
+    ledger: new LedgerFeeder({ ledger: rt.ledger, state }),
+    workspace: new WorkspaceFeeder({ state, repo: rt.git }),
+  };
+  panels.set(key, created);
+  return created;
+}
 
 async function getRuntime(ctx: ExtensionCommandContext, worker?: EngineeringRuntime): Promise<EngineeringRuntime> {
   return getRuntimeByCwd(worker ? worker.cwd : ctx.cwd, ctx.model);
@@ -80,6 +107,8 @@ async function getRuntimeByCwd(cwd: string, model?: Model<any>): Promise<Enginee
     // runtime swallows anything thrown here, and the footer is the only
     // consumer today (the panel will subscribe to the same events).
     onPhase: (event) => {
+      // One event source, two surfaces: the footer summarises, the panel details.
+      panels.get(key)?.ledger.onPhase(event);
       const footer = activeFooter;
       if (!footer) return;
       if (event.phase === "settled") {
@@ -98,6 +127,7 @@ async function getRuntimeByCwd(cwd: string, model?: Model<any>): Promise<Enginee
     ...(blackhole ? { blackhole } : {}),
   });
   runtimes.set(key, { runtime: rt, memoryIdentity });
+  panelFor(key, rt);
   return rt;
 }
 
@@ -330,14 +360,14 @@ ${RECOVERY_PROMPT}`;
   // real pi session, so guard like the Generation Guard block above.
   if (statusBarConfig.enabled && typeof pi.on === "function") {
     pi.on("session_start", (_event, ctx) => {
-      for (const un of footerUnsubscribes.splice(0)) un();
+      for (const un of sessionUnsubscribes.splice(0)) un();
       activeFooter?.dispose();
       const footer = new FooterController({ ctx, config: statusBarConfig });
       activeFooter = footer;
       // The footer is a second consumer of admission events (telemetry owns the
       // constructor hook), so it subscribes and gives the wait a countdown.
       if (gatewayConfig.enabled) {
-        footerUnsubscribes.push(sharedAdmissionController().subscribe((event) => footer.onGatewayEvent(event)));
+        sessionUnsubscribes.push(sharedAdmissionController().subscribe((event) => footer.onGatewayEvent(event)));
       }
     });
 
@@ -346,11 +376,95 @@ ${RECOVERY_PROMPT}`;
     pi.on("message_end", (event) => activeFooter?.onMessageEnd(event));
     pi.on("model_select", (event) => activeFooter?.onModelSelect(event.model));
     pi.on("session_shutdown", () => {
-      for (const un of footerUnsubscribes.splice(0)) un();
+      for (const un of sessionUnsubscribes.splice(0)) un();
       activeFooter?.dispose();
       activeFooter = null;
     });
   }
+
+  // ─── Engineering panel ───────────────────────────────────────────────────
+  // `/panel` (or the configured chord) toggles a right-anchored overlay over
+  // the ledger's record of the run, falling back to the working tree when idle.
+  // Pi registers commands but not keybindings, so the chord is a raw input
+  // handler that consumes only its own key.
+  const panelChord = process.env.PI_PANEL_CHORD ?? "ctrl+p";
+
+  async function openPanel(ctx: {
+    cwd: string;
+    ui: { notify: (m: string, t?: "info" | "warning" | "error") => void };
+  }) {
+    const key = await repoCacheKey(ctx.cwd);
+    const rt = await getRuntimeByCwd(ctx.cwd).catch(() => null);
+    if (!rt) {
+      ctx.ui.notify("Panel unavailable: no engineering runtime for this directory.", "error");
+      return null;
+    }
+    const plumbing = panelFor(key, rt);
+    void plumbing.workspace.refresh();
+    return { plumbing, rt };
+  }
+
+  /** Resolve a selected row into a bounded content view. */
+  function openRowFor(rt: EngineeringRuntime, state: PanelState) {
+    return async (payload: { kind: string; path?: string; source?: string }) => {
+      if (payload.kind !== "file" || !payload.path) return undefined;
+      // A run's file is shown as the candidate diff when one was captured;
+      // the artifact URI travels, the body is fetched only to display it.
+      const candidateId = state.snapshot.run?.candidateId;
+      if (payload.source === "run" && candidateId) {
+        const candidate = rt.ledger.getCandidate(candidateId);
+        if (candidate?.diff_artifact_uri) {
+          return readDiffContent(rt.artifacts, candidate.diff_artifact_uri, payload.path);
+        }
+      }
+      return readFileContent(resolve(rt.cwd, payload.path), payload.path);
+    };
+  }
+
+  // The overlay and the chord need a live session UI, which only exists in a
+  // real Pi run (the smoke-test stub has no pi.on).
+  if (typeof pi.on === "function") {
+    pi.on("session_start", async (_event, ctx) => {
+      activePanel?.dispose();
+      const key = await repoCacheKey(ctx.cwd);
+      const rt = await getRuntimeByCwd(ctx.cwd).catch(() => null);
+      if (!rt) return;
+      const plumbing = panelFor(key, rt);
+      const controller = new PanelController({
+        state: plumbing.state,
+        ui: ctx.ui as never,
+        chord: panelChord,
+        onOpen: () => {
+          plumbing.workspace.invalidate();
+          void plumbing.workspace.refresh();
+          plumbing.ledger.refresh();
+        },
+        openRow: openRowFor(rt, plumbing.state),
+      });
+      activePanel = controller;
+      if (typeof ctx.ui.onTerminalInput === "function") {
+        sessionUnsubscribes.push(ctx.ui.onTerminalInput((data) => controller.handleTerminalInput(data)));
+      }
+    });
+
+    pi.on("session_shutdown", () => {
+      activePanel?.dispose();
+      activePanel = null;
+    });
+  }
+
+  pi.registerCommand("panel", {
+    description: "Toggle the engineering panel: changed files, reviews, models, and token spend.",
+    handler: async (_args, ctx) => {
+      const opened = await openPanel(ctx);
+      if (!opened) return;
+      if (!activePanel) {
+        ctx.ui.notify("Panel unavailable: this session has no interactive UI.", "error");
+        return;
+      }
+      activePanel.toggle();
+    },
+  });
 
   pi.registerCommand("engineer", {
     description: "Run the adaptive engineering workflow for a goal (scout -> implement -> verify -> review).",
