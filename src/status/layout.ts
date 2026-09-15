@@ -14,7 +14,7 @@
 
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { StatusBarConfig } from "./config.ts";
-import type { HarnessStatusState } from "./state.ts";
+import type { HarnessStatusState, WaitState } from "./state.ts";
 
 const SEP = " │ ";
 
@@ -29,15 +29,20 @@ export interface RenderSegment {
  * Render the status line. Returns a plain string (no ANSI); the footer layer
  * applies theme styling. Never throws — on any unexpected input returns "".
  */
-export function renderStatus(state: HarnessStatusState, width: number, config: StatusBarConfig): string {
+export function renderStatus(
+  state: HarnessStatusState,
+  width: number,
+  config: StatusBarConfig,
+  nowMs: number = Date.now(),
+): string {
   try {
-    return renderUnsafe(state, width, config);
+    return renderUnsafe(state, width, config, nowMs);
   } catch {
     return "";
   }
 }
 
-function renderUnsafe(state: HarnessStatusState, width: number, config: StatusBarConfig): string {
+function renderUnsafe(state: HarnessStatusState, width: number, config: StatusBarConfig, nowMs: number): string {
   const maxWidth = Math.max(0, width);
 
   const throughputFull = formatThroughput(state, true, config);
@@ -74,6 +79,11 @@ function renderUnsafe(state: HarnessStatusState, width: number, config: StatusBa
     full.push({ text: throughputFull, priority: 5 });
     short.push({ text: throughputShort ?? throughputFull, priority: 5 });
   }
+  if (config.showWait && state.wait) {
+    const wait = formatWait(state.wait, nowMs);
+    full.push({ text: wait, priority: 7 });
+    short.push({ text: wait, priority: 7 });
+  }
 
   // Progressive elision: try each stage until it fits.
   const stages: RenderSegment[][] = [];
@@ -84,13 +94,19 @@ function renderUnsafe(state: HarnessStatusState, width: number, config: StatusBa
   stages.push(short.filter((s) => s.priority >= 2));
   stages.push(short.filter((s) => s.priority >= 3));
   stages.push(short.filter((s) => s.priority >= 4));
+  // Then model, then throughput, then the task — the wait reason outlives all
+  // of them, because it is the only segment that explains an idle session.
+  stages.push(short.filter((s) => s.priority >= 5));
+  stages.push(short.filter((s) => s.priority >= 6));
+  stages.push(short.filter((s) => s.priority >= 7));
 
   for (const stage of stages) {
     const line = assemble(stage);
     if (visibleWidth(line) <= maxWidth) return line;
   }
 
-  // Irreducible core (model + tps). Truncate as a last resort so it never wraps.
+  // Irreducible core (the wait reason, else model + tps). Truncate as a last
+  // resort so the line never wraps.
   const core = assemble(stages[stages.length - 1]!);
   if (visibleWidth(core) <= maxWidth) return core;
   return truncateToWidth(core, maxWidth, "…");
@@ -145,6 +161,20 @@ function formatThroughput(state: HarnessStatusState, full: boolean, config: Stat
   if (rate == null) return null; // unavailable / nothing to show
   if (full) return `⚡ ${rate.toFixed(1)} t/s`;
   return `⚡${Math.round(rate)} t/s`;
+}
+
+/**
+ * "⏳ gateway 30s · queue_timeout" — rendered at the highest priority, so it is
+ * the last segment standing as the terminal narrows.
+ */
+function formatWait(wait: WaitState, nowMs: number): string {
+  const parts: string[] = [wait.kind];
+  if (wait.untilMs != null) {
+    const remainingMs = Math.max(0, wait.untilMs - nowMs);
+    parts.push(`${Math.ceil(remainingMs / 1000)}s`);
+  }
+  const head = parts.join(" ");
+  return wait.detail ? `⏳ ${head} · ${wait.detail}` : `⏳ ${head}`;
 }
 
 let cachedHome: string | undefined;

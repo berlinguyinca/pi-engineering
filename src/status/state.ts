@@ -23,6 +23,30 @@ export interface ThroughputState {
   outputTokens?: number;
 }
 
+/**
+ * Why the runtime is not producing output right now.
+ *
+ * This is the one thing that explains an apparently frozen session, so the
+ * footer renders it at the highest priority (see layout.ts).
+ */
+export interface WaitState {
+  /** What we are waiting on. */
+  kind: "gateway" | "verify" | "worker";
+  /** Machine-readable detail, e.g. "queue_timeout" or the verify command. */
+  detail: string;
+  /** Epoch ms when the wait is expected to end. Omitted when unknown. */
+  untilMs?: number;
+}
+
+/** The engineering task currently in flight. */
+export interface TaskState {
+  workItemId: string;
+  /** Pipeline phase, e.g. "scout", "implement", "verify", "review". */
+  phase: string;
+  /** Short human label (the goal), optional. */
+  label?: string;
+}
+
 export interface HarnessStatusState {
   /** Process/active working directory. */
   cwd: string;
@@ -40,6 +64,10 @@ export interface HarnessStatusState {
   model?: string;
   /** Active model provider. */
   provider?: string;
+  /** Engineering task in flight, when a run is active. */
+  task?: TaskState;
+  /** Why the runtime is waiting, when it is. */
+  wait?: WaitState;
   /** Live throughput telemetry. */
   throughput: ThroughputState;
 }

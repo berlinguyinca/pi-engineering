@@ -135,3 +135,52 @@ test("layout: outside a git repo omits repository/worktree/branch gracefully", (
   assert.ok(line.includes("qwen3.8-27b"));
   assert.ok(line.includes("⚡"));
 });
+
+// ─── Wait segment (why the runtime is idle) ─────────────────────────────────
+
+test("wait: renders the reason and a countdown", () => {
+  const s = state({
+    throughput: { phase: "waiting" },
+    wait: { kind: "gateway", detail: "queue_timeout", untilMs: 30_000 },
+  });
+  assert.match(renderStatus(s, 200, cfg, 0), /⏳ gateway 30s · queue_timeout/);
+});
+
+test("wait: countdown floors at 0s and never goes negative", () => {
+  const s = state({
+    throughput: { phase: "waiting" },
+    wait: { kind: "gateway", detail: "queue_timeout", untilMs: 1_000 },
+  });
+  assert.match(renderStatus(s, 200, cfg, 9_000), /⏳ gateway 0s · queue_timeout/);
+});
+
+test("wait: a wait with no deadline renders without a countdown", () => {
+  const s = state({ throughput: { phase: "waiting" }, wait: { kind: "verify", detail: "npm test" } });
+  const line = renderStatus(s, 200, cfg, 0);
+  assert.match(line, /⏳ verify · npm test/);
+  assert.doesNotMatch(line, /\d+s ·/);
+});
+
+test("wait: the wait segment is the last thing standing as width shrinks", () => {
+  const s = state({
+    throughput: { phase: "streaming", currentTokensPerSecond: 247 },
+    task: { workItemId: "WI-12", phase: "implement" },
+    wait: { kind: "gateway", detail: "queue_timeout", untilMs: 30_000 },
+  });
+  const narrow = renderStatus(s, 26, cfg, 0);
+  assert.match(narrow, /gateway/);
+  assert.ok(visibleWidth(narrow) <= 26, `line too wide: ${visibleWidth(narrow)}`);
+});
+
+test("wait: no wait state renders no wait segment", () => {
+  assert.doesNotMatch(renderStatus(state(), 200, cfg, 0), /⏳/);
+});
+
+test("wait: showWait=false hides the segment even while waiting", () => {
+  const config: StatusBarConfig = { ...DEFAULT_STATUS_BAR_CONFIG, showWait: false };
+  const s = state({
+    throughput: { phase: "waiting" },
+    wait: { kind: "gateway", detail: "queue_timeout", untilMs: 30_000 },
+  });
+  assert.doesNotMatch(renderStatus(s, 200, config, 0), /⏳/);
+});
