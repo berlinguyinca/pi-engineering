@@ -16,7 +16,8 @@ import { GenerationGuard } from "../src/guard/GenerationGuard.ts";
 import { RECOVERY_PROMPT, TOOL_TRANSITION_RULE, buildDegenerationEvent } from "../src/guard/RecoveryController.ts";
 import { resolveGuardConfig } from "../src/guard/config.ts";
 import { guardFeedFor } from "../src/guard/streamText.ts";
-import { defaultModelsPath } from "../src/models/modelsConfig.ts";
+import { ModelHealthProvider } from "../src/models/health.ts";
+import { defaultModelsPath, providerBaseUrl, readModelsConfig } from "../src/models/modelsConfig.ts";
 import { refreshProviderModels } from "../src/models/refresh.ts";
 import { PanelController } from "../src/panel/PanelController.ts";
 import { PanelState } from "../src/panel/PanelState.ts";
@@ -328,6 +329,45 @@ ${RECOVERY_PROMPT}`;
   // turn — behind one shared cooldown until the reported wait has elapsed.
   const gatewayConfig = sharedGatewayConfig();
 
+  // Gateway-reported per-model readiness (`slots`, `x_state`). Built lazily and
+  // cached per provider: this is consulted on every hold, and holds arrive in
+  // bursts exactly when the gateway can least afford extra requests.
+  const healthProviders = new Map<string, ModelHealthProvider>();
+  const healthFor = async (ctx: { model?: Model<any>; modelRegistry?: unknown }): Promise<
+    ModelHealthProvider | undefined
+  > => {
+    const model = ctx.model;
+    if (!model) return undefined;
+    let provider = healthProviders.get(model.provider);
+    if (!provider) {
+      const baseUrl = model.baseUrl ?? providerBaseUrl(safeModelsConfig(), model.provider);
+      if (!baseUrl) return undefined;
+      let apiKey: string | undefined;
+      try {
+        const registry = ctx.modelRegistry as
+          | { getApiKeyAndHeaders?: (m: Model<any>) => Promise<{ ok: boolean; apiKey?: string }> }
+          | undefined;
+        const resolved = await registry?.getApiKeyAndHeaders?.(model);
+        if (resolved?.ok) apiKey = resolved.apiKey;
+      } catch {
+        // Unauthenticated probe; the gateway decides whether that is allowed.
+      }
+      provider = new ModelHealthProvider({ baseUrl, ...(apiKey ? { apiKey } : {}) });
+      healthProviders.set(model.provider, provider);
+    }
+    await provider.refresh();
+    return provider;
+  };
+
+  /** Read models.json without letting a malformed file break a command. */
+  function safeModelsConfig(): ReturnType<typeof readModelsConfig> {
+    try {
+      return readModelsConfig(defaultModelsPath());
+    } catch {
+      return {};
+    }
+  }
+
   // ─── /refresh-models: make the configured catalogue match the gateway ────
   // Model configuration drifts silently and expensively. Measured against a
   // live gateway, a working models.json had one model configured at 1,048,576
@@ -604,15 +644,20 @@ ${RECOVERY_PROMPT}`;
     // reason to guess.
     const FALLBACK_AFTER_HOLDS = 3;
 
-    const toCandidate = (m: Model<any>): FallbackCandidate => ({
-      id: m.id,
-      provider: m.provider,
-      api: m.api,
-      contextWindow: m.contextWindow,
-      maxTokens: m.maxTokens,
-      reasoning: m.reasoning === true,
-      input: m.input ?? ["text"],
-    });
+    const toCandidate = (m: Model<any>, health?: ModelHealthProvider): FallbackCandidate => {
+      const reading = health?.get(m.id) ?? {};
+      return {
+        id: m.id,
+        provider: m.provider,
+        api: m.api,
+        contextWindow: m.contextWindow,
+        maxTokens: m.maxTokens,
+        reasoning: m.reasoning === true,
+        input: m.input ?? ["text"],
+        ...(reading.state !== undefined ? { state: reading.state } : {}),
+        ...(reading.slots !== undefined ? { slots: reading.slots } : {}),
+      };
+    };
 
     /** The most recent session context, for the hold-driven fallback check. */
     let latestCtx: ExtensionCommandContext | undefined;
@@ -626,9 +671,12 @@ ${RECOVERY_PROMPT}`;
       if (available.length < 2) return;
 
       const usage = ctx.getContextUsage?.();
+      // Readiness makes the difference between swapping to a model that can
+      // serve and swapping to another one with no workers.
+      const health = await healthFor(ctx).catch(() => undefined);
       const decision = chooseFallbackModel({
-        current: toCandidate(current),
-        available: available.map(toCandidate),
+        current: toCandidate(current, health),
+        available: available.map((m) => toCandidate(m, health)),
         usedTokens: usage?.tokens ?? null,
       });
       if (decision.action !== "switch") return;

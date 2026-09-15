@@ -36,6 +36,14 @@ export interface GatewayReportInput {
   model?: { id: string; provider: string; api: string; contextWindow: number } | undefined;
   /** Context tokens in use; `null` when Pi does not know (just after compaction). */
   contextTokens?: number | null;
+  /**
+   * Gateway-reported per-model readiness, when available. This is what actually
+   * explains a `503 no worker for model`: the refusing model is the one with no
+   * free slots, and no retry counter can show that.
+   */
+  health?: ReadonlyMap<string, { state?: string; slots?: number }>;
+  /** Whether those readings are current, so a stale view is not read as live. */
+  healthFresh?: boolean;
 }
 
 function seconds(ms: number): string {
@@ -111,6 +119,18 @@ export function renderGatewayReport(input: GatewayReportInput): string[] {
     const ctx =
       used == null ? `context unknown of ${input.model.contextWindow}` : `context ${used}/${input.model.contextWindow}`;
     lines.push(`Model: ${input.model.provider}/${input.model.id} (${input.model.api}) · ${ctx}`);
+  }
+
+  if (input.health && input.health.size > 0) {
+    lines.push(input.healthFresh ? "Models (live):" : "Models (last known):");
+    for (const [id, health] of [...input.health].sort(([a], [b]) => (a < b ? -1 : 1))) {
+      const slots = health.slots !== undefined ? `${health.slots} slot(s)` : "slots unknown";
+      const state = health.state ? ` · ${health.state}` : "";
+      // The line that answers "why is this one refusing?".
+      const note = health.slots === 0 ? "  ← no capacity" : "";
+      const marker = input.model && id === input.model.id ? "*" : " ";
+      lines.push(`  ${marker} ${id} — ${slots}${state}${note}`);
+    }
   }
 
   lines.push(`Policy: wait cap ${limit(config.maxWaitMs)}, retry cap ${limit(config.maxRetries)}`);

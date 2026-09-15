@@ -132,3 +132,60 @@ test("gateway report: a disabled controller does not pretend to be holding", () 
   assert.match(out, /disabled/);
   assert.doesNotMatch(out, /Slots:/);
 });
+
+// ─── Per-model readiness ────────────────────────────────────────────────────
+
+test("gateway report: the model with no capacity is the one called out", () => {
+  // This is the line that answers "why is THIS model refusing?" — a retry
+  // counter never can.
+  const out = renderGatewayReport({
+    status: status(),
+    config: CONFIG,
+    installs: [],
+    healthFresh: true,
+    health: new Map([
+      ["deepseek-v4-flash", { state: "warm", slots: 9 }],
+      ["qwen3.8-27b", { state: "cold", slots: 0 }],
+    ]),
+  }).join("\n");
+
+  assert.match(out, /Models \(live\):/);
+  assert.match(out, /qwen3\.8-27b — 0 slot\(s\) · cold {2}← no capacity/);
+  assert.match(out, /deepseek-v4-flash — 9 slot\(s\) · warm/);
+  assert.doesNotMatch(out, /deepseek-v4-flash.*no capacity/);
+});
+
+test("gateway report: a stale reading is labelled as such", () => {
+  // Presenting a cached view as live is how an operator concludes the gateway
+  // is healthy while it is refusing them.
+  const out = renderGatewayReport({
+    status: status(),
+    config: CONFIG,
+    installs: [],
+    healthFresh: false,
+    health: new Map([["m", { slots: 1 }]]),
+  }).join("\n");
+
+  assert.match(out, /Models \(last known\):/);
+});
+
+test("gateway report: the session's own model is marked", () => {
+  const out = renderGatewayReport({
+    status: status(),
+    config: CONFIG,
+    installs: [],
+    model: { id: "deepseek-v4-flash", provider: "metabolomics", api: "openai-completions", contextWindow: 262_144 },
+    health: new Map([
+      ["deepseek-v4-flash", { slots: 9 }],
+      ["other", { slots: 1 }],
+    ]),
+  }).join("\n");
+
+  assert.match(out, /\* deepseek-v4-flash/);
+  assert.match(out, /\s\sother —/, "a model that is not the session's carries no marker");
+});
+
+test("gateway report: absent health readings add no section", () => {
+  const out = renderGatewayReport({ status: status(), config: CONFIG, installs: [] }).join("\n");
+  assert.doesNotMatch(out, /Models \(/);
+});

@@ -28,6 +28,30 @@ export interface FallbackCandidate {
   maxTokens: number;
   reasoning: boolean;
   input: readonly string[];
+  /**
+   * Gateway-reported readiness, when known — `"warm"`, `"cold"`, …
+   *
+   * Advisory, never disqualifying: see `isHealthy`.
+   */
+  state?: string;
+  /** Concurrent requests the gateway will serve for this model, when known. */
+  slots?: number;
+}
+
+/**
+ * Is this model reported as able to serve right now?
+ *
+ * Unknown health counts as healthy. The signal is a snapshot taken at most a
+ * few seconds ago, and treating "we have no data" or "cold at last poll" as
+ * disqualifying would refuse a fallback that would have worked — trading a
+ * usable model for a longer wait on a saturated one. So health ORDERS the
+ * survivors; the hard filters remain context and modality, which are properties
+ * of the model rather than of one moment.
+ */
+export function isHealthy(candidate: FallbackCandidate): boolean {
+  if (candidate.slots !== undefined && candidate.slots <= 0) return false;
+  if (candidate.state !== undefined && candidate.state.toLowerCase() === "cold") return false;
+  return true;
 }
 
 export interface FallbackInput {
@@ -118,16 +142,28 @@ export function chooseFallbackModel(input: FallbackInput): FallbackDecision {
   }
 
   const ranked = [...viable].sort((a, b) => {
+    // Readiness outranks head-room. We are here because one model had no
+    // workers; moving to another that also has none buys nothing, however much
+    // context it could theoretically hold.
+    const health = Number(isHealthy(b)) - Number(isHealthy(a));
+    if (health !== 0) return health;
     if (a.contextWindow !== b.contextWindow) return b.contextWindow - a.contextWindow;
+    // Among equals, spare capacity: a model serving nine concurrent requests is
+    // less likely to refuse the next one than a model serving its only slot.
+    // Below head-room, because running out of context costs a whole fallback
+    // while a busy model costs a wait.
+    const capacity = (b.slots ?? 0) - (a.slots ?? 0);
+    if (capacity !== 0) return capacity;
     const parity = Number(b.reasoning === current.reasoning) - Number(a.reasoning === current.reasoning);
     if (parity !== 0) return parity;
     return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
   });
 
   const pick = ranked[0] as FallbackCandidate;
+  const health = pick.slots !== undefined ? `, ${pick.slots} slot(s) free` : pick.state ? `, ${pick.state}` : "";
   return {
     action: "switch",
     model: pick,
-    reason: `${pick.id} holds ${pick.contextWindow} tokens against ${usedTokens} in use`,
+    reason: `${pick.id} holds ${pick.contextWindow} tokens against ${usedTokens} in use${health}`,
   };
 }

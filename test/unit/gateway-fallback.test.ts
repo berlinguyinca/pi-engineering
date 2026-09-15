@@ -10,7 +10,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { type FallbackCandidate, chooseFallbackModel } from "../../src/gateway/fallback.ts";
+import { type FallbackCandidate, chooseFallbackModel, isHealthy } from "../../src/gateway/fallback.ts";
 
 function model(id: string, contextWindow: number, over: Partial<FallbackCandidate> = {}): FallbackCandidate {
   return {
@@ -155,4 +155,88 @@ test("fallback: the decision is stable across repeated calls", () => {
       "catalogue order must not change the answer",
     );
   }
+});
+
+// ─── Gateway-reported readiness ─────────────────────────────────────────────
+
+test("fallback: readiness outranks head-room", () => {
+  // We are falling back because one model had no workers. Moving to another
+  // that also has none buys nothing, however much context it could hold.
+  const big = model("big-idle", 262_144, { slots: 0 });
+  const smaller = model("smaller-warm", 131_072, { slots: 4, state: "warm" });
+
+  const decision = chooseFallbackModel({
+    current: FLASH,
+    available: [FLASH, big, smaller],
+    usedTokens: 10_000,
+  });
+
+  assert.equal(decision.action === "switch" ? decision.model.id : "", "smaller-warm");
+});
+
+test("fallback: a cold model loses to a warm one of equal size", () => {
+  const cold = model("a-cold", 262_144, { state: "cold" });
+  const warm = model("z-warm", 262_144, { state: "warm" });
+
+  const decision = chooseFallbackModel({ current: FLASH, available: [FLASH, cold, warm], usedTokens: 10_000 });
+  assert.equal(decision.action === "switch" ? decision.model.id : "", "z-warm", "id order alone would pick a-cold");
+});
+
+test("fallback: unhealthy is a ranking, not a veto", () => {
+  // Health is a snapshot seconds old. Refusing the only model that fits because
+  // it was cold at the last poll trades a usable option for a longer wait.
+  const onlyOption = model("cold-but-only", 262_144, { slots: 0, state: "cold" });
+
+  const decision = chooseFallbackModel({ current: FLASH, available: [FLASH, onlyOption], usedTokens: 10_000 });
+  assert.equal(decision.action, "switch");
+  assert.equal(decision.action === "switch" ? decision.model.id : "", "cold-but-only");
+});
+
+test("fallback: unknown health is treated as usable", () => {
+  // Most catalogues report nothing. Absence of data must not look like bad news.
+  const unknown = model("no-health-data", 262_144);
+  assert.equal(isHealthy(unknown), true);
+
+  const decision = chooseFallbackModel({ current: FLASH, available: [FLASH, unknown], usedTokens: 10_000 });
+  assert.equal(decision.action, "switch");
+});
+
+test("fallback: readiness never overrides the context check", () => {
+  // A warm model with slots to spare is still the wrong answer if the session
+  // does not fit in it.
+  const warmButSmall = model("warm-small", 131_072, { slots: 9, state: "warm" });
+
+  const decision = chooseFallbackModel({ current: FLASH, available: [FLASH, warmButSmall], usedTokens: 200_000 });
+  assert.equal(decision.action, "stay", "capacity is not a substitute for fitting");
+});
+
+test("fallback: the reason names the readiness that drove the choice", () => {
+  const warm = model("warm-one", 262_144, { slots: 4, state: "warm" });
+  const decision = chooseFallbackModel({ current: FLASH, available: [FLASH, warm], usedTokens: 10_000 });
+  assert.match(decision.reason, /4 slot\(s\) free/);
+});
+
+test("fallback: among equals, the model with more spare capacity wins", () => {
+  // Live data from the gateway: several 262k models differing only in free
+  // slots. Alphabetical order is a worse tie-break than "least likely to
+  // refuse".
+  const busy = model("a-busy", 262_144, { slots: 1, state: "warm" });
+  const roomy = model("z-roomy", 262_144, { slots: 9, state: "warm" });
+
+  const decision = chooseFallbackModel({ current: FLASH, available: [FLASH, busy, roomy], usedTokens: 20_000 });
+  assert.equal(decision.action === "switch" ? decision.model.id : "", "z-roomy");
+});
+
+test("fallback: head-room still outranks spare capacity", () => {
+  // Running out of context costs a whole second fallback; a busy model costs a
+  // wait. So the bigger window wins even with fewer slots.
+  const bigButBusy = model("big-busy", 262_144, { slots: 1, state: "warm" });
+  const smallButFree = model("small-free", 131_072, { slots: 9, state: "warm" });
+
+  const decision = chooseFallbackModel({
+    current: FLASH,
+    available: [FLASH, bigButBusy, smallButFree],
+    usedTokens: 20_000,
+  });
+  assert.equal(decision.action === "switch" ? decision.model.id : "", "big-busy");
 });
