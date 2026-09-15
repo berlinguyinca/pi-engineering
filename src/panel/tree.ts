@@ -231,16 +231,45 @@ function sessionRows(_state: Readonly<PanelStateShape>): PanelRow[] {
   ];
 }
 
-/** The Memory tab. Task 5 fills this from Blackhole telemetry. */
-function memoryRows(_state: Readonly<PanelStateShape>): PanelRow[] {
+/**
+ * The Memory tab: what this session put into memory.
+ *
+ * A disabled adapter says so and shows NO counters. Blackhole is off by
+ * default, and a column of zeros reads as a broken feature rather than as one
+ * that is not running.
+ */
+function memoryRows(state: Readonly<PanelStateShape>): PanelRow[] {
+  const memory = state.memory;
+  if (!memory) {
+    return [
+      { depth: 0, glyph: "", label: "Memory counts unavailable.", payload: { kind: "empty" }, selectable: false },
+    ];
+  }
+  if (!memory.enabled) {
+    return [
+      {
+        depth: 0,
+        glyph: "",
+        label: "Blackhole session memory is off for this runtime.",
+        payload: { kind: "empty" },
+        selectable: false,
+      },
+    ];
+  }
+  const line = (label: string): PanelRow => ({
+    depth: 0,
+    glyph: "·",
+    label,
+    payload: { kind: "empty" },
+    selectable: false,
+  });
+  const workers = memory.workers;
   return [
-    {
-      depth: 0,
-      glyph: "",
-      label: "Memory counts unavailable.",
-      payload: { kind: "empty" },
-      selectable: false,
-    },
+    line(`entries recorded ${memory.entries}`),
+    line(`promotion candidates ${memory.promotionCandidates}`),
+    line(`promoted to durable memory ${memory.promoted}`),
+    line(`compactions ${memory.compactions}`),
+    line(`memory workers: observer ${workers.observer} · reflector ${workers.reflector} · dropper ${workers.dropper}`),
   ];
 }
 

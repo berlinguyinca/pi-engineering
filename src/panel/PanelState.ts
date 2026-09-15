@@ -64,13 +64,30 @@ export interface PanelWorkspaceView {
  * own part of the panel instead of the whole surface.
  */
 export interface PanelSectionError {
-  section: "run" | "workspace";
+  section: "run" | "workspace" | "memory";
   message: string;
+}
+
+/**
+ * What this session put into memory. Every counter already exists on the
+ * Blackhole manager state, so this is a read model like the rest of the panel.
+ *
+ * `enabled` is load-bearing: Blackhole is off by default, and a disabled
+ * adapter must read as "off", never as zeros that look like a failure.
+ */
+export interface PanelMemoryView {
+  enabled: boolean;
+  entries: number;
+  promotionCandidates: number;
+  promoted: number;
+  compactions: number;
+  workers: { observer: number; reflector: number; dropper: number };
 }
 
 export interface PanelStateShape {
   run?: PanelRunView;
   workspace?: PanelWorkspaceView;
+  memory?: PanelMemoryView;
   errors: PanelSectionError[];
   updatedAt: number;
 }
