@@ -395,7 +395,10 @@ ${RECOVERY_PROMPT}`;
   pi.registerCommand("update", {
     description: "Check for and apply extension updates (fast-forward only, never over uncommitted work).",
     handler: async (args: string, ctx: ExtensionCommandContext) => {
-      const check = (args ?? "").includes("--check");
+      // Tokenised, not a substring test: `includes("--check")` would fire on
+      // any argument that merely contains the text.
+      const argv = (args ?? "").trim().split(/\s+/).filter(Boolean);
+      const check = argv.includes("--check");
       const result = await runSelfUpdate(!check);
       if (result.unavailable) {
         ctx.ui.notify(`Update check unavailable: ${result.unavailable}`, "info");

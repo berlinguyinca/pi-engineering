@@ -159,3 +159,37 @@ test("self-update: a backwards clock does not lock out checking", () => {
   // clock to catch up could mean never checking again.
   assert.equal(shouldCheck(5_000, 1_000), true);
 });
+
+test("self-update: a failing git status is unavailable, not a silent 'current'", async () => {
+  // Reporting "up to date" because the check itself broke is the worst of both
+  // worlds: no update and no reason to look for one.
+  const g = fakeGit({ inside: { stdout: "true" }, status: { code: 128, stderr: "fatal: bad object" } });
+  const result = await checkForUpdate({ cwd: "/repo", git: g.git, apply: true });
+
+  assert.equal(result.decision.action, "skip");
+  assert.match(result.unavailable ?? "", /git status failed/);
+  assert.equal(g.ran("merge"), false);
+});
+
+test("self-update: a diverged AND dirty tree reports both facts", async () => {
+  // An operator told only "diverged" may reach for a rebase without knowing the
+  // tree is unclean.
+  const g = fakeGit({
+    inside: { stdout: "true" },
+    status: {
+      stdout: [
+        "# branch.oid abc",
+        "# branch.head main",
+        "# branch.upstream origin/main",
+        "# branch.ab +2 -3",
+        "1 .M N... 100644 100644 100644 a b src/x.ts",
+      ].join("\n"),
+    },
+  });
+  const result = await checkForUpdate({ cwd: "/repo", git: g.git, apply: true });
+
+  assert.equal(result.decision.action, "report");
+  assert.match(result.decision.reason, /diverged/);
+  assert.match(result.decision.reason, /uncommitted changes present/);
+  assert.equal(g.ran("merge"), false);
+});

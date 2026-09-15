@@ -85,6 +85,14 @@ export async function checkForUpdate(opts: SelfUpdateOptions): Promise<SelfUpdat
     //
     // `--ff-only` is the guarantee: if upstream moved in a way that cannot
     // fast-forward, this fails rather than inventing a merge commit.
+    //
+    // The cleanliness check above is a SNAPSHOT, so a file edited between it and
+    // this line is not covered by it. That window is not closed here, and the
+    // reason it is survivable is git's own behaviour rather than this code's:
+    // a fast-forward refuses outright when it would overwrite a conflicting
+    // local change, and carries a non-conflicting one across. So "never applied
+    // over uncommitted work" is the intent of the check, not an atomic
+    // guarantee — stated plainly rather than implied.
     const target = observation.upstream ?? "@{u}";
     const pull = await opts.git(["merge", "--ff-only", target]);
     if (pull.code !== 0) {

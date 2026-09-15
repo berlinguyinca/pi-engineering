@@ -299,3 +299,22 @@ test("wiring: session_start returns without waiting on the update check", async 
     else process.env.PI_SELF_UPDATE = prev;
   }
 });
+
+test("wiring: the session_start check honours PI_SELF_UPDATE=0", async () => {
+  // The auto-apply path runs unattended against the operator's own checkout, so
+  // the off switch has to actually be wired to it.
+  const prev = process.env.PI_SELF_UPDATE;
+  process.env.PI_SELF_UPDATE = "0";
+  try {
+    const handlers = loadExtension();
+    const starts = handlers.get("session_start") ?? [];
+    const ctx = ctxStub();
+    const began = Date.now();
+    await Promise.all(starts.map((h) => Promise.resolve(h({}, ctx))));
+
+    assert.ok(Date.now() - began < 1_000, "disabled means no work at all, not work that is ignored");
+  } finally {
+    if (prev === undefined) delete process.env.PI_SELF_UPDATE;
+    else process.env.PI_SELF_UPDATE = prev;
+  }
+});

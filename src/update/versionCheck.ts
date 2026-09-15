@@ -74,10 +74,14 @@ export function decideUpdate(obs: RepoObservation): UpdateAction {
   if (obs.ahead > 0) {
     // Diverged. A fast-forward is impossible and anything else is a merge,
     // which is a decision about someone's work, not a maintenance task.
+    //
+    // The dirty fact is included rather than suppressed: an operator told only
+    // "diverged" may reach for a rebase without knowing the tree is unclean.
+    const dirtyNote = obs.dirty ? ", uncommitted changes present" : "";
     return {
       action: "report",
       behind: obs.behind,
-      reason: `diverged from ${obs.upstream} (${obs.ahead} ahead, ${obs.behind} behind) — merge or rebase yourself`,
+      reason: `diverged from ${obs.upstream} (${obs.ahead} ahead, ${obs.behind} behind${dirtyNote}) — merge or rebase yourself`,
     };
   }
   if (obs.dirty) {
