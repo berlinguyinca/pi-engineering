@@ -76,22 +76,27 @@ export async function checkForUpdate(opts: SelfUpdateOptions): Promise<SelfUpdat
       return { decision, observation, applied: false };
     }
 
-    // `--ff-only` is the guarantee. If upstream moved in a way that cannot
+    // Merge the tracked upstream ref, NOT `FETCH_HEAD`. A fetch that touches
+    // several refs leaves FETCH_HEAD pointing at whichever came last, so it is
+    // the wrong target in exactly the repositories this runs in — and using it
+    // as the primary path meant every real apply fell through to a branch no
+    // test covered. The upstream ref is what `behind` was computed against, so
+    // it is the only ref whose fast-forward matches the decision.
+    //
+    // `--ff-only` is the guarantee: if upstream moved in a way that cannot
     // fast-forward, this fails rather than inventing a merge commit.
-    const pull = await opts.git(["merge", "--ff-only", "FETCH_HEAD"]);
+    const target = observation.upstream ?? "@{u}";
+    const pull = await opts.git(["merge", "--ff-only", target]);
     if (pull.code !== 0) {
-      const fallback = await opts.git(["merge", "--ff-only", observation.upstream ?? "@{u}"]);
-      if (fallback.code !== 0) {
-        return {
-          decision: {
-            action: "report",
-            behind: decision.behind,
-            reason: `fast-forward refused: ${firstLine(fallback.stderr || fallback.stdout)}`,
-          },
-          observation,
-          applied: false,
-        };
-      }
+      return {
+        decision: {
+          action: "report",
+          behind: decision.behind,
+          reason: `fast-forward refused: ${firstLine(pull.stderr || pull.stdout)}`,
+        },
+        observation,
+        applied: false,
+      };
     }
 
     const head = await opts.git(["rev-parse", "HEAD"]);

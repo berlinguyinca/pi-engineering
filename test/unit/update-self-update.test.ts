@@ -44,6 +44,28 @@ test("self-update: a clean checkout behind upstream is fast-forwarded when asked
   assert.ok(merge?.includes("--ff-only"), "a background task must never invent a merge commit");
 });
 
+test("self-update: the merge targets the tracked upstream, never FETCH_HEAD", async () => {
+  // Found by fresh-context review. A fetch touching several refs leaves
+  // FETCH_HEAD pointing at whichever came last, so it is the wrong target in
+  // exactly the repositories this runs in — and using it as the primary path
+  // meant every real apply fell through to a branch no test covered.
+  const g = fakeGit({
+    inside: { stdout: "true" },
+    status: { stdout: BEHIND },
+    merge: { code: 0 },
+    "rev-parse HEAD": { stdout: "newsha" },
+  });
+  await checkForUpdate({ cwd: "/repo", git: g.git, apply: true });
+
+  const merge = g.calls.find((c) => c[0] === "merge");
+  assert.deepEqual(merge, ["merge", "--ff-only", "origin/main"]);
+  assert.equal(
+    g.calls.filter((c) => c[0] === "merge").length,
+    1,
+    "one attempt against the ref the decision was computed from",
+  );
+});
+
 test("self-update: reporting mode never mutates the checkout", async () => {
   const g = fakeGit({ inside: { stdout: "true" }, status: { stdout: BEHIND } });
   const result = await checkForUpdate({ cwd: "/repo", git: g.git, apply: false });

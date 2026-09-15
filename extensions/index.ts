@@ -370,6 +370,28 @@ ${RECOVERY_PROMPT}`;
     return checkForUpdate({ cwd: extensionRoot, git: runGit, apply });
   };
 
+  // Registered on its own, NOT inside the gateway-admission block: staying
+  // current has nothing to do with backpressure, and nesting it there meant
+  // PI_GATEWAY_ADMISSION_ENABLED=0 silently switched off update checking too.
+  // Found by a fresh-context review.
+  if (typeof pi.on === "function") {
+    pi.on("session_start", (_event, ctx) => {
+      if (!selfUpdateEnabled || !shouldCheck(lastUpdateCheckAt, Date.now())) return;
+      // Deliberately not awaited: a session must never wait on a network call
+      // to start, and a failed check is silence rather than a notice.
+      void runSelfUpdate(selfUpdateMode !== "check")
+        .then((result) => {
+          if (result.unavailable) return;
+          // Only speak when there is something to act on. "You are up to date"
+          // every few hours is noise that trains the operator to ignore the one
+          // notice that matters.
+          if (result.decision.action === "current" || result.decision.action === "skip") return;
+          ctx.ui.notify(describeUpdate(result.decision, { applied: result.applied }), "info");
+        })
+        .catch(() => {});
+    });
+  }
+
   pi.registerCommand("update", {
     description: "Check for and apply extension updates (fast-forward only, never over uncommitted work).",
     handler: async (args: string, ctx: ExtensionCommandContext) => {
@@ -680,21 +702,6 @@ ${RECOVERY_PROMPT}`;
     pi.on("session_start", (_event, ctx) => {
       latestCtx = ctx as ExtensionCommandContext;
       installStreamRetry(ctx, ctx.model);
-
-      // Deliberately not awaited: a session must never wait on a network call
-      // to start, and a failed check is silence rather than a notice.
-      if (selfUpdateEnabled && shouldCheck(lastUpdateCheckAt, Date.now())) {
-        void runSelfUpdate(selfUpdateMode !== "check")
-          .then((result) => {
-            if (result.unavailable) return;
-            // Only speak when there is something to act on. "You are up to
-            // date" every four hours is noise that trains the operator to
-            // ignore the one notice that matters.
-            if (result.decision.action === "current" || result.decision.action === "skip") return;
-            ctx.ui.notify(describeUpdate(result.decision, { applied: result.applied }), "info");
-          })
-          .catch(() => {});
-      }
     });
     pi.on("before_agent_start", (_event, ctx) => {
       latestCtx = ctx as ExtensionCommandContext;

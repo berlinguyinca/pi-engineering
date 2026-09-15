@@ -248,3 +248,54 @@ test("wiring: /update is registered and reports without mutating anything", asyn
   assert.ok((notices[0]?.text ?? "").length > 0);
   assert.ok((notices[0]?.text ?? "").split("\n").length <= 4, "a notice, not a git transcript");
 });
+
+test("wiring: update checking survives the gateway being disabled", async () => {
+  // Found by fresh-context review. The session_start auto-check was nested
+  // inside the gateway-admission guard, so PI_GATEWAY_ADMISSION_ENABLED=0
+  // silently switched off update checking too — two unrelated features sharing
+  // one switch, which is exactly the kind of coupling nobody discovers until
+  // they are stuck on stale code with no idea why.
+  const prevGateway = process.env.PI_GATEWAY_ADMISSION_ENABLED;
+  const prevUpdate = process.env.PI_SELF_UPDATE;
+  process.env.PI_GATEWAY_ADMISSION_ENABLED = "0";
+  process.env.PI_SELF_UPDATE = "check";
+  setSharedAdmissionController(undefined);
+  try {
+    const handlers = loadExtension();
+    const starts = handlers.get("session_start") ?? [];
+    assert.ok(starts.length > 0, "session_start must still be wired with the gateway disabled");
+
+    // Driving them must not throw, and must not block on the network.
+    const ctx = ctxStub();
+    await Promise.all(starts.map((h) => Promise.resolve(h({}, ctx))));
+  } finally {
+    if (prevGateway === undefined) delete process.env.PI_GATEWAY_ADMISSION_ENABLED;
+    else process.env.PI_GATEWAY_ADMISSION_ENABLED = prevGateway;
+    if (prevUpdate === undefined) delete process.env.PI_SELF_UPDATE;
+    else process.env.PI_SELF_UPDATE = prevUpdate;
+    setSharedAdmissionController(undefined);
+  }
+});
+
+test("wiring: session_start returns without waiting on the update check", async () => {
+  // The "deliberately not awaited" claim, verified rather than asserted in a
+  // comment: a session must never wait on a network call to start.
+  const prev = process.env.PI_SELF_UPDATE;
+  process.env.PI_SELF_UPDATE = "check";
+  try {
+    const handlers = loadExtension();
+    const starts = handlers.get("session_start") ?? [];
+    const ctx = ctxStub();
+
+    const began = Date.now();
+    await Promise.all(starts.map((h) => Promise.resolve(h({}, ctx))));
+    const elapsed = Date.now() - began;
+
+    // A real fetch against a remote takes far longer than this; anything under
+    // a second proves the handler did not await one.
+    assert.ok(elapsed < 1_000, `session_start took ${elapsed}ms — it is awaiting the check`);
+  } finally {
+    if (prev === undefined) delete process.env.PI_SELF_UPDATE;
+    else process.env.PI_SELF_UPDATE = prev;
+  }
+});
