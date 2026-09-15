@@ -189,6 +189,14 @@ export interface RuntimePhaseEvent {
   goal?: string;
   /** Model that produced this phase, known only once a worker has run. */
   model?: string;
+  /**
+   * Token/cost usage for this phase, when a worker reported it.
+   *
+   * Per-model spend is not persisted anywhere — WorkerUsage is folded into the
+   * runtime's aggregate telemetry and lost per model — so this event is the
+   * source the panel accumulates from.
+   */
+  usage?: { input: number; output: number; cost: number };
 }
 
 export interface EngineeringRuntimeOptions {
@@ -455,6 +463,7 @@ export class EngineeringRuntime {
           phase,
           goal: this.currentPhaseGoal || undefined,
           model: run.usage.model,
+          usage: { input: run.usage.input, output: run.usage.output, cost: run.usage.cost },
         });
       }
     }
