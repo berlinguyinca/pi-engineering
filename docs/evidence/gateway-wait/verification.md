@@ -27,11 +27,13 @@ admission controller instead, eventually succeeded.
 
 - `npm run typecheck`: passed.
 - `npm run lint`: passed.
-- `npm test`: 752 tests, 751 passed, zero failed, one optional PostgreSQL test
+- `npm test`: 840 tests, 839 passed, zero failed, one optional PostgreSQL test
   skipped.
-- `npm run test:e2e`: package loads with 16 commands and six core tools.
-- 40+ new tests covering the retry pump, the installer, admission scoping,
-  fallback selection and the `/gateway` report.
+- `npm run test:e2e`: package loads with 17 commands and six core tools.
+- ~120 new tests covering the retry pump, the installer, admission scoping,
+  fallback selection, the `/gateway` report, the catalogue reader and planner,
+  `models.json` persistence, cached readiness, and the extension's own event and
+  command wiring.
 - `test/integration/gateway-stream-retry-registry.test.ts` drives a real
   `ModelRuntime`, not a double, through the same entry point Pi's agent loop
   uses.
@@ -125,10 +127,40 @@ which refusals are account-wide — was also resolved: all three now share one
 predicate keyed on what a refusal is about rather than on where its wait came
 from.
 
+A third gateway review and a first models-area review were run after the
+`/refresh-models`, `/gateway` and readiness work landed. Both reported zero
+critical and zero high findings.
+
+The gateway review's substantive finding was that two predicates which looked
+like duplicates disagreed: `isGatewayAdmissionRefusal` (which layer owns an
+error) still keyed on a body-advertised wait while `isAccountWideRefusal` (who
+has to wait) keyed on what the refusal is about. Underneath the naming confusion
+was a real gap — a rate limit reporting its wait in a `Retry-After` header went
+to the layer that gives up after four attempts, which is the failure this work
+removed from the interactive turn, still present on the worker path. Ownership
+now keys on whether a wait was advertised at all.
+
+Writing the boundary test for that exposed a further defect, unrelated to the
+review: `"overloaded"` — Anthropic's 529 wording, and a member of pi-ai's own
+retryable pattern list — was missing from `classifyError`, so a text-only
+overload error was classified permanent and a worker abandoned a failure that
+clears itself in seconds.
+
+The models review's medium finding was that an added model's fabricated `cost`
+and `name` were not declared as inferred; a zero cost is a claim that the model
+is free, which the gateway never made. Its low findings about credential-bearing
+files were also acted on: a failed write no longer strands a key-bearing
+temporary file, and backups are capped so repeated refreshes do not accumulate
+copies of the API key.
+
 Both reviews independently confirmed, by reading the installed package rather
 than this repo's documentation, that pi's `AssistantMessageEventStream`
 completes on the first `done`/`error` event and drops every later push — the
 fact the whole retry-safety rule rests on.
+
+Across all five reviews, findings were fixed rather than waived except where a
+reason is recorded in the commit that closed them. No review reported a critical
+or high finding at any point.
 
 The reviews are scoped to this delta and its interaction with the existing
 admission controller and transient-retry layers. They are not a fresh audit of
