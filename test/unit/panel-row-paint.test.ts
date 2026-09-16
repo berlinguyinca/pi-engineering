@@ -211,3 +211,54 @@ test("shaping: every row that means something carries a tone", () => {
   );
   assert.equal(rows.find((row) => row.payload.kind === "section")?.tone, "section");
 });
+
+function manyRows(count: number): PanelState {
+  const state = new PanelState();
+  state.set({
+    updatedAt: 1,
+    narrative: { text: "Working through the panel's rendering.", updatedAt: 1, generated: true },
+    workspace: {
+      branch: "main",
+      files: Array.from({ length: count }, (_, i) => ({ path: `src/f${i}.ts`, change: "modified" as const })),
+    },
+  });
+  return state;
+}
+
+test("component: a cursor below the fold highlights nothing, not the summary", () => {
+  // Both render paths clip — `padToHeight` to the terminal, the split to
+  // whatever the narrative leaves — so a selection scrolled past the bottom has
+  // an index that refers to a line the tree no longer occupies. In the split
+  // that line belongs to the SUMMARY, and the highlight would land on generated
+  // prose while the cursor sat somewhere else entirely.
+  const component = new PanelComponent({
+    state: manyRows(40),
+    requestRender: () => {},
+    fillHeight: () => 18,
+    theme: spyTheme(),
+  });
+  for (let i = 0; i < 39; i++) component.handleInput("\x1b[B");
+  const lines = component.render(50);
+  assert.equal(lines.length, 18, "the panel still fills its column");
+  assert.equal(
+    lines.filter((line) => line.includes("<bg:selectedBg>")).length,
+    0,
+    "an off-screen cursor highlights no row at all",
+  );
+  component.dispose();
+});
+
+test("component: a cursor inside the tree pane still highlights, with a summary below", () => {
+  const component = new PanelComponent({
+    state: manyRows(40),
+    requestRender: () => {},
+    fillHeight: () => 18,
+    theme: spyTheme(),
+  });
+  component.handleInput("\x1b[B");
+  const lines = component.render(50);
+  const at = lines.findIndex((line) => line.includes("<bg:selectedBg>"));
+  assert.ok(at >= 0, "a visible cursor is still drawn");
+  assert.ok(at < 12, "and it is in the tree pane, not the summary");
+  component.dispose();
+});

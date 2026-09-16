@@ -194,13 +194,16 @@ export class PanelComponent {
       const total = this.fillHeight?.();
       const narrative = this.renderNarrative(inner, total);
       if (narrative.length === 0) {
-        return this.withBorder(this.withHint(this.padToHeight(bounded, inner), inner), inner);
+        const body = this.padToHeight(bounded, inner);
+        this.clampSelectedLine(body.length);
+        return this.withBorder(this.withHint(body, inner), inner);
       }
 
       // The tree takes what the narrative does not, so the split always sums to
       // the height the overlay was given rather than overflowing it.
       const topHeight = Math.max(0, (total ?? bounded.length + narrative.length) - narrative.length);
       const top = bounded.length >= topHeight ? bounded.slice(0, topHeight) : this.pad(bounded, topHeight, inner);
+      this.clampSelectedLine(top.length);
       return this.withBorder([...this.withHint(top, inner), ...narrative], inner);
     } catch {
       // Never throw into Pi's render loop.
@@ -234,6 +237,19 @@ export class PanelComponent {
     if (this.focusedFn?.() === true) return " ↑↓ move · ⏎ open · esc leave · tab switch";
     const chord = this.chord && this.chord !== "none" ? this.chord : undefined;
     return chord ? ` ${chord} to navigate` : "";
+  }
+
+  /**
+   * Forget the cursor's line when it falls outside the tree pane.
+   *
+   * Both paths clip: `padToHeight` to the terminal, and the split to whatever
+   * the narrative leaves. A selection below the fold is off screen, and its
+   * index then refers to a line the tree no longer occupies — in the split that
+   * is a row of the SUMMARY, so the highlight would land on generated prose
+   * while the cursor is somewhere else entirely.
+   */
+  private clampSelectedLine(treeHeight: number): void {
+    if (this.selectedLine !== null && this.selectedLine >= treeHeight) this.selectedLine = null;
   }
 
   /**
