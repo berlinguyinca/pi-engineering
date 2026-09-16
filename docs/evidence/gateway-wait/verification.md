@@ -27,9 +27,9 @@ admission controller instead, eventually succeeded.
 
 - `npm run typecheck`: passed.
 - `npm run lint`: passed.
-- `npm test`: 840 tests, 839 passed, zero failed, one optional PostgreSQL test
+- `npm test`: 883 tests, 882 passed, zero failed, one optional PostgreSQL test
   skipped.
-- `npm run test:e2e`: package loads with 17 commands and six core tools.
+- `npm run test:e2e`: package loads with 18 commands and six core tools.
 - ~120 new tests covering the retry pump, the installer, admission scoping,
   fallback selection, the `/gateway` report, the catalogue reader and planner,
   `models.json` persistence, cached readiness, and the extension's own event and
@@ -67,6 +67,15 @@ real narrative from a live model for the first time — the one part of the pane
 that had never been observed working, and whose failures `Narrator` swallows by
 design. The first run exposed output cut mid-word at exactly 400 characters;
 narratives are now cut at a sentence boundary.
+
+`node scripts/dogfood-self-update.ts` passed four phases against real git
+checkouts: a clone genuinely behind its upstream is fast-forwarded and HEAD
+really moves; a clone carrying a real uncommitted edit is reported rather than
+applied, HEAD does not move, and the edit is intact afterwards; this repository
+is read in report-only mode and verified unchanged; and a directory that is not
+a repository is silence rather than an error. Writing that fixture exposed a
+portability bug in the fixture itself — pushing a `main` refspec fails on a
+machine whose `init.defaultBranch` is something else.
 
 `node scripts/dogfood-roadmap.ts` passed the incomplete → verified → invalidated
 → reverified lifecycle in a disposable repository.
@@ -158,7 +167,25 @@ than this repo's documentation, that pi's `AssistantMessageEventStream`
 completes on the first `done`/`error` event and drops every later push — the
 fact the whole retry-safety rule rests on.
 
-Across all five reviews, findings were fixed rather than waived except where a
+Four further reviews covered the self-update feature (twice), the models area
+and the panel/status surface. All reported zero critical and zero high findings.
+
+The update reviews found that the session-start check had been nested inside the
+gateway-admission guard, so `PI_GATEWAY_ADMISSION_ENABLED=0` silently disabled
+update checking as well; that the fast-forward targeted `FETCH_HEAD`, which a
+multi-ref fetch leaves pointing at the wrong commit, so every real apply fell
+through to an untested fallback; and that the "never applied over uncommitted
+work" claim was stated more strongly than the code delivers — the cleanliness
+check is a snapshot, and what makes the remaining window survivable is git's own
+refusal to fast-forward over a conflicting change rather than anything here.
+
+The surface review found a defect that did not exist when the code was written:
+the panel's working-tree view refreshed only when the panel was opened, which
+was adequate while the panel was a toggle and became wrong when it was changed
+to stay open for a whole session. No test failed, because nothing broke — the
+context around the code changed.
+
+Across all nine reviews, findings were fixed rather than waived except where a
 reason is recorded in the commit that closed them. No review reported a critical
 or high finding at any point.
 
