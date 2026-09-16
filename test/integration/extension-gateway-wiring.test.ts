@@ -318,3 +318,51 @@ test("wiring: the session_start check honours PI_SELF_UPDATE=0", async () => {
     else process.env.PI_SELF_UPDATE = prev;
   }
 });
+
+test("wiring: the panel does not open itself by default", async () => {
+  // `ctx.ui.custom()` is documented as "Show a custom component with keyboard
+  // focus", and pi has no non-focusing variant — so a panel opened before the
+  // operator asked for it takes the keyboard and pi accepts no input at all.
+  // This shipped once; the assertion exists so it cannot ship twice.
+  const prev = process.env.PI_PANEL_AUTO_OPEN;
+  delete process.env.PI_PANEL_AUTO_OPEN;
+  try {
+    let customCalls = 0;
+    const handlers = new Map<string, Handler[]>();
+    const pi = {
+      on: (name: string, handler: Handler) => {
+        const list = handlers.get(name) ?? [];
+        list.push(handler);
+        handlers.set(name, list);
+      },
+      registerCommand: () => {},
+      registerTool: () => {},
+      registerShortcut: () => {},
+      registerFlag: () => {},
+      getFlag: () => undefined,
+      registerMessageRenderer: () => {},
+      registerMarkdownTransformer: () => {},
+      registerEntryRenderer: () => {},
+      setModel: async () => false,
+      events: { on: () => {}, emit: () => {} },
+    };
+    (extension as unknown as (pi: unknown) => void)(pi);
+
+    const ctx = {
+      ...ctxStub(),
+      ui: {
+        ...ctxStub().ui,
+        custom: () => {
+          customCalls++;
+          return Promise.resolve();
+        },
+      },
+    };
+    for (const h of handlers.get("session_start") ?? []) await Promise.resolve(h({}, ctx));
+
+    assert.equal(customCalls, 0, "a session start must never seize the keyboard");
+  } finally {
+    if (prev === undefined) delete process.env.PI_PANEL_AUTO_OPEN;
+    else process.env.PI_PANEL_AUTO_OPEN = prev;
+  }
+});
