@@ -219,3 +219,68 @@ test("component: without a height hint the panel renders only its content", () =
   assert.ok(lines.length > 0 && lines.length < 20, `expected content-sized output, got ${lines.length}`);
   c.dispose();
 });
+
+test("component: the narrative gets the bottom third, tree keeps the rest", () => {
+  const state = new PanelState();
+  state.set({
+    updatedAt: 1,
+    workspace: { branch: "main", files: [{ path: "a.ts", change: "modified" }] },
+    narrative: { generated: true, updatedAt: 1, text: "We started on X then moved to Y and are now on Z." },
+  });
+  const c = new PanelComponent({ state, requestRender: () => {}, fillHeight: () => 18 });
+
+  const lines = c.render(60);
+  assert.equal(lines.length, 18, "the split must sum to the height given, not overflow it");
+  const ruleAt = lines.findIndex((l) => l.includes("summary"));
+  assert.ok(ruleAt > 0, "a titled rule separates the panes");
+  assert.ok(lines.length - ruleAt <= 7, `the narrative pane should be about a third, got ${lines.length - ruleAt}`);
+  c.dispose();
+});
+
+test("component: the summary is labelled as generated", () => {
+  // It is a model's summary of observed state, not a record of it, and the
+  // panel must never let the two read the same (INV-006).
+  const state = new PanelState();
+  state.set({ updatedAt: 1, narrative: { generated: true, updatedAt: 1, text: "Some prose." } });
+  const c = new PanelComponent({ state, requestRender: () => {}, fillHeight: () => 18 });
+
+  assert.match(c.render(60).join("\n"), /summary · generated/);
+  c.dispose();
+});
+
+test("component: a short panel shows no split", () => {
+  // Two cramped panes are worse than one, and the tree is the half you act on.
+  const state = new PanelState();
+  state.set({
+    updatedAt: 1,
+    workspace: { branch: "main", files: [{ path: "a.ts", change: "modified" }] },
+    narrative: { generated: true, updatedAt: 1, text: "Some prose." },
+  });
+  const c = new PanelComponent({ state, requestRender: () => {}, fillHeight: () => 8 });
+
+  assert.doesNotMatch(c.render(60).join("\n"), /summary · generated/);
+  c.dispose();
+});
+
+test("component: no narrative means no rule and no wasted rows", () => {
+  const state = new PanelState();
+  state.set({ updatedAt: 1, workspace: { branch: "main", files: [{ path: "a.ts", change: "modified" }] } });
+  const c = new PanelComponent({ state, requestRender: () => {}, fillHeight: () => 18 });
+
+  const lines = c.render(60);
+  assert.doesNotMatch(lines.join("\n"), /summary/);
+  assert.equal(lines.length, 18);
+  c.dispose();
+});
+
+test("component: opening a file replaces the split rather than shrinking it", () => {
+  // While reading a file the whole column is the file; a summary stripe under
+  // it would cost rows the reader needs.
+  const state = new PanelState();
+  state.set({ updatedAt: 1, narrative: { generated: true, updatedAt: 1, text: "Some prose." } });
+  const c = new PanelComponent({ state, requestRender: () => {}, fillHeight: () => 18 });
+  c.showContent({ title: "x.ts", lines: ["const a = 1;"], truncated: false });
+
+  assert.doesNotMatch(c.render(60).join("\n"), /summary · generated/);
+  c.dispose();
+});

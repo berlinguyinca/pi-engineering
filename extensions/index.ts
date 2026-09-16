@@ -929,15 +929,21 @@ ${RECOVERY_PROMPT}`;
   /**
    * Start the session narrator for a repo, at most once.
    *
-   * Off by default (`PI_PANEL_NARRATOR`): it is the only part of the panel that
-   * spends money, so the operator opts in. It observes the panel's own state —
+   * On by default now that the panel gives the summary a permanent home;
+   * `PI_PANEL_NARRATOR=0` turns it off. It is the only part of the panel that
+   * spends money, and it is the operator's money, so the gate stays and the
+   * cost is bounded rather than hidden: one call at most every two minutes,
+   * only when the observed state has actually changed, never while a gateway
+   * cooldown is standing, and nothing at all in a session that never opens the
+   * panel. It observes the panel's own state —
    * the run view the ledger feeder already publishes — rather than reaching
    * into the runtime for a second source of truth, and it is gated on the SAME
    * admission controller as every other model call in this process.
    */
   const narrators = new Map<string, Narrator>();
   function startNarrator(plumbing: PanelPlumbing, _rt: EngineeringRuntime): void {
-    if (process.env.PI_PANEL_NARRATOR !== "true") return;
+    const mode = (process.env.PI_PANEL_NARRATOR ?? "1").toLowerCase();
+    if (mode === "0" || mode === "false" || mode === "off") return;
     const key = [...panels.entries()].find(([, value]) => value === plumbing)?.[0];
     if (!key || narrators.has(key)) return;
 

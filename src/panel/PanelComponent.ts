@@ -17,6 +17,16 @@ import { type GutterKind, formatGutter, gutterWidth, numberDiffLines, numberFile
 /** The panel's left edge, and the columns it costs (glyph + space). */
 const BORDER_GLYPH = "│";
 const BORDER_WIDTH = 2;
+
+/**
+ * Share of the panel given to the narrative pane.
+ *
+ * A third: enough for a few sentences of arc, not so much that the tree — the
+ * part you act on — has to scroll to show a handful of files.
+ */
+const NARRATIVE_SHARE = 1 / 3;
+/** Below this the split is abandoned: two cramped panes are worse than one. */
+const MIN_SPLIT_HEIGHT = 12;
 import { highlightLine, looksLikeDiff } from "./highlight.ts";
 import {
   DEFAULT_LAYOUT,
@@ -28,6 +38,7 @@ import {
 } from "./layout.ts";
 import { type SearchState, findMatches, stepMatch } from "./search.ts";
 import { type PanelRow, type RowPayload, buildRows, clampSelection, renderTabBar } from "./tree.ts";
+import { wrapTail } from "./wrap.ts";
 
 const KEY_UP = "\x1b[A";
 const KEY_DOWN = "\x1b[B";
@@ -154,11 +165,61 @@ export class PanelComponent {
       // Belt and braces: the TUI contract is per-line, and a styling mistake
       // here would corrupt the whole frame.
       const bounded = lines.map((line) => (visibleWidth(line) > inner ? truncateToWidth(line, inner, "…") : line));
-      return this.withBorder(this.padToHeight(bounded, inner), inner);
+
+      const total = this.fillHeight?.();
+      const narrative = this.renderNarrative(inner, total);
+      if (narrative.length === 0) return this.withBorder(this.padToHeight(bounded, inner), inner);
+
+      // The tree takes what the narrative does not, so the split always sums to
+      // the height the overlay was given rather than overflowing it.
+      const topHeight = Math.max(0, (total ?? bounded.length + narrative.length) - narrative.length);
+      const top = bounded.length >= topHeight ? bounded.slice(0, topHeight) : this.pad(bounded, topHeight, inner);
+      return this.withBorder([...top, ...narrative], inner);
     } catch {
       // Never throw into Pi's render loop.
       return [];
     }
+  }
+
+  /**
+   * The bottom pane: what this session has been working on.
+   *
+   * Returns nothing when there is no narrative, or when the panel is too short
+   * to carry two panes — a tree squeezed into four rows next to three rows of
+   * prose serves neither, and the tree is the half you act on.
+   *
+   * The text is labelled as generated on its own rule. It is a model's summary
+   * of observed state, not a record of it, and the panel must never let the two
+   * read the same (INV-006).
+   */
+  private renderNarrative(width: number, totalHeight: number | undefined): string[] {
+    const narrative = this.state.snapshot.narrative;
+    if (!narrative?.text || this.content) return [];
+    if (totalHeight === undefined || totalHeight < MIN_SPLIT_HEIGHT) return [];
+
+    const paneHeight = Math.max(3, Math.floor(totalHeight * NARRATIVE_SHARE));
+    const bodyHeight = paneHeight - 1; // one row for the rule
+    const rule = this.rule(width, "summary · generated");
+    const body = wrapTail(narrative.text, width, bodyHeight);
+    const theme = this.theme;
+    const painted = theme ? body.map((l) => theme.fg("thinkingText", l)) : body;
+    return [rule, ...painted, ...Array.from({ length: Math.max(0, bodyHeight - painted.length) }, () => "")];
+  }
+
+  /** A titled horizontal rule: `── summary · generated ────`. */
+  private rule(width: number, title: string): string {
+    const label = ` ${title} `;
+    const dashes = Math.max(0, width - label.length - 2);
+    const text = `──${label}${"─".repeat(dashes)}`;
+    const clipped = truncateToWidth(text, width, "…");
+    return this.theme ? this.theme.fg("borderMuted", clipped) : clipped;
+  }
+
+  /** Pad `lines` to `height` with blanks of the panel's inner width. */
+  private pad(lines: string[], height: number, width: number): string[] {
+    if (lines.length >= height) return lines;
+    const blank = " ".repeat(Math.max(0, width));
+    return [...lines, ...Array.from({ length: height - lines.length }, () => blank)];
   }
 
   /**
