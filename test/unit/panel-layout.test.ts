@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { test } from "node:test";
 import {
   DEFAULT_LAYOUT,
@@ -43,7 +44,7 @@ test("layout: a saved layout round-trips through the file, not just memory", asy
   const p = await tempProfile();
   try {
     const written = new PanelLayoutStore({ profileDir: p.dir });
-    written.save({ widthPercent: 50, tab: "reviews", expanded: ["files", "run"] });
+    written.save({ ...DEFAULT_LAYOUT, widthPercent: 50, tab: "reviews", expanded: ["files", "run"] });
     // A SEPARATE store instance: this is the restart the acceptance criteria mean.
     const reloaded = new PanelLayoutStore({ profileDir: p.dir }).load();
     assert.equal(reloaded.widthPercent, 50);
@@ -57,7 +58,12 @@ test("layout: a saved layout round-trips through the file, not just memory", asy
 test("layout: the file is owner-only and holds no repository content", async () => {
   const p = await tempProfile();
   try {
-    new PanelLayoutStore({ profileDir: p.dir }).save({ widthPercent: 40, tab: "files", expanded: [] });
+    new PanelLayoutStore({ profileDir: p.dir }).save({
+      ...DEFAULT_LAYOUT,
+      widthPercent: 40,
+      tab: "files",
+      expanded: [],
+    });
     const path = join(p.dir, "engineering-panel", "layout.json");
     assert.equal((await stat(path)).mode & 0o777, 0o600);
     const body = await readFile(path, "utf8");
@@ -115,9 +121,62 @@ test("layout: an unwritable profile drops the preference without throwing", asyn
     const notADirectory = join(p.dir, "blocker");
     await writeFile(notADirectory, "");
     const store = new PanelLayoutStore({ profileDir: notADirectory });
-    assert.doesNotThrow(() => store.save({ widthPercent: 40, tab: "files", expanded: [] }));
+    assert.doesNotThrow(() => store.save({ open: true, widthPercent: 40, tab: "files", expanded: [] }));
     assert.deepEqual(store.load(), DEFAULT_LAYOUT, "and the next load still works");
   } finally {
     await p.cleanup();
+  }
+});
+
+test("layout: the panel is open by default, so it is seen without being discovered", () => {
+  // A panel nobody knows to open is a panel nobody uses, and ambient awareness
+  // of the run is the whole point of it.
+  assert.equal(DEFAULT_LAYOUT.open, true);
+});
+
+test("layout: a deliberate close survives the session that made it", () => {
+  // The difference between a default and an imposition: an operator who shut
+  // the panel should not have to shut it again every session.
+  const dir = mkdtempSync(join(tmpdir(), "panel-open-"));
+  try {
+    const store = new PanelLayoutStore({ profileDir: dir });
+    store.save({ ...DEFAULT_LAYOUT, open: false });
+    assert.equal(store.load().open, false);
+
+    store.save({ ...DEFAULT_LAYOUT, open: true });
+    assert.equal(store.load().open, true);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("layout: a layout written before `open` existed opens the panel", () => {
+  // Upgrade path. Those operators opened the panel deliberately; defaulting
+  // them to closed would silently take away something they were using.
+  const dir = mkdtempSync(join(tmpdir(), "panel-legacy-"));
+  try {
+    const store = new PanelLayoutStore({ profileDir: dir });
+    const path = join(dir, "engineering-panel", "layout.json");
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, JSON.stringify({ widthPercent: 40, tab: "files", expanded: ["files"] }));
+
+    const loaded = store.load();
+    assert.equal(loaded.open, true);
+    assert.equal(loaded.widthPercent, 40, "and the rest of the legacy layout survives");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("layout: a non-boolean `open` falls back rather than being trusted", () => {
+  const dir = mkdtempSync(join(tmpdir(), "panel-bad-open-"));
+  try {
+    const store = new PanelLayoutStore({ profileDir: dir });
+    const path = join(dir, "engineering-panel", "layout.json");
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, JSON.stringify({ widthPercent: 35, tab: "files", expanded: [], open: "yes" }));
+    assert.equal(store.load().open, true);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 });

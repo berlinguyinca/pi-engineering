@@ -30,7 +30,27 @@ export interface PanelLayout {
   tab: PanelTabId;
   /** Section ids left expanded, sorted so the file is stable across saves. */
   expanded: string[];
+  /**
+   * Whether the panel was showing when the last session ended.
+   *
+   * Defaults to true: a panel nobody knows to open is a panel nobody uses, and
+   * the whole point of it is ambient awareness of what the run is doing. But a
+   * deliberate close is remembered — an operator who shut it should not have to
+   * shut it again every session, which is the difference between a default and
+   * an imposition.
+   */
+  open: boolean;
 }
+
+/**
+ * The layout fields the COMPONENT owns.
+ *
+ * Open/closed is deliberately not among them: the component draws the panel, it
+ * does not decide whether the panel exists. Letting it publish `open` would mean
+ * a width nudge rewriting a deliberate close back to open, which is how a
+ * remembered preference quietly stops being remembered.
+ */
+export type PanelLayoutPatch = Omit<PanelLayout, "open">;
 
 export const MIN_WIDTH_PERCENT = 20;
 export const MAX_WIDTH_PERCENT = 80;
@@ -49,6 +69,7 @@ export const DEFAULT_LAYOUT: PanelLayout = {
   widthPercent: 35,
   tab: "files",
   expanded: ["files", "findings", "run", "spend", "workspace"],
+  open: true,
 };
 
 export interface LayoutStoreOptions {
@@ -107,6 +128,10 @@ export class PanelLayoutStore {
         widthPercent: clampWidth(record.widthPercent),
         tab: validTab(record.tab),
         expanded: validExpanded(record.expanded),
+        // Absent means a layout written before this field existed. Those
+        // operators had a panel they opened deliberately, so defaulting to
+        // DEFAULT_LAYOUT.open (true) is what they would expect on upgrade.
+        open: typeof record.open === "boolean" ? record.open : DEFAULT_LAYOUT.open,
       };
     } catch {
       // Missing, unreadable, or malformed: defaults, never an error.
@@ -121,6 +146,7 @@ export class PanelLayoutStore {
         widthPercent: clampWidth(layout.widthPercent),
         tab: validTab(layout.tab),
         expanded: validExpanded(layout.expanded),
+        open: layout.open !== false,
       },
       null,
       2,

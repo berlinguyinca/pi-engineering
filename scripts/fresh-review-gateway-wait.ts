@@ -81,6 +81,29 @@ const AREAS: Record<string, { files: string; requirements: string; inspect: stri
       "unverifiable claims in comments",
     ].join(", "),
   },
+  update: {
+    files:
+      "src/update/versionCheck.ts, src/update/selfUpdate.ts, and the /update command plus session_start check in extensions/index.ts. Tests: test/unit/update-version-check.test.ts, test/unit/update-self-update.test.ts, test/integration/extension-gateway-wiring.test.ts.",
+    requirements: [
+      "An update must NEVER be applied over uncommitted work, onto a detached HEAD, onto a branch with no upstream, or onto a diverged branch.",
+      "Only a strict fast-forward is ever performed; a merge or rebase must never be invented by a background task.",
+      "A session must never be delayed by the check: the network call is not awaited on the startup path.",
+      "A session must never fail because of the check: no git, no remote, no network, or a non-repository directory are all silence.",
+      "After applying an update the operator must be told the running process still has the OLD code loaded.",
+      "The check is throttled so session start is not a network round trip every time.",
+    ].join("\n"),
+    inspect: [
+      "any path that can destroy or stash uncommitted work",
+      "any path that can produce a merge commit or rebase",
+      "blocking or awaited network calls on session start",
+      "unhandled rejections escaping into the session",
+      "command injection or unsafe argument construction in git invocation",
+      "incorrect parsing of git porcelain output",
+      "throttle logic that can lock out checking permanently",
+      "test gaps, especially behaviour no test would catch",
+      "unverifiable claims in comments",
+    ].join(", "),
+  },
   surface: {
     files: "src/status/ and src/panel/, plus their tests.",
     requirements: [
@@ -126,7 +149,10 @@ const run = await worker.run({
   cwd: repo,
   context: "",
   maxContextTokens: 400_000,
-  timeoutMs: 1_800_000,
+  // Generous on purpose: under gateway saturation a reviewer spends most of its
+  // wall clock waiting out advertised 30s holds rather than thinking, and a
+  // review killed mid-flight yields nothing at all.
+  timeoutMs: Number(process.env.PI_REVIEW_TIMEOUT_MS ?? 2_700_000),
 });
 
 const r = run.result as WorkerResult;

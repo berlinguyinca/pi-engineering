@@ -10,7 +10,7 @@
 import { PanelComponent } from "./PanelComponent.ts";
 import type { PanelState } from "./PanelState.ts";
 import type { ContentView } from "./content.ts";
-import type { PanelLayout } from "./layout.ts";
+import type { PanelLayout, PanelLayoutPatch } from "./layout.ts";
 import type { RowPayload } from "./tree.ts";
 
 /** Below this many columns the overlay would crowd the chat rather than help. */
@@ -68,7 +68,21 @@ export interface PanelControllerOptions {
   /** Layout to open with; the panel remembers it across sessions. */
   layout?: PanelLayout;
   /** Called whenever the operator changes tab, width, or expansion. */
-  onLayoutChange?: (layout: PanelLayout) => void;
+  onLayoutChange?: (layout: PanelLayoutPatch) => void;
+  /**
+   * Called when the operator opens or closes the panel, so the preference
+   * outlives the session. Separate from `onLayoutChange` because that carries
+   * the component's fields and this one is the controller's.
+   */
+  onVisibilityChange?: (open: boolean) => void;
+  /**
+   * Called whenever the panel stops being on screen — a toggle, the component
+   * closing itself, or session shutdown. Distinct from `onVisibilityChange`,
+   * which records a PREFERENCE; this one is for releasing work that only makes
+   * sense while the panel is visible, and must fire on every path including the
+   * ones that record nothing.
+   */
+  onHidden?: () => void;
 }
 
 export class PanelController {
@@ -78,7 +92,9 @@ export class PanelController {
   private readonly onOpen: (() => void) | undefined;
   private readonly openRowFn: PanelControllerOptions["openRow"];
   private layout: PanelLayout | undefined;
-  private readonly onLayoutChange: ((layout: PanelLayout) => void) | undefined;
+  private readonly onLayoutChange: ((layout: PanelLayoutPatch) => void) | undefined;
+  private readonly onVisibilityChange: ((open: boolean) => void) | undefined;
+  private readonly onHidden: (() => void) | undefined;
 
   private handle: OverlayHandleLike | null = null;
   private component: PanelComponent | null = null;
@@ -92,6 +108,8 @@ export class PanelController {
     this.openRowFn = opts.openRow;
     this.layout = opts.layout;
     this.onLayoutChange = opts.onLayoutChange;
+    this.onVisibilityChange = opts.onVisibilityChange;
+    this.onHidden = opts.onHidden;
   }
 
   isOpen(): boolean {
@@ -111,6 +129,19 @@ export class PanelController {
   toggle(): void {
     if (this.open) this.close();
     else this.show();
+    // Only a toggle records a preference. `dispose()` closes the panel too, and
+    // a session ending is not the operator saying they want it shut.
+    this.onVisibilityChange?.(this.open);
+  }
+
+  /**
+   * Show the panel without recording a preference.
+   *
+   * Used to restore a remembered "open" at session start: that is honouring a
+   * choice already made, not making a new one.
+   */
+  restore(): void {
+    if (!this.open) this.show();
   }
 
   dispose(): void {
@@ -118,17 +149,24 @@ export class PanelController {
   }
 
   private close(): void {
+    const wasOpen = this.open;
     this.component?.dispose();
     this.component = null;
     this.handle?.hide();
     this.handle = null;
     this.open = false;
+    // Only when it was actually on screen: close() is idempotent and is called
+    // on paths that may already have closed it.
+    if (wasOpen) this.onHidden?.();
   }
 
   private show(): void {
     this.open = true;
     this.onOpen?.();
-    void this.ui.custom(
+    // `.catch`, not `void`: a rejected overlay promise with no handler is an
+    // unhandled rejection, which in a Node process is a crash waiting on a
+    // flag. A panel that cannot be drawn closes itself instead.
+    const overlay = this.ui.custom(
       (tui) => {
         this.component = new PanelComponent({
           state: this.state,
@@ -136,11 +174,14 @@ export class PanelController {
           onClose: () => this.close(),
           openRow: (payload) => void this.openSelection(payload),
           ...(this.layout ? { layout: this.layout } : {}),
-          onLayoutChange: (layout) => {
+          onLayoutChange: (patch) => {
             // Held locally too, so re-opening within the session keeps the tab
-            // and width without a file read.
-            this.layout = layout;
-            this.onLayoutChange?.(layout);
+            // and width without a file read. Open/closed is merged in here
+            // rather than taken from the component: the component draws the
+            // panel, it does not decide whether the panel exists, and letting a
+            // width nudge republish `open` would rewrite a deliberate close.
+            this.layout = { ...patch, open: this.layout?.open ?? true };
+            this.onLayoutChange?.(patch);
           },
         });
         return this.component;
@@ -160,6 +201,9 @@ export class PanelController {
         },
       },
     );
+    // A failure to draw is reported through the same path as a close, so the
+    // controller's `open` flag never claims a panel that is not there.
+    void Promise.resolve(overlay).catch(() => this.close());
   }
 
   private async openSelection(payload: RowPayload): Promise<void> {
