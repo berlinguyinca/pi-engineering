@@ -6,11 +6,32 @@
  * commits are enqueued durably (JSONL) instead of being dropped, and flushed
  * when the service returns. Redaction is applied before enqueue so secrets
  * never leave the process.
+ *
+ * ── The durability model, and why it is not an append log ───────────────────
+ *
+ * The file IS the queue: it holds exactly what has not yet been delivered, and
+ * is rewritten atomically (temp + rename) whenever that set shrinks.
+ *
+ * It was an append log with a side "draining" file, and a fresh-context review
+ * proved two ways that loses data:
+ *
+ *   * nothing ever truncated the log, so every commit ever enqueued was
+ *     re-pushed on every restart, forever — silent duplication if `push` is
+ *     not idempotent, and an unbounded file either way;
+ *   * `load()` renamed the log to a single fixed draining path that nothing
+ *     ever read, so a second restart overwrote it and destroyed commits that
+ *     `enqueue()` had already accepted as durable.
+ *
+ * One file with one meaning removes both. The draining path is still READ on
+ * load, so an outbox written by the previous design recovers rather than being
+ * stranded.
  */
 
-import { appendFile, mkdir, readFile, rename } from "node:fs/promises";
-import { dirname } from "node:path";
+import { randomUUID } from "node:crypto";
+import { appendFile, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { id } from "../core/ids.ts";
+import { emitTelemetry } from "../telemetry/sink.ts";
+import { redactSecrets } from "./redact.ts";
 
 export interface MemoryCommit {
   id: string;
@@ -26,42 +47,57 @@ export interface OutboxTransport {
   push(commit: MemoryCommit): Promise<void>;
 }
 
-const REDACT_PATTERNS: Array<{ pattern: RegExp; replacement: string }> = [
-  // Bearer auth first so its token is consumed before the header rule runs.
-  { pattern: /\b(Bearer\s+)\S+/gi, replacement: "$1[REDACTED]" },
-  // key=value / key: value, consuming the whole value token.
-  {
-    pattern: /\b((?:api[_-]?key|secret|password|token|access[_-]?token|authorization))\s*[:=]\s*\S+/gi,
-    replacement: "$1: [REDACTED]",
-  },
-];
-
-/** Redact secrets before a commit leaves the process (never logs secrets). */
+/**
+ * Redact secrets before a commit leaves the process (never logs secrets).
+ *
+ * The rules live in `redact.ts` now: they were applied here and nowhere else,
+ * while run goals, worker roles and event payloads reached the store and the
+ * control-plane response untouched.
+ */
 export function redactMemoryText(text: string): string {
-  let out = text;
-  for (const { pattern, replacement } of REDACT_PATTERNS) {
-    out = out.replace(pattern, replacement);
-  }
-  return out;
+  return redactSecrets(text);
 }
+
+/**
+ * How many undelivered commits may be held before enqueue refuses.
+ *
+ * A bound is required — an outbox with OpenViking down for a day otherwise
+ * grows without limit in both RAM and disk. Refusing is the explicit policy
+ * rather than dropping the oldest: this module exists so that memory is not
+ * silently lost, and a caller told "no" can react, where a caller whose commit
+ * was quietly evicted cannot.
+ */
+export const DEFAULT_MAX_QUEUE = 10_000;
 
 export interface MemoryOutboxOptions {
   transport: OutboxTransport;
   /** Directory for the durable outbox. Empty = in-memory only (tests). */
   dir?: string;
   flushIntervalMs?: number;
+  /** Undelivered commits held before `enqueue` refuses. */
+  maxQueue?: number;
 }
 
 export class MemoryOutbox {
   private readonly transport: OutboxTransport;
   private readonly dir: string | null;
+  private readonly maxQueue: number;
   private readonly queue: MemoryCommit[] = [];
   private timer: ReturnType<typeof setInterval> | null = null;
   private flushing = false;
+  /**
+   * Serialises every write to the outbox file.
+   *
+   * `enqueue` appends and `flush` rewrites; interleaving those two would let an
+   * append land in a file that is about to be replaced by a snapshot taken
+   * before it, losing the commit.
+   */
+  private writeChain: Promise<void> = Promise.resolve();
 
   constructor(opts: MemoryOutboxOptions) {
     this.transport = opts.transport;
     this.dir = opts.dir ?? null;
+    this.maxQueue = opts.maxQueue ?? DEFAULT_MAX_QUEUE;
     // Durability replay happens only via `open()` (async); the sync constructor
     // never touches the disk, so there is no double-load race on recovery.
     if (opts.flushIntervalMs && opts.flushIntervalMs > 0) {
@@ -81,34 +117,69 @@ export class MemoryOutbox {
     return outbox;
   }
 
+  /**
+   * Recover the undelivered queue.
+   *
+   * Both files are read: the live one, and the legacy draining path an older
+   * build may have left behind. Draining entries come FIRST, because they were
+   * enqueued before anything in the current file. Afterwards the two are
+   * consolidated into one file, so the second restart has nothing left to lose.
+   */
   private async load(): Promise<void> {
     if (!this.dir) return;
+    const draining = await this.readEntries(this.drainingPath());
+    const live = await this.readEntries(this.filePath());
+    if (draining.length === 0 && live.length === 0) return;
+
+    this.queue.push(...draining, ...live);
+    // Consolidate before any new write can land, so a crash during recovery
+    // leaves one file holding everything rather than two holding halves.
+    await this.persist();
+    await rm(this.drainingPath(), { force: true }).catch(() => {});
+  }
+
+  /** Parse one JSONL file into commits, skipping anything unreadable. */
+  private async readEntries(path: string): Promise<MemoryCommit[]> {
+    const out: MemoryCommit[] = [];
+    let raw: string;
     try {
-      const raw = await readFile(this.filePath(), "utf-8");
-      for (const line of raw.split("\n")) {
-        if (!line.trim()) continue;
-        try {
-          this.queue.push(JSON.parse(line) as MemoryCommit);
-        } catch {
-          /* skip corrupt lines */
-        }
-      }
-      // Move to a draining file so new writes don't mix with replayed ones.
-      await rename(this.filePath(), this.drainingPath()).catch(() => {});
+      raw = await readFile(path, "utf-8");
     } catch {
-      // No outbox yet.
+      return out; // No outbox yet, which is the normal case.
     }
+    for (const line of raw.split("\n")) {
+      if (!line.trim()) continue;
+      try {
+        out.push(JSON.parse(line) as MemoryCommit);
+      } catch {
+        // A torn trailing line from a process killed mid-append. Skipping it
+        // is right — it was never a complete commit — but it is reported,
+        // because silently losing a memory commit is what this module exists
+        // to prevent.
+        emitTelemetry({
+          level: "warning",
+          text: `memory outbox: skipped an unreadable entry in ${path}`,
+        });
+      }
+    }
+    return out;
   }
 
   private filePath(): string {
     return `${this.dir}/memory-outbox.jsonl`;
   }
 
+  /** Legacy path from the append-log design; read on load, never written. */
   private drainingPath(): string {
     return `${this.dir}/memory-outbox-draining.jsonl`;
   }
 
   async enqueue(commit: Omit<MemoryCommit, "id" | "enqueuedAt"> & { text: string }): Promise<MemoryCommit> {
+    if (this.queue.length >= this.maxQueue) {
+      throw new Error(
+        `memory outbox is full (${this.queue.length} undelivered commits); OpenViking has been unreachable for too long`,
+      );
+    }
     const entry: MemoryCommit = {
       id: id("MEM"),
       projectId: commit.projectId,
@@ -117,11 +188,11 @@ export class MemoryOutbox {
       kind: commit.kind,
       enqueuedAt: new Date().toISOString(),
     };
+    // Durable FIRST, queued second. The other order meant a failed append left
+    // the commit live in the queue while the caller was told it had failed —
+    // so a caller that retried delivered it twice.
+    if (this.dir) await this.append(entry);
     this.queue.push(entry);
-    if (this.dir) {
-      await mkdir(this.dir, { recursive: true });
-      await appendFile(this.filePath(), `${JSON.stringify(entry)}\n`, "utf-8");
-    }
     return entry;
   }
 
@@ -149,7 +220,52 @@ export class MemoryOutbox {
     } finally {
       this.flushing = false;
     }
+    // The file must shrink with the queue, or a restart re-delivers everything
+    // that was already accepted. Rewritten only when something actually left,
+    // so a failing flush costs no I/O.
+    if (pushed > 0 && this.dir) await this.persist();
     return { pushed, remaining: this.queue.length };
+  }
+
+  /** Append one entry, serialised against every other write. */
+  private append(entry: MemoryCommit): Promise<void> {
+    return this.chain(async () => {
+      await mkdir(this.dir as string, { recursive: true });
+      await appendFile(this.filePath(), `${JSON.stringify(entry)}\n`, "utf-8");
+    });
+  }
+
+  /**
+   * Replace the file with exactly what is still undelivered.
+   *
+   * Temp-then-rename: `rename` is atomic on POSIX, so a crash leaves either the
+   * old queue or the new one, never a half-written file that would lose the
+   * difference.
+   */
+  private persist(): Promise<void> {
+    return this.chain(async () => {
+      const dir = this.dir as string;
+      await mkdir(dir, { recursive: true });
+      const body = this.queue.map((entry) => `${JSON.stringify(entry)}\n`).join("");
+      const temporary = `${this.filePath()}.${randomUUID()}.tmp`;
+      try {
+        await writeFile(temporary, body, "utf-8");
+        await rename(temporary, this.filePath());
+      } finally {
+        await rm(temporary, { force: true }).catch(() => {});
+      }
+    });
+  }
+
+  private chain(work: () => Promise<void>): Promise<void> {
+    const next = this.writeChain.then(work, work);
+    // Kept unhandled-safe: the caller awaits `next` and sees the failure, while
+    // the chain itself must not carry a rejection into the following write.
+    this.writeChain = next.then(
+      () => undefined,
+      () => undefined,
+    );
+    return next;
   }
 
   dispose(): void {

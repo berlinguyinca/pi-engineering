@@ -13,7 +13,7 @@
  * re-implemented here.
  */
 
-import type { ProjectRegistry } from "./ProjectRegistry.ts";
+import { type ProjectRegistry, normalizeRemote } from "./ProjectRegistry.ts";
 import type { WorkGraph } from "./WorkGraph.ts";
 import type { EventStoreBackend } from "./eventstore/backend.ts";
 import type { ApprovalRecord } from "./types.ts";
@@ -27,7 +27,15 @@ export interface ControlPlaneSnapshot {
     canonicalRemote: string | null;
     riskClass: string;
     multiRepo: boolean;
-    repositories: Array<{ id: string; root: string; remote: string | null; worktrees: string[] }>;
+    /**
+     * No `root`, no worktree paths, and only the canonical remote.
+     *
+     * This shape is served over the network. The previous one carried the raw
+     * registered remote — `https://user:ghp_TOKEN@host/repo` for an ordinary
+     * PAT clone — plus absolute host paths for the repository and every
+     * worktree.
+     */
+    repositories: Array<{ id: string; remote: string | null; worktreeCount: number }>;
   }>;
   runs: Array<{
     id: string;
@@ -126,9 +134,19 @@ export class ControlPlane {
         canonicalRemote: p.canonicalRemote,
         riskClass: p.riskClass,
         multiRepo: p.multiRepo,
-        repositories: this.registry
-          .listRepositories(p.id)
-          .map((r) => ({ id: r.id, root: r.root, remote: r.remote, worktrees: r.worktreeRoots })),
+        // The CANONICAL remote, and no filesystem paths.
+        //
+        // `remote` was the raw string the caller registered, which for the
+        // ordinary CI/PAT clone shape is `https://user:ghp_TOKEN@host/repo` —
+        // handed to anyone who could reach this endpoint. `root` and
+        // `worktrees` disclosed absolute host paths for the same audience.
+        // Worktrees are reported as a COUNT: the number is the operational
+        // fact (how many are checked out), the paths are not.
+        repositories: this.registry.listRepositories(p.id).map((r) => ({
+          id: r.id,
+          remote: normalizeRemote(r.remote),
+          worktreeCount: r.worktreeRoots.length,
+        })),
       })),
       runs: this.graph.listRuns().map((r) => ({
         id: r.id,

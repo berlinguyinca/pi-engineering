@@ -67,24 +67,61 @@ export interface ApprovalGateOptions {
 }
 
 export class HighRiskApprovalGate {
-  private readonly autonomous: boolean;
+  /**
+   * Standing exemptions, configured by the operator up front.
+   *
+   * Distinct from an approval, which is now single-use: `approve()` used to
+   * push into this same list, so one operator approval of `deploy` permitted
+   * every future deploy for the lifetime of the gate. Approval was per action
+   * TYPE when the only useful thing to approve is an action INSTANCE.
+   */
   private readonly exempt: HighRiskAction[];
+  /** Approvals granted and not yet spent, by operation id. */
+  private readonly granted = new Map<HighRiskAction, Set<string>>();
 
   constructor(opts: ApprovalGateOptions = {}) {
-    this.autonomous = opts.autonomous ?? false;
     this.exempt = opts.exempt ?? [];
+    // `autonomous` is deliberately not stored. It was stored and never read,
+    // so the test asserting "requires approval even under autonomous mode"
+    // could not fail — it would have passed with the flag removed. The
+    // behaviour it describes is the behaviour below, unconditionally.
+    void opts.autonomous;
   }
 
-  /** True when the action may proceed without an approval. */
-  isPermitted(action: HighRiskAction): boolean {
+  /**
+   * True when the action may proceed without a fresh approval.
+   *
+   * `operationId` identifies the concrete operation. Omit it only for a
+   * question about the action type in general ("would a deploy need
+   * approval?"), which can never be answered "yes, already approved".
+   */
+  isPermitted(action: HighRiskAction, operationId?: string): boolean {
     if (this.exempt.includes(action)) return true;
-    // High-risk actions require approval even under autonomous mode.
-    return !HIGH_RISK_ACTIONS.includes(action);
+    if (!HIGH_RISK_ACTIONS.includes(action)) return true;
+    if (!operationId) return false;
+    return this.granted.get(action)?.has(operationId) === true;
   }
 
-  /** A human/operator explicitly approved the action (clears the gate). */
-  approve(action: HighRiskAction): void {
-    if (!this.exempt.includes(action)) this.exempt.push(action);
+  /**
+   * A human/operator explicitly approved ONE operation.
+   *
+   * Consumed by the matching `isPermitted`/`consume` pair: approving a deploy
+   * permits that deploy, not deploys.
+   */
+  approve(action: HighRiskAction, operationId: string): void {
+    const set = this.granted.get(action) ?? new Set<string>();
+    set.add(operationId);
+    this.granted.set(action, set);
+  }
+
+  /** Spend an approval: true once, false every time after. */
+  consume(action: HighRiskAction, operationId: string): boolean {
+    if (this.exempt.includes(action)) return true;
+    if (!HIGH_RISK_ACTIONS.includes(action)) return true;
+    const set = this.granted.get(action);
+    if (!set?.has(operationId)) return false;
+    set.delete(operationId);
+    return true;
   }
 }
 

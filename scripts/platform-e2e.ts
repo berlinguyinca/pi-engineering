@@ -111,7 +111,24 @@ async function main(): Promise<void> {
 
   ok("run completed and durable memory committed");
   info("\n— control-plane snapshot —");
-  process.stdout.write(`${JSON.stringify(platform.controlPlane.snapshot(), null, 2)}\n`);
+  // A REDUCED projection, not the snapshot. Pointed at a real registry — or run
+  // in CI against a seeded workspace — printing the whole snapshot writes
+  // repository remotes and absolute host paths into the console and the CI log.
+  const snapshot = platform.controlPlane.snapshot();
+  process.stdout.write(
+    `${JSON.stringify(
+      {
+        generatedAt: snapshot.generatedAt,
+        workspace: snapshot.workspace.name,
+        projects: snapshot.projects.length,
+        runs: snapshot.runs.map((r) => ({ id: r.id, status: r.status })),
+        workers: snapshot.workers.map((w) => ({ id: w.id, status: w.status })),
+        events: snapshot.events.length,
+      },
+      null,
+      2,
+    )}\n`,
+  );
 }
 
 void main().catch((err) => {

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile } from "node:fs/promises";
+import { appendFile, mkdtemp, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
@@ -39,9 +39,81 @@ describe("EventStore backends", () => {
     const raw = await readFile(file, "utf-8");
     assert.equal(raw.split("\n").filter(Boolean).length, 2);
 
+    // Released before reopening: the backend is single-instance on purpose, so
+    // a restart closes the old handle rather than running two views of one file.
+    s1.close();
     const s2 = await JsonlEventStore.open(file);
     assert.equal(s2.count(), 2);
     assert.equal(s2.all()[1]?.event_id, "evt-2");
+    s2.close();
+  });
+
+  it("refuses a second instance over one file rather than diverging silently", async () => {
+    // Two instances each held their own array and never re-read, so each
+    // reported a silently partial history — and every consumer built on `all()`
+    // (the control plane's feed, a rebuild, a health rollup) inherited it.
+    const dir = await mkdtemp(join(tmpdir(), "pie-store-dup-"));
+    const file = join(dir, "events.jsonl");
+    const first = await JsonlEventStore.open(file);
+    await assert.rejects(() => JsonlEventStore.open(file), /already open/);
+    first.close();
+    const second = await JsonlEventStore.open(file);
+    assert.equal(second.count(), 0);
+    second.close();
+  });
+
+  it("repairs a torn final record instead of swallowing the next event", async () => {
+    // A process killed mid-write leaves a partial line with no newline. The
+    // next append fused onto it, so the FOLLOWING event — whose `append()` had
+    // resolved, and which was therefore committed by this store's own contract
+    // — silently vanished on the restart after that.
+    const dir = await mkdtemp(join(tmpdir(), "pie-store-torn-"));
+    const file = join(dir, "events.jsonl");
+    const first = await JsonlEventStore.open(file);
+    await first.append(evt(1));
+    first.close();
+    // Simulate the kill: a complete record, then a fragment with no newline.
+    await appendFile(file, '{"event_id":"evt-torn","timestamp":"2026-09', "utf-8");
+
+    const second = await JsonlEventStore.open(file);
+    assert.equal(second.count(), 1, "the complete record survives");
+    await second.append(evt(4));
+    second.close();
+
+    const third = await JsonlEventStore.open(file);
+    assert.equal(third.count(), 2, "and the event appended afterwards is still there");
+    assert.ok(third.get("evt-4"), "an append that resolved must survive the next restart");
+    third.close();
+  });
+
+  it("serialises an event when it is appended, not when the write drains", async () => {
+    // `JSON.stringify` inside the write chain meant the persisted bytes
+    // reflected entity state at WRITE time, so a caller that mutated an entity
+    // between `append()` and the queued write changed what history recorded.
+    const dir = await mkdtemp(join(tmpdir(), "pie-store-snapshot-"));
+    const file = join(dir, "events.jsonl");
+    const store = await JsonlEventStore.open(file);
+    const live = { status: "PENDING" };
+    const pending = store.append({ ...evt(9), payload: { run: live } });
+    live.status = "COMPLETED"; // mutated before the write drains
+    await pending;
+    store.close();
+
+    const reopened = await JsonlEventStore.open(file);
+    const payload = reopened.all()[0]?.payload.run as { status: string };
+    assert.equal(payload.status, "PENDING", "history records what was true when the event was appended");
+    reopened.close();
+  });
+
+  it("appendAll is one write, so a batch is not half-applied", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pie-store-batch-"));
+    const file = join(dir, "events.jsonl");
+    const store = await JsonlEventStore.open(file);
+    await store.appendAll([evt(1), evt(2), evt(3)]);
+    store.close();
+    const reopened = await JsonlEventStore.open(file);
+    assert.equal(reopened.count(), 3);
+    reopened.close();
   });
 
   it("LedgerEventStoreBackend adapts the existing single-project store", async () => {
