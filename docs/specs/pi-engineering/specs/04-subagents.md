@@ -1,0 +1,2 @@
+# 04 pi-subagents runtime
+Inspect current upstream first. Reuse run/fanout/lanes, steering, detached/background execution, fresh contexts, structured outputs, limits, worktrees, child extensions, capability ceilings and FleetView when present. Heavy/mutating work defaults to children; trivial reads may remain direct. Parent must stay responsive. Every worker has IDs, lifecycle, heartbeat, events, budgets and cancel/restart.

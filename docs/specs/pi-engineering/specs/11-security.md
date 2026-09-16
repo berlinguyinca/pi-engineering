@@ -1,0 +1,2 @@
+# 11 Security, permissions & Docker
+Docker-first surrounding stack and worker isolation where practical. Enforce identity/project authorization, role tools, Pi permissions, capability ceilings, filesystem/worktree scope, minimal secrets, network policy and audit. Control API cannot bypass worker policy. High-risk deploy/DB/secret/force-push/merge actions can require approval even under autonomous mode. Test cross-project and escape attempts.

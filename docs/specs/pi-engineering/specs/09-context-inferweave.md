@@ -1,0 +1,2 @@
+# 09 Dynamic context & InferWeave
+Discover model context/output/reasoning/vision/tool metadata dynamically, cache with TTL/version and safe fallback. Remove fixed 260k reservations. Use stable session IDs/affinity. InferWeave owns GPU/model placement and dynamic seat admission. One branch=one seat, but admission uses context/KV/VRAM/RAM/residency/compute/queue/fairness. Respect 503 Retry-After and 429 semantics.
