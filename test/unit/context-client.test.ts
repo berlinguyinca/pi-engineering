@@ -199,3 +199,59 @@ test("inspect exposes age and last error without leaking content", async () => {
   assert.equal(entry?.modelId, "m");
   assert.match(entry?.lastError ?? "", /upstream exploded/);
 });
+
+test("one caller cancelling does not cancel another caller's shared refresh", async () => {
+  let aborted = false;
+  let requests = 0;
+  const client = new InferWeaveCapabilityClient({
+    baseUrl: "http://gw",
+    ttlSeconds: 60,
+    staleIfErrorSeconds: 600,
+    timeoutMs: 5_000,
+    transport: (_url, init) =>
+      new Promise<CapabilityFetchResult>((resolve, reject) => {
+        requests += 1;
+        init.signal?.addEventListener("abort", () => {
+          aborted = true;
+          reject(new Error("aborted"));
+        });
+        setTimeout(() => resolve({ status: 200, body: { id: "m", context_window: 131_072 } }), 20);
+      }),
+  });
+
+  const cancelling = new AbortController();
+  const first = client.resolve("m", undefined, cancelling.signal);
+  await new Promise((r) => setTimeout(r, 5));
+  const second = client.resolve("m"); // joins the same refresh
+  cancelling.abort();
+
+  assert.equal((await first).contextWindow, CONSERVATIVE_FALLBACK_CONTEXT, "the cancelled caller stops waiting");
+  assert.equal((await second).contextWindow, 131_072, "the refresh that others waited for still lands");
+  assert.equal(aborted, false, "one waiter leaving must not abort the shared fetch");
+  assert.equal(requests, 1, "still a single request for the generation");
+});
+
+test("the last caller to leave does abandon the fetch", async () => {
+  let aborted = false;
+  const client = new InferWeaveCapabilityClient({
+    baseUrl: "http://gw",
+    ttlSeconds: 60,
+    staleIfErrorSeconds: 600,
+    timeoutMs: 5_000,
+    transport: (_url, init) =>
+      new Promise<CapabilityFetchResult>((resolve, reject) => {
+        init.signal?.addEventListener("abort", () => {
+          aborted = true;
+          reject(new Error("aborted"));
+        });
+        setTimeout(() => resolve({ status: 200, body: { id: "m", context_window: 65_536 } }), 200);
+      }),
+  });
+  const controller = new AbortController();
+  const pending = client.resolve("m", undefined, controller.signal);
+  await new Promise((r) => setTimeout(r, 5));
+  controller.abort();
+  await pending;
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(aborted, true, "nobody wants it any more: the work stops");
+});

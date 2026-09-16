@@ -43,6 +43,12 @@ export interface InferweaveConfig {
   ttlSeconds: number;
   staleIfErrorSeconds: number;
   timeoutMs: number;
+  /**
+   * Cap on per-model capability lookups during one `refreshModels`, so a
+   * gateway that lists 40 models without publishing capabilities cannot turn a
+   * refresh into 40 requests.
+   */
+  maxCapabilityLookups: number;
   /** Explicit per-model windows; unsafe expansions need the flag. */
   overrides: Record<string, LocalModelOverride>;
 }
@@ -55,6 +61,7 @@ export const DEFAULT_INFERWEAVE_CONFIG: InferweaveConfig = {
   ttlSeconds: 300,
   staleIfErrorSeconds: 3_600,
   timeoutMs: 5_000,
+  maxCapabilityLookups: 8,
   overrides: {},
 };
 
@@ -90,6 +97,7 @@ export function inferweaveConfigFromEnv(env: Record<string, string | undefined> 
     ttlSeconds: int(env.INFERWEAVE_TTL_SECONDS, base.ttlSeconds),
     staleIfErrorSeconds: int(env.INFERWEAVE_STALE_SECONDS, base.staleIfErrorSeconds),
     timeoutMs: int(env.INFERWEAVE_TIMEOUT_MS, base.timeoutMs),
+    maxCapabilityLookups: int(env.INFERWEAVE_MAX_CAPABILITY_LOOKUPS, base.maxCapabilityLookups),
     overrides: parseOverrides(env.INFERWEAVE_MODEL_CONTEXT),
   };
 }
@@ -98,8 +106,23 @@ export function parseOverrides(raw: string | undefined): Record<string, LocalMod
   const overrides: Record<string, LocalModelOverride> = {};
   if (!raw) return overrides;
   for (const entry of raw.split(",")) {
-    const parts = entry.trim().split(":");
-    const [modelId, windowRaw, outputRaw, flag] = parts;
+    // Two spellings are accepted, because operators write both:
+    //   model:262144:32768:unsafe   and   model=262144:32768:unsafe
+    const [head, ...tail] = entry.trim().split(":");
+    let modelId = head;
+    let windowRaw: string | undefined;
+    let outputRaw: string | undefined;
+    let flag: string | undefined;
+    if (head?.includes("=")) {
+      const [name, window] = head.split("=", 2);
+      modelId = name;
+      windowRaw = window;
+      [outputRaw, flag] = tail;
+    } else {
+      [windowRaw, outputRaw, flag] = [head, ...tail].slice(1);
+      [windowRaw, outputRaw, flag] = [tail[0], tail[1], tail[2]];
+      modelId = head!;
+    }
     const contextWindow = Number(windowRaw);
     if (!modelId || !Number.isFinite(contextWindow) || contextWindow < 1_024) continue;
     overrides[modelId] = {
@@ -220,20 +243,44 @@ export function createInferweaveProvider(config: InferweaveConfig, deps: Provide
     // is one request.
     const data = (listing.body as { data?: unknown[] }).data ?? [];
     const models: PiModelDefinition[] = [];
+    // A gateway listing that carries no capability anywhere would otherwise
+    // turn one refresh into one request per model. The budget bounds that: the
+    // ids it lists are still registered, on the precedence floor rather than on
+    // a discovered number, and the note says so instead of hiding it.
+    let lookups = config.maxCapabilityLookups;
     for (const entry of data) {
       const capability = normalizeCapability(entry);
       if (!capability.modelId) continue;
       let full = capability;
-      if (capability.guaranteedRoutableTokens === undefined) {
-        const fetched = await client.capability(capability.modelId, signal);
-        if (fetched) full = fetched;
+      // A document is fetched only when the listing says nothing at all about
+      // context. `context_window` alone is already rule 2 of the precedence, so
+      // fetching a document for it would be a second request for an answer that
+      // is good enough — and one request per listed model per refresh is exactly
+      // the stampede this client exists to avoid.
+      const saysNothing =
+        capability.guaranteedRoutableTokens === undefined &&
+        capability.contextWindow === undefined &&
+        capability.maxModelLen === undefined;
+      if (saysNothing) {
+        if (lookups > 0) {
+          lookups -= 1;
+          const fetched = await client.capability(capability.modelId, signal);
+          if (fetched) full = fetched;
+        } else if (!notes.has("lookups")) {
+          notes.set(
+            "lookups",
+            `capability lookups capped at ${config.maxCapabilityLookups}; remaining ids use the floor`,
+          );
+        }
       }
-      const resolved = await client
-        .resolve(capability.modelId, config.overrides[capability.modelId], signal)
-        .catch(() =>
-          resolveModelContext(capability.modelId, full, { localOverride: config.overrides[capability.modelId] }),
-        );
-      models.push(remember(resolved));
+      models.push(
+        remember(
+          resolveModelContext(capability.modelId, full, {
+            localOverride: config.overrides[capability.modelId],
+            lastKnownGood: client.peekLastKnownGood(capability.modelId),
+          }),
+        ),
+      );
     }
     return models.length > 0 ? models : modelsFromListingFallback(data, config);
   };

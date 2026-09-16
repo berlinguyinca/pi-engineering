@@ -197,6 +197,7 @@ export INFERWEAVE_PROVIDER=inferweave                    # provider id shown in 
 export INFERWEAVE_TTL_SECONDS=300                        # capability cache TTL
 export INFERWEAVE_STALE_SECONDS=3600                     # stale-if-error bound
 export INFERWEAVE_TIMEOUT_MS=5000                        # refresh deadline
+export INFERWEAVE_MAX_CAPABILITY_LOOKUPS=8               # per-refresh cap on per-model capability fetches
 # Optional explicit windows; `unsafe` is required to exceed the gateway guarantee:
 export INFERWEAVE_MODEL_CONTEXT="qwen3.8-27b=262144:32768,small-model=32768"
 ```

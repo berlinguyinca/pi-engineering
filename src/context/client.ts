@@ -45,6 +45,12 @@ export interface CapabilityClientOptions {
   now?: () => number;
 }
 
+interface InflightRefresh {
+  promise: Promise<ModelCapability | undefined>;
+  waiters: number;
+  controller: AbortController;
+}
+
 interface CacheEntry {
   capability?: ModelCapability;
   etag?: string;
@@ -65,10 +71,13 @@ export class CapabilityUnavailableError extends Error {
 export class InferWeaveCapabilityClient {
   private readonly options: Required<Pick<CapabilityClientOptions, "now">> & CapabilityClientOptions;
   private readonly cache = new Map<string, CacheEntry>();
-  private readonly inflight = new Map<string, Promise<ModelCapability | undefined>>();
+  private readonly inflight = new Map<string, InflightRefresh>();
 
   constructor(options: CapabilityClientOptions) {
-    this.options = { now: () => Math.floor(Date.now() / 1000), ...options };
+    // `now` must be defaulted after the spread, and with `??`: a caller that
+    // passes `now: undefined` explicitly (which is what an optional dependency
+    // looks like) would otherwise overwrite the default with undefined.
+    this.options = { ...options, now: options.now ?? (() => Math.floor(Date.now() / 1000)) };
   }
 
   /**
@@ -102,11 +111,62 @@ export class InferWeaveCapabilityClient {
       return cached.capability;
     }
     const existing = this.inflight.get(modelId);
-    if (existing) return existing;
+    if (existing) {
+      // Joining someone else's refresh. This caller may stop waiting without
+      // cancelling work the others still need.
+      existing.waiters += 1;
+      return this.awaitOrCancel(existing, signal);
+    }
 
-    const refresh = this.refresh(modelId, signal).finally(() => this.inflight.delete(modelId));
-    this.inflight.set(modelId, refresh);
-    return refresh;
+    const entry: InflightRefresh = { promise: undefined as never, waiters: 1, controller: new AbortController() };
+    const refresh = this.refresh(modelId, entry.controller.signal).finally(() => {
+      this.inflight.delete(modelId);
+    });
+    entry.promise = refresh;
+    this.inflight.set(modelId, entry);
+    // The fetch dies only when the last caller who cared has gone; one caller
+    // giving up must not poison a shared refresh.
+    return this.awaitOrCancel(entry, signal, () => entry.controller.abort());
+  }
+
+  /**
+   * Wait for an in-flight refresh, or resolve with nothing when the caller's
+   * signal fires. Stopping the wait is not the same as stopping the fetch:
+   * with one shared client per process, a cancelled Pi turn must not take the
+   * refresh down with it for everybody else. The fetch is abandoned only when
+   * the last waiter leaves, so cancellation still stops work nobody wants.
+   */
+  private awaitOrCancel(
+    entry: InflightRefresh,
+    signal: AbortSignal | undefined,
+    onLastWaiterLeft?: () => void,
+  ): Promise<ModelCapability | undefined> {
+    if (!signal) return entry.promise;
+    const leave = () => {
+      entry.waiters = Math.max(0, entry.waiters - 1);
+      if (entry.waiters === 0) onLastWaiterLeft?.();
+    };
+    if (signal.aborted) {
+      leave();
+      return Promise.resolve(undefined);
+    }
+    return new Promise((resolve) => {
+      const onAbort = () => {
+        leave();
+        resolve(undefined);
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+      entry.promise.then(
+        (capability) => {
+          signal.removeEventListener("abort", onAbort);
+          resolve(capability);
+        },
+        () => {
+          signal.removeEventListener("abort", onAbort);
+          resolve(undefined);
+        },
+      );
+    });
   }
 
   /** Force a refresh now (Pi's `refreshModels` hook calls this). */
@@ -161,6 +221,25 @@ export class InferWeaveCapabilityClient {
       clearTimeout(timer);
       signal?.removeEventListener("abort", onOuterAbort);
     }
+  }
+
+  /**
+   * The cached capability as a last-known-good candidate, without triggering a
+   * refresh. A stale-but-known number beats a floor when it is inside the age
+   * bound, and the age bound is the caller's to decide.
+   */
+  peekLastKnownGood(
+    modelId: string,
+  ): { contextWindow: number; maxOutputTokens?: number; observedAt: number; maxAgeSeconds: number } | undefined {
+    const entry = this.cache.get(modelId);
+    const guarantee = entry?.capability?.guaranteedRoutableTokens;
+    if (!entry || guarantee === undefined) return undefined;
+    return {
+      contextWindow: guarantee,
+      maxOutputTokens: entry.capability?.maxOutputTokens,
+      observedAt: entry.fetchedAt,
+      maxAgeSeconds: this.options.staleIfErrorSeconds,
+    };
   }
 
   /** Drop cached state (used by tests and on gateway reconfiguration). */
