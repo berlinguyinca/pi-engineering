@@ -42,6 +42,7 @@ import { EngineeringRuntime } from "../src/runtime/EngineeringRuntime.ts";
 import { resolveStatusBarConfig } from "../src/status/config.ts";
 import { FooterController } from "../src/status/footer.ts";
 import { renderStatus } from "../src/status/layout.ts";
+import { type TelemetryNotice, emitTelemetry, setTelemetrySink } from "../src/telemetry/sink.ts";
 import { type CoreServices, buildCoreTools } from "../src/tools/coreTools.ts";
 import { checkForUpdate, shouldCheck } from "../src/update/selfUpdate.ts";
 import { describeUpdate } from "../src/update/versionCheck.ts";
@@ -95,6 +96,18 @@ const panels = new Map<string, PanelPlumbing>();
  */
 let ambientPanel: { key: string; state: PanelState } | undefined;
 let activePanel: PanelController | null = null;
+
+/**
+ * How long the same diagnostic sentence stays suppressed.
+ *
+ * A gateway holding a session back re-emits the identical wait every thirty
+ * seconds; the footer already shows the countdown, so the notification exists
+ * to explain the silence once rather than to keep announcing it.
+ */
+const TELEMETRY_REPEAT_MS = 60_000;
+
+/** Removes this session's telemetry sink. */
+let telemetryUninstall: (() => void) | undefined;
 /** Layout is an operator preference, so one store for the whole process. */
 const panelLayoutStore = new PanelLayoutStore();
 
@@ -347,10 +360,6 @@ export default function (pi: ExtensionAPI) {
         // Abort the current generation.
         ctx.abort();
         // Notify the user.
-        ctx.ui.notify(
-          `GenerationGuard: aborted (${decision.reason}). The degenerate output was discarded. Re-submit your prompt to retry with recovery.`,
-          "error",
-        );
         // Structured telemetry.
         const model = ctx.model
           ? `${(ctx.model as { provider?: string }).provider ?? ""}/${(ctx.model as { id?: string }).id ?? "unknown"}`
@@ -364,9 +373,15 @@ export default function (pi: ExtensionAPI) {
           0,
           decision.diagnostics ?? {},
         );
-        if (process.env.PI_GUARD_TELEMETRY !== "false") {
-          process.stderr.write(`[generation-guard] ${JSON.stringify(telemetryEvent)}\n`);
-        }
+        // One path, not two. The operator used to get a notify AND a line of
+        // raw JSON on stderr saying the same thing — and the stderr line is
+        // what tore the frame. The sink installed at session start turns this
+        // into the notify; headless it is still a line on stderr.
+        emitTelemetry({
+          level: "error",
+          text: `GenerationGuard: aborted (${decision.reason}). The degenerate output was discarded. Re-submit your prompt to retry with recovery.`,
+          ...(process.env.PI_GUARD_TELEMETRY !== "false" ? { detail: telemetryEvent } : {}),
+        });
       }
     });
 
@@ -1030,6 +1045,43 @@ ${RECOVERY_PROMPT}`;
   }
 
   /**
+   * Route diagnostics through Pi's own notifications.
+   *
+   * The bug this closes: subsystems wrote `[gateway-admission] {…}` straight to
+   * stderr. Inside a TUI that lands under a frame the TUI drew, does not wrap,
+   * runs through the side panel, and scrolls the screen by a row the TUI does
+   * not know about — after which every composited row beneath is off by one
+   * character. Through `notify` the line is wrapped, coloured by severity from
+   * the operator's own theme, and drawn as part of the frame.
+   *
+   * Repeats are throttled: a gateway that keeps a session waiting emits the
+   * same sentence every thirty seconds, and the footer already carries the live
+   * countdown. The notification is there to explain the silence once, not to
+   * narrate it.
+   */
+  function installTelemetrySink(ui: { notify(text: string, level: string): void }): () => void {
+    const lastShownAt = new Map<string, number>();
+    return setTelemetrySink((notice: TelemetryNotice) => {
+      const now = Date.now();
+      const previous = lastShownAt.get(notice.text);
+      if (previous !== undefined && now - previous < TELEMETRY_REPEAT_MS) return;
+      lastShownAt.set(notice.text, now);
+      // Bounded: one entry per distinct sentence, and the set of sentences is
+      // small, but a long session must not accumulate them without limit.
+      if (lastShownAt.size > 64) {
+        for (const [text, at] of lastShownAt) {
+          if (now - at >= TELEMETRY_REPEAT_MS) lastShownAt.delete(text);
+        }
+      }
+      try {
+        ui.notify(notice.text, notice.level);
+      } catch {
+        /* A session tearing down is not a reason to fail the work reporting. */
+      }
+    });
+  }
+
+  /**
    * Build the session's controller and bind the chord.
    *
    * Called from `session_start` so the hotkey works without `/panel` first, and
@@ -1088,6 +1140,10 @@ ${RECOVERY_PROMPT}`;
   // real Pi run (the smoke-test stub has no pi.on).
   if (typeof pi.on === "function") {
     pi.on("session_start", async (_event, ctx) => {
+      // First, before anything can report: until a sink is installed every
+      // diagnostic goes to raw stderr, which is what tears the frame.
+      telemetryUninstall?.();
+      telemetryUninstall = installTelemetrySink(ctx.ui as { notify(text: string, level: string): void });
       for (const un of panelUnsubscribes.splice(0)) un();
       activePanel?.dispose();
       activePanel = null;
@@ -1124,6 +1180,9 @@ ${RECOVERY_PROMPT}`;
     });
 
     pi.on("session_shutdown", () => {
+      // A sink pointing at a torn-down session's UI is worse than none.
+      telemetryUninstall?.();
+      telemetryUninstall = undefined;
       for (const un of panelUnsubscribes.splice(0)) un();
       activePanel?.dispose();
       activePanel = null;

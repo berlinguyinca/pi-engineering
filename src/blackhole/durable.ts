@@ -21,6 +21,7 @@
 import { closeSync, openSync, readFileSync, writeSync } from "node:fs";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
+import { emitTelemetry } from "../telemetry/sink.ts";
 import { type DurableMemoryProvider, type DurableMemoryRecord, searchDurable } from "./OpenViking.ts";
 
 /** Dependency-free cross-process shared store backed by append-only JSONL. */
@@ -93,7 +94,10 @@ function warnOpenViking(
       : outcome === "unexpected-body"
         ? "returned an unexpected (non-array) body"
         : `returned ${outcome}`;
-  console.warn(`[pi-engineering-runtime] OpenViking ${baseUrl} ${what} on ${op} (fail-closed to empty). ${hint}`);
+  emitTelemetry({
+    level: "warning",
+    text: `OpenViking ${baseUrl} ${what} on ${op} (fail-closed to empty). ${hint}`,
+  });
 }
 
 export interface OpenVikingEndpointPaths {

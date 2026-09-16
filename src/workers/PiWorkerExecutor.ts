@@ -37,6 +37,7 @@ import {
   resolveTransientRetryConfig,
   withTransientRetry,
 } from "../guard/transient.ts";
+import { emitTelemetry } from "../telemetry/sink.ts";
 import type { WorkerExecutor, WorkerRequest, WorkerRun } from "./WorkerExecutor.ts";
 import { registerLocalProviders } from "./localProviders.ts";
 import { WORKER_KICKOFF, buildSystemPrompt } from "./prompts.ts";
@@ -655,10 +656,15 @@ ${recovery.recoveryPrompt}`;
 
   /** Emit a structured telemetry event (spec §21). */
   private emitTelemetry(event: import("../guard/RecoveryController.ts").DegenerationEvent): void {
-    // Write to stderr for observability without polluting stdout.
-    // In production this would route to the telemetry exporter.
+    // Through the sink rather than straight to stderr: headless that still
+    // writes the line, and inside Pi it becomes a notice the TUI renders
+    // instead of raw JSON painted over whatever the TUI had drawn.
     if (process.env.PI_GUARD_TELEMETRY !== "false") {
-      process.stderr.write(`[generation-guard] ${JSON.stringify(event)}\n`);
+      emitTelemetry({
+        level: "warning",
+        text: `generation guard: aborted ${event.model} · ${event.reason.replaceAll("_", " ")}`,
+        detail: event,
+      });
     }
   }
 

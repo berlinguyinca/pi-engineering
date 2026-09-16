@@ -6,7 +6,9 @@
  * turn — backs off behind the SAME gate when a gateway reports saturation.
  */
 
+import { emitTelemetry } from "../telemetry/sink.ts";
 import { AdmissionController, type AdmissionEvent } from "./AdmissionController.ts";
+import { describeAdmissionEvent } from "./admissionNotice.ts";
 
 export interface GatewayAdmissionConfig {
   enabled: boolean;
@@ -81,9 +83,16 @@ export function resolveGatewayConfig(overrides?: Partial<GatewayAdmissionConfig>
   return cfg;
 }
 
-/** Structured admission telemetry, alongside `[generation-guard]` lines. */
+/**
+ * Report an admission event.
+ *
+ * Through the telemetry sink, not to stderr: inside Pi a raw write lands under
+ * a frame the TUI drew and scrolls it by a row the TUI does not know about,
+ * which is what put unwrapped JSON across the side panel and shifted the
+ * characters beneath it. Headless, the sink's default still writes to stderr.
+ */
 export function emitAdmissionTelemetry(event: AdmissionEvent): void {
-  process.stderr.write(`[gateway-admission] ${JSON.stringify(event)}\n`);
+  emitTelemetry(describeAdmissionEvent(event));
 }
 
 let shared: AdmissionController | undefined;
