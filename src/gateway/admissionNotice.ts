@@ -58,6 +58,10 @@ export function describeAdmissionEvent(event: AdmissionEvent): TelemetryNotice {
     const tail = [reason, load].filter(Boolean).join(" · ");
     return {
       level: "warning",
+      // Keyed on the CONDITION, not the sentence: the queue depth moves between
+      // waits, so two waits for the same reason are different strings and a
+      // text-keyed throttle would never fire.
+      key: `wait:${event.signal.reason ?? event.signal.type ?? event.signal.status ?? "unknown"}`,
       text: `gateway busy — waiting ${formatDuration(event.waitMs)}${tail ? ` · ${tail}` : ""}`,
       detail: event,
     };
@@ -66,12 +70,14 @@ export function describeAdmissionEvent(event: AdmissionEvent): TelemetryNotice {
     const reason = reasonText(event.signal);
     return {
       level: "warning",
+      key: `clamp:${event.signal.reason ?? event.signal.type ?? event.signal.status ?? "unknown"}`,
       text: `gateway busy — concurrency ${event.previous} → ${event.concurrency}${reason ? ` · ${reason}` : ""}`,
       detail: event,
     };
   }
   return {
     level: "info",
+    key: "relax",
     text: `gateway recovered — concurrency ${event.previous} → ${event.concurrency}`,
     detail: event,
   };

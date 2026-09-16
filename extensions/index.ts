@@ -43,6 +43,7 @@ import { resolveStatusBarConfig } from "../src/status/config.ts";
 import { FooterController } from "../src/status/footer.ts";
 import { renderStatus } from "../src/status/layout.ts";
 import { type TelemetryNotice, emitTelemetry, setTelemetrySink } from "../src/telemetry/sink.ts";
+import { createRepeatThrottle } from "../src/telemetry/throttle.ts";
 import { type CoreServices, buildCoreTools } from "../src/tools/coreTools.ts";
 import { checkForUpdate, shouldCheck } from "../src/update/selfUpdate.ts";
 import { describeUpdate } from "../src/update/versionCheck.ts";
@@ -96,15 +97,6 @@ const panels = new Map<string, PanelPlumbing>();
  */
 let ambientPanel: { key: string; state: PanelState } | undefined;
 let activePanel: PanelController | null = null;
-
-/**
- * How long the same diagnostic sentence stays suppressed.
- *
- * A gateway holding a session back re-emits the identical wait every thirty
- * seconds; the footer already shows the countdown, so the notification exists
- * to explain the silence once rather than to keep announcing it.
- */
-const TELEMETRY_REPEAT_MS = 60_000;
 
 /** Removes this session's telemetry sink. */
 let telemetryUninstall: (() => void) | undefined;
@@ -1059,20 +1051,19 @@ ${RECOVERY_PROMPT}`;
    * countdown. The notification is there to explain the silence once, not to
    * narrate it.
    */
+  /**
+   * Route diagnostics through Pi's own notifications.
+   *
+   * The bug this closes: subsystems wrote `[gateway-admission] {…}` straight to
+   * stderr. Inside a TUI that lands under a frame the TUI drew, does not wrap,
+   * and runs through the side panel. Through `notify` the line is wrapped and
+   * coloured by severity from the operator's own theme, and drawn as part of
+   * the frame rather than under it.
+   */
   function installTelemetrySink(ui: { notify(text: string, level: string): void }): () => void {
-    const lastShownAt = new Map<string, number>();
+    const allow = createRepeatThrottle();
     return setTelemetrySink((notice: TelemetryNotice) => {
-      const now = Date.now();
-      const previous = lastShownAt.get(notice.text);
-      if (previous !== undefined && now - previous < TELEMETRY_REPEAT_MS) return;
-      lastShownAt.set(notice.text, now);
-      // Bounded: one entry per distinct sentence, and the set of sentences is
-      // small, but a long session must not accumulate them without limit.
-      if (lastShownAt.size > 64) {
-        for (const [text, at] of lastShownAt) {
-          if (now - at >= TELEMETRY_REPEAT_MS) lastShownAt.delete(text);
-        }
-      }
+      if (!allow(notice)) return;
       try {
         ui.notify(notice.text, notice.level);
       } catch {

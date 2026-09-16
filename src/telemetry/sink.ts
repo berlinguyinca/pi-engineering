@@ -25,6 +25,18 @@ export interface TelemetryNotice {
   /** One line, already phrased for a human. No JSON. */
   text: string;
   /**
+   * What this notice is ABOUT, for throttling repeats.
+   *
+   * Separate from `text` because the text carries live numbers — a gateway
+   * wait names the queue depth, which moves between waits — so two notices
+   * that are the same event to an operator are different strings. Throttling on
+   * the text would silence the one case it should not (an unchanging repeat)
+   * and let through the one it should (the same condition, renumbered).
+   *
+   * Absent means the text is stable enough to key on.
+   */
+  key?: string;
+  /**
    * The structured event, for a sink that wants to record rather than show it.
    * Never rendered by the default sink: that is what the bug was.
    */
