@@ -90,13 +90,13 @@ function renderUnsafe(state: HarnessStatusState, width: number, config: StatusBa
     short.push({ text: throughputShort ?? throughputFull, priority: 6 });
   }
   if (config.showTask && state.task) {
-    full.push({ text: formatTask(state.task, 32), priority: 6 });
-    short.push({ text: formatTask(state.task, 0), priority: 6 });
+    full.push({ text: formatTask(state.task, 32), priority: 7 });
+    short.push({ text: formatTask(state.task, 0), priority: 7 });
   }
   if (config.showWait && state.wait) {
     const wait = formatWait(state.wait, nowMs);
-    full.push({ text: wait, priority: 7 });
-    short.push({ text: wait, priority: 7 });
+    full.push({ text: wait, priority: 8 });
+    short.push({ text: wait, priority: 8 });
   }
 
   // Progressive elision: try each stage until it fits.
@@ -104,12 +104,17 @@ function renderUnsafe(state: HarnessStatusState, width: number, config: StatusBa
   stages.push(full);
   stages.push(short);
   // Drop directory, then repository, then worktree, then branch, then the
-  // context reading (model + tps are the irreducible core).
+  // context reading.
   stages.push(short.filter((s) => s.priority >= 1));
   stages.push(short.filter((s) => s.priority >= 2));
   stages.push(short.filter((s) => s.priority >= 3));
   stages.push(short.filter((s) => s.priority >= 4));
+  // Then model, then throughput, then the task — the wait reason outlives all
+  // of them, because it is the only segment that explains an idle session.
   stages.push(short.filter((s) => s.priority >= 5));
+  stages.push(short.filter((s) => s.priority >= 6));
+  stages.push(short.filter((s) => s.priority >= 7));
+  stages.push(short.filter((s) => s.priority >= 8));
 
   for (const stage of stages) {
     const line = assemble(stage);
