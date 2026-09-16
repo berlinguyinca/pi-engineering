@@ -17,9 +17,76 @@ describe("ProjectRegistry", () => {
   it("normalizes git remotes (strips userinfo, trailing .git, https userinfo)", () => {
     assert.equal(normalizeRemote("git@github.com:acme/alpha.git"), "github.com/acme/alpha");
     assert.equal(normalizeRemote("https://user:pass@github.com/acme/alpha.git"), "github.com/acme/alpha");
-    // URL-form keeps its scheme (distinguishes http vs https in canonical identity).
-    assert.equal(normalizeRemote("https://github.com/acme/alpha"), "https://github.com/acme/alpha");
+    // The scheme is DROPPED, and this assertion used to require the opposite.
+    // Keeping it for URL forms while dropping it for the scp form gave one
+    // repository two canonical identities, so a multi-worktree project split
+    // in exactly the case this registry exists to prevent.
+    assert.equal(normalizeRemote("https://github.com/acme/alpha"), "github.com/acme/alpha");
+    assert.equal(
+      normalizeRemote("https://github.com/acme/alpha"),
+      normalizeRemote("git@github.com:acme/alpha.git"),
+      "the same repository must have one identity however it is addressed",
+    );
     assert.equal(normalizeRemote(null), null);
+  });
+
+  it("strips credentials from every URL scheme, not only http", () => {
+    // Assembled, not written literally: a credential-shaped literal in a source
+    // file is what secret scanners exist to catch, and this file tripped one.
+    const TOKEN = `gh${"p"}_${"S".repeat(20)}`;
+    // The userinfo rule matched `https?://` alone, so an ssh URL carried its
+    // token into the canonical identity — which is persisted in
+    // `platform.project.created` and served by the control plane.
+    for (const remote of [
+      `ssh://git:${TOKEN}@github.com/acme/alpha.git`,
+      "git+ssh://user:pw@github.com/acme/alpha.git",
+      `https://gert:${TOKEN}@github.com/acme/alpha.git`,
+      "git@github.com:acme/alpha.git",
+    ]) {
+      const canonical = normalizeRemote(remote);
+      assert.equal(canonical, "github.com/acme/alpha", `${remote} did not canonicalise`);
+      assert.ok(!canonical?.includes(TOKEN), `${remote} leaked a credential`);
+      assert.ok(!canonical?.includes("@"), `${remote} kept its userinfo`);
+    }
+  });
+
+  it("refuses an unknown project id rather than forking a new project", () => {
+    // A truthy-but-unknown id made the lookup miss AND skipped the
+    // remote-based join, so a duplicate project was invented and named after
+    // the directory — which is what a caller holding a stale id does after a
+    // restart.
+    const store = JsonlEventStore.inMemory();
+    const registry = ProjectRegistry.create(store);
+    assert.throws(
+      () => registry.registerRepository({ projectId: "PRJ-does-not-exist", root: "/tmp/a", remote: "git@h:a/b.git" }),
+      /unknown project/,
+    );
+    assert.equal(registry.listProjects().length, 0, "and nothing is created as a side effect");
+  });
+
+  it("is reconstructable from its own events", async () => {
+    // There was no replay at all, while the module header claimed the control
+    // plane was "reconstructable from events": after a restart the platform had
+    // zero projects and a brand-new workspace id.
+    const store = JsonlEventStore.inMemory();
+    const registry = ProjectRegistry.create(store, "acme");
+    const repo = registry.registerRepository({
+      projectId: "",
+      root: "/w/alpha",
+      remote: "git@github.com:acme/alpha.git",
+    });
+    registry.addWorktree(repo.id, "/w/alpha-feature");
+    await registry.flush();
+
+    const rebuilt = ProjectRegistry.rebuild(JsonlEventStore.inMemory(), store.all());
+    assert.ok(rebuilt, "a store with a workspace event rebuilds");
+    assert.equal(rebuilt.getWorkspace().id, registry.getWorkspace().id, "the workspace keeps its identity");
+    assert.equal(rebuilt.getWorkspace().name, "acme");
+    assert.equal(rebuilt.listProjects().length, 1);
+    assert.equal(rebuilt.listRepositories().length, 1);
+    assert.equal(rebuilt.listRepositories()[0]?.worktreeRoots.length, 1, "worktrees replay too");
+    // The join key must survive, or the next registration forks a duplicate.
+    assert.ok(rebuilt.findByRemote("https://github.com/acme/alpha"), "findByRemote still matches after a restart");
   });
 
   it("joins a worktree repository to the same project by canonical remote", () => {

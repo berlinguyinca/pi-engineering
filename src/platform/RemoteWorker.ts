@@ -50,19 +50,72 @@ export interface RemoteWorkerClientOptions {
   graph: WorkGraph;
   /** Heartbeat interval when attached. */
   heartbeatMs?: number;
+  /** How long a single remote command may take before it is treated as failed. */
+  commandTimeoutMs?: number;
   now?: () => number;
+}
+
+/** Longest a remote may hold a command. A remote is never trusted to answer. */
+export const DEFAULT_COMMAND_TIMEOUT_MS = 30_000;
+/** Longest acknowledgement a remote may return; anything more is truncated. */
+export const MAX_ACK_LENGTH = 4_096;
+
+/** Reject if `promise` has not settled within `ms`. */
+function withTimeout<T>(promise: Promise<T>, ms: number, workerId: string, kind: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    // NOT unref'd, unlike the heartbeat interval. This timer is the only thing
+    // that will ever settle the promise, so letting the loop exit without it
+    // firing reinstates the eternal wait it exists to end.
+    const timer = setTimeout(() => {
+      reject(new Error(`remote worker ${workerId} did not answer ${kind} within ${ms}ms`));
+    }, ms);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (err) => {
+        clearTimeout(timer);
+        reject(err);
+      },
+    );
+  });
+}
+
+/**
+ * Check what a remote sent back before anyone acts on it.
+ *
+ * The raw object used to be returned to the caller typed as a `CommandResult`
+ * by assertion alone, so a hostile or buggy host could report success for a
+ * command it never ran, attribute the result to a DIFFERENT worker, claim an
+ * arbitrary generation, and return an unbounded `ack` that every caller then
+ * held and might log.
+ */
+function validateResult(raw: unknown, workerId: string, generation: number): CommandResult {
+  const reject = (why: string): CommandResult => ({ workerId, generation, ok: false, ack: `invalid response: ${why}` });
+  if (!raw || typeof raw !== "object") return reject("not an object");
+  const r = raw as Partial<CommandResult>;
+  if (r.workerId !== workerId) return reject("workerId mismatch");
+  if (r.generation !== generation) return reject("generation mismatch");
+  if (typeof r.ok !== "boolean") return reject("ok is not a boolean");
+  const ack = typeof r.ack === "string" ? r.ack.slice(0, MAX_ACK_LENGTH) : "";
+  return { workerId, generation, ok: r.ok, ack };
 }
 
 export class RemoteWorkerClient {
   private readonly graph: WorkGraph;
   private readonly heartbeatMs: number;
+  private readonly commandTimeoutMs: number;
   private readonly now: () => number;
   private channels = new Map<string, WorkerChannel>();
   private heartbeatTimers = new Map<string, ReturnType<typeof setInterval>>();
+  /** Workers with a heartbeat still outstanding, so two never overlap. */
+  private inFlightHeartbeat = new Set<string>();
 
   constructor(opts: RemoteWorkerClientOptions) {
     this.graph = opts.graph;
     this.heartbeatMs = opts.heartbeatMs ?? 10_000;
+    this.commandTimeoutMs = opts.commandTimeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS;
     this.now = opts.now ?? Date.now;
   }
 
@@ -104,7 +157,31 @@ export class RemoteWorkerClient {
     };
     // Idempotency: a restart bumps generation; anything sent for the old
     // generation is dropped by the worker/transport.
-    return channel.send(envelope);
+    //
+    // Bounded and validated, because a remote may be slow, absent or hostile.
+    // This used to `return channel.send(envelope)` bare: a hung remote never
+    // settled, and since the heartbeat also dispatches, one hung worker
+    // accumulated a never-settling promise per interval forever. And whatever
+    // came back was handed to the caller typed as a `CommandResult` by
+    // assertion alone — a hostile host could claim success for a command it
+    // never ran, attribute it to a different worker, and return an unbounded
+    // `ack`.
+    let raw: unknown;
+    try {
+      raw = await withTimeout(channel.send(envelope), this.commandTimeoutMs, workerId, command.kind);
+    } catch (err) {
+      // A remote that did not answer is a failed command, not an exception the
+      // caller has to model. The worker is marked recovering so supervision can
+      // act on it.
+      this.graph.setWorkerStatus(workerId, "RECOVERING");
+      return {
+        workerId,
+        generation: worker.generation,
+        ok: false,
+        ack: err instanceof Error ? err.message : "remote command failed",
+      };
+    }
+    return validateResult(raw, workerId, worker.generation);
   }
 
   /** Reconnect a dropped worker (generation preserved) — recovery after disconnect. */
@@ -131,8 +208,22 @@ export class RemoteWorkerClient {
     const existing = this.heartbeatTimers.get(workerId);
     if (existing) clearInterval(existing);
     const timer = setInterval(() => {
-      this.graph.heartbeat(workerId);
-      void this.dispatch(workerId, { kind: "heartbeat" });
+      // Never two in flight for one worker: a remote slower than the interval
+      // otherwise grows an unbounded backlog of outstanding dispatches.
+      if (this.inFlightHeartbeat.has(workerId)) return;
+      this.inFlightHeartbeat.add(workerId);
+      void this.dispatch(workerId, { kind: "heartbeat" })
+        .then((result) => {
+          // Liveness is recorded from the REMOTE's answer, not before asking.
+          // Calling `graph.heartbeat` up front meant the heartbeat measured
+          // that this process's own timer was running: a worker that answered
+          // nothing at all still looked fresh, and `staleWorkers` was
+          // structurally incapable of reporting a hung remote.
+          if (result.ok) this.graph.heartbeat(workerId);
+        })
+        .finally(() => {
+          this.inFlightHeartbeat.delete(workerId);
+        });
     }, this.heartbeatMs);
     // Do not keep the process alive for a remote heartbeat.
     timer.unref?.();
