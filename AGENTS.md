@@ -95,6 +95,55 @@ Keep dependencies minimal and justified.
 
 Use small coherent commits with conventional commit messages.
 
+## One agent, one worktree
+
+This repository is worked on by several agents at once. Each one MUST work in
+its own git worktree, and MUST NOT run `git checkout`, `git switch` or
+`git reset` in a directory it does not own.
+
+This is not a new rule. INV-004 already requires that "every implementation
+candidate MUST execute in an isolated git worktree, branch, container overlay,
+or equivalent sandbox", and the runtime enforces it for the candidates it
+creates (`GitRepo.createWorktree`; `docs/architecture.md`, "Candidate
+isolation"). Agents editing the repository directly were the exception, and the
+exception is what broke.
+
+    git worktree add ../pi-engineering-runtime-<topic> -b <branch> origin/main
+
+Symlink `node_modules` into the new worktree rather than reinstalling. The
+object store is shared, so every commit is visible from every worktree
+immediately.
+
+### Why this matters more than it sounds
+
+A shared checkout has ONE `HEAD`. When an agent switches branches it does so
+for everyone in that directory, including an agent halfway through a task.
+Observed in a single session:
+
+- Commits landed on another agent's branch, because the checkout switched
+  between `git add` and `git commit`. The PR was then rejected with "No commits
+  between main and ..." while the work sat, invisible, on a branch nobody was
+  looking at.
+- Recovering it required a cherry-pick, which gave the commits new hashes,
+  which orphaned the roadmap evidence bound to them, which failed CI. An hour
+  of cascade from one branch switch.
+- `npm test` reported failures belonging to another agent's in-flight work, so
+  a green change looked red. Telling the two apart needed
+  `npx tsx --test $(git ls-files 'test/**/*.test.ts')`, which is not something
+  anyone should have to think of.
+
+Nothing was lost — git does not lose committed objects — but every recovery
+above was avoidable, and none of it would have happened in separate worktrees.
+
+### If you are in a shared checkout anyway
+
+- Check `git rev-parse --abbrev-ref HEAD` immediately before committing, not
+  only before starting.
+- Treat `git status` as a snapshot another process can invalidate.
+- Recover orphaned commits from `git reflog`; they are not gone.
+- Never `git reset --hard` a branch another agent may be on. Move your own
+  commits to your own branch and leave theirs alone.
+
 ## Completion
 
 Continue working until the requested milestone satisfies its acceptance criteria.
