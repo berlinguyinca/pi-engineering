@@ -21,6 +21,32 @@ export type RowPayload =
   | { kind: "error" }
   | { kind: "empty" };
 
+/**
+ * What a row MEANS, so the component can colour it without knowing what it is.
+ *
+ * Semantic rather than chromatic: shaping decides that a deleted file is a
+ * `removed` row, painting decides that `removed` is the theme's error colour.
+ * A tone named "red" here would put the operator's palette in the wrong file
+ * and break the moment they switch to a light theme.
+ *
+ * The values follow the convention every git surface uses — added green,
+ * modified amber, deleted red, renamed accent — because a file tree that
+ * invents its own colour language is one the operator has to learn.
+ */
+export type RowTone =
+  | "section"
+  | "added"
+  | "modified"
+  | "removed"
+  | "renamed"
+  | "commit"
+  | "high"
+  | "medium"
+  | "low"
+  | "ok"
+  | "note"
+  | "error";
+
 export interface PanelRow {
   depth: number;
   glyph: string;
@@ -28,6 +54,8 @@ export interface PanelRow {
   payload: RowPayload;
   /** Whether the cursor may rest here. */
   selectable: boolean;
+  /** How the row should read. Absent means the panel's default text colour. */
+  tone?: RowTone;
 }
 
 /** Collapsible section ids, in render order. */
@@ -46,13 +74,41 @@ const TAB_LABELS: Record<PanelTabId, string> = {
  * The tab bar, as one line. Truncated like every other row: the panel never
  * wraps, so a narrow panel shows the tabs that fit and nothing more.
  */
-export function renderTabBar(active: PanelTabId, width: number): string {
+export function renderTabBar(
+  active: PanelTabId,
+  width: number,
+  theme?: { fg(colour: string, text: string): string },
+): string {
   const line = PANEL_TABS.map((tab) => (tab === active ? `[${TAB_LABELS[tab]}]` : ` ${TAB_LABELS[tab]} `)).join("");
-  return truncateToWidth(line, Math.max(0, width), "…");
+  const plain = truncateToWidth(line, Math.max(0, width), "…");
+  if (!theme) return plain;
+  // Painted AFTER truncation, and only by locating the already-truncated
+  // active token: colouring first and cutting afterwards would slice an escape
+  // sequence in half and stain the rest of the frame with whatever colour
+  // happened to be open.
+  const token = `[${TAB_LABELS[active]}]`;
+  const at = plain.indexOf(token);
+  try {
+    if (at < 0) return theme.fg("dim", plain);
+    return `${theme.fg("dim", plain.slice(0, at))}${theme.fg("accent", token)}${theme.fg("dim", plain.slice(at + token.length))}`;
+  } catch {
+    return plain;
+  }
 }
 
 const OPEN = "▾";
 const SHUT = "▸";
+
+/** Change kind to tone, so the glyph reads the way it does in every git UI. */
+const CHANGE_TONE: Record<PanelFileEntry["change"], RowTone> = {
+  added: "added",
+  modified: "modified",
+  deleted: "removed",
+  renamed: "renamed",
+  // Untracked is green for the same reason added is: it is new work, and the
+  // only difference is whether git has been told about it yet.
+  untracked: "added",
+};
 
 /** One-letter marker per change kind, so a glance says what happened. */
 const CHANGE_GLYPH: Record<PanelFileEntry["change"], string> = {
@@ -70,6 +126,7 @@ function section(id: string, label: string, count: number, expanded: ReadonlySet
     label: `${label} (${count})`,
     payload: { kind: "section", id },
     selectable: true,
+    tone: "section",
   };
 }
 
@@ -80,6 +137,7 @@ function fileRow(file: PanelFileEntry, source: "run" | "workspace"): PanelRow {
     label: `${file.path}${changeSize(file)}`,
     payload: { kind: "file", path: file.path, source },
     selectable: true,
+    tone: CHANGE_TONE[file.change],
   };
 }
 
@@ -127,8 +185,21 @@ function findingRow(finding: PanelFinding): PanelRow {
     label: parts.join(" · "),
     payload: { kind: "finding", id: finding.id },
     selectable: true,
+    // A resolved finding is not a problem any more, whatever it once was: the
+    // severity describes the claim, the tone describes what the operator has
+    // left to do about it.
+    tone: finding.status === "resolved" ? "ok" : (SEVERITY_TONE[finding.severity] ?? "medium"),
   };
 }
+
+/** Severity to tone. Standard traffic lights, not a palette of our own. */
+const SEVERITY_TONE: Record<string, RowTone> = {
+  critical: "high",
+  high: "high",
+  medium: "medium",
+  low: "low",
+  info: "low",
+};
 
 function spendRow(spend: PanelSpend): PanelRow {
   const cost = spend.cost > 0 ? ` · $${spend.cost.toFixed(2)}` : "";
@@ -201,6 +272,7 @@ export function buildRows(
               // of listing recent work is being able to read it.
               payload: { kind: "commit", sha: c.sha, subject: c.subject },
               selectable: true,
+              tone: "commit",
             });
           }
         }
@@ -243,6 +315,7 @@ export function buildRows(
       label: `${error.section}: ${error.message}`,
       payload: { kind: "error" },
       selectable: false,
+      tone: "error",
     });
   }
 
@@ -298,6 +371,9 @@ function sessionRows(state: Readonly<PanelStateShape>, nowMs: number): PanelRow[
       label: `— model-generated · updated ${formatAge(nowMs - narrative.updatedAt)}`,
       payload: { kind: "empty" },
       selectable: false,
+      // Quieter than the text it describes: the attribution must be legible
+      // (INV-006) without competing with the narrative for attention.
+      tone: "note",
     },
   ];
 }

@@ -39,6 +39,7 @@ import {
   stepTab,
   stepWidth,
 } from "./layout.ts";
+import { paintGlyph, paintLabel } from "./rowPaint.ts";
 import { type SearchState, findMatches, stepMatch } from "./search.ts";
 import { type PanelRow, type RowPayload, buildRows, clampSelection, renderTabBar } from "./tree.ts";
 import { wrapTail } from "./wrap.ts";
@@ -117,6 +118,12 @@ export class PanelComponent {
   private search: SearchState | null = null;
   /** Committed matches, so `n`/`N` keep working after the prompt closes. */
   private lastSearch: { matches: number[]; index: number } | null = null;
+  /**
+   * Which RENDERED line the cursor is on, so the row can carry a selection
+   * background. Not the same as `selection`, which indexes rows: the tab bar
+   * occupies a line and the rows start below it.
+   */
+  private selectedLine: number | null = null;
   /** Transient one-line message (a copy result), cleared by the next keystroke. */
   private notice: string | null = null;
   private disposed = false;
@@ -281,9 +288,14 @@ export class PanelComponent {
   private withBorder(lines: string[], inner: number): string[] {
     const edge = this.theme ? this.theme.fg("borderMuted", BORDER_GLYPH) : BORDER_GLYPH;
     const bg = this.backgroundAnsi();
-    return lines.map((line) => {
+    // The cursor's row gets the theme's selection background instead of the
+    // panel's, across the FULL width including the padding — a highlight that
+    // stopped at the end of the text would read as a stray coloured word.
+    const selectedBg = this.selectedLine === null ? "" : this.bgAnsi("selectedBg");
+    return lines.map((line, index) => {
       const pad = Math.max(0, inner - visibleWidth(line));
-      return this.tint(`${edge} ${line}${" ".repeat(pad)}`, bg);
+      const rowBg = index === this.selectedLine && selectedBg ? selectedBg : bg;
+      return this.tint(`${edge} ${line}${" ".repeat(pad)}`, rowBg);
     });
   }
 
@@ -298,8 +310,13 @@ export class PanelComponent {
    * theme's judgement rather than a computed offset.
    */
   private backgroundAnsi(): string {
+    return this.bgAnsi("customMessageBg");
+  }
+
+  /** One background escape, or nothing at all when the theme cannot supply it. */
+  private bgAnsi(colour: string): string {
     try {
-      return this.theme?.getBgAnsi?.("customMessageBg") ?? "";
+      return this.theme?.getBgAnsi?.(colour) ?? "";
     } catch {
       return "";
     }
@@ -437,21 +454,42 @@ export class PanelComponent {
 
   private renderTree(width: number): string[] {
     this.refreshRows();
-    const body = this.currentRows.map((row, index) => {
-      const cursor = index === this.selection ? "›" : " ";
-      const indent = "  ".repeat(row.depth);
-      const glyph = row.glyph ? `${row.glyph} ` : "";
-      return truncateToWidth(`${cursor}${indent}${glyph}${row.label}`, width, "…");
-    });
-    const lines = [renderTabBar(this.activeTab, width), ...body];
+    const body = this.currentRows.map((row, index) => this.renderRow(row, index === this.selection, width));
+    // The tab bar is line 0, so the cursor's row sits one below its index.
+    this.selectedLine = this.selection >= 0 && this.selection < this.currentRows.length ? this.selection + 1 : null;
+    const lines = [renderTabBar(this.activeTab, width, this.theme), ...body];
     if (this.search) lines.push(truncateToWidth(`/${this.search.query}`, width, "…"));
     if (this.notice) lines.push(truncateToWidth(this.notice, width, "…"));
     return lines;
   }
 
+  /**
+   * One tree row: cursor, indent, glyph, label.
+   *
+   * The LABEL is truncated to the space the fixed columns leave, and colour is
+   * applied afterwards — the same rule the diff gutter follows, and for the
+   * same reason: truncating painted text cuts an escape sequence in half and
+   * stains the rest of the frame.
+   */
+  private renderRow(row: PanelRow, selected: boolean, width: number): string {
+    const cursor = selected ? "›" : " ";
+    const indent = "  ".repeat(row.depth);
+    const glyph = row.glyph ? `${row.glyph} ` : "";
+    const plain = `${cursor}${indent}${glyph}${row.label}`;
+    const headWidth = visibleWidth(`${cursor}${indent}${glyph}`);
+    // Too narrow for the label to survive at all: fall back to the plain row
+    // rather than paint fragments of a head that is itself being cut.
+    if (!this.theme || width <= headWidth) return truncateToWidth(plain, width, "…");
+    const label = truncateToWidth(row.label, width - headWidth, "…");
+    const painted = `${paintGlyph(row.glyph, row.tone, this.theme)} `;
+    return `${cursor}${indent}${row.glyph ? painted : ""}${paintLabel(label, row.tone, this.theme)}`;
+  }
+
   private renderContent(width: number): string[] {
     const view = this.content;
     if (!view) return [];
+    // No tree on screen, so no row to highlight.
+    this.selectedLine = null;
     const header = truncateToWidth(`◂ ${view.title}`, width, "…");
     if (view.error) {
       return [header, truncateToWidth(`  error: ${view.error}`, width, "…")];
