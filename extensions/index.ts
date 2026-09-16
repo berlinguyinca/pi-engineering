@@ -10,6 +10,8 @@ import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-c
 import { resolveMemoryEnvironment } from "../src/blackhole/connectionSetup.ts";
 import { openVikingBlackholeOption } from "../src/blackhole/envConfig.ts";
 import { registerInteractiveMemory } from "../src/blackhole/interactiveMemory.ts";
+import { type InferweaveProvider, createInferweaveProvider, inferweaveConfigFromEnv } from "../src/context/provider.ts";
+import { contextReading, planModelSwitch } from "../src/context/usage.ts";
 import { sharedAdmissionController, sharedGatewayConfig } from "../src/gateway/config.ts";
 import { type FallbackCandidate, chooseFallbackModel } from "../src/gateway/fallback.ts";
 import {
@@ -19,8 +21,6 @@ import {
 } from "../src/gateway/installStreamRetry.ts";
 import { describeGatewayWait, isAccountWideRefusal, parseGatewayWait } from "../src/gateway/signals.ts";
 import { renderGatewayReport } from "../src/gateway/statusReport.ts";
-import { type InferweaveProvider, createInferweaveProvider, inferweaveConfigFromEnv } from "../src/context/provider.ts";
-import { contextReading, planModelSwitch } from "../src/context/usage.ts";
 import { GitRepo } from "../src/git/GitRepo.ts";
 import { GenerationGuard } from "../src/guard/GenerationGuard.ts";
 import { RECOVERY_PROMPT, TOOL_TRANSITION_RULE, buildDegenerationEvent } from "../src/guard/RecoveryController.ts";
