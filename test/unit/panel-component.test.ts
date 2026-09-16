@@ -284,3 +284,68 @@ test("component: opening a file replaces the split rather than shrinking it", ()
   assert.doesNotMatch(c.render(60).join("\n"), /summary · generated/);
   c.dispose();
 });
+
+test("component: the panel carries its own background across the whole column", () => {
+  // Without this the panel is text floating over the transcript rather than a
+  // surface beside it.
+  const state = new PanelState();
+  state.set({ updatedAt: 1, workspace: { branch: "main", files: [{ path: "a.ts", change: "modified" }] } });
+  const theme = {
+    fg: (_c: string, t: string) => `\u001b[35m${t}\u001b[0m`,
+    getBgAnsi: () => "\u001b[48;5;236m",
+  };
+  const c = new PanelComponent({ state, requestRender: () => {}, theme, fillHeight: () => 10 });
+
+  const lines = c.render(40);
+  assert.ok(
+    lines.every((l) => l.startsWith("\x1b[48;5;236m")),
+    "every row, including blank padding, is tinted",
+  );
+  assert.ok(
+    lines.every((l) => l.endsWith("\x1b[0m")),
+    "and every row closes its span",
+  );
+  c.dispose();
+});
+
+test("component: a foreground reset does not strip the background", () => {
+  // `theme.fg()` ends with a FULL reset, which clears the background too. A
+  // line wrapped naively loses its tint at the first coloured token and never
+  // gets it back.
+  const state = new PanelState();
+  state.set({ updatedAt: 1, workspace: { branch: "main", files: [{ path: "a.ts", change: "modified" }] } });
+  const theme = {
+    fg: (_c: string, t: string) => `\u001b[35m${t}\u001b[0m`,
+    getBgAnsi: () => "\u001b[48;5;236m",
+  };
+  const c = new PanelComponent({ state, requestRender: () => {}, theme, fillHeight: () => 10 });
+
+  for (const line of c.render(40)) {
+    // Every reset except the final one must be followed by the background
+    // being re-armed.
+    const body = line.slice(0, -"\u001b[0m".length);
+    const resets = body.split("\u001b[0m").slice(1);
+    for (const after of resets) {
+      assert.ok(after.startsWith("\u001b[48;5;236m"), "a reset mid-line must re-arm the background");
+    }
+  }
+  c.dispose();
+});
+
+test("component: without a theme the panel adds no colour of its own", () => {
+  // Not "no escapes at all": pi-tui's own truncateToWidth emits a reset around
+  // its ellipsis, which is not ours to remove. What must be absent is any
+  // background or foreground this component chose.
+  const state = new PanelState();
+  state.set({ updatedAt: 1, workspace: { branch: "main", files: [{ path: "a.ts", change: "modified" }] } });
+  const c = new PanelComponent({ state, requestRender: () => {}, fillHeight: () => 10 });
+
+  const out = c.render(40).join("");
+  const ESC = String.fromCharCode(27);
+  // Built from a code point rather than written literally: a raw control
+  // character in a regex is both unreadable and a lint error.
+  assert.doesNotMatch(out, new RegExp(`${ESC}\\[4[0-9]`), "no background");
+  assert.doesNotMatch(out, new RegExp(`${ESC}\\[3[0-9]`), "no foreground");
+  assert.doesNotMatch(out, new RegExp(`${ESC}\\[48;`), "no extended background");
+  c.dispose();
+});

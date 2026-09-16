@@ -14,6 +14,9 @@ import { type CopyResult, copyToTerminal } from "./clipboard.ts";
 import type { ContentView } from "./content.ts";
 import { type GutterKind, formatGutter, gutterWidth, numberDiffLines, numberFileLines } from "./gutter.ts";
 
+/** ANSI full reset, as emitted by `Theme.fg`. */
+const RESET = "\u001b[0m";
+
 /** The panel's left edge, and the columns it costs (glyph + space). */
 const BORDER_GLYPH = "│";
 const BORDER_WIDTH = 2;
@@ -71,7 +74,7 @@ export interface PanelComponentOptions {
    */
   fillHeight?: () => number | undefined;
   /** Pi's Theme, when the session has one. Absent in tests and headless runs. */
-  theme?: { fg(colour: string, text: string): string };
+  theme?: { fg(colour: string, text: string): string; getBgAnsi?(colour: string): string };
   /** Copy sink. Defaults to OSC 52 on stdout. */
   copy?: (text: string) => CopyResult;
 }
@@ -83,7 +86,7 @@ export class PanelComponent {
   private readonly onClose: (() => void) | undefined;
   private readonly onLayoutChange: ((layout: PanelLayoutPatch) => void) | undefined;
   private readonly fillHeight: (() => number | undefined) | undefined;
-  private readonly theme: { fg(colour: string, text: string): string } | undefined;
+  private readonly theme: { fg(colour: string, text: string): string; getBgAnsi?(colour: string): string } | undefined;
   private readonly copyFn: (text: string) => CopyResult;
   private readonly unsubscribe: () => void;
 
@@ -232,10 +235,43 @@ export class PanelComponent {
    */
   private withBorder(lines: string[], inner: number): string[] {
     const edge = this.theme ? this.theme.fg("borderMuted", BORDER_GLYPH) : BORDER_GLYPH;
+    const bg = this.backgroundAnsi();
     return lines.map((line) => {
       const pad = Math.max(0, inner - visibleWidth(line));
-      return `${edge} ${line}${" ".repeat(pad)}`;
+      return this.tint(`${edge} ${line}${" ".repeat(pad)}`, bg);
     });
+  }
+
+  /**
+   * The panel's own background, so the column reads as a surface rather than
+   * text floating over the transcript.
+   *
+   * `customMessageBg` is pi's tint for an extension's own block — subtle in
+   * both shipped themes (#2d2838 dark, #ede7f6 light) and, unlike a hardcoded
+   * shade, correct in whatever theme the operator actually uses. There is no
+   * way to read the terminal's real background, so "slightly darker" is the
+   * theme's judgement rather than a computed offset.
+   */
+  private backgroundAnsi(): string {
+    try {
+      return this.theme?.getBgAnsi?.("customMessageBg") ?? "";
+    } catch {
+      return "";
+    }
+  }
+
+  /**
+   * Paint one composed line with the background.
+   *
+   * The subtlety: `theme.fg()` ends its span with a full reset, which clears
+   * the BACKGROUND as well as the foreground. A line wrapped naively loses its
+   * tint at the first coloured token and stays lost. So every reset already in
+   * the line is followed by the background being re-armed, and the line is
+   * closed with one final reset.
+   */
+  private tint(line: string, bg: string): string {
+    if (!bg) return line;
+    return `${bg}${line.replaceAll(RESET, `${RESET}${bg}`)}${RESET}`;
   }
 
   /**

@@ -440,6 +440,28 @@ ${RECOVERY_PROMPT}`;
     return checkForUpdate({ cwd: extensionRoot, git: runGit, apply });
   };
 
+  // ─── A clean terminal on the way out ─────────────────────────────────────
+  // Pi leaves its last frame on screen at exit, so the shell prompt returns
+  // underneath a half-session of transcript. Clearing the visible screen hands
+  // the terminal back the way it was found.
+  //
+  // The SCROLLBACK is deliberately left alone (no `3J`): erasing what the
+  // operator did is not tidying, it is destroying the record of a session they
+  // may still want to scroll back through or copy from.
+  if (typeof pi.on === "function") {
+    pi.on("session_shutdown", () => {
+      if ((process.env.PI_CLEAR_ON_EXIT ?? "1").toLowerCase() === "0") return;
+      // Only a real terminal: writing escape codes into a pipe or a log puts
+      // control characters in someone's file.
+      if (!process.stdout.isTTY) return;
+      try {
+        process.stdout.write("\u001b[2J\u001b[H");
+      } catch {
+        // A cosmetic write is never worth failing a shutdown for.
+      }
+    });
+  }
+
   // Registered on its own, NOT inside the gateway-admission block: staying
   // current has nothing to do with backpressure, and nesting it there meant
   // PI_GATEWAY_ADMISSION_ENABLED=0 silently switched off update checking too.

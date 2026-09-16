@@ -367,3 +367,49 @@ test("wiring: an auto-opened panel never captures the keyboard", async () => {
     else process.env.PI_PANEL_AUTO_OPEN = prev;
   }
 });
+
+test("wiring: exiting clears the screen but not the scrollback", async () => {
+  // Erasing what the operator did is not tidying — they may still want to
+  // scroll back through the session or copy from it. So the visible screen is
+  // cleared (2J) and the scrollback (3J) is left alone.
+  const written: string[] = [];
+  const realWrite = process.stdout.write.bind(process.stdout);
+  const realTty = process.stdout.isTTY;
+  Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true });
+  process.stdout.write = ((chunk: string) => {
+    written.push(String(chunk));
+    return true;
+  }) as typeof process.stdout.write;
+  try {
+    const handlers = loadExtension();
+    for (const h of handlers.get("session_shutdown") ?? []) await Promise.resolve(h({}, ctxStub()));
+  } finally {
+    process.stdout.write = realWrite;
+    Object.defineProperty(process.stdout, "isTTY", { value: realTty, configurable: true });
+  }
+
+  const escapes = written.filter((w) => w.includes("[2J"));
+  assert.equal(escapes.length, 1, "the screen is cleared exactly once");
+  assert.ok(!escapes[0]?.includes("[3J"), "the scrollback must survive");
+});
+
+test("wiring: a non-terminal stdout is never written to", async () => {
+  // Escape codes in a pipe become control characters in somebody's log file.
+  const written: string[] = [];
+  const realWrite = process.stdout.write.bind(process.stdout);
+  const realTty = process.stdout.isTTY;
+  Object.defineProperty(process.stdout, "isTTY", { value: false, configurable: true });
+  process.stdout.write = ((chunk: string) => {
+    written.push(String(chunk));
+    return true;
+  }) as typeof process.stdout.write;
+  try {
+    const handlers = loadExtension();
+    for (const h of handlers.get("session_shutdown") ?? []) await Promise.resolve(h({}, ctxStub()));
+  } finally {
+    process.stdout.write = realWrite;
+    Object.defineProperty(process.stdout, "isTTY", { value: realTty, configurable: true });
+  }
+
+  assert.equal(written.filter((w) => w.includes("[2J")).length, 0, "no escape codes when stdout is not a terminal");
+});

@@ -88,10 +88,17 @@ test("onboarding stores verified connection privately, masks keys, and saved set
   const promptCount = f.prompts.length;
   await ensureMemorySetup(f.ctx, f.options);
   assert.equal(f.prompts.length, promptCount, "same update should not prompt again");
-  f.selections.push("Keep current connection");
+  // A new revision no longer re-asks. Confirming a connection that is on disk
+  // and demonstrably working teaches the operator to dismiss the dialog rather
+  // than read it; the revision is still recorded so nothing reads as stale.
   await ensureMemorySetup(f.ctx, { ...f.options, revision: "v2" });
-  assert.ok(f.prompts.length > promptCount, "updated package prompts once");
+  assert.equal(f.prompts.length, promptCount, "a working connection is not re-confirmed after an update");
   assert.equal(JSON.parse(readFileSync(configFile, "utf8")).lastConfirmedRevision, "v2");
+
+  // Changing it is still possible — that is what /memory setup does.
+  f.selections.push("Keep current connection");
+  await ensureMemorySetup(f.ctx, { ...f.options, revision: "v2", force: true });
+  assert.ok(f.prompts.length > promptCount, "an explicit setup still prompts");
 });
 
 test("keep current reuses external key file and does not rewrite it", async (t) => {
@@ -100,8 +107,11 @@ test("keep current reuses external key file and does not rewrite it", async (t) 
   writeFileSync(external, "external-key\n", { mode: 0o640 });
   f.setKey("external-key");
   f.selections.splice(0, 1, "Keep current connection");
+  // `force`, because a working connection is no longer re-confirmed on its
+  // own: this exercises the dialog, which is what /memory setup opens.
   await ensureMemorySetup(f.ctx, {
     ...f.options,
+    force: true,
     env: { PI_OPENVIKING_BASE_URL: "https://old.test", PI_OPENVIKING_TOKEN_FILE: external },
   });
   assert.equal(resolveMemoryEnvironment({}, f.options).PI_OPENVIKING_TOKEN_FILE, external);
@@ -183,6 +193,7 @@ test("confirmation identifies the current host without exposing URL userinfo or 
   f.selections.splice(0, 1, "Later");
   await ensureMemorySetup(f.ctx, {
     ...f.options,
+    force: true,
     env: {
       PI_OPENVIKING_BASE_URL: "https://user:secret@memory.test/path?q=secret",
       PI_OPENVIKING_TOKEN: "personal-test-key",
@@ -238,6 +249,7 @@ test("external key rotation during validation aborts setup without storing stale
   f.selections.splice(0, 1, "Keep current connection");
   await ensureMemorySetup(f.ctx, {
     ...f.options,
+    force: true,
     env: { PI_OPENVIKING_BASE_URL: "https://memory.test", PI_OPENVIKING_TOKEN_FILE: external },
     fetch: async () => {
       writeFileSync(external, "rotated-key\n");
