@@ -98,16 +98,28 @@ export class Narrator {
     const slot = await this.acquire();
     try {
       const text = sanitizeNarrative(await this.summarize(buildNarrativePrompt(deltas, this.currentText())));
+      // The ATTEMPT is what the debounce paces, not the success. Recording it
+      // only on success meant a failing narrator had no debounce at all:
+      // `lastCallAt` never advanced, so every panel state change started
+      // another call. Against a saturated gateway — the one condition that
+      // makes these calls fail in the first place — that is a busy-retry
+      // adding load to the thing already failing, and the panel refresh loop
+      // drives state changes every few seconds. Found by a dogfood run against
+      // a live gateway that was refusing with `queue_timeout`.
+      //
+      // `previous` still advances only on success, which is what the original
+      // intent was protecting: a failed call must not swallow the change it
+      // failed to describe, so the next attempt still sees those deltas.
+      this.lastCallAt = this.now();
       if (!text) return false;
       if (this.disposed) return false;
       this.state.set({ narrative: { text, updatedAt: this.now(), generated: true } });
-      // Recorded only on success, so a failed call retries on the next
-      // meaningful change rather than swallowing it.
       this.previous = { ...input, files: [...input.files] };
-      this.lastCallAt = this.now();
       return true;
     } catch {
-      // Silent by design: the previous narrative and its timestamp stand.
+      // Silent by design: the previous narrative and its timestamp stand. The
+      // attempt is still paced, for the reason above.
+      this.lastCallAt = this.now();
       return false;
     } finally {
       slot.release();

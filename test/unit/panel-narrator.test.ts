@@ -223,3 +223,63 @@ test("narrator: publishing its own narrative does not feed itself a new call", a
   assert.equal(started, 1, "a self-triggered observation must find nothing new");
   narrator.dispose();
 });
+
+test("narrator: a failed call is still paced, so a broken gateway is not hammered", async () => {
+  // `lastCallAt` used to advance only on success, which meant a FAILING
+  // narrator had no debounce at all: every panel state change started another
+  // call. Against a saturated gateway — the one condition that makes these
+  // calls fail — that is a busy-retry adding load to the thing already
+  // failing, and the panel refresh loop drives state changes every few
+  // seconds. Found by a live dogfood run refused with `queue_timeout`.
+  let now = 0;
+  let calls = 0;
+  const narrator = new Narrator({
+    state: new PanelState(),
+    summarize: async () => {
+      calls++;
+      throw new Error("429 queue_timeout");
+    },
+    cooldownRemainingMs: () => 0,
+    acquire: async () => ({ release: () => {} }),
+    minIntervalMs: 60_000,
+    now: () => now,
+  });
+
+  assert.equal(await narrator.observe({ workItemId: "w", phase: "a", files: ["x.ts"] }), false);
+  assert.equal(calls, 1);
+
+  now += 1_000;
+  assert.equal(await narrator.observe({ workItemId: "w", phase: "b", files: ["x.ts", "y.ts"] }), false);
+  assert.equal(calls, 1, "a second change one second later must not start a second call");
+
+  now += 60_000;
+  assert.equal(await narrator.observe({ workItemId: "w", phase: "c", files: ["x.ts", "z.ts"] }), false);
+  assert.equal(calls, 2, "but the interval still lets it try again");
+});
+
+test("narrator: a failed call does not swallow the change it failed to describe", async () => {
+  // The original intent behind recording only on success, which the pacing fix
+  // had to preserve: `previous` must NOT advance on failure, or the deltas that
+  // call failed to describe are lost and never retried.
+  let now = 0;
+  const prompts: string[] = [];
+  let fail = true;
+  const narrator = new Narrator({
+    state: new PanelState(),
+    summarize: async (prompt) => {
+      prompts.push(prompt);
+      if (fail) throw new Error("429 queue_timeout");
+      return "a narrative";
+    },
+    cooldownRemainingMs: () => 0,
+    acquire: async () => ({ release: () => {} }),
+    minIntervalMs: 0,
+    now: () => now,
+  });
+
+  await narrator.observe({ workItemId: "w", phase: "implementing", files: ["a.ts"] });
+  fail = false;
+  now += 1;
+  assert.equal(await narrator.observe({ workItemId: "w", phase: "implementing", files: ["a.ts"] }), true);
+  assert.ok(prompts[1]?.includes("a.ts"), "the retry still carries the file the failed call was about");
+});
