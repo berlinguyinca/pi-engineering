@@ -118,4 +118,59 @@
   findings:
     critical: 0
     high: 0
+- id: dogfood-panel-telemetry-platform
+  milestone: __global__
+  type: dogfood
+  status: pass
+  commit: 1d326d5bce5004411ead0a7a245bdba6fe2d0ace
+  generatedAt: 2026-09-16T17:37:47.515Z
+  paths: &a2
+    - src/
+    - extensions/
+    - scripts/
+    - test/
+  proof: scripts/dogfood-gateway-wait.ts, scripts/dogfood-self-update.ts,
+    scripts/dogfood-panel-surface.ts, scripts/dogfood-roadmap.ts (all pass); npm
+    run test:e2e and npm run platform:e2e; scripts/dogfood-narrator.ts
+    INCONCLUSIVE (the operator's gateway refused admission, 45 queued against a
+    limit of 4 — the live model path produced a real narrative earlier in the
+    same session)
+  summary: "Engineering panel (always-on, non-capturing, coloured, openable
+    commits), telemetry routed off raw stderr so diagnostics no longer tear the
+    TUI frame, and the platform control plane. Four fresh-context reviews:
+    surface, telemetry, and two Opus reviews of src/platform. Every critical and
+    high finding fixed with a regression test, including outbox and event-store
+    data loss, missing registry replay, unhandled emit rejections killing the
+    process, credential disclosure in the control-plane snapshot, and the
+    control server binding every interface unauthenticated. Several tests were
+    found to pin the bugs they appeared to cover and were corrected. NOT
+    covered: per-project authorization (ProjectAuth is implemented and tested
+    but wired to nothing; the control server's token is a deployment control
+    only)."
+- id: review-panel-telemetry-platform
+  milestone: __global__
+  type: fresh_review
+  status: pass
+  commit: 1d326d5bce5004411ead0a7a245bdba6fe2d0ace
+  generatedAt: 2026-09-16T17:37:47.515Z
+  paths: *a2
+  proof: Two independent fresh-context Opus reviews of src/platform
+    (durability/state and untrusted-input/secrets), plus
+    scripts/fresh-review-gateway-wait.ts surface and telemetry areas; all 7
+    critical and 10 high findings fixed, each with a regression test
+  summary: "Engineering panel (always-on, non-capturing, coloured, openable
+    commits), telemetry routed off raw stderr so diagnostics no longer tear the
+    TUI frame, and the platform control plane. Four fresh-context reviews:
+    surface, telemetry, and two Opus reviews of src/platform. Every critical and
+    high finding fixed with a regression test, including outbox and event-store
+    data loss, missing registry replay, unhandled emit rejections killing the
+    process, credential disclosure in the control-plane snapshot, and the
+    control server binding every interface unauthenticated. Several tests were
+    found to pin the bugs they appeared to cover and were corrected. NOT
+    covered: per-project authorization (ProjectAuth is implemented and tested
+    but wired to nothing; the control server's token is a deployment control
+    only)."
+  findings:
+    critical: 0
+    high: 0
 

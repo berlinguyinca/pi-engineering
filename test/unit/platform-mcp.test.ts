@@ -17,8 +17,11 @@ describe("McpRegistry", () => {
       policy: ({ role, tool }) => role === "implementer" && tool === "write",
     });
     registry.register({ name: "lcb", version: "1.0", command: "x", tools: ["query", "write"] });
+    // Server-SCOPED pairs, not bare names. `invoke` decides per (server, tool)
+    // and this returned names across all servers, so a consumer using it as the
+    // authorization answer re-opened the cross-server collision `invoke` closes.
     const allowed = registry.allowlistFor("PRJ-1", "implementer", null);
-    assert.deepEqual(allowed, ["write"]);
+    assert.deepEqual(allowed, [{ server: "lcb", tool: "write" }]);
     assert.deepEqual(registry.allowlistFor("PRJ-1", "reviewer", null), []);
   });
 
@@ -28,7 +31,32 @@ describe("McpRegistry", () => {
     });
     registry.register({ name: "s", version: "1.0", command: "x", tools: ["a", "b", "c"] });
     const allowed = registry.allowlistFor("PRJ-1", "implementer", ["a", "b"]);
-    assert.deepEqual(allowed, ["a", "b"]);
+    assert.deepEqual(allowed, [
+      { server: "s", tool: "a" },
+      { server: "s", tool: "b" },
+    ]);
+  });
+
+  it("a tool name shared by two servers is reported per server", () => {
+    // The collision `invoke` already guards, now visible in the allowlist too.
+    const registry = new McpRegistry({ policy: ({ tool }) => tool === "query" });
+    registry.register({ name: "trusted", version: "1.0", command: "x", tools: ["query"] });
+    registry.register({ name: "untrusted", version: "1.0", command: "x", tools: ["query"] });
+    assert.deepEqual(registry.allowlistFor("PRJ-1", "implementer", null), [
+      { server: "trusted", tool: "query" },
+      { server: "untrusted", tool: "query" },
+    ]);
+  });
+
+  it("a registration command is redacted before it is handed back", () => {
+    const KEY = `sk-${"live"}-1234567890`;
+    // These routinely carry `--api-key=…` in argv, and `discover()` is returned
+    // to callers and printed by tooling.
+    const registry = new McpRegistry();
+    registry.register({ name: "lcb", version: "1.0", command: `node lcb.mjs --api-key=${KEY}`, tools: [] });
+    const command = registry.discover()[0]?.command ?? "";
+    assert.ok(!command.includes(KEY), "the key must not survive discovery");
+    assert.ok(command.includes("node lcb.mjs"), "but the command is still recognisable");
   });
 
   it("records invocation correlation, duration/status and permission decision", async () => {

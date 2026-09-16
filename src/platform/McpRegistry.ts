@@ -11,6 +11,7 @@
  */
 
 import { id } from "../core/ids.ts";
+import { redactSecrets } from "./redact.ts";
 
 export interface McpServer {
   name: string;
@@ -38,6 +39,9 @@ export interface McpRegistryOptions {
   policy?: (ctx: { projectId: string; role: string; tool: string }) => boolean;
 }
 
+/** Invocation records retained; older ones are dropped. */
+const MAX_AUDIT_RECORDS = 1_000;
+
 export class McpRegistry {
   private readonly servers = new Map<string, McpServer>();
   private readonly invocations: McpInvocationRecord[] = [];
@@ -52,8 +56,15 @@ export class McpRegistry {
   }
 
   /** Discovery: what tools exist. Does NOT grant permission. */
+  /**
+   * Registered servers.
+   *
+   * The command is redacted: registration commands routinely carry
+   * `--api-key=…` or `--token=…` in argv, and this is returned to callers and
+   * printed by tooling.
+   */
   discover(): Array<McpServer & { tools: string[] }> {
-    return [...this.servers.values()].map((s) => ({ ...s, tools: [...s.tools] }));
+    return [...this.servers.values()].map((s) => ({ ...s, command: redactSecrets(s.command), tools: [...s.tools] }));
   }
 
   /**
@@ -61,12 +72,16 @@ export class McpRegistry {
    * The effective set is the intersection of what the role's policy allows and
    * what the run ceiling permits — a child can never exceed its ceiling.
    */
-  allowlistFor(projectId: string, role: string, ceilingTools: string[] | null): string[] {
-    const allowed: string[] = [];
+  allowlistFor(
+    projectId: string,
+    role: string,
+    ceilingTools: string[] | null,
+  ): Array<{ server: string; tool: string }> {
+    const allowed: Array<{ server: string; tool: string }> = [];
     for (const server of this.servers.values()) {
       for (const tool of server.tools) {
         if (ceilingTools && !ceilingTools.includes(tool)) continue; // ceiling caps children
-        if (this.policy({ projectId, role, tool })) allowed.push(tool);
+        if (this.policy({ projectId, role, tool })) allowed.push({ server: server.name, tool });
       }
     }
     return allowed;
@@ -122,10 +137,15 @@ export class McpRegistry {
       status,
     };
     this.invocations.push(record);
+    // Actually bounded, which the comment below claimed and the code did not:
+    // every invocation was retained forever in a long-running process.
+    if (this.invocations.length > MAX_AUDIT_RECORDS) {
+      this.invocations.splice(0, this.invocations.length - MAX_AUDIT_RECORDS);
+    }
     return record;
   }
 
-  /** Audit log of invocations (bounded, newest last). */
+  /** Audit log of recent invocations (bounded, newest last). */
   audit(): McpInvocationRecord[] {
     return this.invocations.slice();
   }

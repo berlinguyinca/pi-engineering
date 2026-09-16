@@ -101,6 +101,8 @@ export interface PlannotatorOptions {
   operator?: string | null;
   store?: PendingPlanStore;
   audit?: BypassAudit;
+  /** How long the external gate may hold a plan before silence becomes a rejection. */
+  decisionTimeoutMs?: number;
 }
 
 export class PlannotatorAdapter {
@@ -109,6 +111,7 @@ export class PlannotatorAdapter {
   private readonly operator: string | null;
   private readonly store: PendingPlanStore;
   private readonly audit: BypassAudit;
+  private readonly decisionTimeoutMs: number;
 
   constructor(opts: PlannotatorOptions = {}) {
     this.transport = opts.transport ?? null;
@@ -116,6 +119,7 @@ export class PlannotatorAdapter {
     this.operator = opts.operator ?? null;
     this.store = opts.store ?? new MemoryPendingStore();
     this.audit = opts.audit ?? new MemoryBypassAudit();
+    this.decisionTimeoutMs = opts.decisionTimeoutMs ?? DEFAULT_DECISION_TIMEOUT_MS;
   }
 
   /** Pending plan decisions (survives restart when backed by a durable store). */
@@ -184,15 +188,36 @@ export class PlannotatorAdapter {
     if (!this.transport) {
       throw new Error(`Plannotator ${mode} mode requires a transport to the external Plannotator; none configured.`);
     }
-    const result = await this.transport.submitPlan(plan);
+    // Bounded, because an external gate that hangs otherwise parks the run
+    // forever — and validated, because whatever it returns is written straight
+    // into a persisted approval record that the control plane then serves. An
+    // arbitrary `decision` string used to pass, and `annotations` was stored
+    // without checking it was an array of bounded strings.
+    let result: Awaited<ReturnType<PlannotatorTransport["submitPlan"]>>;
+    try {
+      result = await withDeadline(this.transport.submitPlan(plan), this.decisionTimeoutMs);
+    } catch (err) {
+      // A gate that did not answer is NOT an approval. Recording the absence
+      // of a decision is the safe reading of silence.
+      return this.record({
+        runId: plan.runId,
+        decision: "rejected",
+        mode,
+        externalDecisionId: null,
+        approvedBy: null,
+        reason: err instanceof Error ? err.message : "plan gate did not answer",
+        annotations: [],
+        decidedAt,
+      });
+    }
     return this.record({
       runId: plan.runId,
-      decision: result.decision,
+      decision: validDecision(result.decision),
       mode,
-      externalDecisionId: result.externalDecisionId,
-      approvedBy: result.approvedBy ?? this.operator,
+      externalDecisionId: boundedString(result.externalDecisionId, MAX_DECISION_ID),
+      approvedBy: boundedString(result.approvedBy, MAX_FIELD) ?? this.operator,
       reason: null,
-      annotations: result.annotations ?? [],
+      annotations: boundedAnnotations(result.annotations),
       decidedAt,
     });
   }
@@ -202,6 +227,47 @@ export class PlannotatorAdapter {
     this.store.add(decision);
     return { ...decision };
   }
+}
+
+/** Longest an external gate may hold a plan before its silence is a rejection. */
+export const DEFAULT_DECISION_TIMEOUT_MS = 5 * 60_000;
+const MAX_DECISION_ID = 256;
+const MAX_FIELD = 256;
+const MAX_ANNOTATIONS = 100;
+const MAX_ANNOTATION_LENGTH = 4_096;
+
+/** Reject if `promise` has not settled within `ms`. */
+function withDeadline<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`plan gate did not answer within ${ms}ms`)), ms);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (err) => {
+        clearTimeout(timer);
+        reject(err);
+      },
+    );
+  });
+}
+
+/** Only the three decisions this model defines; anything else is a rejection. */
+function validDecision(value: unknown): PlanDecision["decision"] {
+  return value === "approved" || value === "rejected" || value === "annotated" ? value : "rejected";
+}
+
+function boundedString(value: unknown, max: number): string | null {
+  return typeof value === "string" && value.length > 0 ? value.slice(0, max) : null;
+}
+
+function boundedAnnotations(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter((entry): entry is string => typeof entry === "string")
+    .slice(0, MAX_ANNOTATIONS)
+    .map((entry) => entry.slice(0, MAX_ANNOTATION_LENGTH));
 }
 
 /** A no-op id generator re-export to keep plan refs stable within the module. */

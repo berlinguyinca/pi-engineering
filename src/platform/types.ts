@@ -141,6 +141,7 @@ export type PlatformEventType =
   | "platform.project.created"
   | "platform.project.updated"
   | "platform.repository.registered"
+  | "platform.worktree.added"
   | "platform.run.created"
   | "platform.run.started"
   | "platform.run.status"
