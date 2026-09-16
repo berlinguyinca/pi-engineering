@@ -100,3 +100,15 @@ test("ambient: zero spend adds no token fragment", () => {
   );
   assert.doesNotMatch(line ?? "", /tok/);
 });
+
+test("ambient: a mismatched repository yields no row rather than a wrong one", () => {
+  // The panels map is process-wide. A resolver that returned whatever state was
+  // built most recently would let a footer in one repository summarise another,
+  // and a summary attributed to the wrong tree is worse than no summary.
+  const state = stateWith({ run: RUN });
+  const resolve = (sessionKey: string, ambientKey: string) =>
+    ambientKey === sessionKey ? renderAmbient(state.snapshot) : undefined;
+
+  assert.ok(resolve("/repo/a", "/repo/a"), "same repository renders");
+  assert.equal(resolve("/repo/a", "/repo/b"), undefined, "a different repository renders nothing");
+});

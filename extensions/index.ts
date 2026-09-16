@@ -81,13 +81,19 @@ interface PanelPlumbing {
 const panels = new Map<string, PanelPlumbing>();
 
 /**
- * The panel state the footer's ambient row reads.
+ * The panel state the footer's ambient row reads, with the repository it
+ * belongs to.
  *
  * Tracked separately from `panels` because the footer is built at session start
- * and has no repository key yet — the key comes from an async lookup that
+ * and has no repository key yet — the key arrives from an async lookup that
  * finishes later.
+ *
+ * The key is carried alongside because `panels` is process-wide: without it a
+ * footer opened in one repository would keep summarising whichever repository
+ * most recently built plumbing, and a summary attributed to the wrong tree is
+ * worse than none.
  */
-let ambientPanelState: PanelState | undefined;
+let ambientPanel: { key: string; state: PanelState } | undefined;
 let activePanel: PanelController | null = null;
 /** Layout is an operator preference, so one store for the whole process. */
 const panelLayoutStore = new PanelLayoutStore();
@@ -112,6 +118,9 @@ function startPanelRefresh(plumbing: PanelPlumbing): void {
       plumbing.workspace.invalidate();
       void plumbing.workspace.refresh();
       plumbing.ledger.refresh();
+      // Memory counters went stale for as long as the panel stayed open, which
+      // is now the whole session.
+      plumbing.memory.refresh();
     },
   });
   panelRefresh.start();
@@ -133,7 +142,7 @@ const panelUnsubscribes: Array<() => void> = [];
 function panelFor(key: string, rt: EngineeringRuntime): PanelPlumbing {
   const existing = panels.get(key);
   if (existing) {
-    ambientPanelState = existing.state;
+    ambientPanel = { key, state: existing.state };
     return existing;
   }
   const state = new PanelState();
@@ -144,7 +153,7 @@ function panelFor(key: string, rt: EngineeringRuntime): PanelPlumbing {
     memory: new MemoryFeeder({ state, blackhole: rt.blackhole }),
   };
   panels.set(key, created);
-  ambientPanelState = state;
+  ambientPanel = { key, state };
   return created;
 }
 
@@ -230,9 +239,26 @@ function roadmapCompleteFor(repoRoot: string): () => Promise<boolean> {
   };
 }
 
+/**
+ * Resolved repository keys by cwd.
+ *
+ * Kept so the footer can ask "which repository is this session?" on the RENDER
+ * path, where running git is forbidden. A cwd that has not been resolved yet
+ * simply has no answer, and the ambient row stays absent until it does —
+ * strictly better than answering with another session's repository.
+ */
+const repoKeyCache = new Map<string, string>();
+
+/** The resolved key for a cwd, if one has been resolved. Never does IO. */
+function cachedRepoKey(cwd: string): string | undefined {
+  return repoKeyCache.get(cwd);
+}
+
 async function repoCacheKey(cwd: string): Promise<string> {
   const repo = await GitRepo.open(cwd).catch(() => null);
-  return repo ? repo.root : cwd;
+  const key = repo ? repo.root : cwd;
+  repoKeyCache.set(cwd, key);
+  return key;
 }
 
 /**
@@ -836,14 +862,21 @@ ${RECOVERY_PROMPT}`;
     pi.on("session_start", (_event, ctx) => {
       for (const un of sessionUnsubscribes.splice(0)) un();
       activeFooter?.dispose();
-      // The ambient row needs the engineering state the panel feeds from. It is
-      // rendered in the FOOTER rather than the panel because `ui.custom()`
-      // takes keyboard focus and `setFooter` does not — a permanently visible
-      // panel is a session that accepts no typing.
+      // The ambient row summarises the same engineering state the panel shows,
+      // in a surface that is always readable without stepping into the panel.
+      //
+      // Scoped to THIS session's repository: `panels` is process-wide, so a
+      // resolver that just returned the latest state would let a footer here
+      // summarise a repository someone else's session had opened. A summary
+      // attributed to the wrong tree is worse than no summary.
+      const sessionCwd = ctx.cwd;
       const footer = new FooterController({
         ctx,
         config: statusBarConfig,
-        panelState: () => ambientPanelState,
+        panelState: () => {
+          if (!ambientPanel) return undefined;
+          return ambientPanel.key === cachedRepoKey(sessionCwd) ? ambientPanel.state : undefined;
+        },
       });
       activeFooter = footer;
       // The footer is a second consumer of admission events (telemetry owns the

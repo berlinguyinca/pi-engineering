@@ -211,7 +211,12 @@ export class FooterController {
   setWait(wait: WaitState | undefined): void {
     if (this.disposed) return;
     this.status.set({ wait });
-    if (wait?.untilMs != null) this.startWaitTick();
+    // Any wait ticks, not just one with a deadline. The spinner is derived from
+    // the clock, so without a tick it freezes — and an indefinite wait is
+    // exactly the case where a frozen spinner is worst: the operator is
+    // watching a saturated gateway, and a motionless spinner reads as a hung
+    // session rather than a queue being waited out.
+    if (wait) this.startWaitTick();
     else this.stopWaitTick();
     this.requestRender();
   }
