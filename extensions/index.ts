@@ -1,6 +1,10 @@
+import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { resolve } from "node:path";
+import { promisify } from "node:util";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
+
+const execFileAsync = promisify(execFile);
 import type { Model } from "@earendil-works/pi-ai/compat";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { resolveMemoryEnvironment } from "../src/blackhole/connectionSetup.ts";
@@ -28,8 +32,8 @@ import { PanelState } from "../src/panel/PanelState.ts";
 import { readDiffContent, readFileContent } from "../src/panel/content.ts";
 import { LedgerFeeder } from "../src/panel/feeders/LedgerFeeder.ts";
 import { MemoryFeeder } from "../src/panel/feeders/MemoryFeeder.ts";
-import { WorkspaceFeeder } from "../src/panel/feeders/WorkspaceFeeder.ts";
-import { type PanelLayout, PanelLayoutStore } from "../src/panel/layout.ts";
+import { DEFAULT_WORKSPACE_TTL_MS, WorkspaceFeeder } from "../src/panel/feeders/WorkspaceFeeder.ts";
+import { type PanelLayout, type PanelLayoutPatch, PanelLayoutStore } from "../src/panel/layout.ts";
 import { Narrator } from "../src/panel/narrator/Narrator.ts";
 import { createSummarize } from "../src/panel/narrator/summarize.ts";
 import { RoadmapEngine } from "../src/roadmap/RoadmapEngine.ts";
@@ -38,6 +42,8 @@ import { resolveStatusBarConfig } from "../src/status/config.ts";
 import { FooterController } from "../src/status/footer.ts";
 import { renderStatus } from "../src/status/layout.ts";
 import { type CoreServices, buildCoreTools } from "../src/tools/coreTools.ts";
+import { checkForUpdate, shouldCheck } from "../src/update/selfUpdate.ts";
+import { describeUpdate } from "../src/update/versionCheck.ts";
 import { CommandVerifier } from "../src/verify/Verifier.ts";
 import { PiWorkerExecutor } from "../src/workers/PiWorkerExecutor.ts";
 
@@ -75,6 +81,33 @@ const panels = new Map<string, PanelPlumbing>();
 let activePanel: PanelController | null = null;
 /** Layout is an operator preference, so one store for the whole process. */
 const panelLayoutStore = new PanelLayoutStore();
+
+/**
+ * Periodic refresh while the panel is visible.
+ *
+ * Paced at the workspace feeder's own TTL: faster would re-run git only to get
+ * the cached answer back, slower would leave the TTL unreachable — which is the
+ * state a review found, where the view was refreshed once at open and then
+ * never again.
+ */
+let panelRefreshTimer: ReturnType<typeof setInterval> | null = null;
+
+function startPanelRefresh(plumbing: PanelPlumbing): void {
+  if (panelRefreshTimer) return;
+  panelRefreshTimer = setInterval(() => {
+    plumbing.workspace.invalidate();
+    void plumbing.workspace.refresh();
+    plumbing.ledger.refresh();
+  }, DEFAULT_WORKSPACE_TTL_MS);
+  // A UI refresh must never be the reason a process stays alive.
+  panelRefreshTimer.unref?.();
+}
+
+function stopPanelRefresh(): void {
+  if (!panelRefreshTimer) return;
+  clearInterval(panelRefreshTimer);
+  panelRefreshTimer = null;
+}
 /**
  * Panel input subscriptions, kept separate from `sessionUnsubscribes` on
  * purpose: the footer's `session_start` drains its own array, and a shared
@@ -332,6 +365,83 @@ ${RECOVERY_PROMPT}`;
   // model caller in this process — the worker sessions AND this interactive
   // turn — behind one shared cooldown until the reported wait has elapsed.
   const gatewayConfig = sharedGatewayConfig();
+
+  // ─── Staying current ────────────────────────────────────────────────────
+  // An operator hit the exact failure this package had just fixed, and the
+  // giveaway was a notice in their session that the fix had DELETED — their Pi
+  // was loading a checkout from before the merge, and nothing said so. A fix
+  // that is installed but not loaded is worse than an unfixed bug: the evidence
+  // the operator reports comes from code that no longer exists.
+  //
+  // Auto-apply is on by default (PI_SELF_UPDATE=0 disables; PI_SELF_UPDATE=check
+  // reports without applying), but only ever as a strict fast-forward on a clean
+  // tracking branch — see src/update/versionCheck.ts for what it refuses.
+  const selfUpdateMode = (process.env.PI_SELF_UPDATE ?? "auto").toLowerCase();
+  const selfUpdateEnabled = selfUpdateMode !== "0" && selfUpdateMode !== "false" && selfUpdateMode !== "off";
+  const extensionRoot = resolve(new URL("..", import.meta.url).pathname);
+  let lastUpdateCheckAt: number | undefined;
+
+  const runGit = async (args: string[]) => {
+    const r = await execFileAsync("git", ["-C", extensionRoot, ...args], { timeout: 30_000 }).catch(
+      (err: { code?: number; stdout?: string; stderr?: string; message?: string }) => ({
+        code: typeof err.code === "number" ? err.code : 1,
+        stdout: err.stdout ?? "",
+        stderr: err.stderr ?? err.message ?? "",
+      }),
+    );
+    return { code: (r as { code?: number }).code ?? 0, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
+  };
+
+  const runSelfUpdate = async (apply: boolean) => {
+    lastUpdateCheckAt = Date.now();
+    return checkForUpdate({ cwd: extensionRoot, git: runGit, apply });
+  };
+
+  // Registered on its own, NOT inside the gateway-admission block: staying
+  // current has nothing to do with backpressure, and nesting it there meant
+  // PI_GATEWAY_ADMISSION_ENABLED=0 silently switched off update checking too.
+  // Found by a fresh-context review.
+  if (typeof pi.on === "function") {
+    pi.on("session_start", (_event, ctx) => {
+      if (!selfUpdateEnabled || !shouldCheck(lastUpdateCheckAt, Date.now())) return;
+      // Deliberately not awaited: a session must never wait on a network call
+      // to start, and a failed check is silence rather than a notice.
+      void runSelfUpdate(selfUpdateMode !== "check")
+        .then((result) => {
+          if (result.unavailable) return;
+          // Only speak when there is something to act on. "You are up to date"
+          // every few hours is noise that trains the operator to ignore the one
+          // notice that matters.
+          if (result.decision.action === "current" || result.decision.action === "skip") return;
+          ctx.ui.notify(describeUpdate(result.decision, { applied: result.applied }), "info");
+        })
+        .catch(() => {});
+    });
+  }
+
+  pi.registerCommand("update", {
+    description: "Check for and apply extension updates (fast-forward only, never over uncommitted work).",
+    handler: async (args: string, ctx: ExtensionCommandContext) => {
+      // Tokenised, not a substring test: `includes("--check")` would fire on
+      // any argument that merely contains the text.
+      const argv = (args ?? "").trim().split(/\s+/).filter(Boolean);
+      const check = argv.includes("--check");
+      const result = await runSelfUpdate(!check);
+      if (result.unavailable) {
+        ctx.ui.notify(`Update check unavailable: ${result.unavailable}`, "info");
+        return;
+      }
+      const lines = [describeUpdate(result.decision, { applied: result.applied })];
+      if (result.observation?.upstream) {
+        const dirtyNote = result.observation.dirty ? " · uncommitted changes present" : "";
+        lines.push(
+          `branch ${result.observation.branch} tracking ${result.observation.upstream} · ${result.observation.ahead} ahead, ${result.observation.behind} behind${dirtyNote}`,
+        );
+      }
+      if (result.head) lines.push(`now at ${result.head.slice(0, 12)}`);
+      ctx.ui.notify(lines.join("\n"), result.decision.action === "report" ? "warning" : "info");
+    },
+  });
 
   // Gateway-reported per-model readiness (`slots`, `x_state`). Built lazily and
   // cached per provider: this is consulted on every hold, and holds arrive in
@@ -845,12 +955,23 @@ ${RECOVERY_PROMPT}`;
       ui: ctx.ui as never,
       chord: panelChord,
       layout: panelLayoutStore.load(),
-      onLayoutChange: (layout: PanelLayout) => panelLayoutStore.save(layout),
+      // The patch carries width/tab/expansion; open/closed is the controller's,
+      // and is persisted separately when the panel is opened or closed.
+      onLayoutChange: (patch: PanelLayoutPatch) =>
+        panelLayoutStore.save({ ...patch, open: panelLayoutStore.load().open }),
+      onVisibilityChange: (open: boolean) => panelLayoutStore.save({ ...panelLayoutStore.load(), open }),
       onOpen: () => {
         plumbing.workspace.invalidate();
         void plumbing.workspace.refresh();
         plumbing.ledger.refresh();
         plumbing.memory.refresh();
+        // Keep refreshing while it is on screen. `onOpen` alone was enough when
+        // the panel was a toggle you opened to look at something; now that it
+        // stays open for the whole session, a view refreshed once at start-up
+        // is a working tree from hours ago presented as current — worse than no
+        // panel, because it looks authoritative. Found by a fresh-context
+        // review, and made materially worse by the auto-open change.
+        startPanelRefresh(plumbing);
         // The narrator costs money, so it does not start until the panel has
         // been opened at least once: a session that never opens /panel must
         // not pay for summaries nobody reads.
@@ -876,6 +997,23 @@ ${RECOVERY_PROMPT}`;
       // Not fatal: `/panel` retries the lookup and builds the controller then.
       if (!rt) return;
       activePanel = createPanelController(ctx as { ui: PanelSessionUi }, panelFor(key, rt), rt);
+
+      // Show it unless the operator turned it off. A panel that must be
+      // discovered is a panel nobody uses, and ambient awareness of the run is
+      // the point of it — but a remembered close is honoured, and
+      // PI_PANEL_AUTO_OPEN=0 disables the behaviour outright.
+      //
+      // `restore()` rather than `toggle()`: restoring a remembered choice is
+      // not the operator making a new one, and recording it as one would write
+      // the preference back every session whether they touched it or not.
+      const autoOpen = (process.env.PI_PANEL_AUTO_OPEN ?? "1").toLowerCase();
+      const autoOpenEnabled = autoOpen !== "0" && autoOpen !== "false" && autoOpen !== "off";
+      if (autoOpenEnabled && panelLayoutStore.load().open) {
+        const ui = ctx.ui as PanelSessionUi;
+        // An overlay needs somewhere to draw. A session without interactive UI
+        // gets nothing rather than an error it cannot act on.
+        if (typeof ui.custom === "function") activePanel.restore();
+      }
     });
 
     pi.on("session_shutdown", () => {

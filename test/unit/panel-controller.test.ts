@@ -119,3 +119,97 @@ test("controller: opening is announced so a feeder can refresh", () => {
   assert.equal(opens, 1, "closing must not announce an open");
   controller.dispose();
 });
+
+test("panel: restore shows the panel without recording a new preference", () => {
+  // Restoring a remembered "open" is honouring a choice already made. Recording
+  // it as a fresh one would rewrite the preference every session whether the
+  // operator touched the panel or not.
+  const seen: boolean[] = [];
+  const c = new PanelController({
+    state: new PanelState(),
+    ui: fakeUi() as never,
+    onVisibilityChange: (open) => seen.push(open),
+  });
+
+  c.restore();
+  assert.deepEqual(seen, [], "a restore is not a decision");
+  c.dispose();
+});
+
+test("panel: a toggle records the operator's decision in both directions", () => {
+  const seen: boolean[] = [];
+  const c = new PanelController({
+    state: new PanelState(),
+    ui: fakeUi() as never,
+    onVisibilityChange: (open) => seen.push(open),
+  });
+
+  c.toggle();
+  c.toggle();
+  assert.deepEqual(seen, [true, false], "closing is as much a preference as opening");
+  c.dispose();
+});
+
+test("panel: restoring an already-open panel is a no-op", () => {
+  const seen: boolean[] = [];
+  const c = new PanelController({
+    state: new PanelState(),
+    ui: fakeUi() as never,
+    onVisibilityChange: (open) => seen.push(open),
+  });
+
+  c.toggle();
+  c.restore();
+  assert.deepEqual(seen, [true], "no second open, no second record");
+  c.dispose();
+});
+
+test("panel: disposing is not the operator asking for it to stay shut", () => {
+  // A session ending must not be recorded as a decision to close, or every
+  // shutdown would silently turn the panel off for the next session.
+  const seen: boolean[] = [];
+  const c = new PanelController({
+    state: new PanelState(),
+    ui: fakeUi() as never,
+    onVisibilityChange: (open) => seen.push(open),
+  });
+
+  c.toggle();
+  c.dispose();
+  assert.deepEqual(seen, [true], "shutdown recorded nothing");
+});
+
+test("panel: hiding is reported on every path, including shutdown", () => {
+  // `onHidden` releases work that only makes sense while the panel is visible,
+  // so it must fire even on the paths that record no preference — otherwise a
+  // refresh timer outlives the panel it was refreshing.
+  const hidden: number[] = [];
+  const c = new PanelController({
+    state: new PanelState(),
+    ui: fakeUi() as never,
+    onHidden: () => hidden.push(1),
+  });
+
+  c.toggle();
+  c.toggle();
+  assert.equal(hidden.length, 1, "a toggle-close hides");
+
+  c.toggle();
+  c.dispose();
+  assert.equal(hidden.length, 2, "shutdown hides too, even though it records no preference");
+});
+
+test("panel: closing an already-closed panel hides nothing twice", () => {
+  // close() is idempotent and reached from several paths; firing onHidden each
+  // time would stop work that was never started.
+  const hidden: number[] = [];
+  const c = new PanelController({
+    state: new PanelState(),
+    ui: fakeUi() as never,
+    onHidden: () => hidden.push(1),
+  });
+
+  c.dispose();
+  c.dispose();
+  assert.equal(hidden.length, 0, "it was never on screen");
+});
