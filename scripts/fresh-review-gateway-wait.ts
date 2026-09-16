@@ -104,6 +104,31 @@ const AREAS: Record<string, { files: string; requirements: string; inspect: stri
       "unverifiable claims in comments",
     ].join(", "),
   },
+  platform: {
+    files:
+      "src/platform/ in full (ControlPlane, WorkGraph, ProjectRegistry, Plannotator, McpRegistry, RemoteWorker, memoryOutbox, security, review, types, and eventstore/{jsonl,adapters,backend}), plus scripts/control-server.ts and scripts/platform-e2e.ts. Tests: test/unit/platform-*.test.ts and test/integration/platform-*.test.ts.",
+    requirements: [
+      "An event store is the system's memory. A write that is lost, reordered, or partially applied is data loss, and a restart must see exactly what was committed before it.",
+      "The control plane is reachable over a network. Every input from it is untrusted: nothing may be interpolated into a shell, a path, or a query without validation.",
+      "Secrets must never reach a store, a log, an event body, or a network response. Redaction happens before anything is persisted or enqueued, not on the way out.",
+      "A queue that drops work on failure is worse than one that never accepted it. Failed items stay queued and are retried, and the queue survives a restart.",
+      "A worker that is remote can be slow, absent, or hostile. Nothing may block forever on one, and nothing may trust its response shape without checking it.",
+      "Concurrency is real here: parallel runs, a shared store, and a registry mutated while it is read. Anything that assumes a single caller is a bug waiting for load.",
+    ].join("\n"),
+    inspect: [
+      "lost, reordered or torn writes in the event store, and any non-atomic append",
+      "state that diverges between the store and the in-memory model after a restart",
+      "command, path or query injection from control-plane input",
+      "secrets or credentials reaching an event body, a log line, a response or the outbox",
+      "work silently dropped on failure rather than retried",
+      "unbounded waits, unbounded memory, or unbounded queues",
+      "response shapes from a remote worker trusted without validation",
+      "race conditions under parallel runs against one store or registry",
+      "error handling that destroys state on failure",
+      "test gaps, especially behaviour no test would catch",
+      "unverifiable claims in comments",
+    ].join(", "),
+  },
   telemetry: {
     files:
       "src/telemetry/sink.ts, src/telemetry/throttle.ts, src/gateway/admissionNotice.ts, and every call site that emits through them: src/gateway/config.ts, src/workers/PiWorkerExecutor.ts, src/workers/localProviders.ts, src/blackhole/durable.ts, src/runtime/EngineeringRuntime.ts, and the sink installation in extensions/index.ts. Tests: test/unit/telemetry-sink.test.ts, test/unit/telemetry-throttle.test.ts.",
