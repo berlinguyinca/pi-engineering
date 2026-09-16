@@ -89,29 +89,32 @@
   milestone: __global__
   type: dogfood
   status: pass
-  commit: cf41813b1969455fa58e4cbb6d3f46ae385dade6
-  generatedAt: 2026-09-15T22:36:49.423Z
+  commit: 7a2d37b92e18cb94ed909893a99ab8d423daecc8
+  generatedAt: 2026-09-16T03:41:21.026Z
   paths: &a1
     - src/
     - extensions/
     - test/
-  proof: scripts/dogfood-gateway-wait.ts + scripts/dogfood-narrator.ts +
-    scripts/dogfood-roadmap.ts; docs/evidence/gateway-wait/verification.md
-  summary: Gateway saturation, /gateway, context-safe fallback and
-    /refresh-models; five fresh-context reviews, zero critical and zero high
-    findings, all mediums fixed; dogfooded against the operator's live gateway.
+  proof: scripts/dogfood-gateway-wait.ts + dogfood-self-update.ts +
+    dogfood-narrator.ts + dogfood-roadmap.ts;
+    docs/evidence/gateway-wait/verification.md
+  summary: Gateway saturation, /gateway, context-safe fallback, /refresh-models,
+    self-update and an always-on panel; nine fresh-context reviews, zero
+    critical and zero high, all findings fixed; dogfooded against the operator's
+    live gateway and real git checkouts.
 - id: review-gateway-wait
   milestone: __global__
   type: fresh_review
   status: pass
-  commit: cf41813b1969455fa58e4cbb6d3f46ae385dade6
-  generatedAt: 2026-09-15T22:36:49.423Z
+  commit: 7a2d37b92e18cb94ed909893a99ab8d423daecc8
+  generatedAt: 2026-09-16T03:41:21.026Z
   paths: *a1
-  proof: scripts/fresh-review-gateway-wait.ts gateway (x3) + models;
-    docs/evidence/gateway-wait/verification.md
-  summary: Gateway saturation, /gateway, context-safe fallback and
-    /refresh-models; five fresh-context reviews, zero critical and zero high
-    findings, all mediums fixed; dogfooded against the operator's live gateway.
+  proof: scripts/fresh-review-gateway-wait.ts gateway (x3), models, update (x2),
+    surface; docs/evidence/gateway-wait/verification.md
+  summary: Gateway saturation, /gateway, context-safe fallback, /refresh-models,
+    self-update and an always-on panel; nine fresh-context reviews, zero
+    critical and zero high, all findings fixed; dogfooded against the operator's
+    live gateway and real git checkouts.
   findings:
     critical: 0
     high: 0
