@@ -1,0 +1,8 @@
+# Prometheus scrape config for the pi-engineering control plane (spec 13).
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: "pi-engineering-control-api"
+    static_configs:
+      - targets: ["control-api:8080"]
