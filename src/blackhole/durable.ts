@@ -96,8 +96,25 @@ function warnOpenViking(
         : `returned ${outcome}`;
   emitTelemetry({
     level: "warning",
-    text: `OpenViking ${baseUrl} ${what} on ${op} (fail-closed to empty). ${hint}`,
+    // The ORIGIN, not the configured URL: a base URL may carry userinfo
+    // (https://user:token@host), and this line is now shown to the operator
+    // rather than buried in stderr — a surface is exactly where a credential
+    // must not be repeated back. The origin is what identifies the endpoint
+    // anyway, and it fits a panelled terminal.
+    text: `OpenViking ${safeOrigin(baseUrl)} ${what} on ${op} (fail-closed to empty). ${hint}`,
   });
+}
+
+/** An endpoint's origin, with any credentials dropped. Never throws. */
+function safeOrigin(baseUrl: string): string {
+  try {
+    const url = new URL(baseUrl);
+    return `${url.protocol}//${url.host}`;
+  } catch {
+    // Not parseable as a URL, so it cannot be split into parts safely: report
+    // that it was configured rather than echoing something unexamined.
+    return "(configured endpoint)";
+  }
 }
 
 export interface OpenVikingEndpointPaths {

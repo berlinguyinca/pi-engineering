@@ -83,3 +83,20 @@ test("throttle: a long session does not accumulate keys without limit", () => {
   // can be un-suppressed by it.
   assert.equal(allow({ level: "info", text: "recent", key: "k499" }), false);
 });
+
+test("throttle: the key map is a hard cap, not an aspiration", () => {
+  // It was not, and the comment said it was: the sweep dropped only EXPIRED
+  // entries, so more than MAX_TRACKED distinct conditions inside one window
+  // grew the map without limit. A review demonstrated 100 keys surviving a
+  // 64-entry "cap". Evicting a live entry can only cost a duplicate notice; it
+  // can never silence something, which is why the cap is allowed to bite.
+  const allow = createRepeatThrottle({ now: () => 0, repeatMs: 60_000 });
+  for (let i = 0; i < 500; i++) {
+    assert.equal(allow({ level: "info", text: `event ${i}`, key: `k${i}` }), true);
+  }
+  // The most recent conditions must still be suppressed: eviction takes the
+  // oldest, so the ones that just fired are exactly the ones still held.
+  assert.equal(allow({ level: "info", text: "event 499", key: "k499" }), false);
+  // And an evicted one is merely re-allowed, never lost.
+  assert.equal(allow({ level: "info", text: "event 0", key: "k0" }), true);
+});

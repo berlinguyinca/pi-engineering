@@ -1133,6 +1133,14 @@ ${RECOVERY_PROMPT}`;
     pi.on("session_start", async (_event, ctx) => {
       // First, before anything can report: until a sink is installed every
       // diagnostic goes to raw stderr, which is what tears the frame.
+      //
+      // The previous session's sink is removed rather than left stacked
+      // beneath this one. A review flagged that as a hazard for overlapping
+      // sessions, and it would be — but this extension already treats sessions
+      // as serial: the line below disposes `activePanel`, and the panel's
+      // refresh timer is stopped the same way. One live session per process is
+      // the assumption throughout, and a sink left behind by a session that
+      // will never shut down is a slow leak pointed at a dead UI.
       telemetryUninstall?.();
       telemetryUninstall = installTelemetrySink(ctx.ui as { notify(text: string, level: string): void });
       for (const un of panelUnsubscribes.splice(0)) un();

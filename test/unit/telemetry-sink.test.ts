@@ -12,7 +12,13 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { describeAdmissionEvent, formatDuration } from "../../src/gateway/admissionNotice.ts";
-import { type TelemetryNotice, emitTelemetry, setTelemetrySink, stderrForced } from "../../src/telemetry/sink.ts";
+import {
+  type TelemetryNotice,
+  currentTelemetrySink,
+  emitTelemetry,
+  setTelemetrySink,
+  stderrForced,
+} from "../../src/telemetry/sink.ts";
 
 const SIGNAL = {
   retryAfterMs: 30_000,
@@ -90,11 +96,51 @@ test("sink: uninstalling out of order does not clear a newer sink", () => {
   const second: string[] = [];
   const restoreFirst = setTelemetrySink((n) => first.push(n.text));
   const restoreSecond = setTelemetrySink((n) => second.push(n.text));
-  restoreFirst(); // the older session tears down last
+  restoreFirst(); // the older session tears down first
   emitTelemetry({ level: "info", text: "still live" }, {});
   restoreSecond();
   assert.deepEqual(second, ["still live"]);
   assert.deepEqual(first, []);
+});
+
+test("sink: an uninstalled sink cannot be restored by someone else's teardown", () => {
+  // This is the assertion the test above was missing, and a fresh-context
+  // review caught the gap: it exercised the exact failing sequence and then
+  // checked only which sink received the notice, so it passed while the bug
+  // was live. Install A, install B, uninstall A, uninstall B — and the old
+  // single-slot implementation left the process pointed at A, a sink belonging
+  // to a session that had already gone.
+  const a = () => {};
+  const b = () => {};
+  const restoreA = setTelemetrySink(a);
+  const restoreB = setTelemetrySink(b);
+  restoreA();
+  assert.equal(currentTelemetrySink(), b, "the newer surface is still in force");
+  restoreB();
+  assert.equal(currentTelemetrySink(), undefined, "a removed sink must stay removed");
+});
+
+test("sink: uninstalling twice is a no-op, not a removal of someone else's sink", () => {
+  const a = () => {};
+  const b = () => {};
+  const restoreA = setTelemetrySink(a);
+  restoreA();
+  restoreA();
+  const restoreB = setTelemetrySink(b);
+  restoreA();
+  assert.equal(currentTelemetrySink(), b, "a stale uninstaller may not reach into a later registration");
+  restoreB();
+});
+
+test("sink: the newest surface wins while it is installed", () => {
+  const seen: string[] = [];
+  const restoreA = setTelemetrySink(() => seen.push("a"));
+  const restoreB = setTelemetrySink(() => seen.push("b"));
+  emitTelemetry({ level: "info", text: "x" }, {});
+  restoreB();
+  emitTelemetry({ level: "info", text: "x" }, {});
+  restoreA();
+  assert.deepEqual(seen, ["b", "a"], "removing the top hands control back to the one beneath it");
 });
 
 test("sink: PI_TELEMETRY_STDERR restores the raw line alongside the notice", () => {
@@ -152,4 +198,26 @@ test("notice: durations read the way a person would say them", () => {
   assert.equal(formatDuration(59_400), "59s");
   assert.equal(formatDuration(125_000), "2m 05s");
   assert.equal(formatDuration(-1), "0s", "a negative wait is a bug upstream, not a crash here");
+});
+
+test("notice: an endpoint is reported by origin, never with its credentials", async () => {
+  // A base URL may carry userinfo, and this warning is now SHOWN to the
+  // operator rather than buried in stderr — a surface is exactly where a token
+  // must not be repeated back.
+  const { OpenVikingProvider } = await import("../../src/blackhole/durable.ts");
+  const seen: string[] = [];
+  const restore = setTelemetrySink((n) => seen.push(n.text));
+  try {
+    const provider = new OpenVikingProvider({
+      baseUrl: "https://user:s3cr3t-token@ov.example:8443/api",
+      fetch: (async () => ({ ok: false, status: 401, json: async () => [] })) as never,
+    });
+    assert.deepEqual(await provider.recallAll(), []);
+  } finally {
+    restore();
+  }
+  assert.equal(seen.length, 1);
+  assert.ok(!seen[0]?.includes("s3cr3t-token"), "the credential must not reach the surface");
+  assert.ok(!seen[0]?.includes("user:"), "nor the userinfo around it");
+  assert.match(seen[0] ?? "", /https:\/\/ov\.example:8443/, "the origin still identifies the endpoint");
 });

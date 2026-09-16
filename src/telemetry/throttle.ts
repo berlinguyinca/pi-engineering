@@ -42,12 +42,23 @@ export function createRepeatThrottle(opts: ThrottleOptions = {}): (notice: Telem
     const previous = shownAt.get(key);
     if (previous !== undefined && at - previous < repeatMs) return false;
     shownAt.set(key, at);
-    // Bounded: the set of conditions is small, but a long session must not
-    // accumulate keys without limit. Only expired entries are dropped, so a
-    // sweep can never un-suppress something still inside its window.
+    // A HARD cap, which it was not: sweeping only expired entries left the map
+    // free to grow without limit whenever more than MAX_TRACKED distinct
+    // conditions appeared inside one window, and the comment claiming
+    // otherwise was the kind of unverifiable assurance a review exists to
+    // catch. Expired entries go first — dropping those is free, since they no
+    // longer suppress anything. If that is not enough, the OLDEST live entries
+    // go too: evicting one can only un-suppress a repeat, never silence
+    // something, so the cap costs at worst a duplicate notice under a burst
+    // that is already noisier than the throttle can help with.
     if (shownAt.size > MAX_TRACKED) {
       for (const [seen, when] of shownAt) {
         if (at - when >= repeatMs) shownAt.delete(seen);
+      }
+      // Map iteration is insertion-ordered, so the front is the oldest.
+      for (const seen of shownAt.keys()) {
+        if (shownAt.size <= MAX_TRACKED) break;
+        shownAt.delete(seen);
       }
     }
     return true;

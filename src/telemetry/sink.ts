@@ -45,26 +45,47 @@ export interface TelemetryNotice {
 
 export type TelemetrySink = (notice: TelemetryNotice) => void;
 
-let installed: TelemetrySink | undefined;
+/**
+ * Installed surfaces, newest last. The one in force is the newest still live.
+ *
+ * A stack rather than a single slot plus a remembered predecessor, which is
+ * what this was and which a fresh-context review found broken: each
+ * uninstaller captured whatever had been installed before it and restored that
+ * value, with no way to know the predecessor had ALSO been uninstalled in the
+ * meantime. Install A, install B, uninstall A, uninstall B and the process is
+ * left pointed at A — a sink belonging to a session that has already gone,
+ * which is the exact failure the single-slot version was written to avoid.
+ *
+ * With a stack, removal is removal: an entry that is gone cannot be restored
+ * by anyone else's teardown, in any order.
+ */
+const stack: TelemetrySink[] = [];
 
 /**
  * Route notices to a surface. Returns an uninstaller.
  *
- * Last writer wins, and the uninstaller only clears the sink if it is still the
- * one it installed — two sessions tearing down out of order must not leave the
- * process with no sink while one of them is still running.
+ * The newest surface wins while it is installed, and teardown order does not
+ * matter: uninstalling is idempotent and removes only the caller's own entry.
  */
-export function setTelemetrySink(sink: TelemetrySink | undefined): () => void {
-  const previous = installed;
-  installed = sink;
+export function setTelemetrySink(sink: TelemetrySink): () => void {
+  stack.push(sink);
+  let removed = false;
   return () => {
-    if (installed === sink) installed = previous;
+    if (removed) return;
+    removed = true;
+    const at = stack.lastIndexOf(sink);
+    if (at >= 0) stack.splice(at, 1);
   };
 }
 
 /** The sink in force, for tests and for callers that want to check. */
 export function currentTelemetrySink(): TelemetrySink | undefined {
-  return installed;
+  return stack.length > 0 ? stack[stack.length - 1] : undefined;
+}
+
+/** Drop every installed surface. Tests only, for isolation between cases. */
+export function resetTelemetrySinks(): void {
+  stack.length = 0;
 }
 
 /**
@@ -85,7 +106,7 @@ export function stderrForced(env: NodeJS.ProcessEnv = process.env): boolean {
  * on, and a failed sink falls back to stderr rather than swallowing the line.
  */
 export function emitTelemetry(notice: TelemetryNotice, env: NodeJS.ProcessEnv = process.env): void {
-  const sink = installed;
+  const sink = currentTelemetrySink();
   if (!sink) {
     writeStderr(notice);
     return;
