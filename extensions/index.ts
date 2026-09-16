@@ -36,6 +36,7 @@ import { DEFAULT_WORKSPACE_TTL_MS, WorkspaceFeeder } from "../src/panel/feeders/
 import { type PanelLayout, type PanelLayoutPatch, PanelLayoutStore } from "../src/panel/layout.ts";
 import { Narrator } from "../src/panel/narrator/Narrator.ts";
 import { createSummarize } from "../src/panel/narrator/summarize.ts";
+import { PanelRefreshLoop } from "../src/panel/refreshLoop.ts";
 import { RoadmapEngine } from "../src/roadmap/RoadmapEngine.ts";
 import { EngineeringRuntime } from "../src/runtime/EngineeringRuntime.ts";
 import { resolveStatusBarConfig } from "../src/status/config.ts";
@@ -78,6 +79,15 @@ interface PanelPlumbing {
   memory: MemoryFeeder;
 }
 const panels = new Map<string, PanelPlumbing>();
+
+/**
+ * The panel state the footer's ambient row reads.
+ *
+ * Tracked separately from `panels` because the footer is built at session start
+ * and has no repository key yet — the key comes from an async lookup that
+ * finishes later.
+ */
+let ambientPanelState: PanelState | undefined;
 let activePanel: PanelController | null = null;
 /** Layout is an operator preference, so one store for the whole process. */
 const panelLayoutStore = new PanelLayoutStore();
@@ -86,27 +96,30 @@ const panelLayoutStore = new PanelLayoutStore();
  * Periodic refresh while the panel is visible.
  *
  * Paced at the workspace feeder's own TTL: faster would re-run git only to get
- * the cached answer back, slower would leave the TTL unreachable — which is the
- * state a review found, where the view was refreshed once at open and then
- * never again.
+ * the cached answer back, slower would leave the TTL unreachable. The loop
+ * itself lives in src/panel/refreshLoop.ts so its start/stop/restart behaviour
+ * is testable without counting the process's timers.
  */
-let panelRefreshTimer: ReturnType<typeof setInterval> | null = null;
+let panelRefresh: PanelRefreshLoop | null = null;
 
 function startPanelRefresh(plumbing: PanelPlumbing): void {
-  if (panelRefreshTimer) return;
-  panelRefreshTimer = setInterval(() => {
-    plumbing.workspace.invalidate();
-    void plumbing.workspace.refresh();
-    plumbing.ledger.refresh();
-  }, DEFAULT_WORKSPACE_TTL_MS);
-  // A UI refresh must never be the reason a process stays alive.
-  panelRefreshTimer.unref?.();
+  // A new loop each time, so a new session never inherits the previous
+  // session's repository.
+  panelRefresh?.stop();
+  panelRefresh = new PanelRefreshLoop({
+    intervalMs: DEFAULT_WORKSPACE_TTL_MS,
+    tick: () => {
+      plumbing.workspace.invalidate();
+      void plumbing.workspace.refresh();
+      plumbing.ledger.refresh();
+    },
+  });
+  panelRefresh.start();
 }
 
 function stopPanelRefresh(): void {
-  if (!panelRefreshTimer) return;
-  clearInterval(panelRefreshTimer);
-  panelRefreshTimer = null;
+  panelRefresh?.stop();
+  panelRefresh = null;
 }
 /**
  * Panel input subscriptions, kept separate from `sessionUnsubscribes` on
@@ -119,7 +132,10 @@ const panelUnsubscribes: Array<() => void> = [];
 /** Panel plumbing for a repo, created on first use. */
 function panelFor(key: string, rt: EngineeringRuntime): PanelPlumbing {
   const existing = panels.get(key);
-  if (existing) return existing;
+  if (existing) {
+    ambientPanelState = existing.state;
+    return existing;
+  }
   const state = new PanelState();
   const created: PanelPlumbing = {
     state,
@@ -128,6 +144,7 @@ function panelFor(key: string, rt: EngineeringRuntime): PanelPlumbing {
     memory: new MemoryFeeder({ state, blackhole: rt.blackhole }),
   };
   panels.set(key, created);
+  ambientPanelState = state;
   return created;
 }
 
@@ -819,7 +836,15 @@ ${RECOVERY_PROMPT}`;
     pi.on("session_start", (_event, ctx) => {
       for (const un of sessionUnsubscribes.splice(0)) un();
       activeFooter?.dispose();
-      const footer = new FooterController({ ctx, config: statusBarConfig });
+      // The ambient row needs the engineering state the panel feeds from. It is
+      // rendered in the FOOTER rather than the panel because `ui.custom()`
+      // takes keyboard focus and `setFooter` does not — a permanently visible
+      // panel is a session that accepts no typing.
+      const footer = new FooterController({
+        ctx,
+        config: statusBarConfig,
+        panelState: () => ambientPanelState,
+      });
       activeFooter = footer;
       // The footer is a second consumer of admission events (telemetry owns the
       // constructor hook), so it subscribes and gives the wait a countdown.
@@ -977,6 +1002,13 @@ ${RECOVERY_PROMPT}`;
         // not pay for summaries nobody reads.
         startNarrator(plumbing, rt);
       },
+      // Releasing what the panel was driving. A fresh-context review found this
+      // missing: `stopPanelRefresh` existed and was never called, so the timer
+      // outlived every panel that started it — and because `startPanelRefresh`
+      // returns early when a timer is already set, the first session's timer
+      // permanently blocked every later one while still running git against the
+      // first session's repository.
+      onHidden: () => stopPanelRefresh(),
       openRow: openRowFor(rt, plumbing.state),
     });
     if (typeof ctx.ui.onTerminalInput === "function") {
@@ -992,6 +1024,8 @@ ${RECOVERY_PROMPT}`;
       for (const un of panelUnsubscribes.splice(0)) un();
       activePanel?.dispose();
       activePanel = null;
+      // A new session inherits no timer from the last one.
+      stopPanelRefresh();
       const key = await repoCacheKey(ctx.cwd);
       const rt = await getRuntimeByCwd(ctx.cwd).catch(() => null);
       // Not fatal: `/panel` retries the lookup and builds the controller then.
@@ -1028,6 +1062,11 @@ ${RECOVERY_PROMPT}`;
       for (const un of panelUnsubscribes.splice(0)) un();
       activePanel?.dispose();
       activePanel = null;
+      // Belt and braces alongside `onHidden`: a timer that survives a session
+      // both wastes git on a repository nobody is looking at and, because
+      // `startPanelRefresh` returns early when one is already set, stops the
+      // NEXT session from ever refreshing.
+      stopPanelRefresh();
     });
   }
 
