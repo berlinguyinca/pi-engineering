@@ -85,13 +85,41 @@ test("controller: the overlay is right-anchored and suppressed on narrow termina
   controller.dispose();
 });
 
-test("controller: the hotkey toggles the panel", () => {
+test("controller: the hotkey moves focus and leaves the panel on screen", () => {
+  // The chord used to hide the panel. It now steps into and out of it, because
+  // the panel is registered `nonCapturing` and stays visible while you type —
+  // you stop interacting with it far more often than you want it gone.
+  // `/panel` is what hides it.
   const ui = fakeUi();
   const controller = new PanelController({ state: new PanelState(), ui: ui as never, chord: "ctrl+p" });
+
   controller.handleTerminalInput("\x10");
+  assert.equal(controller.isOpen(), true, "the first chord shows it");
+
+  controller.handleTerminalInput("\x10");
+  assert.equal(controller.isOpen(), true, "the second chord must NOT hide it");
+
+  controller.dispose();
+});
+
+test("controller: the chord consumes only its own key", () => {
+  const ui = fakeUi();
+  const controller = new PanelController({ state: new PanelState(), ui: ui as never, chord: "ctrl+p" });
+
+  assert.equal(controller.handleTerminalInput("a"), undefined, "ordinary typing must reach the prompt");
+  assert.deepEqual(controller.handleTerminalInput("\x10"), { consume: true });
+  controller.dispose();
+});
+
+test("controller: escape releases focus rather than hiding the panel", () => {
+  // The component's close path is a blur now. Ambient visibility is the point.
+  const ui = fakeUi();
+  const controller = new PanelController({ state: new PanelState(), ui: ui as never, chord: "ctrl+p" });
+
+  controller.toggle();
   assert.equal(controller.isOpen(), true);
-  controller.handleTerminalInput("\x10");
-  assert.equal(controller.isOpen(), false);
+  controller.blur();
+  assert.equal(controller.isOpen(), true, "blur leaves it visible");
   controller.dispose();
 });
 

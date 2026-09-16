@@ -178,6 +178,69 @@ export class GitRepo {
     }
   }
 
+  /**
+   * The most recent commits, newest first.
+   *
+   * Uses a unit-separator between fields rather than a printable delimiter,
+   * because commit subjects routinely contain every punctuation character a
+   * naive split would choke on.
+   */
+  async recentCommits(limit = 5): Promise<Array<{ sha: string; subject: string; relative: string }>> {
+    const r = await this.git(["--no-pager", "log", `-n${Math.max(1, limit)}`, "--format=%h%x1f%s%x1f%cr"]);
+    if (r.code !== 0) return [];
+    const out: Array<{ sha: string; subject: string; relative: string }> = [];
+    for (const line of r.stdout.split("\n")) {
+      if (!line.trim()) continue;
+      const [sha, subject, relative] = line.split("\x1f");
+      if (!sha || !subject) continue;
+      out.push({ sha, subject, relative: relative ?? "" });
+    }
+    return out;
+  }
+
+  /**
+   * The patch a commit introduced.
+   *
+   * `--format=` drops the header so the result is a PURE diff: the panel's
+   * gutter numbers diff hunks and colours `+`/`-` lines, and a `commit …` /
+   * `Author: …` preamble would be numbered as source line 1. The subject
+   * belongs in the view's title, not in its body.
+   *
+   * `--first-parent` is what makes this work on a merge, which by default shows
+   * no patch at all — an empty pane where the operator asked to see a change.
+   */
+  async commitDiff(sha: string): Promise<string> {
+    const r = await this.git(["--no-pager", "show", "--format=", "--patch", "--first-parent", sha]);
+    if (r.code !== 0) return "";
+    return r.stdout;
+  }
+
+  /**
+   * Per-file added/removed line counts for the working tree.
+   *
+   * `--numstat` rather than parsing a diff: it is one line per file, and it
+   * reports `-` for binary files instead of a count, which is a distinction the
+   * panel should show rather than render as zero.
+   */
+  async diffStats(): Promise<Map<string, { added: number; removed: number; binary: boolean }>> {
+    const out = new Map<string, { added: number; removed: number; binary: boolean }>();
+    const r = await this.git(["--no-pager", "diff", "--numstat", "HEAD"]);
+    if (r.code !== 0) return out;
+    for (const line of r.stdout.split("\n")) {
+      if (!line.trim()) continue;
+      const [added, removed, ...rest] = line.split("\t");
+      const path = rest.join("\t");
+      if (!path) continue;
+      const binary = added === "-" || removed === "-";
+      out.set(path, {
+        added: binary ? 0 : Number.parseInt(added ?? "0", 10) || 0,
+        removed: binary ? 0 : Number.parseInt(removed ?? "0", 10) || 0,
+        binary,
+      });
+    }
+    return out;
+  }
+
   async deleteBranch(branch: string): Promise<void> {
     await this.git(["branch", "-D", branch]).catch(() => {});
   }

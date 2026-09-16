@@ -1,4 +1,7 @@
 export * from "./core/types.ts";
+export * from "./platform/index.ts";
+export * from "./platform/security.ts";
+export * from "./platform/memoryOutbox.ts";
 export { id, newRunId } from "./core/ids.ts";
 export { EventStore } from "./ledger/EventStore.ts";
 export { Ledger } from "./ledger/Ledger.ts";

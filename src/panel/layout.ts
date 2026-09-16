@@ -67,7 +67,7 @@ export const WIDTH_STEP_PERCENT = 5;
 export const DEFAULT_LAYOUT: PanelLayout = {
   widthPercent: 35,
   tab: "files",
-  expanded: ["files", "findings", "run", "spend", "workspace"],
+  expanded: ["files", "findings", "run", "spend", "workspace", "history"],
   open: true,
 };
 

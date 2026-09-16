@@ -8,6 +8,7 @@ import { decidePromotion } from "../../src/blackhole/promotion.ts";
 import { blackholeTelemetry, formatBlackholeTelemetry } from "../../src/blackhole/telemetry.ts";
 import { PINNED_BLACKHOLE_VERSION, sessionKey } from "../../src/blackhole/types.ts";
 import { validateBlackholePackage } from "../../src/blackhole/versioning.ts";
+import { setTelemetrySink } from "../../src/telemetry/sink.ts";
 
 // ------------------------------------------------------------------ config
 
@@ -324,8 +325,10 @@ test("openviking provider: fails closed when unconfigured", async () => {
 test("openviking provider: warns once on auth failure but still fail-closes to empty", async () => {
   const { OpenVikingProvider } = await import("../../src/blackhole/durable.ts");
   const warns: string[] = [];
-  const origWarn = console.warn;
-  console.warn = (...a: unknown[]) => warns.push(a.join(" "));
+  // Diagnostics moved off `console.warn` onto the telemetry sink, so that inside
+  // Pi they become a wrapped, severity-coloured notice instead of a raw line
+  // written under the TUI's own frame.
+  const restore = setTelemetrySink((notice) => warns.push(notice.text));
   try {
     const fetchFn = async () => ({ ok: false, status: 401, json: async () => [] }) as never;
     const prov = new OpenVikingProvider({ baseUrl: "http://ov.example", fetch: fetchFn as never });
@@ -340,15 +343,17 @@ test("openviking provider: warns once on auth failure but still fail-closes to e
     const searchWarns = warns.filter((w) => w.includes("search"));
     assert.equal(searchWarns.length, 1, "search warns once");
   } finally {
-    console.warn = origWarn;
+    restore();
   }
 });
 
 test("openviking provider: warns once on network unreachable (fetch throws) and fail-closes", async () => {
   const { OpenVikingProvider } = await import("../../src/blackhole/durable.ts");
   const warns: string[] = [];
-  const origWarn = console.warn;
-  console.warn = (...a: unknown[]) => warns.push(a.join(" "));
+  // Diagnostics moved off `console.warn` onto the telemetry sink, so that inside
+  // Pi they become a wrapped, severity-coloured notice instead of a raw line
+  // written under the TUI's own frame.
+  const restore = setTelemetrySink((notice) => warns.push(notice.text));
   try {
     const fetchFn = async () => {
       throw new Error("ECONNREFUSED");
@@ -360,15 +365,17 @@ test("openviking provider: warns once on network unreachable (fetch throws) and 
     assert.match(warns[0]!, /unreachable/i);
     assert.match(warns[0]!, /recall/);
   } finally {
-    console.warn = origWarn;
+    restore();
   }
 });
 
 test("openviking provider: warns once on a 200 with a non-array body and fail-closes", async () => {
   const { OpenVikingProvider } = await import("../../src/blackhole/durable.ts");
   const warns: string[] = [];
-  const origWarn = console.warn;
-  console.warn = (...a: unknown[]) => warns.push(a.join(" "));
+  // Diagnostics moved off `console.warn` onto the telemetry sink, so that inside
+  // Pi they become a wrapped, severity-coloured notice instead of a raw line
+  // written under the TUI's own frame.
+  const restore = setTelemetrySink((notice) => warns.push(notice.text));
   try {
     // e.g. an SSO/captive-portal proxy answering 200 with HTML, not a JSON array
     const fetchFn = async () => ({ ok: true, status: 200, json: async () => ({ not: "an array" }) }) as never;
@@ -378,7 +385,7 @@ test("openviking provider: warns once on a 200 with a non-array body and fail-cl
     assert.equal(warns.length, 1, "warns once per unexpected-body outcome");
     assert.match(warns[0]!, /non-array body/i);
   } finally {
-    console.warn = origWarn;
+    restore();
   }
 });
 

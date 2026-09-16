@@ -78,8 +78,16 @@ export function createSummarize(opts: SummarizeOptions = {}): (prompt: string) =
     );
 
     for await (const event of stream) {
-      const e = event as { type?: string; errorMessage?: string };
-      if (e.type === "error") throw new Error(e.errorMessage ?? "narrative stream failed");
+      const e = event as { type?: string; reason?: string; error?: { errorMessage?: string; stopReason?: string } };
+      if (e.type !== "error") continue;
+      // The reason lives on the event's `error` MESSAGE, not on the event
+      // (pi-ai types.d.ts: `{ type: "error"; reason; error: AssistantMessage }`).
+      // Reading it off the event meant every failure here reported the same
+      // useless fallback string, which is how a live narrator failure came back
+      // saying only "narrative stream failed" — no status, no gateway reason,
+      // nothing to act on. Found by the dogfood that exists precisely because
+      // `Narrator` swallows this path by design.
+      throw new Error(e.error?.errorMessage ?? e.reason ?? "narrative stream failed");
     }
     // The assembled message comes from the stream's own result rather than from
     // re-accumulating deltas.

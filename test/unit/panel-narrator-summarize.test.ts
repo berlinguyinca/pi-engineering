@@ -58,8 +58,18 @@ test("summarize: a non-text content part is skipped rather than rendered", async
 });
 
 test("summarize: an error event throws, so the narrator keeps the old narrative", async () => {
+  // The event shape here is pi-ai's real one: `{ type: "error"; reason; error:
+  // AssistantMessage }`. It used to put `errorMessage` on the EVENT, a shape
+  // pi-ai never produces — so the test passed against code that read the same
+  // non-existent field, and taught the mistake instead of catching it. The
+  // narrator swallows this path by design, so nothing else would have noticed.
   const summarize = createSummarize({
-    runtime: runtime(fakeStream([{ type: "error", errorMessage: "429 queue_timeout" }], { content: "" })),
+    runtime: runtime(
+      fakeStream(
+        [{ type: "error", reason: "error", error: { stopReason: "error", errorMessage: "429 queue_timeout" } }],
+        { content: "" },
+      ),
+    ),
   });
   await assert.rejects(() => summarize("prompt"), /queue_timeout/);
 });
@@ -97,4 +107,13 @@ test("summarize: the prompt reaches the model unchanged", async () => {
   await summarize("the prompt body");
   const messages = (seen as { messages?: { content?: string }[] }).messages ?? [];
   assert.equal(messages[0]?.content, "the prompt body");
+});
+
+test("summarize: an error carrying no message still says something usable", async () => {
+  // Better a reason than a placeholder: "aborted" tells the operator the turn
+  // was cancelled, where the old fallback told them nothing at all.
+  const summarize = createSummarize({
+    runtime: runtime(fakeStream([{ type: "error", reason: "aborted", error: {} }], { content: "" })),
+  });
+  await assert.rejects(() => summarize("prompt"), /aborted/);
 });

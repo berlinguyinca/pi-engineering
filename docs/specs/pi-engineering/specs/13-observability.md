@@ -1,0 +1,2 @@
+# 13 Events, prompts & observability
+Version structured events for run/task/worker lifecycle, heartbeats, activity, files, commands, tests, decisions, blockers, review and interventions. PostgreSQL is authoritative. Prompt telemetry records correlation IDs, role/model/provider, template version, hashes, optional redacted/encrypted payload refs, tokens, latency, context, compactions, tools, routing and outcome. Export metrics/traces. Never expose chain-of-thought.

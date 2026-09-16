@@ -1,0 +1,90 @@
+# Pi Engineering Platform — reference Docker Compose (spec 18 / MASTER_SPEC).
+#
+# Provisions the pi-engineering-OWNED surrounding services: a control API
+# (pi-engineering-runtime), PostgreSQL (authoritative runtime history), optional
+# S3-compatible object storage (MinIO), and observability (Prometheus + Grafana).
+#
+# EXTERNAL tools are NOT built here; they plug in beside these services:
+#   - Pi Web        : external operator UI; point it at the control API below.
+#   - Plannotator   : external plan gate; run its own container near the plane.
+#   - OpenViking    : external shared durable memory (viking.metabolomics.us).
+#   - InferWeave    : external inference placement/seats.
+#
+# Docker-first surrounding stack; remote workers connect OUTBOUND (no public
+# inbound port required — see spec 12).
+
+name: pi-engineering-control-plane
+
+services:
+  # pi-engineering-owned control API: serves the normalized control-plane
+  # snapshot (projects/runs/workers/events) that Pi Web consumes.
+  control-api:
+    build:
+      context: ../../..
+      dockerfile: deploy/compose/control-plane/Dockerfile
+    environment:
+      PI_PLATFORM_STORE: jsonl
+      PI_PLATFORM_STORE_FILE: /data/platform-events.jsonl
+      PI_PLATFORM_WORKSPACE: eng
+    ports:
+      - "8080:8080"
+    volumes:
+      - platform-data:/data
+    depends_on:
+      - postgres
+    restart: unless-stopped
+
+  # Authoritative runtime history (spec 13). The JSONL EventStore is the
+  # compatibility seam; a Postgres-backed backend can be enabled later.
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: pi
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      POSTGRES_DB: pi_engineering
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pi"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  # Optional S3-compatible object storage for large artifacts (spec 13).
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-pi}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD}
+    volumes:
+      - minio-data:/data
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    restart: unless-stopped
+
+  # Observability (spec 13). No chain-of-thought is ever exported.
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+volumes:
+  platform-data:
+  postgres-data:
+  minio-data:

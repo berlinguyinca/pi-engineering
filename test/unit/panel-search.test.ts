@@ -120,10 +120,11 @@ test("search: backspace edits the query", () => {
   c.handleInput("/");
   for (const ch of "abc") c.handleInput(ch);
   c.handleInput("\x7f");
-  assert.equal(
-    c.render(80).find((line) => line.startsWith("/")),
-    "/ab",
-  );
+  // The panel draws a left border, so the prompt is inside the frame rather
+  // than at column zero.
+  const prompt = c.render(80).find((line) => line.includes("/ab"));
+  assert.ok(prompt, "the search prompt should be rendered");
+  assert.match(prompt, /│\s+\/ab\s*$/, "the query follows the border");
   c.dispose();
 });
 

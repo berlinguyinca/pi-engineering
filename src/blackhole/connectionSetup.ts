@@ -199,7 +199,25 @@ export async function ensureMemorySetup(ctx: ExtensionContext, options: MemorySe
     const effective = resolveMemoryEnvironment(env, options);
     const current = resolveOpenVikingFromEnv(effective);
     const revision = options.revision ?? memorySetupRevision();
-    if (!options.force && profile?.lastConfirmedRevision === revision && current?.token) return;
+    // A connection that works needs no confirmation. This used to re-ask on
+    // every revision bump — i.e. after every install or update — which trains
+    // the operator to dismiss a dialog rather than read it, and asks a question
+    // whose answer is already on disk and demonstrably working.
+    //
+    // The prompt is now for the case it was written for: nothing configured.
+    // Changing a working connection is `/memory setup`, which passes `force`.
+    if (!options.force && current?.baseUrl && current.token) {
+      // Still record that this revision has been seen, so the profile does not
+      // look stale to anything else reading it.
+      if (profile && profile.lastConfirmedRevision !== revision) {
+        try {
+          atomicWrite(path, `${JSON.stringify({ ...profile, lastConfirmedRevision: revision }, null, 2)}\n`);
+        } catch {
+          /* A bookkeeping write is never worth failing startup for. */
+        }
+      }
+      return;
+    }
     const configured = Boolean(current?.baseUrl && current.token);
     let hostLabel = "not configured";
     try {

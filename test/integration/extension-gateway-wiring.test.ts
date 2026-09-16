@@ -319,15 +319,15 @@ test("wiring: the session_start check honours PI_SELF_UPDATE=0", async () => {
   }
 });
 
-test("wiring: the panel does not open itself by default", async () => {
-  // `ctx.ui.custom()` is documented as "Show a custom component with keyboard
-  // focus", and pi has no non-focusing variant — so a panel opened before the
-  // operator asked for it takes the keyboard and pi accepts no input at all.
-  // This shipped once; the assertion exists so it cannot ship twice.
+test("wiring: an auto-opened panel never captures the keyboard", async () => {
+  // A panel that takes focus at session start makes pi accept no typing at all.
+  // That shipped once, because `ui.custom()`'s doc comment says "with keyboard
+  // focus" and never mentions the OverlayOptions flag that turns it off. The
+  // panel may open itself; it may not own the keyboard when it does.
   const prev = process.env.PI_PANEL_AUTO_OPEN;
-  delete process.env.PI_PANEL_AUTO_OPEN;
+  process.env.PI_PANEL_AUTO_OPEN = "1";
   try {
-    let customCalls = 0;
+    let capturing: boolean | undefined;
     const handlers = new Map<string, Handler[]>();
     const pi = {
       on: (name: string, handler: Handler) => {
@@ -352,17 +352,64 @@ test("wiring: the panel does not open itself by default", async () => {
       ...ctxStub(),
       ui: {
         ...ctxStub().ui,
-        custom: () => {
-          customCalls++;
+        custom: (_factory: unknown, options?: { overlayOptions?: () => { nonCapturing?: boolean } }) => {
+          const resolved = options?.overlayOptions?.();
+          capturing = resolved?.nonCapturing !== true;
           return Promise.resolve();
         },
       },
     };
     for (const h of handlers.get("session_start") ?? []) await Promise.resolve(h({}, ctx));
 
-    assert.equal(customCalls, 0, "a session start must never seize the keyboard");
+    assert.notEqual(capturing, true, "a session start must never seize the keyboard");
   } finally {
     if (prev === undefined) delete process.env.PI_PANEL_AUTO_OPEN;
     else process.env.PI_PANEL_AUTO_OPEN = prev;
   }
+});
+
+test("wiring: exiting clears the screen but not the scrollback", async () => {
+  // Erasing what the operator did is not tidying — they may still want to
+  // scroll back through the session or copy from it. So the visible screen is
+  // cleared (2J) and the scrollback (3J) is left alone.
+  const written: string[] = [];
+  const realWrite = process.stdout.write.bind(process.stdout);
+  const realTty = process.stdout.isTTY;
+  Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true });
+  process.stdout.write = ((chunk: string) => {
+    written.push(String(chunk));
+    return true;
+  }) as typeof process.stdout.write;
+  try {
+    const handlers = loadExtension();
+    for (const h of handlers.get("session_shutdown") ?? []) await Promise.resolve(h({}, ctxStub()));
+  } finally {
+    process.stdout.write = realWrite;
+    Object.defineProperty(process.stdout, "isTTY", { value: realTty, configurable: true });
+  }
+
+  const escapes = written.filter((w) => w.includes("[2J"));
+  assert.equal(escapes.length, 1, "the screen is cleared exactly once");
+  assert.ok(!escapes[0]?.includes("[3J"), "the scrollback must survive");
+});
+
+test("wiring: a non-terminal stdout is never written to", async () => {
+  // Escape codes in a pipe become control characters in somebody's log file.
+  const written: string[] = [];
+  const realWrite = process.stdout.write.bind(process.stdout);
+  const realTty = process.stdout.isTTY;
+  Object.defineProperty(process.stdout, "isTTY", { value: false, configurable: true });
+  process.stdout.write = ((chunk: string) => {
+    written.push(String(chunk));
+    return true;
+  }) as typeof process.stdout.write;
+  try {
+    const handlers = loadExtension();
+    for (const h of handlers.get("session_shutdown") ?? []) await Promise.resolve(h({}, ctxStub()));
+  } finally {
+    process.stdout.write = realWrite;
+    Object.defineProperty(process.stdout, "isTTY", { value: realTty, configurable: true });
+  }
+
+  assert.equal(written.filter((w) => w.includes("[2J")).length, 0, "no escape codes when stdout is not a terminal");
 });

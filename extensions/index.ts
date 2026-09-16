@@ -29,18 +29,21 @@ import { defaultModelsPath, providerBaseUrl, readModelsConfig } from "../src/mod
 import { refreshProviderModels } from "../src/models/refresh.ts";
 import { PanelController } from "../src/panel/PanelController.ts";
 import { PanelState } from "../src/panel/PanelState.ts";
-import { readDiffContent, readFileContent } from "../src/panel/content.ts";
+import { readCommitContent, readDiffContent, readFileContent } from "../src/panel/content.ts";
 import { LedgerFeeder } from "../src/panel/feeders/LedgerFeeder.ts";
 import { MemoryFeeder } from "../src/panel/feeders/MemoryFeeder.ts";
 import { DEFAULT_WORKSPACE_TTL_MS, WorkspaceFeeder } from "../src/panel/feeders/WorkspaceFeeder.ts";
 import { type PanelLayout, type PanelLayoutPatch, PanelLayoutStore } from "../src/panel/layout.ts";
 import { Narrator } from "../src/panel/narrator/Narrator.ts";
 import { createSummarize } from "../src/panel/narrator/summarize.ts";
+import { PanelRefreshLoop } from "../src/panel/refreshLoop.ts";
 import { RoadmapEngine } from "../src/roadmap/RoadmapEngine.ts";
 import { EngineeringRuntime } from "../src/runtime/EngineeringRuntime.ts";
 import { resolveStatusBarConfig } from "../src/status/config.ts";
 import { FooterController } from "../src/status/footer.ts";
 import { renderStatus } from "../src/status/layout.ts";
+import { type TelemetryNotice, emitTelemetry, setTelemetrySink } from "../src/telemetry/sink.ts";
+import { createRepeatThrottle } from "../src/telemetry/throttle.ts";
 import { type CoreServices, buildCoreTools } from "../src/tools/coreTools.ts";
 import { checkForUpdate, shouldCheck } from "../src/update/selfUpdate.ts";
 import { describeUpdate } from "../src/update/versionCheck.ts";
@@ -78,7 +81,25 @@ interface PanelPlumbing {
   memory: MemoryFeeder;
 }
 const panels = new Map<string, PanelPlumbing>();
+
+/**
+ * The panel state the footer's ambient row reads, with the repository it
+ * belongs to.
+ *
+ * Tracked separately from `panels` because the footer is built at session start
+ * and has no repository key yet — the key arrives from an async lookup that
+ * finishes later.
+ *
+ * The key is carried alongside because `panels` is process-wide: without it a
+ * footer opened in one repository would keep summarising whichever repository
+ * most recently built plumbing, and a summary attributed to the wrong tree is
+ * worse than none.
+ */
+let ambientPanel: { key: string; state: PanelState } | undefined;
 let activePanel: PanelController | null = null;
+
+/** Removes this session's telemetry sink. */
+let telemetryUninstall: (() => void) | undefined;
 /** Layout is an operator preference, so one store for the whole process. */
 const panelLayoutStore = new PanelLayoutStore();
 
@@ -86,27 +107,33 @@ const panelLayoutStore = new PanelLayoutStore();
  * Periodic refresh while the panel is visible.
  *
  * Paced at the workspace feeder's own TTL: faster would re-run git only to get
- * the cached answer back, slower would leave the TTL unreachable — which is the
- * state a review found, where the view was refreshed once at open and then
- * never again.
+ * the cached answer back, slower would leave the TTL unreachable. The loop
+ * itself lives in src/panel/refreshLoop.ts so its start/stop/restart behaviour
+ * is testable without counting the process's timers.
  */
-let panelRefreshTimer: ReturnType<typeof setInterval> | null = null;
+let panelRefresh: PanelRefreshLoop | null = null;
 
 function startPanelRefresh(plumbing: PanelPlumbing): void {
-  if (panelRefreshTimer) return;
-  panelRefreshTimer = setInterval(() => {
-    plumbing.workspace.invalidate();
-    void plumbing.workspace.refresh();
-    plumbing.ledger.refresh();
-  }, DEFAULT_WORKSPACE_TTL_MS);
-  // A UI refresh must never be the reason a process stays alive.
-  panelRefreshTimer.unref?.();
+  // A new loop each time, so a new session never inherits the previous
+  // session's repository.
+  panelRefresh?.stop();
+  panelRefresh = new PanelRefreshLoop({
+    intervalMs: DEFAULT_WORKSPACE_TTL_MS,
+    tick: () => {
+      plumbing.workspace.invalidate();
+      void plumbing.workspace.refresh();
+      plumbing.ledger.refresh();
+      // Memory counters went stale for as long as the panel stayed open, which
+      // is now the whole session.
+      plumbing.memory.refresh();
+    },
+  });
+  panelRefresh.start();
 }
 
 function stopPanelRefresh(): void {
-  if (!panelRefreshTimer) return;
-  clearInterval(panelRefreshTimer);
-  panelRefreshTimer = null;
+  panelRefresh?.stop();
+  panelRefresh = null;
 }
 /**
  * Panel input subscriptions, kept separate from `sessionUnsubscribes` on
@@ -119,7 +146,10 @@ const panelUnsubscribes: Array<() => void> = [];
 /** Panel plumbing for a repo, created on first use. */
 function panelFor(key: string, rt: EngineeringRuntime): PanelPlumbing {
   const existing = panels.get(key);
-  if (existing) return existing;
+  if (existing) {
+    ambientPanel = { key, state: existing.state };
+    return existing;
+  }
   const state = new PanelState();
   const created: PanelPlumbing = {
     state,
@@ -128,6 +158,7 @@ function panelFor(key: string, rt: EngineeringRuntime): PanelPlumbing {
     memory: new MemoryFeeder({ state, blackhole: rt.blackhole }),
   };
   panels.set(key, created);
+  ambientPanel = { key, state };
   return created;
 }
 
@@ -213,9 +244,26 @@ function roadmapCompleteFor(repoRoot: string): () => Promise<boolean> {
   };
 }
 
+/**
+ * Resolved repository keys by cwd.
+ *
+ * Kept so the footer can ask "which repository is this session?" on the RENDER
+ * path, where running git is forbidden. A cwd that has not been resolved yet
+ * simply has no answer, and the ambient row stays absent until it does —
+ * strictly better than answering with another session's repository.
+ */
+const repoKeyCache = new Map<string, string>();
+
+/** The resolved key for a cwd, if one has been resolved. Never does IO. */
+function cachedRepoKey(cwd: string): string | undefined {
+  return repoKeyCache.get(cwd);
+}
+
 async function repoCacheKey(cwd: string): Promise<string> {
   const repo = await GitRepo.open(cwd).catch(() => null);
-  return repo ? repo.root : cwd;
+  const key = repo ? repo.root : cwd;
+  repoKeyCache.set(cwd, key);
+  return key;
 }
 
 /**
@@ -304,10 +352,6 @@ export default function (pi: ExtensionAPI) {
         // Abort the current generation.
         ctx.abort();
         // Notify the user.
-        ctx.ui.notify(
-          `GenerationGuard: aborted (${decision.reason}). The degenerate output was discarded. Re-submit your prompt to retry with recovery.`,
-          "error",
-        );
         // Structured telemetry.
         const model = ctx.model
           ? `${(ctx.model as { provider?: string }).provider ?? ""}/${(ctx.model as { id?: string }).id ?? "unknown"}`
@@ -321,9 +365,15 @@ export default function (pi: ExtensionAPI) {
           0,
           decision.diagnostics ?? {},
         );
-        if (process.env.PI_GUARD_TELEMETRY !== "false") {
-          process.stderr.write(`[generation-guard] ${JSON.stringify(telemetryEvent)}\n`);
-        }
+        // One path, not two. The operator used to get a notify AND a line of
+        // raw JSON on stderr saying the same thing — and the stderr line is
+        // what tore the frame. The sink installed at session start turns this
+        // into the notify; headless it is still a line on stderr.
+        emitTelemetry({
+          level: "error",
+          text: `GenerationGuard: aborted (${decision.reason}). The degenerate output was discarded. Re-submit your prompt to retry with recovery.`,
+          ...(process.env.PI_GUARD_TELEMETRY !== "false" ? { detail: telemetryEvent } : {}),
+        });
       }
     });
 
@@ -396,6 +446,28 @@ ${RECOVERY_PROMPT}`;
     lastUpdateCheckAt = Date.now();
     return checkForUpdate({ cwd: extensionRoot, git: runGit, apply });
   };
+
+  // ─── A clean terminal on the way out ─────────────────────────────────────
+  // Pi leaves its last frame on screen at exit, so the shell prompt returns
+  // underneath a half-session of transcript. Clearing the visible screen hands
+  // the terminal back the way it was found.
+  //
+  // The SCROLLBACK is deliberately left alone (no `3J`): erasing what the
+  // operator did is not tidying, it is destroying the record of a session they
+  // may still want to scroll back through or copy from.
+  if (typeof pi.on === "function") {
+    pi.on("session_shutdown", () => {
+      if ((process.env.PI_CLEAR_ON_EXIT ?? "1").toLowerCase() === "0") return;
+      // Only a real terminal: writing escape codes into a pipe or a log puts
+      // control characters in someone's file.
+      if (!process.stdout.isTTY) return;
+      try {
+        process.stdout.write("\u001b[2J\u001b[H");
+      } catch {
+        // A cosmetic write is never worth failing a shutdown for.
+      }
+    });
+  }
 
   // Registered on its own, NOT inside the gateway-admission block: staying
   // current has nothing to do with backpressure, and nesting it there meant
@@ -819,7 +891,22 @@ ${RECOVERY_PROMPT}`;
     pi.on("session_start", (_event, ctx) => {
       for (const un of sessionUnsubscribes.splice(0)) un();
       activeFooter?.dispose();
-      const footer = new FooterController({ ctx, config: statusBarConfig });
+      // The ambient row summarises the same engineering state the panel shows,
+      // in a surface that is always readable without stepping into the panel.
+      //
+      // Scoped to THIS session's repository: `panels` is process-wide, so a
+      // resolver that just returned the latest state would let a footer here
+      // summarise a repository someone else's session had opened. A summary
+      // attributed to the wrong tree is worse than no summary.
+      const sessionCwd = ctx.cwd;
+      const footer = new FooterController({
+        ctx,
+        config: statusBarConfig,
+        panelState: () => {
+          if (!ambientPanel) return undefined;
+          return ambientPanel.key === cachedRepoKey(sessionCwd) ? ambientPanel.state : undefined;
+        },
+      });
       activeFooter = footer;
       // The footer is a second consumer of admission events (telemetry owns the
       // constructor hook), so it subscribes and gives the wait a countdown.
@@ -871,15 +958,21 @@ ${RECOVERY_PROMPT}`;
   /**
    * Start the session narrator for a repo, at most once.
    *
-   * Off by default (`PI_PANEL_NARRATOR`): it is the only part of the panel that
-   * spends money, so the operator opts in. It observes the panel's own state —
+   * On by default now that the panel gives the summary a permanent home;
+   * `PI_PANEL_NARRATOR=0` turns it off. It is the only part of the panel that
+   * spends money, and it is the operator's money, so the gate stays and the
+   * cost is bounded rather than hidden: one call at most every two minutes,
+   * only when the observed state has actually changed, never while a gateway
+   * cooldown is standing, and nothing at all in a session that never opens the
+   * panel. It observes the panel's own state —
    * the run view the ledger feeder already publishes — rather than reaching
    * into the runtime for a second source of truth, and it is gated on the SAME
    * admission controller as every other model call in this process.
    */
   const narrators = new Map<string, Narrator>();
   function startNarrator(plumbing: PanelPlumbing, _rt: EngineeringRuntime): void {
-    if (process.env.PI_PANEL_NARRATOR !== "true") return;
+    const mode = (process.env.PI_PANEL_NARRATOR ?? "1").toLowerCase();
+    if (mode === "0" || mode === "false" || mode === "off") return;
     const key = [...panels.entries()].find(([, value]) => value === plumbing)?.[0];
     if (!key || narrators.has(key)) return;
 
@@ -922,7 +1015,13 @@ ${RECOVERY_PROMPT}`;
 
   /** Resolve a selected row into a bounded content view. */
   function openRowFor(rt: EngineeringRuntime, state: PanelState) {
-    return async (payload: { kind: string; path?: string; source?: string }) => {
+    return async (payload: { kind: string; path?: string; source?: string; sha?: string; subject?: string }) => {
+      if (payload.kind === "commit" && payload.sha) {
+        // No repository means no history to read; the rows that produce this
+        // payload only exist when there is one, so this is belt and braces.
+        if (!rt.git) return { title: payload.sha, lines: [], truncated: false, error: "not a git checkout" };
+        return readCommitContent(rt.git, payload.sha, payload.subject);
+      }
       if (payload.kind !== "file" || !payload.path) return undefined;
       // A run's file is shown as the candidate diff when one was captured;
       // the artifact URI travels, the body is fetched only to display it.
@@ -935,6 +1034,42 @@ ${RECOVERY_PROMPT}`;
       }
       return readFileContent(resolve(rt.cwd, payload.path), payload.path);
     };
+  }
+
+  /**
+   * Route diagnostics through Pi's own notifications.
+   *
+   * The bug this closes: subsystems wrote `[gateway-admission] {…}` straight to
+   * stderr. Inside a TUI that lands under a frame the TUI drew, does not wrap,
+   * runs through the side panel, and scrolls the screen by a row the TUI does
+   * not know about — after which every composited row beneath is off by one
+   * character. Through `notify` the line is wrapped, coloured by severity from
+   * the operator's own theme, and drawn as part of the frame.
+   *
+   * Repeats are throttled: a gateway that keeps a session waiting emits the
+   * same sentence every thirty seconds, and the footer already carries the live
+   * countdown. The notification is there to explain the silence once, not to
+   * narrate it.
+   */
+  /**
+   * Route diagnostics through Pi's own notifications.
+   *
+   * The bug this closes: subsystems wrote `[gateway-admission] {…}` straight to
+   * stderr. Inside a TUI that lands under a frame the TUI drew, does not wrap,
+   * and runs through the side panel. Through `notify` the line is wrapped and
+   * coloured by severity from the operator's own theme, and drawn as part of
+   * the frame rather than under it.
+   */
+  function installTelemetrySink(ui: { notify(text: string, level: string): void }): () => void {
+    const allow = createRepeatThrottle();
+    return setTelemetrySink((notice: TelemetryNotice) => {
+      if (!allow(notice)) return;
+      try {
+        ui.notify(notice.text, notice.level);
+      } catch {
+        /* A session tearing down is not a reason to fail the work reporting. */
+      }
+    });
   }
 
   /**
@@ -977,6 +1112,13 @@ ${RECOVERY_PROMPT}`;
         // not pay for summaries nobody reads.
         startNarrator(plumbing, rt);
       },
+      // Releasing what the panel was driving. A fresh-context review found this
+      // missing: `stopPanelRefresh` existed and was never called, so the timer
+      // outlived every panel that started it — and because `startPanelRefresh`
+      // returns early when a timer is already set, the first session's timer
+      // permanently blocked every later one while still running git against the
+      // first session's repository.
+      onHidden: () => stopPanelRefresh(),
       openRow: openRowFor(rt, plumbing.state),
     });
     if (typeof ctx.ui.onTerminalInput === "function") {
@@ -989,33 +1131,45 @@ ${RECOVERY_PROMPT}`;
   // real Pi run (the smoke-test stub has no pi.on).
   if (typeof pi.on === "function") {
     pi.on("session_start", async (_event, ctx) => {
+      // First, before anything can report: until a sink is installed every
+      // diagnostic goes to raw stderr, which is what tears the frame.
+      //
+      // The previous session's sink is removed rather than left stacked
+      // beneath this one. A review flagged that as a hazard for overlapping
+      // sessions, and it would be — but this extension already treats sessions
+      // as serial: the line below disposes `activePanel`, and the panel's
+      // refresh timer is stopped the same way. One live session per process is
+      // the assumption throughout, and a sink left behind by a session that
+      // will never shut down is a slow leak pointed at a dead UI.
+      telemetryUninstall?.();
+      telemetryUninstall = installTelemetrySink(ctx.ui as { notify(text: string, level: string): void });
       for (const un of panelUnsubscribes.splice(0)) un();
       activePanel?.dispose();
       activePanel = null;
+      // A new session inherits no timer from the last one.
+      stopPanelRefresh();
       const key = await repoCacheKey(ctx.cwd);
       const rt = await getRuntimeByCwd(ctx.cwd).catch(() => null);
       // Not fatal: `/panel` retries the lookup and builds the controller then.
       if (!rt) return;
       activePanel = createPanelController(ctx as { ui: PanelSessionUi }, panelFor(key, rt), rt);
 
-      // ── Auto-open is OFF by default, and must stay that way ──────────────
-      // `ctx.ui.custom()` is documented as "Show a custom component with
-      // keyboard focus", and pi offers no non-focusing variant. So a panel
-      // opened at session start takes the keyboard before the operator has
-      // typed anything, and pi accepts no input at all until it is closed.
+      // ── The panel is shown by default, and does not take the keyboard ────
+      // It is registered `nonCapturing` (pi-tui OverlayOptions), so it is on
+      // screen without owning input. `ctrl+p` steps into it and back out;
+      // `/panel` hides and shows it.
       //
-      // That shipped once. An always-visible panel is not reachable through
-      // this API: it needs either a non-focusable overlay in pi, or a
-      // footer-style surface that never takes focus. Until then the panel is a
-      // toggle, and PI_PANEL_AUTO_OPEN=1 is an opt-in for anyone who wants the
-      // old behaviour and knows it costs them the keyboard until they press the
-      // chord.
+      // The first attempt at this shipped without `nonCapturing` and made pi
+      // accept no typing at all, because `ui.custom()`'s own doc comment says
+      // "with keyboard focus" and never mentions the option that turns that
+      // off. The flag remains as an escape hatch for anyone who wants no panel
+      // at all without hiding it every session.
       //
       // `restore()` rather than `toggle()`: restoring a remembered choice is
       // not the operator making a new one, and recording it as one would write
       // the preference back every session whether they touched it or not.
-      const autoOpen = (process.env.PI_PANEL_AUTO_OPEN ?? "0").toLowerCase();
-      const autoOpenEnabled = autoOpen === "1" || autoOpen === "true" || autoOpen === "on";
+      const autoOpen = (process.env.PI_PANEL_AUTO_OPEN ?? "1").toLowerCase();
+      const autoOpenEnabled = autoOpen !== "0" && autoOpen !== "false" && autoOpen !== "off";
       if (autoOpenEnabled && panelLayoutStore.load().open) {
         const ui = ctx.ui as PanelSessionUi;
         // An overlay needs somewhere to draw. A session without interactive UI
@@ -1025,9 +1179,17 @@ ${RECOVERY_PROMPT}`;
     });
 
     pi.on("session_shutdown", () => {
+      // A sink pointing at a torn-down session's UI is worse than none.
+      telemetryUninstall?.();
+      telemetryUninstall = undefined;
       for (const un of panelUnsubscribes.splice(0)) un();
       activePanel?.dispose();
       activePanel = null;
+      // Belt and braces alongside `onHidden`: a timer that survives a session
+      // both wastes git on a repository nobody is looking at and, because
+      // `startPanelRefresh` returns early when one is already set, stops the
+      // NEXT session from ever refreshing.
+      stopPanelRefresh();
     });
   }
 

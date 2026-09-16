@@ -21,6 +21,7 @@ import { GitRepo } from "../git/GitRepo.ts";
 import { Ledger } from "../ledger/Ledger.ts";
 import { tasksConflict, topoSort } from "../plan/taskDag.ts";
 import { Scheduler } from "../sched/Scheduler.ts";
+import { emitTelemetry } from "../telemetry/sink.ts";
 import { buildCoreTools } from "../tools/coreTools.ts";
 import { CommandVerifier, type VerificationProvider, type VerifyOutcome } from "../verify/Verifier.ts";
 import { PiWorkerExecutor } from "../workers/PiWorkerExecutor.ts";
@@ -1486,7 +1487,7 @@ Goal: "${goal}"`;
     } catch (err) {
       const note = `context assembly failed: ${String(err)}`;
       await this.ledger.recordEntity("decision", note, "open", this.actor(newRunId(), "planner"), null).catch(() => {});
-      console.warn(note);
+      emitTelemetry({ level: "warning", text: note });
       return `# Task context (0 tokens, budget ${targetTokens})
 (context assembly failed; worker must rely on tools)
 `;

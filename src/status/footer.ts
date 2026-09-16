@@ -15,6 +15,8 @@
 import type { ExtensionContext, ReadonlyFooterDataProvider, Theme } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth } from "@earendil-works/pi-tui";
 import type { AdmissionEvent } from "../gateway/AdmissionController.ts";
+import type { PanelState } from "../panel/PanelState.ts";
+import { renderAmbient } from "./ambient.ts";
 import type { StatusBarConfig } from "./config.ts";
 import { GitContextProvider } from "./git-context.ts";
 import { renderStatus } from "./layout.ts";
@@ -63,6 +65,19 @@ export interface FooterControllerOptions {
   config: StatusBarConfig;
   /** Injectable monotonic clock (ms). Default Date.now. Deterministic in tests. */
   now?: () => number;
+  /**
+   * Resolver for the engineering state behind the ambient summary row.
+   *
+   * A resolver rather than a value: the footer is constructed at session start,
+   * while the panel plumbing is created after an async repository lookup, so a
+   * value captured here would be undefined forever.
+   *
+   * It lives in the footer rather than the panel because `ctx.ui.custom()`
+   * takes keyboard focus and `setFooter` does not — this is the only surface
+   * that can be permanently visible without costing the operator their
+   * keyboard.
+   */
+  panelState?: () => PanelState | undefined;
 }
 
 export class FooterController {
@@ -86,9 +101,12 @@ export class FooterController {
   private lastRenderAt = 0;
   private readonly unsubs: Array<() => void> = [];
 
+  private readonly panelState: (() => PanelState | undefined) | undefined;
+
   constructor(opts: FooterControllerOptions) {
     this.ctx = opts.ctx;
     this.config = opts.config;
+    this.panelState = opts.panelState;
     this.now = opts.now ?? (() => Date.now());
     this.throughput = new ThroughputTracker({
       windowMs: opts.config.throughputWindowMs,
@@ -193,7 +211,12 @@ export class FooterController {
   setWait(wait: WaitState | undefined): void {
     if (this.disposed) return;
     this.status.set({ wait });
-    if (wait?.untilMs != null) this.startWaitTick();
+    // Any wait ticks, not just one with a deadline. The spinner is derived from
+    // the clock, so without a tick it freezes — and an indefinite wait is
+    // exactly the case where a frozen spinner is worst: the operator is
+    // watching a saturated gateway, and a motionless spinner reads as a hung
+    // session rather than a queue being waited out.
+    if (wait) this.startWaitTick();
     else this.stopWaitTick();
     this.requestRender();
   }
@@ -288,13 +311,25 @@ export class FooterController {
     } catch {
       line = "";
     }
-    const lines = [theme.fg("muted", line)];
+    const lines = [paint(theme, line)];
+    // Engineering summary before other extensions' statuses: it is the row the
+    // operator is here for, and a row they have to hunt for is one they stop
+    // looking at.
+    if (this.panelState) {
+      try {
+        const snapshot = this.panelState()?.snapshot;
+        const ambient = snapshot ? renderAmbient(snapshot) : undefined;
+        if (ambient) lines.push(paint(theme, truncateToWidth(ambient, Math.max(0, width), "…")));
+      } catch {
+        // A summary is never worth failing the footer for.
+      }
+    }
     const statuses = [...footerData.getExtensionStatuses()];
     if (statuses.length > 0) {
       // Keep connection failures visible first, then preserve other extensions' order.
       statuses.sort(([a], [b]) => Number(b === "openviking") - Number(a === "openviking"));
       const extensions = statuses.map(([, text]) => text.replace(/[\r\n\t]+/g, " ")).join(" | ");
-      lines.push(theme.fg("muted", truncateToWidth(extensions, Math.max(0, width), "…")));
+      lines.push(paint(theme, truncateToWidth(extensions, Math.max(0, width), "…")));
     }
     return lines;
   }
@@ -347,5 +382,21 @@ export class FooterController {
       detachedHead: g.detachedHead,
     });
     this.requestRender();
+  }
+}
+
+/**
+ * Colour a footer row, or leave it uncoloured.
+ *
+ * The status row and the extension row called `theme.fg` outside the try that
+ * guarded the row's CONTENT, so a throwing theme escaped into pi's render loop
+ * — a whole session lost to a colour lookup. Found by a fresh review; the
+ * ambient row was already guarded, which is what made the gap visible.
+ */
+function paint(theme: Theme, text: string): string {
+  try {
+    return theme.fg("muted", text);
+  } catch {
+    return text;
   }
 }

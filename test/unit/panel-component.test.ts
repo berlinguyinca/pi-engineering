@@ -174,3 +174,178 @@ test("component: unknown input is ignored", () => {
   assert.equal(component.selectedIndex, before);
   component.dispose();
 });
+
+test("component: the panel fills the height it is given", () => {
+  // An overlay is exactly as tall as the lines its component returns, so
+  // without padding a panel with two rows of content renders as two rows
+  // floating in a corner rather than a column beside the transcript.
+  const state = new PanelState();
+  state.set({ updatedAt: 1, workspace: { branch: "main", files: [{ path: "a.ts", change: "modified" }] } });
+  const c = new PanelComponent({ state, requestRender: () => {}, fillHeight: () => 40 });
+
+  const lines = c.render(50);
+  assert.equal(lines.length, 40, "the panel must occupy its whole column");
+  assert.ok(
+    lines.every((l) => l.length === 0 || visibleWidth(l) <= 50),
+    "padding must not overflow the width",
+  );
+  c.dispose();
+});
+
+test("component: content longer than the column is clipped, not overflowed", () => {
+  // Otherwise the overlay runs past the bottom of the screen.
+  const state = new PanelState();
+  state.set({
+    updatedAt: 1,
+    workspace: {
+      branch: "main",
+      files: Array.from({ length: 60 }, (_, i) => ({ path: `file-${i}.ts`, change: "modified" as const })),
+    },
+  });
+  const c = new PanelComponent({ state, requestRender: () => {}, fillHeight: () => 12 });
+
+  assert.equal(c.render(50).length, 12);
+  c.dispose();
+});
+
+test("component: without a height hint the panel renders only its content", () => {
+  // The hint is unavailable until the overlay has rendered once, and a panel
+  // that guessed a height before knowing one would flicker.
+  const state = new PanelState();
+  state.set({ updatedAt: 1, workspace: { branch: "main", files: [{ path: "a.ts", change: "modified" }] } });
+  const c = new PanelComponent({ state, requestRender: () => {} });
+
+  const lines = c.render(50);
+  assert.ok(lines.length > 0 && lines.length < 20, `expected content-sized output, got ${lines.length}`);
+  c.dispose();
+});
+
+test("component: the narrative gets the bottom third, tree keeps the rest", () => {
+  const state = new PanelState();
+  state.set({
+    updatedAt: 1,
+    workspace: { branch: "main", files: [{ path: "a.ts", change: "modified" }] },
+    narrative: { generated: true, updatedAt: 1, text: "We started on X then moved to Y and are now on Z." },
+  });
+  const c = new PanelComponent({ state, requestRender: () => {}, fillHeight: () => 18 });
+
+  const lines = c.render(60);
+  assert.equal(lines.length, 18, "the split must sum to the height given, not overflow it");
+  const ruleAt = lines.findIndex((l) => l.includes("summary"));
+  assert.ok(ruleAt > 0, "a titled rule separates the panes");
+  assert.ok(lines.length - ruleAt <= 7, `the narrative pane should be about a third, got ${lines.length - ruleAt}`);
+  c.dispose();
+});
+
+test("component: the summary is labelled as generated", () => {
+  // It is a model's summary of observed state, not a record of it, and the
+  // panel must never let the two read the same (INV-006).
+  const state = new PanelState();
+  state.set({ updatedAt: 1, narrative: { generated: true, updatedAt: 1, text: "Some prose." } });
+  const c = new PanelComponent({ state, requestRender: () => {}, fillHeight: () => 18 });
+
+  assert.match(c.render(60).join("\n"), /summary · generated/);
+  c.dispose();
+});
+
+test("component: a short panel shows no split", () => {
+  // Two cramped panes are worse than one, and the tree is the half you act on.
+  const state = new PanelState();
+  state.set({
+    updatedAt: 1,
+    workspace: { branch: "main", files: [{ path: "a.ts", change: "modified" }] },
+    narrative: { generated: true, updatedAt: 1, text: "Some prose." },
+  });
+  const c = new PanelComponent({ state, requestRender: () => {}, fillHeight: () => 8 });
+
+  assert.doesNotMatch(c.render(60).join("\n"), /summary · generated/);
+  c.dispose();
+});
+
+test("component: no narrative means no rule and no wasted rows", () => {
+  const state = new PanelState();
+  state.set({ updatedAt: 1, workspace: { branch: "main", files: [{ path: "a.ts", change: "modified" }] } });
+  const c = new PanelComponent({ state, requestRender: () => {}, fillHeight: () => 18 });
+
+  const lines = c.render(60);
+  assert.doesNotMatch(lines.join("\n"), /summary/);
+  assert.equal(lines.length, 18);
+  c.dispose();
+});
+
+test("component: opening a file replaces the split rather than shrinking it", () => {
+  // While reading a file the whole column is the file; a summary stripe under
+  // it would cost rows the reader needs.
+  const state = new PanelState();
+  state.set({ updatedAt: 1, narrative: { generated: true, updatedAt: 1, text: "Some prose." } });
+  const c = new PanelComponent({ state, requestRender: () => {}, fillHeight: () => 18 });
+  c.showContent({ title: "x.ts", lines: ["const a = 1;"], truncated: false });
+
+  assert.doesNotMatch(c.render(60).join("\n"), /summary · generated/);
+  c.dispose();
+});
+
+test("component: the panel carries its own background across the whole column", () => {
+  // Without this the panel is text floating over the transcript rather than a
+  // surface beside it.
+  const state = new PanelState();
+  state.set({ updatedAt: 1, workspace: { branch: "main", files: [{ path: "a.ts", change: "modified" }] } });
+  const theme = {
+    fg: (_c: string, t: string) => `\u001b[35m${t}\u001b[0m`,
+    getBgAnsi: () => "\u001b[48;5;236m",
+  };
+  const c = new PanelComponent({ state, requestRender: () => {}, theme, fillHeight: () => 10 });
+
+  const lines = c.render(40);
+  assert.ok(
+    lines.every((l) => l.startsWith("\x1b[48;5;236m")),
+    "every row, including blank padding, is tinted",
+  );
+  assert.ok(
+    lines.every((l) => l.endsWith("\x1b[0m")),
+    "and every row closes its span",
+  );
+  c.dispose();
+});
+
+test("component: a foreground reset does not strip the background", () => {
+  // `theme.fg()` ends with a FULL reset, which clears the background too. A
+  // line wrapped naively loses its tint at the first coloured token and never
+  // gets it back.
+  const state = new PanelState();
+  state.set({ updatedAt: 1, workspace: { branch: "main", files: [{ path: "a.ts", change: "modified" }] } });
+  const theme = {
+    fg: (_c: string, t: string) => `\u001b[35m${t}\u001b[0m`,
+    getBgAnsi: () => "\u001b[48;5;236m",
+  };
+  const c = new PanelComponent({ state, requestRender: () => {}, theme, fillHeight: () => 10 });
+
+  for (const line of c.render(40)) {
+    // Every reset except the final one must be followed by the background
+    // being re-armed.
+    const body = line.slice(0, -"\u001b[0m".length);
+    const resets = body.split("\u001b[0m").slice(1);
+    for (const after of resets) {
+      assert.ok(after.startsWith("\u001b[48;5;236m"), "a reset mid-line must re-arm the background");
+    }
+  }
+  c.dispose();
+});
+
+test("component: without a theme the panel adds no colour of its own", () => {
+  // Not "no escapes at all": pi-tui's own truncateToWidth emits a reset around
+  // its ellipsis, which is not ours to remove. What must be absent is any
+  // background or foreground this component chose.
+  const state = new PanelState();
+  state.set({ updatedAt: 1, workspace: { branch: "main", files: [{ path: "a.ts", change: "modified" }] } });
+  const c = new PanelComponent({ state, requestRender: () => {}, fillHeight: () => 10 });
+
+  const out = c.render(40).join("");
+  const ESC = String.fromCharCode(27);
+  // Built from a code point rather than written literally: a raw control
+  // character in a regex is both unreadable and a lint error.
+  assert.doesNotMatch(out, new RegExp(`${ESC}\\[4[0-9]`), "no background");
+  assert.doesNotMatch(out, new RegExp(`${ESC}\\[3[0-9]`), "no foreground");
+  assert.doesNotMatch(out, new RegExp(`${ESC}\\[48;`), "no extended background");
+  c.dispose();
+});

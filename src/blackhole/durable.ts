@@ -21,6 +21,7 @@
 import { closeSync, openSync, readFileSync, writeSync } from "node:fs";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
+import { emitTelemetry } from "../telemetry/sink.ts";
 import { type DurableMemoryProvider, type DurableMemoryRecord, searchDurable } from "./OpenViking.ts";
 
 /** Dependency-free cross-process shared store backed by append-only JSONL. */
@@ -93,7 +94,27 @@ function warnOpenViking(
       : outcome === "unexpected-body"
         ? "returned an unexpected (non-array) body"
         : `returned ${outcome}`;
-  console.warn(`[pi-engineering-runtime] OpenViking ${baseUrl} ${what} on ${op} (fail-closed to empty). ${hint}`);
+  emitTelemetry({
+    level: "warning",
+    // The ORIGIN, not the configured URL: a base URL may carry userinfo
+    // (https://user:token@host), and this line is now shown to the operator
+    // rather than buried in stderr — a surface is exactly where a credential
+    // must not be repeated back. The origin is what identifies the endpoint
+    // anyway, and it fits a panelled terminal.
+    text: `OpenViking ${safeOrigin(baseUrl)} ${what} on ${op} (fail-closed to empty). ${hint}`,
+  });
+}
+
+/** An endpoint's origin, with any credentials dropped. Never throws. */
+function safeOrigin(baseUrl: string): string {
+  try {
+    const url = new URL(baseUrl);
+    return `${url.protocol}//${url.host}`;
+  } catch {
+    // Not parseable as a URL, so it cannot be split into parts safely: report
+    // that it was configured rather than echoing something unexamined.
+    return "(configured endpoint)";
+  }
 }
 
 export interface OpenVikingEndpointPaths {
