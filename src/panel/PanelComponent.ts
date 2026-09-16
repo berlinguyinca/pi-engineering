@@ -373,11 +373,19 @@ export class PanelComponent {
   /**
    * Paint one composed line with the background.
    *
-   * The subtlety: `theme.fg()` ends its span with a full reset, which clears
-   * the BACKGROUND as well as the foreground. A line wrapped naively loses its
-   * tint at the first coloured token and stays lost. So every reset already in
-   * the line is followed by the background being re-armed, and the line is
-   * closed with one final reset.
+   * The subtlety is a full reset appearing mid-line, which clears the
+   * BACKGROUND as well as the foreground: past it the row loses its tint and
+   * never gets it back. So every reset already in the line is followed by the
+   * background being re-armed, and the line is closed with one final reset.
+   *
+   * Where those resets come from was worth measuring rather than assuming, and
+   * this comment previously named the wrong source. Pi's `theme.fg()` closes
+   * with `ESC[39m` — foreground only, harmless here. It is `truncateToWidth`
+   * that emits a full `ESC[0m` around its ellipsis, so the rows that lose their
+   * background are precisely the TRUNCATED ones: the long paths and long
+   * commit subjects, which is most of a narrow panel. Pinned in
+   * scripts/dogfood-panel-surface.ts against the real Theme, because no stub
+   * emits either sequence.
    */
   private tint(line: string, bg: string): string {
     if (!bg) return line;
