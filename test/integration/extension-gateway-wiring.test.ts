@@ -319,15 +319,15 @@ test("wiring: the session_start check honours PI_SELF_UPDATE=0", async () => {
   }
 });
 
-test("wiring: the panel does not open itself by default", async () => {
-  // `ctx.ui.custom()` is documented as "Show a custom component with keyboard
-  // focus", and pi has no non-focusing variant — so a panel opened before the
-  // operator asked for it takes the keyboard and pi accepts no input at all.
-  // This shipped once; the assertion exists so it cannot ship twice.
+test("wiring: an auto-opened panel never captures the keyboard", async () => {
+  // A panel that takes focus at session start makes pi accept no typing at all.
+  // That shipped once, because `ui.custom()`'s doc comment says "with keyboard
+  // focus" and never mentions the OverlayOptions flag that turns it off. The
+  // panel may open itself; it may not own the keyboard when it does.
   const prev = process.env.PI_PANEL_AUTO_OPEN;
-  delete process.env.PI_PANEL_AUTO_OPEN;
+  process.env.PI_PANEL_AUTO_OPEN = "1";
   try {
-    let customCalls = 0;
+    let capturing: boolean | undefined;
     const handlers = new Map<string, Handler[]>();
     const pi = {
       on: (name: string, handler: Handler) => {
@@ -352,15 +352,16 @@ test("wiring: the panel does not open itself by default", async () => {
       ...ctxStub(),
       ui: {
         ...ctxStub().ui,
-        custom: () => {
-          customCalls++;
+        custom: (_factory: unknown, options?: { overlayOptions?: () => { nonCapturing?: boolean } }) => {
+          const resolved = options?.overlayOptions?.();
+          capturing = resolved?.nonCapturing !== true;
           return Promise.resolve();
         },
       },
     };
     for (const h of handlers.get("session_start") ?? []) await Promise.resolve(h({}, ctx));
 
-    assert.equal(customCalls, 0, "a session start must never seize the keyboard");
+    assert.notEqual(capturing, true, "a session start must never seize the keyboard");
   } finally {
     if (prev === undefined) delete process.env.PI_PANEL_AUTO_OPEN;
     else process.env.PI_PANEL_AUTO_OPEN = prev;

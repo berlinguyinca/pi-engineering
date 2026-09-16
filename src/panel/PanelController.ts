@@ -37,6 +37,14 @@ export function matchesChord(data: string, chord: string): boolean {
 /** The slice of Pi's overlay handle the controller uses. */
 interface OverlayHandleLike {
   hide(): void;
+  /**
+   * Focus controls. Optional because the smoke-test stub and older pi builds
+   * supply only `hide`, and a panel must still work where they are absent —
+   * it is simply always-visible and never interactive there.
+   */
+  focus?(): void;
+  unfocus?(): void;
+  isFocused?(): boolean;
 }
 
 /** The slice of Pi's UI context the controller uses. */
@@ -122,8 +130,38 @@ export class PanelController {
    */
   handleTerminalInput(data: string): { consume: true } | undefined {
     if (!matchesChord(data, this.chord)) return undefined;
-    this.toggle();
+    // The chord moves focus rather than hiding the panel: `/panel` is for
+    // showing and hiding, this is for stepping in and out.
+    this.toggleFocus();
     return { consume: true };
+  }
+
+  /** Whether the panel currently holds the keyboard. */
+  get focused(): boolean {
+    return this.handle?.isFocused?.() === true;
+  }
+
+  /**
+   * Give the panel the keyboard so it can be navigated.
+   *
+   * Separate from visibility on purpose: the panel is visible nearly always and
+   * interactive rarely, and conflating the two is what made "always visible"
+   * mean "cannot type".
+   */
+  focus(): void {
+    if (!this.open) this.show();
+    this.handle?.focus?.();
+  }
+
+  /** Hand the keyboard back to the prompt, leaving the panel on screen. */
+  blur(): void {
+    this.handle?.unfocus?.();
+  }
+
+  /** The chord: step into the panel, or back out of it. */
+  toggleFocus(): void {
+    if (this.focused) this.blur();
+    else this.focus();
   }
 
   toggle(): void {
@@ -171,7 +209,10 @@ export class PanelController {
         this.component = new PanelComponent({
           state: this.state,
           requestRender: () => tui.requestRender(),
-          onClose: () => this.close(),
+          // Escape releases focus back to the prompt; it does not hide the
+          // panel. Ambient visibility is the point — you stop interacting with
+          // it far more often than you want it gone.
+          onClose: () => this.blur(),
           openRow: (payload) => void this.openSelection(payload),
           ...(this.layout ? { layout: this.layout } : {}),
           onLayoutChange: (patch) => {
@@ -192,7 +233,18 @@ export class PanelController {
           anchor: "top-right",
           width: `${this.layout?.widthPercent ?? 35}%`,
           minWidth: MIN_PANEL_COLUMNS,
+          // Leave the lower half of the terminal to the transcript. Without a
+          // ceiling the overlay claims rows it has nothing to draw in, which
+          // reads as a washed-out block rather than a panel.
+          maxHeight: "60%" as const,
           margin: 1,
+          // The field that makes an always-visible panel possible at all:
+          // without it the overlay seizes the keyboard the moment it appears,
+          // and pi accepts no typing until it is closed. `ui.custom()`'s own
+          // doc comment says "with keyboard focus" and does not mention this,
+          // which is how an always-on panel got shipped and reverted before
+          // anyone read OverlayOptions.
+          nonCapturing: true,
           // Called every render cycle, so it stays a comparison and nothing more.
           visible: (termWidth: number) => termWidth >= MIN_TERMINAL_COLUMNS,
         }),

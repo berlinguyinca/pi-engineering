@@ -1032,24 +1032,22 @@ ${RECOVERY_PROMPT}`;
       if (!rt) return;
       activePanel = createPanelController(ctx as { ui: PanelSessionUi }, panelFor(key, rt), rt);
 
-      // ── Auto-open is OFF by default, and must stay that way ──────────────
-      // `ctx.ui.custom()` is documented as "Show a custom component with
-      // keyboard focus", and pi offers no non-focusing variant. So a panel
-      // opened at session start takes the keyboard before the operator has
-      // typed anything, and pi accepts no input at all until it is closed.
+      // ── The panel is shown by default, and does not take the keyboard ────
+      // It is registered `nonCapturing` (pi-tui OverlayOptions), so it is on
+      // screen without owning input. `ctrl+p` steps into it and back out;
+      // `/panel` hides and shows it.
       //
-      // That shipped once. An always-visible panel is not reachable through
-      // this API: it needs either a non-focusable overlay in pi, or a
-      // footer-style surface that never takes focus. Until then the panel is a
-      // toggle, and PI_PANEL_AUTO_OPEN=1 is an opt-in for anyone who wants the
-      // old behaviour and knows it costs them the keyboard until they press the
-      // chord.
+      // The first attempt at this shipped without `nonCapturing` and made pi
+      // accept no typing at all, because `ui.custom()`'s own doc comment says
+      // "with keyboard focus" and never mentions the option that turns that
+      // off. The flag remains as an escape hatch for anyone who wants no panel
+      // at all without hiding it every session.
       //
       // `restore()` rather than `toggle()`: restoring a remembered choice is
       // not the operator making a new one, and recording it as one would write
       // the preference back every session whether they touched it or not.
-      const autoOpen = (process.env.PI_PANEL_AUTO_OPEN ?? "0").toLowerCase();
-      const autoOpenEnabled = autoOpen === "1" || autoOpen === "true" || autoOpen === "on";
+      const autoOpen = (process.env.PI_PANEL_AUTO_OPEN ?? "1").toLowerCase();
+      const autoOpenEnabled = autoOpen !== "0" && autoOpen !== "false" && autoOpen !== "off";
       if (autoOpenEnabled && panelLayoutStore.load().open) {
         const ui = ctx.ui as PanelSessionUi;
         // An overlay needs somewhere to draw. A session without interactive UI
