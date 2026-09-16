@@ -109,7 +109,11 @@ export class LedgerFeeder {
         phase: event.phase,
         risk: workItem.risk,
         ...(candidate ? { candidateId: candidate.id } : {}),
-        files: (candidate?.changed_files ?? []).map((path) => ({ path, change: "modified" as const })),
+        // "changed", not "modified": `changed_files` is a list of PATHS
+        // (core/types.ts), so the ledger never recorded what happened to them.
+        // Labelling them modified put a fact on screen that nothing had
+        // observed — found by a fresh-context review of the read model.
+        files: (candidate?.changed_files ?? []).map((path) => ({ path, change: "changed" as const })),
         findings,
         spend: [...this.spendByModel.values()],
       },

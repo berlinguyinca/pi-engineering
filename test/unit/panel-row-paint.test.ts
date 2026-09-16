@@ -35,6 +35,35 @@ function spyTheme() {
   };
 }
 
+/**
+ * A theme whose output is ZERO WIDTH, as a real one is.
+ *
+ * `spyTheme` is right for asserting which colour a fragment got and wrong for
+ * anything that renders a whole line: its markup is ordinary characters, so it
+ * consumes columns and the width clamp truncates it. Real escape sequences cost
+ * nothing, so these carry distinct SGR codes that are still identifiable in the
+ * output.
+ */
+const BG_CODE: Record<string, string> = { selectedBg: "48;5;17", customMessageBg: "48;5;18" };
+
+function ansiTheme() {
+  const esc = String.fromCharCode(27);
+  return {
+    fg: (_colour: string, text: string) => `${esc}[38;5;110m${text}${esc}[0m`,
+    getBgAnsi: (colour: string) => `${esc}[${BG_CODE[colour] ?? "48;5;19"}m`,
+  };
+}
+
+/** Does this rendered line carry the given background? */
+function hasBg(line: string, colour: string): boolean {
+  return line.includes(`${String.fromCharCode(27)}[${BG_CODE[colour]}m`);
+}
+
+/** How many times the background was re-armed across the line. */
+function bgCount(line: string, colour: string): number {
+  return line.split(`${String.fromCharCode(27)}[${BG_CODE[colour]}m`).length - 1;
+}
+
 /** The visible text, with the spy's markup removed. */
 function plainOf(painted: string): string {
   return painted.replaceAll(/<\/?[^>]*>/g, "");
@@ -172,18 +201,18 @@ test("component: the cursor's row carries the selection background, full width",
     state: seeded(),
     requestRender: () => {},
     fillHeight: () => 10,
-    theme: spyTheme(),
+    theme: ansiTheme(),
   });
   const lines = component.render(50);
-  const selected = lines.filter((line) => line.includes("<bg:selectedBg>"));
+  const selected = lines.filter((line) => hasBg(line, "selectedBg"));
   assert.equal(selected.length, 1, "exactly one row is the cursor's");
   // Re-armed after every reset, so the highlight survives the coloured tokens
   // inside the row and reaches the padding at the end — a highlight that
   // stopped at the last character would read as a stray coloured word.
-  assert.ok((selected[0]?.match(/<bg:selectedBg>/g) ?? []).length > 1, "the background is re-armed across the row");
+  assert.ok(bgCount(selected[0] ?? "", "selectedBg") > 1, "the background is re-armed across the row");
   for (const line of lines) {
     if (line === selected[0]) continue;
-    assert.ok(line.includes("<bg:customMessageBg>"), "every other row keeps the panel's own surface");
+    assert.ok(hasBg(line, "customMessageBg"), "every other row keeps the panel's own surface");
   }
   component.dispose();
 });
@@ -193,12 +222,12 @@ test("component: an open file has no tree cursor to highlight", () => {
     state: seeded(),
     requestRender: () => {},
     fillHeight: () => 10,
-    theme: spyTheme(),
+    theme: ansiTheme(),
   });
   component.render(50); // tree first, so a stale selection would linger
   component.showContent({ title: "src/a.ts", lines: ["const a = 1;"], truncated: false });
   const lines = component.render(50);
-  assert.ok(!lines.some((line) => line.includes("<bg:selectedBg>")), "no row is selected in a file view");
+  assert.ok(!lines.some((line) => hasBg(line, "selectedBg")), "no row is selected in a file view");
   component.dispose();
 });
 
@@ -235,13 +264,13 @@ test("component: a cursor below the fold highlights nothing, not the summary", (
     state: manyRows(40),
     requestRender: () => {},
     fillHeight: () => 18,
-    theme: spyTheme(),
+    theme: ansiTheme(),
   });
   for (let i = 0; i < 39; i++) component.handleInput("\x1b[B");
   const lines = component.render(50);
   assert.equal(lines.length, 18, "the panel still fills its column");
   assert.equal(
-    lines.filter((line) => line.includes("<bg:selectedBg>")).length,
+    lines.filter((line) => hasBg(line, "selectedBg")).length,
     0,
     "an off-screen cursor highlights no row at all",
   );
@@ -253,12 +282,97 @@ test("component: a cursor inside the tree pane still highlights, with a summary 
     state: manyRows(40),
     requestRender: () => {},
     fillHeight: () => 18,
-    theme: spyTheme(),
+    theme: ansiTheme(),
   });
   component.handleInput("\x1b[B");
   const lines = component.render(50);
-  const at = lines.findIndex((line) => line.includes("<bg:selectedBg>"));
+  const at = lines.findIndex((line) => hasBg(line, "selectedBg"));
   assert.ok(at >= 0, "a visible cursor is still drawn");
   assert.ok(at < 12, "and it is in the tree pane, not the summary");
   component.dispose();
+});
+
+test("component: the width contract holds for wide characters and degenerate widths", () => {
+  // Two escapes from one rule, both found by a fresh review: the narrative pane
+  // never went through the inner truncation, and below width 2 the border's own
+  // two columns exceed the panel. Proven before the fix: render(20) returned a
+  // 38-column line, render(1) a 2-column one.
+  const state = new PanelState();
+  state.set({
+    updatedAt: 1,
+    narrative: { text: `${"漢".repeat(50)} ${"😀".repeat(20)}`, updatedAt: 1, generated: true },
+    workspace: {
+      branch: "main",
+      files: [{ path: "src/日本語/ファイル.ts", change: "modified", added: 3, removed: 1 }],
+    },
+  });
+  for (const width of [0, 1, 2, 3, 20, 40, 60, 80]) {
+    const component = new PanelComponent({
+      state,
+      requestRender: () => {},
+      fillHeight: () => 20,
+      theme: { fg: (_c: string, t: string) => t, getBgAnsi: () => "" },
+    });
+    for (const line of component.render(width)) {
+      assert.ok(visibleWidth(line) <= width, `render(${width}) returned ${visibleWidth(line)} columns`);
+    }
+    component.dispose();
+  }
+});
+
+test("component: one throwing theme colour costs a colour, not the panel", () => {
+  // `render`'s own catch returns an EMPTY panel, so an unguarded theme call
+  // anywhere in it takes the tree, the summary and the border down together —
+  // hiding everything the operator was reading, to report a colour that could
+  // have been skipped.
+  const state = new PanelState();
+  state.set({
+    updatedAt: 1,
+    narrative: { text: "a summary of the work", updatedAt: 1, generated: true },
+    workspace: { branch: "main", files: [{ path: "src/a.ts", change: "modified" }] },
+  });
+  const component = new PanelComponent({
+    state,
+    requestRender: () => {},
+    fillHeight: () => 20,
+    theme: {
+      fg() {
+        throw new Error("theme is broken");
+      },
+    },
+  });
+  const lines = component.render(50);
+  assert.equal(lines.length, 20, "the panel still fills its column");
+  assert.ok(
+    lines.some((line) => line.includes("src/a.ts")),
+    "and still shows the tree",
+  );
+  assert.ok(
+    lines.some((line) => line.includes("a summary of the work")),
+    "and still shows the summary",
+  );
+  component.dispose();
+});
+
+test("shaping: a run's files say the ledger recorded a change, not what it was", () => {
+  // `changed_files` is a list of PATHS, so a run's files genuinely have no
+  // change kind. Reporting them as "modified" put a fact on screen that nothing
+  // had observed — the read model inventing one, which it may never do.
+  const state = new PanelState();
+  state.set({
+    updatedAt: 1,
+    run: {
+      workItemId: "WI-1",
+      goal: "add retry to the gateway client",
+      phase: "review",
+      risk: "low",
+      files: [{ path: "src/a.ts", change: "changed" }],
+      findings: [],
+      spend: [],
+    },
+  });
+  const rows = buildRows(state.snapshot, new Set(["files"]), "files");
+  const file = rows.find((row) => row.payload.kind === "file");
+  assert.equal(file?.glyph, "·", "a neutral bullet: every letter in that column is a claim");
+  assert.equal(file?.tone, "note", "and no colour that would imply one");
 });

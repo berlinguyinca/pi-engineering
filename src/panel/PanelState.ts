@@ -13,7 +13,16 @@
 /** A file the runtime (or the operator) changed. */
 export interface PanelFileEntry {
   path: string;
-  change: "added" | "modified" | "deleted" | "renamed" | "untracked";
+  /**
+   * What happened to the file.
+   *
+   * `changed` means "the source recorded that this path changed, and not how".
+   * The ledger stores `changed_files` as a bare list of paths, so a run's files
+   * genuinely have no change kind — and reporting them as `modified` was the
+   * panel inventing a fact, which a read model may never do. An added file
+   * wearing the amber M is worse than an honest bullet.
+   */
+  change: "added" | "modified" | "deleted" | "renamed" | "untracked" | "changed";
   /** Lines added/removed, when git could count them. */
   added?: number;
   removed?: number;

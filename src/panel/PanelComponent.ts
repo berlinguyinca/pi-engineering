@@ -196,7 +196,7 @@ export class PanelComponent {
       if (narrative.length === 0) {
         const body = this.padToHeight(bounded, inner);
         this.clampSelectedLine(body.length);
-        return this.withBorder(this.withHint(body, inner), inner);
+        return this.clamp(this.withBorder(this.withHint(body, inner), inner), max);
       }
 
       // The tree takes what the narrative does not, so the split always sums to
@@ -204,7 +204,7 @@ export class PanelComponent {
       const topHeight = Math.max(0, (total ?? bounded.length + narrative.length) - narrative.length);
       const top = bounded.length >= topHeight ? bounded.slice(0, topHeight) : this.pad(bounded, topHeight, inner);
       this.clampSelectedLine(top.length);
-      return this.withBorder([...this.withHint(top, inner), ...narrative], inner);
+      return this.clamp(this.withBorder([...this.withHint(top, inner), ...narrative], inner), max);
     } catch {
       // Never throw into Pi's render loop.
       return [];
@@ -227,8 +227,7 @@ export class PanelComponent {
     if (lines.length < 2 || this.content || this.search || !this.focusedFn) return lines;
     const hint = this.hintText();
     if (!hint) return lines;
-    const clipped = truncateToWidth(hint, width, "…");
-    const painted = this.theme ? this.theme.fg("dim", clipped) : clipped;
+    const painted = this.safeFg("dim", truncateToWidth(hint, width, "…"));
     return [...lines.slice(0, -1), painted];
   }
 
@@ -237,6 +236,22 @@ export class PanelComponent {
     if (this.focusedFn?.() === true) return " ↑↓ move · ⏎ open · esc leave · tab switch";
     const chord = this.chord && this.chord !== "none" ? this.chord : undefined;
     return chord ? ` ${chord} to navigate` : "";
+  }
+
+  /**
+   * The last word on the width contract.
+   *
+   * `bounded` clamps the tree and content panes to the INNER width, which is
+   * the right place for it: those lines are composed here. But it never saw the
+   * narrative pane, and it measures the wrong number below width 2, where the
+   * border's two columns exceed the panel itself. Two escapes from one rule, so
+   * the rule is enforced once more at the edge it actually states: every line
+   * render(width) returns is at most `width` visible columns.
+   *
+   * Cheap, because it only rewrites a line that is already wrong.
+   */
+  private clamp(lines: string[], width: number): string[] {
+    return lines.map((line) => (visibleWidth(line) > width ? truncateToWidth(line, width, "…") : line));
   }
 
   /**
@@ -272,8 +287,7 @@ export class PanelComponent {
     const bodyHeight = paneHeight - 1; // one row for the rule
     const rule = this.rule(width, "summary · generated");
     const body = wrapTail(narrative.text, width, bodyHeight);
-    const theme = this.theme;
-    const painted = theme ? body.map((l) => theme.fg("thinkingText", l)) : body;
+    const painted = body.map((l) => this.safeFg("thinkingText", l));
     return [rule, ...painted, ...Array.from({ length: Math.max(0, bodyHeight - painted.length) }, () => "")];
   }
 
@@ -282,8 +296,26 @@ export class PanelComponent {
     const label = ` ${title} `;
     const dashes = Math.max(0, width - label.length - 2);
     const text = `──${label}${"─".repeat(dashes)}`;
-    const clipped = truncateToWidth(text, width, "…");
-    return this.theme ? this.theme.fg("borderMuted", clipped) : clipped;
+    return this.safeFg("borderMuted", truncateToWidth(text, width, "…"));
+  }
+
+  /**
+   * Colour one fragment, or leave it alone.
+   *
+   * Every painter in this file is individually guarded, because render's own
+   * catch returns an EMPTY panel: one throwing theme call would otherwise take
+   * the tree, the summary and the border down together, hiding everything the
+   * operator was reading in order to report a colour that could simply have
+   * been skipped. The tree and the gutter already worked this way; the
+   * narrative and the rule did not, which a fresh review found.
+   */
+  private safeFg(colour: string, text: string): string {
+    if (!this.theme) return text;
+    try {
+      return this.theme.fg(colour, text);
+    } catch {
+      return text;
+    }
   }
 
   /** Pad `lines` to `height` with blanks of the panel's inner width. */
@@ -302,7 +334,7 @@ export class PanelComponent {
    * between "some output" and "a panel".
    */
   private withBorder(lines: string[], inner: number): string[] {
-    const edge = this.theme ? this.theme.fg("borderMuted", BORDER_GLYPH) : BORDER_GLYPH;
+    const edge = this.safeFg("borderMuted", BORDER_GLYPH);
     const bg = this.backgroundAnsi();
     // The cursor's row gets the theme's selection background instead of the
     // panel's, across the FULL width including the padding — a highlight that
@@ -534,8 +566,7 @@ export class PanelComponent {
       const text = truncateToWidth(row.text, textWidth, "…");
       const painted = this.theme ? this.paint(text, row.kind, filename) : text;
       if (gutter === 0) return painted;
-      const label = formatGutter(row, gutter);
-      return `${this.theme ? this.theme.fg("dim", label) : label}${painted}`;
+      return `${this.safeFg("dim", formatGutter(row, gutter))}${painted}`;
     });
   }
 

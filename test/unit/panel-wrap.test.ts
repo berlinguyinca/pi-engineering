@@ -7,6 +7,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { visibleWidth } from "@earendil-works/pi-tui";
 import { wrapTail, wrapText } from "../../src/panel/wrap.ts";
 
 test("wrap: no line exceeds the column", () => {
@@ -60,4 +61,51 @@ test("wrap: the tail keeps the END of a narrative", () => {
 test("wrap: a tail larger than the text returns all of it", () => {
   assert.deepEqual(wrapTail("a b c", 20, 10), ["a b c"]);
   assert.deepEqual(wrapTail("a b c", 20, 0), []);
+});
+
+test("wrap: a wide character costs two columns, not one", () => {
+  // The wrapper measured UTF-16 units, which is the same number as columns for
+  // ASCII and wrong for everything else. The narrative is model-generated
+  // prose, so it is exactly the text most likely to carry CJK or emoji, and a
+  // review proved a 50-character CJK line rendering 102 columns wide in a
+  // 60-column pane — not merely ugly, it corrupts the frame around it.
+  for (const width of [2, 5, 20, 40, 60]) {
+    for (const text of ["漢".repeat(50), "😀".repeat(30), `mixed 漢字 and ${"😀".repeat(5)} text`.repeat(4)]) {
+      for (const line of wrapText(text, width)) {
+        assert.ok(visibleWidth(line) <= width, `"${line}" exceeds ${width} (${visibleWidth(line)} cols)`);
+      }
+    }
+  }
+});
+
+test("wrap: breaking a wide word never splits a character in half", () => {
+  // Slicing by UTF-16 index cuts a surrogate pair into two invalid halves,
+  // which a terminal renders as replacement characters.
+  for (const line of wrapText("😀".repeat(20), 7)) {
+    assert.ok(!line.includes("�"), "no replacement characters");
+    assert.equal(
+      [...line].every((c) => c === "😀"),
+      true,
+      "every emoji survived whole",
+    );
+  }
+});
+
+test("wrap: an odd column cannot fit half a wide character, and does not pretend to", () => {
+  const lines = wrapText("漢".repeat(6), 3);
+  for (const line of lines) assert.ok(visibleWidth(line) <= 3);
+  assert.equal(lines.join(""), "漢".repeat(6), "and nothing is lost to the rounding");
+});
+
+test("wrap: a character wider than the whole column terminates rather than looping", () => {
+  // Width 1 cannot hold a 2-column character. The wrapper must make progress
+  // and stop, not spin trying to place something that can never fit.
+  const lines = wrapText("漢漢漢", 1);
+  assert.ok(Array.isArray(lines));
+  for (const line of lines) assert.ok(visibleWidth(line) <= 1);
+});
+
+test("wrap: ASCII wrapping is unchanged", () => {
+  assert.deepEqual(wrapText("the quick brown fox jumps", 10), ["the quick", "brown fox", "jumps"]);
+  assert.deepEqual(wrapText("supercalifragilistic", 8), ["supercal", "ifragili", "stic"]);
 });

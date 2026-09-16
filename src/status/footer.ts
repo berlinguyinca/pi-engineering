@@ -311,7 +311,7 @@ export class FooterController {
     } catch {
       line = "";
     }
-    const lines = [theme.fg("muted", line)];
+    const lines = [paint(theme, line)];
     // Engineering summary before other extensions' statuses: it is the row the
     // operator is here for, and a row they have to hunt for is one they stop
     // looking at.
@@ -319,7 +319,7 @@ export class FooterController {
       try {
         const snapshot = this.panelState()?.snapshot;
         const ambient = snapshot ? renderAmbient(snapshot) : undefined;
-        if (ambient) lines.push(theme.fg("muted", truncateToWidth(ambient, Math.max(0, width), "…")));
+        if (ambient) lines.push(paint(theme, truncateToWidth(ambient, Math.max(0, width), "…")));
       } catch {
         // A summary is never worth failing the footer for.
       }
@@ -329,7 +329,7 @@ export class FooterController {
       // Keep connection failures visible first, then preserve other extensions' order.
       statuses.sort(([a], [b]) => Number(b === "openviking") - Number(a === "openviking"));
       const extensions = statuses.map(([, text]) => text.replace(/[\r\n\t]+/g, " ")).join(" | ");
-      lines.push(theme.fg("muted", truncateToWidth(extensions, Math.max(0, width), "…")));
+      lines.push(paint(theme, truncateToWidth(extensions, Math.max(0, width), "…")));
     }
     return lines;
   }
@@ -382,5 +382,21 @@ export class FooterController {
       detachedHead: g.detachedHead,
     });
     this.requestRender();
+  }
+}
+
+/**
+ * Colour a footer row, or leave it uncoloured.
+ *
+ * The status row and the extension row called `theme.fg` outside the try that
+ * guarded the row's CONTENT, so a throwing theme escaped into pi's render loop
+ * — a whole session lost to a colour lookup. Found by a fresh review; the
+ * ambient row was already guarded, which is what made the gap visible.
+ */
+function paint(theme: Theme, text: string): string {
+  try {
+    return theme.fg("muted", text);
+  } catch {
+    return text;
   }
 }

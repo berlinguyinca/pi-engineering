@@ -108,6 +108,9 @@ const CHANGE_TONE: Record<PanelFileEntry["change"], RowTone> = {
   // Untracked is green for the same reason added is: it is new work, and the
   // only difference is whether git has been told about it yet.
   untracked: "added",
+  // No colour to carry: the source did not say what happened, so the row must
+  // not imply that it did.
+  changed: "note",
 };
 
 /** One-letter marker per change kind, so a glance says what happened. */
@@ -117,6 +120,8 @@ const CHANGE_GLYPH: Record<PanelFileEntry["change"], string> = {
   deleted: "D",
   renamed: "R",
   untracked: "?",
+  // A neutral bullet, deliberately not a letter: every letter here is a claim.
+  changed: "·",
 };
 
 function section(id: string, label: string, count: number, expanded: ReadonlySet<string>): PanelRow {
