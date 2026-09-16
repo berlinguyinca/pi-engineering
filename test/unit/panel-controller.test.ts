@@ -178,3 +178,38 @@ test("panel: disposing is not the operator asking for it to stay shut", () => {
   c.dispose();
   assert.deepEqual(seen, [true], "shutdown recorded nothing");
 });
+
+test("panel: hiding is reported on every path, including shutdown", () => {
+  // `onHidden` releases work that only makes sense while the panel is visible,
+  // so it must fire even on the paths that record no preference — otherwise a
+  // refresh timer outlives the panel it was refreshing.
+  const hidden: number[] = [];
+  const c = new PanelController({
+    state: new PanelState(),
+    ui: fakeUi() as never,
+    onHidden: () => hidden.push(1),
+  });
+
+  c.toggle();
+  c.toggle();
+  assert.equal(hidden.length, 1, "a toggle-close hides");
+
+  c.toggle();
+  c.dispose();
+  assert.equal(hidden.length, 2, "shutdown hides too, even though it records no preference");
+});
+
+test("panel: closing an already-closed panel hides nothing twice", () => {
+  // close() is idempotent and reached from several paths; firing onHidden each
+  // time would stop work that was never started.
+  const hidden: number[] = [];
+  const c = new PanelController({
+    state: new PanelState(),
+    ui: fakeUi() as never,
+    onHidden: () => hidden.push(1),
+  });
+
+  c.dispose();
+  c.dispose();
+  assert.equal(hidden.length, 0, "it was never on screen");
+});

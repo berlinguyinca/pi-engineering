@@ -32,7 +32,7 @@ import { PanelState } from "../src/panel/PanelState.ts";
 import { readDiffContent, readFileContent } from "../src/panel/content.ts";
 import { LedgerFeeder } from "../src/panel/feeders/LedgerFeeder.ts";
 import { MemoryFeeder } from "../src/panel/feeders/MemoryFeeder.ts";
-import { WorkspaceFeeder } from "../src/panel/feeders/WorkspaceFeeder.ts";
+import { DEFAULT_WORKSPACE_TTL_MS, WorkspaceFeeder } from "../src/panel/feeders/WorkspaceFeeder.ts";
 import { type PanelLayout, type PanelLayoutPatch, PanelLayoutStore } from "../src/panel/layout.ts";
 import { Narrator } from "../src/panel/narrator/Narrator.ts";
 import { createSummarize } from "../src/panel/narrator/summarize.ts";
@@ -81,6 +81,33 @@ const panels = new Map<string, PanelPlumbing>();
 let activePanel: PanelController | null = null;
 /** Layout is an operator preference, so one store for the whole process. */
 const panelLayoutStore = new PanelLayoutStore();
+
+/**
+ * Periodic refresh while the panel is visible.
+ *
+ * Paced at the workspace feeder's own TTL: faster would re-run git only to get
+ * the cached answer back, slower would leave the TTL unreachable — which is the
+ * state a review found, where the view was refreshed once at open and then
+ * never again.
+ */
+let panelRefreshTimer: ReturnType<typeof setInterval> | null = null;
+
+function startPanelRefresh(plumbing: PanelPlumbing): void {
+  if (panelRefreshTimer) return;
+  panelRefreshTimer = setInterval(() => {
+    plumbing.workspace.invalidate();
+    void plumbing.workspace.refresh();
+    plumbing.ledger.refresh();
+  }, DEFAULT_WORKSPACE_TTL_MS);
+  // A UI refresh must never be the reason a process stays alive.
+  panelRefreshTimer.unref?.();
+}
+
+function stopPanelRefresh(): void {
+  if (!panelRefreshTimer) return;
+  clearInterval(panelRefreshTimer);
+  panelRefreshTimer = null;
+}
 /**
  * Panel input subscriptions, kept separate from `sessionUnsubscribes` on
  * purpose: the footer's `session_start` drains its own array, and a shared
@@ -938,6 +965,13 @@ ${RECOVERY_PROMPT}`;
         void plumbing.workspace.refresh();
         plumbing.ledger.refresh();
         plumbing.memory.refresh();
+        // Keep refreshing while it is on screen. `onOpen` alone was enough when
+        // the panel was a toggle you opened to look at something; now that it
+        // stays open for the whole session, a view refreshed once at start-up
+        // is a working tree from hours ago presented as current — worse than no
+        // panel, because it looks authoritative. Found by a fresh-context
+        // review, and made materially worse by the auto-open change.
+        startPanelRefresh(plumbing);
         // The narrator costs money, so it does not start until the panel has
         // been opened at least once: a session that never opens /panel must
         // not pay for summaries nobody reads.

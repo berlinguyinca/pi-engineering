@@ -75,6 +75,14 @@ export interface PanelControllerOptions {
    * the component's fields and this one is the controller's.
    */
   onVisibilityChange?: (open: boolean) => void;
+  /**
+   * Called whenever the panel stops being on screen — a toggle, the component
+   * closing itself, or session shutdown. Distinct from `onVisibilityChange`,
+   * which records a PREFERENCE; this one is for releasing work that only makes
+   * sense while the panel is visible, and must fire on every path including the
+   * ones that record nothing.
+   */
+  onHidden?: () => void;
 }
 
 export class PanelController {
@@ -86,6 +94,7 @@ export class PanelController {
   private layout: PanelLayout | undefined;
   private readonly onLayoutChange: ((layout: PanelLayoutPatch) => void) | undefined;
   private readonly onVisibilityChange: ((open: boolean) => void) | undefined;
+  private readonly onHidden: (() => void) | undefined;
 
   private handle: OverlayHandleLike | null = null;
   private component: PanelComponent | null = null;
@@ -100,6 +109,7 @@ export class PanelController {
     this.layout = opts.layout;
     this.onLayoutChange = opts.onLayoutChange;
     this.onVisibilityChange = opts.onVisibilityChange;
+    this.onHidden = opts.onHidden;
   }
 
   isOpen(): boolean {
@@ -139,17 +149,24 @@ export class PanelController {
   }
 
   private close(): void {
+    const wasOpen = this.open;
     this.component?.dispose();
     this.component = null;
     this.handle?.hide();
     this.handle = null;
     this.open = false;
+    // Only when it was actually on screen: close() is idempotent and is called
+    // on paths that may already have closed it.
+    if (wasOpen) this.onHidden?.();
   }
 
   private show(): void {
     this.open = true;
     this.onOpen?.();
-    void this.ui.custom(
+    // `.catch`, not `void`: a rejected overlay promise with no handler is an
+    // unhandled rejection, which in a Node process is a crash waiting on a
+    // flag. A panel that cannot be drawn closes itself instead.
+    const overlay = this.ui.custom(
       (tui) => {
         this.component = new PanelComponent({
           state: this.state,
@@ -184,6 +201,9 @@ export class PanelController {
         },
       },
     );
+    // A failure to draw is reported through the same path as a close, so the
+    // controller's `open` flag never claims a panel that is not there.
+    void Promise.resolve(overlay).catch(() => this.close());
   }
 
   private async openSelection(payload: RowPayload): Promise<void> {
