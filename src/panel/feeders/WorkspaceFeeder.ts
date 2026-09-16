@@ -107,8 +107,28 @@ export class WorkspaceFeeder {
     }
 
     try {
-      const [status, branch] = await Promise.all([this.repo.status(), this.repo.currentBranch()]);
-      this.publish(parseGitStatusShort(status), branch ?? undefined);
+      // Stats and history alongside status: one refresh, three reads, so the
+      // panel never shows a file list and a line count from different moments.
+      // Optional reads, called through a guard rather than a `.catch`: a repo
+      // object without the method throws synchronously when it is invoked, and
+      // a rejection handler attached afterwards never sees it. The panel must
+      // work against any repo shape, including ones predating these calls.
+      const repo = this.repo as Partial<GitRepo>;
+      const [status, branch, stats, commits] = await Promise.all([
+        this.repo.status(),
+        this.repo.currentBranch(),
+        typeof repo.diffStats === "function"
+          ? repo.diffStats().catch(() => new Map<string, { added: number; removed: number; binary: boolean }>())
+          : Promise.resolve(new Map<string, { added: number; removed: number; binary: boolean }>()),
+        typeof repo.recentCommits === "function" ? repo.recentCommits(5).catch(() => []) : Promise.resolve([]),
+      ]);
+      const files = parseGitStatusShort(status).map((file) => {
+        const stat = stats.get(file.path);
+        return stat
+          ? { ...file, added: stat.added, removed: stat.removed, ...(stat.binary ? { binary: true } : {}) }
+          : file;
+      });
+      this.publish(files, branch ?? undefined, commits);
       this.state.clearError("workspace");
       this.hasRead = true;
       this.lastReadAt = this.now();
@@ -119,7 +139,11 @@ export class WorkspaceFeeder {
     }
   }
 
-  private publish(files: PanelFileEntry[], branch: string | undefined): void {
+  private publish(
+    files: PanelFileEntry[],
+    branch: string | undefined,
+    recentCommits: Array<{ sha: string; subject: string; relative: string }> = [],
+  ): void {
     const usage = this.contextUsage?.();
     this.state.set({
       workspace: {
@@ -127,6 +151,7 @@ export class WorkspaceFeeder {
         files,
         ...(usage?.tokens != null ? { contextTokens: usage.tokens } : {}),
         ...(usage?.percent != null ? { contextPercent: usage.percent } : {}),
+        ...(recentCommits.length > 0 ? { recentCommits } : {}),
       },
       updatedAt: this.now(),
     });

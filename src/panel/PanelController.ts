@@ -105,6 +105,8 @@ export class PanelController {
   private readonly onHidden: (() => void) | undefined;
 
   private handle: OverlayHandleLike | null = null;
+  /** Live terminal height, learned from the overlay's `visible` callback. */
+  private termHeight: number | undefined;
   private component: PanelComponent | null = null;
   private open = false;
 
@@ -205,10 +207,15 @@ export class PanelController {
     // unhandled rejection, which in a Node process is a crash waiting on a
     // flag. A panel that cannot be drawn closes itself instead.
     const overlay = this.ui.custom(
-      (tui) => {
+      (tui, theme) => {
         this.component = new PanelComponent({
           state: this.state,
           requestRender: () => tui.requestRender(),
+          // Minus the overlay's top and bottom margin.
+          fillHeight: () => (this.termHeight ? Math.max(0, this.termHeight - 2) : undefined),
+          // The operator's own theme, so the panel's diff and syntax colours
+          // match the rest of their session instead of a palette invented here.
+          ...(theme ? { theme: theme as { fg(colour: string, text: string): string } } : {}),
           // Escape releases focus back to the prompt; it does not hide the
           // panel. Ambient visibility is the point — you stop interacting with
           // it far more often than you want it gone.
@@ -233,10 +240,6 @@ export class PanelController {
           anchor: "top-right",
           width: `${this.layout?.widthPercent ?? 35}%`,
           minWidth: MIN_PANEL_COLUMNS,
-          // Leave the lower half of the terminal to the transcript. Without a
-          // ceiling the overlay claims rows it has nothing to draw in, which
-          // reads as a washed-out block rather than a panel.
-          maxHeight: "60%" as const,
           margin: 1,
           // The field that makes an always-visible panel possible at all:
           // without it the overlay seizes the keyboard the moment it appears,
@@ -245,8 +248,15 @@ export class PanelController {
           // which is how an always-on panel got shipped and reverted before
           // anyone read OverlayOptions.
           nonCapturing: true,
-          // Called every render cycle, so it stays a comparison and nothing more.
-          visible: (termWidth: number) => termWidth >= MIN_TERMINAL_COLUMNS,
+          // Called every render cycle with the live dimensions, which is the
+          // only place a component learns the terminal HEIGHT: `render(width)`
+          // is given width alone, and an overlay is exactly as tall as the
+          // lines it returns. Recording the height here is what lets the panel
+          // fill its column instead of hugging two rows of content.
+          visible: (termWidth: number, termHeight: number) => {
+            this.termHeight = termHeight;
+            return termWidth >= MIN_TERMINAL_COLUMNS;
+          },
         }),
         onHandle: (handle) => {
           this.handle = handle;

@@ -1,0 +1,17 @@
+# Current Architecture Decisions
+- Pi is the engineering runtime.
+- pi-subagents upstream-first.
+- Pi Web is the single operator UI.
+- Pi Forge is optional/integrated, not a second control plane.
+- Plannotator is a Dockerized plan gate; autonomous mode may explicitly bypass it.
+- OpenViking is mandatory shared durable memory.
+- Blackhole remains local to each Pi session.
+- Runtime correctness/history is EventStore/PostgreSQL.
+- AutoSpec consumes Pi; it does not supervise Pi processes.
+- InferWeave is external and owns inference scheduling/GPU placement.
+- Context capability is discovered dynamically; no fixed 260k reservation architecture.
+- InferWeave capacity uses dynamic seats, not fixed equal-cost slots.
+- Parallel mutating agents use isolated worktrees.
+- Observability never requires hidden chain-of-thought.
+- Target 30–40 simultaneous agents; validate 50.
+- Surrounding services are Docker-first.

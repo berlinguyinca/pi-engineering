@@ -12,6 +12,12 @@ import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { PanelState } from "./PanelState.ts";
 import { type CopyResult, copyToTerminal } from "./clipboard.ts";
 import type { ContentView } from "./content.ts";
+import { type GutterKind, formatGutter, gutterWidth, numberDiffLines, numberFileLines } from "./gutter.ts";
+
+/** The panel's left edge, and the columns it costs (glyph + space). */
+const BORDER_GLYPH = "│";
+const BORDER_WIDTH = 2;
+import { highlightLine, looksLikeDiff } from "./highlight.ts";
 import {
   DEFAULT_LAYOUT,
   type PanelLayout,
@@ -45,6 +51,16 @@ export interface PanelComponentOptions {
   layout?: PanelLayout;
   /** Called whenever the operator changes tab, width, or expansion. */
   onLayoutChange?: (layout: PanelLayoutPatch) => void;
+  /**
+   * Rows the panel should occupy, when known.
+   *
+   * An overlay is exactly as tall as the lines its component returns, so a
+   * panel with two rows of content renders as two rows floating in the corner
+   * rather than a column. Padding to this height is what makes it a panel.
+   */
+  fillHeight?: () => number | undefined;
+  /** Pi's Theme, when the session has one. Absent in tests and headless runs. */
+  theme?: { fg(colour: string, text: string): string };
   /** Copy sink. Defaults to OSC 52 on stdout. */
   copy?: (text: string) => CopyResult;
 }
@@ -55,6 +71,8 @@ export class PanelComponent {
   private readonly openRow: ((payload: RowPayload) => void) | undefined;
   private readonly onClose: (() => void) | undefined;
   private readonly onLayoutChange: ((layout: PanelLayoutPatch) => void) | undefined;
+  private readonly fillHeight: (() => number | undefined) | undefined;
+  private readonly theme: { fg(colour: string, text: string): string } | undefined;
   private readonly copyFn: (text: string) => CopyResult;
   private readonly unsubscribe: () => void;
 
@@ -82,6 +100,8 @@ export class PanelComponent {
     this.openRow = opts.openRow;
     this.onClose = opts.onClose;
     this.onLayoutChange = opts.onLayoutChange;
+    this.fillHeight = opts.fillHeight;
+    this.theme = opts.theme;
     this.copyFn = opts.copy ?? ((text) => copyToTerminal(text));
     // The layout is the single source of truth for what is open, including the
     // first-open defaults (see DEFAULT_LAYOUT.expanded).
@@ -127,14 +147,53 @@ export class PanelComponent {
   render(width: number): string[] {
     const max = Math.max(0, width);
     try {
-      const lines = this.content ? this.renderContent(max) : this.renderTree(max);
+      // The border owns two columns, so everything inside is rendered narrower
+      // rather than being drawn and then clipped by the frame.
+      const inner = Math.max(0, max - BORDER_WIDTH);
+      const lines = this.content ? this.renderContent(inner) : this.renderTree(inner);
       // Belt and braces: the TUI contract is per-line, and a styling mistake
       // here would corrupt the whole frame.
-      return lines.map((line) => (visibleWidth(line) > max ? truncateToWidth(line, max, "…") : line));
+      const bounded = lines.map((line) => (visibleWidth(line) > inner ? truncateToWidth(line, inner, "…") : line));
+      return this.withBorder(this.padToHeight(bounded, inner), inner);
     } catch {
       // Never throw into Pi's render loop.
       return [];
     }
+  }
+
+  /**
+   * Draw the panel's left edge.
+   *
+   * Applied AFTER height padding so the blank rows carry it too: an edge that
+   * stops where the content stops reads as ragged text in the corner rather
+   * than a column beside the transcript, which is the whole visual difference
+   * between "some output" and "a panel".
+   */
+  private withBorder(lines: string[], inner: number): string[] {
+    const edge = this.theme ? this.theme.fg("borderMuted", BORDER_GLYPH) : BORDER_GLYPH;
+    return lines.map((line) => {
+      const pad = Math.max(0, inner - visibleWidth(line));
+      return `${edge} ${line}${" ".repeat(pad)}`;
+    });
+  }
+
+  /**
+   * Pad (or clip) the panel to the height it was told to occupy.
+   *
+   * An overlay is exactly as tall as the lines it returns, so without this a
+   * panel with two rows of content renders as two rows floating in a corner
+   * rather than a column beside the transcript. Padding with blanks of the full
+   * width keeps the background continuous instead of leaving ragged edges.
+   *
+   * Clipping matters as much as padding: content longer than the terminal would
+   * otherwise push the overlay past the bottom of the screen.
+   */
+  private padToHeight(lines: string[], width: number): string[] {
+    const target = this.fillHeight?.();
+    if (target === undefined || target <= 0) return lines;
+    if (lines.length >= target) return lines.slice(0, target);
+    const blank = " ".repeat(width);
+    return [...lines, ...Array.from({ length: target - lines.length }, () => blank)];
   }
 
   handleInput(data: string): void {
@@ -244,9 +303,47 @@ export class PanelComponent {
     if (view.error) {
       return [header, truncateToWidth(`  error: ${view.error}`, width, "…")];
     }
-    const body = view.lines.map((line) => truncateToWidth(line, width, "…"));
+    const body = this.renderNumbered(view.lines, view.title, width);
     if (view.truncated) body.push(truncateToWidth("  … truncated", width, "…"));
     return [header, ...body];
+  }
+
+  /**
+   * Render content with a line-number gutter, then colour it.
+   *
+   * The gutter is composed from plain text and the CONTENT is truncated to the
+   * remaining width before any colour is applied. Truncating afterwards would
+   * cut escape sequences in half and stain the rest of the frame with whatever
+   * colour happened to be open.
+   */
+  private renderNumbered(lines: string[], title: string, width: number): string[] {
+    const isDiff = looksLikeDiff(lines);
+    const rows = isDiff ? numberDiffLines(lines) : numberFileLines(lines);
+    const gutter = gutterWidth(rows);
+    const textWidth = Math.max(0, width - gutter);
+    const filename = title.split(/[\s/]/).pop() ?? title;
+
+    return rows.map((row) => {
+      const text = truncateToWidth(row.text, textWidth, "…");
+      const painted = this.theme ? this.paint(text, row.kind, filename) : text;
+      if (gutter === 0) return painted;
+      const label = formatGutter(row, gutter);
+      return `${this.theme ? this.theme.fg("dim", label) : label}${painted}`;
+    });
+  }
+
+  /** Colour one already-truncated line according to its diff role. */
+  private paint(text: string, kind: GutterKind, filename: string): string {
+    const theme = this.theme;
+    if (!theme) return text;
+    try {
+      if (kind === "added") return theme.fg("toolDiffAdded", text);
+      if (kind === "removed") return theme.fg("toolDiffRemoved", text);
+      if (kind === "meta") return theme.fg("muted", text);
+      return highlightLine(text, { theme, filename });
+    } catch {
+      return text;
+    }
   }
 
   // ─── Navigation ───────────────────────────────────────────────────────────

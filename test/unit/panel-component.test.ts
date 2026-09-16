@@ -174,3 +174,48 @@ test("component: unknown input is ignored", () => {
   assert.equal(component.selectedIndex, before);
   component.dispose();
 });
+
+test("component: the panel fills the height it is given", () => {
+  // An overlay is exactly as tall as the lines its component returns, so
+  // without padding a panel with two rows of content renders as two rows
+  // floating in a corner rather than a column beside the transcript.
+  const state = new PanelState();
+  state.set({ updatedAt: 1, workspace: { branch: "main", files: [{ path: "a.ts", change: "modified" }] } });
+  const c = new PanelComponent({ state, requestRender: () => {}, fillHeight: () => 40 });
+
+  const lines = c.render(50);
+  assert.equal(lines.length, 40, "the panel must occupy its whole column");
+  assert.ok(
+    lines.every((l) => l.length === 0 || visibleWidth(l) <= 50),
+    "padding must not overflow the width",
+  );
+  c.dispose();
+});
+
+test("component: content longer than the column is clipped, not overflowed", () => {
+  // Otherwise the overlay runs past the bottom of the screen.
+  const state = new PanelState();
+  state.set({
+    updatedAt: 1,
+    workspace: {
+      branch: "main",
+      files: Array.from({ length: 60 }, (_, i) => ({ path: `file-${i}.ts`, change: "modified" as const })),
+    },
+  });
+  const c = new PanelComponent({ state, requestRender: () => {}, fillHeight: () => 12 });
+
+  assert.equal(c.render(50).length, 12);
+  c.dispose();
+});
+
+test("component: without a height hint the panel renders only its content", () => {
+  // The hint is unavailable until the overlay has rendered once, and a panel
+  // that guessed a height before knowing one would flicker.
+  const state = new PanelState();
+  state.set({ updatedAt: 1, workspace: { branch: "main", files: [{ path: "a.ts", change: "modified" }] } });
+  const c = new PanelComponent({ state, requestRender: () => {} });
+
+  const lines = c.render(50);
+  assert.ok(lines.length > 0 && lines.length < 20, `expected content-sized output, got ${lines.length}`);
+  c.dispose();
+});

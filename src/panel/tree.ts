@@ -76,10 +76,37 @@ function fileRow(file: PanelFileEntry, source: "run" | "workspace"): PanelRow {
   return {
     depth: 1,
     glyph: CHANGE_GLYPH[file.change],
-    label: file.path,
+    label: `${file.path}${changeSize(file)}`,
     payload: { kind: "file", path: file.path, source },
     selectable: true,
   };
+}
+
+/**
+ * " +31 -1" for a file, or " (binary)".
+ *
+ * Binary is shown rather than rendered as +0 -0: git reports `-` for both
+ * counts there, and a binary file that changed is not a file that changed by
+ * nothing.
+ */
+function changeSize(file: PanelFileEntry): string {
+  if (file.binary) return " (binary)";
+  if (file.added === undefined && file.removed === undefined) return "";
+  const added = file.added ?? 0;
+  const removed = file.removed ?? 0;
+  if (added === 0 && removed === 0) return "";
+  return ` +${added} -${removed}`;
+}
+
+/** "5 files · +119 -7" for a section header. */
+export function changeTotals(files: readonly PanelFileEntry[]): string {
+  let added = 0;
+  let removed = 0;
+  for (const f of files) {
+    added += f.added ?? 0;
+    removed += f.removed ?? 0;
+  }
+  return added === 0 && removed === 0 ? "" : ` +${added} -${removed}`;
 }
 
 /**
@@ -151,9 +178,29 @@ export function buildRows(
     }
     const workspace = state.workspace;
     if (workspace) {
-      const label = workspace.branch ? `Working tree · ${workspace.branch}` : "Working tree";
-      rows.push(section("workspace", label, workspace.files.length, expanded));
+      const base = workspace.branch ? `Working tree · ${workspace.branch}` : "Working tree";
+      rows.push(section("workspace", `${base}${changeTotals(workspace.files)}`, workspace.files.length, expanded));
       if (expanded.has("workspace")) for (const file of workspace.files) rows.push(fileRow(file, "workspace"));
+
+      // History, so a clean tree still has something to say. An always-on panel
+      // showing two lines and a "(0)" is not worth the columns it takes, and a
+      // clean repository is the common case at the start of a session —
+      // precisely when the operator decides whether the panel earns its place.
+      const commits = workspace.recentCommits ?? [];
+      if (workspace.files.length === 0 && commits.length > 0) {
+        rows.push(section("history", "Recent commits", commits.length, expanded));
+        if (expanded.has("history")) {
+          for (const c of commits) {
+            rows.push({
+              depth: 1,
+              glyph: "·",
+              label: `${c.sha} ${c.subject}${c.relative ? ` · ${c.relative}` : ""}`,
+              payload: { kind: "empty" },
+              selectable: false,
+            });
+          }
+        }
+      }
     }
   }
 

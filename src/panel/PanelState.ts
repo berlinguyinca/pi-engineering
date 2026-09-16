@@ -14,6 +14,11 @@
 export interface PanelFileEntry {
   path: string;
   change: "added" | "modified" | "deleted" | "renamed" | "untracked";
+  /** Lines added/removed, when git could count them. */
+  added?: number;
+  removed?: number;
+  /** Git reported `-` for both counts: a binary file, not an empty change. */
+  binary?: boolean;
 }
 
 /** A review finding, attributed to the role and model that produced it. */
@@ -55,6 +60,16 @@ export interface PanelWorkspaceView {
   files: PanelFileEntry[];
   contextTokens?: number;
   contextPercent?: number;
+  /**
+   * Recent history, newest first.
+   *
+   * Carried so the panel has something to say on a clean tree. An always-on
+   * panel that renders two lines and a "(0)" is not worth the columns it
+   * occupies, and a clean repository is the common case at the start of a
+   * session — precisely when the operator is deciding whether the panel earns
+   * its place.
+   */
+  recentCommits?: Array<{ sha: string; subject: string; relative: string }>;
 }
 
 /**
