@@ -20,9 +20,6 @@
     "README.md",
     "SOURCES.md"
   ],
-  "primary_projects": [
-    "InferWeave",
-    "pi-engineering-harness"
-  ],
+  "primary_projects": ["InferWeave", "pi-engineering-harness"],
   "purpose": "Replace fixed full-window session reservations with server-discovered context capabilities and request-scoped dynamic admission."
 }
