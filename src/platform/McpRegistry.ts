@@ -88,9 +88,17 @@ export class McpRegistry {
     const startedAt = new Date().toISOString();
     const t0 = Date.now();
 
+    // Permission is scoped to the REQUESTED server: a tool allowed on one
+    // server must not be invocable on a different server that also happens to
+    // expose a same-named tool. Decided per (server, tool): registered, exposes
+    // the tool, within the run ceiling, and allowed by policy.
+    const server = this.servers.get(args.server);
+    const ceilingOk = !args.ceilingTools || args.ceilingTools.includes(args.tool);
     const allowed =
-      this.allowlistFor(args.projectId, args.role, args.ceilingTools).includes(args.tool) &&
-      this.servers.has(args.server);
+      !!server &&
+      server.tools.includes(args.tool) &&
+      ceilingOk &&
+      this.policy({ projectId: args.projectId, role: args.role, tool: args.tool });
 
     let status: McpInvocationRecord["status"] = "denied";
     if (allowed) {

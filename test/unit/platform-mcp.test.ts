@@ -60,4 +60,31 @@ describe("McpRegistry", () => {
 
     assert.equal(registry.audit().length, 2);
   });
+
+  it("requires the requested server to actually expose the tool", async () => {
+    const registry = new McpRegistry({ policy: ({ tool }) => tool === "query" });
+    registry.register({ name: "lcb", version: "1", command: "x", tools: ["query"] });
+    registry.register({ name: "other", version: "1", command: "y", tools: ["read"] });
+    // 'other' does not expose 'query': denied despite the policy allowing the name.
+    const denied = await registry.invoke({
+      projectId: "PRJ-1",
+      role: "implementer",
+      server: "other",
+      tool: "query",
+      ceilingTools: null,
+      run: async () => "result",
+    });
+    assert.equal(denied.allowed, false);
+    assert.equal(denied.status, "denied");
+    // 'lcb' exposes 'query': allowed.
+    const ok = await registry.invoke({
+      projectId: "PRJ-1",
+      role: "implementer",
+      server: "lcb",
+      tool: "query",
+      ceilingTools: null,
+      run: async () => "result",
+    });
+    assert.equal(ok.allowed, true);
+  });
 });
