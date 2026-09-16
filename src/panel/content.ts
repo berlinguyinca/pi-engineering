@@ -66,6 +66,35 @@ export async function readFileContent(absPath: string, title?: string): Promise<
   }
 }
 
+/** The slice of the repository this module needs. */
+export interface CommitReader {
+  commitDiff(sha: string): Promise<string>;
+}
+
+/**
+ * Read the patch a commit introduced, capped like every other content view.
+ *
+ * The subject goes in the TITLE and the body stays a pure diff, because the
+ * renderer decides between "number this as a file" and "number this as a diff"
+ * by looking at the body: a `commit …`/`Author: …` preamble makes a patch read
+ * as a source file whose first line is a sha.
+ */
+export async function readCommitContent(repo: CommitReader, sha: string, subject?: string): Promise<ContentView> {
+  const label = subject ? `${sha} ${subject}` : sha;
+  try {
+    const body = await repo.commitDiff(sha);
+    if (!body.trim()) {
+      // An empty commit, or one whose patch git declines to produce. Saying so
+      // beats an empty pane that looks like a failure to load.
+      return { title: label, lines: ["  (no textual changes)"], truncated: false };
+    }
+    if (body.length > MAX_CONTENT_BYTES) return toContentView(label, body.slice(0, MAX_CONTENT_BYTES), true);
+    return toContentView(label, body);
+  } catch (err) {
+    return { title: label, lines: [], truncated: false, error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
 /** The slice of the artifact store this module needs. */
 export interface ArtifactReader {
   readContentByUri(uri: string): Promise<string | undefined>;

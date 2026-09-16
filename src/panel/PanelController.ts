@@ -18,6 +18,13 @@ export const MIN_TERMINAL_COLUMNS = 100;
 /** Floor for the overlay's own width. */
 export const MIN_PANEL_COLUMNS = 36;
 export const DEFAULT_CHORD = "ctrl+p";
+/**
+ * Rows left free above and below the panel.
+ *
+ * Zero: a side panel is a column, and a column that stops a row short of either
+ * end is a floating box. Named because `fillHeight` has to agree with it.
+ */
+export const VERTICAL_MARGIN = 0;
 
 /**
  * Does this raw input match the configured chord?
@@ -153,11 +160,13 @@ export class PanelController {
   focus(): void {
     if (!this.open) this.show();
     this.handle?.focus?.();
+    this.component?.focusChanged();
   }
 
   /** Hand the keyboard back to the prompt, leaving the panel on screen. */
   blur(): void {
     this.handle?.unfocus?.();
+    this.component?.focusChanged();
   }
 
   /** The chord: step into the panel, or back out of it. */
@@ -211,8 +220,12 @@ export class PanelController {
         this.component = new PanelComponent({
           state: this.state,
           requestRender: () => tui.requestRender(),
-          // Minus the overlay's top and bottom margin.
-          fillHeight: () => (this.termHeight ? Math.max(0, this.termHeight - 2) : undefined),
+          // The full terminal height, because the overlay is registered with no
+          // top or bottom margin (see VERTICAL_MARGIN). These two numbers are
+          // one decision: shrink the panel without zeroing the margin and it
+          // floats; zero the margin without growing the panel and it comes up
+          // short, which is the same artifact two rows lower.
+          fillHeight: () => (this.termHeight ? Math.max(0, this.termHeight - 2 * VERTICAL_MARGIN) : undefined),
           // The operator's own theme, so the panel's diff and syntax colours
           // match the rest of their session instead of a palette invented here.
           ...(theme ? { theme: theme as { fg(colour: string, text: string): string } } : {}),
@@ -220,6 +233,11 @@ export class PanelController {
           // panel. Ambient visibility is the point — you stop interacting with
           // it far more often than you want it gone.
           onClose: () => this.blur(),
+          // So the panel can say which key steps into it. Registered
+          // `nonCapturing`, it is on screen but inert until then, and a panel
+          // that looks interactive and is not reads as a broken panel.
+          focused: () => this.focused,
+          chord: this.chord,
           openRow: (payload) => void this.openSelection(payload),
           ...(this.layout ? { layout: this.layout } : {}),
           onLayoutChange: (patch) => {
@@ -240,7 +258,13 @@ export class PanelController {
           anchor: "top-right",
           width: `${this.layout?.widthPercent ?? 35}%`,
           minWidth: MIN_PANEL_COLUMNS,
-          margin: 1,
+          // Flush to the right edge and to both ends of the column. A uniform
+          // margin leaves a one-cell gutter on the right and a blank row top
+          // and bottom, and the transcript underneath shows THROUGH them: the
+          // chat's own full-width rules poke out past the panel as stray
+          // coloured stubs. Only the left margin earns its cell, as the gap
+          // between the transcript and the panel's edge.
+          margin: { top: VERTICAL_MARGIN, right: 0, bottom: VERTICAL_MARGIN, left: 1 },
           // The field that makes an always-visible panel possible at all:
           // without it the overlay seizes the keyboard the moment it appears,
           // and pi accepts no typing until it is closed. `ui.custom()`'s own

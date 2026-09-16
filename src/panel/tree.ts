@@ -17,6 +17,7 @@ export type RowPayload =
   | { kind: "file"; path: string; source: "run" | "workspace" }
   | { kind: "finding"; id: string }
   | { kind: "spend"; model: string }
+  | { kind: "commit"; sha: string; subject: string }
   | { kind: "error" }
   | { kind: "empty" };
 
@@ -195,8 +196,11 @@ export function buildRows(
               depth: 1,
               glyph: "·",
               label: `${c.sha} ${c.subject}${c.relative ? ` · ${c.relative}` : ""}`,
-              payload: { kind: "empty" },
-              selectable: false,
+              // Selectable, and carrying the sha rather than the drawn label:
+              // a commit you can see but not open is a caption, and the point
+              // of listing recent work is being able to read it.
+              payload: { kind: "commit", sha: c.sha, subject: c.subject },
+              selectable: true,
             });
           }
         }

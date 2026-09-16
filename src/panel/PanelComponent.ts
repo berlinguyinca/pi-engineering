@@ -75,6 +75,17 @@ export interface PanelComponentOptions {
   fillHeight?: () => number | undefined;
   /** Pi's Theme, when the session has one. Absent in tests and headless runs. */
   theme?: { fg(colour: string, text: string): string; getBgAnsi?(colour: string): string };
+  /**
+   * Whether the panel currently holds the keyboard.
+   *
+   * The panel is registered `nonCapturing`, so arrows and enter go to the
+   * prompt until the operator steps into it. Without this the panel looks
+   * interactive and silently is not — which reads as "the panel is broken",
+   * not as "press a key first".
+   */
+  focused?: () => boolean;
+  /** The chord that steps into the panel, named in the hint. */
+  chord?: string;
   /** Copy sink. Defaults to OSC 52 on stdout. */
   copy?: (text: string) => CopyResult;
 }
@@ -87,6 +98,8 @@ export class PanelComponent {
   private readonly onLayoutChange: ((layout: PanelLayoutPatch) => void) | undefined;
   private readonly fillHeight: (() => number | undefined) | undefined;
   private readonly theme: { fg(colour: string, text: string): string; getBgAnsi?(colour: string): string } | undefined;
+  private readonly focusedFn: (() => boolean) | undefined;
+  private readonly chord: string | undefined;
   private readonly copyFn: (text: string) => CopyResult;
   private readonly unsubscribe: () => void;
 
@@ -116,6 +129,8 @@ export class PanelComponent {
     this.onLayoutChange = opts.onLayoutChange;
     this.fillHeight = opts.fillHeight;
     this.theme = opts.theme;
+    this.focusedFn = opts.focused;
+    this.chord = opts.chord;
     this.copyFn = opts.copy ?? ((text) => copyToTerminal(text));
     // The layout is the single source of truth for what is open, including the
     // first-open defaults (see DEFAULT_LAYOUT.expanded).
@@ -171,17 +186,47 @@ export class PanelComponent {
 
       const total = this.fillHeight?.();
       const narrative = this.renderNarrative(inner, total);
-      if (narrative.length === 0) return this.withBorder(this.padToHeight(bounded, inner), inner);
+      if (narrative.length === 0) {
+        return this.withBorder(this.withHint(this.padToHeight(bounded, inner), inner), inner);
+      }
 
       // The tree takes what the narrative does not, so the split always sums to
       // the height the overlay was given rather than overflowing it.
       const topHeight = Math.max(0, (total ?? bounded.length + narrative.length) - narrative.length);
       const top = bounded.length >= topHeight ? bounded.slice(0, topHeight) : this.pad(bounded, topHeight, inner);
-      return this.withBorder([...top, ...narrative], inner);
+      return this.withBorder([...this.withHint(top, inner), ...narrative], inner);
     } catch {
       // Never throw into Pi's render loop.
       return [];
     }
+  }
+
+  /**
+   * Put the key hint on the pane's last row.
+   *
+   * It OVERWRITES rather than appends, so the hint costs nothing when the panel
+   * is full and sits in otherwise-blank padding when it is not — a row that
+   * pushed content off the bottom to explain how to reach that content would be
+   * its own joke.
+   *
+   * Nothing is shown while a file is open or a search is being typed: the hint
+   * answers "why do my arrow keys do nothing", and in both of those states they
+   * do something.
+   */
+  private withHint(lines: string[], width: number): string[] {
+    if (lines.length < 2 || this.content || this.search || !this.focusedFn) return lines;
+    const hint = this.hintText();
+    if (!hint) return lines;
+    const clipped = truncateToWidth(hint, width, "…");
+    const painted = this.theme ? this.theme.fg("dim", clipped) : clipped;
+    return [...lines.slice(0, -1), painted];
+  }
+
+  /** What the operator can press, given where the keyboard currently is. */
+  private hintText(): string {
+    if (this.focusedFn?.() === true) return " ↑↓ move · ⏎ open · esc leave · tab switch";
+    const chord = this.chord && this.chord !== "none" ? this.chord : undefined;
+    return chord ? ` ${chord} to navigate` : "";
   }
 
   /**
@@ -364,6 +409,17 @@ export class PanelComponent {
         // Unknown input is ignored rather than guessed at.
         return;
     }
+  }
+
+  /**
+   * Focus moved in or out of the panel.
+   *
+   * The key hint depends on it, and focus is the controller's to know — the
+   * component holds no overlay handle — so the repaint has to be asked for
+   * rather than observed.
+   */
+  focusChanged(): void {
+    this.requestRenderFn();
   }
 
   /** Pi calls this on theme changes; rows are rebuilt on the next render. */

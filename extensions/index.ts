@@ -29,7 +29,7 @@ import { defaultModelsPath, providerBaseUrl, readModelsConfig } from "../src/mod
 import { refreshProviderModels } from "../src/models/refresh.ts";
 import { PanelController } from "../src/panel/PanelController.ts";
 import { PanelState } from "../src/panel/PanelState.ts";
-import { readDiffContent, readFileContent } from "../src/panel/content.ts";
+import { readCommitContent, readDiffContent, readFileContent } from "../src/panel/content.ts";
 import { LedgerFeeder } from "../src/panel/feeders/LedgerFeeder.ts";
 import { MemoryFeeder } from "../src/panel/feeders/MemoryFeeder.ts";
 import { DEFAULT_WORKSPACE_TTL_MS, WorkspaceFeeder } from "../src/panel/feeders/WorkspaceFeeder.ts";
@@ -1008,7 +1008,13 @@ ${RECOVERY_PROMPT}`;
 
   /** Resolve a selected row into a bounded content view. */
   function openRowFor(rt: EngineeringRuntime, state: PanelState) {
-    return async (payload: { kind: string; path?: string; source?: string }) => {
+    return async (payload: { kind: string; path?: string; source?: string; sha?: string; subject?: string }) => {
+      if (payload.kind === "commit" && payload.sha) {
+        // No repository means no history to read; the rows that produce this
+        // payload only exist when there is one, so this is belt and braces.
+        if (!rt.git) return { title: payload.sha, lines: [], truncated: false, error: "not a git checkout" };
+        return readCommitContent(rt.git, payload.sha, payload.subject);
+      }
       if (payload.kind !== "file" || !payload.path) return undefined;
       // A run's file is shown as the candidate diff when one was captured;
       // the artifact URI travels, the body is fetched only to display it.

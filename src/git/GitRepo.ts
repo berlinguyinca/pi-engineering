@@ -199,6 +199,23 @@ export class GitRepo {
   }
 
   /**
+   * The patch a commit introduced.
+   *
+   * `--format=` drops the header so the result is a PURE diff: the panel's
+   * gutter numbers diff hunks and colours `+`/`-` lines, and a `commit …` /
+   * `Author: …` preamble would be numbered as source line 1. The subject
+   * belongs in the view's title, not in its body.
+   *
+   * `--first-parent` is what makes this work on a merge, which by default shows
+   * no patch at all — an empty pane where the operator asked to see a change.
+   */
+  async commitDiff(sha: string): Promise<string> {
+    const r = await this.git(["--no-pager", "show", "--format=", "--patch", "--first-parent", sha]);
+    if (r.code !== 0) return "";
+    return r.stdout;
+  }
+
+  /**
    * Per-file added/removed line counts for the working tree.
    *
    * `--numstat` rather than parsing a diff: it is one line per file, and it
