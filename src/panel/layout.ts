@@ -33,11 +33,10 @@ export interface PanelLayout {
   /**
    * Whether the panel was showing when the last session ended.
    *
-   * Defaults to true: a panel nobody knows to open is a panel nobody uses, and
-   * the whole point of it is ambient awareness of what the run is doing. But a
-   * deliberate close is remembered — an operator who shut it should not have to
-   * shut it again every session, which is the difference between a default and
-   * an imposition.
+   * Remembered so a deliberate close survives a restart. It does NOT cause the
+   * panel to open on its own: `ctx.ui.custom()` takes keyboard focus, so a
+   * panel shown before the operator asked for it leaves pi accepting no input.
+   * See the auto-open note in extensions/index.ts.
    */
   open: boolean;
 }

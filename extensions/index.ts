@@ -998,16 +998,24 @@ ${RECOVERY_PROMPT}`;
       if (!rt) return;
       activePanel = createPanelController(ctx as { ui: PanelSessionUi }, panelFor(key, rt), rt);
 
-      // Show it unless the operator turned it off. A panel that must be
-      // discovered is a panel nobody uses, and ambient awareness of the run is
-      // the point of it — but a remembered close is honoured, and
-      // PI_PANEL_AUTO_OPEN=0 disables the behaviour outright.
+      // ── Auto-open is OFF by default, and must stay that way ──────────────
+      // `ctx.ui.custom()` is documented as "Show a custom component with
+      // keyboard focus", and pi offers no non-focusing variant. So a panel
+      // opened at session start takes the keyboard before the operator has
+      // typed anything, and pi accepts no input at all until it is closed.
+      //
+      // That shipped once. An always-visible panel is not reachable through
+      // this API: it needs either a non-focusable overlay in pi, or a
+      // footer-style surface that never takes focus. Until then the panel is a
+      // toggle, and PI_PANEL_AUTO_OPEN=1 is an opt-in for anyone who wants the
+      // old behaviour and knows it costs them the keyboard until they press the
+      // chord.
       //
       // `restore()` rather than `toggle()`: restoring a remembered choice is
       // not the operator making a new one, and recording it as one would write
       // the preference back every session whether they touched it or not.
-      const autoOpen = (process.env.PI_PANEL_AUTO_OPEN ?? "1").toLowerCase();
-      const autoOpenEnabled = autoOpen !== "0" && autoOpen !== "false" && autoOpen !== "off";
+      const autoOpen = (process.env.PI_PANEL_AUTO_OPEN ?? "0").toLowerCase();
+      const autoOpenEnabled = autoOpen === "1" || autoOpen === "true" || autoOpen === "on";
       if (autoOpenEnabled && panelLayoutStore.load().open) {
         const ui = ctx.ui as PanelSessionUi;
         // An overlay needs somewhere to draw. A session without interactive UI
