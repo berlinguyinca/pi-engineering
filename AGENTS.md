@@ -95,6 +95,23 @@ Keep dependencies minimal and justified.
 
 Use small coherent commits with conventional commit messages.
 
+## Merge and PR workflow
+
+Always integrate work into `main`/`master` through a pull request. Do not push
+commits directly to `main`/`master`, and do not create merge commits on
+`main`.
+
+For every unit of work:
+
+1. do the work on a dedicated feature/fix branch off an up-to-date `main`;
+2. push the branch to `origin`;
+3. open a PR against `main` (or `master`) describing the change and its
+   verification evidence;
+4. only merge the PR once it is green.
+
+If a direct merge into `main` has already happened, prefer a clean branch +
+PR for the next change rather than force-rewriting shared history.
+
 ## One agent, one worktree
 
 This repository is worked on by several agents at once. Each one MUST work in
