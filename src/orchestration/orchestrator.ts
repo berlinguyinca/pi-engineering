@@ -63,6 +63,13 @@ export interface OrchestratorOptions {
   parentSessionId?: string | null;
   limits?: { maxActive?: number; maxAgents?: number; maxSubprocesses?: number; maxPerRole?: number };
   router?: IntentRouter;
+  /**
+   * Maximum gate-driven repair rounds (spec 07). Each round repairs the open
+   * blocking findings and then re-validates + re-reviews. Bounded so a reviewer
+   * that keeps re-raising the same defect cannot loop forever; when the budget
+   * is exhausted the mission BLOCKS with the findings left on the record.
+   */
+  maxRepairRounds?: number;
   /** Git provider used to allocate isolated worktrees for mutating tasks. */
   git?: GitRepo | null;
   /** Base ref (commit) worktrees are created at. Defaults to current HEAD. */
@@ -88,11 +95,13 @@ export class Orchestrator {
   private readonly onPhase: OrchestratorOptions["onPhase"];
   private readonly parentSessionId: string | null;
   private readonly limits: NonNullable<OrchestratorOptions["limits"]>;
+  private readonly maxRepairRounds: number;
 
   constructor(opts: OrchestratorOptions) {
     this.store = opts.store;
     this.router = opts.router ?? new IntentRouter();
     this.limits = opts.limits ?? {};
+    this.maxRepairRounds = opts.maxRepairRounds ?? 2;
     this.broker = new ExecutionBroker({
       store: this.store,
       backends: opts.backends,
@@ -193,11 +202,57 @@ export class Orchestrator {
     // Post-execution: validate + review if the mission mutated or requires gates.
     await this.postExecution(this.store.getMission(mission.mission_id)!);
 
-    // Completion gate.
+    // Completion gate, with bounded repair rounds (spec 07): a blocking reviewer
+    // finding creates repair work, and the repaired result is re-validated and
+    // re-reviewed before the gate is consulted again.
+    let verdict = this.gate.evaluate(this.store.getMission(mission.mission_id)!);
+    let repairRounds = 0;
+    while (!verdict.can_complete && repairRounds < this.maxRepairRounds) {
+      const openBlocking = this.store
+        .listFindings(mission.mission_id)
+        .filter((f) => f.severity === "blocking" && f.status === "open");
+      // Nothing repairable (missing gate, failed task, running task): the
+      // repair loop cannot help, so stop and let the caller block or fail.
+      if (openBlocking.length === 0) break;
+      repairRounds++;
+
+      // FINAL_VALIDATION -> REPAIRING is legal; repair tasks run isolated.
+      this.store.transitionMission(mission.mission_id, "REPAIRING");
+      this.phase(this.store.getMission(mission.mission_id)!, "repairing");
+      for (const f of openBlocking) {
+        const where = f.file ? ` [${f.file}${f.line ? `:${f.line}` : ""}]` : "";
+        const repair = this.store.createTask({
+          mission_id: mission.mission_id,
+          kind: "agent",
+          role: "implementer",
+          objective: `Repair review finding (${f.category})${where}: ${f.summary} — recommended: ${f.recommended_action || "n/a"}`,
+          mutates_repo: true,
+          write_domains: ["**"],
+          isolation: "worktree",
+        });
+        this.store.transitionTask(repair.task_id, "READY");
+        await this.runSingleTask(mission.mission_id, repair.task_id);
+        // The repair is ATTEMPTED; the finding is closed out here and the
+        // mandatory re-review below decides whether it still stands. A reviewer
+        // that still sees the defect records a fresh finding, which keeps the
+        // mission blocked — so optimistic closure cannot launder a real issue.
+        this.store.resolveFinding(f.finding_id);
+      }
+      // Mandatory re-validation + re-review of the repaired result.
+      await this.postExecution(this.store.getMission(mission.mission_id)!);
+      verdict = this.gate.evaluate(this.store.getMission(mission.mission_id)!);
+    }
+
     const finalMission = this.store.getMission(mission.mission_id)!;
-    const verdict = this.gate.evaluate(finalMission);
     if (verdict.can_complete) {
-      this.store.completeMission(finalMission.mission_id);
+      // COMPLETE is only legal from REVIEWING / FINAL_VALIDATION. A mission with
+      // no post-execution gates (e.g. a read-only investigation) is still
+      // EXECUTING, so settle it into FINAL_VALIDATION first.
+      const pre = this.store.getMission(mission.mission_id)!.status;
+      if (pre !== "FINAL_VALIDATION" && pre !== "REVIEWING") {
+        this.store.transitionMission(mission.mission_id, "FINAL_VALIDATION");
+      }
+      this.store.completeMission(mission.mission_id);
       this.phase(this.store.getMission(mission.mission_id)!, "complete");
       return {
         mission: this.store.getMission(mission.mission_id)!,
@@ -210,7 +265,7 @@ export class Orchestrator {
     // Not complete: block for repair (legal from FINAL_VALIDATION) or fail.
     const hasBlocking = finalMission.required_gates.length > 0 && verdict.reasons.length > 0;
     if (hasBlocking) {
-      this.store.transitionMission(finalMission.mission_id, "BLOCKED");
+      if (finalMission.status !== "BLOCKED") this.store.transitionMission(finalMission.mission_id, "BLOCKED");
     } else {
       this.store.failMission(finalMission.mission_id, verdict.reasons.join("; "));
     }

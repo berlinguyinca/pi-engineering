@@ -11,7 +11,7 @@ import { EngineeringRuntime } from "../../src/runtime/EngineeringRuntime.ts";
 import type { WorkerExecutor } from "../../src/workers/WorkerExecutor.ts";
 import { makeFixtureRepo } from "../fixtures/make-fixture.ts";
 
-async function openRuntime(root: string) {
+async function openRuntime(root: string, reviewFindings: unknown[] = []) {
   const worker: WorkerExecutor = {
     async run(req) {
       return {
@@ -22,7 +22,7 @@ async function openRuntime(root: string) {
           evidence_refs: ["artifact://test"],
           new_hypotheses: [],
           proposed_tasks: [],
-          details: {},
+          details: reviewFindings.length ? { findings: reviewFindings } : {},
         },
         usage: {
           input: 10,
@@ -96,44 +96,70 @@ describe("orchestration via real EngineeringRuntime (acceptance scenarios)", () 
     assert.ok(r1.mission.required_gates.includes("independent_review"));
   });
 
-  it("scenario D: a reviewer finding blocks completion and creates repair work", async () => {
-    // Not run through the default runtime (whose review backend returns no
-    // findings); instead assert the gate + finding wiring directly via a store
-    // with a blocking finding, matching what runSingleTask records.
-    const fx = fixtures[0]!;
-    const rt = await openRuntime(fx.root);
+  it("scenario D: a blocking reviewer finding blocks completion and the orchestrator creates repair work", async () => {
+    const fx = await makeFixtureRepo();
+    fixtures.push(fx);
+    // The review backend reports a blocking finding on every pass, so the
+    // orchestrator must repair, re-review, and still refuse to complete.
+    const rt = await openRuntime(fx.root, [
+      {
+        severity: "blocking",
+        summary: "auth bypass: token not verified",
+        category: "security",
+        file: "src/a.ts",
+        line: 1,
+      },
+    ]);
     const baseRef = await rt.git!.headCommit();
-    // Pre-seed a blocking finding on a fresh mission to prove the gate blocks.
-    const result = await rt.orchestrator!.orchestrate("Add a health endpoint", {
+    const result = await rt.orchestrator!.orchestrate("Fix the login bug", {
       repository: rt.cwd,
       baseRef,
       mutationRequested: true,
     });
     const store = rt.missionStore!;
-    store.addFinding({
-      mission_id: result.mission.mission_id,
-      task_id: null,
-      severity: "blocking",
-      category: "correctness",
-      file: "src/server.ts",
-      line: 1,
-      summary: "missing null check",
-      evidence: null,
-      recommended_action: "add guard",
+
+    assert.equal(result.completed, false, "a blocking finding must prevent completion");
+    assert.notEqual(store.getMission(result.mission.mission_id)!.status, "COMPLETE");
+    assert.ok(
+      store.listFindings(result.mission.mission_id).some((f) => f.severity === "blocking"),
+      "the blocking finding stays on the record",
+    );
+    // The orchestrator itself created repair work (not the test).
+    const repairs = store
+      .listTasks(result.mission.mission_id)
+      .filter((t) => t.objective.startsWith("Repair review finding"));
+    assert.ok(repairs.length >= 1, "the orchestrator must create repair task(s) from the finding");
+    assert.ok(
+      repairs.every((t) => t.mutates_repo && t.isolation === "worktree"),
+      "repairs mutate in isolation",
+    );
+    // And it re-reviewed after repairing (more than one review task ran).
+    const reviews = store.listTasks(result.mission.mission_id).filter((t) => t.kind === "review");
+    assert.ok(reviews.length >= 2, `expected a re-review after repair, saw ${reviews.length}`);
+  });
+
+  it("a read-only investigation mission never gets a mutating task and still completes", async () => {
+    const fx = await makeFixtureRepo();
+    fixtures.push(fx);
+    const rt = await openRuntime(fx.root);
+    const baseRef = await rt.git!.headCommit();
+    const result = await rt.orchestrator!.orchestrate("Why is login failing?", {
+      repository: rt.cwd,
+      baseRef,
+      mutationRequested: false,
     });
-    const verdict = rt.orchestrator!.gate.evaluate(store.getMission(result.mission.mission_id)!);
-    assert.equal(verdict.can_complete, false);
-    assert.ok(verdict.reasons.some((r) => r.includes("blocking")));
-    // Repair work: a repair task is scheduled by the operator/repair loop.
-    const repair = store.createTask({
-      mission_id: result.mission.mission_id,
-      kind: "agent",
-      role: "implementer",
-      objective: "Repair: add null guard",
-      mutates_repo: true,
-      write_domains: ["src/server/**"],
-    });
-    assert.equal(repair.status, "PENDING");
+    const tasks = rt.missionStore!.listTasks(result.mission.mission_id);
+    assert.equal(result.mission.workflow_class, "investigation");
+    assert.ok(tasks.length > 0);
+    assert.equal(
+      tasks.filter((t) => t.mutates_repo).length,
+      0,
+      `investigation must not mutate: ${JSON.stringify(tasks.map((t) => [t.kind, t.mutates_repo]))}`,
+    );
+    // A mission with no post-execution gates must still reach COMPLETE rather
+    // than dead-ending on an illegal transition.
+    assert.equal(result.completed, true, result.failureReason ?? "");
+    assert.equal(result.mission.status, "COMPLETE");
   });
 
   it("mission/task/execution state survives runtime restart over the same repo", async () => {

@@ -201,12 +201,21 @@ describe("acceptance scenario D — reviewer finding blocks completion and creat
       mutationRequested: true,
     });
     const mission = h.store.getMission(result.mission.mission_id)!;
-    // Blocking finding recorded.
-    const findings = h.store.listFindings(mission.mission_id);
-    assert.ok(findings.some((f) => f.severity === "blocking"));
+    // Blocking finding recorded, and completion refused.
+    assert.ok(h.store.listFindings(mission.mission_id).some((f) => f.severity === "blocking"));
     assert.notEqual(mission.status, "COMPLETE");
-    // Repair work: the orchestrator leaves a repair task open (or blocks).
     assert.equal(result.completed, false);
+    // The orchestrator created repair work from the finding (spec 07) rather
+    // than merely blocking, and re-reviewed after repairing.
+    const tasks = h.store.listTasks(mission.mission_id);
+    assert.ok(
+      tasks.some((t) => t.objective.startsWith("Repair review finding")),
+      `expected a repair task, got ${JSON.stringify(tasks.map((t) => t.objective))}`,
+    );
+    assert.ok(h.calls.review.length >= 2, `expected a re-review after repair, got ${h.calls.review.length}`);
+    // Still blocked because the reviewer keeps re-raising it, and the repair
+    // budget is bounded (no infinite loop).
+    assert.equal(mission.status, "BLOCKED");
   });
 });
 
