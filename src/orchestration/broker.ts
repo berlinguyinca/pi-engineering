@@ -134,6 +134,8 @@ export class ExecutionBroker {
   readonly allocatedWorktrees = new Map<string, { path: string; branch: string }>();
   /** Mission-scoped worktrees awaiting integration (merged+cleaned by the integrator). */
   private readonly missionWorktrees = new Map<string, { path: string; branch: string }[]>();
+  /** Commit each mission's worktrees were actually forked from (landing invariant). */
+  private readonly resolvedBases = new Map<string, string>();
 
   constructor(opts: BrokerOptions) {
     this.store = opts.store;
@@ -185,6 +187,10 @@ export class ExecutionBroker {
       // wins over the incumbent.
       const missionBase = this.store.getMission(input.missionId)?.base_ref?.trim();
       const base = missionBase || this.baseRef || (await this.git.headCommit());
+      // Remember what we actually forked from. A mission may be handed an empty
+      // base_ref, and without a base the 'did the work land' invariant has nothing
+      // to diff against — the fork point recorded here is the fallback.
+      this.resolvedBases.set(input.missionId, base);
       const branch = `pi-eng-orch-${input.taskId}`;
       const wt = await this.git.createWorktree(base, branch);
       const info = { path: wt.path, branch: wt.branch };
@@ -259,7 +265,7 @@ export class ExecutionBroker {
    */
   async changedFilesSinceBase(missionId: string): Promise<string[] | null> {
     if (!this.git) return null;
-    const base = this.store.getMission(missionId)?.base_ref?.trim();
+    const base = this.store.getMission(missionId)?.base_ref?.trim() || this.resolvedBases.get(missionId);
     if (!base) return null;
     try {
       return await this.git.changedFiles(base, await this.git.headCommit());

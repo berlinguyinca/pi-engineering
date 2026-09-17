@@ -504,18 +504,22 @@ export class Orchestrator {
   private async runSingleTask(missionId: string, taskId: string): Promise<boolean> {
     const task = this.store.getTask(taskId)!;
     this.store.transitionTask(taskId, "RUNNING");
-    const handle = await this.broker.execute({
-      taskId,
-      missionId,
-      kind: brokerKind(task.kind),
-      role: task.role,
-      objective: task.objective,
-      mutatesRepo: task.mutates_repo,
-      writeDomains: task.write_domains,
-      isolation: task.isolation,
-      modelRequirements: task.execution_requirements,
-    });
     try {
+      // execute() itself can throw — e.g. no backend is registered for the task
+      // kind. Left outside the try it propagated out of postExecution and
+      // orchestrate and left the mission stranded in INTEGRATING / VALIDATING /
+      // REVIEWING. The scheduler path was hardened the same way; this one was not.
+      const handle = await this.broker.execute({
+        taskId,
+        missionId,
+        kind: brokerKind(task.kind),
+        role: task.role,
+        objective: task.objective,
+        mutatesRepo: task.mutates_repo,
+        writeDomains: task.write_domains,
+        isolation: task.isolation,
+        modelRequirements: task.execution_requirements,
+      });
       const outcome = await handle.result();
       // Record reviewer findings so the completion gate can block on them.
       for (const f of outcome.findings ?? []) {

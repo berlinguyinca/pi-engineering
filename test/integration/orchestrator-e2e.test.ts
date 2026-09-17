@@ -516,3 +516,60 @@ describe("repair of failed gate tasks", () => {
     assert.ok(repairs.length <= 4, `repair must stay bounded, got ${repairs.length}`);
   });
 });
+
+describe("missing backends must degrade, not explode", () => {
+  it("an agent-only runtime does not throw and does not complete a mutation mission", async () => {
+    const store = MissionStore.open(JsonlEventStore.inMemory());
+    const backends: BrokerBackends = {
+      agent: {
+        runAgent: async () => ({
+          executionId: "e",
+          exitStatus: "succeeded",
+          summary: "done",
+          artifactRefs: [],
+          usage: {},
+        }),
+      },
+    };
+    const orchestrator = new Orchestrator({
+      store,
+      backends,
+      planner: async () => [
+        {
+          kind: "agent" as const,
+          role: "implementer",
+          objective: "implement",
+          mutates_repo: true,
+          write_domains: ["src/**"],
+          isolation: "none" as const,
+          depends_on: [],
+          priority: 0,
+          execution_requirements: {},
+          max_attempts: 1,
+          failure_policy: "retry" as const,
+        },
+      ],
+    });
+    // No validation / review / integration backend exists. That must surface as a
+    // blocked mission, not an exception escaping orchestrate with the mission
+    // stranded in INTEGRATING / VALIDATING / REVIEWING.
+    let result: Awaited<ReturnType<Orchestrator["orchestrate"]>> | undefined;
+    let threw: unknown;
+    try {
+      result = await orchestrator.orchestrate("Add an endpoint and fix the build", {
+        repository: ".",
+        baseRef: "abc",
+        mutationRequested: true,
+      });
+    } catch (err) {
+      threw = err;
+    }
+    assert.equal(threw, undefined, `orchestrate must not throw, got ${String(threw)}`);
+    assert.ok(result);
+    assert.equal(result.completed, false, "gates that cannot run must not be treated as passed");
+    assert.ok(
+      ["BLOCKED", "FAILED"].includes(result.mission.status),
+      `mission must settle, got ${result.mission.status}`,
+    );
+  });
+});
