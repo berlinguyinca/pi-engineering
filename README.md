@@ -299,12 +299,15 @@ carries three constraints:
 * it is **labeled as generated and never becomes evidence** — it is not written
   to the ledger, and nothing reads it back as input to a decision (INV-006).
 
+It tracks the **whole session**, not just engineering runs: while a run is
+underway it summarises the run, and when idle it summarises the working tree's
+changed files, so edits and commands outside `/engineer` are part of the arc.
+It is **on by default** (the panel's only spend; `PI_PANEL_NARRATOR=0` turns it
+off), and it does not start until you have opened the panel at least once.
+
 Failure is silent: no model, a refused gateway, or a failed summary leaves the
 previous narrative in place with its own timestamp, and the tab says when it was
 last updated rather than pretending to be current.
-
-It is **off by default** — it is the one part of the panel that spends money —
-and it does not start until you have opened the panel at least once.
 
 ### Memory tab
 
@@ -322,7 +325,7 @@ marks its own section and leaves the rest of the panel working.
 | -------- | ------- | ------- |
 | `PI_PANEL_CHORD` | `ctrl+p` | Hotkey to step the keyboard into/out of the panel; `none` disables it |
 | `PI_PANEL_TOGGLE_CHORD` | `ctrl+b` | Hotkey to collapse/uncollapse the whole panel; `none` disables it |
-| `PI_PANEL_NARRATOR` | *off* | Set to `true` to enable the generated session narrative |
+| `PI_PANEL_NARRATOR` | `1` | Generated session narrative (a short prose arc of what the session has worked on, idle work included); `0` disables it |
 
 Two caveats worth knowing. Pi registers commands but not keybindings, so each
 chord is a raw input handler that consumes only its own key. The toggle chord

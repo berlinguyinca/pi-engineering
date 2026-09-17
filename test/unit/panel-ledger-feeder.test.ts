@@ -93,7 +93,7 @@ test("ledger feeder: spend accumulates per model across phases", async () => {
   assert.equal(spend.find((s) => s.model === "haiku-4-5")?.input, 10);
 });
 
-test("ledger feeder: a settled run clears the run view and its spend", async () => {
+test("ledger feeder: a settled run stays visible so its reviews/tokens/session survive", async () => {
   const ledger = freshLedger();
   const wi = await ledger.createWorkItem("add retry", "low", ["/repo"], planner);
   const state = new PanelState();
@@ -101,7 +101,8 @@ test("ledger feeder: a settled run clears the run view and its spend", async () 
 
   feeder.onPhase({ workItemId: wi.id, phase: "implement", model: "opus-5", usage: { input: 1, output: 1, cost: 0 } });
   feeder.onPhase({ workItemId: wi.id, phase: "settled" });
-  assert.equal(state.snapshot.run === undefined, true, "a settled run clears the view");
+  assert.equal(state.snapshot.run?.phase, "settled", "a settled run stays on screen, marked settled");
+  assert.equal(state.snapshot.run?.spend[0]?.input, 1, "spend survives the settle");
 
   // A later run starts from zero rather than inheriting the previous spend.
   const next = await ledger.createWorkItem("second", "low", ["/repo"], planner);

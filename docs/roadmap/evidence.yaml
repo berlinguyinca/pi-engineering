@@ -369,4 +369,42 @@
   findings:
     critical: 0
     high: 0
+- id: dogfood-panel-session-narration
+  milestone: __global__
+  type: dogfood
+  status: pass
+  commit: 4f2b7d7876f6fda79ddb357172cedce253dc33c4
+  generatedAt: 2026-09-17T18:12:24.058Z
+  paths: &a7
+    - src/panel/feeders/LedgerFeeder.ts
+    - extensions/index.ts
+    - test/unit/panel-ledger-feeder.test.ts
+    - test/unit/panel-narrator.test.ts
+    - test/unit/panel-narrator-deltas.test.ts
+  proof: scripts/dogfood-panel-surface.ts + scripts/dogfood-roadmap.ts (both exit
+    0); npm run typecheck; npm run lint; npm test (1154 pass)
+  summary: "Panel tracks the whole session, not just /engineer runs: narrator also
+    summarises idle working-tree changes (on by default), and a settled run
+    stays visible (marked settled) so its Reviews/Tokens/Session survive. Docs
+    corrected (narrator on by default). Dogfooded deterministically + full suite
+    (1154 pass); fresh review 0 critical / 0 high."
+- id: review-panel-session-narration
+  milestone: __global__
+  type: fresh_review
+  status: pass
+  commit: 4f2b7d7876f6fda79ddb357172cedce253dc33c4
+  generatedAt: 2026-09-17T18:12:24.058Z
+  paths: *a7
+  proof: fresh-context review of LedgerFeeder.onPhase (settle keeps the run,
+    marked settled) + extensions/index.ts startNarrator subscription (idle
+    workspace narration, phase-gated); verified bounded spend, later run resets,
+    narrator debounce/gate unchanged; 0 critical / 0 high
+  summary: "Panel tracks the whole session, not just /engineer runs: narrator also
+    summarises idle working-tree changes (on by default), and a settled run
+    stays visible (marked settled) so its Reviews/Tokens/Session survive. Docs
+    corrected (narrator on by default). Dogfooded deterministically + full suite
+    (1154 pass); fresh review 0 critical / 0 high."
+  findings:
+    critical: 0
+    high: 0
 

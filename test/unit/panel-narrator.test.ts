@@ -41,6 +41,18 @@ test("narrator: nothing new means no model call", async () => {
   h.narrator.dispose();
 });
 
+test("narrator: idle work (files, no work item) is summarised too", async () => {
+  // The session narrative tracks the whole session, not just engineering runs:
+  // an observation carrying only changed files must still produce a narrative.
+  const h = harness();
+  assert.equal(await h.narrator.observe({ files: ["src/a.ts", "src/b.ts"] }), true);
+  assert.match(h.state.snapshot.narrative?.text ?? "", /status bar/);
+  // The arc evolves when the idle files change, without any work item.
+  assert.equal(await h.narrator.observe({ files: ["src/a.ts", "src/c.ts"] }), true);
+  assert.equal(h.calls.length, 2);
+  h.narrator.dispose();
+});
+
 test("narrator: it is skipped entirely while a gateway cooldown is active", async () => {
   // The gate is checked BEFORE acquire(): acquire() waits the cooldown out, and
   // that wait is unbounded, so acquiring first would park for minutes and then

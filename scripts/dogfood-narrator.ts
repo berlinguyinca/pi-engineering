@@ -10,8 +10,9 @@ import { isGatewayAdmissionRefusal } from "../src/gateway/signals.ts";
  * narrative"), which means the model path could be completely dead and every
  * test would still pass. Only a live call settles it.
  *
- * Costs one small model call. The narrator is off by default in sessions
- * (PI_PANEL_NARRATOR), so this is the intended way to exercise it.
+ * Costs one small model call. The narrator is ON by default in sessions
+ * (PI_PANEL_NARRATOR, set to 0 to disable); this dogfood is the way to
+ * exercise it in isolation.
  *
  *   node scripts/dogfood-narrator.ts [--verbose]
  */
