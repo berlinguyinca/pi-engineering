@@ -42,9 +42,15 @@ export class LedgerFeeder {
   onPhase(event: RuntimePhaseEvent): void {
     try {
       if (event.phase === "settled") {
-        // Parallel tournament legs and DAG waves each settle, so only the run
-        // actually on display may clear it.
-        if (event.workItemId === this.activeWorkItemId) this.clear();
+        // Keep the finished run on screen so its Reviews/Tokens/Session survive
+        // the settle — the operator wants to keep seeing what the run found and
+        // spent, not have it vanish. A later run replaces it. (Parallel
+        // tournament legs and DAG waves each settle, so only the run actually
+        // on display is marked settled.)
+        if (event.workItemId === this.activeWorkItemId) {
+          this.publish({ workItemId: event.workItemId, phase: "settled", goal: event.goal });
+          this.state.clearError("run");
+        }
         return;
       }
 
@@ -71,12 +77,6 @@ export class LedgerFeeder {
     } catch (err) {
       this.state.noteError("run", err instanceof Error ? err.message : String(err));
     }
-  }
-
-  private clear(): void {
-    this.activeWorkItemId = "";
-    this.spendByModel = new Map();
-    this.state.set({ run: undefined });
   }
 
   private accumulate(model: string, usage: { input: number; output: number; cost: number }): void {
