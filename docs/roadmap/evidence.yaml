@@ -328,4 +328,45 @@
   findings:
     critical: 0
     high: 0
+- id: dogfood-panel-collapse
+  milestone: __global__
+  type: dogfood
+  status: pass
+  commit: 1f2b7e0b1578bcf907bd3aa3e50da9d34457d0af
+  generatedAt: 2026-09-17T17:18:01.907Z
+  paths: &a6
+    - src/panel/
+    - extensions/index.ts
+    - test/unit/panel-controller.test.ts
+    - test/unit/panel-focus-hint.test.ts
+  proof: scripts/dogfood-panel-surface.ts + scripts/dogfood-roadmap.ts (both exit
+    0); npm run typecheck; npm run lint; npm test (1152 pass)
+  summary: Add ctrl+b to collapse/uncollapse the whole engineering panel
+    (PI_PANEL_TOGGLE_CHORD). Keeps ctrl+p = focus-step, escape = release focus.
+    ctrl+b shadows pi's own cursor-left while the extension is active
+    (documented; configurable to none), consistent with the panel's existing
+    ctrl+p shadowing of pi's model-cycle. Dogfooded deterministically (panel
+    surface vs real Theme, roadmap lifecycle) plus full suite (1152 pass);
+    fresh-context review found 0 critical / 0 high.
+- id: review-panel-collapse
+  milestone: __global__
+  type: fresh_review
+  status: pass
+  commit: 1f2b7e0b1578bcf907bd3aa3e50da9d34457d0af
+  generatedAt: 2026-09-17T17:18:01.907Z
+  paths: *a6
+  proof: fresh-context review of src/panel/PanelController.ts + PanelComponent.ts
+    + extensions/index.ts + panel tests; verified toggle() restores focus via
+    handle.hide() on collapse, chords independently configurable to none; 0
+    critical / 0 high
+  summary: Add ctrl+b to collapse/uncollapse the whole engineering panel
+    (PI_PANEL_TOGGLE_CHORD). Keeps ctrl+p = focus-step, escape = release focus.
+    ctrl+b shadows pi's own cursor-left while the extension is active
+    (documented; configurable to none), consistent with the panel's existing
+    ctrl+p shadowing of pi's model-cycle. Dogfooded deterministically (panel
+    surface vs real Theme, roadmap lifecycle) plus full suite (1152 pass);
+    fresh-context review found 0 critical / 0 high.
+  findings:
+    critical: 0
+    high: 0
 
