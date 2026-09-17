@@ -13,12 +13,17 @@
  */
 
 import type { MissionStore } from "./missionStore.ts";
-import type { CompletionVerdict, Mission, RequiredGate } from "./types.ts";
+import type { CompletionVerdict, Mission, OrchestrationTask, RequiredGate } from "./types.ts";
 
 export interface GateEvidence {
   missionId: string;
   validationsPassed: number;
   reviewsCompleted: number;
+  /**
+   * Successful reviews performed by a security reviewer. Counted separately so a
+   * generic reviewer cannot satisfy a `security_review` gate (spec 07).
+   */
+  securityReviewsCompleted: number;
   /** Findings keyed by finding_id with status. */
   findings: Array<{ finding_id: string; severity: string; status: string }>;
 }
@@ -37,7 +42,21 @@ export class CompletionGate {
     const tasks = this.store.listTasks(mission.mission_id);
 
     const running = tasks.filter((t) => ["READY", "RUNNING", "RETRYING", "WAITING", "PENDING"].includes(t.status));
-    const failed = tasks.filter((t) => t.status === "FAILED");
+    // A FAILED task only blocks while it stands. Each repair round creates a NEW
+    // validation / integration / review task, so counting every historical
+    // failure would keep the gate closed even after the repaired work passed,
+    // making the mission unrecoverable. A failure is superseded once a later task
+    // of the same kind and role succeeded.
+    const superseded = (t: OrchestrationTask): boolean =>
+      tasks.some(
+        (o) =>
+          o.task_id !== t.task_id &&
+          o.kind === t.kind &&
+          o.role === t.role &&
+          o.status === "SUCCEEDED" &&
+          o.created_at >= t.created_at,
+      );
+    const failed = tasks.filter((t) => t.status === "FAILED" && !superseded(t));
 
     // Required gates.
     for (const gate of mission.required_gates) {
@@ -55,10 +74,16 @@ export class CompletionGate {
           }
           break;
         case "security_review":
+          // A generic reviewer must not satisfy a security gate.
+          if (evidence.securityReviewsCompleted === 0) {
+            missingGates.push(gate);
+            reasons.push("security_review gate required but no security review completed");
+          }
+          break;
         case "migration_validation":
         case "compatibility_review":
         case "dependency_validation":
-          // These are satisfied when a review/validation of the right role exists.
+          // These are satisfied when a review/validation of the right kind exists.
           if (evidence.reviewsCompleted === 0 && gate !== "migration_validation" && gate !== "dependency_validation") {
             missingGates.push(gate);
             reasons.push(`${gate} gate required but no review evidence exists`);
@@ -105,12 +130,17 @@ export class CompletionGate {
   gather(missionId: string): GateEvidence {
     const executions = this.store.listExecutions(missionId);
     const findings = this.store.listFindings(missionId);
+    const tasks = this.store.listTasks(missionId);
     const validationsPassed = executions.filter((e) => e.backend === "validation" && e.status === "SUCCEEDED").length;
     const reviewsCompleted = executions.filter((e) => e.backend === "review" && e.status === "SUCCEEDED").length;
+    const securityReviewsCompleted = tasks.filter(
+      (t) => t.kind === "review" && t.status === "SUCCEEDED" && t.role.includes("security"),
+    ).length;
     return {
       missionId,
       validationsPassed,
       reviewsCompleted,
+      securityReviewsCompleted,
       findings: findings.map((f) => ({ finding_id: f.finding_id, severity: f.severity, status: f.status })),
     };
   }

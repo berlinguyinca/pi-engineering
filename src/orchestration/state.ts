@@ -15,11 +15,17 @@ const MISSION_TRANSITIONS: Record<MissionStatus, ReadonlyArray<MissionStatus>> =
   CLASSIFYING: ["PLANNING", "READY", "WAITING_FOR_USER", "BLOCKED", "FAILED", "CANCELED"],
   PLANNING: ["READY", "WAITING_FOR_USER", "BLOCKED", "FAILED", "CANCELED"],
   READY: ["EXECUTING", "WAITING_FOR_USER", "BLOCKED", "FAILED", "CANCELED"],
+  // Forward skips along the canonical order are legal when the skipped stage's
+  // gate does not apply: a read-only investigation has no validation/review
+  // task, so it finishes EXECUTING -> FINAL_VALIDATION -> COMPLETE. Without the
+  // skip such a mission dead-ends (observed: `illegal mission transition
+  // EXECUTING -> COMPLETE`).
   EXECUTING: [
     "INTEGRATING",
     "VALIDATING",
     "REVIEWING",
     "REPAIRING",
+    "FINAL_VALIDATION",
     "WAITING_FOR_USER",
     "BLOCKED",
     "CANCELING",
@@ -29,6 +35,7 @@ const MISSION_TRANSITIONS: Record<MissionStatus, ReadonlyArray<MissionStatus>> =
     "VALIDATING",
     "REVIEWING",
     "REPAIRING",
+    "FINAL_VALIDATION",
     "EXECUTING",
     "WAITING_FOR_USER",
     "BLOCKED",
@@ -48,6 +55,7 @@ const MISSION_TRANSITIONS: Record<MissionStatus, ReadonlyArray<MissionStatus>> =
   REVIEWING: ["REPAIRING", "FINAL_VALIDATION", "COMPLETE", "WAITING_FOR_USER", "BLOCKED", "CANCELING", "FAILED"],
   REPAIRING: [
     "EXECUTING",
+    "INTEGRATING",
     "VALIDATING",
     "REVIEWING",
     "FINAL_VALIDATION",

@@ -126,7 +126,10 @@ export class ExecutionBroker {
   private readonly git: GitRepo | null;
   private readonly baseRef: string;
   /** In-flight execution state for cancellation + allocated worktrees. */
-  private readonly active = new Map<string, { abort: AbortController; status: string; worktree: string | null }>();
+  private readonly active = new Map<
+    string,
+    { abort: AbortController; status: string; worktree: string | null; taskId: string }
+  >();
   /** Allocated worktrees, cleaned up when their execution settles. */
   readonly allocatedWorktrees = new Map<string, { path: string; branch: string }>();
   /** Mission-scoped worktrees awaiting integration (merged+cleaned by the integrator). */
@@ -140,11 +143,48 @@ export class ExecutionBroker {
     this.baseRef = opts.baseRef ?? "";
   }
 
+  /**
+   * Cancel one execution through the broker: abort the runner, settle the
+   * execution as CANCELED, and release its worktree. Cancellation MUST go here
+   * rather than poking the store, otherwise the runner keeps going, the worktree
+   * leaks, and the eventual result overwrites CANCELED with SUCCEEDED.
+   */
+  async cancelExecution(executionId: string, taskId?: string): Promise<boolean> {
+    const entry = this.active.get(executionId);
+    if (!entry) return false;
+    entry.abort.abort();
+    this.store.setExecutionStatus(executionId, "CANCELED", { exit_status: "canceled" });
+    const id = taskId ?? entry.taskId;
+    if (id && this.store.getTask(id) && this.store.getTask(id)!.status === "RUNNING") {
+      this.store.transitionTask(id, "CANCELED");
+    }
+    await this.releaseWorktree(executionId);
+    this.active.delete(executionId);
+    return true;
+  }
+
+  /** Cancel the in-flight execution of a task, if any. */
+  async cancelByTask(taskId: string): Promise<boolean> {
+    let canceled = false;
+    for (const [executionId, entry] of [...this.active]) {
+      if (entry.taskId === taskId) {
+        canceled = (await this.cancelExecution(executionId, taskId)) || canceled;
+      }
+    }
+    return canceled;
+  }
+
   /** Allocate an isolated worktree for a mutating, worktree-isolated task. */
   private async allocateWorktree(executionId: string, input: ExecutionRequestInput): Promise<string | null> {
     if (!input.mutatesRepo || input.isolation !== "worktree" || !this.git) return null;
     try {
-      const base = this.baseRef || (await this.git.headCommit());
+      // The mission's declared base_ref wins: a mission planned against commit X
+      // must branch from X. Falling back to a broker-level ref captured earlier
+      // (the runtime's HEAD at open) silently based the worker on a NEWER commit,
+      // which turns a real conflict into a clean merge where the worker's version
+      // wins over the incumbent.
+      const missionBase = this.store.getMission(input.missionId)?.base_ref?.trim();
+      const base = missionBase || this.baseRef || (await this.git.headCommit());
       const branch = `pi-eng-orch-${input.taskId}`;
       const wt = await this.git.createWorktree(base, branch);
       const info = { path: wt.path, branch: wt.branch };
@@ -160,12 +200,77 @@ export class ExecutionBroker {
     }
   }
 
-  private async releaseWorktree(executionId: string): Promise<void> {
+  /**
+   * Commit a finished worker's edits onto its branch. A worktree directory is
+   * removed after the task settles, and uncommitted edits die with it — without
+   * this harvest, a mutating mission can report COMPLETE having changed the
+   * repository not at all. The branch is kept so integration can merge it.
+   */
+  private async harvestWorktree(executionId: string): Promise<void> {
+    const wt = this.allocatedWorktrees.get(executionId);
+    if (!wt || !this.git) return;
+    try {
+      const status = (await this.git.statusIn(wt.path)).trim();
+      if (status.length > 0) await this.git.commitAll(wt.path, `pi-eng: orchestration work for ${executionId}`);
+    } catch {
+      // A harvest failure must not fail the task; integration will simply have
+      // nothing to merge and the mission will not show the change.
+    }
+  }
+
+  private async releaseWorktree(executionId: string, keepBranch = true): Promise<void> {
     const wt = this.allocatedWorktrees.get(executionId);
     if (wt && this.git) {
-      await this.git.removeWorktree({ path: wt.path, branch: wt.branch }).catch(() => {});
+      // Keep the branch: it carries the harvested work until integration merges it.
+      await this.git.removeWorktree({ path: wt.path, branch: wt.branch }, { keepBranch }).catch(() => {});
     }
     this.allocatedWorktrees.delete(executionId);
+  }
+
+  /** True if the execution left RUNNING already (e.g. canceled via the store). */
+  private settledElsewhere(executionId: string): boolean {
+    const ex = this.store.listExecutions().find((e) => e.execution_id === executionId);
+    return !!ex && ex.status !== "RUNNING";
+  }
+
+  /**
+   * Whether a backend is registered for this task kind. A gate task that failed
+   * because nothing can run it is an unavailable capability, not broken work —
+   * spawning an implementer to 'fix' it would burn rounds for nothing.
+   */
+  hasBackend(kind: ExecutionRequestInput["kind"]): boolean {
+    const key = this.backendForKind(kind) as keyof BrokerBackends;
+    return !!this.backends[key];
+  }
+
+  /** Branches allocated for a mission that still await an integration merge. */
+  pendingIntegrations(missionId: string): number {
+    return (this.missionWorktrees.get(missionId) ?? []).length;
+  }
+
+  /**
+   * Files the main checkout changed relative to the mission's base commit.
+   *
+   * This is the invariant behind 'the work landed'. Harvesting a worktree can
+   * fail silently and merging an empty branch is trivially clean, so a green
+   * integration alone does not prove the repository changed. Returns null when
+   * it cannot be determined (no git provider, or the base ref is unknown), in
+   * which case the caller must not treat it as 'nothing landed'.
+   */
+  async changedFilesSinceBase(missionId: string): Promise<string[] | null> {
+    if (!this.git) return null;
+    const base = this.store.getMission(missionId)?.base_ref?.trim();
+    if (!base) return null;
+    try {
+      return await this.git.changedFiles(base, await this.git.headCommit());
+    } catch {
+      return null;
+    }
+  }
+
+  /** Release any worktrees still tracked for a finished mission. */
+  async cleanupMission(missionId: string): Promise<void> {
+    await this.releaseMissionWorktrees(missionId);
   }
 
   /** Remove + clean all mission worktrees (after integration). */
@@ -216,10 +321,7 @@ export class ExecutionBroker {
       backend,
       status: () => this.active.get(execution.execution_id)?.status ?? "PENDING",
       cancel: async () => {
-        this.active.get(execution.execution_id)?.abort.abort();
-        this.store.setExecutionStatus(execution.execution_id, "CANCELED", { exit_status: "canceled" });
-        await this.releaseWorktree(execution.execution_id);
-        this.active.delete(execution.execution_id);
+        await this.cancelExecution(execution.execution_id, input.taskId);
       },
       steer: async (request) => {
         this.store.steerTask(input.taskId, request);
@@ -235,20 +337,36 @@ export class ExecutionBroker {
         if (worktree) this.active.get(execution.execution_id)!.worktree = worktree;
         try {
           const outcome = await this.dispatch(input, backend, execution.execution_id, abort.signal, worktree);
-          this.store.setExecutionStatus(execution.execution_id, "SUCCEEDED", {
-            exit_status: outcome.exitStatus,
-            artifact_refs: outcome.artifactRefs,
-            usage: outcome.usage,
-          });
+          // A cancellation that already settled this execution must not be
+          // overwritten by the runner's late success.
+          if (!this.settledElsewhere(execution.execution_id)) {
+            // Resolution is not success. The completion gate counts SUCCEEDED
+            // executions as validation/review evidence, so recording a failed
+            // validation run as SUCCEEDED would corrupt the gate's primary
+            // evidence source.
+            const succeeded = outcome.exitStatus === "succeeded";
+            this.store.setExecutionStatus(execution.execution_id, succeeded ? "SUCCEEDED" : "FAILED", {
+              exit_status: outcome.exitStatus,
+              artifact_refs: outcome.artifactRefs,
+              usage: outcome.usage,
+            });
+          }
+          // Persist the worker's edits onto its branch before the worktree is
+          // torn down, otherwise integration has nothing to merge.
+          if (input.mutatesRepo && worktree && outcome.exitStatus === "succeeded") {
+            await this.harvestWorktree(execution.execution_id);
+          }
           this.active.delete(execution.execution_id);
           return outcome;
         } catch (err) {
-          if (abort.signal.aborted) {
-            this.store.setExecutionStatus(execution.execution_id, "CANCELED", { exit_status: "canceled" });
-          } else {
-            this.store.setExecutionStatus(execution.execution_id, "FAILED", {
-              exit_status: err instanceof Error ? err.message : String(err),
-            });
+          if (!this.settledElsewhere(execution.execution_id)) {
+            if (abort.signal.aborted) {
+              this.store.setExecutionStatus(execution.execution_id, "CANCELED", { exit_status: "canceled" });
+            } else {
+              this.store.setExecutionStatus(execution.execution_id, "FAILED", {
+                exit_status: err instanceof Error ? err.message : String(err),
+              });
+            }
           }
           this.active.delete(execution.execution_id);
           throw err;
@@ -259,7 +377,7 @@ export class ExecutionBroker {
       },
     };
 
-    this.active.set(execution.execution_id, { abort, status: "PENDING", worktree: null });
+    this.active.set(execution.execution_id, { abort, status: "PENDING", worktree: null, taskId: input.taskId });
     this.store.setExecutionStatus(execution.execution_id, "RUNNING", {});
     this.active.get(execution.execution_id)!.status = "RUNNING";
     return handle;

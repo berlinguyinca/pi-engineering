@@ -142,7 +142,7 @@ Pi Engineering remains the orchestration authority.
 - `EngineeringRuntime.orchestrator` + `EngineeringRuntime.missionStore` are the
   programmatic entry points.
 
-## Worktree isolation + integration
+## Worktree isolation, harvest, and integration
 
 For a task with `isolation=worktree` and `mutates_repo`, the broker allocates a
 dedicated **git worktree** (reusing `GitRepo.createWorktree`/`removeWorktree`)
@@ -151,6 +151,19 @@ broker collects those worker worktrees as handoffs and the real integration
 backend merges each branch into the current checkout sequentially (via
 `GitRepo.mergeBranch`), runs integration checks, then releases the worktrees.
 Merge conflicts surface as a `conflict` outcome that blocks completion.
+
+**Harvest before teardown.** A worktree directory is removed when its execution
+settles, and uncommitted edits die with it. Before teardown the broker commits
+the worker's edits onto the task branch (`harvestWorktree`) and releases the
+worktree with `keepBranch`, so integration has something to merge. Without this,
+a mutating mission could report COMPLETE having changed the repository not at all.
+
+Ordering is therefore `EXECUTING -> INTEGRATING -> VALIDATING -> REVIEWING ->
+FINAL_VALIDATION`: integration runs **before** validation and review, so both
+observe the merged result rather than an untouched tree. Integration is skipped
+when no worktree holds unmerged work (a mission with no git provider edits the
+checkout directly). Repair tasks follow the same path — they are worktree-isolated
+and re-merged before the mandatory re-review.
 
 Reviewer findings from the real backend are normalized from several shapes
 (structured objects, plain strings, JSON strings) into `{severity, summary, …}`

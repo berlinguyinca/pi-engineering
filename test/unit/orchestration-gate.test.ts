@@ -94,4 +94,23 @@ describe("CompletionGate (spec 07)", () => {
     const v = gate.evaluate(store.getMission(m.mission_id)!);
     assert.equal(v.can_complete, false);
   });
+
+  it("a generic reviewer cannot satisfy a security_review gate (spec 07)", () => {
+    const { store, m } = mission(["validation", "independent_review", "security_review"], "high");
+    const gate = new CompletionGate(store);
+    // A generic review + validation succeeded, but no SECURITY review did.
+    const evidence = {
+      missionId: m.mission_id,
+      validationsPassed: 1,
+      reviewsCompleted: 1,
+      securityReviewsCompleted: 0,
+      findings: [],
+    };
+    const v = gate.evaluate(store.getMission(m.mission_id)!, evidence);
+    assert.equal(v.can_complete, false);
+    assert.ok(v.missing_gates.includes("security_review"), JSON.stringify(v.missing_gates));
+    // With a security review the gate is satisfied.
+    const v2 = gate.evaluate(store.getMission(m.mission_id)!, { ...evidence, securityReviewsCompleted: 1 });
+    assert.equal(v2.can_complete, true, JSON.stringify(v2.reasons));
+  });
 });

@@ -14,7 +14,7 @@
  */
 
 import { type SchedulableTask, Scheduler } from "../sched/Scheduler.ts";
-import type { ExecutionBroker, ExecutionRequestInput } from "./broker.ts";
+import type { ExecutionBroker, ExecutionHandle, ExecutionRequestInput } from "./broker.ts";
 import type { MissionStore } from "./missionStore.ts";
 import type { OrchestrationTask, TaskKind, TaskStatus } from "./types.ts";
 
@@ -227,26 +227,45 @@ export class MissionScheduler {
     let attempt = task.attempt;
     while (true) {
       attempt++;
-      const handle = await this.broker.execute({
-        taskId: task.task_id,
-        missionId: task.mission_id,
-        kind: brokerKind(task.kind),
-        role: task.role,
-        objective: task.objective,
-        mutatesRepo: task.mutates_repo,
-        writeDomains: task.write_domains,
-        isolation: task.isolation,
-        modelRequirements: task.execution_requirements,
-      });
-      this.store.transitionTask(task.task_id, "RUNNING", "system", {
-        attempt,
-        assigned_execution_id: handle.executionId,
-      });
+      let handle: ExecutionHandle;
       try {
-        await handle.result();
+        // execute() itself can throw (e.g. no backend registered for the kind).
+        // Left outside the try it escaped the fire-and-forget run as an
+        // unhandled rejection and left the task stuck in READY, which then threw
+        // an illegal READY -> READY transition on the next pass.
+        handle = await this.broker.execute({
+          taskId: task.task_id,
+          missionId: task.mission_id,
+          kind: brokerKind(task.kind),
+          role: task.role,
+          objective: task.objective,
+          mutatesRepo: task.mutates_repo,
+          writeDomains: task.write_domains,
+          isolation: task.isolation,
+          modelRequirements: task.execution_requirements,
+        });
+        this.store.transitionTask(task.task_id, "RUNNING", "system", {
+          attempt,
+          assigned_execution_id: handle.executionId,
+        });
+        const outcome = await handle.result();
+        // A task canceled underneath the runner (constraint steering) is already
+        // CANCELED; CANCELED -> SUCCEEDED is an illegal transition and used to
+        // escape as an unhandled rejection from the fire-and-forget run.
+        if (this.store.getTask(task.task_id)?.status !== "RUNNING") return;
+        // Resolution is not success: backends report failure through exitStatus
+        // without throwing. Treating resolution as success let a failed worker
+        // satisfy the completion gate.
+        if (outcome.exitStatus !== "succeeded") {
+          this.store.transitionTask(task.task_id, "FAILED", "system", {
+            failure_reason: `backend reported ${outcome.exitStatus}`,
+          });
+          return;
+        }
         this.store.transitionTask(task.task_id, "SUCCEEDED");
         return;
       } catch (err) {
+        if (this.store.getTask(task.task_id)?.status === "CANCELED") return;
         const { action, reason } = classifyFailure(err, task);
         if (action === "retry" && attempt < task.max_attempts) {
           this.store.transitionTask(task.task_id, "RETRYING", "system", { attempt });

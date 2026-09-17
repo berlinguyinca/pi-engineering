@@ -19,6 +19,7 @@ import type {
 import { ROLE_BUDGETS, isMachineEvidence } from "../core/types.ts";
 import { GitRepo } from "../git/GitRepo.ts";
 import { Ledger } from "../ledger/Ledger.ts";
+import { workflowMutatesRepo } from "../orchestration/intentRouter.ts";
 import {
   MISSION_SNAPSHOT_FILENAME,
   type MissionSnapshotFile,
@@ -403,21 +404,29 @@ export class EngineeringRuntime {
       git: rt.git,
       cwd: repoRoot,
     });
-    const defaultPlanner: NonNullable<typeof opts.orchestrationPlanner> = async (mission) => [
-      {
-        kind: "agent",
-        role: "implementer",
-        objective: mission.goal,
-        mutates_repo: true,
-        write_domains: ["**"],
-        isolation: "worktree",
-        depends_on: [],
-        priority: 0,
-        execution_requirements: {},
-        max_attempts: 3,
-        failure_policy: "retry",
-      },
-    ];
+    // The default plan honours the routed workflow class. A research or
+    // investigation mission MUST NOT get a repo-mutating worker: mutation is
+    // derived from the workflow, never assumed. (Dogfood caught the planner
+    // hardcoding mutates_repo:true, which let a read-only "why is this failing?"
+    // request write to the repository.)
+    const defaultPlanner: NonNullable<typeof opts.orchestrationPlanner> = async (mission) => {
+      const mutates = workflowMutatesRepo(mission.workflow_class);
+      return [
+        {
+          kind: "agent",
+          role: mutates ? "implementer" : "investigator",
+          objective: mission.goal,
+          mutates_repo: mutates,
+          write_domains: mutates ? ["**"] : [],
+          isolation: mutates ? "worktree" : "none",
+          depends_on: [],
+          priority: 0,
+          execution_requirements: {},
+          max_attempts: 3,
+          failure_policy: "retry",
+        },
+      ];
+    };
     rt.orchestrator = new Orchestrator({
       store: rt.missionStore,
       backends,
