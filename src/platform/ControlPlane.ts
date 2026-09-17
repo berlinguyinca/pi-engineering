@@ -13,6 +13,8 @@
  * re-implemented here.
  */
 
+import type { MissionStore } from "../orchestration/missionStore.ts";
+import type { Execution, Mission, OrchestrationTask } from "../orchestration/types.ts";
 import { type ProjectRegistry, normalizeRemote } from "./ProjectRegistry.ts";
 import type { WorkGraph } from "./WorkGraph.ts";
 import type { EventStoreBackend } from "./eventstore/backend.ts";
@@ -70,12 +72,28 @@ export interface ControlPlaneSnapshot {
     timestamp: string;
     payload: Record<string, unknown>;
   }>;
+  /** Orchestration missions surfaced to the operator (spec 08). */
+  missions: Array<{
+    id: string;
+    title: string;
+    goal: string;
+    workflowClass: string;
+    status: string;
+    riskProfile: string;
+    constraints: string[];
+    acceptanceCriteria: Array<{ criterion: string; status: string }>;
+    requiredGates: string[];
+    tasks: Array<{ id: string; kind: string; role: string; status: string; objective: string }>;
+    executions: Array<{ id: string; backend: string; status: string }>;
+  }>;
   /** High-level health rollup (no chain-of-thought; only observable state). */
   health: {
     projects: number;
     activeRuns: number;
     activeWorkers: number;
     staleWorkers: number;
+    missions: number;
+    activeMissions: number;
     memory: { openviking: boolean; blackhole: boolean };
   };
 }
@@ -84,6 +102,8 @@ export interface ControlPlaneInputs {
   registry: ProjectRegistry;
   graph: WorkGraph;
   store: EventStoreBackend;
+  /** Optional orchestration MissionStore surfaced to the operator. */
+  missionStore?: MissionStore | null;
   /** Optional external status flags reported by the adapter. */
   memoryStatus?: { openviking: boolean; blackhole: boolean };
 }
@@ -96,12 +116,14 @@ export class ControlPlane {
   private readonly registry: ProjectRegistry;
   private readonly graph: WorkGraph;
   private readonly store: EventStoreBackend;
+  private readonly missionStore: MissionStore | null;
   private readonly memoryStatus: { openviking: boolean; blackhole: boolean };
 
   constructor(inputs: ControlPlaneInputs) {
     this.registry = inputs.registry;
     this.graph = inputs.graph;
     this.store = inputs.store;
+    this.missionStore = inputs.missionStore ?? null;
     this.memoryStatus = inputs.memoryStatus ?? { openviking: true, blackhole: true };
   }
 
@@ -172,13 +194,46 @@ export class ControlPlane {
         generation: w.generation,
       })),
       events,
+      missions: this.snapshotMissions(),
       health: {
         projects: this.registry.listProjects().length,
         activeRuns: activeRuns.length,
         activeWorkers: activeWorkers.length,
         staleWorkers: stale.length,
+        missions: this.missionStore?.listMissions().length ?? 0,
+        activeMissions:
+          this.missionStore?.listMissions().filter((m) => !["COMPLETE", "FAILED", "CANCELED"].includes(m.status))
+            .length ?? 0,
         memory: { ...this.memoryStatus },
       },
     };
+  }
+
+  /** Surface orchestration missions/tasks/executions (spec 08 mission panel). */
+  private snapshotMissions(): ControlPlaneSnapshot["missions"] {
+    if (!this.missionStore) return [];
+    return this.missionStore.listMissions().map((m: Mission) => ({
+      id: m.mission_id,
+      title: m.title,
+      goal: m.goal,
+      workflowClass: m.workflow_class,
+      status: m.status,
+      riskProfile: m.risk_profile,
+      constraints: m.constraints,
+      acceptanceCriteria: m.acceptance_criteria.map((c) => ({ criterion: c.criterion, status: c.status })),
+      requiredGates: m.required_gates,
+      tasks: this.missionStore!.listTasks(m.mission_id).map((t: OrchestrationTask) => ({
+        id: t.task_id,
+        kind: t.kind,
+        role: t.role,
+        status: t.status,
+        objective: t.objective,
+      })),
+      executions: this.missionStore!.listExecutions(m.mission_id).map((e: Execution) => ({
+        id: e.execution_id,
+        backend: e.backend,
+        status: e.status,
+      })),
+    }));
   }
 }

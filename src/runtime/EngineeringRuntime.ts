@@ -1,4 +1,4 @@
-import { mkdir } from "node:fs/promises";
+import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { Model } from "@earendil-works/pi-ai/compat";
 import { ArtifactStore } from "../artifacts/ArtifactStore.ts";
@@ -19,7 +19,17 @@ import type {
 import { ROLE_BUDGETS, isMachineEvidence } from "../core/types.ts";
 import { GitRepo } from "../git/GitRepo.ts";
 import { Ledger } from "../ledger/Ledger.ts";
+import {
+  MISSION_SNAPSHOT_FILENAME,
+  type MissionSnapshotFile,
+  buildMissionSnapshotFile,
+} from "../orchestration/missionSnapshot.ts";
+import { MissionStore } from "../orchestration/missionStore.ts";
+import { Orchestrator } from "../orchestration/orchestrator.ts";
+import type { PlanTaskInput } from "../orchestration/orchestrator.ts";
+import { realBackends } from "../orchestration/realBackends.ts";
 import { tasksConflict, topoSort } from "../plan/taskDag.ts";
+import { JsonlEventStore } from "../platform/eventstore/jsonl.ts";
 import { Scheduler } from "../sched/Scheduler.ts";
 import { emitTelemetry } from "../telemetry/sink.ts";
 import { buildCoreTools } from "../tools/coreTools.ts";
@@ -183,6 +193,12 @@ const PHASE_FOR_ROLE: Partial<Record<WorkerRole, RuntimePhaseEvent["phase"]>> = 
  * Emitted best-effort and synchronously: a listener is an observer, never a
  * participant, so a throwing or slow one must not affect an engineering run.
  */
+/**
+ * Opened orchestration event stores by path, so multiple runtimes over one
+ * repo share a single durable store (the JSONL backend is single-instance).
+ */
+const openedOrchestrationStores = new Map<string, JsonlEventStore>();
+
 export interface RuntimePhaseEvent {
   workItemId: string;
   phase: "scout" | "implement" | "verify" | "review" | "settled";
@@ -237,6 +253,14 @@ export interface EngineeringRuntimeOptions {
    * listener are swallowed so status rendering can never fail a run.
    */
   onPhase?: (event: RuntimePhaseEvent) => void;
+  /**
+   * Optional orchestrator planner (spec 06). Defaults to a single implementer
+   * task. Injected so deterministic tests and the extension can supply one.
+   */
+  orchestrationPlanner?: (
+    mission: import("../orchestration/types.ts").Mission,
+    risk: import("../orchestration/types.ts").RiskProfile,
+  ) => Promise<PlanTaskInput[]>;
 }
 
 /**
@@ -251,13 +275,17 @@ export class EngineeringRuntime {
   broker: ContextBroker | null;
   git: GitRepo | null;
   readonly cwd: string;
-  readonly workDir: string;
+  workDir: string;
   readonly worker: WorkerExecutor;
   readonly reviewerWorker: WorkerExecutor | null;
   readonly verifier: VerificationProvider;
   readonly telemetry: Telemetry;
   readonly roadmapComplete: (() => Promise<boolean>) | null;
   blackhole: BlackholeManager | null;
+  /** Orchestration mission store (spec 00 §3) — durable, restart-recoverable. */
+  missionStore: MissionStore | null;
+  /** Orchestrator facade (spec 06) — auto-invokes workflows from intent. */
+  orchestrator: Orchestrator | null;
   private readonly onPhase: ((event: RuntimePhaseEvent) => void) | null;
   /** Work item whose phases are currently being reported (status surfaces only). */
   private currentWorkItemId = "";
@@ -279,6 +307,28 @@ export class EngineeringRuntime {
       () => undefined,
     );
     return run;
+  }
+
+  /**
+   * Publish the versioned mission snapshot file the PI WEB plugin reads
+   * (spec 08). Writes `<workDir>/orchestration-snapshot.json` and returns the
+   * snapshot. Never throws; callers may fire-and-forget it after any mission
+   * mutation.
+   */
+  async publishMissionSnapshot(): Promise<MissionSnapshotFile | null> {
+    if (!this.missionStore) return null;
+    try {
+      const missions = this.missionStore.listMissions().map((m) => ({
+        mission: m,
+        tasks: this.missionStore!.listTasks(m.mission_id),
+        findings: this.missionStore!.listFindings(m.mission_id),
+      }));
+      const snapshot = buildMissionSnapshotFile(missions);
+      await writeFile(join(this.workDir, MISSION_SNAPSHOT_FILENAME), JSON.stringify(snapshot, null, 2), "utf8");
+      return snapshot;
+    } catch {
+      return null;
+    }
   }
 
   /** Notify status surfaces of pipeline progress. Never throws into the run. */
@@ -316,6 +366,8 @@ export class EngineeringRuntime {
     this.artifacts = undefined as unknown as ArtifactStore;
     this.broker = null;
     this.git = null;
+    this.missionStore = null;
+    this.orchestrator = null;
   }
 
   static async open(opts: EngineeringRuntimeOptions): Promise<EngineeringRuntime> {
@@ -331,6 +383,56 @@ export class EngineeringRuntime {
     rt.artifacts = artifacts;
     rt.broker = broker;
     rt.git = git;
+    rt.workDir = workDir;
+    // Orchestration: durable mission store + orchestrator wired to the existing
+    // worker/verifier/git primitives. Restart-recoverable via the JSONL store.
+    // Multiple runtimes over the same repo share one orchestration store. The
+    // JSONL backend is single-instance per process, so reuse an already-open
+    // store for the same path (a second runtime must not open the same file).
+    const orchestrationPath = join(workDir, "orchestration.jsonl");
+    let orchestrationBackend = openedOrchestrationStores.get(orchestrationPath);
+    if (!orchestrationBackend) {
+      orchestrationBackend = await JsonlEventStore.open(orchestrationPath);
+      openedOrchestrationStores.set(orchestrationPath, orchestrationBackend);
+    }
+    rt.missionStore = MissionStore.open(orchestrationBackend);
+    const backends = realBackends({
+      worker: rt.worker,
+      verifier: rt.verifier,
+      artifacts: rt.artifacts,
+      git: rt.git,
+      cwd: repoRoot,
+    });
+    const defaultPlanner: NonNullable<typeof opts.orchestrationPlanner> = async (mission) => [
+      {
+        kind: "agent",
+        role: "implementer",
+        objective: mission.goal,
+        mutates_repo: true,
+        write_domains: ["**"],
+        isolation: "worktree",
+        depends_on: [],
+        priority: 0,
+        execution_requirements: {},
+        max_attempts: 3,
+        failure_policy: "retry",
+      },
+    ];
+    rt.orchestrator = new Orchestrator({
+      store: rt.missionStore,
+      backends,
+      planner: opts.orchestrationPlanner ?? defaultPlanner,
+      parentSessionId: null,
+      git: rt.git,
+      baseRef: rt.git ? await rt.git.headCommit() : "",
+      onPhase: (mission, phase) => {
+        const mapped: RuntimePhaseEvent["phase"] =
+          phase === "complete" ? "settled" : phase === "classified" ? "scout" : "implement";
+        rt.emitPhase({ workItemId: mission.mission_id, goal: mission.goal, phase: mapped });
+        // Keep the PI WEB mission snapshot fresh as missions progress.
+        void rt.publishMissionSnapshot();
+      },
+    });
     if (opts.blackhole) rt.blackhole = await BlackholeManager.open({ ...opts.blackhole, ledger: rt.ledger });
     // Bind the semantic tools (ledger_read, repo_search, ...) to THIS runtime so
     // worker sessions get the tools their prompts require and always address the

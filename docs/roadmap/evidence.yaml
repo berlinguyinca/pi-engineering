@@ -407,4 +407,49 @@
   findings:
     critical: 0
     high: 0
+- id: dogfood-orchestration
+  milestone: __global__
+  type: dogfood
+  status: pass
+  commit: b592d49dcab6c2fdb49c68624b922015e14e5bd0
+  generatedAt: 2026-09-17T19:03:28.542Z
+  paths: &a8
+    - src/orchestration/
+    - extensions/index.ts
+    - src/tools/coreTools.ts
+    - src/runtime/EngineeringRuntime.ts
+    - src/platform/ControlPlane.ts
+    - src/index.ts
+  proof: scripts/dogfood-panel-surface.ts + scripts/dogfood-roadmap.ts (exit 0);
+    tsc --noEmit; biome check; smoke-load.ts OK; full suite 1212 pass / 0 fail
+  summary: "Mission orchestration vertical slice (spec
+    pi-engineering-orchestration) reusing runtime primitives: intent router,
+    mission store, DAG scheduler, execution broker with worktree isolation,
+    deterministic completion gate, PI WEB mission snapshot + /mission tool +
+    auto-invoke. Fixed pi.on smoke-load crash. Dogfooded + 1212 tests pass;
+    fresh review 0 critical / 0 high."
+- id: review-orchestration
+  milestone: __global__
+  type: fresh_review
+  status: pass
+  commit: b592d49dcab6c2fdb49c68624b922015e14e5bd0
+  generatedAt: 2026-09-17T19:03:28.542Z
+  paths: *a8
+  proof: "fresh-context review of orchestration subsystem (src/orchestration/:
+    orchestrator, broker, scheduler, completionGate, realBackends, missionStore,
+    intentRouter) + extension auto-invoke + mission tool + runtime wiring. Fixed
+    one critical (unguarded pi.on crashed smoke-load; wrapped in typeof guard).
+    Verified deterministic completion gate (validation+independent review
+    required, blocking findings block), worktree isolation for mutating tasks,
+    DI-backed testability, DAG concurrency with write-domain conflict
+    serialization. 0 critical / 0 high remaining."
+  summary: "Mission orchestration vertical slice (spec
+    pi-engineering-orchestration) reusing runtime primitives: intent router,
+    mission store, DAG scheduler, execution broker with worktree isolation,
+    deterministic completion gate, PI WEB mission snapshot + /mission tool +
+    auto-invoke. Fixed pi.on smoke-load crash. Dogfooded + 1212 tests pass;
+    fresh review 0 critical / 0 high."
+  findings:
+    critical: 0
+    high: 0
 

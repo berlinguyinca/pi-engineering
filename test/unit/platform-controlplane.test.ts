@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import { MissionStore } from "../../src/orchestration/missionStore.ts";
+import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 import { Platform } from "../../src/platform/index.ts";
 
 describe("ControlPlane (Pi Web adapter surface)", () => {
@@ -42,5 +44,36 @@ describe("ControlPlane (Pi Web adapter surface)", () => {
     const json = JSON.stringify(platform.controlPlane.snapshot());
     assert.ok(!json.includes("reasoning"));
     assert.ok(!json.includes("chain"));
+  });
+
+  it("surfaces orchestration missions/tasks/executions for PI WEB (spec 08)", () => {
+    const missionStore = MissionStore.open(JsonlEventStore.inMemory());
+    const m = missionStore.createMission({
+      title: "Add a health endpoint",
+      goal: "Add a health endpoint",
+      user_request: "Add a health endpoint",
+      repository: ".",
+      base_ref: "abc",
+      risk_profile: "low",
+      workflow_class: "engineering_review",
+    });
+    missionStore.transitionMission(m.mission_id, "CLASSIFYING");
+    missionStore.transitionMission(m.mission_id, "PLANNING");
+    missionStore.transitionMission(m.mission_id, "READY");
+    missionStore.transitionMission(m.mission_id, "EXECUTING");
+    const t = missionStore.createTask({ mission_id: m.mission_id, kind: "agent", role: "implementer", objective: "x" });
+    const ex = missionStore.createExecution({ task_id: t.task_id, backend: "agent", mission_id: m.mission_id });
+    missionStore.setExecutionStatus(ex.execution_id, "RUNNING");
+
+    const platform = new Platform({ missionStore });
+    const snap = platform.controlPlane.snapshot();
+    assert.equal(snap.missions.length, 1);
+    assert.equal(snap.missions[0]!.title, "Add a health endpoint");
+    assert.equal(snap.missions[0]!.status, "EXECUTING");
+    assert.equal(snap.missions[0]!.tasks.length, 1);
+    assert.equal(snap.missions[0]!.tasks[0]!.role, "implementer");
+    assert.equal(snap.missions[0]!.executions.length, 1);
+    assert.equal(snap.health.missions, 1);
+    assert.equal(snap.health.activeMissions, 1);
   });
 });

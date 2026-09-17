@@ -34,6 +34,8 @@ import { guardFeedFor } from "../src/guard/streamText.ts";
 import { ModelHealthProvider } from "../src/models/health.ts";
 import { defaultModelsPath, providerBaseUrl, readModelsConfig } from "../src/models/modelsConfig.ts";
 import { refreshProviderModels } from "../src/models/refresh.ts";
+import { classifyIntent, workflowForIntent } from "../src/orchestration/intentRouter.ts";
+import type { Intent, WorkflowClass } from "../src/orchestration/types.ts";
 import { PanelController } from "../src/panel/PanelController.ts";
 import { PanelState } from "../src/panel/PanelState.ts";
 import { readCommitContent, readDiffContent, readFileContent } from "../src/panel/content.ts";
@@ -293,6 +295,8 @@ async function resolveServices(cwd: string): Promise<CoreServices | null> {
     ledger: rt.ledger,
     artifacts: rt.artifacts,
     broker: rt.broker,
+    orchestrator: rt.orchestrator,
+    baseRef: () => rt.git?.headCommit().catch(() => "") ?? "",
     currentWorkItemId: () => {
       const w = rt.ledger.listWorkItems().at(-1);
       return w ? w.id : null;
@@ -326,6 +330,56 @@ export default function (pi: ExtensionAPI) {
   // Semantic tools resolved against the runtime for the calling cwd.
   for (const tool of buildCoreTools(resolveServices)) {
     pi.registerTool(tool);
+  }
+
+  // ─── Automatic engineering/review workflow invocation (spec 06) ─────────
+  // Normal-language intent must auto-invoke the orchestration pipeline without
+  // a slash command. We classify the user's prompt with the deterministic
+  // IntentRouter and, when it expresses engineering/review intent, inject a
+  // message directing the model to use the `mission` semantic tool — the
+  // parent session stays the long-lived orchestrator, and the mission tool
+  // does the heavy lifting. This is a directive, not enforcement: the runtime
+  // completion gate is what actually enforces validation/review/completion.
+  // Ordered from passive (conversation/research) to fully-enforced
+  // (engineering_review). Anything at/above `engineering` (incl. `review` and
+  // `security_sensitive`) auto-invokes the mission pipeline.
+  const WORKFLOW_ORDER: WorkflowClass[] = [
+    "conversation",
+    "research",
+    "investigation",
+    "engineering",
+    "review",
+    "engineering_review",
+    "security_sensitive",
+  ];
+  const workflowRank = (w: WorkflowClass) => WORKFLOW_ORDER.indexOf(w);
+  const AUTO_INVOKE_THRESHOLD = workflowRank("engineering");
+  let lastAutoInvoked: { prompt: string; at: number } | null = null;
+  // The auto-invoke handler uses pi.on(), which is only available in a real pi
+  // session (not in the smoke-test stub). Guard accordingly.
+  if (typeof pi.on === "function") {
+    pi.on("before_agent_start", async (event, ctx) => {
+      const prompt = (event.prompt ?? "").trim();
+      if (!prompt || /^\/\w/.test(prompt)) return; // slash commands already route explicitly
+      // Avoid re-injecting on harness auto-retries of the same prompt.
+      if (lastAutoInvoked && lastAutoInvoked.prompt === prompt && Date.now() - lastAutoInvoked.at < 30_000) return;
+      let intent: Intent[] = [];
+      try {
+        intent = classifyIntent(prompt).intent;
+      } catch {
+        return; // classification must never break the turn
+      }
+      const workflow = workflowForIntent(intent);
+      if (workflowRank(workflow) < AUTO_INVOKE_THRESHOLD) return; // conversation/research only
+      lastAutoInvoked = { prompt, at: Date.now() };
+      return {
+        message: {
+          customType: "pi-engineering:auto-invoke",
+          content: `[pi-engineering] This request expresses engineering intent (workflow: ${workflow}). Act as the long-lived orchestrator: call the \`mission\` tool with this request as the mission request so the runtime plans, executes, validates, reviews, and completes the work as a mission. Do not implement the change directly in this session; delegate it through the mission pipeline.`,
+          display: true,
+        },
+      };
+    });
   }
 
   // ─── Generation Guard: interactive session (spec §6, §12) ────────────────
@@ -1336,6 +1390,65 @@ ${RECOVERY_PROMPT}`;
         activePanel = createPanelController({ ui }, opened.plumbing, opened.rt);
       }
       activePanel.toggle();
+    },
+  });
+
+  // ─── Mission orchestration (spec pi-engineering-orchestration) ─────────
+  // Normal-language intent auto-invokes the engineering workflow through the
+  // Orchestrator. `/mission` is an optional power-user control; correctness
+  // never depends on it (the semantic tool + runtime gate enforce policy).
+  pi.registerCommand("mission", {
+    description:
+      "Run the orchestration mission pipeline for a normal-language request (intent -> plan -> execute -> validate -> review -> complete).",
+    handler: async (args, ctx) => {
+      if (!args.trim()) {
+        ctx.ui.notify("/mission <normal-language request>", "error");
+        return;
+      }
+      const rt = await getRuntime(ctx);
+      if (!rt.orchestrator) {
+        ctx.ui.notify("Orchestrator not initialized for this directory.", "error");
+        return;
+      }
+      const baseRef = (await rt.git?.headCommit().catch(() => "")) ?? "";
+      ctx.ui.notify("Routing intent and running orchestration mission...", "info");
+      const result = await rt.orchestrator.orchestrate(args.trim(), {
+        repository: rt.cwd,
+        baseRef,
+        mutationRequested: true,
+      });
+      const m = result.mission;
+      const lines = [
+        `Mission ${m.mission_id} [${m.status}] workflow=${m.workflow_class} risk=${m.risk_profile}`,
+        `Intent: ${result.intent.intent.join(", ")} (confidence ${result.intent.confidence.toFixed(2)})`,
+        `Required gates: ${m.required_gates.join(", ") || "none"}`,
+        `Tasks: ${rt.missionStore?.listTasks(m.mission_id).length ?? 0}`,
+        `Completion: ${result.completed ? "PASSED" : `BLOCKED — ${result.failureReason ?? ""}`}`,
+      ];
+      ctx.ui.notify(lines.join("\n"), result.completed ? "info" : "error");
+    },
+  });
+
+  pi.registerCommand("mission-status", {
+    description: "Show orchestration mission/task/execution status.",
+    handler: async (_args, ctx) => {
+      const rt = await getRuntime(ctx);
+      const store = rt.missionStore;
+      if (!store) {
+        ctx.ui.notify("No orchestration store.", "error");
+        return;
+      }
+      const missions = store.listMissions();
+      if (missions.length === 0) {
+        ctx.ui.notify("No missions yet. Run /mission <request>.", "info");
+        return;
+      }
+      const lines = missions.slice(-10).map((m) => {
+        const tasks = store.listTasks(m.mission_id);
+        const done = tasks.filter((t) => t.status === "SUCCEEDED").length;
+        return `- ${m.mission_id} [${m.status}] ${m.workflow_class} — ${m.title} (${done}/${tasks.length} tasks)`;
+      });
+      ctx.ui.notify(lines.join("\n"), "info");
     },
   });
 

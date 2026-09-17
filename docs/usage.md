@@ -29,10 +29,29 @@ The pipeline runs **asynchronously** with progress notifications:
    and the ledger records it. Material findings spawn a fix round (a child
    candidate) instead.
 
+## Orchestration missions (automatic, no slash command required)
+
+Normal-language intent automatically invokes the orchestration workflow through
+the semantic `mission` tool. An optional `/mission <request>` command runs the
+same pipeline explicitly (correctness never depends on it). See
+[`docs/orchestration.md`](orchestration.md) for the full design.
+
+```bash
+/mission Add a health endpoint
+/mission Find out why login fails
+/mission-status
+```
+
+The pipeline routes intent, creates a durable **mission**, plans/executes
+workers, runs validation, launches a fresh independent reviewer, and enforces
+the deterministic completion gate — no `/engineer` or `/review` needed.
+
 ## Individual commands
 
 | Command        | Effect                                                        |
 | -------------- | ------------------------------------------------------------- |
+| `/mission G`   | Orchestration mission pipeline (intent → plan → execute → validate → review → complete). |
+| `/mission-status` | Show orchestration mission/task/execution status.          |
 | `/engineer G`  | Full adaptive workflow (scout → implement → verify → review). |
 | `/tournament G [n]` | Candidate tournament: n independent implementations, verify+review each, promote the deterministic winner (default 3, `--parallel` opt-in). |
 | `/plan G`      | Decompose `G` into a dependency-aware task DAG (recorded in the ledger). |
