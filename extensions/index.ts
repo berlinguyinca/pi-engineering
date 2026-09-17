@@ -355,28 +355,32 @@ export default function (pi: ExtensionAPI) {
   const workflowRank = (w: WorkflowClass) => WORKFLOW_ORDER.indexOf(w);
   const AUTO_INVOKE_THRESHOLD = workflowRank("engineering");
   let lastAutoInvoked: { prompt: string; at: number } | null = null;
-  pi.on("before_agent_start", async (event, ctx) => {
-    const prompt = (event.prompt ?? "").trim();
-    if (!prompt || /^\/\w/.test(prompt)) return; // slash commands already route explicitly
-    // Avoid re-injecting on harness auto-retries of the same prompt.
-    if (lastAutoInvoked && lastAutoInvoked.prompt === prompt && Date.now() - lastAutoInvoked.at < 30_000) return;
-    let intent: Intent[] = [];
-    try {
-      intent = classifyIntent(prompt).intent;
-    } catch {
-      return; // classification must never break the turn
-    }
-    const workflow = workflowForIntent(intent);
-    if (workflowRank(workflow) < AUTO_INVOKE_THRESHOLD) return; // conversation/research only
-    lastAutoInvoked = { prompt, at: Date.now() };
-    return {
-      message: {
-        customType: "pi-engineering:auto-invoke",
-        content: `[pi-engineering] This request expresses engineering intent (workflow: ${workflow}). Act as the long-lived orchestrator: call the \`mission\` tool with this request as the mission request so the runtime plans, executes, validates, reviews, and completes the work as a mission. Do not implement the change directly in this session; delegate it through the mission pipeline.`,
-        display: true,
-      },
-    };
-  });
+  // The auto-invoke handler uses pi.on(), which is only available in a real pi
+  // session (not in the smoke-test stub). Guard accordingly.
+  if (typeof pi.on === "function") {
+    pi.on("before_agent_start", async (event, ctx) => {
+      const prompt = (event.prompt ?? "").trim();
+      if (!prompt || /^\/\w/.test(prompt)) return; // slash commands already route explicitly
+      // Avoid re-injecting on harness auto-retries of the same prompt.
+      if (lastAutoInvoked && lastAutoInvoked.prompt === prompt && Date.now() - lastAutoInvoked.at < 30_000) return;
+      let intent: Intent[] = [];
+      try {
+        intent = classifyIntent(prompt).intent;
+      } catch {
+        return; // classification must never break the turn
+      }
+      const workflow = workflowForIntent(intent);
+      if (workflowRank(workflow) < AUTO_INVOKE_THRESHOLD) return; // conversation/research only
+      lastAutoInvoked = { prompt, at: Date.now() };
+      return {
+        message: {
+          customType: "pi-engineering:auto-invoke",
+          content: `[pi-engineering] This request expresses engineering intent (workflow: ${workflow}). Act as the long-lived orchestrator: call the \`mission\` tool with this request as the mission request so the runtime plans, executes, validates, reviews, and completes the work as a mission. Do not implement the change directly in this session; delegate it through the mission pipeline.`,
+          display: true,
+        },
+      };
+    });
+  }
 
   // ─── Generation Guard: interactive session (spec §6, §12) ────────────────
   // Monitors streaming output in the main pi session for degeneration loops.
