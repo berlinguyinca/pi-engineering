@@ -88,7 +88,10 @@ Illegal transitions are rejected by `src/orchestration/state.ts`.
 ## Broker backends
 
 `ExecutionBroker.execute(task)` returns an `ExecutionHandle` with
-`result()`/`cancel()`/`steer()`. Backend selection:
+`result()`/`cancel()`/`steer()`. For a task with `isolation=worktree` and
+`mutates_repo`, the broker allocates a dedicated **git worktree** (reusing
+`GitRepo.createWorktree`/`removeWorktree`) and passes its path to the backend;
+non-overlapping parallel mutators therefore edit isolated checkouts.
 
 | Task kind  | Backend (real)                          |
 | ---------- | --------------------------------------- |

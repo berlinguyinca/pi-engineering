@@ -21,7 +21,7 @@ Maps `docs/specs/pi-engineering-orchestration/**` requirements to reuse / modify
 | 3 | Unified execution broker | **new** | `src/orchestration/broker.ts` |
 | 3 | Cancellation + steering | **new** | broker handles |
 | 4 | DAG scheduler + write domains + concurrency + retry | **new** | `src/orchestration/scheduler.ts` |
-| 5 | Worktree lifecycle + integrator role | **new** (+ reuse GitRepo) | `src/orchestration/broker.ts`, `integrator.ts` |
+| 5 | Worktree lifecycle + integrator role | **new** (+ reuse GitRepo) | `src/orchestration/broker.ts` (`allocateWorktree`/`releaseWorktree`), `integrator.ts` |
 | 6 | Automatic engineering workflow (no slash cmd) | **new** | `src/orchestration/orchestrator.ts`, extension hook |
 | 7 | Review/repair/completion gates | **new** | `src/orchestration/completionGate.ts`, `review.ts` |
 | 8 | PI WEB mission/task/execution surface | **modify** | `src/platform/ControlPlane.ts` snapshot + extension |
