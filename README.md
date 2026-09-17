@@ -82,6 +82,39 @@ human summary. See `docs/roadmap/roadmap.yaml` and
 `docs/specs/pi-engineering-verifiable-roadmap-completion-spec.md`. The roadmap
 engine is also exported as a public API from `src/index.ts`.
 
+## Automatic engineering lifecycle & capability-aware model router
+
+The runtime ships an **automatic engineering harness** that owns the lifecycle
+for ordinary engineering turns — no `/review`, `/verify`, or reviewer command
+is needed from the parent model.
+
+- **Automatic activation** — when the agent settles after a turn, the harness
+  runs one lifecycle pass: classify → implement → verify → independent +
+  specialist review → gate. Non-engineering chat with no repository change
+  stays passive.
+- **Harness-owned completion** — the parent model cannot self-declare success.
+  The completion gate decides, and the harness records the completion
+  timestamp. When the gate fails, the harness injects a remediation follow-up.
+- **Capability-aware routing** — models are auto-discovered from configured
+  providers and routed to each role by capability, availability, observed
+  performance, and cost, with overrides and fallback. Every routing decision
+  is fully explainable (candidates, rejects, rationale).
+- **Independent & specialist review** — reviewers are never the implementing
+  model; specialist reviewers are triggered by change category.
+- **Verification & spec verification** — declared commands (package scripts,
+  CI, AGENTS.md, Makefile) are run as evidence; specs are verified when
+  referenced.
+- **Vision routing** — UI/visual work or attached images route to a
+  vision-capable model or force a hand-off.
+- **Destructive-operation gating** — SSH, remote administration, Ansible,
+  deployment, package installs, and server starts are preserved but gated
+  behind risk-aware approval; irreversible operations (recursive deletes,
+  DROP/TRUNCATE, force-push, `terraform destroy`) are blocked or
+  approval-gated — never blanket-disabled.
+
+Implementation spec:
+[docs/specs/pi-automatic-engineering-lifecycle-model-router-spec.md](docs/specs/pi-automatic-engineering-lifecycle-model-router-spec.md).
+
 ## Semantic tools
 
 `ledger_read`, `ledger_claim`, `artifact_read`, `repo_search`, `symbol`,

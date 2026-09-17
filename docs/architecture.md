@@ -27,6 +27,9 @@ src/context/ContextBroker.ts bounded task-context package (repo map + git grep -
 src/verify/Verifier.ts       CommandVerifier + VerificationProvider abstraction
 src/workers/                 role prompts, worker_result tool, executors
 src/tools/coreTools.ts       semantic tools bound per-cwd
+src/capability/              model discovery, capability modeling, observed perf, routing
+src/lifecycle/               automatic lifecycle controller + harness, gates, vision,
+                            destructive-op gating, telemetry, persistence
 ```
 
 ## Durable state
@@ -104,6 +107,27 @@ abstraction permits alternate backends later.
    - run a fresh independent reviewer; collect material findings;
    - if clean (or last round) → controlled-merge + promote; else fix round.
 5. Mark the work item `COMPLETED`/`FAILED` and return a compact `EngineerReport`.
+
+## Automatic lifecycle & model router (`src/lifecycle/`, `src/capability/`)
+
+The lifecycle harness activates automatically on `agent_settled` and runs one
+pass (classify → implement → verify → review → gate). Completion is
+harness-owned; the parent model cannot self-declare success. The model router
+discovers models from configured providers and routes each role by capability,
+availability, observed performance, and cost with overrides and fallback.
+
+- `src/capability/registry.ts` — `ModelCapabilityRegistry`, penalties, saturation.
+- `src/capability/router.ts` — `RoleRouter` (async select/fallback), explainable decisions.
+- `src/lifecycle/controller.ts` — `LifecycleController`, the automatic pass.
+- `src/lifecycle/harness.ts` — `LifecycleHarness`, Pi event wiring + `/engineering` command.
+- `src/lifecycle/gate.ts` — `evaluateGate`, completion gating.
+- `src/lifecycle/destructive.ts` — command risk classification and gating.
+- `src/lifecycle/vision.ts` — vision routing, cache, hand-off.
+- `src/lifecycle/store.ts` — run persistence under `.pi-eng/lifecycle/`.
+- `src/lifecycle/telemetry.ts` — lifecycle + admission telemetry.
+
+State persists under `<repoRoot>/.pi-eng/lifecycle/`. See
+`docs/specs/pi-automatic-engineering-lifecycle-model-router-spec.md`.
 
 ## Extension surface
 
