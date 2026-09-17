@@ -173,4 +173,65 @@
   findings:
     critical: 0
     high: 0
+- id: dogfood-inferweave-context
+  milestone: __global__
+  type: dogfood
+  status: pass
+  commit: 16fd3eea8afdf74aea0599517a6fa416159c9420
+  generatedAt: 2026-09-17T01:57:36.448Z
+  paths: &a3
+    - src/context/
+    - src/status/
+    - extensions/index.ts
+    - test/unit/context-capability.test.ts
+    - test/unit/context-client.test.ts
+    - test/unit/context-provider.test.ts
+    - test/unit/context-status.test.ts
+    - test/integration/extension-context-switch-guard.test.ts
+    - scripts/dogfood-inferweave-context.ts
+    - scripts/fresh-review-inferweave-context.ts
+  proof: scripts/dogfood-inferweave-context.ts — six phases against a real
+    node:http gateway (both base-URL spellings, 304 revalidation, stale-if-error
+    on a destroyed socket, the 128K floor, the switch planner), exit 0
+  summary: "InferWeave dynamic context integration: capability client
+    (single-flight shared refresh, ETag/304, stale-if-error, bounded cache),
+    provider (guaranteed-routable -> contextWindow, advertised output ->
+    maxTokens, one base URL with /v1 exactly once, safe/unsafe overrides), usage
+    planner (compact/reject/none on model switch), and the status-bar ctx
+    segment with the model-switch guard. Dogfood proves it end to end against a
+    real HTTP gateway; the fresh-context review found no critical/high and its
+    six medium/low findings (stale footer window across a switch to an unknown
+    model, untrimmed override fields, the guard silently disabled with the
+    status bar off, a 200-with-no-fields wiping last-known-good, unbounded
+    cache) are fixed, each with a regression test. Not covered: live-fleet
+    shadow validation (needs the node gateway rollout), and the provider's
+    per-model maps remain unbounded like the gateway's listing (the client cache
+    is bounded at 1024)."
+- id: review-inferweave-context
+  milestone: __global__
+  type: fresh_review
+  status: pass
+  commit: 16fd3eea8afdf74aea0599517a6fa416159c9420
+  generatedAt: 2026-09-17T01:57:36.448Z
+  paths: *a3
+  proof: scripts/fresh-review-inferweave-context.ts context — fresh-context
+    reviewer with no inherited reasoning; 0 critical / 0 high; 2 medium + 4 low,
+    every one fixed with a regression test in the same commit
+  summary: "InferWeave dynamic context integration: capability client
+    (single-flight shared refresh, ETag/304, stale-if-error, bounded cache),
+    provider (guaranteed-routable -> contextWindow, advertised output ->
+    maxTokens, one base URL with /v1 exactly once, safe/unsafe overrides), usage
+    planner (compact/reject/none on model switch), and the status-bar ctx
+    segment with the model-switch guard. Dogfood proves it end to end against a
+    real HTTP gateway; the fresh-context review found no critical/high and its
+    six medium/low findings (stale footer window across a switch to an unknown
+    model, untrimmed override fields, the guard silently disabled with the
+    status bar off, a 200-with-no-fields wiping last-known-good, unbounded
+    cache) are fixed, each with a regression test. Not covered: live-fleet
+    shadow validation (needs the node gateway rollout), and the provider's
+    per-model maps remain unbounded like the gateway's listing (the client cache
+    is bounded at 1024)."
+  findings:
+    critical: 0
+    high: 0
 

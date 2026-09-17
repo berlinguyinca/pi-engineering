@@ -76,8 +76,21 @@ export interface HarnessStatusState {
   task?: TaskState;
   /** Why the runtime is waiting, when it is. */
   wait?: WaitState;
+  /**
+   * Context window accounting for the active model: what the session occupies
+   * and the window the capability layer resolved for it (never the largest
+   * window some backend happens to have). Rendered as `ctx 143k/262k 55%`.
+   */
+  context?: ContextWindowStatus;
   /** Live throughput telemetry. */
   throughput: ThroughputState;
+}
+
+export interface ContextWindowStatus {
+  usedTokens: number;
+  windowTokens: number;
+  /** Set when the window came from a stale or overridden capability. */
+  note?: string;
 }
 
 /** Schema for future subprocess/subagent telemetry contribution. */

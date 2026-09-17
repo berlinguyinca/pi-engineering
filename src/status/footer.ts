@@ -78,6 +78,12 @@ export interface FooterControllerOptions {
    * keyboard.
    */
   panelState?: () => PanelState | undefined;
+  /**
+   * Resolve the context window for a model id from the capability layer. Called
+   * on model switch so the reading follows the model that is actually selected
+   * instead of showing the window of the model the session started with.
+   */
+  capabilityWindow?: (modelId: string | undefined) => { windowTokens: number; note?: string } | undefined;
 }
 
 export class FooterController {
@@ -87,6 +93,12 @@ export class FooterController {
   private readonly status: StatusState;
   private readonly throughput: ThroughputTracker;
   private readonly git: GitContextProvider;
+  private readonly capabilityWindow?: (
+    modelId: string | undefined,
+  ) => { windowTokens: number; note?: string } | undefined;
+  /** Window currently shown; kept so usage updates do not need the capability layer. */
+  private contextWindowTokens = 0;
+  private contextNote: string | undefined;
 
   private disposed = false;
   private renderRequest: (() => void) | undefined;
@@ -114,6 +126,7 @@ export class FooterController {
       estimateCharsPerToken: opts.config.estimateCharsPerToken,
       estimateBatchChars: opts.config.estimateBatchChars,
     });
+    this.capabilityWindow = opts.capabilityWindow;
     this.git = new GitContextProvider({ now: this.now, ttlMs: opts.config.gitCacheTtlMs });
     this.status = new StatusState({
       cwd: opts.ctx.cwd,
@@ -173,11 +186,16 @@ export class FooterController {
   }
 
   /** Model switch: rebind the model and reset TPS (no stale rate from a prior model). */
-  onModelSelect(model: { provider?: string; id?: string } | undefined): void {
+  onModelSelect(model: { provider?: string; id?: string; contextWindow?: number } | undefined): void {
     if (this.disposed) return;
     const m = modelInfo(model);
     this.sessionModel = m.id;
     this.throughput.reset();
+    // The window must follow the model: a 1M -> 128K switch that keeps showing
+    // 1M is how a session walks into an impossible request. When the capability
+    // layer does not know the new model, fall back to Pi's own registry window
+    // for it (or clear) — never to the previous model's window.
+    this.applyCapabilityWindow(m.id, model?.contextWindow);
     this.status.set({
       model: m.id,
       provider: m.provider,
@@ -269,6 +287,53 @@ export class FooterController {
       this.status.set({ wait: undefined });
       this.stopWaitTick();
     }
+    this.requestRender();
+  }
+
+  /** Publish the session's current context usage (tokens) for the active model. */
+  setContextUsage(usedTokens: number, windowTokens?: number): void {
+    if (this.disposed) return;
+    if (windowTokens !== undefined && windowTokens > 0) {
+      this.contextWindowTokens = windowTokens;
+      this.contextNote = undefined;
+    }
+    if (this.contextWindowTokens <= 0) return;
+    this.status.set({
+      context: { usedTokens, windowTokens: this.contextWindowTokens, note: this.contextNote },
+    });
+    this.requestRender();
+  }
+
+  /** Publish the capability-resolved window for the active model. */
+  setCapabilityWindow(windowTokens: number, note?: string): void {
+    if (this.disposed) return;
+    this.contextWindowTokens = windowTokens;
+    this.contextNote = note;
+    const used = this.status.snapshot.context?.usedTokens ?? 0;
+    this.status.set({ context: { usedTokens: used, windowTokens, note } });
+    this.requestRender();
+  }
+
+  private applyCapabilityWindow(modelId: string | undefined, registryWindow?: number): void {
+    try {
+      const resolved = this.capabilityWindow?.(modelId);
+      if (resolved && resolved.windowTokens > 0) {
+        this.setCapabilityWindow(resolved.windowTokens, resolved.note);
+        return;
+      }
+    } catch {
+      // A capability lookup must never break the footer.
+    }
+    // No capability for this model. Carrying the previous model's window would
+    // show a number that is not the window Pi enforces for the current model.
+    if (registryWindow && registryWindow > 0) {
+      this.setCapabilityWindow(registryWindow);
+      return;
+    }
+    this.contextWindowTokens = 0;
+    this.contextNote = undefined;
+    const used = this.status.snapshot.context?.usedTokens ?? 0;
+    this.status.set({ context: { usedTokens: used, windowTokens: 0, note: undefined } });
     this.requestRender();
   }
 
