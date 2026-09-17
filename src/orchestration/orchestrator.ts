@@ -273,6 +273,11 @@ export class Orchestrator {
       verdict = this.gate.evaluate(this.store.getMission(mission.mission_id)!);
     }
 
+    // The mission is finished either way; drop any mission-scoped worktree
+    // bookkeeping so it cannot accumulate for tasks that never reach an
+    // integration dispatch (e.g. repair tasks).
+    await this.broker.cleanupMission(mission.mission_id);
+
     const finalMission = this.store.getMission(mission.mission_id)!;
     if (verdict.can_complete) {
       // COMPLETE is only legal from REVIEWING / FINAL_VALIDATION. A mission with
@@ -422,10 +427,11 @@ export class Orchestrator {
           recommended_action: String(f.recommended_action ?? ""),
         });
       }
-      this.store.transitionTask(taskId, "SUCCEEDED");
+      // A task canceled underneath us (steering) must not be rewritten.
+      if (this.store.getTask(taskId)?.status === "RUNNING") this.store.transitionTask(taskId, "SUCCEEDED");
       return true;
     } catch (err) {
-      this.store.transitionTask(taskId, "FAILED");
+      if (this.store.getTask(taskId)?.status === "RUNNING") this.store.transitionTask(taskId, "FAILED");
       return false;
     }
   }
@@ -442,11 +448,11 @@ export class Orchestrator {
       if (t.status === "READY" || t.status === "RUNNING") {
         this.store.steerTask(t.task_id, `constraint added: ${constraint}`);
         if (t.status === "RUNNING") {
-          const ex = this.store.listExecutions(missionId, t.task_id).at(-1);
-          if (ex) {
-            this.store.setExecutionStatus(ex.execution_id, "CANCELED", { exit_status: "steered by constraint" });
-            this.store.transitionTask(t.task_id, "CANCELED");
-          }
+          // Cancel THROUGH the broker so the runner is aborted and its worktree
+          // released. Cancelling by poking the store left the runner running,
+          // leaked the worktree, and let the late result overwrite CANCELED with
+          // SUCCEEDED (and threw CANCELED -> SUCCEEDED in the scheduler).
+          await this.broker.cancelByTask(t.task_id);
         }
       }
     }

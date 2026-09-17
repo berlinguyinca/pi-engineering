@@ -126,7 +126,10 @@ export class ExecutionBroker {
   private readonly git: GitRepo | null;
   private readonly baseRef: string;
   /** In-flight execution state for cancellation + allocated worktrees. */
-  private readonly active = new Map<string, { abort: AbortController; status: string; worktree: string | null }>();
+  private readonly active = new Map<
+    string,
+    { abort: AbortController; status: string; worktree: string | null; taskId: string }
+  >();
   /** Allocated worktrees, cleaned up when their execution settles. */
   readonly allocatedWorktrees = new Map<string, { path: string; branch: string }>();
   /** Mission-scoped worktrees awaiting integration (merged+cleaned by the integrator). */
@@ -138,6 +141,37 @@ export class ExecutionBroker {
     this.defaultTimeoutMs = opts.defaultTimeoutMs ?? 10 * 60_000;
     this.git = opts.git ?? null;
     this.baseRef = opts.baseRef ?? "";
+  }
+
+  /**
+   * Cancel one execution through the broker: abort the runner, settle the
+   * execution as CANCELED, and release its worktree. Cancellation MUST go here
+   * rather than poking the store, otherwise the runner keeps going, the worktree
+   * leaks, and the eventual result overwrites CANCELED with SUCCEEDED.
+   */
+  async cancelExecution(executionId: string, taskId?: string): Promise<boolean> {
+    const entry = this.active.get(executionId);
+    if (!entry) return false;
+    entry.abort.abort();
+    this.store.setExecutionStatus(executionId, "CANCELED", { exit_status: "canceled" });
+    const id = taskId ?? entry.taskId;
+    if (id && this.store.getTask(id) && this.store.getTask(id)!.status === "RUNNING") {
+      this.store.transitionTask(id, "CANCELED");
+    }
+    await this.releaseWorktree(executionId);
+    this.active.delete(executionId);
+    return true;
+  }
+
+  /** Cancel the in-flight execution of a task, if any. */
+  async cancelByTask(taskId: string): Promise<boolean> {
+    let canceled = false;
+    for (const [executionId, entry] of [...this.active]) {
+      if (entry.taskId === taskId) {
+        canceled = (await this.cancelExecution(executionId, taskId)) || canceled;
+      }
+    }
+    return canceled;
   }
 
   /** Allocate an isolated worktree for a mutating, worktree-isolated task. */
@@ -166,6 +200,17 @@ export class ExecutionBroker {
       await this.git.removeWorktree({ path: wt.path, branch: wt.branch }).catch(() => {});
     }
     this.allocatedWorktrees.delete(executionId);
+  }
+
+  /** True if the execution left RUNNING already (e.g. canceled via the store). */
+  private settledElsewhere(executionId: string): boolean {
+    const ex = this.store.listExecutions().find((e) => e.execution_id === executionId);
+    return !!ex && ex.status !== "RUNNING";
+  }
+
+  /** Release any worktrees still tracked for a finished mission. */
+  async cleanupMission(missionId: string): Promise<void> {
+    await this.releaseMissionWorktrees(missionId);
   }
 
   /** Remove + clean all mission worktrees (after integration). */
@@ -216,10 +261,7 @@ export class ExecutionBroker {
       backend,
       status: () => this.active.get(execution.execution_id)?.status ?? "PENDING",
       cancel: async () => {
-        this.active.get(execution.execution_id)?.abort.abort();
-        this.store.setExecutionStatus(execution.execution_id, "CANCELED", { exit_status: "canceled" });
-        await this.releaseWorktree(execution.execution_id);
-        this.active.delete(execution.execution_id);
+        await this.cancelExecution(execution.execution_id, input.taskId);
       },
       steer: async (request) => {
         this.store.steerTask(input.taskId, request);
@@ -235,20 +277,26 @@ export class ExecutionBroker {
         if (worktree) this.active.get(execution.execution_id)!.worktree = worktree;
         try {
           const outcome = await this.dispatch(input, backend, execution.execution_id, abort.signal, worktree);
-          this.store.setExecutionStatus(execution.execution_id, "SUCCEEDED", {
-            exit_status: outcome.exitStatus,
-            artifact_refs: outcome.artifactRefs,
-            usage: outcome.usage,
-          });
+          // A cancellation that already settled this execution must not be
+          // overwritten by the runner's late success.
+          if (!this.settledElsewhere(execution.execution_id)) {
+            this.store.setExecutionStatus(execution.execution_id, "SUCCEEDED", {
+              exit_status: outcome.exitStatus,
+              artifact_refs: outcome.artifactRefs,
+              usage: outcome.usage,
+            });
+          }
           this.active.delete(execution.execution_id);
           return outcome;
         } catch (err) {
-          if (abort.signal.aborted) {
-            this.store.setExecutionStatus(execution.execution_id, "CANCELED", { exit_status: "canceled" });
-          } else {
-            this.store.setExecutionStatus(execution.execution_id, "FAILED", {
-              exit_status: err instanceof Error ? err.message : String(err),
-            });
+          if (!this.settledElsewhere(execution.execution_id)) {
+            if (abort.signal.aborted) {
+              this.store.setExecutionStatus(execution.execution_id, "CANCELED", { exit_status: "canceled" });
+            } else {
+              this.store.setExecutionStatus(execution.execution_id, "FAILED", {
+                exit_status: err instanceof Error ? err.message : String(err),
+              });
+            }
           }
           this.active.delete(execution.execution_id);
           throw err;
@@ -259,7 +307,7 @@ export class ExecutionBroker {
       },
     };
 
-    this.active.set(execution.execution_id, { abort, status: "PENDING", worktree: null });
+    this.active.set(execution.execution_id, { abort, status: "PENDING", worktree: null, taskId: input.taskId });
     this.store.setExecutionStatus(execution.execution_id, "RUNNING", {});
     this.active.get(execution.execution_id)!.status = "RUNNING";
     return handle;

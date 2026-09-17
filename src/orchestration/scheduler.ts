@@ -244,9 +244,15 @@ export class MissionScheduler {
       });
       try {
         await handle.result();
-        this.store.transitionTask(task.task_id, "SUCCEEDED");
+        // A task canceled underneath the runner (constraint steering) is already
+        // CANCELED; CANCELED -> SUCCEEDED is an illegal transition and used to
+        // escape as an unhandled rejection from the fire-and-forget run.
+        if (this.store.getTask(task.task_id)?.status === "RUNNING") {
+          this.store.transitionTask(task.task_id, "SUCCEEDED");
+        }
         return;
       } catch (err) {
+        if (this.store.getTask(task.task_id)?.status === "CANCELED") return;
         const { action, reason } = classifyFailure(err, task);
         if (action === "retry" && attempt < task.max_attempts) {
           this.store.transitionTask(task.task_id, "RETRYING", "system", { attempt });

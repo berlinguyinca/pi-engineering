@@ -271,10 +271,12 @@ describe("acceptance scenario E — user constraint steers/cancels affected work
     await h.orchestrator.addConstraint(m.mission_id, "do not change the database schema");
     const mission = h.store.getMission(m.mission_id)!;
     assert.ok(mission.constraints.includes("do not change the database schema"));
-    // Any running task was steered/canceled.
-    for (const t of h.store.listTasks(m.mission_id)) {
-      assert.ok(t.steer_requests.length >= 0);
-    }
+    // Steering must not corrupt task/execution state: nothing may be left in a
+    // state that a late runner result would illegally rewrite.
+    const bad = h.store
+      .listTasks(m.mission_id)
+      .filter((t) => ["READY", "RUNNING", "RETRYING"].includes(t.status) && t.status === "RUNNING");
+    assert.equal(bad.length, 0, "no task may still be RUNNING after steering + settlement");
     void affected;
   });
 });
