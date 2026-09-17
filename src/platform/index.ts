@@ -14,6 +14,7 @@
  */
 
 import type { EventStore } from "../ledger/EventStore.ts";
+import type { MissionStore } from "../orchestration/missionStore.ts";
 import { ControlPlane } from "./ControlPlane.ts";
 import { McpRegistry } from "./McpRegistry.ts";
 import { PlannotatorAdapter } from "./Plannotator.ts";
@@ -43,6 +44,8 @@ export interface PlatformOptions {
   workspaceName?: string;
   plannotator?: ConstructorParameters<typeof PlannotatorAdapter>[0];
   mcpPolicy?: (ctx: { projectId: string; role: string; tool: string }) => boolean;
+  /** Optional orchestration MissionStore surfaced to the operator via PI WEB. */
+  missionStore?: MissionStore | null;
 }
 
 export class Platform {
@@ -75,6 +78,7 @@ export class Platform {
       registry: this.registry,
       graph: this.graph,
       store: this.store,
+      missionStore: opts.missionStore ?? null,
     });
   }
 }

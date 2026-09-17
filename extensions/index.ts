@@ -293,6 +293,8 @@ async function resolveServices(cwd: string): Promise<CoreServices | null> {
     ledger: rt.ledger,
     artifacts: rt.artifacts,
     broker: rt.broker,
+    orchestrator: rt.orchestrator,
+    baseRef: () => rt.git?.headCommit().catch(() => "") ?? "",
     currentWorkItemId: () => {
       const w = rt.ledger.listWorkItems().at(-1);
       return w ? w.id : null;
@@ -1327,6 +1329,65 @@ ${RECOVERY_PROMPT}`;
         activePanel = createPanelController({ ui }, opened.plumbing, opened.rt);
       }
       activePanel.toggle();
+    },
+  });
+
+  // ─── Mission orchestration (spec pi-engineering-orchestration) ─────────
+  // Normal-language intent auto-invokes the engineering workflow through the
+  // Orchestrator. `/mission` is an optional power-user control; correctness
+  // never depends on it (the semantic tool + runtime gate enforce policy).
+  pi.registerCommand("mission", {
+    description:
+      "Run the orchestration mission pipeline for a normal-language request (intent -> plan -> execute -> validate -> review -> complete).",
+    handler: async (args, ctx) => {
+      if (!args.trim()) {
+        ctx.ui.notify("/mission <normal-language request>", "error");
+        return;
+      }
+      const rt = await getRuntime(ctx);
+      if (!rt.orchestrator) {
+        ctx.ui.notify("Orchestrator not initialized for this directory.", "error");
+        return;
+      }
+      const baseRef = (await rt.git?.headCommit().catch(() => "")) ?? "";
+      ctx.ui.notify("Routing intent and running orchestration mission...", "info");
+      const result = await rt.orchestrator.orchestrate(args.trim(), {
+        repository: rt.cwd,
+        baseRef,
+        mutationRequested: true,
+      });
+      const m = result.mission;
+      const lines = [
+        `Mission ${m.mission_id} [${m.status}] workflow=${m.workflow_class} risk=${m.risk_profile}`,
+        `Intent: ${result.intent.intent.join(", ")} (confidence ${result.intent.confidence.toFixed(2)})`,
+        `Required gates: ${m.required_gates.join(", ") || "none"}`,
+        `Tasks: ${rt.missionStore?.listTasks(m.mission_id).length ?? 0}`,
+        `Completion: ${result.completed ? "PASSED" : `BLOCKED — ${result.failureReason ?? ""}`}`,
+      ];
+      ctx.ui.notify(lines.join("\n"), result.completed ? "info" : "error");
+    },
+  });
+
+  pi.registerCommand("mission-status", {
+    description: "Show orchestration mission/task/execution status.",
+    handler: async (_args, ctx) => {
+      const rt = await getRuntime(ctx);
+      const store = rt.missionStore;
+      if (!store) {
+        ctx.ui.notify("No orchestration store.", "error");
+        return;
+      }
+      const missions = store.listMissions();
+      if (missions.length === 0) {
+        ctx.ui.notify("No missions yet. Run /mission <request>.", "info");
+        return;
+      }
+      const lines = missions.slice(-10).map((m) => {
+        const tasks = store.listTasks(m.mission_id);
+        const done = tasks.filter((t) => t.status === "SUCCEEDED").length;
+        return `- ${m.mission_id} [${m.status}] ${m.workflow_class} — ${m.title} (${done}/${tasks.length} tasks)`;
+      });
+      ctx.ui.notify(lines.join("\n"), "info");
     },
   });
 

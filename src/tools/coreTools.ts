@@ -4,6 +4,7 @@ import type { ArtifactStore } from "../artifacts/ArtifactStore.ts";
 import type { ContextBroker } from "../context/ContextBroker.ts";
 import { type Actor, isMachineEvidence } from "../core/types.ts";
 import type { Ledger } from "../ledger/Ledger.ts";
+import type { Orchestrator } from "../orchestration/orchestrator.ts";
 
 /** Shared services bound to the current repository's runtime. */
 export interface CoreServices {
@@ -12,6 +13,10 @@ export interface CoreServices {
   broker: ContextBroker | null;
   currentWorkItemId: () => string | null;
   actor: () => Actor;
+  /** Optional orchestrator for automatic intent-driven missions (spec 06). */
+  orchestrator?: Orchestrator | null;
+  /** Resolve the current repo base ref. */
+  baseRef?: () => Promise<string> | string;
 }
 
 /**
@@ -266,5 +271,47 @@ export function buildCoreTools(
     },
   });
 
-  return [ledgerRead, ledgerClaim, artifactRead, repoSearch, symbol, testsFor];
+  const mission = defineTool({
+    name: "mission",
+    label: "Mission",
+    description:
+      "Run the orchestration mission pipeline for a normal-language engineering request: route intent, plan, execute workers, validate, fresh-review, and gate completion. Use this for implement/fix/refactor/investigate requests so the engineering workflow runs automatically.",
+    parameters: Type.Object({
+      request: Type.String({ description: "The normal-language request (e.g. 'Add a health endpoint')." }),
+      mutate: Type.Optional(
+        Type.Boolean({
+          description: "Whether the request mutates repository source (default true for implement/fix).",
+        }),
+      ),
+      constraints: Type.Optional(Type.Array(Type.String({ description: "Constraints to apply" }))),
+    }),
+    async execute(_id, params, _sig, _onUpdate, ctx) {
+      const services = await servicesFor(ctx.cwd);
+      if (!services?.orchestrator)
+        return {
+          content: [{ type: "text", text: "Orchestrator not initialized for this directory." }],
+          details: {},
+        };
+      const request = String(params.request);
+      const baseRef = typeof services.baseRef === "function" ? await services.baseRef() : "";
+      const result = await services.orchestrator.orchestrate(request, {
+        repository: ctx.cwd,
+        baseRef,
+        constraints: (params.constraints as string[] | undefined) ?? [],
+        mutationRequested: params.mutate ?? true,
+      });
+      const m = result.mission;
+      const lines = [
+        `Mission ${m.mission_id} [${m.status}] workflow=${m.workflow_class}`,
+        `Intent: ${result.intent.intent.join(", ")} | required gates: ${m.required_gates.join(", ") || "none"}`,
+        result.completed ? `Completed: all gates passed.` : `Not completed: ${result.failureReason ?? "gates unmet"}.`,
+      ];
+      return {
+        content: [{ type: "text", text: lines.join("\n") }],
+        details: { missionId: m.mission_id, status: m.status },
+      };
+    },
+  });
+
+  return [ledgerRead, ledgerClaim, artifactRead, repoSearch, symbol, testsFor, mission];
 }
