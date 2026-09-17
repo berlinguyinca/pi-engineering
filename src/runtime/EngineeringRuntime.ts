@@ -1,4 +1,4 @@
-import { mkdir } from "node:fs/promises";
+import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { Model } from "@earendil-works/pi-ai/compat";
 import { ArtifactStore } from "../artifacts/ArtifactStore.ts";
@@ -19,6 +19,11 @@ import type {
 import { ROLE_BUDGETS, isMachineEvidence } from "../core/types.ts";
 import { GitRepo } from "../git/GitRepo.ts";
 import { Ledger } from "../ledger/Ledger.ts";
+import {
+  MISSION_SNAPSHOT_FILENAME,
+  type MissionSnapshotFile,
+  buildMissionSnapshotFile,
+} from "../orchestration/missionSnapshot.ts";
 import { MissionStore } from "../orchestration/missionStore.ts";
 import { Orchestrator } from "../orchestration/orchestrator.ts";
 import type { PlanTaskInput } from "../orchestration/orchestrator.ts";
@@ -270,7 +275,7 @@ export class EngineeringRuntime {
   broker: ContextBroker | null;
   git: GitRepo | null;
   readonly cwd: string;
-  readonly workDir: string;
+  workDir: string;
   readonly worker: WorkerExecutor;
   readonly reviewerWorker: WorkerExecutor | null;
   readonly verifier: VerificationProvider;
@@ -302,6 +307,28 @@ export class EngineeringRuntime {
       () => undefined,
     );
     return run;
+  }
+
+  /**
+   * Publish the versioned mission snapshot file the PI WEB plugin reads
+   * (spec 08). Writes `<workDir>/orchestration-snapshot.json` and returns the
+   * snapshot. Never throws; callers may fire-and-forget it after any mission
+   * mutation.
+   */
+  async publishMissionSnapshot(): Promise<MissionSnapshotFile | null> {
+    if (!this.missionStore) return null;
+    try {
+      const missions = this.missionStore.listMissions().map((m) => ({
+        mission: m,
+        tasks: this.missionStore!.listTasks(m.mission_id),
+        findings: this.missionStore!.listFindings(m.mission_id),
+      }));
+      const snapshot = buildMissionSnapshotFile(missions);
+      await writeFile(join(this.workDir, MISSION_SNAPSHOT_FILENAME), JSON.stringify(snapshot, null, 2), "utf8");
+      return snapshot;
+    } catch {
+      return null;
+    }
   }
 
   /** Notify status surfaces of pipeline progress. Never throws into the run. */
@@ -356,6 +383,7 @@ export class EngineeringRuntime {
     rt.artifacts = artifacts;
     rt.broker = broker;
     rt.git = git;
+    rt.workDir = workDir;
     // Orchestration: durable mission store + orchestrator wired to the existing
     // worker/verifier/git primitives. Restart-recoverable via the JSONL store.
     // Multiple runtimes over the same repo share one orchestration store. The
@@ -401,6 +429,8 @@ export class EngineeringRuntime {
         const mapped: RuntimePhaseEvent["phase"] =
           phase === "complete" ? "settled" : phase === "classified" ? "scout" : "implement";
         rt.emitPhase({ workItemId: mission.mission_id, goal: mission.goal, phase: mapped });
+        // Keep the PI WEB mission snapshot fresh as missions progress.
+        void rt.publishMissionSnapshot();
       },
     });
     if (opts.blackhole) rt.blackhole = await BlackholeManager.open({ ...opts.blackhole, ledger: rt.ledger });

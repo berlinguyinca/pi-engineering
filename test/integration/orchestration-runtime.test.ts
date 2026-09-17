@@ -159,6 +159,28 @@ describe("orchestration via real EngineeringRuntime (acceptance scenarios)", () 
     );
   });
 
+  it("publishes the versioned mission snapshot file the PI WEB plugin reads (spec 08)", async () => {
+    const fx = await makeFixtureRepo();
+    fixtures.push(fx);
+    const rt = await openRuntime(fx.root);
+    const baseRef = await rt.git!.headCommit();
+    await rt.orchestrator!.orchestrate("Add a health endpoint", {
+      repository: rt.cwd,
+      baseRef,
+      mutationRequested: true,
+    });
+    const snap = await rt.publishMissionSnapshot();
+    assert.ok(snap);
+    assert.equal(snap.contractVersion, 1);
+    assert.equal(snap.missions.length, 1);
+    // The file exists on disk where the browser plugin reads it.
+    const { readFile } = await import("node:fs/promises");
+    const onDisk = JSON.parse(await readFile(`${rt.workDir}/orchestration-snapshot.json`, "utf8")) as {
+      missions: Array<{ status: string }>;
+    };
+    assert.equal(onDisk.missions[0]!.status, "COMPLETE");
+  });
+
   after(async () => {
     for (const f of fixtures) await f.cleanup();
   });
