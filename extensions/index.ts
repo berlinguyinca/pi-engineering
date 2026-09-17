@@ -1045,7 +1045,12 @@ ${RECOVERY_PROMPT}`;
   // the ledger's record of the run, falling back to the working tree when idle.
   // Pi registers commands but not keybindings, so the chord is a raw input
   // handler that consumes only its own key.
+  // Two chords: `ctrl+p` steps the keyboard into and out of the panel for
+  // navigation; `ctrl+b` collapses and uncollapses the whole panel (the same
+  // thing `/panel` does). Both are raw input handlers that consume only their
+  // own key. `ctrl+b` is deliberately not one of pi's default keybindings.
   const panelChord = process.env.PI_PANEL_CHORD ?? "ctrl+p";
+  const panelToggleChord = process.env.PI_PANEL_TOGGLE_CHORD ?? "ctrl+b";
 
   /** The slice of Pi's session UI the panel needs. */
   interface PanelSessionUi {
@@ -1203,6 +1208,7 @@ ${RECOVERY_PROMPT}`;
       state: plumbing.state,
       ui: ctx.ui as never,
       chord: panelChord,
+      toggleChord: panelToggleChord,
       layout: panelLayoutStore.load(),
       // The patch carries width/tab/expansion; open/closed is the controller's,
       // and is persisted separately when the panel is opened or closed.
@@ -1271,7 +1277,7 @@ ${RECOVERY_PROMPT}`;
       // ── The panel is shown by default, and does not take the keyboard ────
       // It is registered `nonCapturing` (pi-tui OverlayOptions), so it is on
       // screen without owning input. `ctrl+p` steps into it and back out;
-      // `/panel` hides and shows it.
+      // `ctrl+b` (or `/panel`) collapses and uncollapses it.
       //
       // The first attempt at this shipped without `nonCapturing` and made pi
       // accept no typing at all, because `ui.custom()`'s own doc comment says

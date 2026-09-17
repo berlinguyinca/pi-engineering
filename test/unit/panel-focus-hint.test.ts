@@ -23,20 +23,32 @@ function seeded(): PanelState {
   return state;
 }
 
-function build(opts: { focused?: boolean; chord?: string; height?: number } = {}): PanelComponent {
+function build(
+  opts: { focused?: boolean; chord?: string; toggleChord?: string; height?: number } = {},
+): PanelComponent {
   return new PanelComponent({
     state: seeded(),
     requestRender: () => {},
     fillHeight: () => opts.height ?? 20,
     ...(opts.chord === undefined ? { chord: "ctrl+p" } : { chord: opts.chord }),
+    ...(opts.toggleChord === undefined ? { toggleChord: "ctrl+b" } : { toggleChord: opts.toggleChord }),
     focused: () => opts.focused === true,
   });
 }
 
-test("hint: an unfocused panel names the chord that steps into it", () => {
+test("hint: an unfocused panel names the chords that step in and hide it", () => {
   const component = build();
   const lines = component.render(60);
   assert.match(lines[lines.length - 1] ?? "", /ctrl\+p to navigate/);
+  assert.match(lines[lines.length - 1] ?? "", /ctrl\+b hide/);
+  component.dispose();
+});
+
+test("hint: a disabled toggle chord is left out of the hint", () => {
+  const component = build({ toggleChord: "none" });
+  const last = component.render(60).at(-1) ?? "";
+  assert.match(last, /ctrl\+p to navigate/);
+  assert.ok(!last.includes("hide"), "no toggle chord, nothing to name");
   component.dispose();
 });
 

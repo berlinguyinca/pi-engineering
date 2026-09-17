@@ -227,8 +227,10 @@ saturated gateway.
 
 ## Engineering panel
 
-`/panel`, or `ctrl+p`, toggles a right-anchored overlay showing what the runtime
-is doing — and what it did:
+A right-anchored overlay shows what the runtime is doing — and what it did.
+It is **on by default** and does not take the keyboard: `ctrl+p` steps the
+keyboard into and out of the panel for navigation, while `ctrl+b` (or `/panel`)
+collapses and uncollapses the whole overlay:
 
 ```
 ┌─ ENGINEERING ───────────┐
@@ -257,12 +259,15 @@ the candidate's changed files, review findings with the **role and model that
 produced them**, and token spend grouped by model. With no run active it shows
 the git working tree and your session's context usage, so it is never empty.
 
-Keys: `↑`/`↓` move, `→`/`enter` expands a section or opens a file, `←`
-collapses, `<`/`>` resize, `/` searches, `n`/`N` step matches, `y` copies the
-selected row and `Y` the visible body, `esc` closes a file view, then a search,
-then the panel. Opening a file shows a **bounded** view — a candidate diff is
-read lazily by artifact URI, a working-tree file from disk, both capped rather
-than loaded whole, and neither is inlined into model context.
+Keys (with the panel focused, via `ctrl+p`): `↑`/`↓` move, `→`/`enter` expands
+a section or opens a file, `←` collapses a section, `<`/`>` resize, `/`
+searches, `n`/`N` step matches, `y` copies the selected row and `Y` the visible
+body, `esc` releases the keyboard back to the prompt (the panel stays visible).
+Outside the panel, `ctrl+p` steps the keyboard into it and `ctrl+b` collapses
+or uncollapses the whole overlay. Opening a file shows a **bounded** view — a
+candidate diff is read lazily by artifact URI, a working-tree file from disk,
+both capped rather than loaded whole, and neither is inlined into model
+context.
 
 Search is smartcase (a lowercase query is case-insensitive; any uppercase makes
 it exact) and matches literally, so `config.ts` means what you typed.
@@ -315,15 +320,18 @@ marks its own section and leaves the rest of the panel working.
 
 | Variable | Default | Meaning |
 | -------- | ------- | ------- |
-| `PI_PANEL_CHORD` | `ctrl+p` | Hotkey to toggle the panel; `none` disables it |
+| `PI_PANEL_CHORD` | `ctrl+p` | Hotkey to step the keyboard into/out of the panel; `none` disables it |
+| `PI_PANEL_TOGGLE_CHORD` | `ctrl+b` | Hotkey to collapse/uncollapse the whole panel; `none` disables it |
 | `PI_PANEL_NARRATOR` | *off* | Set to `true` to enable the generated session narrative |
 
-Two caveats worth knowing. Pi registers commands but not keybindings, so the
-chord is a raw input handler that consumes only its own key — set it to `none`
-if it collides with something you use. And **clicking rows needs fullscreen TUI
-mode** (`--tui-mode fullscreen`): in regular mode the terminal owns its
-scrollback and pointer input is never delivered, so the keyboard is the
-contract and the mouse is a bonus.
+Two caveats worth knowing. Pi registers commands but not keybindings, so each
+chord is a raw input handler that consumes only its own key. The toggle chord
+is active even while you type, so it shadows pi's own `ctrl+b` (move cursor
+left); if you use that, set `PI_PANEL_TOGGLE_CHORD=none` (or to another chord)
+and rely on `/panel`. And **clicking rows needs fullscreen TUI mode**
+(`--tui-mode fullscreen`): in regular mode the terminal owns its scrollback and
+pointer input is never delivered, so the keyboard is the contract and the mouse
+is a bonus.
 
 ## Live status bar
 

@@ -17,7 +17,17 @@ import type { RowPayload } from "./tree.ts";
 export const MIN_TERMINAL_COLUMNS = 100;
 /** Floor for the overlay's own width. */
 export const MIN_PANEL_COLUMNS = 36;
+/** The chord that steps the keyboard into and out of the panel. */
 export const DEFAULT_CHORD = "ctrl+p";
+/**
+ * The chord that collapses and uncollapses the whole panel.
+ *
+ * Distinct from `DEFAULT_CHORD`, which steps the keyboard into and out of the
+ * panel without hiding it. `ctrl+b` is the conventional "toggle the sidebar"
+ * binding and is not among pi's own default keybindings, so it does not shadow
+ * anything the operator already relies on.
+ */
+export const DEFAULT_TOGGLE_CHORD = "ctrl+b";
 /**
  * Rows left free above and below the panel.
  *
@@ -74,8 +84,10 @@ interface PanelUi {
 export interface PanelControllerOptions {
   state: PanelState;
   ui: PanelUi;
-  /** Hotkey, e.g. "ctrl+p". Pass "none" to disable. */
+  /** Hotkey that steps the keyboard into and out of the panel, e.g. "ctrl+p". Pass "none" to disable. */
   chord?: string;
+  /** Hotkey that collapses/uncollapses the whole panel, e.g. "ctrl+b". Pass "none" to disable. */
+  toggleChord?: string;
   /** Called when the panel is opened, so feeders can refresh. */
   onOpen?: () => void;
   /** Resolve a selected row into something to display. */
@@ -104,6 +116,7 @@ export class PanelController {
   private readonly state: PanelState;
   private readonly ui: PanelUi;
   private readonly chord: string;
+  private readonly toggleChord: string;
   private readonly onOpen: (() => void) | undefined;
   private readonly openRowFn: PanelControllerOptions["openRow"];
   private layout: PanelLayout | undefined;
@@ -121,6 +134,7 @@ export class PanelController {
     this.state = opts.state;
     this.ui = opts.ui;
     this.chord = opts.chord ?? DEFAULT_CHORD;
+    this.toggleChord = opts.toggleChord ?? DEFAULT_TOGGLE_CHORD;
     this.onOpen = opts.onOpen;
     this.openRowFn = opts.openRow;
     this.layout = opts.layout;
@@ -134,13 +148,22 @@ export class PanelController {
   }
 
   /**
-   * Raw terminal input. Returns `{ consume: true }` only for our own chord;
+   * Raw terminal input. Returns `{ consume: true }` only for our own chords;
    * everything else is passed through untouched.
+   *
+   * Two chords, two jobs. The focus chord steps into and out of the panel so it
+   * can be navigated; the toggle chord collapses and uncollapses the whole
+   * panel, which is the same thing `/panel` does. Both are checked, so one can
+   * never shadow the other unless the operator deliberately sets them equal.
    */
   handleTerminalInput(data: string): { consume: true } | undefined {
+    if (matchesChord(data, this.toggleChord)) {
+      this.toggle();
+      return { consume: true };
+    }
     if (!matchesChord(data, this.chord)) return undefined;
-    // The chord moves focus rather than hiding the panel: `/panel` is for
-    // showing and hiding, this is for stepping in and out.
+    // The focus chord moves focus rather than hiding the panel: the toggle
+    // chord is for showing and hiding, this is for stepping in and out.
     this.toggleFocus();
     return { consume: true };
   }
@@ -238,6 +261,7 @@ export class PanelController {
           // that looks interactive and is not reads as a broken panel.
           focused: () => this.focused,
           chord: this.chord,
+          toggleChord: this.toggleChord,
           openRow: (payload) => void this.openSelection(payload),
           ...(this.layout ? { layout: this.layout } : {}),
           onLayoutChange: (patch) => {
