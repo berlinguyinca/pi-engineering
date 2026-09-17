@@ -501,4 +501,43 @@
   findings:
     critical: 0
     high: 0
+- id: dogfood-deflake-parallel-tests
+  milestone: __global__
+  type: dogfood
+  status: pass
+  commit: 1da6e5537ecdba1793ee6f5ffc5fc56e0f1fdc7b
+  generatedAt: 2026-09-17T20:29:56.069Z
+  paths: &a10
+    - test/integration/blackhole.test.ts
+    - test/integration/dag-parallel.test.ts
+    - test/integration/vertical-slice.test.ts
+    - test/integration/orchestrator-e2e.test.ts
+    - test/unit/orchestration-scheduler.test.ts
+  proof: scripts/dogfood-panel-surface.ts + scripts/dogfood-roadmap.ts (exit 0);
+    tsc --noEmit; biome check; full test suite 1232 pass / 0 fail across 5
+    consecutive runs (was intermittently flaking 1 test)
+  summary: "De-flake parallel-overlap assertions with a deterministic barrier: 5
+    parallel-tournament/DAG tests now assert overlap deterministically instead
+    of by wall-clock timing. Full suite green 5/5 consecutive runs. 0 critical /
+    0 high."
+- id: review-deflake-parallel-tests
+  milestone: __global__
+  type: fresh_review
+  status: pass
+  commit: 1da6e5537ecdba1793ee6f5ffc5fc56e0f1fdc7b
+  generatedAt: 2026-09-17T20:29:56.069Z
+  paths: *a10
+  proof: "fresh-context review of the de-flake change: replaced wall-clock-sleep
+    overlap assertions (maxActive>=2 / peak>1) with a deterministic
+    parallelBarrier (workers block until N arrive or timeout) across 5
+    parallel-tournament/DAG tests. Overlap is now guaranteed when the runtime
+    dispatches in parallel; assertion fails only if it genuinely serializes.
+    Test-only, no production behavior change. 0 critical / 0 high."
+  summary: "De-flake parallel-overlap assertions with a deterministic barrier: 5
+    parallel-tournament/DAG tests now assert overlap deterministically instead
+    of by wall-clock timing. Full suite green 5/5 consecutive runs. 0 critical /
+    0 high."
+  findings:
+    critical: 0
+    high: 0
 
