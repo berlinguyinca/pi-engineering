@@ -180,11 +180,28 @@ export class Orchestrator {
     this.phase(this.store.getMission(mission.mission_id)!, "classified");
     this.store.transitionMission(mission.mission_id, "PLANNING");
 
-    // For pure conversation/research, no scheduling needed.
-    if (intent.suggested_workflow === "conversation" || intent.suggested_workflow === "research") {
+    // Pure conversation/research has nothing to schedule — but ONLY when policy
+    // attached no gates. Taking this shortcut while gates are set would complete
+    // a mission that policy says must be validated and reviewed, and calling
+    // completeMission straight from PLANNING threw `illegal mission transition
+    // PLANNING -> COMPLETE` (reproduced for a plain "Explain this function").
+    const gatesNow = this.store.getMission(mission.mission_id)!.required_gates;
+    const passive = intent.suggested_workflow === "conversation" || intent.suggested_workflow === "research";
+    if (passive && gatesNow.length === 0) {
+      // Walk the lifecycle legally instead of teleporting to COMPLETE.
+      this.store.transitionMission(mission.mission_id, "READY");
+      this.store.transitionMission(mission.mission_id, "EXECUTING");
+      this.store.transitionMission(mission.mission_id, "FINAL_VALIDATION");
       this.store.completeMission(mission.mission_id);
       const final = this.store.getMission(mission.mission_id)!;
-      return { mission: final, intent, verdict: this.gate.evaluate(final), completed: true, failureReason: null };
+      const verdict = this.gate.evaluate(final);
+      return {
+        mission: final,
+        intent,
+        verdict,
+        completed: verdict.can_complete,
+        failureReason: verdict.can_complete ? null : verdict.reasons.join("; "),
+      };
     }
 
     // Plan/decompose into tasks.
@@ -216,8 +233,12 @@ export class Orchestrator {
       if (openBlocking.length === 0) break;
       repairRounds++;
 
-      // FINAL_VALIDATION -> REPAIRING is legal; repair tasks run isolated.
-      this.store.transitionMission(mission.mission_id, "REPAIRING");
+      // FINAL_VALIDATION -> REPAIRING is legal; guard the self-transition, which
+      // has no self-loop and would throw on a second round that left the mission
+      // already in REPAIRING.
+      if (this.store.getMission(mission.mission_id)!.status !== "REPAIRING") {
+        this.store.transitionMission(mission.mission_id, "REPAIRING");
+      }
       this.phase(this.store.getMission(mission.mission_id)!, "repairing");
       for (const f of openBlocking) {
         const where = f.file ? ` [${f.file}${f.line ? `:${f.line}` : ""}]` : "";
@@ -231,15 +252,24 @@ export class Orchestrator {
           isolation: "worktree",
         });
         this.store.transitionTask(repair.task_id, "READY");
-        await this.runSingleTask(mission.mission_id, repair.task_id);
-        // The repair is ATTEMPTED; the finding is closed out here and the
-        // mandatory re-review below decides whether it still stands. A reviewer
-        // that still sees the defect records a fresh finding, which keeps the
-        // mission blocked — so optimistic closure cannot launder a real issue.
-        this.store.resolveFinding(f.finding_id);
+        const repaired = await this.runSingleTask(mission.mission_id, repair.task_id);
+        // Only a repair that actually RAN may close its finding; a failed repair
+        // leaves the finding open so the gate keeps blocking rather than letting
+        // a crashed worker silently clear a defect. When the repair succeeds the
+        // finding is closed optimistically and the mandatory re-review below
+        // decides whether it still stands — a reviewer that still sees the
+        // defect records a fresh finding, which keeps the mission blocked.
+        if (repaired) this.store.resolveFinding(f.finding_id);
       }
       // Mandatory re-validation + re-review of the repaired result.
-      await this.postExecution(this.store.getMission(mission.mission_id)!);
+      const recheck = await this.postExecution(this.store.getMission(mission.mission_id)!);
+      // A finding may only be considered cleared if the re-review actually ran.
+      // If it failed, there is no evidence the defect is gone, so stop here and
+      // let the mission block rather than complete on optimistic closure.
+      if (recheck.reviewAttempted && !recheck.reviewOk) {
+        verdict = this.gate.evaluate(this.store.getMission(mission.mission_id)!);
+        break;
+      }
       verdict = this.gate.evaluate(this.store.getMission(mission.mission_id)!);
     }
 
@@ -262,8 +292,15 @@ export class Orchestrator {
         failureReason: null,
       };
     }
-    // Not complete: block for repair (legal from FINAL_VALIDATION) or fail.
-    const hasBlocking = finalMission.required_gates.length > 0 && verdict.reasons.length > 0;
+    // Not complete: block when a human/repair decision is needed (unresolved
+    // blocking findings, or unmet required gates); fail only when the work
+    // itself failed. Previously findings on a mission with no required gates
+    // were reported as FAILED, which lost the distinction.
+    const unresolvedBlocking = this.store
+      .listFindings(finalMission.mission_id)
+      .filter((f) => f.severity === "blocking" && f.status !== "resolved").length;
+    const hasBlocking =
+      unresolvedBlocking > 0 || (finalMission.required_gates.length > 0 && verdict.reasons.length > 0);
     if (hasBlocking) {
       if (finalMission.status !== "BLOCKED") this.store.transitionMission(finalMission.mission_id, "BLOCKED");
     } else {
@@ -278,8 +315,18 @@ export class Orchestrator {
     };
   }
 
-  /** Post-execution validation + review, respecting required gates. */
-  private async postExecution(mission: Mission): Promise<void> {
+  /**
+   * Post-execution validation + review, respecting required gates. Reports
+   * whether each stage was attempted and whether it succeeded, so the caller
+   * can refuse to complete when a mandatory re-review did not actually run.
+   */
+  private async postExecution(
+    mission: Mission,
+  ): Promise<{ validationAttempted: boolean; validationOk: boolean; reviewAttempted: boolean; reviewOk: boolean }> {
+    let validationAttempted = false;
+    let validationOk = false;
+    let reviewAttempted = false;
+    let reviewOk = false;
     const gates = new Set<RequiredGate>(mission.required_gates);
     const tasks = this.store.listTasks(mission.mission_id);
     const anyMutation = tasks.some((t) => t.mutates_repo && t.status === "SUCCEEDED");
@@ -295,7 +342,8 @@ export class Orchestrator {
         isolation: "none",
       });
       this.store.transitionTask(task.task_id, "READY");
-      await this.runSingleTask(mission.mission_id, task.task_id);
+      validationAttempted = true;
+      validationOk = await this.runSingleTask(mission.mission_id, task.task_id);
       // From VALIDATING the mission may move on to review or final validation.
       if (
         !gates.has("independent_review") &&
@@ -325,11 +373,13 @@ export class Orchestrator {
         depends_on: this.lastValidationTaskId(mission.mission_id),
       });
       this.store.transitionTask(task.task_id, "READY");
-      await this.runSingleTask(mission.mission_id, task.task_id);
+      reviewAttempted = true;
+      reviewOk = await this.runSingleTask(mission.mission_id, task.task_id);
       // From REVIEWING the mission moves to final validation (or repair handled
       // by the caller via the completion gate).
       this.store.transitionMission(mission.mission_id, "FINAL_VALIDATION");
     }
+    return { validationAttempted, validationOk, reviewAttempted, reviewOk };
   }
 
   private lastValidationTaskId(missionId: string): string[] {
@@ -339,7 +389,8 @@ export class Orchestrator {
       .map((t) => t.task_id);
   }
 
-  private async runSingleTask(missionId: string, taskId: string): Promise<void> {
+  /** Run one task to settlement. Returns true iff it reached SUCCEEDED. */
+  private async runSingleTask(missionId: string, taskId: string): Promise<boolean> {
     const task = this.store.getTask(taskId)!;
     this.store.transitionTask(taskId, "RUNNING");
     const handle = await this.broker.execute({
@@ -372,8 +423,10 @@ export class Orchestrator {
         });
       }
       this.store.transitionTask(taskId, "SUCCEEDED");
+      return true;
     } catch (err) {
       this.store.transitionTask(taskId, "FAILED");
+      return false;
     }
   }
 

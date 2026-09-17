@@ -107,6 +107,43 @@ describe("acceptance scenario A — simple feature auto-invokes engineering+vali
   });
 });
 
+describe("passive requests — gate-bypass and illegal-transition regressions", () => {
+  it("a pure conversation request completes without throwing or bypassing gates", async () => {
+    // Regression: this path called completeMission straight from PLANNING and
+    // threw `illegal mission transition PLANNING -> COMPLETE`.
+    const h = harness();
+    const result = await h.orchestrator.orchestrate("Explain this function", {
+      repository: ".",
+      baseRef: "abc",
+      mutationRequested: false,
+    });
+    assert.equal(result.mission.workflow_class, "conversation");
+    assert.deepEqual(result.mission.required_gates, []);
+    assert.equal(result.completed, true, result.failureReason ?? "");
+    assert.equal(h.store.getMission(result.mission.mission_id)!.status, "COMPLETE");
+    // Nothing was scheduled for a pure conversation.
+    assert.equal(h.store.listTasks(result.mission.mission_id).length, 0);
+  });
+
+  it("a passive classification with policy gates is NOT short-circuited to COMPLETE", async () => {
+    // If policy attaches gates, the passive shortcut must not complete the
+    // mission unvalidated/unreviewed.
+    const h = harness();
+    const result = await h.orchestrator.orchestrate("Explain this function", {
+      repository: ".",
+      baseRef: "abc",
+      mutationRequested: false,
+      changedFiles: ["src/server.ts"],
+    });
+    assert.ok(result.mission.required_gates.length > 0, "policy must attach gates for a source change");
+    if (result.completed) {
+      // Completing is only legitimate because validation + review actually ran.
+      assert.ok(h.calls.validation.length > 0, "validation must have run");
+      assert.ok(h.calls.review.length > 0, "review must have run");
+    }
+  });
+});
+
 describe("acceptance scenario B — investigation escalates on mutation", () => {
   it("starts as investigation and escalates to engineering+review when files change", async () => {
     const h = harness();
