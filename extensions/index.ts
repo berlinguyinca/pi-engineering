@@ -372,11 +372,7 @@ export default function (pi: ExtensionAPI) {
     return {
       message: {
         customType: "pi-engineering:auto-invoke",
-        content:
-          `[pi-engineering] This request expresses engineering intent (workflow: ${workflow}). ` +
-          `Act as the long-lived orchestrator: call the \`mission\` tool with this request as the mission ` +
-          `request so the runtime plans, executes, validates, reviews, and completes the work as a mission. ` +
-          `Do not implement the change directly in this session; delegate it through the mission pipeline.`,
+        content: `[pi-engineering] This request expresses engineering intent (workflow: ${workflow}). Act as the long-lived orchestrator: call the \`mission\` tool with this request as the mission request so the runtime plans, executes, validates, reviews, and completes the work as a mission. Do not implement the change directly in this session; delegate it through the mission pipeline.`,
         display: true,
       },
     };
