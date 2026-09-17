@@ -82,9 +82,12 @@ export function planModelSwitch(
   }
   const usable = Math.floor(toWindow * ratio) - reserve;
   if (used <= usable) {
+    // The window is not narrower in a way that matters: whatever the target
+    // size, current usage already fits inside it with room for output. Either
+    // way no action is required, so the switch is safe as-is.
     return {
       ...base,
-      action: toWindow < fromWindow ? "none" : "none",
+      action: "none",
       reason:
         toWindow < fromWindow
           ? `narrower window (${formatTokens(fromWindow)} -> ${formatTokens(toWindow)}) still holds the session`
