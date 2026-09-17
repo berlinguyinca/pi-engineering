@@ -15,7 +15,18 @@ export { PiWorkerExecutor } from "./workers/PiWorkerExecutor.ts";
 export { FakeWorkerExecutor } from "./workers/FakeWorkerExecutor.ts";
 export { buildSystemPrompt, WORKER_KICKOFF } from "./workers/prompts.ts";
 export { workerResultTool } from "./workers/workerResultTool.ts";
+export { reviewResultTool } from "./lifecycle/reviewResultTool.ts";
 export { buildCoreTools } from "./tools/coreTools.ts";
+// Capability-aware model router (standalone; no lifecycle harness).
+export { createRoleRouter } from "./capability/adapter.ts";
+export type { RoleRouterAdapter, RouteAdapterOptions } from "./capability/adapter.ts";
+export { RoleRouter } from "./capability/router.ts";
+export { ModelCapabilityRegistry } from "./capability/registry.ts";
+export { ROLE_REQUIREMENTS } from "./capability/roles.ts";
+export type { RoleName } from "./capability/roles.ts";
+export { parseRef } from "./capability/router.ts";
+// InferWeave admission-retry subsystem.
+export * from "./inference/index.ts";
 export type { CoreServices } from "./tools/coreTools.ts";
 export { EngineeringRuntime } from "./runtime/EngineeringRuntime.ts";
 export type {

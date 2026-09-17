@@ -14,6 +14,31 @@ export interface WorkerRequest {
   timeoutMs?: number;
   /** Hard context-token budget; the session is aborted once exceeded (spec §10.6). */
   maxContextTokens?: number;
+  /** Opening user message for the fresh session (defaults to the generic kickoff). */
+  kickoff?: string;
+  /**
+   * Explicit model selection produced by the capability router. When absent the
+   * executor falls back to its construction-time model.
+   */
+  modelOverride?: { provider: string; id: string };
+  /** Replace the role prompt entirely (specialist roles own their prompts). */
+  systemPromptOverride?: string;
+  /** Image attachments for vision-capable roles. */
+  images?: WorkerImage[];
+  /**
+   * Which terminating tool the session must call. `review_result` carries a
+   * structured review verdict.
+   */
+  resultTool?: "worker_result" | "review_result";
+}
+
+/** An image passed to a vision-capable worker session. */
+export interface WorkerImage {
+  /** base64 payload without a data: prefix. */
+  data: string;
+  mimeType: string;
+  /** Optional human-readable label used in the prompt. */
+  label?: string;
 }
 
 export interface WorkerRun {
@@ -22,6 +47,8 @@ export interface WorkerRun {
   error?: string;
   /** Number of tool executions performed by the worker session (context telemetry). */
   toolCalls?: number;
+  /** Payload of the terminating tool when it is not a plain worker_result. */
+  structured?: unknown;
 }
 
 /**

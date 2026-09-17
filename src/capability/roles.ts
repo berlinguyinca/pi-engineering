@@ -1,0 +1,230 @@
+/**
+ * Engineering roles (spec §11) and their capability requirements plus tool
+ * allowlists (spec §23).
+ *
+ * Each role declares hard requirements (filter) and soft preferences (score).
+ * `independent` roles must never be served by the model that produced the work
+ * being judged.
+ */
+
+import type { RoleRequirements } from "../lifecycle/types.ts";
+
+export const ROLE_NAMES = [
+  "orchestrator",
+  "planner",
+  "implementer",
+  "reviewer",
+  "test_reviewer",
+  "verifier",
+  "security_reviewer",
+  "architecture_reviewer",
+  "database_reviewer",
+  "api_reviewer",
+  "performance_reviewer",
+  "infrastructure_reviewer",
+  "vision_reviewer",
+  "ui_reviewer",
+  "spec_verifier",
+  "documentation_reviewer",
+] as const;
+
+export type RoleName = (typeof ROLE_NAMES)[number];
+
+export function isRoleName(value: string): value is RoleName {
+  return (ROLE_NAMES as readonly string[]).includes(value);
+}
+
+const READ_ONLY_TOOLS = [
+  "read",
+  "grep",
+  "find",
+  "ls",
+  "repo_search",
+  "symbol",
+  "tests_for",
+  "ledger_read",
+  "artifact_read",
+];
+const IMPLEMENT_TOOLS = [...READ_ONLY_TOOLS, "write", "edit", "bash"];
+
+export const ROLE_REQUIREMENTS: Record<RoleName, RoleRequirements> = {
+  orchestrator: {
+    requires: ["tool_calling", "long_context"],
+    prefers: ["high_quality", "reasoning"],
+    qualityWeight: 0.9,
+    costWeight: 0.1,
+    latencyWeight: 0.1,
+    independent: false,
+    readOnly: false,
+    isolation: "parent",
+    tools: IMPLEMENT_TOOLS,
+  },
+  planner: {
+    requires: ["tool_calling", "long_context"],
+    prefers: ["high_quality", "reasoning", "structured_output"],
+    qualityWeight: 0.9,
+    costWeight: 0.15,
+    latencyWeight: 0.05,
+    independent: false,
+    readOnly: true,
+    isolation: "own",
+    tools: READ_ONLY_TOOLS,
+  },
+  implementer: {
+    requires: ["tool_calling"],
+    prefers: ["code_strong", "fast", "structured_output"],
+    qualityWeight: 0.7,
+    costWeight: 0.35,
+    latencyWeight: 0.2,
+    independent: false,
+    readOnly: false,
+    isolation: "parent",
+    tools: IMPLEMENT_TOOLS,
+  },
+  reviewer: {
+    requires: ["tool_calling", "long_context"],
+    prefers: ["high_quality", "reasoning", "structured_output"],
+    qualityWeight: 1,
+    costWeight: 0.1,
+    latencyWeight: 0.05,
+    independent: true,
+    readOnly: true,
+    isolation: "own",
+    tools: READ_ONLY_TOOLS,
+  },
+  test_reviewer: {
+    requires: ["tool_calling"],
+    prefers: ["code_strong", "structured_output"],
+    qualityWeight: 0.8,
+    costWeight: 0.3,
+    latencyWeight: 0.1,
+    independent: true,
+    readOnly: true,
+    isolation: "own",
+    tools: READ_ONLY_TOOLS,
+  },
+  verifier: {
+    requires: ["tool_calling"],
+    prefers: ["fast", "structured_output"],
+    qualityWeight: 0.6,
+    costWeight: 0.4,
+    latencyWeight: 0.3,
+    independent: true,
+    readOnly: false,
+    isolation: "own",
+    tools: [...READ_ONLY_TOOLS, "bash"],
+  },
+  security_reviewer: {
+    requires: ["tool_calling", "long_context"],
+    prefers: ["high_quality", "reasoning", "privacy_sensitive"],
+    qualityWeight: 1,
+    costWeight: 0.05,
+    latencyWeight: 0.05,
+    independent: true,
+    readOnly: true,
+    isolation: "own",
+    tools: READ_ONLY_TOOLS,
+  },
+  architecture_reviewer: {
+    requires: ["tool_calling", "long_context"],
+    prefers: ["high_quality", "reasoning"],
+    qualityWeight: 1,
+    costWeight: 0.1,
+    latencyWeight: 0.05,
+    independent: true,
+    readOnly: true,
+    isolation: "own",
+    tools: READ_ONLY_TOOLS,
+  },
+  database_reviewer: {
+    requires: ["tool_calling"],
+    prefers: ["reasoning", "code_strong"],
+    qualityWeight: 0.9,
+    costWeight: 0.2,
+    latencyWeight: 0.1,
+    independent: true,
+    readOnly: true,
+    isolation: "own",
+    tools: READ_ONLY_TOOLS,
+  },
+  api_reviewer: {
+    requires: ["tool_calling"],
+    prefers: ["code_strong", "structured_output"],
+    qualityWeight: 0.85,
+    costWeight: 0.25,
+    latencyWeight: 0.1,
+    independent: true,
+    readOnly: true,
+    isolation: "own",
+    tools: READ_ONLY_TOOLS,
+  },
+  performance_reviewer: {
+    requires: ["tool_calling"],
+    prefers: ["reasoning", "fast"],
+    qualityWeight: 0.8,
+    costWeight: 0.3,
+    latencyWeight: 0.2,
+    independent: true,
+    readOnly: true,
+    isolation: "own",
+    tools: READ_ONLY_TOOLS,
+  },
+  infrastructure_reviewer: {
+    requires: ["tool_calling"],
+    prefers: ["reasoning", "code_strong"],
+    qualityWeight: 0.9,
+    costWeight: 0.2,
+    latencyWeight: 0.1,
+    independent: true,
+    readOnly: true,
+    isolation: "own",
+    tools: READ_ONLY_TOOLS,
+  },
+  vision_reviewer: {
+    requires: ["vision"],
+    prefers: ["vision_ui", "high_quality"],
+    qualityWeight: 1,
+    costWeight: 0.1,
+    latencyWeight: 0.1,
+    independent: true,
+    readOnly: true,
+    isolation: "own",
+    tools: ["read", "artifact_read"],
+  },
+  ui_reviewer: {
+    requires: ["vision"],
+    prefers: ["vision_ui", "long_context"],
+    qualityWeight: 0.95,
+    costWeight: 0.1,
+    latencyWeight: 0.1,
+    independent: true,
+    readOnly: true,
+    isolation: "own",
+    tools: ["read", "artifact_read"],
+  },
+  spec_verifier: {
+    requires: ["tool_calling", "long_context"],
+    prefers: ["high_quality", "reasoning", "structured_output"],
+    qualityWeight: 1,
+    costWeight: 0.1,
+    latencyWeight: 0.05,
+    independent: true,
+    readOnly: true,
+    isolation: "own",
+    tools: READ_ONLY_TOOLS,
+  },
+  documentation_reviewer: {
+    requires: ["tool_calling"],
+    prefers: ["long_context", "low_cost"],
+    qualityWeight: 0.6,
+    costWeight: 0.5,
+    latencyWeight: 0.2,
+    independent: true,
+    readOnly: true,
+    isolation: "own",
+    tools: READ_ONLY_TOOLS,
+  },
+};
+
+/** Roles whose verdict counts as an independent review of the change. */
+export const INDEPENDENT_REVIEW_ROLES: readonly RoleName[] = ROLE_NAMES.filter((r) => ROLE_REQUIREMENTS[r].independent);

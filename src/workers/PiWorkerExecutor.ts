@@ -37,6 +37,7 @@ import {
   resolveTransientRetryConfig,
   withTransientRetry,
 } from "../guard/transient.ts";
+import { reviewResultTool } from "../lifecycle/reviewResultTool.ts";
 import { emitTelemetry } from "../telemetry/sink.ts";
 import type { WorkerExecutor, WorkerRequest, WorkerRun } from "./WorkerExecutor.ts";
 import { registerLocalProviders } from "./localProviders.ts";
@@ -154,6 +155,31 @@ export class PiWorkerExecutor implements WorkerExecutor {
   async run(req: WorkerRequest): Promise<WorkerRun> {
     const modelRuntime = await this.getModelRuntime();
     let model = this.model;
+    // The capability router places a role on a specific provider model. When a
+    // route is supplied it wins over the construction-time default.
+    if (req.modelOverride) {
+      const resolved = modelRuntime.getModel(req.modelOverride.provider, req.modelOverride.id) as
+        | Model<any>
+        | undefined;
+      if (resolved) {
+        model = resolved;
+      } else {
+        return {
+          result: {
+            status: "failed",
+            summary: `Routed model ${req.modelOverride.provider}/${req.modelOverride.id} is not registered in this runtime.`,
+            claims: [],
+            evidence_refs: [],
+            new_hypotheses: [],
+            proposed_tasks: [],
+            details: {},
+            error: "unknown-model",
+          },
+          usage: null,
+          error: "unknown-model",
+        };
+      }
+    }
     if (!model) {
       const available = await modelRuntime.getAvailable();
       model = available[0] as Model<any> | undefined;
@@ -176,7 +202,10 @@ export class PiWorkerExecutor implements WorkerExecutor {
     }
 
     // Build the base system prompt with the Tool Transition Rule (spec §15).
-    const baseSystemPrompt = `${buildSystemPrompt(req.role, req.task, req.context)}
+    // Specialist roles may supply their own prompt wholesale.
+    const baseSystemPrompt =
+      req.systemPromptOverride ??
+      `${buildSystemPrompt(req.role, req.task, req.context)}
 
 ${TOOL_TRANSITION_RULE}`;
 
@@ -198,7 +227,8 @@ ${TOOL_TRANSITION_RULE}`;
     initialPrompt: string,
     modelRuntime: ModelRuntime,
   ): Promise<WorkerRun> {
-    const customTools = [...this.customTools, workerResultTool];
+    const terminating = req.resultTool === "review_result" ? reviewResultTool : workerResultTool;
+    const customTools = [...this.customTools, terminating];
     const tools = [...new Set([...req.tools, ...customTools.map((t) => t.name)])];
     let model: Model<any> = initialModel;
     let systemPrompt: string = initialPrompt;
@@ -285,6 +315,7 @@ ${TOOL_TRANSITION_RULE}`;
         guardReason,
         guardDiagnostics,
         captured,
+        structured,
         toolCalls,
         budgetExhausted,
         timedOut,
@@ -301,7 +332,7 @@ ${TOOL_TRANSITION_RULE}`;
         }
         if (gatewayConfig.enabled) admission.noteSuccess();
         const usage = this.collectUsage(this.asMessages(session.messages));
-        return { result: captured, usage, toolCalls };
+        return { result: captured, usage, toolCalls, structured };
       }
 
       // Gateway saturation: honour the wait the gateway reported, hold every
@@ -459,6 +490,7 @@ ${recovery.recoveryPrompt}`;
     guardReason?: GuardAbortReason;
     guardDiagnostics: Record<string, unknown>;
     captured?: WorkerResult;
+    structured?: unknown;
     toolCalls: number;
     budgetExhausted: boolean;
     timedOut: boolean;
@@ -485,7 +517,9 @@ ${recovery.recoveryPrompt}`;
       thinkingLevel: "off",
     });
 
+    const terminatingName = req.resultTool === "review_result" ? "review_result" : "worker_result";
     let captured: WorkerResult | undefined;
+    let structured: unknown;
     let toolCalls = 0;
     let budgetExhausted = false;
     let timedOut = false;
@@ -513,15 +547,19 @@ ${recovery.recoveryPrompt}`;
     };
 
     const unsubscribe = session.subscribe((event) => {
-      // Capture worker_result.
-      if (event.type === "tool_execution_end" && event.toolName === "worker_result") {
+      // Capture the terminating tool (worker_result or review_result).
+      if (event.type === "tool_execution_end" && event.toolName === terminatingName) {
         if (!event.isError) {
-          const details = event.result?.details as WorkerResult | undefined;
-          if (details?.status) captured = details;
+          if (terminatingName === "worker_result") {
+            const details = event.result?.details as WorkerResult | undefined;
+            if (details?.status) captured = details;
+          } else {
+            structured = event.result?.details;
+          }
         }
       }
       // Count tool executions and feed progress to the guard.
-      if (event.type === "tool_execution_start" && event.toolName !== "worker_result") {
+      if (event.type === "tool_execution_start" && event.toolName !== terminatingName) {
         toolCalls++;
         guard.onProgress("tool_call");
       }
@@ -563,7 +601,10 @@ ${recovery.recoveryPrompt}`;
     }, req.timeoutMs ?? 300_000);
 
     try {
-      await session.prompt(WORKER_KICKOFF);
+      await session.prompt(req.kickoff ?? WORKER_KICKOFF, {
+        images: req.images?.map((img) => ({ type: "image" as const, data: img.data, mimeType: img.mimeType })),
+        expandPromptTemplates: false,
+      });
     } catch (err) {
       // Capture the error. An abort triggered by the guard/budget/timeout is
       // EXPECTED (session.abort()) and not a transport failure. A rejection
@@ -595,12 +636,16 @@ ${recovery.recoveryPrompt}`;
       }
     }
 
-    // Fallback: scan messages for the worker_result tool result.
+    // Fallback: scan messages for the terminating tool result.
     if (!captured && !guardAborted) {
       for (const msg of session.messages) {
-        if (msg.role === "toolResult" && msg.toolName === "worker_result" && !msg.isError && msg.details) {
-          const d = msg.details as WorkerResult;
-          if (d?.status) captured = d;
+        if (msg.role === "toolResult" && msg.toolName === terminatingName && !msg.isError && msg.details) {
+          if (terminatingName === "worker_result") {
+            const d = msg.details as WorkerResult;
+            if (d?.status) captured = d;
+          } else {
+            structured = msg.details;
+          }
           break;
         }
       }
@@ -612,6 +657,7 @@ ${recovery.recoveryPrompt}`;
       guardReason,
       guardDiagnostics,
       captured,
+      structured,
       toolCalls,
       budgetExhausted,
       timedOut,
