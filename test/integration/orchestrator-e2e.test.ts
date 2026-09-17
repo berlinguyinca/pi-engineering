@@ -18,6 +18,33 @@ import { MissionStore } from "../../src/orchestration/missionStore.ts";
 import { Orchestrator } from "../../src/orchestration/orchestrator.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 
+/** Deterministic overlap barrier (see dag-parallel/blackhole tests). */
+function parallelBarrier(needed: number, timeoutMs = 5000): { arrived: () => Promise<void> } {
+  let count = 0;
+  let release: () => void;
+  let settled = false;
+  const gate = new Promise<void>((r) => {
+    release = r;
+  });
+  const timer = setTimeout(() => {
+    if (!settled) {
+      settled = true;
+      release();
+    }
+  }, timeoutMs);
+  return {
+    async arrived() {
+      count++;
+      if (count >= needed && !settled) {
+        settled = true;
+        clearTimeout(timer);
+        release();
+      }
+      await gate;
+    },
+  };
+}
+
 interface Harness {
   orchestrator: Orchestrator;
   store: MissionStore;
@@ -136,12 +163,14 @@ describe("acceptance scenario C — independent tasks run concurrently with isol
     const calls: string[] = [];
     let maxConcurrent = 0;
     let concurrent = 0;
+    const barrier = parallelBarrier(2);
     const backends: BrokerBackends = {
       agent: {
         runAgent: async ({ role }) => {
           concurrent++;
           maxConcurrent = Math.max(maxConcurrent, concurrent);
-          await new Promise((r) => setTimeout(r, 15));
+          // Block until both agents are active: deterministic overlap.
+          await barrier.arrived();
           calls.push(role ?? "agent");
           concurrent--;
           return { executionId: "e", exitStatus: "succeeded", summary: "done", artifactRefs: [], usage: {} };

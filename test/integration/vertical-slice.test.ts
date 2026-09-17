@@ -12,6 +12,33 @@ import { CommandVerifier } from "../../src/verify/Verifier.ts";
 import { FakeWorkerExecutor } from "../../src/workers/FakeWorkerExecutor.ts";
 import { makeFixtureRepo } from "../fixtures/make-fixture.ts";
 
+/** Deterministic overlap barrier (see dag-parallel/blackhole tests). */
+function parallelBarrier(needed: number, timeoutMs = 5000): { arrived: () => Promise<void> } {
+  let count = 0;
+  let release: () => void;
+  let settled = false;
+  const gate = new Promise<void>((r) => {
+    release = r;
+  });
+  const timer = setTimeout(() => {
+    if (!settled) {
+      settled = true;
+      release();
+    }
+  }, timeoutMs);
+  return {
+    async arrived() {
+      count++;
+      if (count >= needed && !settled) {
+        settled = true;
+        clearTimeout(timer);
+        release();
+      }
+      await gate;
+    },
+  };
+}
+
 /**
  * End-to-end test of the complete vertical slice, driven by a deterministic
  * fake worker executor so it runs without a model endpoint:
@@ -619,6 +646,7 @@ test("parallel tournament candidates run concurrently in isolated worktrees", as
   try {
     let active = 0;
     let maxActive = 0;
+    const barrier = parallelBarrier(2);
     const worker = new FakeWorkerExecutor({
       scout: () => ({
         status: "completed",
@@ -632,7 +660,8 @@ test("parallel tournament candidates run concurrently in isolated worktrees", as
       implementer: async (req) => {
         active += 1;
         maxActive = Math.max(maxActive, active);
-        await new Promise((resolve) => setTimeout(resolve, 20)); // yield so siblings enter
+        // Block until both candidates are active: deterministic overlap.
+        await barrier.arrived();
         await writeFile(join(req.cwd, "src", "add.js"), `export function add(a, b) {\n  return a + b;\n}\n`);
         active -= 1;
         return {

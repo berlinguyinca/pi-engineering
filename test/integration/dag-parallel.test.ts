@@ -7,11 +7,44 @@ import { CommandVerifier } from "../../src/verify/Verifier.ts";
 import { FakeWorkerExecutor } from "../../src/workers/FakeWorkerExecutor.ts";
 import { makeFixtureRepo } from "../fixtures/make-fixture.ts";
 
+/**
+ * Deterministic overlap barrier: a worker blocks until `needed` workers have
+ * entered (or a timeout). Replaces a wall-clock sleep so "independent tasks run
+ * concurrently" is asserted deterministically rather than by scheduler timing
+ * under full-suite load (which made this test flaky).
+ */
+function parallelBarrier(needed: number, timeoutMs = 5000): { arrived: () => Promise<void> } {
+  let count = 0;
+  let release: () => void;
+  let settled = false;
+  const gate = new Promise<void>((r) => {
+    release = r;
+  });
+  const timer = setTimeout(() => {
+    if (!settled) {
+      settled = true;
+      release();
+    }
+  }, timeoutMs);
+  return {
+    async arrived() {
+      count++;
+      if (count >= needed && !settled) {
+        settled = true;
+        clearTimeout(timer);
+        release();
+      }
+      await gate;
+    },
+  };
+}
+
 test("executePlan parallel runs independent tasks concurrently and integrates safely", async () => {
   const fixture = await makeFixtureRepo();
   try {
     let active = 0;
     let peak = 0;
+    const barrier = parallelBarrier(2);
     const worker = new FakeWorkerExecutor({
       planner: () => ({
         status: "completed",
@@ -46,7 +79,8 @@ test("executePlan parallel runs independent tasks concurrently and integrates sa
       implementer: async (req) => {
         active++;
         peak = Math.max(peak, active);
-        await new Promise((r) => setTimeout(r, 30));
+        // Block until at least two implementers are active: deterministic overlap.
+        await barrier.arrived();
         const body = req.task.toLowerCase();
         const file = body.includes("add") ? "add.js" : body.includes("subtract") ? "subtract.js" : "multiply.js";
         const op = body.includes("add") ? "+" : body.includes("subtract") ? "-" : "*";

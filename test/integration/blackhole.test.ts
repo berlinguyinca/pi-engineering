@@ -7,6 +7,39 @@ import { CommandVerifier } from "../../src/verify/Verifier.ts";
 import { FakeWorkerExecutor } from "../../src/workers/FakeWorkerExecutor.ts";
 import { makeFixtureRepo } from "../fixtures/make-fixture.ts";
 
+/**
+ * Deterministic overlap barrier. A worker calls `arrived()` and blocks until
+ * `needed` workers have entered (or the timeout elapses). This replaces a
+ * wall-clock sleep so "the runtime dispatches candidates in parallel" is
+ * asserted deterministically instead of depending on scheduler timing under
+ * full-suite load (which made these tests flaky).
+ */
+function parallelBarrier(needed: number, timeoutMs = 5000): { arrived: () => Promise<void> } {
+  let count = 0;
+  let release: () => void;
+  let settled = false;
+  const gate = new Promise<void>((r) => {
+    release = r;
+  });
+  const timer = setTimeout(() => {
+    if (!settled) {
+      settled = true;
+      release();
+    }
+  }, timeoutMs);
+  return {
+    async arrived() {
+      count++;
+      if (count >= needed && !settled) {
+        settled = true;
+        clearTimeout(timer);
+        release();
+      }
+      await gate;
+    },
+  };
+}
+
 function fakeWorker() {
   return new FakeWorkerExecutor({
     scout: () => ({
@@ -260,11 +293,13 @@ test("blackhole session isolation: parallel tournament candidates never share wo
   try {
     let active = 0;
     let maxActive = 0;
+    const barrier = parallelBarrier(2);
     const worker = new FakeWorkerExecutor({
       implementer: async (req) => {
         active += 1;
         maxActive = Math.max(maxActive, active);
-        await new Promise((r) => setTimeout(r, 15));
+        // Block until BOTH candidates are active: deterministic overlap.
+        await barrier.arrived();
         await writeFile(join(req.cwd, "src", "add.js"), `export function add(a, b) {\n  return a + b;\n}\n`);
         active -= 1;
         return {
