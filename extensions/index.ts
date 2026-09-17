@@ -3,6 +3,7 @@ import type { Model } from "@earendil-works/pi-ai/compat";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { openVikingBlackholeOption } from "../src/blackhole/envConfig.ts";
 import { GitRepo } from "../src/git/GitRepo.ts";
+import { LifecycleHarness } from "../src/lifecycle/harness.ts";
 import { RoadmapEngine } from "../src/roadmap/RoadmapEngine.ts";
 import { EngineeringRuntime } from "../src/runtime/EngineeringRuntime.ts";
 import { type CoreServices, buildCoreTools } from "../src/tools/coreTools.ts";
@@ -130,6 +131,60 @@ export default function (pi: ExtensionAPI) {
   for (const tool of buildCoreTools(resolveServices)) {
     pi.registerTool(tool);
   }
+
+  // -------------------------------------------------------------------------------------------
+  // Automatic engineering lifecycle + capability-aware model router.
+  //
+  // No command is required: the harness observes edits, runs verification, routes
+  // independent reviewers on provider models, and owns the completion decision.
+  // `/engineering` is diagnostics only.
+  // -------------------------------------------------------------------------------------------
+  const lifecycle = LifecycleHarness.create({
+    record: async (cwd, entry) => {
+      const rt = await getRuntimeByCwd(cwd).catch(() => null);
+      if (!rt) return;
+      const workItem = rt.ledger.listWorkItems().at(-1);
+      await rt.ledger
+        .recordEntity(
+          entry.kind,
+          entry.text,
+          entry.kind === "finding" ? "open" : "accepted",
+          { type: "system" },
+          workItem ? workItem.id : null,
+          { severity: entry.severity as "info" | "low" | "medium" | "high" | "critical" | undefined },
+        )
+        .catch(() => undefined);
+    },
+  });
+  lifecycle.register(pi);
+
+  pi.registerCommand("engineering", {
+    description:
+      "Automatic engineering lifecycle diagnostics: status, explain (routing), models, policy, metrics, runs, ignore, reopen.",
+    getArgumentCompletions: (prefix) => {
+      const subs = [
+        "status",
+        "explain",
+        "models",
+        "refresh-models",
+        "policy",
+        "metrics",
+        "runs",
+        "ignore",
+        "reopen",
+        "reset",
+      ];
+      return subs.filter((s) => s.startsWith(prefix.trim())).map((s) => ({ value: s, label: s }));
+    },
+    handler: async (args, ctx) => {
+      try {
+        const out = await lifecycle.command(args ?? "", ctx);
+        ctx.ui.notify(out, "info");
+      } catch (err) {
+        ctx.ui.notify(`engineering: ${err instanceof Error ? err.message : String(err)}`, "error");
+      }
+    },
+  });
 
   pi.registerCommand("engineer", {
     description: "Run the adaptive engineering workflow for a goal (scout -> implement -> verify -> review).",
