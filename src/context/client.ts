@@ -21,6 +21,14 @@ import {
   resolveModelContext,
 } from "./capability.ts";
 
+/**
+ * Bound on how many model ids the cache may hold. A gateway that lists a
+ * pathological model count must not grow this process without limit; the
+ * eviction target is the longest-fetched id (Map insertion order), which is
+ * the least likely to be re-requested next.
+ */
+const MAX_CACHED_MODELS = 1_024;
+
 export interface CapabilityFetchResult {
   status: number;
   etag?: string;
@@ -78,6 +86,15 @@ export class InferWeaveCapabilityClient {
     // passes `now: undefined` explicitly (which is what an optional dependency
     // looks like) would otherwise overwrite the default with undefined.
     this.options = { ...options, now: options.now ?? (() => Math.floor(Date.now() / 1000)) };
+  }
+
+  /** Cache write with a bound: a new id evicts the oldest, an update never does. */
+  private storeEntry(modelId: string, entry: CacheEntry): void {
+    if (!this.cache.has(modelId) && this.cache.size >= MAX_CACHED_MODELS) {
+      const oldest = this.cache.keys().next().value;
+      if (oldest !== undefined) this.cache.delete(oldest);
+    }
+    this.cache.set(modelId, entry);
   }
 
   /**
@@ -188,27 +205,40 @@ export class InferWeaveCapabilityClient {
       if (result.status === 304 && entry.capability) {
         entry.fetchedAt = this.options.now();
         entry.lastError = undefined;
-        this.cache.set(modelId, entry);
+        this.storeEntry(modelId, entry);
         return entry.capability;
       }
       if (result.status >= 200 && result.status < 300 && result.body) {
         const capability = normalizeCapability(result.body);
+        const saysNothing =
+          !capability.modelId &&
+          capability.guaranteedRoutableTokens === undefined &&
+          capability.contextWindow === undefined &&
+          capability.maxModelLen === undefined;
+        if (saysNothing) {
+          // A 200 that says nothing about context is a non-answer, not an
+          // answer of "zero": wiping the last-known-good here would turn a
+          // flaky gateway response into a floor, on every subsequent call.
+          entry.lastError = "200 with no capability fields";
+          this.storeEntry(modelId, entry);
+          return entry.capability;
+        }
         // The gateway's own freshness wins; a body that claims nothing fresh is
         // served as-is so the caller can see the staleness rather than a lie.
-        this.cache.set(modelId, { capability, etag: result.etag, fetchedAt: this.options.now() });
+        this.storeEntry(modelId, { capability, etag: result.etag, fetchedAt: this.options.now() });
         return capability;
       }
       if (result.status === 404) {
         // No capability for this id: do not invent one, but do not lose the old
         // value either — the caller's precedence rules decide.
         entry.lastError = "404";
-        this.cache.set(modelId, entry);
+        this.storeEntry(modelId, entry);
         return entry.capability;
       }
       throw new CapabilityUnavailableError(modelId, `capability endpoint returned ${result.status}`);
     } catch (error) {
       entry.lastError = error instanceof Error ? error.message : String(error);
-      this.cache.set(modelId, entry);
+      this.storeEntry(modelId, entry);
       // Stale-if-error: hand back what we have, marked by its age. The resolver
       // turns an expired value into an override-or-floor decision.
       if (entry.capability) {

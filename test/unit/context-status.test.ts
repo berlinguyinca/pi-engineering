@@ -107,3 +107,44 @@ test("a narrower window that still holds the session dispatches immediately", ()
   const decision = planModelSwitch(50_000, 1_048_576, 131_072, { reserveOutputTokens: 8_192 });
   assert.equal(decision.action, "none");
 });
+
+import { FooterController } from "../../src/status/footer.ts";
+
+function footer(
+  capabilityWindow: (modelId: string | undefined) => { windowTokens: number; note?: string } | undefined,
+) {
+  const ctx = {
+    cwd: "/tmp/iw-context-footer-test",
+    model: { provider: "p", id: "a" },
+    ui: { setFooter: (_fn: unknown) => {} },
+  };
+  return new FooterController({
+    ctx: ctx as never,
+    config: DEFAULT_STATUS_BAR_CONFIG,
+    capabilityWindow,
+  });
+}
+
+test("switching to a model the capability layer does not know drops the previous window", () => {
+  const known = new Map([
+    ["a", { windowTokens: 262_144 }],
+    ["b", { windowTokens: 131_072 }],
+  ]);
+  const f = footer((id) => (id ? known.get(id) : undefined));
+  f.onModelSelect({ id: "a", contextWindow: 262_144 });
+  f.setContextUsage(100_000);
+  assert.equal(f.state.context?.windowTokens, 262_144);
+
+  // A model the capability layer resolved: its window follows.
+  f.onModelSelect({ id: "b", contextWindow: 131_072 });
+  assert.equal(f.state.context?.windowTokens, 131_072);
+
+  // A model with NO capability: the previous model's window must not survive.
+  // Pi's own registry window for that model is the honest fallback.
+  f.onModelSelect({ id: "unknown-70b", contextWindow: 49_152 });
+  assert.equal(f.state.context?.windowTokens, 49_152, "registry window, not the 262K of the previous model");
+
+  // No capability and no registry window either: show nothing, not a lie.
+  f.onModelSelect({ id: "mystery" });
+  assert.equal(f.state.context?.windowTokens, 0, "cleared, not carried over");
+});

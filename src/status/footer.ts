@@ -186,14 +186,16 @@ export class FooterController {
   }
 
   /** Model switch: rebind the model and reset TPS (no stale rate from a prior model). */
-  onModelSelect(model: { provider?: string; id?: string } | undefined): void {
+  onModelSelect(model: { provider?: string; id?: string; contextWindow?: number } | undefined): void {
     if (this.disposed) return;
     const m = modelInfo(model);
     this.sessionModel = m.id;
     this.throughput.reset();
     // The window must follow the model: a 1M -> 128K switch that keeps showing
-    // 1M is how a session walks into an impossible request.
-    this.applyCapabilityWindow(m.id);
+    // 1M is how a session walks into an impossible request. When the capability
+    // layer does not know the new model, fall back to Pi's own registry window
+    // for it (or clear) — never to the previous model's window.
+    this.applyCapabilityWindow(m.id, model?.contextWindow);
     this.status.set({
       model: m.id,
       provider: m.provider,
@@ -312,14 +314,27 @@ export class FooterController {
     this.requestRender();
   }
 
-  private applyCapabilityWindow(modelId: string | undefined): void {
-    if (!this.capabilityWindow) return;
+  private applyCapabilityWindow(modelId: string | undefined, registryWindow?: number): void {
     try {
-      const resolved = this.capabilityWindow(modelId);
-      if (resolved && resolved.windowTokens > 0) this.setCapabilityWindow(resolved.windowTokens, resolved.note);
+      const resolved = this.capabilityWindow?.(modelId);
+      if (resolved && resolved.windowTokens > 0) {
+        this.setCapabilityWindow(resolved.windowTokens, resolved.note);
+        return;
+      }
     } catch {
       // A capability lookup must never break the footer.
     }
+    // No capability for this model. Carrying the previous model's window would
+    // show a number that is not the window Pi enforces for the current model.
+    if (registryWindow && registryWindow > 0) {
+      this.setCapabilityWindow(registryWindow);
+      return;
+    }
+    this.contextWindowTokens = 0;
+    this.contextNote = undefined;
+    const used = this.status.snapshot.context?.usedTokens ?? 0;
+    this.status.set({ context: { usedTokens: used, windowTokens: 0, note: undefined } });
+    this.requestRender();
   }
 
   /** cwd change: re-resolve git + refresh. */

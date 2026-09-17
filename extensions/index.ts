@@ -963,7 +963,16 @@ ${RECOVERY_PROMPT}`;
       if (!target) return;
       const usage = typeof ctx.getContextUsage === "function" ? ctx.getContextUsage() : undefined;
       const used = usage && typeof usage.tokens === "number" ? usage.tokens : 0;
-      const previous = activeFooter?.state.context?.windowTokens ?? target.windowTokens;
+      // The previous window comes from the event's previousModel — the
+      // capability resolution for it if the layer knows it, else Pi's own
+      // registry window for that model. Footer state must not be the source:
+      // with the status bar disabled there is none, and this guard is the
+      // safety path, so it must stand on its own.
+      const previousModel = event.previousModel;
+      const previous =
+        (previousModel?.id ? inferweave.windowFor(previousModel.id) : undefined)?.windowTokens ??
+        previousModel?.contextWindow ??
+        target.windowTokens;
       const decision = planModelSwitch(used, previous, target.windowTokens, {
         reserveOutputTokens: inferweave.resolved(modelId)?.maxTokens ?? 0,
       });

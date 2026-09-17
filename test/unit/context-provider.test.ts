@@ -56,6 +56,32 @@ test("overrides parse the documented model=window[:output][:unsafe] form", () =>
   assert.deepEqual(parseOverrides(undefined), {});
 });
 
+test("override parsing tolerates whitespace; a malformed entry is skipped whole, not half-applied", () => {
+  // Regression: "model : 262144" used to parse modelId "model " (untrimmed) and
+  // drop the unsafe flag — silently turning an unsafe override into a rejected
+  // one, or the reverse.
+  const spaced = parseOverrides("model : 262144 : 32768 : unsafe");
+  assert.deepEqual(spaced.model, {
+    modelId: "model",
+    contextWindow: 262_144,
+    maxOutputTokens: 32_768,
+    allowUnsafeOverride: true,
+  });
+  assert.equal(spaced["model "], undefined, "no untrimmed ghost entry");
+
+  const equals = parseOverrides("model = 262144");
+  assert.deepEqual(equals.model, {
+    modelId: "model",
+    contextWindow: 262_144,
+    maxOutputTokens: undefined,
+    allowUnsafeOverride: false,
+  });
+
+  // A window that is not a number must drop the whole entry, not a partial one.
+  const bad = parseOverrides("model = notanumber : unsafe");
+  assert.equal(bad.model, undefined);
+});
+
 test("refreshModels gives Pi the guaranteed window and the advertised output cap", async () => {
   const probe = makeTransport({
     listing: () => ({

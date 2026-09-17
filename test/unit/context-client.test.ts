@@ -255,3 +255,52 @@ test("the last caller to leave does abandon the fetch", async () => {
   await new Promise((r) => setTimeout(r, 20));
   assert.equal(aborted, true, "nobody wants it any more: the work stops");
 });
+
+test("a 200 with no capability fields is a non-answer: the last-known-good survives", async () => {
+  const client = new InferWeaveCapabilityClient({
+    baseUrl: "http://gw",
+    ttlSeconds: 0, // every call revalidates against the network
+    staleIfErrorSeconds: 3600,
+    timeoutMs: 1_000,
+    transport: async () => {
+      // First call: a real capability. After that: a 200 whose body says
+      // nothing about context (a flaky gateway, or a JSON parse that came
+      // back empty). It must not wipe what we already know.
+      if (client.inspect().length === 0) {
+        return {
+          status: 200,
+          etag: '"g1"',
+          body: { id: "m", inferweave: { guaranteed_routable_tokens: 262_144 } },
+        } satisfies CapabilityFetchResult;
+      }
+      return { status: 200, body: {} } satisfies CapabilityFetchResult;
+    },
+  });
+
+  const first = await client.resolve("m");
+  assert.equal(first.contextWindow, 262_144);
+
+  const second = await client.resolve("m");
+  assert.equal(second.contextWindow, 262_144, "the known value keeps serving, not the floor");
+  const entry = client.inspect().find((e) => e.modelId === "m");
+  assert.equal(entry?.lastError, "200 with no capability fields", "and the entry says why");
+});
+
+test("the cache is bounded: a pathological model count cannot grow it forever", async () => {
+  const client = new InferWeaveCapabilityClient({
+    baseUrl: "http://gw",
+    ttlSeconds: 0,
+    staleIfErrorSeconds: 3600,
+    timeoutMs: 1_000,
+    transport: async () =>
+      ({
+        status: 200,
+        body: { id: "m", inferweave: { guaranteed_routable_tokens: 65_536 } },
+      }) satisfies CapabilityFetchResult,
+  });
+  const many = 1_300; // beyond the bound
+  for (let i = 0; i < many; i++) await client.resolve(`model-${i}`);
+  const size = client.inspect().length;
+  assert.ok(size <= 1_024, `cache held ${size} entries for ${many} ids`);
+  assert.ok(size >= 1_023, "but it is not evicting entries it should keep");
+});

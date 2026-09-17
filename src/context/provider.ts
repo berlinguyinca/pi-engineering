@@ -112,21 +112,14 @@ export function parseOverrides(raw: string | undefined): Record<string, LocalMod
   for (const entry of raw.split(",")) {
     // Two spellings are accepted, because operators write both:
     //   model:262144:32768:unsafe   and   model=262144:32768:unsafe
-    const [head, ...tail] = entry.trim().split(":");
-    let modelId = head;
-    let windowRaw: string | undefined;
-    let outputRaw: string | undefined;
-    let flag: string | undefined;
-    if (head?.includes("=")) {
-      const [name, window] = head.split("=", 2);
-      modelId = name;
-      windowRaw = window;
-      [outputRaw, flag] = tail;
-    } else {
-      [windowRaw, outputRaw, flag] = [head, ...tail].slice(1);
-      [windowRaw, outputRaw, flag] = [tail[0], tail[1], tail[2]];
-      modelId = head!;
-    }
+    // Whitespace around any field is tolerated. A malformed entry is skipped
+    // whole, never half-applied: a dropped "unsafe" flag would silently turn
+    // an unsafe override into a rejected one (or the reverse).
+    const fields = entry
+      .split(/[=:]/)
+      .map((f) => f.trim())
+      .filter((f) => f.length > 0);
+    const [modelId, windowRaw, outputRaw, flag] = fields;
     const contextWindow = Number(windowRaw);
     if (!modelId || !Number.isFinite(contextWindow) || contextWindow < 1_024) continue;
     overrides[modelId] = {
