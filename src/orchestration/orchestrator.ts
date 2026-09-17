@@ -467,11 +467,19 @@ export class Orchestrator {
       // A task canceled underneath us (steering) must not be rewritten, and a
       // canceled task must NOT count as passing evidence for a gate.
       const status = this.store.getTask(taskId)?.status;
-      if (status === "RUNNING") {
-        this.store.transitionTask(taskId, "SUCCEEDED");
-        return true;
+      if (status !== "RUNNING") return false;
+      // A backend that resolves without throwing has NOT necessarily succeeded:
+      // integration reports `conflict`, validation reports `failed`, and a worker
+      // reports `failed` through exitStatus. Trusting resolution alone let a
+      // failing test suite satisfy the validation gate and a conflicted merge
+      // satisfy integration — i.e. a mission could COMPLETE over an unchanged or
+      // broken tree.
+      if (outcome.exitStatus !== "succeeded") {
+        this.store.transitionTask(taskId, "FAILED", "system", { failure_reason: outcome.exitStatus });
+        return false;
       }
-      return false;
+      this.store.transitionTask(taskId, "SUCCEEDED");
+      return true;
     } catch (err) {
       if (this.store.getTask(taskId)?.status === "RUNNING") this.store.transitionTask(taskId, "FAILED");
       return false;

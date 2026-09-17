@@ -6,6 +6,7 @@
  */
 
 import assert from "node:assert/strict";
+import { readFile, writeFile } from "node:fs/promises";
 import { after, describe, it } from "node:test";
 import { EngineeringRuntime } from "../../src/runtime/EngineeringRuntime.ts";
 import type { WorkerExecutor } from "../../src/workers/WorkerExecutor.ts";
@@ -53,8 +54,30 @@ async function openRuntime(
 describe("orchestration via real EngineeringRuntime (acceptance scenarios)", () => {
   const fixtures: Array<{ root: string; cleanup: () => Promise<void> }> = [];
 
-  it("scenario A: 'Add a health endpoint' auto-invokes engineering+validation+review and completes", async () => {
+  /**
+   * A fixture whose own test suite PASSES at baseline.
+   *
+   * The shared fixture ships `add()` unimplemented on purpose (the vertical-slice
+   * test has an agent implement it), so `npm test` in it fails. A happy-path
+   * orchestration scenario asserts validation passes, so it needs a green repo:
+   * on a red one the completion gate now correctly refuses to complete — earlier
+   * these scenarios only "passed" because a failing validation suite was being
+   * ignored (runSingleTask trusted resolution instead of exitStatus).
+   */
+  async function greenFixture(): Promise<{ root: string; cleanup: () => Promise<void> }> {
     const fx = await makeFixtureRepo();
+    const { writeFile } = await import("node:fs/promises");
+    await writeFile(`${fx.root}/src/add.js`, "export function add(a, b) {\n  return a + b;\n}\n", "utf8");
+    const { execFile } = await import("node:child_process");
+    const { promisify } = await import("node:util");
+    const exec = promisify(execFile);
+    await exec("git", ["-C", fx.root, "add", "-A"]);
+    await exec("git", ["-C", fx.root, "commit", "-q", "-m", "green baseline"]);
+    return fx;
+  }
+
+  it("scenario A: 'Add a health endpoint' auto-invokes engineering+validation+review and completes", async () => {
+    const fx = await greenFixture();
     fixtures.push(fx);
     const rt = await openRuntime(fx.root);
     assert.ok(rt.orchestrator, "orchestrator must be wired by the runtime");
@@ -79,7 +102,7 @@ describe("orchestration via real EngineeringRuntime (acceptance scenarios)", () 
   });
 
   it("scenario B: investigation escalates to engineering+review when source changes", async () => {
-    const fx = await makeFixtureRepo();
+    const fx = await greenFixture();
     fixtures.push(fx);
     const rt = await openRuntime(fx.root);
     const baseRef = await rt.git!.headCommit();
@@ -102,7 +125,7 @@ describe("orchestration via real EngineeringRuntime (acceptance scenarios)", () 
   });
 
   it("scenario D: a blocking reviewer finding blocks completion and the orchestrator creates repair work", async () => {
-    const fx = await makeFixtureRepo();
+    const fx = await greenFixture();
     fixtures.push(fx);
     // The review backend reports a blocking finding on every pass, so the
     // orchestrator must repair, re-review, and still refuse to complete.
@@ -144,7 +167,7 @@ describe("orchestration via real EngineeringRuntime (acceptance scenarios)", () 
   });
 
   it("a read-only investigation mission never gets a mutating task and still completes", async () => {
-    const fx = await makeFixtureRepo();
+    const fx = await greenFixture();
     fixtures.push(fx);
     const rt = await openRuntime(fx.root);
     const baseRef = await rt.git!.headCommit();
@@ -168,7 +191,7 @@ describe("orchestration via real EngineeringRuntime (acceptance scenarios)", () 
   });
 
   it("mission/task/execution state survives runtime restart over the same repo", async () => {
-    const fx = await makeFixtureRepo();
+    const fx = await greenFixture();
     fixtures.push(fx);
     const rt1 = await openRuntime(fx.root);
     const baseRef = await rt1.git!.headCommit();
@@ -191,7 +214,7 @@ describe("orchestration via real EngineeringRuntime (acceptance scenarios)", () 
   });
 
   it("a mutating mission's change actually lands in the repository (worktree -> merge)", async () => {
-    const fx = await makeFixtureRepo();
+    const fx = await greenFixture();
     fixtures.push(fx);
     // The worker edits the checkout it was given (its own worktree), like a real
     // implementer does. Without harvesting + integration the worktree is torn
@@ -234,8 +257,84 @@ describe("orchestration via real EngineeringRuntime (acceptance scenarios)", () 
     assert.ok(integ.length >= 1, "an integration step must run for worktree-isolated mutation");
   });
 
+  /** Commit a divergent edit on the same line the worker will touch. */
+  async function commitInMain(root: string, content: string, msg: string): Promise<void> {
+    await writeFile(`${root}/src/add.js`, content, "utf8");
+    const { execFile } = await import("node:child_process");
+    const { promisify } = await import("node:util");
+    const exec = promisify(execFile);
+    await exec("git", ["-C", root, "add", "-A"]);
+    await exec("git", ["-C", root, "commit", "-q", "-m", msg]);
+  }
+
+  it("a conflicted merge blocks completion and leaves the incumbent tree intact", async () => {
+    const fx = await greenFixture();
+    const { GitRepo } = await import("../../src/git/GitRepo.ts");
+    const probe = await GitRepo.open(fx.root);
+    assert.ok(probe);
+    const baseRef = await probe.headCommit();
+
+    // Same line, different content on both sides -> a real merge conflict. The
+    // incumbent line stays valid JS so the conflict, not a check failure, is
+    // what blocks the mission.
+    await commitInMain(fx.root, "export function add(a, b) {\n  return a + b; // main\n}\n", "main note");
+
+    const rt = await openRuntime(fx.root, [], async (cwd, role) => {
+      if (role !== "implementer") return;
+      await writeFile(`${cwd}/src/add.js`, "export function add(a, b) {\n  return a + b; // worker\n}\n", "utf8");
+    });
+
+    const result = await rt.orchestrator!.orchestrate("Annotate the add helper", {
+      repository: rt.cwd,
+      baseRef,
+      mutationRequested: true,
+    });
+
+    const integ = rt.missionStore!.listTasks(result.mission.mission_id).filter((t) => t.kind === "integration");
+    assert.ok(integ.length >= 1, "integration step should have been created");
+    assert.ok(
+      integ.some((t) => t.status === "FAILED"),
+      `a conflicted merge must be recorded as FAILED, got ${integ.map((t) => t.status).join(",")}`,
+    );
+    assert.equal(result.completed, false, "a conflicted integration must never complete the mission");
+    // mergeBranch aborts a conflicted merge, so the incumbent content survives
+    // and the worker's line is not applied.
+    const mainSrc = await readFile(`${fx.root}/src/add.js`, "utf8");
+    assert.ok(mainSrc.includes("// main"), "incumbent content must survive a conflicted merge");
+    assert.ok(!mainSrc.includes("// worker"), "conflicted worker change must not be applied");
+    assert.ok(!mainSrc.includes("<<<<<<<"), "no conflict markers may be left in the working tree");
+  });
+
+  it("integration checks that fail after a clean merge block completion", async () => {
+    const fx = await greenFixture();
+    const baseRef = await (async () => {
+      const { GitRepo } = await import("../../src/git/GitRepo.ts");
+      const g = await GitRepo.open(fx.root);
+      assert.ok(g);
+      return g.headCommit();
+    })();
+
+    // Merges cleanly but breaks the repo's own suite: integration must report
+    // failure through exitStatus (not throw) and the mission must not complete.
+    const rt = await openRuntime(fx.root, [], async (cwd, role) => {
+      if (role !== "implementer") return;
+      await writeFile(`${cwd}/src/add.js`, "export function add(a, b) {\n  return a - b;\n}\n", "utf8");
+    });
+    const result = await rt.orchestrator!.orchestrate("Change add to subtract", {
+      repository: rt.cwd,
+      baseRef,
+      mutationRequested: true,
+    });
+    assert.equal(result.completed, false, "failing integration checks must block completion");
+    const integ = rt.missionStore!.listTasks(result.mission.mission_id).filter((t) => t.kind === "integration");
+    assert.ok(
+      integ.some((t) => t.status === "FAILED"),
+      `integration must be FAILED, got ${integ.map((t) => t.status).join(",")}`,
+    );
+  });
+
   it("publishes the versioned mission snapshot file the PI WEB plugin reads (spec 08)", async () => {
-    const fx = await makeFixtureRepo();
+    const fx = await greenFixture();
     fixtures.push(fx);
     const rt = await openRuntime(fx.root);
     const baseRef = await rt.git!.headCommit();

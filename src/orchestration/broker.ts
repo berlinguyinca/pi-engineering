@@ -178,7 +178,13 @@ export class ExecutionBroker {
   private async allocateWorktree(executionId: string, input: ExecutionRequestInput): Promise<string | null> {
     if (!input.mutatesRepo || input.isolation !== "worktree" || !this.git) return null;
     try {
-      const base = this.baseRef || (await this.git.headCommit());
+      // The mission's declared base_ref wins: a mission planned against commit X
+      // must branch from X. Falling back to a broker-level ref captured earlier
+      // (the runtime's HEAD at open) silently based the worker on a NEWER commit,
+      // which turns a real conflict into a clean merge where the worker's version
+      // wins over the incumbent.
+      const missionBase = this.store.getMission(input.missionId)?.base_ref?.trim();
+      const base = missionBase || this.baseRef || (await this.git.headCommit());
       const branch = `pi-eng-orch-${input.taskId}`;
       const wt = await this.git.createWorktree(base, branch);
       const info = { path: wt.path, branch: wt.branch };

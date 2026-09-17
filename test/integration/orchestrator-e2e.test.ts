@@ -24,19 +24,45 @@ interface Harness {
   calls: { agent: string[]; review: string[]; validation: string[]; process: string[] };
 }
 
-function harness(opts: { findings?: string[]; failValidation?: boolean; reviewDelay?: boolean } = {}): Harness {
+interface HarnessOpts {
+  findings?: string[];
+  failValidation?: boolean;
+  reviewDelay?: boolean;
+  /**
+   * Realistic validation failure shape. The real CommandVerifier backend does
+   * NOT throw on a failing suite — it resolves with exitStatus "failed". Modeled
+   * only as a throw, the orchestrator once counted a failing suite as passing
+   * gate evidence, so this pins the non-throwing shape too.
+   */
+  validationExitStatus?: string;
+  reviewExitStatus?: string;
+  agentExitStatus?: string;
+}
+
+function harness(opts: HarnessOpts = {}): Harness {
   const store = MissionStore.open(JsonlEventStore.inMemory());
   const calls = { agent: [] as string[], review: [] as string[], validation: [] as string[], process: [] as string[] };
   const backends: BrokerBackends = {
     agent: {
       runAgent: async ({ role, objective }) => {
         calls.agent.push(role ?? objective);
-        return { executionId: "e", exitStatus: "succeeded", summary: "implemented", artifactRefs: [], usage: {} };
+        const exit = opts.agentExitStatus ?? "succeeded";
+        return { executionId: "e", exitStatus: exit, summary: "implemented", artifactRefs: [], usage: {} };
       },
     },
     review: {
       runReview: async () => {
         calls.review.push("review");
+        if (opts.reviewExitStatus && opts.reviewExitStatus !== "succeeded") {
+          return {
+            executionId: "e",
+            exitStatus: opts.reviewExitStatus,
+            summary: "review did not complete",
+            artifactRefs: [],
+            usage: {},
+            findings: [],
+          };
+        }
         const findings = (opts.findings ?? []).map((f) => ({ summary: f, severity: "blocking", status: "open" }));
         return {
           executionId: "e",
@@ -52,6 +78,15 @@ function harness(opts: { findings?: string[]; failValidation?: boolean; reviewDe
       runValidation: async () => {
         calls.validation.push("validation");
         if (opts.failValidation) throw new Error("test failed: expected 1 got 2");
+        if (opts.validationExitStatus && opts.validationExitStatus !== "succeeded") {
+          return {
+            executionId: "e",
+            exitStatus: opts.validationExitStatus,
+            summary: "validation did not pass",
+            artifactRefs: [],
+            usage: {},
+          };
+        }
         return { executionId: "e", exitStatus: "succeeded", summary: "valid", artifactRefs: [], usage: {} };
       },
     },
@@ -355,5 +390,52 @@ describe("acceptance scenario F — state survives orchestrator restart", () => 
       planner: async () => [],
     });
     assert.equal(o2.gate.evaluate(store2.getMission(missionId)!).can_complete, true);
+  });
+});
+
+describe("exitStatus is authoritative (non-throwing backend failures)", () => {
+  it("validation that reports exitStatus 'failed' does NOT satisfy the validation gate", async () => {
+    const h = harness({ validationExitStatus: "failed" });
+    const result = await h.orchestrator.orchestrate("Add an endpoint and fix the build", {
+      repository: ".",
+      baseRef: "abc",
+      mutationRequested: true,
+    });
+    assert.equal(result.completed, false, "a failing validation suite must never complete the mission");
+    // The validation task must be recorded as FAILED, not SUCCEEDED, so the gate
+    // (and any operator) can see why.
+    const v = h.store.listTasks(result.mission.mission_id).filter((t) => t.kind === "validation");
+    assert.ok(v.length >= 1);
+    assert.ok(
+      v.some((t) => t.status === "FAILED"),
+      `a validation task must be FAILED, got ${v.map((t) => t.status).join(",")}`,
+    );
+    assert.ok(h.calls.validation.length >= 1, "validation must still have been attempted");
+  });
+
+  it("review that reports exitStatus 'failed' does NOT count as a completed review", async () => {
+    const h = harness({ reviewExitStatus: "failed" });
+    const result = await h.orchestrator.orchestrate("Add an endpoint and fix the build", {
+      repository: ".",
+      baseRef: "abc",
+      mutationRequested: true,
+    });
+    assert.equal(result.completed, false, "an incomplete review must not satisfy the review gate");
+    assert.ok(h.calls.review.length >= 1);
+  });
+
+  it("a worker reporting exitStatus 'failed' is not counted as a succeeded mutation", async () => {
+    const h = harness({ agentExitStatus: "failed" });
+    const result = await h.orchestrator.orchestrate("Add an endpoint and fix the build", {
+      repository: ".",
+      baseRef: "abc",
+      mutationRequested: true,
+    });
+    assert.equal(result.completed, false, "a failed worker must not yield a completed mission");
+    const impl = h.store.listTasks(result.mission.mission_id).filter((t) => t.role === "implementer");
+    assert.ok(
+      impl.some((t) => t.status === "FAILED"),
+      `implementer must be FAILED, got ${impl.map((t) => t.status).join(",")}`,
+    );
   });
 });

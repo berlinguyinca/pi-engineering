@@ -248,13 +248,21 @@ export class MissionScheduler {
           attempt,
           assigned_execution_id: handle.executionId,
         });
-        await handle.result();
+        const outcome = await handle.result();
         // A task canceled underneath the runner (constraint steering) is already
         // CANCELED; CANCELED -> SUCCEEDED is an illegal transition and used to
         // escape as an unhandled rejection from the fire-and-forget run.
-        if (this.store.getTask(task.task_id)?.status === "RUNNING") {
-          this.store.transitionTask(task.task_id, "SUCCEEDED");
+        if (this.store.getTask(task.task_id)?.status !== "RUNNING") return;
+        // Resolution is not success: backends report failure through exitStatus
+        // without throwing. Treating resolution as success let a failed worker
+        // satisfy the completion gate.
+        if (outcome.exitStatus !== "succeeded") {
+          this.store.transitionTask(task.task_id, "FAILED", "system", {
+            failure_reason: `backend reported ${outcome.exitStatus}`,
+          });
+          return;
         }
+        this.store.transitionTask(task.task_id, "SUCCEEDED");
         return;
       } catch (err) {
         if (this.store.getTask(task.task_id)?.status === "CANCELED") return;
