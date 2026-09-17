@@ -234,14 +234,13 @@
   findings:
     critical: 0
     high: 0
-
 - id: dogfood-stale-context-fallback
   milestone: __global__
   type: dogfood
   status: pass
   commit: 6596c709923f183dc1ce6419b054b698141b0fe5
   generatedAt: 2026-09-17T09:26:08.000Z
-  paths: &staleCtx
+  paths: &a4
     - src/gateway/fallbackLifecycle.ts
     - src/status/footer.ts
     - extensions/index.ts
@@ -249,8 +248,8 @@
     - scripts/dogfood-stale-context-fallback.ts
     - scripts/fresh-review-stale-context-fallback.ts
   proof: scripts/dogfood-stale-context-fallback.ts — deterministic scripted 429
-    inference_admission gateway driving the REAL installGatewayStreamRetry pump +
-    FallbackCoordinator + applyPendingFallback, wired exactly as
+    inference_admission gateway driving the REAL installGatewayStreamRetry pump
+    + FallbackCoordinator + applyPendingFallback, wired exactly as
     extensions/index.ts; 5 phases, exit 0
   summary: "Stale ExtensionCommandContext crash fix: the gateway retry pump is
     driven with the exact 429 inference_admission envelope and onHold/onProgress
@@ -269,16 +268,16 @@
   status: pass
   commit: 6596c709923f183dc1ce6419b054b698141b0fe5
   generatedAt: 2026-09-17T09:26:08.000Z
-  paths: *staleCtx
-  proof: "scripts/fresh-review-stale-context-fallback.ts (worker-based; deferred
-    at record time — the configured gateway was saturated, 30s+ timeouts on every
+  paths: *a4
+  proof: scripts/fresh-review-stale-context-fallback.ts (worker-based; deferred at
+    record time — the configured gateway was saturated, 30s+ timeouts on every
     model call, the failure mode under review). Manual fresh-context review
-    performed against the actual code and Pi's own extension runner source, which
-    verifies ctx.model is an assertActive getter (runner.js:532) and that the
-    hold path reads only the captured plain Model (id/provider), never a ctx
+    performed against the actual code and Pi's own extension runner source,
+    which verifies ctx.model is an assertActive getter (runner.js:532) and that
+    the hold path reads only the captured plain Model (id/provider), never a ctx
     getter. 0 critical / 0 high; 1 medium (fallback was fire-and-forget from
     before_agent_start, risking a mid-turn setModel), fixed to await so the
-    switch lands before the turn's first provider call."
+    switch lands before the turn's first provider call.
   summary: "Stale-context fallback review: verified no retained Pi context
     (latestCtx removed, no equivalent), onHold writes only plain data, the
     fallback runs only from a fresh lifecycle ctx, model_select and
@@ -291,3 +290,42 @@
   findings:
     critical: 0
     high: 0
+- id: dogfood-panel-context-surface
+  milestone: __global__
+  type: dogfood
+  status: pass
+  commit: 103f80965c9a6ec55c9c6f3437e6a30b8fa03fd0
+  generatedAt: 2026-09-17T15:42:00.333Z
+  paths: &a5
+    - src/context/
+    - src/gateway/
+    - src/status/
+    - src/telemetry/
+    - src/panel/
+    - extensions/
+    - test/
+  proof: scripts/dogfood-panel-surface.ts (width contract vs real Theme, no
+    terminal writes) + scripts/dogfood-roadmap.ts (full lifecycle, PASS); npm
+    run typecheck, npm run lint, npm test (1148 pass)
+  summary: Panel + context + gateway-fallback + status + telemetry surface review
+    and dogfood at HEAD
+- id: review-panel-context-surface
+  milestone: __global__
+  type: fresh_review
+  status: pass
+  commit: 103f80965c9a6ec55c9c6f3437e6a30b8fa03fd0
+  generatedAt: 2026-09-17T15:42:00.333Z
+  paths: *a5
+  proof: Focused fresh review of src/context (capability/client/provider/usage),
+    src/gateway (fallbackLifecycle, admissionNotice), src/status (footer,
+    ambient), src/telemetry (sink), src/panel, and extensions/ wiring. Reviewed
+    single-flight/stale-if-error/abort handling, fallback lifecycle safety
+    (plain-data state, fresh-ctx application), width contract, telemetry sink
+    stack. Found 0 critical, 0 high; fixed one redundant ternary in
+    src/context/usage.ts.
+  summary: Panel + context + gateway-fallback + status + telemetry surface review
+    and dogfood at HEAD
+  findings:
+    critical: 0
+    high: 0
+
