@@ -437,7 +437,16 @@ export class FooterController {
 
   private async refreshGit(): Promise<void> {
     const cwd = this.status.snapshot.cwd;
-    const g = await this.git.resolve(cwd);
+    // Detached callers (`void this.refreshGit()`) must never see a rejection:
+    // a transient git failure is not fatal to the footer, and an unhandled
+    // rejection here would terminate the whole Pi session. Keep the last known
+    // git state on screen rather than blanking or crashing.
+    let g;
+    try {
+      g = await this.git.resolve(cwd);
+    } catch {
+      return;
+    }
     if (this.disposed) return;
     this.status.set({
       repositoryRoot: g.repositoryRoot,
