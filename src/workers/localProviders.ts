@@ -2,6 +2,14 @@ import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
+import type { AdmissionRetryConfig } from "../inference/admissionConfig.ts";
+import type { AdmissionEventBus } from "../inference/admissionEvents.ts";
+import {
+  type AdmissionBudgetLedger,
+  type AdmissionState,
+  createAdmissionStreamSimple,
+} from "../inference/admissionTransport.ts";
+import type { AdmissionScope } from "../inference/admissionTransport.ts";
 
 /**
  * Standalone provider discovery for the worker runtime.
@@ -175,10 +183,27 @@ export function partitionByToolSupport(
   return { kept, heldOut };
 }
 
+/** Admission-retry wiring for locally registered providers. */
+export interface LocalAdmissionOptions {
+  config: AdmissionRetryConfig;
+  events?: AdmissionEventBus;
+  budget?: AdmissionBudgetLedger;
+  scope?: AdmissionScope | (() => AdmissionScope);
+  onState?: (state: AdmissionState) => void;
+  onSaturation?: (
+    ref: { provider: string; id: string },
+    saturation: { active?: number; activeLimit?: number; queued?: number; queueLimit?: number },
+  ) => void;
+}
+
 /** Register local nodes onto a ModelRuntime. Returns registered provider ids. */
 export async function registerLocalProviders(
   modelRuntime: ModelRuntime,
-  opts?: { verdicts?: Record<string, boolean>; allowNoTools?: boolean },
+  opts?: {
+    verdicts?: Record<string, boolean>;
+    allowNoTools?: boolean;
+    admission?: LocalAdmissionOptions;
+  },
 ): Promise<string[]> {
   const specs = await readNodeSpecs();
   const verdicts = opts?.verdicts ?? (await readCapabilityVerdicts());
@@ -200,11 +225,13 @@ export async function registerLocalProviders(
       supportsReasoningEffort: node.supportsReasoningEffort === true,
       ...(node.compat ?? {}),
     };
+    const admission = opts?.admission;
     const config = {
       name: node.provider,
       baseUrl: node.baseUrl,
       ...(node.apiKey ? { apiKey: node.apiKey } : {}),
       api: "openai-completions",
+      ...(admission ? { streamSimple: createAdmissionStreamSimple({ ...admission }) } : {}),
       models: usable.map((m) => ({
         id: m.id,
         name: m.name ?? m.id,

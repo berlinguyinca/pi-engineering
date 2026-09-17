@@ -10,8 +10,11 @@ import {
   createExtensionRuntime,
 } from "@earendil-works/pi-coding-agent";
 import type { WorkerResult, WorkerUsage } from "../core/types.ts";
+import type { AdmissionEventBus } from "../inference/admissionEvents.ts";
+import type { AdmissionScope } from "../inference/admissionTransport.ts";
+import { reviewResultTool } from "../lifecycle/reviewResultTool.ts";
 import type { WorkerExecutor, WorkerRequest, WorkerRun } from "./WorkerExecutor.ts";
-import { registerLocalProviders } from "./localProviders.ts";
+import { type LocalAdmissionOptions, registerLocalProviders } from "./localProviders.ts";
 import { WORKER_KICKOFF, buildSystemPrompt } from "./prompts.ts";
 import { workerResultTool } from "./workerResultTool.ts";
 
@@ -38,6 +41,21 @@ export interface PiWorkerExecutorOptions {
   /** Core tools (ledger, artifact, context) exposed to worker sessions. */
   customTools?: ToolDefinition[];
   allowModelNetwork?: boolean;
+  /**
+   * Share an already-built ModelRuntime instead of creating one. The
+   * engineering lifecycle shares its runtime so discovery and execution always
+   * see the same provider inventory.
+   */
+  modelRuntime?: ModelRuntime;
+  /**
+   * Enable InferWeave admission-retry handling for locally registered nodes.
+   * When supplied, admission rejections become scheduler-directed waits instead
+   * of terminal failures, and admission waits are excluded from the worker's
+   * wall-clock timeout budget.
+   */
+  admission?: LocalAdmissionOptions;
+  /** Shared admission event bus (usually the harness's). */
+  admissionEvents?: AdmissionEventBus;
 }
 
 /**
@@ -45,13 +63,21 @@ export interface PiWorkerExecutorOptions {
  *
  * Every task runs in a brand-new in-memory session with a role-specific system
  * prompt and tool allowlist, so no prior reasoning is inherited. The worker must
- * finish by calling `worker_result`; usage is captured from assistant messages.
+ * finish by calling `worker_result` (or `review_result` for review roles); usage
+ * is captured from assistant messages.
+ *
+ * The model is selected per request when `modelOverride` is supplied, which is
+ * how the capability router places each role on a specific provider model.
  */
 export class PiWorkerExecutor implements WorkerExecutor {
   private readonly agentDir: string;
   private readonly customTools: ToolDefinition[];
   private readonly model: Model<any> | undefined;
   private readonly allowModelNetwork: boolean;
+  private readonly admission: LocalAdmissionOptions | undefined;
+  private readonly admissionEvents: AdmissionEventBus | undefined;
+  /** sessionId -> scope, so a shared runtime can attribute waits to the right worker. */
+  private readonly activeScopes = new Map<string, AdmissionScope>();
   private modelRuntime: ModelRuntime | undefined;
   private runtimePromise: Promise<ModelRuntime> | undefined;
 
@@ -60,6 +86,25 @@ export class PiWorkerExecutor implements WorkerExecutor {
     this.customTools = opts.customTools ?? [];
     this.model = opts.model;
     this.allowModelNetwork = opts.allowModelNetwork ?? false;
+    this.admission = opts.admission;
+    this.admissionEvents = opts.admissionEvents;
+    if (opts.modelRuntime) {
+      this.modelRuntime = opts.modelRuntime;
+      this.runtimePromise = Promise.resolve(opts.modelRuntime);
+    }
+  }
+
+  /** Register the scope for a worker session so admission events carry its role. */
+  private registerSessionScope(sessionId: string, scope: AdmissionScope): () => void {
+    this.activeScopes.set(sessionId, scope);
+    return () => this.activeScopes.delete(sessionId);
+  }
+
+  private scopeFor(sessionId?: string): AdmissionScope {
+    if (sessionId && this.activeScopes.has(sessionId)) {
+      return this.activeScopes.get(sessionId)!;
+    }
+    return {};
   }
 
   /** Inject/refresh the semantic tools bound to a runtime (scout/reviewer/implementer sessions). */
@@ -75,18 +120,47 @@ export class PiWorkerExecutor implements WorkerExecutor {
         modelsPath: joinExpand(this.agentDir, "models.json"),
         allowModelNetwork: this.allowModelNetwork,
       });
-      await registerLocalProviders(rt).catch(() => {});
+      await registerLocalProviders(rt, {
+        ...(this.admission ? { admission: { ...this.admission, scope: this.scopeFor.bind(this) } } : {}),
+      }).catch(() => {});
       return rt;
     })();
     return this.runtimePromise;
   }
 
+  /** The runtime used for discovery + model resolution (shared with the router). */
+  async runtime(): Promise<ModelRuntime> {
+    return this.getModelRuntime();
+  }
+
   async run(req: WorkerRequest): Promise<WorkerRun> {
-    const systemPrompt = buildSystemPrompt(req.role, req.task, req.context);
+    const systemPrompt = req.systemPromptOverride ?? buildSystemPrompt(req.role, req.task, req.context);
     const resourceLoader = roleResourceLoader(systemPrompt);
 
     const modelRuntime = await this.getModelRuntime();
     let model = this.model;
+    if (req.modelOverride) {
+      const resolved = modelRuntime.getModel(req.modelOverride.provider, req.modelOverride.id) as
+        | Model<any>
+        | undefined;
+      if (!resolved) {
+        return {
+          result: {
+            status: "failed",
+            summary: `Routed model ${req.modelOverride.provider}/${req.modelOverride.id} is not registered in this runtime.`,
+            claims: [],
+            evidence_refs: [],
+            new_hypotheses: [],
+            proposed_tasks: [],
+            details: {},
+            error: "model-not-registered",
+          },
+          error: "model-not-registered",
+          usage: null,
+        };
+      }
+      model = resolved;
+    }
     if (!model) {
       const available = await modelRuntime.getAvailable();
       model = available[0] as Model<any> | undefined;
@@ -98,7 +172,8 @@ export class PiWorkerExecutor implements WorkerExecutor {
       retry: { enabled: true, maxRetries: 1 },
     });
 
-    const customTools = [...this.customTools, workerResultTool];
+    const terminating = req.resultTool === "review_result" ? reviewResultTool : workerResultTool;
+    const customTools = [...this.customTools, terminating];
     // Tool allowlist must include custom tool names to enable them.
     const tools = [...new Set([...req.tools, ...customTools.map((t) => t.name)])];
 
@@ -114,9 +189,15 @@ export class PiWorkerExecutor implements WorkerExecutor {
       customTools,
       thinkingLevel: "off",
     });
+    const sessionId = session.sessionId ?? sessionManager.getSessionId();
+    const unregisterScope = this.registerSessionScope(sessionId, {
+      sessionId,
+      role: req.role,
+    });
 
     try {
       let captured: WorkerResult | undefined;
+      let structured: unknown;
       let lastAssistantError: string | undefined;
       let toolCalls = 0;
       let budgetExhausted = false;
@@ -134,13 +215,17 @@ export class PiWorkerExecutor implements WorkerExecutor {
         }
       };
       const unsubscribe = session.subscribe((event) => {
-        if (event.type === "tool_execution_end" && event.toolName === "worker_result") {
+        if (event.type === "tool_execution_end" && event.toolName === terminating.name) {
           if (!event.isError) {
-            const details = event.result?.details as WorkerResult | undefined;
-            if (details?.status) captured = details;
+            if (terminating === workerResultTool) {
+              const details = event.result?.details as WorkerResult | undefined;
+              if (details?.status) captured = details;
+            } else {
+              structured = event.result?.details;
+            }
           }
         }
-        if (event.type === "tool_execution_start" && event.toolName !== "worker_result") {
+        if (event.type === "tool_execution_start" && event.toolName !== terminating.name) {
           toolCalls++;
         }
         if ((event.type === "message_end" || event.type === "message_update") && typeof event.message === "object") {
@@ -148,34 +233,81 @@ export class PiWorkerExecutor implements WorkerExecutor {
         }
       });
 
-      // Wall-clock budget.
+      // Wall-clock budget. Admission waits are excluded: each scheduled wait
+      // for this session extends the deadline by the same amount, so a
+      // 30-second scheduler wait never burns a 5-minute worker budget.
       let timedOut = false;
-      const timer = setTimeout(() => {
-        timedOut = true;
-        void session.abort();
-      }, req.timeoutMs ?? 300_000);
+      const baseTimeout = req.timeoutMs ?? 300_000;
+      let deadline = Date.now() + baseTimeout;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const arm = (): void => {
+        if (timer) clearTimeout(timer);
+        timer = setTimeout(
+          () => {
+            timedOut = true;
+            void session.abort();
+          },
+          Math.max(0, deadline - Date.now()),
+        );
+      };
+      arm();
+      const unsubWait = this.admissionEvents?.subscribe((event) => {
+        if (event.sessionId !== sessionId) return;
+        if (event.name !== "inference.retry.scheduled" && event.name !== "inference.retry.waiting") return;
+        const waitMs = event.delayUsedMs ?? event.retryAfterMs ?? 0;
+        if (waitMs <= 0) return;
+        deadline += waitMs;
+        arm();
+      });
 
       try {
-        await session.prompt(WORKER_KICKOFF);
+        await session.prompt(req.kickoff ?? WORKER_KICKOFF, {
+          images: req.images?.map((img) => ({ type: "image" as const, data: img.data, mimeType: img.mimeType })),
+          expandPromptTemplates: false,
+        });
       } catch (err) {
         lastAssistantError = err instanceof Error ? err.message : String(err);
       } finally {
         clearTimeout(timer);
+        unsubWait?.();
+        unregisterScope();
         unsubscribe();
       }
 
-      // Fallback: scan messages for the worker_result tool result.
-      if (!captured) {
+      // Fallback: scan messages for the terminating tool result.
+      if (!captured && !structured) {
         for (const msg of session.messages) {
-          if (msg.role === "toolResult" && msg.toolName === "worker_result" && !msg.isError && msg.details) {
-            const d = msg.details as WorkerResult;
-            if (d?.status) captured = d;
+          if (msg.role === "toolResult" && msg.toolName === terminating.name && !msg.isError && msg.details) {
+            if (terminating === workerResultTool) {
+              const d = msg.details as WorkerResult;
+              if (d?.status) captured = d;
+            } else {
+              structured = msg.details;
+            }
             break;
           }
         }
       }
 
       const usage = this.collectUsage(session.messages);
+      if (terminating === reviewResultTool) {
+        return {
+          result: {
+            status: structured ? "completed" : "failed",
+            summary: structured ? "Review recorded." : "Reviewer returned no review_result.",
+            claims: [],
+            evidence_refs: [],
+            new_hypotheses: [],
+            proposed_tasks: [],
+            details: {},
+            error: structured ? undefined : (lastAssistantError ?? (timedOut ? "timeout" : "no-result")),
+          },
+          structured,
+          usage,
+          error: structured ? undefined : (lastAssistantError ?? (timedOut ? "timeout" : "no-result")),
+          toolCalls,
+        };
+      }
       if (!captured) {
         const reason = budgetExhausted
           ? "Worker exceeded the hard context-token budget."

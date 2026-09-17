@@ -10,6 +10,7 @@ export type { VerificationProvider, VerificationProfile, VerifyOutcome, StageRun
 export type { WorkerExecutor, WorkerRequest, WorkerRun } from "./workers/WorkerExecutor.ts";
 export { PiWorkerExecutor } from "./workers/PiWorkerExecutor.ts";
 export { FakeWorkerExecutor } from "./workers/FakeWorkerExecutor.ts";
+export * from "./inference/index.ts";
 export { buildSystemPrompt, WORKER_KICKOFF } from "./workers/prompts.ts";
 export { workerResultTool } from "./workers/workerResultTool.ts";
 export { buildCoreTools } from "./tools/coreTools.ts";
