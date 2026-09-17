@@ -14,7 +14,7 @@
  */
 
 import { type SchedulableTask, Scheduler } from "../sched/Scheduler.ts";
-import type { ExecutionBroker, ExecutionRequestInput } from "./broker.ts";
+import type { ExecutionBroker, ExecutionHandle, ExecutionRequestInput } from "./broker.ts";
 import type { MissionStore } from "./missionStore.ts";
 import type { OrchestrationTask, TaskKind, TaskStatus } from "./types.ts";
 
@@ -227,22 +227,27 @@ export class MissionScheduler {
     let attempt = task.attempt;
     while (true) {
       attempt++;
-      const handle = await this.broker.execute({
-        taskId: task.task_id,
-        missionId: task.mission_id,
-        kind: brokerKind(task.kind),
-        role: task.role,
-        objective: task.objective,
-        mutatesRepo: task.mutates_repo,
-        writeDomains: task.write_domains,
-        isolation: task.isolation,
-        modelRequirements: task.execution_requirements,
-      });
-      this.store.transitionTask(task.task_id, "RUNNING", "system", {
-        attempt,
-        assigned_execution_id: handle.executionId,
-      });
+      let handle: ExecutionHandle;
       try {
+        // execute() itself can throw (e.g. no backend registered for the kind).
+        // Left outside the try it escaped the fire-and-forget run as an
+        // unhandled rejection and left the task stuck in READY, which then threw
+        // an illegal READY -> READY transition on the next pass.
+        handle = await this.broker.execute({
+          taskId: task.task_id,
+          missionId: task.mission_id,
+          kind: brokerKind(task.kind),
+          role: task.role,
+          objective: task.objective,
+          mutatesRepo: task.mutates_repo,
+          writeDomains: task.write_domains,
+          isolation: task.isolation,
+          modelRequirements: task.execution_requirements,
+        });
+        this.store.transitionTask(task.task_id, "RUNNING", "system", {
+          attempt,
+          assigned_execution_id: handle.executionId,
+        });
         await handle.result();
         // A task canceled underneath the runner (constraint steering) is already
         // CANCELED; CANCELED -> SUCCEEDED is an illegal transition and used to

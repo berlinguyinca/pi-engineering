@@ -194,10 +194,29 @@ export class ExecutionBroker {
     }
   }
 
-  private async releaseWorktree(executionId: string): Promise<void> {
+  /**
+   * Commit a finished worker's edits onto its branch. A worktree directory is
+   * removed after the task settles, and uncommitted edits die with it — without
+   * this harvest, a mutating mission can report COMPLETE having changed the
+   * repository not at all. The branch is kept so integration can merge it.
+   */
+  private async harvestWorktree(executionId: string): Promise<void> {
+    const wt = this.allocatedWorktrees.get(executionId);
+    if (!wt || !this.git) return;
+    try {
+      const status = (await this.git.statusIn(wt.path)).trim();
+      if (status.length > 0) await this.git.commitAll(wt.path, `pi-eng: orchestration work for ${executionId}`);
+    } catch {
+      // A harvest failure must not fail the task; integration will simply have
+      // nothing to merge and the mission will not show the change.
+    }
+  }
+
+  private async releaseWorktree(executionId: string, keepBranch = true): Promise<void> {
     const wt = this.allocatedWorktrees.get(executionId);
     if (wt && this.git) {
-      await this.git.removeWorktree({ path: wt.path, branch: wt.branch }).catch(() => {});
+      // Keep the branch: it carries the harvested work until integration merges it.
+      await this.git.removeWorktree({ path: wt.path, branch: wt.branch }, { keepBranch }).catch(() => {});
     }
     this.allocatedWorktrees.delete(executionId);
   }
@@ -206,6 +225,11 @@ export class ExecutionBroker {
   private settledElsewhere(executionId: string): boolean {
     const ex = this.store.listExecutions().find((e) => e.execution_id === executionId);
     return !!ex && ex.status !== "RUNNING";
+  }
+
+  /** Branches allocated for a mission that still await an integration merge. */
+  pendingIntegrations(missionId: string): number {
+    return (this.missionWorktrees.get(missionId) ?? []).length;
   }
 
   /** Release any worktrees still tracked for a finished mission. */
@@ -285,6 +309,11 @@ export class ExecutionBroker {
               artifact_refs: outcome.artifactRefs,
               usage: outcome.usage,
             });
+          }
+          // Persist the worker's edits onto its branch before the worktree is
+          // torn down, otherwise integration has nothing to merge.
+          if (input.mutatesRepo && worktree && outcome.exitStatus === "succeeded") {
+            await this.harvestWorktree(execution.execution_id);
           }
           this.active.delete(execution.execution_id);
           return outcome;

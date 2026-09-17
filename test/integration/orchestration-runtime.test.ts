@@ -11,9 +11,14 @@ import { EngineeringRuntime } from "../../src/runtime/EngineeringRuntime.ts";
 import type { WorkerExecutor } from "../../src/workers/WorkerExecutor.ts";
 import { makeFixtureRepo } from "../fixtures/make-fixture.ts";
 
-async function openRuntime(root: string, reviewFindings: unknown[] = []) {
+async function openRuntime(
+  root: string,
+  reviewFindings: unknown[] = [],
+  onRun?: (cwd: string, role: string) => Promise<void> | void,
+) {
   const worker: WorkerExecutor = {
     async run(req) {
+      await onRun?.(req.cwd ?? root, req.role ?? "");
       return {
         result: {
           status: "completed",
@@ -183,6 +188,50 @@ describe("orchestration via real EngineeringRuntime (acceptance scenarios)", () 
       rt2.missionStore!.listTasks(r.mission.mission_id).length,
       rt1.missionStore!.listTasks(r.mission.mission_id).length,
     );
+  });
+
+  it("a mutating mission's change actually lands in the repository (worktree -> merge)", async () => {
+    const fx = await makeFixtureRepo();
+    fixtures.push(fx);
+    // The worker edits the checkout it was given (its own worktree), like a real
+    // implementer does. Without harvesting + integration the worktree is torn
+    // down and the mission "completes" with an unchanged repository.
+    const workerCwd: string[] = [];
+    const rt = await openRuntime(fx.root, [], async (cwd, role) => {
+      if (role !== "implementer") return;
+      workerCwd.push(cwd);
+      const { mkdir, writeFile } = await import("node:fs/promises");
+      await mkdir(`${cwd}/src`, { recursive: true });
+      await writeFile(`${cwd}/src/health.ts`, `export const health = () => ({ ok: true });\n`, "utf8");
+    });
+    const baseRef = await rt.git!.headCommit();
+    const result = await rt.orchestrator!.orchestrate("Add a health endpoint", {
+      repository: rt.cwd,
+      baseRef,
+      mutationRequested: true,
+    });
+
+    const { access } = await import("node:fs/promises");
+    let landed = true;
+    try {
+      await access(`${fx.root}/src/health.ts`);
+    } catch {
+      landed = false;
+    }
+    if (!landed) {
+      assert.fail(
+        `worker change never reached the repo (mission ${result.mission.status}, completed=${result.completed}, ${result.failureReason ?? ""})`,
+      );
+    }
+    assert.ok(landed);
+    // The change must have travelled worktree -> harvest -> merge, not been
+    // written straight into the main checkout (which would make this test pass
+    // vacuously if worktree isolation silently fell back to cwd).
+    assert.ok(workerCwd.length >= 1, "implementer should have run");
+    assert.notEqual(workerCwd[0], fx.root, "implementer must run in an isolated worktree");
+    // And the mission only completed because the change was integrated first.
+    const integ = rt.missionStore!.listTasks(result.mission.mission_id).filter((t) => t.kind === "integration");
+    assert.ok(integ.length >= 1, "an integration step must run for worktree-isolated mutation");
   });
 
   it("publishes the versioned mission snapshot file the PI WEB plugin reads (spec 08)", async () => {

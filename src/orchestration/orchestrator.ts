@@ -24,6 +24,7 @@ import type { MissionStore } from "./missionStore.ts";
 import { deriveRequiredGates, mutationFactFromChangedFiles } from "./policies.ts";
 import { brokerKind } from "./scheduler.ts";
 import { MissionScheduler } from "./scheduler.ts";
+import { canTransitionMission } from "./state.ts";
 import type {
   AcceptanceCriterion,
   CompletionVerdict,
@@ -216,15 +217,19 @@ export class Orchestrator {
     this.phase(this.store.getMission(mission.mission_id)!, "executing");
     await this.scheduler.runMission(mission.mission_id);
 
-    // Post-execution: validate + review if the mission mutated or requires gates.
-    await this.postExecution(this.store.getMission(mission.mission_id)!);
+    // Post-execution: integrate, validate + review if the mission mutated or
+    // requires gates. If integration did not land the change, the mission must
+    // not complete — otherwise it reports success over an unchanged repository.
+    const pendingMerge = this.broker.pendingIntegrations(mission.mission_id) > 0;
+    let post = await this.postExecution(this.store.getMission(mission.mission_id)!);
+    let integrated = !pendingMerge || post.integrationOk;
 
     // Completion gate, with bounded repair rounds (spec 07): a blocking reviewer
     // finding creates repair work, and the repaired result is re-validated and
     // re-reviewed before the gate is consulted again.
     let verdict = this.gate.evaluate(this.store.getMission(mission.mission_id)!);
     let repairRounds = 0;
-    while (!verdict.can_complete && repairRounds < this.maxRepairRounds) {
+    while ((!verdict.can_complete || !integrated) && repairRounds < this.maxRepairRounds) {
       const openBlocking = this.store
         .listFindings(mission.mission_id)
         .filter((f) => f.severity === "blocking" && f.status === "open");
@@ -261,12 +266,13 @@ export class Orchestrator {
         // defect records a fresh finding, which keeps the mission blocked.
         if (repaired) this.store.resolveFinding(f.finding_id);
       }
-      // Mandatory re-validation + re-review of the repaired result.
-      const recheck = await this.postExecution(this.store.getMission(mission.mission_id)!);
+      // Mandatory re-integration, re-validation + re-review of the repaired result.
+      post = await this.postExecution(this.store.getMission(mission.mission_id)!);
+      integrated = post.integrationOk;
       // A finding may only be considered cleared if the re-review actually ran.
       // If it failed, there is no evidence the defect is gone, so stop here and
       // let the mission block rather than complete on optimistic closure.
-      if (recheck.reviewAttempted && !recheck.reviewOk) {
+      if (post.reviewAttempted && !post.reviewOk) {
         verdict = this.gate.evaluate(this.store.getMission(mission.mission_id)!);
         break;
       }
@@ -279,7 +285,7 @@ export class Orchestrator {
     await this.broker.cleanupMission(mission.mission_id);
 
     const finalMission = this.store.getMission(mission.mission_id)!;
-    if (verdict.can_complete) {
+    if (verdict.can_complete && integrated) {
       // COMPLETE is only legal from REVIEWING / FINAL_VALIDATION. A mission with
       // no post-execution gates (e.g. a read-only investigation) is still
       // EXECUTING, so settle it into FINAL_VALIDATION first.
@@ -325,16 +331,47 @@ export class Orchestrator {
    * whether each stage was attempted and whether it succeeded, so the caller
    * can refuse to complete when a mandatory re-review did not actually run.
    */
-  private async postExecution(
-    mission: Mission,
-  ): Promise<{ validationAttempted: boolean; validationOk: boolean; reviewAttempted: boolean; reviewOk: boolean }> {
+  private async postExecution(mission: Mission): Promise<{
+    validationAttempted: boolean;
+    validationOk: boolean;
+    reviewAttempted: boolean;
+    reviewOk: boolean;
+    integrationOk: boolean;
+  }> {
     let validationAttempted = false;
     let validationOk = false;
     let reviewAttempted = false;
     let reviewOk = false;
+    let integrationOk = false;
     const gates = new Set<RequiredGate>(mission.required_gates);
     const tasks = this.store.listTasks(mission.mission_id);
     const anyMutation = tasks.some((t) => t.mutates_repo && t.status === "SUCCEEDED");
+
+    // INTEGRATING first: workers and repairs edit isolated worktrees whose
+    // branches must be merged into the checkout BEFORE validation and review,
+    // otherwise both run against an unchanged tree and a mutating mission can
+    // 'complete' without the repository ever changing.
+    // Only integrate when isolated worktrees actually hold unmerged work: a
+    // mission with no git provider edits the checkout directly and needs no merge.
+    if (this.broker.pendingIntegrations(mission.mission_id) > 0) {
+      const cur = this.store.getMission(mission.mission_id)!.status;
+      if (cur !== "INTEGRATING" && canTransitionMission(cur, "INTEGRATING")) {
+        this.store.transitionMission(mission.mission_id, "INTEGRATING");
+      }
+      const integ = this.store.createTask({
+        mission_id: mission.mission_id,
+        kind: "integration",
+        role: "integrator",
+        objective: "Merge worker/repair branches into the base checkout.",
+        mutates_repo: true,
+        isolation: "none",
+      });
+      this.store.transitionTask(integ.task_id, "READY");
+      integrationOk = await this.runSingleTask(mission.mission_id, integ.task_id);
+      // A conflicted or failed integration means the change is not in the tree;
+      // report it so the caller does not complete on top of an unchanged repo.
+      if (!integrationOk) return { validationAttempted, validationOk, reviewAttempted, reviewOk, integrationOk };
+    }
 
     if (gates.has("validation") || anyMutation) {
       this.store.transitionMission(mission.mission_id, "VALIDATING");
@@ -384,7 +421,7 @@ export class Orchestrator {
       // by the caller via the completion gate).
       this.store.transitionMission(mission.mission_id, "FINAL_VALIDATION");
     }
-    return { validationAttempted, validationOk, reviewAttempted, reviewOk };
+    return { validationAttempted, validationOk, reviewAttempted, reviewOk, integrationOk };
   }
 
   private lastValidationTaskId(missionId: string): string[] {
@@ -427,9 +464,14 @@ export class Orchestrator {
           recommended_action: String(f.recommended_action ?? ""),
         });
       }
-      // A task canceled underneath us (steering) must not be rewritten.
-      if (this.store.getTask(taskId)?.status === "RUNNING") this.store.transitionTask(taskId, "SUCCEEDED");
-      return true;
+      // A task canceled underneath us (steering) must not be rewritten, and a
+      // canceled task must NOT count as passing evidence for a gate.
+      const status = this.store.getTask(taskId)?.status;
+      if (status === "RUNNING") {
+        this.store.transitionTask(taskId, "SUCCEEDED");
+        return true;
+      }
+      return false;
     } catch (err) {
       if (this.store.getTask(taskId)?.status === "RUNNING") this.store.transitionTask(taskId, "FAILED");
       return false;

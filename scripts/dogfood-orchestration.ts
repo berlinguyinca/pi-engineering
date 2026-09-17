@@ -221,8 +221,38 @@ try {
     `${afterTasks.length} tasks`,
   );
 
-  // ---- 5: pure investigation does not mutate
-  console.log("\n[5] investigation intent stays read-only");
+  // ---- 5: a mutating mission's change actually lands in the repository
+  console.log("\n[5] worktree work is harvested and merged into the repo");
+  const lFx = await makeRepo();
+  cleanupFns.push(lFx.cleanup);
+  const lSeen: string[] = [];
+  const lRt = await open(lFx.root, [], async (cwd, role) => {
+    if (role !== "implementer") return;
+    lSeen.push(cwd);
+    await writeFile(join(cwd, "LANDING.md"), "# landed\n", "utf8");
+  });
+  const lBase = await lRt.git!.headCommit();
+  const lRes = await lRt.orchestrator!.orchestrate("Add a landing note", {
+    repository: lRt.cwd,
+    baseRef: lBase,
+    mutationRequested: true,
+  });
+  check("implementer ran in an isolated worktree", lSeen.length > 0 && lSeen[0] !== lFx.root, lSeen[0] ?? "none");
+  let landed = false;
+  try {
+    const txt = await readFile(join(lFx.root, "LANDING.md"), "utf8");
+    landed = txt.includes("landed");
+  } catch {
+    landed = false;
+  }
+  check(
+    "worker change reached the main checkout via harvest + integration",
+    landed,
+    `mission=${lRes.mission.status} completed=${lRes.completed} ${lRes.failureReason ?? ""}`,
+  );
+
+  // ---- 6: pure investigation does not mutate
+  console.log("\n[6] investigation intent stays read-only");
   const iFx = await makeRepo();
   cleanupFns.push(iFx.cleanup);
   const iRt = await open(iFx.root);
