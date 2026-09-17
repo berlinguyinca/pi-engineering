@@ -5,6 +5,33 @@ import { MissionStore } from "../../src/orchestration/missionStore.ts";
 import { MissionScheduler, classifyFailure, domainsOverlap } from "../../src/orchestration/scheduler.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 
+/** Deterministic overlap barrier (see dag-parallel/blackhole tests). */
+function parallelBarrier(needed: number, timeoutMs = 5000): { arrived: () => Promise<void> } {
+  let count = 0;
+  let release: () => void;
+  let settled = false;
+  const gate = new Promise<void>((r) => {
+    release = r;
+  });
+  const timer = setTimeout(() => {
+    if (!settled) {
+      settled = true;
+      release();
+    }
+  }, timeoutMs);
+  return {
+    async arrived() {
+      count++;
+      if (count >= needed && !settled) {
+        settled = true;
+        clearTimeout(timer);
+        release();
+      }
+      await gate;
+    },
+  };
+}
+
 function makeBroker(store: MissionStore, backends: BrokerBackends) {
   return new ExecutionBroker({ store, backends });
 }
@@ -46,12 +73,14 @@ describe("MissionScheduler (spec 02)", () => {
     });
     let maxConcurrent = 0;
     let concurrent = 0;
+    const barrier = parallelBarrier(2);
     const backends: BrokerBackends = {
       agent: {
         runAgent: async () => {
           concurrent++;
           maxConcurrent = Math.max(maxConcurrent, concurrent);
-          await new Promise((r) => setTimeout(r, 20));
+          // Block until both agents are active: deterministic overlap.
+          await barrier.arrived();
           concurrent--;
           return { executionId: "e", exitStatus: "succeeded", summary: "done", artifactRefs: [], usage: {} };
         },
