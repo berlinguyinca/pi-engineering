@@ -131,11 +131,30 @@ Pi Engineering remains the orchestration authority.
 
 - **Semantic tool `mission`** — the parent session calls it with a
   normal-language request; the runtime auto-invokes the orchestration workflow.
+- **Auto-invocation hook** — a `before_agent_start` handler classifies every
+  user prompt with the deterministic `IntentRouter`; engineering/review intent
+  injects a directive to call the `mission` tool, making auto-invocation
+  hands-free (not model-discretionary). Deduped per prompt for 30s; enforcement
+  still comes from the runtime completion gate.
 - **`/mission <request>`** — optional power-user control (correctness never
   depends on it).
 - **`/mission-status`** — list missions and task progress.
 - `EngineeringRuntime.orchestrator` + `EngineeringRuntime.missionStore` are the
   programmatic entry points.
+
+## Worktree isolation + integration
+
+For a task with `isolation=worktree` and `mutates_repo`, the broker allocates a
+dedicated **git worktree** (reusing `GitRepo.createWorktree`/`removeWorktree`)
+and tracks it per-mission. When the mission reaches its `integration` task, the
+broker collects those worker worktrees as handoffs and the real integration
+backend merges each branch into the current checkout sequentially (via
+`GitRepo.mergeBranch`), runs integration checks, then releases the worktrees.
+Merge conflicts surface as a `conflict` outcome that blocks completion.
+
+Reviewer findings from the real backend are normalized from several shapes
+(structured objects, plain strings, JSON strings) into `{severity, summary, …}`
+records that the orchestrator persists and the completion gate blocks on.
 
 ## Storage
 

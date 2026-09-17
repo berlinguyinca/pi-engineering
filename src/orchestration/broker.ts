@@ -89,7 +89,11 @@ export interface ReviewRunner {
 }
 
 export interface IntegrationRunner {
-  runIntegration(input: { objective: string; signal: AbortSignal }): Promise<ExecutionOutcome>;
+  runIntegration(input: {
+    objective: string;
+    handoffs: Array<{ worktree: { path: string; branch: string }; summary: string; artifacts: string[] }>;
+    signal: AbortSignal;
+  }): Promise<ExecutionOutcome>;
 }
 
 export interface ValidationRunner {
@@ -125,6 +129,8 @@ export class ExecutionBroker {
   private readonly active = new Map<string, { abort: AbortController; status: string; worktree: string | null }>();
   /** Allocated worktrees, cleaned up when their execution settles. */
   readonly allocatedWorktrees = new Map<string, { path: string; branch: string }>();
+  /** Mission-scoped worktrees awaiting integration (merged+cleaned by the integrator). */
+  private readonly missionWorktrees = new Map<string, { path: string; branch: string }[]>();
 
   constructor(opts: BrokerOptions) {
     this.store = opts.store;
@@ -141,7 +147,11 @@ export class ExecutionBroker {
       const base = this.baseRef || (await this.git.headCommit());
       const branch = `pi-eng-orch-${input.taskId}`;
       const wt = await this.git.createWorktree(base, branch);
-      this.allocatedWorktrees.set(executionId, { path: wt.path, branch: wt.branch });
+      const info = { path: wt.path, branch: wt.branch };
+      this.allocatedWorktrees.set(executionId, info);
+      const mission = this.missionWorktrees.get(input.missionId) ?? [];
+      mission.push(info);
+      this.missionWorktrees.set(input.missionId, mission);
       return wt.path;
     } catch {
       // If a worktree cannot be allocated (e.g. not a git repo), fall back to
@@ -156,6 +166,18 @@ export class ExecutionBroker {
       await this.git.removeWorktree({ path: wt.path, branch: wt.branch }).catch(() => {});
     }
     this.allocatedWorktrees.delete(executionId);
+  }
+
+  /** Remove + clean all mission worktrees (after integration). */
+  private async releaseMissionWorktrees(missionId: string): Promise<void> {
+    const wts = this.missionWorktrees.get(missionId) ?? [];
+    for (const wt of wts) {
+      if (this.git) await this.git.removeWorktree({ path: wt.path, branch: wt.branch }).catch(() => {});
+    }
+    this.missionWorktrees.delete(missionId);
+    for (const [execId, info] of [...this.allocatedWorktrees]) {
+      if (wts.some((w) => w.branch === info.branch)) this.allocatedWorktrees.delete(execId);
+    }
   }
 
   /** Map a task kind to a broker backend. */
@@ -283,7 +305,16 @@ export class ExecutionBroker {
       case "integration": {
         const runner = this.backends.integration;
         if (!runner) throw new Error("no integration backend registered");
-        return runner.runIntegration({ objective: input.objective, signal });
+        const handoffs = (this.missionWorktrees.get(input.missionId) ?? []).map((w) => ({
+          worktree: w,
+          summary: input.objective,
+          artifacts: [] as string[],
+        }));
+        // After integration, release the merged worktrees (fire-and-forget
+        // cleanup so the return value stays a plain Promise<ExecutionOutcome>).
+        const outcome = runner.runIntegration({ objective: input.objective, handoffs, signal });
+        outcome.then(() => this.releaseMissionWorktrees(input.missionId)).catch(() => {});
+        return outcome;
       }
       case "validation": {
         const runner = this.backends.validation;

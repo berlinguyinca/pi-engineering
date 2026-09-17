@@ -21,9 +21,9 @@ Maps `docs/specs/pi-engineering-orchestration/**` requirements to reuse / modify
 | 3 | Unified execution broker | **new** | `src/orchestration/broker.ts` |
 | 3 | Cancellation + steering | **new** | broker handles |
 | 4 | DAG scheduler + write domains + concurrency + retry | **new** | `src/orchestration/scheduler.ts` |
-| 5 | Worktree lifecycle + integrator role | **new** (+ reuse GitRepo) | `src/orchestration/broker.ts` (`allocateWorktree`/`releaseWorktree`), `integrator.ts` |
-| 6 | Automatic engineering workflow (no slash cmd) | **new** | `src/orchestration/orchestrator.ts`, extension hook |
-| 7 | Review/repair/completion gates | **new** | `src/orchestration/completionGate.ts`, `review.ts` |
+| 5 | Worktree lifecycle + integrator role | **new** (+ reuse GitRepo) | `src/orchestration/broker.ts` (`allocateWorktree`/`releaseWorktree`/integration handoffs), `integrator.ts`, `realBackends.ts` |
+| 6 | Automatic engineering workflow (no slash cmd) | **new** | `src/orchestration/orchestrator.ts`, `before_agent_start` auto-invocation hook |
+| 7 | Review/repair/completion gates | **new** | `src/orchestration/completionGate.ts`, `realBackends.ts` (`normalizeFindings`), `orchestrator.ts` |
 | 8 | PI WEB mission/task/execution surface | **modify** | `src/platform/ControlPlane.ts` snapshot + extension |
 | 9 | Context packets + artifacts | reused | `src/context/ContextBroker.ts`, `src/artifacts/ArtifactStore.ts` |
 | 10 | Capability-based model selection | reused | `src/routing/ModelRouter.ts` |

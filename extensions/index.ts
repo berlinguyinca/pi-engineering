@@ -34,6 +34,8 @@ import { guardFeedFor } from "../src/guard/streamText.ts";
 import { ModelHealthProvider } from "../src/models/health.ts";
 import { defaultModelsPath, providerBaseUrl, readModelsConfig } from "../src/models/modelsConfig.ts";
 import { refreshProviderModels } from "../src/models/refresh.ts";
+import { classifyIntent, workflowForIntent } from "../src/orchestration/intentRouter.ts";
+import type { Intent, WorkflowClass } from "../src/orchestration/types.ts";
 import { PanelController } from "../src/panel/PanelController.ts";
 import { PanelState } from "../src/panel/PanelState.ts";
 import { readCommitContent, readDiffContent, readFileContent } from "../src/panel/content.ts";
@@ -329,6 +331,56 @@ export default function (pi: ExtensionAPI) {
   for (const tool of buildCoreTools(resolveServices)) {
     pi.registerTool(tool);
   }
+
+  // ─── Automatic engineering/review workflow invocation (spec 06) ─────────
+  // Normal-language intent must auto-invoke the orchestration pipeline without
+  // a slash command. We classify the user's prompt with the deterministic
+  // IntentRouter and, when it expresses engineering/review intent, inject a
+  // message directing the model to use the `mission` semantic tool — the
+  // parent session stays the long-lived orchestrator, and the mission tool
+  // does the heavy lifting. This is a directive, not enforcement: the runtime
+  // completion gate is what actually enforces validation/review/completion.
+  // Ordered from passive (conversation/research) to fully-enforced
+  // (engineering_review). Anything at/above `engineering` (incl. `review` and
+  // `security_sensitive`) auto-invokes the mission pipeline.
+  const WORKFLOW_ORDER: WorkflowClass[] = [
+    "conversation",
+    "research",
+    "investigation",
+    "engineering",
+    "review",
+    "engineering_review",
+    "security_sensitive",
+  ];
+  const workflowRank = (w: WorkflowClass) => WORKFLOW_ORDER.indexOf(w);
+  const AUTO_INVOKE_THRESHOLD = workflowRank("engineering");
+  let lastAutoInvoked: { prompt: string; at: number } | null = null;
+  pi.on("before_agent_start", async (event, ctx) => {
+    const prompt = (event.prompt ?? "").trim();
+    if (!prompt || /^\/\w/.test(prompt)) return; // slash commands already route explicitly
+    // Avoid re-injecting on harness auto-retries of the same prompt.
+    if (lastAutoInvoked && lastAutoInvoked.prompt === prompt && Date.now() - lastAutoInvoked.at < 30_000) return;
+    let intent: Intent[] = [];
+    try {
+      intent = classifyIntent(prompt).intent;
+    } catch {
+      return; // classification must never break the turn
+    }
+    const workflow = workflowForIntent(intent);
+    if (workflowRank(workflow) < AUTO_INVOKE_THRESHOLD) return; // conversation/research only
+    lastAutoInvoked = { prompt, at: Date.now() };
+    return {
+      message: {
+        customType: "pi-engineering:auto-invoke",
+        content:
+          `[pi-engineering] This request expresses engineering intent (workflow: ${workflow}). ` +
+          `Act as the long-lived orchestrator: call the \`mission\` tool with this request as the mission ` +
+          `request so the runtime plans, executes, validates, reviews, and completes the work as a mission. ` +
+          `Do not implement the change directly in this session; delegate it through the mission pipeline.`,
+        display: true,
+      },
+    };
+  });
 
   // ─── Generation Guard: interactive session (spec §6, §12) ────────────────
   // Monitors streaming output in the main pi session for degeneration loops.

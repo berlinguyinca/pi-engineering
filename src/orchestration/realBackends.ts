@@ -26,6 +26,60 @@ export interface RealBackendsOptions {
   cwd: string;
 }
 
+/**
+ * Normalize reviewer findings of varying shapes into a uniform list of records
+ * consumed by the orchestrator's finding store + the completion gate. Handles
+ * three shapes: objects ({severity, summary|message|text|title}), plain strings
+ * (severity defaults to "warning"), and a JSON string (possibly an array).
+ * The output always carries `summary` (the human message) alongside `message`,
+ * plus optional `severity`, `category`, `file`, `line`, `evidence`, and
+ * `recommended_action` passthroughs.
+ */
+export function normalizeFindings(raw: unknown): Array<Record<string, unknown>> {
+  const norm = (obj: Record<string, unknown>): Record<string, unknown> => {
+    const summary = obj.summary ?? obj.message ?? obj.text ?? obj.title;
+    const out: Record<string, unknown> = { summary };
+    if (typeof summary === "string") {
+      out.message = summary;
+      for (const k of ["severity", "category", "file", "line", "evidence", "recommended_action"] as const) {
+        if (obj[k] !== undefined) out[k] = obj[k];
+      }
+    }
+    return out;
+  };
+  if (Array.isArray(raw)) {
+    return raw.flatMap((f) => {
+      if (typeof f === "string") return [{ summary: f, message: f }];
+      if (f && typeof f === "object") {
+        const out = norm(f as Record<string, unknown>);
+        return out.summary !== undefined ? [out] : [];
+      }
+      return [];
+    });
+  }
+  if (typeof raw === "string" && raw.trim().length > 0) {
+    const trimmed = raw.trim();
+    if (trimmed.startsWith("[") || trimmed.startsWith("{")) {
+      try {
+        const parsed: unknown = JSON.parse(trimmed);
+        if (Array.isArray(parsed)) return normalizeFindings(parsed);
+        if (parsed && typeof parsed === "object") {
+          const out = norm(parsed as Record<string, unknown>);
+          return out.summary !== undefined ? [out] : [];
+        }
+      } catch {
+        /* fall through */
+      }
+    }
+    return [{ summary: trimmed, message: trimmed }];
+  }
+  if (raw && typeof raw === "object") {
+    const out = norm(raw as Record<string, unknown>);
+    return out.summary !== undefined ? [out] : [];
+  }
+  return [];
+}
+
 /** Convert a worker result into a bounded broker outcome. */
 function outcomeOf(result: Awaited<ReturnType<WorkerExecutor["run"]>>): ExecutionOutcome {
   return {
@@ -116,10 +170,12 @@ export function realBackends(opts: RealBackendsOptions) {
           cwd: opts.cwd,
         });
         const outcome = outcomeOf(run);
-        // If the reviewer emitted structured findings in details.findings,
-        // surface them so the completion gate can block on blocking findings.
+        // If the reviewer emitted structured findings, normalize and surface them
+        // so the completion gate can block on blocking findings. Handles three
+        // shapes: a list of objects ({severity, message|summary|text}), a list of
+        // plain strings (severity defaults to "warning"), and a JSON string.
         const raw = (run.result.details as { findings?: unknown } | undefined)?.findings;
-        if (Array.isArray(raw)) outcome.findings = raw as Array<Record<string, unknown>>;
+        outcome.findings = normalizeFindings(raw);
         return outcome;
       },
     },
@@ -144,7 +200,11 @@ export function realBackends(opts: RealBackendsOptions) {
       },
     },
     integration: {
-      async runIntegration(input: { objective: string; signal: AbortSignal }): Promise<ExecutionOutcome> {
+      async runIntegration(input: {
+        objective: string;
+        handoffs: Array<{ worktree: { path: string; branch: string }; summary: string; artifacts: string[] }>;
+        signal: AbortSignal;
+      }): Promise<ExecutionOutcome> {
         if (!opts.git)
           return {
             executionId: "integration",
@@ -153,14 +213,35 @@ export function realBackends(opts: RealBackendsOptions) {
             artifactRefs: [],
             usage: {},
           };
-        // Integrator: merge the current branch into base (fast path). For a
-        // multi-candidate mission the caller drives GitRepo.mergeBranch.
+        // Integrator (spec 05): merge each worker worktree branch into the
+        // current checkout sequentially, then run integration checks.
+        const merged: string[] = [];
+        const conflicts: string[] = [];
+        for (const h of input.handoffs) {
+          const r = await opts.git.mergeBranch(h.worktree.branch).catch((e: Error) => ({
+            merged: false,
+            reason: e.message,
+          }));
+          if (r.merged) merged.push(h.worktree.branch);
+          else conflicts.push(`${h.worktree.branch}: ${(r as { reason?: string }).reason ?? "conflict"}`);
+        }
+        if (conflicts.length > 0) {
+          return {
+            executionId: "integration",
+            exitStatus: "conflict",
+            summary: `integration conflicts: ${conflicts.join("; ")}`,
+            artifactRefs: [],
+            usage: { mergedBranches: merged.length, conflicts: conflicts.length },
+          };
+        }
+        const checks = await opts.verifier.detect(opts.cwd);
+        const result = await opts.verifier.run(opts.cwd, checks, opts.artifacts);
         return {
           executionId: "integration",
-          exitStatus: "succeeded",
-          summary: "integrated",
-          artifactRefs: [],
-          usage: {},
+          exitStatus: result.passed ? "succeeded" : "failed",
+          summary: `integrated ${merged.join(", ") || "nothing"}; checks: ${result.passed ? "pass" : "fail"}`,
+          artifactRefs: result.evidence.flatMap((e) => e.artifacts).filter(Boolean),
+          usage: { mergedBranches: merged.length, conflicts: conflicts.length },
         };
       },
     },

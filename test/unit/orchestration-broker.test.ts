@@ -195,4 +195,89 @@ describe("ExecutionBroker (spec 03)", () => {
       await fx.cleanup();
     }
   });
+
+  it("collects mission worktrees and merges them via the integration backend (spec 05)", async () => {
+    const fx = await makeFixtureRepo();
+    try {
+      const git = await GitRepo.open(fx.root);
+      const store = MissionStore.open(JsonlEventStore.inMemory());
+      const m = store.createMission({
+        title: "x",
+        goal: "x",
+        user_request: "x",
+        repository: ".",
+        base_ref: await git!.headCommit(),
+        risk_profile: "medium",
+        workflow_class: "engineering_review",
+      });
+      const t = store.createTask({
+        mission_id: m.mission_id,
+        kind: "agent",
+        role: "implementer",
+        objective: "x",
+        mutates_repo: true,
+        isolation: "worktree",
+        write_domains: ["src/**"],
+      });
+      store.transitionTask(t.task_id, "READY");
+
+      const seenHandoffs: Array<{ branch: string }> = [];
+      const broker = new ExecutionBroker({
+        store,
+        git,
+        baseRef: await git!.headCommit(),
+        backends: {
+          agent: {
+            runAgent: async () => ({
+              executionId: "e",
+              exitStatus: "succeeded",
+              summary: "done",
+              artifactRefs: [],
+              usage: {},
+            }),
+          },
+          integration: {
+            runIntegration: async ({ handoffs }) => {
+              seenHandoffs.push(...handoffs.map((h) => ({ branch: h.worktree.branch })));
+              return { executionId: "i", exitStatus: "succeeded", summary: "merged", artifactRefs: [], usage: {} };
+            },
+          },
+        },
+      });
+      // Run a mutating agent (allocates a mission worktree).
+      await (
+        await broker.execute({
+          taskId: t.task_id,
+          missionId: m.mission_id,
+          kind: "agent",
+          role: "implementer",
+          objective: "x",
+          mutatesRepo: true,
+          isolation: "worktree",
+        })
+      ).result();
+      // Now run integration for the same mission.
+      const it = store.createTask({
+        mission_id: m.mission_id,
+        kind: "integration",
+        role: "integrator",
+        objective: "merge",
+      });
+      await (
+        await broker.execute({
+          taskId: it.task_id,
+          missionId: m.mission_id,
+          kind: "integration",
+          role: "integrator",
+          objective: "merge",
+        })
+      ).result();
+      // The integrator received the worker worktree as a handoff, and it was released after merging.
+      assert.equal(seenHandoffs.length, 1);
+      assert.ok(seenHandoffs[0]!.branch.startsWith("pi-eng-orch-"));
+      assert.equal(broker.allocatedWorktrees?.size ?? 0, 0);
+    } finally {
+      await fx.cleanup();
+    }
+  });
 });

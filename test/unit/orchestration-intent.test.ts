@@ -1,6 +1,25 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { IntentRouter, classifyIntent, workflowForIntent } from "../../src/orchestration/intentRouter.ts";
+import type { WorkflowClass } from "../../src/orchestration/types.ts";
+
+// Mirrors the extension's auto-invocation threshold (spec 06): engineering or
+// engineering_review intent must auto-invoke the mission pipeline, while
+// conversation/research/investigation alone does not.
+const WORKFLOW_ORDER: WorkflowClass[] = [
+  "conversation",
+  "research",
+  "investigation",
+  "engineering",
+  "review",
+  "engineering_review",
+  "security_sensitive",
+];
+const workflowRank = (w: WorkflowClass) => WORKFLOW_ORDER.indexOf(w);
+const AUTO_INVOKE_THRESHOLD = workflowRank("engineering");
+function shouldAutoInvoke(prompt: string): boolean {
+  return workflowRank(workflowForIntent(classifyIntent(prompt).intent)) >= AUTO_INVOKE_THRESHOLD;
+}
 import {
   deriveRequiredGates,
   mutationFactFromChangedFiles,
@@ -71,6 +90,30 @@ describe("intent router (spec 01)", () => {
 });
 
 describe("policy engine (spec 00 §6, spec 01 §Stage B)", () => {
+  it("auto-invocation triggers only for engineering/review intent (spec 06)", () => {
+    const invoke: string[] = [];
+    const notInvoke: string[] = [];
+    for (const p of [
+      "Add a health endpoint",
+      "Fix login",
+      "Implement OAuth",
+      "Review my changes",
+      "Refactor the scheduler",
+    ]) {
+      if (shouldAutoInvoke(p)) invoke.push(p);
+      else notInvoke.push(p);
+    }
+    for (const p of ["Explain this function", "Why is login failing?", "Hello", "Find where auth happens"]) {
+      if (shouldAutoInvoke(p)) invoke.push(p);
+      else notInvoke.push(p);
+    }
+    assert.deepEqual(notInvoke, ["Explain this function", "Why is login failing?", "Hello", "Find where auth happens"]);
+    assert.ok(invoke.includes("Add a health endpoint"));
+    assert.ok(invoke.includes("Fix login"));
+    assert.ok(invoke.includes("Implement OAuth"));
+    assert.ok(invoke.includes("Review my changes"));
+  });
+
   it("path matching supports ** and *", () => {
     assert.ok(pathMatchesPattern("src/auth/service.ts", "**/auth/**"));
     assert.ok(pathMatchesPattern("src/web/login/Login.tsx", "src/web/login/**"));
