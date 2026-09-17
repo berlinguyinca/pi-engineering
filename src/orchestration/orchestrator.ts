@@ -220,9 +220,8 @@ export class Orchestrator {
     // Post-execution: integrate, validate + review if the mission mutated or
     // requires gates. If integration did not land the change, the mission must
     // not complete — otherwise it reports success over an unchanged repository.
-    const pendingMerge = this.broker.pendingIntegrations(mission.mission_id) > 0;
     let post = await this.postExecution(this.store.getMission(mission.mission_id)!);
-    let integrated = !pendingMerge || post.integrationOk;
+    let integrated = post.integrationOk;
 
     // Completion gate, with bounded repair rounds (spec 07): a blocking reviewer
     // finding creates repair work, and the repaired result is re-validated and
@@ -233,9 +232,22 @@ export class Orchestrator {
       const openBlocking = this.store
         .listFindings(mission.mission_id)
         .filter((f) => f.severity === "blocking" && f.status === "open");
-      // Nothing repairable (missing gate, failed task, running task): the
-      // repair loop cannot help, so stop and let the caller block or fail.
-      if (openBlocking.length === 0) break;
+      // A failed validation / integration / review is repairable too: the usual
+      // cause is work that does not build, does not merge, or was not reviewed
+      // clean. Without this the mission wedges permanently, because a FAILED
+      // task keeps the gate closed and nothing else ever retries it.
+      const failedGates = this.store.listTasks(mission.mission_id).filter(
+        (t) =>
+          (t.kind === "validation" || t.kind === "integration" || t.kind === "review") &&
+          t.status === "FAILED" &&
+          // Only repair a gate that CAN run: a mission whose harness has no
+          // validation/review backend has an unavailable capability, not
+          // broken work, and repairing it would burn rounds for nothing.
+          this.broker.hasBackend(t.kind as "validation" | "integration" | "review"),
+      );
+      // Nothing repairable (missing gate, running task): the repair loop cannot
+      // help, so stop and let the caller block or fail.
+      if (openBlocking.length === 0 && failedGates.length === 0) break;
       repairRounds++;
 
       // FINAL_VALIDATION -> REPAIRING is legal; guard the self-transition, which
@@ -245,13 +257,28 @@ export class Orchestrator {
         this.store.transitionMission(mission.mission_id, "REPAIRING");
       }
       this.phase(this.store.getMission(mission.mission_id)!, "repairing");
-      for (const f of openBlocking) {
+      // What to fix this round: open blocking findings, plus failed gate tasks
+      // when there is nothing else to act on.
+      const objectives: Array<{ objective: string; findingId?: string }> = openBlocking.map((f) => {
         const where = f.file ? ` [${f.file}${f.line ? `:${f.line}` : ""}]` : "";
+        return {
+          objective: `Repair review finding (${f.category})${where}: ${f.summary} — recommended: ${f.recommended_action || "n/a"}`,
+          findingId: f.finding_id,
+        };
+      });
+      if (objectives.length === 0) {
+        for (const t of failedGates) {
+          objectives.push({
+            objective: `Fix the failing ${t.kind} step for this mission (${t.objective}). Make the repository's own checks pass and leave the change ready to integrate.`,
+          });
+        }
+      }
+      for (const obj of objectives) {
         const repair = this.store.createTask({
           mission_id: mission.mission_id,
           kind: "agent",
           role: "implementer",
-          objective: `Repair review finding (${f.category})${where}: ${f.summary} — recommended: ${f.recommended_action || "n/a"}`,
+          objective: obj.objective,
           mutates_repo: true,
           write_domains: ["**"],
           isolation: "worktree",
@@ -264,7 +291,7 @@ export class Orchestrator {
         // finding is closed optimistically and the mandatory re-review below
         // decides whether it still stands — a reviewer that still sees the
         // defect records a fresh finding, which keeps the mission blocked.
-        if (repaired) this.store.resolveFinding(f.finding_id);
+        if (repaired && obj.findingId) this.store.resolveFinding(obj.findingId);
       }
       // Mandatory re-integration, re-validation + re-review of the repaired result.
       post = await this.postExecution(this.store.getMission(mission.mission_id)!);
@@ -342,7 +369,9 @@ export class Orchestrator {
     let validationOk = false;
     let reviewAttempted = false;
     let reviewOk = false;
-    let integrationOk = false;
+    // True unless a merge was required and did not land. Defaulting this to false
+    // made every repair round look unintegrated for missions with no worktrees.
+    let integrationOk = true;
     const gates = new Set<RequiredGate>(mission.required_gates);
     const tasks = this.store.listTasks(mission.mission_id);
     const anyMutation = tasks.some((t) => t.mutates_repo && t.status === "SUCCEEDED");
@@ -368,6 +397,28 @@ export class Orchestrator {
       });
       this.store.transitionTask(integ.task_id, "READY");
       integrationOk = await this.runSingleTask(mission.mission_id, integ.task_id);
+      // A green merge is not proof the work landed: harvesting a worktree can
+      // fail silently, and merging an empty branch is trivially clean. Require
+      // the checkout to actually differ from the mission's base commit.
+      if (integrationOk) {
+        const landed = await this.broker.changedFilesSinceBase(mission.mission_id);
+        if (landed !== null && landed.length === 0) {
+          integrationOk = false;
+          // Say WHAT is wrong, in the channel operators (and the PI WEB panel)
+          // already read, rather than leaving an opaque unmet-gate verdict.
+          this.store.addFinding({
+            mission_id: mission.mission_id,
+            task_id: integ.task_id,
+            severity: "blocking",
+            category: "integration",
+            file: null,
+            line: null,
+            summary: "Integration produced no change: the worker branches held no committed work",
+            evidence: null,
+            recommended_action: "The implementer must actually edit files; harvested worktrees were empty.",
+          });
+        }
+      }
       // A conflicted or failed integration means the change is not in the tree;
       // report it so the caller does not complete on top of an unchanged repo.
       if (!integrationOk) return { validationAttempted, validationOk, reviewAttempted, reviewOk, integrationOk };

@@ -19,7 +19,21 @@ async function openRuntime(
 ) {
   const worker: WorkerExecutor = {
     async run(req) {
-      await onRun?.(req.cwd ?? root, req.role ?? "");
+      if (onRun) {
+        await onRun(req.cwd ?? root, req.role ?? "");
+      } else if (req.role === "implementer") {
+        // A real implementer leaves a change behind. The orchestrator requires the
+        // checkout to actually differ from the mission's base commit before an
+        // integrating mission may complete, so the fake must too — otherwise the
+        // 'nothing landed' invariant correctly blocks it.
+        const { mkdir, writeFile } = await import("node:fs/promises");
+        await mkdir(`${req.cwd ?? root}/src`, { recursive: true });
+        await writeFile(
+          `${req.cwd ?? root}/src/orchestrated.ts`,
+          `// produced by the orchestrated implementer\nexport const orchestrated = true;\n`,
+          "utf8",
+        );
+      }
       return {
         result: {
           status: "completed",
@@ -303,6 +317,31 @@ describe("orchestration via real EngineeringRuntime (acceptance scenarios)", () 
     assert.ok(mainSrc.includes("// main"), "incumbent content must survive a conflicted merge");
     assert.ok(!mainSrc.includes("// worker"), "conflicted worker change must not be applied");
     assert.ok(!mainSrc.includes("<<<<<<<"), "no conflict markers may be left in the working tree");
+  });
+
+  it("an integrating mission whose worker produced no change does not complete", async () => {
+    const fx = await greenFixture();
+    const { GitRepo } = await import("../../src/git/GitRepo.ts");
+    const probe = await GitRepo.open(fx.root);
+    assert.ok(probe);
+    const baseRef = await probe.headCommit();
+    // The worker runs, reports success, and changes nothing. Harvesting yields an
+    // empty branch, which merges cleanly — a green integration alone must not be
+    // taken as proof the repository changed.
+    const rt = await openRuntime(fx.root, [], () => {});
+    const result = await rt.orchestrator!.orchestrate("Add a health endpoint", {
+      repository: rt.cwd,
+      baseRef,
+      mutationRequested: true,
+    });
+    assert.equal(result.completed, false, "no landed change must not count as a completed mutation");
+    // The reason is surfaced as a blocking finding, so operators and the PI WEB
+    // panel see why the mission stopped instead of an opaque unmet-gate verdict.
+    const findings = rt.missionStore!.listFindings(result.mission.mission_id);
+    assert.ok(
+      findings.some((f) => f.category === "integration" && f.severity === "blocking"),
+      `an empty-integration finding is required, got ${findings.map((f) => `${f.severity}:${f.category}`).join(",")}`,
+    );
   });
 
   it("integration checks that fail after a clean merge block completion", async () => {

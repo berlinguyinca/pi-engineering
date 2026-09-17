@@ -13,7 +13,7 @@
  */
 
 import type { MissionStore } from "./missionStore.ts";
-import type { CompletionVerdict, Mission, RequiredGate } from "./types.ts";
+import type { CompletionVerdict, Mission, OrchestrationTask, RequiredGate } from "./types.ts";
 
 export interface GateEvidence {
   missionId: string;
@@ -42,7 +42,21 @@ export class CompletionGate {
     const tasks = this.store.listTasks(mission.mission_id);
 
     const running = tasks.filter((t) => ["READY", "RUNNING", "RETRYING", "WAITING", "PENDING"].includes(t.status));
-    const failed = tasks.filter((t) => t.status === "FAILED");
+    // A FAILED task only blocks while it stands. Each repair round creates a NEW
+    // validation / integration / review task, so counting every historical
+    // failure would keep the gate closed even after the repaired work passed,
+    // making the mission unrecoverable. A failure is superseded once a later task
+    // of the same kind and role succeeded.
+    const superseded = (t: OrchestrationTask): boolean =>
+      tasks.some(
+        (o) =>
+          o.task_id !== t.task_id &&
+          o.kind === t.kind &&
+          o.role === t.role &&
+          o.status === "SUCCEEDED" &&
+          o.created_at >= t.created_at,
+      );
+    const failed = tasks.filter((t) => t.status === "FAILED" && !superseded(t));
 
     // Required gates.
     for (const gate of mission.required_gates) {

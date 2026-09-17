@@ -37,6 +37,8 @@ interface HarnessOpts {
   validationExitStatus?: string;
   reviewExitStatus?: string;
   agentExitStatus?: string;
+  /** Fail the first N validation runs, then succeed (repair-loop recovery). */
+  validationFailTimes?: number;
 }
 
 function harness(opts: HarnessOpts = {}): Harness {
@@ -78,6 +80,9 @@ function harness(opts: HarnessOpts = {}): Harness {
       runValidation: async () => {
         calls.validation.push("validation");
         if (opts.failValidation) throw new Error("test failed: expected 1 got 2");
+        if (opts.validationFailTimes && calls.validation.length <= opts.validationFailTimes) {
+          return { executionId: "e", exitStatus: "failed", summary: "suite red", artifactRefs: [], usage: {} };
+        }
         if (opts.validationExitStatus && opts.validationExitStatus !== "succeeded") {
           return {
             executionId: "e",
@@ -437,5 +442,48 @@ describe("exitStatus is authoritative (non-throwing backend failures)", () => {
       impl.some((t) => t.status === "FAILED"),
       `implementer must be FAILED, got ${impl.map((t) => t.status).join(",")}`,
     );
+  });
+});
+
+describe("repair of failed gate tasks", () => {
+  it("a first-red validation creates repair work and a later green one completes the mission", async () => {
+    const h = harness({ validationFailTimes: 1 });
+    const result = await h.orchestrator.orchestrate("Add an endpoint and fix the build", {
+      repository: ".",
+      baseRef: "abc",
+      mutationRequested: true,
+    });
+    // The red run must have been recorded...
+    const validations = h.store.listTasks(result.mission.mission_id).filter((t) => t.kind === "validation");
+    assert.ok(
+      validations.some((t) => t.status === "FAILED"),
+      "the red validation is recorded",
+    );
+    assert.ok(
+      validations.some((t) => t.status === "SUCCEEDED"),
+      "the re-run validation is recorded",
+    );
+    // ...and repair work must have been created for it (not a permanent wedge)...
+    const repairs = h.store
+      .listTasks(result.mission.mission_id)
+      .filter((t) => t.kind === "agent" && t.objective.includes("Fix the failing validation"));
+    assert.ok(repairs.length >= 1, "a failed validation must spawn repair work, not wedge the mission");
+    // ...and a stale failure must not keep the gate closed once it is green.
+    assert.equal(result.completed, true, "a superseded validation failure must not block completion");
+  });
+
+  it("a permanently red validation still blocks after the bounded repair rounds", async () => {
+    const h = harness({ validationExitStatus: "failed" });
+    const result = await h.orchestrator.orchestrate("Add an endpoint and fix the build", {
+      repository: ".",
+      baseRef: "abc",
+      mutationRequested: true,
+    });
+    assert.equal(result.completed, false, "an unfixable validation must never complete");
+    const repairs = h.store
+      .listTasks(result.mission.mission_id)
+      .filter((t) => t.kind === "agent" && t.objective.includes("Fix the failing validation"));
+    assert.ok(repairs.length >= 1);
+    assert.ok(repairs.length <= 4, `repair must stay bounded, got ${repairs.length}`);
   });
 });

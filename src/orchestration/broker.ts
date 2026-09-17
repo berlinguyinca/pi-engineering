@@ -233,9 +233,39 @@ export class ExecutionBroker {
     return !!ex && ex.status !== "RUNNING";
   }
 
+  /**
+   * Whether a backend is registered for this task kind. A gate task that failed
+   * because nothing can run it is an unavailable capability, not broken work —
+   * spawning an implementer to 'fix' it would burn rounds for nothing.
+   */
+  hasBackend(kind: ExecutionRequestInput["kind"]): boolean {
+    const key = this.backendForKind(kind) as keyof BrokerBackends;
+    return !!this.backends[key];
+  }
+
   /** Branches allocated for a mission that still await an integration merge. */
   pendingIntegrations(missionId: string): number {
     return (this.missionWorktrees.get(missionId) ?? []).length;
+  }
+
+  /**
+   * Files the main checkout changed relative to the mission's base commit.
+   *
+   * This is the invariant behind 'the work landed'. Harvesting a worktree can
+   * fail silently and merging an empty branch is trivially clean, so a green
+   * integration alone does not prove the repository changed. Returns null when
+   * it cannot be determined (no git provider, or the base ref is unknown), in
+   * which case the caller must not treat it as 'nothing landed'.
+   */
+  async changedFilesSinceBase(missionId: string): Promise<string[] | null> {
+    if (!this.git) return null;
+    const base = this.store.getMission(missionId)?.base_ref?.trim();
+    if (!base) return null;
+    try {
+      return await this.git.changedFiles(base, await this.git.headCommit());
+    } catch {
+      return null;
+    }
   }
 
   /** Release any worktrees still tracked for a finished mission. */
@@ -310,7 +340,12 @@ export class ExecutionBroker {
           // A cancellation that already settled this execution must not be
           // overwritten by the runner's late success.
           if (!this.settledElsewhere(execution.execution_id)) {
-            this.store.setExecutionStatus(execution.execution_id, "SUCCEEDED", {
+            // Resolution is not success. The completion gate counts SUCCEEDED
+            // executions as validation/review evidence, so recording a failed
+            // validation run as SUCCEEDED would corrupt the gate's primary
+            // evidence source.
+            const succeeded = outcome.exitStatus === "succeeded";
+            this.store.setExecutionStatus(execution.execution_id, succeeded ? "SUCCEEDED" : "FAILED", {
               exit_status: outcome.exitStatus,
               artifact_refs: outcome.artifactRefs,
               usage: outcome.usage,

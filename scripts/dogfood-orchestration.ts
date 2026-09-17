@@ -46,7 +46,19 @@ function check(name: string, ok: boolean, detail = ""): void {
 function makeWorker(findings: unknown[] = [], onRun?: (cwd: string, role: string) => void) {
   return {
     async run(req: { role: string; task: string; cwd?: string }) {
-      onRun?.(req.cwd ?? "", req.role);
+      if (onRun) {
+        onRun(req.cwd ?? "", req.role);
+      } else if (req.role === "implementer") {
+        // A real implementer leaves a change behind, and an integrating mission
+        // requires the checkout to actually differ from its base commit before it
+        // may complete. Without this the fake 'succeeds' while changing nothing.
+        const { mkdir, writeFile } = await import("node:fs/promises");
+        const cwd = req.cwd ?? "";
+        if (cwd) {
+          await mkdir(`${cwd}/src`, { recursive: true }).catch(() => {});
+          await writeFile(`${cwd}/src/orchestrated.ts`, "export const orchestrated = true;\n", "utf8").catch(() => {});
+        }
+      }
       return {
         result: {
           status: "completed" as const,
@@ -272,6 +284,25 @@ try {
     "investigation created no mutating tasks",
     !iTasks.some((t) => t.mutates_repo),
     JSON.stringify(iTasks.map((t) => [t.kind, t.mutates_repo])),
+  );
+
+  // ---- 7: a worker that changes nothing cannot complete an integrating mission
+  console.log("\n[7] an empty change cannot be reported as completed work");
+  const eFx = await makeRepo();
+  cleanupFns.push(eFx.cleanup);
+  const eRt = await open(eFx.root, [], () => {}); // worker runs, edits nothing
+  const eBase = await eRt.git!.headCommit();
+  const eRes = await eRt.orchestrator!.orchestrate("Add a health endpoint", {
+    repository: eRt.cwd,
+    baseRef: eBase,
+    mutationRequested: true,
+  });
+  check("mission did not complete when nothing landed", eRes.completed === false, `completed=${eRes.completed}`);
+  check(
+    "empty integration is reported as a blocking finding",
+    eRt
+      .missionStore!.listFindings(eRes.mission.mission_id)
+      .some((f) => f.category === "integration" && f.severity === "blocking"),
   );
 } catch (err) {
   failures.push(`threw: ${err instanceof Error ? err.message : String(err)}`);
