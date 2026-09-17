@@ -422,6 +422,24 @@ export class Orchestrator {
       // A conflicted or failed integration means the change is not in the tree;
       // report it so the caller does not complete on top of an unchanged repo.
       if (!integrationOk) return { validationAttempted, validationOk, reviewAttempted, reviewOk, integrationOk };
+    } else if (anyMutation) {
+      // No worktree/merge path exists because the runtime has no git provider, so
+      // there is no base commit to diff against and nothing can PROVE the repo
+      // changed. Mutating without version control cannot be made safe here, but
+      // it must not pass silently: record it (non-blocking) so the unverified
+      // mutation is visible in the mission record and the PI WEB panel.
+      this.store.addFinding({
+        mission_id: mission.mission_id,
+        task_id: null,
+        severity: "minor",
+        category: "verification",
+        file: null,
+        line: null,
+        summary: "Mutation could not be verified against a base commit (no git provider, nothing to integrate)",
+        evidence: null,
+        recommended_action:
+          "Run the runtime inside a git repository so worker output is isolated, merged and diffable.",
+      });
     }
 
     if (gates.has("validation") || anyMutation) {
