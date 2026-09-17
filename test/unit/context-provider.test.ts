@@ -27,7 +27,10 @@ function makeTransport(handlers: {
 test("env config: the integration is inert without a gateway URL", () => {
   assert.equal(inferweaveConfigFromEnv({}).enabled, false);
   assert.equal(inferweaveConfigFromEnv({ INFERWEAVE_BASE_URL: "http://gw:8787/v1/" }).enabled, true);
-  assert.equal(inferweaveConfigFromEnv({ INFERWEAVE_BASE_URL: "http://gw:8787/v1/" }).baseUrl, "http://gw:8787/v1");
+  // The base URL is the gateway root; the OpenAI habit of appending /v1 is
+  // normalised away so every request path carries it exactly once.
+  assert.equal(inferweaveConfigFromEnv({ INFERWEAVE_BASE_URL: "http://gw:8787/v1/" }).baseUrl, "http://gw:8787");
+  assert.equal(inferweaveConfigFromEnv({ INFERWEAVE_BASE_URL: "http://gw:8787" }).baseUrl, "http://gw:8787");
   assert.equal(inferweaveConfigFromEnv({ INFERWEAVE_BASE_URL: "http://gw", INFERWEAVE_ENABLED: "0" }).enabled, false);
   assert.equal(
     inferweaveConfigFromEnv({ INFERWEAVE_BASE_URL: "http://gw", INFERWEAVE_TTL_SECONDS: "45" }).ttlSeconds,
@@ -79,6 +82,35 @@ test("refreshModels gives Pi the guaranteed window and the advertised output cap
   );
   assert.equal(probe.urls.length, 1, "a listing that carries capabilities is one request");
   assert.equal(provider.windowFor("qwen3.8-27b")?.windowTokens, 262_144);
+});
+
+test("both address spellings reach the same gateway paths, each /v1 exactly once", async () => {
+  // Regression: with a documented spelling (…/v1) the capability document was
+  // fetched at /v1/v1/models/… while the listing was fine, and with a root
+  // spelling the listing was asked for unsanitised /models, which the node's
+  // nginx refuses. The base URL is now the gateway root and the paths carry
+  // /v1 themselves.
+  for (const raw of ["http://gw:8787/v1", "http://gw:8787"]) {
+    const probe = makeTransport({
+      listing: () => ({
+        status: 200,
+        body: { data: [{ id: "mystery", object: "model" }] }, // says nothing: forces the document fetch
+      }),
+      capability: () => ({
+        status: 200,
+        body: { model_id: "mystery", guaranteed_routable_tokens: 65_536, max_output_tokens: 8_192 },
+      }),
+    });
+    const config = inferweaveConfigFromEnv({ INFERWEAVE_BASE_URL: raw });
+    const provider = createInferweaveProvider(config, { transport: probe.transport });
+    const models = await provider.registration.refreshModels({});
+    assert.equal(models[0]?.contextWindow, 65_536, `${raw} resolves the capability`);
+    assert.deepEqual(
+      probe.urls,
+      ["http://gw:8787/v1/models", "http://gw:8787/v1/models/mystery/capabilities"],
+      `${raw} builds the gateway's real paths, /v1 exactly once`,
+    );
+  }
 });
 
 test("a model with nothing advertised lands on the floor and says so", async () => {

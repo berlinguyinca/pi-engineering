@@ -88,7 +88,11 @@ function int(value: string | undefined, fallback: number): number {
  */
 export function inferweaveConfigFromEnv(env: Record<string, string | undefined> = process.env): InferweaveConfig {
   const base = DEFAULT_INFERWEAVE_CONFIG;
-  const baseUrl = (env.INFERWEAVE_BASE_URL ?? base.baseUrl).trim().replace(/\/$/, "");
+  // The base URL is the gateway ROOT. Operators write it both ways — the
+  // OpenAI habit appends /v1 — so strip a trailing /v1 here and let the
+  // request paths carry it explicitly. Without this, one spelling works the
+  // listing and breaks the capability document, and the other the reverse.
+  const baseUrl = (env.INFERWEAVE_BASE_URL ?? base.baseUrl).trim().replace(/\/+$/, "").replace(/\/v1$/, "");
   return {
     enabled: baseUrl.length > 0 && bool(env.INFERWEAVE_ENABLED, true),
     baseUrl,
@@ -225,7 +229,7 @@ export function createInferweaveProvider(config: InferweaveConfig, deps: Provide
   };
 
   const refreshModels = async ({ signal }: { signal?: AbortSignal }): Promise<PiModelDefinition[]> => {
-    const listingUrl = `${config.baseUrl}/models`;
+    const listingUrl = `${config.baseUrl}/v1/models`;
     let listing: CapabilityFetchResult;
     try {
       listing = await transport(listingUrl, { signal });
