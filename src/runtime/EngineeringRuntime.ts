@@ -395,6 +395,8 @@ export class EngineeringRuntime {
       backends,
       planner: opts.orchestrationPlanner ?? defaultPlanner,
       parentSessionId: null,
+      git: rt.git,
+      baseRef: rt.git ? await rt.git.headCommit() : "",
       onPhase: (mission, phase) => {
         const mapped: RuntimePhaseEvent["phase"] =
           phase === "complete" ? "settled" : phase === "classified" ? "scout" : "implement";

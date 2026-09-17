@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import { GitRepo } from "../../src/git/GitRepo.ts";
 import { type BrokerBackends, ExecutionBroker } from "../../src/orchestration/broker.ts";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
+import { makeFixtureRepo } from "../fixtures/make-fixture.ts";
 
 function setup(backends: BrokerBackends) {
   const store = MissionStore.open(JsonlEventStore.inMemory());
@@ -68,6 +70,7 @@ describe("ExecutionBroker (spec 03)", () => {
       objective: "x",
     });
     const resultP = handle.result(); // starts dispatch; not awaited yet
+    await new Promise((r) => setImmediate(r)); // let dispatch begin
     assert.ok(started);
     await handle.cancel();
     const ex = store.listExecutions(m.mission_id)[0]!;
@@ -132,5 +135,64 @@ describe("ExecutionBroker (spec 03)", () => {
     });
     await handle.result();
     assert.deepEqual(calls, ["validation"]);
+  });
+
+  it("allocates an isolated git worktree for a mutating, worktree-isolated task (spec 05)", async () => {
+    const fx = await makeFixtureRepo();
+    try {
+      const git = await GitRepo.open(fx.root);
+      const store = MissionStore.open(JsonlEventStore.inMemory());
+      const m = store.createMission({
+        title: "x",
+        goal: "x",
+        user_request: "x",
+        repository: ".",
+        base_ref: await git!.headCommit(),
+        risk_profile: "medium",
+        workflow_class: "engineering_review",
+      });
+      const t = store.createTask({
+        mission_id: m.mission_id,
+        kind: "agent",
+        role: "implementer",
+        objective: "x",
+        mutates_repo: true,
+        isolation: "worktree",
+        write_domains: ["src/**"],
+      });
+      store.transitionTask(t.task_id, "READY");
+      const seenWorktree: string[] = [];
+      const broker = new ExecutionBroker({
+        store,
+        git,
+        baseRef: await git!.headCommit(),
+        backends: {
+          agent: {
+            runAgent: async ({ worktree }) => {
+              seenWorktree.push(worktree ?? "");
+              return { executionId: "e", exitStatus: "succeeded", summary: "done", artifactRefs: [], usage: {} };
+            },
+          },
+        },
+      });
+      const handle = await broker.execute({
+        taskId: t.task_id,
+        missionId: m.mission_id,
+        kind: "agent",
+        role: "implementer",
+        objective: "x",
+        mutatesRepo: true,
+        isolation: "worktree",
+      });
+      await handle.result();
+      // The worker ran in a dedicated worktree path (a sibling of the repo).
+      assert.equal(seenWorktree.length, 1);
+      assert.ok(seenWorktree[0]!.length > 0);
+      assert.notEqual(seenWorktree[0]!, fx.root);
+      // Worktree was released (cleaned up) after settlement.
+      assert.equal(broker.allocatedWorktrees?.size ?? 0, 0);
+    } finally {
+      await fx.cleanup();
+    }
   });
 });

@@ -18,6 +18,7 @@
  * orchestrator; tests inject deterministic fakes.
  */
 
+import type { GitRepo } from "../git/GitRepo.ts";
 import type { MissionStore } from "./missionStore.ts";
 import type { ExecutionBackend } from "./types.ts";
 
@@ -108,19 +109,53 @@ export interface BrokerOptions {
   backends: BrokerBackends;
   /** Default timeout per execution. */
   defaultTimeoutMs?: number;
+  /** Git provider used to allocate isolated worktrees for mutating tasks. */
+  git?: GitRepo | null;
+  /** Base ref (commit) worktrees are created at. Defaults to current HEAD. */
+  baseRef?: string;
 }
 
 export class ExecutionBroker {
   private readonly store: MissionStore;
   private readonly backends: BrokerBackends;
   private readonly defaultTimeoutMs: number;
-  /** In-flight execution state for cancellation. */
-  private readonly active = new Map<string, { abort: AbortController; status: string }>();
+  private readonly git: GitRepo | null;
+  private readonly baseRef: string;
+  /** In-flight execution state for cancellation + allocated worktrees. */
+  private readonly active = new Map<string, { abort: AbortController; status: string; worktree: string | null }>();
+  /** Allocated worktrees, cleaned up when their execution settles. */
+  readonly allocatedWorktrees = new Map<string, { path: string; branch: string }>();
 
   constructor(opts: BrokerOptions) {
     this.store = opts.store;
     this.backends = opts.backends;
     this.defaultTimeoutMs = opts.defaultTimeoutMs ?? 10 * 60_000;
+    this.git = opts.git ?? null;
+    this.baseRef = opts.baseRef ?? "";
+  }
+
+  /** Allocate an isolated worktree for a mutating, worktree-isolated task. */
+  private async allocateWorktree(executionId: string, input: ExecutionRequestInput): Promise<string | null> {
+    if (!input.mutatesRepo || input.isolation !== "worktree" || !this.git) return null;
+    try {
+      const base = this.baseRef || (await this.git.headCommit());
+      const branch = `pi-eng-orch-${input.taskId}`;
+      const wt = await this.git.createWorktree(base, branch);
+      this.allocatedWorktrees.set(executionId, { path: wt.path, branch: wt.branch });
+      return wt.path;
+    } catch {
+      // If a worktree cannot be allocated (e.g. not a git repo), fall back to
+      // the main tree — the scheduler has already serialized conflicting writes.
+      return null;
+    }
+  }
+
+  private async releaseWorktree(executionId: string): Promise<void> {
+    const wt = this.allocatedWorktrees.get(executionId);
+    if (wt && this.git) {
+      await this.git.removeWorktree({ path: wt.path, branch: wt.branch }).catch(() => {});
+    }
+    this.allocatedWorktrees.delete(executionId);
   }
 
   /** Map a task kind to a broker backend. */
@@ -161,6 +196,7 @@ export class ExecutionBroker {
       cancel: async () => {
         this.active.get(execution.execution_id)?.abort.abort();
         this.store.setExecutionStatus(execution.execution_id, "CANCELED", { exit_status: "canceled" });
+        await this.releaseWorktree(execution.execution_id);
         this.active.delete(execution.execution_id);
       },
       steer: async (request) => {
@@ -171,8 +207,12 @@ export class ExecutionBroker {
       result: async () => {
         const timeoutMs = input.timeoutPolicy?.timeoutMs ?? this.defaultTimeoutMs;
         const timer = setTimeout(() => abort.abort(), timeoutMs);
+        // Allocate an isolated worktree before dispatch so mutating workers edit
+        // their own checkout (spec 05), then release it when the task settles.
+        const worktree = await this.allocateWorktree(execution.execution_id, input);
+        if (worktree) this.active.get(execution.execution_id)!.worktree = worktree;
         try {
-          const outcome = await this.dispatch(input, backend, execution.execution_id, abort.signal);
+          const outcome = await this.dispatch(input, backend, execution.execution_id, abort.signal, worktree);
           this.store.setExecutionStatus(execution.execution_id, "SUCCEEDED", {
             exit_status: outcome.exitStatus,
             artifact_refs: outcome.artifactRefs,
@@ -192,11 +232,12 @@ export class ExecutionBroker {
           throw err;
         } finally {
           clearTimeout(timer);
+          await this.releaseWorktree(execution.execution_id);
         }
       },
     };
 
-    this.active.set(execution.execution_id, { abort, status: "PENDING" });
+    this.active.set(execution.execution_id, { abort, status: "PENDING", worktree: null });
     this.store.setExecutionStatus(execution.execution_id, "RUNNING", {});
     this.active.get(execution.execution_id)!.status = "RUNNING";
     return handle;
@@ -207,11 +248,12 @@ export class ExecutionBroker {
     backend: ExecutionBackend,
     executionId: string,
     signal: AbortSignal,
+    worktree: string | null,
   ): Promise<ExecutionOutcome> {
     const base = {
       objective: input.objective,
       contextRef: input.contextRef,
-      worktree: null as string | null,
+      worktree,
       signal,
     };
     switch (backend) {

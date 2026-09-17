@@ -15,6 +15,7 @@
  * No slash command is required: call `orchestrate(request)`.
  */
 
+import type { GitRepo } from "../git/GitRepo.ts";
 import type { EventStoreBackend } from "../platform/eventstore/backend.ts";
 import { type BrokerBackends, ExecutionBroker } from "./broker.ts";
 import { CompletionGate } from "./completionGate.ts";
@@ -62,6 +63,10 @@ export interface OrchestratorOptions {
   parentSessionId?: string | null;
   limits?: { maxActive?: number; maxAgents?: number; maxSubprocesses?: number; maxPerRole?: number };
   router?: IntentRouter;
+  /** Git provider used to allocate isolated worktrees for mutating tasks. */
+  git?: GitRepo | null;
+  /** Base ref (commit) worktrees are created at. Defaults to current HEAD. */
+  baseRef?: string;
 }
 
 export interface OrchestrateResult {
@@ -88,7 +93,12 @@ export class Orchestrator {
     this.store = opts.store;
     this.router = opts.router ?? new IntentRouter();
     this.limits = opts.limits ?? {};
-    this.broker = new ExecutionBroker({ store: this.store, backends: opts.backends });
+    this.broker = new ExecutionBroker({
+      store: this.store,
+      backends: opts.backends,
+      git: opts.git ?? null,
+      baseRef: opts.baseRef ?? "",
+    });
     this.scheduler = new MissionScheduler({
       store: this.store,
       broker: this.broker,
