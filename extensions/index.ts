@@ -1107,19 +1107,28 @@ ${RECOVERY_PROMPT}`;
     // Deltas come from panel state, which the ledger feeder already keeps
     // current. No transcript, no second pipeline.
     //
-    // RUN files only, never the workspace: when a run settles the run view is
-    // cleared, and falling back to the working tree would present every tracked
-    // change as newly changed — the narrator would claim the session edited
-    // files it merely started displaying. The narrator narrates runs, and says
-    // nothing when idle.
+    // The whole session is narrated, run and idle alike: while a run is
+    // underway the run's files drive the arc; when idle (no run, or one that
+    // has settled) the working tree's changed files do. The run view is kept
+    // after settle (see LedgerFeeder), so we switch on phase rather than the
+    // mere presence of a run.
     const unsubscribe = plumbing.state.subscribe((snapshot) => {
+      // Narrate the WHOLE session, not just engineering runs: while a run is
+      // underway we summarise the run; when idle (no run, or one that has
+      // settled) we summarise the working tree's changed files, so edits and
+      // commands outside /engineer are part of the arc too.
       const run = snapshot.run;
-      if (!run) return;
+      const activeRun = run && run.phase !== "settled" ? run : undefined;
+      const files = activeRun
+        ? activeRun.files.map((file) => file.path)
+        : (snapshot.workspace?.files ?? []).map((file) => file.path);
+      // Nothing happening: no deltas to summarise, no model call to spend.
+      if (!activeRun && files.length === 0) return;
       void narrator.observe({
-        ...(run.workItemId ? { workItemId: run.workItemId } : {}),
-        ...(run.goal ? { goal: run.goal } : {}),
-        ...(run.phase ? { phase: run.phase } : {}),
-        files: run.files.map((file) => file.path),
+        ...(activeRun?.workItemId ? { workItemId: activeRun.workItemId } : {}),
+        ...(activeRun?.goal ? { goal: activeRun.goal } : {}),
+        ...(activeRun?.phase ? { phase: activeRun.phase } : {}),
+        files,
       });
     });
     // The panel cache is process-wide and outlives a session, so without this

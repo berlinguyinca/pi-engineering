@@ -8,6 +8,18 @@ test("deltas: a first observation is entirely new", () => {
   assert.ok(d.some((x) => x.kind === "work-item"));
 });
 
+test("deltas: idle work with no work item still reports its changed files", () => {
+  // The session narrative tracks idle edits too, so a files-only observation
+  // (no workItemId/phase) must produce a file delta, not nothing.
+  const d = computeDeltas(undefined, { files: ["src/a.ts", "src/b.ts"] });
+  assert.ok(d.length > 0, "changed idle files are news");
+  assert.ok(
+    d.every((x) => x.kind === "files"),
+    "no work item means no work-item/phase deltas",
+  );
+  assert.match(d.map((x) => x.text).join(" "), /a\.ts/);
+});
+
 test("deltas: an unchanged observation produces nothing to say", () => {
   const input = { workItemId: "WI-1", goal: "add a status bar", phase: "scout", files: ["a.ts"] };
   assert.deepEqual(computeDeltas(input, { ...input, files: ["a.ts"] }), []);
