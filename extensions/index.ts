@@ -856,15 +856,20 @@ ${RECOVERY_PROMPT}`;
     pi.on("session_start", (_event, ctx) => {
       installStreamRetry(ctx, ctx.model);
     });
-    pi.on("before_agent_start", (_event, ctx) => {
+    pi.on("before_agent_start", async (_event, ctx) => {
       installStreamRetry(ctx, ctx.model);
-      // The fallback (if any) is deferred to here so it runs against THIS
-      // callback's live ctx — never a stale one captured from an earlier
-      // session. The promise is awaited-and-caught, so a rejected fallback
-      // cannot escape as an uncaught exception that exits Pi.
-      void applyPendingFallbackWithFreshCtx(ctx as FallbackContext).catch((error) => {
+      // The fallback (if any) runs against THIS callback's live ctx — never a
+      // stale one captured from an earlier session. It is awaited so a switch
+      // (if the decision is one) lands before this turn's first provider call
+      // rather than racing it, and it is caught so a fallback failure degrades
+      // the feature instead of breaking the agent start or escaping as an
+      // uncaught rejection that exits Pi. When nothing is pending this returns
+      // immediately, so the normal path pays no latency.
+      try {
+        await applyPendingFallbackWithFreshCtx(ctx as FallbackContext);
+      } catch (error) {
         console.error("[pi-engineering] fallback application failed", error);
-      });
+      }
     });
     pi.on("model_select", (event, ctx) => {
       // A switch — ours or the operator's — supersedes any stale fallback
