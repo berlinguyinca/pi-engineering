@@ -453,3 +453,52 @@
     critical: 0
     high: 0
 
+- id: dogfood-orchestration-hardening
+  milestone: __global__
+  type: dogfood
+  status: pass
+  commit: fc732eeff6c8d8a5462e6b382473c990b99e078a
+  generatedAt: 2026-09-17T22:00:04.000Z
+  paths: &a9
+    - src/orchestration/
+    - src/runtime/
+    - src/platform/
+    - src/tools/
+    - extensions/
+    - test/fixtures/
+    - scripts/
+  proof: scripts/dogfood-orchestration.ts 24/24 checks pass (exit 0); tsc --noEmit
+    clean; biome check clean; full suite 1226 pass / 0 fail; test:e2e reports
+    COMMANDS OK and package load OK (21 commands, 7 tools)
+  summary: "Orchestration hardening pass driven by dogfooding plus four
+    fresh-context reviews. Dogfood now exercises the real EngineeringRuntime over
+    git fixtures: intent auto-routing, gate-bearing completion, snapshot
+    publication, read-only workflows cannot mutate, blocking findings create
+    bounded repair work, worktree work is harvested and merged into the repo, and
+    an empty change cannot be reported as completed work."
+- id: review-orchestration-hardening
+  milestone: __global__
+  type: fresh_review
+  status: pass
+  commit: fc732eeff6c8d8a5462e6b382473c990b99e078a
+  generatedAt: 2026-09-17T22:00:04.000Z
+  paths: *a9
+  findings:
+    critical: 0
+    high: 0
+  proof: "Four sequential fresh-context reviews of src/orchestration/
+    (orchestrator, broker, scheduler, completionGate, state, realBackends) using
+    an independent PiWorkerExecutor session. The earlier passes found and fixed
+    three critical defects: (1) a passive early return that bypassed the
+    completion gates; (2) worktree-isolated work was silently discarded, so a
+    mutating mission could COMPLETE with the repository unchanged; (3) task and
+    execution success was inferred from a resolved promise instead of
+    exitStatus, so a failing validation suite satisfied the validation gate and a
+    conflicted merge satisfied integration. The final review at this commit
+    returned no remaining critical or high findings (verdict LOW)."
+  summary: "Orchestration gate integrity: exitStatus is authoritative for task and
+    execution status; worktree work is committed to its branch and merged before
+    validation and review; completion additionally requires the checkout to differ
+    from the mission's base commit, with an empty integration surfaced as a
+    blocking finding; failed gate tasks spawn bounded repair work and a superseded
+    failure no longer blocks the gate. 0 critical / 0 high remaining."
