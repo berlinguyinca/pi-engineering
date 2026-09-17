@@ -452,4 +452,53 @@
   findings:
     critical: 0
     high: 0
+- id: dogfood-capability-inference-review
+  milestone: __global__
+  type: dogfood
+  status: pass
+  commit: 592d704a643bf3b37bb3a769448d8e399c1a4082
+  generatedAt: 2026-09-17T19:59:16.544Z
+  paths: &a9
+    - src/capability/
+    - src/inference/
+    - src/lifecycle/reviewResultTool.ts
+    - src/lifecycle/types.ts
+    - src/lifecycle/policy.ts
+    - src/lifecycle/rolePrompts.ts
+    - src/workers/PiWorkerExecutor.ts
+    - src/workers/WorkerExecutor.ts
+    - src/workers/localProviders.ts
+    - src/index.ts
+  proof: scripts/dogfood-panel-surface.ts + scripts/dogfood-roadmap.ts (exit 0);
+    tsc --noEmit; biome check; smoke-load.ts OK; npm test (1231 pass, 1
+    pre-existing parallel-timing flake unrelated to change)
+  summary: "Selective merge of the capability-aware model router, InferWeave
+    admission-retry subsystem, and structured review_result tool into the worker
+    executor — WITHOUT the auto-invoking engineering harness (which competes
+    with mission orchestration #21). Verified + 1231 tests pass; fresh review 0
+    critical / 0 high."
+- id: review-capability-inference-review
+  milestone: __global__
+  type: fresh_review
+  status: pass
+  commit: 592d704a643bf3b37bb3a769448d8e399c1a4082
+  generatedAt: 2026-09-17T19:59:16.544Z
+  paths: *a9
+  proof: "fresh-context review of the selective merge: capability router
+    (discovery/registry/policy/RoleRouter + standalone adapter producing worker
+    modelOverride), InferWeave admission subsystem (config, retry-delay
+    precedence, event bus/metrics, transport), review_result tool +
+    WorkerRequest additive fields wired through PiWorkerExecutor
+    (resultTool/kickoff/modelOverride/images/structured) and localProviders
+    (admission streamSimple). Deliberately excludes the auto-invoking
+    LifecycleHarness. Additive, non-competing, DI-backed, deterministic unit
+    tests. 0 critical / 0 high."
+  summary: "Selective merge of the capability-aware model router, InferWeave
+    admission-retry subsystem, and structured review_result tool into the worker
+    executor — WITHOUT the auto-invoking engineering harness (which competes
+    with mission orchestration #21). Verified + 1231 tests pass; fresh review 0
+    critical / 0 high."
+  findings:
+    critical: 0
+    high: 0
 
