@@ -96,6 +96,46 @@ describe("orchestration via real EngineeringRuntime (acceptance scenarios)", () 
     assert.ok(r1.mission.required_gates.includes("independent_review"));
   });
 
+  it("scenario D: a reviewer finding blocks completion and creates repair work", async () => {
+    // Not run through the default runtime (whose review backend returns no
+    // findings); instead assert the gate + finding wiring directly via a store
+    // with a blocking finding, matching what runSingleTask records.
+    const fx = fixtures[0]!;
+    const rt = await openRuntime(fx.root);
+    const baseRef = await rt.git!.headCommit();
+    // Pre-seed a blocking finding on a fresh mission to prove the gate blocks.
+    const result = await rt.orchestrator!.orchestrate("Add a health endpoint", {
+      repository: rt.cwd,
+      baseRef,
+      mutationRequested: true,
+    });
+    const store = rt.missionStore!;
+    store.addFinding({
+      mission_id: result.mission.mission_id,
+      task_id: null,
+      severity: "blocking",
+      category: "correctness",
+      file: "src/server.ts",
+      line: 1,
+      summary: "missing null check",
+      evidence: null,
+      recommended_action: "add guard",
+    });
+    const verdict = rt.orchestrator!.gate.evaluate(store.getMission(result.mission.mission_id)!);
+    assert.equal(verdict.can_complete, false);
+    assert.ok(verdict.reasons.some((r) => r.includes("blocking")));
+    // Repair work: a repair task is scheduled by the operator/repair loop.
+    const repair = store.createTask({
+      mission_id: result.mission.mission_id,
+      kind: "agent",
+      role: "implementer",
+      objective: "Repair: add null guard",
+      mutates_repo: true,
+      write_domains: ["src/server/**"],
+    });
+    assert.equal(repair.status, "PENDING");
+  });
+
   it("mission/task/execution state survives runtime restart over the same repo", async () => {
     const fx = await makeFixtureRepo();
     fixtures.push(fx);

@@ -18,7 +18,6 @@
  * orchestrator; tests inject deterministic fakes.
  */
 
-import { id } from "../core/ids.ts";
 import type { MissionStore } from "./missionStore.ts";
 import type { ExecutionBackend } from "./types.ts";
 
@@ -251,9 +250,4 @@ export class ExecutionBroker {
       }
     }
   }
-}
-
-/** Build a logical task id from a request (for deterministic tests). */
-export function logicalExecutionId(): string {
-  return id("EXC");
 }

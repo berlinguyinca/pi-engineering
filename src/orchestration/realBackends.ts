@@ -115,7 +115,12 @@ export function realBackends(opts: RealBackendsOptions) {
           tools: ["ledger_read", "artifact_read", "repo_search", "symbol"],
           cwd: opts.cwd,
         });
-        return outcomeOf(run);
+        const outcome = outcomeOf(run);
+        // If the reviewer emitted structured findings in details.findings,
+        // surface them so the completion gate can block on blocking findings.
+        const raw = (run.result.details as { findings?: unknown } | undefined)?.findings;
+        if (Array.isArray(raw)) outcome.findings = raw as Array<Record<string, unknown>>;
+        return outcome;
       },
     },
     process: {
