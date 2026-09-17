@@ -235,3 +235,59 @@
     critical: 0
     high: 0
 
+- id: dogfood-stale-context-fallback
+  milestone: __global__
+  type: dogfood
+  status: pass
+  commit: 6596c709923f183dc1ce6419b054b698141b0fe5
+  generatedAt: 2026-09-17T09:26:08.000Z
+  paths: &staleCtx
+    - src/gateway/fallbackLifecycle.ts
+    - src/status/footer.ts
+    - extensions/index.ts
+    - test/unit/gateway-fallback-lifecycle.test.ts
+    - scripts/dogfood-stale-context-fallback.ts
+    - scripts/fresh-review-stale-context-fallback.ts
+  proof: scripts/dogfood-stale-context-fallback.ts — deterministic scripted 429
+    inference_admission gateway driving the REAL installGatewayStreamRetry pump +
+    FallbackCoordinator + applyPendingFallback, wired exactly as
+    extensions/index.ts; 5 phases, exit 0
+  summary: "Stale ExtensionCommandContext crash fix: the gateway retry pump is
+    driven with the exact 429 inference_admission envelope and onHold/onProgress
+    wired to the coordinator as extensions/index.ts does. Phase 1: the reported
+    retry_after_ms (30000) is honoured and the turn retries to success — the
+    operator never sees the 429. Phase 2: a hold that fires after session
+    replacement never dereferences the stale ctx (a ctx that throws on access,
+    like assertActive, is never read). Phase 3: the pending fallback arms at the
+    threshold and applies only on the fresh ctx — the stale session is never
+    read, written, or notified. Phase 4: a throwing setModel is caught by the
+    detached boundary, not fatal. Phase 5: a 500-hold admission storm keeps the
+    state machine consistent and switches at most once."
+- id: review-stale-context-fallback
+  milestone: __global__
+  type: fresh_review
+  status: pass
+  commit: 6596c709923f183dc1ce6419b054b698141b0fe5
+  generatedAt: 2026-09-17T09:26:08.000Z
+  paths: *staleCtx
+  proof: "scripts/fresh-review-stale-context-fallback.ts (worker-based; deferred
+    at record time — the configured gateway was saturated, 30s+ timeouts on every
+    model call, the failure mode under review). Manual fresh-context review
+    performed against the actual code and Pi's own extension runner source, which
+    verifies ctx.model is an assertActive getter (runner.js:532) and that the
+    hold path reads only the captured plain Model (id/provider), never a ctx
+    getter. 0 critical / 0 high; 1 medium (fallback was fire-and-forget from
+    before_agent_start, risking a mid-turn setModel), fixed to await so the
+    switch lands before the turn's first provider call."
+  summary: "Stale-context fallback review: verified no retained Pi context
+    (latestCtx removed, no equivalent), onHold writes only plain data, the
+    fallback runs only from a fresh lifecycle ctx, model_select and
+    session_shutdown clear the coordinator, multiple holds arm at most one
+    pending fallback with an idempotent claim, the detached promise is caught,
+    and existing gateway retry/admission/threshold/notification semantics are
+    preserved. FooterController.refreshGit no longer propagates a rejecting
+    git.resolve to its detached callers. Findings: 0 critical, 0 high, 1 medium
+    (fixed)."
+  findings:
+    critical: 0
+    high: 0

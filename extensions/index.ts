@@ -13,7 +13,12 @@ import { registerInteractiveMemory } from "../src/blackhole/interactiveMemory.ts
 import { type InferweaveProvider, createInferweaveProvider, inferweaveConfigFromEnv } from "../src/context/provider.ts";
 import { contextReading, planModelSwitch } from "../src/context/usage.ts";
 import { sharedAdmissionController, sharedGatewayConfig } from "../src/gateway/config.ts";
-import { type FallbackCandidate, chooseFallbackModel } from "../src/gateway/fallback.ts";
+import {
+  type FallbackApplyDeps,
+  type FallbackContext,
+  FallbackCoordinator,
+  applyPendingFallback,
+} from "../src/gateway/fallbackLifecycle.ts";
 import {
   installGatewayStreamRetry,
   installedGatewayStreamRetries,
@@ -741,7 +746,11 @@ ${RECOVERY_PROMPT}`;
     // Consecutive waits on the current model, the trigger for considering a
     // stand-in. Reset whenever a stream actually produces output or the model
     // changes.
-    let consecutiveGatewayHolds = 0;
+    // Plain-data state machine for the hold-driven fallback (see
+    // src/gateway/fallbackLifecycle.ts). It holds a count and a pending flag —
+    // never a Pi context — so an async gateway callback can update it safely
+    // even after the session that raised the hold has been replaced or reloaded.
+    const fallbackCoordinator = new FallbackCoordinator();
 
     const installStreamRetry = (ctx: { modelRegistry?: unknown; signal?: AbortSignal }, model?: Model<any>): void => {
       const registry = ctx.modelRegistry as Parameters<typeof installGatewayStreamRetry>[0] | undefined;
@@ -768,15 +777,22 @@ ${RECOVERY_PROMPT}`;
           // accumulated across a whole session and would eventually trip a
           // fallback on unrelated, widely separated holds.
           onProgress: () => {
-            consecutiveGatewayHolds = 0;
+            fallbackCoordinator.onProgress();
           },
           onHold: () => {
-            consecutiveGatewayHolds++;
             // Checked on a hold rather than on failure: by the time a turn
             // fails the operator has already spent the wait this avoids. The
             // in-flight request is left alone — a switch applies to the next
             // one.
-            if (consecutiveGatewayHolds >= FALLBACK_AFTER_HOLDS) void considerFallback(latestCtx);
+            //
+            // PLAIN DATA ONLY. This callback is asynchronous with respect to
+            // the Pi session lifecycle: it can fire after the session that
+            // raised the hold has been replaced, reloaded, forked, or shut
+            // down. Reaching for a captured ctx here (as `considerFallback` used
+            // to) is what crashed Pi via `assertActive`. So a hold only updates
+            // the coordinator's count and pending flag; the fallback itself is
+            // applied later from a fresh lifecycle callback.
+            fallbackCoordinator.onGatewayHold({ modelId: model?.id, provider: model?.provider });
           },
           signalOf: (options) => (options as { signal?: AbortSignal } | undefined)?.signal,
           errorMessage: (m, error) => ({
@@ -801,6 +817,31 @@ ${RECOVERY_PROMPT}`;
       );
     };
 
+    // Apply a pending hold-driven fallback using the FRESH ctx this callback
+    // supplies. This is the only place the session is touched for a fallback:
+    // it reads `ctx.model`/`ctx.modelRegistry`, resolves readiness, and calls
+    // `pi.setModel` — all against a currently-valid context. A failure here is
+    // caught and logged (by the caller), so a fallback problem degrades the
+    // feature rather than terminating Pi.
+    const applyPendingFallbackWithFreshCtx = async (ctx: FallbackContext): Promise<void> => {
+      const pending = fallbackCoordinator.claimPending();
+      if (!pending) return;
+      const result = await applyPendingFallback(
+        {
+          setModel: (m) => pi.setModel(m),
+          healthFor: (c) => healthFor(c as { model?: Model<any>; modelRegistry?: unknown }),
+          log: (message) => console.error(message),
+        } satisfies FallbackApplyDeps,
+        ctx,
+        pending,
+      );
+      // A successful switch means the new model gets a clean ledger; the
+      // stand-in's own outage must start its own count, not inherit the one
+      // that triggered this switch. A "stay" keeps the count so the next hold
+      // re-arms the pending flag and the choice is reconsidered.
+      if (result.switched) fallbackCoordinator.onProgress();
+    };
+
     // Per (provider, api): `composeModelProvider` only dispatches to our
     // handler when the model's api matches the one registered, so a switch to a
     // model on a different api needs its own installation.
@@ -813,19 +854,28 @@ ${RECOVERY_PROMPT}`;
     // from inside the provider's own stream call, which is already too late for
     // that request.
     pi.on("session_start", (_event, ctx) => {
-      latestCtx = ctx as ExtensionCommandContext;
       installStreamRetry(ctx, ctx.model);
     });
-    pi.on("before_agent_start", (_event, ctx) => {
-      latestCtx = ctx as ExtensionCommandContext;
+    pi.on("before_agent_start", async (_event, ctx) => {
       installStreamRetry(ctx, ctx.model);
+      // The fallback (if any) runs against THIS callback's live ctx — never a
+      // stale one captured from an earlier session. It is awaited so a switch
+      // (if the decision is one) lands before this turn's first provider call
+      // rather than racing it, and it is caught so a fallback failure degrades
+      // the feature instead of breaking the agent start or escaping as an
+      // uncaught rejection that exits Pi. When nothing is pending this returns
+      // immediately, so the normal path pays no latency.
+      try {
+        await applyPendingFallbackWithFreshCtx(ctx as FallbackContext);
+      } catch (error) {
+        console.error("[pi-engineering] fallback application failed", error);
+      }
     });
     pi.on("model_select", (event, ctx) => {
-      latestCtx = ctx as ExtensionCommandContext;
-      // A switch — ours or the operator's — means the new model gets a clean
-      // ledger; otherwise one model's outage would keep pushing the next one
-      // toward a fallback it never earned.
-      consecutiveGatewayHolds = 0;
+      // A switch — ours or the operator's — supersedes any stale fallback
+      // intent and the hold ledger; otherwise one model's outage would switch
+      // away from the model the operator just chose.
+      fallbackCoordinator.onModelSelect();
       installStreamRetry(ctx, event.model);
     });
 
@@ -839,58 +889,18 @@ ${RECOVERY_PROMPT}`;
     // error. So a switch needs a measured context size, and `getContextUsage()`
     // reports null right after compaction, which is a refusal rather than a
     // reason to guess.
-    const FALLBACK_AFTER_HOLDS = 3;
-
-    const toCandidate = (m: Model<any>, health?: ModelHealthProvider): FallbackCandidate => {
-      const reading = health?.get(m.id) ?? {};
-      return {
-        id: m.id,
-        provider: m.provider,
-        api: m.api,
-        contextWindow: m.contextWindow,
-        maxTokens: m.maxTokens,
-        reasoning: m.reasoning === true,
-        input: m.input ?? ["text"],
-        ...(reading.state !== undefined ? { state: reading.state } : {}),
-        ...(reading.slots !== undefined ? { slots: reading.slots } : {}),
-      };
-    };
-
-    /** The most recent session context, for the hold-driven fallback check. */
-    let latestCtx: ExtensionCommandContext | undefined;
-
-    const considerFallback = async (ctx: ExtensionCommandContext | undefined): Promise<void> => {
-      if (!ctx) return;
-      const current = ctx.model;
-      if (!current) return;
-      const registry = ctx.modelRegistry as { getAvailable?: () => Model<any>[] } | undefined;
-      const available = registry?.getAvailable?.() ?? [];
-      if (available.length < 2) return;
-
-      const usage = ctx.getContextUsage?.();
-      // Readiness makes the difference between swapping to a model that can
-      // serve and swapping to another one with no workers.
-      const health = await healthFor(ctx).catch(() => undefined);
-      const decision = chooseFallbackModel({
-        current: toCandidate(current, health),
-        available: available.map((m) => toCandidate(m, health)),
-        usedTokens: usage?.tokens ?? null,
-      });
-      if (decision.action !== "switch") return;
-
-      const target = available.find((m) => m.id === decision.model.id && m.provider === decision.model.provider);
-      if (!target) return;
-      // Announced, never silent: a model swap changes output quality, and an
-      // operator who cannot see it happen cannot account for what changed.
-      const switched = await pi.setModel(target);
-      if (switched) {
-        consecutiveGatewayHolds = 0;
-        ctx.ui.notify(
-          `${current.id} has no workers — switched to ${target.id} (${decision.reason}). /model to change back.`,
-          "info",
-        );
-      }
-    };
+    //
+    // Lifecycle safety (INV: session-bound Pi objects MUST NOT be retained for
+    // later asynchronous use): the hold that arms a fallback is observed in a
+    // gateway callback, which is async with respect to the session. It updates
+    // only the coordinator's plain state; the pending flag is then applied in
+    // `before_agent_start` against the fresh ctx that callback supplies. A
+    // stale captured ctx is what crashed Pi (`assertActive`) before this
+    // change — the plain flag has no such hazard.
+    pi.on("session_shutdown", () => {
+      // Ephemeral fallback state must not leak across a session boundary.
+      fallbackCoordinator.onSessionShutdown();
+    });
   }
 
   // ─── Live status bar: harness-owned Pi footer (spec §status-bar) ─────────
