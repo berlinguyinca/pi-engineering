@@ -39,12 +39,58 @@ test("controller: the chord matcher claims only its own key", () => {
   assert.equal(matchesChord("\x10", ""), false);
 });
 
-test("controller: terminal input passes everything except the chord through", () => {
-  const controller = new PanelController({ state: new PanelState(), ui: fakeUi() as never, chord: "ctrl+p" });
+test("controller: terminal input passes everything except the chords through", () => {
+  const ui = fakeUi();
+  const controller = new PanelController({ state: new PanelState(), ui: ui as never, chord: "ctrl+p" });
+  // Focus chord: consumed, and it only steps focus in, never collapses.
   assert.deepEqual(controller.handleTerminalInput("\x10"), { consume: true });
+  assert.equal(controller.isOpen(), true);
+  assert.equal(ui.hideCalls, 0, "the focus chord must not collapse the panel");
   assert.equal(controller.handleTerminalInput("hello"), undefined);
   assert.equal(controller.handleTerminalInput("\x1b[A"), undefined);
   assert.equal(controller.handleTerminalInput("\r"), undefined);
+  controller.dispose();
+});
+
+test("controller: the toggle chord collapses and uncollapses the whole panel", () => {
+  const ui = fakeUi();
+  const controller = new PanelController({ state: new PanelState(), ui: ui as never, chord: "ctrl+p" });
+
+  // ctrl+b (0x02) is the default toggle chord.
+  assert.deepEqual(controller.handleTerminalInput("\x02"), { consume: true });
+  assert.equal(controller.isOpen(), true, "the toggle chord opens the panel");
+  assert.deepEqual(controller.handleTerminalInput("\x02"), { consume: true });
+  assert.equal(controller.isOpen(), false, "the toggle chord collapses the panel");
+  assert.equal(ui.hideCalls, 1);
+  controller.dispose();
+});
+
+test("controller: a disabled toggle chord claims nothing", () => {
+  const ui = fakeUi();
+  const controller = new PanelController({
+    state: new PanelState(),
+    ui: ui as never,
+    chord: "ctrl+p",
+    toggleChord: "none",
+  });
+  assert.equal(controller.handleTerminalInput("\x02"), undefined, "a disabled toggle chord passes through");
+  assert.equal(controller.isOpen(), false);
+  controller.dispose();
+});
+
+test("controller: the focus and toggle chords are independent", () => {
+  const ui = fakeUi();
+  const controller = new PanelController({
+    state: new PanelState(),
+    ui: ui as never,
+    chord: "ctrl+p",
+    toggleChord: "ctrl+o",
+  });
+  // ctrl+o (0x0f) toggles visibility; ctrl+p (0x10) only steps focus in.
+  assert.deepEqual(controller.handleTerminalInput("\x0f"), { consume: true });
+  assert.equal(controller.isOpen(), true);
+  assert.deepEqual(controller.handleTerminalInput("\x10"), { consume: true });
+  assert.equal(controller.isOpen(), true, "focusing must not collapse an open panel");
   controller.dispose();
 });
 

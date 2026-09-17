@@ -41,17 +41,22 @@ render loop.
 
 ## Behavior — panel (track 2)
 
-`/panel` toggles a right-anchored overlay at 35% terminal width, with a floor of
-36 columns; below 100 terminal columns the overlay does not render at all, so it
-never crowds the chat. Toggling focuses the panel; escape closes it and returns
-focus to the editor. Closing preserves expansion and selection state for the
-next open.
+The panel is right-anchored at 35% terminal width, with a floor of 36 columns;
+below 100 terminal columns the overlay does not render at all, so it never
+crowds the chat. It is **on by default** and is registered `nonCapturing`, so it
+stays visible without taking the keyboard. Two separate actions, two separate
+chords: `ctrl+p` steps the keyboard into and out of the panel (for navigation),
+and `ctrl+b` — or `/panel` — collapses and uncollapses the whole overlay.
+Escape, at the top level, releases focus back to the editor rather than hiding
+the panel: ambient visibility is the point, and the operator stops interacting
+with the panel far more often than they want it gone. Collapsing preserves
+expansion and selection state for the next open.
 
-The extension API registers commands but not app keybindings, so the hotkey is
-implemented with a raw input handler (`ctx.ui.onTerminalInput`) that consumes a
-single configurable chord — `ctrl+p` by default — and passes every other key
-through untouched. The chord is configurable, and settable to none, so it can
-never shadow a binding the operator relies on.
+The extension API registers commands but not app keybindings, so both hotkeys
+are implemented with a raw input handler (`ctx.ui.onTerminalInput`) that
+consumes only its own key and passes every other keystroke through untouched.
+Each chord is configurable, and settable to none, so neither can shadow a
+binding the operator relies on.
 
 Navigation is keyboard-first: up/down move the selection, right or enter expands
 a node or opens a file, left collapses. Rows are additionally wrapped in

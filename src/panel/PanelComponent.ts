@@ -87,6 +87,8 @@ export interface PanelComponentOptions {
   focused?: () => boolean;
   /** The chord that steps into the panel, named in the hint. */
   chord?: string;
+  /** The chord that collapses/uncollapses the panel, named in the hint. */
+  toggleChord?: string;
   /** Copy sink. Defaults to OSC 52 on stdout. */
   copy?: (text: string) => CopyResult;
 }
@@ -101,6 +103,7 @@ export class PanelComponent {
   private readonly theme: { fg(colour: string, text: string): string; getBgAnsi?(colour: string): string } | undefined;
   private readonly focusedFn: (() => boolean) | undefined;
   private readonly chord: string | undefined;
+  private readonly toggleChord: string | undefined;
   private readonly copyFn: (text: string) => CopyResult;
   private readonly unsubscribe: () => void;
 
@@ -138,6 +141,7 @@ export class PanelComponent {
     this.theme = opts.theme;
     this.focusedFn = opts.focused;
     this.chord = opts.chord;
+    this.toggleChord = opts.toggleChord;
     this.copyFn = opts.copy ?? ((text) => copyToTerminal(text));
     // The layout is the single source of truth for what is open, including the
     // first-open defaults (see DEFAULT_LAYOUT.expanded).
@@ -235,7 +239,12 @@ export class PanelComponent {
   private hintText(): string {
     if (this.focusedFn?.() === true) return " ↑↓ move · ⏎ open · esc leave · tab switch";
     const chord = this.chord && this.chord !== "none" ? this.chord : undefined;
-    return chord ? ` ${chord} to navigate` : "";
+    const toggle = this.toggleChord && this.toggleChord !== "none" ? this.toggleChord : undefined;
+    const step = chord ? ` ${chord} to navigate` : "";
+    // The collapse chord is only useful when the panel is not focused, so it is
+    // named in the same hint that tells the operator how to reach the panel.
+    const hide = toggle ? ` · ${toggle} hide` : "";
+    return `${step}${hide}`;
   }
 
   /**
