@@ -48,3 +48,30 @@ export function evaluatePhaseGate(
   const state: CavGateStatus = blockers.length === 0 ? "PASS" : "FAIL";
   return { phase, state, blockers, verifiedSteps: verified, totalSteps: phase.steps.length, waivers };
 }
+
+export interface NoFalseCompleteCheck {
+  safe: boolean;
+  blockers: string[];
+}
+
+/**
+ * CAV-22 guard: a phase may NOT be reported COMPLETE unless every step is
+ * VERIFIED with PASSING evidence. UNKNOWN / SKIPPED / BLOCKED / failed evidence
+ * all refuse COMPLETE. This is the anti-false-COMPLETE contract: completion is
+ * derived from evidence, never declared by prose.
+ */
+export function guardNoFalseComplete(
+  phase: CavPhase,
+  ledger: CavEvidenceLedger,
+  opts?: { waive?: (id: string) => boolean },
+): NoFalseCompleteCheck {
+  const blockers: string[] = [];
+  for (const step of phase.steps) {
+    const status = ledger.latestStatus(step.id);
+    const latest = ledger.latestEvidence(step.id);
+    if (opts?.waive?.(step.id)) continue;
+    if (status !== "VERIFIED") blockers.push(`${step.id} not VERIFIED (${status ?? "UNKNOWN"})`);
+    else if (!latest || latest.exit_code !== 0) blockers.push(`${step.id} VERIFIED but no passing evidence`);
+  }
+  return { safe: blockers.length === 0, blockers };
+}
