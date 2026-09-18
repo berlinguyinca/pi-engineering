@@ -47,6 +47,12 @@ export class CompletionGate {
     // failure would keep the gate closed even after the repaired work passed,
     // making the mission unrecoverable. A failure is superseded once a later task
     // of the same kind and role succeeded.
+    // Insertion order is the real chronology (the store is event-sourced). Only
+    // timestamps are not enough: created_at has millisecond resolution, so a task
+    // that fails immediately AFTER a success can share its timestamp, and a
+    // timestamp-only comparison would mask that late failure.
+    const order = new Map<string, number>();
+    tasks.forEach((t, i) => order.set(t.task_id, i));
     const superseded = (t: OrchestrationTask): boolean =>
       tasks.some(
         (o) =>
@@ -54,7 +60,7 @@ export class CompletionGate {
           o.kind === t.kind &&
           o.role === t.role &&
           o.status === "SUCCEEDED" &&
-          o.created_at >= t.created_at,
+          (order.get(o.task_id) ?? -1) > (order.get(t.task_id) ?? -1),
       );
     const failed = tasks.filter((t) => t.status === "FAILED" && !superseded(t));
 

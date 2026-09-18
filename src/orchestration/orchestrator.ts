@@ -306,10 +306,28 @@ export class Orchestrator {
       verdict = this.gate.evaluate(this.store.getMission(mission.mission_id)!);
     }
 
-    // The mission is finished either way; drop any mission-scoped worktree
-    // bookkeeping so it cannot accumulate for tasks that never reach an
-    // integration dispatch (e.g. repair tasks).
-    await this.broker.cleanupMission(mission.mission_id);
+    // The mission is finished either way: release the mission-scoped worktrees so
+    // they cannot accumulate for tasks that never reach an integration dispatch
+    // (e.g. repair tasks). Branches are released only when the work actually
+    // landed — otherwise the branch is the last copy of the worker's output and
+    // deleting it would destroy what an operator needs to resolve the conflict.
+    await this.broker.cleanupMission(mission.mission_id, { keepBranches: !integrated });
+    if (!integrated) {
+      const preserved = this.broker.preservedBranches(mission.mission_id);
+      if (preserved.length > 0) {
+        this.store.addFinding({
+          mission_id: mission.mission_id,
+          task_id: null,
+          severity: "major",
+          category: "integration",
+          file: null,
+          line: null,
+          summary: `Unmerged worker work preserved on branch(es): ${preserved.join(", ")}`,
+          evidence: null,
+          recommended_action: "Merge or discard these branches manually; the orchestrator will not re-run them.",
+        });
+      }
+    }
 
     const finalMission = this.store.getMission(mission.mission_id)!;
     if (verdict.can_complete && integrated) {

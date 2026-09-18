@@ -136,6 +136,8 @@ export class ExecutionBroker {
   private readonly missionWorktrees = new Map<string, { path: string; branch: string }[]>();
   /** Commit each mission's worktrees were actually forked from (landing invariant). */
   private readonly resolvedBases = new Map<string, string>();
+  /** Branches intentionally kept after cleanup because their work never merged. */
+  private readonly preserved = new Map<string, string[]>();
 
   constructor(opts: BrokerOptions) {
     this.store = opts.store;
@@ -275,20 +277,40 @@ export class ExecutionBroker {
   }
 
   /** Release any worktrees still tracked for a finished mission. */
-  async cleanupMission(missionId: string): Promise<void> {
-    await this.releaseMissionWorktrees(missionId);
+  async cleanupMission(missionId: string, opts: { keepBranches?: boolean } = {}): Promise<void> {
+    await this.releaseMissionWorktrees(missionId, opts.keepBranches === true);
   }
 
   /** Remove + clean all mission worktrees (after integration). */
-  private async releaseMissionWorktrees(missionId: string): Promise<void> {
+  private async releaseMissionWorktrees(missionId: string, keepBranches = false): Promise<void> {
     const wts = this.missionWorktrees.get(missionId) ?? [];
     for (const wt of wts) {
-      if (this.git) await this.git.removeWorktree({ path: wt.path, branch: wt.branch }).catch(() => {});
+      // When the work never landed (conflict, failed checks, empty branch) the
+      // branch is the ONLY copy of what the worker produced, and removeWorktree
+      // without keepBranch runs `git branch -D` — destroying work an operator
+      // would need in order to resolve the conflict. Keep it in that case; the
+      // caller keeps branches off for successful integration so branches do not
+      // accumulate.
+      if (this.git) {
+        await this.git
+          .removeWorktree({ path: wt.path, branch: wt.branch }, { keepBranch: keepBranches })
+          .catch(() => {});
+      }
     }
     this.missionWorktrees.delete(missionId);
+    // Only record a preserved list when there was something to preserve, so a
+    // later no-op cleanup cannot overwrite the branches worth recovering with [].
+    if (keepBranches && wts.length > 0) {
+      this.preserved.set(missionId, [...(this.preserved.get(missionId) ?? []), ...wts.map((w) => w.branch)]);
+    }
     for (const [execId, info] of [...this.allocatedWorktrees]) {
       if (wts.some((w) => w.branch === info.branch)) this.allocatedWorktrees.delete(execId);
     }
+  }
+
+  /** Branches kept after cleanup so unmerged worker work stays recoverable. */
+  preservedBranches(missionId: string): string[] {
+    return this.preserved.get(missionId) ?? [];
   }
 
   /** Map a task kind to a broker backend. */
@@ -437,7 +459,14 @@ export class ExecutionBroker {
         // After integration, release the merged worktrees (fire-and-forget
         // cleanup so the return value stays a plain Promise<ExecutionOutcome>).
         const outcome = runner.runIntegration({ objective: input.objective, handoffs, signal });
-        outcome.then(() => this.releaseMissionWorktrees(input.missionId)).catch(() => {});
+        // Release the worktrees, but delete the branches only when the merge
+        // actually landed. After a conflict or a failed integration the branch is
+        // the only remaining copy of the worker's output, and removeWorktree
+        // without keepBranch runs `git branch -D` — which would destroy exactly
+        // what an operator needs to resolve the conflict.
+        outcome
+          .then((o) => this.releaseMissionWorktrees(input.missionId, o.exitStatus !== "succeeded"))
+          .catch(() => {});
         return outcome;
       }
       case "validation": {

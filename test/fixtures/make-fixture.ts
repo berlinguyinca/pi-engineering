@@ -59,7 +59,7 @@ export async function makeFixtureRepo(): Promise<{ root: string; cleanup: () => 
 async function cleanupFixture(root: string): Promise<void> {
   const prefix = `pi-eng-${shortHash(root)}-`;
   const parent = dirname(root);
-  await rm(root, { recursive: true, force: true });
+  await rmRetry(root);
   try {
     const { readdir } = await import("node:fs/promises");
     for (const name of await readdir(parent)) {
@@ -69,6 +69,28 @@ async function cleanupFixture(root: string): Promise<void> {
     }
   } catch {
     // Best effort.
+  }
+}
+
+/**
+ * `rm -rf` a temporary tree, retrying briefly.
+ *
+ * Deleting a fixture repo can race with git activity still settling in its `.git`
+ * (worktree add/remove, branch updates), and `rm` then fails with ENOTEMPTY on a
+ * directory that was non-empty a moment ago and is empty a moment later. Under the
+ * parallel test runner this showed up as an intermittent red run whose only
+ * 'failure' was teardown. Retrying is the whole fix; the tree is ours to delete.
+ */
+async function rmRetry(target: string, attempts = 6): Promise<void> {
+  for (let i = 0; i < attempts; i++) {
+    try {
+      await rm(target, { recursive: true, force: true });
+      return;
+    } catch (err) {
+      const code = (err as { code?: string }).code;
+      if (i === attempts - 1 || (code !== "ENOTEMPTY" && code !== "EBUSY" && code !== "EPERM")) return;
+      await new Promise((r) => setTimeout(r, 25 * (i + 1)));
+    }
   }
 }
 

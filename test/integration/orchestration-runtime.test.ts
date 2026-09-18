@@ -317,6 +317,21 @@ describe("orchestration via real EngineeringRuntime (acceptance scenarios)", () 
     assert.ok(mainSrc.includes("// main"), "incumbent content must survive a conflicted merge");
     assert.ok(!mainSrc.includes("// worker"), "conflicted worker change must not be applied");
     assert.ok(!mainSrc.includes("<<<<<<<"), "no conflict markers may be left in the working tree");
+
+    // Recovery must remain possible: after a conflict the worker branch is the
+    // only copy of its output, so cleanup MUST NOT have run `git branch -D` on it.
+    const { execFile } = await import("node:child_process");
+    const { promisify } = await import("node:util");
+    const branches = await promisify(execFile)("git", ["-C", fx.root, "branch", "--list", "pi-eng-orch-*"]);
+    assert.ok(
+      branches.stdout.trim().length > 0,
+      "unmerged worker work must be preserved on its branch for operator recovery",
+    );
+    const preserved = rt.missionStore!.listFindings(result.mission.mission_id).filter((f) => f.severity === "major");
+    assert.ok(
+      preserved.some((f) => f.summary.includes("preserved on branch")),
+      "preserved work must be reported so an operator knows it exists",
+    );
   });
 
   it("an integrating mission whose worker produced no change does not complete", async () => {

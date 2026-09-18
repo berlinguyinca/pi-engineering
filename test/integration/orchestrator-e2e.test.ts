@@ -66,6 +66,8 @@ interface HarnessOpts {
   agentExitStatus?: string;
   /** Fail the first N validation runs, then succeed (repair-loop recovery). */
   validationFailTimes?: number;
+  /** Fail every validation run AFTER the Nth (a late failure must not be masked). */
+  validationFailAfter?: number;
 }
 
 function harness(opts: HarnessOpts = {}): Harness {
@@ -107,6 +109,15 @@ function harness(opts: HarnessOpts = {}): Harness {
       runValidation: async () => {
         calls.validation.push("validation");
         if (opts.failValidation) throw new Error("test failed: expected 1 got 2");
+        if (opts.validationFailAfter && calls.validation.length > opts.validationFailAfter) {
+          return {
+            executionId: "e",
+            exitStatus: "failed",
+            summary: "suite went red late",
+            artifactRefs: [],
+            usage: {},
+          };
+        }
         if (opts.validationFailTimes && calls.validation.length <= opts.validationFailTimes) {
           return { executionId: "e", exitStatus: "failed", summary: "suite red", artifactRefs: [], usage: {} };
         }
@@ -570,6 +581,33 @@ describe("missing backends must degrade, not explode", () => {
     assert.ok(
       ["BLOCKED", "FAILED"].includes(result.mission.status),
       `mission must settle, got ${result.mission.status}`,
+    );
+  });
+});
+
+describe("a late failure is never masked by an earlier success", () => {
+  it("validation that goes red AFTER a green run still blocks completion", async () => {
+    // A blocking finding forces a repair round, which re-runs validation; that
+    // second run goes red, so a SUCCEEDED validation precedes a FAILED one.
+    const h = harness({ findings: ["the endpoint still leaks a file handle"], validationFailAfter: 1 });
+    const result = await h.orchestrator.orchestrate("Add an endpoint and fix the build", {
+      repository: ".",
+      baseRef: "abc",
+      mutationRequested: true,
+    });
+    const validations = h.store.listTasks(result.mission.mission_id).filter((t) => t.kind === "validation");
+    assert.ok(
+      validations.some((t) => t.status === "SUCCEEDED"),
+      "an earlier validation succeeded",
+    );
+    assert.ok(
+      validations.some((t) => t.status === "FAILED"),
+      "a later validation failed",
+    );
+    assert.equal(
+      result.completed,
+      false,
+      "a FAILED task created after a SUCCEEDED one must still block, not be treated as superseded",
     );
   });
 });
