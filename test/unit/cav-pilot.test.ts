@@ -30,6 +30,49 @@ test("pilot calibration passes on a healthy console surface (deterministic gates
   assert.ok(gateNames.includes("visual"));
 });
 
+test("pilot calibration detects every seeded failure scenario (fail-closed topology)", async () => {
+  const dir = `${REPO}/.pi-eng/cav/pilot-test-failures`;
+  const url = await writeHarness(dir, PILOT_APP);
+  // Seeded scenarios: missing action button (topology break) and a page that
+  // throws (JS failure). The verifier must detect BOTH — never pass on broken.
+  const brokenApp = `<!doctype html><html lang="en"><head><title>pilot</title></head><body><main><h1>Broken</h1></main></body></html>`;
+  const result = await calibratePilot({
+    name: "inferweave",
+    url,
+    artifactsDir: `${dir}/out`,
+    expectedSelectors: ["#action-new"],
+    maxExploreSteps: 4,
+    writeScenarioHtml: async () => url, // reuse healthy url; scenario HTML is the broken surface
+    failureScenarios: [{ id: "missing-action", html: brokenApp, mustFailSelector: "#action-new" }],
+  });
+  // Failure scenario must be DETECTED (gate passes means detection succeeded).
+  const failureGate = result.gates.find((g) => g.gate === "failure");
+  assert.ok(failureGate, "failure gate missing");
+  assert.equal(failureGate.passed, true, JSON.stringify(result.blockers));
+});
+
+// A broken pilot surface that the verifier FAILS to flag is a real finding.
+test("failure scenario that is NOT detected blocks the calibration", async () => {
+  const dir = `${REPO}/.pi-eng/cav/pilot-test-undetected`;
+  const url = await writeHarness(dir, PILOT_APP);
+  // Scenario HTML is NOT actually served (writeScenarioHtml returns the healthy
+  // url), so the verifier sees a healthy surface and passes => not detected.
+  const result = await calibratePilot({
+    name: "inferweave",
+    url,
+    artifactsDir: `${dir}/out`,
+    expectedSelectors: ["#action-new"],
+    maxExploreSteps: 2,
+    writeScenarioHtml: async () => url,
+    failureScenarios: [{ id: "phantom", html: "ignored", mustFailSelector: "#does-not-exist-in-healthy" }],
+  });
+  assert.equal(result.passed, false);
+  assert.ok(
+    result.blockers.some((b) => b.toLowerCase().includes("not detected")),
+    JSON.stringify(result.blockers),
+  );
+});
+
 test("pilot calibration fails closed when an expected selector is missing", async () => {
   const dir = `${REPO}/.pi-eng/cav/pilot-test-broken`;
   const url = await writeHarness(

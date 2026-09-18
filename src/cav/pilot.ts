@@ -29,12 +29,28 @@ export interface PilotConfig {
   maxExploreSteps?: number;
   /** Self-baseline visual threshold (default 0.5%) for render variance. */
   visualThresholdPct?: number;
+  /** Failure scenarios the pilot verifier must detect (fail closed). */
+  failureScenarios?: PilotFailureScenario[];
+  /** Writer used to seed a failure scenario's HTML (test injects a harness). */
+  writeScenarioHtml?: (id: string, html: string) => Promise<string>;
 }
 
 export interface PilotGateResult {
-  gate: "ui" | "visual" | "a11y" | "explore";
+  gate: "ui" | "visual" | "a11y" | "explore" | "failure";
   passed: boolean;
   blockers: string[];
+}
+
+/**
+ * A seeded failure scenario the pilot verifier must DETECT (fail closed). The
+ * verifier must not pass on a broken pilot surface.
+ */
+export interface PilotFailureScenario {
+  id: string;
+  /** HTML to serve for the scenario; must break the healthy invariant. */
+  html: string;
+  /** Selector that must be absent/present to prove detection. */
+  mustFailSelector?: string;
 }
 
 export interface PilotCalibrationResult {
@@ -134,6 +150,46 @@ export async function calibratePilot(cfg: PilotConfig): Promise<PilotCalibration
   const visualBlockers = second.matched ? [] : [`visual diff ${second.diffPct}% > ${visualThreshold}%`];
   gates.push({ gate: "visual", passed: visualBlockers.length === 0, blockers: visualBlockers });
   if (visualBlockers.length) blockers.push(...visualBlockers.map((b) => `visual: ${b}`));
+
+  // Failure-scenario gate: every seeded broken surface must be DETECTED.
+  for (const scenario of cfg.failureScenarios ?? []) {
+    let scenarioUrl = cfg.url;
+    if (cfg.writeScenarioHtml) {
+      scenarioUrl = await cfg.writeScenarioHtml(scenario.id, scenario.html);
+    }
+    let detected = false;
+    let why = "";
+    try {
+      const gate = await instrumentBrowserRun({
+        url: scenarioUrl,
+        artifactsDir: `${cfg.artifactsDir}/failure/${scenario.id}`,
+        verify: async (page) => {
+          for (const sel of cfg.expectedSelectors) {
+            const count = await page.locator(sel).count();
+            if (count === 0) throw new Error(`pilot surface missing expected selector: ${sel}`);
+          }
+          if (scenario.mustFailSelector) {
+            const n = await page.locator(scenario.mustFailSelector).count();
+            if (n !== 0) throw new Error(`failure scenario ${scenario.id} not present`);
+          }
+        },
+      });
+      detected = !gate.passed || gate.blockers.length > 0;
+      why = gate.blockers.join("; ");
+    } catch (err) {
+      detected = true; // thrown verify = failed closed = detection
+      why = err instanceof Error ? err.message : String(err);
+    }
+    const failed = !detected;
+    gates.push({
+      gate: "failure",
+      passed: !failed,
+      blockers: failed
+        ? [`failure scenario ${scenario.id} was NOT detected (verifier passed on a broken surface)`]
+        : [],
+    });
+    if (failed) blockers.push(`failure: scenario ${scenario.id} not detected (${why})`);
+  }
 
   return {
     pilot: cfg.name,
