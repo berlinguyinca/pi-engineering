@@ -196,6 +196,64 @@ describe("ExecutionBroker (spec 03)", () => {
     }
   });
 
+  it("cancelByTask aborts the runner and leaves the execution/task CANCELED (not overwritten)", async () => {
+    const store = MissionStore.open(JsonlEventStore.inMemory());
+    const m = store.createMission({
+      title: "x",
+      goal: "x",
+      user_request: "x",
+      repository: ".",
+      base_ref: "abc",
+      risk_profile: "low",
+      workflow_class: "engineering_review",
+    });
+    const t = store.createTask({
+      mission_id: m.mission_id,
+      kind: "agent",
+      role: "implementer",
+      objective: "slow work",
+      mutates_repo: false,
+    });
+    store.transitionTask(t.task_id, "READY");
+    store.transitionTask(t.task_id, "RUNNING");
+
+    let aborted = false;
+    let executionId = "";
+    const broker = new ExecutionBroker({
+      store,
+      backends: {
+        agent: {
+          runAgent: ({ signal }) =>
+            new Promise((_resolve, reject) => {
+              signal.addEventListener("abort", () => {
+                aborted = true;
+                reject(new Error("aborted"));
+              });
+            }),
+        },
+      },
+    });
+    const handle = await broker.execute({
+      taskId: t.task_id,
+      missionId: m.mission_id,
+      kind: "agent",
+      role: "implementer",
+      objective: "slow work",
+    });
+    executionId = handle.executionId;
+    const settled = handle.result().catch(() => undefined);
+    await new Promise((r) => setImmediate(r));
+
+    const canceled = await broker.cancelByTask(t.task_id);
+    assert.equal(canceled, true, "cancelByTask must find the in-flight execution");
+    await settled;
+
+    assert.ok(aborted, "the runner must actually be aborted");
+    const ex = store.listExecutions(m.mission_id).find((e) => e.execution_id === executionId);
+    assert.equal(ex?.status, "CANCELED", `execution must stay CANCELED, got ${ex?.status}`);
+    assert.equal(store.getTask(t.task_id)?.status, "CANCELED");
+  });
+
   it("collects mission worktrees and merges them via the integration backend (spec 05)", async () => {
     const fx = await makeFixtureRepo();
     try {

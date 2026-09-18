@@ -45,6 +45,47 @@ export interface RoadmapEngineOptions {
 
 export const ALL_EVIDENCE_TYPES: EvidenceType[] = [...GENERATED_TYPES, ...MANUAL_TYPES];
 
+/**
+ * The committed manual-evidence index. It is written by the recording step, not
+ * by implementation work.
+ */
+const EVIDENCE_INDEX_PATH = "docs/roadmap/evidence.yaml";
+
+/**
+ * Strip the evidence index from an invalidation scope.
+ *
+ * The index lives inside the scope of the milestone that governs the evidence
+ * system itself (`M12.scope.paths` includes `docs/roadmap/`). Without this
+ * filter, the act of recording evidence is itself a change in that scope, so the
+ * commit that makes the roadmap verifiable also invalidates it — and every
+ * downstream milestone then falls to BLOCKED on a stale dependency. That is a
+ * self-inflicted dead lock, not staleness: the recorder documents the same rule
+ * ("committing the index must not invalidate its own records").
+ *
+ * Only this exact file is excluded. `docs/roadmap/roadmap.yaml` and every source
+ * path remain watched, so real changes still invalidate evidence.
+ */
+export function watchableScope(paths: string[]): string[] {
+  const normalized = (p: string): string =>
+    p
+      .replace(/\/\*\*$/, "")
+      .replace(/\/\*$/, "")
+      .replace(/\/$/, "");
+  const index = normalized(EVIDENCE_INDEX_PATH);
+  // Original strings are preserved so git pathspec semantics are unchanged for
+  // everything that is not the evidence index.
+  const kept = paths.filter((p) => normalized(p) !== index);
+  // A scope naming a directory that CONTAINS the index (M12's `docs/roadmap`, or
+  // a broad `docs`) still matches the file, so drop just that file with an
+  // exclude pathspec instead of dropping the whole scope — everything else in
+  // that directory must keep invalidating evidence.
+  const coversIndex = kept.some((p) => {
+    const n = normalized(p);
+    return n.length > 0 && index.startsWith(`${n}/`);
+  });
+  return coversIndex ? [...kept, `:(exclude)${EVIDENCE_INDEX_PATH}`] : kept;
+}
+
 export class RoadmapEngine {
   readonly repoRoot: string;
   private readonly roadmapPath: string;
@@ -152,7 +193,8 @@ export class RoadmapEngine {
   private freshness(): EvidenceFreshness {
     return {
       isStale: async (m, record) => {
-        const paths = record.paths.length ? record.paths : m.scope.paths;
+        const paths = watchableScope(record.paths.length ? record.paths : m.scope.paths);
+        if (paths.length === 0) return [];
         return this.gitRepo.changedPathsSince(record.commit, paths);
       },
       implementationExists: async (m) => {
@@ -243,7 +285,7 @@ export class RoadmapEngine {
         // Apply impact-based freshness to stored global records too, so a
         // stale pass (from a change outside milestone scopes) cannot keep the
         // no-refresh status/stop-gate claiming complete.
-        const changed = await this.gitRepo.changedPathsSince(g.commit, g.paths);
+        const changed = await this.gitRepo.changedPathsSince(g.commit, watchableScope(g.paths));
         return changed.length === 0;
       },
       freshReview: async () => {
@@ -253,8 +295,12 @@ export class RoadmapEngine {
         // Absence of a completed independent review never passes the gate.
         if (!rec) return { critical: 1, high: 1 };
         const fresh =
-          (await this.gitRepo.changedPathsSince(rec.commit, rec.paths.length ? rec.paths : ["src", "extensions"]))
-            .length === 0;
+          (
+            await this.gitRepo.changedPathsSince(
+              rec.commit,
+              watchableScope(rec.paths.length ? rec.paths : ["src", "extensions"]),
+            )
+          ).length === 0;
         if (!fresh || rec.status !== "pass") return { critical: 1, high: 1 };
         return rec.findings ?? { critical: 0, high: 0 };
       },
@@ -264,8 +310,12 @@ export class RoadmapEngine {
           .sort((a, b) => (a.generatedAt < b.generatedAt ? 1 : -1))[0];
         if (!rec || rec.status !== "pass") return false;
         return (
-          (await this.gitRepo.changedPathsSince(rec.commit, rec.paths.length ? rec.paths : ["src", "extensions"]))
-            .length === 0
+          (
+            await this.gitRepo.changedPathsSince(
+              rec.commit,
+              watchableScope(rec.paths.length ? rec.paths : ["src", "extensions"]),
+            )
+          ).length === 0
         );
       },
     };

@@ -51,19 +51,49 @@ interface Harness {
   calls: { agent: string[]; review: string[]; validation: string[]; process: string[] };
 }
 
-function harness(opts: { findings?: string[]; failValidation?: boolean; reviewDelay?: boolean } = {}): Harness {
+interface HarnessOpts {
+  findings?: string[];
+  failValidation?: boolean;
+  reviewDelay?: boolean;
+  /**
+   * Realistic validation failure shape. The real CommandVerifier backend does
+   * NOT throw on a failing suite — it resolves with exitStatus "failed". Modeled
+   * only as a throw, the orchestrator once counted a failing suite as passing
+   * gate evidence, so this pins the non-throwing shape too.
+   */
+  validationExitStatus?: string;
+  reviewExitStatus?: string;
+  agentExitStatus?: string;
+  /** Fail the first N validation runs, then succeed (repair-loop recovery). */
+  validationFailTimes?: number;
+  /** Fail every validation run AFTER the Nth (a late failure must not be masked). */
+  validationFailAfter?: number;
+}
+
+function harness(opts: HarnessOpts = {}): Harness {
   const store = MissionStore.open(JsonlEventStore.inMemory());
   const calls = { agent: [] as string[], review: [] as string[], validation: [] as string[], process: [] as string[] };
   const backends: BrokerBackends = {
     agent: {
       runAgent: async ({ role, objective }) => {
         calls.agent.push(role ?? objective);
-        return { executionId: "e", exitStatus: "succeeded", summary: "implemented", artifactRefs: [], usage: {} };
+        const exit = opts.agentExitStatus ?? "succeeded";
+        return { executionId: "e", exitStatus: exit, summary: "implemented", artifactRefs: [], usage: {} };
       },
     },
     review: {
       runReview: async () => {
         calls.review.push("review");
+        if (opts.reviewExitStatus && opts.reviewExitStatus !== "succeeded") {
+          return {
+            executionId: "e",
+            exitStatus: opts.reviewExitStatus,
+            summary: "review did not complete",
+            artifactRefs: [],
+            usage: {},
+            findings: [],
+          };
+        }
         const findings = (opts.findings ?? []).map((f) => ({ summary: f, severity: "blocking", status: "open" }));
         return {
           executionId: "e",
@@ -79,6 +109,27 @@ function harness(opts: { findings?: string[]; failValidation?: boolean; reviewDe
       runValidation: async () => {
         calls.validation.push("validation");
         if (opts.failValidation) throw new Error("test failed: expected 1 got 2");
+        if (opts.validationFailAfter && calls.validation.length > opts.validationFailAfter) {
+          return {
+            executionId: "e",
+            exitStatus: "failed",
+            summary: "suite went red late",
+            artifactRefs: [],
+            usage: {},
+          };
+        }
+        if (opts.validationFailTimes && calls.validation.length <= opts.validationFailTimes) {
+          return { executionId: "e", exitStatus: "failed", summary: "suite red", artifactRefs: [], usage: {} };
+        }
+        if (opts.validationExitStatus && opts.validationExitStatus !== "succeeded") {
+          return {
+            executionId: "e",
+            exitStatus: opts.validationExitStatus,
+            summary: "validation did not pass",
+            artifactRefs: [],
+            usage: {},
+          };
+        }
         return { executionId: "e", exitStatus: "succeeded", summary: "valid", artifactRefs: [], usage: {} };
       },
     },
@@ -131,6 +182,43 @@ describe("acceptance scenario A — simple feature auto-invokes engineering+vali
     // Completion gate passed -> COMPLETE.
     assert.equal(mission.status, "COMPLETE");
     assert.equal(result.completed, true);
+  });
+});
+
+describe("passive requests — gate-bypass and illegal-transition regressions", () => {
+  it("a pure conversation request completes without throwing or bypassing gates", async () => {
+    // Regression: this path called completeMission straight from PLANNING and
+    // threw `illegal mission transition PLANNING -> COMPLETE`.
+    const h = harness();
+    const result = await h.orchestrator.orchestrate("Explain this function", {
+      repository: ".",
+      baseRef: "abc",
+      mutationRequested: false,
+    });
+    assert.equal(result.mission.workflow_class, "conversation");
+    assert.deepEqual(result.mission.required_gates, []);
+    assert.equal(result.completed, true, result.failureReason ?? "");
+    assert.equal(h.store.getMission(result.mission.mission_id)!.status, "COMPLETE");
+    // Nothing was scheduled for a pure conversation.
+    assert.equal(h.store.listTasks(result.mission.mission_id).length, 0);
+  });
+
+  it("a passive classification with policy gates is NOT short-circuited to COMPLETE", async () => {
+    // If policy attaches gates, the passive shortcut must not complete the
+    // mission unvalidated/unreviewed.
+    const h = harness();
+    const result = await h.orchestrator.orchestrate("Explain this function", {
+      repository: ".",
+      baseRef: "abc",
+      mutationRequested: false,
+      changedFiles: ["src/server.ts"],
+    });
+    assert.ok(result.mission.required_gates.length > 0, "policy must attach gates for a source change");
+    if (result.completed) {
+      // Completing is only legitimate because validation + review actually ran.
+      assert.ok(h.calls.validation.length > 0, "validation must have run");
+      assert.ok(h.calls.review.length > 0, "review must have run");
+    }
   });
 });
 
@@ -230,12 +318,21 @@ describe("acceptance scenario D — reviewer finding blocks completion and creat
       mutationRequested: true,
     });
     const mission = h.store.getMission(result.mission.mission_id)!;
-    // Blocking finding recorded.
-    const findings = h.store.listFindings(mission.mission_id);
-    assert.ok(findings.some((f) => f.severity === "blocking"));
+    // Blocking finding recorded, and completion refused.
+    assert.ok(h.store.listFindings(mission.mission_id).some((f) => f.severity === "blocking"));
     assert.notEqual(mission.status, "COMPLETE");
-    // Repair work: the orchestrator leaves a repair task open (or blocks).
     assert.equal(result.completed, false);
+    // The orchestrator created repair work from the finding (spec 07) rather
+    // than merely blocking, and re-reviewed after repairing.
+    const tasks = h.store.listTasks(mission.mission_id);
+    assert.ok(
+      tasks.some((t) => t.objective.startsWith("Repair review finding")),
+      `expected a repair task, got ${JSON.stringify(tasks.map((t) => t.objective))}`,
+    );
+    assert.ok(h.calls.review.length >= 2, `expected a re-review after repair, got ${h.calls.review.length}`);
+    // Still blocked because the reviewer keeps re-raising it, and the repair
+    // budget is bounded (no infinite loop).
+    assert.equal(mission.status, "BLOCKED");
   });
 });
 
@@ -254,10 +351,12 @@ describe("acceptance scenario E — user constraint steers/cancels affected work
     await h.orchestrator.addConstraint(m.mission_id, "do not change the database schema");
     const mission = h.store.getMission(m.mission_id)!;
     assert.ok(mission.constraints.includes("do not change the database schema"));
-    // Any running task was steered/canceled.
-    for (const t of h.store.listTasks(m.mission_id)) {
-      assert.ok(t.steer_requests.length >= 0);
-    }
+    // Steering must not corrupt task/execution state: nothing may be left in a
+    // state that a late runner result would illegally rewrite.
+    const bad = h.store
+      .listTasks(m.mission_id)
+      .filter((t) => ["READY", "RUNNING", "RETRYING"].includes(t.status) && t.status === "RUNNING");
+    assert.equal(bad.length, 0, "no task may still be RUNNING after steering + settlement");
     void affected;
   });
 });
@@ -336,5 +435,179 @@ describe("acceptance scenario F — state survives orchestrator restart", () => 
       planner: async () => [],
     });
     assert.equal(o2.gate.evaluate(store2.getMission(missionId)!).can_complete, true);
+  });
+});
+
+describe("exitStatus is authoritative (non-throwing backend failures)", () => {
+  it("validation that reports exitStatus 'failed' does NOT satisfy the validation gate", async () => {
+    const h = harness({ validationExitStatus: "failed" });
+    const result = await h.orchestrator.orchestrate("Add an endpoint and fix the build", {
+      repository: ".",
+      baseRef: "abc",
+      mutationRequested: true,
+    });
+    assert.equal(result.completed, false, "a failing validation suite must never complete the mission");
+    // The validation task must be recorded as FAILED, not SUCCEEDED, so the gate
+    // (and any operator) can see why.
+    const v = h.store.listTasks(result.mission.mission_id).filter((t) => t.kind === "validation");
+    assert.ok(v.length >= 1);
+    assert.ok(
+      v.some((t) => t.status === "FAILED"),
+      `a validation task must be FAILED, got ${v.map((t) => t.status).join(",")}`,
+    );
+    assert.ok(h.calls.validation.length >= 1, "validation must still have been attempted");
+  });
+
+  it("review that reports exitStatus 'failed' does NOT count as a completed review", async () => {
+    const h = harness({ reviewExitStatus: "failed" });
+    const result = await h.orchestrator.orchestrate("Add an endpoint and fix the build", {
+      repository: ".",
+      baseRef: "abc",
+      mutationRequested: true,
+    });
+    assert.equal(result.completed, false, "an incomplete review must not satisfy the review gate");
+    assert.ok(h.calls.review.length >= 1);
+  });
+
+  it("a worker reporting exitStatus 'failed' is not counted as a succeeded mutation", async () => {
+    const h = harness({ agentExitStatus: "failed" });
+    const result = await h.orchestrator.orchestrate("Add an endpoint and fix the build", {
+      repository: ".",
+      baseRef: "abc",
+      mutationRequested: true,
+    });
+    assert.equal(result.completed, false, "a failed worker must not yield a completed mission");
+    const impl = h.store.listTasks(result.mission.mission_id).filter((t) => t.role === "implementer");
+    assert.ok(
+      impl.some((t) => t.status === "FAILED"),
+      `implementer must be FAILED, got ${impl.map((t) => t.status).join(",")}`,
+    );
+  });
+});
+
+describe("repair of failed gate tasks", () => {
+  it("a first-red validation creates repair work and a later green one completes the mission", async () => {
+    const h = harness({ validationFailTimes: 1 });
+    const result = await h.orchestrator.orchestrate("Add an endpoint and fix the build", {
+      repository: ".",
+      baseRef: "abc",
+      mutationRequested: true,
+    });
+    // The red run must have been recorded...
+    const validations = h.store.listTasks(result.mission.mission_id).filter((t) => t.kind === "validation");
+    assert.ok(
+      validations.some((t) => t.status === "FAILED"),
+      "the red validation is recorded",
+    );
+    assert.ok(
+      validations.some((t) => t.status === "SUCCEEDED"),
+      "the re-run validation is recorded",
+    );
+    // ...and repair work must have been created for it (not a permanent wedge)...
+    const repairs = h.store
+      .listTasks(result.mission.mission_id)
+      .filter((t) => t.kind === "agent" && t.objective.includes("Fix the failing validation"));
+    assert.ok(repairs.length >= 1, "a failed validation must spawn repair work, not wedge the mission");
+    // ...and a stale failure must not keep the gate closed once it is green.
+    assert.equal(result.completed, true, "a superseded validation failure must not block completion");
+  });
+
+  it("a permanently red validation still blocks after the bounded repair rounds", async () => {
+    const h = harness({ validationExitStatus: "failed" });
+    const result = await h.orchestrator.orchestrate("Add an endpoint and fix the build", {
+      repository: ".",
+      baseRef: "abc",
+      mutationRequested: true,
+    });
+    assert.equal(result.completed, false, "an unfixable validation must never complete");
+    const repairs = h.store
+      .listTasks(result.mission.mission_id)
+      .filter((t) => t.kind === "agent" && t.objective.includes("Fix the failing validation"));
+    assert.ok(repairs.length >= 1);
+    assert.ok(repairs.length <= 4, `repair must stay bounded, got ${repairs.length}`);
+  });
+});
+
+describe("missing backends must degrade, not explode", () => {
+  it("an agent-only runtime does not throw and does not complete a mutation mission", async () => {
+    const store = MissionStore.open(JsonlEventStore.inMemory());
+    const backends: BrokerBackends = {
+      agent: {
+        runAgent: async () => ({
+          executionId: "e",
+          exitStatus: "succeeded",
+          summary: "done",
+          artifactRefs: [],
+          usage: {},
+        }),
+      },
+    };
+    const orchestrator = new Orchestrator({
+      store,
+      backends,
+      planner: async () => [
+        {
+          kind: "agent" as const,
+          role: "implementer",
+          objective: "implement",
+          mutates_repo: true,
+          write_domains: ["src/**"],
+          isolation: "none" as const,
+          depends_on: [],
+          priority: 0,
+          execution_requirements: {},
+          max_attempts: 1,
+          failure_policy: "retry" as const,
+        },
+      ],
+    });
+    // No validation / review / integration backend exists. That must surface as a
+    // blocked mission, not an exception escaping orchestrate with the mission
+    // stranded in INTEGRATING / VALIDATING / REVIEWING.
+    let result: Awaited<ReturnType<Orchestrator["orchestrate"]>> | undefined;
+    let threw: unknown;
+    try {
+      result = await orchestrator.orchestrate("Add an endpoint and fix the build", {
+        repository: ".",
+        baseRef: "abc",
+        mutationRequested: true,
+      });
+    } catch (err) {
+      threw = err;
+    }
+    assert.equal(threw, undefined, `orchestrate must not throw, got ${String(threw)}`);
+    assert.ok(result);
+    assert.equal(result.completed, false, "gates that cannot run must not be treated as passed");
+    assert.ok(
+      ["BLOCKED", "FAILED"].includes(result.mission.status),
+      `mission must settle, got ${result.mission.status}`,
+    );
+  });
+});
+
+describe("a late failure is never masked by an earlier success", () => {
+  it("validation that goes red AFTER a green run still blocks completion", async () => {
+    // A blocking finding forces a repair round, which re-runs validation; that
+    // second run goes red, so a SUCCEEDED validation precedes a FAILED one.
+    const h = harness({ findings: ["the endpoint still leaks a file handle"], validationFailAfter: 1 });
+    const result = await h.orchestrator.orchestrate("Add an endpoint and fix the build", {
+      repository: ".",
+      baseRef: "abc",
+      mutationRequested: true,
+    });
+    const validations = h.store.listTasks(result.mission.mission_id).filter((t) => t.kind === "validation");
+    assert.ok(
+      validations.some((t) => t.status === "SUCCEEDED"),
+      "an earlier validation succeeded",
+    );
+    assert.ok(
+      validations.some((t) => t.status === "FAILED"),
+      "a later validation failed",
+    );
+    assert.equal(
+      result.completed,
+      false,
+      "a FAILED task created after a SUCCEEDED one must still block, not be treated as superseded",
+    );
   });
 });

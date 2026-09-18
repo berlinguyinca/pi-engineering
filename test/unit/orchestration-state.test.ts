@@ -39,6 +39,20 @@ describe("orchestration state machines", () => {
     assert.ok(canTransitionMission("EXECUTING", "WAITING_FOR_USER"));
   });
 
+  it("allows forward skips when a stage's gate does not apply (read-only missions)", () => {
+    // A read-only investigation has no validation/review task, so it must be
+    // able to settle from EXECUTING straight to FINAL_VALIDATION -> COMPLETE.
+    assert.ok(canTransitionMission("EXECUTING", "FINAL_VALIDATION"));
+    assert.ok(canTransitionMission("INTEGRATING", "FINAL_VALIDATION"));
+    assert.ok(canTransitionMission("FINAL_VALIDATION", "COMPLETE"));
+    // The bug this regression covers: completing directly from EXECUTING threw
+    // `illegal mission transition EXECUTING -> COMPLETE`.
+    assert.throws(() => assertMissionTransition("EXECUTING", "COMPLETE"));
+    // Backwards moves are still illegal.
+    assert.ok(!canTransitionMission("FINAL_VALIDATION", "EXECUTING"));
+    assert.ok(!canTransitionMission("COMPLETE", "REPAIRING"));
+  });
+
   it("task transitions: READY->RUNNING->SUCCEEDED and retry", () => {
     assert.ok(canTransitionTask("PENDING", "READY"));
     assert.ok(canTransitionTask("READY", "RUNNING"));

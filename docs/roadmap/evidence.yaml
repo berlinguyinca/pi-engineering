@@ -1,31 +1,3 @@
-- id: dogfood-1.0
-  milestone: __global__
-  type: dogfood
-  status: pass
-  commit: 73d0fcfca83d43df345a75194beeba958c536317
-  generatedAt: 2026-09-14T00:25:30.326Z
-  paths:
-    - src/
-  proof: scripts/dogfood-roadmap.ts + real-repo roadmap check
-  summary: deterministic roadmap lifecycle dogfood; release gate reachable at HEAD
-- id: review-1.0
-  milestone: __global__
-  type: fresh_review
-  status: pass
-  commit: 73d0fcfca83d43df345a75194beeba958c536317
-  generatedAt: 2026-09-14T00:25:30.326Z
-  paths:
-    - src/roadmap/
-    - src/blackhole/
-    - src/benchmark/
-    - services/
-  proof: scripts/fresh-review-roadmap.ts + scripts/fresh-review-blackhole.ts +
-    scripts/fresh-review-blackhole-fixes.ts +
-    scripts/fresh-review-openviking-service.ts
-  summary: fresh-context review at HEAD; unresolved findings 0 critical, 0 high
-  findings:
-    critical: 0
-    high: 0
 - id: dogfood-everyday-memory
   milestone: __global__
   type: dogfood
@@ -537,6 +509,61 @@
     parallel-tournament/DAG tests now assert overlap deterministically instead
     of by wall-clock timing. Full suite green 5/5 consecutive runs. 0 critical /
     0 high."
+  findings:
+    critical: 0
+    high: 0
+- id: dogfood-1.0
+  milestone: __global__
+  type: dogfood
+  status: pass
+  commit: 18362d0bf065ba4612e4da43f74a40668e378eba
+  generatedAt: 2026-09-18T00:15:04.937Z
+  paths: &a11
+    - src/orchestration
+    - src/roadmap
+    - src/runtime
+    - src/platform
+    - src/tools
+    - extensions
+    - test/fixtures
+    - scripts
+  proof: "scripts/dogfood-orchestration.ts: 24/24 checks pass (exit 0) against
+    real EngineeringRuntime over git fixtures; npm test 1249 pass / 0 fail on
+    four consecutive full runs; orchestration suites 74/74; tsc --noEmit clean;
+    biome check clean; test:e2e COMMANDS OK + package load OK (21 commands, 7
+    tools)"
+  summary: "Orchestration completion-gate integrity: exitStatus is authoritative;
+    worktree work is harvested and merged before validation and review;
+    completion requires the checkout to differ from the mission's fork point;
+    unmerged work is preserved on its branch and reported; late failures are
+    never masked by earlier successes; recording evidence no longer invalidates
+    the evidence milestone, so the roadmap release gate can pass."
+- id: review-1.0
+  milestone: __global__
+  type: fresh_review
+  status: pass
+  commit: 18362d0bf065ba4612e4da43f74a40668e378eba
+  generatedAt: 2026-09-18T00:15:04.937Z
+  paths: *a11
+  proof: "Five sequential fresh-context reviews of src/orchestration/
+    (orchestrator, broker, scheduler, completionGate, state) and watchableScope
+    in src/roadmap/RoadmapEngine.ts via an independent PiWorkerExecutor session
+    (read/grep only), plus an independent pre-merge review of the branch diff.
+    Findings fixed: passive early return bypassing the completion gates;
+    worktree-isolated work discarded so a mutating mission could COMPLETE with
+    the repository unchanged; success inferred from a resolved promise instead
+    of exitStatus so a failing suite satisfied the validation gate and a
+    conflicted merge satisfied integration; execute() unguarded in
+    runSingleTask; empty base_ref skipping the landed-change invariant;
+    conflicted integration discarding the only copy of the worker's work;
+    millisecond-timestamp supersession masking a late failure. Final review: no
+    remaining critical or high findings (verdict LOW)."
+  summary: "Orchestration completion-gate integrity: exitStatus is authoritative;
+    worktree work is harvested and merged before validation and review;
+    completion requires the checkout to differ from the mission's fork point;
+    unmerged work is preserved on its branch and reported; late failures are
+    never masked by earlier successes; recording evidence no longer invalidates
+    the evidence milestone, so the roadmap release gate can pass."
   findings:
     critical: 0
     high: 0

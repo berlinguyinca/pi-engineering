@@ -27,3 +27,4 @@ npm-debug.log*
 
 # pi-engineering-runtime durable state
 .pi-eng/
+rr*.ts
