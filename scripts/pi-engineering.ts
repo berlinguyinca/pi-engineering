@@ -34,8 +34,13 @@ async function main(): Promise<number> {
   if (cmd === "benchmark") {
     return benchmarkCommand(rest);
   }
+  if (cmd === "cav") {
+    return cavCommand(rest);
+  }
   if (cmd !== "roadmap") {
-    console.error("usage: pi-engineering <roadmap check|roadmap status|blackhole ...|benchmark> [flags]");
+    console.error(
+      "usage: pi-engineering <roadmap check|roadmap status|blackhole ...|benchmark|cav status|...> [flags]",
+    );
     return 2;
   }
   const json = rest.includes("--json");
@@ -53,6 +58,57 @@ async function main(): Promise<number> {
     return exitCode;
   }
   console.error("usage: pi-engineering <roadmap check|roadmap status|blackhole ...|benchmark> [flags]");
+  return 2;
+}
+
+async function cavCommand(rest: string[]): Promise<number> {
+  const json = rest.includes("--json");
+  const sub = rest.find((a) => !a.startsWith("--"));
+  const { stepsDir, ledgerFile } = await import("../src/cav/index.ts").then((m) => m.cavPaths(REPO_ROOT));
+  const { CavEvidenceLedger, evaluatePhaseGate, groupPhases, loadCavSteps } = await import("../src/cav/index.ts");
+  const steps = loadCavSteps(stepsDir);
+  const ledger = await CavEvidenceLedger.open(ledgerFile);
+  const phases = groupPhases(steps);
+  const gates = phases.map((p) => evaluatePhaseGate(p, ledger));
+  const verified = steps.filter((s) => ledger.latestStatus(s.id) === "VERIFIED").length;
+  const failed = steps.filter((s) => {
+    const st = ledger.latestStatus(s.id);
+    return st === "SPECIFIED" || st === undefined;
+  }).length;
+  if (sub === "status") {
+    if (json) {
+      console.log(
+        JSON.stringify(
+          { total: steps.length, verified, phases: gates.map((g) => ({ id: g.phase.id, state: g.state })) },
+          null,
+          2,
+        ),
+      );
+      return 0;
+    }
+    const lines: string[] = [`CAV — ${steps.length} atomic steps, ${phases.length} phases`];
+    lines.push(`  verified: ${verified}/${steps.length}`);
+    for (const g of gates) {
+      lines.push(`  - ${g.phase.id} ${g.phase.name}: ${g.state} (${g.verifiedSteps}/${g.totalSteps})`);
+    }
+    console.log(lines.join("\n"));
+    return 0;
+  }
+  if (sub === "check") {
+    if (json) {
+      console.log(JSON.stringify({ total: steps.length, verified, phases: gates.map((g) => g) }, null, 2));
+    } else {
+      const lines: string[] = [`CAV check — ${steps.length} atomic steps`];
+      lines.push(`  verified: ${verified}/${steps.length}`);
+      for (const g of gates) {
+        lines.push(`  - ${g.phase.id} ${g.phase.name}: ${g.state}`);
+        for (const b of g.blockers) lines.push(`      \u2022 ${b}`);
+      }
+      console.log(lines.join("\n"));
+    }
+    return verified === steps.length ? 0 : 1;
+  }
+  console.error("usage: pi-engineering cav <status|check> [--json]");
   return 2;
 }
 
