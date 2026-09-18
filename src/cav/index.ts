@@ -12,6 +12,7 @@ export * from "./guard.ts";
 export * from "./completion.ts";
 export * from "./classify.ts";
 export * from "./runner.ts";
+export * from "./review.ts";
 
 import { resolve } from "node:path";
 import { evaluatePhaseGate } from "./completion.ts";
