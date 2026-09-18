@@ -10,6 +10,8 @@ export * from "./steps.ts";
 export * from "./evidence.ts";
 export * from "./guard.ts";
 export * from "./completion.ts";
+export * from "./classify.ts";
+export * from "./runner.ts";
 
 import { resolve } from "node:path";
 import { evaluatePhaseGate } from "./completion.ts";
