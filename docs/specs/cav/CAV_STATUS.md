@@ -60,6 +60,13 @@ node --experimental-strip-types scripts/cav-record-evidence.ts <id> --gate unit 
 - UNKNOWN/SKIPPED never PASS
 - reviewer cannot waive a deterministic failure by prose
 
+## Roadmap-1.0 regression check
+`npm run roadmap:check` — all M01..M23 milestones **VERIFIED** (my changes did not
+invalidate roadmap evidence). The two release-gate failures (fresh-review, dogfood)
+are **pre-existing** freshness requirements: committed manual evidence dates from
+2026-09-14, before current main, so it is stale after any `src/` change — this is
+the roadmap's by-design freshness rule, not a CAV regression.
+
 ## Next atomic step
 `CAV-03-01` (Real Stack Lifecycle) — but this is **BLOCKED** in the current
 environment because it requires starting/health-checking a real deployed
