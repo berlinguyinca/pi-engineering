@@ -26,6 +26,7 @@ export * from "./explore.ts";
 export * from "./reconcile.ts";
 export * from "./routing.ts";
 export * from "./concurrency.ts";
+export * from "./statusSurface.ts";
 
 import { resolve } from "node:path";
 import { evaluatePhaseGate } from "./completion.ts";

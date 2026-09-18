@@ -167,6 +167,27 @@ async function main(): Promise<void> {
         await platform.registry.flush();
         return send(200, platform.controlPlane.snapshot());
       }
+      // CAV status/evidence surface for external pi-web (pi-engineering-owned
+      // adapter data; NOT a pi-web implementation). Requires token (non-loopback).
+      if (req.method === "GET" && url.pathname === "/cav") {
+        const { buildCavSurface } = await import("../src/cav/statusSurface.ts");
+        const { loadCavSteps } = await import("../src/cav/steps.ts");
+        const { CavEvidenceLedger } = await import("../src/cav/evidence.ts");
+        const { resolve } = await import("node:path");
+        const { readdirSync } = await import("node:fs");
+        const repo = resolve(import.meta.dirname, "..");
+        const stepsDir = `${repo}/docs/specs/cav/steps`;
+        let steps = loadCavSteps(stepsDir);
+        if (steps.length === 0) {
+          try {
+            readdirSync(stepsDir);
+          } catch {
+            steps = [];
+          }
+        }
+        const ledger = await CavEvidenceLedger.open(`${repo}/.pi-eng/cav/evidence.jsonl`);
+        return send(200, buildCavSurface(steps, ledger));
+      }
       if (req.method === "POST" && url.pathname === "/runs") {
         const b = await body(req);
         const run = platform.graph.createRun({
