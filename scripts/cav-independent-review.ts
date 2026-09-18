@@ -55,23 +55,27 @@ async function main(): Promise<number> {
   const latest = ledger.latestEvidence(stepId)!;
 
   // Evidence-only brief for the reviewer — NO implementer rationale.
+  // The OPERATIVE evidence is the LATEST record for the step (this matches how
+  // the phase gate and orchestration CompletionGate treat a superseded failed
+  // attempt: a later passing run supersedes an earlier failed one).
+  const chain = evidence
+    .map(
+      (e) =>
+        `- ${e.id}: status=${e.status} role=${e.role} gate=${e.gate_type} exit=${e.exit_code} git=${e.git_sha.slice(0, 8)} cmd="${e.command}"`,
+    )
+    .join("\n");
   const brief = `You are an INDEPENDENT REVIEWER. A different model (the implementer)
 produced the evidence below for CAV requirement ${stepId}.
 
-You must decide whether this requirement may be promoted to VERIFIED based ONLY
-on the deterministic evidence. You CANNOT waive a deterministic failure. Missing
-evidence or a non-zero exit code means NOT VERIFIED. Your verdict must name the
-exact evidence record ids you inspected.
+Decide whether this requirement may be promoted to VERIFIED based ONLY on the
+deterministic evidence. The OPERATIVE record is the LATEST one (id ${latest.id}):
+it has status=${latest.status}, gate=${latest.gate_type}, exit=${latest.exit_code}.
+A non-zero exit on the LATEST record, or no evidence at all, means NOT VERIFIED.
+A non-zero exit on an EARLIER (superseded) record does NOT block, provided the
+latest record is a passing gate. You CANNOT waive a deterministic failure.
 
-Evidence for ${stepId}:
-${evidence
-  .map(
-    (e) =>
-      `- ${e.id}: status=${e.status} role=${e.role} gate=${e.gate_type} exit=${e.exit_code} git=${e.git_sha.slice(0, 8)} cmd="${e.command}"`,
-  )
-  .join("\n")}
-
-Latest: ${latest.id} status=${latest.status} exit=${latest.exit_code} gate=${latest.gate_type}
+Evidence chain for ${stepId} (oldest -> newest):
+${chain}
 
 Reply with ONLY a JSON object:
 {"approved": true|false, "inspected": ["EVID-..."], "reasons": ["..."]}`;

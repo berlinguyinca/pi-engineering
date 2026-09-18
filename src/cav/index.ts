@@ -13,6 +13,7 @@ export * from "./completion.ts";
 export * from "./classify.ts";
 export * from "./runner.ts";
 export * from "./review.ts";
+export * from "./stack.ts";
 
 import { resolve } from "node:path";
 import { evaluatePhaseGate } from "./completion.ts";
