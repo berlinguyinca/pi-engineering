@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -153,6 +153,35 @@ test("verifier never reports pass with zero passing stages (review HIGH #1)", as
     const outcome = await v.run(dir, profile, store);
     assert.ok(!outcome.passed, "a run with zero passing stages must not pass");
     assert.equal(outcome.evidence.filter((e) => e.status === "passed").length, 0);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("verifier resolves bare local binaries from node_modules/.bin (regression: ENOENT gates)", async () => {
+  // Reproduces the orchestrator bug where execFile('tsc', ...) failed with
+  // ENOENT because node_modules/.bin was not on the ambient PATH when the
+  // runtime is launched directly with `node` rather than via `npm`. Every
+  // integration/validation gate then spuriously FAILED on empty output even
+  // when the underlying tool worked. The verifier must prepend the repo's
+  // local node_modules/.bin so bare binary names resolve.
+  const dir = await makeProject({
+    "package.json": JSON.stringify({ scripts: { test: "bar-hello" } }),
+  });
+  const binDir = join(dir, "node_modules", ".bin");
+  await mkdir(binDir, { recursive: true });
+  const binPath = join(binDir, "bar-hello");
+  await writeFile(binPath, "#!/bin/sh\necho hello-from-local-bin\n");
+  await chmod(binPath, 0o755);
+  try {
+    const store = await ArtifactStore.create(join(dir, "..", "artifacts"));
+    const v = new CommandVerifier();
+    const profile = await v.detect(dir);
+    const stage = profile.stages.find((s) => s.name === "test");
+    assert.equal(stage?.command, "bar-hello", "bare binary name must be parsed from the script");
+    const outcome = await v.run(dir, profile, store);
+    assert.ok(outcome.passed, "bare local binary must resolve via node_modules/.bin");
+    assert.equal(outcome.failedStage, null);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { readFile } from "node:fs/promises";
+import { access, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import type { ArtifactStore } from "../artifacts/ArtifactStore.ts";
@@ -109,9 +109,49 @@ export function tokenizeCommand(script: string): { command: string; args: string
  * over a stale IPC fd) instead of running as real commands — a silent false
  * pass for verification. We never want that inheritance.
  */
-function cleanEnv(): NodeJS.ProcessEnv {
+/**
+ * Resolve the nearest `node_modules/.bin` directory by walking up from `cwd`.
+ * The verifier spawns commands via execFile with bare binary names (e.g. `tsc`,
+ * `biome`, `eslint`) parsed out of npm scripts. Those binaries live in a
+ * repository's local `node_modules/.bin`, which is NOT on the ambient PATH when
+ * the runtime itself is launched directly with `node` (rather than via `npm`).
+ * Without this, every deterministic gate would spuriously fail with ENOENT even
+ * when the underlying tool works — silently blocking integration/validation for
+ * correctly-landed work.
+ */
+async function localBinDir(cwd: string): Promise<string | null> {
+  let dir = cwd;
+  for (;;) {
+    const bin = join(dir, "node_modules", ".bin");
+    try {
+      await access(bin);
+      return bin;
+    } catch {
+      /* continue walking up */
+    }
+    const parent = dir.split("/").slice(0, -1).join("/");
+    if (parent === dir || parent.length === 0) return null;
+    dir = parent;
+  }
+}
+
+/**
+ * Child-process env with the node test-runner IPC context stripped, plus the
+ * nearest `node_modules/.bin` (resolved from `cwd`) prepended to PATH so bare
+ * local tool binaries resolve. When the runtime itself runs under `node --test`,
+ * spawned `node` commands inherit NODE_TEST_CONTEXT and would otherwise behave
+ * as test children (reporting over a stale IPC fd) instead of running as real
+ * commands — a silent false pass for verification. We never want that inheritance.
+ */
+async function cleanEnv(cwd: string): Promise<NodeJS.ProcessEnv> {
   const env = { ...process.env };
   delete env.NODE_TEST_CONTEXT;
+  const bin = await localBinDir(cwd);
+  if (bin) {
+    const pathKey = Object.keys(env).find((k) => k.toUpperCase() === "PATH") ?? "PATH";
+    const existing = (env[pathKey] as string | undefined) ?? "";
+    env[pathKey] = existing ? `${bin}${process.platform === "win32" ? ";" : ":"}${existing}` : bin;
+  }
   return env;
 }
 
@@ -211,7 +251,7 @@ export class CommandVerifier implements VerificationProvider {
           cwd: stage.cwd ?? cwd,
           timeout: stage.timeoutMs ?? 300_000,
           maxBuffer: 16 * 1024 * 1024,
-          env: cleanEnv(),
+          env: await cleanEnv(stage.cwd ?? cwd),
         });
         stdout = res.stdout;
         stderr = res.stderr;
