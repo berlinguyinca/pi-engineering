@@ -55,7 +55,7 @@ const PATTERNS: Pattern[] = [
     irreversible: true,
   },
   {
-    re: /\brm\s+(-[a-z]*[rf][a-z]*\s+)+\.?\/?\S+/i,
+    re: /\brm\s+(-[a-z]*r[a-z]*\s+)+\.?\/?\S+/i,
     risk: "HIGH",
     categories: ["destructive"],
     reason: "recursive delete of a path",
