@@ -18,6 +18,19 @@ import type { VerificationProvider } from "../verify/Verifier.ts";
 import type { WorkerExecutor, WorkerRequest } from "../workers/WorkerExecutor.ts";
 import type { ExecutionOutcome } from "./broker.ts";
 
+/**
+ * Fresh-context worker wall-clock budget in ms. The default (30 min) gives an
+ * implementation worker enough time to explore the repo, implement, run
+ * verification, and commit within a single bounded run — the historical 10-min
+ * default repeatedly killed workers at the boundary before they could commit
+ * real implementation work. Overridable via PI_ENGINEERING_WORKER_TIMEOUT_MS.
+ */
+export function workerTimeoutMs(): number {
+  const env = Number.parseInt(process.env.PI_ENGINEERING_WORKER_TIMEOUT_MS ?? "", 10);
+  if (Number.isFinite(env) && env > 0) return env;
+  return 30 * 60_000;
+}
+
 export interface RealBackendsOptions {
   worker: WorkerExecutor;
   verifier: VerificationProvider;
@@ -112,7 +125,10 @@ export function realBackends(opts: RealBackendsOptions) {
           context: input.contextRef,
           tools: ["ledger_read", "ledger_claim", "artifact_read", "repo_search", "symbol", "tests_for", "bash"],
           cwd: input.worktree ?? opts.cwd,
-          timeoutMs: 10 * 60_000,
+          // Fresh-context implementation workers need headroom to explore the
+          // repo, implement, run verification, and commit. Configurable so an
+          // operator can tune per environment without recompiling.
+          timeoutMs: workerTimeoutMs(),
         };
         const run = await opts.worker.run(req);
         return outcomeOf(run);
