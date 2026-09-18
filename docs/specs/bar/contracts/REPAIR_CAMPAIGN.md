@@ -1,0 +1,2 @@
+# Repair Campaign Contract
+A campaign is a bounded root-cause remediation unit. Required: campaign ID, root-cause hypothesis/evidence, affected requirements, dependencies, known failures, implementation scope, prohibited acceptance weakening, targeted tests, global regression gate, visual gate when relevant, independent review, completion criteria and before/after evidence. One campaign cannot be VERIFIED until all required affected requirements are VERIFIED or explicitly split with rationale.

@@ -1,0 +1,4 @@
+# AIMS Brownfield Profile
+Prioritize operator console and real-time character behavior. Reconstruct requirements for character selection, live/third-person camera, inventory/hotbar, goals, cognition/decision views, movement, zones, telemetry, conversation logs, foldouts, BlueMap integration, event/reel observability, OpenViking memory surfaces, and character runtime behavior.
+
+Mandatory matrix: multiple characters x runtime states x viewport sizes x loading/error/reconnect states. Detect stale cross-character state, JS errors, failed requests, blank camera, broken foldouts, overflow, missing affordances and visual mismatch. Add multi-hour soak coverage for WebSocket/event streams, stale state, memory growth, reconnects and inventory/cognition synchronization. Preserve no-cheating/player-mechanics constraints.
