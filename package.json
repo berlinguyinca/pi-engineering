@@ -4,7 +4,13 @@
   "description": "Autonomous engineering runtime for the pi coding agent: Engineering Ledger, fresh-context workers, isolated candidates, deterministic verification, and independent review.",
   "license": "MIT",
   "type": "module",
-  "keywords": ["pi-package", "engineering", "orchestration", "ledger", "agent"],
+  "keywords": [
+    "pi-package",
+    "engineering",
+    "orchestration",
+    "ledger",
+    "agent"
+  ],
   "exports": {
     ".": "./src/index.ts"
   },
@@ -38,11 +44,14 @@
     "@biomejs/biome": "^1.9.4",
     "@earendil-works/pi-coding-agent": "0.85.1",
     "@types/node": "^22.10.0",
+    "playwright": "^1.63.0",
     "typebox": "*",
     "typescript": "^5.6.0",
     "yaml": "^2.9.0"
   },
   "pi": {
-    "extensions": ["./extensions"]
+    "extensions": [
+      "./extensions"
+    ]
   }
 }
