@@ -21,6 +21,7 @@ export * from "./visual.ts";
 export * from "./a11y.ts";
 export * from "./sabotage.ts";
 export * from "./vision.ts";
+export * from "./defect.ts";
 
 import { resolve } from "node:path";
 import { evaluatePhaseGate } from "./completion.ts";
