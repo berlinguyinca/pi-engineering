@@ -29,6 +29,7 @@ export * from "./concurrency.ts";
 export * from "./statusSurface.ts";
 export * from "./dogfood.ts";
 export * from "./pilot.ts";
+export * from "./portability.ts";
 
 import { resolve } from "node:path";
 import { evaluatePhaseGate } from "./completion.ts";
