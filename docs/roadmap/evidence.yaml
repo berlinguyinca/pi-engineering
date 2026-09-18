@@ -516,8 +516,8 @@
   milestone: __global__
   type: dogfood
   status: pass
-  commit: 8d2b116578a5b5113e99cf660b03cabc7ede3d9f
-  generatedAt: 2026-09-17T22:51:14.301Z
+  commit: 18362d0bf065ba4612e4da43f74a40668e378eba
+  generatedAt: 2026-09-18T00:15:04.937Z
   paths: &a11
     - src/orchestration
     - src/roadmap
@@ -528,38 +528,42 @@
     - test/fixtures
     - scripts
   proof: "scripts/dogfood-orchestration.ts: 24/24 checks pass (exit 0) against
-    real EngineeringRuntime over git fixtures; npm test 1248 pass / 0 fail;
-    orchestration suites 73/73; tsc --noEmit clean; biome check clean; test:e2e
-    COMMANDS OK + package load OK (21 commands, 7 tools)"
-  summary: "Orchestration completion-gate integrity: exitStatus is authoritative
-    for task and execution status; worktree work is committed to its branch and
-    merged before validation and review; completion requires the checkout to
-    differ from the mission's fork point; failed gate tasks spawn bounded repair
-    work and superseded failures no longer block; recording evidence no longer
-    invalidates the evidence milestone, so the roadmap release gate can pass."
+    real EngineeringRuntime over git fixtures; npm test 1249 pass / 0 fail on
+    four consecutive full runs; orchestration suites 74/74; tsc --noEmit clean;
+    biome check clean; test:e2e COMMANDS OK + package load OK (21 commands, 7
+    tools)"
+  summary: "Orchestration completion-gate integrity: exitStatus is authoritative;
+    worktree work is harvested and merged before validation and review;
+    completion requires the checkout to differ from the mission's fork point;
+    unmerged work is preserved on its branch and reported; late failures are
+    never masked by earlier successes; recording evidence no longer invalidates
+    the evidence milestone, so the roadmap release gate can pass."
 - id: review-1.0
   milestone: __global__
   type: fresh_review
   status: pass
-  commit: 8d2b116578a5b5113e99cf660b03cabc7ede3d9f
-  generatedAt: 2026-09-17T22:51:14.301Z
+  commit: 18362d0bf065ba4612e4da43f74a40668e378eba
+  generatedAt: 2026-09-18T00:15:04.937Z
   paths: *a11
   proof: "Five sequential fresh-context reviews of src/orchestration/
     (orchestrator, broker, scheduler, completionGate, state) and watchableScope
-    in src/roadmap/RoadmapEngine.ts using an independent PiWorkerExecutor
-    session (read/grep only). They found and fixed three critical defects: a
-    passive early return that bypassed the completion gates; worktree-isolated
-    work discarded so a mutating mission could COMPLETE with the repository
-    unchanged; and success inferred from a resolved promise instead of
-    exitStatus, so a failing validation suite satisfied the validation gate and
-    a conflicted merge satisfied integration. Final review: no remaining
-    critical or high findings (verdict LOW)."
-  summary: "Orchestration completion-gate integrity: exitStatus is authoritative
-    for task and execution status; worktree work is committed to its branch and
-    merged before validation and review; completion requires the checkout to
-    differ from the mission's fork point; failed gate tasks spawn bounded repair
-    work and superseded failures no longer block; recording evidence no longer
-    invalidates the evidence milestone, so the roadmap release gate can pass."
+    in src/roadmap/RoadmapEngine.ts via an independent PiWorkerExecutor session
+    (read/grep only), plus an independent pre-merge review of the branch diff.
+    Findings fixed: passive early return bypassing the completion gates;
+    worktree-isolated work discarded so a mutating mission could COMPLETE with
+    the repository unchanged; success inferred from a resolved promise instead
+    of exitStatus so a failing suite satisfied the validation gate and a
+    conflicted merge satisfied integration; execute() unguarded in
+    runSingleTask; empty base_ref skipping the landed-change invariant;
+    conflicted integration discarding the only copy of the worker's work;
+    millisecond-timestamp supersession masking a late failure. Final review: no
+    remaining critical or high findings (verdict LOW)."
+  summary: "Orchestration completion-gate integrity: exitStatus is authoritative;
+    worktree work is harvested and merged before validation and review;
+    completion requires the checkout to differ from the mission's fork point;
+    unmerged work is preserved on its branch and reported; late failures are
+    never masked by earlier successes; recording evidence no longer invalidates
+    the evidence milestone, so the roadmap release gate can pass."
   findings:
     critical: 0
     high: 0
