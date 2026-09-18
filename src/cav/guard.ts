@@ -20,12 +20,14 @@ export class CavGateError extends Error {
 
 /** Convert a glob-ish path prefix (double-star glob) into a RegExp. */
 const REGEX_META = new Set([".", "+", "?", "^", "$", "{", "}", "(", ")", "|", "[", "]", "\\"]);
+const DOUBLE_STAR = "__CAV_DOUBLE_STAR__";
 
 function globToRegExp(glob: string): RegExp {
   // Escape all regex metacharacters except '*' which is handled below.
   let escaped = "";
-  for (const ch of glob) escaped += REGEX_META.has(ch) ? "\\" + ch : ch;
-  const wildcards = escaped.replace(/\*\*/g, "\u0000").replace(/\*/g, "[^/]*").replace(/\u0000/g, ".*");
+  for (const ch of glob) escaped += REGEX_META.has(ch) ? `\\${ch}` : ch;
+  // Replace ** before * so double-star expands to a directory-spanning match.
+  const wildcards = escaped.replace(/\*\*/g, DOUBLE_STAR).replace(/\*/g, "[^/]*").replaceAll(DOUBLE_STAR, ".*");
   return new RegExp(`^${wildcards}$`);
 }
 
@@ -50,9 +52,7 @@ export class ProtectedArtifactGuard {
     for (const p of changedPaths) {
       if (this.isProtected(p)) {
         throw new CavGateError(
-          `protected artifact would be mutated by role '${role}': ${p}. ` +
-            `Acceptance criteria / sabotage fixtures / golden references / completion policy ` +
-            `may not be silently rewritten to make an implementation pass.`,
+          `protected artifact would be mutated by role '${role}': ${p}. Acceptance criteria / sabotage fixtures / golden references / completion policy may not be silently rewritten to make an implementation pass.`,
         );
       }
     }

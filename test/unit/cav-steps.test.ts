@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
-import { test } from "node:test";
 import { resolve } from "node:path";
+import { test } from "node:test";
 import { groupPhases, loadCavSteps, nextUnverifiedStep, stepKind } from "../../src/cav/steps.ts";
 
 const STEPS_DIR = resolve(import.meta.dirname, "../../docs/specs/cav/steps");

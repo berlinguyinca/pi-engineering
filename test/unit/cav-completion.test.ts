@@ -9,7 +9,15 @@ const phase: CavPhase = {
   name: "Root of Trust",
   steps: [
     { id: "CAV-00-01", phase: "00", step: "01", phaseName: "Root of Trust", objective: "a", spec: "s", kind: "define" },
-    { id: "CAV-00-02", phase: "00", step: "02", phaseName: "Root of Trust", objective: "b", spec: "s", kind: "implement" },
+    {
+      id: "CAV-00-02",
+      phase: "00",
+      step: "02",
+      phaseName: "Root of Trust",
+      objective: "b",
+      spec: "s",
+      kind: "implement",
+    },
   ],
   state: "UNKNOWN",
   blockers: [],

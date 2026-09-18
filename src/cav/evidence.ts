@@ -4,8 +4,8 @@ import { id } from "../core/ids.ts";
 import { CavGateError } from "./guard.ts";
 import {
   type CavEvidence,
-  type CavStepState,
   type CavStatus,
+  type CavStepState,
   REVIEWER_ROLES,
   VERIFIED_PROMOTER_ROLES,
 } from "./types.ts";

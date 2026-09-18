@@ -87,7 +87,9 @@ export function loadCavSteps(stepsDir: string): CavStep[] {
 /** Extract the `# Title` line as the short objective. */
 function readObjective(file: string): string {
   try {
-    const first = readFileSync(file, "utf-8").split("\n").find((l) => l.startsWith("# "));
+    const first = readFileSync(file, "utf-8")
+      .split("\n")
+      .find((l) => l.startsWith("# "));
     return first ? first.slice(2).trim() : "";
   } catch {
     return "";
