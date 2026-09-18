@@ -42,6 +42,7 @@ test("non-forward promotions are rejected", async () => {
 
 test("only reviewer roles can write INDEPENDENTLY_REVIEWED", async () => {
   const ledger = CavEvidenceLedger.inMemory();
+  await ledger.record("CAV-00-04", "IMPLEMENTED", { ...BASE, role: "implementer" });
   await assert.rejects(
     ledger.promote("CAV-00-04", "INDEPENDENTLY_REVIEWED", { ...BASE, role: "implementer" }),
     (err) => err instanceof CavGateError && /INDEPENDENTLY_REVIEWED/.test(err.message),

@@ -136,7 +136,13 @@ export class CavEvidenceLedger {
     opts: CavEvidenceOptions,
     currentStatus?: CavStepState,
   ): Promise<CavEvidence> {
-    const from = currentStatus ?? this.latestStatus(requirementId) ?? "UNKNOWN";
+    const prior = currentStatus ?? this.latestStatus(requirementId);
+    // No prior evidence => nothing to promote. A reviewer cannot conjure a
+    // completion state from an empty ledger ("no evidence = no verification").
+    if (!prior) {
+      throw new CavGateError(`cannot promote ${requirementId}: no recorded evidence to promote from`);
+    }
+    const from = prior;
     const fromRank = from === "WAIVED" ? -1 : PROMOTION_ORDER.indexOf(from as CavStatus);
     const targetRank = PROMOTION_ORDER.indexOf(target);
     if (targetRank < 0) throw new CavGateError(`invalid promotion target: ${target}`);
