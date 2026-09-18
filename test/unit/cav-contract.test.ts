@@ -42,7 +42,15 @@ test("a step that throws fails closed", async () => {
   const c: AcceptanceContract = {
     ...okContract,
     requirementId: "AC-TEST-03",
-    journey: [{ id: "s1", description: "throws", assert: () => { throw new Error("x"); } }],
+    journey: [
+      {
+        id: "s1",
+        description: "throws",
+        assert: () => {
+          throw new Error("x");
+        },
+      },
+    ],
   };
   const r = await runJourney(c);
   assert.equal(r.passed, false);

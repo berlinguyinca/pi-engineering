@@ -16,6 +16,7 @@ export * from "./review.ts";
 export * from "./stack.ts";
 export * from "./browser.ts";
 export * from "./contract.ts";
+export * from "./ui.ts";
 
 import { resolve } from "node:path";
 import { evaluatePhaseGate } from "./completion.ts";

@@ -38,10 +38,7 @@ export interface JourneyResult {
 }
 
 /** Run a deterministic journey; fails closed on the first failing step. */
-export async function runJourney(
-  contract: AcceptanceContract,
-  opts?: { page?: Page },
-): Promise<JourneyResult> {
+export async function runJourney(contract: AcceptanceContract, opts?: { page?: Page }): Promise<JourneyResult> {
   const steps: JourneyResult["steps"] = [];
   const blockers: string[] = [];
   let passed = true;
