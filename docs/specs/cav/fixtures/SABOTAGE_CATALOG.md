@@ -1,0 +1,3 @@
+# Mandatory Sabotage Catalog
+
+CAV must prove detection of: broken button, no-op click, wrong navigation, stale selected state, JS exception, rejected promise, HTTP 500, failed request, WebSocket disconnect/reconnect failure, infinite spinner, missing element, overflow/clipping, inaccessible keyboard path, deleted/skipped acceptance test, modified golden to hide regression, mock substituted for required real service, false success exit, missing evidence, reviewer attempting to waive deterministic failure, and concurrent ledger-write collision. Expand this catalog over time; never shrink it to achieve green.

@@ -1,0 +1,124 @@
+# Ordered Implementation Index
+
+Total atomic step specs: 120
+
+- `CAV-00-01` — Root of Trust: Define contracts and interfaces → `steps/CAV-00-01.md`
+- `CAV-00-02` — Root of Trust: Implement minimal mechanism → `steps/CAV-00-02.md`
+- `CAV-00-03` — Root of Trust: Add deterministic tests → `steps/CAV-00-03.md`
+- `CAV-00-04` — Root of Trust: Add failure/sabotage tests → `steps/CAV-00-04.md`
+- `CAV-00-05` — Root of Trust: Gate and document phase completion → `steps/CAV-00-05.md`
+- `CAV-01-01` — Change Classification: Define contracts and interfaces → `steps/CAV-01-01.md`
+- `CAV-01-02` — Change Classification: Implement minimal mechanism → `steps/CAV-01-02.md`
+- `CAV-01-03` — Change Classification: Add deterministic tests → `steps/CAV-01-03.md`
+- `CAV-01-04` — Change Classification: Add failure/sabotage tests → `steps/CAV-01-04.md`
+- `CAV-01-05` — Change Classification: Gate and document phase completion → `steps/CAV-01-05.md`
+- `CAV-02-01` — Deterministic Test Execution: Define contracts and interfaces → `steps/CAV-02-01.md`
+- `CAV-02-02` — Deterministic Test Execution: Implement minimal mechanism → `steps/CAV-02-02.md`
+- `CAV-02-03` — Deterministic Test Execution: Add deterministic tests → `steps/CAV-02-03.md`
+- `CAV-02-04` — Deterministic Test Execution: Add failure/sabotage tests → `steps/CAV-02-04.md`
+- `CAV-02-05` — Deterministic Test Execution: Gate and document phase completion → `steps/CAV-02-05.md`
+- `CAV-03-01` — Real Stack Lifecycle: Define contracts and interfaces → `steps/CAV-03-01.md`
+- `CAV-03-02` — Real Stack Lifecycle: Implement minimal mechanism → `steps/CAV-03-02.md`
+- `CAV-03-03` — Real Stack Lifecycle: Add deterministic tests → `steps/CAV-03-03.md`
+- `CAV-03-04` — Real Stack Lifecycle: Add failure/sabotage tests → `steps/CAV-03-04.md`
+- `CAV-03-05` — Real Stack Lifecycle: Gate and document phase completion → `steps/CAV-03-05.md`
+- `CAV-04-01` — Browser Instrumentation: Define contracts and interfaces → `steps/CAV-04-01.md`
+- `CAV-04-02` — Browser Instrumentation: Implement minimal mechanism → `steps/CAV-04-02.md`
+- `CAV-04-03` — Browser Instrumentation: Add deterministic tests → `steps/CAV-04-03.md`
+- `CAV-04-04` — Browser Instrumentation: Add failure/sabotage tests → `steps/CAV-04-04.md`
+- `CAV-04-05` — Browser Instrumentation: Gate and document phase completion → `steps/CAV-04-05.md`
+- `CAV-05-01` — Acceptance Contracts: Define contracts and interfaces → `steps/CAV-05-01.md`
+- `CAV-05-02` — Acceptance Contracts: Implement minimal mechanism → `steps/CAV-05-02.md`
+- `CAV-05-03` — Acceptance Contracts: Add deterministic tests → `steps/CAV-05-03.md`
+- `CAV-05-04` — Acceptance Contracts: Add failure/sabotage tests → `steps/CAV-05-04.md`
+- `CAV-05-05` — Acceptance Contracts: Gate and document phase completion → `steps/CAV-05-05.md`
+- `CAV-06-01` — UI Interaction Verification: Define contracts and interfaces → `steps/CAV-06-01.md`
+- `CAV-06-02` — UI Interaction Verification: Implement minimal mechanism → `steps/CAV-06-02.md`
+- `CAV-06-03` — UI Interaction Verification: Add deterministic tests → `steps/CAV-06-03.md`
+- `CAV-06-04` — UI Interaction Verification: Add failure/sabotage tests → `steps/CAV-06-04.md`
+- `CAV-06-05` — UI Interaction Verification: Gate and document phase completion → `steps/CAV-06-05.md`
+- `CAV-07-01` — Visual Regression: Define contracts and interfaces → `steps/CAV-07-01.md`
+- `CAV-07-02` — Visual Regression: Implement minimal mechanism → `steps/CAV-07-02.md`
+- `CAV-07-03` — Visual Regression: Add deterministic tests → `steps/CAV-07-03.md`
+- `CAV-07-04` — Visual Regression: Add failure/sabotage tests → `steps/CAV-07-04.md`
+- `CAV-07-05` — Visual Regression: Gate and document phase completion → `steps/CAV-07-05.md`
+- `CAV-08-01` — Accessibility and UX Mechanics: Define contracts and interfaces → `steps/CAV-08-01.md`
+- `CAV-08-02` — Accessibility and UX Mechanics: Implement minimal mechanism → `steps/CAV-08-02.md`
+- `CAV-08-03` — Accessibility and UX Mechanics: Add deterministic tests → `steps/CAV-08-03.md`
+- `CAV-08-04` — Accessibility and UX Mechanics: Add failure/sabotage tests → `steps/CAV-08-04.md`
+- `CAV-08-05` — Accessibility and UX Mechanics: Gate and document phase completion → `steps/CAV-08-05.md`
+- `CAV-09-01` — Sabotage Suite: Define contracts and interfaces → `steps/CAV-09-01.md`
+- `CAV-09-02` — Sabotage Suite: Implement minimal mechanism → `steps/CAV-09-02.md`
+- `CAV-09-03` — Sabotage Suite: Add deterministic tests → `steps/CAV-09-03.md`
+- `CAV-09-04` — Sabotage Suite: Add failure/sabotage tests → `steps/CAV-09-04.md`
+- `CAV-09-05` — Sabotage Suite: Gate and document phase completion → `steps/CAV-09-05.md`
+- `CAV-10-01` — Independent Review: Define contracts and interfaces → `steps/CAV-10-01.md`
+- `CAV-10-02` — Independent Review: Implement minimal mechanism → `steps/CAV-10-02.md`
+- `CAV-10-03` — Independent Review: Add deterministic tests → `steps/CAV-10-03.md`
+- `CAV-10-04` — Independent Review: Add failure/sabotage tests → `steps/CAV-10-04.md`
+- `CAV-10-05` — Independent Review: Gate and document phase completion → `steps/CAV-10-05.md`
+- `CAV-11-01` — Vision Review Advisory: Define contracts and interfaces → `steps/CAV-11-01.md`
+- `CAV-11-02` — Vision Review Advisory: Implement minimal mechanism → `steps/CAV-11-02.md`
+- `CAV-11-03` — Vision Review Advisory: Add deterministic tests → `steps/CAV-11-03.md`
+- `CAV-11-04` — Vision Review Advisory: Add failure/sabotage tests → `steps/CAV-11-04.md`
+- `CAV-11-05` — Vision Review Advisory: Gate and document phase completion → `steps/CAV-11-05.md`
+- `CAV-12-01` — Defect Ledger and Repair Loop: Define contracts and interfaces → `steps/CAV-12-01.md`
+- `CAV-12-02` — Defect Ledger and Repair Loop: Implement minimal mechanism → `steps/CAV-12-02.md`
+- `CAV-12-03` — Defect Ledger and Repair Loop: Add deterministic tests → `steps/CAV-12-03.md`
+- `CAV-12-04` — Defect Ledger and Repair Loop: Add failure/sabotage tests → `steps/CAV-12-04.md`
+- `CAV-12-05` — Defect Ledger and Repair Loop: Gate and document phase completion → `steps/CAV-12-05.md`
+- `CAV-13-01` — Exploratory UI Agent: Define contracts and interfaces → `steps/CAV-13-01.md`
+- `CAV-13-02` — Exploratory UI Agent: Implement minimal mechanism → `steps/CAV-13-02.md`
+- `CAV-13-03` — Exploratory UI Agent: Add deterministic tests → `steps/CAV-13-03.md`
+- `CAV-13-04` — Exploratory UI Agent: Add failure/sabotage tests → `steps/CAV-13-04.md`
+- `CAV-13-05` — Exploratory UI Agent: Gate and document phase completion → `steps/CAV-13-05.md`
+- `CAV-14-01` — Spec Reconciliation: Define contracts and interfaces → `steps/CAV-14-01.md`
+- `CAV-14-02` — Spec Reconciliation: Implement minimal mechanism → `steps/CAV-14-02.md`
+- `CAV-14-03` — Spec Reconciliation: Add deterministic tests → `steps/CAV-14-03.md`
+- `CAV-14-04` — Spec Reconciliation: Add failure/sabotage tests → `steps/CAV-14-04.md`
+- `CAV-14-05` — Spec Reconciliation: Gate and document phase completion → `steps/CAV-14-05.md`
+- `CAV-15-01` — Model Routing: Define contracts and interfaces → `steps/CAV-15-01.md`
+- `CAV-15-02` — Model Routing: Implement minimal mechanism → `steps/CAV-15-02.md`
+- `CAV-15-03` — Model Routing: Add deterministic tests → `steps/CAV-15-03.md`
+- `CAV-15-04` — Model Routing: Add failure/sabotage tests → `steps/CAV-15-04.md`
+- `CAV-15-05` — Model Routing: Gate and document phase completion → `steps/CAV-15-05.md`
+- `CAV-16-01` — Concurrency and Isolation: Define contracts and interfaces → `steps/CAV-16-01.md`
+- `CAV-16-02` — Concurrency and Isolation: Implement minimal mechanism → `steps/CAV-16-02.md`
+- `CAV-16-03` — Concurrency and Isolation: Add deterministic tests → `steps/CAV-16-03.md`
+- `CAV-16-04` — Concurrency and Isolation: Add failure/sabotage tests → `steps/CAV-16-04.md`
+- `CAV-16-05` — Concurrency and Isolation: Gate and document phase completion → `steps/CAV-16-05.md`
+- `CAV-17-01` — Pi-Web Integration: Define contracts and interfaces → `steps/CAV-17-01.md`
+- `CAV-17-02` — Pi-Web Integration: Implement minimal mechanism → `steps/CAV-17-02.md`
+- `CAV-17-03` — Pi-Web Integration: Add deterministic tests → `steps/CAV-17-03.md`
+- `CAV-17-04` — Pi-Web Integration: Add failure/sabotage tests → `steps/CAV-17-04.md`
+- `CAV-17-05` — Pi-Web Integration: Gate and document phase completion → `steps/CAV-17-05.md`
+- `CAV-18-01` — Dogfood Pi Engineering: Define contracts and interfaces → `steps/CAV-18-01.md`
+- `CAV-18-02` — Dogfood Pi Engineering: Implement minimal mechanism → `steps/CAV-18-02.md`
+- `CAV-18-03` — Dogfood Pi Engineering: Add deterministic tests → `steps/CAV-18-03.md`
+- `CAV-18-04` — Dogfood Pi Engineering: Add failure/sabotage tests → `steps/CAV-18-04.md`
+- `CAV-18-05` — Dogfood Pi Engineering: Gate and document phase completion → `steps/CAV-18-05.md`
+- `CAV-19-01` — Pilot AIMS: Define contracts and interfaces → `steps/CAV-19-01.md`
+- `CAV-19-02` — Pilot AIMS: Implement minimal mechanism → `steps/CAV-19-02.md`
+- `CAV-19-03` — Pilot AIMS: Add deterministic tests → `steps/CAV-19-03.md`
+- `CAV-19-04` — Pilot AIMS: Add failure/sabotage tests → `steps/CAV-19-04.md`
+- `CAV-19-05` — Pilot AIMS: Gate and document phase completion → `steps/CAV-19-05.md`
+- `CAV-20-01` — Pilot InferWeave: Define contracts and interfaces → `steps/CAV-20-01.md`
+- `CAV-20-02` — Pilot InferWeave: Implement minimal mechanism → `steps/CAV-20-02.md`
+- `CAV-20-03` — Pilot InferWeave: Add deterministic tests → `steps/CAV-20-03.md`
+- `CAV-20-04` — Pilot InferWeave: Add failure/sabotage tests → `steps/CAV-20-04.md`
+- `CAV-20-05` — Pilot InferWeave: Gate and document phase completion → `steps/CAV-20-05.md`
+- `CAV-21-01` — Pilot WeaveForge: Define contracts and interfaces → `steps/CAV-21-01.md`
+- `CAV-21-02` — Pilot WeaveForge: Implement minimal mechanism → `steps/CAV-21-02.md`
+- `CAV-21-03` — Pilot WeaveForge: Add deterministic tests → `steps/CAV-21-03.md`
+- `CAV-21-04` — Pilot WeaveForge: Add failure/sabotage tests → `steps/CAV-21-04.md`
+- `CAV-21-05` — Pilot WeaveForge: Gate and document phase completion → `steps/CAV-21-05.md`
+- `CAV-22-01` — Autonomous Overnight Operation: Define contracts and interfaces → `steps/CAV-22-01.md`
+- `CAV-22-02` — Autonomous Overnight Operation: Implement minimal mechanism → `steps/CAV-22-02.md`
+- `CAV-22-03` — Autonomous Overnight Operation: Add deterministic tests → `steps/CAV-22-03.md`
+- `CAV-22-04` — Autonomous Overnight Operation: Add failure/sabotage tests → `steps/CAV-22-04.md`
+- `CAV-22-05` — Autonomous Overnight Operation: Gate and document phase completion → `steps/CAV-22-05.md`
+- `CAV-23-01` — Hardening and Release: Define contracts and interfaces → `steps/CAV-23-01.md`
+- `CAV-23-02` — Hardening and Release: Implement minimal mechanism → `steps/CAV-23-02.md`
+- `CAV-23-03` — Hardening and Release: Add deterministic tests → `steps/CAV-23-03.md`
+- `CAV-23-04` — Hardening and Release: Add failure/sabotage tests → `steps/CAV-23-04.md`
+- `CAV-23-05` — Hardening and Release: Gate and document phase completion → `steps/CAV-23-05.md`
