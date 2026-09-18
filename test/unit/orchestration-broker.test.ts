@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { GitRepo } from "../../src/git/GitRepo.ts";
-import { type BrokerBackends, ExecutionBroker } from "../../src/orchestration/broker.ts";
+import { type BrokerBackends, ExecutionBroker, workerTimeoutMs } from "../../src/orchestration/broker.ts";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 import { makeFixtureRepo } from "../fixtures/make-fixture.ts";
@@ -23,6 +23,21 @@ function setup(backends: BrokerBackends) {
 }
 
 describe("ExecutionBroker (spec 03)", () => {
+  it("workerTimeoutMs defaults to 30 min and honors the env override", () => {
+    const prev = process.env.PI_ENGINEERING_WORKER_TIMEOUT_MS;
+    try {
+      delete process.env.PI_ENGINEERING_WORKER_TIMEOUT_MS;
+      assert.equal(workerTimeoutMs(), 30 * 60_000, "default must give workers headroom to commit real work");
+      process.env.PI_ENGINEERING_WORKER_TIMEOUT_MS = "60000";
+      assert.equal(workerTimeoutMs(), 60_000, "env override must win");
+      process.env.PI_ENGINEERING_WORKER_TIMEOUT_MS = "not-a-number";
+      assert.equal(workerTimeoutMs(), 30 * 60_000, "invalid env must fall back to default");
+    } finally {
+      if (prev === undefined) delete process.env.PI_ENGINEERING_WORKER_TIMEOUT_MS;
+      else process.env.PI_ENGINEERING_WORKER_TIMEOUT_MS = prev;
+    }
+  });
+
   it("dispatches to the agent backend and records a successful execution", async () => {
     const { store, m, t, broker } = setup({
       agent: {

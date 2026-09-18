@@ -108,6 +108,22 @@ export interface BrokerBackends {
   validation?: ValidationRunner;
 }
 
+/**
+ * Default execution wall-clock budget in ms. The historical 10-minute default
+ * repeatedly aborted fresh-context implementation workers at the boundary
+ * before they could commit real work (only a trivial file-copy ever landed in
+ * time), which made the mission pipeline unable to integrate anything but
+ * trivial changes. 30 minutes gives a worker room to explore the repo,
+ * implement, verify, and commit within one bounded run. Overridable via
+ * `PI_ENGINEERING_WORKER_TIMEOUT_MS` for the whole pipeline (broker abort
+ * timer and worker budget stay in lockstep).
+ */
+export function workerTimeoutMs(): number {
+  const env = Number.parseInt(process.env.PI_ENGINEERING_WORKER_TIMEOUT_MS ?? "", 10);
+  if (Number.isFinite(env) && env > 0) return env;
+  return 30 * 60_000;
+}
+
 export interface BrokerOptions {
   store: MissionStore;
   backends: BrokerBackends;
@@ -142,7 +158,7 @@ export class ExecutionBroker {
   constructor(opts: BrokerOptions) {
     this.store = opts.store;
     this.backends = opts.backends;
-    this.defaultTimeoutMs = opts.defaultTimeoutMs ?? 10 * 60_000;
+    this.defaultTimeoutMs = opts.defaultTimeoutMs ?? workerTimeoutMs();
     this.git = opts.git ?? null;
     this.baseRef = opts.baseRef ?? "";
   }
