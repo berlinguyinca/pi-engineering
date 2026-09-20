@@ -1412,10 +1412,22 @@ ${RECOVERY_PROMPT}`;
       }
       const baseRef = (await rt.git?.headCommit().catch(() => "")) ?? "";
       ctx.ui.notify("Routing intent and running orchestration mission...", "info");
+      // Stream live mission/task progress to the operator instead of blocking
+      // silently for the whole worker budget (a long mission used to show one
+      // line, then nothing for 30+ minutes). Each task/phase transition is
+      // surfaced as a compact progress line as it happens.
+      let lastLine = "";
       const result = await rt.orchestrator.orchestrate(args.trim(), {
         repository: rt.cwd,
         baseRef,
         mutationRequested: true,
+        onProgress: (line) => {
+          // De-duplicate the trailing completion lines (phase transitions and
+          // task settlements can fire within the same tick).
+          if (line === lastLine) return;
+          lastLine = line;
+          ctx.ui.notify(line, "info");
+        },
       });
       const m = result.mission;
       const lines = [

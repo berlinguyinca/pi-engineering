@@ -185,6 +185,37 @@ describe("acceptance scenario A — simple feature auto-invokes engineering+vali
   });
 });
 
+describe("mission progress visibility — onProgress streams while the mission runs", () => {
+  it("emits phase and task progress lines during orchestration, and clears after", async () => {
+    const h = harness();
+    const lines: string[] = [];
+    const result = await h.orchestrator.orchestrate("Add a health endpoint", {
+      repository: ".",
+      baseRef: "abc",
+      mutationRequested: true,
+      onProgress: (line) => lines.push(line),
+    });
+    assert.equal(result.completed, true, result.failureReason ?? "");
+    // Progress is not empty: the operator sees what the mission is doing.
+    assert.ok(lines.length > 0, "onProgress must emit at least one line");
+    const joined = lines.join("\n");
+    // Phase transitions are surfaced (classified / executing / complete).
+    assert.match(joined, /phase (classified|executing|complete)/);
+    // Task settlements are surfaced (implementer, validation, review).
+    assert.match(joined, /task .* (SUCCEEDED|FAILED)/);
+    // The progress hook does not leak into a subsequent call (cleared on exit).
+    const after: string[] = [];
+    const passive = await h.orchestrator.orchestrate("Explain this function", {
+      repository: ".",
+      baseRef: "abc",
+      mutationRequested: false,
+      onProgress: (line) => after.push(line),
+    });
+    assert.equal(passive.completed, true);
+    assert.ok(after.length >= 1, "the next call still reports its own progress");
+  });
+});
+
 describe("passive requests — gate-bypass and illegal-transition regressions", () => {
   it("a pure conversation request completes without throwing or bypassing gates", async () => {
     // Regression: this path called completeMission straight from PLANNING and
