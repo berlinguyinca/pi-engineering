@@ -37,6 +37,9 @@ async function main(): Promise<number> {
   if (cmd === "cav") {
     return cavCommand(rest);
   }
+  if (cmd === "bar") {
+    return barCommand(rest);
+  }
   if (cmd !== "roadmap") {
     console.error(
       "usage: pi-engineering <roadmap check|roadmap status|blackhole ...|benchmark|cav status|...> [flags]",
@@ -110,6 +113,119 @@ async function cavCommand(rest: string[]): Promise<number> {
   }
   console.error("usage: pi-engineering cav <status|check> [--json]");
   return 2;
+}
+
+/**
+ * BAR CLI: audit a repository with the brownfield engine.
+ *
+ *   node scripts/pi-engineering.ts bar audit [--json]
+ *   node scripts/pi-engineering.ts bar status [--json]
+ *
+ * `bar audit` runs discovery, atomizes requirements (all UNKNOWN), builds an
+ * immutable baseline, clusters root causes, orders dependencies, generates
+ * repair campaigns and writes a report. It does NOT promote anything to
+ * VERIFIED — that requires evidence-gated, independent-verifier
+ * classifications supplied via the reconcile path.
+ */
+async function barCommand(rest: string[]): Promise<number> {
+  const json = rest.includes("--json");
+  const sub = rest.find((a) => !a.startsWith("--"));
+  const bar = await import("../src/bar/index.ts");
+  const { GitRepo } = await import("../src/git/GitRepo.ts");
+  const repo = await GitRepo.open(REPO_ROOT).catch(() => null);
+  const head = repo ? await repo.headCommit().catch(() => "") : "";
+  const store = await bar.BarStore.open(REPO_ROOT);
+
+  if (sub === "audit") {
+    const discovery = bar.discoverRepo(REPO_ROOT, { maxDepth: 8 });
+    // Atomize requirements: one atomic requirement per discovered spec file.
+    const requirements = discovery.specs.slice(0, 200).map((file, i) => ({
+      id: `BARREQ-${String(i + 1).padStart(4, "0")}`,
+      statement: `Spec document ${file} defines requirements that must be verified from current evidence.`,
+      provenance: { file, section: undefined },
+    }));
+    if (requirements.length === 0) {
+      requirements.push({
+        id: "BARREQ-0001",
+        statement: "Repository has no spec documents; requirements must be reconstructed from source and history.",
+        provenance: null,
+      });
+    }
+    const { requirements: records, stateCounts } = bar.executeAudit({
+      project: "pi-engineering-runtime",
+      sourceRevision: head || "unknown",
+      discovery,
+      requirements,
+    });
+    for (const r of records) await store.upsertRequirement(r);
+    const baseline = bar.buildBaseline({
+      project: "pi-engineering-runtime",
+      sourceRevision: head || "unknown",
+      requirements: records,
+      services: discovery.entrypoints,
+      cavResults: [],
+      findings: discovery.historicalClaims.map((c) => `historical claim (untrusted): ${c}`),
+      cwd: REPO_ROOT,
+    });
+    await store.saveBaseline(baseline);
+    const clusters = bar.clusterRootCauses(records);
+    const { order, unresolved } = bar.buildDependencyOrder(records);
+    const campaigns = bar.generateCampaigns(clusters, records, { auditId: baseline.auditId });
+    for (const c of campaigns) await store.saveCampaign(c);
+    const report = bar.buildAuditReport({
+      project: "pi-engineering-runtime",
+      sourceRevision: head || "unknown",
+      cwd: REPO_ROOT,
+      requirements: records,
+      baseline,
+      clusters,
+      dependencyOrder: order,
+      unresolvedDependencies: unresolved,
+      campaigns,
+      deltas: [],
+      coveredSurfaces: [],
+      allSurfaces: discovery.entrypoints,
+    });
+    await store.saveReport(report);
+    console.log(json ? JSON.stringify(report, null, 2) : bar.renderReport(report));
+    return 0;
+  }
+  if (sub === "status") {
+    const reports = store.listReports();
+    if (json) {
+      console.log(
+        JSON.stringify(
+          {
+            audits: reports.length,
+            baselines: store.listBaselines().length,
+            campaigns: store.listCampaigns().length,
+            requirements: store.listRequirements().length,
+            latest: reports.at(-1)?.auditId ?? null,
+          },
+          null,
+          2,
+        ),
+      );
+      return 0;
+    }
+    const latest = reports.at(-1);
+    const lines = [`BAR — audits: ${reports.length}, requirements: ${store.listRequirements().length}`];
+    if (latest) {
+      lines.push("  latest:");
+      lines.push(renderIndented(bar.renderReport(latest)));
+    }
+    console.log(lines.join("\n"));
+    return 0;
+  }
+  console.error("usage: pi-engineering bar <audit|status> [--json]");
+  return 2;
+}
+
+function renderIndented(text: string): string {
+  return text
+    .split("\n")
+    .map((l) => (l ? `  ${l}` : l))
+    .join("\n");
 }
 
 async function blackholeCommand(sub: string, rest: string[]): Promise<number> {
