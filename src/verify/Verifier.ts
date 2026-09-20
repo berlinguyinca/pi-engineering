@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { access, readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { promisify } from "node:util";
 import type { ArtifactStore } from "../artifacts/ArtifactStore.ts";
 import type { Evidence, EvidenceTrust } from "../core/types.ts";
@@ -37,6 +37,15 @@ export interface VerifyOutcome {
   stages: StageRun[];
   evidence: Evidence[];
   failedStage: string | null;
+  /**
+   * True when the repo declared no verification targets at all (no scripts and
+   * no resolvable JS entry file). This is NOT a pass: it means nothing was
+   * actually verified, so the completion gate must not treat it as passing
+   * evidence. It exists so the verifier can report an honest, distinct outcome
+   * instead of a doomed `node --check index.js` stage that hard-fails every
+   * scriptless repo.
+   */
+  noTargets: boolean;
 }
 
 /**
@@ -136,6 +145,50 @@ async function localBinDir(cwd: string): Promise<string | null> {
 }
 
 /**
+ * Resolve a real JS entry file to syntax-check when a repo declares no scripts.
+ * Prefers package.json `main`/`exports["."]`/`bin`, then conventional
+ * `index.js`/`src/index.js`. Returns a path relative to the repo root (or an
+ * absolute path), or null when no such file exists. Never returns a path that
+ * does not exist, so the caller cannot emit a doomed syntax-check stage.
+ */
+async function resolveJsEntry(
+  cwd: string,
+  pkg: { main?: string; exports?: unknown; bin?: unknown },
+): Promise<string | null> {
+  const candidates: string[] = [];
+  const add = (v: unknown): void => {
+    if (typeof v === "string" && v && !v.endsWith(".json")) candidates.push(v);
+  };
+  add(pkg.main);
+  const exportsObj = pkg.exports;
+  if (exportsObj && typeof exportsObj === "object" && !Array.isArray(exportsObj)) {
+    const dot = (exportsObj as Record<string, unknown>)["."];
+    if (typeof dot === "string") add(dot);
+    else if (dot && typeof dot === "object") {
+      const imp = (dot as Record<string, unknown>).import;
+      const req = (dot as Record<string, unknown>).require;
+      add(imp);
+      add(req);
+    }
+  }
+  const bin = pkg.bin;
+  if (bin && typeof bin === "object") for (const v of Object.values(bin)) add(v);
+  else add(bin);
+  candidates.push("index.js", "src/index.js", "lib/index.js");
+
+  for (const cand of candidates) {
+    const abs = join(cwd, cand);
+    try {
+      await access(abs);
+      return basename(cand) === "index.js" ? cand : cand;
+    } catch {
+      /* keep looking */
+    }
+  }
+  return null;
+}
+
+/**
  * Child-process env with the node test-runner IPC context stripped, plus the
  * nearest `node_modules/.bin` (resolved from `cwd`) prepended to PATH so bare
  * local tool binaries resolve. When the runtime itself runs under `node --test`,
@@ -195,12 +248,16 @@ export class CommandVerifier implements VerificationProvider {
     const { key, pkg } = await this.cacheKey(cwd, full);
     const cached = this.profileCache.get(key);
     if (cached) return cached;
-    const profile = this.buildProfile(pkg, full);
+    const profile = await this.buildProfile(pkg, full, cwd);
     this.profileCache.set(key, profile);
     return profile;
   }
 
-  private buildProfile(pkg: { scripts?: Record<string, string> }, full: boolean): VerificationProfile {
+  private async buildProfile(
+    pkg: { scripts?: Record<string, string>; main?: string; exports?: unknown; bin?: unknown },
+    full: boolean,
+    cwd: string,
+  ): Promise<VerificationProfile> {
     const scripts = pkg.scripts ?? {};
     const stages: VerifyStage[] = [];
 
@@ -226,12 +283,20 @@ export class CommandVerifier implements VerificationProvider {
       push("test:full", scripts["test:full"] ?? scripts["test:all"]);
     }
     if (stages.length === 0) {
-      stages.push({
-        name: "node-syntax",
-        command: "node",
-        args: ["--check", "index.js"],
-        required: false,
-      });
+      // No declared scripts. Only fall back to a syntax check if a real JS
+      // entry file exists — otherwise the stage is doomed to ENOENT and would
+      // hard-fail every scriptless repo (finding FINDING-2CcenM). Prefer the
+      // package.json entry points, then conventional index files.
+      const entry = await resolveJsEntry(cwd, pkg);
+      if (entry) {
+        stages.push({
+          name: "node-syntax",
+          command: "node",
+          args: ["--check", entry],
+          required: false,
+          cwd,
+        });
+      }
     }
     return { name: full ? "detected-full" : "detected", stages };
   }
@@ -314,7 +379,11 @@ export class CommandVerifier implements VerificationProvider {
     // pass with zero passing evidence. This keeps "evidence is machine output"
     // honest: passed=true implies at least one deterministic stage actually
     // succeeded.
-    const passed = failedStage === null && stageRuns.length > 0 && stageRuns.some((s) => s.passed);
-    return { passed, stages: stageRuns, evidence, failedStage };
+    const noTargets = stageRuns.length === 0;
+    // A repo with no declared verification targets is NOT a pass (nothing was
+    // actually verified) and NOT a doomed hard-fail. Report it as a distinct
+    // honest outcome so callers can decide how to gate (finding FINDING-2CcenM).
+    const passed = !noTargets && failedStage === null && stageRuns.length > 0 && stageRuns.some((s) => s.passed);
+    return { passed, stages: stageRuns, evidence, failedStage, noTargets };
   }
 }
