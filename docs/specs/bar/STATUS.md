@@ -75,6 +75,28 @@ All merged to `main`. Note: the running pi process holds a stale in-memory
 runtime, so the `mission` tool in an existing session cannot yet execute BAR
 steps to VERIFIED; a fresh process is required.
 
+## BAR-000 step status: VERIFIED
+
+**BAR-000 — Bootstrap & dogfood: define scope and inputs** (`src/bar/scope.ts`,
+`test/unit/bar-scope.test.ts`) is **VERIFIED** (2026-09-20).
+
+Evidence + provenance: `.pi-eng/artifacts/verify/bar-000-verify.md` (source
+revision `3115f0d`, linux/node v22.23.2, verifier identity = independent
+reviewer, separate from implementer).
+
+- `npx tsc --noEmit` — exit 0
+- `node --test test/unit/bar-scope.test.ts` — 6 pass / 0 fail (incl. negative:
+  empty include set, non-existent include dir)
+- `node --test test/unit/bar.test.ts` — 12 pass / 0 fail
+- `node --test test/unit/cav-sabotage*.test.ts` — 8 pass / 0 fail (protected gate)
+- `node --test test/unit/cav-*.test.ts` — 91 pass / 3 fail (pre-existing
+  environmental: absent `.pi-eng/cav/evidence.jsonl` for cav-surface tests and a
+  Playwright screenshot-capture limitation for cav-visual; BAR-000 commit touches
+  no CAV source/protected artifact, so affected CAV gates remain passing)
+- No protected acceptance/golden/sabotage/completion-policy artifact weakened.
+- Independent review found no blocking defect.
+
+## What remains (honestly)
 ## What remains (honestly)
 
 - **No BAR step has been promoted to VERIFIED.** The generic engine is TESTED
