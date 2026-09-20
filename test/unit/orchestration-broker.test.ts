@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { join } from "node:path";
 import { describe, it } from "node:test";
 import { GitRepo } from "../../src/git/GitRepo.ts";
 import { type BrokerBackends, ExecutionBroker, workerTimeoutMs } from "../../src/orchestration/broker.ts";
@@ -349,6 +350,78 @@ describe("ExecutionBroker (spec 03)", () => {
       assert.equal(seenHandoffs.length, 1);
       assert.ok(seenHandoffs[0]!.branch.startsWith("pi-eng-orch-"));
       assert.equal(broker.allocatedWorktrees?.size ?? 0, 0);
+    } finally {
+      await fx.cleanup();
+    }
+  });
+
+  it("records a visible finding when a mutating worker\u2019s edits cannot be harvested (commit fails)", async () => {
+    const fx = await makeFixtureRepo();
+    try {
+      const git = (await GitRepo.open(fx.root))!;
+      const store = MissionStore.open(JsonlEventStore.inMemory());
+      const m = store.createMission({
+        title: "x",
+        goal: "x",
+        user_request: "x",
+        repository: ".",
+        base_ref: await git!.headCommit(),
+        risk_profile: "medium",
+        workflow_class: "engineering_review",
+      });
+      const t = store.createTask({
+        mission_id: m.mission_id,
+        kind: "agent",
+        role: "implementer",
+        objective: "x",
+        mutates_repo: true,
+        isolation: "worktree",
+        write_domains: ["src/**"],
+      });
+      store.transitionTask(t.task_id, "READY");
+
+      // A worker that DID edit its worktree must never have that work lost
+      // silently. Force the harvest commit to fail deterministically (worktrees
+      // share the main repo\u2019s hooks dir) and require the broker to surface a
+      // finding explaining why the work will not integrate.
+      const { mkdir, writeFile, chmod } = await import("node:fs/promises");
+      const hooksDir = join(fx.root, ".git", "hooks");
+      await mkdir(hooksDir, { recursive: true });
+      await writeFile(join(hooksDir, "pre-commit"), "#!/bin/sh\nexit 1\n");
+      await chmod(join(hooksDir, "pre-commit"), 0o755);
+
+      const broker = new ExecutionBroker({
+        store,
+        git,
+        baseRef: await git!.headCommit(),
+        backends: {
+          agent: {
+            runAgent: async ({ worktree }) => {
+              if (worktree) {
+                const { writeFile } = await import("node:fs/promises");
+                await writeFile(join(worktree, "harvest-me.js"), "export const x = 1;\n");
+              }
+              return { executionId: "e", exitStatus: "succeeded", summary: "done", artifactRefs: [], usage: {} };
+            },
+          },
+        },
+      });
+      const handle = await broker.execute({
+        taskId: t.task_id,
+        missionId: m.mission_id,
+        kind: "agent",
+        role: "implementer",
+        objective: "x",
+        mutatesRepo: true,
+        isolation: "worktree",
+      });
+      await handle.result();
+
+      const findings = store.listFindings(m.mission_id);
+      assert.ok(
+        findings.some((f) => f.category === "integration" && f.severity === "major" && f.summary.includes("harvested")),
+        `expected a visible harvest-failure finding, got ${findings.map((f) => `${f.severity}:${f.category}:${f.summary}`).join(" | ")}`,
+      );
     } finally {
       await fx.cleanup();
     }

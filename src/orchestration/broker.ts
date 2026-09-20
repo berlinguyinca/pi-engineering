@@ -229,16 +229,46 @@ export class ExecutionBroker {
    * removed after the task settles, and uncommitted edits die with it — without
    * this harvest, a mutating mission can report COMPLETE having changed the
    * repository not at all. The branch is kept so integration can merge it.
+   *
+   * Returns true when the worktree held edits that were successfully committed
+   * onto the branch (i.e. the work landed and can be integrated). When a worker
+   * edited files but the commit itself failed, those edits are otherwise lost
+   * silently and the mission would surface only an opaque "integration produced
+   * no change" with no trace of the real cause. In that case a finding is
+   * recorded so operators and the PI WEB panel see exactly why the work did not
+   * land.
    */
-  private async harvestWorktree(executionId: string): Promise<void> {
+  private async harvestWorktree(executionId: string): Promise<boolean> {
     const wt = this.allocatedWorktrees.get(executionId);
-    if (!wt || !this.git) return;
+    if (!wt || !this.git) return false;
+    let status = "";
     try {
-      const status = (await this.git.statusIn(wt.path)).trim();
-      if (status.length > 0) await this.git.commitAll(wt.path, `pi-eng: orchestration work for ${executionId}`);
+      status = (await this.git.statusIn(wt.path)).trim();
     } catch {
-      // A harvest failure must not fail the task; integration will simply have
-      // nothing to merge and the mission will not show the change.
+      // Could not even read the worktree status; treat as no harvestable work.
+      return false;
+    }
+    if (status.length === 0) return false;
+    try {
+      await this.git.commitAll(wt.path, `pi-eng: orchestration work for ${executionId}`);
+      return true;
+    } catch (err) {
+      const ex = this.store.getExecution(executionId);
+      if (ex) {
+        this.store.addFinding({
+          mission_id: ex.mission_id,
+          task_id: ex.task_id,
+          severity: "major",
+          category: "integration",
+          file: null,
+          line: null,
+          summary: "Worker edits could not be harvested (worktree commit failed); the work will not integrate",
+          evidence: err instanceof Error ? err.message : String(err),
+          recommended_action:
+            "Resolve the commit failure and re-run the mission, or recover the worker's uncommitted edits from the preserved worktree branch.",
+        });
+      }
+      return false;
     }
   }
 

@@ -117,9 +117,19 @@ export class BarStore {
     await this.appendLine(this.paths.requirements, rec);
   }
 
-  async saveBaseline(base: AuditBaseline): Promise<void> {
-    this.baselines.set(base.auditId, base);
-    await this.appendLine(this.paths.baselines, base);
+  async saveBaseline(base: AuditBaseline): Promise<boolean> {
+    // Baselines are append-only and immutable by construction (BASELINE
+    // contract). If an auditId is already recorded, never overwrite it: the
+    // original immutable snapshot is authoritative. Returns true when newly
+    // stored, false when the existing immutable baseline was preserved.
+    const existing = this.baselines.get(base.auditId);
+    if (existing) {
+      return false;
+    }
+    const record = { ...base, immutable: true as const };
+    this.baselines.set(record.auditId, record);
+    await this.appendLine(this.paths.baselines, record);
+    return true;
   }
 
   async saveCampaign(c: RepairCampaign): Promise<void> {
