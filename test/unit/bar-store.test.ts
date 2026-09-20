@@ -15,11 +15,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import {
+  type AuditBaseline,
   BarStore,
+  type RequirementRecord,
   buildBaseline,
   environmentFingerprint,
   generateCampaigns,
-  type RequirementRecord,
 } from "../../src/bar/index.ts";
 
 function makeReq(partial: Partial<RequirementRecord> = {}): RequirementRecord {
@@ -98,7 +99,10 @@ test("BAR-001 negative: immutable baseline cannot be overwritten or weakened", a
     // First save returns true (newly stored).
     assert.equal(await store.saveBaseline(base), true);
     // Attempting to overwrite with a mutated (weakened) baseline is rejected.
-    const tampered = { ...base, immutable: false as const, findings: ["tampered"] };
+    // A tampered baseline that attempts to weaken the immutable marker. Cast
+    // through unknown because the structural `immutable: true` contract is
+    // exactly what tampering tries to violate.
+    const tampered = { ...base, immutable: false as const, findings: ["tampered"] } as unknown as AuditBaseline;
     assert.equal(await store.saveBaseline(tampered), false, "re-save of existing auditId rejected");
     const stored = store.getBaseline(base.auditId)!;
     assert.equal(stored.immutable, true, "immutable marker cannot be weakened");
@@ -133,7 +137,15 @@ test("BAR-001 environment provenance is deterministic for a given cwd", () => {
 test("BAR-001 campaigns persist with their planned settlement status", async () => {
   await withTmp(async (dir) => {
     const store = await BarStore.open(dir);
-    const base = buildBaseline({ project: "p", sourceRevision: "r", requirements: [], services: [], cavResults: [], findings: [], cwd: dir });
+    const base = buildBaseline({
+      project: "p",
+      sourceRevision: "r",
+      requirements: [],
+      services: [],
+      cavResults: [],
+      findings: [],
+      cwd: dir,
+    });
     await store.saveBaseline(base);
     const campaign = generateCampaigns([{ cluster: "c", requirements: ["R1"], evidence: ["e"] }], [makeReq()], {
       auditId: base.auditId,

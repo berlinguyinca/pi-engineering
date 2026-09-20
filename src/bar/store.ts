@@ -117,7 +117,7 @@ export class BarStore {
     await this.appendLine(this.paths.requirements, rec);
   }
 
-  async saveBaseline(base: AuditBaseline): Promise<void> {
+  async saveBaseline(base: AuditBaseline): Promise<boolean> {
     // Baselines are append-only and immutable by construction (BASELINE
     // contract). If an auditId is already recorded, never overwrite it: the
     // original immutable snapshot is authoritative. Returns true when newly
