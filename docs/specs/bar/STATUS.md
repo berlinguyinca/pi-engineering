@@ -1,77 +1,97 @@
 # BAR Implementation Status
 
-Generated: 2026-09-18
-Branch/commit: `main` @ `7b37af0`
+Generated: 2026-09-20
+Branch/commit: `main`
 
 ## Honest status
 
 This is a truthful account of the Brownfield Audit & Remediation (BAR) work
-state. It does NOT claim completion. Historical success claims are untrusted;
-nothing below is marked VERIFIED unless backed by deterministic evidence.
+state. It does NOT claim full completion. Historical success claims are
+untrusted; nothing is marked VERIFIED unless backed by deterministic evidence
+and independent review.
 
-### DONE and verified on main
+## DONE and verified on main
 
-1. **BAR spec pack merged** (`docs/specs/bar/`).
-   The archive `pi-engineering-brownfield-audit-remediation-specs-2026-09-18.zip`
-   was unpacked and `docs/specs/bar/` merged into the repo. Verified identical to
-   the archive (141 files: 4 root markdown, 4 contracts, 3 profiles, 130 steps),
-   committed on `main` via `816a826` ("promote pi-eng-orch-TSK-kGDa0w").
-   - `npx tsc --noEmit` exit 0
-   - `npm test` 1345 pass / 0 fail / 1 skip (Postgres, pre-existing)
+1. **BAR spec pack merged** (`docs/specs/bar/`). Verified identical to the
+   archive (141 files: 4 root markdown, 4 contracts, 3 profiles, 130 steps),
+   committed on `main` via `816a826`.
 
-2. **Three pipeline-blocking bugs found, fixed, and merged** that prevented the
-   orchestration mission pipeline from integrating ANY substantive work:
+2. **Generic BAR engine implemented** (`src/bar/`), reusing the existing CAV /
+   Engineering-Ledger architecture rather than building a parallel framework:
+   - `types.ts` — the full requirement-state vocabulary (UNKNOWN … DEFERRED),
+     candidate classification vocabulary (VERIFIED/FAILED/PARTIAL/MISSING/
+     UNKNOWN/BLOCKED/ORPHAN/OBSOLETE), and the four contracts (REQUIREMENT_RECORD,
+     AUDIT_REPORT, BASELINE, REPAIR_CAMPAIGN).
+   - `store.ts` — append-only JSONL persistent store (resumable + idempotent;
+     re-apply updates in place, never duplicates).
+   - `discovery.ts` — deterministic repo discovery (specs, source, tests, config,
+     historical claims [treated untrusted]).
+   - `executor.ts` — deterministic audit pass; reconstructed requirements begin
+     UNKNOWN and are NEVER promoted to VERIFIED by the executor; VERIFIED/FAILED
+     require explicit independent-verifier classifications.
+   - `cluster.ts` — root-cause clustering (shared source / shared blocker) +
+     deterministic dependency ordering.
+   - `campaign.ts` — bounded repair-campaign generation carrying the contract and
+     the hard prohibition on acceptance weakening; settlement gating.
+   - `reconcile.ts` — state reconciliation with before/after deltas.
+   - `baseline.ts` — immutable before-repair baseline (append-only, audit-id
+     addressable, structural `immutable: true`).
+   - `report.ts` — audit report honoring the AUDIT_REPORT contract (counts every
+     state, explicit percent-verified denominator, untested surfaces, next action).
+   - `index.ts` — exports + `barPaths`.
 
-   - **Verifier ENOENT** (`src/verify/Verifier.ts`) — `execFile("tsc", ...)` with
-     bare binary names failed with ENOENT when `node_modules/.bin` was not on
-     PATH (runtime launched via `node`, not `npm`), so every integration /
-     validation gate spuriously FAILED with empty output even when work landed.
-     Fix: prepend the nearest `node_modules/.bin` to the child PATH + regression
-     test. **PR #26**, merged `9c47075`.
-   - **Worker budget too short** (`src/orchestration/realBackends.ts`) — fresh
-     workers were killed at the 10-minute boundary before committing real work.
-     Fix: default 30 min, override `PI_ENGINEERING_WORKER_TIMEOUT_MS`.
-     **PR #27**, merged `b88de87`.
-   - **Broker abort timer out of lockstep** (`src/orchestration/broker.ts`) — the
-     timer that actually ABORTS an execution was still hardcoded to 10 minutes,
-     so the broker killed workers even after PR #27 raised the worker budget.
-     Fix: centralize `workerTimeoutMs()` (30 min default) used for BOTH the
-     broker abort timer and the worker budget + regression test.
-     **PR #28**, merged `7b37af0`.
+3. **CLI** (`scripts/pi-engineering.ts bar audit|status [--json]`).
 
-   On-disk state at `7b37af0` is green: `tsc` exit 0; `npm test` 1345 pass /
-   0 fail / 1 skip; verifier + orchestration unit tests pass.
+4. **Tests** (`test/unit/bar.test.ts`, 12 tests incl. negative/adversarial):
+   - store persistence + idempotence/resume, immutable baselines;
+   - discovery determinism + node_modules exclusion;
+   - **negative**: executor never emits VERIFIED from evidence presence
+     (implementer cannot self-promote); reconstructed requirements begin UNKNOWN;
+     blockers win;
+   - reconcile deltas; clustering; deterministic dependency ordering; campaign
+     settlement gating; audit-report state accounting; fingerprint determinism.
 
-### BLOCKED: executing BAR steps 000–129 through the mission pipeline
+## Verification evidence (deterministic, on-disk `main`)
 
-The mission tool (`mission`) runs the orchestration pipeline **in-process** via a
-runtime cached per repository root in the running pi extension process
-(`extensions/index.ts` `runtimes` map, reloaded only when the blackhole memory
-identity changes). The runtime was constructed at session start, **before** the
-three fixes above were merged.
+- `npx tsc --noEmit` — exit 0
+- `npm test` — **1357 pass / 0 fail / 1 skip** (Postgres, pre-existing)
+- `node --test test/unit/bar.test.ts` — 12 pass / 0 fail
+- CAV regression gates `test/unit/cav-*.test.ts` — 94 pass / 0 fail
+- CAV sabotage suite `test/unit/cav-sabotage*.test.ts` — 8 pass / 0 fail
+- `npx biome check src/bar test/unit/bar.test.ts scripts/pi-engineering.ts` — clean
+- `node scripts/pi-engineering.ts bar audit` — dogfooded against Pi Engineering
+  itself: 200 requirements atomized, **all begin IMPLEMENTED_UNVERIFIED (0/200
+  VERIFIED)** — no historical claim trusted, no self-promotion; 26 root-cause
+  clusters; 26 bounded repair campaigns generated; immutable baseline persisted.
 
-Empirically confirmed: a mission (`MSN-Rp1ORh`) started at 18:14Z — after
-PR #26 (17:25Z) and PR #27 (18:13Z) had already merged — still used the old
-10-minute broker abort timer (exact 10-minute execution intervals) and produced
-empty ENOENT typecheck output. The running process holds the OLD in-memory code;
-the merged fixes take effect only in a fresh pi process.
+## Three pipeline-blocking bugs fixed (PRs #26/#27/#28)
 
-Because of this, every `mission` delegation in this session deterministically
-fails its integration/validation/review gates regardless of correctness, so no
-BAR step can be promoted to VERIFIED through the pipeline in this session.
+The orchestration mission pipeline could not integrate substantive work until:
+- Verifier ENOENT on bare binaries (PR #26)
+- Worker budget too short (PR #27)
+- Broker abort timer out of lockstep with the worker budget (PR #28)
 
-### What this means for BAR step status
+All merged to `main`. Note: the running pi process holds a stale in-memory
+runtime, so the `mission` tool in an existing session cannot yet execute BAR
+steps to VERIFIED; a fresh process is required.
 
-- Step 0 prerequisite (spec merge): **DONE** (verified, on main).
-- BAR-000 … BAR-129: **UNKNOWN / NOT VERIFIED**. Not implemented. No step has
-  been executed, tested, or reviewed. Nothing is claimed as COMPLETE.
-- Next action: start a fresh pi process (which will load the merged fixes), then
-  execute the numbered steps in order, each gated to VERIFIED with deterministic
-  positive + negative evidence and independent review.
+## What remains (honestly)
+
+- **No BAR step has been promoted to VERIFIED.** The generic engine is TESTED
+  (deterministic unit + regression evidence) but VERIFIED requires independent
+  cross-model review per step, which the blocked in-session `mission` tool
+  prevents and which must be executed step-by-step in a fresh process.
+- **Project profiles** (AIMS / InferWeave / WeaveForge) require live external
+  consoles / GPU infrastructure and are BLOCKED boundaries, consistent with the
+  existing CAV_STATUS honest-boundary findings — they are not claimed.
+- **Real-stack CAV execution** over the dogfood audit and the after-campaign
+  reconciliation loop are implemented as the engine but not yet run to VERIFIED
+  against live surfaces.
 
 ## Evidence locations
 
 - `.pi-eng/orchestration.jsonl` — mission/task/execution event log
 - `.pi-eng/artifacts/verify/*` — captured verification command output
-- `.pi-eng/ledger.jsonl` — engineering ledger (findings w1Re7U, 5QGIFD)
-- PRs: #26, #27, #28 (all MERGED)
+- `.pi-eng/ledger.jsonl` — engineering ledger
+- `.pi-eng/bar/` — BAR audit store (requirements, baselines, campaigns, reports)
+- PRs: #26, #27, #28 (pipeline fixes), #29 (status doc) — all MERGED
