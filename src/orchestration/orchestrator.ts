@@ -97,6 +97,8 @@ export class Orchestrator {
   private readonly parentSessionId: string | null;
   private readonly limits: NonNullable<OrchestratorOptions["limits"]>;
   private readonly maxRepairRounds: number;
+  /** Per-call progress hook set by `orchestrate`; consumed by task/phase events. */
+  private progress: ((line: string) => void) | null = null;
 
   constructor(opts: OrchestratorOptions) {
     this.store = opts.store;
@@ -113,6 +115,12 @@ export class Orchestrator {
       store: this.store,
       broker: this.broker,
       limits: this.limits,
+      // Surface every task settlement as live progress so a running mission is
+      // never silent: the operator sees each worker/gate settle instead of a
+      // black screen for the whole worker budget (default 30 min).
+      onTaskSettled: (missionId, taskId, status) => {
+        this.report(`[mission ${missionId}] task ${taskId} -> ${status}`);
+      },
     });
     this.gate = new CompletionGate(this.store);
     this.planner = opts.planner;
@@ -123,6 +131,16 @@ export class Orchestrator {
 
   private phase(mission: Mission, phase: string): void {
     this.onPhase?.(mission, phase);
+    this.report(`[mission ${mission.mission_id}] phase ${phase}`);
+  }
+
+  /** Emit a live progress line to the operator (no-op when no hook is set). */
+  private report(line: string): void {
+    try {
+      this.progress?.(line);
+    } catch {
+      // A progress listener is an observer, never a participant.
+    }
   }
 
   /**
@@ -138,6 +156,8 @@ export class Orchestrator {
       changedFiles?: string[];
       mutationRequested?: boolean;
       acceptanceCriteria?: string[];
+      /** Live progress callback (per-call). Lines stream as the mission runs. */
+      onProgress?: (line: string) => void;
     } = { repository: ".", baseRef: "" },
   ): Promise<OrchestrateResult> {
     const intent = this.router.route({
@@ -147,6 +167,11 @@ export class Orchestrator {
         opts.mutationRequested ?? workflowMutatesRepo(this.router.route({ request }).suggested_workflow),
     });
     const risk = this.router.risk({ request });
+
+    // Install the per-call progress hook for the duration of this mission so
+    // task/phase transitions stream to the caller (e.g. the /mission command).
+    this.progress = opts.onProgress ?? null;
+    this.report(`[mission] starting workflow=${intent.suggested_workflow} risk=${risk}`);
 
     const mission = this.store.createMission({
       title: opts.title ?? request,
@@ -196,6 +221,7 @@ export class Orchestrator {
       this.store.completeMission(mission.mission_id);
       const final = this.store.getMission(mission.mission_id)!;
       const verdict = this.gate.evaluate(final);
+      this.progress = null;
       return {
         mission: final,
         intent,
@@ -340,6 +366,7 @@ export class Orchestrator {
       }
       this.store.completeMission(mission.mission_id);
       this.phase(this.store.getMission(mission.mission_id)!, "complete");
+      this.progress = null;
       return {
         mission: this.store.getMission(mission.mission_id)!,
         intent,
@@ -362,6 +389,7 @@ export class Orchestrator {
     } else {
       this.store.failMission(finalMission.mission_id, verdict.reasons.join("; "));
     }
+    this.progress = null;
     return {
       mission: this.store.getMission(mission.mission_id)!,
       intent,
@@ -522,6 +550,7 @@ export class Orchestrator {
   private async runSingleTask(missionId: string, taskId: string): Promise<boolean> {
     const task = this.store.getTask(taskId)!;
     this.store.transitionTask(taskId, "RUNNING");
+    this.report(`[mission ${missionId}] ${task.kind}:${task.role} starting — ${task.objective.slice(0, 120)}`);
     try {
       // execute() itself can throw — e.g. no backend is registered for the task
       // kind. Left outside the try it propagated out of postExecution and
@@ -567,12 +596,15 @@ export class Orchestrator {
       // broken tree.
       if (outcome.exitStatus !== "succeeded") {
         this.store.transitionTask(taskId, "FAILED", "system", { failure_reason: outcome.exitStatus });
+        this.report(`[mission ${missionId}] ${task.kind}:${task.role} FAILED (${outcome.exitStatus})`);
         return false;
       }
       this.store.transitionTask(taskId, "SUCCEEDED");
+      this.report(`[mission ${missionId}] ${task.kind}:${task.role} succeeded`);
       return true;
     } catch (err) {
       if (this.store.getTask(taskId)?.status === "RUNNING") this.store.transitionTask(taskId, "FAILED");
+      this.report(`[mission ${missionId}] ${task.kind}:${task.role} errored`);
       return false;
     }
   }
