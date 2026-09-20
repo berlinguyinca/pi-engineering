@@ -1090,7 +1090,7 @@ Return details.winner_candidate_id set to "${a.id}" or "${b.id}" for your pick.`
       return {
         entry: {
           candidate,
-          outcome: { passed: false, failedStage: "leg-error", stages: [], evidence: [] },
+          outcome: { passed: false, failedStage: "leg-error", stages: [], evidence: [], noTargets: false },
           findings: [],
           reviewCompleted: false,
           winner: false,
