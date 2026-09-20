@@ -16,6 +16,7 @@ export * from "./cluster.ts";
 export * from "./campaign.ts";
 export * from "./reconcile.ts";
 export * from "./baseline.ts";
+export * from "./scope.ts";
 export * from "./report.ts";
 
 /** BAR data paths relative to a repo root. */
