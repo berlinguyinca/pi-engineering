@@ -31,6 +31,8 @@ export interface CreateRunInput {
 }
 
 export interface CreateWorkerInput {
+  /** Optional caller-supplied id (e.g. a remote worker id the agent attached with). */
+  id?: string;
   runId?: string | null;
   projectId: string;
   role: string;
@@ -212,7 +214,7 @@ export class WorkGraph {
   createWorker(input: CreateWorkerInput): Worker {
     const now = new Date().toISOString();
     const worker: Worker = {
-      id: id("WRK"),
+      id: input.id ?? id("WRK"),
       runId: input.runId ?? null,
       projectId: input.projectId,
       role: input.role,

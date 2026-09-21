@@ -24,6 +24,8 @@ export interface WorkerCommandEnvelope {
   generation: number;
   command: WorkerCommand;
   issuedAt: string;
+  /** Transport-level correlation id so a reply is matched to its command. */
+  correlationId?: string;
 }
 
 export interface CommandResult {
