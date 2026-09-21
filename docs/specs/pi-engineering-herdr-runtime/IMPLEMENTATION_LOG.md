@@ -98,4 +98,41 @@ Excluding the two flaky CAV screenshot files: 1483 pass / 0 fail / 1 skip.
 
 Phase C is CHECKPOINTED here, independently, before introducing Herdr (Phase D).
 
-## Phase D — Herdr (NOT STARTED)
+## Phase D — Herdr adapter
+
+### Investigation (real, live)
+- `herdr --version` → 0.9.1; `herdr status` → server running, protocol 22,
+  socket `~/.config/herdr/herdr.sock`.
+- `herdr api schema --json` → 276 KB JSON schema; request `oneOf` lists 103
+  methods (`agent.list/get/read/prompt/start/wait/attach`, `worktree.*`,
+  `workspace.*`, `session.*`, `machine.*`, `events.subscribe/wait`, …).
+- `AgentStatus` enum: idle/working/blocked/done/unknown. Structured errors:
+  `{id, error:{code,message}}`. Full record:
+  `HERDR_COMPATIBILITY.md`.
+
+### Delivered
+- `src/runtime/herdr/HerdrCli.ts` — thin, testable CLI client (interface +
+  `RealHerdrCli` shelling to `herdr`; `HerdrError` normalized). Not a fork.
+- `src/runtime/herdr/HerdrAgentRuntime.ts` — Herdr behind the same
+  `AgentRuntime` seam; opaque Pi ids → Herdr pane/workspace target.
+- `src/runtime/index.ts` — `createAgentRuntime` now selects Herdr behind
+  `runtime:"herdr"` with capability/version negotiation (`negotiateHerdr`).
+- `test/unit/herdr-runtime.test.ts` — same contract via fake CLI + negotiation
+  tests. `test/unit/agentruntime-contract.ts` — shared contract.
+
+### Commands + results
+```
+npx tsc --noEmit                # EXIT 0
+npx biome check src/runtime ...  # clean
+node --test test/unit/agentruntime.test.ts test/unit/herdr-runtime.test.ts  # 12/12
+node --test (excl flaky CAV)    # 1489 pass / 0 fail / 1 skip
+live smoke: RealHerdrCli against running server  # status/list/health OK
+```
+
+### Live finding (medium)
+Provisioning a NEW agent needs a real `pane_id`; `agent start` with an opaque
+id fails (`unknown option: HERD-…`). Full real provisioning (create a pane or
+worktree-backed workspace first) is a Phase E integration concern. See
+`HERDR_COMPATIBILITY.md`.
+
+## Phase E — Complete the architecture (see below)
