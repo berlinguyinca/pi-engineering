@@ -1,0 +1,2 @@
+# 11 — Pi-Web
+Keep Pi-Web as the existing external operator UI. Extend normalized Pi-Engineering APIs/events for workflow/worker status, current operation, branch/worktree, host/runtime, model, artifacts, diff, tests and failures. Actions include inspect, attach terminal, artifacts/diff/tests, interrupt/resume, clarification, cancel, reconcile/restart, retry and review. Avoid direct Herdr coupling except a narrowly defined terminal attachment bridge if required.

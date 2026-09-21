@@ -1,0 +1,2 @@
+# 13 — Recovery and Idempotency
+On restart load unfinished workflows, query runtimes, reconcile persisted WorkerIds, classify alive/resumable/completed-offline/failed/missing and restore orchestration. Never blindly rerun work that may have mutated Git. Every dispatch has RunId+TaskId+attempt/idempotency key. Reconcile events, worktree/commits, artifacts and runtime state before retry. Test coordinator crash, Herdr restart, remote disconnect, worker death and partial completion.
