@@ -1,14 +1,11 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import type { UiGenome } from "../../src/uieng/genome.ts";
-import type { UiImpactLevel } from "../../src/uieng/policy.ts";
-import type { CanonicalTask } from "../../src/uieng/usability.ts";
-import type { DesignArtifact, TaskRequest } from "../../src/uieng/schemas.ts";
 import {
-  DIFFUSION_REFERENCE_NOTE,
   DIFFUSION_IMAGE_GENERATION_CAPABILITY,
-  UX_ARCHITECTURE_CAPABILITY,
+  DIFFUSION_REFERENCE_NOTE,
+  type DesignFamily,
   SELECTION_OPS,
+  UX_ARCHITECTURE_CAPABILITY,
   applySelectionOp,
   checkRequirementsCoverage,
   combineSelections,
@@ -22,12 +19,16 @@ import {
   selectArtifact,
   shouldExplore,
 } from "../../src/uieng/exploration.ts";
+import type { UiGenome } from "../../src/uieng/genome.ts";
+import type { UiImpactLevel } from "../../src/uieng/policy.ts";
+import type { DesignArtifact, TaskRequest } from "../../src/uieng/schemas.ts";
+import type { CanonicalTask } from "../../src/uieng/usability.ts";
 
 function canonicalTask(goal: string, id = goal): CanonicalTask {
   return {
     id,
     goal,
-    mode: "flow",
+    mode: "first_time",
     required_states: ["loading", "error"],
     success_criteria: [`${goal} completes`],
     viewport_targets: ["mobile", "tablet", "desktop"],
@@ -36,6 +37,10 @@ function canonicalTask(goal: string, id = goal): CanonicalTask {
 
 function genome(version = 1): UiGenome {
   return { version, contracts: {} };
+}
+
+function genomeWithContract(version = 1): UiGenome {
+  return { version, contracts: { tokens: { colors: { primary: "#1a73e8" } } } };
 }
 
 function artifact(id: string, title: string, description = "", type = "spec"): DesignArtifact {
@@ -77,7 +82,7 @@ describe("exploration trigger", () => {
 
   it("triggers substantial UI surface from many canonical tasks", () => {
     const tasks = ["a", "b", "c", "d"].map((g) => canonicalTask(`task ${g}`));
-    const inputs = { ...baseInputs, canonicalTasks: tasks, uiGenome: genome() };
+    const inputs = { ...baseInputs, canonicalTasks: tasks, uiGenome: genomeWithContract() };
     assert.equal(explorationTrigger(inputs, "L1_micro"), "substantial_ui_surface");
   });
 });
@@ -162,7 +167,7 @@ describe("requestCapability", () => {
 describe("familyPlan", () => {
   it("covers devices, states and key pages with a reference note", () => {
     const plan = explorationPlan(baseInputs, "L1_micro");
-    const family = familyPlan(plan.hypotheses[0]);
+    const family = familyPlan(plan.hypotheses[0]!);
     assert.deepEqual(family.devices, ["desktop", "tablet", "phone"]);
     assert.ok(family.states.includes("empty"));
     assert.ok(family.states.includes("loading"));
@@ -176,8 +181,12 @@ describe("familyPlan", () => {
     const plan = explorationPlan(baseInputs, "L1_micro");
     const conservative = plan.hypotheses.find((h) => h.archetype === "conservative_modernization")!;
     const cleanSheet = plan.hypotheses.find((h) => h.archetype === "clean_sheet")!;
-    const conservativeKeys = familyPlan(conservative).pages.map((p) => p.key).sort();
-    const cleanKeys = familyPlan(cleanSheet).pages.map((p) => p.key).sort();
+    const conservativeKeys = familyPlan(conservative)
+      .pages.map((p) => p.key)
+      .sort();
+    const cleanKeys = familyPlan(cleanSheet)
+      .pages.map((p) => p.key)
+      .sort();
     assert.ok(cleanKeys.length > conservativeKeys.length);
     assert.ok(!conservativeKeys.includes("create"));
     assert.ok(cleanKeys.includes("create"));
@@ -187,7 +196,7 @@ describe("familyPlan", () => {
 describe("checkRequirementsCoverage", () => {
   it("reports covered and missing requirement ids", () => {
     const plan = explorationPlan(baseInputs, "L1_micro");
-    const family = familyPlan(plan.hypotheses[0]);
+    const family = familyPlan(plan.hypotheses[0]!);
     const result = checkRequirementsCoverage(family, plan.requirements);
     assert.ok(result.covered.includes("responsive"));
     assert.ok(result.covered.includes("states"));
@@ -198,8 +207,8 @@ describe("checkRequirementsCoverage", () => {
 
   it("flags missing states when the family lacks them", () => {
     const plan = explorationPlan(baseInputs, "L1_micro");
-    const family = familyPlan(plan.hypotheses[0]);
-    const stripped = { ...family, states: ["normal", "dialog"] };
+    const family = familyPlan(plan.hypotheses[0]!);
+    const stripped: DesignFamily = { ...family, states: ["normal", "dialog"] };
     const result = checkRequirementsCoverage(stripped, plan.requirements);
     assert.ok(result.missing.includes("states"));
     assert.ok(result.covered.includes("pages"));
@@ -208,7 +217,12 @@ describe("checkRequirementsCoverage", () => {
 
 describe("selection operations", () => {
   const a = artifact("A-1", "Settings redesign spec", "modernize settings navigation", "spec");
-  const b = artifact("B-1", "Settings implementation plan", "implement settings navigation redesign", "implementation_plan");
+  const b = artifact(
+    "B-1",
+    "Settings implementation plan",
+    "implement settings navigation redesign",
+    "implementation_plan",
+  );
   const c = artifact("C-1", "Dashboard spec", "fresh dashboard layout", "spec");
 
   it("supports Select", () => {

@@ -27,14 +27,13 @@
  * functional truth; they are consumed for inspiration, not rendered as UI.
  */
 
-import type { UiGenome, GenomeContracts, ConstitutionRule } from "./genome.ts";
+import type { ConstitutionRule, GenomeContracts, UiGenome } from "./genome.ts";
 import type { UiImpactLevel } from "./policy.ts";
+import type { DesignArtifact, TaskRequest } from "./schemas.ts";
 import type { CanonicalTask } from "./usability.ts";
-import type { TaskRequest, DesignArtifact } from "./schemas.ts";
 
 /** Canonical, machine-readable note attached to every diffusion family. */
-export const DIFFUSION_REFERENCE_NOTE =
-  "Diffusion images are visual ideation/reference, not functional truth.";
+export const DIFFUSION_REFERENCE_NOTE = "Diffusion images are visual ideation/reference, not functional truth.";
 
 /** How many canonical tasks indicate a "substantial UI surface". */
 export const SUBSTANTIAL_TASK_THRESHOLD = 4;
@@ -75,7 +74,8 @@ export interface ExplorationInputs {
  */
 export function explorationTrigger(inputs: ExplorationInputs, uiImpactLevel: UiImpactLevel): ExplorationTriggerKind {
   if (uiImpactLevel === "L3_system_design_system") return "major_redesign";
-  const hasSurface = inputs.existingWorkflows.length > 0 || inputs.canonicalTasks.length > 0;
+  // Only existing workflow/surface (not canonical goals) indicates an established app.
+  const hasSurface = inputs.existingWorkflows.length > 0;
   const hasGenome = inputs.uiGenome !== undefined && Object.keys(inputs.uiGenome.contracts).length > 0;
   if (!hasSurface && !hasGenome && inputs.productGoals.length > 0) return "new_ui";
   if (inputs.canonicalTasks.length >= SUBSTANTIAL_TASK_THRESHOLD) return "substantial_ui_surface";
@@ -237,7 +237,14 @@ function buildHypotheses(inputs: ExplorationInputs): UxHypothesis[] {
       context: `${context}\nArchetype: ${template.archetype}`,
       quality_class: "high",
     });
-    return { id, name: template.name, archetype: template.archetype, rationale: template.rationale, capabilityRequest, diffusionRequest };
+    return {
+      id,
+      name: template.name,
+      archetype: template.archetype,
+      rationale: template.rationale,
+      capabilityRequest,
+      diffusionRequest,
+    };
   });
 }
 
@@ -389,7 +396,9 @@ export interface RequirementsCoverage {
 export function coversRequirement(family: DesignFamily, requirement: ExplorationRequirement): boolean {
   switch (requirement.category) {
     case "responsive":
-      return family.devices.includes("desktop") && family.devices.includes("tablet") && family.devices.includes("phone");
+      return (
+        family.devices.includes("desktop") && family.devices.includes("tablet") && family.devices.includes("phone")
+      );
     case "states":
       return family.states.includes("empty") && family.states.includes("loading") && family.states.includes("error");
     case "pages":
@@ -473,7 +482,11 @@ function dedupe(artifacts: DesignArtifact[]): DesignArtifact[] {
 
 /** Select a single design artifact. */
 export function selectArtifact(artifact: DesignArtifact): SelectionResult {
-  return { op: "Select", artifacts: [artifact], rationale: `Selected design artifact ${artifact.id}: ${artifact.title}` };
+  return {
+    op: "Select",
+    artifacts: [artifact],
+    rationale: `Selected design artifact ${artifact.id}: ${artifact.title}`,
+  };
 }
 
 /** Rank candidates most similar to a seed artifact. */
@@ -484,7 +497,11 @@ export function moreLikeThis(seed: DesignArtifact, candidates: DesignArtifact[],
     .sort((a, b) => b.score - a.score || a.artifact.id.localeCompare(b.artifact.id))
     .slice(0, limit)
     .map((r) => r.artifact);
-  return { op: "More-like-this", artifacts: ranked, rationale: `Ranked ${ranked.length} artifacts similar to ${seed.id}` };
+  return {
+    op: "More-like-this",
+    artifacts: ranked,
+    rationale: `Ranked ${ranked.length} artifacts similar to ${seed.id}`,
+  };
 }
 
 /** Combine several selections into one direction set (deduplicated). */
@@ -512,9 +529,7 @@ export function letPiChoose(candidates: DesignArtifact[]): SelectionResult {
   if (candidates.length === 0) {
     return { op: "Let-Pi-choose", artifacts: [], rationale: "No candidates to choose from" };
   }
-  const chosen = [...candidates].sort(
-    (a, b) => directionScore(b) - directionScore(a) || a.id.localeCompare(b.id),
-  )[0];
+  const chosen = [...candidates].sort((a, b) => directionScore(b) - directionScore(a) || a.id.localeCompare(b.id))[0]!;
   return { op: "Let-Pi-choose", artifacts: [chosen], rationale: `Pi chose ${chosen.id} deterministically` };
 }
 
