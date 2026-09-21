@@ -138,7 +138,8 @@ export class PiWorkerExecutor implements WorkerExecutor {
     (this as unknown as { customTools: ToolDefinition[] }).customTools = tools;
   }
 
-  private async getModelRuntime(): Promise<ModelRuntime> {
+  /** Lazily-built ModelRuntime, exposed for capability-aware model discovery. */
+  async getModelRuntime(): Promise<ModelRuntime> {
     if (this.runtimePromise) return this.runtimePromise;
     this.runtimePromise = (async () => {
       const rt = await ModelRuntime.create({
@@ -150,6 +151,15 @@ export class PiWorkerExecutor implements WorkerExecutor {
       return rt;
     })();
     return this.runtimePromise;
+  }
+
+  /**
+   * Access the shared, cached ModelRuntime for capability discovery/routing.
+   * This is the public surface harness uses to build a model-routing source
+   * from the same runtime the workers run against.
+   */
+  async runtime(): Promise<ModelRuntime> {
+    return this.getModelRuntime();
   }
 
   async run(req: WorkerRequest): Promise<WorkerRun> {

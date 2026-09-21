@@ -4,13 +4,7 @@
   "description": "Autonomous engineering runtime for the pi coding agent: Engineering Ledger, fresh-context workers, isolated candidates, deterministic verification, and independent review.",
   "license": "MIT",
   "type": "module",
-  "keywords": [
-    "pi-package",
-    "engineering",
-    "orchestration",
-    "ledger",
-    "agent"
-  ],
+  "keywords": ["pi-package", "engineering", "orchestration", "ledger", "agent"],
   "exports": {
     ".": "./src/index.ts"
   },
@@ -24,6 +18,7 @@
     "platform:e2e": "node --experimental-strip-types scripts/platform-e2e.ts",
     "platform:serve": "node --experimental-strip-types scripts/control-server.ts",
     "test:roadmap": "node --test \"test/unit/roadmap*.test.ts\" \"test/integration/roadmap*.test.ts\"",
+    "test:dogfood:lifecycle": "node scripts/dogfood-lifecycle.ts",
     "roadmap:check": "node scripts/pi-engineering.ts roadmap check",
     "roadmap:status": "node scripts/pi-engineering.ts roadmap status",
     "lint": "biome check .",
@@ -53,8 +48,6 @@
     "yaml": "^2.9.0"
   },
   "pi": {
-    "extensions": [
-      "./extensions"
-    ]
+    "extensions": ["./extensions"]
   }
 }

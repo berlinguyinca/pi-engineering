@@ -544,7 +544,11 @@ export function executeWithAdmissionRetry(
     let committed = false;
     for await (const event of stream) {
       if (event.type === "done") {
+        // The hand-rolled stream does not auto-resolve `result()` / unblock the
+        // iterator on a pushed terminal event: end it explicitly so the consumer
+        // sees completion (and `result()` resolves) instead of hanging.
         out.push(event);
+        out.end(event.message);
         return { terminal: "done", withheld: false, forwarded: true, committed, aborted: false };
       }
       if (event.type === "error") {
@@ -556,7 +560,10 @@ export function executeWithAdmissionRetry(
           lastStatus = attemptCapture.status ?? lastStatus;
           return { terminal: "error", withheld: true, forwarded: false, committed, aborted: false };
         }
+        // Forwarded (non-withheld) error: end `out` so the consumer's iteration
+        // and `result()` resolve instead of hanging (mirrors the done case).
         out.push(event);
+        out.end(event.error);
         return {
           terminal: "error",
           withheld: false,
