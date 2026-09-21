@@ -12,12 +12,7 @@ import {
   rankClusters,
   reviewerRoleById,
 } from "../../src/uieng/review.ts";
-import type {
-  ImplementationSpec,
-  RootCauseCluster,
-  ReviewerRole,
-  ReviewerScore,
-} from "../../src/uieng/review.ts";
+import type { ImplementationSpec, ReviewerRole, ReviewerScore, RootCauseCluster } from "../../src/uieng/review.ts";
 import type { Finding } from "../../src/uieng/schemas.ts";
 
 function finding(overrides: Partial<Finding>): Finding {
@@ -120,8 +115,8 @@ describe("clusterRootCauses", () => {
     const clusters = clusterRootCauses([highImpact, highImpact2, other]);
     const empty = clusters.find((c) => c.rootCause.includes("empty state"))!;
     assert.equal(empty.impact, 1); // critical member
-    assert.equal(empty.leverage, 2 / 3);
-    assert.equal(empty.confidence, 0.85); // mean of 0.9, 0.8
+    assert.ok(Math.abs(empty.leverage - 2 / 3) < 1e-4);
+    assert.ok(Math.abs(empty.confidence - 0.85) < 1e-4); // mean of 0.9, 0.8
     assert.ok(empty.expectedGain > 0 && empty.expectedGain <= 1);
     assert.equal(empty.effort, "low");
     assert.equal(empty.risk, "low");
@@ -186,8 +181,14 @@ describe("rankClusters", () => {
     };
     const input = [b, a];
     const ranked = rankClusters(input);
-    assert.deepEqual(ranked.map((c) => c.rootCause), ["aaa", "bbb"]);
-    assert.deepEqual(input.map((c) => c.rootCause), ["bbb", "aaa"]);
+    assert.deepEqual(
+      ranked.map((c) => c.rootCause),
+      ["aaa", "bbb"],
+    );
+    assert.deepEqual(
+      input.map((c) => c.rootCause),
+      ["bbb", "aaa"],
+    );
   });
 });
 

@@ -28,9 +28,9 @@
  * advisory vision-review pattern (src/cav/vision.ts).
  */
 
-import { validateMetricIds } from "./rubric.ts";
-import type { ExecutionProvenance, EvidenceBundle, Finding } from "./schemas.ts";
 import type { UiImpactLevel } from "./policy.ts";
+import { validateMetricIds } from "./rubric.ts";
+import type { EvidenceBundle, ExecutionProvenance, Finding } from "./schemas.ts";
 
 // ---------------------------------------------------------------------------
 // 1. Partially-blind reviewer roles
@@ -237,9 +237,10 @@ function buildCluster(rootCause: string, findings: readonly Finding[], totalFind
   const surfaceSet = new Set<string>();
   for (const f of findings) for (const s of mapFindingSurface(f)) surfaceSet.add(s);
   const impact = maxByRank(findings, (f) => SEVERITY_RANK[f.severity]);
-  const confidence = clampUnit(mean(findings.map((f) => f.confidence)));
-  const leverage = clampUnit(totalFindings === 0 ? 0 : findings.length / totalFindings);
-  const expectedGain = clampUnit(leverage * impact);
+  const round4 = (n: number): number => Math.round(n * 10000) / 10000;
+  const confidence = round4(clampUnit(mean(findings.map((f) => f.confidence))));
+  const leverage = round4(clampUnit(totalFindings === 0 ? 0 : findings.length / totalFindings));
+  const expectedGain = round4(clampUnit(leverage * impact));
   return {
     rootCause,
     findings: [...findings],
@@ -348,10 +349,7 @@ export function fnv1a(input: string): number {
  * the spec id is derived from the root cause + affected surface, so identical
  * inputs always yield an identical spec.
  */
-export function buildSpec(
-  cluster: RootCauseCluster,
-  options: ImplementationSpecOptions,
-): ImplementationSpec {
+export function buildSpec(cluster: RootCauseCluster, options: ImplementationSpecOptions): ImplementationSpec {
   validateMetricIds(Object.keys(options.expectedMetricChanges));
   const specId = `SPEC-${fnv1a(`${cluster.rootCause}::${cluster.affectedSurface}`).toString(36).toUpperCase()}`;
   return {
@@ -390,13 +388,7 @@ const ROLES_BY_LEVEL: Record<UiImpactLevel, readonly ReviewerRoleId[]> = {
   L0_none: ["deterministic"],
   L1_micro: ["visual_critic", "deterministic"],
   L2_feature_workflow: ["visual_critic", "usability_agent", "deterministic"],
-  L3_system_design_system: [
-    "visual_critic",
-    "usability_agent",
-    "code_critic",
-    "deterministic",
-    "diagnosis_architect",
-  ],
+  L3_system_design_system: ["visual_critic", "usability_agent", "code_critic", "deterministic", "diagnosis_architect"],
 };
 
 /**
