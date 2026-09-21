@@ -271,3 +271,32 @@ export {
   renderPanels,
 } from "./blackhole/dashboard.ts";
 export type { DashboardPanel } from "./blackhole/dashboard.ts";
+// Autonomous UI engineering shared schema contracts (spec 01-contracts).
+export {
+  SCHEMA_VERSION,
+  MIN_SCHEMA_VERSION,
+  RECORD_KINDS,
+  SCHEMAS,
+  TaskRequestSchema,
+  ExecutionProvenanceSchema,
+  EvidenceBundleSchema,
+  FindingSchema,
+  EvaluationRunSchema,
+  DesignArtifactSchema,
+  CandidateSchema,
+  AcceptanceDecisionSchema,
+  validateRecord,
+  migrateRecord,
+} from "./uieng/schemas.ts";
+export type {
+  RecordKind,
+  TaskRequest,
+  ExecutionProvenance,
+  EvidenceBundle,
+  Finding,
+  EvaluationRun,
+  DesignArtifact,
+  Candidate,
+  AcceptanceDecision,
+  UiengRecord,
+} from "./uieng/schemas.ts";
