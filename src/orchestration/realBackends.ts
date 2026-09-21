@@ -165,12 +165,18 @@ export function realBackends(opts: RealBackendsOptions) {
         contextRef?: string;
         signal: AbortSignal;
       }): Promise<ExecutionOutcome> {
+        // A review must inspect the integrated change, read evidence, and write
+        // concrete findings — a long, prose-heavy task. Give it an explicit,
+        // generous context budget so the reviewer is never cut off for hitting
+        // the (previously unset → default) token cap; the role-adjusted guard
+        // lets it write its findings report without a false degeneration abort.
         const run = await opts.worker.run({
           role: "reviewer",
           task: input.objective,
           context: input.contextRef,
           tools: ["ledger_read", "artifact_read", "repo_search", "symbol"],
           cwd: opts.cwd,
+          maxContextTokens: 64_000,
         });
         const outcome = outcomeOf(run);
         // If the reviewer emitted structured findings, normalize and surface them
