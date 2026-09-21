@@ -500,3 +500,22 @@ export type {
   UsabilityEvaluationPlan,
   UsabilityEvaluationInputs,
 } from "./uieng/usability.ts";
+
+// Vision payload management (spec pi-engineering-vision-payload-management-413-recovery).
+// Pure deterministic logic; no image decoding.
+export * from "./vision/observation.ts";
+export {
+  estimatePayloadBytes,
+  estimateTokensForBytes,
+  classifyBudget,
+  RequestBudgetManager,
+  PAYLOAD_REDUCTION_ORDER,
+  DEFAULT_BUDGET_THRESHOLDS,
+  JSON_SERIALIZATION_OVERHEAD_BYTES,
+} from "./vision/budget.ts";
+export type {
+  PayloadBreakdown,
+  BudgetThresholds,
+  BudgetState as VisionBudgetState,
+} from "./vision/budget.ts";
+export * from "./vision/provider.ts";
