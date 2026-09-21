@@ -62,6 +62,7 @@ the deterministic completion gate — no `/engineer` or `/review` needed.
 | `/ledger [kind]` | Show work items + candidates + entities (optionally filter by `kind`, e.g. `/ledger finding`). |
 | `/context`     | Show active context usage, ledger size, artifact count, budgets. |
 | `/roadmap-status` | Show derived Roadmap 1.0 completion status for this repository. |
+| `/engineering admission` | Show a live InferWeave admission-retry summary (retries, waited time, reasons, saturation). |
 
 ## Verifiable roadmap completion
 

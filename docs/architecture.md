@@ -32,7 +32,18 @@ src/tools/coreTools.ts       semantic tools bound per-cwd
 src/capability/              model discovery, capability modeling, observed perf, routing
 src/lifecycle/               automatic lifecycle controller + harness, gates, vision,
                             destructive-op gating, telemetry, persistence
+src/inference/              InferWeave admission-retry transport, parser, policy,
+                            events/metrics, status UI (see inference-admission-retry.md)
 ```
+
+## InferWeave admission retry
+
+When an InferWeave node is busy it replies `429` with a structured
+`type: "inference_admission"` body. The harness converts those rejections into
+abortable wait/retry states instead of terminal inference failures: the agent
+stays alive across waits, the UI shows a waiting-for-capacity state, and retries
+are never multiplied with the provider transport or the agent layer. See
+`docs/inference-admission-retry.md`.
 
 ## Durable state
 
