@@ -135,4 +135,35 @@ id fails (`unknown option: HERD-…`). Full real provisioning (create a pane or
 worktree-backed workspace first) is a Phase E integration concern. See
 `HERDR_COMPATIBILITY.md`.
 
+## Phase E/F — Request planning + architectural 413 prevention (spec 06)
+
+### Delivered
+- `src/request/RequestPlanner.ts` — pure request planner: discovers the context
+  window from metadata (reuses `resolveModelContext`, conservative 128K floor,
+  never a fixed 260K); budgets BOTH tokens and serialized bytes with headroom;
+  transforms an oversized request BEFORE submission:
+  `direct → materialize (artifact-first) → summarize → split/fan-out → reject`.
+- `src/request/index.ts`, exported from `src/index.ts`.
+- `test/unit/request-planner.test.ts` — 7 regression tests reproducing the 413
+  failure signature (many design-spec references inlined → huge body) and
+  proving the body is shrunk to fit the byte budget before submission.
+
+### Commands + results
+```
+npx tsc --noEmit                # EXIT 0
+npx biome check src/request ... # clean
+node --test test/unit/request-planner.test.ts  # 7/7 pass
+full suite (excl flaky CAV browser tests)      # 1496 pass / 0 fail
+```
+
+### 413 regression evidence
+- 16 specs × 40 KB inlined (~640 KB) → `mode: materialize`, `artifactRefs`=16,
+  planned body `<= byteBudget` BEFORE submission. ✔
+- 3 MB single reference → `materialize` (collapsed to tiny artifact ref), not
+  reject. ✔
+- 1 MB objective, no refs → `reject` with structured `request_too_large`, no
+  submission. ✔
+- 200 refs under tight ceiling → `split` into fan-out chunks. ✔
+- Context window discovered (128K floor), never 260K. ✔
+
 ## Phase E — Complete the architecture (see below)
