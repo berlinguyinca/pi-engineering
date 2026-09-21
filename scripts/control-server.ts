@@ -185,7 +185,9 @@ async function main(): Promise<void> {
             steps = [];
           }
         }
-        const ledger = await CavEvidenceLedger.open(`${repo}/.pi-eng/cav/evidence.jsonl`);
+        const ledger = await CavEvidenceLedger.open(
+          process.env.PI_CAV_EVIDENCE_FILE ?? `${repo}/.pi-eng/cav/evidence.jsonl`,
+        );
         return send(200, buildCavSurface(steps, ledger));
       }
       if (req.method === "POST" && url.pathname === "/runs") {
