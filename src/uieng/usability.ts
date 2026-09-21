@@ -24,10 +24,10 @@
  * src/uieng/evidence.ts and are consumable by `scoreRecord`.
  */
 
-import type { AnalysisResult, OverflowRecord, BreakpointFailure, RuntimeError } from "./evidence.ts";
-import { analyzeOverflow, analyzeBreakpoints, scoreAnalysis } from "./evidence.ts";
-import type { MetricScore } from "./rubric.ts";
+import type { AnalysisResult, BreakpointFailure, OverflowRecord, RuntimeError } from "./evidence.ts";
+import { analyzeBreakpoints, analyzeOverflow, scoreAnalysis } from "./evidence.ts";
 import type { UiImpactLevel } from "./policy.ts";
+import type { MetricScore } from "./rubric.ts";
 
 // ---------------------------------------------------------------------------
 // 1. Canonical-task model
@@ -139,7 +139,9 @@ export function evaluateCanonicalTask(task: CanonicalTask, metrics: TaskMetrics)
   const navScore = clampScore(
     100 - metrics.navigation_depth * 3 - metrics.wrong_turns * 15 - metrics.backtracks * 15 - metrics.mis_clicks * 5,
   );
-  const cogScore = clampScore(100 - metrics.wrong_turns * 10 - metrics.mis_clicks * 8 - metrics.errors * 10 - metrics.assistance * 20);
+  const cogScore = clampScore(
+    100 - metrics.wrong_turns * 10 - metrics.mis_clicks * 8 - metrics.errors * 10 - metrics.assistance * 20,
+  );
   const errScore = clampScore(100 - metrics.mis_clicks * 20 - metrics.errors * 20);
   const discScore = metrics.assistance === 0 ? 100 : clampScore(100 - metrics.assistance * 30);
 
@@ -166,7 +168,11 @@ export function evaluateCanonicalTask(task: CanonicalTask, metrics: TaskMetrics)
     navScore,
     `depth ${metrics.navigation_depth}, wrong turns ${metrics.wrong_turns}, backtracks ${metrics.backtracks}.`,
   );
-  push("cognitive_load", cogScore, `wrong turns ${metrics.wrong_turns}, mis-clicks ${metrics.mis_clicks}, errors ${metrics.errors}.`);
+  push(
+    "cognitive_load",
+    cogScore,
+    `wrong turns ${metrics.wrong_turns}, mis-clicks ${metrics.mis_clicks}, errors ${metrics.errors}.`,
+  );
   push("error_prevention", errScore, `${metrics.mis_clicks} mis-clicks, ${metrics.errors} errors.`);
   push("interaction_latency", latencyScore(metrics.latency_ms), `observed latency ${metrics.latency_ms}ms.`, 0.8);
   push("discoverability", discScore, `${metrics.assistance} assistance request(s).`);
@@ -424,12 +430,18 @@ interface Scored {
 }
 
 const ok = (details: string, confidence = 0.7): Scored => ({ score: 100, confidence, details });
-const fromIssues = (issues: number, perIssue = 20, details: string, confidence = 0.7): Scored => ({
+const fromIssues = (issues: number, details: string, perIssue = 20, confidence = 0.7): Scored => ({
   score: clampScore(100 - issues * perIssue),
   confidence,
   details: issues === 0 ? `No issues: ${details}` : `${issues} issue(s): ${details}`,
 });
-const fromOutcome = (flag: boolean | undefined, failScore: number, failMsg: string, passMsg: string, confidence = 0.7): Scored =>
+const fromOutcome = (
+  flag: boolean | undefined,
+  failScore: number,
+  failMsg: string,
+  passMsg: string,
+  confidence = 0.7,
+): Scored =>
   flag === false ? { score: failScore, confidence, details: failMsg } : { score: 100, confidence, details: passMsg };
 const fromTiming = (ms: number, confidence = 0.7): Scored => {
   let score: number;
@@ -455,11 +467,7 @@ function scenarioScores(kind: RobustnessScenarioKind, evidence: RobustnessEviden
   switch (kind) {
     case "long_content":
       return {
-        long_content_resilience: fromIssues(
-          evidence.issues ?? 0,
-          20,
-          "long content rendered without layout breakage.",
-        ),
+        long_content_resilience: fromIssues(evidence.issues ?? 0, "long content rendered without layout breakage."),
       };
     case "empty_data":
       return {
@@ -498,9 +506,10 @@ function scenarioScores(kind: RobustnessScenarioKind, evidence: RobustnessEviden
     case "slow_network":
       return {
         slow_error_network: fromErrors(errors),
-        loading_states: out.indicator_shown === false
-          ? { score: 25, confidence: 0.7, details: "no loading indication during slow network." }
-          : ok("graceful behavior during slow network."),
+        loading_states:
+          out.indicator_shown === false
+            ? { score: 25, confidence: 0.7, details: "no loading indication during slow network." }
+            : ok("graceful behavior during slow network."),
       };
     case "reconnect":
       return {
@@ -561,8 +570,10 @@ function scenarioScores(kind: RobustnessScenarioKind, evidence: RobustnessEviden
       return {
         modal_drawer_stacking: fromIssues(
           evidence.issues ?? 0,
+          out.focus_restored === false
+            ? "focus was not restored after overlay close."
+            : "overlays stacked and dismissed correctly.",
           25,
-          out.focus_restored === false ? "focus was not restored after overlay close." : "overlays stacked and dismissed correctly.",
         ),
       };
     case "temporal_traces_video":
@@ -650,7 +661,13 @@ export function buildUsabilityEvaluationPlan(
 ): UsabilityEvaluationPlan {
   const viewportMetricGroups: Record<string, string[]> = {};
   for (const v of viewports) viewportMetricGroups[v.id] = v.metric_ids;
-  return { impact_level: impactLevel, tasks: [...tasks], viewports: [...viewports], viewport_metric_groups: viewportMetricGroups, scenarios: [...scenarios] };
+  return {
+    impact_level: impactLevel,
+    tasks: [...tasks],
+    viewports: [...viewports],
+    viewport_metric_groups: viewportMetricGroups,
+    scenarios: [...scenarios],
+  };
 }
 
 /**

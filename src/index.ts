@@ -471,3 +471,32 @@ export type {
   GenomeInjectionOptions,
   GenomeInjection,
 } from "./uieng/genome.ts";
+
+// Runtime usability & robustness evaluation (spec 05-runtime-tests).
+export {
+  TASK_METRIC_MAPPING,
+  evaluateCanonicalTask,
+  viewportMetricGroup,
+  buildViewportMatrix,
+  VIEWPORT_MATRIX,
+  SCENARIO_METRIC_MAP,
+  ROBUSTNESS_SCENARIOS,
+  analyzeRobustnessScenario,
+  evaluateViewport,
+  buildUsabilityEvaluationPlan,
+  runUsabilityEvaluation,
+} from "./uieng/usability.ts";
+export type {
+  TaskMode,
+  CanonicalTask,
+  TaskMetrics,
+  TaskMetricKey,
+  ViewportMatrixEntry,
+  RobustnessScenarioKind,
+  RobustnessScenario,
+  RobustnessEvidence,
+  RobustnessAnalyzeOptions,
+  ViewportEvidence,
+  UsabilityEvaluationPlan,
+  UsabilityEvaluationInputs,
+} from "./uieng/usability.ts";

@@ -1,20 +1,20 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import { analyzeCapture } from "../../src/uieng/evidence.ts";
+import { METRIC_IDS, assertMetricKnown } from "../../src/uieng/rubric.ts";
 import {
+  type CanonicalTask,
+  ROBUSTNESS_SCENARIOS,
+  TASK_METRIC_MAPPING,
+  VIEWPORT_MATRIX,
   analyzeRobustnessScenario,
   buildUsabilityEvaluationPlan,
   buildViewportMatrix,
   evaluateCanonicalTask,
   evaluateViewport,
-  ROBUSTNESS_SCENARIOS,
   runUsabilityEvaluation,
-  TASK_METRIC_MAPPING,
-  VIEWPORT_MATRIX,
   viewportMetricGroup,
-  type CanonicalTask,
 } from "../../src/uieng/usability.ts";
-import { METRIC_IDS, assertMetricKnown } from "../../src/uieng/rubric.ts";
-import { analyzeCapture } from "../../src/uieng/evidence.ts";
 
 describe("uieng runtime usability & robustness evaluation", () => {
   it("viewportMetricGroup maps viewports deterministically", () => {
@@ -27,7 +27,9 @@ describe("uieng runtime usability & robustness evaluation", () => {
     // 200% zoom shrinks effective CSS width -> zoom_reflow + a smaller group.
     const zoomed = viewportMetricGroup(1920, 1080, 2);
     assert.deepEqual(new Set(zoomed).has("zoom_reflow"), true);
-    assert.deepEqual(new Set(zoomed).has("desktop_layout"), true);
+    // 200% zoom on 1920px reflows to a tablet-sized CSS viewport (960px).
+    assert.deepEqual(new Set(zoomed).has("desktop_layout"), false);
+    assert.deepEqual(new Set(zoomed).has("tablet_reflow"), true);
     assert.deepEqual(new Set(viewportMetricGroup(1280, 800, 2)).has("tablet_reflow"), true);
     assert.equal(viewportMetricGroup(1280, 800, 2).length, viewportMetricGroup(1280, 800, 2).length);
   });
@@ -114,8 +116,10 @@ describe("uieng runtime usability & robustness evaluation", () => {
   });
 
   it("robustness scenario catalog covers all required kinds with known metric ids", () => {
-    const kinds = new Set(ROBUSTNESS_SCENARIOS.map((s) => s.kind));
-    for (const required of [
+    const kinds = new Set<import("../../src/uieng/usability.ts").RobustnessScenarioKind>(
+      ROBUSTNESS_SCENARIOS.map((s) => s.kind),
+    );
+    const requiredKinds: import("../../src/uieng/usability.ts").RobustnessScenarioKind[] = [
       "long_content",
       "empty_data",
       "huge_dataset",
@@ -130,7 +134,8 @@ describe("uieng runtime usability & robustness evaluation", () => {
       "back_forward",
       "modal_drawer_stacking",
       "temporal_traces_video",
-    ]) {
+    ];
+    for (const required of requiredKinds) {
       assert.equal(kinds.has(required), true, `missing ${required}`);
     }
     for (const s of ROBUSTNESS_SCENARIOS) {
@@ -140,7 +145,7 @@ describe("uieng runtime usability & robustness evaluation", () => {
   });
 
   it("analyzeRobustnessScenario is deterministic and scores evidence", () => {
-    const scn = ROBUSTNESS_SCENARIOS.find((s) => s.kind === "double_submit");
+    const scn = ROBUSTNESS_SCENARIOS.find((s) => s.kind === "double_submit")!;
     assert.ok(scn);
     const bad = analyzeRobustnessScenario(scn, { outcomes: { duplicate_prevented: false } });
     assert.equal(bad[0]?.metricId, "repeated_click_double_submit");
@@ -186,7 +191,7 @@ describe("uieng runtime usability & robustness evaluation", () => {
       "L2_feature_workflow",
     );
     assert.equal(plan.impact_level, "L2_feature_workflow");
-    assert.equal(plan.viewport_metric_groups["phone-360"].includes("mobile_reflow"), true);
+    assert.equal(plan.viewport_metric_groups["phone-320"]?.includes("mobile_reflow"), true);
 
     const scores = runUsabilityEvaluation(plan, {
       tasks: {
@@ -204,7 +209,7 @@ describe("uieng runtime usability & robustness evaluation", () => {
         },
       },
       scenarios: { "scn-refresh": { outcomes: { state_restored: true } } },
-      viewports: { "phone-360": { overflows: [] } },
+      viewports: { "phone-320": { overflows: [] } },
     });
     assert.ok(scores.length > 0);
     const ids = new Set(scores.map((s) => s.metric_id));
