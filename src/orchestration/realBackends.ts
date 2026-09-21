@@ -24,6 +24,16 @@ export interface RealBackendsOptions {
   artifacts: ArtifactStore;
   git: GitRepo | null;
   cwd: string;
+  /**
+   * Optional capability-router hook: resolve a worker role to a specific
+   * `{provider, id}` model placement (e.g. from `policy.routing.roles`). When
+   * it returns a model, the worker runs on that model; when it returns
+   * `undefined` (or is omitted) the worker falls back to its construction-time
+   * default, preserving the pre-routing behavior. This is what makes per-role
+   * model placement (a pinned implementer/reviewer) take effect in the mission
+   * pipeline, matching the lifecycle `roleRunner` path.
+   */
+  routeModel?: (role: WorkerRequest["role"]) => Promise<{ provider: string; id: string } | undefined>;
 }
 
 /**
@@ -117,6 +127,11 @@ export function realBackends(opts: RealBackendsOptions) {
           // operator can tune per environment without recompiling.
           timeoutMs: workerTimeoutMs(),
         };
+        // Place the worker on the model the capability router chose for this
+        // role (honours `policy.routing.roles`); fall back to the executor
+        // default when routing is unavailable or the role is unknown.
+        const modelOverride = await opts.routeModel?.(req.role);
+        if (modelOverride) req.modelOverride = modelOverride;
         const run = await opts.worker.run(req);
         return outcomeOf(run);
       },
@@ -170,14 +185,17 @@ export function realBackends(opts: RealBackendsOptions) {
         // generous context budget so the reviewer is never cut off for hitting
         // the (previously unset → default) token cap; the role-adjusted guard
         // lets it write its findings report without a false degeneration abort.
-        const run = await opts.worker.run({
+        const req: WorkerRequest = {
           role: "reviewer",
           task: input.objective,
           context: input.contextRef,
           tools: ["ledger_read", "artifact_read", "repo_search", "symbol"],
           cwd: opts.cwd,
           maxContextTokens: 64_000,
-        });
+        };
+        const modelOverride = await opts.routeModel?.(req.role);
+        if (modelOverride) req.modelOverride = modelOverride;
+        const run = await opts.worker.run(req);
         const outcome = outcomeOf(run);
         // If the reviewer emitted structured findings, normalize and surface them
         // so the completion gate can block on blocking findings. Handles three
