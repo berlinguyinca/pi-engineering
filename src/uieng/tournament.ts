@@ -32,13 +32,13 @@
  */
 
 import { id as newId } from "../core/ids.ts";
-import type { MergeQueue } from "../merge/MergeQueue.ts";
 import type { GitRepo, WorktreeInfo } from "../git/GitRepo.ts";
+import type { MergeQueue } from "../merge/MergeQueue.ts";
 import { METRIC_GROUPS, derivedEvaluation } from "./policy.ts";
 import type { EvaluationPlan, UiImpactLevel } from "./policy.ts";
-import { assertMetricKnown } from "./rubric.ts";
 import { disagreementIndex } from "./review.ts";
 import type { ReviewerScore } from "./review.ts";
+import { assertMetricKnown } from "./rubric.ts";
 import type {
   AcceptanceDecision,
   Candidate,
@@ -48,11 +48,11 @@ import type {
   TaskRequest,
 } from "./schemas.ts";
 import {
-  ROBUSTNESS_SCENARIOS,
-  buildViewportMatrix,
   type CanonicalTask,
+  ROBUSTNESS_SCENARIOS,
   type RobustnessScenario,
   type ViewportMatrixEntry,
+  buildViewportMatrix,
 } from "./usability.ts";
 
 // ---------------------------------------------------------------------------
@@ -150,10 +150,7 @@ export function defaultCanonicalTasks(): CanonicalTask[] {
  * proportional UI policy for the level; viewports, scenarios, and tasks come
  * from src/uieng/usability.ts.
  */
-export function buildEvaluationBattery(
-  plan: EvaluationPlan,
-  opts: TournamentOptions = {},
-): EvaluationBattery {
+export function buildEvaluationBattery(plan: EvaluationPlan, opts: TournamentOptions = {}): EvaluationBattery {
   const viewports = opts.viewports ?? [...buildViewportMatrix()];
   const viewportMetricGroups: Record<string, string[]> = {};
   for (const v of viewports) viewportMetricGroups[v.id] = v.metric_ids;
@@ -259,10 +256,7 @@ export class TournamentRunner {
 // ---------------------------------------------------------------------------
 
 /** Performance/complexity metric ids that must stay within budget. */
-export const PERFORMANCE_COMPLEXITY_METRICS: readonly string[] = [
-  ...METRIC_GROUPS.performance,
-  "component_complexity",
-];
+export const PERFORMANCE_COMPLEXITY_METRICS: readonly string[] = [...METRIC_GROUPS.performance, "component_complexity"];
 
 /** Performance/complexity metric ids, de-duplicated and validated. */
 export function performanceComplexityMetricIds(): string[] {
@@ -401,14 +395,7 @@ export function evaluateCandidate(
   candidateScores: Record<string, number>,
   opts: ParetoGateOptions,
 ): GatedAcceptanceDecision {
-  const {
-    criticalMetricIds,
-    budgets,
-    protectedContracts,
-    targetDeltas,
-    candidate,
-    evaluatorProvenance,
-  } = opts;
+  const { criticalMetricIds, budgets, protectedContracts, targetDeltas, candidate, evaluatorProvenance } = opts;
 
   const deterministicTestsPass = opts.deterministicTestsPass ?? true;
   const protectedContractsIntact = opts.protectedContractsIntact ?? true;
@@ -424,14 +411,20 @@ export function evaluateCandidate(
   // 0. Self-approval guard: a model never approves its own work.
   const sameProvenance = provenanceIdentity(candidate.provenance) === provenanceIdentity(evaluatorProvenance);
   if (sameProvenance) {
-    const finding = findingFor(candidate.provenance.selected_model, "Evaluator provenance matches candidate provenance", "critical");
+    const finding = findingFor(
+      candidate.provenance.selected_model,
+      "Evaluator provenance matches candidate provenance",
+      "critical",
+    );
     findings.push(finding);
   }
   criteria.push({
     id: "independent_evaluator",
     label: "Independent evaluator",
     passed: !sameProvenance,
-    detail: sameProvenance ? "Evaluator and candidate share provenance; a model cannot approve its own work." : "Evaluator provenance differs from candidate provenance.",
+    detail: sameProvenance
+      ? "Evaluator and candidate share provenance; a model cannot approve its own work."
+      : "Evaluator provenance differs from candidate provenance.",
   });
 
   // 1. Target improvement: each required delta must be met.
@@ -444,7 +437,9 @@ export function evaluateCandidate(
   }
   const targetMet = targetFindings.length === 0;
   if (!targetMet) {
-    findings.push(findingFor("critical_task_completion", `Target improvement not met: ${targetFindings.join("; ")}`, "high"));
+    findings.push(
+      findingFor("critical_task_completion", `Target improvement not met: ${targetFindings.join("; ")}`, "high"),
+    );
   }
   criteria.push({
     id: "target_improvement",
@@ -462,7 +457,13 @@ export function evaluateCandidate(
   }
   const criticalMet = criticalFloors.length === 0;
   if (!criticalMet) {
-    findings.push(findingFor("critical_task_completion", `Critical regression below floor: ${criticalFloors.join("; ")}`, "critical"));
+    findings.push(
+      findingFor(
+        "critical_task_completion",
+        `Critical regression below floor: ${criticalFloors.join("; ")}`,
+        "critical",
+      ),
+    );
   }
   criteria.push({
     id: "critical_regression",
@@ -492,7 +493,9 @@ export function evaluateCandidate(
   }
   const perfMet = perfBreaches.length === 0;
   if (!perfMet) {
-    findings.push(findingFor("render_performance_cost", `Performance/complexity over budget: ${perfBreaches.join("; ")}`, "medium"));
+    findings.push(
+      findingFor("render_performance_cost", `Performance/complexity over budget: ${perfBreaches.join("; ")}`, "medium"),
+    );
   }
   criteria.push({
     id: "performance_budget",
@@ -510,7 +513,9 @@ export function evaluateCandidate(
         ? `Protected contracts intact: ${protectedContracts.join(", ")}`
         : `Protected contract(s) broken: ${protectedContracts.join(", ")}`;
   if (!contractMet) {
-    findings.push(findingFor("semantic_accessibility", `Protected contracts broken: ${protectedContracts.join(", ")}`, "critical"));
+    findings.push(
+      findingFor("semantic_accessibility", `Protected contracts broken: ${protectedContracts.join(", ")}`, "critical"),
+    );
   }
   criteria.push({
     id: "protected_contracts",
@@ -522,7 +527,13 @@ export function evaluateCandidate(
   // 6. Disagreement resolved/below threshold.
   const disagreementMet = disagreement <= maxDisagreement;
   if (!disagreementMet) {
-    findings.push(findingFor("critical_task_completion", `Reviewer disagreement ${disagreement.toFixed(2)} above threshold ${maxDisagreement.toFixed(2)}`, "high"));
+    findings.push(
+      findingFor(
+        "critical_task_completion",
+        `Reviewer disagreement ${disagreement.toFixed(2)} above threshold ${maxDisagreement.toFixed(2)}`,
+        "high",
+      ),
+    );
   }
   criteria.push({
     id: "disagreement",
@@ -545,7 +556,12 @@ export function evaluateCandidate(
       ? `Candidate accepted and auto-approved: all ${criteria.length} Pareto gate criteria passed; low-risk proven fix with independent evaluator.`
       : accepted
         ? `Candidate accepted but requires human approval (${highRiskChange ? "high-risk change class" : "approval override"}).`
-        : `Candidate rejected: ${criteria.filter((c) => !c.passed).map((c) => c.label).join(", ") || "independent-evaluator requirement failed"}.`;
+        : `Candidate rejected: ${
+            criteria
+              .filter((c) => !c.passed)
+              .map((c) => c.label)
+              .join(", ") || "independent-evaluator requirement failed"
+          }.`;
 
   const decidedAt = new Date().toISOString();
   const evaluation: EvaluationRun = opts.evaluation ?? {

@@ -541,7 +541,6 @@ export {
 } from "./vision/store.ts";
 export type { TraceabilityRecord } from "./vision/store.ts";
 
-
 // Independent review / diagnosis / implementation-spec generation (spec 06-review-diagnose).
 export {
   REVIEWER_ROLE_IDS,

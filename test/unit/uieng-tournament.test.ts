@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import { derivedEvaluation } from "../../src/uieng/policy.ts";
+import { METRIC_IDS } from "../../src/uieng/rubric.ts";
+import type { ExecutionProvenance, TaskRequest } from "../../src/uieng/schemas.ts";
 import {
   PERFORMANCE_COMPLEXITY_METRICS,
   TournamentRunner,
@@ -13,9 +16,6 @@ import {
   tournamentPlan,
 } from "../../src/uieng/tournament.ts";
 import type { GatedAcceptanceDecision, ParetoGateOptions } from "../../src/uieng/tournament.ts";
-import { METRIC_IDS } from "../../src/uieng/rubric.ts";
-import { derivedEvaluation } from "../../src/uieng/policy.ts";
-import type { ExecutionProvenance, TaskRequest } from "../../src/uieng/schemas.ts";
 
 function taskRequest(overrides: Partial<TaskRequest> = {}): TaskRequest {
   return {
@@ -112,8 +112,8 @@ describe("tournamentPlan", () => {
 
   it("builds a battery with viewport metric groups", () => {
     const battery = buildEvaluationBattery(derivedEvaluation({ level: "L1_micro" }));
-    assert.ok(battery.viewport_metric_groups["desktop"]);
-    assert.ok(battery.viewport_metric_groups["desktop"].includes("desktop_layout"));
+    assert.ok(battery.viewport_metric_groups.desktop);
+    assert.ok(battery.viewport_metric_groups.desktop.includes("desktop_layout"));
   });
 
   it("default canonical task catalog is non-empty and typed", () => {
@@ -149,7 +149,11 @@ describe("provenanceIdentity", () => {
 describe("evaluateCandidate — Pareto gate", () => {
   it("accepts a low-risk candidate that clears every gate", () => {
     const candidate = baseCandidate(provenance({ id: "EXEC-CAND", selected_model: "candidate-model" }));
-    const decision = evaluateCandidate(fullScores({ critical_task_completion: 50 }), fullScores({ critical_task_completion: 70 }), gateOptions(candidate));
+    const decision = evaluateCandidate(
+      fullScores({ critical_task_completion: 50 }),
+      fullScores({ critical_task_completion: 70 }),
+      gateOptions(candidate),
+    );
     assert.equal(decision.accepted, true);
     assert.equal(decision.requiresApproval, false);
     assert.equal(decision.provenance.selected_model, "evaluator-model");
@@ -163,7 +167,7 @@ describe("evaluateCandidate — Pareto gate", () => {
       gateOptions(candidate),
     );
     assert.equal(decision.accepted, false);
-    assert.ok(decision.rationale.includes("target_improvement") || decision.rationale.includes("Deltas"));
+    assert.ok(decision.rationale.includes("Target improvement"));
   });
 
   it("rejects when a critical metric is below its floor", () => {
@@ -253,7 +257,11 @@ describe("evaluateCandidate — Pareto gate", () => {
 
   it("produces a persisted-ready AcceptanceDecision with findings", () => {
     const candidate = baseCandidate(provenance({ selected_model: "candidate-model" }));
-    const decision = evaluateCandidate(fullScores({ critical_task_completion: 50 }), fullScores({ critical_task_completion: 70 }), gateOptions(candidate)) as GatedAcceptanceDecision;
+    const decision = evaluateCandidate(
+      fullScores({ critical_task_completion: 50 }),
+      fullScores({ critical_task_completion: 70 }),
+      gateOptions(candidate),
+    ) as GatedAcceptanceDecision;
     assert.equal(decision.kind, "acceptance_decision");
     assert.equal(decision.schema_version, 1);
     assert.equal(decision.candidate.id, "CAND-1");
@@ -276,7 +284,11 @@ describe("performanceComplexityMetricIds", () => {
 
 describe("gateDisagreement", () => {
   it("reuses the review disagreement index", () => {
-    assert.equal(gateDisagreement([{ roleId: "visual_critic", score: 0.2 }, { roleId: "deterministic", score: 0.8 }]), 0.6);
+    const d = gateDisagreement([
+      { roleId: "visual_critic", score: 0.2 },
+      { roleId: "deterministic", score: 0.8 },
+    ]);
+    assert.ok(Math.abs(d - 0.6) < 1e-9, `expected ~0.6, got ${d}`);
     assert.equal(gateDisagreement([{ roleId: "deterministic", score: 0.5 }]), 0);
   });
 });
@@ -285,10 +297,7 @@ describe("TournamentRunner", () => {
   it("is constructible and references GitRepo + MergeQueue", () => {
     // We only verify the type surface: the runner delegates worktree/merge work
     // to the existing git + queue primitives rather than reimplementing them.
-    const runner = new (TournamentRunner as unknown as new (git: unknown, queue: unknown) => TournamentRunner)(
-      {},
-      {},
-    );
+    const runner = new (TournamentRunner as unknown as new (git: unknown, queue: unknown) => TournamentRunner)({}, {});
     assert.ok(runner instanceof TournamentRunner);
   });
 });
