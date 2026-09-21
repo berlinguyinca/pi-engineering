@@ -274,6 +274,7 @@ export type { DashboardPanel } from "./blackhole/dashboard.ts";
 // Vision payload management (spec pi-engineering-vision-payload-management-413-recovery).
 // Pure deterministic logic; no image decoding.
 export * from "./vision/observation.ts";
+export * from "./vision/metrics.ts";
 export {
   estimatePayloadBytes,
   estimateTokensForBytes,
