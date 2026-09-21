@@ -300,3 +300,26 @@ export type {
   AcceptanceDecision,
   UiengRecord,
 } from "./uieng/schemas.ts";
+
+// Versioned 60-metric UI rubric engine (spec 02-rubric).
+export {
+  RUBRIC_VERSION,
+  METRICS,
+  METRIC_IDS,
+  METRICS_BY_ID,
+  RUBRIC_REGISTRY,
+  validateMetricIds,
+  assertMetricKnown,
+  scoreRecord,
+  scoreAll,
+  aggregateScores,
+} from "./uieng/rubric.ts";
+export type {
+  MetricSource,
+  MetricSeverity,
+  MetricAnchors,
+  RubricMetric,
+  MetricScoreInput,
+  MetricScore,
+  RubricAggregate,
+} from "./uieng/rubric.ts";
