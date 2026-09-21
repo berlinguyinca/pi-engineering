@@ -109,7 +109,9 @@ export function produceEvidenceBundle(plan: CapturePlan, opts: ProduceEvidenceOp
     viewport: {
       width: plan.viewport.width,
       height: plan.viewport.height,
-      ...(plan.viewport.device_scale_factor !== undefined ? { device_scale_factor: plan.viewport.device_scale_factor } : {}),
+      ...(plan.viewport.device_scale_factor !== undefined
+        ? { device_scale_factor: plan.viewport.device_scale_factor }
+        : {}),
     },
   };
   if (plan.route !== undefined) bundle.route = plan.route;
@@ -424,13 +426,16 @@ export interface ComponentReuseInput {
 }
 
 /** Deterministic analyzer: component reuse -> component_reuse. */
-export function analyzeComponentReuse(
-  input: ComponentReuseInput,
-  opts: { evidence?: string[] } = {},
-): AnalysisResult {
+export function analyzeComponentReuse(input: ComponentReuseInput, opts: { evidence?: string[] } = {}): AnalysisResult {
   const evidence = [...(opts.evidence ?? [])];
   if (input.component_instances <= 0) {
-    return { metricId: "component_reuse", score: 100, confidence: 0.5, evidence, details: "No component instances captured." };
+    return {
+      metricId: "component_reuse",
+      score: 100,
+      confidence: 0.5,
+      evidence,
+      details: "No component instances captured.",
+    };
   }
   const reuse = 1 - input.distinct_components / input.component_instances;
   return {
@@ -561,7 +566,13 @@ export function analyzeAssetWeight(input: BundlePerf, opts: { evidence?: string[
   const evidence = [...(opts.evidence ?? [])];
   const bytes = input.transferBytes ?? input.totalBytes;
   if (bytes === undefined) {
-    return { metricId: "asset_weight", score: 100, confidence: 0.4, evidence, details: "No network/bundle size captured." };
+    return {
+      metricId: "asset_weight",
+      score: 100,
+      confidence: 0.4,
+      evidence,
+      details: "No network/bundle size captured.",
+    };
   }
   const kb = bytes / 1024;
   let score: number;
@@ -587,7 +598,13 @@ export function analyzeRenderPerformance(input: RenderPerf, opts: { evidence?: s
   else if (renderMs <= 100) score = 50;
   else if (renderMs <= 250) score = 25;
   else score = 0;
-  return { metricId: "render_performance_cost", score, confidence: 0.8, evidence, details: `render cost ${renderMs}ms.` };
+  return {
+    metricId: "render_performance_cost",
+    score,
+    confidence: 0.8,
+    evidence,
+    details: `render cost ${renderMs}ms.`,
+  };
 }
 
 /** Deterministic analyzer: layout-shift trace (CLS) -> layout_stability. */
@@ -599,7 +616,13 @@ export function analyzeLayoutStability(cls: number, opts: { evidence?: string[] 
   else if (cls <= 0.25) score = 50;
   else if (cls <= 0.5) score = 25;
   else score = 0;
-  return { metricId: "layout_stability", score, confidence: 0.85, evidence, details: `cumulative layout shift ${cls.toFixed(3)}.` };
+  return {
+    metricId: "layout_stability",
+    score,
+    confidence: 0.85,
+    evidence,
+    details: `cumulative layout shift ${cls.toFixed(3)}.`,
+  };
 }
 
 export interface RuntimeError {

@@ -5,6 +5,7 @@ import {
   analyzeAccessibilityViolations,
   analyzeAssetWeight,
   analyzeBreakpoints,
+  analyzeCapture,
   analyzeCodeDuplication,
   analyzeComponentReuse,
   analyzeContrastRatios,
@@ -20,7 +21,6 @@ import {
   analyzeRuntimeErrors,
   analyzeStyleDuplication,
   analyzeTouchTargets,
-  analyzeCapture,
   produceEvidenceBundle,
   scoreAnalysis,
   toMetricScore,
@@ -35,7 +35,14 @@ describe("uieng evidence capture + deterministic analyzers", () => {
       {
         route: "/dashboard",
         state: "loaded",
-        viewport: { width: 1280, height: 800, device_scale_factor: 2, zoom: 1, orientation: "landscape", device: "Desktop Chrome" },
+        viewport: {
+          width: 1280,
+          height: 800,
+          device_scale_factor: 2,
+          zoom: 1,
+          orientation: "landscape",
+          device: "Desktop Chrome",
+        },
         screenshots: ["artifact://shots/main.png", "artifact://shots/hover.png"],
         video: "artifact://video/run.webm",
         dom: "<html><body></body></html>",
@@ -127,10 +134,7 @@ describe("uieng evidence capture + deterministic analyzers", () => {
     assert.equal(analyzeOverflow([]).score, 100);
     assert.equal(analyzeOverflow([{ selector: ".card", axis: "x", overflow: 40 }]).score, 80);
     assert.equal(analyzeBreakpoints([]).score, 100);
-    assert.equal(
-      analyzeBreakpoints([{ breakpoint: "sm", viewport_width: 640, issue: "table overflows" }]).score,
-      75,
-    );
+    assert.equal(analyzeBreakpoints([{ breakpoint: "sm", viewport_width: 640, issue: "table overflows" }]).score, 75);
   });
 
   it("design-token, entropy, duplication, and component-reuse analyzers are deterministic", () => {
@@ -210,6 +214,9 @@ describe("uieng evidence capture + deterministic analyzers", () => {
   });
 
   it("toMetricScore rejects unknown metric ids", () => {
-    assert.throws(() => toMetricScore({ metricId: "bogus", score: 50, confidence: 0.5, evidence: [], details: "x" }), /Unknown metric id/);
+    assert.throws(
+      () => toMetricScore({ metricId: "bogus", score: 50, confidence: 0.5, evidence: [], details: "x" }),
+      /Unknown metric id/,
+    );
   });
 });
