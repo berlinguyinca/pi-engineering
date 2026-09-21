@@ -1,0 +1,11 @@
+# pi-engineering-stack control-plane build context hygiene.
+# Keeps the harness image build lean and prevents host state from leaking in.
+node_modules/
+.git/
+dist/
+docs/evidence/
+test/
+*.log
+.pi-eng/
+.spec-impl/
+*.zip

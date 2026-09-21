@@ -1,0 +1,235 @@
+/**
+ * Pure, mostly-pure status footer renderer.
+ *
+ * `renderStatus(state, width, config)` turns the structured `HarnessStatusState`
+ * into a single line. It NEVER executes git, network, or expensive token work —
+ * the footer reads precomputed state only.
+ *
+ * Responsive layout: segments have an explicit priority (highest first):
+ * throughput, model, branch, worktree, repository, directory. At narrower
+ * widths we abbreviate paths then elide segments from the lowest priority,
+ * always preserving model + TPS as long as practical. We never allow the line
+ * to wrap; the final fallback truncates to the terminal width.
+ */
+
+import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { contextReading } from "../context/usage.ts";
+import type { StatusBarConfig } from "./config.ts";
+import type { HarnessStatusState, TaskState, WaitState } from "./state.ts";
+
+const SEP = " │ ";
+
+export interface RenderSegment {
+  /** Display text (no ANSI). */
+  text: string;
+  /** Lower priority drops first. */
+  priority: number;
+}
+
+/**
+ * Render the status line. Returns a plain string (no ANSI); the footer layer
+ * applies theme styling. Never throws — on any unexpected input returns "".
+ */
+export function renderStatus(
+  state: HarnessStatusState,
+  width: number,
+  config: StatusBarConfig,
+  nowMs: number = Date.now(),
+): string {
+  try {
+    return renderUnsafe(state, width, config, nowMs);
+  } catch {
+    return "";
+  }
+}
+
+function renderUnsafe(state: HarnessStatusState, width: number, config: StatusBarConfig, nowMs: number): string {
+  const maxWidth = Math.max(0, width);
+
+  const throughputFull = formatThroughput(state, true, config);
+  const throughputShort = formatThroughput(state, false, config);
+
+  // Build the full and abbreviated segment lists (respecting config toggles).
+  const full: RenderSegment[] = [];
+  const short: RenderSegment[] = [];
+
+  if (config.showDirectory && state.cwd) {
+    full.push({ text: abbreviateHome(state.cwd), priority: 0 });
+    short.push({ text: leafOf(state.cwd), priority: 0 });
+  }
+  if (config.showRepository && state.repository) {
+    full.push({ text: state.repository, priority: 1 });
+    short.push({ text: shortRepo(state.repository), priority: 1 });
+  }
+  if (config.showWorktree && state.worktree) {
+    full.push({ text: state.worktree, priority: 2 });
+    short.push({ text: state.worktree, priority: 2 });
+  }
+  if (config.showBranch) {
+    const ref = formatBranch(state);
+    if (ref) {
+      full.push({ text: ref, priority: 3 });
+      short.push({ text: ref, priority: 3 });
+    }
+  }
+  if (config.showModel && state.model) {
+    full.push({ text: formatModel(state), priority: 5 });
+    short.push({ text: state.model, priority: 5 });
+  }
+  // Context reading sits right after the model because it qualifies the model:
+  // the number Pi resolved for this id, and how much of it is in use. It is
+  // dropped before the model itself when width runs out.
+  if (config.showContext && state.context) {
+    const reading = contextReading(state.context.usedTokens, state.context.windowTokens);
+    const mark = state.context.note ? `~` : "";
+    full.push({ text: `${mark}${reading.label}`, priority: 4 });
+    short.push({ text: reading.label, priority: 4 });
+  }
+  if (config.showThroughput && throughputFull) {
+    full.push({ text: throughputFull, priority: 6 });
+    short.push({ text: throughputShort ?? throughputFull, priority: 6 });
+  }
+  if (config.showTask && state.task) {
+    full.push({ text: formatTask(state.task, 32), priority: 7 });
+    short.push({ text: formatTask(state.task, 0), priority: 7 });
+  }
+  if (config.showWait && state.wait) {
+    const wait = formatWait(state.wait, nowMs);
+    full.push({ text: wait, priority: 8 });
+    short.push({ text: wait, priority: 8 });
+  }
+
+  // Progressive elision: try each stage until it fits.
+  const stages: RenderSegment[][] = [];
+  stages.push(full);
+  stages.push(short);
+  // Drop directory, then repository, then worktree, then branch, then the
+  // context reading.
+  stages.push(short.filter((s) => s.priority >= 1));
+  stages.push(short.filter((s) => s.priority >= 2));
+  stages.push(short.filter((s) => s.priority >= 3));
+  stages.push(short.filter((s) => s.priority >= 4));
+  // Then model, then throughput, then the task — the wait reason outlives all
+  // of them, because it is the only segment that explains an idle session.
+  stages.push(short.filter((s) => s.priority >= 5));
+  stages.push(short.filter((s) => s.priority >= 6));
+  stages.push(short.filter((s) => s.priority >= 7));
+  stages.push(short.filter((s) => s.priority >= 8));
+
+  for (const stage of stages) {
+    const line = assemble(stage);
+    if (visibleWidth(line) <= maxWidth) return line;
+  }
+
+  // Irreducible core (the wait reason, else model + tps). Truncate as a last
+  // resort so the line never wraps.
+  const core = assemble(stages[stages.length - 1]!);
+  if (visibleWidth(core) <= maxWidth) return core;
+  return truncateToWidth(core, maxWidth, "…");
+}
+
+function assemble(segments: RenderSegment[]): string {
+  return segments
+    .filter((s) => s.text.length > 0)
+    .map((s) => s.text)
+    .join(SEP);
+}
+
+function abbreviateHome(path: string): string {
+  const home = homeDir();
+  if (!home) return path;
+  if (path === home) return "~";
+  if (path.startsWith(`${home}/`) || path.startsWith(`${home}\\`)) return `~${path.slice(home.length)}`;
+  return path;
+}
+
+function leafOf(path: string): string {
+  const parts = path.split(/[\\/]+/).filter(Boolean);
+  return parts.length ? parts[parts.length - 1]! : path;
+}
+
+function shortRepo(repo: string): string {
+  const parts = repo.split("/").filter(Boolean);
+  return parts.length ? parts[parts.length - 1]! : repo;
+}
+
+function formatModel(state: HarnessStatusState): string {
+  if (state.provider && state.provider !== state.model) return `${state.provider}/${state.model}`;
+  return state.model!;
+}
+
+function formatBranch(state: HarnessStatusState): string | null {
+  if (state.branch) return state.branch;
+  if (state.detachedHead) return `@${state.detachedHead}`;
+  return null;
+}
+
+function formatThroughput(state: HarnessStatusState, full: boolean, config: StatusBarConfig): string | null {
+  const t = state.throughput;
+  if (!config.showThroughput) return null;
+  const rate =
+    t.phase === "streaming"
+      ? t.currentTokensPerSecond
+      : t.phase === "idle"
+        ? t.lastCompletedTokensPerSecond
+        : undefined;
+  if (t.phase === "waiting") return full ? "⚡ … t/s" : "⚡…";
+  if (rate == null) return null; // unavailable / nothing to show
+  if (full) return `⚡ ${rate.toFixed(1)} t/s`;
+  return `⚡${Math.round(rate)} t/s`;
+}
+
+/**
+ * "WI-12 implement · add retry to the gateway" — the abbreviated form drops the
+ * goal label, which is the first part worth losing under width pressure.
+ */
+function formatTask(task: TaskState, labelBudget: number): string {
+  const head = `${task.workItemId} ${task.phase}`;
+  if (labelBudget <= 0 || !task.label) return head;
+  const label = task.label.length > labelBudget ? task.label.slice(0, labelBudget).trimEnd() : task.label;
+  return `${head} · ${label}`;
+}
+
+/**
+ * "⏳ gateway 30s · queue_timeout" — rendered at the highest priority, so it is
+ * the last segment standing as the terminal narrows.
+ */
+/**
+ * Spinner frames for a hold. A still glyph reads as a hang, and a hold can now
+ * run for minutes (the gateway budget is unlimited), so the segment has to look
+ * alive. The frame is derived from the clock rather than an internal counter so
+ * `renderStatus` stays pure.
+ */
+const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const SPINNER_PERIOD_MS = 250;
+
+function spinnerFrame(nowMs: number): string {
+  const index = Math.floor(Math.max(0, nowMs) / SPINNER_PERIOD_MS) % SPINNER_FRAMES.length;
+  return SPINNER_FRAMES[index] ?? SPINNER_FRAMES[0]!;
+}
+
+function formatWait(wait: WaitState, nowMs: number): string {
+  const parts: string[] = [wait.kind];
+  if (wait.untilMs != null) {
+    const remainingMs = Math.max(0, wait.untilMs - nowMs);
+    parts.push(`${Math.ceil(remainingMs / 1000)}s`);
+  }
+  const head = parts.join(" ");
+  // Queue position beats the reason: it answers "is this moving?", which the
+  // reason ("queue_timeout") never does.
+  const detail =
+    wait.queued != null ? `queue ${wait.queued}${wait.queueLimit != null ? `/${wait.queueLimit}` : ""}` : wait.detail;
+  const spinner = spinnerFrame(nowMs);
+  return detail ? `${spinner} ${head} · ${detail}` : `${spinner} ${head}`;
+}
+
+let cachedHome: string | undefined;
+function homeDir(): string | undefined {
+  if (cachedHome !== undefined) return cachedHome;
+  try {
+    cachedHome = process.env.HOME || process.env.USERPROFILE || "";
+  } catch {
+    cachedHome = "";
+  }
+  return cachedHome || undefined;
+}

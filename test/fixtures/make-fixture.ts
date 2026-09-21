@@ -42,7 +42,63 @@ export async function makeFixtureRepo(): Promise<{ root: string; cleanup: () => 
 
   await exec("git", ["-C", root, "add", "-A"]);
   await exec("git", ["-C", root, "commit", "-q", "-m", "initial fixture"]);
-  return { root, cleanup: () => rm(root, { recursive: true, force: true }) };
+  return { root, cleanup: () => cleanupFixture(root) };
+}
+
+/**
+ * Remove the fixture repo AND the sibling worktrees GitRepo.createWorktree
+ * places next to it (`<tmpdir>/pi-eng-<shortHash(root>>-<branch>`).
+ *
+ * Those directories live OUTSIDE the repo root, so `rm(root)` leaves them
+ * behind. A run that isolates mutating tasks in worktrees therefore litters the
+ * system tmp dir with hundreds of stale trees, which slows later runs and makes
+ * worktree tests contend. The path prefix is derived from the fixture's own root
+ * with the same hash GitRepo uses, so this can never touch another repo's
+ * worktrees.
+ */
+async function cleanupFixture(root: string): Promise<void> {
+  const prefix = `pi-eng-${shortHash(root)}-`;
+  const parent = dirname(root);
+  await rmRetry(root);
+  try {
+    const { readdir } = await import("node:fs/promises");
+    for (const name of await readdir(parent)) {
+      if (name.startsWith(prefix)) {
+        await rm(join(parent, name), { recursive: true, force: true }).catch(() => {});
+      }
+    }
+  } catch {
+    // Best effort.
+  }
+}
+
+/**
+ * `rm -rf` a temporary tree, retrying briefly.
+ *
+ * Deleting a fixture repo can race with git activity still settling in its `.git`
+ * (worktree add/remove, branch updates), and `rm` then fails with ENOTEMPTY on a
+ * directory that was non-empty a moment ago and is empty a moment later. Under the
+ * parallel test runner this showed up as an intermittent red run whose only
+ * 'failure' was teardown. Retrying is the whole fix; the tree is ours to delete.
+ */
+async function rmRetry(target: string, attempts = 6): Promise<void> {
+  for (let i = 0; i < attempts; i++) {
+    try {
+      await rm(target, { recursive: true, force: true });
+      return;
+    } catch (err) {
+      const code = (err as { code?: string }).code;
+      if (i === attempts - 1 || (code !== "ENOTEMPTY" && code !== "EBUSY" && code !== "EPERM")) return;
+      await new Promise((r) => setTimeout(r, 25 * (i + 1)));
+    }
+  }
+}
+
+/** Mirrors GitRepo's path-shortening hash so cleanup matches its worktree paths. */
+function shortHash(input: string): string {
+  let h = 0;
+  for (let i = 0; i < input.length; i++) h = (h * 31 + input.charCodeAt(i)) | 0;
+  return Math.abs(h).toString(36);
 }
 
 async function mkdtemp(): Promise<string> {

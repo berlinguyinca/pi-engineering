@@ -117,8 +117,9 @@ async function handle(req, res, { store, token, logger, metrics }) {
     // store so a DB outage surfaces as 503 instead of a false healthy. ------
     if (method === "GET" && url.pathname === "/health") {
       try {
-        const n = (await store.recallAll()).length;
-        metrics.setRecords(n);
+        // Cheap liveness probe (store.health() = SELECT 1 / no-op), not a full
+        // table scan, so high-frequency health checks don't hammer the DB.
+        await store.health();
         metrics.observeRequest("GET", "/health", 200);
         sendJson(res, 200, { status: "ok" });
       } catch {
@@ -131,7 +132,8 @@ async function handle(req, res, { store, token, logger, metrics }) {
     // --- /metrics : Prometheus text format (unauthenticated for scraping) ---
     if (method === "GET" && url.pathname === "/metrics") {
       try {
-        metrics.setRecords((await store.recallAll()).length);
+        // Cheap count(*) gauge, not a full scan.
+        metrics.setRecords(await store.count());
       } catch {
         // records gauge stays at last known; service still reports itself up
       }

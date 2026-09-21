@@ -1,0 +1,115 @@
+{
+  "revision": "2026-09-15",
+  "files": [
+    {
+      "path": "IMPLEMENTATION_ORDER.md",
+      "sha256": "6fb2af4c27e049cb3add217e073f65b112c58de86874b7dfda73f321fcf067ee",
+      "bytes": 937
+    },
+    {
+      "path": "MASTER_SPEC.md",
+      "sha256": "03370e9c65af8753e056257e83ac0c3912a43e92f5de4d76bc6a9055424669ff",
+      "bytes": 8441
+    },
+    {
+      "path": "prompts/IMPLEMENT.md",
+      "sha256": "088a87ef02335e345f8391bfde33b48dc09d2d5a763099644651932f1eb97d15",
+      "bytes": 3354
+    },
+    {
+      "path": "specs/01-boundaries.md",
+      "sha256": "9e2827a9940d3eee3dd888eb8aab1a95917bd32239cad4947ff69fd259bf7d10",
+      "bytes": 353
+    },
+    {
+      "path": "specs/02-pi-web.md",
+      "sha256": "19a799d4e7e5c05ffe6613928a3c45fd8429bf446e409a246c3f6ae062f735f5",
+      "bytes": 393
+    },
+    {
+      "path": "specs/03-plannotator.md",
+      "sha256": "34bdec1aba6cfff6a9ac7439988fbf615746eecef5114b6264532015a53c51d2",
+      "bytes": 368
+    },
+    {
+      "path": "specs/04-subagents.md",
+      "sha256": "20d6f825018222dbc4f9a16bb6e64cb45c3ef25b7b3ec0a865ac6a6efca22493",
+      "bytes": 428
+    },
+    {
+      "path": "specs/05-workgraph.md",
+      "sha256": "5490765db434bf77df01b2462245f9faf84ac3a4d4458d800dbbc3ac7275672c",
+      "bytes": 348
+    },
+    {
+      "path": "specs/06-worktrees-review.md",
+      "sha256": "084b089c81d590765fba6701be51ab8dc1dd7050f69cecefd509f00b4e65282a",
+      "bytes": 374
+    },
+    {
+      "path": "specs/07-openviking.md",
+      "sha256": "ea77bd91533fc68a3a1b3a8f192277a895730de2abb70c2e56a7e126f2709fb1",
+      "bytes": 400
+    },
+    {
+      "path": "specs/08-blackhole.md",
+      "sha256": "90d33120c9afca98163d855d9652354af39c7f59656ef537b5ca4ee6739ed5f0",
+      "bytes": 400
+    },
+    {
+      "path": "specs/09-context-inferweave.md",
+      "sha256": "9618a3e68d8192e128d1b27f829a18ee44082c8621d642bc2255915c0dd114ff",
+      "bytes": 416
+    },
+    {
+      "path": "specs/10-routing.md",
+      "sha256": "924cfbc9dcc5ec7985079672cebc8f545bc49ac7b0e194a7b05cc68d0b8f9feb",
+      "bytes": 351
+    },
+    {
+      "path": "specs/11-security.md",
+      "sha256": "5d0f3bc97c8e77a27364050392000249cdd06ce35281b36df65fb0c725e12951",
+      "bytes": 446
+    },
+    {
+      "path": "specs/12-remote.md",
+      "sha256": "b4c6ba64319db717edd3d502c59ba3c4db2060e0b26363b5eb99417c3dc79f2c",
+      "bytes": 368
+    },
+    {
+      "path": "specs/13-observability.md",
+      "sha256": "7e9d93e68dc52907ba11512dace0eda7d8b1c536dbaa0d4c55f078df8c57c8d7",
+      "bytes": 468
+    },
+    {
+      "path": "specs/14-mcp.md",
+      "sha256": "d327b499d3524ab715cf528184414a8c35928dbc6ef7ceeff4734fe71f9b3401",
+      "bytes": 339
+    },
+    {
+      "path": "specs/15-autospec-ci.md",
+      "sha256": "f65a75cd9865e385a6376b97ff690bde1dff3917a6a168abedf756e7f2f2f81d",
+      "bytes": 385
+    },
+    {
+      "path": "specs/16-pi-forge.md",
+      "sha256": "b5c0cdaaee8f5adfccf21c23701ed680db8a6bf03e1140d376767e576d96c145",
+      "bytes": 374
+    },
+    {
+      "path": "specs/17-testing.md",
+      "sha256": "fca21d61afcf723d6b6146df8c8274e81028b2cd849afdf9f4ef8a3beda07774",
+      "bytes": 452
+    },
+    {
+      "path": "specs/18-deployment-migration.md",
+      "sha256": "b60762ab97b6924e4e28ab3126cd70524dd37982ba4fb8e916188d8342a24e47",
+      "bytes": 490
+    },
+    {
+      "path": "support/DECISIONS.md",
+      "sha256": "e35f16308b66a36902ba033ef84ef2ca247ecce530d6b3c0ae8bfd2e78dffd91",
+      "bytes": 917
+    }
+  ]
+}

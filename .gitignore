@@ -1,5 +1,6 @@
 # Dependencies
 node_modules/
+node_modules
 
 # Build output
 dist/
@@ -26,3 +27,4 @@ npm-debug.log*
 
 # pi-engineering-runtime durable state
 .pi-eng/
+rr*.ts

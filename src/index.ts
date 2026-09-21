@@ -1,4 +1,7 @@
 export * from "./core/types.ts";
+export * from "./platform/index.ts";
+export * from "./platform/security.ts";
+export * from "./platform/memoryOutbox.ts";
 export { id, newRunId } from "./core/ids.ts";
 export { EventStore } from "./ledger/EventStore.ts";
 export { Ledger } from "./ledger/Ledger.ts";
@@ -10,10 +13,20 @@ export type { VerificationProvider, VerificationProfile, VerifyOutcome, StageRun
 export type { WorkerExecutor, WorkerRequest, WorkerRun } from "./workers/WorkerExecutor.ts";
 export { PiWorkerExecutor } from "./workers/PiWorkerExecutor.ts";
 export { FakeWorkerExecutor } from "./workers/FakeWorkerExecutor.ts";
-export * from "./inference/index.ts";
 export { buildSystemPrompt, WORKER_KICKOFF } from "./workers/prompts.ts";
 export { workerResultTool } from "./workers/workerResultTool.ts";
+export { reviewResultTool } from "./lifecycle/reviewResultTool.ts";
 export { buildCoreTools } from "./tools/coreTools.ts";
+// Capability-aware model router (standalone; no lifecycle harness).
+export { createRoleRouter } from "./capability/adapter.ts";
+export type { RoleRouterAdapter, RouteAdapterOptions } from "./capability/adapter.ts";
+export { RoleRouter } from "./capability/router.ts";
+export { ModelCapabilityRegistry } from "./capability/registry.ts";
+export { ROLE_REQUIREMENTS } from "./capability/roles.ts";
+export type { RoleName } from "./capability/roles.ts";
+export { parseRef } from "./capability/router.ts";
+// InferWeave admission-retry subsystem.
+export * from "./inference/index.ts";
 export type { CoreServices } from "./tools/coreTools.ts";
 export { EngineeringRuntime } from "./runtime/EngineeringRuntime.ts";
 export type {
@@ -56,8 +69,161 @@ export { runBenchmark, evaluateBenchmark } from "./bench/Benchmark.ts";
 export type { BenchmarkMetrics, BenchmarkBaseline, BenchmarkVerdict } from "./bench/Benchmark.ts";
 export { AdapterRegistry } from "./adapters/Adapters.ts";
 export type { AutoSpecAdapter, InferWeaveAdapter } from "./adapters/Adapters.ts";
+// Orchestration module (spec pi-engineering-orchestration). Re-exported
+// explicitly to avoid colliding with the existing core/platform `TaskKind`,
+// `EntityId` and `AcceptanceCriterion` names. Full surface is available from
+// `src/orchestration/index.ts`.
+export {
+  canTransitionMission,
+  canTransitionTask,
+  assertMissionTransition,
+  assertTaskTransition,
+  pathMatchesPattern,
+  classifyFiles,
+  deriveRequiredGates,
+  mutationFactFromChangedFiles,
+  workflowRank,
+  classifyIntent,
+  workflowForIntent,
+  workflowMutatesRepo,
+  classifyRiskDefault,
+  IntentRouter,
+  MissionStore,
+  ExecutionBroker,
+  MissionScheduler,
+  classifyFailure,
+  domainsOverlap,
+  brokerKind,
+  assertAcyclic,
+  CompletionGate,
+  Integrator,
+  Orchestrator,
+} from "./orchestration/index.ts";
+export type {
+  MissionStatus,
+  WorkflowClass,
+  Intent,
+  RequiredGate,
+  RiskProfile,
+  Mission,
+  OrchestrationTask,
+  TaskStatus,
+  IsolationMode,
+  FailurePolicy,
+  ExecutionBackend,
+  ExecutionStatus,
+  Execution,
+  IntentResult,
+  ReviewFinding,
+  CompletionVerdict,
+  FileClass,
+  PolicyRule,
+  MutationFact,
+  AcceptanceCriterion as OrchestrationAcceptanceCriterion,
+  TaskKind as OrchestrationTaskKind,
+  EntityId as OrchestrationEntityId,
+  MissionCreateInput,
+  TaskCreateInput,
+  OrchestrationEvent,
+  OrchestrationEventType,
+  ExecutionRequestInput,
+  ExecutionHandle,
+  ExecutionOutcome,
+  SchedulerLimits,
+  ScheduledTaskResult,
+  SchedulerOptions as OrchestrationSchedulerOptions,
+  BrokerBackends,
+  BrokerOptions,
+  AgentRunner,
+  ProcessRunner,
+  ReviewRunner,
+  IntegrationRunner,
+  ValidationRunner,
+  OrchestratorOptions,
+  OrchestrateResult,
+  IntegratorInput,
+  GateEvidence,
+  IntentRouterOptions,
+  RouteInput,
+} from "./orchestration/index.ts";
 export { exportTelemetry, formatTelemetry } from "./telemetry/TelemetryExport.ts";
 export type { TelemetrySnapshot } from "./telemetry/TelemetryExport.ts";
+export {
+  GenerationGuard,
+  ModelDegenerationError,
+  normalizeSentence,
+  splitSentences,
+  splitCompleteSentences,
+  guardFeedFor,
+  RECOVERY_PROMPT,
+  TOOL_TRANSITION_RULE,
+  lowerReasoningEffort,
+  decideRecovery,
+  buildCompactedContext,
+  buildDegenerationEvent,
+  initialRecoveryTelemetry,
+  DEFAULT_GUARD_CONFIG,
+  resolveGuardConfig,
+} from "./guard/index.ts";
+export type {
+  GuardDecision,
+  GuardAbortReason,
+  ProgressEventType,
+  GenerationGuardState,
+  ReasoningEffort,
+  CompactionInput,
+  RecoveryDecision,
+  DegenerationEvent,
+  RecoveryTelemetry,
+  GenerationGuardConfig,
+  GuardProfile,
+  GuardFeed,
+} from "./guard/index.ts";
+export {
+  AdmissionController,
+  DEFAULT_GATEWAY_CONFIG,
+  decideGatewayRetry,
+  describeGatewayWait,
+  parseGatewayWait,
+  parseRetryAfterHeader,
+  resolveGatewayConfig,
+  sharedAdmissionController,
+  sharedGatewayConfig,
+} from "./gateway/index.ts";
+export type {
+  AdmissionControllerOptions,
+  AdmissionEvent,
+  AdmissionSlot,
+  AdmissionStatus,
+  GatewayAdmissionConfig,
+  GatewayRetryDecision,
+  GatewayWaitInput,
+  GatewayWaitSignal,
+} from "./gateway/index.ts";
+export { PanelState } from "./panel/PanelState.ts";
+export type {
+  PanelFileEntry,
+  PanelFinding,
+  PanelRunView,
+  PanelSectionError,
+  PanelSpend,
+  PanelStateShape,
+  PanelWorkspaceView,
+} from "./panel/PanelState.ts";
+export { buildRows, clampSelection, SECTION_IDS } from "./panel/tree.ts";
+export type { PanelRow, RowPayload } from "./panel/tree.ts";
+export { LedgerFeeder } from "./panel/feeders/LedgerFeeder.ts";
+export { WorkspaceFeeder, parseGitStatusShort } from "./panel/feeders/WorkspaceFeeder.ts";
+export {
+  MAX_CONTENT_BYTES,
+  MAX_CONTENT_LINES,
+  readDiffContent,
+  readFileContent,
+  toContentView,
+} from "./panel/content.ts";
+export type { ContentView } from "./panel/content.ts";
+export { PanelComponent } from "./panel/PanelComponent.ts";
+export { PanelController, matchesChord } from "./panel/PanelController.ts";
 export { BlackholeManager } from "./blackhole/BlackholeManager.ts";
 export type { BlackholeManagerOptions } from "./blackhole/BlackholeManager.ts";
 export { resolveBlackholeConfig } from "./blackhole/config.ts";

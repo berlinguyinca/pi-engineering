@@ -8,6 +8,7 @@ import { decidePromotion } from "../../src/blackhole/promotion.ts";
 import { blackholeTelemetry, formatBlackholeTelemetry } from "../../src/blackhole/telemetry.ts";
 import { PINNED_BLACKHOLE_VERSION, sessionKey } from "../../src/blackhole/types.ts";
 import { validateBlackholePackage } from "../../src/blackhole/versioning.ts";
+import { setTelemetrySink } from "../../src/telemetry/sink.ts";
 
 // ------------------------------------------------------------------ config
 
@@ -319,6 +320,73 @@ test("openviking provider: maps DurableMemoryProvider onto an HTTP contract", as
 test("openviking provider: fails closed when unconfigured", async () => {
   const { OpenVikingProvider } = await import("../../src/blackhole/durable.ts");
   assert.throws(() => new OpenVikingProvider({ baseUrl: "" }), /baseUrl/);
+});
+
+test("openviking provider: warns once on auth failure but still fail-closes to empty", async () => {
+  const { OpenVikingProvider } = await import("../../src/blackhole/durable.ts");
+  const warns: string[] = [];
+  // Diagnostics moved off `console.warn` onto the telemetry sink, so that inside
+  // Pi they become a wrapped, severity-coloured notice instead of a raw line
+  // written under the TUI's own frame.
+  const restore = setTelemetrySink((notice) => warns.push(notice.text));
+  try {
+    const fetchFn = async () => ({ ok: false, status: 401, json: async () => [] }) as never;
+    const prov = new OpenVikingProvider({ baseUrl: "http://ov.example", fetch: fetchFn as never });
+    // repeated failures warn once per op+status, and always return [] (fail-closed)
+    assert.deepEqual(await prov.recallAll(), []);
+    assert.deepEqual(await prov.recallAll(), []);
+    const recallWarns = warns.filter((w) => w.includes("recall"));
+    assert.equal(recallWarns.length, 1, "recall warns once");
+    assert.match(recallWarns[0]!, /401/);
+    assert.match(recallWarns[0]!, /token/i);
+    assert.deepEqual(await prov.search("x"), []);
+    const searchWarns = warns.filter((w) => w.includes("search"));
+    assert.equal(searchWarns.length, 1, "search warns once");
+  } finally {
+    restore();
+  }
+});
+
+test("openviking provider: warns once on network unreachable (fetch throws) and fail-closes", async () => {
+  const { OpenVikingProvider } = await import("../../src/blackhole/durable.ts");
+  const warns: string[] = [];
+  // Diagnostics moved off `console.warn` onto the telemetry sink, so that inside
+  // Pi they become a wrapped, severity-coloured notice instead of a raw line
+  // written under the TUI's own frame.
+  const restore = setTelemetrySink((notice) => warns.push(notice.text));
+  try {
+    const fetchFn = async () => {
+      throw new Error("ECONNREFUSED");
+    };
+    const prov = new OpenVikingProvider({ baseUrl: "http://ov.example", fetch: fetchFn as never });
+    assert.deepEqual(await prov.recallAll(), []);
+    assert.deepEqual(await prov.recallAll(), []);
+    assert.equal(warns.length, 1, "warns once per unreachable outcome");
+    assert.match(warns[0]!, /unreachable/i);
+    assert.match(warns[0]!, /recall/);
+  } finally {
+    restore();
+  }
+});
+
+test("openviking provider: warns once on a 200 with a non-array body and fail-closes", async () => {
+  const { OpenVikingProvider } = await import("../../src/blackhole/durable.ts");
+  const warns: string[] = [];
+  // Diagnostics moved off `console.warn` onto the telemetry sink, so that inside
+  // Pi they become a wrapped, severity-coloured notice instead of a raw line
+  // written under the TUI's own frame.
+  const restore = setTelemetrySink((notice) => warns.push(notice.text));
+  try {
+    // e.g. an SSO/captive-portal proxy answering 200 with HTML, not a JSON array
+    const fetchFn = async () => ({ ok: true, status: 200, json: async () => ({ not: "an array" }) }) as never;
+    const prov = new OpenVikingProvider({ baseUrl: "http://ov.example", fetch: fetchFn as never });
+    assert.deepEqual(await prov.recallAll(), []);
+    assert.deepEqual(await prov.recallAll(), []);
+    assert.equal(warns.length, 1, "warns once per unexpected-body outcome");
+    assert.match(warns[0]!, /non-array body/i);
+  } finally {
+    restore();
+  }
 });
 
 test("blackhole manager: provider outage degrades hydration to empty (never fails worker)", async () => {

@@ -1,28 +1,569 @@
+- id: dogfood-everyday-memory
+  milestone: __global__
+  type: dogfood
+  status: pass
+  commit: 1d693e7e33c622f5319889d845e5d7507308f70e
+  generatedAt: 2026-09-14T23:26:36.560031+00:00
+  paths:
+    - src/
+    - extensions/
+  proof: docs/evidence/everyday-memory/verification.md
+  summary: Real Viking command and fresh-chat recall roundtrip; temporary note
+    removed; deterministic roadmap lifecycle dogfood passed.
+- id: review-everyday-memory
+  milestone: __global__
+  type: fresh_review
+  status: pass
+  commit: 1d693e7e33c622f5319889d845e5d7507308f70e
+  generatedAt: 2026-09-14T23:26:36.560031+00:00
+  paths:
+    - src/
+    - extensions/
+    - test/
+  proof: docs/evidence/everyday-memory/verification.md
+  summary: Independent feature-delta review from accepted baseline 1716585; all
+    findings resolved; 73 targeted tests and diagnostics passed.
+  findings:
+    critical: 0
+    high: 0
+- id: dogfood-everyday-memory-footer
+  milestone: __global__
+  type: dogfood
+  status: pass
+  commit: 7bf3d64f6e5d340877abfabaa22c4adc74ecadb7
+  generatedAt: 2026-09-14T23:34:47.156913+00:00
+  paths:
+    - src/
+    - extensions/
+    - test/
+  proof: docs/evidence/everyday-memory/verification.md
+  summary: Verified everyday-memory rollout plus integration with accepted
+    status-bar change 50ec1fb; full suite and independent integration review
+    passed.
+- id: fresh_review-everyday-memory-footer
+  milestone: __global__
+  type: fresh_review
+  status: pass
+  commit: 7bf3d64f6e5d340877abfabaa22c4adc74ecadb7
+  generatedAt: 2026-09-14T23:34:47.156913+00:00
+  paths:
+    - src/
+    - extensions/
+    - test/
+  proof: docs/evidence/everyday-memory/verification.md
+  summary: Verified everyday-memory rollout plus integration with accepted
+    status-bar change 50ec1fb; full suite and independent integration review
+    passed.
+  findings:
+    critical: 0
+    high: 0
+- id: dogfood-gateway-wait
+  milestone: __global__
+  type: dogfood
+  status: pass
+  commit: 7a2d37b92e18cb94ed909893a99ab8d423daecc8
+  generatedAt: 2026-09-16T03:41:21.026Z
+  paths: &a1
+    - src/
+    - extensions/
+    - test/
+  proof: scripts/dogfood-gateway-wait.ts + dogfood-self-update.ts +
+    dogfood-narrator.ts + dogfood-roadmap.ts;
+    docs/evidence/gateway-wait/verification.md
+  summary: Gateway saturation, /gateway, context-safe fallback, /refresh-models,
+    self-update and an always-on panel; nine fresh-context reviews, zero
+    critical and zero high, all findings fixed; dogfooded against the operator's
+    live gateway and real git checkouts.
+- id: review-gateway-wait
+  milestone: __global__
+  type: fresh_review
+  status: pass
+  commit: 7a2d37b92e18cb94ed909893a99ab8d423daecc8
+  generatedAt: 2026-09-16T03:41:21.026Z
+  paths: *a1
+  proof: scripts/fresh-review-gateway-wait.ts gateway (x3), models, update (x2),
+    surface; docs/evidence/gateway-wait/verification.md
+  summary: Gateway saturation, /gateway, context-safe fallback, /refresh-models,
+    self-update and an always-on panel; nine fresh-context reviews, zero
+    critical and zero high, all findings fixed; dogfooded against the operator's
+    live gateway and real git checkouts.
+  findings:
+    critical: 0
+    high: 0
+- id: dogfood-panel-telemetry-platform
+  milestone: __global__
+  type: dogfood
+  status: pass
+  commit: 1d326d5bce5004411ead0a7a245bdba6fe2d0ace
+  generatedAt: 2026-09-16T17:37:47.515Z
+  paths: &a2
+    - src/
+    - extensions/
+    - scripts/
+    - test/
+  proof: scripts/dogfood-gateway-wait.ts, scripts/dogfood-self-update.ts,
+    scripts/dogfood-panel-surface.ts, scripts/dogfood-roadmap.ts (all pass); npm
+    run test:e2e and npm run platform:e2e; scripts/dogfood-narrator.ts
+    INCONCLUSIVE (the operator's gateway refused admission, 45 queued against a
+    limit of 4 — the live model path produced a real narrative earlier in the
+    same session)
+  summary: "Engineering panel (always-on, non-capturing, coloured, openable
+    commits), telemetry routed off raw stderr so diagnostics no longer tear the
+    TUI frame, and the platform control plane. Four fresh-context reviews:
+    surface, telemetry, and two Opus reviews of src/platform. Every critical and
+    high finding fixed with a regression test, including outbox and event-store
+    data loss, missing registry replay, unhandled emit rejections killing the
+    process, credential disclosure in the control-plane snapshot, and the
+    control server binding every interface unauthenticated. Several tests were
+    found to pin the bugs they appeared to cover and were corrected. NOT
+    covered: per-project authorization (ProjectAuth is implemented and tested
+    but wired to nothing; the control server's token is a deployment control
+    only)."
+- id: review-panel-telemetry-platform
+  milestone: __global__
+  type: fresh_review
+  status: pass
+  commit: 1d326d5bce5004411ead0a7a245bdba6fe2d0ace
+  generatedAt: 2026-09-16T17:37:47.515Z
+  paths: *a2
+  proof: Two independent fresh-context Opus reviews of src/platform
+    (durability/state and untrusted-input/secrets), plus
+    scripts/fresh-review-gateway-wait.ts surface and telemetry areas; all 7
+    critical and 10 high findings fixed, each with a regression test
+  summary: "Engineering panel (always-on, non-capturing, coloured, openable
+    commits), telemetry routed off raw stderr so diagnostics no longer tear the
+    TUI frame, and the platform control plane. Four fresh-context reviews:
+    surface, telemetry, and two Opus reviews of src/platform. Every critical and
+    high finding fixed with a regression test, including outbox and event-store
+    data loss, missing registry replay, unhandled emit rejections killing the
+    process, credential disclosure in the control-plane snapshot, and the
+    control server binding every interface unauthenticated. Several tests were
+    found to pin the bugs they appeared to cover and were corrected. NOT
+    covered: per-project authorization (ProjectAuth is implemented and tested
+    but wired to nothing; the control server's token is a deployment control
+    only)."
+  findings:
+    critical: 0
+    high: 0
+- id: dogfood-inferweave-context
+  milestone: __global__
+  type: dogfood
+  status: pass
+  commit: 16fd3eea8afdf74aea0599517a6fa416159c9420
+  generatedAt: 2026-09-17T01:57:36.448Z
+  paths: &a3
+    - src/context/
+    - src/status/
+    - extensions/index.ts
+    - test/unit/context-capability.test.ts
+    - test/unit/context-client.test.ts
+    - test/unit/context-provider.test.ts
+    - test/unit/context-status.test.ts
+    - test/integration/extension-context-switch-guard.test.ts
+    - scripts/dogfood-inferweave-context.ts
+    - scripts/fresh-review-inferweave-context.ts
+  proof: scripts/dogfood-inferweave-context.ts — six phases against a real
+    node:http gateway (both base-URL spellings, 304 revalidation, stale-if-error
+    on a destroyed socket, the 128K floor, the switch planner), exit 0
+  summary: "InferWeave dynamic context integration: capability client
+    (single-flight shared refresh, ETag/304, stale-if-error, bounded cache),
+    provider (guaranteed-routable -> contextWindow, advertised output ->
+    maxTokens, one base URL with /v1 exactly once, safe/unsafe overrides), usage
+    planner (compact/reject/none on model switch), and the status-bar ctx
+    segment with the model-switch guard. Dogfood proves it end to end against a
+    real HTTP gateway; the fresh-context review found no critical/high and its
+    six medium/low findings (stale footer window across a switch to an unknown
+    model, untrimmed override fields, the guard silently disabled with the
+    status bar off, a 200-with-no-fields wiping last-known-good, unbounded
+    cache) are fixed, each with a regression test. Not covered: live-fleet
+    shadow validation (needs the node gateway rollout), and the provider's
+    per-model maps remain unbounded like the gateway's listing (the client cache
+    is bounded at 1024)."
+- id: review-inferweave-context
+  milestone: __global__
+  type: fresh_review
+  status: pass
+  commit: 16fd3eea8afdf74aea0599517a6fa416159c9420
+  generatedAt: 2026-09-17T01:57:36.448Z
+  paths: *a3
+  proof: scripts/fresh-review-inferweave-context.ts context — fresh-context
+    reviewer with no inherited reasoning; 0 critical / 0 high; 2 medium + 4 low,
+    every one fixed with a regression test in the same commit
+  summary: "InferWeave dynamic context integration: capability client
+    (single-flight shared refresh, ETag/304, stale-if-error, bounded cache),
+    provider (guaranteed-routable -> contextWindow, advertised output ->
+    maxTokens, one base URL with /v1 exactly once, safe/unsafe overrides), usage
+    planner (compact/reject/none on model switch), and the status-bar ctx
+    segment with the model-switch guard. Dogfood proves it end to end against a
+    real HTTP gateway; the fresh-context review found no critical/high and its
+    six medium/low findings (stale footer window across a switch to an unknown
+    model, untrimmed override fields, the guard silently disabled with the
+    status bar off, a 200-with-no-fields wiping last-known-good, unbounded
+    cache) are fixed, each with a regression test. Not covered: live-fleet
+    shadow validation (needs the node gateway rollout), and the provider's
+    per-model maps remain unbounded like the gateway's listing (the client cache
+    is bounded at 1024)."
+  findings:
+    critical: 0
+    high: 0
+- id: dogfood-stale-context-fallback
+  milestone: __global__
+  type: dogfood
+  status: pass
+  commit: 6596c709923f183dc1ce6419b054b698141b0fe5
+  generatedAt: 2026-09-17T09:26:08.000Z
+  paths: &a4
+    - src/gateway/fallbackLifecycle.ts
+    - src/status/footer.ts
+    - extensions/index.ts
+    - test/unit/gateway-fallback-lifecycle.test.ts
+    - scripts/dogfood-stale-context-fallback.ts
+    - scripts/fresh-review-stale-context-fallback.ts
+  proof: scripts/dogfood-stale-context-fallback.ts — deterministic scripted 429
+    inference_admission gateway driving the REAL installGatewayStreamRetry pump
+    + FallbackCoordinator + applyPendingFallback, wired exactly as
+    extensions/index.ts; 5 phases, exit 0
+  summary: "Stale ExtensionCommandContext crash fix: the gateway retry pump is
+    driven with the exact 429 inference_admission envelope and onHold/onProgress
+    wired to the coordinator as extensions/index.ts does. Phase 1: the reported
+    retry_after_ms (30000) is honoured and the turn retries to success — the
+    operator never sees the 429. Phase 2: a hold that fires after session
+    replacement never dereferences the stale ctx (a ctx that throws on access,
+    like assertActive, is never read). Phase 3: the pending fallback arms at the
+    threshold and applies only on the fresh ctx — the stale session is never
+    read, written, or notified. Phase 4: a throwing setModel is caught by the
+    detached boundary, not fatal. Phase 5: a 500-hold admission storm keeps the
+    state machine consistent and switches at most once."
+- id: review-stale-context-fallback
+  milestone: __global__
+  type: fresh_review
+  status: pass
+  commit: 6596c709923f183dc1ce6419b054b698141b0fe5
+  generatedAt: 2026-09-17T09:26:08.000Z
+  paths: *a4
+  proof: scripts/fresh-review-stale-context-fallback.ts (worker-based; deferred at
+    record time — the configured gateway was saturated, 30s+ timeouts on every
+    model call, the failure mode under review). Manual fresh-context review
+    performed against the actual code and Pi's own extension runner source,
+    which verifies ctx.model is an assertActive getter (runner.js:532) and that
+    the hold path reads only the captured plain Model (id/provider), never a ctx
+    getter. 0 critical / 0 high; 1 medium (fallback was fire-and-forget from
+    before_agent_start, risking a mid-turn setModel), fixed to await so the
+    switch lands before the turn's first provider call.
+  summary: "Stale-context fallback review: verified no retained Pi context
+    (latestCtx removed, no equivalent), onHold writes only plain data, the
+    fallback runs only from a fresh lifecycle ctx, model_select and
+    session_shutdown clear the coordinator, multiple holds arm at most one
+    pending fallback with an idempotent claim, the detached promise is caught,
+    and existing gateway retry/admission/threshold/notification semantics are
+    preserved. FooterController.refreshGit no longer propagates a rejecting
+    git.resolve to its detached callers. Findings: 0 critical, 0 high, 1 medium
+    (fixed)."
+  findings:
+    critical: 0
+    high: 0
+- id: dogfood-panel-context-surface
+  milestone: __global__
+  type: dogfood
+  status: pass
+  commit: 103f80965c9a6ec55c9c6f3437e6a30b8fa03fd0
+  generatedAt: 2026-09-17T15:42:00.333Z
+  paths: &a5
+    - src/context/
+    - src/gateway/
+    - src/status/
+    - src/telemetry/
+    - src/panel/
+    - extensions/
+    - test/
+  proof: scripts/dogfood-panel-surface.ts (width contract vs real Theme, no
+    terminal writes) + scripts/dogfood-roadmap.ts (full lifecycle, PASS); npm
+    run typecheck, npm run lint, npm test (1148 pass)
+  summary: Panel + context + gateway-fallback + status + telemetry surface review
+    and dogfood at HEAD
+- id: review-panel-context-surface
+  milestone: __global__
+  type: fresh_review
+  status: pass
+  commit: 103f80965c9a6ec55c9c6f3437e6a30b8fa03fd0
+  generatedAt: 2026-09-17T15:42:00.333Z
+  paths: *a5
+  proof: Focused fresh review of src/context (capability/client/provider/usage),
+    src/gateway (fallbackLifecycle, admissionNotice), src/status (footer,
+    ambient), src/telemetry (sink), src/panel, and extensions/ wiring. Reviewed
+    single-flight/stale-if-error/abort handling, fallback lifecycle safety
+    (plain-data state, fresh-ctx application), width contract, telemetry sink
+    stack. Found 0 critical, 0 high; fixed one redundant ternary in
+    src/context/usage.ts.
+  summary: Panel + context + gateway-fallback + status + telemetry surface review
+    and dogfood at HEAD
+  findings:
+    critical: 0
+    high: 0
+- id: dogfood-panel-collapse
+  milestone: __global__
+  type: dogfood
+  status: pass
+  commit: 1f2b7e0b1578bcf907bd3aa3e50da9d34457d0af
+  generatedAt: 2026-09-17T17:18:01.907Z
+  paths: &a6
+    - src/panel/
+    - extensions/index.ts
+    - test/unit/panel-controller.test.ts
+    - test/unit/panel-focus-hint.test.ts
+  proof: scripts/dogfood-panel-surface.ts + scripts/dogfood-roadmap.ts (both exit
+    0); npm run typecheck; npm run lint; npm test (1152 pass)
+  summary: Add ctrl+b to collapse/uncollapse the whole engineering panel
+    (PI_PANEL_TOGGLE_CHORD). Keeps ctrl+p = focus-step, escape = release focus.
+    ctrl+b shadows pi's own cursor-left while the extension is active
+    (documented; configurable to none), consistent with the panel's existing
+    ctrl+p shadowing of pi's model-cycle. Dogfooded deterministically (panel
+    surface vs real Theme, roadmap lifecycle) plus full suite (1152 pass);
+    fresh-context review found 0 critical / 0 high.
+- id: review-panel-collapse
+  milestone: __global__
+  type: fresh_review
+  status: pass
+  commit: 1f2b7e0b1578bcf907bd3aa3e50da9d34457d0af
+  generatedAt: 2026-09-17T17:18:01.907Z
+  paths: *a6
+  proof: fresh-context review of src/panel/PanelController.ts + PanelComponent.ts
+    + extensions/index.ts + panel tests; verified toggle() restores focus via
+    handle.hide() on collapse, chords independently configurable to none; 0
+    critical / 0 high
+  summary: Add ctrl+b to collapse/uncollapse the whole engineering panel
+    (PI_PANEL_TOGGLE_CHORD). Keeps ctrl+p = focus-step, escape = release focus.
+    ctrl+b shadows pi's own cursor-left while the extension is active
+    (documented; configurable to none), consistent with the panel's existing
+    ctrl+p shadowing of pi's model-cycle. Dogfooded deterministically (panel
+    surface vs real Theme, roadmap lifecycle) plus full suite (1152 pass);
+    fresh-context review found 0 critical / 0 high.
+  findings:
+    critical: 0
+    high: 0
+- id: dogfood-panel-session-narration
+  milestone: __global__
+  type: dogfood
+  status: pass
+  commit: 4f2b7d7876f6fda79ddb357172cedce253dc33c4
+  generatedAt: 2026-09-17T18:12:24.058Z
+  paths: &a7
+    - src/panel/feeders/LedgerFeeder.ts
+    - extensions/index.ts
+    - test/unit/panel-ledger-feeder.test.ts
+    - test/unit/panel-narrator.test.ts
+    - test/unit/panel-narrator-deltas.test.ts
+  proof: scripts/dogfood-panel-surface.ts + scripts/dogfood-roadmap.ts (both exit
+    0); npm run typecheck; npm run lint; npm test (1154 pass)
+  summary: "Panel tracks the whole session, not just /engineer runs: narrator also
+    summarises idle working-tree changes (on by default), and a settled run
+    stays visible (marked settled) so its Reviews/Tokens/Session survive. Docs
+    corrected (narrator on by default). Dogfooded deterministically + full suite
+    (1154 pass); fresh review 0 critical / 0 high."
+- id: review-panel-session-narration
+  milestone: __global__
+  type: fresh_review
+  status: pass
+  commit: 4f2b7d7876f6fda79ddb357172cedce253dc33c4
+  generatedAt: 2026-09-17T18:12:24.058Z
+  paths: *a7
+  proof: fresh-context review of LedgerFeeder.onPhase (settle keeps the run,
+    marked settled) + extensions/index.ts startNarrator subscription (idle
+    workspace narration, phase-gated); verified bounded spend, later run resets,
+    narrator debounce/gate unchanged; 0 critical / 0 high
+  summary: "Panel tracks the whole session, not just /engineer runs: narrator also
+    summarises idle working-tree changes (on by default), and a settled run
+    stays visible (marked settled) so its Reviews/Tokens/Session survive. Docs
+    corrected (narrator on by default). Dogfooded deterministically + full suite
+    (1154 pass); fresh review 0 critical / 0 high."
+  findings:
+    critical: 0
+    high: 0
+- id: dogfood-orchestration
+  milestone: __global__
+  type: dogfood
+  status: pass
+  commit: b592d49dcab6c2fdb49c68624b922015e14e5bd0
+  generatedAt: 2026-09-17T19:03:28.542Z
+  paths: &a8
+    - src/orchestration/
+    - extensions/index.ts
+    - src/tools/coreTools.ts
+    - src/runtime/EngineeringRuntime.ts
+    - src/platform/ControlPlane.ts
+    - src/index.ts
+  proof: scripts/dogfood-panel-surface.ts + scripts/dogfood-roadmap.ts (exit 0);
+    tsc --noEmit; biome check; smoke-load.ts OK; full suite 1212 pass / 0 fail
+  summary: "Mission orchestration vertical slice (spec
+    pi-engineering-orchestration) reusing runtime primitives: intent router,
+    mission store, DAG scheduler, execution broker with worktree isolation,
+    deterministic completion gate, PI WEB mission snapshot + /mission tool +
+    auto-invoke. Fixed pi.on smoke-load crash. Dogfooded + 1212 tests pass;
+    fresh review 0 critical / 0 high."
+- id: review-orchestration
+  milestone: __global__
+  type: fresh_review
+  status: pass
+  commit: b592d49dcab6c2fdb49c68624b922015e14e5bd0
+  generatedAt: 2026-09-17T19:03:28.542Z
+  paths: *a8
+  proof: "fresh-context review of orchestration subsystem (src/orchestration/:
+    orchestrator, broker, scheduler, completionGate, realBackends, missionStore,
+    intentRouter) + extension auto-invoke + mission tool + runtime wiring. Fixed
+    one critical (unguarded pi.on crashed smoke-load; wrapped in typeof guard).
+    Verified deterministic completion gate (validation+independent review
+    required, blocking findings block), worktree isolation for mutating tasks,
+    DI-backed testability, DAG concurrency with write-domain conflict
+    serialization. 0 critical / 0 high remaining."
+  summary: "Mission orchestration vertical slice (spec
+    pi-engineering-orchestration) reusing runtime primitives: intent router,
+    mission store, DAG scheduler, execution broker with worktree isolation,
+    deterministic completion gate, PI WEB mission snapshot + /mission tool +
+    auto-invoke. Fixed pi.on smoke-load crash. Dogfooded + 1212 tests pass;
+    fresh review 0 critical / 0 high."
+  findings:
+    critical: 0
+    high: 0
+- id: dogfood-capability-inference-review
+  milestone: __global__
+  type: dogfood
+  status: pass
+  commit: 592d704a643bf3b37bb3a769448d8e399c1a4082
+  generatedAt: 2026-09-17T19:59:16.544Z
+  paths: &a9
+    - src/capability/
+    - src/inference/
+    - src/lifecycle/reviewResultTool.ts
+    - src/lifecycle/types.ts
+    - src/lifecycle/policy.ts
+    - src/lifecycle/rolePrompts.ts
+    - src/workers/PiWorkerExecutor.ts
+    - src/workers/WorkerExecutor.ts
+    - src/workers/localProviders.ts
+    - src/index.ts
+  proof: scripts/dogfood-panel-surface.ts + scripts/dogfood-roadmap.ts (exit 0);
+    tsc --noEmit; biome check; smoke-load.ts OK; npm test (1231 pass, 1
+    pre-existing parallel-timing flake unrelated to change)
+  summary: "Selective merge of the capability-aware model router, InferWeave
+    admission-retry subsystem, and structured review_result tool into the worker
+    executor — WITHOUT the auto-invoking engineering harness (which competes
+    with mission orchestration #21). Verified + 1231 tests pass; fresh review 0
+    critical / 0 high."
+- id: review-capability-inference-review
+  milestone: __global__
+  type: fresh_review
+  status: pass
+  commit: 592d704a643bf3b37bb3a769448d8e399c1a4082
+  generatedAt: 2026-09-17T19:59:16.544Z
+  paths: *a9
+  proof: "fresh-context review of the selective merge: capability router
+    (discovery/registry/policy/RoleRouter + standalone adapter producing worker
+    modelOverride), InferWeave admission subsystem (config, retry-delay
+    precedence, event bus/metrics, transport), review_result tool +
+    WorkerRequest additive fields wired through PiWorkerExecutor
+    (resultTool/kickoff/modelOverride/images/structured) and localProviders
+    (admission streamSimple). Deliberately excludes the auto-invoking
+    LifecycleHarness. Additive, non-competing, DI-backed, deterministic unit
+    tests. 0 critical / 0 high."
+  summary: "Selective merge of the capability-aware model router, InferWeave
+    admission-retry subsystem, and structured review_result tool into the worker
+    executor — WITHOUT the auto-invoking engineering harness (which competes
+    with mission orchestration #21). Verified + 1231 tests pass; fresh review 0
+    critical / 0 high."
+  findings:
+    critical: 0
+    high: 0
+- id: dogfood-deflake-parallel-tests
+  milestone: __global__
+  type: dogfood
+  status: pass
+  commit: 1da6e5537ecdba1793ee6f5ffc5fc56e0f1fdc7b
+  generatedAt: 2026-09-17T20:29:56.069Z
+  paths: &a10
+    - test/integration/blackhole.test.ts
+    - test/integration/dag-parallel.test.ts
+    - test/integration/vertical-slice.test.ts
+    - test/integration/orchestrator-e2e.test.ts
+    - test/unit/orchestration-scheduler.test.ts
+  proof: scripts/dogfood-panel-surface.ts + scripts/dogfood-roadmap.ts (exit 0);
+    tsc --noEmit; biome check; full test suite 1232 pass / 0 fail across 5
+    consecutive runs (was intermittently flaking 1 test)
+  summary: "De-flake parallel-overlap assertions with a deterministic barrier: 5
+    parallel-tournament/DAG tests now assert overlap deterministically instead
+    of by wall-clock timing. Full suite green 5/5 consecutive runs. 0 critical /
+    0 high."
+- id: review-deflake-parallel-tests
+  milestone: __global__
+  type: fresh_review
+  status: pass
+  commit: 1da6e5537ecdba1793ee6f5ffc5fc56e0f1fdc7b
+  generatedAt: 2026-09-17T20:29:56.069Z
+  paths: *a10
+  proof: "fresh-context review of the de-flake change: replaced wall-clock-sleep
+    overlap assertions (maxActive>=2 / peak>1) with a deterministic
+    parallelBarrier (workers block until N arrive or timeout) across 5
+    parallel-tournament/DAG tests. Overlap is now guaranteed when the runtime
+    dispatches in parallel; assertion fails only if it genuinely serializes.
+    Test-only, no production behavior change. 0 critical / 0 high."
+  summary: "De-flake parallel-overlap assertions with a deterministic barrier: 5
+    parallel-tournament/DAG tests now assert overlap deterministically instead
+    of by wall-clock timing. Full suite green 5/5 consecutive runs. 0 critical /
+    0 high."
+  findings:
+    critical: 0
+    high: 0
 - id: dogfood-1.0
   milestone: __global__
   type: dogfood
   status: pass
-  commit: 73d0fcfca83d43df345a75194beeba958c536317
-  generatedAt: 2026-09-14T00:25:30.326Z
-  paths:
-    - src/
-  proof: scripts/dogfood-roadmap.ts + real-repo roadmap check
-  summary: deterministic roadmap lifecycle dogfood; release gate reachable at HEAD
+  commit: 18362d0bf065ba4612e4da43f74a40668e378eba
+  generatedAt: 2026-09-18T00:15:04.937Z
+  paths: &a11
+    - src/orchestration
+    - src/roadmap
+    - src/runtime
+    - src/platform
+    - src/tools
+    - extensions
+    - test/fixtures
+    - scripts
+  proof: "scripts/dogfood-orchestration.ts: 24/24 checks pass (exit 0) against
+    real EngineeringRuntime over git fixtures; npm test 1249 pass / 0 fail on
+    four consecutive full runs; orchestration suites 74/74; tsc --noEmit clean;
+    biome check clean; test:e2e COMMANDS OK + package load OK (21 commands, 7
+    tools)"
+  summary: "Orchestration completion-gate integrity: exitStatus is authoritative;
+    worktree work is harvested and merged before validation and review;
+    completion requires the checkout to differ from the mission's fork point;
+    unmerged work is preserved on its branch and reported; late failures are
+    never masked by earlier successes; recording evidence no longer invalidates
+    the evidence milestone, so the roadmap release gate can pass."
 - id: review-1.0
   milestone: __global__
   type: fresh_review
   status: pass
-  commit: 73d0fcfca83d43df345a75194beeba958c536317
-  generatedAt: 2026-09-14T00:25:30.326Z
-  paths:
-    - src/roadmap/
-    - src/blackhole/
-    - src/benchmark/
-    - services/
-  proof: scripts/fresh-review-roadmap.ts + scripts/fresh-review-blackhole.ts +
-    scripts/fresh-review-blackhole-fixes.ts +
-    scripts/fresh-review-openviking-service.ts
-  summary: fresh-context review at HEAD; unresolved findings 0 critical, 0 high
+  commit: 18362d0bf065ba4612e4da43f74a40668e378eba
+  generatedAt: 2026-09-18T00:15:04.937Z
+  paths: *a11
+  proof: "Five sequential fresh-context reviews of src/orchestration/
+    (orchestrator, broker, scheduler, completionGate, state) and watchableScope
+    in src/roadmap/RoadmapEngine.ts via an independent PiWorkerExecutor session
+    (read/grep only), plus an independent pre-merge review of the branch diff.
+    Findings fixed: passive early return bypassing the completion gates;
+    worktree-isolated work discarded so a mutating mission could COMPLETE with
+    the repository unchanged; success inferred from a resolved promise instead
+    of exitStatus so a failing suite satisfied the validation gate and a
+    conflicted merge satisfied integration; execute() unguarded in
+    runSingleTask; empty base_ref skipping the landed-change invariant;
+    conflicted integration discarding the only copy of the worker's work;
+    millisecond-timestamp supersession masking a late failure. Final review: no
+    remaining critical or high findings (verdict LOW)."
+  summary: "Orchestration completion-gate integrity: exitStatus is authoritative;
+    worktree work is harvested and merged before validation and review;
+    completion requires the checkout to differ from the mission's fork point;
+    unmerged work is preserved on its branch and reported; late failures are
+    never masked by earlier successes; recording evidence no longer invalidates
+    the evidence milestone, so the roadmap release gate can pass."
   findings:
     critical: 0
     high: 0

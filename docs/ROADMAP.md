@@ -321,6 +321,21 @@ recall into worker context; session TTL GC; and a native-vs-Blackhole A/B
 benchmark that generates a report + **12 SVG plots** and preserves raw JSONL/CSV
 (`docs/evidence/blackhole/`). See `docs/evidence/milestone-blackhole.md`.
 
+## Harness live status bar (implemented)
+
+`docs/specs/pi-engineering-harness-live-status-bar-spec.md` is implemented into
+the existing `pi-engineering-harness` extension. The harness owns the Pi footer
+through a single composable `FooterController` (`src/status/footer.ts`) — no
+competing `setFooter` calls. It shows the current directory, canonical repo,
+git worktree, branch/detached ref, active provider/model, and live output
+tokens/sec while streaming. A rolling 2.5s window computes TPS from
+authoritative cumulative-token samples (char-estimate fallback when the
+provider doesn't report tokens), preserves the last completed TPS while idle,
+and reconciles to the authoritative `usage.output` at `message_end`. Layout is
+responsive (progressive elision by priority, always preserving model + TPS, no
+wrapping); git is cached and never resolved during a render (streaming rerenders
+add zero subprocesses). See `docs/evidence/milestone-harness-status-bar.md`.
+
 ## Next slice
 
 Roadmap 1.0 (23/23) is complete. Remaining backlog is genuinely external

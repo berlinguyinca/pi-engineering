@@ -29,10 +29,29 @@ The pipeline runs **asynchronously** with progress notifications:
    and the ledger records it. Material findings spawn a fix round (a child
    candidate) instead.
 
+## Orchestration missions (automatic, no slash command required)
+
+Normal-language intent automatically invokes the orchestration workflow through
+the semantic `mission` tool. An optional `/mission <request>` command runs the
+same pipeline explicitly (correctness never depends on it). See
+[`docs/orchestration.md`](orchestration.md) for the full design.
+
+```bash
+/mission Add a health endpoint
+/mission Find out why login fails
+/mission-status
+```
+
+The pipeline routes intent, creates a durable **mission**, plans/executes
+workers, runs validation, launches a fresh independent reviewer, and enforces
+the deterministic completion gate — no `/engineer` or `/review` needed.
+
 ## Individual commands
 
 | Command        | Effect                                                        |
 | -------------- | ------------------------------------------------------------- |
+| `/mission G`   | Orchestration mission pipeline (intent → plan → execute → validate → review → complete). |
+| `/mission-status` | Show orchestration mission/task/execution status.          |
 | `/engineer G`  | Full adaptive workflow (scout → implement → verify → review). |
 | `/tournament G [n]` | Candidate tournament: n independent implementations, verify+review each, promote the deterministic winner (default 3, `--parallel` opt-in). |
 | `/plan G`      | Decompose `G` into a dependency-aware task DAG (recorded in the ledger). |
@@ -184,3 +203,50 @@ node scripts/smoke-engineer.ts  <repo> "your goal"     # full real /engineer
 
 These require a configured model endpoint (pi's normal model config). The
 deterministic unit/integration tests do **not** require a model.
+
+## InferWeave context capabilities (optional)
+
+When the workspace has an InferWeave gateway, the harness can take model context
+sizes from the gateway instead of a static config, and show context pressure in
+the status footer. Enable it by pointing at the gateway:
+
+```bash
+export INFERWEAVE_BASE_URL=http://gw.internal:8787/v1   # enables the integration
+export INFERWEAVE_PROVIDER=inferweave                    # provider id shown in /model
+export INFERWEAVE_TTL_SECONDS=300                        # capability cache TTL
+export INFERWEAVE_STALE_SECONDS=3600                     # stale-if-error bound
+export INFERWEAVE_TIMEOUT_MS=5000                        # refresh deadline
+export INFERWEAVE_MAX_CAPABILITY_LOOKUPS=8               # per-refresh cap on per-model capability fetches
+# Optional explicit windows; `unsafe` is required to exceed the gateway guarantee:
+export INFERWEAVE_MODEL_CONTEXT="qwen3.8-27b=262144:32768,small-model=32768"
+```
+
+What that buys you:
+
+- **Discovery through Pi's own `refreshModels` hook.** `contextWindow` becomes
+  the gateway's *guaranteed routable* context and `maxTokens` its advertised
+  output maximum, so a 1M deployment is not squeezed to 262 144 and a 262 144
+  deployment is not promised 1M. Nothing is forked or patched in Pi core, and Pi's
+  native compaction (including overflow recovery) stays in charge — the harness
+  does not summarize anything itself.
+- **One shared capability client per process**, with ETag revalidation, TTL,
+  timeout, `AbortSignal` and stale-if-error, so a fan-out of subagents does not
+  stampede `/v1/models`.
+- **A context reading in the existing status footer**, next to the model:
+  `… │ acme/qwen3.8-27b │ ctx 143k/262k 55% │ ⚡ 31.0 t/s`. It renders the window
+  the capability layer resolved for the *selected* model, so switching models
+  changes the number. `PI_STATUS_BAR_SHOW_CONTEXT=0` hides the segment; the other
+  `PI_STATUS_BAR_*` knobs are unchanged.
+- **A model-switch guard.** Switching to a narrower window compacts through Pi
+  before the next request; a switch into a window that cannot hold the session is
+  refused with a reason instead of failing later as an upstream error.
+- **`/iw-context [model]`** prints the resolved window and which rule produced it
+  (`guaranteed_routable_tokens`, `context_window`, `max_model_len`,
+  `local_override`, `last_known_good`, `conservative_fallback`), the capability
+  generation, age, source, staleness, heterogeneity, and any refused unsafe
+  override.
+
+Without `INFERWEAVE_BASE_URL` the integration is inert and the footer shows
+context only when Pi reports a window. The floor when nothing trustworthy is
+known is **128 000** tokens — never 260 000/262 144, which came from an admission
+implementation rather than from any model.

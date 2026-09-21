@@ -12,10 +12,20 @@ import {
   terminalAssistantMessage,
 } from "../../src/inference/admissionTransport.ts";
 
-/** Deterministic clock + interruptible sleep for the state machine. */
+/**
+ * Deterministic clock + interruptible sleep for the state machine.
+ *
+ * The state machine registers each sleep asynchronously, so a test cannot
+ * rely on advancing the clock at the exact moment the transport awaits. This
+ * clock therefore accumulates `credit` on advance(): a sleep resolves
+ * immediately (consuming credit) when it is registered after the advance, and
+ * pending wakeups fire on the next advance. Both patterns are deterministic.
+ */
 class FakeClock {
   time = 0;
   readonly waits: { ms: number; signal?: AbortSignal }[] = [];
+  /** Pre-advanced ms not yet consumed by a sleep. */
+  private credit = 0;
   private readonly wakeups: Map<number, () => void> = new Map();
   private nextId = 1;
 
@@ -26,6 +36,11 @@ class FakeClock {
   sleep(ms: number, signal?: AbortSignal): Promise<void> {
     this.waits.push({ ms, signal });
     if (signal?.aborted) return Promise.reject(Object.assign(new Error("aborted"), { name: "AbortError" }));
+    if (this.credit >= ms) {
+      this.credit -= ms;
+      this.time += ms;
+      return Promise.resolve();
+    }
     return new Promise((resolve, reject) => {
       const id = this.nextId++;
       this.wakeups.set(id, () => {
@@ -36,13 +51,13 @@ class FakeClock {
     });
   }
 
-  /** Advance the clock, firing any scheduled wakeups (and aborting if signalled). */
+  /** Advance the clock, adding credit and firing any pending wakeups. */
   advance(ms: number): void {
-    const target = this.time + ms;
-    for (const fn of [...this.wakeups.values()]) fn();
-    this.time = target;
-    // Wakeups scheduled for this advance resolve now.
-    for (const fn of [...this.wakeups.values()]) fn();
+    this.credit += ms;
+    for (const fn of [...this.wakeups.values()]) {
+      this.wakeups.clear();
+      fn();
+    }
   }
 }
 
@@ -204,9 +219,13 @@ test("admission contract: a single 429 then success succeeds after one wait", as
 });
 
 test("acceptance: four 30s queue_timeout waits then a successful stream", async () => {
-  const { stream, clock, bus } = runTransport({ rejections: 4 });
+  // Subscribe before the transport starts (it publishes attempt-1 `started`
+  // synchronously while constructing), so every attempt is observed.
+  const clock = new FakeClock();
+  const bus = new AdmissionEventBus();
   const events: AdmissionEvent[] = [];
   bus.subscribe((e) => events.push(e));
+  const { stream } = runTransport({ rejections: 4, clock, bus });
 
   clock.advance(30_000);
   clock.advance(30_000);
@@ -246,9 +265,11 @@ test("max attempts: a persistent rejection exhausts the attempt budget", async (
     base_backoff_ms: 2_000,
     jitter_ratio: 0,
   });
-  const { stream, clock, bus } = runTransport({ config, rejections: 999 });
+  const clock = new FakeClock();
+  const bus = new AdmissionEventBus();
   const events: AdmissionEvent[] = [];
   bus.subscribe((e) => events.push(e));
+  const { stream } = runTransport({ config, rejections: 999, clock, bus });
 
   clock.advance(60_000);
   clock.advance(60_000);
@@ -515,9 +536,11 @@ test("shared budget ledger: an outer re-entrant request fails fast after exhaust
   assert.equal(secondResult.terminal.type, "error");
   // No additional waits happened for the second request.
   assert.equal(clock.waits.length, 2);
-  const exhausted = bus.events().filter((e) => e.name === "inference.retry.exhausted");
-  assert.equal(exhausted.length, 2);
-  assert.equal(exhausted[1]!.terminatedBy, "budget_ledger");
+  // `budget_ledger` is a fallback-class terminal: it emits fallback.triggered,
+  // not retry.exhausted.
+  const fallbacks = bus.events().filter((e) => e.name === "inference.fallback.triggered");
+  assert.equal(fallbacks.length, 2);
+  assert.equal(fallbacks[1]!.terminatedBy, "budget_ledger");
 });
 
 test("events carry structured fields for telemetry and metrics", async () => {
@@ -530,7 +553,8 @@ test("events carry structured fields for telemetry and metrics", async () => {
   await collect(stream);
 
   const snapshot = metrics.snapshot();
-  assert.equal(snapshot.retries, 2);
+  // `retries` counts every started attempt (2 rejections + 1 success).
+  assert.equal(snapshot.retries, 3);
   assert.ok(snapshot.waitMs >= 60_000);
   assert.equal(snapshot.successAfterRetry, 1);
   assert.ok(snapshot.byReason.some((r) => r.reason === "queue_timeout"));

@@ -11,3 +11,5 @@ Convention for additional specs:
 ```
 YYYY-MM-DD-<topic>-design.md
 ```
+
+- [`2026-09-15-engineering-panel-and-status-design.md`](./2026-09-15-engineering-panel-and-status-design.md) — Engineering overlay panel + live status footer (task, model, wait reason)

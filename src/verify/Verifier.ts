@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
-import { readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { access, readFile } from "node:fs/promises";
+import { basename, join } from "node:path";
 import { promisify } from "node:util";
 import type { ArtifactStore } from "../artifacts/ArtifactStore.ts";
 import type { Evidence, EvidenceTrust } from "../core/types.ts";
@@ -37,6 +37,15 @@ export interface VerifyOutcome {
   stages: StageRun[];
   evidence: Evidence[];
   failedStage: string | null;
+  /**
+   * True when the repo declared no verification targets at all (no scripts and
+   * no resolvable JS entry file). This is NOT a pass: it means nothing was
+   * actually verified, so the completion gate must not treat it as passing
+   * evidence. It exists so the verifier can report an honest, distinct outcome
+   * instead of a doomed `node --check index.js` stage that hard-fails every
+   * scriptless repo.
+   */
+  noTargets: boolean;
 }
 
 /**
@@ -109,9 +118,93 @@ export function tokenizeCommand(script: string): { command: string; args: string
  * over a stale IPC fd) instead of running as real commands — a silent false
  * pass for verification. We never want that inheritance.
  */
-function cleanEnv(): NodeJS.ProcessEnv {
+/**
+ * Resolve the nearest `node_modules/.bin` directory by walking up from `cwd`.
+ * The verifier spawns commands via execFile with bare binary names (e.g. `tsc`,
+ * `biome`, `eslint`) parsed out of npm scripts. Those binaries live in a
+ * repository's local `node_modules/.bin`, which is NOT on the ambient PATH when
+ * the runtime itself is launched directly with `node` (rather than via `npm`).
+ * Without this, every deterministic gate would spuriously fail with ENOENT even
+ * when the underlying tool works — silently blocking integration/validation for
+ * correctly-landed work.
+ */
+async function localBinDir(cwd: string): Promise<string | null> {
+  let dir = cwd;
+  for (;;) {
+    const bin = join(dir, "node_modules", ".bin");
+    try {
+      await access(bin);
+      return bin;
+    } catch {
+      /* continue walking up */
+    }
+    const parent = dir.split("/").slice(0, -1).join("/");
+    if (parent === dir || parent.length === 0) return null;
+    dir = parent;
+  }
+}
+
+/**
+ * Resolve a real JS entry file to syntax-check when a repo declares no scripts.
+ * Prefers package.json `main`/`exports["."]`/`bin`, then conventional
+ * `index.js`/`src/index.js`. Returns a path relative to the repo root (or an
+ * absolute path), or null when no such file exists. Never returns a path that
+ * does not exist, so the caller cannot emit a doomed syntax-check stage.
+ */
+async function resolveJsEntry(
+  cwd: string,
+  pkg: { main?: string; exports?: unknown; bin?: unknown },
+): Promise<string | null> {
+  const candidates: string[] = [];
+  const add = (v: unknown): void => {
+    if (typeof v === "string" && v && !v.endsWith(".json")) candidates.push(v);
+  };
+  add(pkg.main);
+  const exportsObj = pkg.exports;
+  if (exportsObj && typeof exportsObj === "object" && !Array.isArray(exportsObj)) {
+    const dot = (exportsObj as Record<string, unknown>)["."];
+    if (typeof dot === "string") add(dot);
+    else if (dot && typeof dot === "object") {
+      const imp = (dot as Record<string, unknown>).import;
+      const req = (dot as Record<string, unknown>).require;
+      add(imp);
+      add(req);
+    }
+  }
+  const bin = pkg.bin;
+  if (bin && typeof bin === "object") for (const v of Object.values(bin)) add(v);
+  else add(bin);
+  candidates.push("index.js", "src/index.js", "lib/index.js");
+
+  for (const cand of candidates) {
+    const abs = join(cwd, cand);
+    try {
+      await access(abs);
+      return basename(cand) === "index.js" ? cand : cand;
+    } catch {
+      /* keep looking */
+    }
+  }
+  return null;
+}
+
+/**
+ * Child-process env with the node test-runner IPC context stripped, plus the
+ * nearest `node_modules/.bin` (resolved from `cwd`) prepended to PATH so bare
+ * local tool binaries resolve. When the runtime itself runs under `node --test`,
+ * spawned `node` commands inherit NODE_TEST_CONTEXT and would otherwise behave
+ * as test children (reporting over a stale IPC fd) instead of running as real
+ * commands — a silent false pass for verification. We never want that inheritance.
+ */
+async function cleanEnv(cwd: string): Promise<NodeJS.ProcessEnv> {
   const env = { ...process.env };
   delete env.NODE_TEST_CONTEXT;
+  const bin = await localBinDir(cwd);
+  if (bin) {
+    const pathKey = Object.keys(env).find((k) => k.toUpperCase() === "PATH") ?? "PATH";
+    const existing = (env[pathKey] as string | undefined) ?? "";
+    env[pathKey] = existing ? `${bin}${process.platform === "win32" ? ";" : ":"}${existing}` : bin;
+  }
   return env;
 }
 
@@ -155,12 +248,16 @@ export class CommandVerifier implements VerificationProvider {
     const { key, pkg } = await this.cacheKey(cwd, full);
     const cached = this.profileCache.get(key);
     if (cached) return cached;
-    const profile = this.buildProfile(pkg, full);
+    const profile = await this.buildProfile(pkg, full, cwd);
     this.profileCache.set(key, profile);
     return profile;
   }
 
-  private buildProfile(pkg: { scripts?: Record<string, string> }, full: boolean): VerificationProfile {
+  private async buildProfile(
+    pkg: { scripts?: Record<string, string>; main?: string; exports?: unknown; bin?: unknown },
+    full: boolean,
+    cwd: string,
+  ): Promise<VerificationProfile> {
     const scripts = pkg.scripts ?? {};
     const stages: VerifyStage[] = [];
 
@@ -186,12 +283,20 @@ export class CommandVerifier implements VerificationProvider {
       push("test:full", scripts["test:full"] ?? scripts["test:all"]);
     }
     if (stages.length === 0) {
-      stages.push({
-        name: "node-syntax",
-        command: "node",
-        args: ["--check", "index.js"],
-        required: false,
-      });
+      // No declared scripts. Only fall back to a syntax check if a real JS
+      // entry file exists — otherwise the stage is doomed to ENOENT and would
+      // hard-fail every scriptless repo (finding FINDING-2CcenM). Prefer the
+      // package.json entry points, then conventional index files.
+      const entry = await resolveJsEntry(cwd, pkg);
+      if (entry) {
+        stages.push({
+          name: "node-syntax",
+          command: "node",
+          args: ["--check", entry],
+          required: false,
+          cwd,
+        });
+      }
     }
     return { name: full ? "detected-full" : "detected", stages };
   }
@@ -211,7 +316,7 @@ export class CommandVerifier implements VerificationProvider {
           cwd: stage.cwd ?? cwd,
           timeout: stage.timeoutMs ?? 300_000,
           maxBuffer: 16 * 1024 * 1024,
-          env: cleanEnv(),
+          env: await cleanEnv(stage.cwd ?? cwd),
         });
         stdout = res.stdout;
         stderr = res.stderr;
@@ -274,7 +379,11 @@ export class CommandVerifier implements VerificationProvider {
     // pass with zero passing evidence. This keeps "evidence is machine output"
     // honest: passed=true implies at least one deterministic stage actually
     // succeeded.
-    const passed = failedStage === null && stageRuns.length > 0 && stageRuns.some((s) => s.passed);
-    return { passed, stages: stageRuns, evidence, failedStage };
+    const noTargets = stageRuns.length === 0;
+    // A repo with no declared verification targets is NOT a pass (nothing was
+    // actually verified) and NOT a doomed hard-fail. Report it as a distinct
+    // honest outcome so callers can decide how to gate (finding FINDING-2CcenM).
+    const passed = !noTargets && failedStage === null && stageRuns.length > 0 && stageRuns.some((s) => s.passed);
+    return { passed, stages: stageRuns, evidence, failedStage, noTargets };
   }
 }

@@ -30,6 +30,9 @@ const stubPi: StubApi = {
 (extension as (pi: StubApi) => void)(stubPi);
 
 const expectedCommands = [
+  "update",
+  "gateway",
+  "refresh-models",
   "engineer",
   "tournament",
   "plan",
@@ -40,6 +43,8 @@ const expectedCommands = [
   "review",
   "challenge",
   "roadmap-status",
+  "remember",
+  "memory",
 ];
 const missingCommands = expectedCommands.filter((c) => !commands.has(c));
 const expectedTools = ["ledger_read", "ledger_claim", "artifact_read", "repo_search", "symbol", "tests_for"];

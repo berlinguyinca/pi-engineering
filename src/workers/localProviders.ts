@@ -10,6 +10,7 @@ import {
   createAdmissionStreamSimple,
 } from "../inference/admissionTransport.ts";
 import type { AdmissionScope } from "../inference/admissionTransport.ts";
+import { emitTelemetry } from "../telemetry/sink.ts";
 
 /**
  * Standalone provider discovery for the worker runtime.
@@ -214,9 +215,10 @@ export async function registerLocalProviders(
     const declared = node.models ?? [];
     const { kept, heldOut } = partitionByToolSupport(declared, verdicts);
     if (heldOut.length && !allowNoTools) {
-      console.warn(
-        `localProviders: holding ${node.provider}/${heldOut.join(", ")} out of the lane (no OpenAI tool_calls); set QWEN_ALLOW_NO_TOOLS=1 to register anyway`,
-      );
+      emitTelemetry({
+        level: "warning",
+        text: `localProviders: holding ${node.provider}/${heldOut.join(", ")} out of the lane (no OpenAI tool_calls); set QWEN_ALLOW_NO_TOOLS=1 to register anyway`,
+      });
     }
     const usable = allowNoTools ? declared : kept;
     if (usable.length === 0) continue; // nothing this worker can safely be pointed at

@@ -1,0 +1,239 @@
+/**
+ * Control-plane adapter — the pi-engineering side of the Pi Web integration
+ * (spec 02/08).
+ *
+ * Pi Web is an EXTERNAL operator UI. This module is the normalized adapter that
+ * exposes projects, runs, workers, events, tests, reviews, routing/memory status
+ * and interventions as a single JSON contract that an existing Pi Web
+ * deployment (or any operator client) consumes. It does NOT build a Pi Web
+ * frontend/backend. It reads from the pi-engineering-owned state: the
+ * ProjectRegistry, WorkGraph and the shared EventStore backend.
+ *
+ * If a UI feature is absent upstream, that is documented as a Pi Web gap — not
+ * re-implemented here.
+ */
+
+import type { MissionStore } from "../orchestration/missionStore.ts";
+import type { Execution, Mission, OrchestrationTask } from "../orchestration/types.ts";
+import { type ProjectRegistry, normalizeRemote } from "./ProjectRegistry.ts";
+import type { WorkGraph } from "./WorkGraph.ts";
+import type { EventStoreBackend } from "./eventstore/backend.ts";
+import type { ApprovalRecord } from "./types.ts";
+
+export interface ControlPlaneSnapshot {
+  generatedAt: string;
+  workspace: { id: string; name: string };
+  projects: Array<{
+    id: string;
+    name: string;
+    canonicalRemote: string | null;
+    riskClass: string;
+    multiRepo: boolean;
+    /**
+     * No `root`, no worktree paths, and only the canonical remote.
+     *
+     * This shape is served over the network. The previous one carried the raw
+     * registered remote — `https://user:ghp_TOKEN@host/repo` for an ordinary
+     * PAT clone — plus absolute host paths for the repository and every
+     * worktree.
+     */
+    repositories: Array<{ id: string; remote: string | null; worktreeCount: number }>;
+  }>;
+  runs: Array<{
+    id: string;
+    projectId: string;
+    workItemId: string | null;
+    goal: string;
+    status: string;
+    parentRunId: string | null;
+    startedAt: string;
+    finishedAt: string | null;
+    approval: ApprovalRecord | null;
+  }>;
+  workers: Array<{
+    id: string;
+    runId: string | null;
+    projectId: string;
+    role: string;
+    status: string;
+    model: string | null;
+    worktree: string | null;
+    location: { host: string; remote: boolean };
+    heartbeatAt: string | null;
+    generation: number;
+  }>;
+  /** Normalized event feed (bounded) for the operator client. */
+  events: Array<{
+    eventId: string;
+    type: string;
+    projectId: string | null;
+    runId: string | null;
+    workerId: string | null;
+    timestamp: string;
+    payload: Record<string, unknown>;
+  }>;
+  /** Orchestration missions surfaced to the operator (spec 08). */
+  missions: Array<{
+    id: string;
+    title: string;
+    goal: string;
+    workflowClass: string;
+    status: string;
+    riskProfile: string;
+    constraints: string[];
+    acceptanceCriteria: Array<{ criterion: string; status: string }>;
+    requiredGates: string[];
+    tasks: Array<{ id: string; kind: string; role: string; status: string; objective: string }>;
+    executions: Array<{ id: string; backend: string; status: string }>;
+  }>;
+  /** High-level health rollup (no chain-of-thought; only observable state). */
+  health: {
+    projects: number;
+    activeRuns: number;
+    activeWorkers: number;
+    staleWorkers: number;
+    missions: number;
+    activeMissions: number;
+    memory: { openviking: boolean; blackhole: boolean };
+  };
+}
+
+export interface ControlPlaneInputs {
+  registry: ProjectRegistry;
+  graph: WorkGraph;
+  store: EventStoreBackend;
+  /** Optional orchestration MissionStore surfaced to the operator. */
+  missionStore?: MissionStore | null;
+  /** Optional external status flags reported by the adapter. */
+  memoryStatus?: { openviking: boolean; blackhole: boolean };
+}
+
+/** Bounds for the normalized event feed exposed to the operator client. */
+const MAX_EVENTS = 500;
+const STALE_HEARTBEAT_MS = 30_000;
+
+export class ControlPlane {
+  private readonly registry: ProjectRegistry;
+  private readonly graph: WorkGraph;
+  private readonly store: EventStoreBackend;
+  private readonly missionStore: MissionStore | null;
+  private readonly memoryStatus: { openviking: boolean; blackhole: boolean };
+
+  constructor(inputs: ControlPlaneInputs) {
+    this.registry = inputs.registry;
+    this.graph = inputs.graph;
+    this.store = inputs.store;
+    this.missionStore = inputs.missionStore ?? null;
+    this.memoryStatus = inputs.memoryStatus ?? { openviking: true, blackhole: true };
+  }
+
+  snapshot(): ControlPlaneSnapshot {
+    const events = this.store
+      .all()
+      .slice(-MAX_EVENTS)
+      .map((e) => ({
+        eventId: e.event_id,
+        type: e.type,
+        projectId: e.project_id,
+        runId: e.run_id,
+        workerId: e.worker_id,
+        timestamp: e.timestamp,
+        payload: e.payload,
+      }));
+
+    const activeRuns = this.graph.listRuns().filter((r) => !["COMPLETED", "FAILED", "CANCELLED"].includes(r.status));
+    const activeWorkers = this.graph
+      .listWorkers()
+      .filter((w) => ["IDLE", "BOOTSTRAPPING", "RUNNING", "WAITING", "RECOVERING"].includes(w.status));
+    const stale = this.graph.staleWorkers(STALE_HEARTBEAT_MS);
+
+    return {
+      generatedAt: new Date().toISOString(),
+      workspace: this.registry.getWorkspace(),
+      projects: this.registry.listProjects().map((p) => ({
+        id: p.id,
+        name: p.name,
+        canonicalRemote: p.canonicalRemote,
+        riskClass: p.riskClass,
+        multiRepo: p.multiRepo,
+        // The CANONICAL remote, and no filesystem paths.
+        //
+        // `remote` was the raw string the caller registered, which for the
+        // ordinary CI/PAT clone shape is `https://user:ghp_TOKEN@host/repo` —
+        // handed to anyone who could reach this endpoint. `root` and
+        // `worktrees` disclosed absolute host paths for the same audience.
+        // Worktrees are reported as a COUNT: the number is the operational
+        // fact (how many are checked out), the paths are not.
+        repositories: this.registry.listRepositories(p.id).map((r) => ({
+          id: r.id,
+          remote: normalizeRemote(r.remote),
+          worktreeCount: r.worktreeRoots.length,
+        })),
+      })),
+      runs: this.graph.listRuns().map((r) => ({
+        id: r.id,
+        projectId: r.projectId,
+        workItemId: r.workItemId,
+        goal: r.goal,
+        status: r.status,
+        parentRunId: r.parentRunId,
+        startedAt: r.started_at,
+        finishedAt: r.finished_at,
+        approval: r.approval,
+      })),
+      workers: this.graph.listWorkers().map((w) => ({
+        id: w.id,
+        runId: w.runId,
+        projectId: w.projectId,
+        role: w.role,
+        status: w.status,
+        model: w.model,
+        worktree: w.worktree,
+        location: w.location,
+        heartbeatAt: w.heartbeat_at,
+        generation: w.generation,
+      })),
+      events,
+      missions: this.snapshotMissions(),
+      health: {
+        projects: this.registry.listProjects().length,
+        activeRuns: activeRuns.length,
+        activeWorkers: activeWorkers.length,
+        staleWorkers: stale.length,
+        missions: this.missionStore?.listMissions().length ?? 0,
+        activeMissions:
+          this.missionStore?.listMissions().filter((m) => !["COMPLETE", "FAILED", "CANCELED"].includes(m.status))
+            .length ?? 0,
+        memory: { ...this.memoryStatus },
+      },
+    };
+  }
+
+  /** Surface orchestration missions/tasks/executions (spec 08 mission panel). */
+  private snapshotMissions(): ControlPlaneSnapshot["missions"] {
+    if (!this.missionStore) return [];
+    return this.missionStore.listMissions().map((m: Mission) => ({
+      id: m.mission_id,
+      title: m.title,
+      goal: m.goal,
+      workflowClass: m.workflow_class,
+      status: m.status,
+      riskProfile: m.risk_profile,
+      constraints: m.constraints,
+      acceptanceCriteria: m.acceptance_criteria.map((c) => ({ criterion: c.criterion, status: c.status })),
+      requiredGates: m.required_gates,
+      tasks: this.missionStore!.listTasks(m.mission_id).map((t: OrchestrationTask) => ({
+        id: t.task_id,
+        kind: t.kind,
+        role: t.role,
+        status: t.status,
+        objective: t.objective,
+      })),
+      executions: this.missionStore!.listExecutions(m.mission_id).map((e: Execution) => ({
+        id: e.execution_id,
+        backend: e.backend,
+        status: e.status,
+      })),
+    }));
+  }
+}

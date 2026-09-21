@@ -232,21 +232,12 @@ export class LifecycleHarness {
     this.telemetry = LifecycleTelemetry.file(`${persistDir}/telemetry.jsonl`, policy.lifecycle.telemetry);
     this.visionCache = await VisionCache.open(`${persistDir}/vision-cache.json`, policy.vision.cache);
 
-    this.executor = new PiWorkerExecutor({
-      agentDir: this.opts.agentDir,
-      ...(policy.inference?.retry?.admission
-        ? {
-            admission: {
-              config: this.admissionConfig,
-              events: this.admissionBus,
-              budget: this.admissionBudget ?? undefined,
-              onSaturation: (ref, saturation) => this.registry?.recordSaturation(ref, admissionLoad(saturation)),
-            },
-            admissionEvents: this.admissionBus,
-          }
-        : {}),
-    });
-    const modelRuntime = await this.executor.runtime();
+    // The worker executor on main uses the process-wide gateway admission
+    // controller for backpressure, so no inference admission options are passed
+    // here; the interactive-session admission-retry install below still covers
+    // the session registry.
+    this.executor = new PiWorkerExecutor({ agentDir: this.opts.agentDir });
+    const modelRuntime = await this.executor.getModelRuntime();
 
     // Wire admission-retry: event bus -> telemetry + metrics + status UI, and
     // wrap the session's own provider registry so interactive inference also

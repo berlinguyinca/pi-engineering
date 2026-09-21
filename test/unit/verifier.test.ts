@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { test } from "node:test";
 import { ArtifactStore } from "../../src/artifacts/ArtifactStore.ts";
 import { CommandVerifier, tokenizeCommand } from "../../src/verify/Verifier.ts";
@@ -9,7 +9,9 @@ import { CommandVerifier, tokenizeCommand } from "../../src/verify/Verifier.ts";
 async function makeProject(files: Record<string, string>): Promise<string> {
   const dir = await mkdtemp(join(tmpdir(), "pi-eng-ver-"));
   for (const [p, content] of Object.entries(files)) {
-    await writeFile(join(dir, p), content);
+    const abs = join(dir, p);
+    await mkdir(dirname(abs), { recursive: true });
+    await writeFile(abs, content);
   }
   return dir;
 }
@@ -138,10 +140,12 @@ test("verifier runs quoted test args instead of silently passing (regression)", 
   }
 });
 
-test("verifier never reports pass with zero passing stages (review HIGH #1)", async () => {
-  // Repo with no typecheck/test/build scripts -> detect falls back to a
-  // NON-required 'node --check index.js' stage, and index.js does not exist, so
-  // the only stage fails. This must NOT be reported as a clean pass.
+test("scriptless repo without a JS entry is reported as noTargets, not a doomed stage (FINDING-2CcenM)", async () => {
+  // Repo with no typecheck/test/build scripts AND no index.js. Previously
+  // detect emitted a doomed 'node --check index.js' stage that always failed,
+  // hard-failing every scriptless repo. Now it emits no stage and reports an
+  // honest noTargets outcome: NOT a pass (nothing was verified) and NOT a
+  // hard-fail.
   const dir = await makeProject({
     "package.json": JSON.stringify({}),
   });
@@ -149,10 +153,77 @@ test("verifier never reports pass with zero passing stages (review HIGH #1)", as
     const store = await ArtifactStore.create(join(dir, "..", "artifacts"));
     const v = new CommandVerifier();
     const profile = await v.detect(dir);
-    assert.equal(profile.stages[0]?.required, false, "fallback stage is non-required by design");
+    assert.equal(profile.stages.length, 0, "no doomed node --check stage for a scriptless repo");
     const outcome = await v.run(dir, profile, store);
+    assert.equal(outcome.noTargets, true, "no verification targets reported honestly");
     assert.ok(!outcome.passed, "a run with zero passing stages must not pass");
     assert.equal(outcome.evidence.filter((e) => e.status === "passed").length, 0);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("scriptless repo with a real index.js runs the node-syntax stage (FINDING-2CcenM)", async () => {
+  const dir = await makeProject({
+    "package.json": JSON.stringify({}),
+    "index.js": "export const x = 1;\n",
+  });
+  try {
+    const store = await ArtifactStore.create(join(dir, "..", "artifacts"));
+    const v = new CommandVerifier();
+    const profile = await v.detect(dir);
+    assert.equal(profile.stages.length, 1, "syntax stage emitted when a real entry exists");
+    assert.equal(profile.stages[0]?.name, "node-syntax");
+    const outcome = await v.run(dir, profile, store);
+    assert.equal(outcome.noTargets, false);
+    assert.ok(outcome.passed, "a valid JS entry should pass a node --check stage");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("scriptless repo resolves entry from package.json main (FINDING-2CcenM)", async () => {
+  const dir = await makeProject({
+    "package.json": JSON.stringify({ main: "lib/main.js" }),
+    "lib/main.js": "export const y = 2;\n",
+  });
+  try {
+    const store = await ArtifactStore.create(join(dir, "..", "artifacts"));
+    const v = new CommandVerifier();
+    const profile = await v.detect(dir);
+    assert.equal(profile.stages.length, 1);
+    assert.ok(profile.stages[0]!.args.includes("lib/main.js"), "syntax-checks the declared main entry");
+    const outcome = await v.run(dir, profile, store);
+    assert.ok(outcome.passed);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("verifier resolves bare local binaries from node_modules/.bin (regression: ENOENT gates)", async () => {
+  // Reproduces the orchestrator bug where execFile('tsc', ...) failed with
+  // ENOENT because node_modules/.bin was not on the ambient PATH when the
+  // runtime is launched directly with `node` rather than via `npm`. Every
+  // integration/validation gate then spuriously FAILED on empty output even
+  // when the underlying tool worked. The verifier must prepend the repo's
+  // local node_modules/.bin so bare binary names resolve.
+  const dir = await makeProject({
+    "package.json": JSON.stringify({ scripts: { test: "bar-hello" } }),
+  });
+  const binDir = join(dir, "node_modules", ".bin");
+  await mkdir(binDir, { recursive: true });
+  const binPath = join(binDir, "bar-hello");
+  await writeFile(binPath, "#!/bin/sh\necho hello-from-local-bin\n");
+  await chmod(binPath, 0o755);
+  try {
+    const store = await ArtifactStore.create(join(dir, "..", "artifacts"));
+    const v = new CommandVerifier();
+    const profile = await v.detect(dir);
+    const stage = profile.stages.find((s) => s.name === "test");
+    assert.equal(stage?.command, "bar-hello", "bare binary name must be parsed from the script");
+    const outcome = await v.run(dir, profile, store);
+    assert.ok(outcome.passed, "bare local binary must resolve via node_modules/.bin");
+    assert.equal(outcome.failedStage, null);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

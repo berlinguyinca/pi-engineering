@@ -12,6 +12,33 @@ import { CommandVerifier } from "../../src/verify/Verifier.ts";
 import { FakeWorkerExecutor } from "../../src/workers/FakeWorkerExecutor.ts";
 import { makeFixtureRepo } from "../fixtures/make-fixture.ts";
 
+/** Deterministic overlap barrier (see dag-parallel/blackhole tests). */
+function parallelBarrier(needed: number, timeoutMs = 5000): { arrived: () => Promise<void> } {
+  let count = 0;
+  let release: () => void;
+  let settled = false;
+  const gate = new Promise<void>((r) => {
+    release = r;
+  });
+  const timer = setTimeout(() => {
+    if (!settled) {
+      settled = true;
+      release();
+    }
+  }, timeoutMs);
+  return {
+    async arrived() {
+      count++;
+      if (count >= needed && !settled) {
+        settled = true;
+        clearTimeout(timer);
+        release();
+      }
+      await gate;
+    },
+  };
+}
+
 /**
  * End-to-end test of the complete vertical slice, driven by a deterministic
  * fake worker executor so it runs without a model endpoint:
@@ -619,6 +646,7 @@ test("parallel tournament candidates run concurrently in isolated worktrees", as
   try {
     let active = 0;
     let maxActive = 0;
+    const barrier = parallelBarrier(2);
     const worker = new FakeWorkerExecutor({
       scout: () => ({
         status: "completed",
@@ -632,7 +660,8 @@ test("parallel tournament candidates run concurrently in isolated worktrees", as
       implementer: async (req) => {
         active += 1;
         maxActive = Math.max(maxActive, active);
-        await new Promise((resolve) => setTimeout(resolve, 20)); // yield so siblings enter
+        // Block until both candidates are active: deterministic overlap.
+        await barrier.arrived();
         await writeFile(join(req.cwd, "src", "add.js"), `export function add(a, b) {\n  return a + b;\n}\n`);
         active -= 1;
         return {
@@ -1075,3 +1104,117 @@ function writeFile(p: string, content: string): Promise<void> {
     fs.mkdir(p.split("/").slice(0, -1).join("/"), { recursive: true }).then(() => fs.writeFile(p, content)),
   );
 }
+
+/**
+ * The status footer (and later the panel) needs to know which phase the
+ * pipeline is in and which model produced it, without reading the transcript.
+ */
+test("vertical slice: engineer() reports each phase through onPhase and settles", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const worker = new FakeWorkerExecutor({
+      implementer: async (req) => {
+        await writeFile(join(req.cwd, "src", "add.js"), `export function add(a, b) {\n  return a + b;\n}\n`);
+        return {
+          status: "completed",
+          summary: "Implemented add.",
+          claims: [],
+          details: {},
+          evidence_refs: [],
+          new_hypotheses: [],
+          proposed_tasks: [],
+        };
+      },
+      reviewer: () => ({
+        status: "completed",
+        summary: "No material findings.",
+        claims: [],
+        details: { findings: [] },
+        evidence_refs: [],
+        new_hypotheses: [],
+        proposed_tasks: [],
+      }),
+    });
+
+    const phases: string[] = [];
+    const rt = await EngineeringRuntime.open({
+      cwd: fixture.root,
+      worker,
+      verifier: new CommandVerifier(),
+      onPhase: (e) => phases.push(e.phase),
+    });
+
+    await rt.engineer("Implement add(a, b) to return the sum of a and b");
+
+    assert.ok(phases.includes("implement"), `phases seen: ${phases.join(",")}`);
+    assert.equal(phases.at(-1), "settled", "the last phase must clear the footer");
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("vertical slice: onPhase settles even when the run throws", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const worker = new FakeWorkerExecutor({
+      implementer: async () => {
+        throw new Error("implementer exploded");
+      },
+    });
+    const phases: string[] = [];
+    const rt = await EngineeringRuntime.open({
+      cwd: fixture.root,
+      worker,
+      verifier: new CommandVerifier(),
+      onPhase: (e) => phases.push(e.phase),
+    });
+
+    await rt.engineer("Implement add(a, b)").catch(() => undefined);
+
+    assert.equal(phases.at(-1), "settled", "a failed run must still clear the footer");
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("vertical slice: a throwing onPhase listener cannot break a run", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const worker = new FakeWorkerExecutor({
+      implementer: async (req) => {
+        await writeFile(join(req.cwd, "src", "add.js"), `export function add(a, b) {\n  return a + b;\n}\n`);
+        return {
+          status: "completed",
+          summary: "Implemented add.",
+          claims: [],
+          details: {},
+          evidence_refs: [],
+          new_hypotheses: [],
+          proposed_tasks: [],
+        };
+      },
+      reviewer: () => ({
+        status: "completed",
+        summary: "No material findings.",
+        claims: [],
+        details: { findings: [] },
+        evidence_refs: [],
+        new_hypotheses: [],
+        proposed_tasks: [],
+      }),
+    });
+    const rt = await EngineeringRuntime.open({
+      cwd: fixture.root,
+      worker,
+      verifier: new CommandVerifier(),
+      onPhase: () => {
+        throw new Error("status listener blew up");
+      },
+    });
+
+    const report = await rt.engineer("Implement add(a, b) to return the sum of a and b");
+    assert.equal(report.outcome, "promoted");
+  } finally {
+    await fixture.cleanup();
+  }
+});

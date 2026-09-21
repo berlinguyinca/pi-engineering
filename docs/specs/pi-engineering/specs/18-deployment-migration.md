@@ -1,0 +1,2 @@
+# 18 Deployment & migration
+Reference Compose includes control API, Pi Web, PostgreSQL, Plannotator, optional S3-compatible object storage and observability. Workers are dynamic. InferWeave/OpenViking remain external. Roll out behind compatibility seams: inventory -> contracts -> event/work graph -> subagents -> memory -> Plannotator -> Pi Web -> AutoSpec -> remote -> load. Preserve existing single-agent operation until parity. Remove obsolete paths only after tests prove replacement.

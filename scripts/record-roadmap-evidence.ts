@@ -12,8 +12,27 @@
  * The records are scoped to paths that EXCLUDE docs/roadmap/, so committing
  * this index afterwards does not invalidate its own records.
  *
+ * ── Why `--paths` is required rather than defaulted ─────────────────────────
+ *
+ * The gate tests freshness by asking whether anything under a record's `paths`
+ * changed since its commit. Narrow paths therefore produce a record that stays
+ * "fresh" indefinitely while covering almost none of the work it claims to
+ * cover — a green gate that means nothing, which is strictly worse than the red
+ * one it replaced. This script used to hardcode `src/roadmap/`, `src/blackhole/`,
+ * `src/benchmark/` and `services/` for the review record, so recording evidence
+ * for a change to, say, `src/gateway/` produced exactly that false pass.
+ *
+ * Paths are now an explicit argument with no default: state what was actually
+ * reviewed, or the script refuses to write.
+ *
  * Usage:
- *   node scripts/record-roadmap-evidence.ts --critical 0 --high 0
+ *   node scripts/record-roadmap-evidence.ts \
+ *     --paths src/,extensions/,test/ \
+ *     --critical 0 --high 0 \
+ *     --id-suffix gateway-wait \
+ *     --dogfood-proof "scripts/dogfood-gateway-wait.ts" \
+ *     --review-proof "scripts/fresh-review-gateway-wait.ts gateway" \
+ *     --summary "..."
  *
  * Deterministic checks (unit/integration/typecheck/lint/package_load) are NOT
  * recorded here; `roadmap check` (refresh) generates those at HEAD.
@@ -30,19 +49,74 @@ const exec = promisify(execFile);
 interface Args {
   critical: number;
   high: number;
+  /** Scope the gate re-checks for freshness. No default, on purpose. */
+  paths: string[];
+  /** Distinguishes these records from earlier ones; ids must be stable. */
+  idSuffix: string;
+  dogfoodProof: string;
+  reviewProof: string;
+  summary: string;
 }
 
+const USAGE = `Usage: node scripts/record-roadmap-evidence.ts --paths <p1,p2,...> [options]
+
+  --paths <list>          REQUIRED. Comma-separated paths the evidence covers.
+                          These are what the gate re-checks for freshness, so
+                          they must span everything that was reviewed. Narrow
+                          paths make a record that passes forever while
+                          covering nothing.
+  --id-suffix <name>      Record id suffix (default: "1.0").
+  --critical N            Unresolved critical findings (default 0).
+  --high N                Unresolved high findings (default 0).
+  --dogfood-proof <text>  What was run for the dogfood record.
+  --review-proof <text>   What was run for the fresh-review record.
+  --summary <text>        Shared human summary.`;
+
 function parseArgs(argv: string[]): Args {
-  const a: Args = { critical: 0, high: 0 };
+  const a: Args = {
+    critical: 0,
+    high: 0,
+    paths: [],
+    idSuffix: "1.0",
+    dogfoodProof: "",
+    reviewProof: "",
+    summary: "",
+  };
   for (let i = 0; i < argv.length; i++) {
-    if (argv[i] === "--critical") a.critical = Number(argv[++i]);
-    else if (argv[i] === "--high") a.high = Number(argv[++i]);
-    else if (argv[i] === "--help") {
-      console.log("Usage: node scripts/record-roadmap-evidence.ts [--critical N] [--high N]");
+    const flag = argv[i];
+    if (flag === "--critical") a.critical = Number(argv[++i]);
+    else if (flag === "--high") a.high = Number(argv[++i]);
+    else if (flag === "--paths") {
+      a.paths = (argv[++i] ?? "")
+        .split(",")
+        .map((p) => p.trim())
+        .filter(Boolean);
+    } else if (flag === "--id-suffix") a.idSuffix = argv[++i] ?? a.idSuffix;
+    else if (flag === "--dogfood-proof") a.dogfoodProof = argv[++i] ?? "";
+    else if (flag === "--review-proof") a.reviewProof = argv[++i] ?? "";
+    else if (flag === "--summary") a.summary = argv[++i] ?? "";
+    else if (flag === "--help") {
+      console.log(USAGE);
       process.exit(0);
     }
   }
   return a;
+}
+
+/**
+ * Reject a scope that cannot honestly cover a change.
+ *
+ * `docs/roadmap/` is excluded deliberately (committing the index must not
+ * invalidate its own records); anything else that narrow is the false-pass this
+ * argument exists to prevent.
+ */
+function validatePaths(paths: string[]): string | undefined {
+  if (paths.length === 0) return "--paths is required; state what the evidence actually covers";
+  const inert = paths.filter((p) => p.startsWith("docs/"));
+  if (inert.length === paths.length) {
+    return `every path is under docs/ (${paths.join(", ")}); a record scoped only to documentation can never go stale`;
+  }
+  return undefined;
 }
 
 /** Remove a prior record with the same id, then push the new one. */
@@ -52,6 +126,12 @@ function upsert(docs: RoadmapEvidence[], rec: RoadmapEvidence): RoadmapEvidence[
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
+  const pathProblem = validatePaths(args.paths);
+  if (pathProblem) {
+    console.error(`record-roadmap-evidence: ${pathProblem}`);
+    console.error(USAGE);
+    process.exit(2);
+  }
   const root = process.cwd();
   const manualPath = join(root, "docs", "roadmap", "evidence.yaml");
   const { stdout } = await exec("git", ["-C", root, "rev-parse", "HEAD"]);
@@ -72,27 +152,27 @@ async function main() {
 
   const now = new Date().toISOString();
   const updated = upsert(docs, {
-    id: "dogfood-1.0",
+    id: `dogfood-${args.idSuffix}`,
     milestone: "__global__",
     type: "dogfood",
     status: "pass",
     commit: head,
     generatedAt: now,
-    paths: ["src/"],
-    proof: "scripts/dogfood-roadmap.ts + real-repo roadmap check",
-    summary: "deterministic roadmap lifecycle dogfood; release gate reachable at HEAD",
+    paths: args.paths,
+    proof: args.dogfoodProof || "scripts/dogfood-roadmap.ts + real-repo roadmap check",
+    summary: args.summary || "deterministic dogfood; release gate reachable at HEAD",
   });
   const final = upsert(updated, {
-    id: "review-1.0",
+    id: `review-${args.idSuffix}`,
     milestone: "__global__",
     type: "fresh_review",
     status: "pass",
     commit: head,
     generatedAt: now,
-    paths: ["src/roadmap/", "src/blackhole/", "src/benchmark/", "services/"],
-    proof:
-      "scripts/fresh-review-roadmap.ts + scripts/fresh-review-blackhole.ts + scripts/fresh-review-blackhole-fixes.ts + scripts/fresh-review-openviking-service.ts",
-    summary: `fresh-context review at HEAD; unresolved findings ${args.critical} critical, ${args.high} high`,
+    paths: args.paths,
+    proof: args.reviewProof || "fresh-context review worker",
+    summary:
+      args.summary || `fresh-context review at HEAD; unresolved findings ${args.critical} critical, ${args.high} high`,
     findings: { critical: args.critical, high: args.high },
   });
 

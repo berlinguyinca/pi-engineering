@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { mkdir, rm } from "node:fs/promises";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { promisify } from "node:util";
 
 const exec = promisify(execFile);
@@ -132,20 +132,113 @@ export class GitRepo {
     // Crash recovery: clear any stale worktree or leftover directory at the path.
     await this.git(["worktree", "remove", "--force", path]).catch(() => {});
     await this.git(["branch", "-D", branch]).catch(() => {});
-    await this.git(["worktree", "prune"]);
+    await this.forgetWorktreeAdmin(path);
     await rm(path, { recursive: true, force: true }).catch(() => {});
     const add = await this.git(["worktree", "add", path, "-b", branch, baseCommit]);
     if (add.code !== 0) throw new Error(`git worktree add failed: ${add.stderr}`);
     return { path, branch };
   }
 
+  /**
+   * Drop the administrative directory for ONE worktree path, if it is stale.
+   *
+   * This replaces `git worktree prune`, which is global: it removes the
+   * administrative directory of every worktree whose working directory is
+   * currently missing, including ones created moments ago — the
+   * `gc.worktreePruneExpire` default does not protect them (checked against the
+   * installed git). Since candidate isolation creates worktrees in parallel,
+   * and `git worktree add` has a window where the administrative directory
+   * exists before the working directory does, a prune issued by one creation
+   * could delete a sibling's and leave it unusable
+   * ("fatal: not a git repository: .../worktrees/<name>").
+   *
+   * Locking around the prune fixed that and cost the parallelism it was
+   * protecting — candidates stopped overlapping at all. Removing only this
+   * path's entry needs no lock, because every caller owns a distinct path.
+   */
+  private async forgetWorktreeAdmin(path: string): Promise<void> {
+    const common = await this.git(["rev-parse", "--git-common-dir"]);
+    if (common.code !== 0) return;
+    const gitDir = common.stdout.trim();
+    if (!gitDir) return;
+    const absolute = gitDir.startsWith("/") ? gitDir : join(this.repoRoot, gitDir);
+    // `git worktree add` names the administrative directory after the leaf of
+    // the worktree path.
+    await rm(join(absolute, "worktrees", basename(path)), { recursive: true, force: true }).catch(() => {});
+  }
+
   /** Remove a worktree (cleanup/recovery). Optionally keep the branch for lineage. */
   async removeWorktree(info: WorktreeInfo, opts: { keepBranch?: boolean } = {}): Promise<void> {
     await this.git(["worktree", "remove", "--force", info.path]);
-    await this.git(["worktree", "prune"]);
+    // Targeted, for the same reason creation is: a global prune here would be
+    // able to delete a concurrently-created sibling's administrative directory.
+    await this.forgetWorktreeAdmin(info.path);
     if (!opts.keepBranch) {
       await this.git(["branch", "-D", info.branch]).catch(() => {});
     }
+  }
+
+  /**
+   * The most recent commits, newest first.
+   *
+   * Uses a unit-separator between fields rather than a printable delimiter,
+   * because commit subjects routinely contain every punctuation character a
+   * naive split would choke on.
+   */
+  async recentCommits(limit = 5): Promise<Array<{ sha: string; subject: string; relative: string }>> {
+    const r = await this.git(["--no-pager", "log", `-n${Math.max(1, limit)}`, "--format=%h%x1f%s%x1f%cr"]);
+    if (r.code !== 0) return [];
+    const out: Array<{ sha: string; subject: string; relative: string }> = [];
+    for (const line of r.stdout.split("\n")) {
+      if (!line.trim()) continue;
+      const [sha, subject, relative] = line.split("\x1f");
+      if (!sha || !subject) continue;
+      out.push({ sha, subject, relative: relative ?? "" });
+    }
+    return out;
+  }
+
+  /**
+   * The patch a commit introduced.
+   *
+   * `--format=` drops the header so the result is a PURE diff: the panel's
+   * gutter numbers diff hunks and colours `+`/`-` lines, and a `commit …` /
+   * `Author: …` preamble would be numbered as source line 1. The subject
+   * belongs in the view's title, not in its body.
+   *
+   * `--first-parent` is what makes this work on a merge, which by default shows
+   * no patch at all — an empty pane where the operator asked to see a change.
+   */
+  async commitDiff(sha: string): Promise<string> {
+    const r = await this.git(["--no-pager", "show", "--format=", "--patch", "--first-parent", sha]);
+    if (r.code !== 0) return "";
+    return r.stdout;
+  }
+
+  /**
+   * Per-file added/removed line counts for the working tree.
+   *
+   * `--numstat` rather than parsing a diff: it is one line per file, and it
+   * reports `-` for binary files instead of a count, which is a distinction the
+   * panel should show rather than render as zero.
+   */
+  async diffStats(): Promise<Map<string, { added: number; removed: number; binary: boolean }>> {
+    const out = new Map<string, { added: number; removed: number; binary: boolean }>();
+    const r = await this.git(["--no-pager", "diff", "--numstat", "HEAD"]);
+    if (r.code !== 0) return out;
+    for (const line of r.stdout.split("\n")) {
+      if (!line.trim()) continue;
+      const [added, removed, ...rest] = line.split("\t");
+      const path = rest.join("\t");
+      if (!path) continue;
+      const binary = added === "-" || removed === "-";
+      out.set(path, {
+        added: binary ? 0 : Number.parseInt(added ?? "0", 10) || 0,
+        removed: binary ? 0 : Number.parseInt(removed ?? "0", 10) || 0,
+        binary,
+      });
+    }
+    return out;
   }
 
   async deleteBranch(branch: string): Promise<void> {

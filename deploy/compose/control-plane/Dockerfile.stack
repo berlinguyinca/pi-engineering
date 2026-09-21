@@ -1,0 +1,17 @@
+# pi-engineering-stack: lean control-plane image for the pi-engineering harness.
+#
+# This is deployment glue provided by pi-engineering (the harness) so the stack
+# can build and run the harness control API quickly. It needs no npm runtime
+# dependencies: the control-plane server (scripts/control-server.ts) uses only
+# Node built-ins plus the harness's own TypeScript source, which Node 22 runs
+# via --experimental-strip-types.
+#
+# The stack builds this from the mounted harness source at
+#   ${PI_STACK_WORKSPACE}/${PI_STACK_HARNESS_REL}
+# so local harness development is honored (spec 05 "support local source
+# development from /workspaces/pi-engineering").
+FROM node:22-alpine
+WORKDIR /app
+COPY scripts ./scripts
+COPY src ./src
+CMD ["node", "--experimental-strip-types", "scripts/control-server.ts"]

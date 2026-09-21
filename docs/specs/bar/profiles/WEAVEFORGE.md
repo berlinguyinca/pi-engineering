@@ -1,0 +1,2 @@
+# WeaveForge Brownfield Profile
+Prioritize spec -> decomposition -> worker -> implementation -> review -> repair -> verification -> ledger orchestration. Test false completion, no-op worker, TODO/stub implementations, protected-test modification, reviewer/implementer disagreement, subprocess crash, concurrent requirement edits, ignored review defects, inference 429, context pressure and process restart/recovery. Verify concurrency-safe ledger semantics and evidence provenance.

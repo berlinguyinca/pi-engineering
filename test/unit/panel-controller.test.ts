@@ -1,0 +1,289 @@
+import assert from "node:assert/strict";
+import { test } from "node:test";
+import { PanelController, matchesChord } from "../../src/panel/PanelController.ts";
+import { PanelState } from "../../src/panel/PanelState.ts";
+
+/** A minimal ExtensionUIContext stand-in exposing only `custom`. */
+function fakeUi() {
+  const ui = {
+    customCalls: 0,
+    hideCalls: 0,
+    lastOptions: undefined as { overlay?: boolean; overlayOptions?: unknown } | undefined,
+    custom: (
+      factory: (tui: unknown, theme: unknown, keybindings: unknown, done: (v: unknown) => void) => unknown,
+      options?: { overlay?: boolean; overlayOptions?: unknown; onHandle?: (h: unknown) => void },
+    ) => {
+      ui.customCalls++;
+      ui.lastOptions = options;
+      factory({ requestRender: () => {} }, {}, {}, () => {});
+      options?.onHandle?.({
+        hide: () => ui.hideCalls++,
+        setHidden: () => {},
+        isHidden: () => false,
+        focus: () => {},
+        unfocus: () => {},
+        isFocused: () => true,
+        getBounds: () => undefined,
+      });
+      return new Promise<void>(() => {});
+    },
+  };
+  return ui;
+}
+
+test("controller: the chord matcher claims only its own key", () => {
+  assert.equal(matchesChord("\x10", "ctrl+p"), true);
+  assert.equal(matchesChord("\x01", "ctrl+p"), false);
+  assert.equal(matchesChord("p", "ctrl+p"), false);
+  assert.equal(matchesChord("\x10", "none"), false, "a disabled chord claims nothing");
+  assert.equal(matchesChord("\x10", ""), false);
+});
+
+test("controller: terminal input passes everything except the chords through", () => {
+  const ui = fakeUi();
+  const controller = new PanelController({ state: new PanelState(), ui: ui as never, chord: "ctrl+p" });
+  // Focus chord: consumed, and it only steps focus in, never collapses.
+  assert.deepEqual(controller.handleTerminalInput("\x10"), { consume: true });
+  assert.equal(controller.isOpen(), true);
+  assert.equal(ui.hideCalls, 0, "the focus chord must not collapse the panel");
+  assert.equal(controller.handleTerminalInput("hello"), undefined);
+  assert.equal(controller.handleTerminalInput("\x1b[A"), undefined);
+  assert.equal(controller.handleTerminalInput("\r"), undefined);
+  controller.dispose();
+});
+
+test("controller: the toggle chord collapses and uncollapses the whole panel", () => {
+  const ui = fakeUi();
+  const controller = new PanelController({ state: new PanelState(), ui: ui as never, chord: "ctrl+p" });
+
+  // ctrl+b (0x02) is the default toggle chord.
+  assert.deepEqual(controller.handleTerminalInput("\x02"), { consume: true });
+  assert.equal(controller.isOpen(), true, "the toggle chord opens the panel");
+  assert.deepEqual(controller.handleTerminalInput("\x02"), { consume: true });
+  assert.equal(controller.isOpen(), false, "the toggle chord collapses the panel");
+  assert.equal(ui.hideCalls, 1);
+  controller.dispose();
+});
+
+test("controller: a disabled toggle chord claims nothing", () => {
+  const ui = fakeUi();
+  const controller = new PanelController({
+    state: new PanelState(),
+    ui: ui as never,
+    chord: "ctrl+p",
+    toggleChord: "none",
+  });
+  assert.equal(controller.handleTerminalInput("\x02"), undefined, "a disabled toggle chord passes through");
+  assert.equal(controller.isOpen(), false);
+  controller.dispose();
+});
+
+test("controller: the focus and toggle chords are independent", () => {
+  const ui = fakeUi();
+  const controller = new PanelController({
+    state: new PanelState(),
+    ui: ui as never,
+    chord: "ctrl+p",
+    toggleChord: "ctrl+o",
+  });
+  // ctrl+o (0x0f) toggles visibility; ctrl+p (0x10) only steps focus in.
+  assert.deepEqual(controller.handleTerminalInput("\x0f"), { consume: true });
+  assert.equal(controller.isOpen(), true);
+  assert.deepEqual(controller.handleTerminalInput("\x10"), { consume: true });
+  assert.equal(controller.isOpen(), true, "focusing must not collapse an open panel");
+  controller.dispose();
+});
+
+test("controller: a disabled chord never consumes input", () => {
+  const controller = new PanelController({ state: new PanelState(), ui: fakeUi() as never, chord: "none" });
+  assert.equal(controller.handleTerminalInput("\x10"), undefined);
+  assert.equal(controller.isOpen(), false);
+  controller.dispose();
+});
+
+test("controller: toggle opens and closes the overlay exactly once each way", () => {
+  const ui = fakeUi();
+  const controller = new PanelController({ state: new PanelState(), ui: ui as never, chord: "ctrl+p" });
+  assert.equal(controller.isOpen(), false);
+
+  controller.toggle();
+  assert.equal(controller.isOpen(), true);
+  assert.equal(ui.customCalls, 1);
+
+  controller.toggle();
+  assert.equal(controller.isOpen(), false);
+  assert.equal(ui.hideCalls, 1);
+  controller.dispose();
+});
+
+test("controller: the overlay is right-anchored and suppressed on narrow terminals", () => {
+  const ui = fakeUi();
+  const controller = new PanelController({ state: new PanelState(), ui: ui as never, chord: "ctrl+p" });
+  controller.toggle();
+
+  const options = ui.lastOptions as { overlay?: boolean; overlayOptions?: () => Record<string, unknown> } | undefined;
+  assert.equal(options?.overlay, true);
+  const overlay = options?.overlayOptions?.();
+  assert.equal(overlay?.anchor, "top-right");
+  const visible = overlay?.visible as ((w: number, h: number) => boolean) | undefined;
+  assert.equal(visible?.(80, 40), false, "a narrow terminal must not be crowded");
+  assert.equal(visible?.(160, 40), true);
+  controller.dispose();
+});
+
+test("controller: the hotkey moves focus and leaves the panel on screen", () => {
+  // The chord used to hide the panel. It now steps into and out of it, because
+  // the panel is registered `nonCapturing` and stays visible while you type —
+  // you stop interacting with it far more often than you want it gone.
+  // `/panel` is what hides it.
+  const ui = fakeUi();
+  const controller = new PanelController({ state: new PanelState(), ui: ui as never, chord: "ctrl+p" });
+
+  controller.handleTerminalInput("\x10");
+  assert.equal(controller.isOpen(), true, "the first chord shows it");
+
+  controller.handleTerminalInput("\x10");
+  assert.equal(controller.isOpen(), true, "the second chord must NOT hide it");
+
+  controller.dispose();
+});
+
+test("controller: the chord consumes only its own key", () => {
+  const ui = fakeUi();
+  const controller = new PanelController({ state: new PanelState(), ui: ui as never, chord: "ctrl+p" });
+
+  assert.equal(controller.handleTerminalInput("a"), undefined, "ordinary typing must reach the prompt");
+  assert.deepEqual(controller.handleTerminalInput("\x10"), { consume: true });
+  controller.dispose();
+});
+
+test("controller: escape releases focus rather than hiding the panel", () => {
+  // The component's close path is a blur now. Ambient visibility is the point.
+  const ui = fakeUi();
+  const controller = new PanelController({ state: new PanelState(), ui: ui as never, chord: "ctrl+p" });
+
+  controller.toggle();
+  assert.equal(controller.isOpen(), true);
+  controller.blur();
+  assert.equal(controller.isOpen(), true, "blur leaves it visible");
+  controller.dispose();
+});
+
+test("controller: dispose hides an open overlay", () => {
+  const ui = fakeUi();
+  const controller = new PanelController({ state: new PanelState(), ui: ui as never, chord: "ctrl+p" });
+  controller.toggle();
+  controller.dispose();
+  assert.equal(ui.hideCalls, 1);
+  assert.equal(controller.isOpen(), false);
+});
+
+test("controller: opening is announced so a feeder can refresh", () => {
+  const ui = fakeUi();
+  let opens = 0;
+  const controller = new PanelController({
+    state: new PanelState(),
+    ui: ui as never,
+    chord: "ctrl+p",
+    onOpen: () => opens++,
+  });
+  controller.toggle();
+  assert.equal(opens, 1);
+  controller.toggle();
+  assert.equal(opens, 1, "closing must not announce an open");
+  controller.dispose();
+});
+
+test("panel: restore shows the panel without recording a new preference", () => {
+  // Restoring a remembered "open" is honouring a choice already made. Recording
+  // it as a fresh one would rewrite the preference every session whether the
+  // operator touched the panel or not.
+  const seen: boolean[] = [];
+  const c = new PanelController({
+    state: new PanelState(),
+    ui: fakeUi() as never,
+    onVisibilityChange: (open) => seen.push(open),
+  });
+
+  c.restore();
+  assert.deepEqual(seen, [], "a restore is not a decision");
+  c.dispose();
+});
+
+test("panel: a toggle records the operator's decision in both directions", () => {
+  const seen: boolean[] = [];
+  const c = new PanelController({
+    state: new PanelState(),
+    ui: fakeUi() as never,
+    onVisibilityChange: (open) => seen.push(open),
+  });
+
+  c.toggle();
+  c.toggle();
+  assert.deepEqual(seen, [true, false], "closing is as much a preference as opening");
+  c.dispose();
+});
+
+test("panel: restoring an already-open panel is a no-op", () => {
+  const seen: boolean[] = [];
+  const c = new PanelController({
+    state: new PanelState(),
+    ui: fakeUi() as never,
+    onVisibilityChange: (open) => seen.push(open),
+  });
+
+  c.toggle();
+  c.restore();
+  assert.deepEqual(seen, [true], "no second open, no second record");
+  c.dispose();
+});
+
+test("panel: disposing is not the operator asking for it to stay shut", () => {
+  // A session ending must not be recorded as a decision to close, or every
+  // shutdown would silently turn the panel off for the next session.
+  const seen: boolean[] = [];
+  const c = new PanelController({
+    state: new PanelState(),
+    ui: fakeUi() as never,
+    onVisibilityChange: (open) => seen.push(open),
+  });
+
+  c.toggle();
+  c.dispose();
+  assert.deepEqual(seen, [true], "shutdown recorded nothing");
+});
+
+test("panel: hiding is reported on every path, including shutdown", () => {
+  // `onHidden` releases work that only makes sense while the panel is visible,
+  // so it must fire even on the paths that record no preference — otherwise a
+  // refresh timer outlives the panel it was refreshing.
+  const hidden: number[] = [];
+  const c = new PanelController({
+    state: new PanelState(),
+    ui: fakeUi() as never,
+    onHidden: () => hidden.push(1),
+  });
+
+  c.toggle();
+  c.toggle();
+  assert.equal(hidden.length, 1, "a toggle-close hides");
+
+  c.toggle();
+  c.dispose();
+  assert.equal(hidden.length, 2, "shutdown hides too, even though it records no preference");
+});
+
+test("panel: closing an already-closed panel hides nothing twice", () => {
+  // close() is idempotent and reached from several paths; firing onHidden each
+  // time would stop work that was never started.
+  const hidden: number[] = [];
+  const c = new PanelController({
+    state: new PanelState(),
+    ui: fakeUi() as never,
+    onHidden: () => hidden.push(1),
+  });
+
+  c.dispose();
+  c.dispose();
+  assert.equal(hidden.length, 0, "it was never on screen");
+});

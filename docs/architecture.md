@@ -20,6 +20,8 @@ this document describes the *implementation*.
 ```
 extensions/index.ts          pi entry point: registers /commands + semantic tools
 src/runtime/EngineeringRuntime.ts   facade + adaptive /engineer pipeline
+src/orchestration/           mission orchestration (spec pi-engineering-orchestration)
+                             IntentRouter, MissionStore, Scheduler, Broker, CompletionGate, Orchestrator
 src/ledger/                  event-sourced Engineering Ledger (append-only JSONL)
 src/artifacts/               filesystem artifact store (artifact:// URIs, lazy reads)
 src/git/GitRepo.ts           worktree isolation, diff capture, controlled merge

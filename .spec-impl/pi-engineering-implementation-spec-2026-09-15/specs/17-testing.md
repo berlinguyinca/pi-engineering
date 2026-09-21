@@ -1,0 +1,2 @@
+# 17 Testing, recovery & load
+Unit: schemas/transitions/permissions/routing/context/memory redaction/outbox. Integration: parent-child, worktrees, steering/cancel/restart, OpenViking sharing, reviewer isolation, Plannotator, InferWeave backpressure, AutoSpec, MCP. Recovery: worker/parent/DB/provider/OpenViking/remote failures. Load: 50 concurrent workers with events/heartbeats/recall. E2E: real project plan->implement->test->review->fix->complete.

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { reviewResultTool } from "../../src/lifecycle/reviewResultTool.ts";
 import { FakeWorkerExecutor } from "../../src/workers/FakeWorkerExecutor.ts";
 import { WORKER_KICKOFF, buildSystemPrompt } from "../../src/workers/prompts.ts";
 import { workerResultTool } from "../../src/workers/workerResultTool.ts";
@@ -62,6 +63,15 @@ test("role prompts are compact and instruct bounded output", () => {
   assert.ok(prompt.length < 2500, `prompt should stay compact, was ${prompt.length}`);
   assert.ok(prompt.includes("worker_result"));
   assert.match(WORKER_KICKOFF, /worker_result/);
+});
+
+test("review_result tool is a terminating tool with a machine-checkable verdict", async () => {
+  assert.equal(reviewResultTool.name, "review_result");
+  const schema = reviewResultTool.parameters as { properties?: Record<string, unknown> };
+  const verdict = schema.properties?.verdict as { anyOf?: Array<{ const?: string }> } | undefined;
+  const allowed = (verdict?.anyOf ?? []).map((v) => v.const).filter(Boolean);
+  assert.ok(allowed.includes("approve") && allowed.includes("request_changes"));
+  assert.ok((schema.properties as Record<string, unknown>).findings, "findings array expected");
 });
 
 test("worker_result enforces bounded output even for a chatty worker (review MED #6)", async () => {

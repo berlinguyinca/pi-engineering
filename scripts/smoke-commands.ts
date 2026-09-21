@@ -34,6 +34,9 @@ const EXPECTED_COMMANDS = [
   "challenge",
   "roadmap-status",
   "blackhole",
+  "remember",
+  "memory",
+  "panel",
 ];
 const EXPECTED_TOOLS = ["ledger_read", "ledger_claim", "artifact_read", "repo_search", "symbol", "tests_for"];
 

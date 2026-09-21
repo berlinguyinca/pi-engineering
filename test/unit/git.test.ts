@@ -149,3 +149,28 @@ test("changedPathsSince: glob pathspec matches a new test file", async () => {
     await fixture.cleanup();
   }
 });
+
+/**
+ * `EngineeringRuntime.createCandidateWorktree` asserts that worktree creation
+ * is safe to run concurrently (tournament legs and parallel DAG waves create
+ * candidates at the same time). This pins that contract: distinct paths, all
+ * usable. It does NOT reproduce the rare `.git/worktrees/…/HEAD` failure seen
+ * once under full-suite load — that mechanism is still unidentified.
+ */
+test("concurrent worktree creation yields distinct usable worktrees", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const repo = (await GitRepo.open(fixture.root))!;
+    const head = await repo.headCommit();
+    const branches = ["pi-eng-race-a", "pi-eng-race-b", "pi-eng-race-c", "pi-eng-race-d"];
+    const worktrees = await Promise.all(branches.map((branch) => repo.createWorktree(head, branch)));
+    try {
+      assert.equal(new Set(worktrees.map((w) => w.path)).size, branches.length, "each candidate gets its own path");
+      for (const wt of worktrees) assert.equal(await repo.headCommitIn(wt.path), head);
+    } finally {
+      for (const wt of worktrees) await repo.removeWorktree(wt).catch(() => {});
+    }
+  } finally {
+    await fixture.cleanup();
+  }
+});
