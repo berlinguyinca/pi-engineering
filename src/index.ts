@@ -271,3 +271,144 @@ export {
   renderPanels,
 } from "./blackhole/dashboard.ts";
 export type { DashboardPanel } from "./blackhole/dashboard.ts";
+// Autonomous UI engineering shared schema contracts (spec 01-contracts).
+export {
+  SCHEMA_VERSION,
+  MIN_SCHEMA_VERSION,
+  RECORD_KINDS,
+  SCHEMAS,
+  TaskRequestSchema,
+  ExecutionProvenanceSchema,
+  EvidenceBundleSchema,
+  FindingSchema,
+  EvaluationRunSchema,
+  DesignArtifactSchema,
+  CandidateSchema,
+  AcceptanceDecisionSchema,
+  validateRecord,
+  migrateRecord,
+} from "./uieng/schemas.ts";
+export type {
+  RecordKind,
+  TaskRequest,
+  ExecutionProvenance,
+  EvidenceBundle,
+  Finding,
+  EvaluationRun,
+  DesignArtifact,
+  Candidate,
+  AcceptanceDecision,
+  UiengRecord,
+} from "./uieng/schemas.ts";
+
+// Versioned 60-metric UI rubric engine (spec 02-rubric).
+export {
+  RUBRIC_VERSION,
+  METRICS,
+  METRIC_IDS,
+  METRICS_BY_ID,
+  RUBRIC_REGISTRY,
+  validateMetricIds,
+  assertMetricKnown,
+  scoreRecord,
+  scoreAll,
+  aggregateScores,
+} from "./uieng/rubric.ts";
+export type {
+  MetricSource,
+  MetricSeverity,
+  MetricAnchors,
+  RubricMetric,
+  MetricScoreInput,
+  MetricScore,
+  RubricAggregate,
+} from "./uieng/rubric.ts";
+
+// Automatic UI-impact policy + repo/UI discovery (spec 01-auto-policy).
+export {
+  discoverUiProfile,
+  persistUiProfile,
+  loadUiProfile,
+  discoverAndPersistUiProfile,
+  DISCOVERY_LIMITS,
+} from "./uieng/discovery.ts";
+export type { UiProfile } from "./uieng/discovery.ts";
+export {
+  UI_IMPACT_LEVELS,
+  rankLevel,
+  classifyChange,
+  derivedEvaluation,
+  gateFailed,
+  autoAttach,
+  METRIC_GROUP_IDS,
+  METRIC_GROUPS,
+  BROWSER_TEST_KINDS,
+  VIEWPORT_TARGETS,
+} from "./uieng/policy.ts";
+export type {
+  UiImpactLevel,
+  MetricGroupId,
+  BrowserTestKind,
+  ViewportTarget,
+  EvaluationPlan,
+  AutoRemedy,
+  GateFailure,
+  GateBudget,
+  AutoAttachOptions,
+  AutoAttachDecision,
+} from "./uieng/policy.ts";
+
+// Evidence capture + deterministic analyzers (spec 02-evidence).
+export {
+  produceEvidenceBundle,
+  validateEvidenceBundle,
+  analyzeAccessibilityViolations,
+  analyzeContrastRatios,
+  analyzeTouchTargets,
+  analyzeOverflow,
+  analyzeBreakpoints,
+  analyzeDesignTokenAdherence,
+  analyzeDesignEntropy,
+  analyzeStyleDuplication,
+  analyzeCodeDuplication,
+  analyzeComponentReuse,
+  analyzeDomDepth,
+  analyzeDeadStyles,
+  analyzeKeyboardFocus,
+  analyzeRefreshDeepLink,
+  analyzeAssetWeight,
+  analyzeRenderPerformance,
+  analyzeLayoutStability,
+  analyzeRuntimeErrors,
+  analyzeCapture,
+  toMetricScore,
+  scoreAnalysis,
+  MIN_TOUCH_TARGET,
+  RECOMMENDED_TOUCH_TARGET,
+} from "./uieng/evidence.ts";
+export type {
+  ViewportInfo,
+  Bounds,
+  CapturePlan,
+  ProduceEvidenceOptions,
+  AnalysisResult,
+  A11yViolation,
+  ContrastCheck,
+  TouchTarget,
+  OverflowRecord,
+  BreakpointFailure,
+  TokenViolation,
+  DesignEntropyInput,
+  DuplicateRecord,
+  DuplicationInput,
+  ComponentReuseInput,
+  DomDepthInfo,
+  DeadStyleRecord,
+  DeadStyleInput,
+  FocusIssue,
+  RefreshDeepLinkFailure,
+  BundlePerf,
+  RenderPerf,
+  RuntimeError,
+  CaptureSnapshot,
+} from "./uieng/evidence.ts";
