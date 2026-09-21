@@ -195,7 +195,9 @@ export function buildCoreTools(
       }
       const slice = read.content;
       const more = offset + cap < meta.size;
-      const out = more ? `${slice}\n… [truncated; call artifact_read with offset=${read.nextOffset} to continue]` : slice;
+      const out = more
+        ? `${slice}\n… [truncated; call artifact_read with offset=${read.nextOffset} to continue]`
+        : slice;
       return {
         content: [{ type: "text", text: out }],
         details: { uri: meta.uri, size: meta.size, summary: meta.summary, offset, more },

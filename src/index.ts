@@ -501,7 +501,6 @@ export type {
   UsabilityEvaluationInputs,
 } from "./uieng/usability.ts";
 
-
 // Automatic design exploration + diffusion planning (spec 03-design-exploration).
 export {
   DIFFUSION_REFERENCE_NOTE,
