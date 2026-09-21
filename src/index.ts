@@ -519,6 +519,8 @@ export type {
   BudgetState as VisionBudgetState,
 } from "./vision/budget.ts";
 export * from "./vision/provider.ts";
+export * from "./vision/asset.ts";
+export * from "./vision/processor.ts";
 
 // Independent review / diagnosis / implementation-spec generation (spec 06-review-diagnose).
 export {
