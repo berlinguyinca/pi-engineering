@@ -166,4 +166,24 @@ full suite (excl flaky CAV browser tests)      # 1496 pass / 0 fail
 - 200 refs under tight ceiling → `split` into fan-out chunks. ✔
 - Context window discovered (128K floor), never 260K. ✔
 
+## Phase G — Runtime-neutral canary (spec 15)
+
+`test/integration/runtime-canary.test.ts` drives Planner → Engineer A/B
+(fan-out, two isolated implementer ids) → Tester (synthesis) → Reviewer
+through the AgentRuntime seam with deterministic fake executors, composing with
+the request planner (artifact-first refs, bounded output). 2/2 pass; tsc clean;
+biome clean.
+
+Full live canary against real InferWeave + real Herdr provisioning is
+EXTERNALLY BLOCKED (no InferWeave endpoint configured; Herdr provisioning needs
+pane creation — see HERDR_COMPATIBILITY.md finding). Documented, not faked.
+
+## Phase H — Migration / rollback
+
+DEFERRED / EXTERNALLY BLOCKED: the legacy runtime remains the default and the
+rollback target. Herdr is selectable behind `runtime:"herdr"` + capability
+negotiation but is NOT the default. Full rollback drill and the migration state
+machine require a passing live canary first (Phase G blocked). Documented in
+FINAL_RECONCILIATION.md.
+
 ## Phase E — Complete the architecture (see below)
