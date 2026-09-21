@@ -45,6 +45,22 @@ stays alive across waits, the UI shows a waiting-for-capacity state, and retries
 are never multiplied with the provider transport or the agent layer. See
 `docs/inference-admission-retry.md`.
 
+Admission handling spans two layers that share one contract parser:
+
+- **`src/inference/`** — the per-call admission-retry transport
+  (`executeWithAdmissionRetry`), which parses each inference response
+  structurally and drives abortable waits with an elapsed-time budget + attempt
+  limit. It serves the interactive-session registry and `localProviders`.
+- **`src/gateway/` + `src/guard/`** — a process-wide `AdmissionController` that
+  gates concurrency across every session before calls go out, and honours the
+  gateway's advertised wait for worker backpressure.
+
+Both interpret the same `inference_admission` envelope: `src/gateway/signals.ts`
+delegates envelope parsing to `src/inference/admissionContract.ts`
+(`parseAdmissionPayload`) and shares the `Retry-After` parser from
+`src/inference/retryDelay.ts`, so the two layers cannot drift on what a wait
+means.
+
 ## Durable state
 
 All state lives under `<repoRoot>/.pi-eng/`:

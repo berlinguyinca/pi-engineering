@@ -17,6 +17,13 @@
  */
 
 /** A gateway telling us to wait (or to stop). */
+import { parseAdmissionPayload } from "../inference/admissionContract.ts";
+import { parseRetryAfterHeader } from "../inference/retryDelay.ts";
+
+// Re-export the shared Retry-After parser so existing gateway callers keep a
+// single import surface; the canonical implementation lives in retryDelay.ts.
+export { parseRetryAfterHeader };
+
 export interface GatewayWaitSignal {
   /** How long to hold off, in milliseconds. Always >= 0. */
   retryAfterMs: number;
@@ -97,19 +104,6 @@ function leadingStatus(text: string): number | undefined {
   return status >= 400 && status <= 599 ? status : undefined;
 }
 
-/**
- * Parse a `Retry-After` header: delta-seconds, or an HTTP date.
- * Returns milliseconds, or undefined when unparsable.
- */
-export function parseRetryAfterHeader(value: string | undefined, nowMs: number): number | undefined {
-  if (!value) return undefined;
-  const seconds = Number.parseFloat(value.trim());
-  if (Number.isFinite(seconds) && /^\s*[\d.]+\s*$/.test(value)) return Math.max(0, Math.round(seconds * 1000));
-  const date = Date.parse(value);
-  if (Number.isFinite(date)) return Math.max(0, date - nowMs);
-  return undefined;
-}
-
 /** Case-insensitive header lookup (header casing is not guaranteed). */
 function header(headers: Record<string, string> | undefined, name: string): string | undefined {
   if (!headers) return undefined;
@@ -144,10 +138,15 @@ export function parseGatewayWait(input: GatewayWaitInput): GatewayWaitSignal | n
   const text = input.text ?? "";
   const body = text ? embeddedJson(text) : undefined;
 
+  // Structural InferWeave admission envelope, shared with the inference
+  // transport layer (type-tag gated). When the body is not an admission
+  // envelope this is undefined and we fall back to the gateway heuristics.
+  const admission = body ? parseAdmissionPayload(body) : undefined;
+
   const status = input.status ?? leadingStatus(text) ?? num(body?.status);
-  const type = str(body?.type);
-  const reason = str(body?.reason);
-  const isAdmission = type === "inference_admission" || reason === "queue_timeout";
+  const type = admission ? str(admission.payload.type) : str(body?.type);
+  const reason = admission ? admission.reason : str(body?.reason);
+  const isAdmission = admission !== undefined || type === "inference_admission" || reason === "queue_timeout";
   const looksRateLimited =
     isAdmission || /\b(rate[_ -]?limit|too many requests|overloaded|queue[_ -]?timeout|try again later)\b/i.test(text);
 
@@ -158,6 +157,7 @@ export function parseGatewayWait(input: GatewayWaitInput): GatewayWaitSignal | n
   const retryable = !NON_RETRYABLE_PATTERNS.test(text);
 
   const bodyWaitMs =
+    admission?.retryAfterMs ??
     num(body?.retry_after_ms) ??
     num(body?.retryAfterMs) ??
     num((body as Record<string, unknown> | undefined)?.["retry-after-ms"]);
@@ -185,6 +185,13 @@ export function parseGatewayWait(input: GatewayWaitInput): GatewayWaitSignal | n
     source = "default";
   }
 
+  const scope = admission ? admission.scope : str(body?.scope);
+  const activeLimit = admission ? admission.activeLimit : num(body?.active_limit);
+  const queued = admission ? admission.queued : num(body?.queued);
+  const queueLimit = admission ? admission.queueLimit : num(body?.queue_limit);
+  const requestId = admission ? admission.requestId : str(body?.request_id);
+  const message = admission ? admission.message : str(body?.message);
+
   return {
     retryAfterMs,
     retryable,
@@ -192,12 +199,12 @@ export function parseGatewayWait(input: GatewayWaitInput): GatewayWaitSignal | n
     ...(status !== undefined ? { status } : {}),
     ...(reason ? { reason } : {}),
     ...(type ? { type } : {}),
-    ...(str(body?.scope) ? { scope: str(body?.scope) } : {}),
-    ...(num(body?.active_limit) !== undefined ? { activeLimit: num(body?.active_limit) } : {}),
-    ...(num(body?.queued) !== undefined ? { queued: num(body?.queued) } : {}),
-    ...(num(body?.queue_limit) !== undefined ? { queueLimit: num(body?.queue_limit) } : {}),
-    ...(str(body?.request_id) ? { requestId: str(body?.request_id) } : {}),
-    ...(str(body?.message) ? { message: str(body?.message) } : {}),
+    ...(scope ? { scope } : {}),
+    ...(activeLimit !== undefined ? { activeLimit } : {}),
+    ...(queued !== undefined ? { queued } : {}),
+    ...(queueLimit !== undefined ? { queueLimit } : {}),
+    ...(requestId ? { requestId } : {}),
+    ...(message ? { message } : {}),
   };
 }
 

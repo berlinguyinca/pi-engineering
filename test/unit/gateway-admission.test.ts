@@ -47,6 +47,36 @@ test("describes a wait in one line", () => {
   assert.match(text, /30s/);
 });
 
+test("shares the structural admission contract with the inference transport", () => {
+  // The gateway signal parser reuses the inference `parseAdmissionPayload`
+  // contract parser, so an envelope nested one level under `error` / `detail`
+  // (the shape the inference transport already honours) is recognised here
+  // too, with all fields populated from the shared structural parse.
+  const nested = JSON.stringify({
+    error: {
+      type: "inference_admission",
+      reason: "queue_timeout",
+      retry_after_ms: 30_000,
+      active_limit: 4,
+      queued: 30,
+      queue_limit: 100,
+      request_id: "iw-9",
+      scope: "agent",
+    },
+  });
+  const signal = parseGatewayWait({ text: `429: ${nested}` });
+  assert.ok(signal);
+  assert.equal(signal.source, "body");
+  assert.equal(signal.retryAfterMs, 30_000);
+  assert.equal(signal.reason, "queue_timeout");
+  assert.equal(signal.type, "inference_admission");
+  assert.equal(signal.scope, "agent");
+  assert.equal(signal.activeLimit, 4);
+  assert.equal(signal.queued, 30);
+  assert.equal(signal.queueLimit, 100);
+  assert.equal(signal.requestId, "iw-9");
+});
+
 test("falls back to the Retry-After header when there is no body", () => {
   const signal = parseGatewayWait({ status: 429, headers: { "Retry-After": "12" } });
   assert.ok(signal);
