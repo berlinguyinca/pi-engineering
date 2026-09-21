@@ -519,3 +519,32 @@ export type {
   BudgetState as VisionBudgetState,
 } from "./vision/budget.ts";
 export * from "./vision/provider.ts";
+
+// Independent review / diagnosis / implementation-spec generation (spec 06-review-diagnose).
+export {
+  REVIEWER_ROLE_IDS,
+  REVIEWER_ROLES,
+  reviewerRoleById,
+  normalizeRootCause,
+  deriveRootCause,
+  mapFindingSurface,
+  clusterRootCauses,
+  rankClusters,
+  fnv1a,
+  buildSpec,
+  assembleReviewPlan,
+  disagreementIndex,
+} from "./uieng/review.ts";
+export type {
+  EvidenceField,
+  ReviewerRoleId,
+  ReviewerRole,
+  ReviewerScore,
+  ReviewerReview,
+  EffortLevel,
+  RiskLevel,
+  RootCauseCluster,
+  ImplementationSpecOptions,
+  ImplementationSpec,
+  ReviewPlan,
+} from "./uieng/review.ts";
