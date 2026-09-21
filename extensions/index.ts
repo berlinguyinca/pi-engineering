@@ -31,7 +31,6 @@ import { GenerationGuard } from "../src/guard/GenerationGuard.ts";
 import { RECOVERY_PROMPT, TOOL_TRANSITION_RULE, buildDegenerationEvent } from "../src/guard/RecoveryController.ts";
 import { resolveGuardConfig } from "../src/guard/config.ts";
 import { guardFeedFor } from "../src/guard/streamText.ts";
-import { LifecycleHarness } from "../src/lifecycle/harness.ts";
 import { ModelHealthProvider } from "../src/models/health.ts";
 import { defaultModelsPath, providerBaseUrl, readModelsConfig } from "../src/models/modelsConfig.ts";
 import { refreshProviderModels } from "../src/models/refresh.ts";
