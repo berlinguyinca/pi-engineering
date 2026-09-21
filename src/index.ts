@@ -714,3 +714,15 @@ export type {
   VisualVerificationRequest,
   VisualVerificationResult,
 } from "./vision/visual.ts";
+
+// InferWeave task routing + dynamically advertised capabilities (spec §30-31).
+export {
+  TASK_ANALYZE_UI,
+  TASK_IMPLEMENT,
+  TASK_VISUAL_REGRESSION,
+  routeTask,
+  DEFAULT_INFERWEAVE_CAPABILITIES,
+  InferWeaveCapabilityClient,
+  capabilitiesToJson,
+} from "./vision/inferweave.ts";
+export type { VisionTask, VisionTaskRoute, InferWeaveCapabilities } from "./vision/inferweave.ts";
