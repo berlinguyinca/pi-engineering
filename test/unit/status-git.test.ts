@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
 import { realpathSync } from "node:fs";
+import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { test } from "node:test";
