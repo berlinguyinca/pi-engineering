@@ -92,6 +92,7 @@ describe("uieng shared schema contracts", () => {
       "execution_provenance",
       "finding",
       "task_request",
+      "ui_profile",
     ]);
   });
 

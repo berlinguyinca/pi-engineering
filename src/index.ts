@@ -323,3 +323,37 @@ export type {
   MetricScore,
   RubricAggregate,
 } from "./uieng/rubric.ts";
+
+// Automatic UI-impact policy + repo/UI discovery (spec 01-auto-policy).
+export {
+  discoverUiProfile,
+  persistUiProfile,
+  loadUiProfile,
+  discoverAndPersistUiProfile,
+  DISCOVERY_LIMITS,
+} from "./uieng/discovery.ts";
+export type { UiProfile } from "./uieng/discovery.ts";
+export {
+  UI_IMPACT_LEVELS,
+  rankLevel,
+  classifyChange,
+  derivedEvaluation,
+  gateFailed,
+  autoAttach,
+  METRIC_GROUP_IDS,
+  METRIC_GROUPS,
+  BROWSER_TEST_KINDS,
+  VIEWPORT_TARGETS,
+} from "./uieng/policy.ts";
+export type {
+  UiImpactLevel,
+  MetricGroupId,
+  BrowserTestKind,
+  ViewportTarget,
+  EvaluationPlan,
+  AutoRemedy,
+  GateFailure,
+  GateBudget,
+  AutoAttachOptions,
+  AutoAttachDecision,
+} from "./uieng/policy.ts";

@@ -30,6 +30,7 @@ export const RECORD_KINDS = [
   "design_artifact",
   "candidate",
   "acceptance_decision",
+  "ui_profile",
 ] as const;
 export type RecordKind = (typeof RECORD_KINDS)[number];
 
@@ -246,6 +247,51 @@ export const AcceptanceDecisionSchema = Type.Object({
 });
 export type AcceptanceDecision = Static<typeof AcceptanceDecisionSchema>;
 
+/**
+ * UiProfile — the persisted result of automatic repository/UI discovery
+ * (docs/specs/autonomous-ui-engineering/pi-engineering/01-auto-policy.md).
+ * Produced by src/uieng/discovery.ts on repository discovery; consumed by
+ * src/uieng/policy.ts to derive proportional UI-evaluation gates.
+ */
+export const UiProfileSchema = Type.Object({
+  schema_version: schemaVersion,
+  kind: Type.Literal("ui_profile"),
+  id: idString,
+  /** When discovery ran (ISO-8601). */
+  discoveredAt: Type.String({ format: "date-time" }),
+  /** Whether the repository contains any UI surface. */
+  ui_present: Type.Boolean(),
+  /** Primary detected framework (e.g. "react", "vue", "svelte", "next", "astro"). */
+  framework: Type.Optional(Type.String({ maxLength: 100 })),
+  /** Every framework/tool detected during discovery. */
+  frameworks_detected: Type.Array(Type.String({ maxLength: 100 })),
+  /** Route entry points found (page/app/route files). */
+  routes: Type.Array(Type.String({ maxLength: 1000 })),
+  /** Component source files found. */
+  components: Type.Array(Type.String({ maxLength: 1000 })),
+  component_count: Type.Integer({ minimum: 0 }),
+  /** Styling/design-system technology (e.g. "tailwind", "css-modules", "styled-components"). */
+  styling: Type.Optional(Type.String({ maxLength: 200 })),
+  design_system: Type.Optional(Type.String({ maxLength: 200 })),
+  /** Design tokens parsed from token/theme files. */
+  tokens: Type.Optional(Type.Record(Type.String(), Type.Unknown())),
+  token_files: Type.Array(Type.String({ maxLength: 1000 })),
+  /** How to start/dev/build the UI. */
+  startup: Type.Object({
+    dev: Type.Optional(Type.String({ maxLength: 1000 })),
+    build: Type.Optional(Type.String({ maxLength: 1000 })),
+    start: Type.Optional(Type.String({ maxLength: 1000 })),
+    preview: Type.Optional(Type.String({ maxLength: 1000 })),
+  }),
+  /** Browser/E2E test entry files (playwright/cypress/vitest-browser). */
+  browser_tests: Type.Array(Type.String({ maxLength: 1000 })),
+  /** Responsive/breakpoint targets found in config or tokens. */
+  responsive_targets: Type.Array(Type.String({ maxLength: 200 })),
+  /** Design/UI specification documents. */
+  design_docs: Type.Array(Type.String({ maxLength: 1000 })),
+});
+export type UiProfile = Static<typeof UiProfileSchema>;
+
 /** Registry of all top-level record schemas keyed by kind. */
 export const SCHEMAS = {
   task_request: TaskRequestSchema,
@@ -256,6 +302,7 @@ export const SCHEMAS = {
   design_artifact: DesignArtifactSchema,
   candidate: CandidateSchema,
   acceptance_decision: AcceptanceDecisionSchema,
+  ui_profile: UiProfileSchema,
 } as const satisfies Record<RecordKind, ReturnType<typeof Type.Object>>;
 
 export type UiengRecord =
@@ -266,7 +313,8 @@ export type UiengRecord =
   | EvaluationRun
   | DesignArtifact
   | Candidate
-  | AcceptanceDecision;
+  | AcceptanceDecision
+  | UiProfile;
 
 /** Validate an unknown value against the schema for the given record kind. */
 export function validateRecord<K extends RecordKind>(kind: K, value: unknown): value is Static<(typeof SCHEMAS)[K]> {
