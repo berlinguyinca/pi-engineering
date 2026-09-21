@@ -11,15 +11,53 @@
  * the plugin.
  */
 
+import type { MissionProjection } from "./observability/types.ts";
 import type { Mission, OrchestrationTask, ReviewFinding } from "./types.ts";
 
-export const MISSION_SNAPSHOT_CONTRACT_VERSION = 1;
+export const MISSION_SNAPSHOT_CONTRACT_VERSION = 2;
 export const MISSION_SNAPSHOT_FILENAME = "orchestration-snapshot.json";
 
+/**
+ * Additive v2: `observability` was added. Older plugins feature-detect the
+ * optional field and continue to render the base mission/task/finding shape.
+ */
 export interface MissionSnapshotFile {
   contractVersion: number;
   generatedAt: string;
   missions: Array<MissionSnapshotMission>;
+}
+
+export interface MissionObservabilitySnapshot {
+  progress: { approximatePercent: number; verifiedComplete: boolean; basis: string };
+  health: string;
+  currentObjective?: string;
+  currentActivity?: { type: string; summary: string; workerId?: string } | null;
+  workers: { active: number; waiting: number; failed: number };
+  lastHeartbeatAt?: string;
+  lastMeaningfulProgressAt?: string;
+  waitingReason?: string;
+  completionStatus: string;
+  progressHistory: Array<{ at: string; approximatePercent: number; label?: string }>;
+  tests: {
+    running: boolean;
+    completed: number;
+    total: number;
+    passed: number;
+    failed: number;
+    skipped: number;
+    failures: string[];
+  };
+  review: {
+    status: string;
+    blockingOpen: number;
+    findings: Array<{ id: string; severity: string; status: string; summary: string; repaired: boolean }>;
+  };
+  workerDetails: MissionProjection["workers"];
+  activity: MissionProjection["activity"];
+  errors: MissionProjection["errors"];
+  recovery: MissionProjection["recovery"];
+  changes: MissionProjection["changes"];
+  artifacts: MissionProjection["artifacts"];
 }
 
 export interface MissionSnapshotMission {
@@ -34,6 +72,8 @@ export interface MissionSnapshotMission {
   acceptanceCriteria: Array<{ criterion: string; status: string }>;
   tasks: Array<MissionSnapshotTask>;
   findings: Array<MissionSnapshotFinding>;
+  /** Additive v2 — absent for legacy publishers / pre-observability missions. */
+  observability?: MissionObservabilitySnapshot;
 }
 
 export interface MissionSnapshotTask {
@@ -59,10 +99,56 @@ export interface MissionSnapshotFinding {
  * Build a versioned snapshot from the mission store's raw entities. The shape
  * is deliberately flat/JSON-safe and mirrors what the plugin renders.
  */
+function toObservabilitySnapshot(projection: MissionProjection): MissionObservabilitySnapshot {
+  return {
+    progress: { ...projection.summary.progress },
+    health: projection.summary.health,
+    currentObjective: projection.summary.currentObjective,
+    currentActivity: projection.summary.currentActivity,
+    workers: { ...projection.summary.workers },
+    lastHeartbeatAt: projection.summary.lastHeartbeatAt,
+    lastMeaningfulProgressAt: projection.summary.lastMeaningfulProgressAt,
+    waitingReason: projection.summary.waitingReason,
+    completionStatus: projection.summary.completionStatus,
+    progressHistory: projection.progressHistory.map((p) => ({
+      at: p.at,
+      approximatePercent: p.approximatePercent,
+      label: p.label,
+    })),
+    tests: {
+      running: projection.tests.running,
+      completed: projection.tests.completed,
+      total: projection.tests.total,
+      passed: projection.tests.passed,
+      failed: projection.tests.failed,
+      skipped: projection.tests.skipped,
+      failures: projection.tests.failures,
+    },
+    review: {
+      status: projection.review.status,
+      blockingOpen: projection.review.blockingOpen,
+      findings: projection.review.findings.map((f) => ({
+        id: f.findingId,
+        severity: f.severity,
+        status: f.status,
+        summary: f.summary,
+        repaired: f.repaired,
+      })),
+    },
+    workerDetails: projection.workers,
+    activity: projection.activity,
+    errors: projection.errors,
+    recovery: projection.recovery,
+    changes: projection.changes,
+    artifacts: projection.artifacts,
+  };
+}
+
 export function buildMissionSnapshot(
   mission: Mission,
   tasks: OrchestrationTask[],
   findings: ReviewFinding[],
+  observability?: MissionProjection | null,
 ): MissionSnapshotMission {
   return {
     id: mission.mission_id,
@@ -94,15 +180,21 @@ export function buildMissionSnapshot(
       summary: f.summary,
       taskId: f.task_id,
     })),
+    ...(observability ? { observability: toObservabilitySnapshot(observability) } : {}),
   };
 }
 
 export function buildMissionSnapshotFile(
-  missions: Array<{ mission: Mission; tasks: OrchestrationTask[]; findings: ReviewFinding[] }>,
+  missions: Array<{
+    mission: Mission;
+    tasks: OrchestrationTask[];
+    findings: ReviewFinding[];
+    observability?: MissionProjection | null;
+  }>,
 ): MissionSnapshotFile {
   return {
     contractVersion: MISSION_SNAPSHOT_CONTRACT_VERSION,
     generatedAt: new Date().toISOString(),
-    missions: missions.map((m) => buildMissionSnapshot(m.mission, m.tasks, m.findings)),
+    missions: missions.map((m) => buildMissionSnapshot(m.mission, m.tasks, m.findings, m.observability)),
   };
 }

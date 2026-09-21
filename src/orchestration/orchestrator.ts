@@ -21,6 +21,7 @@ import { type BrokerBackends, ExecutionBroker } from "./broker.ts";
 import { CompletionGate } from "./completionGate.ts";
 import { IntentRouter, workflowMutatesRepo } from "./intentRouter.ts";
 import type { MissionStore } from "./missionStore.ts";
+import type { MissionObservability } from "./observability/MissionObservability.ts";
 import { deriveRequiredGates, mutationFactFromChangedFiles } from "./policies.ts";
 import { brokerKind } from "./scheduler.ts";
 import { MissionScheduler } from "./scheduler.ts";
@@ -55,6 +56,14 @@ export type PlanTaskInput = Omit<
 export interface OrchestratorOptions {
   store: MissionStore;
   backends: BrokerBackends;
+  /**
+   * Optional observability read-model (spec 00 §observability). When present the
+   * orchestrator feeds mission/phase/task transitions into it so a real run's
+   * progress, health and activity stream live to the user. The observability
+   * service stays a projector — the store remains authoritative. Optional so the
+   * orchestrator remains usable standalone.
+   */
+  observability?: MissionObservability | null;
   /** Planner: decomposes a goal into tasks. Injected for determinism. */
   planner: (mission: Mission, risk: RiskProfile) => Promise<PlanTaskInput[]>;
   /** Acceptance criterion deriver. */
@@ -94,6 +103,7 @@ export class Orchestrator {
   private readonly planner: OrchestratorOptions["planner"];
   private readonly deriveAcceptance: OrchestratorOptions["deriveAcceptance"];
   private readonly onPhase: OrchestratorOptions["onPhase"];
+  private readonly observability: OrchestratorOptions["observability"];
   private readonly parentSessionId: string | null;
   private readonly limits: NonNullable<OrchestratorOptions["limits"]>;
   private readonly maxRepairRounds: number;
@@ -120,18 +130,47 @@ export class Orchestrator {
       // black screen for the whole worker budget (default 30 min).
       onTaskSettled: (missionId, taskId, status) => {
         this.report(`[mission ${missionId}] task ${taskId} -> ${status}`);
+        this.observeTaskSettled(missionId, taskId, status);
       },
     });
     this.gate = new CompletionGate(this.store);
     this.planner = opts.planner;
     this.deriveAcceptance = opts.deriveAcceptance;
     this.onPhase = opts.onPhase;
+    this.observability = opts.observability ?? null;
     this.parentSessionId = opts.parentSessionId ?? null;
   }
 
   private phase(mission: Mission, phase: string): void {
     this.onPhase?.(mission, phase);
     this.report(`[mission ${mission.mission_id}] phase ${phase}`);
+    this.observability?.phaseChanged(mission.mission_id, phase);
+  }
+
+  /** Signal the CompletionGate passing to observability (100% · VERIFIED COMPLETE). */
+  private observeGatePassed(missionId: string): void {
+    const obs = this.observability;
+    if (!obs) return;
+    obs.gateStarted(missionId);
+    obs.gatePassed(missionId);
+    obs.markVerifiedComplete(missionId);
+  }
+
+  /** Feed a settled task into observability (SUCCEEDED/FAILED terminal states). */
+  private observeTaskSettled(missionId: string, taskId: string, status: TaskStatus): void {
+    const obs = this.observability;
+    if (!obs) return;
+    const task = this.store.getTask(taskId);
+    const label = task?.objective ?? taskId;
+    if (status === "SUCCEEDED") {
+      obs.taskStarted(missionId, taskId, label);
+      obs.taskCompleted(missionId, taskId, label);
+      obs.workerCompleted(missionId, taskId);
+      obs.activity(missionId, { type: "worker_completed", summary: label, workerId: taskId });
+    } else if (status === "FAILED") {
+      obs.workerFailed(missionId, taskId);
+      obs.recordError(missionId, "task_failed", `task ${taskId} settled ${status}`);
+    }
   }
 
   /** Emit a live progress line to the operator (no-op when no hook is set). */
@@ -184,6 +223,7 @@ export class Orchestrator {
       workflow_class: intent.suggested_workflow,
       parent_session_id: this.parentSessionId,
     });
+    this.observability?.missionCreated(mission.mission_id, mission.title);
     this.store.transitionMission(mission.mission_id, "CLASSIFYING");
 
     // Derive acceptance criteria.
@@ -218,6 +258,7 @@ export class Orchestrator {
       this.store.transitionMission(mission.mission_id, "READY");
       this.store.transitionMission(mission.mission_id, "EXECUTING");
       this.store.transitionMission(mission.mission_id, "FINAL_VALIDATION");
+      this.observeGatePassed(mission.mission_id);
       this.store.completeMission(mission.mission_id);
       const final = this.store.getMission(mission.mission_id)!;
       const verdict = this.gate.evaluate(final);
@@ -364,6 +405,7 @@ export class Orchestrator {
       if (pre !== "FINAL_VALIDATION" && pre !== "REVIEWING") {
         this.store.transitionMission(mission.mission_id, "FINAL_VALIDATION");
       }
+      this.observeGatePassed(mission.mission_id);
       this.store.completeMission(mission.mission_id);
       this.phase(this.store.getMission(mission.mission_id)!, "complete");
       this.progress = null;

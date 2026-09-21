@@ -26,6 +26,7 @@ import {
   buildMissionSnapshotFile,
 } from "../orchestration/missionSnapshot.ts";
 import { MissionStore } from "../orchestration/missionStore.ts";
+import { MissionObservability } from "../orchestration/observability/MissionObservability.ts";
 import { Orchestrator } from "../orchestration/orchestrator.ts";
 import type { PlanTaskInput } from "../orchestration/orchestrator.ts";
 import { realBackends } from "../orchestration/realBackends.ts";
@@ -255,6 +256,12 @@ export interface EngineeringRuntimeOptions {
    */
   onPhase?: (event: RuntimePhaseEvent) => void;
   /**
+   * Optional concise user-facing mission-progress emitter (Communication Gate —
+   * always open). Emitted on meaningful transitions (phase/task/worker/test/
+   * review/stall/recovery/gate). Never suppresses ordinary Pi output.
+   */
+  onMissionObservabilityUpdate?: (missionId: string, message: string) => void;
+  /**
    * Optional orchestrator planner (spec 06). Defaults to a single implementer
    * task. Injected so deterministic tests and the extension can supply one.
    */
@@ -287,6 +294,12 @@ export class EngineeringRuntime {
   missionStore: MissionStore | null;
   /** Orchestrator facade (spec 06) — auto-invokes workflows from intent. */
   orchestrator: Orchestrator | null;
+  /**
+   * Mission observability service (spec 00 §observability): weighted-DAG
+   * progress, health/stall/loop detection, structured events, projection. Lives
+   * BESIDE the controller; the controller remains authoritative. Additive.
+   */
+  missionObservability: MissionObservability | null;
   private readonly onPhase: ((event: RuntimePhaseEvent) => void) | null;
   /** Work item whose phases are currently being reported (status surfaces only). */
   private currentWorkItemId = "";
@@ -323,6 +336,7 @@ export class EngineeringRuntime {
         mission: m,
         tasks: this.missionStore!.listTasks(m.mission_id),
         findings: this.missionStore!.listFindings(m.mission_id),
+        observability: this.missionObservability?.projection(m.mission_id) ?? null,
       }));
       const snapshot = buildMissionSnapshotFile(missions);
       await writeFile(join(this.workDir, MISSION_SNAPSHOT_FILENAME), JSON.stringify(snapshot, null, 2), "utf8");
@@ -369,6 +383,7 @@ export class EngineeringRuntime {
     this.git = null;
     this.missionStore = null;
     this.orchestrator = null;
+    this.missionObservability = null;
   }
 
   static async open(opts: EngineeringRuntimeOptions): Promise<EngineeringRuntime> {
@@ -397,6 +412,16 @@ export class EngineeringRuntime {
       openedOrchestrationStores.set(orchestrationPath, orchestrationBackend);
     }
     rt.missionStore = MissionStore.open(orchestrationBackend);
+    // Mission observability shares the SAME durable event store as the mission
+    // controller: its `mission.obs.*` events are ignored by MissionStore replay
+    // and replayed by the observability service, so progress/activity/workers/
+    // tests/review survive restart/reconnect (spec 01/05). Communication gate
+    // is always open — the update emitter never suppresses ordinary Pi output.
+    rt.missionObservability = MissionObservability.open({
+      backend: orchestrationBackend,
+      store: rt.missionStore,
+      onUpdate: opts.onMissionObservabilityUpdate,
+    });
     const backends = realBackends({
       worker: rt.worker,
       verifier: rt.verifier,
@@ -430,6 +455,7 @@ export class EngineeringRuntime {
     rt.orchestrator = new Orchestrator({
       store: rt.missionStore,
       backends,
+      observability: rt.missionObservability,
       planner: opts.orchestrationPlanner ?? defaultPlanner,
       parentSessionId: null,
       git: rt.git,

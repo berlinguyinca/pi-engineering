@@ -60,7 +60,7 @@ describe("mission snapshot publisher (spec 08 §API boundary)", () => {
 
     // The snapshot must round-trip through JSON (the plugin reads the file).
     const roundTripped = JSON.parse(JSON.stringify(file)) as typeof file;
-    assert.equal(roundTripped.contractVersion, 1);
+    assert.equal(roundTripped.contractVersion, MISSION_SNAPSHOT_CONTRACT_VERSION);
     assert.equal(roundTripped.missions[0]!.tasks[0]!.mutatesRepo, true);
   });
 });

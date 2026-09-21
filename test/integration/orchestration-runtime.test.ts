@@ -8,6 +8,7 @@
 import assert from "node:assert/strict";
 import { readFile, writeFile } from "node:fs/promises";
 import { after, describe, it } from "node:test";
+import { MISSION_SNAPSHOT_CONTRACT_VERSION } from "../../src/orchestration/missionSnapshot.ts";
 import { EngineeringRuntime } from "../../src/runtime/EngineeringRuntime.ts";
 import type { WorkerExecutor } from "../../src/workers/WorkerExecutor.ts";
 import { makeFixtureRepo } from "../fixtures/make-fixture.ts";
@@ -392,15 +393,27 @@ describe("orchestration via real EngineeringRuntime (acceptance scenarios)", () 
     fixtures.push(fx);
     const rt = await openRuntime(fx.root);
     const baseRef = await rt.git!.headCommit();
-    await rt.orchestrator!.orchestrate("Add a health endpoint", {
+    const result = await rt.orchestrator!.orchestrate("Add a health endpoint", {
       repository: rt.cwd,
       baseRef,
       mutationRequested: true,
     });
+    // The orchestrator fed the observability read-model during the real run:
+    // progress, health and worker activity are populated (spec 00 §observability).
+    const obs = rt.missionObservability!.projection(result.mission.mission_id);
+    assert.ok(obs, "observability projection present after a real orchestrated run");
+    assert.equal(obs.summary.health, "complete");
+    assert.equal(obs.summary.progress.approximatePercent, 100);
+    assert.equal(obs.summary.progress.verifiedComplete, true);
+    assert.ok(obs.progressHistory.length >= 2, "progress history accumulated during the run");
+    assert.ok(obs.activity.length >= 1, "activity events accumulated during the run");
+
     const snap = await rt.publishMissionSnapshot();
     assert.ok(snap);
-    assert.equal(snap.contractVersion, 1);
+    assert.equal(snap.contractVersion, MISSION_SNAPSHOT_CONTRACT_VERSION);
     assert.equal(snap.missions.length, 1);
+    assert.ok(snap.missions[0]!.observability, "snapshot carries the observability section");
+    assert.equal(snap.missions[0]!.observability!.health, "complete");
     // The file exists on disk where the browser plugin reads it.
     const { readFile } = await import("node:fs/promises");
     const onDisk = JSON.parse(await readFile(`${rt.workDir}/orchestration-snapshot.json`, "utf8")) as {
