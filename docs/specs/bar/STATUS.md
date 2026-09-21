@@ -109,8 +109,9 @@ steps to VERIFIED; a fresh process is required.
 `test/unit/bar-scope.test.ts`) is **VERIFIED** (2026-09-20).
 
 Evidence + provenance: `.pi-eng/artifacts/verify/bar-000-verify.md` (source
-revision `3115f0d`, linux/node v22.23.2, verifier identity = independent
-reviewer, separate from implementer).
+revision `a72f43b`, linux/node v22.23.2, verifier identity = independent
+reviewer, separate from implementer; artifact regenerated from live gate runs
+2026-09-21 after an earlier worker claimed the path without persisting it).
 
 - `npx tsc --noEmit` — exit 0
 - `node --test test/unit/bar-scope.test.ts` — 6 pass / 0 fail (incl. negative:
@@ -124,7 +125,6 @@ reviewer, separate from implementer).
 - No protected acceptance/golden/sabotage/completion-policy artifact weakened.
 - Independent review found no blocking defect.
 
-## What remains (honestly)
 ## What remains (honestly)
 
 - **BAR-000 is promoted to VERIFIED** (see BAR step status above). The remaining
