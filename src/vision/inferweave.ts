@@ -20,10 +20,7 @@ export const TASK_IMPLEMENT = "implement-react-component";
 export const TASK_VISUAL_REGRESSION = "visual-regression-review";
 
 /** The three vision tasks the router understands (spec §31). */
-export type VisionTask =
-  | typeof TASK_ANALYZE_UI
-  | typeof TASK_IMPLEMENT
-  | typeof TASK_VISUAL_REGRESSION;
+export type VisionTask = typeof TASK_ANALYZE_UI | typeof TASK_IMPLEMENT | typeof TASK_VISUAL_REGRESSION;
 
 /** A small route descriptor mapping a task to a capability + model role. */
 export interface VisionTaskRoute {
@@ -35,7 +32,11 @@ export interface VisionTaskRoute {
 const ROUTES: Record<VisionTask, VisionTaskRoute> = {
   [TASK_ANALYZE_UI]: { task: TASK_ANALYZE_UI, capability: "vision", preferredModelRole: "vision-analyst" },
   [TASK_IMPLEMENT]: { task: TASK_IMPLEMENT, capability: "code", preferredModelRole: "implementer" },
-  [TASK_VISUAL_REGRESSION]: { task: TASK_VISUAL_REGRESSION, capability: "vision", preferredModelRole: "visual-reviewer" },
+  [TASK_VISUAL_REGRESSION]: {
+    task: TASK_VISUAL_REGRESSION,
+    capability: "vision",
+    preferredModelRole: "visual-reviewer",
+  },
 };
 
 /** Return the route descriptor for a task; throws on an unknown task. */
@@ -113,10 +114,7 @@ export class InferWeaveCapabilityClient {
 
   /** Construct a RequestBudgetManager from the advertised limits. */
   async buildRequestBudgetManager(): Promise<RequestBudgetManager> {
-    const [maxRequestBytes, maxContextTokens] = await Promise.all([
-      this.maxRequestBytes(),
-      this.maxContextTokens(),
-    ]);
+    const [maxRequestBytes, maxContextTokens] = await Promise.all([this.maxRequestBytes(), this.maxContextTokens()]);
     return new RequestBudgetManager(maxRequestBytes, maxContextTokens);
   }
 
