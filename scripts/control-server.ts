@@ -37,6 +37,7 @@ import { timingSafeEqual } from "node:crypto";
 import { createServer } from "node:http";
 import { JsonlEventStore } from "../src/platform/eventstore/jsonl.ts";
 import { Platform } from "../src/platform/index.ts";
+import { RemoteHttpTransport } from "../src/platform/RemoteHttpTransport.ts";
 
 /** Largest request body accepted. A control call is a few hundred bytes. */
 const MAX_BODY_BYTES = 64 * 1024;
@@ -146,6 +147,30 @@ async function main(): Promise<void> {
   }
 
   const platform = await boot();
+  const remoteHttp = new RemoteHttpTransport(platform);
+
+  // Reflect this node into the stack node-registry (best-effort, Phase 2-lite).
+  const nodeRegistryUrl = process.env.PI_PLATFORM_NODE_REGISTRY_URL || "";
+  const thisNodeId = process.env.PI_PLATFORM_NODE_ID || "local";
+  const thisNodeEndpoint = process.env.PI_PLATFORM_NODE_ENDPOINT || "";
+  async function reflectNode() {
+    if (!nodeRegistryUrl) return;
+    try {
+      await fetch(`${nodeRegistryUrl.replace(/\/$/, "")}/register`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          node_id: thisNodeId,
+          name: thisNodeId,
+          endpoint: thisNodeEndpoint,
+          capabilities: { control_plane: true },
+        }),
+      });
+    } catch {
+      /* non-fatal: registry is stack-owned and may be absent */
+    }
+  }
+
   const server = createServer(async (req, res) => {
     const send = (code: number, obj: unknown) => {
       res.writeHead(code, { "content-type": "application/json" });
@@ -209,6 +234,29 @@ async function main(): Promise<void> {
         await platform.graph.flush();
         return send(201, w);
       }
+      if (req.method === "GET" && url.pathname === "/worker/attach") {
+        // A remote node agent dials in and attaches an outbound channel.
+        remoteHttp.attach(
+          requiredString(url.searchParams.get("workerId"), "workerId"),
+          {
+            projectId: requiredString(url.searchParams.get("projectId"), "projectId"),
+            role: requiredString(url.searchParams.get("role"), "role"),
+            node: url.searchParams.get("node") ?? "remote",
+          },
+          req,
+          res,
+        );
+        await reflectNode();
+        await platform.graph.flush();
+        return; // SSE response is owned by the transport.
+      }
+      if (req.method === "POST" && url.pathname === "/worker/result") {
+        const b = await body(req);
+        const resolved = remoteHttp.result(b);
+        await platform.graph.flush();
+        if (resolved) return send(200, { accepted: true });
+        return send(404, { error: "unknown or expired correlationId" });
+      }
       return send(404, { error: "not found" });
     } catch (err) {
       if (err instanceof BadRequest) return send(400, { error: err.message });
@@ -229,6 +277,7 @@ async function main(): Promise<void> {
   server.listen(port, bind, () => {
     const scope = isLoopback(bind) ? "loopback only" : `${bind} (token required)`;
     process.stdout.write(`control-plane listening on ${bind}:${port} — ${scope}\n`);
+    void reflectNode();
   });
 }
 
