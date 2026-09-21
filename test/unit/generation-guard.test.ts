@@ -433,6 +433,33 @@ test("buildCompactedWorkerPrompt: context is truncated to 500 chars", async () =
 
 // ─── Fallback model ID resolution (follow-up) ─────────────────────────────
 
+// ─── Role-adjusted guard budgets (review token budget) ────────────────────
+
+test("guardConfigForRole gives prose roles a generous narration/no-progress budget", async () => {
+  const { guardConfigForRole } = await import("../../src/workers/PiWorkerExecutor.ts");
+  const prose = guardConfigForRole("reviewer", DEFAULT_GUARD_CONFIG);
+  // A review must be allowed to write its findings without a false abort.
+  assert.ok(prose.maxNarrationTokensBeforeAction > DEFAULT_GUARD_CONFIG.maxNarrationTokensBeforeAction);
+  assert.ok(prose.maxReasoningTokensWithoutProgress > DEFAULT_GUARD_CONFIG.maxReasoningTokensWithoutProgress);
+  // Repetition + recovery-ladder loop mitigation stay active for prose roles.
+  assert.equal(prose.enabled, true);
+  assert.equal(prose.repeatedSentenceThreshold, DEFAULT_GUARD_CONFIG.repeatedSentenceThreshold);
+  assert.equal(prose.maxRecoveryAttempts, DEFAULT_GUARD_CONFIG.maxRecoveryAttempts);
+
+  // Other prose-producing roles are covered too.
+  for (const role of ["clean-room-challenger", "security-review", "performance-review"] as const) {
+    const cfg = guardConfigForRole(role, DEFAULT_GUARD_CONFIG);
+    assert.ok(cfg.maxNarrationTokensBeforeAction > DEFAULT_GUARD_CONFIG.maxNarrationTokensBeforeAction, role);
+  }
+});
+
+test("guardConfigForRole keeps strict budgets for tool-driven roles", async () => {
+  const { guardConfigForRole } = await import("../../src/workers/PiWorkerExecutor.ts");
+  for (const role of ["implementer", "debugger", "test-generator"] as const) {
+    assert.equal(guardConfigForRole(role, DEFAULT_GUARD_CONFIG), DEFAULT_GUARD_CONFIG, role);
+  }
+});
+
 test("PiWorkerExecutor accepts fallbackModelId option", async () => {
   const { PiWorkerExecutor } = await import("../../src/workers/PiWorkerExecutor.ts");
   const { DEFAULT_GUARD_CONFIG } = await import("../../src/guard/config.ts");

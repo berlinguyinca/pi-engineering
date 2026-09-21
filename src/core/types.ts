@@ -279,10 +279,15 @@ export const ROLE_BUDGETS: Record<WorkerRole, TokenBudget> = {
   debugger: { role: "debugger", targetTokens: 18000, hardMaxTokens: 48000 },
   "test-designer": { role: "test-designer", targetTokens: 10000, hardMaxTokens: 24000 },
   "test-generator": { role: "test-generator", targetTokens: 10000, hardMaxTokens: 24000 },
-  reviewer: { role: "reviewer", targetTokens: 10000, hardMaxTokens: 24000 },
-  "architecture-reviewer": { role: "architecture-reviewer", targetTokens: 16000, hardMaxTokens: 40000 },
-  "security-review": { role: "security-review", targetTokens: 10000, hardMaxTokens: 24000 },
-  "performance-review": { role: "performance-review", targetTokens: 10000, hardMaxTokens: 24000 },
-  "clean-room-challenger": { role: "clean-room-challenger", targetTokens: 12000, hardMaxTokens: 32000 },
-  summarizer: { role: "summarizer", targetTokens: 4000, hardMaxTokens: 8000 },
+  // Review and prose-producing roles carry larger hard budgets: an independent
+  // review must inspect a full diff/evidence set and write concrete findings
+  // without being aborted at the context cap. A review that fails because the
+  // worker hit the token budget is a false failure — the review didn't reject
+  // the work, the harness cut it off.
+  reviewer: { role: "reviewer", targetTokens: 24000, hardMaxTokens: 64000 },
+  "architecture-reviewer": { role: "architecture-reviewer", targetTokens: 24000, hardMaxTokens: 64000 },
+  "security-review": { role: "security-review", targetTokens: 24000, hardMaxTokens: 64000 },
+  "performance-review": { role: "performance-review", targetTokens: 24000, hardMaxTokens: 64000 },
+  "clean-room-challenger": { role: "clean-room-challenger", targetTokens: 24000, hardMaxTokens: 64000 },
+  summarizer: { role: "summarizer", targetTokens: 8000, hardMaxTokens: 16000 },
 };

@@ -9,7 +9,7 @@ import {
   createAgentSession,
   createExtensionRuntime,
 } from "@earendil-works/pi-coding-agent";
-import type { WorkerResult, WorkerUsage } from "../core/types.ts";
+import type { WorkerResult, WorkerRole, WorkerUsage } from "../core/types.ts";
 import type { AdmissionController } from "../gateway/AdmissionController.ts";
 import { type GatewayAdmissionConfig, sharedAdmissionController, sharedGatewayConfig } from "../gateway/config.ts";
 import { decideGatewayRetry, parseGatewayWait } from "../gateway/signals.ts";
@@ -244,6 +244,16 @@ ${TOOL_TRANSITION_RULE}`;
     const gatewayConfig = this.gatewayConfig;
     let gatewayRetries = 0;
 
+    // Prose-producing roles (reviewers, challenger, scout, summarizer) deliver
+    // prose findings/assessments, not a tool call. The generic worker guard's
+    // tight narration/no-progress budgets (600 / 1500 tokens) treated a
+    // legitimate written review as "excessive narration" / "no progress" and
+    // aborted it — a false failure that made independent reviews fail on a
+    // token budget instead of on merit. Derive a role-adjusted guard so these
+    // roles get a generous prose budget while tool-driven roles keep the
+    // strict loop-mitigation defaults.
+    const guardConfig = guardConfigForRole(req.role, this.guardConfig);
+
     while (true) {
       // Two retry layers, with a clean ownership split:
       //
@@ -262,7 +272,8 @@ ${TOOL_TRANSITION_RULE}`;
       >;
       try {
         transientOutcome = await withTransientRetry({
-          fn: () => this.runSingleAttempt(req, model, systemPrompt, modelRuntime, customTools, tools, attempt),
+          fn: () =>
+            this.runSingleAttempt(req, model, systemPrompt, modelRuntime, customTools, tools, attempt, guardConfig),
           config: this.transientConfig,
           sleep: this.transientSleep,
           rand: this.transientRand,
@@ -484,6 +495,7 @@ ${recovery.recoveryPrompt}`;
     customTools: ToolDefinition[],
     tools: string[],
     attempt: number,
+    guardConfig: GenerationGuardConfig = this.guardConfig,
   ): Promise<{
     session: { dispose: () => void; messages: readonly unknown[] };
     guardAborted: boolean;
@@ -532,8 +544,10 @@ ${recovery.recoveryPrompt}`;
     let assistantError: string | undefined;
     let promptError: unknown = undefined;
 
-    // Generation guard (spec §6-§12).
-    const guard = new GenerationGuard(this.guardConfig);
+    // Generation guard (spec §6-§12). Role-adjusted so prose-producing roles
+    // (reviewer etc.) are not aborted as "excessive narration" / "no progress"
+    // for writing a legitimate findings report.
+    const guard = new GenerationGuard(guardConfig);
     guard.setRecoveryAttempt(attempt);
 
     const enforceBudget = (message: unknown): void => {
@@ -754,6 +768,46 @@ ${recovery.recoveryPrompt}`;
 function joinExpand(base: string, rel: string): string {
   const expanded = base.replace(/^~(?=$|\/)/, homedir());
   return expanded.endsWith("/") ? `${expanded}${rel}` : `${expanded}/${rel}`;
+}
+
+/**
+ * Roles whose deliverable is prose (findings / assessment / summary) rather
+ * than a tool call. These workers must be allowed to write a substantial
+ * report; the generic worker guard's tight budgets are for tool-driven roles
+ * whose only job is to call `worker_result` after acting.
+ */
+const PROSE_ROLES: ReadonlySet<WorkerRole> = new Set<WorkerRole>([
+  "reviewer",
+  "architecture-reviewer",
+  "security-review",
+  "performance-review",
+  "clean-room-challenger",
+  "scout",
+  "summarizer",
+]);
+
+/**
+ * A review must inspect evidence and write concrete findings. It should never
+ * be cut off for "not making progress" while it is composing its report.
+ */
+const PROSE_NO_PROGRESS_BUDGET = 32_000;
+const PROSE_NARRATION_BUDGET = 24_000;
+
+/**
+ * Derive a role-adjusted generation-guard config.
+ *
+ * Tool-driven roles keep the strict defaults (loop mitigation). Prose roles get
+ * generous narration and no-progress budgets so a legitimate written review is
+ * not aborted as degeneration. All other detectors (repetition, recovery
+ * ladder) remain active for both groups.
+ */
+export function guardConfigForRole(role: WorkerRole, base: GenerationGuardConfig): GenerationGuardConfig {
+  if (!PROSE_ROLES.has(role)) return base;
+  return {
+    ...base,
+    maxNarrationTokensBeforeAction: PROSE_NARRATION_BUDGET,
+    maxReasoningTokensWithoutProgress: PROSE_NO_PROGRESS_BUDGET,
+  };
 }
 
 /**
