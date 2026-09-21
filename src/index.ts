@@ -761,3 +761,36 @@ export {
   capabilitiesToJson,
 } from "./vision/inferweave.ts";
 export type { VisionTask, VisionTaskRoute, InferWeaveCapabilities } from "./vision/inferweave.ts";
+// Staged rollout state machine (spec 10-rollout.md).
+export {
+  ROLLOUT_STAGE_ORDER,
+  rolloutStageIndex,
+  stageMutatesRepo,
+  canAdvance,
+  evidenceAllowsAdvance,
+  nextStage,
+  captureBaselineSnapshot,
+  createRolloutState,
+  recordRolloutTransition,
+  checkRollbackConditions,
+  isAuthoritativeGate,
+  rolloutApprovalForChange,
+  rolloutDisagreement,
+  rolloutBudgetAvailable,
+  rolloutAutoAttach,
+  rolloutShouldExplore,
+} from "./uieng/rollout.ts";
+export type {
+  RolloutStage,
+  RolloutConfig,
+  RolloutEvidence,
+  BaselineSnapshot,
+  RollbackCondition,
+  RolloutTransition,
+  RolloutState,
+  RollbackCandidate,
+  RollbackViolation,
+  RollbackCheck,
+  GateKind,
+  GateRef,
+} from "./uieng/rollout.ts";
