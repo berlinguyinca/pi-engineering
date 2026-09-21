@@ -210,7 +210,10 @@ async function main(): Promise<void> {
             steps = [];
           }
         }
-        const ledger = await CavEvidenceLedger.open(`${repo}/.pi-eng/cav/evidence.jsonl`);
+        // Evidence file is overridable so deployments/tests can point the surface
+        // at a seeded ledger instead of the gitignored local default.
+        const evidenceFile = process.env.PI_CAV_EVIDENCE_FILE ?? `${repo}/.pi-eng/cav/evidence.jsonl`;
+        const ledger = await CavEvidenceLedger.open(evidenceFile);
         return send(200, buildCavSurface(steps, ledger));
       }
       if (req.method === "POST" && url.pathname === "/runs") {
