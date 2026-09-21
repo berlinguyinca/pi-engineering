@@ -572,21 +572,24 @@ export type {
 
 // Candidate tournaments + Pareto acceptance gates (spec 07-tournaments-gates).
 export {
+  buildEvaluationBattery,
+  defaultCanonicalTasks,
   tournamentPlan,
-  materializeCandidateWorktrees,
+  candidateProvenance,
+  TournamentRunner,
+  PERFORMANCE_COMPLEXITY_METRICS,
+  performanceComplexityMetricIds,
+  provenanceIdentity,
+  changeRequiresApproval,
   evaluateCandidate,
-  PROMOTION_LEVELS,
-  DEFAULT_DISAGREEMENT_THRESHOLD,
-  DEFAULT_CRITICAL_METRIC_IDS,
-  COMPLEXITY_METRIC_IDS,
+  gateDisagreement,
 } from "./uieng/tournament.ts";
 export type {
-  TournamentPlan,
-  TournamentPlanOptions,
   EvaluationBattery,
-  CandidateWorktree,
+  TournamentPlan,
+  TournamentOptions,
   GateBudgets,
-  RiskFlag,
-  EvaluateCandidateOptions,
-  TournamentAcceptanceDecision,
+  ParetoGateOptions,
+  GatedAcceptanceDecision,
+  GateCriterion,
 } from "./uieng/tournament.ts";

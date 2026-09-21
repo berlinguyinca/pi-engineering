@@ -1,509 +1,600 @@
 /**
- * Candidate tournaments + Pareto acceptance gates
- * (docs/specs/autonomous-ui-engineering/pi-engineering/07-tournaments-gates.md).
+ * Candidate tournaments + Pareto acceptance gates for autonomous UI
+ * engineering (docs/specs/autonomous-ui-engineering/pi-engineering/07-tournaments-gates.md).
  *
- * For uncertain/high-impact UI changes we run a small tournament: multiple
- * isolated candidate worktrees (materialized through `src/git/GitRepo.ts`
- * `createWorktree`) each solve the task independently, then a Pareto gate
- * accepts a candidate only if it is not dominated on the 60 individually-
- * retained rubric metrics from `src/uieng/rubric.ts`, and never on a single
- * aesthetic/aggregate score. Integration/promotion is handed to
- * `src/merge/MergeQueue.ts` (candidate -> integration -> main); git is
- * referenced, never reimplemented here.
+ * Two deterministic, pure pieces (no live browser, no model invocation):
  *
- * All decision logic in this module is pure and deterministic.
+ *  1. Tournament planning: for uncertain/high-impact changes we define MULTIPLE
+ *     isolated-worktree candidates that compete, each carrying its own
+ *     {@link ExecutionProvenance} so no single model's bias propagates. The
+ *     plan derives an evaluation battery from the proportional UI policy
+ *     (src/uieng/policy.ts) and references the rubric (src/uieng/rubric.ts),
+ *     the runtime usability catalog (src/uieng/usability.ts), and the existing
+ *     git/worktree + merge-queue infrastructure (src/git/GitRepo.ts,
+ *     src/merge/MergeQueue.ts) — we reference it, never reimplement git.
+ *
+ *  2. Pareto gate: a candidate is accepted ONLY when it clears every gate
+ *     independently (target improvement, no critical regression, deterministic
+ *     tests pass, performance/complexity within budget, protected contracts
+ *     intact, disagreement resolved). Decisions are made from the 60
+ *     individually-retained rubric metrics (src/uieng/rubric.ts) — never from a
+ *     single aesthetic/aggregate score. Models never approve their own work:
+ *     the evaluator provenance MUST differ from the candidate provenance.
+ *     Low-risk proven fixes may auto-accept; major IA / product-semantic /
+ *     destructive / security-sensitive changes require approval (a
+ *     `requiresApproval` flag on the returned decision).
+ *
+ * Reuses the shared schema contracts (Candidate, AcceptanceDecision,
+ * EvaluationRun, ExecutionProvenance, Finding) from src/uieng/schemas.ts,
+ * metric ids from src/uieng/rubric.ts, usability artifacts from
+ * src/uieng/usability.ts, reviewer disagreement from src/uieng/review.ts, and
+ * {@link UiImpactLevel} from src/uieng/policy.ts.
  */
 
 import { id as newId } from "../core/ids.ts";
 import type { GitRepo, WorktreeInfo } from "../git/GitRepo.ts";
-import type { PromotionLevel } from "../merge/MergeQueue.ts";
-import {
-  type BrowserTestKind,
-  METRIC_GROUPS,
-  type UiImpactLevel,
-  VIEWPORT_TARGETS,
-  type ViewportTarget,
-  derivedEvaluation,
-} from "./policy.ts";
-import { METRICS, type MetricSeverity } from "./rubric.ts";
-import {
-  type AcceptanceDecision,
-  type Candidate,
-  type EvaluationRun,
-  type ExecutionProvenance,
-  type Finding,
-  SCHEMA_VERSION,
-  type TaskRequest,
+import type { MergeQueue } from "../merge/MergeQueue.ts";
+import { METRIC_GROUPS, derivedEvaluation } from "./policy.ts";
+import type { EvaluationPlan, UiImpactLevel } from "./policy.ts";
+import { disagreementIndex } from "./review.ts";
+import type { ReviewerScore } from "./review.ts";
+import { assertMetricKnown } from "./rubric.ts";
+import type {
+  AcceptanceDecision,
+  Candidate,
+  EvaluationRun,
+  ExecutionProvenance,
+  Finding,
+  TaskRequest,
 } from "./schemas.ts";
 import {
+  type CanonicalTask,
   ROBUSTNESS_SCENARIOS,
   type RobustnessScenario,
-  type RobustnessScenarioKind,
-  VIEWPORT_MATRIX,
   type ViewportMatrixEntry,
+  buildViewportMatrix,
 } from "./usability.ts";
 
 // ---------------------------------------------------------------------------
 // Tournament plan
 // ---------------------------------------------------------------------------
 
-/** How many competing candidates to run per UI-impact level. */
-const CANDIDATE_COUNTS: Record<UiImpactLevel, number> = {
-  L0_none: 1,
-  L1_micro: 2,
-  L2_feature_workflow: 3,
-  L3_system_design_system: 5,
-};
-
-/** Robustness scenario kinds exercised per UI-impact level. */
-const SCENARIO_KINDS_BY_LEVEL: Record<UiImpactLevel, readonly RobustnessScenarioKind[]> = {
-  L0_none: [],
-  L1_micro: ["empty_data", "loading", "refresh"],
-  L2_feature_workflow: [
-    "empty_data",
-    "huge_dataset",
-    "loading",
-    "backend_error",
-    "slow_network",
-    "rapid_clicks",
-    "double_submit",
-    "refresh",
-    "deep_link",
-    "back_forward",
-    "modal_drawer_stacking",
-  ],
-  L3_system_design_system: ROBUSTNESS_SCENARIOS.map((s) => s.kind),
-};
-
-/** Viewport-matrix entry ids selected by each plan viewport target. */
-const VIEWPORT_ENTRY_IDS: Record<ViewportTarget, readonly string[]> = {
-  mobile: ["phone-320", "phone-360", "phone-390", "phone-430"],
-  tablet: ["tablet-portrait", "tablet-landscape"],
-  desktop: ["laptop", "desktop"],
-  ultrawide: ["ultrawide"],
-};
-
-/** Promotion path a winning candidate follows through MergeQueue. */
-export const PROMOTION_LEVELS: readonly PromotionLevel[] = ["candidate", "integration", "main"];
-
-/** Per-candidate worktree isolation slot (materialized via GitRepo.createWorktree). */
-export interface CandidateWorktree {
-  candidateId: string;
-  /** Branch name the isolated worktree runs on. */
-  branch: string;
-  /** Base commit/ref the worktree forks from (the baseline). */
-  base: string;
-  /** 1-based slot in the tournament. */
-  slot: number;
-}
-
-/** The evaluation battery a winning candidate must pass. */
+/** The evaluation battery a tournament runs: rubric metrics + usability pieces. */
 export interface EvaluationBattery {
-  /** The individually-retained rubric metric ids that apply (subset of the 60). */
-  rubricMetricIds: string[];
-  /** Usability robustness scenarios exercised. */
-  scenarios: RobustnessScenario[];
-  /** Viewport matrix entries evaluated against. */
+  /** Applicable rubric metric ids (from the proportional UI policy). */
+  metric_ids: string[];
+  /** Canonical usability tasks to exercise. */
+  tasks: CanonicalTask[];
+  /** Viewport matrix entries to render at. */
   viewports: ViewportMatrixEntry[];
-  /** Browser test kinds to run. */
-  browserTests: BrowserTestKind[];
-  reason: string;
+  /** viewport id -> applicable rubric reflow/layout metric ids. */
+  viewport_metric_groups: Record<string, string[]>;
+  /** Robustness scenarios to run. */
+  scenarios: RobustnessScenario[];
 }
 
-/** A complete tournament plan for one task + UI-impact level. */
+/** A full candidate-tournament plan for one task. */
 export interface TournamentPlan {
-  schema_version: number;
-  taskRequest: TaskRequest;
-  impactLevel: UiImpactLevel;
-  /** Number of competing candidates. */
-  candidateCount: number;
-  /** Candidate records (src/uieng/schemas.ts) to be executed. */
+  task_request: TaskRequest;
+  /** The UI-impact level the tournament is scoped to. */
+  ui_impact_level: UiImpactLevel;
+  /** Competing isolated-worktree candidates (one per branch). */
   candidates: Candidate[];
-  /** Which rubric metrics + usability scenarios + viewports apply. */
-  evaluationBattery: EvaluationBattery;
-  /** The ref (commit/branch) every candidate forks from. */
-  baselineRef: string;
-  /** Isolated worktrees to materialize via GitRepo.createWorktree. */
-  worktrees: CandidateWorktree[];
-  /** Promotion path through MergeQueue (candidate -> integration -> main). */
-  promotionLevels: readonly PromotionLevel[];
-  /** L2/L3 (and higher-candidate) changes require human approval to land. */
-  requiresApproval: boolean;
+  evaluation_battery: EvaluationBattery;
+  /** Baseline ref the candidates branch from (e.g. "main" or a commit SHA). */
+  baseline_ref: string;
+  /** Human-readable reason for the tournament shape. */
   reason: string;
 }
 
-export interface TournamentPlanOptions {
-  /** Baseline ref every candidate forks from. Default "main". */
+/** Options controlling tournament shape. */
+export interface TournamentOptions {
+  /** Baseline branch/commit the worktrees branch from. Default "main". */
   baselineRef?: string;
-  /** Branch prefix for candidate worktrees. Default "cand". */
+  /** Optional UI profile forwarded to the proportional policy plan. */
+  uiProfile?: unknown;
+  /** Explicit canonical tasks; defaults to the standard catalog. */
+  tasks?: CanonicalTask[];
+  /** Explicit robustness scenarios; defaults to the full catalog. */
+  scenarios?: RobustnessScenario[];
+  /** Explicit viewport matrix; defaults to the full matrix. */
+  viewports?: ViewportMatrixEntry[];
+  /** Prefix for candidate worktree branches. Default "cand". */
   branchPrefix?: string;
 }
 
-function slugify(input: string): string {
-  const slug = input
-    .replace(/[^a-zA-Z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .toLowerCase();
-  return slug || "task";
-}
+/**
+ * The number of competing candidates per UI-impact level. Higher impact /
+ * higher uncertainty → more isolated candidates so divergent solutions can
+ * compete before any single one is promoted.
+ */
+const CANDIDATE_COUNT_BY_LEVEL: Record<UiImpactLevel, number> = {
+  L0_none: 0,
+  L1_micro: 2,
+  L2_feature_workflow: 3,
+  L3_system_design_system: 4,
+};
 
-/** Diversity (0..1) per candidate slot: higher-impact levels spread more. */
-function diversityFor(level: UiImpactLevel, index: number, count: number): number {
-  if (count <= 1) return 0;
-  return Math.round(((index / (count - 1)) * 0.8 + rankBonus(level)) * 100) / 100;
-}
-
-function rankBonus(level: UiImpactLevel): number {
-  switch (level) {
-    case "L3_system_design_system":
-      return 0.2;
-    case "L2_feature_workflow":
-      return 0.1;
-    default:
-      return 0;
-  }
+/** The standard canonical-task catalog used when no tasks are supplied. */
+export function defaultCanonicalTasks(): CanonicalTask[] {
+  return [
+    {
+      id: "task-primary-flow",
+      goal: "Complete the primary user journey end-to-end.",
+      mode: "first_time",
+      required_states: ["home", "primary"],
+      success_criteria: ["Primary journey completes successfully", "State is correct at the end"],
+      viewport_targets: ["phone-390", "desktop"],
+    },
+    {
+      id: "task-keyboard-access",
+      goal: "Complete a core task using only the keyboard.",
+      mode: "keyboard",
+      required_states: ["primary"],
+      success_criteria: ["Every interactive element is reachable by keyboard", "Focus never lost or trapped"],
+      viewport_targets: ["desktop"],
+    },
+    {
+      id: "task-recovery",
+      goal: "Recover cleanly from an error mid-task without losing context.",
+      mode: "first_time",
+      required_states: ["primary", "error"],
+      success_criteria: ["Error is surfaced clearly", "Recovery preserves context"],
+      viewport_targets: ["tablet-portrait"],
+    },
+  ];
 }
 
 /**
- * Build a tournament plan for a task at a UI-impact level. Pure/deterministic:
- * chooses candidate count, isolated worktree branches, and the evaluation
- * battery (rubric metric ids + usability robustness scenarios + viewport
- * matrix) by reusing `derivedEvaluation` from `src/uieng/policy.ts` and the
- * scenario/viewport catalogs from `src/uieng/usability.ts`. Worktrees are
- * referenced as branch slots to be materialized with `GitRepo.createWorktree`;
- * promotion follows `MergeQueue` levels — git is not reimplemented here.
+ * Assemble the evaluation battery for a tournament. Metric ids come from the
+ * proportional UI policy for the level; viewports, scenarios, and tasks come
+ * from src/uieng/usability.ts.
+ */
+export function buildEvaluationBattery(plan: EvaluationPlan, opts: TournamentOptions = {}): EvaluationBattery {
+  const viewports = opts.viewports ?? [...buildViewportMatrix()];
+  const viewportMetricGroups: Record<string, string[]> = {};
+  for (const v of viewports) viewportMetricGroups[v.id] = v.metric_ids;
+  return {
+    metric_ids: [...plan.metric_ids],
+    tasks: opts.tasks ?? defaultCanonicalTasks(),
+    viewports,
+    viewport_metric_groups: viewportMetricGroups,
+    scenarios: opts.scenarios ?? [...ROBUSTNESS_SCENARIOS],
+  };
+}
+
+/**
+ * Build a tournament plan for a task at a UI-impact level. For high-impact /
+ * uncertain changes this returns MULTIPLE isolated-worktree candidates with
+ * distinct provenance and diversity; for L0 (no UI impact) it returns zero
+ * candidates (no tournament). Pure/deterministic over the structured inputs.
  */
 export function tournamentPlan(
   taskRequest: TaskRequest,
-  impactLevel: UiImpactLevel,
-  options: TournamentPlanOptions = {},
+  uiImpactLevel: UiImpactLevel,
+  opts: TournamentOptions = {},
 ): TournamentPlan {
-  const policyPlan = derivedEvaluation({ level: impactLevel });
-  const baselineRef = options.baselineRef ?? "main";
-  const branchPrefix = options.branchPrefix ?? "cand";
-  const count = CANDIDATE_COUNTS[impactLevel];
-  const baseSlug = slugify(taskRequest.id);
+  const plan = derivedEvaluation({ level: uiImpactLevel, uiProfile: opts.uiProfile as never });
+  const battery = buildEvaluationBattery(plan, opts);
+  const count = CANDIDATE_COUNT_BY_LEVEL[uiImpactLevel];
+  const prefix = opts.branchPrefix ?? "cand";
+  const baselineRef = opts.baselineRef ?? "main";
 
   const candidates: Candidate[] = [];
-  const worktrees: CandidateWorktree[] = [];
-  for (let slot = 1; slot <= count; slot++) {
-    const branch = `${branchPrefix}-${baseSlug}-${slot}`;
-    const provenance: ExecutionProvenance = {
-      schema_version: SCHEMA_VERSION,
-      kind: "execution_provenance",
-      id: newId("PRV"),
-      selected_model: `tournament-${slot}`,
-      runtime: "tournament-plan",
-    };
-    const candidate: Candidate = {
-      schema_version: SCHEMA_VERSION,
+  for (let i = 0; i < count; i++) {
+    const diversity = count <= 1 ? 0 : i / (count - 1);
+    candidates.push({
+      schema_version: 1,
       kind: "candidate",
       id: newId("CAND"),
       task_request: taskRequest,
       artifacts: [],
-      provenance,
-      diversity: diversityFor(impactLevel, slot - 1, count),
+      provenance: candidateProvenance(uiImpactLevel, i),
+      diversity,
       status: "pending",
-    };
-    candidates.push(candidate);
-    worktrees.push({ candidateId: candidate.id, branch, base: baselineRef, slot });
+    });
   }
 
-  const scenarios = ROBUSTNESS_SCENARIOS.filter((s) => SCENARIO_KINDS_BY_LEVEL[impactLevel].includes(s.kind));
-  const viewports = policyPlan.viewports.flatMap((target) =>
-    (VIEWPORT_ENTRY_IDS[target] ?? [])
-      .map((id) => VIEWPORT_MATRIX.find((v) => v.id === id))
-      .filter((v): v is ViewportMatrixEntry => v !== undefined),
-  );
-
-  const battery: EvaluationBattery = {
-    rubricMetricIds: [...policyPlan.metric_ids],
-    scenarios,
-    viewports,
-    browserTests: [...policyPlan.browser_tests],
-    reason: policyPlan.reason,
-  };
-
-  const requiresApproval = impactLevel === "L2_feature_workflow" || impactLevel === "L3_system_design_system";
-
   return {
-    schema_version: SCHEMA_VERSION,
-    taskRequest,
-    impactLevel,
-    candidateCount: count,
+    task_request: taskRequest,
+    ui_impact_level: uiImpactLevel,
     candidates,
-    evaluationBattery: battery,
-    baselineRef,
-    worktrees,
-    promotionLevels: [...PROMOTION_LEVELS],
-    requiresApproval,
-    reason: `Tournament of ${count} candidate(s) for ${impactLevel}; each candidate evaluated on ${battery.rubricMetricIds.length} individual rubric metrics across ${battery.viewports.length} viewport(s).`,
+    evaluation_battery: battery,
+    baseline_ref: baselineRef,
+    reason: plan.reason,
+  };
+}
+
+/** Derive a deterministic per-slot provenance so candidate branches differ. */
+export function candidateProvenance(level: UiImpactLevel, slot: number): ExecutionProvenance {
+  return {
+    schema_version: 1,
+    kind: "execution_provenance",
+    id: newId("EXEC"),
+    provider: "uieng-tournament",
+    selected_model: `candidate-${level}-${slot}`,
+    site: "isolated-worktree",
+    node: `slot-${slot}`,
+    selection_reason: `Tournament candidate slot ${slot} for UI-impact level ${level}`,
   };
 }
 
 /**
- * Materialize the isolated candidate worktrees for a plan by delegating to
- * `GitRepo.createWorktree` (src/git/GitRepo.ts). This is the reuse seam that
- * keeps git in GitRepo — the tournament only supplies branch names.
+ * A thin orchestrator that materializes the plan's isolated worktrees using the
+ * existing git worktree infrastructure (src/git/GitRepo.ts) and can promote a
+ * winner through the merge queue (src/merge/MergeQueue.ts). It references —
+ * never reimplements — those primitives.
  */
-export async function materializeCandidateWorktrees(
-  git: GitRepo,
-  plan: TournamentPlan,
-  baseCommit: string,
-): Promise<WorktreeInfo[]> {
-  const created: WorktreeInfo[] = [];
-  for (const worktree of plan.worktrees) {
-    created.push(await git.createWorktree(baseCommit, worktree.branch));
+export class TournamentRunner {
+  private readonly git: GitRepo;
+  private readonly queue: MergeQueue;
+
+  constructor(git: GitRepo, queue: MergeQueue) {
+    this.git = git;
+    this.queue = queue;
   }
-  return created;
+
+  /** Create one isolated worktree per candidate branch at the baseline. */
+  async materialize(plan: TournamentPlan): Promise<WorktreeInfo[]> {
+    const worktrees: WorktreeInfo[] = [];
+    for (const candidate of plan.candidates) {
+      const branch = `${plan.baseline_ref}-${candidate.id.toLowerCase()}`;
+      const wt = await this.git.createWorktree(plan.baseline_ref, branch);
+      worktrees.push(wt);
+    }
+    return worktrees;
+  }
+
+  /** Promote a winner branch through the merge queue (integration gate). */
+  promote(branch: string): ReturnType<MergeQueue["promote"]> {
+    return this.queue.promote(branch);
+  }
 }
 
 // ---------------------------------------------------------------------------
-// Pareto acceptance gate
+// Pareto gate
 // ---------------------------------------------------------------------------
 
-/** Performance/complexity budget floors enforced by the gate. */
+/** Performance/complexity metric ids that must stay within budget. */
+export const PERFORMANCE_COMPLEXITY_METRICS: readonly string[] = [...METRIC_GROUPS.performance, "component_complexity"];
+
+/** Performance/complexity metric ids, de-duplicated and validated. */
+export function performanceComplexityMetricIds(): string[] {
+  return [...new Set(PERFORMANCE_COMPLEXITY_METRICS)];
+}
+
+/** Numeric budgets for the gate (performance/complexity floors). */
 export interface GateBudgets {
-  /** Minimum candidate score on every performance-group metric. Default 0. */
-  performanceFloor?: number;
-  /** Minimum candidate score on every complexity-group metric. Default 0. */
-  complexityFloor?: number;
-  /** Max allowed drop on a protected contract metric vs baseline. Default 0. */
-  maxProtectedRegression?: number;
+  /** Minimum score for every performance/complexity metric (default 50). */
+  performanceComplexityFloor?: number;
+  /** Per-metric minimum floors overriding the group default. */
+  metricFloors?: Record<string, number>;
 }
 
-/** Risk flags that force a human-approval gate (never auto-merge). */
-export type RiskFlag =
-  | "ia_restructuring"
-  | "product_semantic_change"
-  | "destructive"
-  | "security_sensitive"
-  | "data_loss"
-  | "breaking_api";
+/** Options to {@link evaluateCandidate} — the Pareto gate inputs. */
+export interface ParetoGateOptions {
+  /** Critical metric ids (task/accessibility/behavior) that have a hard floor. */
+  criticalMetricIds: string[];
+  budgets: GateBudgets;
+  /** Protected semantics/contract names that must remain intact. */
+  protectedContracts: string[];
+  /** metric id -> required candidate-minus-baseline delta. */
+  targetDeltas: Record<string, number>;
+  /** Whether the deterministic verification tests passed. Default true. */
+  deterministicTestsPass?: boolean;
+  /** Whether all protected contracts are intact in the candidate. Default true. */
+  protectedContractsIntact?: boolean;
+  /** Observed reviewer disagreement (0..1). Default 0. */
+  disagreement?: number;
+  /** Max acceptable disagreement before a verdict is trusted. Default 0.2. */
+  maxDisagreement?: number;
+  /** Floor below which a critical metric fails. Default 50. */
+  criticalFloor?: number;
+  /** The candidate under evaluation (carries its own provenance). */
+  candidate: Candidate;
+  /** The evaluator provenance — MUST differ from the candidate's. */
+  evaluatorProvenance: ExecutionProvenance;
+  /** Whether this change is major IA / product-semantic / destructive / security-sensitive. */
+  highRiskChange?: boolean;
+  /** Explicit override forcing `requiresApproval` regardless of risk class. */
+  forceRequiresApproval?: boolean;
+  /** Optional pre-built evaluation run; one is synthesized when omitted. */
+  evaluation?: EvaluationRun;
+}
 
-/** Default max reviewer-disagreement before a verdict is untrusted. */
-export const DEFAULT_DISAGREEMENT_THRESHOLD = 0.35;
+/** The gate verdict: accepted + whether human approval is still required. */
+export type GatedAcceptanceDecision = AcceptanceDecision & { requiresApproval: boolean };
 
-/** Metrics treated as critical when the caller does not supply its own set. */
-export const DEFAULT_CRITICAL_METRIC_IDS: readonly string[] = METRICS.filter(
-  (m) => m.severity === "high" || m.severity === "critical",
-).map((m) => m.id);
+/** A single gate-criterion evaluation result (why the gate passed/failed). */
+export interface GateCriterion {
+  id: string;
+  label: string;
+  passed: boolean;
+  detail: string;
+}
 
-/** Complexity-group metric ids used by the budget check. */
-export const COMPLEXITY_METRIC_IDS: readonly string[] = [
-  "component_complexity",
-  "dependency_complexity",
-  "code_duplication",
-  "design_entropy",
+const clampScore = (n: number): number => Math.min(100, Math.max(0, n));
+
+/**
+ * A stable identity for a provenance: two executions are the same agent when
+ * their model/gateway/provider/site/node all match. Used so a model can never
+ * approve its own work.
+ */
+export function provenanceIdentity(prov: ExecutionProvenance): string {
+  return JSON.stringify([
+    prov.selected_model,
+    prov.provider ?? null,
+    prov.gateway ?? null,
+    prov.site ?? null,
+    prov.node ?? null,
+  ]);
+}
+
+const APPROVAL_TRIGGER_PATTERNS: readonly RegExp[] = [
+  /information\s*arch/i,
+  /\bia\b/i,
+  /product\s*semantic/i,
+  /destructive/i,
+  /security/i,
+  /auth/i,
+  /schema/i,
+  /migration/i,
+  /breaking/i,
+  /redirect/i,
+  /permission/i,
 ];
 
-export interface EvaluateCandidateOptions {
-  /** The candidate under evaluation (its provenance must differ from the evaluator). */
-  candidate: Candidate;
-  /** Evaluator provenance; self-approval is forbidden when it matches the candidate's. */
-  evaluatorProvenance: ExecutionProvenance;
-  /** Metric ids treated as critical (task/accessibility/behavior). */
-  criticalMetricIds?: readonly string[];
-  /** Absolute floor per critical metric; defaults to the baseline score. */
-  criticalMetricFloors?: Readonly<Record<string, number>>;
-  /** Performance/complexity budget floors. */
-  budgets?: GateBudgets;
-  /** Metric ids whose protected semantics/contracts must stay intact. */
-  protectedContracts?: readonly string[];
-  /** metricId -> minimum required candidate-baseline delta (0..100). */
-  targetDeltas?: Readonly<Record<string, number>>;
-  /** Deterministic test gate result (e.g. npx tsc --noEmit + node --test). */
-  deterministicTests?: { passed: boolean; failures?: readonly string[] };
-  /** Reviewer-disagreement index from src/uieng/review.ts (0..1). */
-  disagreementIndex?: number;
-  /** Max acceptable disagreement. Default {@link DEFAULT_DISAGREEMENT_THRESHOLD}. */
-  disagreementThreshold?: number;
-  /** Risk flags that force human approval. */
-  riskFlags?: readonly RiskFlag[];
-  /** UI-impact level; L2/L3 changes require approval. */
-  impactLevel?: UiImpactLevel;
-}
-
 /**
- * A Pareto acceptance decision. Extends the shared `AcceptanceDecision` schema
- * record with the `requiresApproval` flag the tournament gate requires.
+ * Deterministically classify a change kind as requiring human approval. Major
+ * information-architecture, product-semantic, destructive, or
+ * security-sensitive changes must not be auto-accepted.
  */
-export interface TournamentAcceptanceDecision extends AcceptanceDecision {
-  /** True when human/model approval is required before the change may land. */
-  requiresApproval: boolean;
+export function changeRequiresApproval(changeKind: string): boolean {
+  return APPROVAL_TRIGGER_PATTERNS.some((re) => re.test(changeKind));
 }
 
-const clampScore = (n: number): number => {
-  if (!Number.isFinite(n)) throw new Error(`Invalid score ${String(n)}; expected 0..100`);
-  return Math.min(100, Math.max(0, n));
-};
-
-function normalizeScores(scores: Readonly<Record<string, number>>): Record<string, number> {
-  const out: Record<string, number> = {};
-  for (const [metricId, value] of Object.entries(scores)) out[metricId] = clampScore(value);
-  return out;
+/** Score lookup with a fail-fast for unknown metric ids. */
+function scoreAt(scores: Record<string, number>, metricId: string): number {
+  const value = scores[metricId];
+  if (value === undefined) throw new Error(`Missing score for metric "${metricId}" in the gate inputs`);
+  assertMetricKnown(metricId);
+  return clampScore(value);
 }
 
-/** Self-approval check: same model + provider means the model judged its own work. */
-function sameProvenance(a: ExecutionProvenance, b: ExecutionProvenance): boolean {
-  return a.selected_model === b.selected_model && a.provider === b.provider;
-}
-
-function gateFinding(metricId: string, severity: MetricSeverity, impact: string): Finding {
-  return {
-    schema_version: SCHEMA_VERSION,
-    kind: "finding",
-    id: newId("FIND"),
-    rubric: metricId,
-    score: 0,
-    confidence: 0.9,
-    severity,
-    evidence: [],
-    impact,
-  };
-}
+const findingFor = (metricId: string, message: string, severity: Finding["severity"]): Finding => ({
+  schema_version: 1,
+  kind: "finding",
+  id: newId("FIND"),
+  rubric: metricId,
+  score: 0,
+  confidence: 0.9,
+  severity,
+  evidence: [],
+  impact: message,
+  root_cause: `Pareto gate criterion failed for metric ${metricId}`,
+});
 
 /**
- * Evaluate one candidate against the baseline via the Pareto acceptance gate.
+ * Evaluate a candidate against the baseline across ALL gate criteria. Returns a
+ * persisted-ready {@link AcceptanceDecision} (plus a `requiresApproval` flag).
  *
- * Acceptance requires ALL of:
- *   1. target improvement (expected metric deltas met),
- *   2. no critical task/accessibility/behavior regression (critical metrics at/above floor),
- *   3. deterministic tests pass,
- *   4. performance/complexity within budget floors,
- *   5. protected semantics/contracts intact (no regression beyond budget),
- *   6. reviewer disagreement resolved/below threshold,
- *   7. the evaluator is NOT the same model that produced the candidate.
+ * Acceptance requires EVERY gate to pass independently:
+ *  - target improvement (each required delta met);
+ *  - no critical regression (each critical metric at/above its floor);
+ *  - deterministic tests pass;
+ *  - performance/complexity within budgets;
+ *  - protected semantics/contracts intact;
+ *  - disagreement resolved/below threshold.
  *
- * The decision is made on the 60 individually-retained rubric metrics; a single
- * aggregate/aesthetic score is never used to accept or reject. Low-risk proven
- * fixes may auto-accept; major IA / product-semantic / destructive /
- * security-sensitive changes (and L2/L3 impact) set `requiresApproval`.
+ * Models never approve their own work: if the evaluator provenance equals the
+ * candidate's provenance the decision is rejected outright. The decision is
+ * made from the 60 individually-retained rubric metrics — never an aggregate.
  */
 export function evaluateCandidate(
-  baselineScores: Readonly<Record<string, number>>,
-  candidateScores: Readonly<Record<string, number>>,
-  options: EvaluateCandidateOptions,
-): TournamentAcceptanceDecision {
-  const baseline = normalizeScores(baselineScores);
-  const candidate = normalizeScores(candidateScores);
+  baselineScores: Record<string, number>,
+  candidateScores: Record<string, number>,
+  opts: ParetoGateOptions,
+): GatedAcceptanceDecision {
+  const { criticalMetricIds, budgets, protectedContracts, targetDeltas, candidate, evaluatorProvenance } = opts;
+
+  const deterministicTestsPass = opts.deterministicTestsPass ?? true;
+  const protectedContractsIntact = opts.protectedContractsIntact ?? true;
+  const disagreement = opts.disagreement ?? 0;
+  const maxDisagreement = opts.maxDisagreement ?? 0.2;
+  const criticalFloor = opts.criticalFloor ?? 50;
+  const performanceFloor = budgets.performanceComplexityFloor ?? 50;
+  const highRiskChange = opts.highRiskChange ?? false;
+
+  const criteria: GateCriterion[] = [];
   const findings: Finding[] = [];
-  const reasons: string[] = [];
-  let accepted = true;
 
-  // 1. No self-approval: the evaluator must not share provenance with the candidate.
-  if (sameProvenance(options.evaluatorProvenance, options.candidate.provenance)) {
-    accepted = false;
-    reasons.push("Self-approval: evaluator and candidate share the same provenance.");
-    findings.push(gateFinding("self_approval", "critical", "Evaluator must differ from the candidate's provenance."));
+  // 0. Self-approval guard: a model never approves its own work.
+  const sameProvenance = provenanceIdentity(candidate.provenance) === provenanceIdentity(evaluatorProvenance);
+  if (sameProvenance) {
+    const finding = findingFor(
+      candidate.provenance.selected_model,
+      "Evaluator provenance matches candidate provenance",
+      "critical",
+    );
+    findings.push(finding);
   }
+  criteria.push({
+    id: "independent_evaluator",
+    label: "Independent evaluator",
+    passed: !sameProvenance,
+    detail: sameProvenance
+      ? "Evaluator and candidate share provenance; a model cannot approve its own work."
+      : "Evaluator provenance differs from candidate provenance.",
+  });
 
-  // 2. Target improvement: each target metric must meet its required delta.
-  for (const [metricId, delta] of Object.entries(options.targetDeltas ?? {})) {
-    const b = baseline[metricId] ?? 0;
-    const c = candidate[metricId] ?? 0;
-    if (c - b < delta) {
-      accepted = false;
-      reasons.push(`Target improvement on ${metricId} not met: expected +${delta}, got ${Math.round(c - b)}.`);
-      findings.push(gateFinding(metricId, "high", `Target improvement on ${metricId} not met.`));
-    }
+  // 1. Target improvement: each required delta must be met.
+  const targetIds = Object.keys(targetDeltas);
+  const targetFindings: string[] = [];
+  for (const metricId of targetIds) {
+    const required = targetDeltas[metricId] ?? 0;
+    const delta = scoreAt(candidateScores, metricId) - scoreAt(baselineScores, metricId);
+    if (delta < required) targetFindings.push(`${metricId}: +${delta.toFixed(1)} < +${required}`);
   }
-
-  // 3. Critical metric floors: any regression below floor fails the gate.
-  const criticalIds =
-    options.criticalMetricIds !== undefined && options.criticalMetricIds.length > 0
-      ? options.criticalMetricIds
-      : DEFAULT_CRITICAL_METRIC_IDS;
-  for (const metricId of criticalIds) {
-    const floor = options.criticalMetricFloors?.[metricId] ?? baseline[metricId] ?? 0;
-    const c = candidate[metricId];
-    if (c === undefined || c < floor) {
-      accepted = false;
-      reasons.push(`Critical regression on ${metricId}: score ${c ?? "n/a"} below floor ${floor}.`);
-      findings.push(
-        gateFinding(metricId, "critical", `Critical task/accessibility/behavior regression on ${metricId}.`),
-      );
-    }
+  const targetMet = targetFindings.length === 0;
+  if (!targetMet) {
+    findings.push(
+      findingFor("critical_task_completion", `Target improvement not met: ${targetFindings.join("; ")}`, "high"),
+    );
   }
+  criteria.push({
+    id: "target_improvement",
+    label: "Target improvement",
+    passed: targetMet,
+    detail: targetMet ? "All required metric deltas met." : `Deltas missed: ${targetFindings.join("; ")}`,
+  });
 
-  // 4. Deterministic tests must pass.
-  if (options.deterministicTests && !options.deterministicTests.passed) {
-    accepted = false;
-    reasons.push("Deterministic tests did not pass.");
-    findings.push(gateFinding("deterministic_tests", "critical", "Deterministic tests failed."));
+  // 2. No critical regression: every critical metric at/above its floor.
+  const criticalFloors: string[] = [];
+  for (const metricId of criticalMetricIds) {
+    const score = scoreAt(candidateScores, metricId);
+    const floor = budgets.metricFloors?.[metricId] ?? criticalFloor;
+    if (score < floor) criticalFloors.push(`${metricId}: ${score.toFixed(1)} < ${floor}`);
   }
-
-  // 5. Performance/complexity within budget floors.
-  const perfFloor = options.budgets?.performanceFloor ?? 0;
-  for (const metricId of METRIC_GROUPS.performance) {
-    const c = candidate[metricId];
-    if (c !== undefined && c < perfFloor) {
-      accepted = false;
-      reasons.push(`Performance metric ${metricId} at ${c} below floor ${perfFloor}.`);
-      findings.push(gateFinding(metricId, "high", `Performance/complexity budget exceeded on ${metricId}.`));
-    }
+  const criticalMet = criticalFloors.length === 0;
+  if (!criticalMet) {
+    findings.push(
+      findingFor(
+        "critical_task_completion",
+        `Critical regression below floor: ${criticalFloors.join("; ")}`,
+        "critical",
+      ),
+    );
   }
-  const complexityFloor = options.budgets?.complexityFloor ?? 0;
-  for (const metricId of COMPLEXITY_METRIC_IDS) {
-    const c = candidate[metricId];
-    if (c !== undefined && c < complexityFloor) {
-      accepted = false;
-      reasons.push(`Complexity metric ${metricId} at ${c} below floor ${complexityFloor}.`);
-      findings.push(gateFinding(metricId, "high", `Performance/complexity budget exceeded on ${metricId}.`));
-    }
+  criteria.push({
+    id: "critical_regression",
+    label: "No critical regression",
+    passed: criticalMet,
+    detail: criticalMet ? "All critical metrics at/above their floors." : `Below floor: ${criticalFloors.join("; ")}`,
+  });
+
+  // 3. Deterministic tests pass.
+  if (!deterministicTestsPass) {
+    findings.push(findingFor("critical_task_completion", "Deterministic verification tests did not pass", "high"));
   }
+  criteria.push({
+    id: "deterministic_tests",
+    label: "Deterministic tests pass",
+    passed: deterministicTestsPass,
+    detail: deterministicTestsPass ? "Deterministic verification passed." : "Deterministic verification failed.",
+  });
 
-  // 6. Protected semantics/contracts must stay intact.
-  const maxProtectedRegression = options.budgets?.maxProtectedRegression ?? 0;
-  for (const contractId of options.protectedContracts ?? []) {
-    const b = baseline[contractId] ?? 0;
-    const c = candidate[contractId] ?? 0;
-    if (c < b - maxProtectedRegression) {
-      accepted = false;
-      reasons.push(`Protected contract ${contractId} regressed from ${b} to ${c}.`);
-      findings.push(gateFinding(contractId, "critical", `Protected semantics/contract ${contractId} broken.`));
-    }
+  // 4. Performance/complexity within budgets.
+  const perfBreaches: string[] = [];
+  for (const metricId of performanceComplexityMetricIds()) {
+    if (candidateScores[metricId] === undefined) continue;
+    const floor = budgets.metricFloors?.[metricId] ?? performanceFloor;
+    const score = scoreAt(candidateScores, metricId);
+    if (score < floor) perfBreaches.push(`${metricId}: ${score.toFixed(1)} < ${floor}`);
   }
-
-  // 7. Reviewer disagreement must be resolved/below threshold.
-  const threshold = options.disagreementThreshold ?? DEFAULT_DISAGREEMENT_THRESHOLD;
-  if (options.disagreementIndex !== undefined && options.disagreementIndex > threshold) {
-    accepted = false;
-    reasons.push(`Reviewer disagreement ${options.disagreementIndex} above threshold ${threshold}.`);
-    findings.push(gateFinding("disagreement", "medium", "Reviewer disagreement exceeds the acceptable threshold."));
+  const perfMet = perfBreaches.length === 0;
+  if (!perfMet) {
+    findings.push(
+      findingFor("render_performance_cost", `Performance/complexity over budget: ${perfBreaches.join("; ")}`, "medium"),
+    );
   }
+  criteria.push({
+    id: "performance_budget",
+    label: "Performance/complexity within budgets",
+    passed: perfMet,
+    detail: perfMet ? "All performance/complexity metrics within budget." : `Over budget: ${perfBreaches.join("; ")}`,
+  });
 
-  // Approval requirement: L2/L3 impact or explicit risk flags.
-  const requiresApproval =
-    (options.riskFlags?.length ?? 0) > 0 ||
-    options.impactLevel === "L2_feature_workflow" ||
-    options.impactLevel === "L3_system_design_system";
+  // 5. Protected semantics/contracts intact.
+  const contractMet = protectedContractsIntact && protectedContracts.length > 0 ? true : protectedContractsIntact;
+  const contractDetail =
+    protectedContracts.length === 0
+      ? "No protected contracts declared."
+      : protectedContractsIntact
+        ? `Protected contracts intact: ${protectedContracts.join(", ")}`
+        : `Protected contract(s) broken: ${protectedContracts.join(", ")}`;
+  if (!contractMet) {
+    findings.push(
+      findingFor("semantic_accessibility", `Protected contracts broken: ${protectedContracts.join(", ")}`, "critical"),
+    );
+  }
+  criteria.push({
+    id: "protected_contracts",
+    label: "Protected semantics/contracts intact",
+    passed: contractMet,
+    detail: contractDetail,
+  });
 
-  const run: EvaluationRun = {
-    schema_version: SCHEMA_VERSION,
+  // 6. Disagreement resolved/below threshold.
+  const disagreementMet = disagreement <= maxDisagreement;
+  if (!disagreementMet) {
+    findings.push(
+      findingFor(
+        "critical_task_completion",
+        `Reviewer disagreement ${disagreement.toFixed(2)} above threshold ${maxDisagreement.toFixed(2)}`,
+        "high",
+      ),
+    );
+  }
+  criteria.push({
+    id: "disagreement",
+    label: "Disagreement resolved/below threshold",
+    passed: disagreementMet,
+    detail: disagreementMet
+      ? `Disagreement ${disagreement.toFixed(2)} at/below threshold ${maxDisagreement.toFixed(2)}.`
+      : `Disagreement ${disagreement.toFixed(2)} exceeds threshold ${maxDisagreement.toFixed(2)}.`,
+  });
+
+  const allPassed = criteria.every((c) => c.passed);
+  const accepted = allPassed && !sameProvenance;
+
+  // Approval: high-risk changes (or a forced override) always require approval,
+  // even when accepted. Low-risk proven fixes may auto-accept.
+  const requiresApproval = (opts.forceRequiresApproval ?? false) || highRiskChange;
+
+  const rationale =
+    accepted && !requiresApproval
+      ? `Candidate accepted and auto-approved: all ${criteria.length} Pareto gate criteria passed; low-risk proven fix with independent evaluator.`
+      : accepted
+        ? `Candidate accepted but requires human approval (${highRiskChange ? "high-risk change class" : "approval override"}).`
+        : `Candidate rejected: ${
+            criteria
+              .filter((c) => !c.passed)
+              .map((c) => c.label)
+              .join(", ") || "independent-evaluator requirement failed"
+          }.`;
+
+  const decidedAt = new Date().toISOString();
+  const evaluation: EvaluationRun = opts.evaluation ?? {
+    schema_version: 1,
     kind: "evaluation_run",
-    id: newId("EVAL"),
-    task_request: options.candidate.task_request,
-    provenance: options.evaluatorProvenance,
+    id: newId("RUN"),
+    task_request: candidate.task_request,
+    provenance: evaluatorProvenance,
     findings,
-    started_at: new Date().toISOString(),
+    started_at: decidedAt,
+    finished_at: decidedAt,
     verdict: accepted ? "pass" : "fail",
   };
 
-  const decision: TournamentAcceptanceDecision = {
-    schema_version: SCHEMA_VERSION,
+  return {
+    schema_version: 1,
     kind: "acceptance_decision",
-    id: newId("DEC"),
-    candidate: options.candidate,
+    id: newId("ADEC"),
+    candidate,
     accepted,
-    rationale:
-      reasons.length > 0 ? reasons.join("; ") : "Pareto gate passed on all individually-retained rubric metrics.",
+    rationale,
     findings,
-    evaluation: run,
-    provenance: options.evaluatorProvenance,
-    decided_at: new Date().toISOString(),
+    evaluation,
+    provenance: evaluatorProvenance,
+    decided_at: decidedAt,
     requiresApproval,
   };
+}
 
-  return decision;
+/**
+ * Convenience wrapper around {@link disagreementIndex} to compute the gate's
+ * disagreement input from reviewer scores (reusing src/uieng/review.ts).
+ */
+export function gateDisagreement(reviews: readonly ReviewerScore[]): number {
+  return disagreementIndex(reviews);
 }
