@@ -664,6 +664,41 @@ export type {
   GateCriterion,
 } from "./uieng/tournament.ts";
 
+// pi-web integration adapter surface (spec 09-pi-web-adapter).
+export {
+  WEB_SNAPSHOT_VERSION,
+  UIENG_EVENT_TYPES,
+  buildWebSnapshot,
+  computeMetricDeltas,
+  uiengEvaluationCompleted,
+  uiengFindingMapped,
+  uiengCandidateAccepted,
+  uiengWorkDequeued,
+  uiengApprovalRequested,
+} from "./uieng/web.ts";
+export type {
+  UiengEventType,
+  ScoreTrendPoint,
+  BeforeAfterPair,
+  TaskSuccessEntry,
+  MetricDelta,
+  WorkQueueItem,
+  ProtectedApproval,
+  WebSnapshotInput,
+  WebSnapshot,
+  UiengEventEnvelope,
+  EvaluationCompletedEvent,
+  FindingMappedEvent,
+  CandidateAcceptedEvent,
+  WorkDequeuedEvent,
+  ApprovalRequestedEvent,
+  UiengEvent,
+  PiWebSnapshotQuery,
+  PiWebQueueQuery,
+  PiWebApprovalsQuery,
+  PiWebAdapter,
+} from "./uieng/web.ts";
+
 // Autonomous UI quality controller (spec 08-autonomous-controller).
 export {
   createQualityState,
