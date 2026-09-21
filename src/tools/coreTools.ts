@@ -178,22 +178,26 @@ export function buildCoreTools(
       const meta = services.artifacts.getByUri(String(params.uri));
       if (!meta)
         return { content: [{ type: "text", text: "Artifact not found." }], details: { found: false }, isError: true };
-      const text = await services.artifacts.readContentByUri(String(params.uri));
+      const offset = params.offset ? Math.max(0, Number(params.offset)) : 0;
+      const cap = params.max_chars ? Math.max(1, Number(params.max_chars)) : 12000;
+      // Read only the requested byte range from disk (true lazy retrieval for
+      // large outputs) rather than loading the whole file and slicing in memory.
+      const read = await services.artifacts.readSliceByUri(String(params.uri), offset, cap);
       // A missing content file must surface as an error, not a silent empty
       // result (a reviewer would otherwise judge an empty diff and could
       // report no findings, enabling silent promotion).
-      if (text == null) {
+      if (read == null) {
         return {
           content: [{ type: "text", text: "Artifact metadata exists but its content file is missing." }],
           details: { found: false },
           isError: true,
         };
       }
-      const offset = params.offset ? Math.max(0, Number(params.offset)) : 0;
-      const cap = params.max_chars ? Math.max(1, Number(params.max_chars)) : 12000;
-      const slice = text.slice(offset, offset + cap);
-      const more = offset + cap < text.length;
-      const out = more ? `${slice}\n… [truncated; call artifact_read with offset=${offset + cap} to continue]` : slice;
+      const slice = read.content;
+      const more = offset + cap < meta.size;
+      const out = more
+        ? `${slice}\n… [truncated; call artifact_read with offset=${read.nextOffset} to continue]`
+        : slice;
       return {
         content: [{ type: "text", text: out }],
         details: { uri: meta.uri, size: meta.size, summary: meta.summary, offset, more },

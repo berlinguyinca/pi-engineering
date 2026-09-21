@@ -22,8 +22,8 @@ export interface StackLifecycleOptions {
   pollMs?: number;
   /** Injectable fetch (deterministic in tests). */
   fetchImpl?: typeof fetch;
-  /** Extra environment variables merged into the child's environment. */
-  env?: Record<string, string>;
+  /** Extra environment variables for the child process (merged over process.env). */
+  env?: NodeJS.ProcessEnv;
 }
 
 export interface StackLifecycleResult {
@@ -85,7 +85,7 @@ export async function runRealStackLifecycle(
     spawnError = e;
   };
   try {
-    const cleanEnv = { ...process.env, NODE_TEST_CONTEXT: "", ...opts.env };
+    const cleanEnv = { ...process.env, NODE_TEST_CONTEXT: "", ...(opts.env ?? {}) };
     child = spawn(opts.command, opts.args, {
       cwd: opts.cwd,
       env: cleanEnv,
