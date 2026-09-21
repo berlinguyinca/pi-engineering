@@ -521,6 +521,26 @@ export type {
 export * from "./vision/provider.ts";
 export * from "./vision/asset.ts";
 export * from "./vision/processor.ts";
+export {
+  UNIFIED_CONTRACT_SCHEMA_VERSION,
+  TOPIC_AREAS,
+  detectConflicts,
+  DesignContractMerger,
+  renderContractMarkdown,
+} from "./vision/merger.ts";
+export type {
+  ReferencePrecedence,
+  ReferenceConflict,
+  ContractSection,
+  UnifiedDesignContract,
+} from "./vision/merger.ts";
+export {
+  DEFAULT_ANALYSIS_ROOT,
+  VisionObservationStore,
+  buildTraceability,
+} from "./vision/store.ts";
+export type { TraceabilityRecord } from "./vision/store.ts";
+
 
 // Independent review / diagnosis / implementation-spec generation (spec 06-review-diagnose).
 export {
