@@ -244,6 +244,8 @@ export const AcceptanceDecisionSchema = Type.Object({
   evaluation: EvaluationRunSchema,
   provenance: ExecutionProvenanceSchema,
   decided_at: Type.String({ format: "date-time" }),
+  /** True when the change requires human/model approval before it may land. */
+  requiresApproval: Type.Optional(Type.Boolean()),
 });
 export type AcceptanceDecision = Static<typeof AcceptanceDecisionSchema>;
 

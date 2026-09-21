@@ -541,7 +541,6 @@ export {
 } from "./vision/store.ts";
 export type { TraceabilityRecord } from "./vision/store.ts";
 
-
 // Independent review / diagnosis / implementation-spec generation (spec 06-review-diagnose).
 export {
   REVIEWER_ROLE_IDS,
@@ -570,3 +569,24 @@ export type {
   ImplementationSpec,
   ReviewPlan,
 } from "./uieng/review.ts";
+
+// Candidate tournaments + Pareto acceptance gates (spec 07-tournaments-gates).
+export {
+  tournamentPlan,
+  materializeCandidateWorktrees,
+  evaluateCandidate,
+  PROMOTION_LEVELS,
+  DEFAULT_DISAGREEMENT_THRESHOLD,
+  DEFAULT_CRITICAL_METRIC_IDS,
+  COMPLEXITY_METRIC_IDS,
+} from "./uieng/tournament.ts";
+export type {
+  TournamentPlan,
+  TournamentPlanOptions,
+  EvaluationBattery,
+  CandidateWorktree,
+  GateBudgets,
+  RiskFlag,
+  EvaluateCandidateOptions,
+  TournamentAcceptanceDecision,
+} from "./uieng/tournament.ts";
