@@ -1,4 +1,4 @@
-import { mkdir, readFile, readdir, unlink, writeFile } from "node:fs/promises";
+import { mkdir, open, readFile, readdir, unlink, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type { ArtifactMeta } from "../core/types.ts";
 
@@ -82,9 +82,19 @@ export class ArtifactStore {
     return meta;
   }
 
-  /** Return the artifact summary (compact; never injects full content). */
+  /**
+   * Return an artifact's metadata (compact; never injects full content).
+   * Accepts the composite 'category/id' index key, or a bare id that is unique
+   * across categories (the index is keyed by 'category/id', so a raw-id lookup
+   * would otherwise always miss).
+   */
   async get(id: string): Promise<ArtifactMeta | undefined> {
-    return this.index.get(id);
+    const direct = this.index.get(id);
+    if (direct) return direct;
+    for (const [key, meta] of this.index) {
+      if (key.endsWith(`/${id}`)) return meta;
+    }
+    return undefined;
   }
 
   getByUri(uri: string): ArtifactMeta | undefined {
@@ -106,6 +116,48 @@ export class ArtifactStore {
     const meta = this.getByUri(uri);
     if (!meta) return undefined;
     return this.readContent(meta.category, meta.id);
+  }
+
+  /**
+   * Lazily read a bounded slice of artifact content directly from disk, without
+   * loading the whole file into memory. Supports paging through large outputs
+   * (logs/diffs/reports) with an explicit offset. Returns undefined when the
+   * content file is missing.
+   */
+  async readSlice(
+    category: string,
+    id: string,
+    offset = 0,
+    maxChars = 12000,
+  ): Promise<{ content: string; nextOffset: number } | undefined> {
+    try {
+      const handle = await open(this.contentPath(category, id), "r");
+      try {
+        const { bytesRead, buffer } = await handle.read({
+          position: Math.max(0, offset),
+          length: Math.max(1, maxChars),
+        });
+        return {
+          content: buffer.subarray(0, bytesRead).toString("utf-8"),
+          nextOffset: offset + bytesRead,
+        };
+      } finally {
+        await handle.close();
+      }
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Bounded lazy read of an artifact by its artifact:// URI. */
+  async readSliceByUri(
+    uri: string,
+    offset = 0,
+    maxChars = 12000,
+  ): Promise<{ content: string; nextOffset: number } | undefined> {
+    const meta = this.getByUri(uri);
+    if (!meta) return undefined;
+    return this.readSlice(meta.category, meta.id, offset, maxChars);
   }
 
   async delete(uri: string): Promise<void> {

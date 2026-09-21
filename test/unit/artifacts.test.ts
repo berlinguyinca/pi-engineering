@@ -37,3 +37,50 @@ test("artifact store is rehydrated from disk after reopen", async () => {
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("artifact get resolves by composite key and by bare unique id", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-eng-art-"));
+  try {
+    const store = await ArtifactStore.create(join(dir, "artifacts"));
+    await store.put("verify", "tr-9", "content-a", "summary a");
+    await store.put("logs", "run-1", "content-b", "summary b");
+
+    // Composite key (the index key) resolves directly.
+    assert.equal((await store.get("verify/tr-9"))?.summary, "summary a");
+    // Bare id resolves across categories (the latent get(id) bug fix).
+    assert.equal((await store.get("tr-9"))?.summary, "summary a");
+    assert.equal((await store.get("run-1"))?.summary, "summary b");
+    // Unknown ids return undefined.
+    assert.equal(await store.get("does-not-exist"), undefined);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("artifact slices are read lazily and page correctly", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-eng-art-"));
+  try {
+    const store = await ArtifactStore.create(join(dir, "artifacts"));
+    const body = "abcdefghij";
+    await store.put("logs", "paged", body, "s");
+
+    const first = await store.readSlice("logs", "paged", 0, 4);
+    assert.equal(first?.content, "abcd");
+    assert.equal(first?.nextOffset, 4);
+
+    const second = await store.readSliceByUri("artifact://logs/paged", 4, 4);
+    assert.equal(second?.content, "efgh");
+    assert.equal(second?.nextOffset, 8);
+
+    // Past the end returns the remaining tail, not more bytes than exist.
+    const tail = await store.readSliceByUri("artifact://logs/paged", 8, 100);
+    assert.equal(tail?.content, "ij");
+    assert.equal(tail?.nextOffset, 10);
+
+    // Missing content file surfaces as undefined (not an empty string).
+    await rm(join(dir, "artifacts", "logs", "paged.txt"));
+    assert.equal(await store.readSliceByUri("artifact://logs/paged", 0, 4), undefined);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
