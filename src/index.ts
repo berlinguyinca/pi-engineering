@@ -311,3 +311,22 @@ export {
   buildTraceability,
 } from "./vision/store.ts";
 export type { TraceabilityRecord } from "./vision/store.ts";
+
+
+// Vision worker isolation + 413 recovery (Phase 3/4).
+export {
+  VISION_ANALYSIS_TASK,
+  VISUAL_REGRESSION_TASK,
+  IMPLEMENT_TASK,
+  VISION_WORKER_INSTRUCTIONS,
+  buildVisionWorkerContext,
+  VisionAnalysisWorker,
+} from "./vision/worker.ts";
+export type { VisionWorkerRequest, VisionWorkerResult } from "./vision/worker.ts";
+export {
+  DESIGN_OBSERVATION_TEXT_ALLOWANCE_BYTES,
+  classifyBoundary,
+  buildDiagnostic,
+  PayloadRecoveryManager,
+} from "./vision/recovery.ts";
+export type { PayloadBoundary, PayloadDiagnostic } from "./vision/recovery.ts";
