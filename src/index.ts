@@ -647,3 +647,19 @@ export type {
   ControlEvent,
   RevertResult,
 } from "./uieng/controller.ts";
+export {
+  VISUAL_DIFF_SCHEMA_VERSION,
+  DEFAULT_VIEWPORTS,
+  validateVisualDiffObservation,
+  isVisualDiffObservation,
+  renderVisualDiffMarkdown,
+  planResponsiveViewports,
+  VisualVerificationWorker,
+} from "./vision/visual.ts";
+export type {
+  VisualDifference,
+  Viewport,
+  VisualDiffObservation,
+  VisualVerificationRequest,
+  VisualVerificationResult,
+} from "./vision/visual.ts";
