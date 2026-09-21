@@ -16,12 +16,11 @@ import {
   type WebSnapshotInput,
 } from "../../src/uieng/web.ts";
 import { METRICS, aggregateScores, scoreAll } from "../../src/uieng/rubric.ts";
-import { clusterRootCauses, disagreementIndex, rankClusters } from "../../src/uieng/review.ts";
+import { clusterRootCauses, disagreementIndex, rankClusters, reviewerRoleById } from "../../src/uieng/review.ts";
 import { VIEWPORT_MATRIX, evaluateCanonicalTask } from "../../src/uieng/usability.ts";
 import { createQualityState } from "../../src/uieng/controller.ts";
 import { changeRequiresApproval } from "../../src/uieng/tournament.ts";
 import type {
-  AcceptanceDecision,
   Candidate,
   EvaluationRun,
   ExecutionProvenance,
@@ -174,8 +173,20 @@ function baseInput(overrides: Partial<WebSnapshotInput> = {}): WebSnapshotInput 
     },
     taskSuccess: [],
     reviewerReviews: [
-      { roleId: "ux", score: 0.8, confidence: 0.9 },
-      { roleId: "accessibility", score: 0.6, confidence: 0.8 },
+      {
+        roleId: "diagnosis_architect",
+        role: reviewerRoleById("diagnosis_architect"),
+        score: 0.8,
+        confidence: 0.9,
+        findingIds: ["F1", "F2", "F3"],
+      },
+      {
+        roleId: "deterministic",
+        role: reviewerRoleById("deterministic"),
+        score: 0.6,
+        confidence: 0.8,
+        findingIds: ["F1", "F2", "F3"],
+      },
     ],
     baselineScores: { visual_hierarchy: 60, contrast_ratio: 55 },
     candidateScores: { visual_hierarchy: 75, contrast_ratio: 55 },
@@ -196,7 +207,7 @@ describe("buildWebSnapshot", () => {
     assert.equal(snap.dashboard.scores.length, 60);
     assert.equal(snap.dashboard.secondary, true);
     assert.equal(snap.trends.length, 2);
-    assert.equal(snap.clusters.length, 2);
+    assert.equal(snap.rootCauseMap.length, 2);
     assert.equal(snap.designGallery.length, 1);
     assert.equal(snap.responsivePreviews.length, VIEWPORT_MATRIX.length);
     assert.equal(snap.candidateComparisons.candidates.length, 1);
@@ -204,8 +215,8 @@ describe("buildWebSnapshot", () => {
     assert.equal(
       snap.reviewerConsensus.disagreement,
       disagreementIndex([
-        { roleId: "ux", score: 0.8, confidence: 0.9 },
-        { roleId: "accessibility", score: 0.6, confidence: 0.8 },
+        { roleId: "diagnosis_architect", score: 0.8, confidence: 0.9 },
+        { roleId: "deterministic", score: 0.6, confidence: 0.8 },
       ]),
     );
     // causal deltas computed from baseline vs candidate score maps.
@@ -229,11 +240,11 @@ describe("buildWebSnapshot", () => {
   });
 
   it("computes per-metric deltas deterministically and sorted by metric id", () => {
-    const deltas = computeMetricDeltas({ a11y_contrast: 50, visual_hierarchy: 60 }, { a11y_contrast: 90, visual_hierarchy: 75 }, provenance("evaluator"));
+    const deltas = computeMetricDeltas({ contrast: 50, visual_hierarchy: 60 }, { contrast: 90, visual_hierarchy: 75 }, provenance("evaluator"));
     const ids = deltas.map((d) => d.metric_id);
     assert.deepEqual(ids, [...ids].sort());
-    const a11y = deltas.find((d) => d.metric_id === "a11y_contrast");
-    assert.equal(a11y?.delta, 40);
+    const contrast = deltas.find((d) => d.metric_id === "contrast");
+    assert.equal(contrast?.delta, 40);
     // metric not present on both sides is skipped.
     const filtered = computeMetricDeltas({ only_base: 1 }, { visual_hierarchy: 10 }, provenance("evaluator"));
     assert.equal(filtered.length, 0);
@@ -280,22 +291,31 @@ describe("uieng event constructors", () => {
   });
 
   it("constructs a candidate.accepted event", () => {
-    const decision = baseInput().approvalDecisions[0] as AcceptanceDecision;
+    const decision = baseInput().approvalDecisions[0] as GatedAcceptanceDecision;
     const ev = uiengCandidateAccepted({ id: "E3", at, provenance: prov, decision });
     assert.equal(ev.type, "uieng.candidate.accepted");
     assert.equal(ev.payload.decision.candidate.id, "CAND-A");
   });
 
   it("constructs a work.dequeued event", () => {
-    const state = createQualityState("M1");
-    const item = state.qualityDebt[0]!;
+    const item = {
+      id: "DEBT-1",
+      rootCause: "spacing tokens inconsistent",
+      metricIds: ["spacing"],
+      impact: 0.5,
+      effort: 0.3,
+      risk: 0.2,
+      createdAt: "2026-09-15T00:00:00Z",
+      status: "open" as const,
+    };
+    const state = createQualityState("M1", { debt: [item] });
     const ev = uiengWorkDequeued({ id: "E4", at, provenance: prov, item, state });
     assert.equal(ev.type, "uieng.work.dequeued");
     assert.equal(ev.payload.item.id, item.id);
   });
 
   it("constructs an approval.requested event", () => {
-    const decision = baseInput().approvalDecisions[0] as AcceptanceDecision;
+    const decision = baseInput().approvalDecisions[0] as GatedAcceptanceDecision;
     const ev = uiengApprovalRequested({ id: "E5", at, provenance: prov, decision, reason: "schema migration" });
     assert.equal(ev.type, "uieng.approval.requested");
     assert.equal(ev.payload.reason, "schema migration");
@@ -305,7 +325,7 @@ describe("uieng event constructors", () => {
   it("all event envelopes carry schema_version, type, id, at, provenance", () => {
     const state = createQualityState("M1");
     const item = state.qualityDebt[0]!;
-    const decision = baseInput().approvalDecisions[0] as AcceptanceDecision;
+    const decision = baseInput().approvalDecisions[0] as GatedAcceptanceDecision;
     const events: UiengEvent[] = [
       uiengEvaluationCompleted({ id: "E1", at, provenance: prov, run: baseInput().approvalDecisions[0]!.evaluation, dashboard: baseInput().dashboard }),
       uiengFindingMapped({ id: "E2", at, provenance: prov, cluster: baseInput().clusters[0]!, surface: "Nav" }),
