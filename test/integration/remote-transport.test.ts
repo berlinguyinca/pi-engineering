@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
-import { describe, it, afterEach } from "node:test";
-import { Platform } from "../../src/platform/index.ts";
+import { afterEach, describe, it } from "node:test";
 import { RemoteHttpTransport } from "../../src/platform/RemoteHttpTransport.ts";
-import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 import type { WorkerCommandEnvelope } from "../../src/platform/RemoteWorker.ts";
+import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
+import { Platform } from "../../src/platform/index.ts";
 
 const servers: Array<ReturnType<typeof createServer>> = [];
 const platforms: Platform[] = [];
@@ -58,11 +58,12 @@ function runAgent(control: string, workerId: string) {
       if (event !== "command") return;
       const env = JSON.parse(data) as WorkerCommandEnvelope;
       const base = { workerId: env.workerId, generation: env.generation };
-      const result = env.command.kind === "heartbeat"
-        ? { ...base, ok: true, ack: "remote-alive" }
-        : env.command.kind === "run_task"
-          ? { ...base, ok: false, ack: "remote task execution not yet wired" }
-          : { ...base, ok: true, ack: "ack" };
+      const result =
+        env.command.kind === "heartbeat"
+          ? { ...base, ok: true, ack: "remote-alive" }
+          : env.command.kind === "run_task"
+            ? { ...base, ok: false, ack: "remote task execution not yet wired" }
+            : { ...base, ok: true, ack: "ack" };
       void fetch(`${control}/worker/result`, {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -72,7 +73,9 @@ function runAgent(control: string, workerId: string) {
     void (async () => {
       while (true) {
         try {
-          const res = await fetch(`${control}/worker/attach?workerId=${workerId}&projectId=PRJ&role=worker&node=agent-node`);
+          const res = await fetch(
+            `${control}/worker/attach?workerId=${workerId}&projectId=PRJ&role=worker&node=agent-node`,
+          );
           const reader = res.body!.getReader();
           const decoder = new TextDecoder();
           let buffer = "";
@@ -80,15 +83,18 @@ function runAgent(control: string, workerId: string) {
             const { done, value } = await reader.read();
             if (done) break;
             buffer += decoder.decode(value, { stream: true });
-            let idx;
-            while ((idx = buffer.indexOf("\n\n")) >= 0) {
+            let idx = buffer.indexOf("\n\n");
+            while (idx >= 0) {
               const frame = buffer.slice(0, idx);
               buffer = buffer.slice(idx + 2);
               for (const line of frame.split("\n").filter((l) => !l.startsWith(":"))) {
-                if (line.startsWith("event:")) { event = line.slice(6).trim(); lines.length = 0; }
-                else if (line.startsWith("data:")) lines.push(line.slice(5).trim());
+                if (line.startsWith("event:")) {
+                  event = line.slice(6).trim();
+                  lines.length = 0;
+                } else if (line.startsWith("data:")) lines.push(line.slice(5).trim());
               }
               flush();
+              idx = buffer.indexOf("\n\n");
             }
           }
         } catch {

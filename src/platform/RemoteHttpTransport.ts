@@ -132,7 +132,12 @@ export class RemoteHttpTransport {
   private send(envelope: WorkerCommandEnvelope): Promise<CommandResult> {
     const res = this.streams.get(envelope.workerId);
     if (!res) {
-      return Promise.resolve({ workerId: envelope.workerId, generation: envelope.generation, ok: false, ack: "no channel" });
+      return Promise.resolve({
+        workerId: envelope.workerId,
+        generation: envelope.generation,
+        ok: false,
+        ack: "no channel",
+      });
     }
     const correlationId = this.correlationId();
     const framed: WorkerCommandEnvelope = { ...envelope, correlationId };
@@ -144,7 +149,12 @@ export class RemoteHttpTransport {
     } catch {
       this.pending.delete(correlationId);
       this.handleDisconnect(envelope.workerId, "write failed");
-      return Promise.resolve({ workerId: envelope.workerId, generation: envelope.generation, ok: false, ack: "write failed" });
+      return Promise.resolve({
+        workerId: envelope.workerId,
+        generation: envelope.generation,
+        ok: false,
+        ack: "write failed",
+      });
     }
     return promise;
   }

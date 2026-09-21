@@ -35,9 +35,9 @@
 
 import { timingSafeEqual } from "node:crypto";
 import { createServer } from "node:http";
+import { RemoteHttpTransport } from "../src/platform/RemoteHttpTransport.ts";
 import { JsonlEventStore } from "../src/platform/eventstore/jsonl.ts";
 import { Platform } from "../src/platform/index.ts";
-import { RemoteHttpTransport } from "../src/platform/RemoteHttpTransport.ts";
 
 /** Largest request body accepted. A control call is a few hundred bytes. */
 const MAX_BODY_BYTES = 64 * 1024;
