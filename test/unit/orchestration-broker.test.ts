@@ -426,4 +426,78 @@ describe("ExecutionBroker (spec 03)", () => {
       await fx.cleanup();
     }
   });
+
+  it("surfaces an attributable finding when a mutating worker succeeds with no edits to harvest", async () => {
+    const fx = await makeFixtureRepo();
+    try {
+      const git = (await GitRepo.open(fx.root))!;
+      const store = MissionStore.open(JsonlEventStore.inMemory());
+      const m = store.createMission({
+        title: "x",
+        goal: "x",
+        user_request: "x",
+        repository: ".",
+        base_ref: await git!.headCommit(),
+        risk_profile: "medium",
+        workflow_class: "engineering_review",
+      });
+      const t = store.createTask({
+        mission_id: m.mission_id,
+        kind: "agent",
+        role: "implementer",
+        objective: "x",
+        mutates_repo: true,
+        isolation: "worktree",
+        write_domains: ["src/**"],
+      });
+      store.transitionTask(t.task_id, "READY");
+
+      // The worker reports SUCCESS but never touches its isolated worktree. This
+      // is exactly the "harvested worktrees were empty" case the integration
+      // finding calls out: the broker must record WHO came back empty so the
+      // later opaque integration block is not the only trace.
+      const broker = new ExecutionBroker({
+        store,
+        git,
+        baseRef: await git!.headCommit(),
+        backends: {
+          agent: {
+            runAgent: async () => ({
+              executionId: "e",
+              exitStatus: "succeeded",
+              summary: "done (no changes needed)",
+              artifactRefs: [],
+              usage: {},
+            }),
+          },
+        },
+      });
+      const handle = await broker.execute({
+        taskId: t.task_id,
+        missionId: m.mission_id,
+        kind: "agent",
+        role: "implementer",
+        objective: "x",
+        mutatesRepo: true,
+        isolation: "worktree",
+      });
+      await handle.result();
+
+      const findings = store.listFindings(m.mission_id);
+      assert.ok(
+        findings.some(
+          (f) =>
+            f.category === "integration" &&
+            f.summary.includes("held no committed work") &&
+            f.summary.includes("harvested worktree was empty") &&
+            f.task_id === t.task_id,
+        ),
+        `expected an attributable empty-harvest finding for the worker task, got ${findings
+          .map((f) => `${f.severity}:${f.category}:${f.summary} (task=${f.task_id})`)
+          .join(" | ")}`,
+      );
+    } finally {
+      await fx.cleanup();
+    }
+  });
 });

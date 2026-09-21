@@ -11,6 +11,31 @@ import { groupPhases, loadCavSteps } from "../../src/cav/steps.ts";
 
 const REPO = resolve(import.meta.dirname, "../..");
 
+const BASE_EVIDENCE = {
+  gitSha: "test-sha",
+  workerRunId: "RUN-test",
+  gateType: "unit",
+  tool: "node",
+  command: "cav-surface.test.ts",
+  exitCode: 0,
+};
+
+/**
+ * Seed a fresh evidence ledger with VERIFIED evidence for the given steps so a
+ * surface built from it is non-trivial. Deterministic: the ledger is created
+ * (or cleared) from scratch, so the test does not depend on pre-populated
+ * `.pi-eng` durable state that a fresh checkout / CI does not have.
+ */
+async function seedVerified(steps: ReturnType<typeof loadCavSteps>, file?: string): Promise<CavEvidenceLedger> {
+  const ledger = file ? await CavEvidenceLedger.open(file) : CavEvidenceLedger.inMemory();
+  ledger.clear();
+  for (const step of steps) {
+    // record() accepts VERIFIED directly; role-gating only applies to promote().
+    await ledger.record(step.id, "VERIFIED", { ...BASE_EVIDENCE, role: "reviewer" });
+  }
+  return ledger;
+}
+
 test("control-server exposes a /cav status+evidence data surface for external consumers", async () => {
   const port = 19000 + Math.floor(Math.random() * 200);
   const steps = loadCavSteps(`${REPO}/docs/specs/cav/steps`);
