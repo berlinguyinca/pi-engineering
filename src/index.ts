@@ -501,6 +501,57 @@ export type {
   UsabilityEvaluationInputs,
 } from "./uieng/usability.ts";
 
+
+// Automatic design exploration + diffusion planning (spec 03-design-exploration).
+export {
+  DIFFUSION_REFERENCE_NOTE,
+  SUBSTANTIAL_TASK_THRESHOLD,
+  EXPLORATION_TRIGGERS,
+  REQUIREMENT_CATEGORIES,
+  CAPABILITY_IDS,
+  UX_ARCHITECTURE_CAPABILITY,
+  DIFFUSION_IMAGE_GENERATION_CAPABILITY,
+  RESPONSIVE_FAMILY_CAPABILITY,
+  VISUAL_IDEATION_CAPABILITY,
+  DESIGN_DEVICES,
+  DESIGN_STATES,
+  explorationTrigger,
+  shouldExplore,
+  explorationPlan,
+  requestCapability,
+  familyPlan,
+  coversRequirement,
+  checkRequirementsCoverage,
+  SELECTION_OPS,
+  selectArtifact,
+  moreLikeThis,
+  combineSelections,
+  applyFeedback,
+  letPiChoose,
+  applySelectionOp,
+  convertDesignDirection,
+} from "./uieng/exploration.ts";
+export type {
+  ExplorationTriggerKind,
+  ExplorationInputs,
+  ExplorationRequirement,
+  RequirementCategory,
+  HypothesisArchetype,
+  UxHypothesis,
+  ExplorationPlan,
+  CapabilityId,
+  CapabilityRequestPayload,
+  CapabilityRequest,
+  DesignDevice,
+  DesignState,
+  DesignPage,
+  DesignFamily,
+  RequirementsCoverage,
+  SelectionOp,
+  SelectionResult,
+  SelectionOpOptions,
+  SelectedDirection,
+} from "./uieng/exploration.ts";
 // Vision payload management (spec pi-engineering-vision-payload-management-413-recovery).
 // Pure deterministic logic; no image decoding.
 export * from "./vision/observation.ts";
