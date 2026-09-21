@@ -248,7 +248,29 @@ export class ExecutionBroker {
       // Could not even read the worktree status; treat as no harvestable work.
       return false;
     }
-    if (status.length === 0) return false;
+    if (status.length === 0) {
+      // A mutating worker reported SUCCESS but produced nothing to commit.
+      // Without this, the mission surfaces only the later opaque "Integration
+      // produced no change" block and the operator cannot tell WHICH worker
+      // came back empty. Record it here, attributed to the worker's task, so
+      // the PI WEB panel and the mission record name the culprit directly.
+      const ex = this.store.getExecution(executionId);
+      if (ex) {
+        this.store.addFinding({
+          mission_id: ex.mission_id,
+          task_id: ex.task_id,
+          severity: "minor",
+          category: "integration",
+          file: null,
+          line: null,
+          summary: `Worker branch held no committed work (${wt.branch}); harvested worktree was empty`,
+          evidence: null,
+          recommended_action:
+            "The implementer must actually edit files and commit them; an empty worktree cannot integrate.",
+        });
+      }
+      return false;
+    }
     try {
       await this.git.commitAll(wt.path, `pi-eng: orchestration work for ${executionId}`);
       return true;
