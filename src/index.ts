@@ -593,3 +593,39 @@ export type {
   GatedAcceptanceDecision,
   GateCriterion,
 } from "./uieng/tournament.ts";
+
+// Autonomous UI quality controller (spec 08-autonomous-controller).
+export {
+  createQualityState,
+  rollbackRefFor,
+  debtSurface,
+  remainingBudget,
+  debtCost,
+  debtLeverage,
+  surfaceInCooldown,
+  idleCapacityForDebt,
+  evaluationScore,
+  recentImprovement,
+  checkStopConditions,
+  controlEventFor,
+  decideNext,
+  applyAction,
+  recordEvaluation,
+  recordDecision,
+  markDebtRemediated,
+  rejectDebt,
+  revertChange,
+} from "./uieng/controller.ts";
+export type {
+  DebtItemStatus,
+  DebtItem,
+  Cooldown,
+  UiQualityState,
+  UiQualityConfig,
+  ControllerContext,
+  StopCondition,
+  ControllerAction,
+  ControlEventType,
+  ControlEvent,
+  RevertResult,
+} from "./uieng/controller.ts";
