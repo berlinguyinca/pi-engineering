@@ -241,7 +241,8 @@ test("worker requests carry the role's hard context-token budget (spec §10.6)",
     await rt.engineer("Implement add(a, b) to return a + b");
     assert.equal(captured.get("scout"), 24000);
     assert.equal(captured.get("implementer"), 40000);
-    assert.equal(captured.get("reviewer"), 24000);
+    // Review roles carry the larger hard budget (spec §10.6).
+    assert.equal(captured.get("reviewer"), 64000);
   } finally {
     await fixture.cleanup();
   }

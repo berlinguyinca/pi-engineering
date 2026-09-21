@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { mkdtemp, rm } from "node:fs/promises";
+import { realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { test } from "node:test";
@@ -57,7 +58,8 @@ test("git context: primary worktree resolves root, origin repo id, and branch", 
     const ctx = await provider.resolve(fixture.root);
     assert.equal(ctx.insideGit, true);
     assert.equal(ctx.repository, "acme/widgets");
-    assert.equal(ctx.repositoryRoot, fixture.root);
+    // git resolves the macOS /var -> /private/var symlink, so compare realpaths.
+    assert.equal(ctx.repositoryRoot, realpathSync(fixture.root));
     assert.equal(ctx.worktree, undefined); // primary worktree not labelled `wt:`
     assert.ok(ctx.branch === "master" || ctx.branch === "main");
     assert.equal(ctx.detachedHead, undefined);
