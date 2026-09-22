@@ -1,0 +1,37 @@
+# Repo-level engineering policy — per-role model placement (the standing decision).
+#
+# Layered: built-in defaults < global (~/.pi/agent/engineering.yaml) < this
+# file < env:PI_ENGINEERING_POLICY. Routing runs in `auto` mode, so these pins
+# are preferences: when a pinned model is present and healthy it wins over
+# scoring; when it is unavailable the router degrades to the best available
+# candidate (see RoleRouter.select — "Overrides win over ranking"). Core keeps
+# working on a host without these models.
+#
+# Why explicit placement: the orchestrator/mission worker roles are now routed
+# through the capability router (PR #46). Left to pure auto scoring the platform
+# selects `deepseek_v4-flash-…-mxfp4` as "best implementer", but that model
+# loops (no progress) on substantial turns and exhausts the worker budget
+# without committing. The APS work (src/aps) exists precisely to detect such
+# loops; prevention is to not route roles onto them.
+#
+# Placement uses three DISTINCT qwen models so plan/implement/review are
+# genuinely independent (separation-of-duties), and image review is vision:
+#   planner     -> qwen3.8-flash_next (fast, distinct)
+#   implementer -> qwen3.8-27b text   (capable)
+#   reviewer    -> qwen3.8-27b vision (distinct from implementer; can read UI)
+#   vision      -> qwen3.8-27b vision
+routing:
+  mode: auto
+  roles:
+    planner:
+      model: "metabolomics/qwen3.8-flash_next-modality-text-quant-q4_k_xl"
+      timeout_ms: 1200000
+      max_context_tokens: 128000
+    implementer:
+      model: "metabolomics/qwen3.8-27b-modality-text-quant-q8_k_xl"
+      timeout_ms: 3600000
+      max_context_tokens: 128000
+    reviewer:
+      model: "metabolomics/qwen3.8-27b-modality-vision-quant-q8_k_xl"
+      timeout_ms: 1800000
+      max_context_tokens: 128000
