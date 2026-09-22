@@ -1,5 +1,5 @@
 /**
- * APS Phase 1 — AgentProgressSupervisor (detect-only).
+ * APS Phase 1/2 — AgentProgressSupervisor (detect-only).
  *
  * The supervisor consumes `AgentAction`s, runs them through the
  * `ProgressEvaluator`, and — when the evaluator classifies a loop candidate —
@@ -20,6 +20,7 @@
 import { id } from "../core/ids.ts";
 import type { EventStoreBackend, StoredEvent } from "../platform/eventstore/backend.ts";
 import { emitTelemetry } from "../telemetry/sink.ts";
+import { contextUtilization } from "./context.ts";
 import { ToolCallNormalizer } from "./fingerprint.ts";
 import { ProgressEvaluator } from "./progress.ts";
 import type { AgentAction, AgentLoopCandidateEvent, LoopVerdict, ProgressThresholds } from "./types.ts";
@@ -149,6 +150,12 @@ export class AgentProgressSupervisor {
       phase: action.phase,
       reason,
       fingerprint: action.contentFingerprint,
+      tool: action.tool,
+      model:
+        action.modelProvider !== undefined || action.modelId !== undefined
+          ? { provider: action.modelProvider ?? "unknown", id: action.modelId ?? "unknown" }
+          : null,
+      contextUtilization: contextUtilization(action.inputTokens, action.maxContextTokens),
       family: call.family,
       target: call.target,
       metrics: {
@@ -177,6 +184,9 @@ export class AgentProgressSupervisor {
         phase: event.phase,
         reason: event.reason,
         fingerprint: event.fingerprint,
+        tool: event.tool,
+        model: event.model === null ? null : { ...event.model },
+        contextUtilization: event.contextUtilization,
         family: event.family,
         target: event.target,
         metrics: { ...event.metrics },

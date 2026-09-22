@@ -6,6 +6,8 @@
  */
 
 export * from "./types.ts";
+export * from "./context.ts";
 export * from "./fingerprint.ts";
 export * from "./progress.ts";
 export * from "./supervisor.ts";
+export * from "./workerActivity.ts";

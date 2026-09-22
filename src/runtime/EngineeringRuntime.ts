@@ -552,6 +552,8 @@ export class EngineeringRuntime {
       context: opts.context,
       timeoutMs: opts.timeoutMs ?? 300_000,
       maxContextTokens: budget?.hardMaxTokens,
+      runId,
+      workItemId: opts.wi.id,
     };
     // Open an isolated per-session memory store for this worker when Blackhole
     // is enabled. The store is keyed by a STABLE session identity (project /
