@@ -62,8 +62,20 @@ export async function createAgentRuntime(sel: AgentRuntimeSelector): Promise<Age
  * so Pi-Engineering never assumes a Herdr capability that is not present.
  */
 export async function negotiateHerdr(cli: HerdrCli, minProtocol?: number): Promise<void> {
-  const st = await cli.status();
-  if (!st.ok) throw new Error("Herdr server unreachable during capability negotiation");
+  let st;
+  try {
+    st = await cli.status();
+  } catch (err) {
+    const cause = err instanceof Error ? err.message : err;
+    throw new Error(
+      `Herdr unavailable during capability negotiation — install Herdr and start its server. (cause: ${cause}). Use herdrEnsureLocal() to detect/install, or keep runtime='legacy'. See docs/specs/pi-engineering-herdr-runtime/HERDR_COMPATIBILITY.md`,
+    );
+  }
+  if (!st.ok) {
+    throw new Error(
+      "Herdr server unreachable during capability negotiation — start the Herdr server, or use herdrEnsureLocal()",
+    );
+  }
   if (minProtocol !== undefined && st.protocol < minProtocol) {
     throw new Error(`Herdr protocol ${st.protocol} below required minimum ${minProtocol}`);
   }

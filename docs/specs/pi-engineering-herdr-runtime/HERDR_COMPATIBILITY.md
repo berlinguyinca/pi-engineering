@@ -152,6 +152,23 @@ must create a pane (`pane.split`) or a worktree-backed workspace first, then
 `agent start` in it. The opaque-id path is correct for the runtime-neutral
 contract (verified with a fake CLI) but not yet wired to real pane creation.
 
+## Install / bootstrap posture
+
+Pi-Engineering does NOT auto-install or auto-start Herdr on any request path.
+Herdr is an external dependency with its own install/upgrade lifecycle
+(binary + long-running socket server). The normal selection path
+(`negotiateHerdr`) fails **closed** with an actionable error when Herdr is
+missing or its server is down, and points at `herdrEnsureLocal()`.
+
+`herdrEnsureLocal()` is an explicit, operator-gated utility:
+- `detectHerdr()` — side-effect-free binary + server check.
+- returns `install-needed` / `start-server` / `ok` with guidance.
+- runs an install command ONLY when the operator supplies BOTH
+  `installCommand` AND `autoInstall: true` (never an embedded command).
+
+Live check (2026-09-21): `herdrEnsureLocal()` against the running server →
+`ok: true`, server 0.9.1, protocol 22.
+
 ## Selected integration mechanism
 
 Drive the **Herdr CLI over the socket API** (`herdr <method> <args>`), not a raw

@@ -178,6 +178,17 @@ Full live canary against real InferWeave + real Herdr provisioning is
 EXTERNALLY BLOCKED (no InferWeave endpoint configured; Herdr provisioning needs
 pane creation — see HERDR_COMPATIBILITY.md finding). Documented, not faked.
 
+### Follow-up: opt-in Herdr local-environment helper
+
+- `src/runtime/herdr/ensureHerdr.ts` — `detectHerdr` (side-effect-free) +
+  `herdrEnsureLocal` (operator-gated; installs only with explicit
+  `installCommand` + `autoInstall: true`). Pi-Engineering does NOT auto-install
+  on the hot path.
+- `negotiateHerdr` now fails closed with an actionable install hint.
+- `test/unit/herdr-ensure.test.ts` — 5/5 (ok / start-server / install-needed /
+  no-auto-install-without-both-flags / protocol gate).
+- Verified live: `herdrEnsureLocal()` → `{ok:true, action:ok, server 0.9.1, protocol 22}`.
+
 ## Phase H — Migration / rollback
 
 DEFERRED / EXTERNALLY BLOCKED: the legacy runtime remains the default and the
