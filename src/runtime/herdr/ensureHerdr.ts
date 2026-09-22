@@ -155,7 +155,12 @@ export async function herdrEnsureLocal(opts: HerdrEnsureLocalOptions = {}): Prom
   }
   return {
     ok: true,
-    detection: { ...detection0, serverRunning: true, status, reason: `server reachable (${status.serverVersion}, protocol ${status.protocol})` },
+    detection: {
+      ...detection0,
+      serverRunning: true,
+      status,
+      reason: `server reachable (${status.serverVersion}, protocol ${status.protocol})`,
+    },
     action: "ok",
     message: `Herdr ready (server ${status.serverVersion}, protocol ${status.protocol}).`,
   };
