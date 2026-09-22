@@ -422,12 +422,42 @@ export class EngineeringRuntime {
       store: rt.missionStore,
       onUpdate: opts.onMissionObservabilityUpdate,
     });
+    // Route orchestration worker roles through the capability router so per-role
+    // model placement (policy.routing.roles, e.g. a pinned implementer/reviewer)
+    // is honored by the mission pipeline, matching the lifecycle roleRunner
+    // path. Degrades to the worker's construction-time default model when the
+    // router cannot be built, so core never requires discovery or network.
+    let routeModel:
+      | ((role: WorkerRequest["role"]) => Promise<{ provider: string; id: string } | undefined>)
+      | undefined;
+    try {
+      const { createRoleRouter } = await import("../capability/adapter.ts");
+      const { isRoleName } = await import("../capability/roles.ts");
+      const sharedRuntime = rt.worker instanceof PiWorkerExecutor ? await rt.worker.getModelRuntime() : undefined;
+      const routerAdapter = await createRoleRouter({
+        cwd: repoRoot,
+        agentDir: opts.agentDir,
+        modelRuntime: sharedRuntime,
+        allowModelNetwork: false,
+      });
+      routeModel = async (role) => {
+        if (!isRoleName(role)) return undefined;
+        try {
+          return await routerAdapter.route(role);
+        } catch {
+          return undefined;
+        }
+      };
+    } catch {
+      routeModel = undefined;
+    }
     const backends = realBackends({
       worker: rt.worker,
       verifier: rt.verifier,
       artifacts: rt.artifacts,
       git: rt.git,
       cwd: repoRoot,
+      routeModel,
     });
     // The default plan honours the routed workflow class. A research or
     // investigation mission MUST NOT get a repo-mutating worker: mutation is

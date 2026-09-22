@@ -1,6 +1,77 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { normalizeFindings } from "../../src/orchestration/realBackends.ts";
+import { normalizeFindings, realBackends } from "../../src/orchestration/realBackends.ts";
+import type { WorkerExecutor, WorkerRequest } from "../../src/workers/WorkerExecutor.ts";
+
+function capturingWorker(seen: WorkerRequest[]): WorkerExecutor {
+  return {
+    async run(req: WorkerRequest) {
+      seen.push(req);
+      return {
+        result: {
+          status: "completed",
+          summary: "ok",
+          claims: [],
+          evidence_refs: [],
+          new_hypotheses: [],
+          proposed_tasks: [],
+          details: {},
+        },
+        usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 1, turns: 1, model: "m" },
+        toolCalls: 0,
+      } as never;
+    },
+  };
+}
+
+describe("realBackends capability routing", () => {
+  it("places the implementer worker on the model routeModel returns", async () => {
+    const seen: WorkerRequest[] = [];
+    const backends = realBackends({
+      worker: capturingWorker(seen),
+      verifier: {} as never,
+      artifacts: {} as never,
+      git: null,
+      cwd: "/repo",
+      routeModel: async (role) => (role === "implementer" ? { provider: "metabolomics", id: "qwen-27b" } : undefined),
+    });
+    const out = await backends.agent.runAgent({
+      role: "implementer",
+      objective: "do work",
+      signal: new AbortController().signal,
+    });
+    assert.equal(out.exitStatus, "succeeded");
+    assert.deepEqual(seen[0]?.modelOverride, { provider: "metabolomics", id: "qwen-27b" });
+  });
+
+  it("leaves modelOverride unset when routeModel returns undefined", async () => {
+    const seen: WorkerRequest[] = [];
+    const backends = realBackends({
+      worker: capturingWorker(seen),
+      verifier: {} as never,
+      artifacts: {} as never,
+      git: null,
+      cwd: "/repo",
+      routeModel: async () => undefined,
+    });
+    await backends.agent.runAgent({ role: "implementer", objective: "x", signal: new AbortController().signal });
+    assert.equal(seen[0]?.modelOverride, undefined);
+  });
+
+  it("routes the reviewer too", async () => {
+    const seen: WorkerRequest[] = [];
+    const backends = realBackends({
+      worker: capturingWorker(seen),
+      verifier: {} as never,
+      artifacts: {} as never,
+      git: null,
+      cwd: "/repo",
+      routeModel: async (role) => (role === "reviewer" ? { provider: "metabolomics", id: "qwen-vision" } : undefined),
+    });
+    await backends.review.runReview({ objective: "review", signal: new AbortController().signal });
+    assert.deepEqual(seen[0]?.modelOverride, { provider: "metabolomics", id: "qwen-vision" });
+  });
+});
 
 describe("normalizeFindings (spec 07 — reviewer finding normalization)", () => {
   it("passes through structured objects, mapping summary/message/text/title", () => {
