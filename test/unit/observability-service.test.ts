@@ -281,3 +281,19 @@ test("quiet-period update surfaces health when no transition fires", async () =>
     "quiet update reports still-running health",
   );
 });
+
+test("a recent transition update suppresses the quiet-period summary", async () => {
+  const h = harness({ quietUpdateIntervalMs: 60_000 });
+  const id = makeMission(h);
+  h.obs.missionCreated(id, "M");
+  h.clock.advance(30_000);
+  h.obs.phaseChanged(id, "EXECUTING"); // transition update resets the quiet timer
+  const before = h.updates.length;
+  h.obs.maybeEmitQuietUpdate(id); // still within the interval of the last transition -> no summary
+  assert.equal(h.updates.length, before, "recent transition suppresses the quiet summary");
+  // Let the quiet window elapse with no transitions, then the summary may fire.
+  h.clock.advance(61_000);
+  h.obs.maybeEmitQuietUpdate(id);
+  assert.ok(h.updates.length > before, "quiet summary fires once the interval elapses");
+  assert.ok(h.updates.some((m) => m.includes("Still running")));
+});

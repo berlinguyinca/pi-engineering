@@ -1119,6 +1119,12 @@ export class MissionObservability {
 
   /** Emit a concise user-facing update (Communication Gate — always open). */
   private emitUpdate(missionId: string, message: string): void {
+    // A transition-level update resets the quiet-period timer so a periodic
+    // summary (maybeEmitQuietUpdate) is suppressed while real transitions are
+    // still streaming. Only live API calls reach emitUpdate — replay applies
+    // events directly and never emits — so this cannot cause reconnect spam.
+    const s = this.states.get(missionId);
+    if (s) s.lastUpdateEmittedAt = this.now();
     try {
       this.onUpdate?.(missionId, message);
     } catch {
