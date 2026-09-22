@@ -1,0 +1,2 @@
+# 09 — InferWeave Routing
+Workers request capabilities such as coding, vision, long-context, review, reasoning and fast/simple. InferWeave selects open-weight model/runtime and owns GPU placement, batching, residency, context and queues. No static GPU/model mapping in Pi-Engineering/Herdr. Surface model/runtime/context/queue/token-rate telemetry. Handle admission/concurrency failures with bounded queue/retry policy.

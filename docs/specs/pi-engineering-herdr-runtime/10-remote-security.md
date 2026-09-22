@@ -1,0 +1,2 @@
+# 10 — Remote Hosts and Security
+Keep Tailscale/secure connectivity below Herdr. Host registry contains HostId, connection profile, process capabilities, health, allowed roots/projects. Host scheduling is process placement, not inference placement. Enforce least privilege for filesystem, repos, shell/network, MCP, secrets, Git, services, deployment and remote access. Audit privileged actions; prevent path escape; do not inject broad secrets into all workers.

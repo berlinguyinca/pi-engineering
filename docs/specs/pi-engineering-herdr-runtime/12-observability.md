@@ -1,0 +1,2 @@
+# 12 — Observability
+Metrics: active workers by role/host, duration, failures/blocked time, recoveries, completed tasks, review failures, repair cycles, tokens/rate, model usage, InferWeave queue/admission, context/request utilization, prevented oversized requests and artifacts. Derive health from Herdr state + Pi lifecycle + InferWeave activity + process health + output + heartbeat. Terminal silence alone is not failure. Grafana=time-series/infrastructure; Pi-Web=workflow/operator.

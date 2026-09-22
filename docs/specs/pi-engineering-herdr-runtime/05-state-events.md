@@ -1,0 +1,2 @@
+# 05 — State and Events
+Normalize CREATED/STARTING/READY/WORKING/WAITING/BLOCKED/COMPLETED/FAILED/INTERRUPTED/RECOVERING/LOST/TERMINATED. Persist runtime mapping, host/project/workflow/task/role, timestamps, worktree/branch, capabilities, current operation, failures and recovery count. Publish idempotent correlated worker/task/review/repair/runtime events. PostgreSQL/event storage remains authoritative.

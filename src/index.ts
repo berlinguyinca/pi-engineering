@@ -29,6 +29,10 @@ export { parseRef } from "./capability/router.ts";
 export * from "./inference/index.ts";
 export type { CoreServices } from "./tools/coreTools.ts";
 export { EngineeringRuntime } from "./runtime/EngineeringRuntime.ts";
+// Runtime-neutral AgentRuntime seam (herdr spec 02/03/14). All external runtime
+// access flows through AgentRuntime; legacy is the current backend, Herdr is
+// added behind the same seam in Phase D.
+export * from "./runtime/index.ts";
 export type {
   EngineerReport,
   EngineeringRuntimeOptions,
@@ -794,3 +798,5 @@ export type {
   GateKind,
   GateRef,
 } from "./uieng/rollout.ts";
+
+export * from "./request/index.ts";

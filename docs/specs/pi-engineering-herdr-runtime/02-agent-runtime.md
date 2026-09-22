@@ -1,0 +1,2 @@
+# 02 — AgentRuntime
+Introduce runtime-neutral IDs and interface operations for create/start/sendTask/get/list/boundedOutput/waitFor/interrupt/terminate/resume-or-reconcile/attach/health/capabilities. WorkerRequest is declarative: role, capabilities, isolation, duration/persistence, review, context policy and permissions. Runtime IDs stay opaque. Add contract tests usable by legacy and Herdr runtimes.

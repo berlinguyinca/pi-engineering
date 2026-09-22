@@ -1,0 +1,2 @@
+# 04 — Worker Model and Session Factory
+Formalize ephemeral subagent, persistent Herdr agent worker, and non-agent service worker. Roles include planner, architect, engineer, frontend/backend engineer, tester, reviewer, security/UI reviewer, researcher, debugger and repair worker. Session Factory consumes task+capabilities+isolation+duration+dependencies+security policy and emits a WorkerPlan/DAG. Herdr executes; it does not decide why workers exist.

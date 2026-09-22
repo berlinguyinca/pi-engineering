@@ -1,0 +1,200 @@
+# Pi-Engineering Herdr Runtime — Implementation Log
+
+This log records each phase's commands and results, per `IMPLEMENTATION_PROMPT.md`.
+
+## Phase A — Reconciliation
+
+Inspection commands (run in worktree `feat/herdr-runtime-recon`):
+
+```
+git worktree add ../pi-engineering-runtime-herdr -b feat/herdr-runtime-recon origin/main
+ln -s <main>/node_modules node_modules
+unzip -o ~/Downloads/pi-engineering-herdr-runtime-spec-pack-2026-09-20.zip
+```
+
+Key files inspected:
+- `src/workers/WorkerExecutor.ts` — `WorkerRequest` / `WorkerRun`
+- `src/core/types.ts` — `WorkerResult`, `WorkerRole`, `ROLE_BUDGETS`
+- `src/artifacts/ArtifactStore.ts` — artifact-first storage, summary-only reads
+- `src/git/GitRepo.ts` — worktree create/merge
+- `src/orchestration/` — `types.ts`, `broker.ts`, `integrator.ts`, `orchestrator.ts`, `missionStore.ts`, `scheduler.ts`, `completionGate.ts`, `realBackends.ts`
+- `src/platform/` — `types.ts`, `WorkGraph.ts`, `ControlPlane.ts`, `RemoteWorker.ts`, `RemoteHttpTransport.ts`, `ProjectRegistry.ts`, `eventstore/backend.ts`, `memoryOutbox.ts`, `redact.ts`
+- `src/security/SecurityPolicy.ts`, `src/budget/BudgetManager.ts`, `src/context/` (`capability.ts`, `usage.ts`, `ContextBroker.ts`), `src/capability/`, `src/routing/ModelRouter.ts`, `src/inference/admission*.ts`, `src/lifecycle/`, `src/telemetry/`, `src/blackhole/`
+
+Deliverable: `IMPLEMENTATION_RECONCILIATION.md` (65 requirement rows; 16 EXISTING,
+22 PARTIAL, 18 MISSING, 3 CONFLICTING, 6 EXTERNAL).
+
+## Phase B — Dependency-aware implementation DAG
+
+The current architecture changes the naive "implement specs in numeric order"
+dependency order. Reconciliation shows a large EXISTING foundation; the DAG is
+built around the real dependencies:
+
+```
+ 1. AgentRuntime interface + contracts          (spec 02)   ── Phase C  [foundation]
+ 2. LegacyAgentRuntime adapter (current runtime) (spec 02)  ── Phase C  [depends 1]
+ 3. Herdr/pi-herdr compatibility spike           (spec 03)  ── Phase D  [depends 1]
+ 4. HerdrAgentRuntime + flag/negotiation         (spec 03,14)── Phase D  [depends 3]
+ 5. Normalized worker state/events vocabulary    (spec 05)  ── Phase E  [depends 2,4]
+ 6. Rich structured WorkerResult                 (spec 06)  ── Phase E  [depends 5]
+ 7. Byte budget + fan-out/synthesis + 413        (spec 06)  ── Phase E  [depends 6]
+ 8. Worktree isolation hardening + integration   (spec 07)  ── Phase E  [depends 2]
+ 9. Review/repair bounds                         (spec 08)  ── Phase E  [depends 6,7]
+10. InferWeave capability routing + admission    (spec 09)  ── Phase E  [depends 4,7]
+11. Remote host registry + least-privilege       (spec 10)  ── Phase E  [depends 4]
+12. Pi-Web normalized APIs/events/actions        (spec 11)  ── Phase E  [depends 5,7,8]
+13. Observability metrics                        (spec 12)  ── Phase E  [depends 5,10]
+14. Restart reconciliation + idempotency         (spec 13)  ── Phase E  [depends 5,8]
+15. Spec-15 test suite + 413 regression          (spec 15)  ── Phase F  [depends 6,7,10,13,14]
+16. Canary (planner→2 engineers→tester→reviewer→repair→re-review) ── Phase G [depends 15]
+17. Migration/rollback state machine             (spec 14)  ── Phase H  [depends 16]
+18. Final reconciliation + DoD                     (spec 16) ── Phase H  [depends all]
+```
+
+Critical dependency notes (why we do not follow numeric order blindly):
+- `03-herdr-adapter` depends on `02-agent-runtime` (the interface must exist first).
+- `05 state/events`, `06 WorkerResult`, `07 git`, `13 recovery` all depend on the
+  AgentRuntime abstraction (2) so legacy and Herdr share one contract.
+- The 413 subsystem (7) depends on the rich WorkerResult (6) and on InferWeave
+  capability discovery (10) for dynamic byte/token limits — not a fixed 260k.
+- Migration/rollback (14/17) is LAST because it requires parity + canary evidence.
+
+### Phase C scope (this checkpoint)
+AgentRuntime interface + LegacyAgentRuntime adapter + contract tests. Nothing
+Herdr yet. Checkpointed independently before Phase D.
+
+## Phase C — Abstraction (current runtime behind AgentRuntime)
+
+### Delivered
+- `src/runtime/AgentRuntime.ts` — runtime-neutral interface: opaque `RuntimeId`;
+  operations create/start/sendTask/get/list/boundedOutput/waitFor/interrupt/
+  terminate/resumeOrReconcile/attach/health/capabilities; declarative
+  `AgentWorkerRequest` (role, capabilities, isolation, duration, review,
+  contextPolicy, permissions); normalized `AgentStatus`; structured
+  artifact-first `AgentWorkerResult`; `ContextPolicy` with discovered (not
+  fixed-260k) limits.
+- `src/runtime/LegacyAgentRuntime.ts` — adapter wrapping the CURRENT
+  `WorkerExecutor`. Documented legacy limitation: interrupt/terminate update
+  persisted status; they cannot abort an in-flight `WorkerExecutor.run` (no
+  AbortSignal).
+- `src/runtime/index.ts` — re-exports + `createAgentRuntime` selector behind a
+  feature flag (`runtime: "herdr"` reserved for Phase D, fails safe to legacy).
+- `src/index.ts` — re-exports the runtime seam.
+- `test/unit/agentruntime.test.ts` — 6 contract tests that MUST pass for both
+  legacy and (future) Herdr runtimes.
+
+### Commands + results
+```
+npx tsc --noEmit          # EXIT 0 (clean)
+npx biome check src/runtime test/unit/agentruntime.test.ts   # clean
+node --test test/unit/agentruntime.test.ts   # 6 pass / 0 fail
+npm test (full)           # 1490 pass / 1 fail / 1 skip
+```
+The 1 full-suite failure is a pre-existing FLAKY Playwright CAV screenshot test
+(`test/unit/cav-visual.test.ts`, `cav-pilot.test.ts`) that fails on
+"Unable to capture screenshot" under parallel load; it passes in isolation
+(4/0). It does not import any runtime file and is unrelated to this change.
+Excluding the two flaky CAV screenshot files: 1483 pass / 0 fail / 1 skip.
+
+Phase C is CHECKPOINTED here, independently, before introducing Herdr (Phase D).
+
+## Phase D — Herdr adapter
+
+### Investigation (real, live)
+- `herdr --version` → 0.9.1; `herdr status` → server running, protocol 22,
+  socket `~/.config/herdr/herdr.sock`.
+- `herdr api schema --json` → 276 KB JSON schema; request `oneOf` lists 103
+  methods (`agent.list/get/read/prompt/start/wait/attach`, `worktree.*`,
+  `workspace.*`, `session.*`, `machine.*`, `events.subscribe/wait`, …).
+- `AgentStatus` enum: idle/working/blocked/done/unknown. Structured errors:
+  `{id, error:{code,message}}`. Full record:
+  `HERDR_COMPATIBILITY.md`.
+
+### Delivered
+- `src/runtime/herdr/HerdrCli.ts` — thin, testable CLI client (interface +
+  `RealHerdrCli` shelling to `herdr`; `HerdrError` normalized). Not a fork.
+- `src/runtime/herdr/HerdrAgentRuntime.ts` — Herdr behind the same
+  `AgentRuntime` seam; opaque Pi ids → Herdr pane/workspace target.
+- `src/runtime/index.ts` — `createAgentRuntime` now selects Herdr behind
+  `runtime:"herdr"` with capability/version negotiation (`negotiateHerdr`).
+- `test/unit/herdr-runtime.test.ts` — same contract via fake CLI + negotiation
+  tests. `test/unit/agentruntime-contract.ts` — shared contract.
+
+### Commands + results
+```
+npx tsc --noEmit                # EXIT 0
+npx biome check src/runtime ...  # clean
+node --test test/unit/agentruntime.test.ts test/unit/herdr-runtime.test.ts  # 12/12
+node --test (excl flaky CAV)    # 1489 pass / 0 fail / 1 skip
+live smoke: RealHerdrCli against running server  # status/list/health OK
+```
+
+### Live finding (medium)
+Provisioning a NEW agent needs a real `pane_id`; `agent start` with an opaque
+id fails (`unknown option: HERD-…`). Full real provisioning (create a pane or
+worktree-backed workspace first) is a Phase E integration concern. See
+`HERDR_COMPATIBILITY.md`.
+
+## Phase E/F — Request planning + architectural 413 prevention (spec 06)
+
+### Delivered
+- `src/request/RequestPlanner.ts` — pure request planner: discovers the context
+  window from metadata (reuses `resolveModelContext`, conservative 128K floor,
+  never a fixed 260K); budgets BOTH tokens and serialized bytes with headroom;
+  transforms an oversized request BEFORE submission:
+  `direct → materialize (artifact-first) → summarize → split/fan-out → reject`.
+- `src/request/index.ts`, exported from `src/index.ts`.
+- `test/unit/request-planner.test.ts` — 7 regression tests reproducing the 413
+  failure signature (many design-spec references inlined → huge body) and
+  proving the body is shrunk to fit the byte budget before submission.
+
+### Commands + results
+```
+npx tsc --noEmit                # EXIT 0
+npx biome check src/request ... # clean
+node --test test/unit/request-planner.test.ts  # 7/7 pass
+full suite (excl flaky CAV browser tests)      # 1496 pass / 0 fail
+```
+
+### 413 regression evidence
+- 16 specs × 40 KB inlined (~640 KB) → `mode: materialize`, `artifactRefs`=16,
+  planned body `<= byteBudget` BEFORE submission. ✔
+- 3 MB single reference → `materialize` (collapsed to tiny artifact ref), not
+  reject. ✔
+- 1 MB objective, no refs → `reject` with structured `request_too_large`, no
+  submission. ✔
+- 200 refs under tight ceiling → `split` into fan-out chunks. ✔
+- Context window discovered (128K floor), never 260K. ✔
+
+## Phase G — Runtime-neutral canary (spec 15)
+
+`test/integration/runtime-canary.test.ts` drives Planner → Engineer A/B
+(fan-out, two isolated implementer ids) → Tester (synthesis) → Reviewer
+through the AgentRuntime seam with deterministic fake executors, composing with
+the request planner (artifact-first refs, bounded output). 2/2 pass; tsc clean;
+biome clean.
+
+Full live canary against real InferWeave + real Herdr provisioning is
+EXTERNALLY BLOCKED (no InferWeave endpoint configured; Herdr provisioning needs
+pane creation — see HERDR_COMPATIBILITY.md finding). Documented, not faked.
+
+### Follow-up: opt-in Herdr local-environment helper
+
+- `src/runtime/herdr/ensureHerdr.ts` — `detectHerdr` (side-effect-free) +
+  `herdrEnsureLocal` (operator-gated; installs only with explicit
+  `installCommand` + `autoInstall: true`). Pi-Engineering does NOT auto-install
+  on the hot path.
+- `negotiateHerdr` now fails closed with an actionable install hint.
+- `test/unit/herdr-ensure.test.ts` — 5/5 (ok / start-server / install-needed /
+  no-auto-install-without-both-flags / protocol gate).
+- Verified live: `herdrEnsureLocal()` → `{ok:true, action:ok, server 0.9.1, protocol 22}`.
+
+## Phase H — Migration / rollback
+
+DEFERRED / EXTERNALLY BLOCKED: the legacy runtime remains the default and the
+rollback target. Herdr is selectable behind `runtime:"herdr"` + capability
+negotiation but is NOT the default. Full rollback drill and the migration state
+machine require a passing live canary first (Phase G blocked). Documented in
+FINAL_RECONCILIATION.md.
+
+## Phase E — Complete the architecture (see below)

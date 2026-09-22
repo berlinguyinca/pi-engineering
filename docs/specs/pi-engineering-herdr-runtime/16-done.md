@@ -1,0 +1,2 @@
+# 16 — Definition of Done
+Complete only after: ADR/boundaries; legacy+Herdr pass same contracts; Herdr capability/version check; persistent workers/services/worktrees; normalized persisted state/events; artifact-first bounded output; proactive 413 prevention; dynamic InferWeave routing; bounded review/repair; remote/recovery/idempotency tests; Pi-Web visibility/intervention; security/audit; observability; canary+rollback; then removal of duplicated legacy runtime. Produce final reconciliation with implemented/reused/deprecated/deferred/evidence/risks.
