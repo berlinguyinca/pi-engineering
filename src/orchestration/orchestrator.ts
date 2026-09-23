@@ -22,6 +22,7 @@ import { CompletionGate } from "./completionGate.ts";
 import { IntentRouter, workflowMutatesRepo } from "./intentRouter.ts";
 import type { MissionStore } from "./missionStore.ts";
 import type { MissionObservability } from "./observability/MissionObservability.ts";
+import { computeProgress } from "./observability/progress.ts";
 import { deriveRequiredGates, mutationFactFromChangedFiles } from "./policies.ts";
 import { brokerKind } from "./scheduler.ts";
 import { MissionScheduler } from "./scheduler.ts";
@@ -109,6 +110,8 @@ export class Orchestrator {
   private readonly maxRepairRounds: number;
   /** Per-call progress hook set by `orchestrate`; consumed by task/phase events. */
   private progress: ((line: string) => void) | null = null;
+  /** Mission currently being orchestrated, used to append a live progress bar. */
+  private activeMissionId: string | null = null;
 
   constructor(opts: OrchestratorOptions) {
     this.store = opts.store;
@@ -173,10 +176,37 @@ export class Orchestrator {
     }
   }
 
-  /** Emit a live progress line to the operator (no-op when no hook is set). */
+  /**
+   * Format a compact text progress bar (20 cells) from the active mission's
+   * weighted-DAG progress. Empty when no mission is active. The percent is
+   * computed deterministically from the mission DAG (never an LLM number).
+   */
+  private progressBar(): string {
+    const missionId = this.activeMissionId;
+    if (!missionId) return "";
+    const projection = this.observability?.projection(missionId);
+    const mission = this.store.getMission(missionId);
+    const pct =
+      projection?.summary.progress.approximatePercent ??
+      computeProgress({
+        missionId,
+        tasks: this.store.listTasks(missionId),
+        missionStatus: mission?.status ?? "NEW",
+        verifiedComplete: false,
+        completionStatus: "",
+      }).approximatePercent;
+    if (!Number.isFinite(pct) || pct < 0) return "";
+    const cells = Math.round(Math.min(100, pct) / 5);
+    const filled = "#".repeat(cells);
+    const empty = ".".repeat(20 - cells);
+    return `[${filled}${empty}] ${Math.round(pct)}%`;
+  }
+
+  /** Emit a live progress line to the operator, appending the live progress bar. */
   private report(line: string): void {
+    const bar = this.progressBar();
     try {
-      this.progress?.(line);
+      this.progress?.(bar ? `${line} ${bar}` : line);
     } catch {
       // A progress listener is an observer, never a participant.
     }
@@ -223,6 +253,7 @@ export class Orchestrator {
       workflow_class: intent.suggested_workflow,
       parent_session_id: this.parentSessionId,
     });
+    this.activeMissionId = mission.mission_id;
     this.observability?.missionCreated(mission.mission_id, mission.title);
     this.store.transitionMission(mission.mission_id, "CLASSIFYING");
 
@@ -263,6 +294,7 @@ export class Orchestrator {
       const final = this.store.getMission(mission.mission_id)!;
       const verdict = this.gate.evaluate(final);
       this.progress = null;
+      this.activeMissionId = null;
       return {
         mission: final,
         intent,
@@ -409,6 +441,7 @@ export class Orchestrator {
       this.store.completeMission(mission.mission_id);
       this.phase(this.store.getMission(mission.mission_id)!, "complete");
       this.progress = null;
+      this.activeMissionId = null;
       return {
         mission: this.store.getMission(mission.mission_id)!,
         intent,
@@ -432,6 +465,7 @@ export class Orchestrator {
       this.store.failMission(finalMission.mission_id, verdict.reasons.join("; "));
     }
     this.progress = null;
+    this.activeMissionId = null;
     return {
       mission: this.store.getMission(mission.mission_id)!,
       intent,

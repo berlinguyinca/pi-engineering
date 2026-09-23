@@ -616,6 +616,33 @@ describe("missing backends must degrade, not explode", () => {
   });
 });
 
+describe("missions stream live progress instead of blocking silently", () => {
+  it("onProgress emits activity lines each carrying a progress bar", async () => {
+    const h = harness();
+    const lines: string[] = [];
+    const result = await h.orchestrator.orchestrate("Add a health endpoint", {
+      repository: ".",
+      baseRef: "abc",
+      mutationRequested: true,
+      onProgress: (line) => lines.push(line),
+    });
+    assert.ok(result.completed, "deterministic harness mission should complete");
+    assert.ok(lines.length > 0, "mission must not run silently — progress lines must stream");
+    // Each line while the mission is active should carry the deterministic
+    // progress bar (20 cells) so the operator sees forward movement.
+    const withBar = lines.filter((l) => l.includes("[") && l.includes("%") && l.includes("]"));
+    assert.ok(
+      withBar.length >= lines.length - 1,
+      `expected nearly every line to carry a progress bar; ${withBar.length}/${lines.length} did`,
+    );
+    // Activity lines show what the mission is doing (phases/tasks), not silence.
+    assert.ok(
+      lines.some((l) => l.includes("phase") || l.includes("task") || l.includes("starting")),
+      lines.join("\n"),
+    );
+  });
+});
+
 describe("a late failure is never masked by an earlier success", () => {
   it("validation that goes red AFTER a green run still blocks completion", async () => {
     // A blocking finding forces a repair round, which re-runs validation; that

@@ -303,6 +303,12 @@ export function buildCoreTools(
         baseRef,
         constraints: (params.constraints as string[] | undefined) ?? [],
         mutationRequested: params.mutate ?? true,
+        // Stream every live progress line (phase/task transitions + progress
+        // bar) to the operator via the tool update callback instead of blocking
+        // silently for the whole mission.
+        onProgress: (line: string) => {
+          _onUpdate?.({ content: [{ type: "text", text: line }], details: {} });
+        },
       });
       const m = result.mission;
       const lines = [
