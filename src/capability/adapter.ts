@@ -69,6 +69,25 @@ export async function createRoleRouter(opts: RouteAdapterOptions): Promise<RoleR
     sources,
     context,
     file: join(agentDir, "capability-cache.json"),
+    // The models.json source advertises every catalog model as available, but
+    // the execution ModelRuntime may not actually register all of them (local
+    // provider hold-outs for no-tool models, stale catalog entries, renamed
+    // ids). Availability must be truthful to the runtime, or the router routes
+    // a role to a model the worker cannot run and the task dies with zero
+    // tokens before any work happens. Demote in place on every inventory load
+    // and refresh so the correction survives TTL re-discovery.
+    onInventory: (records) => {
+      const runnable = new Set(
+        runtime.getAvailableSnapshot().map((m) => `${m.provider}/${m.id}`),
+      );
+      for (const rec of records) {
+        if (!runnable.has(`${rec.provider}/${rec.id}`)) {
+          rec.available = false;
+          rec.healthy = false;
+          rec.healthReason = "not registered in the execution ModelRuntime";
+        }
+      }
+    },
   });
   await registry.ensureFresh();
 

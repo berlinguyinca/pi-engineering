@@ -32,6 +32,12 @@ export interface RegistryOptions {
   ttlMs?: number;
   /** Penalty decay window. */
   penaltyDecayMs?: number;
+  /**
+   * Invoked with the live inventory records after a cache load and after every
+   * refresh, before the inventory is persisted. Lets a caller correct records
+   * in place (e.g. demote models the execution runtime cannot actually run).
+   */
+  onInventory?: (records: ModelRecord[]) => void;
 }
 
 export interface RefreshResult {
@@ -63,6 +69,7 @@ export class ModelCapabilityRegistry {
   private refreshPromise: Promise<RefreshResult> | undefined;
   private writeChain: Promise<void> = Promise.resolve();
   readonly observed: ObservedStore;
+  private readonly onInventory: ((records: ModelRecord[]) => void) | undefined;
 
   private constructor(opts: RegistryOptions) {
     this.sources = opts.sources;
@@ -71,6 +78,7 @@ export class ModelCapabilityRegistry {
     this.ttlMs = opts.ttlMs ?? 300_000;
     this.penaltyDecayMs = opts.penaltyDecayMs ?? 600_000;
     this.observed = ObservedStore.inMemory();
+    this.onInventory = opts.onInventory;
   }
 
   static async open(opts: RegistryOptions): Promise<ModelCapabilityRegistry> {
@@ -85,6 +93,10 @@ export class ModelCapabilityRegistry {
         // No usable cache: discovery will repopulate.
       }
     }
+    // A restored cache may be stale with respect to the execution runtime
+    // (models re-registered, held out, or renamed since it was written);
+    // let the caller correct it before any routing reads it.
+    registry.onInventory?.([...registry.records.values()]);
     return registry;
   }
 
@@ -149,6 +161,8 @@ export class ModelCapabilityRegistry {
       const merged = mergeRecords(batches);
       const before = [...this.records.keys()].sort().join(",");
       this.records = new Map(merged.map((rec) => [modelKey(rec), rec]));
+      // Correct the merged inventory in place before it is read or persisted.
+      this.onInventory?.([...this.records.values()]);
       const after = [...this.records.keys()].sort().join(",");
       const result: RefreshResult = {
         models: this.records.size,

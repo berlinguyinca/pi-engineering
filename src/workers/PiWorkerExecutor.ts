@@ -199,37 +199,43 @@ export class PiWorkerExecutor implements WorkerExecutor {
     return this.getModelRuntime();
   }
 
-  async run(req: WorkerRequest): Promise<WorkerRun> {
-    const modelRuntime = await this.getModelRuntime();
-    let model = this.model;
-    // The capability router places a role on a specific provider model. When a
-    // route is supplied it wins over the construction-time default.
+  /**
+   * Resolve the model a task runs on. A routed override wins when it resolves
+   * in the execution runtime; an override that cannot resolve degrades to the
+   * construction-time default, then to the first available model — a stale
+   * route must never kill a task with zero work. Returns the chosen model and
+   * the override it degraded from, when one was skipped.
+   */
+  async resolveModel(
+    req: WorkerRequest,
+    modelRuntime: Pick<ModelRuntime, "getModel" | "getAvailable">,
+  ): Promise<{ model: Model<any> | undefined; degradedFrom?: string }> {
     if (req.modelOverride) {
       const resolved = modelRuntime.getModel(req.modelOverride.provider, req.modelOverride.id) as
         | Model<any>
         | undefined;
-      if (resolved) {
-        model = resolved;
-      } else {
-        return {
-          result: {
-            status: "failed",
-            summary: `Routed model ${req.modelOverride.provider}/${req.modelOverride.id} is not registered in this runtime.`,
-            claims: [],
-            evidence_refs: [],
-            new_hypotheses: [],
-            proposed_tasks: [],
-            details: {},
-            error: "unknown-model",
-          },
-          usage: null,
-          error: "unknown-model",
-        };
-      }
-    }
-    if (!model) {
+      if (resolved) return { model: resolved };
+      const from = `${req.modelOverride.provider}/${req.modelOverride.id}`;
+      if (this.model) return { model: this.model, degradedFrom: from };
       const available = await modelRuntime.getAvailable();
-      model = available[0] as Model<any> | undefined;
+      return { model: available[0] as Model<any> | undefined, degradedFrom: from };
+    }
+    if (this.model) return { model: this.model };
+    const available = await modelRuntime.getAvailable();
+    return { model: available[0] as Model<any> | undefined };
+  }
+
+  async run(req: WorkerRequest): Promise<WorkerRun> {
+    const modelRuntime = await this.getModelRuntime();
+    const { model, degradedFrom } = await this.resolveModel(req, modelRuntime);
+    if (degradedFrom) {
+      // The router selected a model this runtime cannot actually register
+      // (stale registry, a hold-out, or a catalog entry that never reached
+      // the node file). Degrading keeps the task alive; a hard fail here
+      // killed the whole mission with zero tokens before any work happened.
+      console.error(
+        `[pi-engineering] routed model ${degradedFrom} is not registered in the worker runtime; falling back to the default model`,
+      );
     }
     if (!model) {
       return {
