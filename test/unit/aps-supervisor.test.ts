@@ -58,10 +58,13 @@ function setup(): Harness {
   const notices: TelemetryNotice[] = [];
   const uninstall = setTelemetrySink((n) => notices.push(n));
   test.after(uninstall);
+  // These are Phase 1 DETECTION tests; disable enforcement so they isolate the
+  // loop_candidate behavior without a prevented event changing event counts.
   const supervisor = new AgentProgressSupervisor({
     eventStore: store,
     onEvent: (event) => inProcess.push(event),
     now: () => "2026-01-01T00:00:00.000Z",
+    prevention: { enabled: false },
   });
   return { supervisor, store, inProcess, notices };
 }

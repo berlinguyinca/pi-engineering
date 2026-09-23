@@ -23,10 +23,21 @@ import { emitTelemetry } from "../telemetry/sink.ts";
 import { contextUtilization } from "./context.ts";
 import { ToolCallNormalizer } from "./fingerprint.ts";
 import { ProgressEvaluator } from "./progress.ts";
-import type { AgentAction, AgentLoopCandidateEvent, LoopVerdict, ProgressThresholds } from "./types.ts";
+import {
+  type AgentAction,
+  type AgentLoopCandidateEvent,
+  type AgentLoopEvent,
+  type AgentLoopPreventedEvent,
+  DEFAULT_LOOP_PREVENTION,
+  type LoopPreventionOptions,
+  type LoopVerdict,
+  type ProgressThresholds,
+} from "./types.ts";
 
 /** Persistent event type for loop candidates (additive to the store's type space). */
 export const AGENT_LOOP_CANDIDATE_EVENT = "agent.loop_candidate";
+/** Persistent event type for loop prevention (Phase 3 enforcement). */
+export const AGENT_LOOP_PREVENTED_EVENT = "agent.loop_prevented";
 
 export interface AgentProgressSupervisorOptions {
   /** Bounded history size passed to the evaluator. Default 50. */
@@ -41,32 +52,52 @@ export interface AgentProgressSupervisorOptions {
    */
   eventStore?: EventStoreBackend;
   /** In-process subscriber, invoked before any async sink. */
-  onEvent?: (event: AgentLoopCandidateEvent) => void;
+  onEvent?: (event: AgentLoopEvent) => void;
   /**
    * Telemetry notice emitter. Defaults to the global telemetry sink
    * (`emitTelemetry` in `src/telemetry/sink.ts`).
    */
-  emitNotice?: (event: AgentLoopCandidateEvent) => void;
+  emitNotice?: (event: AgentLoopEvent) => void;
   /** Injectable clock for deterministic timestamps. */
   now?: () => string;
+  /**
+   * Loop-prevention configuration (Phase 3 enforcement). Defaults to
+   * `DEFAULT_LOOP_PREVENTION` (enabled, conservative).
+   */
+  prevention?: LoopPreventionOptions;
+  /**
+   * Enforcement callback invoked when a loop is PREVENTED (Phase 3). The
+   * caller wires this to terminate the current run attempt. Settable after
+   * construction because the abort handle (the session) is created later.
+   */
+  onPrevented?: (event: AgentLoopPreventedEvent) => void;
 }
 
 /** Verdict plus whether a new event was emitted for this action. */
 export interface ObserveResult extends LoopVerdict {
   /** True when a fresh `agent.loop_candidate` event was emitted. */
   emitted: boolean;
+  /** True when the run was PREVENTED (Phase 3 enforcement fired) by this action. */
+  prevented?: boolean;
+  /** Loop-prevention reason (e.g. "no_progress_turns"), when prevented. */
+  preventionReason?: string;
 }
 
 export class AgentProgressSupervisor {
   private readonly evaluator: ProgressEvaluator;
   private readonly normalizer: ToolCallNormalizer;
   private readonly eventStore: EventStoreBackend | undefined;
-  private readonly onEvent: ((event: AgentLoopCandidateEvent) => void) | undefined;
-  private readonly emitNotice: (event: AgentLoopCandidateEvent) => void;
+  private readonly onEvent: ((event: AgentLoopEvent) => void) | undefined;
+  private readonly emitNotice: (event: AgentLoopEvent) => void;
   private readonly now: () => string;
   /** sessionId -> fingerprint of the loop already reported for that session. */
   private readonly reportedLoops = new Map<string, string>();
-  private readonly events: AgentLoopCandidateEvent[] = [];
+  private readonly events: AgentLoopEvent[] = [];
+  private readonly prevention: Required<LoopPreventionOptions>;
+  /** Enforcement callback (settable after construction; see options). */
+  onPrevented: ((event: AgentLoopPreventedEvent) => void) | undefined;
+  /** Fires prevention at most once per supervisor (the session is aborted). */
+  private preventionFired = false;
 
   constructor(options: AgentProgressSupervisorOptions = {}) {
     this.evaluator = new ProgressEvaluator({
@@ -76,6 +107,8 @@ export class AgentProgressSupervisor {
     this.normalizer = options.normalizer ?? new ToolCallNormalizer();
     this.eventStore = options.eventStore;
     this.onEvent = options.onEvent;
+    this.onPrevented = options.onPrevented;
+    this.prevention = { ...DEFAULT_LOOP_PREVENTION, ...options.prevention };
     this.now = options.now ?? (() => new Date().toISOString());
     this.emitNotice =
       options.emitNotice ??
@@ -88,8 +121,8 @@ export class AgentProgressSupervisor {
         }));
   }
 
-  /** All events emitted so far, in emission order. */
-  get emittedEvents(): readonly AgentLoopCandidateEvent[] {
+  /** All events emitted so far, in emission order (candidate + prevented). */
+  get emittedEvents(): readonly AgentLoopEvent[] {
     return this.events;
   }
 
@@ -101,6 +134,36 @@ export class AgentProgressSupervisor {
    */
   async observe(action: AgentAction): Promise<ObserveResult> {
     const verdict = this.evaluator.classify(action);
+    const vector = this.evaluator.vector();
+    // Phase 3 enforcement (independent of the detection gate): a SUSTAINED run
+    // of identical no-progress actions (noProgressTurns at/above the PREVENTION
+    // threshold) is prevented — the enforcement hook fires once and the caller
+    // aborts the run. Conservative: only identical-fingerprint no-progress
+    // triggers it; changed inputs/results change the fingerprint and keep
+    // noProgressTurns low, so legitimate repeats are never prevented.
+    if (this.prevention.enabled && !this.preventionFired && vector.noProgressTurns >= this.prevention.noProgressTurns) {
+      this.preventionFired = true;
+      const event = this.buildPreventedEvent(action, vector.noProgressTurns);
+      this.events.push(event);
+      try {
+        this.onPrevented?.(event);
+      } catch {
+        /* A failing enforcement callback must not break detection. */
+      }
+      try {
+        this.emitNotice(event);
+      } catch {
+        /* A failing notice emitter must not break detection. */
+      }
+      if (this.eventStore !== undefined) {
+        try {
+          await this.eventStore.append(this.toStoredEvent(event));
+        } catch {
+          /* Persistence is best-effort. */
+        }
+      }
+      return { ...verdict, emitted: true, prevented: true, preventionReason: "no_progress_turns" };
+    }
     if (!verdict.loop_candidate) {
       // Progress (or a non-loop action) resets the reported-loop marker.
       this.reportedLoops.delete(action.sessionId);
@@ -135,6 +198,17 @@ export class AgentProgressSupervisor {
     return { ...verdict, emitted: true };
   }
 
+  private buildPreventedEvent(action: AgentAction, noProgressTurns: number): AgentLoopPreventedEvent {
+    const candidate = this.buildEvent(action, "no_progress_turns");
+    const { type: _type, ...rest } = candidate;
+    return {
+      ...rest,
+      type: "agent.loop_prevented",
+      prevented: true,
+      metrics: { ...candidate.metrics, noProgressTurns },
+    };
+  }
+
   private buildEvent(action: AgentAction, reason: string): AgentLoopCandidateEvent {
     const vector = this.evaluator.vector();
     const call = this.normalizer.normalize({ name: action.tool, arguments: action.normalizedArguments });
@@ -167,11 +241,13 @@ export class AgentProgressSupervisor {
   }
 
   /** Map an APS event onto the shared persistent event model. */
-  private toStoredEvent(event: AgentLoopCandidateEvent): StoredEvent {
+  private toStoredEvent(event: AgentLoopEvent): StoredEvent {
     return {
       event_id: event.event_id,
       timestamp: event.timestamp,
-      type: AGENT_LOOP_CANDIDATE_EVENT,
+      type: (event.type === "agent.loop_prevented"
+        ? AGENT_LOOP_PREVENTED_EVENT
+        : AGENT_LOOP_CANDIDATE_EVENT) as StoredEvent["type"],
       project_id: null,
       run_id: event.runId,
       worker_id: event.sessionId,

@@ -715,3 +715,131 @@ it("cleanup never force-deletes a worker branch carrying unmerged commits", asyn
     await fx.cleanup();
   }
 });
+
+/**
+ * Loss-on-failure regression (finding fGg5J6): a mutating worker that FAILS
+ * after leaving uncommitted edits must not have those edits destroyed with the
+ * worktree teardown. The broker must harvest (commit) the partial work onto
+ * the worker branch, must NOT merge a failed branch into the base checkout, and
+ * must preserve the branch so the partial work stays recoverable.
+ */
+it("preserves a failed worker's uncommitted edits (never merges or discards them)", async () => {
+  const fx = await makeFixtureRepo();
+  try {
+    const git = (await GitRepo.open(fx.root))!;
+    const base = await git.headCommit();
+    const store = MissionStore.open(JsonlEventStore.inMemory());
+    const m = store.createMission({
+      title: "x",
+      goal: "x",
+      user_request: "x",
+      repository: ".",
+      base_ref: base,
+      risk_profile: "medium",
+      workflow_class: "engineering_review",
+    });
+    const t = store.createTask({
+      mission_id: m.mission_id,
+      kind: "agent",
+      role: "implementer",
+      objective: "x",
+      mutates_repo: true,
+      isolation: "worktree",
+      write_domains: ["src/**"],
+    });
+    store.transitionTask(t.task_id, "READY");
+
+    const { execFile } = await import("node:child_process");
+    const { promisify } = await import("node:util");
+    const exec = promisify(execFile);
+    const broker = new ExecutionBroker({
+      store,
+      git,
+      baseRef: base,
+      backends: {
+        agent: {
+          runAgent: async ({ worktree }) => {
+            // Write partial work, do NOT commit, then FAIL. Before the fix this
+            // work died with the worktree teardown (no harvest on failure).
+            const { writeFile } = await import("node:fs/promises");
+            await writeFile(join(worktree!, "src", "partial.js"), "export const partial = 1;\n");
+            return {
+              executionId: "e",
+              exitStatus: "failed",
+              summary: "worker failed (gateway)",
+              artifactRefs: [],
+              usage: {},
+              error: "loop_prevented",
+            };
+          },
+        },
+        integration: {
+          runIntegration: async (input) =>
+            new Integrator(git).integrate({
+              objective: input.objective,
+              baseCommit: base,
+              handoffs: input.handoffs,
+              signal: input.signal,
+            }),
+        },
+      },
+    });
+
+    const workerBranch = `pi-eng-orch-${t.task_id}`;
+    const outcome = await (
+      await broker.execute({
+        taskId: t.task_id,
+        missionId: m.mission_id,
+        kind: "agent",
+        role: "implementer",
+        objective: "x",
+        mutatesRepo: true,
+        isolation: "worktree",
+      })
+    ).result();
+    assert.equal(outcome.exitStatus, "failed");
+
+    // (a) The partial work was harvested onto the branch (committed), not lost.
+    assert.equal(
+      await git.branchAheadOf(base, workerBranch),
+      true,
+      "failed worker's uncommitted edits must be harvested (committed) onto the branch",
+    );
+    const branchFile = await exec("git", ["-C", fx.root, "show", `${workerBranch}:src/partial.js`]).catch(() => null);
+    assert.ok(branchFile?.stdout.includes("export const partial"), "partial work must be on the branch");
+
+    // (b) Integration must NOT merge a failed branch: the base checkout is unchanged.
+    const it = store.createTask({
+      mission_id: m.mission_id,
+      kind: "integration",
+      role: "integrator",
+      objective: "merge",
+    });
+    store.transitionTask(it.task_id, "READY");
+    await (
+      await broker.execute({
+        taskId: it.task_id,
+        missionId: m.mission_id,
+        kind: "integration",
+        role: "integrator",
+        objective: "merge",
+        mutatesRepo: true,
+        isolation: "none",
+      })
+    ).result();
+    const head = await git.headCommit();
+    assert.equal(head, base, "failed worker branch must not be merged into the base checkout");
+
+    // (c) The failed branch is preserved after cleanup (never force-deleted).
+    await broker.cleanupMission(m.mission_id, { keepBranches: false });
+    const verify = await exec("git", ["-C", fx.root, "rev-parse", "--verify", "--quiet", workerBranch]).catch(
+      () => null,
+    );
+    assert.ok(
+      verify && verify.stdout.trim().length > 0,
+      `failed worker branch must be preserved after cleanup (branch=${workerBranch})`,
+    );
+  } finally {
+    await fx.cleanup();
+  }
+});
