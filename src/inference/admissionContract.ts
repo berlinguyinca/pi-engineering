@@ -181,8 +181,6 @@ export function parseAdmissionPayload(value: unknown): AdmissionInfo | undefined
   if (typeof body === "string") {
     const text = body.trim();
     if (!text) return undefined;
-    // Cheap pre-filter: admission payloads are JSON objects with a type tag.
-    if (!text.includes("inference_admission")) return undefined;
     try {
       body = JSON.parse(text);
     } catch {

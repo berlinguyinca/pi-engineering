@@ -302,7 +302,7 @@ export class AdmissionController {
       this.cooldownUntil = until;
     }
 
-    if (signal.activeLimit !== undefined) {
+    if (signal.activeLimit !== undefined && signal.scope !== "model") {
       // The gateway counts every concurrent request against this limit,
       // including the operator's own interactive turn, so keep the reserve
       // free rather than filling the window with background work.

@@ -8,9 +8,34 @@ import { type AdmissionEvent, AdmissionEventBus, AdmissionMetrics } from "../../
 import {
   type AdmissionAttemptCapture,
   AdmissionBudgetLedger,
+  createAdmissionCaptureFetch,
   executeWithAdmissionRetry,
   terminalAssistantMessage,
 } from "../../src/inference/admissionTransport.ts";
+
+test("capture fetch recognizes a raw inferweave_backpressure response", async () => {
+  const capture: AdmissionAttemptCapture = {};
+  const fetch = createAdmissionCaptureFetch(
+    capture,
+    async () =>
+      new Response(JSON.stringify({ ...SAFE_CAPTURE, type: "inferweave_backpressure" }), {
+        status: 503,
+        headers: { "content-type": "application/json" },
+      }),
+  );
+  const response = await fetch("https://example.invalid", {});
+  assert.equal(capture.admission?.type, "inferweave_backpressure");
+  assert.equal(response.headers.get("x-should-retry"), "false");
+});
+
+const SAFE_CAPTURE = {
+  reason: "NO_CONTEXT_CAPACITY",
+  retryable: true,
+  replay_safe: true,
+  request_state: "queued",
+  action: "backoff",
+  action_code: "IW-ACT-BACKOFF",
+};
 
 /**
  * Deterministic clock + interruptible sleep for the state machine.

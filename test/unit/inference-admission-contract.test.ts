@@ -140,6 +140,11 @@ test("parses a JSON string body", () => {
   assert.equal(info.retryAfterMs, 30_000);
 });
 
+test("parses both contract generations from raw JSON strings", () => {
+  assert.equal(parseAdmissionPayload(JSON.stringify(PAYLOAD))?.type, "inference_admission");
+  assert.equal(parseAdmissionPayload(JSON.stringify(SAFE_NEW))?.type, "inferweave_backpressure");
+});
+
 test("rejects a bare provider-shaped 429 body (no admission type tag)", () => {
   const body = { error: { message: "rate limited", type: "rate_limit_exceeded" } };
   assert.equal(parseAdmissionPayload(body), undefined);

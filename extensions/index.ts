@@ -709,19 +709,31 @@ ${RECOVERY_PROMPT}`;
   });
   if (gatewayConfig.enabled && typeof pi.on === "function") {
     const admission = sharedAdmissionController();
+    const responseMetadata = new Map<string, Array<{ status?: number; headers?: Record<string, string> }>>();
+    const responseKey = (model: { provider?: string; id?: string } | undefined): string | undefined =>
+      model?.provider && model.id ? `${model.provider}/${model.id}` : undefined;
+    const takeResponseMetadata = (model: { provider?: string; id?: string } | undefined) => {
+      const key = responseKey(model);
+      if (!key) return undefined;
+      const queue = responseMetadata.get(key);
+      const metadata = queue?.shift();
+      if (!queue || queue.length === 0) responseMetadata.delete(key);
+      return metadata;
+    };
+    const clearResponseMetadata = (model: { provider?: string; id?: string } | undefined): void => {
+      const key = responseKey(model);
+      if (key) responseMetadata.delete(key);
+    };
 
-    // Status line + headers: what the transport saw (`Retry-After`), no body.
-    // Narrowed to 429: a transient 5xx is Pi's own retry to handle, and arming
-    // a process-wide cooldown on one flaky response would stall every caller.
-    pi.on("after_provider_response", async (event) => {
-      if (event.status !== 429) return;
-      const signal = parseGatewayWait({ status: event.status, headers: event.headers });
-      // A 429 is a statement about the account, so it parks everyone. Scoped
-      // through the same predicate as the other two paths rather than by hand.
-      if (signal?.retryable) {
-        if (isAccountWideRefusal(signal)) admission.noteWait(signal);
-        else admission.noteObservedWait(signal);
-      }
+    // Headers arrive before the flattened terminal body. Record them without
+    // mutating cooldown state; scope and the maximum header/body delay can only
+    // be decided once the terminal body is available.
+    pi.on("after_provider_response", async (event, ctx) => {
+      const key = responseKey(ctx.model);
+      if (!key) return;
+      const queue = responseMetadata.get(key) ?? [];
+      queue.push({ status: event.status, headers: event.headers });
+      responseMetadata.set(key, queue);
     });
 
     // Pi's own session retry stops after `retry.maxRetries` (default 3),
@@ -741,7 +753,7 @@ ${RECOVERY_PROMPT}`;
     pi.on("message_end", async (event, ctx) => {
       const msg = event.message as { role?: string; stopReason?: string; errorMessage?: string } | undefined;
       if (msg?.role !== "assistant" || msg.stopReason !== "error" || !msg.errorMessage) return;
-      const signal = parseGatewayWait({ text: msg.errorMessage });
+      const signal = parseGatewayWait({ ...(takeResponseMetadata(ctx.model) ?? {}), text: msg.errorMessage });
       if (!signal?.retryable) return;
       const waitMs = isAccountWideRefusal(signal) ? admission.noteWait(signal) : admission.noteObservedWait(signal);
       // The status bar owns this now: a spinner, the countdown and the queue
@@ -765,9 +777,8 @@ ${RECOVERY_PROMPT}`;
     // bar carries that (spinner + countdown + queue position); the notify path
     // is the fallback for a session running without one.
     //
-    // The wait is unbounded by policy, so it is tied to the turn's own abort
-    // signal: escape ends the hold for this caller and leaves the cooldown
-    // standing for everyone else.
+    // The wait is tied to the turn's own abort signal: escape ends the hold for
+    // this caller and leaves any wider cooldown standing for other callers.
     let noticeSilentUntil = 0;
     pi.on("before_provider_request", async (_event, ctx) => {
       const identity = ctx.model ? { provider: ctx.model.provider, model: ctx.model.id } : {};
@@ -835,6 +846,7 @@ ${RECOVERY_PROMPT}`;
           // accumulated across a whole session and would eventually trip a
           // fallback on unrelated, widely separated holds.
           onProgress: () => {
+            clearResponseMetadata(model);
             fallbackCoordinator.onProgress();
           },
           onHold: () => {
@@ -854,6 +866,7 @@ ${RECOVERY_PROMPT}`;
           },
           maxAttempts: gatewayConfig.maxRetries + 1,
           maxElapsedMs: gatewayConfig.maxElapsedMs,
+          response: () => takeResponseMetadata(model),
           signalOf: (options) => (options as { signal?: AbortSignal } | undefined)?.signal,
           errorMessage: (m, error) => ({
             role: "assistant",

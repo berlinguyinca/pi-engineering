@@ -172,6 +172,33 @@ test("stream retry: the body-advertised wait is honoured exactly", async () => {
   assert.equal(h.seen[0]?.ms, 30_000, "the gateway said 30s; anything else walks back into the queue");
 });
 
+test("stream retry: one decision chooses the larger 503 header delay over the body", async () => {
+  const body =
+    '503: {"type":"inferweave_backpressure","reason":"NO_CONTEXT_CAPACITY","retryable":true,' +
+    '"replay_safe":true,"request_state":"queued","action":"backoff","action_code":"IW-ACT-BACKOFF",' +
+    '"retry_after_ms":1000,"scope":"model"}';
+  const s = scripted([[failed(body)], [done()]]);
+  const h = holds();
+  await pumpWithGatewayRetry(s.open, sink(), {
+    hold: h.hold,
+    response: () => ({ status: 503, headers: { "retry-after": "8" } }),
+  });
+  assert.deepEqual(
+    h.seen.map((entry) => entry.ms),
+    [8_000],
+  );
+});
+
+test("stream retry: non-finite direct budgets fail closed to finite defaults", async () => {
+  const s = scripted(Array.from({ length: 50 }, () => [failed(SATURATED)]));
+  const outcome = await pumpWithGatewayRetry(s.open, sink(), {
+    hold: holds().hold,
+    maxAttempts: Number.POSITIVE_INFINITY,
+    maxElapsedMs: Number.POSITIVE_INFINITY,
+  });
+  assert.ok(outcome.attempts < 50);
+});
+
 test("stream retry: a synthesized wait escalates instead of hammering a flat 5s", async () => {
   // A bare 503 advertises no wait, so the 5s default is a guess. Repeating it
   // unchanged against a gateway with no workers is a busy-wait.

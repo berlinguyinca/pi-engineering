@@ -87,6 +87,18 @@ test("gateway report: a synthesized wait is distinguished from an advertised one
   assert.match(out, /no wait advertised — using 5s/, "the operator should know when the number is ours, not theirs");
 });
 
+test("gateway report: Retry-After headers are described as advertised", () => {
+  const out = renderGatewayReport({
+    status: status({
+      lastSignal: { retryAfterMs: 8_000, retryable: true, source: "header", status: 503 },
+    }),
+    config: CONFIG,
+    installs: [],
+  }).join("\n");
+  assert.match(out, /asked for 8s/);
+  assert.doesNotMatch(out, /no wait advertised/);
+});
+
 test("gateway report: a session without the wrapper is warned, not reassured", () => {
   const out = renderGatewayReport({ status: status(), config: CONFIG, installs: [] }).join("\n");
   assert.match(out, /Admission retry NOT installed — this turn uses Pi's own retry budget/);

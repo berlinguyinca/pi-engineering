@@ -133,7 +133,7 @@ Top-level YAML in the engineering policy under `inference.retry.admission`
 | `enabled` | `true` | Master switch. |
 | `observe_only` | `false` | Parse + emit events, never wait or change control flow. |
 | `max_attempts` | `50` | Attempt cap for one logical inference. |
-| `max_elapsed_ms` | `900000` | Cumulative *waited* budget (not wall clock). |
+| `max_elapsed_ms` | `900000` | Monotonic wall-clock budget for one logical inference. |
 | `min_delay_ms` / `max_delay_ms` | `500` / `120000` | Delay bounds (ms). |
 | `base_backoff_ms` / `max_backoff_ms` | `2000` / `120000` | Backoff (ms). |
 | `jitter_ratio` | `0.1` | Positive jitter fraction. |
@@ -184,8 +184,8 @@ cumulative wait, ending with *"Waiting for inference capacity... [Esc to cancel]
 
 ## Tests
 
-`test/unit/inference-admission-transport.test.ts` is the surviving admission
-suite on `main` (a deterministic fake-clock state machine):
+`test/unit/inference-admission-transport.test.ts` provides the deterministic
+fake-clock state-machine coverage:
 
 - single 429 then success (honors a 30s wait);
 - acceptance: four 30s `queue_timeout` waits then a successful stream (agent
@@ -198,10 +198,10 @@ suite on `main` (a deterministic fake-clock state machine):
 - quota→fallback (no wait); 401/403 never waited; unknown reasons;
 - stream replay safety; `observe_only`; shared-budget ledger; metrics fields.
 
-Additional unit suites (contract parsing, delay precedence, policy/config,
-status UI) and the `node:http` fake-InferWeave integration test were authored
-but were dropped during the merge of the feature branch into `main`; the
-behaviour they covered is exercised through the transport suite above.
+The checked-in parser, delay, policy/config, gateway controller, interactive
+stream retry, installer, and status suites cover both retry paths. Integration
+coverage includes the real provider registry, extension event wiring, and the
+`node:http` fake-InferWeave endpoint.
 
 ## Troubleshooting
 

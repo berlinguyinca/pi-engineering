@@ -133,6 +133,44 @@ test("wiring: a 429 carrying only a Retry-After header is still account-wide", a
   }
 });
 
+test("wiring: the header hook records metadata without mutating cooldown early", async () => {
+  const { controller, calls } = observableController();
+  try {
+    const handlers = loadExtension();
+    const ctx = { ...ctxStub(), model: { provider: "acme", id: "busy", api: "openai-completions" } };
+    for (const handler of handlers.get("after_provider_response") ?? []) {
+      await handler({ status: 429, headers: { "retry-after": "8" } }, ctx);
+    }
+    assert.deepEqual(calls, []);
+    assert.equal(controller.cooldownRemainingMs(), 0);
+  } finally {
+    setSharedAdmissionController(undefined);
+  }
+});
+
+test("wiring: final body combines with cached 503 headers before scope mutation", async () => {
+  const { controller, calls } = observableController();
+  try {
+    const handlers = loadExtension();
+    const ctx = { ...ctxStub(), model: { provider: "acme", id: "busy", api: "openai-completions" } };
+    for (const handler of handlers.get("after_provider_response") ?? []) {
+      await handler({ status: 503, headers: { "retry-after": "8" } }, ctx);
+    }
+    const errorMessage =
+      '503: {"type":"inferweave_backpressure","reason":"NO_CONTEXT_CAPACITY","retryable":true,' +
+      '"replay_safe":true,"request_state":"queued","action":"backoff","action_code":"IW-ACT-BACKOFF",' +
+      '"retry_after_ms":1000,"scope":"model"}';
+    for (const handler of handlers.get("message_end") ?? []) {
+      await handler({ message: { role: "assistant", stopReason: "error", errorMessage } }, ctx);
+    }
+    assert.deepEqual(calls, ["noteObservedWait"]);
+    assert.equal(controller.status().lastSignal?.retryAfterMs, 8_000);
+    assert.equal(controller.cooldownRemainingMs({ provider: "acme", model: "other" }), 0);
+  } finally {
+    setSharedAdmissionController(undefined);
+  }
+});
+
 test("wiring: a non-gateway assistant error touches the controller at all", async () => {
   const { calls } = observableController();
   try {

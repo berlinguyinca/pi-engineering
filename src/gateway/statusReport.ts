@@ -99,7 +99,7 @@ export function renderGatewayReport(input: GatewayReportInput): string[] {
     }
     if (signal.activeLimit != null) parts.push(`gateway admits ${signal.activeLimit} at once`);
     parts.push(
-      signal.source === "body"
+      signal.source !== "default"
         ? `asked for ${seconds(signal.retryAfterMs)}`
         : `no wait advertised — using ${seconds(signal.retryAfterMs)}`,
     );

@@ -82,6 +82,12 @@ export function resolveGatewayConfig(overrides?: Partial<GatewayAdmissionConfig>
   cfg.telemetry = bool(env.PI_GATEWAY_TELEMETRY, cfg.telemetry);
 
   if (overrides) Object.assign(cfg, overrides);
+  // Programmatic callers are no more trusted than environment input. Infinite
+  // budgets silently recreate the unbounded retry loop this config prevents.
+  if (!Number.isFinite(cfg.maxRetries)) cfg.maxRetries = DEFAULT_GATEWAY_CONFIG.maxRetries;
+  if (!Number.isFinite(cfg.maxElapsedMs)) cfg.maxElapsedMs = DEFAULT_GATEWAY_CONFIG.maxElapsedMs;
+  cfg.maxRetries = Math.max(0, Math.floor(cfg.maxRetries));
+  cfg.maxElapsedMs = Math.max(0, cfg.maxElapsedMs);
   return cfg;
 }
 

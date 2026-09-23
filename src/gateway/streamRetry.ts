@@ -37,7 +37,7 @@
  * belongs to, are injected as `hold`.
  */
 
-import { type GatewayWaitSignal, parseGatewayWait } from "./signals.ts";
+import { type GatewayWaitInput, type GatewayWaitSignal, parseGatewayWait } from "./signals.ts";
 
 /** A terminal event ends pi's stream and resolves its result. */
 function isTerminal(type: string | undefined): boolean {
@@ -101,6 +101,8 @@ export interface GatewayStreamRetryOptions {
   maxElapsedMs?: number;
   /** Injectable monotonic clock. */
   now?: () => number;
+  /** Status/headers captured for the attempt before the body was flattened. */
+  response?: () => Omit<GatewayWaitInput, "text"> | undefined;
   /** Ceiling on a SYNTHESIZED wait. Advertised waits are honoured exactly. */
   maxEscalatedWaitMs?: number;
   /**
@@ -141,6 +143,15 @@ export const MAX_ESCALATED_WAIT_MS = 60_000;
 export const DEFAULT_GATEWAY_MAX_ATTEMPTS = 8;
 export const DEFAULT_GATEWAY_MAX_ELAPSED_MS = 300_000;
 
+/** Monotonic default used for elapsed budgets; HTTP-date parsing remains wall-clock based. */
+export function monotonicNow(): number {
+  return globalThis.performance?.now() ?? Date.now();
+}
+
+function finiteBudget(value: number | undefined, fallback: number, minimum: number): number {
+  return typeof value === "number" && Number.isFinite(value) && value >= minimum ? value : fallback;
+}
+
 function errorText(value: unknown): string {
   return value instanceof Error ? value.message : String(value ?? "");
 }
@@ -174,9 +185,9 @@ export async function pumpWithGatewayRetry<E extends RetryableEvent, R extends R
   sink: RetrySink<E, R>,
   opts: GatewayStreamRetryOptions,
 ): Promise<GatewayStreamRetryOutcome> {
-  const maxAttempts = opts.maxAttempts ?? DEFAULT_GATEWAY_MAX_ATTEMPTS;
-  const maxElapsedMs = opts.maxElapsedMs ?? DEFAULT_GATEWAY_MAX_ELAPSED_MS;
-  const now = opts.now ?? Date.now;
+  const maxAttempts = Math.floor(finiteBudget(opts.maxAttempts, DEFAULT_GATEWAY_MAX_ATTEMPTS, 1));
+  const maxElapsedMs = finiteBudget(opts.maxElapsedMs, DEFAULT_GATEWAY_MAX_ELAPSED_MS, 1);
+  const now = opts.now ?? monotonicNow;
   const startedAt = now();
   const capMs = opts.maxEscalatedWaitMs ?? MAX_ESCALATED_WAIT_MS;
   const priorHolds = opts.priorHolds ?? 0;
@@ -233,7 +244,7 @@ export async function pumpWithGatewayRetry<E extends RetryableEvent, R extends R
 
     const failure = thrown !== undefined ? errorText(thrown) : (result?.errorMessage ?? "");
     const isAbort = result?.stopReason === "aborted" || opts.signal?.aborted === true;
-    const wait = isAbort || forwarded ? null : parseGatewayWait({ text: failure });
+    const wait = isAbort || forwarded ? null : parseGatewayWait({ ...(opts.response?.() ?? {}), text: failure });
     const remainingMs = maxElapsedMs - (now() - startedAt);
     const held = wait ? waitFor(wait, attempt + priorHolds, capMs) : undefined;
     const retryable =

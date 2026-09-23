@@ -72,6 +72,7 @@ export interface InstallDeps<M, O> {
   maxAttempts?: number;
   maxElapsedMs?: number;
   now?: () => number;
+  response?: GatewayStreamRetryOptions["response"];
 }
 
 export type InstallResult =
@@ -178,6 +179,7 @@ export function installGatewayStreamRetry<M, C, O>(
       ...(deps.maxAttempts != null ? { maxAttempts: deps.maxAttempts } : {}),
       ...(deps.maxElapsedMs != null ? { maxElapsedMs: deps.maxElapsedMs } : {}),
       ...(deps.now ? { now: deps.now } : {}),
+      ...(deps.response ? { response: deps.response } : {}),
     }).catch((error: unknown) => {
       // A throw that is not gateway backpressure. Pi expects a terminal event,
       // never a rejected promise, so report it the way `lazyStream` does.

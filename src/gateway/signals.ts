@@ -149,9 +149,12 @@ export function parseGatewayWait(input: GatewayWaitInput): GatewayWaitSignal | n
   // transport layer (type-tag gated). When the body is not an admission
   // envelope this is undefined and we fall back to the gateway heuristics.
   const admission = body ? parseAdmissionPayload(body) : undefined;
+  const malformedNewContract = admission === undefined && text.includes("inferweave_backpressure");
 
   const status = input.status ?? leadingStatus(text) ?? num(body?.status);
-  const type = admission ? str(admission.payload.type) : str(body?.type);
+  const type = admission
+    ? str(admission.payload.type)
+    : (str(body?.type) ?? (malformedNewContract ? "inferweave_backpressure" : undefined));
   const reason = admission ? admission.reason : str(body?.reason);
   const isAdmission = admission !== undefined || type === "inference_admission" || reason === "queue_timeout";
   const looksRateLimited =
@@ -161,7 +164,11 @@ export function parseGatewayWait(input: GatewayWaitInput): GatewayWaitSignal | n
 
   // Quota/billing exhaustion is deterministic: waiting never clears it, and Pi's
   // own retry classifier fails fast there for the same reason.
-  const retryable = admission ? isAutomaticReplayAllowed(admission, false) : !NON_RETRYABLE_PATTERNS.test(text);
+  const retryable = malformedNewContract
+    ? false
+    : admission
+      ? isAutomaticReplayAllowed(admission, false)
+      : !NON_RETRYABLE_PATTERNS.test(text);
 
   const bodyWaitMs =
     admission?.retryAfterMs ??

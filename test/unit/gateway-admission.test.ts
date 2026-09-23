@@ -124,6 +124,17 @@ test("malformed payloads degrade instead of throwing", () => {
   assert.equal(signal.source, "default");
 });
 
+test("a malformed new-contract marker is terminal instead of using legacy retry heuristics", () => {
+  const signal = parseGatewayWait({
+    text: '503: {"type":"inferweave_backpressure","retryable":tru',
+    headers: { "retry-after": "8" },
+  });
+  assert.ok(signal);
+  assert.equal(signal.type, "inferweave_backpressure");
+  assert.equal(signal.retryable, false);
+  assert.equal(signal.retryAfterMs, 8_000);
+});
+
 test("a retry_after_ms reported as a string is honoured", () => {
   const signal = parseGatewayWait({ text: '429: {"retry_after_ms":"1500","reason":"queue_timeout"}' });
   assert.equal(signal?.retryAfterMs, 1500);
@@ -411,6 +422,13 @@ test("model-scoped cooldown does not pause another model", async () => {
   assert.equal(controller.cooldownRemainingMs({ provider: "acme", model: "busy" }), 5_000);
   await controller.awaitCooldown({ provider: "acme", model: "other" });
   assert.deepEqual(slept, []);
+  assert.equal(controller.status().concurrency, 4, "a model-scoped refusal must not clamp unrelated models");
+});
+
+test("programmatic non-finite gateway budgets normalize back to finite defaults", () => {
+  const cfg = resolveGatewayConfig({ maxRetries: Number.POSITIVE_INFINITY, maxElapsedMs: Number.POSITIVE_INFINITY });
+  assert.ok(Number.isFinite(cfg.maxRetries));
+  assert.ok(Number.isFinite(cfg.maxElapsedMs));
 });
 
 test("an unlimited budget never gives up, however many waits have been spent", () => {
