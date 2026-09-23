@@ -9,7 +9,8 @@ import {
   createAgentSession,
   createExtensionRuntime,
 } from "@earendil-works/pi-coding-agent";
-import type { AgentProgressSupervisorOptions } from "../aps/supervisor.ts";
+import { AGENT_LOOP_PREVENTED_EVENT, type AgentProgressSupervisorOptions } from "../aps/supervisor.ts";
+import { type AgentLoopPreventedEvent, DEFAULT_LOOP_PREVENTION } from "../aps/types.ts";
 import { WorkerActivityAdapter } from "../aps/workerActivity.ts";
 import type { WorkerResult, WorkerRole, WorkerUsage } from "../core/types.ts";
 import type { AdmissionController } from "../gateway/AdmissionController.ts";
@@ -98,6 +99,15 @@ export interface PiWorkerExecutorOptions {
    * Default `{}` (enabled with default thresholds); `false` disables.
    */
   aps?: AgentProgressSupervisorOptions | false;
+  /**
+   * APS loop PREVENTION (Phase 3, first enforcement): when the supervisor
+   * detects a SUSTAINED no-progress loop (identical fingerprint, no state
+   * change >= threshold) it aborts the run attempt and surfaces a
+   * `loop_prevented` outcome, so a looping agent does not burn the rest of the
+   * worker budget. Default `DEFAULT_LOOP_PREVENTION` (enabled, conservative);
+   * `false` disables (detection only).
+   */
+  loopPrevention?: import("../aps/types.ts").LoopPreventionOptions | false;
 }
 
 /**
@@ -122,6 +132,8 @@ export class PiWorkerExecutor implements WorkerExecutor {
   private readonly transientRand: () => number;
   /** APS loop-detection options for worker sessions (`false` disables). */
   private readonly aps: AgentProgressSupervisorOptions | false | undefined;
+  /** APS loop-prevention options (`false` disables enforcement). */
+  private readonly loopPrevention: import("../aps/types.ts").LoopPreventionOptions | false | undefined;
   private modelRuntime: ModelRuntime | undefined;
   private runtimePromise: Promise<ModelRuntime> | undefined;
   /** Aggregate recovery telemetry across all worker runs. */
@@ -143,6 +155,7 @@ export class PiWorkerExecutor implements WorkerExecutor {
     this.transientSleep = opts.transientSleep ?? ((ms) => new Promise<void>((r) => setTimeout(r, ms)));
     this.transientRand = opts.transientRand ?? Math.random;
     this.aps = opts.aps;
+    this.loopPrevention = opts.loopPrevention;
   }
 
   /** Inject/refresh the semantic tools bound to a runtime (scout/reviewer/implementer sessions). */
@@ -353,6 +366,8 @@ ${TOOL_TRANSITION_RULE}`;
         budgetExhausted,
         timedOut,
         assistantError,
+        loopPrevented,
+        loopPreventedEvent,
       } = transientOutcome.value!;
       if (assistantError) lastAssistantError = assistantError;
 
@@ -378,6 +393,41 @@ ${TOOL_TRANSITION_RULE}`;
           await admission.noteWaitAndSleep(decision.signal);
           continue;
         }
+      }
+
+      // Phase 3 enforcement outcome: the supervisor PREVENTED a sustained loop
+      // and aborted the run. This is terminal for the attempt — not a guard
+      // recovery-ladder case and not a transient retry. The broker preserves
+      // any partial edits and does not integrate failed work.
+      if (loopPrevented) {
+        this.emitTelemetry({
+          event: "model_generation_aborted",
+          reason: "loop_prevented" as GuardAbortReason,
+          model: (model as { id?: string }).id ?? "unknown",
+          agent: req.role,
+          attempt,
+          reasoning_tokens: 0,
+          output_tokens: this.estimateOutputTokens(session.messages),
+          tokens_since_progress: loopPreventedEvent?.metrics.noProgressTurns ?? 0,
+          timestamp: new Date().toISOString(),
+        });
+        const usage = this.collectUsage(this.asMessages(session.messages));
+        const detail = { loop_prevented: true, no_progress_turns: loopPreventedEvent?.metrics.noProgressTurns ?? 0 };
+        return {
+          result: {
+            status: "failed",
+            summary: `Agent loop prevented after ${detail.no_progress_turns} identical no-progress turns (${AGENT_LOOP_PREVENTED_EVENT}).`,
+            claims: [],
+            evidence_refs: [],
+            new_hypotheses: [],
+            proposed_tasks: [],
+            details: detail,
+            error: "loop_prevented",
+          },
+          usage,
+          error: "loop_prevented",
+          toolCalls,
+        };
       }
 
       if (!guardAborted || !this.guardConfig.enabled) {
@@ -522,6 +572,8 @@ ${recovery.recoveryPrompt}`;
     session: { dispose: () => void; messages: readonly unknown[] };
     guardAborted: boolean;
     guardReason?: GuardAbortReason;
+    loopPrevented: boolean;
+    loopPreventedEvent?: AgentLoopPreventedEvent;
     guardDiagnostics: Record<string, unknown>;
     captured?: WorkerResult;
     structured?: unknown;
@@ -557,6 +609,19 @@ ${recovery.recoveryPrompt}`;
     // `agent.loop_candidate` events. Never affects the run.
     const apsAdapter = this.createApsAdapter(req, model);
     const apsDetach = apsAdapter ? apsAdapter.attach(session) : undefined;
+    // Phase 3 enforcement: when the supervisor PREVENTS a sustained loop, abort
+    // this run attempt so the worker does not burn its remaining budget, and
+    // surface a distinguishable outcome. Settable after session creation
+    // because the abort handle lives on the session.
+    if (apsAdapter) {
+      apsAdapter.supervisor.onPrevented = (event) => {
+        if (!loopPrevented) {
+          loopPrevented = true;
+          loopPreventedEvent = event;
+          void session.abort();
+        }
+      };
+    }
     let captured: WorkerResult | undefined;
     let structured: unknown;
     let toolCalls = 0;
@@ -565,6 +630,8 @@ ${recovery.recoveryPrompt}`;
     let guardAborted = false;
     let guardReason: GuardAbortReason | undefined;
     let guardDiagnostics: Record<string, unknown> = {};
+    let loopPrevented = false;
+    let loopPreventedEvent: AgentLoopPreventedEvent | undefined;
     // Two distinct error channels, both needed: `assistantError` is the
     // assistant MESSAGE's error (stopReason "error" — where a gateway 429 body
     // arrives), `promptError` is a THROWN transport failure.
@@ -698,6 +765,8 @@ ${recovery.recoveryPrompt}`;
       guardAborted,
       guardReason,
       guardDiagnostics,
+      loopPrevented,
+      loopPreventedEvent,
       captured,
       structured,
       toolCalls,
@@ -710,6 +779,14 @@ ${recovery.recoveryPrompt}`;
   /** Build the per-attempt APS activity adapter (null when detection is disabled). */
   private createApsAdapter(req: WorkerRequest, model: Model<any>): WorkerActivityAdapter | null {
     if (this.aps === false) return null;
+    // Phase 3 enforcement config rides in the supervisor options: when a
+    // sustained no-progress loop reaches the prevention threshold the
+    // supervisor fires `onPrevented`, which the run loop wires to abort the
+    // session and surface a `loop_prevented` outcome.
+    const prevention =
+      this.loopPrevention === false
+        ? { ...DEFAULT_LOOP_PREVENTION, enabled: false }
+        : { ...DEFAULT_LOOP_PREVENTION, ...(this.loopPrevention ?? {}) };
     return new WorkerActivityAdapter({
       role: req.role,
       sessionId: req.sessionId,
@@ -718,7 +795,7 @@ ${recovery.recoveryPrompt}`;
       model: { provider: model.provider, id: model.id },
       maxContextTokens: req.maxContextTokens,
       rootPrefix: req.cwd,
-      supervisorOptions: this.aps,
+      supervisorOptions: { ...(this.aps ?? {}), prevention },
     });
   }
 

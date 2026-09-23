@@ -212,3 +212,46 @@ export interface AgentLoopCandidateEvent {
     staleToolResults: number;
   };
 }
+
+/**
+ * Loop prevention (Phase 3: first enforcement) configuration.
+ *
+ * Conservative by design: ONLY a SUSTAINED run of identical semantic
+ * fingerprints with no observed state change (`no_progress_turns`) is
+ * preventable. Legitimate repeated operations — polling, pagination,
+ * retries — change the tool inputs or the observed result, which changes the
+ * fingerprint, and are therefore NEVER prevented.
+ */
+export interface LoopPreventionOptions {
+  /** Whether prevention (enforcement) is active. Default: true. */
+  enabled?: boolean;
+  /**
+   * Trailing run of identical no-progress actions (SAME semantic fingerprint,
+   * no state change) that prevents the current run attempt. Default: 4 (five
+   * consecutive identical actions).
+   */
+  noProgressTurns?: number;
+}
+
+/** Default loop-prevention configuration (enforcement ON, conservative). */
+export const DEFAULT_LOOP_PREVENTION: Required<LoopPreventionOptions> = {
+  enabled: true,
+  noProgressTurns: 4,
+};
+
+/**
+ * The structured event the supervisor emits when it PREVENTS a loop
+ * (Phase 3: first enforcement).
+ *
+ * Unlike `AgentLoopCandidateEvent` (detect-only), a prevented event means the
+ * enforcement hook fired: the worker run attempt is terminated so the mission
+ * does not burn its remaining budget on a looping agent.
+ */
+export interface AgentLoopPreventedEvent extends Omit<AgentLoopCandidateEvent, "type"> {
+  readonly type: "agent.loop_prevented";
+  /** Always true; distinguishes prevention from mere detection. */
+  readonly prevented: true;
+}
+
+/** Either kind of loop event emitted by the supervisor (detect or prevent). */
+export type AgentLoopEvent = AgentLoopCandidateEvent | AgentLoopPreventedEvent;

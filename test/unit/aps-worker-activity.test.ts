@@ -13,7 +13,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { contextUtilization } from "../../src/aps/context.ts";
 import { AgentProgressSupervisor, type AgentProgressSupervisorOptions } from "../../src/aps/supervisor.ts";
-import type { AgentLoopCandidateEvent } from "../../src/aps/types.ts";
+import type { AgentLoopCandidateEvent, AgentLoopEvent } from "../../src/aps/types.ts";
 import { WorkerActivityAdapter } from "../../src/aps/workerActivity.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 import type { TelemetryNotice } from "../../src/telemetry/sink.ts";
@@ -58,7 +58,7 @@ function emitUsage(bus: FakeSessionBus, input: number): void {
 interface Harness {
   adapter: WorkerActivityAdapter;
   bus: FakeSessionBus;
-  events: AgentLoopCandidateEvent[];
+  events: AgentLoopEvent[];
   notices: TelemetryNotice[];
   store: JsonlEventStore;
   detach: () => void;
@@ -69,7 +69,7 @@ function setup(
   adapterOptions: Partial<ConstructorParameters<typeof WorkerActivityAdapter>[0]> = {},
 ): Harness {
   const bus = new FakeSessionBus();
-  const events: AgentLoopCandidateEvent[] = [];
+  const events: AgentLoopEvent[] = [];
   const notices: TelemetryNotice[] = [];
   const uninstall = setTelemetrySink((n) => notices.push(n));
   test.after(uninstall);

@@ -154,6 +154,12 @@ export class ExecutionBroker {
   private readonly resolvedBases = new Map<string, string>();
   /** Branches intentionally kept after cleanup because their work never merged. */
   private readonly preserved = new Map<string, string[]>();
+  /**
+   * Worker branches whose execution FAILED. Their partial edits are preserved
+   * (never merged, never force-deleted) so a failed run's work stays
+   * recoverable instead of being destroyed with the worktree teardown.
+   */
+  private readonly failedBranches = new Map<string, string[]>();
   /** Missions where at least one worker branch carried commits since base (own commits recognized at harvest). */
   private readonly committedWork = new Map<string, boolean>();
 
@@ -488,9 +494,20 @@ export class ExecutionBroker {
             });
           }
           // Persist the worker's edits onto its branch before the worktree is
-          // torn down, otherwise integration has nothing to merge.
-          if (input.mutatesRepo && worktree && outcome.exitStatus === "succeeded") {
+          // torn down, otherwise integration has nothing to merge — and on a
+          // FAILED execution, otherwise the worker's partial work dies with the
+          // worktree. Harvest whenever there is a worktree (success or failure);
+          // failed branches are then excluded from integration and preserved.
+          if (input.mutatesRepo && worktree) {
             await this.harvestWorktree(execution.execution_id);
+            if (outcome.exitStatus !== "succeeded") {
+              const info = this.allocatedWorktrees.get(execution.execution_id);
+              if (info) {
+                const list = this.failedBranches.get(input.missionId) ?? [];
+                if (!list.includes(info.branch)) list.push(info.branch);
+                this.failedBranches.set(input.missionId, list);
+              }
+            }
           }
           this.active.delete(execution.execution_id);
           return outcome;
@@ -559,11 +576,16 @@ export class ExecutionBroker {
       case "integration": {
         const runner = this.backends.integration;
         if (!runner) throw new Error("no integration backend registered");
-        const handoffs = (this.missionWorktrees.get(input.missionId) ?? []).map((w) => ({
-          worktree: w,
-          summary: input.objective,
-          artifacts: [] as string[],
-        }));
+        // Failed executions must not be merged (their work is incomplete).
+        // Their branches are preserved separately (see failedBranches).
+        const failed = new Set(this.failedBranches.get(input.missionId) ?? []);
+        const handoffs = (this.missionWorktrees.get(input.missionId) ?? [])
+          .filter((w) => !failed.has(w.branch))
+          .map((w) => ({
+            worktree: w,
+            summary: input.objective,
+            artifacts: [] as string[],
+          }));
         // After integration, release the merged worktrees (fire-and-forget
         // cleanup so the return value stays a plain Promise<ExecutionOutcome>).
         const outcome = runner.runIntegration({ objective: input.objective, handoffs, signal });
