@@ -53,6 +53,38 @@ describe("orchestration state machines", () => {
     assert.ok(!canTransitionMission("COMPLETE", "REPAIRING"));
   });
 
+  it("resilience states: waiting missions park and resume (not fail)", () => {
+    // A mission parks in a WAITING_* state on infrastructure failure.
+    assert.ok(canTransitionMission("EXECUTING", "WAITING_FOR_LLM"));
+    assert.ok(canTransitionMission("EXECUTING", "WAITING_FOR_CAPACITY"));
+    assert.ok(canTransitionMission("EXECUTING", "WAITING_FOR_GATEWAY"));
+    assert.ok(canTransitionMission("EXECUTING", "WAITING_FOR_MODEL"));
+    assert.ok(canTransitionMission("EXECUTING", "RECOVERING_CONTEXT"));
+    // And resumes back to execution (never dead-ends).
+    assert.ok(canTransitionMission("WAITING_FOR_LLM", "EXECUTING"));
+    assert.ok(canTransitionMission("WAITING_FOR_CAPACITY", "EXECUTING"));
+    assert.ok(canTransitionMission("WAITING_FOR_GATEWAY", "EXECUTING"));
+    assert.ok(canTransitionMission("RECOVERING_CONTEXT", "EXECUTING"));
+    assert.ok(canTransitionMission("WAITING_FOR_MODEL", "EXECUTING"));
+  });
+
+  it("PAUSED_INFRASTRUCTURE is the terminal-on-exhaustion state and resumes", () => {
+    assert.ok(canTransitionMission("WAITING_FOR_LLM", "PAUSED_INFRASTRUCTURE"));
+    assert.ok(canTransitionMission("WAITING_FOR_CAPACITY", "PAUSED_INFRASTRUCTURE"));
+    assert.ok(canTransitionMission("WAITING_FOR_GATEWAY", "PAUSED_INFRASTRUCTURE"));
+    // Resume path: PAUSED -> QUEUED -> STARTING -> EXECUTING.
+    assert.ok(canTransitionMission("PAUSED_INFRASTRUCTURE", "QUEUED"));
+    assert.ok(canTransitionMission("QUEUED", "STARTING"));
+    assert.ok(canTransitionMission("STARTING", "EXECUTING"));
+  });
+
+  it("NEEDS_ATTENTION is for auth/config errors and can be resumed", () => {
+    assert.ok(canTransitionMission("EXECUTING", "NEEDS_ATTENTION"));
+    assert.ok(canTransitionMission("WAITING_FOR_LLM", "NEEDS_ATTENTION"));
+    assert.ok(canTransitionMission("NEEDS_ATTENTION", "EXECUTING"));
+    assert.ok(canTransitionMission("NEEDS_ATTENTION", "QUEUED"));
+  });
+
   it("task transitions: READY->RUNNING->SUCCEEDED and retry", () => {
     assert.ok(canTransitionTask("PENDING", "READY"));
     assert.ok(canTransitionTask("READY", "RUNNING"));

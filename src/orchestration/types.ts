@@ -16,6 +16,8 @@ export type MissionStatus =
   | "CLASSIFYING"
   | "PLANNING"
   | "READY"
+  | "QUEUED"
+  | "STARTING"
   | "EXECUTING"
   | "INTEGRATING"
   | "VALIDATING"
@@ -24,6 +26,19 @@ export type MissionStatus =
   | "FINAL_VALIDATION"
   | "COMPLETE"
   | "WAITING_FOR_USER"
+  // Resilience states: transient infrastructure / gateway / capacity / model
+  // waits, context recovery, process recovery, and the terminal-on-exhaustion
+  // pause. A mission parks in one of these instead of failing so that progress
+  // is preserved and it resumes automatically when infrastructure recovers.
+  | "WAITING_FOR_LLM"
+  | "WAITING_FOR_CAPACITY"
+  | "WAITING_FOR_GATEWAY"
+  | "WAITING_FOR_MODEL"
+  | "WAITING_FOR_TOOL"
+  | "RECOVERING_CONTEXT"
+  | "RECOVERING_PROCESS"
+  | "PAUSED_INFRASTRUCTURE"
+  | "NEEDS_ATTENTION"
   | "BLOCKED"
   | "CANCELING"
   | "CANCELED"
