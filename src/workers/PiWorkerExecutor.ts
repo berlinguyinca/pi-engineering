@@ -10,6 +10,13 @@ import {
   createExtensionRuntime,
 } from "@earendil-works/pi-coding-agent";
 import {
+  DEFAULT_ESCALATION,
+  type EscalationEvent,
+  shouldEscalate as apsShouldEscalate,
+  buildEscalationPrompt,
+  selectEscalationModel as selectApsEscalationModel,
+} from "../aps/escalation.ts";
+import {
   isRecoverable as apsRecoverable,
   buildRecoveryPrompt as buildApsRecoveryPrompt,
   decideRecovery as decideApsRecovery,
@@ -120,6 +127,12 @@ export interface PiWorkerExecutorOptions {
    * `false` disables (detection only).
    */
   loopPrevention?: import("../aps/types.ts").LoopPreventionOptions | false;
+  /**
+   * APS escalation (Phase 5): when a loop survives recovery (Phase 4), escalate
+   * to a distinct (optionally pinned) model once per run, or surface
+   * `escalated_to_human`. Default `DEFAULT_ESCALATION`; `false` disables.
+   */
+  escalation?: import("../aps/escalation.ts").EscalationOptions | false;
 }
 
 /**
@@ -146,6 +159,8 @@ export class PiWorkerExecutor implements WorkerExecutor {
   private readonly aps: AgentProgressSupervisorOptions | false | undefined;
   /** APS loop-prevention options (`false` disables enforcement). */
   private readonly loopPrevention: import("../aps/types.ts").LoopPreventionOptions | false | undefined;
+  /** APS escalation options (`false` disables). */
+  private readonly escalation: import("../aps/escalation.ts").EscalationOptions | false | undefined;
   private modelRuntime: ModelRuntime | undefined;
   private runtimePromise: Promise<ModelRuntime> | undefined;
   /** Aggregate recovery telemetry across all worker runs. */
@@ -168,6 +183,7 @@ export class PiWorkerExecutor implements WorkerExecutor {
     this.transientRand = opts.transientRand ?? Math.random;
     this.aps = opts.aps;
     this.loopPrevention = opts.loopPrevention;
+    this.escalation = opts.escalation;
   }
 
   /** Inject/refresh the semantic tools bound to a runtime (scout/reviewer/implementer sessions). */
@@ -280,6 +296,8 @@ ${TOOL_TRANSITION_RULE}`;
     let model: Model<any> = initialModel;
     let systemPrompt: string = initialPrompt;
     let attempt = 0;
+    let escalatedCount = 0;
+    let escalatedToHuman = false;
     let lastGuardReason: GuardAbortReason | undefined;
     let lastGuardDiagnostics: Record<string, unknown> = {};
     let lastAssistantError: string | undefined;
@@ -424,7 +442,8 @@ ${TOOL_TRANSITION_RULE}`;
           timestamp: new Date().toISOString(),
         });
         const noProgressTurns = loopPreventedEvent?.metrics.noProgressTurns ?? 0;
-        // Decide a recovery and, if safe and not exhausted, retry once.
+        // Phase 4 recovery: one conservative replan/compact attempt via a fresh
+        // session, before escalation (Phase 5).
         if (loopPreventedEvent !== undefined && attempt < APS_RECOVERY_MAX_ATTEMPTS) {
           const recovery = decideApsRecovery(loopPreventedEvent);
           if (apsRecoverable(recovery)) {
@@ -438,11 +457,57 @@ ${TOOL_TRANSITION_RULE}`;
             continue; // fresh session, replan/compact directive, one recovery only
           }
         }
+        // Phase 5 escalation: the loop survived recovery. Escalate ONCE to a
+        // distinct (optionally pinned) model; if none is available, surface
+        // `escalated_to_human`. Bounded; never loops.
+        if (
+          loopPreventedEvent !== undefined &&
+          this.escalation !== false &&
+          apsShouldEscalate(attempt + 1, escalatedCount, { ...DEFAULT_ESCALATION, ...(this.escalation ?? {}) })
+        ) {
+          const currentModelId = (model as { id?: string }).id;
+          const available = (await modelRuntime.getAvailable()) as unknown as { id?: string }[];
+          const escalationConfig = { ...DEFAULT_ESCALATION, ...(this.escalation ?? {}) };
+          const target = selectApsEscalationModel(
+            currentModelId,
+            available,
+            escalationConfig.preferredEscalationModelId,
+          );
+          const escalationEvent: EscalationEvent = {
+            type: "agent.escalation",
+            event_id: `aps-escalation-${Math.random().toString(36).slice(2, 8)}`,
+            timestamp: new Date().toISOString(),
+            sessionId: loopPreventedEvent.sessionId,
+            runId: loopPreventedEvent.runId,
+            workItemId: loopPreventedEvent.workItemId,
+            role: req.role,
+            tier: 1,
+            fromModel: currentModelId ?? "unknown",
+            toModel: target === null ? null : target.id,
+            reason: "loop_prevented_after_recovery",
+            attempt,
+            escalatedToHuman: target === null,
+            humanReviewRequested: target === null,
+          };
+          this.emitTelemetry(escalationEvent);
+          if (target !== null) {
+            const escalated = available.find((m) => m.id === target.id) as Model<any> | undefined;
+            if (escalated) {
+              escalatedCount += 1;
+              attempt += 1;
+              model = escalated;
+              systemPrompt = `${systemPrompt}\n\n${buildEscalationPrompt(escalationEvent.reason)}`;
+              continue; // fresh session on the escalated model, once per run
+            }
+          }
+          escalatedToHuman = true;
+        }
         const usage = this.collectUsage(this.asMessages(session.messages));
         const detail = {
           loop_prevented: true,
           no_progress_turns: noProgressTurns,
           recovery: loopPreventedEvent !== undefined ? decideApsRecovery(loopPreventedEvent).action : "none",
+          escalated_to_human: escalatedToHuman,
         };
         return {
           result: {
@@ -866,14 +931,17 @@ ${recovery.recoveryPrompt}`;
   }
 
   /** Emit a structured telemetry event (spec §21). */
-  private emitTelemetry(event: import("../guard/RecoveryController.ts").DegenerationEvent): void {
+  private emitTelemetry(event: import("../guard/RecoveryController.ts").DegenerationEvent | EscalationEvent): void {
     // Through the sink rather than straight to stderr: headless that still
     // writes the line, and inside Pi it becomes a notice the TUI renders
     // instead of raw JSON painted over whatever the TUI had drawn.
     if (process.env.PI_GUARD_TELEMETRY !== "false") {
+      const isEscalation = "toModel" in event;
       emitTelemetry({
         level: "warning",
-        text: `generation guard: aborted ${event.model} · ${event.reason.replaceAll("_", " ")}`,
+        text: isEscalation
+          ? `aps escalation: ${event.role} ${event.toModel ? `-> ${event.toModel}` : "-> human"} · ${event.reason.replaceAll("_", " ")}`
+          : `generation guard: aborted ${event.model} · ${event.reason.replaceAll("_", " ")}`,
         detail: event,
       });
     }
