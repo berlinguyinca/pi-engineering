@@ -81,7 +81,11 @@ export function curatedTags(rec: {
   }
   if (/flash|mini|haiku|lite|turbo|small|fast|nanofast/.test(hay)) tags.push("fast", "low_cost");
   if (/opus|ultra|max|pro|-4\.(6|7|8)|thinking|reasoner/.test(hay)) tags.push("high_quality", "reasoning_heavy");
-  if ((rec.contextWindow ?? 0) >= 200_000) tags.push("long_context");
+  // 128K context is long in practice; the previous 200K cutoff excluded the
+  // 131072-token class of models, leaving no long_context candidate for the
+  // planner/reviewer roles (which require it) and forcing them to degrade onto
+  // a non-long-context model.
+  if ((rec.contextWindow ?? 0) >= 128_000) tags.push("long_context");
   if (rec.local) tags.push("local_hosted");
   const inPrice = rec.priceInputUsdPerMTok;
   const outPrice = rec.priceOutputUsdPerMTok;
