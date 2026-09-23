@@ -32,6 +32,7 @@ import type { PlanTaskInput } from "../orchestration/orchestrator.ts";
 import { realBackends } from "../orchestration/realBackends.ts";
 import { tasksConflict, topoSort } from "../plan/taskDag.ts";
 import { JsonlEventStore } from "../platform/eventstore/jsonl.ts";
+import { resolveGatewayResilienceConfig } from "../resilience/config.ts";
 import { Scheduler } from "../sched/Scheduler.ts";
 import { emitTelemetry } from "../telemetry/sink.ts";
 import { buildCoreTools } from "../tools/coreTools.ts";
@@ -300,6 +301,13 @@ export class EngineeringRuntime {
    * BESIDE the controller; the controller remains authoritative. Additive.
    */
   missionObservability: MissionObservability | null;
+  /**
+   * Mission-level gateway resilience config (spec §resilience). Time-based
+   * retry window (default 90m), 10s recovery probes, circuit breaker, and
+   * auto-resume — resolved from environment with injectable defaults. Lives
+   * beside the orchestrator; the orchestrator remains authoritative.
+   */
+  resilience: import("../resilience/config.ts").GatewayResilienceConfig;
   private readonly onPhase: ((event: RuntimePhaseEvent) => void) | null;
   /** Work item whose phases are currently being reported (status surfaces only). */
   private currentWorkItemId = "";
@@ -384,6 +392,8 @@ export class EngineeringRuntime {
     this.missionStore = null;
     this.orchestrator = null;
     this.missionObservability = null;
+    // Resolve the time-based gateway resilience config from environment.
+    this.resilience = resolveGatewayResilienceConfig();
   }
 
   static async open(opts: EngineeringRuntimeOptions): Promise<EngineeringRuntime> {
