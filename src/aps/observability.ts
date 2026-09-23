@@ -19,10 +19,10 @@ import type { EscalationEvent } from "./escalation.ts";
 import type { ApsRecoveryAction } from "./recovery.ts";
 import type { AgentLoopEvent, AgentLoopPreventedEvent, SemanticStrategyFamily } from "./types.ts";
 
-export type ContextUtilizationBucket = "<0.5" | "0.5-0.75" | "0.75-0.9" | ">=0.9";
+export type ContextUtilizationBucket = "<0.5" | "0.5-0.75" | "0.75-0.9" | ">=0.9" | "unknown";
 
-function bucketFor(utilization: number | null): ContextUtilizationBucket {
-  if (utilization === null) return "<0.5";
+function bucketFor(utilization: number | null | undefined): ContextUtilizationBucket {
+  if (utilization === null || utilization === undefined || Number.isNaN(utilization)) return "unknown";
   if (utilization < 0.5) return "<0.5";
   if (utilization < 0.75) return "0.5-0.75";
   if (utilization < 0.9) return "0.75-0.9";
@@ -63,7 +63,7 @@ export function emptySnapshot(): ApsSnapshot {
     recoverySuccessRate: null,
     noProgressTurnsBySession: {},
     loopsByTool: {},
-    loopsByContextUtilizationBucket: { "<0.5": 0, "0.5-0.75": 0, "0.75-0.9": 0, ">=0.9": 0 },
+    loopsByContextUtilizationBucket: { "<0.5": 0, "0.5-0.75": 0, "0.75-0.9": 0, ">=0.9": 0, unknown: 0 },
     compactionFrequency: 0,
     escalationFrequency: 0,
   };
@@ -113,7 +113,8 @@ export class ApsObservability {
   }
 
   snapshot(): ApsSnapshot {
-    return this.s;
+    // Return a copy so callers cannot mutate live accumulator state.
+    return structuredClone(this.s);
   }
 }
 
@@ -128,6 +129,6 @@ export function apsNotice(event: AgentLoopEvent | AgentLoopPreventedEvent | Esca
   if (event.type === "agent.loop_prevented") {
     return `APS loop prevented · ${event.role} · ${event.family} · ${event.metrics.noProgressTurns} identical turns`;
   }
-  const fam = event.family as SemanticStrategyFamily;
+  const fam = (event.family as SemanticStrategyFamily | undefined) ?? "unknown";
   return `APS loop candidate · ${event.role} · ${fam} · ${event.metrics.noProgressTurns} turns`;
 }

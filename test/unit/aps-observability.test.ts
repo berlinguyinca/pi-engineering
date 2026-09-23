@@ -41,7 +41,30 @@ test("empty snapshot has zeroed totals and buckets", () => {
   const s = emptySnapshot();
   assert.equal(s.totals.loopCandidates, 0);
   assert.equal(s.recoverySuccessRate, null);
-  assert.deepEqual(s.loopsByContextUtilizationBucket, { "<0.5": 0, "0.5-0.75": 0, "0.75-0.9": 0, ">=0.9": 0 });
+  assert.deepEqual(s.loopsByContextUtilizationBucket, {
+    "<0.5": 0,
+    "0.5-0.75": 0,
+    "0.75-0.9": 0,
+    ">=0.9": 0,
+    unknown: 0,
+  });
+});
+
+test("missing utilization lands in the unknown bucket", () => {
+  const obs = new ApsObservability();
+  obs.recordPrevented(prevented("m1", "read_file", 4, 0.9));
+  obs.recordPrevented(prevented("m1", "read_file", 4, Number.NaN));
+  const s = obs.snapshot();
+  assert.equal(s.loopsByContextUtilizationBucket[">=0.9"], 1);
+  assert.equal(s.loopsByContextUtilizationBucket.unknown, 1);
+});
+
+test("snapshot returns a copy, not mutable internal state", () => {
+  const obs = new ApsObservability();
+  obs.recordPrevented(prevented("m1", "read_file", 4, 0.5));
+  const s = obs.snapshot();
+  s.totals.loopCandidates = 999;
+  assert.equal(obs.snapshot().totals.loopCandidates, 1);
 });
 
 test("loop rate is bucketed by model, tool, and context utilization", () => {

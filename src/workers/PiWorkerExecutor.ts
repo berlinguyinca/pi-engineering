@@ -315,6 +315,7 @@ ${TOOL_TRANSITION_RULE}`;
     let attempt = 0;
     let escalatedCount = 0;
     let escalatedToHuman = false;
+    let recoveryPending = false;
     let lastGuardReason: GuardAbortReason | undefined;
     let lastGuardDiagnostics: Record<string, unknown> = {};
     let lastAssistantError: string | undefined;
@@ -425,6 +426,9 @@ ${TOOL_TRANSITION_RULE}`;
         if (attempt > 0) {
           recordRetryOutcome(this.recoveryTelemetry, true, false);
         }
+        if (recoveryPending) {
+          this.observability.recordRecoveryOutcome(true);
+        }
         if (gatewayConfig.enabled) admission.noteSuccess();
         const usage = this.collectUsage(this.asMessages(session.messages));
         return { result: captured, usage, toolCalls, structured };
@@ -463,11 +467,12 @@ ${TOOL_TRANSITION_RULE}`;
           this.observability.recordPrevented(loopPreventedEvent);
         }
         // Phase 4 recovery: one conservative replan/compact attempt via a fresh
-        // session, before escalation (Phase 5).
-        if (loopPreventedEvent !== undefined && attempt < APS_RECOVERY_MAX_ATTEMPTS) {
+        // session, before escalation (Phase 5). Gated by rollout.recovery.
+        if (loopPreventedEvent !== undefined && this.rollout.recovery && attempt < APS_RECOVERY_MAX_ATTEMPTS) {
           const recovery = decideApsRecovery(loopPreventedEvent);
           if (apsRecoverable(recovery)) {
-            this.observability.recordRecovery(recovery.action);
+            if (this.rollout.observability) this.observability.recordRecovery(recovery.action);
+            recoveryPending = true;
             attempt += 1;
             const recoveryPrompt = buildApsRecoveryPrompt(recovery, loopPreventedEvent);
             if (recovery.action === "compact") {
@@ -484,6 +489,7 @@ ${TOOL_TRANSITION_RULE}`;
         if (
           loopPreventedEvent !== undefined &&
           this.escalation !== false &&
+          this.rollout.escalation &&
           apsShouldEscalate(attempt + 1, escalatedCount, { ...DEFAULT_ESCALATION, ...(this.escalation ?? {}) })
         ) {
           const currentModelId = (model as { id?: string }).id;
@@ -511,7 +517,7 @@ ${TOOL_TRANSITION_RULE}`;
             humanReviewRequested: target === null,
           };
           this.emitTelemetry(escalationEvent);
-          this.observability.recordEscalation(escalationEvent);
+          if (this.rollout.observability) this.observability.recordEscalation(escalationEvent);
           if (target !== null) {
             const escalated = available.find((m) => m.id === target.id) as Model<any> | undefined;
             if (escalated) {
@@ -902,7 +908,7 @@ ${recovery.recoveryPrompt}`;
     // supervisor fires `onPrevented`, which the run loop wires to abort the
     // session and surface a `loop_prevented` outcome.
     const prevention =
-      this.loopPrevention === false
+      this.loopPrevention === false || !this.rollout.prevention
         ? { ...DEFAULT_LOOP_PREVENTION, enabled: false }
         : { ...DEFAULT_LOOP_PREVENTION, ...(this.loopPrevention ?? {}) };
     return new WorkerActivityAdapter({
