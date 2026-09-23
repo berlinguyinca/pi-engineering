@@ -218,6 +218,33 @@ test("admission contract: a single 429 then success succeeds after one wait", as
   assert.ok(names.includes("inference.retry.succeeded"));
 });
 
+test("new-contract explicit false is surfaced with the final server message and codes", async () => {
+  const finalText = "capacity rejected: FINAL-CODE / IW-ACT-DO-NOT-RETRY";
+  const { stream, clock } = runTransport({
+    rejections: 0,
+    invoke: (_attempt, _options, capture) => {
+      capture.admission = {
+        type: "inferweave_backpressure",
+        reason: "internal_error",
+        code: "FINAL-CODE",
+        message: "final server message",
+        retryable: false,
+        replaySafe: false,
+        requestState: "dispatched",
+        action: "do_not_retry",
+        actionCode: "IW-ACT-DO-NOT-RETRY",
+        explicitReplayContract: true,
+        payload: {},
+      } satisfies AdmissionInfo;
+      return errorStream(finalText);
+    },
+  });
+  const { terminal } = await collect(stream);
+  assert.equal(clock.waits.length, 0);
+  assert.match((terminal as { error?: { errorMessage?: string } }).error?.errorMessage ?? "", /FINAL-CODE/);
+  assert.match((terminal as { error?: { errorMessage?: string } }).error?.errorMessage ?? "", /IW-ACT-DO-NOT-RETRY/);
+});
+
 test("acceptance: four 30s queue_timeout waits then a successful stream", async () => {
   // Subscribe before the transport starts (it publishes attempt-1 `started`
   // synchronously while constructing), so every attempt is observed.

@@ -691,6 +691,7 @@ ${RECOVERY_PROMPT}`;
           reservedSlots: gatewayConfig.reservedSlots,
           maxWaitMs: gatewayConfig.maxWaitMs,
           maxRetries: gatewayConfig.maxRetries,
+          maxElapsedMs: gatewayConfig.maxElapsedMs,
         },
         installs: installedGatewayStreamRetries(),
         model: ctx.model
@@ -769,7 +770,8 @@ ${RECOVERY_PROMPT}`;
     // standing for everyone else.
     let noticeSilentUntil = 0;
     pi.on("before_provider_request", async (_event, ctx) => {
-      const remaining = admission.cooldownRemainingMs();
+      const identity = ctx.model ? { provider: ctx.model.provider, model: ctx.model.id } : {};
+      const remaining = admission.cooldownRemainingMs(identity);
       if (remaining <= 0) return;
       if (!statusBarConfig.enabled) {
         const now = Date.now();
@@ -782,10 +784,10 @@ ${RECOVERY_PROMPT}`;
         }
       }
       const signal = ctx.signal;
-      await admission.awaitCooldown(signal ? { signal } : {});
+      await admission.awaitCooldown({ ...identity, ...(signal ? { signal } : {}) });
     });
 
-    // ─── Unbounded waiting for the interactive turn ────────────────────────
+    // ─── Bounded waiting for the interactive turn ──────────────────────────
     // Everything above holds the turn BEFORE a request and records the wait
     // after one fails, but it cannot stop Pi from giving up: `retryAssistantCall`
     // (pi-ai utils/retry.js) retries a failed assistant message `maxRetries`
@@ -823,9 +825,11 @@ ${RECOVERY_PROMPT}`;
           // outage into a runtime-wide stall. Either way the wait is emitted,
           // so the footer keeps its spinner and countdown.
           hold: async (waitSignal, _attempt, abort) => {
-            const opts = abort ? { signal: abort } : {};
-            if (isAccountWideRefusal(waitSignal)) await admission.noteWaitAndSleep(waitSignal, opts);
-            else await admission.noteCallerWaitAndSleep(waitSignal, opts);
+            const scopedSignal = { ...waitSignal, provider: model.provider, model: model.id };
+            const opts = { provider: model.provider, model: model.id, ...(abort ? { signal: abort } : {}) };
+            if (isAccountWideRefusal(scopedSignal)) await admission.noteWaitAndSleep(scopedSignal, opts);
+            else if (scopedSignal.scope === "model") await admission.noteWaitAndSleep(scopedSignal, opts);
+            else await admission.noteCallerWaitAndSleep(scopedSignal, opts);
           },
           // "Consecutive" has to mean consecutive: without this the counter
           // accumulated across a whole session and would eventually trip a
@@ -848,6 +852,8 @@ ${RECOVERY_PROMPT}`;
             // applied later from a fresh lifecycle callback.
             fallbackCoordinator.onGatewayHold({ modelId: model?.id, provider: model?.provider });
           },
+          maxAttempts: gatewayConfig.maxRetries + 1,
+          maxElapsedMs: gatewayConfig.maxElapsedMs,
           signalOf: (options) => (options as { signal?: AbortSignal } | undefined)?.signal,
           errorMessage: (m, error) => ({
             role: "assistant",

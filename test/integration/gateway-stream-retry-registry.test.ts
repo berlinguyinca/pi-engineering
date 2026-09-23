@@ -159,16 +159,17 @@ test("registry: a 503 through ModelRuntime.streamSimple is waited out, not surfa
   });
 });
 
-test("registry: saturation far past Pi's three-attempt budget still recovers", async () => {
+test("registry: default interactive retry budget is finite and preserves the final failure", async () => {
   const script = [...Array.from({ length: 12 }, () => ({ error: "503 no worker for model" })), {}];
   await withRegistry(script, async ({ registry, runtime, calls }) => {
     const holds: number[] = [];
     install(registry, holds);
     const result = await runtime.streamSimple(MODEL as never, { messages: [] } as never, { apiKey: "k" }).result();
 
-    assert.equal(calls(), 13);
-    assert.equal(holds.length, 12, "Pi would have given up at 3");
-    assert.equal(result.stopReason, "stop");
+    assert.equal(calls(), 8);
+    assert.equal(holds.length, 7);
+    assert.equal(result.stopReason, "error");
+    assert.equal(result.errorMessage, "503 no worker for model");
   });
 });
 

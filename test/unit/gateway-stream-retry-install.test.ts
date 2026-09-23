@@ -112,6 +112,24 @@ function deps(stream: ReturnType<typeof fakeStream>, extra: Record<string, unkno
   };
 }
 
+test("install: threads finite attempt and elapsed budgets into the interactive pump", async () => {
+  resetGatewayStreamRetry();
+  const fail = { type: "error", error: { stopReason: "error", errorMessage: SATURATED } } as Ev;
+  const h = makeHost(Array.from({ length: 10 }, () => [fail]));
+  const stream = fakeStream();
+  installGatewayStreamRetry(
+    h.host,
+    { provider: "acme", api: "a" },
+    deps(stream, { maxAttempts: 2, maxElapsedMs: 60_000, now: () => 0 }),
+  );
+  const handler = h.registered[0]?.config.streamSimple as (m: unknown, c: unknown) => unknown;
+  handler({}, {});
+  const settled = await stream.settled;
+  assert.equal(h.baseCalls, 2);
+  assert.equal(settled.stopReason, "error");
+  assert.equal(settled.errorMessage, SATURATED);
+});
+
 test("install: registers the api and a streamSimple handler", () => {
   resetGatewayStreamRetry();
   const h = makeHost([[{ type: "done", message: { stopReason: "stop" } }]]);

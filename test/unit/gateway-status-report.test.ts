@@ -89,7 +89,7 @@ test("gateway report: a synthesized wait is distinguished from an advertised one
 
 test("gateway report: a session without the wrapper is warned, not reassured", () => {
   const out = renderGatewayReport({ status: status(), config: CONFIG, installs: [] }).join("\n");
-  assert.match(out, /NOT installed — this turn still stops at Pi's own retry budget/);
+  assert.match(out, /Admission retry NOT installed — this turn uses Pi's own retry budget/);
 });
 
 test("gateway report: installed providers are listed", () => {
@@ -98,7 +98,7 @@ test("gateway report: installed providers are listed", () => {
     config: CONFIG,
     installs: ["metabolomics:openai-completions"],
   }).join("\n");
-  assert.match(out, /Unbounded waiting installed for: metabolomics:openai-completions/);
+  assert.match(out, /Bounded admission retry installed for: metabolomics:openai-completions/);
 });
 
 test("gateway report: context usage is shown, and an unknown count says so", () => {
@@ -117,9 +117,9 @@ test("gateway report: context usage is shown, and an unknown count says so", () 
   assert.match(unknown.join("\n"), /context unknown of 1048576/);
 });
 
-test("gateway report: unlimited policy reads as unlimited, not Infinity", () => {
+test("gateway report: legacy infinite overrides read as unlimited, not Infinity", () => {
   const out = renderGatewayReport({ status: status(), config: CONFIG, installs: [] }).join("\n");
-  assert.match(out, /wait cap unlimited, retry cap unlimited/);
+  assert.match(out, /retry cap unlimited, elapsed cap default/);
   assert.doesNotMatch(out, /Infinity/);
 });
 

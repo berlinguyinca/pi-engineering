@@ -82,11 +82,12 @@ import {
   type AdmissionHeaders,
   type AdmissionInfo,
   admissionFromResponse,
+  isAutomaticReplayAllowed,
   mayCarryAdmission,
   serverRequestIdFromHeaders,
 } from "./admissionContract.ts";
 import type { AdmissionEvent, AdmissionEventBus, AdmissionEventName } from "./admissionEvents.ts";
-import { type RetryDelaySource, resolveRetryDelay } from "./retryDelay.ts";
+import { type RetryDelaySource, decideWait, resolveRetryDelay } from "./retryDelay.ts";
 
 /** One provider attempt: the shape of pi-ai's `streamSimple`. */
 export type AdmissionStreamFunction = (
@@ -555,7 +556,12 @@ export function executeWithAdmissionRetry(
         const admission = attemptCapture.admission;
         // Withhold only an unambiguous, structured admission rejection that has
         // produced no output yet: replaying after output would duplicate it.
-        if (admission !== undefined && !committed && !config.observe_only && event.reason !== "aborted") {
+        if (
+          admission !== undefined &&
+          isAutomaticReplayAllowed(admission, committed) &&
+          !config.observe_only &&
+          event.reason !== "aborted"
+        ) {
           last = admission;
           lastStatus = attemptCapture.status ?? lastStatus;
           return { terminal: "error", withheld: true, forwarded: false, committed, aborted: false };
@@ -594,7 +600,7 @@ export function executeWithAdmissionRetry(
       reason: admission.reason,
       action: lastDecision ?? "retry",
       attempts: attempt,
-      elapsedMs: waitedMs,
+      elapsedMs: now() - startedAt,
       lastDelayMs: lastDelayMs > 0 ? lastDelayMs : undefined,
       serverRequestId: admission.requestId,
       terminatedBy:
@@ -607,6 +613,8 @@ export function executeWithAdmissionRetry(
               : undefined,
       fallbackAttempted: usesFallback,
       serverMessage: admission.message,
+      code: admission.code,
+      actionCode: admission.actionCode,
     });
     if (usesFallback) {
       publish("inference.fallback.triggered", { terminatedBy: reason });
@@ -715,6 +723,7 @@ export function executeWithAdmissionRetry(
         reason: admission.reason,
         status: lastStatus,
         serverDelayMs: admission.retryAfterMs,
+        explicitReplayContract: admission.explicitReplayContract,
       });
       lastDecision = decision.action;
 
@@ -728,6 +737,7 @@ export function executeWithAdmissionRetry(
         fallbackAfterMs: decision.fallbackAfterMs,
         reasonBudgetMs: decision.maxElapsedMs,
         waitedMs,
+        elapsedMs: now() - startedAt,
         attempt,
         maxAttempts: config.max_attempts,
         ledger: ledgerActive ? opts.budget : undefined,
@@ -755,9 +765,18 @@ export function executeWithAdmissionRetry(
         nowMs: now(),
         random,
       });
-      // Never wait past the reason budget: clip the last wait instead of
-      // overshooting it and only reporting the overrun afterwards.
-      const waitMs = Math.min(delay.delayMs, Math.max(0, decision.maxElapsedMs - waitedMs));
+      const waitDecision = decideWait({
+        serverMinimumMs: delay.serverDelayMs,
+        proposedMs: delay.delayMs,
+        remainingMs: Math.max(0, decision.maxElapsedMs - (now() - startedAt)),
+      });
+      if (waitDecision.action === "stop") {
+        lastDelayMs = delay.delayMs;
+        lastDelaySource = delay.source;
+        failAdmission("budget_elapsed");
+        return;
+      }
+      const waitMs = waitDecision.waitMs;
       lastDelayMs = waitMs;
       lastDelaySource = delay.source;
       if (waitMs <= 0) {
@@ -825,6 +844,7 @@ export function evaluateTerminal(input: {
   fallbackAfterMs?: number;
   reasonBudgetMs: number;
   waitedMs: number;
+  elapsedMs?: number;
   attempt: number;
   maxAttempts: number;
   ledger?: AdmissionBudgetLedger;
@@ -834,9 +854,11 @@ export function evaluateTerminal(input: {
 }): TerminalReason | undefined {
   if (input.decision === "fail") return "permanent";
   if (input.decision === "fallback") return "fallback";
-  if (input.decision === "retry_then_fallback" && input.waitedMs >= (input.fallbackAfterMs ?? input.reasonBudgetMs)) {
+  const elapsedMs = input.elapsedMs ?? input.waitedMs;
+  if (input.decision === "retry_then_fallback" && elapsedMs >= (input.fallbackAfterMs ?? input.reasonBudgetMs)) {
     return "fallback";
   }
+  if (elapsedMs >= input.reasonBudgetMs) return "budget_elapsed";
   if (input.ledger?.isExhausted(input.budgetKey, input.windowMs)) return "budget_ledger";
   if (input.ledger?.overSharedBudget(input.budgetKey, input.windowMs, input.sharedBudgetMs)) return "budget_ledger";
   if (input.attempt >= input.maxAttempts) return "budget_attempts";

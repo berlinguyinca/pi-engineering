@@ -20,10 +20,83 @@ import {
   formatAdmissionFailure,
   formatDuration,
   isAdmissionRetryStatus,
+  isAutomaticReplayAllowed,
   mayCarryAdmission,
   parseAdmissionPayload,
   serverRequestIdFromHeaders,
 } from "../../src/inference/admissionContract.ts";
+
+const SAFE_NEW = {
+  type: "inferweave_backpressure",
+  code: "NO_CONTEXT_CAPACITY",
+  reason: "NO_CONTEXT_CAPACITY",
+  retryable: true,
+  replay_safe: true,
+  request_state: "queued",
+  action: "backoff",
+  action_code: "IW-ACT-BACKOFF",
+  message: "server says wait",
+};
+
+test("normalizes both contract types and every supported envelope shape", () => {
+  for (const type of ["inference_admission", "inferweave_backpressure"]) {
+    const payload = { ...SAFE_NEW, type };
+    for (const body of [payload, { error: payload }, { detail: payload }, { detail: { error: payload } }]) {
+      const info = parseAdmissionPayload(body);
+      assert.ok(info);
+      assert.equal(info.type, type);
+      assert.equal(info.code, "NO_CONTEXT_CAPACITY");
+      assert.equal(info.actionCode, "IW-ACT-BACKOFF");
+      assert.equal(info.requestState, "queued");
+      assert.equal(info.message, "server says wait");
+    }
+  }
+});
+
+test("new-contract replay requires explicit true flags, safe state, and a permitted action", () => {
+  for (const request_state of ["not_started", "queued"]) {
+    const info = parseAdmissionPayload({ ...SAFE_NEW, request_state });
+    assert.ok(info);
+    assert.equal(isAutomaticReplayAllowed(info, false), true);
+  }
+  for (const action_code of ["IW-ACT-BACKOFF", "IW-ACT-REDUCE-CONCURRENCY", "IW-ACT-RETRY-ALTERNATE"]) {
+    const info = parseAdmissionPayload({ ...SAFE_NEW, action_code });
+    assert.ok(info);
+    assert.equal(isAutomaticReplayAllowed(info, false), true);
+  }
+  for (const patch of [
+    { retryable: false },
+    { replay_safe: false },
+    { request_state: "dispatched" },
+    { request_state: "streaming" },
+    { request_state: "unknown" },
+    { action_code: "IW-ACT-UNKNOWN" },
+    { action_code: "IW-ACT-DO-NOT-RETRY" },
+  ]) {
+    const info = parseAdmissionPayload({ ...SAFE_NEW, ...patch });
+    assert.ok(info);
+    assert.equal(isAutomaticReplayAllowed(info, false), false, JSON.stringify(patch));
+  }
+});
+
+test("explicit false wins and committed output always prevents replay", () => {
+  const explicitFalse = parseAdmissionPayload({ ...SAFE_NEW, retryable: false, message: "final server message" });
+  assert.ok(explicitFalse);
+  assert.equal(isAutomaticReplayAllowed(explicitFalse, false), false);
+  assert.equal(explicitFalse.message, "final server message");
+
+  const safe = parseAdmissionPayload(SAFE_NEW);
+  assert.ok(safe);
+  assert.equal(isAutomaticReplayAllowed(safe, true), false);
+});
+
+test("unknown action fields are preserved as inert absence", () => {
+  const info = parseAdmissionPayload({ ...SAFE_NEW, action: "future_action", action_code: "IW-ACT-UNKNOWN" });
+  assert.ok(info);
+  assert.equal(info.action, undefined);
+  assert.equal(info.actionCode, undefined);
+  assert.equal(isAutomaticReplayAllowed(info, false), false);
+});
 
 const PAYLOAD = {
   type: "inference_admission",

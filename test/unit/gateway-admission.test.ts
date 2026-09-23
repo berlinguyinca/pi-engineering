@@ -183,11 +183,11 @@ test("a longer cooldown is never shortened by a later, smaller wait", () => {
   assert.equal(controller.cooldownRemainingMs(), 30_000);
 });
 
-test("a single wait is capped so a bad payload cannot park the runtime", () => {
+test("a server minimum is never shortened by the local wait setting", () => {
   const { controller } = testController({ maxWaitMs: 5_000 });
   const armed = controller.noteWait({ retryAfterMs: 86_400_000, retryable: true, source: "body" });
-  assert.equal(armed, 5_000);
-  assert.equal(controller.cooldownRemainingMs(), 5_000);
+  assert.equal(armed, 86_400_000);
+  assert.equal(controller.cooldownRemainingMs(), 86_400_000);
 });
 
 test("the interactive reserve applies from the start, before any gateway pushback", () => {
@@ -371,18 +371,46 @@ test("a throwing subscriber cannot break admission control", () => {
   assert.equal(controller.cooldownRemainingMs(), 5_000);
 });
 
-// ─── Unbounded waiting (operator policy: wait, never fail on saturation) ─────
+// ─── Finite waiting without shortening a server minimum ─────────────────────
 
-test("the default retry budget is unlimited: saturation is waited out, not failed", () => {
+test("the default retry and elapsed budgets are finite", () => {
   const saved = { ...process.env };
   try {
     for (const key of Object.keys(process.env)) if (key.startsWith("PI_GATEWAY_")) delete process.env[key];
     const cfg = resolveGatewayConfig();
-    assert.equal(cfg.maxRetries, Number.POSITIVE_INFINITY, "a 429 must never exhaust a worker's budget");
-    assert.equal(cfg.maxWaitMs, Number.POSITIVE_INFINITY, "a capped wait manufactures the next 429");
+    assert.ok(Number.isFinite(cfg.maxRetries));
+    assert.ok(cfg.maxRetries > 0);
+    assert.ok(Number.isFinite(cfg.maxElapsedMs));
+    assert.ok(cfg.maxElapsedMs > 0);
   } finally {
     process.env = saved;
   }
+});
+
+test("model-scoped cooldown does not pause another model", async () => {
+  let now = 1_000;
+  const slept: number[] = [];
+  const controller = new AdmissionController({
+    maxConcurrency: 4,
+    jitterMs: 0,
+    now: () => now,
+    sleep: async (ms) => {
+      slept.push(ms);
+      now += ms;
+    },
+  });
+  controller.noteWait({
+    retryAfterMs: 5_000,
+    retryable: true,
+    source: "body",
+    scope: "model",
+    provider: "acme",
+    model: "busy",
+  });
+  assert.equal(controller.cooldownRemainingMs({ provider: "acme", model: "other" }), 0);
+  assert.equal(controller.cooldownRemainingMs({ provider: "acme", model: "busy" }), 5_000);
+  await controller.awaitCooldown({ provider: "acme", model: "other" });
+  assert.deepEqual(slept, []);
 });
 
 test("an unlimited budget never gives up, however many waits have been spent", () => {

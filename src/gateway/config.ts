@@ -17,19 +17,18 @@ export interface GatewayAdmissionConfig {
   /** Slots held back for the operator's own interactive turn. */
   reservedSlots: number;
   /**
-   * Upper bound on a single honoured wait. Unlimited by default: clamping a
-   * wait the gateway asked for only sends the retry back into the same
-   * saturated queue and earns the same 429.
+   * Legacy display/configuration field. Server minima are never shortened;
+   * maxElapsedMs determines whether a retry chain can afford the wait.
    */
   maxWaitMs: number;
   /** Stagger window applied when a cooldown releases waiters. */
   jitterMs: number;
   /**
    * Retries a worker attempt may spend waiting out gateway backpressure.
-   * Unlimited by default: saturation is a wait, not a failure. Workers run
-   * with Pi's own retry disabled, so this is the only ceiling on them.
    */
   maxRetries: number;
+  /** Total monotonic time available to one interactive retry chain. */
+  maxElapsedMs: number;
   /** Emit one structured telemetry line per admission event. */
   telemetry: boolean;
 }
@@ -38,9 +37,10 @@ export const DEFAULT_GATEWAY_CONFIG: GatewayAdmissionConfig = {
   enabled: true,
   maxConcurrency: 4,
   reservedSlots: 1,
-  maxWaitMs: Number.POSITIVE_INFINITY,
+  maxWaitMs: 300_000,
   jitterMs: 250,
-  maxRetries: Number.POSITIVE_INFINITY,
+  maxRetries: 8,
+  maxElapsedMs: 300_000,
   telemetry: true,
 };
 
@@ -64,7 +64,8 @@ function bool(value: string | undefined, fallback: boolean): boolean {
  *   PI_GATEWAY_RESERVED_SLOTS    — int, slots kept for the interactive turn (default 1)
  *   PI_GATEWAY_MAX_WAIT_MS       — int, cap on one honoured wait (default: none)
  *   PI_GATEWAY_JITTER_MS         — int, release stagger window (default 250)
- *   PI_GATEWAY_MAX_RETRIES       — int, gateway-wait retries per worker attempt (default: unlimited)
+ *   PI_GATEWAY_MAX_RETRIES       — int, gateway-wait retries per worker attempt (default: 8)
+ *   PI_GATEWAY_MAX_ELAPSED_MS    — int, elapsed budget per interactive retry chain (default: 300000)
  *   PI_GATEWAY_TELEMETRY         — "true"/"false" (default true)
  */
 export function resolveGatewayConfig(overrides?: Partial<GatewayAdmissionConfig>): GatewayAdmissionConfig {
@@ -77,6 +78,7 @@ export function resolveGatewayConfig(overrides?: Partial<GatewayAdmissionConfig>
   cfg.maxWaitMs = Math.max(0, int(env.PI_GATEWAY_MAX_WAIT_MS, cfg.maxWaitMs));
   cfg.jitterMs = Math.max(0, int(env.PI_GATEWAY_JITTER_MS, cfg.jitterMs));
   cfg.maxRetries = Math.max(0, int(env.PI_GATEWAY_MAX_RETRIES, cfg.maxRetries));
+  cfg.maxElapsedMs = Math.max(0, int(env.PI_GATEWAY_MAX_ELAPSED_MS, cfg.maxElapsedMs));
   cfg.telemetry = bool(env.PI_GATEWAY_TELEMETRY, cfg.telemetry);
 
   if (overrides) Object.assign(cfg, overrides);

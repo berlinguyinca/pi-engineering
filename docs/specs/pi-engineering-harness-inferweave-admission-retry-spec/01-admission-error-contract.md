@@ -6,10 +6,16 @@ The harness SHOULD recognize InferWeave admission responses matching:
 
 ```ts
 interface InferWeaveAdmissionError {
-  type: "inference_admission";
+  type: "inference_admission" | "inferweave_backpressure";
+  code?: string;
   reason: string;
   message?: string;
-  scope?: "agent" | "user" | "model" | "gateway" | string;
+  scope?: "request" | "model" | "caller" | "global" | string;
+  retryable?: boolean;
+  replay_safe?: boolean;
+  request_state?: "not_started" | "queued" | "dispatched" | "streaming" | "unknown";
+  action?: string;
+  action_code?: string;
   request_id?: string;
   retry_after_ms?: number;
 
@@ -22,7 +28,12 @@ interface InferWeaveAdmissionError {
 }
 ```
 
-Recognition MUST require sufficient structured evidence, preferably `type === "inference_admission"`. Do not infer admission semantics solely from human-readable message strings.
+Recognition requires either supported type tag and accepts top-level, `error`,
+`detail`, and `detail.error` envelopes. New-contract automatic replay requires
+explicit `retryable=true`, `replay_safe=true`, request state `not_started` or
+`queued`, and action code `IW-ACT-BACKOFF`, `IW-ACT-REDUCE-CONCURRENCY`, or
+`IW-ACT-RETRY-ALTERNATE`. Explicit false always wins. Legacy envelopes without
+the new fields retain the conservative compatibility heuristics.
 
 ## 2. HTTP status
 
@@ -30,21 +41,20 @@ Primary status is expected to be HTTP 429.
 
 The policy abstraction SHOULD permit future InferWeave scheduler states to use another transient status (for example 503) without redesigning the harness.
 
-## 3. Retry delay precedence
+## 3. Retry delay resolution
 
-Determine the requested delay using this precedence:
-
-1. `retry-after-ms` response header, if present and valid.
-2. Standard `Retry-After` header.
-3. JSON body `retry_after_ms`.
-4. Harness exponential backoff.
+Parse `retry-after-ms`, standard `Retry-After`, and body `retry_after_ms`. The
+largest valid server value is the minimum wait. Use local exponential backoff
+only when no valid server hint exists.
 
 `Retry-After` MUST support both forms defined by HTTP semantics:
 
 - integer seconds
 - HTTP date
 
-All server-provided values MUST be validated and clamped to configured minimum/maximum bounds.
+Server-provided values are validated but never clamped downward. If the minimum
+cannot fit the remaining elapsed budget, stop and surface the final server
+failure rather than retry early.
 
 ## 4. InferWeave gateway recommendation
 
@@ -94,6 +104,7 @@ Every final failure MUST retain:
 
 - original HTTP status,
 - InferWeave `reason`,
+- server `message`, `code`, and `action_code`,
 - original `request_id`,
 - number of attempts,
 - elapsed retry time,

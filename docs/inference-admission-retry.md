@@ -1,7 +1,8 @@
 # InferWeave Admission Retry
 
 The Pi Engineering Harness converts InferWeave admission-control rejections
-(`429`/`503` with a structured `type: "inference_admission"` body) from terminal
+(`4xx`/`5xx` with a structured `type: "inference_admission"` or
+`"inferweave_backpressure"` body) from terminal
 inference failures into scheduler-directed wait/retry states. The agent stays
 alive while the gateway is busy, waits are abortable, and the UI shows a
 waiting-for-capacity state instead of repeated `Error: 429` lines.
@@ -69,9 +70,12 @@ them into an `APIError`.
 
 ## Admission classification
 
-A response is an admission response **only** when its JSON body carries
-`type: "inference_admission"` (optionally nested under `error`, `detail`, or
-`detail.error`). A bare `429` from a non-InferWeave provider is left untouched.
+A response is normalized from a supported type tag at the top level or under
+`error`, `detail`, or `detail.error`. New-contract replay requires explicit true
+retryable and replay-safe flags, `not_started`/`queued`, a permitted frozen
+action code, no committed output, and remaining finite attempt and elapsed
+budgets. Explicit false and unknown actions are terminal. Legacy envelopes
+without these fields keep conservative compatibility heuristics.
 
 ### Reason taxonomy
 
@@ -86,15 +90,20 @@ A response is an admission response **only** when its JSON body carries
 The **HTTP status outranks the reason token**: `400/401/403/404/422` always
 `fail`, whatever the gateway labelled it.
 
-### Retry timing precedence
+### Retry timing
 
-1. `retry-after-ms` header
-2. `Retry-After` header (delta-seconds, then HTTP date)
-3. body `retry_after_ms`
-4. local exponential backoff (`base_backoff_ms * 2^(attempt-1)`, capped)
+All valid `retry-after-ms`, `Retry-After`, and body `retry_after_ms` hints are
+considered; the largest is the server minimum. Local exponential backoff is
+used only when no valid server hint exists.
 
-Server-directed delays outside `[min_delay_ms, max_delay_ms]` are clamped, and
-jitter is **positive-only** so a server wait is never shortened.
+Server minima are never clamped downward. Jitter is **positive-only** and must
+fit the remaining elapsed budget; otherwise the retry chain stops and preserves
+the final server message/code.
+
+The interactive wrapper defaults to 8 attempts and 300000 ms elapsed. Its
+clock is injectable for deterministic tests. Model-scoped cooldowns are keyed
+by provider/model and do not pause unrelated models; absent scope retains the
+legacy process-wide hold.
 
 ### Response-header recommendation
 
@@ -182,7 +191,8 @@ suite on `main` (a deterministic fake-clock state machine):
 - acceptance: four 30s `queue_timeout` waits then a successful stream (agent
   alive through all waits);
 - retry-after precedence and delay resolution;
-- attempt and elapsed budgets (`budget_attempts` / `budget_elapsed`), clipping;
+- attempt and elapsed budgets (`budget_attempts` / `budget_elapsed`), stopping
+  rather than shortening a server minimum;
 - immediate cancellation (mid-wait and pre-aborted), never reported as an
   InferWeave failure;
 - quota→fallback (no wait); 401/403 never waited; unknown reasons;

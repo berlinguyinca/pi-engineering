@@ -94,10 +94,13 @@ export interface GatewayStreamRetryOptions {
   /** The turn's abort signal. Escape must end the turn, not restart it. */
   signal?: AbortSignal;
   /**
-   * Attempt ceiling. Unlimited by default — saturation is a wait, not a
-   * failure, which is the entire point of this module.
+   * Finite attempt ceiling. Defaults to DEFAULT_GATEWAY_MAX_ATTEMPTS.
    */
   maxAttempts?: number;
+  /** Finite monotonic elapsed budget for the complete retry chain. */
+  maxElapsedMs?: number;
+  /** Injectable monotonic clock. */
+  now?: () => number;
   /** Ceiling on a SYNTHESIZED wait. Advertised waits are honoured exactly. */
   maxEscalatedWaitMs?: number;
   /**
@@ -135,6 +138,8 @@ export interface GatewayStreamRetryOutcome {
 
 /** Default ceiling for a wait we invented rather than were told. */
 export const MAX_ESCALATED_WAIT_MS = 60_000;
+export const DEFAULT_GATEWAY_MAX_ATTEMPTS = 8;
+export const DEFAULT_GATEWAY_MAX_ELAPSED_MS = 300_000;
 
 function errorText(value: unknown): string {
   return value instanceof Error ? value.message : String(value ?? "");
@@ -169,7 +174,10 @@ export async function pumpWithGatewayRetry<E extends RetryableEvent, R extends R
   sink: RetrySink<E, R>,
   opts: GatewayStreamRetryOptions,
 ): Promise<GatewayStreamRetryOutcome> {
-  const maxAttempts = opts.maxAttempts ?? Number.POSITIVE_INFINITY;
+  const maxAttempts = opts.maxAttempts ?? DEFAULT_GATEWAY_MAX_ATTEMPTS;
+  const maxElapsedMs = opts.maxElapsedMs ?? DEFAULT_GATEWAY_MAX_ELAPSED_MS;
+  const now = opts.now ?? Date.now;
+  const startedAt = now();
   const capMs = opts.maxEscalatedWaitMs ?? MAX_ESCALATED_WAIT_MS;
   const priorHolds = opts.priorHolds ?? 0;
   let holds = 0;
@@ -226,10 +234,12 @@ export async function pumpWithGatewayRetry<E extends RetryableEvent, R extends R
     const failure = thrown !== undefined ? errorText(thrown) : (result?.errorMessage ?? "");
     const isAbort = result?.stopReason === "aborted" || opts.signal?.aborted === true;
     const wait = isAbort || forwarded ? null : parseGatewayWait({ text: failure });
-    const retryable = wait?.retryable === true && attempt < maxAttempts;
+    const remainingMs = maxElapsedMs - (now() - startedAt);
+    const held = wait ? waitFor(wait, attempt + priorHolds, capMs) : undefined;
+    const retryable =
+      held?.retryable === true && attempt < maxAttempts && remainingMs > 0 && held.retryAfterMs <= remainingMs;
 
-    if (retryable && wait) {
-      const held = waitFor(wait, attempt + priorHolds, capMs);
+    if (retryable && held) {
       opts.onHold?.({ attempt, signal: held, errorText: failure });
       holds++;
       await opts.hold(held, attempt);

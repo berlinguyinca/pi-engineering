@@ -334,7 +334,7 @@ export interface AdmissionDecision {
  */
 export function decideAdmission(
   config: AdmissionRetryConfig,
-  input: { reason: string; status: number; serverDelayMs?: number },
+  input: { reason: string; status: number; serverDelayMs?: number; explicitReplayContract?: boolean },
 ): AdmissionDecision {
   const fromTaxonomy = Object.hasOwn(DEFAULT_ADMISSION_REASON_POLICY, input.reason)
     ? DEFAULT_ADMISSION_REASON_POLICY[input.reason]
@@ -348,6 +348,18 @@ export function decideAdmission(
   if (PERMANENT_ADMISSION_STATUSES.includes(input.status)) {
     return {
       action: "fail",
+      maxElapsedMs: config.max_elapsed_ms,
+      reason: input.reason,
+      unknownReason,
+    };
+  }
+
+  // Explicit replay eligibility has already been checked by the shared pure
+  // predicate. A future condition code is safe to execute when its action is a
+  // known retry action; legacy unknown-reason heuristics remain below.
+  if (input.explicitReplayContract === true) {
+    return {
+      action: "retry",
       maxElapsedMs: config.max_elapsed_ms,
       reason: input.reason,
       unknownReason,

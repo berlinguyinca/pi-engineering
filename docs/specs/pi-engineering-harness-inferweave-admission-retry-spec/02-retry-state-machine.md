@@ -57,7 +57,8 @@ Use both:
 
 Whichever limit is reached first terminates local retries.
 
-Recommended defaults for engineering-agent workloads:
+Defaults are finite in both structured and interactive retry paths. The
+structured path uses:
 
 ```yaml
 maxAttempts: 50
@@ -74,12 +75,15 @@ Pseudo-code:
 const serverDelay = parseServerRetryDelay(response);
 const backoffDelay = exponentialBackoff(attempt, baseDelayMs, maxBackoffMs);
 
-let delay = serverDelay ?? backoffDelay;
-delay = clamp(delay, minDelayMs, maxDelayMs);
-delay = addBoundedJitter(delay, jitterRatio);
+const minimum = maxValidServerDelay(response);
+const delay = addBoundedPositiveJitter(minimum ?? clampLocalBackoff(backoffDelay));
+if (delay > remainingElapsedBudget) return surfaceFinalServerFailure();
 ```
 
 When InferWeave explicitly supplies a delay, jitter MUST remain small so the client respects scheduler intent while avoiding a thundering herd.
+
+Jitter may not cause the wait to exceed the remaining elapsed budget. The
+client stops rather than shortening a server minimum.
 
 Recommended jitter: 0–10% positive jitter for server-directed admission retries.
 
@@ -103,6 +107,15 @@ Differentiate failures that occur:
 2. after partial assistant output is emitted.
 
 Initial implementation SHOULD automatically replay admission failures only when no model output has been committed to the turn.
+
+For the new contract, no-output is necessary but not sufficient: the explicit
+retryable/replay-safe flags, safe request state, permitted action, attempt
+budget, and elapsed budget must all pass. A withheld terminal response with an
+unsafe state is surfaced unchanged.
+
+Cooldown scope follows the server. `model` cooldowns are keyed by provider and
+model identity; `caller` and `global` retain wider holds. Missing scope uses the
+legacy conservative process-wide behavior.
 
 For post-stream interruption, use existing stream-resume/recovery semantics if available. Do not naively replay a full generation and duplicate content.
 

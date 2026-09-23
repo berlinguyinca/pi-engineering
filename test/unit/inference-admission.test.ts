@@ -42,7 +42,7 @@ test("retry delay: header beats body; absent header falls back to body then back
   assert.equal(backoff.source, "backoff");
 });
 
-test("retry delay: a server delay outside bounds is clamped and flagged", () => {
+test("retry delay: a server minimum is not clamped downward", () => {
   const bounds: RetryDelayBounds = {
     baseBackoffMs: 1000,
     minDelayMs: 1000,
@@ -50,8 +50,8 @@ test("retry delay: a server delay outside bounds is clamped and flagged", () => 
     jitterRatio: 0,
   };
   const d = resolveRetryDelay({ headers: { "retry-after-ms": "9000" }, attempt: 1, bounds, random: () => 0 });
-  assert.equal(d.delayMs, 5000);
-  assert.equal(d.clamped, true);
+  assert.equal(d.delayMs, 9000);
+  assert.equal(d.clamped, undefined);
 });
 
 test("parseRetryAfterMsHeader: bare seconds, numeric, and invalid inputs", () => {

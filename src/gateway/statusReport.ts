@@ -25,12 +25,13 @@ export interface GatewayReportConfig {
   reservedSlots: number;
   maxWaitMs: number;
   maxRetries: number;
+  maxElapsedMs?: number;
 }
 
 export interface GatewayReportInput {
   status: AdmissionStatus;
   config: GatewayReportConfig;
-  /** `provider:api` pairs whose transport is wrapped for unbounded waiting. */
+  /** `provider:api` pairs whose transport is wrapped for bounded waiting. */
   installs: readonly string[];
   /** The session's model, when one is resolved. */
   model?: { id: string; provider: string; api: string; contextWindow: number } | undefined;
@@ -110,8 +111,8 @@ export function renderGatewayReport(input: GatewayReportInput): string[] {
 
   lines.push(
     input.installs.length > 0
-      ? `Unbounded waiting installed for: ${[...input.installs].sort().join(", ")}`
-      : "Unbounded waiting NOT installed — this turn still stops at Pi's own retry budget.",
+      ? `Bounded admission retry installed for: ${[...input.installs].sort().join(", ")}`
+      : "Admission retry NOT installed — this turn uses Pi's own retry budget.",
   );
 
   if (input.model) {
@@ -133,6 +134,7 @@ export function renderGatewayReport(input: GatewayReportInput): string[] {
     }
   }
 
-  lines.push(`Policy: wait cap ${limit(config.maxWaitMs)}, retry cap ${limit(config.maxRetries)}`);
+  const elapsed = config.maxElapsedMs === undefined ? "default" : seconds(config.maxElapsedMs);
+  lines.push(`Policy: server minimums preserved, retry cap ${limit(config.maxRetries)}, elapsed cap ${elapsed}`);
   return lines;
 }
