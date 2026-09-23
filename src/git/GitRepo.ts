@@ -315,4 +315,33 @@ export class GitRepo {
     }
     return [...set];
   }
+
+  /**
+   * True when `branch` carries commits since `baseCommit` (i.e. its tip is not
+   * the base commit). This is how a worker's OWN commits are recognized: an
+   * implementer that commits directly onto its worker branch leaves a clean
+   * working tree, but the branch has advanced past base — the work HAS landed
+   * there. Returns false when the branch cannot be resolved or has no commits
+   * beyond base.
+   */
+  async branchAheadOf(baseCommit: string, branch: string): Promise<boolean> {
+    const r = await this.git(["rev-list", "--count", `${baseCommit}..${branch}`]);
+    if (r.code !== 0) return false;
+    const n = Number.parseInt(r.stdout, 10);
+    return Number.isFinite(n) && n > 0;
+  }
+
+  /**
+   * True when `commit` is an ancestor of `ancestorOf` (reachable from it).
+   *
+   * Used to decide whether a worker branch's work is already contained in the
+   * integrated checkout before a cleanup is allowed to force-delete the branch.
+   * A branch whose tip is NOT an ancestor of HEAD still carries unmerged work
+   * and must be preserved; returning false on any git error makes cleanup err on
+   * the safe side (preserve rather than destroy).
+   */
+  async isAncestor(commit: string, ancestorOf: string): Promise<boolean> {
+    const r = await this.git(["merge-base", "--is-ancestor", commit, ancestorOf]);
+    return r.code === 0;
+  }
 }

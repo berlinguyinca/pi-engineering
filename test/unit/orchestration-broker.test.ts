@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { describe, it } from "node:test";
 import { GitRepo } from "../../src/git/GitRepo.ts";
 import { type BrokerBackends, ExecutionBroker, workerTimeoutMs } from "../../src/orchestration/broker.ts";
+import { Integrator } from "../../src/orchestration/integrator.ts";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 import { makeFixtureRepo } from "../fixtures/make-fixture.ts";
@@ -500,4 +501,217 @@ describe("ExecutionBroker (spec 03)", () => {
       await fx.cleanup();
     }
   });
+});
+
+/**
+ * Regression (APS Phase 1/2): an implementer that commits its OWN work directly
+ * onto its worker branch leaves a clean working tree, but the branch has
+ * advanced past the mission base. Harvest must recognize that committed work
+ * (not treat a clean tree as "nothing to harvest"), integration must merge the
+ * branch tip into the base checkout, and changedFilesSinceBase must then be
+ * non-empty. This pins the whole committed-work branch lifecycle with a real
+ * git fixture and NO live model.
+ */
+it("harvest recognizes a worker's own committed work (clean tree) and integration lands it", async () => {
+  const fx = await makeFixtureRepo();
+  try {
+    const git = (await GitRepo.open(fx.root))!;
+    const base = await git.headCommit();
+    const store = MissionStore.open(JsonlEventStore.inMemory());
+    const m = store.createMission({
+      title: "x",
+      goal: "x",
+      user_request: "x",
+      repository: ".",
+      base_ref: base,
+      risk_profile: "medium",
+      workflow_class: "engineering_review",
+    });
+    const t = store.createTask({
+      mission_id: m.mission_id,
+      kind: "agent",
+      role: "implementer",
+      objective: "x",
+      mutates_repo: true,
+      isolation: "worktree",
+      write_domains: ["src/**"],
+    });
+    store.transitionTask(t.task_id, "READY");
+
+    const { execFile } = await import("node:child_process");
+    const { promisify } = await import("node:util");
+    const exec = promisify(execFile);
+    const broker = new ExecutionBroker({
+      store,
+      git,
+      baseRef: base,
+      backends: {
+        agent: {
+          runAgent: async ({ worktree }) => {
+            // Simulate an implementer that commits its own work directly onto
+            // its worker branch and leaves a CLEAN tree (nothing to "harvest"
+            // from the working tree, yet the branch has advanced past base).
+            const { writeFile } = await import("node:fs/promises");
+            await writeFile(join(worktree!, "src", "add.js"), "export const add = (a, b) => a + b;\n");
+            await exec("git", ["-C", worktree!, "add", "-A"]);
+            await exec("git", ["-C", worktree!, "commit", "-q", "-m", "implementer commits own work"]);
+            return { executionId: "e", exitStatus: "succeeded", summary: "done", artifactRefs: [], usage: {} };
+          },
+        },
+        integration: {
+          runIntegration: async (input) =>
+            new Integrator(git).integrate({
+              objective: input.objective,
+              baseCommit: base,
+              handoffs: input.handoffs,
+              signal: input.signal,
+            }),
+        },
+      },
+    });
+
+    const workerBranch = `pi-eng-orch-${t.task_id}`;
+    await (
+      await broker.execute({
+        taskId: t.task_id,
+        missionId: m.mission_id,
+        kind: "agent",
+        role: "implementer",
+        objective: "x",
+        mutatesRepo: true,
+        isolation: "worktree",
+      })
+    ).result();
+
+    // (a) Harvest must recognize the committed work even though the tree is clean.
+    assert.equal(
+      broker.hasCommittedWorkerWork(m.mission_id),
+      true,
+      "harvest must recognize the worker's own committed work (branch advanced past base)",
+    );
+    assert.equal(await git.branchAheadOf(base, workerBranch), true, "worker branch must have commits since base");
+
+    // (b) Integration merges the branch tip into the base checkout and the
+    // base-vs-HEAD diff is non-empty afterwards.
+    const it = store.createTask({
+      mission_id: m.mission_id,
+      kind: "integration",
+      role: "integrator",
+      objective: "merge",
+    });
+    store.transitionTask(it.task_id, "READY");
+    await (
+      await broker.execute({
+        taskId: it.task_id,
+        missionId: m.mission_id,
+        kind: "integration",
+        role: "integrator",
+        objective: "merge",
+      })
+    ).result();
+
+    const landed = await broker.changedFilesSinceBase(m.mission_id);
+    assert.ok(landed !== null, "changedFilesSinceBase must be computable");
+    assert.ok(landed!.length > 0, `integration must land committed work; got ${JSON.stringify(landed)}`);
+    assert.ok(landed!.includes("src/add.js"));
+    // The merged file is present in the base checkout.
+    const { access } = await import("node:fs/promises");
+    let present = true;
+    try {
+      await access(join(fx.root, "src", "add.js"));
+    } catch {
+      present = false;
+    }
+    assert.ok(present, "the committed work must be physically present in the base checkout after merge");
+  } finally {
+    await fx.cleanup();
+  }
+});
+
+/**
+ * Regression (branch lifecycle): cleanup MUST never force-delete (git branch -D)
+ * a worker branch that carries unmerged commits, even when the caller asks for
+ * keepBranches=false (the "integration succeeded" path). The unmerged branch is
+ * the only copy of the worker's output and must stay recoverable.
+ */
+it("cleanup never force-deletes a worker branch carrying unmerged commits", async () => {
+  const fx = await makeFixtureRepo();
+  try {
+    const git = (await GitRepo.open(fx.root))!;
+    const base = await git.headCommit();
+    const store = MissionStore.open(JsonlEventStore.inMemory());
+    const m = store.createMission({
+      title: "x",
+      goal: "x",
+      user_request: "x",
+      repository: ".",
+      base_ref: base,
+      risk_profile: "medium",
+      workflow_class: "engineering_review",
+    });
+    const t = store.createTask({
+      mission_id: m.mission_id,
+      kind: "agent",
+      role: "implementer",
+      objective: "x",
+      mutates_repo: true,
+      isolation: "worktree",
+      write_domains: ["src/**"],
+    });
+    store.transitionTask(t.task_id, "READY");
+
+    const { execFile } = await import("node:child_process");
+    const { promisify } = await import("node:util");
+    const exec = promisify(execFile);
+    const broker = new ExecutionBroker({
+      store,
+      git,
+      baseRef: base,
+      backends: {
+        agent: {
+          runAgent: async ({ worktree }) => {
+            const { writeFile } = await import("node:fs/promises");
+            await writeFile(join(worktree!, "src", "add.js"), "export const add = (a, b) => a + b;\n");
+            await exec("git", ["-C", worktree!, "add", "-A"]);
+            await exec("git", ["-C", worktree!, "commit", "-q", "-m", "unmerged worker work"]);
+            return { executionId: "e", exitStatus: "succeeded", summary: "done", artifactRefs: [], usage: {} };
+          },
+        },
+      },
+    });
+    const workerBranch = `pi-eng-orch-${t.task_id}`;
+    await (
+      await broker.execute({
+        taskId: t.task_id,
+        missionId: m.mission_id,
+        kind: "agent",
+        role: "implementer",
+        objective: "x",
+        mutatesRepo: true,
+        isolation: "worktree",
+      })
+    ).result();
+
+    // The work was committed directly and never integrated.
+    assert.equal(await git.branchAheadOf(base, workerBranch), true, "branch must carry commits since base");
+    assert.equal(broker.pendingIntegrations(m.mission_id), 1, "an unmerged mission worktree must still be tracked");
+
+    // Cleanup with keepBranches=false (the "integration succeeded" path) must
+    // STILL preserve the branch because its tip is not an ancestor of HEAD.
+    await broker.cleanupMission(m.mission_id, { keepBranches: false });
+
+    const verify = await exec("git", ["-C", fx.root, "rev-parse", "--verify", "--quiet", workerBranch]).catch(
+      () => null,
+    );
+    assert.ok(
+      verify && verify.stdout.trim().length > 0,
+      `unmerged worker branch must be preserved after cleanup (branch=${workerBranch})`,
+    );
+    assert.ok(
+      broker.preservedBranches(m.mission_id).includes(workerBranch),
+      "the preserved branch must be recorded for operator recovery",
+    );
+  } finally {
+    await fx.cleanup();
+  }
 });

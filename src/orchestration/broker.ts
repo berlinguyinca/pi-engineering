@@ -154,6 +154,8 @@ export class ExecutionBroker {
   private readonly resolvedBases = new Map<string, string>();
   /** Branches intentionally kept after cleanup because their work never merged. */
   private readonly preserved = new Map<string, string[]>();
+  /** Missions where at least one worker branch carried commits since base (own commits recognized at harvest). */
+  private readonly committedWork = new Map<string, boolean>();
 
   constructor(opts: BrokerOptions) {
     this.store = opts.store;
@@ -241,6 +243,25 @@ export class ExecutionBroker {
   private async harvestWorktree(executionId: string): Promise<boolean> {
     const wt = this.allocatedWorktrees.get(executionId);
     if (!wt || !this.git) return false;
+    const ex = this.store.getExecution(executionId);
+    const missionId = ex?.mission_id;
+    const base = missionId
+      ? this.store.getMission(missionId)?.base_ref?.trim() || this.resolvedBases.get(missionId)
+      : undefined;
+    // A worker that already committed directly onto its worker branch leaves a
+    // clean working tree, but the branch has advanced past the mission base —
+    // that IS the work landing, not "nothing to harvest". Compare the branch
+    // TIP to the base commit rather than trusting a clean tree as "empty".
+    if (base) {
+      try {
+        if (await this.git.branchAheadOf(base, wt.branch)) {
+          if (missionId) this.committedWork.set(missionId, true);
+          return true;
+        }
+      } catch {
+        // Fall through to the status-based harvest below.
+      }
+    }
     let status = "";
     try {
       status = (await this.git.statusIn(wt.path)).trim();
@@ -273,6 +294,7 @@ export class ExecutionBroker {
     }
     try {
       await this.git.commitAll(wt.path, `pi-eng: orchestration work for ${executionId}`);
+      if (missionId) this.committedWork.set(missionId, true);
       return true;
     } catch (err) {
       const ex = this.store.getExecution(executionId);
@@ -325,6 +347,18 @@ export class ExecutionBroker {
   }
 
   /**
+   * Whether any of a mission's worker branches carried commits since base.
+   *
+   * Recognized at harvest time: an implementer that commits directly onto its
+   * worker branch (leaving a clean tree) is recorded here. The orchestrator uses
+   * this to distinguish a genuinely empty worker branch from a merge/harvest bug
+   * where committed work exists on a branch but did not reach the checkout.
+   */
+  hasCommittedWorkerWork(missionId: string): boolean {
+    return this.committedWork.get(missionId) ?? false;
+  }
+
+  /**
    * Files the main checkout changed relative to the mission's base commit.
    *
    * This is the invariant behind 'the work landed'. Harvesting a worktree can
@@ -353,24 +387,30 @@ export class ExecutionBroker {
   private async releaseMissionWorktrees(missionId: string, keepBranches = false): Promise<void> {
     const wts = this.missionWorktrees.get(missionId) ?? [];
     for (const wt of wts) {
-      // When the work never landed (conflict, failed checks, empty branch) the
-      // branch is the ONLY copy of what the worker produced, and removeWorktree
-      // without keepBranch runs `git branch -D` — destroying work an operator
-      // would need in order to resolve the conflict. Keep it in that case; the
-      // caller keeps branches off for successful integration so branches do not
-      // accumulate.
+      // SAFETY: a worker branch must never be force-deleted (git branch -D)
+      // while its work is not contained in the integrated checkout. A branch
+      // whose tip IS an ancestor of HEAD was merged (its work landed) and may be
+      // dropped so branches do not accumulate. A branch whose tip is NOT an
+      // ancestor of HEAD still carries unmerged work and is the only copy of
+      // what the worker produced — removeWorktree without keepBranch would run
+      // `git branch -D` and orphan the real commits into the object store.
+      // Preserve it regardless of whether integration reported success.
       if (this.git) {
-        await this.git
-          .removeWorktree({ path: wt.path, branch: wt.branch }, { keepBranch: keepBranches })
-          .catch(() => {});
+        let keep = keepBranches;
+        try {
+          if (!(await this.git.isAncestor(wt.branch, await this.git.headCommit()))) keep = true;
+        } catch {
+          keep = true; // cannot verify the work merged -> preserve (safe).
+        }
+        await this.git.removeWorktree({ path: wt.path, branch: wt.branch }, { keepBranch: keep }).catch(() => {});
+        if (keep) {
+          const list = this.preserved.get(missionId) ?? [];
+          if (!list.includes(wt.branch)) list.push(wt.branch);
+          this.preserved.set(missionId, list);
+        }
       }
     }
     this.missionWorktrees.delete(missionId);
-    // Only record a preserved list when there was something to preserve, so a
-    // later no-op cleanup cannot overwrite the branches worth recovering with [].
-    if (keepBranches && wts.length > 0) {
-      this.preserved.set(missionId, [...(this.preserved.get(missionId) ?? []), ...wts.map((w) => w.branch)]);
-    }
     for (const [execId, info] of [...this.allocatedWorktrees]) {
       if (wts.some((w) => w.branch === info.branch)) this.allocatedWorktrees.delete(execId);
     }
