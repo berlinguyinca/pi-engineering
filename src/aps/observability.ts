@@ -22,7 +22,9 @@ import type { AgentLoopEvent, AgentLoopPreventedEvent, SemanticStrategyFamily } 
 export type ContextUtilizationBucket = "<0.5" | "0.5-0.75" | "0.75-0.9" | ">=0.9" | "unknown";
 
 function bucketFor(utilization: number | null | undefined): ContextUtilizationBucket {
-  if (utilization === null || utilization === undefined || Number.isNaN(utilization)) return "unknown";
+  if (utilization === null || utilization === undefined || Number.isNaN(utilization) || utilization < 0) {
+    return "unknown";
+  }
   if (utilization < 0.5) return "<0.5";
   if (utilization < 0.75) return "0.5-0.75";
   if (utilization < 0.9) return "0.75-0.9";
@@ -71,8 +73,8 @@ export function emptySnapshot(): ApsSnapshot {
 
 export class ApsObservability {
   private s = emptySnapshot();
-  private preventedCount = 0;
-  private recoveredAfterPrevention = 0;
+  private recoveryAttempts = 0;
+  private recoverySuccesses = 0;
 
   recordCandidate(event: AgentLoopEvent): void {
     this.s.totals.loopCandidates += 1;
@@ -88,22 +90,26 @@ export class ApsObservability {
 
   recordPrevented(event: AgentLoopPreventedEvent): void {
     this.s.totals.loopsPrevented += 1;
-    this.preventedCount += 1;
     this.recordCandidate(event);
   }
 
   recordRecovery(action: ApsRecoveryAction): void {
     this.s.totals.recoveries += 1;
+    this.recoveryAttempts += 1;
     if (action === "compact") this.s.totals.compactions += 1;
     if (action === "replan") this.s.totals.replans += 1;
     this.s.compactionFrequency = this.s.totals.compactions;
   }
 
-  /** Mark that a prevented run subsequently progressed (recovery succeeded). */
+  /**
+   * Record whether a recovery attempt led to a successful run. The success rate
+   * uses RECOVERY ATTEMPTS as the denominator (not all preventions), so it is a
+   * true recovery success rate.
+   */
   recordRecoveryOutcome(success: boolean): void {
-    if (success) this.recoveredAfterPrevention += 1;
+    if (success) this.recoverySuccesses += 1;
     this.s.recoverySuccessRate =
-      this.preventedCount === 0 ? null : Math.min(1, this.recoveredAfterPrevention / this.preventedCount);
+      this.recoveryAttempts === 0 ? null : Math.min(1, this.recoverySuccesses / this.recoveryAttempts);
   }
 
   recordEscalation(event: EscalationEvent): void {

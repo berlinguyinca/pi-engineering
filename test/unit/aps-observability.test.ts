@@ -93,15 +93,14 @@ test("recovery is tallied by action (compact vs replan)", () => {
   assert.equal(s.compactionFrequency, 1);
 });
 
-test("recovery success rate is null until prevented, then a ratio", () => {
+test("recovery success rate is null until attempts, then successes/attempts", () => {
   const obs = new ApsObservability();
   assert.equal(obs.snapshot().recoverySuccessRate, null);
-  obs.recordPrevented(prevented("m1", "read_file", 4, 0.5));
+  obs.recordRecovery("replan");
+  obs.recordRecovery("compact");
   obs.recordRecoveryOutcome(true);
-  obs.recordPrevented(prevented("m1", "read_file", 4, 0.5));
   obs.recordRecoveryOutcome(false);
-  const s = obs.snapshot();
-  assert.equal(s.recoverySuccessRate, 0.5);
+  assert.equal(obs.snapshot().recoverySuccessRate, 0.5);
 });
 
 test("escalation is tallied as model vs human", () => {

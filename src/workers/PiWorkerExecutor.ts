@@ -427,7 +427,8 @@ ${TOOL_TRANSITION_RULE}`;
           recordRetryOutcome(this.recoveryTelemetry, true, false);
         }
         if (recoveryPending) {
-          this.observability.recordRecoveryOutcome(true);
+          if (this.rollout.observability) this.observability.recordRecoveryOutcome(true);
+          recoveryPending = false;
         }
         if (gatewayConfig.enabled) admission.noteSuccess();
         const usage = this.collectUsage(this.asMessages(session.messages));
@@ -529,6 +530,12 @@ ${TOOL_TRANSITION_RULE}`;
             }
           }
           escalatedToHuman = true;
+        }
+        // A pending recovery attempt that ended unsuccessfully is a recovery
+        // FAILURE for the recovery-success metric.
+        if (recoveryPending) {
+          if (this.rollout.observability) this.observability.recordRecoveryOutcome(false);
+          recoveryPending = false;
         }
         const usage = this.collectUsage(this.asMessages(session.messages));
         const detail = {
@@ -919,7 +926,18 @@ ${recovery.recoveryPrompt}`;
       model: { provider: model.provider, id: model.id },
       maxContextTokens: req.maxContextTokens,
       rootPrefix: req.cwd,
-      supervisorOptions: { ...(this.aps ?? {}), prevention },
+      supervisorOptions: {
+        ...(this.aps ?? {}),
+        prevention,
+        // Phase 6 observability: record detection-only loop candidates. Prevented
+        // events are recorded separately via the loop_prevented path, so this
+        // only captures candidates that were NOT prevented (avoids double count).
+        onEvent: (event) => {
+          if (this.rollout.observability && event.type !== "agent.loop_prevented") {
+            this.observability.recordCandidate(event);
+          }
+        },
+      },
     });
   }
 
