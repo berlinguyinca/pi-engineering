@@ -133,7 +133,7 @@ test("wiring: a 429 carrying only a Retry-After header is still account-wide", a
   }
 });
 
-test("wiring: the header hook records metadata without mutating cooldown early", async () => {
+test("wiring: the response hook does not mutate shared state before a terminal body", async () => {
   const { controller, calls } = observableController();
   try {
     const handlers = loadExtension();
@@ -148,7 +148,7 @@ test("wiring: the header hook records metadata without mutating cooldown early",
   }
 });
 
-test("wiring: final body combines with cached 503 headers before scope mutation", async () => {
+test("wiring: an uncorrelated response hook cannot contaminate a later terminal body", async () => {
   const { controller, calls } = observableController();
   try {
     const handlers = loadExtension();
@@ -164,7 +164,7 @@ test("wiring: final body combines with cached 503 headers before scope mutation"
       await handler({ message: { role: "assistant", stopReason: "error", errorMessage } }, ctx);
     }
     assert.deepEqual(calls, ["noteObservedWait"]);
-    assert.equal(controller.status().lastSignal?.retryAfterMs, 8_000);
+    assert.equal(controller.status().lastSignal?.retryAfterMs, 1_000);
     assert.equal(controller.cooldownRemainingMs({ provider: "acme", model: "other" }), 0);
   } finally {
     setSharedAdmissionController(undefined);

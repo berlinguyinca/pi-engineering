@@ -15,6 +15,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
   type ProviderHost,
+  captureGatewayAttemptResponse,
   installGatewayStreamRetry,
   isGatewayStreamRetryInstalled,
   resetGatewayStreamRetry,
@@ -177,6 +178,122 @@ test("install: a different api on the same provider is wrapped separately", () =
 
   assert.equal(second, "installed", "compose dispatches per api, so each api needs its own wrapper");
   assert.equal(h.registered.length, 2);
+});
+
+test("install: response metadata is attempt-local, error-only, and consumed once", async () => {
+  const first = captureGatewayAttemptResponse({
+    onResponse: async (_response: { status: number; headers?: Record<string, string> }, _model: unknown) => {},
+  });
+  const second = captureGatewayAttemptResponse({
+    onResponse: async (_response: { status: number; headers?: Record<string, string> }, _model: unknown) => {},
+  });
+
+  await first.options.onResponse?.({ status: 503, headers: { "retry-after": "8" } }, {});
+  await second.options.onResponse?.({ status: 429, headers: { "retry-after": "3" } }, {});
+  assert.deepEqual(second.take(), { status: 429, headers: { "retry-after": "3" } });
+  assert.deepEqual(first.take(), { status: 503, headers: { "retry-after": "8" } });
+  assert.equal(first.take(), undefined, "metadata belongs to one parse decision only");
+
+  const success = captureGatewayAttemptResponse({
+    onResponse: async (_response: { status: number; headers?: Record<string, string> }, _model: unknown) => {},
+  });
+  await success.options.onResponse?.({ status: 200, headers: { "retry-after": "99" } }, {});
+  assert.equal(success.take(), undefined, "a successful response cannot poison a later failure");
+});
+
+test("install: hold receives the actual model for each call on one provider api", async () => {
+  resetGatewayStreamRetry();
+  const fail = { type: "error", error: { stopReason: "error", errorMessage: SATURATED } } as Ev;
+  const ok = { type: "done", message: { stopReason: "stop" } } as Ev;
+  const h = makeHost([[fail], [ok], [fail], [ok]]);
+  const streams: Array<ReturnType<typeof fakeStream>> = [];
+  const heldModels: string[] = [];
+  installGatewayStreamRetry(
+    h.host,
+    { provider: "acme", api: "a" },
+    {
+      createStream: () => {
+        const stream = fakeStream();
+        streams.push(stream);
+        return stream;
+      },
+      hold: async (_signal, _attempt, _abort, model: { id: string }) => {
+        heldModels.push(model.id);
+      },
+      errorMessage: (_m: unknown, error: unknown) => ({ stopReason: "error", errorMessage: String(error) }),
+    },
+  );
+  const handler = h.registered[0]?.config.streamSimple as (model: { id: string }, context: unknown) => unknown;
+
+  handler({ id: "model-a" }, {});
+  await streams[0]!.settled;
+  handler({ id: "model-b" }, {});
+  await streams[1]!.settled;
+
+  assert.deepEqual(heldModels, ["model-a", "model-b"]);
+});
+
+test("install: each same-provider model call uses its own response headers", async () => {
+  resetGatewayStreamRetry();
+  type TestModel = { id: string };
+  type TestOptions = {
+    onResponse?: (
+      response: { status: number; headers?: Record<string, string> },
+      model: TestModel,
+    ) => void | Promise<void>;
+  };
+  const calls = new Map<string, number>();
+  const base = {
+    streamSimple(model: TestModel, _context: unknown, options?: TestOptions) {
+      const call = calls.get(model.id) ?? 0;
+      calls.set(model.id, call + 1);
+      const retryAfter = model.id === "model-a" ? "7" : "9";
+      return {
+        async *[Symbol.asyncIterator]() {
+          await options?.onResponse?.(
+            { status: call === 0 ? 503 : 200, headers: { "retry-after": retryAfter } },
+            model,
+          );
+          yield call === 0
+            ? ({ type: "error", error: { stopReason: "error", errorMessage: SATURATED } } as Ev)
+            : ({ type: "done", message: { stopReason: "stop" } } as Ev);
+        },
+        result: async () => (call === 0 ? { stopReason: "error", errorMessage: SATURATED } : { stopReason: "stop" }),
+      };
+    },
+  };
+  const registered: Array<Record<string, unknown>> = [];
+  const host: ProviderHost<TestModel, unknown, TestOptions> = {
+    getProvider: () => base,
+    registerProvider: (_id, config) => registered.push(config ?? {}),
+  };
+  const streams: Array<ReturnType<typeof fakeStream>> = [];
+  const holdsSeen: Array<{ model: string; ms: number }> = [];
+  installGatewayStreamRetry(
+    host,
+    { provider: "acme", api: "a" },
+    {
+      createStream: () => {
+        const stream = fakeStream();
+        streams.push(stream);
+        return stream;
+      },
+      hold: async (signal, _attempt, _abort, model) => {
+        holdsSeen.push({ model: model.id, ms: signal.retryAfterMs });
+      },
+      errorMessage: (_model, error) => ({ stopReason: "error", errorMessage: String(error) }),
+    },
+  );
+  const handler = registered[0]?.streamSimple as (model: TestModel, context: unknown) => unknown;
+
+  handler({ id: "model-a" }, {});
+  handler({ id: "model-b" }, {});
+  await Promise.all(streams.map((stream) => stream.settled));
+
+  assert.deepEqual(holdsSeen, [
+    { model: "model-a", ms: 7_000 },
+    { model: "model-b", ms: 9_000 },
+  ]);
 });
 
 test("install: reports an unknown provider instead of registering a broken wrapper", () => {

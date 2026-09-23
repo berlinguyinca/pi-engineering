@@ -186,7 +186,7 @@ export async function pumpWithGatewayRetry<E extends RetryableEvent, R extends R
   opts: GatewayStreamRetryOptions,
 ): Promise<GatewayStreamRetryOutcome> {
   const maxAttempts = Math.floor(finiteBudget(opts.maxAttempts, DEFAULT_GATEWAY_MAX_ATTEMPTS, 1));
-  const maxElapsedMs = finiteBudget(opts.maxElapsedMs, DEFAULT_GATEWAY_MAX_ELAPSED_MS, 1);
+  const maxElapsedMs = finiteBudget(opts.maxElapsedMs, DEFAULT_GATEWAY_MAX_ELAPSED_MS, 0);
   const now = opts.now ?? monotonicNow;
   const startedAt = now();
   const capMs = opts.maxEscalatedWaitMs ?? MAX_ESCALATED_WAIT_MS;

@@ -199,6 +199,22 @@ test("stream retry: non-finite direct budgets fail closed to finite defaults", a
   assert.ok(outcome.attempts < 50);
 });
 
+test("stream retry: a zero elapsed budget permits no replay", async () => {
+  const s = scripted([[failed(SATURATED)], [done()]]);
+  const out = sink();
+  const h = holds();
+  const outcome = await pumpWithGatewayRetry(s.open, out, {
+    hold: h.hold,
+    maxElapsedMs: 0,
+    now: () => 0,
+  });
+
+  assert.equal(outcome.attempts, 1);
+  assert.equal(outcome.holds, 0);
+  assert.equal(s.opened, 1);
+  assert.equal(out.ended?.errorMessage, SATURATED);
+});
+
 test("stream retry: a synthesized wait escalates instead of hammering a flat 5s", async () => {
   // A bare 503 advertises no wait, so the 5s default is a guess. Repeating it
   // unchanged against a gateway with no workers is a busy-wait.

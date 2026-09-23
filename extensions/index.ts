@@ -709,32 +709,12 @@ ${RECOVERY_PROMPT}`;
   });
   if (gatewayConfig.enabled && typeof pi.on === "function") {
     const admission = sharedAdmissionController();
-    const responseMetadata = new Map<string, Array<{ status?: number; headers?: Record<string, string> }>>();
-    const responseKey = (model: { provider?: string; id?: string } | undefined): string | undefined =>
-      model?.provider && model.id ? `${model.provider}/${model.id}` : undefined;
-    const takeResponseMetadata = (model: { provider?: string; id?: string } | undefined) => {
-      const key = responseKey(model);
-      if (!key) return undefined;
-      const queue = responseMetadata.get(key);
-      const metadata = queue?.shift();
-      if (!queue || queue.length === 0) responseMetadata.delete(key);
-      return metadata;
-    };
-    const clearResponseMetadata = (model: { provider?: string; id?: string } | undefined): void => {
-      const key = responseKey(model);
-      if (key) responseMetadata.delete(key);
-    };
 
-    // Headers arrive before the flattened terminal body. Record them without
-    // mutating cooldown state; scope and the maximum header/body delay can only
-    // be decided once the terminal body is available.
-    pi.on("after_provider_response", async (event, ctx) => {
-      const key = responseKey(ctx.model);
-      if (!key) return;
-      const queue = responseMetadata.get(key) ?? [];
-      queue.push({ status: event.status, headers: event.headers });
-      responseMetadata.set(key, queue);
-    });
+    // The interactive wrapper captures headers on each attempt's own
+    // `onResponse` callback. This hook deliberately does not cache them by
+    // provider/model: that pair is shared by concurrent calls and is therefore
+    // not a safe correlation key.
+    pi.on("after_provider_response", async () => {});
 
     // Pi's own session retry stops after `retry.maxRetries` (default 3),
     // ignores the wait the gateway advertised, and has no accessor on the
@@ -753,7 +733,7 @@ ${RECOVERY_PROMPT}`;
     pi.on("message_end", async (event, ctx) => {
       const msg = event.message as { role?: string; stopReason?: string; errorMessage?: string } | undefined;
       if (msg?.role !== "assistant" || msg.stopReason !== "error" || !msg.errorMessage) return;
-      const signal = parseGatewayWait({ ...(takeResponseMetadata(ctx.model) ?? {}), text: msg.errorMessage });
+      const signal = parseGatewayWait({ text: msg.errorMessage });
       if (!signal?.retryable) return;
       const waitMs = isAccountWideRefusal(signal) ? admission.noteWait(signal) : admission.noteObservedWait(signal);
       // The status bar owns this now: a spinner, the countdown and the queue
@@ -835,9 +815,14 @@ ${RECOVERY_PROMPT}`;
           // parking workers on healthy models behind it would turn one model's
           // outage into a runtime-wide stall. Either way the wait is emitted,
           // so the footer keeps its spinner and countdown.
-          hold: async (waitSignal, _attempt, abort) => {
-            const scopedSignal = { ...waitSignal, provider: model.provider, model: model.id };
-            const opts = { provider: model.provider, model: model.id, ...(abort ? { signal: abort } : {}) };
+          hold: async (waitSignal, _attempt, abort, actualModel) => {
+            const callModel = actualModel as Model<any>;
+            const scopedSignal = { ...waitSignal, provider: callModel.provider, model: callModel.id };
+            const opts = {
+              provider: callModel.provider,
+              model: callModel.id,
+              ...(abort ? { signal: abort } : {}),
+            };
             if (isAccountWideRefusal(scopedSignal)) await admission.noteWaitAndSleep(scopedSignal, opts);
             else if (scopedSignal.scope === "model") await admission.noteWaitAndSleep(scopedSignal, opts);
             else await admission.noteCallerWaitAndSleep(scopedSignal, opts);
@@ -846,10 +831,9 @@ ${RECOVERY_PROMPT}`;
           // accumulated across a whole session and would eventually trip a
           // fallback on unrelated, widely separated holds.
           onProgress: () => {
-            clearResponseMetadata(model);
             fallbackCoordinator.onProgress();
           },
-          onHold: () => {
+          onHold: (_info, actualModel) => {
             // Checked on a hold rather than on failure: by the time a turn
             // fails the operator has already spent the wait this avoids. The
             // in-flight request is left alone — a switch applies to the next
@@ -862,11 +846,11 @@ ${RECOVERY_PROMPT}`;
             // to) is what crashed Pi via `assertActive`. So a hold only updates
             // the coordinator's count and pending flag; the fallback itself is
             // applied later from a fresh lifecycle callback.
-            fallbackCoordinator.onGatewayHold({ modelId: model?.id, provider: model?.provider });
+            const callModel = actualModel as Model<any>;
+            fallbackCoordinator.onGatewayHold({ modelId: callModel.id, provider: callModel.provider });
           },
           maxAttempts: gatewayConfig.maxRetries + 1,
           maxElapsedMs: gatewayConfig.maxElapsedMs,
-          response: () => takeResponseMetadata(model),
           signalOf: (options) => (options as { signal?: AbortSignal } | undefined)?.signal,
           errorMessage: (m, error) => ({
             role: "assistant",

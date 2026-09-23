@@ -447,6 +447,17 @@ test("an explicit budget of zero still means zero (no sentinel collision with un
   }
 });
 
+test("an explicit elapsed budget of zero survives environment and programmatic configuration", () => {
+  const saved = { ...process.env };
+  try {
+    process.env.PI_GATEWAY_MAX_ELAPSED_MS = "0";
+    assert.equal(resolveGatewayConfig().maxElapsedMs, 0);
+    assert.equal(resolveGatewayConfig({ maxElapsedMs: 0 }).maxElapsedMs, 0);
+  } finally {
+    process.env = saved;
+  }
+});
+
 test("a long advertised wait is honoured in full by default", () => {
   // Clamping a 5-minute wait to 2 minutes only sends the retry into the same
   // saturated queue and earns the same 429.
