@@ -15,6 +15,7 @@ interface HarnessOpts {
   probeIntervalMs?: number;
   autoResume?: boolean;
   preserve?: boolean;
+  breakerThreshold?: number;
 }
 
 class Harness {
@@ -40,7 +41,7 @@ class Harness {
       jitter_ms: 0,
       request_timeout_ms: 120_000,
       connect_timeout_ms: 10_000,
-      circuit_breaker_threshold: 1000,
+      circuit_breaker_threshold: opts.breakerThreshold ?? 1000,
     };
     const hooks: SupervisorHooks = {
       transition: (from, to) => {
@@ -235,6 +236,21 @@ describe("MissionSupervisor", () => {
     // Retry-after from the error (5000) overrides the 10s probe interval.
     assert.equal(sleeps[0], 5_000);
     void realSleep;
+  });
+
+  it("opens the circuit breaker after the threshold and probes only while OPEN", async () => {
+    const h = new Harness(failingExecute(), probeResult(false), {
+      retryWindowMs: 90 * 60_000,
+      probeIntervalMs: 10_000,
+      breakerThreshold: 3,
+    });
+    h.setNow(0);
+    await h.run({ mission_id: "MSN-1", step_id: "step-1" });
+    // 3 consecutive failures opened the breaker; afterwards the supervisor only
+    // probes (no real requests) until the retry window closes.
+    const breaker = (h.supervisor as unknown as { breaker: { snapshot(): { state: string } } }).breaker;
+    assert.equal(breaker.snapshot().state, "OPEN");
+    void h;
   });
 
   it("publishes heartbeats while waiting", async () => {

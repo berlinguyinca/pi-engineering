@@ -155,8 +155,10 @@ export class MissionSupervisor {
       // Heartbeat (independent of LLM activity).
       this.publishHeartbeat(step.mission_id);
 
-      // Circuit breaker gate: while OPEN only probe; on half-open send one real.
-      if (!this.breaker.allowRequest()) {
+      // Circuit breaker gate: while OPEN only probe; on half-open send one real
+      // request. tryHalfOpen transitions OPEN -> HALF_OPEN so a failed real
+      // request correctly reopens (resets the cooldown) instead of storming.
+      if (!this.breaker.tryHalfOpen()) {
         probes += await this.probeAndWait(window, retryAfterMs);
         this.publishHeartbeat(step.mission_id);
         continue;
