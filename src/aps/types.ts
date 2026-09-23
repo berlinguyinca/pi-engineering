@@ -97,6 +97,17 @@ export interface AgentAction {
   workItemId: string | null;
   /** Wall-clock timestamp (ISO). Kept for bookkeeping; excluded from fingerprinting. */
   occurredAt?: string;
+  /** Provider of the model producing the action (e.g. "anthropic"), when known. */
+  modelProvider?: string;
+  /** Model id producing the action (e.g. "claude-..."), when known. */
+  modelId?: string;
+  /**
+   * Input tokens of the latest assistant turn at the time of the action
+   * (usage data), when available. Used for context-utilization reporting.
+   */
+  inputTokens?: number;
+  /** Configured context budget in tokens for the session, when configured. */
+  maxContextTokens?: number;
 }
 
 /**
@@ -183,6 +194,16 @@ export interface AgentLoopCandidateEvent {
   reason: string;
   /** contentFingerprint of the action that completed the loop. */
   fingerprint: string;
+  /** Raw tool name of the action that completed the loop (e.g. "repo_search"). */
+  tool: string;
+  /** The model producing the action when the loop completed, or null when unknown. */
+  model: { provider: string; id: string } | null;
+  /**
+   * Context utilization at loop completion: input tokens / configured
+   * max_context_tokens, in [0, 1]. null when usage data or the configured
+   * budget is unavailable.
+   */
+  contextUtilization: number | null;
   family: SemanticStrategyFamily;
   target: string;
   metrics: {

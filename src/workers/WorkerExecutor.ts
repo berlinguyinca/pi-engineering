@@ -30,6 +30,12 @@ export interface WorkerRequest {
    * structured review verdict.
    */
   resultTool?: "worker_result" | "review_result";
+  /** Run this worker session belongs to (observability ids), when known. */
+  runId?: string;
+  /** Work item the session is scoped to (observability ids), if any. */
+  workItemId?: string | null;
+  /** Stable session identity (observability ids); generated when omitted. */
+  sessionId?: string;
 }
 
 /** An image passed to a vision-capable worker session. */

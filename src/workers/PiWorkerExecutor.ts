@@ -9,6 +9,8 @@ import {
   createAgentSession,
   createExtensionRuntime,
 } from "@earendil-works/pi-coding-agent";
+import type { AgentProgressSupervisorOptions } from "../aps/supervisor.ts";
+import { WorkerActivityAdapter } from "../aps/workerActivity.ts";
 import type { WorkerResult, WorkerRole, WorkerUsage } from "../core/types.ts";
 import type { AdmissionController } from "../gateway/AdmissionController.ts";
 import { type GatewayAdmissionConfig, sharedAdmissionController, sharedGatewayConfig } from "../gateway/config.ts";
@@ -89,6 +91,13 @@ export interface PiWorkerExecutorOptions {
   transientSleep?: (ms: number) => Promise<void>;
   /** Injectable RNG for backoff jitter (deterministic in tests). */
   transientRand?: () => number;
+  /**
+   * APS loop-detection for worker sessions (Phase 2, detect-only): tool-call
+   * activity is turned into AgentAction records and fed to an
+   * AgentProgressSupervisor, which emits `agent.loop_candidate` events.
+   * Default `{}` (enabled with default thresholds); `false` disables.
+   */
+  aps?: AgentProgressSupervisorOptions | false;
 }
 
 /**
@@ -111,6 +120,8 @@ export class PiWorkerExecutor implements WorkerExecutor {
   private readonly transientConfig: BackoffConfig;
   private readonly transientSleep: (ms: number) => Promise<void>;
   private readonly transientRand: () => number;
+  /** APS loop-detection options for worker sessions (`false` disables). */
+  private readonly aps: AgentProgressSupervisorOptions | false | undefined;
   private modelRuntime: ModelRuntime | undefined;
   private runtimePromise: Promise<ModelRuntime> | undefined;
   /** Aggregate recovery telemetry across all worker runs. */
@@ -131,6 +142,7 @@ export class PiWorkerExecutor implements WorkerExecutor {
     this.transientConfig = opts.transientConfig ?? resolveTransientRetryConfig();
     this.transientSleep = opts.transientSleep ?? ((ms) => new Promise<void>((r) => setTimeout(r, ms)));
     this.transientRand = opts.transientRand ?? Math.random;
+    this.aps = opts.aps;
   }
 
   /** Inject/refresh the semantic tools bound to a runtime (scout/reviewer/implementer sessions). */
@@ -540,6 +552,11 @@ ${recovery.recoveryPrompt}`;
     });
 
     const terminatingName = req.resultTool === "review_result" ? "review_result" : "worker_result";
+    // APS Phase 2 (detect-only): observe the session's tool-call activity on
+    // the EXISTING session event bus; loop candidates become structured
+    // `agent.loop_candidate` events. Never affects the run.
+    const apsAdapter = this.createApsAdapter(req, model);
+    const apsDetach = apsAdapter ? apsAdapter.attach(session) : undefined;
     let captured: WorkerResult | undefined;
     let structured: unknown;
     let toolCalls = 0;
@@ -640,6 +657,7 @@ ${recovery.recoveryPrompt}`;
     } finally {
       clearTimeout(timer);
       unsubscribe();
+      apsDetach?.();
     }
 
     // Surface a retryable transport error so runWithGuard's withTransientRetry
@@ -687,6 +705,21 @@ ${recovery.recoveryPrompt}`;
       timedOut,
       assistantError,
     };
+  }
+
+  /** Build the per-attempt APS activity adapter (null when detection is disabled). */
+  private createApsAdapter(req: WorkerRequest, model: Model<any>): WorkerActivityAdapter | null {
+    if (this.aps === false) return null;
+    return new WorkerActivityAdapter({
+      role: req.role,
+      sessionId: req.sessionId,
+      runId: req.runId,
+      workItemId: req.workItemId,
+      model: { provider: model.provider, id: model.id },
+      maxContextTokens: req.maxContextTokens,
+      rootPrefix: req.cwd,
+      supervisorOptions: this.aps,
+    });
   }
 
   /** Cast session messages to the shape collectUsage expects. */
