@@ -9,6 +9,11 @@ import {
   createAgentSession,
   createExtensionRuntime,
 } from "@earendil-works/pi-coding-agent";
+import {
+  isRecoverable as apsRecoverable,
+  buildRecoveryPrompt as buildApsRecoveryPrompt,
+  decideRecovery as decideApsRecovery,
+} from "../aps/recovery.ts";
 import { AGENT_LOOP_PREVENTED_EVENT, type AgentProgressSupervisorOptions } from "../aps/supervisor.ts";
 import { type AgentLoopPreventedEvent, DEFAULT_LOOP_PREVENTION } from "../aps/types.ts";
 import { WorkerActivityAdapter } from "../aps/workerActivity.ts";
@@ -46,6 +51,13 @@ import type { WorkerExecutor, WorkerRequest, WorkerRun } from "./WorkerExecutor.
 import { registerLocalProviders } from "./localProviders.ts";
 import { WORKER_KICKOFF, buildSystemPrompt } from "./prompts.ts";
 import { workerResultTool } from "./workerResultTool.ts";
+
+/**
+ * Maximum APS loop-recovery attempts (Phase 4). Bounded to one: after a
+ * replan/compact attempt the worker either progresses or is reported
+ * loop_prevented — APS never retries a loop indefinitely.
+ */
+const APS_RECOVERY_MAX_ATTEMPTS = 1;
 
 /** A minimal resource loader that supplies only the role prompt (context firewall). */
 function roleResourceLoader(systemPrompt: string): ResourceLoader {
@@ -395,10 +407,10 @@ ${TOOL_TRANSITION_RULE}`;
         }
       }
 
-      // Phase 3 enforcement outcome: the supervisor PREVENTED a sustained loop
-      // and aborted the run. This is terminal for the attempt — not a guard
-      // recovery-ladder case and not a transient retry. The broker preserves
-      // any partial edits and does not integrate failed work.
+      // Phase 3/4 outcome: the supervisor PREVENTED a sustained loop and aborted
+      // the run. Phase 4 RECOVERY: attempt ONE conservative recovery (replan to a
+      // different strategy, or compact the identical no-progress turns) via a
+      // FRESH session before giving up. Bounded to one APS recovery; never loops.
       if (loopPrevented) {
         this.emitTelemetry({
           event: "model_generation_aborted",
@@ -411,12 +423,31 @@ ${TOOL_TRANSITION_RULE}`;
           tokens_since_progress: loopPreventedEvent?.metrics.noProgressTurns ?? 0,
           timestamp: new Date().toISOString(),
         });
+        const noProgressTurns = loopPreventedEvent?.metrics.noProgressTurns ?? 0;
+        // Decide a recovery and, if safe and not exhausted, retry once.
+        if (loopPreventedEvent !== undefined && attempt < APS_RECOVERY_MAX_ATTEMPTS) {
+          const recovery = decideApsRecovery(loopPreventedEvent);
+          if (apsRecoverable(recovery)) {
+            attempt += 1;
+            const recoveryPrompt = buildApsRecoveryPrompt(recovery, loopPreventedEvent);
+            if (recovery.action === "compact") {
+              systemPrompt = buildCompactedWorkerPrompt(req, recoveryPrompt);
+            } else {
+              systemPrompt = `${systemPrompt}\n\n${recoveryPrompt}`;
+            }
+            continue; // fresh session, replan/compact directive, one recovery only
+          }
+        }
         const usage = this.collectUsage(this.asMessages(session.messages));
-        const detail = { loop_prevented: true, no_progress_turns: loopPreventedEvent?.metrics.noProgressTurns ?? 0 };
+        const detail = {
+          loop_prevented: true,
+          no_progress_turns: noProgressTurns,
+          recovery: loopPreventedEvent !== undefined ? decideApsRecovery(loopPreventedEvent).action : "none",
+        };
         return {
           result: {
             status: "failed",
-            summary: `Agent loop prevented after ${detail.no_progress_turns} identical no-progress turns (${AGENT_LOOP_PREVENTED_EVENT}).`,
+            summary: `Agent loop prevented after ${noProgressTurns} identical no-progress turns (${AGENT_LOOP_PREVENTED_EVENT}).`,
             claims: [],
             evidence_refs: [],
             new_hypotheses: [],
