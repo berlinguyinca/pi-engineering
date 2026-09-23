@@ -16,11 +16,13 @@ import {
   buildEscalationPrompt,
   selectEscalationModel as selectApsEscalationModel,
 } from "../aps/escalation.ts";
+import { ApsObservability } from "../aps/observability.ts";
 import {
   isRecoverable as apsRecoverable,
   buildRecoveryPrompt as buildApsRecoveryPrompt,
   decideRecovery as decideApsRecovery,
 } from "../aps/recovery.ts";
+import { DEFAULT_ROLLOUT_PHASE, resolveRollout } from "../aps/rollout.ts";
 import { AGENT_LOOP_PREVENTED_EVENT, type AgentProgressSupervisorOptions } from "../aps/supervisor.ts";
 import { type AgentLoopPreventedEvent, DEFAULT_LOOP_PREVENTION } from "../aps/types.ts";
 import { WorkerActivityAdapter } from "../aps/workerActivity.ts";
@@ -133,6 +135,11 @@ export interface PiWorkerExecutorOptions {
    * `escalated_to_human`. Default `DEFAULT_ESCALATION`; `false` disables.
    */
   escalation?: import("../aps/escalation.ts").EscalationOptions | false;
+  /**
+   * APS rollout phase (Phase 6): progressive-enablement gate. Default
+   * `DEFAULT_ROLLOUT_PHASE` (full enforcement + observability).
+   */
+  rolloutPhase?: import("../aps/rollout.ts").ApsRolloutPhase;
 }
 
 /**
@@ -161,6 +168,10 @@ export class PiWorkerExecutor implements WorkerExecutor {
   private readonly loopPrevention: import("../aps/types.ts").LoopPreventionOptions | false | undefined;
   /** APS escalation options (`false` disables). */
   private readonly escalation: import("../aps/escalation.ts").EscalationOptions | false | undefined;
+  /** APS rollout gate (Phase 6). */
+  private readonly rollout: import("../aps/rollout.ts").ApsRollout;
+  /** APS observability accumulator (Phase 6). */
+  readonly observability: import("../aps/observability.ts").ApsObservability = new ApsObservability();
   private modelRuntime: ModelRuntime | undefined;
   private runtimePromise: Promise<ModelRuntime> | undefined;
   /** Aggregate recovery telemetry across all worker runs. */
@@ -184,6 +195,12 @@ export class PiWorkerExecutor implements WorkerExecutor {
     this.aps = opts.aps;
     this.loopPrevention = opts.loopPrevention;
     this.escalation = opts.escalation;
+    this.rollout = resolveRollout(opts.rolloutPhase ?? DEFAULT_ROLLOUT_PHASE);
+  }
+
+  /** APS observability snapshot (Phase 6) — Grafana-ready metrics. */
+  apsSnapshot(): import("../aps/observability.ts").ApsSnapshot {
+    return this.observability.snapshot();
   }
 
   /** Inject/refresh the semantic tools bound to a runtime (scout/reviewer/implementer sessions). */
@@ -442,11 +459,15 @@ ${TOOL_TRANSITION_RULE}`;
           timestamp: new Date().toISOString(),
         });
         const noProgressTurns = loopPreventedEvent?.metrics.noProgressTurns ?? 0;
+        if (this.rollout.observability && loopPreventedEvent !== undefined) {
+          this.observability.recordPrevented(loopPreventedEvent);
+        }
         // Phase 4 recovery: one conservative replan/compact attempt via a fresh
         // session, before escalation (Phase 5).
         if (loopPreventedEvent !== undefined && attempt < APS_RECOVERY_MAX_ATTEMPTS) {
           const recovery = decideApsRecovery(loopPreventedEvent);
           if (apsRecoverable(recovery)) {
+            this.observability.recordRecovery(recovery.action);
             attempt += 1;
             const recoveryPrompt = buildApsRecoveryPrompt(recovery, loopPreventedEvent);
             if (recovery.action === "compact") {
@@ -490,6 +511,7 @@ ${TOOL_TRANSITION_RULE}`;
             humanReviewRequested: target === null,
           };
           this.emitTelemetry(escalationEvent);
+          this.observability.recordEscalation(escalationEvent);
           if (target !== null) {
             const escalated = available.find((m) => m.id === target.id) as Model<any> | undefined;
             if (escalated) {
