@@ -492,8 +492,12 @@ export class Orchestrator {
         const landed = await this.broker.changedFilesSinceBase(mission.mission_id);
         if (landed !== null && landed.length === 0) {
           integrationOk = false;
-          // Say WHAT is wrong, in the channel operators (and the PI WEB panel)
-          // already read, rather than leaving an opaque unmet-gate verdict.
+          // Distinguish a genuinely empty worker branch (tip == base, no edits)
+          // from a merge/harvest bug where committed work exists on a branch but
+          // did not reach the checkout. The first is an implementer that produced
+          // nothing; the second is a pipeline defect and must not be reported as
+          // "the workers produced no work" — that would hide a lost integration.
+          const committed = this.broker.hasCommittedWorkerWork(mission.mission_id);
           this.store.addFinding({
             mission_id: mission.mission_id,
             task_id: integ.task_id,
@@ -501,9 +505,13 @@ export class Orchestrator {
             category: "integration",
             file: null,
             line: null,
-            summary: "Integration produced no change: the worker branches held no committed work",
+            summary: committed
+              ? "Integration merged but the base checkout is unchanged despite committed worker work — a merge/harvest bug; the worker branches are preserved and must be inspected"
+              : "Integration produced no change: the worker branches held no committed work",
             evidence: null,
-            recommended_action: "The implementer must actually edit files; harvested worktrees were empty.",
+            recommended_action: committed
+              ? "Inspect the preserved worker branches (git branch | grep pi-eng-orch) and the merge result; the worker's committed work must be recovered and integrated manually."
+              : "The implementer must actually edit files; harvested worktrees were empty.",
           });
         }
       }
