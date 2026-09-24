@@ -1,10 +1,8 @@
 /**
  * Retry-delay resolution (spec 02 §2).
  *
- * Precedence, first hit wins: `retry-after-ms` header → `Retry-After` header
- * (delta-seconds or HTTP date) → body `retry_after_ms` → exponential backoff.
- * Every delay is clamped into `[minDelayMs, maxDelayMs]` and jitter is
- * positive-only so a server wait is never shortened.
+ * The largest valid header/body server minimum wins. Local backoff is bounded,
+ * and positive jitter never shortens a server minimum.
  */
 
 import assert from "node:assert/strict";
@@ -13,6 +11,7 @@ import {
   addBoundedJitter,
   bodyRetryAfterMs,
   clampDelay,
+  decideWait,
   exponentialBackoffMs,
   parseRetryAfterHeader,
   parseRetryAfterMsHeader,
@@ -28,7 +27,7 @@ const BOUNDS = {
   honorRetryAfter: true,
 };
 
-test("retry-after-ms header beats the body field", () => {
+test("the largest valid server delay wins across headers and body", () => {
   const r = resolveRetryDelay({
     headers: { "retry-after-ms": "4000", "retry-after": "2" },
     body: { retry_after_ms: 9000 },
@@ -36,12 +35,12 @@ test("retry-after-ms header beats the body field", () => {
     bounds: BOUNDS,
     random: () => 0,
   });
-  assert.equal(r.source, "retry-after-ms");
-  assert.equal(r.delayMs, 4000);
-  assert.equal(r.serverDelayMs, 4000);
+  assert.equal(r.source, "body");
+  assert.equal(r.delayMs, 9000);
+  assert.equal(r.serverDelayMs, 9000);
 });
 
-test("Retry-After delta-seconds is honored when no ms header is present", () => {
+test("Retry-After delta-seconds wins only when it is the largest server minimum", () => {
   const r = resolveRetryDelay({
     headers: { "retry-after": "7" },
     body: { retry_after_ms: 9000 },
@@ -49,8 +48,8 @@ test("Retry-After delta-seconds is honored when no ms header is present", () => 
     bounds: BOUNDS,
     random: () => 0,
   });
-  assert.equal(r.source, "retry-after-seconds");
-  assert.equal(r.delayMs, 7000);
+  assert.equal(r.source, "body");
+  assert.equal(r.delayMs, 9000);
 });
 
 test("Retry-After HTTP date resolves relative to now", () => {
@@ -100,15 +99,15 @@ test("honorRetryAfter:false ignores server hints and uses backoff", () => {
   assert.equal(r.delayMs, 4_000);
 });
 
-test("server delay is clamped into policy bounds and flagged", () => {
+test("server minimum is never clamped downward", () => {
   const r = resolveRetryDelay({
     headers: { "retry-after-ms": "10000000" }, // 2.7 hours
     attempt: 1,
     bounds: BOUNDS,
     random: () => 0,
   });
-  assert.equal(r.delayMs, 120_000);
-  assert.equal(r.clamped, true);
+  assert.equal(r.delayMs, 10_000_000);
+  assert.equal(r.clamped, undefined);
   assert.equal(r.serverDelayMs, 10_000_000);
 
   const low = resolveRetryDelay({
@@ -118,6 +117,17 @@ test("server delay is clamped into policy bounds and flagged", () => {
     random: () => 0,
   });
   assert.equal(low.delayMs, 500);
+});
+
+test("a server minimum that does not fit the remaining elapsed budget stops", () => {
+  assert.deepEqual(decideWait({ serverMinimumMs: 8_000, proposedMs: 8_000, remainingMs: 7_000 }), {
+    action: "stop",
+    reason: "budget_elapsed",
+  });
+  assert.deepEqual(decideWait({ serverMinimumMs: 8_000, proposedMs: 8_500, remainingMs: 9_000 }), {
+    action: "wait",
+    waitMs: 8_500,
+  });
 });
 
 test("positive-only jitter never shortens a server wait", () => {

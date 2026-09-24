@@ -17,6 +17,7 @@
  * Pure except for the injected clock and sleeper, so tests never sleep.
  */
 
+import { monotonicNow } from "../core/clock.ts";
 import { type GatewayWaitSignal, describeGatewayWait } from "./signals.ts";
 
 export interface AdmissionControllerOptions {
@@ -32,10 +33,8 @@ export interface AdmissionControllerOptions {
    */
   reservedSlots?: number;
   /**
-   * Upper bound on a single honoured wait. Unlimited by default: the operator's
-   * policy is to wait until the gateway has capacity rather than fail, and a
-   * clamped wait only re-enters the same saturated queue. Set a finite value to
-   * stop a bad payload parking the runtime.
+   * Retained for configuration compatibility. The controller never shortens a
+   * server minimum; retry-chain elapsed budgets decide whether it can be paid.
    */
   maxWaitMs?: number;
   /**
@@ -46,7 +45,7 @@ export interface AdmissionControllerOptions {
   jitterMs?: number;
   /** Consecutive clean runs after which the clamp relaxes by one slot. */
   successesToRelax?: number;
-  /** Injected monotonic clock (ms). Default Date.now. */
+  /** Injected monotonic clock (ms). Default performance.now(). */
   now?: () => number;
   /** Injected sleeper. Default setTimeout-based. */
   sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
@@ -88,6 +87,8 @@ export interface AdmissionWaitOptions {
    * gateway it has capacity again.
    */
   signal?: AbortSignal;
+  provider?: string;
+  model?: string;
 }
 
 /** A held admission slot. Release is idempotent. */
@@ -122,7 +123,6 @@ export class AdmissionController {
   private readonly configuredMax: number;
   private readonly minConcurrency: number;
   private readonly reservedSlots: number;
-  private readonly maxWaitMs: number;
   private readonly jitterMs: number;
   private readonly successesToRelax: number;
   private readonly now: () => number;
@@ -136,6 +136,7 @@ export class AdmissionController {
   private active = 0;
   private waiting = 0;
   private cooldownUntil = 0;
+  private readonly modelCooldownUntil = new Map<string, number>();
   private consecutiveSuccesses = 0;
   private lastSignal: GatewayWaitSignal | undefined;
   /** Waiters parked on a free slot, resolved in FIFO order. */
@@ -147,10 +148,9 @@ export class AdmissionController {
     this.configuredMax = Math.max(1, opts.maxConcurrency);
     this.minConcurrency = Math.max(1, opts.minConcurrency ?? 1);
     this.reservedSlots = Math.max(0, opts.reservedSlots ?? 0);
-    this.maxWaitMs = Math.max(0, opts.maxWaitMs ?? Number.POSITIVE_INFINITY);
     this.jitterMs = Math.max(0, opts.jitterMs ?? 250);
     this.successesToRelax = Math.max(1, opts.successesToRelax ?? 3);
-    this.now = opts.now ?? (() => Date.now());
+    this.now = opts.now ?? monotonicNow;
     this.sleep = opts.sleep ?? defaultSleep;
     this.random = opts.random ?? Math.random;
     this.onEvent = opts.onEvent;
@@ -186,19 +186,23 @@ export class AdmissionController {
   }
 
   status(): AdmissionStatus {
+    const identity = this.lastSignal ? { provider: this.lastSignal.provider, model: this.lastSignal.model } : undefined;
     return {
       active: this.active,
       waiting: this.waiting,
       concurrency: this.concurrency,
       baseConcurrency: this.baseConcurrency,
-      cooldownMs: Math.max(0, this.cooldownUntil - this.now()),
+      cooldownMs: this.cooldownRemainingMs(identity),
       ...(this.lastSignal ? { lastSignal: this.lastSignal } : {}),
     };
   }
 
   /** Milliseconds left on the process-wide cooldown (0 when open). */
-  cooldownRemainingMs(): number {
-    return Math.max(0, this.cooldownUntil - this.now());
+  cooldownRemainingMs(identity: { provider?: string; model?: string } = {}): number {
+    const global = Math.max(0, this.cooldownUntil - this.now());
+    const key = this.modelKey(identity.provider, identity.model);
+    const model = key ? Math.max(0, (this.modelCooldownUntil.get(key) ?? 0) - this.now()) : 0;
+    return Math.max(global, model);
   }
 
   /**
@@ -219,7 +223,7 @@ export class AdmissionController {
         // it releases THIS caller and leaves the cooldown standing for everyone
         // else, because the gateway is still saturated either way.
         if (signal?.aborted) return waited;
-        const remaining = this.cooldownRemainingMs();
+        const remaining = this.cooldownRemainingMs(opts);
         if (remaining <= 0) break;
         await this.sleepOrAbort(remaining, signal);
         if (signal?.aborted) return waited;
@@ -289,12 +293,17 @@ export class AdmissionController {
     this.consecutiveSuccesses = 0;
     this.lastSignal = signal;
 
-    const waitMs = Math.min(signal.retryAfterMs, this.maxWaitMs);
+    const waitMs = signal.retryAfterMs;
     const until = this.now() + waitMs;
-    // Never shorten a cooldown another caller already earned.
-    if (until > this.cooldownUntil) this.cooldownUntil = until;
+    const modelKey = signal.scope === "model" ? this.modelKey(signal.provider, signal.model) : undefined;
+    if (modelKey) {
+      if (until > (this.modelCooldownUntil.get(modelKey) ?? 0)) this.modelCooldownUntil.set(modelKey, until);
+    } else if (until > this.cooldownUntil) {
+      // Missing scope remains the conservative legacy process-wide behavior.
+      this.cooldownUntil = until;
+    }
 
-    if (signal.activeLimit !== undefined) {
+    if (signal.activeLimit !== undefined && signal.scope !== "model") {
       // The gateway counts every concurrent request against this limit,
       // including the operator's own interactive turn, so keep the reserve
       // free rather than filling the window with background work.
@@ -324,7 +333,7 @@ export class AdmissionController {
    */
   noteObservedWait(signal: GatewayWaitSignal): number {
     this.lastSignal = signal;
-    const waitMs = Math.min(signal.retryAfterMs, this.maxWaitMs);
+    const waitMs = signal.retryAfterMs;
     this.emit({ type: "wait", waitMs, signal, concurrency: this.concurrency });
     return waitMs;
   }
@@ -346,7 +355,7 @@ export class AdmissionController {
    */
   async noteCallerWaitAndSleep(signal: GatewayWaitSignal, opts: AdmissionWaitOptions = {}): Promise<number> {
     this.lastSignal = signal;
-    const waitMs = Math.min(signal.retryAfterMs, this.maxWaitMs);
+    const waitMs = signal.retryAfterMs;
     this.waiting++;
     try {
       this.emit({ type: "wait", waitMs, signal, concurrency: this.concurrency });
@@ -364,7 +373,11 @@ export class AdmissionController {
    */
   async noteWaitAndSleep(signal: GatewayWaitSignal, opts: AdmissionWaitOptions = {}): Promise<number> {
     this.noteWait(signal);
-    return this.awaitCooldown(opts);
+    return this.awaitCooldown({
+      ...opts,
+      provider: opts.provider ?? signal.provider,
+      model: opts.model ?? signal.model,
+    });
   }
 
   /** Record a clean run: relaxes the clamp back toward the configured max. */
@@ -382,14 +395,18 @@ export class AdmissionController {
 
   /** Human-readable one-liner describing the current hold, for notices. */
   describe(): string | null {
-    const remaining = this.cooldownRemainingMs();
-    if (remaining <= 0) return null;
     const signal = this.lastSignal;
+    const remaining = this.cooldownRemainingMs(signal ? { provider: signal.provider, model: signal.model } : undefined);
+    if (remaining <= 0) return null;
     return signal ? `gateway backoff: ${describeGatewayWait(signal)}` : `gateway backoff: ${remaining}ms`;
   }
 
   private effectiveLimit(): number {
     return Math.max(this.minConcurrency, this.concurrency);
+  }
+
+  private modelKey(provider: string | undefined, model: string | undefined): string | undefined {
+    return provider && model ? `${provider}/${model}` : undefined;
   }
 
   private waitForSlot(): Promise<void> {

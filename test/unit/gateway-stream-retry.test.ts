@@ -47,6 +47,10 @@ const SATURATED = "503 no worker for model";
 const ADMISSION_429 =
   '429: {"active":4,"active_limit":4,"message":"inference admission: queue_timeout","queue_limit":100,"queued":30,' +
   '"reason":"queue_timeout","retry_after_ms":30000,"scope":"agent","type":"inference_admission"}';
+const EXPLICIT_FALSE =
+  '503: {"error":{"type":"inferweave_backpressure","code":"FINAL-CODE","reason":"internal_error",' +
+  '"retryable":false,"replay_safe":false,"request_state":"dispatched","action":"do_not_retry",' +
+  '"action_code":"IW-ACT-DO-NOT-RETRY","message":"final server message"}}';
 
 /** A scripted attempt sequence, shaped like pi's AssistantMessageEventStream. */
 function scripted(attempts: Ev[][]) {
@@ -159,6 +163,35 @@ test("stream retry: a 503 AFTER output is not retried — retrying would duplica
   assert.equal(h.seen.length, 0);
 });
 
+test("stream retry: partial output withholds and augments one generic terminal from result guidance", async () => {
+  let opened = 0;
+  const generic = failed("provider request failed");
+  const open = () => {
+    opened++;
+    return {
+      async *[Symbol.asyncIterator]() {
+        yield text("partial");
+        yield generic;
+      },
+      result: async (): Promise<Res> => ({ stopReason: "error", errorMessage: EXPLICIT_FALSE }),
+    };
+  };
+  const out = sink();
+
+  await pumpWithGatewayRetry(open, out, { hold: holds().hold });
+
+  assert.equal(opened, 1, "partial output must make replay unsafe");
+  assert.deepEqual(
+    out.pushed.map((event) => event.type),
+    ["text_delta", "error"],
+    "the failing terminal is emitted exactly once after guidance is available",
+  );
+  const terminalMessage = out.pushed.at(-1)?.error?.errorMessage ?? "";
+  assert.match(terminalMessage, /final server message/);
+  assert.match(terminalMessage, /FINAL-CODE/);
+  assert.match(terminalMessage, /IW-ACT-DO-NOT-RETRY/);
+});
+
 test("stream retry: the body-advertised wait is honoured exactly", async () => {
   const s = scripted([[failed(ADMISSION_429)], [done()]]);
   const h = holds();
@@ -166,6 +199,49 @@ test("stream retry: the body-advertised wait is honoured exactly", async () => {
 
   assert.equal(h.seen.length, 1);
   assert.equal(h.seen[0]?.ms, 30_000, "the gateway said 30s; anything else walks back into the queue");
+});
+
+test("stream retry: one decision chooses the larger 503 header delay over the body", async () => {
+  const body =
+    '503: {"type":"inferweave_backpressure","reason":"NO_CONTEXT_CAPACITY","retryable":true,' +
+    '"replay_safe":true,"request_state":"queued","action":"backoff","action_code":"IW-ACT-BACKOFF",' +
+    '"retry_after_ms":1000,"scope":"model"}';
+  const s = scripted([[failed(body)], [done()]]);
+  const h = holds();
+  await pumpWithGatewayRetry(s.open, sink(), {
+    hold: h.hold,
+    response: () => ({ status: 503, headers: { "retry-after": "8" } }),
+  });
+  assert.deepEqual(
+    h.seen.map((entry) => entry.ms),
+    [8_000],
+  );
+});
+
+test("stream retry: non-finite direct budgets fail closed to finite defaults", async () => {
+  const s = scripted(Array.from({ length: 50 }, () => [failed(SATURATED)]));
+  const outcome = await pumpWithGatewayRetry(s.open, sink(), {
+    hold: holds().hold,
+    maxAttempts: Number.POSITIVE_INFINITY,
+    maxElapsedMs: Number.POSITIVE_INFINITY,
+  });
+  assert.ok(outcome.attempts < 50);
+});
+
+test("stream retry: a zero elapsed budget permits no replay", async () => {
+  const s = scripted([[failed(SATURATED)], [done()]]);
+  const out = sink();
+  const h = holds();
+  const outcome = await pumpWithGatewayRetry(s.open, out, {
+    hold: h.hold,
+    maxElapsedMs: 0,
+    now: () => 0,
+  });
+
+  assert.equal(outcome.attempts, 1);
+  assert.equal(outcome.holds, 0);
+  assert.equal(s.opened, 1);
+  assert.equal(out.ended?.errorMessage, SATURATED);
 });
 
 test("stream retry: a synthesized wait escalates instead of hammering a flat 5s", async () => {
@@ -193,16 +269,46 @@ test("stream retry: an escalated wait is capped so it never becomes an outage", 
   assert.equal(h.seen.at(-1)?.ms, 60_000, "and should reach the cap");
 });
 
-test("stream retry: saturation is waited out indefinitely, not for three attempts", async () => {
-  // The whole point. Pi's own budget is 3; this must not have one.
-  const s = scripted([...Array.from({ length: 50 }, () => [failed(SATURATED)]), [text("finally"), done()]]);
+test("stream retry: default attempt budget is finite and preserves the last server failure", async () => {
+  const s = scripted(Array.from({ length: 50 }, () => [failed(`${SATURATED} final-code`)]));
   const out = sink();
   const h = holds();
   const outcome = await pumpWithGatewayRetry(s.open, out, { hold: h.hold });
 
-  assert.equal(outcome.attempts, 51);
-  assert.equal(out.ended?.stopReason, "stop");
-  assert.equal(out.pushed.at(0)?.text, "finally");
+  assert.ok(Number.isFinite(outcome.attempts));
+  assert.ok(outcome.attempts < 50);
+  assert.equal(out.ended?.stopReason, "error");
+  assert.match(out.ended?.errorMessage ?? "", /final-code/);
+});
+
+test("stream retry: elapsed budget stops before a server minimum that cannot fit", async () => {
+  const now = 0;
+  const s = scripted([[failed(ADMISSION_429)], [done()]]);
+  const out = sink();
+  const outcome = await pumpWithGatewayRetry(s.open, out, {
+    hold: async () => {},
+    now: () => now,
+    maxElapsedMs: 1_000,
+  });
+  assert.equal(outcome.attempts, 1);
+  assert.equal(out.ended?.errorMessage, ADMISSION_429);
+});
+
+test("stream retry: a hold that overruns the elapsed budget does not open another request", async () => {
+  let now = 0;
+  const s = scripted([[failed(SATURATED)], [done()]]);
+  const out = sink();
+  const outcome = await pumpWithGatewayRetry(s.open, out, {
+    maxElapsedMs: 10_000,
+    now: () => now,
+    hold: async () => {
+      now = 10_001;
+    },
+  });
+
+  assert.equal(outcome.attempts, 1);
+  assert.equal(s.opened, 1, "elapsed time must be rechecked immediately before replay");
+  assert.equal(out.ended?.errorMessage, SATURATED);
 });
 
 test("stream retry: a non-gateway error fails fast", async () => {
@@ -214,6 +320,16 @@ test("stream retry: a non-gateway error fails fast", async () => {
   assert.equal(s.opened, 1, "waiting cannot fix a bad key");
   assert.equal(out.ended?.errorMessage, "401 invalid api key");
   assert.equal(h.seen.length, 0);
+});
+
+test("stream retry: explicit false preserves the final server error without replay", async () => {
+  const s = scripted([[failed(EXPLICIT_FALSE)], [done()]]);
+  const out = sink();
+  await pumpWithGatewayRetry(s.open, out, { hold: holds().hold });
+  assert.equal(s.opened, 1);
+  assert.equal(out.ended?.errorMessage, EXPLICIT_FALSE);
+  assert.match(out.ended?.errorMessage ?? "", /FINAL-CODE/);
+  assert.match(out.ended?.errorMessage ?? "", /IW-ACT-DO-NOT-RETRY/);
 });
 
 test("stream retry: quota exhaustion fails fast even though it is a 429", async () => {

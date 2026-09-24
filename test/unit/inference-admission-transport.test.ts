@@ -8,9 +8,34 @@ import { type AdmissionEvent, AdmissionEventBus, AdmissionMetrics } from "../../
 import {
   type AdmissionAttemptCapture,
   AdmissionBudgetLedger,
+  createAdmissionCaptureFetch,
   executeWithAdmissionRetry,
   terminalAssistantMessage,
 } from "../../src/inference/admissionTransport.ts";
+
+test("capture fetch recognizes a raw inferweave_backpressure response", async () => {
+  const capture: AdmissionAttemptCapture = {};
+  const fetch = createAdmissionCaptureFetch(
+    capture,
+    async () =>
+      new Response(JSON.stringify({ ...SAFE_CAPTURE, type: "inferweave_backpressure" }), {
+        status: 503,
+        headers: { "content-type": "application/json" },
+      }),
+  );
+  const response = await fetch("https://example.invalid", {});
+  assert.equal(capture.admission?.type, "inferweave_backpressure");
+  assert.equal(response.headers.get("x-should-retry"), "false");
+});
+
+const SAFE_CAPTURE = {
+  reason: "NO_CONTEXT_CAPACITY",
+  retryable: true,
+  replay_safe: true,
+  request_state: "queued",
+  action: "backoff",
+  action_code: "IW-ACT-BACKOFF",
+};
 
 /**
  * Deterministic clock + interruptible sleep for the state machine.
@@ -218,6 +243,74 @@ test("admission contract: a single 429 then success succeeds after one wait", as
   assert.ok(names.includes("inference.retry.succeeded"));
 });
 
+test("new-contract explicit false augments a generic provider error with final guidance", async () => {
+  const finalText = "provider request failed";
+  const { stream, clock } = runTransport({
+    rejections: 0,
+    invoke: (_attempt, _options, capture) => {
+      capture.admission = {
+        type: "inferweave_backpressure",
+        reason: "internal_error",
+        code: "FINAL-CODE",
+        message: "final server message",
+        retryable: false,
+        replaySafe: false,
+        requestState: "dispatched",
+        action: "do_not_retry",
+        actionCode: "IW-ACT-DO-NOT-RETRY",
+        explicitReplayContract: true,
+        payload: {},
+      } satisfies AdmissionInfo;
+      return errorStream(finalText);
+    },
+  });
+  const { terminal } = await collect(stream);
+  assert.equal(clock.waits.length, 0);
+  assert.match((terminal as { error?: { errorMessage?: string } }).error?.errorMessage ?? "", /final server message/);
+  assert.match((terminal as { error?: { errorMessage?: string } }).error?.errorMessage ?? "", /FINAL-CODE/);
+  assert.match((terminal as { error?: { errorMessage?: string } }).error?.errorMessage ?? "", /IW-ACT-DO-NOT-RETRY/);
+});
+
+test("committed output augments its terminal provider error with captured guidance", async () => {
+  const clock = new FakeClock();
+  const stream = executeWithAdmissionRetry(
+    model(),
+    context() as never,
+    {} as never,
+    (_attempt, _options, capture) => {
+      capture.admission = {
+        type: "inferweave_backpressure",
+        reason: "internal_error",
+        code: "COMMITTED-CODE",
+        message: "do not replay committed output",
+        retryable: true,
+        replaySafe: true,
+        requestState: "queued",
+        action: "backoff",
+        actionCode: "IW-ACT-BACKOFF",
+        explicitReplayContract: true,
+        payload: {},
+      };
+      const s = createAssistantMessageEventStream();
+      s.push({ type: "text_delta", contentIndex: 0, delta: "partial", partial: {} as never });
+      s.push({
+        type: "error",
+        reason: "error",
+        error: terminalAssistantMessage(model(), "provider request failed", "error"),
+      });
+      s.end();
+      return s;
+    },
+    { config: CONFIG, now: clock.now.bind(clock), sleep: clock.sleep.bind(clock), random: () => 0 },
+  );
+
+  const { terminal } = await collect(stream);
+  const message = (terminal as { error?: { errorMessage?: string } }).error?.errorMessage ?? "";
+  assert.match(message, /do not replay committed output/);
+  assert.match(message, /COMMITTED-CODE/);
+  assert.match(message, /IW-ACT-BACKOFF/);
+});
+
 test("acceptance: four 30s queue_timeout waits then a successful stream", async () => {
   // Subscribe before the transport starts (it publishes attempt-1 `started`
   // synchronously while constructing), so every attempt is observed.
@@ -254,6 +347,51 @@ test("honors retry-after precedence: retry-after-ms header beats body retry_afte
   const { terminal } = await collect(stream);
   assert.equal(terminal.type, "done");
   assert.equal(clock.waits[0]!.ms, 30_000);
+});
+
+test("an injected monotonic clock does not replace wall time for HTTP-date retry-after", async () => {
+  const originalDateNow = Date.now;
+  const epoch = Date.parse("2026-09-23T12:00:00Z");
+  let monotonic = 100;
+  let calls = 0;
+  const waits: number[] = [];
+  try {
+    Date.now = () => epoch;
+    const stream = executeWithAdmissionRetry(
+      model(),
+      context() as never,
+      {} as never,
+      (attempt, _options, capture) => {
+        calls++;
+        if (attempt === 1) {
+          capture.admission = {
+            reason: "queue_timeout",
+            payload: { type: "inference_admission", reason: "queue_timeout" },
+          };
+          capture.status = 429;
+          capture.headers = { "retry-after": "Wed, 23 Sep 2026 12:00:30 GMT" };
+          return errorStream();
+        }
+        return successStream();
+      },
+      {
+        config: normalizeAdmissionConfig({ max_elapsed_ms: 60_000, jitter_ratio: 0 }),
+        now: () => monotonic,
+        sleep: async (ms) => {
+          waits.push(ms);
+          monotonic += ms;
+        },
+        random: () => 0,
+      },
+    );
+
+    const { terminal } = await collect(stream);
+    assert.equal(terminal.type, "done");
+    assert.equal(calls, 2);
+    assert.deepEqual(waits, [30_000]);
+  } finally {
+    Date.now = originalDateNow;
+  }
 });
 
 test("max attempts: a persistent rejection exhausts the attempt budget", async () => {
@@ -306,6 +444,103 @@ test("max elapsed: a rejection beyond the elapsed budget fails without over-wait
   assert.equal(exhausted.terminatedBy, "budget_elapsed");
   // No wait longer than the remaining budget was performed.
   assert.ok(clock.waits.every((w) => w.ms <= 30_000));
+});
+
+test("sleep jitter overrun is rechecked before the next structured request", async () => {
+  let now = 0;
+  let calls = 0;
+  const config = normalizeAdmissionConfig({ max_attempts: 10, max_elapsed_ms: 1_000, jitter_ratio: 0 });
+  const stream = executeWithAdmissionRetry(
+    model(),
+    context() as never,
+    {} as never,
+    (_attempt, _options, capture) => {
+      calls++;
+      capture.admission = admissionInfo("queue_timeout", 500);
+      return errorStream("retained server failure");
+    },
+    {
+      config,
+      now: () => now,
+      sleep: async () => {
+        now = 1_001;
+      },
+      random: () => 0,
+    },
+  );
+
+  const { terminal } = await collect(stream);
+  assert.equal(calls, 1, "elapsed time must be rechecked immediately before replay");
+  assert.match((terminal as { error?: { errorMessage?: string } }).error?.errorMessage ?? "", /queue_timeout/);
+});
+
+test("a synchronous retry-state hook cannot advance past budget before invoke", async () => {
+  let now = 0;
+  let calls = 0;
+  const config = normalizeAdmissionConfig({ max_attempts: 10, max_elapsed_ms: 1_000, jitter_ratio: 0 });
+  const stream = executeWithAdmissionRetry(
+    model(),
+    context() as never,
+    {} as never,
+    (_attempt, _options, capture) => {
+      calls++;
+      capture.admission = {
+        ...admissionInfo("queue_timeout", 500),
+        code: "RETAINED-CODE",
+        message: "retained structured failure",
+        actionCode: "IW-ACT-BACKOFF",
+      };
+      return errorStream("generic provider failure");
+    },
+    {
+      config,
+      now: () => now,
+      sleep: async (ms) => {
+        now += ms;
+      },
+      random: () => 0,
+      onState: (state) => {
+        if (state.phase === "RETRYING") now = 1_001;
+      },
+    },
+  );
+
+  const { terminal } = await collect(stream);
+  assert.equal(calls, 1, "the elapsed guard must run after synchronous retry hooks and before invoke");
+  const message = (terminal as { error?: { errorMessage?: string } }).error?.errorMessage ?? "";
+  assert.match(message, /retained structured failure/);
+  assert.match(message, /RETAINED-CODE/);
+  assert.match(message, /IW-ACT-BACKOFF/);
+});
+
+test("the structured transport elapsed budget ignores wall-clock jumps by default", async () => {
+  const originalDateNow = Date.now;
+  let calls = 0;
+  let wallNow = 0;
+  try {
+    Date.now = () => wallNow;
+    const config = normalizeAdmissionConfig({ max_attempts: 2, max_elapsed_ms: 10_000, jitter_ratio: 0 });
+    const stream = executeWithAdmissionRetry(
+      model(),
+      context() as never,
+      {} as never,
+      (attempt, _options, capture) => {
+        calls++;
+        if (attempt === 1) {
+          capture.admission = admissionInfo("queue_timeout", 500);
+          wallNow = 1_000_000;
+          return errorStream();
+        }
+        return successStream();
+      },
+      { config, sleep: async () => {}, random: () => 0 },
+    );
+    const { terminal } = await collect(stream);
+    assert.equal(terminal.type, "done");
+    assert.equal(calls, 2);
+  } finally {
+    Date.now = originalDateNow;
+  }
 });
 
 test("cancellation during a wait is immediate and not reported as an InferWeave failure", async () => {

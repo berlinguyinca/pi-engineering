@@ -28,6 +28,7 @@ import type {
   Model,
   SimpleStreamOptions,
 } from "@earendil-works/pi-ai/compat";
+import { monotonicNow } from "../core/clock.ts";
 // The pi-ai `utils/event-stream` subpath does not resolve under Pi's resource
 // loader (it resolves the package main then appends the subpath, yielding
 // `dist/compat.js/utils/event-stream`). `@earendil-works/pi-ai/compat` exports
@@ -75,18 +76,26 @@ function createAssistantMessageEventStream(): AssistantMessageEventStream {
   };
   return stream as unknown as AssistantMessageEventStream;
 }
-import { type AdmissionRetryConfig, decideAdmission, resolveAdmissionScope } from "./admissionConfig.ts";
+import {
+  type AdmissionDecision,
+  type AdmissionRetryConfig,
+  decideAdmission,
+  resolveAdmissionScope,
+} from "./admissionConfig.ts";
 import {
   type AdmissionAction,
   AdmissionFailure,
   type AdmissionHeaders,
   type AdmissionInfo,
+  DEFAULT_ADMISSION_REASON_POLICY,
   admissionFromResponse,
+  augmentInferenceErrorMessage,
+  isAutomaticReplayAllowed,
   mayCarryAdmission,
   serverRequestIdFromHeaders,
 } from "./admissionContract.ts";
 import type { AdmissionEvent, AdmissionEventBus, AdmissionEventName } from "./admissionEvents.ts";
-import { type RetryDelaySource, resolveRetryDelay } from "./retryDelay.ts";
+import { type RetryDelaySource, decideWait, resolveRetryDelay } from "./retryDelay.ts";
 
 /** One provider attempt: the shape of pi-ai's `streamSimple`. */
 export type AdmissionStreamFunction = (
@@ -139,7 +148,7 @@ export interface AdmissionState {
   maxAttempts: number;
   /** Cumulative time already waited for this logical operation. */
   waitedMs: number;
-  /** Wall-clock time since the operation started. */
+  /** Monotonic time since the operation started. */
   elapsedMs: number;
   reason?: string;
   httpStatus?: number;
@@ -163,7 +172,7 @@ export interface AdmissionTransportOptions {
   events?: AdmissionEventBus;
   /** Attempt implementation. Defaults to the pi-ai implementation for `model.api`. */
   delegate?: AdmissionStreamFunction;
-  /** Clock (epoch ms). Injectable for deterministic tests. */
+  /** Monotonic duration clock. Injectable for deterministic tests. */
   now?: () => number;
   /** Interruptible sleep. Injectable for deterministic tests. */
   sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
@@ -453,7 +462,8 @@ export function executeWithAdmissionRetry(
   opts: AdmissionTransportOptions,
 ): AssistantMessageEventStream {
   const out = createAssistantMessageEventStream();
-  const now = opts.now ?? Date.now;
+  const now = opts.now ?? monotonicNow;
+  const wallNow = Date.now;
   const sleep = opts.sleep ?? abortableSleep;
   const random = opts.random ?? Math.random;
   const config = resolveAdmissionScope(opts.config, model.provider, model.id);
@@ -473,6 +483,7 @@ export function executeWithAdmissionRetry(
   let lastDelayMs = 0;
   let lastDelaySource: RetryDelaySource | undefined;
   let lastDecision: AdmissionAction | undefined;
+  let lastPolicy: AdmissionDecision | undefined;
 
   const scopeOf = (): AdmissionScope => (typeof scopeConfig === "function" ? scopeConfig(sessionIdOf()) : scopeConfig);
 
@@ -555,15 +566,26 @@ export function executeWithAdmissionRetry(
         const admission = attemptCapture.admission;
         // Withhold only an unambiguous, structured admission rejection that has
         // produced no output yet: replaying after output would duplicate it.
-        if (admission !== undefined && !committed && !config.observe_only && event.reason !== "aborted") {
+        if (
+          admission !== undefined &&
+          (isAutomaticReplayAllowed(admission, committed) ||
+            (!committed &&
+              admission.explicitReplayContract !== true &&
+              ["fail", "fallback"].includes(DEFAULT_ADMISSION_REASON_POLICY[admission.reason]?.action ?? ""))) &&
+          !config.observe_only &&
+          event.reason !== "aborted"
+        ) {
           last = admission;
           lastStatus = attemptCapture.status ?? lastStatus;
           return { terminal: "error", withheld: true, forwarded: false, committed, aborted: false };
         }
         // Forwarded (non-withheld) error: end `out` so the consumer's iteration
         // and `result()` resolve instead of hanging (mirrors the done case).
-        out.push(event);
-        out.end(event.error);
+        const terminal = admission
+          ? { ...event.error, errorMessage: augmentInferenceErrorMessage(event.error.errorMessage, admission) }
+          : event.error;
+        out.push({ ...event, error: terminal });
+        out.end(terminal);
         return {
           terminal: "error",
           withheld: false,
@@ -594,7 +616,7 @@ export function executeWithAdmissionRetry(
       reason: admission.reason,
       action: lastDecision ?? "retry",
       attempts: attempt,
-      elapsedMs: waitedMs,
+      elapsedMs: now() - startedAt,
       lastDelayMs: lastDelayMs > 0 ? lastDelayMs : undefined,
       serverRequestId: admission.requestId,
       terminatedBy:
@@ -607,6 +629,8 @@ export function executeWithAdmissionRetry(
               : undefined,
       fallbackAttempted: usesFallback,
       serverMessage: admission.message,
+      code: admission.code,
+      actionCode: admission.actionCode,
     });
     if (usesFallback) {
       publish("inference.fallback.triggered", { terminatedBy: reason });
@@ -665,6 +689,29 @@ export function executeWithAdmissionRetry(
         model: model.id,
       });
 
+      // Synchronous state/event/log hooks above may consume the last sliver of
+      // the elapsed budget. Guard at the actual replay boundary, immediately
+      // before opening the next provider request, and retain the last refusal.
+      if (attempt > 1 && lastPolicy) {
+        const preInvokeReason = evaluateTerminal({
+          decision: lastPolicy.action,
+          fallbackAfterMs: lastPolicy.fallbackAfterMs,
+          reasonBudgetMs: lastPolicy.maxElapsedMs,
+          waitedMs,
+          elapsedMs: now() - startedAt,
+          attempt: attempt - 1,
+          maxAttempts: config.max_attempts,
+          ledger: ledgerActive ? opts.budget : undefined,
+          budgetKey,
+          windowMs: ledgerWindowMs,
+          sharedBudgetMs: config.shared_budget_ms,
+        });
+        if (preInvokeReason) {
+          failAdmission(preInvokeReason);
+          return;
+        }
+      }
+
       let outcome: AttemptOutcome;
       try {
         outcome = await consumeAttempt(invoke(attempt, attemptOptions, capture), capture);
@@ -715,8 +762,10 @@ export function executeWithAdmissionRetry(
         reason: admission.reason,
         status: lastStatus,
         serverDelayMs: admission.retryAfterMs,
+        explicitReplayContract: admission.explicitReplayContract,
       });
       lastDecision = decision.action;
+      lastPolicy = decision;
 
       if (options?.signal?.aborted) {
         cancelWait("aborted_before_wait");
@@ -728,6 +777,7 @@ export function executeWithAdmissionRetry(
         fallbackAfterMs: decision.fallbackAfterMs,
         reasonBudgetMs: decision.maxElapsedMs,
         waitedMs,
+        elapsedMs: now() - startedAt,
         attempt,
         maxAttempts: config.max_attempts,
         ledger: ledgerActive ? opts.budget : undefined,
@@ -752,12 +802,21 @@ export function executeWithAdmissionRetry(
           jitterRatio: config.jitter_ratio,
           honorRetryAfter: config.honor_retry_after,
         },
-        nowMs: now(),
+        nowMs: wallNow(),
         random,
       });
-      // Never wait past the reason budget: clip the last wait instead of
-      // overshooting it and only reporting the overrun afterwards.
-      const waitMs = Math.min(delay.delayMs, Math.max(0, decision.maxElapsedMs - waitedMs));
+      const waitDecision = decideWait({
+        serverMinimumMs: delay.serverDelayMs,
+        proposedMs: delay.delayMs,
+        remainingMs: Math.max(0, decision.maxElapsedMs - (now() - startedAt)),
+      });
+      if (waitDecision.action === "stop") {
+        lastDelayMs = delay.delayMs;
+        lastDelaySource = delay.source;
+        failAdmission("budget_elapsed");
+        return;
+      }
+      const waitMs = waitDecision.waitMs;
       lastDelayMs = waitMs;
       lastDelaySource = delay.source;
       if (waitMs <= 0) {
@@ -765,7 +824,7 @@ export function executeWithAdmissionRetry(
         return;
       }
 
-      const waitUntilMs = now() + waitMs;
+      const waitUntilMs = wallNow() + waitMs;
       publish("inference.retry.scheduled", {
         delayUsedMs: waitMs,
         retryAfterMs: admission.retryAfterMs,
@@ -805,6 +864,23 @@ export function executeWithAdmissionRetry(
         cancelWait("cancelled_after_wait");
         return;
       }
+      const postWaitReason = evaluateTerminal({
+        decision: decision.action,
+        fallbackAfterMs: decision.fallbackAfterMs,
+        reasonBudgetMs: decision.maxElapsedMs,
+        waitedMs,
+        elapsedMs: now() - startedAt,
+        attempt,
+        maxAttempts: config.max_attempts,
+        ledger: ledgerActive ? opts.budget : undefined,
+        budgetKey,
+        windowMs: ledgerWindowMs,
+        sharedBudgetMs: config.shared_budget_ms,
+      });
+      if (postWaitReason) {
+        failAdmission(postWaitReason);
+        return;
+      }
     }
   };
 
@@ -825,6 +901,7 @@ export function evaluateTerminal(input: {
   fallbackAfterMs?: number;
   reasonBudgetMs: number;
   waitedMs: number;
+  elapsedMs?: number;
   attempt: number;
   maxAttempts: number;
   ledger?: AdmissionBudgetLedger;
@@ -834,9 +911,11 @@ export function evaluateTerminal(input: {
 }): TerminalReason | undefined {
   if (input.decision === "fail") return "permanent";
   if (input.decision === "fallback") return "fallback";
-  if (input.decision === "retry_then_fallback" && input.waitedMs >= (input.fallbackAfterMs ?? input.reasonBudgetMs)) {
+  const elapsedMs = input.elapsedMs ?? input.waitedMs;
+  if (input.decision === "retry_then_fallback" && elapsedMs >= (input.fallbackAfterMs ?? input.reasonBudgetMs)) {
     return "fallback";
   }
+  if (elapsedMs >= input.reasonBudgetMs) return "budget_elapsed";
   if (input.ledger?.isExhausted(input.budgetKey, input.windowMs)) return "budget_ledger";
   if (input.ledger?.overSharedBudget(input.budgetKey, input.windowMs, input.sharedBudgetMs)) return "budget_ledger";
   if (input.attempt >= input.maxAttempts) return "budget_attempts";

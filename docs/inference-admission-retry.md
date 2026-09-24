@@ -1,7 +1,8 @@
 # InferWeave Admission Retry
 
 The Pi Engineering Harness converts InferWeave admission-control rejections
-(`429`/`503` with a structured `type: "inference_admission"` body) from terminal
+(`4xx`/`5xx` with a structured `type: "inference_admission"` or
+`"inferweave_backpressure"` body) from terminal
 inference failures into scheduler-directed wait/retry states. The agent stays
 alive while the gateway is busy, waits are abortable, and the UI shows a
 waiting-for-capacity state instead of repeated `Error: 429` lines.
@@ -69,9 +70,14 @@ them into an `APIError`.
 
 ## Admission classification
 
-A response is an admission response **only** when its JSON body carries
-`type: "inference_admission"` (optionally nested under `error`, `detail`, or
-`detail.error`). A bare `429` from a non-InferWeave provider is left untouched.
+A response is normalized from a supported type tag at the top level or under
+`error`, `detail`, or `detail.error`. New-contract replay requires explicit true
+retryable and replay-safe flags, `not_started`/`queued`, a permitted frozen
+action code, no committed output, and remaining finite attempt and elapsed
+budgets. Explicit false and unknown actions are terminal. Legacy envelopes
+without these fields keep conservative compatibility heuristics, except
+permanent quota, authentication, authorization, and malformed-request reasons,
+which are never replayed.
 
 ### Reason taxonomy
 
@@ -83,18 +89,25 @@ A response is an admission response **only** when its JSON body carries
 | `auth_failed`, `forbidden`, `malformed_request` | `fail` (permanent) |
 | *unknown* | `retry_if_server_delay_present` (60s budget) |
 
-The **HTTP status outranks the reason token**: `400/401/403/404/422` always
+The **HTTP status outranks the reason token**: `400/401/403/404/409/413/422` always
 `fail`, whatever the gateway labelled it.
 
-### Retry timing precedence
+### Retry timing
 
-1. `retry-after-ms` header
-2. `Retry-After` header (delta-seconds, then HTTP date)
-3. body `retry_after_ms`
-4. local exponential backoff (`base_backoff_ms * 2^(attempt-1)`, capped)
+All valid `retry-after-ms`, `Retry-After`, and body `retry_after_ms` hints are
+considered; the largest is the server minimum. Local exponential backoff is
+used only when no valid server hint exists.
 
-Server-directed delays outside `[min_delay_ms, max_delay_ms]` are clamped, and
-jitter is **positive-only** so a server wait is never shortened.
+Server minima are never clamped downward. Jitter is **positive-only** and must
+fit the remaining elapsed budget; otherwise the retry chain stops and preserves
+the final server message/code.
+
+The interactive wrapper defaults to 8 attempts and 300000 ms elapsed. Duration
+budgets and cooldowns use a monotonic clock; wall time is used only to interpret
+HTTP-date retry headers and render countdown deadlines. The duration clock is
+injectable for deterministic tests. Model-scoped cooldowns are keyed
+by provider/model and do not pause unrelated models; absent scope retains the
+legacy process-wide hold.
 
 ### Response-header recommendation
 
@@ -124,7 +137,7 @@ Top-level YAML in the engineering policy under `inference.retry.admission`
 | `enabled` | `true` | Master switch. |
 | `observe_only` | `false` | Parse + emit events, never wait or change control flow. |
 | `max_attempts` | `50` | Attempt cap for one logical inference. |
-| `max_elapsed_ms` | `900000` | Cumulative *waited* budget (not wall clock). |
+| `max_elapsed_ms` | `900000` | Monotonic wall-clock budget for one logical inference. |
 | `min_delay_ms` / `max_delay_ms` | `500` / `120000` | Delay bounds (ms). |
 | `base_backoff_ms` / `max_backoff_ms` | `2000` / `120000` | Backoff (ms). |
 | `jitter_ratio` | `0.1` | Positive jitter fraction. |
@@ -175,23 +188,24 @@ cumulative wait, ending with *"Waiting for inference capacity... [Esc to cancel]
 
 ## Tests
 
-`test/unit/inference-admission-transport.test.ts` is the surviving admission
-suite on `main` (a deterministic fake-clock state machine):
+`test/unit/inference-admission-transport.test.ts` provides the deterministic
+fake-clock state-machine coverage:
 
 - single 429 then success (honors a 30s wait);
 - acceptance: four 30s `queue_timeout` waits then a successful stream (agent
   alive through all waits);
 - retry-after precedence and delay resolution;
-- attempt and elapsed budgets (`budget_attempts` / `budget_elapsed`), clipping;
+- attempt and elapsed budgets (`budget_attempts` / `budget_elapsed`), stopping
+  rather than shortening a server minimum;
 - immediate cancellation (mid-wait and pre-aborted), never reported as an
   InferWeave failure;
 - quota→fallback (no wait); 401/403 never waited; unknown reasons;
 - stream replay safety; `observe_only`; shared-budget ledger; metrics fields.
 
-Additional unit suites (contract parsing, delay precedence, policy/config,
-status UI) and the `node:http` fake-InferWeave integration test were authored
-but were dropped during the merge of the feature branch into `main`; the
-behaviour they covered is exercised through the transport suite above.
+The checked-in parser, delay, policy/config, gateway controller, interactive
+stream retry, installer, and status suites cover both retry paths. Integration
+coverage includes the real provider registry, extension event wiring, and the
+`node:http` fake-InferWeave endpoint.
 
 ## Troubleshooting
 
@@ -199,7 +213,7 @@ behaviour they covered is exercised through the transport suite above.
   cancellation. It is never silently skipped.
 - **`quota_exhausted` still fails.** That is by design: quota is a permanent
   condition, so it goes to fallback/terminal, never a wait.
-- **Auth failures loop.** They don't: `400/401/403/404/422` always `fail`
+- **Permanent failures loop.** They don't: `400/401/403/404/409/413/422` always `fail`
   immediately.
 - **A wait ran long.** `max_elapsed_ms` and `max_attempts` bound a single
   logical operation; `shared_budget_ms` bounds it across re-entrant operations

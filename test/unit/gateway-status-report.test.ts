@@ -87,9 +87,21 @@ test("gateway report: a synthesized wait is distinguished from an advertised one
   assert.match(out, /no wait advertised — using 5s/, "the operator should know when the number is ours, not theirs");
 });
 
+test("gateway report: Retry-After headers are described as advertised", () => {
+  const out = renderGatewayReport({
+    status: status({
+      lastSignal: { retryAfterMs: 8_000, retryable: true, source: "header", status: 503 },
+    }),
+    config: CONFIG,
+    installs: [],
+  }).join("\n");
+  assert.match(out, /asked for 8s/);
+  assert.doesNotMatch(out, /no wait advertised/);
+});
+
 test("gateway report: a session without the wrapper is warned, not reassured", () => {
   const out = renderGatewayReport({ status: status(), config: CONFIG, installs: [] }).join("\n");
-  assert.match(out, /NOT installed — this turn still stops at Pi's own retry budget/);
+  assert.match(out, /Admission retry NOT installed — this turn uses Pi's own retry budget/);
 });
 
 test("gateway report: installed providers are listed", () => {
@@ -98,7 +110,7 @@ test("gateway report: installed providers are listed", () => {
     config: CONFIG,
     installs: ["metabolomics:openai-completions"],
   }).join("\n");
-  assert.match(out, /Unbounded waiting installed for: metabolomics:openai-completions/);
+  assert.match(out, /Bounded admission retry installed for: metabolomics:openai-completions/);
 });
 
 test("gateway report: context usage is shown, and an unknown count says so", () => {
@@ -117,9 +129,9 @@ test("gateway report: context usage is shown, and an unknown count says so", () 
   assert.match(unknown.join("\n"), /context unknown of 1048576/);
 });
 
-test("gateway report: unlimited policy reads as unlimited, not Infinity", () => {
+test("gateway report: legacy infinite overrides read as unlimited, not Infinity", () => {
   const out = renderGatewayReport({ status: status(), config: CONFIG, installs: [] }).join("\n");
-  assert.match(out, /wait cap unlimited, retry cap unlimited/);
+  assert.match(out, /retry cap unlimited, elapsed cap default/);
   assert.doesNotMatch(out, /Infinity/);
 });
 

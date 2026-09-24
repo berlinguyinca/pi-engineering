@@ -110,6 +110,36 @@ test("quota and billing exhaustion is reported as NON-retryable", () => {
   }
 });
 
+test("legacy permanent admission reasons are non-retryable raw or nested", () => {
+  for (const reason of ["quota_exhausted", "auth_failed", "forbidden", "malformed_request"]) {
+    for (const body of [
+      { type: "inference_admission", reason },
+      { detail: { error: { type: "inference_admission", reason } } },
+    ]) {
+      const signal = parseGatewayWait({ status: 429, text: JSON.stringify(body) });
+      assert.ok(signal);
+      assert.equal(signal.retryable, false, `${reason}: ${JSON.stringify(body)}`);
+    }
+  }
+});
+
+test("409 and 413 remain non-retryable even with explicit safe replay flags", () => {
+  const body = JSON.stringify({
+    type: "inferweave_backpressure",
+    reason: "queue_timeout",
+    retryable: true,
+    replay_safe: true,
+    request_state: "queued",
+    action: "backoff",
+    action_code: "IW-ACT-BACKOFF",
+  });
+  for (const status of [409, 413]) {
+    const signal = parseGatewayWait({ status, text: body });
+    assert.ok(signal);
+    assert.equal(signal.retryable, false, `status ${status}`);
+  }
+});
+
 test("ordinary errors are not mistaken for backpressure", () => {
   assert.equal(parseGatewayWait({ text: "400: invalid request: unknown tool" }), null);
   assert.equal(parseGatewayWait({ text: "context window exceeded" }), null);
@@ -122,6 +152,17 @@ test("malformed payloads degrade instead of throwing", () => {
   assert.ok(signal);
   assert.equal(signal.status, 429);
   assert.equal(signal.source, "default");
+});
+
+test("a malformed new-contract marker is terminal instead of using legacy retry heuristics", () => {
+  const signal = parseGatewayWait({
+    text: '503: {"type":"inferweave_backpressure","retryable":tru',
+    headers: { "retry-after": "8" },
+  });
+  assert.ok(signal);
+  assert.equal(signal.type, "inferweave_backpressure");
+  assert.equal(signal.retryable, false);
+  assert.equal(signal.retryAfterMs, 8_000);
 });
 
 test("a retry_after_ms reported as a string is honoured", () => {
@@ -183,11 +224,11 @@ test("a longer cooldown is never shortened by a later, smaller wait", () => {
   assert.equal(controller.cooldownRemainingMs(), 30_000);
 });
 
-test("a single wait is capped so a bad payload cannot park the runtime", () => {
+test("a server minimum is never shortened by the local wait setting", () => {
   const { controller } = testController({ maxWaitMs: 5_000 });
   const armed = controller.noteWait({ retryAfterMs: 86_400_000, retryable: true, source: "body" });
-  assert.equal(armed, 5_000);
-  assert.equal(controller.cooldownRemainingMs(), 5_000);
+  assert.equal(armed, 86_400_000);
+  assert.equal(controller.cooldownRemainingMs(), 86_400_000);
 });
 
 test("the interactive reserve applies from the start, before any gateway pushback", () => {
@@ -371,18 +412,66 @@ test("a throwing subscriber cannot break admission control", () => {
   assert.equal(controller.cooldownRemainingMs(), 5_000);
 });
 
-// ─── Unbounded waiting (operator policy: wait, never fail on saturation) ─────
+test("the default controller clock is monotonic when wall time moves backward", () => {
+  const originalDateNow = Date.now;
+  try {
+    Date.now = () => 100_000;
+    const controller = new AdmissionController({ maxConcurrency: 1, jitterMs: 0 });
+    controller.noteWait({ retryAfterMs: 1_000, retryable: true, source: "body" });
+    Date.now = () => 0;
+    assert.ok(controller.cooldownRemainingMs() <= 1_000, "a wall-clock rollback must not lengthen the cooldown");
+  } finally {
+    Date.now = originalDateNow;
+  }
+});
 
-test("the default retry budget is unlimited: saturation is waited out, not failed", () => {
+// ─── Finite waiting without shortening a server minimum ─────────────────────
+
+test("the default retry and elapsed budgets are finite", () => {
   const saved = { ...process.env };
   try {
     for (const key of Object.keys(process.env)) if (key.startsWith("PI_GATEWAY_")) delete process.env[key];
     const cfg = resolveGatewayConfig();
-    assert.equal(cfg.maxRetries, Number.POSITIVE_INFINITY, "a 429 must never exhaust a worker's budget");
-    assert.equal(cfg.maxWaitMs, Number.POSITIVE_INFINITY, "a capped wait manufactures the next 429");
+    assert.ok(Number.isFinite(cfg.maxRetries));
+    assert.ok(cfg.maxRetries > 0);
+    assert.ok(Number.isFinite(cfg.maxElapsedMs));
+    assert.ok(cfg.maxElapsedMs > 0);
   } finally {
     process.env = saved;
   }
+});
+
+test("model-scoped cooldown does not pause another model", async () => {
+  let now = 1_000;
+  const slept: number[] = [];
+  const controller = new AdmissionController({
+    maxConcurrency: 4,
+    jitterMs: 0,
+    now: () => now,
+    sleep: async (ms) => {
+      slept.push(ms);
+      now += ms;
+    },
+  });
+  controller.noteWait({
+    retryAfterMs: 5_000,
+    retryable: true,
+    source: "body",
+    scope: "model",
+    provider: "acme",
+    model: "busy",
+  });
+  assert.equal(controller.cooldownRemainingMs({ provider: "acme", model: "other" }), 0);
+  assert.equal(controller.cooldownRemainingMs({ provider: "acme", model: "busy" }), 5_000);
+  await controller.awaitCooldown({ provider: "acme", model: "other" });
+  assert.deepEqual(slept, []);
+  assert.equal(controller.status().concurrency, 4, "a model-scoped refusal must not clamp unrelated models");
+});
+
+test("programmatic non-finite gateway budgets normalize back to finite defaults", () => {
+  const cfg = resolveGatewayConfig({ maxRetries: Number.POSITIVE_INFINITY, maxElapsedMs: Number.POSITIVE_INFINITY });
+  assert.ok(Number.isFinite(cfg.maxRetries));
+  assert.ok(Number.isFinite(cfg.maxElapsedMs));
 });
 
 test("an unlimited budget never gives up, however many waits have been spent", () => {
@@ -396,6 +485,17 @@ test("an explicit budget of zero still means zero (no sentinel collision with un
     process.env.PI_GATEWAY_MAX_RETRIES = "0";
     assert.equal(resolveGatewayConfig().maxRetries, 0);
     assert.equal(decideGatewayRetry(PRODUCTION_429, 0, 0).action, "give-up");
+  } finally {
+    process.env = saved;
+  }
+});
+
+test("an explicit elapsed budget of zero survives environment and programmatic configuration", () => {
+  const saved = { ...process.env };
+  try {
+    process.env.PI_GATEWAY_MAX_ELAPSED_MS = "0";
+    assert.equal(resolveGatewayConfig().maxElapsedMs, 0);
+    assert.equal(resolveGatewayConfig({ maxElapsedMs: 0 }).maxElapsedMs, 0);
   } finally {
     process.env = saved;
   }

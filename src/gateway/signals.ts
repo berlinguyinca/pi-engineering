@@ -17,8 +17,12 @@
  */
 
 /** A gateway telling us to wait (or to stop). */
-import { parseAdmissionPayload } from "../inference/admissionContract.ts";
-import { parseRetryAfterHeader } from "../inference/retryDelay.ts";
+import {
+  PERMANENT_ADMISSION_STATUSES,
+  isAutomaticReplayAllowed,
+  parseAdmissionPayload,
+} from "../inference/admissionContract.ts";
+import { parseRetryAfterHeader, parseRetryAfterMsHeader } from "../inference/retryDelay.ts";
 
 // Re-export the shared Retry-After parser so existing gateway callers keep a
 // single import surface; the canonical implementation lives in retryDelay.ts.
@@ -46,6 +50,13 @@ export interface GatewayWaitSignal {
   requestId?: string;
   /** The gateway's human-readable message, when present. */
   message?: string;
+  code?: string;
+  action?: string;
+  actionCode?: string;
+  replaySafe?: boolean;
+  requestState?: "not_started" | "queued" | "dispatched" | "streaming" | "unknown";
+  provider?: string;
+  model?: string;
 }
 
 /** Statuses that mean "the gateway is saturated, come back later". */
@@ -142,9 +153,12 @@ export function parseGatewayWait(input: GatewayWaitInput): GatewayWaitSignal | n
   // transport layer (type-tag gated). When the body is not an admission
   // envelope this is undefined and we fall back to the gateway heuristics.
   const admission = body ? parseAdmissionPayload(body) : undefined;
+  const malformedNewContract = admission === undefined && text.includes("inferweave_backpressure");
 
   const status = input.status ?? leadingStatus(text) ?? num(body?.status);
-  const type = admission ? str(admission.payload.type) : str(body?.type);
+  const type = admission
+    ? str(admission.payload.type)
+    : (str(body?.type) ?? (malformedNewContract ? "inferweave_backpressure" : undefined));
   const reason = admission ? admission.reason : str(body?.reason);
   const isAdmission = admission !== undefined || type === "inference_admission" || reason === "queue_timeout";
   const looksRateLimited =
@@ -154,7 +168,14 @@ export function parseGatewayWait(input: GatewayWaitInput): GatewayWaitSignal | n
 
   // Quota/billing exhaustion is deterministic: waiting never clears it, and Pi's
   // own retry classifier fails fast there for the same reason.
-  const retryable = !NON_RETRYABLE_PATTERNS.test(text);
+  const retryable =
+    status !== undefined && PERMANENT_ADMISSION_STATUSES.includes(status)
+      ? false
+      : malformedNewContract
+        ? false
+        : admission
+          ? isAutomaticReplayAllowed(admission, false)
+          : !NON_RETRYABLE_PATTERNS.test(text);
 
   const bodyWaitMs =
     admission?.retryAfterMs ??
@@ -162,24 +183,25 @@ export function parseGatewayWait(input: GatewayWaitInput): GatewayWaitSignal | n
     num(body?.retryAfterMs) ??
     num((body as Record<string, unknown> | undefined)?.["retry-after-ms"]);
   const bodyWaitSeconds = num(body?.retry_after) ?? num(body?.retryAfter);
-  const headerWaitMs =
-    parseRetryAfterHeader(header(input.headers, "retry-after"), nowMs) ??
-    (() => {
-      const ms = num(header(input.headers, "retry-after-ms"));
-      return ms === undefined ? undefined : Math.max(0, Math.round(ms));
-    })();
+  const retryAfter = parseRetryAfterHeader(header(input.headers, "retry-after"), nowMs);
+  const retryAfterMsHeader = parseRetryAfterMsHeader(header(input.headers, "retry-after-ms"));
+  const headerWaitMs = [retryAfter, retryAfterMsHeader]
+    .filter((value): value is number => value !== undefined)
+    .reduce((maximum, value) => Math.max(maximum, value), -1);
+  const validHeaderWaitMs = headerWaitMs >= 0 ? headerWaitMs : undefined;
 
   let retryAfterMs: number;
   let source: GatewayWaitSignal["source"];
-  if (bodyWaitMs !== undefined) {
-    retryAfterMs = Math.max(0, Math.round(bodyWaitMs));
-    source = "body";
-  } else if (bodyWaitSeconds !== undefined) {
-    retryAfterMs = Math.max(0, Math.round(bodyWaitSeconds * 1000));
-    source = "body";
-  } else if (headerWaitMs !== undefined) {
-    retryAfterMs = headerWaitMs;
-    source = "header";
+  const normalizedBodyMs = bodyWaitMs !== undefined ? Math.max(0, Math.round(bodyWaitMs)) : undefined;
+  const normalizedBodySeconds =
+    bodyWaitSeconds !== undefined ? Math.max(0, Math.round(bodyWaitSeconds * 1000)) : undefined;
+  const bodyMaximum = [normalizedBodyMs, normalizedBodySeconds]
+    .filter((value): value is number => value !== undefined)
+    .reduce((maximum, value) => Math.max(maximum, value), -1);
+  if (bodyMaximum >= 0 || validHeaderWaitMs !== undefined) {
+    const bodyWins = bodyMaximum >= (validHeaderWaitMs ?? -1);
+    retryAfterMs = bodyWins ? bodyMaximum : (validHeaderWaitMs as number);
+    source = bodyWins ? "body" : "header";
   } else {
     retryAfterMs = DEFAULT_WAIT_MS;
     source = "default";
@@ -205,6 +227,15 @@ export function parseGatewayWait(input: GatewayWaitInput): GatewayWaitSignal | n
     ...(queueLimit !== undefined ? { queueLimit } : {}),
     ...(requestId ? { requestId } : {}),
     ...(message ? { message } : {}),
+    ...(admission?.code ? { code: admission.code } : {}),
+    ...(admission?.action ? { action: admission.action } : {}),
+    ...(admission?.actionCode ? { actionCode: admission.actionCode } : {}),
+    ...(admission?.replaySafe !== undefined ? { replaySafe: admission.replaySafe } : {}),
+    ...(admission?.requestState ? { requestState: admission.requestState } : {}),
+    ...(str(admission?.payload.provider ?? body?.provider)
+      ? { provider: str(admission?.payload.provider ?? body?.provider) }
+      : {}),
+    ...(str(admission?.payload.model ?? body?.model) ? { model: str(admission?.payload.model ?? body?.model) } : {}),
   };
 }
 
@@ -263,6 +294,8 @@ export function isAccountWideRefusal(signal: GatewayWaitSignal): boolean {
   // Not to be confused with `isGatewayAdmissionRefusal`, which answers a
   // different question — see its comment. This one decides WHO waits; that one
   // decides WHICH LAYER owns the wait.
+  if (signal.scope === "model" || signal.scope === "request") return false;
+  if (signal.scope === "caller" || signal.scope === "global") return true;
   return signal.status === 429 || signal.type === "inference_admission" || signal.reason === "queue_timeout";
 }
 

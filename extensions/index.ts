@@ -691,6 +691,7 @@ ${RECOVERY_PROMPT}`;
           reservedSlots: gatewayConfig.reservedSlots,
           maxWaitMs: gatewayConfig.maxWaitMs,
           maxRetries: gatewayConfig.maxRetries,
+          maxElapsedMs: gatewayConfig.maxElapsedMs,
         },
         installs: installedGatewayStreamRetries(),
         model: ctx.model
@@ -709,19 +710,11 @@ ${RECOVERY_PROMPT}`;
   if (gatewayConfig.enabled && typeof pi.on === "function") {
     const admission = sharedAdmissionController();
 
-    // Status line + headers: what the transport saw (`Retry-After`), no body.
-    // Narrowed to 429: a transient 5xx is Pi's own retry to handle, and arming
-    // a process-wide cooldown on one flaky response would stall every caller.
-    pi.on("after_provider_response", async (event) => {
-      if (event.status !== 429) return;
-      const signal = parseGatewayWait({ status: event.status, headers: event.headers });
-      // A 429 is a statement about the account, so it parks everyone. Scoped
-      // through the same predicate as the other two paths rather than by hand.
-      if (signal?.retryable) {
-        if (isAccountWideRefusal(signal)) admission.noteWait(signal);
-        else admission.noteObservedWait(signal);
-      }
-    });
+    // The interactive wrapper captures headers on each attempt's own
+    // `onResponse` callback. This hook deliberately does not cache them by
+    // provider/model: that pair is shared by concurrent calls and is therefore
+    // not a safe correlation key.
+    pi.on("after_provider_response", async () => {});
 
     // Pi's own session retry stops after `retry.maxRetries` (default 3),
     // ignores the wait the gateway advertised, and has no accessor on the
@@ -764,12 +757,12 @@ ${RECOVERY_PROMPT}`;
     // bar carries that (spinner + countdown + queue position); the notify path
     // is the fallback for a session running without one.
     //
-    // The wait is unbounded by policy, so it is tied to the turn's own abort
-    // signal: escape ends the hold for this caller and leaves the cooldown
-    // standing for everyone else.
+    // The wait is tied to the turn's own abort signal: escape ends the hold for
+    // this caller and leaves any wider cooldown standing for other callers.
     let noticeSilentUntil = 0;
     pi.on("before_provider_request", async (_event, ctx) => {
-      const remaining = admission.cooldownRemainingMs();
+      const identity = ctx.model ? { provider: ctx.model.provider, model: ctx.model.id } : {};
+      const remaining = admission.cooldownRemainingMs(identity);
       if (remaining <= 0) return;
       if (!statusBarConfig.enabled) {
         const now = Date.now();
@@ -782,10 +775,10 @@ ${RECOVERY_PROMPT}`;
         }
       }
       const signal = ctx.signal;
-      await admission.awaitCooldown(signal ? { signal } : {});
+      await admission.awaitCooldown({ ...identity, ...(signal ? { signal } : {}) });
     });
 
-    // ─── Unbounded waiting for the interactive turn ────────────────────────
+    // ─── Bounded waiting for the interactive turn ──────────────────────────
     // Everything above holds the turn BEFORE a request and records the wait
     // after one fails, but it cannot stop Pi from giving up: `retryAssistantCall`
     // (pi-ai utils/retry.js) retries a failed assistant message `maxRetries`
@@ -822,10 +815,17 @@ ${RECOVERY_PROMPT}`;
           // parking workers on healthy models behind it would turn one model's
           // outage into a runtime-wide stall. Either way the wait is emitted,
           // so the footer keeps its spinner and countdown.
-          hold: async (waitSignal, _attempt, abort) => {
-            const opts = abort ? { signal: abort } : {};
-            if (isAccountWideRefusal(waitSignal)) await admission.noteWaitAndSleep(waitSignal, opts);
-            else await admission.noteCallerWaitAndSleep(waitSignal, opts);
+          hold: async (waitSignal, _attempt, abort, actualModel) => {
+            const callModel = actualModel as Model<any>;
+            const scopedSignal = { ...waitSignal, provider: callModel.provider, model: callModel.id };
+            const opts = {
+              provider: callModel.provider,
+              model: callModel.id,
+              ...(abort ? { signal: abort } : {}),
+            };
+            if (isAccountWideRefusal(scopedSignal)) await admission.noteWaitAndSleep(scopedSignal, opts);
+            else if (scopedSignal.scope === "model") await admission.noteWaitAndSleep(scopedSignal, opts);
+            else await admission.noteCallerWaitAndSleep(scopedSignal, opts);
           },
           // "Consecutive" has to mean consecutive: without this the counter
           // accumulated across a whole session and would eventually trip a
@@ -833,7 +833,7 @@ ${RECOVERY_PROMPT}`;
           onProgress: () => {
             fallbackCoordinator.onProgress();
           },
-          onHold: () => {
+          onHold: (_info, actualModel) => {
             // Checked on a hold rather than on failure: by the time a turn
             // fails the operator has already spent the wait this avoids. The
             // in-flight request is left alone — a switch applies to the next
@@ -846,8 +846,11 @@ ${RECOVERY_PROMPT}`;
             // to) is what crashed Pi via `assertActive`. So a hold only updates
             // the coordinator's count and pending flag; the fallback itself is
             // applied later from a fresh lifecycle callback.
-            fallbackCoordinator.onGatewayHold({ modelId: model?.id, provider: model?.provider });
+            const callModel = actualModel as Model<any>;
+            fallbackCoordinator.onGatewayHold({ modelId: callModel.id, provider: callModel.provider });
           },
+          maxAttempts: gatewayConfig.maxRetries + 1,
+          maxElapsedMs: gatewayConfig.maxElapsedMs,
           signalOf: (options) => (options as { signal?: AbortSignal } | undefined)?.signal,
           errorMessage: (m, error) => ({
             role: "assistant",

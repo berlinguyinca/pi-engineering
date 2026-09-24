@@ -1,14 +1,10 @@
 /**
  * Retry-delay resolution (spec 02 §2).
  *
- * Precedence, first hit wins:
- *   1. `retry-after-ms` response header (milliseconds)
- *   2. `Retry-After` response header (delta-seconds or HTTP date)
- *   3. structured body field `retry_after_ms`
- *   4. local exponential backoff
+ * All valid server hints are parsed and the largest is the minimum wait.
+ * Local exponential backoff is used only when no valid server hint exists.
  *
- * Every returned delay is clamped into `[minDelayMs, maxDelayMs]` and may carry
- * bounded positive jitter. Nothing here waits; it only computes.
+ * Server minima are never clamped downward. Local backoff remains bounded.
  */
 
 import { type AdmissionHeaders, headerGetter } from "./admissionContract.ts";
@@ -24,8 +20,23 @@ export interface RetryDelay {
   source: RetryDelaySource;
   /** Server-directed delay before clamping/jitter, when one was supplied. */
   serverDelayMs?: number;
-  /** True when a server-directed delay had to be clamped into policy bounds. */
+  /** True when a server delay below the local minimum was raised. */
   clamped?: boolean;
+}
+
+export type WaitDecision = { action: "wait"; waitMs: number } | { action: "stop"; reason: "budget_elapsed" };
+
+/** Preserve server minima: stop instead of shortening a wait that cannot fit. */
+export function decideWait(input: {
+  serverMinimumMs?: number;
+  proposedMs: number;
+  remainingMs: number;
+}): WaitDecision {
+  if (input.serverMinimumMs !== undefined && input.serverMinimumMs > input.remainingMs) {
+    return { action: "stop", reason: "budget_elapsed" };
+  }
+  const waitMs = Math.min(input.proposedMs, input.remainingMs);
+  return waitMs > 0 ? { action: "wait", waitMs } : { action: "stop", reason: "budget_elapsed" };
 }
 
 /** Bounds and backoff shape used to resolve a delay. */
@@ -122,7 +133,8 @@ function fromServer(
   bounds: RetryDelayBounds,
   input: ResolveRetryDelayInput,
 ): RetryDelay {
-  const clampedMs = clampDelay(serverDelayMs, bounds.minDelayMs, bounds.maxDelayMs);
+  // maxDelayMs bounds local policy, never a server-declared minimum.
+  const clampedMs = Math.max(serverDelayMs, Math.max(0, bounds.minDelayMs));
   return {
     delayMs: addBoundedJitter(clampedMs, bounds.jitterRatio, input.random ?? Math.random),
     source,
@@ -132,30 +144,33 @@ function fromServer(
 }
 
 /**
- * Resolve the wait before the next attempt, following the precedence chain.
- *
- * A server-directed delay outside `[minDelayMs, maxDelayMs]` is clamped rather
- * than dropped, and the result is flagged so telemetry can report the
- * disagreement with the server.
+ * Resolve the wait before the next attempt, choosing the largest valid server
+ * minimum and otherwise using bounded local backoff.
  */
 export function resolveRetryDelay(input: ResolveRetryDelayInput): RetryDelay {
   const { bounds } = input;
   if (bounds.honorRetryAfter !== false) {
     const get = headerGetter(input.headers);
 
+    const candidates: Array<{ source: RetryDelaySource; ms: number }> = [];
     const msHeader = parseRetryAfterMsHeader(get("retry-after-ms"));
-    if (msHeader !== undefined) return fromServer("retry-after-ms", msHeader, bounds, input);
-
+    if (msHeader !== undefined) candidates.push({ source: "retry-after-ms", ms: msHeader });
     const retryAfter = get("retry-after");
     if (retryAfter !== undefined) {
       const seconds = parseRetryAfterMsHeader(retryAfter);
-      if (seconds !== undefined) return fromServer("retry-after-seconds", seconds * 1000, bounds, input);
-      const dateMs = parseRetryAfterHeader(retryAfter, input.nowMs ?? Date.now());
-      if (dateMs !== undefined) return fromServer("retry-after-date", dateMs, bounds, input);
+      if (seconds !== undefined) candidates.push({ source: "retry-after-seconds", ms: seconds * 1000 });
+      else {
+        const dateMs = parseRetryAfterHeader(retryAfter, input.nowMs ?? Date.now());
+        if (dateMs !== undefined) candidates.push({ source: "retry-after-date", ms: dateMs });
+      }
     }
-
     const fromBody = bodyRetryAfterMs(input.body);
-    if (fromBody !== undefined) return fromServer("body", fromBody, bounds, input);
+    if (fromBody !== undefined) candidates.push({ source: "body", ms: fromBody });
+    const largest = candidates.reduce<{ source: RetryDelaySource; ms: number } | undefined>(
+      (best, candidate) => (!best || candidate.ms > best.ms ? candidate : best),
+      undefined,
+    );
+    if (largest) return fromServer(largest.source, largest.ms, bounds, input);
   }
 
   const backoff = exponentialBackoffMs(input.attempt, bounds.baseBackoffMs, bounds.maxBackoffMs ?? bounds.maxDelayMs);

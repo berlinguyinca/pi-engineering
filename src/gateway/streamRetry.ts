@@ -37,7 +37,11 @@
  * belongs to, are injected as `hold`.
  */
 
-import { type GatewayWaitSignal, parseGatewayWait } from "./signals.ts";
+import { monotonicNow } from "../core/clock.ts";
+import { augmentInferenceErrorMessage } from "../inference/admissionContract.ts";
+import { type GatewayWaitInput, type GatewayWaitSignal, parseGatewayWait } from "./signals.ts";
+
+export { monotonicNow } from "../core/clock.ts";
 
 /** A terminal event ends pi's stream and resolves its result. */
 function isTerminal(type: string | undefined): boolean {
@@ -65,6 +69,8 @@ function carriesFailure<E extends RetryableEvent, R extends RetryableResult>(eve
 /** The slice of pi's assistant event we need to reason about. */
 export interface RetryableEvent {
   type?: string;
+  message?: RetryableResult;
+  error?: RetryableResult;
 }
 
 /** The slice of pi's AssistantMessage we need to reason about. */
@@ -94,10 +100,15 @@ export interface GatewayStreamRetryOptions {
   /** The turn's abort signal. Escape must end the turn, not restart it. */
   signal?: AbortSignal;
   /**
-   * Attempt ceiling. Unlimited by default — saturation is a wait, not a
-   * failure, which is the entire point of this module.
+   * Finite attempt ceiling. Defaults to DEFAULT_GATEWAY_MAX_ATTEMPTS.
    */
   maxAttempts?: number;
+  /** Finite monotonic elapsed budget for the complete retry chain. */
+  maxElapsedMs?: number;
+  /** Injectable monotonic clock. */
+  now?: () => number;
+  /** Status/headers captured for the attempt before the body was flattened. */
+  response?: () => Omit<GatewayWaitInput, "text"> | undefined;
   /** Ceiling on a SYNTHESIZED wait. Advertised waits are honoured exactly. */
   maxEscalatedWaitMs?: number;
   /**
@@ -135,6 +146,12 @@ export interface GatewayStreamRetryOutcome {
 
 /** Default ceiling for a wait we invented rather than were told. */
 export const MAX_ESCALATED_WAIT_MS = 60_000;
+export const DEFAULT_GATEWAY_MAX_ATTEMPTS = 8;
+export const DEFAULT_GATEWAY_MAX_ELAPSED_MS = 300_000;
+
+function finiteBudget(value: number | undefined, fallback: number, minimum: number): number {
+  return typeof value === "number" && Number.isFinite(value) && value >= minimum ? value : fallback;
+}
 
 function errorText(value: unknown): string {
   return value instanceof Error ? value.message : String(value ?? "");
@@ -169,7 +186,10 @@ export async function pumpWithGatewayRetry<E extends RetryableEvent, R extends R
   sink: RetrySink<E, R>,
   opts: GatewayStreamRetryOptions,
 ): Promise<GatewayStreamRetryOutcome> {
-  const maxAttempts = opts.maxAttempts ?? Number.POSITIVE_INFINITY;
+  const maxAttempts = Math.floor(finiteBudget(opts.maxAttempts, DEFAULT_GATEWAY_MAX_ATTEMPTS, 1));
+  const maxElapsedMs = finiteBudget(opts.maxElapsedMs, DEFAULT_GATEWAY_MAX_ELAPSED_MS, 0);
+  const now = opts.now ?? monotonicNow;
+  const startedAt = now();
   const capMs = opts.maxEscalatedWaitMs ?? MAX_ESCALATED_WAIT_MS;
   const priorHolds = opts.priorHolds ?? 0;
   let holds = 0;
@@ -209,7 +229,7 @@ export async function pumpWithGatewayRetry<E extends RetryableEvent, R extends R
           // thing we forward — and a failing one is held until we have decided.
           // Both shapes count: `type: "error"`, and `done` carrying a message
           // whose stopReason is "error".
-          if (!forwarded && carriesFailure<E, R>(event)) {
+          if (carriesFailure<E, R>(event)) {
             withheld = event;
             continue;
           }
@@ -225,11 +245,14 @@ export async function pumpWithGatewayRetry<E extends RetryableEvent, R extends R
 
     const failure = thrown !== undefined ? errorText(thrown) : (result?.errorMessage ?? "");
     const isAbort = result?.stopReason === "aborted" || opts.signal?.aborted === true;
-    const wait = isAbort || forwarded ? null : parseGatewayWait({ text: failure });
-    const retryable = wait?.retryable === true && attempt < maxAttempts;
+    const guidance = isAbort ? null : parseGatewayWait({ ...(opts.response?.() ?? {}), text: failure });
+    const wait = forwarded ? null : guidance;
+    const remainingMs = maxElapsedMs - (now() - startedAt);
+    const held = wait ? waitFor(wait, attempt + priorHolds, capMs) : undefined;
+    const retryable =
+      held?.retryable === true && attempt < maxAttempts && remainingMs > 0 && held.retryAfterMs <= remainingMs;
 
-    if (retryable && wait) {
-      const held = waitFor(wait, attempt + priorHolds, capMs);
+    if (retryable && held) {
       opts.onHold?.({ attempt, signal: held, errorText: failure });
       holds++;
       await opts.hold(held, attempt);
@@ -240,17 +263,36 @@ export async function pumpWithGatewayRetry<E extends RetryableEvent, R extends R
         sink.end(abortedFrom(result));
         return { attempts: attempt, holds, settled: "aborted" };
       }
-      continue;
+      // Timer jitter or a busy event loop can make the hold resolve after its
+      // budget. Recheck after the await and at the replay boundary.
+      const elapsedAfterHold = now() - startedAt;
+      if (elapsedAfterHold < maxElapsedMs) {
+        const elapsedAtReplay = now() - startedAt;
+        if (elapsedAtReplay < maxElapsedMs) continue;
+      }
     }
 
     // Settled: a throw with nothing to report is the caller's problem, since
     // building an assistant message needs the model.
     if (thrown !== undefined) throw thrown;
-    if (withheld) sink.push(withheld);
-    sink.end(result);
+    const finalResult = guidance ? withGuidance(result, guidance) : result;
+    if (withheld) sink.push(guidance ? withEventGuidance(withheld, guidance) : withheld);
+    sink.end(finalResult);
     const settled = isAbort ? "aborted" : result?.stopReason === "error" ? "error" : "ok";
     return { attempts: attempt, holds, settled };
   }
+}
+
+function withGuidance<R extends RetryableResult>(result: R | undefined, guidance: GatewayWaitSignal): R | undefined {
+  if (!result) return result;
+  return { ...result, errorMessage: augmentInferenceErrorMessage(result.errorMessage, guidance) };
+}
+
+function withEventGuidance<E extends RetryableEvent>(event: E, guidance: GatewayWaitSignal): E {
+  const field = event.type === "done" ? "message" : "error";
+  const terminal = event[field];
+  if (!terminal) return event;
+  return { ...event, [field]: withGuidance(terminal, guidance) } as E;
 }
 
 /** Normalise a failed result into an aborted one, dropping the error text. */

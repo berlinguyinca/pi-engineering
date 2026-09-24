@@ -21,7 +21,7 @@
  *     forward and only `api`/`streamSimple` are added.
  */
 
-import type { GatewayWaitSignal } from "./signals.ts";
+import type { GatewayWaitInput, GatewayWaitSignal } from "./signals.ts";
 import {
   type AttemptStream,
   type GatewayStreamRetryOptions,
@@ -49,6 +49,51 @@ export interface ProviderHost<M, C, O> {
   getRegisteredNativeProvider?(providerId: string): ProviderLike<M, C, O> | undefined;
 }
 
+interface ProviderResponseLike {
+  status: number;
+  headers?: Record<string, string>;
+}
+
+interface ProviderResponseOptions<R extends ProviderResponseLike = ProviderResponseLike, M = unknown> {
+  onResponse?: (response: R, model: M) => void | Promise<void>;
+}
+
+/**
+ * Give one provider attempt a private response-metadata cell.
+ *
+ * The provider/model pair is not a request identifier: two calls can be in
+ * flight for the same model, and FIFO metadata lets either call consume the
+ * other's headers. Wrapping the attempt's own `onResponse` callback makes the
+ * transport invocation itself the correlation boundary. Only error responses
+ * are retained, and `take` consumes them exactly once.
+ */
+export function captureGatewayAttemptResponse<
+  R extends ProviderResponseLike,
+  M,
+  O extends ProviderResponseOptions<R, M>,
+>(options: O): { options: O; take: () => Omit<GatewayWaitInput, "text"> | undefined; clear: () => void } {
+  let metadata: Omit<GatewayWaitInput, "text"> | undefined;
+  const original = options.onResponse;
+  const captured = {
+    ...options,
+    onResponse: async (response: R, model: M) => {
+      metadata = response.status >= 400 ? { status: response.status, headers: response.headers } : undefined;
+      await original?.(response, model);
+    },
+  } as O;
+  return {
+    options: captured,
+    take: () => {
+      const value = metadata;
+      metadata = undefined;
+      return value;
+    },
+    clear: () => {
+      metadata = undefined;
+    },
+  };
+}
+
 export interface InstallDeps<M, O> {
   /** Build the stream handed back to Pi. `createAssistantMessageEventStream`. */
   createStream(): RetrySink<RetryableEvent, RetryableResult> & AttemptStream<RetryableEvent, RetryableResult>;
@@ -57,18 +102,21 @@ export interface InstallDeps<M, O> {
    * the stream's own abort signal so escape ends the hold for THIS turn while
    * the cooldown stays standing for every other caller.
    */
-  hold(signal: GatewayWaitSignal, attempt: number, abort: AbortSignal | undefined): Promise<void>;
-  onHold?: GatewayStreamRetryOptions["onHold"];
+  hold(signal: GatewayWaitSignal, attempt: number, abort: AbortSignal | undefined, model: M): Promise<void>;
+  onHold?: (info: Parameters<NonNullable<GatewayStreamRetryOptions["onHold"]>>[0], model: M) => void;
   /**
    * Called when a stream first produces output. Exposed so a caller keeping its
    * own consecutive-hold count resets it on the same evidence this module does.
    */
-  onProgress?: () => void;
+  onProgress?: (model: M) => void;
   /** Turn a thrown transport failure into an assistant error message. */
   errorMessage(model: M, error: unknown): RetryableResult;
   /** Read the turn's abort signal off the provider options. */
   signalOf?(options: O | undefined): AbortSignal | undefined;
   maxEscalatedWaitMs?: number;
+  maxAttempts?: number;
+  maxElapsedMs?: number;
+  now?: () => number;
 }
 
 export type InstallResult =
@@ -157,22 +205,39 @@ export function installGatewayStreamRetry<M, C, O>(
   const streamSimple = (model: M, context: C, options?: O) => {
     const out = deps.createStream();
     const signal = deps.signalOf?.(options);
-    void pumpWithGatewayRetry(() => baseStream(model, context, options), out, {
-      hold: (waitSignal, attempt) => {
-        consecutiveHolds++;
-        return deps.hold(waitSignal, attempt, signal);
+    let responseCapture:
+      | ReturnType<typeof captureGatewayAttemptResponse<ProviderResponseLike, unknown, ProviderResponseOptions>>
+      | undefined;
+    void pumpWithGatewayRetry(
+      () => {
+        responseCapture = captureGatewayAttemptResponse(
+          (options ?? {}) as ProviderResponseOptions<ProviderResponseLike, unknown>,
+        );
+        return baseStream(model, context, responseCapture.options as O);
       },
-      priorHolds: consecutiveHolds,
-      // Synchronous, unlike the outcome: the agent loop starts its next
-      // provider call before a `.then` on this pump would run.
-      onProgress: () => {
-        consecutiveHolds = 0;
-        deps.onProgress?.();
+      out,
+      {
+        hold: (waitSignal, attempt) => {
+          consecutiveHolds++;
+          return deps.hold(waitSignal, attempt, signal, model);
+        },
+        priorHolds: consecutiveHolds,
+        // Synchronous, unlike the outcome: the agent loop starts its next
+        // provider call before a `.then` on this pump would run.
+        onProgress: () => {
+          responseCapture?.clear();
+          consecutiveHolds = 0;
+          deps.onProgress?.(model);
+        },
+        ...(deps.onHold ? { onHold: (info) => deps.onHold?.(info, model) } : {}),
+        ...(signal ? { signal } : {}),
+        ...(deps.maxEscalatedWaitMs != null ? { maxEscalatedWaitMs: deps.maxEscalatedWaitMs } : {}),
+        ...(deps.maxAttempts != null ? { maxAttempts: deps.maxAttempts } : {}),
+        ...(deps.maxElapsedMs != null ? { maxElapsedMs: deps.maxElapsedMs } : {}),
+        ...(deps.now ? { now: deps.now } : {}),
+        response: () => responseCapture?.take(),
       },
-      ...(deps.onHold ? { onHold: deps.onHold } : {}),
-      ...(signal ? { signal } : {}),
-      ...(deps.maxEscalatedWaitMs != null ? { maxEscalatedWaitMs: deps.maxEscalatedWaitMs } : {}),
-    }).catch((error: unknown) => {
+    ).catch((error: unknown) => {
       // A throw that is not gateway backpressure. Pi expects a terminal event,
       // never a rejected promise, so report it the way `lazyStream` does.
       const message = deps.errorMessage(model, error);
