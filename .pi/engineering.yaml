@@ -27,10 +27,17 @@ routing:
       model: "metabolomics/qwen3.8-flash_next-modality-text-quant-q4_k_xl"
       timeout_ms: 1200000
       max_context_tokens: 128000
+    # NOTE: the previously pinned `qwen3.8-27b-modality-text-quant-q8_k_xl` is
+    # not present in the gateway's available set, so the degrade-safe router fell
+    # back to auto-scoring and picked `deepseek_v4-flash…-mxfp4` as "best
+    # implementer" — a looping, non-functional model that burned the whole worker
+    # budget without committing. Repoint to an AVAILABLE qwen-27b text model with
+    # 262k context (explicit text modality, distinct from the planner and the
+    # vision reviewer).
     implementer:
-      model: "metabolomics/qwen3.8-27b-modality-text-quant-q8_k_xl"
+      model: "metabolomics/qwen3.8-27b-modality-text-ctx-c262k-quant-q4_k_xl"
       timeout_ms: 3600000
-      max_context_tokens: 128000
+      max_context_tokens: 256000
     reviewer:
       model: "metabolomics/qwen3.8-27b-modality-vision-quant-q8_k_xl"
       timeout_ms: 1800000
