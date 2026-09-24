@@ -7,28 +7,8 @@
       "valid": true,
       "status": 400,
       "headers": {},
-      "body": {
-        "type": "inferweave_backpressure",
-        "code": "invalid_request",
-        "reason": "invalid_request",
-        "retryable": false,
-        "replay_safe": false,
-        "request_state": "not_started",
-        "action": "fix_request",
-        "action_code": "IW-ACT-FIX-REQUEST",
-        "scope": "request",
-        "message": "Correct the request syntax or parameters."
-      },
-      "expected": {
-        "code": "invalid_request",
-        "reason": "invalid_request",
-        "retryable": false,
-        "replay_safe": false,
-        "request_state": "not_started",
-        "action": "fix_request",
-        "action_code": "IW-ACT-FIX-REQUEST",
-        "scope": "request"
-      },
+      "body": {"type": "inferweave_backpressure", "code": "invalid_request", "reason": "invalid_request", "retryable": false, "replay_safe": false, "request_state": "not_started", "action": "fix_request", "action_code": "IW-ACT-FIX-REQUEST", "scope": "request", "message": "Correct the request syntax or parameters."},
+      "expected": {"code": "invalid_request", "reason": "invalid_request", "retryable": false, "replay_safe": false, "request_state": "not_started", "action": "fix_request", "action_code": "IW-ACT-FIX-REQUEST", "scope": "request"},
       "legacy": false
     },
     {
@@ -37,30 +17,8 @@
       "valid": true,
       "status": 401,
       "headers": {},
-      "body": {
-        "error": {
-          "type": "inferweave_backpressure",
-          "code": "authentication_required",
-          "reason": "authentication_required",
-          "retryable": false,
-          "replay_safe": false,
-          "request_state": "not_started",
-          "action": "authenticate",
-          "action_code": "IW-ACT-AUTHENTICATE",
-          "scope": "caller",
-          "message": "Supply valid credentials."
-        }
-      },
-      "expected": {
-        "code": "authentication_required",
-        "reason": "authentication_required",
-        "retryable": false,
-        "replay_safe": false,
-        "request_state": "not_started",
-        "action": "authenticate",
-        "action_code": "IW-ACT-AUTHENTICATE",
-        "scope": "caller"
-      },
+      "body": {"error": {"type": "inferweave_backpressure", "code": "authentication_required", "reason": "authentication_required", "retryable": false, "replay_safe": false, "request_state": "not_started", "action": "authenticate", "action_code": "IW-ACT-AUTHENTICATE", "scope": "caller", "message": "Supply valid credentials."}},
+      "expected": {"code": "authentication_required", "reason": "authentication_required", "retryable": false, "replay_safe": false, "request_state": "not_started", "action": "authenticate", "action_code": "IW-ACT-AUTHENTICATE", "scope": "caller"},
       "legacy": false
     },
     {
@@ -69,30 +27,8 @@
       "valid": true,
       "status": 403,
       "headers": {},
-      "body": {
-        "detail": {
-          "type": "inferweave_backpressure",
-          "code": "access_denied",
-          "reason": "access_denied",
-          "retryable": false,
-          "replay_safe": false,
-          "request_state": "not_started",
-          "action": "request_access",
-          "action_code": "IW-ACT-REQUEST-ACCESS",
-          "scope": "caller",
-          "message": "Request access or quota from the operator."
-        }
-      },
-      "expected": {
-        "code": "access_denied",
-        "reason": "access_denied",
-        "retryable": false,
-        "replay_safe": false,
-        "request_state": "not_started",
-        "action": "request_access",
-        "action_code": "IW-ACT-REQUEST-ACCESS",
-        "scope": "caller"
-      },
+      "body": {"detail": {"type": "inferweave_backpressure", "code": "access_denied", "reason": "access_denied", "retryable": false, "replay_safe": false, "request_state": "not_started", "action": "request_access", "action_code": "IW-ACT-REQUEST-ACCESS", "scope": "caller", "message": "Request access or quota from the operator."}},
+      "expected": {"code": "access_denied", "reason": "access_denied", "retryable": false, "replay_safe": false, "request_state": "not_started", "action": "request_access", "action_code": "IW-ACT-REQUEST-ACCESS", "scope": "caller"},
       "legacy": false
     },
     {
@@ -101,30 +37,8 @@
       "valid": true,
       "status": 404,
       "headers": {},
-      "body": {
-        "error": {
-          "type": "inferweave_backpressure",
-          "code": "model_not_found",
-          "reason": "model_not_found",
-          "retryable": false,
-          "replay_safe": false,
-          "request_state": "not_started",
-          "action": "fix_request",
-          "action_code": "IW-ACT-FIX-REQUEST",
-          "scope": "request",
-          "message": "Use a model or endpoint that exists."
-        }
-      },
-      "expected": {
-        "code": "model_not_found",
-        "reason": "model_not_found",
-        "retryable": false,
-        "replay_safe": false,
-        "request_state": "not_started",
-        "action": "fix_request",
-        "action_code": "IW-ACT-FIX-REQUEST",
-        "scope": "request"
-      },
+      "body": {"error": {"type": "inferweave_backpressure", "code": "model_not_found", "reason": "model_not_found", "retryable": false, "replay_safe": false, "request_state": "not_started", "action": "fix_request", "action_code": "IW-ACT-FIX-REQUEST", "scope": "request", "message": "Use a model or endpoint that exists."}},
+      "expected": {"code": "model_not_found", "reason": "model_not_found", "retryable": false, "replay_safe": false, "request_state": "not_started", "action": "fix_request", "action_code": "IW-ACT-FIX-REQUEST", "scope": "request"},
       "legacy": false
     },
     {
@@ -132,33 +46,9 @@
       "role": "producer",
       "valid": true,
       "status": 408,
-      "headers": { "Retry-After": "2" },
-      "body": {
-        "error": {
-          "type": "inferweave_backpressure",
-          "code": "request_timeout",
-          "reason": "request_timeout",
-          "retryable": true,
-          "replay_safe": true,
-          "request_state": "queued",
-          "action": "backoff",
-          "action_code": "IW-ACT-BACKOFF",
-          "retry_after_ms": 2000,
-          "scope": "request",
-          "message": "Wait at least 2 seconds before retrying."
-        }
-      },
-      "expected": {
-        "code": "request_timeout",
-        "reason": "request_timeout",
-        "retryable": true,
-        "replay_safe": true,
-        "request_state": "queued",
-        "action": "backoff",
-        "action_code": "IW-ACT-BACKOFF",
-        "retry_after_ms": 2000,
-        "scope": "request"
-      },
+      "headers": {"Retry-After": "2"},
+      "body": {"error": {"type": "inferweave_backpressure", "code": "request_timeout", "reason": "request_timeout", "retryable": true, "replay_safe": true, "request_state": "queued", "action": "backoff", "action_code": "IW-ACT-BACKOFF", "retry_after_ms": 2000, "scope": "request", "message": "Wait at least 2 seconds before retrying."}},
+      "expected": {"code": "request_timeout", "reason": "request_timeout", "retryable": true, "replay_safe": true, "request_state": "queued", "action": "backoff", "action_code": "IW-ACT-BACKOFF", "retry_after_ms": 2000, "scope": "request"},
       "legacy": false
     },
     {
@@ -167,30 +57,8 @@
       "valid": true,
       "status": 409,
       "headers": {},
-      "body": {
-        "error": {
-          "type": "inferweave_backpressure",
-          "code": "idempotency_conflict",
-          "reason": "idempotency_conflict",
-          "retryable": false,
-          "replay_safe": false,
-          "request_state": "unknown",
-          "action": "resolve_conflict",
-          "action_code": "IW-ACT-RESOLVE-CONFLICT",
-          "scope": "request",
-          "message": "Resolve the idempotency conflict before resubmission."
-        }
-      },
-      "expected": {
-        "code": "idempotency_conflict",
-        "reason": "idempotency_conflict",
-        "retryable": false,
-        "replay_safe": false,
-        "request_state": "unknown",
-        "action": "resolve_conflict",
-        "action_code": "IW-ACT-RESOLVE-CONFLICT",
-        "scope": "request"
-      },
+      "body": {"error": {"type": "inferweave_backpressure", "code": "idempotency_conflict", "reason": "idempotency_conflict", "retryable": false, "replay_safe": false, "request_state": "unknown", "action": "resolve_conflict", "action_code": "IW-ACT-RESOLVE-CONFLICT", "scope": "request", "message": "Resolve the idempotency conflict before resubmission."}},
+      "expected": {"code": "idempotency_conflict", "reason": "idempotency_conflict", "retryable": false, "replay_safe": false, "request_state": "unknown", "action": "resolve_conflict", "action_code": "IW-ACT-RESOLVE-CONFLICT", "scope": "request"},
       "legacy": false
     },
     {
@@ -199,30 +67,8 @@
       "valid": true,
       "status": 413,
       "headers": {},
-      "body": {
-        "error": {
-          "type": "inferweave_backpressure",
-          "code": "CONTEXT_WINDOW_EXCEEDED",
-          "reason": "CONTEXT_WINDOW_EXCEEDED",
-          "retryable": false,
-          "replay_safe": false,
-          "request_state": "not_started",
-          "action": "reduce_input",
-          "action_code": "IW-ACT-REDUCE-INPUT",
-          "scope": "request",
-          "message": "Reduce input to the published context ceiling."
-        }
-      },
-      "expected": {
-        "code": "CONTEXT_WINDOW_EXCEEDED",
-        "reason": "CONTEXT_WINDOW_EXCEEDED",
-        "retryable": false,
-        "replay_safe": false,
-        "request_state": "not_started",
-        "action": "reduce_input",
-        "action_code": "IW-ACT-REDUCE-INPUT",
-        "scope": "request"
-      },
+      "body": {"error": {"type": "inferweave_backpressure", "code": "CONTEXT_WINDOW_EXCEEDED", "reason": "CONTEXT_WINDOW_EXCEEDED", "retryable": false, "replay_safe": false, "request_state": "not_started", "action": "reduce_input", "action_code": "IW-ACT-REDUCE-INPUT", "scope": "request", "message": "Reduce input to the published context ceiling."}},
+      "expected": {"code": "CONTEXT_WINDOW_EXCEEDED", "reason": "CONTEXT_WINDOW_EXCEEDED", "retryable": false, "replay_safe": false, "request_state": "not_started", "action": "reduce_input", "action_code": "IW-ACT-REDUCE-INPUT", "scope": "request"},
       "legacy": false
     },
     {
@@ -231,30 +77,8 @@
       "valid": true,
       "status": 422,
       "headers": {},
-      "body": {
-        "error": {
-          "type": "inferweave_backpressure",
-          "code": "invalid_inference",
-          "reason": "invalid_inference",
-          "retryable": false,
-          "replay_safe": false,
-          "request_state": "not_started",
-          "action": "fix_request",
-          "action_code": "IW-ACT-FIX-REQUEST",
-          "scope": "request",
-          "message": "Correct the inference parameters."
-        }
-      },
-      "expected": {
-        "code": "invalid_inference",
-        "reason": "invalid_inference",
-        "retryable": false,
-        "replay_safe": false,
-        "request_state": "not_started",
-        "action": "fix_request",
-        "action_code": "IW-ACT-FIX-REQUEST",
-        "scope": "request"
-      },
+      "body": {"error": {"type": "inferweave_backpressure", "code": "invalid_inference", "reason": "invalid_inference", "retryable": false, "replay_safe": false, "request_state": "not_started", "action": "fix_request", "action_code": "IW-ACT-FIX-REQUEST", "scope": "request", "message": "Correct the inference parameters."}},
+      "expected": {"code": "invalid_inference", "reason": "invalid_inference", "retryable": false, "replay_safe": false, "request_state": "not_started", "action": "fix_request", "action_code": "IW-ACT-FIX-REQUEST", "scope": "request"},
       "legacy": false
     },
     {
@@ -262,34 +86,9 @@
       "role": "client_input",
       "valid": false,
       "status": 429,
-      "headers": { "Retry-After": "3" },
-      "body": {
-        "error": {
-          "type": "inference_admission",
-          "code": "model_queue_full",
-          "reason": "model_queue_full",
-          "retryable": true,
-          "replay_safe": true,
-          "request_state": "queued",
-          "action": "backoff",
-          "action_code": "IW-ACT-BACKOFF",
-          "retry_after_ms": 1500,
-          "scope": "model",
-          "message": "Wait at least 3 seconds and reduce parallel retries."
-        }
-      },
-      "expected": {
-        "code": "model_queue_full",
-        "reason": "model_queue_full",
-        "retryable": true,
-        "replay_safe": true,
-        "request_state": "queued",
-        "action": "backoff",
-        "action_code": "IW-ACT-BACKOFF",
-        "retry_after_ms": 3000,
-        "scope": "model",
-        "classification": "admission_queue"
-      },
+      "headers": {"Retry-After": "3"},
+      "body": {"error": {"type": "inference_admission", "code": "model_queue_full", "reason": "model_queue_full", "retryable": true, "replay_safe": true, "request_state": "queued", "action": "backoff", "action_code": "IW-ACT-BACKOFF", "retry_after_ms": 1500, "scope": "model", "message": "Wait at least 3 seconds and reduce parallel retries."}},
+      "expected": {"code": "model_queue_full", "reason": "model_queue_full", "retryable": true, "replay_safe": true, "request_state": "queued", "action": "backoff", "action_code": "IW-ACT-BACKOFF", "retry_after_ms": 3000, "scope": "model", "classification": "admission_queue"},
       "legacy": true
     },
     {
@@ -297,34 +96,9 @@
       "role": "producer",
       "valid": true,
       "status": 429,
-      "headers": { "Retry-After": "3" },
-      "body": {
-        "error": {
-          "type": "inference_admission",
-          "code": "model_queue_full",
-          "reason": "model_queue_full",
-          "retryable": true,
-          "replay_safe": true,
-          "request_state": "queued",
-          "action": "backoff",
-          "action_code": "IW-ACT-BACKOFF",
-          "retry_after_ms": 3000,
-          "scope": "model",
-          "message": "Wait at least 3 seconds before retrying the queued request."
-        }
-      },
-      "expected": {
-        "code": "model_queue_full",
-        "reason": "model_queue_full",
-        "retryable": true,
-        "replay_safe": true,
-        "request_state": "queued",
-        "action": "backoff",
-        "action_code": "IW-ACT-BACKOFF",
-        "retry_after_ms": 3000,
-        "scope": "model",
-        "classification": "admission_queue"
-      },
+      "headers": {"Retry-After": "3"},
+      "body": {"error": {"type": "inference_admission", "code": "model_queue_full", "reason": "model_queue_full", "retryable": true, "replay_safe": true, "request_state": "queued", "action": "backoff", "action_code": "IW-ACT-BACKOFF", "retry_after_ms": 3000, "scope": "model", "message": "Wait at least 3 seconds before retrying the queued request."}},
+      "expected": {"code": "model_queue_full", "reason": "model_queue_full", "retryable": true, "replay_safe": true, "request_state": "queued", "action": "backoff", "action_code": "IW-ACT-BACKOFF", "retry_after_ms": 3000, "scope": "model", "classification": "admission_queue"},
       "legacy": true
     },
     {
@@ -333,30 +107,8 @@
       "valid": true,
       "status": 500,
       "headers": {},
-      "body": {
-        "error": {
-          "type": "inferweave_backpressure",
-          "code": "internal_error",
-          "reason": "internal_error",
-          "retryable": false,
-          "replay_safe": false,
-          "request_state": "dispatched",
-          "action": "do_not_retry",
-          "action_code": "IW-ACT-DO-NOT-RETRY",
-          "scope": "request",
-          "message": "Surface the failure without automatic replay."
-        }
-      },
-      "expected": {
-        "code": "internal_error",
-        "reason": "internal_error",
-        "retryable": false,
-        "replay_safe": false,
-        "request_state": "dispatched",
-        "action": "do_not_retry",
-        "action_code": "IW-ACT-DO-NOT-RETRY",
-        "scope": "request"
-      },
+      "body": {"error": {"type": "inferweave_backpressure", "code": "internal_error", "reason": "internal_error", "retryable": false, "replay_safe": false, "request_state": "dispatched", "action": "do_not_retry", "action_code": "IW-ACT-DO-NOT-RETRY", "scope": "request", "message": "Surface the failure without automatic replay."}},
+      "expected": {"code": "internal_error", "reason": "internal_error", "retryable": false, "replay_safe": false, "request_state": "dispatched", "action": "do_not_retry", "action_code": "IW-ACT-DO-NOT-RETRY", "scope": "request"},
       "legacy": false
     },
     {
@@ -365,30 +117,8 @@
       "valid": true,
       "status": 502,
       "headers": {},
-      "body": {
-        "error": {
-          "type": "inferweave_backpressure",
-          "code": "invalid_upstream_response",
-          "reason": "invalid_upstream_response",
-          "retryable": false,
-          "replay_safe": false,
-          "request_state": "dispatched",
-          "action": "retry_alternate",
-          "action_code": "IW-ACT-RETRY-ALTERNATE",
-          "scope": "model",
-          "message": "Try an alternate only for a separately safe request."
-        }
-      },
-      "expected": {
-        "code": "invalid_upstream_response",
-        "reason": "invalid_upstream_response",
-        "retryable": false,
-        "replay_safe": false,
-        "request_state": "dispatched",
-        "action": "retry_alternate",
-        "action_code": "IW-ACT-RETRY-ALTERNATE",
-        "scope": "model"
-      },
+      "body": {"error": {"type": "inferweave_backpressure", "code": "invalid_upstream_response", "reason": "invalid_upstream_response", "retryable": false, "replay_safe": false, "request_state": "dispatched", "action": "retry_alternate", "action_code": "IW-ACT-RETRY-ALTERNATE", "scope": "model", "message": "Try an alternate only for a separately safe request."}},
+      "expected": {"code": "invalid_upstream_response", "reason": "invalid_upstream_response", "retryable": false, "replay_safe": false, "request_state": "dispatched", "action": "retry_alternate", "action_code": "IW-ACT-RETRY-ALTERNATE", "scope": "model"},
       "legacy": false
     },
     {
@@ -396,34 +126,9 @@
       "role": "producer",
       "valid": true,
       "status": 503,
-      "headers": { "Retry-After": "5" },
-      "body": {
-        "error": {
-          "type": "inferweave_backpressure",
-          "code": "NO_CONTEXT_CAPACITY",
-          "reason": "NO_CONTEXT_CAPACITY",
-          "retryable": true,
-          "replay_safe": true,
-          "request_state": "not_started",
-          "action": "retry_alternate",
-          "action_code": "IW-ACT-RETRY-ALTERNATE",
-          "retry_after_ms": 5000,
-          "scope": "model",
-          "message": "Try another eligible deployment after at least 5 seconds."
-        }
-      },
-      "expected": {
-        "code": "NO_CONTEXT_CAPACITY",
-        "reason": "NO_CONTEXT_CAPACITY",
-        "retryable": true,
-        "replay_safe": true,
-        "request_state": "not_started",
-        "action": "retry_alternate",
-        "action_code": "IW-ACT-RETRY-ALTERNATE",
-        "retry_after_ms": 5000,
-        "scope": "model",
-        "classification": "capacity_unavailable"
-      },
+      "headers": {"Retry-After": "5"},
+      "body": {"error": {"type": "inferweave_backpressure", "code": "NO_CONTEXT_CAPACITY", "reason": "NO_CONTEXT_CAPACITY", "retryable": true, "replay_safe": true, "request_state": "not_started", "action": "retry_alternate", "action_code": "IW-ACT-RETRY-ALTERNATE", "retry_after_ms": 5000, "scope": "model", "message": "Try another eligible deployment after at least 5 seconds."}},
+      "expected": {"code": "NO_CONTEXT_CAPACITY", "reason": "NO_CONTEXT_CAPACITY", "retryable": true, "replay_safe": true, "request_state": "not_started", "action": "retry_alternate", "action_code": "IW-ACT-RETRY-ALTERNATE", "retry_after_ms": 5000, "scope": "model", "classification": "capacity_unavailable"},
       "legacy": false
     },
     {
@@ -431,33 +136,9 @@
       "role": "producer",
       "valid": true,
       "status": 504,
-      "headers": { "Retry-After": "1" },
-      "body": {
-        "error": {
-          "type": "inferweave_backpressure",
-          "code": "upstream_timeout",
-          "reason": "upstream_timeout",
-          "retryable": true,
-          "replay_safe": false,
-          "request_state": "dispatched",
-          "action": "retry_alternate",
-          "action_code": "IW-ACT-RETRY-ALTERNATE",
-          "retry_after_ms": 1000,
-          "scope": "model",
-          "message": "Retry only when the logical request is independently replay-safe."
-        }
-      },
-      "expected": {
-        "code": "upstream_timeout",
-        "reason": "upstream_timeout",
-        "retryable": true,
-        "replay_safe": false,
-        "request_state": "dispatched",
-        "action": "retry_alternate",
-        "action_code": "IW-ACT-RETRY-ALTERNATE",
-        "retry_after_ms": 1000,
-        "scope": "model"
-      },
+      "headers": {"Retry-After": "1"},
+      "body": {"error": {"type": "inferweave_backpressure", "code": "upstream_timeout", "reason": "upstream_timeout", "retryable": true, "replay_safe": false, "request_state": "dispatched", "action": "retry_alternate", "action_code": "IW-ACT-RETRY-ALTERNATE", "retry_after_ms": 1000, "scope": "model", "message": "Retry only when the logical request is independently replay-safe."}},
+      "expected": {"code": "upstream_timeout", "reason": "upstream_timeout", "retryable": true, "replay_safe": false, "request_state": "dispatched", "action": "retry_alternate", "action_code": "IW-ACT-RETRY-ALTERNATE", "retry_after_ms": 1000, "scope": "model"},
       "legacy": false
     },
     {
@@ -466,32 +147,8 @@
       "valid": true,
       "status": 429,
       "headers": {},
-      "body": {
-        "detail": {
-          "error": {
-            "type": "inferweave_backpressure",
-            "code": "caller_concurrency",
-            "reason": "caller_concurrency",
-            "retryable": false,
-            "replay_safe": false,
-            "request_state": "streaming",
-            "action": "reduce_concurrency",
-            "action_code": "IW-ACT-REDUCE-CONCURRENCY",
-            "scope": "caller",
-            "message": "Reduce caller concurrency; do not replay committed output."
-          }
-        }
-      },
-      "expected": {
-        "code": "caller_concurrency",
-        "reason": "caller_concurrency",
-        "retryable": false,
-        "replay_safe": false,
-        "request_state": "streaming",
-        "action": "reduce_concurrency",
-        "action_code": "IW-ACT-REDUCE-CONCURRENCY",
-        "scope": "caller"
-      },
+      "body": {"detail": {"error": {"type": "inferweave_backpressure", "code": "caller_concurrency", "reason": "caller_concurrency", "retryable": false, "replay_safe": false, "request_state": "streaming", "action": "reduce_concurrency", "action_code": "IW-ACT-REDUCE-CONCURRENCY", "scope": "caller", "message": "Reduce caller concurrency; do not replay committed output."}}},
+      "expected": {"code": "caller_concurrency", "reason": "caller_concurrency", "retryable": false, "replay_safe": false, "request_state": "streaming", "action": "reduce_concurrency", "action_code": "IW-ACT-REDUCE-CONCURRENCY", "scope": "caller"},
       "legacy": false
     },
     {
@@ -500,30 +157,8 @@
       "valid": false,
       "status": 503,
       "headers": {},
-      "body": {
-        "error": {
-          "type": "inferweave_backpressure",
-          "code": "future_condition",
-          "reason": "future_condition",
-          "retryable": false,
-          "replay_safe": false,
-          "request_state": "unknown",
-          "action": "future_action",
-          "action_code": "IW-ACT-UNKNOWN",
-          "scope": "global",
-          "message": "Unknown actions are surfaced but never automatically executed."
-        }
-      },
-      "expected": {
-        "code": "future_condition",
-        "reason": "future_condition",
-        "retryable": false,
-        "replay_safe": false,
-        "request_state": "unknown",
-        "action": null,
-        "action_code": null,
-        "scope": "global"
-      },
+      "body": {"error": {"type": "inferweave_backpressure", "code": "future_condition", "reason": "future_condition", "retryable": false, "replay_safe": false, "request_state": "unknown", "action": "future_action", "action_code": "IW-ACT-UNKNOWN", "scope": "global", "message": "Unknown actions are surfaced but never automatically executed."}},
+      "expected": {"code": "future_condition", "reason": "future_condition", "retryable": false, "replay_safe": false, "request_state": "unknown", "action": null, "action_code": null, "scope": "global"},
       "legacy": false
     },
     {
@@ -532,30 +167,8 @@
       "valid": true,
       "status": 400,
       "headers": {},
-      "body": {
-        "error": {
-          "type": "inferweave_backpressure",
-          "code": "invalid_request",
-          "reason": "invalid_request",
-          "retryable": false,
-          "replay_safe": false,
-          "request_state": "not_started",
-          "action": "fix_request",
-          "action_code": "IW-ACT-FIX-REQUEST",
-          "scope": "request",
-          "message": "</script><script>alert(\"x\")</script> & <img src=x onerror=alert(1)>"
-        }
-      },
-      "expected": {
-        "code": "invalid_request",
-        "reason": "invalid_request",
-        "retryable": false,
-        "replay_safe": false,
-        "request_state": "not_started",
-        "action": "fix_request",
-        "action_code": "IW-ACT-FIX-REQUEST",
-        "scope": "request"
-      },
+      "body": {"error": {"type": "inferweave_backpressure", "code": "invalid_request", "reason": "invalid_request", "retryable": false, "replay_safe": false, "request_state": "not_started", "action": "fix_request", "action_code": "IW-ACT-FIX-REQUEST", "scope": "request", "message": "</script><script>alert(\"x\")</script> & <img src=x onerror=alert(1)>"}},
+      "expected": {"code": "invalid_request", "reason": "invalid_request", "retryable": false, "replay_safe": false, "request_state": "not_started", "action": "fix_request", "action_code": "IW-ACT-FIX-REQUEST", "scope": "request"},
       "legacy": false
     }
   ]

@@ -1,7 +1,7 @@
 {
   "$schema": "https://biomejs.dev/schemas/1.9.4/schema.json",
   "files": {
-    "ignore": ["node_modules", "dist", "build", ".pi-eng", "services"]
+    "ignore": ["node_modules", "dist", "build", ".pi-eng", "services", "test/fixtures/backpressure-conformance-v1.json"]
   },
   "formatter": {
     "enabled": true,
