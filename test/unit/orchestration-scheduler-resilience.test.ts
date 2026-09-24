@@ -216,5 +216,8 @@ describe("MissionScheduler resilience (time-based gateway window)", () => {
     await scheduler.runMission(m.mission_id);
     assert.equal(calls, 1, "no retry for a non-transient failure");
     assert.equal(store.getTask(t.task_id)!.status, "FAILED");
+    // The worker's own summary is kept: the exit status alone hid the cause.
+    const failed = store.getTask(t.task_id) as unknown as { failure_reason?: string };
+    assert.equal(failed.failure_reason, "backend reported failed: worker gave up");
   });
 });

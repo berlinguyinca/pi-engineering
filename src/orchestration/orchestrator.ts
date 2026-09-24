@@ -760,8 +760,13 @@ export class Orchestrator {
       // satisfy integration — i.e. a mission could COMPLETE over an unchanged or
       // broken tree.
       if (outcome.exitStatus !== "succeeded") {
-        this.store.transitionTask(taskId, "FAILED", "system", { failure_reason: outcome.exitStatus });
-        this.report(`[mission ${missionId}] ${task.kind}:${task.role} FAILED (${outcome.exitStatus})`);
+        // Include the worker's own result summary so failures are diagnosable
+        // from the event log (guard aborts, budgets, timeouts otherwise vanish).
+        const detail = outcome.summary ? `: ${outcome.summary}` : "";
+        this.store.transitionTask(taskId, "FAILED", "system", {
+          failure_reason: `${outcome.exitStatus}${detail}`,
+        });
+        this.report(`[mission ${missionId}] ${task.kind}:${task.role} FAILED (${outcome.exitStatus}${detail})`);
         return false;
       }
       this.store.transitionTask(taskId, "SUCCEEDED");

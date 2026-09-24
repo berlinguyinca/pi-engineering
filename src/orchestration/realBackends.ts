@@ -199,6 +199,10 @@ export function realBackends(opts: RealBackendsOptions) {
           tools: ["ledger_read", "artifact_read", "repo_search", "symbol"],
           cwd: opts.cwd,
           maxContextTokens: 64_000,
+          // Same generous wall-clock budget as implementation workers: a review
+          // must inspect the integrated change before writing findings, and the
+          // executor's default (5 min) aborted the reviewer mid-analysis.
+          timeoutMs: workerTimeoutMs(),
         };
         const modelOverride = await opts.routeModel?.(req.role);
         if (modelOverride) req.modelOverride = modelOverride;

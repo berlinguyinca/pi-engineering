@@ -350,8 +350,11 @@ export class MissionScheduler {
               continue;
             }
           }
+          // Surface the worker's own result summary (guard aborts, budget
+          // exhaustion, timeouts, no-result) — exitStatus alone hid the cause.
+          const detail = outcome.summary ? `: ${outcome.summary}` : "";
           this.store.transitionTask(task.task_id, "FAILED", "system", {
-            failure_reason: `backend reported ${outcome.exitStatus}`,
+            failure_reason: `backend reported ${outcome.exitStatus}${detail}`,
           });
           return;
         }

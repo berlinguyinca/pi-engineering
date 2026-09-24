@@ -486,6 +486,9 @@ describe("exitStatus is authoritative (non-throwing backend failures)", () => {
       v.some((t) => t.status === "FAILED"),
       `a validation task must be FAILED, got ${v.map((t) => t.status).join(",")}`,
     );
+    // The failure reason carries the backend's own summary, not just the status.
+    const reasons = v.map((t) => (t as unknown as { failure_reason?: string }).failure_reason);
+    assert.ok(reasons.includes("failed: validation did not pass"), `got ${JSON.stringify(reasons)}`);
     assert.ok(h.calls.validation.length >= 1, "validation must still have been attempted");
   });
 

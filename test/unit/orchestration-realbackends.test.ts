@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import { workerTimeoutMs } from "../../src/orchestration/broker.ts";
 import { normalizeFindings, realBackends } from "../../src/orchestration/realBackends.ts";
 import type { WorkerExecutor, WorkerRequest } from "../../src/workers/WorkerExecutor.ts";
 
@@ -70,6 +71,21 @@ describe("realBackends capability routing", () => {
     });
     await backends.review.runReview({ objective: "review", signal: new AbortController().signal });
     assert.deepEqual(seen[0]?.modelOverride, { provider: "metabolomics", id: "qwen-vision" });
+  });
+
+  it("gives the reviewer the same wall-clock budget as implementation workers", async () => {
+    // Without an explicit budget the executor's 5-minute default aborted
+    // reviewers mid-analysis.
+    const seen: WorkerRequest[] = [];
+    const backends = realBackends({
+      worker: capturingWorker(seen),
+      verifier: {} as never,
+      artifacts: {} as never,
+      git: null,
+      cwd: "/repo",
+    });
+    await backends.review.runReview({ objective: "review", signal: new AbortController().signal });
+    assert.equal(seen[0]?.timeoutMs, workerTimeoutMs());
   });
 });
 
