@@ -13,10 +13,41 @@
  * with an active mutator exists, and concurrency policy permits.
  */
 
+import { CircuitBreaker } from "../resilience/circuitBreaker.ts";
+import type { InfraErrorCategory } from "../resilience/classify.ts";
+import { CATEGORY_TO_STATE } from "../resilience/classify.ts";
+import { type GatewayResilienceConfig, resolveGatewayResilienceConfig } from "../resilience/config.ts";
+import { type RecoveryProbe, healthyProbe } from "../resilience/probe.ts";
+import { type RetryWindowState, recordProbe, startRetryWindow, windowOpen } from "../resilience/retryWindow.ts";
 import { type SchedulableTask, Scheduler } from "../sched/Scheduler.ts";
 import type { ExecutionBroker, ExecutionHandle, ExecutionRequestInput } from "./broker.ts";
 import type { MissionStore } from "./missionStore.ts";
-import type { OrchestrationTask, TaskKind, TaskStatus } from "./types.ts";
+import type { MissionStatus, OrchestrationTask, TaskKind, TaskStatus } from "./types.ts";
+
+/** Real clock/sleep for production; tests inject deterministic fakes. */
+const realNow = (): number => Date.now();
+const realSleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Map a worker failure marker (`transient:<category>`) to the resilience
+ * infrastructure category. Returns null for markers that are NOT a confident
+ * transient-infrastructure failure (so those keep the existing failure path).
+ */
+function infraCategoryFromWorkerMarker(marker?: string): InfraErrorCategory | null {
+  if (!marker || !marker.startsWith("transient:")) return null;
+  const sub = marker.slice("transient:".length);
+  switch (sub) {
+    case "rate_limit":
+      return "RATE_LIMITED";
+    case "compaction":
+      return "CONTEXT_RECOVERABLE";
+    case "permanent":
+      return null;
+    default:
+      // server_unavailable, server_error, network, timeout
+      return "TRANSIENT_INFRASTRUCTURE";
+  }
+}
 
 export interface SchedulerLimits {
   maxActive: number;
@@ -44,6 +75,22 @@ export interface SchedulerOptions {
   limits?: Partial<SchedulerLimits>;
   /** Called when a task reaches a terminal state. */
   onTaskSettled?: (missionId: string, taskId: string, status: TaskStatus) => void;
+  /**
+   * Mission-level gateway resilience config. Defaults to the environment-resolved
+   * config (90-min time-based window, 10s probes, auto-resume). A transient
+   * infrastructure failure in a worker is retried within this window (parking
+   * the mission in a WAITING_* state) instead of failing the task; on exhaustion
+   * the mission pauses (PAUSED_INFRASTRUCTURE), not fails.
+   */
+  resilience?: GatewayResilienceConfig;
+  /** Lightweight gateway recovery probe. Defaults to a pass-through healthy probe. */
+  probe?: RecoveryProbe;
+  /** Injectable clock (default Date.now) for the retry window + circuit breaker. */
+  now?: () => number;
+  /** Injectable sleep (default real setTimeout) for probe waits. */
+  sleep?: (ms: number) => Promise<void>;
+  /** Injectable RNG (default Math.random) for probe jitter. */
+  rand?: () => number;
 }
 
 /** Failure classifier (spec 02 retry/recovery). */
@@ -96,12 +143,31 @@ export class MissionScheduler {
   /** Counters for concurrency limits. */
   private counters = { agents: 0, subprocesses: 0, byRole: new Map<string, number>() };
   private queue: Scheduler;
+  /** Mission-level gateway resilience config (time-based window, probes). */
+  private readonly resilience: GatewayResilienceConfig;
+  /** Lightweight gateway recovery probe. */
+  private readonly probe: RecoveryProbe;
+  private readonly clockNow: () => number;
+  private readonly sleepFn: (ms: number) => Promise<void>;
+  private readonly rand: () => number;
+  /** Per-task active retry window (created on the first infra failure). */
+  private readonly windows = new Map<string, RetryWindowState>();
+  /** Per-task circuit breaker (prevents a request storm during recovery). */
+  private readonly breakers = new Map<string, CircuitBreaker>();
 
   constructor(opts: SchedulerOptions) {
     this.store = opts.store;
     this.broker = opts.broker;
     this.limits = { ...DEFAULT_LIMITS, ...opts.limits };
     this.onTaskSettled = opts.onTaskSettled;
+    // Resolve the time-based resilience config (env-overridable). Resilience is
+    // ON by default so missions survive gateway outages; a probe + clock + sleep
+    // are injectable for deterministic fault-injection tests.
+    this.resilience = opts.resilience ?? resolveGatewayResilienceConfig();
+    this.probe = opts.probe ?? healthyProbe();
+    this.clockNow = opts.now ?? realNow;
+    this.sleepFn = opts.sleep ?? realSleep;
+    this.rand = opts.rand ?? Math.random;
     this.queue = new Scheduler({ concurrency: this.limits.maxActive });
   }
 
@@ -198,7 +264,11 @@ export class MissionScheduler {
       for (const task of runnable) {
         if (signal?.aborted) break;
         if (this.hasConflict(task)) continue;
-        this.store.transitionTask(task.task_id, "READY");
+        // Idempotent: a resumed (already-READY) task must not throw on
+        // READY -> READY; only transition from PENDING/WAITING.
+        if (this.store.getTask(task.task_id)?.status !== "READY") {
+          this.store.transitionTask(task.task_id, "READY");
+        }
         this.acquire(task);
         void this.runOne(task);
       }
@@ -227,6 +297,15 @@ export class MissionScheduler {
     let attempt = task.attempt;
     while (true) {
       attempt++;
+      // Resilience probe gate: when a time-based retry window is active for this
+      // task (a prior transient infrastructure failure), start a fresh worker
+      // attempt ONLY once the recovery probe reports the gateway healthy; otherwise
+      // wait the probe interval and re-check, without burning a full worker session.
+      // On window exhaustion the mission is PAUSED (not FAILED).
+      const gate = await this.probeGate(task);
+      if (gate === "paused") return;
+      if (gate === "wait") continue;
+
       let handle: ExecutionHandle;
       try {
         // execute() itself can throw (e.g. no backend registered for the kind).
@@ -257,15 +336,37 @@ export class MissionScheduler {
         // without throwing. Treating resolution as success let a failed worker
         // satisfy the completion gate.
         if (outcome.exitStatus !== "succeeded") {
+          // A worker transient-infra marker (e.g. `transient:server_unavailable`)
+          // enters the time-based resilience window (park in WAITING_*, retry,
+          // pause on exhaustion) instead of immediately failing the task. Other
+          // non-throwing failures keep the existing behaviour.
+          const infraCat = infraCategoryFromWorkerMarker(outcome.error);
+          if (infraCat) {
+            const res = this.resilienceGate(task, infraCat);
+            if (res.paused) return;
+            if (res.retry) {
+              this.store.transitionTask(task.task_id, "RETRYING", "system", { attempt });
+              await this.sleepFn(res.waitMs);
+              continue;
+            }
+          }
           this.store.transitionTask(task.task_id, "FAILED", "system", {
             failure_reason: `backend reported ${outcome.exitStatus}`,
           });
           return;
         }
+        // Success: clear the resilience window, close the breaker, and resume the
+        // mission out of any WAITING state it was parked in.
+        this.breakerSuccess(task);
+        this.clearResilience(task);
+        this.resumeToExecuting(task.mission_id);
         this.store.transitionTask(task.task_id, "SUCCEEDED");
         return;
       } catch (err) {
         if (this.store.getTask(task.task_id)?.status === "CANCELED") return;
+        // Thrown failures (e.g. no backend registered) keep the existing
+        // attempt-count repair path; the time-based window applies to the
+        // worker's non-throwing transient-infrastructure outcomes above.
         const { action, reason } = classifyFailure(err, task);
         if (action === "retry" && attempt < task.max_attempts) {
           this.store.transitionTask(task.task_id, "RETRYING", "system", { attempt });
@@ -275,6 +376,178 @@ export class MissionScheduler {
         return;
       }
     }
+  }
+
+  /**
+   * Probe gate: active only when a resilience retry window exists for the task.
+   * Waits for gateway recovery before starting a real worker attempt, and pauses
+   * the mission (not fails) when the retry window is exhausted.
+   *   "proceed" — start a real attempt now;
+   *   "wait"    — sleep (already done) and re-loop without an attempt;
+   *   "paused"  — window exhausted; the mission is paused, stop.
+   */
+  private async probeGate(task: OrchestrationTask): Promise<"proceed" | "wait" | "paused"> {
+    const window = this.windows.get(task.task_id);
+    if (!window) return "proceed";
+    const cfg = this.resilience;
+    if (!windowOpen(window, this.clockNow())) return this.pauseMission(task) ? "paused" : "proceed";
+    // Circuit breaker: while OPEN and the cooldown has not elapsed, only probe.
+    const breaker = this.breakers.get(task.task_id);
+    if (breaker && !breaker.allowRequest()) {
+      await this.sleepFn(cfg.probe_interval_ms);
+      return "wait";
+    }
+    breaker?.tryHalfOpen();
+    const result = await this.probe.probe();
+    if (result.healthy) return "proceed";
+    // Gateway still down: honour the reported wait (else the probe interval),
+    // then re-probe without a real attempt.
+    await this.sleepFn(result.retry_after_ms ?? cfg.probe_interval_ms);
+    return "wait";
+  }
+
+  /**
+   * Decide the resilience action for a transient-infrastructure failure. Within
+   * the retry window, parks the mission in the matching WAITING_* state and
+   * schedules a retry; on exhaustion pauses the mission (NOT FAILED) and leaves
+   * the task resumable. Returns retry=false when resilience should not apply
+   * (disabled) so the caller falls through to normal failure handling.
+   */
+  private resilienceGate(
+    task: OrchestrationTask,
+    cat: InfraErrorCategory,
+  ): { retry: boolean; waitMs: number; paused: boolean } {
+    const cfg = this.resilience;
+    if (!cfg || !cfg.retry_transient_errors) return { retry: false, waitMs: 0, paused: false };
+    let window = this.windows.get(task.task_id);
+    if (!window) {
+      window = startRetryWindow(this.clockNow(), cfg.retry_window_ms);
+      this.windows.set(task.task_id, window);
+    }
+    if (!windowOpen(window, this.clockNow())) {
+      if (this.pauseMission(task)) return { retry: false, waitMs: 0, paused: true };
+      return { retry: false, waitMs: 0, paused: false };
+    }
+    // Park the mission in the state matching the failure category and record the
+    // probe; the task is left resumable by the caller (RETRYING).
+    this.parkMission(task.mission_id, CATEGORY_TO_STATE[cat] as MissionStatus);
+    this.breakerFailure(task);
+    this.windows.set(task.task_id, recordProbe(window, this.clockNow()));
+    const wait = cfg.probe_interval_ms + (cfg.jitter_ms > 0 ? Math.round(cfg.jitter_ms * this.rand()) : 0);
+    return { retry: true, waitMs: wait, paused: false };
+  }
+
+  /** Park the mission in a state; idempotent and safe against illegal transitions. */
+  private parkMission(missionId: string, state: MissionStatus): void {
+    const mission = this.store.getMission(missionId);
+    if (!mission || mission.status === state) return;
+    try {
+      this.store.transitionMission(missionId, state);
+    } catch {
+      /* mission already in an incompatible state — leave it */
+    }
+  }
+
+  /** Resume a parked mission back to EXECUTING after a task succeeds. Only when
+   * no other task in the mission is still paused (RETRYING), so a mission with a
+   * paused task never reports EXECUTING. */
+  private resumeToExecuting(missionId: string): void {
+    const mission = this.store.getMission(missionId);
+    if (!mission || mission.status === "EXECUTING") return;
+    const parked: MissionStatus[] = [
+      "WAITING_FOR_LLM",
+      "WAITING_FOR_CAPACITY",
+      "WAITING_FOR_GATEWAY",
+      "WAITING_FOR_MODEL",
+      "WAITING_FOR_TOOL",
+      "RECOVERING_CONTEXT",
+      "RECOVERING_PROCESS",
+      "PAUSED_INFRASTRUCTURE",
+    ];
+    if (!parked.includes(mission.status)) return;
+    const anyPaused = this.store.listTasks(missionId).some((t) => t.status === "RETRYING");
+    if (anyPaused) return;
+    try {
+      this.store.transitionMission(missionId, "EXECUTING");
+    } catch {
+      /* ignore */
+    }
+  }
+
+  /** Pause a mission on retry-window exhaustion: PAUSED (not FAILED), resumable. */
+  private pauseMission(task: OrchestrationTask): boolean {
+    const mission = this.store.getMission(task.mission_id);
+    if (!mission) return false;
+    this.parkMission(task.mission_id, "PAUSED_INFRASTRUCTURE");
+    this.markTaskResumable(task);
+    this.clearResilience(task);
+    return true;
+  }
+
+  /** Leave a task in a resumable non-terminal state (RETRYING) for later re-run. */
+  private markTaskResumable(task: OrchestrationTask): void {
+    const status = this.store.getTask(task.task_id)?.status;
+    if (status === "RUNNING") {
+      this.store.transitionTask(task.task_id, "RETRYING", "system", {
+        failure_reason: "infrastructure retry window exhausted — paused (auto-resume on recovery)",
+      });
+    }
+  }
+
+  private breakerFailure(task: OrchestrationTask): void {
+    let breaker = this.breakers.get(task.task_id);
+    if (!breaker) {
+      breaker = new CircuitBreaker({
+        threshold: this.resilience.circuit_breaker_threshold,
+        openCooldownMs: this.resilience.probe_interval_ms,
+        now: this.clockNow,
+      });
+      this.breakers.set(task.task_id, breaker);
+    }
+    breaker.recordFailure();
+  }
+
+  private breakerSuccess(task: OrchestrationTask): void {
+    this.breakers.get(task.task_id)?.recordSuccess();
+    this.breakers.delete(task.task_id);
+  }
+
+  /** Drop the task's retry window + breaker (used on success and pause). */
+  private clearResilience(task: OrchestrationTask): void {
+    this.windows.delete(task.task_id);
+    this.breakers.delete(task.task_id);
+  }
+
+  /** Lightweight gateway readiness check (for auto-resume decisions). */
+  async gatewayHealthy(): Promise<boolean> {
+    const result = await this.probe.probe();
+    return result.healthy;
+  }
+
+  /**
+   * Re-run the paused task(s) of a mission whose infrastructure has recovered.
+   * Transitions any RETRYING (resumable) tasks back to READY and drives the
+   * scheduler to a new terminal state. Called on auto-resume (gateway healthy)
+   * or on operator restart. Returns the final mission status.
+   */
+  async resumePausedMission(missionId: string, signal?: AbortSignal): Promise<MissionStatus> {
+    const mission = this.store.getMission(missionId);
+    if (!mission) throw new Error(`unknown mission ${missionId}`);
+    // Only a paused mission is resumable here.
+    if (mission.status !== "PAUSED_INFRASTRUCTURE") return mission.status;
+    this.resumeToExecuting(missionId);
+    // Re-queue any resumable (RETRYING) tasks.
+    for (const t of this.store.listTasks(missionId)) {
+      if (t.status === "RETRYING") {
+        try {
+          this.store.transitionTask(t.task_id, "READY");
+        } catch {
+          /* already re-queued */
+        }
+      }
+    }
+    await this.runMission(missionId, signal);
+    return this.store.getMission(missionId)?.status ?? "FAILED";
   }
 }
 
