@@ -349,6 +349,51 @@ test("honors retry-after precedence: retry-after-ms header beats body retry_afte
   assert.equal(clock.waits[0]!.ms, 30_000);
 });
 
+test("an injected monotonic clock does not replace wall time for HTTP-date retry-after", async () => {
+  const originalDateNow = Date.now;
+  const epoch = Date.parse("2026-09-23T12:00:00Z");
+  let monotonic = 100;
+  let calls = 0;
+  const waits: number[] = [];
+  try {
+    Date.now = () => epoch;
+    const stream = executeWithAdmissionRetry(
+      model(),
+      context() as never,
+      {} as never,
+      (attempt, _options, capture) => {
+        calls++;
+        if (attempt === 1) {
+          capture.admission = {
+            reason: "queue_timeout",
+            payload: { type: "inference_admission", reason: "queue_timeout" },
+          };
+          capture.status = 429;
+          capture.headers = { "retry-after": "Wed, 23 Sep 2026 12:00:30 GMT" };
+          return errorStream();
+        }
+        return successStream();
+      },
+      {
+        config: normalizeAdmissionConfig({ max_elapsed_ms: 60_000, jitter_ratio: 0 }),
+        now: () => monotonic,
+        sleep: async (ms) => {
+          waits.push(ms);
+          monotonic += ms;
+        },
+        random: () => 0,
+      },
+    );
+
+    const { terminal } = await collect(stream);
+    assert.equal(terminal.type, "done");
+    assert.equal(calls, 2);
+    assert.deepEqual(waits, [30_000]);
+  } finally {
+    Date.now = originalDateNow;
+  }
+});
+
 test("max attempts: a persistent rejection exhausts the attempt budget", async () => {
   const config = normalizeAdmissionConfig({
     max_attempts: 3,
@@ -427,6 +472,45 @@ test("sleep jitter overrun is rechecked before the next structured request", asy
   const { terminal } = await collect(stream);
   assert.equal(calls, 1, "elapsed time must be rechecked immediately before replay");
   assert.match((terminal as { error?: { errorMessage?: string } }).error?.errorMessage ?? "", /queue_timeout/);
+});
+
+test("a synchronous retry-state hook cannot advance past budget before invoke", async () => {
+  let now = 0;
+  let calls = 0;
+  const config = normalizeAdmissionConfig({ max_attempts: 10, max_elapsed_ms: 1_000, jitter_ratio: 0 });
+  const stream = executeWithAdmissionRetry(
+    model(),
+    context() as never,
+    {} as never,
+    (_attempt, _options, capture) => {
+      calls++;
+      capture.admission = {
+        ...admissionInfo("queue_timeout", 500),
+        code: "RETAINED-CODE",
+        message: "retained structured failure",
+        actionCode: "IW-ACT-BACKOFF",
+      };
+      return errorStream("generic provider failure");
+    },
+    {
+      config,
+      now: () => now,
+      sleep: async (ms) => {
+        now += ms;
+      },
+      random: () => 0,
+      onState: (state) => {
+        if (state.phase === "RETRYING") now = 1_001;
+      },
+    },
+  );
+
+  const { terminal } = await collect(stream);
+  assert.equal(calls, 1, "the elapsed guard must run after synchronous retry hooks and before invoke");
+  const message = (terminal as { error?: { errorMessage?: string } }).error?.errorMessage ?? "";
+  assert.match(message, /retained structured failure/);
+  assert.match(message, /RETAINED-CODE/);
+  assert.match(message, /IW-ACT-BACKOFF/);
 });
 
 test("the structured transport elapsed budget ignores wall-clock jumps by default", async () => {

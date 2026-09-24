@@ -163,6 +163,35 @@ test("stream retry: a 503 AFTER output is not retried — retrying would duplica
   assert.equal(h.seen.length, 0);
 });
 
+test("stream retry: partial output withholds and augments one generic terminal from result guidance", async () => {
+  let opened = 0;
+  const generic = failed("provider request failed");
+  const open = () => {
+    opened++;
+    return {
+      async *[Symbol.asyncIterator]() {
+        yield text("partial");
+        yield generic;
+      },
+      result: async (): Promise<Res> => ({ stopReason: "error", errorMessage: EXPLICIT_FALSE }),
+    };
+  };
+  const out = sink();
+
+  await pumpWithGatewayRetry(open, out, { hold: holds().hold });
+
+  assert.equal(opened, 1, "partial output must make replay unsafe");
+  assert.deepEqual(
+    out.pushed.map((event) => event.type),
+    ["text_delta", "error"],
+    "the failing terminal is emitted exactly once after guidance is available",
+  );
+  const terminalMessage = out.pushed.at(-1)?.error?.errorMessage ?? "";
+  assert.match(terminalMessage, /final server message/);
+  assert.match(terminalMessage, /FINAL-CODE/);
+  assert.match(terminalMessage, /IW-ACT-DO-NOT-RETRY/);
+});
+
 test("stream retry: the body-advertised wait is honoured exactly", async () => {
   const s = scripted([[failed(ADMISSION_429)], [done()]]);
   const h = holds();

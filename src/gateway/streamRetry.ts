@@ -229,7 +229,7 @@ export async function pumpWithGatewayRetry<E extends RetryableEvent, R extends R
           // thing we forward — and a failing one is held until we have decided.
           // Both shapes count: `type: "error"`, and `done` carrying a message
           // whose stopReason is "error".
-          if (!forwarded && carriesFailure<E, R>(event)) {
+          if (carriesFailure<E, R>(event)) {
             withheld = event;
             continue;
           }

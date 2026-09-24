@@ -76,7 +76,12 @@ function createAssistantMessageEventStream(): AssistantMessageEventStream {
   };
   return stream as unknown as AssistantMessageEventStream;
 }
-import { type AdmissionRetryConfig, decideAdmission, resolveAdmissionScope } from "./admissionConfig.ts";
+import {
+  type AdmissionDecision,
+  type AdmissionRetryConfig,
+  decideAdmission,
+  resolveAdmissionScope,
+} from "./admissionConfig.ts";
 import {
   type AdmissionAction,
   AdmissionFailure,
@@ -458,7 +463,7 @@ export function executeWithAdmissionRetry(
 ): AssistantMessageEventStream {
   const out = createAssistantMessageEventStream();
   const now = opts.now ?? monotonicNow;
-  const wallNow = opts.now ?? Date.now;
+  const wallNow = Date.now;
   const sleep = opts.sleep ?? abortableSleep;
   const random = opts.random ?? Math.random;
   const config = resolveAdmissionScope(opts.config, model.provider, model.id);
@@ -478,6 +483,7 @@ export function executeWithAdmissionRetry(
   let lastDelayMs = 0;
   let lastDelaySource: RetryDelaySource | undefined;
   let lastDecision: AdmissionAction | undefined;
+  let lastPolicy: AdmissionDecision | undefined;
 
   const scopeOf = (): AdmissionScope => (typeof scopeConfig === "function" ? scopeConfig(sessionIdOf()) : scopeConfig);
 
@@ -683,6 +689,29 @@ export function executeWithAdmissionRetry(
         model: model.id,
       });
 
+      // Synchronous state/event/log hooks above may consume the last sliver of
+      // the elapsed budget. Guard at the actual replay boundary, immediately
+      // before opening the next provider request, and retain the last refusal.
+      if (attempt > 1 && lastPolicy) {
+        const preInvokeReason = evaluateTerminal({
+          decision: lastPolicy.action,
+          fallbackAfterMs: lastPolicy.fallbackAfterMs,
+          reasonBudgetMs: lastPolicy.maxElapsedMs,
+          waitedMs,
+          elapsedMs: now() - startedAt,
+          attempt: attempt - 1,
+          maxAttempts: config.max_attempts,
+          ledger: ledgerActive ? opts.budget : undefined,
+          budgetKey,
+          windowMs: ledgerWindowMs,
+          sharedBudgetMs: config.shared_budget_ms,
+        });
+        if (preInvokeReason) {
+          failAdmission(preInvokeReason);
+          return;
+        }
+      }
+
       let outcome: AttemptOutcome;
       try {
         outcome = await consumeAttempt(invoke(attempt, attemptOptions, capture), capture);
@@ -736,6 +765,7 @@ export function executeWithAdmissionRetry(
         explicitReplayContract: admission.explicitReplayContract,
       });
       lastDecision = decision.action;
+      lastPolicy = decision;
 
       if (options?.signal?.aborted) {
         cancelWait("aborted_before_wait");
