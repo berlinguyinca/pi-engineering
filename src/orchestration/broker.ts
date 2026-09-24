@@ -56,6 +56,14 @@ export interface ExecutionOutcome {
   artifactRefs: string[];
   usage: Record<string, unknown>;
   findings?: Array<Record<string, unknown>>;
+  /**
+   * Machine-readable failure marker, when the backend reports one (e.g. the
+   * worker's `transient:<category>` marker). Carries the structured failure
+   * reason so the mission scheduler can classify a NON-throwing failure and
+   * route a transient infrastructure failure into the time-based resilience
+   * window instead of immediately failing the task.
+   */
+  error?: string;
 }
 
 /** Backend runner contracts — injected, so the broker stays deterministic-testable. */
