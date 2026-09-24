@@ -116,11 +116,20 @@ test("decideAdmission maps the taxonomy to actions", () => {
   assert.equal(decideAdmission(cfg, { reason: "auth_failed", status: 429 }).action, "fail");
 });
 
-test("HTTP status outranks the reason token: auth/authorization statuses always fail", () => {
+test("HTTP status outranks replay flags: permanent statuses always fail", () => {
   const cfg = normalizeAdmissionConfig({});
-  for (const status of [400, 401, 403, 404, 422]) {
+  for (const status of [400, 401, 403, 404, 409, 413, 422]) {
     // Even a retryable reason token on a permanent status is a hard fail.
-    assert.equal(decideAdmission(cfg, { reason: "queue_timeout", status }).action, "fail", `status ${status}`);
+    assert.equal(
+      decideAdmission(cfg, {
+        reason: "queue_timeout",
+        status,
+        serverDelayMs: 1_000,
+        explicitReplayContract: true,
+      }).action,
+      "fail",
+      `status ${status}`,
+    );
   }
   // A retryable reason on a non-permanent 4xx/5xx is still retried.
   assert.equal(decideAdmission(cfg, { reason: "queue_timeout", status: 503 }).action, "retry");

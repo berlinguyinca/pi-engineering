@@ -69,7 +69,7 @@ export interface AdmissionReasonPolicy {
 export const ADMISSION_STATUSES: readonly number[] = [429, 503];
 
 /** Statuses that are permanent regardless of the reason token carried. */
-export const PERMANENT_ADMISSION_STATUSES: readonly number[] = [400, 401, 403, 404, 422];
+export const PERMANENT_ADMISSION_STATUSES: readonly number[] = [400, 401, 403, 404, 409, 413, 422];
 
 /** Reason taxonomy and defaults (spec 01 §4). */
 export const DEFAULT_ADMISSION_REASON_POLICY: Readonly<Record<string, AdmissionReasonPolicy>> = {
@@ -236,7 +236,10 @@ export function parseAdmissionPayload(value: unknown): AdmissionInfo | undefined
 /** Shared pure replay gate used by both structured and interactive transports. */
 export function isAutomaticReplayAllowed(info: AdmissionInfo, outputCommitted: boolean): boolean {
   if (outputCommitted) return false;
-  if (info.explicitReplayContract !== true) return true;
+  if (info.explicitReplayContract !== true) {
+    const policy = DEFAULT_ADMISSION_REASON_POLICY[info.reason];
+    return policy === undefined || policy.action === "retry" || policy.action === "retry_then_fallback";
+  }
   return (
     info.retryable === true &&
     info.replaySafe === true &&
@@ -244,6 +247,19 @@ export function isAutomaticReplayAllowed(info: AdmissionInfo, outputCommitted: b
     info.actionCode !== undefined &&
     REPLAY_ACTION_CODES.has(info.actionCode)
   );
+}
+
+/** Preserve normalized server guidance when a provider flattens the terminal error. */
+export function augmentInferenceErrorMessage(
+  providerMessage: string | undefined,
+  guidance: Pick<InferenceGuidance, "message" | "code" | "actionCode">,
+): string {
+  const base = providerMessage?.trim() || "Inference request rejected";
+  const parts = [base];
+  if (guidance.message && !base.includes(guidance.message)) parts.push(`message=${guidance.message}`);
+  if (guidance.code && !base.includes(guidance.code)) parts.push(`code=${guidance.code}`);
+  if (guidance.actionCode && !base.includes(guidance.actionCode)) parts.push(`action_code=${guidance.actionCode}`);
+  return parts.join(", ");
 }
 
 function candidateAdmissionObject(body: unknown): Record<string, unknown> | undefined {

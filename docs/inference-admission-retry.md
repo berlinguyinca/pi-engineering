@@ -75,7 +75,9 @@ A response is normalized from a supported type tag at the top level or under
 retryable and replay-safe flags, `not_started`/`queued`, a permitted frozen
 action code, no committed output, and remaining finite attempt and elapsed
 budgets. Explicit false and unknown actions are terminal. Legacy envelopes
-without these fields keep conservative compatibility heuristics.
+without these fields keep conservative compatibility heuristics, except
+permanent quota, authentication, authorization, and malformed-request reasons,
+which are never replayed.
 
 ### Reason taxonomy
 
@@ -87,7 +89,7 @@ without these fields keep conservative compatibility heuristics.
 | `auth_failed`, `forbidden`, `malformed_request` | `fail` (permanent) |
 | *unknown* | `retry_if_server_delay_present` (60s budget) |
 
-The **HTTP status outranks the reason token**: `400/401/403/404/422` always
+The **HTTP status outranks the reason token**: `400/401/403/404/409/413/422` always
 `fail`, whatever the gateway labelled it.
 
 ### Retry timing
@@ -100,8 +102,10 @@ Server minima are never clamped downward. Jitter is **positive-only** and must
 fit the remaining elapsed budget; otherwise the retry chain stops and preserves
 the final server message/code.
 
-The interactive wrapper defaults to 8 attempts and 300000 ms elapsed. Its
-clock is injectable for deterministic tests. Model-scoped cooldowns are keyed
+The interactive wrapper defaults to 8 attempts and 300000 ms elapsed. Duration
+budgets and cooldowns use a monotonic clock; wall time is used only to interpret
+HTTP-date retry headers and render countdown deadlines. The duration clock is
+injectable for deterministic tests. Model-scoped cooldowns are keyed
 by provider/model and do not pause unrelated models; absent scope retains the
 legacy process-wide hold.
 
@@ -209,7 +213,7 @@ coverage includes the real provider registry, extension event wiring, and the
   cancellation. It is never silently skipped.
 - **`quota_exhausted` still fails.** That is by design: quota is a permanent
   condition, so it goes to fallback/terminal, never a wait.
-- **Auth failures loop.** They don't: `400/401/403/404/422` always `fail`
+- **Permanent failures loop.** They don't: `400/401/403/404/409/413/422` always `fail`
   immediately.
 - **A wait ran long.** `max_elapsed_ms` and `max_attempts` bound a single
   logical operation; `shared_budget_ms` bounds it across re-entrant operations

@@ -17,7 +17,11 @@
  */
 
 /** A gateway telling us to wait (or to stop). */
-import { isAutomaticReplayAllowed, parseAdmissionPayload } from "../inference/admissionContract.ts";
+import {
+  PERMANENT_ADMISSION_STATUSES,
+  isAutomaticReplayAllowed,
+  parseAdmissionPayload,
+} from "../inference/admissionContract.ts";
 import { parseRetryAfterHeader, parseRetryAfterMsHeader } from "../inference/retryDelay.ts";
 
 // Re-export the shared Retry-After parser so existing gateway callers keep a
@@ -164,11 +168,14 @@ export function parseGatewayWait(input: GatewayWaitInput): GatewayWaitSignal | n
 
   // Quota/billing exhaustion is deterministic: waiting never clears it, and Pi's
   // own retry classifier fails fast there for the same reason.
-  const retryable = malformedNewContract
-    ? false
-    : admission
-      ? isAutomaticReplayAllowed(admission, false)
-      : !NON_RETRYABLE_PATTERNS.test(text);
+  const retryable =
+    status !== undefined && PERMANENT_ADMISSION_STATUSES.includes(status)
+      ? false
+      : malformedNewContract
+        ? false
+        : admission
+          ? isAutomaticReplayAllowed(admission, false)
+          : !NON_RETRYABLE_PATTERNS.test(text);
 
   const bodyWaitMs =
     admission?.retryAfterMs ??

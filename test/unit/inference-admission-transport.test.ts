@@ -243,8 +243,8 @@ test("admission contract: a single 429 then success succeeds after one wait", as
   assert.ok(names.includes("inference.retry.succeeded"));
 });
 
-test("new-contract explicit false is surfaced with the final server message and codes", async () => {
-  const finalText = "capacity rejected: FINAL-CODE / IW-ACT-DO-NOT-RETRY";
+test("new-contract explicit false augments a generic provider error with final guidance", async () => {
+  const finalText = "provider request failed";
   const { stream, clock } = runTransport({
     rejections: 0,
     invoke: (_attempt, _options, capture) => {
@@ -266,8 +266,49 @@ test("new-contract explicit false is surfaced with the final server message and 
   });
   const { terminal } = await collect(stream);
   assert.equal(clock.waits.length, 0);
+  assert.match((terminal as { error?: { errorMessage?: string } }).error?.errorMessage ?? "", /final server message/);
   assert.match((terminal as { error?: { errorMessage?: string } }).error?.errorMessage ?? "", /FINAL-CODE/);
   assert.match((terminal as { error?: { errorMessage?: string } }).error?.errorMessage ?? "", /IW-ACT-DO-NOT-RETRY/);
+});
+
+test("committed output augments its terminal provider error with captured guidance", async () => {
+  const clock = new FakeClock();
+  const stream = executeWithAdmissionRetry(
+    model(),
+    context() as never,
+    {} as never,
+    (_attempt, _options, capture) => {
+      capture.admission = {
+        type: "inferweave_backpressure",
+        reason: "internal_error",
+        code: "COMMITTED-CODE",
+        message: "do not replay committed output",
+        retryable: true,
+        replaySafe: true,
+        requestState: "queued",
+        action: "backoff",
+        actionCode: "IW-ACT-BACKOFF",
+        explicitReplayContract: true,
+        payload: {},
+      };
+      const s = createAssistantMessageEventStream();
+      s.push({ type: "text_delta", contentIndex: 0, delta: "partial", partial: {} as never });
+      s.push({
+        type: "error",
+        reason: "error",
+        error: terminalAssistantMessage(model(), "provider request failed", "error"),
+      });
+      s.end();
+      return s;
+    },
+    { config: CONFIG, now: clock.now.bind(clock), sleep: clock.sleep.bind(clock), random: () => 0 },
+  );
+
+  const { terminal } = await collect(stream);
+  const message = (terminal as { error?: { errorMessage?: string } }).error?.errorMessage ?? "";
+  assert.match(message, /do not replay committed output/);
+  assert.match(message, /COMMITTED-CODE/);
+  assert.match(message, /IW-ACT-BACKOFF/);
 });
 
 test("acceptance: four 30s queue_timeout waits then a successful stream", async () => {
@@ -358,6 +399,64 @@ test("max elapsed: a rejection beyond the elapsed budget fails without over-wait
   assert.equal(exhausted.terminatedBy, "budget_elapsed");
   // No wait longer than the remaining budget was performed.
   assert.ok(clock.waits.every((w) => w.ms <= 30_000));
+});
+
+test("sleep jitter overrun is rechecked before the next structured request", async () => {
+  let now = 0;
+  let calls = 0;
+  const config = normalizeAdmissionConfig({ max_attempts: 10, max_elapsed_ms: 1_000, jitter_ratio: 0 });
+  const stream = executeWithAdmissionRetry(
+    model(),
+    context() as never,
+    {} as never,
+    (_attempt, _options, capture) => {
+      calls++;
+      capture.admission = admissionInfo("queue_timeout", 500);
+      return errorStream("retained server failure");
+    },
+    {
+      config,
+      now: () => now,
+      sleep: async () => {
+        now = 1_001;
+      },
+      random: () => 0,
+    },
+  );
+
+  const { terminal } = await collect(stream);
+  assert.equal(calls, 1, "elapsed time must be rechecked immediately before replay");
+  assert.match((terminal as { error?: { errorMessage?: string } }).error?.errorMessage ?? "", /queue_timeout/);
+});
+
+test("the structured transport elapsed budget ignores wall-clock jumps by default", async () => {
+  const originalDateNow = Date.now;
+  let calls = 0;
+  let wallNow = 0;
+  try {
+    Date.now = () => wallNow;
+    const config = normalizeAdmissionConfig({ max_attempts: 2, max_elapsed_ms: 10_000, jitter_ratio: 0 });
+    const stream = executeWithAdmissionRetry(
+      model(),
+      context() as never,
+      {} as never,
+      (attempt, _options, capture) => {
+        calls++;
+        if (attempt === 1) {
+          capture.admission = admissionInfo("queue_timeout", 500);
+          wallNow = 1_000_000;
+          return errorStream();
+        }
+        return successStream();
+      },
+      { config, sleep: async () => {}, random: () => 0 },
+    );
+    const { terminal } = await collect(stream);
+    assert.equal(terminal.type, "done");
+    assert.equal(calls, 2);
+  } finally {
+    Date.now = originalDateNow;
+  }
 });
 
 test("cancellation during a wait is immediate and not reported as an InferWeave failure", async () => {

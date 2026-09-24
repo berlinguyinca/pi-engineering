@@ -28,6 +28,7 @@ import type {
   Model,
   SimpleStreamOptions,
 } from "@earendil-works/pi-ai/compat";
+import { monotonicNow } from "../core/clock.ts";
 // The pi-ai `utils/event-stream` subpath does not resolve under Pi's resource
 // loader (it resolves the package main then appends the subpath, yielding
 // `dist/compat.js/utils/event-stream`). `@earendil-works/pi-ai/compat` exports
@@ -81,7 +82,9 @@ import {
   AdmissionFailure,
   type AdmissionHeaders,
   type AdmissionInfo,
+  DEFAULT_ADMISSION_REASON_POLICY,
   admissionFromResponse,
+  augmentInferenceErrorMessage,
   isAutomaticReplayAllowed,
   mayCarryAdmission,
   serverRequestIdFromHeaders,
@@ -140,7 +143,7 @@ export interface AdmissionState {
   maxAttempts: number;
   /** Cumulative time already waited for this logical operation. */
   waitedMs: number;
-  /** Wall-clock time since the operation started. */
+  /** Monotonic time since the operation started. */
   elapsedMs: number;
   reason?: string;
   httpStatus?: number;
@@ -164,7 +167,7 @@ export interface AdmissionTransportOptions {
   events?: AdmissionEventBus;
   /** Attempt implementation. Defaults to the pi-ai implementation for `model.api`. */
   delegate?: AdmissionStreamFunction;
-  /** Clock (epoch ms). Injectable for deterministic tests. */
+  /** Monotonic duration clock. Injectable for deterministic tests. */
   now?: () => number;
   /** Interruptible sleep. Injectable for deterministic tests. */
   sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
@@ -454,7 +457,8 @@ export function executeWithAdmissionRetry(
   opts: AdmissionTransportOptions,
 ): AssistantMessageEventStream {
   const out = createAssistantMessageEventStream();
-  const now = opts.now ?? Date.now;
+  const now = opts.now ?? monotonicNow;
+  const wallNow = opts.now ?? Date.now;
   const sleep = opts.sleep ?? abortableSleep;
   const random = opts.random ?? Math.random;
   const config = resolveAdmissionScope(opts.config, model.provider, model.id);
@@ -558,7 +562,10 @@ export function executeWithAdmissionRetry(
         // produced no output yet: replaying after output would duplicate it.
         if (
           admission !== undefined &&
-          isAutomaticReplayAllowed(admission, committed) &&
+          (isAutomaticReplayAllowed(admission, committed) ||
+            (!committed &&
+              admission.explicitReplayContract !== true &&
+              ["fail", "fallback"].includes(DEFAULT_ADMISSION_REASON_POLICY[admission.reason]?.action ?? ""))) &&
           !config.observe_only &&
           event.reason !== "aborted"
         ) {
@@ -568,8 +575,11 @@ export function executeWithAdmissionRetry(
         }
         // Forwarded (non-withheld) error: end `out` so the consumer's iteration
         // and `result()` resolve instead of hanging (mirrors the done case).
-        out.push(event);
-        out.end(event.error);
+        const terminal = admission
+          ? { ...event.error, errorMessage: augmentInferenceErrorMessage(event.error.errorMessage, admission) }
+          : event.error;
+        out.push({ ...event, error: terminal });
+        out.end(terminal);
         return {
           terminal: "error",
           withheld: false,
@@ -762,7 +772,7 @@ export function executeWithAdmissionRetry(
           jitterRatio: config.jitter_ratio,
           honorRetryAfter: config.honor_retry_after,
         },
-        nowMs: now(),
+        nowMs: wallNow(),
         random,
       });
       const waitDecision = decideWait({
@@ -784,7 +794,7 @@ export function executeWithAdmissionRetry(
         return;
       }
 
-      const waitUntilMs = now() + waitMs;
+      const waitUntilMs = wallNow() + waitMs;
       publish("inference.retry.scheduled", {
         delayUsedMs: waitMs,
         retryAfterMs: admission.retryAfterMs,
@@ -822,6 +832,23 @@ export function executeWithAdmissionRetry(
       if (ledgerActive) opts.budget?.addWait(budgetKey, ledgerWindowMs, waitMs);
       if (options?.signal?.aborted) {
         cancelWait("cancelled_after_wait");
+        return;
+      }
+      const postWaitReason = evaluateTerminal({
+        decision: decision.action,
+        fallbackAfterMs: decision.fallbackAfterMs,
+        reasonBudgetMs: decision.maxElapsedMs,
+        waitedMs,
+        elapsedMs: now() - startedAt,
+        attempt,
+        maxAttempts: config.max_attempts,
+        ledger: ledgerActive ? opts.budget : undefined,
+        budgetKey,
+        windowMs: ledgerWindowMs,
+        sharedBudgetMs: config.shared_budget_ms,
+      });
+      if (postWaitReason) {
+        failAdmission(postWaitReason);
         return;
       }
     }

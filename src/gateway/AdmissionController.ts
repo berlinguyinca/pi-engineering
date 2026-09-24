@@ -17,6 +17,7 @@
  * Pure except for the injected clock and sleeper, so tests never sleep.
  */
 
+import { monotonicNow } from "../core/clock.ts";
 import { type GatewayWaitSignal, describeGatewayWait } from "./signals.ts";
 
 export interface AdmissionControllerOptions {
@@ -44,7 +45,7 @@ export interface AdmissionControllerOptions {
   jitterMs?: number;
   /** Consecutive clean runs after which the clamp relaxes by one slot. */
   successesToRelax?: number;
-  /** Injected monotonic clock (ms). Default Date.now. */
+  /** Injected monotonic clock (ms). Default performance.now(). */
   now?: () => number;
   /** Injected sleeper. Default setTimeout-based. */
   sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
@@ -149,7 +150,7 @@ export class AdmissionController {
     this.reservedSlots = Math.max(0, opts.reservedSlots ?? 0);
     this.jitterMs = Math.max(0, opts.jitterMs ?? 250);
     this.successesToRelax = Math.max(1, opts.successesToRelax ?? 3);
-    this.now = opts.now ?? (() => Date.now());
+    this.now = opts.now ?? monotonicNow;
     this.sleep = opts.sleep ?? defaultSleep;
     this.random = opts.random ?? Math.random;
     this.onEvent = opts.onEvent;

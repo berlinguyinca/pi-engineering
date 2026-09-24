@@ -110,6 +110,36 @@ test("quota and billing exhaustion is reported as NON-retryable", () => {
   }
 });
 
+test("legacy permanent admission reasons are non-retryable raw or nested", () => {
+  for (const reason of ["quota_exhausted", "auth_failed", "forbidden", "malformed_request"]) {
+    for (const body of [
+      { type: "inference_admission", reason },
+      { detail: { error: { type: "inference_admission", reason } } },
+    ]) {
+      const signal = parseGatewayWait({ status: 429, text: JSON.stringify(body) });
+      assert.ok(signal);
+      assert.equal(signal.retryable, false, `${reason}: ${JSON.stringify(body)}`);
+    }
+  }
+});
+
+test("409 and 413 remain non-retryable even with explicit safe replay flags", () => {
+  const body = JSON.stringify({
+    type: "inferweave_backpressure",
+    reason: "queue_timeout",
+    retryable: true,
+    replay_safe: true,
+    request_state: "queued",
+    action: "backoff",
+    action_code: "IW-ACT-BACKOFF",
+  });
+  for (const status of [409, 413]) {
+    const signal = parseGatewayWait({ status, text: body });
+    assert.ok(signal);
+    assert.equal(signal.retryable, false, `status ${status}`);
+  }
+});
+
 test("ordinary errors are not mistaken for backpressure", () => {
   assert.equal(parseGatewayWait({ text: "400: invalid request: unknown tool" }), null);
   assert.equal(parseGatewayWait({ text: "context window exceeded" }), null);
@@ -380,6 +410,19 @@ test("a throwing subscriber cannot break admission control", () => {
   });
   assert.doesNotThrow(() => controller.noteWait({ retryAfterMs: 5_000, retryable: true, source: "body" }));
   assert.equal(controller.cooldownRemainingMs(), 5_000);
+});
+
+test("the default controller clock is monotonic when wall time moves backward", () => {
+  const originalDateNow = Date.now;
+  try {
+    Date.now = () => 100_000;
+    const controller = new AdmissionController({ maxConcurrency: 1, jitterMs: 0 });
+    controller.noteWait({ retryAfterMs: 1_000, retryable: true, source: "body" });
+    Date.now = () => 0;
+    assert.ok(controller.cooldownRemainingMs() <= 1_000, "a wall-clock rollback must not lengthen the cooldown");
+  } finally {
+    Date.now = originalDateNow;
+  }
 });
 
 // ─── Finite waiting without shortening a server minimum ─────────────────────

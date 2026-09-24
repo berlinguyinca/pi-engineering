@@ -265,6 +265,23 @@ test("stream retry: elapsed budget stops before a server minimum that cannot fit
   assert.equal(out.ended?.errorMessage, ADMISSION_429);
 });
 
+test("stream retry: a hold that overruns the elapsed budget does not open another request", async () => {
+  let now = 0;
+  const s = scripted([[failed(SATURATED)], [done()]]);
+  const out = sink();
+  const outcome = await pumpWithGatewayRetry(s.open, out, {
+    maxElapsedMs: 10_000,
+    now: () => now,
+    hold: async () => {
+      now = 10_001;
+    },
+  });
+
+  assert.equal(outcome.attempts, 1);
+  assert.equal(s.opened, 1, "elapsed time must be rechecked immediately before replay");
+  assert.equal(out.ended?.errorMessage, SATURATED);
+});
+
 test("stream retry: a non-gateway error fails fast", async () => {
   const s = scripted([[failed("401 invalid api key")], [done()]]);
   const out = sink();

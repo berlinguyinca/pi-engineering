@@ -33,13 +33,19 @@ Recognition requires either supported type tag and accepts top-level, `error`,
 explicit `retryable=true`, `replay_safe=true`, request state `not_started` or
 `queued`, and action code `IW-ACT-BACKOFF`, `IW-ACT-REDUCE-CONCURRENCY`, or
 `IW-ACT-RETRY-ALTERNATE`. Explicit false always wins. Legacy envelopes without
-the new fields retain the conservative compatibility heuristics.
+the new fields retain the conservative compatibility heuristics, except quota,
+authentication, authorization, and malformed-request reasons, which are
+terminal.
 
 ## 2. HTTP status
 
 Primary status is expected to be HTTP 429.
 
 The policy abstraction SHOULD permit future InferWeave scheduler states to use another transient status (for example 503) without redesigning the harness.
+
+HTTP 400, 401, 403, 404, 409, 413, and 422 are permanent regardless of retry
+flags or reason tokens. Conflict and input-ceiling responses require caller
+action and MUST NOT be replayed automatically.
 
 ## 3. Retry delay resolution
 
@@ -95,6 +101,8 @@ The harness MUST support at least:
 | `auth_failed` / 401 | fail immediately | Permanent until credentials change |
 | `forbidden` / 403 | fail immediately | Permanent authorization/policy failure |
 | malformed request / 400 | fail immediately | Client bug/request issue |
+| conflict / 409 | fail immediately | Caller must resolve conflicting state |
+| input too large / 413 | fail immediately | Caller must reduce the request |
 
 Unknown admission reasons MUST follow a configurable conservative default. Recommended default: retry only when the HTTP status is transient and a valid server retry delay is supplied; otherwise fail rather than loop indefinitely.
 

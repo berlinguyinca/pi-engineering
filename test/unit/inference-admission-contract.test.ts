@@ -90,6 +90,20 @@ test("explicit false wins and committed output always prevents replay", () => {
   assert.equal(isAutomaticReplayAllowed(safe, true), false);
 });
 
+test("legacy permanent reasons are terminal in raw and nested envelopes", () => {
+  for (const reason of ["quota_exhausted", "auth_failed", "forbidden", "malformed_request"]) {
+    for (const body of [
+      { type: "inference_admission", reason },
+      { error: { type: "inference_admission", reason } },
+      { detail: { error: { type: "inference_admission", reason } } },
+    ]) {
+      const info = parseAdmissionPayload(body);
+      assert.ok(info);
+      assert.equal(isAutomaticReplayAllowed(info, false), false, `${reason}: ${JSON.stringify(body)}`);
+    }
+  }
+});
+
 test("unknown action fields are preserved as inert absence", () => {
   const info = parseAdmissionPayload({ ...SAFE_NEW, action: "future_action", action_code: "IW-ACT-UNKNOWN" });
   assert.ok(info);
@@ -213,7 +227,7 @@ test("isAdmissionRetryStatus is 429/503 only", () => {
 });
 
 test("permanent statuses never wait regardless of reason token", () => {
-  assert.deepEqual([...PERMANENT_ADMISSION_STATUSES].sort(), [400, 401, 403, 404, 422]);
+  assert.deepEqual([...PERMANENT_ADMISSION_STATUSES].sort(), [400, 401, 403, 404, 409, 413, 422]);
   for (const s of PERMANENT_ADMISSION_STATUSES) assert.ok(mayCarryAdmission(s));
 });
 
