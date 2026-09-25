@@ -89,6 +89,22 @@ export function classifyError(error: unknown): ErrorClass {
     return { category: "rate_limit", retryable: true, retryAfterMs, reason: "rate-limit / concurrency admission" };
   }
 
+  // Truncated streams: the provider closed the SSE stream before any
+  // finish_reason arrived (observed on the metabolomics gateway under
+  // momentary load — zero tokens, sub-second worker death). A fresh request
+  // succeeds seconds later, so treat it as transient, not permanent. Checked
+  // BEFORE the 503 branch because the executor's composite failure text
+  // ("Worker returned no worker_result. Stream ended without finish_reason")
+  // would otherwise false-match the "no worker" pattern.
+  if (isTruncatedStream(raw)) {
+    return {
+      category: "server_error",
+      retryable: true,
+      retryAfterMs,
+      reason: "truncated stream (no finish_reason)",
+    };
+  }
+
   // 503 no worker for model / service unavailable / provider overload.
   //
   // "overloaded" is Anthropic's 529 wording and appears in pi-ai's own
@@ -142,6 +158,16 @@ export function classifyError(error: unknown): ErrorClass {
   }
 
   return { category: "permanent", retryable: false, reason: "permanent error" };
+}
+
+/**
+ * True when a provider error says the stream closed before any finish_reason
+ * (pi-ai's openai-completions "Stream ended without finish_reason"). Shared by
+ * the classifier and the executor, which sees it as an assistant-message error
+ * rather than a throw.
+ */
+export function isTruncatedStream(text: string | undefined): boolean {
+  return !!text && /stream ended without finish_reason|no finish_reason/i.test(text);
 }
 
 function extractStatus(error: unknown): number | null {

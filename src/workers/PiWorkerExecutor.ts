@@ -55,6 +55,7 @@ import {
   type TransientTelemetry,
   classifyError,
   initialTransientTelemetry,
+  isTruncatedStream,
   recordTransientError,
   recordTransientOutcome,
   resolveTransientRetryConfig,
@@ -907,6 +908,28 @@ ${recovery.recoveryPrompt}`;
           break;
         }
       }
+    }
+
+    // Silent stream death: the provider closed the SSE stream before any
+    // finish_reason arrived (observed on the metabolomics gateway under
+    // momentary load — zero tokens, sub-second session end). No exception is
+    // thrown, so the promptError ladder above never sees it and the run used
+    // to settle as a permanent "no worker_result" failure. Surface it as
+    // retryable — but only AFTER the fallback scan, and only when the session
+    // produced no terminating result of either kind (worker_result or a
+    // reviewer's review_result): a run that already delivered its result must
+    // not be thrown away and re-run because its final turn was cut.
+    if (
+      captured === undefined &&
+      structured === undefined &&
+      !guardAborted &&
+      !budgetExhausted &&
+      !timedOut &&
+      !loopPrevented &&
+      isTruncatedStream(assistantError)
+    ) {
+      session.dispose();
+      throw new TransientError("server_error", assistantError!, 1);
     }
 
     return {

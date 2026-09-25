@@ -6,6 +6,7 @@ import {
   backoffDelayMs,
   classifyError,
   initialTransientTelemetry,
+  isTruncatedStream,
   recordTransientError,
   recordTransientOutcome,
   resolveTransientRetryConfig,
@@ -24,6 +25,20 @@ test("classify: 429 caller_concurrency admission is a retryable rate_limit", () 
   const cls = classifyError(new Error("429 inference admission: caller_concurrency"));
   assert.equal(cls.category, "rate_limit");
   assert.equal(cls.retryable, true);
+});
+
+test("isTruncatedStream: matches pi-ai's truncation wording only", () => {
+  assert.equal(isTruncatedStream("Stream ended without finish_reason"), true);
+  assert.equal(isTruncatedStream("upstream returned no finish_reason"), true);
+  assert.equal(isTruncatedStream("503 no worker for model"), false);
+  assert.equal(isTruncatedStream(undefined), false);
+});
+
+test("classify: truncated stream (no finish_reason) is retryable", () => {
+  const cls = classifyError(new Error("Worker returned no worker_result. Stream ended without finish_reason"));
+  assert.equal(cls.category, "server_error");
+  assert.equal(cls.retryable, true);
+  assert.equal(cls.reason, "truncated stream (no finish_reason)");
 });
 
 test("classify: numeric status 503 is retryable", () => {
