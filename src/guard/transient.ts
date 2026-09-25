@@ -113,7 +113,7 @@ export function classifyError(error: unknown): ErrorClass {
   // ended before the response did. It carries no status (it arrives after a 200
   // head), so without this it fell through to "permanent" and workers gave up.
   if (
-    isGatewayLinkCut(raw) ||
+    (status == null && isGatewayLinkCut(raw)) ||
     has(
       "econnreset",
       "econnrefused",

@@ -33,8 +33,13 @@ export interface GatewayWaitSignal {
   retryAfterMs: number;
   /** Whether retrying can plausibly succeed (false for quota/billing exhaustion). */
   retryable: boolean;
-  /** Where the wait came from — useful when diagnosing a stuck queue. */
-  source: "body" | "header" | "default";
+  /**
+   * Where the wait came from — useful when diagnosing a stuck queue.
+   * `"link-cut"` is the gateway's fixed hint for a flattened link cut (see
+   * LINK_CUT_WAIT_MS): honoured exactly, like a body or header wait, but not a
+   * body instruction, so it never claims the admission controller's layer.
+   */
+  source: "body" | "header" | "default" | "link-cut";
   status?: number;
   /** Gateway-reported machine reason, e.g. "queue_timeout". */
   reason?: string;
@@ -80,16 +85,31 @@ const NON_RETRYABLE_PATTERNS =
  * `retry_after_ms: 1000`), and the OpenAI SDK flattens that frame to its bare
  * message — "…the route serving this model ended before the response did…",
  * optionally prefixed "Connection lost:" in the newer wording. Nothing
- * structured survives, so the sentence itself is the signal.
+ * structured survives, so the sentence itself is the signal. The bare reason
+ * token counts only next to "InferWeave": other proxies may use the same word.
  */
-const LINK_CUT_PATTERN = /route serving this model ended before the response did|\bupstream_transport_error\b/i;
+const LINK_CUT_SENTENCE = /route serving this model ended before the response did/i;
+const LINK_CUT_REASON = /\bupstream_transport_error\b/i;
 
 /** The gateway's own hint for a link cut: the request is routed afresh at once. */
 export const LINK_CUT_WAIT_MS = 1_000;
 
-/** True when a provider error is a gateway link cut (see LINK_CUT_PATTERN). */
+/**
+ * True when a provider error is a flattened gateway link cut.
+ *
+ * Fails closed: text that also carries a permanent status (401/403/...), a
+ * quota/billing phrase, or any `inferweave_backpressure` envelope is not a link
+ * cut here. A well-formed envelope is decided by the admission contract, and a
+ * malformed one is terminal — both exactly as without the link-cut rule.
+ */
 export function isGatewayLinkCut(text: string | undefined): boolean {
-  return text !== undefined && LINK_CUT_PATTERN.test(text);
+  if (!text) return false;
+  const matches = LINK_CUT_SENTENCE.test(text) || (LINK_CUT_REASON.test(text) && /inferweave/i.test(text));
+  if (!matches) return false;
+  if (text.includes("inferweave_backpressure")) return false;
+  if (NON_RETRYABLE_PATTERNS.test(text)) return false;
+  const status = leadingStatus(text) ?? num(embeddedJson(text)?.status);
+  return !(status !== undefined && PERMANENT_ADMISSION_STATUSES.includes(status));
 }
 
 /** Read the first JSON object embedded in a provider error string. */
@@ -186,14 +206,16 @@ export function parseGatewayWait(input: GatewayWaitInput): GatewayWaitSignal | n
 
   // A flattened link cut carries no envelope to parse. Replay is safe while no
   // token was delivered (the pump enforces that), and it concerns one model's
-  // route, so it must not park the process behind an account-wide cooldown.
-  // The wait is a default, not a body instruction: it escalates on repeats and
-  // stays with the transient layers rather than the admission controller.
-  if (!admission && isGatewayLinkCut(text)) {
+  // route. "Routed afresh" means the next attempt takes a new route, so the 1s
+  // hint is honoured exactly — no escalation — and `gatewayHoldScope` keeps it
+  // out of every shared cooldown. Behind the same fail-closed guards as every
+  // other signal: a permanent status or malformed envelope is never a link cut.
+  const permanentStatus = status !== undefined && PERMANENT_ADMISSION_STATUSES.includes(status);
+  if (!admission && !malformedNewContract && !permanentStatus && isGatewayLinkCut(text)) {
     return {
       retryAfterMs: LINK_CUT_WAIT_MS,
       retryable: true,
-      source: "default",
+      source: "link-cut",
       reason: "upstream_transport_error",
       type: "inferweave_backpressure",
       scope: "model",
@@ -336,6 +358,20 @@ export function isAccountWideRefusal(signal: GatewayWaitSignal): boolean {
   return signal.status === 429 || signal.type === "inference_admission" || signal.reason === "queue_timeout";
 }
 
+/**
+ * Which cooldown a hold for `signal` belongs to.
+ *
+ * `"shared"`: arm the admission controller's cooldown (process-wide for an
+ * account-wide refusal, per-model for a model-scoped one) so other callers back
+ * off too. `"caller"`: park only the caller that hit it. A link cut is always
+ * the caller's: one request's route broke, and the retry is routed afresh.
+ */
+export function gatewayHoldScope(signal: GatewayWaitSignal): "shared" | "caller" {
+  if (signal.source === "link-cut") return "caller";
+  if (isAccountWideRefusal(signal) || signal.scope === "model") return "shared";
+  return "caller";
+}
+
 export function isGatewayAdmissionRefusal(errorText: string | undefined): boolean {
   if (!errorText) return false;
   const signal = parseGatewayWait({ text: errorText });
@@ -353,4 +389,21 @@ export function decideGatewayRetry(
   if (!signal.retryable) return { action: "give-up", signal, reason: "non-retryable" };
   if (retriesSoFar >= maxRetries) return { action: "give-up", signal, reason: "retries-exhausted" };
   return { action: "wait", signal };
+}
+
+/**
+ * The worker's handover after its transient-retry loop gave up.
+ *
+ * Errors the transient layer owns (see classifyError) have already had their
+ * retries there; a link cut is one of them, so handing it to the gateway layer
+ * as well would multiply the two budgets. Everything else keeps the existing
+ * `decideGatewayRetry` behaviour.
+ */
+export function decideTransientHandover(
+  errorText: string | undefined,
+  retriesSoFar: number,
+  maxRetries: number,
+): GatewayRetryDecision {
+  if (isGatewayLinkCut(errorText)) return { action: "not-gateway" };
+  return decideGatewayRetry(errorText, retriesSoFar, maxRetries);
 }

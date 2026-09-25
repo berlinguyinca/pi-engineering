@@ -35,6 +35,12 @@
  * arrives, before any token, and a gateway link cut lands exactly there. The
  * failed attempt's held `start` is discarded on retry, so exactly one reaches
  * the sink.
+ *
+ * That widens the retry window on purpose, and not only for link cuts: ANY
+ * retryable gateway wait that lands after the 200 head but before the first
+ * token (an overload, a 503 relayed mid-stream) is now waited out and replayed
+ * too. It is the same safety condition — nothing visible has reached the
+ * transcript — just checked on content rather than on the head.
  * Pi's own `retryAssistantCall` can restart after partial output because it
  * discards the whole failed message; mid-stream, we have no such luxury.
  *
@@ -43,29 +49,10 @@
  */
 
 import { monotonicNow } from "../core/clock.ts";
-import { augmentInferenceErrorMessage } from "../inference/admissionContract.ts";
+import { augmentInferenceErrorMessage, isAssistantOutputEvent } from "../inference/admissionContract.ts";
 import { type GatewayWaitInput, type GatewayWaitSignal, parseGatewayWait } from "./signals.ts";
 
 export { monotonicNow } from "../core/clock.ts";
-
-/**
- * Events that put visible content into the assistant message. Mirrors
- * `isOutputEvent` in inference/admissionTransport.ts; anything else before the
- * first of these (`start`) can be withheld without the transcript noticing.
- */
-function isOutputEvent(type: string | undefined): boolean {
-  return (
-    type === "text_start" ||
-    type === "text_delta" ||
-    type === "text_end" ||
-    type === "thinking_start" ||
-    type === "thinking_delta" ||
-    type === "thinking_end" ||
-    type === "toolcall_start" ||
-    type === "toolcall_delta" ||
-    type === "toolcall_end"
-  );
-}
 
 /** A terminal event ends pi's stream and resolves its result. */
 function isTerminal(type: string | undefined): boolean {
@@ -184,7 +171,8 @@ function errorText(value: unknown): string {
 /**
  * Grow a synthesized wait with consecutive failures.
  *
- * A gateway that reports `retry_after_ms` is obeyed to the millisecond — it
+ * A gateway that reports `retry_after_ms` (or a link cut's fixed "routed
+ * afresh" hint) is obeyed to the millisecond — it
  * knows when its queue drains and we do not. A bare `503 no worker for model`
  * advertises nothing, so `parseGatewayWait` hands back a flat default; asking
  * again every 5s while a model has no workers at all is a busy-wait against an
@@ -192,7 +180,7 @@ function errorText(value: unknown): string {
  * once capacity returns.
  */
 function waitFor(signal: GatewayWaitSignal, attempt: number, capMs: number): GatewayWaitSignal {
-  if (signal.source === "body" || signal.source === "header") return signal;
+  if (signal.source === "body" || signal.source === "header" || signal.source === "link-cut") return signal;
   const escalated = Math.min(capMs, signal.retryAfterMs * 2 ** Math.max(0, attempt - 1));
   return { ...signal, retryAfterMs: escalated };
 }
@@ -266,7 +254,7 @@ export async function pumpWithGatewayRetry<E extends RetryableEvent, R extends R
           emit(event);
           continue;
         }
-        if (!forwarded && !isOutputEvent(event.type)) {
+        if (!forwarded && !isAssistantOutputEvent(event.type)) {
           leading.push(event);
           continue;
         }

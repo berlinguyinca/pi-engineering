@@ -90,6 +90,7 @@ import {
   DEFAULT_ADMISSION_REASON_POLICY,
   admissionFromResponse,
   augmentInferenceErrorMessage,
+  isAssistantOutputEvent,
   isAutomaticReplayAllowed,
   mayCarryAdmission,
   serverRequestIdFromHeaders,
@@ -382,20 +383,6 @@ export function terminalAssistantMessage(
   };
 }
 
-function isOutputEvent(event: AssistantMessageEvent): boolean {
-  return (
-    event.type === "text_start" ||
-    event.type === "text_delta" ||
-    event.type === "text_end" ||
-    event.type === "thinking_start" ||
-    event.type === "thinking_delta" ||
-    event.type === "thinking_end" ||
-    event.type === "toolcall_start" ||
-    event.type === "toolcall_delta" ||
-    event.type === "toolcall_end"
-  );
-}
-
 /** Result of consuming one attempt's stream. */
 interface AttemptOutcome {
   /** Terminal event seen, if the stream produced one. */
@@ -594,7 +581,7 @@ export function executeWithAdmissionRetry(
           aborted: event.reason === "aborted",
         };
       }
-      if (isOutputEvent(event)) {
+      if (isAssistantOutputEvent(event.type)) {
         if (!committed) setState("STREAMING");
         committed = true;
       }

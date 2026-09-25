@@ -29,7 +29,13 @@ import { WorkerActivityAdapter } from "../aps/workerActivity.ts";
 import type { WorkerResult, WorkerRole, WorkerUsage } from "../core/types.ts";
 import type { AdmissionController } from "../gateway/AdmissionController.ts";
 import { type GatewayAdmissionConfig, sharedAdmissionController, sharedGatewayConfig } from "../gateway/config.ts";
-import { decideGatewayRetry, parseGatewayWait } from "../gateway/signals.ts";
+import {
+  type GatewayWaitSignal,
+  decideGatewayRetry,
+  decideTransientHandover,
+  gatewayHoldScope,
+  parseGatewayWait,
+} from "../gateway/signals.ts";
 import { GenerationGuard, type GuardAbortReason } from "../guard/GenerationGuard.ts";
 import { TOOL_TRANSITION_RULE } from "../guard/RecoveryController.ts";
 import {
@@ -326,6 +332,16 @@ ${TOOL_TRANSITION_RULE}`;
     const admission = this.admission;
     const gatewayConfig = this.gatewayConfig;
     let gatewayRetries = 0;
+    // Scope every hold to the model actually called, then route it the same way
+    // the interactive turn does (gatewayHoldScope). Without provider/model a
+    // model-scoped signal fell back to the process-wide cooldown, and a link
+    // cut must not arm any shared cooldown at all.
+    const holdForGateway = (signal: GatewayWaitSignal): Promise<number> => {
+      const scoped = { ...signal, provider: model.provider, model: model.id };
+      return gatewayHoldScope(scoped) === "caller"
+        ? admission.noteCallerWaitAndSleep(scoped)
+        : admission.noteWaitAndSleep(scoped);
+    };
 
     // Prose-producing roles (reviewers, challenger, scout, summarizer) deliver
     // prose findings/assessments, not a tool call. The generic worker guard's
@@ -373,11 +389,13 @@ ${TOOL_TRANSITION_RULE}`;
         // error (classifyError hands it over rather than backing off against a
         // wait it cannot read). Honour the wait the gateway actually reported
         // and retry the same attempt, process-wide.
+        // A link cut is NOT handed over: the transient loop above already
+        // owned its retries (decideTransientHandover).
         if (gatewayConfig.enabled) {
-          const handover = decideGatewayRetry(detail, gatewayRetries, gatewayConfig.maxRetries);
+          const handover = decideTransientHandover(detail, gatewayRetries, gatewayConfig.maxRetries);
           if (handover.action === "wait") {
             gatewayRetries++;
-            await admission.noteWaitAndSleep(handover.signal);
+            await holdForGateway(handover.signal);
             continue;
           }
         }
@@ -442,7 +460,7 @@ ${TOOL_TRANSITION_RULE}`;
         const decision = decideGatewayRetry(assistantError, gatewayRetries, gatewayConfig.maxRetries);
         if (decision.action === "wait") {
           gatewayRetries++;
-          await admission.noteWaitAndSleep(decision.signal);
+          await holdForGateway(decision.signal);
           continue;
         }
       }

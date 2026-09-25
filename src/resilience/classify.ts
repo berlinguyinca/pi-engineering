@@ -158,7 +158,7 @@ export function classifyInfraError(error: unknown): InfraErrorClass {
   // Gateway link cut: a peer route ended mid-response. Status-less (it follows
   // a 200 head) and replayable, so name it rather than leaving it to the
   // unclassified fallback.
-  if (isGatewayLinkCut(raw)) {
+  if (status == null && isGatewayLinkCut(raw)) {
     return {
       category: "TRANSIENT_INFRASTRUCTURE",
       retryable: true,
