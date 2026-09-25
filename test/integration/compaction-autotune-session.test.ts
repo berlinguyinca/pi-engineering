@@ -97,7 +97,16 @@ after(() => {
 const MODEL_ID = "qwen3.8-27b";
 const OTHER_ID = "small-128k";
 
-async function startSession(opts: { settings?: unknown; loadPrepare?: () => Promise<undefined> } = {}) {
+type InlineFactory = (pi: never) => void;
+
+async function startSession(
+  opts: {
+    settings?: unknown;
+    loadPrepare?: () => Promise<undefined>;
+    extra?: InlineFactory;
+    extensionPaths?: string[];
+  } = {},
+) {
   // Each session starts with a clean script: no sizes left over from another test.
   gateway.promptTokens.length = 0;
   gateway.requests.length = 0;
@@ -161,7 +170,8 @@ async function startSession(opts: { settings?: unknown; loadPrepare?: () => Prom
     noPromptTemplates: true,
     noThemes: true,
     noContextFiles: true,
-    extensionFactories: [factory as never],
+    extensionFactories: [factory as never, ...(opts.extra ? [opts.extra as never] : [])],
+    ...(opts.extensionPaths ? { additionalExtensionPaths: opts.extensionPaths } : {}),
   });
   await resourceLoader.reload();
   const { session } = await createAgentSession({
@@ -205,7 +215,7 @@ async function settle(session: Session, count: number): Promise<void> {
   await session.waitForIdle?.();
 }
 
-test("B + A: compacts at the TUNED threshold, keeps the tuned tail, summary sent with thinking off", async () => {
+test("B + A: compacts at the TUNED threshold (turn_end boundary), keeps the tuned tail, summary sent with thinking off", async () => {
   const notices: string[] = [];
   const uninstall = setTelemetrySink((n) => notices.push(n.text));
   const s = await startSession();
@@ -351,5 +361,68 @@ test("model switch recomputes: the new model's values are announced", async () =
   } finally {
     uninstall();
     s.cleanup();
+  }
+});
+
+test("B never races another extension's agent_settled follow-up (it compacts at turn_end instead)", async () => {
+  // src/lifecycle/harness.ts sends remediation follow-ups from agent_settled;
+  // Pi defers them past the emission. A ctx.compact() fired from agent_settled
+  // made that deferred prompt fail ("Cannot submit a prompt while compaction
+  // is in progress"). Compacting at the turn boundary leaves settle alone.
+  let sent = false;
+  const extra = (pi: {
+    on(event: string, handler: () => void): void;
+    sendUserMessage(text: string, options: { deliverAs: string }): void;
+  }) => {
+    pi.on("agent_settled", () => {
+      if (sent) return;
+      sent = true;
+      pi.sendUserMessage("remediation follow-up", { deliverAs: "followUp" });
+    });
+  };
+  const errors: string[] = [];
+  const s = await startSession({ extra: extra as never });
+  s.session.subscribe((event: { type: string; error?: unknown }) => {
+    if (event.type === "extension_error") errors.push(String(event.error));
+  });
+  try {
+    for (let i = 0; i < 3; i++) await turn(s.session, 60_000);
+    sent = false;
+    await turn(s.session, 240_000);
+    await settle(s.session, 1);
+    for (let i = 0; i < 100; i++) {
+      if (gateway.requests.some((r) => JSON.stringify(r.body.messages ?? "").includes("remediation follow-up"))) break;
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    assert.equal(compactions(s.session).length, 1, "compacted at the boundary");
+    assert.ok(
+      gateway.requests.some((r) => JSON.stringify(r.body.messages ?? "").includes("remediation follow-up")),
+      "the follow-up was delivered",
+    );
+    assert.deepEqual(errors, []);
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("Pi's real extension loader (jiti with its alias map) can load Pi's prepareCompaction", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "autotune-jiti-"));
+  const autoTune = new URL("../../src/compaction/autoTune.ts", import.meta.url).pathname;
+  const extension = join(dir, "probe-extension.ts");
+  writeFileSync(
+    extension,
+    `import { loadPiPrepareCompaction } from ${JSON.stringify(autoTune)};
+export default function (_pi: unknown) {
+  (globalThis as Record<string, unknown>).__autotunePrepare = loadPiPrepareCompaction();
+}
+`,
+  );
+  const s = await startSession({ extensionPaths: [extension] });
+  try {
+    const loaded = await (globalThis as Record<string, unknown>).__autotunePrepare;
+    assert.equal(typeof loaded, "function", "tuned keepRecent is applied for real users, not just in tests");
+  } finally {
+    s.cleanup();
+    rmSync(dir, { recursive: true, force: true });
   }
 });

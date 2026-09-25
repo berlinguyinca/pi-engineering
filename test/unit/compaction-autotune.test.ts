@@ -146,7 +146,13 @@ test("an older Pi (no agent_settled, no per-model compaction) gets a one-time no
 
     assert.equal(registerAutoCompaction(host as never, { piVersion: "0.87.1", enabled: false }), false, "switched off");
     assert.equal(registerAutoCompaction(host as never, { piVersion: "0.87.1" }), true);
-    assert.deepEqual(events.sort(), ["agent_settled", "model_select", "session_before_compact", "session_start"]);
+    assert.deepEqual(events.sort(), [
+      "model_select",
+      "session_before_compact",
+      "session_compact",
+      "session_start",
+      "turn_end",
+    ]);
   } finally {
     uninstall();
   }
