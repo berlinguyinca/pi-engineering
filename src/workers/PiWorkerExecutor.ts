@@ -930,7 +930,7 @@ ${recovery.recoveryPrompt}`;
       for (const msg of session.messages) {
         if (msg.role === "toolResult" && msg.toolName === terminatingName && !msg.isError && msg.details) {
           if (terminatingName === "worker_result") {
-            const d = msg.details as WorkerResult;
+            const d = msg.details as unknown as WorkerResult;
             if (d?.status) captured = d;
           } else {
             structured = msg.details;

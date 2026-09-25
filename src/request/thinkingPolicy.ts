@@ -125,8 +125,26 @@ export interface ThinkingContext {
   tools?: unknown[];
 }
 
+/**
+ * The system prompt of a provider context, in either shape pi-ai has used:
+ * `context.systemPrompt` (≤ 0.85), or a leading `{ role: "system" }` message
+ * (0.87+, where `normalizeContext` folds the prompt and tools into the
+ * transcript — the shape Pi's compaction now sends).
+ */
+export function systemPromptText(context: ThinkingContext): string {
+  if (typeof context.systemPrompt === "string") return context.systemPrompt;
+  const first = context.messages[0] as { role?: string; content?: unknown } | undefined;
+  if (first?.role !== "system") return "";
+  if (typeof first.content === "string") return first.content;
+  if (!Array.isArray(first.content)) return "";
+  return (first.content as Array<{ type?: string; text?: string }>)
+    .filter((b) => b.type === "text")
+    .map((b) => b.text ?? "")
+    .join("\n");
+}
+
 export function isSummarizationRequest(context: ThinkingContext): boolean {
-  return (context.systemPrompt ?? "").trimStart().startsWith(SUMMARIZATION_PROMPT_OPENING);
+  return systemPromptText(context).trimStart().startsWith(SUMMARIZATION_PROMPT_OPENING);
 }
 
 /** Estimated input tokens, the way Pi's own compaction estimates them. */
