@@ -11,16 +11,25 @@
 import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { terminalAssistantMessage } from "../inference/admissionTransport.ts";
 import { type RequestBodyBudgetConfig, streamWithinRequestBudget } from "../request/bodyBudget.ts";
+import { type ThinkingOffConfig, streamWithThinkingPolicy } from "../request/thinkingPolicy.ts";
 
 const GUARDED = Symbol.for("pi-engineering.requestBodyGuard");
 
 type StreamSimple = ModelRuntime["streamSimple"];
 
-/** Wrap `runtime.streamSimple` in place. Idempotent. */
-export function guardRuntimeRequestBody(runtime: ModelRuntime, config: RequestBodyBudgetConfig): void {
+/**
+ * Wrap `runtime.streamSimple` in place: the body budget outside, the thinking
+ * policy (when given) inside, so it sees the fitted context. Idempotent.
+ */
+export function guardRuntimeRequestBody(
+  runtime: ModelRuntime,
+  config: RequestBodyBudgetConfig,
+  thinking?: ThinkingOffConfig,
+): void {
   const target = runtime as ModelRuntime & { [GUARDED]?: boolean };
   if (target[GUARDED]) return;
-  const base = runtime.streamSimple.bind(runtime);
+  const provider = runtime.streamSimple.bind(runtime);
+  const base = thinking ? streamWithThinkingPolicy(provider as never, thinking) : provider;
   const guarded = streamWithinRequestBudget(base as never, {
     config,
     errorResult: (model, error) => terminalAssistantMessage(model as never, error.message, "error"),

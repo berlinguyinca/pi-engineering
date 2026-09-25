@@ -66,6 +66,7 @@ import {
 } from "../guard/transient.ts";
 import { reviewResultTool } from "../lifecycle/reviewResultTool.ts";
 import { type RequestBodyBudgetConfig, resolveRequestBodyBudgetConfig } from "../request/bodyBudget.ts";
+import { type ThinkingOffConfig, resolveThinkingOffConfig } from "../request/thinkingPolicy.ts";
 import { emitTelemetry } from "../telemetry/sink.ts";
 import type { WorkerExecutor, WorkerRequest, WorkerRun } from "./WorkerExecutor.ts";
 import { registerLocalProviders } from "./localProviders.ts";
@@ -137,6 +138,11 @@ export interface PiWorkerExecutorOptions {
    * PI_REQUEST_BODY_HEADROOM, else the gateway's advertised cap, else 10 MiB.
    */
   requestBodyBudget?: RequestBodyBudgetConfig;
+  /**
+   * Thinking off for Pi summaries and near-full contexts on gateways that
+   * accept it (src/request/thinkingPolicy.ts). Default: PI_THINKING_OFF_* env.
+   */
+  thinkingPolicy?: ThinkingOffConfig;
   aps?: AgentProgressSupervisorOptions | false;
   /**
    * APS loop PREVENTION (Phase 3, first enforcement): when the supervisor
@@ -193,6 +199,7 @@ export class PiWorkerExecutor implements WorkerExecutor {
   private modelRuntime: ModelRuntime | undefined;
   private runtimePromise: Promise<ModelRuntime> | undefined;
   private readonly requestBodyBudget: RequestBodyBudgetConfig;
+  private readonly thinkingPolicy: ThinkingOffConfig;
   /** Aggregate recovery telemetry across all worker runs. */
   readonly recoveryTelemetry: RecoveryTelemetry = initialRecoveryTelemetry();
   /** Aggregate transient-error retry telemetry across all worker runs. */
@@ -216,6 +223,7 @@ export class PiWorkerExecutor implements WorkerExecutor {
     this.escalation = opts.escalation;
     this.rollout = resolveRollout(opts.rolloutPhase ?? DEFAULT_ROLLOUT_PHASE);
     this.requestBodyBudget = opts.requestBodyBudget ?? resolveRequestBodyBudgetConfig();
+    this.thinkingPolicy = opts.thinkingPolicy ?? resolveThinkingOffConfig();
   }
 
   /** APS observability snapshot (Phase 6) — Grafana-ready metrics. */
@@ -238,7 +246,7 @@ export class PiWorkerExecutor implements WorkerExecutor {
         allowModelNetwork: this.allowModelNetwork,
       });
       await registerLocalProviders(rt).catch(() => {});
-      guardRuntimeRequestBody(rt, this.requestBodyBudget);
+      guardRuntimeRequestBody(rt, this.requestBodyBudget, this.thinkingPolicy);
       return rt;
     })();
     return this.runtimePromise;

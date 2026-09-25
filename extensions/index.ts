@@ -52,6 +52,7 @@ import { Narrator } from "../src/panel/narrator/Narrator.ts";
 import { createSummarize } from "../src/panel/narrator/summarize.ts";
 import { PanelRefreshLoop } from "../src/panel/refreshLoop.ts";
 import { resolveRequestBodyBudgetConfig } from "../src/request/bodyBudget.ts";
+import { resolveThinkingOffConfig } from "../src/request/thinkingPolicy.ts";
 import { RoadmapEngine } from "../src/roadmap/RoadmapEngine.ts";
 import { EngineeringRuntime } from "../src/runtime/EngineeringRuntime.ts";
 import { resolveStatusBarConfig } from "../src/status/config.ts";
@@ -860,6 +861,10 @@ ${RECOVERY_PROMPT}`;
           // Fit every request body to the gateway's cap (advertised, else
           // 10 MiB) before it is sent; a 413 is permanent and ends the turn.
           requestBodyBudget: resolveRequestBodyBudgetConfig(),
+          // Thinking off for Pi's summaries (compaction) and near-full turns on
+          // the metabolomics gateway, whose models think by default and would
+          // otherwise spend the whole output budget on hidden reasoning.
+          thinkingPolicy: resolveThinkingOffConfig(),
           signalOf: (options) => (options as { signal?: AbortSignal } | undefined)?.signal,
           errorMessage: (m, error) => ({
             role: "assistant",

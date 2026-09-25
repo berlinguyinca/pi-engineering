@@ -22,8 +22,9 @@
  */
 
 import { type BudgetContext, type RequestBodyBudgetConfig, streamWithinRequestBudget } from "../request/bodyBudget.ts";
+import { type ThinkingOffConfig, streamWithThinkingPolicy } from "../request/thinkingPolicy.ts";
 
-type ModelLike = { baseUrl?: string; id?: string };
+type ModelLike = { baseUrl?: string; id?: string; api?: string; provider?: string; contextWindow?: number };
 import type { GatewayWaitInput, GatewayWaitSignal } from "./signals.ts";
 import {
   type AttemptStream,
@@ -122,6 +123,12 @@ export interface InstallDeps<M, O> {
    * src/request/bodyBudget.ts). Omitted, requests are sent as built.
    */
   requestBodyBudget?: RequestBodyBudgetConfig;
+  /**
+   * Thinking off for Pi summaries and near-full contexts on gateways that
+   * accept `reasoning_effort: "none"` (see src/request/thinkingPolicy.ts).
+   * Omitted, payloads are sent as built.
+   */
+  thinkingPolicy?: ThinkingOffConfig;
   maxAttempts?: number;
   maxElapsedMs?: number;
   now?: () => number;
@@ -190,8 +197,16 @@ export function installGatewayStreamRetry<M, C, O>(
   const base = native ?? host.getProvider(target.provider);
   if (!base) return "no-provider";
   // Captured BEFORE registration: this reference reaches the real transport.
-  const rawStream = base.streamSimple?.bind(base);
-  if (!rawStream) return "no-base-stream";
+  const providerStream = base.streamSimple?.bind(base);
+  if (!providerStream) return "no-base-stream";
+  // Innermost: the thinking policy sees the context actually sent (after the
+  // body budget has fitted it) and edits the provider payload.
+  const rawStream: typeof providerStream = deps.thinkingPolicy
+    ? (streamWithThinkingPolicy<ModelLike, BudgetContext, O, RetryableEvent, RetryableResult>(
+        providerStream as never,
+        deps.thinkingPolicy,
+      ) as unknown as typeof providerStream)
+    : providerStream;
   // The body guard sits inside the retry pump: each attempt is fitted, and an
   // unsendable request surfaces as a non-gateway error the pump never retries.
   const budget = deps.requestBodyBudget;
