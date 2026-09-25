@@ -39,7 +39,7 @@ export interface GatewayWaitSignal {
    * LINK_CUT_WAIT_MS): honoured exactly, like a body or header wait, but not a
    * body instruction, so it never claims the admission controller's layer.
    */
-  source: "body" | "header" | "default" | "link-cut";
+  source: "body" | "header" | "default" | "link-cut" | "transport-drop";
   /**
    * A genuine post-200 flattened InferWeave refusal: a bare code (or its
    * readable wording) with no HTTP status. Held by the caller alone, since
@@ -166,6 +166,60 @@ export function flattenedInferWeaveRefusalCode(text: string | undefined): string
   const status = errorTextStatus(text);
   if (status !== undefined && PERMANENT_ADMISSION_STATUSES.includes(status)) return undefined;
   return code;
+}
+
+/**
+ * A connection dropped under the request by the transport itself — undici's
+ * "terminated" (socket closed mid-body, often with an "other side closed"
+ * cause), "socket hang up", ECONNRESET / UND_ERR_SOCKET, or "fetch failed"
+ * (connection refused while a gateway restarts). Observed: every "Error:
+ * terminated" coincided with a gateway restart whose drain grace cut a long
+ * in-flight stream. Anchored at the start of the text (after an optional
+ * "Error:"/"TypeError:"), so prose that mentions the word is not a drop.
+ */
+const TRANSPORT_DROP =
+  /^\s*(?:(?:type)?error:\s*)?(?:terminated|other side closed|socket hang up|fetch failed|(?:read\s+)?econnreset|und_err_socket)\b/i;
+
+/**
+ * Waits for a transport drop: a gateway restart takes ~40-80s, so the ladder
+ * reaches past it quickly without hammering a gateway that is still draining.
+ */
+export const TRANSPORT_DROP_WAITS_MS: readonly number[] = [2_000, 5_000, 10_000, 20_000, 40_000, 60_000];
+
+/**
+ * True when a provider error is a bare transport drop. Fails closed like the
+ * link-cut rule: a leading HTTP status, any embedded JSON body, an admission
+ * envelope, or quota/billing wording means the gateway ANSWERED, and the
+ * structured paths decide.
+ */
+export function isTransportDrop(text: string | undefined): boolean {
+  if (!text || !TRANSPORT_DROP.test(text)) return false;
+  if (/inferweave_backpressure|inference_admission/i.test(text)) return false;
+  if (NON_RETRYABLE_PATTERNS.test(text)) return false;
+  if (embeddedJson(text) !== undefined) return false;
+  return errorTextStatus(text) === undefined;
+}
+
+/**
+ * The interactive pump's wait for a transport drop, or null.
+ *
+ * Deliberately NOT part of parseGatewayWait: that parser also feeds the worker
+ * gateway layer, and a worker's transport drop is owned by the transient layer
+ * (classifyError → network). Replay is safe only while nothing visible reached
+ * the transcript, which the pump enforces; a user abort is excluded there too.
+ * An error status observed for the attempt (anything but a 2xx head) means the
+ * gateway answered, so it is not a drop.
+ */
+export function transportDropWait(input: GatewayWaitInput): GatewayWaitSignal | null {
+  if (input.status !== undefined && (input.status < 200 || input.status >= 300)) return null;
+  if (!isTransportDrop(input.text)) return null;
+  return {
+    retryAfterMs: TRANSPORT_DROP_WAITS_MS[0]!,
+    retryable: true,
+    source: "transport-drop",
+    reason: "transport_drop",
+    scope: "request",
+  };
 }
 
 export function isFlattenedInferWeaveRefusal(text: string | undefined): boolean {
@@ -382,6 +436,10 @@ export function parseGatewayWait(input: GatewayWaitInput): GatewayWaitSignal | n
  * against an outage. Escalate those, capped so recovery stays prompt.
  */
 export function escalateSyntheticWait(signal: GatewayWaitSignal, attempt: number, capMs: number): GatewayWaitSignal {
+  if (signal.source === "transport-drop") {
+    const step = TRANSPORT_DROP_WAITS_MS[Math.min(Math.max(0, attempt - 1), TRANSPORT_DROP_WAITS_MS.length - 1)]!;
+    return { ...signal, retryAfterMs: Math.min(capMs, step) };
+  }
   if (signal.source !== "default") return signal;
   const escalated = Math.min(capMs, signal.retryAfterMs * 2 ** Math.max(0, attempt - 1));
   return { ...signal, retryAfterMs: escalated };
@@ -469,7 +527,7 @@ export function isAccountWideRefusal(signal: GatewayWaitSignal): boolean {
  * the caller's: one request's route broke, and the retry is routed afresh.
  */
 export function gatewayHoldScope(signal: GatewayWaitSignal): "shared" | "caller" {
-  if (signal.source === "link-cut" || signal.flattened) return "caller";
+  if (signal.source === "link-cut" || signal.source === "transport-drop" || signal.flattened) return "caller";
   if (isAccountWideRefusal(signal) || signal.scope === "model") return "shared";
   return "caller";
 }

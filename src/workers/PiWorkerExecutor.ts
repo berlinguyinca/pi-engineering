@@ -36,6 +36,7 @@ import {
   escalateSyntheticWait,
   gatewayFailureMarker,
   gatewayHoldScope,
+  isTransportDrop,
   parseGatewayWait,
 } from "../gateway/signals.ts";
 import { MAX_ESCALATED_WAIT_MS } from "../gateway/streamRetry.ts";
@@ -951,10 +952,13 @@ ${recovery.recoveryPrompt}`;
       !budgetExhausted &&
       !timedOut &&
       !loopPrevented &&
-      isTruncatedStream(assistantError)
+      (isTruncatedStream(assistantError) || isTransportDrop(assistantError))
     ) {
+      // A transport drop (undici "terminated": a gateway restart cut the
+      // socket) arrives the same way — an assistant-message error, no throw —
+      // and is retried under the same no-progress rule, as a network failure.
       session.dispose();
-      throw new TransientError("server_error", assistantError!, 1);
+      throw new TransientError(isTruncatedStream(assistantError) ? "server_error" : "network", assistantError!, 1);
     }
 
     return {

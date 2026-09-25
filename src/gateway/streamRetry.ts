@@ -50,7 +50,13 @@
 
 import { monotonicNow } from "../core/clock.ts";
 import { augmentInferenceErrorMessage, isAssistantOutputEvent } from "../inference/admissionContract.ts";
-import { type GatewayWaitInput, type GatewayWaitSignal, escalateSyntheticWait, parseGatewayWait } from "./signals.ts";
+import {
+  type GatewayWaitInput,
+  type GatewayWaitSignal,
+  escalateSyntheticWait,
+  parseGatewayWait,
+  transportDropWait,
+} from "./signals.ts";
 
 export { monotonicNow } from "../core/clock.ts";
 
@@ -251,8 +257,12 @@ export async function pumpWithGatewayRetry<E extends RetryableEvent, R extends R
 
     const failure = thrown !== undefined ? errorText(thrown) : (result?.errorMessage ?? "");
     const isAbort = result?.stopReason === "aborted" || opts.signal?.aborted === true;
-    const guidance = isAbort ? null : parseGatewayWait({ ...(opts.response?.() ?? {}), text: failure });
-    const wait = forwarded ? null : guidance;
+    const observed = { ...(opts.response?.() ?? {}), text: failure };
+    const guidance = isAbort ? null : parseGatewayWait(observed);
+    // A bare transport drop (the gateway restarted under the stream) carries
+    // no guidance, but before any visible output it is replay-safe: the
+    // caller's own escalating hold, same budget, never after output or abort.
+    const wait = forwarded ? null : (guidance ?? (isAbort ? null : transportDropWait(observed)));
     const remainingMs = maxElapsedMs - (now() - startedAt);
     const held = wait ? escalateSyntheticWait(wait, attempt + priorHolds, capMs) : undefined;
     const retryable =

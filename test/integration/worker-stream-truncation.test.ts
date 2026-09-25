@@ -185,3 +185,27 @@ test("worker: a cut AFTER a tool ran is not replayed — the task already has si
   );
   assert.equal(requests, 2, "no fresh-session replay after a tool ran");
 });
+
+/** The gateway restarts under the stream: the socket closes mid-body. */
+const socketCut: Reply = (res) => {
+  res.writeHead(200, { "content-type": "text/event-stream" });
+  res.write(chunk({ role: "assistant", content: "" }));
+  setTimeout(() => res.socket?.destroy(), 20);
+};
+
+test("worker: a connection cut before any tool ran (undici 'terminated') is retried in a fresh session", async () => {
+  const requests = await withProbe(
+    [socketCut, toolCalls([{ name: "worker_result", args: WORKER_RESULT }])],
+    async (executor, cwd) => {
+      const run = await executor.run({
+        role: "implementer",
+        task: "t",
+        tools: [],
+        cwd,
+        modelOverride: { provider: "probe", id: "probe-model" },
+      });
+      assert.equal(run.result.status, "completed", run.result.summary);
+    },
+  );
+  assert.equal(requests, 2, "one cut attempt, one fresh retry");
+});
