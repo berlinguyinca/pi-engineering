@@ -26,6 +26,13 @@ export interface GateEvidence {
   securityReviewsCompleted: number;
   /** Findings keyed by finding_id with status. */
   findings: Array<{ finding_id: string; severity: string; status: string }>;
+  /**
+   * Branch names merged by SUCCEEDED integration executions (parsed from
+   * "integrated A, B; checks: pass" summaries). Used to supersede the FAILED
+   * status of a worker whose committed work was recovered after a wall-clock
+   * timeout (see broker integration handoff).
+   */
+  integratedBranches: string[];
 }
 
 export class CompletionGate {
@@ -61,7 +68,14 @@ export class CompletionGate {
           o.role === t.role &&
           o.status === "SUCCEEDED" &&
           (order.get(o.task_id) ?? -1) > (order.get(t.task_id) ?? -1),
-      );
+      ) ||
+      // Recovery supersede: the worker's branch was merged by a succeeded
+      // integration (its committed work was recovered after the wall-clock
+      // timeout). The deliverable is on the base tree and was gated by the
+      // integration checks + validation + review, so the task's FAILED status
+      // (a timeout, not a rejected deliverable) must not block completion.
+      // Branch naming is stable: `pi-eng-orch-<task_id>` (broker allocation).
+      evidence.integratedBranches.includes(`pi-eng-orch-${t.task_id}`);
     const failed = tasks.filter((t) => t.status === "FAILED" && !superseded(t));
 
     // Required gates.
@@ -132,6 +146,26 @@ export class CompletionGate {
     };
   }
 
+  /**
+   * Parse merged branch names from integration summaries of the form
+   * "integrated a, b; checks: pass" (both the realBackends integrator and the
+   * Integrator class emit this shape). "integrated nothing" yields [].
+   */
+  static parseIntegratedBranches(summaries: string[]): string[] {
+    const branches: string[] = [];
+    for (const s of summaries) {
+      const m = /integrated\s+(.+?);\s*checks:/.exec(s);
+      if (!m) continue;
+      const list = m[1]!.trim();
+      if (!list || list === "nothing") continue;
+      for (const b of list.split(",")) {
+        const name = b.trim();
+        if (name) branches.push(name);
+      }
+    }
+    return branches;
+  }
+
   /** Gather gate evidence from the store. */
   gather(missionId: string): GateEvidence {
     const executions = this.store.listExecutions(missionId);
@@ -142,11 +176,17 @@ export class CompletionGate {
     const securityReviewsCompleted = tasks.filter(
       (t) => t.kind === "review" && t.status === "SUCCEEDED" && t.role.includes("security"),
     ).length;
+    const integratedBranches = CompletionGate.parseIntegratedBranches(
+      executions
+        .filter((e) => e.backend === "integration" && e.status === "SUCCEEDED")
+        .map((e) => (e.summary as string | undefined) ?? ""),
+    );
     return {
       missionId,
       validationsPassed,
       reviewsCompleted,
       securityReviewsCompleted,
+      integratedBranches,
       findings: findings.map((f) => ({ finding_id: f.finding_id, severity: f.severity, status: f.status })),
     };
   }

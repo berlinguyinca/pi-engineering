@@ -95,6 +95,50 @@ describe("CompletionGate (spec 07)", () => {
     assert.equal(v.can_complete, false);
   });
 
+  it("recovered timed-out work (merged branch) does not block completion (MSN-4IhxSO)", () => {
+    const { store, m } = mission(["validation", "independent_review"]);
+    // The implementer committed real work, then hit the wall-clock timeout.
+    const t = store.createTask({ mission_id: m.mission_id, kind: "agent", role: "implementer", objective: "x" });
+    store.transitionTask(t.task_id, "READY");
+    store.transitionTask(t.task_id, "RUNNING");
+    store.transitionTask(t.task_id, "FAILED");
+    // Integration recovered the committed branch; checks passed.
+    const itask = store.createTask({ mission_id: m.mission_id, kind: "integration", role: "integrator", objective: "merge" });
+    store.transitionTask(itask.task_id, "READY");
+    store.transitionTask(itask.task_id, "RUNNING");
+    store.transitionTask(itask.task_id, "SUCCEEDED");
+    const iex = store.createExecution({ task_id: itask.task_id, backend: "integration", mission_id: m.mission_id });
+    store.setExecutionStatus(iex.execution_id, "SUCCEEDED", {
+      summary: `integrated pi-eng-orch-${t.task_id}; checks: pass`,
+    });
+    // Validation + review succeeded.
+    const vtask = store.createTask({ mission_id: m.mission_id, kind: "validation", role: "validator", objective: "validate" });
+    store.transitionTask(vtask.task_id, "READY");
+    store.transitionTask(vtask.task_id, "RUNNING");
+    store.transitionTask(vtask.task_id, "SUCCEEDED");
+    const vex = store.createExecution({ task_id: vtask.task_id, backend: "validation", mission_id: m.mission_id });
+    store.setExecutionStatus(vex.execution_id, "SUCCEEDED");
+    const rtask = store.createTask({ mission_id: m.mission_id, kind: "review", role: "reviewer", objective: "review" });
+    store.transitionTask(rtask.task_id, "READY");
+    store.transitionTask(rtask.task_id, "RUNNING");
+    store.transitionTask(rtask.task_id, "SUCCEEDED");
+    const rex = store.createExecution({ task_id: rtask.task_id, backend: "review", mission_id: m.mission_id });
+    store.setExecutionStatus(rex.execution_id, "SUCCEEDED");
+
+    const gate = new CompletionGate(store);
+    const v = gate.evaluate(store.getMission(m.mission_id)!);
+    assert.equal(v.can_complete, true, JSON.stringify(v.reasons));
+
+    // Control: the SAME failed task whose branch was NOT merged still blocks.
+    const t2 = store.createTask({ mission_id: m.mission_id, kind: "agent", role: "implementer", objective: "y" });
+    store.transitionTask(t2.task_id, "READY");
+    store.transitionTask(t2.task_id, "RUNNING");
+    store.transitionTask(t2.task_id, "FAILED");
+    const v2 = gate.evaluate(store.getMission(m.mission_id)!);
+    assert.equal(v2.can_complete, false);
+    assert.ok(v2.reasons.some((r) => r.includes("task(s) failed")), JSON.stringify(v2.reasons));
+  });
+
   it("a generic reviewer cannot satisfy a security_review gate (spec 07)", () => {
     const { store, m } = mission(["validation", "independent_review", "security_review"], "high");
     const gate = new CompletionGate(store);
@@ -104,6 +148,7 @@ describe("CompletionGate (spec 07)", () => {
       validationsPassed: 1,
       reviewsCompleted: 1,
       securityReviewsCompleted: 0,
+      integratedBranches: [],
       findings: [],
     };
     const v = gate.evaluate(store.getMission(m.mission_id)!, evidence);
