@@ -45,7 +45,14 @@
  */
 
 import { pathToFileURL } from "node:url";
-import { type CompactionResult, SettingsManager, VERSION, compact, getAgentDir } from "@earendil-works/pi-coding-agent";
+import {
+  type CompactionResult,
+  SettingsManager,
+  VERSION,
+  compact,
+  estimateTokens,
+  getAgentDir,
+} from "@earendil-works/pi-coding-agent";
 import { emitTelemetry } from "../telemetry/sink.ts";
 
 export const PI_DEFAULT_RESERVE_TOKENS = 16_384;
@@ -225,6 +232,22 @@ function versionAtLeast(version: string, minimum: string): boolean {
     if ((a[i] ?? 0) !== (b[i] ?? 0)) return (a[i] ?? 0) > (b[i] ?? 0);
   }
   return true;
+}
+
+/** Estimated context after a compaction: its summary plus the kept tail. */
+function estimateAfter(branch: unknown[], result: CompactionResult): number {
+  const entries = branch as Array<{ id?: string; type?: string; message?: unknown }>;
+  const start = entries.findIndex((e) => e.id === result.firstKeptEntryId);
+  let tokens = Math.ceil(result.summary.length / 4);
+  for (const entry of start >= 0 ? entries.slice(start) : []) {
+    if (entry.type !== "message" || !entry.message) continue;
+    try {
+      tokens += estimateTokens(entry.message as never);
+    } catch {
+      tokens += Math.ceil(JSON.stringify(entry.message).length / 4);
+    }
+  }
+  return tokens;
 }
 
 // ─── Pi's prepareCompaction ────────────────────────────────────────────────
@@ -482,11 +505,24 @@ export function registerAutoCompaction(pi: AutoCompactionHost, options: AutoComp
         undefined,
         ctx.signal,
       );
+      if (ctx.signal?.aborted) {
+        // Esc during the summary: Pi's compact() can settle with an aborted
+        // summary rather than throw. Never commit it; not a failure either.
+        state = { armed: true };
+        return undefined;
+      }
       if (!result) {
         turnsSinceFailure = 0;
         return undefined;
       }
       turnsSinceFailure = undefined;
+      // Pi emits no compaction_start/end (and no session_compact) for a
+      // boundary-supplied compaction, so say what happened ourselves.
+      emitTelemetry({
+        level: "info",
+        key: "compaction-autotune:compacted",
+        text: `Compacted ~${(usage.tokens ?? result.tokensBefore).toLocaleString("en-US")} → ~${estimateAfter(ctx.sessionManager.getBranch(), result).toLocaleString("en-US")} tokens (tuned for ${ctx.model?.provider}/${ctx.model?.id}: keep ${effective.keepRecentTokens.toLocaleString("en-US")} recent).`,
+      });
       const draft = {
         type: "compaction",
         summary: result.summary,
@@ -497,6 +533,11 @@ export function registerAutoCompaction(pi: AutoCompactionHost, options: AutoComp
       // Boundary results REPLACE the accumulated drafts: keep other handlers'.
       return { entries: [...(event.entries ?? []), draft] };
     } catch (error) {
+      if (ctx.signal?.aborted) {
+        // Esc is the user's choice, not a failure: no warning, no hold-off.
+        state = { armed: true };
+        return undefined;
+      }
       turnsSinceFailure = 0;
       emitTelemetry({
         level: "warning",

@@ -43,6 +43,7 @@ function gatewayServer() {
   const requests: Recorded[] = [];
   const promptTokens: number[] = [];
   let failSummaries = false;
+  let summaryDelayMs = 0;
   const server = createServer((req: IncomingMessage, res: ServerResponse) => {
     let raw = "";
     req.on("data", (chunk) => {
@@ -61,13 +62,22 @@ function gatewayServer() {
       }
       const content = summarization ? "## Goal\nKeep going.\n## Progress\nDone some things." : "ok";
       const prompt = summarization ? 1000 : (promptTokens.shift() ?? 1000);
-      res.writeHead(200, { "content-type": "text/event-stream" });
-      const chunk = (payload: unknown) => res.write(`data: ${JSON.stringify(payload)}\n\n`);
-      const base = { id: "c", object: "chat.completion.chunk", created: 0, model: "m" };
-      chunk({ ...base, choices: [{ index: 0, delta: { role: "assistant", content }, finish_reason: null }] });
-      chunk({ ...base, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] });
-      chunk({ ...base, choices: [], usage: { prompt_tokens: prompt, completion_tokens: 5, total_tokens: prompt + 5 } });
-      res.end("data: [DONE]\n\n");
+      const respond = () => {
+        if (res.destroyed) return;
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        const chunk = (payload: unknown) => res.write(`data: ${JSON.stringify(payload)}\n\n`);
+        const base = { id: "c", object: "chat.completion.chunk", created: 0, model: "m" };
+        chunk({ ...base, choices: [{ index: 0, delta: { role: "assistant", content }, finish_reason: null }] });
+        chunk({ ...base, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] });
+        chunk({
+          ...base,
+          choices: [],
+          usage: { prompt_tokens: prompt, completion_tokens: 5, total_tokens: prompt + 5 },
+        });
+        res.end("data: [DONE]\n\n");
+      };
+      if (summarization && summaryDelayMs > 0) setTimeout(respond, summaryDelayMs);
+      else respond();
     });
   });
   return {
@@ -76,6 +86,9 @@ function gatewayServer() {
     promptTokens,
     failSummaries(on: boolean) {
       failSummaries = on;
+    },
+    delaySummaries(ms: number) {
+      summaryDelayMs = ms;
     },
   };
 }
@@ -256,6 +269,11 @@ test("B + A: compacts at the TUNED threshold (turn_end boundary), keeps the tune
     assert.equal(summaries[0]?.body.reasoning_effort, "none", "summarized through the guarded gateway path");
     assert.ok(outputCap(summaries[0]?.body) > 13_107, "summary budget from the tuned reserve (0.8 x 32768)");
     assert.ok(notices.some((t) => t.includes(`Compaction tuned for gw/${MODEL_ID}`)));
+    // Pi emits no compaction_start/end for a boundary (draft) compaction, so we say it.
+    assert.ok(
+      notices.some((t) => /^Compacted ~[\d,]+ → ~[\d,]+ tokens \(tuned/.test(t)),
+      JSON.stringify(notices),
+    );
   } finally {
     uninstall();
     s.cleanup();
@@ -424,5 +442,27 @@ export default function (_pi: unknown) {
   } finally {
     s.cleanup();
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Esc during a tuned boundary compaction is not a failure (no warning, trigger not held off)", async () => {
+  const notices: string[] = [];
+  const uninstall = setTelemetrySink((n) => notices.push(n.text));
+  const s = await startSession();
+  try {
+    for (let i = 0; i < 3; i++) await turn(s.session, 60_000);
+    gateway.delaySummaries(5_000);
+    const run = turn(s.session, 240_000);
+    for (let i = 0; i < 200 && !gateway.requests.some((r) => r.summarization); i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    await s.session.abort();
+    await run.catch(() => undefined);
+    assert.equal(compactions(s.session).length, 0);
+    assert.ok(!notices.some((t) => /did not complete/.test(t)), JSON.stringify(notices));
+  } finally {
+    gateway.delaySummaries(0);
+    uninstall();
+    s.cleanup();
   }
 });
