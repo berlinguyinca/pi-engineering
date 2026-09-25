@@ -59,6 +59,14 @@ test("missing utilization lands in the unknown bucket", () => {
   assert.equal(s.loopsByContextUtilizationBucket.unknown, 1);
 });
 
+test("negative utilization lands in the unknown bucket", () => {
+  const obs = new ApsObservability();
+  obs.recordPrevented(prevented("m1", "read_file", 4, -0.3));
+  const s = obs.snapshot();
+  assert.equal(s.loopsByContextUtilizationBucket.unknown, 1);
+  assert.equal(s.loopsByContextUtilizationBucket["<0.5"], 0);
+});
+
 test("snapshot returns a copy, not mutable internal state", () => {
   const obs = new ApsObservability();
   obs.recordPrevented(prevented("m1", "read_file", 4, 0.5));
