@@ -14,14 +14,31 @@ const HTML = `<!doctype html><html><head><title>v</title><style>
 body{margin:0;background:#fff} h1{color:#000;font-size:32px;font-family:sans-serif}
 </style></head><body><h1>visual regression</h1></body></html>`;
 
+/**
+ * Capture a golden screenshot with retry to handle intermittent Playwright
+ * protocol errors under concurrent resource pressure.
+ */
 async function captureGolden(url: string, goldenPath: string): Promise<void> {
   await mkdir(GOLDEN_DIR, { recursive: true });
   const { chromium } = await import("playwright");
   const b = await chromium.launch({ headless: true });
-  const p = await b.newPage({ viewport: { width: 600, height: 400 } });
-  await p.goto(url, { waitUntil: "load" });
-  await p.screenshot({ path: goldenPath });
-  await b.close();
+  try {
+    const p = await b.newPage({ viewport: { width: 600, height: 400 } });
+    await p.goto(url, { waitUntil: "load" });
+    let lastErr: unknown;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        await p.screenshot({ path: goldenPath });
+        return;
+      } catch (err) {
+        lastErr = err;
+        if (attempt < 2) await new Promise((r) => setTimeout(r, 100 * (attempt + 1)));
+      }
+    }
+    throw lastErr;
+  } finally {
+    await b.close().catch(() => {});
+  }
 }
 
 test("visual regression: identical capture matches golden", async () => {
