@@ -45,14 +45,15 @@ Rules:
 `;
 
 /**
- * Roles whose deliverable is repository edits made in an isolated worktree.
+ * Roles whose deliverable is repository edits (made in an isolated worktree
+ * when the broker allocated one).
  * These workers must commit their own progress: the session can be killed by
  * the wall-clock budget at any moment, and only the WORKER'S OWN commits are
  * recovered after a timeout — the harvest auto-commit of uncommitted edits is
  * treated as incomplete and is deliberately NOT integrated (see broker
  * recovery, "recover only the worker's own commits").
  */
-const MUTATING_ROLES: ReadonlySet<WorkerRole> = new Set<WorkerRole>([
+export const MUTATING_ROLES: ReadonlySet<WorkerRole> = new Set<WorkerRole>([
   "implementer",
   "debugger",
   "test-generator",
@@ -62,15 +63,30 @@ const MUTATING_ROLES: ReadonlySet<WorkerRole> = new Set<WorkerRole>([
 const COMMIT_DISCIPLINE = `\
 Commit discipline (isolated worktree):
 - Commit your work on the current branch after EVERY coherent unit of change (a working piece, not the whole task at once). If your task involves an iterate/verify loop, commit after each completed loop iteration.
-- Your session can be terminated by a wall-clock budget at any time. Only your own commits survive: uncommitted edits are captured once at termination, treated as incomplete, and are NOT merged.
-- Never leave the session with a large uncommitted delta; commit the last coherent state as soon as you have one.`;
+- If your session is terminated by the time budget, only your own commits are recovered; uncommitted edits at that point are not merged.
+- Never leave the session with a large uncommitted delta; commit the last coherent state as soon as you have one.
+- Only add commits on the current branch: never switch branches, rebase, amend or rewrite commits you did not make, or push.`;
+
+/**
+ * Whether a worker gets the commit-discipline instruction: a mutating role
+ * running in a worktree the broker allocated for it. Everywhere else (the
+ * user's own checkout on a fallback path, read-only roles) it stays silent.
+ */
+export function wantsCommitDiscipline(role: WorkerRole, opts?: { isolatedWorktree?: boolean }): boolean {
+  return opts?.isolatedWorktree === true && MUTATING_ROLES.has(role);
+}
 
 /**
  * Build the system prompt for a worker.
  * `task` and optional `context` are injected; the worker is told to finish with
  * `worker_result`.
  */
-export function buildSystemPrompt(role: WorkerRole, task: string, context?: string): string {
+export function buildSystemPrompt(
+  role: WorkerRole,
+  task: string,
+  context?: string,
+  opts?: { isolatedWorktree?: boolean },
+): string {
   const parts: string[] = [];
   parts.push(`# Role: ${role}`);
   parts.push(ROLE_PROMPTS[role] ?? ROLE_PROMPTS.implementer);
@@ -84,7 +100,7 @@ export function buildSystemPrompt(role: WorkerRole, task: string, context?: stri
   }
   parts.push("");
   parts.push(BASE_RULES);
-  if (MUTATING_ROLES.has(role)) parts.push(COMMIT_DISCIPLINE);
+  if (wantsCommitDiscipline(role, opts)) parts.push(COMMIT_DISCIPLINE);
   return parts.join("\n");
 }
 

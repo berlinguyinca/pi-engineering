@@ -120,6 +120,7 @@ export function realBackends(opts: RealBackendsOptions) {
         objective: string;
         contextRef?: string;
         worktree?: string | null;
+        isolatedWorktree?: boolean;
         modelRequirements?: Record<string, unknown>;
         signal: AbortSignal;
       }): Promise<ExecutionOutcome> {
@@ -133,6 +134,9 @@ export function realBackends(opts: RealBackendsOptions) {
           // repo, implement, run verification, and commit. Configurable so an
           // operator can tune per environment without recompiling.
           timeoutMs: workerTimeoutMs(),
+          // Only the broker's word makes a directory an isolated worktree; the
+          // fallback (no worktree) runs in the user's checkout.
+          isolatedWorktree: input.isolatedWorktree === true && !!input.worktree,
         };
         // Place the worker on the model the capability router chose for this
         // role (honours `policy.routing.roles`); fall back to the executor
