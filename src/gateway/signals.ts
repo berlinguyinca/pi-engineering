@@ -38,14 +38,13 @@ export interface GatewayWaitSignal {
    * `"link-cut"` is the gateway's fixed hint for a flattened link cut (see
    * LINK_CUT_WAIT_MS): honoured exactly, like a body or header wait, but not a
    * body instruction, so it never claims the admission controller's layer.
-   * `"hint"` is the same idea for a flattened refusal code whose wait the
-   * gateway fixes (see FLATTENED_REFUSAL_HINT_MS).
    */
-  source: "body" | "header" | "default" | "link-cut" | "hint";
+  source: "body" | "header" | "default" | "link-cut";
   /**
-   * Parsed from a flattened InferWeave refusal (bare code or its readable
-   * wording) rather than an envelope. Held by the caller alone: flattening lost
-   * the scope and limits that would justify parking anyone else.
+   * A genuine post-200 flattened InferWeave refusal: a bare code (or its
+   * readable wording) with no HTTP status. Held by the caller alone, since
+   * flattening lost the scope and limits that would justify parking anyone
+   * else. The same code WITH a status keeps the shared model-scoped hold.
    */
   flattened?: boolean;
   status?: number;
@@ -137,20 +136,16 @@ const FLATTENED_REFUSAL_CODES: ReadonlySet<string> = new Set([
   "request_not_queueable",
 ]);
 
-/**
- * Waits known exactly despite flattening. A stale routing snapshot is fixed by
- * the next request, which is routed on a fresh snapshot; the gateway advertises
- * 1s for it. The others have no such constant — `model_activating`'s real wait
- * is the placement's warm-up and `capacity_unavailable` lasts as long as no node
- * serves the model — so they take the escalating default instead of a guess.
- */
-const FLATTENED_REFUSAL_HINT_MS: Readonly<Record<string, number>> = { routing_snapshot_expired: 1_000 };
-
 /** "Error: 503: routing_snapshot_expired" → status 503, code. The whole text. */
 const BARE_REFUSAL = /^\s*(?:error:\s*)?(?:(?:http\s*)?(\d{3})\b[:\s]*)?([a-z_]+)\.?\s*$/i;
 /** The readable wording: "No fresh route for model m (routing_snapshot_expired); please retry your request." */
 const WORDED_REFUSAL = /\(([a-z_]+)\);\s*please retry your request\b/i;
 const PREFIXED_STATUS = /^\s*(?:error:\s*)?(?:http\s*)?(\d{3})\b/i;
+
+/** HTTP status leading an error text, after an optional "Error:" prefix. */
+export function errorTextStatus(text: string | undefined): number | undefined {
+  return text ? num(PREFIXED_STATUS.exec(text)?.[1]) : undefined;
+}
 
 /**
  * The retryable pre-dispatch refusal code a flattened InferWeave error carries,
@@ -168,7 +163,7 @@ export function flattenedInferWeaveRefusalCode(text: string | undefined): string
   if (NON_RETRYABLE_PATTERNS.test(text)) return undefined;
   const code = (BARE_REFUSAL.exec(text)?.[2] ?? WORDED_REFUSAL.exec(text)?.[1])?.toLowerCase();
   if (!code || !FLATTENED_REFUSAL_CODES.has(code)) return undefined;
-  const status = num(PREFIXED_STATUS.exec(text)?.[1]);
+  const status = errorTextStatus(text);
   if (status !== undefined && PERMANENT_ADMISSION_STATUSES.includes(status)) return undefined;
   return code;
 }
@@ -288,26 +283,18 @@ export function parseGatewayWait(input: GatewayWaitInput): GatewayWaitSignal | n
     };
   }
 
-  // A pre-dispatch refusal relayed after a 200 head arrives as its bare code
-  // (or the readable wording). Retryable and replay-safe while nothing was
-  // delivered — the pump's rule — and about one model's routing.
+  // A pre-dispatch refusal carried only as its code (bare, or the readable
+  // "(<code>); please retry your request" wording). Retryable and replay-safe
+  // while nothing was delivered — the pump's rule — and about one model's
+  // routing. It goes through the normal wait handling below, so an observed
+  // Retry-After or body wait is still honoured exactly; with none, the
+  // escalating default applies, because no fixed delay survives flattening
+  // (a stale snapshot lasts until the controller republishes, a warm-up as
+  // long as the placement takes).
   const refusalCode =
     !admission && !malformedNewContract && !permanentStatus ? flattenedInferWeaveRefusalCode(text) : undefined;
-  if (refusalCode) {
-    const hint = FLATTENED_REFUSAL_HINT_MS[refusalCode];
-    return {
-      retryAfterMs: hint ?? DEFAULT_WAIT_MS,
-      retryable: true,
-      source: hint !== undefined ? "hint" : "default",
-      reason: refusalCode,
-      type: "inferweave_backpressure",
-      scope: "model",
-      flattened: true,
-      ...(status !== undefined ? { status } : {}),
-    };
-  }
 
-  if (!(status !== undefined && WAIT_STATUSES.has(status)) && !looksRateLimited) return null;
+  if (!(status !== undefined && WAIT_STATUSES.has(status)) && !looksRateLimited && !refusalCode) return null;
 
   // Quota/billing exhaustion is deterministic: waiting never clears it, and Pi's
   // own retry classifier fails fast there for the same reason.
@@ -350,20 +337,23 @@ export function parseGatewayWait(input: GatewayWaitInput): GatewayWaitSignal | n
     source = "default";
   }
 
-  const scope = admission ? admission.scope : str(body?.scope);
+  const scope = admission ? admission.scope : (str(body?.scope) ?? (refusalCode ? "model" : undefined));
   const activeLimit = admission ? admission.activeLimit : num(body?.active_limit);
   const queued = admission ? admission.queued : num(body?.queued);
   const queueLimit = admission ? admission.queueLimit : num(body?.queue_limit);
   const requestId = admission ? admission.requestId : str(body?.request_id);
   const message = admission ? admission.message : str(body?.message);
 
+  const signalReason = reason ?? refusalCode;
+  const signalType = type ?? (refusalCode ? "inferweave_backpressure" : undefined);
   return {
     retryAfterMs,
     retryable,
     source,
+    ...(refusalCode && status === undefined ? { flattened: true } : {}),
     ...(status !== undefined ? { status } : {}),
-    ...(reason ? { reason } : {}),
-    ...(type ? { type } : {}),
+    ...(signalReason ? { reason: signalReason } : {}),
+    ...(signalType ? { type: signalType } : {}),
     ...(scope ? { scope } : {}),
     ...(activeLimit !== undefined ? { activeLimit } : {}),
     ...(queued !== undefined ? { queued } : {}),
@@ -380,6 +370,34 @@ export function parseGatewayWait(input: GatewayWaitInput): GatewayWaitSignal | n
       : {}),
     ...(str(admission?.payload.model ?? body?.model) ? { model: str(admission?.payload.model ?? body?.model) } : {}),
   };
+}
+
+/**
+ * Grow a synthesized wait with consecutive failures.
+ *
+ * A gateway that reports `retry_after_ms` (or a link cut's fixed "routed
+ * afresh" hint) is obeyed to the millisecond — it knows when its queue drains
+ * and we do not. A wait we synthesized (`"default"`) advertises nothing, and
+ * asking again every 5s while a model has no workers at all is a busy-wait
+ * against an outage. Escalate those, capped so recovery stays prompt.
+ */
+export function escalateSyntheticWait(signal: GatewayWaitSignal, attempt: number, capMs: number): GatewayWaitSignal {
+  if (signal.source !== "default") return signal;
+  const escalated = Math.min(capMs, signal.retryAfterMs * 2 ** Math.max(0, attempt - 1));
+  return { ...signal, retryAfterMs: escalated };
+}
+
+/**
+ * The worker failure marker for a gateway wait budget that ran out.
+ *
+ * A flattened refusal is the same failure the transient layer sees when it is
+ * thrown, so it exhausts into the same `transient:server_unavailable` marker —
+ * the scheduler's resilience window then waits out a long warm-up instead of
+ * failing the task. Everything else keeps its `gateway:<reason>` marker.
+ */
+export function gatewayFailureMarker(signal: GatewayWaitSignal): string {
+  if (signal.flattened) return "transient:server_unavailable";
+  return `gateway:${signal.reason ?? signal.type ?? signal.status ?? "rate-limited"}`;
 }
 
 /** One-line human summary for notices and logs. */

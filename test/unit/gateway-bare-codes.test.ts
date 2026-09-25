@@ -16,6 +16,8 @@ import { isRetryableAssistantError } from "@earendil-works/pi-ai/utils/retry";
 import {
   DEFAULT_WAIT_MS,
   decideTransientHandover,
+  escalateSyntheticWait,
+  gatewayFailureMarker,
   gatewayHoldScope,
   isAccountWideRefusal,
   isFlattenedInferWeaveRefusal,
@@ -62,15 +64,58 @@ test("bare codes: the new Rust wording is recognised and matches Pi's own retry 
   assert.equal(isRetryableAssistantError({ stopReason: "error", errorMessage: RUST_WORDING } as never), true);
 });
 
-test("bare codes: a stale snapshot waits the gateway's exact 1s; capacity waits escalate from the default", () => {
-  const stale = parseGatewayWait({ text: "routing_snapshot_expired" });
-  assert.equal(stale?.retryAfterMs, 1_000);
-  assert.equal(stale?.source, "hint", "honoured exactly — the retry is routed on a fresh snapshot");
-  for (const code of ["capacity_unavailable", "model_activating"]) {
+test("bare codes: every flattened code escalates from the default wait — none is a fixed hint", () => {
+  // A stale snapshot persists until the controller republishes, and the 1s the
+  // gateway advertises is its generic retry_after for every 408/429/5xx. A flat
+  // 1s would spend the whole attempt budget in ~8s.
+  for (const code of CODES) {
     const signal = parseGatewayWait({ text: code });
     assert.equal(signal?.retryAfterMs, DEFAULT_WAIT_MS, code);
-    assert.equal(signal?.source, "default", `${code}: the real delay was lost in flattening, so it escalates`);
+    assert.equal(signal?.source, "default", code);
+    assert.equal(signal?.flattened, true, code);
   }
+});
+
+test("bare codes: an observed Retry-After is honoured exactly instead of the default", () => {
+  const withStatus = parseGatewayWait({ text: "model_activating", status: 429, headers: { "retry-after": "30" } });
+  assert.equal(withStatus?.retryAfterMs, 30_000);
+  assert.equal(withStatus?.source, "header");
+  assert.equal(withStatus?.reason, "model_activating");
+
+  const noStatus = parseGatewayWait({ text: "model_activating", headers: { "retry-after-ms": "2500" } });
+  assert.equal(noStatus?.retryAfterMs, 2_500);
+  assert.equal(noStatus?.source, "header");
+  assert.equal(noStatus?.flattened, true);
+});
+
+test("bare codes: with an HTTP status the refusal is not flattened and keeps the shared model hold", () => {
+  for (const input of [{ text: "429: queue_limit_reached" }, { text: "model_activating", status: 503 }]) {
+    const signal = parseGatewayWait(input);
+    assert.ok(signal, input.text);
+    assert.equal(signal.retryable, true);
+    assert.equal(signal.flattened, undefined, "only a genuine post-200 bare code is flattened");
+    assert.equal(signal.scope, "model");
+    assert.equal(gatewayHoldScope(signal), "shared");
+    assert.equal(isAccountWideRefusal(signal), false);
+  }
+});
+
+test("worker gateway path: flattened waits escalate and exhaustion is a transient marker", () => {
+  const flat = parseGatewayWait({ text: "model_activating" });
+  assert.ok(flat);
+  const waits = [1, 2, 3, 4, 5, 6].map((n) => escalateSyntheticWait(flat, n, 60_000).retryAfterMs);
+  assert.deepEqual(waits, [5_000, 10_000, 20_000, 40_000, 60_000, 60_000]);
+  assert.equal(gatewayFailureMarker(flat), "transient:server_unavailable", "same resilience window as the thrown path");
+
+  const header = parseGatewayWait({ text: "model_activating", headers: { "retry-after": "30" } });
+  assert.ok(header);
+  assert.equal(escalateSyntheticWait(header, 4, 60_000).retryAfterMs, 30_000, "an advertised wait never escalates");
+
+  const admission = parseGatewayWait({
+    text: '429: {"reason":"queue_timeout","retry_after_ms":30000,"scope":"agent","type":"inference_admission"}',
+  });
+  assert.ok(admission);
+  assert.equal(gatewayFailureMarker(admission), "gateway:queue_timeout");
 });
 
 test("bare codes: held by the caller only, never an account-wide or admission refusal", () => {
@@ -106,12 +151,19 @@ test("bare codes: fail closed behind permanent statuses, quota wording and any e
   ];
   for (const text of negatives) {
     assert.equal(isFlattenedInferWeaveRefusal(text), false, text);
-    assert.notEqual(parseGatewayWait({ text })?.source, "hint", text);
+    assert.notEqual(parseGatewayWait({ text })?.flattened, true, text);
   }
   assert.notEqual(parseGatewayWait({ text: "capacity_unavailable", status: 401 })?.retryable, true);
 });
 
 // ─── Single ownership with the worker's transient layer ─────────────────────
+
+test("transient: the routing rule honours a permanent status in the text", () => {
+  for (const text of ["404 routing_snapshot_expired", "Error: 403: capacity_unavailable", "401 retry_alternate"]) {
+    assert.equal(classifyError(new Error(text)).retryable, false, text);
+  }
+  assert.equal(classifyError({ status: 404, message: "capacity_unavailable" }).retryable, false);
+});
 
 test("bare codes: the transient layer retries them and the handover leaves them alone", () => {
   for (const text of [...CODES, RUST_WORDING]) {
@@ -166,7 +218,6 @@ test("bare codes: [start, error(routing_snapshot_expired)] is retried with exact
       hold: async (signal) => {
         holds.push(signal.retryAfterMs);
       },
-      priorHolds: 4,
     },
   );
 
@@ -176,5 +227,5 @@ test("bare codes: [start, error(routing_snapshot_expired)] is retried with exact
     ["start", "text_delta", "done"],
   );
   assert.equal(ended?.stopReason, "stop");
-  assert.deepEqual(holds, [1_000], "exact, however many holds came before");
+  assert.deepEqual(holds, [DEFAULT_WAIT_MS]);
 });

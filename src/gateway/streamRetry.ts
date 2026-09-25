@@ -50,7 +50,7 @@
 
 import { monotonicNow } from "../core/clock.ts";
 import { augmentInferenceErrorMessage, isAssistantOutputEvent } from "../inference/admissionContract.ts";
-import { type GatewayWaitInput, type GatewayWaitSignal, parseGatewayWait } from "./signals.ts";
+import { type GatewayWaitInput, type GatewayWaitSignal, escalateSyntheticWait, parseGatewayWait } from "./signals.ts";
 
 export { monotonicNow } from "../core/clock.ts";
 
@@ -169,29 +169,6 @@ function errorText(value: unknown): string {
 }
 
 /**
- * Grow a synthesized wait with consecutive failures.
- *
- * A gateway that reports `retry_after_ms` (or a link cut's fixed "routed
- * afresh" hint) is obeyed to the millisecond — it
- * knows when its queue drains and we do not. A bare `503 no worker for model`
- * advertises nothing, so `parseGatewayWait` hands back a flat default; asking
- * again every 5s while a model has no workers at all is a busy-wait against an
- * outage. Escalate those, and cap them so the session still recovers promptly
- * once capacity returns.
- */
-function waitFor(signal: GatewayWaitSignal, attempt: number, capMs: number): GatewayWaitSignal {
-  if (
-    signal.source === "body" ||
-    signal.source === "header" ||
-    signal.source === "link-cut" ||
-    signal.source === "hint"
-  )
-    return signal;
-  const escalated = Math.min(capMs, signal.retryAfterMs * 2 ** Math.max(0, attempt - 1));
-  return { ...signal, retryAfterMs: escalated };
-}
-
-/**
  * Run `open` until it settles, waiting out gateway saturation in between.
  *
  * Forwards events to `sink` as they arrive, so streaming output is unaffected.
@@ -277,7 +254,7 @@ export async function pumpWithGatewayRetry<E extends RetryableEvent, R extends R
     const guidance = isAbort ? null : parseGatewayWait({ ...(opts.response?.() ?? {}), text: failure });
     const wait = forwarded ? null : guidance;
     const remainingMs = maxElapsedMs - (now() - startedAt);
-    const held = wait ? waitFor(wait, attempt + priorHolds, capMs) : undefined;
+    const held = wait ? escalateSyntheticWait(wait, attempt + priorHolds, capMs) : undefined;
     const retryable =
       held?.retryable === true && attempt < maxAttempts && remainingMs > 0 && held.retryAfterMs <= remainingMs;
 

@@ -15,7 +15,12 @@
  * sleep so tests can exercise backoff and retry loops without sleeping.
  */
 
-import { isFlattenedInferWeaveRefusal, isGatewayAdmissionRefusal, isGatewayLinkCut } from "../gateway/signals.ts";
+import {
+  errorTextStatus,
+  isFlattenedInferWeaveRefusal,
+  isGatewayAdmissionRefusal,
+  isGatewayLinkCut,
+} from "../gateway/signals.ts";
 import { PERMANENT_ADMISSION_STATUSES } from "../inference/admissionContract.ts";
 
 export type TransientErrorCategory =
@@ -142,10 +147,16 @@ export function classifyError(error: unknown): ErrorClass {
   // isFlattenedInferWeaveRefusal covers the remaining retryable pre-dispatch
   // codes (model_activating, queue_*) in the same shapes the interactive pump
   // recognises, so both layers agree on what is retryable.
+  //
+  // A permanent status — on the error object or leading the text ("404
+  // routing_snapshot_expired") — excludes the whole rule: waiting never fixes it.
+  const textStatus = errorTextStatus(raw);
+  const permanentStatus = [status, textStatus].some((s) => s != null && PERMANENT_ADMISSION_STATUSES.includes(s));
   if (
-    (!carriesEnvelope &&
+    !permanentStatus &&
+    ((!carriesEnvelope &&
       has("routing_snapshot_expired", "capacity_unavailable", "retry_alternate", "try another eligible deployment")) ||
-    (isFlattenedInferWeaveRefusal(raw) && !(status != null && PERMANENT_ADMISSION_STATUSES.includes(status)))
+      isFlattenedInferWeaveRefusal(raw))
   ) {
     return {
       category: "server_unavailable",
