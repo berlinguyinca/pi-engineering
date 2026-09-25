@@ -285,7 +285,7 @@ test("link cut: a non-gateway failure after start is forwarded as before", async
   );
 });
 
-test("link cut: repeated cuts and prior holds never escalate the 1s hint", async () => {
+test("link cut: the 1s hint is honoured for the first holds, then paced so a long outage cannot flood", async () => {
   const s = scripted([
     [start(), failed(NEW_WORDING)],
     [start(), failed(NEW_WORDING)],
@@ -296,9 +296,11 @@ test("link cut: repeated cuts and prior holds never escalate the 1s hint", async
     hold: async (signal) => {
       holds.push(signal.retryAfterMs);
     },
-    priorHolds: 5,
+    priorHolds: 3,
   });
-  assert.deepEqual(holds, [1_000, 1_000], "routed afresh: no ladder, however many holds came before");
+  // Holds 4 and 5 of the run still follow the gateway's hint; see
+  // long-wait-policy.test.ts for the pacing floor that follows.
+  assert.deepEqual(holds, [1_000, 1_000], "routed afresh: the gateway's 1s hint while the run is short");
 });
 
 test("post-head saturation: an overload after `start` but before output is retried too", async () => {

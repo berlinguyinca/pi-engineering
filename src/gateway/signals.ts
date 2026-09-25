@@ -47,6 +47,12 @@ export interface GatewayWaitSignal {
    * else. The same code WITH a status keeps the shared model-scoped hold.
    */
   flattened?: boolean;
+  /**
+   * Epoch ms at which the current run of waits began (set by the interactive
+   * pump). Lets the status line say what we are waiting for AND since when —
+   * an outage can last hours, and "waiting 60s" alone reads as a loop.
+   */
+  waitingSinceMs?: number;
   status?: number;
   /** Gateway-reported machine reason, e.g. "queue_timeout". */
   reason?: string;
@@ -462,8 +468,38 @@ export function escalateSyntheticWait(signal: GatewayWaitSignal, attempt: number
  * the scheduler's resilience window then waits out a long warm-up instead of
  * failing the task. Everything else keeps its `gateway:<reason>` marker.
  */
+/**
+ * Does this wait carry POSITIVE evidence of a transient condition, the kind
+ * that can last hours and does clear (a model reloading or moving GPUs,
+ * capacity_unavailable, a gateway restart, a queue timeout)? Only those earn
+ * the long horizon. A bare 500/502/504 with no envelope, reason or refusal
+ * code is not evidence — a deterministic upstream failure (e.g. a template
+ * crash on one specific input) looks exactly like it and never clears — so it
+ * keeps a short, finite budget.
+ */
+export function isLongWaitTransient(signal: GatewayWaitSignal): boolean {
+  if (!signal.retryable) return false;
+  if (signal.source === "link-cut" || signal.source === "transport-drop" || signal.flattened) return true;
+  if (signal.type === "inference_admission" || signal.type === "inferweave_backpressure") return true;
+  if (signal.reason) return true;
+  // Text-only saturation wording ("overloaded", "rate limit", "queue timeout")
+  // is what parseGatewayWait recognised when there was no status at all.
+  if (signal.status === undefined) return true;
+  return signal.status === 429 || signal.status === 503 || signal.status === 529;
+}
+
 export function gatewayFailureMarker(signal: GatewayWaitSignal): string {
-  if (signal.flattened) return "transient:server_unavailable";
+  // A retryable wait that outlasted the worker's own budget is transient
+  // infrastructure: the mission scheduler owns the long wait (hours, with
+  // probes and capped backoff), so hand it over instead of failing the task.
+  // Account-wide admission (429 / queue) parks as a capacity wait; everything
+  // else as a model/gateway outage. A non-retryable refusal (quota, billing,
+  // a malformed or replay-unsafe envelope) keeps its gateway marker and fails.
+  // A bare 5xx is not evidence of a transient outage (isLongWaitTransient):
+  // it keeps its gateway marker and fails instead of waiting for hours.
+  if (isLongWaitTransient(signal)) {
+    return isAccountWideRefusal(signal) ? "transient:rate_limit" : "transient:server_unavailable";
+  }
   return `gateway:${signal.reason ?? signal.type ?? signal.status ?? "rate-limited"}`;
 }
 

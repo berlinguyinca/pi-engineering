@@ -33,7 +33,12 @@ import { realBackends } from "../orchestration/realBackends.ts";
 import { tasksConflict, topoSort } from "../plan/taskDag.ts";
 import { JsonlEventStore } from "../platform/eventstore/jsonl.ts";
 import { resolveGatewayResilienceConfig } from "../resilience/config.ts";
-import { HttpRecoveryProbe } from "../resilience/probe.ts";
+import {
+  CatalogRecoveryProbe,
+  HttpRecoveryProbe,
+  type RecoveryProbe,
+  resolveCatalogProbeTarget,
+} from "../resilience/probe.ts";
 import { Scheduler } from "../sched/Scheduler.ts";
 import { emitTelemetry } from "../telemetry/sink.ts";
 import { buildCoreTools } from "../tools/coreTools.ts";
@@ -42,16 +47,31 @@ import { PiWorkerExecutor } from "../workers/PiWorkerExecutor.ts";
 import type { WorkerExecutor, WorkerRequest } from "../workers/WorkerExecutor.ts";
 
 /**
- * Build the mission gateway recovery probe. When the operator sets
- * PI_GATEWAY_HEALTH_URL, a lightweight HTTP readiness probe is used so recovery
- * from an outage is detected without starting a full worker session; otherwise
- * undefined is returned and the scheduler falls back to its pass-through probe
- * (recovery confirmed by the next real attempt).
+ * Build the mission gateway recovery probe.
+ *
+ * Default: an authenticated `GET {baseUrl}/models` against the provider the
+ * implementer is routed to (CatalogRecoveryProbe), healthy only when that
+ * model is listed with capacity — so a paused mission resumes itself without
+ * any configuration. PI_GATEWAY_HEALTH_URL overrides it with a plain
+ * readiness probe. With no model runtime at all (a non-Pi worker) there is
+ * nothing to probe and the scheduler's pass-through probe applies.
  */
-function buildGatewayRecoveryProbe(): HttpRecoveryProbe | undefined {
+function buildGatewayRecoveryProbe(
+  worker: WorkerExecutor,
+  routeModel: ((role: WorkerRequest["role"]) => Promise<{ provider: string; id: string } | undefined>) | undefined,
+): RecoveryProbe | undefined {
   const url = process.env.PI_GATEWAY_HEALTH_URL;
-  if (!url) return undefined;
-  return new HttpRecoveryProbe({ baseUrl: url, timeoutMs: 5_000 });
+  if (url) return new HttpRecoveryProbe({ baseUrl: url, timeoutMs: 5_000 });
+  if (!(worker instanceof PiWorkerExecutor)) return undefined;
+  return new CatalogRecoveryProbe({
+    resolve: async () => {
+      const runtime = await worker.getModelRuntime();
+      const routed = await routeModel?.("implementer").catch(() => undefined);
+      const fallback = routed ? undefined : (await runtime.getAvailable())[0];
+      const ref = routed ?? (fallback ? { provider: fallback.provider, id: fallback.id } : undefined);
+      return ref ? resolveCatalogProbeTarget(runtime as never, ref) : undefined;
+    },
+  });
 }
 
 export interface EngineerReport {
@@ -521,7 +541,7 @@ export class EngineeringRuntime {
       // detected without burning a full worker session; otherwise the scheduler's
       // pass-through probe applies.
       resilience: rt.resilience,
-      probe: buildGatewayRecoveryProbe(),
+      probe: buildGatewayRecoveryProbe(rt.worker, routeModel),
       onPhase: (mission, phase) => {
         const mapped: RuntimePhaseEvent["phase"] =
           phase === "complete" ? "settled" : phase === "classified" ? "scout" : "implement";

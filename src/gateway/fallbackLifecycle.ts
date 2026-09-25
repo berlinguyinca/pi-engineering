@@ -64,12 +64,19 @@ export class FallbackCoordinator {
    * Idempotent past the threshold: repeated holds while a fallback is already
    * pending re-arm nothing and cannot turn one pending fallback into several.
    */
-  onGatewayHold(info: { modelId?: string; provider?: string; source?: GatewayWaitSignal["source"] } = {}): void {
+  onGatewayHold(
+    info: { modelId?: string; provider?: string; source?: GatewayWaitSignal["source"]; accountWide?: boolean } = {},
+  ): void {
     // A connection problem is not a model problem: a transport drop (the
     // gateway restarting under the stream) or a link cut (retried on a fresh
     // route) says nothing about this model's capacity, so it neither counts
     // toward a switch nor ends a run of saturation holds.
     if (info.source === "transport-drop" || info.source === "link-cut") return;
+    // An account-wide refusal (a 429 / admission queue every model shares) is
+    // not this model's outage either: a stand-in would wait in the same queue.
+    // Only a model-scoped outage — capacity_unavailable, a reload, a GPU move —
+    // makes a switch worth it, and that can last hours.
+    if (info.accountWide === true) return;
     this.consecutiveHolds++;
     if (this.consecutiveHolds >= this.afterHolds && !this.fallbackPending) {
       this.fallbackPending = true;

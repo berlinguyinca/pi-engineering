@@ -54,6 +54,7 @@ import {
   type GatewayWaitInput,
   type GatewayWaitSignal,
   escalateSyntheticWait,
+  isLongWaitTransient,
   parseGatewayWait,
   transportDropWait,
 } from "./signals.ts";
@@ -124,6 +125,14 @@ export interface GatewayStreamRetryOptions {
   maxElapsedMs?: number;
   /** Injectable monotonic clock. */
   now?: () => number;
+  /** Injectable wall clock (epoch ms) for `waitingSinceMs`. Default Date.now. */
+  wallNow?: () => number;
+  /**
+   * When the current run of waits began (epoch ms), carried across provider
+   * calls like `priorHolds`: an outage outlives a turn. Defaults to the first
+   * hold of this call.
+   */
+  waitingSinceMs?: number;
   /** Status/headers captured for the attempt before the body was flattened. */
   response?: () => Omit<GatewayWaitInput, "text"> | undefined;
   /** Ceiling on a SYNTHESIZED wait. Advertised waits are honoured exactly. */
@@ -150,6 +159,12 @@ export interface GatewayStreamRetryOptions {
    * never happens.
    */
   onProgress?(): void;
+  /**
+   * Called synchronously just before the stream ends, with how it settled —
+   * for the same reason as `onProgress`: the next provider call can start
+   * before a `.then` on the outcome runs.
+   */
+  onSettle?(settled: GatewayStreamRetryOutcome["settled"]): void;
 }
 
 export interface GatewayStreamRetryOutcome {
@@ -161,10 +176,53 @@ export interface GatewayStreamRetryOutcome {
   settled: "ok" | "error" | "aborted";
 }
 
-/** Default ceiling for a wait we invented rather than were told. */
+/**
+ * Default ceiling for a wait we invented rather than were told. Kept at a
+ * minute for the interactive turn so a recovered gateway is noticed promptly;
+ * an advertised Retry-After / retry_after_ms is honoured exactly instead.
+ */
 export const MAX_ESCALATED_WAIT_MS = 60_000;
-export const DEFAULT_GATEWAY_MAX_ATTEMPTS = 8;
-export const DEFAULT_GATEWAY_MAX_ELAPSED_MS = 300_000;
+/**
+ * Transient infrastructure (a model reloading or moving GPUs, capacity
+ * unavailable, a gateway restart, queue timeouts) can last hours. The ELAPSED
+ * horizon is what ends a wait — the operator can press Esc at any time — so
+ * the attempt ceiling is only a runaway guard, never the limiting factor.
+ */
+export const DEFAULT_GATEWAY_MAX_ATTEMPTS = 1_000_000;
+export const DEFAULT_GATEWAY_MAX_ELAPSED_MS = 12 * 3_600_000;
+/**
+ * The finite budget for a wait WITHOUT positive transient evidence — a bare
+ * 500/502/504 (see isLongWaitTransient). A deterministic upstream failure
+ * looks exactly like it and never clears, so it gets the old short budget.
+ */
+export const SHORT_TRANSIENT_MAX_ATTEMPTS = 8;
+
+/**
+ * Pacing floor for a long interactive wait. The first few holds follow the
+ * gateway's own hint (a link cut's 1s, an advertised retry_after_ms); after
+ * that every wait is at least an escalating 5s→60s, and once the operator has
+ * waited half an hour, at least 3 minutes. Without it a 1s hint honoured for
+ * 12 hours is ~43k requests, each re-sending the whole (up to 32 MiB) body.
+ * A LONGER advertised wait is always honoured as is.
+ */
+export const PACE_FREE_HOLDS = 5;
+export const PACE_SLOW_AFTER_MS = 30 * 60_000;
+export const PACE_SLOW_FLOOR_MS = 180_000;
+
+export function paceInteractiveWait(
+  signal: GatewayWaitSignal,
+  holdNumber: number,
+  waitedMs: number,
+  capMs: number,
+): GatewayWaitSignal {
+  if (holdNumber <= PACE_FREE_HOLDS) return signal;
+  const floor =
+    waitedMs >= PACE_SLOW_AFTER_MS
+      ? PACE_SLOW_FLOOR_MS
+      : Math.min(capMs, 5_000 * 2 ** Math.min(holdNumber - PACE_FREE_HOLDS - 1, 30));
+  return signal.retryAfterMs >= floor ? signal : { ...signal, retryAfterMs: floor };
+}
+export const SHORT_TRANSIENT_MAX_ELAPSED_MS = 300_000;
 
 function finiteBudget(value: number | undefined, fallback: number, minimum: number): number {
   return typeof value === "number" && Number.isFinite(value) && value >= minimum ? value : fallback;
@@ -193,6 +251,8 @@ export async function pumpWithGatewayRetry<E extends RetryableEvent, R extends R
   const startedAt = now();
   const capMs = opts.maxEscalatedWaitMs ?? MAX_ESCALATED_WAIT_MS;
   const priorHolds = opts.priorHolds ?? 0;
+  const wallNow = opts.wallNow ?? Date.now;
+  let waitingSinceMs = opts.waitingSinceMs;
   let holds = 0;
   let progressed = false;
 
@@ -264,9 +324,21 @@ export async function pumpWithGatewayRetry<E extends RetryableEvent, R extends R
     // caller's own escalating hold, same budget, never after output or abort.
     const wait = forwarded ? null : (guidance ?? (isAbort ? null : transportDropWait(observed)));
     const remainingMs = maxElapsedMs - (now() - startedAt);
-    const held = wait ? escalateSyntheticWait(wait, attempt + priorHolds, capMs) : undefined;
+    const escalated = wait ? escalateSyntheticWait(wait, attempt + priorHolds, capMs) : undefined;
+    if (escalated && waitingSinceMs === undefined) waitingSinceMs = wallNow();
+    const held = escalated
+      ? {
+          ...paceInteractiveWait(escalated, attempt + priorHolds, wallNow() - (waitingSinceMs ?? wallNow()), capMs),
+          waitingSinceMs,
+        }
+      : undefined;
+    const longWait = held ? isLongWaitTransient(held) : false;
+    const attemptCap = longWait ? maxAttempts : Math.min(maxAttempts, SHORT_TRANSIENT_MAX_ATTEMPTS);
+    const chainRemainingMs = longWait
+      ? remainingMs
+      : Math.min(maxElapsedMs, SHORT_TRANSIENT_MAX_ELAPSED_MS) - (now() - startedAt);
     const retryable =
-      held?.retryable === true && attempt < maxAttempts && remainingMs > 0 && held.retryAfterMs <= remainingMs;
+      held?.retryable === true && attempt < attemptCap && chainRemainingMs > 0 && held.retryAfterMs <= chainRemainingMs;
 
     if (retryable && held) {
       opts.onHold?.({ attempt, signal: held, errorText: failure });
@@ -276,6 +348,7 @@ export async function pumpWithGatewayRetry<E extends RetryableEvent, R extends R
       // message matches what Pi's own retry does when its backoff is
       // interrupted, so callers never have to care when cancellation landed.
       if (opts.signal?.aborted) {
+        opts.onSettle?.("aborted");
         sink.end(abortedFrom(result));
         return { attempts: attempt, holds, settled: "aborted" };
       }
@@ -296,8 +369,9 @@ export async function pumpWithGatewayRetry<E extends RetryableEvent, R extends R
     if (thrown !== undefined) throw thrown;
     const finalResult = guidance ? withGuidance(result, guidance) : result;
     if (withheld) sink.push(guidance ? withEventGuidance(withheld, guidance) : withheld);
-    sink.end(finalResult);
     const settled = isAbort ? "aborted" : result?.stopReason === "error" ? "error" : "ok";
+    opts.onSettle?.(settled);
+    sink.end(finalResult);
     return { attempts: attempt, holds, settled };
   }
 }

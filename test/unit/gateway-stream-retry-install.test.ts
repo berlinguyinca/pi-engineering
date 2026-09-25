@@ -395,3 +395,42 @@ test("install: escalation climbs within a call and resets once one succeeds", as
   assert.equal((await streams[1]!.settled).stopReason, "stop");
   assert.equal(waits[2], 5_000, "a stream that completed means capacity is back — the ladder resets");
 });
+
+test("install: a run of holds ends when a call settles in failure", async () => {
+  // Without this an outage that ended a turn left its escalation (and its
+  // "waiting since") to the NEXT turn, perhaps hours later.
+  resetGatewayStreamRetry();
+  const waits: number[] = [];
+  const since: Array<number | undefined> = [];
+  const streams: Array<ReturnType<typeof fakeStream>> = [];
+  const fail = { type: "error", error: { stopReason: "error", errorMessage: SATURATED } } as Ev;
+  const ok = { type: "done", message: { stopReason: "stop" } } as Ev;
+  // Call 1: two failures, budget of 2 attempts → settles in error.
+  // Call 2: one failure, then success.
+  const h = makeHost([[fail], [fail], [fail], [ok]]);
+  installGatewayStreamRetry(
+    h.host,
+    { provider: "acme", api: "a" },
+    {
+      createStream: () => {
+        const s = fakeStream();
+        streams.push(s);
+        return s;
+      },
+      hold: async (sig: { retryAfterMs: number; waitingSinceMs?: number }) => {
+        waits.push(sig.retryAfterMs);
+        since.push(sig.waitingSinceMs);
+      },
+      errorMessage: (_m: unknown, e: unknown) => ({ stopReason: "error", errorMessage: String(e) }),
+      maxAttempts: 2,
+    },
+  );
+  const handler = h.registered[0]?.config.streamSimple as (m: unknown, c: unknown) => unknown;
+
+  handler({}, {});
+  assert.equal((await streams[0]!.settled).stopReason, "error");
+  handler({}, {});
+  assert.equal((await streams[1]!.settled).stopReason, "stop");
+  assert.deepEqual(waits, [5_000, 5_000], "the failed call's run does not escalate the next call");
+  assert.notEqual(since[1], undefined, "the new run carries its own 'waiting since'");
+});

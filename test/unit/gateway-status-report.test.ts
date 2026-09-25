@@ -131,7 +131,7 @@ test("gateway report: context usage is shown, and an unknown count says so", () 
 
 test("gateway report: legacy infinite overrides read as unlimited, not Infinity", () => {
   const out = renderGatewayReport({ status: status(), config: CONFIG, installs: [] }).join("\n");
-  assert.match(out, /retry cap unlimited, elapsed cap default/);
+  assert.match(out, /worker retry cap unlimited \(then the mission window\), interactive wait horizon default/);
   assert.doesNotMatch(out, /Infinity/);
 });
 

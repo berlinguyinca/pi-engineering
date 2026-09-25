@@ -25,6 +25,18 @@ export function formatDuration(ms: number): string {
   return `${minutes}m ${String(seconds % 60).padStart(2, "0")}s`;
 }
 
+/**
+ * How long an outage has lasted, at a glance: "42s", "5m 07s", "2h 03m". An
+ * outage can run for hours, and "waiting 60s" alone reads as a stuck loop.
+ */
+export function formatWaitingFor(ms: number): string {
+  const total = Math.max(0, Math.floor(ms / 1000));
+  if (total < 60) return `${total}s`;
+  const minutes = Math.floor(total / 60);
+  if (minutes < 60) return `${minutes}m ${String(total % 60).padStart(2, "0")}s`;
+  return `${Math.floor(minutes / 60)}h ${String(minutes % 60).padStart(2, "0")}m`;
+}
+
 /** "queue timeout" from "queue_timeout"; the gateway's own words, made readable. */
 function reasonText(signal: GatewayWaitSignal): string {
   const raw = signal.reason ?? signal.type ?? (signal.status ? `HTTP ${signal.status}` : "");
@@ -51,11 +63,14 @@ function loadText(signal: GatewayWaitSignal): string {
  * the session just got slower. A relax is INFO: it is good news, and good news
  * does not need to look like a problem.
  */
-export function describeAdmissionEvent(event: AdmissionEvent): TelemetryNotice {
+export function describeAdmissionEvent(event: AdmissionEvent, now: () => number = Date.now): TelemetryNotice {
   if (event.type === "wait") {
     const reason = reasonText(event.signal);
     const load = loadText(event.signal);
-    const tail = [reason, load].filter(Boolean).join(" · ");
+    const since = event.signal.waitingSinceMs;
+    const lasted = since !== undefined ? `waiting for ${formatWaitingFor(now() - since)}` : "";
+    // Which model an outage is about: one model reloading is not the gateway down.
+    const tail = [reason, event.signal.model, load, lasted].filter(Boolean).join(" · ");
     return {
       level: "warning",
       // Keyed on the CONDITION, not the sentence: the queue depth moves between

@@ -111,7 +111,10 @@ export function classifyError(error: unknown): ErrorClass {
   // would otherwise false-match the "no worker" pattern.
   if (isTruncatedStream(raw) && !(status != null && PERMANENT_ADMISSION_STATUSES.includes(status))) {
     return {
-      category: "server_error",
+      // A connection-level truncation, not a server verdict: "network", so
+      // the scheduler treats it as a transient outage (a bare 5xx
+      // "server_error" is not).
+      category: "network",
       retryable: true,
       retryAfterMs,
       reason: "truncated stream (no finish_reason)",

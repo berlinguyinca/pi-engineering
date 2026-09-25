@@ -107,7 +107,7 @@ test("isTruncatedStream: fails closed behind the envelope and permanent-status g
 
 test("classify: truncated stream (no finish_reason) is retryable", () => {
   const cls = classifyError(new Error("Worker returned no worker_result. Stream ended without finish_reason"));
-  assert.equal(cls.category, "server_error");
+  assert.equal(cls.category, "network", "a connection truncation, not a server verdict");
   assert.equal(cls.retryable, true);
   assert.equal(cls.reason, "truncated stream (no finish_reason)");
 });

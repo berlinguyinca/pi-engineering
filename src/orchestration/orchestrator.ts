@@ -262,6 +262,11 @@ export class Orchestrator {
       acceptanceCriteria?: string[];
       /** Live progress callback (per-call). Lines stream as the mission runs. */
       onProgress?: (line: string) => void;
+      /**
+       * Ends an auto-resume wait (a paused mission watching the recovery
+       * probe) at once; the mission is returned PAUSED, still resumable.
+       */
+      signal?: AbortSignal;
     } = { repository: ".", baseRef: "" },
   ): Promise<OrchestrateResult> {
     const intent = this.router.route({
@@ -350,6 +355,23 @@ export class Orchestrator {
     this.store.transitionMission(mission.mission_id, "EXECUTING");
     this.phase(this.store.getMission(mission.mission_id)!, "executing");
     await this.scheduler.runMission(mission.mission_id);
+
+    // Auto-resume: a mission that paused because its retry window ran out
+    // watches the recovery probe (with a real probe only) and resumes itself on
+    // the first healthy answer, for up to auto_resume_horizon_ms after it first
+    // paused. Resuming re-queues the paused tasks with a fresh window, so an
+    // outage of many hours never turns into a failed mission.
+    const resumeHorizon = this.scheduler.resilienceConfig.auto_resume_horizon_ms ?? 0;
+    if (resumeHorizon > 0 && this.store.getMission(mission.mission_id)?.status === "PAUSED_INFRASTRUCTURE") {
+      const deadline = this.scheduler.now() + resumeHorizon;
+      while (
+        this.store.getMission(mission.mission_id)?.status === "PAUSED_INFRASTRUCTURE" &&
+        (await this.scheduler.awaitRecovery(deadline, opts.signal, mission.mission_id))
+      ) {
+        this.report(`[mission ${mission.mission_id}] gateway healthy again — resuming`);
+        await this.scheduler.resumePausedMission(mission.mission_id, opts.signal);
+      }
+    }
 
     // Resilience: if a worker's transient-infrastructure retry window exhausted
     // mid-execution, the mission is PAUSED (not FAILED) with all progress

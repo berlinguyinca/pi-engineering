@@ -236,6 +236,9 @@ export function installGatewayStreamRetry<M, C, O>(
   // wait every few seconds — exactly the busy-wait it exists to prevent. A
   // stream that completes normally means capacity is back, so it resets.
   let consecutiveHolds = 0;
+  // When that run of holds began (epoch ms), so the status line can say how
+  // long an outage has lasted across provider calls; cleared with the run.
+  let waitingSinceMs: number | undefined;
 
   /**
    * Marker so an installation can be VERIFIED rather than assumed.
@@ -271,14 +274,17 @@ export function installGatewayStreamRetry<M, C, O>(
         {
           hold: (waitSignal, attempt) => {
             consecutiveHolds++;
+            waitingSinceMs ??= waitSignal.waitingSinceMs;
             return deps.hold(waitSignal, attempt, signal, model);
           },
           priorHolds: consecutiveHolds,
+          ...(waitingSinceMs !== undefined ? { waitingSinceMs } : {}),
           // Synchronous, unlike the outcome: the agent loop starts its next
           // provider call before a `.then` on this pump would run.
           onProgress: () => {
             responseCapture?.clear();
             consecutiveHolds = 0;
+            waitingSinceMs = undefined;
             deps.onProgress?.(model);
           },
           ...(deps.onHold ? { onHold: (info) => deps.onHold?.(info, model) } : {}),
@@ -288,9 +294,19 @@ export function installGatewayStreamRetry<M, C, O>(
           ...(deps.maxElapsedMs != null ? { maxElapsedMs: deps.maxElapsedMs } : {}),
           ...(deps.now ? { now: deps.now } : {}),
           response: () => responseCapture?.take(),
+          // A call that ended in failure or abort closes the run of holds: the
+          // next turn (perhaps hours later) starts a fresh escalation and a
+          // fresh "waiting since" rather than inheriting a stale one.
+          onSettle: (settled) => {
+            if (settled === "ok") return;
+            consecutiveHolds = 0;
+            waitingSinceMs = undefined;
+          },
         },
       );
     })().catch((error: unknown) => {
+      consecutiveHolds = 0;
+      waitingSinceMs = undefined;
       // A throw that is not gateway backpressure. Pi expects a terminal event,
       // never a rejected promise, so report it the way `lazyStream` does.
       const message = deps.errorMessage(model, error);

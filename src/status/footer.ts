@@ -222,6 +222,8 @@ export class FooterController {
       // the one number that says whether the hold is going anywhere.
       ...(signal.queued !== undefined ? { queued: signal.queued } : {}),
       ...(signal.queueLimit !== undefined ? { queueLimit: signal.queueLimit } : {}),
+      // A long outage says how long it has lasted, not only the next countdown.
+      ...(signal.waitingSinceMs !== undefined ? { sinceMs: signal.waitingSinceMs } : {}),
     });
   }
 

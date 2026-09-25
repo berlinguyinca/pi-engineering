@@ -44,6 +44,8 @@ export interface WaitState {
   queued?: number;
   /** The gateway's queue capacity, when it reports one. */
   queueLimit?: number;
+  /** Epoch ms the current run of waits began; rendered as "for 2h 03m". */
+  sinceMs?: number;
 }
 
 /** The engineering task currently in flight. */
