@@ -596,7 +596,9 @@ ${TOOL_TRANSITION_RULE}`;
             ? "timeout"
             : gateway
               ? `gateway:${gateway.reason ?? gateway.type ?? gateway.status ?? "rate-limited"}`
-              : (lastAssistantError ?? "no-result");
+              : isTruncatedStream(lastAssistantError)
+                ? "truncated_after_progress"
+                : (lastAssistantError ?? "no-result");
         return {
           result: {
             status: "failed",
@@ -918,10 +920,14 @@ ${recovery.recoveryPrompt}`;
     // retryable — but only AFTER the fallback scan, and only when the session
     // produced no terminating result of either kind (worker_result or a
     // reviewer's review_result): a run that already delivered its result must
-    // not be thrown away and re-run because its final turn was cut.
+    // not be thrown away and re-run because its final turn was cut. And only
+    // before any tool ran: a fresh-session replay re-runs every tool (bash
+    // included) under a new wall-clock budget, so a cut after progress settles
+    // as a non-transient `truncated_after_progress` failure instead.
     if (
       captured === undefined &&
       structured === undefined &&
+      toolCalls === 0 &&
       !guardAborted &&
       !budgetExhausted &&
       !timedOut &&
