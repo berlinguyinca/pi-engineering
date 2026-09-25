@@ -3,9 +3,10 @@ import { describe, it } from "node:test";
 import { DEFAULT_GATEWAY_RESILIENCE, resolveGatewayResilienceConfig } from "../../src/resilience/config.ts";
 
 describe("resolveGatewayResilienceConfig", () => {
-  it("uses the 90-minute time-based defaults (not attempt counts)", () => {
+  it("uses the 12-hour time-based defaults (not attempt counts)", () => {
+    // A model reload, GPU move or capacity outage can last hours.
     const cfg = resolveGatewayResilienceConfig({});
-    assert.equal(cfg.retry_window_ms, 90 * 60_000);
+    assert.equal(cfg.retry_window_ms, 12 * 3_600_000);
     assert.equal(cfg.probe_interval_ms, 10_000);
     assert.equal(cfg.request_timeout_ms, 120_000);
     assert.equal(cfg.preserve_mission_on_exhaustion, true);

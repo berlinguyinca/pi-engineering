@@ -204,8 +204,9 @@ a 30s ask), so the runtime reads the refusal itself:
 * the reported `retry_after_ms` (body) or `Retry-After` (header) is honoured
   **in full** — clamping a wait the gateway asked for only sends the retry back
   into the same saturated queue and earns the same 429;
-* saturation is a wait, never a failure: the retry budget is **unlimited** by
-  default, so a worker keeps waiting until the gateway has capacity;
+* saturation is a wait, never a failure: transient conditions are waited out
+  for hours (see *Long transient outages* below), never ended by an attempt
+  count;
 * the cooldown is held **process-wide** — every model caller waits behind one
   gate, so parallel tournament legs stop hammering a queue that just refused
   one of them, and the interactive session holds its next request too;
@@ -227,36 +228,50 @@ Waiting out backpressure is deliberately **separate** from the degeneration
 recovery ladder: a queue timeout is not a degeneration, and must not burn
 attempts lowering reasoning effort or swapping models.
 
-### The one limit this cannot remove
+### Long transient outages: wait for hours, fail only on permanent errors
 
-The worker sessions run with Pi's own auto-retry disabled, so the unlimited
-budget above is the whole story for them: a scout, implementer, reviewer or
-tournament leg waits as long as it takes. Note the consequence — a worker's
-`timeoutMs` bounds one *attempt*, not the wait, so a permanently saturated
-gateway parks that worker indefinitely by design. Set `PI_GATEWAY_MAX_RETRIES`
-if you want a ceiling.
+A model reloading or moving to another GPU, `capacity_unavailable` /
+`model_activating` / `no worker`, a gateway restart, a link cut, an expired
+routing snapshot or a queue timeout can last **hours**. None of them ends an
+interactive turn or a mission early. The **elapsed horizon** ends a wait;
+attempt counts never do. Permanent errors — auth, other 4xx, quota/billing,
+`model_not_found` after its one catalog-resync retry, `request_too_large` —
+still fail fast. Context overflow is handled by compaction.
 
-Your **interactive** turn is different. Pi retries it itself and stops after
-`retry.maxRetries` (default 3), and the extension API exposes no accessor for
-that setting, so the runtime cannot raise it for you. Raise it yourself in
-`.pi/settings.json`:
+Each error class has **one** layer that owns its long wait, so waits never
+multiply:
 
-```json
-{ "retry": { "maxRetries": 100 } }
-```
+| Who | Short retries (seconds) | Long wait (owner) | After the horizon |
+| --- | --- | --- | --- |
+| Interactive turn | — | the gateway pump: capped-exponential waits (≤60s between attempts, an advertised `Retry-After` / `retry_after_ms` honoured exactly), up to `PI_GATEWAY_MAX_ELAPSED_MS` | the error is shown; **Esc** ends the wait at any time |
+| Worker session | transient layer (`PI_GUARD_TRANSIENT_*`, 4 attempts) and up to `PI_GATEWAY_MAX_RETRIES` honoured gateway waits | hands off with a `transient:*` marker to the mission scheduler | — |
+| Mission | — | scheduler window `PI_GATEWAY_RETRY_WINDOW`: relaunches paced by the recovery probe (`PI_GATEWAY_HEALTH_URL`), or without one by a capped-exponential backoff up to `PI_GATEWAY_MAX_BACKOFF` | the mission **pauses** (never fails); with a real probe it resumes itself on the first healthy answer within `PI_GATEWAY_AUTO_RESUME_HORIZON` |
 
-The runtime says this once per session, the second time it holds for a
-saturated gateway.
+While a turn waits, the status bar shows what it is waiting for, the next
+retry countdown and, once the outage passes a minute, how long it has lasted
+(`gateway 60s · capacity_unavailable · for 2h 03m`). A model fallback is armed
+only by a model's own outage (three consecutive holds): an account-wide queue,
+a connection drop and a link cut do not switch models.
 
 | Variable | Default | Meaning |
 | -------- | ------- | ------- |
 | `PI_GATEWAY_ADMISSION_ENABLED` | `true` | Disable admission control entirely |
 | `PI_GATEWAY_MAX_CONCURRENCY` | `4` | Total concurrent model requests this runtime aims at |
 | `PI_GATEWAY_RESERVED_SLOTS` | `1` | Of that total, slots kept free for your interactive turn (so 3 worker sessions by default, held from the start) |
-| `PI_GATEWAY_MAX_WAIT_MS` | *none* | Cap on a single honoured wait; unset means the gateway's ask is honoured in full |
+| `PI_GATEWAY_MAX_WAIT_MS` | `300000` | Retained for compatibility; a server-advertised wait is never shortened |
 | `PI_GATEWAY_JITTER_MS` | `250` | Release stagger window |
-| `PI_GATEWAY_MAX_RETRIES` | *unlimited* | Gateway-wait retries per worker attempt; set a number to make workers give up |
+| `PI_GATEWAY_MAX_RETRIES` | `8` | Gateway waits one worker attempt honours before the mission scheduler takes over the wait |
+| `PI_GATEWAY_MAX_ELAPSED_MS` | `12h` | How long an interactive turn waits out transient infrastructure (ms or a duration such as `12h`) |
+| `PI_GATEWAY_RETRY_WINDOW` | `12h` | How long a mission keeps relaunching a task through a transient outage before pausing |
+| `PI_GATEWAY_MAX_BACKOFF` | `3m` | Cap between relaunches when no recovery probe is configured |
+| `PI_GATEWAY_HEALTH_URL` | *none* | Gateway base URL for the recovery probe (`/ready`, `/health`, `/v1/models`) |
+| `PI_GATEWAY_PROBE_INTERVAL` | `10000` | Recovery probe cadence (ms) |
+| `PI_GATEWAY_AUTO_RESUME` | `true` | Whether a paused mission resumes itself when the probe reports healthy |
+| `PI_GATEWAY_AUTO_RESUME_HORIZON` | `24h` | How long a paused mission keeps probing for recovery |
 | `PI_GATEWAY_TELEMETRY` | `true` | Emit `[gateway-admission]` events on stderr |
+
+Pi's own retry (`.pi/settings.json` `retry`) is separate; the waits above do
+not depend on it and work with it disabled.
 
 ## Engineering panel
 

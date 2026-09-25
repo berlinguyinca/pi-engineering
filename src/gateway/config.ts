@@ -6,6 +6,7 @@
  * turn — backs off behind the SAME gate when a gateway reports saturation.
  */
 
+import { parseDurationMs } from "../resilience/duration.ts";
 import { emitTelemetry } from "../telemetry/sink.ts";
 import { AdmissionController, type AdmissionEvent } from "./AdmissionController.ts";
 import { describeAdmissionEvent } from "./admissionNotice.ts";
@@ -27,7 +28,11 @@ export interface GatewayAdmissionConfig {
    * Retries a worker attempt may spend waiting out gateway backpressure.
    */
   maxRetries: number;
-  /** Total monotonic time available to one interactive retry chain. */
+  /**
+   * Total monotonic time one interactive retry chain may wait out transient
+   * infrastructure. Long by design (default 12h): the operator can press Esc
+   * at any time, and the status line shows what we wait for and since when.
+   */
   maxElapsedMs: number;
   /** Emit one structured telemetry line per admission event. */
   telemetry: boolean;
@@ -40,7 +45,7 @@ export const DEFAULT_GATEWAY_CONFIG: GatewayAdmissionConfig = {
   maxWaitMs: 300_000,
   jitterMs: 250,
   maxRetries: 8,
-  maxElapsedMs: 300_000,
+  maxElapsedMs: 12 * 3_600_000,
   telemetry: true,
 };
 
@@ -56,6 +61,17 @@ function bool(value: string | undefined, fallback: boolean): boolean {
 }
 
 /**
+ * Read PI_GATEWAY_MAX_ELAPSED_MS: plain ms or a duration ("12h"). "0" is a
+ * real setting (no waiting); anything unparseable is null (use the default).
+ * Shared by every layer that defaults to this horizon.
+ */
+export function parseGatewayElapsedMs(value: string | undefined): number | null {
+  const raw = value?.trim();
+  if (!raw) return null;
+  return raw === "0" ? 0 : parseDurationMs(raw);
+}
+
+/**
  * Resolve gateway config from the environment.
  *
  * Env vars:
@@ -64,8 +80,10 @@ function bool(value: string | undefined, fallback: boolean): boolean {
  *   PI_GATEWAY_RESERVED_SLOTS    — int, slots kept for the interactive turn (default 1)
  *   PI_GATEWAY_MAX_WAIT_MS       — int, cap on one honoured wait (default: none)
  *   PI_GATEWAY_JITTER_MS         — int, release stagger window (default 250)
- *   PI_GATEWAY_MAX_RETRIES       — int, gateway-wait retries per worker attempt (default: 8)
- *   PI_GATEWAY_MAX_ELAPSED_MS    — int, elapsed budget per interactive retry chain (default: 300000)
+ *   PI_GATEWAY_MAX_RETRIES       — int, gateway-wait retries per worker attempt before the
+ *                                  mission scheduler takes over the wait (default: 8)
+ *   PI_GATEWAY_MAX_ELAPSED_MS    — ms or duration ("12h"), how long one interactive turn waits
+ *                                  out transient infrastructure (default: 12h)
  *   PI_GATEWAY_TELEMETRY         — "true"/"false" (default true)
  */
 export function resolveGatewayConfig(overrides?: Partial<GatewayAdmissionConfig>): GatewayAdmissionConfig {
@@ -78,7 +96,8 @@ export function resolveGatewayConfig(overrides?: Partial<GatewayAdmissionConfig>
   cfg.maxWaitMs = Math.max(0, int(env.PI_GATEWAY_MAX_WAIT_MS, cfg.maxWaitMs));
   cfg.jitterMs = Math.max(0, int(env.PI_GATEWAY_JITTER_MS, cfg.jitterMs));
   cfg.maxRetries = Math.max(0, int(env.PI_GATEWAY_MAX_RETRIES, cfg.maxRetries));
-  cfg.maxElapsedMs = Math.max(0, int(env.PI_GATEWAY_MAX_ELAPSED_MS, cfg.maxElapsedMs));
+  const elapsed = parseGatewayElapsedMs(env.PI_GATEWAY_MAX_ELAPSED_MS);
+  if (elapsed !== null) cfg.maxElapsedMs = elapsed;
   cfg.telemetry = bool(env.PI_GATEWAY_TELEMETRY, cfg.telemetry);
 
   if (overrides) Object.assign(cfg, overrides);
@@ -100,7 +119,7 @@ export function resolveGatewayConfig(overrides?: Partial<GatewayAdmissionConfig>
  * characters beneath it. Headless, the sink's default still writes to stderr.
  */
 export function emitAdmissionTelemetry(event: AdmissionEvent): void {
-  emitTelemetry(describeAdmissionEvent(event));
+  emitTelemetry(describeAdmissionEvent(event, Date.now));
 }
 
 let shared: AdmissionController | undefined;

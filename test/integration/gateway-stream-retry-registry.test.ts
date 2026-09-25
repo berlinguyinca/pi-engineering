@@ -159,17 +159,18 @@ test("registry: a 503 through ModelRuntime.streamSimple is waited out, not surfa
   });
 });
 
-test("registry: default interactive retry budget is finite and preserves the final failure", async () => {
+test("registry: the default interactive budget is not an attempt count — 12 refusals, then success", async () => {
+  // The old 8-attempt ceiling ended a turn during a routine model reload. The
+  // elapsed horizon (12h) is the limit now; see the unit tests for its end.
   const script = [...Array.from({ length: 12 }, () => ({ error: "503 no worker for model" })), {}];
   await withRegistry(script, async ({ registry, runtime, calls }) => {
     const holds: number[] = [];
     install(registry, holds);
     const result = await runtime.streamSimple(MODEL as never, { messages: [] } as never, { apiKey: "k" }).result();
 
-    assert.equal(calls(), 8);
-    assert.equal(holds.length, 7);
-    assert.equal(result.stopReason, "error");
-    assert.equal(result.errorMessage, "503 no worker for model");
+    assert.equal(calls(), 13);
+    assert.equal(holds.length, 12);
+    assert.equal(result.stopReason, "stop");
   });
 });
 

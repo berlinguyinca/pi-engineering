@@ -115,7 +115,9 @@ test("worker gateway path: flattened waits escalate and exhaustion is a transien
     text: '429: {"reason":"queue_timeout","retry_after_ms":30000,"scope":"agent","type":"inference_admission"}',
   });
   assert.ok(admission);
-  assert.equal(gatewayFailureMarker(admission), "gateway:queue_timeout");
+  // Exhausted in the worker, a retryable account-wide queue is handed to the
+  // mission scheduler as a capacity wait rather than failing the task.
+  assert.equal(gatewayFailureMarker(admission), "transient:rate_limit");
 });
 
 test("bare codes: held by the caller only, never an account-wide or admission refusal", () => {

@@ -13,6 +13,7 @@
  * with an active mutator exists, and concurrency policy permits.
  */
 
+import { formatWaitingFor } from "../gateway/admissionNotice.ts";
 import { CircuitBreaker } from "../resilience/circuitBreaker.ts";
 import type { InfraErrorCategory } from "../resilience/classify.ts";
 import { CATEGORY_TO_STATE } from "../resilience/classify.ts";
@@ -41,14 +42,18 @@ function infraCategoryFromWorkerMarker(marker?: string): InfraErrorCategory | nu
       return "RATE_LIMITED";
     case "compaction":
       return "CONTEXT_RECOVERABLE";
+    // An unknown model already had its one catalog-resync retry in the worker;
+    // the gateway is healthy, so the infra window would only hide a
+    // configuration error behind hours of waiting and a paused mission.
+    // A bare 5xx ("server_error": no envelope, reason or refusal code) that
+    // outlasted the worker's short retries is not evidence of an outage that
+    // clears either: a deterministic upstream failure looks exactly like it.
     case "permanent":
     case "model_unavailable":
-      // An unknown model already had its one catalog-resync retry in the
-      // worker; the gateway is healthy, so the infra window would only hide a
-      // configuration error behind a 90-minute wait and a paused mission.
+    case "server_error":
       return null;
     default:
-      // server_unavailable, server_error, network, timeout
+      // server_unavailable, network, timeout
       return "TRANSIENT_INFRASTRUCTURE";
   }
 }
@@ -151,11 +156,24 @@ export class MissionScheduler {
   private readonly resilience: GatewayResilienceConfig;
   /** Lightweight gateway recovery probe. */
   private readonly probe: RecoveryProbe;
+  /**
+   * True when a real recovery probe was injected (e.g. HttpRecoveryProbe from
+   * PI_GATEWAY_HEALTH_URL). Only a real probe can pace relaunches promptly and
+   * decide an auto-resume; the default pass-through probe always says healthy.
+   */
+  private readonly hasRealProbe: boolean;
   private readonly clockNow: () => number;
   private readonly sleepFn: (ms: number) => Promise<void>;
   private readonly rand: () => number;
   /** Per-task active retry window (created on the first infra failure). */
   private readonly windows = new Map<string, RetryWindowState>();
+  /**
+   * Per-task outage bookkeeping that SURVIVES a pause and resume (unlike the
+   * retry window): when the outage began, and how many relaunches it has
+   * cost. Cleared only when the task succeeds.
+   */
+  private readonly outageStartedAt = new Map<string, number>();
+  private readonly relaunches = new Map<string, number>();
   /** Per-task circuit breaker (prevents a request storm during recovery). */
   private readonly breakers = new Map<string, CircuitBreaker>();
 
@@ -169,6 +187,7 @@ export class MissionScheduler {
     // are injectable for deterministic fault-injection tests.
     this.resilience = opts.resilience ?? resolveGatewayResilienceConfig();
     this.probe = opts.probe ?? healthyProbe();
+    this.hasRealProbe = opts.probe !== undefined;
     this.clockNow = opts.now ?? realNow;
     this.sleepFn = opts.sleep ?? realSleep;
     this.rand = opts.rand ?? Math.random;
@@ -345,6 +364,12 @@ export class MissionScheduler {
           // pause on exhaustion) instead of immediately failing the task. Other
           // non-throwing failures keep the existing behaviour.
           const infraCat = infraCategoryFromWorkerMarker(outcome.error);
+          const ceiling = infraCat ? this.outageCeiling(task, outcome) : null;
+          if (ceiling) {
+            this.store.transitionTask(task.task_id, "FAILED", "system", { failure_reason: ceiling });
+            this.forgetOutage(task);
+            return;
+          }
           if (infraCat) {
             const res = this.resilienceGate(task, infraCat);
             if (res.paused) return;
@@ -366,6 +391,7 @@ export class MissionScheduler {
         // mission out of any WAITING state it was parked in.
         this.breakerSuccess(task);
         this.clearResilience(task);
+        this.forgetOutage(task);
         this.resumeToExecuting(task.mission_id);
         this.store.transitionTask(task.task_id, "SUCCEEDED");
         return;
@@ -439,8 +465,19 @@ export class MissionScheduler {
     // probe; the task is left resumable by the caller (RETRYING).
     this.parkMission(task.mission_id, CATEGORY_TO_STATE[cat] as MissionStatus);
     this.breakerFailure(task);
+    const failures = window.probe_count;
     this.windows.set(task.task_id, recordProbe(window, this.clockNow()));
-    const wait = cfg.probe_interval_ms + (cfg.jitter_ms > 0 ? Math.round(cfg.jitter_ms * this.rand()) : 0);
+    // With a real recovery probe, relaunch pacing is the probe's job (probeGate
+    // re-checks every probe interval and starts the next attempt as soon as the
+    // gateway answers). Without one, each relaunch IS the probe: back off
+    // exponentially from the probe interval to max_backoff_ms, so an outage of
+    // hours costs dozens of worker sessions, not thousands.
+    // Relaunches back off exponentially from the probe interval to
+    // max_backoff_ms either way; a real probe additionally keeps a relaunch
+    // from happening at all while it reports the gateway unhealthy (probeGate).
+    const base = cfg.probe_interval_ms;
+    const paced = Math.min(cfg.max_backoff_ms ?? base, base * 2 ** Math.min(failures, 30));
+    const wait = paced + (cfg.jitter_ms > 0 ? Math.round(cfg.jitter_ms * this.rand()) : 0);
     return { retry: true, waitMs: wait, paused: false };
   }
 
@@ -523,6 +560,78 @@ export class MissionScheduler {
   private clearResilience(task: OrchestrationTask): void {
     this.windows.delete(task.task_id);
     this.breakers.delete(task.task_id);
+  }
+
+  /**
+   * Record one more infra failure for the task and decide whether its outage
+   * has hit a ceiling: the total duration (across pause and resume) or the
+   * relaunch count. Returns the failure reason when it has, else null.
+   */
+  private outageCeiling(task: OrchestrationTask, outcome: { error?: string; summary?: string }): string | null {
+    const cfg = this.resilience;
+    const now = this.clockNow();
+    const started = this.outageStartedAt.get(task.task_id) ?? now;
+    this.outageStartedAt.set(task.task_id, started);
+    const relaunches = (this.relaunches.get(task.task_id) ?? 0) + 1;
+    this.relaunches.set(task.task_id, relaunches);
+    const last = `last: ${outcome.error ?? "transient"}${outcome.summary ? ` — ${outcome.summary}` : ""}`;
+    const maxOutage = cfg.max_outage_ms ?? Number.POSITIVE_INFINITY;
+    if (now - started >= maxOutage) {
+      return `transient infrastructure outage lasted ${formatWaitingFor(now - started)} (limit ${formatWaitingFor(maxOutage)}); ${last}`;
+    }
+    const maxRelaunches = cfg.max_relaunches ?? Number.POSITIVE_INFINITY;
+    if (relaunches > maxRelaunches) {
+      return `task relaunched ${maxRelaunches} times through a transient outage without success while the gateway looked healthy; ${last}`;
+    }
+    return null;
+  }
+
+  private forgetOutage(task: OrchestrationTask): void {
+    this.outageStartedAt.delete(task.task_id);
+    this.relaunches.delete(task.task_id);
+  }
+
+  /** The resolved mission resilience config. */
+  get resilienceConfig(): GatewayResilienceConfig {
+    return this.resilience;
+  }
+
+  /** The scheduler's clock (injectable), for callers pacing against it. */
+  now(): number {
+    return this.clockNow();
+  }
+
+  /**
+   * After a pause: watch the recovery probe until it reports healthy (true) or
+   * `deadlineMs` (scheduler clock) passes (false). Probes back off from the
+   * probe interval to max_backoff_ms, honouring a probe's retry_after_ms.
+   * Returns false immediately when auto-resume is off, has no horizon, or no
+   * real probe exists — the pass-through probe cannot tell a recovery apart.
+   */
+  async awaitRecovery(deadlineMs: number, signal?: AbortSignal, missionId?: string): Promise<boolean> {
+    const cfg = this.resilience;
+    if (!cfg.auto_resume_on_recovery || !this.hasRealProbe) return false;
+    // Stop as soon as nobody needs the answer: the caller aborted, or the
+    // mission left PAUSED_INFRASTRUCTURE (resumed or canceled elsewhere).
+    const stillPaused = () =>
+      missionId === undefined || this.store.getMission(missionId)?.status === "PAUSED_INFRASTRUCTURE";
+    for (let n = 0; this.clockNow() < deadlineMs; n++) {
+      if (signal?.aborted || !stillPaused()) return false;
+      const result = await this.probe.probe();
+      // Only a real answer resumes: a probe that could not even resolve its
+      // target (authoritative: false) says nothing about a recovery.
+      if (result.healthy && result.authoritative !== false) return true;
+      const backoff = Math.min(
+        cfg.max_backoff_ms ?? cfg.probe_interval_ms,
+        cfg.probe_interval_ms * 2 ** Math.min(n, 30),
+      );
+      const jitter = cfg.jitter_ms > 0 ? Math.round(cfg.jitter_ms * this.rand()) : 0;
+      await this.sleepFn(
+        Math.min(result.retry_after_ms ?? backoff + jitter, Math.max(0, deadlineMs - this.clockNow())),
+      );
+      if (this.clockNow() >= deadlineMs || signal?.aborted) break;
+    }
+    return false;
   }
 
   /** Lightweight gateway readiness check (for auto-resume decisions). */

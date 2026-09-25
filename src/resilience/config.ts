@@ -5,7 +5,12 @@
  * Environment variables override individual knobs so an operator can tune
  * behaviour per environment without recompiling:
  *
- *   PI_GATEWAY_RETRY_WINDOW     total wall-clock retry budget (ms or "90m")
+ *   PI_GATEWAY_RETRY_WINDOW     total wall-clock retry budget (ms or "12h"; default 12h)
+ *   PI_GATEWAY_MAX_BACKOFF      cap between worker relaunches (ms or "3m"; default 3m)
+ *   PI_GATEWAY_MAX_RELAUNCHES   worker relaunches per task through one outage (default 100)
+ *   PI_GATEWAY_MAX_OUTAGE       total ceiling across pause + resume, then FAIL (default 36h)
+ *   PI_GATEWAY_AUTO_RESUME_HORIZON  how long a paused mission watches the recovery
+ *                               probe to resume itself (ms or "24h"; default 24h)
  *   PI_GATEWAY_PROBE_INTERVAL   recovery probe cadence in ms (default 10_000)
  *   PI_GATEWAY_REQUEST_TIMEOUT  per-request timeout in ms (default 120_000)
  *   PI_GATEWAY_AUTO_RESUME      auto-resume from PAUSED_INFRASTRUCTURE ("1"/"true")
@@ -16,8 +21,36 @@
 import { parseDurationMs } from "./duration.ts";
 
 export interface GatewayResilienceConfig {
-  /** Wall-clock retry budget for one logical mission step, ms. Default 90 min. */
+  /**
+   * Wall-clock retry budget for one logical mission step, ms. Default 12h:
+   * a model reload, a GPU move or capacity_unavailable can last hours.
+   */
   retry_window_ms: number;
+  /**
+   * Cap on the capped-exponential wait between worker relaunches when no real
+   * recovery probe is configured (with one, the probe interval paces instead,
+   * so recovery is noticed promptly). Default 3 min.
+   */
+  max_backoff_ms?: number;
+  /**
+   * After the window is exhausted the mission PAUSES; with a real recovery
+   * probe it keeps probing this long and resumes itself on the first healthy
+   * answer. Default 24h. 0 disables auto-resume inside orchestrate().
+   */
+  auto_resume_horizon_ms?: number;
+  /**
+   * Worker relaunches one task may spend on a single outage. Relaunches only
+   * happen while the recovery probe says healthy, so reaching this means the
+   * gateway looks fine and the task still fails: FAIL with the reason rather
+   * than replaying a full session every few minutes for hours. Default 100.
+   */
+  max_relaunches?: number;
+  /**
+   * Total ceiling on one outage for a task, across pause and auto-resume.
+   * Past it the task FAILS with a clear reason. Default 36h (12h window +
+   * 24h auto-resume).
+   */
+  max_outage_ms?: number;
   /** Recovery-probe cadence, ms. Default 10s. */
   probe_interval_ms: number;
   /** Per-request timeout, ms. Default 120s. */
@@ -37,7 +70,11 @@ export interface GatewayResilienceConfig {
 }
 
 export const DEFAULT_GATEWAY_RESILIENCE: GatewayResilienceConfig = {
-  retry_window_ms: 90 * 60_000,
+  retry_window_ms: 12 * 3_600_000,
+  max_backoff_ms: 180_000,
+  auto_resume_horizon_ms: 24 * 3_600_000,
+  max_relaunches: 100,
+  max_outage_ms: 36 * 3_600_000,
   probe_interval_ms: 10_000,
   request_timeout_ms: 120_000,
   connect_timeout_ms: 10_000,
@@ -76,6 +113,10 @@ export function resolveGatewayResilienceConfig(
   const bool = (k: string): boolean | undefined => truthy(env[k]);
 
   const retryWindow = dur("PI_GATEWAY_RETRY_WINDOW");
+  const maxBackoff = dur("PI_GATEWAY_MAX_BACKOFF");
+  const autoResumeHorizon = dur("PI_GATEWAY_AUTO_RESUME_HORIZON");
+  const maxRelaunches = num("PI_GATEWAY_MAX_RELAUNCHES");
+  const maxOutage = dur("PI_GATEWAY_MAX_OUTAGE");
   const probe = num("PI_GATEWAY_PROBE_INTERVAL");
   const requestTimeout = num("PI_GATEWAY_REQUEST_TIMEOUT");
   const connectTimeout = num("PI_GATEWAY_CONNECT_TIMEOUT");
@@ -86,6 +127,10 @@ export function resolveGatewayResilienceConfig(
   const retryTransient = bool("PI_GATEWAY_RETRY_TRANSIENT");
 
   if (retryWindow != null) cfg.retry_window_ms = retryWindow;
+  if (maxBackoff != null) cfg.max_backoff_ms = maxBackoff;
+  if (autoResumeHorizon != null) cfg.auto_resume_horizon_ms = autoResumeHorizon;
+  if (maxRelaunches != null) cfg.max_relaunches = Math.floor(maxRelaunches);
+  if (maxOutage != null) cfg.max_outage_ms = maxOutage;
   if (probe != null) cfg.probe_interval_ms = probe;
   if (requestTimeout != null) cfg.request_timeout_ms = requestTimeout;
   if (connectTimeout != null) cfg.connect_timeout_ms = connectTimeout;

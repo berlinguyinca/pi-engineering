@@ -877,9 +877,9 @@ ${RECOVERY_PROMPT}`;
               modelId: callModel.id,
               provider: callModel.provider,
               source: info.signal.source,
+              accountWide: isAccountWideRefusal(info.signal),
             });
           },
-          maxAttempts: gatewayConfig.maxRetries + 1,
           maxElapsedMs: gatewayConfig.maxElapsedMs,
           // Fit every request body to the gateway's cap (advertised, else
           // 10 MiB) before it is sent; a 413 is permanent and ends the turn.

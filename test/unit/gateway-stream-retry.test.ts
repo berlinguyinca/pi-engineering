@@ -24,7 +24,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { pumpWithGatewayRetry } from "../../src/gateway/streamRetry.ts";
+import { DEFAULT_GATEWAY_MAX_ELAPSED_MS, pumpWithGatewayRetry } from "../../src/gateway/streamRetry.ts";
 
 interface Ev {
   type: string;
@@ -218,14 +218,21 @@ test("stream retry: one decision chooses the larger 503 header delay over the bo
   );
 });
 
-test("stream retry: non-finite direct budgets fail closed to finite defaults", async () => {
-  const s = scripted(Array.from({ length: 50 }, () => [failed(SATURATED)]));
+test("stream retry: non-finite direct budgets fail closed to the finite (12h) default horizon", async () => {
+  // A gateway that never recovers still ends the chain: the elapsed horizon.
+  let now = 0;
+  const s = scripted([[failed(SATURATED)]]);
   const outcome = await pumpWithGatewayRetry(s.open, sink(), {
-    hold: holds().hold,
+    hold: async (signal) => {
+      now += signal.retryAfterMs;
+    },
+    now: () => now,
     maxAttempts: Number.POSITIVE_INFINITY,
     maxElapsedMs: Number.POSITIVE_INFINITY,
   });
-  assert.ok(outcome.attempts < 50);
+  assert.ok(Number.isFinite(outcome.attempts));
+  assert.ok(now <= DEFAULT_GATEWAY_MAX_ELAPSED_MS, `waited ${now}ms`);
+  assert.ok(now > DEFAULT_GATEWAY_MAX_ELAPSED_MS - 120_000, "and used the horizon, not an attempt count");
 });
 
 test("stream retry: a zero elapsed budget permits no replay", async () => {
@@ -269,14 +276,19 @@ test("stream retry: an escalated wait is capped so it never becomes an outage", 
   assert.equal(h.seen.at(-1)?.ms, 60_000, "and should reach the cap");
 });
 
-test("stream retry: default attempt budget is finite and preserves the last server failure", async () => {
-  const s = scripted(Array.from({ length: 50 }, () => [failed(`${SATURATED} final-code`)]));
+test("stream retry: the default horizon ends a hopeless chain and preserves the last server failure", async () => {
+  let now = 0;
+  const s = scripted([[failed(`${SATURATED} final-code`)]]);
   const out = sink();
-  const h = holds();
-  const outcome = await pumpWithGatewayRetry(s.open, out, { hold: h.hold });
+  const outcome = await pumpWithGatewayRetry(s.open, out, {
+    hold: async (signal) => {
+      now += signal.retryAfterMs;
+    },
+    now: () => now,
+  });
 
   assert.ok(Number.isFinite(outcome.attempts));
-  assert.ok(outcome.attempts < 50);
+  assert.ok(outcome.attempts > 50, "attempt counts are not the limit");
   assert.equal(out.ended?.stopReason, "error");
   assert.match(out.ended?.errorMessage ?? "", /final-code/);
 });

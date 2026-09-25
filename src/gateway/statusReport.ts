@@ -51,6 +51,7 @@ function seconds(ms: number): string {
   if (ms <= 0) return "0s";
   if (ms < 1000) return `${ms}ms`;
   const s = ms / 1000;
+  if (s >= 3600 && s % 3600 === 0) return `${s / 3600}h`;
   return s >= 10 ? `${Math.round(s)}s` : `${Math.round(s * 10) / 10}s`;
 }
 
@@ -135,6 +136,8 @@ export function renderGatewayReport(input: GatewayReportInput): string[] {
   }
 
   const elapsed = config.maxElapsedMs === undefined ? "default" : seconds(config.maxElapsedMs);
-  lines.push(`Policy: server minimums preserved, retry cap ${limit(config.maxRetries)}, elapsed cap ${elapsed}`);
+  lines.push(
+    `Policy: server minimums preserved, worker retry cap ${limit(config.maxRetries)} (then the mission window), interactive wait horizon ${elapsed}`,
+  );
   return lines;
 }

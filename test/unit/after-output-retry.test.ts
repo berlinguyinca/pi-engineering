@@ -68,16 +68,28 @@ test("scope: only failures AFTER visible output belong here (pre-output waits ar
   const link =
     "Connection lost: the route serving this model ended before the response did; the response is incomplete. Please retry your request: it is routed afresh.";
   assert.equal(isRetryableTransportFailure(failed(link, [])), false, "no output: the pump owns it");
-  assert.equal(
-    isRetryableTransportFailure(failed(link, [{ type: "text", text: "  " }])),
-    false,
-    "whitespace is not output",
-  );
+  // The pump's rule (isAssistantOutputEvent): ANY text/thinking block start is
+  // forwarded, so once one exists the pump will not replay — even an empty or
+  // whitespace-only block. This layer must then own the failure, or a cut
+  // right after an empty block start is retried by nobody.
+  for (const block of [
+    { type: "text", text: "" },
+    { type: "text", text: "  " },
+    { type: "thinking", thinking: "" },
+  ]) {
+    assert.equal(isRetryableTransportFailure(failed(link, [block])), true, JSON.stringify(block));
+  }
   assert.equal(isRetryableTransportFailure(failed(link, [{ type: "thinking", thinking: "hmm" }])), true);
   assert.equal(
     isRetryableTransportFailure(failed(link, [{ type: "toolCall", id: "t", name: "read", arguments: {} }])),
     true,
   );
+});
+
+test("horizon: the same default and duration syntax as the pump's PI_GATEWAY_MAX_ELAPSED_MS", async () => {
+  const { DEFAULT_GATEWAY_MAX_ELAPSED_MS } = await import("../../src/gateway/streamRetry.ts");
+  assert.equal(DEFAULT_AFTER_OUTPUT_SCHEDULE.horizonMs, DEFAULT_GATEWAY_MAX_ELAPSED_MS);
+  assert.equal(resolveAfterOutputSchedule({ PI_GATEWAY_MAX_ELAPSED_MS: "2h" }).horizonMs, 2 * 3_600_000);
 });
 
 test("horizon: one shared setting (PI_GATEWAY_MAX_ELAPSED_MS) by default; the specific override wins", () => {

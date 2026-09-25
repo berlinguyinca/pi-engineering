@@ -14,6 +14,7 @@
 
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { contextReading } from "../context/usage.ts";
+import { formatWaitingFor } from "../gateway/admissionNotice.ts";
 import type { StatusBarConfig } from "./config.ts";
 import type { HarnessStatusState, TaskState, WaitState } from "./state.ts";
 
@@ -220,7 +221,11 @@ function formatWait(wait: WaitState, nowMs: number): string {
   const detail =
     wait.queued != null ? `queue ${wait.queued}${wait.queueLimit != null ? `/${wait.queueLimit}` : ""}` : wait.detail;
   const spinner = spinnerFrame(nowMs);
-  return detail ? `${spinner} ${head} · ${detail}` : `${spinner} ${head}`;
+  // How long the outage has lasted, once it is long enough to matter.
+  const lasted =
+    wait.sinceMs != null && nowMs - wait.sinceMs >= 60_000 ? `for ${formatWaitingFor(nowMs - wait.sinceMs)}` : "";
+  const tail = [detail, lasted].filter(Boolean).join(" · ");
+  return tail ? `${spinner} ${head} · ${tail}` : `${spinner} ${head}`;
 }
 
 let cachedHome: string | undefined;

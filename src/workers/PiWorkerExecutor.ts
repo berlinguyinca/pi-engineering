@@ -966,7 +966,7 @@ ${recovery.recoveryPrompt}`;
       // socket) arrives the same way — an assistant-message error, no throw —
       // and is retried under the same no-progress rule, as a network failure.
       session.dispose();
-      throw new TransientError(isTruncatedStream(assistantError) ? "server_error" : "network", assistantError!, 1);
+      throw new TransientError("network", assistantError!, 1);
     }
 
     return {
