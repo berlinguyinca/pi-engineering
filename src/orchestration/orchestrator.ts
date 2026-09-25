@@ -17,6 +17,8 @@
 
 import type { GitRepo } from "../git/GitRepo.ts";
 import type { EventStoreBackend } from "../platform/eventstore/backend.ts";
+import type { GatewayResilienceConfig } from "../resilience/config.ts";
+import type { RecoveryProbe } from "../resilience/probe.ts";
 import { type BrokerBackends, ExecutionBroker } from "./broker.ts";
 import { CompletionGate } from "./completionGate.ts";
 import { IntentRouter, workflowMutatesRepo } from "./intentRouter.ts";
@@ -85,6 +87,24 @@ export interface OrchestratorOptions {
   git?: GitRepo | null;
   /** Base ref (commit) worktrees are created at. Defaults to current HEAD. */
   baseRef?: string;
+  /**
+   * Mission-level gateway resilience config passed to the scheduler. Defaults to
+   * the environment-resolved config (time-based 90-min window, 10s probes).
+   * Inject to override for a deployment or to disable (retry_transient_errors).
+   */
+  resilience?: GatewayResilienceConfig;
+  /**
+   * Lightweight gateway recovery probe passed to the scheduler. Defaults to a
+   * pass-through healthy probe; inject an HttpRecoveryProbe for a real gateway
+   * to detect recovery without burning a full worker session.
+   */
+  probe?: RecoveryProbe;
+  /** Injectable clock passed to the scheduler (default Date.now). For tests. */
+  now?: () => number;
+  /** Injectable sleep passed to the scheduler (default real setTimeout). For tests. */
+  sleep?: (ms: number) => Promise<void>;
+  /** Injectable RNG passed to the scheduler (default Math.random). For tests. */
+  rand?: () => number;
 }
 
 export interface OrchestrateResult {
@@ -93,6 +113,13 @@ export interface OrchestrateResult {
   verdict: CompletionVerdict;
   completed: boolean;
   failureReason: string | null;
+  /**
+   * True when the mission paused on an infrastructure failure (its time-based
+   * retry window was exhausted) rather than failing. A paused mission preserves
+   * all progress and is resumable via `Orchestrator.resume()` when the gateway
+   * recovers — it is NOT a terminal failure.
+   */
+  paused?: boolean;
 }
 
 export class Orchestrator {
@@ -128,6 +155,14 @@ export class Orchestrator {
       store: this.store,
       broker: this.broker,
       limits: this.limits,
+      // Time-based gateway resilience: a worker transient-infra failure retries
+      // within the (env-resolved) window, parking the mission in a WAITING state,
+      // and pauses (not fails) on exhaustion. Operator may override config/probe.
+      resilience: opts.resilience,
+      probe: opts.probe,
+      now: opts.now,
+      sleep: opts.sleep,
+      rand: opts.rand,
       // Surface every task settlement as live progress so a running mission is
       // never silent: the operator sees each worker/gate settle instead of a
       // black screen for the whole worker budget (default 30 min).
@@ -316,6 +351,32 @@ export class Orchestrator {
     this.phase(this.store.getMission(mission.mission_id)!, "executing");
     await this.scheduler.runMission(mission.mission_id);
 
+    // Resilience: if a worker's transient-infrastructure retry window exhausted
+    // mid-execution, the mission is PAUSED (not FAILED) with all progress
+    // preserved. Do NOT proceed to integration/validation; return a paused
+    // verdict so the caller can resume it when the gateway recovers.
+    const pausedMission = this.store.getMission(mission.mission_id)!;
+    if (pausedMission.status === "PAUSED_INFRASTRUCTURE") {
+      this.progress = null;
+      this.report(
+        `[mission ${mission.mission_id}] PAUSED: infrastructure retry window exhausted (auto-resume on recovery)`,
+      );
+      return {
+        mission: pausedMission,
+        intent,
+        verdict: {
+          can_complete: false,
+          reasons: ["paused: infrastructure retry window exhausted"],
+          missing_gates: [],
+          unresolved_findings: 0,
+          running_tasks: 0,
+        },
+        completed: false,
+        failureReason: null,
+        paused: true,
+      };
+    }
+
     // Post-execution: integrate, validate + review if the mission mutated or
     // requires gates. If integration did not land the change, the mission must
     // not complete — otherwise it reports success over an unchanged repository.
@@ -473,6 +534,26 @@ export class Orchestrator {
       completed: false,
       failureReason: verdict.reasons.join("; "),
     };
+  }
+
+  /**
+   * Resume a PAUSED_INFRASTRUCTURE mission once the gateway is healthy.
+   *
+   * A paused mission is not a failure: all progress is preserved and the
+   * interrupted task is left resumable. This re-runs the paused task(s) when the
+   * recovery probe reports the gateway healthy (or unconditionally with
+   * `{ force: true }`), returning the updated mission. When the gateway is still
+   * down the mission is left paused (call again on the next probe).
+   */
+  async resume(missionId: string, opts?: { force?: boolean }): Promise<Mission> {
+    const mission = this.store.getMission(missionId);
+    if (!mission) throw new Error(`unknown mission ${missionId}`);
+    if (mission.status !== "PAUSED_INFRASTRUCTURE") return mission;
+    if (!opts?.force && !(await this.scheduler.gatewayHealthy())) return mission;
+    this.phase(mission, "executing");
+    this.report(`[mission ${missionId}] resuming after infrastructure recovery`);
+    await this.scheduler.resumePausedMission(missionId);
+    return this.store.getMission(missionId)!;
   }
 
   /**

@@ -92,9 +92,10 @@ export function normalizeFindings(raw: unknown): Array<Record<string, unknown>> 
 
 /** Convert a worker result into a bounded broker outcome. */
 function outcomeOf(result: Awaited<ReturnType<WorkerExecutor["run"]>>): ExecutionOutcome {
-  return {
+  const completed = result.result.status === "completed";
+  const outcome: ExecutionOutcome = {
     executionId: "worker",
-    exitStatus: result.result.status === "completed" ? "succeeded" : "failed",
+    exitStatus: completed ? "succeeded" : "failed",
     summary: result.result.summary,
     artifactRefs: result.result.evidence_refs ?? [],
     usage: {
@@ -103,6 +104,12 @@ function outcomeOf(result: Awaited<ReturnType<WorkerExecutor["run"]>>): Executio
       model: result.usage?.model ?? "unknown",
     },
   };
+  // Surface the worker's machine-readable failure marker (e.g.
+  // `transient:server_unavailable`) so the scheduler can classify a non-throwing
+  // failure and route a transient infrastructure failure into the time-based
+  // resilience window instead of immediately failing the task.
+  if (!completed) outcome.error = result.result.error ?? result.result.summary;
+  return outcome;
 }
 
 export function realBackends(opts: RealBackendsOptions) {

@@ -33,12 +33,26 @@ import { realBackends } from "../orchestration/realBackends.ts";
 import { tasksConflict, topoSort } from "../plan/taskDag.ts";
 import { JsonlEventStore } from "../platform/eventstore/jsonl.ts";
 import { resolveGatewayResilienceConfig } from "../resilience/config.ts";
+import { HttpRecoveryProbe } from "../resilience/probe.ts";
 import { Scheduler } from "../sched/Scheduler.ts";
 import { emitTelemetry } from "../telemetry/sink.ts";
 import { buildCoreTools } from "../tools/coreTools.ts";
 import { CommandVerifier, type VerificationProvider, type VerifyOutcome } from "../verify/Verifier.ts";
 import { PiWorkerExecutor } from "../workers/PiWorkerExecutor.ts";
 import type { WorkerExecutor, WorkerRequest } from "../workers/WorkerExecutor.ts";
+
+/**
+ * Build the mission gateway recovery probe. When the operator sets
+ * PI_GATEWAY_HEALTH_URL, a lightweight HTTP readiness probe is used so recovery
+ * from an outage is detected without starting a full worker session; otherwise
+ * undefined is returned and the scheduler falls back to its pass-through probe
+ * (recovery confirmed by the next real attempt).
+ */
+function buildGatewayRecoveryProbe(): HttpRecoveryProbe | undefined {
+  const url = process.env.PI_GATEWAY_HEALTH_URL;
+  if (!url) return undefined;
+  return new HttpRecoveryProbe({ baseUrl: url, timeoutMs: 5_000 });
+}
 
 export interface EngineerReport {
   work_item: WorkItem;
@@ -500,6 +514,14 @@ export class EngineeringRuntime {
       parentSessionId: null,
       git: rt.git,
       baseRef: rt.git ? await rt.git.headCommit() : "",
+      // Mission-level gateway resilience: a worker transient-infra failure retries
+      // within the (env-resolved) time-based window, parking the mission in a
+      // WAITING state, and pauses (not fails) on exhaustion. When an operator sets
+      // PI_GATEWAY_HEALTH_URL, a real HTTP recovery probe is used so recovery is
+      // detected without burning a full worker session; otherwise the scheduler's
+      // pass-through probe applies.
+      resilience: rt.resilience,
+      probe: buildGatewayRecoveryProbe(),
       onPhase: (mission, phase) => {
         const mapped: RuntimePhaseEvent["phase"] =
           phase === "complete" ? "settled" : phase === "classified" ? "scout" : "implement";

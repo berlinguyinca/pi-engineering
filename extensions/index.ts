@@ -1433,14 +1433,20 @@ ${RECOVERY_PROMPT}`;
         },
       });
       const m = result.mission;
+      const completion = result.paused
+        ? "PAUSED — infrastructure retry window exhausted (auto-resumes on recovery; not a failure)"
+        : result.completed
+          ? "PASSED"
+          : `BLOCKED — ${result.failureReason ?? ""}`;
       const lines = [
         `Mission ${m.mission_id} [${m.status}] workflow=${m.workflow_class} risk=${m.risk_profile}`,
         `Intent: ${result.intent.intent.join(", ")} (confidence ${result.intent.confidence.toFixed(2)})`,
         `Required gates: ${m.required_gates.join(", ") || "none"}`,
         `Tasks: ${rt.missionStore?.listTasks(m.mission_id).length ?? 0}`,
-        `Completion: ${result.completed ? "PASSED" : `BLOCKED — ${result.failureReason ?? ""}`}`,
+        `Completion: ${completion}`,
       ];
-      ctx.ui.notify(lines.join("\n"), result.completed ? "info" : "error");
+      // A paused mission is not a failure: notify as info, not error.
+      ctx.ui.notify(lines.join("\n"), result.completed || result.paused ? "info" : "error");
     },
   });
 

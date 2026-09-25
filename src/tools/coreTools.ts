@@ -311,14 +311,19 @@ export function buildCoreTools(
         },
       });
       const m = result.mission;
+      const statusLine = result.paused
+        ? "PAUSED: infrastructure retry window exhausted. Progress is preserved; the mission auto-resumes when the gateway recovers (it is not a failure)."
+        : result.completed
+          ? "Completed: all gates passed."
+          : `Not completed: ${result.failureReason ?? "gates unmet"}.`;
       const lines = [
         `Mission ${m.mission_id} [${m.status}] workflow=${m.workflow_class}`,
         `Intent: ${result.intent.intent.join(", ")} | required gates: ${m.required_gates.join(", ") || "none"}`,
-        result.completed ? `Completed: all gates passed.` : `Not completed: ${result.failureReason ?? "gates unmet"}.`,
+        statusLine,
       ];
       return {
         content: [{ type: "text", text: lines.join("\n") }],
-        details: { missionId: m.mission_id, status: m.status },
+        details: { missionId: m.mission_id, status: m.status, paused: result.paused ?? false },
       };
     },
   });
