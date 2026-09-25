@@ -18,6 +18,8 @@
  * without a network.
  */
 
+import { noteAdvertisedRequestLimit, noteRequestLimitHeader } from "../request/bodyBudget.ts";
+
 /** One model as the gateway describes it. */
 export interface GatewayModelEntry {
   id: string;
@@ -29,6 +31,8 @@ export interface GatewayModelEntry {
   state?: string;
   /** Concurrent requests this model can serve. Zero is why a 503 happens. */
   slots?: number;
+  /** Largest request body the gateway accepts for this model, when advertised. */
+  maxRequestBytes?: number;
 }
 
 function num(value: unknown): number | undefined {
@@ -67,12 +71,14 @@ export function parseGatewayModels(payload: unknown): GatewayModelEntry[] {
     const contextTotal = num(row.ctx_total);
     const state = str(row.x_state) ?? str(row.state);
     const slots = typeof row.slots === "number" && Number.isFinite(row.slots) ? row.slots : undefined;
+    const maxRequestBytes = num(row.max_request_bytes);
     out.push({
       id,
       contextWindow,
       ...(contextTotal !== undefined ? { contextTotal } : {}),
       ...(state ? { state } : {}),
       ...(slots !== undefined ? { slots } : {}),
+      ...(maxRequestBytes !== undefined ? { maxRequestBytes } : {}),
     });
   }
   return out.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
@@ -120,6 +126,14 @@ export async function fetchGatewayModels(opts: FetchCatalogOptions): Promise<Gat
     if (!res.ok) throw new CatalogFetchError(`gateway returned ${res.status} for ${base}/models`, res.status);
     const body: unknown = await res.json().catch(() => null);
     const models = parseGatewayModels(body);
+    // The request-body cap, however the gateway chose to advertise it: a
+    // response header, a listing-level field, or per model. Recorded for the
+    // live-path body guard (src/request/bodyBudget.ts).
+    noteRequestLimitHeader(base, res.headers);
+    noteAdvertisedRequestLimit(base, (body as { max_request_bytes?: unknown } | null)?.max_request_bytes);
+    for (const model of models) {
+      if (model.maxRequestBytes !== undefined) noteAdvertisedRequestLimit(base, model.maxRequestBytes, model.id);
+    }
     if (models.length === 0) {
       throw new CatalogFetchError(`gateway returned no usable models from ${base}/models`, res.status);
     }

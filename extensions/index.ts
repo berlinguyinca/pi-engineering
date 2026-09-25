@@ -51,6 +51,7 @@ import { type PanelLayout, type PanelLayoutPatch, PanelLayoutStore } from "../sr
 import { Narrator } from "../src/panel/narrator/Narrator.ts";
 import { createSummarize } from "../src/panel/narrator/summarize.ts";
 import { PanelRefreshLoop } from "../src/panel/refreshLoop.ts";
+import { resolveRequestBodyBudgetConfig } from "../src/request/bodyBudget.ts";
 import { RoadmapEngine } from "../src/roadmap/RoadmapEngine.ts";
 import { EngineeringRuntime } from "../src/runtime/EngineeringRuntime.ts";
 import { resolveStatusBarConfig } from "../src/status/config.ts";
@@ -856,6 +857,9 @@ ${RECOVERY_PROMPT}`;
           },
           maxAttempts: gatewayConfig.maxRetries + 1,
           maxElapsedMs: gatewayConfig.maxElapsedMs,
+          // Fit every request body to the gateway's cap (advertised, else
+          // 10 MiB) before it is sent; a 413 is permanent and ends the turn.
+          requestBodyBudget: resolveRequestBodyBudgetConfig(),
           signalOf: (options) => (options as { signal?: AbortSignal } | undefined)?.signal,
           errorMessage: (m, error) => ({
             role: "assistant",
