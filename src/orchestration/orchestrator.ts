@@ -99,6 +99,12 @@ export interface OrchestratorOptions {
    * to detect recovery without burning a full worker session.
    */
   probe?: RecoveryProbe;
+  /** Injectable clock passed to the scheduler (default Date.now). For tests. */
+  now?: () => number;
+  /** Injectable sleep passed to the scheduler (default real setTimeout). For tests. */
+  sleep?: (ms: number) => Promise<void>;
+  /** Injectable RNG passed to the scheduler (default Math.random). For tests. */
+  rand?: () => number;
 }
 
 export interface OrchestrateResult {
@@ -154,6 +160,9 @@ export class Orchestrator {
       // and pauses (not fails) on exhaustion. Operator may override config/probe.
       resilience: opts.resilience,
       probe: opts.probe,
+      now: opts.now,
+      sleep: opts.sleep,
+      rand: opts.rand,
       // Surface every task settlement as live progress so a running mission is
       // never silent: the operator sees each worker/gate settle instead of a
       // black screen for the whole worker budget (default 30 min).
