@@ -29,14 +29,27 @@
  * jitter, bounded by a long elapsed horizon (12h by default). The schedule is
  * a small interface so a shared long-wait policy can replace it.
  *
- * Single owner per failure: the pump handles failures before output; Pi's own
- * retry (when the user enabled it) runs first — this boundary is only reached
- * once Pi has given up — so the two never retry the same attempt at once.
+ * Ownership — one owner per failure, no nesting:
+ * - failures BEFORE any visible output belong to the gateway pump
+ *   (streamRetry.ts), which waits them out inside the provider call (with the
+ *   long-wait horizon of feat/long-wait-transient-retry); this controller
+ *   ignores them;
+ * - failures AFTER visible output belong here;
+ * - Pi's own retry (when the user enabled it) runs first — this boundary is
+ *   only reached once Pi has given up — so the two never retry at once.
+ *
+ * The owed wait is keyed by (provider, model) and only the continued request
+ * for that model takes it — never a summarization call or another model's
+ * call. A model whose calls never pass the wrapper cannot be paced, so it is
+ * not retried at all (with a notice) rather than retried in a tight loop.
  */
 
-import { isContextOverflow } from "@earendil-works/pi-ai/utils/overflow";
-import { isRetryableAssistantError } from "@earendil-works/pi-ai/utils/retry";
+// The compat entry, not the utils/* subpaths: Pi's extension loader aliases
+// "@earendil-works/pi-ai/compat" to the host's pi-ai, while a subpath would
+// bind whatever copy happens to be installed next to this package.
+import { isContextOverflow, isRetryableAssistantError } from "@earendil-works/pi-ai/compat";
 import { isBodyTooLarge } from "../request/bodyBudget.ts";
+import { isSummarizationRequest } from "../request/thinkingPolicy.ts";
 import { emitTelemetry } from "../telemetry/sink.ts";
 import { isGatewayLinkCut } from "./signals.ts";
 
@@ -82,13 +95,20 @@ function positive(value: string | undefined): number | undefined {
   return value !== undefined && value.trim() !== "" && Number.isFinite(n) && n >= 0 ? n : undefined;
 }
 
-/** Defaults, overridable with PI_AFTER_OUTPUT_RETRY_{HORIZON,CAP,BASE}_MS. */
+/**
+ * Defaults, overridable with PI_AFTER_OUTPUT_RETRY_{HORIZON,CAP,BASE}_MS. The
+ * horizon defaults to the one shared retry window, PI_GATEWAY_MAX_ELAPSED_MS
+ * (the pump's elapsed budget), so every layer gives up at the same time.
+ */
 export function resolveAfterOutputSchedule(
   env: Record<string, string | undefined> = process.env,
 ): LongWaitScheduleOptions {
   return {
     ...DEFAULT_AFTER_OUTPUT_SCHEDULE,
-    horizonMs: positive(env.PI_AFTER_OUTPUT_RETRY_HORIZON_MS) ?? DEFAULT_AFTER_OUTPUT_SCHEDULE.horizonMs,
+    horizonMs:
+      positive(env.PI_AFTER_OUTPUT_RETRY_HORIZON_MS) ??
+      positive(env.PI_GATEWAY_MAX_ELAPSED_MS) ??
+      DEFAULT_AFTER_OUTPUT_SCHEDULE.horizonMs,
     capMs: positive(env.PI_AFTER_OUTPUT_RETRY_CAP_MS) ?? DEFAULT_AFTER_OUTPUT_SCHEDULE.capMs,
     baseMs: positive(env.PI_AFTER_OUTPUT_RETRY_BASE_MS) ?? DEFAULT_AFTER_OUTPUT_SCHEDULE.baseMs,
   };
@@ -111,10 +131,30 @@ interface AssistantLike {
  */
 export function isRetryableTransportFailure(message: AssistantLike | undefined, contextWindow = 0): boolean {
   if (!message || message.role !== "assistant" || message.stopReason !== "error") return false;
+  // Before visible output the pump owns the failure (and waits it out itself).
+  if (!hasVisibleOutput(message)) return false;
   const text = message.errorMessage ?? "";
   if (isBodyTooLarge(text)) return false;
   if (isContextOverflow(message as never, contextWindow)) return false;
   return isGatewayLinkCut(text) || isRetryableAssistantError(message as never);
+}
+
+/** Did the failed turn put anything on screen (text, thinking, a tool call)? */
+export function hasVisibleOutput(message: AssistantLike): boolean {
+  if (!Array.isArray(message.content)) return false;
+  return (message.content as Array<{ type?: string; text?: string; thinking?: string; name?: string }>).some(
+    (block) =>
+      (block.type === "text" && (block.text ?? "").trim() !== "") ||
+      (block.type === "thinking" && (block.thinking ?? "").trim() !== "") ||
+      block.type === "toolCall",
+  );
+}
+
+/** A short name for the failure, for the status line. */
+export function failureKind(text: string): string {
+  if (isGatewayLinkCut(text)) return "link cut";
+  if (/terminated|socket hang up|other side closed/i.test(text)) return "connection dropped";
+  return "transport error";
 }
 
 // ─── The retry controller ──────────────────────────────────────────────────
@@ -128,6 +168,15 @@ interface BeforeSettleEvent {
   outcome: "completed" | "aborted" | "error";
   entries: unknown[];
   context: { contextEntries: ProjectedEntry[] };
+}
+
+interface ModelKey {
+  provider?: string;
+  id?: string;
+}
+
+function keyOf(model: ModelKey | undefined): string {
+  return `${model?.provider ?? "?"}/${model?.id ?? "?"}`;
 }
 
 interface SettleContext {
@@ -172,8 +221,10 @@ export class AfterOutputRetry {
   private readonly sleep: (ms: number, signal: AbortSignal | undefined) => Promise<void>;
   private attempt = 0;
   private firstFailureAt: number | undefined;
-  /** The wait owed before the continued request is sent. */
-  private pending: { delayMs: number; attempt: number } | undefined;
+  /** The wait owed before the continued request for a model is sent. */
+  private readonly pending = new Map<string, { delayMs: number; attempt: number; kind: string }>();
+  /** Models whose calls pass the gateway wrapper (so a wait can be taken). */
+  private readonly paced = new Set<string>();
   private ui: SettleContext["ui"];
 
   constructor(options: AfterOutputRetryOptions = {}) {
@@ -199,7 +250,17 @@ export class AfterOutputRetry {
   private reset(): void {
     this.attempt = 0;
     this.firstFailureAt = undefined;
-    this.pending = undefined;
+    this.pending.clear();
+  }
+
+  /** Record that `model`'s calls pass the wrapper. Called by beforeSend. */
+  observe(model: ModelKey): void {
+    this.paced.add(keyOf(model));
+  }
+
+  /** Owe a wait before `model`'s next (non-summary) call. */
+  owe(model: ModelKey, delayMs: number, attempt: number, kind: string): void {
+    this.pending.set(keyOf(model), { delayMs, attempt, kind });
   }
 
   private onBeforeSettle(event: BeforeSettleEvent, ctx: SettleContext) {
@@ -210,6 +271,19 @@ export class AfterOutputRetry {
     }
     const failed = this.lastFailed(event.context.contextEntries);
     if (!failed || !isRetryableTransportFailure(failed.message, ctx.model?.contextWindow ?? 0)) {
+      this.reset();
+      return undefined;
+    }
+    const key = keyOf(ctx.model);
+    if (!this.paced.has(key) || this.pending.has(key)) {
+      // Either this model's calls never pass the gateway wrapper, or the last
+      // owed wait was never taken (the continued request bypassed it). Retrying
+      // now would be unpaced — a tight loop for hours — so stop instead.
+      emitTelemetry({
+        level: "warning",
+        key: "after-output-retry:unpaced",
+        text: `Not retrying the cut-off answer: requests to ${key} do not pass the pi-engineering gateway wrapper, so no backoff can be applied (${failed.message.errorMessage ?? "unknown error"}).`,
+      });
       this.reset();
       return undefined;
     }
@@ -226,12 +300,13 @@ export class AfterOutputRetry {
     }
     this.attempt++;
     const delayMs = this.schedule.delayMs(this.attempt);
-    this.pending = { delayMs, attempt: this.attempt };
+    const kind = failureKind(failed.message.errorMessage ?? "");
+    this.owe(ctx.model ?? {}, delayMs, this.attempt, kind);
     this.ui = ctx.ui;
     emitTelemetry({
       level: "info",
       key: "after-output-retry:attempt",
-      text: `Connection lost mid-answer; retrying in ${formatWait(delayMs)} (attempt ${this.attempt}, for up to ${formatHorizon(this.schedule.horizonMs)}; Esc stops).`,
+      text: `Answer cut off mid-stream (${kind}); retrying in ${formatWait(delayMs)} (attempt ${this.attempt}, for up to ${formatHorizon(this.schedule.horizonMs)}; Esc stops).`,
     });
     // Omit the failed partial answer from the model's context (Pi's own retry
     // does the same) and ask for one more provider request. Boundary results
@@ -257,15 +332,23 @@ export class AfterOutputRetry {
    * by a pending retry against the request's own abort signal. Resolves
    * "aborted" when Esc ends the wait.
    */
-  async beforeSend(_model: unknown, signal: AbortSignal | undefined): Promise<"go" | "aborted"> {
-    const pending = this.pending;
+  async beforeSend(
+    model: ModelKey,
+    signal: AbortSignal | undefined,
+    context?: { systemPrompt?: string; messages: unknown[] },
+  ): Promise<"go" | "aborted"> {
+    this.observe(model);
+    // A summary (compaction) or another model's call must not take the wait.
+    if (context && isSummarizationRequest(context)) return "go";
+    const key = keyOf(model);
+    const pending = this.pending.get(key);
     if (!pending) return "go";
-    this.pending = undefined;
+    this.pending.delete(key);
     const until = this.now() + pending.delayMs;
     const status = () =>
       this.ui?.setStatus?.(
         STATUS_KEY,
-        `Connection lost — retrying in ${formatWait(Math.max(0, until - this.now()))} (attempt ${pending.attempt}; Esc to stop)`,
+        `Answer cut off (${pending.kind}) — retrying in ${formatWait(Math.max(0, until - this.now()))} (attempt ${pending.attempt}; Esc to stop)`,
       );
     const tick = setInterval(() => {
       try {

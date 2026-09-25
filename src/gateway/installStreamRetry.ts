@@ -105,7 +105,7 @@ export function captureGatewayAttemptResponse<
   };
 }
 
-export interface InstallDeps<M, O> {
+export interface InstallDeps<M, O, C = unknown> {
   /** Build the stream handed back to Pi. `createAssistantMessageEventStream`. */
   createStream(): RetrySink<RetryableEvent, RetryableResult> & AttemptStream<RetryableEvent, RetryableResult>;
   /**
@@ -141,7 +141,7 @@ export interface InstallDeps<M, O> {
    * the after-output retry takes the wait it owes here, so Esc ends it at once.
    * "aborted" ends the call as aborted without sending anything.
    */
-  beforeSend?: (model: M, signal: AbortSignal | undefined) => Promise<"go" | "aborted">;
+  beforeSend?: (model: M, signal: AbortSignal | undefined, context: C) => Promise<"go" | "aborted">;
   maxAttempts?: number;
   maxElapsedMs?: number;
   now?: () => number;
@@ -196,7 +196,7 @@ export function isGatewayStreamRetryLive<M, C, O>(host: ProviderHost<M, C, O>, p
 export function installGatewayStreamRetry<M, C, O>(
   host: ProviderHost<M, C, O>,
   target: { provider: string; api: string },
-  deps: InstallDeps<M, O>,
+  deps: InstallDeps<M, O, C>,
 ): InstallResult {
   const key = `${target.provider}:${target.api}`;
   if (installed.has(key)) return "already-installed";
@@ -254,7 +254,7 @@ export function installGatewayStreamRetry<M, C, O>(
       | ReturnType<typeof captureGatewayAttemptResponse<ProviderResponseLike, unknown, ProviderResponseOptions>>
       | undefined;
     void (async () => {
-      if (deps.beforeSend && (await deps.beforeSend(model, signal)) === "aborted") {
+      if (deps.beforeSend && (await deps.beforeSend(model, signal, context)) === "aborted") {
         const aborted = { ...deps.errorMessage(model, new Error("Request aborted")), stopReason: "aborted" };
         out.push({ type: "error", reason: "aborted", error: aborted } as RetryableEvent);
         out.end(aborted);

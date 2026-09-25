@@ -63,3 +63,48 @@ test("classification: transport drops and link cuts are retryable; request probl
   );
   assert.equal(isRetryableTransportFailure({ ...failed("terminated"), stopReason: "stop" }), false);
 });
+
+test("scope: only failures AFTER visible output belong here (pre-output waits are the pump's)", () => {
+  const link =
+    "Connection lost: the route serving this model ended before the response did; the response is incomplete. Please retry your request: it is routed afresh.";
+  assert.equal(isRetryableTransportFailure(failed(link, [])), false, "no output: the pump owns it");
+  assert.equal(
+    isRetryableTransportFailure(failed(link, [{ type: "text", text: "  " }])),
+    false,
+    "whitespace is not output",
+  );
+  assert.equal(isRetryableTransportFailure(failed(link, [{ type: "thinking", thinking: "hmm" }])), true);
+  assert.equal(
+    isRetryableTransportFailure(failed(link, [{ type: "toolCall", id: "t", name: "read", arguments: {} }])),
+    true,
+  );
+});
+
+test("horizon: one shared setting (PI_GATEWAY_MAX_ELAPSED_MS) by default; the specific override wins", () => {
+  assert.equal(resolveAfterOutputSchedule({ PI_GATEWAY_MAX_ELAPSED_MS: "3600000" }).horizonMs, 3_600_000);
+  assert.equal(
+    resolveAfterOutputSchedule({ PI_GATEWAY_MAX_ELAPSED_MS: "3600000", PI_AFTER_OUTPUT_RETRY_HORIZON_MS: "60000" })
+      .horizonMs,
+    60_000,
+  );
+});
+
+test("the owed wait is keyed by (provider, model) and never taken by a summarization call", async () => {
+  const { AfterOutputRetry } = await import("../../src/gateway/afterOutputRetry.ts");
+  const slept: number[] = [];
+  const retry = new AfterOutputRetry({
+    schedule: { baseMs: 1_000, capMs: 1_000, jitter: 0, horizonMs: 60_000 },
+    sleep: async (ms) => {
+      slept.push(ms);
+    },
+  });
+  const model = { provider: "gw", id: "m" };
+  retry.observe(model);
+  retry.owe(model, 1_000, 1, "link cut");
+  const summary = { systemPrompt: "You are a context summarization assistant. Your task…", messages: [] };
+  assert.equal(await retry.beforeSend({ provider: "gw", id: "other" }, undefined, { messages: [] }), "go");
+  assert.equal(await retry.beforeSend(model, undefined, summary), "go");
+  assert.deepEqual(slept, [], "neither consumed the wait");
+  assert.equal(await retry.beforeSend(model, undefined, { messages: [] }), "go");
+  assert.deepEqual(slept, [1_000], "the continued request took it");
+});

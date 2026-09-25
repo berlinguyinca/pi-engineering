@@ -78,7 +78,7 @@ after(() => {
 const FAST = { baseMs: 5, capMs: 20, jitter: 0, horizonMs: 60_000 };
 
 async function startSession(
-  opts: { retrySettings?: unknown; schedule?: Partial<typeof FAST> } = {},
+  opts: { retrySettings?: unknown; schedule?: Partial<typeof FAST>; unwrapped?: boolean } = {},
 ): Promise<{ session: Awaited<ReturnType<typeof createAgentSession>>["session"]; cleanup: () => void }> {
   gw.script.length = 0;
   gw.bodies.length = 0;
@@ -116,7 +116,7 @@ async function startSession(
   const factory = (pi: { on(event: string, handler: (event: unknown, ctx: never) => unknown): void }) => {
     retry.register(pi as never);
     pi.on("session_start", (_e, ctx: { modelRegistry: unknown; model?: { provider: string; api: string } }) => {
-      if (!ctx.model) return;
+      if (!ctx.model || opts.unwrapped) return;
       installGatewayStreamRetry(
         ctx.modelRegistry as never,
         { provider: ctx.model.provider, api: ctx.model.api },
@@ -130,7 +130,7 @@ async function startSession(
             errorMessage: String(error),
             model: (m as { id: string }).id,
           }),
-          beforeSend: (model, signal) => retry.beforeSend(model, signal),
+          beforeSend: (model, signal, context) => retry.beforeSend(model as never, signal, context as never),
           signalOf: (o) => (o as { signal?: AbortSignal } | undefined)?.signal,
         },
       );
@@ -255,6 +255,42 @@ test("Esc during the wait ends the turn promptly and sends nothing more", async 
     await new Promise((r) => setTimeout(r, 100));
     assert.equal(gw.bodies.length, 1, "no request after Esc");
   } finally {
+    s.cleanup();
+  }
+});
+
+test("a provider without the gateway wrapper is not retried (no wait could be taken): notice, no tight loop", async () => {
+  const notices: string[] = [];
+  const uninstall = setTelemetrySink((n) => notices.push(n.text));
+  const s = await startSession({ unwrapped: true });
+  try {
+    gw.script.push({ kind: "cut", partial: "Hello", error: LINK_CUT }, { kind: "ok", text: "never" });
+    await s.session.prompt("go");
+    await new Promise((r) => setTimeout(r, 100));
+    assert.equal(gw.bodies.length, 1, "no unpaced retry");
+    assert.ok(
+      notices.some((t) => /gateway wrapper/i.test(t)),
+      JSON.stringify(notices),
+    );
+  } finally {
+    uninstall();
+    s.cleanup();
+  }
+});
+
+test("the first notice names the failure kind", async () => {
+  const notices: string[] = [];
+  const uninstall = setTelemetrySink((n) => notices.push(n.text));
+  const s = await startSession();
+  try {
+    gw.script.push({ kind: "cut", partial: "Hello", error: LINK_CUT }, { kind: "ok", text: "ok" });
+    await s.session.prompt("go");
+    assert.ok(
+      notices.some((t) => /link cut/i.test(t) && /retrying in/i.test(t)),
+      JSON.stringify(notices),
+    );
+  } finally {
+    uninstall();
     s.cleanup();
   }
 });

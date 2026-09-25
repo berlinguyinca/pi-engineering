@@ -887,7 +887,7 @@ ${RECOVERY_PROMPT}`;
           // A stream cut after partial output is replayed by afterOutputRetry
           // (agent_before_settle); the wait it owes is taken here, against the
           // request's own abort signal, so Esc ends it at once.
-          beforeSend: (_model, signal) => afterOutputRetry.beforeSend(_model, signal),
+          beforeSend: (model, signal, context) => afterOutputRetry.beforeSend(model as never, signal, context as never),
           // Thinking off for Pi's summaries (compaction) and near-full turns on
           // the metabolomics gateway, whose models think by default and would
           // otherwise spend the whole output budget on hidden reasoning.
