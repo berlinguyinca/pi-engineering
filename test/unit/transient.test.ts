@@ -27,6 +27,39 @@ test("classify: 429 caller_concurrency admission is a retryable rate_limit", () 
   assert.equal(cls.retryable, true);
 });
 
+for (const text of [
+  "routing_snapshot_expired",
+  '404: {"code":"model_not_found","message":"model_not_found"}',
+  "invalid model name: ",
+  '503 {"code":"capacity_unavailable","action":"retry_alternate"}',
+]) {
+  test(`classify: gateway routing failure is retryable (${text.slice(0, 40)}…)`, () => {
+    const cls = classifyError(new Error(text));
+    assert.equal(cls.retryable, true);
+    assert.equal(cls.category, "server_unavailable");
+  });
+}
+
+test("classify: the routing rule never overrides the admission contract's fail-closed decision", () => {
+  // A well-formed backpressure envelope that forbids replay, and a malformed
+  // one: the contract says terminal for both. Their rendered text still
+  // carries routing tokens, which must not flip them to retryable.
+  for (const text of [
+    '503: {"type":"inferweave_backpressure","reason":"capacity_unavailable","action":"retry_alternate","replay_safe":false,"retry_after_ms":1000}',
+    '{"type":"inferweave_backpressure","reason":"capacity_unavailable","retry_after_ms":"soon"',
+  ]) {
+    const cls = classifyError(new Error(text));
+    assert.equal(cls.retryable, false, text);
+  }
+});
+
+test("classify: a link cut stays with the network branch, not the routing rule", () => {
+  const cls = classifyError(
+    new Error("The route serving this model ended before the response did; the response is incomplete."),
+  );
+  assert.equal(cls.category, "network");
+});
+
 test("isTruncatedStream: matches pi-ai's truncation wording only", () => {
   assert.equal(isTruncatedStream("Stream ended without finish_reason"), true);
   assert.equal(isTruncatedStream("upstream returned no finish_reason"), true);

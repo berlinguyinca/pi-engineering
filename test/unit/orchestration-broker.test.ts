@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import { GitRepo } from "../../src/git/GitRepo.ts";
@@ -353,6 +354,216 @@ describe("ExecutionBroker (spec 03)", () => {
       assert.equal(broker.allocatedWorktrees?.size ?? 0, 0);
     } finally {
       await fx.cleanup();
+    }
+  });
+
+  it("recovers committed work from a failed execution (stranded-work fix; MSN-1xh24o)", async () => {
+    const fx = await makeFixtureRepo();
+    try {
+      const git = await GitRepo.open(fx.root);
+      const store = MissionStore.open(JsonlEventStore.inMemory());
+      const m = store.createMission({
+        title: "x",
+        goal: "x",
+        user_request: "x",
+        repository: ".",
+        base_ref: await git!.headCommit(),
+        risk_profile: "medium",
+        workflow_class: "engineering_review",
+      });
+      const seenHandoffs: Array<{ branch: string; summary: string }> = [];
+      const broker = new ExecutionBroker({
+        store,
+        git,
+        baseRef: await git!.headCommit(),
+        backends: {
+          agent: {
+            // First run: commit real work, then fail (wall-clock timeout that
+            // fires AFTER the worker's commit). Second run: fail with no work.
+            runAgent: async ({ worktree, objective }) => {
+              if (objective === "commit-then-fail" && worktree) {
+                await mkdir(join(worktree, "src"), { recursive: true });
+                await writeFile(join(worktree, "src", "work.txt"), "committed before the timeout\n");
+              }
+              // The real agent backend's wall-clock marker (PiWorkerExecutor).
+              return {
+                executionId: "e",
+                exitStatus: "failed",
+                summary: "Worker timed out.",
+                error: "timeout",
+                artifactRefs: [],
+                usage: {},
+              };
+            },
+          },
+          integration: {
+            runIntegration: async ({ handoffs }) => {
+              seenHandoffs.push(...handoffs.map((h) => ({ branch: h.worktree.branch, summary: h.summary })));
+              return { executionId: "i", exitStatus: "succeeded", summary: "merged", artifactRefs: [], usage: {} };
+            },
+          },
+        },
+      });
+
+      const t1 = store.createTask({
+        mission_id: m.mission_id,
+        kind: "agent",
+        role: "implementer",
+        objective: "commit-then-fail",
+        mutates_repo: true,
+        isolation: "worktree",
+        write_domains: ["src/**"],
+      });
+      store.transitionTask(t1.task_id, "READY");
+      await (
+        await broker.execute({
+          taskId: t1.task_id,
+          missionId: m.mission_id,
+          kind: "agent",
+          role: "implementer",
+          objective: "commit-then-fail",
+          mutatesRepo: true,
+          isolation: "worktree",
+        })
+      ).result();
+
+      const t2 = store.createTask({
+        mission_id: m.mission_id,
+        kind: "agent",
+        role: "implementer",
+        objective: "fail-empty",
+        mutates_repo: true,
+        isolation: "worktree",
+        write_domains: ["src/**"],
+      });
+      store.transitionTask(t2.task_id, "READY");
+      await (
+        await broker.execute({
+          taskId: t2.task_id,
+          missionId: m.mission_id,
+          kind: "agent",
+          role: "implementer",
+          objective: "fail-empty",
+          mutatesRepo: true,
+          isolation: "worktree",
+        })
+      ).result();
+
+      const it = store.createTask({
+        mission_id: m.mission_id,
+        kind: "integration",
+        role: "integrator",
+        objective: "merge",
+      });
+      await (
+        await broker.execute({
+          taskId: it.task_id,
+          missionId: m.mission_id,
+          kind: "integration",
+          role: "integrator",
+          objective: "merge",
+        })
+      ).result();
+
+      // Exactly ONE handoff: the failed branch that committed work (recovered).
+      // The empty failed branch must stay excluded.
+      assert.equal(seenHandoffs.length, 1, `expected 1 recovered handoff, got ${JSON.stringify(seenHandoffs)}`);
+      assert.ok(seenHandoffs[0]!.branch.startsWith("pi-eng-orch-"));
+      assert.match(seenHandoffs[0]!.summary, /recovered/);
+    } finally {
+      await fx.cleanup();
+    }
+  });
+
+  it("keeps committed work from a gateway/transport timeout preserve-only (only the wall-clock marker recovers)", async () => {
+    // `gateway:queue_timeout` and `transient:timeout` both contain "timeout" and
+    // their summaries say "timed out", but neither is the worker's wall-clock
+    // budget: the run was cut short by infrastructure, so its partial commits
+    // must not be handed to integration.
+    for (const marker of ["gateway:queue_timeout", "transient:timeout"]) {
+      const fx = await makeFixtureRepo();
+      try {
+        const git = await GitRepo.open(fx.root);
+        const store = MissionStore.open(JsonlEventStore.inMemory());
+        const m = store.createMission({
+          title: "x",
+          goal: "x",
+          user_request: "x",
+          repository: ".",
+          base_ref: await git!.headCommit(),
+          risk_profile: "medium",
+          workflow_class: "engineering_review",
+        });
+        const seenHandoffs: string[] = [];
+        const broker = new ExecutionBroker({
+          store,
+          git,
+          baseRef: await git!.headCommit(),
+          backends: {
+            agent: {
+              runAgent: async ({ worktree }) => {
+                if (worktree) {
+                  await mkdir(join(worktree, "src"), { recursive: true });
+                  await writeFile(join(worktree, "src", "partial.txt"), "partial\n");
+                }
+                return {
+                  executionId: "e",
+                  exitStatus: "failed",
+                  summary: "Worker failed after 5 attempt(s): request timed out",
+                  error: marker,
+                  artifactRefs: [],
+                  usage: {},
+                };
+              },
+            },
+            integration: {
+              runIntegration: async ({ handoffs }) => {
+                seenHandoffs.push(...handoffs.map((h) => h.worktree.branch));
+                return { executionId: "i", exitStatus: "succeeded", summary: "merged", artifactRefs: [], usage: {} };
+              },
+            },
+          },
+        });
+        const t = store.createTask({
+          mission_id: m.mission_id,
+          kind: "agent",
+          role: "implementer",
+          objective: "o",
+          mutates_repo: true,
+          isolation: "worktree",
+          write_domains: ["src/**"],
+        });
+        store.transitionTask(t.task_id, "READY");
+        await (
+          await broker.execute({
+            taskId: t.task_id,
+            missionId: m.mission_id,
+            kind: "agent",
+            role: "implementer",
+            objective: "o",
+            mutatesRepo: true,
+            isolation: "worktree",
+          })
+        ).result();
+        const it = store.createTask({
+          mission_id: m.mission_id,
+          kind: "integration",
+          role: "integrator",
+          objective: "merge",
+        });
+        await (
+          await broker.execute({
+            taskId: it.task_id,
+            missionId: m.mission_id,
+            kind: "integration",
+            role: "integrator",
+            objective: "merge",
+          })
+        ).result();
+        assert.deepEqual(seenHandoffs, [], `${marker}: partial work must stay preserve-only`);
+      } finally {
+        await fx.cleanup();
+      }
     }
   });
 

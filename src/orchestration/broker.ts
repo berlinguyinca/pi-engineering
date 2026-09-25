@@ -116,6 +116,9 @@ export interface BrokerBackends {
   validation?: ValidationRunner;
 }
 
+/** The worker's machine-readable failure marker for a wall-clock timeout. */
+const WALL_CLOCK_TIMEOUT_MARKER = "timeout";
+
 /**
  * Default execution wall-clock budget in ms. The historical 10-minute default
  * repeatedly aborted fresh-context implementation workers at the boundary
@@ -167,7 +170,8 @@ export class ExecutionBroker {
    * (never merged, never force-deleted) so a failed run's work stays
    * recoverable instead of being destroyed with the worktree teardown.
    */
-  private readonly failedBranches = new Map<string, string[]>();
+  /** missionId -> branch -> failure marker (outcome.error, else summary) of the failed execution. */
+  private readonly failedBranches = new Map<string, Map<string, string>>();
   /** Missions where at least one worker branch carried commits since base (own commits recognized at harvest). */
   private readonly committedWork = new Map<string, boolean>();
 
@@ -511,9 +515,9 @@ export class ExecutionBroker {
             if (outcome.exitStatus !== "succeeded") {
               const info = this.allocatedWorktrees.get(execution.execution_id);
               if (info) {
-                const list = this.failedBranches.get(input.missionId) ?? [];
-                if (!list.includes(info.branch)) list.push(info.branch);
-                this.failedBranches.set(input.missionId, list);
+                const byBranch = this.failedBranches.get(input.missionId) ?? new Map<string, string>();
+                if (!byBranch.has(info.branch)) byBranch.set(info.branch, outcome.error ?? outcome.summary ?? "failed");
+                this.failedBranches.set(input.missionId, byBranch);
               }
             }
           }
@@ -544,7 +548,7 @@ export class ExecutionBroker {
     return handle;
   }
 
-  private dispatch(
+  private async dispatch(
     input: ExecutionRequestInput,
     backend: ExecutionBackend,
     executionId: string,
@@ -584,16 +588,44 @@ export class ExecutionBroker {
       case "integration": {
         const runner = this.backends.integration;
         if (!runner) throw new Error("no integration backend registered");
-        // Failed executions must not be merged (their work is incomplete).
-        // Their branches are preserved separately (see failedBranches).
-        const failed = new Set(this.failedBranches.get(input.missionId) ?? []);
-        const handoffs = (this.missionWorktrees.get(input.missionId) ?? [])
-          .filter((w) => !failed.has(w.branch))
-          .map((w) => ({
-            worktree: w,
-            summary: input.objective,
-            artifacts: [] as string[],
-          }));
+        // Failed executions are excluded from the merge by default (their
+        // work is presumed incomplete — a degenerate loop that committed
+        // garbage must not be auto-merged); their branches are preserved
+        // separately (see failedBranches). EXCEPTION: a worker killed by the
+        // WALL-CLOCK timeout after it had committed real work leaves a
+        // completed deliverable on its branch. Previously that work was
+        // stranded forever — preserved but never merged, with the completion
+        // gate flagging "Unmerged worker work" on every pass (observed:
+        // MSN-1xh24o, a 367-line console change lost twice). Timeout-only
+        // recovery: when the failure reason is a wall-clock timeout and the
+        // failed branch carries commits the incumbent has not received, hand
+        // it off too; the integration checks (verifier) still gate it.
+        const failedByBranch = this.failedBranches.get(input.missionId) ?? new Map<string, string>();
+        const handoffs: Array<{
+          worktree: { path: string; branch: string };
+          summary: string;
+          artifacts: string[];
+        }> = [];
+        for (const w of this.missionWorktrees.get(input.missionId) ?? []) {
+          const reason = failedByBranch.get(w.branch);
+          if (reason === undefined) {
+            handoffs.push({ worktree: w, summary: input.objective, artifacts: [] });
+            continue;
+          }
+          // Exactly the worker's wall-clock marker (PiWorkerExecutor: error
+          // "timeout"). A substring match also caught `gateway:queue_timeout`
+          // and `transient:timeout` — gateway/transport failures whose partial
+          // work must stay preserve-only.
+          if (reason !== WALL_CLOCK_TIMEOUT_MARKER) continue;
+          const ahead = this.git ? await this.git.revListCount(`HEAD..${w.branch}`) : 0;
+          if (ahead > 0) {
+            handoffs.push({
+              worktree: w,
+              summary: `${input.objective} [recovered: ${ahead} commit(s) from a timed-out execution]`,
+              artifacts: [],
+            });
+          }
+        }
         // After integration, release the merged worktrees (fire-and-forget
         // cleanup so the return value stays a plain Promise<ExecutionOutcome>).
         const outcome = runner.runIntegration({ objective: input.objective, handoffs, signal });

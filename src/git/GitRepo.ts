@@ -269,6 +269,17 @@ export class GitRepo {
     if (r.code !== 0) throw new Error(`git commit failed: ${r.stderr}`);
   }
 
+  /**
+   * Number of commits in `range` (e.g. "HEAD..branch") — i.e. committed work
+   * on the branch that the incumbent has not yet received. 0 on any git
+   * failure (fail-safe: treat unknown as "no recoverable work").
+   */
+  async revListCount(range: string): Promise<number> {
+    const r = await this.git(["--no-pager", "rev-list", "--count", range]);
+    if (r.code !== 0) return 0;
+    return Number.parseInt(r.stdout.trim(), 10) || 0;
+  }
+
   /** Unified diff between two commits (or base and worktree HEAD). */
   async captureDiff(baseCommit: string, headCommit: string): Promise<string> {
     const r = await this.git(["diff", baseCommit, headCommit, "--", ":!package-lock.json"]);

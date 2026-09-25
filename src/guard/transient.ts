@@ -105,6 +105,37 @@ export function classifyError(error: unknown): ErrorClass {
     };
   }
 
+  // Gateway routing failures (metabolomics/inferweave): expired routing
+  // snapshots, 404 model_not_found after a catalog shrink, invalid-model-name
+  // 400s on the multimodal route, and flattened capacity backpressure
+  // (capacity_unavailable / retry_alternate). Each clears on the next request
+  // (re-routed afresh / alternate deployment / catalog resync) — retryable,
+  // bounded by the transient budget.
+  //
+  // Text carrying an admission envelope is NOT ours: the structural admission
+  // contract decides it (a malformed or replay-unsafe envelope is terminal), so
+  // re-reading its rendered text here would override that fail-closed decision.
+  // A link cut ("…the response is incomplete…") is also not matched here: it is
+  // owned by the network branch below, behind isGatewayLinkCut's guards.
+  if (
+    !has("inferweave_backpressure", "inference_admission") &&
+    has(
+      "routing_snapshot_expired",
+      "model_not_found",
+      "invalid model name",
+      "capacity_unavailable",
+      "retry_alternate",
+      "try another eligible deployment",
+    )
+  ) {
+    return {
+      category: "server_unavailable",
+      retryable: true,
+      retryAfterMs,
+      reason: "gateway routing failure (snapshot/404/backpressure)",
+    };
+  }
+
   // 503 no worker for model / service unavailable / provider overload.
   //
   // "overloaded" is Anthropic's 529 wording and appears in pi-ai's own
