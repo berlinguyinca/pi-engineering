@@ -16,7 +16,7 @@ import type { ArtifactStore } from "../artifacts/ArtifactStore.ts";
 import type { GitRepo } from "../git/GitRepo.ts";
 import type { VerificationProvider } from "../verify/Verifier.ts";
 import type { WorkerExecutor, WorkerRequest } from "../workers/WorkerExecutor.ts";
-import { type ExecutionOutcome, workerTimeoutMs } from "./broker.ts";
+import { type ExecutionOutcome, type IntegrationHandoff, workerTimeoutMs } from "./broker.ts";
 
 export interface RealBackendsOptions {
   worker: WorkerExecutor;
@@ -240,7 +240,7 @@ export function realBackends(opts: RealBackendsOptions) {
     integration: {
       async runIntegration(input: {
         objective: string;
-        handoffs: Array<{ worktree: { path: string; branch: string }; summary: string; artifacts: string[] }>;
+        handoffs: IntegrationHandoff[];
         signal: AbortSignal;
       }): Promise<ExecutionOutcome> {
         if (!opts.git)
@@ -253,23 +253,35 @@ export function realBackends(opts: RealBackendsOptions) {
           };
         // Integrator (spec 05): merge each worker worktree branch into the
         // current checkout sequentially, then run integration checks.
+        // Recovered work (from a timed-out execution) merges its exact worker
+        // commit, and a conflict on it is reported but does not fail the
+        // integration: the branch stays preserved, and clean work is not held
+        // hostage by a half-finished run.
         const merged: string[] = [];
+        const recovered: string[] = [];
         const conflicts: string[] = [];
+        const skippedRecovered: string[] = [];
         for (const h of input.handoffs) {
-          const r = await opts.git.mergeBranch(h.worktree.branch).catch((e: Error) => ({
+          const r = await opts.git.mergeBranch(h.ref ?? h.worktree.branch).catch((e: Error) => ({
             merged: false,
             reason: e.message,
           }));
-          if (r.merged) merged.push(h.worktree.branch);
-          else conflicts.push(`${h.worktree.branch}: ${(r as { reason?: string }).reason ?? "conflict"}`);
+          const reason = `${h.worktree.branch}: ${(r as { reason?: string }).reason ?? "conflict"}`;
+          if (r.merged) (h.recovered ? recovered : merged).push(h.worktree.branch);
+          else (h.recovered ? skippedRecovered : conflicts).push(reason);
         }
+        const recoveredNote =
+          (recovered.length ? `; recovered from timed-out execution(s): ${recovered.join(", ")}` : "") +
+          (skippedRecovered.length
+            ? `; recovered work NOT merged (kept on its branch): ${skippedRecovered.join("; ")}`
+            : "");
         if (conflicts.length > 0) {
           return {
             executionId: "integration",
             exitStatus: "conflict",
-            summary: `integration conflicts: ${conflicts.join("; ")}`,
+            summary: `integration conflicts: ${conflicts.join("; ")}${recoveredNote}`,
             artifactRefs: [],
-            usage: { mergedBranches: merged.length, conflicts: conflicts.length },
+            usage: { mergedBranches: merged.length + recovered.length, conflicts: conflicts.length },
           };
         }
         const checks = await opts.verifier.detect(opts.cwd);
@@ -277,9 +289,9 @@ export function realBackends(opts: RealBackendsOptions) {
         return {
           executionId: "integration",
           exitStatus: result.passed ? "succeeded" : "failed",
-          summary: `integrated ${merged.join(", ") || "nothing"}; checks: ${result.passed ? "pass" : "fail"}`,
+          summary: `integrated ${merged.join(", ") || "nothing"}${recoveredNote}; checks: ${result.passed ? "pass" : "fail"}`,
           artifactRefs: result.evidence.flatMap((e) => e.artifacts).filter(Boolean),
-          usage: { mergedBranches: merged.length, conflicts: conflicts.length },
+          usage: { mergedBranches: merged.length + recovered.length, conflicts: conflicts.length },
         };
       },
     },

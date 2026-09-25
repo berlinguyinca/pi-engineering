@@ -271,13 +271,15 @@ export class GitRepo {
 
   /**
    * Number of commits in `range` (e.g. "HEAD..branch") — i.e. committed work
-   * on the branch that the incumbent has not yet received. 0 on any git
-   * failure (fail-safe: treat unknown as "no recoverable work").
+   * on the branch that the incumbent has not yet received. null when git
+   * cannot answer (bad ref, git failure): "unknown" is not "no commits", and
+   * the caller decides how to surface it.
    */
-  async revListCount(range: string): Promise<number> {
+  async revListCount(range: string): Promise<number | null> {
     const r = await this.git(["--no-pager", "rev-list", "--count", range]);
-    if (r.code !== 0) return 0;
-    return Number.parseInt(r.stdout.trim(), 10) || 0;
+    if (r.code !== 0) return null;
+    const n = Number.parseInt(r.stdout.trim(), 10);
+    return Number.isFinite(n) ? n : null;
   }
 
   /** Unified diff between two commits (or base and worktree HEAD). */
