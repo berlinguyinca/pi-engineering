@@ -36,6 +36,12 @@ export interface WorkerRequest {
   workItemId?: string | null;
   /** Stable session identity (observability ids); generated when omitted. */
   sessionId?: string;
+  /**
+   * True only when `cwd` is a worktree the broker allocated for this worker.
+   * Gates the commit-discipline instruction: a worker running in the user's
+   * own checkout (any fallback path) must never be told to commit there.
+   */
+  isolatedWorktree?: boolean;
 }
 
 /** An image passed to a vision-capable worker session. */

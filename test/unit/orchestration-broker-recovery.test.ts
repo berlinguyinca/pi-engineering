@@ -4,6 +4,8 @@
  * the integrator's handoff list.
  */
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { existsSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { describe, it } from "node:test";
@@ -157,11 +159,31 @@ describe("ExecutionBroker: recovering a timed-out worker's committed work", () =
       assert.equal(h.recovered, true);
       assert.equal(h.ref, s.workerCommits.get("committed"), "merge the worker's own tip, not the harvest commit");
       assert.equal(h.worktree.branch, s.branchOf("committed"));
+      // The half-done edit is still harvested onto the branch (preserved for an
+      // operator), just never merged: the tip is a harvest commit past the ref.
+      const tip = execFileSync("git", ["-C", s.fx.root, "rev-parse", h.worktree.branch], { encoding: "utf8" }).trim();
+      assert.notEqual(tip, h.ref);
+      execFileSync("git", ["-C", s.fx.root, "cat-file", "-e", `${h.worktree.branch}:src/half.txt`]);
       // Surfaced, not silent.
       assert.ok(
         s.store.listFindings(s.m.mission_id).some((f) => /recover/i.test(f.summary)),
         "a finding must name the recovered execution",
       );
+    } finally {
+      await s.fx.cleanup();
+    }
+  });
+
+  it("a SUCCEEDED worker that committed some steps and left the last one uncommitted keeps all of it", async () => {
+    // Commit discipline makes this the common shape: steps committed as they
+    // go, the final step still in the tree when the worker reports success.
+    const s = await scenario([{ task: "disciplined", commit: ["step1.txt"], edit: ["step4.txt"], outcome: SUCCESS }], {
+      merge: true,
+    });
+    try {
+      assert.equal(s.handoffs.length, 1);
+      assert.ok(existsSync(`${s.fx.root}/src/step1.txt`), "the committed step is integrated");
+      assert.ok(existsSync(`${s.fx.root}/src/step4.txt`), "the uncommitted last step is harvested and integrated");
     } finally {
       await s.fx.cleanup();
     }

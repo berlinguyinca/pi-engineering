@@ -69,7 +69,7 @@ import { type RequestBodyBudgetConfig, resolveRequestBodyBudgetConfig } from "..
 import { emitTelemetry } from "../telemetry/sink.ts";
 import type { WorkerExecutor, WorkerRequest, WorkerRun } from "./WorkerExecutor.ts";
 import { registerLocalProviders } from "./localProviders.ts";
-import { WORKER_KICKOFF, buildSystemPrompt } from "./prompts.ts";
+import { WORKER_KICKOFF, buildSystemPrompt, wantsCommitDiscipline } from "./prompts.ts";
 import { guardRuntimeRequestBody } from "./requestBodyGuard.ts";
 import { workerResultTool } from "./workerResultTool.ts";
 
@@ -306,7 +306,7 @@ export class PiWorkerExecutor implements WorkerExecutor {
     // Specialist roles may supply their own prompt wholesale.
     const baseSystemPrompt =
       req.systemPromptOverride ??
-      `${buildSystemPrompt(req.role, req.task, req.context)}
+      `${buildSystemPrompt(req.role, req.task, req.context, { isolatedWorktree: req.isolatedWorktree })}
 
 ${TOOL_TRANSITION_RULE}`;
 
@@ -1149,7 +1149,7 @@ export function guardConfigForRole(role: WorkerRole, base: GenerationGuardConfig
  * model needs to make progress: the task, the role, and the recovery
  * instruction. Verbose context from prior attempts is deliberately excluded.
  */
-function buildCompactedWorkerPrompt(req: WorkerRequest, recoveryPrompt: string | null): string {
+export function buildCompactedWorkerPrompt(req: WorkerRequest, recoveryPrompt: string | null): string {
   const parts: string[] = [];
   parts.push(`# Task`);
   parts.push(req.task);
@@ -1178,6 +1178,13 @@ function buildCompactedWorkerPrompt(req: WorkerRequest, recoveryPrompt: string |
   // Base rules (kept short — the model already knows its role).
   parts.push(`Rules:`);
   parts.push(`- Use the available tools; never guess APIs or signatures.`);
+  // Same gate as the full prompt: never tell a read-only role, or a worker in
+  // the user's own checkout, to commit.
+  if (wantsCommitDiscipline(req.role, req)) {
+    parts.push(
+      "- Commit your work on the current branch after each coherent change. If your session is terminated by the time budget, only your own commits are recovered; uncommitted edits at that point are not merged. Never switch branches, rebase, amend others' commits, or push.",
+    );
+  }
   parts.push(`- Your final action MUST be calling the worker_result tool.`);
   parts.push(`- Do not ask questions. Do not emit an assistant answer after calling worker_result.`);
 
