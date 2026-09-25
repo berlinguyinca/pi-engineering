@@ -13,6 +13,7 @@ import { registerInteractiveMemory } from "../src/blackhole/interactiveMemory.ts
 import { registerAutoCompaction } from "../src/compaction/autoTune.ts";
 import { type InferweaveProvider, createInferweaveProvider, inferweaveConfigFromEnv } from "../src/context/provider.ts";
 import { contextReading, planModelSwitch } from "../src/context/usage.ts";
+import { AfterOutputRetry } from "../src/gateway/afterOutputRetry.ts";
 import { sharedAdmissionController, sharedGatewayConfig } from "../src/gateway/config.ts";
 import {
   type FallbackApplyDeps,
@@ -817,6 +818,13 @@ ${RECOVERY_PROMPT}`;
     // even after the session that raised the hold has been replaced or reloaded.
     const fallbackCoordinator = new FallbackCoordinator();
 
+    // Retry a turn whose stream was cut AFTER partial output (link cut,
+    // "terminated"): omit the partial answer and continue, with long-wait
+    // backoff (no attempt cap; 12h horizon by default). Pi's own retry, when the
+    // user enabled it, still goes first. PI_AFTER_OUTPUT_RETRY=0 turns it off.
+    const afterOutputRetry = new AfterOutputRetry();
+    if (!/^(0|false|off|no)$/i.test(process.env.PI_AFTER_OUTPUT_RETRY ?? "")) afterOutputRetry.register(pi as never);
+
     const installStreamRetry = (ctx: { modelRegistry?: unknown; signal?: AbortSignal }, model?: Model<any>): void => {
       const registry = ctx.modelRegistry as Parameters<typeof installGatewayStreamRetry>[0] | undefined;
       if (!registry || typeof registry.registerProvider !== "function") return;
@@ -876,6 +884,10 @@ ${RECOVERY_PROMPT}`;
           // Fit every request body to the gateway's cap (advertised, else
           // 10 MiB) before it is sent; a 413 is permanent and ends the turn.
           requestBodyBudget: resolveRequestBodyBudgetConfig(),
+          // A stream cut after partial output is replayed by afterOutputRetry
+          // (agent_before_settle); the wait it owes is taken here, against the
+          // request's own abort signal, so Esc ends it at once.
+          beforeSend: (_model, signal) => afterOutputRetry.beforeSend(_model, signal),
           // Thinking off for Pi's summaries (compaction) and near-full turns on
           // the metabolomics gateway, whose models think by default and would
           // otherwise spend the whole output budget on hidden reasoning.

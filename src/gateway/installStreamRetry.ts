@@ -136,6 +136,12 @@ export interface InstallDeps<M, O> {
    * Omitted, payloads are sent as built.
    */
   thinkingPolicy?: ThinkingOffConfig;
+  /**
+   * Awaited before each provider call is sent, with the call's abort signal:
+   * the after-output retry takes the wait it owes here, so Esc ends it at once.
+   * "aborted" ends the call as aborted without sending anything.
+   */
+  beforeSend?: (model: M, signal: AbortSignal | undefined) => Promise<"go" | "aborted">;
   maxAttempts?: number;
   maxElapsedMs?: number;
   now?: () => number;
@@ -247,36 +253,44 @@ export function installGatewayStreamRetry<M, C, O>(
     let responseCapture:
       | ReturnType<typeof captureGatewayAttemptResponse<ProviderResponseLike, unknown, ProviderResponseOptions>>
       | undefined;
-    void pumpWithGatewayRetry(
-      () => {
-        responseCapture = captureGatewayAttemptResponse(
-          (options ?? {}) as ProviderResponseOptions<ProviderResponseLike, unknown>,
-        );
-        return baseStream(model, context, responseCapture.options as O);
-      },
-      out,
-      {
-        hold: (waitSignal, attempt) => {
-          consecutiveHolds++;
-          return deps.hold(waitSignal, attempt, signal, model);
+    void (async () => {
+      if (deps.beforeSend && (await deps.beforeSend(model, signal)) === "aborted") {
+        const aborted = { ...deps.errorMessage(model, new Error("Request aborted")), stopReason: "aborted" };
+        out.push({ type: "error", reason: "aborted", error: aborted } as RetryableEvent);
+        out.end(aborted);
+        return;
+      }
+      await pumpWithGatewayRetry(
+        () => {
+          responseCapture = captureGatewayAttemptResponse(
+            (options ?? {}) as ProviderResponseOptions<ProviderResponseLike, unknown>,
+          );
+          return baseStream(model, context, responseCapture.options as O);
         },
-        priorHolds: consecutiveHolds,
-        // Synchronous, unlike the outcome: the agent loop starts its next
-        // provider call before a `.then` on this pump would run.
-        onProgress: () => {
-          responseCapture?.clear();
-          consecutiveHolds = 0;
-          deps.onProgress?.(model);
+        out,
+        {
+          hold: (waitSignal, attempt) => {
+            consecutiveHolds++;
+            return deps.hold(waitSignal, attempt, signal, model);
+          },
+          priorHolds: consecutiveHolds,
+          // Synchronous, unlike the outcome: the agent loop starts its next
+          // provider call before a `.then` on this pump would run.
+          onProgress: () => {
+            responseCapture?.clear();
+            consecutiveHolds = 0;
+            deps.onProgress?.(model);
+          },
+          ...(deps.onHold ? { onHold: (info) => deps.onHold?.(info, model) } : {}),
+          ...(signal ? { signal } : {}),
+          ...(deps.maxEscalatedWaitMs != null ? { maxEscalatedWaitMs: deps.maxEscalatedWaitMs } : {}),
+          ...(deps.maxAttempts != null ? { maxAttempts: deps.maxAttempts } : {}),
+          ...(deps.maxElapsedMs != null ? { maxElapsedMs: deps.maxElapsedMs } : {}),
+          ...(deps.now ? { now: deps.now } : {}),
+          response: () => responseCapture?.take(),
         },
-        ...(deps.onHold ? { onHold: (info) => deps.onHold?.(info, model) } : {}),
-        ...(signal ? { signal } : {}),
-        ...(deps.maxEscalatedWaitMs != null ? { maxEscalatedWaitMs: deps.maxEscalatedWaitMs } : {}),
-        ...(deps.maxAttempts != null ? { maxAttempts: deps.maxAttempts } : {}),
-        ...(deps.maxElapsedMs != null ? { maxElapsedMs: deps.maxElapsedMs } : {}),
-        ...(deps.now ? { now: deps.now } : {}),
-        response: () => responseCapture?.take(),
-      },
-    ).catch((error: unknown) => {
+      );
+    })().catch((error: unknown) => {
       // A throw that is not gateway backpressure. Pi expects a terminal event,
       // never a rejected promise, so report it the way `lazyStream` does.
       const message = deps.errorMessage(model, error);
