@@ -180,7 +180,13 @@ function errorText(value: unknown): string {
  * once capacity returns.
  */
 function waitFor(signal: GatewayWaitSignal, attempt: number, capMs: number): GatewayWaitSignal {
-  if (signal.source === "body" || signal.source === "header" || signal.source === "link-cut") return signal;
+  if (
+    signal.source === "body" ||
+    signal.source === "header" ||
+    signal.source === "link-cut" ||
+    signal.source === "hint"
+  )
+    return signal;
   const escalated = Math.min(capMs, signal.retryAfterMs * 2 ** Math.max(0, attempt - 1));
   return { ...signal, retryAfterMs: escalated };
 }

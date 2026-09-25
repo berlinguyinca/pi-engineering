@@ -15,7 +15,7 @@
  * sleep so tests can exercise backoff and retry loops without sleeping.
  */
 
-import { isGatewayAdmissionRefusal, isGatewayLinkCut } from "../gateway/signals.ts";
+import { isFlattenedInferWeaveRefusal, isGatewayAdmissionRefusal, isGatewayLinkCut } from "../gateway/signals.ts";
 import { PERMANENT_ADMISSION_STATUSES } from "../inference/admissionContract.ts";
 
 export type TransientErrorCategory =
@@ -139,9 +139,13 @@ export function classifyError(error: unknown): ErrorClass {
   // snapshots and flattened capacity backpressure (capacity_unavailable /
   // retry_alternate). Each clears on the next request (re-routed afresh /
   // alternate deployment) — retryable, bounded by the transient budget.
+  // isFlattenedInferWeaveRefusal covers the remaining retryable pre-dispatch
+  // codes (model_activating, queue_*) in the same shapes the interactive pump
+  // recognises, so both layers agree on what is retryable.
   if (
-    !carriesEnvelope &&
-    has("routing_snapshot_expired", "capacity_unavailable", "retry_alternate", "try another eligible deployment")
+    (!carriesEnvelope &&
+      has("routing_snapshot_expired", "capacity_unavailable", "retry_alternate", "try another eligible deployment")) ||
+    (isFlattenedInferWeaveRefusal(raw) && !(status != null && PERMANENT_ADMISSION_STATUSES.includes(status)))
   ) {
     return {
       category: "server_unavailable",

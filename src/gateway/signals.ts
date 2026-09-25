@@ -38,8 +38,16 @@ export interface GatewayWaitSignal {
    * `"link-cut"` is the gateway's fixed hint for a flattened link cut (see
    * LINK_CUT_WAIT_MS): honoured exactly, like a body or header wait, but not a
    * body instruction, so it never claims the admission controller's layer.
+   * `"hint"` is the same idea for a flattened refusal code whose wait the
+   * gateway fixes (see FLATTENED_REFUSAL_HINT_MS).
    */
-  source: "body" | "header" | "default" | "link-cut";
+  source: "body" | "header" | "default" | "link-cut" | "hint";
+  /**
+   * Parsed from a flattened InferWeave refusal (bare code or its readable
+   * wording) rather than an envelope. Held by the caller alone: flattening lost
+   * the scope and limits that would justify parking anyone else.
+   */
+  flattened?: boolean;
   status?: number;
   /** Gateway-reported machine reason, e.g. "queue_timeout". */
   reason?: string;
@@ -110,6 +118,63 @@ export function isGatewayLinkCut(text: string | undefined): boolean {
   if (NON_RETRYABLE_PATTERNS.test(text)) return false;
   const status = leadingStatus(text) ?? num(embeddedJson(text)?.status);
   return !(status !== undefined && PERMANENT_ADMISSION_STATUSES.includes(status));
+}
+
+/**
+ * Pre-dispatch InferWeave refusal codes that are retryable per the gateway's
+ * own guidance (iw-protocol `inference_guidance`: 503 → retry_alternate, 429
+ * queue/model → backoff, all with request_state not_started/queued, so replay
+ * is safe). Deliberately excludes caller-scoped quota codes
+ * (`caller_hard_quota`) and everything the guidance marks do-not-retry.
+ */
+const FLATTENED_REFUSAL_CODES: ReadonlySet<string> = new Set([
+  "routing_snapshot_expired",
+  "capacity_unavailable",
+  "model_activating",
+  "queue_timeout",
+  "queue_deadline_exceeded",
+  "queue_limit_reached",
+  "request_not_queueable",
+]);
+
+/**
+ * Waits known exactly despite flattening. A stale routing snapshot is fixed by
+ * the next request, which is routed on a fresh snapshot; the gateway advertises
+ * 1s for it. The others have no such constant — `model_activating`'s real wait
+ * is the placement's warm-up and `capacity_unavailable` lasts as long as no node
+ * serves the model — so they take the escalating default instead of a guess.
+ */
+const FLATTENED_REFUSAL_HINT_MS: Readonly<Record<string, number>> = { routing_snapshot_expired: 1_000 };
+
+/** "Error: 503: routing_snapshot_expired" → status 503, code. The whole text. */
+const BARE_REFUSAL = /^\s*(?:error:\s*)?(?:(?:http\s*)?(\d{3})\b[:\s]*)?([a-z_]+)\.?\s*$/i;
+/** The readable wording: "No fresh route for model m (routing_snapshot_expired); please retry your request." */
+const WORDED_REFUSAL = /\(([a-z_]+)\);\s*please retry your request\b/i;
+const PREFIXED_STATUS = /^\s*(?:error:\s*)?(?:http\s*)?(\d{3})\b/i;
+
+/**
+ * The retryable pre-dispatch refusal code a flattened InferWeave error carries,
+ * or undefined.
+ *
+ * Only two shapes count: the whole text is the code (after an optional
+ * "Error:" and HTTP status), or the gateway's "(<code>); please retry your
+ * request" wording. Prose that merely mentions a code is not a refusal. Fails
+ * closed like isGatewayLinkCut: a permanent status, quota/billing wording, or
+ * any admission envelope leaves the decision to the structured path.
+ */
+export function flattenedInferWeaveRefusalCode(text: string | undefined): string | undefined {
+  if (!text) return undefined;
+  if (/inferweave_backpressure|inference_admission/i.test(text)) return undefined;
+  if (NON_RETRYABLE_PATTERNS.test(text)) return undefined;
+  const code = (BARE_REFUSAL.exec(text)?.[2] ?? WORDED_REFUSAL.exec(text)?.[1])?.toLowerCase();
+  if (!code || !FLATTENED_REFUSAL_CODES.has(code)) return undefined;
+  const status = num(PREFIXED_STATUS.exec(text)?.[1]);
+  if (status !== undefined && PERMANENT_ADMISSION_STATUSES.includes(status)) return undefined;
+  return code;
+}
+
+export function isFlattenedInferWeaveRefusal(text: string | undefined): boolean {
+  return flattenedInferWeaveRefusalCode(text) !== undefined;
 }
 
 /** Read the first JSON object embedded in a provider error string. */
@@ -219,6 +284,25 @@ export function parseGatewayWait(input: GatewayWaitInput): GatewayWaitSignal | n
       reason: "upstream_transport_error",
       type: "inferweave_backpressure",
       scope: "model",
+      ...(status !== undefined ? { status } : {}),
+    };
+  }
+
+  // A pre-dispatch refusal relayed after a 200 head arrives as its bare code
+  // (or the readable wording). Retryable and replay-safe while nothing was
+  // delivered — the pump's rule — and about one model's routing.
+  const refusalCode =
+    !admission && !malformedNewContract && !permanentStatus ? flattenedInferWeaveRefusalCode(text) : undefined;
+  if (refusalCode) {
+    const hint = FLATTENED_REFUSAL_HINT_MS[refusalCode];
+    return {
+      retryAfterMs: hint ?? DEFAULT_WAIT_MS,
+      retryable: true,
+      source: hint !== undefined ? "hint" : "default",
+      reason: refusalCode,
+      type: "inferweave_backpressure",
+      scope: "model",
+      flattened: true,
       ...(status !== undefined ? { status } : {}),
     };
   }
@@ -367,7 +451,7 @@ export function isAccountWideRefusal(signal: GatewayWaitSignal): boolean {
  * the caller's: one request's route broke, and the retry is routed afresh.
  */
 export function gatewayHoldScope(signal: GatewayWaitSignal): "shared" | "caller" {
-  if (signal.source === "link-cut") return "caller";
+  if (signal.source === "link-cut" || signal.flattened) return "caller";
   if (isAccountWideRefusal(signal) || signal.scope === "model") return "shared";
   return "caller";
 }
@@ -395,7 +479,8 @@ export function decideGatewayRetry(
  * The worker's handover after its transient-retry loop gave up.
  *
  * Errors the transient layer owns (see classifyError) have already had their
- * retries there; a link cut is one of them, so handing it to the gateway layer
+ * retries there; a link cut or a flattened refusal code is one of them, so
+ * handing it to the gateway layer
  * as well would multiply the two budgets. Everything else keeps the existing
  * `decideGatewayRetry` behaviour.
  */
@@ -404,6 +489,6 @@ export function decideTransientHandover(
   retriesSoFar: number,
   maxRetries: number,
 ): GatewayRetryDecision {
-  if (isGatewayLinkCut(errorText)) return { action: "not-gateway" };
+  if (isGatewayLinkCut(errorText) || isFlattenedInferWeaveRefusal(errorText)) return { action: "not-gateway" };
   return decideGatewayRetry(errorText, retriesSoFar, maxRetries);
 }
