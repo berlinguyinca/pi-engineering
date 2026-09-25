@@ -42,6 +42,10 @@ function infraCategoryFromWorkerMarker(marker?: string): InfraErrorCategory | nu
     case "compaction":
       return "CONTEXT_RECOVERABLE";
     case "permanent":
+    case "model_unavailable":
+      // An unknown model already had its one catalog-resync retry in the
+      // worker; the gateway is healthy, so the infra window would only hide a
+      // configuration error behind a 90-minute wait and a paused mission.
       return null;
     default:
       // server_unavailable, server_error, network, timeout

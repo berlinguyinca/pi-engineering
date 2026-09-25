@@ -220,4 +220,45 @@ describe("MissionScheduler resilience (time-based gateway window)", () => {
     const failed = store.getTask(t.task_id) as unknown as { failure_reason?: string };
     assert.equal(failed.failure_reason, "backend reported failed: worker gave up");
   });
+  it("fails an unknown-model task with its real cause instead of parking it in the infra window", async () => {
+    // The worker already spent its one catalog-resync retry. A healthy gateway
+    // plus a model it does not know is a configuration problem: waiting 90
+    // minutes (and pausing the mission as "infrastructure") hides it.
+    const store = MissionStore.open(JsonlEventStore.inMemory());
+    const m = makeMission(store);
+    const t = store.createTask({ mission_id: m.mission_id, kind: "agent", role: "implementer", objective: "x" });
+    let calls = 0;
+    const backends: BrokerBackends = {
+      agent: {
+        runAgent: async () => {
+          calls++;
+          return {
+            executionId: "e",
+            exitStatus: "failed" as const,
+            summary: 'Worker failed after 2 attempt(s): 404: {"code":"model_not_found"}',
+            artifactRefs: [],
+            usage: {},
+            error: "transient:model_unavailable",
+          };
+        },
+      },
+    };
+    const broker = new ExecutionBroker({ store, backends });
+    const clk = clock();
+    const scheduler = new MissionScheduler({
+      store,
+      broker,
+      resilience: testResilience,
+      probe: { probe: async () => ({ healthy: true }) },
+      now: clk.now,
+      sleep: clk.sleep,
+      rand: () => 0,
+    });
+    await scheduler.runMission(m.mission_id);
+    assert.equal(calls, 1, "no infra-window retry for an unknown model");
+    assert.equal(store.getTask(t.task_id)!.status, "FAILED");
+    assert.notEqual(store.getMission(m.mission_id)!.status, "PAUSED_INFRASTRUCTURE");
+    const failed = store.getTask(t.task_id) as unknown as { failure_reason?: string };
+    assert.match(failed.failure_reason ?? "", /model_not_found/);
+  });
 });
