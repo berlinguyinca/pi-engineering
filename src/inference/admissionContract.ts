@@ -233,6 +233,27 @@ export function parseAdmissionPayload(value: unknown): AdmissionInfo | undefined
   return info;
 }
 
+/**
+ * Does this assistant stream event put visible content into the message?
+ *
+ * Shared by both retry layers: output reaching the consumer is what makes a
+ * replay unsafe (it would duplicate text), while leading bookkeeping events such
+ * as `start` can be withheld without the transcript noticing.
+ */
+export function isAssistantOutputEvent(type: string | undefined): boolean {
+  return (
+    type === "text_start" ||
+    type === "text_delta" ||
+    type === "text_end" ||
+    type === "thinking_start" ||
+    type === "thinking_delta" ||
+    type === "thinking_end" ||
+    type === "toolcall_start" ||
+    type === "toolcall_delta" ||
+    type === "toolcall_end"
+  );
+}
+
 /** Shared pure replay gate used by both structured and interactive transports. */
 export function isAutomaticReplayAllowed(info: AdmissionInfo, outputCommitted: boolean): boolean {
   if (outputCommitted) return false;

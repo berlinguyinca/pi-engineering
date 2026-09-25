@@ -30,6 +30,17 @@
  *
  * So the pump withholds a terminal error event until it has decided not to
  * retry, and abandons retrying the moment any non-terminal event is forwarded.
+ * Leading bookkeeping events (`start`) are held too, until the first output
+ * event or a successful terminal: pi-ai pushes `start` as soon as the HTTP 200
+ * arrives, before any token, and a gateway link cut lands exactly there. The
+ * failed attempt's held `start` is discarded on retry, so exactly one reaches
+ * the sink.
+ *
+ * That widens the retry window on purpose, and not only for link cuts: ANY
+ * retryable gateway wait that lands after the 200 head but before the first
+ * token (an overload, a 503 relayed mid-stream) is now waited out and replayed
+ * too. It is the same safety condition — nothing visible has reached the
+ * transcript — just checked on content rather than on the head.
  * Pi's own `retryAssistantCall` can restart after partial output because it
  * discards the whole failed message; mid-stream, we have no such luxury.
  *
@@ -38,7 +49,7 @@
  */
 
 import { monotonicNow } from "../core/clock.ts";
-import { augmentInferenceErrorMessage } from "../inference/admissionContract.ts";
+import { augmentInferenceErrorMessage, isAssistantOutputEvent } from "../inference/admissionContract.ts";
 import { type GatewayWaitInput, type GatewayWaitSignal, parseGatewayWait } from "./signals.ts";
 
 export { monotonicNow } from "../core/clock.ts";
@@ -160,7 +171,8 @@ function errorText(value: unknown): string {
 /**
  * Grow a synthesized wait with consecutive failures.
  *
- * A gateway that reports `retry_after_ms` is obeyed to the millisecond — it
+ * A gateway that reports `retry_after_ms` (or a link cut's fixed "routed
+ * afresh" hint) is obeyed to the millisecond — it
  * knows when its queue drains and we do not. A bare `503 no worker for model`
  * advertises nothing, so `parseGatewayWait` hands back a flat default; asking
  * again every 5s while a model has no workers at all is a busy-wait against an
@@ -168,7 +180,7 @@ function errorText(value: unknown): string {
  * once capacity returns.
  */
 function waitFor(signal: GatewayWaitSignal, attempt: number, capMs: number): GatewayWaitSignal {
-  if (signal.source === "body" || signal.source === "header") return signal;
+  if (signal.source === "body" || signal.source === "header" || signal.source === "link-cut") return signal;
   const escalated = Math.min(capMs, signal.retryAfterMs * 2 ** Math.max(0, attempt - 1));
   return { ...signal, retryAfterMs: escalated };
 }
@@ -216,6 +228,11 @@ export async function pumpWithGatewayRetry<E extends RetryableEvent, R extends R
       }
       sink.push(event);
     };
+    /** Leading non-output events (`start`) held until something visible. */
+    const leading: E[] = [];
+    const release = (): void => {
+      for (const event of leading.splice(0)) emit(event);
+    };
     /** A terminal error held back while a retry is still possible. */
     let withheld: E | undefined;
     let result: R | undefined;
@@ -233,9 +250,15 @@ export async function pumpWithGatewayRetry<E extends RetryableEvent, R extends R
             withheld = event;
             continue;
           }
+          release();
           emit(event);
           continue;
         }
+        if (!forwarded && !isAssistantOutputEvent(event.type)) {
+          leading.push(event);
+          continue;
+        }
+        release();
         emit(event);
       }
       result = await inner.result();
@@ -274,6 +297,9 @@ export async function pumpWithGatewayRetry<E extends RetryableEvent, R extends R
 
     // Settled: a throw with nothing to report is the caller's problem, since
     // building an assistant message needs the model.
+    // A held `start` still precedes the failure it belongs to — but it is not
+    // the gateway serving us, so it bypasses `emit` and never counts as progress.
+    for (const event of leading) sink.push(event);
     if (thrown !== undefined) throw thrown;
     const finalResult = guidance ? withGuidance(result, guidance) : result;
     if (withheld) sink.push(guidance ? withEventGuidance(withheld, guidance) : withheld);

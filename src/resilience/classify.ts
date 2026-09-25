@@ -15,6 +15,8 @@
  * and provider error objects.
  */
 
+import { isGatewayLinkCut } from "../gateway/signals.ts";
+
 export type InfraErrorCategory =
   | "TRANSIENT_INFRASTRUCTURE"
   | "RATE_LIMITED"
@@ -151,6 +153,20 @@ export function classifyInfraError(error: unknown): InfraErrorClass {
   // 429 rate-limit / concurrency admission -> WAITING_FOR_CAPACITY.
   if (status === 429 || has("too many requests", "rate limit", "rate limited", "caller_concurrency", "admission")) {
     return { category: "RATE_LIMITED", retryable: true, retryAfterMs, reason: "rate-limited / concurrency admission" };
+  }
+
+  // Gateway link cut: a peer route ended mid-response. Status-less (it follows
+  // a 200 head) and replayable, so name it rather than leaving it to the
+  // unclassified fallback.
+  if (status == null && isGatewayLinkCut(raw)) {
+    return {
+      category: "TRANSIENT_INFRASTRUCTURE",
+      retryable: true,
+      retryAfterMs,
+      scheduler_state,
+      request_id,
+      reason: "gateway link cut",
+    };
   }
 
   // Gateway/model transient infrastructure.

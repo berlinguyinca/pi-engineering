@@ -24,7 +24,12 @@ import {
   installedGatewayStreamRetries,
   isGatewayStreamRetryLive,
 } from "../src/gateway/installStreamRetry.ts";
-import { describeGatewayWait, isAccountWideRefusal, parseGatewayWait } from "../src/gateway/signals.ts";
+import {
+  describeGatewayWait,
+  gatewayHoldScope,
+  isAccountWideRefusal,
+  parseGatewayWait,
+} from "../src/gateway/signals.ts";
 import { renderGatewayReport } from "../src/gateway/statusReport.ts";
 import { GitRepo } from "../src/git/GitRepo.ts";
 import { GenerationGuard } from "../src/guard/GenerationGuard.ts";
@@ -823,8 +828,8 @@ ${RECOVERY_PROMPT}`;
               model: callModel.id,
               ...(abort ? { signal: abort } : {}),
             };
-            if (isAccountWideRefusal(scopedSignal)) await admission.noteWaitAndSleep(scopedSignal, opts);
-            else if (scopedSignal.scope === "model") await admission.noteWaitAndSleep(scopedSignal, opts);
+            // A link cut is always the caller's own: its retry is routed afresh.
+            if (gatewayHoldScope(scopedSignal) === "shared") await admission.noteWaitAndSleep(scopedSignal, opts);
             else await admission.noteCallerWaitAndSleep(scopedSignal, opts);
           },
           // "Consecutive" has to mean consecutive: without this the counter
