@@ -65,10 +65,12 @@ import {
   withTransientRetry,
 } from "../guard/transient.ts";
 import { reviewResultTool } from "../lifecycle/reviewResultTool.ts";
+import { type RequestBodyBudgetConfig, resolveRequestBodyBudgetConfig } from "../request/bodyBudget.ts";
 import { emitTelemetry } from "../telemetry/sink.ts";
 import type { WorkerExecutor, WorkerRequest, WorkerRun } from "./WorkerExecutor.ts";
 import { registerLocalProviders } from "./localProviders.ts";
 import { WORKER_KICKOFF, buildSystemPrompt } from "./prompts.ts";
+import { guardRuntimeRequestBody } from "./requestBodyGuard.ts";
 import { workerResultTool } from "./workerResultTool.ts";
 
 /**
@@ -129,6 +131,12 @@ export interface PiWorkerExecutorOptions {
    * AgentProgressSupervisor, which emits `agent.loop_candidate` events.
    * Default `{}` (enabled with default thresholds); `false` disables.
    */
+  /**
+   * Request-body budget for every provider call this worker makes (see
+   * src/request/bodyBudget.ts). Default: PI_MAX_REQUEST_BODY_BYTES /
+   * PI_REQUEST_BODY_HEADROOM, else the gateway's advertised cap, else 10 MiB.
+   */
+  requestBodyBudget?: RequestBodyBudgetConfig;
   aps?: AgentProgressSupervisorOptions | false;
   /**
    * APS loop PREVENTION (Phase 3, first enforcement): when the supervisor
@@ -184,6 +192,7 @@ export class PiWorkerExecutor implements WorkerExecutor {
   readonly observability: import("../aps/observability.ts").ApsObservability = new ApsObservability();
   private modelRuntime: ModelRuntime | undefined;
   private runtimePromise: Promise<ModelRuntime> | undefined;
+  private readonly requestBodyBudget: RequestBodyBudgetConfig;
   /** Aggregate recovery telemetry across all worker runs. */
   readonly recoveryTelemetry: RecoveryTelemetry = initialRecoveryTelemetry();
   /** Aggregate transient-error retry telemetry across all worker runs. */
@@ -206,6 +215,7 @@ export class PiWorkerExecutor implements WorkerExecutor {
     this.loopPrevention = opts.loopPrevention;
     this.escalation = opts.escalation;
     this.rollout = resolveRollout(opts.rolloutPhase ?? DEFAULT_ROLLOUT_PHASE);
+    this.requestBodyBudget = opts.requestBodyBudget ?? resolveRequestBodyBudgetConfig();
   }
 
   /** APS observability snapshot (Phase 6) — Grafana-ready metrics. */
@@ -228,6 +238,7 @@ export class PiWorkerExecutor implements WorkerExecutor {
         allowModelNetwork: this.allowModelNetwork,
       });
       await registerLocalProviders(rt).catch(() => {});
+      guardRuntimeRequestBody(rt, this.requestBodyBudget);
       return rt;
     })();
     return this.runtimePromise;

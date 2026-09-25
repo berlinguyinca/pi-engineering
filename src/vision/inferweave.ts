@@ -8,6 +8,7 @@
  * real InferWeave client.
  */
 
+import { FALLBACK_MAX_REQUEST_BODY_BYTES } from "../request/bodyBudget.ts";
 import { RequestBudgetManager } from "./budget.ts";
 
 // ── Task-level routing (spec §31) ──────────────────────────────────────────
@@ -57,9 +58,14 @@ export interface InferWeaveCapabilities {
   maxImagesPerRequest?: number;
 }
 
-/** Spec §30 defaults: 64 MiB, 262144 tokens, 1800px, 8 images. */
+/**
+ * Spec §30 defaults: 262144 tokens, 1800px, 8 images. `maxRequestBytes` is the
+ * deployed gateway's real body cap (10 MiB), shared with the live-path guard —
+ * the spec's 64 MiB overstated it by 6x and would have planned requests the
+ * gateway rejects with a 413.
+ */
 export const DEFAULT_INFERWEAVE_CAPABILITIES: InferWeaveCapabilities = {
-  maxRequestBytes: 67_108_864,
+  maxRequestBytes: FALLBACK_MAX_REQUEST_BODY_BYTES,
   maxContextTokens: 262_144,
   supportsVision: true,
   preferredImageLongEdge: 1800,

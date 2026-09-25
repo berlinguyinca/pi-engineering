@@ -21,6 +21,9 @@
  *     forward and only `api`/`streamSimple` are added.
  */
 
+import { type BudgetContext, type RequestBodyBudgetConfig, streamWithinRequestBudget } from "../request/bodyBudget.ts";
+
+type ModelLike = { baseUrl?: string; id?: string };
 import type { GatewayWaitInput, GatewayWaitSignal } from "./signals.ts";
 import {
   type AttemptStream,
@@ -114,6 +117,11 @@ export interface InstallDeps<M, O> {
   /** Read the turn's abort signal off the provider options. */
   signalOf?(options: O | undefined): AbortSignal | undefined;
   maxEscalatedWaitMs?: number;
+  /**
+   * Fit every attempt's request body to the gateway's cap before sending (see
+   * src/request/bodyBudget.ts). Omitted, requests are sent as built.
+   */
+  requestBodyBudget?: RequestBodyBudgetConfig;
   maxAttempts?: number;
   maxElapsedMs?: number;
   now?: () => number;
@@ -182,8 +190,17 @@ export function installGatewayStreamRetry<M, C, O>(
   const base = native ?? host.getProvider(target.provider);
   if (!base) return "no-provider";
   // Captured BEFORE registration: this reference reaches the real transport.
-  const baseStream = base.streamSimple?.bind(base);
-  if (!baseStream) return "no-base-stream";
+  const rawStream = base.streamSimple?.bind(base);
+  if (!rawStream) return "no-base-stream";
+  // The body guard sits inside the retry pump: each attempt is fitted, and an
+  // unsendable request surfaces as a non-gateway error the pump never retries.
+  const budget = deps.requestBodyBudget;
+  const baseStream: typeof rawStream = budget
+    ? (streamWithinRequestBudget<ModelLike, BudgetContext, O, RetryableEvent, RetryableResult>(rawStream as never, {
+        config: budget,
+        errorResult: (model, error) => deps.errorMessage(model as M, error),
+      }) as unknown as typeof rawStream)
+    : rawStream;
 
   // Consecutive saturated attempts for THIS provider, across provider calls.
   // The agent loop issues one call per tool round-trip and an outage outlives a

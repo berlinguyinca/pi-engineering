@@ -60,6 +60,11 @@ const INVALID_PATTERNS =
 const CONTEXT_PATTERNS =
   /\b(context[_ -]?length|context[_ -]?exceeded|context[_ -]?window|maximum[_ -]?context|too[_ -]?many[_ -]?tokens|token[_ -]?budget|input[_ -]?too[_ -]?long|413|prompt[_ -]?is[_ -]?too[_ -]?long|context[_ -]?limit)\b/i;
 
+const BODY_TOO_LARGE =
+  /request body too large|payload too large|request entity too large|body too large|\brequest_too_large\b/i;
+const CONTEXT_WORDING =
+  /context[_ -]?(length|window|limit|exceeded)|maximum[_ -]?context|too[_ -]?many[_ -]?tokens|prompt[_ -]?is[_ -]?too[_ -]?long|input[_ -]?too[_ -]?long/i;
+
 const MODEL_STATES =
   /(relocat|load|cold[_ -]?start|unload|drain|restart|starting[_ -]?up|no[_ -]?worker|worker[_ -]?(down|restarting)|scheduler|placement|spinning[_ -]?up)/i;
 
@@ -138,6 +143,14 @@ export function classifyInfraError(error: unknown): InfraErrorClass {
   // Invalid request errors never blind-retry.
   if (status === 400 || INVALID_PATTERNS.test(raw)) {
     return { category: "INVALID_REQUEST", retryable: false, reason: "invalid request" };
+  }
+
+  // A body-size 413 (the gateway's byte cap, or our own preflight refusing to
+  // send) is not a context problem and not transient: resending the same body
+  // fails the same way. The live path already shrinks what it can before
+  // sending (src/request/bodyBudget.ts), so what is left needs a person.
+  if (BODY_TOO_LARGE.test(raw) && !CONTEXT_WORDING.test(raw)) {
+    return { category: "INVALID_REQUEST", retryable: false, reason: "request body exceeds the gateway's size cap" };
   }
 
   // 413 / context overflow -> context recovery, NOT infrastructure retry.
