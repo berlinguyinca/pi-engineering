@@ -693,8 +693,29 @@ export function isBodyTooLarge(text: string | undefined): boolean {
   return !!text && BODY_TOO_LARGE.test(text) && !/Request body too large to send/.test(text);
 }
 
-/** A cap stated in a gateway's 413 text ("limit 10485760 bytes", "max 10 MiB"), if any. */
+/**
+ * A 413 that speaks for ONE ROUTE, not the gateway (inferweave-gateway #358):
+ * `scope: "route"` and/or `route_max_request_bytes`, e.g. a link peer limited to
+ * one 1 MiB frame. Another route may still carry the request, so it must never
+ * be learned as the gateway's cap — that would shrink every later request in
+ * the process — and resending the same request to the same route cannot help.
+ */
+export function isRouteLimitedTooLarge(text: string | undefined): boolean {
+  return (
+    isBodyTooLarge(text) && (/"scope"\s*:\s*"route"/i.test(text ?? "") || /"route_max_request_bytes"/i.test(text ?? ""))
+  );
+}
+
+function routeLimitBytes(text: string): number | undefined {
+  return positiveInt(/"route_max_request_bytes"\s*:\s*"?(\d+)/i.exec(text)?.[1]);
+}
+
+/**
+ * The GATEWAY's cap stated in a 413 ("limit 10485760 bytes", "max 10 MiB",
+ * `max_request_bytes`), if any. Never a route's bound.
+ */
 export function limitFromBodyTooLarge(text: string): number | undefined {
+  if (isRouteLimitedTooLarge(text)) return undefined;
   // Preferred: the gateway's JSON 413 states it — {"code":"request_too_large",…,"max_request_bytes":33554432}.
   const field = /"(?:x_)?max_request_bytes"\s*:\s*"?(\d+)/i.exec(text);
   if (field) return positiveInt(field[1]);
@@ -714,6 +735,11 @@ export function limitFromBodyTooLarge(text: string): number | undefined {
  */
 export function describeRequestTooLarge(text: string | undefined, limitBytes: number): string | undefined {
   if (!isBodyTooLarge(text)) return undefined;
+  if (isRouteLimitedTooLarge(text)) {
+    const bound = routeLimitBytes(text ?? "");
+    const size = bound !== undefined ? `about ${formatSize(bound)}` : "a per-route limit";
+    return `${text} — the route serving this model accepts smaller request bodies (${size}) than the gateway does, so the request is out of budget for that route. This is the route's limit, not the gateway's; it is not learned and not resent. Reduce the attachments or use a model served on another route. Not retryable as-is.`;
+  }
   return `${text} — the model gateway rejected the request body as larger than its cap (about ${formatSize(limitBytes)}), so the request is out of budget. Older images and tool output are reduced automatically before sending; the newest message's attachments are what remains too big. Not retryable as-is.`;
 }
 
@@ -859,7 +885,9 @@ export function streamWithinRequestBudget<
             model.baseUrl !== undefined &&
             opts.config.maxBytes === undefined &&
             failure?.stopReason === "error" &&
-            isBodyTooLarge(failure.errorMessage)
+            isBodyTooLarge(failure.errorMessage) &&
+            // A route's bound is not the gateway's: never learned, never resent.
+            !isRouteLimitedTooLarge(failure.errorMessage)
           ) {
             // The gateway's stated cap when it gives one, never above what was
             // just refused (so the resend is always smaller); else 80% of it.
