@@ -12,7 +12,6 @@
 
 import assert from "node:assert/strict";
 import { before, test } from "node:test";
-import { streamSimple as openAiStreamSimple } from "@earendil-works/pi-ai/api/openai-completions";
 import { isRetryableAssistantError } from "@earendil-works/pi-ai/utils/retry";
 import { decideGatewayRetry, parseGatewayWait } from "../../src/gateway/signals.ts";
 import { classifyError } from "../../src/guard/transient.ts";
@@ -20,13 +19,17 @@ import {
   type BudgetContext,
   DEFAULT_REQUEST_BODY_HEADROOM,
   FALLBACK_MAX_REQUEST_BODY_BYTES,
+  type ImageResizer,
   REQUEST_LIMIT_HEADER,
   RequestBodyTooLargeError,
   advertisedRequestLimit,
   describeRequestTooLarge,
   estimateRequestBodyBytes,
   fitRequestBody,
+  formatSize,
+  limitFromBodyTooLarge,
   noteAdvertisedRequestLimit,
+  noteLearnedRequestLimit,
   noteRequestLimitHeader,
   requestBodyLimit,
   resetAdvertisedRequestLimits,
@@ -111,53 +114,96 @@ test("budget: an advertised cap (models listing or response header) replaces the
 
 // ─── Estimate ──────────────────────────────────────────────────────────────
 
-test("estimate: conservative and close to pi-ai's real openai-completions body", async () => {
-  const small = pngImage(640, 400, 60, 9);
-  const context = {
+/** A tool call whose arguments are quote/newline heavy: double-escaped on the wire. */
+const heavyWrite = {
+  role: "assistant",
+  content: [
+    {
+      type: "toolCall",
+      id: "call_1",
+      name: "write",
+      arguments: { path: "src/a.ts", content: 'const s = "quoted";\n\t'.repeat(20_000) },
+    },
+  ],
+  api: "openai-completions",
+  provider: "probe",
+  model: "m",
+  usage: {
+    input: 0,
+    output: 0,
+    cacheRead: 0,
+    cacheWrite: 0,
+    totalTokens: 0,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+  },
+  stopReason: "toolUse",
+  timestamp: 1,
+};
+
+function estimateContext() {
+  return {
     systemPrompt: "You are a careful engineer.".repeat(40),
     messages: [
-      user([{ type: "text", text: "look at this" }, small]),
-      assistant("I see a gradient."),
-      toolResult([{ type: "text", text: "x".repeat(20_000) }, pngImage(320, 200, 30, 10)]),
+      user([{ type: "text", text: "look at this" }, pngImage(640, 400, 60, 9)]),
+      heavyWrite,
+      { ...toolResult([{ type: "text", text: "x".repeat(20_000) }, pngImage(320, 200, 30, 10)]), toolCallId: "call_1" },
+      assistant("done"),
+      user([{ type: "text", text: 'and "this"\nplease' }]),
     ],
     tools: [
       {
-        name: "read",
-        description: "Read a file",
-        parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] },
+        name: "write",
+        description: "Write a file",
+        parameters: {
+          type: "object",
+          properties: { path: { type: "string" }, content: { type: "string" } },
+          required: ["path", "content"],
+        },
       },
     ],
   };
+}
+
+async function realPayloadBytes(api: string, context: unknown): Promise<number> {
+  const mod = (await import(`@earendil-works/pi-ai/api/${api}`)) as {
+    streamSimple: (m: unknown, c: unknown, o: unknown) => { result(): Promise<unknown> };
+  };
   const model = {
-    id: "vision-model",
+    id: api === "anthropic-messages" ? "claude-sonnet-4-5" : "vision-model",
     name: "v",
-    api: "openai-completions",
-    provider: "probe",
+    api,
+    provider: api === "anthropic-messages" ? "anthropic" : "probe",
     baseUrl: "http://127.0.0.1:9/v1",
     reasoning: false,
     input: ["text", "image"],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    contextWindow: 100_000,
+    contextWindow: 200_000,
     maxTokens: 1000,
   };
   let payload: unknown;
-  const stream = openAiStreamSimple(
-    model as never,
-    context as never,
-    {
+  await mod
+    .streamSimple(model, context, {
       apiKey: "k",
       onPayload: (params: unknown) => {
         payload = params;
         throw new Error("captured");
       },
-    } as never,
-  );
-  await stream.result();
-  assert.ok(payload, "pi-ai built its payload");
-  const actual = Buffer.byteLength(JSON.stringify(payload));
+    })
+    .result();
+  assert.ok(payload, `${api} built its payload`);
+  return Buffer.byteLength(JSON.stringify(payload));
+}
+
+test("estimate: never under the real body for openai-completions, anthropic-messages and openai-responses", async () => {
+  const context = estimateContext();
   const estimate = estimateRequestBodyBytes(context as never);
-  assert.ok(estimate >= actual, `estimate ${estimate} must not undercount the real ${actual}`);
-  assert.ok(estimate <= actual * 1.05 + 16_384, `estimate ${estimate} is too pessimistic vs ${actual}`);
+  for (const api of ["openai-completions", "anthropic-messages", "openai-responses"]) {
+    const actual = await realPayloadBytes(api, context);
+    assert.ok(estimate >= actual, `${api}: estimate ${estimate} must not undercount the real ${actual}`);
+    if (api === "openai-completions") {
+      assert.ok(estimate <= actual * 1.05 + 16_384, `estimate ${estimate} is too pessimistic vs ${actual}`);
+    }
+  }
 });
 
 // ─── Fitting ───────────────────────────────────────────────────────────────
@@ -310,7 +356,7 @@ test("a gateway 413 is permanent everywhere and explained", () => {
     assert.equal(infra.category, "INVALID_REQUEST", text);
     const described = describeRequestTooLarge(text, 10 * 1024 * 1024);
     assert.ok(described?.includes(text), "keeps the original text");
-    assert.match(described ?? "", /10 MiB/);
+    assert.match(described ?? "", /10\.0 MiB/);
     assert.equal(isRetryableAssistantError({ stopReason: "error", errorMessage: described } as never), false);
   }
   // A context-length 413 is still a context problem, not a body-size one.
@@ -346,6 +392,194 @@ test("budget: GET /models advertises the cap (listing field, per model, or heade
     const config = resolveRequestBodyBudgetConfig({});
     assert.equal(requestBodyLimit(config, { baseUrl: base, id: "a" }).maxBytes, 32 * 1024 * 1024, "listing field");
     assert.equal(requestBodyLimit(config, { baseUrl: base, id: "b" }).maxBytes, 16 * 1024 * 1024, "per-model field");
+  } finally {
+    server.close();
+    resetAdvertisedRequestLimits();
+  }
+});
+
+// ─── Review round: tool calls, protection, lossless downscale, trust, CPU ──
+
+test("fit: huge arguments of OLDER tool calls are trimmed, keeping a valid object shape", async () => {
+  const context = {
+    messages: [
+      user([{ type: "text", text: "write it" }]),
+      heavyWrite,
+      { ...toolResult([{ type: "text", text: "ok" }]), toolCallId: "call_1" },
+      assistant("written"),
+      user([{ type: "text", text: "thanks" }]),
+    ],
+  };
+  const snapshot = JSON.stringify(context);
+  const fit = await fitRequestBody(context as BudgetContext, 120_000);
+  assert.ok(fit.estimatedBytes <= 120_000);
+  assert.equal(JSON.stringify(context), snapshot);
+  const call = (fit.context.messages[1] as { content: Array<{ arguments: Record<string, string> }> }).content[0];
+  assert.deepEqual(Object.keys(call?.arguments ?? {}), ["path", "content"], "same keys");
+  assert.equal(call?.arguments.path, "src/a.ts", "small fields untouched");
+  assert.match(call?.arguments.content ?? "", /tool-call argument omitted to fit the request size limit/);
+  assert.ok(fit.actions.some((a) => a.includes("tool-call argument")));
+});
+
+test("fit: the user's prompt images outlive tool-result images across tool rounds", async () => {
+  const img = (seed: number) => pngImage(260, 260, 260, seed);
+  const promptImage = img(1);
+  const call = (id: string) => ({
+    ...assistant(""),
+    content: [{ type: "toolCall", id, name: "screenshot", arguments: {} }],
+    stopReason: "toolUse",
+  });
+  const context = {
+    messages: [
+      user([{ type: "text", text: "match this design" }, promptImage]),
+      call("a"),
+      { ...toolResult([img(2)]), toolCallId: "a" },
+      call("b"),
+      { ...toolResult([img(3)]), toolCallId: "b" },
+      call("c"),
+      { ...toolResult([img(4)]), toolCallId: "c" },
+    ],
+  };
+  const perImage = promptImage.data.length;
+  const fit = await fitRequestBody(context as BudgetContext, Math.floor(perImage * 2.6));
+  const out = fit.context.messages as Array<{ role: string; content: Array<{ type: string; data?: string }> }>;
+  const hasImage = (i: number) => out[i]?.content.some((b) => b.type === "image");
+  assert.equal(hasImage(0), true, "the prompt image is protected");
+  assert.equal(out[0]?.content[1]?.data, promptImage.data);
+  assert.equal(hasImage(6), true, "the latest turn is protected");
+  assert.equal(hasImage(2), false, "the oldest tool-result image goes first");
+});
+
+test("fit: images Pi already sized (<= 2000px) are left alone when the request fits", async () => {
+  const image = pngImage(1900, 1000, 40, 5);
+  const context = { messages: [user([{ type: "text", text: "look" }, image])] };
+  const fit = await fitRequestBody(context as BudgetContext, 64 * 1024 * 1024);
+  assert.equal(fit.context, context, "no copy, no re-encode");
+});
+
+test("fit: a larger image is downscaled losslessly (PNG stays PNG) and its coordinate note follows", async () => {
+  const noted = pngImage(2400, 1500, 20, 6);
+  const note =
+    "[Image: original 4800x3000, displayed at 2400x1500. Multiply coordinates by 2.00 to map to original image.]";
+  const pasted = pngImage(2880, 1800, 20, 7);
+  const context = {
+    messages: [
+      { ...toolResult([noted, { type: "text", text: note }]) },
+      assistant("seen"),
+      user([{ type: "text", text: "and this" }, pasted]),
+    ],
+  };
+  const snapshot = JSON.stringify(context);
+  const fit = await fitRequestBody(context as BudgetContext, 64 * 1024 * 1024);
+  assert.equal(JSON.stringify(context), snapshot);
+  const out = fit.context.messages as Array<{
+    content: Array<{ type: string; data?: string; mimeType?: string; text?: string }>;
+  }>;
+
+  const first = out[0]?.content ?? [];
+  assert.equal(first[0]?.mimeType, "image/png");
+  const firstMeta = extractMetadata(Buffer.from(first[0]?.data ?? "", "base64"));
+  assert.deepEqual([firstMeta.width, firstMeta.height], [1800, 1125]);
+  assert.equal(
+    first[1]?.text,
+    "[Image: original 4800x3000, displayed at 1800x1125. Multiply coordinates by 2.67 to map to original image.]",
+    "the existing note is rewritten against the new size",
+  );
+
+  const last = out[2]?.content ?? [];
+  assert.equal(last[1]?.mimeType, "image/png");
+  assert.equal(
+    last[2]?.text,
+    "[Image: original 2880x1800, displayed at 1800x1125. Multiply coordinates by 1.60 to map to original image.]",
+    "a note is added where there was none",
+  );
+});
+
+test("budget: advertised caps are clamped, a learned 413 cap wins, and a newer header beats an older listing", () => {
+  resetAdvertisedRequestLimits();
+  const config = resolveRequestBodyBudgetConfig({});
+  const base = "https://gw.example/v1";
+  noteAdvertisedRequestLimit(base, 1024);
+  assert.equal(advertisedRequestLimit(base), 1024 * 1024, "clamped up to 1 MiB");
+  noteAdvertisedRequestLimit(base, 1024 * 1024 * 1024);
+  assert.equal(advertisedRequestLimit(base), 64 * 1024 * 1024, "clamped down to 64 MiB");
+
+  noteAdvertisedRequestLimit(base, 16 * 1024 * 1024, "b");
+  noteRequestLimitHeader(base, { "x-inferweave-max-request-bytes": String(32 * 1024 * 1024) }, "b");
+  assert.equal(requestBodyLimit(config, { baseUrl: base, id: "b" }).maxBytes, 32 * 1024 * 1024, "newer header wins");
+
+  // A relayed header from a downstream gateway can overstate the cap of the
+  // gateway in front of it; a 413 is ground truth.
+  noteLearnedRequestLimit(base, 10 * 1024 * 1024);
+  assert.equal(requestBodyLimit(config, { baseUrl: base, id: "b" }).maxBytes, 10 * 1024 * 1024);
+  noteRequestLimitHeader(base, { "x-inferweave-max-request-bytes": String(32 * 1024 * 1024) }, "b");
+  assert.equal(requestBodyLimit(config, { baseUrl: base, id: "b" }).maxBytes, 10 * 1024 * 1024, "still the 413 cap");
+  resetAdvertisedRequestLimits();
+});
+
+test("sizes never contain a three-digit run (Pi's retry regex matches 500/502/...)", () => {
+  for (const bytes of [0, 999, 500_000, 5_020_000, 99.96 * 1024 * 1024, 150 * 1024 * 1024, 502 * 1024 * 1024, 5e11]) {
+    assert.doesNotMatch(formatSize(bytes), /\d{3}/, `${bytes} -> ${formatSize(bytes)}`);
+  }
+  const described = describeRequestTooLarge("413 request body too large: 15024502 > 10485760", 10 * 1024 * 1024);
+  assert.ok(described);
+  assert.equal(isRetryableAssistantError({ stopReason: "error", errorMessage: described } as never), false);
+});
+
+test("fit: a resizer failure is not cached forever", async () => {
+  let calls = 0;
+  const flaky: ImageResizer = async (bytes, mimeType, options) => {
+    calls++;
+    if (calls === 1) throw new Error("worker crashed");
+    const { resizeImage } = await import("@earendil-works/pi-coding-agent");
+    return resizeImage(bytes, mimeType, options);
+  };
+  const image = pngImage(2600, 1400, 10, 42);
+  const context = { messages: [user([{ type: "text", text: "x" }, image])] };
+  const first = await fitRequestBody(context as BudgetContext, 64 * 1024 * 1024, { resize: flaky });
+  assert.equal(first.context, context, "a failed re-encode keeps the original");
+  const second = await fitRequestBody(context as BudgetContext, 64 * 1024 * 1024, { resize: flaky });
+  assert.notEqual(second.context, context, "the next call tries again");
+});
+
+test("a 413's stated limit is used only when labelled as the limit", () => {
+  assert.equal(limitFromBodyTooLarge("413 request body too large (limit 10485760 bytes)"), 10_485_760);
+  assert.equal(limitFromBodyTooLarge("413 payload too large: max 10 MiB"), 10 * 1024 * 1024);
+  assert.equal(limitFromBodyTooLarge("413 request body of 15024502 bytes too large"), undefined);
+  assert.equal(limitFromBodyTooLarge("413 http: request body too large"), undefined);
+});
+
+// The Fry gateway's contract (inferweave-gateway #358).
+const FRY_413 =
+  '413 {"error":{"type":"inferweave_backpressure","code":"request_too_large","message":"request body too large","retryable":false,"action_code":"IW-ACT-REDUCE-INPUT","max_request_bytes":33554432}}';
+
+test("the gateway's JSON 413 is recognised, permanent, and states its cap", () => {
+  assert.equal(limitFromBodyTooLarge(FRY_413), 33_554_432);
+  assert.equal(limitFromBodyTooLarge('413 {"error":{"code":"request_too_large"}}'), undefined);
+  const bare = '413 {"error":{"code":"request_too_large","retryable":false}}';
+  assert.ok(describeRequestTooLarge(bare, 10 * 1024 * 1024), "the code alone is enough");
+  for (const text of [FRY_413, bare]) {
+    assert.equal(classifyError(new Error(text)).retryable, false, text);
+    assert.notEqual(parseGatewayWait({ text })?.retryable, true, text);
+    assert.equal(classifyInfraError(new Error(text)).category, "INVALID_REQUEST", text);
+    const described = describeRequestTooLarge(text, 10 * 1024 * 1024) ?? "";
+    assert.equal(isRetryableAssistantError({ stopReason: "error", errorMessage: described } as never), false);
+  }
+});
+
+test("budget: GET /models x_max_request_bytes (the gateway's extension field) is honoured", async () => {
+  const { createServer } = await import("node:http");
+  const { fetchGatewayModels } = await import("../../src/models/gatewayCatalog.ts");
+  resetAdvertisedRequestLimits();
+  const server = createServer((_req, res) => {
+    res.setHeader("content-type", "application/json");
+    res.end(JSON.stringify({ x_max_request_bytes: 32 * 1024 * 1024, data: [{ id: "a", ctx_per_request: 1000 }] }));
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const base = `http://127.0.0.1:${(server.address() as { port: number }).port}/v1`;
+    await fetchGatewayModels({ baseUrl: base });
+    assert.equal(advertisedRequestLimit(base, "a"), 32 * 1024 * 1024);
   } finally {
     server.close();
     resetAdvertisedRequestLimits();

@@ -60,7 +60,8 @@ const INVALID_PATTERNS =
 const CONTEXT_PATTERNS =
   /\b(context[_ -]?length|context[_ -]?exceeded|context[_ -]?window|maximum[_ -]?context|too[_ -]?many[_ -]?tokens|token[_ -]?budget|input[_ -]?too[_ -]?long|413|prompt[_ -]?is[_ -]?too[_ -]?long|context[_ -]?limit)\b/i;
 
-const BODY_TOO_LARGE = /request body too large|payload too large|request entity too large|body too large/i;
+const BODY_TOO_LARGE =
+  /request body too large|payload too large|request entity too large|body too large|\brequest_too_large\b/i;
 const CONTEXT_WORDING =
   /context[_ -]?(length|window|limit|exceeded)|maximum[_ -]?context|too[_ -]?many[_ -]?tokens|prompt[_ -]?is[_ -]?too[_ -]?long|input[_ -]?too[_ -]?long/i;
 

@@ -71,7 +71,7 @@ export function parseGatewayModels(payload: unknown): GatewayModelEntry[] {
     const contextTotal = num(row.ctx_total);
     const state = str(row.x_state) ?? str(row.state);
     const slots = typeof row.slots === "number" && Number.isFinite(row.slots) ? row.slots : undefined;
-    const maxRequestBytes = num(row.max_request_bytes);
+    const maxRequestBytes = num(row.x_max_request_bytes) ?? num(row.max_request_bytes);
     out.push({
       id,
       contextWindow,
@@ -130,7 +130,10 @@ export async function fetchGatewayModels(opts: FetchCatalogOptions): Promise<Gat
     // response header, a listing-level field, or per model. Recorded for the
     // live-path body guard (src/request/bodyBudget.ts).
     noteRequestLimitHeader(base, res.headers);
-    noteAdvertisedRequestLimit(base, (body as { max_request_bytes?: unknown } | null)?.max_request_bytes);
+    // `x_max_request_bytes` is the gateway's extension-field convention (like
+    // `x_context_window`); `max_request_bytes` is accepted as well.
+    const listing = body as { x_max_request_bytes?: unknown; max_request_bytes?: unknown } | null;
+    noteAdvertisedRequestLimit(base, listing?.x_max_request_bytes ?? listing?.max_request_bytes);
     for (const model of models) {
       if (model.maxRequestBytes !== undefined) noteAdvertisedRequestLimit(base, model.maxRequestBytes, model.id);
     }
