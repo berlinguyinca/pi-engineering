@@ -24,7 +24,14 @@
 import { type BudgetContext, type RequestBodyBudgetConfig, streamWithinRequestBudget } from "../request/bodyBudget.ts";
 import { type ThinkingOffConfig, streamWithThinkingPolicy } from "../request/thinkingPolicy.ts";
 
-type ModelLike = { baseUrl?: string; id?: string; api?: string; provider?: string; contextWindow?: number };
+type ModelLike = {
+  baseUrl?: string;
+  id?: string;
+  api?: string;
+  provider?: string;
+  contextWindow?: number;
+  maxTokens?: number;
+};
 import type { GatewayWaitInput, GatewayWaitSignal } from "./signals.ts";
 import {
   type AttemptStream,

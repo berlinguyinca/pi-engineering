@@ -25,15 +25,26 @@
  *
  * 1. Pi summarization requests (compaction, turn prefix, branch summary):
  *    thinking off. A summary is a transcription task; thinking buys nothing.
- * 2. Ordinary turns whose remaining output room (context window minus the
- *    estimated input) is under a threshold (32k tokens): thinking off, so a
+ * 2. Ordinary turns whose real output allowance is small: thinking off, so a
  *    near-full context still answers instead of spending its last tokens on
- *    reasoning nobody sees. Default on; a turn with room keeps thinking.
- * 3. A reply still cut at "length" with almost no visible text becomes a clear
- *    error instead of a one-word answer.
+ *    reasoning nobody sees. The allowance is the `max_tokens` pi-ai actually
+ *    puts in the payload — `min(maxTokens, window - input - safety)`, already
+ *    clamped by pi-ai — read inside `onPayload`; without one it is estimated as
+ *    `min(model.maxTokens, window - input)`. Threshold 16k tokens: pi-ai's own
+ *    "high" thinking budget and Pi's default compaction reserve, and above the
+ *    8–13k tokens these models were measured spending on hidden reasoning — an
+ *    allowance below it can be consumed by thinking alone. Default on; a turn
+ *    with room keeps thinking, and overriding a reasoning level the user set is
+ *    logged.
+ * 3. A reply cut at "length" with almost no visible text becomes a clear error
+ *    instead of a one-word answer — but ONLY when it spent the model's whole
+ *    `maxTokens`. A shorter (window-clamped) length stop is exactly what Pi's
+ *    own recovery handles (`isRecoverableLength`: output < model.maxTokens →
+ *    drop the message, compact, retry once), so it is left untouched.
  */
 
 import { estimateTokens } from "@earendil-works/pi-coding-agent";
+import { emitTelemetry } from "../telemetry/sink.ts";
 
 export interface ThinkingOffConfig {
   /** Thinking off for Pi summarization requests (PI_THINKING_OFF_SUMMARIES). */
@@ -51,7 +62,7 @@ export interface ThinkingOffConfig {
 export const DEFAULT_THINKING_OFF_CONFIG: ThinkingOffConfig = {
   summaries: true,
   lowOutputBudget: true,
-  lowOutputBudgetTokens: 32_768,
+  lowOutputBudgetTokens: 16_384,
   gatewayHosts: ["llm.metabolomics.us"],
   providers: ["metabolomics"],
 };
@@ -86,6 +97,7 @@ export interface ThinkingModel {
   provider?: string;
   baseUrl?: string;
   contextWindow?: number;
+  maxTokens?: number;
 }
 
 /** Is `model` served by a gateway known to accept `reasoning_effort: "none"`? */
@@ -133,17 +145,47 @@ function estimateInputTokens(context: ThinkingContext): number {
 
 export type ThinkingOffReason = "summarization" | "low-output-budget";
 
+/**
+ * @param allowance the provider-clamped output allowance (`max_tokens` from
+ *   the payload) when known; otherwise it is estimated.
+ */
 export function thinkingOffReason(
   model: ThinkingModel,
   context: ThinkingContext,
   config: ThinkingOffConfig,
+  allowance?: number,
 ): ThinkingOffReason | undefined {
   if (!acceptsThinkingOff(model, config)) return undefined;
   if (config.summaries && isSummarizationRequest(context)) return "summarization";
-  if (config.lowOutputBudget && model.contextWindow) {
-    const room = model.contextWindow - estimateInputTokens(context);
-    if (room < config.lowOutputBudgetTokens) return "low-output-budget";
+  if (config.lowOutputBudget) {
+    const room = allowance ?? estimatedAllowance(model, context);
+    if (room !== undefined && room < config.lowOutputBudgetTokens) return "low-output-budget";
   }
+  return undefined;
+}
+
+function estimatedAllowance(model: ThinkingModel, context: ThinkingContext): number | undefined {
+  // The window term may be zero or negative (an overfull context): that is the
+  // smallest allowance of all, not a missing one.
+  const window = model.contextWindow ? model.contextWindow - estimateInputTokens(context) : undefined;
+  const candidates = [model.maxTokens && model.maxTokens > 0 ? model.maxTokens : undefined, window].filter(
+    (n): n is number => typeof n === "number",
+  );
+  return candidates.length > 0 ? Math.min(...candidates) : undefined;
+}
+
+/** The output allowance pi-ai wrote into an openai-completions payload. */
+function payloadAllowance(payload: unknown): number | undefined {
+  const p = payload as { max_tokens?: unknown; max_completion_tokens?: unknown } | null;
+  const n = p?.max_tokens ?? p?.max_completion_tokens;
+  return typeof n === "number" && Number.isFinite(n) ? n : undefined;
+}
+
+/** A reasoning level the caller asked for, as it appears in the payload. */
+function requestedReasoning(payload: unknown): string | undefined {
+  const p = payload as { reasoning_effort?: unknown; chat_template_kwargs?: { enable_thinking?: unknown } } | null;
+  if (typeof p?.reasoning_effort === "string" && p.reasoning_effort !== "none") return p.reasoning_effort;
+  if (p?.chat_template_kwargs?.enable_thinking === true) return "on";
   return undefined;
 }
 
@@ -173,13 +215,20 @@ const VISIBLE_CHAR_LIMIT = 40;
 const MIN_HIDDEN_OUTPUT_TOKENS = 256;
 
 /**
- * Explain a reply cut at "length" that shows almost nothing: the model spent
- * its output allowance on hidden reasoning. Undefined for anything else.
+ * Explain a reply cut at "length" that shows almost nothing because the model
+ * spent its WHOLE output allowance (`maxTokens`) on hidden reasoning.
+ * Undefined for anything else — in particular for a length stop below
+ * `maxTokens`, which Pi recovers from itself (compact and retry), and when the
+ * allowance is unknown.
  * Carries "out of budget" (Pi's retry matcher treats it as final) and no
  * digits (which that matcher, lacking word boundaries, could catch).
  */
-export function describeHiddenReasoningTruncation(message: AssistantLike | undefined): string | undefined {
+export function describeHiddenReasoningTruncation(
+  message: AssistantLike | undefined,
+  maxTokens: number | undefined,
+): string | undefined {
   if (!message || message.stopReason !== "length") return undefined;
+  if (!maxTokens || maxTokens <= 0 || (message.usage?.output ?? 0) < maxTokens) return undefined;
   const blocks = Array.isArray(message.content) ? (message.content as Array<{ type?: string; text?: string }>) : [];
   const visible = blocks
     .filter((b) => b.type === "text")
@@ -216,21 +265,29 @@ export function streamWithThinkingPolicy<
 ): (model: M, context: C, options?: O) => AttemptLike<E, R> {
   return (model, context, options) => {
     if (!acceptsThinkingOff(model, config)) return base(model, context, options);
-    const reason = thinkingOffReason(model, context, config);
     const userHook = (options as { onPayload?: (payload: unknown, m: unknown) => unknown } | undefined)?.onPayload;
-    const effective = reason
-      ? ({
-          ...(options ?? {}),
-          onPayload: async (payload: unknown, m: unknown) => {
-            const off = applyThinkingOff(payload);
-            const next = await userHook?.(off, m);
-            return next === undefined ? off : next;
-          },
-        } as O)
-      : options;
+    // Decided inside onPayload, where the provider-clamped max_tokens — the
+    // real output allowance — is known.
+    const effective = {
+      ...(options ?? {}),
+      onPayload: async (payload: unknown, m: unknown) => {
+        const reason = thinkingOffReason(model, context, config, payloadAllowance(payload));
+        const edited = reason ? applyThinkingOff(payload) : payload;
+        const requested = requestedReasoning(payload);
+        if (reason === "low-output-budget" && requested) {
+          emitTelemetry({
+            level: "info",
+            key: "thinking-off:low-output-budget",
+            text: `Thinking off for this turn: reasoning "${requested}" overridden, only about ${payloadAllowance(payload) ?? "a few thousand"} output tokens are left, which hidden reasoning would use up.`,
+          });
+        }
+        const next = await userHook?.(edited, m);
+        return next === undefined ? edited : next;
+      },
+    } as O;
     const inner = base(model, context, effective);
     const explain = (message: R): R => {
-      const described = describeHiddenReasoningTruncation(message);
+      const described = describeHiddenReasoningTruncation(message, model.maxTokens);
       return described ? { ...message, stopReason: "error", errorMessage: described } : message;
     };
     return {

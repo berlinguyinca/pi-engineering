@@ -16,6 +16,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { isRecoverableLength } from "@earendil-works/pi-ai/utils/overflow";
 import { isRetryableAssistantError } from "@earendil-works/pi-ai/utils/retry";
 import { generateSummary } from "@earendil-works/pi-coding-agent";
 import {
@@ -23,8 +24,10 @@ import {
   describeHiddenReasoningTruncation,
   isSummarizationRequest,
   resolveThinkingOffConfig,
+  streamWithThinkingPolicy,
   thinkingOffReason,
 } from "../../src/request/thinkingPolicy.ts";
+import { setTelemetrySink } from "../../src/telemetry/sink.ts";
 
 const METABOLOMICS = {
   id: "qwen3.8-27b-modality-vision-quant-q8_k_xl",
@@ -65,7 +68,7 @@ test("config: summaries and low-budget turns default on; env can turn each off",
   const config = resolveThinkingOffConfig({});
   assert.equal(config.summaries, true);
   assert.equal(config.lowOutputBudget, true);
-  assert.equal(config.lowOutputBudgetTokens, 32_768);
+  assert.equal(config.lowOutputBudgetTokens, 16_384);
   assert.ok(config.gatewayHosts.includes("llm.metabolomics.us"));
   assert.ok(config.providers.includes("metabolomics"));
 
@@ -99,11 +102,20 @@ test("policy: summarization on the metabolomics gateway → thinking off; elsewh
   );
 });
 
-test("policy: an ordinary turn keeps thinking unless the output room left is small", () => {
+test("policy: an ordinary turn keeps thinking unless its real output allowance is small", () => {
   const config = resolveThinkingOffConfig({});
   assert.equal(thinkingOffReason(METABOLOMICS, { messages: [user("hi")] }, config), undefined);
-  // ~240k tokens of input in a 262k window: under 32k left for thinking + answer.
-  const nearFull = { messages: [user("word ".repeat(240_000))] };
+  // The provider-clamped max_tokens from the payload is the real allowance.
+  assert.equal(thinkingOffReason(METABOLOMICS, { messages: [user("hi")] }, config, 12_000), "low-output-budget");
+  assert.equal(thinkingOffReason(METABOLOMICS, { messages: [user("hi")] }, config, 30_000), undefined);
+  // Without a payload value: min(model.maxTokens, window - input). ~250k
+  // tokens of input in a 262k window leaves ~12k.
+  const nearFull = { messages: [user("word ".repeat(200_000))] };
+  // A small model.maxTokens is an allowance too, whatever the window says.
+  assert.equal(
+    thinkingOffReason({ ...METABOLOMICS, maxTokens: 8_192 }, { messages: [user("hi")] }, config),
+    "low-output-budget",
+  );
   assert.equal(thinkingOffReason(METABOLOMICS, nearFull, config), "low-output-budget");
   assert.equal(thinkingOffReason(ELSEWHERE, nearFull, config), undefined);
   assert.equal(
@@ -133,21 +145,74 @@ test("payload: reasoning_effort 'none' (never 'minimal'), and the chat-template 
   assert.equal(original.reasoning_effort, "high", "the payload is copied, not mutated");
 });
 
-test("a 'length' stop with almost no visible text is explained, not shown as 'The'", () => {
-  const cut = {
+test("a 'length' stop Pi can recover from is left alone for Pi's compact-and-retry", () => {
+  // Near the window pi-ai clamps max_tokens below model.maxTokens; Pi's
+  // isRecoverableLength (output < model.maxTokens) then compacts and retries.
+  const clamped = {
     role: "assistant",
     stopReason: "length",
     content: [{ type: "text", text: "The" }],
     usage: { input: 240_000, output: 13_107 },
   };
-  const explained = describeHiddenReasoningTruncation(cut);
+  assert.equal(describeHiddenReasoningTruncation(clamped, 32_768), undefined);
+  assert.equal(isRecoverableLength(clamped as never, 32_768), true);
+  assert.equal(describeHiddenReasoningTruncation(clamped, undefined), undefined, "unknown allowance: leave it");
+});
+
+test("a 'length' stop that spent the WHOLE allowance with almost no visible text is explained", () => {
+  const cut = {
+    role: "assistant",
+    stopReason: "length",
+    content: [{ type: "text", text: "The" }],
+    usage: { input: 20_000, output: 32_768 },
+  };
+  assert.equal(isRecoverableLength(cut as never, 32_768), false, "Pi will not recover this one");
+  const explained = describeHiddenReasoningTruncation(cut, 32_768);
   assert.ok(explained);
   assert.match(explained, /hidden reasoning/i);
   assert.equal(isRetryableAssistantError({ stopReason: "error", errorMessage: explained } as never), false);
   assert.doesNotMatch(explained, /\d{3}/, "no digit runs Pi's retry matcher could catch");
 
   const real = { ...cut, content: [{ type: "text", text: "A full paragraph of real answer text that was cut off." }] };
-  assert.equal(describeHiddenReasoningTruncation(real), undefined);
-  assert.equal(describeHiddenReasoningTruncation({ ...cut, stopReason: "stop" }), undefined);
-  assert.equal(describeHiddenReasoningTruncation({ ...cut, usage: { input: 10, output: 3 } }), undefined);
+  assert.equal(describeHiddenReasoningTruncation(real, 32_768), undefined);
+  assert.equal(describeHiddenReasoningTruncation({ ...cut, stopReason: "stop" }, 32_768), undefined);
+});
+
+test("overriding a reasoning level the user set, for a small allowance, is logged", async () => {
+  const notices: string[] = [];
+  const uninstall = setTelemetrySink((n) => notices.push(n.text));
+  try {
+    let sent: Record<string, unknown> | undefined;
+    const base = (_m: unknown, _c: unknown, options?: { onPayload?: (p: unknown, m: unknown) => unknown }) => ({
+      async *[Symbol.asyncIterator]() {},
+      result: async () => {
+        sent = (await options?.onPayload?.({ max_tokens: 9_000, reasoning_effort: "high" }, METABOLOMICS)) as never;
+        return { stopReason: "stop" };
+      },
+    });
+    const wrapped = streamWithThinkingPolicy(base as never, resolveThinkingOffConfig({}));
+    await wrapped(METABOLOMICS, { systemPrompt: "You are Pi.", messages: [user("hi")] }, {} as never).result();
+    assert.equal(sent?.reasoning_effort, "none");
+    assert.equal(notices.length, 1);
+    assert.match(notices[0] ?? "", /reasoning "high" overridden/);
+
+    // Room to spare: the user's level stands and nothing is logged.
+    notices.length = 0;
+    const roomy = (_m: unknown, _c: unknown, options?: { onPayload?: (p: unknown, m: unknown) => unknown }) => ({
+      async *[Symbol.asyncIterator]() {},
+      result: async () => {
+        sent = (await options?.onPayload?.({ max_tokens: 32_768, reasoning_effort: "high" }, METABOLOMICS)) as never;
+        return { stopReason: "stop" };
+      },
+    });
+    await streamWithThinkingPolicy(roomy as never, resolveThinkingOffConfig({}))(
+      METABOLOMICS,
+      { systemPrompt: "You are Pi.", messages: [user("hi")] },
+      {} as never,
+    ).result();
+    assert.equal(sent?.reasoning_effort, "high");
+    assert.deepEqual(notices, []);
+  } finally {
+    uninstall();
+  }
 });

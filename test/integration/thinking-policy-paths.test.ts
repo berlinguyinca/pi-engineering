@@ -14,6 +14,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { streamSimple as openAiStreamSimple } from "@earendil-works/pi-ai/api/openai-completions";
+import { isRecoverableLength } from "@earendil-works/pi-ai/utils/overflow";
 import { ModelRegistry, ModelRuntime, generateSummary } from "@earendil-works/pi-coding-agent";
 import { installGatewayStreamRetry, resetGatewayStreamRetry } from "../../src/gateway/installStreamRetry.ts";
 import { resolveThinkingOffConfig } from "../../src/request/thinkingPolicy.ts";
@@ -183,40 +184,55 @@ test("worker: the guarded runtime sends thinking off for summarization too", asy
   });
 });
 
-test("interactive: a turn cut at 'length' after one word of hidden-reasoning spend is explained", async () => {
-  await withDir(async (dir) => {
-    const cutOff = () => {
-      const s = createAssistantMessageEventStream();
-      const message = {
-        role: "assistant",
-        content: [{ type: "text", text: "The" }],
-        api: API,
-        provider: METABOLOMICS.provider,
-        model: METABOLOMICS.id,
-        usage: {
-          input: 240_000,
-          output: 13_107,
-          cacheRead: 0,
-          cacheWrite: 0,
-          totalTokens: 253_107,
-          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-        },
-        stopReason: "length",
-        timestamp: 1,
-      };
-      queueMicrotask(() => {
-        s.push({ type: "start", partial: { ...message, content: [] } } as never);
-        s.push({ type: "text_delta", contentIndex: 0, delta: "The", partial: message } as never);
-        s.push({ type: "done", reason: "length", message } as never);
-      });
-      return s;
+function cutOffProvider(output: number) {
+  return () => {
+    const s = createAssistantMessageEventStream();
+    const message = {
+      role: "assistant",
+      content: [{ type: "text", text: "The" }],
+      api: API,
+      provider: METABOLOMICS.provider,
+      model: METABOLOMICS.id,
+      usage: {
+        input: 20_000,
+        output,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: 20_000 + output,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      },
+      stopReason: "length",
+      timestamp: 1,
     };
-    const runtime = await interactiveRuntime(dir, METABOLOMICS, cutOff as never);
-    const result = await runtime
-      .streamSimple(METABOLOMICS as never, { messages: [{ role: "user", content: "hi", timestamp: 1 }] } as never, {
-        apiKey: "k",
-      })
-      .result();
+    queueMicrotask(() => {
+      s.push({ type: "start", partial: { ...message, content: [] } } as never);
+      s.push({ type: "text_delta", contentIndex: 0, delta: "The", partial: message } as never);
+      s.push({ type: "done", reason: "length", message } as never);
+    });
+    return s;
+  };
+}
+
+async function cutOffResult(dir: string, output: number) {
+  const runtime = await interactiveRuntime(dir, METABOLOMICS, cutOffProvider(output) as never);
+  return runtime
+    .streamSimple(METABOLOMICS as never, { messages: [{ role: "user", content: "hi", timestamp: 1 }] } as never, {
+      apiKey: "k",
+    })
+    .result();
+}
+
+test("interactive: a clamped 'length' stop reaches Pi unchanged, so its compact-and-retry still fires", async () => {
+  await withDir(async (dir) => {
+    const result = await cutOffResult(dir, 13_107);
+    assert.equal(result.stopReason, "length");
+    assert.equal(isRecoverableLength(result, METABOLOMICS.maxTokens), true, "Pi's own recovery applies");
+  });
+});
+
+test("interactive: a 'length' stop that spent the whole allowance on hidden reasoning is explained", async () => {
+  await withDir(async (dir) => {
+    const result = await cutOffResult(dir, METABOLOMICS.maxTokens);
     assert.equal(result.stopReason, "error");
     assert.match(result.errorMessage ?? "", /hidden reasoning/i);
   });
