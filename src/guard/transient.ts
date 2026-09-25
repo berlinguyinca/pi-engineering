@@ -20,6 +20,7 @@ import {
   isFlattenedInferWeaveRefusal,
   isGatewayAdmissionRefusal,
   isGatewayLinkCut,
+  isTransportDrop,
 } from "../gateway/signals.ts";
 import { PERMANENT_ADMISSION_STATUSES } from "../inference/admissionContract.ts";
 
@@ -191,6 +192,8 @@ export function classifyError(error: unknown): ErrorClass {
   // head), so without this it fell through to "permanent" and workers gave up.
   if (
     (status == null && isGatewayLinkCut(raw)) ||
+    // undici's "terminated" / "other side closed": a restart cut the socket.
+    (status == null && isTransportDrop(raw)) ||
     has(
       "econnreset",
       "econnrefused",
