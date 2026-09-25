@@ -10,6 +10,7 @@ import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-c
 import { resolveMemoryEnvironment } from "../src/blackhole/connectionSetup.ts";
 import { openVikingBlackholeOption } from "../src/blackhole/envConfig.ts";
 import { registerInteractiveMemory } from "../src/blackhole/interactiveMemory.ts";
+import { registerAutoCompaction } from "../src/compaction/autoTune.ts";
 import { type InferweaveProvider, createInferweaveProvider, inferweaveConfigFromEnv } from "../src/context/provider.ts";
 import { contextReading, planModelSwitch } from "../src/context/usage.ts";
 import { sharedAdmissionController, sharedGatewayConfig } from "../src/gateway/config.ts";
@@ -714,6 +715,16 @@ ${RECOVERY_PROMPT}`;
       ctx.ui.notify(lines.join("\n"), "info");
     },
   });
+  // Per-model compaction tuning (src/compaction/autoTune.ts): Pi's own
+  // compaction, triggered and cut for the active model's window and output
+  // allowance, without ever writing the user's settings. PI_AUTO_COMPACTION=0
+  // turns it off; a value the user set in Pi's settings always wins.
+  if (typeof pi.on === "function") {
+    registerAutoCompaction(pi as never, {
+      enabled: !/^(0|false|off|no)$/i.test(process.env.PI_AUTO_COMPACTION ?? ""),
+    });
+  }
+
   if (gatewayConfig.enabled && typeof pi.on === "function") {
     const admission = sharedAdmissionController();
 
