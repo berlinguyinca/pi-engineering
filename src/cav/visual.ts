@@ -10,7 +10,7 @@
  */
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import type { Browser } from "playwright";
+import type { Browser, Page } from "playwright";
 import { PNG } from "pngjs";
 
 export interface GoldenCompareOptions {
@@ -47,6 +47,28 @@ function pixelDiff(a: Buffer, b: Buffer, w: number, h: number): { diff: number; 
     if (a[i] !== b[i] || a[i + 1] !== b[i + 1] || a[i + 2] !== b[i + 2]) diff++;
   }
   return { diff, total: w * h };
+}
+
+/**
+ * Capture a screenshot with retry to handle intermittent Playwright protocol
+ * errors (e.g. "Protocol error (Page.captureScreenshot): Unable to capture
+ * screenshot") that can occur under concurrent resource pressure.
+ */
+async function captureScreenshot(page: Page, path: string, maxRetries = 3): Promise<void> {
+  let lastErr: unknown;
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      await page.screenshot({ path });
+      return;
+    } catch (err) {
+      lastErr = err;
+      if (attempt < maxRetries - 1) {
+        // Brief pause before retry to let the compositor settle.
+        await new Promise((r) => setTimeout(r, 100 * (attempt + 1)));
+      }
+    }
+  }
+  throw lastErr;
 }
 
 /**
@@ -93,7 +115,7 @@ export async function compareToGolden(opts: GoldenCompareOptions): Promise<Golde
     context = await browser.newContext({ viewport: opts.viewport ?? { width: 1280, height: 800 } });
     page = await context.newPage();
     await page.goto(opts.url, { waitUntil: "load", timeout: 30000 });
-    await page.screenshot({ path: capturePath });
+    await captureScreenshot(page, capturePath);
     const fresh = await readFile(capturePath);
     const gd = decodePng(golden);
     const fd = decodePng(fresh);
