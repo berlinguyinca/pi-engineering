@@ -839,7 +839,7 @@ ${RECOVERY_PROMPT}`;
           onProgress: () => {
             fallbackCoordinator.onProgress();
           },
-          onHold: (_info, actualModel) => {
+          onHold: (info, actualModel) => {
             // Checked on a hold rather than on failure: by the time a turn
             // fails the operator has already spent the wait this avoids. The
             // in-flight request is left alone — a switch applies to the next
@@ -853,7 +853,11 @@ ${RECOVERY_PROMPT}`;
             // the coordinator's count and pending flag; the fallback itself is
             // applied later from a fresh lifecycle callback.
             const callModel = actualModel as Model<any>;
-            fallbackCoordinator.onGatewayHold({ modelId: callModel.id, provider: callModel.provider });
+            fallbackCoordinator.onGatewayHold({
+              modelId: callModel.id,
+              provider: callModel.provider,
+              source: info.signal.source,
+            });
           },
           maxAttempts: gatewayConfig.maxRetries + 1,
           maxElapsedMs: gatewayConfig.maxElapsedMs,

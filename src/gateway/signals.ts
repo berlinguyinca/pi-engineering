@@ -174,11 +174,19 @@ export function flattenedInferWeaveRefusalCode(text: string | undefined): string
  * cause), "socket hang up", ECONNRESET / UND_ERR_SOCKET, or "fetch failed"
  * (connection refused while a gateway restarts). Observed: every "Error:
  * terminated" coincided with a gateway restart whose drain grace cut a long
- * in-flight stream. Anchored at the start of the text (after an optional
- * "Error:"/"TypeError:"), so prose that mentions the word is not a drop.
+ * in-flight stream. The OpenAI SDK's "Connection error." (APIConnectionError)
+ * is what a retry sees while the restarting gateway's listener is still
+ * closed. Anchored at the start of the text (after an optional
+ * "Error:"/"TypeError:"), so prose that mentions the words is not a drop.
  */
 const TRANSPORT_DROP =
-  /^\s*(?:(?:type)?error:\s*)?(?:terminated|other side closed|socket hang up|fetch failed|(?:read\s+)?econnreset|und_err_socket)\b/i;
+  /^\s*(?:(?:type)?error:\s*)?(?:terminated|other side closed|socket hang up|fetch failed|(?:read\s+)?econnreset|und_err_socket|connection error)\b/i;
+
+/**
+ * Transport failures that are NOT a restart: DNS (ENOTFOUND, EAI_AGAIN) and
+ * TLS/certificate errors mean a misconfigured endpoint, which no wait fixes.
+ */
+const PERMANENT_TRANSPORT = /\b(?:enotfound|eai_again|certificate|ssl|tls)\b/i;
 
 /**
  * Waits for a transport drop: a gateway restart takes ~40-80s, so the ladder
@@ -196,6 +204,7 @@ export function isTransportDrop(text: string | undefined): boolean {
   if (!text || !TRANSPORT_DROP.test(text)) return false;
   if (/inferweave_backpressure|inference_admission/i.test(text)) return false;
   if (NON_RETRYABLE_PATTERNS.test(text)) return false;
+  if (PERMANENT_TRANSPORT.test(text)) return false;
   if (embeddedJson(text) !== undefined) return false;
   return errorTextStatus(text) === undefined;
 }

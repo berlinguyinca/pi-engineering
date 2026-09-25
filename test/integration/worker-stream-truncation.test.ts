@@ -209,3 +209,25 @@ test("worker: a connection cut before any tool ran (undici 'terminated') is retr
   );
   assert.equal(requests, 2, "one cut attempt, one fresh retry");
 });
+
+/** The restarting gateway accepts the connection and closes it before any head. */
+const closedBeforeHead: Reply = (res) => {
+  res.socket?.destroy();
+};
+
+test("worker: a connection closed before any response head is retried (SDK 'Connection error.')", async () => {
+  const requests = await withProbe(
+    [closedBeforeHead, toolCalls([{ name: "worker_result", args: WORKER_RESULT }])],
+    async (executor, cwd) => {
+      const run = await executor.run({
+        role: "implementer",
+        task: "t",
+        tools: [],
+        cwd,
+        modelOverride: { provider: "probe", id: "probe-model" },
+      });
+      assert.equal(run.result.status, "completed", run.result.summary);
+    },
+  );
+  assert.equal(requests, 2);
+});

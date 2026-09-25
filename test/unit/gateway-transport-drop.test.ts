@@ -34,6 +34,11 @@ const DROPS = [
   "UND_ERR_SOCKET: other side closed",
   "fetch failed",
   "fetch failed: connect ECONNREFUSED 10.0.0.5:8081",
+  // The OpenAI SDK's APIConnectionError when a retry hits the closed listener
+  // of a gateway that is still restarting.
+  "Connection error.",
+  "Error: Connection error.",
+  "connection error",
 ];
 
 // ─── Signal ─────────────────────────────────────────────────────────────────
@@ -66,6 +71,16 @@ test("transport drop: fails closed when a status or body envelope is present", (
     { text: "The worker was terminated by policy" },
     { text: "Request was aborted" },
     { text: "This operation was aborted" },
+    { text: "401 Connection error." },
+    { text: 'Connection error. {"error":{"message":"denied"}}' },
+    { text: "The upstream reported a connection error while loading" },
+    // Permanent misconfiguration, not a restart: DNS and TLS failures.
+    { text: "fetch failed: getaddrinfo ENOTFOUND gateway.invalid" },
+    { text: "fetch failed (cause: getaddrinfo EAI_AGAIN gateway)" },
+    { text: "fetch failed: unable to verify the first certificate" },
+    { text: "fetch failed: self-signed certificate in certificate chain" },
+    { text: "fetch failed: SSL routines:ssl3_get_record:wrong version number" },
+    { text: "fetch failed: Client network socket disconnected before secure TLS connection was established" },
   ];
   for (const n of negatives) assert.equal(transportDropWait(n), null, JSON.stringify(n));
 });
@@ -161,6 +176,24 @@ test("pump: [start, error(terminated)] is retried with exactly one start, on a c
     { ms: 2_000, scope: "caller" },
     { ms: 5_000, scope: "caller" },
   ]);
+  assert.equal(outcome.settled, "ok");
+});
+
+test('pump: a restart window chains terminated → "Connection error." → success', async () => {
+  const s = scripted([[start(), failed("terminated")], [failed("Connection error.")], [start(), text("back"), done()]]);
+  const out = sink();
+  const holds: number[] = [];
+  const outcome = await pumpWithGatewayRetry(s.open, out, {
+    hold: async (signal) => {
+      holds.push(signal.retryAfterMs);
+    },
+  });
+  assert.equal(s.opened, 3);
+  assert.deepEqual(holds, [2_000, 5_000], "one escalating ladder across both wordings");
+  assert.deepEqual(
+    out.pushed.map((e) => e.type),
+    ["start", "text_delta", "done"],
+  );
   assert.equal(outcome.settled, "ok");
 });
 

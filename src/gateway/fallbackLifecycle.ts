@@ -24,6 +24,7 @@
 import type { Model } from "@earendil-works/pi-ai/compat";
 import type { ModelHealthProvider } from "../models/health.ts";
 import { type FallbackCandidate, chooseFallbackModel } from "./fallback.ts";
+import type { GatewayWaitSignal } from "./signals.ts";
 
 /** Consecutive gateway holds before a stand-in is considered. */
 export const FALLBACK_AFTER_HOLDS = 3;
@@ -63,7 +64,12 @@ export class FallbackCoordinator {
    * Idempotent past the threshold: repeated holds while a fallback is already
    * pending re-arm nothing and cannot turn one pending fallback into several.
    */
-  onGatewayHold(info: { modelId?: string; provider?: string } = {}): void {
+  onGatewayHold(info: { modelId?: string; provider?: string; source?: GatewayWaitSignal["source"] } = {}): void {
+    // A connection problem is not a model problem: a transport drop (the
+    // gateway restarting under the stream) or a link cut (retried on a fresh
+    // route) says nothing about this model's capacity, so it neither counts
+    // toward a switch nor ends a run of saturation holds.
+    if (info.source === "transport-drop" || info.source === "link-cut") return;
     this.consecutiveHolds++;
     if (this.consecutiveHolds >= this.afterHolds && !this.fallbackPending) {
       this.fallbackPending = true;

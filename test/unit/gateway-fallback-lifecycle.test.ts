@@ -171,6 +171,28 @@ test("coordinator: a stream producing output resets the consecutive-hold run", (
   assert.equal(c.hasPending, false, "a single hold after progress does not arm a fallback");
 });
 
+test("coordinator: transport drops and link cuts never arm a model fallback", () => {
+  // A routine gateway restart yields 2s/5s/10s transport-drop holds; switching
+  // the operator's model is no answer to a connection problem. The same holds
+  // for a link cut, whose retry is routed afresh.
+  for (const source of ["transport-drop", "link-cut"] as const) {
+    const c = new FallbackCoordinator();
+    for (let i = 0; i < FALLBACK_AFTER_HOLDS + 2; i++) c.onGatewayHold({ source });
+    assert.equal(c.hasPending, false, source);
+    assert.equal(c.holds, 0, `${source} holds are not counted`);
+  }
+});
+
+test("coordinator: gateway saturation holds still count, a drop in between neither counts nor resets", () => {
+  const c = new FallbackCoordinator();
+  c.onGatewayHold({ source: "default" });
+  c.onGatewayHold({ source: "transport-drop" });
+  c.onGatewayHold({ source: "body" });
+  assert.equal(c.holds, 2);
+  c.onGatewayHold({ source: "default" });
+  assert.equal(c.hasPending, true, "three 503/429 holds arm the fallback as before");
+});
+
 test("T5: many holds produce at most one pending fallback, claimed exactly once", () => {
   const c = new FallbackCoordinator();
   for (let i = 0; i < 10; i++) c.onGatewayHold();
