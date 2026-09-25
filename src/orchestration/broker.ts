@@ -85,6 +85,8 @@ export interface AgentRunner {
     objective: string;
     contextRef?: string;
     worktree?: string | null;
+    /** True only when `worktree` is one this broker allocated for the run. */
+    isolatedWorktree?: boolean;
     modelRequirements?: Record<string, unknown>;
     signal: AbortSignal;
   }): Promise<ExecutionOutcome>;
@@ -310,16 +312,19 @@ export class ExecutionBroker {
     const base = missionId
       ? this.store.getMission(missionId)?.base_ref?.trim() || this.resolvedBases.get(missionId)
       : undefined;
-    // A worker that already committed directly onto its worker branch leaves a
-    // clean working tree, but the branch has advanced past the mission base —
-    // that IS the work landing, not "nothing to harvest". Compare the branch
-    // TIP to the base commit rather than trusting a clean tree as "empty".
+    // A worker that already committed directly onto its worker branch has
+    // advanced it past the mission base — that IS the work landing, not
+    // "nothing to harvest". Compare the branch TIP to the base commit rather
+    // than trusting a clean tree as "empty". Being ahead does NOT end the
+    // harvest: a worker that commits as it goes can still leave its last step
+    // uncommitted, and returning here dropped that step with the worktree.
+    // (Timeout recovery is unaffected: its ref is captured before this runs,
+    // so this harvest commit is still excluded from a recovered merge.)
+    let ahead = false;
     if (base) {
       try {
-        if (await this.git.branchAheadOf(base, wt.branch)) {
-          if (missionId) this.committedWork.set(missionId, true);
-          return true;
-        }
+        ahead = await this.git.branchAheadOf(base, wt.branch);
+        if (ahead && missionId) this.committedWork.set(missionId, true);
       } catch {
         // Fall through to the status-based harvest below.
       }
@@ -328,9 +333,11 @@ export class ExecutionBroker {
     try {
       status = (await this.git.statusIn(wt.path)).trim();
     } catch {
-      // Could not even read the worktree status; treat as no harvestable work.
-      return false;
+      // Could not even read the worktree status: the worker's own commits are
+      // still harvestable work; nothing else can be said.
+      return ahead;
     }
+    if (status.length === 0 && ahead) return true;
     if (status.length === 0) {
       // A mutating worker reported SUCCESS but produced nothing to commit.
       // Without this, the mission surfaces only the later opaque "Integration
@@ -681,6 +688,7 @@ export class ExecutionBroker {
           objective: input.objective,
           contextRef: input.contextRef,
           worktree: base.worktree,
+          isolatedWorktree: worktree !== null,
           modelRequirements: input.modelRequirements,
           signal,
         });
