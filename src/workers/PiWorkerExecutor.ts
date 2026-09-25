@@ -33,9 +33,12 @@ import {
   type GatewayWaitSignal,
   decideGatewayRetry,
   decideTransientHandover,
+  escalateSyntheticWait,
+  gatewayFailureMarker,
   gatewayHoldScope,
   parseGatewayWait,
 } from "../gateway/signals.ts";
+import { MAX_ESCALATED_WAIT_MS } from "../gateway/streamRetry.ts";
 import { GenerationGuard, type GuardAbortReason } from "../guard/GenerationGuard.ts";
 import { TOOL_TRANSITION_RULE } from "../guard/RecoveryController.ts";
 import {
@@ -337,8 +340,13 @@ ${TOOL_TRANSITION_RULE}`;
     // the interactive turn does (gatewayHoldScope). Without provider/model a
     // model-scoped signal fell back to the process-wide cooldown, and a link
     // cut must not arm any shared cooldown at all.
+    //
+    // A flattened refusal's wait is synthesized, so it escalates like the
+    // interactive pump's: a flat 5s x maxRetries gave up on a model_activating
+    // warm-up that outlasts ~40s.
     const holdForGateway = (signal: GatewayWaitSignal): Promise<number> => {
-      const scoped = { ...signal, provider: model.provider, model: model.id };
+      const paced = signal.flattened ? escalateSyntheticWait(signal, gatewayRetries, MAX_ESCALATED_WAIT_MS) : signal;
+      const scoped = { ...paced, provider: model.provider, model: model.id };
       return gatewayHoldScope(scoped) === "caller"
         ? admission.noteCallerWaitAndSleep(scoped)
         : admission.noteWaitAndSleep(scoped);
@@ -595,7 +603,7 @@ ${TOOL_TRANSITION_RULE}`;
           : timedOut
             ? "timeout"
             : gateway
-              ? `gateway:${gateway.reason ?? gateway.type ?? gateway.status ?? "rate-limited"}`
+              ? gatewayFailureMarker(gateway)
               : isTruncatedStream(lastAssistantError)
                 ? "truncated_after_progress"
                 : (lastAssistantError ?? "no-result");
