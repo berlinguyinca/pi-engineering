@@ -1178,6 +1178,7 @@ function buildCompactedWorkerPrompt(req: WorkerRequest, recoveryPrompt: string |
   // Base rules (kept short — the model already knows its role).
   parts.push(`Rules:`);
   parts.push(`- Use the available tools; never guess APIs or signatures.`);
+  parts.push(`- Commit your work on the current branch after each coherent change; only your own commits survive a session termination (uncommitted edits are not merged).`);
   parts.push(`- Your final action MUST be calling the worker_result tool.`);
   parts.push(`- Do not ask questions. Do not emit an assistant answer after calling worker_result.`);
 

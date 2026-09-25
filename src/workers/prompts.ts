@@ -45,6 +45,27 @@ Rules:
 `;
 
 /**
+ * Roles whose deliverable is repository edits made in an isolated worktree.
+ * These workers must commit their own progress: the session can be killed by
+ * the wall-clock budget at any moment, and only the WORKER'S OWN commits are
+ * recovered after a timeout — the harvest auto-commit of uncommitted edits is
+ * treated as incomplete and is deliberately NOT integrated (see broker
+ * recovery, "recover only the worker's own commits").
+ */
+const MUTATING_ROLES: ReadonlySet<WorkerRole> = new Set<WorkerRole>([
+  "implementer",
+  "debugger",
+  "test-generator",
+  "clean-room-challenger",
+]);
+
+const COMMIT_DISCIPLINE = `\
+Commit discipline (isolated worktree):
+- Commit your work on the current branch after EVERY coherent unit of change (a working piece, not the whole task at once). If your task involves an iterate/verify loop, commit after each completed loop iteration.
+- Your session can be terminated by a wall-clock budget at any time. Only your own commits survive: uncommitted edits are captured once at termination, treated as incomplete, and are NOT merged.
+- Never leave the session with a large uncommitted delta; commit the last coherent state as soon as you have one.`;
+
+/**
  * Build the system prompt for a worker.
  * `task` and optional `context` are injected; the worker is told to finish with
  * `worker_result`.
@@ -63,6 +84,7 @@ export function buildSystemPrompt(role: WorkerRole, task: string, context?: stri
   }
   parts.push("");
   parts.push(BASE_RULES);
+  if (MUTATING_ROLES.has(role)) parts.push(COMMIT_DISCIPLINE);
   return parts.join("\n");
 }
 
