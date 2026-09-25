@@ -51,7 +51,9 @@ import { isContextOverflow, isRetryableAssistantError } from "@earendil-works/pi
 import { isBodyTooLarge } from "../request/bodyBudget.ts";
 import { isSummarizationRequest } from "../request/thinkingPolicy.ts";
 import { emitTelemetry } from "../telemetry/sink.ts";
+import { parseGatewayElapsedMs } from "./config.ts";
 import { isGatewayLinkCut } from "./signals.ts";
+import { DEFAULT_GATEWAY_MAX_ELAPSED_MS } from "./streamRetry.ts";
 
 // ─── Schedule ──────────────────────────────────────────────────────────────
 
@@ -75,7 +77,7 @@ export const DEFAULT_AFTER_OUTPUT_SCHEDULE: LongWaitScheduleOptions = {
   baseMs: 2_000,
   capMs: 3 * 60 * 1000,
   jitter: 0.2,
-  horizonMs: 12 * 60 * 60 * 1000,
+  horizonMs: DEFAULT_GATEWAY_MAX_ELAPSED_MS,
 };
 
 export function longWaitSchedule(options: LongWaitScheduleOptions): RetrySchedule {
@@ -107,7 +109,7 @@ export function resolveAfterOutputSchedule(
     ...DEFAULT_AFTER_OUTPUT_SCHEDULE,
     horizonMs:
       positive(env.PI_AFTER_OUTPUT_RETRY_HORIZON_MS) ??
-      positive(env.PI_GATEWAY_MAX_ELAPSED_MS) ??
+      parseGatewayElapsedMs(env.PI_GATEWAY_MAX_ELAPSED_MS) ??
       DEFAULT_AFTER_OUTPUT_SCHEDULE.horizonMs,
     capMs: positive(env.PI_AFTER_OUTPUT_RETRY_CAP_MS) ?? DEFAULT_AFTER_OUTPUT_SCHEDULE.capMs,
     baseMs: positive(env.PI_AFTER_OUTPUT_RETRY_BASE_MS) ?? DEFAULT_AFTER_OUTPUT_SCHEDULE.baseMs,
@@ -139,14 +141,17 @@ export function isRetryableTransportFailure(message: AssistantLike | undefined, 
   return isGatewayLinkCut(text) || isRetryableAssistantError(message as never);
 }
 
-/** Did the failed turn put anything on screen (text, thinking, a tool call)? */
+/**
+ * Did the failed turn put anything on screen — by the pump's rule? The pump
+ * (isAssistantOutputEvent) counts ANY text/thinking/tool-call block start as
+ * forwarded and never replays after one, even an empty block. This layer must
+ * use the same rule, or a cut right after an empty block start is owned by
+ * neither and retried by nobody.
+ */
 export function hasVisibleOutput(message: AssistantLike): boolean {
   if (!Array.isArray(message.content)) return false;
-  return (message.content as Array<{ type?: string; text?: string; thinking?: string; name?: string }>).some(
-    (block) =>
-      (block.type === "text" && (block.text ?? "").trim() !== "") ||
-      (block.type === "thinking" && (block.thinking ?? "").trim() !== "") ||
-      block.type === "toolCall",
+  return (message.content as Array<{ type?: string }>).some(
+    (block) => block.type === "text" || block.type === "thinking" || block.type === "toolCall",
   );
 }
 

@@ -61,6 +61,17 @@ function bool(value: string | undefined, fallback: boolean): boolean {
 }
 
 /**
+ * Read PI_GATEWAY_MAX_ELAPSED_MS: plain ms or a duration ("12h"). "0" is a
+ * real setting (no waiting); anything unparseable is null (use the default).
+ * Shared by every layer that defaults to this horizon.
+ */
+export function parseGatewayElapsedMs(value: string | undefined): number | null {
+  const raw = value?.trim();
+  if (!raw) return null;
+  return raw === "0" ? 0 : parseDurationMs(raw);
+}
+
+/**
  * Resolve gateway config from the environment.
  *
  * Env vars:
@@ -85,10 +96,7 @@ export function resolveGatewayConfig(overrides?: Partial<GatewayAdmissionConfig>
   cfg.maxWaitMs = Math.max(0, int(env.PI_GATEWAY_MAX_WAIT_MS, cfg.maxWaitMs));
   cfg.jitterMs = Math.max(0, int(env.PI_GATEWAY_JITTER_MS, cfg.jitterMs));
   cfg.maxRetries = Math.max(0, int(env.PI_GATEWAY_MAX_RETRIES, cfg.maxRetries));
-  // "0" is a real setting (no interactive waiting at all); the duration parser
-  // treats it as invalid, so it is read first.
-  const rawElapsed = env.PI_GATEWAY_MAX_ELAPSED_MS?.trim();
-  const elapsed = !rawElapsed ? null : rawElapsed === "0" ? 0 : parseDurationMs(rawElapsed);
+  const elapsed = parseGatewayElapsedMs(env.PI_GATEWAY_MAX_ELAPSED_MS);
   if (elapsed !== null) cfg.maxElapsedMs = elapsed;
   cfg.telemetry = bool(env.PI_GATEWAY_TELEMETRY, cfg.telemetry);
 
