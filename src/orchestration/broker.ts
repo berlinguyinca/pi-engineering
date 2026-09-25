@@ -35,6 +35,11 @@ export interface ExecutionRequestInput {
   capabilities?: string[];
   modelRequirements?: Record<string, unknown>;
   timeoutPolicy?: { timeoutMs?: number; maxAttempts?: number };
+  /**
+   * Review only: recovered tasks whose objective the review request asks to
+   * verify. Recorded on the execution as `reviewed_recovered`.
+   */
+  reviewedRecovered?: string[];
 }
 
 export interface ExecutionHandle {
@@ -587,6 +592,9 @@ export class ExecutionBroker {
               artifact_refs: outcome.artifactRefs,
               usage: outcome.usage,
               ...(outcome.recoveredMerged?.length ? { recovered_merged: outcome.recoveredMerged } : {}),
+              ...(backend === "review" && input.reviewedRecovered?.length
+                ? { reviewed_recovered: [...input.reviewedRecovered] }
+                : {}),
             });
           }
           // Persist the worker's edits onto its branch before the worktree is

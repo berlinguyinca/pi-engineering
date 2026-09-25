@@ -132,9 +132,10 @@ describe("CompletionGate (spec 07)", () => {
       const t = timedOut(store, m.mission_id);
       execution(store, m.mission_id, "integration", "SUCCEEDED", { recovered_merged: [merge(t)] });
       execution(store, m.mission_id, "validation", "SUCCEEDED");
-      execution(store, m.mission_id, "review", "SUCCEEDED");
+      execution(store, m.mission_id, "review", "SUCCEEDED", { reviewed_recovered: [t.task_id] });
       const v = new CompletionGate(store).evaluate(store.getMission(m.mission_id)!);
       assert.equal(v.can_complete, true, JSON.stringify(v.reasons));
+      assert.deepEqual(v.superseded_by_recovery, [t.task_id], "the supersede is reported, not silent");
     });
 
     it("does not read integration prose: a summary naming the branch is not evidence", () => {
@@ -144,7 +145,7 @@ describe("CompletionGate (spec 07)", () => {
         summary: `integrated pi-eng-orch-${t.task_id}; checks: pass`,
       });
       execution(store, m.mission_id, "validation", "SUCCEEDED");
-      execution(store, m.mission_id, "review", "SUCCEEDED");
+      execution(store, m.mission_id, "review", "SUCCEEDED", { reviewed_recovered: [t.task_id] });
       const v = new CompletionGate(store).evaluate(store.getMission(m.mission_id)!);
       assert.equal(v.can_complete, false);
       assert.ok(
@@ -159,7 +160,9 @@ describe("CompletionGate (spec 07)", () => {
       const unrecovered = timedOut(store, m.mission_id);
       execution(store, m.mission_id, "integration", "SUCCEEDED", { recovered_merged: [merge(recovered)] });
       execution(store, m.mission_id, "validation", "SUCCEEDED");
-      execution(store, m.mission_id, "review", "SUCCEEDED");
+      execution(store, m.mission_id, "review", "SUCCEEDED", {
+        reviewed_recovered: [recovered.task_id, unrecovered.task_id],
+      });
       const v = new CompletionGate(store).evaluate(store.getMission(m.mission_id)!);
       assert.equal(v.can_complete, false);
       assert.ok(v.reasons.includes("1 task(s) failed"), JSON.stringify(v.reasons));
@@ -172,7 +175,7 @@ describe("CompletionGate (spec 07)", () => {
       execution(store, m.mission_id, "integration", "FAILED", { recovered_merged: [merge(t)] });
       execution(store, m.mission_id, "integration", "SUCCEEDED");
       execution(store, m.mission_id, "validation", "SUCCEEDED");
-      execution(store, m.mission_id, "review", "SUCCEEDED");
+      execution(store, m.mission_id, "review", "SUCCEEDED", { reviewed_recovered: [t.task_id] });
       const v = new CompletionGate(store).evaluate(store.getMission(m.mission_id)!);
       assert.equal(v.can_complete, false, JSON.stringify(v.reasons));
     });
@@ -183,12 +186,58 @@ describe("CompletionGate (spec 07)", () => {
         const t = timedOut(store, m.mission_id);
         // Evidence from BEFORE the recovered merge does not cover it.
         execution(store, m.mission_id, "validation", "SUCCEEDED");
-        execution(store, m.mission_id, "review", "SUCCEEDED");
+        execution(store, m.mission_id, "review", "SUCCEEDED", { reviewed_recovered: [t.task_id] });
         execution(store, m.mission_id, "integration", "SUCCEEDED", { recovered_merged: [merge(t)] });
-        for (const k of after) execution(store, m.mission_id, k, "SUCCEEDED");
+        for (const k of after) {
+          execution(store, m.mission_id, k, "SUCCEEDED", k === "review" ? { reviewed_recovered: [t.task_id] } : {});
+        }
         const v = new CompletionGate(store).evaluate(store.getMission(m.mission_id)!);
         assert.equal(v.can_complete, false, `after=${after.join("+") || "none"}: ${JSON.stringify(v.reasons)}`);
       }
+    });
+
+    it("only a review that was told to check the recovered task's objective counts", () => {
+      // A green build and a generic review can both miss that a timed-out
+      // worker finished 2 of 5 steps. The review must have run with the explicit
+      // completeness note for THIS task.
+      for (const covered of [undefined, ["TSK-someone-else"]]) {
+        const { store, m } = mission(["validation", "independent_review"]);
+        const t = timedOut(store, m.mission_id);
+        execution(store, m.mission_id, "integration", "SUCCEEDED", { recovered_merged: [merge(t)] });
+        execution(store, m.mission_id, "validation", "SUCCEEDED");
+        execution(store, m.mission_id, "review", "SUCCEEDED", covered ? { reviewed_recovered: covered } : {});
+        const v = new CompletionGate(store).evaluate(store.getMission(m.mission_id)!);
+        assert.equal(v.can_complete, false, `covered=${JSON.stringify(covered)}`);
+        assert.deepEqual(v.superseded_by_recovery, []);
+      }
+    });
+
+    it("a FAILED review that carried the note is not evidence", () => {
+      const { store, m } = mission(["validation", "independent_review"]);
+      const t = timedOut(store, m.mission_id);
+      execution(store, m.mission_id, "integration", "SUCCEEDED", { recovered_merged: [merge(t)] });
+      execution(store, m.mission_id, "validation", "SUCCEEDED");
+      execution(store, m.mission_id, "review", "FAILED", { reviewed_recovered: [t.task_id] });
+      execution(store, m.mission_id, "review", "SUCCEEDED");
+      const v = new CompletionGate(store).evaluate(store.getMission(m.mission_id)!);
+      assert.equal(v.can_complete, false, JSON.stringify(v.reasons));
+    });
+
+    it("the store hands out copies of the recovery arrays", () => {
+      const { store, m } = mission(["validation"]);
+      const t = timedOut(store, m.mission_id);
+      execution(store, m.mission_id, "integration", "SUCCEEDED", { recovered_merged: [merge(t)] });
+      execution(store, m.mission_id, "review", "SUCCEEDED", { reviewed_recovered: [t.task_id] });
+      const [integ, review] = store.listExecutions(m.mission_id);
+      integ!.recovered_merged!.push(merge({ task_id: "TSK-injected" }));
+      integ!.recovered_merged![0]!.task_id = "TSK-mutated";
+      review!.reviewed_recovered!.push("TSK-injected");
+      const again = store.listExecutions(m.mission_id);
+      assert.deepEqual(again[0]!.recovered_merged, [merge(t)]);
+      assert.deepEqual(again[1]!.reviewed_recovered, [t.task_id]);
+      const one = store.getExecution(again[0]!.execution_id)!;
+      one.recovered_merged![0]!.ref = "mutated";
+      assert.deepEqual(store.getExecution(again[0]!.execution_id)!.recovered_merged, [merge(t)]);
     });
   });
 

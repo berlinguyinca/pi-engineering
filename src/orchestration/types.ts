@@ -198,6 +198,12 @@ export interface Execution {
    * completion gate; absent when nothing recovered was merged.
    */
   recovered_merged?: RecoveredMerge[];
+  /**
+   * Review executions only: recovered tasks this review was explicitly asked
+   * to check for completeness (their objective was in the review request).
+   * The completion gate counts only such a review for a recovery supersede.
+   */
+  reviewed_recovered?: EntityId[];
 }
 
 /** A recovered worker commit merged by integration. */
@@ -242,4 +248,10 @@ export interface CompletionVerdict {
   missing_gates: RequiredGate[];
   unresolved_findings: number;
   running_tasks: number;
+  /**
+   * FAILED tasks that no longer block because their committed work was
+   * recovered, merged, validated and completeness-reviewed. Reported so a
+   * completion over a FAILED task is auditable.
+   */
+  superseded_by_recovery?: string[];
 }
