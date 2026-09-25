@@ -15,7 +15,7 @@
  * sleep so tests can exercise backoff and retry loops without sleeping.
  */
 
-import { isGatewayAdmissionRefusal } from "../gateway/signals.ts";
+import { isGatewayAdmissionRefusal, isGatewayLinkCut } from "../gateway/signals.ts";
 
 export type TransientErrorCategory =
   | "rate_limit" // 429 — too many requests / caller_concurrency admission
@@ -109,8 +109,11 @@ export function classifyError(error: unknown): ErrorClass {
     return { category: "server_error", retryable: true, retryAfterMs, reason: `5xx (${status})` };
   }
 
-  // Network-level failures.
+  // Network-level failures, including a gateway link cut: a peer route that
+  // ended before the response did. It carries no status (it arrives after a 200
+  // head), so without this it fell through to "permanent" and workers gave up.
   if (
+    isGatewayLinkCut(raw) ||
     has(
       "econnreset",
       "econnrefused",

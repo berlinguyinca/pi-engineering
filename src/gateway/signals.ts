@@ -72,6 +72,26 @@ export const DEFAULT_WAIT_MS = 5_000;
 const NON_RETRYABLE_PATTERNS =
   /\b(quota[_ -]?exceeded|insufficient[_ -]?quota|billing|payment[_ -]?required|credit[_ -]?balance|exceeded your current quota|out of credits)\b/i;
 
+/**
+ * A linked (peer-gateway) stream cut mid-response.
+ *
+ * InferWeave reports it after a 200 head as an SSE error frame
+ * (`inferweave_backpressure`, reason `upstream_transport_error`, scope `model`,
+ * `retry_after_ms: 1000`), and the OpenAI SDK flattens that frame to its bare
+ * message — "…the route serving this model ended before the response did…",
+ * optionally prefixed "Connection lost:" in the newer wording. Nothing
+ * structured survives, so the sentence itself is the signal.
+ */
+const LINK_CUT_PATTERN = /route serving this model ended before the response did|\bupstream_transport_error\b/i;
+
+/** The gateway's own hint for a link cut: the request is routed afresh at once. */
+export const LINK_CUT_WAIT_MS = 1_000;
+
+/** True when a provider error is a gateway link cut (see LINK_CUT_PATTERN). */
+export function isGatewayLinkCut(text: string | undefined): boolean {
+  return text !== undefined && LINK_CUT_PATTERN.test(text);
+}
+
 /** Read the first JSON object embedded in a provider error string. */
 function embeddedJson(text: string): Record<string, unknown> | undefined {
   const start = text.indexOf("{");
@@ -163,6 +183,23 @@ export function parseGatewayWait(input: GatewayWaitInput): GatewayWaitSignal | n
   const isAdmission = admission !== undefined || type === "inference_admission" || reason === "queue_timeout";
   const looksRateLimited =
     isAdmission || /\b(rate[_ -]?limit|too many requests|overloaded|queue[_ -]?timeout|try again later)\b/i.test(text);
+
+  // A flattened link cut carries no envelope to parse. Replay is safe while no
+  // token was delivered (the pump enforces that), and it concerns one model's
+  // route, so it must not park the process behind an account-wide cooldown.
+  // The wait is a default, not a body instruction: it escalates on repeats and
+  // stays with the transient layers rather than the admission controller.
+  if (!admission && isGatewayLinkCut(text)) {
+    return {
+      retryAfterMs: LINK_CUT_WAIT_MS,
+      retryable: true,
+      source: "default",
+      reason: "upstream_transport_error",
+      type: "inferweave_backpressure",
+      scope: "model",
+      ...(status !== undefined ? { status } : {}),
+    };
+  }
 
   if (!(status !== undefined && WAIT_STATUSES.has(status)) && !looksRateLimited) return null;
 

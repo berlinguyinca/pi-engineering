@@ -30,6 +30,11 @@
  *
  * So the pump withholds a terminal error event until it has decided not to
  * retry, and abandons retrying the moment any non-terminal event is forwarded.
+ * Leading bookkeeping events (`start`) are held too, until the first output
+ * event or a successful terminal: pi-ai pushes `start` as soon as the HTTP 200
+ * arrives, before any token, and a gateway link cut lands exactly there. The
+ * failed attempt's held `start` is discarded on retry, so exactly one reaches
+ * the sink.
  * Pi's own `retryAssistantCall` can restart after partial output because it
  * discards the whole failed message; mid-stream, we have no such luxury.
  *
@@ -42,6 +47,25 @@ import { augmentInferenceErrorMessage } from "../inference/admissionContract.ts"
 import { type GatewayWaitInput, type GatewayWaitSignal, parseGatewayWait } from "./signals.ts";
 
 export { monotonicNow } from "../core/clock.ts";
+
+/**
+ * Events that put visible content into the assistant message. Mirrors
+ * `isOutputEvent` in inference/admissionTransport.ts; anything else before the
+ * first of these (`start`) can be withheld without the transcript noticing.
+ */
+function isOutputEvent(type: string | undefined): boolean {
+  return (
+    type === "text_start" ||
+    type === "text_delta" ||
+    type === "text_end" ||
+    type === "thinking_start" ||
+    type === "thinking_delta" ||
+    type === "thinking_end" ||
+    type === "toolcall_start" ||
+    type === "toolcall_delta" ||
+    type === "toolcall_end"
+  );
+}
 
 /** A terminal event ends pi's stream and resolves its result. */
 function isTerminal(type: string | undefined): boolean {
@@ -216,6 +240,11 @@ export async function pumpWithGatewayRetry<E extends RetryableEvent, R extends R
       }
       sink.push(event);
     };
+    /** Leading non-output events (`start`) held until something visible. */
+    const leading: E[] = [];
+    const release = (): void => {
+      for (const event of leading.splice(0)) emit(event);
+    };
     /** A terminal error held back while a retry is still possible. */
     let withheld: E | undefined;
     let result: R | undefined;
@@ -233,9 +262,15 @@ export async function pumpWithGatewayRetry<E extends RetryableEvent, R extends R
             withheld = event;
             continue;
           }
+          release();
           emit(event);
           continue;
         }
+        if (!forwarded && !isOutputEvent(event.type)) {
+          leading.push(event);
+          continue;
+        }
+        release();
         emit(event);
       }
       result = await inner.result();
@@ -274,6 +309,9 @@ export async function pumpWithGatewayRetry<E extends RetryableEvent, R extends R
 
     // Settled: a throw with nothing to report is the caller's problem, since
     // building an assistant message needs the model.
+    // A held `start` still precedes the failure it belongs to — but it is not
+    // the gateway serving us, so it bypasses `emit` and never counts as progress.
+    for (const event of leading) sink.push(event);
     if (thrown !== undefined) throw thrown;
     const finalResult = guidance ? withGuidance(result, guidance) : result;
     if (withheld) sink.push(guidance ? withEventGuidance(withheld, guidance) : withheld);
