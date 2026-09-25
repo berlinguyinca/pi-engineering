@@ -532,14 +532,14 @@ export class MissionStore {
 
   getExecution(executionId: string): Execution | undefined {
     const ex = this.executions.get(executionId);
-    return ex ? { ...ex, logs: [...ex.logs], artifact_refs: [...ex.artifact_refs] } : undefined;
+    return ex ? copyExecution(ex) : undefined;
   }
 
   listExecutions(missionId?: string, taskId?: string): Execution[] {
     return [...this.executions.values()]
       .filter((e) => (missionId ? e.mission_id === missionId : true))
       .filter((e) => (taskId ? e.task_id === taskId : true))
-      .map((e) => ({ ...e, logs: [...e.logs], artifact_refs: [...e.artifact_refs] }));
+      .map(copyExecution);
   }
 
   // ── Findings ────────────────────────────────────────────────────────────
@@ -568,4 +568,15 @@ export class MissionStore {
       .filter((f) => (missionId ? f.mission_id === missionId : true))
       .map((f) => ({ ...f }));
   }
+}
+
+/** A caller-owned copy: no array or record in it aliases the store's state. */
+function copyExecution(ex: Execution): Execution {
+  return {
+    ...ex,
+    logs: [...ex.logs],
+    artifact_refs: [...ex.artifact_refs],
+    ...(ex.recovered_merged ? { recovered_merged: ex.recovered_merged.map((r) => ({ ...r })) } : {}),
+    ...(ex.reviewed_recovered ? { reviewed_recovered: [...ex.reviewed_recovered] } : {}),
+  };
 }

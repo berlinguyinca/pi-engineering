@@ -26,6 +26,21 @@ export interface GateEvidence {
   securityReviewsCompleted: number;
   /** Findings keyed by finding_id with status. */
   findings: Array<{ finding_id: string; severity: string; status: string }>;
+  /**
+   * Tasks whose committed work was recovered after a wall-clock timeout: the
+   * broker recorded their exact worker commit as merged by a SUCCEEDED
+   * integration (`Execution.recovered_merged`), and after that integration a
+   * validation SUCCEEDED and a review SUCCEEDED that was explicitly asked to
+   * verify the task's objective is fully met (`Execution.reviewed_recovered`).
+   * Structured evidence only — integration summaries are prose, never parsed.
+   *
+   * Conservative by design: a mission with no review step can never supersede
+   * a recovered task (a green build does not prove a timed-out worker finished
+   * its objective). "After" is store insertion order, which is creation order
+   * because post-execution runs integration, validation and review
+   * sequentially.
+   */
+  recoveredTasks: string[];
 }
 
 export class CompletionGate {
@@ -61,8 +76,16 @@ export class CompletionGate {
           o.role === t.role &&
           o.status === "SUCCEEDED" &&
           (order.get(o.task_id) ?? -1) > (order.get(t.task_id) ?? -1),
-      );
+      ) ||
+      // Recovery supersede: the worker timed out AFTER committing, the broker
+      // merged exactly that commit, and validation + review passed on the
+      // result. The FAILED status records a timeout, not a rejected
+      // deliverable, so it must not block completion. See gather().
+      evidence.recoveredTasks.includes(t.task_id);
     const failed = tasks.filter((t) => t.status === "FAILED" && !superseded(t));
+    const supersededByRecovery = tasks
+      .filter((t) => t.status === "FAILED" && evidence.recoveredTasks.includes(t.task_id))
+      .map((t) => t.task_id);
 
     // Required gates.
     for (const gate of mission.required_gates) {
@@ -129,6 +152,7 @@ export class CompletionGate {
       missing_gates: missingGates,
       unresolved_findings: unresolvedBlocking,
       running_tasks: running.length,
+      superseded_by_recovery: supersededByRecovery,
     };
   }
 
@@ -142,11 +166,27 @@ export class CompletionGate {
     const securityReviewsCompleted = tasks.filter(
       (t) => t.kind === "review" && t.status === "SUCCEEDED" && t.role.includes("security"),
     ).length;
+    // Insertion order is the chronology (event-sourced store): a recovered
+    // merge counts only when a validation and a completeness-noted review both
+    // SUCCEEDED after the integration that merged it — evidence from before
+    // does not cover it.
+    const recoveredTasks: string[] = [];
+    executions.forEach((e, i) => {
+      if (e.backend !== "integration" || e.status !== "SUCCEEDED" || !e.recovered_merged?.length) return;
+      const later = executions.slice(i + 1).filter((x) => x.status === "SUCCEEDED");
+      if (!later.some((x) => x.backend === "validation")) return;
+      for (const r of e.recovered_merged) {
+        if (later.some((x) => x.backend === "review" && x.reviewed_recovered?.includes(r.task_id))) {
+          recoveredTasks.push(r.task_id);
+        }
+      }
+    });
     return {
       missionId,
       validationsPassed,
       reviewsCompleted,
       securityReviewsCompleted,
+      recoveredTasks,
       findings: findings.map((f) => ({ finding_id: f.finding_id, severity: f.severity, status: f.status })),
     };
   }

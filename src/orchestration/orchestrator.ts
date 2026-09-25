@@ -499,6 +499,20 @@ export class Orchestrator {
         this.store.transitionMission(mission.mission_id, "FINAL_VALIDATION");
       }
       this.observeGatePassed(mission.mission_id);
+      // Completing over a FAILED task must leave a trail naming it and why.
+      for (const taskId of verdict.superseded_by_recovery ?? []) {
+        this.store.addFinding({
+          mission_id: mission.mission_id,
+          task_id: taskId,
+          severity: "minor",
+          category: "integration",
+          file: null,
+          line: null,
+          summary: `FAILED status of task ${taskId} superseded by recovery: its commits were merged after a wall-clock timeout, then validated and reviewed for completeness`,
+          evidence: null,
+          recommended_action: "None required; recorded so the completion over a failed task is auditable.",
+        });
+      }
       this.store.completeMission(mission.mission_id);
       this.phase(this.store.getMission(mission.mission_id)!, "complete");
       this.progress = null;
@@ -685,23 +699,48 @@ export class Orchestrator {
     ) {
       this.store.transitionMission(mission.mission_id, "REVIEWING");
       const role = gates.has("security_review") ? "security-review" : "reviewer";
+      // Work recovered from a timed-out worker was committed before the worker
+      // finished: a green build and a generic review can both miss that only
+      // part of its objective was done. Name each recovered task and its
+      // objective in the review request; the completion gate counts only a
+      // review that carried this note (see CompletionGate.gather).
+      const recovered = this.recoveredTasks(mission.mission_id);
+      const recoveryNote = recovered
+        .map(
+          (t) =>
+            `\n\nRecovered work — verify task ${t.task_id} objective is fully met (its commits were recovered after a wall-clock timeout, so it may be incomplete; report a blocking finding for anything missing). Objective: ${t.objective}`,
+        )
+        .join("");
       const task = this.store.createTask({
         mission_id: mission.mission_id,
         kind: "review",
         role,
-        objective: `Fresh independent review of the integrated change. Mission: ${mission.goal}`,
+        objective: `Fresh independent review of the integrated change. Mission: ${mission.goal}${recoveryNote}`,
         mutates_repo: false,
         isolation: "none",
         depends_on: this.lastValidationTaskId(mission.mission_id),
       });
       this.store.transitionTask(task.task_id, "READY");
       reviewAttempted = true;
-      reviewOk = await this.runSingleTask(mission.mission_id, task.task_id);
+      reviewOk = await this.runSingleTask(mission.mission_id, task.task_id, {
+        reviewedRecovered: recovered.map((t) => t.task_id),
+      });
       // From REVIEWING the mission moves to final validation (or repair handled
       // by the caller via the completion gate).
       this.store.transitionMission(mission.mission_id, "FINAL_VALIDATION");
     }
     return { validationAttempted, validationOk, reviewAttempted, reviewOk, integrationOk };
+  }
+
+  /** Tasks whose recovered commits a SUCCEEDED integration merged (broker evidence). */
+  private recoveredTasks(missionId: string): OrchestrationTask[] {
+    const ids = new Set(
+      this.store
+        .listExecutions(missionId)
+        .filter((e) => e.backend === "integration" && e.status === "SUCCEEDED")
+        .flatMap((e) => (e.recovered_merged ?? []).map((r) => r.task_id)),
+    );
+    return [...ids].map((id) => this.store.getTask(id)).filter((t): t is OrchestrationTask => t !== undefined);
   }
 
   private lastValidationTaskId(missionId: string): string[] {
@@ -712,7 +751,11 @@ export class Orchestrator {
   }
 
   /** Run one task to settlement. Returns true iff it reached SUCCEEDED. */
-  private async runSingleTask(missionId: string, taskId: string): Promise<boolean> {
+  private async runSingleTask(
+    missionId: string,
+    taskId: string,
+    extra: { reviewedRecovered?: string[] } = {},
+  ): Promise<boolean> {
     const task = this.store.getTask(taskId)!;
     this.store.transitionTask(taskId, "RUNNING");
     this.report(`[mission ${missionId}] ${task.kind}:${task.role} starting — ${task.objective.slice(0, 120)}`);
@@ -731,6 +774,7 @@ export class Orchestrator {
         writeDomains: task.write_domains,
         isolation: task.isolation,
         modelRequirements: task.execution_requirements,
+        ...(extra.reviewedRecovered?.length ? { reviewedRecovered: extra.reviewedRecovered } : {}),
       });
       const outcome = await handle.result();
       // Record reviewer findings so the completion gate can block on them.
