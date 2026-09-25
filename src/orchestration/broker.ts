@@ -96,10 +96,28 @@ export interface ReviewRunner {
   }): Promise<ExecutionOutcome & { findings?: Array<Record<string, unknown>> }>;
 }
 
+/** One branch handed to the integrator. */
+export interface IntegrationHandoff {
+  worktree: { path: string; branch: string };
+  summary: string;
+  artifacts: string[];
+  /**
+   * Exact commit to merge instead of the branch tip. Set for recovered work:
+   * the branch tip also carries the broker's harvest auto-commit of the
+   * worker's uncommitted (half-done) edits, which must not be integrated.
+   */
+  ref?: string;
+  /**
+   * Committed work recovered from a wall-clock-timed-out execution. Handed off
+   * after every clean branch; a conflict on it must not fail the integration.
+   */
+  recovered?: boolean;
+}
+
 export interface IntegrationRunner {
   runIntegration(input: {
     objective: string;
-    handoffs: Array<{ worktree: { path: string; branch: string }; summary: string; artifacts: string[] }>;
+    handoffs: IntegrationHandoff[];
     signal: AbortSignal;
   }): Promise<ExecutionOutcome>;
 }
@@ -116,6 +134,12 @@ export interface BrokerBackends {
   validation?: ValidationRunner;
 }
 
+/** Largest delay setTimeout honours (2^31-1 ms, ~24.8 days). */
+const MAX_TIMER_MS = 2 ** 31 - 1;
+
+/** The worker's machine-readable failure marker for a wall-clock timeout. */
+const WALL_CLOCK_TIMEOUT_MARKER = "timeout";
+
 /**
  * Default execution wall-clock budget in ms. The historical 10-minute default
  * repeatedly aborted fresh-context implementation workers at the boundary
@@ -128,7 +152,9 @@ export interface BrokerBackends {
  */
 export function workerTimeoutMs(): number {
   const env = Number.parseInt(process.env.PI_ENGINEERING_WORKER_TIMEOUT_MS ?? "", 10);
-  if (Number.isFinite(env) && env > 0) return env;
+  // setTimeout fires IMMEDIATELY for delays above 2^31-1 ms, which would turn a
+  // generous override into an instant abort.
+  if (Number.isFinite(env) && env > 0) return Math.min(env, MAX_TIMER_MS);
   return 30 * 60_000;
 }
 
@@ -167,7 +193,13 @@ export class ExecutionBroker {
    * (never merged, never force-deleted) so a failed run's work stays
    * recoverable instead of being destroyed with the worktree teardown.
    */
-  private readonly failedBranches = new Map<string, string[]>();
+  /**
+   * missionId -> branch -> the LAST settled failure on that branch: its marker
+   * (outcome.error, else summary) and, for a wall-clock timeout, the worker's
+   * own tip captured BEFORE the harvest auto-commit. A later successful
+   * execution on the same branch (a retry of the task) deletes the entry.
+   */
+  private readonly failedBranches = new Map<string, Map<string, { marker: string; recoverRef?: string }>>();
   /** Missions where at least one worker branch carried commits since base (own commits recognized at harvest). */
   private readonly committedWork = new Map<string, boolean>();
 
@@ -229,7 +261,9 @@ export class ExecutionBroker {
       const wt = await this.git.createWorktree(base, branch);
       const info = { path: wt.path, branch: wt.branch };
       this.allocatedWorktrees.set(executionId, info);
-      const mission = this.missionWorktrees.get(input.missionId) ?? [];
+      // A retried task re-creates its branch (same name): replace, never
+      // duplicate, or integration would hand the same branch off twice.
+      const mission = (this.missionWorktrees.get(input.missionId) ?? []).filter((w) => w.branch !== info.branch);
       mission.push(info);
       this.missionWorktrees.set(input.missionId, mission);
       return wt.path;
@@ -328,6 +362,50 @@ export class ExecutionBroker {
       }
       return false;
     }
+  }
+
+  /**
+   * The worker's own tip when it committed work past the mission base, else
+   * undefined. An undeterminable count is recorded as a finding rather than
+   * silently read as "nothing to recover".
+   */
+  private async workerCommittedTip(
+    executionId: string,
+    missionId: string,
+    worktree: string,
+  ): Promise<string | undefined> {
+    if (!this.git) return undefined;
+    const base = this.store.getMission(missionId)?.base_ref?.trim() || this.resolvedBases.get(missionId);
+    let tip: string | undefined;
+    let count: number | null = null;
+    try {
+      tip = await this.git.headCommitIn(worktree);
+      if (base) count = await this.git.revListCount(`${base}..${tip}`);
+    } catch {
+      count = null;
+    }
+    if (count === null) {
+      this.recoveryFinding(executionId, "Could not count a timed-out worker's commits; its work was not recovered");
+      return undefined;
+    }
+    return count > 0 ? tip : undefined;
+  }
+
+  private recoveryFinding(executionId: string, summary: string, evidence: string | null = null): void {
+    const ex = this.store.getExecution(executionId);
+    if (!ex) return;
+    this.store.addFinding({
+      mission_id: ex.mission_id,
+      task_id: ex.task_id,
+      severity: "minor",
+      category: "integration",
+      file: null,
+      line: null,
+      summary,
+      evidence,
+      recommended_action:
+        "Review the recovered commits: they were made before the worker hit its wall-clock budget and were merged after every clean branch.",
+    });
   }
 
   private async releaseWorktree(executionId: string, keepBranch = true): Promise<void> {
@@ -507,14 +585,30 @@ export class ExecutionBroker {
           // worktree. Harvest whenever there is a worktree (success or failure);
           // failed branches are then excluded from integration and preserved.
           if (input.mutatesRepo && worktree) {
+            const info = this.allocatedWorktrees.get(execution.execution_id);
+            const failed = outcome.exitStatus !== "succeeded";
+            // Captured BEFORE the harvest: the harvest commits the worker's
+            // uncommitted edits too, and those are exactly what a timed-out
+            // worker had not finished.
+            const recoverRef =
+              failed && outcome.error === WALL_CLOCK_TIMEOUT_MARKER && info
+                ? await this.workerCommittedTip(execution.execution_id, input.missionId, worktree)
+                : undefined;
             await this.harvestWorktree(execution.execution_id);
-            if (outcome.exitStatus !== "succeeded") {
-              const info = this.allocatedWorktrees.get(execution.execution_id);
-              if (info) {
-                const list = this.failedBranches.get(input.missionId) ?? [];
-                if (!list.includes(info.branch)) list.push(info.branch);
-                this.failedBranches.set(input.missionId, list);
+            if (info) {
+              // Last settled outcome wins: a retry that succeeds on the same
+              // branch clears the earlier failure instead of being excluded.
+              const byBranch =
+                this.failedBranches.get(input.missionId) ?? new Map<string, { marker: string; recoverRef?: string }>();
+              if (failed) {
+                byBranch.set(info.branch, {
+                  marker: outcome.error ?? outcome.summary ?? "failed",
+                  ...(recoverRef ? { recoverRef } : {}),
+                });
+              } else {
+                byBranch.delete(info.branch);
               }
+              this.failedBranches.set(input.missionId, byBranch);
             }
           }
           this.active.delete(execution.execution_id);
@@ -544,7 +638,7 @@ export class ExecutionBroker {
     return handle;
   }
 
-  private dispatch(
+  private async dispatch(
     input: ExecutionRequestInput,
     backend: ExecutionBackend,
     executionId: string,
@@ -584,16 +678,58 @@ export class ExecutionBroker {
       case "integration": {
         const runner = this.backends.integration;
         if (!runner) throw new Error("no integration backend registered");
-        // Failed executions must not be merged (their work is incomplete).
-        // Their branches are preserved separately (see failedBranches).
-        const failed = new Set(this.failedBranches.get(input.missionId) ?? []);
-        const handoffs = (this.missionWorktrees.get(input.missionId) ?? [])
-          .filter((w) => !failed.has(w.branch))
-          .map((w) => ({
-            worktree: w,
-            summary: input.objective,
-            artifacts: [] as string[],
-          }));
+        // Failed executions are excluded from the merge by default (their
+        // work is presumed incomplete — a degenerate loop that committed
+        // garbage must not be auto-merged); their branches are preserved
+        // separately (see failedBranches). EXCEPTION: a worker killed by the
+        // WALL-CLOCK timeout after committing real work leaves a completed
+        // deliverable on its branch, which used to be stranded forever
+        // (observed: MSN-1xh24o, a 367-line console change lost twice).
+        //
+        // Only the commits the WORKER made are recovered — the exact tip
+        // captured before the harvest auto-commit, never the branch tip — and
+        // they are handed off LAST, after every clean branch, so a conflict or
+        // breakage in them cannot block good work. Note the integration checks
+        // run AFTER merging into the checkout; they report a broken tree but
+        // do not roll a recovered merge back.
+        const failedByBranch = this.failedBranches.get(input.missionId);
+        const handoffs: IntegrationHandoff[] = [];
+        const recovered: IntegrationHandoff[] = [];
+        for (const w of this.missionWorktrees.get(input.missionId) ?? []) {
+          const failure = failedByBranch?.get(w.branch);
+          if (failure === undefined) {
+            handoffs.push({ worktree: w, summary: input.objective, artifacts: [] });
+            continue;
+          }
+          // Exactly the worker's wall-clock marker (PiWorkerExecutor: error
+          // "timeout"). A substring match also caught `gateway:queue_timeout`
+          // and `transient:timeout` — gateway/transport failures whose partial
+          // work must stay preserve-only.
+          if (failure.marker !== WALL_CLOCK_TIMEOUT_MARKER || !failure.recoverRef) continue;
+          const ahead = this.git ? await this.git.revListCount(`HEAD..${failure.recoverRef}`) : 0;
+          if (ahead === null) {
+            this.recoveryFinding(
+              executionId,
+              `Could not count recoverable commits on ${w.branch}; its timed-out work was not recovered`,
+            );
+            continue;
+          }
+          if (ahead > 0) {
+            recovered.push({
+              worktree: w,
+              ref: failure.recoverRef,
+              recovered: true,
+              summary: `${input.objective} [recovered: ${ahead} commit(s) from a timed-out execution]`,
+              artifacts: [],
+            });
+            this.recoveryFinding(
+              executionId,
+              `Recovering ${ahead} commit(s) from a timed-out execution on ${w.branch} (merged after clean branches)`,
+              failure.recoverRef,
+            );
+          }
+        }
+        handoffs.push(...recovered);
         // After integration, release the merged worktrees (fire-and-forget
         // cleanup so the return value stays a plain Promise<ExecutionOutcome>).
         const outcome = runner.runIntegration({ objective: input.objective, handoffs, signal });

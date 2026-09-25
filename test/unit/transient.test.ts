@@ -6,6 +6,7 @@ import {
   backoffDelayMs,
   classifyError,
   initialTransientTelemetry,
+  isTruncatedStream,
   recordTransientError,
   recordTransientOutcome,
   resolveTransientRetryConfig,
@@ -24,6 +25,91 @@ test("classify: 429 caller_concurrency admission is a retryable rate_limit", () 
   const cls = classifyError(new Error("429 inference admission: caller_concurrency"));
   assert.equal(cls.category, "rate_limit");
   assert.equal(cls.retryable, true);
+});
+
+for (const text of ["routing_snapshot_expired", '503 {"code":"capacity_unavailable","action":"retry_alternate"}']) {
+  test(`classify: gateway routing failure is retryable (${text.slice(0, 40)}…)`, () => {
+    const cls = classifyError(new Error(text));
+    assert.equal(cls.retryable, true);
+    assert.equal(cls.category, "server_unavailable");
+  });
+}
+
+// A model the catalog does not know is either a catalog that has not resynced
+// (one retry clears it) or a configuration typo (no amount of waiting does).
+// It must not be an infrastructure category, or the mission scheduler parks
+// the task in its 90-minute gateway window while the gateway is healthy.
+for (const text of ['404: {"code":"model_not_found","message":"model_not_found"}', "invalid model name: qwen-typo"]) {
+  test(`classify: unknown model gets one retry, never the infra window (${text.slice(0, 30)}…)`, () => {
+    const cls = classifyError(new Error(text));
+    assert.equal(cls.category, "model_unavailable");
+    assert.equal(cls.retryable, true);
+    assert.equal(cls.maxRetries, 1);
+  });
+}
+
+test("withTransientRetry: an unknown model is retried exactly once, then reported", async () => {
+  let calls = 0;
+  const out = await withTransientRetry({
+    fn: async () => {
+      calls++;
+      throw new Error('404: {"code":"model_not_found"}');
+    },
+    sleep: async () => {},
+    rand: () => 0,
+  });
+  assert.equal(calls, 2);
+  assert.equal(out.category, "model_unavailable");
+  assert.ok(out.error);
+});
+
+test("classify: the routing rule never overrides the admission contract's fail-closed decision", () => {
+  // A well-formed backpressure envelope that forbids replay, and a malformed
+  // one: the contract says terminal for both. Their rendered text still
+  // carries routing tokens, which must not flip them to retryable.
+  for (const text of [
+    '503: {"type":"inferweave_backpressure","reason":"capacity_unavailable","action":"retry_alternate","replay_safe":false,"retry_after_ms":1000}',
+    '{"type":"inferweave_backpressure","reason":"capacity_unavailable","retry_after_ms":"soon"',
+  ]) {
+    const cls = classifyError(new Error(text));
+    assert.equal(cls.retryable, false, text);
+  }
+});
+
+test("classify: a link cut stays with the network branch, not the routing rule", () => {
+  const cls = classifyError(
+    new Error("The route serving this model ended before the response did; the response is incomplete."),
+  );
+  assert.equal(cls.category, "network");
+});
+
+test("isTruncatedStream: anchored on pi-ai's exact truncation message", () => {
+  assert.equal(isTruncatedStream("Stream ended without finish_reason"), true);
+  assert.equal(isTruncatedStream("Error: Stream ended without finish_reason"), true);
+  assert.equal(isTruncatedStream("Worker returned no worker_result. Stream ended without finish_reason"), true);
+  // Loose look-alikes are not pi-ai's truncation.
+  assert.equal(isTruncatedStream("upstream returned no finish_reason"), false);
+  assert.equal(isTruncatedStream("the model said: stream ended without finish_reason was a bug"), false);
+  assert.equal(isTruncatedStream("503 no worker for model"), false);
+  assert.equal(isTruncatedStream(undefined), false);
+});
+
+test("isTruncatedStream: fails closed behind the envelope and permanent-status guards", () => {
+  assert.equal(
+    isTruncatedStream('Stream ended without finish_reason {"type":"inferweave_backpressure","reason":"x"}'),
+    false,
+  );
+  assert.equal(isTruncatedStream('Stream ended without finish_reason {"type":"inference_admission"}'), false);
+  assert.equal(isTruncatedStream("401: Stream ended without finish_reason"), false);
+  const cls = classifyError(Object.assign(new Error("Stream ended without finish_reason"), { status: 403 }));
+  assert.equal(cls.retryable, false);
+});
+
+test("classify: truncated stream (no finish_reason) is retryable", () => {
+  const cls = classifyError(new Error("Worker returned no worker_result. Stream ended without finish_reason"));
+  assert.equal(cls.category, "server_error");
+  assert.equal(cls.retryable, true);
+  assert.equal(cls.reason, "truncated stream (no finish_reason)");
 });
 
 test("classify: numeric status 503 is retryable", () => {

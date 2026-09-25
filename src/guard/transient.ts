@@ -16,6 +16,7 @@
  */
 
 import { isGatewayAdmissionRefusal, isGatewayLinkCut } from "../gateway/signals.ts";
+import { PERMANENT_ADMISSION_STATUSES } from "../inference/admissionContract.ts";
 
 export type TransientErrorCategory =
   | "rate_limit" // 429 — too many requests / caller_concurrency admission
@@ -24,6 +25,7 @@ export type TransientErrorCategory =
   | "network" // ECONNRESET / ECONNREFUSED / fetch failed / DNS
   | "timeout" // wall-clock / provider deadline exceeded
   | "compaction" // summarization/context-overflow/compaction failure
+  | "model_unavailable" // model_not_found / invalid model name — one resync retry, never the infra window
   | "permanent"; // NOT retryable — do not auto-retry
 
 export interface ErrorClass {
@@ -34,6 +36,11 @@ export interface ErrorClass {
   retryAfterMs?: number;
   /** Human-readable reason (first matching signal). */
   reason?: string;
+  /**
+   * Retry cap for this error, below the configured budget. Used where one
+   * retry can help but more only hide the cause (an unknown model).
+   */
+  maxRetries?: number;
 }
 
 /** A structured error wrapper carrying the classified category. */
@@ -89,6 +96,61 @@ export function classifyError(error: unknown): ErrorClass {
     return { category: "rate_limit", retryable: true, retryAfterMs, reason: "rate-limit / concurrency admission" };
   }
 
+  // Truncated streams: the provider closed the SSE stream before any
+  // finish_reason arrived (observed on the metabolomics gateway under
+  // momentary load — zero tokens, sub-second worker death). A fresh request
+  // succeeds seconds later, so treat it as transient, not permanent. Checked
+  // BEFORE the 503 branch because the executor's composite failure text
+  // ("Worker returned no worker_result. Stream ended without finish_reason")
+  // would otherwise false-match the "no worker" pattern.
+  if (isTruncatedStream(raw) && !(status != null && PERMANENT_ADMISSION_STATUSES.includes(status))) {
+    return {
+      category: "server_error",
+      retryable: true,
+      retryAfterMs,
+      reason: "truncated stream (no finish_reason)",
+    };
+  }
+
+  // Text carrying an admission envelope is NOT ours for the rules below: the
+  // structural admission contract decides it (a malformed or replay-unsafe
+  // envelope is terminal), so re-reading its rendered text here would override
+  // that fail-closed decision. A link cut ("…the response is incomplete…") is
+  // not matched here either: the network branch owns it, behind
+  // isGatewayLinkCut's guards.
+  const carriesEnvelope = has("inferweave_backpressure", "inference_admission");
+
+  // An unknown model: 404 model_not_found after a catalog shrink, or an
+  // invalid-model-name 400 on the multimodal route. One retry covers a catalog
+  // that has not resynced yet; a configuration typo never clears, so this is
+  // NOT an infrastructure category — the mission scheduler would otherwise park
+  // the task in its gateway window while the gateway answers perfectly well.
+  if (!carriesEnvelope && has("model_not_found", "invalid model name")) {
+    return {
+      category: "model_unavailable",
+      retryable: true,
+      retryAfterMs,
+      maxRetries: 1,
+      reason: "unknown model (catalog resync or misconfiguration)",
+    };
+  }
+
+  // Gateway routing failures (metabolomics/inferweave): expired routing
+  // snapshots and flattened capacity backpressure (capacity_unavailable /
+  // retry_alternate). Each clears on the next request (re-routed afresh /
+  // alternate deployment) — retryable, bounded by the transient budget.
+  if (
+    !carriesEnvelope &&
+    has("routing_snapshot_expired", "capacity_unavailable", "retry_alternate", "try another eligible deployment")
+  ) {
+    return {
+      category: "server_unavailable",
+      retryable: true,
+      retryAfterMs,
+      reason: "gateway routing failure (snapshot/backpressure)",
+    };
+  }
+
   // 503 no worker for model / service unavailable / provider overload.
   //
   // "overloaded" is Anthropic's 529 wording and appears in pi-ai's own
@@ -142,6 +204,27 @@ export function classifyError(error: unknown): ErrorClass {
   }
 
   return { category: "permanent", retryable: false, reason: "permanent error" };
+}
+
+/**
+ * pi-ai's openai-completions error when the SSE stream closes before any
+ * finish_reason, verbatim. Anchored: at the start of the text (optionally
+ * "Error: "-prefixed) or as the final sentence of the executor's composite
+ * "Worker returned no worker_result. <error>" — never a phrase inside prose.
+ */
+const TRUNCATED_STREAM = /(?:^|\.\s+)(?:error:\s*)?stream ended without finish_reason\.?\s*$/i;
+
+/**
+ * True when a provider error is pi-ai's truncated-stream error. Shared by the
+ * classifier and the executor, which sees it as an assistant-message error
+ * rather than a throw. Fails closed like the link-cut rule: text carrying an
+ * admission envelope or a leading permanent status is never a truncation.
+ */
+export function isTruncatedStream(text: string | undefined): boolean {
+  if (!text || !TRUNCATED_STREAM.test(text.trim())) return false;
+  if (/inferweave_backpressure|inference_admission/i.test(text)) return false;
+  const lead = /^\s*(?:HTTP\s*)?(\d{3})\b/.exec(text);
+  return !(lead && PERMANENT_ADMISSION_STATUSES.includes(Number.parseInt(lead[1]!, 10)));
 }
 
 function extractStatus(error: unknown): number | null {
@@ -293,7 +376,7 @@ export async function withTransientRetry<T>(opts: RetryOptions<T>): Promise<Retr
         // Permanent error: do not retry.
         return { value: undefined, error: err, attempts, category: cls.category };
       }
-      if (attempt >= config.maxAttempts + 1) {
+      if (attempt >= Math.min(config.maxAttempts, cls.maxRetries ?? config.maxAttempts) + 1) {
         // Exhausted retries.
         return { value: undefined, error: err, attempts, category: cls.category };
       }

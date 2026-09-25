@@ -1,7 +1,13 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { describe, it } from "node:test";
+import { GitRepo } from "../../src/git/GitRepo.ts";
+import { workerTimeoutMs } from "../../src/orchestration/broker.ts";
 import { normalizeFindings, realBackends } from "../../src/orchestration/realBackends.ts";
 import type { WorkerExecutor, WorkerRequest } from "../../src/workers/WorkerExecutor.ts";
+import { makeFixtureRepo } from "../fixtures/make-fixture.ts";
 
 function capturingWorker(seen: WorkerRequest[]): WorkerExecutor {
   return {
@@ -71,6 +77,21 @@ describe("realBackends capability routing", () => {
     await backends.review.runReview({ objective: "review", signal: new AbortController().signal });
     assert.deepEqual(seen[0]?.modelOverride, { provider: "metabolomics", id: "qwen-vision" });
   });
+
+  it("gives the reviewer the same wall-clock budget as implementation workers", async () => {
+    // Without an explicit budget the executor's 5-minute default aborted
+    // reviewers mid-analysis.
+    const seen: WorkerRequest[] = [];
+    const backends = realBackends({
+      worker: capturingWorker(seen),
+      verifier: {} as never,
+      artifacts: {} as never,
+      git: null,
+      cwd: "/repo",
+    });
+    await backends.review.runReview({ objective: "review", signal: new AbortController().signal });
+    assert.equal(seen[0]?.timeoutMs, workerTimeoutMs());
+  });
 });
 
 describe("normalizeFindings (spec 07 — reviewer finding normalization)", () => {
@@ -123,5 +144,68 @@ describe("normalizeFindings (spec 07 — reviewer finding normalization)", () =>
     assert.deepEqual(normalizeFindings("[not json"), [{ summary: "[not json", message: "[not json" }]);
     assert.deepEqual(normalizeFindings(42), []);
     assert.deepEqual(normalizeFindings([{ noSummaryField: true }]), []);
+  });
+});
+
+describe("realBackends integration: recovered handoffs", () => {
+  const passingVerifier = {
+    detect: async () => ({ name: "none", stages: [] }),
+    run: async () => ({ passed: true, stages: [], evidence: [], failedStage: null, noTargets: false }),
+  };
+  const sh = (cwd: string, ...args: string[]) => execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8" }).trim();
+
+  /** A branch off HEAD with one commit writing `file`; returns that commit. */
+  function branchWith(root: string, branch: string, file: string, content: string): string {
+    sh(root, "checkout", "-q", "-b", branch);
+    writeFileSync(join(root, file), content);
+    sh(root, "add", "-A");
+    sh(root, "commit", "-q", "-m", `${branch}: ${file}`);
+    const sha = sh(root, "rev-parse", "HEAD");
+    sh(root, "checkout", "-q", "-");
+    return sha;
+  }
+
+  it("merges a recovered handoff's exact ref, and a conflict on it does not fail clean work", async () => {
+    const fx = await makeFixtureRepo();
+    try {
+      const git = (await GitRepo.open(fx.root))!;
+      branchWith(fx.root, "clean", "src/add.js", "export const add = (a, b) => a + b;\n");
+      // Recovered branch: a conflicting worker commit ...
+      const conflictRef = branchWith(fx.root, "rec-conflict", "src/add.js", "export const add = () => 0;\n");
+      // ... and a non-conflicting one whose branch tip ALSO carries a harvest
+      // auto-commit of half-done work that must not be merged.
+      const goodRef = branchWith(fx.root, "rec-good", "src/extra.js", "export const extra = 1;\n");
+      sh(fx.root, "checkout", "-q", "rec-good");
+      writeFileSync(join(fx.root, "src", "half.js"), "half-done\n");
+      sh(fx.root, "add", "-A");
+      sh(fx.root, "commit", "-q", "-m", "pi-eng: harvest");
+      sh(fx.root, "checkout", "-q", "-");
+
+      const backends = realBackends({
+        worker: capturingWorker([]),
+        verifier: passingVerifier as never,
+        artifacts: {} as never,
+        git,
+        cwd: fx.root,
+      });
+      const wt = (branch: string) => ({ path: fx.root, branch });
+      const out = await backends.integration.runIntegration({
+        objective: "merge",
+        signal: new AbortController().signal,
+        handoffs: [
+          { worktree: wt("clean"), summary: "s", artifacts: [] },
+          { worktree: wt("rec-conflict"), summary: "s", artifacts: [], ref: conflictRef, recovered: true },
+          { worktree: wt("rec-good"), summary: "s", artifacts: [], ref: goodRef, recovered: true },
+        ],
+      });
+      assert.equal(out.exitStatus, "succeeded", out.summary);
+      assert.match(out.summary, /recovered/);
+      assert.match(out.summary, /rec-conflict/);
+      assert.equal(readFileSync(join(fx.root, "src", "add.js"), "utf8"), "export const add = (a, b) => a + b;\n");
+      assert.ok(existsSync(join(fx.root, "src", "extra.js")), "the recovered worker commit is merged");
+      assert.ok(!existsSync(join(fx.root, "src", "half.js")), "the harvest commit on the branch tip is not");
+    } finally {
+      await fx.cleanup();
+    }
   });
 });

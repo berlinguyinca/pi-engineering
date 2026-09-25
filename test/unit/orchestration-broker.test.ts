@@ -32,6 +32,8 @@ describe("ExecutionBroker (spec 03)", () => {
       assert.equal(workerTimeoutMs(), 30 * 60_000, "default must give workers headroom to commit real work");
       process.env.PI_ENGINEERING_WORKER_TIMEOUT_MS = "60000";
       assert.equal(workerTimeoutMs(), 60_000, "env override must win");
+      process.env.PI_ENGINEERING_WORKER_TIMEOUT_MS = String(2 ** 40);
+      assert.equal(workerTimeoutMs(), 2 ** 31 - 1, "beyond setTimeout's range the timer would fire at once");
       process.env.PI_ENGINEERING_WORKER_TIMEOUT_MS = "not-a-number";
       assert.equal(workerTimeoutMs(), 30 * 60_000, "invalid env must fall back to default");
     } finally {
