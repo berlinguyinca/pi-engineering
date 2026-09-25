@@ -157,7 +157,10 @@ async function withRuntime(run: (dir: string) => Promise<void>): Promise<void> {
 
 function assertReduced(seen: Seen | undefined, newestData: string): void {
   assert.ok(seen, "the provider was called");
-  const texts = seen.messages.flatMap((m) => m.content.filter((b) => b.type === "text").map((b) => b.text ?? ""));
+  // pi-ai 0.87 folds the system prompt into a leading system message whose
+  // content is a string.
+  const blocks = seen.messages.filter((m) => Array.isArray(m.content));
+  const texts = blocks.flatMap((m) => m.content.filter((b) => b.type === "text").map((b) => b.text ?? ""));
   assert.ok(
     texts.some((t) => t.startsWith("[image omitted to fit the request size limit")),
     "oldest images dropped",

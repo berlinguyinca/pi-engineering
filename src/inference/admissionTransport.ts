@@ -941,7 +941,11 @@ export function createAdmissionStreamSimple(opts: AdmissionTransportOptions): Ad
     ((model, context, options) => {
       const api = getApiProvider(model.api);
       if (!api) throw new Error(`No API provider registered for api: ${model.api}`);
-      return api.streamSimple(model, context, options);
+      // pi-ai 0.87 providers take a normalized TranscriptContext (system prompt
+      // folded into a leading system message). Pi's ModelRuntime normalizes
+      // before dispatching to a provider, so the context arriving here already
+      // has that shape; the brand is type-only.
+      return api.streamSimple(model, context as Parameters<typeof api.streamSimple>[1], options);
     });
   return (model, context, options) =>
     executeWithAdmissionRetry(

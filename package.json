@@ -37,7 +37,10 @@
   },
   "devDependencies": {
     "@biomejs/biome": "^1.9.4",
-    "@earendil-works/pi-coding-agent": "0.85.1",
+    "@earendil-works/pi-agent-core": "0.87.1",
+    "@earendil-works/pi-ai": "0.87.1",
+    "@earendil-works/pi-coding-agent": "0.87.1",
+    "@earendil-works/pi-tui": "0.87.1",
     "@types/node": "^22.10.0",
     "@types/pngjs": "^6.0.5",
     "axe-core": "^4.13.0",
