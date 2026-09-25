@@ -28,7 +28,19 @@ interface Step {
 const TIMEOUT = { exitStatus: "failed", summary: "Worker timed out.", error: "timeout" } as const;
 const SUCCESS = { exitStatus: "succeeded", summary: "done" } as const;
 
-async function scenario(steps: Step[]) {
+/**
+ * How the integration runner behaves. "record" (default) only records the
+ * handoffs; "merge" really merges each handoff (its exact ref when given) into
+ * the fixture checkout, skipping the listed branches, like realBackends does
+ * for a conflicting recovered handoff.
+ */
+interface IntegrationMode {
+  merge?: boolean;
+  skip?: (branch: string) => boolean;
+  exitStatus?: string;
+}
+
+async function scenario(steps: Step[], mode: IntegrationMode = {}) {
   const fx = await makeFixtureRepo();
   const git = (await GitRepo.open(fx.root))!;
   const store = MissionStore.open(JsonlEventStore.inMemory());
@@ -71,7 +83,19 @@ async function scenario(steps: Step[]) {
       integration: {
         runIntegration: async (input) => {
           handoffs.push(...(input.handoffs as Handoff[]));
-          return { executionId: "i", exitStatus: "succeeded", summary: "merged", artifactRefs: [], usage: {} };
+          if (mode.merge) {
+            for (const h of input.handoffs) {
+              if (mode.skip?.(h.worktree.branch)) continue;
+              await git.mergeBranch(h.ref ?? h.worktree.branch);
+            }
+          }
+          return {
+            executionId: "i",
+            exitStatus: mode.exitStatus ?? "succeeded",
+            summary: "merged",
+            artifactRefs: [],
+            usage: {},
+          };
         },
       },
     },
@@ -119,7 +143,9 @@ async function scenario(steps: Step[]) {
     })
   ).result();
   const branchOf = (task: string) => `pi-eng-orch-${taskIds.get(task)}`;
-  return { fx, store, m, handoffs, workerCommits, branchOf };
+  const taskOf = (task: string) => taskIds.get(task)!;
+  const integration = store.listExecutions(m.mission_id).find((e) => e.backend === "integration")!;
+  return { fx, store, m, handoffs, workerCommits, branchOf, taskOf, integration };
 }
 
 describe("ExecutionBroker: recovering a timed-out worker's committed work", () => {
@@ -195,6 +221,50 @@ describe("ExecutionBroker: recovering a timed-out worker's committed work", () =
         s.handoffs.map((h) => [h.worktree.branch, h.recovered === true]),
         [[s.branchOf("retried"), false]],
       );
+    } finally {
+      await s.fx.cleanup();
+    }
+  });
+});
+
+describe("ExecutionBroker: recording what recovery actually merged (completion-gate evidence)", () => {
+  it("records the recovered task, branch and exact ref on the integration execution once merged", async () => {
+    const s = await scenario(
+      [
+        { task: "recovered", commit: ["r.txt"], edit: ["half.txt"], outcome: TIMEOUT },
+        { task: "clean", commit: ["c.txt"], outcome: SUCCESS },
+      ],
+      { merge: true },
+    );
+    try {
+      assert.deepEqual(s.integration.recovered_merged, [
+        { task_id: s.taskOf("recovered"), branch: s.branchOf("recovered"), ref: s.workerCommits.get("recovered") },
+      ]);
+    } finally {
+      await s.fx.cleanup();
+    }
+  });
+
+  it("records nothing for recovered work the integrator did not merge (skipped / conflict)", async () => {
+    const s = await scenario([{ task: "recovered", commit: ["r.txt"], outcome: TIMEOUT }], {
+      merge: true,
+      skip: () => true,
+    });
+    try {
+      assert.equal(s.handoffs.length, 1, "it was handed off");
+      assert.equal(s.integration.recovered_merged, undefined);
+    } finally {
+      await s.fx.cleanup();
+    }
+  });
+
+  it("records nothing when the integration itself did not succeed", async () => {
+    const s = await scenario([{ task: "recovered", commit: ["r.txt"], outcome: TIMEOUT }], {
+      merge: true,
+      exitStatus: "failed",
+    });
+    try {
+      assert.equal(s.integration.recovered_merged, undefined);
     } finally {
       await s.fx.cleanup();
     }

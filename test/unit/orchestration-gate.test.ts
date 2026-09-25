@@ -95,6 +95,103 @@ describe("CompletionGate (spec 07)", () => {
     assert.equal(v.can_complete, false);
   });
 
+  describe("recovered timed-out work (MSN-4IhxSO)", () => {
+    type Store = ReturnType<typeof mission>["store"];
+    type RecoveredMerge = { task_id: string; branch: string; ref: string };
+
+    function settled(store: Store, missionId: string, kind: string, role: string, status: "SUCCEEDED" | "FAILED") {
+      const t = store.createTask({ mission_id: missionId, kind: kind as never, role, objective: kind });
+      store.transitionTask(t.task_id, "READY");
+      store.transitionTask(t.task_id, "RUNNING");
+      store.transitionTask(t.task_id, status);
+      return t;
+    }
+    function execution(
+      store: Store,
+      missionId: string,
+      kind: "integration" | "validation" | "review",
+      status: "SUCCEEDED" | "FAILED",
+      extra: Record<string, unknown> = {},
+    ) {
+      const t = settled(store, missionId, kind, kind === "integration" ? "integrator" : kind, status);
+      const ex = store.createExecution({ task_id: t.task_id, backend: kind, mission_id: missionId });
+      store.setExecutionStatus(ex.execution_id, status, extra as never);
+    }
+    const merge = (t: { task_id: string }): RecoveredMerge => ({
+      task_id: t.task_id,
+      branch: `pi-eng-orch-${t.task_id}`,
+      ref: "4d57c63",
+    });
+    /** A timed-out implementer, as the broker leaves it. */
+    function timedOut(store: Store, missionId: string) {
+      return settled(store, missionId, "agent", "implementer", "FAILED");
+    }
+
+    it("supersedes the FAILED status once its recovered ref merged and validation + review passed after", () => {
+      const { store, m } = mission(["validation", "independent_review"]);
+      const t = timedOut(store, m.mission_id);
+      execution(store, m.mission_id, "integration", "SUCCEEDED", { recovered_merged: [merge(t)] });
+      execution(store, m.mission_id, "validation", "SUCCEEDED");
+      execution(store, m.mission_id, "review", "SUCCEEDED");
+      const v = new CompletionGate(store).evaluate(store.getMission(m.mission_id)!);
+      assert.equal(v.can_complete, true, JSON.stringify(v.reasons));
+    });
+
+    it("does not read integration prose: a summary naming the branch is not evidence", () => {
+      const { store, m } = mission(["validation", "independent_review"]);
+      const t = timedOut(store, m.mission_id);
+      execution(store, m.mission_id, "integration", "SUCCEEDED", {
+        summary: `integrated pi-eng-orch-${t.task_id}; checks: pass`,
+      });
+      execution(store, m.mission_id, "validation", "SUCCEEDED");
+      execution(store, m.mission_id, "review", "SUCCEEDED");
+      const v = new CompletionGate(store).evaluate(store.getMission(m.mission_id)!);
+      assert.equal(v.can_complete, false);
+      assert.ok(
+        v.reasons.some((r) => r.includes("task(s) failed")),
+        JSON.stringify(v.reasons),
+      );
+    });
+
+    it("a succeeded integration that merged OTHER work does not supersede an unrecovered task", () => {
+      const { store, m } = mission(["validation", "independent_review"]);
+      const recovered = timedOut(store, m.mission_id);
+      const unrecovered = timedOut(store, m.mission_id);
+      execution(store, m.mission_id, "integration", "SUCCEEDED", { recovered_merged: [merge(recovered)] });
+      execution(store, m.mission_id, "validation", "SUCCEEDED");
+      execution(store, m.mission_id, "review", "SUCCEEDED");
+      const v = new CompletionGate(store).evaluate(store.getMission(m.mission_id)!);
+      assert.equal(v.can_complete, false);
+      assert.ok(v.reasons.includes("1 task(s) failed"), JSON.stringify(v.reasons));
+      void unrecovered;
+    });
+
+    it("a FAILED integration's recovered merge is not evidence", () => {
+      const { store, m } = mission(["validation", "independent_review"]);
+      const t = timedOut(store, m.mission_id);
+      execution(store, m.mission_id, "integration", "FAILED", { recovered_merged: [merge(t)] });
+      execution(store, m.mission_id, "integration", "SUCCEEDED");
+      execution(store, m.mission_id, "validation", "SUCCEEDED");
+      execution(store, m.mission_id, "review", "SUCCEEDED");
+      const v = new CompletionGate(store).evaluate(store.getMission(m.mission_id)!);
+      assert.equal(v.can_complete, false, JSON.stringify(v.reasons));
+    });
+
+    it("requires validation AND review to have passed AFTER the integration that merged it", () => {
+      for (const after of [["validation"], ["review"], []] as const) {
+        const { store, m } = mission(["validation", "independent_review"]);
+        const t = timedOut(store, m.mission_id);
+        // Evidence from BEFORE the recovered merge does not cover it.
+        execution(store, m.mission_id, "validation", "SUCCEEDED");
+        execution(store, m.mission_id, "review", "SUCCEEDED");
+        execution(store, m.mission_id, "integration", "SUCCEEDED", { recovered_merged: [merge(t)] });
+        for (const k of after) execution(store, m.mission_id, k, "SUCCEEDED");
+        const v = new CompletionGate(store).evaluate(store.getMission(m.mission_id)!);
+        assert.equal(v.can_complete, false, `after=${after.join("+") || "none"}: ${JSON.stringify(v.reasons)}`);
+      }
+    });
+  });
+
   it("a generic reviewer cannot satisfy a security_review gate (spec 07)", () => {
     const { store, m } = mission(["validation", "independent_review", "security_review"], "high");
     const gate = new CompletionGate(store);
@@ -104,6 +201,7 @@ describe("CompletionGate (spec 07)", () => {
       validationsPassed: 1,
       reviewsCompleted: 1,
       securityReviewsCompleted: 0,
+      recoveredTasks: [],
       findings: [],
     };
     const v = gate.evaluate(store.getMission(m.mission_id)!, evidence);

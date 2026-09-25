@@ -191,6 +191,20 @@ export interface Execution {
   logs: string[];
   artifact_refs: string[];
   status: ExecutionStatus;
+  /**
+   * Integration executions only: recovered worker commits (from a
+   * wall-clock-timed-out execution) that this integration verifiably merged —
+   * the exact worker ref is an ancestor of HEAD afterwards. Consumed by the
+   * completion gate; absent when nothing recovered was merged.
+   */
+  recovered_merged?: RecoveredMerge[];
+}
+
+/** A recovered worker commit merged by integration. */
+export interface RecoveredMerge {
+  task_id: EntityId;
+  branch: string;
+  ref: string;
 }
 
 /** Result of the semantic + policy router (spec 01). */

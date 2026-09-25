@@ -20,7 +20,7 @@
 
 import type { GitRepo } from "../git/GitRepo.ts";
 import type { MissionStore } from "./missionStore.ts";
-import type { ExecutionBackend } from "./types.ts";
+import type { ExecutionBackend, RecoveredMerge } from "./types.ts";
 
 export interface ExecutionRequestInput {
   taskId: string;
@@ -64,6 +64,12 @@ export interface ExecutionOutcome {
    * window instead of immediately failing the task.
    */
   error?: string;
+  /**
+   * Integration only: recovered worker commits this integration verifiably
+   * merged (set by the broker, not the runner). Persisted on the execution as
+   * `recovered_merged` for the completion gate.
+   */
+  recoveredMerged?: RecoveredMerge[];
 }
 
 /** Backend runner contracts — injected, so the broker stays deterministic-testable. */
@@ -199,7 +205,10 @@ export class ExecutionBroker {
    * own tip captured BEFORE the harvest auto-commit. A later successful
    * execution on the same branch (a retry of the task) deletes the entry.
    */
-  private readonly failedBranches = new Map<string, Map<string, { marker: string; recoverRef?: string }>>();
+  private readonly failedBranches = new Map<
+    string,
+    Map<string, { marker: string; taskId: string; recoverRef?: string }>
+  >();
   /** Missions where at least one worker branch carried commits since base (own commits recognized at harvest). */
   private readonly committedWork = new Map<string, boolean>();
 
@@ -577,6 +586,7 @@ export class ExecutionBroker {
               exit_status: outcome.exitStatus,
               artifact_refs: outcome.artifactRefs,
               usage: outcome.usage,
+              ...(outcome.recoveredMerged?.length ? { recovered_merged: outcome.recoveredMerged } : {}),
             });
           }
           // Persist the worker's edits onto its branch before the worktree is
@@ -599,10 +609,12 @@ export class ExecutionBroker {
               // Last settled outcome wins: a retry that succeeds on the same
               // branch clears the earlier failure instead of being excluded.
               const byBranch =
-                this.failedBranches.get(input.missionId) ?? new Map<string, { marker: string; recoverRef?: string }>();
+                this.failedBranches.get(input.missionId) ??
+                new Map<string, { marker: string; taskId: string; recoverRef?: string }>();
               if (failed) {
                 byBranch.set(info.branch, {
                   marker: outcome.error ?? outcome.summary ?? "failed",
+                  taskId: input.taskId,
                   ...(recoverRef ? { recoverRef } : {}),
                 });
               } else {
@@ -695,6 +707,7 @@ export class ExecutionBroker {
         const failedByBranch = this.failedBranches.get(input.missionId);
         const handoffs: IntegrationHandoff[] = [];
         const recovered: IntegrationHandoff[] = [];
+        const recoveredMeta: RecoveredMerge[] = [];
         for (const w of this.missionWorktrees.get(input.missionId) ?? []) {
           const failure = failedByBranch?.get(w.branch);
           if (failure === undefined) {
@@ -715,6 +728,7 @@ export class ExecutionBroker {
             continue;
           }
           if (ahead > 0) {
+            recoveredMeta.push({ task_id: failure.taskId, branch: w.branch, ref: failure.recoverRef });
             recovered.push({
               worktree: w,
               ref: failure.recoverRef,
@@ -732,7 +746,25 @@ export class ExecutionBroker {
         handoffs.push(...recovered);
         // After integration, release the merged worktrees (fire-and-forget
         // cleanup so the return value stays a plain Promise<ExecutionOutcome>).
-        const outcome = runner.runIntegration({ objective: input.objective, handoffs, signal });
+        // What recovery actually landed is decided here, from git, not from
+        // the runner's prose: a recovered ref counts only when the integration
+        // succeeded AND the exact worker commit is an ancestor of HEAD after it
+        // (a skipped or conflicting recovered handoff is not). This is the
+        // completion gate's evidence for superseding the timed-out task.
+        const git = this.git;
+        const outcome = runner
+          .runIntegration({ objective: input.objective, handoffs, signal })
+          .then(async (o): Promise<ExecutionOutcome> => {
+            if (o.exitStatus !== "succeeded" || !git || recoveredMeta.length === 0) return o;
+            // Unknown HEAD: no evidence, and never a failed integration.
+            const head = await git.headCommit().catch(() => null);
+            if (!head) return o;
+            const merged: RecoveredMerge[] = [];
+            for (const r of recoveredMeta) {
+              if (await git.isAncestor(r.ref, head).catch(() => false)) merged.push(r);
+            }
+            return merged.length > 0 ? { ...o, recoveredMerged: merged } : o;
+          });
         // Release the worktrees, but delete the branches only when the merge
         // actually landed. After a conflict or a failed integration the branch is
         // the only remaining copy of the worker's output, and removeWorktree
