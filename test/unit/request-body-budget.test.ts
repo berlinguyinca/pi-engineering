@@ -11,8 +11,13 @@
  */
 
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { before, test } from "node:test";
+import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { isRetryableAssistantError } from "@earendil-works/pi-ai/utils/retry";
+import { createReadTool } from "@earendil-works/pi-coding-agent";
 import { decideGatewayRetry, parseGatewayWait } from "../../src/gateway/signals.ts";
 import { classifyError } from "../../src/guard/transient.ts";
 import {
@@ -20,6 +25,7 @@ import {
   DEFAULT_REQUEST_BODY_HEADROOM,
   FALLBACK_MAX_REQUEST_BODY_BYTES,
   type ImageResizer,
+  LEARNED_CAP_TTL_MS,
   REQUEST_LIMIT_HEADER,
   RequestBodyTooLargeError,
   advertisedRequestLimit,
@@ -34,11 +40,12 @@ import {
   requestBodyLimit,
   resetAdvertisedRequestLimits,
   resolveRequestBodyBudgetConfig,
+  streamWithinRequestBudget,
 } from "../../src/request/bodyBudget.ts";
 import { classifyInfraError } from "../../src/resilience/classify.ts";
 import { DEFAULT_INFERWEAVE_CAPABILITIES } from "../../src/vision/inferweave.ts";
 import { extractMetadata } from "../../src/vision/processor.ts";
-import { pngImage } from "../support/images.ts";
+import { makePng, pngImage } from "../support/images.ts";
 
 type Img = ReturnType<typeof pngImage>;
 const user = (content: unknown[]) => ({ role: "user", content, timestamp: 1 });
@@ -457,42 +464,64 @@ test("fit: images Pi already sized (<= 2000px) are left alone when the request f
   assert.equal(fit.context, context, "no copy, no re-encode");
 });
 
-test("fit: a larger image is downscaled losslessly (PNG stays PNG) and its coordinate note follows", async () => {
-  const noted = pngImage(2400, 1500, 20, 6);
-  const note =
-    "[Image: original 4800x3000, displayed at 2400x1500. Multiply coordinates by 2.00 to map to original image.]";
+test("fit: a pasted image over Pi's cap is downscaled losslessly (PNG stays PNG) and gains a coordinate note", async () => {
   const pasted = pngImage(2880, 1800, 20, 7);
-  const context = {
-    messages: [
-      { ...toolResult([noted, { type: "text", text: note }]) },
-      assistant("seen"),
-      user([{ type: "text", text: "and this" }, pasted]),
-    ],
-  };
+  const context = { messages: [user([{ type: "text", text: "match this" }, pasted])] };
   const snapshot = JSON.stringify(context);
   const fit = await fitRequestBody(context as BudgetContext, 64 * 1024 * 1024);
   assert.equal(JSON.stringify(context), snapshot);
-  const out = fit.context.messages as Array<{
+  const out = fit.context.messages[0] as {
     content: Array<{ type: string; data?: string; mimeType?: string; text?: string }>;
-  }>;
-
-  const first = out[0]?.content ?? [];
-  assert.equal(first[0]?.mimeType, "image/png");
-  const firstMeta = extractMetadata(Buffer.from(first[0]?.data ?? "", "base64"));
-  assert.deepEqual([firstMeta.width, firstMeta.height], [1800, 1125]);
+  };
+  assert.equal(out.content[1]?.mimeType, "image/png");
+  const meta = extractMetadata(Buffer.from(out.content[1]?.data ?? "", "base64"));
+  assert.deepEqual([meta.width, meta.height], [1800, 1125]);
   assert.equal(
-    first[1]?.text,
-    "[Image: original 4800x3000, displayed at 1800x1125. Multiply coordinates by 2.67 to map to original image.]",
-    "the existing note is rewritten against the new size",
-  );
-
-  const last = out[2]?.content ?? [];
-  assert.equal(last[1]?.mimeType, "image/png");
-  assert.equal(
-    last[2]?.text,
+    out.content[2]?.text,
     "[Image: original 2880x1800, displayed at 1800x1125. Multiply coordinates by 1.60 to map to original image.]",
-    "a note is added where there was none",
   );
+});
+
+test("fit: re-encoding an image Pi's read tool produced rewrites Pi's own note line, rebased on the original", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-read-"));
+  try {
+    writeFileSync(join(dir, "shot.png"), makePng(3000, 1900, 700, 11));
+    const read = await createReadTool(dir).execute("r1", { path: "shot.png" } as never);
+    const content = read.content as Array<{ type: string; text?: string; data?: string }>;
+    // Pi's real layout: the note is a LINE in the text block BEFORE the image.
+    assert.equal(content[0]?.type, "text");
+    assert.match(
+      content[0]?.text ?? "",
+      /^Read image file \[image\/\w+\]\n\[Image: original 3000x1900, displayed at 2000x1267\./,
+    );
+    assert.equal(content[1]?.type, "image");
+
+    const context = {
+      messages: [
+        user([{ type: "text", text: "look at the file" }]),
+        { ...assistant(""), content: [{ type: "toolCall", id: "r1", name: "read", arguments: { path: "shot.png" } }] },
+        { ...toolResult(content), toolCallId: "r1" },
+        assistant("seen"),
+        user([{ type: "text", text: "next" }]),
+      ],
+    };
+    const estimate = estimateRequestBodyBytes(context as never);
+    const budget = 1_400_000;
+    assert.ok(estimate > budget, `fixture must be over budget (${estimate})`);
+    const fit = await fitRequestBody(context as BudgetContext, budget);
+    const out = (fit.context.messages[2] as { content: Array<{ type: string; text?: string; data?: string }> }).content;
+    assert.equal(out.length, 2, "no second, conflicting note block");
+    const meta = extractMetadata(Buffer.from(out[1]?.data ?? "", "base64"));
+    assert.ok(Math.max(meta.width ?? 0, meta.height ?? 0) <= 1800);
+    const scale = (3000 / (meta.width ?? 1)).toFixed(2);
+    assert.equal(
+      out[0]?.text,
+      `${content[0]?.text?.split("\n")[0]}\n[Image: original 3000x1900, displayed at ${meta.width}x${meta.height}. Multiply coordinates by ${scale} to map to original image.]`,
+    );
+    assert.equal((content[0]?.text ?? "").includes("displayed at 2000x1267"), true, "Pi's tool result is untouched");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("budget: advertised caps are clamped, a learned 413 cap wins, and a newer header beats an older listing", () => {
@@ -584,4 +613,81 @@ test("budget: GET /models x_max_request_bytes (the gateway's extension field) is
     server.close();
     resetAdvertisedRequestLimits();
   }
+});
+
+test("learned caps have a floor, expire, and only a labelled limit is parsed from text", () => {
+  resetAdvertisedRequestLimits();
+  const config = resolveRequestBodyBudgetConfig({});
+  const base = "https://gw.example/v1";
+  assert.equal(noteLearnedRequestLimit(base, 512 * 1024, 0), false, "below 1 MiB is not learned");
+  assert.equal(requestBodyLimit(config, { baseUrl: base }, 0).source, "fallback");
+  assert.equal(noteLearnedRequestLimit(base, 4 * 1024 * 1024, 0), true);
+  assert.equal(requestBodyLimit(config, { baseUrl: base }, 1000).maxBytes, 4 * 1024 * 1024);
+  assert.equal(
+    requestBodyLimit(config, { baseUrl: base }, LEARNED_CAP_TTL_MS + 1).source,
+    "fallback",
+    "a learned cap expires",
+  );
+  // Text fallback needs "limit|max … N bytes"; a bare "cap" or unit-less number is not taken.
+  assert.equal(limitFromBodyTooLarge("413 body too large, cap 12345678"), undefined);
+  assert.equal(limitFromBodyTooLarge("413 body too large, limit is 12345678"), undefined);
+  assert.equal(limitFromBodyTooLarge("413 body too large, limit is 12345678 bytes"), 12_345_678);
+  resetAdvertisedRequestLimits();
+});
+
+function scriptedBase(events: Array<Record<string, unknown>>, counter: { pulled: number; called: number }) {
+  return () => {
+    counter.called++;
+    const stream = createAssistantMessageEventStream();
+    return {
+      async *[Symbol.asyncIterator]() {
+        for (const e of events) {
+          counter.pulled++;
+          yield e;
+        }
+      },
+      result: async () => (events.at(-1) as { message?: unknown })?.message ?? stream.result(),
+    };
+  };
+}
+
+test("wrapper: an already-aborted call is never sent", async () => {
+  const counter = { pulled: 0, called: 0 };
+  const wrapped = streamWithinRequestBudget(
+    scriptedBase([{ type: "done", message: { stopReason: "stop" } }], counter) as never,
+    {
+      config: resolveRequestBodyBudgetConfig({}),
+      errorResult: (_m, error) => ({ stopReason: "error", errorMessage: error.message }),
+    },
+  );
+  const aborted = new AbortController();
+  aborted.abort();
+  const result = await wrapped(
+    { baseUrl: "https://gw.example/v1" },
+    { messages: [] } as never,
+    { signal: aborted.signal } as never,
+  ).result();
+  assert.equal((result as { stopReason?: string }).stopReason, "aborted");
+  assert.equal(counter.called, 0);
+});
+
+test("wrapper: when the consumer stops reading, the inner stream is not drained", async () => {
+  const counter = { pulled: 0, called: 0 };
+  const events = [
+    { type: "start" },
+    ...Array.from({ length: 50 }, (_, i) => ({ type: "text_delta", delta: String(i) })),
+    { type: "done", message: { stopReason: "stop" } },
+  ];
+  const wrapped = streamWithinRequestBudget(scriptedBase(events, counter) as never, {
+    config: resolveRequestBodyBudgetConfig({}),
+    errorResult: (_m, error) => ({ stopReason: "error", errorMessage: error.message }),
+  });
+  const stream = wrapped({ baseUrl: "https://gw.example/v1" }, { messages: [] } as never, undefined) as AsyncIterable<{
+    type?: string;
+  }>;
+  for await (const event of stream) {
+    if (event.type === "text_delta") break;
+  }
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.ok(counter.pulled < events.length, `inner was drained (${counter.pulled}/${events.length})`);
 });

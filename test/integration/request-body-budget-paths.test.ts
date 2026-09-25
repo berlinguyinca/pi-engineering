@@ -287,6 +287,20 @@ test("interactive path: a second 413 is final, explained, and not retried again"
   });
 });
 
+test("interactive path: a 413 on a body under 1 MiB teaches nothing and is not resent", async () => {
+  await withRuntime(async (dir) => {
+    const probe = probeProvider({ error: "413 http: request body too large" });
+    const runtime = await interactiveRuntime(dir, probe);
+    const context = { messages: [{ role: "user", content: "small", timestamp: 1 }] };
+    const result = await runtime.streamSimple(MODEL as never, context as never, { apiKey: "k" }).result();
+    assert.equal(probe.seen.length, 1, "no resend");
+    assert.equal(result.stopReason, "error");
+    assert.match(result.errorMessage ?? "", /out of budget/);
+    const limit = requestBodyLimit(resolveRequestBodyBudgetConfig({}), { baseUrl: BASE_URL, id: MODEL.id });
+    assert.equal(limit.source, "fallback", "no process-wide cap learned from a tiny body");
+  });
+});
+
 test("compaction: summarization calls go through the same guarded streamSimple", async () => {
   await withRuntime(async (dir) => {
     const executor = new PiWorkerExecutor({ agentDir: dir, requestBodyBudget: BUDGET });

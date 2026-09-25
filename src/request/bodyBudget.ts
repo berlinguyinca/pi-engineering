@@ -132,11 +132,13 @@ export function resolveRequestBodyBudgetConfig(
  */
 const advertised = new Map<string, number>();
 /**
- * Caps a 413 taught us, same keys. Ground truth about the gateway in front of
- * us, which a header relayed from a gateway behind it may overstate. Only ever
- * lowered, for the life of the process.
+ * Caps a 413 taught us, per base URL. Ground truth about the gateway in front
+ * of us, which a header relayed from a gateway behind it may overstate. Only
+ * ever lowered while it lasts, never below 1 MiB, and forgotten after
+ * LEARNED_CAP_TTL_MS so a raised gateway cap is picked up again.
  */
-const learned = new Map<string, number>();
+const learned = new Map<string, { bytes: number; at: number }>();
+export const LEARNED_CAP_TTL_MS = 30 * 60 * 1000;
 
 function baseKey(baseUrl: string): string {
   return baseUrl.trim().replace(/\/+$/, "");
@@ -173,11 +175,28 @@ export function noteRequestLimitHeader(baseUrl: string | undefined, headers: unk
 }
 
 /** Record a cap a 413 proved; only ever lowers what is known. */
-export function noteLearnedRequestLimit(baseUrl: string, bytes: number): void {
+/**
+ * Record a cap a 413 proved. Returns false — and learns nothing — for a value
+ * below MIN_ADVERTISED_REQUEST_BYTES: a 413 on a body that small is not a
+ * size cap worth shrinking every later request in the process to.
+ */
+export function noteLearnedRequestLimit(baseUrl: string, bytes: number, now: number = Date.now()): boolean {
   const n = positiveInt(bytes);
-  if (!baseUrl || n === undefined) return;
+  if (!baseUrl || n === undefined || n < MIN_ADVERTISED_REQUEST_BYTES) return false;
   const key = baseKey(baseUrl);
-  learned.set(key, Math.min(learned.get(key) ?? Number.POSITIVE_INFINITY, n));
+  const current = learnedCap(key, now);
+  learned.set(key, { bytes: Math.min(current ?? Number.POSITIVE_INFINITY, n), at: now });
+  return true;
+}
+
+function learnedCap(key: string, now: number): number | undefined {
+  const entry = learned.get(key);
+  if (!entry) return undefined;
+  if (now - entry.at > LEARNED_CAP_TTL_MS) {
+    learned.delete(key);
+    return undefined;
+  }
+  return entry.bytes;
 }
 
 export function advertisedRequestLimit(baseUrl: string | undefined, modelId?: string): number | undefined {
@@ -195,9 +214,10 @@ export function resetAdvertisedRequestLimits(): void {
 export function requestBodyLimit(
   config: RequestBodyBudgetConfig,
   model: { baseUrl?: string; id?: string },
+  now: number = Date.now(),
 ): RequestBodyLimit {
   const known = advertisedRequestLimit(model.baseUrl, model.id);
-  const taught = model.baseUrl ? learned.get(baseKey(model.baseUrl)) : undefined;
+  const taught = model.baseUrl ? learnedCap(baseKey(model.baseUrl), now) : undefined;
   let [maxBytes, source]: [number, RequestBodyLimit["source"]] =
     config.maxBytes !== undefined
       ? [config.maxBytes, "config"]
@@ -322,23 +342,44 @@ interface Reencoded {
 }
 
 /**
- * Re-encodes are expensive and the same old image recurs every turn. Keyed by
- * mode, length and a hash of sampled slices (hashing 3 MB per image per turn is
- * what the cache is avoiding); LRU. Only deterministic outcomes are cached — a
- * resizer that throws or returns nothing is tried again next time.
+ * Re-encodes are expensive and the same old image recurs every turn.
+ *
+ * First level: a WeakMap on the image block object itself, which the session
+ * keeps stable across turns — no hashing at all on a hit, and no collisions.
+ * Second level (a block rebuilt by a conversion): a full sha256 of the data,
+ * LRU. Only deterministic outcomes are cached — a resizer that throws or
+ * returns nothing is tried again next time.
  */
+const blockCache = new WeakMap<object, Map<string, Reencoded | "unchanged">>();
 const resizeCache = new Map<string, Reencoded | "unchanged">();
 const RESIZE_CACHE_LIMIT = 64;
-const SAMPLE = 4096;
 
 function cacheKey(mode: string, data: string): string {
-  const mid = Math.floor(data.length / 2);
-  const hash = createHash("sha1")
-    .update(data.slice(0, SAMPLE))
-    .update(data.slice(Math.max(0, mid - SAMPLE / 2), mid + SAMPLE / 2))
-    .update(data.slice(-SAMPLE))
-    .digest("hex");
-  return `${mode}:${data.length}:${hash}`;
+  return `${mode}:${createHash("sha256").update(data).digest("hex")}`;
+}
+
+function cached(image: ImageBlock, mode: string): Reencoded | "unchanged" | undefined {
+  const byBlock = blockCache.get(image)?.get(mode);
+  if (byBlock !== undefined) return byBlock;
+  const key = cacheKey(mode, image.data);
+  const hit = resizeCache.get(key);
+  if (hit === undefined) return undefined;
+  resizeCache.delete(key);
+  resizeCache.set(key, hit);
+  remember(image, mode, hit, false);
+  return hit;
+}
+
+function remember(image: ImageBlock, mode: string, result: Reencoded | "unchanged", global = true): void {
+  let perBlock = blockCache.get(image);
+  if (!perBlock) {
+    perBlock = new Map();
+    blockCache.set(image, perBlock);
+  }
+  perBlock.set(mode, result);
+  if (!global) return;
+  resizeCache.set(cacheKey(mode, image.data), result);
+  if (resizeCache.size > RESIZE_CACHE_LIMIT) resizeCache.delete(resizeCache.keys().next().value as string);
 }
 
 async function reencode(
@@ -347,13 +388,9 @@ async function reencode(
   mode: "lossless" | "lossy",
   maxLongEdge: number,
 ): Promise<Reencoded | null> {
-  const key = cacheKey(`${mode}:${maxLongEdge}`, image.data);
-  const hit = resizeCache.get(key);
-  if (hit !== undefined) {
-    resizeCache.delete(key);
-    resizeCache.set(key, hit);
-    return hit === "unchanged" ? null : hit;
-  }
+  const modeKey = `${mode}:${maxLongEdge}`;
+  const hit = cached(image, modeKey);
+  if (hit !== undefined) return hit === "unchanged" ? null : hit;
   // Lossless: the only change is size. A PNG's first candidate is a PNG, and a
   // JPEG must come back no bigger than it went in, which rules out a PNG.
   const maxBytes =
@@ -386,14 +423,17 @@ async function reencode(
       : out.data.length < image.data.length);
   const result: Reencoded | "unchanged" =
     useful && dims ? { data: out.data, mimeType: out.mimeType, ...dims } : "unchanged";
-  resizeCache.set(key, result);
-  if (resizeCache.size > RESIZE_CACHE_LIMIT) resizeCache.delete(resizeCache.keys().next().value as string);
+  remember(image, modeKey, result);
   return result === "unchanged" ? null : result;
 }
 
-/** Pi's read-tool note: "[Image: original WxH, displayed at wxh. Multiply coordinates by S …]". */
+/**
+ * Pi's read-tool note, a LINE of the text block before the image
+ * ("Read image file [image/png]\n[Image: original WxH, displayed at wxh. …]";
+ * pi-coding-agent core/tools/read.js, utils/image-process.js).
+ */
 const DIMENSION_NOTE =
-  /^\[Image: original (\d+)x(\d+), displayed at (\d+)x(\d+)\. Multiply coordinates by [\d.]+ to map to original image\.\]$/;
+  /^\[Image: original (\d+)x(\d+), displayed at (\d+)x(\d+)\. Multiply coordinates by [\d.]+ to map to original image\.\]$/m;
 
 function dimensionNote(original: { width: number; height: number }, shown: { width: number; height: number }): string {
   const scale = original.width / shown.width;
@@ -513,8 +553,11 @@ export async function fitRequestBody<C extends BudgetContext>(
   const current = (ref: { message: number; block: number }): unknown =>
     ((messages ?? source)[ref.message]?.content as unknown[])[ref.block];
   const actions: string[] = [];
-  /** Notes to insert after a rescaled image that had none (applied last: inserting shifts indices). */
-  const pendingNotes = new Map<string, string>();
+  /**
+   * Original size for rescaled images that had no note; the note is written
+   * at the end, against the image's final size (inserting shifts indices).
+   */
+  const pendingNotes = new Map<string, { width: number; height: number }>();
 
   const rescale = async (ref: ImageRef, mode: "lossless" | "lossy"): Promise<boolean> => {
     const image = current(ref) as ImageBlock;
@@ -525,19 +568,27 @@ export async function fitRequestBody<C extends BudgetContext>(
     content[ref.block] = { ...image, data: out.data, mimeType: out.mimeType };
     estimate -= imageCost(image) - imageCost(content[ref.block] as ImageBlock);
     if (before && (before.width !== out.width || before.height !== out.height)) {
-      // Keep coordinates mappable: rewrite Pi's note when it follows the
-      // image, otherwise add one against the size the model knew.
-      const next = content[ref.block + 1];
-      const match = isText(next) ? DIMENSION_NOTE.exec(next.text) : null;
-      if (match && isText(next)) {
+      // Keep coordinates mappable. Pi's own note is a line in the text block
+      // next to the image (before it, from the read tool): rewrite that line
+      // in place, rebased on the ORIGINAL size it states. Otherwise add one
+      // against the size the model knew — once, however often this image is
+      // rescaled.
+      const key = `${ref.message}:${ref.block}`;
+      let rewritten = false;
+      for (const at of [ref.block - 1, ref.block + 1]) {
+        const block = content[at];
+        const match = isText(block) ? DIMENSION_NOTE.exec(block.text) : null;
+        if (!match || !isText(block)) continue;
         const original = { width: Number(match[1]), height: Number(match[2]) };
-        const text = dimensionNote(original, out);
-        content[ref.block + 1] = { ...next, text };
-        estimate += Buffer.byteLength(text) - Buffer.byteLength(next.text);
-      } else {
-        const text = dimensionNote(before, out);
-        pendingNotes.set(`${ref.message}:${ref.block}`, text);
-        estimate += Buffer.byteLength(JSON.stringify({ type: "text", text })) + 1;
+        const text = block.text.replace(match[0], dimensionNote(original, out));
+        content[at] = { ...block, text };
+        estimate += Buffer.byteLength(text) - Buffer.byteLength(block.text);
+        rewritten = true;
+        break;
+      }
+      if (!rewritten && !pendingNotes.has(key)) {
+        pendingNotes.set(key, before);
+        estimate += Buffer.byteLength(JSON.stringify({ type: "text", text: dimensionNote(before, out) })) + 1;
       }
     }
     return true;
@@ -616,9 +667,11 @@ export async function fitRequestBody<C extends BudgetContext>(
 
   // Insert added notes, back to front so earlier indices stay valid.
   const inserts = [...pendingNotes.entries()]
-    .map(([key, text]) => {
+    .flatMap(([key, original]) => {
       const [m, b] = key.split(":").map(Number) as [number, number];
-      return { m, b, text };
+      const image = current({ message: m, block: b });
+      const shown = isImage(image) ? imageDimensions(image) : null;
+      return shown ? [{ m, b, text: dimensionNote(original, shown) }] : [];
     })
     .sort((x, y) => y.m - x.m || y.b - x.b);
   for (const { m, b, text } of inserts) writable(m).splice(b + 1, 0, { type: "text", text });
@@ -642,14 +695,14 @@ export function isBodyTooLarge(text: string | undefined): boolean {
 
 /** A cap stated in a gateway's 413 text ("limit 10485760 bytes", "max 10 MiB"), if any. */
 export function limitFromBodyTooLarge(text: string): number | undefined {
-  // The gateway's JSON 413 states it: {"code":"request_too_large",…,"max_request_bytes":33554432}.
-  const field = /"?(?:x_)?max_request_bytes"?\s*[:=]\s*"?(\d+)/i.exec(text);
+  // Preferred: the gateway's JSON 413 states it — {"code":"request_too_large",…,"max_request_bytes":33554432}.
+  const field = /"(?:x_)?max_request_bytes"\s*:\s*"?(\d+)/i.exec(text);
   if (field) return positiveInt(field[1]);
-  // Only a number labelled as the limit: "request body of N bytes" is the
-  // body's size, not the cap.
-  const bytes = /(?:limit|max(?:imum)?|cap)\D{0,20}(\d{4,})\s*(?:bytes|b)?\b/i.exec(text);
+  // Text fallback only for an explicit "limit/max … N bytes" or "… N MiB/MB":
+  // "request body of N bytes" is the body's size, and a bare number is anything.
+  const bytes = /\b(?:limit|max(?:imum)?)\b\D{0,20}?(\d{4,})\s*bytes\b/i.exec(text);
   if (bytes) return positiveInt(bytes[1]);
-  const mib = /(?:limit|max(?:imum)?|cap)\D{0,20}(\d+(?:\.\d+)?)\s*(MiB|MB)\b/i.exec(text);
+  const mib = /\b(?:limit|max(?:imum)?)\b\D{0,20}?(\d+(?:\.\d+)?)\s*(MiB|MB)\b/i.exec(text);
   if (mib) return Math.floor(Number(mib[1]) * (mib[2]?.toLowerCase() === "mib" ? 1024 * 1024 : 1_000_000));
   return undefined;
 }
@@ -685,10 +738,12 @@ export interface RequestBudgetStreamOptions<M, R> {
 }
 
 /** A minimal push/end stream, so a resend can happen behind one returned stream. */
-function eventQueue<E, R>(): AttemptLike<E, R> & { push(e: E): void; end(r: R): void } {
+function eventQueue<E, R>(): AttemptLike<E, R> & { push(e: E): void; end(r: R): void; closed(): boolean } {
   const queue: E[] = [];
   const waiters: Array<() => void> = [];
   let done = false;
+  /** The consumer stopped reading (broke out of its loop) before the end. */
+  let abandoned = false;
   let final: R | undefined;
   const wake = () => {
     for (const w of waiters.splice(0)) w();
@@ -704,16 +759,21 @@ function eventQueue<E, R>(): AttemptLike<E, R> & { push(e: E): void; end(r: R): 
       done = true;
       wake();
     },
+    closed: () => abandoned,
     async result() {
       while (!done) await new Promise<void>((resolve) => waiters.push(resolve));
       return final as R;
     },
     async *[Symbol.asyncIterator]() {
       let i = 0;
-      while (true) {
-        while (i < queue.length) yield queue[i++] as E;
-        if (done) return;
-        await new Promise<void>((resolve) => waiters.push(resolve));
+      try {
+        while (true) {
+          while (i < queue.length) yield queue[i++] as E;
+          if (done) return;
+          await new Promise<void>((resolve) => waiters.push(resolve));
+        }
+      } finally {
+        if (!done) abandoned = true;
       }
     },
   };
@@ -770,14 +830,26 @@ export function streamWithinRequestBudget<
       return { context: fitted.context, estimate: fitted.estimatedBytes, limit };
     };
 
+    const signal = (options as { signal?: AbortSignal } | undefined)?.signal;
+    const endAborted = () => {
+      const aborted = { ...opts.errorResult(model, new Error("Request aborted")), stopReason: "aborted" } as R;
+      out.push({ type: "error", reason: "aborted", error: aborted } as unknown as E);
+      out.end(aborted);
+    };
+
     void (async () => {
+      // Escape before (or during) a slow fit must not send anything.
+      if (signal?.aborted) return endAborted();
       let attempt = await fit();
+      if (signal?.aborted) return endAborted();
       for (let resend = 0; ; resend++) {
         const inner = base(model, attempt.context, withHeaderCapture);
         const held: E[] = [];
         let visible = false;
         let retryWith: number | undefined;
         for await (const event of inner) {
+          // The consumer walked away: stop pulling from the provider.
+          if (out.closed()) break;
           const terminal = event.type === "done" || event.type === "error";
           const failure = event.type === "error" ? event.error : event.type === "done" ? event.message : undefined;
           if (
@@ -791,12 +863,17 @@ export function streamWithinRequestBudget<
           ) {
             // The gateway's stated cap when it gives one, never above what was
             // just refused (so the resend is always smaller); else 80% of it.
+            // A cap below 1 MiB is not learned (noteLearnedRequestLimit refuses
+            // it): the 413 is then passed on, explained, like any other.
             const stated = limitFromBodyTooLarge(failure.errorMessage ?? "");
-            retryWith =
+            const candidate =
               stated !== undefined
                 ? Math.min(stated, Math.floor(attempt.estimate * 0.95))
                 : Math.floor(attempt.estimate * 0.8);
-            break;
+            if (noteLearnedRequestLimit(model.baseUrl, candidate)) {
+              retryWith = candidate;
+              break;
+            }
           }
           if (!visible && !terminal && !isAssistantOutputEvent(event.type)) {
             held.push(event);
@@ -811,9 +888,13 @@ export function streamWithinRequestBudget<
             out.push({ ...event, message: explain(event.message, attempt.limit) });
           else out.push(event);
         }
-        if (retryWith !== undefined && model.baseUrl !== undefined) {
-          noteLearnedRequestLimit(model.baseUrl, retryWith);
+        if (out.closed()) {
+          out.end({ ...opts.errorResult(model, new Error("Request abandoned")), stopReason: "aborted" } as R);
+          return;
+        }
+        if (retryWith !== undefined) {
           attempt = await fit();
+          if (signal?.aborted) return endAborted();
           continue;
         }
         if (!visible) for (const h of held) out.push(h);
