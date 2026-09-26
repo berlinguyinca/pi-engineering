@@ -15,6 +15,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import type { BrokerBackends } from "../../src/orchestration/broker.ts";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
+import { MissionObservability } from "../../src/orchestration/observability/MissionObservability.ts";
 import { Orchestrator } from "../../src/orchestration/orchestrator.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 
@@ -52,6 +53,7 @@ interface Harness {
 }
 
 interface HarnessOpts {
+  emitActivity?: boolean;
   findings?: string[];
   failValidation?: boolean;
   reviewDelay?: boolean;
@@ -75,8 +77,11 @@ function harness(opts: HarnessOpts = {}): Harness {
   const calls = { agent: [] as string[], review: [] as string[], validation: [] as string[], process: [] as string[] };
   const backends: BrokerBackends = {
     agent: {
-      runAgent: async ({ role, objective }) => {
+      runAgent: async ({ role, objective, onActivity }) => {
         calls.agent.push(role ?? objective);
+        if (opts.emitActivity) {
+          onActivity?.({ kind: "state", summary: "Worker session started", meaningfulProgress: false });
+        }
         const exit = opts.agentExitStatus ?? "succeeded";
         return { executionId: "e", exitStatus: exit, summary: "implemented", artifactRefs: [], usage: {} };
       },
@@ -150,7 +155,10 @@ function harness(opts: HarnessOpts = {}): Harness {
         objective: "implement",
         mutates_repo: true,
         write_domains: ["src/**"],
-        isolation: "worktree" as const,
+        // The deterministic harness has no Git provider. Its concern is the
+        // orchestration lifecycle, so it opts out of repository isolation
+        // explicitly instead of relying on an unsafe worktree fallback.
+        isolation: "none" as const,
         depends_on: [],
         priority: 0,
         execution_requirements: {},
@@ -185,7 +193,427 @@ describe("acceptance scenario A — simple feature auto-invokes engineering+vali
   });
 });
 
+describe("mission caller cancellation", () => {
+  it("aborts active work and does not continue into validation or review", async () => {
+    const store = MissionStore.open(JsonlEventStore.inMemory());
+    let started!: () => void;
+    const workerStarted = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    let backendSignal: AbortSignal | undefined;
+    let validationCalls = 0;
+    let reviewCalls = 0;
+    const orchestrator = new Orchestrator({
+      store,
+      planner: async () => [
+        {
+          kind: "agent" as const,
+          role: "implementer",
+          objective: "long-running implementation",
+          mutates_repo: true,
+          write_domains: ["src/**"],
+          isolation: "none" as const,
+          depends_on: [],
+          priority: 0,
+          execution_requirements: {},
+          max_attempts: 1,
+          failure_policy: "block" as const,
+        },
+      ],
+      backends: {
+        agent: {
+          runAgent: async ({ signal }) => {
+            backendSignal = signal;
+            started();
+            await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+            return { executionId: "late", exitStatus: "succeeded", summary: "late", artifactRefs: [], usage: {} };
+          },
+        },
+        validation: {
+          runValidation: async () => {
+            validationCalls++;
+            return { executionId: "v", exitStatus: "succeeded", summary: "valid", artifactRefs: [], usage: {} };
+          },
+        },
+        review: {
+          runReview: async () => {
+            reviewCalls++;
+            return { executionId: "r", exitStatus: "succeeded", summary: "reviewed", artifactRefs: [], usage: {} };
+          },
+        },
+      },
+    });
+    const controller = new AbortController();
+    const running = orchestrator.orchestrate("Implement a cancellable change", {
+      repository: ".",
+      baseRef: "abc",
+      mutationRequested: true,
+      signal: controller.signal,
+    });
+
+    await workerStarted;
+    controller.abort();
+    const result = await running;
+
+    assert.equal(backendSignal?.aborted, true);
+    assert.equal(result.mission.status, "CANCELED");
+    assert.equal(result.completed, false);
+    assert.equal(validationCalls, 0);
+    assert.equal(reviewCalls, 0);
+  });
+
+  for (const stage of ["validation", "review"] as const) {
+    it(`cancels an active ${stage} gate and starts no later gate`, async () => {
+      const store = MissionStore.open(JsonlEventStore.inMemory());
+      let started!: () => void;
+      const gateStarted = new Promise<void>((resolve) => {
+        started = resolve;
+      });
+      let reviewCalls = 0;
+      const waitForAbort = async (signal: AbortSignal) => {
+        started();
+        if (!signal.aborted) {
+          await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+        }
+        return { executionId: stage, exitStatus: "succeeded", summary: "late", artifactRefs: [], usage: {} };
+      };
+      const orchestrator = new Orchestrator({
+        store,
+        planner: async () => [
+          {
+            kind: "agent" as const,
+            role: "implementer",
+            objective: "implement",
+            mutates_repo: true,
+            write_domains: ["src/**"],
+            isolation: "none" as const,
+            depends_on: [],
+            priority: 0,
+            execution_requirements: {},
+            max_attempts: 1,
+            failure_policy: "block" as const,
+          },
+        ],
+        backends: {
+          agent: {
+            runAgent: async () => ({
+              executionId: "agent",
+              exitStatus: "succeeded",
+              summary: "done",
+              artifactRefs: [],
+              usage: {},
+            }),
+          },
+          validation: {
+            runValidation: async ({ signal }) =>
+              stage === "validation"
+                ? waitForAbort(signal)
+                : { executionId: "v", exitStatus: "succeeded", summary: "valid", artifactRefs: [], usage: {} },
+          },
+          review: {
+            runReview: async ({ signal }) => {
+              reviewCalls++;
+              return stage === "review"
+                ? { ...(await waitForAbort(signal)), findings: [] }
+                : {
+                    executionId: "r",
+                    exitStatus: "succeeded",
+                    summary: "reviewed",
+                    artifactRefs: [],
+                    usage: {},
+                    findings: [],
+                  };
+            },
+          },
+        },
+      });
+      const controller = new AbortController();
+      const pending = orchestrator.orchestrate(`Cancel during ${stage}`, {
+        repository: ".",
+        baseRef: "abc",
+        mutationRequested: true,
+        signal: controller.signal,
+      });
+
+      await gateStarted;
+      controller.abort();
+      const result = await pending;
+
+      assert.equal(result.mission.status, "CANCELED");
+      assert.equal(result.completed, false);
+      assert.ok(
+        store.listTasks(result.mission.mission_id).some((task) => task.kind === stage && task.status === "CANCELED"),
+      );
+      if (stage === "validation") assert.equal(reviewCalls, 0);
+    });
+  }
+
+  it("cancels active repair work and does not re-enter validation", async () => {
+    const store = MissionStore.open(JsonlEventStore.inMemory());
+    let repairStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      repairStarted = resolve;
+    });
+    let validationCalls = 0;
+    const orchestrator = new Orchestrator({
+      store,
+      planner: async () => [
+        {
+          kind: "agent" as const,
+          role: "implementer",
+          objective: "initial implementation",
+          mutates_repo: true,
+          write_domains: ["src/**"],
+          isolation: "none" as const,
+          depends_on: [],
+          priority: 0,
+          execution_requirements: {},
+          max_attempts: 1,
+          failure_policy: "block" as const,
+        },
+      ],
+      backends: {
+        agent: {
+          runAgent: async ({ objective, signal }) => {
+            if (objective.includes("Repair review finding")) {
+              repairStarted();
+              if (!signal.aborted) {
+                await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+              }
+            }
+            return { executionId: "a", exitStatus: "succeeded", summary: "done", artifactRefs: [], usage: {} };
+          },
+        },
+        validation: {
+          runValidation: async () => {
+            validationCalls++;
+            return { executionId: "v", exitStatus: "succeeded", summary: "valid", artifactRefs: [], usage: {} };
+          },
+        },
+        review: {
+          runReview: async () => ({
+            executionId: "r",
+            exitStatus: "succeeded",
+            summary: "needs repair",
+            artifactRefs: [],
+            usage: {},
+            findings: [{ severity: "blocking", summary: "fix it" }],
+          }),
+        },
+      },
+    });
+    const controller = new AbortController();
+    const pending = orchestrator.orchestrate("Cancel repair", {
+      repository: ".",
+      baseRef: "abc",
+      mutationRequested: true,
+      signal: controller.signal,
+    });
+
+    await started;
+    controller.abort();
+    const result = await pending;
+
+    assert.equal(result.mission.status, "CANCELED");
+    assert.equal(validationCalls, 1, "cancellation must prevent post-repair validation");
+    assert.ok(
+      store
+        .listTasks(result.mission.mission_id)
+        .some((task) => task.objective.includes("Repair review finding") && task.status === "CANCELED"),
+    );
+  });
+});
+
 describe("mission progress visibility — onProgress streams while the mission runs", () => {
+  it("records execution stages with truthful activity types", () => {
+    const backend = JsonlEventStore.inMemory();
+    const store = MissionStore.open(backend);
+    const obs = new MissionObservability({ backend, store });
+    const mission = store.createMission({
+      title: "typed activity",
+      goal: "typed activity",
+      user_request: "typed activity",
+      repository: ".",
+      base_ref: "",
+      risk_profile: "low",
+      workflow_class: "engineering",
+    });
+    const task = store.createTask({
+      mission_id: mission.mission_id,
+      kind: "validation",
+      role: "validator",
+      objective: "check",
+    });
+    obs.missionCreated(mission.mission_id, mission.title);
+    const orchestrator = new Orchestrator({ store, backends: {}, observability: obs, planner: async () => [] });
+    const observe = (
+      orchestrator as unknown as {
+        observeWorkerActivity: (event: {
+          kind: "execution";
+          phase: "started" | "completed" | "failed";
+          stage: "validation" | "integration" | "process";
+          summary: string;
+          meaningfulProgress: boolean;
+          missionId: string;
+          taskId: string;
+          executionId: string;
+        }) => void;
+      }
+    ).observeWorkerActivity.bind(orchestrator);
+    for (const [executionId, stage, phase] of [
+      ["validation", "validation", "started"],
+      ["integration", "integration", "completed"],
+      ["process", "process", "started"],
+      ["failed", "validation", "failed"],
+    ] as const) {
+      observe({
+        kind: "execution",
+        phase,
+        stage,
+        summary: `${stage} ${phase}`,
+        meaningfulProgress: false,
+        missionId: mission.mission_id,
+        taskId: task.task_id,
+        executionId,
+      });
+    }
+    assert.deepEqual(
+      obs
+        .projection(mission.mission_id)!
+        .activity.slice(-4)
+        .map((event) => event.type),
+      ["validation", "integration", "running_command", "error"],
+    );
+  });
+
+  it("releases a mission progress callback when planning throws", async () => {
+    const store = MissionStore.open(JsonlEventStore.inMemory());
+    const orchestrator = new Orchestrator({
+      store,
+      backends: {},
+      planner: async () => {
+        throw new Error("planner unavailable");
+      },
+    });
+    await assert.rejects(
+      orchestrator.orchestrate("Add a health endpoint", {
+        repository: ".",
+        baseRef: "abc",
+        mutationRequested: true,
+        onProgress: () => {},
+      }),
+      /planner unavailable/,
+    );
+
+    const callbacks = (orchestrator as unknown as { progress: Map<string, (line: string) => void> }).progress;
+    assert.equal(callbacks.size, 0, "failed orchestration must release the captured caller callback");
+  });
+
+  it("releases execution bookkeeping after settlement when observability is disabled", async () => {
+    const h = harness({ emitActivity: true });
+    const result = await h.orchestrator.orchestrate("Add a health endpoint", {
+      repository: ".",
+      baseRef: "abc",
+      mutationRequested: true,
+    });
+    assert.equal(result.completed, true);
+    const internals = h.orchestrator as unknown as {
+      observedExecutions: Set<string>;
+      taskExecutions: Map<string, string>;
+    };
+    assert.equal(internals.observedExecutions.size, 0);
+    assert.equal(internals.taskExecutions.size, 0);
+  });
+
+  it("streams worker tool detail and heartbeats into observability without changing DAG percentage", async () => {
+    const backend = JsonlEventStore.inMemory();
+    const store = MissionStore.open(backend);
+    const obs = new MissionObservability({ backend, store });
+    const lines: string[] = [];
+    const backends: BrokerBackends = {
+      agent: {
+        runAgent: async ({ onActivity }) => {
+          const secret = `sk-${"z".repeat(32)}`;
+          onActivity?.({
+            kind: "state",
+            summary: `PRIVATE PROMPT CONTENT ${secret}`,
+            meaningfulProgress: true,
+          });
+          onActivity?.({
+            kind: "tool",
+            phase: "started",
+            toolName: "bash",
+            summary: "Running tool: bash",
+            meaningfulProgress: false,
+          });
+          onActivity?.({
+            kind: "heartbeat",
+            summary: "Still running · elapsed 15s · last activity 4s ago",
+            meaningfulProgress: false,
+            elapsedMs: 15_000,
+            lastActivityMs: 4_000,
+          });
+          return { executionId: "e", exitStatus: "succeeded", summary: "done", artifactRefs: [], usage: {} };
+        },
+      },
+      validation: {
+        runValidation: async () => ({
+          executionId: "v",
+          exitStatus: "succeeded",
+          summary: "ok",
+          artifactRefs: [],
+          usage: {},
+        }),
+      },
+      review: {
+        runReview: async () => ({
+          executionId: "r",
+          exitStatus: "succeeded",
+          summary: "ok",
+          artifactRefs: [],
+          usage: {},
+          findings: [],
+        }),
+      },
+    };
+    const orchestrator = new Orchestrator({
+      store,
+      backends,
+      observability: obs,
+      planner: async () => [
+        {
+          kind: "agent",
+          role: "implementer",
+          objective: "PRIVATE TASK OBJECTIVE SHOULD NOT BECOME ACTIVITY",
+          mutates_repo: false,
+          write_domains: [],
+          isolation: "none",
+          depends_on: [],
+          priority: 0,
+          execution_requirements: {},
+          max_attempts: 1,
+          failure_policy: "block" as const,
+        },
+      ],
+    });
+    const result = await orchestrator.orchestrate("Add live mission detail", {
+      repository: ".",
+      baseRef: "abc",
+      mutationRequested: true,
+      onProgress: (line) => lines.push(line),
+    });
+    const projection = obs.projection(result.mission.mission_id)!;
+    assert.ok(projection.activity.some((event) => event.summary === "Running tool: bash"));
+    assert.ok(projection.summary.lastHeartbeatAt);
+    assert.equal(projection.summary.workers.active, 0, "settled execution must not leave a phantom running worker");
+    assert.match(lines.join("\n"), /Running tool: bash/);
+    assert.match(lines.join("\n"), /elapsed 15s .*last activity 4s ago/);
+    assert.doesNotMatch(JSON.stringify(projection), /PRIVATE PROMPT CONTENT|sk-z/);
+    assert.doesNotMatch(JSON.stringify(projection.activity), /PRIVATE TASK OBJECTIVE/);
+    assert.doesNotMatch(lines.join("\n"), /PRIVATE PROMPT CONTENT|sk-z/);
+    assert.equal(projection.summary.progress.approximatePercent, 100, "only the completed DAG advances percentage");
+  });
+
   it("emits phase and task progress lines during orchestration, and clears after", async () => {
     const h = harness();
     const lines: string[] = [];
@@ -299,6 +727,14 @@ describe("acceptance scenario C — independent tasks run concurrently with isol
     const orchestrator = new Orchestrator({
       store,
       backends,
+      git: {
+        headCommit: async () => "abc",
+        createWorktree: async (_base: string, branch: string) => ({ path: ".", branch }),
+        branchAheadOf: async () => false,
+        statusIn: async () => "",
+        removeWorktree: async () => {},
+        isAncestor: async () => false,
+      } as never,
       planner: async () => [
         {
           kind: "agent" as const,
@@ -435,7 +871,7 @@ describe("acceptance scenario F — state survives orchestrator restart", () => 
           objective: "x",
           mutates_repo: true,
           write_domains: ["src/**"],
-          isolation: "worktree" as const,
+          isolation: "none" as const,
           depends_on: [],
           priority: 0,
           execution_requirements: {},

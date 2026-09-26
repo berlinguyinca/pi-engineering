@@ -25,6 +25,301 @@ function setup(backends: BrokerBackends) {
 }
 
 describe("ExecutionBroker (spec 03)", () => {
+  it("fails closed when an isolated mutating worktree cannot be allocated", async () => {
+    let runs = 0;
+    const { store, m, t } = setup({});
+    const broker = new ExecutionBroker({
+      store,
+      git: {
+        headCommit: async () => "abc",
+        createWorktree: async () => {
+          throw new Error("disk full");
+        },
+      } as never,
+      backends: {
+        agent: {
+          runAgent: async () => {
+            runs++;
+            return { executionId: "e", exitStatus: "succeeded", summary: "unsafe", artifactRefs: [], usage: {} };
+          },
+        },
+      },
+    });
+
+    const handle = await broker.execute({
+      taskId: t.task_id,
+      missionId: m.mission_id,
+      kind: "agent",
+      role: "implementer",
+      objective: "mutate safely",
+      mutatesRepo: true,
+      isolation: "worktree",
+    });
+
+    await assert.rejects(handle.result(), /isolated worktree.*disk full/i);
+    assert.equal(runs, 0, "the worker must never fall back to the user's checkout");
+    assert.equal(store.listExecutions(m.mission_id)[0]?.status, "FAILED");
+  });
+
+  it("still dispatches read-only and explicitly non-isolated work without a worktree", async () => {
+    const seen: Array<string | null | undefined> = [];
+    const { store, m } = setup({});
+    const broker = new ExecutionBroker({
+      store,
+      backends: {
+        agent: {
+          runAgent: async ({ worktree }) => {
+            seen.push(worktree);
+            return { executionId: "e", exitStatus: "succeeded", summary: "safe", artifactRefs: [], usage: {} };
+          },
+        },
+      },
+    });
+    const readOnly = store.createTask({
+      mission_id: m.mission_id,
+      kind: "agent",
+      role: "scout",
+      objective: "inspect",
+    });
+    const nonIsolated = store.createTask({
+      mission_id: m.mission_id,
+      kind: "agent",
+      role: "implementer",
+      objective: "mutate explicitly in place",
+    });
+
+    await (
+      await broker.execute({
+        taskId: readOnly.task_id,
+        missionId: m.mission_id,
+        kind: "agent",
+        objective: "inspect",
+        mutatesRepo: false,
+        isolation: "worktree",
+      })
+    ).result();
+    await (
+      await broker.execute({
+        taskId: nonIsolated.task_id,
+        missionId: m.mission_id,
+        kind: "agent",
+        objective: "mutate explicitly in place",
+        mutatesRepo: true,
+        isolation: "none",
+      })
+    ).result();
+
+    assert.deepEqual(seen, [null, null]);
+  });
+
+  it("does not dispatch when an execution was canceled before result starts", async () => {
+    let runs = 0;
+    const { m, t, broker } = setup({
+      agent: {
+        runAgent: async () => {
+          runs++;
+          return { executionId: "e", exitStatus: "succeeded", summary: "late", artifactRefs: [], usage: {} };
+        },
+      },
+    });
+    const handle = await broker.execute({
+      taskId: t.task_id,
+      missionId: m.mission_id,
+      kind: "agent",
+      objective: "x",
+    });
+    await handle.cancel();
+    await assert.rejects(handle.result(), /aborted/i);
+    assert.equal(runs, 0);
+  });
+
+  it("does not dispatch after cancellation during worktree allocation and releases the allocated worktree", async () => {
+    let runs = 0;
+    let releaseAllocation!: () => void;
+    let allocationStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      allocationStarted = resolve;
+    });
+    let removals = 0;
+    const { store, m, t } = setup({});
+    const broker = new ExecutionBroker({
+      store,
+      baseRef: "abc",
+      git: {
+        createWorktree: async () => {
+          allocationStarted();
+          await new Promise<void>((resolve) => {
+            releaseAllocation = resolve;
+          });
+          return { path: "/tmp/delayed-worktree", branch: "delayed" };
+        },
+        removeWorktree: async () => {
+          removals++;
+        },
+      } as never,
+      backends: {
+        agent: {
+          runAgent: async () => {
+            runs++;
+            return { executionId: "e", exitStatus: "succeeded", summary: "late", artifactRefs: [], usage: {} };
+          },
+        },
+      },
+    });
+    const handle = await broker.execute({
+      taskId: t.task_id,
+      missionId: m.mission_id,
+      kind: "agent",
+      objective: "x",
+      mutatesRepo: true,
+      isolation: "worktree",
+    });
+    const pending = handle.result();
+    await started;
+    await handle.cancel();
+    releaseAllocation();
+    await assert.rejects(pending, /aborted/i);
+    assert.equal(runs, 0);
+    assert.equal(removals, 1);
+  });
+
+  it("clears the activity interval immediately when a signal-ignoring backend is canceled", async () => {
+    let finish!: () => void;
+    const originalSetInterval = globalThis.setInterval;
+    const originalClearInterval = globalThis.clearInterval;
+    let activityTimer: ReturnType<typeof setInterval> | undefined;
+    let activityTimerCleared = false;
+    globalThis.setInterval = ((...args: Parameters<typeof setInterval>) => {
+      activityTimer = originalSetInterval(...args);
+      return activityTimer;
+    }) as typeof setInterval;
+    globalThis.clearInterval = ((timer: ReturnType<typeof setInterval>) => {
+      if (timer === activityTimer) activityTimerCleared = true;
+      return originalClearInterval(timer);
+    }) as typeof clearInterval;
+    try {
+      const { m, t, broker } = setup({
+        agent: {
+          runAgent: async () => {
+            await new Promise<void>((resolve) => {
+              finish = resolve;
+            });
+            return { executionId: "e", exitStatus: "succeeded", summary: "late", artifactRefs: [], usage: {} };
+          },
+        },
+      });
+      const handle = await broker.execute({
+        taskId: t.task_id,
+        missionId: m.mission_id,
+        kind: "agent",
+        objective: "x",
+      });
+      const pending = handle.result();
+      while (!finish) await new Promise((resolve) => setTimeout(resolve, 0));
+      await handle.cancel();
+      finish();
+      await pending;
+      assert.equal(activityTimerCleared, true);
+    } finally {
+      globalThis.setInterval = originalSetInterval;
+      globalThis.clearInterval = originalClearInterval;
+      if (activityTimer) originalClearInterval(activityTimer);
+    }
+  });
+
+  it("emits execution-local heartbeats for long validation/process work and stops after settlement", async () => {
+    const activity: Array<{ kind: string; summary: string }> = [];
+    const finish: Array<() => void> = [];
+    const delayedOutcome = (executionId: string) => async () => {
+      await new Promise<void>((resolve) => finish.push(resolve));
+      return { executionId, exitStatus: "succeeded", summary: "ok", artifactRefs: [], usage: {} };
+    };
+    const { store, m, broker } = setup({
+      validation: {
+        runValidation: delayedOutcome("v"),
+      },
+      process: { runProcess: delayedOutcome("p") },
+    });
+    const validation = store.createTask({
+      mission_id: m.mission_id,
+      kind: "validation",
+      role: "validator",
+      objective: "check",
+    });
+    const process = store.createTask({ mission_id: m.mission_id, kind: "process", role: "runner", objective: "build" });
+    const observing = new ExecutionBroker({
+      store,
+      backends: (broker as unknown as { backends: BrokerBackends }).backends,
+      activityHeartbeatMs: 10,
+      onActivity: (event) => activity.push({ kind: event.kind, summary: event.summary }),
+    });
+    const validationHandle = await observing.execute({
+      taskId: validation.task_id,
+      missionId: m.mission_id,
+      kind: "validation",
+      objective: "check",
+    });
+    const processHandle = await observing.execute({
+      taskId: process.task_id,
+      missionId: m.mission_id,
+      kind: "process",
+      objective: "build",
+    });
+    const pending = Promise.all([validationHandle.result(), processHandle.result()]);
+    await new Promise((resolve) => setTimeout(resolve, 35));
+    for (const resolve of finish) resolve();
+    await pending;
+    assert.ok(
+      activity.some((event) => /Validation still running/.test(event.summary)),
+      JSON.stringify(activity),
+    );
+    assert.ok(
+      activity.some((event) => /Process still running/.test(event.summary)),
+      JSON.stringify(activity),
+    );
+    const count = activity.length;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    assert.equal(activity.length, count, "execution heartbeats must stop after settlement");
+  });
+
+  it("attaches mission/task/execution identity to backend activity", async () => {
+    const seen: Array<{ missionId: string; taskId: string; executionId: string; summary: string }> = [];
+    const { m, t, broker } = setup({
+      agent: {
+        runAgent: async ({ onActivity }) => {
+          onActivity?.({ kind: "state", summary: "Worker session started", meaningfulProgress: false });
+          return { executionId: "e", exitStatus: "succeeded", summary: "done", artifactRefs: [], usage: {} };
+        },
+      },
+    });
+    const observing = new ExecutionBroker({
+      store: (broker as unknown as { store: MissionStore }).store,
+      backends: (broker as unknown as { backends: BrokerBackends }).backends,
+      onActivity: (event) =>
+        seen.push({
+          missionId: event.missionId,
+          taskId: event.taskId,
+          executionId: event.executionId,
+          summary: event.summary,
+        }),
+    });
+    const handle = await observing.execute({
+      taskId: t.task_id,
+      missionId: m.mission_id,
+      kind: "agent",
+      role: "implementer",
+      objective: "x",
+    });
+    await handle.result();
+    assert.ok(seen.some((event) => event.summary === "Worker session started"));
+    assert.ok(
+      seen.every(
+        (event) =>
+          event.missionId === m.mission_id && event.taskId === t.task_id && event.executionId === handle.executionId,
+      ),
+    );
+  });
+
   it("workerTimeoutMs defaults to 30 min and honors the env override", () => {
     const prev = process.env.PI_ENGINEERING_WORKER_TIMEOUT_MS;
     try {

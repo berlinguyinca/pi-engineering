@@ -31,6 +31,100 @@ function capturingWorker(seen: WorkerRequest[]): WorkerExecutor {
 }
 
 describe("realBackends capability routing", () => {
+  it("does not start or publish activity for a pre-aborted worker", async () => {
+    let runs = 0;
+    const activity: import("../../src/workers/WorkerExecutor.ts").WorkerActivity[] = [];
+    const worker: WorkerExecutor = {
+      async run(req) {
+        runs++;
+        return capturingWorker([]).run(req);
+      },
+    };
+    const backends = realBackends({ worker, verifier: {} as never, artifacts: {} as never, git: null, cwd: "/repo" });
+    const abort = new AbortController();
+    abort.abort();
+    await assert.rejects(
+      backends.agent.runAgent({
+        role: "implementer",
+        objective: "x",
+        signal: abort.signal,
+        onActivity: (e) => activity.push(e),
+      }),
+      /aborted/i,
+    );
+    assert.equal(runs, 0);
+    assert.deepEqual(activity, []);
+  });
+
+  it("suppresses late completion and activity after abort", async () => {
+    let finish!: () => void;
+    let started!: () => void;
+    const workerStarted = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    const activity: import("../../src/workers/WorkerExecutor.ts").WorkerActivity[] = [];
+    const worker: WorkerExecutor = {
+      async run(req) {
+        await new Promise<void>((resolve) => {
+          finish = resolve;
+          started();
+        });
+        req.onActivity?.({ kind: "state", phase: "completed", summary: "late", meaningfulProgress: true });
+        return capturingWorker([]).run(req);
+      },
+    };
+    const backends = realBackends({ worker, verifier: {} as never, artifacts: {} as never, git: null, cwd: "/repo" });
+    const abort = new AbortController();
+    const pending = backends.agent.runAgent({
+      role: "implementer",
+      objective: "x",
+      signal: abort.signal,
+      onActivity: (event) => activity.push(event),
+    });
+    await workerStarted;
+    abort.abort();
+    finish();
+    await pending;
+    assert.deepEqual(activity, []);
+  });
+
+  it("forwards worker activity and suppresses updates after the worker settles", async () => {
+    const activity: import("../../src/workers/WorkerExecutor.ts").WorkerActivity[] = [];
+    let finish!: () => void;
+    const worker: WorkerExecutor = {
+      async run(req) {
+        req.onActivity?.({ kind: "tool", phase: "started", summary: "Running tool: bash", meaningfulProgress: false });
+        await new Promise<void>((resolve) => {
+          finish = resolve;
+        });
+        return capturingWorker([]).run(req);
+      },
+    };
+    const backends = realBackends({
+      worker,
+      verifier: {} as never,
+      artifacts: {} as never,
+      git: null,
+      cwd: "/repo",
+    });
+    const pending = backends.agent.runAgent({
+      role: "implementer",
+      objective: "do work",
+      signal: new AbortController().signal,
+      onActivity: (event) => activity.push(event),
+    });
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    finish();
+    await pending;
+    assert.deepEqual(activity.at(-1), {
+      kind: "state",
+      phase: "completed",
+      summary: "Worker session completed",
+      meaningfulProgress: true,
+    });
+    assert.equal(activity.filter((event) => event.kind === "tool").length, 1);
+  });
+
   it("places the implementer worker on the model routeModel returns", async () => {
     const seen: WorkerRequest[] = [];
     const backends = realBackends({
@@ -208,4 +302,88 @@ describe("realBackends integration: recovered handoffs", () => {
       await fx.cleanup();
     }
   });
+
+  it("stops integration between branch merges when canceled", async () => {
+    const controller = new AbortController();
+    const merged: string[] = [];
+    let verificationRuns = 0;
+    const git = {
+      async mergeBranch(branch: string) {
+        merged.push(branch);
+        controller.abort();
+        return { merged: true };
+      },
+    };
+    const verifier = {
+      detect: async () => ({ name: "none", stages: [] }),
+      run: async () => {
+        verificationRuns++;
+        return { passed: true, stages: [], evidence: [], failedStage: null, noTargets: false };
+      },
+    };
+    const backends = realBackends({
+      worker: capturingWorker([]),
+      verifier: verifier as never,
+      artifacts: {} as never,
+      git: git as never,
+      cwd: "/repo",
+    });
+
+    await assert.rejects(
+      backends.integration.runIntegration({
+        objective: "merge",
+        signal: controller.signal,
+        handoffs: [
+          { worktree: { path: "/one", branch: "one" }, summary: "one", artifacts: [] },
+          { worktree: { path: "/two", branch: "two" }, summary: "two", artifacts: [] },
+        ],
+      }),
+      (error: unknown) => {
+        assert.equal((error as { name?: string }).name, "AbortError");
+        return true;
+      },
+    );
+    assert.deepEqual(merged, ["one"]);
+    assert.equal(verificationRuns, 0, "post-merge verification must not start after cancellation");
+  });
+});
+
+describe("realBackends deterministic cancellation", () => {
+  for (const kind of ["validation", "process"] as const) {
+    it(`forwards cancellation to the ${kind} verifier`, async () => {
+      const controller = new AbortController();
+      let receivedSignal: AbortSignal | undefined;
+      let verifierStarted!: () => void;
+      const started = new Promise<void>((resolve) => {
+        verifierStarted = resolve;
+      });
+      const verifier = {
+        detect: async () => ({ name: "test", stages: [] }),
+        run: async (_cwd: string, _profile: unknown, _artifacts: unknown, opts?: { signal?: AbortSignal }) => {
+          receivedSignal = opts?.signal;
+          verifierStarted();
+          await new Promise<void>((_resolve, reject) => {
+            opts?.signal?.addEventListener("abort", () => reject(opts.signal?.reason), { once: true });
+          });
+          throw new Error("unreachable");
+        },
+      };
+      const backends = realBackends({
+        worker: capturingWorker([]),
+        verifier: verifier as never,
+        artifacts: {} as never,
+        git: null,
+        cwd: "/repo",
+      });
+
+      const pending =
+        kind === "validation"
+          ? backends.validation.runValidation({ objective: "check", signal: controller.signal })
+          : backends.process.runProcess({ objective: "check", signal: controller.signal });
+      await started;
+      controller.abort();
+      await assert.rejects(pending, { name: "AbortError" });
+      assert.equal(receivedSignal, controller.signal);
+    });
+  }
 });

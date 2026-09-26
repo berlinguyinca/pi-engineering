@@ -82,6 +82,23 @@ export interface TaskCreateInput {
   failure_policy?: OrchestrationTask["failure_policy"];
 }
 
+/** Bounded, inspectable record of an event that could not be persisted. */
+export interface MissionPersistenceDiagnostic {
+  eventId: string;
+  eventType: string;
+  missionId: string;
+  eventTimestamp: string;
+  message: string;
+}
+
+const MAX_PERSISTENCE_DIAGNOSTICS = 50;
+
+function persistenceErrorMessage(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  if (typeof error === "string") return error;
+  return "Unknown persistence error";
+}
+
 /** Maps a platform StoredEvent back to an orchestration event. */
 function fromStored(e: StoredEvent): OrchestrationEvent {
   return {
@@ -100,6 +117,8 @@ export class MissionStore {
   private readonly tasks = new Map<string, OrchestrationTask>();
   private readonly executions = new Map<string, Execution>();
   private readonly findings = new Map<string, ReviewFinding>();
+  private readonly persistenceErrors: MissionPersistenceDiagnostic[] = [];
+  private readonly pendingWrites: Array<{ event: OrchestrationEvent; stored: StoredEvent }> = [];
   private emitChain: Promise<void> = Promise.resolve();
 
   private constructor(backend: EventStoreBackend) {
@@ -131,12 +150,63 @@ export class MissionStore {
       worker_id: null,
       payload,
     };
-    this.emitChain = this.emitChain.then(() => this.backend.append(stored)).then(() => undefined);
+    this.pendingWrites.push({ event, stored });
+    this.scheduleDrain();
+  }
+
+  private scheduleDrain(): void {
+    const drain = this.emitChain.then(() => this.drainPending());
+    // Background persistence must not create an unhandled rejection. The
+    // failed head remains queued; flush() performs a retry and reports failure.
+    this.emitChain = drain.catch(() => undefined);
+  }
+
+  private async drainPending(): Promise<void> {
+    while (this.pendingWrites.length > 0) {
+      const pending = this.pendingWrites[0]!;
+      try {
+        await this.backend.append(pending.stored);
+      } catch (error) {
+        this.recordPersistenceFailure(pending.event, error);
+        throw error;
+      }
+      this.pendingWrites.shift();
+      this.clearPersistenceFailure(pending.event.event_id);
+    }
+  }
+
+  private recordPersistenceFailure(event: OrchestrationEvent, error: unknown): void {
+    const diagnostic: MissionPersistenceDiagnostic = {
+      eventId: event.event_id,
+      eventType: event.type,
+      missionId: event.mission_id,
+      eventTimestamp: event.timestamp,
+      message: persistenceErrorMessage(error),
+    };
+    const existing = this.persistenceErrors.findIndex((entry) => entry.eventId === event.event_id);
+    if (existing >= 0) this.persistenceErrors[existing] = diagnostic;
+    else this.persistenceErrors.push(diagnostic);
+    if (this.persistenceErrors.length > MAX_PERSISTENCE_DIAGNOSTICS) this.persistenceErrors.shift();
+  }
+
+  private clearPersistenceFailure(eventId: string): void {
+    const index = this.persistenceErrors.findIndex((entry) => entry.eventId === eventId);
+    if (index >= 0) this.persistenceErrors.splice(index, 1);
   }
 
   /** Await all pending event writes (so tests can assert durability). */
   async flush(): Promise<void> {
     await this.emitChain;
+    if (this.pendingWrites.length === 0) return;
+
+    const drain = this.drainPending();
+    this.emitChain = drain.catch(() => undefined);
+    await drain;
+  }
+
+  /** Recent persistence failures, oldest first. */
+  persistenceDiagnostics(): MissionPersistenceDiagnostic[] {
+    return this.persistenceErrors.map((diagnostic) => ({ ...diagnostic }));
   }
 
   private apply(e: OrchestrationEvent): void {

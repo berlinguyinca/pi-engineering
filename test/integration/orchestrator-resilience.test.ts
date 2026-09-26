@@ -41,6 +41,10 @@ function clock() {
 interface HarnessOpts {
   /** The agent worker fails with a transient-infra marker until `healthy` flips. */
   failWhileDown: () => boolean;
+  /** Fail the first N post-resume validation runs, then recover. */
+  validationFailTimes?: number;
+  onValidation?: (signal: AbortSignal) => Promise<void>;
+  probe?: () => Promise<{ healthy: boolean }>;
 }
 
 function harness(opts: HarnessOpts) {
@@ -64,8 +68,12 @@ function harness(opts: HarnessOpts) {
       },
     },
     validation: {
-      runValidation: async () => {
+      runValidation: async ({ signal }) => {
         calls.validation++;
+        await opts.onValidation?.(signal);
+        if (calls.validation <= (opts.validationFailTimes ?? 0)) {
+          return { executionId: "e", exitStatus: "failed", summary: "suite red", artifactRefs: [], usage: {} };
+        }
         return { executionId: "e", exitStatus: "succeeded", summary: "valid", artifactRefs: [], usage: {} };
       },
     },
@@ -104,7 +112,7 @@ function harness(opts: HarnessOpts) {
         objective: "implement",
         mutates_repo: true,
         write_domains: ["src/**"],
-        isolation: "worktree" as const,
+        isolation: "none" as const,
         depends_on: [],
         priority: 0,
         execution_requirements: {},
@@ -113,7 +121,7 @@ function harness(opts: HarnessOpts) {
       },
     ],
     resilience: shortResilience,
-    probe: { probe: async () => ({ healthy: probeHealthy }) },
+    probe: { probe: opts.probe ?? (async () => ({ healthy: probeHealthy })) },
     now: clk.now,
     sleep: clk.sleep,
     rand: () => 0,
@@ -153,7 +161,7 @@ describe("resilience e2e — a gateway outage pauses (not fails) a live mission"
     assert.equal(agentTask.status, "RETRYING");
   });
 
-  it("resume() re-runs the paused task once the gateway recovers", async () => {
+  it("forced resume completes the full lifecycle with validation and independent review", async () => {
     let down = true;
     const h = harness({ failWhileDown: () => down });
     h.setProbeHealthy(false);
@@ -166,14 +174,76 @@ describe("resilience e2e — a gateway outage pauses (not fails) a live mission"
     const missionId = result.mission.mission_id;
     assert.equal(h.store.getMission(missionId)!.status, "PAUSED_INFRASTRUCTURE");
 
-    // Gateway recovers: the probe reports healthy and the worker now succeeds.
+    // The worker can run again even though the probe has not caught up yet.
     down = false;
-    h.setProbeHealthy(true);
-    const resumed = await h.orchestrator.resume(missionId);
-    // The paused task re-ran and succeeded; the mission left the paused state.
+    const resumed = await h.orchestrator.resume(missionId, { force: true });
+    // Resume is equivalent to an uninterrupted run: it does not stop at EXECUTING.
     const agentTask = h.store.listTasks(missionId).find((t) => t.kind === "agent")!;
     assert.equal(agentTask.status, "SUCCEEDED");
-    assert.notEqual(resumed.status, "PAUSED_INFRASTRUCTURE");
+    assert.equal(resumed.status, "COMPLETE");
+    assert.equal(h.calls.validation, 1, "required validation must run after the resumed worker settles");
+    assert.equal(h.calls.review, 1, "required independent review must run after resumed validation");
+    assert.equal(h.orchestrator.gate.evaluate(resumed).can_complete, true);
+  });
+
+  it("resume attempts bounded repair and blocks when validation remains red", async () => {
+    let down = true;
+    const h = harness({ failWhileDown: () => down, validationFailTimes: 99 });
+    const result = await h.orchestrator.orchestrate("Add a health endpoint", {
+      repository: ".",
+      baseRef: "abc",
+      mutationRequested: true,
+    });
+    const missionId = result.mission.mission_id;
+    down = false;
+
+    const resumed = await h.orchestrator.resume(missionId, { force: true });
+
+    assert.equal(resumed.status, "BLOCKED");
+    assert.ok(h.calls.validation >= 2, "the resumed repair path must re-run validation");
+    assert.ok(h.calls.review >= 2, "the resumed repair path must perform a fresh review");
+    const repairs = h.store
+      .listTasks(missionId)
+      .filter((task) => task.kind === "agent" && task.objective.includes("Fix the failing validation"));
+    assert.ok(repairs.length >= 1, "a failed resumed gate must create repair work");
+    assert.ok(repairs.length <= 4, `repair must remain bounded, got ${repairs.length}`);
+  });
+
+  it("aborting a resumed mission cancels its active finalization gate", async () => {
+    let down = true;
+    let validationStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      validationStarted = resolve;
+    });
+    const h = harness({
+      failWhileDown: () => down,
+      onValidation: async (signal) => {
+        validationStarted();
+        if (!signal.aborted) {
+          await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+        }
+      },
+    });
+    const initial = await h.orchestrator.orchestrate("Add a health endpoint", {
+      repository: ".",
+      baseRef: "abc",
+      mutationRequested: true,
+    });
+    down = false;
+    const controller = new AbortController();
+    const pending = h.orchestrator.resume(initial.mission.mission_id, { force: true, signal: controller.signal });
+
+    await started;
+    controller.abort();
+    const resumed = await pending;
+
+    assert.equal(resumed.status, "CANCELED");
+    assert.equal(h.calls.review, 0);
+    assert.ok(
+      h.store
+        .listTasks(initial.mission.mission_id)
+        .some((task) => task.kind === "validation" && task.status === "CANCELED"),
+    );
   });
 
   it("resume() is a no-op while the gateway is still down", async () => {
@@ -191,5 +261,46 @@ describe("resilience e2e — a gateway outage pauses (not fails) a live mission"
     const resumed = await h.orchestrator.resume(missionId);
     assert.equal(resumed.status, "PAUSED_INFRASTRUCTURE");
     assert.equal(h.calls.agent, before, "no re-run while the gateway is still down");
+  });
+
+  it("a pre-aborted resume cancels without probing or launching work", async () => {
+    const h = harness({ failWhileDown: () => true });
+    const result = await h.orchestrator.orchestrate("Add a health endpoint", {
+      repository: ".",
+      baseRef: "abc",
+      mutationRequested: true,
+    });
+    const before = h.calls.agent;
+    const controller = new AbortController();
+    controller.abort();
+
+    const resumed = await h.orchestrator.resume(result.mission.mission_id, { signal: controller.signal });
+
+    assert.equal(resumed.status, "CANCELED");
+    assert.equal(h.calls.agent, before);
+  });
+
+  it("aborting resume interrupts an in-flight gateway health probe", async () => {
+    let hangProbe = false;
+    const h = harness({
+      failWhileDown: () => true,
+      probe: async () => {
+        if (hangProbe) return new Promise(() => {});
+        return { healthy: false };
+      },
+    });
+    const initial = await h.orchestrator.orchestrate("Add a health endpoint", {
+      repository: ".",
+      baseRef: "abc",
+      mutationRequested: true,
+    });
+    hangProbe = true;
+    const controller = new AbortController();
+    const pending = h.orchestrator.resume(initial.mission.mission_id, { signal: controller.signal });
+    controller.abort();
+
+    const resumed = await pending;
+
+    assert.equal(resumed.status, "CANCELED");
   });
 });

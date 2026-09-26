@@ -56,7 +56,7 @@ import { PanelRefreshLoop } from "../src/panel/refreshLoop.ts";
 import { resolveRequestBodyBudgetConfig } from "../src/request/bodyBudget.ts";
 import { resolveThinkingOffConfig } from "../src/request/thinkingPolicy.ts";
 import { RoadmapEngine } from "../src/roadmap/RoadmapEngine.ts";
-import { EngineeringRuntime } from "../src/runtime/EngineeringRuntime.ts";
+import { EngineeringRuntime, type RuntimeMissionActivityEvent } from "../src/runtime/EngineeringRuntime.ts";
 import { resolveStatusBarConfig } from "../src/status/config.ts";
 import { FooterController } from "../src/status/footer.ts";
 import { renderStatus } from "../src/status/layout.ts";
@@ -82,6 +82,8 @@ import { PiWorkerExecutor } from "../src/workers/PiWorkerExecutor.ts";
  */
 
 const runtimes = new Map<string, { runtime: EngineeringRuntime; memoryIdentity: string }>();
+const runtimeOpens = new Map<string, Promise<{ runtime: EngineeringRuntime; memoryIdentity: string }>>();
+const allowRuntimeDiagnostic = createRepeatThrottle();
 
 // Live status bar: the harness owns the Pi footer through a single composable
 // controller (src/status/). One active controller per session.
@@ -209,11 +211,13 @@ async function getRuntimeByCwd(cwd: string, model?: Model<any>): Promise<Enginee
     .digest("hex");
   const existing = runtimes.get(key);
   if (existing?.memoryIdentity === memoryIdentity) return existing.runtime;
+  const pending = runtimeOpens.get(`${key}\0${memoryIdentity}`);
+  if (pending) return (await pending).runtime;
   // OpenViking connection from the environment. If PI_OPENVIKING_BASE_URL is
   // set, blackhole is enabled with the openviking durable store for EVERY repo
   // this extension runs in — set it once per install and all repos share the
   // deployed durable memory. Absent the env, blackhole stays off (unchanged).
-  const rt = await EngineeringRuntime.open({
+  const opening = EngineeringRuntime.open({
     cwd,
     verifier: new CommandVerifier(),
     model,
@@ -222,6 +226,15 @@ async function getRuntimeByCwd(cwd: string, model?: Model<any>): Promise<Enginee
     // from the roadmap engine (completion is never declared). If the repo has no
     // roadmap, the gate is open.
     roadmapComplete: roadmapCompleteFor(key),
+    onMissionSnapshotError: (message) => {
+      const notice: TelemetryNotice = {
+        level: "warning",
+        text: message,
+        key: `mission-snapshot-write:${key}`,
+      };
+      if (allowRuntimeDiagnostic(notice)) emitTelemetry(notice);
+    },
+    onMissionActivity: (event) => publishMissionActivity(key, event),
     // Pipeline progress -> status footer. Best-effort and read-only: the
     // runtime swallows anything thrown here, and the footer is the only
     // consumer today (the panel will subscribe to the same events).
@@ -244,10 +257,47 @@ async function getRuntimeByCwd(cwd: string, model?: Model<any>): Promise<Enginee
       if (event.model) footer.setProducingModel(event.model);
     },
     ...(blackhole ? { blackhole } : {}),
+  }).then((runtime) => ({ runtime, memoryIdentity }));
+  const openKey = `${key}\0${memoryIdentity}`;
+  runtimeOpens.set(openKey, opening);
+  try {
+    const opened = await opening;
+    runtimes.set(key, opened);
+    panelFor(key, opened.runtime);
+    return opened.runtime;
+  } finally {
+    if (runtimeOpens.get(openKey) === opening) runtimeOpens.delete(openKey);
+  }
+}
+
+/** Feed live mission detail into persistent surfaces without creating notices. */
+function publishMissionActivity(key: string, event: RuntimeMissionActivityEvent): void {
+  const heartbeat = event.lastHeartbeatAt ? ` · hb ${new Date(event.lastHeartbeatAt).toISOString().slice(11, 19)}` : "";
+  const workers = ` · workers ${event.activeWorkers} active/${event.waitingWorkers} waiting/${event.failedWorkers} failed`;
+  const detail = `${event.summary}${workers}${heartbeat}`.slice(0, 320);
+  const plumbing = panels.get(key);
+  if (plumbing) {
+    const previous = plumbing.state.snapshot.run;
+    const sameMission = previous?.workItemId === event.missionId;
+    plumbing.state.set({
+      run: {
+        workItemId: event.missionId,
+        goal: detail,
+        phase: `${event.phase} · ${event.approximatePercent}% · ${event.health}`,
+        risk: "mission",
+        files: sameMission ? previous.files : [],
+        findings: sameMission ? previous.findings : [],
+        spend: sameMission ? previous.spend : [],
+      },
+      updatedAt: Date.now(),
+    });
+  }
+  if (ambientPanel?.key !== key) return;
+  activeFooter?.setTask({
+    workItemId: event.missionId,
+    phase: `${event.phase} ${event.approximatePercent}%`,
+    label: detail,
   });
-  runtimes.set(key, { runtime: rt, memoryIdentity });
-  panelFor(key, rt);
-  return rt;
 }
 
 /**
@@ -1465,6 +1515,7 @@ ${RECOVERY_PROMPT}`;
         repository: rt.cwd,
         baseRef,
         mutationRequested: true,
+        signal: ctx.signal,
         onProgress: (line) => {
           // De-duplicate the trailing completion lines (phase transitions and
           // task settlements can fire within the same tick).

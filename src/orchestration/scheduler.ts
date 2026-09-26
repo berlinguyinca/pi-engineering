@@ -29,6 +29,8 @@ import type { MissionStatus, OrchestrationTask, TaskKind, TaskStatus } from "./t
 const realNow = (): number => Date.now();
 const realSleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
+type AbortableResult<T> = { aborted: true } | { aborted: false; value: T };
+
 /**
  * Map a worker failure marker (`transient:<category>`) to the resilience
  * infrastructure category. Returns null for markers that are NOT a confident
@@ -176,6 +178,8 @@ export class MissionScheduler {
   private readonly relaunches = new Map<string, number>();
   /** Per-task circuit breaker (prevents a request storm during recovery). */
   private readonly breakers = new Map<string, CircuitBreaker>();
+  /** In-flight runners, retained so mission cancellation can await cleanup. */
+  private readonly activeRuns = new Map<string, Set<Promise<void>>>();
 
   constructor(opts: SchedulerOptions) {
     this.store = opts.store;
@@ -223,6 +227,7 @@ export class MissionScheduler {
 
   private hasCapacity(t: OrchestrationTask): boolean {
     const kind = t.kind;
+    if (this.activeTasks.size >= this.limits.maxActive) return false;
     if (kind === "agent" && this.counters.agents >= this.limits.maxAgents) return false;
     if ((kind === "process" || kind === "validation") && this.counters.subprocesses >= this.limits.maxSubprocesses) {
       return false;
@@ -250,53 +255,90 @@ export class MissionScheduler {
     // Topological sanity check (throws on cycle).
     assertAcyclic(this.store.listTasks(missionId));
     let done = false;
-    while (!done && !signal?.aborted) {
-      const mission = this.store.getMission(missionId);
-      if (!mission || mission.status === "CANCELED" || mission.status === "FAILED" || mission.status === "COMPLETE") {
-        return;
-      }
-      const runnable = this.runnable(missionId);
-      const terminal = this.store
-        .listTasks(missionId)
-        .filter((t) => ["SUCCEEDED", "FAILED", "CANCELED", "SKIPPED"].includes(t.status)).length;
-      const total = this.store.listTasks(missionId).length;
+    let canceling: Promise<void> | null = null;
+    const cancelActive = (): Promise<void> => {
+      canceling ??= Promise.all(
+        [...this.activeTasks.values()]
+          .filter((task) => task.mission_id === missionId)
+          .map((task) => this.broker.cancelByTask(task.task_id)),
+      ).then(() => undefined);
+      return canceling;
+    };
+    const onAbort = (): void => {
+      void cancelActive();
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+    try {
+      while (!done && !signal?.aborted) {
+        const mission = this.store.getMission(missionId);
+        if (!mission || mission.status === "CANCELED" || mission.status === "FAILED" || mission.status === "COMPLETE") {
+          return;
+        }
+        const runnable = this.runnable(missionId);
+        const terminal = this.store
+          .listTasks(missionId)
+          .filter((t) => ["SUCCEEDED", "FAILED", "CANCELED", "SKIPPED"].includes(t.status)).length;
+        const total = this.store.listTasks(missionId).length;
 
-      if (runnable.length === 0) {
-        // Nothing runnable now. If every task is terminal, we are done; else
-        // something is BLOCKED/WAITING (handled by caller) or a conflict that
-        // will clear when an active task settles.
-        if (terminal === total || total === 0) done = true;
-        else if (this.activeTasks.size === 0) {
-          // No active task and nothing runnable but not all terminal → blocked.
-          const blocked = this.store
-            .listTasks(missionId)
-            .filter((t) => !["SUCCEEDED", "FAILED", "CANCELED", "SKIPPED"].includes(t.status));
-          if (blocked.length > 0) {
-            // Deadlock or all deps failed; leave for orchestrator.
-            done = true;
+        if (runnable.length === 0) {
+          // Nothing runnable now. If every task is terminal, we are done; else
+          // something is BLOCKED/WAITING (handled by caller) or a conflict that
+          // will clear when an active task settles.
+          if (terminal === total || total === 0) done = true;
+          else if (this.activeTasks.size === 0) {
+            // No active task and nothing runnable but not all terminal → blocked.
+            const blocked = this.store
+              .listTasks(missionId)
+              .filter((t) => !["SUCCEEDED", "FAILED", "CANCELED", "SKIPPED"].includes(t.status));
+            if (blocked.length > 0) {
+              // Deadlock or all deps failed; leave for orchestrator.
+              done = true;
+            }
           }
+          // If active tasks exist, wait for them.
+          await this.abortable(new Promise<void>((resolve) => setTimeout(resolve, 10)), signal);
+          continue;
         }
-        // If active tasks exist, wait for them.
-        await new Promise((r) => setTimeout(r, 10));
-        continue;
-      }
 
-      // Launch runnable tasks incrementally, re-checking write-domain conflict
-      // against tasks acquired earlier in this same pass so overlapping domains
-      // serialize even when they were both "runnable" at pass start.
-      for (const task of runnable) {
-        if (signal?.aborted) break;
-        if (this.hasConflict(task)) continue;
-        // Idempotent: a resumed (already-READY) task must not throw on
-        // READY -> READY; only transition from PENDING/WAITING.
-        if (this.store.getTask(task.task_id)?.status !== "READY") {
-          this.store.transitionTask(task.task_id, "READY");
+        // Launch runnable tasks incrementally, re-checking write-domain conflict
+        // against tasks acquired earlier in this same pass so overlapping domains
+        // serialize even when they were both "runnable" at pass start.
+        for (const task of runnable) {
+          if (signal?.aborted) break;
+          if (this.hasConflict(task)) continue;
+          if (!this.hasCapacity(task)) continue;
+          // Idempotent: a resumed (already-READY) task must not throw on
+          // READY -> READY; only transition from PENDING/WAITING.
+          if (this.store.getTask(task.task_id)?.status !== "READY") {
+            this.store.transitionTask(task.task_id, "READY");
+          }
+          this.acquire(task);
+          this.trackRun(task, signal);
         }
-        this.acquire(task);
-        void this.runOne(task);
+        await this.abortable(new Promise<void>((resolve) => setTimeout(resolve, 10)), signal);
       }
-      await new Promise((r) => setTimeout(r, 10));
+    } finally {
+      signal?.removeEventListener("abort", onAbort);
+      if (signal?.aborted) await cancelActive();
+      try {
+        await Promise.all(this.activeRuns.get(missionId) ?? []);
+      } finally {
+        this.activeRuns.delete(missionId);
+      }
     }
+  }
+
+  private trackRun(task: OrchestrationTask, signal?: AbortSignal): void {
+    let runs = this.activeRuns.get(task.mission_id);
+    if (!runs) {
+      runs = new Set();
+      this.activeRuns.set(task.mission_id, runs);
+    }
+    const run = this.runOne(task, signal);
+    runs.add(run);
+    // Mark the detached runner handled immediately; runMission still observes
+    // the original promise through Promise.all before clearing this mission set.
+    void run.catch(() => undefined);
   }
 
   private hasConflict(t: OrchestrationTask): boolean {
@@ -307,25 +349,33 @@ export class MissionScheduler {
   }
 
   /** Execute a single task with retry via the broker. */
-  private async runOne(task: OrchestrationTask): Promise<void> {
+  private async runOne(task: OrchestrationTask, signal?: AbortSignal): Promise<void> {
     try {
-      await this.executeWithRetry(task);
+      await this.executeWithRetry(task, signal);
     } finally {
       this.release(task);
       this.onTaskSettled?.(task.mission_id, task.task_id, this.store.getTask(task.task_id)?.status ?? "FAILED");
     }
   }
 
-  private async executeWithRetry(task: OrchestrationTask): Promise<void> {
+  private async executeWithRetry(task: OrchestrationTask, signal?: AbortSignal): Promise<void> {
     let attempt = task.attempt;
     while (true) {
+      if (signal?.aborted) {
+        this.cancelTask(task);
+        return;
+      }
       attempt++;
       // Resilience probe gate: when a time-based retry window is active for this
       // task (a prior transient infrastructure failure), start a fresh worker
       // attempt ONLY once the recovery probe reports the gateway healthy; otherwise
       // wait the probe interval and re-check, without burning a full worker session.
       // On window exhaustion the mission is PAUSED (not FAILED).
-      const gate = await this.probeGate(task);
+      const gate = await this.probeGate(task, signal);
+      if (gate === "aborted") {
+        this.cancelTask(task);
+        return;
+      }
       if (gate === "paused") return;
       if (gate === "wait") continue;
 
@@ -346,6 +396,10 @@ export class MissionScheduler {
           isolation: task.isolation,
           modelRequirements: task.execution_requirements,
         });
+        if (signal?.aborted) {
+          await handle.cancel();
+          return;
+        }
         this.store.transitionTask(task.task_id, "RUNNING", "system", {
           attempt,
           assigned_execution_id: handle.executionId,
@@ -375,7 +429,11 @@ export class MissionScheduler {
             if (res.paused) return;
             if (res.retry) {
               this.store.transitionTask(task.task_id, "RETRYING", "system", { attempt });
-              await this.sleepFn(res.waitMs);
+              const waited = await this.abortable(this.sleepFn(res.waitMs), signal);
+              if (waited.aborted) {
+                this.cancelTask(task);
+                return;
+              }
               continue;
             }
           }
@@ -396,6 +454,10 @@ export class MissionScheduler {
         this.store.transitionTask(task.task_id, "SUCCEEDED");
         return;
       } catch (err) {
+        if (signal?.aborted) {
+          this.cancelTask(task);
+          return;
+        }
         if (this.store.getTask(task.task_id)?.status === "CANCELED") return;
         // Thrown failures (e.g. no backend registered) keep the existing
         // attempt-count repair path; the time-based window applies to the
@@ -419,7 +481,11 @@ export class MissionScheduler {
    *   "wait"    — sleep (already done) and re-loop without an attempt;
    *   "paused"  — window exhausted; the mission is paused, stop.
    */
-  private async probeGate(task: OrchestrationTask): Promise<"proceed" | "wait" | "paused"> {
+  private async probeGate(
+    task: OrchestrationTask,
+    signal?: AbortSignal,
+  ): Promise<"proceed" | "wait" | "paused" | "aborted"> {
+    if (signal?.aborted) return "aborted";
     const window = this.windows.get(task.task_id);
     if (!window) return "proceed";
     const cfg = this.resilience;
@@ -427,16 +493,45 @@ export class MissionScheduler {
     // Circuit breaker: while OPEN and the cooldown has not elapsed, only probe.
     const breaker = this.breakers.get(task.task_id);
     if (breaker && !breaker.allowRequest()) {
-      await this.sleepFn(cfg.probe_interval_ms);
+      const waited = await this.abortable(this.sleepFn(cfg.probe_interval_ms), signal);
+      if (waited.aborted) return "aborted";
       return "wait";
     }
     breaker?.tryHalfOpen();
-    const result = await this.probe.probe();
+    const probed = await this.abortable(this.probe.probe(), signal);
+    if (probed.aborted) return "aborted";
+    const result = probed.value;
     if (result.healthy) return "proceed";
     // Gateway still down: honour the reported wait (else the probe interval),
     // then re-probe without a real attempt.
-    await this.sleepFn(result.retry_after_ms ?? cfg.probe_interval_ms);
+    const waited = await this.abortable(this.sleepFn(result.retry_after_ms ?? cfg.probe_interval_ms), signal);
+    if (waited.aborted) return "aborted";
     return "wait";
+  }
+
+  private cancelTask(task: OrchestrationTask): void {
+    const status = this.store.getTask(task.task_id)?.status;
+    if (!status || ["SUCCEEDED", "FAILED", "CANCELED", "SKIPPED"].includes(status)) return;
+    this.store.transitionTask(task.task_id, "CANCELED");
+  }
+
+  private async abortable<T>(operation: Promise<T>, signal?: AbortSignal): Promise<AbortableResult<T>> {
+    if (!signal) return { aborted: false, value: await operation };
+    if (signal.aborted) return { aborted: true };
+    return new Promise<AbortableResult<T>>((resolve, reject) => {
+      const onAbort = (): void => resolve({ aborted: true });
+      signal.addEventListener("abort", onAbort, { once: true });
+      operation.then(
+        (value) => {
+          signal.removeEventListener("abort", onAbort);
+          resolve({ aborted: false, value });
+        },
+        (error: unknown) => {
+          signal.removeEventListener("abort", onAbort);
+          reject(error);
+        },
+      );
+    });
   }
 
   /**
@@ -617,7 +712,9 @@ export class MissionScheduler {
       missionId === undefined || this.store.getMission(missionId)?.status === "PAUSED_INFRASTRUCTURE";
     for (let n = 0; this.clockNow() < deadlineMs; n++) {
       if (signal?.aborted || !stillPaused()) return false;
-      const result = await this.probe.probe();
+      const probed = await this.abortable(this.probe.probe(), signal);
+      if (probed.aborted) return false;
+      const result = probed.value;
       // Only a real answer resumes: a probe that could not even resolve its
       // target (authoritative: false) says nothing about a recovery.
       if (result.healthy && result.authoritative !== false) return true;
@@ -626,18 +723,20 @@ export class MissionScheduler {
         cfg.probe_interval_ms * 2 ** Math.min(n, 30),
       );
       const jitter = cfg.jitter_ms > 0 ? Math.round(cfg.jitter_ms * this.rand()) : 0;
-      await this.sleepFn(
-        Math.min(result.retry_after_ms ?? backoff + jitter, Math.max(0, deadlineMs - this.clockNow())),
+      const waited = await this.abortable(
+        this.sleepFn(Math.min(result.retry_after_ms ?? backoff + jitter, Math.max(0, deadlineMs - this.clockNow()))),
+        signal,
       );
+      if (waited.aborted) return false;
       if (this.clockNow() >= deadlineMs || signal?.aborted) break;
     }
     return false;
   }
 
   /** Lightweight gateway readiness check (for auto-resume decisions). */
-  async gatewayHealthy(): Promise<boolean> {
-    const result = await this.probe.probe();
-    return result.healthy;
+  async gatewayHealthy(signal?: AbortSignal): Promise<boolean> {
+    const result = await this.abortable(this.probe.probe(), signal);
+    return !result.aborted && result.value.healthy;
   }
 
   /**

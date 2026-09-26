@@ -15,7 +15,7 @@
 import type { ArtifactStore } from "../artifacts/ArtifactStore.ts";
 import type { GitRepo } from "../git/GitRepo.ts";
 import type { VerificationProvider } from "../verify/Verifier.ts";
-import type { WorkerExecutor, WorkerRequest } from "../workers/WorkerExecutor.ts";
+import type { WorkerActivity, WorkerExecutor, WorkerRequest } from "../workers/WorkerExecutor.ts";
 import { type ExecutionOutcome, type IntegrationHandoff, workerTimeoutMs } from "./broker.ts";
 
 export interface RealBackendsOptions {
@@ -113,6 +113,43 @@ function outcomeOf(result: Awaited<ReturnType<WorkerExecutor["run"]>>): Executio
 }
 
 export function realBackends(opts: RealBackendsOptions) {
+  const runWorker = async (
+    req: WorkerRequest,
+    input: { signal: AbortSignal; onActivity?: (event: WorkerActivity) => void },
+  ): Promise<Awaited<ReturnType<WorkerExecutor["run"]>>> => {
+    if (input.signal.aborted) throw new Error("worker execution aborted");
+    let aborted = false;
+    const markAborted = (): void => {
+      aborted = true;
+    };
+    const publish = (event: WorkerActivity): void => {
+      if (aborted) return;
+      try {
+        input.onActivity?.(event);
+      } catch {
+        // Activity consumers are observers, never participants.
+      }
+    };
+    req.onActivity = publish;
+    req.signal = input.signal;
+    input.signal.addEventListener("abort", markAborted, { once: true });
+    try {
+      const result = await opts.worker.run(req);
+      const completed = result.result.status === "completed";
+      publish({
+        kind: "state",
+        phase: completed ? "completed" : "failed",
+        summary: completed ? "Worker session completed" : "Worker session failed",
+        meaningfulProgress: completed,
+      });
+      return result;
+    } catch (error) {
+      publish({ kind: "state", phase: "failed", summary: "Worker session failed", meaningfulProgress: false });
+      throw error;
+    } finally {
+      input.signal.removeEventListener("abort", markAborted);
+    }
+  };
   return {
     agent: {
       async runAgent(input: {
@@ -123,6 +160,7 @@ export function realBackends(opts: RealBackendsOptions) {
         isolatedWorktree?: boolean;
         modelRequirements?: Record<string, unknown>;
         signal: AbortSignal;
+        onActivity?: (event: WorkerActivity) => void;
       }): Promise<ExecutionOutcome> {
         const req: WorkerRequest = {
           role: (input.role as WorkerRequest["role"]) ?? "implementer",
@@ -143,7 +181,7 @@ export function realBackends(opts: RealBackendsOptions) {
         // default when routing is unavailable or the role is unknown.
         const modelOverride = await opts.routeModel?.(req.role);
         if (modelOverride) req.modelOverride = modelOverride;
-        const run = await opts.worker.run(req);
+        const run = await runWorker(req, input);
         return outcomeOf(run);
       },
     },
@@ -153,16 +191,18 @@ export function realBackends(opts: RealBackendsOptions) {
         objective: string;
         contextRef?: string;
         signal: AbortSignal;
+        onActivity?: (event: WorkerActivity) => void;
       }): Promise<ExecutionOutcome> {
-        return opts.worker
-          .run({
+        return runWorker(
+          {
             role: "scout",
             task: input.objective,
             context: input.contextRef,
             tools: ["ledger_read", "repo_search", "symbol", "tests_for"],
             cwd: opts.cwd,
-          })
-          .then(outcomeOf);
+          },
+          input,
+        ).then(outcomeOf);
       },
     },
     validation: {
@@ -170,10 +210,13 @@ export function realBackends(opts: RealBackendsOptions) {
         objective: string;
         worktree?: string | null;
         signal: AbortSignal;
+        onActivity?: (event: WorkerActivity) => void;
       }): Promise<ExecutionOutcome> {
+        input.signal.throwIfAborted();
         const cwd = input.worktree ?? opts.cwd;
         const profile = await opts.verifier.detect(cwd);
-        const outcome = await opts.verifier.run(cwd, profile, opts.artifacts);
+        input.signal.throwIfAborted();
+        const outcome = await opts.verifier.run(cwd, profile, opts.artifacts, { signal: input.signal });
         return {
           executionId: "validation",
           exitStatus: outcome.passed ? "succeeded" : "failed",
@@ -210,7 +253,7 @@ export function realBackends(opts: RealBackendsOptions) {
         };
         const modelOverride = await opts.routeModel?.(req.role);
         if (modelOverride) req.modelOverride = modelOverride;
-        const run = await opts.worker.run(req);
+        const run = await runWorker(req, input);
         const outcome = outcomeOf(run);
         // If the reviewer emitted structured findings, normalize and surface them
         // so the completion gate can block on blocking findings. Handles three
@@ -229,9 +272,11 @@ export function realBackends(opts: RealBackendsOptions) {
       }): Promise<ExecutionOutcome> {
         // Deterministic process execution falls back to verification-style
         // commands; a generic subprocess runner can be attached here later.
+        input.signal.throwIfAborted();
         const cwd = input.worktree ?? opts.cwd;
         const profile = await opts.verifier.detect(cwd);
-        const outcome = await opts.verifier.run(cwd, profile, opts.artifacts);
+        input.signal.throwIfAborted();
+        const outcome = await opts.verifier.run(cwd, profile, opts.artifacts, { signal: input.signal });
         return {
           executionId: "process",
           exitStatus: outcome.passed ? "succeeded" : "failed",
@@ -247,6 +292,7 @@ export function realBackends(opts: RealBackendsOptions) {
         handoffs: IntegrationHandoff[];
         signal: AbortSignal;
       }): Promise<ExecutionOutcome> {
+        input.signal.throwIfAborted();
         if (!opts.git)
           return {
             executionId: "integration",
@@ -266,10 +312,12 @@ export function realBackends(opts: RealBackendsOptions) {
         const conflicts: string[] = [];
         const skippedRecovered: string[] = [];
         for (const h of input.handoffs) {
+          input.signal.throwIfAborted();
           const r = await opts.git.mergeBranch(h.ref ?? h.worktree.branch).catch((e: Error) => ({
             merged: false,
             reason: e.message,
           }));
+          input.signal.throwIfAborted();
           const reason = `${h.worktree.branch}: ${(r as { reason?: string }).reason ?? "conflict"}`;
           if (r.merged) (h.recovered ? recovered : merged).push(h.worktree.branch);
           else (h.recovered ? skippedRecovered : conflicts).push(reason);
@@ -288,8 +336,10 @@ export function realBackends(opts: RealBackendsOptions) {
             usage: { mergedBranches: merged.length + recovered.length, conflicts: conflicts.length },
           };
         }
+        input.signal.throwIfAborted();
         const checks = await opts.verifier.detect(opts.cwd);
-        const result = await opts.verifier.run(opts.cwd, checks, opts.artifacts);
+        input.signal.throwIfAborted();
+        const result = await opts.verifier.run(opts.cwd, checks, opts.artifacts, { signal: input.signal });
         return {
           executionId: "integration",
           exitStatus: result.passed ? "succeeded" : "failed",

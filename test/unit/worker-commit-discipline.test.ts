@@ -113,7 +113,7 @@ test("the flag is plumbed broker → realBackends → WorkerRequest only for a b
   );
 
   // The broker says so only when it really allocated one. Without a git
-  // provider there is no worktree, so the runner hears `false`.
+  // provider a requested isolated mutation fails closed before dispatch.
   const store = MissionStore.open(JsonlEventStore.inMemory());
   const m = store.createMission({
     title: "x",
@@ -138,18 +138,21 @@ test("the flag is plumbed broker → realBackends → WorkerRequest only for a b
   });
   const t = store.createTask({ mission_id: m.mission_id, kind: "agent", role: "implementer", objective: "x" });
   store.transitionTask(t.task_id, "READY");
-  await (
-    await broker.execute({
-      taskId: t.task_id,
-      missionId: m.mission_id,
-      kind: "agent",
-      role: "implementer",
-      objective: "x",
-      mutatesRepo: true,
-      isolation: "worktree",
-    })
-  ).result();
-  assert.deepEqual(flags, [false]);
+  await assert.rejects(
+    (
+      await broker.execute({
+        taskId: t.task_id,
+        missionId: m.mission_id,
+        kind: "agent",
+        role: "implementer",
+        objective: "x",
+        mutatesRepo: true,
+        isolation: "worktree",
+      })
+    ).result(),
+    /isolated worktree/i,
+  );
+  assert.deepEqual(flags, []);
 });
 
 test("the broker reports isolatedWorktree: true when it allocated a real git worktree", async () => {

@@ -19,6 +19,8 @@
  */
 
 import type { GitRepo } from "../git/GitRepo.ts";
+import type { WorkerActivity } from "../workers/WorkerExecutor.ts";
+import { sanitizeWorkerActivity } from "../workers/activity.ts";
 import type { MissionStore } from "./missionStore.ts";
 import type { ExecutionBackend, RecoveredMerge } from "./types.ts";
 
@@ -89,6 +91,7 @@ export interface AgentRunner {
     isolatedWorktree?: boolean;
     modelRequirements?: Record<string, unknown>;
     signal: AbortSignal;
+    onActivity?: (event: WorkerActivity) => void;
   }): Promise<ExecutionOutcome>;
   onSteer?: (steer: string) => void;
 }
@@ -106,6 +109,7 @@ export interface ReviewRunner {
     objective: string;
     contextRef?: string;
     signal: AbortSignal;
+    onActivity?: (event: WorkerActivity) => void;
   }): Promise<ExecutionOutcome & { findings?: Array<Record<string, unknown>> }>;
 }
 
@@ -180,6 +184,10 @@ export interface BrokerOptions {
   git?: GitRepo | null;
   /** Base ref (commit) worktrees are created at. Defaults to current HEAD. */
   baseRef?: string;
+  /** Execution-local live worker activity with durable orchestration identity. */
+  onActivity?: (event: WorkerActivity & { missionId: string; taskId: string; executionId: string }) => void;
+  /** Periodic liveness detail for every backend while it is running. */
+  activityHeartbeatMs?: number;
 }
 
 export class ExecutionBroker {
@@ -188,6 +196,8 @@ export class ExecutionBroker {
   private readonly defaultTimeoutMs: number;
   private readonly git: GitRepo | null;
   private readonly baseRef: string;
+  private readonly onActivity?: BrokerOptions["onActivity"];
+  private readonly activityHeartbeatMs: number;
   /** In-flight execution state for cancellation + allocated worktrees. */
   private readonly active = new Map<
     string,
@@ -225,6 +235,8 @@ export class ExecutionBroker {
     this.defaultTimeoutMs = opts.defaultTimeoutMs ?? workerTimeoutMs();
     this.git = opts.git ?? null;
     this.baseRef = opts.baseRef ?? "";
+    this.onActivity = opts.onActivity;
+    this.activityHeartbeatMs = opts.activityHeartbeatMs ?? 15_000;
   }
 
   /**
@@ -260,7 +272,10 @@ export class ExecutionBroker {
 
   /** Allocate an isolated worktree for a mutating, worktree-isolated task. */
   private async allocateWorktree(executionId: string, input: ExecutionRequestInput): Promise<string | null> {
-    if (!input.mutatesRepo || input.isolation !== "worktree" || !this.git) return null;
+    if (!input.mutatesRepo || input.isolation !== "worktree") return null;
+    if (!this.git) {
+      throw new Error("Required isolated worktree allocation failed: no git provider is available");
+    }
     try {
       // The mission's declared base_ref wins: a mission planned against commit X
       // must branch from X. Falling back to a broker-level ref captured earlier
@@ -283,10 +298,9 @@ export class ExecutionBroker {
       mission.push(info);
       this.missionWorktrees.set(input.missionId, mission);
       return wt.path;
-    } catch {
-      // If a worktree cannot be allocated (e.g. not a git repo), fall back to
-      // the main tree — the scheduler has already serialized conflicting writes.
-      return null;
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      throw new Error(`Required isolated worktree allocation failed: ${detail}`, { cause: error });
     }
   }
 
@@ -578,14 +592,93 @@ export class ExecutionBroker {
         runner?.onSteer?.(request);
       },
       result: async () => {
+        if (abort.signal.aborted) throw new Error("execution aborted before dispatch");
         const timeoutMs = input.timeoutPolicy?.timeoutMs ?? this.defaultTimeoutMs;
-        const timer = setTimeout(() => abort.abort(), timeoutMs);
-        // Allocate an isolated worktree before dispatch so mutating workers edit
-        // their own checkout (spec 05), then release it when the task settles.
-        const worktree = await this.allocateWorktree(execution.execution_id, input);
-        if (worktree) this.active.get(execution.execution_id)!.worktree = worktree;
+        const timer = setTimeout(
+          () => abort.abort(new DOMException(`Execution exceeded its ${timeoutMs}ms deadline`, "TimeoutError")),
+          timeoutMs,
+        );
+        const activityStartedAt = Date.now();
+        let lastActivityAt = activityStartedAt;
+        let activitySettled = false;
+        let activityTimer: ReturnType<typeof setInterval> | undefined;
+        const emitActivity = (event: WorkerActivity): void => {
+          if (activitySettled || abort.signal.aborted) return;
+          const safe = sanitizeWorkerActivity(event);
+          if (!safe) return;
+          if (safe.kind !== "heartbeat") lastActivityAt = Date.now();
+          try {
+            this.onActivity?.({
+              ...safe,
+              missionId: input.missionId,
+              taskId: input.taskId,
+              executionId: execution.execution_id,
+            });
+          } catch {
+            // Observability is never a participant in execution.
+          }
+        };
+        const onAbort = (): void => {
+          if (activitySettled) return;
+          if (activityTimer) clearInterval(activityTimer);
+          activityTimer = undefined;
+          const timedOut = abort.signal.reason instanceof DOMException && abort.signal.reason.name === "TimeoutError";
+          const safe = sanitizeWorkerActivity({
+            kind: "execution",
+            phase: timedOut ? "failed" : "canceled",
+            stage: backend,
+            summary: "",
+            meaningfulProgress: false,
+          });
+          if (safe) {
+            try {
+              this.onActivity?.({
+                ...safe,
+                missionId: input.missionId,
+                taskId: input.taskId,
+                executionId: execution.execution_id,
+              });
+            } catch {
+              // Observability is never a participant in execution.
+            }
+          }
+          activitySettled = true;
+        };
+        emitActivity({ kind: "execution", phase: "started", stage: backend, summary: "", meaningfulProgress: false });
+        activityTimer =
+          this.activityHeartbeatMs > 0
+            ? setInterval(() => {
+                const at = Date.now();
+                emitActivity({
+                  kind: "heartbeat",
+                  stage: backend,
+                  summary: "",
+                  meaningfulProgress: false,
+                  elapsedMs: Math.max(0, at - activityStartedAt),
+                  lastActivityMs: Math.max(0, at - lastActivityAt),
+                });
+              }, this.activityHeartbeatMs)
+            : undefined;
+        activityTimer?.unref?.();
+        abort.signal.addEventListener("abort", onAbort, { once: true });
+        let worktree: string | null = null;
         try {
-          const outcome = await this.dispatch(input, backend, execution.execution_id, abort.signal, worktree);
+          // Allocate an isolated worktree before dispatch so mutating workers
+          // edit their own checkout (spec 05). This remains inside the cleanup
+          // boundary because cancellation can remove the active entry while
+          // allocation is in flight.
+          worktree = await this.allocateWorktree(execution.execution_id, input);
+          const active = this.active.get(execution.execution_id);
+          if (worktree && active) active.worktree = worktree;
+          if (abort.signal.aborted) throw new Error("execution aborted before dispatch");
+          const outcome = await this.dispatch(
+            input,
+            backend,
+            execution.execution_id,
+            abort.signal,
+            worktree,
+            emitActivity,
+          );
           // A cancellation that already settled this execution must not be
           // overwritten by the runner's late success.
           if (!this.settledElsewhere(execution.execution_id)) {
@@ -639,20 +732,32 @@ export class ExecutionBroker {
             }
           }
           this.active.delete(execution.execution_id);
+          emitActivity({
+            kind: "execution",
+            phase: outcome.exitStatus === "succeeded" ? "completed" : "failed",
+            stage: backend,
+            summary: "",
+            meaningfulProgress: outcome.exitStatus === "succeeded",
+          });
           return outcome;
         } catch (err) {
           if (!this.settledElsewhere(execution.execution_id)) {
-            if (abort.signal.aborted) {
+            const timedOut = abort.signal.reason instanceof DOMException && abort.signal.reason.name === "TimeoutError";
+            if (abort.signal.aborted && !timedOut) {
               this.store.setExecutionStatus(execution.execution_id, "CANCELED", { exit_status: "canceled" });
             } else {
               this.store.setExecutionStatus(execution.execution_id, "FAILED", {
-                exit_status: err instanceof Error ? err.message : String(err),
+                exit_status: timedOut ? WALL_CLOCK_TIMEOUT_MARKER : err instanceof Error ? err.message : String(err),
               });
             }
           }
           this.active.delete(execution.execution_id);
+          emitActivity({ kind: "execution", phase: "failed", stage: backend, summary: "", meaningfulProgress: false });
           throw err;
         } finally {
+          activitySettled = true;
+          if (activityTimer) clearInterval(activityTimer);
+          abort.signal.removeEventListener("abort", onAbort);
           clearTimeout(timer);
           await this.releaseWorktree(execution.execution_id);
         }
@@ -671,12 +776,14 @@ export class ExecutionBroker {
     executionId: string,
     signal: AbortSignal,
     worktree: string | null,
+    onActivity: (event: WorkerActivity) => void,
   ): Promise<ExecutionOutcome> {
     const base = {
       objective: input.objective,
       contextRef: input.contextRef,
       worktree,
       signal,
+      onActivity,
     };
     switch (backend) {
       case "agent":
@@ -691,6 +798,7 @@ export class ExecutionBroker {
           isolatedWorktree: worktree !== null,
           modelRequirements: input.modelRequirements,
           signal,
+          onActivity: base.onActivity,
         });
       }
       case "process": {
@@ -701,7 +809,12 @@ export class ExecutionBroker {
       case "review": {
         const runner = this.backends.review;
         if (!runner) throw new Error("no review backend registered");
-        return runner.runReview({ objective: input.objective, contextRef: input.contextRef, signal });
+        return runner.runReview({
+          objective: input.objective,
+          contextRef: input.contextRef,
+          signal,
+          onActivity: base.onActivity,
+        });
       }
       case "integration": {
         const runner = this.backends.integration;

@@ -46,7 +46,9 @@ function run(outageMs: number) {
         objective: "implement",
         mutates_repo: true,
         write_domains: ["src/**"],
-        isolation: "worktree" as const,
+        // This fake-clock resilience harness has no Git provider and exercises
+        // retry lifecycle only, so direct execution is explicit.
+        isolation: "none" as const,
         depends_on: [],
         priority: 0,
         execution_requirements: {},
@@ -99,7 +101,7 @@ describe("orchestrator: an outage longer than the retry horizon", () => {
 });
 
 describe("orchestrator: cancelling an auto-resume wait", () => {
-  it("an aborted orchestration returns the mission PAUSED instead of watching the probe for hours", async () => {
+  it("an aborted orchestration cancels the mission instead of watching the probe for hours", async () => {
     const h = run(100 * HOUR);
     const controller = new AbortController();
     const pending = h.orchestrator.orchestrate("Add a health endpoint", {
@@ -114,7 +116,9 @@ describe("orchestrator: cancelling an auto-resume wait", () => {
     }, 0);
     const result = await pending;
     clearInterval(timer);
-    assert.equal(result.paused, true);
+    assert.equal(result.paused, undefined);
+    assert.equal(result.completed, false);
+    assert.equal(result.mission.status, "CANCELED");
     assert.ok(h.clock() < 36 * HOUR, `stopped at ${h.clock()}ms`);
   });
 });

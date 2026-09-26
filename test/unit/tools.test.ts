@@ -116,3 +116,44 @@ test("artifact_read errors (not silently empty) when the content file is missing
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("mission tool forwards the caller cancellation signal to orchestration", async () => {
+  const controller = new AbortController();
+  let receivedSignal: AbortSignal | undefined;
+  const tools = buildCoreTools(async () => ({
+    ledger: {} as never,
+    artifacts: {} as never,
+    broker: null,
+    currentWorkItemId: () => null,
+    actor: () => ({ type: "user" }),
+    baseRef: () => "base",
+    orchestrator: {
+      orchestrate: async (_request: string, opts: { signal?: AbortSignal }) => {
+        receivedSignal = opts.signal;
+        return {
+          mission: {
+            mission_id: "MSN-test",
+            status: "CANCELED",
+            workflow_class: "engineering",
+            required_gates: [],
+          },
+          intent: { intent: ["engineering"] },
+          completed: false,
+          failureReason: "canceled",
+        };
+      },
+    } as never,
+  }));
+  const mission = tools.find((tool) => tool.name === "mission")!;
+  const execute = mission.execute as unknown as (
+    id: string,
+    params: { request: string },
+    signal: AbortSignal,
+    onUpdate: unknown,
+    ctx: { cwd: string },
+  ) => Promise<unknown>;
+
+  await execute("m", { request: "cancel me" }, controller.signal, undefined, { cwd: "/repo" });
+
+  assert.equal(receivedSignal, controller.signal);
+});
