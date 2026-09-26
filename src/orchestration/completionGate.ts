@@ -57,11 +57,11 @@ export class CompletionGate {
     const tasks = this.store.listTasks(mission.mission_id);
 
     const running = tasks.filter((t) => ["READY", "RUNNING", "RETRYING", "WAITING", "PENDING"].includes(t.status));
-    // A FAILED task only blocks while it stands. Each repair round creates a NEW
-    // validation / integration / review task, so counting every historical
-    // failure would keep the gate closed even after the repaired work passed,
-    // making the mission unrecoverable. A failure is superseded once a later task
-    // of the same kind and role succeeded.
+    // A FAILED task only blocks while it stands. Each gate-repair round creates a
+    // NEW validation / integration / review task, so counting every historical
+    // gate failure would keep the mission unrecoverable after the repair passed.
+    // Implementation tasks are different: another agent task with the same role
+    // may have an unrelated objective and is never implicit evidence of repair.
     // Insertion order is the real chronology (the store is event-sourced). Only
     // timestamps are not enough: created_at has millisecond resolution, so a task
     // that fails immediately AFTER a success can share its timestamp, and a
@@ -69,14 +69,15 @@ export class CompletionGate {
     const order = new Map<string, number>();
     tasks.forEach((t, i) => order.set(t.task_id, i));
     const superseded = (t: OrchestrationTask): boolean =>
-      tasks.some(
-        (o) =>
-          o.task_id !== t.task_id &&
-          o.kind === t.kind &&
-          o.role === t.role &&
-          o.status === "SUCCEEDED" &&
-          (order.get(o.task_id) ?? -1) > (order.get(t.task_id) ?? -1),
-      ) ||
+      ((t.kind === "integration" || t.kind === "validation" || t.kind === "review") &&
+        tasks.some(
+          (o) =>
+            o.task_id !== t.task_id &&
+            o.kind === t.kind &&
+            o.role === t.role &&
+            o.status === "SUCCEEDED" &&
+            (order.get(o.task_id) ?? -1) > (order.get(t.task_id) ?? -1),
+        )) ||
       // Recovery supersede: the worker timed out AFTER committing, the broker
       // merged exactly that commit, and validation + review passed on the
       // result. The FAILED status records a timeout, not a rejected

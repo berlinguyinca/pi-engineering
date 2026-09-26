@@ -244,3 +244,38 @@ test("verifier fails a candidate whose required test fails (AC-005)", async () =
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("verifier aborts an active command promptly", async () => {
+  const dir = await makeProject({
+    "package.json": JSON.stringify({}),
+  });
+  try {
+    const store = await ArtifactStore.create(join(dir, "..", "artifacts"));
+    const verifier = new CommandVerifier();
+    const controller = new AbortController();
+    const profile = {
+      name: "abortable",
+      stages: [
+        {
+          name: "long-running",
+          command: process.execPath,
+          args: ["-e", "setInterval(() => {}, 10_000)"],
+          required: true,
+          timeoutMs: 30_000,
+        },
+      ],
+    };
+
+    const startedAt = Date.now();
+    const pending = verifier.run(dir, profile, store, { signal: controller.signal });
+    setTimeout(() => controller.abort(), 25);
+
+    await assert.rejects(pending, (error: unknown) => {
+      assert.equal((error as { name?: string }).name, "AbortError");
+      return true;
+    });
+    assert.ok(Date.now() - startedAt < 2_000, "abort should not wait for the command timeout");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});

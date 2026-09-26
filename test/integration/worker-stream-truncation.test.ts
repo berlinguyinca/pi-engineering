@@ -18,6 +18,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { resolveGatewayConfig } from "../../src/gateway/config.ts";
+import { ExecutionBroker } from "../../src/orchestration/broker.ts";
+import { MissionStore } from "../../src/orchestration/missionStore.ts";
+import { realBackends } from "../../src/orchestration/realBackends.ts";
+import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 import { PiWorkerExecutor } from "../../src/workers/PiWorkerExecutor.ts";
 
 type Reply = (res: ServerResponse) => void;
@@ -230,4 +234,56 @@ test("worker: a connection closed before any response head is retried (SDK 'Conn
     },
   );
   assert.equal(requests, 2);
+});
+
+test("broker deadline preceding the worker timer is classified as a wall-clock timeout", async () => {
+  const slowerThanBroker: Reply = (res) => {
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.write(chunk({ role: "assistant", content: "working" }));
+    setTimeout(() => res.end("data: [DONE]\n\n"), 150);
+  };
+  await withProbe([slowerThanBroker], async (executor, cwd) => {
+    const store = MissionStore.open(JsonlEventStore.inMemory());
+    const mission = store.createMission({
+      title: "deadline",
+      goal: "deadline",
+      user_request: "deadline",
+      repository: cwd,
+      base_ref: "",
+      risk_profile: "low",
+      workflow_class: "engineering_review",
+    });
+    const task = store.createTask({
+      mission_id: mission.mission_id,
+      kind: "agent",
+      role: "implementer",
+      objective: "wait forever",
+    });
+    const broker = new ExecutionBroker({
+      store,
+      defaultTimeoutMs: 30,
+      backends: realBackends({
+        worker: executor,
+        verifier: {} as never,
+        artifacts: {} as never,
+        git: null,
+        cwd,
+        routeModel: async () => ({ provider: "probe", id: "probe-model" }),
+      }),
+    });
+
+    const outcome = await (
+      await broker.execute({
+        taskId: task.task_id,
+        missionId: mission.mission_id,
+        kind: "agent",
+        role: "implementer",
+        objective: "wait forever",
+      })
+    ).result();
+
+    assert.equal(outcome.exitStatus, "failed");
+    assert.equal(outcome.error, "timeout");
+    assert.equal(store.listExecutions(mission.mission_id)[0]?.status, "FAILED");
+  });
 });

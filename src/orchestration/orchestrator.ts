@@ -19,12 +19,14 @@ import type { GitRepo } from "../git/GitRepo.ts";
 import type { EventStoreBackend } from "../platform/eventstore/backend.ts";
 import type { GatewayResilienceConfig } from "../resilience/config.ts";
 import type { RecoveryProbe } from "../resilience/probe.ts";
+import type { WorkerActivity } from "../workers/WorkerExecutor.ts";
 import { type BrokerBackends, ExecutionBroker } from "./broker.ts";
 import { CompletionGate } from "./completionGate.ts";
 import { IntentRouter, workflowMutatesRepo } from "./intentRouter.ts";
 import type { MissionStore } from "./missionStore.ts";
 import type { MissionObservability } from "./observability/MissionObservability.ts";
 import { computeProgress } from "./observability/progress.ts";
+import type { ActivityType } from "./observability/types.ts";
 import { deriveRequiredGates, mutationFactFromChangedFiles } from "./policies.ts";
 import { brokerKind } from "./scheduler.ts";
 import { MissionScheduler } from "./scheduler.ts";
@@ -122,6 +124,8 @@ export interface OrchestrateResult {
   paused?: boolean;
 }
 
+type FinalizationResult = Omit<OrchestrateResult, "intent" | "paused">;
+
 export class Orchestrator {
   readonly store: MissionStore;
   readonly broker: ExecutionBroker;
@@ -135,10 +139,10 @@ export class Orchestrator {
   private readonly parentSessionId: string | null;
   private readonly limits: NonNullable<OrchestratorOptions["limits"]>;
   private readonly maxRepairRounds: number;
-  /** Per-call progress hook set by `orchestrate`; consumed by task/phase events. */
-  private progress: ((line: string) => void) | null = null;
-  /** Mission currently being orchestrated, used to append a live progress bar. */
-  private activeMissionId: string | null = null;
+  /** Per-mission progress hooks; missions may overlap on one orchestrator. */
+  private readonly progress = new Map<string, (line: string) => void>();
+  private readonly observedExecutions = new Set<string>();
+  private readonly taskExecutions = new Map<string, string>();
 
   constructor(opts: OrchestratorOptions) {
     this.store = opts.store;
@@ -150,6 +154,7 @@ export class Orchestrator {
       backends: opts.backends,
       git: opts.git ?? null,
       baseRef: opts.baseRef ?? "",
+      onActivity: (event) => this.observeWorkerActivity(event),
     });
     this.scheduler = new MissionScheduler({
       store: this.store,
@@ -167,7 +172,7 @@ export class Orchestrator {
       // never silent: the operator sees each worker/gate settle instead of a
       // black screen for the whole worker budget (default 30 min).
       onTaskSettled: (missionId, taskId, status) => {
-        this.report(`[mission ${missionId}] task ${taskId} -> ${status}`);
+        this.report(missionId, `[mission ${missionId}] task ${taskId} -> ${status}`);
         this.observeTaskSettled(missionId, taskId, status);
       },
     });
@@ -181,8 +186,75 @@ export class Orchestrator {
 
   private phase(mission: Mission, phase: string): void {
     this.onPhase?.(mission, phase);
-    this.report(`[mission ${mission.mission_id}] phase ${phase}`);
+    this.report(mission.mission_id, `[mission ${mission.mission_id}] phase ${phase}`);
     this.observability?.phaseChanged(mission.mission_id, phase);
+  }
+
+  private observeWorkerActivity(
+    event: WorkerActivity & { missionId: string; taskId: string; executionId: string },
+  ): void {
+    const obs = this.observability;
+    if (!this.observedExecutions.has(event.executionId)) {
+      this.observedExecutions.add(event.executionId);
+      this.taskExecutions.set(`${event.missionId}:${event.taskId}`, event.executionId);
+      const task = this.store.getTask(event.taskId);
+      obs?.workerStarted(event.missionId, event.executionId, { taskId: event.taskId, runtime: "pi" });
+      if (task) {
+        obs?.taskStarted(event.missionId, event.taskId, task.objective);
+        obs?.setCurrentObjective(event.missionId, task.objective);
+      }
+    }
+    if (event.kind === "heartbeat") {
+      obs?.heartbeat(event.missionId, event.executionId, {
+        elapsedMs: event.elapsedMs,
+        lastActivityMs: event.lastActivityMs,
+      });
+    } else {
+      const type = this.activityType(event);
+      obs?.activity(event.missionId, {
+        type,
+        summary: event.summary,
+        workerId: event.executionId,
+        meaningfulProgress: event.meaningfulProgress,
+      });
+      if (event.kind === "tool")
+        obs?.noteWorkerTool(event.missionId, event.executionId, `${event.toolName}:${event.phase}`);
+      if ((event.kind === "state" || event.kind === "execution") && event.phase === "completed") {
+        obs?.workerCompleted(event.missionId, event.executionId);
+        if (event.kind === "execution") {
+          this.observedExecutions.delete(event.executionId);
+          this.taskExecutions.delete(`${event.missionId}:${event.taskId}`);
+        }
+      } else if (
+        (event.kind === "state" || event.kind === "execution") &&
+        (event.phase === "failed" || event.phase === "canceled")
+      ) {
+        obs?.workerFailed(event.missionId, event.executionId);
+        if (event.kind === "execution") {
+          this.observedExecutions.delete(event.executionId);
+          this.taskExecutions.delete(`${event.missionId}:${event.taskId}`);
+        }
+      }
+    }
+    this.report(event.missionId, `[mission ${event.missionId}] ${event.summary}`);
+  }
+
+  private activityType(event: WorkerActivity): ActivityType {
+    if (event.kind === "tool") return event.toolName === "bash" ? "running_command" : "tool_invocation";
+    if (event.phase === "failed" || event.phase === "canceled") return "error";
+    if (event.kind === "state") return event.phase === "completed" ? "worker_completed" : "worker_started";
+    switch (event.stage) {
+      case "validation":
+        return "validation";
+      case "integration":
+        return "integration";
+      case "review":
+        return event.phase === "completed" ? "review_completed" : "review_started";
+      case "process":
+        return "running_command";
+      default:
+        return event.phase === "completed" ? "worker_completed" : "worker_started";
+    }
   }
 
   /** Signal the CompletionGate passing to observability (100% · VERIFIED COMPLETE). */
@@ -197,18 +269,21 @@ export class Orchestrator {
   /** Feed a settled task into observability (SUCCEEDED/FAILED terminal states). */
   private observeTaskSettled(missionId: string, taskId: string, status: TaskStatus): void {
     const obs = this.observability;
-    if (!obs) return;
     const task = this.store.getTask(taskId);
     const label = task?.objective ?? taskId;
-    if (status === "SUCCEEDED") {
+    const workerId = this.taskExecutions.get(`${missionId}:${taskId}`) ?? taskId;
+    if (obs && status === "SUCCEEDED") {
       obs.taskStarted(missionId, taskId, label);
       obs.taskCompleted(missionId, taskId, label);
-      obs.workerCompleted(missionId, taskId);
-      obs.activity(missionId, { type: "worker_completed", summary: label, workerId: taskId });
-    } else if (status === "FAILED") {
-      obs.workerFailed(missionId, taskId);
+      obs.workerCompleted(missionId, workerId);
+      obs.activity(missionId, { type: "worker_completed", summary: "Task completed", workerId });
+    } else if (obs && status === "FAILED") {
+      obs.workerFailed(missionId, workerId);
+      obs.activity(missionId, { type: "error", summary: "Task failed", workerId });
       obs.recordError(missionId, "task_failed", `task ${taskId} settled ${status}`);
     }
+    this.taskExecutions.delete(`${missionId}:${taskId}`);
+    this.observedExecutions.delete(workerId);
   }
 
   /**
@@ -216,9 +291,7 @@ export class Orchestrator {
    * weighted-DAG progress. Empty when no mission is active. The percent is
    * computed deterministically from the mission DAG (never an LLM number).
    */
-  private progressBar(): string {
-    const missionId = this.activeMissionId;
-    if (!missionId) return "";
+  private progressBar(missionId: string): string {
     const projection = this.observability?.projection(missionId);
     const mission = this.store.getMission(missionId);
     const pct =
@@ -238,10 +311,10 @@ export class Orchestrator {
   }
 
   /** Emit a live progress line to the operator, appending the live progress bar. */
-  private report(line: string): void {
-    const bar = this.progressBar();
+  private report(missionId: string, line: string): void {
+    const bar = this.progressBar(missionId);
     try {
-      this.progress?.(bar ? `${line} ${bar}` : line);
+      this.progress.get(missionId)?.(bar ? `${line} ${bar}` : line);
     } catch {
       // A progress listener is an observer, never a participant.
     }
@@ -262,10 +335,7 @@ export class Orchestrator {
       acceptanceCriteria?: string[];
       /** Live progress callback (per-call). Lines stream as the mission runs. */
       onProgress?: (line: string) => void;
-      /**
-       * Ends an auto-resume wait (a paused mission watching the recovery
-       * probe) at once; the mission is returned PAUSED, still resumable.
-       */
+      /** Cancels active work and stops any infrastructure-recovery wait. */
       signal?: AbortSignal;
     } = { repository: ".", baseRef: "" },
   ): Promise<OrchestrateResult> {
@@ -279,8 +349,11 @@ export class Orchestrator {
 
     // Install the per-call progress hook for the duration of this mission so
     // task/phase transitions stream to the caller (e.g. the /mission command).
-    this.progress = opts.onProgress ?? null;
-    this.report(`[mission] starting workflow=${intent.suggested_workflow} risk=${risk}`);
+    try {
+      opts.onProgress?.(`[mission] starting workflow=${intent.suggested_workflow} risk=${risk}`);
+    } catch {
+      // A progress listener is an observer, never a participant.
+    }
 
     const mission = this.store.createMission({
       title: opts.title ?? request,
@@ -293,154 +366,201 @@ export class Orchestrator {
       workflow_class: intent.suggested_workflow,
       parent_session_id: this.parentSessionId,
     });
-    this.activeMissionId = mission.mission_id;
-    this.observability?.missionCreated(mission.mission_id, mission.title);
-    this.store.transitionMission(mission.mission_id, "CLASSIFYING");
+    if (opts.onProgress) this.progress.set(mission.mission_id, opts.onProgress);
+    try {
+      this.observability?.missionCreated(mission.mission_id, mission.title);
+      this.store.transitionMission(mission.mission_id, "CLASSIFYING");
 
-    // Derive acceptance criteria.
-    const criteria = opts.acceptanceCriteria ?? (await this.deriveAcceptance?.(mission)) ?? [];
-    for (const c of criteria) this.store.addAcceptanceCriterion(mission.mission_id, c);
-    if (criteria.length === 0 && workflowMutatesRepo(intent.suggested_workflow)) {
-      this.store.addAcceptanceCriterion(mission.mission_id, `Goal achieved: ${request}`);
-    }
-
-    // Required gates from policy. A mutation request (even before files exist)
-    // counts as a source mutation so validation + review are mandated by code.
-    if (intent.suggested_workflow !== "conversation" || opts.mutationRequested) {
-      const fact = mutationFactFromChangedFiles(opts.changedFiles ?? []);
-      if (opts.mutationRequested && fact.changedFiles.length === 0) {
-        fact.changedFiles = [request];
+      // Derive acceptance criteria.
+      const criteria = opts.acceptanceCriteria ?? (await this.deriveAcceptance?.(mission)) ?? [];
+      for (const c of criteria) this.store.addAcceptanceCriterion(mission.mission_id, c);
+      if (criteria.length === 0 && workflowMutatesRepo(intent.suggested_workflow)) {
+        this.store.addAcceptanceCriterion(mission.mission_id, `Goal achieved: ${request}`);
       }
-      const { gates } = deriveRequiredGates(fact);
-      this.store.updateMission(mission.mission_id, { required_gates: dedupe([...gates]) });
-    }
-    this.phase(this.store.getMission(mission.mission_id)!, "classified");
-    this.store.transitionMission(mission.mission_id, "PLANNING");
 
-    // Pure conversation/research has nothing to schedule — but ONLY when policy
-    // attached no gates. Taking this shortcut while gates are set would complete
-    // a mission that policy says must be validated and reviewed, and calling
-    // completeMission straight from PLANNING threw `illegal mission transition
-    // PLANNING -> COMPLETE` (reproduced for a plain "Explain this function").
-    const gatesNow = this.store.getMission(mission.mission_id)!.required_gates;
-    const passive = intent.suggested_workflow === "conversation" || intent.suggested_workflow === "research";
-    if (passive && gatesNow.length === 0) {
-      // Walk the lifecycle legally instead of teleporting to COMPLETE.
+      // Required gates from policy. A mutation request (even before files exist)
+      // counts as a source mutation so validation + review are mandated by code.
+      if (intent.suggested_workflow !== "conversation" || opts.mutationRequested) {
+        const fact = mutationFactFromChangedFiles(opts.changedFiles ?? []);
+        if (opts.mutationRequested && fact.changedFiles.length === 0) {
+          fact.changedFiles = [request];
+        }
+        const { gates } = deriveRequiredGates(fact);
+        this.store.updateMission(mission.mission_id, { required_gates: dedupe([...gates]) });
+      }
+      this.phase(this.store.getMission(mission.mission_id)!, "classified");
+      this.store.transitionMission(mission.mission_id, "PLANNING");
+
+      // Pure conversation/research has nothing to schedule — but ONLY when policy
+      // attached no gates. Taking this shortcut while gates are set would complete
+      // a mission that policy says must be validated and reviewed, and calling
+      // completeMission straight from PLANNING threw `illegal mission transition
+      // PLANNING -> COMPLETE` (reproduced for a plain "Explain this function").
+      const gatesNow = this.store.getMission(mission.mission_id)!.required_gates;
+      const passive = intent.suggested_workflow === "conversation" || intent.suggested_workflow === "research";
+      if (passive && gatesNow.length === 0) {
+        // Walk the lifecycle legally instead of teleporting to COMPLETE.
+        this.store.transitionMission(mission.mission_id, "READY");
+        this.store.transitionMission(mission.mission_id, "EXECUTING");
+        this.store.transitionMission(mission.mission_id, "FINAL_VALIDATION");
+        this.observeGatePassed(mission.mission_id);
+        this.store.completeMission(mission.mission_id);
+        const final = this.store.getMission(mission.mission_id)!;
+        const verdict = this.gate.evaluate(final);
+        return {
+          mission: final,
+          intent,
+          verdict,
+          completed: verdict.can_complete,
+          failureReason: verdict.can_complete ? null : verdict.reasons.join("; "),
+        };
+      }
+
+      // Plan/decompose into tasks.
+      const planned = await this.planner(this.store.getMission(mission.mission_id)!, risk);
+      for (const t of planned) {
+        this.store.createTask({ mission_id: mission.mission_id, ...t });
+      }
       this.store.transitionMission(mission.mission_id, "READY");
+
+      // Schedule + execute.
       this.store.transitionMission(mission.mission_id, "EXECUTING");
-      this.store.transitionMission(mission.mission_id, "FINAL_VALIDATION");
-      this.observeGatePassed(mission.mission_id);
-      this.store.completeMission(mission.mission_id);
-      const final = this.store.getMission(mission.mission_id)!;
-      const verdict = this.gate.evaluate(final);
-      this.progress = null;
-      this.activeMissionId = null;
-      return {
-        mission: final,
-        intent,
-        verdict,
-        completed: verdict.can_complete,
-        failureReason: verdict.can_complete ? null : verdict.reasons.join("; "),
-      };
-    }
+      this.phase(this.store.getMission(mission.mission_id)!, "executing");
+      await this.scheduler.runMission(mission.mission_id, opts.signal);
 
-    // Plan/decompose into tasks.
-    const planned = await this.planner(this.store.getMission(mission.mission_id)!, risk);
-    for (const t of planned) {
-      this.store.createTask({ mission_id: mission.mission_id, ...t });
-    }
-    this.store.transitionMission(mission.mission_id, "READY");
-
-    // Schedule + execute.
-    this.store.transitionMission(mission.mission_id, "EXECUTING");
-    this.phase(this.store.getMission(mission.mission_id)!, "executing");
-    await this.scheduler.runMission(mission.mission_id);
-
-    // Auto-resume: a mission that paused because its retry window ran out
-    // watches the recovery probe (with a real probe only) and resumes itself on
-    // the first healthy answer, for up to auto_resume_horizon_ms after it first
-    // paused. Resuming re-queues the paused tasks with a fresh window, so an
-    // outage of many hours never turns into a failed mission.
-    const resumeHorizon = this.scheduler.resilienceConfig.auto_resume_horizon_ms ?? 0;
-    if (resumeHorizon > 0 && this.store.getMission(mission.mission_id)?.status === "PAUSED_INFRASTRUCTURE") {
-      const deadline = this.scheduler.now() + resumeHorizon;
-      while (
-        this.store.getMission(mission.mission_id)?.status === "PAUSED_INFRASTRUCTURE" &&
-        (await this.scheduler.awaitRecovery(deadline, opts.signal, mission.mission_id))
-      ) {
-        this.report(`[mission ${mission.mission_id}] gateway healthy again — resuming`);
-        await this.scheduler.resumePausedMission(mission.mission_id, opts.signal);
+      if (opts.signal?.aborted) {
+        const current = this.store.getMission(mission.mission_id)!;
+        if (current.status !== "CANCELED") {
+          if (canTransitionMission(current.status, "CANCELING")) {
+            this.store.transitionMission(mission.mission_id, "CANCELING");
+          }
+          if (canTransitionMission(this.store.getMission(mission.mission_id)!.status, "CANCELED")) {
+            this.store.transitionMission(mission.mission_id, "CANCELED");
+          }
+        }
+        await this.broker.cleanupMission(mission.mission_id);
+        const canceled = this.store.getMission(mission.mission_id)!;
+        this.report(mission.mission_id, `[mission ${mission.mission_id}] canceled by caller`);
+        return {
+          mission: canceled,
+          intent,
+          verdict: this.gate.evaluate(canceled),
+          completed: false,
+          failureReason: "canceled by caller",
+        };
       }
-    }
 
-    // Resilience: if a worker's transient-infrastructure retry window exhausted
-    // mid-execution, the mission is PAUSED (not FAILED) with all progress
-    // preserved. Do NOT proceed to integration/validation; return a paused
-    // verdict so the caller can resume it when the gateway recovers.
-    const pausedMission = this.store.getMission(mission.mission_id)!;
-    if (pausedMission.status === "PAUSED_INFRASTRUCTURE") {
-      this.progress = null;
-      this.report(
-        `[mission ${mission.mission_id}] PAUSED: infrastructure retry window exhausted (auto-resume on recovery)`,
-      );
-      return {
-        mission: pausedMission,
-        intent,
-        verdict: {
-          can_complete: false,
-          reasons: ["paused: infrastructure retry window exhausted"],
-          missing_gates: [],
-          unresolved_findings: 0,
-          running_tasks: 0,
-        },
-        completed: false,
-        failureReason: null,
-        paused: true,
-      };
-    }
+      // Auto-resume: a mission that paused because its retry window ran out
+      // watches the recovery probe (with a real probe only) and resumes itself on
+      // the first healthy answer, for up to auto_resume_horizon_ms after it first
+      // paused. Resuming re-queues the paused tasks with a fresh window, so an
+      // outage of many hours never turns into a failed mission.
+      const resumeHorizon = this.scheduler.resilienceConfig.auto_resume_horizon_ms ?? 0;
+      if (resumeHorizon > 0 && this.store.getMission(mission.mission_id)?.status === "PAUSED_INFRASTRUCTURE") {
+        const deadline = this.scheduler.now() + resumeHorizon;
+        while (
+          this.store.getMission(mission.mission_id)?.status === "PAUSED_INFRASTRUCTURE" &&
+          (await this.scheduler.awaitRecovery(deadline, opts.signal, mission.mission_id))
+        ) {
+          this.report(mission.mission_id, `[mission ${mission.mission_id}] gateway healthy again — resuming`);
+          await this.scheduler.resumePausedMission(mission.mission_id, opts.signal);
+        }
+      }
 
+      // Resilience: if a worker's transient-infrastructure retry window exhausted
+      // mid-execution, the mission is PAUSED (not FAILED) with all progress
+      // preserved. Do NOT proceed to integration/validation; return a paused
+      // verdict so the caller can resume it when the gateway recovers.
+      const pausedMission = this.store.getMission(mission.mission_id)!;
+      if (pausedMission.status === "PAUSED_INFRASTRUCTURE") {
+        this.report(
+          mission.mission_id,
+          `[mission ${mission.mission_id}] PAUSED: infrastructure retry window exhausted (auto-resume on recovery)`,
+        );
+        return {
+          mission: pausedMission,
+          intent,
+          verdict: {
+            can_complete: false,
+            reasons: ["paused: infrastructure retry window exhausted"],
+            missing_gates: [],
+            unresolved_findings: 0,
+            running_tasks: 0,
+          },
+          completed: false,
+          failureReason: null,
+          paused: true,
+        };
+      }
+
+      const finalized = await this.finalizeMission(mission.mission_id, opts.signal);
+      return { ...finalized, intent };
+    } finally {
+      this.progress.delete(mission.mission_id);
+    }
+  }
+
+  /**
+   * Resume a PAUSED_INFRASTRUCTURE mission once the gateway is healthy.
+   *
+   * A paused mission is not a failure: all progress is preserved and the
+   * interrupted task is left resumable. This re-runs the paused task(s) when the
+   * recovery probe reports the gateway healthy (or unconditionally with
+   * `{ force: true }`), returning the updated mission. When the gateway is still
+   * down the mission is left paused (call again on the next probe).
+   */
+  async resume(missionId: string, opts?: { force?: boolean; signal?: AbortSignal }): Promise<Mission> {
+    const mission = this.store.getMission(missionId);
+    if (!mission) throw new Error(`unknown mission ${missionId}`);
+    if (mission.status !== "PAUSED_INFRASTRUCTURE") return mission;
+    if (opts?.signal?.aborted) return this.cancelMission(missionId);
+    if (!opts?.force && !(await this.scheduler.gatewayHealthy(opts?.signal))) {
+      return opts?.signal?.aborted ? this.cancelMission(missionId) : mission;
+    }
+    this.phase(mission, "executing");
+    this.report(missionId, `[mission ${missionId}] resuming after infrastructure recovery`);
+    await this.scheduler.resumePausedMission(missionId, opts?.signal);
+    const resumed = this.store.getMission(missionId)!;
+    if (resumed.status === "PAUSED_INFRASTRUCTURE") return resumed;
+    if (opts?.signal?.aborted) return this.cancelMission(missionId);
+    return (await this.finalizeMission(missionId, opts?.signal)).mission;
+  }
+
+  /** Complete the lifecycle after scheduler work settles, whether initial or resumed. */
+  private async finalizeMission(missionId: string, signal?: AbortSignal): Promise<FinalizationResult> {
+    if (signal?.aborted) return this.canceledFinalization(missionId);
     // Post-execution: integrate, validate + review if the mission mutated or
     // requires gates. If integration did not land the change, the mission must
     // not complete — otherwise it reports success over an unchanged repository.
-    let post = await this.postExecution(this.store.getMission(mission.mission_id)!);
+    let post = await this.postExecution(this.store.getMission(missionId)!, signal);
+    if (signal?.aborted) return this.canceledFinalization(missionId);
     let integrated = post.integrationOk;
 
     // Completion gate, with bounded repair rounds (spec 07): a blocking reviewer
     // finding creates repair work, and the repaired result is re-validated and
     // re-reviewed before the gate is consulted again.
-    let verdict = this.gate.evaluate(this.store.getMission(mission.mission_id)!);
+    let verdict = this.gate.evaluate(this.store.getMission(missionId)!);
     let repairRounds = 0;
     while ((!verdict.can_complete || !integrated) && repairRounds < this.maxRepairRounds) {
+      if (signal?.aborted) return this.canceledFinalization(missionId);
       const openBlocking = this.store
-        .listFindings(mission.mission_id)
+        .listFindings(missionId)
         .filter((f) => f.severity === "blocking" && f.status === "open");
-      // A failed validation / integration / review is repairable too: the usual
-      // cause is work that does not build, does not merge, or was not reviewed
-      // clean. Without this the mission wedges permanently, because a FAILED
-      // task keeps the gate closed and nothing else ever retries it.
-      const failedGates = this.store.listTasks(mission.mission_id).filter(
-        (t) =>
-          (t.kind === "validation" || t.kind === "integration" || t.kind === "review") &&
-          t.status === "FAILED" &&
-          // Only repair a gate that CAN run: a mission whose harness has no
-          // validation/review backend has an unavailable capability, not
-          // broken work, and repairing it would burn rounds for nothing.
-          this.broker.hasBackend(t.kind as "validation" | "integration" | "review"),
-      );
-      // Nothing repairable (missing gate, running task): the repair loop cannot
-      // help, so stop and let the caller block or fail.
+      const failedGates = this.store
+        .listTasks(missionId)
+        .filter(
+          (t) =>
+            (t.kind === "validation" || t.kind === "integration" || t.kind === "review") &&
+            t.status === "FAILED" &&
+            this.broker.hasBackend(t.kind as "validation" | "integration" | "review"),
+        );
       if (openBlocking.length === 0 && failedGates.length === 0) break;
       repairRounds++;
 
-      // FINAL_VALIDATION -> REPAIRING is legal; guard the self-transition, which
-      // has no self-loop and would throw on a second round that left the mission
-      // already in REPAIRING.
-      if (this.store.getMission(mission.mission_id)!.status !== "REPAIRING") {
-        this.store.transitionMission(mission.mission_id, "REPAIRING");
+      if (this.store.getMission(missionId)!.status !== "REPAIRING") {
+        this.store.transitionMission(missionId, "REPAIRING");
       }
-      this.phase(this.store.getMission(mission.mission_id)!, "repairing");
-      // What to fix this round: open blocking findings, plus failed gate tasks
-      // when there is nothing else to act on.
+      this.phase(this.store.getMission(missionId)!, "repairing");
       const objectives: Array<{ objective: string; findingId?: string }> = openBlocking.map((f) => {
         const where = f.file ? ` [${f.file}${f.line ? `:${f.line}` : ""}]` : "";
         return {
@@ -455,50 +575,49 @@ export class Orchestrator {
           });
         }
       }
+      const successfulMutations = this.store
+        .listTasks(missionId)
+        .filter((task) => task.mutates_repo && task.status === "SUCCEEDED");
+      // Preserve an explicitly direct-checkout mission's execution model for
+      // repairs. Otherwise a standalone orchestrator with no Git provider can
+      // run the original task but its automatically-created repair fails before
+      // the backend starts. Any mission that used (or mixed in) worktrees keeps
+      // the safer isolated repair path.
+      const repairIsolation =
+        successfulMutations.length > 0 && successfulMutations.every((task) => task.isolation === "none")
+          ? "none"
+          : "worktree";
       for (const obj of objectives) {
         const repair = this.store.createTask({
-          mission_id: mission.mission_id,
+          mission_id: missionId,
           kind: "agent",
           role: "implementer",
           objective: obj.objective,
           mutates_repo: true,
           write_domains: ["**"],
-          isolation: "worktree",
+          isolation: repairIsolation,
         });
         this.store.transitionTask(repair.task_id, "READY");
-        const repaired = await this.runSingleTask(mission.mission_id, repair.task_id);
-        // Only a repair that actually RAN may close its finding; a failed repair
-        // leaves the finding open so the gate keeps blocking rather than letting
-        // a crashed worker silently clear a defect. When the repair succeeds the
-        // finding is closed optimistically and the mandatory re-review below
-        // decides whether it still stands — a reviewer that still sees the
-        // defect records a fresh finding, which keeps the mission blocked.
+        const repaired = await this.runSingleTask(missionId, repair.task_id, { signal });
+        if (signal?.aborted) return this.canceledFinalization(missionId);
         if (repaired && obj.findingId) this.store.resolveFinding(obj.findingId);
       }
-      // Mandatory re-integration, re-validation + re-review of the repaired result.
-      post = await this.postExecution(this.store.getMission(mission.mission_id)!);
+      post = await this.postExecution(this.store.getMission(missionId)!, signal);
+      if (signal?.aborted) return this.canceledFinalization(missionId);
       integrated = post.integrationOk;
-      // A finding may only be considered cleared if the re-review actually ran.
-      // If it failed, there is no evidence the defect is gone, so stop here and
-      // let the mission block rather than complete on optimistic closure.
       if (post.reviewAttempted && !post.reviewOk) {
-        verdict = this.gate.evaluate(this.store.getMission(mission.mission_id)!);
+        verdict = this.gate.evaluate(this.store.getMission(missionId)!);
         break;
       }
-      verdict = this.gate.evaluate(this.store.getMission(mission.mission_id)!);
+      verdict = this.gate.evaluate(this.store.getMission(missionId)!);
     }
 
-    // The mission is finished either way: release the mission-scoped worktrees so
-    // they cannot accumulate for tasks that never reach an integration dispatch
-    // (e.g. repair tasks). Branches are released only when the work actually
-    // landed — otherwise the branch is the last copy of the worker's output and
-    // deleting it would destroy what an operator needs to resolve the conflict.
-    await this.broker.cleanupMission(mission.mission_id, { keepBranches: !integrated });
+    await this.broker.cleanupMission(missionId, { keepBranches: !integrated });
     if (!integrated) {
-      const preserved = this.broker.preservedBranches(mission.mission_id);
+      const preserved = this.broker.preservedBranches(missionId);
       if (preserved.length > 0) {
         this.store.addFinding({
-          mission_id: mission.mission_id,
+          mission_id: missionId,
           task_id: null,
           severity: "major",
           category: "integration",
@@ -511,20 +630,16 @@ export class Orchestrator {
       }
     }
 
-    const finalMission = this.store.getMission(mission.mission_id)!;
+    const finalMission = this.store.getMission(missionId)!;
     if (verdict.can_complete && integrated) {
-      // COMPLETE is only legal from REVIEWING / FINAL_VALIDATION. A mission with
-      // no post-execution gates (e.g. a read-only investigation) is still
-      // EXECUTING, so settle it into FINAL_VALIDATION first.
-      const pre = this.store.getMission(mission.mission_id)!.status;
+      const pre = finalMission.status;
       if (pre !== "FINAL_VALIDATION" && pre !== "REVIEWING") {
-        this.store.transitionMission(mission.mission_id, "FINAL_VALIDATION");
+        this.store.transitionMission(missionId, "FINAL_VALIDATION");
       }
-      this.observeGatePassed(mission.mission_id);
-      // Completing over a FAILED task must leave a trail naming it and why.
+      this.observeGatePassed(missionId);
       for (const taskId of verdict.superseded_by_recovery ?? []) {
         this.store.addFinding({
-          mission_id: mission.mission_id,
+          mission_id: missionId,
           task_id: taskId,
           severity: "minor",
           category: "integration",
@@ -535,37 +650,28 @@ export class Orchestrator {
           recommended_action: "None required; recorded so the completion over a failed task is auditable.",
         });
       }
-      this.store.completeMission(mission.mission_id);
-      this.phase(this.store.getMission(mission.mission_id)!, "complete");
-      this.progress = null;
-      this.activeMissionId = null;
+      this.store.completeMission(missionId);
+      this.phase(this.store.getMission(missionId)!, "complete");
       return {
-        mission: this.store.getMission(mission.mission_id)!,
-        intent,
+        mission: this.store.getMission(missionId)!,
         verdict,
         completed: true,
         failureReason: null,
       };
     }
-    // Not complete: block when a human/repair decision is needed (unresolved
-    // blocking findings, or unmet required gates); fail only when the work
-    // itself failed. Previously findings on a mission with no required gates
-    // were reported as FAILED, which lost the distinction.
+
     const unresolvedBlocking = this.store
-      .listFindings(finalMission.mission_id)
+      .listFindings(missionId)
       .filter((f) => f.severity === "blocking" && f.status !== "resolved").length;
     const hasBlocking =
       unresolvedBlocking > 0 || (finalMission.required_gates.length > 0 && verdict.reasons.length > 0);
     if (hasBlocking) {
-      if (finalMission.status !== "BLOCKED") this.store.transitionMission(finalMission.mission_id, "BLOCKED");
+      if (finalMission.status !== "BLOCKED") this.store.transitionMission(missionId, "BLOCKED");
     } else {
-      this.store.failMission(finalMission.mission_id, verdict.reasons.join("; "));
+      this.store.failMission(missionId, verdict.reasons.join("; "));
     }
-    this.progress = null;
-    this.activeMissionId = null;
     return {
-      mission: this.store.getMission(mission.mission_id)!,
-      intent,
+      mission: this.store.getMission(missionId)!,
       verdict,
       completed: false,
       failureReason: verdict.reasons.join("; "),
@@ -573,31 +679,14 @@ export class Orchestrator {
   }
 
   /**
-   * Resume a PAUSED_INFRASTRUCTURE mission once the gateway is healthy.
-   *
-   * A paused mission is not a failure: all progress is preserved and the
-   * interrupted task is left resumable. This re-runs the paused task(s) when the
-   * recovery probe reports the gateway healthy (or unconditionally with
-   * `{ force: true }`), returning the updated mission. When the gateway is still
-   * down the mission is left paused (call again on the next probe).
-   */
-  async resume(missionId: string, opts?: { force?: boolean }): Promise<Mission> {
-    const mission = this.store.getMission(missionId);
-    if (!mission) throw new Error(`unknown mission ${missionId}`);
-    if (mission.status !== "PAUSED_INFRASTRUCTURE") return mission;
-    if (!opts?.force && !(await this.scheduler.gatewayHealthy())) return mission;
-    this.phase(mission, "executing");
-    this.report(`[mission ${missionId}] resuming after infrastructure recovery`);
-    await this.scheduler.resumePausedMission(missionId);
-    return this.store.getMission(missionId)!;
-  }
-
-  /**
    * Post-execution validation + review, respecting required gates. Reports
    * whether each stage was attempted and whether it succeeded, so the caller
    * can refuse to complete when a mandatory re-review did not actually run.
    */
-  private async postExecution(mission: Mission): Promise<{
+  private async postExecution(
+    mission: Mission,
+    signal?: AbortSignal,
+  ): Promise<{
     validationAttempted: boolean;
     validationOk: boolean;
     reviewAttempted: boolean;
@@ -635,7 +724,10 @@ export class Orchestrator {
         isolation: "none",
       });
       this.store.transitionTask(integ.task_id, "READY");
-      integrationOk = await this.runSingleTask(mission.mission_id, integ.task_id);
+      integrationOk = await this.runSingleTask(mission.mission_id, integ.task_id, { signal });
+      if (signal?.aborted) {
+        return { validationAttempted, validationOk, reviewAttempted, reviewOk, integrationOk: false };
+      }
       // A green merge is not proof the work landed: harvesting a worktree can
       // fail silently, and merging an empty branch is trivially clean. Require
       // the checkout to actually differ from the mission's base commit.
@@ -701,7 +793,10 @@ export class Orchestrator {
       });
       this.store.transitionTask(task.task_id, "READY");
       validationAttempted = true;
-      validationOk = await this.runSingleTask(mission.mission_id, task.task_id);
+      validationOk = await this.runSingleTask(mission.mission_id, task.task_id, { signal });
+      if (signal?.aborted) {
+        return { validationAttempted, validationOk, reviewAttempted, reviewOk, integrationOk };
+      }
       // From VALIDATING the mission may move on to review or final validation.
       if (
         !gates.has("independent_review") &&
@@ -746,7 +841,11 @@ export class Orchestrator {
       reviewAttempted = true;
       reviewOk = await this.runSingleTask(mission.mission_id, task.task_id, {
         reviewedRecovered: recovered.map((t) => t.task_id),
+        signal,
       });
+      if (signal?.aborted) {
+        return { validationAttempted, validationOk, reviewAttempted, reviewOk, integrationOk };
+      }
       // From REVIEWING the mission moves to final validation (or repair handled
       // by the caller via the completion gate).
       this.store.transitionMission(mission.mission_id, "FINAL_VALIDATION");
@@ -776,11 +875,14 @@ export class Orchestrator {
   private async runSingleTask(
     missionId: string,
     taskId: string,
-    extra: { reviewedRecovered?: string[] } = {},
+    extra: { reviewedRecovered?: string[]; signal?: AbortSignal } = {},
   ): Promise<boolean> {
     const task = this.store.getTask(taskId)!;
     this.store.transitionTask(taskId, "RUNNING");
-    this.report(`[mission ${missionId}] ${task.kind}:${task.role} starting — ${task.objective.slice(0, 120)}`);
+    this.report(
+      missionId,
+      `[mission ${missionId}] ${task.kind}:${task.role} starting — ${task.objective.slice(0, 120)}`,
+    );
     try {
       // execute() itself can throw — e.g. no backend is registered for the task
       // kind. Left outside the try it propagated out of postExecution and
@@ -798,7 +900,12 @@ export class Orchestrator {
         modelRequirements: task.execution_requirements,
         ...(extra.reviewedRecovered?.length ? { reviewedRecovered: extra.reviewedRecovered } : {}),
       });
-      const outcome = await handle.result();
+      const onAbort = (): void => {
+        void handle.cancel();
+      };
+      if (extra.signal?.aborted) await handle.cancel();
+      else extra.signal?.addEventListener("abort", onAbort, { once: true });
+      const outcome = await handle.result().finally(() => extra.signal?.removeEventListener("abort", onAbort));
       // Record reviewer findings so the completion gate can block on them.
       for (const f of outcome.findings ?? []) {
         const severity =
@@ -832,17 +939,51 @@ export class Orchestrator {
         this.store.transitionTask(taskId, "FAILED", "system", {
           failure_reason: `${outcome.exitStatus}${detail}`,
         });
-        this.report(`[mission ${missionId}] ${task.kind}:${task.role} FAILED (${outcome.exitStatus}${detail})`);
+        this.report(
+          missionId,
+          `[mission ${missionId}] ${task.kind}:${task.role} FAILED (${outcome.exitStatus}${detail})`,
+        );
         return false;
       }
       this.store.transitionTask(taskId, "SUCCEEDED");
-      this.report(`[mission ${missionId}] ${task.kind}:${task.role} succeeded`);
+      this.report(missionId, `[mission ${missionId}] ${task.kind}:${task.role} succeeded`);
       return true;
     } catch (err) {
+      if (extra.signal?.aborted) {
+        await this.broker.cancelByTask(taskId);
+        if (this.store.getTask(taskId)?.status === "RUNNING") this.store.transitionTask(taskId, "CANCELED");
+        this.report(missionId, `[mission ${missionId}] ${task.kind}:${task.role} canceled`);
+        return false;
+      }
       if (this.store.getTask(taskId)?.status === "RUNNING") this.store.transitionTask(taskId, "FAILED");
-      this.report(`[mission ${missionId}] ${task.kind}:${task.role} errored`);
+      this.report(missionId, `[mission ${missionId}] ${task.kind}:${task.role} errored`);
       return false;
     }
+  }
+
+  /** Settle a caller-aborted mission without allowing later gate work to run. */
+  private async cancelMission(missionId: string): Promise<Mission> {
+    let mission = this.store.getMission(missionId)!;
+    if (mission.status === "CANCELED") return mission;
+    if (canTransitionMission(mission.status, "CANCELING")) {
+      mission = this.store.transitionMission(missionId, "CANCELING");
+    }
+    if (canTransitionMission(mission.status, "CANCELED")) {
+      mission = this.store.transitionMission(missionId, "CANCELED");
+    }
+    await this.broker.cleanupMission(missionId);
+    this.report(missionId, `[mission ${missionId}] canceled by caller`);
+    return mission;
+  }
+
+  private async canceledFinalization(missionId: string): Promise<FinalizationResult> {
+    const mission = await this.cancelMission(missionId);
+    return {
+      mission,
+      verdict: this.gate.evaluate(mission),
+      completed: false,
+      failureReason: "canceled by caller",
+    };
   }
 
   // ── Steering ───────────────────────────────────────────────────────────

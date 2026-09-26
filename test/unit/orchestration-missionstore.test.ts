@@ -1,7 +1,68 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
+import type { EventStoreBackend, StoredEvent } from "../../src/platform/eventstore/backend.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
+
+class FailOnceBackend implements EventStoreBackend {
+  private readonly inner = JsonlEventStore.inMemory();
+  private rejectNext = false;
+  attempts = 0;
+
+  failNextAppend(): void {
+    this.rejectNext = true;
+  }
+
+  async append(event: StoredEvent): Promise<StoredEvent> {
+    this.attempts += 1;
+    if (this.rejectNext) {
+      this.rejectNext = false;
+      throw new Error("mission persistence unavailable");
+    }
+    return this.inner.append(event);
+  }
+
+  async appendAll(events: StoredEvent[]): Promise<void> {
+    await this.inner.appendAll(events);
+  }
+
+  all(): StoredEvent[] {
+    return this.inner.all();
+  }
+
+  get(eventId: string): StoredEvent | undefined {
+    return this.inner.get(eventId);
+  }
+
+  count(): number {
+    return this.inner.count();
+  }
+}
+
+class UnavailableBackend implements EventStoreBackend {
+  attempts = 0;
+
+  async append(_event: StoredEvent): Promise<StoredEvent> {
+    this.attempts += 1;
+    throw new Error("mission persistence unavailable");
+  }
+
+  async appendAll(_events: StoredEvent[]): Promise<void> {
+    throw new Error("mission persistence unavailable");
+  }
+
+  all(): StoredEvent[] {
+    return [];
+  }
+
+  get(_eventId: string): StoredEvent | undefined {
+    return undefined;
+  }
+
+  count(): number {
+    return 0;
+  }
+}
 
 function store(): MissionStore {
   return MissionStore.open(JsonlEventStore.inMemory());
@@ -127,6 +188,57 @@ describe("MissionStore", () => {
     assert.equal(restored.status, "EXECUTING");
     const task = s2.getTask(t.task_id)!;
     assert.equal(task.status, "RUNNING");
+  });
+
+  it("retries a failed append in order so restart replays the complete semantic state", async () => {
+    const backend = new FailOnceBackend();
+    const s = MissionStore.open(backend);
+    backend.failNextAppend();
+
+    const m = s.createMission({
+      title: "recover persistence",
+      goal: "persist later mission changes",
+      user_request: "keep the mission visible",
+      repository: ".",
+      base_ref: "main",
+      risk_profile: "low",
+      workflow_class: "engineering_review",
+    });
+    s.addAcceptanceCriterion(m.mission_id, "later events remain durable");
+
+    await s.flush();
+    assert.equal(backend.attempts, 3, "the failed creation is retried before the later update");
+    assert.deepEqual(
+      backend.all().map((event) => event.type),
+      ["mission.created", "mission.updated"],
+      "dependent events persist only after their prerequisite",
+    );
+    assert.deepEqual(s.persistenceDiagnostics(), [], "a recovered append is no longer unresolved");
+
+    const reopened = MissionStore.open(backend);
+    assert.equal(reopened.getMission(m.mission_id)?.acceptance_criteria[0]?.criterion, "later events remain durable");
+  });
+
+  it("rejects flush and retains the ordered queue while persistence remains unavailable", async () => {
+    const backend = new UnavailableBackend();
+    const s = MissionStore.open(backend);
+    const m = s.createMission({
+      title: "unavailable persistence",
+      goal: "surface durability failure",
+      user_request: "do not claim a durable flush",
+      repository: ".",
+      base_ref: "main",
+      risk_profile: "low",
+      workflow_class: "engineering_review",
+    });
+    s.addAcceptanceCriterion(m.mission_id, "later events stay queued");
+
+    await assert.rejects(s.flush(), /mission persistence unavailable/);
+    assert.equal(backend.count(), 0, "no dependent event overtakes the failed creation");
+    assert.deepEqual(
+      s.persistenceDiagnostics().map(({ eventType, missionId, message }) => ({ eventType, missionId, message })),
+      [{ eventType: "mission.created", missionId: m.mission_id, message: "mission persistence unavailable" }],
+    );
   });
 
   it("records and resolves review findings", () => {

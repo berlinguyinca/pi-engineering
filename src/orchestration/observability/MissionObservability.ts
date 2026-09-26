@@ -18,8 +18,8 @@
  */
 
 import { id } from "../../core/ids.ts";
-import type { EventStoreBackend } from "../../platform/eventstore/backend.ts";
-import type { MissionStore } from "../missionStore.ts";
+import type { EventStoreBackend, StoredEvent } from "../../platform/eventstore/backend.ts";
+import type { MissionPersistenceDiagnostic, MissionStore } from "../missionStore.ts";
 import {
   fromStoredEvent,
   newObservabilityEvent,
@@ -117,6 +117,8 @@ export interface MissionObservabilityOptions {
   config?: Partial<MissionObservabilityConfig>;
   /** User-facing update emitter (Communication Gate — always open). */
   onUpdate?: (missionId: string, message: string) => void;
+  /** Every projection change, including sampled heartbeats (snapshot/UI invalidation). */
+  onChange?: (missionId: string) => void;
   /** Deterministic clock for tests. */
   now?: () => string;
 }
@@ -126,8 +128,11 @@ export class MissionObservability {
   private readonly store: MissionStore;
   private readonly backend: EventStoreBackend;
   private readonly onUpdate?: (missionId: string, message: string) => void;
+  private readonly onChange?: (missionId: string) => void;
   private readonly nowFn: () => string;
   private readonly states = new Map<string, MissionObsState>();
+  private readonly persistenceErrors: MissionPersistenceDiagnostic[] = [];
+  private readonly pendingWrites: Array<{ event: MissionObservabilityEvent; stored: StoredEvent }> = [];
   private emitChain: Promise<void> = Promise.resolve();
 
   constructor(opts: MissionObservabilityOptions) {
@@ -135,6 +140,7 @@ export class MissionObservability {
     this.store = opts.store;
     this.config = { ...DEFAULT_OBSERVABILITY_CONFIG, ...opts.config };
     this.onUpdate = opts.onUpdate;
+    this.onChange = opts.onChange;
     this.nowFn = opts.now ?? (() => new Date().toISOString());
   }
 
@@ -184,13 +190,73 @@ export class MissionObservability {
   /** Persist an observability event (append + apply). Returns the event id. */
   private persist(ev: MissionObservabilityEvent): void {
     const stored = toStoredEvent(ev, storedTypeForEventType(ev.type));
-    this.emitChain = this.emitChain.then(() => this.backend.append(stored)).then(() => undefined);
+    this.pendingWrites.push({ event: ev, stored });
+    this.scheduleDrain();
     this.apply(ev);
+    this.changed(ev.missionId);
+  }
+
+  private scheduleDrain(): void {
+    const drain = this.emitChain.then(() => this.drainPending());
+    // Keep the failed head queued without leaking an unhandled rejection.
+    // flush() retries it and exposes any still-unresolved durability failure.
+    this.emitChain = drain.catch(() => undefined);
+  }
+
+  private async drainPending(): Promise<void> {
+    while (this.pendingWrites.length > 0) {
+      const pending = this.pendingWrites[0]!;
+      try {
+        await this.backend.append(pending.stored);
+      } catch (error) {
+        this.recordPersistenceFailure(pending.event, error);
+        throw error;
+      }
+      this.pendingWrites.shift();
+      this.clearPersistenceFailure(pending.event.event_id);
+    }
+  }
+
+  private recordPersistenceFailure(ev: MissionObservabilityEvent, error: unknown): void {
+    const diagnostic: MissionPersistenceDiagnostic = {
+      eventId: ev.event_id,
+      eventType: ev.type,
+      missionId: ev.missionId,
+      eventTimestamp: ev.timestamp,
+      message: error instanceof Error ? error.message : typeof error === "string" ? error : "Unknown persistence error",
+    };
+    const existing = this.persistenceErrors.findIndex((entry) => entry.eventId === ev.event_id);
+    if (existing >= 0) this.persistenceErrors[existing] = diagnostic;
+    else this.persistenceErrors.push(diagnostic);
+    if (this.persistenceErrors.length > 50) this.persistenceErrors.shift();
+  }
+
+  private clearPersistenceFailure(eventId: string): void {
+    const index = this.persistenceErrors.findIndex((entry) => entry.eventId === eventId);
+    if (index >= 0) this.persistenceErrors.splice(index, 1);
+  }
+
+  private changed(missionId: string): void {
+    try {
+      this.onChange?.(missionId);
+    } catch {
+      // Projection invalidators are observers, never participants.
+    }
   }
 
   /** Await all pending event writes (tests assert durability). */
   async flush(): Promise<void> {
     await this.emitChain;
+    if (this.pendingWrites.length === 0) return;
+
+    const drain = this.drainPending();
+    this.emitChain = drain.catch(() => undefined);
+    await drain;
+  }
+
+  /** Recent persistence failures, oldest first. */
+  persistenceDiagnostics(): MissionPersistenceDiagnostic[] {
+    return this.persistenceErrors.map((diagnostic) => ({ ...diagnostic }));
   }
 
   private record(input: {
@@ -686,6 +752,7 @@ export class MissionObservability {
           s.workers.set(workerId, w);
         }
       }
+      this.changed(missionId);
       return;
     }
     s.lastHeartbeatPersistedAt = nowMs;

@@ -289,7 +289,7 @@ export function buildCoreTools(
       ),
       constraints: Type.Optional(Type.Array(Type.String({ description: "Constraints to apply" }))),
     }),
-    async execute(_id, params, _sig, _onUpdate, ctx) {
+    async execute(_id, params, signal, _onUpdate, ctx) {
       const services = await servicesFor(ctx.cwd);
       if (!services?.orchestrator)
         return {
@@ -303,6 +303,7 @@ export function buildCoreTools(
         baseRef,
         constraints: (params.constraints as string[] | undefined) ?? [],
         mutationRequested: params.mutate ?? true,
+        signal,
         // Stream every live progress line (phase/task transitions + progress
         // bar) to the operator via the tool update callback instead of blocking
         // silently for the whole mission.

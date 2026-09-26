@@ -10,7 +10,7 @@ export { ContextBroker, estimateTokens } from "./context/ContextBroker.ts";
 export { GitRepo } from "./git/GitRepo.ts";
 export { CommandVerifier } from "./verify/Verifier.ts";
 export type { VerificationProvider, VerificationProfile, VerifyOutcome, StageRun } from "./verify/Verifier.ts";
-export type { WorkerExecutor, WorkerRequest, WorkerRun } from "./workers/WorkerExecutor.ts";
+export type { WorkerActivity, WorkerExecutor, WorkerRequest, WorkerRun } from "./workers/WorkerExecutor.ts";
 export { PiWorkerExecutor } from "./workers/PiWorkerExecutor.ts";
 export { FakeWorkerExecutor } from "./workers/FakeWorkerExecutor.ts";
 export { buildSystemPrompt, WORKER_KICKOFF } from "./workers/prompts.ts";

@@ -1,5 +1,6 @@
-import { mkdir, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { randomUUID } from "node:crypto";
+import { mkdir, rename, unlink, writeFile } from "node:fs/promises";
+import { join, resolve } from "node:path";
 import type { Model } from "@earendil-works/pi-ai/compat";
 import { ArtifactStore } from "../artifacts/ArtifactStore.ts";
 import { BlackholeManager, type BlackholeManagerOptions } from "../blackhole/BlackholeManager.ts";
@@ -32,6 +33,7 @@ import type { PlanTaskInput } from "../orchestration/orchestrator.ts";
 import { realBackends } from "../orchestration/realBackends.ts";
 import { tasksConflict, topoSort } from "../plan/taskDag.ts";
 import { JsonlEventStore } from "../platform/eventstore/jsonl.ts";
+import { redactSecrets } from "../platform/redact.ts";
 import { resolveGatewayResilienceConfig } from "../resilience/config.ts";
 import {
   CatalogRecoveryProbe,
@@ -235,6 +237,11 @@ const PHASE_FOR_ROLE: Partial<Record<WorkerRole, RuntimePhaseEvent["phase"]>> = 
  * repo share a single durable store (the JSONL backend is single-instance).
  */
 const openedOrchestrationStores = new Map<string, JsonlEventStore>();
+/** Live mission state owners shared by sequential runtimes for one work dir. */
+const openedMissionStores = new Map<string, MissionStore>();
+const openedMissionObservability = new Map<string, MissionObservability>();
+/** Concurrent same-repository initialization is single-flight. */
+const openingRuntimes = new Map<string, Promise<EngineeringRuntime>>();
 
 export interface RuntimePhaseEvent {
   workItemId: string;
@@ -251,6 +258,21 @@ export interface RuntimePhaseEvent {
    * source the panel accumulates from.
    */
   usage?: { input: number; output: number; cost: number };
+}
+
+/** Bounded, display-safe mission state for persistent footer/panel surfaces. */
+export interface RuntimeMissionActivityEvent {
+  missionId: string;
+  title: string;
+  phase: string;
+  state: string;
+  health: string;
+  approximatePercent: number;
+  summary: string;
+  activeWorkers: number;
+  waitingWorkers: number;
+  failedWorkers: number;
+  lastHeartbeatAt?: string;
 }
 
 export interface EngineeringRuntimeOptions {
@@ -296,6 +318,10 @@ export interface EngineeringRuntimeOptions {
    * review/stall/recovery/gate). Never suppresses ordinary Pi output.
    */
   onMissionObservabilityUpdate?: (missionId: string, message: string) => void;
+  /** Persistent, non-notification UI feed. Values are redacted and bounded. */
+  onMissionActivity?: (event: RuntimeMissionActivityEvent) => void;
+  /** Bounded diagnostic when the live mission snapshot cannot be written. */
+  onMissionSnapshotError?: (message: string) => void;
   /**
    * Optional orchestrator planner (spec 06). Defaults to a single implementer
    * task. Injected so deterministic tests and the extension can supply one.
@@ -343,9 +369,13 @@ export class EngineeringRuntime {
    */
   resilience: import("../resilience/config.ts").GatewayResilienceConfig;
   private readonly onPhase: ((event: RuntimePhaseEvent) => void) | null;
+  private readonly onMissionSnapshotError: ((message: string) => void) | null;
+  private readonly onMissionActivity: ((event: RuntimeMissionActivityEvent) => void) | null;
   /** Work item whose phases are currently being reported (status surfaces only). */
   private currentWorkItemId = "";
   private currentPhaseGoal = "";
+  private snapshotPublishPending: Promise<MissionSnapshotFile | null> | null = null;
+  private snapshotPublishDirty = false;
 
   /**
    * Serializes git mutations that touch the shared main repo (worktree create,
@@ -373,19 +403,54 @@ export class EngineeringRuntime {
    */
   async publishMissionSnapshot(): Promise<MissionSnapshotFile | null> {
     if (!this.missionStore) return null;
-    try {
-      const missions = this.missionStore.listMissions().map((m) => ({
-        mission: m,
-        tasks: this.missionStore!.listTasks(m.mission_id),
-        findings: this.missionStore!.listFindings(m.mission_id),
-        observability: this.missionObservability?.projection(m.mission_id) ?? null,
-      }));
-      const snapshot = buildMissionSnapshotFile(missions);
-      await writeFile(join(this.workDir, MISSION_SNAPSHOT_FILENAME), JSON.stringify(snapshot, null, 2), "utf8");
-      return snapshot;
-    } catch {
-      return null;
-    }
+    this.snapshotPublishDirty = true;
+    if (this.snapshotPublishPending) return this.snapshotPublishPending;
+    this.snapshotPublishPending = (async () => {
+      let latest: MissionSnapshotFile | null = null;
+      while (this.snapshotPublishDirty) {
+        this.snapshotPublishDirty = false;
+        try {
+          // A snapshot is presented as the durable mission view. Do not publish
+          // newer in-memory state over a failed event-log head: retry queued
+          // writes in order and surface persistent failure through the existing
+          // operator diagnostic hook.
+          await this.missionStore!.flush();
+          await this.missionObservability?.flush();
+          const missions = this.missionStore!.listMissions().map((m) => ({
+            mission: m,
+            tasks: this.missionStore!.listTasks(m.mission_id),
+            findings: this.missionStore!.listFindings(m.mission_id),
+            observability: this.missionObservability?.projection(m.mission_id) ?? null,
+          }));
+          latest = buildMissionSnapshotFile(missions);
+          const path = join(this.workDir, MISSION_SNAPSHOT_FILENAME);
+          const temporary = join(this.workDir, `.${MISSION_SNAPSHOT_FILENAME}.${process.pid}.${randomUUID()}.tmp`);
+          try {
+            await writeFile(temporary, JSON.stringify(latest, null, 2), "utf8");
+            await rename(temporary, path);
+          } catch (error) {
+            await unlink(temporary).catch(() => undefined);
+            throw error;
+          }
+        } catch {
+          latest = null;
+          // Leave retry scheduling to a later observability change. Retrying
+          // immediately here would spin on a persistent disk/permission error.
+          this.snapshotPublishDirty = false;
+          try {
+            this.onMissionSnapshotError?.("Mission snapshot publication failed; live mission detail may be stale.");
+          } catch {
+            // Diagnostics are observers, never participants in execution.
+          }
+          break;
+        }
+      }
+      return latest;
+    })().finally(() => {
+      this.snapshotPublishPending = null;
+      if (this.snapshotPublishDirty) void this.publishMissionSnapshot();
+    });
+    return this.snapshotPublishPending;
   }
 
   /** Notify status surfaces of pipeline progress. Never throws into the run. */
@@ -398,6 +463,39 @@ export class EngineeringRuntime {
     }
   }
 
+  /** Project observability into a compact surface event without raw commands or metadata. */
+  private emitMissionActivity(missionId: string): void {
+    if (!this.onMissionActivity) return;
+    const projection = this.missionObservability?.projection(missionId);
+    if (!projection) return;
+    const summary = projection.summary;
+    const raw = summary.currentActivity?.summary ?? summary.currentObjective ?? summary.title;
+    const bounded = redactSecrets(raw)
+      .replace(/[\r\n\t]+/g, " ")
+      .trim()
+      .slice(0, 240);
+    try {
+      this.onMissionActivity({
+        missionId,
+        title: redactSecrets(summary.title)
+          .replace(/[\r\n\t]+/g, " ")
+          .trim()
+          .slice(0, 160),
+        phase: summary.phase,
+        state: summary.state,
+        health: summary.health,
+        approximatePercent: summary.progress.approximatePercent,
+        summary: bounded,
+        activeWorkers: summary.workers.active,
+        waitingWorkers: summary.workers.waiting,
+        failedWorkers: summary.workers.failed,
+        ...(summary.lastHeartbeatAt ? { lastHeartbeatAt: summary.lastHeartbeatAt } : {}),
+      });
+    } catch {
+      // UI listeners are observers, never participants in mission execution.
+    }
+  }
+
   private constructor(opts: EngineeringRuntimeOptions) {
     this.cwd = opts.cwd;
     this.workDir = opts.workDir ?? "";
@@ -406,6 +504,8 @@ export class EngineeringRuntime {
     this.verifier = opts.verifier ?? new CommandVerifier();
     this.roadmapComplete = opts.roadmapComplete ?? null;
     this.onPhase = opts.onPhase ?? null;
+    this.onMissionSnapshotError = opts.onMissionSnapshotError ?? null;
+    this.onMissionActivity = opts.onMissionActivity ?? null;
     this.blackhole = null;
     this.telemetry = {
       workers: {},
@@ -434,6 +534,26 @@ export class EngineeringRuntime {
     const git = await GitRepo.open(opts.cwd);
     const repoRoot = git ? git.root : opts.cwd;
     const workDir = opts.workDir ?? join(repoRoot, ".pi-eng");
+    const openKey = `${resolve(repoRoot)}\0${resolve(workDir)}`;
+    const existing = openingRuntimes.get(openKey);
+    if (existing) return existing;
+    const opening = EngineeringRuntime.openResolved(opts, git, repoRoot, workDir);
+    openingRuntimes.set(openKey, opening);
+    try {
+      return await opening;
+    } finally {
+      // Only initialization is shared. A later open must rebuild dynamic
+      // profile/credential-dependent services while reusing live mission state.
+      if (openingRuntimes.get(openKey) === opening) openingRuntimes.delete(openKey);
+    }
+  }
+
+  private static async openResolved(
+    opts: EngineeringRuntimeOptions,
+    git: GitRepo | null,
+    repoRoot: string,
+    workDir: string,
+  ): Promise<EngineeringRuntime> {
     await mkdir(workDir, { recursive: true });
     const ledger = await Ledger.create(join(workDir, "ledger.jsonl"));
     const artifacts = await ArtifactStore.create(join(workDir, "artifacts"));
@@ -455,17 +575,26 @@ export class EngineeringRuntime {
       orchestrationBackend = await JsonlEventStore.open(orchestrationPath);
       openedOrchestrationStores.set(orchestrationPath, orchestrationBackend);
     }
-    rt.missionStore = MissionStore.open(orchestrationBackend);
+    rt.missionStore = openedMissionStores.get(orchestrationPath) ?? MissionStore.open(orchestrationBackend);
+    openedMissionStores.set(orchestrationPath, rt.missionStore);
     // Mission observability shares the SAME durable event store as the mission
     // controller: its `mission.obs.*` events are ignored by MissionStore replay
     // and replayed by the observability service, so progress/activity/workers/
     // tests/review survive restart/reconnect (spec 01/05). Communication gate
     // is always open — the update emitter never suppresses ordinary Pi output.
-    rt.missionObservability = MissionObservability.open({
-      backend: orchestrationBackend,
-      store: rt.missionStore,
-      onUpdate: opts.onMissionObservabilityUpdate,
-    });
+    rt.missionObservability = openedMissionObservability.get(orchestrationPath) ?? null;
+    if (!rt.missionObservability) {
+      rt.missionObservability = MissionObservability.open({
+        backend: orchestrationBackend,
+        store: rt.missionStore,
+        onUpdate: opts.onMissionObservabilityUpdate,
+        onChange: (missionId) => {
+          void rt.publishMissionSnapshot();
+          rt.emitMissionActivity(missionId);
+        },
+      });
+      openedMissionObservability.set(orchestrationPath, rt.missionObservability);
+    }
     // Route orchestration worker roles through the capability router so per-role
     // model placement (policy.routing.roles, e.g. a pinned implementer/reviewer)
     // is honored by the mission pipeline, matching the lifecycle roleRunner

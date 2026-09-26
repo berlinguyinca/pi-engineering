@@ -59,7 +59,12 @@ export interface VerifyOutcome {
 export interface VerificationProvider {
   /** Detect the repo's verification profile. `full` adds a broader suite (lint + test:full). */
   detect(cwd: string, opts?: { full?: boolean }): Promise<VerificationProfile>;
-  run(cwd: string, profile: VerificationProfile, artifactStore: ArtifactStore): Promise<VerifyOutcome>;
+  run(
+    cwd: string,
+    profile: VerificationProfile,
+    artifactStore: ArtifactStore,
+    opts?: { signal?: AbortSignal },
+  ): Promise<VerifyOutcome>;
 }
 
 function truncate(text: string, max: number): string {
@@ -301,12 +306,18 @@ export class CommandVerifier implements VerificationProvider {
     return { name: full ? "detected-full" : "detected", stages };
   }
 
-  async run(cwd: string, profile: VerificationProfile, store: ArtifactStore): Promise<VerifyOutcome> {
+  async run(
+    cwd: string,
+    profile: VerificationProfile,
+    store: ArtifactStore,
+    opts?: { signal?: AbortSignal },
+  ): Promise<VerifyOutcome> {
     const stageRuns: StageRun[] = [];
     const evidence: Evidence[] = [];
     let failedStage: string | null = null;
 
     for (const stage of profile.stages) {
+      opts?.signal?.throwIfAborted();
       const startedAt = new Date().toISOString();
       let stdout = "";
       let stderr = "";
@@ -317,11 +328,13 @@ export class CommandVerifier implements VerificationProvider {
           timeout: stage.timeoutMs ?? 300_000,
           maxBuffer: 16 * 1024 * 1024,
           env: await cleanEnv(stage.cwd ?? cwd),
+          signal: opts?.signal,
         });
         stdout = res.stdout;
         stderr = res.stderr;
         code = 0;
       } catch (err) {
+        if (opts?.signal?.aborted || (err as { name?: string }).name === "AbortError") throw err;
         const e = err as NodeJS.ErrnoException & { stdout?: string; stderr?: string; code?: number };
         code = typeof e.code === "number" ? e.code : 1;
         stdout = (e.stdout as string) ?? "";

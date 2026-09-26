@@ -1,5 +1,17 @@
 import type { WorkerResult, WorkerRole, WorkerUsage } from "../core/types.ts";
 
+/** Bounded, operator-safe live state from a worker session. */
+export interface WorkerActivity {
+  kind: "state" | "tool" | "heartbeat" | "execution";
+  summary: string;
+  phase?: "started" | "completed" | "failed" | "canceled";
+  stage?: "agent" | "process" | "review" | "integration" | "validation" | "research";
+  toolName?: string;
+  meaningfulProgress: boolean;
+  elapsedMs?: number;
+  lastActivityMs?: number;
+}
+
 /** A delegated task for a fresh-context worker (INV-002, §12). */
 export interface WorkerRequest {
   role: WorkerRole;
@@ -42,6 +54,10 @@ export interface WorkerRequest {
    * own checkout (any fallback path) must never be told to commit there.
    */
   isolatedWorktree?: boolean;
+  /** Live bounded activity; never includes prompts, model text, tool arguments, or secrets. */
+  onActivity?: (event: WorkerActivity) => void;
+  /** Abort the active model session when the owning execution is canceled. */
+  signal?: AbortSignal;
 }
 
 /** An image passed to a vision-capable worker session. */

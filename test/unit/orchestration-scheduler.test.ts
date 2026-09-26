@@ -4,6 +4,30 @@ import { type BrokerBackends, ExecutionBroker } from "../../src/orchestration/br
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
 import { MissionScheduler, classifyFailure, domainsOverlap } from "../../src/orchestration/scheduler.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
+import type { GatewayResilienceConfig } from "../../src/resilience/config.ts";
+
+const cancellationResilience: GatewayResilienceConfig = {
+  retry_window_ms: 60_000,
+  probe_interval_ms: 1_000,
+  request_timeout_ms: 120_000,
+  connect_timeout_ms: 10_000,
+  jitter_ms: 0,
+  circuit_breaker_threshold: 99,
+  retry_transient_errors: true,
+  preserve_mission_on_exhaustion: true,
+  auto_resume_on_recovery: true,
+};
+
+function transientInfrastructureOutcome() {
+  return {
+    executionId: "e",
+    exitStatus: "failed" as const,
+    summary: "gateway unavailable",
+    artifactRefs: [],
+    usage: {},
+    error: "transient:server_unavailable",
+  };
+}
 
 /** Deterministic overlap barrier (see dag-parallel/blackhole tests). */
 function parallelBarrier(needed: number, timeoutMs = 5000): { arrived: () => Promise<void> } {
@@ -36,6 +60,38 @@ function makeBroker(store: MissionStore, backends: BrokerBackends) {
   return new ExecutionBroker({ store, backends });
 }
 
+function createExecutingMission(store: MissionStore) {
+  const mission = store.createMission({
+    title: "concurrency limits",
+    goal: "concurrency limits",
+    user_request: "concurrency limits",
+    repository: ".",
+    base_ref: "",
+    risk_profile: "medium",
+    workflow_class: "engineering_review",
+  });
+  store.transitionMission(mission.mission_id, "CLASSIFYING");
+  store.transitionMission(mission.mission_id, "PLANNING");
+  store.transitionMission(mission.mission_id, "READY");
+  store.transitionMission(mission.mission_id, "EXECUTING");
+  return mission;
+}
+
+function delayedConcurrencyTracker(delayMs = 25) {
+  let active = 0;
+  let peak = 0;
+  return {
+    async run() {
+      active++;
+      peak = Math.max(peak, active);
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+      active--;
+      return { executionId: "e", exitStatus: "succeeded", summary: "done", artifactRefs: [], usage: {} };
+    },
+    peak: () => peak,
+  };
+}
+
 describe("MissionScheduler (spec 02)", () => {
   it("runs independent tasks concurrently (parallelism)", async () => {
     const store = MissionStore.open(JsonlEventStore.inMemory());
@@ -60,7 +116,7 @@ describe("MissionScheduler (spec 02)", () => {
       objective: "backend",
       write_domains: ["src/server/**"],
       mutates_repo: true,
-      isolation: "worktree",
+      isolation: "none",
     });
     const b = store.createTask({
       mission_id: m.mission_id,
@@ -69,7 +125,7 @@ describe("MissionScheduler (spec 02)", () => {
       objective: "frontend",
       write_domains: ["src/web/**"],
       mutates_repo: true,
-      isolation: "worktree",
+      isolation: "none",
     });
     let maxConcurrent = 0;
     let concurrent = 0;
@@ -117,6 +173,7 @@ describe("MissionScheduler (spec 02)", () => {
       objective: "a",
       write_domains: ["src/shared/**"],
       mutates_repo: true,
+      isolation: "none",
     });
     const b = store.createTask({
       mission_id: m.mission_id,
@@ -125,6 +182,7 @@ describe("MissionScheduler (spec 02)", () => {
       objective: "b",
       write_domains: ["src/shared/util.ts"],
       mutates_repo: true,
+      isolation: "none",
     });
     let maxConcurrent = 0;
     let concurrent = 0;
@@ -275,6 +333,229 @@ describe("MissionScheduler (spec 02)", () => {
     await scheduler.runMission(m.mission_id);
     assert.equal(calls, 2);
     assert.equal(store.getTask(t.task_id)!.status, "FAILED");
+  });
+
+  it("cancels active mission executions when the caller aborts", async () => {
+    const store = MissionStore.open(JsonlEventStore.inMemory());
+    const mission = createExecutingMission(store);
+    const task = store.createTask({
+      mission_id: mission.mission_id,
+      kind: "agent",
+      role: "implementer",
+      objective: "long-running work",
+    });
+    let backendSignal: AbortSignal | undefined;
+    let markStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    const broker = makeBroker(store, {
+      agent: {
+        runAgent: async ({ signal }) => {
+          backendSignal = signal;
+          markStarted();
+          await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+          return { executionId: "e", exitStatus: "succeeded", summary: "late", artifactRefs: [], usage: {} };
+        },
+      },
+    });
+    const scheduler = new MissionScheduler({ store, broker });
+    const controller = new AbortController();
+    const running = scheduler.runMission(mission.mission_id, controller.signal);
+
+    await started;
+    controller.abort();
+    await running;
+
+    assert.equal(backendSignal?.aborted, true, "the active backend must receive cancellation");
+    assert.equal(store.getTask(task.task_id)?.status, "CANCELED");
+  });
+
+  it("cancels promptly during resilience backoff and releases scheduler capacity", async () => {
+    const store = MissionStore.open(JsonlEventStore.inMemory());
+    const firstMission = createExecutingMission(store);
+    const firstTask = store.createTask({
+      mission_id: firstMission.mission_id,
+      kind: "agent",
+      role: "implementer",
+      objective: "retrying work",
+    });
+    let enterBackoff!: () => void;
+    const backoffStarted = new Promise<void>((resolve) => {
+      enterBackoff = resolve;
+    });
+    const neverCompletes = new Promise<void>(() => undefined);
+    const broker = makeBroker(store, {
+      agent: {
+        runAgent: async ({ objective }) =>
+          objective === "retrying work"
+            ? transientInfrastructureOutcome()
+            : { executionId: "e2", exitStatus: "succeeded", summary: "done", artifactRefs: [], usage: {} },
+      },
+    });
+    const scheduler = new MissionScheduler({
+      store,
+      broker,
+      limits: { maxActive: 1 },
+      resilience: cancellationResilience,
+      sleep: async () => {
+        enterBackoff();
+        await neverCompletes;
+      },
+    });
+    const controller = new AbortController();
+    const running = scheduler.runMission(firstMission.mission_id, controller.signal);
+
+    await backoffStarted;
+    controller.abort();
+    await running;
+
+    assert.equal(store.getTask(firstTask.task_id)?.status, "CANCELED");
+
+    const secondMission = createExecutingMission(store);
+    const secondTask = store.createTask({
+      mission_id: secondMission.mission_id,
+      kind: "agent",
+      role: "implementer",
+      objective: "fresh work",
+    });
+    await scheduler.runMission(secondMission.mission_id);
+    assert.equal(store.getTask(secondTask.task_id)?.status, "SUCCEEDED", "canceled work must release maxActive");
+  });
+
+  it("cancels promptly while a recovery probe is pending", async () => {
+    const store = MissionStore.open(JsonlEventStore.inMemory());
+    const mission = createExecutingMission(store);
+    const task = store.createTask({
+      mission_id: mission.mission_id,
+      kind: "agent",
+      role: "implementer",
+      objective: "probe-gated work",
+    });
+    let probeStarted!: () => void;
+    const probing = new Promise<void>((resolve) => {
+      probeStarted = resolve;
+    });
+    const broker = makeBroker(store, {
+      agent: { runAgent: async () => transientInfrastructureOutcome() },
+    });
+    const scheduler = new MissionScheduler({
+      store,
+      broker,
+      resilience: cancellationResilience,
+      sleep: async () => undefined,
+      probe: {
+        probe: async () => {
+          probeStarted();
+          await new Promise<void>(() => undefined);
+          return { healthy: false };
+        },
+      },
+    });
+    const controller = new AbortController();
+    const running = scheduler.runMission(mission.mission_id, controller.signal);
+
+    await probing;
+    controller.abort();
+    await running;
+
+    assert.equal(store.getTask(task.task_id)?.status, "CANCELED");
+  });
+
+  it("enforces the agent cap when several delayed agents become runnable together", async () => {
+    const store = MissionStore.open(JsonlEventStore.inMemory());
+    const mission = createExecutingMission(store);
+    for (let i = 0; i < 3; i++) {
+      store.createTask({
+        mission_id: mission.mission_id,
+        kind: "agent",
+        role: `agent-${i}`,
+        objective: `agent ${i}`,
+      });
+    }
+    const tracker = delayedConcurrencyTracker();
+    const broker = makeBroker(store, { agent: { runAgent: tracker.run } });
+    const scheduler = new MissionScheduler({
+      store,
+      broker,
+      limits: { maxActive: 10, maxAgents: 1, maxPerRole: 10 },
+    });
+
+    await scheduler.runMission(mission.mission_id);
+
+    assert.equal(tracker.peak(), 1, "no more than maxAgents agent executions may overlap");
+  });
+
+  it("enforces the subprocess cap when delayed process tasks become runnable together", async () => {
+    const store = MissionStore.open(JsonlEventStore.inMemory());
+    const mission = createExecutingMission(store);
+    for (let i = 0; i < 3; i++) {
+      store.createTask({
+        mission_id: mission.mission_id,
+        kind: "process",
+        role: `process-${i}`,
+        objective: `process ${i}`,
+      });
+    }
+    const tracker = delayedConcurrencyTracker();
+    const broker = makeBroker(store, { process: { runProcess: tracker.run } });
+    const scheduler = new MissionScheduler({
+      store,
+      broker,
+      limits: { maxActive: 10, maxSubprocesses: 1, maxPerRole: 10 },
+    });
+
+    await scheduler.runMission(mission.mission_id);
+
+    assert.equal(tracker.peak(), 1, "no more than maxSubprocesses process executions may overlap");
+  });
+
+  it("enforces the per-role cap when delayed tasks share a role", async () => {
+    const store = MissionStore.open(JsonlEventStore.inMemory());
+    const mission = createExecutingMission(store);
+    for (let i = 0; i < 3; i++) {
+      store.createTask({
+        mission_id: mission.mission_id,
+        kind: "agent",
+        role: "implementer",
+        objective: `implementation ${i}`,
+      });
+    }
+    const tracker = delayedConcurrencyTracker();
+    const broker = makeBroker(store, { agent: { runAgent: tracker.run } });
+    const scheduler = new MissionScheduler({
+      store,
+      broker,
+      limits: { maxActive: 10, maxAgents: 10, maxPerRole: 1 },
+    });
+
+    await scheduler.runMission(mission.mission_id);
+
+    assert.equal(tracker.peak(), 1, "no more than maxPerRole executions for one role may overlap");
+  });
+
+  it("enforces the aggregate cap when delayed tasks become runnable together", async () => {
+    const store = MissionStore.open(JsonlEventStore.inMemory());
+    const mission = createExecutingMission(store);
+    for (let i = 0; i < 4; i++) {
+      store.createTask({
+        mission_id: mission.mission_id,
+        kind: "agent",
+        role: `aggregate-${i}`,
+        objective: `aggregate ${i}`,
+      });
+    }
+    const tracker = delayedConcurrencyTracker();
+    const broker = makeBroker(store, { agent: { runAgent: tracker.run } });
+    const scheduler = new MissionScheduler({
+      store,
+      broker,
+      limits: { maxActive: 2, maxAgents: 10, maxPerRole: 10 },
+    });
+
+    await scheduler.runMission(mission.mission_id);
+
+    assert.equal(tracker.peak(), 2, "no more than maxActive executions may overlap");
   });
 });
 

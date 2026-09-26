@@ -70,6 +70,7 @@ import { type RequestBodyBudgetConfig, resolveRequestBodyBudgetConfig } from "..
 import { type ThinkingOffConfig, resolveThinkingOffConfig } from "../request/thinkingPolicy.ts";
 import { emitTelemetry } from "../telemetry/sink.ts";
 import type { WorkerExecutor, WorkerRequest, WorkerRun } from "./WorkerExecutor.ts";
+import { activityFromSessionEvent, emitWorkerActivity } from "./activity.ts";
 import { registerLocalProviders } from "./localProviders.ts";
 import { WORKER_KICKOFF, buildSystemPrompt, wantsCommitDiscipline } from "./prompts.ts";
 import { guardRuntimeRequestBody } from "./requestBodyGuard.ts";
@@ -817,6 +818,7 @@ ${recovery.recoveryPrompt}`;
     // arrives), `promptError` is a THROWN transport failure.
     let assistantError: string | undefined;
     let promptError: unknown = undefined;
+    let ownerAborted = false;
 
     // Generation guard (spec §6-§12). Role-adjusted so prose-producing roles
     // (reviewer etc.) are not aborted as "excessive narration" / "no progress"
@@ -835,6 +837,9 @@ ${recovery.recoveryPrompt}`;
     };
 
     const unsubscribe = session.subscribe((event) => {
+      const activity = activityFromSessionEvent(event);
+      const activityToolName = "toolName" in event ? event.toolName : undefined;
+      if (activity && activityToolName !== terminatingName) emitWorkerActivity(req, activity);
       // Capture the terminating tool (worker_result or review_result).
       if (event.type === "tool_execution_end" && event.toolName === terminatingName) {
         if (!event.isError) {
@@ -883,12 +888,26 @@ ${recovery.recoveryPrompt}`;
     });
 
     // Wall-clock budget.
-    const timer = setTimeout(() => {
-      timedOut = true;
+    // The owner signal is the sole deadline authority when present (the broker
+    // starts its clock before setup/worktree allocation). Standalone executor
+    // callers without an owner signal retain the local worker timer.
+    const timer = req.signal
+      ? undefined
+      : setTimeout(() => {
+          timedOut = true;
+          void session.abort();
+        }, req.timeoutMs ?? 300_000);
+    const abortFromOwner = (): void => {
+      ownerAborted = true;
+      const reason = req.signal?.reason;
+      if (reason instanceof DOMException && reason.name === "TimeoutError") timedOut = true;
       void session.abort();
-    }, req.timeoutMs ?? 300_000);
+    };
+    req.signal?.addEventListener("abort", abortFromOwner, { once: true });
 
     try {
+      emitWorkerActivity(req, { kind: "state", summary: "Worker session started", meaningfulProgress: false });
+      if (req.signal?.aborted) abortFromOwner();
       await session.prompt(req.kickoff ?? WORKER_KICKOFF, {
         images: req.images?.map((img) => ({ type: "image" as const, data: img.data, mimeType: img.mimeType })),
         expandPromptTemplates: false,
@@ -898,11 +917,12 @@ ${recovery.recoveryPrompt}`;
       // EXPECTED (session.abort()) and not a transport failure. A rejection
       // with none of those flags set is a real provider/transport error (503,
       // 429, network, timeout) that the transient-recovery layer retries.
-      if (!guardAborted && !budgetExhausted && !timedOut) {
+      if (!guardAborted && !budgetExhausted && !timedOut && !ownerAborted) {
         promptError = err;
       }
     } finally {
-      clearTimeout(timer);
+      if (timer) clearTimeout(timer);
+      req.signal?.removeEventListener("abort", abortFromOwner);
       unsubscribe();
       apsDetach?.();
     }

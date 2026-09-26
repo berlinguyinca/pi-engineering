@@ -95,6 +95,53 @@ describe("CompletionGate (spec 07)", () => {
     assert.equal(v.can_complete, false);
   });
 
+  it("does not let an unrelated successful implementation supersede a failed implementation", () => {
+    const { store, m } = mission([]);
+    const failed = store.createTask({
+      mission_id: m.mission_id,
+      kind: "agent",
+      role: "implementer",
+      objective: "implement the API endpoint",
+    });
+    store.transitionTask(failed.task_id, "READY");
+    store.transitionTask(failed.task_id, "RUNNING");
+    store.transitionTask(failed.task_id, "FAILED");
+
+    const unrelated = store.createTask({
+      mission_id: m.mission_id,
+      kind: "agent",
+      role: "implementer",
+      objective: "update the CLI output",
+    });
+    store.transitionTask(unrelated.task_id, "READY");
+    store.transitionTask(unrelated.task_id, "RUNNING");
+    store.transitionTask(unrelated.task_id, "SUCCEEDED");
+
+    const v = new CompletionGate(store).evaluate(store.getMission(m.mission_id)!);
+    assert.equal(v.can_complete, false, "unrelated implementation work is not retry evidence");
+    assert.ok(v.reasons.includes("1 task(s) failed"), JSON.stringify(v.reasons));
+  });
+
+  it("still supersedes repeated gate-task failures after a later matching success", () => {
+    for (const kind of ["integration", "validation", "review"] as const) {
+      const { store, m } = mission([]);
+      for (const status of ["FAILED", "SUCCEEDED"] as const) {
+        const task = store.createTask({
+          mission_id: m.mission_id,
+          kind,
+          role: `${kind}-runner`,
+          objective: `run ${kind}`,
+        });
+        store.transitionTask(task.task_id, "READY");
+        store.transitionTask(task.task_id, "RUNNING");
+        store.transitionTask(task.task_id, status);
+      }
+
+      const v = new CompletionGate(store).evaluate(store.getMission(m.mission_id)!);
+      assert.equal(v.can_complete, true, `${kind}: ${JSON.stringify(v.reasons)}`);
+    }
+  });
+
   describe("recovered timed-out work (MSN-4IhxSO)", () => {
     type Store = ReturnType<typeof mission>["store"];
     type RecoveredMerge = { task_id: string; branch: string; ref: string };

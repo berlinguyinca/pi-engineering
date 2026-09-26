@@ -10,9 +10,73 @@ import { test } from "node:test";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
 import { MissionObservability } from "../../src/orchestration/observability/MissionObservability.ts";
 import type { DEFAULT_OBSERVABILITY_CONFIG } from "../../src/orchestration/observability/types.ts";
+import type { EventStoreBackend, StoredEvent } from "../../src/platform/eventstore/backend.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 
 const NOW = "2024-01-01T00:00:00.000Z";
+
+class FailOnceBackend implements EventStoreBackend {
+  private readonly inner = JsonlEventStore.inMemory();
+  private rejectNext = false;
+  attempts = 0;
+
+  failNextAppend(): void {
+    this.rejectNext = true;
+  }
+
+  async append(event: StoredEvent): Promise<StoredEvent> {
+    this.attempts += 1;
+    if (this.rejectNext) {
+      this.rejectNext = false;
+      throw new Error("observability persistence unavailable");
+    }
+    return this.inner.append(event);
+  }
+
+  async appendAll(events: StoredEvent[]): Promise<void> {
+    await this.inner.appendAll(events);
+  }
+
+  all(): StoredEvent[] {
+    return this.inner.all();
+  }
+
+  get(eventId: string): StoredEvent | undefined {
+    return this.inner.get(eventId);
+  }
+
+  count(): number {
+    return this.inner.count();
+  }
+}
+
+class UnavailableObservabilityBackend implements EventStoreBackend {
+  private readonly seed = JsonlEventStore.inMemory();
+  unavailable = false;
+
+  async append(event: StoredEvent): Promise<StoredEvent> {
+    if (this.unavailable && event.type.startsWith("mission.obs.")) {
+      throw new Error("observability persistence unavailable");
+    }
+    return this.seed.append(event);
+  }
+
+  async appendAll(events: StoredEvent[]): Promise<void> {
+    await this.seed.appendAll(events);
+  }
+
+  all(): StoredEvent[] {
+    return this.seed.all();
+  }
+
+  get(eventId: string): StoredEvent | undefined {
+    return this.seed.get(eventId);
+  }
+
+  count(): number {
+    return this.seed.count();
+  }
+}
 
 interface Clock {
   t: number;
@@ -33,7 +97,7 @@ function clock(): Clock {
 }
 
 interface Harness {
-  backend: JsonlEventStore;
+  backend: EventStoreBackend;
   store: MissionStore;
   obs: MissionObservability;
   updates: string[];
@@ -117,6 +181,87 @@ test("multiple missions are tracked independently and never go modal", async () 
   assert.equal(h.obs.summary(b)!.workers.active, 1);
   // Communication gate stays open for both.
   assert.equal(h.updates.length, 2, "worker-start updates emitted for both missions");
+});
+
+test("retries observability appends in order so restart restores the complete projection", async () => {
+  const backend = new FailOnceBackend();
+  const store = MissionStore.open(backend);
+  const obs = new MissionObservability({ backend, store, now: clock().now });
+  const id = makeMission({ backend, store, obs, updates: [], clock: clock() });
+  await store.flush();
+  const attemptsBeforeObservability = backend.attempts;
+  backend.failNextAppend();
+
+  obs.missionCreated(id, "M");
+  obs.phaseChanged(id, "EXECUTING");
+
+  await obs.flush();
+  assert.equal(backend.attempts, attemptsBeforeObservability + 3, "the failed creation is retried before the phase");
+  assert.deepEqual(
+    backend
+      .all()
+      .filter((event) => event.type.startsWith("mission.obs."))
+      .map((event) => event.type),
+    ["mission.obs.created", "mission.obs.phase"],
+    "the later observability event persists only after its prerequisite",
+  );
+  assert.deepEqual(obs.persistenceDiagnostics(), [], "a recovered append is no longer unresolved");
+
+  const reopened = MissionObservability.open({ backend, store, now: clock().now });
+  assert.equal(reopened.projection(id)?.summary.title, "M");
+  assert.equal(reopened.projection(id)?.progressHistory.at(-1)?.label, "EXECUTING");
+});
+
+test("observability flush rejects and later events remain queued while persistence is unavailable", async () => {
+  const backend = new UnavailableObservabilityBackend();
+  const store = MissionStore.open(backend);
+  const obs = new MissionObservability({ backend, store, now: clock().now });
+  const id = makeMission({ backend, store, obs, updates: [], clock: clock() });
+  await store.flush();
+  backend.unavailable = true;
+
+  obs.missionCreated(id, "M");
+  obs.phaseChanged(id, "EXECUTING");
+
+  await assert.rejects(obs.flush(), /observability persistence unavailable/);
+  assert.deepEqual(
+    backend
+      .all()
+      .filter((event) => event.type.startsWith("mission.obs."))
+      .map((event) => event.type),
+    [],
+    "the phase does not overtake the failed creation",
+  );
+  assert.deepEqual(
+    obs.persistenceDiagnostics().map(({ eventType, missionId, message }) => ({ eventType, missionId, message })),
+    [{ eventType: "MISSION_CREATED", missionId: id, message: "observability persistence unavailable" }],
+  );
+});
+
+test("change hook fires for activity and sampled heartbeats so snapshot publishers stay live", () => {
+  const backend = JsonlEventStore.inMemory();
+  const store = MissionStore.open(backend);
+  const clk = clock();
+  const changed: string[] = [];
+  const obs = new MissionObservability({
+    backend,
+    store,
+    now: clk.now,
+    config: { heartbeatSampleMs: 60_000 },
+    onChange: (missionId) => changed.push(missionId),
+  });
+  const id = makeMission({ backend, store, obs, updates: [], clock: clk });
+  obs.missionCreated(id, "M");
+  obs.workerStarted(id, "wk-1");
+  changed.length = 0;
+
+  obs.activity(id, { type: "running_command", summary: "Running tool: bash", workerId: "wk-1" });
+  obs.heartbeat(id, "wk-1", { elapsedMs: 10_000, lastActivityMs: 2_000 });
+  clk.advance(1_000);
+  obs.heartbeat(id, "wk-1", { elapsedMs: 11_000, lastActivityMs: 3_000 });
+
+  assert.deepEqual(changed, [id, id, id]);
+  assert.equal(obs.projection(id)?.summary.lastHeartbeatAt, clk.now());
 });
 
 test("100% VERIFIED COMPLETE only after the CompletionGate passes", async () => {
