@@ -118,7 +118,7 @@ class SessionContext {
  * fallback is captured rather than escaping as an uncaught exception.
  */
 function makeHarness(deps: FallbackApplyDeps) {
-  const coordinator = new FallbackCoordinator();
+  const coordinator = enabledCoordinator();
   let lastError: unknown;
   const onHold = (info: { modelId?: string; provider?: string } = {}): void => {
     coordinator.onGatewayHold(info);
@@ -136,6 +136,10 @@ function makeHarness(deps: FallbackApplyDeps) {
   return { coordinator, onHold, beforeAgentStart, getLastError: () => lastError };
 }
 
+function enabledCoordinator(): FallbackCoordinator {
+  return new FallbackCoordinator({ enabled: true });
+}
+
 function setModelRecorder(): { deps: FallbackApplyDeps; calls: M[] } {
   const calls: M[] = [];
   return {
@@ -151,8 +155,16 @@ function setModelRecorder(): { deps: FallbackApplyDeps; calls: M[] } {
 
 // ─── FallbackCoordinator: the plain-data state machine ──────────────────────
 
-test("coordinator: holds accumulate and arm a pending fallback at the threshold", () => {
+test("coordinator: automatic model fallback is disabled by default", () => {
   const c = new FallbackCoordinator();
+  for (let i = 0; i < FALLBACK_AFTER_HOLDS + 2; i++) c.onGatewayHold();
+  assert.equal(c.holds, 0, "disabled fallback does not count holds");
+  assert.equal(c.hasPending, false, "disabled fallback never arms a model switch");
+  assert.equal(c.claimPending(), undefined, "there is no switch for a lifecycle callback to apply");
+});
+
+test("coordinator: explicit opt-in arms a pending fallback at the threshold", () => {
+  const c = enabledCoordinator();
   for (let i = 0; i < FALLBACK_AFTER_HOLDS - 1; i++) c.onGatewayHold();
   assert.equal(c.hasPending, false, "below the threshold nothing is pending");
   assert.equal(c.holds, FALLBACK_AFTER_HOLDS - 1);
@@ -162,7 +174,7 @@ test("coordinator: holds accumulate and arm a pending fallback at the threshold"
 });
 
 test("coordinator: a stream producing output resets the consecutive-hold run", () => {
-  const c = new FallbackCoordinator();
+  const c = enabledCoordinator();
   c.onGatewayHold();
   c.onGatewayHold();
   c.onProgress();
@@ -176,7 +188,7 @@ test("coordinator: transport drops and link cuts never arm a model fallback", ()
   // the operator's model is no answer to a connection problem. The same holds
   // for a link cut, whose retry is routed afresh.
   for (const source of ["transport-drop", "link-cut"] as const) {
-    const c = new FallbackCoordinator();
+    const c = enabledCoordinator();
     for (let i = 0; i < FALLBACK_AFTER_HOLDS + 2; i++) c.onGatewayHold({ source });
     assert.equal(c.hasPending, false, source);
     assert.equal(c.holds, 0, `${source} holds are not counted`);
@@ -184,7 +196,7 @@ test("coordinator: transport drops and link cuts never arm a model fallback", ()
 });
 
 test("coordinator: gateway saturation holds still count, a drop in between neither counts nor resets", () => {
-  const c = new FallbackCoordinator();
+  const c = enabledCoordinator();
   c.onGatewayHold({ source: "default" });
   c.onGatewayHold({ source: "transport-drop" });
   c.onGatewayHold({ source: "body" });
@@ -194,7 +206,7 @@ test("coordinator: gateway saturation holds still count, a drop in between neith
 });
 
 test("T5: many holds produce at most one pending fallback, claimed exactly once", () => {
-  const c = new FallbackCoordinator();
+  const c = enabledCoordinator();
   for (let i = 0; i < 10; i++) c.onGatewayHold();
   assert.equal(c.hasPending, true);
   const first = c.claimPending();
@@ -205,7 +217,7 @@ test("T5: many holds produce at most one pending fallback, claimed exactly once"
 });
 
 test("T4: an explicit model_select clears the pending fallback and the hold count", () => {
-  const c = new FallbackCoordinator();
+  const c = enabledCoordinator();
   c.onGatewayHold();
   c.onGatewayHold();
   c.onGatewayHold();
@@ -216,7 +228,7 @@ test("T4: an explicit model_select clears the pending fallback and the hold coun
 });
 
 test("session shutdown clears ephemeral fallback state", () => {
-  const c = new FallbackCoordinator();
+  const c = enabledCoordinator();
   c.onGatewayHold();
   c.onGatewayHold();
   c.onGatewayHold();
@@ -227,7 +239,7 @@ test("session shutdown clears ephemeral fallback state", () => {
 });
 
 test("coordinator: a snapshot is plain data only", () => {
-  const c = new FallbackCoordinator();
+  const c = enabledCoordinator();
   c.onGatewayHold({ modelId: "m", provider: "p" });
   c.onGatewayHold();
   c.onGatewayHold();
@@ -468,7 +480,7 @@ test("T7: an admission storm keeps state consistent and switches at most once", 
 });
 
 test("T7: holds keep counting across progress until a real switch or select", () => {
-  const c = new FallbackCoordinator();
+  const c = enabledCoordinator();
   // 2 holds, progress (reset), 3 more holds → pending again.
   c.onGatewayHold();
   c.onGatewayHold();

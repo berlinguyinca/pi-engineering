@@ -249,13 +249,15 @@ multiply:
 
 While a turn waits, the status bar shows what it is waiting for, the next
 retry countdown and, once the outage passes a minute, how long it has lasted
-(`gateway 60s · capacity_unavailable · for 2h 03m`). A model fallback is armed
-only by a model's own outage (three consecutive holds): an account-wide queue,
-a connection drop and a link cut do not switch models.
+(`gateway 60s · capacity_unavailable · for 2h 03m`). Automatic model fallback
+is disabled by default. When explicitly enabled, it is armed only by a model's
+own outage (three consecutive holds): an account-wide queue, a connection drop
+and a link cut do not switch models.
 
 | Variable | Default | Meaning |
 | -------- | ------- | ------- |
 | `PI_GATEWAY_ADMISSION_ENABLED` | `true` | Disable admission control entirely |
+| `PI_GATEWAY_MODEL_FALLBACK_ENABLED` | `false` | Allow a model-scoped outage to switch the active session model automatically |
 | `PI_GATEWAY_MAX_CONCURRENCY` | `4` | Total concurrent model requests this runtime aims at |
 | `PI_GATEWAY_RESERVED_SLOTS` | `1` | Of that total, slots kept free for your interactive turn (so 3 worker sessions by default, held from the start) |
 | `PI_GATEWAY_MAX_WAIT_MS` | `300000` | Retained for compatibility; a server-advertised wait is never shortened |

@@ -809,14 +809,15 @@ ${RECOVERY_PROMPT}`;
     // provider call to the handler we supply (provider-composer.js:315-323), so
     // a wait taken in there costs Pi nothing from its retry budget. Saturation
     // becomes what it actually is — a slow request, not a failed one.
-    // Consecutive waits on the current model, the trigger for considering a
-    // stand-in. Reset whenever a stream actually produces output or the model
-    // changes.
+    // When explicitly enabled, consecutive waits on the current model trigger
+    // consideration of a stand-in. Reset whenever a stream actually produces
+    // output or the model changes.
     // Plain-data state machine for the hold-driven fallback (see
     // src/gateway/fallbackLifecycle.ts). It holds a count and a pending flag —
     // never a Pi context — so an async gateway callback can update it safely
     // even after the session that raised the hold has been replaced or reloaded.
-    const fallbackCoordinator = new FallbackCoordinator();
+    // Its own default is also off, keeping the safety boundary fail-closed.
+    const fallbackCoordinator = new FallbackCoordinator({ enabled: gatewayConfig.modelFallbackEnabled });
 
     // Retry a turn whose stream was cut AFTER partial output (link cut,
     // "terminated"): omit the partial answer and continue, with long-wait
