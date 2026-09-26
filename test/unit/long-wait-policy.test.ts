@@ -326,11 +326,11 @@ describe("long-wait policy: model fallback during a long outage", () => {
   it("only a model's own outage arms a switch; an account-wide queue does not", async () => {
     const { FallbackCoordinator, FALLBACK_AFTER_HOLDS } = await import("../../src/gateway/fallbackLifecycle.ts");
     // Every model shares the account's queue: switching models cannot help.
-    const queue = new FallbackCoordinator();
+    const queue = new FallbackCoordinator({ enabled: true });
     for (let i = 0; i < FALLBACK_AFTER_HOLDS + 3; i++) queue.onGatewayHold({ source: "body", accountWide: true });
     assert.equal(queue.hasPending, false);
     // One model is unavailable (capacity, reload, GPU move): a stand-in helps.
-    const model = new FallbackCoordinator();
+    const model = new FallbackCoordinator({ enabled: true });
     for (let i = 0; i < FALLBACK_AFTER_HOLDS; i++) model.onGatewayHold({ source: "default", accountWide: false });
     assert.equal(model.hasPending, true);
   });

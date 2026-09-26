@@ -46,6 +46,8 @@ export interface PendingFallback {
  * that is what keeps a stale session from leaking into an async callback.
  */
 export class FallbackCoordinator {
+  /** Disabled unless the operator explicitly opts into automatic switching. */
+  readonly enabled: boolean;
   readonly afterHolds: number;
   private consecutiveHolds = 0;
   private fallbackPending = false;
@@ -54,7 +56,8 @@ export class FallbackCoordinator {
   private sourceModelId: string | undefined;
   private sourceProvider: string | undefined;
 
-  constructor(opts: { afterHolds?: number } = {}) {
+  constructor(opts: { enabled?: boolean; afterHolds?: number } = {}) {
+    this.enabled = opts.enabled ?? false;
     this.afterHolds = opts.afterHolds ?? FALLBACK_AFTER_HOLDS;
   }
 
@@ -67,6 +70,7 @@ export class FallbackCoordinator {
   onGatewayHold(
     info: { modelId?: string; provider?: string; source?: GatewayWaitSignal["source"]; accountWide?: boolean } = {},
   ): void {
+    if (!this.enabled) return;
     // A connection problem is not a model problem: a transport drop (the
     // gateway restarting under the stream) or a link cut (retried on a fresh
     // route) says nothing about this model's capacity, so it neither counts
