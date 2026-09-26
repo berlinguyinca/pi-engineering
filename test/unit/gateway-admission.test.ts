@@ -340,11 +340,29 @@ test("gateway config is tunable from the environment", () => {
     process.env.PI_GATEWAY_RESERVED_SLOTS = "0";
     process.env.PI_GATEWAY_MAX_RETRIES = "7";
     process.env.PI_GATEWAY_ADMISSION_ENABLED = "false";
+    process.env.PI_GATEWAY_MODEL_FALLBACK_ENABLED = "true";
     const cfg = resolveGatewayConfig();
     assert.equal(cfg.maxConcurrency, 2);
     assert.equal(cfg.reservedSlots, 0);
     assert.equal(cfg.maxRetries, 7);
     assert.equal(cfg.enabled, false);
+    assert.equal(cfg.modelFallbackEnabled, true);
+  } finally {
+    process.env = saved;
+  }
+});
+
+test("automatic model fallback requires an affirmative opt-in", () => {
+  const saved = { ...process.env };
+  try {
+    for (const value of ["false", "0", "off", "no", "FALSE", "typo", ""]) {
+      process.env.PI_GATEWAY_MODEL_FALLBACK_ENABLED = value;
+      assert.equal(resolveGatewayConfig().modelFallbackEnabled, false, value || "empty");
+    }
+    for (const value of ["true", "1", "on", "yes", "TRUE"]) {
+      process.env.PI_GATEWAY_MODEL_FALLBACK_ENABLED = value;
+      assert.equal(resolveGatewayConfig().modelFallbackEnabled, true, value);
+    }
   } finally {
     process.env = saved;
   }
@@ -436,6 +454,7 @@ test("the default retry and elapsed budgets are finite", () => {
     assert.ok(cfg.maxRetries > 0);
     assert.ok(Number.isFinite(cfg.maxElapsedMs));
     assert.ok(cfg.maxElapsedMs > 0);
+    assert.equal(cfg.modelFallbackEnabled, false, "automatic session model switching is opt-in");
   } finally {
     process.env = saved;
   }

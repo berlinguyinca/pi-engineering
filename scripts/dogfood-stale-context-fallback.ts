@@ -56,8 +56,9 @@ function log(...args: unknown[]): void {
 
 // The exact admission envelope the gateway sends on a queue timeout.
 const ADMISSION_429 =
-  '429: {"status":429,"reason":"queue_timeout","retryable":true,"type":"inference_admission",' +
-  '"retry_after_ms":30000,"queued":45,"queue_limit":100,"active_limit":4,"scope":"agent","request_id":"dogfood-1"}';
+  '429: {"active":4,"active_limit":4,"message":"inference admission: queue_timeout",' +
+  '"queue_limit":100,"queued":45,"reason":"queue_timeout","request_id":"dogfood-1",' +
+  '"retry_after_ms":30000,"scope":"agent","type":"inference_admission"}';
 
 // ── the scripted base stream ─────────────────────────────────────────────────
 type Ev = RetryableEvent & { text?: string; error?: RetryableResult };
@@ -194,7 +195,7 @@ class StaleCtx implements FallbackContext {
  * detached-promise boundary (the `.catch`) that keeps a failure from exiting Pi.
  */
 function makeHarness(deps: FallbackApplyDeps) {
-  const coordinator = new FallbackCoordinator();
+  const coordinator = new FallbackCoordinator({ enabled: true });
   let lastError: unknown;
   const onHold = (): void => {
     coordinator.onGatewayHold();
