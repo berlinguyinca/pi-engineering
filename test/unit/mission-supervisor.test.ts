@@ -405,4 +405,44 @@ describe("MissionSupervisor", () => {
     assert.match(diagnostic.message, /injected interval failure/);
     assert.match(supervisor.diagnostics()[0]?.message ?? "", /injected interval failure/);
   });
+
+  it("captures an async error callback rejection without emitting an unhandled rejection", async () => {
+    const h = harness();
+    let callbackInvoked!: () => void;
+    const invoked = new Promise<void>((resolve) => {
+      callbackInvoked = resolve;
+    });
+    const supervisor = new MissionSupervisor({
+      store: h.store,
+      observability: h.observability,
+      intervalMs: 1,
+      onError: async () => {
+        callbackInvoked();
+        throw new Error("async callback failure");
+      },
+    });
+    h.store.flush = async () => {
+      supervisor.stop();
+      throw new Error("injected interval failure");
+    };
+    const unhandled: unknown[] = [];
+    const onUnhandled = (error: unknown) => unhandled.push(error);
+    process.on("unhandledRejection", onUnhandled);
+
+    try {
+      supervisor.start();
+      await invoked;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      await new Promise<void>((resolve) => setImmediate(resolve));
+
+      assert.deepEqual(unhandled, []);
+      assert.deepEqual(
+        supervisor.diagnostics().map((diagnostic) => diagnostic.message),
+        ["injected interval failure", "Supervisor error callback failed: async callback failure"],
+      );
+    } finally {
+      supervisor.stop();
+      process.off("unhandledRejection", onUnhandled);
+    }
+  });
 });

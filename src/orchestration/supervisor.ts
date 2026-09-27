@@ -39,7 +39,7 @@ export interface MissionSupervisorOptions {
   recoveryPlanner?: RecoveryPlanner;
   now?: () => number;
   intervalMs?: number;
-  onError?: (diagnostic: SupervisorDiagnostic) => void;
+  onError?: (diagnostic: SupervisorDiagnostic) => void | Promise<void>;
 }
 
 export interface SupervisorDiagnostic {
@@ -70,7 +70,7 @@ export class MissionSupervisor {
   private readonly classifier = new FailureClassifier();
   private readonly now: () => number;
   private readonly intervalMs: number;
-  private readonly onError?: (diagnostic: SupervisorDiagnostic) => void;
+  private readonly onError?: (diagnostic: SupervisorDiagnostic) => void | Promise<void>;
   private readonly supervisorDiagnostics: SupervisorDiagnostic[] = [];
   private timer?: ReturnType<typeof setInterval>;
   private readonly missionTicks = new Map<string, Promise<SupervisorStatus>>();
@@ -405,7 +405,7 @@ export class MissionSupervisor {
     }
   }
 
-  private handleIntervalFailure(error: unknown): void {
+  private async handleIntervalFailure(error: unknown): Promise<void> {
     if (error instanceof StaleSupervisorResumptionError) return;
     const normalized = error instanceof Error ? error : new Error(String(error));
     const diagnostic: SupervisorDiagnostic = {
@@ -413,18 +413,21 @@ export class MissionSupervisor {
       name: normalized.name,
       message: normalized.message,
     };
-    this.supervisorDiagnostics.push(diagnostic);
-    if (this.supervisorDiagnostics.length > 100) this.supervisorDiagnostics.shift();
+    this.appendDiagnostic(diagnostic);
     try {
-      this.onError?.({ ...diagnostic });
+      await this.onError?.({ ...diagnostic });
     } catch (callbackError) {
       const callbackFailure = callbackError instanceof Error ? callbackError : new Error(String(callbackError));
-      this.supervisorDiagnostics.push({
+      this.appendDiagnostic({
         occurredAt: new Date(this.now()).toISOString(),
         name: callbackFailure.name,
         message: `Supervisor error callback failed: ${callbackFailure.message}`,
       });
-      if (this.supervisorDiagnostics.length > 100) this.supervisorDiagnostics.shift();
     }
+  }
+
+  private appendDiagnostic(diagnostic: SupervisorDiagnostic): void {
+    this.supervisorDiagnostics.push(diagnostic);
+    if (this.supervisorDiagnostics.length > 100) this.supervisorDiagnostics.shift();
   }
 }

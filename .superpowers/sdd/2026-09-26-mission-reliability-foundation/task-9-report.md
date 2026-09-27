@@ -138,3 +138,29 @@ Addressed both high-severity replay and detached-timer findings with failing reg
 - Replay parity of the per-lineage last-event ordinal when one checkpoint ID is updated after another lineage at the same `createdAt`.
 - Centralized selection precedence: sequence is lineage-local, while cross-lineage chronology uses `createdAt` then durable event ordinal.
 - Detached interval behavior: only typed stale-generation cancellation is ignored; operational failures remain visible through `diagnostics()` and `onError`.
+
+## Fix round 4
+
+Addressed the remaining high-severity detached-callback finding with a failing regression before implementation:
+
+- `MissionSupervisorOptions.onError` now explicitly accepts synchronous or asynchronous handlers. Detached tick failure handling assimilates and awaits the handler result, captures a rejected handler as a second bounded diagnostic, and never invokes the failing handler recursively.
+- The interval regression uses an async-rejecting handler and asserts that no `unhandledRejection` is emitted while diagnostics retain both the original tick failure and the callback failure. Existing synchronous-handler, no-handler stale-cancellation, and generation-fencing coverage remains green.
+
+### Fix-round RED evidence
+
+- `node --test --experimental-strip-types --test-name-pattern='async error callback rejection' test/unit/mission-supervisor.test.ts`
+  - Result before implementation: **0 passed, 1 failed** because `async callback failure` escaped the detached tick failure path.
+
+### Fix-round verification
+
+- Supervisor unit suite: **13 passed, 0 failed**.
+- Expanded Task 9 reliability matrix: **193 passed, 0 failed**.
+- `npm run typecheck`: passed.
+- `npm run lint -- --diagnostic-level=error`: passed; Biome checked 587 files.
+- `npm test`: **2573 passed, 0 failed, 1 skipped** (Postgres integration requires `TEST_DATABASE_URL`).
+- `git diff --check`: passed.
+
+### Fix-round reviewer focus
+
+- Promise assimilation on the detached interval error path and absence of `unhandledRejection` for rejecting async handlers.
+- Callback-failure diagnostics remain bounded and bypass `onError`, preventing a recursive callback-failure loop.
