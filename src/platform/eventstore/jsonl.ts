@@ -32,6 +32,7 @@ import { appendFile, mkdir, readFile, rename, truncate, writeFile } from "node:f
 import { dirname } from "node:path";
 import { emitTelemetry } from "../../telemetry/sink.ts";
 import type { EventStoreBackend, StoredEvent } from "./backend.ts";
+import { ExclusiveFileLock } from "./fileLock.ts";
 
 /** Files held by a live instance in this process, so two cannot diverge silently. */
 const openFiles = new Set<string>();
@@ -43,6 +44,8 @@ export class JsonlEventStore implements EventStoreBackend {
   /** Serializes concurrent appends so writes + in-memory state stay ordered. */
   private appendChain: Promise<void> = Promise.resolve();
   private readonly memoryOnly: boolean;
+  private writerLock: ExclusiveFileLock | null = null;
+  private pendingAppends = 0;
   private closed = false;
 
   private constructor(file: string, memoryOnly: boolean) {
@@ -62,9 +65,16 @@ export class JsonlEventStore implements EventStoreBackend {
       );
     }
     const store = new JsonlEventStore(file, false);
-    await store.load();
-    openFiles.add(file);
-    return store;
+    store.writerLock = await ExclusiveFileLock.acquire(file);
+    try {
+      await store.load();
+      openFiles.add(file);
+      return store;
+    } catch (error) {
+      store.writerLock.release();
+      store.writerLock = null;
+      throw error;
+    }
   }
 
   /** In-memory JSONL-shaped store (no persistence) for tests and ephemeral use. */
@@ -74,8 +84,14 @@ export class JsonlEventStore implements EventStoreBackend {
 
   /** Release the file so another instance may open it. */
   close(): void {
+    if (this.closed) return;
     this.closed = true;
-    if (!this.memoryOnly) openFiles.delete(this.file);
+    if (this.pendingAppends === 0) this.releaseWriterLock();
+  }
+
+  /** True when this backend can prove it owns the local mutation boundary. */
+  ownsWriterLock(): boolean {
+    return this.memoryOnly || (this.writerLock !== null && !this.closed);
   }
 
   private async load(): Promise<void> {
@@ -119,14 +135,17 @@ export class JsonlEventStore implements EventStoreBackend {
     // mutate the entity before the bytes were produced, so what history
     // recorded depended on when the write happened to drain.
     const line = `${JSON.stringify(event)}\n`;
-    const op = this.appendChain.then(async () => {
-      if (!this.memoryOnly) {
-        await mkdir(dirname(this.file), { recursive: true });
-        await appendFile(this.file, line, "utf-8");
-      }
-      this.events.push(event);
-      this.byId.set(event.event_id, event);
-    });
+    this.pendingAppends++;
+    const op = this.appendChain
+      .then(async () => {
+        if (!this.memoryOnly) {
+          await mkdir(dirname(this.file), { recursive: true });
+          await appendFile(this.file, line, "utf-8");
+        }
+        this.events.push(event);
+        this.byId.set(event.event_id, event);
+      })
+      .finally(() => this.appendSettled());
     this.appendChain = op.catch(() => {});
     await op;
     return event;
@@ -144,16 +163,19 @@ export class JsonlEventStore implements EventStoreBackend {
     if (this.closed) throw new Error("JsonlEventStore: appendAll after close");
     if (events.length === 0) return;
     const body = events.map((event) => `${JSON.stringify(event)}\n`).join("");
-    const op = this.appendChain.then(async () => {
-      if (!this.memoryOnly) {
-        await mkdir(dirname(this.file), { recursive: true });
-        await appendFile(this.file, body, "utf-8");
-      }
-      for (const event of events) {
-        this.events.push(event);
-        this.byId.set(event.event_id, event);
-      }
-    });
+    this.pendingAppends++;
+    const op = this.appendChain
+      .then(async () => {
+        if (!this.memoryOnly) {
+          await mkdir(dirname(this.file), { recursive: true });
+          await appendFile(this.file, body, "utf-8");
+        }
+        for (const event of events) {
+          this.events.push(event);
+          this.byId.set(event.event_id, event);
+        }
+      })
+      .finally(() => this.appendSettled());
     this.appendChain = op.catch(() => {});
     await op;
   }
@@ -168,6 +190,18 @@ export class JsonlEventStore implements EventStoreBackend {
 
   count(): number {
     return this.events.length;
+  }
+
+  private appendSettled(): void {
+    this.pendingAppends--;
+    if (this.closed && this.pendingAppends === 0) this.releaseWriterLock();
+  }
+
+  private releaseWriterLock(): void {
+    if (this.memoryOnly) return;
+    openFiles.delete(this.file);
+    this.writerLock?.release();
+    this.writerLock = null;
   }
 }
 

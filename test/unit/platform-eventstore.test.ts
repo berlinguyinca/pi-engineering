@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { appendFile, mkdtemp, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { EventStore } from "../../src/ledger/EventStore.ts";
 import { LedgerEventStoreBackend } from "../../src/platform/eventstore/adapters.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
@@ -16,6 +18,43 @@ const evt = (i: number) => ({
   worker_id: null,
   payload: { i },
 });
+
+const jsonlModule = pathToFileURL(
+  fileURLToPath(new URL("../../src/platform/eventstore/jsonl.ts", import.meta.url)),
+).href;
+
+async function startStoreOwner(file: string) {
+  const script = `
+    import { JsonlEventStore } from ${JSON.stringify(jsonlModule)};
+    const store = await JsonlEventStore.open(${JSON.stringify(file)});
+    process.stdout.write("READY\\n");
+    process.on("message", (message) => {
+      if (message === "close") {
+        store.close();
+        process.exit(0);
+      }
+    });
+  `;
+  const child = spawn(process.execPath, ["--input-type=module", "--eval", script], {
+    stdio: ["ignore", "pipe", "pipe", "ipc"],
+  });
+  await new Promise<void>((resolve, reject) => {
+    let stderr = "";
+    child.stderr!.on("data", (chunk) => {
+      stderr += String(chunk);
+    });
+    child.stdout!.on("data", (chunk) => {
+      if (String(chunk).includes("READY")) resolve();
+    });
+    child.once("exit", (code) => reject(new Error(`store owner exited early (${code}): ${stderr}`)));
+  });
+  return child;
+}
+
+async function waitForExit(child: ReturnType<typeof spawn>): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  await new Promise<void>((resolve) => child.once("exit", () => resolve()));
+}
 
 describe("EventStore backends", () => {
   it("JsonlEventStore in-memory appends and replays in order", async () => {
@@ -48,6 +87,15 @@ describe("EventStore backends", () => {
     s2.close();
   });
 
+  it("creates a missing parent directory before acquiring its writer lock", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pie-store-parent-"));
+    const file = join(dir, "nested", "events.jsonl");
+    const store = await JsonlEventStore.open(file);
+    await store.append(evt(1));
+    store.close();
+    assert.equal((await readFile(file, "utf8")).trim().length > 0, true);
+  });
+
   it("refuses a second instance over one file rather than diverging silently", async () => {
     // Two instances each held their own array and never re-read, so each
     // reported a silently partial history — and every consumer built on `all()`
@@ -60,6 +108,29 @@ describe("EventStore backends", () => {
     const second = await JsonlEventStore.open(file);
     assert.equal(second.count(), 0);
     second.close();
+  });
+
+  it("holds the JSONL writer lock across processes and recovers only after release or verified death", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pie-store-process-lock-"));
+    const file = join(dir, "events.jsonl");
+
+    const cleanOwner = await startStoreOwner(file);
+    try {
+      await assert.rejects(() => JsonlEventStore.open(file), /writer lock.*pid/i);
+    } finally {
+      cleanOwner.send("close");
+      await waitForExit(cleanOwner);
+    }
+
+    const afterCleanRelease = await JsonlEventStore.open(file);
+    afterCleanRelease.close();
+
+    const crashedOwner = await startStoreOwner(file);
+    crashedOwner.kill("SIGKILL");
+    await waitForExit(crashedOwner);
+
+    const afterVerifiedDeath = await JsonlEventStore.open(file);
+    afterVerifiedDeath.close();
   });
 
   it("repairs a torn final record instead of swallowing the next event", async () => {
@@ -102,6 +173,21 @@ describe("EventStore backends", () => {
     const reopened = await JsonlEventStore.open(file);
     const payload = reopened.all()[0]?.payload.run as { status: string };
     assert.equal(payload.status, "PENDING", "history records what was true when the event was appended");
+    reopened.close();
+  });
+
+  it("does not release the writer lock while a queued append is still draining", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pie-store-close-drain-"));
+    const file = join(dir, "events.jsonl");
+    const store = await JsonlEventStore.open(file);
+    const pending = store.append(evt(10));
+    store.close();
+
+    await assert.rejects(() => JsonlEventStore.open(file), /already open|writer lock/i);
+    await pending;
+
+    const reopened = await JsonlEventStore.open(file);
+    assert.ok(reopened.get("evt-10"));
     reopened.close();
   });
 

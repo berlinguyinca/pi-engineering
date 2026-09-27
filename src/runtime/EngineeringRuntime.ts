@@ -30,6 +30,7 @@ import { MissionStore } from "../orchestration/missionStore.ts";
 import { MissionObservability } from "../orchestration/observability/MissionObservability.ts";
 import { Orchestrator } from "../orchestration/orchestrator.ts";
 import type { PlanTaskInput } from "../orchestration/orchestrator.ts";
+import { MissionOwnership } from "../orchestration/ownership.ts";
 import { realBackends } from "../orchestration/realBackends.ts";
 import { RepositoryRegistry } from "../orchestration/repositoryRegistry.ts";
 import { WorkspaceManifestResolver } from "../orchestration/workspaceManifest.ts";
@@ -242,6 +243,7 @@ const openedOrchestrationStores = new Map<string, JsonlEventStore>();
 /** Live mission state owners shared by sequential runtimes for one work dir. */
 const openedMissionStores = new Map<string, MissionStore>();
 const openedMissionObservability = new Map<string, MissionObservability>();
+const openedOrchestrationStoreReferences = new Map<string, number>();
 /** Concurrent same-repository initialization is single-flight. */
 const openingRuntimes = new Map<string, Promise<EngineeringRuntime>>();
 
@@ -355,6 +357,8 @@ export class EngineeringRuntime {
   blackhole: BlackholeManager | null;
   /** Orchestration mission store (spec 00 §3) — durable, restart-recoverable. */
   missionStore: MissionStore | null;
+  /** Durable fenced authority used by orchestration dispatch. */
+  missionOwnership: MissionOwnership | null;
   /** Orchestrator facade (spec 06) — auto-invokes workflows from intent. */
   orchestrator: Orchestrator | null;
   /**
@@ -382,6 +386,8 @@ export class EngineeringRuntime {
   private currentPhaseGoal = "";
   private snapshotPublishPending: Promise<MissionSnapshotFile | null> | null = null;
   private snapshotPublishDirty = false;
+  private orchestrationPath: string | null = null;
+  private closed = false;
 
   /**
    * Serializes git mutations that touch the shared main repo (worktree create,
@@ -530,6 +536,7 @@ export class EngineeringRuntime {
     this.broker = null;
     this.git = null;
     this.missionStore = null;
+    this.missionOwnership = null;
     this.orchestrator = null;
     this.missionObservability = null;
     this.repositoryRegistry = new RepositoryRegistry();
@@ -583,8 +590,16 @@ export class EngineeringRuntime {
       orchestrationBackend = await JsonlEventStore.open(orchestrationPath);
       openedOrchestrationStores.set(orchestrationPath, orchestrationBackend);
     }
+    openedOrchestrationStoreReferences.set(
+      orchestrationPath,
+      (openedOrchestrationStoreReferences.get(orchestrationPath) ?? 0) + 1,
+    );
+    rt.orchestrationPath = orchestrationPath;
     rt.missionStore = openedMissionStores.get(orchestrationPath) ?? MissionStore.open(orchestrationBackend);
     openedMissionStores.set(orchestrationPath, rt.missionStore);
+    rt.missionOwnership = new MissionOwnership(rt.missionStore, {
+      ownerId: `runtime-${process.pid}-${randomUUID()}`,
+    });
     for (const mission of rt.missionStore.listMissions()) {
       const manifest = rt.missionStore.getWorkspaceManifest(mission.mission_id);
       if (manifest) await rt.repositoryRegistry.register(manifest);
@@ -692,6 +707,7 @@ export class EngineeringRuntime {
       workspaceResolver: new WorkspaceManifestResolver(),
       repositoryRegistry: rt.repositoryRegistry,
       launchCwd: opts.cwd,
+      ownership: rt.missionOwnership,
       // Mission-level gateway resilience: a worker transient-infra failure retries
       // within the (env-resolved) time-based window, parking the mission in a
       // WAITING state, and pauses (not fails) on exhaustion. When an operator sets
@@ -732,6 +748,31 @@ export class EngineeringRuntime {
     // A distinct reviewer worker also needs the shared-ledger tools bound.
     if (rt.reviewerWorker instanceof PiWorkerExecutor) rt.reviewerWorker.setCustomTools(tools);
     return rt;
+  }
+
+  /** Release this runtime's share of the orchestration writer lock. Idempotent. */
+  async close(): Promise<void> {
+    if (this.closed) return;
+    this.closed = true;
+    await this.missionStore?.flush();
+    await this.missionObservability?.flush();
+    const path = this.orchestrationPath;
+    if (path) {
+      const references = (openedOrchestrationStoreReferences.get(path) ?? 1) - 1;
+      if (references <= 0) {
+        openedOrchestrationStoreReferences.delete(path);
+        openedMissionObservability.delete(path);
+        openedMissionStores.delete(path);
+        openedOrchestrationStores.get(path)?.close();
+        openedOrchestrationStores.delete(path);
+      } else {
+        openedOrchestrationStoreReferences.set(path, references);
+      }
+    }
+    this.orchestrator = null;
+    this.missionOwnership = null;
+    this.missionObservability = null;
+    this.missionStore = null;
   }
 
   actor(runId: string, role?: WorkerRole): Actor {

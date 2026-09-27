@@ -28,6 +28,7 @@ import type { MissionStore } from "./missionStore.ts";
 import type { MissionObservability } from "./observability/MissionObservability.ts";
 import { computeProgress } from "./observability/progress.ts";
 import type { ActivityType, WaitingReason } from "./observability/types.ts";
+import type { MissionOwnership } from "./ownership.ts";
 import { deriveRequiredGates, mutationFactFromChangedFiles } from "./policies.ts";
 import type { RepositoryRegistry } from "./repositoryRegistry.ts";
 import { brokerKind } from "./scheduler.ts";
@@ -116,6 +117,8 @@ export interface OrchestratorOptions {
   repositoryRegistry?: RepositoryRegistry;
   /** Process launch directory; never assumed to be the requested repository. */
   launchCwd?: string;
+  /** Durable controller authority renewed immediately before worker dispatch. */
+  ownership?: MissionOwnership;
 }
 
 export interface OrchestrateResult {
@@ -155,6 +158,8 @@ export class Orchestrator {
   private readonly workspaceResolver?: WorkspaceManifestResolver;
   private readonly repositoryRegistry?: RepositoryRegistry;
   private readonly launchCwd: string;
+  private readonly ownership?: MissionOwnership;
+  private readonly ownershipByMission = new Map<string, import("./types.ts").MissionLease>();
   private readonly missionRepoIds = new Map<string, string>();
 
   constructor(opts: OrchestratorOptions) {
@@ -231,6 +236,7 @@ export class Orchestrator {
     this.workspaceResolver = opts.workspaceResolver;
     this.repositoryRegistry = opts.repositoryRegistry;
     this.launchCwd = opts.launchCwd ?? ".";
+    this.ownership = opts.ownership;
   }
 
   private repoIdForMission(missionId: string): string | undefined {
@@ -453,6 +459,9 @@ export class Orchestrator {
       workflow_class: intent.suggested_workflow,
       parent_session_id: this.parentSessionId,
     });
+    if (this.ownership) {
+      this.ownershipByMission.set(mission.mission_id, await this.ownership.acquire(mission.mission_id));
+    }
     if (opts.onProgress) this.progress.set(mission.mission_id, opts.onProgress);
     try {
       this.observability?.missionCreated(mission.mission_id, mission.title);
@@ -636,6 +645,7 @@ export class Orchestrator {
       // Schedule + execute.
       this.store.transitionMission(mission.mission_id, "EXECUTING");
       this.phase(this.store.getMission(mission.mission_id)!, "executing");
+      await this.renewMissionOwnership(mission.mission_id);
       await this.scheduler.runMission(mission.mission_id, opts.signal);
 
       if (opts.signal?.aborted) {
@@ -707,6 +717,11 @@ export class Orchestrator {
       return { ...finalized, intent };
     } finally {
       this.progress.delete(mission.mission_id);
+      const identity = this.ownershipByMission.get(mission.mission_id);
+      if (identity && this.ownership) {
+        await this.ownership.release(identity);
+        this.ownershipByMission.delete(mission.mission_id);
+      }
     }
   }
 
@@ -728,13 +743,21 @@ export class Orchestrator {
     if (!opts?.force && !(await this.scheduler.gatewayHealthy(opts?.signal))) {
       return opts?.signal?.aborted ? this.cancelMission(missionId) : mission;
     }
-    this.phase(mission, "executing");
-    this.report(missionId, `[mission ${missionId}] resuming after infrastructure recovery`);
-    await this.scheduler.resumePausedMission(missionId, opts?.signal);
-    const resumed = this.store.getMission(missionId)!;
-    if (resumed.status === "PAUSED_INFRASTRUCTURE") return resumed;
-    if (opts?.signal?.aborted) return this.cancelMission(missionId);
-    return (await this.finalizeMission(missionId, opts?.signal)).mission;
+    if (this.ownership) this.ownershipByMission.set(missionId, await this.ownership.acquire(missionId));
+    try {
+      this.phase(mission, "executing");
+      this.report(missionId, `[mission ${missionId}] resuming after infrastructure recovery`);
+      await this.renewMissionOwnership(missionId);
+      await this.scheduler.resumePausedMission(missionId, opts?.signal);
+      const resumed = this.store.getMission(missionId)!;
+      if (resumed.status === "PAUSED_INFRASTRUCTURE") return resumed;
+      if (opts?.signal?.aborted) return this.cancelMission(missionId);
+      return (await this.finalizeMission(missionId, opts?.signal)).mission;
+    } finally {
+      const identity = this.ownershipByMission.get(missionId);
+      if (identity && this.ownership) await this.ownership.release(identity);
+      this.ownershipByMission.delete(missionId);
+    }
   }
 
   /** Complete the lifecycle after scheduler work settles, whether initial or resumed. */
@@ -1109,6 +1132,7 @@ export class Orchestrator {
     taskId: string,
     extra: { reviewedRecovered?: string[]; signal?: AbortSignal } = {},
   ): Promise<boolean> {
+    await this.renewMissionOwnership(missionId);
     const task = this.store.getTask(taskId)!;
     this.store.transitionTask(taskId, "RUNNING");
     this.report(
@@ -1192,6 +1216,12 @@ export class Orchestrator {
       this.report(missionId, `[mission ${missionId}] ${task.kind}:${task.role} errored`);
       return false;
     }
+  }
+
+  private async renewMissionOwnership(missionId: string): Promise<void> {
+    const identity = this.ownershipByMission.get(missionId);
+    if (!identity || !this.ownership) return;
+    this.ownershipByMission.set(missionId, await this.ownership.renew(identity));
   }
 
   /** Settle a caller-aborted mission without allowing later gate work to run. */

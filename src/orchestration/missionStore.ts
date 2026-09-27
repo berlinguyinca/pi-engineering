@@ -193,6 +193,9 @@ export class MissionStore {
   private readonly evidenceInvalidations = new Map<string, EvidenceInvalidation>();
   private readonly missionLeases = new Map<string, MissionLease>();
   private readonly repositoryLeases = new Map<string, RepositoryLease>();
+  /** Last epochs survive release/expiry so a restarted owner cannot reuse a token. */
+  private readonly missionLeaseEpochs = new Map<string, MissionLease>();
+  private readonly repositoryLeaseEpochs = new Map<string, RepositoryLease>();
   private readonly missionResumptions: MissionResumption[] = [];
   private readonly missionStops: MissionStop[] = [];
   private readonly persistenceErrors: MissionPersistenceDiagnostic[] = [];
@@ -458,15 +461,16 @@ export class MissionStore {
         if (scope === "mission") {
           const lease = e.payload.lease as MissionLease;
           if (lease) {
+            this.missionLeaseEpochs.set(lease.missionId, { ...lease });
             if (transition === "expired" || transition === "fenced") this.missionLeases.delete(lease.missionId);
             else this.missionLeases.set(lease.missionId, { ...lease });
           }
         } else if (scope === "repository") {
           const lease = e.payload.lease as RepositoryLease;
           if (lease) {
-            const key = repositoryLeaseKey(lease.missionId, lease.repoId);
-            if (transition === "expired" || transition === "fenced") this.repositoryLeases.delete(key);
-            else this.repositoryLeases.set(key, { ...lease });
+            this.repositoryLeaseEpochs.set(lease.repoId, { ...lease });
+            if (transition === "expired" || transition === "fenced") this.repositoryLeases.delete(lease.repoId);
+            else this.repositoryLeases.set(lease.repoId, { ...lease });
           }
         }
         break;
@@ -1055,6 +1059,11 @@ export class MissionStore {
     return lease ? { ...lease } : undefined;
   }
 
+  getLatestMissionLease(missionId: string): MissionLease | undefined {
+    const lease = this.missionLeaseEpochs.get(missionId);
+    return lease ? { ...lease } : undefined;
+  }
+
   transitionRepositoryLease(transition: LeaseTransition, lease: RepositoryLease): RepositoryLease {
     this.applyLeaseTransition(transition, "repository", lease);
     return { ...lease };
@@ -1067,8 +1076,24 @@ export class MissionStore {
   }
 
   getRepositoryLease(missionId: string, repoId: string): RepositoryLease | undefined {
-    const lease = this.repositoryLeases.get(repositoryLeaseKey(missionId, repoId));
+    const lease = this.repositoryLeases.get(repoId);
+    return lease?.missionId === missionId ? { ...lease } : undefined;
+  }
+
+  getRepositoryLeaseByRepoId(repoId: string): RepositoryLease | undefined {
+    const lease = this.repositoryLeases.get(repoId);
     return lease ? { ...lease } : undefined;
+  }
+
+  getLatestRepositoryLease(repoId: string): RepositoryLease | undefined {
+    const lease = this.repositoryLeaseEpochs.get(repoId);
+    return lease ? { ...lease } : undefined;
+  }
+
+  /** Local takeover is permitted only while this process owns the JSONL writer boundary. */
+  hasExclusiveWriterAuthority(): boolean {
+    const backend = this.backend as EventStoreBackend & { ownsWriterLock?: () => boolean };
+    return backend.ownsWriterLock?.() ?? true;
   }
 
   private applyLeaseTransition(
@@ -1078,13 +1103,14 @@ export class MissionStore {
   ): void {
     if (!this.missions.has(lease.missionId)) throw new Error(`unknown mission ${lease.missionId}`);
     if (scope === "mission") {
+      this.missionLeaseEpochs.set(lease.missionId, { ...lease });
       if (transition === "expired" || transition === "fenced") this.missionLeases.delete(lease.missionId);
       else this.missionLeases.set(lease.missionId, { ...lease });
     } else {
       const repositoryLease = lease as RepositoryLease;
-      const key = repositoryLeaseKey(repositoryLease.missionId, repositoryLease.repoId);
-      if (transition === "expired" || transition === "fenced") this.repositoryLeases.delete(key);
-      else this.repositoryLeases.set(key, { ...repositoryLease });
+      this.repositoryLeaseEpochs.set(repositoryLease.repoId, { ...repositoryLease });
+      if (transition === "expired" || transition === "fenced") this.repositoryLeases.delete(repositoryLease.repoId);
+      else this.repositoryLeases.set(repositoryLease.repoId, { ...repositoryLease });
     }
     this.emit(`lease.${transition}`, lease.missionId, { actor: "system", scope, lease });
   }
@@ -1214,10 +1240,6 @@ function copyMissionStop(stop: MissionStop): MissionStop {
     preservedWork: [...stop.preservedWork],
     attemptedRecoveries: [...stop.attemptedRecoveries],
   };
-}
-
-function repositoryLeaseKey(missionId: string, repoId: string): string {
-  return `${missionId}\u0000${repoId}`;
 }
 
 function validateMissionUpdatePatch(patch: MissionUpdatePatch): MissionUpdatePatch {
