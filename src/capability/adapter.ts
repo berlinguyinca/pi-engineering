@@ -14,6 +14,7 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
+import { normalizeAgentDir } from "../core/piAgentDir.ts";
 import { type LoadPolicyOptions, loadPolicy } from "../lifecycle/policy.ts";
 import type { ModelRef, RoutingDecision } from "../lifecycle/types.ts";
 import { registerLocalProviders } from "../workers/localProviders.ts";
@@ -50,7 +51,9 @@ export interface RoleRouterAdapter {
  * start any lifecycle or auto-invoke any work.
  */
 export async function createRoleRouter(opts: RouteAdapterOptions): Promise<RoleRouterAdapter> {
-  const agentDir = opts.agentDir ?? process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
+  const agentDir = normalizeAgentDir(
+    opts.agentDir ?? process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent"),
+  );
   const policy = (await loadPolicy(opts.policy ?? { cwd: opts.cwd, agentDir })).policy;
 
   let runtime = opts.modelRuntime;

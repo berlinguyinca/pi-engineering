@@ -1,7 +1,8 @@
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, join, matchesGlob, relative, resolve } from "node:path";
+import { basename, join, matchesGlob, relative } from "node:path";
 import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
+import { normalizeAgentDir } from "../core/piAgentDir.ts";
 import type { AdmissionRetryConfig } from "../inference/admissionConfig.ts";
 import type { AdmissionEventBus } from "../inference/admissionEvents.ts";
 import {
@@ -193,12 +194,6 @@ async function isInteractiveProviderExtensionDisabled(agentDir: string): Promise
   return !enabled;
 }
 
-function expandHomePath(path: string): string {
-  if (path === "~") return homedir();
-  if (path.startsWith("~/")) return resolve(homedir(), path.slice(2));
-  return resolve(path);
-}
-
 export async function readNodeSpecs(): Promise<NodeSpec[]> {
   try {
     const raw = await readFile(nodesFilePath(), "utf-8");
@@ -265,7 +260,9 @@ export async function registerLocalProviders(
     agentDir?: string;
   },
 ): Promise<string[]> {
-  const agentDir = expandHomePath(opts?.agentDir ?? process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent"));
+  const agentDir = normalizeAgentDir(
+    opts?.agentDir ?? process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent"),
+  );
   if (await isInteractiveProviderExtensionDisabled(agentDir)) return [];
   const specs = await readNodeSpecs();
   const verdicts = opts?.verdicts ?? (await readCapabilityVerdicts());

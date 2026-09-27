@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { test } from "node:test";
 import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
+import { normalizeAgentDir } from "../../src/core/piAgentDir.ts";
 import { PiWorkerExecutor } from "../../src/workers/PiWorkerExecutor.ts";
 import {
   DEFAULT_MAX_TOKENS,
@@ -73,6 +74,11 @@ const nodeWith = (models: unknown[]) => ({
       models,
     },
   ],
+});
+
+test("normalizeAgentDir expands both Pi-supported tilde separator forms", () => {
+  assert.equal(normalizeAgentDir("~/.pi/agent"), join(process.env.HOME ?? "", ".pi", "agent"));
+  assert.equal(normalizeAgentDir("~\\.pi\\agent"), join(process.env.HOME ?? "", ".pi", "agent"));
 });
 
 test("partition: a model probed unable to call tools is held out", () => {
@@ -171,6 +177,23 @@ test("register: a Pi-disabled qwen-turing extension is not mirrored into workers
       const { registered, runtime } = fakeRuntime();
       await registerLocalProviders(runtime, { verdicts: {}, agentDir: "~/.pi/agent" });
       assert.equal(registered.length, 0, "workers must honor the same extension exclusion as interactive Pi");
+    });
+  });
+});
+
+test("register: a backslash tilde profile finds Pi's disabled extension settings", async () => {
+  await withNodesFile(nodeWith([{ id: "windows-profile-model" }]), async (homeDir) => {
+    const agentDir = join(homeDir, ".pi", "agent");
+    await mkdir(agentDir, { recursive: true });
+    await writeFile(
+      join(agentDir, "settings.json"),
+      JSON.stringify({ extensions: ["-extensions/qwen-turing.ts"] }),
+      "utf-8",
+    );
+    await withEnv("HOME", homeDir, async () => {
+      const { registered, runtime } = fakeRuntime();
+      await registerLocalProviders(runtime, { verdicts: {}, agentDir: "~\\.pi\\agent" });
+      assert.equal(registered.length, 0);
     });
   });
 });
