@@ -42,6 +42,24 @@ const EMPTY_SNAPSHOT: CheckpointSnapshot = {
   preservedUncommittedChanges: [],
 };
 
+/** Select one current checkpoint per task from durable event order. */
+export function latestTaskCheckpoints(checkpoints: readonly TaskCheckpoint[]): TaskCheckpoint[] {
+  const latestByTask = new Map<string, TaskCheckpoint>();
+  for (const checkpoint of checkpoints) {
+    const current = latestByTask.get(checkpoint.taskId);
+    if (!current || checkpointSupersedes(checkpoint, current)) latestByTask.set(checkpoint.taskId, checkpoint);
+  }
+  return [...latestByTask.values()];
+}
+
+function checkpointSupersedes(candidate: TaskCheckpoint, current: TaskCheckpoint): boolean {
+  if (candidate.checkpointId === current.checkpointId && candidate.sequence !== current.sequence) {
+    return candidate.sequence > current.sequence;
+  }
+  const chronology = candidate.createdAt.localeCompare(current.createdAt);
+  return chronology >= 0;
+}
+
 /** Persists recoverable work only. It never changes task or acceptance status. */
 export class CheckpointManager {
   private readonly store: MissionStore;
@@ -179,10 +197,11 @@ export class CheckpointManager {
   }
 
   private latest(taskId: string, checkpointId?: string): TaskCheckpoint | undefined {
-    return this.store
-      .listTaskCheckpoints(undefined, taskId)
-      .filter((checkpoint) => (checkpointId ? checkpoint.checkpointId === checkpointId : true))
-      .sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.sequence - a.sequence)[0];
+    return latestTaskCheckpoints(
+      this.store
+        .listTaskCheckpoints(undefined, taskId)
+        .filter((checkpoint) => (checkpointId ? checkpoint.checkpointId === checkpointId : true)),
+    )[0];
   }
 }
 

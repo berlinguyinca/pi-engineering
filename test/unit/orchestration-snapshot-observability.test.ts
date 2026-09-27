@@ -6,12 +6,14 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { latestTaskCheckpoints } from "../../src/orchestration/checkpoints.ts";
 import {
   MISSION_SNAPSHOT_CONTRACT_VERSION,
   buildMissionSnapshotFile,
 } from "../../src/orchestration/missionSnapshot.ts";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
 import { MissionObservability } from "../../src/orchestration/observability/MissionObservability.ts";
+import type { TaskCheckpoint } from "../../src/orchestration/types.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 
 function mission(store: MissionStore, title: string) {
@@ -25,6 +27,66 @@ function mission(store: MissionStore, title: string) {
     workflow_class: "engineering",
   });
 }
+
+function checkpoint(overrides: Partial<TaskCheckpoint> & Pick<TaskCheckpoint, "checkpointId">): TaskCheckpoint {
+  return {
+    executionId: "EXE-default",
+    missionId: "MSN-checkpoints",
+    taskId: "TSK-checkpoints",
+    repoId: "repo-1",
+    baseSha: "base",
+    candidateSha: null,
+    branch: null,
+    worktree: null,
+    committedChanges: [],
+    preservedUncommittedChanges: [],
+    completedDeliverables: [],
+    remainingDeliverables: [],
+    acceptanceIds: [],
+    validationEvidenceRefs: [],
+    artifactRefs: [],
+    artifactHashes: [],
+    workerId: null,
+    sessionId: null,
+    model: null,
+    sequence: 1,
+    missionGeneration: 0,
+    candidateGeneration: 0,
+    fencingToken: 0,
+    createdAt: "2026-09-27T12:00:00.000Z",
+    ...overrides,
+  };
+}
+
+test("latest checkpoints use cross-execution chronology and durable order instead of unrelated sequence", () => {
+  const oldExecution = checkpoint({
+    checkpointId: "CHK-old-execution",
+    executionId: "EXE-old",
+    sequence: 5,
+    createdAt: "2026-09-27T12:00:00.000Z",
+  });
+  const recoveryExecution = checkpoint({
+    checkpointId: "CHK-recovery",
+    executionId: "EXE-recovery",
+    sequence: 1,
+    createdAt: "2026-09-27T12:01:00.000Z",
+  });
+  assert.equal(latestTaskCheckpoints([oldExecution, recoveryExecution])[0]?.checkpointId, "CHK-recovery");
+
+  const sameTimeLaterEvent = checkpoint({
+    checkpointId: "CHK-same-time-later-event",
+    executionId: "EXE-later",
+    sequence: 0,
+    createdAt: recoveryExecution.createdAt,
+  });
+  const durableOrder = [oldExecution, recoveryExecution, sameTimeLaterEvent];
+  assert.equal(latestTaskCheckpoints(durableOrder)[0]?.checkpointId, "CHK-same-time-later-event");
+  assert.equal(
+    latestTaskCheckpoints(structuredClone(durableOrder))[0]?.checkpointId,
+    "CHK-same-time-later-event",
+    "replay of the same durable event order selects the same checkpoint",
+  );
+});
 
 test("snapshot contract remains additive after the reliability bump", async () => {
   assert.equal(MISSION_SNAPSHOT_CONTRACT_VERSION, 3);

@@ -1,3 +1,4 @@
+import { latestTaskCheckpoints } from "./checkpoints.ts";
 import type { MissionStore } from "./missionStore.ts";
 import type { MissionObservability } from "./observability/MissionObservability.ts";
 import { FailureClassifier, RecoveryPlanner } from "./recovery.ts";
@@ -82,9 +83,17 @@ export class MissionSupervisor {
   }
 
   async reconcileOnStartup(beforeDispatch?: () => void | Promise<void>): Promise<SupervisorStatus[]> {
+    const expectedGenerations = new Map(
+      this.store
+        .listMissions((mission) => !TERMINAL.has(mission.status))
+        .map((mission) => [mission.mission_id, this.currentResumptionGeneration(mission.mission_id)] as const),
+    );
     const statuses = await this.tick();
+    this.assertExpectedGenerations(expectedGenerations);
     await this.store.flush();
+    this.assertExpectedGenerations(expectedGenerations);
     await beforeDispatch?.();
+    this.assertExpectedGenerations(expectedGenerations);
     return statuses;
   }
 
@@ -93,38 +102,61 @@ export class MissionSupervisor {
   }
 
   private async runTick(missionId?: string): Promise<SupervisorStatus[]> {
-    const missions = this.store
+    const flights = this.store
       .listMissions((mission) => !TERMINAL.has(mission.status))
-      .filter((mission) => (missionId ? mission.mission_id === missionId : true));
-    const statuses = await Promise.all(missions.map((mission) => this.reconcileFlight(mission)));
+      .filter((mission) => (missionId ? mission.mission_id === missionId : true))
+      .map((mission) => ({
+        mission,
+        expectedResumptionGeneration: this.currentResumptionGeneration(mission.mission_id),
+      }));
+    const statuses = await Promise.all(
+      flights.map(({ mission, expectedResumptionGeneration }) =>
+        this.reconcileFlight(mission, expectedResumptionGeneration),
+      ),
+    );
+    for (const { mission, expectedResumptionGeneration } of flights) {
+      this.assertResumptionGeneration(mission.mission_id, expectedResumptionGeneration);
+    }
     await this.store.flush();
+    for (const { mission, expectedResumptionGeneration } of flights) {
+      this.assertResumptionGeneration(mission.mission_id, expectedResumptionGeneration);
+    }
     return statuses;
   }
 
-  private reconcileFlight(mission: Mission): Promise<SupervisorStatus> {
-    const existing = this.missionTicks.get(mission.mission_id);
+  private reconcileFlight(mission: Mission, expectedResumptionGeneration: number): Promise<SupervisorStatus> {
+    const flightKey = `${mission.mission_id}\u0000${expectedResumptionGeneration}`;
+    const existing = this.missionTicks.get(flightKey);
     if (existing) return existing;
-    const flight = this.reconcile(mission).finally(() => {
-      if (this.missionTicks.get(mission.mission_id) === flight) this.missionTicks.delete(mission.mission_id);
+    const flight = this.reconcile(mission, expectedResumptionGeneration).finally(() => {
+      if (this.missionTicks.get(flightKey) === flight) this.missionTicks.delete(flightKey);
     });
-    this.missionTicks.set(mission.mission_id, flight);
+    this.missionTicks.set(flightKey, flight);
     return flight;
   }
 
-  private async reconcile(mission: Mission): Promise<SupervisorStatus> {
-    const currentResumption = this.store.listMissionResumptions(mission.mission_id).at(-1)?.generation ?? 0;
+  private async reconcile(mission: Mission, expectedResumptionGeneration: number): Promise<SupervisorStatus> {
+    this.assertResumptionGeneration(mission.mission_id, expectedResumptionGeneration);
     const currentStop = this.store
       .listMissionStops(mission.mission_id)
-      .filter((stop) => stop.resumptionGeneration === currentResumption)
+      .filter((stop) => stop.resumptionGeneration === expectedResumptionGeneration)
       .at(-1);
-    if (currentStop) return this.statusForStop(mission, currentStop.reason, currentStop.resumeCondition);
+    if (currentStop) {
+      this.assertResumptionGeneration(mission.mission_id, expectedResumptionGeneration);
+      return this.statusForStop(mission, currentStop.reason, currentStop.resumeCondition, expectedResumptionGeneration);
+    }
 
     const diagnosis = this.diagnose(mission);
-    if (!diagnosis) return this.status(mission, "HEALTHY", "Mission has current ownership or a named future wait");
+    if (!diagnosis) {
+      this.assertResumptionGeneration(mission.mission_id, expectedResumptionGeneration);
+      return this.status(mission, "HEALTHY", "Mission has current ownership or a named future wait");
+    }
 
+    this.assertResumptionGeneration(mission.mission_id, expectedResumptionGeneration);
     if (diagnosis.health === "DEADLOCKED" && mission.status !== "BLOCKED") {
       if (canTransitionMission(mission.status, "BLOCKED")) this.store.transitionMission(mission.mission_id, "BLOCKED");
     }
+    this.assertResumptionGeneration(mission.mission_id, expectedResumptionGeneration);
     const classification = this.classifier.classify({
       missionId: mission.mission_id,
       taskId: diagnosis.task?.task_id ?? null,
@@ -138,25 +170,29 @@ export class MissionSupervisor {
         .listFailureClassifications(mission.mission_id)
         .find((existing) => existing.fingerprint === classification.fingerprint) ??
       this.store.classifyFailure(classification);
+    this.assertResumptionGeneration(mission.mission_id, expectedResumptionGeneration);
     const history = this.store.listRecoveryDecisions(mission.mission_id);
     let decision = history.find(
       (candidate) =>
         candidate.classificationId === durableClassification.classificationId &&
-        (candidate.resumptionGeneration ?? 0) === currentResumption &&
+        (candidate.resumptionGeneration ?? 0) === expectedResumptionGeneration &&
         (candidate.status === "planned" || candidate.status === "started"),
     );
     if (!decision) {
+      this.assertResumptionGeneration(mission.mission_id, expectedResumptionGeneration);
       decision = this.store.planRecovery(
         this.planner.decide({
           classification: durableClassification,
           history,
           now: this.now(),
-          resumptionGeneration: currentResumption,
+          resumptionGeneration: expectedResumptionGeneration,
         }),
       );
       if (decision.action === "STOP") {
+        this.assertResumptionGeneration(mission.mission_id, expectedResumptionGeneration);
         const exhausted = this.store.transitionRecovery(decision.recoveryId, "exhausted");
         const preservedWork = this.preservedWork(mission.mission_id);
+        this.assertResumptionGeneration(mission.mission_id, expectedResumptionGeneration);
         this.store.stopMission(mission.mission_id, {
           reason: diagnosis.reason,
           preservedWork,
@@ -167,17 +203,19 @@ export class MissionSupervisor {
       }
     }
     await this.store.flush();
+    this.assertResumptionGeneration(mission.mission_id, expectedResumptionGeneration);
     const result = this.status(mission, diagnosis.health, diagnosis.reason, diagnosis.task, decision);
     const stop = this.store
       .listMissionStops(mission.mission_id)
-      .filter((candidate) => candidate.resumptionGeneration === currentResumption)
+      .filter((candidate) => candidate.resumptionGeneration === expectedResumptionGeneration)
       .at(-1);
+    this.assertResumptionGeneration(mission.mission_id, expectedResumptionGeneration);
     return stop
       ? {
           ...result,
           action: "STOP",
           nextAction: stop.resumeCondition,
-          preservedWork: [...stop.preservedWork],
+          preservedWork: this.preservedWork(mission.mission_id),
         }
       : result;
   }
@@ -296,22 +334,26 @@ export class MissionSupervisor {
     };
   }
 
-  private statusForStop(mission: Mission, reason: string, resumeCondition: string): SupervisorStatus {
-    const decision = this.store.listRecoveryDecisions(mission.mission_id).at(-1);
+  private statusForStop(
+    mission: Mission,
+    reason: string,
+    resumeCondition: string,
+    expectedResumptionGeneration: number,
+  ): SupervisorStatus {
+    const decision = this.store
+      .listRecoveryDecisions(mission.mission_id)
+      .filter((candidate) => (candidate.resumptionGeneration ?? 0) === expectedResumptionGeneration)
+      .at(-1);
     const status = this.status(mission, "ACTIONABLE_STOP", reason, undefined, decision);
     return { ...status, action: "STOP", nextAction: resumeCondition };
   }
 
   private preservedWork(missionId: string): string[] {
-    const currentCheckpoints = new Map<string, ReturnType<MissionStore["listTaskCheckpoints"]>[number]>();
-    for (const checkpoint of this.store.listTaskCheckpoints(missionId)) {
-      const current = currentCheckpoints.get(checkpoint.taskId);
-      if (!current || checkpoint.sequence > current.sequence) currentCheckpoints.set(checkpoint.taskId, checkpoint);
-    }
+    const currentCheckpoints = latestTaskCheckpoints(this.store.listTaskCheckpoints(missionId));
     return [
       ...new Set(
         [
-          ...[...currentCheckpoints.values()].flatMap((checkpoint) => [
+          ...currentCheckpoints.flatMap((checkpoint) => [
             checkpoint.worktree,
             checkpoint.branch,
             checkpoint.candidateSha,
@@ -323,5 +365,20 @@ export class MissionSupervisor {
         ].filter((value): value is string => typeof value === "string" && value.trim().length > 0),
       ),
     ];
+  }
+
+  private currentResumptionGeneration(missionId: string): number {
+    return this.store.listMissionResumptions(missionId).at(-1)?.generation ?? 0;
+  }
+
+  private assertExpectedGenerations(expected: ReadonlyMap<string, number>): void {
+    for (const [missionId, generation] of expected) this.assertResumptionGeneration(missionId, generation);
+  }
+
+  private assertResumptionGeneration(missionId: string, expected: number): void {
+    const current = this.currentResumptionGeneration(missionId);
+    if (current !== expected) {
+      throw new Error(`stale supervisor resumption for ${missionId}: expected ${expected}, current ${current}`);
+    }
   }
 }

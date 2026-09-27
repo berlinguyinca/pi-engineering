@@ -289,4 +289,52 @@ describe("MissionSupervisor", () => {
       [second.mission_id],
     );
   });
+
+  it("does not let a startup tick for a new resumption reuse an in-flight stale decision", async () => {
+    const h = harness();
+    const task = h.store.createTask({
+      mission_id: h.mission.mission_id,
+      kind: "agent",
+      role: "implementer",
+      objective: "generation-scoped work",
+    });
+    h.store.transitionTask(task.task_id, "READY");
+    const originalFlush = h.store.flush.bind(h.store);
+    let releaseFirst!: () => void;
+    let firstEntered!: () => void;
+    const firstBlocked = new Promise<void>((resolve) => {
+      firstEntered = resolve;
+    });
+    const gate = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    let flushes = 0;
+    h.store.flush = async () => {
+      if (flushes++ === 0) {
+        firstEntered();
+        await gate;
+      }
+      await originalFlush();
+    };
+
+    const stale = h.supervisor.tick(h.mission.mission_id);
+    await firstBlocked;
+    h.store.resumeMission(h.mission.mission_id, "new supervisor generation");
+    let dispatched = 0;
+    const current = h.supervisor.reconcileOnStartup(() => {
+      dispatched++;
+    });
+    releaseFirst();
+
+    await assert.rejects(stale, /stale supervisor resumption/i);
+    const [currentStatus] = await current;
+    assert.equal(dispatched, 1);
+    assert.equal(currentStatus?.decision?.resumptionGeneration, 1);
+    const decisions = h.store.listRecoveryDecisions(h.mission.mission_id);
+    assert.deepEqual(
+      decisions.map((decision) => decision.resumptionGeneration),
+      [0, 1],
+    );
+    assert.notEqual(decisions[0]?.recoveryId, decisions[1]?.recoveryId);
+  });
 });

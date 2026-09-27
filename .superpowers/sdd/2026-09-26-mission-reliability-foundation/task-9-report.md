@@ -86,3 +86,29 @@ Addressed all six review findings with failing regressions before implementation
 - Resumption races before finalization versus reentrant observers after a successful completion CAS.
 - Per-mission supervisor flight cleanup when full and targeted ticks overlap.
 - Whether latest-per-task checkpoint selection and cross-generation stop refs expose all recoverable work without reviving stale checkpoint versions.
+
+## Fix round 2
+
+Addressed both high-severity follow-up findings with failing regressions before implementation:
+
+- Supervisor flights are keyed by mission ID and captured resumption generation. `reconcile`, full ticks, and startup reconciliation validate that generation after every await and immediately before state-changing actions or return. An overlapping generation-0 targeted tick and generation-1 startup reconciliation now create distinct decisions; the stale flight rejects and cannot dispatch or return its prior generation's result.
+- Latest checkpoint selection is centralized in `latestTaskCheckpoints` and reused by `CheckpointManager`, `MissionSupervisor`, and `MissionObservability`. Sequence is compared only within one checkpoint ID/lineage. Across recovery executions, `createdAt` determines chronology and later durable event order deterministically breaks timestamp ties, so a newer recovery checkpoint at sequence 1 supersedes an older execution checkpoint at sequence 5.
+
+### Fix-round RED evidence
+
+- `node --test test/unit/mission-supervisor.test.ts test/unit/orchestration-snapshot-observability.test.ts`
+  - Result before implementation: the generation-1 startup joined the stale generation-0 flight, and the checkpoint chronology helper was absent.
+
+### Fix-round verification
+
+- Expanded focused reliability/checkpoint matrix (`task-9-fix2-focused.log`): **197 passed, 0 failed**.
+- `npm run typecheck` (`task-9-fix2-typecheck.log`): passed.
+- `npm run lint` (`task-9-fix2-lint.log`): passed; Biome checked 587 files.
+- `npm test` (`task-9-fix2-full-suite.log`): **2569 passed, 0 failed, 1 skipped** (Postgres integration requires `TEST_DATABASE_URL`).
+- `git diff --check`: passed.
+
+### Fix-round reviewer focus
+
+- Generation checks surrounding `MissionStore.flush()` and the startup `beforeDispatch` callback.
+- Cleanup and coexistence of overlapping per-generation supervisor flight keys.
+- Checkpoint ordering when different lineages share an identical `createdAt`; later durable event order is the replay-stable tie-breaker.

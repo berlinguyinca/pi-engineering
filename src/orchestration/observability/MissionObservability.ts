@@ -19,6 +19,7 @@
 
 import { id } from "../../core/ids.ts";
 import type { EventStoreBackend, StoredEvent } from "../../platform/eventstore/backend.ts";
+import { latestTaskCheckpoints } from "../checkpoints.ts";
 import { hashCandidateEvidenceIdentity } from "../evidence.ts";
 import type { MissionPersistenceDiagnostic, MissionStore } from "../missionStore.ts";
 import {
@@ -1274,15 +1275,11 @@ export class MissionObservability {
   }
 
   private preservedWork(missionId: string): string[] {
-    const currentCheckpoints = new Map<string, ReturnType<MissionStore["listTaskCheckpoints"]>[number]>();
-    for (const checkpoint of this.store.listTaskCheckpoints(missionId)) {
-      const current = currentCheckpoints.get(checkpoint.taskId);
-      if (!current || checkpoint.sequence > current.sequence) currentCheckpoints.set(checkpoint.taskId, checkpoint);
-    }
+    const currentCheckpoints = latestTaskCheckpoints(this.store.listTaskCheckpoints(missionId));
     return [
       ...new Set(
         [
-          ...[...currentCheckpoints.values()].flatMap((checkpoint) => [
+          ...currentCheckpoints.flatMap((checkpoint) => [
             checkpoint.worktree,
             checkpoint.branch,
             checkpoint.candidateSha,
