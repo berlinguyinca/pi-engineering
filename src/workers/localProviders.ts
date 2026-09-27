@@ -141,6 +141,26 @@ export function nodesFilePath(): string {
   return join(homedir(), ".pi", "agent", "qwen-nodes.json");
 }
 
+async function isInteractiveProviderExtensionDisabled(agentDir: string): Promise<boolean> {
+  try {
+    const parsed = JSON.parse(await readFile(join(agentDir, "settings.json"), "utf-8")) as {
+      extensions?: unknown[];
+    };
+    return (parsed.extensions ?? []).some(
+      (entry) =>
+        typeof entry === "string" && (entry === "-extensions/qwen-turing.ts" || entry === "!extensions/qwen-turing.ts"),
+    );
+  } catch {
+    return false;
+  }
+}
+
+function expandHomePath(path: string): string {
+  if (path === "~") return homedir();
+  if (path.startsWith("~/")) return join(homedir(), path.slice(2));
+  return path;
+}
+
 export async function readNodeSpecs(): Promise<NodeSpec[]> {
   try {
     const raw = await readFile(nodesFilePath(), "utf-8");
@@ -204,8 +224,11 @@ export async function registerLocalProviders(
     verdicts?: Record<string, boolean>;
     allowNoTools?: boolean;
     admission?: LocalAdmissionOptions;
+    agentDir?: string;
   },
 ): Promise<string[]> {
+  const agentDir = expandHomePath(opts?.agentDir ?? process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent"));
+  if (await isInteractiveProviderExtensionDisabled(agentDir)) return [];
   const specs = await readNodeSpecs();
   const verdicts = opts?.verdicts ?? (await readCapabilityVerdicts());
   const allowNoTools = opts?.allowNoTools === true || process.env.QWEN_ALLOW_NO_TOOLS === "1";

@@ -61,7 +61,7 @@ export async function createRoleRouter(opts: RouteAdapterOptions): Promise<RoleR
       allowModelNetwork: opts.allowModelNetwork ?? false,
     });
   }
-  await registerLocalProviders(runtime).catch(() => {});
+  await registerLocalProviders(runtime, { agentDir }).catch(() => {});
 
   const context = { cwd: opts.cwd, agentDir };
   const sources = [new PiModelRuntimeSource(runtime), new AgentModelsFileSource()];

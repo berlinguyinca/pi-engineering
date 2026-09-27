@@ -247,7 +247,7 @@ export class PiWorkerExecutor implements WorkerExecutor {
         modelsPath: joinExpand(this.agentDir, "models.json"),
         allowModelNetwork: this.allowModelNetwork,
       });
-      await registerLocalProviders(rt).catch(() => {});
+      await registerLocalProviders(rt, { agentDir: this.agentDir }).catch(() => {});
       guardRuntimeRequestBody(rt, this.requestBodyBudget, this.thinkingPolicy);
       return rt;
     })();

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -31,17 +31,21 @@ function onlyConfig(registered: Array<{ id: string; config: any }>): any {
 }
 
 /** Run `fn` with QWEN_NODES_FILE pointing at a temp file holding `nodes`. */
-async function withNodesFile(nodes: unknown, fn: () => Promise<void>): Promise<void> {
+async function withNodesFile(nodes: unknown, fn: (dir: string) => Promise<void>): Promise<void> {
   const dir = await mkdtemp(join(tmpdir(), "localproviders-"));
   const path = join(dir, "qwen-nodes.json");
   await writeFile(path, JSON.stringify(nodes), "utf-8");
   const prior = process.env.QWEN_NODES_FILE;
+  const priorAgentDir = process.env.PI_CODING_AGENT_DIR;
   process.env.QWEN_NODES_FILE = path;
+  process.env.PI_CODING_AGENT_DIR = dir;
   try {
-    await fn();
+    await fn(dir);
   } finally {
     if (prior === undefined) delete process.env.QWEN_NODES_FILE;
     else process.env.QWEN_NODES_FILE = prior;
+    if (priorAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = priorAgentDir;
     await rm(dir, { recursive: true, force: true });
   }
 }
@@ -151,6 +155,23 @@ test("register: a tool-incapable model is never registered on a worker", async (
       assert.deepEqual(ids, ["working-model"]);
     },
   );
+});
+
+test("register: a Pi-disabled qwen-turing extension is not mirrored into workers", async () => {
+  await withNodesFile(nodeWith([{ id: "disabled-model" }]), async (homeDir) => {
+    const agentDir = join(homeDir, ".pi", "agent");
+    await mkdir(agentDir, { recursive: true });
+    await writeFile(
+      join(agentDir, "settings.json"),
+      JSON.stringify({ extensions: ["-extensions/qwen-turing.ts"] }),
+      "utf-8",
+    );
+    await withEnv("HOME", homeDir, async () => {
+      const { registered, runtime } = fakeRuntime();
+      await registerLocalProviders(runtime, { verdicts: {}, agentDir: "~/.pi/agent" });
+      assert.equal(registered.length, 0, "workers must honor the same extension exclusion as interactive Pi");
+    });
+  });
 });
 
 test("register: a verdict held in the capability files is honoured too", async () => {

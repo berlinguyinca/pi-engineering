@@ -59,7 +59,7 @@ export function createSummarize(opts: SummarizeOptions = {}): (prompt: string) =
         modelsPath: joinExpand(agentDir, "models.json"),
         allowModelNetwork: opts.allowModelNetwork ?? false,
       });
-      await registerLocalProviders(runtime).catch(() => {});
+      await registerLocalProviders(runtime, { agentDir }).catch(() => {});
       return runtime as unknown as SummarizeRuntime;
     })();
     return runtimePromise;
