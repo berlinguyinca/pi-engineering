@@ -94,6 +94,55 @@ export type OrchestrationEventType =
   | "mission.resumed"
   | "mission.stopped";
 
+const ORCHESTRATION_EVENT_TYPES: ReadonlySet<string> = new Set<OrchestrationEventType>([
+  "mission.created",
+  "mission.updated",
+  "mission.completed",
+  "mission.failed",
+  "task.created",
+  "task.ready",
+  "task.started",
+  "task.completed",
+  "task.failed",
+  "task.retried",
+  "task.canceled",
+  "task.steered",
+  "task.authority_assigned",
+  "execution.created",
+  "execution.started",
+  "execution.completed",
+  "execution.failed",
+  "execution.canceled",
+  "finding.created",
+  "finding.resolved",
+  "workspace.authorized",
+  "workspace.rebound",
+  "workspace.rebind_failed",
+  "task.checkpointed",
+  "task.split",
+  "task.superseded",
+  "failure.classified",
+  "recovery.planned",
+  "recovery.started",
+  "recovery.succeeded",
+  "recovery.failed",
+  "recovery.exhausted",
+  "execution.orphaned",
+  "execution.reconciled",
+  "execution.late_result_rejected",
+  "lease.acquired",
+  "lease.renewed",
+  "lease.expired",
+  "lease.fenced",
+  "evidence.invalidated",
+  "candidate.changed",
+  "evidence.validation_recorded",
+  "evidence.review_recorded",
+  "execution.gate_evidence_published",
+  "mission.resumed",
+  "mission.stopped",
+]);
+
 export interface OrchestrationEvent {
   event_id: string;
   mission_id: string;
@@ -371,6 +420,7 @@ export class MissionStore {
   }
 
   private apply(e: OrchestrationEvent): void {
+    if (!ORCHESTRATION_EVENT_TYPES.has(e.type)) return;
     switch (e.type) {
       case "mission.created": {
         const p = e.payload.mission as Mission;
@@ -2328,7 +2378,13 @@ export class MissionStore {
     missionId: string,
     input: Omit<
       MissionStop,
-      "missionId" | "stoppedAt" | "generation" | "resumptionGeneration" | "blockedEpisodeId" | "recoveryDeadline"
+      | "missionId"
+      | "stoppedAt"
+      | "generation"
+      | "resumptionGeneration"
+      | "blockedEpisodeId"
+      | "recoveryDeadline"
+      | "settlementIdentity"
     >,
   ): MissionStop {
     const mission = this.missions.get(missionId);
@@ -2356,35 +2412,123 @@ export class MissionStore {
     return copyMissionStop(stop);
   }
 
-  /**
-   * Settle an exact mission snapshot once. The check and in-memory append are
-   * synchronous, so another callback on this store observes the first stop.
-   */
+  /** Settle an exact durable mission snapshot once across every store sharing the backend. */
   stopMissionIfCurrent(
     missionId: string,
     input: Omit<
       MissionStop,
-      "missionId" | "stoppedAt" | "generation" | "resumptionGeneration" | "blockedEpisodeId" | "recoveryDeadline"
+      | "missionId"
+      | "stoppedAt"
+      | "generation"
+      | "resumptionGeneration"
+      | "blockedEpisodeId"
+      | "recoveryDeadline"
+      | "settlementIdentity"
     >,
     expected: MissionRevisionFence,
-  ): MissionStop | undefined {
-    const currentGeneration = this.listMissionResumptions(missionId).at(-1)?.generation ?? 0;
-    const existing = this.listMissionStops(missionId)
-      .filter((stop) => stop.resumptionGeneration === currentGeneration)
+  ): Promise<MissionStop | undefined> {
+    const settle = this.emitChain.then(async () => {
+      await this.drainPending();
+
+      const durableBefore = MissionStore.open(this.backend);
+      const existingBefore = durableBefore.currentStopForGeneration(missionId, expected.resumptionGeneration);
+      if (existingBefore) {
+        return settlementIdentityMatches(existingBefore.settlementIdentity, expected)
+          ? copyMissionStop(existingBefore)
+          : undefined;
+      }
+      if (!durableBefore.matchesMissionFence(missionId, expected)) return undefined;
+
+      const deadlines = durableBefore
+        .listRecoveryDecisions(missionId)
+        .filter((decision) => (decision.resumptionGeneration ?? 0) === expected.resumptionGeneration)
+        .map((decision) => decision.deadline)
+        .filter((deadline) => Number.isFinite(Date.parse(deadline)))
+        .sort();
+      const stop: MissionStop = {
+        missionId,
+        reason: input.reason,
+        preservedWork: [...input.preservedWork],
+        attemptedRecoveries: [...input.attemptedRecoveries],
+        resumeCondition: input.resumeCondition,
+        stoppedAt: new Date().toISOString(),
+        generation: (durableBefore.listMissionStops(missionId).at(-1)?.generation ?? 0) + 1,
+        resumptionGeneration: expected.resumptionGeneration,
+        blockedEpisodeId: expected.blockedEpisodeId,
+        recoveryDeadline: deadlines[0] ?? null,
+        settlementIdentity: { ...expected },
+      };
+      const payload = structuredClone({ actor: "system", stop });
+      const event: OrchestrationEvent = {
+        event_id: id("oevt"),
+        mission_id: missionId,
+        timestamp: stop.stoppedAt,
+        type: "mission.stopped",
+        actor: "system",
+        payload,
+      };
+      const stored: StoredEvent = {
+        event_id: event.event_id,
+        timestamp: event.timestamp,
+        type: event.type,
+        project_id: null,
+        run_id: missionId,
+        worker_id: null,
+        payload,
+      };
+      let committedByAnotherStore: MissionStop | undefined;
+      let appended: StoredEvent | undefined;
+      try {
+        appended = await this.backend.appendConditionally(
+          stored,
+          () => {
+            const durableCurrent = MissionStore.open(this.backend);
+            const existing = durableCurrent.currentStopForGeneration(missionId, expected.resumptionGeneration);
+            if (existing) {
+              if (settlementIdentityMatches(existing.settlementIdentity, expected)) {
+                committedByAnotherStore = existing;
+              }
+              return false;
+            }
+            return durableCurrent.matchesMissionFence(missionId, expected);
+          },
+          () => this.apply(event),
+        );
+      } catch (error) {
+        this.recordPersistenceFailure(event, error);
+        throw error;
+      }
+      if (appended) {
+        this.clearPersistenceFailure(event.event_id);
+        return copyMissionStop(stop);
+      }
+      return committedByAnotherStore ? copyMissionStop(committedByAnotherStore) : undefined;
+    });
+    this.emitChain = settle.then(
+      () => undefined,
+      () => undefined,
+    );
+    return settle;
+  }
+
+  private currentStopForGeneration(missionId: string, resumptionGeneration: number): MissionStop | undefined {
+    return this.missionStops
+      .filter((stop) => stop.missionId === missionId && stop.resumptionGeneration === resumptionGeneration)
       .at(-1);
-    if (existing) return existing;
+  }
+
+  private matchesMissionFence(missionId: string, expected: MissionRevisionFence): boolean {
     const mission = this.missions.get(missionId);
-    if (
-      !mission ||
-      ["COMPLETE", "FAILED", "CANCELED"].includes(mission.status) ||
-      currentGeneration !== expected.resumptionGeneration ||
-      mission.revision !== expected.revision ||
-      mission.status !== expected.status ||
-      (mission.blocked_episode_id ?? null) !== expected.blockedEpisodeId
-    ) {
-      return undefined;
-    }
-    return this.stopMission(missionId, input);
+    const currentGeneration =
+      this.missionResumptions.filter((resumption) => resumption.missionId === missionId).at(-1)?.generation ?? 0;
+    return (
+      !!mission &&
+      !["COMPLETE", "FAILED", "CANCELED"].includes(mission.status) &&
+      currentGeneration === expected.resumptionGeneration &&
+      mission.revision === expected.revision &&
+      mission.status === expected.status &&
+      (mission.blocked_episode_id ?? null) === expected.blockedEpisodeId
+    );
   }
 
   listMissionStops(missionId?: string): MissionStop[] {
@@ -2542,7 +2686,17 @@ function copyMissionStop(stop: MissionStop): MissionStop {
     ...stop,
     preservedWork: [...stop.preservedWork],
     attemptedRecoveries: [...stop.attemptedRecoveries],
+    ...(stop.settlementIdentity ? { settlementIdentity: { ...stop.settlementIdentity } } : {}),
   };
+}
+
+function settlementIdentityMatches(actual: MissionStop["settlementIdentity"], expected: MissionRevisionFence): boolean {
+  return (
+    actual?.revision === expected.revision &&
+    actual.status === expected.status &&
+    actual.resumptionGeneration === expected.resumptionGeneration &&
+    actual.blockedEpisodeId === expected.blockedEpisodeId
+  );
 }
 
 function validateMissionUpdatePatch(patch: MissionUpdatePatch): MissionUpdatePatch {

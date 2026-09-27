@@ -542,6 +542,13 @@ export interface MissionStop {
   resumptionGeneration: number;
   blockedEpisodeId: EntityId | null;
   recoveryDeadline: string | null;
+  /** Exact durable mission snapshot consumed by an atomic settlement. */
+  settlementIdentity?: {
+    revision: number;
+    status: MissionStatus;
+    resumptionGeneration: number;
+    blockedEpisodeId: EntityId | null;
+  };
 }
 
 /** A recovered worker commit merged by integration. */

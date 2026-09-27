@@ -1079,7 +1079,7 @@ export class EngineeringRuntime {
     if (expectedResumptionGeneration !== undefined && currentGeneration !== expectedResumptionGeneration) return;
     const decisions = this.missionStore.listRecoveryDecisions(missionId).map((decision) => decision.recoveryId);
     const fence = expectedMission ?? mission;
-    this.missionStore.stopMissionIfCurrent(
+    await this.missionStore.stopMissionIfCurrent(
       missionId,
       {
         reason,

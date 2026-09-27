@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, it } from "node:test";
 import { taskCoverageFingerprint } from "../../src/orchestration/evidence.ts";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
@@ -448,7 +451,7 @@ describe("MissionStore", () => {
     first.transitionMission(mission.mission_id, "CLASSIFYING");
     first.transitionMission(mission.mission_id, "READY");
     const beforeStop = first.getMission(mission.mission_id)!;
-    const settled = first.stopMissionIfCurrent(
+    const settled = await first.stopMissionIfCurrent(
       mission.mission_id,
       {
         reason: "revision settlement",
@@ -472,7 +475,7 @@ describe("MissionStore", () => {
     assert.equal(reopened.getMission(mission.mission_id)?.revision, liveRevision);
   });
 
-  it("atomically returns the existing stop for concurrent settlement of one mission revision", () => {
+  it("atomically returns the existing stop for concurrent settlement of one mission revision", async () => {
     const s = store();
     const mission = s.createMission({
       title: "single stop",
@@ -497,12 +500,228 @@ describe("MissionStore", () => {
       resumeCondition: "operator resumes",
     };
 
-    const first = s.stopMissionIfCurrent(mission.mission_id, input, expected);
-    const second = s.stopMissionIfCurrent(mission.mission_id, input, expected);
+    const first = await s.stopMissionIfCurrent(mission.mission_id, input, expected);
+    const second = await s.stopMissionIfCurrent(mission.mission_id, input, expected);
 
     assert.ok(first);
     assert.deepEqual(second, first);
     assert.equal(s.listMissionStops(mission.mission_id).length, 1);
+  });
+
+  it("settles one durable stop across two stores and replays exact retries deterministically", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "mission-stop-cas-"));
+    const file = join(directory, "events.jsonl");
+    let backend: JsonlEventStore | undefined;
+    let first: MissionStore | undefined;
+    let second: MissionStore | undefined;
+    try {
+      backend = await JsonlEventStore.open(file);
+      const seed = MissionStore.open(backend);
+      const mission = seed.createMission({
+        title: "cross-store settlement",
+        goal: "cross-store settlement",
+        user_request: "cross-store settlement",
+        repository: ".",
+        base_ref: "",
+        risk_profile: "low",
+        workflow_class: "engineering",
+      });
+      await seed.flush();
+
+      first = MissionStore.open(backend);
+      second = MissionStore.open(backend);
+      const current = first.getMission(mission.mission_id)!;
+      const expected = {
+        revision: current.revision,
+        status: current.status,
+        resumptionGeneration: 0,
+        blockedEpisodeId: current.blocked_episode_id ?? null,
+      };
+      const firstInput = {
+        reason: "first durable settlement",
+        attemptedRecoveries: ["REC-first"],
+        preservedWork: ["candidate:first"],
+        resumeCondition: "operator resumes",
+      };
+      const secondInput = {
+        reason: "racing settlement must return the winner",
+        attemptedRecoveries: ["REC-second"],
+        preservedWork: ["candidate:second"],
+        resumeCondition: "operator retries",
+      };
+
+      const [firstResult, secondResult] = await Promise.all([
+        first.stopMissionIfCurrent(mission.mission_id, firstInput, expected),
+        second.stopMissionIfCurrent(mission.mission_id, secondInput, expected),
+      ]);
+
+      assert.ok(firstResult);
+      assert.deepEqual(secondResult, firstResult, "both callers observe the one committed stop");
+      assert.deepEqual(firstResult.settlementIdentity, expected);
+      assert.equal(
+        backend.all().filter((event) => event.type === "mission.stopped").length,
+        1,
+        "the shared backend contains one stop event",
+      );
+      assert.equal(
+        first.listMissionStops(mission.mission_id).length + second.listMissionStops(mission.mission_id).length,
+        1,
+        "only the store whose append committed applies the stop locally",
+      );
+
+      backend.close();
+      backend = undefined;
+      const replayBackend = await JsonlEventStore.open(file);
+      const replayed = MissionStore.open(replayBackend);
+      const replayedStop = replayed.listMissionStops(mission.mission_id).at(-1);
+      assert.deepEqual(replayedStop, firstResult);
+      assert.deepEqual(
+        await replayed.stopMissionIfCurrent(mission.mission_id, secondInput, expected),
+        firstResult,
+        "an exact retry after replay returns the committed winner",
+      );
+      assert.equal(replayBackend.all().filter((event) => event.type === "mission.stopped").length, 1);
+      replayBackend.close();
+    } finally {
+      await first?.flush().catch(() => undefined);
+      await second?.flush().catch(() => undefined);
+      backend?.close();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("does not mutate locally when a conditional stop append fails and permits cleanup plus retry", async () => {
+    const backend = new FailOnceBackend();
+    const seed = MissionStore.open(backend);
+    const mission = seed.createMission({
+      title: "retry failed settlement",
+      goal: "retry failed settlement",
+      user_request: "retry failed settlement",
+      repository: ".",
+      base_ref: "",
+      risk_profile: "low",
+      workflow_class: "engineering",
+    });
+    await seed.flush();
+    const store = MissionStore.open(backend);
+    const current = store.getMission(mission.mission_id)!;
+    const expected = {
+      revision: current.revision,
+      status: current.status,
+      resumptionGeneration: 0,
+      blockedEpisodeId: current.blocked_episode_id ?? null,
+    };
+    const input = {
+      reason: "retry after persistence cleanup",
+      attemptedRecoveries: [],
+      preservedWork: [],
+      resumeCondition: "backend recovers",
+    };
+    backend.failNextAppend();
+
+    await assert.rejects(
+      async () => await store.stopMissionIfCurrent(mission.mission_id, input, expected),
+      /persistence unavailable/,
+    );
+    assert.equal(store.listMissionStops(mission.mission_id).length, 0);
+    assert.equal(store.getMission(mission.mission_id)?.revision, current.revision);
+    assert.equal(backend.all().filter((event) => event.type === "mission.stopped").length, 0);
+
+    const retried = await store.stopMissionIfCurrent(mission.mission_id, input, expected);
+    assert.ok(retried);
+    assert.equal(store.listMissionStops(mission.mission_id).length, 1);
+    assert.deepEqual(MissionStore.open(backend).listMissionStops(mission.mission_id), [retried]);
+  });
+
+  it("commits an exact settlement and rejects a concurrent stale store snapshot", async () => {
+    const backend = JsonlEventStore.inMemory();
+    const seed = MissionStore.open(backend);
+    const mission = seed.createMission({
+      title: "exact versus stale",
+      goal: "exact versus stale",
+      user_request: "exact versus stale",
+      repository: ".",
+      base_ref: "",
+      risk_profile: "low",
+      workflow_class: "engineering",
+    });
+    await seed.flush();
+    const stale = MissionStore.open(backend);
+    const staleMission = stale.getMission(mission.mission_id)!;
+    seed.transitionMission(mission.mission_id, "CLASSIFYING");
+    await seed.flush();
+    const exact = MissionStore.open(backend);
+    const exactMission = exact.getMission(mission.mission_id)!;
+    const input = {
+      reason: "only exact state settles",
+      attemptedRecoveries: [],
+      preservedWork: [],
+      resumeCondition: "operator resumes",
+    };
+
+    const [staleResult, exactResult] = await Promise.all([
+      stale.stopMissionIfCurrent(mission.mission_id, input, {
+        revision: staleMission.revision,
+        status: staleMission.status,
+        resumptionGeneration: 0,
+        blockedEpisodeId: staleMission.blocked_episode_id ?? null,
+      }),
+      exact.stopMissionIfCurrent(mission.mission_id, input, {
+        revision: exactMission.revision,
+        status: exactMission.status,
+        resumptionGeneration: 0,
+        blockedEpisodeId: exactMission.blocked_episode_id ?? null,
+      }),
+    ]);
+
+    assert.ok(exactResult);
+    assert.equal(staleResult, undefined);
+    assert.equal(backend.all().filter((event) => event.type === "mission.stopped").length, 1);
+  });
+
+  it("does not let a non-authoritative observability append invalidate an exact settlement", async () => {
+    const backend = JsonlEventStore.inMemory();
+    const seed = MissionStore.open(backend);
+    const mission = seed.createMission({
+      title: "observability does not own revision",
+      goal: "observability does not own revision",
+      user_request: "observability does not own revision",
+      repository: ".",
+      base_ref: "",
+      risk_profile: "low",
+      workflow_class: "engineering",
+    });
+    await seed.flush();
+    const store = MissionStore.open(backend);
+    const current = store.getMission(mission.mission_id)!;
+    await backend.append({
+      event_id: "OBS-between-snapshot-and-settlement",
+      timestamp: new Date().toISOString(),
+      type: "mission.obs.activity",
+      project_id: null,
+      run_id: mission.mission_id,
+      worker_id: null,
+      payload: { missionId: mission.mission_id, summary: "display-only progress" },
+    });
+
+    const settled = await store.stopMissionIfCurrent(
+      mission.mission_id,
+      {
+        reason: "authoritative state stayed current",
+        attemptedRecoveries: [],
+        preservedWork: [],
+        resumeCondition: "operator resumes",
+      },
+      {
+        revision: current.revision,
+        status: current.status,
+        resumptionGeneration: 0,
+        blockedEpisodeId: current.blocked_episode_id ?? null,
+      },
+    );
+
+    assert.ok(settled);
+    assert.equal(MissionStore.open(backend).getMission(mission.mission_id)?.revision, current.revision + 1);
   });
 
   it("replays every supported task transition metadata field and rejects all others", async () => {
