@@ -147,6 +147,14 @@ export type IsolationMode = "none" | "worktree";
 
 export type FailurePolicy = "retry" | "replan" | "repair" | "block" | "ask_user";
 
+/** Bounded checkpoint cadence for one task execution. */
+export interface TaskCheckpointPolicy {
+  /** Persist after this many meaningful worker activity records. */
+  activity_milestone: number;
+  /** Persist this long before the execution deadline. */
+  before_deadline_ms: number;
+}
+
 /** A task: one node in a mission's dependency graph. */
 export interface OrchestrationTask {
   task_id: EntityId;
@@ -175,6 +183,14 @@ export interface OrchestrationTask {
   repo_id?: EntityId;
   /** Stable acceptance criteria this task is responsible for. */
   acceptance_ids?: EntityId[];
+  /** Explicit bounded outputs used to split and reconcile work. */
+  deliverables?: string[];
+  /** Hard wall-clock budget for one execution attempt. */
+  execution_budget_ms?: number;
+  /** Durable checkpoint cadence. */
+  checkpoint_policy?: TaskCheckpointPolicy;
+  /** Artifact classes the worker must return. */
+  required_output_artifacts?: string[];
   /** Candidate revision generation this task may affect. */
   candidate_generation?: number;
   /** Mission ownership generation at dispatch. */
@@ -233,6 +249,8 @@ export interface Execution {
   mission_generation?: number;
   /** Fences results from revoked or expired owners. */
   fencing_token?: number;
+  /** Checkpoint lineage for this bounded execution. */
+  checkpoint_id?: EntityId;
 }
 
 /** A canonical filesystem root explicitly authorized for a mission. */
@@ -287,6 +305,9 @@ export interface TaskCheckpoint {
   sessionId: string | null;
   model: string | null;
   sequence: number;
+  missionGeneration: number;
+  candidateGeneration: number;
+  fencingToken: number;
   createdAt: string;
 }
 

@@ -22,6 +22,7 @@ import { id } from "../core/ids.ts";
 import type { GitRepo } from "../git/GitRepo.ts";
 import type { WorkerActivity } from "../workers/WorkerExecutor.ts";
 import { sanitizeWorkerActivity } from "../workers/activity.ts";
+import type { CheckpointManager, CheckpointSnapshot } from "./checkpoints.ts";
 import type { MissionStore } from "./missionStore.ts";
 import type { DispatchAuthority } from "./ownership.ts";
 import type { ExecutionBackend, RecoveredMerge } from "./types.ts";
@@ -40,6 +41,10 @@ export interface ExecutionRequestInput {
   capabilities?: string[];
   modelRequirements?: Record<string, unknown>;
   timeoutPolicy?: { timeoutMs?: number; maxAttempts?: number };
+  checkpointId?: string;
+  deliverables?: string[];
+  executionBudgetMs?: number;
+  checkpointPolicy?: { activity_milestone: number; before_deadline_ms: number };
   /**
    * Review only: recovered tasks whose objective the review request asks to
    * verify. Recorded on the execution as `reviewed_recovered`.
@@ -219,6 +224,7 @@ export interface BrokerOptions {
   onActivity?: (event: WorkerActivity & { missionId: string; taskId: string; executionId: string }) => void;
   /** Periodic liveness detail for every backend while it is running. */
   activityHeartbeatMs?: number;
+  checkpoints?: CheckpointManager;
 }
 
 export class ExecutionBroker {
@@ -230,6 +236,7 @@ export class ExecutionBroker {
   private readonly resolveRepository?: BrokerOptions["resolveRepository"];
   private readonly onActivity?: BrokerOptions["onActivity"];
   private readonly activityHeartbeatMs: number;
+  private readonly checkpoints?: CheckpointManager;
   /** In-flight execution state for cancellation + allocated worktrees. */
   private readonly active = new Map<
     string,
@@ -277,6 +284,36 @@ export class ExecutionBroker {
     this.resolveRepository = opts.resolveRepository;
     this.onActivity = opts.onActivity;
     this.activityHeartbeatMs = opts.activityHeartbeatMs ?? 15_000;
+    this.checkpoints = opts.checkpoints;
+  }
+
+  private async checkpointSnapshot(
+    executionId: string,
+    input: ExecutionRequestInput,
+    repository: { repoId?: string; root: string; git: GitRepo } | null,
+  ): Promise<CheckpointSnapshot> {
+    const info = this.allocatedWorktrees.get(executionId);
+    if (!info || !repository) {
+      return {
+        candidateSha: null,
+        branch: null,
+        worktree: null,
+        committedChanges: [],
+        preservedUncommittedChanges: [],
+      };
+    }
+    const binding = this.store
+      .getWorkspaceManifest(input.missionId)
+      ?.repositories.find((candidate) => candidate.repoId === input.repoId);
+    const baseSha = binding?.baseSha ?? this.store.getMission(input.missionId)?.base_ref ?? "";
+    const candidateSha = await repository.git.headCommitIn(info.path);
+    return {
+      candidateSha,
+      branch: info.branch,
+      worktree: info.path,
+      committedChanges: baseSha ? await repository.git.changedFiles(baseSha, candidateSha) : [],
+      preservedUncommittedChanges: await repository.git.statusPathsIn(info.path),
+    };
   }
 
   private async repositoryFor(
@@ -697,6 +734,7 @@ export class ExecutionBroker {
   async execute(input: ExecutionRequestInput): Promise<ExecutionHandle> {
     input.authority?.assertAuthoritative();
     const backend = this.backendForKind(input.kind);
+    const checkpointId = input.checkpointId ?? (this.checkpoints && input.repoId ? id("TCP") : undefined);
     const execution = this.store.createExecution({
       task_id: input.taskId,
       mission_id: input.missionId,
@@ -705,6 +743,7 @@ export class ExecutionBroker {
       thinking_level: (input.modelRequirements as { thinking?: string } | undefined)?.thinking ?? null,
       mission_generation: input.authority?.missionIdentity.generation,
       fencing_token: input.authority?.missionIdentity.fencingToken,
+      checkpoint_id: checkpointId,
     });
 
     const abort = new AbortController();
@@ -724,7 +763,7 @@ export class ExecutionBroker {
       },
       result: async () => {
         if (abort.signal.aborted) throw new Error("execution aborted before dispatch");
-        const timeoutMs = input.timeoutPolicy?.timeoutMs ?? this.defaultTimeoutMs;
+        const timeoutMs = input.executionBudgetMs ?? input.timeoutPolicy?.timeoutMs ?? this.defaultTimeoutMs;
         const timer = setTimeout(
           () => abort.abort(new DOMException(`Execution exceeded its ${timeoutMs}ms deadline`, "TimeoutError")),
           timeoutMs,
@@ -733,11 +772,35 @@ export class ExecutionBroker {
         let lastActivityAt = activityStartedAt;
         let activitySettled = false;
         let activityTimer: ReturnType<typeof setInterval> | undefined;
+        let checkpointTimer: ReturnType<typeof setTimeout> | undefined;
+        let repository: { repoId?: string; root: string; git: GitRepo } | null = null;
+        let meaningfulActivity = 0;
+        let checkpointChain = Promise.resolve();
+        const queueCheckpoint = (completedDeliverables: string[] = [], artifactRefs: string[] = []): void => {
+          if (!this.checkpoints || !checkpointId || !input.repoId) return;
+          checkpointChain = checkpointChain.then(async () => {
+            input.authority?.assertAuthoritative();
+            const snapshot = await this.checkpointSnapshot(execution.execution_id, input, repository);
+            input.authority?.assertAuthoritative();
+            await this.checkpoints!.persist({
+              taskId: input.taskId,
+              checkpointId,
+              completedDeliverables,
+              artifactRefs,
+              model: execution.model,
+              snapshot,
+            });
+          });
+        };
         const emitActivity = (event: WorkerActivity): void => {
           if (activitySettled || abort.signal.aborted) return;
           const safe = sanitizeWorkerActivity(event);
           if (!safe) return;
           if (safe.kind !== "heartbeat") lastActivityAt = Date.now();
+          if (safe.meaningfulProgress && input.checkpointPolicy?.activity_milestone) {
+            meaningfulActivity++;
+            if (meaningfulActivity % input.checkpointPolicy.activity_milestone === 0) queueCheckpoint();
+          }
           try {
             this.onActivity?.({
               ...safe,
@@ -795,7 +858,7 @@ export class ExecutionBroker {
         let worktree: string | null = null;
         try {
           input.authority?.assertAuthoritative();
-          const repository = await this.repositoryFor(input);
+          repository = await this.repositoryFor(input);
           if (repository) this.missionRepositories.set(input.missionId, repository);
           if (
             input.repoId &&
@@ -815,6 +878,13 @@ export class ExecutionBroker {
           worktree = await this.allocateWorktree(execution.execution_id, input, repository);
           const active = this.active.get(execution.execution_id);
           if (worktree && active) active.worktree = worktree;
+          if (this.checkpoints && checkpointId && input.checkpointPolicy) {
+            checkpointTimer = setTimeout(
+              () => queueCheckpoint(),
+              Math.max(0, timeoutMs - input.checkpointPolicy.before_deadline_ms),
+            );
+            checkpointTimer.unref?.();
+          }
           if (abort.signal.aborted) throw new Error("execution aborted before dispatch");
           input.authority?.assertAuthoritative();
           let outcome = await this.dispatch(
@@ -837,6 +907,11 @@ export class ExecutionBroker {
               error: "WORKSPACE_SCOPE_MISMATCH",
             };
           }
+          queueCheckpoint(
+            outcome.exitStatus === "succeeded" ? [...(input.deliverables ?? [])] : [],
+            outcome.artifactRefs,
+          );
+          await checkpointChain;
           // A cancellation that already settled this execution must not be
           // overwritten by the runner's late success.
           if (!this.settledElsewhere(execution.execution_id)) {
@@ -939,6 +1014,8 @@ export class ExecutionBroker {
         } finally {
           activitySettled = true;
           if (activityTimer) clearInterval(activityTimer);
+          if (checkpointTimer) clearTimeout(checkpointTimer);
+          await checkpointChain.catch(() => undefined);
           abort.signal.removeEventListener("abort", onAbort);
           clearTimeout(timer);
           await this.releaseWorktree(execution.execution_id);

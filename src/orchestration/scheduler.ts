@@ -432,6 +432,9 @@ export class MissionScheduler {
           writeDomains: task.write_domains,
           isolation: task.isolation,
           modelRequirements: task.execution_requirements,
+          deliverables: task.deliverables,
+          executionBudgetMs: task.execution_budget_ms,
+          checkpointPolicy: task.checkpoint_policy,
           authority,
         });
         authority?.onInvalidated(() => {

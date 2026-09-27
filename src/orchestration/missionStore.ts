@@ -118,6 +118,10 @@ export interface TaskCreateInput {
   failure_policy?: OrchestrationTask["failure_policy"];
   repo_id?: string;
   acceptance_ids?: string[];
+  deliverables?: string[];
+  execution_budget_ms?: number;
+  checkpoint_policy?: OrchestrationTask["checkpoint_policy"];
+  required_output_artifacts?: string[];
   candidate_generation?: number;
   mission_generation?: number;
   fencing_token?: number;
@@ -709,6 +713,10 @@ export class MissionStore {
       steer_requests: [],
       repo_id: input.repo_id,
       acceptance_ids: input.acceptance_ids ? [...input.acceptance_ids] : [],
+      deliverables: input.deliverables ? [...input.deliverables] : [],
+      execution_budget_ms: input.execution_budget_ms,
+      checkpoint_policy: input.checkpoint_policy ? { ...input.checkpoint_policy } : undefined,
+      required_output_artifacts: input.required_output_artifacts ? [...input.required_output_artifacts] : [],
       candidate_generation: input.candidate_generation ?? 0,
       mission_generation: input.mission_generation ?? authority?.generation ?? 0,
       fencing_token: input.fencing_token ?? authority?.fencingToken ?? 0,
@@ -813,6 +821,7 @@ export class MissionStore {
     thinking_level?: string | null;
     mission_generation?: number;
     fencing_token?: number;
+    checkpoint_id?: string;
   }): Execution {
     const task = this.tasks.get(input.task_id);
     const ex: Execution = {
@@ -834,6 +843,7 @@ export class MissionStore {
       status: "PENDING",
       mission_generation: input.mission_generation ?? task?.mission_generation ?? 0,
       fencing_token: input.fencing_token ?? task?.fencing_token ?? 0,
+      checkpoint_id: input.checkpoint_id,
     };
     this.executions.set(ex.execution_id, ex);
     this.emit("execution.created", input.mission_id, { actor: "system", execution: ex });
@@ -1272,6 +1282,9 @@ function copyTask(task: OrchestrationTask): OrchestrationTask {
     artifacts: [...task.artifacts],
     steer_requests: [...task.steer_requests],
     ...(task.acceptance_ids ? { acceptance_ids: [...task.acceptance_ids] } : {}),
+    ...(task.deliverables ? { deliverables: [...task.deliverables] } : {}),
+    ...(task.checkpoint_policy ? { checkpoint_policy: { ...task.checkpoint_policy } } : {}),
+    ...(task.required_output_artifacts ? { required_output_artifacts: [...task.required_output_artifacts] } : {}),
   };
 }
 

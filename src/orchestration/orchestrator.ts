@@ -22,6 +22,7 @@ import type { GatewayResilienceConfig } from "../resilience/config.ts";
 import type { RecoveryProbe } from "../resilience/probe.ts";
 import type { WorkerActivity } from "../workers/WorkerExecutor.ts";
 import { type BrokerBackends, ExecutionBroker } from "./broker.ts";
+import { CheckpointManager } from "./checkpoints.ts";
 import { CompletionGate } from "./completionGate.ts";
 import { IntentRouter, workflowMutatesRepo } from "./intentRouter.ts";
 import type { MissionStore } from "./missionStore.ts";
@@ -45,6 +46,13 @@ import type {
   TaskStatus,
   WorkflowClass,
 } from "./types.ts";
+import {
+  DEFAULT_WORKSET_POLICY,
+  type WorksetPolicy,
+  WorksetValidationError,
+  splitTaskDeliverables,
+  validateWorkset,
+} from "./workset.ts";
 import { type WorkspaceManifestResolver, WorkspaceScopeError, createWorkspaceManifest } from "./workspaceManifest.ts";
 
 /** A task planned by the planner; the orchestrator fills lifecycle fields. */
@@ -60,7 +68,8 @@ export type PlanTaskInput = Omit<
   | "steer_requests"
   | "artifacts"
   | "assigned_execution_id"
->;
+  | "task_id"
+> & { task_id?: string };
 
 export interface OrchestratorOptions {
   store: MissionStore;
@@ -119,6 +128,8 @@ export interface OrchestratorOptions {
   launchCwd?: string;
   /** Durable controller authority renewed immediately before worker dispatch. */
   ownership?: MissionOwnership;
+  /** Bounds planner work before the first executable dispatch. */
+  worksetPolicy?: Partial<WorksetPolicy>;
 }
 
 export interface OrchestrateResult {
@@ -161,6 +172,7 @@ export class Orchestrator {
   private readonly ownership?: MissionOwnership;
   private readonly ownershipByMission = new Map<string, import("./types.ts").MissionLease>();
   private readonly missionRepoIds = new Map<string, string>();
+  private readonly worksetPolicy: WorksetPolicy;
 
   constructor(opts: OrchestratorOptions) {
     this.store = opts.store;
@@ -168,6 +180,8 @@ export class Orchestrator {
     this.router = opts.router ?? new IntentRouter();
     this.limits = opts.limits ?? {};
     this.maxRepairRounds = opts.maxRepairRounds ?? 2;
+    this.worksetPolicy = { ...DEFAULT_WORKSET_POLICY, ...opts.worksetPolicy };
+    const checkpoints = new CheckpointManager({ store: this.store });
     this.broker = new ExecutionBroker({
       store: this.store,
       backends: opts.backends,
@@ -180,6 +194,7 @@ export class Orchestrator {
         : undefined,
       baseRef: opts.baseRef ?? "",
       onActivity: (event) => this.observeWorkerActivity(event),
+      checkpoints,
     });
     this.scheduler = new MissionScheduler({
       store: this.store,
@@ -599,26 +614,105 @@ export class Orchestrator {
 
       // Plan/decompose into tasks.
       const planned = await this.planner(this.store.getMission(mission.mission_id)!, risk);
-      const bindingDomains = this.store
-        .getWorkspaceManifest(mission.mission_id)
-        ?.repositories.find(
-          (repository) => repository.repoId === this.repoIdForMission(mission.mission_id),
-        )?.writableDomains;
-      const scopedPlan = planned.map((task) => ({
+      const plannedMission = this.store.getMission(mission.mission_id)!;
+      const manifest = this.store.getWorkspaceManifest(mission.mission_id);
+      const acceptanceIds = plannedMission.acceptance_criteria.flatMap((criterion) =>
+        criterion.acceptance_id ? [criterion.acceptance_id] : [],
+      );
+      const normalized = planned.map((task) => ({
         ...task,
-        write_domains:
-          task.mutates_repo && bindingDomains
-            ? intersectWriteDomains(task.write_domains.length > 0 ? task.write_domains : ["**"], bindingDomains)
-            : task.write_domains,
+        task_id: task.task_id ?? id("TSK"),
+        acceptance_ids: task.acceptance_ids?.length ? [...task.acceptance_ids] : [...acceptanceIds],
+        deliverables: task.deliverables?.length ? [...task.deliverables] : [task.objective],
+        execution_budget_ms: task.execution_budget_ms ?? this.worksetPolicy.maxTaskBudgetMs,
+        checkpoint_policy: task.checkpoint_policy ?? {
+          activity_milestone: 5,
+          before_deadline_ms: 30_000,
+        },
+        required_output_artifacts: task.required_output_artifacts?.length
+          ? [...task.required_output_artifacts]
+          : ["worker-output"],
       }));
-      if (scopedPlan.some((task) => task.mutates_repo && task.write_domains.length === 0)) {
-        const summary = "Planner requested mutation outside the workspace manifest's writable domains";
+      const expandedByOriginal = new Map<string, typeof normalized>();
+      for (const task of normalized) {
+        const repositories =
+          manifest && manifest.repositories.length > 1 && !task.repo_id && task.kind !== "aggregation"
+            ? manifest.repositories
+            : [
+                manifest?.repositories.find(
+                  (repository) => repository.repoId === (task.repo_id ?? this.repoIdForMission(mission.mission_id)),
+                ),
+              ];
+        const expanded = repositories.map((repository) => {
+          const repoId = repository?.repoId ?? task.repo_id ?? this.repoIdForMission(mission.mission_id);
+          return {
+            ...task,
+            task_id: repositories.length > 1 && repoId ? `${task.task_id}@${repoId}` : task.task_id,
+            ...(repoId ? { repo_id: repoId } : {}),
+            write_domains:
+              task.mutates_repo && repository
+                ? intersectWriteDomains(
+                    task.write_domains.length > 0 ? task.write_domains : ["**"],
+                    repository.writableDomains,
+                  )
+                : task.write_domains,
+          };
+        });
+        expandedByOriginal.set(task.task_id, expanded);
+      }
+      const expanded = [...expandedByOriginal.values()].flat().map((task) => ({
+        ...task,
+        depends_on: task.depends_on.flatMap((dependency) => {
+          const candidates = expandedByOriginal.get(dependency);
+          if (!candidates) return [dependency];
+          const sameRepository = candidates.find((candidate) => candidate.repo_id === task.repo_id);
+          return sameRepository ? [sameRepository.task_id] : candidates.map((candidate) => candidate.task_id);
+        }),
+      }));
+      const split = expanded.flatMap((task) => splitTaskDeliverables(task, this.worksetPolicy.maxDeliverablesPerTask));
+      const finalId = new Map(
+        expanded.map((task) => [
+          task.task_id,
+          split
+            .filter(
+              (candidate) => candidate.task_id === task.task_id || candidate.task_id.startsWith(`${task.task_id}-`),
+            )
+            .at(-1)!.task_id,
+        ]),
+      );
+      const scopedPlan = split.map((task) => ({
+        ...task,
+        depends_on: task.depends_on.map((dependency) => finalId.get(dependency) ?? dependency),
+      }));
+      let worksetError: WorksetValidationError | undefined;
+      if (manifest) {
+        try {
+          validateWorkset({ manifest, acceptanceIds, tasks: scopedPlan, policy: this.worksetPolicy });
+        } catch (error) {
+          if (error instanceof WorksetValidationError) worksetError = error;
+          else throw error;
+        }
+      }
+      if (scopedPlan.some((task) => task.mutates_repo && task.write_domains.length === 0) || worksetError) {
+        const summary =
+          worksetError?.message ?? "Planner requested mutation outside the workspace manifest's writable domains";
+        const category =
+          worksetError?.code === "TASK_BUDGET_EXCEEDED"
+            ? "TASK_BUDGET_EXHAUSTED"
+            : worksetError?.code === "CYCLIC_DEPENDENCY" || worksetError?.code === "UNKNOWN_DEPENDENCY"
+              ? "DEADLOCKED_DAG"
+              : worksetError?.code === "UNKNOWN_REPOSITORY" ||
+                  worksetError?.code === "MISSING_REPOSITORY_BINDING" ||
+                  worksetError?.code === "WRITE_DOMAIN_OUTSIDE_REPOSITORY" ||
+                  worksetError?.code === "CROSS_REPOSITORY_MUTATION_UNSUPPORTED"
+                ? "WORKSPACE_SCOPE_MISMATCH"
+                : "REQUIREMENT_AMBIGUITY";
         this.store.classifyFailure({
           classificationId: id("FC"),
           missionId: mission.mission_id,
           taskId: null,
           executionId: null,
-          category: "WORKSPACE_SCOPE_MISMATCH",
+          category,
           evidenceRefs: [],
           fingerprint: `workspace-plan:${this.repoIdForMission(mission.mission_id) ?? "none"}`,
           summary,
@@ -638,7 +732,6 @@ export class Orchestrator {
         this.store.createTask({
           mission_id: mission.mission_id,
           ...t,
-          ...(this.repoIdForMission(mission.mission_id) ? { repo_id: this.repoIdForMission(mission.mission_id) } : {}),
         });
       }
       this.store.transitionMission(mission.mission_id, "READY");
@@ -856,6 +949,7 @@ export class Orchestrator {
           write_domains: this.writableDomainsForMission(missionId),
           isolation: repairIsolation,
           repo_id: this.repoIdForMission(missionId),
+          ...this.boundedTaskFields(missionId, ["repair"], ["diff", "test-results"]),
         });
         this.store.transitionTask(repair.task_id, "READY");
         const repaired = await this.runSingleTask(missionId, repair.task_id, { signal });
@@ -990,6 +1084,7 @@ export class Orchestrator {
         write_domains: this.writableDomainsForMission(mission.mission_id),
         isolation: "none",
         repo_id: this.repoIdForMission(mission.mission_id),
+        ...this.boundedTaskFields(mission.mission_id, ["integration"], ["integrated-candidate"]),
       });
       this.store.transitionTask(integ.task_id, "READY");
       integrationOk = await this.runSingleTask(mission.mission_id, integ.task_id, { signal });
@@ -1059,6 +1154,7 @@ export class Orchestrator {
         mutates_repo: false,
         isolation: "none",
         repo_id: this.repoIdForMission(mission.mission_id),
+        ...this.boundedTaskFields(mission.mission_id, ["validation"], ["test-results"]),
       });
       this.store.transitionTask(task.task_id, "READY");
       validationAttempted = true;
@@ -1106,6 +1202,7 @@ export class Orchestrator {
         isolation: "none",
         depends_on: this.lastValidationTaskId(mission.mission_id),
         repo_id: this.repoIdForMission(mission.mission_id),
+        ...this.boundedTaskFields(mission.mission_id, ["independent-review"], ["review-result"]),
       });
       this.store.transitionTask(task.task_id, "READY");
       reviewAttempted = true;
@@ -1142,6 +1239,26 @@ export class Orchestrator {
         ?.repositories.find((repository) => repository.repoId === repoId)
         ?.writableDomains.slice() ?? ["**"]
     );
+  }
+
+  private boundedTaskFields(
+    missionId: string,
+    deliverables: string[],
+    requiredOutputArtifacts: string[],
+  ): Pick<
+    OrchestrationTask,
+    "acceptance_ids" | "deliverables" | "execution_budget_ms" | "checkpoint_policy" | "required_output_artifacts"
+  > {
+    const mission = this.store.getMission(missionId);
+    return {
+      acceptance_ids: mission?.acceptance_criteria.flatMap((criterion) =>
+        criterion.acceptance_id ? [criterion.acceptance_id] : [],
+      ),
+      deliverables,
+      execution_budget_ms: this.worksetPolicy.maxTaskBudgetMs,
+      checkpoint_policy: { activity_milestone: 5, before_deadline_ms: 30_000 },
+      required_output_artifacts: requiredOutputArtifacts,
+    };
   }
 
   private lastValidationTaskId(missionId: string): string[] {
@@ -1184,6 +1301,9 @@ export class Orchestrator {
         writeDomains: task.write_domains,
         isolation: task.isolation,
         modelRequirements: task.execution_requirements,
+        deliverables: task.deliverables,
+        executionBudgetMs: task.execution_budget_ms,
+        checkpointPolicy: task.checkpoint_policy,
         authority,
         ...(extra.reviewedRecovered?.length ? { reviewedRecovered: extra.reviewedRecovered } : {}),
       });

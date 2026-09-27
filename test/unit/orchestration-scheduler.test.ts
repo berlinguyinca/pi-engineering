@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { type BrokerBackends, ExecutionBroker } from "../../src/orchestration/broker.ts";
+import { CheckpointManager } from "../../src/orchestration/checkpoints.ts";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
 import { MissionOwnership, type OwnershipIdentity } from "../../src/orchestration/ownership.ts";
 import { MissionScheduler, classifyFailure, domainsOverlap } from "../../src/orchestration/scheduler.ts";
@@ -94,6 +95,60 @@ function delayedConcurrencyTracker(delayMs = 25) {
 }
 
 describe("MissionScheduler (spec 02)", () => {
+  it("attaches checkpoint identity and checkpoints progress without passing acceptance", async () => {
+    const store = MissionStore.open(JsonlEventStore.inMemory());
+    const mission = createExecutingMission(store);
+    store.addAcceptanceCriterion(mission.mission_id, "the implementation is validated", undefined, "AC-1");
+    const task = store.createTask({
+      mission_id: mission.mission_id,
+      kind: "agent",
+      role: "implementer",
+      objective: "bounded implementation",
+      repo_id: "repo-1",
+      acceptance_ids: ["AC-1"],
+      deliverables: ["implementation", "tests"],
+      execution_budget_ms: 10_000,
+      checkpoint_policy: { activity_milestone: 1, before_deadline_ms: 1_000 },
+      mutates_repo: false,
+      isolation: "none",
+      mission_generation: 3,
+      fencing_token: 5,
+    });
+    const checkpoints = new CheckpointManager({ store });
+    const broker = new ExecutionBroker({
+      store,
+      checkpoints,
+      resolveRepository: async (repoId) => ({ repoId, root: "/repo", git: {} as never }),
+      backends: {
+        agent: {
+          runAgent: async ({ onActivity }) => {
+            onActivity?.({ kind: "state", summary: "implementation ready", meaningfulProgress: true });
+            return {
+              executionId: "worker",
+              exitStatus: "succeeded",
+              summary: "done",
+              artifactRefs: ["artifact://handoff"],
+              usage: {},
+            };
+          },
+        },
+      },
+    });
+
+    await new MissionScheduler({ store, broker }).runMission(mission.mission_id);
+
+    const execution = store.listExecutions(mission.mission_id, task.task_id)[0]!;
+    assert.match(execution.checkpoint_id ?? "", /^TCP-/);
+    const checkpoint = store.getTaskCheckpoint(execution.checkpoint_id!);
+    assert.ok(checkpoint);
+    assert.deepEqual(checkpoint.completedDeliverables, ["implementation", "tests"]);
+    assert.deepEqual(checkpoint.artifactRefs, ["artifact://handoff"]);
+    assert.equal(checkpoint.missionGeneration, task.mission_generation);
+    assert.equal(checkpoint.candidateGeneration, task.candidate_generation);
+    assert.equal(checkpoint.fencingToken, task.fencing_token);
+    assert.equal(store.getMission(mission.mission_id)?.acceptance_criteria[0]?.status, "pending");
+  });
+
   it("holds fenced mission and repository authority for the entire mutating dispatch", async () => {
     const store = MissionStore.open(JsonlEventStore.inMemory());
     const mission = createExecutingMission(store);

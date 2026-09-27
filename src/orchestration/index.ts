@@ -3,6 +3,8 @@ export * from "./state.ts";
 export * from "./policies.ts";
 export * from "./intentRouter.ts";
 export * from "./missionStore.ts";
+export * from "./checkpoints.ts";
+export * from "./workset.ts";
 export * from "./broker.ts";
 export * from "./scheduler.ts";
 export * from "./completionGate.ts";

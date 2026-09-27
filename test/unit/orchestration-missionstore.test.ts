@@ -432,6 +432,9 @@ describe("MissionStore", () => {
       sessionId: "session-1",
       model: "local/local",
       sequence: 2,
+      missionGeneration: 3,
+      candidateGeneration: 4,
+      fencingToken: 7,
       createdAt: "2026-09-26T10:01:00.000Z",
     };
     s1.checkpointTask(checkpoint);
