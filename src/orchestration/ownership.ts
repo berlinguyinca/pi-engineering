@@ -32,6 +32,7 @@ export class MissionOwnership {
   private readonly heartbeatMs: number;
   private readonly now: () => number;
   private readonly missionHolders = new Map<string, number>();
+  private readonly repositoryHolders = new Map<string, number>();
 
   constructor(store: MissionStore, options: MissionOwnershipOptions) {
     if (!options.ownerId.trim()) throw new Error("MissionOwnership ownerId is required");
@@ -116,7 +117,10 @@ export class MissionOwnership {
       await this.store.flush();
       throw new Error(`mission ${identity.missionId} lease expired at ${current!.renewBy}`);
     }
-    const renewed = { ...current!, renewBy: new Date(now + this.leaseMs).toISOString() };
+    const renewed = {
+      ...current!,
+      renewBy: new Date(now + this.leaseMs).toISOString(),
+    };
     this.store.transitionMissionLease("renewed", renewed);
     await this.store.flush();
     return { ...renewed };
@@ -131,7 +135,10 @@ export class MissionOwnership {
       if (current.missionId !== identity.missionId || current.ownerId !== identity.ownerId) {
         throw new Error(`repository ${repoId} is leased to mission ${current.missionId} by ${current.ownerId}`);
       }
-      return this.renewRepository(current);
+      const renewed = await this.renewRepository(current);
+      const key = this.repositoryEpochKey(renewed);
+      this.repositoryHolders.set(key, (this.repositoryHolders.get(key) ?? 0) + 1);
+      return renewed;
     }
     if (current) {
       this.store.transitionRepositoryLease("expired", current);
@@ -150,6 +157,7 @@ export class MissionOwnership {
     };
     this.store.transitionRepositoryLease("acquired", lease);
     await this.store.flush();
+    this.repositoryHolders.set(this.repositoryEpochKey(lease), 1);
     return { ...lease };
   }
 
@@ -163,7 +171,10 @@ export class MissionOwnership {
       await this.store.flush();
       throw new Error(`repository ${identity.repoId} lease expired at ${current!.renewBy}`);
     }
-    const renewed = { ...current!, renewBy: new Date(now + this.leaseMs).toISOString() };
+    const renewed = {
+      ...current!,
+      renewBy: new Date(now + this.leaseMs).toISOString(),
+    };
     this.store.transitionRepositoryLease("renewed", renewed);
     await this.store.flush();
     return { ...renewed };
@@ -183,6 +194,13 @@ export class MissionOwnership {
     if (!current) return;
     this.assertAuthoritative(identity);
     if (isRepositoryIdentity(identity)) {
+      const key = this.repositoryEpochKey(identity);
+      const holders = this.repositoryHolders.get(key) ?? 1;
+      if (holders > 1) {
+        this.repositoryHolders.set(key, holders - 1);
+        return;
+      }
+      this.repositoryHolders.delete(key);
       this.store.transitionRepositoryLease("fenced", identity);
     } else {
       const key = this.epochKey(identity);
@@ -218,6 +236,10 @@ export class MissionOwnership {
 
   private epochKey(identity: MissionLease): string {
     return `${identity.missionId}:${identity.generation}:${identity.fencingToken}`;
+  }
+
+  private repositoryEpochKey(identity: RepositoryLease): string {
+    return `${identity.missionId}:${identity.repoId}:${identity.generation}:${identity.fencingToken}`;
   }
 
   private assertMissionOwner(missionId: string, ownerId: string): void {

@@ -90,6 +90,7 @@ export type OrchestrationEventType =
   | "candidate.changed"
   | "evidence.validation_recorded"
   | "evidence.review_recorded"
+  | "execution.gate_evidence_published"
   | "mission.resumed"
   | "mission.stopped";
 
@@ -163,6 +164,23 @@ export type MissionUpdatePatch = Partial<
 
 export interface MissionTransitionOptions {
   recoveryDecisionId?: string;
+}
+
+export interface MissionCompletionOptions {
+  expectedResumptionGeneration: number;
+}
+
+export interface GateEvidencePublication {
+  executionId: string;
+  exitStatus: string;
+  artifactRefs: string[];
+  usage: Execution["usage"];
+  recoveredMerged?: NonNullable<Execution["recovered_merged"]>;
+  reviewedRecovered?: NonNullable<Execution["reviewed_recovered"]>;
+  identity: CandidateEvidenceIdentity;
+  reason: string;
+  validationEvidence?: Omit<ValidationEvidence, "identity" | "identityHash" | "recordedAt">;
+  reviewEvidence?: Omit<ReviewEvidence, "identity" | "identityHash" | "recordedAt">;
 }
 
 /** Bounded, inspectable record of an event that could not be persisted. */
@@ -240,7 +258,10 @@ export class MissionStore {
   private readonly missionResumptions: MissionResumption[] = [];
   private readonly missionStops: MissionStop[] = [];
   private readonly persistenceErrors: MissionPersistenceDiagnostic[] = [];
-  private readonly pendingWrites: Array<{ event: OrchestrationEvent; stored: StoredEvent }> = [];
+  private readonly pendingWrites: Array<{
+    event: OrchestrationEvent;
+    stored: StoredEvent;
+  }> = [];
   private emitChain: Promise<void> = Promise.resolve();
 
   private constructor(backend: EventStoreBackend) {
@@ -449,6 +470,10 @@ export class MissionStore {
         }
         break;
       }
+      case "execution.gate_evidence_published": {
+        this.applyGateEvidencePublication(e.payload);
+        break;
+      }
       case "execution.late_result_rejected": {
         const execution = e.payload.execution as Execution | undefined;
         if (execution) this.executions.set(execution.execution_id, copyExecution(execution));
@@ -502,7 +527,11 @@ export class MissionStore {
         const missionPatch = e.payload.mission_patch as Partial<Mission> | undefined;
         if (decision && missionPatch) {
           const mission = this.missions.get(decision.missionId);
-          if (mission) this.missions.set(decision.missionId, { ...mission, ...missionPatch });
+          if (mission)
+            this.missions.set(decision.missionId, {
+              ...mission,
+              ...missionPatch,
+            });
         }
         break;
       }
@@ -631,7 +660,10 @@ export class MissionStore {
       completed_at: null,
     };
     this.missions.set(mission.mission_id, mission);
-    this.emit("mission.created", mission.mission_id, { actor: "system", mission });
+    this.emit("mission.created", mission.mission_id, {
+      actor: "system",
+      mission,
+    });
     return copyMission(mission);
   }
 
@@ -686,12 +718,20 @@ export class MissionStore {
     };
     this.missions.set(missionId, { ...m, ...patch });
     if (repairDecision) {
-      const started: RecoveryDecision = { ...repairDecision, status: "started" };
+      const started: RecoveryDecision = {
+        ...repairDecision,
+        status: "started",
+      };
       this.recoveryDecisions.set(started.recoveryId, started);
       this.emit(
         "recovery.started",
         missionId,
-        { actor, decision: started, mission_id: missionId, mission_patch: patch },
+        {
+          actor,
+          decision: started,
+          mission_id: missionId,
+          mission_patch: patch,
+        },
         now,
       );
     } else {
@@ -724,9 +764,15 @@ export class MissionStore {
     return this.getMission(missionId)!;
   }
 
-  completeMission(missionId: string, actor = "system"): Mission {
+  completeMission(missionId: string, options: MissionCompletionOptions, actor = "system"): Mission {
     const m = this.missions.get(missionId);
     if (!m) throw new Error(`unknown mission ${missionId}`);
+    const currentResumptionGeneration = this.listMissionResumptions(missionId).at(-1)?.generation ?? 0;
+    if (options.expectedResumptionGeneration !== currentResumptionGeneration) {
+      throw new Error(
+        `stale mission resumption at completion: expected ${options.expectedResumptionGeneration}, current ${currentResumptionGeneration}`,
+      );
+    }
     assertMissionTransition(m.status, "COMPLETE");
     this.missions.set(missionId, {
       ...m,
@@ -748,7 +794,11 @@ export class MissionStore {
       completed_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
     });
-    this.emit("mission.failed", missionId, { actor, mission_id: missionId, failure_reason: reason });
+    this.emit("mission.failed", missionId, {
+      actor,
+      mission_id: missionId,
+      failure_reason: reason,
+    });
     return this.getMission(missionId)!;
   }
 
@@ -768,7 +818,11 @@ export class MissionStore {
         ...(evidence ? { evidence } : {}),
       },
     ];
-    const next = { ...m, acceptance_criteria: criteria, updated_at: new Date().toISOString() };
+    const next = {
+      ...m,
+      acceptance_criteria: criteria,
+      updated_at: new Date().toISOString(),
+    };
     this.missions.set(missionId, next);
     this.emit("mission.updated", missionId, {
       actor: "system",
@@ -784,7 +838,11 @@ export class MissionStore {
     const criteria = m.acceptance_criteria.map((c, i) =>
       i === index ? { ...c, status, ...(evidence ? { evidence } : {}) } : c,
     );
-    const next = { ...m, acceptance_criteria: criteria, updated_at: new Date().toISOString() };
+    const next = {
+      ...m,
+      acceptance_criteria: criteria,
+      updated_at: new Date().toISOString(),
+    };
     this.missions.set(missionId, next);
     this.emit("mission.updated", missionId, {
       actor: "system",
@@ -925,7 +983,12 @@ export class MissionStore {
               : to === "RETRYING"
                 ? "task.retried"
                 : "task.canceled";
-    const event = this.emit(type, t.mission_id, { actor, task_id: taskId, status: to, ...extra });
+    const event = this.emit(type, t.mission_id, {
+      actor,
+      task_id: taskId,
+      status: to,
+      ...extra,
+    });
     const now = event.timestamp;
     const next: OrchestrationTask = {
       ...t,
@@ -946,7 +1009,11 @@ export class MissionStore {
     }
     const next = { ...t, steer_requests: [...t.steer_requests, request] };
     this.tasks.set(taskId, next);
-    this.emit("task.steered", t.mission_id, { actor, task_id: taskId, request });
+    this.emit("task.steered", t.mission_id, {
+      actor,
+      task_id: taskId,
+      request,
+    });
     return this.getTask(taskId)!;
   }
 
@@ -996,7 +1063,10 @@ export class MissionStore {
       candidate_generation: input.candidate_generation ?? task?.candidate_generation ?? 0,
     };
     this.executions.set(ex.execution_id, ex);
-    this.emit("execution.created", input.mission_id, { actor: "system", execution: ex });
+    this.emit("execution.created", input.mission_id, {
+      actor: "system",
+      execution: ex,
+    });
     return copyExecution(ex);
   }
 
@@ -1023,6 +1093,233 @@ export class MissionStore {
             : "execution.canceled";
     this.emit(type, ex.mission_id, { actor: "system", execution: next });
     return this.getExecution(executionId)!;
+  }
+
+  /** Atomically settle one current execution and publish its candidate-bound gate evidence. */
+  publishGateEvidenceIfAuthoritative(input: GateEvidencePublication): Promise<Execution> {
+    const publish = this.emitChain.then(async () => {
+      await this.drainPending();
+      this.assertExecutionAuthoritative(input.executionId);
+      const current = this.executions.get(input.executionId)!;
+      const task = this.tasks.get(current.task_id)!;
+      const now = new Date().toISOString();
+      const identity = this.assertCandidateIdentity(
+        current.mission_id,
+        input.identity,
+        hashCandidateEvidenceIdentity(input.identity),
+      );
+      const identityHash = hashCandidateEvidenceIdentity(identity);
+      const execution: Execution = {
+        ...current,
+        status: "SUCCEEDED",
+        ended_at: now,
+        exit_status: input.exitStatus,
+        artifact_refs: [...input.artifactRefs],
+        usage: structuredClone(input.usage),
+        ...(input.recoveredMerged?.length ? { recovered_merged: [...input.recoveredMerged] } : {}),
+        ...(input.reviewedRecovered?.length ? { reviewed_recovered: [...input.reviewedRecovered] } : {}),
+      };
+      const candidate: CandidateRevision = {
+        missionId: current.mission_id,
+        taskId: task.task_id,
+        executionId: current.execution_id,
+        identity,
+        identityHash,
+        reason: input.reason.trim() || "candidate changed",
+        recordedAt: now,
+      };
+      const evidenceRecordedAt = this.freshEvidenceTimestamp({
+        missionId: current.mission_id,
+        identityHash,
+        recordedAt: now,
+      });
+      const validationEvidence = input.validationEvidence
+        ? copyValidationEvidence({
+            ...input.validationEvidence,
+            identity,
+            identityHash,
+            recordedAt: evidenceRecordedAt,
+          })
+        : undefined;
+      const reviewEvidence = input.reviewEvidence
+        ? copyReviewEvidence({
+            ...input.reviewEvidence,
+            identity,
+            identityHash,
+            recordedAt: evidenceRecordedAt,
+          })
+        : undefined;
+      const prior = this.candidates.get(candidateKey(current.mission_id, identity.repoId));
+      const invalidation =
+        prior && prior.identityHash !== identityHash
+          ? {
+              invalidationId: id("EI"),
+              missionId: current.mission_id,
+              identity: prior.identity,
+              reason: input.reason.trim() || "candidate changed",
+              invalidatedAt: now,
+              scope: "all" as const,
+            }
+          : undefined;
+      const payload = structuredClone({
+        actor: "system",
+        execution,
+        candidate,
+        ...(validationEvidence ? { validationEvidence } : {}),
+        ...(reviewEvidence ? { reviewEvidence } : {}),
+        ...(invalidation ? { invalidation } : {}),
+      });
+      this.assertGateEvidencePublication(payload);
+      const event: OrchestrationEvent = {
+        event_id: id("oevt"),
+        mission_id: current.mission_id,
+        timestamp: now,
+        type: "execution.gate_evidence_published",
+        actor: "system",
+        payload,
+      };
+      let authorityError: unknown;
+      let appended: StoredEvent | undefined;
+      try {
+        appended = await this.backend.appendConditionally(
+          {
+            event_id: event.event_id,
+            timestamp: event.timestamp,
+            type: event.type,
+            project_id: null,
+            run_id: event.mission_id,
+            worker_id: null,
+            payload,
+          },
+          () => {
+            try {
+              this.assertExecutionAuthoritative(input.executionId);
+              return true;
+            } catch (error) {
+              authorityError = error;
+              return false;
+            }
+          },
+          () => this.apply(event),
+        );
+      } catch (error) {
+        if (!authorityError) this.recordPersistenceFailure(event, error);
+        throw error;
+      }
+      if (!appended) throw authorityError ?? new Error("gate evidence authority changed before publication");
+      this.clearPersistenceFailure(event.event_id);
+      return this.getExecution(input.executionId)!;
+    });
+    this.emitChain = publish.then(
+      () => undefined,
+      () => undefined,
+    );
+    return publish;
+  }
+
+  private assertGateEvidencePublication(payload: Record<string, unknown>): void {
+    const execution = payload.execution as Execution;
+    const candidate = payload.candidate as CandidateRevision;
+    const validationEvidence = payload.validationEvidence as ValidationEvidence | undefined;
+    const reviewEvidence = payload.reviewEvidence as ReviewEvidence | undefined;
+    const current = this.executions.get(execution.execution_id);
+    const task = current ? this.tasks.get(current.task_id) : undefined;
+    if (!current || !task || current.status !== "RUNNING") {
+      throw new Error("gate evidence execution is not currently authoritative");
+    }
+    this.assertExecutionAuthoritative(current.execution_id);
+    const immutableMismatches = [
+      current.task_id !== execution.task_id ? "task" : null,
+      current.mission_id !== execution.mission_id ? "mission" : null,
+      current.backend !== execution.backend ? "backend" : null,
+      current.mission_generation !== execution.mission_generation ? "mission generation" : null,
+      current.resumption_generation !== execution.resumption_generation ? "resumption generation" : null,
+      current.candidate_generation !== execution.candidate_generation ? "candidate generation" : null,
+      current.fencing_token !== execution.fencing_token ? "fencing token" : null,
+    ].filter((value): value is string => value !== null);
+    if (immutableMismatches.length > 0) {
+      throw new Error(`gate evidence execution identity mismatch: ${immutableMismatches.join(", ")}`);
+    }
+    const identity = this.assertCandidateIdentity(candidate.missionId, candidate.identity, candidate.identityHash);
+    this.assertSettledExecutionIdentity(task, execution, identity);
+    if (
+      candidate.missionId !== execution.mission_id ||
+      candidate.taskId !== task.task_id ||
+      candidate.executionId !== execution.execution_id ||
+      task.repo_id !== identity.repoId ||
+      execution.repo_id !== identity.repoId ||
+      execution.base_sha !== identity.baseSha
+    ) {
+      throw new Error("gate evidence candidate provenance mismatch");
+    }
+    this.assertUnusedCandidateExecution(execution.execution_id);
+    if (validationEvidence) {
+      if (execution.backend !== "validation") throw new Error("validation evidence backend mismatch");
+      this.assertGateEvidenceRecord(validationEvidence, candidate, execution, task);
+      if (
+        !validationEvidence.command.trim() ||
+        !validationEvidence.profile.trim() ||
+        !Number.isInteger(validationEvidence.exitCode)
+      )
+        throw new Error("malformed validation evidence");
+      validateAcceptanceResults(validationEvidence.acceptanceResults, identity.acceptanceIds);
+      this.assertUnusedEvidenceExecution(execution.execution_id, this.validationEvidence.values());
+    }
+    if (reviewEvidence) {
+      if (execution.backend !== "review") throw new Error("review evidence backend mismatch");
+      this.assertGateEvidenceRecord(reviewEvidence, candidate, execution, task);
+      if (!reviewEvidence.reviewerSessionId.trim() || !reviewEvidence.model.trim() || !reviewEvidence.provider.trim())
+        throw new Error("malformed review evidence identity");
+      if (
+        !Array.isArray(reviewEvidence.findings) ||
+        reviewEvidence.findings.some((finding) => !finding.summary?.trim())
+      )
+        throw new Error("malformed review findings");
+      validateAcceptanceResults(reviewEvidence.acceptanceResults, identity.acceptanceIds);
+      this.assertUnusedEvidenceExecution(execution.execution_id, this.reviewEvidence.values());
+    }
+  }
+
+  private assertGateEvidenceRecord(
+    evidence: ValidationEvidence | ReviewEvidence,
+    candidate: CandidateRevision,
+    execution: Execution,
+    task: OrchestrationTask,
+  ): void {
+    if (
+      evidence.missionId !== candidate.missionId ||
+      evidence.taskId !== task.task_id ||
+      evidence.executionId !== execution.execution_id ||
+      evidence.identityHash !== candidate.identityHash ||
+      hashCandidateEvidenceIdentity(evidence.identity) !== candidate.identityHash
+    ) {
+      throw new Error("gate evidence provenance mismatch");
+    }
+  }
+
+  private applyGateEvidencePublication(payload: Record<string, unknown>): void {
+    try {
+      this.assertGateEvidencePublication(payload);
+      const execution = payload.execution as Execution;
+      const candidate = payload.candidate as CandidateRevision;
+      const invalidation = payload.invalidation as EvidenceInvalidation | undefined;
+      const validationEvidence = payload.validationEvidence as ValidationEvidence | undefined;
+      const reviewEvidence = payload.reviewEvidence as ReviewEvidence | undefined;
+      this.executions.set(execution.execution_id, copyExecution(execution));
+      if (invalidation)
+        this.evidenceInvalidations.set(invalidation.invalidationId, copyEvidenceInvalidation(invalidation));
+      this.candidates.set(
+        candidateKey(candidate.missionId, candidate.identity.repoId),
+        copyCandidateRevision(candidate),
+      );
+      this.candidateExecutionIds.add(candidate.executionId);
+      if (validationEvidence)
+        this.validationEvidence.set(validationEvidence.evidenceId, copyValidationEvidence(validationEvidence));
+      if (reviewEvidence) this.reviewEvidence.set(reviewEvidence.evidenceId, copyReviewEvidence(reviewEvidence));
+    } catch (error) {
+      const execution = payload.execution as Execution | undefined;
+      this.quarantineEvidence(execution?.mission_id ?? "unknown", error);
+    }
   }
 
   getExecution(executionId: string): Execution | undefined {
@@ -1174,7 +1471,10 @@ export class MissionStore {
       created_at: new Date().toISOString(),
     };
     this.findings.set(f.finding_id, f);
-    this.emit("finding.created", finding.mission_id, { actor: "agent", finding: f });
+    this.emit("finding.created", finding.mission_id, {
+      actor: "agent",
+      finding: f,
+    });
     return { ...f };
   }
 
@@ -1182,7 +1482,10 @@ export class MissionStore {
     const f = this.findings.get(findingId);
     if (!f) return;
     f.status = "resolved";
-    this.emit("finding.resolved", f.mission_id, { actor: "system", finding_id: findingId });
+    this.emit("finding.resolved", f.mission_id, {
+      actor: "system",
+      finding_id: findingId,
+    });
   }
 
   listFindings(missionId?: string): ReviewFinding[] {
@@ -1332,7 +1635,10 @@ export class MissionStore {
     if (!task || task.mission_id !== checkpoint.missionId) throw new Error(`unknown task ${checkpoint.taskId}`);
     const copy = copyTaskCheckpoint(checkpoint);
     this.taskCheckpoints.set(copy.checkpointId, copy);
-    this.emit("task.checkpointed", checkpoint.missionId, { actor: "system", checkpoint: copy });
+    this.emit("task.checkpointed", checkpoint.missionId, {
+      actor: "system",
+      checkpoint: copy,
+    });
     return copyTaskCheckpoint(copy);
   }
 
@@ -1426,7 +1732,10 @@ export class MissionStore {
     if (!this.missions.has(classification.missionId)) throw new Error(`unknown mission ${classification.missionId}`);
     const copy = copyFailureClassification(classification);
     this.failureClassifications.set(copy.classificationId, copy);
-    this.emit("failure.classified", classification.missionId, { actor: "system", classification: copy });
+    this.emit("failure.classified", classification.missionId, {
+      actor: "system",
+      classification: copy,
+    });
     return copyFailureClassification(copy);
   }
 
@@ -1466,7 +1775,10 @@ export class MissionStore {
         : {}),
     };
     this.recoveryDecisions.set(copy.recoveryId, copy);
-    this.emit("recovery.planned", decision.missionId, { actor: "system", decision: copy });
+    this.emit("recovery.planned", decision.missionId, {
+      actor: "system",
+      decision: copy,
+    });
     return copyRecoveryDecision(copy);
   }
 
@@ -1565,7 +1877,10 @@ export class MissionStore {
     }
     const copy = copyTaskSupersession(supersession);
     this.taskSupersessions.set(copy.supersessionId, copy);
-    this.emit("task.superseded", supersession.missionId, { actor: "system", supersession: copy });
+    this.emit("task.superseded", supersession.missionId, {
+      actor: "system",
+      supersession: copy,
+    });
     return copyTaskSupersession(copy);
   }
 
@@ -1599,7 +1914,10 @@ export class MissionStore {
     if (!this.missions.has(invalidation.missionId)) throw new Error(`unknown mission ${invalidation.missionId}`);
     const copy = copyEvidenceInvalidation(invalidation);
     this.evidenceInvalidations.set(copy.invalidationId, copy);
-    this.emit("evidence.invalidated", invalidation.missionId, { actor: "system", invalidation: copy });
+    this.emit("evidence.invalidated", invalidation.missionId, {
+      actor: "system",
+      invalidation: copy,
+    });
     return copyEvidenceInvalidation(copy);
   }
 
@@ -1653,9 +1971,15 @@ export class MissionStore {
   recordValidationEvidence(raw: ValidationEvidence): ValidationEvidence {
     this.assertValidationEvidence(raw);
     this.assertUnusedEvidenceExecution(raw.executionId, this.validationEvidence.values());
-    const evidence = copyValidationEvidence({ ...raw, recordedAt: this.freshEvidenceTimestamp(raw) });
+    const evidence = copyValidationEvidence({
+      ...raw,
+      recordedAt: this.freshEvidenceTimestamp(raw),
+    });
     this.validationEvidence.set(evidence.evidenceId, evidence);
-    this.emit("evidence.validation_recorded", evidence.missionId, { actor: "system", evidence });
+    this.emit("evidence.validation_recorded", evidence.missionId, {
+      actor: "system",
+      evidence,
+    });
     return copyValidationEvidence(evidence);
   }
 
@@ -1668,9 +1992,15 @@ export class MissionStore {
   recordReviewEvidence(raw: ReviewEvidence): ReviewEvidence {
     this.assertReviewEvidence(raw);
     this.assertUnusedEvidenceExecution(raw.executionId, this.reviewEvidence.values());
-    const evidence = copyReviewEvidence({ ...raw, recordedAt: this.freshEvidenceTimestamp(raw) });
+    const evidence = copyReviewEvidence({
+      ...raw,
+      recordedAt: this.freshEvidenceTimestamp(raw),
+    });
     this.reviewEvidence.set(evidence.evidenceId, evidence);
-    this.emit("evidence.review_recorded", evidence.missionId, { actor: "system", evidence });
+    this.emit("evidence.review_recorded", evidence.missionId, {
+      actor: "system",
+      evidence,
+    });
     return copyReviewEvidence(evidence);
   }
 
@@ -1799,7 +2129,11 @@ export class MissionStore {
     this.evidenceReplayErrors.set(missionId, diagnostics);
   }
 
-  private freshEvidenceTimestamp(raw: { missionId: string; identityHash: string; recordedAt: string }): string {
+  private freshEvidenceTimestamp(raw: {
+    missionId: string;
+    identityHash: string;
+    recordedAt: string;
+  }): string {
     const latestInvalidation = this.listEvidenceInvalidations(raw.missionId)
       .filter((entry) => hashCandidateEvidenceIdentity(entry.identity) === raw.identityHash)
       .reduce((latest, entry) => Math.max(latest, Date.parse(entry.invalidatedAt)), Number.NEGATIVE_INFINITY);
@@ -1895,7 +2229,9 @@ export class MissionStore {
 
   /** Local takeover is permitted only while this process owns the JSONL writer boundary. */
   hasExclusiveWriterAuthority(): boolean {
-    const backend = this.backend as EventStoreBackend & { ownsWriterLock?: () => boolean };
+    const backend = this.backend as EventStoreBackend & {
+      ownsWriterLock?: () => boolean;
+    };
     return backend.ownsWriterLock?.() ?? false;
   }
 
@@ -1915,11 +2251,20 @@ export class MissionStore {
       else this.missionLeases.set(lease.missionId, { ...lease });
     } else {
       const repositoryLease = lease as RepositoryLease;
-      this.repositoryLeaseEpochs.set(repositoryLease.repoId, { ...repositoryLease });
+      this.repositoryLeaseEpochs.set(repositoryLease.repoId, {
+        ...repositoryLease,
+      });
       if (transition === "expired" || transition === "fenced") this.repositoryLeases.delete(repositoryLease.repoId);
-      else this.repositoryLeases.set(repositoryLease.repoId, { ...repositoryLease });
+      else
+        this.repositoryLeases.set(repositoryLease.repoId, {
+          ...repositoryLease,
+        });
     }
-    this.emit(`lease.${transition}`, lease.missionId, { actor: "system", scope, lease });
+    this.emit(`lease.${transition}`, lease.missionId, {
+      actor: "system",
+      scope,
+      lease,
+    });
   }
 
   resumeMission(missionId: string, reason: string): MissionResumption {
@@ -2006,7 +2351,9 @@ function copyMission(mission: Mission): Mission {
   return {
     ...mission,
     constraints: [...mission.constraints],
-    acceptance_criteria: mission.acceptance_criteria.map((criterion) => ({ ...criterion })),
+    acceptance_criteria: mission.acceptance_criteria.map((criterion) => ({
+      ...criterion,
+    })),
     task_ids: [...mission.task_ids],
     artifact_refs: [...mission.artifact_refs],
     decision_refs: [...mission.decision_refs],
@@ -2066,7 +2413,11 @@ function copyTaskSupersession(supersession: TaskSupersession): TaskSupersession 
     replacementTaskIds: [...supersession.replacementTaskIds],
     acceptanceIds: [...supersession.acceptanceIds],
     ...(supersession.expectedReplacementFingerprints
-      ? { expectedReplacementFingerprints: { ...supersession.expectedReplacementFingerprints } }
+      ? {
+          expectedReplacementFingerprints: {
+            ...supersession.expectedReplacementFingerprints,
+          },
+        }
       : {}),
   };
 }
@@ -2108,7 +2459,9 @@ function copyValidationEvidence(evidence: ValidationEvidence): ValidationEvidenc
     ...evidence,
     identity: copyEvidenceIdentity(evidence.identity),
     testSummary: structuredClone(evidence.testSummary),
-    acceptanceResults: evidence.acceptanceResults?.map((result) => ({ ...result })),
+    acceptanceResults: evidence.acceptanceResults?.map((result) => ({
+      ...result,
+    })),
   };
 }
 
@@ -2117,7 +2470,9 @@ function copyReviewEvidence(evidence: ReviewEvidence): ReviewEvidence {
     ...evidence,
     identity: copyEvidenceIdentity(evidence.identity),
     findings: evidence.findings.map((finding) => ({ ...finding })),
-    acceptanceResults: evidence.acceptanceResults?.map((result) => ({ ...result })),
+    acceptanceResults: evidence.acceptanceResults?.map((result) => ({
+      ...result,
+    })),
   };
 }
 

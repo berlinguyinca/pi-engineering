@@ -19,6 +19,7 @@
 
 import { id } from "../../core/ids.ts";
 import type { EventStoreBackend, StoredEvent } from "../../platform/eventstore/backend.ts";
+import { hashCandidateEvidenceIdentity } from "../evidence.ts";
 import type { MissionPersistenceDiagnostic, MissionStore } from "../missionStore.ts";
 import {
   fromStoredEvent,
@@ -81,7 +82,13 @@ interface MissionObsState {
   taskUnits: Record<string, { completed: number; total: number }>;
   taskWeights: Record<string, number>;
   artifacts: string[];
-  changes: { branch?: string; worktree?: string; changedFiles: string[]; commits: string[]; integrationState: string };
+  changes: {
+    branch?: string;
+    worktree?: string;
+    changedFiles: string[];
+    commits: string[];
+    integrationState: string;
+  };
   lastUpdateEmittedAt?: string;
   lastHeartbeatPersistedAt?: number;
   quietSince?: string;
@@ -132,7 +139,10 @@ export class MissionObservability {
   private readonly nowFn: () => string;
   private readonly states = new Map<string, MissionObsState>();
   private readonly persistenceErrors: MissionPersistenceDiagnostic[] = [];
-  private readonly pendingWrites: Array<{ event: MissionObservabilityEvent; stored: StoredEvent }> = [];
+  private readonly pendingWrites: Array<{
+    event: MissionObservabilityEvent;
+    stored: StoredEvent;
+  }> = [];
   private emitChain: Promise<void> = Promise.resolve();
 
   constructor(opts: MissionObservabilityOptions) {
@@ -292,7 +302,14 @@ export class MissionObservability {
     switch (ev.type) {
       case "MISSION_CREATED":
         s.title = (meta.title as string) ?? ev.summary;
-        s.progressHistory = [{ at: ev.timestamp, approximatePercent: 0, meaningfulProgress: false, label: "created" }];
+        s.progressHistory = [
+          {
+            at: ev.timestamp,
+            approximatePercent: 0,
+            meaningfulProgress: false,
+            label: "created",
+          },
+        ];
         break;
       case "MISSION_PHASE_CHANGED": {
         const label = (meta.phase as string) ?? undefined;
@@ -373,7 +390,13 @@ export class MissionObservability {
           meaningfulProgress: ev.meaningfulProgress,
         };
         this.pushActivity(s, rec);
-        s.currentActivity = { type, summary: ev.summary, workerId, file: rec.file, command: rec.command };
+        s.currentActivity = {
+          type,
+          summary: ev.summary,
+          workerId,
+          file: rec.file,
+          command: rec.command,
+        };
         if (workerId) {
           const w = s.workers.get(workerId);
           if (w) {
@@ -792,7 +815,12 @@ export class MissionObservability {
   workerStarted(
     missionId: string,
     workerId: string,
-    opts: { taskId?: string; model?: string; runtime?: string; host?: string } = {},
+    opts: {
+      taskId?: string;
+      model?: string;
+      runtime?: string;
+      host?: string;
+    } = {},
   ): void {
     this.record({
       missionId,
@@ -800,7 +828,12 @@ export class MissionObservability {
       summary: `Worker started: ${workerId}`,
       workerId,
       taskId: opts.taskId,
-      metadata: { model: opts.model, runtime: opts.runtime, host: opts.host, label: "worker started" },
+      metadata: {
+        model: opts.model,
+        runtime: opts.runtime,
+        host: opts.host,
+        label: "worker started",
+      },
       meaningfulProgress: true,
     });
     this.emitUpdate(missionId, `Worker started: ${workerId}`);
@@ -847,7 +880,14 @@ export class MissionObservability {
       missionId,
       type: "TEST_PROGRESS",
       summary: `Tests ${completed}/${total}`,
-      metadata: { completed, total, passed, failed, skipped, activityType: "running_test" },
+      metadata: {
+        completed,
+        total,
+        passed,
+        failed,
+        skipped,
+        activityType: "running_test",
+      },
       meaningfulProgress: true,
     });
   }
@@ -1092,7 +1132,9 @@ export class MissionObservability {
       weights: s.taskWeights,
       creditRunningWithoutUnits: true,
       historyLabel: s.currentActivity?.type ?? status.toLowerCase(),
+      ...this.acceptanceProgress(missionId),
     });
+    const actionable = this.actionableStatus(missionId, s, health.health);
     return {
       missionId,
       title: s.title,
@@ -1103,6 +1145,8 @@ export class MissionObservability {
         verifiedComplete: s.verifiedComplete,
         basis: progress.basis,
       },
+      acceptanceCoverage: { ...progress.acceptanceCoverage },
+      workflowProgress: { ...progress.workflowProgress },
       health: health.health,
       currentObjective: s.currentObjective,
       currentActivity: s.currentActivity,
@@ -1113,6 +1157,118 @@ export class MissionObservability {
       waitingSince: s.waitingSince,
       completionStatus: s.completionStatus,
       runtimeStartedAt: s.runtimeStartedAt,
+      ...actionable,
+    };
+  }
+
+  private acceptanceProgress(missionId: string): {
+    acceptanceIds: string[];
+    verifiedAcceptanceIds: string[];
+  } {
+    const mission = this.store.getMission(missionId);
+    const acceptanceIds = (mission?.acceptance_criteria ?? []).flatMap((criterion) =>
+      criterion.acceptance_id ? [criterion.acceptance_id] : [],
+    );
+    const candidate = this.store.getCandidate(missionId);
+    if (!candidate) return { acceptanceIds, verifiedAcceptanceIds: [] };
+    const manifest = this.store.getWorkspaceManifest(missionId);
+    const currentGeneration =
+      this.store.getLatestMissionLease(missionId)?.generation ??
+      Math.max(0, ...this.store.listTasks(missionId).map((task) => task.mission_generation ?? 0));
+    const candidateCurrent =
+      !!manifest &&
+      manifest.repositories.length === 1 &&
+      candidate.identity.workspaceManifestHash === manifest.hash &&
+      candidate.identity.missionGeneration === currentGeneration &&
+      manifest.repositories.some(
+        (repository) =>
+          repository.repoId === candidate.identity.repoId && repository.baseSha === candidate.identity.baseSha,
+      );
+    if (!candidateCurrent) return { acceptanceIds, verifiedAcceptanceIds: [] };
+    const invalidated = (recordedAt: string, kind: "validation" | "review") =>
+      this.store
+        .listEvidenceInvalidations(missionId)
+        .some(
+          (entry) =>
+            hashCandidateEvidenceIdentity(entry.identity) === candidate.identityHash &&
+            Date.parse(entry.invalidatedAt) >= Date.parse(recordedAt) &&
+            (entry.scope === undefined || entry.scope === "all" || entry.scope === kind),
+        );
+    const explicitPassing = new Set(
+      [
+        ...this.store
+          .listValidationEvidence(missionId)
+          .filter(
+            (evidence) =>
+              evidence.identityHash === candidate.identityHash && !invalidated(evidence.recordedAt, "validation"),
+          ),
+        ...this.store
+          .listReviewEvidence(missionId)
+          .filter(
+            (evidence) =>
+              evidence.identityHash === candidate.identityHash && !invalidated(evidence.recordedAt, "review"),
+          ),
+      ]
+        .flatMap((evidence) => evidence.acceptanceResults ?? [])
+        .filter((result) => result.status === "passed")
+        .map((result) => result.acceptanceId),
+    );
+    const verifiedAcceptanceIds = (mission?.acceptance_criteria ?? []).flatMap((criterion) =>
+      criterion.acceptance_id &&
+      criterion.status === "passed" &&
+      criterion.evidence === candidate.identityHash &&
+      candidate.identity.acceptanceIds.includes(criterion.acceptance_id) &&
+      explicitPassing.has(criterion.acceptance_id)
+        ? [criterion.acceptance_id]
+        : [],
+    );
+    return { acceptanceIds, verifiedAcceptanceIds };
+  }
+
+  private actionableStatus(
+    missionId: string,
+    s: MissionObsState,
+    health: MissionHealth,
+  ): Pick<
+    MissionObservabilitySummary,
+    "action" | "reason" | "recovery" | "nextAction" | "nextActionAt" | "owner" | "repository" | "task" | "preservedWork"
+  > {
+    const currentResumption = this.store.listMissionResumptions(missionId).at(-1)?.generation ?? 0;
+    const recovery = this.store
+      .listRecoveryDecisions(missionId)
+      .filter((decision) => (decision.resumptionGeneration ?? 0) === currentResumption)
+      .at(-1);
+    const stop = this.store
+      .listMissionStops(missionId)
+      .filter((candidate) => candidate.resumptionGeneration === currentResumption)
+      .at(-1);
+    const task = this.store
+      .listTasks(missionId)
+      .find((candidate) => ["RUNNING", "READY", "WAITING", "BLOCKED", "RETRYING"].includes(candidate.status));
+    const lease = this.store.getMissionLease(missionId);
+    const manifest = this.store.getWorkspaceManifest(missionId);
+    const classification = this.store.listFailureClassifications(missionId).at(-1);
+    const nextAction =
+      stop?.resumeCondition ?? recovery?.expectedMaterialChange ?? task?.objective ?? "No further action is scheduled";
+    return {
+      action:
+        recovery?.action ??
+        s.currentActivity?.summary ??
+        task?.objective ??
+        this.store.getMission(missionId)?.status ??
+        "UNKNOWN",
+      reason:
+        stop?.reason ?? classification?.summary ?? recovery?.expectedMaterialChange ?? `Mission health is ${health}`,
+      recovery: {
+        attempt: recovery?.attempt ?? 0,
+        maxAttempts: recovery?.maxAttempts ?? 0,
+      },
+      nextAction,
+      ...(recovery?.nextActionAt ? { nextActionAt: recovery.nextActionAt } : {}),
+      owner: lease?.ownerId ?? null,
+      repository: task?.repo_id ?? manifest?.repositories[0]?.repoId ?? null,
+      task: task?.task_id ?? null,
+      preservedWork: [...(stop?.preservedWork ?? [])],
     };
   }
 
@@ -1139,7 +1295,11 @@ export class MissionObservability {
     return [...s.workers.values()].some((w) => w.state === "running" || w.state === "waiting");
   }
 
-  private workerCounts(s: MissionObsState): { active: number; waiting: number; failed: number } {
+  private workerCounts(s: MissionObsState): {
+    active: number;
+    waiting: number;
+    failed: number;
+  } {
     let active = 0;
     let waiting = 0;
     let failed = 0;
@@ -1165,6 +1325,7 @@ export class MissionObservability {
       units: s.taskUnits,
       weights: s.taskWeights,
       creditRunningWithoutUnits: true,
+      ...this.acceptanceProgress(missionId),
     });
     const workers: WorkerObservability[] = [];
     for (const w of s.workers.values()) {

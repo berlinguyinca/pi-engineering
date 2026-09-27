@@ -31,8 +31,8 @@ import type {
 import type { WorkerActivity } from "../workers/WorkerExecutor.ts";
 import { sanitizeWorkerActivity } from "../workers/activity.ts";
 import type { CheckpointManager, CheckpointSnapshot } from "./checkpoints.ts";
-import { EvidenceUnavailableError, buildCandidateEvidenceIdentity, hashCandidateEvidenceIdentity } from "./evidence.ts";
-import type { LateExecutionEvidence, MissionStore } from "./missionStore.ts";
+import { EvidenceUnavailableError, buildCandidateEvidenceIdentity } from "./evidence.ts";
+import type { GateEvidencePublication, LateExecutionEvidence, MissionStore } from "./missionStore.ts";
 import type { DispatchAuthority } from "./ownership.ts";
 import { replacementRecoveryFingerprint, replacementTaskFingerprintSpec } from "./recovery.ts";
 import type { ExecutionBackend, RecoveredMerge, ReviewEvidence, ValidationEvidence } from "./types.ts";
@@ -197,7 +197,9 @@ function lateEvidence(
       summary: handoff.summary,
       artifacts: [...handoff.artifacts],
     })),
-    recovery: (outcome?.recoveredMerged ?? []).map((recovered) => ({ ...recovered })),
+    recovery: (outcome?.recoveredMerged ?? []).map((recovered) => ({
+      ...recovered,
+    })),
     gate: {
       requiredOutputArtifacts: [...(input.requiredOutputArtifacts ?? [])],
       reviewedRecovered: [...(input.reviewedRecovered ?? [])],
@@ -375,7 +377,13 @@ export interface BrokerOptions {
     missionId: string,
   ) => Promise<{ repoId: string; root: string; git: GitRepo }>;
   /** Execution-local live worker activity with durable orchestration identity. */
-  onActivity?: (event: WorkerActivity & { missionId: string; taskId: string; executionId: string }) => void;
+  onActivity?: (
+    event: WorkerActivity & {
+      missionId: string;
+      taskId: string;
+      executionId: string;
+    },
+  ) => void;
   /** Periodic liveness detail for every backend while it is running. */
   activityHeartbeatMs?: number;
   checkpoints?: CheckpointManager;
@@ -411,17 +419,35 @@ export class ExecutionBroker {
   /** Allocated worktrees, cleaned up when their execution settles. */
   readonly allocatedWorktrees = new Map<
     string,
-    { path: string; branch: string; git: GitRepo; repoId?: string; writeDomains: string[] }
+    {
+      path: string;
+      branch: string;
+      git: GitRepo;
+      repoId?: string;
+      writeDomains: string[];
+    }
   >();
   /** Mission-scoped worktrees awaiting integration (merged+cleaned by the integrator). */
   private readonly missionWorktrees = new Map<
     string,
-    Array<{ path: string; branch: string; git: GitRepo; repoId?: string; writeDomains: string[] }>
+    Array<{
+      path: string;
+      branch: string;
+      git: GitRepo;
+      repoId?: string;
+      writeDomains: string[];
+    }>
   >();
   /** Successfully integrated worktrees awaiting separately owned cleanup. */
   private readonly deferredCleanup = new Map<
     string,
-    Array<{ path: string; branch: string; git: GitRepo; repoId?: string; writeDomains: string[] }>
+    Array<{
+      path: string;
+      branch: string;
+      git: GitRepo;
+      repoId?: string;
+      writeDomains: string[];
+    }>
   >();
   private readonly missionRepositories = new Map<string, { repoId?: string; root: string; git: GitRepo }>();
   /** Isolated integration candidates. Failed/red/canceled candidates remain inspectable. */
@@ -743,7 +769,12 @@ export class ExecutionBroker {
           .getWorkspaceManifest(input.missionId)
           ?.repositories.find((repository) => repository.repoId === input.repoId);
         if (!binding) throw new Error(`WORKSPACE_SCOPE_MISMATCH: unknown repository binding ${input.repoId}`);
-        if (this.git) return { repoId: input.repoId, root: binding.canonicalRoot, git: this.git };
+        if (this.git)
+          return {
+            repoId: input.repoId,
+            root: binding.canonicalRoot,
+            git: this.git,
+          };
         if (!input.mutatesRepo || input.isolation === "none") return null;
         throw new Error(`WORKSPACE_SCOPE_MISMATCH: no repository provider for ${input.repoId}`);
       }
@@ -760,21 +791,21 @@ export class ExecutionBroker {
     return { root: this.git.root, git: this.git };
   }
 
-  private async recordGateEvidence(
+  private async buildGateEvidencePublication(
     input: ExecutionRequestInput,
     executionId: string,
     backend: ExecutionBackend,
     outcome: ExecutionOutcome,
     repository: { repoId?: string; root: string; git: GitRepo } | null,
-  ): Promise<void> {
-    if (!input.repoId || !["integration", "validation", "review"].includes(backend)) return;
+  ): Promise<GateEvidencePublication | null> {
+    if (!input.repoId || !["integration", "validation", "review"].includes(backend)) return null;
     const manifest = this.store.getWorkspaceManifest(input.missionId);
     const binding = manifest?.repositories.find((candidate) => candidate.repoId === input.repoId);
     const execution = this.store.getExecution(executionId);
     const task = this.store.getTask(input.taskId);
     // Legacy/non-gated broker uses may not have a workspace manifest. Do not
     // synthesize evidence for them; absence remains visible to the gate.
-    if (!manifest || !binding || !execution || !task) return;
+    if (!manifest || !binding || !execution || !task) return null;
     if (!repository) throw new EvidenceUnavailableError(`no repository-scoped Git target for ${input.repoId}`);
 
     const candidateTarget = this.missionCandidates.get(input.missionId);
@@ -799,37 +830,40 @@ export class ExecutionBroker {
       acceptanceIds,
       artifactHashes: candidateArtifacts,
     });
-    const candidate = this.store.recordCandidate(
-      input.missionId,
+    return {
+      executionId,
+      exitStatus: outcome.exitStatus,
+      artifactRefs: [...outcome.artifactRefs],
+      usage: structuredClone(outcome.usage),
+      ...(outcome.recoveredMerged?.length ? { recoveredMerged: [...outcome.recoveredMerged] } : {}),
+      ...(backend === "review" && input.reviewedRecovered?.length
+        ? { reviewedRecovered: [...input.reviewedRecovered] }
+        : {}),
       identity,
-      backend === "integration" ? "integration" : `${backend} target`,
-      { taskId: input.taskId, executionId },
-    );
-    const recordedAt = new Date().toISOString();
-    if (backend === "validation" && outcome.validationEvidence) {
-      this.store.recordValidationEvidence({
-        evidenceId: id("VE"),
-        missionId: input.missionId,
-        taskId: input.taskId,
-        executionId,
-        identity: candidate.identity,
-        identityHash: candidate.identityHash,
-        ...outcome.validationEvidence,
-        recordedAt,
-      });
-    }
-    if (backend === "review" && outcome.reviewEvidence) {
-      this.store.recordReviewEvidence({
-        evidenceId: id("RE"),
-        missionId: input.missionId,
-        taskId: input.taskId,
-        executionId,
-        identity: candidate.identity,
-        identityHash: hashCandidateEvidenceIdentity(candidate.identity),
-        ...outcome.reviewEvidence,
-        recordedAt,
-      });
-    }
+      reason: backend === "integration" ? "integration" : `${backend} target`,
+      ...(backend === "validation" && outcome.validationEvidence
+        ? {
+            validationEvidence: {
+              evidenceId: id("VE"),
+              missionId: input.missionId,
+              taskId: input.taskId,
+              executionId,
+              ...outcome.validationEvidence,
+            },
+          }
+        : {}),
+      ...(backend === "review" && outcome.reviewEvidence
+        ? {
+            reviewEvidence: {
+              evidenceId: id("RE"),
+              missionId: input.missionId,
+              taskId: input.taskId,
+              executionId,
+              ...outcome.reviewEvidence,
+            },
+          }
+        : {}),
+    };
   }
 
   /**
@@ -1327,9 +1361,11 @@ export class ExecutionBroker {
   }
 
   /** Recompute candidate content identity from Git; durable metadata is not trusted as mutation proof. */
-  async verifiedCandidateContent(
-    missionId: string,
-  ): Promise<{ candidateSha: string; diffHash: string; hasChanges: boolean } | null> {
+  async verifiedCandidateContent(missionId: string): Promise<{
+    candidateSha: string;
+    diffHash: string;
+    hasChanges: boolean;
+  } | null> {
     const manifest = this.store.getWorkspaceManifest(missionId);
     const candidate = this.store.getCandidate(missionId);
     if (!manifest || !candidate || !this.resolveRepository) return null;
@@ -1344,7 +1380,11 @@ export class ExecutionBroker {
     const diff = await repository.git.captureDiff(binding.baseSha, candidateSha);
     const diffHash = artifactHash(diff);
     if (diffHash !== candidate.identity.diffHash) return null;
-    return { candidateSha, diffHash, hasChanges: candidateSha !== binding.baseSha && diff.trim().length > 0 };
+    return {
+      candidateSha,
+      diffHash,
+      hasChanges: candidateSha !== binding.baseSha && diff.trim().length > 0,
+    };
   }
 
   /** Read-only fail-closed preflight for Git journals consumed by recovery. */
@@ -1369,7 +1409,13 @@ export class ExecutionBroker {
           ["cleanup", await git.loadPendingBranchCleanupInventory(missionId, repoId)],
         ] as const;
         for (const [recordKind, inventory] of inventories) {
-          diagnostics.push(...inventory.diagnostics.map((diagnostic) => ({ repoId, recordKind, ...diagnostic })));
+          diagnostics.push(
+            ...inventory.diagnostics.map((diagnostic) => ({
+              repoId,
+              recordKind,
+              ...diagnostic,
+            })),
+          );
         }
       } catch (error) {
         diagnostics.push({
@@ -1511,7 +1557,10 @@ export class ExecutionBroker {
           try {
             assertOrigin?.();
             await candidate.git.removeWorktree(
-              { path: candidate.lifecycle.path, branch: candidate.lifecycle.branch },
+              {
+                path: candidate.lifecycle.path,
+                branch: candidate.lifecycle.branch,
+              },
               { keepBranch: true },
               acquired,
             );
@@ -1649,7 +1698,10 @@ export class ExecutionBroker {
           try {
             await wt.git.removeWorktree(
               { path: wt.path, branch: wt.branch },
-              { keepBranch: keep, cleanupIdentity: { missionId, repoId: wt.repoId ?? "" } },
+              {
+                keepBranch: keep,
+                cleanupIdentity: { missionId, repoId: wt.repoId ?? "" },
+              },
               assertOrigin ? { assertAuthoritative: assertOrigin } : undefined,
             );
           } catch (error) {
@@ -1733,7 +1785,11 @@ export class ExecutionBroker {
   private async preserveCandidate(missionId: string, authority?: DispatchAuthority): Promise<void> {
     const candidate = this.missionCandidates.get(missionId);
     if (!candidate || candidate.lifecycle.state === "promoted") return;
-    candidate.lifecycle = { ...candidate.lifecycle, state: "preserved", updatedAt: new Date().toISOString() };
+    candidate.lifecycle = {
+      ...candidate.lifecycle,
+      state: "preserved",
+      updatedAt: new Date().toISOString(),
+    };
     await candidate.git.persistCandidateLifecycle(candidate.lifecycle, authority);
   }
 
@@ -1784,7 +1840,10 @@ export class ExecutionBroker {
     }
     if (!candidate) return false;
     authority?.assertAuthoritative();
-    const worktree = { path: candidate.lifecycle.path, branch: candidate.lifecycle.branch };
+    const worktree = {
+      path: candidate.lifecycle.path,
+      branch: candidate.lifecycle.branch,
+    };
     const result = await candidate.git.promoteCandidate(
       worktree,
       candidate.lifecycle.baseSha,
@@ -1936,7 +1995,11 @@ export class ExecutionBroker {
           let activitySettled = false;
           let activityTimer: ReturnType<typeof setInterval> | undefined;
           let checkpointTimer: ReturnType<typeof setTimeout> | undefined;
-          let repository: { repoId?: string; root: string; git: GitRepo } | null = null;
+          let repository: {
+            repoId?: string;
+            root: string;
+            git: GitRepo;
+          } | null = null;
           let meaningfulActivity = 0;
           let checkpointScheduling = true;
           let retainWorktreeOnCleanup = false;
@@ -2081,7 +2144,13 @@ export class ExecutionBroker {
             }
             activitySettled = true;
           };
-          emitActivity({ kind: "execution", phase: "started", stage: backend, summary: "", meaningfulProgress: false });
+          emitActivity({
+            kind: "execution",
+            phase: "started",
+            stage: backend,
+            summary: "",
+            meaningfulProgress: false,
+          });
           activityTimer =
             this.activityHeartbeatMs > 0
               ? setInterval(() => {
@@ -2187,14 +2256,20 @@ export class ExecutionBroker {
               repository,
             )
               .then((outcome) => ({ kind: "backend_result" as const, outcome }))
-              .catch((error: unknown) => ({ kind: "backend_error" as const, error }))
+              .catch((error: unknown) => ({
+                kind: "backend_error" as const,
+                error,
+              }))
               .finally(acknowledgeWriterSettled);
             let removeAbortRaceListener = (): void => {};
             const aborted = new Promise<{ kind: "aborted" }>((resolve) => {
               const listener = (): void => resolve({ kind: "aborted" });
               removeAbortRaceListener = () => abort.signal.removeEventListener("abort", listener);
               if (abort.signal.aborted) resolve({ kind: "aborted" });
-              else abort.signal.addEventListener("abort", listener, { once: true });
+              else
+                abort.signal.addEventListener("abort", listener, {
+                  once: true,
+                });
             });
             const first = await Promise.race([backendSettlement, aborted]);
             removeAbortRaceListener();
@@ -2316,7 +2391,10 @@ export class ExecutionBroker {
               const info = this.allocatedWorktrees.get(execution.execution_id);
               if (info) {
                 const byBranch = this.failedBranches.get(input.missionId) ?? new Map();
-                byBranch.set(info.branch, { marker: "WORKSPACE_SCOPE_MISMATCH", taskId: input.taskId });
+                byBranch.set(info.branch, {
+                  marker: "WORKSPACE_SCOPE_MISMATCH",
+                  taskId: input.taskId,
+                });
                 this.failedBranches.set(input.missionId, byBranch);
               }
             }
@@ -2328,16 +2406,24 @@ export class ExecutionBroker {
             if (!succeeded && (backend === "integration" || backend === "validation" || backend === "review")) {
               await this.preserveCandidate(input.missionId, input.authority);
             }
-            this.store.setExecutionStatus(execution.execution_id, succeeded ? "SUCCEEDED" : "FAILED", {
-              exit_status: outcome.exitStatus,
-              artifact_refs: outcome.artifactRefs,
-              usage: outcome.usage,
-              ...(outcome.recoveredMerged?.length ? { recovered_merged: outcome.recoveredMerged } : {}),
-              ...(backend === "review" && input.reviewedRecovered?.length
-                ? { reviewed_recovered: [...input.reviewedRecovered] }
-                : {}),
-            });
-            if (succeeded) await this.recordGateEvidence(input, execution.execution_id, backend, outcome, repository);
+            const gatePublication = succeeded
+              ? await this.buildGateEvidencePublication(input, execution.execution_id, backend, outcome, repository)
+              : null;
+            input.authority?.assertAuthoritative();
+            this.store.assertExecutionAuthoritative(execution.execution_id);
+            if (gatePublication) {
+              await this.store.publishGateEvidenceIfAuthoritative(gatePublication);
+            } else {
+              this.store.setExecutionStatus(execution.execution_id, succeeded ? "SUCCEEDED" : "FAILED", {
+                exit_status: outcome.exitStatus,
+                artifact_refs: outcome.artifactRefs,
+                usage: outcome.usage,
+                ...(outcome.recoveredMerged?.length ? { recovered_merged: outcome.recoveredMerged } : {}),
+                ...(backend === "review" && input.reviewedRecovered?.length
+                  ? { reviewed_recovered: [...input.reviewedRecovered] }
+                  : {}),
+              });
+            }
             this.active.delete(execution.execution_id);
             emitActivity({
               kind: "execution",
@@ -2548,7 +2634,10 @@ export class ExecutionBroker {
         input.authority?.assertAuthoritative();
         const reconciled = await repository.git.reconcileCandidateWorktree(lifecycle, input.authority);
         if (reconciled) {
-          this.missionCandidates.set(input.missionId, { lifecycle, git: repository.git });
+          this.missionCandidates.set(input.missionId, {
+            lifecycle,
+            git: repository.git,
+          });
         }
       }
     }
@@ -2581,7 +2670,12 @@ export class ExecutionBroker {
       case "process": {
         const runner = this.backends.process;
         if (!runner) throw new Error("no process backend registered");
-        return runner.runProcess({ repoId: input.repoId, objective: input.objective, worktree: base.worktree, signal });
+        return runner.runProcess({
+          repoId: input.repoId,
+          objective: input.objective,
+          worktree: base.worktree,
+          signal,
+        });
       }
       case "review": {
         const runner = this.backends.review;
@@ -2678,7 +2772,11 @@ export class ExecutionBroker {
               }
             }
             assertOrigin();
-            handoffs.push({ worktree: w, summary: input.objective, artifacts: [] });
+            handoffs.push({
+              worktree: w,
+              summary: input.objective,
+              artifacts: [],
+            });
             continue;
           }
           // Exactly the worker's wall-clock marker (PiWorkerExecutor: error
@@ -2698,7 +2796,11 @@ export class ExecutionBroker {
           }
           if (ahead > 0) {
             assertOrigin();
-            recoveredMeta.push({ task_id: failure.taskId, branch: w.branch, ref: failure.recoverRef });
+            recoveredMeta.push({
+              task_id: failure.taskId,
+              branch: w.branch,
+              ref: failure.recoverRef,
+            });
             recovered.push({
               worktree: w,
               ref: failure.recoverRef,
@@ -2737,7 +2839,12 @@ export class ExecutionBroker {
           repoId: input.repoId,
           objective: input.objective,
           handoffs,
-          candidate: candidate ? { path: candidate.lifecycle.path, branch: candidate.lifecycle.branch } : undefined,
+          candidate: candidate
+            ? {
+                path: candidate.lifecycle.path,
+                branch: candidate.lifecycle.branch,
+              }
+            : undefined,
           candidateLifecycle: candidate?.lifecycle,
           integrationRun,
           authority: input.authority,

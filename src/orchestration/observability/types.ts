@@ -14,6 +14,12 @@
 /** Mission health (spec 03). */
 export type MissionHealth = "active" | "waiting" | "slow" | "stalled" | "blocked" | "failed" | "complete";
 
+export interface ProgressMeasure {
+  completed: number;
+  total: number;
+  approximatePercent: number;
+}
+
 /** Completion verification status (spec 07). */
 export type CompletionStatus =
   | "not_ready"
@@ -216,6 +222,10 @@ export interface MissionObservabilitySummary {
     verifiedComplete: boolean;
     basis: "weighted_dag" | "inferred";
   };
+  /** Primary user-facing measure: current candidate acceptance evidence. */
+  acceptanceCoverage: ProgressMeasure;
+  /** Secondary diagnostic: orchestration mechanics completed. */
+  workflowProgress: ProgressMeasure & { basis: "weighted_dag" | "inferred" };
   health: MissionHealth;
   currentObjective?: string;
   currentActivity?: CurrentActivity;
@@ -226,6 +236,15 @@ export interface MissionObservabilitySummary {
   waitingSince?: string;
   completionStatus: CompletionStatus;
   runtimeStartedAt?: string;
+  action: string;
+  reason: string;
+  recovery: { attempt: number; maxAttempts: number };
+  nextAction: string;
+  nextActionAt?: string;
+  owner: string | null;
+  repository: string | null;
+  task: string | null;
+  preservedWork: string[];
 }
 
 /** The derived projection/read model (spec 05). */

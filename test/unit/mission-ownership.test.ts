@@ -59,7 +59,11 @@ describe("MissionOwnership", () => {
     let now = Date.parse("2026-09-26T10:00:00.000Z");
     const store = MissionStore.open(JsonlEventStore.inMemory());
     mission(store, "M-1");
-    const ownership = new MissionOwnership(store, { ownerId: "controller-a", now: () => now, leaseMs: 60_000 });
+    const ownership = new MissionOwnership(store, {
+      ownerId: "controller-a",
+      now: () => now,
+      leaseMs: 60_000,
+    });
 
     const acquired = await ownership.acquire("M-1");
     now += 30_000;
@@ -74,10 +78,17 @@ describe("MissionOwnership", () => {
   it("does not let one overlapping same-owner flight release another flight's epoch", async () => {
     const store = MissionStore.open(JsonlEventStore.inMemory());
     mission(store, "M-overlap");
-    const ownership = new MissionOwnership(store, { ownerId: "controller", leaseMs: 60_000 });
+    const ownership = new MissionOwnership(store, {
+      ownerId: "controller",
+      leaseMs: 60_000,
+    });
 
-    const first = await ownership.acquire("M-overlap", { resumptionGeneration: 0 });
-    const second = await ownership.acquire("M-overlap", { resumptionGeneration: 0 });
+    const first = await ownership.acquire("M-overlap", {
+      resumptionGeneration: 0,
+    });
+    const second = await ownership.acquire("M-overlap", {
+      resumptionGeneration: 0,
+    });
     assert.equal(first.generation, second.generation);
 
     await ownership.release(first);
@@ -88,14 +99,69 @@ describe("MissionOwnership", () => {
     assert.equal(store.getMissionLease("M-overlap"), undefined);
   });
 
+  it("reference-counts overlapping same-owner repository authorities by exact lease epoch", async () => {
+    const store = MissionStore.open(JsonlEventStore.inMemory());
+    mission(store, "M-repo-overlap");
+    const ownership = new MissionOwnership(store, {
+      ownerId: "controller",
+      leaseMs: 60_000,
+    });
+    const missionIdentity = await ownership.acquire("M-repo-overlap", {
+      resumptionGeneration: 0,
+    });
+
+    const first = await ownership.maintain(missionIdentity, "repo-shared-epoch");
+    const second = await ownership.maintain(missionIdentity, "repo-shared-epoch");
+    assert.equal(first.repositoryIdentity?.generation, second.repositoryIdentity?.generation);
+    assert.equal(first.repositoryIdentity?.fencingToken, second.repositoryIdentity?.fencingToken);
+
+    await first.close();
+
+    assert.doesNotThrow(() => second.assertAuthoritative());
+    assert.deepEqual(store.getRepositoryLeaseByRepoId("repo-shared-epoch"), second.repositoryIdentity);
+    await second.close();
+    assert.equal(store.getRepositoryLeaseByRepoId("repo-shared-epoch"), undefined);
+  });
+
+  it("cannot let a stale resumption epoch release the fresh owner's repository lease", async () => {
+    const store = MissionStore.open(JsonlEventStore.inMemory());
+    mission(store, "M-repo-resume");
+    const ownership = new MissionOwnership(store, {
+      ownerId: "controller",
+      leaseMs: 60_000,
+    });
+    const staleMission = await ownership.acquire("M-repo-resume", {
+      resumptionGeneration: 0,
+    });
+    const stale = await ownership.maintain(staleMission, "repo-resume");
+
+    store.resumeMission("M-repo-resume", "operator resumed while repository work was active");
+    const currentMission = await ownership.acquire("M-repo-resume", {
+      resumptionGeneration: 1,
+    });
+    const current = await ownership.maintain(currentMission, "repo-resume");
+
+    assert.ok(await stale.close(), "stale close reports authority loss");
+    assert.doesNotThrow(() => current.assertAuthoritative());
+    assert.deepEqual(store.getRepositoryLeaseByRepoId("repo-resume"), current.repositoryIdentity);
+    await current.close();
+  });
+
   it("fences the prior resumption epoch before the same owner acquires the next one", async () => {
     const store = MissionStore.open(JsonlEventStore.inMemory());
     mission(store, "M-resume");
-    const ownership = new MissionOwnership(store, { ownerId: "controller", leaseMs: 60_000 });
-    const stale = await ownership.acquire("M-resume", { resumptionGeneration: 0 });
+    const ownership = new MissionOwnership(store, {
+      ownerId: "controller",
+      leaseMs: 60_000,
+    });
+    const stale = await ownership.acquire("M-resume", {
+      resumptionGeneration: 0,
+    });
 
     store.resumeMission("M-resume", "explicit operator resumption");
-    const current = await ownership.acquire("M-resume", { resumptionGeneration: 1 });
+    const current = await ownership.acquire("M-resume", {
+      resumptionGeneration: 1,
+    });
 
     assert.equal(current.generation, stale.generation + 1);
     assert.equal(current.resumptionGeneration, 1);
@@ -109,7 +175,11 @@ describe("MissionOwnership", () => {
     let now = Date.parse("2026-09-26T10:00:00.000Z");
     const store = MissionStore.open(JsonlEventStore.inMemory());
     mission(store, "M-1");
-    const firstOwner = new MissionOwnership(store, { ownerId: "controller-a", now: () => now, leaseMs: 10_000 });
+    const firstOwner = new MissionOwnership(store, {
+      ownerId: "controller-a",
+      now: () => now,
+      leaseMs: 10_000,
+    });
     const first = await firstOwner.acquire("M-1");
     const firstRepository = await firstOwner.acquireRepository(first, "repo-takeover");
     now += 5_000;
@@ -118,7 +188,11 @@ describe("MissionOwnership", () => {
     now += 5_001;
     assert.throws(() => firstOwner.assertAuthoritative(first), /expired/i);
     await assert.rejects(() => firstOwner.renew(first), /expired/i);
-    const secondOwner = new MissionOwnership(store, { ownerId: "controller-b", now: () => now, leaseMs: 10_000 });
+    const secondOwner = new MissionOwnership(store, {
+      ownerId: "controller-b",
+      now: () => now,
+      leaseMs: 10_000,
+    });
     const second = await secondOwner.acquire("M-1");
 
     assert.equal(second.generation, 2);
@@ -134,7 +208,10 @@ describe("MissionOwnership", () => {
     const store = MissionStore.open(JsonlEventStore.inMemory());
     mission(store, "M-1");
     mission(store, "M-2");
-    const owner = new MissionOwnership(store, { ownerId: "controller", leaseMs: 60_000 });
+    const owner = new MissionOwnership(store, {
+      ownerId: "controller",
+      leaseMs: 60_000,
+    });
     const firstMission = await owner.acquire("M-1");
     const secondMission = await owner.acquire("M-2");
     await owner.acquireRepository(firstMission, "repo-shared");
@@ -146,7 +223,11 @@ describe("MissionOwnership", () => {
     const { MissionOwnership } = await import("../../src/orchestration/ownership.ts");
     const store = MissionStore.open(JsonlEventStore.inMemory());
     mission(store, "M-1");
-    const owner = new MissionOwnership(store, { ownerId: "controller", leaseMs: 5_000, heartbeatMs: 10 });
+    const owner = new MissionOwnership(store, {
+      ownerId: "controller",
+      leaseMs: 5_000,
+      heartbeatMs: 10,
+    });
     const missionIdentity = await owner.acquire("M-1");
     const authority = await owner.maintain(missionIdentity, "repo-long");
     const firstRenewBy = authority.missionIdentity.renewBy;
@@ -172,7 +253,11 @@ describe("MissionOwnership", () => {
     const backend1 = await JsonlEventStore.open(file);
     const store1 = MissionStore.open(backend1);
     mission(store1, "M-1");
-    const ownership1 = new MissionOwnership(store1, { ownerId: "controller-a", now: () => now, leaseMs: 10_000 });
+    const ownership1 = new MissionOwnership(store1, {
+      ownerId: "controller-a",
+      now: () => now,
+      leaseMs: 10_000,
+    });
     const stale = await ownership1.acquire("M-1");
     await store1.flush();
     backend1.close();
@@ -180,7 +265,11 @@ describe("MissionOwnership", () => {
     now += 10_001;
     const backend2 = await JsonlEventStore.open(file);
     const store2 = MissionStore.open(backend2);
-    const ownership2 = new MissionOwnership(store2, { ownerId: "controller-b", now: () => now, leaseMs: 10_000 });
+    const ownership2 = new MissionOwnership(store2, {
+      ownerId: "controller-b",
+      now: () => now,
+      leaseMs: 10_000,
+    });
     const current = await ownership2.acquire("M-1");
 
     assert.equal(current.generation, 2);
@@ -193,8 +282,16 @@ describe("MissionOwnership", () => {
     const root = await mkdtemp(join(tmpdir(), "pie-runtime-ownership-"));
     const workDir = join(root, ".pi-eng");
     const file = join(workDir, "orchestration.jsonl");
-    const first = await EngineeringRuntime.open({ cwd: root, workDir, worker: new FakeWorkerExecutor({}) });
-    const second = await EngineeringRuntime.open({ cwd: root, workDir, worker: new FakeWorkerExecutor({}) });
+    const first = await EngineeringRuntime.open({
+      cwd: root,
+      workDir,
+      worker: new FakeWorkerExecutor({}),
+    });
+    const second = await EngineeringRuntime.open({
+      cwd: root,
+      workDir,
+      worker: new FakeWorkerExecutor({}),
+    });
 
     await first.close();
     await assert.rejects(() => JsonlEventStore.open(file), /already open|writer lock/i);
@@ -209,8 +306,16 @@ describe("MissionOwnership", () => {
     const workDir = join(root, ".pi-eng");
     const file = join(workDir, "orchestration.jsonl");
     const [first, second] = await Promise.all([
-      EngineeringRuntime.open({ cwd: root, workDir, worker: new FakeWorkerExecutor({}) }),
-      EngineeringRuntime.open({ cwd: root, workDir, worker: new FakeWorkerExecutor({}) }),
+      EngineeringRuntime.open({
+        cwd: root,
+        workDir,
+        worker: new FakeWorkerExecutor({}),
+      }),
+      EngineeringRuntime.open({
+        cwd: root,
+        workDir,
+        worker: new FakeWorkerExecutor({}),
+      }),
     ]);
     assert.strictEqual(first, second);
 
@@ -245,7 +350,11 @@ describe("MissionOwnership", () => {
     const root = await mkdtemp(join(tmpdir(), "pie-runtime-close-retry-"));
     const workDir = join(root, ".pi-eng");
     const file = join(workDir, "orchestration.jsonl");
-    const runtime = await EngineeringRuntime.open({ cwd: root, workDir, worker: new FakeWorkerExecutor({}) });
+    const runtime = await EngineeringRuntime.open({
+      cwd: root,
+      workDir,
+      worker: new FakeWorkerExecutor({}),
+    });
     const store = runtime.missionStore!;
     const originalFlush = store.flush.bind(store);
     let attempts = 0;
@@ -276,7 +385,9 @@ describe("MissionOwnership", () => {
       store,
       backends: {},
       planner: async () => [],
-      ownership: new FailingReleaseOwnership(store, { ownerId: "release-test" }),
+      ownership: new FailingReleaseOwnership(store, {
+        ownerId: "release-test",
+      }),
     });
 
     const result = await orchestrator.orchestrate("Explain the ownership model", {

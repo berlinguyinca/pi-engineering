@@ -98,7 +98,12 @@ export interface OrchestratorOptions {
   /** Called on each mission phase transition. */
   onPhase?: (mission: Mission, phase: string) => void;
   parentSessionId?: string | null;
-  limits?: { maxActive?: number; maxAgents?: number; maxSubprocesses?: number; maxPerRole?: number };
+  limits?: {
+    maxActive?: number;
+    maxAgents?: number;
+    maxSubprocesses?: number;
+    maxPerRole?: number;
+  };
   router?: IntentRouter;
   /**
    * Maximum gate-driven repair rounds (spec 07). Each round repairs the open
@@ -214,7 +219,11 @@ export class Orchestrator {
               repoId,
               writableDomains,
             );
-            return { repoId: context.repoId, root: context.root, git: context.git };
+            return {
+              repoId: context.repoId,
+              root: context.root,
+              git: context.git,
+            };
           }
         : undefined,
       baseRef: opts.baseRef ?? "",
@@ -870,6 +879,7 @@ export class Orchestrator {
         missionId,
         signal,
         repairDecision.action === "CREATE_REPAIR_TASKS" ? candidateIdentityBefore : undefined,
+        expectedResumptionGeneration,
       );
       this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
       this.store.transitionRecovery(repairDecision.recoveryId, finalized.completed ? "succeeded" : "failed");
@@ -978,14 +988,21 @@ export class Orchestrator {
   }
 
   private observeWorkerActivity(
-    event: WorkerActivity & { missionId: string; taskId: string; executionId: string },
+    event: WorkerActivity & {
+      missionId: string;
+      taskId: string;
+      executionId: string;
+    },
   ): void {
     const obs = this.observability;
     if (!this.observedExecutions.has(event.executionId)) {
       this.observedExecutions.add(event.executionId);
       this.taskExecutions.set(`${event.missionId}:${event.taskId}`, event.executionId);
       const task = this.store.getTask(event.taskId);
-      obs?.workerStarted(event.missionId, event.executionId, { taskId: event.taskId, runtime: "pi" });
+      obs?.workerStarted(event.missionId, event.executionId, {
+        taskId: event.taskId,
+        runtime: "pi",
+      });
       if (task) {
         obs?.taskStarted(event.missionId, event.taskId, task.objective);
         obs?.setCurrentObjective(event.missionId, task.objective);
@@ -1063,10 +1080,18 @@ export class Orchestrator {
       obs.taskStarted(missionId, taskId, label);
       obs.taskCompleted(missionId, taskId, label);
       obs.workerCompleted(missionId, workerId);
-      obs.activity(missionId, { type: "worker_completed", summary: "Task completed", workerId });
+      obs.activity(missionId, {
+        type: "worker_completed",
+        summary: "Task completed",
+        workerId,
+      });
     } else if (obs && status === "FAILED") {
       obs.workerFailed(missionId, workerId);
-      obs.activity(missionId, { type: "error", summary: "Task failed", workerId });
+      obs.activity(missionId, {
+        type: "error",
+        summary: "Task failed",
+        workerId,
+      });
       obs.recordError(missionId, "task_failed", `task ${taskId} settled ${status}`);
     }
     this.taskExecutions.delete(`${missionId}:${taskId}`);
@@ -1303,7 +1328,9 @@ export class Orchestrator {
           fact.changedFiles = [request];
         }
         const { gates } = deriveRequiredGates(fact);
-        this.store.updateMission(mission.mission_id, { required_gates: dedupe([...gates]) });
+        this.store.updateMission(mission.mission_id, {
+          required_gates: dedupe([...gates]),
+        });
       }
       this.phase(this.store.getMission(mission.mission_id)!, "classified");
       this.store.transitionMission(mission.mission_id, "PLANNING");
@@ -1321,7 +1348,12 @@ export class Orchestrator {
         this.store.transitionMission(mission.mission_id, "EXECUTING");
         this.store.transitionMission(mission.mission_id, "FINAL_VALIDATION");
         this.observeGatePassed(mission.mission_id);
-        this.store.completeMission(mission.mission_id);
+        this.store.completeMission(mission.mission_id, {
+          expectedResumptionGeneration:
+            this.ownershipByMission.get(mission.mission_id)?.resumptionGeneration ??
+            this.store.listMissionResumptions(mission.mission_id).at(-1)?.generation ??
+            0,
+        });
         const final = this.store.getMission(mission.mission_id)!;
         const verdict = this.gate.evaluate(final);
         return {
@@ -1607,6 +1639,9 @@ export class Orchestrator {
     missionId: string,
     signal?: AbortSignal,
     requiredCandidateChangeFrom?: string | null,
+    expectedResumptionGeneration = this.ownershipByMission.get(missionId)?.resumptionGeneration ??
+      this.store.listMissionResumptions(missionId).at(-1)?.generation ??
+      0,
   ): Promise<FinalizationResult> {
     if (signal?.aborted) return this.canceledFinalization(missionId);
     await this.reconcileCommittedPromotions(missionId);
@@ -1765,7 +1800,9 @@ export class Orchestrator {
           ...this.boundedTaskFields(missionId, ["repair"], []),
         });
         this.store.transitionTask(repair.task_id, "READY");
-        const repaired = await this.runSingleTask(missionId, repair.task_id, { signal });
+        const repaired = await this.runSingleTask(missionId, repair.task_id, {
+          signal,
+        });
         if (signal?.aborted) return this.canceledFinalization(missionId);
         if (repaired && obj.findingId) this.store.resolveFinding(obj.findingId);
       }
@@ -1868,7 +1905,7 @@ export class Orchestrator {
           recommended_action: "None required; recorded so the completion over a failed task is auditable.",
         });
       }
-      this.store.completeMission(missionId);
+      this.store.completeMission(missionId, { expectedResumptionGeneration });
       this.phase(this.store.getMission(missionId)!, "complete");
       return {
         mission: this.store.getMission(missionId)!,
@@ -1892,7 +1929,11 @@ export class Orchestrator {
     const reason = verdict.reasons.join("; ") || "completion requirements were not satisfied";
     const summary = `Mission ${stopped.status.toLowerCase()}: ${reason}. No workers remain active.`;
     this.observability?.clearWaiting(missionId);
-    this.observability?.activity(missionId, { type: "error", summary, meaningfulProgress: true });
+    this.observability?.activity(missionId, {
+      type: "error",
+      summary,
+      meaningfulProgress: true,
+    });
     this.report(missionId, `[mission ${missionId}] ${summary}`);
     return {
       mission: stopped,
@@ -1953,7 +1994,13 @@ export class Orchestrator {
       this.store.transitionTask(integ.task_id, "READY");
       integrationOk = await this.runSingleTask(mission.mission_id, integ.task_id, { signal });
       if (signal?.aborted) {
-        return { validationAttempted, validationOk, reviewAttempted, reviewOk, integrationOk: false };
+        return {
+          validationAttempted,
+          validationOk,
+          reviewAttempted,
+          reviewOk,
+          integrationOk: false,
+        };
       }
       // A green merge is not proof the work landed: harvesting a worktree can
       // fail silently, and merging an empty branch is trivially clean. Require
@@ -1987,7 +2034,14 @@ export class Orchestrator {
       }
       // A conflicted or failed integration means the change is not in the tree;
       // report it so the caller does not complete on top of an unchanged repo.
-      if (!integrationOk) return { validationAttempted, validationOk, reviewAttempted, reviewOk, integrationOk };
+      if (!integrationOk)
+        return {
+          validationAttempted,
+          validationOk,
+          reviewAttempted,
+          reviewOk,
+          integrationOk,
+        };
     } else if (anyMutation) {
       // No worktree/merge path exists because the runtime has no git provider, so
       // there is no base commit to diff against and nothing can PROVE the repo
@@ -2024,7 +2078,13 @@ export class Orchestrator {
       validationAttempted = true;
       validationOk = await this.runSingleTask(mission.mission_id, task.task_id, { signal });
       if (signal?.aborted) {
-        return { validationAttempted, validationOk, reviewAttempted, reviewOk, integrationOk };
+        return {
+          validationAttempted,
+          validationOk,
+          reviewAttempted,
+          reviewOk,
+          integrationOk,
+        };
       }
       // From VALIDATING the mission may move on to review or final validation.
       if (
@@ -2075,13 +2135,25 @@ export class Orchestrator {
         signal,
       });
       if (signal?.aborted) {
-        return { validationAttempted, validationOk, reviewAttempted, reviewOk, integrationOk };
+        return {
+          validationAttempted,
+          validationOk,
+          reviewAttempted,
+          reviewOk,
+          integrationOk,
+        };
       }
       // From REVIEWING the mission moves to final validation (or repair handled
       // by the caller via the completion gate).
       this.store.transitionMission(mission.mission_id, "FINAL_VALIDATION");
     }
-    return { validationAttempted, validationOk, reviewAttempted, reviewOk, integrationOk };
+    return {
+      validationAttempted,
+      validationOk,
+      reviewAttempted,
+      reviewOk,
+      integrationOk,
+    };
   }
 
   /** Tasks whose recovered commits a SUCCEEDED integration merged (broker evidence). */
@@ -2170,11 +2242,16 @@ export class Orchestrator {
         checkpointPolicy: task.checkpoint_policy,
         requiredOutputArtifacts: task.required_output_artifacts,
         candidateBaseSha: task.repair_base_candidate_sha,
-        acceptanceCriteria: this.store
-          .getMission(missionId)
-          ?.acceptance_criteria.flatMap((criterion) =>
-            criterion.acceptance_id ? [{ acceptanceId: criterion.acceptance_id, criterion: criterion.criterion }] : [],
-          ),
+        acceptanceCriteria: this.store.getMission(missionId)?.acceptance_criteria.flatMap((criterion) =>
+          criterion.acceptance_id
+            ? [
+                {
+                  acceptanceId: criterion.acceptance_id,
+                  criterion: criterion.criterion,
+                },
+              ]
+            : [],
+        ),
         authority,
         ...(extra.reviewedRecovered?.length ? { reviewedRecovered: extra.reviewedRecovered } : {}),
       });

@@ -127,7 +127,12 @@ describe("MissionStore", () => {
     backend.failNextAppend();
     await assert.rejects(
       s.bindWorkspaceManifestDurably(
-        { ...original, manifestId: "WM-rebuilt", generation: 2, hash: "rebuilt" },
+        {
+          ...original,
+          manifestId: "WM-rebuilt",
+          generation: 2,
+          hash: "rebuilt",
+        },
         { generation: original.generation, hash: original.hash },
       ),
       /persistence unavailable/i,
@@ -202,9 +207,129 @@ describe("MissionStore", () => {
     s.transitionMission(m.mission_id, "VALIDATING");
     s.transitionMission(m.mission_id, "REVIEWING");
     s.transitionMission(m.mission_id, "FINAL_VALIDATION");
-    const done = s.completeMission(m.mission_id);
+    const done = s.completeMission(m.mission_id, {
+      expectedResumptionGeneration: 0,
+    });
     assert.equal(done.status, "COMPLETE");
     assert.ok(done.completed_at);
+  });
+
+  it("rejects completion when the expected resumption epoch is stale at the mutation boundary", () => {
+    const s = store();
+    const m = s.createMission({
+      title: "stale finalization",
+      goal: "stale finalization",
+      user_request: "stale finalization",
+      repository: ".",
+      base_ref: "abc123",
+      risk_profile: "low",
+      workflow_class: "engineering_review",
+    });
+    for (const status of ["CLASSIFYING", "PLANNING", "READY", "EXECUTING", "FINAL_VALIDATION"] as const) {
+      s.transitionMission(m.mission_id, status);
+    }
+    s.resumeMission(m.mission_id, "operator resumed while finalization was pending");
+
+    assert.throws(
+      () => s.completeMission(m.mission_id, { expectedResumptionGeneration: 0 }),
+      /stale.*resumption|expected.*0.*current.*1/i,
+    );
+    assert.equal(s.getMission(m.mission_id)?.status, "FINAL_VALIDATION");
+    assert.equal(s.getMission(m.mission_id)?.completed_at, null);
+  });
+
+  it("atomically rejects gate settlement and publication when the durable append fails", async () => {
+    const backend = new FailOnceBackend();
+    const s = MissionStore.open(backend);
+    const m = s.createMission({
+      title: "atomic gate evidence",
+      goal: "atomic gate evidence",
+      user_request: "atomic gate evidence",
+      repository: "/repo",
+      base_ref: "base",
+      risk_profile: "medium",
+      workflow_class: "engineering_review",
+    });
+    s.bindWorkspaceManifest({
+      manifestId: "WM-atomic-gate",
+      missionId: m.mission_id,
+      generation: 1,
+      authorizedRoots: [
+        {
+          canonicalPath: "/repo",
+          source: "existing_manifest",
+          access: "write",
+        },
+      ],
+      repositories: [
+        {
+          repoId: "repo-atomic",
+          canonicalRoot: "/repo",
+          baseRef: "main",
+          baseSha: "base",
+          writableDomains: ["**"],
+        },
+      ],
+      dependencyEdges: [],
+      hash: "manifest-atomic-gate",
+      createdAt: "2026-09-27T00:00:00.000Z",
+    });
+    const task = s.createTask({
+      mission_id: m.mission_id,
+      kind: "validation",
+      role: "validator",
+      objective: "validate",
+      repo_id: "repo-atomic",
+    });
+    s.transitionTask(task.task_id, "READY");
+    const execution = s.createExecution({
+      task_id: task.task_id,
+      mission_id: m.mission_id,
+      backend: "validation",
+      repo_id: "repo-atomic",
+      base_sha: "base",
+    });
+    s.assignTaskExecution(task.task_id, execution.execution_id);
+    s.setExecutionStatus(execution.execution_id, "RUNNING");
+    await s.flush();
+    backend.failNextAppend();
+
+    await assert.rejects(
+      s.publishGateEvidenceIfAuthoritative({
+        executionId: execution.execution_id,
+        exitStatus: "succeeded",
+        artifactRefs: [],
+        usage: {},
+        identity: {
+          workspaceManifestHash: "manifest-atomic-gate",
+          missionGeneration: 0,
+          repoId: "repo-atomic",
+          baseSha: "base",
+          candidateSha: "candidate",
+          diffHash: "sha256:diff",
+          acceptanceIds: [],
+          artifactHashes: [],
+        },
+        reason: "validation target",
+        validationEvidence: {
+          evidenceId: "VE-atomic",
+          missionId: m.mission_id,
+          taskId: task.task_id,
+          executionId: execution.execution_id,
+          command: "npm test",
+          profile: "default",
+          exitCode: 0,
+          testSummary: { passed: 1 },
+          noTargets: false,
+          accessible: true,
+          acceptanceResults: [],
+        },
+      }),
+      /mission persistence unavailable/,
+    );
+    assert.equal(s.getExecution(execution.execution_id)?.status, "RUNNING");
+    assert.equal(s.getCandidate(m.mission_id), undefined);
+    assert.equal(s.listValidationEvidence(m.mission_id).length, 0);
   });
 
   it("rejects illegal transitions", () => {
@@ -290,7 +415,12 @@ describe("MissionStore", () => {
     s1.transitionMission(m.mission_id, "PLANNING");
     s1.transitionMission(m.mission_id, "READY");
     s1.transitionMission(m.mission_id, "EXECUTING");
-    const t = s1.createTask({ mission_id: m.mission_id, kind: "process", role: "validator", objective: "validate" });
+    const t = s1.createTask({
+      mission_id: m.mission_id,
+      kind: "process",
+      role: "validator",
+      objective: "validate",
+    });
     s1.transitionTask(t.task_id, "READY");
     s1.transitionTask(t.task_id, "RUNNING");
     await s1.flush();
@@ -399,8 +529,18 @@ describe("MissionStore", () => {
     await assert.rejects(s.flush(), /mission persistence unavailable/);
     assert.equal(backend.count(), 0, "no dependent event overtakes the failed creation");
     assert.deepEqual(
-      s.persistenceDiagnostics().map(({ eventType, missionId, message }) => ({ eventType, missionId, message })),
-      [{ eventType: "mission.created", missionId: m.mission_id, message: "mission persistence unavailable" }],
+      s.persistenceDiagnostics().map(({ eventType, missionId, message }) => ({
+        eventType,
+        missionId,
+        message,
+      })),
+      [
+        {
+          eventType: "mission.created",
+          missionId: m.mission_id,
+          message: "mission persistence unavailable",
+        },
+      ],
     );
   });
 
@@ -453,8 +593,16 @@ describe("MissionStore", () => {
       missionId: mission.mission_id,
       generation: 3,
       authorizedRoots: [
-        { canonicalPath: "/workspace", source: "explicit_user_path", access: "write" },
-        { canonicalPath: "/workspace/read-only", source: "existing_manifest", access: "read" },
+        {
+          canonicalPath: "/workspace",
+          source: "explicit_user_path",
+          access: "write",
+        },
+        {
+          canonicalPath: "/workspace/read-only",
+          source: "existing_manifest",
+          access: "read",
+        },
       ],
       repositories: [
         {
@@ -680,7 +828,10 @@ describe("MissionStore", () => {
     const immutableFailure = s.getTask(failed.task_id)!;
     assert.throws(() => s.transitionTask(failed.task_id, "READY"), /illegal task transition FAILED -> READY/);
     assert.throws(
-      () => s.transitionTask(failed.task_id, "FAILED", "system", { status: "READY" } as never),
+      () =>
+        s.transitionTask(failed.task_id, "FAILED", "system", {
+          status: "READY",
+        } as never),
       /status must be changed through transitionTask/,
     );
     assert.throws(() => s.steerTask(failed.task_id, "change the failed task"), /terminal task.*immutable/);
@@ -934,7 +1085,9 @@ describe("MissionStore", () => {
     assert.equal(s.getMission(mission.mission_id)?.status, "BLOCKED");
 
     const firstBlockedEpisode = s.getMission(mission.mission_id)!;
-    s.transitionMission(mission.mission_id, "REPAIRING", "system", { recoveryDecisionId: "RCV-repair" });
+    s.transitionMission(mission.mission_id, "REPAIRING", "system", {
+      recoveryDecisionId: "RCV-repair",
+    });
     assert.equal(s.getRecoveryDecision("RCV-repair")?.status, "started");
     assert.equal(s.transitionMission(mission.mission_id, "EXECUTING").status, "EXECUTING");
     s.transitionMission(mission.mission_id, "BLOCKED");

@@ -7,6 +7,7 @@ export * from "./checkpoints.ts";
 export * from "./workset.ts";
 export * from "./broker.ts";
 export * from "./scheduler.ts";
+export * from "./supervisor.ts";
 export * from "./completionGate.ts";
 export * from "./integrator.ts";
 export * from "./orchestrator.ts";

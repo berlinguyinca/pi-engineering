@@ -28,7 +28,13 @@ export interface MissionSnapshotFile {
 }
 
 export interface MissionObservabilitySnapshot {
-  progress: { approximatePercent: number; verifiedComplete: boolean; basis: string };
+  progress: {
+    approximatePercent: number;
+    verifiedComplete: boolean;
+    basis: string;
+  };
+  acceptanceCoverage: MissionProjection["summary"]["acceptanceCoverage"];
+  workflowProgress: MissionProjection["summary"]["workflowProgress"];
   health: string;
   currentObjective?: string;
   currentActivity?: { type: string; summary: string; workerId?: string } | null;
@@ -37,7 +43,11 @@ export interface MissionObservabilitySnapshot {
   lastMeaningfulProgressAt?: string;
   waitingReason?: string;
   completionStatus: string;
-  progressHistory: Array<{ at: string; approximatePercent: number; label?: string }>;
+  progressHistory: Array<{
+    at: string;
+    approximatePercent: number;
+    label?: string;
+  }>;
   tests: {
     running: boolean;
     completed: number;
@@ -50,7 +60,13 @@ export interface MissionObservabilitySnapshot {
   review: {
     status: string;
     blockingOpen: number;
-    findings: Array<{ id: string; severity: string; status: string; summary: string; repaired: boolean }>;
+    findings: Array<{
+      id: string;
+      severity: string;
+      status: string;
+      summary: string;
+      repaired: boolean;
+    }>;
   };
   workerDetails: MissionProjection["workers"];
   activity: MissionProjection["activity"];
@@ -58,6 +74,15 @@ export interface MissionObservabilitySnapshot {
   recovery: MissionProjection["recovery"];
   changes: MissionProjection["changes"];
   artifacts: MissionProjection["artifacts"];
+  action: string;
+  reason: string;
+  recoveryAttempt: { attempt: number; maxAttempts: number };
+  nextAction: string;
+  nextActionAt?: string;
+  owner: string | null;
+  repository: string | null;
+  task: string | null;
+  preservedWork: string[];
 }
 
 export interface MissionSnapshotMission {
@@ -110,6 +135,8 @@ export interface MissionSnapshotFinding {
 function toObservabilitySnapshot(projection: MissionProjection): MissionObservabilitySnapshot {
   return {
     progress: { ...projection.summary.progress },
+    acceptanceCoverage: { ...projection.summary.acceptanceCoverage },
+    workflowProgress: { ...projection.summary.workflowProgress },
     health: projection.summary.health,
     currentObjective: projection.summary.currentObjective,
     currentActivity: projection.summary.currentActivity,
@@ -149,6 +176,15 @@ function toObservabilitySnapshot(projection: MissionProjection): MissionObservab
     recovery: projection.recovery,
     changes: projection.changes,
     artifacts: projection.artifacts,
+    action: projection.summary.action,
+    reason: projection.summary.reason,
+    recoveryAttempt: { ...projection.summary.recovery },
+    nextAction: projection.summary.nextAction,
+    nextActionAt: projection.summary.nextActionAt,
+    owner: projection.summary.owner,
+    repository: projection.summary.repository,
+    task: projection.summary.task,
+    preservedWork: [...projection.summary.preservedWork],
   };
 }
 

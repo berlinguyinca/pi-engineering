@@ -88,7 +88,12 @@ test("synthetic mission observability E2E scenario", async () => {
   // ── planning ──
   walkMission(store, id, "PLANNING");
   obs.phaseChanged(id, "PLANNING");
-  const planT = store.createTask({ mission_id: id, kind: "process", role: "planner", objective: "Decompose work" });
+  const planT = store.createTask({
+    mission_id: id,
+    kind: "process",
+    role: "planner",
+    objective: "Decompose work",
+  });
   store.transitionTask(planT.task_id, "READY");
   store.transitionTask(planT.task_id, "RUNNING");
   obs.workerStarted(id, "wk-plan", { taskId: planT.task_id });
@@ -103,8 +108,18 @@ test("synthetic mission observability E2E scenario", async () => {
     role: "implementer",
     objective: "Implement EventDrawer",
   });
-  const t2 = store.createTask({ mission_id: id, kind: "agent", role: "implementer", objective: "Wire state" });
-  const t3 = store.createTask({ mission_id: id, kind: "validation", role: "verifier", objective: "Validate build" });
+  const t2 = store.createTask({
+    mission_id: id,
+    kind: "agent",
+    role: "implementer",
+    objective: "Wire state",
+  });
+  const t3 = store.createTask({
+    mission_id: id,
+    kind: "validation",
+    role: "verifier",
+    objective: "Validate build",
+  });
 
   // ── implementation (with an InferWeave admission wait) ──
   walkMission(store, id, "EXECUTING");
@@ -112,7 +127,11 @@ test("synthetic mission observability E2E scenario", async () => {
   obs.setWaiting(id, "inferweave_admission", "queue depth 3");
   store.transitionTask(t1.task_id, "READY");
   store.transitionTask(t1.task_id, "RUNNING");
-  obs.workerStarted(id, "wk-impl", { taskId: t1.task_id, model: "deepseek_v4-flash", host: "n-42" });
+  obs.workerStarted(id, "wk-impl", {
+    taskId: t1.task_id,
+    model: "deepseek_v4-flash",
+    host: "n-42",
+  });
   advance(45_000);
   obs.clearWaiting(id);
   obs.taskProgress(id, t1.task_id, 3, 10);
@@ -177,8 +196,12 @@ test("synthetic mission observability E2E scenario", async () => {
   obs.testProgress(id, 30, 40, 30, 0);
   obs.testProgress(id, 40, 40, 40, 0);
   obs.testCompleted(id, 40, 0, 0);
-  const midPercent = obs.summary(id)!.progress.approximatePercent;
-  assert.ok(midPercent > 0 && midPercent < 100, "in-progress mission is never 100%");
+  const midSummary = obs.summary(id)!;
+  assert.equal(midSummary.progress.approximatePercent, 0, "process completion is not acceptance evidence");
+  assert.ok(
+    midSummary.workflowProgress.approximatePercent > 0 && midSummary.workflowProgress.approximatePercent < 100,
+    "workflow progress remains visible as a secondary diagnostic",
+  );
 
   // ── independent review surfaces a blocking finding ──
   walkMission(store, id, "REVIEWING");
@@ -192,7 +215,12 @@ test("synthetic mission observability E2E scenario", async () => {
   // ── repair + re-review ──
   walkMission(store, id, "REPAIRING");
   obs.phaseChanged(id, "REPAIRING");
-  const repairT = store.createTask({ mission_id: id, kind: "agent", role: "repair", objective: "Fix focus bug" });
+  const repairT = store.createTask({
+    mission_id: id,
+    kind: "agent",
+    role: "repair",
+    objective: "Fix focus bug",
+  });
   store.transitionTask(repairT.task_id, "READY");
   store.transitionTask(repairT.task_id, "RUNNING");
   obs.workerStarted(id, "wk-repair", { taskId: repairT.task_id });
@@ -237,7 +265,12 @@ test("synthetic mission observability E2E scenario", async () => {
   // Persistence: a fresh service over the same store reconstructs the terminal
   // state (verified complete survives restart).
   await obs.flush();
-  const obs2 = MissionObservability.open({ backend, store, onUpdate: () => {}, now: nowFn });
+  const obs2 = MissionObservability.open({
+    backend,
+    store,
+    onUpdate: () => {},
+    now: nowFn,
+  });
   const replayed = obs2.summary(id)!;
   assert.equal(replayed.progress.approximatePercent, 100);
   assert.equal(replayed.progress.verifiedComplete, true);

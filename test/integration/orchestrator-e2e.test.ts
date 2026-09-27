@@ -50,7 +50,12 @@ function parallelBarrier(needed: number, timeoutMs = 5000): { arrived: () => Pro
 interface Harness {
   orchestrator: Orchestrator;
   store: MissionStore;
-  calls: { agent: string[]; review: string[]; validation: string[]; process: string[] };
+  calls: {
+    agent: string[];
+    review: string[];
+    validation: string[];
+    process: string[];
+  };
 }
 
 interface HarnessOpts {
@@ -72,20 +77,37 @@ interface HarnessOpts {
   /** Fail every validation run AFTER the Nth (a late failure must not be masked). */
   validationFailAfter?: number;
   noGitEvidenceTarget?: boolean;
+  /** Emit a distinct candidate identity after a repair worker runs. */
+  materialRepairEvidence?: boolean;
 }
 
 function harness(opts: HarnessOpts = {}): Harness {
   const store = MissionStore.open(JsonlEventStore.inMemory());
-  const calls = { agent: [] as string[], review: [] as string[], validation: [] as string[], process: [] as string[] };
+  const calls = {
+    agent: [] as string[],
+    review: [] as string[],
+    validation: [] as string[],
+    process: [] as string[],
+  };
   const backends: BrokerBackends = {
     agent: {
       runAgent: async ({ role, objective, onActivity }) => {
         calls.agent.push(role ?? objective);
         if (opts.emitActivity) {
-          onActivity?.({ kind: "state", summary: "Worker session started", meaningfulProgress: false });
+          onActivity?.({
+            kind: "state",
+            summary: "Worker session started",
+            meaningfulProgress: false,
+          });
         }
         const exit = opts.agentExitStatus ?? "succeeded";
-        return { executionId: "e", exitStatus: exit, summary: "implemented", artifactRefs: [], usage: {} };
+        return {
+          executionId: "e",
+          exitStatus: exit,
+          summary: "implemented",
+          artifactRefs: [],
+          usage: {},
+        };
       },
     },
     review: {
@@ -101,7 +123,11 @@ function harness(opts: HarnessOpts = {}): Harness {
             findings: [],
           };
         }
-        const findings = (opts.findings ?? []).map((f) => ({ summary: f, severity: "blocking", status: "open" }));
+        const findings = (opts.findings ?? []).map((f) => ({
+          summary: f,
+          severity: "blocking",
+          status: "open",
+        }));
         return {
           executionId: "e",
           exitStatus: "succeeded",
@@ -145,7 +171,13 @@ function harness(opts: HarnessOpts = {}): Harness {
           };
         }
         if (opts.validationFailTimes && calls.validation.length <= opts.validationFailTimes) {
-          return { executionId: "e", exitStatus: "failed", summary: "suite red", artifactRefs: [], usage: {} };
+          return {
+            executionId: "e",
+            exitStatus: "failed",
+            summary: "suite red",
+            artifactRefs: [],
+            usage: {},
+          };
         }
         if (opts.validationExitStatus && opts.validationExitStatus !== "succeeded") {
           return {
@@ -177,7 +209,13 @@ function harness(opts: HarnessOpts = {}): Harness {
     process: {
       runProcess: async () => {
         calls.process.push("process");
-        return { executionId: "e", exitStatus: "succeeded", summary: "ran", artifactRefs: [], usage: {} };
+        return {
+          executionId: "e",
+          exitStatus: "succeeded",
+          summary: "ran",
+          artifactRefs: [],
+          usage: {},
+        };
       },
     },
   };
@@ -189,8 +227,12 @@ function harness(opts: HarnessOpts = {}): Harness {
       : {
           git: {
             root: process.cwd(),
-            headCommit: async () => "candidate-test-sha",
-            captureDiff: async () => "diff --git a/src/health.ts b/src/health.ts",
+            headCommit: async () =>
+              opts.materialRepairEvidence && calls.agent.length > 1 ? "candidate-repair-sha" : "candidate-test-sha",
+            captureDiff: async () =>
+              opts.materialRepairEvidence && calls.agent.length > 1
+                ? "diff --git a/src/repair.ts b/src/repair.ts"
+                : "diff --git a/src/health.ts b/src/health.ts",
             changedFiles: async () => ["src/health.ts"],
           } as unknown as GitRepo,
         }),
@@ -294,7 +336,13 @@ describe("material legacy orchestration workset safety", () => {
         agent: {
           runAgent: async () => {
             calls++;
-            return { executionId: "unsafe", exitStatus: "succeeded", summary: "unsafe", artifactRefs: [], usage: {} };
+            return {
+              executionId: "unsafe",
+              exitStatus: "succeeded",
+              summary: "unsafe",
+              artifactRefs: [],
+              usage: {},
+            };
           },
         },
       },
@@ -339,7 +387,13 @@ describe("material legacy orchestration workset safety", () => {
         agent: {
           runAgent: async () => {
             calls++;
-            return { executionId: "worker", exitStatus: "succeeded", summary: "done", artifactRefs: [], usage: {} };
+            return {
+              executionId: "worker",
+              exitStatus: "succeeded",
+              summary: "done",
+              artifactRefs: [],
+              usage: {},
+            };
           },
         },
       },
@@ -409,7 +463,13 @@ describe("mission caller cancellation", () => {
             backendSignal = signal;
             started();
             await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
-            return { executionId: "late", exitStatus: "succeeded", summary: "late", artifactRefs: [], usage: {} };
+            return {
+              executionId: "late",
+              exitStatus: "succeeded",
+              summary: "late",
+              artifactRefs: [],
+              usage: {},
+            };
           },
         },
         validation: {
@@ -436,7 +496,13 @@ describe("mission caller cancellation", () => {
         review: {
           runReview: async () => {
             reviewCalls++;
-            return { executionId: "r", exitStatus: "succeeded", summary: "reviewed", artifactRefs: [], usage: {} };
+            return {
+              executionId: "r",
+              exitStatus: "succeeded",
+              summary: "reviewed",
+              artifactRefs: [],
+              usage: {},
+            };
           },
         },
       },
@@ -473,7 +539,13 @@ describe("mission caller cancellation", () => {
         if (!signal.aborted) {
           await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
         }
-        return { executionId: stage, exitStatus: "succeeded", summary: "late", artifactRefs: [], usage: {} };
+        return {
+          executionId: stage,
+          exitStatus: "succeeded",
+          summary: "late",
+          artifactRefs: [],
+          usage: {},
+        };
       };
       const orchestrator = new Orchestrator({
         store,
@@ -509,7 +581,13 @@ describe("mission caller cancellation", () => {
             runValidation: async ({ signal }) =>
               stage === "validation"
                 ? waitForAbort(signal)
-                : { executionId: "v", exitStatus: "succeeded", summary: "valid", artifactRefs: [], usage: {} },
+                : {
+                    executionId: "v",
+                    exitStatus: "succeeded",
+                    summary: "valid",
+                    artifactRefs: [],
+                    usage: {},
+                  },
           },
           review: {
             runReview: async ({ signal }) => {
@@ -588,16 +666,32 @@ describe("mission caller cancellation", () => {
             if (objective.includes("Repair review finding")) {
               repairStarted();
               if (!signal.aborted) {
-                await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+                await new Promise<void>((resolve) =>
+                  signal.addEventListener("abort", () => resolve(), {
+                    once: true,
+                  }),
+                );
               }
             }
-            return { executionId: "a", exitStatus: "succeeded", summary: "done", artifactRefs: [], usage: {} };
+            return {
+              executionId: "a",
+              exitStatus: "succeeded",
+              summary: "done",
+              artifactRefs: [],
+              usage: {},
+            };
           },
         },
         validation: {
           runValidation: async () => {
             validationCalls++;
-            return { executionId: "v", exitStatus: "succeeded", summary: "valid", artifactRefs: [], usage: {} };
+            return {
+              executionId: "v",
+              exitStatus: "succeeded",
+              summary: "valid",
+              artifactRefs: [],
+              usage: {},
+            };
           },
         },
         review: {
@@ -655,7 +749,12 @@ describe("mission progress visibility — onProgress streams while the mission r
       objective: "check",
     });
     obs.missionCreated(mission.mission_id, mission.title);
-    const orchestrator = new Orchestrator({ store, backends: {}, observability: obs, planner: async () => [] });
+    const orchestrator = new Orchestrator({
+      store,
+      backends: {},
+      observability: obs,
+      planner: async () => [],
+    });
     const observe = (
       orchestrator as unknown as {
         observeWorkerActivity: (event: {
@@ -715,7 +814,11 @@ describe("mission progress visibility — onProgress streams while the mission r
       /planner unavailable/,
     );
 
-    const callbacks = (orchestrator as unknown as { progress: Map<string, (line: string) => void> }).progress;
+    const callbacks = (
+      orchestrator as unknown as {
+        progress: Map<string, (line: string) => void>;
+      }
+    ).progress;
     assert.equal(callbacks.size, 0, "failed orchestration must release the captured caller callback");
   });
 
@@ -763,7 +866,13 @@ describe("mission progress visibility — onProgress streams while the mission r
             elapsedMs: 15_000,
             lastActivityMs: 4_000,
           });
-          return { executionId: "e", exitStatus: "succeeded", summary: "done", artifactRefs: [], usage: {} };
+          return {
+            executionId: "e",
+            exitStatus: "succeeded",
+            summary: "done",
+            artifactRefs: [],
+            usage: {},
+          };
         },
       },
       validation: {
@@ -980,7 +1089,13 @@ describe("acceptance scenario C — independent tasks run concurrently with isol
           await barrier.arrived();
           calls.push(role ?? "agent");
           concurrent--;
-          return { executionId: "e", exitStatus: "succeeded", summary: "done", artifactRefs: [], usage: {} };
+          return {
+            executionId: "e",
+            exitStatus: "succeeded",
+            summary: "done",
+            artifactRefs: [],
+            usage: {},
+          };
         },
       },
     };
@@ -989,7 +1104,10 @@ describe("acceptance scenario C — independent tasks run concurrently with isol
       backends,
       git: {
         headCommit: async () => "abc",
-        createWorktree: async (_base: string, branch: string) => ({ path: ".", branch }),
+        createWorktree: async (_base: string, branch: string) => ({
+          path: ".",
+          branch,
+        }),
         branchAheadOf: async () => false,
         statusIn: async () => "",
         removeWorktree: async () => {},
@@ -1258,7 +1376,7 @@ describe("exitStatus is authoritative (non-throwing backend failures)", () => {
 
 describe("repair of failed gate tasks", () => {
   it("a first-red validation creates repair work and a later green one completes the mission", async () => {
-    const h = harness({ validationFailTimes: 1 });
+    const h = harness({ validationFailTimes: 1, materialRepairEvidence: true });
     const result = await h.orchestrator.orchestrate("Add an endpoint and fix the build", {
       repository: ".",
       baseRef: "abc",
@@ -1283,7 +1401,9 @@ describe("repair of failed gate tasks", () => {
       h.store
         .listRecoveryDecisions(result.mission.mission_id)
         .some((decision) => decision.action === "CREATE_REPAIR_TASKS" && decision.status === "succeeded"),
-      "gate repair must consume the same durable recovery ledger",
+      `gate repair must consume the same durable recovery ledger: ${JSON.stringify(
+        h.store.listRecoveryDecisions(result.mission.mission_id),
+      )}`,
     );
     // ...and a stale failure must not keep the gate closed once it is green.
     assert.equal(result.completed, true, "a superseded validation failure must not block completion");
@@ -1396,7 +1516,10 @@ describe("a late failure is never masked by an earlier success", () => {
   it("validation that goes red AFTER a green run still blocks completion", async () => {
     // A blocking finding forces a repair round, which re-runs validation; that
     // second run goes red, so a SUCCEEDED validation precedes a FAILED one.
-    const h = harness({ findings: ["the endpoint still leaks a file handle"], validationFailAfter: 1 });
+    const h = harness({
+      findings: ["the endpoint still leaks a file handle"],
+      validationFailAfter: 1,
+    });
     const result = await h.orchestrator.orchestrate("Add an endpoint and fix the build", {
       repository: ".",
       baseRef: "abc",

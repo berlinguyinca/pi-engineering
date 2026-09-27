@@ -31,9 +31,19 @@ test("snapshot contract remains additive after the reliability bump", async () =
   const backend = JsonlEventStore.inMemory();
   const store = MissionStore.open(backend);
   const m = mission(store, "M");
-  const t = store.createTask({ mission_id: m.mission_id, kind: "agent", role: "implementer", objective: "O" });
+  const t = store.createTask({
+    mission_id: m.mission_id,
+    kind: "agent",
+    role: "implementer",
+    objective: "O",
+  });
   const file = buildMissionSnapshotFile([
-    { mission: m, tasks: store.listTasks(m.mission_id), findings: [], observability: null },
+    {
+      mission: m,
+      tasks: store.listTasks(m.mission_id),
+      findings: [],
+      observability: null,
+    },
   ]);
   const snap = file.missions[0]!;
   assert.equal(snap.observability, undefined, "null projection yields no observability section");
@@ -46,7 +56,11 @@ test("snapshot includes full observability section when projection present", asy
   const backend = JsonlEventStore.inMemory();
   const store = MissionStore.open(backend);
   const updates: string[] = [];
-  const obs = new MissionObservability({ backend, store, onUpdate: (_i, m) => updates.push(m) });
+  const obs = new MissionObservability({
+    backend,
+    store,
+    onUpdate: (_i, m) => updates.push(m),
+  });
   const m = mission(store, "AIMS Console Refactor");
   obs.missionCreated(m.mission_id, "AIMS Console Refactor");
   const t = store.createTask({
@@ -55,7 +69,10 @@ test("snapshot includes full observability section when projection present", asy
     role: "implementer",
     objective: "Implement EventDrawer",
   });
-  obs.workerStarted(m.mission_id, "wk-1", { taskId: t.task_id, model: "claude" });
+  obs.workerStarted(m.mission_id, "wk-1", {
+    taskId: t.task_id,
+    model: "claude",
+  });
   obs.activity(m.mission_id, {
     type: "editing_file",
     summary: "editing EventDrawer.tsx",
@@ -70,12 +87,29 @@ test("snapshot includes full observability section when projection present", asy
 
   const proj = obs.projection(m.mission_id)!;
   const file = buildMissionSnapshotFile([
-    { mission: m, tasks: store.listTasks(m.mission_id), findings: [], observability: proj },
+    {
+      mission: m,
+      tasks: store.listTasks(m.mission_id),
+      findings: [],
+      observability: proj,
+    },
   ]);
   const ob = file.missions[0]!.observability!;
   assert.ok(ob, "observability section present");
   assert.ok(ob.progress.approximatePercent >= 0 && ob.progress.approximatePercent < 100);
   assert.equal(ob.progress.basis, "weighted_dag");
+  assert.ok(ob.acceptanceCoverage);
+  assert.ok(ob.workflowProgress);
+  assert.equal(typeof ob.action, "string");
+  assert.equal(typeof ob.reason, "string");
+  assert.equal(typeof ob.recoveryAttempt.attempt, "number");
+  assert.equal(typeof ob.recoveryAttempt.maxAttempts, "number");
+  assert.equal(typeof ob.nextAction, "string");
+  assert.ok("nextActionAt" in ob);
+  assert.ok("owner" in ob);
+  assert.ok("repository" in ob);
+  assert.ok("task" in ob);
+  assert.ok(Array.isArray(ob.preservedWork));
   assert.equal(ob.currentActivity?.summary, "editing EventDrawer.tsx");
   assert.equal(ob.workers.active, 1);
   assert.equal(ob.workerDetails[0]!.model, "claude");

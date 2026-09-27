@@ -10,6 +10,7 @@ import { type BrokerBackends, ExecutionBroker, workerTimeoutMs } from "../../src
 import { CheckpointManager } from "../../src/orchestration/checkpoints.ts";
 import { Integrator } from "../../src/orchestration/integrator.ts";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
+import { MissionOwnership } from "../../src/orchestration/ownership.ts";
 import type { EventStoreBackend, StoredEvent } from "../../src/platform/eventstore/backend.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 import { makeFixtureRepo } from "../fixtures/make-fixture.ts";
@@ -137,7 +138,12 @@ function setup(backends: BrokerBackends) {
     risk_profile: "low",
     workflow_class: "engineering_review",
   });
-  const t = store.createTask({ mission_id: m.mission_id, kind: "agent", role: "implementer", objective: "x" });
+  const t = store.createTask({
+    mission_id: m.mission_id,
+    kind: "agent",
+    role: "implementer",
+    objective: "x",
+  });
   store.transitionTask(t.task_id, "READY");
   return { store, m, t, broker: new ExecutionBroker({ store, backends }) };
 }
@@ -183,7 +189,13 @@ async function assertCrossBoundaryRenameRejected(commitRename: boolean): Promise
             assert.ok(worktree);
             await exec("git", ["-C", worktree, "mv", "outside.ts", "src/inside.ts"]);
             if (commitRename) await exec("git", ["-C", worktree, "commit", "-q", "-m", "cross-boundary rename"]);
-            return { executionId: "worker", exitStatus: "succeeded", summary: "renamed", artifactRefs: [], usage: {} };
+            return {
+              executionId: "worker",
+              exitStatus: "succeeded",
+              summary: "renamed",
+              artifactRefs: [],
+              usage: {},
+            };
           },
         },
         integration: {
@@ -250,13 +262,131 @@ async function assertCrossBoundaryRenameRejected(commitRename: boolean): Promise
 }
 
 describe("ExecutionBroker (spec 03)", () => {
+  it("publishes no gate evidence when the mission resumes during diff capture", async () => {
+    const fx = await makeFixtureRepo();
+    try {
+      const git = (await GitRepo.open(fx.root))!;
+      const store = MissionStore.open(JsonlEventStore.inMemory());
+      const baseSha = await git.headCommit();
+      const mission = store.createMission({
+        title: "gate evidence resumption race",
+        goal: "gate evidence resumption race",
+        user_request: "gate evidence resumption race",
+        repository: fx.root,
+        base_ref: baseSha,
+        risk_profile: "medium",
+        workflow_class: "engineering_review",
+      });
+      store.bindWorkspaceManifest({
+        manifestId: "WM-gate-race",
+        missionId: mission.mission_id,
+        generation: 1,
+        authorizedRoots: [
+          {
+            canonicalPath: fx.root,
+            source: "existing_manifest",
+            access: "write",
+          },
+        ],
+        repositories: [
+          {
+            repoId: "repo-gate-race",
+            canonicalRoot: fx.root,
+            baseRef: "main",
+            baseSha,
+            writableDomains: ["**"],
+          },
+        ],
+        dependencyEdges: [],
+        hash: "manifest-gate-race",
+        createdAt: "2026-09-27T00:00:00.000Z",
+      });
+      const ownership = new MissionOwnership(store, {
+        ownerId: "gate-race-controller",
+        leaseMs: 60_000,
+      });
+      const missionIdentity = await ownership.acquire(mission.mission_id, {
+        resumptionGeneration: 0,
+      });
+      const task = store.createTask({
+        mission_id: mission.mission_id,
+        kind: "validation",
+        role: "validator",
+        objective: "validate the current candidate",
+        repo_id: "repo-gate-race",
+      });
+      store.transitionTask(task.task_id, "READY");
+      const authority = await ownership.maintain(missionIdentity, "repo-gate-race");
+      const originalCaptureDiff = git.captureDiff.bind(git);
+      let resumed = false;
+      git.captureDiff = async (...args) => {
+        if (!resumed) {
+          resumed = true;
+          store.resumeMission(mission.mission_id, "operator resumed during evidence capture");
+        }
+        return originalCaptureDiff(...args);
+      };
+      const broker = new ExecutionBroker({
+        store,
+        resolveRepository: async () => ({
+          repoId: "repo-gate-race",
+          root: fx.root,
+          git,
+        }),
+        backends: {
+          validation: {
+            runValidation: async () => ({
+              executionId: "validation-gate-race",
+              exitStatus: "succeeded",
+              summary: "green",
+              artifactRefs: [],
+              usage: {},
+              validationEvidence: {
+                command: "npm test",
+                profile: "default",
+                exitCode: 0,
+                testSummary: { passed: 1 },
+                noTargets: false,
+                accessible: true,
+                acceptanceResults: [],
+              },
+            }),
+          },
+        },
+      });
+
+      const handle = await broker.execute({
+        taskId: task.task_id,
+        missionId: mission.mission_id,
+        repoId: "repo-gate-race",
+        kind: "validation",
+        role: "validator",
+        objective: task.objective,
+        authority,
+      });
+      await assert.rejects(handle.result(), /stale.*resumption|stale.*fencing/i);
+
+      assert.equal(store.listValidationEvidence(mission.mission_id).length, 0);
+      assert.notEqual(store.getExecution(handle.executionId)?.status, "SUCCEEDED");
+      await authority.close();
+    } finally {
+      await fx.cleanup();
+    }
+  });
+
   it("memoizes one dispatch and one exact result promise per handle", async () => {
     let dispatches = 0;
     const { broker, m, t } = setup({
       agent: {
         runAgent: async () => {
           dispatches++;
-          return { executionId: "worker", exitStatus: "succeeded", summary: "done", artifactRefs: [], usage: {} };
+          return {
+            executionId: "worker",
+            exitStatus: "succeeded",
+            summary: "done",
+            artifactRefs: [],
+            usage: {},
+          };
         },
       },
     });
@@ -293,7 +423,13 @@ describe("ExecutionBroker (spec 03)", () => {
         manifestId: "WM-reentrant-result",
         missionId: mission.mission_id,
         generation: 1,
-        authorizedRoots: [{ canonicalPath: fx.root, source: "existing_manifest", access: "write" }],
+        authorizedRoots: [
+          {
+            canonicalPath: fx.root,
+            source: "existing_manifest",
+            access: "write",
+          },
+        ],
         repositories: [
           {
             repoId: "repo-reentrant-result",
@@ -439,8 +575,18 @@ describe("ExecutionBroker (spec 03)", () => {
           agent: {
             runAgent: async ({ signal }) => {
               started();
-              await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
-              return { executionId: "late", exitStatus: "succeeded", summary: "late", artifactRefs: [], usage: {} };
+              await new Promise<void>((resolve) =>
+                signal.addEventListener("abort", () => resolve(), {
+                  once: true,
+                }),
+              );
+              return {
+                executionId: "late",
+                exitStatus: "succeeded",
+                summary: "late",
+                artifactRefs: [],
+                usage: {},
+              };
             },
           },
           integration: {
@@ -523,7 +669,13 @@ describe("ExecutionBroker (spec 03)", () => {
         agent: {
           runAgent: async () => {
             dispatches++;
-            return { executionId: "worker", exitStatus: "succeeded", summary: "done", artifactRefs: [], usage: {} };
+            return {
+              executionId: "worker",
+              exitStatus: "succeeded",
+              summary: "done",
+              artifactRefs: [],
+              usage: {},
+            };
           },
         },
       },
@@ -581,7 +733,13 @@ describe("ExecutionBroker (spec 03)", () => {
         agent: {
           runAgent: async () => {
             await blocked;
-            return { executionId: "late", exitStatus: "succeeded", summary: "late", artifactRefs: [], usage: {} };
+            return {
+              executionId: "late",
+              exitStatus: "succeeded",
+              summary: "late",
+              artifactRefs: [],
+              usage: {},
+            };
           },
         },
       },
@@ -739,7 +897,13 @@ describe("ExecutionBroker (spec 03)", () => {
         agent: {
           runAgent: async () => {
             await blocked;
-            return { executionId: "late", exitStatus: "succeeded", summary: "late", artifactRefs: [], usage: {} };
+            return {
+              executionId: "late",
+              exitStatus: "succeeded",
+              summary: "late",
+              artifactRefs: [],
+              usage: {},
+            };
           },
         },
       },
@@ -794,7 +958,13 @@ describe("ExecutionBroker (spec 03)", () => {
       agent: {
         runAgent: async ({ signal }) => {
           await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
-          return { executionId: "late", exitStatus: "failed", summary: "deadline", artifactRefs: [], usage: {} };
+          return {
+            executionId: "late",
+            exitStatus: "failed",
+            summary: "deadline",
+            artifactRefs: [],
+            usage: {},
+          };
         },
       },
     });
@@ -865,7 +1035,13 @@ describe("ExecutionBroker (spec 03)", () => {
         manifestId: "WM-cancel",
         missionId: mission.mission_id,
         generation: 1,
-        authorizedRoots: [{ canonicalPath: fx.root, source: "existing_manifest", access: "write" }],
+        authorizedRoots: [
+          {
+            canonicalPath: fx.root,
+            source: "existing_manifest",
+            access: "write",
+          },
+        ],
         repositories: [
           {
             repoId: "repo-cancel",
@@ -911,8 +1087,18 @@ describe("ExecutionBroker (spec 03)", () => {
               assert.ok(worktree);
               await writeFile(join(worktree, "src", "cancelled.ts"), "export const cancelled = true;\n", "utf8");
               dirty();
-              await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
-              return { executionId: "late", exitStatus: "succeeded", summary: "late", artifactRefs: [], usage: {} };
+              await new Promise<void>((resolve) =>
+                signal.addEventListener("abort", () => resolve(), {
+                  once: true,
+                }),
+              );
+              return {
+                executionId: "late",
+                exitStatus: "succeeded",
+                summary: "late",
+                artifactRefs: [],
+                usage: {},
+              };
             },
           },
         },
@@ -990,7 +1176,13 @@ describe("ExecutionBroker (spec 03)", () => {
           { once: true },
         );
       });
-      return { executionId: "late", exitStatus: "succeeded", summary: "late", artifactRefs: [], usage: {} };
+      return {
+        executionId: "late",
+        exitStatus: "succeeded",
+        summary: "late",
+        artifactRefs: [],
+        usage: {},
+      };
     });
     try {
       const result = context.handle.result().catch(() => undefined);
@@ -1018,7 +1210,13 @@ describe("ExecutionBroker (spec 03)", () => {
       await writeFile(join(worktree, "src", "snapshot-start.ts"), "export const snapshotStart = true;\n", "utf8");
       started(worktree);
       await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
-      return { executionId: "late", exitStatus: "succeeded", summary: "late", artifactRefs: [], usage: {} };
+      return {
+        executionId: "late",
+        exitStatus: "succeeded",
+        summary: "late",
+        artifactRefs: [],
+        usage: {},
+      };
     });
     const originalStatusPathsIn = context.git.statusPathsIn.bind(context.git);
     let statusReads = 0;
@@ -1063,7 +1261,13 @@ describe("ExecutionBroker (spec 03)", () => {
       await writeFile(join(worktree, "src", "uncooperative.ts"), "export const uncooperative = true;\n", "utf8");
       started(worktree);
       await released;
-      return { executionId: "late", exitStatus: "succeeded", summary: "late", artifactRefs: [], usage: {} };
+      return {
+        executionId: "late",
+        exitStatus: "succeeded",
+        summary: "late",
+        artifactRefs: [],
+        usage: {},
+      };
     }, 25);
     const worktree = await (async () => {
       const result = context.handle.result().catch(() => undefined);
@@ -1103,7 +1307,13 @@ describe("ExecutionBroker (spec 03)", () => {
         await writeFile(join(worktree, "src", "stalled-checkpoint.ts"), "export const stalled = true;\n", "utf8");
         started(worktree);
         await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
-        return { executionId: "late", exitStatus: "succeeded", summary: "late", artifactRefs: [], usage: {} };
+        return {
+          executionId: "late",
+          exitStatus: "succeeded",
+          summary: "late",
+          artifactRefs: [],
+          usage: {},
+        };
       },
       20,
       stalledCheckpoints,
@@ -1143,7 +1353,13 @@ describe("ExecutionBroker (spec 03)", () => {
         manifestId: "WM-retain",
         missionId: mission.mission_id,
         generation: 1,
-        authorizedRoots: [{ canonicalPath: fx.root, source: "existing_manifest", access: "write" }],
+        authorizedRoots: [
+          {
+            canonicalPath: fx.root,
+            source: "existing_manifest",
+            access: "write",
+          },
+        ],
         repositories: [
           {
             repoId: "repo-retain",
@@ -1167,7 +1383,10 @@ describe("ExecutionBroker (spec 03)", () => {
         isolation: "worktree",
         write_domains: ["src/**"],
         execution_budget_ms: 10_000,
-        checkpoint_policy: { activity_milestone: 10, before_deadline_ms: 1_000 },
+        checkpoint_policy: {
+          activity_milestone: 10,
+          before_deadline_ms: 1_000,
+        },
       });
       let dirty!: () => void;
       const dirtyWritten = new Promise<void>((resolve) => {
@@ -1185,8 +1404,18 @@ describe("ExecutionBroker (spec 03)", () => {
               worktree = allocated!;
               await writeFile(join(worktree, "src", "retained.ts"), "export const retained = true;\n", "utf8");
               dirty();
-              await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
-              return { executionId: "late", exitStatus: "succeeded", summary: "late", artifactRefs: [], usage: {} };
+              await new Promise<void>((resolve) =>
+                signal.addEventListener("abort", () => resolve(), {
+                  once: true,
+                }),
+              );
+              return {
+                executionId: "late",
+                exitStatus: "succeeded",
+                summary: "late",
+                artifactRefs: [],
+                usage: {},
+              };
             },
           },
         },
@@ -1232,13 +1461,24 @@ describe("ExecutionBroker (spec 03)", () => {
       store,
       resolveRepository: async (repoId) => {
         if (repoId !== "repo-known") throw new Error(`WORKSPACE_SCOPE_MISMATCH: unknown ${repoId}`);
-        return { repoId, root: "/repo", git: {} as never, writableDomains: ["**"] };
+        return {
+          repoId,
+          root: "/repo",
+          git: {} as never,
+          writableDomains: ["**"],
+        };
       },
       backends: {
         agent: {
           runAgent: async (input) => {
             seen.push(input.repoId ?? "");
-            return { executionId: "e", exitStatus: "succeeded", summary: "done", artifactRefs: [], usage: {} };
+            return {
+              executionId: "e",
+              exitStatus: "succeeded",
+              summary: "done",
+              artifactRefs: [],
+              usage: {},
+            };
           },
         },
       },
@@ -1256,7 +1496,12 @@ describe("ExecutionBroker (spec 03)", () => {
     ).result();
     assert.deepEqual(seen, ["repo-known"]);
 
-    const missing = store.createTask({ mission_id: m.mission_id, kind: "agent", role: "implementer", objective: "x" });
+    const missing = store.createTask({
+      mission_id: m.mission_id,
+      kind: "agent",
+      role: "implementer",
+      objective: "x",
+    });
     store.transitionTask(missing.task_id, "READY");
     const handle = await broker.execute({
       taskId: missing.task_id,
@@ -1294,7 +1539,13 @@ describe("ExecutionBroker (spec 03)", () => {
         manifestId: "WM-missing-candidate",
         missionId: mission.mission_id,
         generation: 1,
-        authorizedRoots: [{ canonicalPath: fx.root, source: "existing_manifest", access: "write" }],
+        authorizedRoots: [
+          {
+            canonicalPath: fx.root,
+            source: "existing_manifest",
+            access: "write",
+          },
+        ],
         repositories: [
           {
             repoId: "repo-missing-candidate",
@@ -1317,7 +1568,11 @@ describe("ExecutionBroker (spec 03)", () => {
       });
       const broker = new ExecutionBroker({
         store,
-        resolveRepository: async () => ({ repoId: "repo-missing-candidate", root: fx.root, git }),
+        resolveRepository: async () => ({
+          repoId: "repo-missing-candidate",
+          root: fx.root,
+          git,
+        }),
         backends: {
           validation: {
             candidateScoped: true,
@@ -1365,7 +1620,13 @@ describe("ExecutionBroker (spec 03)", () => {
         manifestId: "WM-restart-candidate",
         missionId: mission.mission_id,
         generation: 3,
-        authorizedRoots: [{ canonicalPath: fx.root, source: "existing_manifest", access: "write" }],
+        authorizedRoots: [
+          {
+            canonicalPath: fx.root,
+            source: "existing_manifest",
+            access: "write",
+          },
+        ],
         repositories: [
           {
             repoId: "repo-restart-candidate",
@@ -1436,7 +1697,11 @@ describe("ExecutionBroker (spec 03)", () => {
       let validatedPath: string | null = null;
       const broker = new ExecutionBroker({
         store,
-        resolveRepository: async () => ({ repoId: "repo-restart-candidate", root: fx.root, git }),
+        resolveRepository: async () => ({
+          repoId: "repo-restart-candidate",
+          root: fx.root,
+          git,
+        }),
         backends: {
           validation: {
             candidateScoped: true,
@@ -1492,7 +1757,13 @@ describe("ExecutionBroker (spec 03)", () => {
         manifestId: "WM-promotion-restart",
         missionId: mission.mission_id,
         generation: 1,
-        authorizedRoots: [{ canonicalPath: fx.root, source: "existing_manifest", access: "write" }],
+        authorizedRoots: [
+          {
+            canonicalPath: fx.root,
+            source: "existing_manifest",
+            access: "write",
+          },
+        ],
         repositories: [
           {
             repoId: "repo-promotion-restart",
@@ -1560,7 +1831,11 @@ describe("ExecutionBroker (spec 03)", () => {
       let recoveredGatePath: string | null = null;
       const restarted = new ExecutionBroker({
         store,
-        resolveRepository: async () => ({ repoId: "repo-promotion-restart", root: fx.root, git }),
+        resolveRepository: async () => ({
+          repoId: "repo-promotion-restart",
+          root: fx.root,
+          git,
+        }),
         backends: {
           validation: {
             candidateScoped: true,
@@ -1628,7 +1903,11 @@ describe("ExecutionBroker (spec 03)", () => {
       });
       const forgedRestart = new ExecutionBroker({
         store,
-        resolveRepository: async () => ({ repoId: "repo-promotion-restart", root: fx.root, git }),
+        resolveRepository: async () => ({
+          repoId: "repo-promotion-restart",
+          root: fx.root,
+          git,
+        }),
         backends: {
           validation: {
             candidateScoped: true,
@@ -1674,7 +1953,13 @@ describe("ExecutionBroker (spec 03)", () => {
         manifestId: "WM-reauthorize-promotion",
         missionId: mission.mission_id,
         generation: 1,
-        authorizedRoots: [{ canonicalPath: fx.root, source: "existing_manifest", access: "write" }],
+        authorizedRoots: [
+          {
+            canonicalPath: fx.root,
+            source: "existing_manifest",
+            access: "write",
+          },
+        ],
         repositories: [
           {
             repoId: "repo-reauthorize-promotion",
@@ -1747,12 +2032,24 @@ describe("ExecutionBroker (spec 03)", () => {
 
       const broker = new ExecutionBroker({
         store,
-        resolveRepository: async () => ({ repoId: "repo-reauthorize-promotion", root: fx.root, git }),
+        resolveRepository: async () => ({
+          repoId: "repo-reauthorize-promotion",
+          root: fx.root,
+          git,
+        }),
         backends: {},
       });
       const authority = {
-        missionIdentity: { missionId: mission.mission_id, generation: 0, fencingToken: 8 },
-        repositoryIdentity: { repoId: "repo-reauthorize-promotion", generation: 99, fencingToken: 12 },
+        missionIdentity: {
+          missionId: mission.mission_id,
+          generation: 0,
+          fencingToken: 8,
+        },
+        repositoryIdentity: {
+          repoId: "repo-reauthorize-promotion",
+          generation: 99,
+          fencingToken: 12,
+        },
         assertAuthoritative: () => {},
         onInvalidated: () => () => {},
         close: async () => undefined,
@@ -1786,7 +2083,13 @@ describe("ExecutionBroker (spec 03)", () => {
         manifestId: "WM-stale-cancel",
         missionId: mission.mission_id,
         generation: 1,
-        authorizedRoots: [{ canonicalPath: fx.root, source: "existing_manifest", access: "write" }],
+        authorizedRoots: [
+          {
+            canonicalPath: fx.root,
+            source: "existing_manifest",
+            access: "write",
+          },
+        ],
         repositories: [
           {
             repoId: "repo-stale-cancel",
@@ -1841,17 +2144,30 @@ describe("ExecutionBroker (spec 03)", () => {
       store.assignTaskAuthority(task.task_id, authority.missionIdentity);
       const broker = new ExecutionBroker({
         store,
-        resolveRepository: async () => ({ repoId: "repo-stale-cancel", root: fx.root, git }),
+        resolveRepository: async () => ({
+          repoId: "repo-stale-cancel",
+          root: fx.root,
+          git,
+        }),
         backends: {
           integration: {
             candidateScoped: true,
             runIntegration: async ({ signal }) => {
               await new Promise<void>((resolve) => {
                 if (signal.aborted) resolve();
-                else signal.addEventListener("abort", () => resolve(), { once: true });
+                else
+                  signal.addEventListener("abort", () => resolve(), {
+                    once: true,
+                  });
                 started();
               });
-              return { executionId: "late", exitStatus: "succeeded", summary: "late", artifactRefs: [], usage: {} };
+              return {
+                executionId: "late",
+                exitStatus: "succeeded",
+                summary: "late",
+                artifactRefs: [],
+                usage: {},
+              };
             },
           },
         },
@@ -1897,12 +2213,22 @@ describe("ExecutionBroker (spec 03)", () => {
     const broker = new ExecutionBroker({
       store,
       git: {} as never,
-      resolveRepository: async (repoId) => ({ repoId, root: "/repo", git: {} as never }),
+      resolveRepository: async (repoId) => ({
+        repoId,
+        root: "/repo",
+        git: {} as never,
+      }),
       backends: {
         agent: {
           runAgent: async () => {
             runs++;
-            return { executionId: "e", exitStatus: "succeeded", summary: "done", artifactRefs: [], usage: {} };
+            return {
+              executionId: "e",
+              exitStatus: "succeeded",
+              summary: "done",
+              artifactRefs: [],
+              usage: {},
+            };
           },
         },
       },
@@ -1934,12 +2260,22 @@ describe("ExecutionBroker (spec 03)", () => {
     const broker = new ExecutionBroker({
       store,
       git: {} as never,
-      resolveRepository: async (repoId) => ({ repoId, root: "/repo", git: {} as never }),
+      resolveRepository: async (repoId) => ({
+        repoId,
+        root: "/repo",
+        git: {} as never,
+      }),
       backends: {
         agent: {
           runAgent: async () => {
             runs++;
-            return { executionId: "e", exitStatus: "succeeded", summary: "unsafe", artifactRefs: [], usage: {} };
+            return {
+              executionId: "e",
+              exitStatus: "succeeded",
+              summary: "unsafe",
+              artifactRefs: [],
+              usage: {},
+            };
           },
         },
       },
@@ -1974,7 +2310,13 @@ describe("ExecutionBroker (spec 03)", () => {
         agent: {
           runAgent: async () => {
             runs++;
-            return { executionId: "e", exitStatus: "succeeded", summary: "unsafe", artifactRefs: [], usage: {} };
+            return {
+              executionId: "e",
+              exitStatus: "succeeded",
+              summary: "unsafe",
+              artifactRefs: [],
+              usage: {},
+            };
           },
         },
       },
@@ -2004,7 +2346,13 @@ describe("ExecutionBroker (spec 03)", () => {
         agent: {
           runAgent: async ({ worktree }) => {
             seen.push(worktree);
-            return { executionId: "e", exitStatus: "succeeded", summary: "safe", artifactRefs: [], usage: {} };
+            return {
+              executionId: "e",
+              exitStatus: "succeeded",
+              summary: "safe",
+              artifactRefs: [],
+              usage: {},
+            };
           },
         },
       },
@@ -2052,7 +2400,13 @@ describe("ExecutionBroker (spec 03)", () => {
       agent: {
         runAgent: async () => {
           runs++;
-          return { executionId: "e", exitStatus: "succeeded", summary: "late", artifactRefs: [], usage: {} };
+          return {
+            executionId: "e",
+            exitStatus: "succeeded",
+            summary: "late",
+            artifactRefs: [],
+            usage: {},
+          };
         },
       },
     });
@@ -2095,7 +2449,13 @@ describe("ExecutionBroker (spec 03)", () => {
         agent: {
           runAgent: async () => {
             runs++;
-            return { executionId: "e", exitStatus: "succeeded", summary: "late", artifactRefs: [], usage: {} };
+            return {
+              executionId: "e",
+              exitStatus: "succeeded",
+              summary: "late",
+              artifactRefs: [],
+              usage: {},
+            };
           },
         },
       },
@@ -2139,7 +2499,13 @@ describe("ExecutionBroker (spec 03)", () => {
             await new Promise<void>((resolve) => {
               finish = resolve;
             });
-            return { executionId: "e", exitStatus: "succeeded", summary: "late", artifactRefs: [], usage: {} };
+            return {
+              executionId: "e",
+              exitStatus: "succeeded",
+              summary: "late",
+              artifactRefs: [],
+              usage: {},
+            };
           },
         },
       });
@@ -2167,7 +2533,13 @@ describe("ExecutionBroker (spec 03)", () => {
     const finish: Array<() => void> = [];
     const delayedOutcome = (executionId: string) => async () => {
       await new Promise<void>((resolve) => finish.push(resolve));
-      return { executionId, exitStatus: "succeeded", summary: "ok", artifactRefs: [], usage: {} };
+      return {
+        executionId,
+        exitStatus: "succeeded",
+        summary: "ok",
+        artifactRefs: [],
+        usage: {},
+      };
     };
     const { store, m, broker } = setup({
       validation: {
@@ -2181,7 +2553,12 @@ describe("ExecutionBroker (spec 03)", () => {
       role: "validator",
       objective: "check",
     });
-    const process = store.createTask({ mission_id: m.mission_id, kind: "process", role: "runner", objective: "build" });
+    const process = store.createTask({
+      mission_id: m.mission_id,
+      kind: "process",
+      role: "runner",
+      objective: "build",
+    });
     const observing = new ExecutionBroker({
       store,
       backends: (broker as unknown as { backends: BrokerBackends }).backends,
@@ -2218,12 +2595,27 @@ describe("ExecutionBroker (spec 03)", () => {
   });
 
   it("attaches mission/task/execution identity to backend activity", async () => {
-    const seen: Array<{ missionId: string; taskId: string; executionId: string; summary: string }> = [];
+    const seen: Array<{
+      missionId: string;
+      taskId: string;
+      executionId: string;
+      summary: string;
+    }> = [];
     const { m, t, broker } = setup({
       agent: {
         runAgent: async ({ onActivity }) => {
-          onActivity?.({ kind: "state", summary: "Worker session started", meaningfulProgress: false });
-          return { executionId: "e", exitStatus: "succeeded", summary: "done", artifactRefs: [], usage: {} };
+          onActivity?.({
+            kind: "state",
+            summary: "Worker session started",
+            meaningfulProgress: false,
+          });
+          return {
+            executionId: "e",
+            exitStatus: "succeeded",
+            summary: "done",
+            artifactRefs: [],
+            usage: {},
+          };
         },
       },
     });
@@ -2361,7 +2753,13 @@ describe("ExecutionBroker (spec 03)", () => {
       validation: {
         runValidation: async () => {
           calls.push("validation");
-          return { executionId: "e", exitStatus: "succeeded", summary: "ok", artifactRefs: [], usage: {} };
+          return {
+            executionId: "e",
+            exitStatus: "succeeded",
+            summary: "ok",
+            artifactRefs: [],
+            usage: {},
+          };
         },
       },
     });
@@ -2419,7 +2817,13 @@ describe("ExecutionBroker (spec 03)", () => {
           agent: {
             runAgent: async ({ worktree }) => {
               seenWorktree.push(worktree ?? "");
-              return { executionId: "e", exitStatus: "succeeded", summary: "done", artifactRefs: [], usage: {} };
+              return {
+                executionId: "e",
+                exitStatus: "succeeded",
+                summary: "done",
+                artifactRefs: [],
+                usage: {},
+              };
             },
           },
         },
@@ -2546,7 +2950,13 @@ describe("ExecutionBroker (spec 03)", () => {
           integration: {
             runIntegration: async ({ handoffs }) => {
               seenHandoffs.push(...handoffs.map((h) => ({ branch: h.worktree.branch })));
-              return { executionId: "i", exitStatus: "succeeded", summary: "merged", artifactRefs: [], usage: {} };
+              return {
+                executionId: "i",
+                exitStatus: "succeeded",
+                summary: "merged",
+                artifactRefs: [],
+                usage: {},
+              };
             },
           },
         },
@@ -2634,7 +3044,13 @@ describe("ExecutionBroker (spec 03)", () => {
                 const { writeFile } = await import("node:fs/promises");
                 await writeFile(join(worktree, "harvest-me.js"), "export const x = 1;\n");
               }
-              return { executionId: "e", exitStatus: "succeeded", summary: "done", artifactRefs: [], usage: {} };
+              return {
+                executionId: "e",
+                exitStatus: "succeeded",
+                summary: "done",
+                artifactRefs: [],
+                usage: {},
+              };
             },
           },
         },
@@ -2787,7 +3203,13 @@ it("harvest recognizes a worker's own committed work (clean tree) and integratio
             await writeFile(join(worktree!, "src", "add.js"), "export const add = (a, b) => a + b;\n");
             await exec("git", ["-C", worktree!, "add", "-A"]);
             await exec("git", ["-C", worktree!, "commit", "-q", "-m", "implementer commits own work"]);
-            return { executionId: "e", exitStatus: "succeeded", summary: "done", artifactRefs: [], usage: {} };
+            return {
+              executionId: "e",
+              exitStatus: "succeeded",
+              summary: "done",
+              artifactRefs: [],
+              usage: {},
+            };
           },
         },
         integration: {
@@ -2905,7 +3327,13 @@ it("cleanup never force-deletes a worker branch carrying unmerged commits", asyn
             await writeFile(join(worktree!, "src", "add.js"), "export const add = (a, b) => a + b;\n");
             await exec("git", ["-C", worktree!, "add", "-A"]);
             await exec("git", ["-C", worktree!, "commit", "-q", "-m", "unmerged worker work"]);
-            return { executionId: "e", exitStatus: "succeeded", summary: "done", artifactRefs: [], usage: {} };
+            return {
+              executionId: "e",
+              exitStatus: "succeeded",
+              summary: "done",
+              artifactRefs: [],
+              usage: {},
+            };
           },
         },
       },
@@ -3098,7 +3526,13 @@ it("cleans repositories independently and durably reports a locked removal for r
     const internals = broker as unknown as {
       missionWorktrees: Map<
         string,
-        Array<{ path: string; branch: string; git: GitRepo; repoId: string; writeDomains: string[] }>
+        Array<{
+          path: string;
+          branch: string;
+          git: GitRepo;
+          repoId: string;
+          writeDomains: string[];
+        }>
       >;
     };
     internals.missionWorktrees.set(mission.mission_id, [
@@ -3111,7 +3545,11 @@ it("cleans repositories independently and durably reports a locked removal for r
     const authorityForRepo = async (repoId: string) => {
       acquired.push(repoId);
       return {
-        missionIdentity: { missionId: mission.mission_id, generation: 1, fencingToken: 1 },
+        missionIdentity: {
+          missionId: mission.mission_id,
+          generation: 1,
+          fencingToken: 1,
+        },
         repositoryIdentity: { repoId, generation: 1, fencingToken: 1 },
         assertAuthoritative: () => {},
         onInvalidated: () => () => {},
@@ -3122,7 +3560,9 @@ it("cleans repositories independently and durably reports a locked removal for r
       } as never;
     };
 
-    const firstPass = await broker.cleanupMission(mission.mission_id, { authorityForRepo });
+    const firstPass = await broker.cleanupMission(mission.mission_id, {
+      authorityForRepo,
+    });
     assert.deepEqual(acquired.sort(), ["repo-one", "repo-two"]);
     assert.deepEqual(closed.sort(), ["repo-one", "repo-two"]);
     assert.equal(firstPass.failures.length, 2);
@@ -3140,7 +3580,9 @@ it("cleans repositories independently and durably reports a locked removal for r
 
     await exec("git", ["-C", firstFixture.root, "worktree", "unlock", first.path]);
     failRepoTwoRelease = false;
-    const retry = await broker.cleanupMission(mission.mission_id, { authorityForRepo });
+    const retry = await broker.cleanupMission(mission.mission_id, {
+      authorityForRepo,
+    });
     assert.deepEqual(retry.failures, []);
     await assert.rejects(access(first.path));
   } finally {
@@ -3181,7 +3623,11 @@ it("turns a corrupt durable cleanup journal into a structured finding after brok
 
     const restarted = new ExecutionBroker({
       store,
-      resolveRepository: async () => ({ repoId: "repo-corrupt-cleanup", root: fx.root, git }),
+      resolveRepository: async () => ({
+        repoId: "repo-corrupt-cleanup",
+        root: fx.root,
+        git,
+      }),
       backends: {},
     });
     const result = await restarted.cleanupMission(mission.mission_id);
