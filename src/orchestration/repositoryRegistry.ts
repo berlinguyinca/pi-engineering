@@ -102,6 +102,28 @@ export class RepositoryRegistry {
     for (const context of this.contexts.values()) {
       if (contains(context.root, canonical)) return context;
     }
+    // Linked candidate worktrees are siblings, not descendants, of the bound
+    // incumbent. Match their shared Git common directory and construct every
+    // cwd-sensitive dependency from the candidate root so repository tools,
+    // validation, and review cannot silently inspect the incumbent.
+    const candidateGit = await GitRepo.open(canonical);
+    if (candidateGit) {
+      const candidateCommon = await candidateGit.commonDir().catch(() => "");
+      for (const context of this.contexts.values()) {
+        if (candidateCommon && candidateCommon === (await context.git.commonDir().catch(() => ""))) {
+          const contextBroker = await ContextBroker.open(candidateGit.root);
+          if (!contextBroker)
+            throw new WorkspaceScopeError(`Candidate repository cannot be opened: ${candidateGit.root}`);
+          return {
+            ...context,
+            root: candidateGit.root,
+            git: candidateGit,
+            contextBroker,
+            verifierCwd: candidateGit.root,
+          };
+        }
+      }
+    }
     const active = this.activeRepo.getStore();
     return active ? this.get(active) : null;
   }

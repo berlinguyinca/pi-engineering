@@ -23,6 +23,16 @@ export interface GitResult {
   code: number;
 }
 
+export interface GitMutationGuard {
+  assertAuthoritative(): void;
+}
+
+export interface PromotionResult {
+  promoted: boolean;
+  reason: string | null;
+  candidateSha: string | null;
+}
+
 /**
  * Minimal Git repository provider (spec §7 `git/`, §13.3 worktree isolation).
  *
@@ -78,6 +88,13 @@ export class GitRepo {
     return this.repoRoot;
   }
 
+  /** Canonical shared object/admin directory, equal across linked worktrees. */
+  async commonDir(): Promise<string> {
+    const r = await this.git(["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+    if (r.code !== 0) throw new Error(`git common directory lookup failed: ${r.stderr}`);
+    return r.stdout;
+  }
+
   async headCommit(): Promise<string> {
     const r = await this.git(["rev-parse", "HEAD"]);
     if (r.code !== 0) throw new Error(`git rev-parse HEAD failed: ${r.stderr}`);
@@ -126,7 +143,7 @@ export class GitRepo {
    * parallel test fixtures) never collide. A stale leftover at the path is
    * removed first (crash recovery).
    */
-  async createWorktree(baseCommit: string, branch: string): Promise<WorktreeInfo> {
+  async createWorktree(baseCommit: string, branch: string, guard?: GitMutationGuard): Promise<WorktreeInfo> {
     // Place the worktree as a SIBLING of the repo root (outside the working
     // tree). Deriving the path from `this.cwd` would, when the runtime is
     // opened from a subdirectory, drop the worktree INSIDE the repo (visible
@@ -136,10 +153,13 @@ export class GitRepo {
     const path = join(parent, `pi-eng-${shortHash(this.repoRoot)}-${branch}`);
     await mkdir(parent, { recursive: true }).catch(() => {});
     // Crash recovery: clear any stale worktree or leftover directory at the path.
+    guard?.assertAuthoritative();
     await this.git(["worktree", "remove", "--force", path]).catch(() => {});
+    guard?.assertAuthoritative();
     await this.git(["branch", "-D", branch]).catch(() => {});
     await this.forgetWorktreeAdmin(path);
     await rm(path, { recursive: true, force: true }).catch(() => {});
+    guard?.assertAuthoritative();
     const add = await this.git(["worktree", "add", path, "-b", branch, baseCommit]);
     if (add.code !== 0) throw new Error(`git worktree add failed: ${add.stderr}`);
     return { path, branch };
@@ -174,12 +194,18 @@ export class GitRepo {
   }
 
   /** Remove a worktree (cleanup/recovery). Optionally keep the branch for lineage. */
-  async removeWorktree(info: WorktreeInfo, opts: { keepBranch?: boolean } = {}): Promise<void> {
+  async removeWorktree(
+    info: WorktreeInfo,
+    opts: { keepBranch?: boolean } = {},
+    guard?: GitMutationGuard,
+  ): Promise<void> {
+    guard?.assertAuthoritative();
     await this.git(["worktree", "remove", "--force", info.path]);
     // Targeted, for the same reason creation is: a global prune here would be
     // able to delete a concurrently-created sibling's administrative directory.
     await this.forgetWorktreeAdmin(info.path);
     if (!opts.keepBranch) {
+      guard?.assertAuthoritative();
       await this.git(["branch", "-D", info.branch]).catch(() => {});
     }
   }
@@ -269,8 +295,65 @@ export class GitRepo {
     return { merged: false, conflict: conflicted, reason };
   }
 
-  async commitAll(path: string, message: string): Promise<void> {
+  /** Merge one handoff into an isolated integration candidate, never the incumbent checkout. */
+  async mergeRefInWorktree(
+    candidate: WorktreeInfo,
+    ref: string,
+    guard?: GitMutationGuard,
+  ): Promise<{ merged: boolean; conflict: boolean; reason: string | null }> {
+    guard?.assertAuthoritative();
+    const r = await this.git(["-C", candidate.path, "--no-pager", "merge", "--no-ff", "-m", `integrate ${ref}`, ref]);
+    if (r.code === 0) return { merged: true, conflict: false, reason: null };
+    const conflicted = r.stdout.includes("CONFLICT") || r.stderr.includes("CONFLICT");
+    const reason = (r.stderr || r.stdout || "merge failed").split("\n")[0]?.slice(0, 200) ?? "merge failed";
+    if (conflicted) {
+      guard?.assertAuthoritative();
+      await this.git(["-C", candidate.path, "merge", "--abort"]);
+    }
+    return { merged: false, conflict: conflicted, reason };
+  }
+
+  /**
+   * Promote a fully gated candidate into the local incumbent checkout.
+   * The bound base is checked immediately before the single reset mutation;
+   * divergence leaves HEAD, index, and tree unchanged.
+   */
+  async promoteCandidate(
+    candidate: WorktreeInfo,
+    boundBase: string,
+    guard?: GitMutationGuard,
+  ): Promise<PromotionResult> {
+    const candidateSha = await this.resolveCommit(candidate.branch);
+    if (!candidateSha) return { promoted: false, reason: "candidate ref is unavailable", candidateSha: null };
+    if ((await this.statusIn(candidate.path)) !== "") {
+      return { promoted: false, reason: "candidate worktree is not clean", candidateSha };
+    }
+    const incumbent = await this.headCommit();
+    if (incumbent !== boundBase) {
+      return { promoted: false, reason: `incumbent diverged from bound base ${boundBase}`, candidateSha };
+    }
+    const incumbentTracked = await this.git(["status", "--porcelain", "--untracked-files=no"]);
+    if (incumbentTracked.code !== 0 || incumbentTracked.stdout.length > 0) {
+      return { promoted: false, reason: "incumbent index or working tree is not clean", candidateSha };
+    }
+    guard?.assertAuthoritative();
+    // Repository authority serializes local promotion. Recheck at the mutation
+    // boundary so a stale or diverged incumbent is rejected without a write.
+    if ((await this.headCommit()) !== boundBase) {
+      return { promoted: false, reason: `incumbent diverged from bound base ${boundBase}`, candidateSha };
+    }
+    guard?.assertAuthoritative();
+    const promoted = await this.git(["reset", "--hard", candidateSha]);
+    if (promoted.code !== 0) {
+      return { promoted: false, reason: promoted.stderr || promoted.stdout || "promotion failed", candidateSha };
+    }
+    return { promoted: true, reason: null, candidateSha };
+  }
+
+  async commitAll(path: string, message: string, guard?: GitMutationGuard): Promise<void> {
+    guard?.assertAuthoritative();
     await this.git(["-C", path, "add", "-A"]);
+    guard?.assertAuthoritative();
     const r = await this.git(["-C", path, "commit", "-m", message]);
     if (r.code !== 0) throw new Error(`git commit failed: ${r.stderr}`);
   }

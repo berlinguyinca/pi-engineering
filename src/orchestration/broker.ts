@@ -20,7 +20,7 @@
 
 import { createHash } from "node:crypto";
 import { id } from "../core/ids.ts";
-import type { GitRepo } from "../git/GitRepo.ts";
+import type { GitRepo, WorktreeInfo } from "../git/GitRepo.ts";
 import type { WorkerActivity } from "../workers/WorkerExecutor.ts";
 import { sanitizeWorkerActivity } from "../workers/activity.ts";
 import type { CheckpointManager, CheckpointSnapshot } from "./checkpoints.ts";
@@ -194,6 +194,7 @@ export interface ReviewRunner {
     objective: string;
     contextRef?: string;
     acceptanceCriteria?: Array<{ acceptanceId: string; criterion: string }>;
+    worktree?: string | null;
     signal: AbortSignal;
     onActivity?: (event: WorkerActivity) => void;
   }): Promise<ExecutionOutcome & { findings?: Array<Record<string, unknown>> }>;
@@ -218,10 +219,14 @@ export interface IntegrationHandoff {
 }
 
 export interface IntegrationRunner {
+  /** Declares that the runner merges and verifies exclusively in `candidate`. */
+  candidateScoped?: boolean;
   runIntegration(input: {
     repoId?: string;
     objective: string;
     handoffs: IntegrationHandoff[];
+    candidate?: WorktreeInfo;
+    authority?: DispatchAuthority;
     signal: AbortSignal;
   }): Promise<ExecutionOutcome>;
 }
@@ -342,6 +347,8 @@ export class ExecutionBroker {
     Array<{ path: string; branch: string; git: GitRepo; repoId?: string; writeDomains: string[] }>
   >();
   private readonly missionRepositories = new Map<string, { repoId?: string; root: string; git: GitRepo }>();
+  /** Isolated integration candidates. Failed/red/canceled candidates remain inspectable. */
+  private readonly missionCandidates = new Map<string, { worktree: WorktreeInfo; git: GitRepo; baseSha: string }>();
   /** Commit each mission's worktrees were actually forked from (landing invariant). */
   private readonly resolvedBases = new Map<string, string>();
   /** Branches intentionally kept after cleanup because their work never merged. */
@@ -441,6 +448,7 @@ export class ExecutionBroker {
       await info.git.commitAll(
         info.path,
         `pi-eng: preserve checkpoint ${checkpointId} for ${executionId} (${attempt})`,
+        { assertAuthoritative: assertOrigin },
       );
       assertOrigin();
     }
@@ -539,7 +547,10 @@ export class ExecutionBroker {
     if (!manifest || !binding || !execution || !task) return;
     if (!repository) throw new EvidenceUnavailableError(`no repository-scoped Git target for ${input.repoId}`);
 
-    const candidateSha = await repository.git.headCommit();
+    const candidateTarget = this.missionCandidates.get(input.missionId);
+    const candidateSha = candidateTarget
+      ? await candidateTarget.git.headCommitIn(candidateTarget.worktree.path)
+      : await repository.git.headCommit();
     const diff = await repository.git.captureDiff(binding.baseSha, candidateSha);
     const diffHash = artifactHash(diff);
     const acceptanceIds = [...new Set(task.acceptance_ids ?? [])].sort();
@@ -718,7 +729,7 @@ export class ExecutionBroker {
       // to diff against — the fork point recorded here is the fallback.
       this.resolvedBases.set(input.missionId, base);
       const branch = `pi-eng-orch-${input.taskId}`;
-      const wt = await repository.git.createWorktree(base, branch);
+      const wt = await repository.git.createWorktree(base, branch, input.authority);
       const info = {
         path: wt.path,
         branch: wt.branch,
@@ -767,7 +778,7 @@ export class ExecutionBroker {
    * recorded so operators and the PI WEB panel see exactly why the work did not
    * land.
    */
-  private async harvestWorktree(executionId: string): Promise<boolean> {
+  private async harvestWorktree(executionId: string, authority?: DispatchAuthority): Promise<boolean> {
     const wt = this.allocatedWorktrees.get(executionId);
     if (!wt) return false;
     const git = wt.git;
@@ -826,7 +837,7 @@ export class ExecutionBroker {
       return false;
     }
     try {
-      await git.commitAll(wt.path, `pi-eng: orchestration work for ${executionId}`);
+      await git.commitAll(wt.path, `pi-eng: orchestration work for ${executionId}`, authority);
       if (missionId) this.committedWork.set(missionId, true);
       return true;
     } catch (err) {
@@ -1015,7 +1026,9 @@ export class ExecutionBroker {
     const base = this.store.getMission(missionId)?.base_ref?.trim() || this.resolvedBases.get(missionId);
     if (!base) return null;
     try {
-      return await git.changedFiles(base, await git.headCommit());
+      const candidate = this.missionCandidates.get(missionId);
+      const head = candidate ? await git.headCommitIn(candidate.worktree.path) : await git.headCommit();
+      return await git.changedFiles(base, head);
     } catch {
       return null;
     }
@@ -1124,7 +1137,31 @@ export class ExecutionBroker {
 
   /** Branches kept after cleanup so unmerged worker work stays recoverable. */
   preservedBranches(missionId: string): string[] {
-    return this.preserved.get(missionId) ?? [];
+    const branches = [...(this.preserved.get(missionId) ?? [])];
+    for (const worktree of this.missionWorktrees.get(missionId) ?? []) {
+      if (!branches.includes(worktree.branch)) branches.push(worktree.branch);
+    }
+    const candidate = this.missionCandidates.get(missionId)?.worktree.branch;
+    if (candidate && !branches.includes(candidate)) branches.push(candidate);
+    return branches;
+  }
+
+  candidateWorktree(missionId: string): WorktreeInfo | undefined {
+    const candidate = this.missionCandidates.get(missionId)?.worktree;
+    return candidate ? { ...candidate } : undefined;
+  }
+
+  /** Sole incumbent mutation: called only after current candidate gates pass. */
+  async promoteCandidate(missionId: string, authority?: DispatchAuthority): Promise<boolean> {
+    const candidate = this.missionCandidates.get(missionId);
+    if (!candidate) return false;
+    authority?.assertAuthoritative();
+    const result = await candidate.git.promoteCandidate(candidate.worktree, candidate.baseSha, authority);
+    authority?.assertAuthoritative();
+    if (!result.promoted) throw new Error(result.reason ?? "candidate promotion failed");
+    await candidate.git.removeWorktree(candidate.worktree, { keepBranch: true }, authority).catch(() => undefined);
+    this.missionCandidates.delete(missionId);
+    return true;
   }
 
   /** Map a task kind to a broker backend. */
@@ -1583,7 +1620,7 @@ export class ExecutionBroker {
                 failed && outcome.error === WALL_CLOCK_TIMEOUT_MARKER && info
                   ? await this.workerCommittedTip(execution.execution_id, input.missionId, worktree)
                   : undefined;
-              await this.harvestWorktree(execution.execution_id);
+              await this.harvestWorktree(execution.execution_id, input.authority);
               input.authority?.assertAuthoritative();
               this.store.assertExecutionAuthoritative(execution.execution_id);
               if (info) {
@@ -1797,6 +1834,7 @@ export class ExecutionBroker {
           objective: input.objective,
           contextRef: input.contextRef,
           acceptanceCriteria: input.acceptanceCriteria,
+          worktree: this.missionCandidates.get(input.missionId)?.worktree.path ?? null,
           signal,
           onActivity: base.onActivity,
         });
@@ -1808,6 +1846,23 @@ export class ExecutionBroker {
           input.authority?.assertAuthoritative();
           this.store.assertExecutionAuthoritative(executionId);
         };
+        assertOrigin();
+        if (!repository) throw new Error("integration requires a repository-scoped Git provider");
+        let candidate = this.missionCandidates.get(input.missionId);
+        if (input.repoId && runner.candidateScoped === true && !candidate) {
+          const baseSha =
+            this.store.getMission(input.missionId)?.base_ref?.trim() ||
+            this.resolvedBases.get(input.missionId) ||
+            (await repository.git.headCommit());
+          assertOrigin();
+          const worktree = await repository.git.createWorktree(
+            baseSha,
+            `pi-eng-candidate-${input.missionId.replace(/[^a-zA-Z0-9._-]/g, "-")}`,
+            input.authority,
+          );
+          candidate = { worktree, git: repository.git, baseSha };
+          this.missionCandidates.set(input.missionId, candidate);
+        }
         assertOrigin();
         // Failed executions are excluded from the merge by default (their
         // work is presumed incomplete — a degenerate loop that committed
@@ -1900,6 +1955,8 @@ export class ExecutionBroker {
           repoId: input.repoId,
           objective: input.objective,
           handoffs,
+          candidate: candidate?.worktree,
+          authority: input.authority,
           signal,
         });
         try {
@@ -1952,7 +2009,7 @@ export class ExecutionBroker {
         return runner.runValidation({
           repoId: input.repoId,
           objective: input.objective,
-          worktree: base.worktree,
+          worktree: this.missionCandidates.get(input.missionId)?.worktree.path ?? base.worktree,
           signal,
         });
       }

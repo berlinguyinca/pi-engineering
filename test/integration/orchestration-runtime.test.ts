@@ -127,7 +127,18 @@ describe("orchestration via real EngineeringRuntime (acceptance scenarios)", () 
       baseRef,
       mutationRequested: true,
     });
-    assert.equal(result.completed, true);
+    assert.equal(
+      result.completed,
+      true,
+      JSON.stringify({
+        reason: result.failureReason,
+        verdict: result.verdict,
+        tasks: rt
+          .missionStore!.listTasks(result.mission.mission_id)
+          .map((task) => ({ kind: task.kind, status: task.status, failure: task.failure_reason })),
+        findings: rt.missionStore!.listFindings(result.mission.mission_id).map((finding) => finding.summary),
+      }),
+    );
     assert.equal(result.mission.status, "COMPLETE");
     assert.ok(result.mission.required_gates.includes("validation"));
     assert.ok(result.mission.required_gates.includes("independent_review"));
@@ -225,8 +236,12 @@ describe("orchestration via real EngineeringRuntime (acceptance scenarios)", () 
       "every executable task must carry the selected repository binding",
     );
     assert.ok(workerCwds.some(({ role, cwd }) => role === "implementer" && cwd !== metaRoot));
-    assert.ok(workerCwds.some(({ role, cwd }) => role === "reviewer" && cwd === target.root));
-    assert.ok(verifierCwds.length > 0 && verifierCwds.every((cwd) => cwd === target.root));
+    const reviewerCwd = workerCwds.find(({ role }) => role === "reviewer")?.cwd;
+    assert.ok(reviewerCwd && reviewerCwd !== target.root && reviewerCwd !== metaRoot);
+    assert.ok(verifierCwds.length > 0 && verifierCwds.every((cwd) => cwd === reviewerCwd));
+    const candidate = rt.missionStore!.getCandidate(result.mission.mission_id, manifest.repositories[0]!.repoId);
+    assert.ok(candidate, "candidate-scoped gate evidence must be recorded");
+    assert.equal(candidate.identity.candidateSha, await targetGit.headCommit());
     assert.equal(await readFile(join(target.root, "src", "scoped.ts"), "utf8"), "export const scoped = true;\n");
 
     const repoSearch = rt.coreTools.find((tool) => tool.name === "repo_search");
@@ -789,8 +804,10 @@ describe("orchestration via real EngineeringRuntime (acceptance scenarios)", () 
     const integ = rt.missionStore!.listTasks(result.mission.mission_id).filter((t) => t.kind === "integration");
     assert.ok(integ.length >= 1, "integration step should have been created");
     assert.ok(
-      integ.some((t) => t.status === "FAILED"),
-      `a conflicted merge must be recorded as FAILED, got ${integ.map((t) => t.status).join(",")}`,
+      rt
+        .missionStore!.listFindings(result.mission.mission_id)
+        .some((finding) => /promotion rejected.*diverged/i.test(finding.summary)),
+      "incumbent divergence must reject promotion",
     );
     assert.equal(result.completed, false, "a conflicted integration must never complete the mission");
     // mergeBranch aborts a conflicted merge, so the incumbent content survives
@@ -799,6 +816,12 @@ describe("orchestration via real EngineeringRuntime (acceptance scenarios)", () 
     assert.ok(mainSrc.includes("// main"), "incumbent content must survive a conflicted merge");
     assert.ok(!mainSrc.includes("// worker"), "conflicted worker change must not be applied");
     assert.ok(!mainSrc.includes("<<<<<<<"), "no conflict markers may be left in the working tree");
+    assert.ok(
+      rt
+        .orchestrator!.broker.preservedBranches(result.mission.mission_id)
+        .some((branch) => branch.includes("candidate")),
+      "the rejected candidate must remain inspectable",
+    );
 
     // Recovery must remain possible: after a conflict the worker branch is the
     // only copy of its output, so cleanup MUST NOT have run `git branch -D` on it.

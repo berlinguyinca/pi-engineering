@@ -992,6 +992,45 @@ export class Orchestrator {
       verdict = this.gate.evaluate(this.store.getMission(missionId)!);
     }
 
+    // Promotion is the only incumbent mutation. It occurs after both gate
+    // attempts are current and green, under a fresh repository fencing check.
+    // Failed/red/canceled candidates remain mounted/ref-addressable for diagnosis.
+    if (verdict.can_complete && integrated && this.broker.candidateWorktree(missionId)) {
+      const integrationTask = this.store
+        .listTasks(missionId)
+        .filter((task) => task.kind === "integration" && task.repo_id)
+        .at(-1);
+      if (!integrationTask) {
+        integrated = false;
+      } else if (!this.ownership) {
+        // Legacy in-memory orchestrators have no lease provider. Production
+        // runtimes always supply ownership; retain compatibility for isolated
+        // deterministic harnesses while still using the guarded Git primitive.
+        integrated = await this.broker.promoteCandidate(missionId);
+      } else {
+        const promotionAuthority = await this.acquireTaskAuthority(integrationTask);
+        try {
+          promotionAuthority.assertAuthoritative();
+          integrated = await this.broker.promoteCandidate(missionId, promotionAuthority);
+        } catch (error) {
+          integrated = false;
+          this.store.addFinding({
+            mission_id: missionId,
+            task_id: integrationTask.task_id,
+            severity: "blocking",
+            category: "integration",
+            file: null,
+            line: null,
+            summary: `Candidate promotion rejected: ${error instanceof Error ? error.message : String(error)}`,
+            evidence: null,
+            recommended_action:
+              "Inspect the preserved candidate and retry only from the originally bound incumbent base.",
+          });
+        } finally {
+          await promotionAuthority.close();
+        }
+      }
+    }
     await this.broker.cleanupMission(missionId, { keepBranches: !integrated });
     if (!integrated) {
       const preserved = this.broker.preservedBranches(missionId);

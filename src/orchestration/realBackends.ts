@@ -16,6 +16,7 @@ import { createHash } from "node:crypto";
 import type { ArtifactStore } from "../artifacts/ArtifactStore.ts";
 import { id } from "../core/ids.ts";
 import type { GitRepo } from "../git/GitRepo.ts";
+import type { WorktreeInfo } from "../git/GitRepo.ts";
 import type { VerificationProvider } from "../verify/Verifier.ts";
 import type { WorkerActivity, WorkerExecutor, WorkerRequest } from "../workers/WorkerExecutor.ts";
 import { type ExecutionOutcome, type IntegrationHandoff, workerTimeoutMs } from "./broker.ts";
@@ -332,6 +333,7 @@ export function realBackends(opts: RealBackendsOptions) {
         objective: string;
         contextRef?: string;
         acceptanceCriteria?: Array<{ acceptanceId: string; criterion: string }>;
+        worktree?: string | null;
         signal: AbortSignal;
         onActivity?: (event: WorkerActivity) => void;
       }): Promise<ExecutionOutcome> {
@@ -349,7 +351,7 @@ export function realBackends(opts: RealBackendsOptions) {
             .join("")}`,
           context: input.contextRef,
           tools: ["ledger_read", "artifact_read", "repo_search", "symbol"],
-          cwd: bound.cwd,
+          cwd: input.worktree ?? bound.cwd,
           maxContextTokens: 64_000,
           // Same generous wall-clock budget as implementation workers: a review
           // must inspect the integrated change before writing findings, and the
@@ -470,10 +472,13 @@ export function realBackends(opts: RealBackendsOptions) {
       },
     },
     integration: {
+      candidateScoped: true,
       async runIntegration(input: {
         repoId?: string;
         objective: string;
         handoffs: IntegrationHandoff[];
+        candidate?: WorktreeInfo;
+        authority?: import("./ownership.ts").DispatchAuthority;
         signal: AbortSignal;
       }): Promise<ExecutionOutcome> {
         input.signal.throwIfAborted();
@@ -498,7 +503,10 @@ export function realBackends(opts: RealBackendsOptions) {
         const skippedRecovered: string[] = [];
         for (const h of input.handoffs) {
           input.signal.throwIfAborted();
-          const r = await repo.git.mergeBranch(h.ref ?? h.worktree.branch).catch((e: Error) => ({
+          const r = await (input.candidate
+            ? repo.git.mergeRefInWorktree(input.candidate, h.ref ?? h.worktree.branch, input.authority)
+            : repo.git.mergeBranch(h.ref ?? h.worktree.branch)
+          ).catch((e: Error) => ({
             merged: false,
             reason: e.message,
           }));
@@ -522,9 +530,10 @@ export function realBackends(opts: RealBackendsOptions) {
           };
         }
         input.signal.throwIfAborted();
-        const checks = await opts.verifier.detect(repo.cwd);
+        const candidateCwd = input.candidate?.path ?? repo.cwd;
+        const checks = await opts.verifier.detect(candidateCwd);
         input.signal.throwIfAborted();
-        const result = await opts.verifier.run(repo.cwd, checks, opts.artifacts, { signal: input.signal });
+        const result = await opts.verifier.run(candidateCwd, checks, opts.artifacts, { signal: input.signal });
         const artifactRefs = result.evidence.flatMap((e) => e.artifacts).filter(Boolean);
         const artifactState = await artifactContentHashes(opts.artifacts, artifactRefs);
         return {

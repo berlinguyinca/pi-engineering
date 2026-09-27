@@ -2217,8 +2217,7 @@ it("harvest recognizes a worker's own committed work (clean tree) and integratio
     );
     assert.equal(await git.branchAheadOf(base, workerBranch), true, "worker branch must have commits since base");
 
-    // (b) Integration merges the branch tip into the base checkout and the
-    // base-vs-HEAD diff is non-empty afterwards.
+    // (b) Legacy unbound integration merges the branch tip into the base checkout.
     const it = store.createTask({
       mission_id: m.mission_id,
       kind: "integration",

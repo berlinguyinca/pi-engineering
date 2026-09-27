@@ -174,3 +174,65 @@ test("concurrent worktree creation yields distinct usable worktrees", async () =
     await fixture.cleanup();
   }
 });
+
+test("a conflicting second handoff mutates only the preserved integration candidate", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const repo = (await GitRepo.open(fixture.root))!;
+    const base = await repo.headCommit();
+    const incumbentStatus = await repo.status();
+    const first = await repo.createWorktree(base, "handoff-first");
+    const second = await repo.createWorktree(base, "handoff-second");
+    const candidate = await repo.createWorktree(base, "integration-candidate");
+    try {
+      await writeFile(join(first.path, "src", "add.js"), "export const value = 'first';\n");
+      await repo.commitAll(first.path, "first handoff");
+      await writeFile(join(second.path, "src", "add.js"), "export const value = 'second';\n");
+      await repo.commitAll(second.path, "second handoff");
+
+      assert.equal((await repo.mergeRefInWorktree(candidate, first.branch)).merged, true);
+      const conflict = await repo.mergeRefInWorktree(candidate, second.branch);
+
+      assert.equal(conflict.conflict, true);
+      assert.equal(await repo.headCommit(), base, "incumbent HEAD must not move");
+      assert.equal(await repo.status(), incumbentStatus, "incumbent index/tree must remain untouched");
+      assert.ok(await repo.resolveCommit(candidate.branch), "candidate ref must remain inspectable");
+      assert.notEqual(await repo.headCommitIn(candidate.path), base, "successful first handoff remains on candidate");
+    } finally {
+      await repo.removeWorktree(first, { keepBranch: true }).catch(() => {});
+      await repo.removeWorktree(second, { keepBranch: true }).catch(() => {});
+      await repo.removeWorktree(candidate, { keepBranch: true }).catch(() => {});
+    }
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("candidate promotion refuses incumbent divergence without touching index or tree", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const repo = (await GitRepo.open(fixture.root))!;
+    const base = await repo.headCommit();
+    const candidate = await repo.createWorktree(base, "promotion-candidate");
+    try {
+      await writeFile(join(candidate.path, "src", "candidate.js"), "export const candidate = true;\n");
+      await repo.commitAll(candidate.path, "candidate");
+      await writeFile(join(fixture.root, "src", "incumbent.js"), "export const incumbent = true;\n");
+      await exec("git", ["-C", fixture.root, "add", "-A"]);
+      await exec("git", ["-C", fixture.root, "commit", "-q", "-m", "incumbent diverged"]);
+      const diverged = await repo.headCommit();
+
+      const promoted = await repo.promoteCandidate(candidate, base);
+
+      assert.equal(promoted.promoted, false);
+      assert.match(promoted.reason ?? "", /diverged/i);
+      assert.equal(await repo.headCommit(), diverged);
+      assert.equal(await repo.status(), "");
+      assert.ok(await repo.resolveCommit(candidate.branch));
+    } finally {
+      await repo.removeWorktree(candidate, { keepBranch: true }).catch(() => {});
+    }
+  } finally {
+    await fixture.cleanup();
+  }
+});
