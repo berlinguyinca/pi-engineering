@@ -1468,21 +1468,6 @@ export class ExecutionBroker {
                 input.taskId,
               );
             }
-            input.authority?.assertAuthoritative();
-            if (input.repoId && (backend === "integration" || backend === "validation" || input.mutatesRepo)) {
-              this.store.invalidateRepositoryEvidence(
-                input.missionId,
-                input.repoId,
-                backend === "integration"
-                  ? "integration started"
-                  : backend === "validation"
-                    ? "validation attempt started"
-                    : "candidate-affecting execution started",
-              );
-            }
-            if (input.repoId && backend === "review") {
-              this.store.invalidateRepositoryReviewEvidence(input.missionId, input.repoId, "review attempt started");
-            }
             writerStarted = true;
             const backendSettlement: Promise<BackendSettlement> = this.dispatch(
               input,
@@ -1737,6 +1722,20 @@ export class ExecutionBroker {
     input.authority?.assertAuthoritative();
     this.store.setExecutionStatus(execution.execution_id, "RUNNING", {});
     this.active.get(execution.execution_id)!.status = "RUNNING";
+    if (input.repoId && (backend === "integration" || backend === "validation" || input.mutatesRepo)) {
+      this.store.invalidateRepositoryEvidence(
+        input.missionId,
+        input.repoId,
+        backend === "integration"
+          ? "integration started"
+          : backend === "validation"
+            ? "validation attempt started"
+            : "candidate-affecting execution started",
+      );
+    }
+    if (input.repoId && backend === "review") {
+      this.store.invalidateRepositoryReviewEvidence(input.missionId, input.repoId, "review attempt started");
+    }
     return handle;
   }
 

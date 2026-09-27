@@ -225,6 +225,8 @@ export class MissionStore {
   private readonly validationEvidence = new Map<string, ValidationEvidence>();
   private readonly reviewEvidence = new Map<string, ReviewEvidence>();
   private readonly candidateExecutionIds = new Set<string>();
+  private readonly authoritativeExecutionStartOrder = new Map<string, number>();
+  private executionStartSequence = 0;
   private readonly evidenceReplayErrors = new Map<string, string[]>();
   private readonly missionLeases = new Map<string, MissionLease>();
   private readonly repositoryLeases = new Map<string, RepositoryLease>();
@@ -425,6 +427,7 @@ export class MissionStore {
         if (e.payload.execution) {
           const ex = e.payload.execution as Execution;
           this.executions.set(ex.execution_id, copyExecution(ex));
+          if (e.type === "execution.started") this.recordAuthoritativeExecutionStart(ex);
         } else {
           const xid = e.payload.execution_id as string;
           const status = e.payload.status as ExecutionStatus;
@@ -970,6 +973,7 @@ export class MissionStore {
       ...(status === "SUCCEEDED" || status === "FAILED" || status === "CANCELED" ? { ended_at: now } : {}),
     };
     this.executions.set(executionId, next);
+    if (status === "RUNNING") this.recordAuthoritativeExecutionStart(next);
     const type =
       status === "RUNNING"
         ? "execution.started"
@@ -992,6 +996,25 @@ export class MissionStore {
       .filter((e) => (missionId ? e.mission_id === missionId : true))
       .filter((e) => (taskId ? e.task_id === taskId : true))
       .map(copyExecution);
+  }
+
+  executionAuthoritativeStartOrder(executionId: string): number | undefined {
+    return this.authoritativeExecutionStartOrder.get(executionId);
+  }
+
+  private recordAuthoritativeExecutionStart(execution: Execution): void {
+    if (this.authoritativeExecutionStartOrder.has(execution.execution_id)) return;
+    const task = this.tasks.get(execution.task_id);
+    if (
+      !task ||
+      task.mission_id !== execution.mission_id ||
+      task.assigned_execution_id !== execution.execution_id ||
+      task.mission_generation !== execution.mission_generation ||
+      task.candidate_generation !== execution.candidate_generation ||
+      task.fencing_token !== execution.fencing_token
+    )
+      return;
+    this.authoritativeExecutionStartOrder.set(execution.execution_id, ++this.executionStartSequence);
   }
 
   /**

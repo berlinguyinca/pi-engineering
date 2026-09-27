@@ -114,3 +114,34 @@ Fix base: `116881d453e0b0241e8dd4b30f3089724f799611`
 
 - The optional Postgres event-store integration remains unrun because `TEST_DATABASE_URL` is not configured.
 - Multi-repository completion remains intentionally fail-closed until repository head-vector evidence is implemented.
+
+---
+
+## Review Fix Round 3
+
+Fix base: `bb3c6434581eabea30f365b94d6d45b6916491fb`
+
+### RED
+
+- `node --test test/unit/orchestration-gate.test.ts` → 43 passed, 3 failed. Both validation and review allowed an older-created task that executed and failed after a newer green attempt to leave completion open; gate invalidation was also absent until after the failing repository resolver ran.
+
+### GREEN
+
+- Focused: `node --test test/unit/orchestration-gate.test.ts` → 47 passed, 0 failed, including live and JSONL-replay ordering checks and pre-resolution invalidation for validation and review.
+- Review-invalidation mutation check: removing the early review invalidation and running `node --test --test-name-pattern="durably invalidates review evidence" test/unit/orchestration-gate.test.ts` → 0 passed, 1 failed; restoring it → 1 passed, 0 failed.
+- Orchestration regression surface: `node --test test/unit/orchestration-*.test.ts test/integration/orchestration*.test.ts` → 226 passed, 0 failed.
+- Typecheck: `npm run typecheck` → passed.
+- Lint/static format: `npm run lint` → 583 files checked, no errors.
+- Full suite: `npm test` → 2,405 passed, 0 failed, 1 optional Postgres skip.
+
+### Fix Decisions
+
+- A gate attempt begins when its exact assigned execution durably enters `RUNNING`. The store reconstructs a monotonic authoritative-start order from `execution.started` event sequence, accepting a start only when mission, candidate generation, fence, and current assignment all match.
+- Completion selects the latest validation and review by authoritative execution-start order, never task creation or map insertion order.
+- A failed gate task becomes obsolete only when current passing evidence belongs to a strictly later authoritative successful execution. Failed attempts without a proven earlier start remain blocking.
+- Repository-scoped validation/review invalidation now occurs immediately after the execution enters `RUNNING`, before repository resolution, worktree setup, checkpoint setup, or backend dispatch can fail.
+
+### Residual Concerns
+
+- The optional Postgres event-store integration remains unrun because `TEST_DATABASE_URL` is not configured.
+- Multi-repository completion remains intentionally fail-closed until repository head-vector evidence is implemented.

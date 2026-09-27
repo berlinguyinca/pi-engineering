@@ -120,8 +120,27 @@ export class CompletionGate {
       );
     const tasks = this.store.listTasks(missionId);
     const repoGateTasks = candidate ? tasks.filter((task) => task.repo_id === candidate.identity.repoId) : [];
-    const latestValidationTask = repoGateTasks.filter((task) => task.kind === "validation").at(-1);
-    const latestReviewTask = repoGateTasks.filter((task) => task.kind === "review").at(-1);
+    const repoGateExecutions = candidate
+      ? this.store
+          .listExecutions(missionId)
+          .filter((execution) => execution.repo_id === candidate.identity.repoId)
+          .filter((execution) => this.store.executionAuthoritativeStartOrder(execution.execution_id) !== undefined)
+          .sort(
+            (left, right) =>
+              this.store.executionAuthoritativeStartOrder(left.execution_id)! -
+              this.store.executionAuthoritativeStartOrder(right.execution_id)!,
+          )
+      : [];
+    const latestValidationExecution = repoGateExecutions
+      .filter((execution) => execution.backend === "validation")
+      .at(-1);
+    const latestReviewExecution = repoGateExecutions.filter((execution) => execution.backend === "review").at(-1);
+    const latestValidationTask = latestValidationExecution
+      ? tasks.find((task) => task.task_id === latestValidationExecution.task_id)
+      : undefined;
+    const latestReviewTask = latestReviewExecution
+      ? tasks.find((task) => task.task_id === latestReviewExecution.task_id)
+      : undefined;
     const currentValidation =
       candidateCurrent && candidate
         ? this.store
@@ -136,7 +155,9 @@ export class CompletionGate {
               (entry) =>
                 latestValidationTask?.status === "SUCCEEDED" &&
                 latestValidationTask.task_id === entry.taskId &&
-                latestValidationTask.assigned_execution_id === entry.executionId,
+                latestValidationTask.assigned_execution_id === entry.executionId &&
+                latestValidationExecution?.execution_id === entry.executionId &&
+                latestValidationExecution.status === "SUCCEEDED",
             )
             .at(-1)
         : undefined;
@@ -154,7 +175,9 @@ export class CompletionGate {
               (entry) =>
                 latestReviewTask?.status === "SUCCEEDED" &&
                 latestReviewTask.task_id === entry.taskId &&
-                latestReviewTask.assigned_execution_id === entry.executionId,
+                latestReviewTask.assigned_execution_id === entry.executionId &&
+                latestReviewExecution?.execution_id === entry.executionId &&
+                latestReviewExecution.status === "SUCCEEDED",
             )
             .at(-1)
         : undefined;
@@ -190,18 +213,28 @@ export class CompletionGate {
 
     const validSuperseded = new Set<string>();
     const obsoleteGateAttempts = new Set<string>();
-    if (validationOk && latestValidationTask) {
+    const markProvablyEarlierFailedAttempts = (
+      kind: "validation" | "review",
+      currentExecutionId: string | undefined,
+    ): void => {
+      if (!currentExecutionId) return;
+      const currentOrder = this.store.executionAuthoritativeStartOrder(currentExecutionId);
+      if (currentOrder === undefined) return;
       for (const task of repoGateTasks) {
-        if (task.kind === "validation" && task.status === "FAILED" && task.task_id !== latestValidationTask.task_id)
+        if (task.kind !== kind || task.status !== "FAILED") continue;
+        const attemptOrders = repoGateExecutions
+          .filter((execution) => execution.backend === kind && execution.task_id === task.task_id)
+          .flatMap((execution) => {
+            const order = this.store.executionAuthoritativeStartOrder(execution.execution_id);
+            return order === undefined ? [] : [order];
+          });
+        if (attemptOrders.length > 0 && attemptOrders.every((order) => order < currentOrder)) {
           obsoleteGateAttempts.add(task.task_id);
+        }
       }
-    }
-    if (reviewOk && latestReviewTask) {
-      for (const task of repoGateTasks) {
-        if (task.kind === "review" && task.status === "FAILED" && task.task_id !== latestReviewTask.task_id)
-          obsoleteGateAttempts.add(task.task_id);
-      }
-    }
+    };
+    if (validationOk) markProvablyEarlierFailedAttempts("validation", currentValidation?.executionId);
+    if (reviewOk) markProvablyEarlierFailedAttempts("review", currentReview?.executionId);
     const supersessionProblems: string[] = [];
     for (const lineage of this.store.listTaskSupersessions(missionId)) {
       const failed = tasks.find((task) => task.task_id === lineage.failedTaskId);

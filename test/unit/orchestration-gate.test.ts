@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import { ExecutionBroker } from "../../src/orchestration/broker.ts";
 import { CompletionGate } from "../../src/orchestration/completionGate.ts";
 import {
   buildCandidateEvidenceIdentity,
@@ -336,9 +337,19 @@ describe("CompletionGate (spec 07)", () => {
 });
 
 describe("revision-bound completion evidence", () => {
-  function currentEvidenceMission() {
+  function currentEvidenceMission(olderGateKind?: "validation" | "review") {
     const { store, m, backend } = mission(["validation", "independent_review"]);
     const acceptance = store.addAcceptanceCriterion(m.mission_id, "current candidate is verified", undefined, "AC-1");
+    const olderGate = olderGateKind
+      ? store.createTask({
+          mission_id: m.mission_id,
+          kind: olderGateKind,
+          role: olderGateKind === "review" ? "independent-reviewer" : "validator",
+          objective: `older-created ${olderGateKind}`,
+          repo_id: "repo-1",
+          acceptance_ids: ["AC-1"],
+        })
+      : undefined;
     const manifest = {
       manifestId: "WM-1",
       missionId: m.mission_id,
@@ -406,7 +417,27 @@ describe("revision-bound completion evidence", () => {
       recordedAt: new Date().toISOString(),
     });
     store.setCriterionStatus(m.mission_id, 0, "passed", hashCandidateEvidenceIdentity(identity));
-    return { store, backend, mission: store.getMission(acceptance.mission_id)!, identity, validationRun };
+    return { store, backend, mission: store.getMission(acceptance.mission_id)!, identity, validationRun, olderGate };
+  }
+
+  async function failOlderCreatedGateAfterGreen(kind: "validation" | "review") {
+    const fixture = currentEvidenceMission(kind);
+    const task = fixture.olderGate!;
+    fixture.store.transitionTask(task.task_id, "READY");
+    const execution = fixture.store.createExecution({
+      task_id: task.task_id,
+      backend: kind,
+      mission_id: fixture.mission.mission_id,
+      repo_id: fixture.identity.repoId,
+      base_sha: fixture.identity.baseSha,
+    });
+    fixture.store.transitionTask(task.task_id, "RUNNING", "system", {
+      assigned_execution_id: execution.execution_id,
+    });
+    fixture.store.setExecutionStatus(execution.execution_id, "RUNNING");
+    fixture.store.setExecutionStatus(execution.execution_id, "FAILED");
+    fixture.store.transitionTask(task.task_id, "FAILED");
+    return fixture;
   }
 
   it("hashes canonical identity JSON independent of set ordering", () => {
@@ -433,6 +464,64 @@ describe("revision-bound completion evidence", () => {
     const verdict = new CompletionGate(store).evaluate(mission);
     assert.equal(verdict.can_complete, true, JSON.stringify(verdict.reasons));
   });
+
+  for (const kind of ["validation", "review"] as const) {
+    it(`orders ${kind} attempts by authoritative execution start across live and JSONL replay`, async () => {
+      const { store, backend, mission } = await failOlderCreatedGateAfterGreen(kind);
+      const live = new CompletionGate(store).evaluate(store.getMission(mission.mission_id)!);
+      assert.equal(live.can_complete, false, JSON.stringify(live));
+      assert.match(live.reasons.join("; "), new RegExp(`${kind}|failed`, "i"));
+
+      await store.flush();
+      const replayed = MissionStore.open(backend);
+      const replay = new CompletionGate(replayed).evaluate(replayed.getMission(mission.mission_id)!);
+      assert.equal(replay.can_complete, false, JSON.stringify(replay));
+      assert.match(replay.reasons.join("; "), new RegExp(`${kind}|failed`, "i"));
+    });
+  }
+
+  for (const kind of ["validation", "review"] as const) {
+    it(`durably invalidates ${kind} evidence before repository resolution can fail`, async () => {
+      const { store, backend, mission, identity } = currentEvidenceMission();
+      const task = store.createTask({
+        mission_id: mission.mission_id,
+        kind,
+        role: kind === "review" ? "independent-reviewer" : "validator",
+        objective: "fail during repository setup",
+        repo_id: identity.repoId,
+        acceptance_ids: ["AC-1"],
+      });
+      const before = store.listEvidenceInvalidations(mission.mission_id).length;
+      const neverRun = async () => {
+        throw new Error("backend must not run");
+      };
+      const broker = new ExecutionBroker({
+        store,
+        resolveRepository: async () => {
+          throw new Error("repository setup failed");
+        },
+        backends: {
+          validation: { runValidation: neverRun },
+          review: { runReview: neverRun },
+        },
+      });
+      const handle = await broker.execute({
+        taskId: task.task_id,
+        missionId: mission.mission_id,
+        repoId: identity.repoId,
+        kind,
+        role: task.role,
+        objective: task.objective,
+      });
+      const invalidations = store.listEvidenceInvalidations(mission.mission_id);
+      assert.equal(invalidations.length, before + 1);
+      assert.equal(invalidations.at(-1)?.scope, kind === "review" ? "review" : "all");
+      await assert.rejects(handle.result(), /repository setup failed/);
+      await store.flush();
+      const replayed = MissionStore.open(backend);
+      assert.equal(replayed.listEvidenceInvalidations(mission.mission_id).length, before + 1);
+    });
+  }
 
   it("rejects evidence whose settled execution has stale candidate generation", () => {
     const { store, mission, identity } = currentEvidenceMission();
