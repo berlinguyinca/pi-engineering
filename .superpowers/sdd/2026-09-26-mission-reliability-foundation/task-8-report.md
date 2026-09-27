@@ -6,6 +6,8 @@ Implemented pure typed failure classification, stable failure fingerprints, dura
 
 Fix round 1 closes all nine adversarial findings: complete canonical candidate/promotion identity, action-specific recovery execution, exact checkpoint import, single-flight blocked episodes with transitive leaf supersession, one restart-persistent recovery ledger, conservative provider classification, terminal failure classification, generation-bound stop/resume records, and durable ownership-release diagnostics.
 
+Fix round 2 closes six replay and materiality findings: durable recovery-owned phase replay, typed immutable checkpoint import, resumption-generation decision rollover, provider-first terminal gate classification, genuinely mutating repair tasks with candidate-delta proof, and staged workspace-manifest replacement.
+
 The two carried Task 7 prerequisites are enforced before recovery:
 
 - candidate, integration-run, and promotion journals use canonical complete-payload filenames and reject impossible identity/generation relationships;
@@ -32,13 +34,21 @@ Metabolomics remains disabled. No model or package dependency was added.
 - Terminal gate failures initially transitioned tasks before any durable classification; the scheduler regression proves classification precedes failure state.
 - Replacement work initially discarded dependency and checkpoint state, and downstream dependencies ignored transitive replacement leaves; the new regressions prove exact recovery requirements and leaf satisfaction.
 - A stop after explicit resumption initially reported the old recovery deadline; the generation-bound deadline regression failed red and now reports only the current resumption epoch.
+- Three crash-point regressions (after replacement flush, after `REPAIRING`, and during dispatch) initially returned `BLOCKED`; replay now resumes the recovery-owned supersession lineage and treats its current leaves as the durable material delta.
+- Explicit resumption initially reused the prior generation's started decision. Recovery now fails the stale started decision, creates a decision bound to the new resumption deadline, and retains cumulative fingerprint/mission accounting.
+- A real Git checkpoint-import regression saw exact formerly dirty bytes in the replacement worktree but no typed completed-work context. The broker now validates and exposes checkpoint identity, source path/branch, committed/formerly-dirty paths, completed deliverables, and artifact identities.
+- Unreproducible dirty paths, traversal/absolute repository paths, relative source worktrees, and unmatched artifact hashes initially reached dispatch; all now fail before execution creation.
+- Permanent provider failures in validation/review/integration were initially overwritten by task-kind categories. Structured provider/error classification now wins, with gate/merge fallback only for genuine gate failures.
+- `CREATE_REPAIR_TASKS` initially cloned failed validation/review tasks. It now creates bounded mutating implementer work in isolated worktrees and durably records the starting candidate identity; recovery cannot succeed without changed candidate evidence and fresh gates.
+- Manifest rebuild initially bound generation 2 before probes, so a failed probe survived restart as authoritative. Registry contexts are now staged and probed before commit and durable manifest bind; the restart regression retains generation 1 on failure.
+- The full suite exposed a filesystem-order-dependent promotion test that sometimes forged a stale intent instead of the completed record. The regression now selects the completed promotion explicitly and remains deterministic under concurrent full-suite load.
 
 ## GREEN evidence
 
-- `node --test test/unit/git.test.ts test/unit/orchestration-missionstore.test.ts test/unit/orchestration-recovery-planner.test.ts test/unit/orchestration-scheduler.test.ts test/integration/orchestrator-recovery.test.ts test/integration/orchestrator-resilience.test.ts test/unit/orchestration-gate.test.ts test/integration/orchestrator-e2e.test.ts` — 190 passed, 0 failed.
+- `node --test test/unit/git.test.ts test/unit/orchestration-missionstore.test.ts test/unit/orchestration-recovery-planner.test.ts test/unit/orchestration-scheduler.test.ts test/integration/orchestrator-recovery.test.ts test/integration/orchestrator-resilience.test.ts test/unit/orchestration-gate.test.ts test/integration/orchestrator-e2e.test.ts` — 200 passed, 0 failed.
 - `npm run typecheck` — passed.
 - `npm run lint` — passed (585 files checked).
-- `npm test` — 2,473 passed, 0 failed, 1 skipped; the skip requires `TEST_DATABASE_URL` for the optional Postgres OpenViking round trip.
+- `npm test` — 2,483 passed, 0 failed, 1 skipped; the skip requires `TEST_DATABASE_URL` for the optional Postgres OpenViking round trip.
 - `git diff --check` — passed.
 
 ## Decisions
@@ -52,6 +62,9 @@ Metabolomics remains disabled. No model or package dependency was added.
 - Candidate journal filenames bind parent/run lineage, seed/base/candidate SHAs, repository and mission generations, branch, and path; replay additionally derives the deterministic mission-owned branch/worktree mapping.
 - The selected recovery action remains authoritative: wait and pause stop before dispatch, manifest rebuild requires a new probed manifest generation, evidence reconstruction requires invalidation, fencing requires an orphan/replacement delta, and repair actions require current-leaf replacements.
 - Explicit resumption starts a new deadline epoch but does not reset the unified mission ceiling or identical-fingerprint attempt count. Stop records bind stop generation, resumption generation, blocked episode, current deadline, and every known preserved repository asset.
+- Recovery phase is reconstructed from the generation-bound decision plus deterministic recovery-owned task/supersession IDs. Existing current leaves are resumed, not recreated, across every write-ahead crash boundary.
+- Checkpoint recovery always creates a fresh worktree at the exact verified candidate commit. The typed backend context carries preserved completed work and artifact identities; no opaque requirement alone can claim imported state.
+- Workspace registry replacement is a stage/probe/commit operation. The durable manifest generation advances only after every staged role probe succeeds.
 
 ## Residual risk / reviewer focus
 
@@ -60,4 +73,6 @@ Metabolomics remains disabled. No model or package dependency was added.
 - Review unified recovery accounting between scheduler retries and parent repair, especially provider transient behavior and earliest-deadline replay.
 - Review action postconditions and error settlement in `repairBlockedMission`, especially manifest probe failures and checkpoint mismatch findings.
 - Review exact checkpoint recovery requirements (`candidateSha`, committed/dirty paths, artifacts) and transitive supersession leaf behavior in scheduler and completion gates.
+- Review the durable `startingCandidateIdentityHash` baseline and the post-integration material-delta gate for `CREATE_REPAIR_TASKS`.
+- Review staged registry replacement for the invariant that failed probes cannot mutate either active in-memory repository authority or replayed manifest generation.
 - The optional Postgres-backed OpenViking test was not run because `TEST_DATABASE_URL` is not configured; it is unrelated to this change.

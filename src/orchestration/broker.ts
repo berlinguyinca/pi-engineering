@@ -19,6 +19,7 @@
  */
 
 import { createHash } from "node:crypto";
+import { isAbsolute } from "node:path";
 import { id } from "../core/ids.ts";
 import type {
   CandidateLifecycle,
@@ -49,6 +50,8 @@ export interface ExecutionRequestInput {
   isolation?: "none" | "worktree";
   capabilities?: string[];
   modelRequirements?: Record<string, unknown>;
+  /** Verified durable checkpoint imported into this fresh execution. */
+  recovery?: CheckpointRecoveryContext;
   timeoutPolicy?: { timeoutMs?: number; maxAttempts?: number };
   checkpointId?: string;
   deliverables?: string[];
@@ -63,6 +66,18 @@ export interface ExecutionRequestInput {
   acceptanceCriteria?: Array<{ acceptanceId: string; criterion: string }>;
   /** Renewable fencing held by the caller for the complete dispatch. */
   authority?: DispatchAuthority;
+}
+
+export interface CheckpointRecoveryContext {
+  checkpointId: string;
+  candidateSha: string;
+  sourceBranch: string;
+  sourceWorktree: string;
+  committedPaths: string[];
+  formerlyDirtyPaths: string[];
+  completedDeliverables: string[];
+  artifactRefs: string[];
+  artifactHashes: string[];
 }
 
 export interface ExecutionHandle {
@@ -198,10 +213,53 @@ export interface AgentRunner {
     /** True only when `worktree` is one this broker allocated for the run. */
     isolatedWorktree?: boolean;
     modelRequirements?: Record<string, unknown>;
+    recovery?: CheckpointRecoveryContext;
     signal: AbortSignal;
     onActivity?: (event: WorkerActivity) => void;
   }): Promise<ExecutionOutcome>;
   onSteer?: (steer: string) => void;
+}
+
+function checkpointRecoveryContext(requirements?: Record<string, unknown>): CheckpointRecoveryContext | undefined {
+  if (typeof requirements?.recoveryFromCheckpoint !== "string") return undefined;
+  const strings = (value: unknown, field: string): string[] => {
+    if (!Array.isArray(value) || value.some((entry) => typeof entry !== "string" || !entry.trim())) {
+      throw new Error(`checkpoint recovery ${field} is invalid`);
+    }
+    return [...value];
+  };
+  const required = (value: unknown, field: string): string => {
+    if (typeof value !== "string" || !value.trim()) throw new Error(`checkpoint recovery ${field} is invalid`);
+    return value;
+  };
+  const committedPaths = strings(requirements.recoveryCommittedChanges, "committed paths");
+  const formerlyDirtyPaths = strings(requirements.recoveryUncommittedChanges, "formerly dirty paths");
+  const unsafePath = (path: string): boolean =>
+    path.startsWith("/") || path.includes("\\") || path.split("/").some((segment) => segment === "..");
+  if ([...committedPaths, ...formerlyDirtyPaths].some(unsafePath)) {
+    throw new Error("checkpoint recovery committed paths are unsafe");
+  }
+  if (formerlyDirtyPaths.some((path) => !committedPaths.includes(path))) {
+    throw new Error("checkpoint recovery cannot reproduce formerly dirty paths from the immutable candidate");
+  }
+  const artifactRefs = strings(requirements.recoveryArtifactRefs, "artifact refs");
+  const artifactHashes = strings(requirements.recoveryArtifactHashes, "artifact hashes");
+  if (artifactRefs.length !== artifactHashes.length) {
+    throw new Error("checkpoint recovery artifact identities do not match");
+  }
+  const sourceWorktree = required(requirements.recoveryWorktree, "source worktree");
+  if (!isAbsolute(sourceWorktree)) throw new Error("checkpoint recovery source worktree must be absolute");
+  return {
+    checkpointId: required(requirements.recoveryFromCheckpoint, "checkpoint identity"),
+    candidateSha: required(requirements.recoveryCandidateSha, "candidate SHA"),
+    sourceBranch: required(requirements.recoveryBranch, "source branch"),
+    sourceWorktree,
+    committedPaths,
+    formerlyDirtyPaths,
+    completedDeliverables: strings(requirements.recoveryCompletedDeliverables, "completed deliverables"),
+    artifactRefs,
+    artifactHashes,
+  };
 }
 
 export interface ProcessRunner {
@@ -782,8 +840,7 @@ export class ExecutionBroker {
       // which turns a real conflict into a clean merge where the worker's version
       // wins over the incumbent.
       const missionBase = this.store.getMission(input.missionId)?.base_ref?.trim();
-      const recoveryCandidateSha = (input.modelRequirements as { recoveryCandidateSha?: unknown } | undefined)
-        ?.recoveryCandidateSha;
+      const recoveryCandidateSha = input.recovery?.candidateSha;
       let base = missionBase || this.baseRef || (await repository.git.headCommit());
       if (typeof recoveryCandidateSha === "string" && recoveryCandidateSha.trim()) {
         const resolvedRecovery = await repository.git.resolveCommit(recoveryCandidateSha);
@@ -1607,7 +1664,11 @@ export class ExecutionBroker {
   }
 
   async execute(rawInput: ExecutionRequestInput): Promise<ExecutionHandle> {
-    const input = { ...rawInput, writeDomains: (rawInput.writeDomains ?? []).map(canonicalizeWriteDomain) };
+    const input: ExecutionRequestInput = {
+      ...rawInput,
+      writeDomains: (rawInput.writeDomains ?? []).map(canonicalizeWriteDomain),
+      recovery: rawInput.recovery ?? checkpointRecoveryContext(rawInput.modelRequirements),
+    };
     input.authority?.assertAuthoritative();
     const executionStartedAt = Date.now();
     const executionBudgetMs = input.executionBudgetMs ?? input.timeoutPolicy?.timeoutMs ?? this.defaultTimeoutMs;
@@ -2326,6 +2387,7 @@ export class ExecutionBroker {
           worktree: base.worktree,
           isolatedWorktree: worktree !== null,
           modelRequirements: input.modelRequirements,
+          recovery: input.recovery,
           signal,
           onActivity: base.onActivity,
         });

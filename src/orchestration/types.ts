@@ -465,6 +465,8 @@ export interface RecoveryDecision {
   blockedEpisodeId?: EntityId;
   /** Explicit operator resumption epoch; restart alone never increments it. */
   resumptionGeneration?: number;
+  /** Candidate evidence baseline that a mutating repair must durably supersede. */
+  startingCandidateIdentityHash?: string | null;
 }
 
 export interface EvidenceInvalidation {

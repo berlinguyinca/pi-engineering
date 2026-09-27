@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
+import { readFile, writeFile } from "node:fs/promises";
 import { describe, it } from "node:test";
+import { GitRepo } from "../../src/git/GitRepo.ts";
 import { type BrokerBackends, ExecutionBroker } from "../../src/orchestration/broker.ts";
 import { CheckpointManager } from "../../src/orchestration/checkpoints.ts";
 import { taskCoverageFingerprint } from "../../src/orchestration/evidence.ts";
@@ -8,6 +10,7 @@ import { MissionOwnership, type OwnershipIdentity } from "../../src/orchestratio
 import { MissionScheduler, classifyFailure, domainsOverlap } from "../../src/orchestration/scheduler.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 import type { GatewayResilienceConfig } from "../../src/resilience/config.ts";
+import { makeFixtureRepo } from "../fixtures/make-fixture.ts";
 
 const cancellationResilience: GatewayResilienceConfig = {
   retry_window_ms: 60_000,
@@ -225,6 +228,184 @@ describe("MissionScheduler (spec 02)", () => {
     assert.equal(checkpoint.candidateGeneration, task.candidate_generation);
     assert.equal(checkpoint.fencingToken, task.fencing_token);
     assert.equal(store.getMission(mission.mission_id)?.acceptance_criteria[0]?.status, "pending");
+  });
+
+  it("imports the verified checkpoint snapshot and exposes typed completed work to the replacement", async () => {
+    const fixture = await makeFixtureRepo();
+    const git = (await GitRepo.open(fixture.root))!;
+    const baseSha = await git.headCommit();
+    await writeFile(`${fixture.root}/recovered.txt`, "exact dirty bytes\n", "utf8");
+    await git.commitAll(fixture.root, "preserve formerly dirty checkpoint bytes");
+    const candidateSha = await git.headCommit();
+    const store = MissionStore.open(JsonlEventStore.inMemory());
+    const mission = createExecutingMission(store);
+    const task = store.createTask({
+      mission_id: mission.mission_id,
+      kind: "agent",
+      role: "implementer",
+      objective: "finish the checkpoint remainder",
+      mutates_repo: true,
+      isolation: "worktree",
+      deliverables: ["remaining"],
+      execution_requirements: {
+        recoveryFromCheckpoint: "CHK-dirty",
+        recoveryCandidateSha: candidateSha,
+        recoveryBranch: "pi-eng-orch-original",
+        recoveryWorktree: "/preserved/original",
+        recoveryCommittedChanges: ["recovered.txt"],
+        recoveryUncommittedChanges: ["recovered.txt"],
+        recoveryCompletedDeliverables: ["completed"],
+        recoveryArtifactRefs: ["artifact://checkpoint/one"],
+        recoveryArtifactHashes: ["sha256:checkpoint-one"],
+      },
+    });
+    let observedRecovery: Record<string, unknown> | undefined;
+    const scheduler = new MissionScheduler({
+      store,
+      broker: new ExecutionBroker({
+        store,
+        git,
+        baseRef: baseSha,
+        backends: {
+          agent: {
+            runAgent: async (input) => {
+              observedRecovery = (input as typeof input & { recovery?: Record<string, unknown> }).recovery;
+              assert.equal(await readFile(`${input.worktree}/recovered.txt`, "utf8"), "exact dirty bytes\n");
+              return {
+                executionId: "replacement",
+                exitStatus: "succeeded",
+                summary: "remaining work completed",
+                artifactRefs: [],
+                usage: {},
+              };
+            },
+          },
+        },
+      }),
+    });
+    try {
+      await scheduler.runMission(mission.mission_id);
+
+      assert.equal(store.getTask(task.task_id)?.status, "SUCCEEDED");
+      assert.deepEqual(observedRecovery, {
+        checkpointId: "CHK-dirty",
+        candidateSha,
+        sourceBranch: "pi-eng-orch-original",
+        sourceWorktree: "/preserved/original",
+        committedPaths: ["recovered.txt"],
+        formerlyDirtyPaths: ["recovered.txt"],
+        completedDeliverables: ["completed"],
+        artifactRefs: ["artifact://checkpoint/one"],
+        artifactHashes: ["sha256:checkpoint-one"],
+      });
+    } finally {
+      await fixture.cleanup();
+    }
+  });
+
+  it("fails closed before dispatch when formerly dirty checkpoint bytes are not reproducible", async () => {
+    const store = MissionStore.open(JsonlEventStore.inMemory());
+    const mission = createExecutingMission(store);
+    const task = store.createTask({
+      mission_id: mission.mission_id,
+      kind: "agent",
+      role: "implementer",
+      objective: "do not dispatch an incomplete checkpoint",
+      execution_requirements: {
+        recoveryFromCheckpoint: "CHK-unreproducible",
+        recoveryCandidateSha: "candidate-sha",
+        recoveryBranch: "pi-eng-orch-original",
+        recoveryWorktree: "/preserved/original",
+        recoveryCommittedChanges: [],
+        recoveryUncommittedChanges: ["lost-dirty.txt"],
+        recoveryCompletedDeliverables: [],
+        recoveryArtifactRefs: [],
+        recoveryArtifactHashes: [],
+      },
+      max_attempts: 1,
+      failure_policy: "block",
+    });
+    let dispatches = 0;
+    const scheduler = new MissionScheduler({
+      store,
+      broker: makeBroker(store, {
+        agent: {
+          runAgent: async () => {
+            dispatches++;
+            return { executionId: "unsafe", exitStatus: "succeeded", summary: "unsafe", artifactRefs: [], usage: {} };
+          },
+        },
+      }),
+    });
+
+    await scheduler.runMission(mission.mission_id);
+
+    assert.equal(dispatches, 0);
+    assert.equal(store.getTask(task.task_id)?.status, "FAILED");
+    assert.match(store.getTask(task.task_id)?.failure_reason ?? "", /cannot reproduce formerly dirty paths/i);
+  });
+
+  it("rejects unsafe checkpoint paths and unmatched artifact hashes before execution creation", async () => {
+    const cases = [
+      {
+        name: "unsafe committed path",
+        overrides: { recoveryCommittedChanges: ["../escape.txt"] },
+        expected: /checkpoint recovery committed paths are unsafe/i,
+      },
+      {
+        name: "unmatched artifact hash",
+        overrides: { recoveryArtifactHashes: [] },
+        expected: /artifact identities do not match/i,
+      },
+      {
+        name: "relative source worktree",
+        overrides: { recoveryWorktree: "relative/preserved" },
+        expected: /source worktree must be absolute/i,
+      },
+    ];
+    for (const testCase of cases) {
+      const store = MissionStore.open(JsonlEventStore.inMemory());
+      const mission = createExecutingMission(store);
+      const task = store.createTask({
+        mission_id: mission.mission_id,
+        kind: "agent",
+        role: "implementer",
+        objective: testCase.name,
+      });
+      const broker = makeBroker(store, {
+        agent: {
+          runAgent: async () => ({
+            executionId: "unsafe",
+            exitStatus: "succeeded",
+            summary: "unsafe",
+            artifactRefs: [],
+            usage: {},
+          }),
+        },
+      });
+      await assert.rejects(
+        broker.execute({
+          taskId: task.task_id,
+          missionId: mission.mission_id,
+          kind: "agent",
+          objective: testCase.name,
+          modelRequirements: {
+            recoveryFromCheckpoint: "CHK-unsafe",
+            recoveryCandidateSha: "candidate-sha",
+            recoveryBranch: "pi-eng-orch-original",
+            recoveryWorktree: "/preserved/original",
+            recoveryCommittedChanges: ["safe.txt"],
+            recoveryUncommittedChanges: [],
+            recoveryCompletedDeliverables: [],
+            recoveryArtifactRefs: ["artifact://checkpoint/one"],
+            recoveryArtifactHashes: ["sha256:checkpoint-one"],
+            ...testCase.overrides,
+          },
+        }),
+        testCase.expected,
+      );
+      assert.equal(store.listExecutions(mission.mission_id).length, 0);
+    }
   });
 
   it("holds fenced mission and repository authority for the entire mutating dispatch", async () => {
@@ -1162,11 +1343,11 @@ describe("failure classifier (spec 02)", () => {
     await scheduler.runMission(mission.mission_id);
 
     const classifications = store.listFailureClassifications(mission.mission_id);
-    assert.deepEqual(classifications.map((classification) => classification.category).sort(), [
-      "MERGE_CONFLICT",
-      "REVIEW_FAILED",
-      "VALIDATION_FAILED",
-    ]);
+    assert.deepEqual(
+      classifications.map((classification) => classification.category).sort(),
+      ["MERGE_CONFLICT", "REVIEW_FAILED", "VALIDATION_FAILED"],
+      JSON.stringify(classifications),
+    );
     const events = backend.all().filter((event) => event.run_id === mission.mission_id);
     for (const kind of ["validation", "review", "integration"] as const) {
       const taskId = `TSK-terminal-${kind}`;
@@ -1180,6 +1361,58 @@ describe("failure classifier (spec 02)", () => {
             (event) => event.type === "task.failed" && (event.payload.task_id as string | undefined) === taskId,
           ),
       );
+    }
+  });
+
+  it("preserves permanent provider classification for validation, review, and integration failures", async () => {
+    const fixture = await makeFixtureRepo();
+    const git = (await GitRepo.open(fixture.root))!;
+    const store = MissionStore.open(JsonlEventStore.inMemory());
+    const mission = createExecutingMission(store);
+    for (const kind of ["validation", "review", "integration"] as const) {
+      store.createTask({
+        task_id: `TSK-provider-${kind}`,
+        mission_id: mission.mission_id,
+        kind,
+        role: kind,
+        objective: `${kind} with permanent provider refusal`,
+        max_attempts: 1,
+        failure_policy: "block",
+      });
+    }
+    const refused = async () => ({
+      executionId: "provider-refusal",
+      exitStatus: "failed",
+      summary: "provider rejected the request",
+      error: "provider invalid api key",
+      artifactRefs: [],
+      usage: {},
+    });
+    const scheduler = new MissionScheduler({
+      store,
+      broker: new ExecutionBroker({
+        store,
+        git,
+        baseRef: await git.headCommit(),
+        backends: {
+          validation: { runValidation: refused },
+          review: { runReview: refused },
+          integration: { runIntegration: refused },
+        },
+      }),
+    });
+    try {
+      await scheduler.runMission(mission.mission_id);
+
+      assert.deepEqual(
+        store
+          .listFailureClassifications(mission.mission_id)
+          .map((classification) => classification.category)
+          .sort(),
+        ["PROVIDER_PERMANENT", "PROVIDER_PERMANENT", "PROVIDER_PERMANENT"],
+      );
+    } finally {
+      await fixture.cleanup();
     }
   });
 });

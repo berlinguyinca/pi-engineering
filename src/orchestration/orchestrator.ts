@@ -338,11 +338,20 @@ export class Orchestrator {
       const classifications = this.store.listFailureClassifications(missionId);
       const classification = classifications.at(-1);
       if (!classification) throw new Error(`blocked mission ${missionId} has no durable failure classification`);
+      const resumptionGeneration = this.store.listMissionResumptions(missionId).at(-1)?.generation ?? 0;
+      const recoveryStartCandidate = this.store.getCandidate(missionId)?.identityHash ?? null;
+      for (const stale of this.store
+        .listRecoveryDecisions(missionId)
+        .filter((entry) => entry.status === "started" && (entry.resumptionGeneration ?? 0) !== resumptionGeneration)) {
+        this.store.transitionRecovery(stale.recoveryId, "failed");
+      }
       let repairDecision = this.store
         .listRecoveryDecisions(missionId)
         .find(
           (entry) =>
-            entry.blockedEpisodeId === blockedEpisodeId && (entry.status === "planned" || entry.status === "started"),
+            entry.blockedEpisodeId === blockedEpisodeId &&
+            (entry.resumptionGeneration ?? 0) === resumptionGeneration &&
+            (entry.status === "planned" || entry.status === "started"),
         );
       if (!repairDecision) {
         const history = this.store.listRecoveryDecisions(missionId);
@@ -350,7 +359,7 @@ export class Orchestrator {
           classification,
           history,
           now: this.scheduler.now(),
-          resumptionGeneration: this.store.listMissionResumptions(missionId).at(-1)?.generation ?? 0,
+          resumptionGeneration,
         });
 
         if (choice.action === "STOP") {
@@ -369,7 +378,10 @@ export class Orchestrator {
           return this.store.getMission(missionId)!;
         }
 
-        repairDecision = this.store.planRecovery(choice);
+        repairDecision = this.store.planRecovery({
+          ...choice,
+          startingCandidateIdentityHash: recoveryStartCandidate,
+        });
         await this.store.flush();
       }
 
@@ -404,12 +416,13 @@ export class Orchestrator {
             ? await this.workspaceResolver!.resolve(mission.user_request, this.launchCwd)
             : await this.workspaceResolver!.resolveRepository(mission.repository);
           const rebuilt = createWorkspaceManifest(resolved, missionId, (current?.generation ?? 0) + 1);
-          this.store.bindWorkspaceManifest(rebuilt);
           if (this.repositoryRegistry) {
-            await this.repositoryRegistry.register(rebuilt);
-            const probes = await this.repositoryRegistry.probe(resolved.primaryRepoId);
+            const staged = await this.repositoryRegistry.stage(rebuilt);
+            const probes = await staged.probe(resolved.primaryRepoId);
             if (probes.some((probe) => !probe.ok)) throw new Error("rebuilt workspace manifest failed role probes");
+            staged.commit();
           }
+          this.store.bindWorkspaceManifest(rebuilt);
           this.missionRepoIds.set(missionId, resolved.primaryRepoId);
           await this.store.flush();
         } catch (error) {
@@ -432,6 +445,10 @@ export class Orchestrator {
       }
 
       const invalidationsBefore = this.store.listEvidenceInvalidations(missionId).length;
+      const candidateIdentityBefore =
+        repairDecision.startingCandidateIdentityHash !== undefined
+          ? repairDecision.startingCandidateIdentityHash
+          : recoveryStartCandidate;
 
       const unresolvedFailedTasks = this.store
         .listTasks(missionId)
@@ -504,19 +521,22 @@ export class Orchestrator {
             : [failed.objective];
         const replacements = remaining.map((deliverable, index) => {
           const replacementId = `${repairDecision.recoveryId}-TSK-${failed.task_id}-${index + 1}`;
+          const createsRepair = repairDecision.action === "CREATE_REPAIR_TASKS";
           return (
             this.store.getTask(replacementId) ??
             this.store.createTask({
               task_id: replacementId,
               mission_id: missionId,
-              kind: failed.kind,
-              role: failed.role,
-              objective: `Recover ${failed.objective}: complete remaining deliverable ${deliverable}`,
+              kind: createsRepair ? "agent" : failed.kind,
+              role: createsRepair ? "implementer" : failed.role,
+              objective: createsRepair
+                ? `Repair the repository defect exposed by ${failed.kind}: ${failed.objective}. Then leave the candidate ready for fresh gates.`
+                : `Recover ${failed.objective}: complete remaining deliverable ${deliverable}`,
               depends_on: [...failed.depends_on],
               priority: failed.priority,
-              mutates_repo: failed.mutates_repo,
-              write_domains: [...failed.write_domains],
-              isolation: failed.isolation,
+              mutates_repo: createsRepair ? true : failed.mutates_repo,
+              write_domains: createsRepair ? this.writableDomainsForMission(missionId) : [...failed.write_domains],
+              isolation: createsRepair ? "worktree" : failed.isolation,
               execution_requirements: {
                 ...failed.execution_requirements,
                 recoveryFromCheckpoint: checkpoint?.checkpointId,
@@ -525,6 +545,7 @@ export class Orchestrator {
                 recoveryWorktree: checkpoint?.worktree,
                 recoveryCommittedChanges: [...(checkpoint?.committedChanges ?? [])],
                 recoveryUncommittedChanges: [...(checkpoint?.preservedUncommittedChanges ?? [])],
+                recoveryCompletedDeliverables: [...(checkpoint?.completedDeliverables ?? [])],
                 recoveryArtifactRefs: [...(checkpoint?.artifactRefs ?? [])],
                 recoveryArtifactHashes: [...(checkpoint?.artifactHashes ?? [])],
               },
@@ -581,16 +602,19 @@ export class Orchestrator {
           recoveryDecisionId: repairDecision.recoveryId,
         });
       }
-      for (const lineage of this.store.listTaskSupersessions(missionId)) {
+      const recoveryLineages = this.store
+        .listTaskSupersessions(missionId)
+        .filter((lineage) => lineage.supersessionId.startsWith(`${repairDecision.recoveryId}-SUP-`));
+      for (const lineage of recoveryLineages) {
         for (const taskId of lineage.replacementTaskIds) {
           if (this.store.getTask(taskId)?.status === "PENDING") this.store.transitionTask(taskId, "READY");
         }
       }
       await this.store.flush();
       await this.scheduler.runMission(missionId, signal);
-      const replacementsFailed = this.store
-        .listTaskSupersessions(missionId)
-        .some((lineage) => !this.store.isTaskSatisfiedBySupersession(lineage.failedTaskId));
+      const replacementsFailed = recoveryLineages.some(
+        (lineage) => !this.store.isTaskSatisfiedBySupersession(lineage.failedTaskId),
+      );
       if (replacementsFailed) {
         this.store.transitionRecovery(repairDecision.recoveryId, "failed");
         if (this.store.getMission(missionId)?.status === "REPAIRING") {
@@ -612,7 +636,7 @@ export class Orchestrator {
           case "CREATE_REPAIR_TASKS":
           case "REBUILD_INTEGRATION_CANDIDATE":
           case "REPAIR_BLOCKED_MISSION":
-            return failedTasks.length > 0;
+            return failedTasks.length > 0 || recoveryLineages.length > 0;
           default:
             return false;
         }
@@ -624,7 +648,11 @@ export class Orchestrator {
         await this.store.flush();
         return this.store.getMission(missionId)!;
       }
-      const finalized = await this.finalizeMission(missionId, signal);
+      const finalized = await this.finalizeMission(
+        missionId,
+        signal,
+        repairDecision.action === "CREATE_REPAIR_TASKS" ? candidateIdentityBefore : undefined,
+      );
       this.store.transitionRecovery(repairDecision.recoveryId, finalized.completed ? "succeeded" : "failed");
       await this.store.flush();
       return finalized.mission;
@@ -1342,7 +1370,11 @@ export class Orchestrator {
   }
 
   /** Complete the lifecycle after scheduler work settles, whether initial or resumed. */
-  private async finalizeMission(missionId: string, signal?: AbortSignal): Promise<FinalizationResult> {
+  private async finalizeMission(
+    missionId: string,
+    signal?: AbortSignal,
+    requiredCandidateChangeFrom?: string | null,
+  ): Promise<FinalizationResult> {
     if (signal?.aborted) return this.canceledFinalization(missionId);
     await this.reconcileCommittedPromotions(missionId);
     if (signal?.aborted) return this.canceledFinalization(missionId);
@@ -1352,14 +1384,39 @@ export class Orchestrator {
     let post = await this.postExecution(this.store.getMission(missionId)!, signal);
     if (signal?.aborted) return this.canceledFinalization(missionId);
     let integrated = post.integrationOk;
+    if (
+      requiredCandidateChangeFrom !== undefined &&
+      (this.store.getCandidate(missionId)?.identityHash ?? null) === requiredCandidateChangeFrom
+    ) {
+      const evidence = requiredCandidateChangeFrom ?? "no-prior-candidate";
+      if (
+        !this.store
+          .listFindings(missionId)
+          .some((finding) => finding.category === "recovery_material_delta" && finding.evidence === evidence)
+      ) {
+        this.store.addFinding({
+          mission_id: missionId,
+          task_id: null,
+          severity: "blocking",
+          category: "recovery_material_delta",
+          file: null,
+          line: null,
+          summary: "Recovery repair did not produce a new candidate evidence identity.",
+          evidence,
+          recommended_action: "Produce a repository mutation and rebuild candidate evidence before rerunning gates.",
+        });
+      }
+    }
 
     // Completion gate, with bounded repair rounds (spec 07): a blocking reviewer
     // finding creates repair work, and the repaired result is re-validated and
     // re-reviewed before the gate is consulted again.
     let verdict = this.gate.evaluate(this.store.getMission(missionId)!);
-    let repairRounds = this.store
-      .listRecoveryDecisions(missionId)
-      .filter((decision) => decision.action === "CREATE_REPAIR_TASKS").length;
+    let repairRounds =
+      requiredCandidateChangeFrom !== undefined
+        ? this.maxRepairRounds
+        : this.store.listRecoveryDecisions(missionId).filter((decision) => decision.action === "CREATE_REPAIR_TASKS")
+            .length;
     while ((!verdict.can_complete || !integrated) && repairRounds < this.maxRepairRounds) {
       if (signal?.aborted) return this.canceledFinalization(missionId);
       const openBlocking = this.store
@@ -1413,7 +1470,11 @@ export class Orchestrator {
         break;
       }
       const gateRecovery =
-        this.store.getRecoveryDecision(recoveryChoice.recoveryId) ?? this.store.planRecovery(recoveryChoice);
+        this.store.getRecoveryDecision(recoveryChoice.recoveryId) ??
+        this.store.planRecovery({
+          ...recoveryChoice,
+          startingCandidateIdentityHash: this.store.getCandidate(missionId)?.identityHash ?? null,
+        });
       if (gateRecovery.status === "planned") this.store.transitionRecovery(gateRecovery.recoveryId, "started");
       await this.store.flush();
 

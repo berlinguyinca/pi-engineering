@@ -26,6 +26,11 @@ export interface RoleAccessProbe {
   reason?: string;
 }
 
+export interface StagedRepositoryRegistration {
+  probe(repoId: string): Promise<RoleAccessProbe[]>;
+  commit(): void;
+}
+
 function contains(root: string, cwd: string): boolean {
   const parent = resolve(root);
   const child = resolve(cwd);
@@ -47,6 +52,18 @@ export class RepositoryRegistry {
 
   async register(manifest: WorkspaceManifest): Promise<void> {
     for (const binding of manifest.repositories) await this.registerBinding(binding);
+  }
+
+  /** Build and probe replacement contexts without changing current execution authority. */
+  async stage(manifest: WorkspaceManifest): Promise<StagedRepositoryRegistration> {
+    const staged = new RepositoryRegistry();
+    await staged.register(manifest);
+    return {
+      probe: (repoId) => staged.probe(repoId),
+      commit: () => {
+        for (const binding of manifest.repositories) this.contexts.set(binding.repoId, staged.get(binding.repoId));
+      },
+    };
   }
 
   private async registerBinding(binding: RepositoryBinding): Promise<void> {

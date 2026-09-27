@@ -1602,7 +1602,18 @@ describe("ExecutionBroker (spec 03)", () => {
       assert.equal(await git.headCommit(), candidate.candidateSha);
 
       const stateDir = join(await git.commonDir(), "pi-engineering-candidates");
-      const promotionFile = (await readdir(stateDir)).find((name) => name.startsWith("promotion."))!;
+      const promotionFile = (
+        await Promise.all(
+          (
+            await readdir(stateDir)
+          )
+            .filter((name) => name.startsWith("promotion."))
+            .map(async (name) => ({
+              name,
+              record: JSON.parse(await readFile(join(stateDir, name), "utf8")) as { state?: string },
+            })),
+        )
+      ).find(({ record }) => record.state === "completed")!.name;
       const forged = JSON.parse(await readFile(join(stateDir, promotionFile), "utf8")) as Record<string, unknown>;
       forged.candidateRepositoryGeneration = 999;
       await writeFile(join(stateDir, promotionFile), JSON.stringify(forged));

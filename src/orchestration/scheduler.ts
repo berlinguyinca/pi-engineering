@@ -485,7 +485,7 @@ export class MissionScheduler {
           if (ceiling) {
             authority?.assertAuthoritative();
             this.settleTaskRecoveries(task, "failed");
-            this.recordTerminalFailure(task, ceiling, handle.executionId);
+            this.recordTerminalFailure(task, ceiling, handle.executionId, outcome.error);
             this.store.transitionTask(task.task_id, "FAILED", "system", { failure_reason: ceiling });
             this.forgetOutage(task);
             return;
@@ -506,7 +506,7 @@ export class MissionScheduler {
               if (recoveryStop) {
                 authority?.assertAuthoritative();
                 this.settleTaskRecoveries(task, "failed");
-                this.recordTerminalFailure(task, recoveryStop, handle.executionId);
+                this.recordTerminalFailure(task, recoveryStop, handle.executionId, outcome.error);
                 this.store.transitionTask(task.task_id, "FAILED", "system", { failure_reason: recoveryStop });
                 return;
               }
@@ -525,7 +525,12 @@ export class MissionScheduler {
           const detail = outcome.summary ? `: ${outcome.summary}` : "";
           authority?.assertAuthoritative();
           this.settleTaskRecoveries(task, "failed");
-          this.recordTerminalFailure(task, `backend reported ${outcome.exitStatus}${detail}`, handle.executionId);
+          this.recordTerminalFailure(
+            task,
+            `backend reported ${outcome.exitStatus}${detail}`,
+            handle.executionId,
+            outcome.error,
+          );
           this.store.transitionTask(task.task_id, "FAILED", "system", {
             failure_reason: `backend reported ${outcome.exitStatus}${detail}`,
           });
@@ -588,7 +593,12 @@ export class MissionScheduler {
           if (recoveryStop) {
             authority?.assertAuthoritative();
             this.settleTaskRecoveries(task, "failed");
-            this.recordTerminalFailure(task, recoveryStop, handle?.executionId ?? null);
+            this.recordTerminalFailure(
+              task,
+              recoveryStop,
+              handle?.executionId ?? null,
+              err instanceof Error ? err.message : String(err),
+            );
             this.store.transitionTask(task.task_id, "FAILED", "system", { failure_reason: recoveryStop });
             return;
           }
@@ -598,7 +608,12 @@ export class MissionScheduler {
         }
         authority?.assertAuthoritative();
         this.settleTaskRecoveries(task, "failed");
-        this.recordTerminalFailure(task, reason, handle?.executionId ?? null);
+        this.recordTerminalFailure(
+          task,
+          reason,
+          handle?.executionId ?? null,
+          err instanceof Error ? err.message : String(err),
+        );
         this.store.transitionTask(task.task_id, "FAILED", "system", { failure_reason: reason });
         return;
       } finally {
@@ -639,8 +654,32 @@ export class MissionScheduler {
     return decision.action === "STOP" ? decision.expectedMaterialChange : null;
   }
 
-  private recordTerminalFailure(task: OrchestrationTask, summary: string, executionId: string | null): void {
-    const category =
+  private recordTerminalFailure(
+    task: OrchestrationTask,
+    summary: string,
+    executionId: string | null,
+    structuredError?: string,
+  ): void {
+    const evidence = {
+      missionId: task.mission_id,
+      taskId: task.task_id,
+      executionId,
+      summary: [structuredError, summary].filter(Boolean).join(": "),
+      evidenceRefs: [],
+      observedAt: new Date(this.clockNow()).toISOString(),
+    };
+    const inferred = this.failureClassifier.classify(evidence);
+    const structuredCategory =
+      !!structuredError &&
+      !/repository-scoped git provider|git provider/i.test(structuredError) &&
+      [
+        "PROVIDER_TRANSIENT",
+        "PROVIDER_PERMANENT",
+        "AUTHORIZATION_OR_CREDENTIAL",
+        "PERSISTENCE_FAILURE",
+        "WORKSPACE_SCOPE_MISMATCH",
+      ].includes(inferred.category);
+    const gateCategory =
       task.kind === "validation"
         ? "VALIDATION_FAILED"
         : task.kind === "review"
@@ -648,15 +687,9 @@ export class MissionScheduler {
           : task.kind === "integration"
             ? "MERGE_CONFLICT"
             : undefined;
-    const classification = this.failureClassifier.classify({
-      missionId: task.mission_id,
-      taskId: task.task_id,
-      executionId,
-      summary,
-      evidenceRefs: [],
-      ...(category ? { category } : {}),
-      observedAt: new Date(this.clockNow()).toISOString(),
-    });
+    const classification = structuredCategory
+      ? inferred
+      : this.failureClassifier.classify({ ...evidence, ...(gateCategory ? { category: gateCategory } : {}) });
     if (this.store.getFailureClassification(classification.classificationId)) return;
     this.store.classifyFailure({
       ...classification,
