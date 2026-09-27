@@ -37,3 +37,31 @@ Conflict, red validation/checks, failed review, cancellation/stale authority, an
 
 - `IntegrationRunner.candidateScoped` intentionally preserves legacy injected test/custom runners that still integrate directly. The production `realBackends` runner declares candidate scope; repository-bound runtime missions therefore use the isolated path.
 - Legacy in-memory orchestrators without a `MissionOwnership` provider retain a compatibility promotion path. Production `EngineeringRuntime` supplies durable ownership and uses repository fencing for candidate creation, integration, and promotion.
+
+## Fix round 1
+
+Review findings were addressed with the following hardening:
+
+- Promotion cleanliness inspects tracked and untracked incumbent paths (`--untracked-files=all`) and rejects collisions without overwriting them. Only untracked `.pi-eng/**` runtime metadata is ignored, and promotion separately rejects candidates that touch that namespace, so the exception cannot hide a reset collision.
+- Promotion writes durable intent, performs a base-bound `git update-ref` compare-and-swap inside a repository promotion critical section, reconciles the checkout, and records completion. An observed candidate HEAD is idempotently reconciled as already promoted after restart.
+- Candidate lifecycle records live in the repository Git common directory and include mission, repository, lease generation, execution attempt, branch, path, base SHA, candidate SHA, state, and timestamp. Every attempt gets a unique ref; preserved candidates are never deleted by retry creation.
+- Promotion intent/completion records are keyed by mission, repository, generation, and exact candidate SHA. Restart observes `HEAD == candidate` as a committed promotion and completes reconciliation idempotently rather than attempting a second promotion.
+- Candidate-scoped integration/validation/review restore the exact persisted candidate after broker recreation, remount a missing checkout only when its branch still resolves to the recorded SHA, and fail with `CANDIDATE_UNAVAILABLE` instead of falling back to the incumbent.
+- Promotion/mission cleanup stays under repository authority. Stale destructive cleanup retains the worktree/ref for later reconciliation.
+- Recovered-commit ancestry is checked against the exact candidate worktree HEAD.
+- Candidate worktrees resolve their own Git/context/verifier dependencies; unresolved candidate-looking paths fail closed.
+
+### Fix-round RED/GREEN evidence
+
+- RED: `node --test test/unit/git.test.ts` failed on untracked collision overwrite and non-idempotent restart promotion.
+- RED: the preserved same-attempt retry regression failed because candidate creation deleted and recreated the diagnostic ref.
+- GREEN: `node --test test/unit/git.test.ts` passed 15/15 after durable lifecycle reconciliation and preserved-attempt refusal.
+- GREEN: focused Task 7 suite passed 76/76 after crash/remount and missing-candidate regressions.
+- GREEN: `npm run typecheck` passed.
+- GREEN: `npm run lint` passed (`Checked 583 files`).
+- GREEN: bounded `timeout 180 npm test` passed: 2,418 tests; 2,417 passed, 0 failed, 1 skipped.
+- GREEN: `git diff --check` passed.
+
+### Fix-round residual concerns
+
+- None known in the Task 7 correctness scope. Production backends are candidate-scoped; legacy injected runners remain opt-in compatibility surfaces and do not silently acquire candidate scope.

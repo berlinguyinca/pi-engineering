@@ -20,7 +20,7 @@
 
 import { createHash } from "node:crypto";
 import { id } from "../core/ids.ts";
-import type { GitRepo, WorktreeInfo } from "../git/GitRepo.ts";
+import type { CandidateLifecycle, GitRepo, WorktreeInfo } from "../git/GitRepo.ts";
 import type { WorkerActivity } from "../workers/WorkerExecutor.ts";
 import { sanitizeWorkerActivity } from "../workers/activity.ts";
 import type { CheckpointManager, CheckpointSnapshot } from "./checkpoints.ts";
@@ -189,6 +189,7 @@ export interface ProcessRunner {
 }
 
 export interface ReviewRunner {
+  candidateScoped?: boolean;
   runReview(input: {
     repoId?: string;
     objective: string;
@@ -232,6 +233,7 @@ export interface IntegrationRunner {
 }
 
 export interface ValidationRunner {
+  candidateScoped?: boolean;
   runValidation(input: {
     repoId?: string;
     objective: string;
@@ -329,6 +331,7 @@ export class ExecutionBroker {
       missionId: string;
       cancelCheckpoint?: () => Promise<void>;
       terminalPromise?: Promise<ExecutionOutcome>;
+      authority?: DispatchAuthority;
     }
   >();
   /** Allocated worktrees, cleaned up when their execution settles. */
@@ -348,7 +351,7 @@ export class ExecutionBroker {
   >();
   private readonly missionRepositories = new Map<string, { repoId?: string; root: string; git: GitRepo }>();
   /** Isolated integration candidates. Failed/red/canceled candidates remain inspectable. */
-  private readonly missionCandidates = new Map<string, { worktree: WorktreeInfo; git: GitRepo; baseSha: string }>();
+  private readonly missionCandidates = new Map<string, { lifecycle: CandidateLifecycle; git: GitRepo }>();
   /** Commit each mission's worktrees were actually forked from (landing invariant). */
   private readonly resolvedBases = new Map<string, string>();
   /** Branches intentionally kept after cleanup because their work never merged. */
@@ -549,7 +552,7 @@ export class ExecutionBroker {
 
     const candidateTarget = this.missionCandidates.get(input.missionId);
     const candidateSha = candidateTarget
-      ? await candidateTarget.git.headCommitIn(candidateTarget.worktree.path)
+      ? await candidateTarget.git.headCommitIn(candidateTarget.lifecycle.path)
       : await repository.git.headCommit();
     const diff = await repository.git.captureDiff(binding.baseSha, candidateSha);
     const diffHash = artifactHash(diff);
@@ -654,8 +657,11 @@ export class ExecutionBroker {
         this.retainWorktree(entry.missionId, executionId);
       }
       const outcome = this.terminalizeExecution(executionId, reason, taskId);
+      await this.preserveCandidate(entry.missionId).catch(() => undefined);
       if (reason === "canceled" && checkpointSettled && entry.worktree) {
-        void this.releaseWorktree(executionId).catch(() => this.retainWorktree(entry.missionId, executionId));
+        void this.releaseWorktree(executionId, true, entry.authority).catch(() =>
+          this.retainWorktree(entry.missionId, executionId),
+        );
       }
       return outcome;
     })();
@@ -962,13 +968,13 @@ export class ExecutionBroker {
     return [...changed].filter((path) => !pathAllowed(path, domains)).sort();
   }
 
-  private async releaseWorktree(executionId: string, keepBranch = true): Promise<void> {
+  private async releaseWorktree(executionId: string, keepBranch = true, authority?: DispatchAuthority): Promise<void> {
     const wt = this.allocatedWorktrees.get(executionId);
     if (wt && this.isRetainedWorktree(wt.path)) return;
     if (wt) {
       // Keep the branch: it carries the harvested work until integration merges it.
       try {
-        await wt.git.removeWorktree({ path: wt.path, branch: wt.branch }, { keepBranch });
+        await wt.git.removeWorktree({ path: wt.path, branch: wt.branch }, { keepBranch }, authority);
       } catch {
         const missionId = this.store.getExecution(executionId)?.mission_id;
         if (missionId) this.retainWorktree(missionId, executionId);
@@ -1027,7 +1033,7 @@ export class ExecutionBroker {
     if (!base) return null;
     try {
       const candidate = this.missionCandidates.get(missionId);
-      const head = candidate ? await git.headCommitIn(candidate.worktree.path) : await git.headCommit();
+      const head = candidate ? await git.headCommitIn(candidate.lifecycle.path) : await git.headCommit();
       return await git.changedFiles(base, head);
     } catch {
       return null;
@@ -1035,7 +1041,10 @@ export class ExecutionBroker {
   }
 
   /** Release any worktrees still tracked for a finished mission. */
-  async cleanupMission(missionId: string, opts: { keepBranches?: boolean } = {}): Promise<void> {
+  async cleanupMission(
+    missionId: string,
+    opts: { keepBranches?: boolean; authority?: DispatchAuthority } = {},
+  ): Promise<void> {
     const deferred = this.deferredCleanup.get(missionId) ?? [];
     if (deferred.length > 0) {
       const active = this.missionWorktrees.get(missionId) ?? [];
@@ -1046,7 +1055,11 @@ export class ExecutionBroker {
       this.missionWorktrees.set(missionId, active);
       this.deferredCleanup.delete(missionId);
     }
-    await this.releaseMissionWorktrees(missionId, opts.keepBranches === true);
+    await this.releaseMissionWorktrees(
+      missionId,
+      opts.keepBranches === true,
+      opts.authority ? () => opts.authority!.assertAuthoritative() : undefined,
+    );
   }
 
   private deferMissionWorktreeCleanup(missionId: string): void {
@@ -1091,7 +1104,7 @@ export class ExecutionBroker {
         if (wt.git) {
           let keep = keepBranches;
           try {
-            const head = await wt.git.headCommit();
+            const head = this.missionCandidates.get(missionId)?.lifecycle.candidateSha ?? (await wt.git.headCommit());
             assertOrigin?.();
             if (!(await wt.git.isAncestor(wt.branch, head))) keep = true;
             assertOrigin?.();
@@ -1103,7 +1116,11 @@ export class ExecutionBroker {
           }
           assertOrigin?.();
           try {
-            await wt.git.removeWorktree({ path: wt.path, branch: wt.branch }, { keepBranch: keep });
+            await wt.git.removeWorktree(
+              { path: wt.path, branch: wt.branch },
+              { keepBranch: keep },
+              assertOrigin ? { assertAuthoritative: assertOrigin } : undefined,
+            );
           } catch {
             assertOrigin?.();
             keep = true;
@@ -1141,14 +1158,21 @@ export class ExecutionBroker {
     for (const worktree of this.missionWorktrees.get(missionId) ?? []) {
       if (!branches.includes(worktree.branch)) branches.push(worktree.branch);
     }
-    const candidate = this.missionCandidates.get(missionId)?.worktree.branch;
+    const candidate = this.missionCandidates.get(missionId)?.lifecycle.branch;
     if (candidate && !branches.includes(candidate)) branches.push(candidate);
     return branches;
   }
 
   candidateWorktree(missionId: string): WorktreeInfo | undefined {
-    const candidate = this.missionCandidates.get(missionId)?.worktree;
-    return candidate ? { ...candidate } : undefined;
+    const candidate = this.missionCandidates.get(missionId)?.lifecycle;
+    return candidate ? { path: candidate.path, branch: candidate.branch } : undefined;
+  }
+
+  private async preserveCandidate(missionId: string, authority?: DispatchAuthority): Promise<void> {
+    const candidate = this.missionCandidates.get(missionId);
+    if (!candidate || candidate.lifecycle.state === "promoted") return;
+    candidate.lifecycle = { ...candidate.lifecycle, state: "preserved", updatedAt: new Date().toISOString() };
+    await candidate.git.persistCandidateLifecycle(candidate.lifecycle, authority);
   }
 
   /** Sole incumbent mutation: called only after current candidate gates pass. */
@@ -1156,11 +1180,21 @@ export class ExecutionBroker {
     const candidate = this.missionCandidates.get(missionId);
     if (!candidate) return false;
     authority?.assertAuthoritative();
-    const result = await candidate.git.promoteCandidate(candidate.worktree, candidate.baseSha, authority);
-    authority?.assertAuthoritative();
+    const worktree = { path: candidate.lifecycle.path, branch: candidate.lifecycle.branch };
+    const result = await candidate.git.promoteCandidate(
+      worktree,
+      candidate.lifecycle.baseSha,
+      authority,
+      candidate.lifecycle,
+    );
     if (!result.promoted) throw new Error(result.reason ?? "candidate promotion failed");
-    await candidate.git.removeWorktree(candidate.worktree, { keepBranch: true }, authority).catch(() => undefined);
-    this.missionCandidates.delete(missionId);
+    try {
+      await candidate.git.removeWorktree(worktree, { keepBranch: true }, authority);
+      this.missionCandidates.delete(missionId);
+    } catch {
+      // Promotion is committed. A stale cleanup token retains the worktree/ref
+      // for a later authoritative reconciliation; it cannot undo promotion.
+    }
     return true;
   }
 
@@ -1654,6 +1688,9 @@ export class ExecutionBroker {
             input.authority?.assertAuthoritative();
             this.store.assertExecutionAuthoritative(execution.execution_id);
             const succeeded = outcome.exitStatus === "succeeded";
+            if (!succeeded && (backend === "integration" || backend === "validation" || backend === "review")) {
+              await this.preserveCandidate(input.missionId, input.authority);
+            }
             this.store.setExecutionStatus(execution.execution_id, succeeded ? "SUCCEEDED" : "FAILED", {
               exit_status: outcome.exitStatus,
               artifact_refs: outcome.artifactRefs,
@@ -1726,7 +1763,7 @@ export class ExecutionBroker {
             abort.signal.removeEventListener("abort", onAbort);
             clearTimeout(timer);
             if (!retainWorktreeOnCleanup && !cleanupOwnedByCancellation) {
-              await this.releaseWorktree(execution.execution_id);
+              await this.releaseWorktree(execution.execution_id, true, input.authority);
             }
           }
         };
@@ -1756,6 +1793,7 @@ export class ExecutionBroker {
       worktree: null,
       taskId: input.taskId,
       missionId: input.missionId,
+      authority: input.authority,
     });
     input.authority?.assertAuthoritative();
     this.store.setExecutionStatus(execution.execution_id, "RUNNING", {});
@@ -1796,6 +1834,25 @@ export class ExecutionBroker {
     onActivity: (event: WorkerActivity) => void,
     repository: { repoId?: string; root: string; git: GitRepo } | null,
   ): Promise<ExecutionOutcome> {
+    if (
+      input.repoId &&
+      repository &&
+      !this.missionCandidates.has(input.missionId) &&
+      ((backend === "integration" && this.backends.integration?.candidateScoped === true) ||
+        (backend === "validation" && this.backends.validation?.candidateScoped === true) ||
+        (backend === "review" && this.backends.review?.candidateScoped === true))
+    ) {
+      const records = await repository.git.loadCandidateLifecycles(input.missionId, input.repoId);
+      const lifecycle = records
+        .filter((record) => record.state === "integrating" || record.state === "promotion_intent")
+        .at(-1);
+      if (lifecycle) {
+        const reconciled = await repository.git.reconcileCandidateWorktree(lifecycle, input.authority);
+        if (reconciled) {
+          this.missionCandidates.set(input.missionId, { lifecycle, git: repository.git });
+        }
+      }
+    }
     const base = {
       objective: input.objective,
       contextRef: input.contextRef,
@@ -1829,12 +1886,16 @@ export class ExecutionBroker {
       case "review": {
         const runner = this.backends.review;
         if (!runner) throw new Error("no review backend registered");
+        const candidatePath = this.missionCandidates.get(input.missionId)?.lifecycle.path;
+        if (input.repoId && runner.candidateScoped === true && !candidatePath) {
+          throw new Error("CANDIDATE_UNAVAILABLE: review cannot fall back to the incumbent checkout");
+        }
         return runner.runReview({
           repoId: input.repoId,
           objective: input.objective,
           contextRef: input.contextRef,
           acceptanceCriteria: input.acceptanceCriteria,
-          worktree: this.missionCandidates.get(input.missionId)?.worktree.path ?? null,
+          worktree: candidatePath ?? null,
           signal,
           onActivity: base.onActivity,
         });
@@ -1849,18 +1910,27 @@ export class ExecutionBroker {
         assertOrigin();
         if (!repository) throw new Error("integration requires a repository-scoped Git provider");
         let candidate = this.missionCandidates.get(input.missionId);
+        if (candidate?.lifecycle.state === "preserved") candidate = undefined;
         if (input.repoId && runner.candidateScoped === true && !candidate) {
           const baseSha =
             this.store.getMission(input.missionId)?.base_ref?.trim() ||
             this.resolvedBases.get(input.missionId) ||
             (await repository.git.headCommit());
           assertOrigin();
-          const worktree = await repository.git.createWorktree(
+          const lifecycle = await repository.git.createCandidateWorktree(
             baseSha,
-            `pi-eng-candidate-${input.missionId.replace(/[^a-zA-Z0-9._-]/g, "-")}`,
+            {
+              missionId: input.missionId,
+              repoId: input.repoId,
+              generation:
+                input.authority?.repositoryIdentity?.generation ??
+                this.store.getExecution(executionId)?.mission_generation ??
+                0,
+              attempt: executionId,
+            },
             input.authority,
           );
-          candidate = { worktree, git: repository.git, baseSha };
+          candidate = { lifecycle, git: repository.git };
           this.missionCandidates.set(input.missionId, candidate);
         }
         assertOrigin();
@@ -1955,7 +2025,7 @@ export class ExecutionBroker {
           repoId: input.repoId,
           objective: input.objective,
           handoffs,
-          candidate: candidate?.worktree,
+          candidate: candidate ? { path: candidate.lifecycle.path, branch: candidate.lifecycle.branch } : undefined,
           authority: input.authority,
           signal,
         });
@@ -1972,10 +2042,21 @@ export class ExecutionBroker {
           );
           throw error;
         }
+        if (candidate) {
+          const candidateSha = await candidate.git.headCommitIn(candidate.lifecycle.path);
+          assertOrigin();
+          candidate.lifecycle = {
+            ...candidate.lifecycle,
+            candidateSha,
+            state: outcome.exitStatus === "succeeded" ? "integrating" : "preserved",
+            updatedAt: new Date().toISOString(),
+          };
+          await candidate.git.persistCandidateLifecycle(candidate.lifecycle, input.authority);
+        }
         if (outcome.exitStatus === "succeeded" && git && recoveredMeta.length > 0) {
           let head: string | null = null;
           try {
-            head = await git.headCommit();
+            head = candidate ? await git.headCommitIn(candidate.lifecycle.path) : await git.headCommit();
           } catch {
             head = null;
           }
@@ -2006,10 +2087,14 @@ export class ExecutionBroker {
       case "validation": {
         const runner = this.backends.validation;
         if (!runner) throw new Error("no validation backend registered");
+        const candidatePath = this.missionCandidates.get(input.missionId)?.lifecycle.path;
+        if (input.repoId && runner.candidateScoped === true && !candidatePath) {
+          throw new Error("CANDIDATE_UNAVAILABLE: validation cannot fall back to the incumbent checkout");
+        }
         return runner.runValidation({
           repoId: input.repoId,
           objective: input.objective,
-          worktree: this.missionCandidates.get(input.missionId)?.worktree.path ?? base.worktree,
+          worktree: candidatePath ?? base.worktree,
           signal,
         });
       }

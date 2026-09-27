@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdir, rm } from "node:fs/promises";
+import { access, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { promisify } from "node:util";
 
@@ -29,8 +29,32 @@ export interface GitMutationGuard {
 
 export interface PromotionResult {
   promoted: boolean;
+  alreadyPromoted?: boolean;
   reason: string | null;
   candidateSha: string | null;
+}
+
+export interface CandidateLifecycle {
+  missionId: string;
+  repoId: string;
+  generation: number;
+  attempt: string;
+  branch: string;
+  path: string;
+  baseSha: string;
+  candidateSha: string;
+  state: "integrating" | "preserved" | "promotion_intent" | "promoted";
+  updatedAt: string;
+}
+
+interface PromotionLifecycle {
+  missionId: string;
+  repoId: string;
+  generation: number;
+  candidateSha: string;
+  baseSha: string;
+  state: "intent" | "completed";
+  updatedAt: string;
 }
 
 /**
@@ -95,6 +119,133 @@ export class GitRepo {
     return r.stdout;
   }
 
+  private async candidateStateDir(): Promise<string> {
+    const dir = join(await this.commonDir(), "pi-engineering-candidates");
+    await mkdir(dir, { recursive: true });
+    return dir;
+  }
+
+  private async assertPromotionUnlocked(): Promise<void> {
+    const lock = join(await this.commonDir(), "pi-engineering-promotion.lock");
+    try {
+      await access(lock);
+      throw new Error("repository promotion critical section is held");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+  }
+
+  private candidateStateName(missionId: string, repoId: string, generation: number, attempt: string): string {
+    return `${[missionId, repoId, String(generation), attempt]
+      .map((part) => Buffer.from(part).toString("base64url"))
+      .join(".")}.json`;
+  }
+
+  private promotionStateName(
+    record: Pick<PromotionLifecycle, "missionId" | "repoId" | "generation" | "candidateSha">,
+  ): string {
+    return `promotion.${[record.missionId, record.repoId, String(record.generation), record.candidateSha]
+      .map((part) => Buffer.from(part).toString("base64url"))
+      .join(".")}.json`;
+  }
+
+  private async persistPromotionLifecycle(record: PromotionLifecycle, guard?: GitMutationGuard): Promise<void> {
+    guard?.assertAuthoritative();
+    const dir = await this.candidateStateDir();
+    const target = join(dir, this.promotionStateName(record));
+    const temporary = `${target}.${process.pid}.tmp`;
+    await writeFile(temporary, JSON.stringify(record), "utf8");
+    guard?.assertAuthoritative();
+    await rename(temporary, target);
+  }
+
+  async persistCandidateLifecycle(record: CandidateLifecycle, guard?: GitMutationGuard): Promise<void> {
+    guard?.assertAuthoritative();
+    const dir = await this.candidateStateDir();
+    const target = join(
+      dir,
+      this.candidateStateName(record.missionId, record.repoId, record.generation, record.attempt),
+    );
+    const temporary = `${target}.${process.pid}.tmp`;
+    await writeFile(temporary, JSON.stringify(record), "utf8");
+    guard?.assertAuthoritative();
+    await rename(temporary, target);
+  }
+
+  async loadCandidateLifecycles(missionId: string, repoId: string): Promise<CandidateLifecycle[]> {
+    const dir = await this.candidateStateDir();
+    const records: CandidateLifecycle[] = [];
+    for (const name of await readdir(dir).catch(() => [] as string[])) {
+      if (!name.endsWith(".json")) continue;
+      try {
+        const parsed = JSON.parse(await readFile(join(dir, name), "utf8")) as CandidateLifecycle;
+        if (
+          parsed.missionId === missionId &&
+          parsed.repoId === repoId &&
+          typeof parsed.attempt === "string" &&
+          typeof parsed.branch === "string" &&
+          typeof parsed.path === "string" &&
+          typeof parsed.candidateSha === "string"
+        ) {
+          records.push(parsed);
+        }
+      } catch {
+        // Malformed lifecycle records are ignored here and fail closed when no
+        // usable candidate can be reconciled by the broker.
+      }
+    }
+    return records.sort((a, b) => a.generation - b.generation || a.updatedAt.localeCompare(b.updatedAt));
+  }
+
+  async createCandidateWorktree(
+    baseSha: string,
+    identity: { missionId: string; repoId: string; generation: number; attempt: string },
+    guard?: GitMutationGuard,
+  ): Promise<CandidateLifecycle> {
+    const existing = (await this.loadCandidateLifecycles(identity.missionId, identity.repoId)).find(
+      (record) => record.generation === identity.generation && record.attempt === identity.attempt,
+    );
+    if (existing) {
+      if (existing.state !== "integrating" && existing.state !== "promotion_intent") {
+        throw new Error(`${existing.state} candidate attempt already exists at ${existing.branch}`);
+      }
+      const reconciled = await this.reconcileCandidateWorktree(existing, guard);
+      if (reconciled) return existing;
+      throw new Error(`candidate attempt already exists but cannot be reconciled: ${existing.branch}`);
+    }
+    const suffix = [identity.missionId, identity.repoId, identity.generation, identity.attempt]
+      .join("-")
+      .replace(/[^a-zA-Z0-9._-]/g, "-");
+    const worktree = await this.createWorktree(baseSha, `pi-eng-candidate-${suffix}`, guard);
+    const record: CandidateLifecycle = {
+      ...identity,
+      ...worktree,
+      baseSha,
+      candidateSha: await this.headCommitIn(worktree.path),
+      state: "integrating",
+      updatedAt: new Date().toISOString(),
+    };
+    await this.persistCandidateLifecycle(record, guard);
+    return record;
+  }
+
+  /** Re-open the exact persisted candidate, mounting its worktree if a crash removed only the checkout. */
+  async reconcileCandidateWorktree(record: CandidateLifecycle, guard?: GitMutationGuard): Promise<WorktreeInfo | null> {
+    const ref = await this.resolveCommit(record.branch);
+    if (ref !== record.candidateSha) return null;
+    const mountedHead = await this.headCommitIn(record.path).catch(() => null);
+    if (mountedHead === record.candidateSha) return { path: record.path, branch: record.branch };
+    if (mountedHead !== null) return null;
+    await this.assertPromotionUnlocked();
+    guard?.assertAuthoritative();
+    const add = await this.git(["worktree", "add", record.path, record.branch]);
+    if (add.code !== 0) return null;
+    guard?.assertAuthoritative();
+    return (await this.headCommitIn(record.path)) === record.candidateSha
+      ? { path: record.path, branch: record.branch }
+      : null;
+  }
+
   async headCommit(): Promise<string> {
     const r = await this.git(["rev-parse", "HEAD"]);
     if (r.code !== 0) throw new Error(`git rev-parse HEAD failed: ${r.stderr}`);
@@ -144,6 +295,7 @@ export class GitRepo {
    * removed first (crash recovery).
    */
   async createWorktree(baseCommit: string, branch: string, guard?: GitMutationGuard): Promise<WorktreeInfo> {
+    await this.assertPromotionUnlocked();
     // Place the worktree as a SIBLING of the repo root (outside the working
     // tree). Deriving the path from `this.cwd` would, when the runtime is
     // opened from a subdirectory, drop the worktree INSIDE the repo (visible
@@ -157,7 +309,9 @@ export class GitRepo {
     await this.git(["worktree", "remove", "--force", path]).catch(() => {});
     guard?.assertAuthoritative();
     await this.git(["branch", "-D", branch]).catch(() => {});
+    guard?.assertAuthoritative();
     await this.forgetWorktreeAdmin(path);
+    guard?.assertAuthoritative();
     await rm(path, { recursive: true, force: true }).catch(() => {});
     guard?.assertAuthoritative();
     const add = await this.git(["worktree", "add", path, "-b", branch, baseCommit]);
@@ -199,10 +353,12 @@ export class GitRepo {
     opts: { keepBranch?: boolean } = {},
     guard?: GitMutationGuard,
   ): Promise<void> {
+    await this.assertPromotionUnlocked();
     guard?.assertAuthoritative();
     await this.git(["worktree", "remove", "--force", info.path]);
     // Targeted, for the same reason creation is: a global prune here would be
     // able to delete a concurrently-created sibling's administrative directory.
+    guard?.assertAuthoritative();
     await this.forgetWorktreeAdmin(info.path);
     if (!opts.keepBranch) {
       guard?.assertAuthoritative();
@@ -273,7 +429,9 @@ export class GitRepo {
     return out;
   }
 
-  async deleteBranch(branch: string): Promise<void> {
+  async deleteBranch(branch: string, guard?: GitMutationGuard): Promise<void> {
+    await this.assertPromotionUnlocked();
+    guard?.assertAuthoritative();
     await this.git(["branch", "-D", branch]).catch(() => {});
   }
 
@@ -283,13 +441,19 @@ export class GitRepo {
    * incumbent directly (INV-003); this is the runtime's evidence-gated merge.
    * Returns false (without mutating state) if the merge would conflict.
    */
-  async mergeBranch(branch: string): Promise<{ merged: boolean; conflict: boolean; reason: string | null }> {
+  async mergeBranch(
+    branch: string,
+    guard?: GitMutationGuard,
+  ): Promise<{ merged: boolean; conflict: boolean; reason: string | null }> {
+    await this.assertPromotionUnlocked();
+    guard?.assertAuthoritative();
     const r = await this.git(["--no-pager", "merge", "--no-ff", "-m", `promote ${branch}`, branch]);
     if (r.code === 0) return { merged: true, conflict: false, reason: null };
     const conflicted = r.stdout.includes("CONFLICT") || r.stderr.includes("CONFLICT");
     const reason = (r.stderr || r.stdout || "merge failed").split("\n")[0]?.slice(0, 200) ?? "merge failed";
     if (conflicted) {
       // Keep the incumbent immutable: abort the merge.
+      guard?.assertAuthoritative();
       await this.git(["merge", "--abort"]).catch(() => {});
     }
     return { merged: false, conflict: conflicted, reason };
@@ -301,6 +465,7 @@ export class GitRepo {
     ref: string,
     guard?: GitMutationGuard,
   ): Promise<{ merged: boolean; conflict: boolean; reason: string | null }> {
+    await this.assertPromotionUnlocked();
     guard?.assertAuthoritative();
     const r = await this.git(["-C", candidate.path, "--no-pager", "merge", "--no-ff", "-m", `integrate ${ref}`, ref]);
     if (r.code === 0) return { merged: true, conflict: false, reason: null };
@@ -322,35 +487,166 @@ export class GitRepo {
     candidate: WorktreeInfo,
     boundBase: string,
     guard?: GitMutationGuard,
+    lifecycle?: CandidateLifecycle,
   ): Promise<PromotionResult> {
-    const candidateSha = await this.resolveCommit(candidate.branch);
-    if (!candidateSha) return { promoted: false, reason: "candidate ref is unavailable", candidateSha: null };
-    if ((await this.statusIn(candidate.path)) !== "") {
-      return { promoted: false, reason: "candidate worktree is not clean", candidateSha };
-    }
-    const incumbent = await this.headCommit();
-    if (incumbent !== boundBase) {
-      return { promoted: false, reason: `incumbent diverged from bound base ${boundBase}`, candidateSha };
-    }
-    const incumbentTracked = await this.git(["status", "--porcelain", "--untracked-files=no"]);
-    if (incumbentTracked.code !== 0 || incumbentTracked.stdout.length > 0) {
-      return { promoted: false, reason: "incumbent index or working tree is not clean", candidateSha };
-    }
+    const lockPath = join(await this.commonDir(), "pi-engineering-promotion.lock");
     guard?.assertAuthoritative();
-    // Repository authority serializes local promotion. Recheck at the mutation
-    // boundary so a stale or diverged incumbent is rejected without a write.
-    if ((await this.headCommit()) !== boundBase) {
-      return { promoted: false, reason: `incumbent diverged from bound base ${boundBase}`, candidateSha };
+    try {
+      await mkdir(lockPath);
+    } catch {
+      let ownerPid: number | undefined;
+      try {
+        ownerPid = (JSON.parse(await readFile(join(lockPath, "owner.json"), "utf8")) as { pid?: number }).pid;
+      } catch {
+        ownerPid = undefined;
+      }
+      let live = false;
+      if (ownerPid) {
+        try {
+          process.kill(ownerPid, 0);
+          live = true;
+        } catch {
+          live = false;
+        }
+      }
+      if (live) {
+        return { promoted: false, reason: "repository promotion critical section is already held", candidateSha: null };
+      }
+      await rm(lockPath, { recursive: true, force: true });
+      guard?.assertAuthoritative();
+      await mkdir(lockPath);
     }
-    guard?.assertAuthoritative();
-    const promoted = await this.git(["reset", "--hard", candidateSha]);
-    if (promoted.code !== 0) {
-      return { promoted: false, reason: promoted.stderr || promoted.stdout || "promotion failed", candidateSha };
+    await writeFile(
+      join(lockPath, "owner.json"),
+      JSON.stringify({ pid: process.pid, openedAt: new Date().toISOString() }),
+    );
+    try {
+      const candidateSha = await this.resolveCommit(candidate.branch);
+      if (!candidateSha) return { promoted: false, reason: "candidate ref is unavailable", candidateSha: null };
+      if ((await this.statusIn(candidate.path)) !== "") {
+        return { promoted: false, reason: "candidate worktree is not clean", candidateSha };
+      }
+      const incumbent = await this.headCommit();
+      if (incumbent === candidateSha) {
+        const reconciled = await this.git(["reset", "--hard", candidateSha]);
+        if (reconciled.code !== 0) {
+          return { promoted: false, reason: reconciled.stderr || "promotion reconciliation failed", candidateSha };
+        }
+        if (lifecycle) {
+          await this.persistPromotionLifecycle({
+            missionId: lifecycle.missionId,
+            repoId: lifecycle.repoId,
+            generation: lifecycle.generation,
+            candidateSha,
+            baseSha: boundBase,
+            state: "completed",
+            updatedAt: new Date().toISOString(),
+          });
+          await this.persistCandidateLifecycle({
+            ...lifecycle,
+            candidateSha,
+            state: "promoted",
+            updatedAt: new Date().toISOString(),
+          });
+        }
+        return { promoted: true, alreadyPromoted: true, reason: null, candidateSha };
+      }
+      if (incumbent !== boundBase) {
+        return { promoted: false, reason: `incumbent diverged from bound base ${boundBase}`, candidateSha };
+      }
+      const candidateRuntimePaths = (await this.changedFiles(boundBase, candidateSha)).filter(
+        (path) => path === ".pi-eng" || path.startsWith(".pi-eng/"),
+      );
+      if (candidateRuntimePaths.length > 0) {
+        return {
+          promoted: false,
+          reason: `candidate collides with runtime-owned state: ${candidateRuntimePaths.join(", ")}`,
+          candidateSha,
+        };
+      }
+      const incumbentStatus = await this.git(["status", "--porcelain", "--untracked-files=all"]);
+      const incumbentDirt = incumbentStatus.stdout
+        .split("\n")
+        .filter((line) => line.length > 0 && !line.startsWith("?? .pi-eng/"))
+        .join("\n");
+      if (incumbentStatus.code !== 0 || incumbentDirt.length > 0) {
+        return {
+          promoted: false,
+          reason: `incumbent index or working tree is not clean: ${incumbentDirt || incumbentStatus.stderr}`,
+          candidateSha,
+        };
+      }
+      guard?.assertAuthoritative();
+      if (lifecycle) {
+        await this.persistPromotionLifecycle(
+          {
+            missionId: lifecycle.missionId,
+            repoId: lifecycle.repoId,
+            generation: lifecycle.generation,
+            candidateSha,
+            baseSha: boundBase,
+            state: "intent",
+            updatedAt: new Date().toISOString(),
+          },
+          guard,
+        );
+        await this.persistCandidateLifecycle(
+          { ...lifecycle, candidateSha, state: "promotion_intent", updatedAt: new Date().toISOString() },
+          guard,
+        );
+      }
+      // Repository authority serializes local promotion. Recheck at the mutation
+      // boundary so a stale or diverged incumbent is rejected without a write.
+      if ((await this.headCommit()) !== boundBase) {
+        return { promoted: false, reason: `incumbent diverged from bound base ${boundBase}`, candidateSha };
+      }
+      guard?.assertAuthoritative();
+      const advanced = await this.git(["update-ref", "HEAD", candidateSha, boundBase]);
+      if (advanced.code !== 0) {
+        return {
+          promoted: false,
+          reason: advanced.stderr || advanced.stdout || "promotion compare-and-swap failed",
+          candidateSha,
+        };
+      }
+      // From this point promotion is committed. Complete checkout reconciliation
+      // even if the lease expires during the subprocess; restart follows the same
+      // HEAD==candidate path above.
+      const promoted = await this.git(["reset", "--hard", candidateSha]);
+      if (promoted.code !== 0) {
+        return {
+          promoted: false,
+          reason: `promotion committed; checkout reconciliation failed: ${promoted.stderr}`,
+          candidateSha,
+        };
+      }
+      if (lifecycle) {
+        // Once HEAD moved, authority loss is reconciled as a committed promotion,
+        // never reported as an ordinary rejection that callers might retry.
+        await this.persistCandidateLifecycle({
+          ...lifecycle,
+          candidateSha,
+          state: "promoted",
+          updatedAt: new Date().toISOString(),
+        });
+        await this.persistPromotionLifecycle({
+          missionId: lifecycle.missionId,
+          repoId: lifecycle.repoId,
+          generation: lifecycle.generation,
+          candidateSha,
+          baseSha: boundBase,
+          state: "completed",
+          updatedAt: new Date().toISOString(),
+        });
+      }
+      return { promoted: true, reason: null, candidateSha };
+    } finally {
+      await rm(lockPath, { recursive: true, force: true });
     }
-    return { promoted: true, reason: null, candidateSha };
   }
 
   async commitAll(path: string, message: string, guard?: GitMutationGuard): Promise<void> {
+    await this.assertPromotionUnlocked();
     guard?.assertAuthoritative();
     await this.git(["-C", path, "add", "-A"]);
     guard?.assertAuthoritative();

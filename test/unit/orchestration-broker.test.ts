@@ -1275,6 +1275,169 @@ describe("ExecutionBroker (spec 03)", () => {
     );
   });
 
+  it("fails candidate-scoped validation closed when durable candidate state is missing", async () => {
+    const fx = await makeFixtureRepo();
+    try {
+      const git = (await GitRepo.open(fx.root))!;
+      const store = MissionStore.open(JsonlEventStore.inMemory());
+      const base = await git.headCommit();
+      const mission = store.createMission({
+        title: "missing candidate",
+        goal: "missing candidate",
+        user_request: "missing candidate",
+        repository: fx.root,
+        base_ref: base,
+        risk_profile: "medium",
+        workflow_class: "engineering_review",
+      });
+      store.bindWorkspaceManifest({
+        manifestId: "WM-missing-candidate",
+        missionId: mission.mission_id,
+        generation: 1,
+        authorizedRoots: [{ canonicalPath: fx.root, source: "existing_manifest", access: "write" }],
+        repositories: [
+          {
+            repoId: "repo-missing-candidate",
+            canonicalRoot: fx.root,
+            baseRef: "main",
+            baseSha: base,
+            writableDomains: ["**"],
+          },
+        ],
+        dependencyEdges: [],
+        hash: "manifest-missing-candidate",
+        createdAt: new Date().toISOString(),
+      });
+      const task = store.createTask({
+        mission_id: mission.mission_id,
+        kind: "validation",
+        role: "validator",
+        objective: "validate candidate",
+        repo_id: "repo-missing-candidate",
+      });
+      const broker = new ExecutionBroker({
+        store,
+        resolveRepository: async () => ({ repoId: "repo-missing-candidate", root: fx.root, git }),
+        backends: {
+          validation: {
+            candidateScoped: true,
+            runValidation: async () => {
+              assert.fail("candidate-scoped validation must not inspect the incumbent");
+            },
+          },
+        },
+      });
+
+      await assert.rejects(
+        (
+          await broker.execute({
+            taskId: task.task_id,
+            missionId: mission.mission_id,
+            repoId: "repo-missing-candidate",
+            kind: "validation",
+            objective: task.objective,
+          })
+        ).result(),
+        /CANDIDATE_UNAVAILABLE/,
+      );
+      assert.equal(await git.headCommit(), base);
+    } finally {
+      await fx.cleanup();
+    }
+  });
+
+  it("reconciles a durable candidate checkout after broker restart and validates only its exact HEAD", async () => {
+    const fx = await makeFixtureRepo();
+    try {
+      const git = (await GitRepo.open(fx.root))!;
+      const store = MissionStore.open(JsonlEventStore.inMemory());
+      const base = await git.headCommit();
+      const mission = store.createMission({
+        title: "restart candidate",
+        goal: "restart candidate",
+        user_request: "restart candidate",
+        repository: fx.root,
+        base_ref: base,
+        risk_profile: "medium",
+        workflow_class: "engineering_review",
+      });
+      store.bindWorkspaceManifest({
+        manifestId: "WM-restart-candidate",
+        missionId: mission.mission_id,
+        generation: 3,
+        authorizedRoots: [{ canonicalPath: fx.root, source: "existing_manifest", access: "write" }],
+        repositories: [
+          {
+            repoId: "repo-restart-candidate",
+            canonicalRoot: fx.root,
+            baseRef: "main",
+            baseSha: base,
+            writableDomains: ["**"],
+          },
+        ],
+        dependencyEdges: [],
+        hash: "manifest-restart-candidate",
+        createdAt: new Date().toISOString(),
+      });
+      const candidate = await git.createCandidateWorktree(base, {
+        missionId: mission.mission_id,
+        repoId: "repo-restart-candidate",
+        generation: 3,
+        attempt: "EX-restart-candidate",
+      });
+      await writeFile(join(candidate.path, "src", "restart-candidate.ts"), "export const candidate = true;\n");
+      await git.commitAll(candidate.path, "candidate before restart");
+      candidate.candidateSha = await git.headCommitIn(candidate.path);
+      candidate.updatedAt = new Date().toISOString();
+      await git.persistCandidateLifecycle(candidate);
+      await git.removeWorktree(candidate, { keepBranch: true });
+
+      const task = store.createTask({
+        mission_id: mission.mission_id,
+        kind: "validation",
+        role: "validator",
+        objective: "validate restored candidate",
+        repo_id: "repo-restart-candidate",
+      });
+      let validatedPath: string | null = null;
+      const broker = new ExecutionBroker({
+        store,
+        resolveRepository: async () => ({ repoId: "repo-restart-candidate", root: fx.root, git }),
+        backends: {
+          validation: {
+            candidateScoped: true,
+            runValidation: async (input) => {
+              validatedPath = input.worktree ?? null;
+              assert.equal(await git.headCommitIn(input.worktree!), candidate.candidateSha);
+              return {
+                executionId: "validation",
+                exitStatus: "succeeded",
+                summary: "green",
+                artifactRefs: [],
+                usage: {},
+              };
+            },
+          },
+        },
+      });
+
+      await (
+        await broker.execute({
+          taskId: task.task_id,
+          missionId: mission.mission_id,
+          repoId: "repo-restart-candidate",
+          kind: "validation",
+          objective: task.objective,
+        })
+      ).result();
+      assert.equal(validatedPath, candidate.path);
+      assert.equal(await git.headCommit(), base, "reconciliation must not inspect or mutate incumbent HEAD");
+      await git.removeWorktree(candidate, { keepBranch: true }).catch(() => {});
+    } finally {
+      await fx.cleanup();
+    }
+  });
+
   it("rejects manifest-era mutation when the task has no repoId", async () => {
     let runs = 0;
     const { m, store } = setup({});

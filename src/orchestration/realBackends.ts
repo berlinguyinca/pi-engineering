@@ -283,6 +283,7 @@ export function realBackends(opts: RealBackendsOptions) {
       },
     },
     validation: {
+      candidateScoped: true,
       async runValidation(input: {
         repoId?: string;
         objective: string;
@@ -328,6 +329,7 @@ export function realBackends(opts: RealBackendsOptions) {
       },
     },
     review: {
+      candidateScoped: true,
       async runReview(input: {
         repoId?: string;
         objective: string;
@@ -491,6 +493,9 @@ export function realBackends(opts: RealBackendsOptions) {
             artifactRefs: [],
             usage: {},
           };
+        if (input.repoId && !input.candidate) {
+          throw new Error("CANDIDATE_UNAVAILABLE: integration cannot fall back to the incumbent checkout");
+        }
         // Integrator (spec 05): merge each worker worktree branch into the
         // current checkout sequentially, then run integration checks.
         // Recovered work (from a timed-out execution) merges its exact worker

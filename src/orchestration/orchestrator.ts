@@ -995,6 +995,7 @@ export class Orchestrator {
     // Promotion is the only incumbent mutation. It occurs after both gate
     // attempts are current and green, under a fresh repository fencing check.
     // Failed/red/canceled candidates remain mounted/ref-addressable for diagnosis.
+    let cleanupComplete = false;
     if (verdict.can_complete && integrated && this.broker.candidateWorktree(missionId)) {
       const integrationTask = this.store
         .listTasks(missionId)
@@ -1012,6 +1013,11 @@ export class Orchestrator {
         try {
           promotionAuthority.assertAuthoritative();
           integrated = await this.broker.promoteCandidate(missionId, promotionAuthority);
+          await this.broker.cleanupMission(missionId, {
+            keepBranches: !integrated,
+            authority: promotionAuthority,
+          });
+          cleanupComplete = true;
         } catch (error) {
           integrated = false;
           this.store.addFinding({
@@ -1031,7 +1037,25 @@ export class Orchestrator {
         }
       }
     }
-    await this.broker.cleanupMission(missionId, { keepBranches: !integrated });
+    if (!cleanupComplete) {
+      const cleanupTask = this.store
+        .listTasks(missionId)
+        .filter((task) => task.kind === "integration" && task.repo_id)
+        .at(-1);
+      if (cleanupTask && this.ownership) {
+        const cleanupAuthority = await this.acquireTaskAuthority(cleanupTask);
+        try {
+          await this.broker.cleanupMission(missionId, {
+            keepBranches: !integrated,
+            authority: cleanupAuthority,
+          });
+        } finally {
+          await cleanupAuthority.close();
+        }
+      } else {
+        await this.broker.cleanupMission(missionId, { keepBranches: !integrated });
+      }
+    }
     if (!integrated) {
       const preserved = this.broker.preservedBranches(missionId);
       if (preserved.length > 0) {

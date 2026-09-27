@@ -1,7 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { constants } from "node:fs";
 import { access, realpath } from "node:fs/promises";
-import { resolve, sep } from "node:path";
+import { basename, resolve, sep } from "node:path";
 import { ContextBroker } from "../context/ContextBroker.ts";
 import { GitRepo } from "../git/GitRepo.ts";
 import type { RepositoryBinding, WorkspaceManifest } from "./types.ts";
@@ -123,6 +123,9 @@ export class RepositoryRegistry {
           };
         }
       }
+    }
+    if (basename(canonical).includes("pi-eng-candidate-")) {
+      throw new WorkspaceScopeError(`Candidate repository context is unavailable: ${canonical}`);
     }
     const active = this.activeRepo.getStore();
     return active ? this.get(active) : null;

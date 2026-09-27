@@ -236,3 +236,139 @@ test("candidate promotion refuses incumbent divergence without touching index or
     await fixture.cleanup();
   }
 });
+
+test("candidate promotion refuses an untracked path collision without overwriting it", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const repo = (await GitRepo.open(fixture.root))!;
+    const base = await repo.headCommit();
+    const candidate = await repo.createWorktree(base, "untracked-collision-candidate");
+    try {
+      await writeFile(join(candidate.path, "collision.ts"), "candidate\n");
+      await repo.commitAll(candidate.path, "candidate collision");
+      await writeFile(join(fixture.root, "collision.ts"), "incumbent untracked\n");
+
+      const promoted = await repo.promoteCandidate(candidate, base);
+
+      assert.equal(promoted.promoted, false);
+      assert.match(promoted.reason ?? "", /clean|untracked/i);
+      assert.equal(await repo.headCommit(), base);
+      assert.equal(
+        await (await import("node:fs/promises")).readFile(join(fixture.root, "collision.ts"), "utf8"),
+        "incumbent untracked\n",
+      );
+    } finally {
+      await repo.removeWorktree(candidate, { keepBranch: true }).catch(() => {});
+    }
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("candidate promotion is idempotent when restart observes candidate HEAD", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const repo = (await GitRepo.open(fixture.root))!;
+    const base = await repo.headCommit();
+    const candidate = await repo.createCandidateWorktree(base, {
+      missionId: "MSN-restart",
+      repoId: "repo-restart",
+      generation: 4,
+      attempt: "attempt-1",
+    });
+    try {
+      await writeFile(join(candidate.path, "src", "promoted.js"), "export const promoted = true;\n");
+      await repo.commitAll(candidate.path, "candidate promoted");
+      const first = await repo.promoteCandidate(candidate, base, undefined, candidate);
+      const reopened = (await GitRepo.open(fixture.root))!;
+      const reconciled = await reopened.promoteCandidate(candidate, base, undefined, candidate);
+
+      assert.equal(first.promoted, true);
+      assert.equal(reconciled.promoted, true);
+      assert.equal(reconciled.alreadyPromoted, true);
+      assert.equal(await reopened.headCommit(), first.candidateSha);
+      const stateDir = join(await reopened.commonDir(), "pi-engineering-candidates");
+      const promotionRecords = (await (await import("node:fs/promises")).readdir(stateDir)).filter((name) =>
+        name.startsWith("promotion."),
+      );
+      const records = await Promise.all(
+        promotionRecords.map(
+          async (name) =>
+            JSON.parse(await (await import("node:fs/promises")).readFile(join(stateDir, name), "utf8")) as {
+              candidateSha: string;
+              state: string;
+            },
+        ),
+      );
+      assert.ok(
+        records.some((record) => record.candidateSha === first.candidateSha && record.state === "completed"),
+        "restart reconciliation must durably complete the candidate-SHA-keyed promotion record",
+      );
+    } finally {
+      await repo.removeWorktree(candidate, { keepBranch: true }).catch(() => {});
+    }
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("candidate lifecycle preserves an earlier attempt and remounts its exact persisted SHA after restart", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const repo = (await GitRepo.open(fixture.root))!;
+    const base = await repo.headCommit();
+    const first = await repo.createCandidateWorktree(base, {
+      missionId: "MSN-preserve",
+      repoId: "repo-preserve",
+      generation: 9,
+      attempt: "attempt-1",
+    });
+    let second: Awaited<ReturnType<GitRepo["createCandidateWorktree"]>> | undefined;
+    try {
+      await writeFile(join(first.path, "src", "preserved.js"), "export const preserved = true;\n");
+      await repo.commitAll(first.path, "preserved candidate");
+      first.candidateSha = await repo.headCommitIn(first.path);
+      first.state = "preserved";
+      first.updatedAt = new Date().toISOString();
+      await repo.persistCandidateLifecycle(first);
+
+      await assert.rejects(
+        repo.createCandidateWorktree(base, {
+          missionId: "MSN-preserve",
+          repoId: "repo-preserve",
+          generation: 9,
+          attempt: "attempt-1",
+        }),
+        /preserved candidate attempt already exists/i,
+      );
+      assert.equal(
+        await repo.resolveCommit(first.branch),
+        first.candidateSha,
+        "same-attempt retry must preserve its ref",
+      );
+
+      second = await repo.createCandidateWorktree(base, {
+        missionId: "MSN-preserve",
+        repoId: "repo-preserve",
+        generation: 9,
+        attempt: "attempt-2",
+      });
+      assert.notEqual(second.branch, first.branch);
+      assert.equal(await repo.resolveCommit(first.branch), first.candidateSha, "retry must not delete preserved ref");
+
+      await repo.removeWorktree(first, { keepBranch: true });
+      const reopened = (await GitRepo.open(fixture.root))!;
+      const persisted = (await reopened.loadCandidateLifecycles("MSN-preserve", "repo-preserve")).find(
+        (record) => record.attempt === "attempt-1",
+      );
+      assert.ok(persisted);
+      assert.ok(await reopened.reconcileCandidateWorktree(persisted));
+      assert.equal(await reopened.headCommitIn(persisted.path), first.candidateSha);
+    } finally {
+      await repo.removeWorktree(first, { keepBranch: true }).catch(() => {});
+      if (second) await repo.removeWorktree(second, { keepBranch: true }).catch(() => {});
+    }
+  } finally {
+    await fixture.cleanup();
+  }
+});
