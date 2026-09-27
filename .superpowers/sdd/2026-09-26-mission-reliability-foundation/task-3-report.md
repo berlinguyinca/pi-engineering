@@ -242,3 +242,44 @@ Implemented a real cross-process JSONL writer lock and replay-backed mission/rep
 - A crash after creating a reaper tombstone but before unlinking the fixed dead claim fails closed rather than allowing another process to guess ownership. This favors safety over automatic recovery from that narrow reaper crash window.
 - Permanent tombstones remain intentionally bounded to stale claimant identities and prevent arbitrarily delayed reapers from acting on replacement claims.
 - The local shared-filesystem/hostname/PID-namespace boundary and deferred Git path-enumeration work remain unchanged.
+
+## Fix Round 5
+
+### Outcome
+
+- A reaper crash immediately after tombstone publication no longer leaves later acquirers spinning on `EEXIST`. An existing identity-specific tombstone now produces a bounded, explicit recovery-blocked error.
+- The fixed recovery claim and tombstone are retained unchanged. A later process neither deletes them nor guesses which reaper may still resume.
+- A deterministic post-tombstone-publication hook exercises the exact crash window, and the regression verifies bounded cross-process rejection plus byte-for-byte evidence preservation.
+
+### RED evidence
+
+- `node --test --test-name-pattern="reaper crashes after publishing" test/unit/platform-eventstore.test.ts`
+  - 1 test, 0 passed, 1 failed with `Missing expected rejection`.
+  - The existing implementation never reached a post-tombstone crash hook and completed acquisition instead, demonstrating that the crash window was not covered.
+
+### GREEN evidence
+
+- `node --test --test-name-pattern="reaper crashes after publishing" test/unit/platform-eventstore.test.ts`
+  - 1 passed, 0 failed.
+- `node --test test/unit/platform-eventstore.test.ts test/unit/mission-ownership.test.ts test/unit/orchestration-missionstore.test.ts`
+  - 40 passed, 0 failed.
+- `npm run typecheck`
+  - Passed (`tsc --noEmit`).
+- `npm run lint`
+  - Passed (`biome check .`; 578 files checked, no fixes applied).
+- `npm test`
+  - Final run: 2,321 tests discovered; 2,320 passed, 0 failed, 1 skipped in 30.839s.
+  - The sole skip remains the OpenViking Postgres round-trip because `TEST_DATABASE_URL` is unset.
+  - Two prior full-suite runs each exposed a different unrelated transient failure (`cav-sabotage-suite` screenshot capture, then `orchestration-scheduler` lease timing); each passed immediately in isolation before the final green full run.
+
+### Files changed
+
+- `src/platform/eventstore/fileLock.ts` — deterministic post-tombstone crash hook and bounded recovery-blocked diagnostics on tombstone collision.
+- `test/unit/platform-eventstore.test.ts` — crash-window regression proving prompt rejection and fixed claim/tombstone preservation; updated the existing two-reaper race to expect the stronger diagnostic.
+
+### Self-review and concerns
+
+- `ENOENT` while linking the tombstone remains retryable because the observed fixed claim has already moved. Destination collisions are not retryable because a delayed tombstone creator may still resume and unlink the fixed path.
+- The blocked error includes the fixed-claim and tombstone identity tokens when readable, while malformed evidence is reported as unreadable and still preserved.
+- Recovery from this state requires an operator or a future protocol that can prove the original reaper cannot resume; this change deliberately does not delete or infer ownership.
+- The local shared-filesystem/hostname/PID-namespace boundary and deferred Git path-enumeration work remain unchanged.

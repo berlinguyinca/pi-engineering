@@ -102,6 +102,11 @@ export interface FileLockRecoveryHooks {
   /** Deterministic crash/race injection points; production callers omit these. */
   afterRecoveryClaimPublished?: (claimPath: string, owner: FileLockOwner) => Promise<void> | void;
   beforeRecoveryClaimReap?: (claimPath: string, claimant: FileLockOwner) => Promise<void> | void;
+  afterRecoveryClaimTombstonePublished?: (
+    claimPath: string,
+    tombstonePath: string,
+    claimant: FileLockOwner,
+  ) => Promise<void> | void;
 }
 
 /**
@@ -165,11 +170,19 @@ export class ExclusiveFileLock {
             // cannot remove a replacement claim published afterward.
             await link(claimPath, tombstone);
           } catch (reapError) {
-            if ((reapError as NodeJS.ErrnoException).code === "ENOENT" || claimCollision(reapError)) {
-              continue;
+            if ((reapError as NodeJS.ErrnoException).code === "ENOENT") continue;
+            if (claimCollision(reapError)) {
+              const fixed = await readRecoveryClaim(claimPath);
+              const existingTombstone = await readRecoveryClaim(tombstone);
+              const fixedToken = fixed?.ownerToken ?? "missing-or-unreadable";
+              const tombstoneToken = existingTombstone?.ownerToken ?? "missing-or-unreadable";
+              throw new Error(
+                `JSONL writer lock recovery for ${file} is blocked by existing tombstone ${tombstone} (fixedClaimToken=${fixedToken} tombstoneToken=${tombstoneToken}); the fixed recovery claim and tombstone were preserved`,
+              );
             }
             throw reapError;
           }
+          await hooks.afterRecoveryClaimTombstonePublished?.(claimPath, tombstone, { ...claimant });
           const reaped = await readRecoveryClaim(tombstone);
           if (reaped?.ownerToken !== claimant.ownerToken) {
             throw new Error(`JSONL writer recovery claim identity changed unexpectedly for ${file}`);

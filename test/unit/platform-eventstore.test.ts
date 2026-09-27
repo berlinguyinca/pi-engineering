@@ -125,7 +125,13 @@ function startRacingOwner(file: string) {
     });
     child.once("error", reject);
   });
-  return { child, outcome };
+  const blockedMessage = new Promise<string>((resolve) => {
+    child.stdout!.on("data", (chunk) => {
+      const match = String(chunk).match(/BLOCKED:(.+)\n/);
+      if (match?.[1]) resolve(match[1]);
+    });
+  });
+  return { child, outcome, blockedMessage };
 }
 
 async function outcomeWithin(
@@ -274,6 +280,52 @@ describe("EventStore backends", () => {
     }
   });
 
+  it("fails closed when a reaper crashes after publishing its tombstone", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pie-store-reaper-tombstone-crash-"));
+    const file = join(dir, "events.jsonl");
+    await writeFile(
+      `${file}.lock`,
+      `${JSON.stringify({
+        pid: 2_000_000_000,
+        host: hostname(),
+        openedAt: "2026-01-01T00:00:00.000Z",
+        ownerToken: "stale-owner-with-crashed-reaper",
+      })}\n`,
+    );
+    const deadClaimant = await startRecoveryClaimant(file);
+    deadClaimant.child.kill("SIGKILL");
+    await waitForExit(deadClaimant.child);
+
+    let tombstonePath: string | undefined;
+    await assert.rejects(
+      () =>
+        ExclusiveFileLock.acquire(file, {
+          afterRecoveryClaimTombstonePublished: async (claimPath, tombstone) => {
+            tombstonePath = tombstone;
+            assert.equal(await readFile(claimPath, "utf8"), await readFile(tombstone, "utf8"));
+            throw new Error("injected reaper crash after tombstone publication");
+          },
+        }),
+      /injected reaper crash/,
+    );
+    assert.ok(tombstonePath);
+    const fixedClaimBefore = await readFile(deadClaimant.claimPath, "utf8");
+    const tombstoneBefore = await readFile(tombstonePath, "utf8");
+
+    const contender = startRacingOwner(file);
+    const outcome = await outcomeWithin(contender);
+    try {
+      assert.equal(outcome, "blocked", "an existing tombstone must reject rather than spin");
+      assert.match(await contender.blockedMessage, /recovery.*blocked.*tombstone/i);
+      assert.equal(await readFile(deadClaimant.claimPath, "utf8"), fixedClaimBefore);
+      assert.equal(await readFile(tombstonePath, "utf8"), tombstoneBefore);
+    } finally {
+      if (outcome === "ready") contender.child.send("close");
+      else contender.child.kill("SIGKILL");
+      await waitForExit(contender.child);
+    }
+  });
+
   it("does not remove a recovery claim held by a live process", async () => {
     const dir = await mkdtemp(join(tmpdir(), "pie-store-live-recovery-claim-"));
     const file = join(dir, "events.jsonl");
@@ -373,7 +425,7 @@ describe("EventStore backends", () => {
       releaseAReap.resolve();
       await aReplacement.promise;
       releaseBReap.resolve();
-      await assert.rejects(acquireB, /recovery.*claimed/i);
+      await assert.rejects(acquireB, /recovery.*blocked.*tombstone/i);
       await assert.rejects(() => ExclusiveFileLock.acquire(file), /recovery.*claimed/i);
       releaseAReplacement.resolve();
       const winner = await acquireA;
