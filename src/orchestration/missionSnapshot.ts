@@ -14,7 +14,7 @@
 import type { MissionProjection } from "./observability/types.ts";
 import type { Mission, OrchestrationTask, ReviewFinding } from "./types.ts";
 
-export const MISSION_SNAPSHOT_CONTRACT_VERSION = 2;
+export const MISSION_SNAPSHOT_CONTRACT_VERSION = 3;
 export const MISSION_SNAPSHOT_FILENAME = "orchestration-snapshot.json";
 
 /**
@@ -69,7 +69,7 @@ export interface MissionSnapshotMission {
   riskProfile: string;
   constraints: string[];
   requiredGates: string[];
-  acceptanceCriteria: Array<{ criterion: string; status: string }>;
+  acceptanceCriteria: Array<{ id?: string; criterion: string; status: string }>;
   tasks: Array<MissionSnapshotTask>;
   findings: Array<MissionSnapshotFinding>;
   /** Additive v2 — absent for legacy publishers / pre-observability missions. */
@@ -85,6 +85,14 @@ export interface MissionSnapshotTask {
   mutatesRepo: boolean;
   isolation: string;
   dependsOn: string[];
+  /** Additive v3 — absent for tasks replayed from pre-reliability events. */
+  reliability?: {
+    repoId?: string;
+    acceptanceIds: string[];
+    candidateGeneration: number;
+    missionGeneration: number;
+    fencingToken: number;
+  };
 }
 
 export interface MissionSnapshotFinding {
@@ -160,6 +168,7 @@ export function buildMissionSnapshot(
     constraints: mission.constraints,
     requiredGates: mission.required_gates,
     acceptanceCriteria: mission.acceptance_criteria.map((c) => ({
+      ...(c.acceptance_id ? { id: c.acceptance_id } : {}),
       criterion: c.criterion,
       status: c.status,
     })),
@@ -172,6 +181,21 @@ export function buildMissionSnapshot(
       mutatesRepo: t.mutates_repo,
       isolation: t.isolation,
       dependsOn: t.depends_on,
+      ...(t.repo_id !== undefined ||
+      t.acceptance_ids !== undefined ||
+      t.candidate_generation !== undefined ||
+      t.mission_generation !== undefined ||
+      t.fencing_token !== undefined
+        ? {
+            reliability: {
+              ...(t.repo_id !== undefined ? { repoId: t.repo_id } : {}),
+              acceptanceIds: t.acceptance_ids ?? [],
+              candidateGeneration: t.candidate_generation ?? 0,
+              missionGeneration: t.mission_generation ?? 0,
+              fencingToken: t.fencing_token ?? 0,
+            },
+          }
+        : {}),
     })),
     findings: findings.map((f) => ({
       id: f.finding_id,

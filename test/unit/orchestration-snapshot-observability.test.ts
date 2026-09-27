@@ -1,5 +1,5 @@
 /**
- * Tests for the additive v2 mission-snapshot contract: the observability
+ * Tests for the additive mission-snapshot contract: the observability
  * section is emitted when present, absent for legacy publishers, and the base
  * mission/task/finding shape is unchanged.
  */
@@ -26,8 +26,8 @@ function mission(store: MissionStore, title: string) {
   });
 }
 
-test("snapshot contract bumped to v2 and is additive", async () => {
-  assert.equal(MISSION_SNAPSHOT_CONTRACT_VERSION, 2);
+test("snapshot contract remains additive after the reliability bump", async () => {
+  assert.equal(MISSION_SNAPSHOT_CONTRACT_VERSION, 3);
   const backend = JsonlEventStore.inMemory();
   const store = MissionStore.open(backend);
   const m = mission(store, "M");
@@ -39,7 +39,7 @@ test("snapshot contract bumped to v2 and is additive", async () => {
   assert.equal(snap.observability, undefined, "null projection yields no observability section");
   assert.equal(snap.id, m.mission_id);
   assert.equal(snap.tasks[0]!.id, t.task_id, "base task shape unchanged");
-  assert.equal(file.contractVersion, 2);
+  assert.equal(file.contractVersion, 3);
 });
 
 test("snapshot includes full observability section when projection present", async () => {

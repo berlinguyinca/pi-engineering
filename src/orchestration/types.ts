@@ -85,6 +85,8 @@ export type RiskProfile = "low" | "medium" | "high" | "critical";
 
 /** A single acceptance criterion with a deterministic pass state. */
 export interface AcceptanceCriterion {
+  /** Stable identity used by task coverage and revision-bound evidence. */
+  acceptance_id?: EntityId;
   criterion: string;
   status: "pending" | "passed" | "failed";
   /** Evidence reference when satisfied. */
@@ -165,6 +167,16 @@ export interface OrchestrationTask {
   completed_at: string | null;
   /** Steering/cancel requests applied while running. */
   steer_requests: string[];
+  /** Repository-scoped execution authority. Absent on legacy events. */
+  repo_id?: EntityId;
+  /** Stable acceptance criteria this task is responsible for. */
+  acceptance_ids?: EntityId[];
+  /** Candidate revision generation this task may affect. */
+  candidate_generation?: number;
+  /** Mission ownership generation at dispatch. */
+  mission_generation?: number;
+  /** Fences results from revoked or expired owners. */
+  fencing_token?: number;
 }
 
 /** Execution backends the broker can dispatch to (spec 03). */
@@ -204,6 +216,188 @@ export interface Execution {
    * The completion gate counts only such a review for a recovery supersede.
    */
   reviewed_recovered?: EntityId[];
+  /** Mission ownership generation at dispatch. Absent on legacy events. */
+  mission_generation?: number;
+  /** Fences results from revoked or expired owners. */
+  fencing_token?: number;
+}
+
+/** A canonical filesystem root explicitly authorized for a mission. */
+export interface AuthorizedRoot {
+  canonicalPath: string;
+  source: "launch_cwd" | "explicit_user_path" | "existing_manifest";
+  access: "read" | "write";
+}
+
+/** One Git repository bound into a mission workspace. */
+export interface RepositoryBinding {
+  repoId: EntityId;
+  canonicalRoot: string;
+  remote?: string;
+  baseRef: string;
+  baseSha: string;
+  writableDomains: string[];
+  validationProfileRef?: string;
+}
+
+/** Durable authority and repository topology for a material mission. */
+export interface WorkspaceManifest {
+  manifestId: EntityId;
+  missionId: EntityId;
+  generation: number;
+  authorizedRoots: AuthorizedRoot[];
+  repositories: RepositoryBinding[];
+  dependencyEdges: Array<{ fromRepoId: EntityId; toRepoId: EntityId }>;
+  hash: string;
+  createdAt: string;
+}
+
+/** Preserved task work. A checkpoint is not validation or approval evidence. */
+export interface TaskCheckpoint {
+  checkpointId: EntityId;
+  missionId: EntityId;
+  taskId: EntityId;
+  repoId: EntityId;
+  baseSha: string;
+  candidateSha: string | null;
+  branch: string | null;
+  worktree: string | null;
+  committedChanges: string[];
+  preservedUncommittedChanges: string[];
+  completedDeliverables: string[];
+  remainingDeliverables: string[];
+  acceptanceIds: EntityId[];
+  validationEvidenceRefs: string[];
+  artifactRefs: string[];
+  artifactHashes: string[];
+  workerId: string | null;
+  sessionId: string | null;
+  model: string | null;
+  sequence: number;
+  createdAt: string;
+}
+
+/** Explicit lineage that accounts for an immutable failed task. */
+export interface TaskSupersession {
+  supersessionId: EntityId;
+  missionId: EntityId;
+  failedTaskId: EntityId;
+  replacementTaskIds: EntityId[];
+  repoId: EntityId;
+  acceptanceIds: EntityId[];
+  reason: string;
+  createdAt: string;
+}
+
+/** Identity shared by validation, review, and invalidation records. */
+export interface CandidateEvidenceIdentity {
+  workspaceManifestHash: string;
+  missionGeneration: number;
+  repoId: EntityId;
+  baseSha: string;
+  candidateSha: string;
+  diffHash: string;
+  acceptanceIds: EntityId[];
+  artifactHashes: string[];
+}
+
+export type FailureCategory =
+  | "WORKSPACE_SCOPE_MISMATCH"
+  | "EVIDENCE_UNAVAILABLE"
+  | "TASK_BUDGET_EXHAUSTED"
+  | "PROVIDER_TRANSIENT"
+  | "PROVIDER_PERMANENT"
+  | "INVALID_WORKER_OUTPUT"
+  | "VALIDATION_FAILED"
+  | "REVIEW_FAILED"
+  | "IMPLEMENTATION_DEFECT"
+  | "MERGE_CONFLICT"
+  | "AUTHORIZATION_OR_CREDENTIAL"
+  | "REQUIREMENT_AMBIGUITY"
+  | "ORPHANED_EXECUTION"
+  | "DEADLOCKED_DAG"
+  | "PERSISTENCE_FAILURE";
+
+/** Stable, machine-readable diagnosis of one failure. */
+export interface FailureClassification {
+  classificationId: EntityId;
+  missionId: EntityId;
+  taskId: EntityId | null;
+  executionId: EntityId | null;
+  category: FailureCategory;
+  evidenceRefs: string[];
+  fingerprint: string;
+  summary: string;
+  classifiedAt: string;
+}
+
+export type RecoveryAction =
+  | "REBUILD_WORKSPACE_MANIFEST"
+  | "RECONSTRUCT_EVIDENCE"
+  | "CHECKPOINT_SPLIT_AND_REPLACE"
+  | "PROBE_AND_BACKOFF"
+  | "REPAIR_WORKER_OUTPUT"
+  | "CREATE_REPAIR_TASKS"
+  | "REBUILD_INTEGRATION_CANDIDATE"
+  | "FENCE_RECONCILE_AND_RESUME"
+  | "WAIT_FOR_REQUIREMENT"
+  | "PAUSE_FOR_PERSISTENCE"
+  | "REPAIR_BLOCKED_MISSION"
+  | "STOP";
+
+export type RecoveryStatus = "planned" | "started" | "succeeded" | "failed" | "exhausted";
+
+/** Bounded recovery choice whose budget and schedule survive restart. */
+export interface RecoveryDecision {
+  recoveryId: EntityId;
+  missionId: EntityId;
+  classificationId: EntityId;
+  action: RecoveryAction;
+  expectedMaterialChange: string;
+  attempt: number;
+  maxAttempts: number;
+  deadline: string;
+  nextActionAt: string;
+  status: RecoveryStatus;
+  decidedAt: string;
+}
+
+export interface EvidenceInvalidation {
+  invalidationId: EntityId;
+  missionId: EntityId;
+  identity: CandidateEvidenceIdentity;
+  reason: string;
+  invalidatedAt: string;
+}
+
+export interface MissionLease {
+  missionId: EntityId;
+  generation: number;
+  ownerId: string;
+  acquiredAt: string;
+  renewBy: string;
+  fencingToken: number;
+}
+
+export interface RepositoryLease extends MissionLease {
+  repoId: EntityId;
+}
+
+export type LeaseTransition = "acquired" | "renewed" | "expired" | "fenced";
+
+export interface MissionResumption {
+  missionId: EntityId;
+  reason: string;
+  resumedAt: string;
+}
+
+export interface MissionStop {
+  missionId: EntityId;
+  reason: string;
+  preservedWork: string[];
+  attemptedRecoveries: EntityId[];
+  resumeCondition: string;
+  stoppedAt: string;
 }
 
 /** A recovered worker commit merged by integration. */
