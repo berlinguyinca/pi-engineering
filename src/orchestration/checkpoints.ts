@@ -148,10 +148,7 @@ export class CheckpointManager {
         createdAt: this.now().toISOString(),
       };
       assertCurrentOrigin();
-      const persisted = this.store.checkpointTask(checkpoint);
-      await this.store.flush();
-      assertCurrentOrigin();
-      return persisted;
+      return await this.store.publishCheckpointIfAuthoritative(checkpoint);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (/authoritative|origin mismatch|stale execution identity/i.test(message)) {

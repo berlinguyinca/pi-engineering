@@ -33,6 +33,52 @@ class ToggleBackend implements EventStoreBackend {
   }
 }
 
+class BlockingBackend implements EventStoreBackend {
+  readonly inner = JsonlEventStore.inMemory();
+  private blockNextAppend = false;
+  private releaseBlocked!: () => void;
+  private appendStarted!: () => void;
+  private readonly blocked = new Promise<void>((resolve) => {
+    this.releaseBlocked = resolve;
+  });
+  readonly started = new Promise<void>((resolve) => {
+    this.appendStarted = resolve;
+  });
+
+  blockNext(): void {
+    this.blockNextAppend = true;
+  }
+
+  release(): void {
+    this.releaseBlocked();
+  }
+
+  async append(event: StoredEvent): Promise<StoredEvent> {
+    if (this.blockNextAppend) {
+      this.blockNextAppend = false;
+      this.appendStarted();
+      await this.blocked;
+    }
+    return this.inner.append(event);
+  }
+
+  async appendAll(events: StoredEvent[]): Promise<void> {
+    for (const event of events) await this.append(event);
+  }
+
+  all(): StoredEvent[] {
+    return this.inner.all();
+  }
+
+  get(eventId: string): StoredEvent | undefined {
+    return this.inner.get(eventId);
+  }
+
+  count(): number {
+    return this.inner.count();
+  }
+}
+
 function manifest(missionId: string, baseSha = "base-a"): WorkspaceManifest {
   return {
     manifestId: `WM-${baseSha}`,
@@ -240,6 +286,51 @@ describe("CheckpointManager durability and immutable origin", () => {
       .find((candidate) => candidate.type === "execution.late_result_rejected");
     assert.equal((event?.payload.evidence as { kind?: string } | undefined)?.kind, "checkpoint");
     assert.equal(store.listFindings(mission.mission_id).length, 0);
+  });
+
+  it("publishes no stale checkpoint when a queued append is blocked during authority takeover", async () => {
+    const backend = new BlockingBackend();
+    const { store, mission, task, execution } = setup(backend);
+    const manager = new CheckpointManager({ store });
+    await manager.persist({
+      taskId: task.task_id,
+      executionId: execution.execution_id,
+      snapshot: {
+        candidateSha: "candidate-before",
+        branch: "mission/task-a",
+        worktree: "/worktree/task-a",
+        committedChanges: ["src/before.ts"],
+        preservedUncommittedChanges: [],
+      },
+    });
+    const durableBefore = backend.all().filter((event) => event.type === "task.checkpointed").length;
+    backend.blockNext();
+    store.addAcceptanceCriterion(mission.mission_id, "hold persistence queue");
+    const late = manager.persist({
+      taskId: task.task_id,
+      executionId: execution.execution_id,
+      snapshot: {
+        candidateSha: "candidate-late",
+        branch: "mission/task-a",
+        worktree: "/worktree/task-a",
+        committedChanges: ["src/late.ts"],
+        preservedUncommittedChanges: [],
+      },
+    });
+    await backend.started;
+    store.assignTaskAuthority(task.task_id, {
+      missionId: mission.mission_id,
+      generation: 4,
+      ownerId: "takeover",
+      acquiredAt: "2026-09-26T10:02:00.000Z",
+      renewBy: "2026-09-26T10:03:00.000Z",
+      fencingToken: 6,
+    });
+    backend.release();
+
+    await assert.rejects(late, /origin mismatch|stale execution identity/i);
+    assert.equal(store.getTaskCheckpoint("TCP-origin")?.candidateSha, "candidate-before");
+    assert.equal(backend.all().filter((event) => event.type === "task.checkpointed").length, durableBefore);
   });
 
   it("does not replace useful preserved work with an unavailable empty snapshot", async () => {

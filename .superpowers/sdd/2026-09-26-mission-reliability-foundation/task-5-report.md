@@ -89,3 +89,46 @@ Final verification:
 - `npm run lint` — 582 files checked, no diagnostics.
 - `npm test` — 2,367 total, 2,366 passed, 0 failed, 1 Postgres-dependent test skipped because `TEST_DATABASE_URL` is unset.
 - `git diff --check` — passed.
+
+## Fix Round 2
+
+Closed the remaining timeout/cancellation authority gaps:
+
+- Explicit cancellation marks its branch integration-ineligible before terminal status changes, so cancellation can never race the result path into a clean handoff.
+- Checkpoint publication is now a store-serialized conditional operation: it drains prior writes, verifies execution/generation/fence/repository/base identity, appends durably, and only then applies the checkpoint in memory. A takeover while an earlier append is blocked leaves both durable and in-memory checkpoint state unchanged.
+- Successful integration records worktrees for separately owned cleanup instead of deleting branches/worktrees while execution authority can disappear across a Git await.
+- The hard abort race now covers repository resolution, worktree allocation, and setup. Late allocations are retained and timeout remains the authoritative reason.
+- Cancellation-grace timers are captured, unrefed, and cleared when checkpoint preservation wins the race.
+
+### RED
+
+```text
+node --test --test-name-pattern='explicitly canceled|worktree allocation is blocked|queued append is blocked|defers destructive' \
+  test/unit/orchestration-broker.test.ts \
+  test/unit/orchestration-checkpoints.test.ts \
+  test/unit/orchestration-broker-recovery.test.ts
+```
+
+Result before implementation: 4 tests, 0 passed, 4 failed. Failures demonstrated canceled work entering a handoff, setup owning settlement past the deadline, stale checkpoint replacement, and destructive integration cleanup beginning under revocable execution authority.
+
+### GREEN
+
+```text
+node --test \
+  test/unit/orchestration-broker.test.ts \
+  test/unit/orchestration-broker-recovery.test.ts \
+  test/unit/orchestration-checkpoints.test.ts \
+  test/unit/orchestration-missionstore.test.ts \
+  test/unit/orchestration-scheduler.test.ts \
+  test/unit/orchestration-scheduler-resilience.test.ts \
+  test/unit/orchestration-workset.test.ts
+```
+
+Result: 116 tests, 116 passed, 0 failed. This is the corrected focused command/count for the complete Task 5 authority surface.
+
+Final verification:
+
+- `npm run typecheck` — passed.
+- `npm run lint` — 582 files checked, no diagnostics.
+- `npm test` — 2,371 total, 2,370 passed, 0 failed, 1 Postgres-dependent test skipped because `TEST_DATABASE_URL` is unset.
+- `git diff --check` — passed.

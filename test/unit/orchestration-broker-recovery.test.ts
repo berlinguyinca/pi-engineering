@@ -254,6 +254,123 @@ describe("ExecutionBroker: recovering a timed-out worker's committed work", () =
     }
   });
 
+  it("defers destructive integration cleanup so a takeover cannot delete the recoverable branch", async () => {
+    const fx = await makeFixtureRepo();
+    try {
+      const git = (await GitRepo.open(fx.root))!;
+      const store = MissionStore.open(JsonlEventStore.inMemory());
+      const base = await git.headCommit();
+      const mission = store.createMission({
+        title: "deferred integration cleanup",
+        goal: "deferred integration cleanup",
+        user_request: "deferred integration cleanup",
+        repository: fx.root,
+        base_ref: base,
+        risk_profile: "medium",
+        workflow_class: "engineering_review",
+      });
+      const workerTask = store.createTask({
+        mission_id: mission.mission_id,
+        kind: "agent",
+        role: "implementer",
+        objective: "worker",
+        mutates_repo: true,
+        isolation: "worktree",
+      });
+      const broker = new ExecutionBroker({
+        store,
+        git,
+        baseRef: base,
+        backends: {
+          agent: {
+            runAgent: async ({ worktree }) => {
+              await writeFile(join(worktree!, "src", "deferred-cleanup.ts"), "export const deferred = true;\n");
+              return { executionId: "worker", exitStatus: "succeeded", summary: "done", artifactRefs: [], usage: {} };
+            },
+          },
+          integration: {
+            runIntegration: async () => ({
+              executionId: "integration",
+              exitStatus: "succeeded",
+              summary: "merged",
+              artifactRefs: [],
+              usage: {},
+            }),
+          },
+        },
+      });
+      await (
+        await broker.execute({
+          taskId: workerTask.task_id,
+          missionId: mission.mission_id,
+          kind: "agent",
+          objective: workerTask.objective,
+          mutatesRepo: true,
+          isolation: "worktree",
+        })
+      ).result();
+      const branch = `pi-eng-orch-${workerTask.task_id}`;
+      let removalStarted!: () => void;
+      const removing = new Promise<void>((resolve) => {
+        removalStarted = resolve;
+      });
+      let releaseRemoval!: () => void;
+      const removalBlocked = new Promise<void>((resolve) => {
+        releaseRemoval = resolve;
+      });
+      const originalRemove = git.removeWorktree.bind(git);
+      git.removeWorktree = async (info, options) => {
+        removalStarted();
+        await removalBlocked;
+        return originalRemove(info, options);
+      };
+      const integrationTask = store.createTask({
+        mission_id: mission.mission_id,
+        kind: "integration",
+        role: "integrator",
+        objective: "merge",
+      });
+      const integration = await broker.execute({
+        taskId: integrationTask.task_id,
+        missionId: mission.mission_id,
+        kind: "integration",
+        objective: integrationTask.objective,
+      });
+      const result = integration.result();
+      const first = await Promise.race([
+        result.then(() => "settled" as const),
+        removing.then(() => "removing" as const),
+      ]);
+      if (first === "removing") {
+        store.assignTaskAuthority(integrationTask.task_id, {
+          missionId: mission.mission_id,
+          generation: 1,
+          ownerId: "takeover",
+          acquiredAt: "2026-09-27T12:00:00.000Z",
+          renewBy: "2026-09-27T12:01:00.000Z",
+          fencingToken: 1,
+        });
+        releaseRemoval();
+        await result.catch(() => undefined);
+      } else {
+        store.assignTaskAuthority(integrationTask.task_id, {
+          missionId: mission.mission_id,
+          generation: 1,
+          ownerId: "takeover",
+          acquiredAt: "2026-09-27T12:00:00.000Z",
+          renewBy: "2026-09-27T12:01:00.000Z",
+          fencingToken: 1,
+        });
+      }
+
+      assert.equal(first, "settled", "integration must not begin destructive cleanup under execution authority");
+      execFileSync("git", ["-C", fx.root, "show-ref", "--verify", `refs/heads/${branch}`]);
+      assert.ok(broker.preservedBranches(mission.mission_id).includes(branch));
+    } finally {
+      await fx.cleanup();
+    }
+  });
+
   it("preserves a pre-timeout checkpoint but keeps the uncooperative branch ineligible for integration", async () => {
     const fx = await makeFixtureRepo();
     let release!: () => void;

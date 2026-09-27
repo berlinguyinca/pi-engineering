@@ -315,6 +315,11 @@ export class ExecutionBroker {
     string,
     Array<{ path: string; branch: string; git: GitRepo; repoId?: string; writeDomains: string[] }>
   >();
+  /** Successfully integrated worktrees awaiting separately owned cleanup. */
+  private readonly deferredCleanup = new Map<
+    string,
+    Array<{ path: string; branch: string; git: GitRepo; repoId?: string; writeDomains: string[] }>
+  >();
   private readonly missionRepositories = new Map<string, { repoId?: string; root: string; git: GitRepo }>();
   /** Commit each mission's worktrees were actually forked from (landing invariant). */
   private readonly resolvedBases = new Map<string, string>();
@@ -453,6 +458,23 @@ export class ExecutionBroker {
     this.preserved.set(missionId, branches);
   }
 
+  private markBranchIntegrationIneligible(
+    executionId: string,
+    missionId: string,
+    taskId: string,
+    marker: string,
+  ): void {
+    const info = this.allocatedWorktrees.get(executionId);
+    if (!info) return;
+    const byBranch =
+      this.failedBranches.get(missionId) ?? new Map<string, { marker: string; taskId: string; recoverRef?: string }>();
+    byBranch.set(info.branch, { marker, taskId });
+    this.failedBranches.set(missionId, byBranch);
+    const preserved = this.preserved.get(missionId) ?? [];
+    if (!preserved.includes(info.branch)) preserved.push(info.branch);
+    this.preserved.set(missionId, preserved);
+  }
+
   private async repositoryFor(
     input: ExecutionRequestInput,
   ): Promise<{ repoId?: string; root: string; git: GitRepo } | null> {
@@ -502,16 +524,31 @@ export class ExecutionBroker {
     if (!entry) return Promise.resolve(this.terminalizeExecution(executionId, reason, taskId));
     if (entry.terminalPromise) return entry.terminalPromise;
     entry.terminalPromise = (async () => {
+      this.markBranchIntegrationIneligible(
+        executionId,
+        entry.missionId,
+        taskId,
+        reason === "timeout" ? WALL_CLOCK_TIMEOUT_MARKER : "canceled",
+      );
       const checkpoint = entry.cancelCheckpoint?.();
-      const checkpointSettled = checkpoint
-        ? await Promise.race([
-            checkpoint.then(
-              () => true,
-              () => false,
-            ),
-            new Promise<false>((resolve) => setTimeout(() => resolve(false), this.cancellationAckTimeoutMs)),
-          ])
-        : true;
+      let graceTimer: ReturnType<typeof setTimeout> | undefined;
+      let checkpointSettled = true;
+      try {
+        checkpointSettled = checkpoint
+          ? await Promise.race([
+              checkpoint.then(
+                () => true,
+                () => false,
+              ),
+              new Promise<false>((resolve) => {
+                graceTimer = setTimeout(() => resolve(false), this.cancellationAckTimeoutMs);
+                graceTimer.unref?.();
+              }),
+            ])
+          : true;
+      } finally {
+        if (graceTimer) clearTimeout(graceTimer);
+      }
       if ((reason === "timeout" || !checkpointSettled) && entry.worktree) {
         this.retainWorktree(entry.missionId, executionId);
       }
@@ -605,6 +642,20 @@ export class ExecutionBroker {
       const mission = (this.missionWorktrees.get(input.missionId) ?? []).filter((w) => w.branch !== info.branch);
       mission.push(info);
       this.missionWorktrees.set(input.missionId, mission);
+      try {
+        this.store.assertExecutionAuthoritative(executionId);
+        input.authority?.assertAuthoritative();
+      } catch (error) {
+        this.retainWorktree(input.missionId, executionId);
+        const terminal = this.store.getExecution(executionId);
+        this.markBranchIntegrationIneligible(
+          executionId,
+          input.missionId,
+          input.taskId,
+          terminal?.exit_status === WALL_CLOCK_TIMEOUT_MARKER ? WALL_CLOCK_TIMEOUT_MARKER : "canceled",
+        );
+        throw error;
+      }
       return wt.path;
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
@@ -882,7 +933,31 @@ export class ExecutionBroker {
 
   /** Release any worktrees still tracked for a finished mission. */
   async cleanupMission(missionId: string, opts: { keepBranches?: boolean } = {}): Promise<void> {
+    const deferred = this.deferredCleanup.get(missionId) ?? [];
+    if (deferred.length > 0) {
+      const active = this.missionWorktrees.get(missionId) ?? [];
+      const branches = new Set(active.map((worktree) => worktree.branch));
+      for (const worktree of deferred) {
+        if (!branches.has(worktree.branch)) active.push(worktree);
+      }
+      this.missionWorktrees.set(missionId, active);
+      this.deferredCleanup.delete(missionId);
+    }
     await this.releaseMissionWorktrees(missionId, opts.keepBranches === true);
+  }
+
+  private deferMissionWorktreeCleanup(missionId: string): void {
+    const worktrees = this.missionWorktrees.get(missionId) ?? [];
+    const deferred = this.deferredCleanup.get(missionId) ?? [];
+    const branches = new Set(deferred.map((worktree) => worktree.branch));
+    const preserved = this.preserved.get(missionId) ?? [];
+    for (const worktree of worktrees) {
+      if (!branches.has(worktree.branch)) deferred.push(worktree);
+      if (!preserved.includes(worktree.branch)) preserved.push(worktree.branch);
+    }
+    if (deferred.length > 0) this.deferredCleanup.set(missionId, deferred);
+    this.preserved.set(missionId, preserved);
+    this.missionWorktrees.delete(missionId);
   }
 
   /** Remove + clean all mission worktrees (after integration). */
@@ -1040,7 +1115,7 @@ export class ExecutionBroker {
       },
       result: () => {
         if (resultPromise) return resultPromise;
-        resultPromise = (async () => {
+        const operationPromise = (async () => {
           if (abort.signal.aborted) {
             const terminal = this.store.getExecution(execution.execution_id);
             if (terminal?.status === "CANCELED") {
@@ -1056,6 +1131,7 @@ export class ExecutionBroker {
               abort.abort(new DOMException(`Execution exceeded its ${executionBudgetMs}ms deadline`, "TimeoutError")),
             Math.max(0, executionDeadlineAt - Date.now()),
           );
+          timer.unref?.();
           const activityStartedAt = Date.now();
           let lastActivityAt = activityStartedAt;
           let activitySettled = false;
@@ -1227,6 +1303,8 @@ export class ExecutionBroker {
           try {
             input.authority?.assertAuthoritative();
             repository = await this.repositoryFor(input);
+            this.store.assertExecutionAuthoritative(execution.execution_id);
+            input.authority?.assertAuthoritative();
             if (repository) this.missionRepositories.set(input.missionId, repository);
             const repositoryBinding = input.repoId
               ? this.store
@@ -1291,7 +1369,13 @@ export class ExecutionBroker {
             }
             if (abort.signal.aborted) {
               detachedAfterTerminalAbort = true;
-              return this.terminalizeAfterGrace(execution.execution_id, "canceled", input.taskId);
+              const timedOut =
+                abort.signal.reason instanceof DOMException && abort.signal.reason.name === "TimeoutError";
+              return this.terminalizeAfterGrace(
+                execution.execution_id,
+                timedOut ? "timeout" : "canceled",
+                input.taskId,
+              );
             }
             input.authority?.assertAuthoritative();
             writerStarted = true;
@@ -1519,6 +1603,21 @@ export class ExecutionBroker {
             }
           }
         })();
+        let removeAbortListener = (): void => {};
+        const authoritativeAbort = new Promise<ExecutionOutcome>((resolve, reject) => {
+          const settle = (): void => {
+            const timedOut = abort.signal.reason instanceof DOMException && abort.signal.reason.name === "TimeoutError";
+            void this.terminalizeAfterGrace(
+              execution.execution_id,
+              timedOut ? "timeout" : "canceled",
+              input.taskId,
+            ).then(resolve, reject);
+          };
+          removeAbortListener = () => abort.signal.removeEventListener("abort", settle);
+          if (abort.signal.aborted) settle();
+          else abort.signal.addEventListener("abort", settle, { once: true });
+        });
+        resultPromise = Promise.race([operationPromise, authoritativeAbort]).finally(removeAbortListener);
         return resultPromise;
       },
     };
@@ -1722,13 +1821,11 @@ export class ExecutionBroker {
             if (merged.length > 0) outcome = { ...outcome, recoveredMerged: merged };
           }
         }
-        // Release the worktrees, but delete the branches only when the merge
-        // actually landed. After a conflict or a failed integration the branch is
-        // the only remaining copy of the worker's output, and removeWorktree
-        // without keepBranch runs `git branch -D` — which would destroy exactly
-        // what an operator needs to resolve the conflict.
+        // Transfer cleanup to the mission-owned reconciliation path. Destructive
+        // Git operations cannot safely straddle a revocable execution-authority
+        // await, even after a successful merge.
         assertOrigin();
-        await this.releaseMissionWorktrees(input.missionId, outcome.exitStatus !== "succeeded", assertOrigin);
+        this.deferMissionWorktreeCleanup(input.missionId);
         assertOrigin();
         return outcome;
       }

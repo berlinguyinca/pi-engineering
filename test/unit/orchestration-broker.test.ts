@@ -287,6 +287,156 @@ describe("ExecutionBroker (spec 03)", () => {
     assert.equal(outcome.error, "canceled");
     assert.equal(store.getExecution(handle.executionId)?.status, "CANCELED");
   });
+
+  it("keeps an explicitly canceled worker branch out of integration handoffs", async () => {
+    const fx = await makeFixtureRepo();
+    try {
+      const git = await GitRepo.open(fx.root);
+      assert.ok(git);
+      const store = MissionStore.open(JsonlEventStore.inMemory());
+      const mission = store.createMission({
+        title: "canceled branch",
+        goal: "canceled branch",
+        user_request: "canceled branch",
+        repository: fx.root,
+        base_ref: await git.headCommit(),
+        risk_profile: "medium",
+        workflow_class: "engineering_review",
+      });
+      const workerTask = store.createTask({
+        mission_id: mission.mission_id,
+        kind: "agent",
+        role: "implementer",
+        objective: "cancel this worker",
+        mutates_repo: true,
+        isolation: "worktree",
+      });
+      let started!: () => void;
+      const workerStarted = new Promise<void>((resolve) => {
+        started = resolve;
+      });
+      let handoffs = 0;
+      const broker = new ExecutionBroker({
+        store,
+        git,
+        baseRef: mission.base_ref,
+        cancellationAckTimeoutMs: 10,
+        backends: {
+          agent: {
+            runAgent: async ({ signal }) => {
+              started();
+              await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+              return { executionId: "late", exitStatus: "succeeded", summary: "late", artifactRefs: [], usage: {} };
+            },
+          },
+          integration: {
+            runIntegration: async (input) => {
+              handoffs = input.handoffs.length;
+              return {
+                executionId: "integration",
+                exitStatus: "succeeded",
+                summary: "done",
+                artifactRefs: [],
+                usage: {},
+              };
+            },
+          },
+        },
+      });
+      const worker = await broker.execute({
+        taskId: workerTask.task_id,
+        missionId: mission.mission_id,
+        kind: "agent",
+        objective: workerTask.objective,
+        mutatesRepo: true,
+        isolation: "worktree",
+      });
+      const workerResult = worker.result();
+      await workerStarted;
+      await worker.cancel();
+      assert.equal((await workerResult).error, "canceled");
+      const integrationTask = store.createTask({
+        mission_id: mission.mission_id,
+        kind: "integration",
+        role: "integrator",
+        objective: "merge eligible work",
+      });
+      await (
+        await broker.execute({
+          taskId: integrationTask.task_id,
+          missionId: mission.mission_id,
+          kind: "integration",
+          objective: integrationTask.objective,
+        })
+      ).result();
+
+      assert.equal(handoffs, 0);
+      assert.ok(broker.preservedBranches(mission.mission_id).some((branch) => branch.includes(workerTask.task_id)));
+    } finally {
+      await fx.cleanup();
+    }
+  });
+
+  it("hard-times out while worktree allocation is blocked and preserves the late allocation", async () => {
+    let allocationStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      allocationStarted = resolve;
+    });
+    let releaseAllocation!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      releaseAllocation = resolve;
+    });
+    let dispatches = 0;
+    let removals = 0;
+    const { store, m, t } = setup({});
+    const broker = new ExecutionBroker({
+      store,
+      defaultTimeoutMs: 15,
+      cancellationAckTimeoutMs: 10,
+      baseRef: "base",
+      git: {
+        root: "/repo",
+        createWorktree: async () => {
+          allocationStarted();
+          await blocked;
+          return { path: "/tmp/late-allocation", branch: "late-allocation" };
+        },
+        removeWorktree: async () => {
+          removals++;
+        },
+      } as never,
+      backends: {
+        agent: {
+          runAgent: async () => {
+            dispatches++;
+            return { executionId: "worker", exitStatus: "succeeded", summary: "done", artifactRefs: [], usage: {} };
+          },
+        },
+      },
+    });
+    const handle = await broker.execute({
+      taskId: t.task_id,
+      missionId: m.mission_id,
+      kind: "agent",
+      objective: t.objective,
+      mutatesRepo: true,
+      isolation: "worktree",
+      executionBudgetMs: 15,
+    });
+    const result = handle.result();
+    await started;
+
+    const outcome = await Promise.race([
+      result,
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("setup timeout did not settle")), 100)),
+    ]);
+    assert.equal(outcome.error, "timeout");
+    releaseAllocation();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(dispatches, 0);
+    assert.equal(removals, 0);
+    assert.ok(broker.preservedBranches(m.mission_id).includes("late-allocation"));
+  });
   it("settles at the deadline plus cancellation grace when the backend ignores AbortSignal forever", async () => {
     const backend = JsonlEventStore.inMemory();
     const store = MissionStore.open(backend);
@@ -1197,7 +1347,7 @@ describe("ExecutionBroker (spec 03)", () => {
     assert.equal(runs, 0);
   });
 
-  it("does not dispatch after cancellation during worktree allocation and releases the allocated worktree", async () => {
+  it("does not dispatch after cancellation during worktree allocation and preserves the late worktree", async () => {
     let runs = 0;
     let releaseAllocation!: () => void;
     let allocationStarted!: () => void;
@@ -1244,7 +1394,8 @@ describe("ExecutionBroker (spec 03)", () => {
     releaseAllocation();
     assert.equal((await pending).error, "canceled");
     assert.equal(runs, 0);
-    assert.equal(removals, 1);
+    assert.equal(removals, 0);
+    assert.ok(broker.preservedBranches(m.mission_id).includes("delayed"));
   });
 
   it("clears the activity interval immediately when a signal-ignoring backend is canceled", async () => {

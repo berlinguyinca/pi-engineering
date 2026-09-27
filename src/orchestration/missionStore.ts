@@ -1067,6 +1067,68 @@ export class MissionStore {
     return copyTaskCheckpoint(copy);
   }
 
+  /**
+   * Serialize the authority check with durable checkpoint publication.
+   * Unlike checkpointTask(), this does not expose the checkpoint in memory or
+   * enqueue its event before the expected execution identity is current.
+   */
+  publishCheckpointIfAuthoritative(checkpoint: TaskCheckpoint): Promise<TaskCheckpoint> {
+    const publish = this.emitChain.then(async () => {
+      await this.drainPending();
+      this.assertExecutionAuthoritative(checkpoint.executionId);
+      const task = this.tasks.get(checkpoint.taskId);
+      const repository = this.workspaceManifests
+        .get(checkpoint.missionId)
+        ?.repositories.find((candidate) => candidate.repoId === checkpoint.repoId);
+      const mismatches = [
+        !task || task.mission_id !== checkpoint.missionId ? "task" : null,
+        task?.assigned_execution_id && task.assigned_execution_id !== checkpoint.executionId
+          ? "execution assignment"
+          : null,
+        task?.repo_id !== checkpoint.repoId ? "repository" : null,
+        !repository || repository.baseSha !== checkpoint.baseSha ? "base" : null,
+        (task?.mission_generation ?? 0) !== checkpoint.missionGeneration ? "mission generation" : null,
+        (task?.candidate_generation ?? 0) !== checkpoint.candidateGeneration ? "candidate generation" : null,
+        (task?.fencing_token ?? 0) !== checkpoint.fencingToken ? "fencing token" : null,
+      ].filter((value): value is string => value !== null);
+      if (mismatches.length > 0) throw new Error(`checkpoint origin mismatch: ${mismatches.join(", ")}`);
+
+      const copy = copyTaskCheckpoint(checkpoint);
+      const payload = structuredClone({ actor: "system", checkpoint: copy });
+      const event: OrchestrationEvent = {
+        event_id: id("oevt"),
+        mission_id: checkpoint.missionId,
+        timestamp: new Date().toISOString(),
+        type: "task.checkpointed",
+        actor: "system",
+        payload,
+      };
+      const stored: StoredEvent = {
+        event_id: event.event_id,
+        timestamp: event.timestamp,
+        type: event.type,
+        project_id: null,
+        run_id: checkpoint.missionId,
+        worker_id: null,
+        payload,
+      };
+      try {
+        await this.backend.append(stored);
+      } catch (error) {
+        this.recordPersistenceFailure(event, error);
+        throw error;
+      }
+      this.clearPersistenceFailure(event.event_id);
+      this.apply(event);
+      return copyTaskCheckpoint(copy);
+    });
+    this.emitChain = publish.then(
+      () => undefined,
+      () => undefined,
+    );
+    return publish;
+  }
+
   listTaskCheckpoints(missionId?: string, taskId?: string): TaskCheckpoint[] {
     return [...this.taskCheckpoints.values()]
       .filter((checkpoint) => (missionId ? checkpoint.missionId === missionId : true))
