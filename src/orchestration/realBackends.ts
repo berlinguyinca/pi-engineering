@@ -121,6 +121,45 @@ export function normalizeFindings(raw: unknown): Array<Record<string, unknown>> 
   return [];
 }
 
+function validRawReviewFinding(value: unknown): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const finding = value as Record<string, unknown>;
+  if (typeof finding.title !== "string" || !finding.title.trim()) return false;
+  if (typeof finding.detail !== "string" || !finding.detail.trim()) return false;
+  try {
+    normalizeReviewSeverity(finding.severity);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function validRawMissingTest(value: unknown): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const missing = value as Record<string, unknown>;
+  if (typeof missing.description !== "string" || !missing.description.trim()) return false;
+  try {
+    normalizeReviewSeverity(missing.severity);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function validRawSpecGap(value: unknown): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const gap = value as Record<string, unknown>;
+  if (typeof gap.requirement !== "string" || !gap.requirement.trim()) return false;
+  if (typeof gap.detail !== "string" || !gap.detail.trim()) return false;
+  if (!["missing", "partial", "divergent", "unverifiable"].includes(String(gap.status))) return false;
+  try {
+    normalizeReviewSeverity(gap.severity);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** Convert a worker result into a bounded broker outcome. */
 function outcomeOf(result: Awaited<ReturnType<WorkerExecutor["run"]>>): ExecutionOutcome {
   const completed = result.result.status === "completed";
@@ -352,8 +391,11 @@ export function realBackends(opts: RealBackendsOptions) {
         let outputValid =
           (verdict === "approve" || verdict === "request_changes") &&
           Array.isArray(raw) &&
+          raw.every(validRawReviewFinding) &&
           Array.isArray(structured?.missingTests) &&
+          structured.missingTests.every(validRawMissingTest) &&
           Array.isArray(structured?.specGaps) &&
+          structured.specGaps.every(validRawSpecGap) &&
           !!modelRoute;
         const supplemental = [
           ...(Array.isArray(structured?.missingTests) ? structured.missingTests : []),

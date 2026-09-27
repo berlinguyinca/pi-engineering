@@ -42,7 +42,6 @@ function successfulEvidenceExecution(
     acceptance_ids: kind === "review" ? [repoId === "repo-r" ? "AC-R" : "AC-1"] : [],
   });
   store.transitionTask(task.task_id, "READY");
-  store.transitionTask(task.task_id, "RUNNING");
   const execution = store.createExecution({
     task_id: task.task_id,
     backend: kind,
@@ -50,6 +49,8 @@ function successfulEvidenceExecution(
     repo_id: repoId,
     base_sha: baseSha,
   });
+  store.transitionTask(task.task_id, "RUNNING", "system", { assigned_execution_id: execution.execution_id });
+  store.setExecutionStatus(execution.execution_id, "RUNNING");
   store.setExecutionStatus(execution.execution_id, "SUCCEEDED");
   store.transitionTask(task.task_id, "SUCCEEDED");
   return { taskId: task.task_id, executionId: execution.execution_id };
@@ -433,9 +434,207 @@ describe("revision-bound completion evidence", () => {
     assert.equal(verdict.can_complete, true, JSON.stringify(verdict.reasons));
   });
 
+  it("rejects evidence whose settled execution has stale candidate generation", () => {
+    const { store, mission, identity } = currentEvidenceMission();
+    const original = store.listValidationEvidence(mission.mission_id)[0]!;
+    const task = store.createTask({
+      mission_id: mission.mission_id,
+      kind: "validation",
+      role: "validator",
+      objective: "stale generation",
+      repo_id: identity.repoId,
+      candidate_generation: 2,
+    });
+    store.transitionTask(task.task_id, "READY");
+    const execution = store.createExecution({
+      task_id: task.task_id,
+      backend: "validation",
+      mission_id: mission.mission_id,
+      repo_id: identity.repoId,
+      base_sha: identity.baseSha,
+      candidate_generation: 1,
+    });
+    store.transitionTask(task.task_id, "RUNNING", "system", { assigned_execution_id: execution.execution_id });
+    store.setExecutionStatus(execution.execution_id, "RUNNING");
+    store.setExecutionStatus(execution.execution_id, "SUCCEEDED");
+    store.transitionTask(task.task_id, "SUCCEEDED");
+    assert.throws(
+      () =>
+        store.recordValidationEvidence({
+          ...original,
+          evidenceId: "VE-stale-generation",
+          taskId: task.task_id,
+          executionId: execution.execution_id,
+        }),
+      /candidate generation|authoritative/i,
+    );
+  });
+
+  it("rejects evidence from an execution that is no longer the task assignment", () => {
+    const { store, mission, identity } = currentEvidenceMission();
+    const original = store.listValidationEvidence(mission.mission_id)[0]!;
+    const task = store.createTask({
+      mission_id: mission.mission_id,
+      kind: "validation",
+      role: "validator",
+      objective: "stale assignment",
+      repo_id: identity.repoId,
+    });
+    store.transitionTask(task.task_id, "READY");
+    const stale = store.createExecution({
+      task_id: task.task_id,
+      backend: "validation",
+      mission_id: mission.mission_id,
+      repo_id: identity.repoId,
+      base_sha: identity.baseSha,
+    });
+    const assigned = store.createExecution({
+      task_id: task.task_id,
+      backend: "validation",
+      mission_id: mission.mission_id,
+      repo_id: identity.repoId,
+      base_sha: identity.baseSha,
+    });
+    store.transitionTask(task.task_id, "RUNNING", "system", { assigned_execution_id: assigned.execution_id });
+    store.setExecutionStatus(stale.execution_id, "RUNNING");
+    store.setExecutionStatus(stale.execution_id, "SUCCEEDED");
+    store.transitionTask(task.task_id, "SUCCEEDED");
+    assert.throws(
+      () =>
+        store.recordValidationEvidence({
+          ...original,
+          evidenceId: "VE-stale-assignment",
+          taskId: task.task_id,
+          executionId: stale.execution_id,
+        }),
+      /assigned execution|authoritative/i,
+    );
+  });
+
+  it("blocks when a later authoritative validation attempt fails after earlier green evidence", () => {
+    const { store, mission, identity } = currentEvidenceMission();
+    const task = store.createTask({
+      mission_id: mission.mission_id,
+      kind: "validation",
+      role: "validator",
+      objective: "later validation",
+      repo_id: identity.repoId,
+    });
+    store.transitionTask(task.task_id, "READY");
+    const execution = store.createExecution({
+      task_id: task.task_id,
+      backend: "validation",
+      mission_id: mission.mission_id,
+      repo_id: identity.repoId,
+      base_sha: identity.baseSha,
+    });
+    store.transitionTask(task.task_id, "RUNNING", "system", { assigned_execution_id: execution.execution_id });
+    store.setExecutionStatus(execution.execution_id, "RUNNING");
+    store.setExecutionStatus(execution.execution_id, "FAILED");
+    store.transitionTask(task.task_id, "FAILED");
+    const verdict = new CompletionGate(store).evaluate(store.getMission(mission.mission_id)!);
+    assert.equal(verdict.can_complete, false, JSON.stringify(verdict));
+    assert.match(verdict.reasons.join("; "), /validation|failed/i);
+  });
+
+  it("does not let a historical execution be republished with a fresh evidence timestamp", () => {
+    const { store, mission } = currentEvidenceMission();
+    const review = store.listReviewEvidence(mission.mission_id)[0]!;
+    assert.throws(
+      () =>
+        store.recordReviewEvidence({
+          ...review,
+          evidenceId: "RE-republished-history",
+          recordedAt: new Date(Date.now() + 60_000).toISOString(),
+        }),
+      /historical execution|already recorded|duplicate/i,
+    );
+  });
+
+  it("anchors supersession freshness to execution end time rather than a later evidence record time", () => {
+    const { store, mission, identity } = currentEvidenceMission();
+    const oldValidation = successfulEvidenceExecution(store, mission.mission_id, "validation", "repo-1", "base-a");
+    const oldReview = successfulEvidenceExecution(store, mission.mission_id, "review", "repo-1", "base-a");
+    const failed = store.createTask({
+      mission_id: mission.mission_id,
+      kind: "agent",
+      role: "implementer",
+      objective: "repair exact behavior",
+      repo_id: "repo-1",
+      acceptance_ids: ["AC-1"],
+      deliverables: ["src/repair.ts"],
+    });
+    store.transitionTask(failed.task_id, "READY");
+    store.transitionTask(failed.task_id, "RUNNING");
+    store.transitionTask(failed.task_id, "FAILED");
+    const replacement = store.createTask({
+      mission_id: mission.mission_id,
+      kind: "agent",
+      role: "implementer",
+      objective: failed.objective,
+      repo_id: "repo-1",
+      acceptance_ids: ["AC-1"],
+      deliverables: ["src/repair.ts"],
+    });
+    store.transitionTask(replacement.task_id, "READY");
+    store.transitionTask(replacement.task_id, "RUNNING");
+    store.transitionTask(replacement.task_id, "SUCCEEDED");
+    store.supersedeTask({
+      supersessionId: "TS-delayed-evidence",
+      missionId: mission.mission_id,
+      failedTaskId: failed.task_id,
+      replacementTaskIds: [replacement.task_id],
+      repoId: "repo-1",
+      acceptanceIds: ["AC-1"],
+      coverageFingerprint: taskCoverageFingerprint(failed),
+      reason: "repair",
+      createdAt: new Date().toISOString(),
+    });
+    const identityHash = hashCandidateEvidenceIdentity(identity);
+    store.recordCandidate(mission.mission_id, identity, "delayed historical publication", oldValidation);
+    store.recordValidationEvidence({
+      evidenceId: "VE-delayed-history",
+      missionId: mission.mission_id,
+      taskId: oldValidation.taskId,
+      executionId: oldValidation.executionId,
+      identity,
+      identityHash,
+      command: "npm test",
+      profile: "default",
+      exitCode: 0,
+      testSummary: { passed: 1 },
+      noTargets: false,
+      accessible: true,
+      acceptanceResults: [{ acceptanceId: "AC-1", status: "passed", detail: "historical" }],
+      recordedAt: new Date(Date.now() + 60_000).toISOString(),
+    });
+    store.recordReviewEvidence({
+      evidenceId: "RE-delayed-history",
+      missionId: mission.mission_id,
+      taskId: oldReview.taskId,
+      executionId: oldReview.executionId,
+      identity,
+      identityHash,
+      reviewerSessionId: "delayed-review",
+      model: "model-a",
+      provider: "provider-a",
+      verdict: "approve",
+      independenceMode: "independent",
+      findings: [],
+      outputValid: true,
+      accessible: true,
+      acceptanceResults: [{ acceptanceId: "AC-1", status: "passed", detail: "historical" }],
+      recordedAt: new Date(Date.now() + 60_000).toISOString(),
+    });
+    const verdict = new CompletionGate(store).evaluate(store.getMission(mission.mission_id)!);
+    assert.equal(verdict.can_complete, false, JSON.stringify(verdict));
+    assert.match(verdict.reasons.join("; "), /supersession|replacement/i);
+  });
+
   it("rejects generic green evidence without explicit per-acceptance results", () => {
     const { store, mission } = currentEvidenceMission();
     const review = store.listReviewEvidence(mission.mission_id)[0]!;
+    const rerun = successfulEvidenceExecution(store, mission.mission_id, "review", "repo-1", "base-a");
     store.invalidateEvidence({
       invalidationId: "EI-self-attestation",
       missionId: mission.mission_id,
@@ -443,7 +642,13 @@ describe("revision-bound completion evidence", () => {
       reason: "replace explicit result",
       invalidatedAt: new Date().toISOString(),
     });
-    store.recordReviewEvidence({ ...review, evidenceId: "RE-generic", acceptanceResults: [] });
+    store.recordReviewEvidence({
+      ...review,
+      evidenceId: "RE-generic",
+      taskId: rerun.taskId,
+      executionId: rerun.executionId,
+      acceptanceResults: [],
+    });
     const verdict = new CompletionGate(store).evaluate(store.getMission(mission.mission_id)!);
     assert.equal(verdict.can_complete, false);
     assert.match(verdict.reasons.join("; "), /explicit current passing result/i);
@@ -510,7 +715,19 @@ describe("revision-bound completion evidence", () => {
         assert.throws(record, /generation/i);
         return;
       }
-      record();
+      const rerun = successfulEvidenceExecution(
+        store,
+        mission.mission_id,
+        "validation",
+        identity.repoId,
+        identity.baseSha,
+      );
+      store.recordCandidate(
+        mission.mission_id,
+        buildCandidateEvidenceIdentity({ ...identity, [field]: stale }),
+        "candidate change",
+        rerun,
+      );
       const verdict = new CompletionGate(store).evaluate(store.getMission(mission.mission_id)!);
       assert.equal(verdict.can_complete, false);
       assert.match(verdict.reasons.join("; "), /current validation evidence|current review evidence|acceptance/i);
@@ -561,6 +778,7 @@ describe("revision-bound completion evidence", () => {
   it("rejects no-target validation", () => {
     const { store, mission } = currentEvidenceMission();
     const evidence = store.listValidationEvidence(mission.mission_id)[0]!;
+    const rerun = successfulEvidenceExecution(store, mission.mission_id, "validation", "repo-1", "base-a");
     store.invalidateEvidence({
       invalidationId: "EI-old-validation",
       missionId: mission.mission_id,
@@ -568,7 +786,13 @@ describe("revision-bound completion evidence", () => {
       reason: "validation rerun",
       invalidatedAt: new Date().toISOString(),
     });
-    store.recordValidationEvidence({ ...evidence, evidenceId: "VE-no-target", noTargets: true });
+    store.recordValidationEvidence({
+      ...evidence,
+      evidenceId: "VE-no-target",
+      taskId: rerun.taskId,
+      executionId: rerun.executionId,
+      noTargets: true,
+    });
     const verdict = new CompletionGate(store).evaluate(store.getMission(mission.mission_id)!);
     assert.equal(verdict.can_complete, false);
     assert.match(verdict.reasons.join("; "), /no-target|validation/i);
@@ -686,6 +910,13 @@ describe("strict reviewer evidence", () => {
         return { store, mission };
       })();
       const review = fixture.store.listReviewEvidence(fixture.mission.mission_id)[0]!;
+      const rerun = successfulEvidenceExecution(
+        fixture.store,
+        fixture.mission.mission_id,
+        "review",
+        "repo-r",
+        "base-r",
+      );
       fixture.store.invalidateEvidence({
         invalidationId: `EI-${defect}`,
         missionId: fixture.mission.mission_id,
@@ -696,6 +927,8 @@ describe("strict reviewer evidence", () => {
       fixture.store.recordReviewEvidence({
         ...review,
         evidenceId: `RE-${defect}`,
+        taskId: rerun.taskId,
+        executionId: rerun.executionId,
         ...(defect === "malformed" ? { outputValid: false } : {}),
         ...(defect === "inaccessible" ? { accessible: false } : {}),
         ...(defect === "request_changes" ? { verdict: "request_changes" as const } : {}),

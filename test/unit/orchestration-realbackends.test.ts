@@ -279,6 +279,39 @@ describe("realBackends capability routing", () => {
     assert.equal(outcome.reviewEvidence?.provider, "");
   });
 
+  it("fails closed when any raw review finding is malformed instead of silently discarding it", async () => {
+    const worker: WorkerExecutor = {
+      async run() {
+        return {
+          result: { status: "completed", summary: "ok", details: {} },
+          structured: {
+            verdict: "approve",
+            findings: [{ severity: "critical" }],
+            missingTests: [],
+            specGaps: [],
+            acceptanceResults: [{ acceptanceId: "AC-1", status: "passed", detail: "claimed pass" }],
+          },
+          usage: { model: "reviewer" },
+        } as never;
+      },
+    };
+    const backends = realBackends({
+      worker,
+      verifier: {} as never,
+      artifacts: {} as never,
+      git: null,
+      cwd: "/repo",
+      reviewFallbackModel: { provider: "test", id: "reviewer" },
+    });
+    const outcome = await backends.review.runReview({
+      objective: "review",
+      acceptanceCriteria: [{ acceptanceId: "AC-1", criterion: "works" }],
+      signal: new AbortController().signal,
+    });
+    assert.equal(outcome.reviewEvidence?.outputValid, false);
+    assert.equal(outcome.reviewEvidence?.verdict, "approve");
+  });
+
   it("turns blocking missing tests and spec gaps into blocking review findings", async () => {
     const worker: WorkerExecutor = {
       async run() {
@@ -288,7 +321,9 @@ describe("realBackends capability routing", () => {
             verdict: "request_changes",
             findings: [],
             missingTests: [{ severity: "high", description: "no regression test" }],
-            specGaps: [{ severity: "critical", requirement: "must preserve data", detail: "not met" }],
+            specGaps: [
+              { severity: "critical", requirement: "must preserve data", status: "missing", detail: "not met" },
+            ],
             acceptanceResults: [{ acceptanceId: "AC-1", status: "failed", detail: "gap remains" }],
           },
           usage: { model: "reviewer" },

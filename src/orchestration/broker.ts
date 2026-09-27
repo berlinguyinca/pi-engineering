@@ -1183,6 +1183,7 @@ export class ExecutionBroker {
       base_sha: binding?.baseSha ?? this.store.getMission(input.missionId)?.base_ref,
       candidate_generation: task?.candidate_generation,
     });
+    this.store.assignTaskExecution(input.taskId, execution.execution_id);
 
     const abort = new AbortController();
     let resultPromise: Promise<ExecutionOutcome> | undefined;
@@ -1468,12 +1469,19 @@ export class ExecutionBroker {
               );
             }
             input.authority?.assertAuthoritative();
-            if (input.repoId && (backend === "integration" || input.mutatesRepo)) {
+            if (input.repoId && (backend === "integration" || backend === "validation" || input.mutatesRepo)) {
               this.store.invalidateRepositoryEvidence(
                 input.missionId,
                 input.repoId,
-                backend === "integration" ? "integration started" : "candidate-affecting execution started",
+                backend === "integration"
+                  ? "integration started"
+                  : backend === "validation"
+                    ? "validation attempt started"
+                    : "candidate-affecting execution started",
               );
+            }
+            if (input.repoId && backend === "review") {
+              this.store.invalidateRepositoryReviewEvidence(input.missionId, input.repoId, "review attempt started");
             }
             writerStarted = true;
             const backendSettlement: Promise<BackendSettlement> = this.dispatch(

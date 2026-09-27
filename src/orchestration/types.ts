@@ -467,6 +467,8 @@ export interface EvidenceInvalidation {
   identity: CandidateEvidenceIdentity;
   reason: string;
   invalidatedAt: string;
+  /** Omitted legacy records invalidate every evidence class for the identity. */
+  scope?: "all" | "validation" | "review";
 }
 
 export interface MissionLease {

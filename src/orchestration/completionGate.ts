@@ -9,6 +9,7 @@ export interface GateEvidence {
   securityReviewsCompleted: number;
   findings: Array<{ finding_id: string; severity: string; status: string }>;
   recoveredTasks: string[];
+  obsoleteGateAttempts?: string[];
   validationProblem?: string;
   reviewProblem?: string;
   acceptanceProblems?: string[];
@@ -33,7 +34,10 @@ export class CompletionGate {
       ["READY", "RUNNING", "RETRYING", "WAITING", "PENDING"].includes(task.status),
     );
     const superseded = new Set(evidence.recoveredTasks);
-    const failed = tasks.filter((task) => task.status === "FAILED" && !superseded.has(task.task_id));
+    const obsoleteGateAttempts = new Set(evidence.obsoleteGateAttempts ?? []);
+    const failed = tasks.filter(
+      (task) => task.status === "FAILED" && !superseded.has(task.task_id) && !obsoleteGateAttempts.has(task.task_id),
+    );
 
     for (const gate of mission.required_gates) {
       const validationGate =
@@ -107,12 +111,17 @@ export class CompletionGate {
           repository.repoId === candidate.identity.repoId && repository.baseSha === candidate.identity.baseSha,
       );
     const invalidations = this.store.listEvidenceInvalidations(missionId);
-    const invalidated = (identityHash: string, recordedAt: string): boolean =>
+    const invalidated = (identityHash: string, recordedAt: string, evidenceKind: "validation" | "review"): boolean =>
       invalidations.some(
         (entry) =>
           hashCandidateEvidenceIdentity(entry.identity) === identityHash &&
+          (entry.scope === undefined || entry.scope === "all" || entry.scope === evidenceKind) &&
           Date.parse(entry.invalidatedAt) >= Date.parse(recordedAt),
       );
+    const tasks = this.store.listTasks(missionId);
+    const repoGateTasks = candidate ? tasks.filter((task) => task.repo_id === candidate.identity.repoId) : [];
+    const latestValidationTask = repoGateTasks.filter((task) => task.kind === "validation").at(-1);
+    const latestReviewTask = repoGateTasks.filter((task) => task.kind === "review").at(-1);
     const currentValidation =
       candidateCurrent && candidate
         ? this.store
@@ -122,7 +131,13 @@ export class CompletionGate {
                 entry.identityHash === candidate.identityHash &&
                 evidenceIdentitiesEqual(entry.identity, candidate.identity),
             )
-            .filter((entry) => !invalidated(entry.identityHash, entry.recordedAt))
+            .filter((entry) => !invalidated(entry.identityHash, entry.recordedAt, "validation"))
+            .filter(
+              (entry) =>
+                latestValidationTask?.status === "SUCCEEDED" &&
+                latestValidationTask.task_id === entry.taskId &&
+                latestValidationTask.assigned_execution_id === entry.executionId,
+            )
             .at(-1)
         : undefined;
     const currentReview =
@@ -134,7 +149,13 @@ export class CompletionGate {
                 entry.identityHash === candidate.identityHash &&
                 evidenceIdentitiesEqual(entry.identity, candidate.identity),
             )
-            .filter((entry) => !invalidated(entry.identityHash, entry.recordedAt))
+            .filter((entry) => !invalidated(entry.identityHash, entry.recordedAt, "review"))
+            .filter(
+              (entry) =>
+                latestReviewTask?.status === "SUCCEEDED" &&
+                latestReviewTask.task_id === entry.taskId &&
+                latestReviewTask.assigned_execution_id === entry.executionId,
+            )
             .at(-1)
         : undefined;
 
@@ -167,13 +188,31 @@ export class CompletionGate {
       return [];
     });
 
-    const tasks = this.store.listTasks(missionId);
     const validSuperseded = new Set<string>();
+    const obsoleteGateAttempts = new Set<string>();
+    if (validationOk && latestValidationTask) {
+      for (const task of repoGateTasks) {
+        if (task.kind === "validation" && task.status === "FAILED" && task.task_id !== latestValidationTask.task_id)
+          obsoleteGateAttempts.add(task.task_id);
+      }
+    }
+    if (reviewOk && latestReviewTask) {
+      for (const task of repoGateTasks) {
+        if (task.kind === "review" && task.status === "FAILED" && task.task_id !== latestReviewTask.task_id)
+          obsoleteGateAttempts.add(task.task_id);
+      }
+    }
     const supersessionProblems: string[] = [];
     for (const lineage of this.store.listTaskSupersessions(missionId)) {
       const failed = tasks.find((task) => task.task_id === lineage.failedTaskId);
       const replacements = lineage.replacementTaskIds.map((taskId) => tasks.find((task) => task.task_id === taskId));
       const coverage = new Set(replacements.flatMap((task) => task?.acceptance_ids ?? []));
+      const evidenceExecutions =
+        candidate && currentValidation && currentReview
+          ? [candidate.executionId, currentValidation.executionId, currentReview.executionId].map((executionId) =>
+              this.store.getExecution(executionId),
+            )
+          : [];
       const valid =
         failed?.status === "FAILED" &&
         failed.repo_id === lineage.repoId &&
@@ -187,8 +226,13 @@ export class CompletionGate {
         ) &&
         !!candidate &&
         !!currentReview &&
+        evidenceExecutions.length === 3 &&
         replacements.every(
-          (task) => !!task?.completed_at && Date.parse(currentReview.recordedAt) > Date.parse(task.completed_at),
+          (task) =>
+            !!task?.completed_at &&
+            evidenceExecutions.every(
+              (execution) => !!execution?.ended_at && Date.parse(execution.ended_at) > Date.parse(task.completed_at!),
+            ),
         ) &&
         lineage.acceptanceIds.every((acceptanceId) => coverage.has(acceptanceId));
       if (valid) validSuperseded.add(lineage.failedTaskId);
@@ -196,20 +240,6 @@ export class CompletionGate {
         supersessionProblems.push(
           `invalid supersession lineage for ${lineage.failedTaskId}: replacement coverage is not successful`,
         );
-    }
-    if (validationOk && currentValidation) {
-      for (const task of tasks) {
-        if (task.kind === "validation" && task.status === "FAILED" && task.task_id !== currentValidation.taskId) {
-          validSuperseded.add(task.task_id);
-        }
-      }
-    }
-    if (reviewOk && currentReview) {
-      for (const task of tasks) {
-        if (task.kind === "review" && task.status === "FAILED" && task.task_id !== currentReview.taskId) {
-          validSuperseded.add(task.task_id);
-        }
-      }
     }
     if (validationOk && reviewOk && currentReview) {
       const executions = this.store.listExecutions(missionId);
@@ -297,6 +327,7 @@ export class CompletionGate {
           : 0,
       findings: [...storedFindings, ...reviewFindings],
       recoveredTasks: [...validSuperseded],
+      obsoleteGateAttempts: [...obsoleteGateAttempts],
       validationProblem,
       reviewProblem,
       acceptanceProblems: [

@@ -224,6 +224,7 @@ export class MissionStore {
   private readonly candidates = new Map<string, CandidateRevision>();
   private readonly validationEvidence = new Map<string, ValidationEvidence>();
   private readonly reviewEvidence = new Map<string, ReviewEvidence>();
+  private readonly candidateExecutionIds = new Set<string>();
   private readonly evidenceReplayErrors = new Map<string, string[]>();
   private readonly missionLeases = new Map<string, MissionLease>();
   private readonly repositoryLeases = new Map<string, RepositoryLease>();
@@ -410,6 +411,9 @@ export class MissionStore {
         if (task) {
           task.mission_generation = e.payload.mission_generation as number;
           task.fencing_token = e.payload.fencing_token as number;
+          if (e.payload.assigned_execution_id !== undefined) {
+            task.assigned_execution_id = e.payload.assigned_execution_id as string;
+          }
         }
         break;
       }
@@ -510,10 +514,12 @@ export class MissionStore {
               candidate.identityHash,
             );
             this.assertCandidateProvenance(candidate.missionId, identity, candidate.taskId, candidate.executionId);
+            this.assertUnusedCandidateExecution(candidate.executionId);
             this.candidates.set(
               candidateKey(candidate.missionId, identity.repoId),
               copyCandidateRevision({ ...candidate, identity }),
             );
+            this.candidateExecutionIds.add(candidate.executionId);
           } catch (error) {
             this.quarantineEvidence(candidate.missionId, error);
           }
@@ -525,6 +531,7 @@ export class MissionStore {
         if (evidence) {
           try {
             this.assertValidationEvidence(evidence);
+            this.assertUnusedEvidenceExecution(evidence.executionId, this.validationEvidence.values());
             this.validationEvidence.set(evidence.evidenceId, copyValidationEvidence(evidence));
           } catch (error) {
             this.quarantineEvidence(evidence.missionId, error);
@@ -537,6 +544,7 @@ export class MissionStore {
         if (evidence) {
           try {
             this.assertReviewEvidence(evidence);
+            this.assertUnusedEvidenceExecution(evidence.executionId, this.reviewEvidence.values());
             this.reviewEvidence.set(evidence.evidenceId, copyReviewEvidence(evidence));
           } catch (error) {
             this.quarantineEvidence(evidence.missionId, error);
@@ -823,6 +831,27 @@ export class MissionStore {
       task_id: taskId,
       mission_generation: lease.generation,
       fencing_token: lease.fencingToken,
+    });
+    return copyTask(task);
+  }
+
+  assignTaskExecution(taskId: string, executionId: string): OrchestrationTask {
+    const task = this.tasks.get(taskId);
+    const execution = this.executions.get(executionId);
+    if (!task || !execution || execution.task_id !== taskId || execution.mission_id !== task.mission_id)
+      throw new Error(`execution ${executionId} does not belong to task ${taskId}`);
+    if (task.assigned_execution_id && task.assigned_execution_id !== executionId) {
+      const assigned = this.executions.get(task.assigned_execution_id);
+      if (assigned && !["SUCCEEDED", "FAILED", "CANCELED"].includes(assigned.status))
+        throw new Error(`task ${taskId} already has an active assigned execution`);
+    }
+    task.assigned_execution_id = executionId;
+    this.emit("task.authority_assigned", task.mission_id, {
+      actor: "system",
+      task_id: taskId,
+      mission_generation: task.mission_generation,
+      fencing_token: task.fencing_token,
+      assigned_execution_id: executionId,
     });
     return copyTask(task);
   }
@@ -1362,6 +1391,7 @@ export class MissionStore {
     const identity = this.assertCandidateIdentity(missionId, rawIdentity, hashCandidateEvidenceIdentity(rawIdentity));
     const identityHash = hashCandidateEvidenceIdentity(identity);
     this.assertCandidateProvenance(missionId, identity, provenance.taskId, provenance.executionId);
+    this.assertUnusedCandidateExecution(provenance.executionId);
     const key = candidateKey(missionId, identity.repoId);
     const prior = this.candidates.get(key);
     if (prior && prior.identityHash !== identityHash) this.invalidateCandidate(prior, reason);
@@ -1375,6 +1405,7 @@ export class MissionStore {
       recordedAt: new Date().toISOString(),
     };
     this.candidates.set(key, candidate);
+    this.candidateExecutionIds.add(candidate.executionId);
     this.emit("candidate.changed", missionId, { actor: "system", candidate });
     return copyCandidateRevision(candidate);
   }
@@ -1399,6 +1430,7 @@ export class MissionStore {
 
   recordValidationEvidence(raw: ValidationEvidence): ValidationEvidence {
     this.assertValidationEvidence(raw);
+    this.assertUnusedEvidenceExecution(raw.executionId, this.validationEvidence.values());
     const evidence = copyValidationEvidence({ ...raw, recordedAt: this.freshEvidenceTimestamp(raw) });
     this.validationEvidence.set(evidence.evidenceId, evidence);
     this.emit("evidence.validation_recorded", evidence.missionId, { actor: "system", evidence });
@@ -1413,6 +1445,7 @@ export class MissionStore {
 
   recordReviewEvidence(raw: ReviewEvidence): ReviewEvidence {
     this.assertReviewEvidence(raw);
+    this.assertUnusedEvidenceExecution(raw.executionId, this.reviewEvidence.values());
     const evidence = copyReviewEvidence({ ...raw, recordedAt: this.freshEvidenceTimestamp(raw) });
     this.reviewEvidence.set(evidence.evidenceId, evidence);
     this.emit("evidence.review_recorded", evidence.missionId, { actor: "system", evidence });
@@ -1450,8 +1483,8 @@ export class MissionStore {
     this.assertEvidenceRecord(raw.missionId, raw.identity, raw.identityHash);
     const task = this.tasks.get(raw.taskId);
     const execution = this.executions.get(raw.executionId);
-    if (!task || !execution || execution.status !== "SUCCEEDED" || execution.backend !== backend)
-      throw new Error("evidence execution is not a successful authoritative execution");
+    if (!task || !execution) throw new Error("evidence execution is not a successful authoritative execution");
+    this.assertSettledExecutionIdentity(task, execution, raw.identity, backend);
     if (
       task.mission_id !== raw.missionId ||
       execution.mission_id !== raw.missionId ||
@@ -1464,11 +1497,6 @@ export class MissionStore {
       execution.base_sha !== raw.identity.baseSha
     )
       throw new Error("evidence provenance repository mismatch");
-    if (
-      (execution.mission_generation ?? 0) !== raw.identity.missionGeneration ||
-      execution.fencing_token !== task.fencing_token
-    )
-      throw new Error("evidence provenance generation/fence mismatch");
   }
 
   private assertCandidateProvenance(
@@ -1479,8 +1507,8 @@ export class MissionStore {
   ): void {
     const task = taskId ? this.tasks.get(taskId) : undefined;
     const execution = executionId ? this.executions.get(executionId) : undefined;
-    if (!task || !execution || execution.status !== "SUCCEEDED")
-      throw new Error("candidate requires a successful authoritative execution");
+    if (!task || !execution) throw new Error("candidate requires a successful authoritative execution");
+    this.assertSettledExecutionIdentity(task, execution, identity);
     if (task.mission_id !== missionId || execution.mission_id !== missionId || execution.task_id !== task.task_id)
       throw new Error("candidate provenance mission/task mismatch");
     if (
@@ -1489,11 +1517,42 @@ export class MissionStore {
       execution.base_sha !== identity.baseSha
     )
       throw new Error("candidate provenance repository mismatch");
+  }
+
+  private assertSettledExecutionIdentity(
+    task: OrchestrationTask,
+    execution: Execution,
+    identity: CandidateEvidenceIdentity,
+    backend?: "validation" | "review",
+  ): void {
     if (
-      (execution.mission_generation ?? 0) !== identity.missionGeneration ||
-      execution.fencing_token !== task.fencing_token
+      execution.status !== "SUCCEEDED" ||
+      !execution.ended_at ||
+      !Number.isFinite(Date.parse(execution.ended_at)) ||
+      (backend !== undefined && execution.backend !== backend)
     )
-      throw new Error("candidate provenance generation/fence mismatch");
+      throw new Error("evidence execution is not a successful authoritative execution");
+    const mismatches = [
+      task.mission_generation !== identity.missionGeneration ? "mission generation" : null,
+      execution.mission_generation !== identity.missionGeneration ? "execution mission generation" : null,
+      task.candidate_generation !== execution.candidate_generation ? "candidate generation" : null,
+      task.fencing_token !== execution.fencing_token ? "fencing token" : null,
+      task.assigned_execution_id !== execution.execution_id ? "assigned execution" : null,
+    ].filter((value): value is string => value !== null);
+    if (mismatches.length > 0) throw new Error(`evidence execution is not authoritative: ${mismatches.join(", ")}`);
+  }
+
+  private assertUnusedCandidateExecution(executionId: string): void {
+    if (this.candidateExecutionIds.has(executionId))
+      throw new Error(`historical execution ${executionId} already recorded candidate evidence`);
+  }
+
+  private assertUnusedEvidenceExecution<T extends { executionId: string }>(
+    executionId: string,
+    existing: IterableIterator<T>,
+  ): void {
+    if ([...existing].some((evidence) => evidence.executionId === executionId))
+      throw new Error(`historical execution ${executionId} already recorded evidence`);
   }
 
   private assertValidationEvidence(raw: ValidationEvidence): void {
@@ -1536,6 +1595,19 @@ export class MissionStore {
     if (current) this.invalidateCandidate(current, reason);
   }
 
+  invalidateRepositoryReviewEvidence(missionId: string, repoId: string, reason: string): void {
+    const current = this.candidates.get(candidateKey(missionId, repoId));
+    if (!current) return;
+    this.invalidateEvidence({
+      invalidationId: id("EI"),
+      missionId,
+      identity: current.identity,
+      reason,
+      invalidatedAt: new Date().toISOString(),
+      scope: "review",
+    });
+  }
+
   private invalidateCandidate(current: CandidateRevision, reason: string): void {
     this.invalidateEvidence({
       invalidationId: id("EI"),
@@ -1543,6 +1615,7 @@ export class MissionStore {
       identity: current.identity,
       reason,
       invalidatedAt: new Date().toISOString(),
+      scope: "all",
     });
   }
 
