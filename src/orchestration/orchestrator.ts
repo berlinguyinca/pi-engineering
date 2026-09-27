@@ -767,7 +767,7 @@ export class Orchestrator {
             this.store.transitionMission(mission.mission_id, "CANCELED");
           }
         }
-        await this.broker.cleanupMission(mission.mission_id);
+        await this.cleanupCanceledMission(mission.mission_id);
         const canceled = this.store.getMission(mission.mission_id)!;
         this.report(mission.mission_id, `[mission ${mission.mission_id}] canceled by caller`);
         return {
@@ -996,7 +996,8 @@ export class Orchestrator {
     // attempts are current and green, under a fresh repository fencing check.
     // Failed/red/canceled candidates remain mounted/ref-addressable for diagnosis.
     let cleanupComplete = false;
-    if (verdict.can_complete && integrated && this.broker.candidateWorktree(missionId)) {
+    const hasCandidateForPromotion = await this.broker.hasCandidateForPromotion(missionId);
+    if (verdict.can_complete && integrated && hasCandidateForPromotion) {
       const integrationTask = this.store
         .listTasks(missionId)
         .filter((task) => task.kind === "integration" && task.repo_id)
@@ -1578,6 +1579,38 @@ export class Orchestrator {
     };
   }
 
+  /** Clean canceled mission work only while holding fresh repository authority. */
+  private async cleanupCanceledMission(missionId: string): Promise<void> {
+    const cleanupTask = this.store
+      .listTasks(missionId)
+      .filter((task) => task.repo_id && task.mutates_repo)
+      .at(-1);
+    if (!cleanupTask || !this.ownership) {
+      await this.broker.cleanupMission(missionId, { keepBranches: true });
+      return;
+    }
+    try {
+      const authority = await this.acquireTaskAuthority(cleanupTask);
+      try {
+        await this.broker.cleanupMission(missionId, { keepBranches: true, authority });
+      } finally {
+        await authority.close();
+      }
+    } catch (error) {
+      this.store.addFinding({
+        mission_id: missionId,
+        task_id: cleanupTask.task_id,
+        severity: "major",
+        category: "integration",
+        file: null,
+        line: null,
+        summary: `Cancellation cleanup could not acquire or retain repository authority; diagnostics preserved: ${error instanceof Error ? error.message : String(error)}`,
+        evidence: null,
+        recommended_action: "Reacquire repository authority before retrying cleanup.",
+      });
+    }
+  }
+
   /** Settle a caller-aborted mission without allowing later gate work to run. */
   private async cancelMission(missionId: string): Promise<Mission> {
     let mission = this.store.getMission(missionId)!;
@@ -1588,7 +1621,7 @@ export class Orchestrator {
     if (canTransitionMission(mission.status, "CANCELED")) {
       mission = this.store.transitionMission(missionId, "CANCELED");
     }
-    await this.broker.cleanupMission(missionId);
+    await this.cleanupCanceledMission(missionId);
     this.report(missionId, `[mission ${missionId}] canceled by caller`);
     return mission;
   }

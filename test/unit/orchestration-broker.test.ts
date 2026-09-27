@@ -1379,11 +1379,37 @@ describe("ExecutionBroker (spec 03)", () => {
         hash: "manifest-restart-candidate",
         createdAt: new Date().toISOString(),
       });
+      const integrationTask = store.createTask({
+        mission_id: mission.mission_id,
+        kind: "integration",
+        role: "integrator",
+        objective: "integrate candidate before restart",
+        repo_id: "repo-restart-candidate",
+        mission_generation: 0,
+        candidate_generation: 0,
+      });
+      store.transitionTask(integrationTask.task_id, "READY");
+      store.transitionTask(integrationTask.task_id, "RUNNING");
+      const integrationExecution = store.createExecution({
+        task_id: integrationTask.task_id,
+        mission_id: mission.mission_id,
+        backend: "integration",
+        repo_id: "repo-restart-candidate",
+        base_sha: base,
+        mission_generation: 0,
+        candidate_generation: 0,
+      });
+      store.assignTaskExecution(integrationTask.task_id, integrationExecution.execution_id);
+      store.setExecutionStatus(integrationExecution.execution_id, "RUNNING");
+      store.setExecutionStatus(integrationExecution.execution_id, "SUCCEEDED");
+      store.transitionTask(integrationTask.task_id, "SUCCEEDED");
       const candidate = await git.createCandidateWorktree(base, {
         missionId: mission.mission_id,
         repoId: "repo-restart-candidate",
-        generation: 3,
-        attempt: "EX-restart-candidate",
+        missionGeneration: 0,
+        candidateGeneration: 0,
+        repositoryGeneration: 3,
+        attempt: integrationExecution.execution_id,
       });
       await writeFile(join(candidate.path, "src", "restart-candidate.ts"), "export const candidate = true;\n");
       await git.commitAll(candidate.path, "candidate before restart");
@@ -1391,6 +1417,14 @@ describe("ExecutionBroker (spec 03)", () => {
       candidate.updatedAt = new Date().toISOString();
       await git.persistCandidateLifecycle(candidate);
       await git.removeWorktree(candidate, { keepBranch: true });
+      const wrongGeneration = await git.createCandidateWorktree(base, {
+        missionId: mission.mission_id,
+        repoId: "repo-restart-candidate",
+        missionGeneration: 99,
+        candidateGeneration: 99,
+        repositoryGeneration: 99,
+        attempt: "EX-wrong-generation",
+      });
 
       const task = store.createTask({
         mission_id: mission.mission_id,
@@ -1433,6 +1467,213 @@ describe("ExecutionBroker (spec 03)", () => {
       assert.equal(validatedPath, candidate.path);
       assert.equal(await git.headCommit(), base, "reconciliation must not inspect or mutate incumbent HEAD");
       await git.removeWorktree(candidate, { keepBranch: true }).catch(() => {});
+      await git.removeWorktree(wrongGeneration, { keepBranch: true }).catch(() => {});
+    } finally {
+      await fx.cleanup();
+    }
+  });
+
+  it("reconciles committed promotion after candidate cleanup and broker restart before mission completion", async () => {
+    const fx = await makeFixtureRepo();
+    try {
+      const git = (await GitRepo.open(fx.root))!;
+      const store = MissionStore.open(JsonlEventStore.inMemory());
+      const base = await git.headCommit();
+      const mission = store.createMission({
+        title: "promotion restart",
+        goal: "promotion restart",
+        user_request: "promotion restart",
+        repository: fx.root,
+        base_ref: base,
+        risk_profile: "medium",
+        workflow_class: "engineering_review",
+      });
+      store.bindWorkspaceManifest({
+        manifestId: "WM-promotion-restart",
+        missionId: mission.mission_id,
+        generation: 1,
+        authorizedRoots: [{ canonicalPath: fx.root, source: "existing_manifest", access: "write" }],
+        repositories: [
+          {
+            repoId: "repo-promotion-restart",
+            canonicalRoot: fx.root,
+            baseRef: "main",
+            baseSha: base,
+            writableDomains: ["**"],
+          },
+        ],
+        dependencyEdges: [],
+        hash: "manifest-promotion-restart",
+        createdAt: new Date().toISOString(),
+      });
+      const integrationTask = store.createTask({
+        mission_id: mission.mission_id,
+        kind: "integration",
+        role: "integrator",
+        objective: "integrate",
+        repo_id: "repo-promotion-restart",
+        mission_generation: 0,
+        candidate_generation: 0,
+      });
+      store.transitionTask(integrationTask.task_id, "READY");
+      store.transitionTask(integrationTask.task_id, "RUNNING");
+      const execution = store.createExecution({
+        task_id: integrationTask.task_id,
+        mission_id: mission.mission_id,
+        backend: "integration",
+        repo_id: "repo-promotion-restart",
+        base_sha: base,
+        mission_generation: 0,
+        candidate_generation: 0,
+      });
+      store.assignTaskExecution(integrationTask.task_id, execution.execution_id);
+      store.setExecutionStatus(execution.execution_id, "RUNNING");
+      store.setExecutionStatus(execution.execution_id, "SUCCEEDED");
+      store.transitionTask(integrationTask.task_id, "SUCCEEDED");
+      const candidate = await git.createCandidateWorktree(base, {
+        missionId: mission.mission_id,
+        repoId: "repo-promotion-restart",
+        missionGeneration: 0,
+        candidateGeneration: 0,
+        repositoryGeneration: 1,
+        attempt: execution.execution_id,
+      });
+      await writeFile(join(candidate.path, "src", "promotion-restart.ts"), "export const recovered = true;\n");
+      await git.commitAll(candidate.path, "promotion restart candidate");
+      candidate.candidateSha = await git.headCommitIn(candidate.path);
+      await git.persistCandidateLifecycle(candidate);
+      await assert.rejects(
+        git.promoteCandidate(candidate, base, undefined, candidate, {
+          afterCompletion: () => {
+            throw new Error("crash after promotion completion");
+          },
+        }),
+        /crash after promotion completion/,
+      );
+      await git.removeWorktree(candidate, { keepBranch: true });
+
+      const restarted = new ExecutionBroker({
+        store,
+        resolveRepository: async () => ({ repoId: "repo-promotion-restart", root: fx.root, git }),
+        backends: {},
+      });
+
+      assert.equal(await restarted.promoteCandidate(mission.mission_id), true);
+      assert.equal(await git.headCommit(), candidate.candidateSha);
+    } finally {
+      await fx.cleanup();
+    }
+  });
+
+  it("records stale cancellation preservation failure and retains the candidate diagnostics", async () => {
+    const fx = await makeFixtureRepo();
+    try {
+      const git = (await GitRepo.open(fx.root))!;
+      const store = MissionStore.open(JsonlEventStore.inMemory());
+      const base = await git.headCommit();
+      const mission = store.createMission({
+        title: "stale cancel",
+        goal: "stale cancel",
+        user_request: "stale cancel",
+        repository: fx.root,
+        base_ref: base,
+        risk_profile: "medium",
+        workflow_class: "engineering_review",
+      });
+      store.bindWorkspaceManifest({
+        manifestId: "WM-stale-cancel",
+        missionId: mission.mission_id,
+        generation: 1,
+        authorizedRoots: [{ canonicalPath: fx.root, source: "existing_manifest", access: "write" }],
+        repositories: [
+          {
+            repoId: "repo-stale-cancel",
+            canonicalRoot: fx.root,
+            baseRef: "main",
+            baseSha: base,
+            writableDomains: ["**"],
+          },
+        ],
+        dependencyEdges: [],
+        hash: "manifest-stale-cancel",
+        createdAt: new Date().toISOString(),
+      });
+      const task = store.createTask({
+        mission_id: mission.mission_id,
+        kind: "integration",
+        role: "integrator",
+        objective: "integrate until canceled",
+        repo_id: "repo-stale-cancel",
+        mission_generation: 5,
+        candidate_generation: 2,
+      });
+      let started!: () => void;
+      const running = new Promise<void>((resolve) => {
+        started = resolve;
+      });
+      let stale = false;
+      const authority = {
+        missionIdentity: {
+          missionId: mission.mission_id,
+          generation: 5,
+          ownerId: "owner-stale-cancel",
+          acquiredAt: new Date().toISOString(),
+          renewBy: new Date(Date.now() + 60_000).toISOString(),
+          fencingToken: 5,
+        },
+        repositoryIdentity: {
+          missionId: mission.mission_id,
+          repoId: "repo-stale-cancel",
+          generation: 9,
+          ownerId: "owner-stale-cancel",
+          acquiredAt: new Date().toISOString(),
+          renewBy: new Date(Date.now() + 60_000).toISOString(),
+          fencingToken: 9,
+        },
+        assertAuthoritative: () => {
+          if (stale) throw new Error("stale repository authority");
+        },
+        onInvalidated: () => {},
+        close: async () => undefined,
+      };
+      store.assignTaskAuthority(task.task_id, authority.missionIdentity);
+      const broker = new ExecutionBroker({
+        store,
+        resolveRepository: async () => ({ repoId: "repo-stale-cancel", root: fx.root, git }),
+        backends: {
+          integration: {
+            candidateScoped: true,
+            runIntegration: async ({ signal }) => {
+              await new Promise<void>((resolve) => {
+                if (signal.aborted) resolve();
+                else signal.addEventListener("abort", () => resolve(), { once: true });
+                started();
+              });
+              return { executionId: "late", exitStatus: "succeeded", summary: "late", artifactRefs: [], usage: {} };
+            },
+          },
+        },
+      });
+      const handle = await broker.execute({
+        taskId: task.task_id,
+        missionId: mission.mission_id,
+        repoId: "repo-stale-cancel",
+        kind: "integration",
+        objective: task.objective,
+        authority,
+      });
+      const result = handle.result();
+      await running;
+      stale = true;
+      await handle.cancel();
+      await result;
+
+      assert.ok(broker.candidateWorktree(mission.mission_id), "stale cancellation must retain candidate checkout");
+      assert.ok(
+        store
+          .listFindings(mission.mission_id)
+          .some((finding) => finding.summary.includes("Candidate preservation failed during cancellation")),
+      );
     } finally {
       await fx.cleanup();
     }

@@ -227,6 +227,7 @@ export interface IntegrationRunner {
     objective: string;
     handoffs: IntegrationHandoff[];
     candidate?: WorktreeInfo;
+    candidateLifecycle?: CandidateLifecycle;
     authority?: DispatchAuthority;
     signal: AbortSignal;
   }): Promise<ExecutionOutcome>;
@@ -657,11 +658,37 @@ export class ExecutionBroker {
         this.retainWorktree(entry.missionId, executionId);
       }
       const outcome = this.terminalizeExecution(executionId, reason, taskId);
-      await this.preserveCandidate(entry.missionId).catch(() => undefined);
+      try {
+        await this.preserveCandidate(entry.missionId, entry.authority);
+      } catch (error) {
+        this.retainMissionWorktrees(entry.missionId);
+        this.store.addFinding({
+          mission_id: entry.missionId,
+          task_id: taskId,
+          severity: "major",
+          category: "integration",
+          file: null,
+          line: null,
+          summary: `Candidate preservation failed during cancellation; diagnostics retained: ${error instanceof Error ? error.message : String(error)}`,
+          evidence: null,
+          recommended_action: "Reacquire repository authority before cleanup or candidate lifecycle reconciliation.",
+        });
+      }
       if (reason === "canceled" && checkpointSettled && entry.worktree) {
-        void this.releaseWorktree(executionId, true, entry.authority).catch(() =>
-          this.retainWorktree(entry.missionId, executionId),
-        );
+        await this.releaseWorktree(executionId, true, entry.authority).catch((error) => {
+          this.retainWorktree(entry.missionId, executionId);
+          this.store.addFinding({
+            mission_id: entry.missionId,
+            task_id: taskId,
+            severity: "major",
+            category: "integration",
+            file: null,
+            line: null,
+            summary: `Canceled worktree cleanup failed; worktree retained: ${error instanceof Error ? error.message : String(error)}`,
+            evidence: null,
+            recommended_action: "Reacquire repository authority before retrying cleanup.",
+          });
+        });
       }
       return outcome;
     })();
@@ -975,9 +1002,22 @@ export class ExecutionBroker {
       // Keep the branch: it carries the harvested work until integration merges it.
       try {
         await wt.git.removeWorktree({ path: wt.path, branch: wt.branch }, { keepBranch }, authority);
-      } catch {
+      } catch (error) {
         const missionId = this.store.getExecution(executionId)?.mission_id;
-        if (missionId) this.retainWorktree(missionId, executionId);
+        if (missionId) {
+          this.retainWorktree(missionId, executionId);
+          this.store.addFinding({
+            mission_id: missionId,
+            task_id: this.store.getExecution(executionId)?.task_id ?? null,
+            severity: "major",
+            category: "integration",
+            file: null,
+            line: null,
+            summary: `Worktree cleanup failed; diagnostics retained: ${error instanceof Error ? error.message : String(error)}`,
+            evidence: null,
+            recommended_action: "Reacquire repository authority before retrying cleanup.",
+          });
+        }
         return;
       }
     }
@@ -1168,6 +1208,30 @@ export class ExecutionBroker {
     return candidate ? { path: candidate.path, branch: candidate.branch } : undefined;
   }
 
+  async hasCandidateForPromotion(missionId: string): Promise<boolean> {
+    if (this.missionCandidates.has(missionId)) return true;
+    if (!this.resolveRepository) return false;
+    const integrationTask = this.store
+      .listTasks(missionId)
+      .filter((task) => task.kind === "integration" && task.repo_id && task.status === "SUCCEEDED")
+      .at(-1);
+    if (!integrationTask?.repo_id || !integrationTask.assigned_execution_id) return false;
+    const repository = await this.resolveRepository(integrationTask.repo_id, integrationTask.write_domains);
+    const boundBase =
+      this.store
+        .getWorkspaceManifest(missionId)
+        ?.repositories.find((binding) => binding.repoId === integrationTask.repo_id)?.baseSha ??
+      this.store.getMission(missionId)?.base_ref;
+    return (await repository.git.loadCandidateLifecycles(missionId, integrationTask.repo_id)).some(
+      (record) =>
+        record.missionGeneration === (integrationTask.mission_generation ?? 0) &&
+        record.candidateGeneration === (integrationTask.candidate_generation ?? 0) &&
+        record.attempt === integrationTask.assigned_execution_id &&
+        record.baseSha === boundBase &&
+        ["integrating", "promotion_intent", "promoted"].includes(record.state),
+    );
+  }
+
   private async preserveCandidate(missionId: string, authority?: DispatchAuthority): Promise<void> {
     const candidate = this.missionCandidates.get(missionId);
     if (!candidate || candidate.lifecycle.state === "promoted") return;
@@ -1177,7 +1241,49 @@ export class ExecutionBroker {
 
   /** Sole incumbent mutation: called only after current candidate gates pass. */
   async promoteCandidate(missionId: string, authority?: DispatchAuthority): Promise<boolean> {
-    const candidate = this.missionCandidates.get(missionId);
+    let candidate = this.missionCandidates.get(missionId);
+    if (!candidate && this.resolveRepository) {
+      authority?.assertAuthoritative();
+      const missionGeneration = authority?.missionIdentity.generation;
+      const integrationTask = this.store
+        .listTasks(missionId)
+        .filter(
+          (task) =>
+            task.kind === "integration" &&
+            task.repo_id &&
+            task.status === "SUCCEEDED" &&
+            (missionGeneration === undefined || task.mission_generation === missionGeneration),
+        )
+        .at(-1);
+      const attempt = integrationTask?.assigned_execution_id;
+      if (integrationTask?.repo_id && attempt) {
+        const repository = await this.resolveRepository(integrationTask.repo_id, integrationTask.write_domains);
+        const boundBase =
+          this.store
+            .getWorkspaceManifest(missionId)
+            ?.repositories.find((binding) => binding.repoId === integrationTask.repo_id)?.baseSha ??
+          this.store.getMission(missionId)?.base_ref;
+        const lifecycle = (await repository.git.loadCandidateLifecycles(missionId, integrationTask.repo_id)).find(
+          (record) =>
+            record.missionGeneration === (integrationTask.mission_generation ?? 0) &&
+            record.candidateGeneration === (integrationTask.candidate_generation ?? 0) &&
+            record.attempt === attempt &&
+            record.baseSha === boundBase,
+        );
+        if (lifecycle?.state === "promotion_intent" || lifecycle?.state === "promoted") {
+          const recovered = await repository.git.reconcilePromotion(lifecycle, authority);
+          if (!recovered.promoted) throw new Error(recovered.reason ?? "candidate promotion recovery failed");
+          return true;
+        }
+        if (lifecycle?.state === "integrating") {
+          const reconciled = await repository.git.reconcileCandidateWorktree(lifecycle, authority);
+          if (reconciled) {
+            candidate = { lifecycle, git: repository.git };
+            this.missionCandidates.set(missionId, candidate);
+          }
+        }
+      }
+    }
     if (!candidate) return false;
     authority?.assertAuthoritative();
     const worktree = { path: candidate.lifecycle.path, branch: candidate.lifecycle.branch };
@@ -1842,11 +1948,44 @@ export class ExecutionBroker {
         (backend === "validation" && this.backends.validation?.candidateScoped === true) ||
         (backend === "review" && this.backends.review?.candidateScoped === true))
     ) {
+      input.authority?.assertAuthoritative();
+      const task = this.store.getTask(input.taskId);
+      const missionGeneration = input.authority?.missionIdentity.generation ?? task?.mission_generation ?? 0;
+      const candidateGeneration = task?.candidate_generation ?? 0;
+      const boundBase =
+        this.store
+          .getWorkspaceManifest(input.missionId)
+          ?.repositories.find((binding) => binding.repoId === input.repoId)?.baseSha ??
+        this.store.getMission(input.missionId)?.base_ref;
+      const expectedAttempt =
+        backend === "integration"
+          ? executionId
+          : this.store
+              .listTasks(input.missionId)
+              .filter(
+                (candidateTask) =>
+                  candidateTask.kind === "integration" &&
+                  candidateTask.repo_id === input.repoId &&
+                  candidateTask.status === "SUCCEEDED" &&
+                  (candidateTask.mission_generation ?? 0) === missionGeneration &&
+                  (candidateTask.candidate_generation ?? 0) === candidateGeneration,
+              )
+              .at(-1)?.assigned_execution_id;
       const records = await repository.git.loadCandidateLifecycles(input.missionId, input.repoId);
-      const lifecycle = records
-        .filter((record) => record.state === "integrating" || record.state === "promotion_intent")
-        .at(-1);
+      const lifecycle = expectedAttempt
+        ? records.find(
+            (record) =>
+              record.missionId === input.missionId &&
+              record.repoId === input.repoId &&
+              record.missionGeneration === missionGeneration &&
+              record.candidateGeneration === candidateGeneration &&
+              record.attempt === expectedAttempt &&
+              record.baseSha === boundBase &&
+              (record.state === "integrating" || record.state === "promotion_intent"),
+          )
+        : undefined;
       if (lifecycle) {
+        input.authority?.assertAuthoritative();
         const reconciled = await repository.git.reconcileCandidateWorktree(lifecycle, input.authority);
         if (reconciled) {
           this.missionCandidates.set(input.missionId, { lifecycle, git: repository.git });
@@ -1922,10 +2061,9 @@ export class ExecutionBroker {
             {
               missionId: input.missionId,
               repoId: input.repoId,
-              generation:
-                input.authority?.repositoryIdentity?.generation ??
-                this.store.getExecution(executionId)?.mission_generation ??
-                0,
+              missionGeneration: this.store.getExecution(executionId)?.mission_generation ?? 0,
+              candidateGeneration: this.store.getExecution(executionId)?.candidate_generation ?? 0,
+              repositoryGeneration: input.authority?.repositoryIdentity?.generation ?? 0,
               attempt: executionId,
             },
             input.authority,
@@ -2026,6 +2164,7 @@ export class ExecutionBroker {
           objective: input.objective,
           handoffs,
           candidate: candidate ? { path: candidate.lifecycle.path, branch: candidate.lifecycle.branch } : undefined,
+          candidateLifecycle: candidate?.lifecycle,
           authority: input.authority,
           signal,
         });

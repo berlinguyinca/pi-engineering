@@ -15,7 +15,7 @@
 import { createHash } from "node:crypto";
 import type { ArtifactStore } from "../artifacts/ArtifactStore.ts";
 import { id } from "../core/ids.ts";
-import type { GitRepo } from "../git/GitRepo.ts";
+import type { CandidateLifecycle, GitRepo } from "../git/GitRepo.ts";
 import type { WorktreeInfo } from "../git/GitRepo.ts";
 import type { VerificationProvider } from "../verify/Verifier.ts";
 import type { WorkerActivity, WorkerExecutor, WorkerRequest } from "../workers/WorkerExecutor.ts";
@@ -480,6 +480,7 @@ export function realBackends(opts: RealBackendsOptions) {
         objective: string;
         handoffs: IntegrationHandoff[];
         candidate?: WorktreeInfo;
+        candidateLifecycle?: CandidateLifecycle;
         authority?: import("./ownership.ts").DispatchAuthority;
         signal: AbortSignal;
       }): Promise<ExecutionOutcome> {
@@ -506,10 +507,16 @@ export function realBackends(opts: RealBackendsOptions) {
         const recovered: string[] = [];
         const conflicts: string[] = [];
         const skippedRecovered: string[] = [];
-        for (const h of input.handoffs) {
+        for (const [sequence, h] of input.handoffs.entries()) {
           input.signal.throwIfAborted();
           const r = await (input.candidate
-            ? repo.git.mergeRefInWorktree(input.candidate, h.ref ?? h.worktree.branch, input.authority)
+            ? repo.git.mergeRefInWorktree(
+                input.candidate,
+                h.ref ?? h.worktree.branch,
+                input.authority,
+                input.candidateLifecycle,
+                sequence,
+              )
             : repo.git.mergeBranch(h.ref ?? h.worktree.branch)
           ).catch((e: Error) => ({
             merged: false,
@@ -536,9 +543,20 @@ export function realBackends(opts: RealBackendsOptions) {
         }
         input.signal.throwIfAborted();
         const candidateCwd = input.candidate?.path ?? repo.cwd;
+        if (input.candidateLifecycle) {
+          await repo.git.beginCandidateCheck(input.candidateLifecycle, "integration-verifier", input.authority);
+        }
         const checks = await opts.verifier.detect(candidateCwd);
         input.signal.throwIfAborted();
         const result = await opts.verifier.run(candidateCwd, checks, opts.artifacts, { signal: input.signal });
+        if (input.candidateLifecycle) {
+          await repo.git.completeCandidateCheck(
+            input.candidateLifecycle,
+            "integration-verifier",
+            result.passed,
+            input.authority,
+          );
+        }
         const artifactRefs = result.evidence.flatMap((e) => e.artifacts).filter(Boolean);
         const artifactState = await artifactContentHashes(opts.artifacts, artifactRefs);
         return {

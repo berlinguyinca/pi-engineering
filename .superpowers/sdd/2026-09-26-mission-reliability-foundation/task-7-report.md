@@ -65,3 +65,37 @@ Review findings were addressed with the following hardening:
 ### Fix-round residual concerns
 
 - None known in the Task 7 correctness scope. Production backends are candidate-scoped; legacy injected runners remain opt-in compatibility surfaces and do not silently acquire candidate scope.
+
+## Fix round 2
+
+The second review round hardened restart and concurrency boundaries:
+
+- Promotion intent and completion are loaded by exact mission, repository, mission generation, candidate generation, integration execution, base SHA, and candidate SHA. `HEAD == candidateSha` is recoverable only with that exact durable intent; restart reasserts authority immediately before checkout reconciliation.
+- Crash injection covers promotion immediately after compare-and-swap, reset, candidate-state persistence, completion persistence, candidate cleanup, and before mission completion. Every committed boundary reconciles idempotently as already promoted.
+- The custom PID-directory promotion lock was replaced by the repository's tokenized `ExclusiveFileLock`, including atomic owner publication, token-matched release, stale-owner recovery, and a real child-process contention regression.
+- Candidate merges now journal intent before each handoff, then persist merge result and the resulting candidate SHA immediately after the Git mutation. An advanced ref with an incomplete journal is reconciled by ancestry proof without a second merge.
+- Integration verification journals intent/result. An interrupted intent is rerun and durably completed on restart.
+- Candidate restoration no longer selects the newest record. It requires the exact durable integration execution and matching repository, base, mission generation, candidate generation, branch SHA, and current authority.
+- Both mission-cancellation finalizers acquire repository cleanup authority. Stale cancellation preserves work and writes explicit candidate-preservation/worktree-cleanup findings rather than swallowing failures.
+
+### Fix-round-2 RED/GREEN evidence
+
+- RED: promotion crash-boundary hooks were absent, `HEAD == candidateSha` promoted without durable intent, and merge replay had no durable journal; the three adversarial Git regressions failed before implementation.
+- RED: the first focused run exposed read-only missions attempting recovery promotion without integration lineage; durable integration lineage now gates that path.
+- RED: full-suite concurrency exposed cancellation settling before worktree cleanup and a pre-abort listener race in the stale-cancellation regression; cancellation now awaits authorized cleanup and the regression handles pre-aborted signals.
+- GREEN: focused Task 7 suite passed 83/83.
+- GREEN: `npm run typecheck` passed.
+- GREEN: `npm run lint` passed (`Checked 583 files`).
+- GREEN: bounded `timeout 180 npm test` passed: 2,425 tests; 2,424 passed, 0 failed, 1 skipped.
+- GREEN: `git diff --check` passed.
+
+### Fix-round-2 reviewer focus
+
+- Verify promotion recovery accepts only exact durable intent/completion identity and never interprets an arbitrary matching HEAD as proof.
+- Verify every handoff mutation has a persisted pre-intent and post-SHA, and incomplete intents reconcile only with ancestry proof.
+- Verify cancellation cleanup uses newly acquired repository authority and stale paths retain diagnostics with an explicit finding.
+- Verify `ExclusiveFileLock` remains the sole promotion critical-section implementation; no ad hoc PID lock remains.
+
+### Fix-round-2 residual concerns
+
+- `ExclusiveFileLock` is intentionally a local-filesystem protocol. Shared/network filesystems or hosts with different PID namespaces still require a distributed lock and remain outside the local-promotion contract.

@@ -1,13 +1,17 @@
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { test } from "node:test";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { GitRepo } from "../../src/git/GitRepo.ts";
 import { makeFixtureRepo } from "../fixtures/make-fixture.ts";
 
 const exec = promisify(execFile);
+const fileLockModule = pathToFileURL(
+  fileURLToPath(new URL("../../src/platform/eventstore/fileLock.ts", import.meta.url)),
+).href;
 
 test("git repo detection and head commit", async () => {
   const fixture = await makeFixtureRepo();
@@ -273,7 +277,9 @@ test("candidate promotion is idempotent when restart observes candidate HEAD", a
     const candidate = await repo.createCandidateWorktree(base, {
       missionId: "MSN-restart",
       repoId: "repo-restart",
-      generation: 4,
+      missionGeneration: 4,
+      candidateGeneration: 0,
+      repositoryGeneration: 4,
       attempt: "attempt-1",
     });
     try {
@@ -320,7 +326,9 @@ test("candidate lifecycle preserves an earlier attempt and remounts its exact pe
     const first = await repo.createCandidateWorktree(base, {
       missionId: "MSN-preserve",
       repoId: "repo-preserve",
-      generation: 9,
+      missionGeneration: 9,
+      candidateGeneration: 0,
+      repositoryGeneration: 9,
       attempt: "attempt-1",
     });
     let second: Awaited<ReturnType<GitRepo["createCandidateWorktree"]>> | undefined;
@@ -336,7 +344,9 @@ test("candidate lifecycle preserves an earlier attempt and remounts its exact pe
         repo.createCandidateWorktree(base, {
           missionId: "MSN-preserve",
           repoId: "repo-preserve",
-          generation: 9,
+          missionGeneration: 9,
+          candidateGeneration: 0,
+          repositoryGeneration: 9,
           attempt: "attempt-1",
         }),
         /preserved candidate attempt already exists/i,
@@ -350,7 +360,9 @@ test("candidate lifecycle preserves an earlier attempt and remounts its exact pe
       second = await repo.createCandidateWorktree(base, {
         missionId: "MSN-preserve",
         repoId: "repo-preserve",
-        generation: 9,
+        missionGeneration: 9,
+        candidateGeneration: 0,
+        repositoryGeneration: 10,
         attempt: "attempt-2",
       });
       assert.notEqual(second.branch, first.branch);
@@ -369,6 +381,228 @@ test("candidate lifecycle preserves an earlier attempt and remounts its exact pe
       if (second) await repo.removeWorktree(second, { keepBranch: true }).catch(() => {});
     }
   } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("promotion crash boundaries reconcile only from the exact durable intent", async () => {
+  for (const crashAt of ["afterCas", "afterReset", "afterCandidateState", "afterCompletion"] as const) {
+    const fixture = await makeFixtureRepo();
+    try {
+      const repo = (await GitRepo.open(fixture.root))!;
+      const base = await repo.headCommit();
+      const candidate = await repo.createCandidateWorktree(base, {
+        missionId: `MSN-crash-${crashAt}`,
+        repoId: "repo-crash",
+        missionGeneration: 7,
+        candidateGeneration: 3,
+        repositoryGeneration: 11,
+        attempt: `EX-${crashAt}`,
+      });
+      await writeFile(join(candidate.path, "src", `crash-${crashAt}.js`), "export const recovered = true;\n");
+      await repo.commitAll(candidate.path, `candidate ${crashAt}`);
+      candidate.candidateSha = await repo.headCommitIn(candidate.path);
+      await repo.persistCandidateLifecycle(candidate);
+
+      await assert.rejects(
+        repo.promoteCandidate(candidate, base, undefined, candidate, {
+          [crashAt]: () => {
+            throw new Error(`crash:${crashAt}`);
+          },
+        }),
+        new RegExp(`crash:${crashAt}`),
+      );
+
+      const reopened = (await GitRepo.open(fixture.root))!;
+      const identity = {
+        missionId: candidate.missionId,
+        repoId: candidate.repoId,
+        missionGeneration: candidate.missionGeneration,
+        candidateGeneration: candidate.candidateGeneration,
+        repositoryGeneration: candidate.repositoryGeneration,
+        attempt: candidate.attempt,
+        baseSha: candidate.baseSha,
+        candidateSha: candidate.candidateSha,
+      };
+      if (crashAt === "afterCas") {
+        await assert.rejects(
+          reopened.reconcilePromotion(identity, {
+            assertAuthoritative: () => {
+              throw new Error("stale recovery authority");
+            },
+          }),
+          /stale recovery authority/,
+        );
+        assert.equal(await reopened.headCommit(), candidate.candidateSha, "committed CAS must not be rolled back");
+      }
+      const recovered = await reopened.reconcilePromotion(identity);
+      assert.equal(recovered.promoted, true, crashAt);
+      assert.equal(recovered.alreadyPromoted, true, crashAt);
+      assert.equal(await reopened.headCommit(), candidate.candidateSha);
+      const records = await reopened.loadPromotionLifecycles(candidate.missionId, candidate.repoId);
+      assert.equal(records.at(-1)?.state, "completed");
+    } finally {
+      await fixture.cleanup();
+    }
+  }
+});
+
+test("HEAD at a candidate SHA is not treated as promoted without its exact durable intent", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const repo = (await GitRepo.open(fixture.root))!;
+    const base = await repo.headCommit();
+    const candidate = await repo.createCandidateWorktree(base, {
+      missionId: "MSN-no-intent",
+      repoId: "repo-no-intent",
+      missionGeneration: 2,
+      candidateGeneration: 4,
+      repositoryGeneration: 8,
+      attempt: "EX-no-intent",
+    });
+    await writeFile(join(candidate.path, "src", "no-intent.js"), "export const noIntent = true;\n");
+    await repo.commitAll(candidate.path, "candidate without promotion intent");
+    candidate.candidateSha = await repo.headCommitIn(candidate.path);
+    await repo.persistCandidateLifecycle(candidate);
+    await exec("git", ["-C", fixture.root, "update-ref", "HEAD", candidate.candidateSha, base]);
+
+    const result = await repo.promoteCandidate(candidate, base, undefined, candidate);
+
+    assert.equal(result.promoted, false);
+    assert.match(result.reason ?? "", /exact durable promotion intent/i);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("a crash after a candidate merge advances the ref once and journal replay does not merge twice", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const repo = (await GitRepo.open(fixture.root))!;
+    const base = await repo.headCommit();
+    const handoff = await repo.createWorktree(base, "journal-handoff");
+    const candidate = await repo.createCandidateWorktree(base, {
+      missionId: "MSN-merge-journal",
+      repoId: "repo-merge-journal",
+      missionGeneration: 5,
+      candidateGeneration: 6,
+      repositoryGeneration: 9,
+      attempt: "EX-merge-journal",
+    });
+    try {
+      await writeFile(join(handoff.path, "src", "journal.js"), "export const journal = true;\n");
+      await repo.commitAll(handoff.path, "journal handoff");
+      await assert.rejects(
+        repo.mergeRefInWorktree(candidate, handoff.branch, undefined, candidate, 0, {
+          afterMutation: () => {
+            throw new Error("crash:after-merge");
+          },
+        }),
+        /crash:after-merge/,
+      );
+      const advanced = await repo.headCommitIn(candidate.path);
+
+      const reopened = (await GitRepo.open(fixture.root))!;
+      const persisted = (await reopened.loadCandidateLifecycles(candidate.missionId, candidate.repoId)).find(
+        (record) => record.attempt === candidate.attempt,
+      );
+      assert.ok(persisted);
+      const replayed = await reopened.mergeRefInWorktree(persisted, handoff.branch, undefined, persisted, 0);
+
+      assert.equal(replayed.merged, true);
+      assert.equal(await reopened.headCommitIn(candidate.path), advanced);
+      assert.equal(persisted.merges?.[0]?.state, "completed");
+      assert.equal(persisted.merges?.[0]?.afterSha, advanced);
+    } finally {
+      await repo.removeWorktree(handoff, { keepBranch: true }).catch(() => {});
+      await repo.removeWorktree(candidate, { keepBranch: true }).catch(() => {});
+    }
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("an interrupted candidate check remains an intent and is durably completed after restart", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const repo = (await GitRepo.open(fixture.root))!;
+    const base = await repo.headCommit();
+    const candidate = await repo.createCandidateWorktree(base, {
+      missionId: "MSN-check-journal",
+      repoId: "repo-check-journal",
+      missionGeneration: 3,
+      candidateGeneration: 2,
+      repositoryGeneration: 7,
+      attempt: "EX-check-journal",
+    });
+    await repo.beginCandidateCheck(candidate, "integration-verifier");
+
+    const reopened = (await GitRepo.open(fixture.root))!;
+    const persisted = (await reopened.loadCandidateLifecycles(candidate.missionId, candidate.repoId)).find(
+      (record) => record.attempt === candidate.attempt,
+    );
+    assert.equal(persisted?.checks?.[0]?.state, "intent");
+    await reopened.beginCandidateCheck(persisted!, "integration-verifier");
+    await reopened.completeCandidateCheck(persisted!, "integration-verifier", true);
+
+    const completed = (await reopened.loadCandidateLifecycles(candidate.missionId, candidate.repoId)).find(
+      (record) => record.attempt === candidate.attempt,
+    );
+    assert.equal(completed?.checks?.[0]?.state, "completed");
+    assert.equal(completed?.checks?.[0]?.passed, true);
+    await repo.removeWorktree(candidate, { keepBranch: true }).catch(() => {});
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("promotion uses the tokenized exclusive lock across child-process acquisition races", async () => {
+  const fixture = await makeFixtureRepo();
+  let child: ReturnType<typeof spawn> | undefined;
+  try {
+    const repo = (await GitRepo.open(fixture.root))!;
+    const base = await repo.headCommit();
+    const candidate = await repo.createWorktree(base, "promotion-lock-race");
+    await writeFile(join(candidate.path, "src", "lock-race.js"), "export const lockRace = true;\n");
+    await repo.commitAll(candidate.path, "promotion lock race candidate");
+    const lockFile = join(await repo.commonDir(), "pi-engineering-promotion");
+    const script = `
+      import { ExclusiveFileLock } from ${JSON.stringify(fileLockModule)};
+      const lock = await ExclusiveFileLock.acquire(${JSON.stringify(lockFile)});
+      process.stdout.write("READY\\n");
+      process.on("message", (message) => {
+        if (message === "close") {
+          lock.release();
+          process.exit(0);
+        }
+      });
+    `;
+    child = spawn(process.execPath, ["--input-type=module", "--eval", script], {
+      stdio: ["ignore", "pipe", "pipe", "ipc"],
+    });
+    await new Promise<void>((resolve, reject) => {
+      let stderr = "";
+      child!.stderr!.on("data", (chunk) => {
+        stderr += String(chunk);
+      });
+      child!.stdout!.on("data", (chunk) => {
+        if (String(chunk).includes("READY")) resolve();
+      });
+      child!.once("exit", (code) => reject(new Error(`lock owner exited early (${code}): ${stderr}`)));
+    });
+
+    const blocked = await repo.promoteCandidate(candidate, base);
+
+    assert.equal(blocked.promoted, false);
+    assert.match(blocked.reason ?? "", /critical section.*held/i);
+    child.send("close");
+    await new Promise<void>((resolve) => child!.once("exit", () => resolve()));
+    child = undefined;
+    const acquiredAfterRelease = await repo.promoteCandidate(candidate, base);
+    assert.equal(acquiredAfterRelease.promoted, true);
+    await repo.removeWorktree(candidate, { keepBranch: true });
+  } finally {
+    child?.kill("SIGKILL");
     await fixture.cleanup();
   }
 });
