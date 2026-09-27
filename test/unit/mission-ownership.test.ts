@@ -33,6 +33,12 @@ describe("MissionOwnership", () => {
         events.push(event);
         return event;
       },
+      appendConditionally: async (event, condition, onCommit) => {
+        if (!condition()) return undefined;
+        events.push(event);
+        onCommit?.();
+        return event;
+      },
       appendAll: async (batch) => {
         events.push(...batch);
       },

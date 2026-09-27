@@ -31,6 +31,19 @@ class FailOnceBackend implements EventStoreBackend {
     return this.inner.append(event);
   }
 
+  async appendConditionally(
+    event: StoredEvent,
+    condition: () => boolean,
+    onCommit?: () => void,
+  ): Promise<StoredEvent | undefined> {
+    this.attempts += 1;
+    if (this.rejectNext) {
+      this.rejectNext = false;
+      throw new Error("mission persistence unavailable");
+    }
+    return this.inner.appendConditionally(event, condition, onCommit);
+  }
+
   async appendAll(events: StoredEvent[]): Promise<void> {
     await this.inner.appendAll(events);
   }
@@ -52,6 +65,15 @@ class UnavailableBackend implements EventStoreBackend {
   attempts = 0;
 
   async append(_event: StoredEvent): Promise<StoredEvent> {
+    this.attempts += 1;
+    throw new Error("mission persistence unavailable");
+  }
+
+  async appendConditionally(
+    _event: StoredEvent,
+    _condition: () => boolean,
+    _onCommit?: () => void,
+  ): Promise<StoredEvent | undefined> {
     this.attempts += 1;
     throw new Error("mission persistence unavailable");
   }

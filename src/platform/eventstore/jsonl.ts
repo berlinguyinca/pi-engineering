@@ -28,6 +28,7 @@
  */
 
 import { randomUUID } from "node:crypto";
+import { appendFileSync } from "node:fs";
 import { appendFile, mkdir, readFile, rename, truncate, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { emitTelemetry } from "../../telemetry/sink.ts";
@@ -149,6 +150,34 @@ export class JsonlEventStore implements EventStoreBackend {
     this.appendChain = op.catch(() => {});
     await op;
     return event;
+  }
+
+  async appendConditionally(
+    event: StoredEvent,
+    condition: () => boolean,
+    onCommit?: () => void,
+  ): Promise<StoredEvent | undefined> {
+    if (this.closed) throw new Error("JsonlEventStore: append after close");
+    const line = `${JSON.stringify(event)}\n`;
+    this.pendingAppends++;
+    const op = this.appendChain
+      .then(async (): Promise<StoredEvent | undefined> => {
+        if (!this.memoryOnly) await mkdir(dirname(this.file), { recursive: true });
+        if (!condition()) return undefined;
+        // The predicate and commit intentionally do not yield. Mission authority
+        // changes synchronously, so none can interleave this critical section.
+        if (!this.memoryOnly) appendFileSync(this.file, line, "utf-8");
+        this.events.push(event);
+        this.byId.set(event.event_id, event);
+        onCommit?.();
+        return event;
+      })
+      .finally(() => this.appendSettled());
+    this.appendChain = op.then(
+      () => undefined,
+      () => undefined,
+    );
+    return await op;
   }
 
   /**

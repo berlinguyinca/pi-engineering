@@ -25,6 +25,15 @@ class LateAppendFailureBackend implements EventStoreBackend {
     return this.inner.append(event);
   }
 
+  appendConditionally(
+    event: StoredEvent,
+    condition: () => boolean,
+    onCommit?: () => void,
+  ): Promise<StoredEvent | undefined> {
+    if (this.fail) return Promise.reject(new Error("late evidence persistence unavailable"));
+    return this.inner.appendConditionally(event, condition, onCommit);
+  }
+
   appendAll(events: StoredEvent[]): Promise<void> {
     if (this.fail) return Promise.reject(new Error("late evidence persistence unavailable"));
     return this.inner.appendAll(events);

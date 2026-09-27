@@ -1,3 +1,4 @@
+import { appendFileSync } from "node:fs";
 import { appendFile, mkdir, readFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import type { LedgerEvent } from "../core/types.ts";
@@ -73,6 +74,27 @@ export class EventStore {
     this.appendChain = op.catch(() => {});
     await op;
     return event;
+  }
+
+  async appendConditionally(
+    event: LedgerEvent,
+    condition: () => boolean,
+    onCommit?: () => void,
+  ): Promise<LedgerEvent | undefined> {
+    const op = this.appendChain.then(async (): Promise<LedgerEvent | undefined> => {
+      if (!this.memoryOnly) await mkdir(dirname(this.file), { recursive: true });
+      if (!condition()) return undefined;
+      if (!this.memoryOnly) appendFileSync(this.file, `${JSON.stringify(event)}\n`, "utf-8");
+      this.events.push(event);
+      this.byId.set(event.event_id, event);
+      onCommit?.();
+      return event;
+    });
+    this.appendChain = op.then(
+      () => undefined,
+      () => undefined,
+    );
+    return await op;
   }
 
   /** Append many events as one write. */

@@ -132,3 +132,42 @@ Final verification:
 - `npm run lint` — 582 files checked, no diagnostics.
 - `npm test` — 2,371 total, 2,370 passed, 0 failed, 1 Postgres-dependent test skipped because `TEST_DATABASE_URL` is unset.
 - `git diff --check` — passed.
+
+## Fix Round 3
+
+Closed the checkpoint-append authority race found in review:
+
+- The event-store contract now supports a conditional append whose final authority predicate, durable commit, and materialized-state update execute in one non-yielding critical section.
+- Checkpoint publication revalidates execution, generation, fencing token, repository, and base at that durable commit point. A takeover while the checkpoint append is blocked rejects the append before either durable or in-memory checkpoint state changes.
+- Both JSONL event-store implementations and the ledger adapter preserve the conditional-commit contract; test backends were updated mechanically to maintain the same interface.
+
+### RED
+
+```text
+node --test --test-name-pattern='own append is blocked' \
+  test/unit/orchestration-checkpoints.test.ts
+```
+
+Result before implementation: 1 test, 0 passed, 1 failed with `Missing expected rejection`; the stale checkpoint append completed after authority takeover.
+
+### GREEN
+
+```text
+node --test \
+  test/unit/orchestration-checkpoints.test.ts \
+  test/unit/orchestration-missionstore.test.ts \
+  test/unit/platform-eventstore.test.ts \
+  test/unit/eventstore.test.ts
+```
+
+Result: 39 tests, 39 passed, 0 failed.
+
+Final verification:
+
+- `node --test test/unit/orchestration-broker.test.ts` — 40 passed, 0 failed.
+- `npm run typecheck` — passed.
+- `npm run lint` — 582 files checked, no diagnostics.
+- `node --test --test-concurrency=8 "test/unit/**/*.test.ts" "test/integration/**/*.test.ts"` — 2,371 total, 2,370 passed, 0 failed, 1 Postgres-dependent test skipped because `TEST_DATABASE_URL` is unset.
+- `git diff --check` — passed.
+
+The first default-concurrency `npm test` attempt was not accepted as completion evidence: browser screenshot capture failed under load and the broker test process was cancelled after timer starvation. The broker file then passed independently, and the complete bounded-concurrency rerun passed as recorded above.

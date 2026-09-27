@@ -15,6 +15,15 @@ class ToggleBackend implements EventStoreBackend {
     return this.inner.append(event);
   }
 
+  async appendConditionally(
+    event: StoredEvent,
+    condition: () => boolean,
+    onCommit?: () => void,
+  ): Promise<StoredEvent | undefined> {
+    if (!this.available) throw new Error("checkpoint persistence unavailable");
+    return this.inner.appendConditionally(event, condition, onCommit);
+  }
+
   async appendAll(events: StoredEvent[]): Promise<void> {
     if (!this.available) throw new Error("checkpoint persistence unavailable");
     return this.inner.appendAll(events);
@@ -60,6 +69,19 @@ class BlockingBackend implements EventStoreBackend {
       await this.blocked;
     }
     return this.inner.append(event);
+  }
+
+  async appendConditionally(
+    event: StoredEvent,
+    condition: () => boolean,
+    onCommit?: () => void,
+  ): Promise<StoredEvent | undefined> {
+    if (this.blockNextAppend) {
+      this.blockNextAppend = false;
+      this.appendStarted();
+      await this.blocked;
+    }
+    return this.inner.appendConditionally(event, condition, onCommit);
   }
 
   async appendAll(events: StoredEvent[]): Promise<void> {
@@ -288,7 +310,7 @@ describe("CheckpointManager durability and immutable origin", () => {
     assert.equal(store.listFindings(mission.mission_id).length, 0);
   });
 
-  it("publishes no stale checkpoint when a queued append is blocked during authority takeover", async () => {
+  it("publishes no stale checkpoint when its own append is blocked during authority takeover", async () => {
     const backend = new BlockingBackend();
     const { store, mission, task, execution } = setup(backend);
     const manager = new CheckpointManager({ store });
@@ -305,7 +327,6 @@ describe("CheckpointManager durability and immutable origin", () => {
     });
     const durableBefore = backend.all().filter((event) => event.type === "task.checkpointed").length;
     backend.blockNext();
-    store.addAcceptanceCriterion(mission.mission_id, "hold persistence queue");
     const late = manager.persist({
       taskId: task.task_id,
       executionId: execution.execution_id,

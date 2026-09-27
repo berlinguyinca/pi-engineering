@@ -28,6 +28,22 @@ export class LedgerEventStoreBackend implements EventStoreBackend {
     return event;
   }
 
+  async appendConditionally(
+    event: StoredEvent,
+    condition: () => boolean,
+    onCommit?: () => void,
+  ): Promise<StoredEvent | undefined> {
+    const ledger: LedgerEvent = {
+      event_id: event.event_id,
+      work_item_id: event.run_id ?? null,
+      timestamp: event.timestamp,
+      actor: { type: "system" },
+      type: event.type as LedgerEvent["type"],
+      payload: { ...event.payload, project_id: event.project_id, run_id: event.run_id, worker_id: event.worker_id },
+    };
+    return (await this.store.appendConditionally(ledger, condition, onCommit)) ? event : undefined;
+  }
+
   async appendAll(events: StoredEvent[]): Promise<void> {
     for (const e of events) await this.append(e);
   }

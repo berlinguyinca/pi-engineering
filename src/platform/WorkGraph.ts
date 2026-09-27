@@ -409,6 +409,12 @@ function JsonlEventStoreLike(): EventStoreBackend {
       events.push(e);
       return e;
     },
+    appendConditionally: async (e, condition, onCommit) => {
+      if (!condition()) return undefined;
+      events.push(e);
+      onCommit?.();
+      return e;
+    },
     appendAll: async (es) => {
       events.push(...es);
     },

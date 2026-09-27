@@ -163,6 +163,9 @@ test("a failing event store degrades gracefully (detection keeps working)", asyn
     append: async () => {
       throw new Error("disk on fire");
     },
+    appendConditionally: async () => {
+      throw new Error("disk on fire");
+    },
     appendAll: async () => {},
     all: () => [],
     get: () => undefined,

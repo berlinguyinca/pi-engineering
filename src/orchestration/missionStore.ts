@@ -1075,23 +1075,7 @@ export class MissionStore {
   publishCheckpointIfAuthoritative(checkpoint: TaskCheckpoint): Promise<TaskCheckpoint> {
     const publish = this.emitChain.then(async () => {
       await this.drainPending();
-      this.assertExecutionAuthoritative(checkpoint.executionId);
-      const task = this.tasks.get(checkpoint.taskId);
-      const repository = this.workspaceManifests
-        .get(checkpoint.missionId)
-        ?.repositories.find((candidate) => candidate.repoId === checkpoint.repoId);
-      const mismatches = [
-        !task || task.mission_id !== checkpoint.missionId ? "task" : null,
-        task?.assigned_execution_id && task.assigned_execution_id !== checkpoint.executionId
-          ? "execution assignment"
-          : null,
-        task?.repo_id !== checkpoint.repoId ? "repository" : null,
-        !repository || repository.baseSha !== checkpoint.baseSha ? "base" : null,
-        (task?.mission_generation ?? 0) !== checkpoint.missionGeneration ? "mission generation" : null,
-        (task?.candidate_generation ?? 0) !== checkpoint.candidateGeneration ? "candidate generation" : null,
-        (task?.fencing_token ?? 0) !== checkpoint.fencingToken ? "fencing token" : null,
-      ].filter((value): value is string => value !== null);
-      if (mismatches.length > 0) throw new Error(`checkpoint origin mismatch: ${mismatches.join(", ")}`);
+      this.assertCheckpointAuthoritative(checkpoint);
 
       const copy = copyTaskCheckpoint(checkpoint);
       const payload = structuredClone({ actor: "system", checkpoint: copy });
@@ -1112,14 +1096,27 @@ export class MissionStore {
         worker_id: null,
         payload,
       };
+      let authorityError: unknown;
       try {
-        await this.backend.append(stored);
+        const appended = await this.backend.appendConditionally(
+          stored,
+          () => {
+            try {
+              this.assertCheckpointAuthoritative(checkpoint);
+              return true;
+            } catch (error) {
+              authorityError = error;
+              return false;
+            }
+          },
+          () => this.apply(event),
+        );
+        if (!appended) throw authorityError ?? new Error("checkpoint origin mismatch");
       } catch (error) {
-        this.recordPersistenceFailure(event, error);
+        if (!authorityError) this.recordPersistenceFailure(event, error);
         throw error;
       }
       this.clearPersistenceFailure(event.event_id);
-      this.apply(event);
       return copyTaskCheckpoint(copy);
     });
     this.emitChain = publish.then(
@@ -1127,6 +1124,26 @@ export class MissionStore {
       () => undefined,
     );
     return publish;
+  }
+
+  private assertCheckpointAuthoritative(checkpoint: TaskCheckpoint): void {
+    this.assertExecutionAuthoritative(checkpoint.executionId);
+    const task = this.tasks.get(checkpoint.taskId);
+    const repository = this.workspaceManifests
+      .get(checkpoint.missionId)
+      ?.repositories.find((candidate) => candidate.repoId === checkpoint.repoId);
+    const mismatches = [
+      !task || task.mission_id !== checkpoint.missionId ? "task" : null,
+      task?.assigned_execution_id && task.assigned_execution_id !== checkpoint.executionId
+        ? "execution assignment"
+        : null,
+      task?.repo_id !== checkpoint.repoId ? "repository" : null,
+      !repository || repository.baseSha !== checkpoint.baseSha ? "base" : null,
+      (task?.mission_generation ?? 0) !== checkpoint.missionGeneration ? "mission generation" : null,
+      (task?.candidate_generation ?? 0) !== checkpoint.candidateGeneration ? "candidate generation" : null,
+      (task?.fencing_token ?? 0) !== checkpoint.fencingToken ? "fencing token" : null,
+    ].filter((value): value is string => value !== null);
+    if (mismatches.length > 0) throw new Error(`checkpoint origin mismatch: ${mismatches.join(", ")}`);
   }
 
   listTaskCheckpoints(missionId?: string, taskId?: string): TaskCheckpoint[] {
