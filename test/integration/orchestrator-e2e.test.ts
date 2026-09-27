@@ -941,10 +941,12 @@ describe("exitStatus is authoritative (non-throwing backend failures)", () => {
 
   it("a worker reporting exitStatus 'failed' is not counted as a succeeded mutation", async () => {
     const h = harness({ agentExitStatus: "failed" });
+    const lines: string[] = [];
     const result = await h.orchestrator.orchestrate("Add an endpoint and fix the build", {
       repository: ".",
       baseRef: "abc",
       mutationRequested: true,
+      onProgress: (line) => lines.push(line),
     });
     assert.equal(result.completed, false, "a failed worker must not yield a completed mission");
     const impl = h.store.listTasks(result.mission.mission_id).filter((t) => t.role === "implementer");
@@ -952,6 +954,9 @@ describe("exitStatus is authoritative (non-throwing backend failures)", () => {
       impl.some((t) => t.status === "FAILED"),
       `implementer must be FAILED, got ${impl.map((t) => t.status).join(",")}`,
     );
+    const progress = lines.join("\n");
+    assert.match(progress, /task .* -> FAILED: backend reported failed: implemented/);
+    assert.match(progress, /Mission (blocked|failed): .*No workers remain active\./i);
   });
 });
 

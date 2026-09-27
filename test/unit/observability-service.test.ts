@@ -299,10 +299,15 @@ test("waiting missions explain why and are never classified as stalls", async ()
   const sum = h.obs.summary(id)!;
   assert.equal(sum.health, "waiting");
   assert.equal(sum.waitingReason, "inferweave_admission");
+  assert.equal(sum.currentActivity?.type, "waiting_for_queue");
+  assert.equal(sum.currentActivity?.summary, "queue depth 3");
   // Resuming clears the wait.
   h.obs.clearWaiting(id);
   await h.obs.flush();
-  assert.equal(h.obs.summary(id)!.waitingReason, undefined);
+  const resumed = h.obs.summary(id)!;
+  assert.equal(resumed.waitingReason, undefined);
+  assert.equal(resumed.currentActivity?.type, "recovery");
+  assert.equal(resumed.currentActivity?.summary, "Resumed");
 });
 
 test("heartbeat alone does not advance meaningful progress", async () => {

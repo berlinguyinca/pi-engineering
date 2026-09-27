@@ -33,7 +33,16 @@ export interface RealBackendsOptions {
    * model placement (a pinned implementer/reviewer) take effect in the mission
    * pipeline, matching the lifecycle `roleRunner` path.
    */
-  routeModel?: (role: WorkerRequest["role"]) => Promise<{ provider: string; id: string } | undefined>;
+  routeModel?: (role: WorkerRequest["role"]) => Promise<ModelRoute | undefined>;
+  /** Current/session model used when review cannot be placed on a distinct model. */
+  reviewFallbackModel?: { provider: string; id: string };
+}
+
+export interface ModelRoute {
+  provider: string;
+  id: string;
+  /** Operator-visible notice when policy had to degrade model separation. */
+  warning?: string;
 }
 
 /**
@@ -179,8 +188,8 @@ export function realBackends(opts: RealBackendsOptions) {
         // Place the worker on the model the capability router chose for this
         // role (honours `policy.routing.roles`); fall back to the executor
         // default when routing is unavailable or the role is unknown.
-        const modelOverride = await opts.routeModel?.(req.role);
-        if (modelOverride) req.modelOverride = modelOverride;
+        const modelRoute = await opts.routeModel?.(req.role);
+        if (modelRoute) req.modelOverride = { provider: modelRoute.provider, id: modelRoute.id };
         const run = await runWorker(req, input);
         return outcomeOf(run);
       },
@@ -233,6 +242,7 @@ export function realBackends(opts: RealBackendsOptions) {
         objective: string;
         contextRef?: string;
         signal: AbortSignal;
+        onActivity?: (event: WorkerActivity) => void;
       }): Promise<ExecutionOutcome> {
         // A review must inspect the integrated change, read evidence, and write
         // concrete findings — a long, prose-heavy task. Give it an explicit,
@@ -251,8 +261,27 @@ export function realBackends(opts: RealBackendsOptions) {
           // executor's default (5 min) aborted the reviewer mid-analysis.
           timeoutMs: workerTimeoutMs(),
         };
-        const modelOverride = await opts.routeModel?.(req.role);
-        if (modelOverride) req.modelOverride = modelOverride;
+        const routed = await opts.routeModel?.(req.role);
+        const modelRoute =
+          routed ??
+          (opts.reviewFallbackModel
+            ? {
+                ...opts.reviewFallbackModel,
+                warning: `Warning: no distinct reviewer model is available; reviewing with ${opts.reviewFallbackModel.provider}/${opts.reviewFallbackModel.id} in a fresh session with reduced independence.`,
+              }
+            : undefined);
+        if (modelRoute) {
+          req.modelOverride = { provider: modelRoute.provider, id: modelRoute.id };
+          if (modelRoute.warning) {
+            input.onActivity?.({
+              kind: "execution",
+              stage: "review",
+              phase: "started",
+              summary: modelRoute.warning,
+              meaningfulProgress: false,
+            });
+          }
+        }
         const run = await runWorker(req, input);
         const outcome = outcomeOf(run);
         // If the reviewer emitted structured findings, normalize and surface them

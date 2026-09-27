@@ -172,6 +172,55 @@ describe("realBackends capability routing", () => {
     assert.deepEqual(seen[0]?.modelOverride, { provider: "metabolomics", id: "qwen-vision" });
   });
 
+  it("warns while explicitly routing review to the current model when no distinct reviewer exists", async () => {
+    const seen: WorkerRequest[] = [];
+    const activity: import("../../src/workers/WorkerExecutor.ts").WorkerActivity[] = [];
+    const backends = realBackends({
+      worker: capturingWorker(seen),
+      verifier: {} as never,
+      artifacts: {} as never,
+      git: null,
+      cwd: "/repo",
+      routeModel: async () => ({
+        provider: "local",
+        id: "local",
+        warning: "No distinct reviewer model is available; reviewing with local/local in a fresh session.",
+      }),
+    });
+
+    await backends.review.runReview({
+      objective: "review",
+      signal: new AbortController().signal,
+      onActivity: (event) => activity.push(event),
+    });
+
+    assert.deepEqual(seen[0]?.modelOverride, { provider: "local", id: "local" });
+    assert.ok(activity.some((event) => event.summary.includes("No distinct reviewer model")));
+  });
+
+  it("falls back to the current model when reviewer routing finds no distinct model", async () => {
+    const seen: WorkerRequest[] = [];
+    const activity: import("../../src/workers/WorkerExecutor.ts").WorkerActivity[] = [];
+    const backends = realBackends({
+      worker: capturingWorker(seen),
+      verifier: {} as never,
+      artifacts: {} as never,
+      git: null,
+      cwd: "/repo",
+      routeModel: async () => undefined,
+      reviewFallbackModel: { provider: "local", id: "local" },
+    } as never);
+
+    await backends.review.runReview({
+      objective: "review",
+      signal: new AbortController().signal,
+      onActivity: (event) => activity.push(event),
+    });
+
+    assert.deepEqual(seen[0]?.modelOverride, { provider: "local", id: "local" });
+    assert.ok(activity.some((event) => /reduced independence/i.test(event.summary)));
+  });
+
   it("gives the reviewer the same wall-clock budget as implementation workers", async () => {
     // Without an explicit budget the executor's 5-minute default aborted
     // reviewers mid-analysis.

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { type BrokerBackends, ExecutionBroker } from "../../src/orchestration/broker.ts";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
-import { MissionScheduler } from "../../src/orchestration/scheduler.ts";
+import { MissionScheduler, type MissionSchedulerStatusNotice } from "../../src/orchestration/scheduler.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 import type { GatewayResilienceConfig } from "../../src/resilience/config.ts";
 
@@ -108,6 +108,49 @@ describe("MissionScheduler resilience (time-based gateway window)", () => {
     assert.ok(calls >= 1, "the worker was attempted at least once");
   });
 
+  it("reports why a mission has no active worker and what recovery will happen next", async () => {
+    const store = MissionStore.open(JsonlEventStore.inMemory());
+    const m = makeMission(store);
+    store.createTask({ mission_id: m.mission_id, kind: "agent", role: "implementer", objective: "x" });
+    const notices: MissionSchedulerStatusNotice[] = [];
+    const broker = new ExecutionBroker({
+      store,
+      backends: { agent: { runAgent: async () => transientOutcome() } },
+    });
+    const clk = clock();
+    const scheduler = new MissionScheduler({
+      store,
+      broker,
+      resilience: testResilience,
+      probe: { probe: async () => ({ healthy: false }) },
+      now: clk.now,
+      sleep: clk.sleep,
+      rand: () => 0,
+      onStatus: (notice) => {
+        notices.push(notice);
+      },
+    });
+
+    await scheduler.runMission(m.mission_id);
+
+    assert.ok(
+      notices.some(
+        (notice) =>
+          notice.status === "WAITING_FOR_LLM" &&
+          notice.action === "retrying" &&
+          typeof notice.reason === "string" &&
+          typeof notice.nextActionAt === "number",
+      ),
+      JSON.stringify(notices),
+    );
+    assert.ok(
+      notices.some(
+        (notice) => notice.status === "PAUSED_INFRASTRUCTURE" && notice.action === "paused" && notice.terminal === true,
+      ),
+      JSON.stringify(notices),
+    );
+  });
+
   it("retries within the window and succeeds when the gateway recovers", async () => {
     const store = MissionStore.open(JsonlEventStore.inMemory());
     const m = makeMission(store);
@@ -126,6 +169,7 @@ describe("MissionScheduler resilience (time-based gateway window)", () => {
     };
     const broker = new ExecutionBroker({ store, backends });
     const clk = clock();
+    const notices: MissionSchedulerStatusNotice[] = [];
     const scheduler = new MissionScheduler({
       store,
       broker,
@@ -135,6 +179,9 @@ describe("MissionScheduler resilience (time-based gateway window)", () => {
       now: clk.now,
       sleep: clk.sleep,
       rand: () => 0,
+      onStatus: (notice) => {
+        notices.push(notice);
+      },
     });
     await scheduler.runMission(m.mission_id);
     assert.equal(calls, 2, "exactly one retry after recovery");
@@ -142,6 +189,12 @@ describe("MissionScheduler resilience (time-based gateway window)", () => {
     // The mission is no longer parked.
     assert.notEqual(store.getMission(m.mission_id)!.status, "PAUSED_INFRASTRUCTURE");
     assert.notEqual(store.getMission(m.mission_id)!.status, "WAITING_FOR_LLM");
+    assert.ok(
+      notices.some(
+        (notice) => notice.status === "EXECUTING" && notice.action === "resumed" && notice.terminal === false,
+      ),
+      JSON.stringify(notices),
+    );
   });
 
   it("resumes a paused mission when the gateway returns healthy", async () => {

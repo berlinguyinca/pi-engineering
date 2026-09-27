@@ -466,6 +466,15 @@ export class MissionObservability {
       case "MODEL_REQUEST_WAITING":
         s.waitingReason = (meta.reason as WaitingReason) ?? "model_request";
         s.waitingSince = s.waitingSince ?? ev.timestamp;
+        s.currentActivity = {
+          type:
+            s.waitingReason === "inferweave_admission" || s.waitingReason === "rate_limit"
+              ? "waiting_for_queue"
+              : s.waitingReason === "model_request"
+                ? "waiting_for_model"
+                : "waiting_for_worker",
+          summary: ev.summary,
+        };
         break;
       case "MODEL_REQUEST_COMPLETED":
       case "MODEL_REQUEST_FAILED":
@@ -473,6 +482,10 @@ export class MissionObservability {
           // Explicit resume (clearWaiting) always clears any waiting reason.
           s.waitingReason = undefined;
           s.waitingSince = undefined;
+          s.currentActivity = {
+            type: "recovery",
+            summary: ev.summary,
+          };
         } else if (s.waitingReason === "model_request" || s.waitingReason === "inferweave_admission") {
           s.waitingReason = undefined;
           s.waitingSince = undefined;
