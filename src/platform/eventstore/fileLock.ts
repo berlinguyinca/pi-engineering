@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { readFileSync, rmSync as removeSync } from "node:fs";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { hostname } from "node:os";
@@ -45,6 +45,18 @@ function verifiedStale(owner: FileLockOwner): boolean {
   return owner.host === hostname() && !processIsAlive(owner.pid);
 }
 
+function recoveryClaimPath(path: string, ownerToken: string): string {
+  const tokenHash = createHash("sha256").update(ownerToken).digest("hex").slice(0, 24);
+  return `${path}.recover.${tokenHash}`;
+}
+
+/**
+ * Local-filesystem process lock.
+ *
+ * Stale-owner proof assumes every contender sees the same filesystem, hostname,
+ * and PID namespace. Shared/network filesystems or containers with different PID
+ * namespaces require a distributed/advisory lock and are deliberately unsupported.
+ */
 export class ExclusiveFileLock {
   readonly owner: FileLockOwner;
   readonly path: string;
@@ -79,14 +91,35 @@ export class ExclusiveFileLock {
           throw new Error(`JSONL writer lock for ${file} is held (${diagnostic})`);
         }
 
-        const stalePath = `${path}.stale.${process.pid}.${randomUUID()}`;
+        // Serialize recovery by the exact stale token observed. A contender must
+        // re-read after winning this claim, so it can never rename/unlink a new
+        // winner that replaced the stale record in the meantime.
+        const claimPath = recoveryClaimPath(path, current.ownerToken);
         try {
-          await rename(path, stalePath);
-        } catch (renameError) {
-          if ((renameError as NodeJS.ErrnoException).code === "ENOENT") continue;
-          throw renameError;
+          await writeFile(claimPath, `${JSON.stringify(owner)}\n`, { encoding: "utf8", flag: "wx" });
+        } catch (claimError) {
+          if ((claimError as NodeJS.ErrnoException).code !== "EEXIST") throw claimError;
+          await new Promise((resolve) => setTimeout(resolve, 2));
+          continue;
         }
-        await rm(stalePath, { recursive: true, force: true });
+        try {
+          const claimed = await readOwner(path);
+          if (!claimed || claimed.ownerToken !== current.ownerToken || !verifiedStale(claimed)) continue;
+          const stalePath = `${path}.stale.${process.pid}.${randomUUID()}`;
+          try {
+            await rename(path, stalePath);
+          } catch (renameError) {
+            if ((renameError as NodeJS.ErrnoException).code === "ENOENT") continue;
+            throw renameError;
+          }
+          const quarantined = await readOwner(stalePath);
+          if (quarantined?.ownerToken !== current.ownerToken) {
+            throw new Error(`JSONL writer lock recovery token changed unexpectedly for ${file}`);
+          }
+          await rm(stalePath, { force: true });
+        } finally {
+          await rm(claimPath, { force: true });
+        }
       }
     }
   }

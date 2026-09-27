@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { appendFile, mkdtemp, readFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { appendFile, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -54,6 +54,37 @@ async function startStoreOwner(file: string) {
 async function waitForExit(child: ReturnType<typeof spawn>): Promise<void> {
   if (child.exitCode !== null || child.signalCode !== null) return;
   await new Promise<void>((resolve) => child.once("exit", () => resolve()));
+}
+
+function startRacingOwner(file: string) {
+  const script = `
+    import { JsonlEventStore } from ${JSON.stringify(jsonlModule)};
+    try {
+      const store = await JsonlEventStore.open(${JSON.stringify(file)});
+      process.stdout.write("READY\\n");
+      process.on("message", (message) => {
+        if (message === "close") {
+          store.close();
+          process.exit(0);
+        }
+      });
+    } catch (error) {
+      process.stdout.write("BLOCKED:" + String(error) + "\\n");
+      process.exit(2);
+    }
+  `;
+  const child = spawn(process.execPath, ["--input-type=module", "--eval", script], {
+    stdio: ["ignore", "pipe", "pipe", "ipc"],
+  });
+  const outcome = new Promise<"ready" | "blocked">((resolve, reject) => {
+    child.stdout!.on("data", (chunk) => {
+      const line = String(chunk);
+      if (line.includes("READY")) resolve("ready");
+      if (line.includes("BLOCKED:")) resolve("blocked");
+    });
+    child.once("error", reject);
+  });
+  return { child, outcome };
 }
 
 describe("EventStore backends", () => {
@@ -131,6 +162,31 @@ describe("EventStore backends", () => {
 
     const afterVerifiedDeath = await JsonlEventStore.open(file);
     afterVerifiedDeath.close();
+  });
+
+  it("preserves the live winner when two processes race to recover one stale lock", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pie-store-stale-race-"));
+    const file = join(dir, "events.jsonl");
+    await writeFile(
+      `${file}.lock`,
+      `${JSON.stringify({
+        pid: 2_000_000_000,
+        host: hostname(),
+        openedAt: "2026-01-01T00:00:00.000Z",
+        ownerToken: "stale-race-owner",
+      })}\n`,
+    );
+    const contenders = [startRacingOwner(file), startRacingOwner(file)];
+    const outcomes = await Promise.all(contenders.map((contender) => contender.outcome));
+    assert.deepEqual(outcomes.slice().sort(), ["blocked", "ready"]);
+    await assert.rejects(() => JsonlEventStore.open(file), /writer lock.*pid/i);
+
+    const winner = contenders[outcomes.indexOf("ready")]!.child;
+    winner.send("close");
+    await waitForExit(winner);
+    for (const contender of contenders) {
+      if (contender.child !== winner) await waitForExit(contender.child);
+    }
   });
 
   it("repairs a torn final record instead of swallowing the next event", async () => {

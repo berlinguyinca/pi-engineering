@@ -58,3 +58,55 @@ Implemented a real cross-process JSONL writer lock and replay-backed mission/rep
 - PID reuse intentionally fails closed: a stale lock whose PID now belongs to a live process is not removed automatically.
 - Lease renewal is performed at dispatch boundaries, not by a background heartbeat. Long-running worker result fencing is intentionally completed by later reliability tasks that guard every authoritative update.
 - The deferred Task 2 Git path-enumeration fail-open boundary was not encountered and was not changed.
+
+## Fix Round 1
+
+### Outcome
+
+- Mission dispatch now holds a renewable authority session for the complete worker lifetime, stamps the active mission generation/fencing token onto both task and execution records, validates authority at dispatch/result/mutation boundaries, cancels on invalidation, and records late results as rejected.
+- Every mutating scheduled, repair, validation, review, and integration execution acquires repository authority by `repoId`, renews it while running, and fences/releases it after settlement. Separate missions/controllers are serialized on the same repository.
+- Stale JSONL lock recovery now uses a token-specific atomic recovery claim, revalidates the observed stale owner, quarantines only that exact token, and never unlinks a replacement winner.
+- Writer authority is fail-closed unless a backend explicitly proves it. The in-memory JSONL backend explicitly owns its writer boundary.
+- Shared-runtime initialization/ref-counting is single-flight and exception-safe; failed initialization rolls back its store reference, while failed close remains retryable and does not mark the runtime closed early.
+- Mission release failures are isolated from the already-determined mission outcome.
+
+### RED evidence
+
+- `node --test --test-name-pattern="fails closed" test/unit/mission-ownership.test.ts`
+  - Failed with `Missing expected rejection`; backends without `ownsWriterLock()` were implicitly authorized.
+- Focused ownership/scheduler runs initially exposed missing long-worker fencing: mission/repository leases expired without renewal, late results were accepted, and no repository lease surrounded mutations.
+- The stale-recovery race regression initially demonstrated that rename/unlink recovery could act after the observed stale owner had changed; recovery lacked a token-specific atomic claimant.
+- Runtime lifecycle regressions initially exposed dropped concurrent-open references, leaked writer authority after failed initialization, and a permanently closed runtime after a failed flush.
+- `node --test test/unit/platform-eventstore.test.ts test/unit/mission-ownership.test.ts test/unit/orchestration-missionstore.test.ts test/unit/orchestration-broker.test.ts test/unit/orchestration-scheduler.test.ts test/integration/orchestrator-e2e.test.ts test/integration/runtime-mission-live-snapshot.test.ts`
+  - Intermediate result: 108 tests, 106 passed, 2 failed.
+  - Failures identified repository leases left behind when expiry was first reconciled by `renew()`, and replay/live `mission.updated_at` divergence for task creation.
+- `node --test --test-name-pattern="expires an overdue" test/unit/mission-ownership.test.ts && node --test --test-name-pattern="replays reliability authority" test/unit/orchestration-missionstore.test.ts`
+  - After the bounded fixes: 2 passed, 0 failed.
+
+### GREEN evidence
+
+- `node --test test/unit/platform-eventstore.test.ts test/unit/mission-ownership.test.ts test/unit/orchestration-missionstore.test.ts test/unit/orchestration-broker.test.ts test/unit/orchestration-scheduler.test.ts test/integration/orchestrator-e2e.test.ts test/integration/runtime-mission-live-snapshot.test.ts`
+  - 108 passed, 0 failed.
+  - Covers lease expiry during a live worker, takeover cancellation/late-result rejection, task/execution fencing stamps, repository mutation serialization across controllers/missions, release-failure outcome isolation, two-contender stale recovery, concurrent runtime opens, failed initialization rollback, and failed-close retry.
+- `npm run typecheck`
+  - Passed (`tsc --noEmit`).
+- `npm run lint`
+  - Passed (`biome check .`; 578 files checked, no fixes applied).
+- `npm test`
+  - 2,315 tests discovered: 2,314 passed, 0 failed, 1 skipped in 30.875s.
+  - The sole skip remains the OpenViking Postgres round-trip because `TEST_DATABASE_URL` is unset.
+
+### Files changed
+
+- `src/orchestration/{ownership,missionStore,scheduler,broker,orchestrator}.ts` — renewable mission/repository authority, durable epoch stamping, authority-checked dispatch and settlement, and non-masking release.
+- `src/platform/eventstore/{fileLock,jsonl}.ts` — token-specific stale recovery and accurate single-writer documentation.
+- `src/runtime/EngineeringRuntime.ts` — exception-safe shared initialization, reference accounting, and retryable close.
+- `test/unit/{mission-ownership,orchestration-scheduler,platform-eventstore}.test.ts` — long-run expiry/takeover, actual mutation fencing, runtime lifecycle failures, and stale-recovery race coverage.
+
+### Self-review and concerns
+
+- Repository mutation authority is keyed by `repoId`; same-repository mutators serialize even when declared write domains are disjoint.
+- Authority is rechecked before execution creation/start, dispatch, result acceptance, worktree harvest, and authoritative task settlement. Renewal failure invalidates the session and cancels the active execution.
+- The lock is intentionally a local-filesystem primitive. Correct stale-owner proof requires every contender to share the same filesystem, hostname, and PID namespace. Network filesystems and containers with differing PID namespaces require a separate distributed/advisory ownership design and are unsupported here.
+- A release/flush failure cannot rewrite a successful or failed mission result; repository authority then fails closed until its durable expiry.
+- The deferred Task 2 Git path-enumeration fail-open boundary was not encountered and remains unchanged.

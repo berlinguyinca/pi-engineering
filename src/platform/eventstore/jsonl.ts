@@ -22,9 +22,9 @@
  *    domain calls produced two different durable histories depending only on
  *    whether the write had been awaited.
  *
- * This backend remains SINGLE-PROCESS. Two instances over one file do not see
- * each other's appends — there is no lock and no re-read — which is why
- * `open()` refuses a file another live instance already holds.
+ * This backend remains single-writer. A local-filesystem process lock prevents
+ * distinct runtimes from opening the same file concurrently; the in-process
+ * registry provides the same protection before a second lock attempt.
  */
 
 import { randomUUID } from "node:crypto";

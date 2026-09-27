@@ -388,6 +388,7 @@ export class EngineeringRuntime {
   private snapshotPublishDirty = false;
   private orchestrationPath: string | null = null;
   private closed = false;
+  private openReferences = 1;
 
   /**
    * Serializes git mutations that touch the shared main repo (worktree create,
@@ -551,7 +552,11 @@ export class EngineeringRuntime {
     const workDir = opts.workDir ?? join(repoRoot, ".pi-eng");
     const openKey = `${resolve(repoRoot)}\0${resolve(workDir)}`;
     const existing = openingRuntimes.get(openKey);
-    if (existing) return existing;
+    if (existing) {
+      const runtime = await existing;
+      runtime.retainOpenReference();
+      return runtime;
+    }
     const opening = EngineeringRuntime.openResolved(opts, git, repoRoot, workDir);
     openingRuntimes.set(openKey, opening);
     try {
@@ -585,194 +590,218 @@ export class EngineeringRuntime {
     // JSONL backend is single-instance per process, so reuse an already-open
     // store for the same path (a second runtime must not open the same file).
     const orchestrationPath = join(workDir, "orchestration.jsonl");
-    let orchestrationBackend = openedOrchestrationStores.get(orchestrationPath);
-    if (!orchestrationBackend) {
-      orchestrationBackend = await JsonlEventStore.open(orchestrationPath);
-      openedOrchestrationStores.set(orchestrationPath, orchestrationBackend);
-    }
-    openedOrchestrationStoreReferences.set(
-      orchestrationPath,
-      (openedOrchestrationStoreReferences.get(orchestrationPath) ?? 0) + 1,
-    );
-    rt.orchestrationPath = orchestrationPath;
-    rt.missionStore = openedMissionStores.get(orchestrationPath) ?? MissionStore.open(orchestrationBackend);
-    openedMissionStores.set(orchestrationPath, rt.missionStore);
-    rt.missionOwnership = new MissionOwnership(rt.missionStore, {
-      ownerId: `runtime-${process.pid}-${randomUUID()}`,
-    });
-    for (const mission of rt.missionStore.listMissions()) {
-      const manifest = rt.missionStore.getWorkspaceManifest(mission.mission_id);
-      if (manifest) await rt.repositoryRegistry.register(manifest);
-    }
-    // Mission observability shares the SAME durable event store as the mission
-    // controller: its `mission.obs.*` events are ignored by MissionStore replay
-    // and replayed by the observability service, so progress/activity/workers/
-    // tests/review survive restart/reconnect (spec 01/05). Communication gate
-    // is always open — the update emitter never suppresses ordinary Pi output.
-    rt.missionObservability = openedMissionObservability.get(orchestrationPath) ?? null;
-    if (!rt.missionObservability) {
-      rt.missionObservability = MissionObservability.open({
-        backend: orchestrationBackend,
-        store: rt.missionStore,
-        onUpdate: opts.onMissionObservabilityUpdate,
-        onChange: (missionId) => {
-          void rt.publishMissionSnapshot();
-          rt.emitMissionActivity(missionId);
-        },
-      });
-      openedMissionObservability.set(orchestrationPath, rt.missionObservability);
-    }
-    // Route orchestration worker roles through the capability router so per-role
-    // model placement (policy.routing.roles, e.g. a pinned implementer/reviewer)
-    // is honored by the mission pipeline, matching the lifecycle roleRunner
-    // path. Degrades to the worker's construction-time default model when the
-    // router cannot be built, so core never requires discovery or network.
-    let routeModel:
-      | ((role: WorkerRequest["role"]) => Promise<{ provider: string; id: string } | undefined>)
-      | undefined;
-    let reviewFallbackModel = opts.model ? { provider: opts.model.provider, id: opts.model.id } : undefined;
     try {
-      const { createRoleRouter } = await import("../capability/adapter.ts");
-      const { isRoleName } = await import("../capability/roles.ts");
-      const sharedRuntime = rt.worker instanceof PiWorkerExecutor ? await rt.worker.getModelRuntime() : undefined;
-      if (!reviewFallbackModel && sharedRuntime) {
-        const available = (await sharedRuntime.getAvailable())[0];
-        if (available) reviewFallbackModel = { provider: available.provider, id: available.id };
+      let orchestrationBackend = openedOrchestrationStores.get(orchestrationPath);
+      if (!orchestrationBackend) {
+        orchestrationBackend = await JsonlEventStore.open(orchestrationPath);
+        openedOrchestrationStores.set(orchestrationPath, orchestrationBackend);
       }
-      const routerAdapter = await createRoleRouter({
-        cwd: repoRoot,
-        agentDir: opts.agentDir,
-        modelRuntime: sharedRuntime,
-        allowModelNetwork: false,
+      openedOrchestrationStoreReferences.set(
+        orchestrationPath,
+        (openedOrchestrationStoreReferences.get(orchestrationPath) ?? 0) + 1,
+      );
+      rt.orchestrationPath = orchestrationPath;
+      rt.missionStore = openedMissionStores.get(orchestrationPath) ?? MissionStore.open(orchestrationBackend);
+      openedMissionStores.set(orchestrationPath, rt.missionStore);
+      rt.missionOwnership = new MissionOwnership(rt.missionStore, {
+        ownerId: `runtime-${process.pid}-${randomUUID()}`,
       });
-      routeModel = async (role) => {
-        if (!isRoleName(role)) return undefined;
-        try {
-          return await routerAdapter.route(role, reviewFallbackModel ? { requester: reviewFallbackModel } : undefined);
-        } catch {
-          return undefined;
+      for (const mission of rt.missionStore.listMissions()) {
+        const manifest = rt.missionStore.getWorkspaceManifest(mission.mission_id);
+        if (manifest) await rt.repositoryRegistry.register(manifest);
+      }
+      // Mission observability shares the SAME durable event store as the mission
+      // controller: its `mission.obs.*` events are ignored by MissionStore replay
+      // and replayed by the observability service, so progress/activity/workers/
+      // tests/review survive restart/reconnect (spec 01/05). Communication gate
+      // is always open — the update emitter never suppresses ordinary Pi output.
+      rt.missionObservability = openedMissionObservability.get(orchestrationPath) ?? null;
+      if (!rt.missionObservability) {
+        rt.missionObservability = MissionObservability.open({
+          backend: orchestrationBackend,
+          store: rt.missionStore,
+          onUpdate: opts.onMissionObservabilityUpdate,
+          onChange: (missionId) => {
+            void rt.publishMissionSnapshot();
+            rt.emitMissionActivity(missionId);
+          },
+        });
+        openedMissionObservability.set(orchestrationPath, rt.missionObservability);
+      }
+      // Route orchestration worker roles through the capability router so per-role
+      // model placement (policy.routing.roles, e.g. a pinned implementer/reviewer)
+      // is honored by the mission pipeline, matching the lifecycle roleRunner
+      // path. Degrades to the worker's construction-time default model when the
+      // router cannot be built, so core never requires discovery or network.
+      let routeModel:
+        | ((role: WorkerRequest["role"]) => Promise<{ provider: string; id: string } | undefined>)
+        | undefined;
+      let reviewFallbackModel = opts.model ? { provider: opts.model.provider, id: opts.model.id } : undefined;
+      try {
+        const { createRoleRouter } = await import("../capability/adapter.ts");
+        const { isRoleName } = await import("../capability/roles.ts");
+        const sharedRuntime = rt.worker instanceof PiWorkerExecutor ? await rt.worker.getModelRuntime() : undefined;
+        if (!reviewFallbackModel && sharedRuntime) {
+          const available = (await sharedRuntime.getAvailable())[0];
+          if (available) reviewFallbackModel = { provider: available.provider, id: available.id };
         }
-      };
-    } catch {
-      routeModel = undefined;
-    }
-    const backends = realBackends({
-      worker: rt.worker,
-      verifier: rt.verifier,
-      artifacts: rt.artifacts,
-      git: rt.git,
-      cwd: repoRoot,
-      routeModel,
-      reviewFallbackModel,
-      repository: async (repoId) => {
-        if (repoId) {
-          const context = await rt.repositoryRegistry.resolveForExecution(repoId);
-          return { git: context.git, cwd: context.root };
-        }
-        if (!rt.git) throw new Error(`No legacy Git repository is bound for ${repoRoot}`);
-        return { git: rt.git, cwd: repoRoot };
-      },
-    });
-    // The default plan honours the routed workflow class. A research or
-    // investigation mission MUST NOT get a repo-mutating worker: mutation is
-    // derived from the workflow, never assumed. (Dogfood caught the planner
-    // hardcoding mutates_repo:true, which let a read-only "why is this failing?"
-    // request write to the repository.)
-    const defaultPlanner: NonNullable<typeof opts.orchestrationPlanner> = async (mission) => {
-      const mutates = workflowMutatesRepo(mission.workflow_class);
-      return [
-        {
-          kind: "agent",
-          role: mutates ? "implementer" : "investigator",
-          objective: mission.goal,
-          mutates_repo: mutates,
-          write_domains: mutates ? ["**"] : [],
-          isolation: mutates ? "worktree" : "none",
-          depends_on: [],
-          priority: 0,
-          execution_requirements: {},
-          max_attempts: 3,
-          failure_policy: "retry",
-        },
-      ];
-    };
-    rt.orchestrator = new Orchestrator({
-      store: rt.missionStore,
-      backends,
-      observability: rt.missionObservability,
-      planner: opts.orchestrationPlanner ?? defaultPlanner,
-      parentSessionId: null,
-      git: rt.git,
-      baseRef: rt.git ? await rt.git.headCommit() : "",
-      workspaceResolver: new WorkspaceManifestResolver(),
-      repositoryRegistry: rt.repositoryRegistry,
-      launchCwd: opts.cwd,
-      ownership: rt.missionOwnership,
-      // Mission-level gateway resilience: a worker transient-infra failure retries
-      // within the (env-resolved) time-based window, parking the mission in a
-      // WAITING state, and pauses (not fails) on exhaustion. When an operator sets
-      // PI_GATEWAY_HEALTH_URL, a real HTTP recovery probe is used so recovery is
-      // detected without burning a full worker session; otherwise the scheduler's
-      // pass-through probe applies.
-      resilience: rt.resilience,
-      probe: buildGatewayRecoveryProbe(rt.worker, routeModel),
-      onPhase: (mission, phase) => {
-        const mapped: RuntimePhaseEvent["phase"] =
-          phase === "complete" ? "settled" : phase === "classified" ? "scout" : "implement";
-        rt.emitPhase({ workItemId: mission.mission_id, goal: mission.goal, phase: mapped });
-        // Keep the PI WEB mission snapshot fresh as missions progress.
-        void rt.publishMissionSnapshot();
-      },
-    });
-    if (opts.blackhole) rt.blackhole = await BlackholeManager.open({ ...opts.blackhole, ledger: rt.ledger });
-    // Bind the semantic tools (ledger_read, repo_search, ...) to THIS runtime so
-    // worker sessions get the tools their prompts require and always address the
-    // shared ledger/broker regardless of their cwd (a candidate worktree must not
-    // open a separate empty ledger).
-    const tools = buildCoreTools(async (cwd) => {
-      const context = await rt.repositoryRegistry.resolve(cwd);
-      return {
-        ledger: rt.ledger,
+        const routerAdapter = await createRoleRouter({
+          cwd: repoRoot,
+          agentDir: opts.agentDir,
+          modelRuntime: sharedRuntime,
+          allowModelNetwork: false,
+        });
+        routeModel = async (role) => {
+          if (!isRoleName(role)) return undefined;
+          try {
+            return await routerAdapter.route(
+              role,
+              reviewFallbackModel ? { requester: reviewFallbackModel } : undefined,
+            );
+          } catch {
+            return undefined;
+          }
+        };
+      } catch {
+        routeModel = undefined;
+      }
+      const backends = realBackends({
+        worker: rt.worker,
+        verifier: rt.verifier,
         artifacts: rt.artifacts,
-        broker: context?.contextBroker ?? rt.broker,
-        currentWorkItemId: () => rt.ledger.listWorkItems().at(-1)?.id ?? null,
-        actor: () => ({ type: "system" }),
-        orchestrator: rt.orchestrator,
-        baseRef: async () => (context ? context.git.headCommit() : (rt.git?.headCommit() ?? "")),
-        repoId: context?.repoId,
-        repositoryRoot: context?.root,
+        git: rt.git,
+        cwd: repoRoot,
+        routeModel,
+        reviewFallbackModel,
+        repository: async (repoId) => {
+          if (repoId) {
+            const context = await rt.repositoryRegistry.resolveForExecution(repoId);
+            return { git: context.git, cwd: context.root };
+          }
+          if (!rt.git) throw new Error(`No legacy Git repository is bound for ${repoRoot}`);
+          return { git: rt.git, cwd: repoRoot };
+        },
+      });
+      // The default plan honours the routed workflow class. A research or
+      // investigation mission MUST NOT get a repo-mutating worker: mutation is
+      // derived from the workflow, never assumed. (Dogfood caught the planner
+      // hardcoding mutates_repo:true, which let a read-only "why is this failing?"
+      // request write to the repository.)
+      const defaultPlanner: NonNullable<typeof opts.orchestrationPlanner> = async (mission) => {
+        const mutates = workflowMutatesRepo(mission.workflow_class);
+        return [
+          {
+            kind: "agent",
+            role: mutates ? "implementer" : "investigator",
+            objective: mission.goal,
+            mutates_repo: mutates,
+            write_domains: mutates ? ["**"] : [],
+            isolation: mutates ? "worktree" : "none",
+            depends_on: [],
+            priority: 0,
+            execution_requirements: {},
+            max_attempts: 3,
+            failure_policy: "retry",
+          },
+        ];
       };
-    });
-    rt.coreTools = tools;
-    if (rt.worker instanceof PiWorkerExecutor) rt.worker.setCustomTools(tools);
-    // A distinct reviewer worker also needs the shared-ledger tools bound.
-    if (rt.reviewerWorker instanceof PiWorkerExecutor) rt.reviewerWorker.setCustomTools(tools);
-    return rt;
+      rt.orchestrator = new Orchestrator({
+        store: rt.missionStore,
+        backends,
+        observability: rt.missionObservability,
+        planner: opts.orchestrationPlanner ?? defaultPlanner,
+        parentSessionId: null,
+        git: rt.git,
+        baseRef: rt.git ? await rt.git.headCommit() : "",
+        workspaceResolver: new WorkspaceManifestResolver(),
+        repositoryRegistry: rt.repositoryRegistry,
+        launchCwd: opts.cwd,
+        ownership: rt.missionOwnership,
+        // Mission-level gateway resilience: a worker transient-infra failure retries
+        // within the (env-resolved) time-based window, parking the mission in a
+        // WAITING state, and pauses (not fails) on exhaustion. When an operator sets
+        // PI_GATEWAY_HEALTH_URL, a real HTTP recovery probe is used so recovery is
+        // detected without burning a full worker session; otherwise the scheduler's
+        // pass-through probe applies.
+        resilience: rt.resilience,
+        probe: buildGatewayRecoveryProbe(rt.worker, routeModel),
+        onPhase: (mission, phase) => {
+          const mapped: RuntimePhaseEvent["phase"] =
+            phase === "complete" ? "settled" : phase === "classified" ? "scout" : "implement";
+          rt.emitPhase({ workItemId: mission.mission_id, goal: mission.goal, phase: mapped });
+          // Keep the PI WEB mission snapshot fresh as missions progress.
+          void rt.publishMissionSnapshot();
+        },
+      });
+      if (opts.blackhole) rt.blackhole = await BlackholeManager.open({ ...opts.blackhole, ledger: rt.ledger });
+      // Bind the semantic tools (ledger_read, repo_search, ...) to THIS runtime so
+      // worker sessions get the tools their prompts require and always address the
+      // shared ledger/broker regardless of their cwd (a candidate worktree must not
+      // open a separate empty ledger).
+      const tools = buildCoreTools(async (cwd) => {
+        const context = await rt.repositoryRegistry.resolve(cwd);
+        return {
+          ledger: rt.ledger,
+          artifacts: rt.artifacts,
+          broker: context?.contextBroker ?? rt.broker,
+          currentWorkItemId: () => rt.ledger.listWorkItems().at(-1)?.id ?? null,
+          actor: () => ({ type: "system" }),
+          orchestrator: rt.orchestrator,
+          baseRef: async () => (context ? context.git.headCommit() : (rt.git?.headCommit() ?? "")),
+          repoId: context?.repoId,
+          repositoryRoot: context?.root,
+        };
+      });
+      rt.coreTools = tools;
+      if (rt.worker instanceof PiWorkerExecutor) rt.worker.setCustomTools(tools);
+      // A distinct reviewer worker also needs the shared-ledger tools bound.
+      if (rt.reviewerWorker instanceof PiWorkerExecutor) rt.reviewerWorker.setCustomTools(tools);
+      return rt;
+    } catch (error) {
+      EngineeringRuntime.releaseOrchestrationReference(orchestrationPath);
+      throw error;
+    }
   }
 
   /** Release this runtime's share of the orchestration writer lock. Idempotent. */
   async close(): Promise<void> {
     if (this.closed) return;
-    this.closed = true;
+    if (this.openReferences > 1) {
+      this.openReferences--;
+      if (this.orchestrationPath) EngineeringRuntime.releaseOrchestrationReference(this.orchestrationPath);
+      return;
+    }
     await this.missionStore?.flush();
     await this.missionObservability?.flush();
     const path = this.orchestrationPath;
-    if (path) {
-      const references = (openedOrchestrationStoreReferences.get(path) ?? 1) - 1;
-      if (references <= 0) {
-        openedOrchestrationStoreReferences.delete(path);
-        openedMissionObservability.delete(path);
-        openedMissionStores.delete(path);
-        openedOrchestrationStores.get(path)?.close();
-        openedOrchestrationStores.delete(path);
-      } else {
-        openedOrchestrationStoreReferences.set(path, references);
-      }
-    }
+    if (path) EngineeringRuntime.releaseOrchestrationReference(path);
+    this.closed = true;
     this.orchestrator = null;
     this.missionOwnership = null;
     this.missionObservability = null;
     this.missionStore = null;
+  }
+
+  private retainOpenReference(): void {
+    if (this.closed || !this.orchestrationPath) throw new Error("cannot retain a closed EngineeringRuntime");
+    this.openReferences++;
+    openedOrchestrationStoreReferences.set(
+      this.orchestrationPath,
+      (openedOrchestrationStoreReferences.get(this.orchestrationPath) ?? 0) + 1,
+    );
+  }
+
+  private static releaseOrchestrationReference(path: string): void {
+    const references = (openedOrchestrationStoreReferences.get(path) ?? 1) - 1;
+    if (references > 0) {
+      openedOrchestrationStoreReferences.set(path, references);
+      return;
+    }
+    openedOrchestrationStoreReferences.delete(path);
+    openedMissionObservability.delete(path);
+    openedMissionStores.delete(path);
+    openedOrchestrationStores.get(path)?.close();
+    openedOrchestrationStores.delete(path);
   }
 
   actor(runId: string, role?: WorkerRole): Actor {

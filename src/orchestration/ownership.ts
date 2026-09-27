@@ -4,10 +4,20 @@ import type { MissionLease, RepositoryLease } from "./types.ts";
 export interface MissionOwnershipOptions {
   ownerId: string;
   leaseMs?: number;
+  heartbeatMs?: number;
   now?: () => number;
 }
 
 export type OwnershipIdentity = MissionLease | RepositoryLease;
+
+export interface DispatchAuthority {
+  readonly missionIdentity: MissionLease;
+  readonly repositoryIdentity?: RepositoryLease;
+  assertAuthoritative(): void;
+  onInvalidated(listener: (error: Error) => void): void;
+  /** Stops renewal and releases repository authority. Release failures are returned, never thrown. */
+  close(): Promise<Error | undefined>;
+}
 
 function isRepositoryIdentity(identity: OwnershipIdentity): identity is RepositoryLease {
   return "repoId" in identity;
@@ -18,6 +28,7 @@ export class MissionOwnership {
   private readonly store: MissionStore;
   private readonly ownerId: string;
   private readonly leaseMs: number;
+  private readonly heartbeatMs: number;
   private readonly now: () => number;
 
   constructor(store: MissionStore, options: MissionOwnershipOptions) {
@@ -28,7 +39,17 @@ export class MissionOwnership {
     this.store = store;
     this.ownerId = options.ownerId;
     this.leaseMs = options.leaseMs ?? 30_000;
+    this.heartbeatMs = options.heartbeatMs ?? Math.max(1, Math.floor(this.leaseMs / 3));
+    if (!Number.isFinite(this.heartbeatMs) || this.heartbeatMs <= 0 || this.heartbeatMs >= this.leaseMs) {
+      throw new Error("MissionOwnership heartbeatMs must be positive and shorter than leaseMs");
+    }
     this.now = options.now ?? Date.now;
+  }
+
+  async maintain(identity: MissionLease, repoId?: string): Promise<DispatchAuthority> {
+    const mission = await this.renew(identity);
+    const repository = repoId ? await this.acquireRepository(mission, repoId) : undefined;
+    return new RenewableDispatchAuthority(this, mission, repository, this.heartbeatMs);
   }
 
   async acquire(missionId: string): Promise<MissionLease> {
@@ -43,6 +64,9 @@ export class MissionOwnership {
     }
     if (current) {
       this.store.transitionMissionLease("expired", current);
+      for (const repository of this.store.listRepositoryLeases(missionId)) {
+        this.store.transitionRepositoryLease("expired", repository);
+      }
       await this.store.flush();
     }
 
@@ -66,6 +90,9 @@ export class MissionOwnership {
     const now = this.now();
     if (this.isExpired(current!, now)) {
       this.store.transitionMissionLease("expired", current!);
+      for (const repository of this.store.listRepositoryLeases(identity.missionId)) {
+        this.store.transitionRepositoryLease("expired", repository);
+      }
       await this.store.flush();
       throw new Error(`mission ${identity.missionId} lease expired at ${current!.renewBy}`);
     }
@@ -187,7 +214,77 @@ export class MissionOwnership {
 
   private assertWriterAuthority(): void {
     if (!this.store.hasExclusiveWriterAuthority()) {
-      throw new Error("mission ownership takeover requires the JSONL writer lock");
+      throw new Error("mission ownership takeover requires explicit JSONL writer authority");
     }
+  }
+}
+
+class RenewableDispatchAuthority implements DispatchAuthority {
+  private mission: MissionLease;
+  private repository?: RepositoryLease;
+  private readonly ownership: MissionOwnership;
+  private readonly timer: ReturnType<typeof setInterval>;
+  private pulseChain: Promise<void> = Promise.resolve();
+  private failure: Error | undefined;
+  private stopped = false;
+  private readonly invalidationListeners = new Set<(error: Error) => void>();
+
+  constructor(
+    ownership: MissionOwnership,
+    mission: MissionLease,
+    repository: RepositoryLease | undefined,
+    heartbeatMs: number,
+  ) {
+    this.ownership = ownership;
+    this.mission = mission;
+    this.repository = repository;
+    this.timer = setInterval(() => {
+      this.pulseChain = this.pulseChain
+        .then(() => this.pulse())
+        .catch((error) => {
+          this.failure = error instanceof Error ? error : new Error(String(error));
+          for (const listener of this.invalidationListeners) listener(this.failure);
+        });
+    }, heartbeatMs);
+    this.timer.unref?.();
+  }
+
+  get missionIdentity(): MissionLease {
+    return { ...this.mission };
+  }
+
+  get repositoryIdentity(): RepositoryLease | undefined {
+    return this.repository ? { ...this.repository } : undefined;
+  }
+
+  assertAuthoritative(): void {
+    if (this.failure) throw this.failure;
+    this.ownership.assertAuthoritative(this.mission);
+    if (this.repository) this.ownership.assertAuthoritative(this.repository);
+  }
+
+  onInvalidated(listener: (error: Error) => void): void {
+    this.invalidationListeners.add(listener);
+    if (this.failure) listener(this.failure);
+  }
+
+  async close(): Promise<Error | undefined> {
+    if (this.stopped) return this.failure;
+    this.stopped = true;
+    clearInterval(this.timer);
+    await this.pulseChain;
+    if (!this.repository) return this.failure;
+    try {
+      await this.ownership.release(this.repository);
+    } catch (error) {
+      return error instanceof Error ? error : new Error(String(error));
+    }
+    return this.failure;
+  }
+
+  private async pulse(): Promise<void> {
+    if (this.stopped || this.failure) return;
+    this.mission = await this.ownership.renew(this.mission);
+    if (this.repository) this.repository = await this.ownership.renewRepository(this.repository);
   }
 }

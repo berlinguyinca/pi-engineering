@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { type BrokerBackends, ExecutionBroker } from "../../src/orchestration/broker.ts";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
+import { MissionOwnership } from "../../src/orchestration/ownership.ts";
 import { MissionScheduler, classifyFailure, domainsOverlap } from "../../src/orchestration/scheduler.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 import type { GatewayResilienceConfig } from "../../src/resilience/config.ts";
@@ -93,6 +94,244 @@ function delayedConcurrencyTracker(delayMs = 25) {
 }
 
 describe("MissionScheduler (spec 02)", () => {
+  it("holds fenced mission and repository authority for the entire mutating dispatch", async () => {
+    const store = MissionStore.open(JsonlEventStore.inMemory());
+    const mission = createExecutingMission(store);
+    const ownership = new MissionOwnership(store, {
+      ownerId: "scheduler-owner",
+      leaseMs: 30,
+      heartbeatMs: 5,
+    });
+    let identity = await ownership.acquire(mission.mission_id);
+    const task = store.createTask({
+      mission_id: mission.mission_id,
+      kind: "agent",
+      role: "implementer",
+      objective: "long mutation",
+      mutates_repo: true,
+      isolation: "none",
+    });
+    const broker = makeBroker(store, {
+      agent: {
+        runAgent: async () => {
+          await new Promise((resolve) => setTimeout(resolve, 60));
+          assert.equal(store.getRepositoryLeaseByRepoId("repo-1")?.missionId, mission.mission_id);
+          return { executionId: "e", exitStatus: "succeeded", summary: "done", artifactRefs: [], usage: {} };
+        },
+      },
+    });
+    const scheduler = new MissionScheduler({
+      store,
+      broker,
+      acquireAuthority: async (scheduled) => {
+        const held = await ownership.maintain(identity, scheduled.mutates_repo ? "repo-1" : undefined);
+        return {
+          get missionIdentity() {
+            return held.missionIdentity;
+          },
+          get repositoryIdentity() {
+            return held.repositoryIdentity;
+          },
+          assertAuthoritative: () => held.assertAuthoritative(),
+          onInvalidated: (listener) => held.onInvalidated(listener),
+          close: async () => {
+            const error = await held.close();
+            identity = held.missionIdentity;
+            return error;
+          },
+        };
+      },
+    });
+
+    await scheduler.runMission(mission.mission_id);
+
+    const settled = store.getTask(task.task_id)!;
+    const execution = store.listExecutions(mission.mission_id, task.task_id)[0]!;
+    assert.equal(settled.status, "SUCCEEDED", settled.failure_reason);
+    assert.ok((settled.mission_generation ?? 0) > 0);
+    assert.equal(execution.mission_generation, settled.mission_generation);
+    assert.equal(execution.fencing_token, settled.fencing_token);
+    assert.equal(store.getRepositoryLeaseByRepoId("repo-1"), undefined);
+  });
+
+  it("cancels and rejects a late worker result after mission takeover", async () => {
+    const store = MissionStore.open(JsonlEventStore.inMemory());
+    const mission = createExecutingMission(store);
+    let now = Date.parse("2026-09-26T10:00:00.000Z");
+    const firstOwner = new MissionOwnership(store, {
+      ownerId: "controller-a",
+      leaseMs: 100,
+      heartbeatMs: 10,
+      now: () => now,
+    });
+    let identity = await firstOwner.acquire(mission.mission_id);
+    const task = store.createTask({
+      mission_id: mission.mission_id,
+      kind: "agent",
+      role: "implementer",
+      objective: "late mutation",
+      mutates_repo: true,
+      isolation: "none",
+    });
+    let started!: () => void;
+    const dispatched = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    const broker = makeBroker(store, {
+      agent: {
+        runAgent: async ({ signal }) => {
+          started();
+          await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+          return { executionId: "late", exitStatus: "succeeded", summary: "late", artifactRefs: [], usage: {} };
+        },
+      },
+    });
+    const scheduler = new MissionScheduler({
+      store,
+      broker,
+      acquireAuthority: async () => {
+        const held = await firstOwner.maintain(identity, "repo-stale");
+        return {
+          get missionIdentity() {
+            return held.missionIdentity;
+          },
+          get repositoryIdentity() {
+            return held.repositoryIdentity;
+          },
+          assertAuthoritative: () => held.assertAuthoritative(),
+          onInvalidated: (listener) => held.onInvalidated(listener),
+          close: async () => {
+            const error = await held.close();
+            identity = held.missionIdentity;
+            return error;
+          },
+        };
+      },
+    });
+    const running = scheduler.runMission(mission.mission_id);
+    await dispatched;
+
+    now += 101;
+    const secondOwner = new MissionOwnership(store, {
+      ownerId: "controller-b",
+      leaseMs: 100,
+      heartbeatMs: 10,
+      now: () => now,
+    });
+    const takeover = await secondOwner.acquire(mission.mission_id);
+    await running;
+
+    assert.equal(takeover.generation, 2);
+    assert.notEqual(store.getTask(task.task_id)?.status, "SUCCEEDED");
+    const execution = store.listExecutions(mission.mission_id, task.task_id)[0]!;
+    assert.equal(execution.status, "CANCELED");
+    assert.match(execution.exit_status ?? "", /late_result_rejected/);
+  });
+
+  it("serializes mutating dispatches from separate controllers by repository id", async () => {
+    const store = MissionStore.open(JsonlEventStore.inMemory());
+    const firstMission = createExecutingMission(store);
+    const secondMission = createExecutingMission(store);
+    const firstOwner = new MissionOwnership(store, { ownerId: "runtime-a", leaseMs: 1_000, heartbeatMs: 50 });
+    const secondOwner = new MissionOwnership(store, { ownerId: "runtime-b", leaseMs: 1_000, heartbeatMs: 50 });
+    let firstIdentity = await firstOwner.acquire(firstMission.mission_id);
+    let secondIdentity = await secondOwner.acquire(secondMission.mission_id);
+    const firstTask = store.createTask({
+      mission_id: firstMission.mission_id,
+      kind: "agent",
+      role: "implementer",
+      objective: "first mutation",
+      mutates_repo: true,
+      isolation: "none",
+    });
+    const secondTask = store.createTask({
+      mission_id: secondMission.mission_id,
+      kind: "agent",
+      role: "implementer",
+      objective: "second mutation",
+      mutates_repo: true,
+      isolation: "none",
+    });
+    let releaseFirst!: () => void;
+    const firstMayFinish = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    let firstStarted!: () => void;
+    const firstDispatched = new Promise<void>((resolve) => {
+      firstStarted = resolve;
+    });
+    let secondCalls = 0;
+    const schedulerFor = (
+      missionOwner: MissionOwnership,
+      identity: () => typeof firstIdentity,
+      update: (next: typeof firstIdentity) => void,
+      broker: ExecutionBroker,
+    ) =>
+      new MissionScheduler({
+        store,
+        broker,
+        acquireAuthority: async () => {
+          const held = await missionOwner.maintain(identity(), "repo-shared");
+          return {
+            get missionIdentity() {
+              return held.missionIdentity;
+            },
+            get repositoryIdentity() {
+              return held.repositoryIdentity;
+            },
+            assertAuthoritative: () => held.assertAuthoritative(),
+            onInvalidated: (listener) => held.onInvalidated(listener),
+            close: async () => {
+              const error = await held.close();
+              update(held.missionIdentity);
+              return error;
+            },
+          };
+        },
+      });
+    const firstScheduler = schedulerFor(
+      firstOwner,
+      () => firstIdentity,
+      (next) => {
+        firstIdentity = next;
+      },
+      makeBroker(store, {
+        agent: {
+          runAgent: async () => {
+            firstStarted();
+            await firstMayFinish;
+            return { executionId: "first", exitStatus: "succeeded", summary: "done", artifactRefs: [], usage: {} };
+          },
+        },
+      }),
+    );
+    const secondScheduler = schedulerFor(
+      secondOwner,
+      () => secondIdentity,
+      (next) => {
+        secondIdentity = next;
+      },
+      makeBroker(store, {
+        agent: {
+          runAgent: async () => {
+            secondCalls++;
+            return { executionId: "second", exitStatus: "succeeded", summary: "done", artifactRefs: [], usage: {} };
+          },
+        },
+      }),
+    );
+
+    const firstRun = firstScheduler.runMission(firstMission.mission_id);
+    await firstDispatched;
+    await secondScheduler.runMission(secondMission.mission_id);
+    assert.equal(secondCalls, 0);
+    assert.equal(store.getTask(secondTask.task_id)?.status, "BLOCKED");
+    assert.match(store.getTask(secondTask.task_id)?.failure_reason ?? "", /repo-shared.*mission/i);
+
+    releaseFirst();
+    await firstRun;
+    assert.equal(store.getTask(firstTask.task_id)?.status, "SUCCEEDED");
+  });
   it("runs independent tasks concurrently (parallelism)", async () => {
     const store = MissionStore.open(JsonlEventStore.inMemory());
     const m = store.createMission({

@@ -28,7 +28,7 @@ import type { MissionStore } from "./missionStore.ts";
 import type { MissionObservability } from "./observability/MissionObservability.ts";
 import { computeProgress } from "./observability/progress.ts";
 import type { ActivityType, WaitingReason } from "./observability/types.ts";
-import type { MissionOwnership } from "./ownership.ts";
+import type { DispatchAuthority, MissionOwnership } from "./ownership.ts";
 import { deriveRequiredGates, mutationFactFromChangedFiles } from "./policies.ts";
 import type { RepositoryRegistry } from "./repositoryRegistry.ts";
 import { brokerKind } from "./scheduler.ts";
@@ -164,6 +164,7 @@ export class Orchestrator {
 
   constructor(opts: OrchestratorOptions) {
     this.store = opts.store;
+    this.ownership = opts.ownership;
     this.router = opts.router ?? new IntentRouter();
     this.limits = opts.limits ?? {};
     this.maxRepairRounds = opts.maxRepairRounds ?? 2;
@@ -192,6 +193,7 @@ export class Orchestrator {
       now: opts.now,
       sleep: opts.sleep,
       rand: opts.rand,
+      acquireAuthority: this.ownership ? (task) => this.acquireTaskAuthority(task) : undefined,
       onStatus: (notice) => {
         const obs = this.observability;
         if (notice.action === "resumed") {
@@ -236,7 +238,6 @@ export class Orchestrator {
     this.workspaceResolver = opts.workspaceResolver;
     this.repositoryRegistry = opts.repositoryRegistry;
     this.launchCwd = opts.launchCwd ?? ".";
-    this.ownership = opts.ownership;
   }
 
   private repoIdForMission(missionId: string): string | undefined {
@@ -719,7 +720,7 @@ export class Orchestrator {
       this.progress.delete(mission.mission_id);
       const identity = this.ownershipByMission.get(mission.mission_id);
       if (identity && this.ownership) {
-        await this.ownership.release(identity);
+        await this.ownership.release(identity).catch(() => undefined);
         this.ownershipByMission.delete(mission.mission_id);
       }
     }
@@ -755,7 +756,7 @@ export class Orchestrator {
       return (await this.finalizeMission(missionId, opts?.signal)).mission;
     } finally {
       const identity = this.ownershipByMission.get(missionId);
-      if (identity && this.ownership) await this.ownership.release(identity);
+      if (identity && this.ownership) await this.ownership.release(identity).catch(() => undefined);
       this.ownershipByMission.delete(missionId);
     }
   }
@@ -1133,18 +1134,22 @@ export class Orchestrator {
     extra: { reviewedRecovered?: string[]; signal?: AbortSignal } = {},
   ): Promise<boolean> {
     await this.renewMissionOwnership(missionId);
-    const task = this.store.getTask(taskId)!;
+    let task = this.store.getTask(taskId)!;
+    const authority = this.ownership ? await this.acquireTaskAuthority(task) : undefined;
+    if (authority) task = this.store.assignTaskAuthority(taskId, authority.missionIdentity);
+    authority?.assertAuthoritative();
     this.store.transitionTask(taskId, "RUNNING");
     this.report(
       missionId,
       `[mission ${missionId}] ${task.kind}:${task.role} starting — ${task.objective.slice(0, 120)}`,
     );
+    let handle: Awaited<ReturnType<ExecutionBroker["execute"]>> | undefined;
     try {
       // execute() itself can throw — e.g. no backend is registered for the task
       // kind. Left outside the try it propagated out of postExecution and
       // orchestrate and left the mission stranded in INTEGRATING / VALIDATING /
       // REVIEWING. The scheduler path was hardened the same way; this one was not.
-      const handle = await this.broker.execute({
+      handle = await this.broker.execute({
         taskId,
         missionId,
         repoId: task.repo_id,
@@ -1155,14 +1160,20 @@ export class Orchestrator {
         writeDomains: task.write_domains,
         isolation: task.isolation,
         modelRequirements: task.execution_requirements,
+        authority,
         ...(extra.reviewedRecovered?.length ? { reviewedRecovered: extra.reviewedRecovered } : {}),
       });
+      const executionHandle = handle;
+      authority?.onInvalidated(() => {
+        void executionHandle.cancel();
+      });
       const onAbort = (): void => {
-        void handle.cancel();
+        void executionHandle.cancel();
       };
-      if (extra.signal?.aborted) await handle.cancel();
+      if (extra.signal?.aborted) await executionHandle.cancel();
       else extra.signal?.addEventListener("abort", onAbort, { once: true });
-      const outcome = await handle.result().finally(() => extra.signal?.removeEventListener("abort", onAbort));
+      const outcome = await executionHandle.result().finally(() => extra.signal?.removeEventListener("abort", onAbort));
+      authority?.assertAuthoritative();
       // Record reviewer findings so the completion gate can block on them.
       for (const f of outcome.findings ?? []) {
         const severity =
@@ -1206,6 +1217,20 @@ export class Orchestrator {
       this.report(missionId, `[mission ${missionId}] ${task.kind}:${task.role} succeeded`);
       return true;
     } catch (err) {
+      if (authority) {
+        try {
+          authority.assertAuthoritative();
+        } catch (authorityError) {
+          await handle?.cancel().catch(() => undefined);
+          if (handle) {
+            this.store.rejectLateExecution(
+              handle.executionId,
+              authorityError instanceof Error ? authorityError.message : String(authorityError),
+            );
+          }
+          return false;
+        }
+      }
       if (extra.signal?.aborted) {
         await this.broker.cancelByTask(taskId);
         if (this.store.getTask(taskId)?.status === "RUNNING") this.store.transitionTask(taskId, "CANCELED");
@@ -1215,6 +1240,8 @@ export class Orchestrator {
       if (this.store.getTask(taskId)?.status === "RUNNING") this.store.transitionTask(taskId, "FAILED");
       this.report(missionId, `[mission ${missionId}] ${task.kind}:${task.role} errored`);
       return false;
+    } finally {
+      await authority?.close();
     }
   }
 
@@ -1222,6 +1249,30 @@ export class Orchestrator {
     const identity = this.ownershipByMission.get(missionId);
     if (!identity || !this.ownership) return;
     this.ownershipByMission.set(missionId, await this.ownership.renew(identity));
+  }
+
+  private async acquireTaskAuthority(task: OrchestrationTask): Promise<DispatchAuthority> {
+    const identity = this.ownershipByMission.get(task.mission_id);
+    if (!identity || !this.ownership) throw new Error(`mission ${task.mission_id} has no active ownership`);
+    if (task.mutates_repo && !task.repo_id) {
+      throw new Error(`mutating task ${task.task_id} has no repository identity`);
+    }
+    const held = await this.ownership.maintain(identity, task.mutates_repo ? task.repo_id : undefined);
+    return {
+      get missionIdentity() {
+        return held.missionIdentity;
+      },
+      get repositoryIdentity() {
+        return held.repositoryIdentity;
+      },
+      assertAuthoritative: () => held.assertAuthoritative(),
+      onInvalidated: (listener) => held.onInvalidated(listener),
+      close: async () => {
+        const error = await held.close();
+        this.ownershipByMission.set(task.mission_id, held.missionIdentity);
+        return error;
+      },
+    };
   }
 
   /** Settle a caller-aborted mission without allowing later gate work to run. */

@@ -49,6 +49,7 @@ export type OrchestrationEventType =
   | "task.retried"
   | "task.canceled"
   | "task.steered"
+  | "task.authority_assigned"
   | "execution.created"
   | "execution.started"
   | "execution.completed"
@@ -332,7 +333,7 @@ export class MissionStore {
             this.missions.set(mission.mission_id, {
               ...mission,
               task_ids: [...mission.task_ids, p.task_id],
-              updated_at: e.timestamp,
+              updated_at: p.created_at,
             });
           }
         }
@@ -370,6 +371,15 @@ export class MissionStore {
         }
         break;
       }
+      case "task.authority_assigned": {
+        const taskId = e.payload.task_id as string;
+        const task = this.tasks.get(taskId);
+        if (task) {
+          task.mission_generation = e.payload.mission_generation as number;
+          task.fencing_token = e.payload.fencing_token as number;
+        }
+        break;
+      }
       case "execution.created":
       case "execution.started":
       case "execution.completed":
@@ -390,6 +400,11 @@ export class MissionStore {
             this.executions.set(xid, ex);
           }
         }
+        break;
+      }
+      case "execution.late_result_rejected": {
+        const execution = e.payload.execution as Execution | undefined;
+        if (execution) this.executions.set(execution.execution_id, copyExecution(execution));
         break;
       }
       case "finding.created": {
@@ -669,6 +684,7 @@ export class MissionStore {
 
   createTask(input: TaskCreateInput): OrchestrationTask {
     const now = new Date().toISOString();
+    const authority = this.missionLeases.get(input.mission_id);
     const task: OrchestrationTask = {
       task_id: input.task_id ?? id("TSK"),
       mission_id: input.mission_id,
@@ -694,8 +710,8 @@ export class MissionStore {
       repo_id: input.repo_id,
       acceptance_ids: input.acceptance_ids ? [...input.acceptance_ids] : [],
       candidate_generation: input.candidate_generation ?? 0,
-      mission_generation: input.mission_generation ?? 0,
-      fencing_token: input.fencing_token ?? 0,
+      mission_generation: input.mission_generation ?? authority?.generation ?? 0,
+      fencing_token: input.fencing_token ?? authority?.fencingToken ?? 0,
     };
     this.tasks.set(task.task_id, task);
     const mission = this.missions.get(input.mission_id);
@@ -713,6 +729,21 @@ export class MissionStore {
   getTask(taskId: string): OrchestrationTask | undefined {
     const t = this.tasks.get(taskId);
     return t ? copyTask(t) : undefined;
+  }
+
+  assignTaskAuthority(taskId: string, lease: MissionLease): OrchestrationTask {
+    const task = this.tasks.get(taskId);
+    if (!task) throw new Error(`unknown task ${taskId}`);
+    if (task.mission_id !== lease.missionId) throw new Error(`lease mission does not match task ${taskId}`);
+    task.mission_generation = lease.generation;
+    task.fencing_token = lease.fencingToken;
+    this.emit("task.authority_assigned", task.mission_id, {
+      actor: "system",
+      task_id: taskId,
+      mission_generation: lease.generation,
+      fencing_token: lease.fencingToken,
+    });
+    return copyTask(task);
   }
 
   listTasks(missionId?: string): OrchestrationTask[] {
@@ -783,6 +814,7 @@ export class MissionStore {
     mission_generation?: number;
     fencing_token?: number;
   }): Execution {
+    const task = this.tasks.get(input.task_id);
     const ex: Execution = {
       execution_id: id("EXC"),
       task_id: input.task_id,
@@ -800,8 +832,8 @@ export class MissionStore {
       logs: [],
       artifact_refs: [],
       status: "PENDING",
-      mission_generation: input.mission_generation ?? 0,
-      fencing_token: input.fencing_token ?? 0,
+      mission_generation: input.mission_generation ?? task?.mission_generation ?? 0,
+      fencing_token: input.fencing_token ?? task?.fencing_token ?? 0,
     };
     this.executions.set(ex.execution_id, ex);
     this.emit("execution.created", input.mission_id, { actor: "system", execution: ex });
@@ -842,6 +874,24 @@ export class MissionStore {
       .filter((e) => (missionId ? e.mission_id === missionId : true))
       .filter((e) => (taskId ? e.task_id === taskId : true))
       .map(copyExecution);
+  }
+
+  rejectLateExecution(executionId: string, reason: string): Execution {
+    const execution = this.executions.get(executionId);
+    if (!execution) throw new Error(`unknown execution ${executionId}`);
+    const rejected: Execution = {
+      ...execution,
+      status: "CANCELED",
+      exit_status: `late_result_rejected:${reason}`,
+      ended_at: new Date().toISOString(),
+    };
+    this.executions.set(executionId, rejected);
+    this.emit("execution.late_result_rejected", execution.mission_id, {
+      actor: "system",
+      execution: rejected,
+      reason,
+    });
+    return copyExecution(rejected);
   }
 
   // ── Findings ────────────────────────────────────────────────────────────
@@ -1093,7 +1143,7 @@ export class MissionStore {
   /** Local takeover is permitted only while this process owns the JSONL writer boundary. */
   hasExclusiveWriterAuthority(): boolean {
     const backend = this.backend as EventStoreBackend & { ownsWriterLock?: () => boolean };
-    return backend.ownsWriterLock?.() ?? true;
+    return backend.ownsWriterLock?.() ?? false;
   }
 
   private applyLeaseTransition(

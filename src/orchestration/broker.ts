@@ -23,6 +23,7 @@ import type { GitRepo } from "../git/GitRepo.ts";
 import type { WorkerActivity } from "../workers/WorkerExecutor.ts";
 import { sanitizeWorkerActivity } from "../workers/activity.ts";
 import type { MissionStore } from "./missionStore.ts";
+import type { DispatchAuthority } from "./ownership.ts";
 import type { ExecutionBackend, RecoveredMerge } from "./types.ts";
 
 export interface ExecutionRequestInput {
@@ -44,6 +45,8 @@ export interface ExecutionRequestInput {
    * verify. Recorded on the execution as `reviewed_recovered`.
    */
   reviewedRecovered?: string[];
+  /** Renewable fencing held by the caller for the complete dispatch. */
+  authority?: DispatchAuthority;
 }
 
 export interface ExecutionHandle {
@@ -692,6 +695,7 @@ export class ExecutionBroker {
   }
 
   async execute(input: ExecutionRequestInput): Promise<ExecutionHandle> {
+    input.authority?.assertAuthoritative();
     const backend = this.backendForKind(input.kind);
     const execution = this.store.createExecution({
       task_id: input.taskId,
@@ -699,6 +703,8 @@ export class ExecutionBroker {
       backend,
       model: (input.modelRequirements as { model?: string } | undefined)?.model ?? null,
       thinking_level: (input.modelRequirements as { thinking?: string } | undefined)?.thinking ?? null,
+      mission_generation: input.authority?.missionIdentity.generation,
+      fencing_token: input.authority?.missionIdentity.fencingToken,
     });
 
     const abort = new AbortController();
@@ -788,6 +794,7 @@ export class ExecutionBroker {
         abort.signal.addEventListener("abort", onAbort, { once: true });
         let worktree: string | null = null;
         try {
+          input.authority?.assertAuthoritative();
           const repository = await this.repositoryFor(input);
           if (repository) this.missionRepositories.set(input.missionId, repository);
           if (
@@ -809,6 +816,7 @@ export class ExecutionBroker {
           const active = this.active.get(execution.execution_id);
           if (worktree && active) active.worktree = worktree;
           if (abort.signal.aborted) throw new Error("execution aborted before dispatch");
+          input.authority?.assertAuthoritative();
           let outcome = await this.dispatch(
             input,
             backend,
@@ -819,6 +827,7 @@ export class ExecutionBroker {
             repository,
           );
           const escaped = await this.outOfScopeWorktreePaths(execution.execution_id, input);
+          input.authority?.assertAuthoritative();
           if (escaped.length > 0) {
             this.workspaceScopeFailure(execution.execution_id, escaped, input.writeDomains ?? []);
             outcome = {
@@ -852,6 +861,7 @@ export class ExecutionBroker {
           // worktree. Harvest whenever there is a worktree (success or failure);
           // failed branches are then excluded from integration and preserved.
           if (input.mutatesRepo && worktree && escaped.length === 0) {
+            input.authority?.assertAuthoritative();
             const info = this.allocatedWorktrees.get(execution.execution_id);
             const failed = outcome.exitStatus !== "succeeded";
             // Captured BEFORE the harvest: the harvest commits the worker's
@@ -862,6 +872,7 @@ export class ExecutionBroker {
                 ? await this.workerCommittedTip(execution.execution_id, input.missionId, worktree)
                 : undefined;
             await this.harvestWorktree(execution.execution_id);
+            input.authority?.assertAuthoritative();
             if (info) {
               // Last settled outcome wins: a retry that succeeds on the same
               // branch clears the earlier failure instead of being excluded.
@@ -898,13 +909,21 @@ export class ExecutionBroker {
           });
           return outcome;
         } catch (err) {
+          let authorityError: Error | undefined;
+          try {
+            input.authority?.assertAuthoritative();
+          } catch (error) {
+            authorityError = error instanceof Error ? error : new Error(String(error));
+          }
           if (input.repoId || this.resolveRepository) {
             const summary = err instanceof Error ? err.message : String(err);
             if (/WORKSPACE_SCOPE_MISMATCH|repository binding|authorized root|unknown repo/i.test(summary)) {
               this.classifyWorkspaceMismatch(input, execution.execution_id, summary);
             }
           }
-          if (!this.settledElsewhere(execution.execution_id)) {
+          if (authorityError) {
+            this.store.rejectLateExecution(execution.execution_id, authorityError.message);
+          } else if (!this.settledElsewhere(execution.execution_id)) {
             const timedOut = abort.signal.reason instanceof DOMException && abort.signal.reason.name === "TimeoutError";
             if (abort.signal.aborted && !timedOut) {
               this.store.setExecutionStatus(execution.execution_id, "CANCELED", { exit_status: "canceled" });
@@ -928,6 +947,7 @@ export class ExecutionBroker {
     };
 
     this.active.set(execution.execution_id, { abort, status: "PENDING", worktree: null, taskId: input.taskId });
+    input.authority?.assertAuthoritative();
     this.store.setExecutionStatus(execution.execution_id, "RUNNING", {});
     this.active.get(execution.execution_id)!.status = "RUNNING";
     return handle;
