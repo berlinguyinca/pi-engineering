@@ -13,6 +13,7 @@ export interface RepositoryExecutionContext {
   git: GitRepo;
   contextBroker: ContextBroker;
   verifierCwd: string;
+  writableDomains: string[];
 }
 
 export type RepositoryRole = "implementer" | "validator" | "integrator" | "reviewer";
@@ -29,6 +30,14 @@ function contains(root: string, cwd: string): boolean {
   const parent = resolve(root);
   const child = resolve(cwd);
   return child === parent || child.startsWith(`${parent}${sep}`);
+}
+
+function domainAuthorized(requested: string, authorized: string[]): boolean {
+  const request = requested.replace(/\/$/, "").replace(/\/\*\*$/, "");
+  return authorized.some((domain) => {
+    const allow = domain.replace(/\/$/, "").replace(/\/\*\*$/, "");
+    return allow === "**" || request === allow || request.startsWith(`${allow}/`);
+  });
 }
 
 /** Repository-scoped Git, semantic-context, and verifier dependencies. */
@@ -61,6 +70,7 @@ export class RepositoryRegistry {
       git,
       contextBroker,
       verifierCwd: canonicalRoot,
+      writableDomains: [...binding.writableDomains],
     });
   }
 
@@ -110,9 +120,7 @@ export class RepositoryRegistry {
             throw new Error("Git root differs from binding");
           if (role === "validator" && context.verifierCwd !== context.root)
             throw new Error("verifier cwd differs from binding");
-          if (role === "reviewer" && !(await context.contextBroker.repoMap(1)).length) {
-            throw new Error("semantic repository context is empty");
-          }
+          if (role === "reviewer") await context.contextBroker.repoMap(1);
           return { role, repoId, root: context.root, ok: true };
         } catch (error) {
           return {
@@ -126,6 +134,29 @@ export class RepositoryRegistry {
       }),
     );
     return probes;
+  }
+
+  async resolveForExecution(repoId: string, writableDomains: string[] = []): Promise<RepositoryExecutionContext> {
+    const context = this.get(repoId);
+    const canonicalRoot = await realpath(context.root).catch(() => "");
+    const git = canonicalRoot ? await GitRepo.open(canonicalRoot) : null;
+    if (!git || canonicalRoot !== context.root || (await realpath(git.root)) !== context.root) {
+      throw new WorkspaceScopeError(`Repository binding changed before execution: ${repoId}`);
+    }
+    const requested = writableDomains.length > 0 ? writableDomains : context.writableDomains;
+    if (requested.some((domain) => !domainAuthorized(domain, context.writableDomains))) {
+      throw new WorkspaceScopeError(`Requested writable domains exceed repository binding: ${repoId}`);
+    }
+    for (const domain of context.writableDomains) {
+      const prefix = domain.split("*")[0]?.replace(/\/$/, "") ?? "";
+      if (!prefix) continue;
+      const authorizedRoot = resolve(context.root, prefix);
+      const canonical = await realpath(authorizedRoot).catch(() => "");
+      if (canonical !== authorizedRoot || !contains(context.root, canonical)) {
+        throw new WorkspaceScopeError(`Authorized root changed before execution: ${authorizedRoot}`);
+      }
+    }
+    return context;
   }
 
   /** Git facade selected from the async repository binding of the mission. */

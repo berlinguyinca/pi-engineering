@@ -303,10 +303,12 @@ export function buildCoreTools(
           details: {},
         };
       const request = String(params.request);
-      const baseRef = typeof services.baseRef === "function" ? await services.baseRef() : "";
       const result = await services.orchestrator.orchestrate(request, {
         repository: services.repositoryRoot ?? ctx.cwd,
-        baseRef,
+        // The orchestrator resolves the request's explicit repository before
+        // choosing a base. Forwarding the caller cwd's SHA can bind an external
+        // target mission to an unrelated launch repository commit.
+        baseRef: "",
         constraints: (params.constraints as string[] | undefined) ?? [],
         mutationRequested: params.mutate ?? true,
         signal,

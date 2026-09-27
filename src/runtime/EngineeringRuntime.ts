@@ -649,14 +649,13 @@ export class EngineeringRuntime {
       cwd: repoRoot,
       routeModel,
       reviewFallbackModel,
-      repository: () => {
-        try {
-          const context = rt.repositoryRegistry.current();
+      repository: async (repoId) => {
+        if (repoId) {
+          const context = await rt.repositoryRegistry.resolveForExecution(repoId);
           return { git: context.git, cwd: context.root };
-        } catch {
-          if (!rt.git) throw new Error(`No Git repository is bound for ${repoRoot}`);
-          return { git: rt.git, cwd: repoRoot };
         }
+        if (!rt.git) throw new Error(`No legacy Git repository is bound for ${repoRoot}`);
+        return { git: rt.git, cwd: repoRoot };
       },
     });
     // The default plan honours the routed workflow class. A research or
@@ -688,7 +687,7 @@ export class EngineeringRuntime {
       observability: rt.missionObservability,
       planner: opts.orchestrationPlanner ?? defaultPlanner,
       parentSessionId: null,
-      git: rt.repositoryRegistry.gitFacade(),
+      git: rt.git,
       baseRef: rt.git ? await rt.git.headCommit() : "",
       workspaceResolver: new WorkspaceManifestResolver(),
       repositoryRegistry: rt.repositoryRegistry,

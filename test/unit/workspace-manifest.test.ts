@@ -1,12 +1,20 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { mkdir, mkdtemp, rename, rm, symlink } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, it } from "node:test";
-import { WorkspaceManifestResolver, WorkspaceScopeError } from "../../src/orchestration/workspaceManifest.ts";
+import { promisify } from "node:util";
+import { RepositoryRegistry } from "../../src/orchestration/repositoryRegistry.ts";
+import {
+  WorkspaceManifestResolver,
+  WorkspaceScopeError,
+  createWorkspaceManifest,
+} from "../../src/orchestration/workspaceManifest.ts";
 import { makeFixtureRepo } from "../fixtures/make-fixture.ts";
 
 describe("WorkspaceManifestResolver path policy", () => {
+  const exec = promisify(execFile);
   const cleanup: Array<() => Promise<void>> = [];
 
   afterEach(async () => {
@@ -135,6 +143,20 @@ describe("WorkspaceManifestResolver path policy", () => {
     await assert.rejects(new WorkspaceManifestResolver().resolve(`Implement in ${link}`, launchCwd), /symlink/i);
   });
 
+  it("stops execution when an authorized subdirectory is replaced by a symlink after preflight", async () => {
+    const repo = await makeFixtureRepo();
+    const outside = await mkdtemp(join(tmpdir(), "pi-eng-outside-"));
+    cleanup.push(repo.cleanup, () => rm(outside, { recursive: true, force: true }));
+    const resolved = await new WorkspaceManifestResolver().resolve(`Implement in ${join(repo.root, "src")}`, tmpdir());
+    const registry = new RepositoryRegistry();
+    await registry.register(createWorkspaceManifest(resolved, "MSN-toctou"));
+    await registry.resolveForExecution(resolved.primaryRepoId, ["src/new-directory/**"]);
+    await rm(join(repo.root, "src"), { recursive: true, force: true });
+    await symlink(outside, join(repo.root, "src"), "dir");
+
+    await assert.rejects(registry.resolveForExecution(resolved.primaryRepoId, ["src/**"]), /authorized root changed/i);
+  });
+
   it("uses a canonical Git launch cwd only when the request names no absolute path", async () => {
     const repo = await makeFixtureRepo();
     cleanup.push(repo.cleanup);
@@ -143,6 +165,19 @@ describe("WorkspaceManifestResolver path policy", () => {
 
     assert.equal(resolved.repositories[0]?.canonicalRoot, repo.root);
     assert.equal(resolved.authorizedRoots[0]?.source, "launch_cwd");
+  });
+
+  it("accepts an empty Git repository with a valid HEAD during role preflight", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-eng-empty-repo-"));
+    cleanup.push(() => rm(root, { recursive: true, force: true }));
+    await exec("git", ["init", "-q", root]);
+    await exec("git", ["-C", root, "config", "user.email", "test@example.com"]);
+    await exec("git", ["-C", root, "config", "user.name", "Test"]);
+    await exec("git", ["-C", root, "commit", "--allow-empty", "-q", "-m", "empty baseline"]);
+
+    const resolved = await new WorkspaceManifestResolver().resolve(`Review ${root}`, tmpdir());
+
+    assert.equal(resolved.repositories[0]?.canonicalRoot, root);
   });
 
   it("does not treat a repository path found in repository content as user authorization", async () => {

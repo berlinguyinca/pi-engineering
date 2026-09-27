@@ -37,7 +37,7 @@ export interface RealBackendsOptions {
   /** Current/session model used when review cannot be placed on a distinct model. */
   reviewFallbackModel?: { provider: string; id: string };
   /** Resolve the repository selected by the current mission's async binding. */
-  repository?: () => { git: GitRepo; cwd: string };
+  repository?: (repoId?: string) => Promise<{ git: GitRepo; cwd: string }> | { git: GitRepo; cwd: string };
 }
 
 export interface ModelRoute {
@@ -124,8 +124,8 @@ function outcomeOf(result: Awaited<ReturnType<WorkerExecutor["run"]>>): Executio
 }
 
 export function realBackends(opts: RealBackendsOptions) {
-  const repository = (): { git: GitRepo | null; cwd: string } =>
-    opts.repository?.() ?? { git: opts.git, cwd: opts.cwd };
+  const repository = async (repoId?: string): Promise<{ git: GitRepo | null; cwd: string }> =>
+    (await opts.repository?.(repoId)) ?? { git: opts.git, cwd: opts.cwd };
   const runWorker = async (
     req: WorkerRequest,
     input: { signal: AbortSignal; onActivity?: (event: WorkerActivity) => void },
@@ -167,6 +167,7 @@ export function realBackends(opts: RealBackendsOptions) {
     agent: {
       async runAgent(input: {
         role: string;
+        repoId?: string;
         objective: string;
         contextRef?: string;
         worktree?: string | null;
@@ -175,12 +176,13 @@ export function realBackends(opts: RealBackendsOptions) {
         signal: AbortSignal;
         onActivity?: (event: WorkerActivity) => void;
       }): Promise<ExecutionOutcome> {
+        const bound = await repository(input.repoId);
         const req: WorkerRequest = {
           role: (input.role as WorkerRequest["role"]) ?? "implementer",
           task: input.objective,
           context: input.contextRef,
           tools: ["ledger_read", "ledger_claim", "artifact_read", "repo_search", "symbol", "tests_for", "bash"],
-          cwd: input.worktree ?? repository().cwd,
+          cwd: input.worktree ?? bound.cwd,
           // Fresh-context implementation workers need headroom to explore the
           // repo, implement, run verification, and commit. Configurable so an
           // operator can tune per environment without recompiling.
@@ -201,18 +203,20 @@ export function realBackends(opts: RealBackendsOptions) {
     research: {
       async runAgent(input: {
         role?: string;
+        repoId?: string;
         objective: string;
         contextRef?: string;
         signal: AbortSignal;
         onActivity?: (event: WorkerActivity) => void;
       }): Promise<ExecutionOutcome> {
+        const bound = await repository(input.repoId);
         return runWorker(
           {
             role: "scout",
             task: input.objective,
             context: input.contextRef,
             tools: ["ledger_read", "repo_search", "symbol", "tests_for"],
-            cwd: repository().cwd,
+            cwd: bound.cwd,
           },
           input,
         ).then(outcomeOf);
@@ -220,13 +224,14 @@ export function realBackends(opts: RealBackendsOptions) {
     },
     validation: {
       async runValidation(input: {
+        repoId?: string;
         objective: string;
         worktree?: string | null;
         signal: AbortSignal;
         onActivity?: (event: WorkerActivity) => void;
       }): Promise<ExecutionOutcome> {
         input.signal.throwIfAborted();
-        const cwd = input.worktree ?? repository().cwd;
+        const cwd = input.worktree ?? (await repository(input.repoId)).cwd;
         const profile = await opts.verifier.detect(cwd);
         input.signal.throwIfAborted();
         const outcome = await opts.verifier.run(cwd, profile, opts.artifacts, { signal: input.signal });
@@ -243,6 +248,7 @@ export function realBackends(opts: RealBackendsOptions) {
     },
     review: {
       async runReview(input: {
+        repoId?: string;
         objective: string;
         contextRef?: string;
         signal: AbortSignal;
@@ -253,12 +259,13 @@ export function realBackends(opts: RealBackendsOptions) {
         // generous context budget so the reviewer is never cut off for hitting
         // the (previously unset → default) token cap; the role-adjusted guard
         // lets it write its findings report without a false degeneration abort.
+        const bound = await repository(input.repoId);
         const req: WorkerRequest = {
           role: "reviewer",
           task: input.objective,
           context: input.contextRef,
           tools: ["ledger_read", "artifact_read", "repo_search", "symbol"],
-          cwd: repository().cwd,
+          cwd: bound.cwd,
           maxContextTokens: 64_000,
           // Same generous wall-clock budget as implementation workers: a review
           // must inspect the integrated change before writing findings, and the
@@ -297,6 +304,7 @@ export function realBackends(opts: RealBackendsOptions) {
     },
     process: {
       async runProcess(input: {
+        repoId?: string;
         objective: string;
         worktree?: string | null;
         signal: AbortSignal;
@@ -304,7 +312,7 @@ export function realBackends(opts: RealBackendsOptions) {
         // Deterministic process execution falls back to verification-style
         // commands; a generic subprocess runner can be attached here later.
         input.signal.throwIfAborted();
-        const cwd = input.worktree ?? repository().cwd;
+        const cwd = input.worktree ?? (await repository(input.repoId)).cwd;
         const profile = await opts.verifier.detect(cwd);
         input.signal.throwIfAborted();
         const outcome = await opts.verifier.run(cwd, profile, opts.artifacts, { signal: input.signal });
@@ -319,12 +327,13 @@ export function realBackends(opts: RealBackendsOptions) {
     },
     integration: {
       async runIntegration(input: {
+        repoId?: string;
         objective: string;
         handoffs: IntegrationHandoff[];
         signal: AbortSignal;
       }): Promise<ExecutionOutcome> {
         input.signal.throwIfAborted();
-        const repo = repository();
+        const repo = await repository(input.repoId);
         if (!repo.git)
           return {
             executionId: "integration",

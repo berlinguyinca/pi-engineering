@@ -403,6 +403,7 @@ export class MissionScheduler {
         handle = await this.broker.execute({
           taskId: task.task_id,
           missionId: task.mission_id,
+          repoId: task.repo_id,
           kind: brokerKind(task.kind),
           role: task.role,
           objective: task.objective,

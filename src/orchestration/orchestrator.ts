@@ -16,7 +16,7 @@
  */
 
 import { id } from "../core/ids.ts";
-import type { GitRepo } from "../git/GitRepo.ts";
+import { GitRepo } from "../git/GitRepo.ts";
 import type { EventStoreBackend } from "../platform/eventstore/backend.ts";
 import type { GatewayResilienceConfig } from "../resilience/config.ts";
 import type { RecoveryProbe } from "../resilience/probe.ts";
@@ -166,6 +166,12 @@ export class Orchestrator {
       store: this.store,
       backends: opts.backends,
       git: opts.git ?? null,
+      resolveRepository: opts.repositoryRegistry
+        ? async (repoId, writableDomains) => {
+            const context = await opts.repositoryRegistry!.resolveForExecution(repoId, writableDomains);
+            return { repoId: context.repoId, root: context.root, git: context.git };
+          }
+        : undefined,
       baseRef: opts.baseRef ?? "",
       onActivity: (event) => this.observeWorkerActivity(event),
     });
@@ -424,12 +430,24 @@ export class Orchestrator {
     }
 
     const primaryBinding = workspace?.repositories.find((repository) => repository.repoId === workspace?.primaryRepoId);
+    let selectedBaseRef = primaryBinding?.baseSha ?? opts.baseRef;
+    if (primaryBinding && opts.baseRef && !workspaceError) {
+      const targetGit = await GitRepo.open(primaryBinding.canonicalRoot);
+      const targetCommit = await targetGit?.resolveCommit(opts.baseRef);
+      if (!targetCommit) {
+        workspaceError = new WorkspaceScopeError(
+          `Requested base ${opts.baseRef} does not belong to selected repository ${primaryBinding.canonicalRoot}`,
+        );
+      } else {
+        selectedBaseRef = targetCommit;
+      }
+    }
     const mission = this.store.createMission({
       title: opts.title ?? request,
       goal: request,
       user_request: request,
       repository: primaryBinding?.canonicalRoot ?? opts.repository,
-      base_ref: opts.baseRef || primaryBinding?.baseSha || "",
+      base_ref: selectedBaseRef || "",
       constraints: opts.constraints ?? [],
       risk_profile: risk,
       workflow_class: intent.suggested_workflow,
@@ -571,7 +589,42 @@ export class Orchestrator {
 
       // Plan/decompose into tasks.
       const planned = await this.planner(this.store.getMission(mission.mission_id)!, risk);
-      for (const t of planned) {
+      const bindingDomains = this.store
+        .getWorkspaceManifest(mission.mission_id)
+        ?.repositories.find(
+          (repository) => repository.repoId === this.repoIdForMission(mission.mission_id),
+        )?.writableDomains;
+      const scopedPlan = planned.map((task) => ({
+        ...task,
+        write_domains:
+          task.mutates_repo && bindingDomains
+            ? intersectWriteDomains(task.write_domains.length > 0 ? task.write_domains : ["**"], bindingDomains)
+            : task.write_domains,
+      }));
+      if (scopedPlan.some((task) => task.mutates_repo && task.write_domains.length === 0)) {
+        const summary = "Planner requested mutation outside the workspace manifest's writable domains";
+        this.store.classifyFailure({
+          classificationId: id("FC"),
+          missionId: mission.mission_id,
+          taskId: null,
+          executionId: null,
+          category: "WORKSPACE_SCOPE_MISMATCH",
+          evidenceRefs: [],
+          fingerprint: `workspace-plan:${this.repoIdForMission(mission.mission_id) ?? "none"}`,
+          summary,
+          classifiedAt: new Date().toISOString(),
+        });
+        this.store.transitionMission(mission.mission_id, "BLOCKED");
+        const blocked = this.store.getMission(mission.mission_id)!;
+        return {
+          mission: blocked,
+          intent,
+          verdict: this.gate.evaluate(blocked),
+          completed: false,
+          failureReason: summary,
+        };
+      }
+      for (const t of scopedPlan) {
         this.store.createTask({
           mission_id: mission.mission_id,
           ...t,
@@ -752,7 +805,7 @@ export class Orchestrator {
           role: "implementer",
           objective: obj.objective,
           mutates_repo: true,
-          write_domains: ["**"],
+          write_domains: this.writableDomainsForMission(missionId),
           isolation: repairIsolation,
           repo_id: this.repoIdForMission(missionId),
         });
@@ -886,6 +939,7 @@ export class Orchestrator {
         role: "integrator",
         objective: "Merge worker/repair branches into the base checkout.",
         mutates_repo: true,
+        write_domains: this.writableDomainsForMission(mission.mission_id),
         isolation: "none",
         repo_id: this.repoIdForMission(mission.mission_id),
       });
@@ -1032,6 +1086,16 @@ export class Orchestrator {
     return [...ids].map((id) => this.store.getTask(id)).filter((t): t is OrchestrationTask => t !== undefined);
   }
 
+  private writableDomainsForMission(missionId: string): string[] {
+    const repoId = this.repoIdForMission(missionId);
+    return (
+      this.store
+        .getWorkspaceManifest(missionId)
+        ?.repositories.find((repository) => repository.repoId === repoId)
+        ?.writableDomains.slice() ?? ["**"]
+    );
+  }
+
   private lastValidationTaskId(missionId: string): string[] {
     return this.store
       .listTasks(missionId)
@@ -1059,6 +1123,7 @@ export class Orchestrator {
       const handle = await this.broker.execute({
         taskId,
         missionId,
+        repoId: task.repo_id,
         kind: brokerKind(task.kind),
         role: task.role,
         objective: task.objective,
@@ -1180,4 +1245,22 @@ export class Orchestrator {
 
 function dedupe<T>(arr: T[]): T[] {
   return [...new Set(arr)];
+}
+
+function intersectWriteDomains(requested: string[], authorized: string[]): string[] {
+  const intersection = new Set<string>();
+  const contains = (outer: string, inner: string): boolean => {
+    if (outer === "**") return true;
+    if (outer === inner) return true;
+    if (!outer.endsWith("/**")) return false;
+    const prefix = outer.slice(0, -3).replace(/\/$/, "");
+    return inner === prefix || inner.startsWith(`${prefix}/`);
+  };
+  for (const request of requested) {
+    for (const allow of authorized) {
+      if (contains(request, allow)) intersection.add(allow);
+      else if (contains(allow, request)) intersection.add(request);
+    }
+  }
+  return [...intersection];
 }

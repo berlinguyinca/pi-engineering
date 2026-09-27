@@ -25,6 +25,134 @@ function setup(backends: BrokerBackends) {
 }
 
 describe("ExecutionBroker (spec 03)", () => {
+  it("passes repoId explicitly to the backend and rejects a missing binding before dispatch", async () => {
+    const seen: string[] = [];
+    const { m, t, store } = setup({});
+    const broker = new ExecutionBroker({
+      store,
+      resolveRepository: async (repoId) => {
+        if (repoId !== "repo-known") throw new Error(`WORKSPACE_SCOPE_MISMATCH: unknown ${repoId}`);
+        return { repoId, root: "/repo", git: {} as never, writableDomains: ["**"] };
+      },
+      backends: {
+        agent: {
+          runAgent: async (input) => {
+            seen.push(input.repoId ?? "");
+            return { executionId: "e", exitStatus: "succeeded", summary: "done", artifactRefs: [], usage: {} };
+          },
+        },
+      },
+    });
+
+    await (
+      await broker.execute({
+        taskId: t.task_id,
+        missionId: m.mission_id,
+        repoId: "repo-known",
+        kind: "agent",
+        role: "implementer",
+        objective: "read",
+      })
+    ).result();
+    assert.deepEqual(seen, ["repo-known"]);
+
+    const missing = store.createTask({ mission_id: m.mission_id, kind: "agent", role: "implementer", objective: "x" });
+    store.transitionTask(missing.task_id, "READY");
+    const handle = await broker.execute({
+      taskId: missing.task_id,
+      missionId: m.mission_id,
+      repoId: "repo-missing",
+      kind: "agent",
+      role: "implementer",
+      objective: "must not dispatch",
+    });
+    await assert.rejects(handle.result(), /WORKSPACE_SCOPE_MISMATCH/);
+    assert.deepEqual(seen, ["repo-known"], "missing bindings must fail before backend dispatch");
+    assert.ok(
+      store
+        .listFailureClassifications(m.mission_id)
+        .some((classification) => classification.category === "WORKSPACE_SCOPE_MISMATCH"),
+    );
+  });
+
+  it("rejects manifest-era mutation when the task has no repoId", async () => {
+    let runs = 0;
+    const { m, store } = setup({});
+    const task = store.createTask({
+      mission_id: m.mission_id,
+      kind: "agent",
+      role: "implementer",
+      objective: "unbound mutation",
+      mutates_repo: true,
+      isolation: "none",
+      write_domains: ["**"],
+    });
+    store.transitionTask(task.task_id, "READY");
+    const broker = new ExecutionBroker({
+      store,
+      git: {} as never,
+      resolveRepository: async (repoId) => ({ repoId, root: "/repo", git: {} as never }),
+      backends: {
+        agent: {
+          runAgent: async () => {
+            runs++;
+            return { executionId: "e", exitStatus: "succeeded", summary: "done", artifactRefs: [], usage: {} };
+          },
+        },
+      },
+    });
+
+    const handle = await broker.execute({
+      taskId: task.task_id,
+      missionId: m.mission_id,
+      kind: "agent",
+      role: "implementer",
+      objective: task.objective,
+      mutatesRepo: true,
+      isolation: "none",
+      writeDomains: ["**"],
+    });
+
+    await assert.rejects(handle.result(), /WORKSPACE_SCOPE_MISMATCH/);
+    assert.equal(runs, 0);
+    assert.ok(
+      store
+        .listFailureClassifications(m.mission_id)
+        .some((classification) => classification.category === "WORKSPACE_SCOPE_MISMATCH"),
+    );
+  });
+
+  it("fails closed before direct-checkout mutation when manifest domains are restricted", async () => {
+    let runs = 0;
+    const { m, t, store } = setup({});
+    const broker = new ExecutionBroker({
+      store,
+      git: {} as never,
+      resolveRepository: async (repoId) => ({ repoId, root: "/repo", git: {} as never }),
+      backends: {
+        agent: {
+          runAgent: async () => {
+            runs++;
+            return { executionId: "e", exitStatus: "succeeded", summary: "unsafe", artifactRefs: [], usage: {} };
+          },
+        },
+      },
+    });
+    const handle = await broker.execute({
+      taskId: t.task_id,
+      missionId: m.mission_id,
+      repoId: "repo-known",
+      kind: "agent",
+      role: "implementer",
+      objective: "unsafe direct mutation",
+      mutatesRepo: true,
+      writeDomains: ["src/**"],
+      isolation: "none",
+    });
+
+    await assert.rejects(handle.result(), /restricted domains require an isolated worktree/i);
+    assert.equal(runs, 0);
+  });
   it("fails closed when an isolated mutating worktree cannot be allocated", async () => {
     let runs = 0;
     const { store, m, t } = setup({});

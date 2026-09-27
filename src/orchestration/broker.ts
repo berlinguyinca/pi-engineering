@@ -18,6 +18,7 @@
  * orchestrator; tests inject deterministic fakes.
  */
 
+import { id } from "../core/ids.ts";
 import type { GitRepo } from "../git/GitRepo.ts";
 import type { WorkerActivity } from "../workers/WorkerExecutor.ts";
 import { sanitizeWorkerActivity } from "../workers/activity.ts";
@@ -27,6 +28,7 @@ import type { ExecutionBackend, RecoveredMerge } from "./types.ts";
 export interface ExecutionRequestInput {
   taskId: string;
   missionId: string;
+  repoId?: string;
   kind: "agent" | "process" | "review" | "integration" | "validation" | "research";
   role?: string;
   objective: string;
@@ -84,6 +86,7 @@ export interface AgentRunner {
   /** Spawn a fresh agent child. Returns a handle that resolves on completion. */
   runAgent(input: {
     role: string;
+    repoId?: string;
     objective: string;
     contextRef?: string;
     worktree?: string | null;
@@ -98,6 +101,7 @@ export interface AgentRunner {
 
 export interface ProcessRunner {
   runProcess(input: {
+    repoId?: string;
     objective: string;
     worktree?: string | null;
     signal: AbortSignal;
@@ -106,6 +110,7 @@ export interface ProcessRunner {
 
 export interface ReviewRunner {
   runReview(input: {
+    repoId?: string;
     objective: string;
     contextRef?: string;
     signal: AbortSignal;
@@ -133,6 +138,7 @@ export interface IntegrationHandoff {
 
 export interface IntegrationRunner {
   runIntegration(input: {
+    repoId?: string;
     objective: string;
     handoffs: IntegrationHandoff[];
     signal: AbortSignal;
@@ -140,7 +146,12 @@ export interface IntegrationRunner {
 }
 
 export interface ValidationRunner {
-  runValidation(input: { objective: string; worktree?: string | null; signal: AbortSignal }): Promise<ExecutionOutcome>;
+  runValidation(input: {
+    repoId?: string;
+    objective: string;
+    worktree?: string | null;
+    signal: AbortSignal;
+  }): Promise<ExecutionOutcome>;
 }
 
 export interface BrokerBackends {
@@ -156,6 +167,27 @@ const MAX_TIMER_MS = 2 ** 31 - 1;
 
 /** The worker's machine-readable failure marker for a wall-clock timeout. */
 const WALL_CLOCK_TIMEOUT_MARKER = "timeout";
+
+function pathAllowed(path: string, domains: string[]): boolean {
+  const normalized = path.replaceAll("\\", "/").replace(/^\.\//, "");
+  return domains.some((domain) => {
+    const pattern = domain.replaceAll("\\", "/").replace(/^\.\//, "");
+    if (pattern === "**") return true;
+    if (pattern.endsWith("/**")) {
+      const prefix = pattern.slice(0, -3).replace(/\/$/, "");
+      return normalized === prefix || normalized.startsWith(`${prefix}/`);
+    }
+    return normalized === pattern;
+  });
+}
+
+function statusPaths(status: string): string[] {
+  return status
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => line.slice(3).split(" -> ").at(-1)?.trim() ?? "")
+    .filter(Boolean);
+}
 
 /**
  * Default execution wall-clock budget in ms. The historical 10-minute default
@@ -184,6 +216,10 @@ export interface BrokerOptions {
   git?: GitRepo | null;
   /** Base ref (commit) worktrees are created at. Defaults to current HEAD. */
   baseRef?: string;
+  resolveRepository?: (
+    repoId: string,
+    writableDomains: string[],
+  ) => Promise<{ repoId: string; root: string; git: GitRepo }>;
   /** Execution-local live worker activity with durable orchestration identity. */
   onActivity?: (event: WorkerActivity & { missionId: string; taskId: string; executionId: string }) => void;
   /** Periodic liveness detail for every backend while it is running. */
@@ -196,6 +232,7 @@ export class ExecutionBroker {
   private readonly defaultTimeoutMs: number;
   private readonly git: GitRepo | null;
   private readonly baseRef: string;
+  private readonly resolveRepository?: BrokerOptions["resolveRepository"];
   private readonly onActivity?: BrokerOptions["onActivity"];
   private readonly activityHeartbeatMs: number;
   /** In-flight execution state for cancellation + allocated worktrees. */
@@ -204,9 +241,16 @@ export class ExecutionBroker {
     { abort: AbortController; status: string; worktree: string | null; taskId: string }
   >();
   /** Allocated worktrees, cleaned up when their execution settles. */
-  readonly allocatedWorktrees = new Map<string, { path: string; branch: string }>();
+  readonly allocatedWorktrees = new Map<
+    string,
+    { path: string; branch: string; git: GitRepo; repoId?: string; writeDomains: string[] }
+  >();
   /** Mission-scoped worktrees awaiting integration (merged+cleaned by the integrator). */
-  private readonly missionWorktrees = new Map<string, { path: string; branch: string }[]>();
+  private readonly missionWorktrees = new Map<
+    string,
+    Array<{ path: string; branch: string; git: GitRepo; repoId?: string; writeDomains: string[] }>
+  >();
+  private readonly missionRepositories = new Map<string, { repoId?: string; root: string; git: GitRepo }>();
   /** Commit each mission's worktrees were actually forked from (landing invariant). */
   private readonly resolvedBases = new Map<string, string>();
   /** Branches intentionally kept after cleanup because their work never merged. */
@@ -235,8 +279,27 @@ export class ExecutionBroker {
     this.defaultTimeoutMs = opts.defaultTimeoutMs ?? workerTimeoutMs();
     this.git = opts.git ?? null;
     this.baseRef = opts.baseRef ?? "";
+    this.resolveRepository = opts.resolveRepository;
     this.onActivity = opts.onActivity;
     this.activityHeartbeatMs = opts.activityHeartbeatMs ?? 15_000;
+  }
+
+  private async repositoryFor(
+    input: ExecutionRequestInput,
+  ): Promise<{ repoId?: string; root: string; git: GitRepo } | null> {
+    if (input.repoId) {
+      if (!this.resolveRepository) throw new Error(`WORKSPACE_SCOPE_MISMATCH: no resolver for ${input.repoId}`);
+      const resolved = await this.resolveRepository(input.repoId, input.writeDomains ?? []);
+      if (resolved.repoId !== input.repoId) {
+        throw new Error(`WORKSPACE_SCOPE_MISMATCH: resolved ${resolved.repoId} for ${input.repoId}`);
+      }
+      return resolved;
+    }
+    if (this.resolveRepository && input.mutatesRepo) {
+      throw new Error("WORKSPACE_SCOPE_MISMATCH: mutating execution has no repository binding");
+    }
+    if (!this.git) return null;
+    return { root: this.git.root, git: this.git };
   }
 
   /**
@@ -271,9 +334,13 @@ export class ExecutionBroker {
   }
 
   /** Allocate an isolated worktree for a mutating, worktree-isolated task. */
-  private async allocateWorktree(executionId: string, input: ExecutionRequestInput): Promise<string | null> {
+  private async allocateWorktree(
+    executionId: string,
+    input: ExecutionRequestInput,
+    repository: { repoId?: string; root: string; git: GitRepo } | null,
+  ): Promise<string | null> {
     if (!input.mutatesRepo || input.isolation !== "worktree") return null;
-    if (!this.git) {
+    if (!repository) {
       throw new Error("Required isolated worktree allocation failed: no git provider is available");
     }
     try {
@@ -283,14 +350,20 @@ export class ExecutionBroker {
       // which turns a real conflict into a clean merge where the worker's version
       // wins over the incumbent.
       const missionBase = this.store.getMission(input.missionId)?.base_ref?.trim();
-      const base = missionBase || this.baseRef || (await this.git.headCommit());
+      const base = missionBase || this.baseRef || (await repository.git.headCommit());
       // Remember what we actually forked from. A mission may be handed an empty
       // base_ref, and without a base the 'did the work land' invariant has nothing
       // to diff against — the fork point recorded here is the fallback.
       this.resolvedBases.set(input.missionId, base);
       const branch = `pi-eng-orch-${input.taskId}`;
-      const wt = await this.git.createWorktree(base, branch);
-      const info = { path: wt.path, branch: wt.branch };
+      const wt = await repository.git.createWorktree(base, branch);
+      const info = {
+        path: wt.path,
+        branch: wt.branch,
+        git: repository.git,
+        repoId: repository.repoId,
+        writeDomains: [...(input.writeDomains ?? [])],
+      };
       this.allocatedWorktrees.set(executionId, info);
       // A retried task re-creates its branch (same name): replace, never
       // duplicate, or integration would hand the same branch off twice.
@@ -320,7 +393,8 @@ export class ExecutionBroker {
    */
   private async harvestWorktree(executionId: string): Promise<boolean> {
     const wt = this.allocatedWorktrees.get(executionId);
-    if (!wt || !this.git) return false;
+    if (!wt) return false;
+    const git = wt.git;
     const ex = this.store.getExecution(executionId);
     const missionId = ex?.mission_id;
     const base = missionId
@@ -337,7 +411,7 @@ export class ExecutionBroker {
     let ahead = false;
     if (base) {
       try {
-        ahead = await this.git.branchAheadOf(base, wt.branch);
+        ahead = await git.branchAheadOf(base, wt.branch);
         if (ahead && missionId) this.committedWork.set(missionId, true);
       } catch {
         // Fall through to the status-based harvest below.
@@ -345,7 +419,7 @@ export class ExecutionBroker {
     }
     let status = "";
     try {
-      status = (await this.git.statusIn(wt.path)).trim();
+      status = (await git.statusIn(wt.path)).trim();
     } catch {
       // Could not even read the worktree status: the worker's own commits are
       // still harvestable work; nothing else can be said.
@@ -376,7 +450,7 @@ export class ExecutionBroker {
       return false;
     }
     try {
-      await this.git.commitAll(wt.path, `pi-eng: orchestration work for ${executionId}`);
+      await git.commitAll(wt.path, `pi-eng: orchestration work for ${executionId}`);
       if (missionId) this.committedWork.set(missionId, true);
       return true;
     } catch (err) {
@@ -409,13 +483,14 @@ export class ExecutionBroker {
     missionId: string,
     worktree: string,
   ): Promise<string | undefined> {
-    if (!this.git) return undefined;
+    const git = this.allocatedWorktrees.get(executionId)?.git;
+    if (!git) return undefined;
     const base = this.store.getMission(missionId)?.base_ref?.trim() || this.resolvedBases.get(missionId);
     let tip: string | undefined;
     let count: number | null = null;
     try {
-      tip = await this.git.headCommitIn(worktree);
-      if (base) count = await this.git.revListCount(`${base}..${tip}`);
+      tip = await git.headCommitIn(worktree);
+      if (base) count = await git.revListCount(`${base}..${tip}`);
     } catch {
       count = null;
     }
@@ -443,11 +518,68 @@ export class ExecutionBroker {
     });
   }
 
+  private workspaceScopeFailure(executionId: string, paths: string[], domains: string[]): void {
+    const execution = this.store.getExecution(executionId);
+    if (!execution) return;
+    const summary = `Worker changed paths outside authorized domains (${domains.join(", ") || "none"}): ${paths.join(", ")}`;
+    this.store.classifyFailure({
+      classificationId: id("FC"),
+      missionId: execution.mission_id,
+      taskId: execution.task_id,
+      executionId,
+      category: "WORKSPACE_SCOPE_MISMATCH",
+      evidenceRefs: [],
+      fingerprint: `workspace-scope:${execution.task_id}:${paths.sort().join("|")}`,
+      summary,
+      classifiedAt: new Date().toISOString(),
+    });
+    this.store.addFinding({
+      mission_id: execution.mission_id,
+      task_id: execution.task_id,
+      severity: "blocking",
+      category: "integration",
+      file: paths[0] ?? null,
+      line: null,
+      summary,
+      evidence: null,
+      recommended_action: "Restrict the implementation to the manifest's authorized writable domains.",
+    });
+  }
+
+  private classifyWorkspaceMismatch(input: ExecutionRequestInput, executionId: string, summary: string): void {
+    this.store.classifyFailure({
+      classificationId: id("FC"),
+      missionId: input.missionId,
+      taskId: input.taskId,
+      executionId,
+      category: "WORKSPACE_SCOPE_MISMATCH",
+      evidenceRefs: [],
+      fingerprint: `workspace-binding:${input.repoId ?? "missing"}:${summary}`,
+      summary,
+      classifiedAt: new Date().toISOString(),
+    });
+  }
+
+  private async outOfScopeWorktreePaths(executionId: string, input: ExecutionRequestInput): Promise<string[]> {
+    if (!input.repoId || !input.mutatesRepo) return [];
+    const wt = this.allocatedWorktrees.get(executionId);
+    if (!wt) return [];
+    const domains = input.writeDomains ?? [];
+    const base = this.store.getMission(input.missionId)?.base_ref?.trim() || this.resolvedBases.get(input.missionId);
+    const changed = new Set<string>();
+    if (base) {
+      const tip = await wt.git.headCommitIn(wt.path);
+      for (const path of await wt.git.changedFiles(base, tip)) changed.add(path);
+    }
+    for (const path of statusPaths(await wt.git.statusIn(wt.path))) changed.add(path);
+    return [...changed].filter((path) => !pathAllowed(path, domains)).sort();
+  }
+
   private async releaseWorktree(executionId: string, keepBranch = true): Promise<void> {
     const wt = this.allocatedWorktrees.get(executionId);
-    if (wt && this.git) {
+    if (wt) {
       // Keep the branch: it carries the harvested work until integration merges it.
-      await this.git.removeWorktree({ path: wt.path, branch: wt.branch }, { keepBranch }).catch(() => {});
+      await wt.git.removeWorktree({ path: wt.path, branch: wt.branch }, { keepBranch }).catch(() => {});
     }
     this.allocatedWorktrees.delete(executionId);
   }
@@ -495,11 +627,12 @@ export class ExecutionBroker {
    * which case the caller must not treat it as 'nothing landed'.
    */
   async changedFilesSinceBase(missionId: string): Promise<string[] | null> {
-    if (!this.git) return null;
+    const git = this.missionRepositories.get(missionId)?.git ?? this.git;
+    if (!git) return null;
     const base = this.store.getMission(missionId)?.base_ref?.trim() || this.resolvedBases.get(missionId);
     if (!base) return null;
     try {
-      return await this.git.changedFiles(base, await this.git.headCommit());
+      return await git.changedFiles(base, await git.headCommit());
     } catch {
       return null;
     }
@@ -522,14 +655,14 @@ export class ExecutionBroker {
       // what the worker produced — removeWorktree without keepBranch would run
       // `git branch -D` and orphan the real commits into the object store.
       // Preserve it regardless of whether integration reported success.
-      if (this.git) {
+      if (wt.git) {
         let keep = keepBranches;
         try {
-          if (!(await this.git.isAncestor(wt.branch, await this.git.headCommit()))) keep = true;
+          if (!(await wt.git.isAncestor(wt.branch, await wt.git.headCommit()))) keep = true;
         } catch {
           keep = true; // cannot verify the work merged -> preserve (safe).
         }
-        await this.git.removeWorktree({ path: wt.path, branch: wt.branch }, { keepBranch: keep }).catch(() => {});
+        await wt.git.removeWorktree({ path: wt.path, branch: wt.branch }, { keepBranch: keep }).catch(() => {});
         if (keep) {
           const list = this.preserved.get(missionId) ?? [];
           if (!list.includes(wt.branch)) list.push(wt.branch);
@@ -663,22 +796,46 @@ export class ExecutionBroker {
         abort.signal.addEventListener("abort", onAbort, { once: true });
         let worktree: string | null = null;
         try {
+          const repository = await this.repositoryFor(input);
+          if (repository) this.missionRepositories.set(input.missionId, repository);
+          if (
+            input.repoId &&
+            input.mutatesRepo &&
+            input.kind !== "integration" &&
+            input.isolation !== "worktree" &&
+            !(input.writeDomains ?? []).includes("**")
+          ) {
+            throw new Error(
+              `WORKSPACE_SCOPE_MISMATCH: restricted domains require an isolated worktree (${(input.writeDomains ?? []).join(", ") || "none"})`,
+            );
+          }
           // Allocate an isolated worktree before dispatch so mutating workers
           // edit their own checkout (spec 05). This remains inside the cleanup
           // boundary because cancellation can remove the active entry while
           // allocation is in flight.
-          worktree = await this.allocateWorktree(execution.execution_id, input);
+          worktree = await this.allocateWorktree(execution.execution_id, input, repository);
           const active = this.active.get(execution.execution_id);
           if (worktree && active) active.worktree = worktree;
           if (abort.signal.aborted) throw new Error("execution aborted before dispatch");
-          const outcome = await this.dispatch(
+          let outcome = await this.dispatch(
             input,
             backend,
             execution.execution_id,
             abort.signal,
             worktree,
             emitActivity,
+            repository,
           );
+          const escaped = await this.outOfScopeWorktreePaths(execution.execution_id, input);
+          if (escaped.length > 0) {
+            this.workspaceScopeFailure(execution.execution_id, escaped, input.writeDomains ?? []);
+            outcome = {
+              ...outcome,
+              exitStatus: "failed",
+              summary: `WORKSPACE_SCOPE_MISMATCH: out-of-scope changes: ${escaped.join(", ")}`,
+              error: "WORKSPACE_SCOPE_MISMATCH",
+            };
+          }
           // A cancellation that already settled this execution must not be
           // overwritten by the runner's late success.
           if (!this.settledElsewhere(execution.execution_id)) {
@@ -702,7 +859,7 @@ export class ExecutionBroker {
           // FAILED execution, otherwise the worker's partial work dies with the
           // worktree. Harvest whenever there is a worktree (success or failure);
           // failed branches are then excluded from integration and preserved.
-          if (input.mutatesRepo && worktree) {
+          if (input.mutatesRepo && worktree && escaped.length === 0) {
             const info = this.allocatedWorktrees.get(execution.execution_id);
             const failed = outcome.exitStatus !== "succeeded";
             // Captured BEFORE the harvest: the harvest commits the worker's
@@ -731,6 +888,14 @@ export class ExecutionBroker {
               this.failedBranches.set(input.missionId, byBranch);
             }
           }
+          if (input.mutatesRepo && worktree && escaped.length > 0) {
+            const info = this.allocatedWorktrees.get(execution.execution_id);
+            if (info) {
+              const byBranch = this.failedBranches.get(input.missionId) ?? new Map();
+              byBranch.set(info.branch, { marker: "WORKSPACE_SCOPE_MISMATCH", taskId: input.taskId });
+              this.failedBranches.set(input.missionId, byBranch);
+            }
+          }
           this.active.delete(execution.execution_id);
           emitActivity({
             kind: "execution",
@@ -741,6 +906,12 @@ export class ExecutionBroker {
           });
           return outcome;
         } catch (err) {
+          if (input.repoId || this.resolveRepository) {
+            const summary = err instanceof Error ? err.message : String(err);
+            if (/WORKSPACE_SCOPE_MISMATCH|repository binding|authorized root|unknown repo/i.test(summary)) {
+              this.classifyWorkspaceMismatch(input, execution.execution_id, summary);
+            }
+          }
           if (!this.settledElsewhere(execution.execution_id)) {
             const timedOut = abort.signal.reason instanceof DOMException && abort.signal.reason.name === "TimeoutError";
             if (abort.signal.aborted && !timedOut) {
@@ -777,6 +948,7 @@ export class ExecutionBroker {
     signal: AbortSignal,
     worktree: string | null,
     onActivity: (event: WorkerActivity) => void,
+    repository: { repoId?: string; root: string; git: GitRepo } | null,
   ): Promise<ExecutionOutcome> {
     const base = {
       objective: input.objective,
@@ -791,6 +963,7 @@ export class ExecutionBroker {
         const runner = this.backends.agent;
         if (!runner) throw new Error(`no agent backend registered for ${backend}`);
         return runner.runAgent({
+          repoId: input.repoId,
           role: input.role ?? "worker",
           objective: input.objective,
           contextRef: input.contextRef,
@@ -804,12 +977,13 @@ export class ExecutionBroker {
       case "process": {
         const runner = this.backends.process;
         if (!runner) throw new Error("no process backend registered");
-        return runner.runProcess({ objective: input.objective, worktree: base.worktree, signal });
+        return runner.runProcess({ repoId: input.repoId, objective: input.objective, worktree: base.worktree, signal });
       }
       case "review": {
         const runner = this.backends.review;
         if (!runner) throw new Error("no review backend registered");
         return runner.runReview({
+          repoId: input.repoId,
           objective: input.objective,
           contextRef: input.contextRef,
           signal,
@@ -837,9 +1011,27 @@ export class ExecutionBroker {
         const handoffs: IntegrationHandoff[] = [];
         const recovered: IntegrationHandoff[] = [];
         const recoveredMeta: RecoveredMerge[] = [];
+        const baseCommit =
+          this.store.getMission(input.missionId)?.base_ref?.trim() || this.resolvedBases.get(input.missionId);
         for (const w of this.missionWorktrees.get(input.missionId) ?? []) {
           const failure = failedByBranch?.get(w.branch);
           if (failure === undefined) {
+            if (w.repoId && baseCommit) {
+              const escaped = (await w.git.changedFiles(baseCommit, w.branch)).filter(
+                (path) => !pathAllowed(path, w.writeDomains),
+              );
+              if (escaped.length > 0) {
+                this.workspaceScopeFailure(executionId, escaped, w.writeDomains);
+                return {
+                  executionId,
+                  exitStatus: "failed",
+                  summary: `WORKSPACE_SCOPE_MISMATCH: integration rejected out-of-scope paths: ${escaped.join(", ")}`,
+                  artifactRefs: [],
+                  usage: {},
+                  error: "WORKSPACE_SCOPE_MISMATCH",
+                };
+              }
+            }
             handoffs.push({ worktree: w, summary: input.objective, artifacts: [] });
             continue;
           }
@@ -848,7 +1040,7 @@ export class ExecutionBroker {
           // and `transient:timeout` — gateway/transport failures whose partial
           // work must stay preserve-only.
           if (failure.marker !== WALL_CLOCK_TIMEOUT_MARKER || !failure.recoverRef) continue;
-          const ahead = this.git ? await this.git.revListCount(`HEAD..${failure.recoverRef}`) : 0;
+          const ahead = repository ? await repository.git.revListCount(`HEAD..${failure.recoverRef}`) : 0;
           if (ahead === null) {
             this.recoveryFinding(
               executionId,
@@ -880,9 +1072,9 @@ export class ExecutionBroker {
         // succeeded AND the exact worker commit is an ancestor of HEAD after it
         // (a skipped or conflicting recovered handoff is not). This is the
         // completion gate's evidence for superseding the timed-out task.
-        const git = this.git;
+        const git = repository?.git ?? null;
         const outcome = runner
-          .runIntegration({ objective: input.objective, handoffs, signal })
+          .runIntegration({ repoId: input.repoId, objective: input.objective, handoffs, signal })
           .then(async (o): Promise<ExecutionOutcome> => {
             if (o.exitStatus !== "succeeded" || !git || recoveredMeta.length === 0) return o;
             // Unknown HEAD: no evidence, and never a failed integration.
@@ -907,7 +1099,12 @@ export class ExecutionBroker {
       case "validation": {
         const runner = this.backends.validation;
         if (!runner) throw new Error("no validation backend registered");
-        return runner.runValidation({ objective: input.objective, worktree: base.worktree, signal });
+        return runner.runValidation({
+          repoId: input.repoId,
+          objective: input.objective,
+          worktree: base.worktree,
+          signal,
+        });
       }
     }
   }

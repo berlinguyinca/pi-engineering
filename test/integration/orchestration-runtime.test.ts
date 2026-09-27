@@ -232,6 +232,213 @@ describe("orchestration via real EngineeringRuntime (acceptance scenarios)", () 
     );
   });
 
+  it("confines a subdirectory-authorized worker and never integrates out-of-scope changes", async () => {
+    const target = await greenFixture();
+    const metaRoot = await mkdtemp(join(tmpdir(), "pi-eng-meta-root-"));
+    fixtures.push(target, { root: metaRoot, cleanup: () => rm(metaRoot, { recursive: true, force: true }) });
+    const worker: WorkerExecutor = {
+      async run(req) {
+        if (req.role === "implementer") {
+          await writeFile(join(req.cwd!, "src", "allowed.ts"), "export const allowed = true;\n", "utf8");
+          await writeFile(join(req.cwd!, "outside.ts"), "export const escaped = true;\n", "utf8");
+        }
+        return {
+          result: {
+            status: "completed",
+            summary: "worker completed",
+            claims: [],
+            evidence_refs: [],
+            new_hypotheses: [],
+            proposed_tasks: [],
+            details: {},
+          },
+          usage: {
+            input: 1,
+            output: 1,
+            cacheRead: 0,
+            cacheWrite: 0,
+            cost: 0,
+            contextTokens: 1,
+            turns: 1,
+            model: "fake",
+          },
+          toolCalls: 0,
+        };
+      },
+    };
+    const rt = await EngineeringRuntime.open({
+      cwd: metaRoot,
+      worker,
+      verifier: new (await import("../../src/verify/Verifier.ts")).CommandVerifier(),
+    });
+
+    const result = await rt.orchestrator!.orchestrate(`Implement only in ${join(target.root, "src")}`, {
+      repository: metaRoot,
+      baseRef: "",
+      mutationRequested: true,
+    });
+
+    assert.equal(result.completed, false);
+    const manifest = rt.missionStore!.getWorkspaceManifest(result.mission.mission_id)!;
+    assert.deepEqual(manifest.repositories[0]?.writableDomains, ["src/**"]);
+    assert.ok(
+      rt
+        .missionStore!.listTasks(result.mission.mission_id)
+        .filter((task) => task.mutates_repo)
+        .every((task) => task.write_domains.every((domain) => domain === "src/**")),
+    );
+    await assert.rejects(readFile(join(target.root, "outside.ts"), "utf8"), /ENOENT/);
+    await assert.rejects(readFile(join(target.root, "src", "allowed.ts"), "utf8"), /ENOENT/);
+    assert.ok(
+      rt
+        .missionStore!.listFailureClassifications(result.mission.mission_id)
+        .some((classification) => classification.category === "WORKSPACE_SCOPE_MISMATCH"),
+    );
+  });
+
+  it("keeps concurrent external missions bound to their explicit repoIds", async () => {
+    const first = await greenFixture();
+    const second = await greenFixture();
+    const metaRoot = await mkdtemp(join(tmpdir(), "pi-eng-meta-root-"));
+    fixtures.push(first, second, { root: metaRoot, cleanup: () => rm(metaRoot, { recursive: true, force: true }) });
+    const worker: WorkerExecutor = {
+      async run(req) {
+        if (req.role === "implementer") {
+          const marker = req.task.includes(first.root) ? "first" : "second";
+          await writeFile(join(req.cwd!, "src", `${marker}.ts`), `export const ${marker} = true;\n`, "utf8");
+          await new Promise((resolve) => setTimeout(resolve, 25));
+        }
+        return {
+          result: {
+            status: "completed",
+            summary: "done",
+            claims: [],
+            evidence_refs: [],
+            new_hypotheses: [],
+            proposed_tasks: [],
+            details: {},
+          },
+          usage: {
+            input: 1,
+            output: 1,
+            cacheRead: 0,
+            cacheWrite: 0,
+            cost: 0,
+            contextTokens: 1,
+            turns: 1,
+            model: "fake",
+          },
+          toolCalls: 0,
+        };
+      },
+    };
+    const rt = await EngineeringRuntime.open({
+      cwd: metaRoot,
+      worker,
+      verifier: new (await import("../../src/verify/Verifier.ts")).CommandVerifier(),
+    });
+
+    const [a, b] = await Promise.all([
+      rt.orchestrator!.orchestrate(`Add first support in ${first.root}`, {
+        repository: metaRoot,
+        baseRef: "",
+        mutationRequested: true,
+      }),
+      rt.orchestrator!.orchestrate(`Add second support in ${second.root}`, {
+        repository: metaRoot,
+        baseRef: "",
+        mutationRequested: true,
+      }),
+    ]);
+
+    assert.equal(a.completed, true, a.failureReason ?? "");
+    assert.equal(b.completed, true, b.failureReason ?? "");
+    assert.match(await readFile(join(first.root, "src", "first.ts"), "utf8"), /first/);
+    assert.match(await readFile(join(second.root, "src", "second.ts"), "utf8"), /second/);
+    await assert.rejects(readFile(join(first.root, "src", "second.ts"), "utf8"), /ENOENT/);
+    await assert.rejects(readFile(join(second.root, "src", "first.ts"), "utf8"), /ENOENT/);
+  });
+
+  it("mission tool derives the external target base instead of forwarding the launch repo SHA", async () => {
+    const launch = await greenFixture();
+    const target = await greenFixture();
+    fixtures.push(launch, target);
+    await writeFile(join(launch.root, "launch-only.txt"), "different history\n", "utf8");
+    const { execFile } = await import("node:child_process");
+    const { promisify } = await import("node:util");
+    await promisify(execFile)("git", ["-C", launch.root, "add", "launch-only.txt"]);
+    await promisify(execFile)("git", ["-C", launch.root, "commit", "-q", "-m", "launch-only history"]);
+    const rt = await openRuntime(launch.root);
+    const targetGit = await (await import("../../src/git/GitRepo.ts")).GitRepo.open(target.root);
+    assert.ok(targetGit);
+    const targetBase = await targetGit.headCommit();
+    const launchBase = await rt.git!.headCommit();
+    assert.notEqual(targetBase, launchBase);
+    const missionTool = rt.coreTools.find((tool) => tool.name === "mission")!;
+    const execute = missionTool.execute as unknown as (
+      id: string,
+      params: { request: string; mutate: boolean },
+      signal: AbortSignal | undefined,
+      onUpdate: unknown,
+      ctx: { cwd: string },
+    ) => Promise<{ details: { missionId: string } }>;
+
+    const response = await execute(
+      "external-base",
+      { request: `Add external support in ${target.root}`, mutate: true },
+      undefined,
+      undefined,
+      { cwd: launch.root },
+    );
+
+    const mission = rt.missionStore!.getMission(response.details.missionId)!;
+    assert.equal(mission.repository, target.root);
+    assert.equal(mission.base_ref, targetBase);
+  });
+
+  it("rejects a supplied base commit that does not belong to the selected external repository", async () => {
+    const launch = await greenFixture();
+    const target = await greenFixture();
+    const metaRoot = await mkdtemp(join(tmpdir(), "pi-eng-meta-root-"));
+    fixtures.push(launch, target, { root: metaRoot, cleanup: () => rm(metaRoot, { recursive: true, force: true }) });
+    await writeFile(join(launch.root, "launch-only.txt"), "unique launch commit\n", "utf8");
+    const { execFile } = await import("node:child_process");
+    const { promisify } = await import("node:util");
+    await promisify(execFile)("git", ["-C", launch.root, "add", "launch-only.txt"]);
+    await promisify(execFile)("git", ["-C", launch.root, "commit", "-q", "-m", "unique launch commit"]);
+    const launchGit = await (await import("../../src/git/GitRepo.ts")).GitRepo.open(launch.root);
+    assert.ok(launchGit);
+    const rt = await openRuntime(metaRoot);
+
+    const result = await rt.orchestrator!.orchestrate(`Modify ${target.root}`, {
+      repository: metaRoot,
+      baseRef: await launchGit.headCommit(),
+      mutationRequested: true,
+    });
+
+    assert.equal(result.mission.status, "BLOCKED");
+    assert.match(result.failureReason ?? "", /does not belong to selected repository/i);
+    assert.equal(rt.missionStore!.listTasks(result.mission.mission_id).length, 0);
+  });
+
+  it("reloads an external manifest binding when the meta-root runtime reopens", async () => {
+    const target = await greenFixture();
+    const metaRoot = await mkdtemp(join(tmpdir(), "pi-eng-meta-root-"));
+    fixtures.push(target, { root: metaRoot, cleanup: () => rm(metaRoot, { recursive: true, force: true }) });
+    const rt1 = await openRuntime(metaRoot);
+    const result = await rt1.orchestrator!.orchestrate(`Add support in ${target.root}`, {
+      repository: metaRoot,
+      baseRef: "",
+      mutationRequested: true,
+    });
+    await rt1.missionStore!.flush();
+    const repoId = rt1.missionStore!.getWorkspaceManifest(result.mission.mission_id)!.repositories[0]!.repoId;
+
+    const rt2 = await openRuntime(metaRoot);
+
+    assert.equal(rt2.repositoryRegistry.get(repoId).root, target.root);
+  });
+
   it("scenario B: investigation escalates to engineering+review when source changes", async () => {
     const fx = await greenFixture();
     fixtures.push(fx);

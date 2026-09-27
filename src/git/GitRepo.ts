@@ -84,6 +84,12 @@ export class GitRepo {
     return r.stdout;
   }
 
+  /** Resolve a ref only when this repository owns the referenced commit. */
+  async resolveCommit(ref: string): Promise<string | null> {
+    const r = await this.git(["rev-parse", "--verify", `${ref}^{commit}`]);
+    return r.code === 0 && r.stdout ? r.stdout : null;
+  }
+
   /** Resolve HEAD commit inside a specific worktree path. */
   async headCommitIn(path: string): Promise<string> {
     const r = await this.git(["-C", path, "rev-parse", "HEAD"]);
