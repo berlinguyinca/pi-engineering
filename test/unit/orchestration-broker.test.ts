@@ -212,6 +212,147 @@ async function assertCrossBoundaryRenameRejected(commitRename: boolean): Promise
 }
 
 describe("ExecutionBroker (spec 03)", () => {
+  it("settles at the deadline plus cancellation grace when the backend ignores AbortSignal forever", async () => {
+    const backend = JsonlEventStore.inMemory();
+    const store = MissionStore.open(backend);
+    const mission = store.createMission({
+      title: "hard timeout",
+      goal: "hard timeout",
+      user_request: "hard timeout",
+      repository: ".",
+      base_ref: "",
+      risk_profile: "low",
+      workflow_class: "engineering_review",
+    });
+    const task = store.createTask({
+      mission_id: mission.mission_id,
+      kind: "agent",
+      role: "implementer",
+      objective: "ignore cancellation",
+    });
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const broker = new ExecutionBroker({
+      store,
+      defaultTimeoutMs: 25,
+      cancellationAckTimeoutMs: 20,
+      backends: {
+        agent: {
+          runAgent: async () => {
+            await blocked;
+            return { executionId: "late", exitStatus: "succeeded", summary: "late", artifactRefs: [], usage: {} };
+          },
+        },
+      },
+    });
+    const handle = await broker.execute({
+      taskId: task.task_id,
+      missionId: mission.mission_id,
+      kind: "agent",
+      objective: task.objective,
+    });
+
+    const result = handle.result();
+    const observed = await Promise.race([
+      result.then((outcome) => ({ kind: "settled" as const, outcome })),
+      new Promise<{ kind: "observation_timeout" }>((resolve) =>
+        setTimeout(() => resolve({ kind: "observation_timeout" }), 125),
+      ),
+    ]);
+    release();
+    await result.catch(() => undefined);
+
+    assert.equal(observed.kind, "settled", "an uncooperative backend must not own handle settlement");
+    if (observed.kind === "settled") {
+      assert.equal(observed.outcome.exitStatus, "failed");
+      assert.equal(observed.outcome.error, "timeout");
+    }
+    assert.equal(store.getExecution(handle.executionId)?.status, "FAILED");
+    assert.equal(store.getExecution(handle.executionId)?.exit_status, "timeout");
+  });
+
+  it("records a late success as evidence without overwriting the terminal timeout", async () => {
+    const backend = JsonlEventStore.inMemory();
+    const store = MissionStore.open(backend);
+    const mission = store.createMission({
+      title: "late success",
+      goal: "late success",
+      user_request: "late success",
+      repository: ".",
+      base_ref: "",
+      risk_profile: "low",
+      workflow_class: "engineering_review",
+    });
+    const task = store.createTask({
+      mission_id: mission.mission_id,
+      kind: "review",
+      role: "reviewer",
+      objective: "arrive too late",
+      required_output_artifacts: ["gate"],
+    });
+    store.transitionTask(task.task_id, "READY");
+    let finishLate!: () => void;
+    const late = new Promise<void>((resolve) => {
+      finishLate = resolve;
+    });
+    const broker = new ExecutionBroker({
+      store,
+      defaultTimeoutMs: 20,
+      cancellationAckTimeoutMs: 15,
+      backends: {
+        review: {
+          runReview: async () => {
+            await late;
+            return {
+              executionId: "late-review",
+              exitStatus: "succeeded",
+              summary: "late approval",
+              artifactRefs: ["artifact://gate/late-approval"],
+              usage: { accepted: true },
+              findings: [{ severity: "none", summary: "late finding" }],
+            };
+          },
+        },
+      },
+    });
+    const handle = await broker.execute({
+      taskId: task.task_id,
+      missionId: mission.mission_id,
+      kind: "review",
+      objective: task.objective,
+      requiredOutputArtifacts: task.required_output_artifacts,
+    });
+
+    const outcome = await Promise.race([
+      handle.result(),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("result did not hard-timeout")), 125)),
+    ]).catch(async (error) => {
+      finishLate();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      throw error;
+    });
+    assert.equal(outcome.error, "timeout");
+    const terminal = store.getExecution(handle.executionId)!;
+    const findings = store.listFindings(mission.mission_id);
+
+    finishLate();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    assert.deepEqual(
+      store.getExecution(handle.executionId),
+      terminal,
+      "late output must not rewrite terminal evidence",
+    );
+    assert.deepEqual(store.listFindings(mission.mission_id), findings, "late findings must remain inert evidence");
+    assert.deepEqual(terminal.artifact_refs, [], "late gate artifacts must not become completion evidence");
+    assert.ok(
+      backend.all().some((event) => event.type === "execution.late_result_rejected"),
+      "the rejected late result must remain auditable",
+    );
+  });
+
   it("does not complete declared deliverables when required artifact identities are missing", async () => {
     const { broker, m, t, store } = setup({
       agent: {
@@ -464,22 +605,17 @@ describe("ExecutionBroker (spec 03)", () => {
       return { executionId: "late", exitStatus: "succeeded", summary: "late", artifactRefs: [], usage: {} };
     });
     const originalStatusPathsIn = context.git.statusPathsIn.bind(context.git);
-    const originalHeadCommitIn = context.git.headCommitIn.bind(context.git);
     let statusReads = 0;
+    let movedHead = false;
     context.git.statusPathsIn = async (worktree) => {
       const paths = await originalStatusPathsIn(worktree);
       statusReads++;
-      return paths;
-    };
-    let movedHead = false;
-    context.git.headCommitIn = async (worktree) => {
-      const head = await originalHeadCommitIn(worktree);
       if (statusReads >= 3 && !movedHead) {
         movedHead = true;
         await writeFile(join(worktree, "src", "moved-head.ts"), "export const movedHead = true;\n", "utf8");
         await context.git.commitAll(worktree, "move HEAD during checkpoint snapshot");
       }
-      return head;
+      return paths;
     };
     const result = context.handle.result().catch(() => undefined);
     const worktree = await worktreeReady;

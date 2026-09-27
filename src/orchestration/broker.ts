@@ -261,6 +261,7 @@ export class ExecutionBroker {
       worktree: string | null;
       taskId: string;
       cancelCheckpoint?: () => Promise<void>;
+      canceling?: boolean;
     }
   >();
   /** Allocated worktrees, cleaned up when their execution settles. */
@@ -419,6 +420,7 @@ export class ExecutionBroker {
   async cancelExecution(executionId: string, taskId?: string): Promise<boolean> {
     const entry = this.active.get(executionId);
     if (!entry) return false;
+    entry.canceling = true;
     entry.abort.abort();
     const checkpoint = entry.cancelCheckpoint?.();
     let checkpointError: unknown;
@@ -894,6 +896,8 @@ export class ExecutionBroker {
         let meaningfulActivity = 0;
         let checkpointScheduling = true;
         let retainWorktreeOnCleanup = false;
+        let detachedAfterTerminalAbort = false;
+        let cleanupOwnedByCancellation = false;
         let cancelCheckpointPromise: Promise<void> | undefined;
         let checkpointChain = Promise.resolve();
         let writerStarted = false;
@@ -1091,22 +1095,175 @@ export class ExecutionBroker {
           if (abort.signal.aborted) throw new Error("execution aborted before dispatch");
           input.authority?.assertAuthoritative();
           writerStarted = true;
-          let outcome: ExecutionOutcome;
-          try {
-            outcome = await this.dispatch(
-              input,
-              backend,
-              execution.execution_id,
-              abort.signal,
-              worktree,
-              emitActivity,
-              repository,
-            );
-          } finally {
-            acknowledgeWriterSettled();
+          type BackendSettlement =
+            | { kind: "backend_result"; outcome: ExecutionOutcome }
+            | { kind: "backend_error"; error: unknown };
+          const backendSettlement: Promise<BackendSettlement> = this.dispatch(
+            input,
+            backend,
+            execution.execution_id,
+            abort.signal,
+            worktree,
+            emitActivity,
+            repository,
+          )
+            .then((outcome) => ({ kind: "backend_result" as const, outcome }))
+            .catch((error: unknown) => ({ kind: "backend_error" as const, error }))
+            .finally(acknowledgeWriterSettled);
+          let removeAbortRaceListener = (): void => {};
+          const aborted = new Promise<{ kind: "aborted" }>((resolve) => {
+            const listener = (): void => resolve({ kind: "aborted" });
+            removeAbortRaceListener = () => abort.signal.removeEventListener("abort", listener);
+            if (abort.signal.aborted) resolve({ kind: "aborted" });
+            else abort.signal.addEventListener("abort", listener, { once: true });
+          });
+          const first = await Promise.race([backendSettlement, aborted]);
+          removeAbortRaceListener();
+          if (first.kind === "aborted") {
+            const timedOut = abort.signal.reason instanceof DOMException && abort.signal.reason.name === "TimeoutError";
+            const activeAtAbort = this.active.get(execution.execution_id);
+            const externallyCanceled = activeAtAbort?.canceling === true;
+            const checkpointCancellation = activeAtAbort?.cancelCheckpoint?.();
+            let graceTimer: ReturnType<typeof setTimeout> | undefined;
+            const cleanupSettled = Promise.allSettled([
+              backendSettlement,
+              checkpointCancellation ?? Promise.resolve(),
+            ]).then(() => true);
+            const cleanupCompleted = await Promise.race([
+              cleanupSettled,
+              new Promise<false>((resolve) => {
+                graceTimer = setTimeout(() => resolve(false), this.cancellationAckTimeoutMs);
+              }),
+            ]);
+            if (graceTimer) clearTimeout(graceTimer);
+
+            if (externallyCanceled) {
+              cleanupOwnedByCancellation = true;
+              detachedAfterTerminalAbort = true;
+              if (cleanupCompleted) {
+                const late = await backendSettlement;
+                if (late.kind === "backend_error") throw late.error;
+              }
+              void backendSettlement
+                .then(async (late) => {
+                  await new Promise<void>((resolve) => setImmediate(resolve));
+                  this.store.rejectLateExecution(execution.execution_id, "cancellation", {
+                    kind: late.kind,
+                    ...(late.kind === "backend_result"
+                      ? {
+                          exitStatus: late.outcome.exitStatus,
+                          summary: late.outcome.summary,
+                          artifactRefs: [...late.outcome.artifactRefs],
+                        }
+                      : { error: late.error instanceof Error ? late.error.message : String(late.error) }),
+                  });
+                })
+                .catch(() => {});
+              return {
+                executionId: execution.execution_id,
+                exitStatus: "failed",
+                summary: "Execution was canceled",
+                artifactRefs: [],
+                usage: {},
+                error: "canceled",
+              };
+            }
+
+            if (this.settledElsewhere(execution.execution_id)) {
+              detachedAfterTerminalAbort = true;
+              void backendSettlement
+                .then((late) => {
+                  this.store.rejectLateExecution(execution.execution_id, timedOut ? "hard timeout" : "cancellation", {
+                    kind: late.kind,
+                    ...(late.kind === "backend_result"
+                      ? {
+                          exitStatus: late.outcome.exitStatus,
+                          summary: late.outcome.summary,
+                          artifactRefs: [...late.outcome.artifactRefs],
+                        }
+                      : { error: late.error instanceof Error ? late.error.message : String(late.error) }),
+                  });
+                })
+                .catch(() => {});
+              return {
+                executionId: execution.execution_id,
+                exitStatus: "failed",
+                summary: timedOut ? `Execution exceeded its ${executionBudgetMs}ms deadline` : "Execution was canceled",
+                artifactRefs: [],
+                usage: {},
+                error: timedOut ? WALL_CLOCK_TIMEOUT_MARKER : "canceled",
+              };
+            }
+
+            // The terminal broker outcome revokes this execution. Before that
+            // fence lands, any bounded preservation work must still prove the
+            // originating mission + execution identity.
+            if (worktree) {
+              // A backend that crossed its deadline is no longer trusted to be
+              // quiescent. Keep the checkout mounted instead of performing any
+              // unbounded harvest after the grace boundary.
+              retainWorktreeOnCleanup = true;
+              this.retainWorktree(input.missionId, execution.execution_id);
+            }
+            input.authority?.assertAuthoritative();
+            this.store.assertExecutionAuthoritative(execution.execution_id);
+            if (worktree) {
+              const info = this.allocatedWorktrees.get(execution.execution_id);
+              const byBranch =
+                this.failedBranches.get(input.missionId) ??
+                new Map<string, { marker: string; taskId: string; recoverRef?: string }>();
+              if (info) {
+                byBranch.set(info.branch, {
+                  marker: timedOut ? WALL_CLOCK_TIMEOUT_MARKER : "canceled",
+                  taskId: input.taskId,
+                });
+                this.failedBranches.set(input.missionId, byBranch);
+              }
+            }
+
+            const terminalOutcome: ExecutionOutcome = {
+              executionId: execution.execution_id,
+              exitStatus: "failed",
+              summary: timedOut
+                ? `Execution exceeded its ${executionBudgetMs}ms deadline and cancellation grace`
+                : "Execution was canceled",
+              artifactRefs: [],
+              usage: {},
+              error: timedOut ? WALL_CLOCK_TIMEOUT_MARKER : "canceled",
+            };
+            this.store.setExecutionStatus(execution.execution_id, timedOut ? "FAILED" : "CANCELED", {
+              exit_status: terminalOutcome.error,
+            });
+            this.active.delete(execution.execution_id);
+            detachedAfterTerminalAbort = true;
+            void backendSettlement
+              .then((late) => {
+                this.store.rejectLateExecution(execution.execution_id, timedOut ? "hard timeout" : "cancellation", {
+                  kind: late.kind,
+                  ...(late.kind === "backend_result"
+                    ? {
+                        exitStatus: late.outcome.exitStatus,
+                        summary: late.outcome.summary,
+                        artifactRefs: [...late.outcome.artifactRefs],
+                      }
+                    : { error: late.error instanceof Error ? late.error.message : String(late.error) }),
+                });
+              })
+              .catch(() => {});
+            emitActivity({
+              kind: "execution",
+              phase: timedOut ? "failed" : "canceled",
+              stage: backend,
+              summary: "",
+              meaningfulProgress: false,
+            });
+            return terminalOutcome;
           }
+          if (first.kind === "backend_error") throw first.error;
+          let outcome = first.outcome;
           const escaped = await this.outOfScopeWorktreePaths(execution.execution_id, input);
           input.authority?.assertAuthoritative();
+          this.store.assertExecutionAuthoritative(execution.execution_id);
           if (escaped.length > 0) {
             this.workspaceScopeFailure(execution.execution_id, escaped, input.writeDomains ?? []);
             outcome = {
@@ -1134,24 +1291,8 @@ export class ExecutionBroker {
             outcome.artifactRefs.map(artifactHash),
           );
           await checkpointChain;
-          // A cancellation that already settled this execution must not be
-          // overwritten by the runner's late success.
-          if (!this.settledElsewhere(execution.execution_id)) {
-            // Resolution is not success. The completion gate counts SUCCEEDED
-            // executions as validation/review evidence, so recording a failed
-            // validation run as SUCCEEDED would corrupt the gate's primary
-            // evidence source.
-            const succeeded = outcome.exitStatus === "succeeded";
-            this.store.setExecutionStatus(execution.execution_id, succeeded ? "SUCCEEDED" : "FAILED", {
-              exit_status: outcome.exitStatus,
-              artifact_refs: outcome.artifactRefs,
-              usage: outcome.usage,
-              ...(outcome.recoveredMerged?.length ? { recovered_merged: outcome.recoveredMerged } : {}),
-              ...(backend === "review" && input.reviewedRecovered?.length
-                ? { reviewed_recovered: [...input.reviewedRecovered] }
-                : {}),
-            });
-          }
+          input.authority?.assertAuthoritative();
+          this.store.assertExecutionAuthoritative(execution.execution_id);
           // Persist the worker's edits onto its branch before the worktree is
           // torn down, otherwise integration has nothing to merge — and on a
           // FAILED execution, otherwise the worker's partial work dies with the
@@ -1159,6 +1300,7 @@ export class ExecutionBroker {
           // failed branches are then excluded from integration and preserved.
           if (input.mutatesRepo && worktree && escaped.length === 0) {
             input.authority?.assertAuthoritative();
+            this.store.assertExecutionAuthoritative(execution.execution_id);
             const info = this.allocatedWorktrees.get(execution.execution_id);
             const failed = outcome.exitStatus !== "succeeded";
             // Captured BEFORE the harvest: the harvest commits the worker's
@@ -1170,6 +1312,7 @@ export class ExecutionBroker {
                 : undefined;
             await this.harvestWorktree(execution.execution_id);
             input.authority?.assertAuthoritative();
+            this.store.assertExecutionAuthoritative(execution.execution_id);
             if (info) {
               // Last settled outcome wins: a retry that succeeds on the same
               // branch clears the earlier failure instead of being excluded.
@@ -1196,6 +1339,21 @@ export class ExecutionBroker {
               this.failedBranches.set(input.missionId, byBranch);
             }
           }
+          // Publish terminal result evidence only after every mutation and
+          // handoff decision has passed the live execution fence. The status
+          // transition itself revokes that fence.
+          input.authority?.assertAuthoritative();
+          this.store.assertExecutionAuthoritative(execution.execution_id);
+          const succeeded = outcome.exitStatus === "succeeded";
+          this.store.setExecutionStatus(execution.execution_id, succeeded ? "SUCCEEDED" : "FAILED", {
+            exit_status: outcome.exitStatus,
+            artifact_refs: outcome.artifactRefs,
+            usage: outcome.usage,
+            ...(outcome.recoveredMerged?.length ? { recovered_merged: outcome.recoveredMerged } : {}),
+            ...(backend === "review" && input.reviewedRecovered?.length
+              ? { reviewed_recovered: [...input.reviewedRecovered] }
+              : {}),
+          });
           this.active.delete(execution.execution_id);
           emitActivity({
             kind: "execution",
@@ -1238,11 +1396,15 @@ export class ExecutionBroker {
           if (activityTimer) clearInterval(activityTimer);
           if (checkpointTimer) clearTimeout(checkpointTimer);
           checkpointScheduling = false;
-          await cancelCheckpointPromise?.catch(() => undefined);
-          await checkpointChain.catch(() => undefined);
+          if (!detachedAfterTerminalAbort) {
+            await cancelCheckpointPromise?.catch(() => undefined);
+            await checkpointChain.catch(() => undefined);
+          }
           abort.signal.removeEventListener("abort", onAbort);
           clearTimeout(timer);
-          if (!retainWorktreeOnCleanup) await this.releaseWorktree(execution.execution_id);
+          if (!retainWorktreeOnCleanup && !cleanupOwnedByCancellation) {
+            await this.releaseWorktree(execution.execution_id);
+          }
         }
       },
     };

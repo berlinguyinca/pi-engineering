@@ -95,6 +95,63 @@ function delayedConcurrencyTracker(delayMs = 25) {
 }
 
 describe("MissionScheduler (spec 02)", () => {
+  it("releases scheduler capacity after the hard timeout of an uncooperative backend", async () => {
+    const store = MissionStore.open(JsonlEventStore.inMemory());
+    const mission = createExecutingMission(store);
+    const stuck = store.createTask({
+      mission_id: mission.mission_id,
+      kind: "agent",
+      role: "implementer",
+      objective: "stuck",
+      execution_budget_ms: 25,
+      max_attempts: 1,
+    });
+    const next = store.createTask({
+      mission_id: mission.mission_id,
+      kind: "agent",
+      role: "implementer",
+      objective: "next",
+      execution_budget_ms: 1_000,
+      max_attempts: 1,
+    });
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const starts: string[] = [];
+    const broker = new ExecutionBroker({
+      store,
+      cancellationAckTimeoutMs: 20,
+      backends: {
+        agent: {
+          runAgent: async ({ objective }) => {
+            starts.push(objective);
+            if (objective === "stuck") await blocked;
+            return { executionId: objective, exitStatus: "succeeded", summary: "done", artifactRefs: [], usage: {} };
+          },
+        },
+      },
+    });
+    const scheduler = new MissionScheduler({
+      store,
+      broker,
+      limits: { maxActive: 1, maxAgents: 1, maxPerRole: 1 },
+    });
+
+    const running = scheduler.runMission(mission.mission_id);
+    const observed = await Promise.race([
+      running.then(() => "settled" as const),
+      new Promise<"observation_timeout">((resolve) => setTimeout(() => resolve("observation_timeout"), 150)),
+    ]);
+    release();
+    await running;
+
+    assert.equal(observed, "settled", "the timed-out slot must be available to the next task");
+    assert.deepEqual(starts, ["stuck", "next"]);
+    assert.equal(store.getTask(stuck.task_id)?.status, "FAILED");
+    assert.equal(store.getTask(next.task_id)?.status, "SUCCEEDED");
+  });
+
   it("attaches checkpoint identity and checkpoints progress without passing acceptance", async () => {
     const store = MissionStore.open(JsonlEventStore.inMemory());
     const mission = createExecutingMission(store);
@@ -282,7 +339,8 @@ describe("MissionScheduler (spec 02)", () => {
   });
 
   it("cancels and rejects a late worker result after mission takeover", async () => {
-    const store = MissionStore.open(JsonlEventStore.inMemory());
+    const eventStore = JsonlEventStore.inMemory();
+    const store = MissionStore.open(eventStore);
     const mission = createExecutingMission(store);
     let now = Date.parse("2026-09-26T10:00:00.000Z");
     const firstOwner = new MissionOwnership(store, {
@@ -352,7 +410,8 @@ describe("MissionScheduler (spec 02)", () => {
     assert.notEqual(store.getTask(task.task_id)?.status, "SUCCEEDED");
     const execution = store.listExecutions(mission.mission_id, task.task_id)[0]!;
     assert.equal(execution.status, "CANCELED");
-    assert.match(execution.exit_status ?? "", /late_result_rejected/);
+    assert.equal(execution.exit_status, "canceled", "late evidence must not overwrite the terminal cancellation");
+    assert.ok(eventStore.all().some((event) => event.type === "execution.late_result_rejected"));
   });
 
   it("serializes mutating dispatches from separate controllers by repository id", async () => {

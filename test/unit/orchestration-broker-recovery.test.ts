@@ -11,6 +11,7 @@ import { join } from "node:path";
 import { describe, it } from "node:test";
 import { GitRepo } from "../../src/git/GitRepo.ts";
 import { ExecutionBroker, type ExecutionOutcome } from "../../src/orchestration/broker.ts";
+import { CheckpointManager } from "../../src/orchestration/checkpoints.ts";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 import { makeFixtureRepo } from "../fixtures/make-fixture.ts";
@@ -151,6 +152,149 @@ async function scenario(steps: Step[], mode: IntegrationMode = {}) {
 }
 
 describe("ExecutionBroker: recovering a timed-out worker's committed work", () => {
+  it("preserves a pre-timeout checkpoint but keeps the uncooperative branch ineligible for integration", async () => {
+    const fx = await makeFixtureRepo();
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    try {
+      const git = (await GitRepo.open(fx.root))!;
+      const store = MissionStore.open(JsonlEventStore.inMemory());
+      const base = await git.headCommit();
+      const mission = store.createMission({
+        title: "preserve timeout checkpoint",
+        goal: "preserve timeout checkpoint",
+        user_request: "preserve timeout checkpoint",
+        repository: fx.root,
+        base_ref: base,
+        risk_profile: "medium",
+        workflow_class: "engineering_review",
+      });
+      store.bindWorkspaceManifest({
+        manifestId: "WM-timeout-preserve",
+        missionId: mission.mission_id,
+        generation: 1,
+        authorizedRoots: [{ canonicalPath: fx.root, source: "existing_manifest", access: "write" }],
+        repositories: [
+          {
+            repoId: "repo-timeout-preserve",
+            canonicalRoot: fx.root,
+            baseRef: "main",
+            baseSha: base,
+            writableDomains: ["src/**"],
+          },
+        ],
+        dependencyEdges: [],
+        hash: "manifest-timeout-preserve",
+        createdAt: "2026-09-27T10:00:00.000Z",
+      });
+      const task = store.createTask({
+        mission_id: mission.mission_id,
+        repo_id: "repo-timeout-preserve",
+        kind: "agent",
+        role: "implementer",
+        objective: "commit then ignore timeout",
+        mutates_repo: true,
+        isolation: "worktree",
+        write_domains: ["src/**"],
+        deliverables: ["implementation"],
+        execution_budget_ms: 1_000,
+        checkpoint_policy: { activity_milestone: 1, before_deadline_ms: 200 },
+      });
+      const handoffs: Handoff[] = [];
+      const broker = new ExecutionBroker({
+        store,
+        git,
+        checkpoints: new CheckpointManager({ store }),
+        cancellationAckTimeoutMs: 20,
+        resolveRepository: async (repoId) => ({ repoId, root: fx.root, git }),
+        backends: {
+          agent: {
+            runAgent: async ({ worktree, onActivity }) => {
+              await mkdir(join(worktree!, "src"), { recursive: true });
+              await writeFile(join(worktree!, "src", "preserved.ts"), "export const preserved = true;\n");
+              await git.commitAll(worktree!, "worker checkpoint commit");
+              onActivity?.({ kind: "state", summary: "checkpoint", meaningfulProgress: true });
+              await blocked;
+              return {
+                executionId: "late-worker",
+                exitStatus: "succeeded",
+                summary: "late",
+                artifactRefs: ["artifact://handoff/late"],
+                usage: {},
+              };
+            },
+          },
+          integration: {
+            runIntegration: async (input) => {
+              handoffs.push(...(input.handoffs as Handoff[]));
+              return {
+                executionId: "integration",
+                exitStatus: "succeeded",
+                summary: "done",
+                artifactRefs: [],
+                usage: {},
+              };
+            },
+          },
+        },
+      });
+      const handle = await broker.execute({
+        taskId: task.task_id,
+        missionId: mission.mission_id,
+        repoId: task.repo_id,
+        kind: "agent",
+        role: task.role,
+        objective: task.objective,
+        mutatesRepo: true,
+        isolation: "worktree",
+        writeDomains: task.write_domains,
+        deliverables: task.deliverables,
+        executionBudgetMs: task.execution_budget_ms,
+        checkpointPolicy: task.checkpoint_policy,
+      });
+      const result = handle.result();
+      const outcome = await Promise.race([
+        result,
+        new Promise<never>((_, reject) => setTimeout(() => reject(new Error("result did not hard-timeout")), 4_000)),
+      ]).catch(async (error) => {
+        release();
+        await result.catch(() => undefined);
+        throw error;
+      });
+      assert.equal(outcome.error, "timeout");
+      const checkpoint = store.getTaskCheckpoint(store.getExecution(handle.executionId)!.checkpoint_id!);
+      assert.ok(checkpoint?.candidateSha, "the last stable checkpoint remains recoverable evidence");
+      execFileSync("git", ["-C", fx.root, "cat-file", "-e", `${checkpoint.candidateSha}:src/preserved.ts`]);
+
+      const integrationTask = store.createTask({
+        mission_id: mission.mission_id,
+        repo_id: task.repo_id,
+        kind: "integration",
+        role: "integrator",
+        objective: "do not integrate unreconciled timeout work",
+      });
+      await (
+        await broker.execute({
+          taskId: integrationTask.task_id,
+          missionId: mission.mission_id,
+          repoId: task.repo_id,
+          kind: "integration",
+          role: integrationTask.role,
+          objective: integrationTask.objective,
+        })
+      ).result();
+      assert.deepEqual(handoffs, [], "checkpointed timeout work requires reconciliation before integration");
+
+      release();
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    } finally {
+      release();
+      await fx.cleanup();
+    }
+  });
+
   it("recovers exactly the commits the worker made, not the harvest's auto-commit of its half-done edits", async () => {
     const s = await scenario([{ task: "committed", commit: ["done.txt"], edit: ["half.txt"], outcome: TIMEOUT }]);
     try {

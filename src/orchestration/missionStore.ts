@@ -892,20 +892,56 @@ export class MissionStore {
       .map(copyExecution);
   }
 
-  rejectLateExecution(executionId: string, reason: string): Execution {
+  /**
+   * Assert that an execution still owns its result/mutation epoch.
+   *
+   * Execution status is the broker-local revocation fence: once timeout or
+   * cancellation settles it, continuations from the backend may be observed
+   * as evidence but can no longer publish artifacts, findings, checkpoints,
+   * candidate state, or handoffs. Generation fields additionally prevent an
+   * older execution from writing through a reassigned task.
+   */
+  assertExecutionAuthoritative(executionId: string): Execution {
     const execution = this.executions.get(executionId);
     if (!execution) throw new Error(`unknown execution ${executionId}`);
-    const rejected: Execution = {
-      ...execution,
-      status: "CANCELED",
-      exit_status: `late_result_rejected:${reason}`,
-      ended_at: new Date().toISOString(),
-    };
-    this.executions.set(executionId, rejected);
+    if (execution.status !== "RUNNING") {
+      throw new Error(`execution ${executionId} is no longer authoritative (${execution.status})`);
+    }
+    const task = this.tasks.get(execution.task_id);
+    if (!task) throw new Error(`unknown task ${execution.task_id}`);
+    const mismatches = [
+      task.mission_generation !== execution.mission_generation ? "mission generation" : null,
+      task.candidate_generation !== execution.candidate_generation ? "candidate generation" : null,
+      task.fencing_token !== execution.fencing_token ? "fencing token" : null,
+      task.assigned_execution_id && task.assigned_execution_id !== executionId ? "assigned execution" : null,
+    ].filter((value): value is string => value !== null);
+    if (mismatches.length > 0) {
+      throw new Error(`stale execution identity for ${executionId}: ${mismatches.join(", ")}`);
+    }
+    return copyExecution(execution);
+  }
+
+  rejectLateExecution(executionId: string, reason: string, evidence?: Record<string, unknown>): Execution {
+    const execution = this.executions.get(executionId);
+    if (!execution) throw new Error(`unknown execution ${executionId}`);
+    // A late observation is append-only evidence. Never rewrite an already
+    // terminal timeout/cancellation outcome with whatever the stale backend
+    // happened to return later.
+    const rejected: Execution =
+      execution.status === "RUNNING"
+        ? {
+            ...execution,
+            status: "CANCELED",
+            exit_status: `late_result_rejected:${reason}`,
+            ended_at: new Date().toISOString(),
+          }
+        : execution;
+    if (execution.status === "RUNNING") this.executions.set(executionId, rejected);
     this.emit("execution.late_result_rejected", execution.mission_id, {
       actor: "system",
       execution: rejected,
       reason,
+      ...(evidence ? { evidence } : {}),
     });
     return copyExecution(rejected);
   }
