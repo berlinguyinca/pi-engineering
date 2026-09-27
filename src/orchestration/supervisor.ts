@@ -46,6 +46,13 @@ export interface SupervisorDiagnostic {
   occurredAt: string;
   name: string;
   message: string;
+  callbackFailure?: SupervisorDiagnosticDetail;
+}
+
+export interface SupervisorDiagnosticDetail {
+  occurredAt: string;
+  name: string;
+  message: string;
 }
 
 interface Diagnosis {
@@ -102,7 +109,10 @@ export class MissionSupervisor {
   }
 
   diagnostics(): SupervisorDiagnostic[] {
-    return this.supervisorDiagnostics.map((diagnostic) => ({ ...diagnostic }));
+    return this.supervisorDiagnostics.map((diagnostic) => ({
+      ...diagnostic,
+      ...(diagnostic.callbackFailure ? { callbackFailure: { ...diagnostic.callbackFailure } } : {}),
+    }));
   }
 
   async reconcileOnStartup(beforeDispatch?: () => void | Promise<void>): Promise<SupervisorStatus[]> {
@@ -418,11 +428,11 @@ export class MissionSupervisor {
       await this.onError?.({ ...diagnostic });
     } catch (callbackError) {
       const callbackFailure = callbackError instanceof Error ? callbackError : new Error(String(callbackError));
-      this.appendDiagnostic({
+      diagnostic.callbackFailure = {
         occurredAt: new Date(this.now()).toISOString(),
         name: callbackFailure.name,
-        message: `Supervisor error callback failed: ${callbackFailure.message}`,
-      });
+        message: callbackFailure.message,
+      };
     }
   }
 

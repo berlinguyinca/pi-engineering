@@ -164,3 +164,31 @@ Addressed the remaining high-severity detached-callback finding with a failing r
 
 - Promise assimilation on the detached interval error path and absence of `unhandledRejection` for rejecting async handlers.
 - Callback-failure diagnostics remain bounded and bypass `onError`, preventing a recursive callback-failure loop.
+
+## Fix round 5
+
+Addressed the final high-severity diagnostic-cap finding with a failing concurrent regression before implementation:
+
+- Detached timer failures are now capped as atomic incidents. The tick's root failure is the capped entry, while an `onError` rejection annotates that same incident with its own timestamp, name, and message instead of consuming a second diagnostic slot.
+- `diagnostics()` deep-copies the nested callback detail, preserving an actionable public projection without exposing mutable internal state.
+- The stress regression overlaps 125 failed timer callbacks behind a shared async gate, then releases them to reject together. The public cap remains 100 incidents, every retained incident contains its tick root cause and its corresponding callback failure, and no rejection escapes to `unhandledRejection`.
+
+### Fix-round RED evidence
+
+- `node --test --experimental-strip-types --test-name-pattern='async error callback rejection|atomic incidents' test/unit/mission-supervisor.test.ts`
+  - Result before implementation: **0 passed, 2 failed**. The single callback rejection occupied a separate diagnostic, and the failure storm retained callback-only entries without their root tick failures.
+
+### Fix-round verification
+
+- Supervisor unit suite: **14 passed, 0 failed**.
+- Expanded Task 9 reliability matrix: **194 passed, 0 failed**.
+- `npm run typecheck`: passed.
+- `npm run lint -- --diagnostic-level=error`: passed; Biome checked 587 files.
+- `npm test`: **2574 passed, 0 failed, 1 skipped** (Postgres integration requires `TEST_DATABASE_URL`).
+- `git diff --check`: passed.
+
+### Fix-round reviewer focus
+
+- Incident ordering stays rooted in timer-failure occurrence order even when async callbacks reject in a different order.
+- Eviction removes a complete oldest incident; a late callback rejection can only annotate its own retained root and never creates a callback-only diagnostic.
+- The cap remains 100 under overlapping callback failures, while synchronous callbacks, no-handler behavior, stale-generation cancellation, and supervisor start/stop semantics remain unchanged.

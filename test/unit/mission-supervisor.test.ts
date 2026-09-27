@@ -436,12 +436,92 @@ describe("MissionSupervisor", () => {
       await new Promise<void>((resolve) => setImmediate(resolve));
 
       assert.deepEqual(unhandled, []);
-      assert.deepEqual(
-        supervisor.diagnostics().map((diagnostic) => diagnostic.message),
-        ["injected interval failure", "Supervisor error callback failed: async callback failure"],
-      );
+      assert.deepEqual(supervisor.diagnostics(), [
+        {
+          occurredAt: supervisor.diagnostics()[0]?.occurredAt,
+          name: "Error",
+          message: "injected interval failure",
+          callbackFailure: {
+            occurredAt: supervisor.diagnostics()[0]?.callbackFailure?.occurredAt,
+            name: "Error",
+            message: "async callback failure",
+          },
+        },
+      ]);
     } finally {
       supervisor.stop();
+      process.off("unhandledRejection", onUnhandled);
+    }
+  });
+
+  it("caps overlapping interval failures as atomic incidents with their async callback failures", async () => {
+    const h = harness();
+    const failureCount = 125;
+    let releaseCallbacks!: () => void;
+    const callbackGate = new Promise<void>((resolve) => {
+      releaseCallbacks = resolve;
+    });
+    let callbackCount = 0;
+    let reachedFailureCount!: () => void;
+    const allCallbacksStarted = new Promise<void>((resolve) => {
+      reachedFailureCount = resolve;
+    });
+    let flushCount = 0;
+    let supervisor!: MissionSupervisor;
+    supervisor = new MissionSupervisor({
+      store: h.store,
+      observability: h.observability,
+      intervalMs: 1,
+      onError: async (diagnostic) => {
+        callbackCount++;
+        if (callbackCount === failureCount) {
+          supervisor.stop();
+          reachedFailureCount();
+        }
+        await callbackGate;
+        throw new Error(`callback rejected for ${diagnostic.message}`);
+      },
+    });
+    h.store.flush = async () => {
+      throw new Error(`tick root failure ${++flushCount}`);
+    };
+    const unhandled: unknown[] = [];
+    const onUnhandled = (error: unknown) => unhandled.push(error);
+    process.on("unhandledRejection", onUnhandled);
+
+    try {
+      supervisor.start();
+      await allCallbacksStarted;
+      releaseCallbacks();
+      for (
+        let attempt = 0;
+        attempt < 100 &&
+        (supervisor.diagnostics().length < 100 ||
+          supervisor.diagnostics().some((diagnostic) => !diagnostic.callbackFailure));
+        attempt++
+      ) {
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
+
+      const diagnostics = supervisor.diagnostics();
+      assert.deepEqual(unhandled, []);
+      assert.equal(diagnostics.length, 100, "incident cap remains bounded under a failure storm");
+      for (const diagnostic of diagnostics) {
+        assert.match(diagnostic.message, /^tick root failure \d+$/, "retained incident keeps the tick root cause");
+        assert.match(
+          diagnostic.callbackFailure?.message ?? "",
+          /^callback rejected for tick root failure \d+$/,
+          "retained incident keeps the corresponding callback failure",
+        );
+        assert.equal(
+          diagnostic.callbackFailure?.message,
+          `callback rejected for ${diagnostic.message}`,
+          "root and callback details belong to the same incident",
+        );
+      }
+    } finally {
+      supervisor.stop();
+      releaseCallbacks();
       process.off("unhandledRejection", onUnhandled);
     }
   });
