@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { readFileSync, rmSync as removeSync } from "node:fs";
-import { mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
+import { link, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { hostname } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -50,38 +50,8 @@ function recoveryClaimPath(path: string, ownerToken: string): string {
   return `${path}.recover.${tokenHash}`;
 }
 
-function encodedOwnerEntry(owner: FileLockOwner): string {
-  return `owner.${Buffer.from(JSON.stringify(owner), "utf8").toString("base64url")}`;
-}
-
-function decodeOwnerEntry(entry: string): FileLockOwner | undefined {
-  if (!entry.startsWith("owner.")) return undefined;
-  try {
-    const value = JSON.parse(
-      Buffer.from(entry.slice("owner.".length), "base64url").toString("utf8"),
-    ) as Partial<FileLockOwner>;
-    if (
-      typeof value.pid !== "number" ||
-      typeof value.host !== "string" ||
-      typeof value.openedAt !== "string" ||
-      typeof value.ownerToken !== "string"
-    ) {
-      return undefined;
-    }
-    return value as FileLockOwner;
-  } catch {
-    return undefined;
-  }
-}
-
 async function readRecoveryClaim(path: string): Promise<FileLockOwner | undefined> {
-  try {
-    const entries = await readdir(path);
-    if (entries.length !== 1) return undefined;
-    return decodeOwnerEntry(entries[0]!);
-  } catch {
-    return undefined;
-  }
+  return readOwner(path);
 }
 
 function claimCollision(error: unknown): boolean {
@@ -90,20 +60,19 @@ function claimCollision(error: unknown): boolean {
 
 async function publishRecoveryClaim(path: string, owner: FileLockOwner): Promise<boolean> {
   const candidate = `${path}.candidate.${owner.ownerToken}`;
-  await mkdir(candidate);
+  await writeFile(candidate, `${JSON.stringify(owner)}\n`, { encoding: "utf8", flag: "wx" });
   try {
-    await writeFile(join(candidate, encodedOwnerEntry(owner)), "", { flag: "wx" });
     try {
-      // The non-empty candidate is fully built before this atomic publication.
-      // rename cannot replace an existing non-empty claim directory.
-      await rename(candidate, path);
+      // A hard link publishes the fully written identity atomically and, unlike
+      // POSIX rename, refuses every pre-existing destination type.
+      await link(candidate, path);
       return true;
     } catch (error) {
       if (!claimCollision(error)) throw error;
       return false;
     }
   } finally {
-    await rm(candidate, { recursive: true, force: true });
+    await rm(candidate, { force: true });
   }
 }
 
@@ -191,10 +160,10 @@ export class ExclusiveFileLock {
           await hooks.beforeRecoveryClaimReap?.(claimPath, { ...claimant });
           const tombstone = reapedClaimPath(claimPath, claimant.ownerToken);
           try {
-            // The identity-specific non-empty tombstone is intentionally kept.
-            // It makes a delayed second reaper fail rather than moving a live
-            // replacement that appeared at claimPath after the first rename.
-            await rename(claimPath, tombstone);
+            // Only the reaper that atomically creates this identity-specific
+            // hard-link tombstone may unlink the fixed path. A delayed loser
+            // cannot remove a replacement claim published afterward.
+            await link(claimPath, tombstone);
           } catch (reapError) {
             if ((reapError as NodeJS.ErrnoException).code === "ENOENT" || claimCollision(reapError)) {
               continue;
@@ -205,6 +174,7 @@ export class ExclusiveFileLock {
           if (reaped?.ownerToken !== claimant.ownerToken) {
             throw new Error(`JSONL writer recovery claim identity changed unexpectedly for ${file}`);
           }
+          await rm(claimPath, { force: true });
           continue;
         }
         try {

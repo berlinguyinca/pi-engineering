@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { appendFile, mkdtemp, readFile, readdir, stat, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { appendFile, mkdir, mkdtemp, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
@@ -253,10 +254,11 @@ describe("EventStore backends", () => {
       })}\n`,
     );
     const killedClaimant = await startRecoveryClaimant(file);
-    assert.equal((await stat(killedClaimant.claimPath)).isDirectory(), true);
-    const atomicIdentity = await readdir(killedClaimant.claimPath);
-    assert.equal(atomicIdentity.length, 1, "published claim identity is complete in one directory entry");
-    assert.match(atomicIdentity[0]!, /^owner\./);
+    assert.equal((await stat(killedClaimant.claimPath)).isFile(), true);
+    const atomicIdentity = JSON.parse(await readFile(killedClaimant.claimPath, "utf8")) as {
+      ownerToken?: string;
+    };
+    assert.equal(typeof atomicIdentity.ownerToken, "string", "published claim identity is complete");
     killedClaimant.child.kill("SIGKILL");
     await waitForExit(killedClaimant.child);
 
@@ -286,13 +288,13 @@ describe("EventStore backends", () => {
       })}\n`,
     );
     const claimant = await startRecoveryClaimant(file);
-    const before = await readdir(claimant.claimPath);
+    const before = await readFile(claimant.claimPath, "utf8");
 
     const contender = startRacingOwner(file);
     const outcome = await outcomeWithin(contender);
     try {
       assert.equal(outcome, "blocked");
-      assert.deepEqual(await readdir(claimant.claimPath), before);
+      assert.equal(await readFile(claimant.claimPath, "utf8"), before);
     } finally {
       if (outcome === "ready") contender.child.send("close");
       else contender.child.kill("SIGKILL");
@@ -300,6 +302,27 @@ describe("EventStore backends", () => {
       claimant.child.kill("SIGKILL");
       await waitForExit(claimant.child);
     }
+  });
+
+  it("fails closed when the fixed recovery claim is an empty directory", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pie-store-empty-recovery-claim-"));
+    const file = join(dir, "events.jsonl");
+    const staleOwnerToken = "stale-owner-with-empty-claim";
+    await writeFile(
+      `${file}.lock`,
+      `${JSON.stringify({
+        pid: 2_000_000_000,
+        host: hostname(),
+        openedAt: "2026-01-01T00:00:00.000Z",
+        ownerToken: staleOwnerToken,
+      })}\n`,
+    );
+    const tokenHash = createHash("sha256").update(staleOwnerToken).digest("hex").slice(0, 24);
+    const claimPath = `${file}.lock.recover.${tokenHash}`;
+    await mkdir(claimPath);
+
+    await assert.rejects(() => ExclusiveFileLock.acquire(file), /recovery.*claimed/i);
+    assert.deepEqual(await readdir(claimPath), [], "the unverifiable pre-existing claim is preserved");
   });
 
   it("keeps a replacement live claim when two dead-claim reapers race", async () => {

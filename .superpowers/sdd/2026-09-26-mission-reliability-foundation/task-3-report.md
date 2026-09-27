@@ -201,3 +201,44 @@ Implemented a real cross-process JSONL writer lock and replay-backed mission/rep
 - The fixed claim path accepts only one well-formed identity entry. Legacy file claims and malformed directories are unverifiable and therefore fail closed rather than being guessed stale.
 - Existing live-winner exclusion remains covered after the replacement-claim race settles.
 - The deferred Git path-enumeration fail-open boundary and Tasks 8/9 orphan reconciliation remain out of scope.
+
+## Fix Round 4
+
+### Outcome
+
+- Recovery claim publication now prepares a complete owner file and publishes it with an atomic hard link. Every pre-existing fixed claim path, including an empty directory, causes `EEXIST` and fails closed.
+- Dead-claim reaping uses the same no-replace hard-link primitive to create an identity-specific permanent tombstone before unlinking the fixed claim. Only the reaper that creates that tombstone may unlink, so a delayed loser cannot remove a replacement claim.
+- The killed-claimant, live-claim, and two-reaper/replacement regressions remain covered with the file-based atomic identity representation.
+
+### RED evidence
+
+- `node --test --test-name-pattern="empty directory" test/unit/platform-eventstore.test.ts`
+  - 1 test, 0 passed, 1 failed with `Missing expected rejection`.
+  - POSIX `rename()` replaced the pre-existing empty malformed claim directory and incorrectly allowed lock acquisition.
+
+### GREEN evidence
+
+- `node --test --test-name-pattern="empty directory|recovery claimant is killed|live process|reapers race" test/unit/platform-eventstore.test.ts`
+  - 4 passed, 0 failed.
+- `node --test test/unit/platform-eventstore.test.ts test/unit/mission-ownership.test.ts test/unit/orchestration-missionstore.test.ts`
+  - 39 passed, 0 failed.
+- `npm run typecheck`
+  - Passed (`tsc --noEmit`).
+- `npm run lint`
+  - Passed (`biome check .`; 578 files checked, no fixes applied).
+- `npm test`
+  - Final run: 2,320 tests discovered; 2,319 passed, 0 failed, 1 skipped in 31.186s.
+  - The sole skip remains the OpenViking Postgres round-trip because `TEST_DATABASE_URL` is unset.
+  - Two prior parallel full-suite runs each exposed a different transient unrelated failure (`mission-ownership` lease timing, then `cav-explore` page-exception timing); each passed immediately in isolation before the final green full run.
+
+### Files changed
+
+- `src/platform/eventstore/fileLock.ts` — atomic no-replace claim publication and identity-safe no-replace reaper tombstones via local-filesystem hard links.
+- `test/unit/platform-eventstore.test.ts` — empty-directory fail-closed regression and retained crash/live/race assertions for file claim identities.
+
+### Self-review and concerns
+
+- Claim candidates and tombstones remain on the same filesystem as the JSONL lock, so hard-link publication is atomic and cannot cross a device boundary.
+- A crash after creating a reaper tombstone but before unlinking the fixed dead claim fails closed rather than allowing another process to guess ownership. This favors safety over automatic recovery from that narrow reaper crash window.
+- Permanent tombstones remain intentionally bounded to stale claimant identities and prevent arbitrarily delayed reapers from acting on replacement claims.
+- The local shared-filesystem/hostname/PID-namespace boundary and deferred Git path-enumeration work remain unchanged.
