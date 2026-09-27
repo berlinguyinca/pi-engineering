@@ -27,6 +27,7 @@ import type { CheckpointManager, CheckpointSnapshot } from "./checkpoints.ts";
 import type { MissionStore } from "./missionStore.ts";
 import type { DispatchAuthority } from "./ownership.ts";
 import type { ExecutionBackend, RecoveredMerge } from "./types.ts";
+import { canonicalizeWriteDomain } from "./workset.ts";
 
 export interface ExecutionRequestInput {
   taskId: string;
@@ -188,9 +189,9 @@ const MAX_TIMER_MS = 2 ** 31 - 1;
 const WALL_CLOCK_TIMEOUT_MARKER = "timeout";
 
 function pathAllowed(path: string, domains: string[]): boolean {
-  const normalized = path.replaceAll("\\", "/").replace(/^\.\//, "");
+  const normalized = canonicalizeWriteDomain(path);
   return domains.some((domain) => {
-    const pattern = domain.replaceAll("\\", "/").replace(/^\.\//, "");
+    const pattern = canonicalizeWriteDomain(domain);
     if (pattern === "**") return true;
     if (pattern.endsWith("/**")) {
       const prefix = pattern.slice(0, -3).replace(/\/$/, "");
@@ -333,6 +334,15 @@ export class ExecutionBroker {
     };
   }
 
+  /** Commit dirty cancellation state onto the checkpoint's retained branch before its worktree can be removed. */
+  private async preserveCheckpointWork(executionId: string, checkpointId: string): Promise<void> {
+    const info = this.allocatedWorktrees.get(executionId);
+    if (!info) return;
+    const status = (await info.git.statusIn(info.path)).trim();
+    if (!status) return;
+    await info.git.commitAll(info.path, `pi-eng: preserve checkpoint ${checkpointId} for ${executionId}`);
+  }
+
   private async repositoryFor(
     input: ExecutionRequestInput,
   ): Promise<{ repoId?: string; root: string; git: GitRepo } | null> {
@@ -370,14 +380,20 @@ export class ExecutionBroker {
     if (!entry) return false;
     const checkpoint = entry.cancelCheckpoint?.();
     entry.abort.abort();
-    await checkpoint;
+    let checkpointError: unknown;
+    try {
+      await checkpoint;
+    } catch (error) {
+      checkpointError = error;
+    }
     this.store.setExecutionStatus(executionId, "CANCELED", { exit_status: "canceled" });
     const id = taskId ?? entry.taskId;
     if (id && this.store.getTask(id) && this.store.getTask(id)!.status === "RUNNING") {
       this.store.transitionTask(id, "CANCELED");
     }
-    await this.releaseWorktree(executionId);
+    if (!checkpointError) await this.releaseWorktree(executionId);
     this.active.delete(executionId);
+    if (checkpointError) throw checkpointError;
     return true;
   }
 
@@ -758,7 +774,8 @@ export class ExecutionBroker {
     }
   }
 
-  async execute(input: ExecutionRequestInput): Promise<ExecutionHandle> {
+  async execute(rawInput: ExecutionRequestInput): Promise<ExecutionHandle> {
+    const input = { ...rawInput, writeDomains: (rawInput.writeDomains ?? []).map(canonicalizeWriteDomain) };
     input.authority?.assertAuthoritative();
     const executionStartedAt = Date.now();
     const executionBudgetMs = input.executionBudgetMs ?? input.timeoutPolicy?.timeoutMs ?? this.defaultTimeoutMs;
@@ -770,10 +787,10 @@ export class ExecutionBroker {
       (!Number.isInteger(input.checkpointPolicy.activity_milestone) ||
         input.checkpointPolicy.activity_milestone <= 0 ||
         !Number.isFinite(input.checkpointPolicy.before_deadline_ms) ||
-        input.checkpointPolicy.before_deadline_ms < 0 ||
+        input.checkpointPolicy.before_deadline_ms <= 0 ||
         input.checkpointPolicy.before_deadline_ms >= executionBudgetMs)
     ) {
-      throw new Error("INVALID_CHECKPOINT_POLICY: checkpoint lead must be finite, non-negative, and below budget");
+      throw new Error("INVALID_CHECKPOINT_POLICY: checkpoint lead must be finite, positive, and below budget");
     }
     const executionDeadlineAt = executionStartedAt + executionBudgetMs;
     const backend = this.backendForKind(input.kind);
@@ -825,28 +842,36 @@ export class ExecutionBroker {
         let repository: { repoId?: string; root: string; git: GitRepo } | null = null;
         let meaningfulActivity = 0;
         let checkpointScheduling = true;
+        let retainWorktreeOnCleanup = false;
         let cancelCheckpointPromise: Promise<void> | undefined;
         let checkpointChain = Promise.resolve();
-        const persistCheckpoint = (
+        const writeCheckpoint = async (
           completedDeliverables: string[] = [],
           artifactRefs: string[] = [],
           artifactHashes: string[] = [],
         ): Promise<void> => {
           if (!this.checkpoints || !checkpointId || !input.repoId) return Promise.resolve();
-          checkpointChain = checkpointChain.then(async () => {
-            input.authority?.assertAuthoritative();
-            const snapshot = await this.checkpointSnapshot(execution.execution_id, input, repository);
-            input.authority?.assertAuthoritative();
-            await this.checkpoints!.persist({
-              taskId: input.taskId,
-              executionId: execution.execution_id,
-              completedDeliverables,
-              artifactRefs,
-              artifactHashes,
-              model: execution.model,
-              snapshot,
-            });
+          input.authority?.assertAuthoritative();
+          const snapshot = await this.checkpointSnapshot(execution.execution_id, input, repository);
+          input.authority?.assertAuthoritative();
+          await this.checkpoints.persist({
+            taskId: input.taskId,
+            executionId: execution.execution_id,
+            completedDeliverables,
+            artifactRefs,
+            artifactHashes,
+            model: execution.model,
+            snapshot,
           });
+        };
+        const persistCheckpoint = (
+          completedDeliverables: string[] = [],
+          artifactRefs: string[] = [],
+          artifactHashes: string[] = [],
+        ): Promise<void> => {
+          checkpointChain = checkpointChain.then(() =>
+            writeCheckpoint(completedDeliverables, artifactRefs, artifactHashes),
+          );
           return checkpointChain;
         };
         const queueCheckpoint = (
@@ -925,13 +950,21 @@ export class ExecutionBroker {
           input.authority?.assertAuthoritative();
           repository = await this.repositoryFor(input);
           if (repository) this.missionRepositories.set(input.missionId, repository);
+          const repositoryBinding = input.repoId
+            ? this.store
+                .getWorkspaceManifest(input.missionId)
+                ?.repositories.find((candidate) => candidate.repoId === input.repoId)
+            : undefined;
+          const restrictedRepository =
+            repositoryBinding === undefined
+              ? this.resolveRepository !== undefined
+              : !repositoryBinding.writableDomains.map(canonicalizeWriteDomain).includes("**");
           if (
             input.repoId &&
             input.mutatesRepo &&
             input.kind !== "integration" &&
             input.isolation !== "worktree" &&
-            this.resolveRepository !== undefined &&
-            !(input.writeDomains ?? []).includes("**")
+            restrictedRepository
           ) {
             throw new Error(
               `WORKSPACE_SCOPE_MISMATCH: restricted domains require an isolated worktree (${(input.writeDomains ?? []).join(", ") || "none"})`,
@@ -957,7 +990,16 @@ export class ExecutionBroker {
               checkpointScheduling = false;
               if (checkpointTimer) clearTimeout(checkpointTimer);
               if (activityTimer) clearInterval(activityTimer);
-              cancelCheckpointPromise ??= persistCheckpoint();
+              if (!cancelCheckpointPromise) {
+                checkpointChain = checkpointChain.then(async () => {
+                  await this.preserveCheckpointWork(execution.execution_id, checkpointId);
+                  await writeCheckpoint();
+                });
+                cancelCheckpointPromise = checkpointChain.catch((error) => {
+                  retainWorktreeOnCleanup = true;
+                  throw error;
+                });
+              }
               return cancelCheckpointPromise;
             };
           }
@@ -1109,7 +1151,7 @@ export class ExecutionBroker {
           await checkpointChain.catch(() => undefined);
           abort.signal.removeEventListener("abort", onAbort);
           clearTimeout(timer);
-          await this.releaseWorktree(execution.execution_id);
+          if (!retainWorktreeOnCleanup) await this.releaseWorktree(execution.execution_id);
         }
       },
     };

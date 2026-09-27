@@ -53,12 +53,7 @@ import {
   splitWorksetDeliverables,
   validateWorkset,
 } from "./workset.ts";
-import {
-  type WorkspaceManifestResolver,
-  WorkspaceScopeError,
-  createCompatibilityWorkspaceManifest,
-  createWorkspaceManifest,
-} from "./workspaceManifest.ts";
+import { WorkspaceManifestResolver, WorkspaceScopeError, createWorkspaceManifest } from "./workspaceManifest.ts";
 
 /** A task planned by the planner; the orchestrator fills lifecycle fields. */
 export type PlanTaskInput = Omit<
@@ -255,7 +250,7 @@ export class Orchestrator {
     this.onPhase = opts.onPhase;
     this.observability = opts.observability ?? null;
     this.parentSessionId = opts.parentSessionId ?? null;
-    this.workspaceResolver = opts.workspaceResolver;
+    this.workspaceResolver = opts.workspaceResolver ?? new WorkspaceManifestResolver();
     this.repositoryRegistry = opts.repositoryRegistry;
     this.launchCwd = opts.launchCwd ?? ".";
   }
@@ -435,11 +430,14 @@ export class Orchestrator {
     });
     const risk = this.router.risk({ request });
     const material = workflowMutatesRepo(intent.suggested_workflow) || opts.mutationRequested === true;
+    const executable = intent.suggested_workflow !== "conversation" || material || (opts.changedFiles?.length ?? 0) > 0;
     let workspace: Awaited<ReturnType<WorkspaceManifestResolver["resolve"]>> | undefined;
     let workspaceError: WorkspaceScopeError | undefined;
-    if (material && this.workspaceResolver && this.repositoryRegistry) {
+    if (executable && this.workspaceResolver) {
       try {
-        workspace = await this.workspaceResolver.resolve(request, this.launchCwd);
+        workspace = this.repositoryRegistry
+          ? await this.workspaceResolver.resolve(request, this.launchCwd)
+          : await this.workspaceResolver.resolveRepository(opts.repository);
       } catch (error) {
         workspaceError =
           error instanceof WorkspaceScopeError
@@ -458,7 +456,7 @@ export class Orchestrator {
 
     const primaryBinding = workspace?.repositories.find((repository) => repository.repoId === workspace?.primaryRepoId);
     let selectedBaseRef = primaryBinding?.baseSha ?? opts.baseRef;
-    if (primaryBinding && opts.baseRef && !workspaceError) {
+    if (primaryBinding && opts.baseRef && !workspaceError && this.repositoryRegistry) {
       const targetGit = await GitRepo.open(primaryBinding.canonicalRoot);
       const targetCommit = await targetGit?.resolveCommit(opts.baseRef);
       if (!targetCommit) {
@@ -480,15 +478,6 @@ export class Orchestrator {
       workflow_class: intent.suggested_workflow,
       parent_session_id: this.parentSessionId,
     });
-    if (material && !workspace && !workspaceError) {
-      const compatibilityManifest = createCompatibilityWorkspaceManifest(
-        mission.mission_id,
-        opts.repository,
-        selectedBaseRef,
-      );
-      this.store.bindWorkspaceManifest(compatibilityManifest);
-      this.missionRepoIds.set(mission.mission_id, compatibilityManifest.repositories[0]!.repoId);
-    }
     if (this.ownership) {
       this.ownershipByMission.set(mission.mission_id, await this.ownership.acquire(mission.mission_id));
     }
@@ -518,6 +507,13 @@ export class Orchestrator {
           completed: false,
           failureReason: workspaceError.message,
         };
+      }
+
+      if (workspace && !this.repositoryRegistry) {
+        const manifest = createWorkspaceManifest(workspace, mission.mission_id);
+        this.store.bindWorkspaceManifest(manifest);
+        await this.store.flush();
+        this.missionRepoIds.set(mission.mission_id, workspace.primaryRepoId);
       }
 
       if (workspace && this.repositoryRegistry) {
@@ -689,10 +685,15 @@ export class Orchestrator {
           return sameRepository ? [sameRepository.task_id] : candidates.map((candidate) => candidate.task_id);
         }),
       }));
-      const scopedPlan = expanded;
+      let scopedPlan = expanded;
       if (manifest && !worksetError) {
         try {
-          validateWorkset({ manifest, acceptanceIds, tasks: scopedPlan, policy: this.worksetPolicy });
+          scopedPlan = validateWorkset({
+            manifest,
+            acceptanceIds,
+            tasks: scopedPlan,
+            policy: this.worksetPolicy,
+          }) as typeof scopedPlan;
         } catch (error) {
           if (error instanceof WorksetValidationError) worksetError = error;
           else throw error;

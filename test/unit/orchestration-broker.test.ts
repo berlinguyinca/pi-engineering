@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { access, writeFile } from "node:fs/promises";
+import { access, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import { promisify } from "node:util";
@@ -186,6 +186,17 @@ describe("ExecutionBroker (spec 03)", () => {
       }),
       /INVALID_CHECKPOINT_POLICY/,
     );
+    await assert.rejects(
+      broker.execute({
+        taskId: t.task_id,
+        missionId: m.mission_id,
+        kind: "agent",
+        objective: "zero lead",
+        executionBudgetMs: 50,
+        checkpointPolicy: { activity_milestone: 1, before_deadline_ms: 0 },
+      }),
+      /INVALID_CHECKPOINT_POLICY/,
+    );
 
     const handle = await broker.execute({
       taskId: t.task_id,
@@ -293,10 +304,107 @@ describe("ExecutionBroker (spec 03)", () => {
       const execution = store.getExecution(handle.executionId)!;
       const checkpoint = store.getTaskCheckpoint(execution.checkpoint_id!);
       assert.ok(checkpoint);
-      assert.deepEqual(checkpoint.preservedUncommittedChanges, ["src/cancelled.ts"]);
+      assert.ok(checkpoint.candidateSha, "checkpoint must identify a recoverable commit");
+      const removedWorktree = checkpoint.worktree!;
+      await assert.rejects(access(removedWorktree), "the canceled worktree should be cleaned up");
+      const recovered = await exec("git", ["-C", fx.root, "show", `${checkpoint.candidateSha}:src/cancelled.ts`]);
+      assert.equal(recovered.stdout, "export const cancelled = true;\n");
       const sequence = checkpoint.sequence;
       await new Promise((resolve) => setTimeout(resolve, 130));
       assert.equal(store.getTaskCheckpoint(execution.checkpoint_id!)?.sequence, sequence);
+    } finally {
+      await fx.cleanup();
+    }
+  });
+
+  it("retains the dirty worktree when cancellation preservation cannot commit", async () => {
+    const fx = await makeFixtureRepo();
+    try {
+      const git = await GitRepo.open(fx.root);
+      assert.ok(git);
+      await writeFile(join(fx.root, ".git", "hooks", "pre-commit"), "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+      const store = MissionStore.open(JsonlEventStore.inMemory());
+      const mission = store.createMission({
+        title: "retain failed preservation",
+        goal: "retain failed preservation",
+        user_request: "retain failed preservation",
+        repository: fx.root,
+        base_ref: await git.headCommit(),
+        risk_profile: "medium",
+        workflow_class: "engineering_review",
+      });
+      store.bindWorkspaceManifest({
+        manifestId: "WM-retain",
+        missionId: mission.mission_id,
+        generation: 1,
+        authorizedRoots: [{ canonicalPath: fx.root, source: "existing_manifest", access: "write" }],
+        repositories: [
+          {
+            repoId: "repo-retain",
+            canonicalRoot: fx.root,
+            baseRef: "main",
+            baseSha: mission.base_ref,
+            writableDomains: ["src/**"],
+          },
+        ],
+        dependencyEdges: [],
+        hash: "manifest-retain",
+        createdAt: "2026-09-26T10:00:00.000Z",
+      });
+      const task = store.createTask({
+        mission_id: mission.mission_id,
+        repo_id: "repo-retain",
+        kind: "agent",
+        role: "implementer",
+        objective: "write then retain",
+        mutates_repo: true,
+        isolation: "worktree",
+        write_domains: ["src/**"],
+        execution_budget_ms: 10_000,
+        checkpoint_policy: { activity_milestone: 10, before_deadline_ms: 1_000 },
+      });
+      let dirty!: () => void;
+      const dirtyWritten = new Promise<void>((resolve) => {
+        dirty = resolve;
+      });
+      let worktree = "";
+      const broker = new ExecutionBroker({
+        store,
+        git,
+        checkpoints: new CheckpointManager({ store }),
+        resolveRepository: async (repoId) => ({ repoId, root: fx.root, git }),
+        backends: {
+          agent: {
+            runAgent: async ({ worktree: allocated, signal }) => {
+              worktree = allocated!;
+              await writeFile(join(worktree, "src", "retained.ts"), "export const retained = true;\n", "utf8");
+              dirty();
+              await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+              return { executionId: "late", exitStatus: "succeeded", summary: "late", artifactRefs: [], usage: {} };
+            },
+          },
+        },
+      });
+      const handle = await broker.execute({
+        taskId: task.task_id,
+        missionId: mission.mission_id,
+        repoId: "repo-retain",
+        kind: "agent",
+        role: "implementer",
+        objective: task.objective,
+        mutatesRepo: true,
+        writeDomains: task.write_domains,
+        isolation: "worktree",
+        executionBudgetMs: task.execution_budget_ms,
+        checkpointPolicy: task.checkpoint_policy,
+      });
+      const result = handle.result().catch(() => undefined);
+      await dirtyWritten;
+
+      await assert.rejects(handle.cancel(), /git commit failed/i);
+      await result;
+      await access(worktree);
+      assert.equal(await readFile(join(worktree, "src", "retained.ts"), "utf8"), "export const retained = true;\n");
     } finally {
       await fx.cleanup();
     }

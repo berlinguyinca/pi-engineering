@@ -160,3 +160,73 @@ Result: exit 1; 2,347 total, 2,345 passed, 1 failed, 1 skipped. The only failure
 - Git path-enumeration fail-open behavior and authority-loss `RUNNING` reconciliation remain deliberately deferred per the task ruling.
 - Artifact identity enforcement uses the stable `artifact://<identity>/<id-or-hash>` contract. Hashes retained by checkpoints are SHA-256 fingerprints of the returned artifact references; content verification remains the artifact store's responsibility.
 - Compatibility manifests intentionally authorize only the caller-provided canonical repository root and base, with a broad single-repository domain. They do not authorize multi-repository mutation or create authority for passive conversations.
+
+## Fix Round 2
+
+### Outcome
+
+- Removed the lexical compatibility manifest. Every executable legacy workflow now resolves its repository through `WorkspaceManifestResolver`'s shared realpath, protected-root, existence, symlink, and Git checks before planning. Only a truly non-executable conversation omits repository authority.
+- Cancellation now serializes dirty-work preservation with checkpoint writes, commits dirty contents onto the checkpoint-identified retained branch, flushes the checkpoint, and only then removes the worktree. The regression reconstructs and reads the canceled file from `candidateSha` after cleanup.
+- If cancellation preservation or durable checkpoint persistence fails, cancellation still settles, but the dirty worktree remains in place as the recoverable sole copy; a pre-commit failure regression reads the retained file directly.
+- Checkpoint lead time is now finite, strictly positive, and less than the execution budget in both workset validation and direct broker dispatch.
+- Write domains are canonicalized to POSIX separators by one shared function. The validated workset persists canonical values, while scheduler overlap and broker path enforcement consume the same canonicalizer. Windows/POSIX-equivalent domains cannot dispatch concurrently.
+- The ownership renewal regression now waits for an observed renewal with a five-second lease margin instead of depending on a 30 ms real-time lease and a fixed sleep. Production lease expiry behavior is unchanged.
+
+Checkpointing remains non-approving, and autonomous resume remains inactive.
+
+### RED evidence
+
+Initial round-2 focused run:
+
+```text
+node --test test/unit/orchestration-workset.test.ts test/unit/orchestration-broker.test.ts test/unit/orchestration-scheduler.test.ts test/integration/orchestrator-e2e.test.ts
+```
+
+Result: exit 1; six regressions failed for the intended reasons: protected legacy investigation completed, zero lead was accepted by workset and broker, cancellation's checkpoint SHA lacked the dirty file, Windows/POSIX domains overlapped concurrently, and the validated workset retained backslashes.
+
+The first expanded run then exposed that direct-checkout restriction was being inferred from the task's narrower requested domain instead of the manifest's authorized repository domain. That run was interrupted after the affected cancellation tests waited on work that correctly never dispatched. The broker check was corrected to derive restriction from the canonical repository binding and fail closed when a registry-era binding is missing.
+
+### GREEN evidence
+
+Focused workset/checkpoint/broker/scheduler/orchestrator/ownership matrix:
+
+```text
+node --test test/unit/orchestration-workset.test.ts test/unit/orchestration-checkpoints.test.ts test/unit/orchestration-broker.test.ts test/unit/orchestration-scheduler.test.ts test/unit/mission-ownership.test.ts test/integration/orchestrator-e2e.test.ts test/integration/orchestrator-long-outage.test.ts test/integration/orchestrator-recovery.test.ts test/integration/orchestrator-resilience.test.ts
+```
+
+Result: exit 0; 121 passed, 0 failed.
+
+Static verification:
+
+```text
+npm run typecheck
+npm run lint
+git diff --check
+```
+
+Result: all exit 0; TypeScript emitted no diagnostics, Biome checked 582 files with no findings, and the diff has no whitespace errors.
+
+Full suite:
+
+```text
+npm test
+```
+
+Result: exit 0; 2,352 total, 2,351 passed, 0 failed, 1 skipped. The sole skip is the existing Postgres OpenViking test gated by `TEST_DATABASE_URL`. The previously flaky mission-ownership renewal test passed under full-suite load.
+
+### Files
+
+- `src/orchestration/workspaceManifest.ts`, `src/orchestration/orchestrator.ts` — shared canonical legacy repository resolution and removal of lexical compatibility authority.
+- `src/orchestration/broker.ts` — canonical domains, positive lead validation, content-preserving cancellation checkpoints, and retain-on-preservation-failure behavior.
+- `src/orchestration/workset.ts`, `src/orchestration/scheduler.ts` — persisted domain canonicalization and identical scheduler conflict semantics.
+- `test/integration/orchestrator-e2e.test.ts` — executable legacy protected-root rejection and non-executable conversation compatibility.
+- `test/unit/orchestration-broker.test.ts` — zero lead, post-cleanup content reconstruction, and preservation-failure retention regressions.
+- `test/unit/orchestration-workset.test.ts`, `test/unit/orchestration-scheduler.test.ts` — canonicalization and Windows/POSIX conflict regressions.
+- `test/unit/mission-ownership.test.ts` — renewal-synchronized, full-suite-stable lease test.
+
+### Self-review and concerns
+
+- Cancellation preservation uses an ordinary Git commit whose message contains both checkpoint and execution identity. The checkpoint's `candidateSha` and retained branch identify the durable content; no automatic restore path was introduced.
+- A preservation failure intentionally leaves the worktree allocated/on disk. This is a safety tradeoff: operator cleanup is preferable to deleting the only dirty copy.
+- Legacy executable workflows now use the repository's resolved HEAD as their manifest base. Registry-backed workflows retain explicit base-ref ownership validation.
+- Git path-enumeration fail-open behavior and authority-loss `RUNNING` reconciliation remain deferred exactly as previously ruled.

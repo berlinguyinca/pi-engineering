@@ -98,6 +98,18 @@ export class WorkspaceManifestResolver {
       explicit.length > 0
         ? explicit.map((path) => ({ path, source: "explicit_user_path" as const }))
         : [{ path: launchCwd, source: "launch_cwd" as const }];
+    return this.resolveCandidates(candidates, launchCwd);
+  }
+
+  /** Resolve a legacy repository argument through the same authority checks as request-derived roots. */
+  async resolveRepository(repository: string): Promise<ResolvedWorkspace> {
+    return this.resolveCandidates([{ path: repository, source: "explicit_user_path" }], repository);
+  }
+
+  private async resolveCandidates(
+    candidates: Array<{ path: string; source: AuthorizedRoot["source"] }>,
+    context: string,
+  ): Promise<ResolvedWorkspace> {
     const roots = new Map<string, AuthorizedRoot>();
     const repositories = new Map<string, RepositoryBinding>();
 
@@ -130,7 +142,7 @@ export class WorkspaceManifestResolver {
 
     const orderedRepositories = [...repositories.values()];
     const primary = orderedRepositories[0];
-    if (!primary) throw new WorkspaceScopeError(`No authorized Git repository resolved from ${dirname(launchCwd)}`);
+    if (!primary) throw new WorkspaceScopeError(`No authorized Git repository resolved from ${dirname(context)}`);
     return {
       authorizedRoots: [...roots.values()],
       repositories: orderedRepositories,
@@ -159,34 +171,4 @@ export function createWorkspaceManifest(
     hash,
     createdAt: new Date().toISOString(),
   };
-}
-
-/**
- * Compatibility authority for callers that predate WorkspaceManifestResolver.
- * The caller's repository/base arguments are the complete single-repository
- * authority; material work still flows through the same workset validator.
- */
-export function createCompatibilityWorkspaceManifest(
-  missionId: string,
-  repository: string,
-  baseSha: string,
-): WorkspaceManifest {
-  const canonicalRoot = resolve(repository);
-  return createWorkspaceManifest(
-    {
-      authorizedRoots: [{ canonicalPath: canonicalRoot, source: "existing_manifest", access: "write" }],
-      repositories: [
-        {
-          repoId: repoIdFor(canonicalRoot),
-          canonicalRoot,
-          baseRef: baseSha || "HEAD",
-          baseSha: baseSha || "legacy-unversioned",
-          writableDomains: ["**"],
-        },
-      ],
-      dependencyEdges: [],
-      primaryRepoId: repoIdFor(canonicalRoot),
-    },
-    missionId,
-  );
 }

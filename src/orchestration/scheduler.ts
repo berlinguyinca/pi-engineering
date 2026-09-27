@@ -25,6 +25,7 @@ import type { ExecutionBroker, ExecutionHandle, ExecutionRequestInput } from "./
 import type { MissionStore } from "./missionStore.ts";
 import type { DispatchAuthority } from "./ownership.ts";
 import type { MissionStatus, OrchestrationTask, TaskKind, TaskStatus } from "./types.ts";
+import { canonicalizeWriteDomain } from "./workset.ts";
 
 /** Real clock/sleep for production; tests inject deterministic fakes. */
 const realNow = (): number => Date.now();
@@ -144,7 +145,7 @@ export function classifyFailure(
 
 /** Normalize a write domain: strip trailing slash and a trailing `/**` glob. */
 export function normalizeDomain(d: string): string {
-  return d.replace(/\/$/, "").replace(/\/\*\*$/, "");
+  return canonicalizeWriteDomain(d).replace(/\/\*\*$/, "");
 }
 
 /** True when two mutating tasks have overlapping write domains. */

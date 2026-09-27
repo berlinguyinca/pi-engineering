@@ -58,7 +58,7 @@ export interface ValidateWorksetInput {
   policy?: Partial<WorksetPolicy>;
 }
 
-function domainSegments(domain: string): string[] {
+export function canonicalizeWriteDomain(domain: string): string {
   const normalized = domain.replaceAll("\\", "/");
   if (normalized.startsWith("/") || /^[A-Za-z]:\//.test(normalized)) {
     throw new WorksetValidationError(
@@ -75,7 +75,11 @@ function domainSegments(domain: string): string[] {
       "Use canonical repository-relative path segments without . or ..",
     );
   }
-  return segments;
+  return segments.join("/");
+}
+
+function domainSegments(domain: string): string[] {
+  return canonicalizeWriteDomain(domain).split("/");
 }
 
 function domainWithin(requested: string, authorized: string): boolean {
@@ -127,9 +131,13 @@ export function validateWorkset(input: ValidateWorksetInput): WorksetTask[] {
   const policy = { ...DEFAULT_WORKSET_POLICY, ...input.policy };
   const repositories = new Map(input.manifest.repositories.map((repository) => [repository.repoId, repository]));
   const knownAcceptance = new Set(input.acceptanceIds);
+  const tasks = input.tasks.map((task) => ({
+    ...task,
+    write_domains: task.write_domains.map(canonicalizeWriteDomain),
+  }));
 
   const taskIds = new Set<string>();
-  for (const task of input.tasks) {
+  for (const task of tasks) {
     if (taskIds.has(task.task_id)) {
       throw new WorksetValidationError(
         "DUPLICATE_TASK_ID",
@@ -139,9 +147,9 @@ export function validateWorkset(input: ValidateWorksetInput): WorksetTask[] {
     }
     taskIds.add(task.task_id);
   }
-  assertAcyclic(input.tasks);
+  assertAcyclic(tasks);
   const mutatingRepositories = new Set(
-    input.tasks.filter((task) => task.mutates_repo).flatMap((task) => (task.repo_id ? [task.repo_id] : [])),
+    tasks.filter((task) => task.mutates_repo).flatMap((task) => (task.repo_id ? [task.repo_id] : [])),
   );
   if (mutatingRepositories.size > 1) {
     throw new WorksetValidationError(
@@ -150,8 +158,7 @@ export function validateWorkset(input: ValidateWorksetInput): WorksetTask[] {
       "Run a separate repository-scoped mission; coordinated cross-repository publication is deferred beyond Slice 1",
     );
   }
-  for (const task of input.tasks) {
-    for (const domain of task.write_domains) domainSegments(domain);
+  for (const task of tasks) {
     if (task.kind === "aggregation" && task.mutates_repo) {
       throw new WorksetValidationError(
         "CROSS_REPOSITORY_MUTATION_UNSUPPORTED",
@@ -207,7 +214,7 @@ export function validateWorkset(input: ValidateWorksetInput): WorksetTask[] {
       !Number.isInteger(checkpointPolicy.activity_milestone) ||
       checkpointPolicy.activity_milestone <= 0 ||
       !Number.isFinite(checkpointPolicy.before_deadline_ms) ||
-      checkpointPolicy.before_deadline_ms < 0 ||
+      checkpointPolicy.before_deadline_ms <= 0 ||
       checkpointPolicy.before_deadline_ms >= (task.execution_budget_ms ?? 0)
     ) {
       throw new WorksetValidationError(
@@ -241,7 +248,7 @@ export function validateWorkset(input: ValidateWorksetInput): WorksetTask[] {
     }
   }
 
-  const covered = new Set(input.tasks.flatMap((task) => task.acceptance_ids ?? []));
+  const covered = new Set(tasks.flatMap((task) => task.acceptance_ids ?? []));
   const uncovered = input.acceptanceIds.filter((acceptanceId) => !covered.has(acceptanceId));
   if (uncovered.length > 0) {
     throw new WorksetValidationError(
@@ -250,7 +257,7 @@ export function validateWorkset(input: ValidateWorksetInput): WorksetTask[] {
       "Assign every material acceptance criterion to at least one bounded task",
     );
   }
-  return input.tasks;
+  return tasks;
 }
 
 export function decompositionInput(

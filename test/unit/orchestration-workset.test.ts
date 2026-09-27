@@ -120,7 +120,7 @@ describe("repository-scoped workset validation", () => {
     );
   });
 
-  it("rejects non-positive/non-finite budgets and invalid checkpoint cadence", () => {
+  it("rejects non-positive/non-finite budgets and non-positive or out-of-budget checkpoint cadence", () => {
     for (const execution_budget_ms of [0, -1, Number.POSITIVE_INFINITY]) {
       expectCode("INVALID_TASK_BUDGET", () =>
         validateWorkset({ manifest, acceptanceIds: ["AC-1"], tasks: [task({ execution_budget_ms })] }),
@@ -130,12 +130,23 @@ describe("repository-scoped workset validation", () => {
       { activity_milestone: 0, before_deadline_ms: 1 },
       { activity_milestone: 1.5, before_deadline_ms: 1 },
       { activity_milestone: 1, before_deadline_ms: -1 },
+      { activity_milestone: 1, before_deadline_ms: 0 },
       { activity_milestone: 1, before_deadline_ms: 60_000 },
     ]) {
       expectCode("INVALID_CHECKPOINT_POLICY", () =>
         validateWorkset({ manifest, acceptanceIds: ["AC-1"], tasks: [task({ checkpoint_policy })] }),
       );
     }
+  });
+
+  it("canonicalizes Windows separators before persisting the validated workset", () => {
+    const [validated] = validateWorkset({
+      manifest,
+      acceptanceIds: ["AC-1"],
+      tasks: [task({ write_domains: ["src\\api\\**"] })],
+    });
+
+    assert.deepEqual(validated?.write_domains, ["src/api/**"]);
   });
 
   it("rejects duplicate original task IDs before dependency planning", () => {

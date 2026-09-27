@@ -198,6 +198,31 @@ describe("acceptance scenario A — simple feature auto-invokes engineering+vali
 });
 
 describe("material legacy orchestration workset safety", () => {
+  it("rejects a protected legacy repository before any executable investigation planning", async () => {
+    const store = MissionStore.open(JsonlEventStore.inMemory());
+    let plannerCalls = 0;
+    const orchestrator = new Orchestrator({
+      store,
+      backends: {},
+      planner: async () => {
+        plannerCalls++;
+        return [];
+      },
+    });
+
+    const result = await orchestrator.orchestrate("Find out why login fails", {
+      repository: "/",
+      baseRef: "",
+      mutationRequested: false,
+    });
+
+    assert.equal(result.mission.workflow_class, "investigation");
+    assert.equal(result.mission.status, "BLOCKED");
+    assert.match(result.failureReason ?? "", /protected filesystem root/i);
+    assert.equal(plannerCalls, 0);
+    assert.equal(store.getWorkspaceManifest(result.mission.mission_id), undefined);
+  });
+
   it("blocks a traversal domain before a legacy worker can dispatch", async () => {
     const store = MissionStore.open(JsonlEventStore.inMemory());
     let calls = 0;
@@ -770,6 +795,18 @@ describe("passive requests — gate-bypass and illegal-transition regressions", 
       undefined,
       "passive compatibility must not invent executable repository authority",
     );
+  });
+
+  it("a truly non-executable conversation does not resolve even a protected repository path", async () => {
+    const h = harness();
+    const result = await h.orchestrator.orchestrate("Explain this function", {
+      repository: "/",
+      baseRef: "",
+      mutationRequested: false,
+    });
+
+    assert.equal(result.completed, true);
+    assert.equal(h.store.getWorkspaceManifest(result.mission.mission_id), undefined);
   });
 
   it("a passive classification with policy gates is NOT short-circuited to COMPLETE", async () => {

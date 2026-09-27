@@ -107,12 +107,15 @@ describe("MissionOwnership", () => {
     const { MissionOwnership } = await import("../../src/orchestration/ownership.ts");
     const store = MissionStore.open(JsonlEventStore.inMemory());
     mission(store, "M-1");
-    const owner = new MissionOwnership(store, { ownerId: "controller", leaseMs: 30, heartbeatMs: 5 });
+    const owner = new MissionOwnership(store, { ownerId: "controller", leaseMs: 5_000, heartbeatMs: 10 });
     const missionIdentity = await owner.acquire("M-1");
     const authority = await owner.maintain(missionIdentity, "repo-long");
     const firstRenewBy = authority.missionIdentity.renewBy;
 
-    await new Promise((resolve) => setTimeout(resolve, 45));
+    const renewalDeadline = Date.now() + 2_000;
+    while (authority.missionIdentity.renewBy === firstRenewBy && Date.now() < renewalDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
     authority.assertAuthoritative();
     assert.notEqual(authority.missionIdentity.renewBy, firstRenewBy);
     assert.equal(store.getRepositoryLeaseByRepoId("repo-long")?.missionId, "M-1");

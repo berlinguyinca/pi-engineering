@@ -571,6 +571,37 @@ describe("MissionScheduler (spec 02)", () => {
     assert.equal(store.getTask(b.task_id)!.status, "SUCCEEDED");
   });
 
+  it("serializes equivalent Windows and POSIX write domains", async () => {
+    const store = MissionStore.open(JsonlEventStore.inMemory());
+    const m = createExecutingMission(store);
+    store.createTask({
+      mission_id: m.mission_id,
+      kind: "agent",
+      role: "implementer-a",
+      objective: "windows domain",
+      write_domains: ["src\\api\\**"],
+      mutates_repo: true,
+      isolation: "none",
+    });
+    store.createTask({
+      mission_id: m.mission_id,
+      kind: "agent",
+      role: "implementer-b",
+      objective: "posix domain",
+      write_domains: ["src/api/handler.ts"],
+      mutates_repo: true,
+      isolation: "none",
+    });
+    const concurrency = delayedConcurrencyTracker(20);
+    const scheduler = new MissionScheduler({
+      store,
+      broker: makeBroker(store, { agent: { runAgent: async () => concurrency.run() } }),
+    });
+
+    await scheduler.runMission(m.mission_id);
+    assert.equal(concurrency.peak(), 1);
+  });
+
   it("respects dependency order", async () => {
     const store = MissionStore.open(JsonlEventStore.inMemory());
     const m = store.createMission({
