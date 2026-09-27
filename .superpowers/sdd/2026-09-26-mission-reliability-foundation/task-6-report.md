@@ -174,3 +174,34 @@ Fix base: `9f8966b80d334fd2624a2b131b86b796922ef5b5`
 
 - The optional Postgres event-store integration remains unrun because `TEST_DATABASE_URL` is not configured.
 - Multi-repository completion remains intentionally fail-closed until repository head-vector evidence is implemented.
+
+---
+
+## Review Fix Round 5
+
+Fix base: `2156d34905ca932395cd1a413adf8a897db69ff3`
+
+### RED
+
+- `node --test --test-name-pattern='memoizes result before onActivity' test/unit/orchestration-broker.test.ts` → 0 passed, 1 failed with `RangeError: Maximum call stack size exceeded`. The first synchronous `execution.started` activity re-entered `handle.result()` while `resultPromise` was unset, recursively starting the same operation again.
+
+### GREEN
+
+- Exact re-entrancy regression: `node --test --test-name-pattern='memoizes result before onActivity' test/unit/orchestration-broker.test.ts` → 1 passed, 0 failed. The callback receives the exact memoized promise; repository resolution, backend dispatch, candidate publication, and validation-evidence publication each occur once.
+- Focused broker/cancellation surface: `node --test test/unit/orchestration-broker.test.ts` → 41 passed, 0 failed, including cancel-before-result, cancel-during-allocation, abort-aware and abort-ignoring backends, hard timeout, and late-settlement coverage.
+- Typecheck: `npm run typecheck` → passed.
+- Focused lint/static format: `npx biome check src/orchestration/broker.ts test/unit/orchestration-broker.test.ts` → 2 files checked, no errors.
+- Repository lint/static format: `npm run lint` → 583 files checked, no errors.
+- Full suite: `npm test` → 2,410 passed, 0 failed, 1 optional Postgres skip.
+- Diff hygiene: `git diff --check` → passed; no controller-ledger path changed.
+
+### Fix Decisions
+
+- `result()` now defines the operation without invoking it, queues it through `Promise.resolve().then(runOperation)`, constructs the authoritative cancellation race, and assigns the one memoized result before the queued operation can invoke activity callbacks, repository resolution, or backend code.
+- The cancellation race and its terminalization behavior remain unchanged. Existing cancellation and timeout regressions prove the deferred operation start does not dispatch canceled work or alter authoritative settlements.
+- The regression uses a real repository-bound validation execution and asserts exact promise and outcome identity, one resolver call, one backend call, one candidate record, and one validation-evidence record.
+
+### Residual Concerns
+
+- The optional Postgres event-store integration remains unrun because `TEST_DATABASE_URL` is not configured.
+- Multi-repository completion remains intentionally fail-closed until repository head-vector evidence is implemented.

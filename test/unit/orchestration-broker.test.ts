@@ -274,6 +274,111 @@ describe("ExecutionBroker (spec 03)", () => {
     assert.equal(dispatches, 1);
   });
 
+  it("memoizes result before onActivity can re-enter the handle", async () => {
+    const fx = await makeFixtureRepo();
+    try {
+      const git = await GitRepo.open(fx.root);
+      assert.ok(git);
+      const store = MissionStore.open(JsonlEventStore.inMemory());
+      const mission = store.createMission({
+        title: "reentrant result",
+        goal: "reentrant result",
+        user_request: "reentrant result",
+        repository: fx.root,
+        base_ref: await git.headCommit(),
+        risk_profile: "medium",
+        workflow_class: "engineering_review",
+      });
+      store.bindWorkspaceManifest({
+        manifestId: "WM-reentrant-result",
+        missionId: mission.mission_id,
+        generation: 1,
+        authorizedRoots: [{ canonicalPath: fx.root, source: "existing_manifest", access: "write" }],
+        repositories: [
+          {
+            repoId: "repo-reentrant-result",
+            canonicalRoot: fx.root,
+            baseRef: "main",
+            baseSha: mission.base_ref,
+            writableDomains: ["src/**"],
+          },
+        ],
+        dependencyEdges: [],
+        hash: "manifest-reentrant-result",
+        createdAt: "2026-09-27T12:00:00.000Z",
+      });
+      const task = store.createTask({
+        mission_id: mission.mission_id,
+        repo_id: "repo-reentrant-result",
+        kind: "validation",
+        role: "validator",
+        objective: "validate once",
+      });
+      let resolverCalls = 0;
+      let backendCalls = 0;
+      let handle!: Awaited<ReturnType<ExecutionBroker["execute"]>>;
+      let reentrantResult: Promise<Awaited<ReturnType<typeof handle.result>>> | undefined;
+      const broker = new ExecutionBroker({
+        store,
+        resolveRepository: async (repoId) => {
+          resolverCalls++;
+          return { repoId, root: fx.root, git };
+        },
+        backends: {
+          validation: {
+            runValidation: async () => {
+              backendCalls++;
+              return {
+                executionId: "validation",
+                exitStatus: "succeeded",
+                summary: "green",
+                artifactRefs: [],
+                usage: {},
+                validationEvidence: {
+                  command: "npm test",
+                  profile: "test",
+                  exitCode: 0,
+                  testSummary: { passed: 1, failed: 0 },
+                  noTargets: false,
+                  accessible: true,
+                  acceptanceResults: [],
+                },
+              };
+            },
+          },
+        },
+        onActivity: (event) => {
+          if (event.kind === "execution" && event.phase === "started" && !reentrantResult) {
+            reentrantResult = handle.result();
+          }
+        },
+      });
+      handle = await broker.execute({
+        taskId: task.task_id,
+        missionId: mission.mission_id,
+        repoId: task.repo_id!,
+        kind: "validation",
+        role: task.role,
+        objective: task.objective,
+      });
+
+      const first = handle.result();
+      await Promise.resolve();
+      assert.ok(reentrantResult);
+      assert.equal(reentrantResult, first);
+      assert.equal(handle.result(), first);
+      const [firstOutcome, reentrantOutcome] = await Promise.all([first, reentrantResult]);
+      assert.equal(firstOutcome, reentrantOutcome);
+      assert.equal(firstOutcome.exitStatus, "succeeded");
+      assert.equal(resolverCalls, 1);
+      assert.equal(backendCalls, 1);
+      assert.equal(store.listCandidates(mission.mission_id).length, 1);
+      assert.equal(store.listValidationEvidence(mission.mission_id).length, 1);
+    } finally {
+      await fx.cleanup();
+    }
+  });
+
   it("returns authoritative cancellation when the backend rejects after abort", async () => {
     const { broker, m, t, store } = setup({
       agent: {

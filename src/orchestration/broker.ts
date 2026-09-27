@@ -1206,7 +1206,7 @@ export class ExecutionBroker {
       },
       result: () => {
         if (resultPromise) return resultPromise;
-        const operationPromise = (async () => {
+        const runOperation = async (): Promise<ExecutionOutcome> => {
           if (abort.signal.aborted) {
             const terminal = this.store.getExecution(execution.execution_id);
             if (terminal?.status === "CANCELED") {
@@ -1692,7 +1692,8 @@ export class ExecutionBroker {
               await this.releaseWorktree(execution.execution_id);
             }
           }
-        })();
+        };
+        const operationPromise = Promise.resolve().then(runOperation);
         let removeAbortListener = (): void => {};
         const authoritativeAbort = new Promise<ExecutionOutcome>((resolve, reject) => {
           const settle = (): void => {
