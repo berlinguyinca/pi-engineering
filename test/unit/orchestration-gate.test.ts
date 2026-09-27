@@ -9,10 +9,73 @@ import {
   taskCoverageFingerprint,
 } from "../../src/orchestration/evidence.ts";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
+import type { EventStoreBackend, StoredEvent } from "../../src/platform/eventstore/backend.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 
-function mission(requiredGates: string[], risk = "medium") {
-  const backend = JsonlEventStore.inMemory();
+class GateBarrierBackend implements EventStoreBackend {
+  readonly inner = JsonlEventStore.inMemory();
+  private blockedType: string | undefined;
+  private failedType: string | undefined;
+  private releaseBlockedAppend: (() => void) | undefined;
+  private blockedAppendStarted: (() => void) | undefined;
+  private blocked = Promise.resolve();
+  started = Promise.resolve();
+
+  block(type: string): void {
+    this.blockedType = type;
+    this.blocked = new Promise<void>((resolve) => {
+      this.releaseBlockedAppend = resolve;
+    });
+    this.started = new Promise<void>((resolve) => {
+      this.blockedAppendStarted = resolve;
+    });
+  }
+
+  fail(type: string): void {
+    this.failedType = type;
+  }
+
+  release(): void {
+    this.releaseBlockedAppend?.();
+  }
+
+  async append(event: StoredEvent): Promise<StoredEvent> {
+    if (event.type === this.failedType) throw new Error("gate evidence persistence unavailable");
+    if (event.type === this.blockedType) {
+      this.blockedType = undefined;
+      this.blockedAppendStarted?.();
+      await this.blocked;
+    }
+    return this.inner.append(event);
+  }
+
+  appendConditionally(
+    event: StoredEvent,
+    condition: () => boolean,
+    onCommit?: () => void,
+  ): Promise<StoredEvent | undefined> {
+    if (event.type === this.failedType) return Promise.reject(new Error("gate evidence persistence unavailable"));
+    return this.inner.appendConditionally(event, condition, onCommit);
+  }
+
+  async appendAll(events: StoredEvent[]): Promise<void> {
+    for (const event of events) await this.append(event);
+  }
+
+  all(): StoredEvent[] {
+    return this.inner.all();
+  }
+
+  get(eventId: string): StoredEvent | undefined {
+    return this.inner.get(eventId);
+  }
+
+  count(): number {
+    return this.inner.count();
+  }
+}
+
+function mission(requiredGates: string[], risk = "medium", backend: EventStoreBackend = JsonlEventStore.inMemory()) {
   const store = MissionStore.open(backend);
   const m = store.createMission({
     title: "x",
@@ -337,8 +400,8 @@ describe("CompletionGate (spec 07)", () => {
 });
 
 describe("revision-bound completion evidence", () => {
-  function currentEvidenceMission(olderGateKind?: "validation" | "review") {
-    const { store, m, backend } = mission(["validation", "independent_review"]);
+  function currentEvidenceMission(olderGateKind?: "validation" | "review", eventStore?: EventStoreBackend) {
+    const { store, m, backend } = mission(["validation", "independent_review"], "medium", eventStore);
     const acceptance = store.addAcceptanceCriterion(m.mission_id, "current candidate is verified", undefined, "AC-1");
     const olderGate = olderGateKind
       ? store.createTask({
@@ -477,6 +540,125 @@ describe("revision-bound completion evidence", () => {
       const replay = new CompletionGate(replayed).evaluate(replayed.getMission(mission.mission_id)!);
       assert.equal(replay.can_complete, false, JSON.stringify(replay));
       assert.match(replay.reasons.join("; "), new RegExp(`${kind}|failed`, "i"));
+    });
+  }
+
+  for (const kind of ["validation", "review"] as const) {
+    it(`waits for durable ${kind} invalidation before exposing setup or dispatch`, async () => {
+      const backend = new GateBarrierBackend();
+      const { store, mission, identity } = currentEvidenceMission(undefined, backend);
+      await store.flush();
+      const task = store.createTask({
+        mission_id: mission.mission_id,
+        kind,
+        role: kind === "review" ? "independent-reviewer" : "validator",
+        objective: `durable ${kind}`,
+        repo_id: identity.repoId,
+        acceptance_ids: ["AC-1"],
+      });
+      await store.flush();
+      let resolverCalls = 0;
+      let backendCalls = 0;
+      const broker = new ExecutionBroker({
+        store,
+        resolveRepository: async (repoId) => {
+          resolverCalls++;
+          return { repoId, root: "/repo", git: {} as never };
+        },
+        backends: {
+          validation: {
+            runValidation: async () => {
+              backendCalls++;
+              return { executionId: "validation", exitStatus: "failed", summary: "red", artifactRefs: [], usage: {} };
+            },
+          },
+          review: {
+            runReview: async () => {
+              backendCalls++;
+              return { executionId: "review", exitStatus: "failed", summary: "red", artifactRefs: [], usage: {} };
+            },
+          },
+        },
+      });
+      backend.block("evidence.invalidated");
+      let handleReady = false;
+      const handlePromise = broker
+        .execute({
+          taskId: task.task_id,
+          missionId: mission.mission_id,
+          repoId: identity.repoId,
+          kind,
+          role: task.role,
+          objective: task.objective,
+        })
+        .then((handle) => {
+          handleReady = true;
+          return handle;
+        });
+      await backend.started;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(handleReady, false);
+      assert.equal(resolverCalls, 0);
+      assert.equal(backendCalls, 0);
+
+      backend.release();
+      const handle = await handlePromise;
+      await handle.result();
+      assert.equal(resolverCalls, 1);
+      assert.equal(backendCalls, 1);
+      await store.flush();
+      const replayed = MissionStore.open(backend.inner);
+      assert.equal(replayed.listEvidenceInvalidations(mission.mission_id).length, 1);
+      assert.equal(new CompletionGate(replayed).evaluate(replayed.getMission(mission.mission_id)!).can_complete, false);
+    });
+
+    it(`prevents ${kind} setup and dispatch when invalidation persistence fails`, async () => {
+      const backend = new GateBarrierBackend();
+      const { store, mission, identity } = currentEvidenceMission(undefined, backend);
+      await store.flush();
+      const task = store.createTask({
+        mission_id: mission.mission_id,
+        kind,
+        role: kind === "review" ? "independent-reviewer" : "validator",
+        objective: `failed ${kind} durability`,
+        repo_id: identity.repoId,
+        acceptance_ids: ["AC-1"],
+      });
+      await store.flush();
+      let resolverCalls = 0;
+      let backendCalls = 0;
+      const neverRun = async () => {
+        backendCalls++;
+        throw new Error("backend must not run");
+      };
+      const broker = new ExecutionBroker({
+        store,
+        resolveRepository: async () => {
+          resolverCalls++;
+          throw new Error("resolver must not run");
+        },
+        backends: {
+          validation: { runValidation: neverRun },
+          review: { runReview: neverRun },
+        },
+      });
+      backend.fail("evidence.invalidated");
+      await assert.rejects(
+        broker.execute({
+          taskId: task.task_id,
+          missionId: mission.mission_id,
+          repoId: identity.repoId,
+          kind,
+          role: task.role,
+          objective: task.objective,
+        }),
+        /gate evidence persistence unavailable/,
+      );
+      assert.equal(resolverCalls, 0);
+      assert.equal(backendCalls, 0);
+      const replayed = MissionStore.open(backend.inner);
+      assert.equal(replayed.listEvidenceInvalidations(mission.mission_id).length, 0);
+      assert.equal(new CompletionGate(replayed).evaluate(replayed.getMission(mission.mission_id)!).can_complete, false);
     });
   }
 

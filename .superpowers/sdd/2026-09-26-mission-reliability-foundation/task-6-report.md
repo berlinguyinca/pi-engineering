@@ -115,8 +115,6 @@ Fix base: `116881d453e0b0241e8dd4b30f3089724f799611`
 - The optional Postgres event-store integration remains unrun because `TEST_DATABASE_URL` is not configured.
 - Multi-repository completion remains intentionally fail-closed until repository head-vector evidence is implemented.
 
----
-
 ## Review Fix Round 3
 
 Fix base: `bb3c6434581eabea30f365b94d6d45b6916491fb`
@@ -140,6 +138,37 @@ Fix base: `bb3c6434581eabea30f365b94d6d45b6916491fb`
 - Completion selects the latest validation and review by authoritative execution-start order, never task creation or map insertion order.
 - A failed gate task becomes obsolete only when current passing evidence belongs to a strictly later authoritative successful execution. Failed attempts without a proven earlier start remain blocking.
 - Repository-scoped validation/review invalidation now occurs immediately after the execution enters `RUNNING`, before repository resolution, worktree setup, checkpoint setup, or backend dispatch can fail.
+
+### Residual Concerns
+
+- The optional Postgres event-store integration remains unrun because `TEST_DATABASE_URL` is not configured.
+- Multi-repository completion remains intentionally fail-closed until repository head-vector evidence is implemented.
+
+---
+
+## Review Fix Round 4
+
+Fix base: `9f8966b80d334fd2624a2b131b86b796922ef5b5`
+
+### RED
+
+- `node --test --test-name-pattern="waits for durable|prevents .* setup" test/unit/orchestration-gate.test.ts` → 0 passed, 4 failed. Delayed invalidation append still exposed both validation and review handles, and failed invalidation append did not reject either `execute()` call.
+
+### GREEN
+
+- Durability regressions: `node --test --test-name-pattern="waits for durable|prevents .* setup" test/unit/orchestration-gate.test.ts` → 4 passed, 0 failed.
+- Focused: `node --test test/unit/orchestration-gate.test.ts` → 51 passed, 0 failed.
+- Affected broker/E2E surface: `node --test test/unit/orchestration-broker.test.ts test/integration/orchestrator-e2e.test.ts` → 71 passed, 0 failed.
+- Typecheck: `npm run typecheck` → passed.
+- Lint/static format: `npm run lint` → 583 files checked, no errors.
+- Full suite: `npm test` → 2,409 passed, 0 failed, 1 optional Postgres skip.
+
+### Fix Decisions
+
+- After an exact assigned validation/review execution enters `RUNNING` and its scoped invalidation is recorded, `ExecutionBroker.execute()` now awaits `MissionStore.flush()` before returning the handle.
+- Because repository resolution and all worktree/checkpoint/backend setup begin only from `handle.result()`, withholding the handle makes the durable start-plus-invalidation prefix a mandatory dispatch prerequisite.
+- A failed durability barrier aborts the unpublished execution, removes its active broker entry, records a fail-closed late-execution revocation in live state, and rejects `execute()`; resolver and backend callbacks remain untouched.
+- Delayed-append tests prove neither setup nor dispatch occurs while durability is blocked. Failed-append tests prove neither occurs after persistence rejection. Both validation and review cases reopen the durable inner event stream and assert fail-closed replay state.
 
 ### Residual Concerns
 

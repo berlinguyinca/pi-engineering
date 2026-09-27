@@ -1736,6 +1736,16 @@ export class ExecutionBroker {
     if (input.repoId && backend === "review") {
       this.store.invalidateRepositoryReviewEvidence(input.missionId, input.repoId, "review attempt started");
     }
+    if (backend === "validation" || backend === "review") {
+      try {
+        await this.store.flush();
+      } catch (error) {
+        abort.abort(error);
+        this.active.delete(execution.execution_id);
+        this.store.rejectLateExecution(execution.execution_id, "gate invalidation durability barrier failed");
+        throw error;
+      }
+    }
     return handle;
   }
 
