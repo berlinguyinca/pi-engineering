@@ -603,10 +603,15 @@ export class EngineeringRuntime {
     let routeModel:
       | ((role: WorkerRequest["role"]) => Promise<{ provider: string; id: string } | undefined>)
       | undefined;
+    let reviewFallbackModel = opts.model ? { provider: opts.model.provider, id: opts.model.id } : undefined;
     try {
       const { createRoleRouter } = await import("../capability/adapter.ts");
       const { isRoleName } = await import("../capability/roles.ts");
       const sharedRuntime = rt.worker instanceof PiWorkerExecutor ? await rt.worker.getModelRuntime() : undefined;
+      if (!reviewFallbackModel && sharedRuntime) {
+        const available = (await sharedRuntime.getAvailable())[0];
+        if (available) reviewFallbackModel = { provider: available.provider, id: available.id };
+      }
       const routerAdapter = await createRoleRouter({
         cwd: repoRoot,
         agentDir: opts.agentDir,
@@ -616,7 +621,7 @@ export class EngineeringRuntime {
       routeModel = async (role) => {
         if (!isRoleName(role)) return undefined;
         try {
-          return await routerAdapter.route(role);
+          return await routerAdapter.route(role, reviewFallbackModel ? { requester: reviewFallbackModel } : undefined);
         } catch {
           return undefined;
         }
@@ -631,6 +636,7 @@ export class EngineeringRuntime {
       git: rt.git,
       cwd: repoRoot,
       routeModel,
+      reviewFallbackModel,
     });
     // The default plan honours the routed workflow class. A research or
     // investigation mission MUST NOT get a repo-mutating worker: mutation is

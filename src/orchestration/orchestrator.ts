@@ -26,7 +26,7 @@ import { IntentRouter, workflowMutatesRepo } from "./intentRouter.ts";
 import type { MissionStore } from "./missionStore.ts";
 import type { MissionObservability } from "./observability/MissionObservability.ts";
 import { computeProgress } from "./observability/progress.ts";
-import type { ActivityType } from "./observability/types.ts";
+import type { ActivityType, WaitingReason } from "./observability/types.ts";
 import { deriveRequiredGates, mutationFactFromChangedFiles } from "./policies.ts";
 import { brokerKind } from "./scheduler.ts";
 import { MissionScheduler } from "./scheduler.ts";
@@ -168,11 +168,38 @@ export class Orchestrator {
       now: opts.now,
       sleep: opts.sleep,
       rand: opts.rand,
+      onStatus: (notice) => {
+        const obs = this.observability;
+        if (notice.action === "resumed") {
+          obs?.clearWaiting(notice.missionId);
+          this.report(
+            notice.missionId,
+            `[mission ${notice.missionId}] recovery succeeded; worker execution resumed (attempt ${notice.attempt})`,
+          );
+          return;
+        }
+        const waitingReason: WaitingReason =
+          notice.status === "WAITING_FOR_CAPACITY"
+            ? "rate_limit"
+            : notice.status === "RECOVERING_CONTEXT"
+              ? "model_request"
+              : "external_resource";
+        const next = notice.nextActionAt ? `; next recovery check ${new Date(notice.nextActionAt).toISOString()}` : "";
+        const detail =
+          notice.action === "paused"
+            ? `Recovery stopped with no active worker: ${notice.reason}. Mission is paused and resumable.`
+            : `No active worker while recovery runs: ${notice.reason}; attempt ${notice.attempt}${next}`;
+        obs?.setWaiting(notice.missionId, waitingReason, detail);
+        this.report(notice.missionId, `[mission ${notice.missionId}] ${detail}`);
+      },
       // Surface every task settlement as live progress so a running mission is
       // never silent: the operator sees each worker/gate settle instead of a
       // black screen for the whole worker budget (default 30 min).
       onTaskSettled: (missionId, taskId, status) => {
-        this.report(missionId, `[mission ${missionId}] task ${taskId} -> ${status}`);
+        const reason = (this.store.getTask(taskId) as (OrchestrationTask & { failure_reason?: string }) | undefined)
+          ?.failure_reason;
+        const detail = reason ? `: ${reason}` : "";
+        this.report(missionId, `[mission ${missionId}] task ${taskId} -> ${status}${detail}`);
         this.observeTaskSettled(missionId, taskId, status);
       },
     });
@@ -670,11 +697,17 @@ export class Orchestrator {
     } else {
       this.store.failMission(missionId, verdict.reasons.join("; "));
     }
+    const stopped = this.store.getMission(missionId)!;
+    const reason = verdict.reasons.join("; ") || "completion requirements were not satisfied";
+    const summary = `Mission ${stopped.status.toLowerCase()}: ${reason}. No workers remain active.`;
+    this.observability?.clearWaiting(missionId);
+    this.observability?.activity(missionId, { type: "error", summary, meaningfulProgress: true });
+    this.report(missionId, `[mission ${missionId}] ${summary}`);
     return {
-      mission: this.store.getMission(missionId)!,
+      mission: stopped,
       verdict,
       completed: false,
-      failureReason: verdict.reasons.join("; "),
+      failureReason: reason,
     };
   }
 

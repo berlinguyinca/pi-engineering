@@ -86,6 +86,8 @@ export interface SchedulerOptions {
   limits?: Partial<SchedulerLimits>;
   /** Called when a task reaches a terminal state. */
   onTaskSettled?: (missionId: string, taskId: string, status: TaskStatus) => void;
+  /** Called whenever execution has no active worker because recovery is waiting or has stopped. */
+  onStatus?: (notice: MissionSchedulerStatusNotice) => void;
   /**
    * Mission-level gateway resilience config. Defaults to the environment-resolved
    * config (90-min time-based window, 10s probes, auto-resume). A transient
@@ -102,6 +104,17 @@ export interface SchedulerOptions {
   sleep?: (ms: number) => Promise<void>;
   /** Injectable RNG (default Math.random) for probe jitter. */
   rand?: () => number;
+}
+
+export interface MissionSchedulerStatusNotice {
+  missionId: string;
+  taskId: string;
+  status: MissionStatus;
+  action: "retrying" | "resumed" | "paused";
+  reason: string;
+  attempt: number;
+  nextActionAt?: number;
+  terminal: boolean;
 }
 
 /** Failure classifier (spec 02 retry/recovery). */
@@ -149,6 +162,7 @@ export class MissionScheduler {
   private readonly broker: ExecutionBroker;
   private readonly limits: SchedulerLimits;
   private readonly onTaskSettled?: SchedulerOptions["onTaskSettled"];
+  private readonly onStatus?: SchedulerOptions["onStatus"];
   /** Active executions by task id (for write-domain conflict detection). */
   private readonly activeTasks = new Map<string, OrchestrationTask>();
   /** Counters for concurrency limits. */
@@ -186,6 +200,7 @@ export class MissionScheduler {
     this.broker = opts.broker;
     this.limits = { ...DEFAULT_LIMITS, ...opts.limits };
     this.onTaskSettled = opts.onTaskSettled;
+    this.onStatus = opts.onStatus;
     // Resolve the time-based resilience config (env-overridable). Resilience is
     // ON by default so missions survive gateway outages; a probe + clock + sleep
     // are injectable for deterministic fault-injection tests.
@@ -450,7 +465,17 @@ export class MissionScheduler {
         this.breakerSuccess(task);
         this.clearResilience(task);
         this.forgetOutage(task);
-        this.resumeToExecuting(task.mission_id);
+        if (this.resumeToExecuting(task.mission_id)) {
+          this.onStatus?.({
+            missionId: task.mission_id,
+            taskId: task.task_id,
+            status: "EXECUTING",
+            action: "resumed",
+            reason: "infrastructure recovery succeeded",
+            attempt,
+            terminal: false,
+          });
+        }
         this.store.transitionTask(task.task_id, "SUCCEEDED");
         return;
       } catch (err) {
@@ -493,7 +518,18 @@ export class MissionScheduler {
     // Circuit breaker: while OPEN and the cooldown has not elapsed, only probe.
     const breaker = this.breakers.get(task.task_id);
     if (breaker && !breaker.allowRequest()) {
-      const waited = await this.abortable(this.sleepFn(cfg.probe_interval_ms), signal);
+      const waitMs = cfg.probe_interval_ms;
+      this.onStatus?.({
+        missionId: task.mission_id,
+        taskId: task.task_id,
+        status: this.store.getMission(task.mission_id)?.status ?? "WAITING_FOR_LLM",
+        action: "retrying",
+        reason: "recovery circuit is cooling down before the next gateway probe",
+        attempt: this.store.getTask(task.task_id)?.attempt ?? task.attempt,
+        nextActionAt: this.clockNow() + waitMs,
+        terminal: false,
+      });
+      const waited = await this.abortable(this.sleepFn(waitMs), signal);
       if (waited.aborted) return "aborted";
       return "wait";
     }
@@ -504,7 +540,18 @@ export class MissionScheduler {
     if (result.healthy) return "proceed";
     // Gateway still down: honour the reported wait (else the probe interval),
     // then re-probe without a real attempt.
-    const waited = await this.abortable(this.sleepFn(result.retry_after_ms ?? cfg.probe_interval_ms), signal);
+    const waitMs = result.retry_after_ms ?? cfg.probe_interval_ms;
+    this.onStatus?.({
+      missionId: task.mission_id,
+      taskId: task.task_id,
+      status: this.store.getMission(task.mission_id)?.status ?? "WAITING_FOR_LLM",
+      action: "retrying",
+      reason: result.reason ?? result.scheduler_state ?? "gateway recovery probe is still unhealthy",
+      attempt: this.store.getTask(task.task_id)?.attempt ?? task.attempt,
+      nextActionAt: this.clockNow() + waitMs,
+      terminal: false,
+    });
+    const waited = await this.abortable(this.sleepFn(waitMs), signal);
     if (waited.aborted) return "aborted";
     return "wait";
   }
@@ -573,6 +620,16 @@ export class MissionScheduler {
     const base = cfg.probe_interval_ms;
     const paced = Math.min(cfg.max_backoff_ms ?? base, base * 2 ** Math.min(failures, 30));
     const wait = paced + (cfg.jitter_ms > 0 ? Math.round(cfg.jitter_ms * this.rand()) : 0);
+    this.onStatus?.({
+      missionId: task.mission_id,
+      taskId: task.task_id,
+      status: CATEGORY_TO_STATE[cat] as MissionStatus,
+      action: "retrying",
+      reason: cat,
+      attempt: task.attempt + 1,
+      nextActionAt: this.clockNow() + wait,
+      terminal: false,
+    });
     return { retry: true, waitMs: wait, paused: false };
   }
 
@@ -590,9 +647,9 @@ export class MissionScheduler {
   /** Resume a parked mission back to EXECUTING after a task succeeds. Only when
    * no other task in the mission is still paused (RETRYING), so a mission with a
    * paused task never reports EXECUTING. */
-  private resumeToExecuting(missionId: string): void {
+  private resumeToExecuting(missionId: string): boolean {
     const mission = this.store.getMission(missionId);
-    if (!mission || mission.status === "EXECUTING") return;
+    if (!mission || mission.status === "EXECUTING") return false;
     const parked: MissionStatus[] = [
       "WAITING_FOR_LLM",
       "WAITING_FOR_CAPACITY",
@@ -603,13 +660,14 @@ export class MissionScheduler {
       "RECOVERING_PROCESS",
       "PAUSED_INFRASTRUCTURE",
     ];
-    if (!parked.includes(mission.status)) return;
+    if (!parked.includes(mission.status)) return false;
     const anyPaused = this.store.listTasks(missionId).some((t) => t.status === "RETRYING");
-    if (anyPaused) return;
+    if (anyPaused) return false;
     try {
       this.store.transitionMission(missionId, "EXECUTING");
+      return true;
     } catch {
-      /* ignore */
+      return false;
     }
   }
 
@@ -620,6 +678,15 @@ export class MissionScheduler {
     this.parkMission(task.mission_id, "PAUSED_INFRASTRUCTURE");
     this.markTaskResumable(task);
     this.clearResilience(task);
+    this.onStatus?.({
+      missionId: task.mission_id,
+      taskId: task.task_id,
+      status: "PAUSED_INFRASTRUCTURE",
+      action: "paused",
+      reason: "infrastructure retry window exhausted",
+      attempt: this.store.getTask(task.task_id)?.attempt ?? task.attempt,
+      terminal: true,
+    });
     return true;
   }
 
@@ -710,6 +777,8 @@ export class MissionScheduler {
     // mission left PAUSED_INFRASTRUCTURE (resumed or canceled elsewhere).
     const stillPaused = () =>
       missionId === undefined || this.store.getMission(missionId)?.status === "PAUSED_INFRASTRUCTURE";
+    const recoveryTask = () =>
+      missionId === undefined ? undefined : this.store.listTasks(missionId).find((task) => task.status === "RETRYING");
     for (let n = 0; this.clockNow() < deadlineMs; n++) {
       if (signal?.aborted || !stillPaused()) return false;
       const probed = await this.abortable(this.probe.probe(), signal);
@@ -723,12 +792,35 @@ export class MissionScheduler {
         cfg.probe_interval_ms * 2 ** Math.min(n, 30),
       );
       const jitter = cfg.jitter_ms > 0 ? Math.round(cfg.jitter_ms * this.rand()) : 0;
-      const waited = await this.abortable(
-        this.sleepFn(Math.min(result.retry_after_ms ?? backoff + jitter, Math.max(0, deadlineMs - this.clockNow()))),
-        signal,
-      );
+      const waitMs = Math.min(result.retry_after_ms ?? backoff + jitter, Math.max(0, deadlineMs - this.clockNow()));
+      const task = recoveryTask();
+      if (missionId !== undefined) {
+        this.onStatus?.({
+          missionId,
+          taskId: task?.task_id ?? "recovery",
+          status: "PAUSED_INFRASTRUCTURE",
+          action: "retrying",
+          reason: result.reason ?? result.scheduler_state ?? "gateway recovery probe is still unhealthy",
+          attempt: task?.attempt ?? n + 1,
+          nextActionAt: this.clockNow() + waitMs,
+          terminal: false,
+        });
+      }
+      const waited = await this.abortable(this.sleepFn(waitMs), signal);
       if (waited.aborted) return false;
       if (this.clockNow() >= deadlineMs || signal?.aborted) break;
+    }
+    if (missionId !== undefined && stillPaused() && !signal?.aborted && this.clockNow() >= deadlineMs) {
+      const task = recoveryTask();
+      this.onStatus?.({
+        missionId,
+        taskId: task?.task_id ?? "recovery",
+        status: "PAUSED_INFRASTRUCTURE",
+        action: "paused",
+        reason: `auto-recovery horizon exhausted at ${new Date(deadlineMs).toISOString()}`,
+        attempt: task?.attempt ?? 0,
+        terminal: true,
+      });
     }
     return false;
   }
