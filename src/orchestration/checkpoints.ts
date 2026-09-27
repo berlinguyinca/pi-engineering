@@ -69,6 +69,7 @@ export class CheckpointManager {
       throw new Error(`checkpoint origin mismatch: execution ${input.executionId} lacks repository/base identity`);
     }
     const assertCurrentOrigin = () => {
+      this.store.assertExecutionAuthoritative(input.executionId);
       const task = this.store.getTask(input.taskId);
       const repository = this.store
         .getWorkspaceManifest(execution.mission_id)
@@ -87,67 +88,87 @@ export class CheckpointManager {
       if (mismatches.length > 0) throw new Error(`checkpoint origin mismatch: ${mismatches.join(", ")}`);
       return task!;
     };
-    assertCurrentOrigin();
-    const snapshot = input.snapshot ?? (await this.snapshot?.(originatingTask.task_id)) ?? EMPTY_SNAPSHOT;
-    const task = assertCurrentOrigin();
-    const checkpointId = execution.checkpoint_id;
-    const previous = this.latest(task.task_id, checkpointId);
-    const usefulSnapshot =
-      snapshot.candidateSha !== null ||
-      snapshot.branch !== null ||
-      snapshot.worktree !== null ||
-      snapshot.committedChanges.length > 0 ||
-      snapshot.preservedUncommittedChanges.length > 0;
-    const preservedSnapshot = usefulSnapshot
-      ? snapshot
-      : previous
-        ? {
-            candidateSha: previous.candidateSha,
-            branch: previous.branch,
-            worktree: previous.worktree,
-            committedChanges: previous.committedChanges,
-            preservedUncommittedChanges: previous.preservedUncommittedChanges,
-          }
-        : snapshot;
-    const declared = task.deliverables ?? [];
-    const completed = dedupe([
-      ...(previous?.completedDeliverables ?? []),
-      ...(input.completedDeliverables ?? []),
-    ]).filter((deliverable) => declared.includes(deliverable));
-    const completedSet = new Set(completed);
-    const checkpoint: TaskCheckpoint = {
-      checkpointId,
-      executionId: execution.execution_id,
-      missionId: task.mission_id,
-      taskId: task.task_id,
-      repoId: execution.repo_id,
-      baseSha: execution.base_sha,
-      candidateSha: preservedSnapshot.candidateSha,
-      branch: preservedSnapshot.branch,
-      worktree: preservedSnapshot.worktree,
-      committedChanges: dedupe(preservedSnapshot.committedChanges),
-      preservedUncommittedChanges: dedupe(preservedSnapshot.preservedUncommittedChanges),
-      completedDeliverables: completed,
-      remainingDeliverables: declared.filter((deliverable) => !completedSet.has(deliverable)),
-      acceptanceIds: [...(task.acceptance_ids ?? [])],
-      validationEvidenceRefs: dedupe([
-        ...(previous?.validationEvidenceRefs ?? []),
-        ...(input.validationEvidenceRefs ?? []),
-      ]),
-      artifactRefs: dedupe([...(previous?.artifactRefs ?? []), ...(input.artifactRefs ?? [])]),
-      artifactHashes: dedupe([...(previous?.artifactHashes ?? []), ...(input.artifactHashes ?? [])]),
-      workerId: input.workerId ?? previous?.workerId ?? null,
-      sessionId: input.sessionId ?? previous?.sessionId ?? null,
-      model: input.model ?? previous?.model ?? null,
-      sequence: (previous?.sequence ?? 0) + 1,
-      missionGeneration: execution.mission_generation ?? 0,
-      candidateGeneration: execution.candidate_generation ?? 0,
-      fencingToken: execution.fencing_token ?? 0,
-      createdAt: this.now().toISOString(),
-    };
-    const persisted = this.store.checkpointTask(checkpoint);
-    await this.store.flush();
-    return persisted;
+    try {
+      assertCurrentOrigin();
+      const snapshot = input.snapshot ?? (await this.snapshot?.(originatingTask.task_id)) ?? EMPTY_SNAPSHOT;
+      const task = assertCurrentOrigin();
+      const checkpointId = execution.checkpoint_id;
+      const previous = this.latest(task.task_id, checkpointId);
+      const usefulSnapshot =
+        snapshot.candidateSha !== null ||
+        snapshot.branch !== null ||
+        snapshot.worktree !== null ||
+        snapshot.committedChanges.length > 0 ||
+        snapshot.preservedUncommittedChanges.length > 0;
+      const preservedSnapshot = usefulSnapshot
+        ? snapshot
+        : previous
+          ? {
+              candidateSha: previous.candidateSha,
+              branch: previous.branch,
+              worktree: previous.worktree,
+              committedChanges: previous.committedChanges,
+              preservedUncommittedChanges: previous.preservedUncommittedChanges,
+            }
+          : snapshot;
+      const declared = task.deliverables ?? [];
+      const completed = dedupe([
+        ...(previous?.completedDeliverables ?? []),
+        ...(input.completedDeliverables ?? []),
+      ]).filter((deliverable) => declared.includes(deliverable));
+      const completedSet = new Set(completed);
+      const checkpoint: TaskCheckpoint = {
+        checkpointId,
+        executionId: execution.execution_id,
+        missionId: task.mission_id,
+        taskId: task.task_id,
+        repoId: execution.repo_id,
+        baseSha: execution.base_sha,
+        candidateSha: preservedSnapshot.candidateSha,
+        branch: preservedSnapshot.branch,
+        worktree: preservedSnapshot.worktree,
+        committedChanges: dedupe(preservedSnapshot.committedChanges),
+        preservedUncommittedChanges: dedupe(preservedSnapshot.preservedUncommittedChanges),
+        completedDeliverables: completed,
+        remainingDeliverables: declared.filter((deliverable) => !completedSet.has(deliverable)),
+        acceptanceIds: [...(task.acceptance_ids ?? [])],
+        validationEvidenceRefs: dedupe([
+          ...(previous?.validationEvidenceRefs ?? []),
+          ...(input.validationEvidenceRefs ?? []),
+        ]),
+        artifactRefs: dedupe([...(previous?.artifactRefs ?? []), ...(input.artifactRefs ?? [])]),
+        artifactHashes: dedupe([...(previous?.artifactHashes ?? []), ...(input.artifactHashes ?? [])]),
+        workerId: input.workerId ?? previous?.workerId ?? null,
+        sessionId: input.sessionId ?? previous?.sessionId ?? null,
+        model: input.model ?? previous?.model ?? null,
+        sequence: (previous?.sequence ?? 0) + 1,
+        missionGeneration: execution.mission_generation ?? 0,
+        candidateGeneration: execution.candidate_generation ?? 0,
+        fencingToken: execution.fencing_token ?? 0,
+        createdAt: this.now().toISOString(),
+      };
+      assertCurrentOrigin();
+      const persisted = this.store.checkpointTask(checkpoint);
+      await this.store.flush();
+      assertCurrentOrigin();
+      return persisted;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (/authoritative|origin mismatch|stale execution identity/i.test(message)) {
+        await this.store.recordLateExecution(input.executionId, "checkpoint authority lost", {
+          kind: "checkpoint",
+          exitStatus: null,
+          summary: "Rejected checkpoint from a terminal or stale execution",
+          error: message,
+          artifactRefs: [...(input.artifactRefs ?? [])],
+          findings: [],
+          handoffs: [],
+          recovery: [],
+          gate: null,
+        });
+      }
+      throw error;
+    }
   }
 
   reconcile(taskId: string): ReconciledCheckpoint | null {

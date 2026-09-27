@@ -10,14 +10,43 @@ import { type BrokerBackends, ExecutionBroker, workerTimeoutMs } from "../../src
 import { CheckpointManager } from "../../src/orchestration/checkpoints.ts";
 import { Integrator } from "../../src/orchestration/integrator.ts";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
+import type { EventStoreBackend, StoredEvent } from "../../src/platform/eventstore/backend.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 import { makeFixtureRepo } from "../fixtures/make-fixture.ts";
 
 const exec = promisify(execFile);
 
+class LateAppendFailureBackend implements EventStoreBackend {
+  readonly inner = JsonlEventStore.inMemory();
+  fail = false;
+
+  append(event: StoredEvent): Promise<StoredEvent> {
+    if (this.fail) return Promise.reject(new Error("late evidence persistence unavailable"));
+    return this.inner.append(event);
+  }
+
+  appendAll(events: StoredEvent[]): Promise<void> {
+    if (this.fail) return Promise.reject(new Error("late evidence persistence unavailable"));
+    return this.inner.appendAll(events);
+  }
+
+  all(): StoredEvent[] {
+    return this.inner.all();
+  }
+
+  get(eventId: string): StoredEvent | undefined {
+    return this.inner.get(eventId);
+  }
+
+  count(): number {
+    return this.inner.count();
+  }
+}
+
 async function cancellationCheckpointFixture(
   runAgent: NonNullable<BrokerBackends["agent"]>["runAgent"],
   cancellationAckTimeoutMs = 5_000,
+  checkpoints?: CheckpointManager,
 ) {
   const fx = await makeFixtureRepo();
   const git = await GitRepo.open(fx.root);
@@ -66,7 +95,7 @@ async function cancellationCheckpointFixture(
   const broker = new ExecutionBroker({
     store,
     git,
-    checkpoints: new CheckpointManager({ store }),
+    checkpoints: checkpoints ?? new CheckpointManager({ store }),
     cancellationAckTimeoutMs,
     resolveRepository: async (repoId) => ({ repoId, root: fx.root, git }),
     backends: { agent: { runAgent } },
@@ -212,6 +241,52 @@ async function assertCrossBoundaryRenameRejected(commitRename: boolean): Promise
 }
 
 describe("ExecutionBroker (spec 03)", () => {
+  it("memoizes one dispatch and one exact result promise per handle", async () => {
+    let dispatches = 0;
+    const { broker, m, t } = setup({
+      agent: {
+        runAgent: async () => {
+          dispatches++;
+          return { executionId: "worker", exitStatus: "succeeded", summary: "done", artifactRefs: [], usage: {} };
+        },
+      },
+    });
+    const handle = await broker.execute({
+      taskId: t.task_id,
+      missionId: m.mission_id,
+      kind: "agent",
+      objective: t.objective,
+    });
+
+    const first = handle.result();
+    const second = handle.result();
+    assert.equal(first, second);
+    assert.equal((await first).exitStatus, "succeeded");
+    assert.equal(dispatches, 1);
+  });
+
+  it("returns authoritative cancellation when the backend rejects after abort", async () => {
+    const { broker, m, t, store } = setup({
+      agent: {
+        runAgent: ({ signal }) =>
+          new Promise((_, reject) =>
+            signal.addEventListener("abort", () => reject(new Error("backend abort")), { once: true }),
+          ),
+      },
+    });
+    const handle = await broker.execute({
+      taskId: t.task_id,
+      missionId: m.mission_id,
+      kind: "agent",
+      objective: t.objective,
+    });
+    const result = handle.result();
+    await handle.cancel();
+
+    const outcome = await result;
+    assert.equal(outcome.error, "canceled");
+    assert.equal(store.getExecution(handle.executionId)?.status, "CANCELED");
+  });
   it("settles at the deadline plus cancellation grace when the backend ignores AbortSignal forever", async () => {
     const backend = JsonlEventStore.inMemory();
     const store = MissionStore.open(backend);
@@ -323,6 +398,7 @@ describe("ExecutionBroker (spec 03)", () => {
       kind: "review",
       objective: task.objective,
       requiredOutputArtifacts: task.required_output_artifacts,
+      reviewedRecovered: ["TSK-recovered"],
     });
 
     const outcome = await Promise.race([
@@ -350,6 +426,74 @@ describe("ExecutionBroker (spec 03)", () => {
     assert.ok(
       backend.all().some((event) => event.type === "execution.late_result_rejected"),
       "the rejected late result must remain auditable",
+    );
+    const evidence = backend
+      .all()
+      .reverse()
+      .find((event) => event.type === "execution.late_result_rejected")?.payload.evidence as Record<string, unknown>;
+    assert.deepEqual(evidence.artifactRefs, ["artifact://gate/late-approval"]);
+    assert.deepEqual(evidence.findings, [{ severity: "none", summary: "late finding" }]);
+    assert.equal(evidence.exitStatus, "succeeded");
+    assert.equal(evidence.summary, "late approval");
+    assert.equal(evidence.error, null);
+    assert.deepEqual(evidence.handoffs, []);
+    assert.deepEqual(evidence.recovery, []);
+    assert.deepEqual(evidence.gate, {
+      requiredOutputArtifacts: ["gate"],
+      reviewedRecovered: ["TSK-recovered"],
+      usage: { accepted: true },
+    });
+  });
+
+  it("surfaces detached late-evidence append failure in persistence diagnostics", async () => {
+    const backend = new LateAppendFailureBackend();
+    const store = MissionStore.open(backend);
+    const mission = store.createMission({
+      title: "late append failure",
+      goal: "late append failure",
+      user_request: "late append failure",
+      repository: ".",
+      base_ref: "",
+      risk_profile: "low",
+      workflow_class: "engineering_review",
+    });
+    const task = store.createTask({
+      mission_id: mission.mission_id,
+      kind: "agent",
+      role: "implementer",
+      objective: "finish late",
+    });
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const broker = new ExecutionBroker({
+      store,
+      defaultTimeoutMs: 10,
+      cancellationAckTimeoutMs: 10,
+      backends: {
+        agent: {
+          runAgent: async () => {
+            await blocked;
+            return { executionId: "late", exitStatus: "succeeded", summary: "late", artifactRefs: [], usage: {} };
+          },
+        },
+      },
+    });
+    const handle = await broker.execute({
+      taskId: task.task_id,
+      missionId: mission.mission_id,
+      kind: "agent",
+      objective: task.objective,
+    });
+    await handle.result();
+    await store.flush();
+    backend.fail = true;
+    release();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    assert.ok(
+      store.persistenceDiagnostics().some((diagnostic) => diagnostic.eventType === "execution.late_result_rejected"),
     );
   });
 
@@ -533,6 +677,14 @@ describe("ExecutionBroker (spec 03)", () => {
       assert.ok(checkpoint);
       assert.ok(checkpoint.candidateSha, "checkpoint must identify a recoverable commit");
       const removedWorktree = checkpoint.worktree!;
+      for (let attempt = 0; attempt < 20; attempt++) {
+        try {
+          await access(removedWorktree);
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        } catch {
+          break;
+        }
+      }
       await assert.rejects(access(removedWorktree), "the canceled worktree should be cleaned up");
       const recovered = await exec("git", ["-C", fx.root, "show", `${checkpoint.candidateSha}:src/cancelled.ts`]);
       assert.equal(recovered.stdout, "export const cancelled = true;\n");
@@ -620,7 +772,7 @@ describe("ExecutionBroker (spec 03)", () => {
     const result = context.handle.result().catch(() => undefined);
     const worktree = await worktreeReady;
     try {
-      await assert.rejects(context.handle.cancel(), /snapshot HEAD changed/i);
+      await context.handle.cancel();
       const execution = context.store.getExecution(context.handle.executionId)!;
       assert.equal(context.store.getTaskCheckpoint(execution.checkpoint_id!), undefined);
       await access(worktree);
@@ -652,7 +804,7 @@ describe("ExecutionBroker (spec 03)", () => {
     const worktree = await (async () => {
       const result = context.handle.result().catch(() => undefined);
       const allocated = await worktreeReady;
-      await assert.rejects(context.handle.cancel(), /writer.*quiesce|acknowledge.*cancellation/i);
+      await context.handle.cancel();
       const execution = context.store.getExecution(context.handle.executionId)!;
       assert.equal(context.store.getTaskCheckpoint(execution.checkpoint_id!), undefined);
       await access(allocated);
@@ -671,6 +823,40 @@ describe("ExecutionBroker (spec 03)", () => {
       release();
       await context.fx.cleanup();
     }
+  });
+
+  it("terminalizes cancellation when checkpoint persistence never settles", async () => {
+    let started!: (worktree: string) => void;
+    const worktreeReady = new Promise<string>((resolve) => {
+      started = resolve;
+    });
+    const stalledCheckpoints = {
+      persist: () => new Promise<never>(() => {}),
+    } as unknown as CheckpointManager;
+    const context = await cancellationCheckpointFixture(
+      async ({ worktree, signal }) => {
+        assert.ok(worktree);
+        await writeFile(join(worktree, "src", "stalled-checkpoint.ts"), "export const stalled = true;\n", "utf8");
+        started(worktree);
+        await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+        return { executionId: "late", exitStatus: "succeeded", summary: "late", artifactRefs: [], usage: {} };
+      },
+      20,
+      stalledCheckpoints,
+    );
+    const result = context.handle.result();
+    const worktree = await worktreeReady;
+
+    await Promise.race([
+      context.handle.cancel(),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("cancel did not settle")), 100)),
+    ]);
+
+    assert.equal(context.store.getExecution(context.handle.executionId)?.status, "CANCELED");
+    assert.equal((await result).error, "canceled");
+    await access(worktree);
+    assert.ok(context.broker.preservedBranches(context.mission.mission_id).length > 0);
+    await context.fx.cleanup();
   });
 
   it("retains the dirty worktree when cancellation preservation cannot commit", async () => {
@@ -757,7 +943,7 @@ describe("ExecutionBroker (spec 03)", () => {
       const result = handle.result().catch(() => undefined);
       await dirtyWritten;
 
-      await assert.rejects(handle.cancel(), /git commit failed/i);
+      await handle.cancel();
       await result;
       await broker.cleanupMission(mission.mission_id);
       await access(worktree);
@@ -1007,7 +1193,7 @@ describe("ExecutionBroker (spec 03)", () => {
       objective: "x",
     });
     await handle.cancel();
-    await assert.rejects(handle.result(), /aborted/i);
+    assert.equal((await handle.result()).error, "canceled");
     assert.equal(runs, 0);
   });
 
@@ -1056,7 +1242,7 @@ describe("ExecutionBroker (spec 03)", () => {
     await started;
     await handle.cancel();
     releaseAllocation();
-    await assert.rejects(pending, /aborted/i);
+    assert.equal((await pending).error, "canceled");
     assert.equal(runs, 0);
     assert.equal(removals, 1);
   });
@@ -1267,7 +1453,7 @@ describe("ExecutionBroker (spec 03)", () => {
     await handle.cancel();
     const ex = store.listExecutions(m.mission_id)[0]!;
     assert.equal(ex.status, "CANCELED");
-    await assert.rejects(() => resultP);
+    assert.equal((await resultP).error, "canceled");
   });
 
   it("supports steering and records it as a task steer request", async () => {

@@ -89,6 +89,18 @@ export interface OrchestrationEvent {
   payload: Record<string, unknown>;
 }
 
+export interface LateExecutionEvidence extends Record<string, unknown> {
+  kind: "backend_result" | "backend_error" | "checkpoint" | "integration";
+  exitStatus: string | null;
+  summary: string | null;
+  error: string | null;
+  artifactRefs: string[];
+  findings: Array<Record<string, unknown>>;
+  handoffs: Array<Record<string, unknown>>;
+  recovery: Array<Record<string, unknown>>;
+  gate: Record<string, unknown> | null;
+}
+
 export interface MissionCreateInput {
   mission_id?: string;
   title: string;
@@ -944,6 +956,18 @@ export class MissionStore {
       ...(evidence ? { evidence } : {}),
     });
     return copyExecution(rejected);
+  }
+
+  /** Append inert late evidence and keep append failures visible in persistenceDiagnostics(). */
+  async recordLateExecution(executionId: string, reason: string, evidence: LateExecutionEvidence): Promise<boolean> {
+    this.rejectLateExecution(executionId, reason, evidence);
+    try {
+      await this.flush();
+      return true;
+    } catch {
+      // drainPending records the exact failed event for operator diagnostics.
+      return false;
+    }
   }
 
   // ── Findings ────────────────────────────────────────────────────────────

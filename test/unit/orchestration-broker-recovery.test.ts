@@ -152,6 +152,108 @@ async function scenario(steps: Step[], mode: IntegrationMode = {}) {
 }
 
 describe("ExecutionBroker: recovering a timed-out worker's committed work", () => {
+  it("rejects late integration findings and cleanup while retaining uncertain branches", async () => {
+    const fx = await makeFixtureRepo();
+    try {
+      const git = (await GitRepo.open(fx.root))!;
+      const backend = JsonlEventStore.inMemory();
+      const store = MissionStore.open(backend);
+      const base = await git.headCommit();
+      const mission = store.createMission({
+        title: "late integration",
+        goal: "late integration",
+        user_request: "late integration",
+        repository: fx.root,
+        base_ref: base,
+        risk_profile: "medium",
+        workflow_class: "engineering_review",
+      });
+      const workerTask = store.createTask({
+        mission_id: mission.mission_id,
+        kind: "agent",
+        role: "implementer",
+        objective: "worker",
+        mutates_repo: true,
+        isolation: "worktree",
+        write_domains: ["src/**"],
+      });
+      let releaseIntegration!: () => void;
+      const integrationBlocked = new Promise<void>((resolve) => {
+        releaseIntegration = resolve;
+      });
+      const broker = new ExecutionBroker({
+        store,
+        git,
+        baseRef: base,
+        defaultTimeoutMs: 5_000,
+        cancellationAckTimeoutMs: 15,
+        backends: {
+          agent: {
+            runAgent: async ({ worktree }) => {
+              await writeFile(join(worktree!, "src", "late-integration.ts"), "export const late = true;\n");
+              return { executionId: "worker", exitStatus: "succeeded", summary: "done", artifactRefs: [], usage: {} };
+            },
+          },
+          integration: {
+            runIntegration: async () => {
+              await integrationBlocked;
+              return {
+                executionId: "integration",
+                exitStatus: "succeeded",
+                summary: "late merge",
+                artifactRefs: ["artifact://integration/late"],
+                usage: {},
+                findings: [{ severity: "blocking", summary: "late finding" }],
+              };
+            },
+          },
+        },
+      });
+      await (
+        await broker.execute({
+          taskId: workerTask.task_id,
+          missionId: mission.mission_id,
+          kind: "agent",
+          objective: workerTask.objective,
+          mutatesRepo: true,
+          isolation: "worktree",
+          writeDomains: workerTask.write_domains,
+        })
+      ).result();
+      const integrationTask = store.createTask({
+        mission_id: mission.mission_id,
+        kind: "integration",
+        role: "integrator",
+        objective: "merge",
+      });
+      const integration = await broker.execute({
+        taskId: integrationTask.task_id,
+        missionId: mission.mission_id,
+        kind: "integration",
+        objective: integrationTask.objective,
+        executionBudgetMs: 20,
+      });
+
+      assert.equal((await integration.result()).error, "timeout");
+      const findings = store.listFindings(mission.mission_id);
+      releaseIntegration();
+      await new Promise((resolve) => setTimeout(resolve, 30));
+
+      assert.deepEqual(store.listFindings(mission.mission_id), findings);
+      assert.equal(broker.pendingIntegrations(mission.mission_id), 1);
+      assert.ok(broker.preservedBranches(mission.mission_id).some((branch) => branch.includes(workerTask.task_id)));
+      const evidence = backend
+        .all()
+        .filter((event) => event.type === "execution.late_result_rejected")
+        .map((event) => event.payload.evidence as Record<string, unknown>)
+        .find((candidate) => (candidate.findings as unknown[] | undefined)?.length);
+      assert.deepEqual(evidence?.findings, [{ severity: "blocking", summary: "late finding" }]);
+      assert.equal((evidence?.handoffs as unknown[] | undefined)?.length, 1);
+    } finally {
+      await fx.cleanup();
+    }
+  });
+
   it("preserves a pre-timeout checkpoint but keeps the uncooperative branch ineligible for integration", async () => {
     const fx = await makeFixtureRepo();
     let release!: () => void;

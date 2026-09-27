@@ -54,3 +54,38 @@ Result: exit 0; 2,361 total, 2,360 passed, 0 failed, 1 skipped. The existing Pos
 - Authority-loss reconciliation for unrelated already-`RUNNING` orphans remains deferred to Tasks 8/9. This task explicitly settles only its own broker deadline/cancellation boundary.
 - Git path-enumeration failures remain final-review triage as directed; no fail-open/fail-closed policy was changed here.
 - No auto-repair or automatic integration of checkpointed work was added.
+
+## Fix Round 1
+
+Addressed the six high-severity review findings:
+
+- Cancellation and timeout now share idempotent terminalization. Preservation is bounded; uncertain worktrees are retained, execution/task authority is revoked, and active scheduler ownership is removed before the public promise settles.
+- Checkpoints assert execution authority before snapshotting, after every asynchronous repository/persistence boundary, and immediately before publication. Terminal/stale attempts retain the previous checkpoint and append typed inert evidence.
+- Integration reasserts authority after every awaited repository operation and before findings, handoffs, recovered-merge evidence, and cleanup. Authority loss retains all uncertain branches/worktrees and records evidence only.
+- Backend resolution or rejection after abort is always late evidence; the public result remains the broker's authoritative cancellation/timeout outcome.
+- Each handle memoizes one exact execution promise, preventing duplicate dispatch.
+- One typed late-outcome serializer preserves exit status, summary/error, findings, artifacts, handoffs, recovery metadata, and gate metadata. Detached append failures remain visible through `persistenceDiagnostics()`.
+
+### RED
+
+The focused regression run failed as expected before implementation:
+
+```text
+node --test --test-name-pattern='memoizes|authoritative cancellation|finishes snapshot' \
+  test/unit/orchestration-checkpoints.test.ts test/unit/orchestration-broker.test.ts
+```
+
+Observed failures: distinct result promises/duplicate dispatch, backend rejection controlling cancellation, and a late checkpoint replacing the authoritative snapshot.
+
+Additional regressions cover stalled checkpoint cancellation, late integration cleanup/findings, complete inert late evidence, and detached evidence append failure.
+
+### GREEN
+
+Focused broker/recovery/checkpoint/mission-store/scheduler suites: 97 passed, 0 failed.
+
+Final verification:
+
+- `npm run typecheck` — passed.
+- `npm run lint` — 582 files checked, no diagnostics.
+- `npm test` — 2,367 total, 2,366 passed, 0 failed, 1 Postgres-dependent test skipped because `TEST_DATABASE_URL` is unset.
+- `git diff --check` — passed.

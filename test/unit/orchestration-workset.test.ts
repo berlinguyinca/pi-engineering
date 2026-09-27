@@ -290,6 +290,7 @@ describe("CheckpointManager", () => {
       mission_generation: planned.mission_generation,
       fencing_token: planned.fencing_token,
     });
+    store.setExecutionStatus(execution.execution_id, "RUNNING", {});
 
     const checkpoint = await manager.persist({
       taskId: planned.task_id,

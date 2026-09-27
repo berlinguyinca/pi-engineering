@@ -93,6 +93,7 @@ function setup(backend: EventStoreBackend = JsonlEventStore.inMemory()) {
     mission_generation: 3,
     fencing_token: 5,
   });
+  store.setExecutionStatus(execution.execution_id, "RUNNING", {});
   return { store, mission, task, execution };
 }
 
@@ -191,6 +192,54 @@ describe("CheckpointManager durability and immutable origin", () => {
       manager.persist({ taskId: task.task_id, executionId: execution.execution_id }),
       /checkpoint origin mismatch.*generation|fencing/i,
     );
+  });
+
+  it("rejects a checkpoint that finishes snapshot collection after execution terminalization", async () => {
+    const backend = JsonlEventStore.inMemory();
+    const { store, mission, task, execution } = setup(backend);
+    const first = new CheckpointManager({ store });
+    await first.persist({
+      taskId: task.task_id,
+      executionId: execution.execution_id,
+      snapshot: {
+        candidateSha: "candidate-before",
+        branch: "mission/task-a",
+        worktree: "/worktree/task-a",
+        committedChanges: ["src/before.ts"],
+        preservedUncommittedChanges: [],
+      },
+    });
+    let releaseSnapshot!: () => void;
+    const snapshotBlocked = new Promise<void>((resolve) => {
+      releaseSnapshot = resolve;
+    });
+    const late = new CheckpointManager({
+      store,
+      snapshot: async () => {
+        await snapshotBlocked;
+        return {
+          candidateSha: "candidate-late",
+          branch: "mission/task-a",
+          worktree: "/worktree/task-a",
+          committedChanges: ["src/late.ts"],
+          preservedUncommittedChanges: [],
+        };
+      },
+    });
+
+    const attempted = late.persist({ taskId: task.task_id, executionId: execution.execution_id });
+    store.setExecutionStatus(execution.execution_id, "CANCELED", { exit_status: "canceled" });
+    releaseSnapshot();
+
+    await assert.rejects(attempted, /no longer authoritative|checkpoint origin mismatch/i);
+    assert.equal(store.getTaskCheckpoint("TCP-origin")?.candidateSha, "candidate-before");
+    await store.flush();
+    const event = backend
+      .all()
+      .reverse()
+      .find((candidate) => candidate.type === "execution.late_result_rejected");
+    assert.equal((event?.payload.evidence as { kind?: string } | undefined)?.kind, "checkpoint");
+    assert.equal(store.listFindings(mission.mission_id).length, 0);
   });
 
   it("does not replace useful preserved work with an unavailable empty snapshot", async () => {

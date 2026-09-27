@@ -24,7 +24,7 @@ import type { GitRepo } from "../git/GitRepo.ts";
 import type { WorkerActivity } from "../workers/WorkerExecutor.ts";
 import { sanitizeWorkerActivity } from "../workers/activity.ts";
 import type { CheckpointManager, CheckpointSnapshot } from "./checkpoints.ts";
-import type { MissionStore } from "./missionStore.ts";
+import type { LateExecutionEvidence, MissionStore } from "./missionStore.ts";
 import type { DispatchAuthority } from "./ownership.ts";
 import type { ExecutionBackend, RecoveredMerge } from "./types.ts";
 import { canonicalizeWriteDomain } from "./workset.ts";
@@ -90,6 +90,46 @@ export interface ExecutionOutcome {
    * `recovered_merged` for the completion gate.
    */
   recoveredMerged?: RecoveredMerge[];
+}
+
+type BackendSettlement =
+  | { kind: "backend_result"; outcome: ExecutionOutcome }
+  | { kind: "backend_error"; error: unknown };
+
+function lateEvidence(
+  settlement: BackendSettlement,
+  input: ExecutionRequestInput,
+  handoffs: IntegrationHandoff[] = [],
+): LateExecutionEvidence {
+  const outcome = settlement.kind === "backend_result" ? settlement.outcome : undefined;
+  return {
+    kind: settlement.kind,
+    exitStatus: outcome?.exitStatus ?? null,
+    summary: outcome?.summary ?? null,
+    error:
+      outcome?.error ??
+      (settlement.kind === "backend_error"
+        ? settlement.error instanceof Error
+          ? settlement.error.message
+          : String(settlement.error)
+        : null),
+    artifactRefs: [...(outcome?.artifactRefs ?? [])],
+    findings: (outcome?.findings ?? []).map((finding) => ({ ...finding })),
+    handoffs: handoffs.map((handoff) => ({
+      branch: handoff.worktree.branch,
+      path: handoff.worktree.path,
+      ref: handoff.ref ?? null,
+      recovered: handoff.recovered ?? false,
+      summary: handoff.summary,
+      artifacts: [...handoff.artifacts],
+    })),
+    recovery: (outcome?.recoveredMerged ?? []).map((recovered) => ({ ...recovered })),
+    gate: {
+      requiredOutputArtifacts: [...(input.requiredOutputArtifacts ?? [])],
+      reviewedRecovered: [...(input.reviewedRecovered ?? [])],
+      usage: { ...(outcome?.usage ?? {}) },
+    },
+  };
 }
 
 function artifactIdentity(ref: string): string | null {
@@ -260,8 +300,9 @@ export class ExecutionBroker {
       status: string;
       worktree: string | null;
       taskId: string;
+      missionId: string;
       cancelCheckpoint?: () => Promise<void>;
-      canceling?: boolean;
+      terminalPromise?: Promise<ExecutionOutcome>;
     }
   >();
   /** Allocated worktrees, cleaned up when their execution settles. */
@@ -316,6 +357,7 @@ export class ExecutionBroker {
     executionId: string,
     input: ExecutionRequestInput,
     repository: { repoId?: string; root: string; git: GitRepo } | null,
+    assertOrigin: () => void,
   ): Promise<CheckpointSnapshot> {
     const info = this.allocatedWorktrees.get(executionId);
     if (!info || !repository) {
@@ -332,8 +374,11 @@ export class ExecutionBroker {
       ?.repositories.find((candidate) => candidate.repoId === input.repoId);
     const baseSha = binding?.baseSha ?? this.store.getMission(input.missionId)?.base_ref ?? "";
     const candidateSha = await repository.git.headCommitIn(info.path);
+    assertOrigin();
     const preservedUncommittedChanges = await repository.git.statusPathsIn(info.path);
+    assertOrigin();
     const verifiedCandidateSha = await repository.git.headCommitIn(info.path);
+    assertOrigin();
     if (candidateSha !== verifiedCandidateSha) {
       throw new Error("checkpoint snapshot HEAD changed while cancellation state was being collected");
     }
@@ -341,13 +386,22 @@ export class ExecutionBroker {
       candidateSha: verifiedCandidateSha,
       branch: info.branch,
       worktree: info.path,
-      committedChanges: baseSha ? await repository.git.changedFiles(baseSha, verifiedCandidateSha) : [],
+      committedChanges: baseSha
+        ? await repository.git.changedFiles(baseSha, verifiedCandidateSha).then((paths) => {
+            assertOrigin();
+            return paths;
+          })
+        : [],
       preservedUncommittedChanges,
     };
   }
 
   /** Commit cancellation state until hooks leave a clean, immutable branch tip. */
-  private async preserveCheckpointWork(executionId: string, checkpointId: string): Promise<string[] | null> {
+  private async preserveCheckpointWork(
+    executionId: string,
+    checkpointId: string,
+    assertOrigin: () => void,
+  ): Promise<string[] | null> {
     const info = this.allocatedWorktrees.get(executionId);
     if (!info) return null;
     const preserved = new Set<string>();
@@ -355,14 +409,17 @@ export class ExecutionBroker {
     // snapshot. Re-scan and commit those mutations before claiming durability.
     for (let attempt = 1; attempt <= 3; attempt++) {
       const dirty = await info.git.statusPathsIn(info.path);
+      assertOrigin();
       for (const path of dirty) preserved.add(path);
       if (dirty.length === 0) return [...preserved].sort();
       await info.git.commitAll(
         info.path,
         `pi-eng: preserve checkpoint ${checkpointId} for ${executionId} (${attempt})`,
       );
+      assertOrigin();
     }
     const remaining = await info.git.statusPathsIn(info.path);
+    assertOrigin();
     for (const path of remaining) preserved.add(path);
     if (remaining.length > 0) {
       throw new Error(`checkpoint preservation did not reach an immutable snapshot: ${remaining.join(", ")}`);
@@ -383,6 +440,17 @@ export class ExecutionBroker {
 
   private isRetainedWorktree(path: string): boolean {
     return [...this.retainedWorktrees.values()].some((paths) => paths.has(path));
+  }
+
+  private retainMissionWorktrees(missionId: string): void {
+    const retained = this.retainedWorktrees.get(missionId) ?? new Set<string>();
+    const branches = this.preserved.get(missionId) ?? [];
+    for (const worktree of this.missionWorktrees.get(missionId) ?? []) {
+      retained.add(worktree.path);
+      if (!branches.includes(worktree.branch)) branches.push(worktree.branch);
+    }
+    this.retainedWorktrees.set(missionId, retained);
+    this.preserved.set(missionId, branches);
   }
 
   private async repositoryFor(
@@ -420,24 +488,73 @@ export class ExecutionBroker {
   async cancelExecution(executionId: string, taskId?: string): Promise<boolean> {
     const entry = this.active.get(executionId);
     if (!entry) return false;
-    entry.canceling = true;
     entry.abort.abort();
-    const checkpoint = entry.cancelCheckpoint?.();
-    let checkpointError: unknown;
-    try {
-      await checkpoint;
-    } catch (error) {
-      checkpointError = error;
-    }
-    this.store.setExecutionStatus(executionId, "CANCELED", { exit_status: "canceled" });
-    const id = taskId ?? entry.taskId;
-    if (id && this.store.getTask(id) && this.store.getTask(id)!.status === "RUNNING") {
-      this.store.transitionTask(id, "CANCELED");
-    }
-    if (!checkpointError) await this.releaseWorktree(executionId);
-    this.active.delete(executionId);
-    if (checkpointError) throw checkpointError;
+    await this.terminalizeAfterGrace(executionId, "canceled", taskId ?? entry.taskId);
     return true;
+  }
+
+  private terminalizeAfterGrace(
+    executionId: string,
+    reason: "canceled" | "timeout",
+    taskId: string,
+  ): Promise<ExecutionOutcome> {
+    const entry = this.active.get(executionId);
+    if (!entry) return Promise.resolve(this.terminalizeExecution(executionId, reason, taskId));
+    if (entry.terminalPromise) return entry.terminalPromise;
+    entry.terminalPromise = (async () => {
+      const checkpoint = entry.cancelCheckpoint?.();
+      const checkpointSettled = checkpoint
+        ? await Promise.race([
+            checkpoint.then(
+              () => true,
+              () => false,
+            ),
+            new Promise<false>((resolve) => setTimeout(() => resolve(false), this.cancellationAckTimeoutMs)),
+          ])
+        : true;
+      if ((reason === "timeout" || !checkpointSettled) && entry.worktree) {
+        this.retainWorktree(entry.missionId, executionId);
+      }
+      const outcome = this.terminalizeExecution(executionId, reason, taskId);
+      if (reason === "canceled" && checkpointSettled && entry.worktree) {
+        void this.releaseWorktree(executionId).catch(() => this.retainWorktree(entry.missionId, executionId));
+      }
+      return outcome;
+    })();
+    return entry.terminalPromise;
+  }
+
+  private terminalizeExecution(executionId: string, reason: "canceled" | "timeout", taskId: string): ExecutionOutcome {
+    const existing = this.store.getExecution(executionId);
+    const error = reason === "timeout" ? WALL_CLOCK_TIMEOUT_MARKER : "canceled";
+    const outcome: ExecutionOutcome = {
+      executionId,
+      exitStatus: "failed",
+      summary:
+        reason === "timeout" ? "Execution exceeded its deadline and cancellation grace" : "Execution was canceled",
+      artifactRefs: [],
+      usage: {},
+      error,
+    };
+    if (existing?.status === "RUNNING") {
+      this.store.setExecutionStatus(executionId, reason === "timeout" ? "FAILED" : "CANCELED", {
+        exit_status: error,
+      });
+    }
+    const task = this.store.getTask(taskId);
+    if (task?.status === "RUNNING") this.store.transitionTask(taskId, reason === "timeout" ? "FAILED" : "CANCELED");
+    this.active.delete(executionId);
+    return outcome;
+  }
+
+  private observeLate(
+    executionId: string,
+    reason: string,
+    settlement: BackendSettlement,
+    input: ExecutionRequestInput,
+    handoffs: IntegrationHandoff[] = [],
+  ): void {
+    void this.store.recordLateExecution(executionId, reason, lateEvidence(settlement, input, handoffs));
   }
 
   /** Cancel the in-flight execution of a task, if any. */
@@ -698,7 +815,13 @@ export class ExecutionBroker {
     if (wt && this.isRetainedWorktree(wt.path)) return;
     if (wt) {
       // Keep the branch: it carries the harvested work until integration merges it.
-      await wt.git.removeWorktree({ path: wt.path, branch: wt.branch }, { keepBranch }).catch(() => {});
+      try {
+        await wt.git.removeWorktree({ path: wt.path, branch: wt.branch }, { keepBranch });
+      } catch {
+        const missionId = this.store.getExecution(executionId)?.mission_id;
+        if (missionId) this.retainWorktree(missionId, executionId);
+        return;
+      }
     }
     this.allocatedWorktrees.delete(executionId);
   }
@@ -763,37 +886,67 @@ export class ExecutionBroker {
   }
 
   /** Remove + clean all mission worktrees (after integration). */
-  private async releaseMissionWorktrees(missionId: string, keepBranches = false): Promise<void> {
+  private async releaseMissionWorktrees(
+    missionId: string,
+    keepBranches = false,
+    assertOrigin?: () => void,
+  ): Promise<void> {
     const wts = this.missionWorktrees.get(missionId) ?? [];
     const retained = this.retainedWorktrees.get(missionId) ?? new Set<string>();
     const survivors: typeof wts = [];
-    for (const wt of wts) {
-      if (retained.has(wt.path)) {
-        survivors.push(wt);
-        continue;
-      }
-      // SAFETY: a worker branch must never be force-deleted (git branch -D)
-      // while its work is not contained in the integrated checkout. A branch
-      // whose tip IS an ancestor of HEAD was merged (its work landed) and may be
-      // dropped so branches do not accumulate. A branch whose tip is NOT an
-      // ancestor of HEAD still carries unmerged work and is the only copy of
-      // what the worker produced — removeWorktree without keepBranch would run
-      // `git branch -D` and orphan the real commits into the object store.
-      // Preserve it regardless of whether integration reported success.
-      if (wt.git) {
-        let keep = keepBranches;
-        try {
-          if (!(await wt.git.isAncestor(wt.branch, await wt.git.headCommit()))) keep = true;
-        } catch {
-          keep = true; // cannot verify the work merged -> preserve (safe).
+    try {
+      assertOrigin?.();
+      for (const wt of wts) {
+        assertOrigin?.();
+        if (retained.has(wt.path)) {
+          survivors.push(wt);
+          continue;
         }
-        await wt.git.removeWorktree({ path: wt.path, branch: wt.branch }, { keepBranch: keep }).catch(() => {});
-        if (keep) {
-          const list = this.preserved.get(missionId) ?? [];
-          if (!list.includes(wt.branch)) list.push(wt.branch);
-          this.preserved.set(missionId, list);
+        // SAFETY: a worker branch must never be force-deleted (git branch -D)
+        // while its work is not contained in the integrated checkout. A branch
+        // whose tip IS an ancestor of HEAD was merged (its work landed) and may be
+        // dropped so branches do not accumulate. A branch whose tip is NOT an
+        // ancestor of HEAD still carries unmerged work and is the only copy of
+        // what the worker produced — removeWorktree without keepBranch would run
+        // `git branch -D` and orphan the real commits into the object store.
+        // Preserve it regardless of whether integration reported success.
+        if (wt.git) {
+          let keep = keepBranches;
+          try {
+            const head = await wt.git.headCommit();
+            assertOrigin?.();
+            if (!(await wt.git.isAncestor(wt.branch, head))) keep = true;
+            assertOrigin?.();
+          } catch (error) {
+            if (assertOrigin) {
+              assertOrigin();
+            }
+            keep = true; // cannot verify the work merged -> preserve (safe).
+          }
+          assertOrigin?.();
+          try {
+            await wt.git.removeWorktree({ path: wt.path, branch: wt.branch }, { keepBranch: keep });
+          } catch {
+            assertOrigin?.();
+            keep = true;
+            retained.add(wt.path);
+            this.retainedWorktrees.set(missionId, retained);
+            survivors.push(wt);
+          }
+          assertOrigin?.();
+          if (keep) {
+            const list = this.preserved.get(missionId) ?? [];
+            if (!list.includes(wt.branch)) list.push(wt.branch);
+            this.preserved.set(missionId, list);
+          }
         }
       }
+      assertOrigin?.();
+    } catch (error) {
+      if (assertOrigin) {
+        this.retainMissionWorktrees(missionId);
+      }
+      throw error;
     }
     if (survivors.length > 0) this.missionWorktrees.set(missionId, survivors);
     else this.missionWorktrees.delete(missionId);
@@ -867,12 +1020,16 @@ export class ExecutionBroker {
     });
 
     const abort = new AbortController();
+    let resultPromise: Promise<ExecutionOutcome> | undefined;
     const handle: ExecutionHandle = {
       executionId: execution.execution_id,
       taskId: input.taskId,
       missionId: input.missionId,
       backend,
-      status: () => this.active.get(execution.execution_id)?.status ?? "PENDING",
+      status: () =>
+        this.active.get(execution.execution_id)?.status ??
+        this.store.getExecution(execution.execution_id)?.status ??
+        "PENDING",
       cancel: async () => {
         await this.cancelExecution(execution.execution_id, input.taskId);
       },
@@ -881,127 +1038,137 @@ export class ExecutionBroker {
         const runner = this.backends[backend as keyof BrokerBackends] as { onSteer?: (s: string) => void } | undefined;
         runner?.onSteer?.(request);
       },
-      result: async () => {
-        if (abort.signal.aborted) throw new Error("execution aborted before dispatch");
-        const timer = setTimeout(
-          () => abort.abort(new DOMException(`Execution exceeded its ${executionBudgetMs}ms deadline`, "TimeoutError")),
-          Math.max(0, executionDeadlineAt - Date.now()),
-        );
-        const activityStartedAt = Date.now();
-        let lastActivityAt = activityStartedAt;
-        let activitySettled = false;
-        let activityTimer: ReturnType<typeof setInterval> | undefined;
-        let checkpointTimer: ReturnType<typeof setTimeout> | undefined;
-        let repository: { repoId?: string; root: string; git: GitRepo } | null = null;
-        let meaningfulActivity = 0;
-        let checkpointScheduling = true;
-        let retainWorktreeOnCleanup = false;
-        let detachedAfterTerminalAbort = false;
-        let cleanupOwnedByCancellation = false;
-        let cancelCheckpointPromise: Promise<void> | undefined;
-        let checkpointChain = Promise.resolve();
-        let writerStarted = false;
-        let acknowledgeWriterSettled!: () => void;
-        const writerSettled = new Promise<void>((resolve) => {
-          acknowledgeWriterSettled = resolve;
-        });
-        const awaitWriterQuiescence = async (): Promise<void> => {
-          if (!writerStarted) return;
-          let timeout: ReturnType<typeof setTimeout> | undefined;
-          try {
-            await Promise.race([
-              writerSettled,
-              new Promise<never>((_, reject) => {
-                timeout = setTimeout(
-                  () => reject(new Error("backend writer did not acknowledge cancellation or quiesce")),
-                  this.cancellationAckTimeoutMs,
-                );
-              }),
-            ]);
-          } finally {
-            if (timeout) clearTimeout(timeout);
+      result: () => {
+        if (resultPromise) return resultPromise;
+        resultPromise = (async () => {
+          if (abort.signal.aborted) {
+            const terminal = this.store.getExecution(execution.execution_id);
+            if (terminal?.status === "CANCELED") {
+              return this.terminalizeExecution(execution.execution_id, "canceled", input.taskId);
+            }
+            if (terminal?.status === "FAILED" && terminal.exit_status === WALL_CLOCK_TIMEOUT_MARKER) {
+              return this.terminalizeExecution(execution.execution_id, "timeout", input.taskId);
+            }
+            throw new Error("execution aborted before dispatch");
           }
-        };
-        const writeCheckpoint = async (
-          completedDeliverables: string[] = [],
-          artifactRefs: string[] = [],
-          artifactHashes: string[] = [],
-          requiredPreservedPaths: string[] | null = null,
-        ): Promise<CheckpointSnapshot | undefined> => {
-          if (!this.checkpoints || !checkpointId || !input.repoId) return undefined;
-          input.authority?.assertAuthoritative();
-          const snapshot = await this.checkpointSnapshot(execution.execution_id, input, repository);
-          input.authority?.assertAuthoritative();
-          if (
-            requiredPreservedPaths !== null &&
-            (!snapshot.candidateSha ||
-              snapshot.preservedUncommittedChanges.length > 0 ||
-              requiredPreservedPaths.some((path) => !snapshot.committedChanges.includes(path)))
-          ) {
-            throw new Error("checkpoint final snapshot does not contain every preserved path");
-          }
-          await this.checkpoints.persist({
-            taskId: input.taskId,
-            executionId: execution.execution_id,
-            completedDeliverables,
-            artifactRefs,
-            artifactHashes,
-            model: execution.model,
-            snapshot,
+          const timer = setTimeout(
+            () =>
+              abort.abort(new DOMException(`Execution exceeded its ${executionBudgetMs}ms deadline`, "TimeoutError")),
+            Math.max(0, executionDeadlineAt - Date.now()),
+          );
+          const activityStartedAt = Date.now();
+          let lastActivityAt = activityStartedAt;
+          let activitySettled = false;
+          let activityTimer: ReturnType<typeof setInterval> | undefined;
+          let checkpointTimer: ReturnType<typeof setTimeout> | undefined;
+          let repository: { repoId?: string; root: string; git: GitRepo } | null = null;
+          let meaningfulActivity = 0;
+          let checkpointScheduling = true;
+          let retainWorktreeOnCleanup = false;
+          let detachedAfterTerminalAbort = false;
+          let cleanupOwnedByCancellation = false;
+          let cancelCheckpointPromise: Promise<void> | undefined;
+          let checkpointChain = Promise.resolve();
+          let writerStarted = false;
+          let acknowledgeWriterSettled!: () => void;
+          const writerSettled = new Promise<void>((resolve) => {
+            acknowledgeWriterSettled = resolve;
           });
-          return snapshot;
-        };
-        const persistCheckpoint = (
-          completedDeliverables: string[] = [],
-          artifactRefs: string[] = [],
-          artifactHashes: string[] = [],
-        ): Promise<void> => {
-          checkpointChain = checkpointChain.then(async () => {
-            await writeCheckpoint(completedDeliverables, artifactRefs, artifactHashes);
-          });
-          return checkpointChain;
-        };
-        const queueCheckpoint = (
-          completedDeliverables: string[] = [],
-          artifactRefs: string[] = [],
-          artifactHashes: string[] = [],
-        ): void => {
-          if (!checkpointScheduling) return;
-          void persistCheckpoint(completedDeliverables, artifactRefs, artifactHashes);
-        };
-        const emitActivity = (event: WorkerActivity): void => {
-          if (activitySettled || abort.signal.aborted) return;
-          const safe = sanitizeWorkerActivity(event);
-          if (!safe) return;
-          if (safe.kind !== "heartbeat") lastActivityAt = Date.now();
-          if (safe.meaningfulProgress && input.checkpointPolicy?.activity_milestone) {
-            meaningfulActivity++;
-            if (meaningfulActivity % input.checkpointPolicy.activity_milestone === 0) queueCheckpoint();
-          }
-          try {
-            this.onActivity?.({
-              ...safe,
-              missionId: input.missionId,
+          const awaitWriterQuiescence = async (): Promise<void> => {
+            if (!writerStarted) return;
+            let timeout: ReturnType<typeof setTimeout> | undefined;
+            try {
+              await Promise.race([
+                writerSettled,
+                new Promise<never>((_, reject) => {
+                  timeout = setTimeout(
+                    () => reject(new Error("backend writer did not acknowledge cancellation or quiesce")),
+                    this.cancellationAckTimeoutMs,
+                  );
+                }),
+              ]);
+            } finally {
+              if (timeout) clearTimeout(timeout);
+            }
+          };
+          const assertOrigin = (): void => {
+            input.authority?.assertAuthoritative();
+            this.store.assertExecutionAuthoritative(execution.execution_id);
+          };
+          const writeCheckpoint = async (
+            completedDeliverables: string[] = [],
+            artifactRefs: string[] = [],
+            artifactHashes: string[] = [],
+            requiredPreservedPaths: string[] | null = null,
+          ): Promise<CheckpointSnapshot | undefined> => {
+            if (!this.checkpoints || !checkpointId || !input.repoId) return undefined;
+            assertOrigin();
+            const snapshot = await this.checkpointSnapshot(execution.execution_id, input, repository, assertOrigin);
+            assertOrigin();
+            if (
+              requiredPreservedPaths !== null &&
+              (!snapshot.candidateSha ||
+                snapshot.preservedUncommittedChanges.length > 0 ||
+                requiredPreservedPaths.some((path) => !snapshot.committedChanges.includes(path)))
+            ) {
+              throw new Error("checkpoint final snapshot does not contain every preserved path");
+            }
+            assertOrigin();
+            await this.checkpoints.persist({
               taskId: input.taskId,
               executionId: execution.execution_id,
+              completedDeliverables,
+              artifactRefs,
+              artifactHashes,
+              model: execution.model,
+              snapshot,
             });
-          } catch {
-            // Observability is never a participant in execution.
-          }
-        };
-        const onAbort = (): void => {
-          if (activitySettled) return;
-          if (activityTimer) clearInterval(activityTimer);
-          activityTimer = undefined;
-          const timedOut = abort.signal.reason instanceof DOMException && abort.signal.reason.name === "TimeoutError";
-          const safe = sanitizeWorkerActivity({
-            kind: "execution",
-            phase: timedOut ? "failed" : "canceled",
-            stage: backend,
-            summary: "",
-            meaningfulProgress: false,
-          });
-          if (safe) {
+            assertOrigin();
+            return snapshot;
+          };
+          const persistCheckpoint = (
+            completedDeliverables: string[] = [],
+            artifactRefs: string[] = [],
+            artifactHashes: string[] = [],
+          ): Promise<void> => {
+            checkpointChain = checkpointChain.then(async () => {
+              await writeCheckpoint(completedDeliverables, artifactRefs, artifactHashes);
+            });
+            return checkpointChain;
+          };
+          const queueCheckpoint = (
+            completedDeliverables: string[] = [],
+            artifactRefs: string[] = [],
+            artifactHashes: string[] = [],
+          ): void => {
+            if (!checkpointScheduling) return;
+            void persistCheckpoint(completedDeliverables, artifactRefs, artifactHashes).catch((error) => {
+              retainWorktreeOnCleanup = true;
+              this.retainWorktree(input.missionId, execution.execution_id);
+              if (this.store.getExecution(execution.execution_id)?.status !== "RUNNING") {
+                void this.store.recordLateExecution(execution.execution_id, "checkpoint authority lost", {
+                  kind: "checkpoint",
+                  exitStatus: null,
+                  summary: "Rejected queued checkpoint from a terminal execution",
+                  error: error instanceof Error ? error.message : String(error),
+                  artifactRefs: [...artifactRefs],
+                  findings: [],
+                  handoffs: [],
+                  recovery: [],
+                  gate: null,
+                });
+              }
+            });
+          };
+          const emitActivity = (event: WorkerActivity): void => {
+            if (activitySettled || abort.signal.aborted) return;
+            const safe = sanitizeWorkerActivity(event);
+            if (!safe) return;
+            if (safe.kind !== "heartbeat") lastActivityAt = Date.now();
+            if (safe.meaningfulProgress && input.checkpointPolicy?.activity_milestone) {
+              meaningfulActivity++;
+              if (meaningfulActivity % input.checkpointPolicy.activity_milestone === 0) queueCheckpoint();
+            }
             try {
               this.onActivity?.({
                 ...safe,
@@ -1012,404 +1179,357 @@ export class ExecutionBroker {
             } catch {
               // Observability is never a participant in execution.
             }
-          }
-          activitySettled = true;
-        };
-        emitActivity({ kind: "execution", phase: "started", stage: backend, summary: "", meaningfulProgress: false });
-        activityTimer =
-          this.activityHeartbeatMs > 0
-            ? setInterval(() => {
-                const at = Date.now();
-                emitActivity({
-                  kind: "heartbeat",
-                  stage: backend,
-                  summary: "",
-                  meaningfulProgress: false,
-                  elapsedMs: Math.max(0, at - activityStartedAt),
-                  lastActivityMs: Math.max(0, at - lastActivityAt),
-                });
-              }, this.activityHeartbeatMs)
-            : undefined;
-        activityTimer?.unref?.();
-        abort.signal.addEventListener("abort", onAbort, { once: true });
-        let worktree: string | null = null;
-        try {
-          input.authority?.assertAuthoritative();
-          repository = await this.repositoryFor(input);
-          if (repository) this.missionRepositories.set(input.missionId, repository);
-          const repositoryBinding = input.repoId
-            ? this.store
-                .getWorkspaceManifest(input.missionId)
-                ?.repositories.find((candidate) => candidate.repoId === input.repoId)
-            : undefined;
-          const restrictedRepository =
-            repositoryBinding === undefined
-              ? this.resolveRepository !== undefined
-              : !repositoryBinding.writableDomains.map(canonicalizeWriteDomain).includes("**");
-          if (
-            input.repoId &&
-            input.mutatesRepo &&
-            input.kind !== "integration" &&
-            input.isolation !== "worktree" &&
-            restrictedRepository
-          ) {
-            throw new Error(
-              `WORKSPACE_SCOPE_MISMATCH: restricted domains require an isolated worktree (${(input.writeDomains ?? []).join(", ") || "none"})`,
-            );
-          }
-          // Allocate an isolated worktree before dispatch so mutating workers
-          // edit their own checkout (spec 05). This remains inside the cleanup
-          // boundary because cancellation can remove the active entry while
-          // allocation is in flight.
-          worktree = await this.allocateWorktree(execution.execution_id, input, repository);
-          const active = this.active.get(execution.execution_id);
-          if (worktree && active) active.worktree = worktree;
-          if (this.checkpoints && checkpointId && input.checkpointPolicy) {
-            checkpointTimer = setTimeout(
-              () => queueCheckpoint(),
-              Math.max(0, executionDeadlineAt - input.checkpointPolicy.before_deadline_ms - Date.now()),
-            );
-            checkpointTimer.unref?.();
-          }
-          const activeForCheckpoint = this.active.get(execution.execution_id);
-          if (activeForCheckpoint && this.checkpoints && checkpointId) {
-            activeForCheckpoint.cancelCheckpoint = () => {
-              checkpointScheduling = false;
-              if (checkpointTimer) clearTimeout(checkpointTimer);
-              if (activityTimer) clearInterval(activityTimer);
-              if (!cancelCheckpointPromise) {
-                checkpointChain = checkpointChain.then(async () => {
-                  await awaitWriterQuiescence();
-                  const preservedPaths = await this.preserveCheckpointWork(execution.execution_id, checkpointId);
-                  await writeCheckpoint([], [], [], preservedPaths);
-                });
-                cancelCheckpointPromise = checkpointChain.catch((error) => {
-                  retainWorktreeOnCleanup = true;
-                  this.retainWorktree(input.missionId, execution.execution_id);
-                  throw error;
-                });
-              }
-              return cancelCheckpointPromise;
-            };
-          }
-          if (abort.signal.aborted) throw new Error("execution aborted before dispatch");
-          input.authority?.assertAuthoritative();
-          writerStarted = true;
-          type BackendSettlement =
-            | { kind: "backend_result"; outcome: ExecutionOutcome }
-            | { kind: "backend_error"; error: unknown };
-          const backendSettlement: Promise<BackendSettlement> = this.dispatch(
-            input,
-            backend,
-            execution.execution_id,
-            abort.signal,
-            worktree,
-            emitActivity,
-            repository,
-          )
-            .then((outcome) => ({ kind: "backend_result" as const, outcome }))
-            .catch((error: unknown) => ({ kind: "backend_error" as const, error }))
-            .finally(acknowledgeWriterSettled);
-          let removeAbortRaceListener = (): void => {};
-          const aborted = new Promise<{ kind: "aborted" }>((resolve) => {
-            const listener = (): void => resolve({ kind: "aborted" });
-            removeAbortRaceListener = () => abort.signal.removeEventListener("abort", listener);
-            if (abort.signal.aborted) resolve({ kind: "aborted" });
-            else abort.signal.addEventListener("abort", listener, { once: true });
-          });
-          const first = await Promise.race([backendSettlement, aborted]);
-          removeAbortRaceListener();
-          if (first.kind === "aborted") {
+          };
+          const onAbort = (): void => {
+            if (activitySettled) return;
+            if (activityTimer) clearInterval(activityTimer);
+            activityTimer = undefined;
             const timedOut = abort.signal.reason instanceof DOMException && abort.signal.reason.name === "TimeoutError";
-            const activeAtAbort = this.active.get(execution.execution_id);
-            const externallyCanceled = activeAtAbort?.canceling === true;
-            const checkpointCancellation = activeAtAbort?.cancelCheckpoint?.();
-            let graceTimer: ReturnType<typeof setTimeout> | undefined;
-            const cleanupSettled = Promise.allSettled([
-              backendSettlement,
-              checkpointCancellation ?? Promise.resolve(),
-            ]).then(() => true);
-            const cleanupCompleted = await Promise.race([
-              cleanupSettled,
-              new Promise<false>((resolve) => {
-                graceTimer = setTimeout(() => resolve(false), this.cancellationAckTimeoutMs);
-              }),
-            ]);
-            if (graceTimer) clearTimeout(graceTimer);
-
-            if (externallyCanceled) {
-              cleanupOwnedByCancellation = true;
-              detachedAfterTerminalAbort = true;
-              if (cleanupCompleted) {
-                const late = await backendSettlement;
-                if (late.kind === "backend_error") throw late.error;
-              }
-              void backendSettlement
-                .then(async (late) => {
-                  await new Promise<void>((resolve) => setImmediate(resolve));
-                  this.store.rejectLateExecution(execution.execution_id, "cancellation", {
-                    kind: late.kind,
-                    ...(late.kind === "backend_result"
-                      ? {
-                          exitStatus: late.outcome.exitStatus,
-                          summary: late.outcome.summary,
-                          artifactRefs: [...late.outcome.artifactRefs],
-                        }
-                      : { error: late.error instanceof Error ? late.error.message : String(late.error) }),
-                  });
-                })
-                .catch(() => {});
-              return {
-                executionId: execution.execution_id,
-                exitStatus: "failed",
-                summary: "Execution was canceled",
-                artifactRefs: [],
-                usage: {},
-                error: "canceled",
-              };
-            }
-
-            if (this.settledElsewhere(execution.execution_id)) {
-              detachedAfterTerminalAbort = true;
-              void backendSettlement
-                .then((late) => {
-                  this.store.rejectLateExecution(execution.execution_id, timedOut ? "hard timeout" : "cancellation", {
-                    kind: late.kind,
-                    ...(late.kind === "backend_result"
-                      ? {
-                          exitStatus: late.outcome.exitStatus,
-                          summary: late.outcome.summary,
-                          artifactRefs: [...late.outcome.artifactRefs],
-                        }
-                      : { error: late.error instanceof Error ? late.error.message : String(late.error) }),
-                  });
-                })
-                .catch(() => {});
-              return {
-                executionId: execution.execution_id,
-                exitStatus: "failed",
-                summary: timedOut ? `Execution exceeded its ${executionBudgetMs}ms deadline` : "Execution was canceled",
-                artifactRefs: [],
-                usage: {},
-                error: timedOut ? WALL_CLOCK_TIMEOUT_MARKER : "canceled",
-              };
-            }
-
-            // The terminal broker outcome revokes this execution. Before that
-            // fence lands, any bounded preservation work must still prove the
-            // originating mission + execution identity.
-            if (worktree) {
-              // A backend that crossed its deadline is no longer trusted to be
-              // quiescent. Keep the checkout mounted instead of performing any
-              // unbounded harvest after the grace boundary.
-              retainWorktreeOnCleanup = true;
-              this.retainWorktree(input.missionId, execution.execution_id);
-            }
-            input.authority?.assertAuthoritative();
-            this.store.assertExecutionAuthoritative(execution.execution_id);
-            if (worktree) {
-              const info = this.allocatedWorktrees.get(execution.execution_id);
-              const byBranch =
-                this.failedBranches.get(input.missionId) ??
-                new Map<string, { marker: string; taskId: string; recoverRef?: string }>();
-              if (info) {
-                byBranch.set(info.branch, {
-                  marker: timedOut ? WALL_CLOCK_TIMEOUT_MARKER : "canceled",
-                  taskId: input.taskId,
-                });
-                this.failedBranches.set(input.missionId, byBranch);
-              }
-            }
-
-            const terminalOutcome: ExecutionOutcome = {
-              executionId: execution.execution_id,
-              exitStatus: "failed",
-              summary: timedOut
-                ? `Execution exceeded its ${executionBudgetMs}ms deadline and cancellation grace`
-                : "Execution was canceled",
-              artifactRefs: [],
-              usage: {},
-              error: timedOut ? WALL_CLOCK_TIMEOUT_MARKER : "canceled",
-            };
-            this.store.setExecutionStatus(execution.execution_id, timedOut ? "FAILED" : "CANCELED", {
-              exit_status: terminalOutcome.error,
-            });
-            this.active.delete(execution.execution_id);
-            detachedAfterTerminalAbort = true;
-            void backendSettlement
-              .then((late) => {
-                this.store.rejectLateExecution(execution.execution_id, timedOut ? "hard timeout" : "cancellation", {
-                  kind: late.kind,
-                  ...(late.kind === "backend_result"
-                    ? {
-                        exitStatus: late.outcome.exitStatus,
-                        summary: late.outcome.summary,
-                        artifactRefs: [...late.outcome.artifactRefs],
-                      }
-                    : { error: late.error instanceof Error ? late.error.message : String(late.error) }),
-                });
-              })
-              .catch(() => {});
-            emitActivity({
+            const safe = sanitizeWorkerActivity({
               kind: "execution",
               phase: timedOut ? "failed" : "canceled",
               stage: backend,
               summary: "",
               meaningfulProgress: false,
             });
-            return terminalOutcome;
-          }
-          if (first.kind === "backend_error") throw first.error;
-          let outcome = first.outcome;
-          const escaped = await this.outOfScopeWorktreePaths(execution.execution_id, input);
-          input.authority?.assertAuthoritative();
-          this.store.assertExecutionAuthoritative(execution.execution_id);
-          if (escaped.length > 0) {
-            this.workspaceScopeFailure(execution.execution_id, escaped, input.writeDomains ?? []);
-            outcome = {
-              ...outcome,
-              exitStatus: "failed",
-              summary: `WORKSPACE_SCOPE_MISMATCH: out-of-scope changes: ${escaped.join(", ")}`,
-              error: "WORKSPACE_SCOPE_MISMATCH",
-            };
-          }
-          if (outcome.exitStatus === "succeeded" && input.requiredOutputArtifacts?.length) {
-            const identities = new Set(outcome.artifactRefs.map(artifactIdentity).filter((value) => value !== null));
-            const missing = input.requiredOutputArtifacts.filter((identity) => !identities.has(identity));
-            if (missing.length > 0) {
+            if (safe) {
+              try {
+                this.onActivity?.({
+                  ...safe,
+                  missionId: input.missionId,
+                  taskId: input.taskId,
+                  executionId: execution.execution_id,
+                });
+              } catch {
+                // Observability is never a participant in execution.
+              }
+            }
+            activitySettled = true;
+          };
+          emitActivity({ kind: "execution", phase: "started", stage: backend, summary: "", meaningfulProgress: false });
+          activityTimer =
+            this.activityHeartbeatMs > 0
+              ? setInterval(() => {
+                  const at = Date.now();
+                  emitActivity({
+                    kind: "heartbeat",
+                    stage: backend,
+                    summary: "",
+                    meaningfulProgress: false,
+                    elapsedMs: Math.max(0, at - activityStartedAt),
+                    lastActivityMs: Math.max(0, at - lastActivityAt),
+                  });
+                }, this.activityHeartbeatMs)
+              : undefined;
+          activityTimer?.unref?.();
+          abort.signal.addEventListener("abort", onAbort, { once: true });
+          let worktree: string | null = null;
+          try {
+            input.authority?.assertAuthoritative();
+            repository = await this.repositoryFor(input);
+            if (repository) this.missionRepositories.set(input.missionId, repository);
+            const repositoryBinding = input.repoId
+              ? this.store
+                  .getWorkspaceManifest(input.missionId)
+                  ?.repositories.find((candidate) => candidate.repoId === input.repoId)
+              : undefined;
+            const restrictedRepository =
+              repositoryBinding === undefined
+                ? this.resolveRepository !== undefined
+                : !repositoryBinding.writableDomains.map(canonicalizeWriteDomain).includes("**");
+            if (
+              input.repoId &&
+              input.mutatesRepo &&
+              input.kind !== "integration" &&
+              input.isolation !== "worktree" &&
+              restrictedRepository
+            ) {
+              throw new Error(
+                `WORKSPACE_SCOPE_MISMATCH: restricted domains require an isolated worktree (${(input.writeDomains ?? []).join(", ") || "none"})`,
+              );
+            }
+            // Allocate an isolated worktree before dispatch so mutating workers
+            // edit their own checkout (spec 05). This remains inside the cleanup
+            // boundary because cancellation can remove the active entry while
+            // allocation is in flight.
+            worktree = await this.allocateWorktree(execution.execution_id, input, repository);
+            const active = this.active.get(execution.execution_id);
+            if (worktree && active) active.worktree = worktree;
+            if (this.checkpoints && checkpointId && input.checkpointPolicy) {
+              checkpointTimer = setTimeout(
+                () => queueCheckpoint(),
+                Math.max(0, executionDeadlineAt - input.checkpointPolicy.before_deadline_ms - Date.now()),
+              );
+              checkpointTimer.unref?.();
+            }
+            const activeForCheckpoint = this.active.get(execution.execution_id);
+            if (activeForCheckpoint && this.checkpoints && checkpointId) {
+              activeForCheckpoint.cancelCheckpoint = () => {
+                checkpointScheduling = false;
+                if (checkpointTimer) clearTimeout(checkpointTimer);
+                if (activityTimer) clearInterval(activityTimer);
+                if (!cancelCheckpointPromise) {
+                  checkpointChain = checkpointChain.then(async () => {
+                    await awaitWriterQuiescence();
+                    assertOrigin();
+                    const preservedPaths = await this.preserveCheckpointWork(
+                      execution.execution_id,
+                      checkpointId,
+                      assertOrigin,
+                    );
+                    assertOrigin();
+                    await writeCheckpoint([], [], [], preservedPaths);
+                  });
+                  cancelCheckpointPromise = checkpointChain.catch((error) => {
+                    retainWorktreeOnCleanup = true;
+                    this.retainWorktree(input.missionId, execution.execution_id);
+                    throw error;
+                  });
+                }
+                return cancelCheckpointPromise;
+              };
+            }
+            if (abort.signal.aborted) {
+              detachedAfterTerminalAbort = true;
+              return this.terminalizeAfterGrace(execution.execution_id, "canceled", input.taskId);
+            }
+            input.authority?.assertAuthoritative();
+            writerStarted = true;
+            const backendSettlement: Promise<BackendSettlement> = this.dispatch(
+              input,
+              backend,
+              execution.execution_id,
+              abort.signal,
+              worktree,
+              emitActivity,
+              repository,
+            )
+              .then((outcome) => ({ kind: "backend_result" as const, outcome }))
+              .catch((error: unknown) => ({ kind: "backend_error" as const, error }))
+              .finally(acknowledgeWriterSettled);
+            let removeAbortRaceListener = (): void => {};
+            const aborted = new Promise<{ kind: "aborted" }>((resolve) => {
+              const listener = (): void => resolve({ kind: "aborted" });
+              removeAbortRaceListener = () => abort.signal.removeEventListener("abort", listener);
+              if (abort.signal.aborted) resolve({ kind: "aborted" });
+              else abort.signal.addEventListener("abort", listener, { once: true });
+            });
+            const first = await Promise.race([backendSettlement, aborted]);
+            removeAbortRaceListener();
+            if (first.kind === "aborted") {
+              const timedOut =
+                abort.signal.reason instanceof DOMException && abort.signal.reason.name === "TimeoutError";
+              if (worktree && this.store.getExecution(execution.execution_id)?.status === "RUNNING") {
+                const info = this.allocatedWorktrees.get(execution.execution_id);
+                const byBranch =
+                  this.failedBranches.get(input.missionId) ??
+                  new Map<string, { marker: string; taskId: string; recoverRef?: string }>();
+                if (info) {
+                  byBranch.set(info.branch, {
+                    marker: timedOut ? WALL_CLOCK_TIMEOUT_MARKER : "canceled",
+                    taskId: input.taskId,
+                  });
+                  this.failedBranches.set(input.missionId, byBranch);
+                }
+              }
+              const terminalOutcome = await this.terminalizeAfterGrace(
+                execution.execution_id,
+                timedOut ? "timeout" : "canceled",
+                input.taskId,
+              );
+              if (timedOut && worktree) retainWorktreeOnCleanup = true;
+              detachedAfterTerminalAbort = true;
+              cleanupOwnedByCancellation = true;
+              void backendSettlement.then((late) =>
+                this.observeLate(execution.execution_id, timedOut ? "hard timeout" : "cancellation", late, input),
+              );
+              emitActivity({
+                kind: "execution",
+                phase: timedOut ? "failed" : "canceled",
+                stage: backend,
+                summary: "",
+                meaningfulProgress: false,
+              });
+              return terminalOutcome;
+            }
+            if (first.kind === "backend_error") {
+              if (abort.signal.aborted) {
+                this.observeLate(execution.execution_id, "cancellation", first, input);
+                return this.terminalizeAfterGrace(execution.execution_id, "canceled", input.taskId);
+              }
+              throw first.error;
+            }
+            let outcome = first.outcome;
+            const escaped = await this.outOfScopeWorktreePaths(execution.execution_id, input);
+            input.authority?.assertAuthoritative();
+            this.store.assertExecutionAuthoritative(execution.execution_id);
+            if (escaped.length > 0) {
+              this.workspaceScopeFailure(execution.execution_id, escaped, input.writeDomains ?? []);
               outcome = {
                 ...outcome,
                 exitStatus: "failed",
-                summary: `Required output artifact identities missing: ${missing.join(", ")}`,
-                error: "INVALID_WORKER_OUTPUT",
+                summary: `WORKSPACE_SCOPE_MISMATCH: out-of-scope changes: ${escaped.join(", ")}`,
+                error: "WORKSPACE_SCOPE_MISMATCH",
               };
             }
-          }
-          queueCheckpoint(
-            outcome.exitStatus === "succeeded" ? [...(input.deliverables ?? [])] : [],
-            outcome.artifactRefs,
-            outcome.artifactRefs.map(artifactHash),
-          );
-          await checkpointChain;
-          input.authority?.assertAuthoritative();
-          this.store.assertExecutionAuthoritative(execution.execution_id);
-          // Persist the worker's edits onto its branch before the worktree is
-          // torn down, otherwise integration has nothing to merge — and on a
-          // FAILED execution, otherwise the worker's partial work dies with the
-          // worktree. Harvest whenever there is a worktree (success or failure);
-          // failed branches are then excluded from integration and preserved.
-          if (input.mutatesRepo && worktree && escaped.length === 0) {
-            input.authority?.assertAuthoritative();
-            this.store.assertExecutionAuthoritative(execution.execution_id);
-            const info = this.allocatedWorktrees.get(execution.execution_id);
-            const failed = outcome.exitStatus !== "succeeded";
-            // Captured BEFORE the harvest: the harvest commits the worker's
-            // uncommitted edits too, and those are exactly what a timed-out
-            // worker had not finished.
-            const recoverRef =
-              failed && outcome.error === WALL_CLOCK_TIMEOUT_MARKER && info
-                ? await this.workerCommittedTip(execution.execution_id, input.missionId, worktree)
-                : undefined;
-            await this.harvestWorktree(execution.execution_id);
-            input.authority?.assertAuthoritative();
-            this.store.assertExecutionAuthoritative(execution.execution_id);
-            if (info) {
-              // Last settled outcome wins: a retry that succeeds on the same
-              // branch clears the earlier failure instead of being excluded.
-              const byBranch =
-                this.failedBranches.get(input.missionId) ??
-                new Map<string, { marker: string; taskId: string; recoverRef?: string }>();
-              if (failed) {
-                byBranch.set(info.branch, {
-                  marker: outcome.error ?? outcome.summary ?? "failed",
-                  taskId: input.taskId,
-                  ...(recoverRef ? { recoverRef } : {}),
-                });
-              } else {
-                byBranch.delete(info.branch);
+            if (outcome.exitStatus === "succeeded" && input.requiredOutputArtifacts?.length) {
+              const identities = new Set(outcome.artifactRefs.map(artifactIdentity).filter((value) => value !== null));
+              const missing = input.requiredOutputArtifacts.filter((identity) => !identities.has(identity));
+              if (missing.length > 0) {
+                outcome = {
+                  ...outcome,
+                  exitStatus: "failed",
+                  summary: `Required output artifact identities missing: ${missing.join(", ")}`,
+                  error: "INVALID_WORKER_OUTPUT",
+                };
               }
-              this.failedBranches.set(input.missionId, byBranch);
             }
-          }
-          if (input.mutatesRepo && worktree && escaped.length > 0) {
-            const info = this.allocatedWorktrees.get(execution.execution_id);
-            if (info) {
-              const byBranch = this.failedBranches.get(input.missionId) ?? new Map();
-              byBranch.set(info.branch, { marker: "WORKSPACE_SCOPE_MISMATCH", taskId: input.taskId });
-              this.failedBranches.set(input.missionId, byBranch);
-            }
-          }
-          // Publish terminal result evidence only after every mutation and
-          // handoff decision has passed the live execution fence. The status
-          // transition itself revokes that fence.
-          input.authority?.assertAuthoritative();
-          this.store.assertExecutionAuthoritative(execution.execution_id);
-          const succeeded = outcome.exitStatus === "succeeded";
-          this.store.setExecutionStatus(execution.execution_id, succeeded ? "SUCCEEDED" : "FAILED", {
-            exit_status: outcome.exitStatus,
-            artifact_refs: outcome.artifactRefs,
-            usage: outcome.usage,
-            ...(outcome.recoveredMerged?.length ? { recovered_merged: outcome.recoveredMerged } : {}),
-            ...(backend === "review" && input.reviewedRecovered?.length
-              ? { reviewed_recovered: [...input.reviewedRecovered] }
-              : {}),
-          });
-          this.active.delete(execution.execution_id);
-          emitActivity({
-            kind: "execution",
-            phase: outcome.exitStatus === "succeeded" ? "completed" : "failed",
-            stage: backend,
-            summary: "",
-            meaningfulProgress: outcome.exitStatus === "succeeded",
-          });
-          return outcome;
-        } catch (err) {
-          let authorityError: Error | undefined;
-          try {
+            queueCheckpoint(
+              outcome.exitStatus === "succeeded" ? [...(input.deliverables ?? [])] : [],
+              outcome.artifactRefs,
+              outcome.artifactRefs.map(artifactHash),
+            );
+            await checkpointChain;
             input.authority?.assertAuthoritative();
-          } catch (error) {
-            authorityError = error instanceof Error ? error : new Error(String(error));
-          }
-          if (input.repoId || this.resolveRepository) {
-            const summary = err instanceof Error ? err.message : String(err);
-            if (/WORKSPACE_SCOPE_MISMATCH|repository binding|authorized root|unknown repo/i.test(summary)) {
-              this.classifyWorkspaceMismatch(input, execution.execution_id, summary);
+            this.store.assertExecutionAuthoritative(execution.execution_id);
+            // Persist the worker's edits onto its branch before the worktree is
+            // torn down, otherwise integration has nothing to merge — and on a
+            // FAILED execution, otherwise the worker's partial work dies with the
+            // worktree. Harvest whenever there is a worktree (success or failure);
+            // failed branches are then excluded from integration and preserved.
+            if (input.mutatesRepo && worktree && escaped.length === 0) {
+              input.authority?.assertAuthoritative();
+              this.store.assertExecutionAuthoritative(execution.execution_id);
+              const info = this.allocatedWorktrees.get(execution.execution_id);
+              const failed = outcome.exitStatus !== "succeeded";
+              // Captured BEFORE the harvest: the harvest commits the worker's
+              // uncommitted edits too, and those are exactly what a timed-out
+              // worker had not finished.
+              const recoverRef =
+                failed && outcome.error === WALL_CLOCK_TIMEOUT_MARKER && info
+                  ? await this.workerCommittedTip(execution.execution_id, input.missionId, worktree)
+                  : undefined;
+              await this.harvestWorktree(execution.execution_id);
+              input.authority?.assertAuthoritative();
+              this.store.assertExecutionAuthoritative(execution.execution_id);
+              if (info) {
+                // Last settled outcome wins: a retry that succeeds on the same
+                // branch clears the earlier failure instead of being excluded.
+                const byBranch =
+                  this.failedBranches.get(input.missionId) ??
+                  new Map<string, { marker: string; taskId: string; recoverRef?: string }>();
+                if (failed) {
+                  byBranch.set(info.branch, {
+                    marker: outcome.error ?? outcome.summary ?? "failed",
+                    taskId: input.taskId,
+                    ...(recoverRef ? { recoverRef } : {}),
+                  });
+                } else {
+                  byBranch.delete(info.branch);
+                }
+                this.failedBranches.set(input.missionId, byBranch);
+              }
+            }
+            if (input.mutatesRepo && worktree && escaped.length > 0) {
+              const info = this.allocatedWorktrees.get(execution.execution_id);
+              if (info) {
+                const byBranch = this.failedBranches.get(input.missionId) ?? new Map();
+                byBranch.set(info.branch, { marker: "WORKSPACE_SCOPE_MISMATCH", taskId: input.taskId });
+                this.failedBranches.set(input.missionId, byBranch);
+              }
+            }
+            // Publish terminal result evidence only after every mutation and
+            // handoff decision has passed the live execution fence. The status
+            // transition itself revokes that fence.
+            input.authority?.assertAuthoritative();
+            this.store.assertExecutionAuthoritative(execution.execution_id);
+            const succeeded = outcome.exitStatus === "succeeded";
+            this.store.setExecutionStatus(execution.execution_id, succeeded ? "SUCCEEDED" : "FAILED", {
+              exit_status: outcome.exitStatus,
+              artifact_refs: outcome.artifactRefs,
+              usage: outcome.usage,
+              ...(outcome.recoveredMerged?.length ? { recovered_merged: outcome.recoveredMerged } : {}),
+              ...(backend === "review" && input.reviewedRecovered?.length
+                ? { reviewed_recovered: [...input.reviewedRecovered] }
+                : {}),
+            });
+            this.active.delete(execution.execution_id);
+            emitActivity({
+              kind: "execution",
+              phase: outcome.exitStatus === "succeeded" ? "completed" : "failed",
+              stage: backend,
+              summary: "",
+              meaningfulProgress: outcome.exitStatus === "succeeded",
+            });
+            return outcome;
+          } catch (err) {
+            let authorityError: Error | undefined;
+            try {
+              input.authority?.assertAuthoritative();
+              this.store.assertExecutionAuthoritative(execution.execution_id);
+            } catch (error) {
+              authorityError = error instanceof Error ? error : new Error(String(error));
+            }
+            if (!authorityError && (input.repoId || this.resolveRepository)) {
+              const summary = err instanceof Error ? err.message : String(err);
+              if (/WORKSPACE_SCOPE_MISMATCH|repository binding|authorized root|unknown repo/i.test(summary)) {
+                this.classifyWorkspaceMismatch(input, execution.execution_id, summary);
+              }
+            }
+            if (authorityError) {
+              if (backend === "integration") this.retainMissionWorktrees(input.missionId);
+              void this.store.recordLateExecution(
+                execution.execution_id,
+                authorityError.message,
+                lateEvidence({ kind: "backend_error", error: err }, input),
+              );
+            } else if (!this.settledElsewhere(execution.execution_id)) {
+              const timedOut =
+                abort.signal.reason instanceof DOMException && abort.signal.reason.name === "TimeoutError";
+              if (abort.signal.aborted && !timedOut) {
+                this.store.setExecutionStatus(execution.execution_id, "CANCELED", { exit_status: "canceled" });
+              } else {
+                this.store.setExecutionStatus(execution.execution_id, "FAILED", {
+                  exit_status: timedOut ? WALL_CLOCK_TIMEOUT_MARKER : err instanceof Error ? err.message : String(err),
+                });
+              }
+            }
+            this.active.delete(execution.execution_id);
+            emitActivity({
+              kind: "execution",
+              phase: "failed",
+              stage: backend,
+              summary: "",
+              meaningfulProgress: false,
+            });
+            throw err;
+          } finally {
+            activitySettled = true;
+            if (activityTimer) clearInterval(activityTimer);
+            if (checkpointTimer) clearTimeout(checkpointTimer);
+            checkpointScheduling = false;
+            if (!detachedAfterTerminalAbort) {
+              await cancelCheckpointPromise?.catch(() => undefined);
+              await checkpointChain.catch(() => undefined);
+            }
+            abort.signal.removeEventListener("abort", onAbort);
+            clearTimeout(timer);
+            if (!retainWorktreeOnCleanup && !cleanupOwnedByCancellation) {
+              await this.releaseWorktree(execution.execution_id);
             }
           }
-          if (authorityError) {
-            this.store.rejectLateExecution(execution.execution_id, authorityError.message);
-          } else if (!this.settledElsewhere(execution.execution_id)) {
-            const timedOut = abort.signal.reason instanceof DOMException && abort.signal.reason.name === "TimeoutError";
-            if (abort.signal.aborted && !timedOut) {
-              this.store.setExecutionStatus(execution.execution_id, "CANCELED", { exit_status: "canceled" });
-            } else {
-              this.store.setExecutionStatus(execution.execution_id, "FAILED", {
-                exit_status: timedOut ? WALL_CLOCK_TIMEOUT_MARKER : err instanceof Error ? err.message : String(err),
-              });
-            }
-          }
-          this.active.delete(execution.execution_id);
-          emitActivity({ kind: "execution", phase: "failed", stage: backend, summary: "", meaningfulProgress: false });
-          throw err;
-        } finally {
-          activitySettled = true;
-          if (activityTimer) clearInterval(activityTimer);
-          if (checkpointTimer) clearTimeout(checkpointTimer);
-          checkpointScheduling = false;
-          if (!detachedAfterTerminalAbort) {
-            await cancelCheckpointPromise?.catch(() => undefined);
-            await checkpointChain.catch(() => undefined);
-          }
-          abort.signal.removeEventListener("abort", onAbort);
-          clearTimeout(timer);
-          if (!retainWorktreeOnCleanup && !cleanupOwnedByCancellation) {
-            await this.releaseWorktree(execution.execution_id);
-          }
-        }
+        })();
+        return resultPromise;
       },
     };
 
-    this.active.set(execution.execution_id, { abort, status: "PENDING", worktree: null, taskId: input.taskId });
+    this.active.set(execution.execution_id, {
+      abort,
+      status: "PENDING",
+      worktree: null,
+      taskId: input.taskId,
+      missionId: input.missionId,
+    });
     input.authority?.assertAuthoritative();
     this.store.setExecutionStatus(execution.execution_id, "RUNNING", {});
     this.active.get(execution.execution_id)!.status = "RUNNING";
@@ -1468,6 +1588,11 @@ export class ExecutionBroker {
       case "integration": {
         const runner = this.backends.integration;
         if (!runner) throw new Error("no integration backend registered");
+        const assertOrigin = (): void => {
+          input.authority?.assertAuthoritative();
+          this.store.assertExecutionAuthoritative(executionId);
+        };
+        assertOrigin();
         // Failed executions are excluded from the merge by default (their
         // work is presumed incomplete — a degenerate loop that committed
         // garbage must not be auto-merged); their branches are preserved
@@ -1495,7 +1620,9 @@ export class ExecutionBroker {
               const escaped = (await w.git.changedFiles(baseCommit, w.branch)).filter(
                 (path) => !pathAllowed(path, w.writeDomains),
               );
+              assertOrigin();
               if (escaped.length > 0) {
+                assertOrigin();
                 this.workspaceScopeFailure(executionId, escaped, w.writeDomains);
                 return {
                   executionId,
@@ -1507,6 +1634,7 @@ export class ExecutionBroker {
                 };
               }
             }
+            assertOrigin();
             handoffs.push({ worktree: w, summary: input.objective, artifacts: [] });
             continue;
           }
@@ -1516,7 +1644,9 @@ export class ExecutionBroker {
           // work must stay preserve-only.
           if (failure.marker !== WALL_CLOCK_TIMEOUT_MARKER || !failure.recoverRef) continue;
           const ahead = repository ? await repository.git.revListCount(`HEAD..${failure.recoverRef}`) : 0;
+          assertOrigin();
           if (ahead === null) {
+            assertOrigin();
             this.recoveryFinding(
               executionId,
               `Could not count recoverable commits on ${w.branch}; its timed-out work was not recovered`,
@@ -1524,6 +1654,7 @@ export class ExecutionBroker {
             continue;
           }
           if (ahead > 0) {
+            assertOrigin();
             recoveredMeta.push({ task_id: failure.taskId, branch: w.branch, ref: failure.recoverRef });
             recovered.push({
               worktree: w,
@@ -1539,6 +1670,7 @@ export class ExecutionBroker {
             );
           }
         }
+        assertOrigin();
         handoffs.push(...recovered);
         // After integration, release the merged worktrees (fire-and-forget
         // cleanup so the return value stays a plain Promise<ExecutionOutcome>).
@@ -1548,27 +1680,56 @@ export class ExecutionBroker {
         // (a skipped or conflicting recovered handoff is not). This is the
         // completion gate's evidence for superseding the timed-out task.
         const git = repository?.git ?? null;
-        const outcome = runner
-          .runIntegration({ repoId: input.repoId, objective: input.objective, handoffs, signal })
-          .then(async (o): Promise<ExecutionOutcome> => {
-            if (o.exitStatus !== "succeeded" || !git || recoveredMeta.length === 0) return o;
-            // Unknown HEAD: no evidence, and never a failed integration.
-            const head = await git.headCommit().catch(() => null);
-            if (!head) return o;
+        let outcome = await runner.runIntegration({
+          repoId: input.repoId,
+          objective: input.objective,
+          handoffs,
+          signal,
+        });
+        try {
+          assertOrigin();
+        } catch (error) {
+          this.retainMissionWorktrees(input.missionId);
+          this.observeLate(
+            executionId,
+            "integration authority lost",
+            { kind: "backend_result", outcome },
+            input,
+            handoffs,
+          );
+          throw error;
+        }
+        if (outcome.exitStatus === "succeeded" && git && recoveredMeta.length > 0) {
+          let head: string | null = null;
+          try {
+            head = await git.headCommit();
+          } catch {
+            head = null;
+          }
+          assertOrigin();
+          if (head) {
             const merged: RecoveredMerge[] = [];
-            for (const r of recoveredMeta) {
-              if (await git.isAncestor(r.ref, head).catch(() => false)) merged.push(r);
+            for (const recoveredMerge of recoveredMeta) {
+              let isMerged = false;
+              try {
+                isMerged = await git.isAncestor(recoveredMerge.ref, head);
+              } catch {
+                isMerged = false;
+              }
+              assertOrigin();
+              if (isMerged) merged.push(recoveredMerge);
             }
-            return merged.length > 0 ? { ...o, recoveredMerged: merged } : o;
-          });
+            if (merged.length > 0) outcome = { ...outcome, recoveredMerged: merged };
+          }
+        }
         // Release the worktrees, but delete the branches only when the merge
         // actually landed. After a conflict or a failed integration the branch is
         // the only remaining copy of the worker's output, and removeWorktree
         // without keepBranch runs `git branch -D` — which would destroy exactly
         // what an operator needs to resolve the conflict.
-        outcome
-          .then((o) => this.releaseMissionWorktrees(input.missionId, o.exitStatus !== "succeeded"))
-          .catch(() => {});
+        assertOrigin();
+        await this.releaseMissionWorktrees(input.missionId, outcome.exitStatus !== "succeeded", assertOrigin);
+        assertOrigin();
         return outcome;
       }
       case "validation": {
