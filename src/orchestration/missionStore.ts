@@ -122,6 +122,15 @@ export interface TaskCreateInput {
   fencing_token?: number;
 }
 
+/** Non-authority mission metadata that may be changed without a lifecycle operation. */
+export type MissionUpdatePatch = Partial<
+  Pick<Mission, "constraints" | "artifact_refs" | "decision_refs" | "required_gates">
+>;
+
+export interface MissionTransitionOptions {
+  recoveryDecisionId?: string;
+}
+
 /** Bounded, inspectable record of an event that could not be persisted. */
 export interface MissionPersistenceDiagnostic {
   eventId: string;
@@ -132,6 +141,12 @@ export interface MissionPersistenceDiagnostic {
 }
 
 const MAX_PERSISTENCE_DIAGNOSTICS = 50;
+const MISSION_UPDATE_FIELDS = new Set<keyof MissionUpdatePatch>([
+  "constraints",
+  "artifact_refs",
+  "decision_refs",
+  "required_gates",
+]);
 const TASK_TRANSITION_METADATA_FIELDS = new Set<keyof TaskTransitionMetadata>([
   "attempt",
   "assigned_execution_id",
@@ -510,9 +525,19 @@ export class MissionStore {
     return (projectFilter ? all.filter(projectFilter) : all).map(copyMission);
   }
 
-  transitionMission(missionId: string, to: MissionStatus, actor = "system", repairRecoveryId?: string): Mission {
+  transitionMission(
+    missionId: string,
+    to: MissionStatus,
+    actorOrOptions: string | MissionTransitionOptions = "system",
+    explicitOptions: MissionTransitionOptions = {},
+  ): Mission {
     const m = this.missions.get(missionId);
     if (!m) throw new Error(`unknown mission ${missionId}`);
+    const actor = typeof actorOrOptions === "string" ? actorOrOptions : "system";
+    const options = validateMissionTransitionOptions(
+      typeof actorOrOptions === "string" ? explicitOptions : actorOrOptions,
+    );
+    const repairRecoveryId = options.recoveryDecisionId;
     let repairDecision: RecoveryDecision | undefined;
     if (m.status === "BLOCKED" && to === "REPAIRING") {
       repairDecision = repairRecoveryId ? this.recoveryDecisions.get(repairRecoveryId) : undefined;
@@ -552,15 +577,17 @@ export class MissionStore {
     return this.getMission(missionId)!;
   }
 
-  updateMission(missionId: string, patch: Partial<Mission>, actor = "system"): Mission {
+  updateMission(missionId: string, patch: MissionUpdatePatch, actor = "system"): Mission {
     const m = this.missions.get(missionId);
     if (!m) throw new Error(`unknown mission ${missionId}`);
-    if (patch.status !== undefined) {
+    if (Object.hasOwn(patch, "status")) {
       throw new Error("mission status must be changed through transitionMission");
     }
-    const next = { ...m, ...patch, updated_at: new Date().toISOString() };
+    const safePatch = validateMissionUpdatePatch(patch);
+    const now = new Date().toISOString();
+    const next = { ...m, ...safePatch, updated_at: now };
     this.missions.set(missionId, next);
-    this.emit("mission.updated", missionId, { actor, mission_id: missionId, patch });
+    this.emit("mission.updated", missionId, { actor, mission_id: missionId, patch: safePatch }, now);
     return this.getMission(missionId)!;
   }
 
@@ -925,6 +952,9 @@ export class MissionStore {
     if (!RECOVERY_TRANSITIONS[decision.status].includes(status)) {
       throw new Error(`illegal recovery transition ${decision.status} -> ${status}`);
     }
+    if (status === "started" && decision.action === "REPAIR_BLOCKED_MISSION") {
+      throw new Error("blocked-mission repair must start atomically through transitionMission");
+    }
     const next = { ...decision, status };
     this.recoveryDecisions.set(recoveryId, next);
     this.emit(`recovery.${status}` as OrchestrationEventType, decision.missionId, {
@@ -1188,6 +1218,30 @@ function copyMissionStop(stop: MissionStop): MissionStop {
 
 function repositoryLeaseKey(missionId: string, repoId: string): string {
   return `${missionId}\u0000${repoId}`;
+}
+
+function validateMissionUpdatePatch(patch: MissionUpdatePatch): MissionUpdatePatch {
+  for (const key of Object.keys(patch)) {
+    if (!MISSION_UPDATE_FIELDS.has(key as keyof MissionUpdatePatch)) {
+      throw new Error(`unsupported mission update field ${key}`);
+    }
+  }
+  return {
+    ...(patch.constraints !== undefined ? { constraints: [...patch.constraints] } : {}),
+    ...(patch.artifact_refs !== undefined ? { artifact_refs: [...patch.artifact_refs] } : {}),
+    ...(patch.decision_refs !== undefined ? { decision_refs: [...patch.decision_refs] } : {}),
+    ...(patch.required_gates !== undefined ? { required_gates: [...patch.required_gates] } : {}),
+  };
+}
+
+function validateMissionTransitionOptions(options: MissionTransitionOptions): MissionTransitionOptions {
+  for (const key of Object.keys(options)) {
+    if (key !== "recoveryDecisionId") throw new Error(`unsupported mission transition option ${key}`);
+  }
+  if (options.recoveryDecisionId !== undefined && typeof options.recoveryDecisionId !== "string") {
+    throw new Error("mission transition recoveryDecisionId must be a string");
+  }
+  return options.recoveryDecisionId === undefined ? {} : { recoveryDecisionId: options.recoveryDecisionId };
 }
 
 function validateTaskTransitionMetadata(metadata: TaskTransitionMetadata): TaskTransitionMetadata {

@@ -709,7 +709,7 @@ describe("MissionStore", () => {
       /illegal mission transition BLOCKED -> EXECUTING/,
     );
     assert.throws(
-      () => s.updateMission(mission.mission_id, { status: "EXECUTING" }),
+      () => s.updateMission(mission.mission_id, { status: "EXECUTING" } as never),
       /status must be changed through transitionMission/,
     );
     assert.throws(
@@ -754,12 +754,46 @@ describe("MissionStore", () => {
       status: "planned",
       decidedAt: "2026-09-26T11:20:30.000Z",
     });
-    s.transitionMission(mission.mission_id, "REPAIRING", "system", "RCV-repair");
+    assert.throws(
+      () => s.transitionRecovery("RCV-repair", "started"),
+      /blocked-mission repair must start atomically through transitionMission/,
+    );
+    assert.equal(s.getRecoveryDecision("RCV-repair")?.status, "planned");
+    assert.equal(s.getMission(mission.mission_id)?.status, "BLOCKED");
+
+    const firstBlockedEpisode = s.getMission(mission.mission_id)!;
+    s.transitionMission(mission.mission_id, "REPAIRING", "system", { recoveryDecisionId: "RCV-repair" });
     assert.equal(s.getRecoveryDecision("RCV-repair")?.status, "started");
     assert.equal(s.transitionMission(mission.mission_id, "EXECUTING").status, "EXECUTING");
     s.transitionMission(mission.mission_id, "BLOCKED");
+    const secondBlockedEpisode = s.getMission(mission.mission_id)!;
+    for (const forbiddenPatch of [
+      { blocked_at: firstBlockedEpisode.blocked_at },
+      { blocked_episode_id: firstBlockedEpisode.blocked_episode_id },
+      { mission_id: "MSN-rewritten" },
+      { title: "rewritten title" },
+      { goal: "rewritten goal" },
+      { user_request: "rewritten request" },
+      { repository: "/different/repository" },
+      { base_ref: "different-ref" },
+      { risk_profile: "low" },
+      { workflow_class: "conversation" },
+      { task_ids: [] },
+      { created_at: "2000-01-01T00:00:00.000Z" },
+      { updated_at: "2000-01-01T00:00:00.000Z" },
+      { completed_at: "2000-01-01T00:00:00.000Z" },
+    ]) {
+      assert.throws(
+        () => s.updateMission(mission.mission_id, forbiddenPatch as never),
+        /unsupported mission update field/,
+      );
+    }
+    assert.deepEqual(s.getMission(mission.mission_id), secondBlockedEpisode);
     assert.throws(
-      () => s.transitionMission(mission.mission_id, "REPAIRING", "system", "RCV-stale-planned"),
+      () =>
+        s.transitionMission(mission.mission_id, "REPAIRING", "system", {
+          recoveryDecisionId: "RCV-stale-planned",
+        }),
       /does not belong to the current blocked episode/,
     );
     assert.equal(s.getRecoveryDecision("RCV-stale-planned")?.status, "planned");
