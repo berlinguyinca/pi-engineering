@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
+import { writeFileSync } from "node:fs";
 import { access, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { describe, it } from "node:test";
@@ -13,6 +14,79 @@ import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 import { makeFixtureRepo } from "../fixtures/make-fixture.ts";
 
 const exec = promisify(execFile);
+
+async function cancellationCheckpointFixture(
+  runAgent: NonNullable<BrokerBackends["agent"]>["runAgent"],
+  cancellationAckTimeoutMs = 5_000,
+) {
+  const fx = await makeFixtureRepo();
+  const git = await GitRepo.open(fx.root);
+  assert.ok(git);
+  const store = MissionStore.open(JsonlEventStore.inMemory());
+  const mission = store.createMission({
+    title: "cancellation quiescence",
+    goal: "cancellation quiescence",
+    user_request: "cancellation quiescence",
+    repository: fx.root,
+    base_ref: await git.headCommit(),
+    risk_profile: "medium",
+    workflow_class: "engineering_review",
+  });
+  store.bindWorkspaceManifest({
+    manifestId: "WM-cancellation-quiescence",
+    missionId: mission.mission_id,
+    generation: 1,
+    authorizedRoots: [{ canonicalPath: fx.root, source: "existing_manifest", access: "write" }],
+    repositories: [
+      {
+        repoId: "repo-cancellation-quiescence",
+        canonicalRoot: fx.root,
+        baseRef: "main",
+        baseSha: mission.base_ref,
+        writableDomains: ["src/**"],
+      },
+    ],
+    dependencyEdges: [],
+    hash: "manifest-cancellation-quiescence",
+    createdAt: "2026-09-27T10:00:00.000Z",
+  });
+  const task = store.createTask({
+    mission_id: mission.mission_id,
+    repo_id: "repo-cancellation-quiescence",
+    kind: "agent",
+    role: "implementer",
+    objective: "cancel safely",
+    mutates_repo: true,
+    isolation: "worktree",
+    write_domains: ["src/**"],
+    deliverables: ["implementation"],
+    execution_budget_ms: 10_000,
+    checkpoint_policy: { activity_milestone: 10, before_deadline_ms: 1_000 },
+  });
+  const broker = new ExecutionBroker({
+    store,
+    git,
+    checkpoints: new CheckpointManager({ store }),
+    cancellationAckTimeoutMs,
+    resolveRepository: async (repoId) => ({ repoId, root: fx.root, git }),
+    backends: { agent: { runAgent } },
+  });
+  const handle = await broker.execute({
+    taskId: task.task_id,
+    missionId: mission.mission_id,
+    repoId: task.repo_id!,
+    kind: "agent",
+    role: "implementer",
+    objective: task.objective,
+    mutatesRepo: true,
+    writeDomains: task.write_domains,
+    isolation: "worktree",
+    deliverables: task.deliverables,
+    executionBudgetMs: task.execution_budget_ms,
+    checkpointPolicy: task.checkpoint_policy,
+  });
+  return { fx, git, store, mission, task, broker, handle };
+}
 
 function setup(backends: BrokerBackends) {
   const store = MissionStore.open(JsonlEventStore.inMemory());
@@ -331,6 +405,135 @@ describe("ExecutionBroker (spec 03)", () => {
       assert.equal(store.getTaskCheckpoint(execution.checkpoint_id!)?.sequence, sequence);
     } finally {
       await fx.cleanup();
+    }
+  });
+
+  it("waits for an abort-aware writer before publishing the cancellation checkpoint", async () => {
+    let started!: (worktree: string) => void;
+    const worktreeReady = new Promise<string>((resolve) => {
+      started = resolve;
+    });
+    const context = await cancellationCheckpointFixture(async ({ worktree, signal }) => {
+      assert.ok(worktree);
+      await writeFile(join(worktree, "src", "before-abort.ts"), "export const beforeAbort = true;\n", "utf8");
+      started(worktree);
+      await new Promise<void>((resolve) => {
+        signal.addEventListener(
+          "abort",
+          () => {
+            writeFileSync(join(worktree, "src", "late-head.ts"), "export const lateHead = true;\n", "utf8");
+            execFile("git", ["-C", worktree, "add", "-A"], (addError) => {
+              assert.ifError(addError);
+              execFile("git", ["-C", worktree, "commit", "-q", "-m", "late cancellation write"], (commitError) => {
+                assert.ifError(commitError);
+                resolve();
+              });
+            });
+          },
+          { once: true },
+        );
+      });
+      return { executionId: "late", exitStatus: "succeeded", summary: "late", artifactRefs: [], usage: {} };
+    });
+    try {
+      const result = context.handle.result().catch(() => undefined);
+      await worktreeReady;
+      await context.handle.cancel();
+      await result;
+
+      const execution = context.store.getExecution(context.handle.executionId)!;
+      const checkpoint = context.store.getTaskCheckpoint(execution.checkpoint_id!);
+      assert.ok(checkpoint?.candidateSha);
+      const late = await exec("git", ["-C", context.fx.root, "show", `${checkpoint.candidateSha}:src/late-head.ts`]);
+      assert.equal(late.stdout, "export const lateHead = true;\n");
+    } finally {
+      await context.fx.cleanup();
+    }
+  });
+
+  it("retains the worktree and publishes no stale SHA when HEAD moves during the final snapshot", async () => {
+    let started!: (worktree: string) => void;
+    const worktreeReady = new Promise<string>((resolve) => {
+      started = resolve;
+    });
+    const context = await cancellationCheckpointFixture(async ({ worktree, signal }) => {
+      assert.ok(worktree);
+      await writeFile(join(worktree, "src", "snapshot-start.ts"), "export const snapshotStart = true;\n", "utf8");
+      started(worktree);
+      await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+      return { executionId: "late", exitStatus: "succeeded", summary: "late", artifactRefs: [], usage: {} };
+    });
+    const originalStatusPathsIn = context.git.statusPathsIn.bind(context.git);
+    const originalHeadCommitIn = context.git.headCommitIn.bind(context.git);
+    let statusReads = 0;
+    context.git.statusPathsIn = async (worktree) => {
+      const paths = await originalStatusPathsIn(worktree);
+      statusReads++;
+      return paths;
+    };
+    let movedHead = false;
+    context.git.headCommitIn = async (worktree) => {
+      const head = await originalHeadCommitIn(worktree);
+      if (statusReads >= 3 && !movedHead) {
+        movedHead = true;
+        await writeFile(join(worktree, "src", "moved-head.ts"), "export const movedHead = true;\n", "utf8");
+        await context.git.commitAll(worktree, "move HEAD during checkpoint snapshot");
+      }
+      return head;
+    };
+    const result = context.handle.result().catch(() => undefined);
+    const worktree = await worktreeReady;
+    try {
+      await assert.rejects(context.handle.cancel(), /snapshot HEAD changed/i);
+      const execution = context.store.getExecution(context.handle.executionId)!;
+      assert.equal(context.store.getTaskCheckpoint(execution.checkpoint_id!), undefined);
+      await access(worktree);
+      assert.equal(await readFile(join(worktree, "src", "moved-head.ts"), "utf8"), "export const movedHead = true;\n");
+      await context.broker.cleanupMission(context.mission.mission_id);
+      await access(worktree);
+    } finally {
+      await result;
+      await context.fx.cleanup();
+    }
+  });
+
+  it("retains the worktree and publishes no checkpoint when the writer ignores cancellation", async () => {
+    let started!: (worktree: string) => void;
+    const worktreeReady = new Promise<string>((resolve) => {
+      started = resolve;
+    });
+    let release!: () => void;
+    const released = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const context = await cancellationCheckpointFixture(async ({ worktree }) => {
+      assert.ok(worktree);
+      await writeFile(join(worktree, "src", "uncooperative.ts"), "export const uncooperative = true;\n", "utf8");
+      started(worktree);
+      await released;
+      return { executionId: "late", exitStatus: "succeeded", summary: "late", artifactRefs: [], usage: {} };
+    }, 25);
+    const worktree = await (async () => {
+      const result = context.handle.result().catch(() => undefined);
+      const allocated = await worktreeReady;
+      await assert.rejects(context.handle.cancel(), /writer.*quiesce|acknowledge.*cancellation/i);
+      const execution = context.store.getExecution(context.handle.executionId)!;
+      assert.equal(context.store.getTaskCheckpoint(execution.checkpoint_id!), undefined);
+      await access(allocated);
+      assert.equal(
+        await readFile(join(allocated, "src", "uncooperative.ts"), "utf8"),
+        "export const uncooperative = true;\n",
+      );
+      release();
+      await result;
+      return allocated;
+    })();
+    try {
+      await context.broker.cleanupMission(context.mission.mission_id);
+      await access(worktree);
+    } finally {
+      release();
+      await context.fx.cleanup();
     }
   });
 

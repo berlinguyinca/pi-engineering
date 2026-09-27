@@ -294,3 +294,65 @@ Result: exit 0; 2,354 total, 2,353 passed, 0 failed, 1 skipped. The sole skip is
 - Retained dirty worktrees are intentionally not reclaimed by ordinary mission cleanup because they remain the only proven content-bearing copy. Operator-directed recovery/cleanup belongs with the later recovery work; no automatic resume was introduced here.
 - Final snapshot verification happens before persistence, so a race that leaves new dirt cannot publish a falsely durable checkpoint; it retains the worktree instead.
 - Git path-enumeration fail-open behavior and authority-loss `RUNNING` reconciliation remain deferred exactly as ruled.
+
+## Fix Round 4
+
+### Outcome
+
+- Cancellation now aborts the backend before checkpoint collection and waits up to five seconds for the active backend dispatch to settle. Only an acknowledged, quiescent writer can proceed to the final immutable snapshot.
+- A backend that ignores cancellation fails closed after the bounded acknowledgment wait: no cancellation checkpoint is published, the execution is canceled, and the content-bearing worktree remains mounted through ordinary mission cleanup.
+- Final snapshot collection verifies a stable `HEAD` across `HEAD -> status -> HEAD`. A concurrent tip change rejects persistence and retains the worktree instead of publishing the stale SHA or removing recoverable content.
+- An abort-aware writer may finish a late commit before acknowledging cancellation; the checkpoint then identifies that final commit rather than the pre-abort tip.
+
+Task 5's hard terminal fencing remains out of scope; this round adds only the bounded acknowledgment and retained-work fail-closed behavior requested for Task 4.
+
+### RED evidence
+
+```text
+node --test --test-name-pattern='abort-aware writer|writer ignores cancellation' test/unit/orchestration-broker.test.ts
+```
+
+Result: exit 1; 0 passed, 2 failed. The late writer raced the broker's preservation commit, and the signal-ignoring writer allowed cancellation to return without error, proving checkpoint collection began before writer quiescence.
+
+The first SHA-stability regression run also failed with “Missing expected rejection,” proving the existing single-HEAD snapshot could publish through a concurrent tip change.
+
+### GREEN evidence
+
+Focused broker/checkpoint/scheduler matrix:
+
+```text
+node --test test/unit/orchestration-broker.test.ts test/unit/orchestration-checkpoints.test.ts test/unit/orchestration-scheduler.test.ts
+```
+
+Result: exit 0; 59 passed, 0 failed.
+
+Static verification:
+
+```text
+npm run typecheck
+npm run lint
+git diff --check
+```
+
+Result: all exit 0; TypeScript emitted no diagnostics, Biome checked 582 files with no findings, and the diff has no whitespace errors.
+
+Full suite (serialized to avoid unrelated browser resource contention, with an empty agent config so the optional live vision reviewer takes its documented unavailable path):
+
+```text
+PI_CODING_AGENT_DIR=/tmp/pi-eng-task4-empty-agent node --test --test-concurrency=1 "test/unit/**/*.test.ts" "test/integration/**/*.test.ts"
+```
+
+Result: exit 0; 2,357 total, 2,356 passed, 0 failed, 1 skipped. The sole skip is the existing Postgres OpenViking test gated by `TEST_DATABASE_URL`.
+
+An initial parallel `npm test` run had three load-only failures: one Playwright screenshot resource failure and two acknowledgment timeouts at the original one-second/25-millisecond bounds. The production bound was raised to a still-bounded five seconds, the 25-millisecond bound was confined to the intentionally uncooperative regression, and the serialized full suite passed.
+
+### Files
+
+- `src/orchestration/broker.ts` — abort-before-snapshot ordering, bounded backend-settlement acknowledgment, stable double-HEAD snapshot validation, and retained-work fail-closed handling.
+- `test/unit/orchestration-broker.test.ts` — deterministic abort-aware late commit, concurrent HEAD movement, and signal-ignoring writer regressions.
+
+### Self-review and concerns
+
+- The five-second acknowledgment wait is deliberately bounded. A writer that outlives it can continue until Task 5 adds hard terminal fencing, but it cannot cause a cancellation checkpoint to be published or its worktree to be automatically removed.
+- Stable HEAD validation detects committed tip movement during collection; the existing clean-status requirement independently detects uncommitted dirt. Either failure retains the worktree.
+- Checkpoint persistence remains preserve-only and never marks acceptance or gates passed. No autonomous resume path was added.

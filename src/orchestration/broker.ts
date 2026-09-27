@@ -237,6 +237,8 @@ export interface BrokerOptions {
   /** Periodic liveness detail for every backend while it is running. */
   activityHeartbeatMs?: number;
   checkpoints?: CheckpointManager;
+  /** Maximum cancellation delay while waiting for the backend writer to acknowledge abort. */
+  cancellationAckTimeoutMs?: number;
 }
 
 export class ExecutionBroker {
@@ -249,6 +251,7 @@ export class ExecutionBroker {
   private readonly onActivity?: BrokerOptions["onActivity"];
   private readonly activityHeartbeatMs: number;
   private readonly checkpoints?: CheckpointManager;
+  private readonly cancellationAckTimeoutMs: number;
   /** In-flight execution state for cancellation + allocated worktrees. */
   private readonly active = new Map<
     string,
@@ -305,6 +308,7 @@ export class ExecutionBroker {
     this.onActivity = opts.onActivity;
     this.activityHeartbeatMs = opts.activityHeartbeatMs ?? 15_000;
     this.checkpoints = opts.checkpoints;
+    this.cancellationAckTimeoutMs = opts.cancellationAckTimeoutMs ?? 5_000;
   }
 
   private async checkpointSnapshot(
@@ -327,12 +331,17 @@ export class ExecutionBroker {
       ?.repositories.find((candidate) => candidate.repoId === input.repoId);
     const baseSha = binding?.baseSha ?? this.store.getMission(input.missionId)?.base_ref ?? "";
     const candidateSha = await repository.git.headCommitIn(info.path);
+    const preservedUncommittedChanges = await repository.git.statusPathsIn(info.path);
+    const verifiedCandidateSha = await repository.git.headCommitIn(info.path);
+    if (candidateSha !== verifiedCandidateSha) {
+      throw new Error("checkpoint snapshot HEAD changed while cancellation state was being collected");
+    }
     return {
-      candidateSha,
+      candidateSha: verifiedCandidateSha,
       branch: info.branch,
       worktree: info.path,
-      committedChanges: baseSha ? await repository.git.changedFiles(baseSha, candidateSha) : [],
-      preservedUncommittedChanges: await repository.git.statusPathsIn(info.path),
+      committedChanges: baseSha ? await repository.git.changedFiles(baseSha, verifiedCandidateSha) : [],
+      preservedUncommittedChanges,
     };
   }
 
@@ -410,8 +419,8 @@ export class ExecutionBroker {
   async cancelExecution(executionId: string, taskId?: string): Promise<boolean> {
     const entry = this.active.get(executionId);
     if (!entry) return false;
-    const checkpoint = entry.cancelCheckpoint?.();
     entry.abort.abort();
+    const checkpoint = entry.cancelCheckpoint?.();
     let checkpointError: unknown;
     try {
       await checkpoint;
@@ -887,6 +896,28 @@ export class ExecutionBroker {
         let retainWorktreeOnCleanup = false;
         let cancelCheckpointPromise: Promise<void> | undefined;
         let checkpointChain = Promise.resolve();
+        let writerStarted = false;
+        let acknowledgeWriterSettled!: () => void;
+        const writerSettled = new Promise<void>((resolve) => {
+          acknowledgeWriterSettled = resolve;
+        });
+        const awaitWriterQuiescence = async (): Promise<void> => {
+          if (!writerStarted) return;
+          let timeout: ReturnType<typeof setTimeout> | undefined;
+          try {
+            await Promise.race([
+              writerSettled,
+              new Promise<never>((_, reject) => {
+                timeout = setTimeout(
+                  () => reject(new Error("backend writer did not acknowledge cancellation or quiesce")),
+                  this.cancellationAckTimeoutMs,
+                );
+              }),
+            ]);
+          } finally {
+            if (timeout) clearTimeout(timeout);
+          }
+        };
         const writeCheckpoint = async (
           completedDeliverables: string[] = [],
           artifactRefs: string[] = [],
@@ -1044,6 +1075,7 @@ export class ExecutionBroker {
               if (activityTimer) clearInterval(activityTimer);
               if (!cancelCheckpointPromise) {
                 checkpointChain = checkpointChain.then(async () => {
+                  await awaitWriterQuiescence();
                   const preservedPaths = await this.preserveCheckpointWork(execution.execution_id, checkpointId);
                   await writeCheckpoint([], [], [], preservedPaths);
                 });
@@ -1058,15 +1090,21 @@ export class ExecutionBroker {
           }
           if (abort.signal.aborted) throw new Error("execution aborted before dispatch");
           input.authority?.assertAuthoritative();
-          let outcome = await this.dispatch(
-            input,
-            backend,
-            execution.execution_id,
-            abort.signal,
-            worktree,
-            emitActivity,
-            repository,
-          );
+          writerStarted = true;
+          let outcome: ExecutionOutcome;
+          try {
+            outcome = await this.dispatch(
+              input,
+              backend,
+              execution.execution_id,
+              abort.signal,
+              worktree,
+              emitActivity,
+              repository,
+            );
+          } finally {
+            acknowledgeWriterSettled();
+          }
           const escaped = await this.outOfScopeWorktreePaths(execution.execution_id, input);
           input.authority?.assertAuthoritative();
           if (escaped.length > 0) {
