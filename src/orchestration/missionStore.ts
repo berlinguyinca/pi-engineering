@@ -151,6 +151,8 @@ export interface TaskCreateInput {
   mission_generation?: number;
   fencing_token?: number;
   recovery_authority?: OrchestrationTask["recovery_authority"];
+  repair_base_candidate_sha?: string;
+  replacement_spec_fingerprint?: string;
 }
 
 /** Non-authority mission metadata that may be changed without a lifecycle operation. */
@@ -825,6 +827,8 @@ export class MissionStore {
       mission_generation: input.mission_generation ?? authority?.generation ?? 0,
       fencing_token: input.fencing_token ?? authority?.fencingToken ?? 0,
       recovery_authority: input.recovery_authority ? { ...input.recovery_authority } : undefined,
+      repair_base_candidate_sha: input.repair_base_candidate_sha,
+      replacement_spec_fingerprint: input.replacement_spec_fingerprint,
     };
     this.tasks.set(task.task_id, task);
     const mission = this.missions.get(input.mission_id);
@@ -1222,12 +1226,21 @@ export class MissionStore {
   }
 
   /** Publish a manifest only after its event is durably appended. */
-  bindWorkspaceManifestDurably(manifest: WorkspaceManifest): Promise<WorkspaceManifest> {
+  bindWorkspaceManifestDurably(
+    manifest: WorkspaceManifest,
+    expectedPredecessor: { generation: number; hash: string } | null,
+  ): Promise<WorkspaceManifest> {
     const publish = this.emitChain.then(async () => {
       await this.drainPending();
       if (!this.missions.has(manifest.missionId)) throw new Error(`unknown mission ${manifest.missionId}`);
       const copy = copyWorkspaceManifest(manifest);
       const prior = this.workspaceManifests.get(manifest.missionId);
+      const expectedGeneration = expectedPredecessor?.generation ?? 0;
+      if (manifest.generation !== expectedGeneration + 1) {
+        throw new Error(
+          `workspace manifest generation must advance exactly once (${expectedGeneration} -> ${manifest.generation})`,
+        );
+      }
       const type = prior ? "workspace.rebound" : "workspace.authorized";
       const payload = structuredClone({ actor: "system", manifest: copy });
       const event: OrchestrationEvent = {
@@ -1247,17 +1260,33 @@ export class MissionStore {
         worker_id: null,
         payload,
       };
+      let appended: StoredEvent | undefined;
       try {
-        const appended = await this.backend.appendConditionally(
+        appended = await this.backend.appendConditionally(
           stored,
-          () => true,
+          () => {
+            const durablePrior = this.backend
+              .all()
+              .filter(
+                (candidate) =>
+                  candidate.run_id === manifest.missionId &&
+                  (candidate.type === "workspace.authorized" || candidate.type === "workspace.rebound"),
+              )
+              .at(-1)?.payload.manifest as WorkspaceManifest | undefined;
+            if (expectedPredecessor === null) return durablePrior === undefined && manifest.generation === 1;
+            return (
+              durablePrior?.generation === expectedPredecessor.generation &&
+              durablePrior.hash === expectedPredecessor.hash &&
+              manifest.generation === expectedPredecessor.generation + 1
+            );
+          },
           () => this.apply(event),
         );
-        if (!appended) throw new Error("workspace manifest durable bind was rejected");
       } catch (error) {
         this.recordPersistenceFailure(event, error);
         throw error;
       }
+      if (!appended) throw new Error("workspace manifest durable compare-and-swap was rejected");
       this.clearPersistenceFailure(event.event_id);
       if (prior) this.invalidateCurrentCandidate(manifest.missionId, "workspace manifest rebound");
       return copyWorkspaceManifest(copy);
@@ -1496,13 +1525,14 @@ export class MissionStore {
       }
       for (const replacement of supersession.expectedReplacementFingerprints ? replacements : []) {
         const authority = replacement?.recovery_authority;
+        const expected = supersession.expectedReplacementFingerprints?.[replacement!.task_id];
         if (
-          !authority ||
-          authority.recoveryDecisionId !== supersession.recoveryDecisionId ||
-          authority.supersessionId !== supersession.supersessionId ||
-          authority.originalTaskId !== supersession.failedTaskId ||
-          supersession.expectedReplacementFingerprints?.[replacement!.task_id] !==
-            authority.expectedReplacementFingerprint
+          replacement?.replacement_spec_fingerprint !== expected ||
+          (authority !== undefined &&
+            (authority.recoveryDecisionId !== supersession.recoveryDecisionId ||
+              authority.supersessionId !== supersession.supersessionId ||
+              authority.originalTaskId !== supersession.failedTaskId ||
+              expected !== authority.expectedReplacementFingerprint))
         ) {
           throw new Error("supersession replacement recovery fingerprint mismatch");
         }

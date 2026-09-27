@@ -123,14 +123,63 @@ describe("MissionStore", () => {
       hash: "original",
       createdAt: "2026-09-27T00:00:00.000Z",
     };
-    await s.bindWorkspaceManifestDurably(original);
+    await s.bindWorkspaceManifestDurably(original, null);
     backend.failNextAppend();
     await assert.rejects(
-      s.bindWorkspaceManifestDurably({ ...original, manifestId: "WM-rebuilt", generation: 2, hash: "rebuilt" }),
+      s.bindWorkspaceManifestDurably(
+        { ...original, manifestId: "WM-rebuilt", generation: 2, hash: "rebuilt" },
+        { generation: original.generation, hash: original.hash },
+      ),
       /persistence unavailable/i,
     );
     assert.equal(s.getWorkspaceManifest(mission.mission_id)?.hash, "original");
     assert.equal(MissionStore.open(backend).getWorkspaceManifest(mission.mission_id)?.hash, "original");
+  });
+
+  it("conditionally binds exactly one monotonic manifest successor", async () => {
+    const backend = JsonlEventStore.inMemory();
+    const seed = MissionStore.open(backend);
+    const mission = seed.createMission({
+      title: "manifest cas",
+      goal: "manifest cas",
+      user_request: "manifest cas",
+      repository: ".",
+      base_ref: "base",
+      risk_profile: "low",
+      workflow_class: "engineering",
+    });
+    const original: WorkspaceManifest = {
+      manifestId: "WM-cas-1",
+      missionId: mission.mission_id,
+      generation: 1,
+      authorizedRoots: [],
+      repositories: [],
+      dependencyEdges: [],
+      hash: "cas-1",
+      createdAt: "2026-09-27T00:00:00.000Z",
+    };
+    await seed.bindWorkspaceManifestDurably(original, null);
+    const first = MissionStore.open(backend);
+    const second = MissionStore.open(backend);
+    const expected = { generation: original.generation, hash: original.hash };
+    const attempts = await Promise.allSettled([
+      first.bindWorkspaceManifestDurably(
+        { ...original, manifestId: "WM-cas-2a", generation: 2, hash: "cas-2a" },
+        expected,
+      ),
+      second.bindWorkspaceManifestDurably(
+        { ...original, manifestId: "WM-cas-2b", generation: 2, hash: "cas-2b" },
+        expected,
+      ),
+    ]);
+
+    assert.equal(attempts.filter((result) => result.status === "fulfilled").length, 1);
+    assert.equal(attempts.filter((result) => result.status === "rejected").length, 1);
+    const rebound = backend.all().filter((event) => event.type === "workspace.rebound");
+    assert.equal(rebound.length, 1);
+    assert.deepEqual(first.persistenceDiagnostics(), []);
+    assert.deepEqual(second.persistenceDiagnostics(), []);
+    assert.equal(MissionStore.open(backend).getWorkspaceManifest(mission.mission_id)?.generation, 2);
   });
 
   it("creates and transitions a mission through its lifecycle", async () => {

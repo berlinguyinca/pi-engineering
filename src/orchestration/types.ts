@@ -212,6 +212,10 @@ export interface OrchestrationTask {
   failure_reason?: string;
   /** Durable checkpoint lineage; never reconstructed from model requirements. */
   recovery_authority?: TaskRecoveryAuthority;
+  /** Independently Git-verified candidate base for a fresh gate-repair worker. */
+  repair_base_candidate_sha?: string;
+  /** Immutable full replacement/manifest/checkpoint fingerprint for replay and dispatch. */
+  replacement_spec_fingerprint?: string;
 }
 
 /** The complete allow-list of metadata a task lifecycle transition may update. */

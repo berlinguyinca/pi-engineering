@@ -275,6 +275,73 @@ describe("WorkspaceManifestResolver path policy", () => {
     );
   });
 
+  it("rejects an async-local repository scope after a newer manifest replaces it", async () => {
+    const repo = await makeFixtureRepo();
+    cleanup.push(repo.cleanup);
+    const resolved = await new WorkspaceManifestResolver().resolve(`Implement in ${repo.root}`, tmpdir());
+    const original = createWorkspaceManifest(resolved, "MSN-stale-als");
+    const registry = new RepositoryRegistry();
+    await registry.register(original);
+    registry.activate(original.missionId, original.generation, original.hash, resolved.primaryRepoId);
+    const replacement = {
+      ...original,
+      manifestId: "WM-stale-als-2",
+      generation: 2,
+      hash: "manifest-stale-als-2",
+    };
+    const staged = await registry.stage(replacement);
+    staged.activate();
+
+    assert.throws(() => registry.get(resolved.primaryRepoId), /inactive workspace manifest/i);
+    await assert.rejects(registry.resolve(repo.root), /inactive workspace manifest/i);
+  });
+
+  it("fails closed when a path has no direct or common-Git active manifest match", async () => {
+    const activeRepo = await makeFixtureRepo();
+    const unmatchedRepo = await makeFixtureRepo();
+    cleanup.push(activeRepo.cleanup, unmatchedRepo.cleanup);
+    const resolved = await new WorkspaceManifestResolver().resolve(`Implement in ${activeRepo.root}`, tmpdir());
+    const manifest = createWorkspaceManifest(resolved, "MSN-unmatched-path");
+    const registry = new RepositoryRegistry();
+    await registry.register(manifest);
+    registry.activate(manifest.missionId, manifest.generation, manifest.hash, resolved.primaryRepoId);
+
+    assert.equal(await registry.resolve(unmatchedRepo.root), null);
+  });
+
+  it("fails closed when a path matches more than one active manifest", async () => {
+    const repo = await makeFixtureRepo();
+    cleanup.push(repo.cleanup);
+    const resolved = await new WorkspaceManifestResolver().resolve(`Implement in ${repo.root}`, tmpdir());
+    const registry = new RepositoryRegistry();
+    await registry.register(createWorkspaceManifest(resolved, "MSN-ambiguous-a"));
+    await registry.register(createWorkspaceManifest(resolved, "MSN-ambiguous-b"));
+
+    await assert.rejects(registry.resolve(repo.root), /ambiguous across active mission manifests/i);
+  });
+
+  it("restages and activates a durable manifest after bind-before-activate crash", async () => {
+    const repo = await makeFixtureRepo();
+    cleanup.push(repo.cleanup);
+    const resolved = await new WorkspaceManifestResolver().resolve(`Implement in ${repo.root}`, tmpdir());
+    const manifest = createWorkspaceManifest(resolved, "MSN-bind-crash");
+    const restartedRegistry = new RepositoryRegistry();
+
+    await restartedRegistry.ensureActive(manifest, resolved.primaryRepoId);
+
+    assert.equal(
+      (
+        await restartedRegistry.resolveForExecution(
+          manifest.missionId,
+          manifest.generation,
+          manifest.hash,
+          resolved.primaryRepoId,
+        )
+      ).root,
+      repo.root,
+    );
+  });
+
   it("does not treat a repository path found in repository content as user authorization", async () => {
     const launchRepo = await makeFixtureRepo();
     const otherRepo = await makeFixtureRepo();

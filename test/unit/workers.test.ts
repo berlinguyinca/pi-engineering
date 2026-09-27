@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { reviewResultTool } from "../../src/lifecycle/reviewResultTool.ts";
 import { FakeWorkerExecutor } from "../../src/workers/FakeWorkerExecutor.ts";
+import { buildCompactedWorkerPrompt } from "../../src/workers/PiWorkerExecutor.ts";
 import { WORKER_KICKOFF, buildSystemPrompt } from "../../src/workers/prompts.ts";
 import { workerResultTool } from "../../src/workers/workerResultTool.ts";
 
@@ -63,6 +64,49 @@ test("role prompts are compact and instruct bounded output", () => {
   assert.ok(prompt.length < 2500, `prompt should stay compact, was ${prompt.length}`);
   assert.ok(prompt.includes("worker_result"));
   assert.match(WORKER_KICKOFF, /worker_result/);
+});
+
+test("compaction truncates ordinary context but preserves the complete durable recovery block", () => {
+  const longHash = `sha256:${"a".repeat(64)}`;
+  const prompt = buildCompactedWorkerPrompt(
+    {
+      role: "implementer",
+      task: "resume exact work",
+      tools: [],
+      cwd: "/tmp/candidate",
+      context: "ordinary ".repeat(200),
+      recovery: {
+        recoveryDecisionId: "RCV-durable",
+        expectedReplacementFingerprint: longHash,
+        originalTaskId: "TSK-original",
+        originalExecutionId: "EXE-original",
+        supersessionId: "SUP-exact",
+        missionId: "MSN-exact",
+        repoId: "repo-exact",
+        missionGeneration: 7,
+        candidateGeneration: 8,
+        fencingToken: 9,
+        resumptionGeneration: 10,
+        checkpointId: "CHK-exact",
+        candidateSha: "candidate-exact",
+        sourceBranch: "branch-exact",
+        sourceWorktree: "/tmp/source-exact",
+        committedPaths: ["src/committed.ts"],
+        formerlyDirtyPaths: ["src/dirty.ts"],
+        completedDeliverables: ["durable-deliverable"],
+        artifactRefs: ["artifact://durable"],
+        artifactHashes: [longHash],
+      },
+    },
+    "recover now",
+  );
+
+  assert.match(prompt, /ordinary ordinary/);
+  assert.match(prompt, /\[truncated\]/);
+  assert.match(prompt, /Verified durable checkpoint recovery context \(immutable\)/);
+  assert.match(prompt, /artifact:\/\/durable/);
+  assert.match(prompt, new RegExp(longHash));
+  assert.match(prompt, /sourceWorktree=\/tmp\/source-exact/);
 });
 
 test("review_result tool is a terminating tool with a machine-checkable verdict", async () => {

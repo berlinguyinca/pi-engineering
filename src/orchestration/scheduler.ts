@@ -452,6 +452,7 @@ export class MissionScheduler {
           executionBudgetMs: task.execution_budget_ms,
           checkpointPolicy: task.checkpoint_policy,
           requiredOutputArtifacts: task.required_output_artifacts,
+          candidateBaseSha: task.repair_base_candidate_sha,
           authority,
         });
         authority?.onInvalidated(() => {

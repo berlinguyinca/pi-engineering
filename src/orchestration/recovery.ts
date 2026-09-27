@@ -1,5 +1,13 @@
 import { createHash } from "node:crypto";
-import type { FailureCategory, FailureClassification, RecoveryAction, RecoveryDecision } from "./types.ts";
+import type {
+  FailureCategory,
+  FailureClassification,
+  OrchestrationTask,
+  RecoveryAction,
+  RecoveryDecision,
+  TaskCheckpoint,
+  WorkspaceManifest,
+} from "./types.ts";
 
 export interface FailureEvidence {
   missionId: string;
@@ -63,22 +71,82 @@ function hash(value: unknown): string {
   return createHash("sha256").update(JSON.stringify(value)).digest("hex");
 }
 
+export type ReplacementTaskFingerprintSpec = Pick<
+  OrchestrationTask,
+  | "task_id"
+  | "mission_id"
+  | "kind"
+  | "role"
+  | "objective"
+  | "depends_on"
+  | "priority"
+  | "mutates_repo"
+  | "write_domains"
+  | "isolation"
+  | "execution_requirements"
+  | "max_attempts"
+  | "failure_policy"
+  | "repo_id"
+  | "acceptance_ids"
+  | "deliverables"
+  | "execution_budget_ms"
+  | "checkpoint_policy"
+  | "required_output_artifacts"
+  | "candidate_generation"
+  | "repair_base_candidate_sha"
+>;
+
+export function replacementTaskFingerprintSpec(task: ReplacementTaskFingerprintSpec): ReplacementTaskFingerprintSpec {
+  return {
+    task_id: task.task_id,
+    mission_id: task.mission_id,
+    kind: task.kind,
+    role: task.role,
+    objective: task.objective,
+    depends_on: [...task.depends_on],
+    priority: task.priority,
+    mutates_repo: task.mutates_repo,
+    write_domains: [...task.write_domains],
+    isolation: task.isolation,
+    execution_requirements: structuredClone(task.execution_requirements),
+    max_attempts: task.max_attempts,
+    failure_policy: task.failure_policy,
+    repo_id: task.repo_id,
+    acceptance_ids: [...(task.acceptance_ids ?? [])],
+    deliverables: [...(task.deliverables ?? [])],
+    execution_budget_ms: task.execution_budget_ms,
+    checkpoint_policy: task.checkpoint_policy ? { ...task.checkpoint_policy } : undefined,
+    required_output_artifacts: [...(task.required_output_artifacts ?? [])],
+    candidate_generation: task.candidate_generation,
+    repair_base_candidate_sha: task.repair_base_candidate_sha,
+  };
+}
+
 export function replacementRecoveryFingerprint(input: {
   recoveryDecisionId: string;
-  taskId: string;
-  originalTaskId: string;
-  originalExecutionId: string;
-  checkpointId: string;
   supersessionId: string;
-  role: string;
-  mutatesRepo: boolean;
-  repoId: string;
-  missionGeneration: number;
-  candidateGeneration: number;
-  fencingToken: number;
   resumptionGeneration: number;
+  replacement: ReplacementTaskFingerprintSpec;
+  manifest: WorkspaceManifest;
+  checkpoint: TaskCheckpoint | null;
 }): string {
-  return `sha256:${hash(input)}`;
+  return `sha256:${hash({
+    recoveryDecisionId: input.recoveryDecisionId,
+    supersessionId: input.supersessionId,
+    resumptionGeneration: input.resumptionGeneration,
+    replacement: replacementTaskFingerprintSpec(input.replacement),
+    manifest: structuredClone(input.manifest),
+    checkpoint: input.checkpoint
+      ? {
+          schemaVersion: 1,
+          snapshot: structuredClone(input.checkpoint),
+          artifactIdentities: input.checkpoint.artifactRefs.map((ref, index) => ({
+            ref,
+            hash: input.checkpoint!.artifactHashes[index],
+          })),
+        }
+      : null,
+  })}`;
 }
 
 function normalizedSummary(summary: string): string {

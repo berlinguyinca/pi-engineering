@@ -37,6 +37,7 @@ import {
   RecoveryPlanner,
   type RecoveryPlannerOptions,
   replacementRecoveryFingerprint,
+  replacementTaskFingerprintSpec,
 } from "./recovery.ts";
 import type { RepositoryRegistry } from "./repositoryRegistry.ts";
 import { brokerKind } from "./scheduler.ts";
@@ -181,6 +182,8 @@ export class Orchestrator {
   private readonly launchCwd: string;
   private readonly ownership?: MissionOwnership;
   private readonly ownershipByMission = new Map<string, import("./types.ts").MissionLease>();
+  private readonly recoveryOwnershipByFlight = new Map<string, import("./types.ts").MissionLease>();
+  private readonly recoveryTaskGenerations = new Map<string, number>();
   private readonly missionRepoIds = new Map<string, string>();
   private readonly worksetPolicy: WorksetPolicy;
   private readonly recoveryPlanner: RecoveryPlanner;
@@ -307,7 +310,7 @@ export class Orchestrator {
     expectedResumptionGeneration: number,
     signal?: AbortSignal,
   ): Promise<Mission> {
-    this.activateMissionRepository(missionId);
+    await this.activateMissionRepository(missionId);
     this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
     const mission = this.store.getMission(missionId);
     if (!mission) throw new Error(`unknown mission ${missionId}`);
@@ -318,6 +321,7 @@ export class Orchestrator {
         this.store.transitionRecovery(decision.recoveryId, mission.status === "COMPLETE" ? "succeeded" : "failed");
       }
       await this.store.flush();
+      this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
       return this.store.getMission(missionId)!;
     }
     if (mission.status !== "BLOCKED" && mission.status !== "REPAIRING") return mission;
@@ -326,10 +330,12 @@ export class Orchestrator {
     const priorResumption = this.store.listMissionResumptions(missionId).at(-1);
     if (priorStop && (!priorResumption || priorResumption.stopGeneration < priorStop.generation)) return mission;
 
+    let acquiredLease: Awaited<ReturnType<MissionOwnership["acquire"]>> | undefined;
+    const recoveryLeaseKey = `${missionId}:${expectedResumptionGeneration}`;
     if (this.ownership) {
-      const lease = await this.ownership.acquire(missionId);
+      acquiredLease = await this.ownership.acquire(missionId);
       this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
-      this.ownershipByMission.set(missionId, lease);
+      this.recoveryOwnershipByFlight.set(recoveryLeaseKey, acquiredLease);
     }
     try {
       const repositoryDiagnostics = await this.broker.durableRepositoryDiagnostics(missionId);
@@ -358,6 +364,7 @@ export class Orchestrator {
           resumeCondition: "repair or quarantine every reported durable repository record",
         });
         await this.store.flush();
+        this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
         return this.store.getMission(missionId)!;
       }
       const reconciledOrphans = this.store.reconcileOrphanedExecutions(missionId);
@@ -369,11 +376,13 @@ export class Orchestrator {
       const resumptionGeneration = this.store.listMissionResumptions(missionId).at(-1)?.generation ?? 0;
       this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
       const recoveryStartRecord = this.store.getCandidate(missionId);
+      const verifiedRecoveryStart = recoveryStartRecord ? await this.broker.verifiedCandidateContent(missionId) : null;
+      this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
       const recoveryStartCandidate = recoveryStartRecord?.identityHash ?? null;
-      const recoveryStartContent = recoveryStartRecord
+      const recoveryStartContent = verifiedRecoveryStart
         ? {
-            candidateSha: recoveryStartRecord.identity.candidateSha,
-            diffHash: recoveryStartRecord.identity.diffHash,
+            candidateSha: verifiedRecoveryStart.candidateSha,
+            diffHash: verifiedRecoveryStart.diffHash,
           }
         : null;
       for (const stale of this.store
@@ -405,13 +414,16 @@ export class Orchestrator {
           this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
           if (decision.status === "planned") this.store.transitionRecovery(decision.recoveryId, "exhausted");
           const attemptedRecoveries = history.map((entry) => entry.recoveryId);
+          const preservedWork = await this.preservedMissionWork(missionId);
+          this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
           this.store.stopMission(missionId, {
             reason: choice.expectedMaterialChange,
-            preservedWork: await this.preservedMissionWork(missionId),
+            preservedWork,
             attemptedRecoveries,
             resumeCondition: "provide new material evidence or increase the approved recovery budget",
           });
           await this.store.flush();
+          this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
           return this.store.getMission(missionId)!;
         }
 
@@ -430,13 +442,33 @@ export class Orchestrator {
           this.store.transitionMission(missionId, "WAITING_FOR_USER");
         }
         await this.store.flush();
+        this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
+        return this.store.getMission(missionId)!;
+      }
+      if (repairDecision.action === "CREATE_REPAIR_TASKS" && !repairDecision.startingCandidateContent) {
+        if (repairDecision.status === "planned") this.store.transitionRecovery(repairDecision.recoveryId, "failed");
+        this.store.addFinding({
+          mission_id: missionId,
+          task_id: classification.taskId,
+          severity: "blocking",
+          category: "recovery_candidate_baseline",
+          file: null,
+          line: null,
+          summary: "Gate repair requires an independently Git-verified current candidate.",
+          evidence: repairDecision.recoveryId,
+          recommended_action: "Reconstruct the current candidate from Git before dispatching repair work.",
+        });
+        await this.store.flush();
+        this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
         return this.store.getMission(missionId)!;
       }
       if (repairDecision.action === "PAUSE_FOR_PERSISTENCE" || repairDecision.action === "PROBE_AND_BACKOFF") {
         if (repairDecision.status === "planned") this.store.transitionRecovery(repairDecision.recoveryId, "started");
+        const preservedWork = await this.preservedMissionWork(missionId);
+        this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
         this.store.stopMission(missionId, {
           reason: repairDecision.expectedMaterialChange,
-          preservedWork: await this.preservedMissionWork(missionId),
+          preservedWork,
           attemptedRecoveries: [repairDecision.recoveryId],
           resumeCondition:
             repairDecision.action === "PAUSE_FOR_PERSISTENCE"
@@ -444,6 +476,7 @@ export class Orchestrator {
               : `a healthy provider probe must succeed before ${repairDecision.deadline}`,
         });
         await this.store.flush();
+        this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
         return this.store.getMission(missionId)!;
       }
 
@@ -458,17 +491,31 @@ export class Orchestrator {
           const rebuilt = createWorkspaceManifest(resolved, missionId, (current?.generation ?? 0) + 1);
           if (this.repositoryRegistry) {
             const staged = await this.repositoryRegistry.stage(rebuilt);
+            this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
             const probes = await staged.probe(resolved.primaryRepoId);
             this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
             if (probes.some((probe) => !probe.ok)) throw new Error("rebuilt workspace manifest failed role probes");
-            await this.store.bindWorkspaceManifestDurably(rebuilt);
+            await this.store.bindWorkspaceManifestDurably(
+              rebuilt,
+              current ? { generation: current.generation, hash: current.hash } : null,
+            );
             this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
-            staged.activate();
+            try {
+              staged.activate();
+            } catch {
+              await this.repositoryRegistry.ensureActive(rebuilt, resolved.primaryRepoId);
+              this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
+            }
           } else {
-            await this.store.bindWorkspaceManifestDurably(rebuilt);
+            await this.store.bindWorkspaceManifestDurably(
+              rebuilt,
+              current ? { generation: current.generation, hash: current.hash } : null,
+            );
+            this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
           }
           this.missionRepoIds.set(missionId, resolved.primaryRepoId);
         } catch (error) {
+          if (error instanceof Error && error.message.startsWith("STALE_RECOVERY_GENERATION")) throw error;
           const summary = `workspace manifest rebuild failed: ${error instanceof Error ? error.message : String(error)}`;
           this.store.addFinding({
             mission_id: missionId,
@@ -483,6 +530,7 @@ export class Orchestrator {
           });
           if (repairDecision.status === "planned") this.store.transitionRecovery(repairDecision.recoveryId, "failed");
           await this.store.flush();
+          this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
           return this.store.getMission(missionId)!;
         }
       }
@@ -522,8 +570,16 @@ export class Orchestrator {
             return false;
         }
       });
+      const importsCheckpoint = [
+        "CHECKPOINT_SPLIT_AND_REPLACE",
+        "REPAIR_WORKER_OUTPUT",
+        "FENCE_RECONCILE_AND_RESUME",
+        "REPAIR_BLOCKED_MISSION",
+      ].includes(repairDecision.action);
       for (const failed of failedTasks) {
-        const checkpoint = this.store.listTaskCheckpoints(missionId, failed.task_id).at(-1);
+        const checkpoint = importsCheckpoint
+          ? this.store.listTaskCheckpoints(missionId, failed.task_id).at(-1)
+          : undefined;
         try {
           if (!checkpoint && repairDecision.action === "CHECKPOINT_SPLIT_AND_REPLACE") {
             throw new Error("checkpoint repair identity/integrity mismatch: durable checkpoint is missing");
@@ -544,19 +600,24 @@ export class Orchestrator {
             recommended_action: "Reconcile the exact checkpoint origin and preserved work before retrying recovery.",
           });
           if (repairDecision.status === "planned") this.store.transitionRecovery(repairDecision.recoveryId, "failed");
+          const preservedWork = await this.preservedMissionWork(missionId);
+          this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
           this.store.stopMission(missionId, {
             reason: summary,
-            preservedWork: await this.preservedMissionWork(missionId),
+            preservedWork,
             attemptedRecoveries: [repairDecision.recoveryId],
             resumeCondition:
               "a canonical checkpoint with matching execution, generation, repository, and artifacts is required",
           });
           await this.store.flush();
+          this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
           return this.store.getMission(missionId)!;
         }
       }
       for (const failed of failedTasks) {
-        const checkpoint = this.store.listTaskCheckpoints(missionId, failed.task_id).at(-1);
+        const checkpoint = importsCheckpoint
+          ? this.store.listTaskCheckpoints(missionId, failed.task_id).at(-1)
+          : undefined;
         const remaining = checkpoint?.remainingDeliverables.length
           ? checkpoint.remainingDeliverables
           : (failed.deliverables ?? []).length
@@ -569,38 +630,7 @@ export class Orchestrator {
           const createsRepair = repairDecision.action === "CREATE_REPAIR_TASKS";
           const role = createsRepair ? "implementer" : failed.role;
           const mutatesRepo = createsRepair ? true : failed.mutates_repo;
-          const fingerprint = checkpoint
-            ? replacementRecoveryFingerprint({
-                recoveryDecisionId: repairDecision.recoveryId,
-                taskId: replacementId,
-                originalTaskId: failed.task_id,
-                originalExecutionId: checkpoint.executionId,
-                checkpointId: checkpoint.checkpointId,
-                supersessionId,
-                role,
-                mutatesRepo,
-                repoId: failed.repo_id ?? "",
-                missionGeneration: checkpoint.missionGeneration,
-                candidateGeneration: checkpoint.candidateGeneration,
-                fencingToken: checkpoint.fencingToken,
-                resumptionGeneration: repairDecision.resumptionGeneration ?? 0,
-              })
-            : "";
-          replacementFingerprints[replacementId] = fingerprint;
-          const existing = this.store.getTask(replacementId);
-          if (existing) {
-            const exact =
-              existing.role === role &&
-              existing.mutates_repo === mutatesRepo &&
-              existing.repo_id === failed.repo_id &&
-              existing.recovery_authority?.expectedReplacementFingerprint === fingerprint &&
-              existing.recovery_authority?.recoveryDecisionId === repairDecision.recoveryId &&
-              existing.recovery_authority?.checkpointId === checkpoint?.checkpointId &&
-              existing.recovery_authority?.supersessionId === supersessionId;
-            if (!exact) throw new Error(`replacement replay identity mismatch: ${replacementId}`);
-            return existing;
-          }
-          return this.store.createTask({
+          const replacementSpec = replacementTaskFingerprintSpec({
             task_id: replacementId,
             mission_id: missionId,
             kind: createsRepair ? "agent" : failed.kind,
@@ -623,6 +653,47 @@ export class Orchestrator {
             checkpoint_policy: failed.checkpoint_policy,
             required_output_artifacts: [...(failed.required_output_artifacts ?? [])],
             candidate_generation: (failed.candidate_generation ?? 0) + index + 1,
+            repair_base_candidate_sha: createsRepair
+              ? (repairDecision.startingCandidateContent?.candidateSha ?? undefined)
+              : undefined,
+          });
+          const manifest = this.store.getWorkspaceManifest(missionId);
+          const fingerprint = replacementRecoveryFingerprint({
+            recoveryDecisionId: repairDecision.recoveryId,
+            supersessionId,
+            resumptionGeneration: repairDecision.resumptionGeneration ?? 0,
+            replacement: replacementSpec,
+            manifest: manifest!,
+            checkpoint: checkpoint ?? null,
+          });
+          replacementFingerprints[replacementId] = fingerprint;
+          const existing = this.store.getTask(replacementId);
+          if (existing) {
+            this.recoveryTaskGenerations.set(existing.task_id, expectedResumptionGeneration);
+            const existingFingerprint = manifest
+              ? replacementRecoveryFingerprint({
+                  recoveryDecisionId: repairDecision.recoveryId,
+                  supersessionId,
+                  resumptionGeneration: repairDecision.resumptionGeneration ?? 0,
+                  replacement: replacementTaskFingerprintSpec(existing),
+                  manifest,
+                  checkpoint: checkpoint ?? null,
+                })
+              : "";
+            const exact =
+              existingFingerprint === fingerprint &&
+              existing.replacement_spec_fingerprint === fingerprint &&
+              (!checkpoint ||
+                (existing.recovery_authority?.expectedReplacementFingerprint === fingerprint &&
+                  existing.recovery_authority?.recoveryDecisionId === repairDecision.recoveryId &&
+                  existing.recovery_authority?.checkpointId === checkpoint.checkpointId &&
+                  existing.recovery_authority?.supersessionId === supersessionId));
+            if (!exact) throw new Error(`replacement replay fingerprint/full-spec mismatch: ${replacementId}`);
+            return existing;
+          }
+          const created = this.store.createTask({
+            ...replacementSpec,
+            replacement_spec_fingerprint: fingerprint,
             recovery_authority: checkpoint
               ? {
                   recoveryDecisionId: repairDecision.recoveryId,
@@ -635,6 +706,8 @@ export class Orchestrator {
                 }
               : undefined,
           });
+          this.recoveryTaskGenerations.set(created.task_id, expectedResumptionGeneration);
+          return created;
         });
         if (!this.store.listTaskSupersessions(missionId).some((lineage) => lineage.failedTaskId === failed.task_id)) {
           this.store.supersedeTask({
@@ -650,7 +723,7 @@ export class Orchestrator {
               : "bounded replacement",
             createdAt: new Date(this.scheduler.now()).toISOString(),
             recoveryDecisionId: repairDecision.recoveryId,
-            ...(checkpoint ? { expectedReplacementFingerprints: replacementFingerprints } : {}),
+            expectedReplacementFingerprints: replacementFingerprints,
           });
         }
       }
@@ -701,7 +774,48 @@ export class Orchestrator {
           this.store.transitionMission(missionId, "BLOCKED");
         }
         await this.store.flush();
+        this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
         return this.store.getMission(missionId)!;
+      }
+      const recoveryMutatesRepository = recoveryLineages.some((lineage) =>
+        lineage.replacementTaskIds.some((taskId) => this.store.getTask(taskId)?.mutates_repo === true),
+      );
+      if (recoveryMutatesRepository && this.broker.pendingIntegrations(missionId) > 0) {
+        const integrationTaskId = `${repairDecision.recoveryId}-integration`;
+        let integrationTask = this.store.getTask(integrationTaskId);
+        if (!integrationTask) {
+          integrationTask = this.store.createTask({
+            task_id: integrationTaskId,
+            mission_id: missionId,
+            kind: "integration",
+            role: "integrator",
+            objective: `Integrate recovery repair ${repairDecision.recoveryId} before evaluating materiality.`,
+            mutates_repo: true,
+            write_domains: this.writableDomainsForMission(missionId),
+            isolation: "none",
+            repo_id: this.repoIdForMission(missionId),
+            ...this.boundedTaskFields(missionId, ["integrated recovery candidate"], []),
+          });
+        }
+        this.recoveryTaskGenerations.set(integrationTask.task_id, expectedResumptionGeneration);
+        if (integrationTask.status === "PENDING") this.store.transitionTask(integrationTask.task_id, "READY");
+        const currentStatus = this.store.getMission(missionId)?.status;
+        if (currentStatus && currentStatus !== "INTEGRATING" && canTransitionMission(currentStatus, "INTEGRATING")) {
+          this.store.transitionMission(missionId, "INTEGRATING");
+        }
+        await this.store.flush();
+        this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
+        const integrated = await this.runSingleTask(missionId, integrationTask.task_id, { signal });
+        this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
+        if (!integrated) {
+          this.store.transitionRecovery(repairDecision.recoveryId, "failed");
+          if (canTransitionMission(this.store.getMission(missionId)!.status, "BLOCKED")) {
+            this.store.transitionMission(missionId, "BLOCKED");
+          }
+          await this.store.flush();
+          this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
+          return this.store.getMission(missionId)!;
+        }
       }
       const verifiedCandidateContent = await this.broker.verifiedCandidateContent(missionId);
       this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
@@ -709,11 +823,8 @@ export class Orchestrator {
       const gitMaterialDelta =
         !!verifiedCandidateContent?.hasChanges &&
         (!contentBaseline ||
-          verifiedCandidateContent.candidateSha !== contentBaseline.candidateSha ||
-          verifiedCandidateContent.diffHash !== contentBaseline.diffHash);
-      const recoveryMutatesRepository = recoveryLineages.some((lineage) =>
-        lineage.replacementTaskIds.some((taskId) => this.store.getTask(taskId)?.mutates_repo === true),
-      );
+          (verifiedCandidateContent.candidateSha !== contentBaseline.candidateSha &&
+            verifiedCandidateContent.diffHash !== contentBaseline.diffHash));
       const materialDelta = (() => {
         switch (repairDecision.action) {
           case "REBUILD_WORKSPACE_MANIFEST":
@@ -735,9 +846,11 @@ export class Orchestrator {
       })();
       if (!materialDelta) {
         this.store.transitionRecovery(repairDecision.recoveryId, "failed");
-        if (this.store.getMission(missionId)?.status === "REPAIRING")
+        const currentStatus = this.store.getMission(missionId)?.status;
+        if (currentStatus && canTransitionMission(currentStatus, "BLOCKED"))
           this.store.transitionMission(missionId, "BLOCKED");
         await this.store.flush();
+        this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
         return this.store.getMission(missionId)!;
       }
       const finalized = await this.finalizeMission(
@@ -748,24 +861,30 @@ export class Orchestrator {
       this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
       this.store.transitionRecovery(repairDecision.recoveryId, finalized.completed ? "succeeded" : "failed");
       await this.store.flush();
+      this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
       return finalized.mission;
     } finally {
-      const lease = this.ownershipByMission.get(missionId);
-      if (lease && this.ownership) {
+      const leaseToRelease = this.recoveryOwnershipByFlight.get(recoveryLeaseKey) ?? acquiredLease;
+      if (leaseToRelease && this.ownership) {
         try {
-          await this.ownership.release(lease);
+          await this.ownership.release(leaseToRelease);
         } catch (error) {
           await this.store.recordOwnershipReleaseFailure({
             missionId,
-            generation: lease.generation,
-            fencingToken: lease.fencingToken,
-            ownerId: lease.ownerId,
-            renewBy: lease.renewBy,
+            generation: leaseToRelease.generation,
+            fencingToken: leaseToRelease.fencingToken,
+            ownerId: leaseToRelease.ownerId,
+            renewBy: leaseToRelease.renewBy,
             error,
           });
         }
       }
-      this.ownershipByMission.delete(missionId);
+      if (this.recoveryOwnershipByFlight.get(recoveryLeaseKey) === leaseToRelease) {
+        this.recoveryOwnershipByFlight.delete(recoveryLeaseKey);
+      }
+      for (const [taskId, generation] of this.recoveryTaskGenerations) {
+        if (generation === expectedResumptionGeneration) this.recoveryTaskGenerations.delete(taskId);
+      }
     }
   }
 
@@ -830,12 +949,12 @@ export class Orchestrator {
     if (invalid.length > 0) throw new Error(`checkpoint repair identity/integrity mismatch: ${invalid.join(", ")}`);
   }
 
-  private activateMissionRepository(missionId: string): void {
+  private async activateMissionRepository(missionId: string): Promise<void> {
     const repoId = this.repoIdForMission(missionId);
     const manifest = this.store.getWorkspaceManifest(missionId);
     if (repoId && manifest && this.repositoryRegistry) {
       this.missionRepoIds.set(missionId, repoId);
-      this.repositoryRegistry.activate(missionId, manifest.generation, manifest.hash, repoId);
+      await this.repositoryRegistry.ensureActive(manifest, repoId);
     }
   }
 
@@ -1095,7 +1214,7 @@ export class Orchestrator {
           const staged = await this.repositoryRegistry.stage(manifest);
           probes = await staged.probe(workspace.primaryRepoId);
           if (probes.some((probe) => !probe.ok)) throw new Error("workspace manifest failed role probes");
-          await this.store.bindWorkspaceManifestDurably(manifest);
+          await this.store.bindWorkspaceManifestDurably(manifest, null);
           staged.activate();
         } catch (error) {
           const summary = error instanceof Error ? error.message : String(error);
@@ -2006,7 +2125,7 @@ export class Orchestrator {
     taskId: string,
     extra: { reviewedRecovered?: string[]; signal?: AbortSignal } = {},
   ): Promise<boolean> {
-    await this.renewMissionOwnership(missionId);
+    if (!this.recoveryTaskGenerations.has(taskId)) await this.renewMissionOwnership(missionId);
     let task = this.store.getTask(taskId)!;
     const authority = this.ownership ? await this.acquireTaskAuthority(task) : undefined;
     if (authority) task = this.store.assignTaskAuthority(taskId, authority.missionIdentity);
@@ -2037,6 +2156,7 @@ export class Orchestrator {
         executionBudgetMs: task.execution_budget_ms,
         checkpointPolicy: task.checkpoint_policy,
         requiredOutputArtifacts: task.required_output_artifacts,
+        candidateBaseSha: task.repair_base_candidate_sha,
         acceptanceCriteria: this.store
           .getMission(missionId)
           ?.acceptance_criteria.flatMap((criterion) =>
@@ -2198,7 +2318,11 @@ export class Orchestrator {
   }
 
   private async acquireTaskAuthority(task: OrchestrationTask): Promise<DispatchAuthority> {
-    const identity = this.ownershipByMission.get(task.mission_id);
+    const recoveryGeneration = this.recoveryTaskGenerations.get(task.task_id);
+    const recoveryKey = recoveryGeneration === undefined ? undefined : `${task.mission_id}:${recoveryGeneration}`;
+    const identity = recoveryKey
+      ? this.recoveryOwnershipByFlight.get(recoveryKey)
+      : this.ownershipByMission.get(task.mission_id);
     if (!identity || !this.ownership) throw new Error(`mission ${task.mission_id} has no active ownership`);
     if (task.mutates_repo && !task.repo_id) {
       throw new Error(`mutating task ${task.task_id} has no repository identity`);
@@ -2215,7 +2339,13 @@ export class Orchestrator {
       onInvalidated: (listener) => held.onInvalidated(listener),
       close: async () => {
         const error = await held.close();
-        this.ownershipByMission.set(task.mission_id, held.missionIdentity);
+        if (recoveryKey) {
+          if (this.recoveryOwnershipByFlight.get(recoveryKey) === identity) {
+            this.recoveryOwnershipByFlight.set(recoveryKey, held.missionIdentity);
+          }
+        } else {
+          this.ownershipByMission.set(task.mission_id, held.missionIdentity);
+        }
         return error;
       },
     };

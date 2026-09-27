@@ -6,9 +6,12 @@
  * trail.
  */
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { describe, it } from "node:test";
+import { promisify } from "node:util";
 import { GitRepo } from "../../src/git/GitRepo.ts";
 import type { BrokerBackends, IntegrationHandoff } from "../../src/orchestration/broker.ts";
 import { buildCandidateEvidenceIdentity, taskCoverageFingerprint } from "../../src/orchestration/evidence.ts";
@@ -17,11 +20,13 @@ import { Orchestrator } from "../../src/orchestration/orchestrator.ts";
 import { MissionOwnership, type OwnershipIdentity } from "../../src/orchestration/ownership.ts";
 import { replacementRecoveryFingerprint } from "../../src/orchestration/recovery.ts";
 import { RepositoryRegistry } from "../../src/orchestration/repositoryRegistry.ts";
+import type { MissionLease } from "../../src/orchestration/types.ts";
 import { WorkspaceManifestResolver, createWorkspaceManifest } from "../../src/orchestration/workspaceManifest.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 import { makeFixtureRepo } from "../fixtures/make-fixture.ts";
 
 const OBJECTIVE = "Add the console panel (all five steps)";
+const exec = promisify(execFile);
 
 async function run() {
   const fx = await makeFixtureRepo();
@@ -171,6 +176,7 @@ function blockedRepairHarness(
       | "REVIEW_FAILED";
     failedKind?: "agent" | "validation" | "review";
     failOwnershipRelease?: boolean;
+    ownership?: MissionOwnership;
   } = {},
 ) {
   const backend = JsonlEventStore.inMemory();
@@ -332,9 +338,9 @@ function blockedRepairHarness(
       await super.release(identity);
     }
   }
-  const ownership = options.failOwnershipRelease
-    ? new HarnessOwnership(store, { ownerId: "blocked-repair-controller" })
-    : undefined;
+  const ownership =
+    options.ownership ??
+    (options.failOwnershipRelease ? new HarnessOwnership(store, { ownerId: "blocked-repair-controller" }) : undefined);
   const observedRecoveries: Array<unknown> = [];
   const orchestrator = new Orchestrator({
     store,
@@ -375,7 +381,246 @@ function blockedRepairHarness(
     now: () => Date.parse("2026-09-27T00:00:10.000Z"),
     ownership,
   });
+  if (options.withCandidate) {
+    orchestrator.broker.verifiedCandidateContent = async () => ({
+      candidateSha: "candidate-sha",
+      diffHash: "diff-hash",
+      hasChanges: true,
+    });
+  }
   return { backend, store, missionId: mission.mission_id, failed, orphanedExecution, orchestrator, observedRecoveries };
+}
+
+async function realGateRepairHarness(emptyRepair: boolean) {
+  const fixture = await makeFixtureRepo();
+  const git = (await GitRepo.open(fixture.root))!;
+  const baseSha = await git.headCommit();
+  const baselineWorktree = await git.createWorktree(baseSha, `candidate-baseline-${emptyRepair ? "empty" : "real"}`);
+  await writeFile(join(baselineWorktree.path, "src", "candidate-baseline.ts"), "export const baseline = true;\n");
+  await git.commitAll(baselineWorktree.path, "candidate baseline");
+  const candidateSha = await git.headCommitIn(baselineWorktree.path);
+  const baselineDiff = await git.captureDiff(baseSha, candidateSha);
+  const baselineDiffHash = `sha256:${createHash("sha256").update(baselineDiff).digest("hex")}`;
+  const backend = JsonlEventStore.inMemory();
+  const store = MissionStore.open(backend);
+  const mission = store.createMission({
+    mission_id: emptyRepair ? "MSN-empty-repair" : "MSN-real-repair",
+    title: "repair failed gate",
+    goal: "repair failed gate",
+    user_request: `repair ${fixture.root}`,
+    repository: fixture.root,
+    base_ref: baseSha,
+    risk_profile: "high",
+    workflow_class: "engineering",
+  });
+  const manifest = {
+    manifestId: `WM-${mission.mission_id}`,
+    missionId: mission.mission_id,
+    generation: 1,
+    authorizedRoots: [{ canonicalPath: fixture.root, source: "existing_manifest" as const, access: "write" as const }],
+    repositories: [
+      {
+        repoId: "repo-real-repair",
+        canonicalRoot: fixture.root,
+        baseRef: baseSha,
+        baseSha,
+        writableDomains: ["**"],
+      },
+    ],
+    dependencyEdges: [],
+    hash: `manifest-${mission.mission_id}`,
+    createdAt: "2026-09-27T00:00:00.000Z",
+  };
+  store.bindWorkspaceManifest(manifest);
+  for (const status of ["CLASSIFYING", "PLANNING", "READY", "EXECUTING"] as const) {
+    store.transitionMission(mission.mission_id, status);
+  }
+  const candidateTask = store.createTask({
+    task_id: "TSK-current-candidate",
+    mission_id: mission.mission_id,
+    kind: "integration",
+    role: "integrator",
+    objective: "current candidate",
+    repo_id: "repo-real-repair",
+  });
+  store.transitionTask(candidateTask.task_id, "READY");
+  const candidateExecution = store.createExecution({
+    task_id: candidateTask.task_id,
+    mission_id: mission.mission_id,
+    backend: "integration",
+    repo_id: "repo-real-repair",
+    base_sha: baseSha,
+  });
+  store.transitionTask(candidateTask.task_id, "RUNNING", "system", {
+    assigned_execution_id: candidateExecution.execution_id,
+  });
+  store.setExecutionStatus(candidateExecution.execution_id, "RUNNING");
+  store.setExecutionStatus(candidateExecution.execution_id, "SUCCEEDED", { exit_status: "succeeded" });
+  store.transitionTask(candidateTask.task_id, "SUCCEEDED");
+  store.recordCandidate(
+    mission.mission_id,
+    buildCandidateEvidenceIdentity({
+      workspaceManifestHash: manifest.hash,
+      missionGeneration: 0,
+      repoId: "repo-real-repair",
+      baseSha,
+      candidateSha,
+      diffHash: baselineDiffHash,
+      acceptanceIds: [],
+      artifactHashes: [],
+    }),
+    "verified candidate before repair",
+    { taskId: candidateTask.task_id, executionId: candidateExecution.execution_id },
+  );
+  const failed = store.createTask({
+    task_id: "TSK-failed-gate",
+    mission_id: mission.mission_id,
+    kind: "validation",
+    role: "validator",
+    objective: "validation failed on current candidate",
+    repo_id: "repo-real-repair",
+    deliverables: ["repair validation defect"],
+  });
+  store.transitionTask(failed.task_id, "READY");
+  const failedExecution = store.createExecution({
+    task_id: failed.task_id,
+    mission_id: mission.mission_id,
+    backend: "validation",
+    repo_id: "repo-real-repair",
+    base_sha: baseSha,
+  });
+  store.transitionTask(failed.task_id, "RUNNING", "system", {
+    assigned_execution_id: failedExecution.execution_id,
+  });
+  store.setExecutionStatus(failedExecution.execution_id, "RUNNING");
+  store.setExecutionStatus(failedExecution.execution_id, "FAILED", { exit_status: "failed" });
+  store.transitionTask(failed.task_id, "FAILED", "system", { failure_reason: "validation failed" });
+  store.classifyFailure({
+    classificationId: "FC-real-gate",
+    missionId: mission.mission_id,
+    taskId: failed.task_id,
+    executionId: failedExecution.execution_id,
+    category: "VALIDATION_FAILED",
+    evidenceRefs: [],
+    fingerprint: `sha256:${(emptyRepair ? "e" : "f").repeat(64)}`,
+    summary: "validation failed",
+    classifiedAt: "2026-09-27T00:00:01.000Z",
+  });
+  store.transitionMission(mission.mission_id, "BLOCKED");
+  const registry = new RepositoryRegistry();
+  await registry.register(manifest);
+  const orchestrator = new Orchestrator({
+    store,
+    repositoryRegistry: registry,
+    backends: {
+      agent: {
+        runAgent: async ({ worktree }) => {
+          if (!worktree) throw new Error("repair worktree missing");
+          if (emptyRepair) {
+            await exec("git", ["-C", worktree, "commit", "--allow-empty", "-m", "empty repair"]);
+          } else {
+            await writeFile(join(worktree, "src", "actual-repair.ts"), "export const repaired = true;\n");
+            await git.commitAll(worktree, "actual repair");
+          }
+          return {
+            executionId: "repair-agent",
+            exitStatus: "succeeded",
+            summary: "repair worker settled",
+            artifactRefs: [],
+            usage: {},
+          };
+        },
+      },
+      integration: {
+        candidateScoped: true,
+        runIntegration: async (input) => {
+          for (const [sequence, handoff] of input.handoffs.entries()) {
+            const merged = await git.mergeRefInWorktree(
+              input.candidate!,
+              handoff.ref ?? handoff.worktree.branch,
+              input.authority,
+              input.candidateLifecycle,
+              sequence,
+              {},
+              input.integrationRun,
+            );
+            if (!merged.merged) {
+              return {
+                executionId: "repair-integration",
+                exitStatus: "failed",
+                summary: merged.reason ?? "merge failed",
+                artifactRefs: [],
+                usage: {},
+              };
+            }
+          }
+          return {
+            executionId: "repair-integration",
+            exitStatus: "succeeded",
+            summary: "repair integrated",
+            artifactRefs: [],
+            usage: {},
+          };
+        },
+      },
+      validation: {
+        candidateScoped: true,
+        runValidation: async () => ({
+          executionId: "repair-validation",
+          exitStatus: "succeeded",
+          summary: "repair validates",
+          artifactRefs: [],
+          usage: {},
+          validationEvidence: {
+            command: "test",
+            profile: "repair",
+            exitCode: 0,
+            testSummary: { passed: 1 },
+            noTargets: false,
+            accessible: true,
+            acceptanceResults: [],
+          },
+        }),
+      },
+      review: {
+        candidateScoped: true,
+        runReview: async () => ({
+          executionId: "repair-review",
+          exitStatus: "succeeded",
+          summary: "repair approved",
+          artifactRefs: [],
+          usage: {},
+          findings: [],
+          reviewEvidence: {
+            reviewerSessionId: "repair-review",
+            model: "test",
+            provider: "test",
+            verdict: "approve",
+            independenceMode: "independent",
+            findings: [],
+            outputValid: true,
+            accessible: true,
+            acceptanceResults: [],
+          },
+        }),
+      },
+    },
+    planner: async () => [],
+    recovery: { missionCeiling: 4, strategyMaxAttempts: 2, decisionTtlMs: 60_000 },
+    now: () => Date.parse("2026-09-27T00:00:10.000Z"),
+  });
+  return {
+    fixture,
+    store,
+    missionId: mission.mission_id,
+    orchestrator,
+    baselineDiffHash,
+    candidateSha,
+    cleanup: async () => {
+      await git.removeWorktree(baselineWorktree, { keepBranch: false }).catch(() => undefined);
+      await fixture.cleanup();
+    },
+  };
 }
 
 describe("orchestrator: durable blocked-mission repair", () => {
@@ -503,32 +748,40 @@ describe("orchestrator: durable blocked-mission repair", () => {
       const expectedReplacementFingerprints: Record<string, string> = {};
       const replacements = ["two", "three"].map((deliverable, index) => {
         const taskId = `${recoveryId}-TSK-${h.failed.task_id}-${index + 1}`;
-        const fingerprint = replacementRecoveryFingerprint({
-          recoveryDecisionId: recoveryId,
-          taskId,
-          originalTaskId: h.failed.task_id,
-          originalExecutionId: h.orphanedExecution.execution_id,
-          checkpointId: "CHK-original",
-          supersessionId,
-          role: "implementer",
-          mutatesRepo: false,
-          repoId: "repo-repair",
-          missionGeneration: 0,
-          candidateGeneration: 0,
-          fencingToken: 0,
-          resumptionGeneration: 0,
-        });
-        expectedReplacementFingerprints[taskId] = fingerprint;
-        return h.store.createTask({
+        const replacement = {
           task_id: taskId,
           mission_id: h.missionId,
-          kind: "agent",
+          kind: "agent" as const,
           role: "implementer",
           objective: `Recover ${h.failed.objective}: complete remaining deliverable ${deliverable}`,
           depends_on: ["TSK-prerequisite"],
-          deliverables: [deliverable],
-          repo_id: "repo-repair",
+          priority: 0,
+          mutates_repo: false,
+          write_domains: [],
+          isolation: "none" as const,
+          execution_requirements: {},
           max_attempts: 1,
+          failure_policy: "block" as const,
+          repo_id: "repo-repair",
+          acceptance_ids: [],
+          deliverables: [deliverable],
+          execution_budget_ms: undefined,
+          checkpoint_policy: undefined,
+          required_output_artifacts: [],
+          candidate_generation: index + 1,
+        };
+        const fingerprint = replacementRecoveryFingerprint({
+          recoveryDecisionId: recoveryId,
+          supersessionId,
+          resumptionGeneration: 0,
+          replacement,
+          manifest: h.store.getWorkspaceManifest(h.missionId)!,
+          checkpoint: h.store.getTaskCheckpoint("CHK-original")!,
+        });
+        expectedReplacementFingerprints[taskId] = fingerprint;
+        return h.store.createTask({
+          ...replacement,
+          replacement_spec_fingerprint: fingerprint,
           recovery_authority: {
             recoveryDecisionId: recoveryId,
             expectedReplacementFingerprint: fingerprint,
@@ -628,6 +881,106 @@ describe("orchestrator: durable blocked-mission repair", () => {
     assert.equal(h.store.listRecoveryDecisions(h.missionId)[0]?.resumptionGeneration, 1);
   });
 
+  it("releases only the generation-local lease when overlapping repair flights settle", async () => {
+    class OverlapOwnership extends MissionOwnership {
+      readonly released: MissionLease[] = [];
+      private next = 0;
+
+      override async acquire(missionId: string): Promise<MissionLease> {
+        const generation = ++this.next;
+        return {
+          missionId,
+          generation,
+          ownerId: `owner-${generation}`,
+          acquiredAt: `2026-09-27T00:00:0${generation}.000Z`,
+          renewBy: `2026-09-27T00:01:0${generation}.000Z`,
+          fencingToken: generation,
+        };
+      }
+
+      override async release(identity: OwnershipIdentity): Promise<void> {
+        if (!("repoId" in identity)) this.released.push(identity);
+      }
+    }
+    const ownership = new OverlapOwnership(MissionStore.open(JsonlEventStore.inMemory()), {
+      ownerId: "overlap",
+    });
+    const h = blockedRepairHarness({ category: "REQUIREMENT_AMBIGUITY", ownership });
+    let releaseFirst!: () => void;
+    let firstStarted!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const started = new Promise<void>((resolve) => {
+      firstStarted = resolve;
+    });
+    const diagnostics = h.orchestrator.broker.durableRepositoryDiagnostics.bind(h.orchestrator.broker);
+    let calls = 0;
+    h.orchestrator.broker.durableRepositoryDiagnostics = async (missionId) => {
+      if (++calls === 1) {
+        firstStarted();
+        await gate;
+      }
+      return diagnostics(missionId);
+    };
+    const stale = h.orchestrator.repairBlockedMission(h.missionId);
+    await started;
+    h.store.resumeMission(h.missionId, "new generation");
+    const current = h.orchestrator.repairBlockedMission(h.missionId);
+    releaseFirst();
+
+    await assert.rejects(stale, /STALE_RECOVERY_GENERATION/);
+    await current;
+    assert.deepEqual(ownership.released.map((lease) => lease.generation).sort(), [1, 2]);
+  });
+
+  it("checks resumption generation after preserved-work collection before stopping", async () => {
+    const h = blockedRepairHarness({ category: "PERSISTENCE_FAILURE" });
+    let release!: () => void;
+    let started!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const entered = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    h.orchestrator.broker.durableRepositoryStateRefs = async () => {
+      started();
+      await gate;
+      return ["durable-ref"];
+    };
+    const stale = h.orchestrator.repairBlockedMission(h.missionId);
+    await entered;
+    h.store.resumeMission(h.missionId, "resume during preserved work");
+    release();
+
+    await assert.rejects(stale, /STALE_RECOVERY_GENERATION/);
+    assert.equal(h.store.listMissionStops(h.missionId).length, 0);
+  });
+
+  it("checks resumption generation after scheduler settlement before recovery settlement", async () => {
+    const h = blockedRepairHarness();
+    let release!: () => void;
+    let started!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const entered = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    h.orchestrator.scheduler.runMission = async () => {
+      started();
+      await gate;
+    };
+    const stale = h.orchestrator.repairBlockedMission(h.missionId);
+    await entered;
+    h.store.resumeMission(h.missionId, "resume during scheduler");
+    release();
+
+    await assert.rejects(stale, /STALE_RECOVERY_GENERATION/);
+    assert.equal(h.store.listRecoveryDecisions(h.missionId).at(-1)?.status, "started");
+  });
+
   it("rejects deterministic replacement ids whose durable recovery fingerprint is not exact", async () => {
     const h = blockedRepairHarness();
     const recoveryId = "RCV-forged-replay";
@@ -653,6 +1006,7 @@ describe("orchestrator: durable blocked-mission repair", () => {
       role: "implementer",
       objective: "forged replay",
       repo_id: "repo-repair",
+      replacement_spec_fingerprint: "sha256:forged",
       recovery_authority: {
         recoveryDecisionId: recoveryId,
         expectedReplacementFingerprint: "sha256:forged",
@@ -717,7 +1071,7 @@ describe("orchestrator: durable blocked-mission repair", () => {
   });
 
   it("creates bounded mutating repair work for CREATE_REPAIR_TASKS and requires new candidate evidence", async () => {
-    const h = blockedRepairHarness({ category: "VALIDATION_FAILED", failedKind: "validation" });
+    const h = blockedRepairHarness({ withCandidate: true, category: "VALIDATION_FAILED", failedKind: "validation" });
 
     const repaired = await h.orchestrator.repairBlockedMission(h.missionId);
 
@@ -742,9 +1096,82 @@ describe("orchestrator: durable blocked-mission repair", () => {
       false,
       "a same-kind gate rerun is not repair material",
     );
+    assert.ok(
+      replacements.every((task) => task.recovery_authority === undefined),
+      "gate repair must start from the independently verified candidate, not import a worker checkpoint",
+    );
+    assert.ok(h.observedRecoveries.every((recovery) => recovery === undefined));
     assert.equal(recovery.status, "failed");
-    assert.equal(recovery.startingCandidateIdentityHash, null);
+    assert.ok(recovery.startingCandidateIdentityHash);
+    assert.deepEqual(recovery.startingCandidateContent, {
+      candidateSha: "candidate-sha",
+      diffHash: "diff-hash",
+    });
     assert.equal(repaired.status, "BLOCKED");
+  });
+
+  it("refuses gate repair when the current candidate cannot be independently verified", async () => {
+    const h = blockedRepairHarness({ category: "REVIEW_FAILED", failedKind: "review" });
+
+    const repaired = await h.orchestrator.repairBlockedMission(h.missionId);
+
+    assert.equal(repaired.status, "BLOCKED");
+    assert.equal(h.store.listTaskSupersessions(h.missionId).length, 0);
+    assert.ok(h.store.listFindings(h.missionId).some((finding) => finding.category === "recovery_candidate_baseline"));
+    assert.deepEqual(h.observedRecoveries, []);
+  });
+
+  it("integrates genuine repair content before materiality is evaluated", async () => {
+    const h = await realGateRepairHarness(false);
+    try {
+      const repaired = await h.orchestrator.repairBlockedMission(h.missionId);
+      const recovery = h.store.listRecoveryDecisions(h.missionId).at(-1)!;
+      const integrations = h.store
+        .listTasks(h.missionId)
+        .filter((task) => task.task_id === `${recovery.recoveryId}-integration`);
+
+      assert.equal(integrations.length, 1);
+      assert.equal(integrations[0]?.status, "SUCCEEDED");
+      assert.notEqual(h.store.getCandidate(h.missionId)?.identity.diffHash, h.baselineDiffHash);
+      assert.equal(
+        recovery.status,
+        "succeeded",
+        JSON.stringify({
+          mission: repaired,
+          tasks: h.store.listTasks(h.missionId).map((task) => ({
+            id: task.task_id,
+            kind: task.kind,
+            status: task.status,
+            failure: task.failure_reason,
+          })),
+          findings: h.store.listFindings(h.missionId).map((finding) => finding.summary),
+          verdict: h.orchestrator.gate.evaluate(repaired),
+        }),
+      );
+      assert.equal(repaired.status, "COMPLETE");
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("rejects a SHA-only empty repair commit whose content diff is unchanged", async () => {
+    const h = await realGateRepairHarness(true);
+    try {
+      const repaired = await h.orchestrator.repairBlockedMission(h.missionId);
+      const recovery = h.store.listRecoveryDecisions(h.missionId).at(-1)!;
+
+      assert.equal(
+        h.store.getTask(`${recovery.recoveryId}-integration`)?.status,
+        "SUCCEEDED",
+        "empty commit must reach the post-integration content check",
+      );
+      assert.equal(h.store.getCandidate(h.missionId)?.identity.diffHash, h.baselineDiffHash);
+      assert.notEqual(h.store.getCandidate(h.missionId)?.identity.candidateSha, h.candidateSha);
+      assert.equal(recovery.status, "failed");
+      assert.equal(repaired.status, "BLOCKED");
+    } finally {
+      await h.cleanup();
+    }
   });
 
   it("does not accept candidate metadata invalidation as Git material change", async () => {

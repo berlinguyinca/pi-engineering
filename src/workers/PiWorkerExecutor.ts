@@ -1190,12 +1190,19 @@ export function buildCompactedWorkerPrompt(req: WorkerRequest, recoveryPrompt: s
 
   // Include only a compact slice of the context (first 500 chars) to avoid
   // re-introducing the verbose context that may have contributed to the loop.
-  const verifiedContext = workerContext(req);
+  const verifiedContext = req.context;
   if (verifiedContext?.trim()) {
     const compactContext = verifiedContext.trim();
     const sliced = compactContext.length > 500 ? `${compactContext.slice(0, 500)}… [truncated]` : compactContext;
     parts.push(`# Context (compacted)`);
     parts.push(sliced);
+    parts.push("");
+  }
+
+  const durableRecovery = durableRecoveryContext(req);
+  if (durableRecovery) {
+    parts.push(`# Durable Recovery Context (untruncated)`);
+    parts.push(durableRecovery);
     parts.push("");
   }
 
@@ -1224,17 +1231,35 @@ export function buildCompactedWorkerPrompt(req: WorkerRequest, recoveryPrompt: s
 
 export function workerContext(req: WorkerRequest): string | undefined {
   if (!req.recovery) return req.context;
+  const durable = durableRecoveryContext(req)!;
+  return req.context?.trim() ? `${req.context.trim()}\n\n${durable}` : durable;
+}
+
+function durableRecoveryContext(req: WorkerRequest): string | undefined {
+  if (!req.recovery) return undefined;
   const recovery = req.recovery;
   const durable = [
     "Verified durable checkpoint recovery context (immutable):",
     `decision=${recovery.recoveryDecisionId}`,
+    `replacementFingerprint=${recovery.expectedReplacementFingerprint}`,
+    `supersession=${recovery.supersessionId}`,
+    `mission=${recovery.missionId}`,
+    `repository=${recovery.repoId}`,
+    `missionGeneration=${recovery.missionGeneration}`,
+    `candidateGeneration=${recovery.candidateGeneration}`,
+    `fencingToken=${recovery.fencingToken}`,
+    `resumptionGeneration=${recovery.resumptionGeneration}`,
     `checkpoint=${recovery.checkpointId}`,
     `originalTask=${recovery.originalTaskId}`,
     `originalExecution=${recovery.originalExecutionId}`,
     `candidateSha=${recovery.candidateSha}`,
     `sourceBranch=${recovery.sourceBranch}`,
+    `sourceWorktree=${recovery.sourceWorktree}`,
+    `committedPaths=${recovery.committedPaths.join(",")}`,
+    `formerlyDirtyPaths=${recovery.formerlyDirtyPaths.join(",")}`,
     `completedDeliverables=${recovery.completedDeliverables.join(",")}`,
+    `artifactRefs=${recovery.artifactRefs.join(",")}`,
     `artifactHashes=${recovery.artifactHashes.join(",")}`,
   ].join("\n");
-  return req.context?.trim() ? `${req.context.trim()}\n\n${durable}` : durable;
+  return durable;
 }

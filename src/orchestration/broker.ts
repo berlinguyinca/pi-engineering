@@ -34,7 +34,7 @@ import type { CheckpointManager, CheckpointSnapshot } from "./checkpoints.ts";
 import { EvidenceUnavailableError, buildCandidateEvidenceIdentity, hashCandidateEvidenceIdentity } from "./evidence.ts";
 import type { LateExecutionEvidence, MissionStore } from "./missionStore.ts";
 import type { DispatchAuthority } from "./ownership.ts";
-import { replacementRecoveryFingerprint } from "./recovery.ts";
+import { replacementRecoveryFingerprint, replacementTaskFingerprintSpec } from "./recovery.ts";
 import type { ExecutionBackend, RecoveredMerge, ReviewEvidence, ValidationEvidence } from "./types.ts";
 import { canonicalizeWriteDomain } from "./workset.ts";
 
@@ -64,6 +64,8 @@ export interface ExecutionRequestInput {
    * verify. Recorded on the execution as `reviewed_recovered`.
    */
   reviewedRecovered?: string[];
+  /** Verified current candidate used as the base for fresh gate-repair work. */
+  candidateBaseSha?: string;
   acceptanceCriteria?: Array<{ acceptanceId: string; criterion: string }>;
   /** Renewable fencing held by the caller for the complete dispatch. */
   authority?: DispatchAuthority;
@@ -472,23 +474,21 @@ export class ExecutionBroker {
     const lineage = this.store
       .listTaskSupersessions(input.missionId)
       .find((entry) => entry.supersessionId === authority.supersessionId);
-    const expected = replacementRecoveryFingerprint({
-      recoveryDecisionId: authority.recoveryDecisionId,
-      taskId: input.taskId,
-      originalTaskId: authority.originalTaskId,
-      originalExecutionId: authority.originalExecutionId,
-      checkpointId: authority.checkpointId,
-      supersessionId: authority.supersessionId,
-      role: task?.role ?? "",
-      mutatesRepo: task?.mutates_repo ?? false,
-      repoId: task?.repo_id ?? "",
-      missionGeneration: checkpoint?.missionGeneration ?? -1,
-      candidateGeneration: checkpoint?.candidateGeneration ?? -1,
-      fencingToken: checkpoint?.fencingToken ?? -1,
-      resumptionGeneration: authority.resumptionGeneration,
-    });
+    const manifest = this.store.getWorkspaceManifest(input.missionId);
+    const expected =
+      task && checkpoint && manifest
+        ? replacementRecoveryFingerprint({
+            recoveryDecisionId: authority.recoveryDecisionId,
+            supersessionId: authority.supersessionId,
+            resumptionGeneration: authority.resumptionGeneration,
+            replacement: replacementTaskFingerprintSpec(task),
+            manifest,
+            checkpoint,
+          })
+        : "";
     const invalid = [
       !task || task.mission_id !== input.missionId ? "replacement task" : null,
+      !manifest ? "workspace manifest" : null,
       !checkpoint || checkpoint.missionId !== input.missionId || checkpoint.taskId !== authority.originalTaskId
         ? "checkpoint"
         : null,
@@ -571,6 +571,38 @@ export class ExecutionBroker {
       artifactRefs: Object.freeze([...checkpoint.artifactRefs]),
       artifactHashes: Object.freeze([...checkpoint.artifactHashes]),
     }) as CheckpointRecoveryContext;
+  }
+
+  private assertReplacementSpec(input: ExecutionRequestInput): void {
+    const task = this.store.getTask(input.taskId);
+    if (!task?.replacement_spec_fingerprint) return;
+    const lineage = this.store
+      .listTaskSupersessions(input.missionId)
+      .find((entry) => entry.replacementTaskIds.includes(input.taskId));
+    const decision = lineage?.recoveryDecisionId
+      ? this.store.getRecoveryDecision(lineage.recoveryDecisionId)
+      : undefined;
+    const manifest = this.store.getWorkspaceManifest(input.missionId);
+    const checkpoint = task.recovery_authority
+      ? (this.store.getTaskCheckpoint(task.recovery_authority.checkpointId) ?? null)
+      : null;
+    if (!lineage || !decision || !manifest || (task.recovery_authority && !checkpoint)) {
+      throw new Error("replacement replay fingerprint/full-spec mismatch: incomplete durable authority");
+    }
+    const expected = replacementRecoveryFingerprint({
+      recoveryDecisionId: decision.recoveryId,
+      supersessionId: lineage.supersessionId,
+      resumptionGeneration: decision.resumptionGeneration ?? 0,
+      replacement: replacementTaskFingerprintSpec(task),
+      manifest,
+      checkpoint,
+    });
+    if (
+      expected !== task.replacement_spec_fingerprint ||
+      lineage.expectedReplacementFingerprints?.[task.task_id] !== expected
+    ) {
+      throw new Error(`replacement replay fingerprint/full-spec mismatch: ${task.task_id}`);
+    }
   }
 
   private async checkpointSnapshot(
@@ -941,12 +973,13 @@ export class ExecutionBroker {
       const missionBase = this.store.getMission(input.missionId)?.base_ref?.trim();
       const recoveryCandidateSha = input.recovery?.candidateSha;
       let base = missionBase || this.baseRef || (await repository.git.headCommit());
-      if (typeof recoveryCandidateSha === "string" && recoveryCandidateSha.trim()) {
-        const resolvedRecovery = await repository.git.resolveCommit(recoveryCandidateSha);
-        if (resolvedRecovery !== recoveryCandidateSha) {
-          throw new Error(`checkpoint repair candidate is unavailable in repository: ${recoveryCandidateSha}`);
+      const preservedCandidateSha = recoveryCandidateSha ?? input.candidateBaseSha;
+      if (typeof preservedCandidateSha === "string" && preservedCandidateSha.trim()) {
+        const resolvedRecovery = await repository.git.resolveCommit(preservedCandidateSha);
+        if (resolvedRecovery !== preservedCandidateSha) {
+          throw new Error(`repair candidate is unavailable in repository: ${preservedCandidateSha}`);
         }
-        base = recoveryCandidateSha;
+        base = preservedCandidateSha;
       }
       // Remember what we actually forked from. A mission may be handed an empty
       // base_ref, and without a base the 'did the work land' invariant has nothing
@@ -1796,6 +1829,7 @@ export class ExecutionBroker {
       ...rawInput,
       writeDomains: (rawInput.writeDomains ?? []).map(canonicalizeWriteDomain),
     };
+    this.assertReplacementSpec(input);
     input.recovery = this.durableRecoveryContext(input);
     input.authority?.assertAuthoritative();
     const executionStartedAt = Date.now();

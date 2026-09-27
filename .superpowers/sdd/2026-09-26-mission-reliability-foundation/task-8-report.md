@@ -94,3 +94,38 @@ Metabolomics remains disabled. No model or package dependency was added.
 - Review Git materiality: candidate SHA and diff hash are recomputed from the exact active repository binding; artifacts, generation increments, and invalidations cannot satisfy a mutating repair.
 - Review registry ambiguity behavior for shared repository paths: mission-aware execution is exact, while path-only tools fail closed when more than one active manifest matches.
 - The optional Postgres-backed OpenViking test was not run because `TEST_DATABASE_URL` is not configured; it is unrelated to this change.
+
+## Fix round 4
+
+### Outcome
+
+- Replacement replay and dispatch now bind the complete immutable task specification, exact manifest identity, complete checkpoint snapshot, and ordered artifact reference/hash pairs. The broker independently recomputes the same fingerprint before worktree allocation.
+- Only resume-preserved-worker actions import a checkpoint. Validation/review/implementation repair starts from an independently Git-verified current candidate and carries no checkpoint authority.
+- Recovery flights, leases, task authority, awaited phases, settlement, and return paths are fenced by resumption generation. A stale flight releases only the exact generation-local lease it acquired.
+- Mutating repair work is integrated under fencing before materiality evaluation. Materiality requires changed Git content and diff identity, so a SHA-only empty commit is rejected.
+- Workspace-manifest binding is a true predecessor-generation/hash CAS. A bind-before-activate crash is recoverable by idempotently restaging and activating the durable manifest.
+- Registry async-local and path lookups validate against the current active manifest. Obsolete scopes are inaccessible, and path resolution requires exactly one direct/common-Git match.
+- Worker prompt compaction applies only to ordinary context; the immutable durable recovery block is appended intact.
+
+### Adversarial TDD evidence
+
+- RED: gate repair inherited checkpoint authority; same-generation manifest binds both committed; stale async-local scopes and unmatched paths remained usable; long ordinary context truncated durable recovery fields.
+- GREEN: a 32-case fingerprint mutation matrix covers task, manifest, checkpoint, path, candidate/base, and artifact identity; recovery integration tests cover no-checkpoint gate repair, generation races after awaited phases, overlapping flight leases, genuine integration, and SHA-only empty-commit rejection.
+- Registry/store tests cover concurrent same-predecessor manifest CAS, bind-before-activate restart recovery, removed-repository async-local invalidation, and unmatched/ambiguous path failure.
+- Worker tests prove long ordinary prompt context is compacted while the durable recovery block remains complete.
+
+### Verification
+
+- Recovery-focused final run: `node --test` over Git, mission-store, recovery-planner, scheduler, broker-recovery, workspace-manifest, workers, orchestrator-recovery/resilience, gate, and orchestration-runtime tests — 174 passed, 0 failed.
+- `npm run typecheck` — passed.
+- `npm run lint` — passed; 585 files checked.
+- `git diff --check` — passed.
+- Bounded full suite: `timeout 180s npm test` — 2,534 passed, 0 failed, 1 skipped in 38.4 seconds. The skip is the optional Postgres OpenViking round trip because `TEST_DATABASE_URL` is unset.
+
+### Reviewer focus
+
+- Confirm the replacement fingerprint has no mutable or omitted authority surface and that both replay and dispatch compare the complete object.
+- Confirm every recovery await is followed by a generation assertion before mutation, settlement, lease release, or result publication.
+- Confirm manifest CAS checks the exact persisted predecessor at append time and restart activation cannot expose an uncommitted manifest.
+- Confirm mutating repair materiality is evaluated only after fenced integration and requires a changed diff, not merely a new commit SHA.
+- Confirm path-only registry resolution fails closed for zero or multiple matches and stale async-local scopes cannot reach removed bindings.

@@ -68,6 +68,22 @@ export class RepositoryRegistry {
     staged.activate();
   }
 
+  /** Restage durable manifest authority after a crash between bind and activation. */
+  async ensureActive(manifest: WorkspaceManifest, repoId: string): Promise<void> {
+    const active = this.activeManifests.get(manifest.missionId);
+    const expected = { missionId: manifest.missionId, generation: manifest.generation, hash: manifest.hash };
+    if (
+      !active ||
+      active.generation !== manifest.generation ||
+      active.hash !== manifest.hash ||
+      !this.contexts.get(scopeKey(expected))?.has(repoId)
+    ) {
+      const staged = await this.stage(manifest);
+      staged.activate();
+    }
+    this.activate(manifest.missionId, manifest.generation, manifest.hash, repoId);
+  }
+
   /** Build and probe replacement contexts without changing current execution authority. */
   async stage(manifest: WorkspaceManifest): Promise<StagedRepositoryRegistration> {
     const scope: ManifestScope = {
@@ -78,8 +94,10 @@ export class RepositoryRegistry {
     const stagedContexts = new Map<string, RepositoryExecutionContext>();
     for (const binding of manifest.repositories) await this.registerBinding(binding, stagedContexts);
     const activate = (): void => {
+      const prior = this.activeManifests.get(scope.missionId);
       this.contexts.set(scopeKey(scope), stagedContexts);
       this.activeManifests.set(scope.missionId, { ...scope });
+      if (prior && scopeKey(prior) !== scopeKey(scope)) this.contexts.delete(scopeKey(prior));
     };
     return {
       probe: (repoId) => this.probeContext(stagedContexts, repoId),
@@ -123,6 +141,7 @@ export class RepositoryRegistry {
         ? { ...[...this.activeManifests.values()][0]!, repoId }
         : undefined);
     if (!active) throw new WorkspaceScopeError("No mission manifest is active for this execution");
+    this.assertActiveScope(active);
     const context = this.contexts.get(scopeKey(active))?.get(repoId);
     if (!context) throw new WorkspaceScopeError(`Unknown repository binding: ${repoId}`);
     return context;
@@ -132,6 +151,13 @@ export class RepositoryRegistry {
     const active = this.activeRepo.getStore();
     if (!active) throw new WorkspaceScopeError("No repository binding is active for this execution");
     return this.get(active.repoId);
+  }
+
+  private assertActiveScope(scope: ManifestScope): void {
+    const current = this.activeManifests.get(scope.missionId);
+    if (!current || current.generation !== scope.generation || current.hash !== scope.hash) {
+      throw new WorkspaceScopeError(`Inactive workspace manifest for mission ${scope.missionId}`);
+    }
   }
 
   activate(missionId: string, generation: number, hash: string, repoId: string): void {
@@ -155,6 +181,7 @@ export class RepositoryRegistry {
       // still the only authority and is safer than falling back to launch cwd.
     }
     const active = this.activeRepo.getStore();
+    if (active) this.assertActiveScope(active);
     const activeContexts = active
       ? [...(this.contexts.get(scopeKey(active))?.values() ?? [])]
       : [...this.activeManifests.values()].flatMap((scope) => [
@@ -197,12 +224,14 @@ export class RepositoryRegistry {
     if (basename(canonical).includes("pi-eng-candidate-")) {
       throw new WorkspaceScopeError(`Candidate repository context is unavailable: ${canonical}`);
     }
-    return active ? this.get(active.repoId) : null;
+    return null;
   }
 
   async probe(repoId: string): Promise<RoleAccessProbe[]> {
+    const asyncActive = this.activeRepo.getStore();
+    if (asyncActive) this.assertActiveScope(asyncActive);
     const active =
-      this.activeRepo.getStore() ??
+      asyncActive ??
       ([...this.activeManifests.values()].length === 1
         ? { ...[...this.activeManifests.values()][0]!, repoId }
         : undefined);
