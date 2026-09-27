@@ -782,7 +782,16 @@ export class ExecutionBroker {
       // which turns a real conflict into a clean merge where the worker's version
       // wins over the incumbent.
       const missionBase = this.store.getMission(input.missionId)?.base_ref?.trim();
-      const base = missionBase || this.baseRef || (await repository.git.headCommit());
+      const recoveryCandidateSha = (input.modelRequirements as { recoveryCandidateSha?: unknown } | undefined)
+        ?.recoveryCandidateSha;
+      let base = missionBase || this.baseRef || (await repository.git.headCommit());
+      if (typeof recoveryCandidateSha === "string" && recoveryCandidateSha.trim()) {
+        const resolvedRecovery = await repository.git.resolveCommit(recoveryCandidateSha);
+        if (resolvedRecovery !== recoveryCandidateSha) {
+          throw new Error(`checkpoint repair candidate is unavailable in repository: ${recoveryCandidateSha}`);
+        }
+        base = recoveryCandidateSha;
+      }
       // Remember what we actually forked from. A mission may be handed an empty
       // base_ref, and without a base the 'did the work land' invariant has nothing
       // to diff against — the fork point recorded here is the fallback.
@@ -1140,6 +1149,47 @@ export class ExecutionBroker {
       }
     }
     return diagnostics;
+  }
+
+  /** Canonical durable Git assets preserved in exact stop diagnostics. */
+  async durableRepositoryStateRefs(missionId: string): Promise<string[]> {
+    const repoIds = [
+      ...new Set(
+        [
+          ...(this.store.getWorkspaceManifest(missionId)?.repositories.map((repository) => repository.repoId) ?? []),
+          ...this.store.listTasks(missionId).map((task) => task.repo_id),
+        ].filter((repoId): repoId is string => typeof repoId === "string" && repoId.trim().length > 0),
+      ),
+    ];
+    const refs: string[] = [];
+    for (const repoId of repoIds) {
+      const git = this.resolveRepository ? (await this.resolveRepository(repoId, [])).git : this.git;
+      if (!git) continue;
+      const [candidates, runs, promotions, cleanups] = await Promise.all([
+        git.loadCandidateLifecycleInventory(missionId, repoId),
+        git.loadIntegrationRunInventory(missionId, repoId),
+        git.loadPromotionLifecycleInventory(missionId, repoId),
+        git.loadPendingBranchCleanupInventory(missionId, repoId),
+      ]);
+      refs.push(
+        ...candidates.records.flatMap((record) => [
+          `candidate-record:${record.candidateId}`,
+          record.path,
+          record.branch,
+          record.candidateSha,
+        ]),
+        ...runs.records.map((record) => `integration-run-record:${record.candidateId}:${record.runId}`),
+        ...promotions.records.map(
+          (record) => `promotion-record:${record.candidateId}:${record.originRepositoryGeneration}:${record.state}`,
+        ),
+        ...cleanups.records.flatMap((record) => [
+          `cleanup-record:${record.missionId}:${record.repoId}:${record.path}:${record.branch}:${record.state}`,
+          record.path,
+          record.branch,
+        ]),
+      );
+    }
+    return [...new Set(refs)];
   }
 
   /** Release any worktrees still tracked for a finished mission. */

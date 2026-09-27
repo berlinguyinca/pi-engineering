@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { access, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -1091,7 +1092,20 @@ test("forged candidate and promotion identities are rejected while loading durab
     candidate.integrationRunId = run.runId;
     await repo.persistCandidateLifecycle(candidate);
     await repo.promoteCandidate(candidate, base, undefined, candidate);
-    const promotionFile = (await readdir(stateDir)).find((name) => name.startsWith("promotion."))!;
+    const completedPromotion = (await repo.loadPromotionLifecycles(candidate.missionId, candidate.repoId)).find(
+      (record) => record.state === "completed",
+    )!;
+    assert.equal(
+      completedPromotion.reconciliationRepositoryGeneration,
+      completedPromotion.originRepositoryGeneration,
+      "initial promotion completion must close the authority ordering",
+    );
+    let promotionFile = "";
+    for (const name of (await readdir(stateDir)).filter((entry) => entry.startsWith("promotion."))) {
+      const record = JSON.parse(await readFile(join(stateDir, name), "utf8")) as { state?: string };
+      if (record.state === "completed") promotionFile = name;
+    }
+    assert.ok(promotionFile);
     const forgedPromotion = JSON.parse(await readFile(join(stateDir, promotionFile), "utf8")) as Record<
       string,
       unknown
@@ -1101,7 +1115,10 @@ test("forged candidate and promotion identities are rejected while loading durab
     forgedPromotion.reconciliationRepositoryGeneration = 1;
     await writeFile(join(stateDir, promotionFile), JSON.stringify(forgedPromotion));
     const impossiblePromotion = await repo.loadPromotionLifecycleInventory(candidate.missionId, candidate.repoId);
-    assert.deepEqual(impossiblePromotion.records, []);
+    assert.equal(
+      impossiblePromotion.records.some((record) => record.state === "completed"),
+      false,
+    );
     assert.equal(impossiblePromotion.diagnostics.length, 1);
     assert.match(impossiblePromotion.diagnostics[0]?.reason ?? "", /candidate.*origin.*reconciliation/i);
 
@@ -1111,11 +1128,58 @@ test("forged candidate and promotion identities are rejected while loading durab
     forgedPromotion.attempt = "different-attempt";
     await writeFile(join(stateDir, promotionFile), JSON.stringify(forgedPromotion));
     const mismatchedPromotion = await repo.loadPromotionLifecycleInventory(candidate.missionId, candidate.repoId);
-    assert.deepEqual(mismatchedPromotion.records, []);
+    assert.equal(
+      mismatchedPromotion.records.some((record) => record.state === "completed"),
+      false,
+    );
     assert.equal(mismatchedPromotion.diagnostics.length, 1);
     assert.match(
       mismatchedPromotion.diagnostics[0]?.reason ?? "",
-      /(?:canonical.*(?:filename|identity)|identity.*canonical)/i,
+      /(?:canonical.*(?:filename|identity)|identity.*canonical|authority ordering)/i,
+    );
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("candidate replay rejects a self-consistent filename whose path and branch are not deterministic", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const repo = (await GitRepo.open(fixture.root))!;
+    const candidate = await repo.createCandidateWorktree(await repo.headCommit(), {
+      missionId: "MSN-forged-location",
+      repoId: "repo-forged-location",
+      missionGeneration: 2,
+      candidateGeneration: 3,
+      repositoryGeneration: 4,
+      attempt: "attempt-location",
+    });
+    const stateDir = join(await repo.commonDir(), "pi-engineering-candidates");
+    const original = (await readdir(stateDir)).find((name) => name.startsWith("candidate."))!;
+    const forged = JSON.parse(await readFile(join(stateDir, original), "utf8")) as typeof candidate;
+    forged.path = join(fixture.root, "unrelated-worktree");
+    forged.branch = "unrelated-branch";
+    forged.seedSha = "0".repeat(40);
+    forged.parentCandidateId = "forged-parent";
+    forged.integrationRunId = "forged-run";
+    const parts = [
+      forged.candidateId,
+      forged.missionId,
+      forged.repoId,
+      forged.missionGeneration,
+      forged.candidateGeneration,
+      forged.repositoryGeneration,
+      forged.attempt,
+      forged.baseSha,
+      forged.candidateSha,
+    ];
+    const forgedName = `candidate.${createHash("sha256").update(JSON.stringify(parts)).digest("hex")}.json`;
+    await writeFile(join(stateDir, forgedName), JSON.stringify(forged));
+
+    const inventory = await repo.loadCandidateLifecycleInventory(candidate.missionId, candidate.repoId);
+    assert.ok(inventory.diagnostics.some((diagnostic) => diagnostic.file === forgedName));
+    assert.ok(
+      inventory.records.every((record) => record.path === candidate.path && record.branch === candidate.branch),
     );
   } finally {
     await fixture.cleanup();

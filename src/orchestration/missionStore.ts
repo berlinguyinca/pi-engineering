@@ -657,8 +657,11 @@ export class MissionStore {
       if (!repairDecision) {
         throw new Error("BLOCKED -> REPAIRING requires a durable repair recovery decision ID");
       }
-      if (repairDecision.missionId !== missionId || repairDecision.action !== "REPAIR_BLOCKED_MISSION") {
-        throw new Error(`recovery ${repairRecoveryId} is not a repair decision for mission ${missionId}`);
+      if (
+        repairDecision.missionId !== missionId ||
+        ["STOP", "WAIT_FOR_REQUIREMENT", "PAUSE_FOR_PERSISTENCE", "PROBE_AND_BACKOFF"].includes(repairDecision.action)
+      ) {
+        throw new Error(`recovery ${repairRecoveryId} cannot enter active repair for mission ${missionId}`);
       }
       if (repairDecision.status !== "planned") {
         throw new Error(`repair recovery ${repairRecoveryId} must be planned, not ${repairDecision.status}`);
@@ -686,6 +689,16 @@ export class MissionStore {
       );
     } else {
       this.emit("mission.updated", missionId, { actor, mission_id: missionId, patch }, now);
+    }
+    if (to === "BLOCKED" && this.missions.get(missionId)?.blocked_episode_id) {
+      const blockerEpisodeId = this.missions.get(missionId)!.blocked_episode_id!;
+      for (const classification of [...this.failureClassifications.values()].filter(
+        (entry) => entry.missionId === missionId && !entry.blockerEpisodeId,
+      )) {
+        const associated = { ...classification, blockerEpisodeId };
+        this.failureClassifications.set(associated.classificationId, associated);
+        this.emit("failure.classified", missionId, { actor: "system", classification: associated }, now);
+      }
     }
     return this.getMission(missionId)!;
   }
@@ -1346,7 +1359,10 @@ export class MissionStore {
     const copy: RecoveryDecision = {
       ...decision,
       status: "planned",
-      ...(decision.action === "REPAIR_BLOCKED_MISSION" ? { blockedEpisodeId: mission.blocked_episode_id } : {}),
+      resumptionGeneration: this.listMissionResumptions(decision.missionId).at(-1)?.generation ?? 0,
+      ...(mission.status === "BLOCKED" && decision.action !== "STOP"
+        ? { blockedEpisodeId: mission.blocked_episode_id }
+        : {}),
     };
     this.recoveryDecisions.set(copy.recoveryId, copy);
     this.emit("recovery.planned", decision.missionId, { actor: "system", decision: copy });
@@ -1430,6 +1446,21 @@ export class MissionStore {
     return [...this.taskSupersessions.values()]
       .filter((supersession) => (missionId ? supersession.missionId === missionId : true))
       .map(copyTaskSupersession);
+  }
+
+  /** Current transitive leaves for a task's immutable supersession lineage. */
+  taskSupersessionLeaves(taskId: string, visiting = new Set<string>()): OrchestrationTask[] {
+    if (visiting.has(taskId)) return [];
+    const lineage = [...this.taskSupersessions.values()].find((entry) => entry.failedTaskId === taskId);
+    const task = this.tasks.get(taskId);
+    if (!lineage) return task ? [copyTask(task)] : [];
+    const next = new Set(visiting).add(taskId);
+    return lineage.replacementTaskIds.flatMap((replacementId) => this.taskSupersessionLeaves(replacementId, next));
+  }
+
+  isTaskSatisfiedBySupersession(taskId: string): boolean {
+    const leaves = this.taskSupersessionLeaves(taskId);
+    return leaves.length > 0 && leaves.every((task) => task.status === "SUCCEEDED");
   }
 
   getTaskSupersession(supersessionId: string): TaskSupersession | undefined {
@@ -1766,7 +1797,13 @@ export class MissionStore {
 
   resumeMission(missionId: string, reason: string): MissionResumption {
     if (!this.missions.has(missionId)) throw new Error(`unknown mission ${missionId}`);
-    const resumption = { missionId, reason, resumedAt: new Date().toISOString() };
+    const resumption = {
+      missionId,
+      reason,
+      resumedAt: new Date().toISOString(),
+      generation: (this.listMissionResumptions(missionId).at(-1)?.generation ?? 0) + 1,
+      stopGeneration: this.listMissionStops(missionId).at(-1)?.generation ?? 0,
+    };
     this.missionResumptions.push(resumption);
     this.emit("mission.resumed", missionId, { actor: "system", resumption });
     return { ...resumption };
@@ -1778,8 +1815,21 @@ export class MissionStore {
       .map((resumption) => ({ ...resumption }));
   }
 
-  stopMission(missionId: string, input: Omit<MissionStop, "missionId" | "stoppedAt">): MissionStop {
-    if (!this.missions.has(missionId)) throw new Error(`unknown mission ${missionId}`);
+  stopMission(
+    missionId: string,
+    input: Omit<
+      MissionStop,
+      "missionId" | "stoppedAt" | "generation" | "resumptionGeneration" | "blockedEpisodeId" | "recoveryDeadline"
+    >,
+  ): MissionStop {
+    const mission = this.missions.get(missionId);
+    if (!mission) throw new Error(`unknown mission ${missionId}`);
+    const resumptionGeneration = this.listMissionResumptions(missionId).at(-1)?.generation ?? 0;
+    const deadlines = this.listRecoveryDecisions(missionId)
+      .filter((decision) => (decision.resumptionGeneration ?? 0) === resumptionGeneration)
+      .map((decision) => decision.deadline)
+      .filter((deadline) => Number.isFinite(Date.parse(deadline)))
+      .sort();
     const stop: MissionStop = {
       missionId,
       reason: input.reason,
@@ -1787,6 +1837,10 @@ export class MissionStore {
       attemptedRecoveries: [...input.attemptedRecoveries],
       resumeCondition: input.resumeCondition,
       stoppedAt: new Date().toISOString(),
+      generation: (this.listMissionStops(missionId).at(-1)?.generation ?? 0) + 1,
+      resumptionGeneration,
+      blockedEpisodeId: mission.blocked_episode_id ?? null,
+      recoveryDeadline: deadlines[0] ?? null,
     };
     this.missionStops.push(stop);
     this.emit("mission.stopped", missionId, { actor: "system", stop });

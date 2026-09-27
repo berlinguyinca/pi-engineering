@@ -261,9 +261,37 @@ export class GitRepo {
       record.candidateGeneration,
       record.repositoryGeneration,
       record.attempt,
+      record.parentCandidateId ?? "",
+      record.seedSha ?? "",
+      record.integrationRunId ?? "",
+      record.branch,
+      record.path,
       record.baseSha,
       record.candidateSha,
     ]);
+  }
+
+  private candidateBranch(identity: {
+    missionId: string;
+    repoId: string;
+    missionGeneration: number;
+    candidateGeneration: number;
+    attempt: string;
+  }): string {
+    const suffix = [
+      identity.missionId,
+      identity.repoId,
+      identity.missionGeneration,
+      identity.candidateGeneration,
+      identity.attempt,
+    ]
+      .join("-")
+      .replace(/[^a-zA-Z0-9._-]/g, "-");
+    return `pi-eng-candidate-${suffix}`;
+  }
+
+  private worktreePath(branch: string): string {
+    return join(this.repoRoot, "..", `pi-eng-${shortHash(this.repoRoot)}-${branch}`);
   }
 
   private candidateId(identity: {
@@ -362,6 +390,7 @@ export class GitRepo {
       record.originRepositoryGeneration,
       record.attempt,
       record.integrationRunId,
+      record.reconciliationRepositoryGeneration ?? "",
       record.baseSha,
       record.candidateSha,
     ]);
@@ -385,6 +414,15 @@ export class GitRepo {
     await writeFile(temporary, JSON.stringify(record), "utf8");
     guard?.assertAuthoritative();
     await rename(temporary, target);
+    for (const name of await readdir(dir).catch(() => [] as string[])) {
+      if (!name.startsWith("candidate.") || !name.endsWith(".json") || join(dir, name) === target) continue;
+      try {
+        const prior = JSON.parse(await readFile(join(dir, name), "utf8")) as Partial<CandidateLifecycle>;
+        if (prior.candidateId === record.candidateId) await rm(join(dir, name), { force: true });
+      } catch {
+        // Unreadable records remain for inventory diagnostics; never hide corruption.
+      }
+    }
   }
 
   async persistIntegrationRun(record: IntegrationRunRecord, guard?: GitMutationGuard): Promise<void> {
@@ -403,6 +441,7 @@ export class GitRepo {
   ): Promise<DurableRecordInventory<CandidateLifecycle>> {
     const dir = await this.candidateStateDir(false);
     const records: CandidateLifecycle[] = [];
+    const recordFiles = new Map<string, string>();
     const diagnostics: Array<{ file: string; reason: string }> = [];
     for (const name of await readdir(dir).catch(() => [] as string[])) {
       if (!name.endsWith(".json")) continue;
@@ -429,15 +468,31 @@ export class GitRepo {
           typeof parsed.baseSha === "string" &&
           parsed.baseSha.trim().length > 0 &&
           typeof parsed.candidateSha === "string" &&
-          parsed.candidateSha.trim().length > 0
+          parsed.candidateSha.trim().length > 0 &&
+          (parsed.parentCandidateId === undefined ||
+            (typeof parsed.parentCandidateId === "string" && parsed.parentCandidateId.trim().length > 0)) &&
+          typeof parsed.seedSha === "string" &&
+          parsed.seedSha.trim().length > 0 &&
+          (parsed.integrationRunId === undefined ||
+            (typeof parsed.integrationRunId === "string" && parsed.integrationRunId.trim().length > 0))
         ) {
           const derivedCandidateId = this.candidateId(parsed);
           const canonical = { ...parsed, candidateId: derivedCandidateId };
-          if (parsed.candidateId !== derivedCandidateId || name !== this.candidateStateName(canonical)) {
+          const expectedBranch = this.candidateBranch(parsed);
+          const expectedPath = this.worktreePath(expectedBranch);
+          if (
+            parsed.candidateId !== derivedCandidateId ||
+            parsed.branch !== expectedBranch ||
+            parsed.path !== expectedPath ||
+            name !== this.candidateStateName(canonical)
+          ) {
             diagnostics.push({ file: name, reason: "candidate identity does not match canonical filename" });
             continue;
           }
-          if (parsed.missionId === missionId && parsed.repoId === repoId) records.push(canonical);
+          if (parsed.missionId === missionId && parsed.repoId === repoId) {
+            records.push(canonical);
+            recordFiles.set(canonical.candidateId, name);
+          }
         } else {
           diagnostics.push({ file: name, reason: "candidate record has invalid or empty identity fields" });
         }
@@ -446,6 +501,35 @@ export class GitRepo {
           file: name,
           reason: `candidate record is unreadable: ${error instanceof Error ? error.message : String(error)}`,
         });
+      }
+    }
+    const byCandidateId = new Map(records.map((record) => [record.candidateId, record]));
+    const runs = await this.loadIntegrationRunInventory(missionId, repoId);
+    for (const record of [...records]) {
+      const parent = record.parentCandidateId ? byCandidateId.get(record.parentCandidateId) : undefined;
+      const lineageValid = record.parentCandidateId
+        ? !!parent &&
+          parent.missionId === record.missionId &&
+          parent.repoId === record.repoId &&
+          record.seedSha === parent.candidateSha
+        : record.seedSha === record.baseSha;
+      const runValid = record.integrationRunId
+        ? runs.records.some(
+            (run) =>
+              run.runId === record.integrationRunId &&
+              run.candidateId === record.candidateId &&
+              run.missionGeneration === record.missionGeneration &&
+              run.candidateGeneration === record.candidateGeneration,
+          )
+        : true;
+      if (!lineageValid || !runValid) {
+        diagnostics.push({
+          file: recordFiles.get(record.candidateId) ?? "",
+          reason: !lineageValid
+            ? "candidate parent/seed lineage is invalid"
+            : "candidate integration run lineage is invalid",
+        });
+        records.splice(records.indexOf(record), 1);
       }
     }
     records.sort(
@@ -504,7 +588,10 @@ export class GitRepo {
         });
       }
     }
-    records.sort((a, b) => a.updatedAt.localeCompare(b.updatedAt));
+    records.sort(
+      (a, b) =>
+        a.updatedAt.localeCompare(b.updatedAt) || (a.state === "completed" ? 1 : 0) - (b.state === "completed" ? 1 : 0),
+    );
     return {
       records: [...new Map(records.map((record) => [`${record.candidateId}\0${record.runId}`, record])).values()],
       diagnostics,
@@ -600,6 +687,7 @@ export class GitRepo {
               parsed.reconciliationRepositoryGeneration >= 0 &&
               parsed.reconciliationRepositoryGeneration >= parsed.originRepositoryGeneration)) &&
           (parsed.state !== "intent" || parsed.reconciliationRepositoryGeneration === undefined) &&
+          (parsed.state !== "completed" || parsed.reconciliationRepositoryGeneration !== undefined) &&
           (parsed.state === "intent" || parsed.state === "completed")
         ) {
           const derivedCandidateId = this.candidateId(parsed);
@@ -622,7 +710,10 @@ export class GitRepo {
         });
       }
     }
-    records.sort((a, b) => a.updatedAt.localeCompare(b.updatedAt));
+    records.sort(
+      (a, b) =>
+        a.updatedAt.localeCompare(b.updatedAt) || (a.state === "completed" ? 1 : 0) - (b.state === "completed" ? 1 : 0),
+    );
     return { records, diagnostics };
   }
 
@@ -658,17 +749,8 @@ export class GitRepo {
       if (reconciled) return existing;
       throw new Error(`candidate attempt already exists but cannot be reconciled: ${existing.branch}`);
     }
-    const suffix = [
-      identity.missionId,
-      identity.repoId,
-      identity.missionGeneration,
-      identity.candidateGeneration,
-      identity.attempt,
-    ]
-      .join("-")
-      .replace(/[^a-zA-Z0-9._-]/g, "-");
     const seedSha = identity.seedSha ?? baseSha;
-    const worktree = await this.createWorktree(seedSha, `pi-eng-candidate-${suffix}`, guard);
+    const worktree = await this.createWorktree(seedSha, this.candidateBranch(identity), guard);
     const record: CandidateLifecycle = {
       ...identity,
       candidateId: this.candidateId(identity),
@@ -1404,6 +1486,7 @@ export class GitRepo {
         await hooks.afterCandidateState?.();
         await this.persistPromotionLifecycle({
           ...promotionIntent!,
+          reconciliationRepositoryGeneration: promotionIntent!.originRepositoryGeneration,
           state: "completed",
           updatedAt: new Date().toISOString(),
         });
@@ -1539,7 +1622,9 @@ export class GitRepo {
     await this.persistPromotionLifecycle({
       ...intent,
       reconciliationRepositoryGeneration:
-        guard?.repositoryIdentity?.generation ?? intent.reconciliationRepositoryGeneration,
+        guard?.repositoryIdentity?.generation ??
+        intent.reconciliationRepositoryGeneration ??
+        intent.originRepositoryGeneration,
       state: "completed",
       updatedAt: new Date().toISOString(),
     });

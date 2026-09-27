@@ -724,6 +724,63 @@ describe("MissionStore", () => {
     assert.deepEqual(s.getTask(failed.task_id), immutableFailure, "supersession records never rewrite failed history");
   });
 
+  it("reports the recovery deadline for the current explicit resumption generation", () => {
+    const s = store();
+    const mission = s.createMission({
+      title: "resumed recovery",
+      goal: "report the truthful recovery window",
+      user_request: "resume recovery",
+      repository: ".",
+      base_ref: "main",
+      risk_profile: "high",
+      workflow_class: "engineering_review",
+    });
+    s.classifyFailure({
+      classificationId: "FCL-resume-deadline",
+      missionId: mission.mission_id,
+      taskId: null,
+      executionId: null,
+      category: "PROVIDER_TRANSIENT",
+      evidenceRefs: [],
+      fingerprint: "resume-deadline",
+      summary: "provider unavailable",
+      classifiedAt: "2026-09-27T00:00:00.000Z",
+    });
+    const recovery = (recoveryId: string, deadline: string): RecoveryDecision => ({
+      recoveryId,
+      missionId: mission.mission_id,
+      classificationId: "FCL-resume-deadline",
+      action: "PROBE_AND_BACKOFF",
+      expectedMaterialChange: "provider probe succeeds",
+      attempt: 1,
+      maxAttempts: 2,
+      deadline,
+      nextActionAt: "2026-09-27T00:00:00.000Z",
+      status: "planned",
+      decidedAt: "2026-09-27T00:00:00.000Z",
+      failureFingerprint: "resume-deadline",
+    });
+    s.planRecovery(recovery("RCV-before-resume", "2026-09-27T00:01:00.000Z"));
+    s.stopMission(mission.mission_id, {
+      reason: "first recovery stopped",
+      preservedWork: [],
+      attemptedRecoveries: ["RCV-before-resume"],
+      resumeCondition: "provider health returns",
+    });
+    s.resumeMission(mission.mission_id, "provider health returned");
+    s.planRecovery(recovery("RCV-after-resume", "2026-09-27T00:05:00.000Z"));
+
+    const stop = s.stopMission(mission.mission_id, {
+      reason: "resumed recovery stopped",
+      preservedWork: [],
+      attemptedRecoveries: ["RCV-after-resume"],
+      resumeCondition: "provider health returns again",
+    });
+
+    assert.equal(stop.resumptionGeneration, 1);
+    assert.equal(stop.recoveryDeadline, "2026-09-27T00:05:00.000Z");
+  });
+
   it("rejects BLOCKED to EXECUTING bypass and atomically consumes durable repair authority", async () => {
     const backend = JsonlEventStore.inMemory();
     const s = MissionStore.open(backend);

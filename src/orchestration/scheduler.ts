@@ -244,7 +244,10 @@ export class MissionScheduler {
         // Approvals etc. handled by caller; treat as not runnable here.
         continue;
       }
-      const depsDone = t.depends_on.every((d) => byId.get(d)?.status === "SUCCEEDED");
+      const depsDone = t.depends_on.every(
+        (dependencyId) =>
+          byId.get(dependencyId)?.status === "SUCCEEDED" || this.store.isTaskSatisfiedBySupersession(dependencyId),
+      );
       if (!depsDone) continue;
       if (t.mutates_repo) {
         const conflict = active.some(
@@ -482,6 +485,7 @@ export class MissionScheduler {
           if (ceiling) {
             authority?.assertAuthoritative();
             this.settleTaskRecoveries(task, "failed");
+            this.recordTerminalFailure(task, ceiling, handle.executionId);
             this.store.transitionTask(task.task_id, "FAILED", "system", { failure_reason: ceiling });
             this.forgetOutage(task);
             return;
@@ -502,6 +506,7 @@ export class MissionScheduler {
               if (recoveryStop) {
                 authority?.assertAuthoritative();
                 this.settleTaskRecoveries(task, "failed");
+                this.recordTerminalFailure(task, recoveryStop, handle.executionId);
                 this.store.transitionTask(task.task_id, "FAILED", "system", { failure_reason: recoveryStop });
                 return;
               }
@@ -520,6 +525,7 @@ export class MissionScheduler {
           const detail = outcome.summary ? `: ${outcome.summary}` : "";
           authority?.assertAuthoritative();
           this.settleTaskRecoveries(task, "failed");
+          this.recordTerminalFailure(task, `backend reported ${outcome.exitStatus}${detail}`, handle.executionId);
           this.store.transitionTask(task.task_id, "FAILED", "system", {
             failure_reason: `backend reported ${outcome.exitStatus}${detail}`,
           });
@@ -582,6 +588,7 @@ export class MissionScheduler {
           if (recoveryStop) {
             authority?.assertAuthoritative();
             this.settleTaskRecoveries(task, "failed");
+            this.recordTerminalFailure(task, recoveryStop, handle?.executionId ?? null);
             this.store.transitionTask(task.task_id, "FAILED", "system", { failure_reason: recoveryStop });
             return;
           }
@@ -591,6 +598,7 @@ export class MissionScheduler {
         }
         authority?.assertAuthoritative();
         this.settleTaskRecoveries(task, "failed");
+        this.recordTerminalFailure(task, reason, handle?.executionId ?? null);
         this.store.transitionTask(task.task_id, "FAILED", "system", { failure_reason: reason });
         return;
       } finally {
@@ -621,6 +629,7 @@ export class MissionScheduler {
       classification,
       history: this.store.listRecoveryDecisions(task.mission_id),
       now: this.clockNow(),
+      resumptionGeneration: this.store.listMissionResumptions(task.mission_id).at(-1)?.generation ?? 0,
     });
     const persisted = this.store.getRecoveryDecision(decision.recoveryId) ?? this.store.planRecovery(decision);
     if (persisted.status === "planned") {
@@ -628,6 +637,31 @@ export class MissionScheduler {
     }
     await this.store.flush();
     return decision.action === "STOP" ? decision.expectedMaterialChange : null;
+  }
+
+  private recordTerminalFailure(task: OrchestrationTask, summary: string, executionId: string | null): void {
+    const category =
+      task.kind === "validation"
+        ? "VALIDATION_FAILED"
+        : task.kind === "review"
+          ? "REVIEW_FAILED"
+          : task.kind === "integration"
+            ? "MERGE_CONFLICT"
+            : undefined;
+    const classification = this.failureClassifier.classify({
+      missionId: task.mission_id,
+      taskId: task.task_id,
+      executionId,
+      summary,
+      evidenceRefs: [],
+      ...(category ? { category } : {}),
+      observedAt: new Date(this.clockNow()).toISOString(),
+    });
+    if (this.store.getFailureClassification(classification.classificationId)) return;
+    this.store.classifyFailure({
+      ...classification,
+      blockerEpisodeId: this.store.getMission(task.mission_id)?.blocked_episode_id,
+    });
   }
 
   private settleTaskRecoveries(task: OrchestrationTask, status: "succeeded" | "failed"): void {

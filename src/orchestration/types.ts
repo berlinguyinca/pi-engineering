@@ -426,6 +426,8 @@ export interface FailureClassification {
   fingerprint: string;
   summary: string;
   classifiedAt: string;
+  /** Durable BLOCKED episode this failure belongs to when one already exists. */
+  blockerEpisodeId?: EntityId;
 }
 
 export type RecoveryAction =
@@ -461,6 +463,8 @@ export interface RecoveryDecision {
   failureFingerprint?: string;
   /** Durable identity of the BLOCKED episode this repair decision may consume. */
   blockedEpisodeId?: EntityId;
+  /** Explicit operator resumption epoch; restart alone never increments it. */
+  resumptionGeneration?: number;
 }
 
 export interface EvidenceInvalidation {
@@ -492,6 +496,8 @@ export interface MissionResumption {
   missionId: EntityId;
   reason: string;
   resumedAt: string;
+  generation: number;
+  stopGeneration: number;
 }
 
 export interface MissionStop {
@@ -501,6 +507,10 @@ export interface MissionStop {
   attemptedRecoveries: EntityId[];
   resumeCondition: string;
   stoppedAt: string;
+  generation: number;
+  resumptionGeneration: number;
+  blockedEpisodeId: EntityId | null;
+  recoveryDeadline: string | null;
 }
 
 /** A recovered worker commit merged by integration. */

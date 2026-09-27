@@ -238,8 +238,8 @@ export class CompletionGate {
     const supersessionProblems: string[] = [];
     for (const lineage of this.store.listTaskSupersessions(missionId)) {
       const failed = tasks.find((task) => task.task_id === lineage.failedTaskId);
-      const replacements = lineage.replacementTaskIds.map((taskId) => tasks.find((task) => task.task_id === taskId));
-      const coverage = new Set(replacements.flatMap((task) => task?.acceptance_ids ?? []));
+      const replacements = this.store.taskSupersessionLeaves(lineage.failedTaskId);
+      const coverage = new Set(replacements.flatMap((task) => task.acceptance_ids ?? []));
       const evidenceExecutions =
         candidate && currentValidation && currentReview
           ? [candidate.executionId, currentValidation.executionId, currentReview.executionId].map((executionId) =>
@@ -247,7 +247,7 @@ export class CompletionGate {
             )
           : [];
       const replacementCoverageValid = replacements.every(
-        (task) => task?.status === "SUCCEEDED" && task.repo_id === lineage.repoId,
+        (task) => task.status === "SUCCEEDED" && task.repo_id === lineage.repoId,
       );
       const requiresMutationProof = failed?.mutates_repo === true || !!candidate || mission.required_gates.length > 0;
       const mutationProofValid =
@@ -257,7 +257,7 @@ export class CompletionGate {
           evidenceExecutions.length === 3 &&
           replacements.every(
             (task) =>
-              !!task?.completed_at &&
+              !!task.completed_at &&
               evidenceExecutions.every(
                 (execution) => !!execution?.ended_at && Date.parse(execution.ended_at) > Date.parse(task.completed_at!),
               ),

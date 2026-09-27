@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { type BrokerBackends, ExecutionBroker } from "../../src/orchestration/broker.ts";
 import { CheckpointManager } from "../../src/orchestration/checkpoints.ts";
+import { taskCoverageFingerprint } from "../../src/orchestration/evidence.ts";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
 import { MissionOwnership, type OwnershipIdentity } from "../../src/orchestration/ownership.ts";
 import { MissionScheduler, classifyFailure, domainsOverlap } from "../../src/orchestration/scheduler.ts";
@@ -1052,6 +1053,72 @@ describe("write-domain conflict detection", () => {
   });
 });
 
+describe("superseded dependency satisfaction", () => {
+  it("runs a downstream task only after every transitive leaf replacement succeeds", async () => {
+    const store = MissionStore.open(JsonlEventStore.inMemory());
+    const mission = createExecutingMission(store);
+    const failed = store.createTask({
+      task_id: "TSK-failed-dependency",
+      mission_id: mission.mission_id,
+      kind: "agent",
+      role: "implementer",
+      objective: "failed dependency",
+      repo_id: "repo-a",
+    });
+    store.transitionTask(failed.task_id, "READY");
+    store.transitionTask(failed.task_id, "RUNNING");
+    store.transitionTask(failed.task_id, "FAILED");
+    const replacement = store.createTask({
+      task_id: "TSK-leaf-replacement",
+      mission_id: mission.mission_id,
+      kind: "agent",
+      role: "implementer",
+      objective: "leaf replacement",
+      repo_id: "repo-a",
+    });
+    store.transitionTask(replacement.task_id, "READY");
+    store.transitionTask(replacement.task_id, "RUNNING");
+    store.transitionTask(replacement.task_id, "SUCCEEDED");
+    store.supersedeTask({
+      supersessionId: "SUP-dependency",
+      missionId: mission.mission_id,
+      failedTaskId: failed.task_id,
+      replacementTaskIds: [replacement.task_id],
+      repoId: "repo-a",
+      acceptanceIds: [],
+      coverageFingerprint: taskCoverageFingerprint(failed),
+      reason: "replacement",
+      createdAt: "2026-09-27T00:00:00.000Z",
+    });
+    const downstream = store.createTask({
+      task_id: "TSK-downstream",
+      mission_id: mission.mission_id,
+      kind: "process",
+      role: "builder",
+      objective: "downstream",
+      depends_on: [failed.task_id],
+    });
+    const scheduler = new MissionScheduler({
+      store,
+      broker: makeBroker(store, {
+        process: {
+          runProcess: async () => ({
+            executionId: "downstream",
+            exitStatus: "succeeded",
+            summary: "done",
+            artifactRefs: [],
+            usage: {},
+          }),
+        },
+      }),
+    });
+
+    await scheduler.runMission(mission.mission_id);
+
+    assert.equal(store.getTask(downstream.task_id)?.status, "SUCCEEDED");
+  });
+});
+
 describe("failure classifier (spec 02)", () => {
   it("classifies transient vs merge vs test failures", () => {
     const task = { failure_policy: "retry" } as never;
@@ -1059,5 +1126,60 @@ describe("failure classifier (spec 02)", () => {
     assert.equal(classifyFailure(new Error("merge conflict in src/a.ts"), task).action, "repair");
     assert.equal(classifyFailure(new Error("test failed: expected 1 got 2"), task).action, "repair");
     assert.equal(classifyFailure(new Error("context overflow max tokens"), task).action, "retry");
+  });
+
+  it("classifies every terminal gate failure before task failure is durable", async () => {
+    const backend = JsonlEventStore.inMemory();
+    const store = MissionStore.open(backend);
+    const mission = createExecutingMission(store);
+    for (const kind of ["validation", "review", "integration"] as const) {
+      store.createTask({
+        task_id: `TSK-terminal-${kind}`,
+        mission_id: mission.mission_id,
+        kind,
+        role: kind,
+        objective: `${kind} terminal failure`,
+        max_attempts: 1,
+        failure_policy: "block",
+      });
+    }
+    const failed = async () => ({
+      executionId: "terminal",
+      exitStatus: "failed",
+      summary: "terminal gate failure",
+      artifactRefs: [],
+      usage: {},
+    });
+    const scheduler = new MissionScheduler({
+      store,
+      broker: makeBroker(store, {
+        validation: { runValidation: failed },
+        review: { runReview: failed },
+        integration: { runIntegration: failed },
+      }),
+    });
+
+    await scheduler.runMission(mission.mission_id);
+
+    const classifications = store.listFailureClassifications(mission.mission_id);
+    assert.deepEqual(classifications.map((classification) => classification.category).sort(), [
+      "MERGE_CONFLICT",
+      "REVIEW_FAILED",
+      "VALIDATION_FAILED",
+    ]);
+    const events = backend.all().filter((event) => event.run_id === mission.mission_id);
+    for (const kind of ["validation", "review", "integration"] as const) {
+      const taskId = `TSK-terminal-${kind}`;
+      assert.ok(
+        events.findIndex(
+          (event) =>
+            event.type === "failure.classified" &&
+            (event.payload.classification as { taskId?: string } | undefined)?.taskId === taskId,
+        ) <
+          events.findIndex(
+            (event) => event.type === "task.failed" && (event.payload.task_id as string | undefined) === taskId,
+          ),
+      );
+    }
   });
 });

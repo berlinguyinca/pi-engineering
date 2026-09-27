@@ -1279,6 +1279,12 @@ describe("repair of failed gate tasks", () => {
       .listTasks(result.mission.mission_id)
       .filter((t) => t.kind === "agent" && t.objective.includes("Fix the failing validation"));
     assert.ok(repairs.length >= 1, "a failed validation must spawn repair work, not wedge the mission");
+    assert.ok(
+      h.store
+        .listRecoveryDecisions(result.mission.mission_id)
+        .some((decision) => decision.action === "CREATE_REPAIR_TASKS" && decision.status === "succeeded"),
+      "gate repair must consume the same durable recovery ledger",
+    );
     // ...and a stale failure must not keep the gate closed once it is green.
     assert.equal(result.completed, true, "a superseded validation failure must not block completion");
   });

@@ -58,6 +58,25 @@ describe("FailureClassifier", () => {
     );
   });
 
+  it("treats auth, model, configuration, and unknown provider failures as permanent", () => {
+    const classifier = new FailureClassifier();
+    for (const evidence of [
+      { summary: "provider invalid api key", providerCode: "invalid_api_key" },
+      { summary: "provider model does not exist", providerCode: "model_not_found" },
+      { summary: "provider configuration is invalid", providerCode: "invalid_configuration" },
+      { summary: "provider returned an unrecognized refusal", providerCode: "mystery_failure" },
+    ]) {
+      assert.equal(
+        classifier.classify({ ...baseEvidence(evidence.summary), ...evidence }).category,
+        "PROVIDER_PERMANENT",
+      );
+    }
+    assert.equal(
+      classifier.classify({ ...baseEvidence("connection reset"), providerCode: "ECONNRESET" }).category,
+      "PROVIDER_TRANSIENT",
+    );
+  });
+
   it("canonicalizes evidence order but changes when material evidence changes", () => {
     const first = failureFingerprint({ ...baseEvidence("Validation failed"), category: "VALIDATION_FAILED" });
     const reordered = failureFingerprint({

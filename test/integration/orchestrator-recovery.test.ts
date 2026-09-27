@@ -14,6 +14,7 @@ import type { BrokerBackends, IntegrationHandoff } from "../../src/orchestration
 import { buildCandidateEvidenceIdentity, taskCoverageFingerprint } from "../../src/orchestration/evidence.ts";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
 import { Orchestrator } from "../../src/orchestration/orchestrator.ts";
+import { MissionOwnership, type OwnershipIdentity } from "../../src/orchestration/ownership.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 import { makeFixtureRepo } from "../fixtures/make-fixture.ts";
 
@@ -156,7 +157,13 @@ describe("orchestrator: completing over work recovered from a timed-out worker",
   });
 });
 
-function blockedRepairHarness(options: { withCandidate?: boolean } = {}) {
+function blockedRepairHarness(
+  options: {
+    withCandidate?: boolean;
+    category?: "TASK_BUDGET_EXHAUSTED" | "REQUIREMENT_AMBIGUITY" | "PERSISTENCE_FAILURE";
+    failOwnershipRelease?: boolean;
+  } = {},
+) {
   const backend = JsonlEventStore.inMemory();
   const store = MissionStore.open(backend);
   const mission = store.createMission({
@@ -231,6 +238,16 @@ function blockedRepairHarness(options: { withCandidate?: boolean } = {}) {
       { taskId: candidateTask.task_id, executionId: candidateExecution.execution_id },
     );
   }
+  const prerequisite = store.createTask({
+    task_id: "TSK-prerequisite",
+    mission_id: mission.mission_id,
+    kind: "process",
+    role: "builder",
+    objective: "prepare bounded repair inputs",
+    repo_id: "repo-repair",
+  });
+  store.transitionTask(prerequisite.task_id, "READY");
+  store.transitionTask(prerequisite.task_id, "SUCCEEDED");
   const failed = store.createTask({
     task_id: "TSK-original",
     mission_id: mission.mission_id,
@@ -240,6 +257,7 @@ function blockedRepairHarness(options: { withCandidate?: boolean } = {}) {
     repo_id: "repo-repair",
     acceptance_ids: [],
     deliverables: ["one", "two", "three"],
+    depends_on: [prerequisite.task_id],
     mutates_repo: false,
     max_attempts: 1,
   });
@@ -288,13 +306,22 @@ function blockedRepairHarness(options: { withCandidate?: boolean } = {}) {
     missionId: mission.mission_id,
     taskId: failed.task_id,
     executionId: orphanedExecution.execution_id,
-    category: "TASK_BUDGET_EXHAUSTED",
+    category: options.category ?? "TASK_BUDGET_EXHAUSTED",
     evidenceRefs: ["CHK-original"],
     fingerprint: "sha256:budget-fingerprint",
     summary: "task execution budget exhausted",
     classifiedAt: "2026-09-27T00:00:00.000Z",
   });
   store.transitionMission(mission.mission_id, "BLOCKED");
+  class HarnessOwnership extends MissionOwnership {
+    override async release(identity: OwnershipIdentity): Promise<void> {
+      if (options.failOwnershipRelease && !("repoId" in identity)) throw new Error("injected mission release failure");
+      await super.release(identity);
+    }
+  }
+  const ownership = options.failOwnershipRelease
+    ? new HarnessOwnership(store, { ownerId: "blocked-repair-controller" })
+    : undefined;
   const orchestrator = new Orchestrator({
     store,
     backends: {
@@ -311,6 +338,7 @@ function blockedRepairHarness(options: { withCandidate?: boolean } = {}) {
     planner: async () => [],
     recovery: { missionCeiling: 4, strategyMaxAttempts: 2, decisionTtlMs: 60_000 },
     now: () => Date.parse("2026-09-27T00:00:10.000Z"),
+    ownership,
   });
   return { backend, store, missionId: mission.mission_id, failed, orphanedExecution, orchestrator };
 }
@@ -329,6 +357,19 @@ describe("orchestrator: durable blocked-mission repair", () => {
       JSON.stringify(
         replacements.map((task) => ({ id: task.task_id, status: task.status, reason: task.failure_reason })),
       ),
+    );
+    assert.ok(replacements.every((task) => task.depends_on.includes("TSK-prerequisite")));
+    assert.ok(
+      replacements.every(
+        (task) =>
+          task.execution_requirements.recoveryFromCheckpoint === "CHK-original" &&
+          task.execution_requirements.recoveryCandidateSha === "candidate-sha" &&
+          task.execution_requirements.recoveryBranch === "pi-eng-orch-TSK-original" &&
+          task.execution_requirements.recoveryWorktree === "/tmp/preserved-repair" &&
+          JSON.stringify(task.execution_requirements.recoveryCommittedChanges) === JSON.stringify(["one"]) &&
+          JSON.stringify(task.execution_requirements.recoveryUncommittedChanges) === JSON.stringify([]),
+      ),
+      "replacement execution must receive the exact verified checkpoint snapshot",
     );
     const lineage = h.store.listTaskSupersessions(h.missionId);
     assert.equal(lineage.length, 1);
@@ -403,6 +444,65 @@ describe("orchestrator: durable blocked-mission repair", () => {
     assert.equal(h.store.getRecoveryDecision(recoveryId)?.status, "succeeded");
   });
 
+  it("single-flights concurrent repair calls for one blocked episode", async () => {
+    const h = blockedRepairHarness();
+
+    const [first, second] = await Promise.all([
+      h.orchestrator.repairBlockedMission(h.missionId),
+      h.orchestrator.repairBlockedMission(h.missionId),
+    ]);
+
+    assert.equal(first.status, "COMPLETE");
+    assert.equal(second.status, "COMPLETE");
+    assert.equal(h.store.listTaskSupersessions(h.missionId).length, 1);
+    assert.equal(h.store.listTasks(h.missionId).filter((task) => task.objective.startsWith("Recover ")).length, 2);
+  });
+
+  it("waits for requirement clarification without creating generic replacement work", async () => {
+    const h = blockedRepairHarness({ category: "REQUIREMENT_AMBIGUITY" });
+
+    const waiting = await h.orchestrator.repairBlockedMission(h.missionId);
+
+    assert.equal(waiting.status, "WAITING_FOR_USER");
+    assert.equal(h.store.listTaskSupersessions(h.missionId).length, 0);
+    assert.equal(
+      h.store.listTasks(h.missionId).some((task) => task.objective.startsWith("Recover ")),
+      false,
+    );
+    assert.equal(h.store.listRecoveryDecisions(h.missionId).at(-1)?.action, "WAIT_FOR_REQUIREMENT");
+  });
+
+  it("pauses for persistence recovery without dispatching replacement work", async () => {
+    const h = blockedRepairHarness({ category: "PERSISTENCE_FAILURE" });
+
+    const paused = await h.orchestrator.repairBlockedMission(h.missionId);
+
+    assert.equal(paused.status, "BLOCKED");
+    assert.equal(h.store.listTaskSupersessions(h.missionId).length, 0);
+    assert.equal(
+      h.store.listTasks(h.missionId).some((task) => task.objective.startsWith("Recover ")),
+      false,
+    );
+    assert.equal(h.store.listRecoveryDecisions(h.missionId).at(-1)?.action, "PAUSE_FOR_PERSISTENCE");
+    assert.match(h.store.listMissionStops(h.missionId).at(-1)?.resumeCondition ?? "", /durable write/i);
+  });
+
+  it("durably records mission ownership release failure after preserving the repair outcome", async () => {
+    const h = blockedRepairHarness({ category: "REQUIREMENT_AMBIGUITY", failOwnershipRelease: true });
+
+    const waiting = await h.orchestrator.repairBlockedMission(h.missionId);
+
+    assert.equal(waiting.status, "WAITING_FOR_USER");
+    assert.ok(
+      h.store
+        .listFindings(h.missionId)
+        .some(
+          (finding) => finding.category === "ownership_release" && /mission ownership release/i.test(finding.summary),
+        ),
+    );
+    assert.deepEqual(h.store.persistenceDiagnostics(), []);
+  });
+
   it("stops with exact durable details after the identical strategy budget is exhausted", async () => {
     const h = blockedRepairHarness();
     for (const attempt of [1, 2]) {
@@ -426,8 +526,17 @@ describe("orchestrator: durable blocked-mission repair", () => {
     const stopped = await h.orchestrator.repairBlockedMission(h.missionId);
     assert.equal(stopped.status, "BLOCKED");
     const detail = h.store.listMissionStops(h.missionId).at(-1)!;
+    assert.equal(detail.generation, 1);
+    assert.equal(detail.resumptionGeneration, 0);
+    assert.equal(detail.blockedEpisodeId, stopped.blocked_episode_id);
+    assert.equal(detail.recoveryDeadline, "2026-09-27T00:01:00.000Z");
     assert.match(detail.reason, /identical failure fingerprint exhausted/i);
-    assert.deepEqual(detail.preservedWork, ["/tmp/preserved-repair", "pi-eng-orch-TSK-original"]);
+    assert.deepEqual(detail.preservedWork, [
+      "/tmp/preserved-repair",
+      "pi-eng-orch-TSK-original",
+      "candidate-sha",
+      "one",
+    ]);
     assert.deepEqual(detail.attemptedRecoveries, ["RCV-prior-1", "RCV-prior-2"]);
     assert.match(detail.resumeCondition, /new material evidence|increase the approved recovery budget/i);
 

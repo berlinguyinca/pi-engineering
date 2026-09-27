@@ -23,6 +23,7 @@ export interface RecoveryDecisionInput {
   classification: FailureClassification;
   history: RecoveryDecision[];
   now: number;
+  resumptionGeneration?: number;
 }
 
 const DEFAULT_ACTIONS: Record<FailureCategory, RecoveryAction> = {
@@ -99,11 +100,20 @@ export class FailureClassifier {
 
   private inferCategory(evidence: FailureEvidence): FailureCategory {
     const summary = normalizedSummary(evidence.summary);
+    const providerCode = evidence.providerCode?.trim().toUpperCase();
     if (evidence.providerStatus !== undefined) {
-      if (evidence.providerStatus === 408 || evidence.providerStatus === 429 || evidence.providerStatus >= 500) {
+      if ([408, 425, 429, 500, 502, 503, 504].includes(evidence.providerStatus)) {
         return "PROVIDER_TRANSIENT";
       }
       if (evidence.providerStatus >= 400) return "PROVIDER_PERMANENT";
+    }
+    if (providerCode) {
+      if (
+        ["ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "EAI_AGAIN", "RATE_LIMITED", "OVERLOADED"].includes(providerCode)
+      ) {
+        return "PROVIDER_TRANSIENT";
+      }
+      return "PROVIDER_PERMANENT";
     }
     if (/workspace|scope mismatch|role-access|repository mismatch/.test(summary)) return "WORKSPACE_SCOPE_MISMATCH";
     if (/evidence.*(unavailable|missing|inaccessible)|candidate evidence unavailable/.test(summary)) {
@@ -112,7 +122,17 @@ export class FailureClassifier {
     if (/budget exhausted|execution budget|deadline exceeded|wall.clock timeout/.test(summary)) {
       return "TASK_BUDGET_EXHAUSTED";
     }
-    if (/provider|429|503|rate limit|network|econn|temporar|gateway/.test(summary)) return "PROVIDER_TRANSIENT";
+    if (
+      /invalid.*(api key|credential|model|config)|model.*(not found|does not exist)|auth|unauthorized|forbidden/.test(
+        summary,
+      )
+    ) {
+      return /provider|api key|model|config/.test(summary) ? "PROVIDER_PERMANENT" : "AUTHORIZATION_OR_CREDENTIAL";
+    }
+    if (/429|502|503|504|rate limit|network|econn|temporar|gateway|timeout|connection reset/.test(summary)) {
+      return "PROVIDER_TRANSIENT";
+    }
+    if (/provider/.test(summary)) return "PROVIDER_PERMANENT";
     if (/schema|invalid worker output|malformed output/.test(summary)) return "INVALID_WORKER_OUTPUT";
     if (/validation|test suite|tests? failed|compile|typecheck/.test(summary)) return "VALIDATION_FAILED";
     if (/review|request(ed)? changes/.test(summary)) return "REVIEW_FAILED";
@@ -151,7 +171,12 @@ export class RecoveryPlanner {
     const fingerprint = input.classification.fingerprint;
     const fingerprintAttempts = input.history.filter((decision) => decision.failureFingerprint === fingerprint).length;
     const attempt = fingerprintAttempts + 1;
-    const durableDeadlines = input.history.map((decision) => Date.parse(decision.deadline)).filter(Number.isFinite);
+    const resumptionGeneration =
+      input.resumptionGeneration ?? Math.max(0, ...input.history.map((decision) => decision.resumptionGeneration ?? 0));
+    const durableDeadlines = input.history
+      .filter((decision) => (decision.resumptionGeneration ?? 0) === resumptionGeneration)
+      .map((decision) => Date.parse(decision.deadline))
+      .filter(Number.isFinite);
     const durableDeadline =
       durableDeadlines.length > 0 ? Math.min(...durableDeadlines) : input.now + this.decisionTtlMs;
     const missionExhausted = input.history.length >= this.missionCeiling;
@@ -193,6 +218,7 @@ export class RecoveryPlanner {
       status: "planned",
       decidedAt,
       failureFingerprint: fingerprint,
+      resumptionGeneration,
     };
   }
 }
