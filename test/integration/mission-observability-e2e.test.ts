@@ -244,7 +244,8 @@ test("synthetic mission observability E2E scenario", async () => {
   obs.gatePassed(id);
   walkMission(store, id, "COMPLETE");
   const final = obs.summary(id)!;
-  assert.equal(final.progress.approximatePercent, 100, "100 only after gate passes");
+  assert.equal(final.progress.approximatePercent, 0, "explicitly empty acceptance remains 0% after gate passes");
+  assert.equal(final.workflowProgress.approximatePercent, 100, "workflow completion remains separately visible");
   assert.equal(final.progress.verifiedComplete, true);
   assert.equal(final.health, "complete");
   assert.ok(updates.some((m) => m.includes("100% · VERIFIED COMPLETE ✓")));
@@ -260,7 +261,7 @@ test("synthetic mission observability E2E scenario", async () => {
   const history = obs.projection(id)!.progressHistory;
   assert.ok(history.length >= 5, "history spans the whole journey");
   const pcts = history.map((p) => p.approximatePercent);
-  assert.equal(pcts[pcts.length - 1], 100, "history ends at 100 after gate");
+  assert.equal(pcts[pcts.length - 1], 0, "primary history preserves explicit empty acceptance coverage");
 
   // Persistence: a fresh service over the same store reconstructs the terminal
   // state (verified complete survives restart).
@@ -272,7 +273,8 @@ test("synthetic mission observability E2E scenario", async () => {
     now: nowFn,
   });
   const replayed = obs2.summary(id)!;
-  assert.equal(replayed.progress.approximatePercent, 100);
+  assert.equal(replayed.progress.approximatePercent, 0);
+  assert.equal(replayed.workflowProgress.approximatePercent, 100);
   assert.equal(replayed.progress.verifiedComplete, true);
   assert.equal(replayed.health, "complete");
 });

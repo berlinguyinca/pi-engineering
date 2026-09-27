@@ -56,7 +56,7 @@ export class MissionSupervisor {
   private readonly now: () => number;
   private readonly intervalMs: number;
   private timer?: ReturnType<typeof setInterval>;
-  private ticking?: Promise<SupervisorStatus[]>;
+  private readonly missionTicks = new Map<string, Promise<SupervisorStatus>>();
 
   constructor(options: MissionSupervisorOptions) {
     this.store = options.store;
@@ -89,21 +89,26 @@ export class MissionSupervisor {
   }
 
   tick(missionId?: string): Promise<SupervisorStatus[]> {
-    if (this.ticking) return this.ticking;
-    this.ticking = this.runTick(missionId).finally(() => {
-      this.ticking = undefined;
-    });
-    return this.ticking;
+    return this.runTick(missionId);
   }
 
   private async runTick(missionId?: string): Promise<SupervisorStatus[]> {
     const missions = this.store
       .listMissions((mission) => !TERMINAL.has(mission.status))
       .filter((mission) => (missionId ? mission.mission_id === missionId : true));
-    const statuses: SupervisorStatus[] = [];
-    for (const mission of missions) statuses.push(await this.reconcile(mission));
+    const statuses = await Promise.all(missions.map((mission) => this.reconcileFlight(mission)));
     await this.store.flush();
     return statuses;
+  }
+
+  private reconcileFlight(mission: Mission): Promise<SupervisorStatus> {
+    const existing = this.missionTicks.get(mission.mission_id);
+    if (existing) return existing;
+    const flight = this.reconcile(mission).finally(() => {
+      if (this.missionTicks.get(mission.mission_id) === flight) this.missionTicks.delete(mission.mission_id);
+    });
+    this.missionTicks.set(mission.mission_id, flight);
+    return flight;
   }
 
   private async reconcile(mission: Mission): Promise<SupervisorStatus> {
@@ -205,6 +210,7 @@ export class MissionSupervisor {
         reason: `Named wait ${wait.action} expired at ${wait.deadline}`,
       };
     }
+    if (wait) return null;
     const projectedHealth = this.observability?.summary(mission.mission_id)?.health;
     if (projectedHealth === "stalled") {
       return {
@@ -217,11 +223,12 @@ export class MissionSupervisor {
     const activeExecution = this.store
       .listExecutions(mission.mission_id)
       .some((execution) => execution.status === "RUNNING");
-    const succeeded = new Set(tasks.filter((task) => task.status === "SUCCEEDED").map((task) => task.task_id));
+    const dependencySatisfied = (taskId: string) =>
+      this.store.getTask(taskId)?.status === "SUCCEEDED" || this.store.isTaskSatisfiedBySupersession(taskId);
     const runnable = tasks.find(
       (task) =>
         (task.status === "READY" || task.status === "PENDING" || task.status === "RETRYING") &&
-        task.depends_on.every((dependency) => succeeded.has(dependency)),
+        task.depends_on.every(dependencySatisfied),
     );
     if (!activeExecution && runnable) {
       return {
@@ -234,16 +241,23 @@ export class MissionSupervisor {
     const unresolved = tasks.find(
       (task) =>
         ["PENDING", "READY", "WAITING", "BLOCKED", "RETRYING"].includes(task.status) &&
-        task.depends_on.some((dependency) => !succeeded.has(dependency)),
+        task.depends_on.some((dependency) => !dependencySatisfied(dependency)),
     );
     if (!activeExecution && unresolved && !runnable) {
       return {
         health: "DEADLOCKED",
         category: "DEADLOCKED_DAG",
         reason: `Task ${unresolved.task_id} has unresolved dependencies: ${unresolved.depends_on
-          .filter((dependency) => !succeeded.has(dependency))
+          .filter((dependency) => !dependencySatisfied(dependency))
           .join(", ")}`,
         task: unresolved,
+      };
+    }
+    if (!activeExecution) {
+      return {
+        health: "ORPHANED",
+        category: "ORPHANED_EXECUTION",
+        reason: `Nonterminal mission ${mission.mission_id} has no active worker, runnable task, dependency wait, or named wait`,
       };
     }
     return null;
@@ -289,12 +303,24 @@ export class MissionSupervisor {
   }
 
   private preservedWork(missionId: string): string[] {
+    const currentCheckpoints = new Map<string, ReturnType<MissionStore["listTaskCheckpoints"]>[number]>();
+    for (const checkpoint of this.store.listTaskCheckpoints(missionId)) {
+      const current = currentCheckpoints.get(checkpoint.taskId);
+      if (!current || checkpoint.sequence > current.sequence) currentCheckpoints.set(checkpoint.taskId, checkpoint);
+    }
     return [
       ...new Set(
-        this.store
-          .listTaskCheckpoints(missionId)
-          .flatMap((checkpoint) => [checkpoint.worktree, checkpoint.branch])
-          .filter((value): value is string => typeof value === "string" && value.trim().length > 0),
+        [
+          ...[...currentCheckpoints.values()].flatMap((checkpoint) => [
+            checkpoint.worktree,
+            checkpoint.branch,
+            checkpoint.candidateSha,
+            ...checkpoint.committedChanges,
+            ...checkpoint.preservedUncommittedChanges,
+            ...checkpoint.artifactRefs,
+          ]),
+          ...this.store.listMissionStops(missionId).flatMap((stop) => stop.preservedWork),
+        ].filter((value): value is string => typeof value === "string" && value.trim().length > 0),
       ),
     ];
   }

@@ -231,7 +231,7 @@ export interface MissionObservabilitySummary {
   currentActivity?: CurrentActivity;
   workers: { active: number; waiting: number; failed: number };
   lastHeartbeatAt?: string;
-  lastMeaningfulProgressAt?: string;
+  lastMeaningfulProgressAt: string | null;
   waitingReason?: WaitingReason;
   waitingSince?: string;
   completionStatus: CompletionStatus;
@@ -240,7 +240,7 @@ export interface MissionObservabilitySummary {
   reason: string;
   recovery: { attempt: number; maxAttempts: number };
   nextAction: string;
-  nextActionAt?: string;
+  nextActionAt: string | null;
   owner: string | null;
   repository: string | null;
   task: string | null;

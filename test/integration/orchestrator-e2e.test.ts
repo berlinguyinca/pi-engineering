@@ -1019,6 +1019,39 @@ describe("passive requests — gate-bypass and illegal-transition regressions", 
     );
   });
 
+  it("rejects a reentrant resumption without publishing verified completion", async () => {
+    const backend = JsonlEventStore.inMemory();
+    const store = MissionStore.open(backend);
+    const observability = new MissionObservability({ backend, store });
+    const orchestrator = new Orchestrator({
+      store,
+      observability,
+      backends: {},
+      planner: async () => [],
+    });
+    let resumed = false;
+
+    await assert.rejects(
+      orchestrator.orchestrate("Explain this function", {
+        repository: ".",
+        baseRef: "abc",
+        mutationRequested: false,
+        onProgress: () => {
+          const active = store.listMissions().at(-1);
+          if (active && !resumed) {
+            resumed = true;
+            store.resumeMission(active.mission_id, "reentrant observer resumed mission");
+          }
+        },
+      }),
+      /stale mission resumption at completion/,
+    );
+
+    const missionId = store.listMissions().at(-1)!.mission_id;
+    assert.equal(store.getMission(missionId)?.status, "FINAL_VALIDATION");
+    assert.equal(observability.summary(missionId)?.progress.verifiedComplete, false);
+  });
+
   it("a truly non-executable conversation does not resolve even a protected repository path", async () => {
     const h = harness();
     const result = await h.orchestrator.orchestrate("Explain this function", {

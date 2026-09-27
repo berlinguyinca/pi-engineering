@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import { taskCoverageFingerprint } from "../../src/orchestration/evidence.ts";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
 import { MissionObservability } from "../../src/orchestration/observability/MissionObservability.ts";
 import { MissionOwnership } from "../../src/orchestration/ownership.ts";
@@ -80,6 +81,81 @@ describe("MissionSupervisor", () => {
 
     assert.equal(status?.health, "DEADLOCKED");
     assert.equal(status?.decision?.action, "REPAIR_BLOCKED_MISSION");
+  });
+
+  it("treats transitive successful supersession leaves as satisfied dependencies", async () => {
+    const h = harness();
+    const original = h.store.createTask({
+      task_id: "TSK-original",
+      mission_id: h.mission.mission_id,
+      kind: "agent",
+      role: "implementer",
+      objective: "original work",
+      repo_id: "repo-1",
+    });
+    h.store.transitionTask(original.task_id, "READY");
+    h.store.transitionTask(original.task_id, "RUNNING");
+    h.store.transitionTask(original.task_id, "FAILED");
+    const firstReplacement = h.store.createTask({
+      task_id: "TSK-replacement-1",
+      mission_id: h.mission.mission_id,
+      kind: "agent",
+      role: "implementer",
+      objective: "first replacement",
+      repo_id: "repo-1",
+    });
+    h.store.transitionTask(firstReplacement.task_id, "READY");
+    h.store.transitionTask(firstReplacement.task_id, "RUNNING");
+    h.store.transitionTask(firstReplacement.task_id, "FAILED");
+    h.store.supersedeTask({
+      supersessionId: "SUP-original",
+      missionId: h.mission.mission_id,
+      failedTaskId: original.task_id,
+      replacementTaskIds: [firstReplacement.task_id],
+      repoId: "repo-1",
+      acceptanceIds: [],
+      coverageFingerprint: taskCoverageFingerprint(original),
+      reason: "replace original",
+      createdAt: "2026-09-27T12:00:00.000Z",
+    });
+    const leaf = h.store.createTask({
+      task_id: "TSK-replacement-2",
+      mission_id: h.mission.mission_id,
+      kind: "agent",
+      role: "implementer",
+      objective: "successful leaf",
+      repo_id: "repo-1",
+    });
+    h.store.transitionTask(leaf.task_id, "READY");
+    h.store.transitionTask(leaf.task_id, "RUNNING");
+    h.store.transitionTask(leaf.task_id, "SUCCEEDED");
+    h.store.supersedeTask({
+      supersessionId: "SUP-replacement",
+      missionId: h.mission.mission_id,
+      failedTaskId: firstReplacement.task_id,
+      replacementTaskIds: [leaf.task_id],
+      repoId: "repo-1",
+      acceptanceIds: [],
+      coverageFingerprint: taskCoverageFingerprint(firstReplacement),
+      reason: "replace failed replacement",
+      createdAt: "2026-09-27T12:00:01.000Z",
+    });
+    const dependent = h.store.createTask({
+      task_id: "TSK-dependent",
+      mission_id: h.mission.mission_id,
+      kind: "agent",
+      role: "implementer",
+      objective: "depends on recovered work",
+      depends_on: [original.task_id],
+      repo_id: "repo-1",
+    });
+    h.store.transitionTask(dependent.task_id, "READY");
+
+    const [status] = await h.supervisor.tick();
+
+    assert.equal(status?.health, "ORPHANED");
+    assert.equal(status?.task, dependent.task_id);
+    assert.equal(status?.decision?.action, "FENCE_RECONCILE_AND_RESUME");
   });
 
   it("detects an expired controller lease independently of worker events", async () => {
@@ -172,5 +248,45 @@ describe("MissionSupervisor", () => {
     assert.equal(observedDecisions, 1, "startup reconciliation must durably schedule recovery before dispatch");
     assert.equal(h.store.listRecoveryDecisions(h.mission.mission_id).length, 1);
     assert.equal(h.store.listFailureClassifications(h.mission.mission_id).length, 1);
+  });
+
+  it("durably recovers an executing mission with zero tasks instead of reporting healthy", async () => {
+    const h = harness();
+
+    const [status] = await h.supervisor.tick();
+
+    assert.notEqual(status?.health, "HEALTHY");
+    assert.notEqual(status?.action, "MONITOR");
+    assert.ok(status?.decision ?? h.store.listMissionStops(h.mission.mission_id).at(-1));
+  });
+
+  it("keeps concurrent targeted ticks scoped to their requested missions", async () => {
+    const h = harness();
+    const second = h.store.createMission({
+      title: "second mission",
+      goal: "finish second",
+      user_request: "finish second",
+      repository: "/repo",
+      base_ref: "main",
+      risk_profile: "medium",
+      workflow_class: "engineering",
+    });
+    for (const status of ["CLASSIFYING", "PLANNING", "READY", "EXECUTING"] as const) {
+      h.store.transitionMission(second.mission_id, status);
+    }
+
+    const [firstStatuses, secondStatuses] = await Promise.all([
+      h.supervisor.tick(h.mission.mission_id),
+      h.supervisor.tick(second.mission_id),
+    ]);
+
+    assert.deepEqual(
+      firstStatuses.map((status) => status.missionId),
+      [h.mission.mission_id],
+    );
+    assert.deepEqual(
+      secondStatuses.map((status) => status.missionId),
+      [second.mission_id],
+    );
   });
 });

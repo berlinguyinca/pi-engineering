@@ -877,9 +877,9 @@ export class Orchestrator {
       }
       const finalized = await this.finalizeMission(
         missionId,
+        expectedResumptionGeneration,
         signal,
         repairDecision.action === "CREATE_REPAIR_TASKS" ? candidateIdentityBefore : undefined,
-        expectedResumptionGeneration,
       );
       this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
       this.store.transitionRecovery(repairDecision.recoveryId, finalized.completed ? "succeeded" : "failed");
@@ -1207,6 +1207,7 @@ export class Orchestrator {
       workflow_class: intent.suggested_workflow,
       parent_session_id: this.parentSessionId,
     });
+    const expectedResumptionGeneration = this.store.listMissionResumptions(mission.mission_id).at(-1)?.generation ?? 0;
     if (this.ownership) {
       this.ownershipByMission.set(mission.mission_id, await this.ownership.acquire(mission.mission_id));
     }
@@ -1347,13 +1348,10 @@ export class Orchestrator {
         this.store.transitionMission(mission.mission_id, "READY");
         this.store.transitionMission(mission.mission_id, "EXECUTING");
         this.store.transitionMission(mission.mission_id, "FINAL_VALIDATION");
-        this.observeGatePassed(mission.mission_id);
         this.store.completeMission(mission.mission_id, {
-          expectedResumptionGeneration:
-            this.ownershipByMission.get(mission.mission_id)?.resumptionGeneration ??
-            this.store.listMissionResumptions(mission.mission_id).at(-1)?.generation ??
-            0,
+          expectedResumptionGeneration,
         });
+        this.observeGatePassed(mission.mission_id);
         const final = this.store.getMission(mission.mission_id)!;
         const verdict = this.gate.evaluate(final);
         return {
@@ -1563,7 +1561,7 @@ export class Orchestrator {
         };
       }
 
-      const finalized = await this.finalizeMission(mission.mission_id, opts.signal);
+      const finalized = await this.finalizeMission(mission.mission_id, expectedResumptionGeneration, opts.signal);
       return { ...finalized, intent };
     } finally {
       this.progress.delete(mission.mission_id);
@@ -1596,6 +1594,7 @@ export class Orchestrator {
    * down the mission is left paused (call again on the next probe).
    */
   async resume(missionId: string, opts?: { force?: boolean; signal?: AbortSignal }): Promise<Mission> {
+    const expectedResumptionGeneration = this.store.listMissionResumptions(missionId).at(-1)?.generation ?? 0;
     this.activateMissionRepository(missionId);
     const mission = this.store.getMission(missionId);
     if (!mission) throw new Error(`unknown mission ${missionId}`);
@@ -1613,7 +1612,7 @@ export class Orchestrator {
       const resumed = this.store.getMission(missionId)!;
       if (resumed.status === "PAUSED_INFRASTRUCTURE") return resumed;
       if (opts?.signal?.aborted) return this.cancelMission(missionId);
-      return (await this.finalizeMission(missionId, opts?.signal)).mission;
+      return (await this.finalizeMission(missionId, expectedResumptionGeneration, opts?.signal)).mission;
     } finally {
       const identity = this.ownershipByMission.get(missionId);
       if (identity && this.ownership) {
@@ -1637,11 +1636,9 @@ export class Orchestrator {
   /** Complete the lifecycle after scheduler work settles, whether initial or resumed. */
   private async finalizeMission(
     missionId: string,
+    expectedResumptionGeneration: number,
     signal?: AbortSignal,
     requiredCandidateChangeFrom?: string | null,
-    expectedResumptionGeneration = this.ownershipByMission.get(missionId)?.resumptionGeneration ??
-      this.store.listMissionResumptions(missionId).at(-1)?.generation ??
-      0,
   ): Promise<FinalizationResult> {
     if (signal?.aborted) return this.canceledFinalization(missionId);
     await this.reconcileCommittedPromotions(missionId);
@@ -1891,7 +1888,7 @@ export class Orchestrator {
       if (pre !== "FINAL_VALIDATION" && pre !== "REVIEWING") {
         this.store.transitionMission(missionId, "FINAL_VALIDATION");
       }
-      this.observeGatePassed(missionId);
+      this.store.completeMission(missionId, { expectedResumptionGeneration });
       for (const taskId of verdict.superseded_by_recovery ?? []) {
         this.store.addFinding({
           mission_id: missionId,
@@ -1905,7 +1902,7 @@ export class Orchestrator {
           recommended_action: "None required; recorded so the completion over a failed task is auditable.",
         });
       }
-      this.store.completeMission(missionId, { expectedResumptionGeneration });
+      this.observeGatePassed(missionId);
       this.phase(this.store.getMission(missionId)!, "complete");
       return {
         mission: this.store.getMission(missionId)!,

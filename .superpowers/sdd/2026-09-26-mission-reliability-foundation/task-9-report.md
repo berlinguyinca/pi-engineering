@@ -55,3 +55,34 @@ Implemented the clock-driven mission supervisor, acceptance-first progress, work
 ## Known boundary
 
 Runtime lifecycle wiring that starts/stops the supervisor belongs to Task 10 by plan. Task 9 supplies and verifies `start`, `stop`, `tick`, and `reconcileOnStartup` without changing `EngineeringRuntime` lifecycle ownership.
+
+## Fix round 1
+
+Addressed all six review findings with failing regressions before implementation:
+
+- Mission finalization now captures a required resumption generation before ownership awaits or observer callbacks. Completion performs the store CAS before publishing verified-complete observability, and no call path can adopt a later generation through a default fallback. A reentrant progress callback that resumes the mission now causes stale finalization to fail without publishing verified completion.
+- Supervisor dependency readiness uses `isTaskSatisfiedBySupersession` for both runnable and unresolved classification, including transitive replacement leaves.
+- An explicitly present empty `acceptanceIds` contract remains 0% primary coverage even after verified completion. Only `undefined` retains legacy workflow fallback, while workflow completion remains separately reported.
+- Every nonterminal mission without an active execution, runnable work, unresolved dependency, or named wait is classified for durable orphan recovery; zero-task `EXECUTING` missions cannot report `HEALTHY`/`MONITOR` only.
+- Supervisor single-flight state is mission-scoped, so concurrent targeted ticks for distinct missions return only their requested mission while overlapping full/targeted ticks can coalesce per mission.
+- Snapshot timing fields serialize explicit `null` values. Preserved work is the deduplicated union of each task's latest checkpoint refs and durable stop refs, including stopped work visible during a later recovery generation.
+
+### Fix-round RED evidence
+
+- `node --test test/unit/mission-supervisor.test.ts test/unit/observability-progress.test.ts test/unit/orchestration-snapshot-observability.test.ts test/integration/orchestrator-e2e.test.ts`
+  - Result before implementation: **59 passed, 6 failed**, one intentional failure for each review finding.
+- The broader observability run then exposed the stale legacy assumption that explicit empty acceptance could become 100%; the updated history assertion failed until history computation used the same acceptance-first contract as the summary.
+
+### Fix-round verification
+
+- Focused reliability/integration matrix (`task-9-fix1-focused.log`): **187 passed, 0 failed**.
+- `npm run typecheck` (`task-9-fix1-typecheck.log`): passed.
+- `npm run lint` (`task-9-fix1-lint.log`): passed; Biome checked 587 files.
+- `npm test` (`task-9-fix1-full-suite.log`): **2567 passed, 0 failed, 1 skipped** (Postgres integration requires `TEST_DATABASE_URL`).
+- `git diff --check`: passed.
+
+### Fix-round reviewer focus
+
+- Resumption races before finalization versus reentrant observers after a successful completion CAS.
+- Per-mission supervisor flight cleanup when full and targeted ticks overlap.
+- Whether latest-per-task checkpoint selection and cross-generation stop refs expose all recoverable work without reviving stale checkpoint versions.

@@ -191,9 +191,7 @@ export function computeProgress(input: ProgressInput): ProgressResult {
       ? workflowPercent
       : acceptanceTotal > 0
         ? Math.floor((acceptanceCompleted / acceptanceTotal) * 100)
-        : complete
-          ? 100
-          : 0;
+        : 0;
   const basis = input.basis ?? "weighted_dag";
 
   const historyPoint: ProgressHistoryPoint = {

@@ -315,7 +315,7 @@ test("change hook fires for activity and sampled heartbeats so snapshot publishe
   assert.equal(obs.projection(id)?.summary.lastHeartbeatAt, clk.now());
 });
 
-test("100% VERIFIED COMPLETE only after the CompletionGate passes", async () => {
+test("verified completion does not turn an explicit empty acceptance contract into 100%", async () => {
   const h = harness();
   const id = makeMission(h);
   h.obs.missionCreated(id, "M");
@@ -341,7 +341,8 @@ test("100% VERIFIED COMPLETE only after the CompletionGate passes", async () => 
   // Gate passes.
   h.obs.markVerifiedComplete(id);
   await h.obs.flush();
-  assert.equal(h.obs.summary(id)!.progress.approximatePercent, 100);
+  assert.equal(h.obs.summary(id)!.progress.approximatePercent, 0);
+  assert.equal(h.obs.summary(id)!.workflowProgress.approximatePercent, 100);
   assert.equal(h.obs.summary(id)!.progress.verifiedComplete, true);
   assert.ok(h.updates.some((m) => m.includes("100% · VERIFIED COMPLETE ✓")));
 });

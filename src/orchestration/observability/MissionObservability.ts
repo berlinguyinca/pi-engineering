@@ -658,6 +658,7 @@ export class MissionObservability {
       units: s.taskUnits,
       weights: s.taskWeights,
       creditRunningWithoutUnits: true,
+      ...this.acceptanceProgress(s.missionId),
     });
     return res.approximatePercent;
   }
@@ -1152,7 +1153,7 @@ export class MissionObservability {
       currentActivity: s.currentActivity,
       workers: workerCounts,
       lastHeartbeatAt: s.lastHeartbeatAt,
-      lastMeaningfulProgressAt: s.lastMeaningfulProgressAt,
+      lastMeaningfulProgressAt: s.lastMeaningfulProgressAt ?? null,
       waitingReason: health.waitingReason ?? s.waitingReason,
       waitingSince: s.waitingSince,
       completionStatus: s.completionStatus,
@@ -1264,12 +1265,35 @@ export class MissionObservability {
         maxAttempts: recovery?.maxAttempts ?? 0,
       },
       nextAction,
-      ...(recovery?.nextActionAt ? { nextActionAt: recovery.nextActionAt } : {}),
+      nextActionAt: recovery?.nextActionAt ?? null,
       owner: lease?.ownerId ?? null,
       repository: task?.repo_id ?? manifest?.repositories[0]?.repoId ?? null,
       task: task?.task_id ?? null,
-      preservedWork: [...(stop?.preservedWork ?? [])],
+      preservedWork: this.preservedWork(missionId),
     };
+  }
+
+  private preservedWork(missionId: string): string[] {
+    const currentCheckpoints = new Map<string, ReturnType<MissionStore["listTaskCheckpoints"]>[number]>();
+    for (const checkpoint of this.store.listTaskCheckpoints(missionId)) {
+      const current = currentCheckpoints.get(checkpoint.taskId);
+      if (!current || checkpoint.sequence > current.sequence) currentCheckpoints.set(checkpoint.taskId, checkpoint);
+    }
+    return [
+      ...new Set(
+        [
+          ...[...currentCheckpoints.values()].flatMap((checkpoint) => [
+            checkpoint.worktree,
+            checkpoint.branch,
+            checkpoint.candidateSha,
+            ...checkpoint.committedChanges,
+            ...checkpoint.preservedUncommittedChanges,
+            ...checkpoint.artifactRefs,
+          ]),
+          ...this.store.listMissionStops(missionId).flatMap((missionStop) => missionStop.preservedWork),
+        ].filter((value): value is string => typeof value === "string" && value.trim().length > 0),
+      ),
+    ];
   }
 
   private currentHealth(s: MissionObsState, status: string): { health: MissionHealth; waitingReason?: WaitingReason } {

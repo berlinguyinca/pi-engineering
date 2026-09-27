@@ -40,7 +40,7 @@ export interface MissionObservabilitySnapshot {
   currentActivity?: { type: string; summary: string; workerId?: string } | null;
   workers: { active: number; waiting: number; failed: number };
   lastHeartbeatAt?: string;
-  lastMeaningfulProgressAt?: string;
+  lastMeaningfulProgressAt: string | null;
   waitingReason?: string;
   completionStatus: string;
   progressHistory: Array<{
@@ -78,7 +78,7 @@ export interface MissionObservabilitySnapshot {
   reason: string;
   recoveryAttempt: { attempt: number; maxAttempts: number };
   nextAction: string;
-  nextActionAt?: string;
+  nextActionAt: string | null;
   owner: string | null;
   repository: string | null;
   task: string | null;

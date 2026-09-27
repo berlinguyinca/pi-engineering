@@ -118,3 +118,93 @@ test("snapshot includes full observability section when projection present", asy
   assert.ok(ob.progressHistory.length >= 1);
   assert.equal(ob.review.blockingOpen, 0);
 });
+
+test("snapshot writes nullable timing fields and combines checkpoint and stopped work during recovery", () => {
+  const backend = JsonlEventStore.inMemory();
+  const store = MissionStore.open(backend);
+  const obs = new MissionObservability({ backend, store });
+  const m = mission(store, "Recoverable mission");
+  obs.missionCreated(m.mission_id, m.title);
+  const task = store.createTask({
+    task_id: "TSK-preserved",
+    mission_id: m.mission_id,
+    kind: "agent",
+    role: "implementer",
+    objective: "preserve work",
+    repo_id: "repo-1",
+  });
+  const execution = store.createExecution({
+    task_id: task.task_id,
+    mission_id: m.mission_id,
+    backend: "agent",
+  });
+  store.checkpointTask({
+    checkpointId: "CHK-preserved",
+    executionId: execution.execution_id,
+    missionId: m.mission_id,
+    taskId: task.task_id,
+    repoId: "repo-1",
+    baseSha: "base",
+    candidateSha: "candidate",
+    branch: "branch-preserved",
+    worktree: "/tmp/worktree-preserved",
+    committedChanges: ["commit-preserved"],
+    preservedUncommittedChanges: ["artifact://dirty.patch"],
+    completedDeliverables: [],
+    remainingDeliverables: ["finish"],
+    acceptanceIds: [],
+    validationEvidenceRefs: [],
+    artifactRefs: ["artifact://checkpoint"],
+    artifactHashes: [],
+    workerId: null,
+    sessionId: null,
+    model: null,
+    sequence: 1,
+    missionGeneration: 0,
+    candidateGeneration: 0,
+    fencingToken: 0,
+    createdAt: "2026-09-27T12:00:00.000Z",
+  });
+  store.stopMission(m.mission_id, {
+    reason: "operator input required",
+    preservedWork: ["artifact://stopped-work"],
+    attemptedRecoveries: [],
+    resumeCondition: "provide input",
+  });
+  store.resumeMission(m.mission_id, "input arrived");
+  const classification = store.classifyFailure({
+    classificationId: "FC-recovery",
+    missionId: m.mission_id,
+    taskId: task.task_id,
+    executionId: null,
+    category: "ORPHANED_EXECUTION",
+    evidenceRefs: [],
+    fingerprint: "sha256:ongoing",
+    summary: "ongoing recovery",
+    classifiedAt: "2026-09-27T12:00:01.000Z",
+  });
+  store.planRecovery({
+    recoveryId: "RCV-ongoing",
+    missionId: m.mission_id,
+    classificationId: classification.classificationId,
+    action: "FENCE_RECONCILE_AND_RESUME",
+    expectedMaterialChange: "resume preserved work",
+    attempt: 1,
+    maxAttempts: 2,
+    deadline: "2026-09-27T12:10:00.000Z",
+    nextActionAt: "2026-09-27T12:01:00.000Z",
+    status: "planned",
+    decidedAt: "2026-09-27T12:00:01.000Z",
+    resumptionGeneration: 1,
+  });
+
+  const projection = obs.projection(m.mission_id)!;
+  const snapshot = buildMissionSnapshotFile([{ mission: m, tasks: [task], findings: [], observability: projection }])
+    .missions[0]!.observability!;
+
+  assert.equal(snapshot.lastMeaningfulProgressAt, null);
+  assert.equal(snapshot.nextActionAt, "2026-09-27T12:01:00.000Z");
+  assert.ok(snapshot.preservedWork.includes("/tmp/worktree-preserved"));
+  assert.ok(snapshot.preservedWork.includes("branch-preserved"));
+  assert.ok(snapshot.preservedWork.includes("artifact://stopped-work"));
+});
