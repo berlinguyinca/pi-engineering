@@ -777,6 +777,8 @@ export class MissionScheduler {
     // mission left PAUSED_INFRASTRUCTURE (resumed or canceled elsewhere).
     const stillPaused = () =>
       missionId === undefined || this.store.getMission(missionId)?.status === "PAUSED_INFRASTRUCTURE";
+    const recoveryTask = () =>
+      missionId === undefined ? undefined : this.store.listTasks(missionId).find((task) => task.status === "RETRYING");
     for (let n = 0; this.clockNow() < deadlineMs; n++) {
       if (signal?.aborted || !stillPaused()) return false;
       const probed = await this.abortable(this.probe.probe(), signal);
@@ -790,12 +792,35 @@ export class MissionScheduler {
         cfg.probe_interval_ms * 2 ** Math.min(n, 30),
       );
       const jitter = cfg.jitter_ms > 0 ? Math.round(cfg.jitter_ms * this.rand()) : 0;
-      const waited = await this.abortable(
-        this.sleepFn(Math.min(result.retry_after_ms ?? backoff + jitter, Math.max(0, deadlineMs - this.clockNow()))),
-        signal,
-      );
+      const waitMs = Math.min(result.retry_after_ms ?? backoff + jitter, Math.max(0, deadlineMs - this.clockNow()));
+      const task = recoveryTask();
+      if (missionId !== undefined) {
+        this.onStatus?.({
+          missionId,
+          taskId: task?.task_id ?? "recovery",
+          status: "PAUSED_INFRASTRUCTURE",
+          action: "retrying",
+          reason: result.reason ?? result.scheduler_state ?? "gateway recovery probe is still unhealthy",
+          attempt: task?.attempt ?? n + 1,
+          nextActionAt: this.clockNow() + waitMs,
+          terminal: false,
+        });
+      }
+      const waited = await this.abortable(this.sleepFn(waitMs), signal);
       if (waited.aborted) return false;
       if (this.clockNow() >= deadlineMs || signal?.aborted) break;
+    }
+    if (missionId !== undefined && stillPaused() && !signal?.aborted && this.clockNow() >= deadlineMs) {
+      const task = recoveryTask();
+      this.onStatus?.({
+        missionId,
+        taskId: task?.task_id ?? "recovery",
+        status: "PAUSED_INFRASTRUCTURE",
+        action: "paused",
+        reason: `auto-recovery horizon exhausted at ${new Date(deadlineMs).toISOString()}`,
+        attempt: task?.attempt ?? 0,
+        terminal: true,
+      });
     }
     return false;
   }

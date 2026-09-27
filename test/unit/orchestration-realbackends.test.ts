@@ -221,6 +221,28 @@ describe("realBackends capability routing", () => {
     assert.ok(activity.some((event) => /reduced independence/i.test(event.summary)));
   });
 
+  it("warns about reduced independence even when a custom worker's current model identity is unknown", async () => {
+    const seen: WorkerRequest[] = [];
+    const activity: import("../../src/workers/WorkerExecutor.ts").WorkerActivity[] = [];
+    const backends = realBackends({
+      worker: capturingWorker(seen),
+      verifier: {} as never,
+      artifacts: {} as never,
+      git: null,
+      cwd: "/repo",
+      routeModel: async () => undefined,
+    });
+
+    await backends.review.runReview({
+      objective: "review",
+      signal: new AbortController().signal,
+      onActivity: (event) => activity.push(event),
+    });
+
+    assert.equal(seen[0]?.modelOverride, undefined);
+    assert.ok(activity.some((event) => /current worker model.*reduced independence/i.test(event.summary)));
+  });
+
   it("gives the reviewer the same wall-clock budget as implementation workers", async () => {
     // Without an explicit budget the executor's 5-minute default aborted
     // reviewers mid-analysis.

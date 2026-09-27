@@ -16,7 +16,7 @@ import {
 } from "../../src/gateway/streamRetry.ts";
 import { type BrokerBackends, ExecutionBroker } from "../../src/orchestration/broker.ts";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
-import { MissionScheduler } from "../../src/orchestration/scheduler.ts";
+import { MissionScheduler, type MissionSchedulerStatusNotice } from "../../src/orchestration/scheduler.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 import { DEFAULT_GATEWAY_RESILIENCE, resolveGatewayResilienceConfig } from "../../src/resilience/config.ts";
 
@@ -490,6 +490,7 @@ function schedulerHarness(opts: {
   let now = 0;
   let calls = 0;
   let probes = 0;
+  const notices: MissionSchedulerStatusNotice[] = [];
   const scheduler = new MissionScheduler({
     store,
     broker: new ExecutionBroker({
@@ -517,6 +518,9 @@ function schedulerHarness(opts: {
       now += ms;
     },
     rand: () => 0,
+    onStatus: (notice) => {
+      notices.push(notice);
+    },
   });
   return {
     store,
@@ -524,6 +528,7 @@ function schedulerHarness(opts: {
     t,
     scheduler,
     stats: () => ({ calls, probes, now }),
+    notices,
   };
 }
 
@@ -586,5 +591,28 @@ describe("long-wait policy: relaunch cost and ceilings", () => {
     const before = h.stats().probes;
     assert.equal(await h.scheduler.awaitRecovery(20 * HOUR, undefined, h.m.mission_id), false);
     assert.equal(h.stats().probes, before, "no probing for a mission that is not paused");
+  });
+
+  it("awaitRecovery publishes every next probe and clearly stops when its horizon expires", async () => {
+    const h = schedulerHarness({
+      resilience: { probe_interval_ms: 100, max_backoff_ms: 200 },
+      healthy: () => false,
+      down: () => true,
+    });
+    h.store.transitionMission(h.m.mission_id, "PAUSED_INFRASTRUCTURE");
+
+    assert.equal(await h.scheduler.awaitRecovery(500, undefined, h.m.mission_id), false);
+    const scheduled = h.notices.filter((notice) => notice.action === "retrying");
+    assert.ok(scheduled.length >= 2, JSON.stringify(h.notices));
+    assert.ok(scheduled.every((notice) => typeof notice.nextActionAt === "number"));
+    assert.ok(
+      h.notices.some(
+        (notice) =>
+          notice.action === "paused" &&
+          notice.terminal === true &&
+          /auto-recovery horizon exhausted/i.test(notice.reason),
+      ),
+      JSON.stringify(h.notices),
+    );
   });
 });

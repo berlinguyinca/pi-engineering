@@ -262,25 +262,23 @@ export function realBackends(opts: RealBackendsOptions) {
           timeoutMs: workerTimeoutMs(),
         };
         const routed = await opts.routeModel?.(req.role);
-        const modelRoute =
-          routed ??
-          (opts.reviewFallbackModel
-            ? {
-                ...opts.reviewFallbackModel,
-                warning: `Warning: no distinct reviewer model is available; reviewing with ${opts.reviewFallbackModel.provider}/${opts.reviewFallbackModel.id} in a fresh session with reduced independence.`,
-              }
-            : undefined);
+        const modelRoute = routed ?? opts.reviewFallbackModel;
+        const fallbackWarning = routed
+          ? routed.warning
+          : opts.reviewFallbackModel
+            ? `Warning: no distinct reviewer model is available; reviewing with ${opts.reviewFallbackModel.provider}/${opts.reviewFallbackModel.id} in a fresh session with reduced independence.`
+            : "Warning: no distinct reviewer model is available; reviewing with the current worker model in a fresh session with reduced independence.";
         if (modelRoute) {
           req.modelOverride = { provider: modelRoute.provider, id: modelRoute.id };
-          if (modelRoute.warning) {
-            input.onActivity?.({
-              kind: "execution",
-              stage: "review",
-              phase: "started",
-              summary: modelRoute.warning,
-              meaningfulProgress: false,
-            });
-          }
+        }
+        if (fallbackWarning) {
+          input.onActivity?.({
+            kind: "execution",
+            stage: "review",
+            phase: "started",
+            summary: fallbackWarning,
+            meaningfulProgress: false,
+          });
         }
         const run = await runWorker(req, input);
         const outcome = outcomeOf(run);
