@@ -340,6 +340,52 @@ export interface CandidateEvidenceIdentity {
   artifactHashes: string[];
 }
 
+/** The independently persisted revision that gate evidence must match exactly. */
+export interface CandidateRevision {
+  missionId: EntityId;
+  identity: CandidateEvidenceIdentity;
+  identityHash: string;
+  reason: string;
+  recordedAt: string;
+}
+
+export interface ValidationEvidence {
+  evidenceId: EntityId;
+  missionId: EntityId;
+  taskId: EntityId;
+  executionId: EntityId;
+  identity: CandidateEvidenceIdentity;
+  identityHash: string;
+  command: string;
+  profile: string;
+  exitCode: number;
+  testSummary: Record<string, unknown>;
+  noTargets: boolean;
+  accessible: boolean;
+  recordedAt: string;
+}
+
+export type ReviewVerdict = "approve" | "request_changes";
+export type ReviewIndependenceMode = "independent" | "same_model_reduced";
+
+export interface ReviewEvidence {
+  evidenceId: EntityId;
+  missionId: EntityId;
+  taskId: EntityId;
+  executionId: EntityId;
+  identity: CandidateEvidenceIdentity;
+  identityHash: string;
+  reviewerSessionId: string;
+  model: string;
+  provider: string;
+  verdict: ReviewVerdict;
+  independenceMode: ReviewIndependenceMode;
+  findings: Array<Pick<ReviewFinding, "severity" | "summary" | "status">>;
+  outputValid: boolean;
+  accessible: boolean;
+  recordedAt: string;
+}
+
 export type FailureCategory =
   | "WORKSPACE_SCOPE_MISMATCH"
   | "EVIDENCE_UNAVAILABLE"

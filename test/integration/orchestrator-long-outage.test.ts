@@ -33,8 +33,35 @@ function run(outageMs: number) {
             }
           : ok,
     },
-    validation: { runValidation: async () => ok },
-    review: { runReview: async () => ({ ...ok, findings: [] }) },
+    validation: {
+      runValidation: async () => ({
+        ...ok,
+        validationEvidence: {
+          command: "npm test",
+          profile: "test",
+          exitCode: 0,
+          testSummary: { passed: 1 },
+          noTargets: false,
+          accessible: true,
+        },
+      }),
+    },
+    review: {
+      runReview: async () => ({
+        ...ok,
+        findings: [],
+        reviewEvidence: {
+          reviewerSessionId: "review-long-outage",
+          model: "test",
+          provider: "test",
+          verdict: "approve",
+          independenceMode: "independent",
+          findings: [],
+          outputValid: true,
+          accessible: true,
+        },
+      }),
+    },
   };
   const orchestrator = new Orchestrator({
     store,

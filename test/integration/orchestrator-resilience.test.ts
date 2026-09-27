@@ -74,7 +74,21 @@ function harness(opts: HarnessOpts) {
         if (calls.validation <= (opts.validationFailTimes ?? 0)) {
           return { executionId: "e", exitStatus: "failed", summary: "suite red", artifactRefs: [], usage: {} };
         }
-        return { executionId: "e", exitStatus: "succeeded", summary: "valid", artifactRefs: [], usage: {} };
+        return {
+          executionId: "e",
+          exitStatus: "succeeded",
+          summary: "valid",
+          artifactRefs: [],
+          usage: {},
+          validationEvidence: {
+            command: "npm test",
+            profile: "test",
+            exitCode: 0,
+            testSummary: { passed: 1 },
+            noTargets: false,
+            accessible: true,
+          },
+        };
       },
     },
     review: {
@@ -87,6 +101,16 @@ function harness(opts: HarnessOpts) {
           artifactRefs: [],
           usage: {},
           findings: [],
+          reviewEvidence: {
+            reviewerSessionId: "review-resilience",
+            model: "test",
+            provider: "test",
+            verdict: "approve",
+            independenceMode: "independent",
+            findings: [],
+            outputValid: true,
+            accessible: true,
+          },
         };
       },
     },

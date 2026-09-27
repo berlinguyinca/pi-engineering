@@ -107,6 +107,20 @@ function harness(opts: HarnessOpts = {}): Harness {
           artifactRefs: [],
           usage: {},
           findings,
+          reviewEvidence: {
+            reviewerSessionId: "review-session",
+            model: "test-reviewer",
+            provider: "test",
+            verdict: findings.length > 0 ? ("request_changes" as const) : ("approve" as const),
+            independenceMode: "independent" as const,
+            findings: findings.map((finding) => ({
+              severity: "blocking" as const,
+              summary: String(finding.summary),
+              status: "open" as const,
+            })),
+            outputValid: true,
+            accessible: true,
+          },
         };
       },
     },
@@ -135,7 +149,21 @@ function harness(opts: HarnessOpts = {}): Harness {
             usage: {},
           };
         }
-        return { executionId: "e", exitStatus: "succeeded", summary: "valid", artifactRefs: [], usage: {} };
+        return {
+          executionId: "e",
+          exitStatus: "succeeded",
+          summary: "valid",
+          artifactRefs: [],
+          usage: {},
+          validationEvidence: {
+            command: "npm test",
+            profile: "test",
+            exitCode: 0,
+            testSummary: { passed: 1, failed: 0 },
+            noTargets: false,
+            accessible: true,
+          },
+        };
       },
     },
     process: {
@@ -694,6 +722,14 @@ describe("mission progress visibility — onProgress streams while the mission r
           summary: "ok",
           artifactRefs: [],
           usage: {},
+          validationEvidence: {
+            command: "npm test",
+            profile: "test",
+            exitCode: 0,
+            testSummary: { passed: 1 },
+            noTargets: false,
+            accessible: true,
+          },
         }),
       },
       review: {
@@ -704,6 +740,16 @@ describe("mission progress visibility — onProgress streams while the mission r
           artifactRefs: [],
           usage: {},
           findings: [],
+          reviewEvidence: {
+            reviewerSessionId: "review-observability",
+            model: "test",
+            provider: "test",
+            verdict: "approve",
+            independenceMode: "independent",
+            findings: [],
+            outputValid: true,
+            accessible: true,
+          },
         }),
       },
     };
@@ -1003,6 +1049,14 @@ describe("acceptance scenario F — state survives orchestrator restart", () => 
           summary: "valid",
           artifactRefs: [],
           usage: {},
+          validationEvidence: {
+            command: "npm test",
+            profile: "test",
+            exitCode: 0,
+            testSummary: { passed: 1 },
+            noTargets: false,
+            accessible: true,
+          },
         }),
       },
       review: {
@@ -1012,6 +1066,16 @@ describe("acceptance scenario F — state survives orchestrator restart", () => 
           summary: "reviewed",
           artifactRefs: [],
           usage: {},
+          reviewEvidence: {
+            reviewerSessionId: "review-restart",
+            model: "test",
+            provider: "test",
+            verdict: "approve",
+            independenceMode: "independent",
+            findings: [],
+            outputValid: true,
+            accessible: true,
+          },
         }),
       },
     };

@@ -1,46 +1,20 @@
-/**
- * Deterministic completion gate (spec 07).
- *
- * A mission may transition to COMPLETE only if:
- *   - all required gates are satisfied,
- *   - no blocking findings remain,
- *   - no required task is still running,
- *   - validation evidence exists where required,
- *   - independent review evidence exists where required.
- *
- * This is application logic, not a prompt: the model cannot mark a failing
- * mission complete.
- */
-
+import { evidenceIdentitiesEqual, hashCandidateEvidenceIdentity } from "./evidence.ts";
 import type { MissionStore } from "./missionStore.ts";
-import type { CompletionVerdict, Mission, OrchestrationTask, RequiredGate } from "./types.ts";
+import type { CompletionVerdict, Mission, RequiredGate } from "./types.ts";
 
 export interface GateEvidence {
   missionId: string;
   validationsPassed: number;
   reviewsCompleted: number;
-  /**
-   * Successful reviews performed by a security reviewer. Counted separately so a
-   * generic reviewer cannot satisfy a `security_review` gate (spec 07).
-   */
   securityReviewsCompleted: number;
-  /** Findings keyed by finding_id with status. */
   findings: Array<{ finding_id: string; severity: string; status: string }>;
-  /**
-   * Tasks whose committed work was recovered after a wall-clock timeout: the
-   * broker recorded their exact worker commit as merged by a SUCCEEDED
-   * integration (`Execution.recovered_merged`), and after that integration a
-   * validation SUCCEEDED and a review SUCCEEDED that was explicitly asked to
-   * verify the task's objective is fully met (`Execution.reviewed_recovered`).
-   * Structured evidence only — integration summaries are prose, never parsed.
-   *
-   * Conservative by design: a mission with no review step can never supersede
-   * a recovered task (a green build does not prove a timed-out worker finished
-   * its objective). "After" is store insertion order, which is creation order
-   * because post-execution runs integration, validation and review
-   * sequentially.
-   */
   recoveredTasks: string[];
+  validationProblem?: string;
+  reviewProblem?: string;
+  acceptanceProblems?: string[];
+  activeExecutionProblems?: string[];
+  terminalTaskProblems?: string[];
+  supersessionProblems?: string[];
 }
 
 export class CompletionGate {
@@ -50,145 +24,251 @@ export class CompletionGate {
     this.store = store;
   }
 
-  /** Evaluate whether a mission may complete, given current state. */
-  evaluate(mission: Mission, evidence: GateEvidence = this.gather(mission.mission_id)): CompletionVerdict {
+  evaluate(mission: Mission): CompletionVerdict {
+    const evidence = this.gather(mission.mission_id);
     const reasons: string[] = [];
     const missingGates: RequiredGate[] = [];
     const tasks = this.store.listTasks(mission.mission_id);
+    const running = tasks.filter((task) =>
+      ["READY", "RUNNING", "RETRYING", "WAITING", "PENDING"].includes(task.status),
+    );
+    const superseded = new Set(evidence.recoveredTasks);
+    const failed = tasks.filter((task) => task.status === "FAILED" && !superseded.has(task.task_id));
 
-    const running = tasks.filter((t) => ["READY", "RUNNING", "RETRYING", "WAITING", "PENDING"].includes(t.status));
-    // A FAILED task only blocks while it stands. Each gate-repair round creates a
-    // NEW validation / integration / review task, so counting every historical
-    // gate failure would keep the mission unrecoverable after the repair passed.
-    // Implementation tasks are different: another agent task with the same role
-    // may have an unrelated objective and is never implicit evidence of repair.
-    // Insertion order is the real chronology (the store is event-sourced). Only
-    // timestamps are not enough: created_at has millisecond resolution, so a task
-    // that fails immediately AFTER a success can share its timestamp, and a
-    // timestamp-only comparison would mask that late failure.
-    const order = new Map<string, number>();
-    tasks.forEach((t, i) => order.set(t.task_id, i));
-    const superseded = (t: OrchestrationTask): boolean =>
-      ((t.kind === "integration" || t.kind === "validation" || t.kind === "review") &&
-        tasks.some(
-          (o) =>
-            o.task_id !== t.task_id &&
-            o.kind === t.kind &&
-            o.role === t.role &&
-            o.status === "SUCCEEDED" &&
-            (order.get(o.task_id) ?? -1) > (order.get(t.task_id) ?? -1),
-        )) ||
-      // Recovery supersede: the worker timed out AFTER committing, the broker
-      // merged exactly that commit, and validation + review passed on the
-      // result. The FAILED status records a timeout, not a rejected
-      // deliverable, so it must not block completion. See gather().
-      evidence.recoveredTasks.includes(t.task_id);
-    const failed = tasks.filter((t) => t.status === "FAILED" && !superseded(t));
-    const supersededByRecovery = tasks
-      .filter((t) => t.status === "FAILED" && evidence.recoveredTasks.includes(t.task_id))
-      .map((t) => t.task_id);
-
-    // Required gates.
     for (const gate of mission.required_gates) {
-      switch (gate) {
-        case "validation":
-          if (evidence.validationsPassed === 0) {
-            missingGates.push(gate);
-            reasons.push("validation gate required but no validation evidence exists");
-          }
-          break;
-        case "independent_review":
-          if (evidence.reviewsCompleted === 0) {
-            missingGates.push(gate);
-            reasons.push("independent review gate required but no review completed");
-          }
-          break;
-        case "security_review":
-          // A generic reviewer must not satisfy a security gate.
-          if (evidence.securityReviewsCompleted === 0) {
-            missingGates.push(gate);
-            reasons.push("security_review gate required but no security review completed");
-          }
-          break;
-        case "migration_validation":
-        case "compatibility_review":
-        case "dependency_validation":
-          // These are satisfied when a review/validation of the right kind exists.
-          if (evidence.reviewsCompleted === 0 && gate !== "migration_validation" && gate !== "dependency_validation") {
-            missingGates.push(gate);
-            reasons.push(`${gate} gate required but no review evidence exists`);
-          } else if (
-            (gate === "migration_validation" || gate === "dependency_validation") &&
-            evidence.validationsPassed === 0
-          ) {
-            missingGates.push(gate);
-            reasons.push(`${gate} gate required but no validation evidence exists`);
-          }
-          break;
+      const validationGate =
+        gate === "validation" || gate === "migration_validation" || gate === "dependency_validation";
+      const reviewGate = gate === "independent_review" || gate === "compatibility_review";
+      if (validationGate && evidence.validationsPassed === 0) {
+        missingGates.push(gate);
+        reasons.push(evidence.validationProblem ?? `${gate} gate required but no current validation evidence exists`);
+      } else if (reviewGate && evidence.reviewsCompleted === 0) {
+        missingGates.push(gate);
+        reasons.push(evidence.reviewProblem ?? `${gate} gate required but no current review evidence exists`);
+      } else if (gate === "security_review" && evidence.securityReviewsCompleted === 0) {
+        missingGates.push(gate);
+        reasons.push(
+          evidence.reviewProblem ?? "security_review gate required but no current security review evidence exists",
+        );
       }
     }
 
-    // No blocking findings.
     const unresolvedBlocking = evidence.findings.filter(
-      (f) => f.severity === "blocking" && f.status !== "resolved",
+      (finding) => finding.severity === "blocking" && finding.status !== "resolved",
     ).length;
-    if (unresolvedBlocking > 0) {
-      reasons.push(`${unresolvedBlocking} blocking finding(s) unresolved`);
-    }
+    if (unresolvedBlocking > 0) reasons.push(`${unresolvedBlocking} blocking finding(s) unresolved`);
+    if (running.length > 0) reasons.push(`${running.length} task(s) still running`);
+    if (failed.length > 0) reasons.push(`${failed.length} task(s) failed`);
+    reasons.push(
+      ...(evidence.terminalTaskProblems ?? []),
+      ...(evidence.supersessionProblems ?? []),
+      ...(evidence.activeExecutionProblems ?? []),
+      ...(evidence.acceptanceProblems ?? []),
+    );
 
-    // No running tasks.
-    if (running.length > 0) {
-      reasons.push(`${running.length} task(s) still running`);
-    }
-
-    // No failed tasks.
-    if (failed.length > 0) {
-      reasons.push(`${failed.length} task(s) failed`);
-    }
-
+    const structuralProblems =
+      (evidence.terminalTaskProblems?.length ?? 0) +
+      (evidence.supersessionProblems?.length ?? 0) +
+      (evidence.activeExecutionProblems?.length ?? 0) +
+      (evidence.acceptanceProblems?.length ?? 0);
     return {
       can_complete:
-        missingGates.length === 0 && unresolvedBlocking === 0 && running.length === 0 && failed.length === 0,
-      reasons,
-      missing_gates: missingGates,
+        missingGates.length === 0 &&
+        unresolvedBlocking === 0 &&
+        running.length === 0 &&
+        failed.length === 0 &&
+        structuralProblems === 0,
+      reasons: [...new Set(reasons)],
+      missing_gates: [...new Set(missingGates)],
       unresolved_findings: unresolvedBlocking,
       running_tasks: running.length,
-      superseded_by_recovery: supersededByRecovery,
+      superseded_by_recovery: evidence.recoveredTasks,
     };
   }
 
-  /** Gather gate evidence from the store. */
   gather(missionId: string): GateEvidence {
-    const executions = this.store.listExecutions(missionId);
-    const findings = this.store.listFindings(missionId);
+    const mission = this.store.getMission(missionId);
+    if (!mission) throw new Error(`unknown mission ${missionId}`);
+    const candidate = this.store.getCandidate(missionId);
+    const manifest = this.store.getWorkspaceManifest(missionId);
+    const currentGeneration =
+      this.store.getLatestMissionLease(missionId)?.generation ??
+      Math.max(0, ...this.store.listTasks(missionId).map((task) => task.mission_generation ?? 0));
+    const candidateCurrent =
+      !!candidate &&
+      !!manifest &&
+      candidate.identity.workspaceManifestHash === manifest.hash &&
+      candidate.identity.missionGeneration === currentGeneration &&
+      manifest.repositories.some(
+        (repository) =>
+          repository.repoId === candidate.identity.repoId && repository.baseSha === candidate.identity.baseSha,
+      );
+    const invalidations = this.store.listEvidenceInvalidations(missionId);
+    const invalidated = (identityHash: string, recordedAt: string): boolean =>
+      invalidations.some(
+        (entry) =>
+          hashCandidateEvidenceIdentity(entry.identity) === identityHash &&
+          Date.parse(entry.invalidatedAt) >= Date.parse(recordedAt),
+      );
+    const currentValidation =
+      candidateCurrent && candidate
+        ? this.store
+            .listValidationEvidence(missionId)
+            .filter(
+              (entry) =>
+                entry.identityHash === candidate.identityHash &&
+                evidenceIdentitiesEqual(entry.identity, candidate.identity),
+            )
+            .filter((entry) => !invalidated(entry.identityHash, entry.recordedAt))
+            .at(-1)
+        : undefined;
+    const currentReview =
+      candidateCurrent && candidate
+        ? this.store
+            .listReviewEvidence(missionId)
+            .filter(
+              (entry) =>
+                entry.identityHash === candidate.identityHash &&
+                evidenceIdentitiesEqual(entry.identity, candidate.identity),
+            )
+            .filter((entry) => !invalidated(entry.identityHash, entry.recordedAt))
+            .at(-1)
+        : undefined;
+
+    const validationOk =
+      !!currentValidation &&
+      currentValidation.accessible &&
+      !currentValidation.noTargets &&
+      currentValidation.exitCode === 0;
+    const reviewOk =
+      !!currentReview &&
+      currentReview.accessible &&
+      currentReview.outputValid &&
+      currentReview.verdict === "approve" &&
+      currentReview.findings.every((finding) => finding.severity !== "blocking" || finding.status === "resolved");
+
+    const acceptanceProblems = mission.acceptance_criteria.flatMap((criterion) => {
+      const acceptanceId = criterion.acceptance_id;
+      if (!acceptanceId) return [`material acceptance criterion lacks a stable acceptance ID: ${criterion.criterion}`];
+      if (!candidateCurrent || !candidate?.identity.acceptanceIds.includes(acceptanceId))
+        return [`acceptance ${acceptanceId} lacks current candidate evidence`];
+      if (criterion.status !== "passed") return [`acceptance ${acceptanceId} is ${criterion.status}`];
+      if (criterion.evidence !== candidate.identityHash)
+        return [`acceptance ${acceptanceId} is not bound to current evidence`];
+      return [];
+    });
+
     const tasks = this.store.listTasks(missionId);
-    const validationsPassed = executions.filter((e) => e.backend === "validation" && e.status === "SUCCEEDED").length;
-    const reviewsCompleted = executions.filter((e) => e.backend === "review" && e.status === "SUCCEEDED").length;
-    const securityReviewsCompleted = tasks.filter(
-      (t) => t.kind === "review" && t.status === "SUCCEEDED" && t.role.includes("security"),
-    ).length;
-    // Insertion order is the chronology (event-sourced store): a recovered
-    // merge counts only when a validation and a completeness-noted review both
-    // SUCCEEDED after the integration that merged it — evidence from before
-    // does not cover it.
-    const recoveredTasks: string[] = [];
-    executions.forEach((e, i) => {
-      if (e.backend !== "integration" || e.status !== "SUCCEEDED" || !e.recovered_merged?.length) return;
-      const later = executions.slice(i + 1).filter((x) => x.status === "SUCCEEDED");
-      if (!later.some((x) => x.backend === "validation")) return;
-      for (const r of e.recovered_merged) {
-        if (later.some((x) => x.backend === "review" && x.reviewed_recovered?.includes(r.task_id))) {
-          recoveredTasks.push(r.task_id);
+    const validSuperseded = new Set<string>();
+    const supersessionProblems: string[] = [];
+    for (const lineage of this.store.listTaskSupersessions(missionId)) {
+      const failed = tasks.find((task) => task.task_id === lineage.failedTaskId);
+      const replacements = lineage.replacementTaskIds.map((taskId) => tasks.find((task) => task.task_id === taskId));
+      const coverage = new Set(replacements.flatMap((task) => task?.acceptance_ids ?? []));
+      const valid =
+        failed?.status === "FAILED" &&
+        failed.repo_id === lineage.repoId &&
+        replacements.length > 0 &&
+        replacements.every((task) => task?.status === "SUCCEEDED" && task.repo_id === lineage.repoId) &&
+        lineage.acceptanceIds.every((acceptanceId) => coverage.has(acceptanceId));
+      if (valid) validSuperseded.add(lineage.failedTaskId);
+      else
+        supersessionProblems.push(
+          `invalid supersession lineage for ${lineage.failedTaskId}: replacement coverage is not successful`,
+        );
+    }
+    if (validationOk && currentValidation) {
+      for (const task of tasks) {
+        if (task.kind === "validation" && task.status === "FAILED" && task.task_id !== currentValidation.taskId) {
+          validSuperseded.add(task.task_id);
         }
       }
-    });
+    }
+    if (reviewOk && currentReview) {
+      for (const task of tasks) {
+        if (task.kind === "review" && task.status === "FAILED" && task.task_id !== currentReview.taskId) {
+          validSuperseded.add(task.task_id);
+        }
+      }
+    }
+    if (validationOk && reviewOk && currentReview) {
+      const executions = this.store.listExecutions(missionId);
+      const reviewExecution = executions.find((execution) => execution.execution_id === currentReview.executionId);
+      const reviewedRecovered = new Set(reviewExecution?.reviewed_recovered ?? []);
+      for (const integration of executions) {
+        if (integration.backend !== "integration" || integration.status !== "SUCCEEDED") continue;
+        for (const recovered of integration.recovered_merged ?? []) {
+          if (reviewedRecovered.has(recovered.task_id)) validSuperseded.add(recovered.task_id);
+        }
+      }
+    }
+
+    const terminalTaskProblems = tasks
+      .filter((task) => ["BLOCKED", "CANCELED", "SKIPPED"].includes(task.status))
+      .filter((task) => !validSuperseded.has(task.task_id))
+      .map((task) => `unresolved ${task.status} task ${task.task_id}`);
+    const activeExecutionProblems = this.store
+      .listExecutions(missionId)
+      .filter((execution) => execution.status === "RUNNING")
+      .map((execution) => {
+        const task = this.store.getTask(execution.task_id);
+        const fenced =
+          task &&
+          execution.mission_generation === task.mission_generation &&
+          execution.fencing_token === task.fencing_token &&
+          task.assigned_execution_id === execution.execution_id;
+        return `${fenced ? "active" : "active unfenced"} execution ${execution.execution_id} can still mutate candidate state`;
+      });
+
+    const reviewProblem = !candidateCurrent
+      ? "current review evidence is unavailable because no candidate is recorded"
+      : !currentReview
+        ? "no current review evidence matches the exact candidate"
+        : !currentReview.accessible
+          ? "current review evidence is inaccessible"
+          : !currentReview.outputValid
+            ? "current review evidence is malformed"
+            : currentReview.verdict === "request_changes"
+              ? "current review requested changes"
+              : !reviewOk
+                ? "current review has unresolved blocking findings"
+                : undefined;
+    const validationProblem = !candidateCurrent
+      ? "current validation evidence is unavailable because no candidate is recorded"
+      : !currentValidation
+        ? "no current validation evidence matches the exact candidate"
+        : !currentValidation.accessible
+          ? "current validation evidence is inaccessible"
+          : currentValidation.noTargets
+            ? "no-target validation cannot satisfy a mutation gate"
+            : currentValidation.exitCode !== 0
+              ? `current validation failed with exit code ${currentValidation.exitCode}`
+              : undefined;
+
+    const storedFindings = this.store.listFindings(missionId).map((finding) => ({
+      finding_id: finding.finding_id,
+      severity: finding.severity,
+      status: finding.status,
+    }));
+    const reviewFindings = (currentReview?.findings ?? []).map((finding, index) => ({
+      finding_id: `${currentReview?.evidenceId ?? "review"}:${index}`,
+      severity: finding.severity,
+      status: finding.status,
+    }));
     return {
       missionId,
-      validationsPassed,
-      reviewsCompleted,
-      securityReviewsCompleted,
-      recoveredTasks,
-      findings: findings.map((f) => ({ finding_id: f.finding_id, severity: f.severity, status: f.status })),
+      validationsPassed: validationOk ? 1 : 0,
+      reviewsCompleted: reviewOk ? 1 : 0,
+      securityReviewsCompleted:
+        reviewOk && tasks.some((task) => task.kind === "review" && task.role.includes("security")) ? 1 : 0,
+      findings: [...storedFindings, ...reviewFindings],
+      recoveredTasks: [...validSuperseded],
+      validationProblem,
+      reviewProblem,
+      acceptanceProblems,
+      activeExecutionProblems,
+      terminalTaskProblems,
+      supersessionProblems,
     };
   }
 }

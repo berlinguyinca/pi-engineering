@@ -24,9 +24,10 @@ import type { GitRepo } from "../git/GitRepo.ts";
 import type { WorkerActivity } from "../workers/WorkerExecutor.ts";
 import { sanitizeWorkerActivity } from "../workers/activity.ts";
 import type { CheckpointManager, CheckpointSnapshot } from "./checkpoints.ts";
+import { buildCandidateEvidenceIdentity, hashCandidateEvidenceIdentity } from "./evidence.ts";
 import type { LateExecutionEvidence, MissionStore } from "./missionStore.ts";
 import type { DispatchAuthority } from "./ownership.ts";
-import type { ExecutionBackend, RecoveredMerge } from "./types.ts";
+import type { ExecutionBackend, RecoveredMerge, ReviewEvidence, ValidationEvidence } from "./types.ts";
 import { canonicalizeWriteDomain } from "./workset.ts";
 
 export interface ExecutionRequestInput {
@@ -90,6 +91,23 @@ export interface ExecutionOutcome {
    * `recovered_merged` for the completion gate.
    */
   recoveredMerged?: RecoveredMerge[];
+  /** Content hashes of accessible artifacts produced by this backend. */
+  artifactHashes?: string[];
+  validationEvidence?: Pick<
+    ValidationEvidence,
+    "command" | "profile" | "exitCode" | "testSummary" | "noTargets" | "accessible"
+  >;
+  reviewEvidence?: Pick<
+    ReviewEvidence,
+    | "reviewerSessionId"
+    | "model"
+    | "provider"
+    | "verdict"
+    | "independenceMode"
+    | "findings"
+    | "outputValid"
+    | "accessible"
+  >;
 }
 
 type BackendSettlement =
@@ -499,6 +517,75 @@ export class ExecutionBroker {
     }
     if (!this.git) return null;
     return { root: this.git.root, git: this.git };
+  }
+
+  private async recordGateEvidence(
+    input: ExecutionRequestInput,
+    executionId: string,
+    backend: ExecutionBackend,
+    outcome: ExecutionOutcome,
+    repository: { repoId?: string; root: string; git: GitRepo } | null,
+  ): Promise<void> {
+    if (!input.repoId || !["integration", "validation", "review"].includes(backend)) return;
+    const manifest = this.store.getWorkspaceManifest(input.missionId);
+    const binding = manifest?.repositories.find((candidate) => candidate.repoId === input.repoId);
+    const execution = this.store.getExecution(executionId);
+    const task = this.store.getTask(input.taskId);
+    if (!manifest || !binding || !execution || !task) return;
+
+    let candidateSha = this.store.getCandidate(input.missionId)?.identity.candidateSha ?? binding.baseSha;
+    let diffHash = this.store.getCandidate(input.missionId)?.identity.diffHash ?? artifactHash("");
+    if (repository) {
+      candidateSha = await repository.git.headCommit();
+      const diff = await repository.git.captureDiff(binding.baseSha, candidateSha);
+      diffHash = artifactHash(diff);
+    }
+    const acceptanceIds = [...new Set(task.acceptance_ids ?? [])].sort();
+    const priorArtifacts = this.store.getCandidate(input.missionId)?.identity.artifactHashes ?? [];
+    const candidateArtifacts =
+      backend === "integration"
+        ? [...new Set(outcome.artifactHashes ?? outcome.artifactRefs.map(artifactHash))].sort()
+        : priorArtifacts;
+    const identity = buildCandidateEvidenceIdentity({
+      workspaceManifestHash: manifest.hash,
+      missionGeneration: execution.mission_generation ?? task.mission_generation ?? 0,
+      repoId: input.repoId,
+      baseSha: binding.baseSha,
+      candidateSha,
+      diffHash,
+      acceptanceIds,
+      artifactHashes: candidateArtifacts,
+    });
+    const candidate = this.store.recordCandidate(
+      input.missionId,
+      identity,
+      backend === "integration" ? "integration" : `${backend} target`,
+    );
+    const recordedAt = new Date().toISOString();
+    if (backend === "validation" && outcome.validationEvidence) {
+      this.store.recordValidationEvidence({
+        evidenceId: id("VE"),
+        missionId: input.missionId,
+        taskId: input.taskId,
+        executionId,
+        identity: candidate.identity,
+        identityHash: candidate.identityHash,
+        ...outcome.validationEvidence,
+        recordedAt,
+      });
+    }
+    if (backend === "review" && outcome.reviewEvidence) {
+      this.store.recordReviewEvidence({
+        evidenceId: id("RE"),
+        missionId: input.missionId,
+        taskId: input.taskId,
+        executionId,
+        identity: candidate.identity,
+        identityHash: hashCandidateEvidenceIdentity(candidate.identity),
+        ...outcome.reviewEvidence,
+        recordedAt,
+      });
+    }
   }
 
   /**
@@ -1525,6 +1612,9 @@ export class ExecutionBroker {
             // Publish terminal result evidence only after every mutation and
             // handoff decision has passed the live execution fence. The status
             // transition itself revokes that fence.
+            input.authority?.assertAuthoritative();
+            this.store.assertExecutionAuthoritative(execution.execution_id);
+            await this.recordGateEvidence(input, execution.execution_id, backend, outcome, repository);
             input.authority?.assertAuthoritative();
             this.store.assertExecutionAuthoritative(execution.execution_id);
             const succeeded = outcome.exitStatus === "succeeded";

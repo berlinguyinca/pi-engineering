@@ -12,8 +12,11 @@
 
 import { id } from "../core/ids.ts";
 import type { EventStoreBackend, StoredEvent } from "../platform/eventstore/backend.ts";
+import { buildCandidateEvidenceIdentity, hashCandidateEvidenceIdentity } from "./evidence.ts";
 import { assertMissionTransition, assertTaskTransition } from "./state.ts";
 import type {
+  CandidateEvidenceIdentity,
+  CandidateRevision,
   EvidenceInvalidation,
   Execution,
   ExecutionStatus,
@@ -28,11 +31,13 @@ import type {
   RecoveryDecision,
   RecoveryStatus,
   RepositoryLease,
+  ReviewEvidence,
   ReviewFinding,
   TaskCheckpoint,
   TaskStatus,
   TaskSupersession,
   TaskTransitionMetadata,
+  ValidationEvidence,
   WorkspaceManifest,
 } from "./types.ts";
 
@@ -77,6 +82,9 @@ export type OrchestrationEventType =
   | "lease.expired"
   | "lease.fenced"
   | "evidence.invalidated"
+  | "candidate.changed"
+  | "evidence.validation_recorded"
+  | "evidence.review_recorded"
   | "mission.resumed"
   | "mission.stopped";
 
@@ -208,6 +216,9 @@ export class MissionStore {
   private readonly recoveryDecisions = new Map<string, RecoveryDecision>();
   private readonly taskSupersessions = new Map<string, TaskSupersession>();
   private readonly evidenceInvalidations = new Map<string, EvidenceInvalidation>();
+  private readonly candidates = new Map<string, CandidateRevision>();
+  private readonly validationEvidence = new Map<string, ValidationEvidence>();
+  private readonly reviewEvidence = new Map<string, ReviewEvidence>();
   private readonly missionLeases = new Map<string, MissionLease>();
   private readonly repositoryLeases = new Map<string, RepositoryLease>();
   /** Last epochs survive release/expiry so a restarted owner cannot reuse a token. */
@@ -481,6 +492,21 @@ export class MissionStore {
         if (invalidation) {
           this.evidenceInvalidations.set(invalidation.invalidationId, copyEvidenceInvalidation(invalidation));
         }
+        break;
+      }
+      case "candidate.changed": {
+        const candidate = e.payload.candidate as CandidateRevision;
+        if (candidate) this.candidates.set(candidate.missionId, copyCandidateRevision(candidate));
+        break;
+      }
+      case "evidence.validation_recorded": {
+        const evidence = e.payload.evidence as ValidationEvidence;
+        if (evidence) this.validationEvidence.set(evidence.evidenceId, copyValidationEvidence(evidence));
+        break;
+      }
+      case "evidence.review_recorded": {
+        const evidence = e.payload.evidence as ReviewEvidence;
+        if (evidence) this.reviewEvidence.set(evidence.evidenceId, copyReviewEvidence(evidence));
         break;
       }
       case "lease.acquired":
@@ -1042,7 +1068,10 @@ export class MissionStore {
   bindWorkspaceManifest(manifest: WorkspaceManifest): WorkspaceManifest {
     if (!this.missions.has(manifest.missionId)) throw new Error(`unknown mission ${manifest.missionId}`);
     const copy = copyWorkspaceManifest(manifest);
-    const type = this.workspaceManifests.has(manifest.missionId) ? "workspace.rebound" : "workspace.authorized";
+    const prior = this.workspaceManifests.get(manifest.missionId);
+    const type = prior ? "workspace.rebound" : "workspace.authorized";
+    if (prior && prior.hash !== manifest.hash)
+      this.invalidateCurrentCandidate(manifest.missionId, "workspace manifest rebound");
     this.workspaceManifests.set(manifest.missionId, copy);
     this.emit(type, manifest.missionId, { actor: "system", manifest: copy });
     return copyWorkspaceManifest(copy);
@@ -1283,6 +1312,98 @@ export class MissionStore {
     return copyEvidenceInvalidation(copy);
   }
 
+  recordCandidate(missionId: string, rawIdentity: CandidateEvidenceIdentity, reason: string): CandidateRevision {
+    if (!this.missions.has(missionId)) throw new Error(`unknown mission ${missionId}`);
+    const identity = buildCandidateEvidenceIdentity(rawIdentity);
+    const manifest = this.workspaceManifests.get(missionId);
+    if (!manifest || manifest.hash !== identity.workspaceManifestHash) {
+      throw new Error("candidate identity does not match the current workspace manifest");
+    }
+    const binding = manifest.repositories.find((repository) => repository.repoId === identity.repoId);
+    if (!binding || binding.baseSha !== identity.baseSha) {
+      throw new Error("candidate identity does not match the current repository/base");
+    }
+    const identityHash = hashCandidateEvidenceIdentity(identity);
+    const prior = this.candidates.get(missionId);
+    if (prior && prior.identityHash !== identityHash) this.invalidateCurrentCandidate(missionId, reason);
+    const candidate: CandidateRevision = {
+      missionId,
+      identity,
+      identityHash,
+      reason: reason.trim() || "candidate changed",
+      recordedAt: new Date().toISOString(),
+    };
+    this.candidates.set(missionId, candidate);
+    this.emit("candidate.changed", missionId, { actor: "system", candidate });
+    return copyCandidateRevision(candidate);
+  }
+
+  getCandidate(missionId: string): CandidateRevision | undefined {
+    const candidate = this.candidates.get(missionId);
+    return candidate ? copyCandidateRevision(candidate) : undefined;
+  }
+
+  recordValidationEvidence(raw: ValidationEvidence): ValidationEvidence {
+    this.assertEvidenceRecord(raw.missionId, raw.identity, raw.identityHash);
+    if (!raw.command.trim() || !raw.profile.trim() || !Number.isInteger(raw.exitCode)) {
+      throw new Error("malformed validation evidence");
+    }
+    const evidence = copyValidationEvidence({ ...raw, recordedAt: this.freshEvidenceTimestamp(raw) });
+    this.validationEvidence.set(evidence.evidenceId, evidence);
+    this.emit("evidence.validation_recorded", evidence.missionId, { actor: "system", evidence });
+    return copyValidationEvidence(evidence);
+  }
+
+  listValidationEvidence(missionId?: string): ValidationEvidence[] {
+    return [...this.validationEvidence.values()]
+      .filter((evidence) => (missionId ? evidence.missionId === missionId : true))
+      .map(copyValidationEvidence);
+  }
+
+  recordReviewEvidence(raw: ReviewEvidence): ReviewEvidence {
+    this.assertEvidenceRecord(raw.missionId, raw.identity, raw.identityHash);
+    if (!raw.reviewerSessionId.trim() || !raw.model.trim() || !raw.provider.trim()) {
+      throw new Error("malformed review evidence identity");
+    }
+    const evidence = copyReviewEvidence({ ...raw, recordedAt: this.freshEvidenceTimestamp(raw) });
+    this.reviewEvidence.set(evidence.evidenceId, evidence);
+    this.emit("evidence.review_recorded", evidence.missionId, { actor: "system", evidence });
+    return copyReviewEvidence(evidence);
+  }
+
+  listReviewEvidence(missionId?: string): ReviewEvidence[] {
+    return [...this.reviewEvidence.values()]
+      .filter((evidence) => (missionId ? evidence.missionId === missionId : true))
+      .map(copyReviewEvidence);
+  }
+
+  private assertEvidenceRecord(missionId: string, identity: CandidateEvidenceIdentity, identityHash: string): void {
+    if (!this.missions.has(missionId)) throw new Error(`unknown mission ${missionId}`);
+    const canonical = buildCandidateEvidenceIdentity(identity);
+    if (hashCandidateEvidenceIdentity(canonical) !== identityHash) throw new Error("malformed candidate evidence hash");
+  }
+
+  private freshEvidenceTimestamp(raw: { missionId: string; identityHash: string; recordedAt: string }): string {
+    const latestInvalidation = this.listEvidenceInvalidations(raw.missionId)
+      .filter((entry) => hashCandidateEvidenceIdentity(entry.identity) === raw.identityHash)
+      .reduce((latest, entry) => Math.max(latest, Date.parse(entry.invalidatedAt)), Number.NEGATIVE_INFINITY);
+    const requested = Date.parse(raw.recordedAt);
+    const now = Date.now();
+    return new Date(Math.max(Number.isFinite(requested) ? requested : now, now, latestInvalidation + 1)).toISOString();
+  }
+
+  private invalidateCurrentCandidate(missionId: string, reason: string): void {
+    const current = this.candidates.get(missionId);
+    if (!current) return;
+    this.invalidateEvidence({
+      invalidationId: id("EI"),
+      missionId,
+      identity: current.identity,
+      reason,
+      invalidatedAt: new Date().toISOString(),
+    });
+  }
+
   listEvidenceInvalidations(missionId?: string): EvidenceInvalidation[] {
     return [...this.evidenceInvalidations.values()]
       .filter((invalidation) => (missionId ? invalidation.missionId === missionId : true))
@@ -1348,6 +1469,10 @@ export class MissionStore {
   ): void {
     if (!this.missions.has(lease.missionId)) throw new Error(`unknown mission ${lease.missionId}`);
     if (scope === "mission") {
+      const prior = this.missionLeaseEpochs.get(lease.missionId);
+      if (prior && prior.generation !== lease.generation) {
+        this.invalidateCurrentCandidate(lease.missionId, "mission generation changed");
+      }
       this.missionLeaseEpochs.set(lease.missionId, { ...lease });
       if (transition === "expired" || transition === "fenced") this.missionLeases.delete(lease.missionId);
       else this.missionLeases.set(lease.missionId, { ...lease });
@@ -1479,6 +1604,34 @@ function copyEvidenceInvalidation(invalidation: EvidenceInvalidation): EvidenceI
       acceptanceIds: [...invalidation.identity.acceptanceIds],
       artifactHashes: [...invalidation.identity.artifactHashes],
     },
+  };
+}
+
+function copyEvidenceIdentity(identity: CandidateEvidenceIdentity): CandidateEvidenceIdentity {
+  return {
+    ...identity,
+    acceptanceIds: [...identity.acceptanceIds],
+    artifactHashes: [...identity.artifactHashes],
+  };
+}
+
+function copyCandidateRevision(candidate: CandidateRevision): CandidateRevision {
+  return { ...candidate, identity: copyEvidenceIdentity(candidate.identity) };
+}
+
+function copyValidationEvidence(evidence: ValidationEvidence): ValidationEvidence {
+  return {
+    ...evidence,
+    identity: copyEvidenceIdentity(evidence.identity),
+    testSummary: structuredClone(evidence.testSummary),
+  };
+}
+
+function copyReviewEvidence(evidence: ReviewEvidence): ReviewEvidence {
+  return {
+    ...evidence,
+    identity: copyEvidenceIdentity(evidence.identity),
+    findings: evidence.findings.map((finding) => ({ ...finding })),
   };
 }
 

@@ -12,11 +12,14 @@
  * mission; tests inject deterministic fakes instead.
  */
 
+import { createHash } from "node:crypto";
 import type { ArtifactStore } from "../artifacts/ArtifactStore.ts";
+import { id } from "../core/ids.ts";
 import type { GitRepo } from "../git/GitRepo.ts";
 import type { VerificationProvider } from "../verify/Verifier.ts";
 import type { WorkerActivity, WorkerExecutor, WorkerRequest } from "../workers/WorkerExecutor.ts";
 import { type ExecutionOutcome, type IntegrationHandoff, workerTimeoutMs } from "./broker.ts";
+import { normalizeReviewSeverity } from "./evidence.ts";
 
 export interface RealBackendsOptions {
   worker: WorkerExecutor;
@@ -45,6 +48,23 @@ export interface ModelRoute {
   id: string;
   /** Operator-visible notice when policy had to degrade model separation. */
   warning?: string;
+}
+
+async function artifactContentHashes(
+  store: ArtifactStore,
+  refs: string[],
+): Promise<{ hashes: string[]; allAccessible: boolean }> {
+  const hashes: string[] = [];
+  let allAccessible = true;
+  for (const ref of refs) {
+    const content = await store.readContentByUri(ref);
+    if (content === undefined) {
+      allAccessible = false;
+      continue;
+    }
+    hashes.push(`sha256:${createHash("sha256").update(content).digest("hex")}`);
+  }
+  return { hashes: [...new Set(hashes)].sort(), allAccessible };
 }
 
 /**
@@ -235,14 +255,34 @@ export function realBackends(opts: RealBackendsOptions) {
         const profile = await opts.verifier.detect(cwd);
         input.signal.throwIfAborted();
         const outcome = await opts.verifier.run(cwd, profile, opts.artifacts, { signal: input.signal });
+        const artifactRefs = outcome.evidence.flatMap((e) => e.artifacts).filter(Boolean);
+        const artifactState = await artifactContentHashes(opts.artifacts, artifactRefs);
         return {
           executionId: "validation",
           exitStatus: outcome.passed ? "succeeded" : "failed",
           summary: outcome.passed
             ? `validation passed (${outcome.stages.length} stages)`
             : `validation failed at ${outcome.failedStage ?? "unknown"}`,
-          artifactRefs: outcome.evidence.flatMap((e) => e.artifacts).filter(Boolean),
+          artifactRefs,
+          artifactHashes: artifactState.hashes,
           usage: { stages: outcome.stages.length },
+          validationEvidence: {
+            command:
+              profile.stages.map((stage) => [stage.command, ...stage.args].join(" ")).join(" && ") || "<no-target>",
+            profile: profile.name,
+            exitCode:
+              outcome.passed && !outcome.noTargets ? 0 : (outcome.stages.find((stage) => !stage.passed)?.exitCode ?? 1),
+            testSummary: {
+              stages: outcome.stages.map((stage) => ({
+                name: stage.stage.name,
+                exitCode: stage.exitCode,
+                passed: stage.passed,
+              })),
+              failedStage: outcome.failedStage,
+            },
+            noTargets: outcome.noTargets,
+            accessible: artifactState.allAccessible,
+          },
         };
       },
     },
@@ -260,6 +300,7 @@ export function realBackends(opts: RealBackendsOptions) {
         // the (previously unset → default) token cap; the role-adjusted guard
         // lets it write its findings report without a false degeneration abort.
         const bound = await repository(input.repoId);
+        const reviewerSessionId = id("RVS");
         const req: WorkerRequest = {
           role: "reviewer",
           task: input.objective,
@@ -271,6 +312,8 @@ export function realBackends(opts: RealBackendsOptions) {
           // must inspect the integrated change before writing findings, and the
           // executor's default (5 min) aborted the reviewer mid-analysis.
           timeoutMs: workerTimeoutMs(),
+          sessionId: reviewerSessionId,
+          resultTool: "review_result",
         };
         const routed = await opts.routeModel?.(req.role);
         const modelRoute = routed ?? opts.reviewFallbackModel;
@@ -297,8 +340,36 @@ export function realBackends(opts: RealBackendsOptions) {
         // so the completion gate can block on blocking findings. Handles three
         // shapes: a list of objects ({severity, message|summary|text}), a list of
         // plain strings (severity defaults to "warning"), and a JSON string.
-        const raw = (run.result.details as { findings?: unknown } | undefined)?.findings;
+        const structured = run.structured as { verdict?: unknown; findings?: unknown } | undefined;
+        const raw = structured?.findings ?? (run.result.details as { findings?: unknown } | undefined)?.findings;
         outcome.findings = normalizeFindings(raw);
+        const verdict = structured?.verdict;
+        let outputValid = verdict === "approve" || verdict === "request_changes";
+        const normalizedFindings = outcome.findings.flatMap((finding) => {
+          try {
+            return [
+              {
+                severity: normalizeReviewSeverity(finding.severity),
+                summary: String(finding.summary ?? "review finding"),
+                status: finding.status === "resolved" ? ("resolved" as const) : ("open" as const),
+              },
+            ];
+          } catch {
+            outputValid = false;
+            return [];
+          }
+        });
+        outcome.reviewEvidence = {
+          reviewerSessionId,
+          model: modelRoute?.id ?? "current-model",
+          provider: modelRoute?.provider ?? "current-provider",
+          verdict: verdict === "approve" ? "approve" : "request_changes",
+          independenceMode: routed && !routed.warning ? "independent" : "same_model_reduced",
+          findings: normalizedFindings,
+          outputValid,
+          accessible: true,
+        };
+        outcome.artifactHashes = (await artifactContentHashes(opts.artifacts, outcome.artifactRefs)).hashes;
         return outcome;
       },
     },
@@ -381,11 +452,14 @@ export function realBackends(opts: RealBackendsOptions) {
         const checks = await opts.verifier.detect(repo.cwd);
         input.signal.throwIfAborted();
         const result = await opts.verifier.run(repo.cwd, checks, opts.artifacts, { signal: input.signal });
+        const artifactRefs = result.evidence.flatMap((e) => e.artifacts).filter(Boolean);
+        const artifactState = await artifactContentHashes(opts.artifacts, artifactRefs);
         return {
           executionId: "integration",
           exitStatus: result.passed ? "succeeded" : "failed",
           summary: `integrated ${merged.join(", ") || "nothing"}${recoveredNote}; checks: ${result.passed ? "pass" : "fail"}`,
-          artifactRefs: result.evidence.flatMap((e) => e.artifacts).filter(Boolean),
+          artifactRefs,
+          artifactHashes: artifactState.hashes,
           usage: { mergedBranches: merged.length + recovered.length, conflicts: conflicts.length },
         };
       },

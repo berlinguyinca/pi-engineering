@@ -24,6 +24,7 @@ import type { WorkerActivity } from "../workers/WorkerExecutor.ts";
 import { type BrokerBackends, ExecutionBroker } from "./broker.ts";
 import { CheckpointManager } from "./checkpoints.ts";
 import { CompletionGate } from "./completionGate.ts";
+import { normalizeReviewSeverity } from "./evidence.ts";
 import { IntentRouter, workflowMutatesRepo } from "./intentRouter.ts";
 import type { MissionStore } from "./missionStore.ts";
 import type { MissionObservability } from "./observability/MissionObservability.ts";
@@ -923,6 +924,17 @@ export class Orchestrator {
       if (openBlocking.length === 0 && failedGates.length === 0) break;
       repairRounds++;
 
+      const repairCandidate = this.store.getCandidate(missionId);
+      if (repairCandidate) {
+        this.store.invalidateEvidence({
+          invalidationId: id("EI"),
+          missionId,
+          identity: repairCandidate.identity,
+          reason: "repair changed candidate-relevant inputs",
+          invalidatedAt: new Date().toISOString(),
+        });
+      }
+
       if (this.store.getMission(missionId)!.status !== "REPAIRING") {
         this.store.transitionMission(missionId, "REPAIRING");
       }
@@ -1335,12 +1347,16 @@ export class Orchestrator {
       authority?.assertAuthoritative();
       // Record reviewer findings so the completion gate can block on them.
       for (const f of outcome.findings ?? []) {
-        const severity =
-          (f.severity as string) === "blocking" ? "blocking" : (f.severity as string) === "major" ? "major" : "minor";
+        let severity: ReviewFinding["severity"];
+        try {
+          severity = normalizeReviewSeverity(f.severity);
+        } catch {
+          severity = "blocking";
+        }
         this.store.addFinding({
           mission_id: missionId,
           task_id: taskId,
-          severity: severity as ReviewFinding["severity"],
+          severity,
           category: (f.category as string) ?? "correctness",
           file: (f.file as string | null) ?? null,
           line: (f.line as number | null) ?? null,
@@ -1373,6 +1389,7 @@ export class Orchestrator {
         return false;
       }
       this.store.transitionTask(taskId, "SUCCEEDED");
+      if (task.kind === "validation" || task.kind === "review") this.markAcceptanceFromCurrentEvidence(missionId);
       this.report(missionId, `[mission ${missionId}] ${task.kind}:${task.role} succeeded`);
       return true;
     } catch (err) {
@@ -1415,6 +1432,42 @@ export class Orchestrator {
         });
       }
     }
+  }
+
+  private markAcceptanceFromCurrentEvidence(missionId: string): void {
+    const mission = this.store.getMission(missionId);
+    const candidate = this.store.getCandidate(missionId);
+    if (!mission || !candidate) return;
+    const validation = this.store
+      .listValidationEvidence(missionId)
+      .filter((evidence) => evidence.identityHash === candidate.identityHash)
+      .at(-1);
+    const review = this.store
+      .listReviewEvidence(missionId)
+      .filter((evidence) => evidence.identityHash === candidate.identityHash)
+      .at(-1);
+    const requiresValidation = mission.required_gates.some((gate) =>
+      ["validation", "migration_validation", "dependency_validation"].includes(gate),
+    );
+    const requiresReview = mission.required_gates.some((gate) =>
+      ["independent_review", "security_review", "compatibility_review"].includes(gate),
+    );
+    const validationOk =
+      !requiresValidation ||
+      (!!validation && validation.accessible && !validation.noTargets && validation.exitCode === 0);
+    const reviewOk =
+      !requiresReview ||
+      (!!review &&
+        review.accessible &&
+        review.outputValid &&
+        review.verdict === "approve" &&
+        review.findings.every((finding) => finding.severity !== "blocking" || finding.status === "resolved"));
+    if (!validationOk || !reviewOk) return;
+    mission.acceptance_criteria.forEach((criterion, index) => {
+      if (criterion.acceptance_id && candidate.identity.acceptanceIds.includes(criterion.acceptance_id)) {
+        this.store.setCriterionStatus(missionId, index, "passed", candidate.identityHash);
+      }
+    });
   }
 
   private async renewMissionOwnership(missionId: string): Promise<void> {

@@ -60,6 +60,16 @@ async function openRuntime(
           model: "fake",
         },
         toolCalls: 1,
+        structured:
+          req.resultTool === "review_result"
+            ? {
+                verdict: reviewFindings.length > 0 ? "request_changes" : "approve",
+                findings: reviewFindings,
+                missingTests: [],
+                specGaps: [],
+                summary: reviewFindings.length > 0 ? "changes requested" : "approved",
+              }
+            : undefined,
       };
     },
   };
@@ -162,6 +172,10 @@ describe("orchestration via real EngineeringRuntime (acceptance scenarios)", () 
             model: "fake",
           },
           toolCalls: 0,
+          structured:
+            req.resultTool === "review_result"
+              ? { verdict: "approve", findings: [], missingTests: [], specGaps: [], summary: "approved" }
+              : undefined,
         };
       },
     };
@@ -265,6 +279,10 @@ describe("orchestration via real EngineeringRuntime (acceptance scenarios)", () 
             model: "fake",
           },
           toolCalls: 0,
+          structured:
+            req.resultTool === "review_result"
+              ? { verdict: "approve", findings: [], missingTests: [], specGaps: [], summary: "approved" }
+              : undefined,
         };
       },
     };
@@ -331,6 +349,10 @@ describe("orchestration via real EngineeringRuntime (acceptance scenarios)", () 
             model: "fake",
           },
           toolCalls: 0,
+          structured:
+            req.resultTool === "review_result"
+              ? { verdict: "approve", findings: [], missingTests: [], specGaps: [], summary: "approved" }
+              : undefined,
         };
       },
     };
@@ -514,6 +536,10 @@ describe("orchestration via real EngineeringRuntime (acceptance scenarios)", () 
           },
           usage: null,
           toolCalls: 0,
+          structured:
+            req.resultTool === "review_result"
+              ? { verdict: "approve", findings: [], missingTests: [], specGaps: [], summary: "approved" }
+              : undefined,
         };
       },
     };

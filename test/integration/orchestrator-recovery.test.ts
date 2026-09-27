@@ -53,12 +53,37 @@ async function run() {
         summary: "ok",
         artifactRefs: [],
         usage: {},
+        validationEvidence: {
+          command: "npm test",
+          profile: "test",
+          exitCode: 0,
+          testSummary: { passed: 1 },
+          noTargets: false,
+          accessible: true,
+        },
       }),
     },
     review: {
       runReview: async ({ objective }) => {
         reviewObjectives.push(objective);
-        return { executionId: "r", exitStatus: "succeeded", summary: "ok", artifactRefs: [], usage: {}, findings: [] };
+        return {
+          executionId: "r",
+          exitStatus: "succeeded",
+          summary: "ok",
+          artifactRefs: [],
+          usage: {},
+          findings: [],
+          reviewEvidence: {
+            reviewerSessionId: "review-recovery",
+            model: "test",
+            provider: "test",
+            verdict: "approve",
+            independenceMode: "independent",
+            findings: [],
+            outputValid: true,
+            accessible: true,
+          },
+        };
       },
     },
   };
