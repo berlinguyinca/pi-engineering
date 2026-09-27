@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import { test } from "node:test";
 import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { PiWorkerExecutor } from "../../src/workers/PiWorkerExecutor.ts";
@@ -194,6 +194,20 @@ test("register: Pi glob and exact override precedence controls worker mirroring"
       await registerLocalProviders(runtime, { verdicts: {}, agentDir });
       assert.equal(registered.length, entry.registered, JSON.stringify(entry.extensions));
     }
+  });
+});
+
+test("register: absolute exclusions work when the selected agent directory is relative", async () => {
+  await withNodesFile(nodeWith([{ id: "relative-profile-model" }]), async (agentDir) => {
+    const absoluteExtension = join(agentDir, "extensions", "qwen-turing.ts");
+    await writeFile(
+      join(agentDir, "settings.json"),
+      JSON.stringify({ extensions: [`-${absoluteExtension}`] }),
+      "utf-8",
+    );
+    const { registered, runtime } = fakeRuntime();
+    await registerLocalProviders(runtime, { verdicts: {}, agentDir: relative(process.cwd(), agentDir) });
+    assert.equal(registered.length, 0);
   });
 });
 

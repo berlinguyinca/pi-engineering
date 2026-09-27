@@ -1,6 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, join, matchesGlob, relative } from "node:path";
+import { basename, join, matchesGlob, relative, resolve } from "node:path";
 import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import type { AdmissionRetryConfig } from "../inference/admissionConfig.ts";
 import type { AdmissionEventBus } from "../inference/admissionEvents.ts";
@@ -195,8 +195,8 @@ async function isInteractiveProviderExtensionDisabled(agentDir: string): Promise
 
 function expandHomePath(path: string): string {
   if (path === "~") return homedir();
-  if (path.startsWith("~/")) return join(homedir(), path.slice(2));
-  return path;
+  if (path.startsWith("~/")) return resolve(homedir(), path.slice(2));
+  return resolve(path);
 }
 
 export async function readNodeSpecs(): Promise<NodeSpec[]> {
