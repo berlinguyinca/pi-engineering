@@ -11,6 +11,7 @@ import { join } from "node:path";
 import { describe, it } from "node:test";
 import { GitRepo } from "../../src/git/GitRepo.ts";
 import type { BrokerBackends, IntegrationHandoff } from "../../src/orchestration/broker.ts";
+import { buildCandidateEvidenceIdentity, taskCoverageFingerprint } from "../../src/orchestration/evidence.ts";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
 import { Orchestrator } from "../../src/orchestration/orchestrator.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
@@ -152,5 +153,285 @@ describe("orchestrator: completing over work recovered from a timed-out worker",
     } finally {
       await r.fx.cleanup();
     }
+  });
+});
+
+function blockedRepairHarness(options: { withCandidate?: boolean } = {}) {
+  const backend = JsonlEventStore.inMemory();
+  const store = MissionStore.open(backend);
+  const mission = store.createMission({
+    mission_id: "MSN-blocked-repair",
+    title: "repair",
+    goal: "finish three bounded deliverables",
+    user_request: "finish three bounded deliverables",
+    repository: process.cwd(),
+    base_ref: "base-sha",
+    risk_profile: "medium",
+    workflow_class: "engineering",
+  });
+  store.bindWorkspaceManifest({
+    manifestId: "WM-repair",
+    missionId: mission.mission_id,
+    generation: 1,
+    authorizedRoots: [{ canonicalPath: process.cwd(), source: "launch_cwd", access: "write" }],
+    repositories: [
+      {
+        repoId: "repo-repair",
+        canonicalRoot: process.cwd(),
+        baseRef: "base-sha",
+        baseSha: "base-sha",
+        writableDomains: ["src/**"],
+      },
+    ],
+    dependencyEdges: [],
+    hash: "manifest-repair",
+    createdAt: "2026-09-27T00:00:00.000Z",
+  });
+  for (const status of ["CLASSIFYING", "PLANNING", "READY", "EXECUTING"] as const) {
+    store.transitionMission(mission.mission_id, status);
+  }
+  if (options.withCandidate) {
+    const candidateTask = store.createTask({
+      task_id: "TSK-candidate",
+      mission_id: mission.mission_id,
+      kind: "integration",
+      role: "integrator",
+      objective: "record candidate before repair",
+      repo_id: "repo-repair",
+      acceptance_ids: [],
+      deliverables: ["candidate"],
+    });
+    store.transitionTask(candidateTask.task_id, "READY");
+    const candidateExecution = store.createExecution({
+      task_id: candidateTask.task_id,
+      mission_id: mission.mission_id,
+      backend: "integration",
+      repo_id: "repo-repair",
+      base_sha: "base-sha",
+    });
+    store.transitionTask(candidateTask.task_id, "RUNNING", "system", {
+      assigned_execution_id: candidateExecution.execution_id,
+    });
+    store.setExecutionStatus(candidateExecution.execution_id, "RUNNING");
+    store.setExecutionStatus(candidateExecution.execution_id, "SUCCEEDED", { exit_status: "succeeded" });
+    store.transitionTask(candidateTask.task_id, "SUCCEEDED");
+    store.recordCandidate(
+      mission.mission_id,
+      buildCandidateEvidenceIdentity({
+        workspaceManifestHash: "manifest-repair",
+        missionGeneration: 0,
+        repoId: "repo-repair",
+        baseSha: "base-sha",
+        candidateSha: "candidate-sha",
+        diffHash: "diff-hash",
+        acceptanceIds: [],
+        artifactHashes: [],
+      }),
+      "pre-repair candidate",
+      { taskId: candidateTask.task_id, executionId: candidateExecution.execution_id },
+    );
+  }
+  const failed = store.createTask({
+    task_id: "TSK-original",
+    mission_id: mission.mission_id,
+    kind: "agent",
+    role: "implementer",
+    objective: "finish one, two, and three",
+    repo_id: "repo-repair",
+    acceptance_ids: [],
+    deliverables: ["one", "two", "three"],
+    mutates_repo: false,
+    max_attempts: 1,
+  });
+  store.transitionTask(failed.task_id, "READY");
+  const orphanedExecution = store.createExecution({
+    task_id: failed.task_id,
+    mission_id: mission.mission_id,
+    backend: "agent",
+    repo_id: "repo-repair",
+    base_sha: "base-sha",
+  });
+  store.transitionTask(failed.task_id, "RUNNING", "system", {
+    assigned_execution_id: orphanedExecution.execution_id,
+  });
+  store.setExecutionStatus(orphanedExecution.execution_id, "RUNNING");
+  store.transitionTask(failed.task_id, "FAILED", "system", { failure_reason: "task execution budget exhausted" });
+  store.checkpointTask({
+    checkpointId: "CHK-original",
+    executionId: orphanedExecution.execution_id,
+    missionId: mission.mission_id,
+    taskId: failed.task_id,
+    repoId: "repo-repair",
+    baseSha: "base-sha",
+    candidateSha: "candidate-sha",
+    branch: "pi-eng-orch-TSK-original",
+    worktree: "/tmp/preserved-repair",
+    committedChanges: ["one"],
+    preservedUncommittedChanges: [],
+    completedDeliverables: ["one"],
+    remainingDeliverables: ["two", "three"],
+    acceptanceIds: [],
+    validationEvidenceRefs: [],
+    artifactRefs: [],
+    artifactHashes: [],
+    workerId: "worker",
+    sessionId: "session",
+    model: "local/local",
+    sequence: 1,
+    missionGeneration: 0,
+    candidateGeneration: 0,
+    fencingToken: 0,
+    createdAt: "2026-09-27T00:00:00.000Z",
+  });
+  store.classifyFailure({
+    classificationId: "FC-budget",
+    missionId: mission.mission_id,
+    taskId: failed.task_id,
+    executionId: orphanedExecution.execution_id,
+    category: "TASK_BUDGET_EXHAUSTED",
+    evidenceRefs: ["CHK-original"],
+    fingerprint: "sha256:budget-fingerprint",
+    summary: "task execution budget exhausted",
+    classifiedAt: "2026-09-27T00:00:00.000Z",
+  });
+  store.transitionMission(mission.mission_id, "BLOCKED");
+  const orchestrator = new Orchestrator({
+    store,
+    backends: {
+      agent: {
+        runAgent: async () => ({
+          executionId: "replacement",
+          exitStatus: "succeeded",
+          summary: "remaining deliverable complete",
+          artifactRefs: [],
+          usage: {},
+        }),
+      },
+    },
+    planner: async () => [],
+    recovery: { missionCeiling: 4, strategyMaxAttempts: 2, decisionTtlMs: 60_000 },
+    now: () => Date.parse("2026-09-27T00:00:10.000Z"),
+  });
+  return { backend, store, missionId: mission.mission_id, failed, orphanedExecution, orchestrator };
+}
+
+describe("orchestrator: durable blocked-mission repair", () => {
+  it("writes the repair before BLOCKED -> REPAIRING, splits checkpoint remainder, and records supersession", async () => {
+    const h = blockedRepairHarness();
+    const repaired = await h.orchestrator.repairBlockedMission(h.missionId);
+
+    const replacements = h.store
+      .listTasks(h.missionId)
+      .filter((task) => task.task_id !== h.failed.task_id && task.kind === "agent");
+    assert.deepEqual(replacements.map((task) => task.deliverables?.[0]).sort(), ["three", "two"]);
+    assert.ok(
+      replacements.every((task) => task.status === "SUCCEEDED"),
+      JSON.stringify(
+        replacements.map((task) => ({ id: task.task_id, status: task.status, reason: task.failure_reason })),
+      ),
+    );
+    const lineage = h.store.listTaskSupersessions(h.missionId);
+    assert.equal(lineage.length, 1);
+    assert.equal(lineage[0]?.failedTaskId, h.failed.task_id);
+    assert.deepEqual(lineage[0]?.replacementTaskIds.sort(), replacements.map((task) => task.task_id).sort());
+    assert.equal(lineage[0]?.coverageFingerprint, taskCoverageFingerprint(h.failed));
+    const events = h.backend.all().filter((event) => event.run_id === h.missionId);
+    const planned = events.findIndex((event) => event.type === "recovery.planned");
+    const orphaned = events.findIndex((event) => event.type === "execution.orphaned");
+    const reconciled = events.findIndex((event) => event.type === "execution.reconciled");
+    const started = events.findIndex((event) => event.type === "recovery.started");
+    const createdReplacement = events.findIndex(
+      (event) =>
+        event.type === "task.created" &&
+        (event.payload.task as { objective?: string } | undefined)?.objective?.startsWith("Recover ") === true,
+    );
+    assert.ok(
+      orphaned >= 0 &&
+        reconciled > orphaned &&
+        planned > reconciled &&
+        createdReplacement > planned &&
+        started > createdReplacement,
+      "write-ahead order must be durable",
+    );
+    assert.equal(h.store.getExecution(h.orphanedExecution.execution_id)?.status, "CANCELED");
+    assert.equal(
+      repaired.status,
+      "COMPLETE",
+      `successful replacement work must re-run gates through completion: ${JSON.stringify({ failure: repaired.failure_reason, verdict: h.orchestrator.gate.evaluate(repaired) })}`,
+    );
+    assert.equal(h.store.listRecoveryDecisions(h.missionId).at(-1)?.status, "succeeded");
+
+    const second = await h.orchestrator.repairBlockedMission(h.missionId);
+    assert.equal(second.status, repaired.status);
+    assert.equal(h.store.listTaskSupersessions(h.missionId).length, 1, "repair replay must be idempotent");
+  });
+
+  it("invalidates current candidate evidence before replacement dispatch", async () => {
+    const h = blockedRepairHarness({ withCandidate: true });
+    await h.orchestrator.repairBlockedMission(h.missionId);
+
+    const invalidations = h.store.listEvidenceInvalidations(h.missionId);
+    assert.equal(invalidations.length, 1);
+    assert.match(invalidations[0]?.reason ?? "", /blocked mission repair/i);
+  });
+
+  it("resumes an atomically-started repair after restart without duplicating replacement lineage", async () => {
+    const h = blockedRepairHarness();
+    const recoveryId = "RCV-crash-replay";
+    h.store.planRecovery({
+      recoveryId,
+      missionId: h.missionId,
+      classificationId: "FC-budget",
+      action: "REPAIR_BLOCKED_MISSION",
+      expectedMaterialChange: "resume checkpointed repair",
+      attempt: 1,
+      maxAttempts: 2,
+      deadline: "2026-09-27T00:01:00.000Z",
+      nextActionAt: "2026-09-27T00:00:10.000Z",
+      status: "planned",
+      decidedAt: "2026-09-27T00:00:10.000Z",
+      failureFingerprint: "sha256:budget-fingerprint",
+    });
+    h.store.transitionMission(h.missionId, "REPAIRING", { recoveryDecisionId: recoveryId });
+    await h.store.flush();
+
+    const repaired = await h.orchestrator.repairBlockedMission(h.missionId);
+
+    assert.equal(repaired.status, "COMPLETE");
+    assert.equal(h.store.listTaskSupersessions(h.missionId).length, 1);
+    assert.equal(h.store.listTasks(h.missionId).filter((task) => task.objective.startsWith("Recover ")).length, 2);
+    assert.equal(h.store.getRecoveryDecision(recoveryId)?.status, "succeeded");
+  });
+
+  it("stops with exact durable details after the identical strategy budget is exhausted", async () => {
+    const h = blockedRepairHarness();
+    for (const attempt of [1, 2]) {
+      h.store.planRecovery({
+        recoveryId: `RCV-prior-${attempt}`,
+        missionId: h.missionId,
+        classificationId: "FC-budget",
+        action: "CHECKPOINT_SPLIT_AND_REPLACE",
+        expectedMaterialChange: "split remaining work",
+        attempt,
+        maxAttempts: 2,
+        deadline: "2026-09-27T00:01:00.000Z",
+        nextActionAt: "2026-09-27T00:00:00.000Z",
+        status: "planned",
+        decidedAt: "2026-09-27T00:00:00.000Z",
+        failureFingerprint: "sha256:budget-fingerprint",
+      });
+      h.store.transitionRecovery(`RCV-prior-${attempt}`, "failed");
+    }
+
+    const stopped = await h.orchestrator.repairBlockedMission(h.missionId);
+    assert.equal(stopped.status, "BLOCKED");
+    const detail = h.store.listMissionStops(h.missionId).at(-1)!;
+    assert.match(detail.reason, /identical failure fingerprint exhausted/i);
+    assert.deepEqual(detail.preservedWork, ["/tmp/preserved-repair", "pi-eng-orch-TSK-original"]);
+    assert.deepEqual(detail.attemptedRecoveries, ["RCV-prior-1", "RCV-prior-2"]);
+    assert.match(detail.resumeCondition, /new material evidence|increase the approved recovery budget/i);
+
+    await h.orchestrator.repairBlockedMission(h.missionId);
+    assert.equal(h.store.listMissionStops(h.missionId).length, 1, "exhausted repair replay must be idempotent");
   });
 });

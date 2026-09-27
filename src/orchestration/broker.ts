@@ -130,6 +130,13 @@ export interface CleanupResult {
   failures: CleanupFailure[];
 }
 
+export interface DurableRepositoryDiagnostic {
+  repoId: string;
+  recordKind: "candidate" | "integration-run" | "promotion" | "cleanup" | "repository";
+  file: string;
+  reason: string;
+}
+
 type BackendSettlement =
   | { kind: "backend_result"; outcome: ExecutionOutcome }
   | { kind: "backend_error"; error: unknown };
@@ -1097,6 +1104,42 @@ export class ExecutionBroker {
     } catch {
       return null;
     }
+  }
+
+  /** Read-only fail-closed preflight for Git journals consumed by recovery. */
+  async durableRepositoryDiagnostics(missionId: string): Promise<DurableRepositoryDiagnostic[]> {
+    const repoIds = [
+      ...new Set(
+        [
+          ...(this.store.getWorkspaceManifest(missionId)?.repositories.map((repository) => repository.repoId) ?? []),
+          ...this.store.listTasks(missionId).map((task) => task.repo_id),
+        ].filter((repoId): repoId is string => typeof repoId === "string" && repoId.trim().length > 0),
+      ),
+    ];
+    const diagnostics: DurableRepositoryDiagnostic[] = [];
+    for (const repoId of repoIds) {
+      try {
+        const git = this.resolveRepository ? (await this.resolveRepository(repoId, [])).git : this.git;
+        if (!git) continue;
+        const inventories = [
+          ["candidate", await git.loadCandidateLifecycleInventory(missionId, repoId)],
+          ["integration-run", await git.loadIntegrationRunInventory(missionId, repoId)],
+          ["promotion", await git.loadPromotionLifecycleInventory(missionId, repoId)],
+          ["cleanup", await git.loadPendingBranchCleanupInventory(missionId, repoId)],
+        ] as const;
+        for (const [recordKind, inventory] of inventories) {
+          diagnostics.push(...inventory.diagnostics.map((diagnostic) => ({ repoId, recordKind, ...diagnostic })));
+        }
+      } catch (error) {
+        diagnostics.push({
+          repoId,
+          recordKind: "repository",
+          file: "",
+          reason: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+    return diagnostics;
   }
 
   /** Release any worktrees still tracked for a finished mission. */

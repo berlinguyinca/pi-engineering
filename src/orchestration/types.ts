@@ -457,6 +457,8 @@ export interface RecoveryDecision {
   nextActionAt: string;
   status: RecoveryStatus;
   decidedAt: string;
+  /** Stable classifier fingerprint used for restart-safe strategy accounting. */
+  failureFingerprint?: string;
   /** Durable identity of the BLOCKED episode this repair decision may consume. */
   blockedEpisodeId?: EntityId;
 }

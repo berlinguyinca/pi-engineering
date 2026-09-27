@@ -246,27 +246,29 @@ export class CompletionGate {
               this.store.getExecution(executionId),
             )
           : [];
+      const replacementCoverageValid = replacements.every(
+        (task) => task?.status === "SUCCEEDED" && task.repo_id === lineage.repoId,
+      );
+      const requiresMutationProof = failed?.mutates_repo === true || !!candidate || mission.required_gates.length > 0;
+      const mutationProofValid =
+        !requiresMutationProof ||
+        (!!candidate &&
+          !!currentReview &&
+          evidenceExecutions.length === 3 &&
+          replacements.every(
+            (task) =>
+              !!task?.completed_at &&
+              evidenceExecutions.every(
+                (execution) => !!execution?.ended_at && Date.parse(execution.ended_at) > Date.parse(task.completed_at!),
+              ),
+          ));
       const valid =
         failed?.status === "FAILED" &&
         failed.repo_id === lineage.repoId &&
         replacements.length > 0 &&
         lineage.coverageFingerprint === (failed ? taskCoverageFingerprint(failed) : "") &&
-        replacements.every(
-          (task) =>
-            task?.status === "SUCCEEDED" &&
-            task.repo_id === lineage.repoId &&
-            taskCoverageFingerprint(task) === lineage.coverageFingerprint,
-        ) &&
-        !!candidate &&
-        !!currentReview &&
-        evidenceExecutions.length === 3 &&
-        replacements.every(
-          (task) =>
-            !!task?.completed_at &&
-            evidenceExecutions.every(
-              (execution) => !!execution?.ended_at && Date.parse(execution.ended_at) > Date.parse(task.completed_at!),
-            ),
-        ) &&
+        replacementCoverageValid &&
+        mutationProofValid &&
         lineage.acceptanceIds.every((acceptanceId) => coverage.has(acceptanceId));
       if (valid) validSuperseded.add(lineage.failedTaskId);
       else

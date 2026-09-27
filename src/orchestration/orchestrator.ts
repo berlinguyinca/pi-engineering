@@ -24,7 +24,7 @@ import type { WorkerActivity } from "../workers/WorkerExecutor.ts";
 import { type BrokerBackends, ExecutionBroker } from "./broker.ts";
 import { CheckpointManager } from "./checkpoints.ts";
 import { CompletionGate } from "./completionGate.ts";
-import { normalizeReviewSeverity } from "./evidence.ts";
+import { hashCandidateEvidenceIdentity, normalizeReviewSeverity, taskCoverageFingerprint } from "./evidence.ts";
 import { IntentRouter, workflowMutatesRepo } from "./intentRouter.ts";
 import type { MissionStore } from "./missionStore.ts";
 import type { MissionObservability } from "./observability/MissionObservability.ts";
@@ -32,6 +32,7 @@ import { computeProgress } from "./observability/progress.ts";
 import type { ActivityType, WaitingReason } from "./observability/types.ts";
 import type { DispatchAuthority, MissionOwnership } from "./ownership.ts";
 import { deriveRequiredGates, mutationFactFromChangedFiles } from "./policies.ts";
+import { RecoveryPlanner, type RecoveryPlannerOptions } from "./recovery.ts";
 import type { RepositoryRegistry } from "./repositoryRegistry.ts";
 import { brokerKind } from "./scheduler.ts";
 import { MissionScheduler } from "./scheduler.ts";
@@ -132,6 +133,8 @@ export interface OrchestratorOptions {
   ownership?: MissionOwnership;
   /** Bounds planner work before the first executable dispatch. */
   worksetPolicy?: Partial<WorksetPolicy>;
+  /** Durable mission-wide recovery budget shared by retries and blocked repair. */
+  recovery?: RecoveryPlannerOptions;
 }
 
 export interface OrchestrateResult {
@@ -175,6 +178,7 @@ export class Orchestrator {
   private readonly ownershipByMission = new Map<string, import("./types.ts").MissionLease>();
   private readonly missionRepoIds = new Map<string, string>();
   private readonly worksetPolicy: WorksetPolicy;
+  private readonly recoveryPlanner: RecoveryPlanner;
 
   constructor(opts: OrchestratorOptions) {
     this.store = opts.store;
@@ -183,6 +187,7 @@ export class Orchestrator {
     this.limits = opts.limits ?? {};
     this.maxRepairRounds = opts.maxRepairRounds ?? 2;
     this.worksetPolicy = { ...DEFAULT_WORKSET_POLICY, ...opts.worksetPolicy };
+    this.recoveryPlanner = new RecoveryPlanner(opts.recovery);
     const checkpoints = new CheckpointManager({ store: this.store });
     this.broker = new ExecutionBroker({
       store: this.store,
@@ -211,6 +216,7 @@ export class Orchestrator {
       sleep: opts.sleep,
       rand: opts.rand,
       acquireAuthority: this.ownership ? (task) => this.acquireTaskAuthority(task) : undefined,
+      recovery: opts.recovery,
       onStatus: (notice) => {
         const obs = this.observability;
         if (notice.action === "resumed") {
@@ -255,6 +261,220 @@ export class Orchestrator {
     this.workspaceResolver = opts.workspaceResolver ?? new WorkspaceManifestResolver();
     this.repositoryRegistry = opts.repositoryRegistry;
     this.launchCwd = opts.launchCwd ?? ".";
+  }
+
+  /**
+   * Repair one durable BLOCKED episode. Every material side effect is preceded
+   * by its durable recovery plan, and replay observes the existing episode
+   * instead of creating duplicate replacement work.
+   */
+  async repairBlockedMission(missionId: string, signal?: AbortSignal): Promise<Mission> {
+    this.activateMissionRepository(missionId);
+    const mission = this.store.getMission(missionId);
+    if (!mission) throw new Error(`unknown mission ${missionId}`);
+    if (mission.status !== "BLOCKED" && mission.status !== "REPAIRING") return mission;
+    const blockedEpisodeId = mission.blocked_episode_id;
+    const priorStop = this.store.listMissionStops(missionId).at(-1);
+    if (priorStop) return mission;
+
+    if (this.ownership) {
+      const lease = await this.ownership.acquire(missionId);
+      this.ownershipByMission.set(missionId, lease);
+    }
+    try {
+      const repositoryDiagnostics = await this.broker.durableRepositoryDiagnostics(missionId);
+      if (repositoryDiagnostics.length > 0) {
+        for (const diagnostic of repositoryDiagnostics) {
+          this.store.addFinding({
+            mission_id: missionId,
+            task_id: null,
+            severity: "blocking",
+            category: "persistence",
+            file: diagnostic.file || null,
+            line: null,
+            summary: `Corrupt durable ${diagnostic.recordKind} record for ${diagnostic.repoId}`,
+            evidence: diagnostic.reason,
+            recommended_action: "Repair or quarantine the named durable record before mission recovery.",
+          });
+        }
+        this.store.stopMission(missionId, {
+          reason: "durable repository recovery records failed canonical identity validation",
+          preservedWork: this.store
+            .listTaskCheckpoints(missionId)
+            .flatMap((checkpoint) => [checkpoint.worktree, checkpoint.branch])
+            .filter((value): value is string => !!value?.trim()),
+          attemptedRecoveries: [],
+          resumeCondition: "repair or quarantine every reported durable repository record",
+        });
+        await this.store.flush();
+        return this.store.getMission(missionId)!;
+      }
+      this.store.reconcileOrphanedExecutions(missionId);
+      await this.store.flush();
+      const classifications = this.store.listFailureClassifications(missionId);
+      const classification = classifications.at(-1);
+      if (!classification) throw new Error(`blocked mission ${missionId} has no durable failure classification`);
+      let repairDecision = this.store
+        .listRecoveryDecisions(missionId)
+        .find(
+          (entry) =>
+            entry.blockedEpisodeId === blockedEpisodeId &&
+            entry.action === "REPAIR_BLOCKED_MISSION" &&
+            (entry.status === "planned" || entry.status === "started"),
+        );
+      if (!repairDecision) {
+        const history = this.store
+          .listRecoveryDecisions(missionId)
+          .filter((decision) => decision.blockedEpisodeId !== blockedEpisodeId);
+        const choice = this.recoveryPlanner.decide({ classification, history, now: this.scheduler.now() });
+
+        if (choice.action === "STOP") {
+          const existing = this.store.getRecoveryDecision(choice.recoveryId);
+          const decision = existing ?? this.store.planRecovery(choice);
+          await this.store.flush();
+          if (decision.status === "planned") this.store.transitionRecovery(decision.recoveryId, "exhausted");
+          const checkpoints = this.store.listTaskCheckpoints(missionId);
+          const preservedWork = [
+            ...new Set(
+              checkpoints.flatMap((checkpoint) =>
+                [checkpoint.worktree, checkpoint.branch].filter((value): value is string => !!value?.trim()),
+              ),
+            ),
+          ];
+          const attemptedRecoveries = history.map((entry) => entry.recoveryId);
+          this.store.stopMission(missionId, {
+            reason: choice.expectedMaterialChange,
+            preservedWork,
+            attemptedRecoveries,
+            resumeCondition: "provide new material evidence or increase the approved recovery budget",
+          });
+          await this.store.flush();
+          return this.store.getMission(missionId)!;
+        }
+
+        repairDecision = this.store.planRecovery({
+          ...choice,
+          recoveryId: `${choice.recoveryId}-repair`,
+          action: "REPAIR_BLOCKED_MISSION",
+          expectedMaterialChange: `${choice.action}: ${choice.expectedMaterialChange}`,
+        });
+        await this.store.flush();
+      }
+
+      const failedTasks = this.store
+        .listTasks(missionId)
+        .filter(
+          (task) =>
+            task.status === "FAILED" &&
+            !this.store.listTaskSupersessions(missionId).some((lineage) => lineage.failedTaskId === task.task_id),
+        );
+      for (const failed of failedTasks) {
+        const checkpoint = this.store.listTaskCheckpoints(missionId, failed.task_id).at(-1);
+        const remaining = checkpoint?.remainingDeliverables.length
+          ? checkpoint.remainingDeliverables
+          : (failed.deliverables ?? []).length
+            ? (failed.deliverables ?? [])
+            : [failed.objective];
+        const replacements = remaining.map((deliverable, index) => {
+          const replacementId = `${repairDecision.recoveryId}-TSK-${failed.task_id}-${index + 1}`;
+          return (
+            this.store.getTask(replacementId) ??
+            this.store.createTask({
+              task_id: replacementId,
+              mission_id: missionId,
+              kind: failed.kind,
+              role: failed.role,
+              objective: `Recover ${failed.objective}: complete remaining deliverable ${deliverable}`,
+              depends_on: [],
+              priority: failed.priority,
+              mutates_repo: failed.mutates_repo,
+              write_domains: [...failed.write_domains],
+              isolation: failed.isolation,
+              execution_requirements: {
+                ...failed.execution_requirements,
+                recoveryFromCheckpoint: checkpoint?.checkpointId,
+              },
+              max_attempts: 1,
+              failure_policy: "block",
+              repo_id: failed.repo_id,
+              acceptance_ids: [...(failed.acceptance_ids ?? [])],
+              deliverables: [deliverable],
+              execution_budget_ms: failed.execution_budget_ms,
+              checkpoint_policy: failed.checkpoint_policy,
+              required_output_artifacts: [...(failed.required_output_artifacts ?? [])],
+              candidate_generation: (failed.candidate_generation ?? 0) + index + 1,
+            })
+          );
+        });
+        if (!this.store.listTaskSupersessions(missionId).some((lineage) => lineage.failedTaskId === failed.task_id)) {
+          this.store.supersedeTask({
+            supersessionId: `${repairDecision.recoveryId}-SUP-${failed.task_id}`,
+            missionId,
+            failedTaskId: failed.task_id,
+            replacementTaskIds: replacements.map((task) => task.task_id),
+            repoId: failed.repo_id ?? "",
+            acceptanceIds: [...(failed.acceptance_ids ?? [])],
+            coverageFingerprint: taskCoverageFingerprint(failed),
+            reason: checkpoint
+              ? `resume remaining work from checkpoint ${checkpoint.checkpointId}`
+              : "bounded replacement",
+            createdAt: new Date(this.scheduler.now()).toISOString(),
+          });
+        }
+      }
+      for (const candidate of this.store.listCandidates(missionId)) {
+        const reason = `blocked mission repair ${repairDecision.recoveryId}`;
+        if (
+          this.store
+            .listEvidenceInvalidations(missionId)
+            .some(
+              (entry) =>
+                entry.reason === reason && hashCandidateEvidenceIdentity(entry.identity) === candidate.identityHash,
+            )
+        )
+          continue;
+        this.store.invalidateEvidence({
+          invalidationId: id("EI"),
+          missionId,
+          identity: candidate.identity,
+          reason,
+          invalidatedAt: new Date(this.scheduler.now()).toISOString(),
+        });
+      }
+      await this.store.flush();
+      if (this.store.getMission(missionId)?.status === "BLOCKED") {
+        this.store.transitionMission(missionId, "REPAIRING", "system", {
+          recoveryDecisionId: repairDecision.recoveryId,
+        });
+      }
+      for (const lineage of this.store.listTaskSupersessions(missionId)) {
+        for (const taskId of lineage.replacementTaskIds) {
+          if (this.store.getTask(taskId)?.status === "PENDING") this.store.transitionTask(taskId, "READY");
+        }
+      }
+      await this.store.flush();
+      await this.scheduler.runMission(missionId, signal);
+      const replacementsFailed = this.store
+        .listTaskSupersessions(missionId)
+        .flatMap((lineage) => lineage.replacementTaskIds)
+        .some((taskId) => this.store.getTask(taskId)?.status !== "SUCCEEDED");
+      if (replacementsFailed) {
+        this.store.transitionRecovery(repairDecision.recoveryId, "failed");
+        if (this.store.getMission(missionId)?.status === "REPAIRING") {
+          this.store.transitionMission(missionId, "BLOCKED");
+        }
+        await this.store.flush();
+        return this.store.getMission(missionId)!;
+      }
+      const finalized = await this.finalizeMission(missionId, signal);
+      this.store.transitionRecovery(repairDecision.recoveryId, finalized.completed ? "succeeded" : "failed");
+      await this.store.flush();
+      return finalized.mission;
+    } finally {
+      const lease = this.ownershipByMission.get(missionId);
+      if (lease && this.ownership) await this.ownership.release(lease).catch(() => undefined);
+      this.ownershipByMission.delete(missionId);
+    }
   }
 
   private repoIdForMission(missionId: string): string | undefined {

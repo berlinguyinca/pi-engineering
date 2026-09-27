@@ -1066,7 +1066,10 @@ test("forged candidate and promotion identities are rejected while loading durab
     >;
     forgedCandidate.candidateId = "forged-candidate-id";
     await writeFile(join(stateDir, candidateFile), JSON.stringify(forgedCandidate));
-    assert.deepEqual(await repo.loadCandidateLifecycles(candidate.missionId, candidate.repoId), []);
+    const candidateInventory = await repo.loadCandidateLifecycleInventory(candidate.missionId, candidate.repoId);
+    assert.deepEqual(candidateInventory.records, []);
+    assert.equal(candidateInventory.diagnostics.length, 1);
+    assert.match(candidateInventory.diagnostics[0]?.reason ?? "", /canonical.*filename|candidate identity/i);
 
     candidate.candidateId = [
       candidate.missionId,
@@ -1081,6 +1084,11 @@ test("forged candidate and promotion identities are rejected while loading durab
     await writeFile(join(candidate.path, "src", "forged.ts"), "export const forged = false;\n");
     await repo.commitAll(candidate.path, "valid candidate");
     candidate.candidateSha = await repo.headCommitIn(candidate.path);
+    const run = await repo.beginIntegrationRun(candidate, "identity-run", []);
+    run.state = "completed";
+    run.candidateSha = candidate.candidateSha;
+    await repo.persistIntegrationRun(run);
+    candidate.integrationRunId = run.runId;
     await repo.persistCandidateLifecycle(candidate);
     await repo.promoteCandidate(candidate, base, undefined, candidate);
     const promotionFile = (await readdir(stateDir)).find((name) => name.startsWith("promotion."))!;
@@ -1088,14 +1096,96 @@ test("forged candidate and promotion identities are rejected while loading durab
       string,
       unknown
     >;
-    forgedPromotion.originRepositoryGeneration = 999;
+    forgedPromotion.candidateRepositoryGeneration = 2;
+    forgedPromotion.originRepositoryGeneration = 1;
+    forgedPromotion.reconciliationRepositoryGeneration = 1;
     await writeFile(join(stateDir, promotionFile), JSON.stringify(forgedPromotion));
-    assert.deepEqual(await repo.loadPromotionLifecycles(candidate.missionId, candidate.repoId), []);
+    const impossiblePromotion = await repo.loadPromotionLifecycleInventory(candidate.missionId, candidate.repoId);
+    assert.deepEqual(impossiblePromotion.records, []);
+    assert.equal(impossiblePromotion.diagnostics.length, 1);
+    assert.match(impossiblePromotion.diagnostics[0]?.reason ?? "", /candidate.*origin.*reconciliation/i);
 
+    forgedPromotion.candidateRepositoryGeneration = forgedPromotion.repositoryGeneration;
     forgedPromotion.originRepositoryGeneration = forgedPromotion.repositoryGeneration;
+    delete forgedPromotion.reconciliationRepositoryGeneration;
     forgedPromotion.attempt = "different-attempt";
     await writeFile(join(stateDir, promotionFile), JSON.stringify(forgedPromotion));
-    assert.deepEqual(await repo.loadPromotionLifecycles(candidate.missionId, candidate.repoId), []);
+    const mismatchedPromotion = await repo.loadPromotionLifecycleInventory(candidate.missionId, candidate.repoId);
+    assert.deepEqual(mismatchedPromotion.records, []);
+    assert.equal(mismatchedPromotion.diagnostics.length, 1);
+    assert.match(
+      mismatchedPromotion.diagnostics[0]?.reason ?? "",
+      /(?:canonical.*(?:filename|identity)|identity.*canonical)/i,
+    );
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("integration run filename and payload identity must match before replay", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const repo = (await GitRepo.open(fixture.root))!;
+    const base = await repo.headCommit();
+    const candidate = await repo.createCandidateWorktree(base, {
+      missionId: "MSN-run-identity",
+      repoId: "repo-run-identity",
+      missionGeneration: 3,
+      candidateGeneration: 4,
+      repositoryGeneration: 5,
+      attempt: "attempt-run",
+    });
+    const run = await repo.beginIntegrationRun(candidate, "run-one", []);
+    const stateDir = join(await repo.commonDir(), "pi-engineering-candidates");
+    const runFile = (await readdir(stateDir)).find((name) => name.startsWith("run."))!;
+    await writeFile(join(stateDir, runFile), JSON.stringify({ ...run, runId: "forged-run" }));
+
+    const inventory = await repo.loadIntegrationRunInventory(candidate.missionId, candidate.repoId);
+    assert.deepEqual(inventory.records, []);
+    assert.equal(inventory.diagnostics.length, 1);
+    assert.match(inventory.diagnostics[0]?.reason ?? "", /canonical.*filename/i);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("corrupt cleanup ownership fails closed before worktree or branch mutation", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const repo = (await GitRepo.open(fixture.root))!;
+    const worktree = await repo.createWorktree(await repo.headCommit(), "cleanup-owned-target");
+    const identity = { missionId: "MSN-cleanup-owner", repoId: "repo-cleanup-owner" };
+    await assert.rejects(
+      repo.removeWorktree(worktree, { cleanupIdentity: identity }, undefined, {
+        afterIntent: () => {
+          throw new Error("crash after cleanup intent");
+        },
+      }),
+      /crash after cleanup intent/,
+    );
+    const stateDir = join(await repo.commonDir(), "pi-engineering-candidates");
+    const journal = (await readdir(stateDir)).find((name) => name.startsWith("cleanup."))!;
+    const payload = JSON.parse(await readFile(join(stateDir, journal), "utf8")) as Record<string, unknown>;
+    await writeFile(
+      join(stateDir, journal),
+      JSON.stringify({
+        ...payload,
+        missionId: "MSN-unrelated",
+        repoId: "repo-unrelated",
+        path: `${worktree.path}-unrelated`,
+        branch: "unrelated-branch",
+      }),
+    );
+
+    await assert.rejects(
+      repo.removeWorktree(worktree, { cleanupIdentity: identity }),
+      /cleanup journal.*identity|cleanup ownership/i,
+    );
+    assert.equal(await repo.headCommitIn(worktree.path), await repo.headCommit());
+    assert.ok(await repo.resolveCommit(worktree.branch), "the owned branch must remain after fail-closed recovery");
+    const inventory = await repo.loadPendingBranchCleanupInventory(identity.missionId, identity.repoId);
+    assert.deepEqual(inventory.records, []);
+    assert.equal(inventory.diagnostics.length, 1);
   } finally {
     await fixture.cleanup();
   }

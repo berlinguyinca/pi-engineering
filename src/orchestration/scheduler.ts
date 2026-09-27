@@ -24,6 +24,7 @@ import { type SchedulableTask, Scheduler } from "../sched/Scheduler.ts";
 import type { ExecutionBroker, ExecutionHandle, ExecutionRequestInput } from "./broker.ts";
 import type { MissionStore } from "./missionStore.ts";
 import type { DispatchAuthority } from "./ownership.ts";
+import { FailureClassifier, type FailureEvidence, RecoveryPlanner, type RecoveryPlannerOptions } from "./recovery.ts";
 import type { MissionStatus, OrchestrationTask, TaskKind, TaskStatus } from "./types.ts";
 import { canonicalizeWriteDomain } from "./workset.ts";
 
@@ -108,6 +109,8 @@ export interface SchedulerOptions {
   rand?: () => number;
   /** Acquires renewable mission/repository fencing immediately before each dispatch. */
   acquireAuthority?: (task: OrchestrationTask) => Promise<DispatchAuthority>;
+  /** Mission-wide durable retry/repair ceiling. */
+  recovery?: RecoveryPlannerOptions;
 }
 
 export interface MissionSchedulerStatusNotice {
@@ -187,6 +190,8 @@ export class MissionScheduler {
   private readonly sleepFn: (ms: number) => Promise<void>;
   private readonly rand: () => number;
   private readonly acquireAuthority?: SchedulerOptions["acquireAuthority"];
+  private readonly failureClassifier = new FailureClassifier();
+  private readonly recoveryPlanner: RecoveryPlanner;
   /** Per-task active retry window (created on the first infra failure). */
   private readonly windows = new Map<string, RetryWindowState>();
   /**
@@ -217,6 +222,10 @@ export class MissionScheduler {
     this.sleepFn = opts.sleep ?? realSleep;
     this.rand = opts.rand ?? Math.random;
     this.acquireAuthority = opts.acquireAuthority;
+    this.recoveryPlanner = new RecoveryPlanner({
+      decisionTtlMs: this.resilience.max_outage_ms,
+      ...opts.recovery,
+    });
     this.queue = new Scheduler({ concurrency: this.limits.maxActive });
   }
 
@@ -472,6 +481,7 @@ export class MissionScheduler {
           const ceiling = infraCat ? this.outageCeiling(task, outcome) : null;
           if (ceiling) {
             authority?.assertAuthoritative();
+            this.settleTaskRecoveries(task, "failed");
             this.store.transitionTask(task.task_id, "FAILED", "system", { failure_reason: ceiling });
             this.forgetOutage(task);
             return;
@@ -480,6 +490,21 @@ export class MissionScheduler {
             const res = this.resilienceGate(task, infraCat);
             if (res.paused) return;
             if (res.retry) {
+              const recoveryStop = await this.authorizeRetry(task, {
+                missionId: task.mission_id,
+                taskId: task.task_id,
+                executionId: handle.executionId,
+                summary: outcome.summary ?? outcome.error ?? "provider transient failure",
+                evidenceRefs: outcome.artifactRefs,
+                category: "PROVIDER_TRANSIENT",
+                observedAt: new Date(this.clockNow()).toISOString(),
+              });
+              if (recoveryStop) {
+                authority?.assertAuthoritative();
+                this.settleTaskRecoveries(task, "failed");
+                this.store.transitionTask(task.task_id, "FAILED", "system", { failure_reason: recoveryStop });
+                return;
+              }
               authority?.assertAuthoritative();
               this.store.transitionTask(task.task_id, "RETRYING", "system", { attempt });
               const waited = await this.abortable(this.sleepFn(res.waitMs), signal);
@@ -494,6 +519,7 @@ export class MissionScheduler {
           // exhaustion, timeouts, no-result) — exitStatus alone hid the cause.
           const detail = outcome.summary ? `: ${outcome.summary}` : "";
           authority?.assertAuthoritative();
+          this.settleTaskRecoveries(task, "failed");
           this.store.transitionTask(task.task_id, "FAILED", "system", {
             failure_reason: `backend reported ${outcome.exitStatus}${detail}`,
           });
@@ -517,6 +543,7 @@ export class MissionScheduler {
         }
         authority?.assertAuthoritative();
         this.store.transitionTask(task.task_id, "SUCCEEDED");
+        this.settleTaskRecoveries(task, "succeeded");
         return;
       } catch (err) {
         if (authority) {
@@ -543,11 +570,27 @@ export class MissionScheduler {
         // worker's non-throwing transient-infrastructure outcomes above.
         const { action, reason } = classifyFailure(err, task);
         if (action === "retry" && attempt < task.max_attempts) {
+          const recoveryStop = await this.authorizeRetry(task, {
+            missionId: task.mission_id,
+            taskId: task.task_id,
+            executionId: handle?.executionId ?? null,
+            summary: reason,
+            evidenceRefs: [],
+            category: /^transient:/i.test(reason) ? "PROVIDER_TRANSIENT" : undefined,
+            observedAt: new Date(this.clockNow()).toISOString(),
+          });
+          if (recoveryStop) {
+            authority?.assertAuthoritative();
+            this.settleTaskRecoveries(task, "failed");
+            this.store.transitionTask(task.task_id, "FAILED", "system", { failure_reason: recoveryStop });
+            return;
+          }
           authority?.assertAuthoritative();
           this.store.transitionTask(task.task_id, "RETRYING", "system", { attempt });
           continue;
         }
         authority?.assertAuthoritative();
+        this.settleTaskRecoveries(task, "failed");
         this.store.transitionTask(task.task_id, "FAILED", "system", { failure_reason: reason });
         return;
       } finally {
@@ -565,6 +608,38 @@ export class MissionScheduler {
             error: closeError,
           });
         }
+      }
+    }
+  }
+
+  private async authorizeRetry(task: OrchestrationTask, evidence: FailureEvidence): Promise<string | null> {
+    const classification = this.failureClassifier.classify(evidence);
+    if (!this.store.getFailureClassification(classification.classificationId)) {
+      this.store.classifyFailure(classification);
+    }
+    const decision = this.recoveryPlanner.decide({
+      classification,
+      history: this.store.listRecoveryDecisions(task.mission_id),
+      now: this.clockNow(),
+    });
+    const persisted = this.store.getRecoveryDecision(decision.recoveryId) ?? this.store.planRecovery(decision);
+    if (persisted.status === "planned") {
+      this.store.transitionRecovery(persisted.recoveryId, decision.action === "STOP" ? "exhausted" : "started");
+    }
+    await this.store.flush();
+    return decision.action === "STOP" ? decision.expectedMaterialChange : null;
+  }
+
+  private settleTaskRecoveries(task: OrchestrationTask, status: "succeeded" | "failed"): void {
+    const taskClassifications = new Set(
+      this.store
+        .listFailureClassifications(task.mission_id)
+        .filter((classification) => classification.taskId === task.task_id)
+        .map((classification) => classification.classificationId),
+    );
+    for (const decision of this.store.listRecoveryDecisions(task.mission_id)) {
+      if (decision.status === "started" && taskClassifications.has(decision.classificationId)) {
+        this.store.transitionRecovery(decision.recoveryId, status);
       }
     }
   }

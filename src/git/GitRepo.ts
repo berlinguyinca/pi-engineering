@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { access, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { promisify } from "node:util";
@@ -163,6 +164,11 @@ export interface PendingBranchCleanupInventory {
   diagnostics: Array<{ file: string; reason: string }>;
 }
 
+export interface DurableRecordInventory<T> {
+  records: T[];
+  diagnostics: Array<{ file: string; reason: string }>;
+}
+
 /**
  * Minimal Git repository provider (spec §7 `git/`, §13.3 worktree isolation).
  *
@@ -241,16 +247,23 @@ export class GitRepo {
     }
   }
 
-  private candidateStateName(
-    missionId: string,
-    repoId: string,
-    missionGeneration: number,
-    candidateGeneration: number,
-    attempt: string,
-  ): string {
-    return `${[missionId, repoId, String(missionGeneration), String(candidateGeneration), attempt]
-      .map((part) => Buffer.from(part).toString("base64url"))
-      .join(".")}.json`;
+  private durableIdentityName(prefix: string, parts: Array<string | number>): string {
+    const digest = createHash("sha256").update(JSON.stringify(parts)).digest("hex");
+    return `${prefix}.${digest}.json`;
+  }
+
+  private candidateStateName(record: CandidateRecord): string {
+    return this.durableIdentityName("candidate", [
+      record.candidateId,
+      record.missionId,
+      record.repoId,
+      record.missionGeneration,
+      record.candidateGeneration,
+      record.repositoryGeneration,
+      record.attempt,
+      record.baseSha,
+      record.candidateSha,
+    ]);
   }
 
   private candidateId(identity: {
@@ -271,14 +284,23 @@ export class GitRepo {
       .join(".");
   }
 
-  private integrationRunStateName(candidateId: string, runId: string): string {
-    return `run.${[candidateId, runId].map((part) => Buffer.from(part).toString("base64url")).join(".")}.json`;
+  private integrationRunStateName(record: IntegrationRunRecord): string {
+    return this.durableIdentityName("run", [
+      record.candidateId,
+      record.runId,
+      record.missionId,
+      record.repoId,
+      record.missionGeneration,
+      record.candidateGeneration,
+      record.startingCandidateSha,
+      record.candidateSha,
+    ]);
   }
 
-  private branchCleanupStateName(record: Pick<PendingBranchCleanup, "missionId" | "repoId" | "branch">): string {
-    return `cleanup.${[record.missionId, record.repoId, record.branch]
-      .map((part) => Buffer.from(part).toString("base64url"))
-      .join(".")}.json`;
+  private branchCleanupStateName(
+    record: Pick<PendingBranchCleanup, "missionId" | "repoId" | "path" | "branch">,
+  ): string {
+    return this.durableIdentityName("cleanup", [record.missionId, record.repoId, record.path, record.branch]);
   }
 
   private async persistPendingBranchCleanup(record: PendingBranchCleanup, guard?: GitMutationGuard): Promise<void> {
@@ -295,21 +317,24 @@ export class GitRepo {
     const dir = await this.candidateStateDir(false);
     const records: PendingBranchCleanup[] = [];
     const diagnostics: Array<{ file: string; reason: string }> = [];
-    const prefix = `cleanup.${[missionId, repoId].map((part) => Buffer.from(part).toString("base64url")).join(".")}.`;
     for (const name of await readdir(dir).catch(() => [] as string[])) {
-      if (!name.startsWith(prefix) || !name.endsWith(".json")) continue;
+      if (!name.startsWith("cleanup.") || !name.endsWith(".json")) continue;
       try {
         const parsed = JSON.parse(await readFile(join(dir, name), "utf8")) as PendingBranchCleanup;
-        if (
-          parsed.missionId === missionId &&
-          parsed.repoId === repoId &&
+        const structurallyValid =
+          typeof parsed.missionId === "string" &&
+          parsed.missionId.trim().length > 0 &&
+          typeof parsed.repoId === "string" &&
+          parsed.repoId.trim().length > 0 &&
           typeof parsed.path === "string" &&
+          parsed.path.trim().length > 0 &&
           typeof parsed.branch === "string" &&
-          ["intent", "worktree_removed", "branch_deleted"].includes(parsed.state)
-        ) {
-          records.push(parsed);
-        } else {
+          parsed.branch.trim().length > 0 &&
+          ["intent", "worktree_removed", "branch_deleted"].includes(parsed.state);
+        if (!structurallyValid || name !== this.branchCleanupStateName(parsed)) {
           diagnostics.push({ file: name, reason: "cleanup journal has invalid identity or phase" });
+        } else if (parsed.missionId === missionId && parsed.repoId === repoId) {
+          records.push(parsed);
         }
       } catch (error) {
         diagnostics.push({
@@ -325,21 +350,21 @@ export class GitRepo {
     return (await this.loadPendingBranchCleanupInventory(missionId, repoId)).records;
   }
 
-  private promotionStateName(
-    record: Pick<
-      PromotionLifecycle,
-      "missionId" | "repoId" | "missionGeneration" | "candidateGeneration" | "candidateSha"
-    >,
-  ): string {
-    return `promotion.${[
+  private promotionStateName(record: PromotionLifecycle): string {
+    return this.durableIdentityName("promotion", [
+      record.candidateId,
       record.missionId,
       record.repoId,
-      String(record.missionGeneration),
-      String(record.candidateGeneration),
+      record.missionGeneration,
+      record.candidateGeneration,
+      record.repositoryGeneration,
+      record.candidateRepositoryGeneration,
+      record.originRepositoryGeneration,
+      record.attempt,
+      record.integrationRunId,
+      record.baseSha,
       record.candidateSha,
-    ]
-      .map((part) => Buffer.from(part).toString("base64url"))
-      .join(".")}.json`;
+    ]);
   }
 
   private async persistPromotionLifecycle(record: PromotionLifecycle, guard?: GitMutationGuard): Promise<void> {
@@ -355,16 +380,7 @@ export class GitRepo {
   async persistCandidateLifecycle(record: CandidateLifecycle, guard?: GitMutationGuard): Promise<void> {
     guard?.assertAuthoritative();
     const dir = await this.candidateStateDir();
-    const target = join(
-      dir,
-      this.candidateStateName(
-        record.missionId,
-        record.repoId,
-        record.missionGeneration,
-        record.candidateGeneration,
-        record.attempt,
-      ),
-    );
+    const target = join(dir, this.candidateStateName(record));
     const temporary = `${target}.${process.pid}.tmp`;
     await writeFile(temporary, JSON.stringify(record), "utf8");
     guard?.assertAuthoritative();
@@ -374,71 +390,129 @@ export class GitRepo {
   async persistIntegrationRun(record: IntegrationRunRecord, guard?: GitMutationGuard): Promise<void> {
     guard?.assertAuthoritative();
     const dir = await this.candidateStateDir();
-    const target = join(dir, this.integrationRunStateName(record.candidateId, record.runId));
+    const target = join(dir, this.integrationRunStateName(record));
     const temporary = `${target}.${process.pid}.tmp`;
     await writeFile(temporary, JSON.stringify(record), "utf8");
     guard?.assertAuthoritative();
     await rename(temporary, target);
   }
 
-  async loadCandidateLifecycles(missionId: string, repoId: string): Promise<CandidateLifecycle[]> {
+  async loadCandidateLifecycleInventory(
+    missionId: string,
+    repoId: string,
+  ): Promise<DurableRecordInventory<CandidateLifecycle>> {
     const dir = await this.candidateStateDir(false);
     const records: CandidateLifecycle[] = [];
+    const diagnostics: Array<{ file: string; reason: string }> = [];
     for (const name of await readdir(dir).catch(() => [] as string[])) {
       if (!name.endsWith(".json")) continue;
       try {
         if (name.startsWith("promotion.") || name.startsWith("run.") || name.startsWith("cleanup.")) continue;
         const parsed = JSON.parse(await readFile(join(dir, name), "utf8")) as CandidateLifecycle;
         if (
-          parsed.missionId === missionId &&
-          parsed.repoId === repoId &&
-          typeof parsed.missionGeneration === "number" &&
-          typeof parsed.candidateGeneration === "number" &&
-          typeof parsed.repositoryGeneration === "number" &&
+          typeof parsed.missionId === "string" &&
+          parsed.missionId.trim().length > 0 &&
+          typeof parsed.repoId === "string" &&
+          parsed.repoId.trim().length > 0 &&
+          Number.isSafeInteger(parsed.missionGeneration) &&
+          parsed.missionGeneration >= 0 &&
+          Number.isSafeInteger(parsed.candidateGeneration) &&
+          parsed.candidateGeneration >= 0 &&
+          Number.isSafeInteger(parsed.repositoryGeneration) &&
+          parsed.repositoryGeneration >= 0 &&
           typeof parsed.attempt === "string" &&
+          parsed.attempt.trim().length > 0 &&
           typeof parsed.branch === "string" &&
+          parsed.branch.trim().length > 0 &&
           typeof parsed.path === "string" &&
+          parsed.path.trim().length > 0 &&
           typeof parsed.baseSha === "string" &&
-          typeof parsed.candidateSha === "string"
+          parsed.baseSha.trim().length > 0 &&
+          typeof parsed.candidateSha === "string" &&
+          parsed.candidateSha.trim().length > 0
         ) {
           const derivedCandidateId = this.candidateId(parsed);
-          if (parsed.candidateId && parsed.candidateId !== derivedCandidateId) continue;
-          records.push({ ...parsed, candidateId: derivedCandidateId });
+          const canonical = { ...parsed, candidateId: derivedCandidateId };
+          if (parsed.candidateId !== derivedCandidateId || name !== this.candidateStateName(canonical)) {
+            diagnostics.push({ file: name, reason: "candidate identity does not match canonical filename" });
+            continue;
+          }
+          if (parsed.missionId === missionId && parsed.repoId === repoId) records.push(canonical);
+        } else {
+          diagnostics.push({ file: name, reason: "candidate record has invalid or empty identity fields" });
         }
-      } catch {
-        // Malformed lifecycle records are ignored here and fail closed when no
-        // usable candidate can be reconciled by the broker.
+      } catch (error) {
+        diagnostics.push({
+          file: name,
+          reason: `candidate record is unreadable: ${error instanceof Error ? error.message : String(error)}`,
+        });
       }
     }
-    return records.sort(
+    records.sort(
       (a, b) =>
         a.missionGeneration - b.missionGeneration ||
         a.candidateGeneration - b.candidateGeneration ||
         a.updatedAt.localeCompare(b.updatedAt),
     );
+    return { records: [...new Map(records.map((record) => [record.candidateId, record])).values()], diagnostics };
   }
 
-  async loadIntegrationRuns(missionId: string, repoId: string): Promise<IntegrationRunRecord[]> {
+  async loadCandidateLifecycles(missionId: string, repoId: string): Promise<CandidateLifecycle[]> {
+    return (await this.loadCandidateLifecycleInventory(missionId, repoId)).records;
+  }
+
+  async loadIntegrationRunInventory(
+    missionId: string,
+    repoId: string,
+  ): Promise<DurableRecordInventory<IntegrationRunRecord>> {
     const dir = await this.candidateStateDir(false);
     const records: IntegrationRunRecord[] = [];
+    const diagnostics: Array<{ file: string; reason: string }> = [];
     for (const name of await readdir(dir).catch(() => [] as string[])) {
       if (!name.startsWith("run.") || !name.endsWith(".json")) continue;
       try {
         const parsed = JSON.parse(await readFile(join(dir, name), "utf8")) as IntegrationRunRecord;
         if (
-          parsed.missionId === missionId &&
-          parsed.repoId === repoId &&
+          typeof parsed.missionId === "string" &&
+          parsed.missionId.trim().length > 0 &&
+          typeof parsed.repoId === "string" &&
+          parsed.repoId.trim().length > 0 &&
           typeof parsed.candidateId === "string" &&
+          parsed.candidateId.trim().length > 0 &&
           typeof parsed.runId === "string" &&
+          parsed.runId.trim().length > 0 &&
+          Number.isSafeInteger(parsed.missionGeneration) &&
+          parsed.missionGeneration >= 0 &&
+          Number.isSafeInteger(parsed.candidateGeneration) &&
+          parsed.candidateGeneration >= 0 &&
+          typeof parsed.startingCandidateSha === "string" &&
+          parsed.startingCandidateSha.trim().length > 0 &&
+          typeof parsed.candidateSha === "string" &&
+          parsed.candidateSha.trim().length > 0 &&
           Array.isArray(parsed.merges)
         ) {
-          records.push(parsed);
+          if (name !== this.integrationRunStateName(parsed)) {
+            diagnostics.push({ file: name, reason: "integration run identity does not match canonical filename" });
+          } else if (parsed.missionId === missionId && parsed.repoId === repoId) records.push(parsed);
+        } else {
+          diagnostics.push({ file: name, reason: "integration run has invalid or empty identity fields" });
         }
-      } catch {
-        // Unreadable run state is never used to authorize replay.
+      } catch (error) {
+        diagnostics.push({
+          file: name,
+          reason: `integration run is unreadable: ${error instanceof Error ? error.message : String(error)}`,
+        });
       }
     }
-    return records.sort((a, b) => a.updatedAt.localeCompare(b.updatedAt));
+    records.sort((a, b) => a.updatedAt.localeCompare(b.updatedAt));
+    return {
+      records: [...new Map(records.map((record) => [`${record.candidateId}\0${record.runId}`, record])).values()],
+      diagnostics,
+    };
+  }
+
+  async loadIntegrationRuns(missionId: string, repoId: string): Promise<IntegrationRunRecord[]> {
+    return (await this.loadIntegrationRunInventory(missionId, repoId)).records;
   }
 
   async beginIntegrationRun(
@@ -485,41 +559,75 @@ export class GitRepo {
     return record;
   }
 
-  async loadPromotionLifecycles(missionId: string, repoId: string): Promise<PromotionLifecycle[]> {
+  async loadPromotionLifecycleInventory(
+    missionId: string,
+    repoId: string,
+  ): Promise<DurableRecordInventory<PromotionLifecycle>> {
     const dir = await this.candidateStateDir(false);
     const records: PromotionLifecycle[] = [];
+    const diagnostics: Array<{ file: string; reason: string }> = [];
     for (const name of await readdir(dir).catch(() => [] as string[])) {
       if (!name.startsWith("promotion.") || !name.endsWith(".json")) continue;
       try {
         const parsed = JSON.parse(await readFile(join(dir, name), "utf8")) as PromotionLifecycle;
         if (
-          parsed.missionId === missionId &&
-          parsed.repoId === repoId &&
-          typeof parsed.missionGeneration === "number" &&
-          typeof parsed.candidateGeneration === "number" &&
-          typeof parsed.repositoryGeneration === "number" &&
-          typeof parsed.candidateRepositoryGeneration === "number" &&
-          typeof parsed.originRepositoryGeneration === "number" &&
+          typeof parsed.missionId === "string" &&
+          parsed.missionId.trim().length > 0 &&
+          typeof parsed.repoId === "string" &&
+          parsed.repoId.trim().length > 0 &&
+          Number.isSafeInteger(parsed.missionGeneration) &&
+          parsed.missionGeneration >= 0 &&
+          Number.isSafeInteger(parsed.candidateGeneration) &&
+          parsed.candidateGeneration >= 0 &&
+          Number.isSafeInteger(parsed.repositoryGeneration) &&
+          parsed.repositoryGeneration >= 0 &&
+          Number.isSafeInteger(parsed.candidateRepositoryGeneration) &&
+          parsed.candidateRepositoryGeneration >= 0 &&
+          Number.isSafeInteger(parsed.originRepositoryGeneration) &&
+          parsed.originRepositoryGeneration >= 0 &&
           typeof parsed.attempt === "string" &&
+          parsed.attempt.trim().length > 0 &&
           typeof parsed.integrationRunId === "string" &&
+          parsed.integrationRunId.trim().length > 0 &&
           typeof parsed.baseSha === "string" &&
+          parsed.baseSha.trim().length > 0 &&
           typeof parsed.candidateSha === "string" &&
+          parsed.candidateSha.trim().length > 0 &&
           parsed.repositoryGeneration === parsed.originRepositoryGeneration &&
+          parsed.candidateRepositoryGeneration <= parsed.originRepositoryGeneration &&
           (parsed.reconciliationRepositoryGeneration === undefined ||
-            (typeof parsed.reconciliationRepositoryGeneration === "number" &&
+            (Number.isSafeInteger(parsed.reconciliationRepositoryGeneration) &&
+              parsed.reconciliationRepositoryGeneration >= 0 &&
               parsed.reconciliationRepositoryGeneration >= parsed.originRepositoryGeneration)) &&
           (parsed.state !== "intent" || parsed.reconciliationRepositoryGeneration === undefined) &&
           (parsed.state === "intent" || parsed.state === "completed")
         ) {
           const derivedCandidateId = this.candidateId(parsed);
-          if (parsed.candidateId !== derivedCandidateId) continue;
-          records.push(parsed);
+          if (parsed.candidateId !== derivedCandidateId) {
+            diagnostics.push({ file: name, reason: "promotion candidate identity is not canonical" });
+          } else if (name !== this.promotionStateName(parsed)) {
+            diagnostics.push({ file: name, reason: "promotion identity does not match canonical filename" });
+          } else if (parsed.missionId === missionId && parsed.repoId === repoId) records.push(parsed);
+        } else {
+          diagnostics.push({
+            file: name,
+            reason:
+              "promotion authority ordering is invalid: candidate repository generation must not exceed origin or reconciliation generation",
+          });
         }
-      } catch {
-        // Unreadable promotion state cannot authorize recovery.
+      } catch (error) {
+        diagnostics.push({
+          file: name,
+          reason: `promotion record is unreadable: ${error instanceof Error ? error.message : String(error)}`,
+        });
       }
     }
-    return records.sort((a, b) => a.updatedAt.localeCompare(b.updatedAt));
+    records.sort((a, b) => a.updatedAt.localeCompare(b.updatedAt));
+    return { records, diagnostics };
+  }
+
+  async loadPromotionLifecycles(missionId: string, repoId: string): Promise<PromotionLifecycle[]> {
+    return (await this.loadPromotionLifecycleInventory(missionId, repoId)).records;
   }
 
   async createCandidateWorktree(
@@ -782,9 +890,33 @@ export class GitRepo {
     await this.assertPromotionUnlocked();
     let pending: PendingBranchCleanup | undefined;
     if (!opts.keepBranch && opts.cleanupIdentity) {
-      pending = (
-        await this.loadPendingBranchCleanups(opts.cleanupIdentity.missionId, opts.cleanupIdentity.repoId)
-      ).find((record) => record.branch === info.branch && record.path === info.path);
+      const inventory = await this.loadPendingBranchCleanupInventory(
+        opts.cleanupIdentity.missionId,
+        opts.cleanupIdentity.repoId,
+      );
+      if (inventory.diagnostics.length > 0) {
+        throw new Error(
+          `cleanup journal identity is corrupt; refusing Git mutation: ${inventory.diagnostics
+            .map((diagnostic) => `${diagnostic.file}: ${diagnostic.reason}`)
+            .join("; ")}`,
+        );
+      }
+      pending = inventory.records.find((record) => record.branch === info.branch && record.path === info.path);
+      const expectedJournal = join(
+        await this.candidateStateDir(false),
+        this.branchCleanupStateName({ ...opts.cleanupIdentity, path: info.path, branch: info.branch }),
+      );
+      if (!pending) {
+        try {
+          await access(expectedJournal);
+          throw new Error("cleanup journal canonical filename does not match its payload identity");
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        }
+      }
+      if (inventory.records.length > 0 && !pending) {
+        throw new Error("cleanup ownership does not match the requested repository worktree path and branch");
+      }
       if (!pending) {
         pending = {
           ...opts.cleanupIdentity,
@@ -806,6 +938,19 @@ export class GitRepo {
         else throw error;
       }
       if (worktreeExists) {
+        const listed = await this.git(["worktree", "list", "--porcelain"], { preserveStdout: true });
+        if (listed.code !== 0) throw new Error(`cleanup ownership lookup failed: ${listed.stderr}`);
+        const expectedBranch = `refs/heads/${info.branch}`;
+        const exactMapping = listed.stdout
+          .split(/\n\n+/)
+          .some(
+            (entry) =>
+              entry.split("\n").includes(`worktree ${info.path}`) &&
+              entry.split("\n").includes(`branch ${expectedBranch}`),
+          );
+        if (!exactMapping) {
+          throw new Error("cleanup ownership does not match an exact repository worktree path and branch mapping");
+        }
         guard?.assertAuthoritative();
         const removed = await this.git(["worktree", "remove", "--force", info.path]);
         if (removed.code !== 0) {
@@ -1205,7 +1350,7 @@ export class GitRepo {
           candidateRepositoryGeneration: lifecycle.repositoryGeneration,
           originRepositoryGeneration,
           attempt: lifecycle.attempt,
-          integrationRunId: lifecycle.integrationRunId ?? "",
+          integrationRunId: lifecycle.integrationRunId ?? "direct-promotion",
           candidateSha,
           baseSha: boundBase,
           state: "intent",
@@ -1355,7 +1500,7 @@ export class GitRepo {
         record.candidateGeneration === lifecycle.candidateGeneration &&
         record.candidateRepositoryGeneration === lifecycle.repositoryGeneration &&
         record.attempt === lifecycle.attempt &&
-        record.integrationRunId === (lifecycle.integrationRunId ?? "") &&
+        record.integrationRunId === (lifecycle.integrationRunId ?? "direct-promotion") &&
         record.baseSha === lifecycle.baseSha &&
         record.candidateSha === lifecycle.candidateSha &&
         (record.state === "intent" || record.state === "completed"),

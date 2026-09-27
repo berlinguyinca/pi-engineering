@@ -447,6 +447,12 @@ export class MissionStore {
         if (execution) this.executions.set(execution.execution_id, copyExecution(execution));
         break;
       }
+      case "execution.orphaned":
+      case "execution.reconciled": {
+        const execution = e.payload.execution as Execution | undefined;
+        if (execution) this.executions.set(execution.execution_id, copyExecution(execution));
+        break;
+      }
       case "finding.created": {
         const f = e.payload.finding as ReviewFinding;
         if (f) this.findings.set(f.finding_id, { ...f });
@@ -1071,6 +1077,43 @@ export class MissionStore {
     return copyExecution(rejected);
   }
 
+  /**
+   * Fence executions that survived their controller episode before recovery
+   * can dispatch replacement work. The orphan marker is durable first; replay
+   * then observes either the still-live orphan or its terminal reconciliation.
+   */
+  reconcileOrphanedExecutions(missionId: string): Execution[] {
+    const reconciled: Execution[] = [];
+    for (const execution of this.listExecutions(missionId).filter((entry) => entry.status === "RUNNING")) {
+      this.emit("execution.orphaned", missionId, {
+        actor: "system",
+        execution,
+        reason: "blocked mission recovery fenced prior controller execution",
+      });
+      const terminal: Execution = {
+        ...execution,
+        status: "CANCELED",
+        exit_status: "orphaned_execution_reconciled",
+        ended_at: new Date().toISOString(),
+      };
+      this.executions.set(execution.execution_id, terminal);
+      this.emit("execution.reconciled", missionId, {
+        actor: "system",
+        execution: terminal,
+        reason: "prior execution fenced before replacement dispatch",
+      });
+      const task = this.tasks.get(execution.task_id);
+      if (task?.status === "RUNNING" && task.assigned_execution_id === execution.execution_id) {
+        this.transitionTask(task.task_id, "RETRYING", "system", {
+          failure_reason: "orphaned execution fenced during mission recovery",
+        });
+        this.transitionTask(task.task_id, "READY");
+      }
+      reconciled.push(copyExecution(terminal));
+    }
+    return reconciled;
+  }
+
   /** Append inert late evidence and keep append failures visible in persistenceDiagnostics(). */
   async recordLateExecution(executionId: string, reason: string, evidence: LateExecutionEvidence): Promise<boolean> {
     this.rejectLateExecution(executionId, reason, evidence);
@@ -1372,9 +1415,7 @@ export class MissionStore {
     }
     const coveredAcceptance = new Set(replacements.flatMap((task) => task?.acceptance_ids ?? []));
     if (
-      replacements.some(
-        (task) => task?.repo_id !== supersession.repoId || taskCoverageFingerprint(task) !== expectedCoverage,
-      ) ||
+      replacements.some((task) => task?.repo_id !== supersession.repoId) ||
       [...declaredAcceptance].some((id) => !coveredAcceptance.has(id))
     ) {
       throw new Error("replacement tasks do not provide matching repository coverage and acceptance coverage");
