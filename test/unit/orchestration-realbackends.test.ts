@@ -257,6 +257,60 @@ describe("realBackends capability routing", () => {
     await backends.review.runReview({ objective: "review", signal: new AbortController().signal });
     assert.equal(seen[0]?.timeoutMs, workerTimeoutMs());
   });
+
+  it("fails closed for incomplete review payloads and invented model provenance", async () => {
+    const worker: WorkerExecutor = {
+      async run() {
+        return {
+          result: { status: "completed", summary: "ok", details: {} },
+          structured: { verdict: "approve", findings: [] },
+          usage: { model: "unknown" },
+        } as never;
+      },
+    };
+    const backends = realBackends({ worker, verifier: {} as never, artifacts: {} as never, git: null, cwd: "/repo" });
+    const outcome = await backends.review.runReview({
+      objective: "review",
+      acceptanceCriteria: [{ acceptanceId: "AC-1", criterion: "works" }],
+      signal: new AbortController().signal,
+    });
+    assert.equal(outcome.reviewEvidence?.outputValid, false);
+    assert.equal(outcome.reviewEvidence?.model, "");
+    assert.equal(outcome.reviewEvidence?.provider, "");
+  });
+
+  it("turns blocking missing tests and spec gaps into blocking review findings", async () => {
+    const worker: WorkerExecutor = {
+      async run() {
+        return {
+          result: { status: "completed", summary: "ok", details: {} },
+          structured: {
+            verdict: "request_changes",
+            findings: [],
+            missingTests: [{ severity: "high", description: "no regression test" }],
+            specGaps: [{ severity: "critical", requirement: "must preserve data", detail: "not met" }],
+            acceptanceResults: [{ acceptanceId: "AC-1", status: "failed", detail: "gap remains" }],
+          },
+          usage: { model: "reviewer" },
+        } as never;
+      },
+    };
+    const backends = realBackends({
+      worker,
+      verifier: {} as never,
+      artifacts: {} as never,
+      git: null,
+      cwd: "/repo",
+      reviewFallbackModel: { provider: "test", id: "reviewer" },
+    });
+    const outcome = await backends.review.runReview({
+      objective: "review",
+      acceptanceCriteria: [{ acceptanceId: "AC-1", criterion: "works" }],
+      signal: new AbortController().signal,
+    });
+    assert.equal(outcome.reviewEvidence?.outputValid, true);
+    assert.equal(outcome.reviewEvidence?.findings.filter((finding) => finding.severity === "blocking").length, 2);
+  });
 });
 
 describe("normalizeFindings (spec 07 — reviewer finding normalization)", () => {

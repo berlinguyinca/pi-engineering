@@ -17,6 +17,14 @@ import { EngineeringRuntime } from "../../src/runtime/EngineeringRuntime.ts";
 import type { WorkerExecutor } from "../../src/workers/WorkerExecutor.ts";
 import { makeFixtureRepo } from "../fixtures/make-fixture.ts";
 
+function acceptanceResults(task: string) {
+  return [...task.matchAll(/Acceptance criterion ([^:]+):/g)].map((match) => ({
+    acceptanceId: match[1]!,
+    status: "passed" as const,
+    detail: "fake reviewer checked the criterion",
+  }));
+}
+
 async function openRuntime(
   root: string,
   reviewFindings: unknown[] = [],
@@ -43,8 +51,8 @@ async function openRuntime(
         result: {
           status: "completed",
           summary: `worker ${req.role} did ${req.task}`,
-          claims: [{ claim: "done", evidence: "artifact://test" }],
-          evidence_refs: ["artifact://test"],
+          claims: [],
+          evidence_refs: [],
           new_hypotheses: [],
           proposed_tasks: [],
           details: reviewFindings.length ? { findings: reviewFindings } : {},
@@ -67,6 +75,7 @@ async function openRuntime(
                 findings: reviewFindings,
                 missingTests: [],
                 specGaps: [],
+                acceptanceResults: acceptanceResults(req.task),
                 summary: reviewFindings.length > 0 ? "changes requested" : "approved",
               }
             : undefined,
@@ -174,7 +183,14 @@ describe("orchestration via real EngineeringRuntime (acceptance scenarios)", () 
           toolCalls: 0,
           structured:
             req.resultTool === "review_result"
-              ? { verdict: "approve", findings: [], missingTests: [], specGaps: [], summary: "approved" }
+              ? {
+                  verdict: "approve",
+                  findings: [],
+                  missingTests: [],
+                  specGaps: [],
+                  acceptanceResults: acceptanceResults(req.task),
+                  summary: "approved",
+                }
               : undefined,
         };
       },
@@ -281,7 +297,14 @@ describe("orchestration via real EngineeringRuntime (acceptance scenarios)", () 
           toolCalls: 0,
           structured:
             req.resultTool === "review_result"
-              ? { verdict: "approve", findings: [], missingTests: [], specGaps: [], summary: "approved" }
+              ? {
+                  verdict: "approve",
+                  findings: [],
+                  missingTests: [],
+                  specGaps: [],
+                  acceptanceResults: acceptanceResults(req.task),
+                  summary: "approved",
+                }
               : undefined,
         };
       },
@@ -351,7 +374,14 @@ describe("orchestration via real EngineeringRuntime (acceptance scenarios)", () 
           toolCalls: 0,
           structured:
             req.resultTool === "review_result"
-              ? { verdict: "approve", findings: [], missingTests: [], specGaps: [], summary: "approved" }
+              ? {
+                  verdict: "approve",
+                  findings: [],
+                  missingTests: [],
+                  specGaps: [],
+                  acceptanceResults: acceptanceResults(req.task),
+                  summary: "approved",
+                }
               : undefined,
         };
       },
@@ -538,7 +568,14 @@ describe("orchestration via real EngineeringRuntime (acceptance scenarios)", () 
           toolCalls: 0,
           structured:
             req.resultTool === "review_result"
-              ? { verdict: "approve", findings: [], missingTests: [], specGaps: [], summary: "approved" }
+              ? {
+                  verdict: "approve",
+                  findings: [],
+                  missingTests: [],
+                  specGaps: [],
+                  acceptanceResults: acceptanceResults(req.task),
+                  summary: "approved",
+                }
               : undefined,
         };
       },

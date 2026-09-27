@@ -19,7 +19,7 @@ import type { GitRepo } from "../git/GitRepo.ts";
 import type { VerificationProvider } from "../verify/Verifier.ts";
 import type { WorkerActivity, WorkerExecutor, WorkerRequest } from "../workers/WorkerExecutor.ts";
 import { type ExecutionOutcome, type IntegrationHandoff, workerTimeoutMs } from "./broker.ts";
-import { normalizeReviewSeverity } from "./evidence.ts";
+import { normalizeReviewSeverity, validateAcceptanceResults } from "./evidence.ts";
 
 export interface RealBackendsOptions {
   worker: WorkerExecutor;
@@ -282,6 +282,7 @@ export function realBackends(opts: RealBackendsOptions) {
             },
             noTargets: outcome.noTargets,
             accessible: artifactState.allAccessible,
+            acceptanceResults: [],
           },
         };
       },
@@ -291,6 +292,7 @@ export function realBackends(opts: RealBackendsOptions) {
         repoId?: string;
         objective: string;
         contextRef?: string;
+        acceptanceCriteria?: Array<{ acceptanceId: string; criterion: string }>;
         signal: AbortSignal;
         onActivity?: (event: WorkerActivity) => void;
       }): Promise<ExecutionOutcome> {
@@ -303,7 +305,9 @@ export function realBackends(opts: RealBackendsOptions) {
         const reviewerSessionId = id("RVS");
         const req: WorkerRequest = {
           role: "reviewer",
-          task: input.objective,
+          task: `${input.objective}${(input.acceptanceCriteria ?? [])
+            .map((criterion) => `\nAcceptance criterion ${criterion.acceptanceId}: ${criterion.criterion}`)
+            .join("")}`,
           context: input.contextRef,
           tools: ["ledger_read", "artifact_read", "repo_search", "symbol"],
           cwd: bound.cwd,
@@ -340,11 +344,27 @@ export function realBackends(opts: RealBackendsOptions) {
         // so the completion gate can block on blocking findings. Handles three
         // shapes: a list of objects ({severity, message|summary|text}), a list of
         // plain strings (severity defaults to "warning"), and a JSON string.
-        const structured = run.structured as { verdict?: unknown; findings?: unknown } | undefined;
-        const raw = structured?.findings ?? (run.result.details as { findings?: unknown } | undefined)?.findings;
+        const details = run.result.details as Record<string, unknown> | undefined;
+        const structured = (run.structured ?? details) as Record<string, unknown> | undefined;
+        const raw = structured?.findings;
         outcome.findings = normalizeFindings(raw);
         const verdict = structured?.verdict;
-        let outputValid = verdict === "approve" || verdict === "request_changes";
+        let outputValid =
+          (verdict === "approve" || verdict === "request_changes") &&
+          Array.isArray(raw) &&
+          Array.isArray(structured?.missingTests) &&
+          Array.isArray(structured?.specGaps) &&
+          !!modelRoute;
+        const supplemental = [
+          ...(Array.isArray(structured?.missingTests) ? structured.missingTests : []),
+          ...(Array.isArray(structured?.specGaps) ? structured.specGaps : []),
+        ];
+        outcome.findings.push(
+          ...supplemental.map((entry) => {
+            const record = entry as Record<string, unknown>;
+            return { severity: record.severity, summary: record.description ?? record.detail ?? record.requirement };
+          }),
+        );
         const normalizedFindings = outcome.findings.flatMap((finding) => {
           try {
             return [
@@ -359,17 +379,28 @@ export function realBackends(opts: RealBackendsOptions) {
             return [];
           }
         });
+        let acceptanceResults: ReturnType<typeof validateAcceptanceResults> = [];
+        try {
+          acceptanceResults = validateAcceptanceResults(
+            structured?.acceptanceResults,
+            (input.acceptanceCriteria ?? []).map((criterion) => criterion.acceptanceId),
+          );
+        } catch {
+          outputValid = false;
+        }
+        const artifactEvidence = await artifactContentHashes(opts.artifacts, outcome.artifactRefs);
         outcome.reviewEvidence = {
           reviewerSessionId,
-          model: modelRoute?.id ?? "current-model",
-          provider: modelRoute?.provider ?? "current-provider",
+          model: modelRoute?.id ?? "",
+          provider: modelRoute?.provider ?? "",
           verdict: verdict === "approve" ? "approve" : "request_changes",
           independenceMode: routed && !routed.warning ? "independent" : "same_model_reduced",
           findings: normalizedFindings,
           outputValid,
-          accessible: true,
+          accessible: artifactEvidence.allAccessible,
+          acceptanceResults,
         };
-        outcome.artifactHashes = (await artifactContentHashes(opts.artifacts, outcome.artifactRefs)).hashes;
+        outcome.artifactHashes = artifactEvidence.hashes;
         return outcome;
       },
     },

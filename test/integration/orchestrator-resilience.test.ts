@@ -10,6 +10,7 @@
 
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import type { GitRepo } from "../../src/git/GitRepo.ts";
 import type { BrokerBackends } from "../../src/orchestration/broker.ts";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
 import { Orchestrator } from "../../src/orchestration/orchestrator.ts";
@@ -87,12 +88,13 @@ function harness(opts: HarnessOpts) {
             testSummary: { passed: 1 },
             noTargets: false,
             accessible: true,
+            acceptanceResults: [],
           },
         };
       },
     },
     review: {
-      runReview: async () => {
+      runReview: async ({ acceptanceCriteria }) => {
         calls.review++;
         return {
           executionId: "e",
@@ -110,6 +112,11 @@ function harness(opts: HarnessOpts) {
             findings: [],
             outputValid: true,
             accessible: true,
+            acceptanceResults: (acceptanceCriteria ?? []).map((criterion) => ({
+              acceptanceId: criterion.acceptanceId,
+              status: "passed" as const,
+              detail: "checked",
+            })),
           },
         };
       },
@@ -129,6 +136,12 @@ function harness(opts: HarnessOpts) {
   const orchestrator = new Orchestrator({
     store,
     backends,
+    git: {
+      root: process.cwd(),
+      headCommit: async () => "candidate-test-sha",
+      captureDiff: async () => "diff --git a/src/health.ts b/src/health.ts",
+      changedFiles: async () => ["src/health.ts"],
+    } as unknown as GitRepo,
     planner: async (mission) => [
       {
         kind: "agent" as const,

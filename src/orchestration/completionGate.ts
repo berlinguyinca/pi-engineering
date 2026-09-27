@@ -1,4 +1,4 @@
-import { evidenceIdentitiesEqual, hashCandidateEvidenceIdentity } from "./evidence.ts";
+import { evidenceIdentitiesEqual, hashCandidateEvidenceIdentity, taskCoverageFingerprint } from "./evidence.ts";
 import type { MissionStore } from "./missionStore.ts";
 import type { CompletionVerdict, Mission, RequiredGate } from "./types.ts";
 
@@ -89,8 +89,11 @@ export class CompletionGate {
   gather(missionId: string): GateEvidence {
     const mission = this.store.getMission(missionId);
     if (!mission) throw new Error(`unknown mission ${missionId}`);
-    const candidate = this.store.getCandidate(missionId);
     const manifest = this.store.getWorkspaceManifest(missionId);
+    const multiRepoUnsupported = (manifest?.repositories.length ?? 0) > 1;
+    const candidate = multiRepoUnsupported
+      ? undefined
+      : this.store.getCandidate(missionId, manifest?.repositories[0]?.repoId);
     const currentGeneration =
       this.store.getLatestMissionLease(missionId)?.generation ??
       Math.max(0, ...this.store.listTasks(missionId).map((task) => task.mission_generation ?? 0));
@@ -147,11 +150,17 @@ export class CompletionGate {
       currentReview.verdict === "approve" &&
       currentReview.findings.every((finding) => finding.severity !== "blocking" || finding.status === "resolved");
 
+    const explicitResults = [
+      ...(currentValidation?.acceptanceResults ?? []),
+      ...(currentReview?.acceptanceResults ?? []),
+    ];
     const acceptanceProblems = mission.acceptance_criteria.flatMap((criterion) => {
       const acceptanceId = criterion.acceptance_id;
       if (!acceptanceId) return [`material acceptance criterion lacks a stable acceptance ID: ${criterion.criterion}`];
       if (!candidateCurrent || !candidate?.identity.acceptanceIds.includes(acceptanceId))
         return [`acceptance ${acceptanceId} lacks current candidate evidence`];
+      if (!explicitResults.some((result) => result.acceptanceId === acceptanceId && result.status === "passed"))
+        return [`acceptance ${acceptanceId} lacks an explicit current passing result`];
       if (criterion.status !== "passed") return [`acceptance ${acceptanceId} is ${criterion.status}`];
       if (criterion.evidence !== candidate.identityHash)
         return [`acceptance ${acceptanceId} is not bound to current evidence`];
@@ -169,7 +178,18 @@ export class CompletionGate {
         failed?.status === "FAILED" &&
         failed.repo_id === lineage.repoId &&
         replacements.length > 0 &&
-        replacements.every((task) => task?.status === "SUCCEEDED" && task.repo_id === lineage.repoId) &&
+        lineage.coverageFingerprint === (failed ? taskCoverageFingerprint(failed) : "") &&
+        replacements.every(
+          (task) =>
+            task?.status === "SUCCEEDED" &&
+            task.repo_id === lineage.repoId &&
+            taskCoverageFingerprint(task) === lineage.coverageFingerprint,
+        ) &&
+        !!candidate &&
+        !!currentReview &&
+        replacements.every(
+          (task) => !!task?.completed_at && Date.parse(currentReview.recordedAt) > Date.parse(task.completed_at),
+        ) &&
         lineage.acceptanceIds.every((acceptanceId) => coverage.has(acceptanceId));
       if (valid) validSuperseded.add(lineage.failedTaskId);
       else
@@ -221,7 +241,9 @@ export class CompletionGate {
       });
 
     const reviewProblem = !candidateCurrent
-      ? "current review evidence is unavailable because no candidate is recorded"
+      ? multiRepoUnsupported
+        ? "multi-repository completion requires repository head-vector evidence"
+        : "current review evidence is unavailable because no candidate is recorded"
       : !currentReview
         ? "no current review evidence matches the exact candidate"
         : !currentReview.accessible
@@ -234,7 +256,9 @@ export class CompletionGate {
                 ? "current review has unresolved blocking findings"
                 : undefined;
     const validationProblem = !candidateCurrent
-      ? "current validation evidence is unavailable because no candidate is recorded"
+      ? multiRepoUnsupported
+        ? "multi-repository completion requires repository head-vector evidence"
+        : "current validation evidence is unavailable because no candidate is recorded"
       : !currentValidation
         ? "no current validation evidence matches the exact candidate"
         : !currentValidation.accessible
@@ -260,12 +284,26 @@ export class CompletionGate {
       validationsPassed: validationOk ? 1 : 0,
       reviewsCompleted: reviewOk ? 1 : 0,
       securityReviewsCompleted:
-        reviewOk && tasks.some((task) => task.kind === "review" && task.role.includes("security")) ? 1 : 0,
+        reviewOk &&
+        !!currentReview &&
+        tasks.some(
+          (task) =>
+            task.task_id === currentReview.taskId &&
+            task.kind === "review" &&
+            task.role.includes("security") &&
+            task.status === "SUCCEEDED",
+        )
+          ? 1
+          : 0,
       findings: [...storedFindings, ...reviewFindings],
       recoveredTasks: [...validSuperseded],
       validationProblem,
       reviewProblem,
-      acceptanceProblems,
+      acceptanceProblems: [
+        ...(multiRepoUnsupported ? ["multi-repository completion requires repository head-vector evidence"] : []),
+        ...this.store.evidenceDiagnostics(missionId).map((problem) => `quarantined evidence: ${problem}`),
+        ...acceptanceProblems,
+      ],
       activeExecutionProblems,
       terminalTaskProblems,
       supersessionProblems,

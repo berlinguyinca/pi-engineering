@@ -12,7 +12,12 @@
 
 import { id } from "../core/ids.ts";
 import type { EventStoreBackend, StoredEvent } from "../platform/eventstore/backend.ts";
-import { buildCandidateEvidenceIdentity, hashCandidateEvidenceIdentity } from "./evidence.ts";
+import {
+  buildCandidateEvidenceIdentity,
+  hashCandidateEvidenceIdentity,
+  taskCoverageFingerprint,
+  validateAcceptanceResults,
+} from "./evidence.ts";
 import { assertMissionTransition, assertTaskTransition } from "./state.ts";
 import type {
   CandidateEvidenceIdentity,
@@ -219,6 +224,7 @@ export class MissionStore {
   private readonly candidates = new Map<string, CandidateRevision>();
   private readonly validationEvidence = new Map<string, ValidationEvidence>();
   private readonly reviewEvidence = new Map<string, ReviewEvidence>();
+  private readonly evidenceReplayErrors = new Map<string, string[]>();
   private readonly missionLeases = new Map<string, MissionLease>();
   private readonly repositoryLeases = new Map<string, RepositoryLease>();
   /** Last epochs survive release/expiry so a restarted owner cannot reuse a token. */
@@ -496,17 +502,46 @@ export class MissionStore {
       }
       case "candidate.changed": {
         const candidate = e.payload.candidate as CandidateRevision;
-        if (candidate) this.candidates.set(candidate.missionId, copyCandidateRevision(candidate));
+        if (candidate) {
+          try {
+            const identity = this.assertCandidateIdentity(
+              candidate.missionId,
+              candidate.identity,
+              candidate.identityHash,
+            );
+            this.assertCandidateProvenance(candidate.missionId, identity, candidate.taskId, candidate.executionId);
+            this.candidates.set(
+              candidateKey(candidate.missionId, identity.repoId),
+              copyCandidateRevision({ ...candidate, identity }),
+            );
+          } catch (error) {
+            this.quarantineEvidence(candidate.missionId, error);
+          }
+        }
         break;
       }
       case "evidence.validation_recorded": {
         const evidence = e.payload.evidence as ValidationEvidence;
-        if (evidence) this.validationEvidence.set(evidence.evidenceId, copyValidationEvidence(evidence));
+        if (evidence) {
+          try {
+            this.assertValidationEvidence(evidence);
+            this.validationEvidence.set(evidence.evidenceId, copyValidationEvidence(evidence));
+          } catch (error) {
+            this.quarantineEvidence(evidence.missionId, error);
+          }
+        }
         break;
       }
       case "evidence.review_recorded": {
         const evidence = e.payload.evidence as ReviewEvidence;
-        if (evidence) this.reviewEvidence.set(evidence.evidenceId, copyReviewEvidence(evidence));
+        if (evidence) {
+          try {
+            this.assertReviewEvidence(evidence);
+            this.reviewEvidence.set(evidence.evidenceId, copyReviewEvidence(evidence));
+          } catch (error) {
+            this.quarantineEvidence(evidence.missionId, error);
+          }
+        }
         break;
       }
       case "lease.acquired":
@@ -1070,8 +1105,7 @@ export class MissionStore {
     const copy = copyWorkspaceManifest(manifest);
     const prior = this.workspaceManifests.get(manifest.missionId);
     const type = prior ? "workspace.rebound" : "workspace.authorized";
-    if (prior && prior.hash !== manifest.hash)
-      this.invalidateCurrentCandidate(manifest.missionId, "workspace manifest rebound");
+    if (prior) this.invalidateCurrentCandidate(manifest.missionId, "workspace manifest rebound");
     this.workspaceManifests.set(manifest.missionId, copy);
     this.emit(type, manifest.missionId, { actor: "system", manifest: copy });
     return copyWorkspaceManifest(copy);
@@ -1276,13 +1310,19 @@ export class MissionStore {
     if (failed.repo_id !== supersession.repoId || [...failedAcceptance].some((id) => !declaredAcceptance.has(id))) {
       throw new Error("supersession does not match failed task repository coverage and acceptance coverage");
     }
+    const expectedCoverage = taskCoverageFingerprint(failed);
+    if (supersession.coverageFingerprint !== expectedCoverage) {
+      throw new Error("supersession does not match immutable failed task coverage");
+    }
     const replacements = supersession.replacementTaskIds.map((taskId) => this.tasks.get(taskId));
     if (replacements.some((task) => !task || task.mission_id !== supersession.missionId)) {
       throw new Error("supersession contains an unknown replacement task ID");
     }
     const coveredAcceptance = new Set(replacements.flatMap((task) => task?.acceptance_ids ?? []));
     if (
-      replacements.some((task) => task?.repo_id !== supersession.repoId) ||
+      replacements.some(
+        (task) => task?.repo_id !== supersession.repoId || taskCoverageFingerprint(task) !== expectedCoverage,
+      ) ||
       [...declaredAcceptance].some((id) => !coveredAcceptance.has(id))
     ) {
       throw new Error("replacement tasks do not provide matching repository coverage and acceptance coverage");
@@ -1312,42 +1352,53 @@ export class MissionStore {
     return copyEvidenceInvalidation(copy);
   }
 
-  recordCandidate(missionId: string, rawIdentity: CandidateEvidenceIdentity, reason: string): CandidateRevision {
+  recordCandidate(
+    missionId: string,
+    rawIdentity: CandidateEvidenceIdentity,
+    reason: string,
+    provenance: { taskId: string; executionId: string },
+  ): CandidateRevision {
     if (!this.missions.has(missionId)) throw new Error(`unknown mission ${missionId}`);
-    const identity = buildCandidateEvidenceIdentity(rawIdentity);
-    const manifest = this.workspaceManifests.get(missionId);
-    if (!manifest || manifest.hash !== identity.workspaceManifestHash) {
-      throw new Error("candidate identity does not match the current workspace manifest");
-    }
-    const binding = manifest.repositories.find((repository) => repository.repoId === identity.repoId);
-    if (!binding || binding.baseSha !== identity.baseSha) {
-      throw new Error("candidate identity does not match the current repository/base");
-    }
+    const identity = this.assertCandidateIdentity(missionId, rawIdentity, hashCandidateEvidenceIdentity(rawIdentity));
     const identityHash = hashCandidateEvidenceIdentity(identity);
-    const prior = this.candidates.get(missionId);
-    if (prior && prior.identityHash !== identityHash) this.invalidateCurrentCandidate(missionId, reason);
+    this.assertCandidateProvenance(missionId, identity, provenance.taskId, provenance.executionId);
+    const key = candidateKey(missionId, identity.repoId);
+    const prior = this.candidates.get(key);
+    if (prior && prior.identityHash !== identityHash) this.invalidateCandidate(prior, reason);
     const candidate: CandidateRevision = {
       missionId,
+      taskId: provenance.taskId,
+      executionId: provenance.executionId,
       identity,
       identityHash,
       reason: reason.trim() || "candidate changed",
       recordedAt: new Date().toISOString(),
     };
-    this.candidates.set(missionId, candidate);
+    this.candidates.set(key, candidate);
     this.emit("candidate.changed", missionId, { actor: "system", candidate });
     return copyCandidateRevision(candidate);
   }
 
-  getCandidate(missionId: string): CandidateRevision | undefined {
-    const candidate = this.candidates.get(missionId);
+  getCandidate(missionId: string, repoId?: string): CandidateRevision | undefined {
+    const candidates = [...this.candidates.values()].filter((entry) => entry.missionId === missionId);
+    const candidate = repoId
+      ? this.candidates.get(candidateKey(missionId, repoId))
+      : candidates.length === 1
+        ? candidates[0]
+        : undefined;
     return candidate ? copyCandidateRevision(candidate) : undefined;
   }
 
+  listCandidates(missionId: string): CandidateRevision[] {
+    return [...this.candidates.values()].filter((entry) => entry.missionId === missionId).map(copyCandidateRevision);
+  }
+
+  evidenceDiagnostics(missionId: string): string[] {
+    return [...(this.evidenceReplayErrors.get(missionId) ?? [])];
+  }
+
   recordValidationEvidence(raw: ValidationEvidence): ValidationEvidence {
-    this.assertEvidenceRecord(raw.missionId, raw.identity, raw.identityHash);
-    if (!raw.command.trim() || !raw.profile.trim() || !Number.isInteger(raw.exitCode)) {
-      throw new Error("malformed validation evidence");
-    }
+    this.assertValidationEvidence(raw);
     const evidence = copyValidationEvidence({ ...raw, recordedAt: this.freshEvidenceTimestamp(raw) });
     this.validationEvidence.set(evidence.evidenceId, evidence);
     this.emit("evidence.validation_recorded", evidence.missionId, { actor: "system", evidence });
@@ -1361,10 +1412,7 @@ export class MissionStore {
   }
 
   recordReviewEvidence(raw: ReviewEvidence): ReviewEvidence {
-    this.assertEvidenceRecord(raw.missionId, raw.identity, raw.identityHash);
-    if (!raw.reviewerSessionId.trim() || !raw.model.trim() || !raw.provider.trim()) {
-      throw new Error("malformed review evidence identity");
-    }
+    this.assertReviewEvidence(raw);
     const evidence = copyReviewEvidence({ ...raw, recordedAt: this.freshEvidenceTimestamp(raw) });
     this.reviewEvidence.set(evidence.evidenceId, evidence);
     this.emit("evidence.review_recorded", evidence.missionId, { actor: "system", evidence });
@@ -1378,9 +1426,96 @@ export class MissionStore {
   }
 
   private assertEvidenceRecord(missionId: string, identity: CandidateEvidenceIdentity, identityHash: string): void {
+    this.assertCandidateIdentity(missionId, identity, identityHash);
+  }
+
+  private assertCandidateIdentity(
+    missionId: string,
+    raw: CandidateEvidenceIdentity,
+    identityHash: string,
+  ): CandidateEvidenceIdentity {
     if (!this.missions.has(missionId)) throw new Error(`unknown mission ${missionId}`);
-    const canonical = buildCandidateEvidenceIdentity(identity);
-    if (hashCandidateEvidenceIdentity(canonical) !== identityHash) throw new Error("malformed candidate evidence hash");
+    const identity = buildCandidateEvidenceIdentity(raw);
+    if (hashCandidateEvidenceIdentity(identity) !== identityHash) throw new Error("malformed candidate evidence hash");
+    const manifest = this.workspaceManifests.get(missionId);
+    if (!manifest || manifest.hash !== identity.workspaceManifestHash)
+      throw new Error("candidate identity does not match the current workspace manifest");
+    const binding = manifest.repositories.find((repository) => repository.repoId === identity.repoId);
+    if (!binding || binding.baseSha !== identity.baseSha)
+      throw new Error("candidate identity does not match the current repository/base");
+    return identity;
+  }
+
+  private assertEvidenceProvenance(raw: ValidationEvidence | ReviewEvidence, backend: "validation" | "review"): void {
+    this.assertEvidenceRecord(raw.missionId, raw.identity, raw.identityHash);
+    const task = this.tasks.get(raw.taskId);
+    const execution = this.executions.get(raw.executionId);
+    if (!task || !execution || execution.status !== "SUCCEEDED" || execution.backend !== backend)
+      throw new Error("evidence execution is not a successful authoritative execution");
+    if (
+      task.mission_id !== raw.missionId ||
+      execution.mission_id !== raw.missionId ||
+      execution.task_id !== task.task_id
+    )
+      throw new Error("evidence provenance mission/task mismatch");
+    if (
+      task.repo_id !== raw.identity.repoId ||
+      execution.repo_id !== raw.identity.repoId ||
+      execution.base_sha !== raw.identity.baseSha
+    )
+      throw new Error("evidence provenance repository mismatch");
+    if (
+      (execution.mission_generation ?? 0) !== raw.identity.missionGeneration ||
+      execution.fencing_token !== task.fencing_token
+    )
+      throw new Error("evidence provenance generation/fence mismatch");
+  }
+
+  private assertCandidateProvenance(
+    missionId: string,
+    identity: CandidateEvidenceIdentity,
+    taskId?: string,
+    executionId?: string,
+  ): void {
+    const task = taskId ? this.tasks.get(taskId) : undefined;
+    const execution = executionId ? this.executions.get(executionId) : undefined;
+    if (!task || !execution || execution.status !== "SUCCEEDED")
+      throw new Error("candidate requires a successful authoritative execution");
+    if (task.mission_id !== missionId || execution.mission_id !== missionId || execution.task_id !== task.task_id)
+      throw new Error("candidate provenance mission/task mismatch");
+    if (
+      task.repo_id !== identity.repoId ||
+      execution.repo_id !== identity.repoId ||
+      execution.base_sha !== identity.baseSha
+    )
+      throw new Error("candidate provenance repository mismatch");
+    if (
+      (execution.mission_generation ?? 0) !== identity.missionGeneration ||
+      execution.fencing_token !== task.fencing_token
+    )
+      throw new Error("candidate provenance generation/fence mismatch");
+  }
+
+  private assertValidationEvidence(raw: ValidationEvidence): void {
+    this.assertEvidenceProvenance(raw, "validation");
+    if (!raw.command.trim() || !raw.profile.trim() || !Number.isInteger(raw.exitCode))
+      throw new Error("malformed validation evidence");
+    validateAcceptanceResults(raw.acceptanceResults, raw.identity.acceptanceIds);
+  }
+
+  private assertReviewEvidence(raw: ReviewEvidence): void {
+    this.assertEvidenceProvenance(raw, "review");
+    if (!raw.reviewerSessionId.trim() || !raw.model.trim() || !raw.provider.trim())
+      throw new Error("malformed review evidence identity");
+    if (!Array.isArray(raw.findings) || raw.findings.some((finding) => !finding.summary?.trim()))
+      throw new Error("malformed review findings");
+    validateAcceptanceResults(raw.acceptanceResults, raw.identity.acceptanceIds);
+  }
+
+  private quarantineEvidence(missionId: string, error: unknown): void {
+    const diagnostics = this.evidenceReplayErrors.get(missionId) ?? [];
+    diagnostics.push(error instanceof Error ? error.message : String(error));
+    this.evidenceReplayErrors.set(missionId, diagnostics);
   }
 
   private freshEvidenceTimestamp(raw: { missionId: string; identityHash: string; recordedAt: string }): string {
@@ -1393,11 +1528,18 @@ export class MissionStore {
   }
 
   private invalidateCurrentCandidate(missionId: string, reason: string): void {
-    const current = this.candidates.get(missionId);
-    if (!current) return;
+    for (const current of this.listCandidates(missionId)) this.invalidateCandidate(current, reason);
+  }
+
+  invalidateRepositoryEvidence(missionId: string, repoId: string, reason: string): void {
+    const current = this.candidates.get(candidateKey(missionId, repoId));
+    if (current) this.invalidateCandidate(current, reason);
+  }
+
+  private invalidateCandidate(current: CandidateRevision, reason: string): void {
     this.invalidateEvidence({
       invalidationId: id("EI"),
-      missionId,
+      missionId: current.missionId,
       identity: current.identity,
       reason,
       invalidatedAt: new Date().toISOString(),
@@ -1519,6 +1661,10 @@ export class MissionStore {
   }
 }
 
+function candidateKey(missionId: string, repoId: string): string {
+  return `${missionId}\u0000${repoId}`;
+}
+
 /** A caller-owned copy: no array or record in it aliases the store's state. */
 function copyExecution(ex: Execution): Execution {
   return {
@@ -1624,6 +1770,7 @@ function copyValidationEvidence(evidence: ValidationEvidence): ValidationEvidenc
     ...evidence,
     identity: copyEvidenceIdentity(evidence.identity),
     testSummary: structuredClone(evidence.testSummary),
+    acceptanceResults: evidence.acceptanceResults?.map((result) => ({ ...result })),
   };
 }
 
@@ -1632,6 +1779,7 @@ function copyReviewEvidence(evidence: ReviewEvidence): ReviewEvidence {
     ...evidence,
     identity: copyEvidenceIdentity(evidence.identity),
     findings: evidence.findings.map((finding) => ({ ...finding })),
+    acceptanceResults: evidence.acceptanceResults?.map((result) => ({ ...result })),
   };
 }
 

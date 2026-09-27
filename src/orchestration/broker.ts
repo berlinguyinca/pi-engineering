@@ -24,7 +24,7 @@ import type { GitRepo } from "../git/GitRepo.ts";
 import type { WorkerActivity } from "../workers/WorkerExecutor.ts";
 import { sanitizeWorkerActivity } from "../workers/activity.ts";
 import type { CheckpointManager, CheckpointSnapshot } from "./checkpoints.ts";
-import { buildCandidateEvidenceIdentity, hashCandidateEvidenceIdentity } from "./evidence.ts";
+import { EvidenceUnavailableError, buildCandidateEvidenceIdentity, hashCandidateEvidenceIdentity } from "./evidence.ts";
 import type { LateExecutionEvidence, MissionStore } from "./missionStore.ts";
 import type { DispatchAuthority } from "./ownership.ts";
 import type { ExecutionBackend, RecoveredMerge, ReviewEvidence, ValidationEvidence } from "./types.ts";
@@ -54,6 +54,7 @@ export interface ExecutionRequestInput {
    * verify. Recorded on the execution as `reviewed_recovered`.
    */
   reviewedRecovered?: string[];
+  acceptanceCriteria?: Array<{ acceptanceId: string; criterion: string }>;
   /** Renewable fencing held by the caller for the complete dispatch. */
   authority?: DispatchAuthority;
 }
@@ -95,7 +96,7 @@ export interface ExecutionOutcome {
   artifactHashes?: string[];
   validationEvidence?: Pick<
     ValidationEvidence,
-    "command" | "profile" | "exitCode" | "testSummary" | "noTargets" | "accessible"
+    "command" | "profile" | "exitCode" | "testSummary" | "noTargets" | "accessible" | "acceptanceResults"
   >;
   reviewEvidence?: Pick<
     ReviewEvidence,
@@ -107,6 +108,7 @@ export interface ExecutionOutcome {
     | "findings"
     | "outputValid"
     | "accessible"
+    | "acceptanceResults"
   >;
 }
 
@@ -191,6 +193,7 @@ export interface ReviewRunner {
     repoId?: string;
     objective: string;
     contextRef?: string;
+    acceptanceCriteria?: Array<{ acceptanceId: string; criterion: string }>;
     signal: AbortSignal;
     onActivity?: (event: WorkerActivity) => void;
   }): Promise<ExecutionOutcome & { findings?: Array<Record<string, unknown>> }>;
@@ -531,17 +534,16 @@ export class ExecutionBroker {
     const binding = manifest?.repositories.find((candidate) => candidate.repoId === input.repoId);
     const execution = this.store.getExecution(executionId);
     const task = this.store.getTask(input.taskId);
+    // Legacy/non-gated broker uses may not have a workspace manifest. Do not
+    // synthesize evidence for them; absence remains visible to the gate.
     if (!manifest || !binding || !execution || !task) return;
+    if (!repository) throw new EvidenceUnavailableError(`no repository-scoped Git target for ${input.repoId}`);
 
-    let candidateSha = this.store.getCandidate(input.missionId)?.identity.candidateSha ?? binding.baseSha;
-    let diffHash = this.store.getCandidate(input.missionId)?.identity.diffHash ?? artifactHash("");
-    if (repository) {
-      candidateSha = await repository.git.headCommit();
-      const diff = await repository.git.captureDiff(binding.baseSha, candidateSha);
-      diffHash = artifactHash(diff);
-    }
+    const candidateSha = await repository.git.headCommit();
+    const diff = await repository.git.captureDiff(binding.baseSha, candidateSha);
+    const diffHash = artifactHash(diff);
     const acceptanceIds = [...new Set(task.acceptance_ids ?? [])].sort();
-    const priorArtifacts = this.store.getCandidate(input.missionId)?.identity.artifactHashes ?? [];
+    const priorArtifacts = this.store.getCandidate(input.missionId, input.repoId)?.identity.artifactHashes ?? [];
     const candidateArtifacts =
       backend === "integration"
         ? [...new Set(outcome.artifactHashes ?? outcome.artifactRefs.map(artifactHash))].sort()
@@ -560,6 +562,7 @@ export class ExecutionBroker {
       input.missionId,
       identity,
       backend === "integration" ? "integration" : `${backend} target`,
+      { taskId: input.taskId, executionId },
     );
     const recordedAt = new Date().toISOString();
     if (backend === "validation" && outcome.validationEvidence) {
@@ -1465,6 +1468,13 @@ export class ExecutionBroker {
               );
             }
             input.authority?.assertAuthoritative();
+            if (input.repoId && (backend === "integration" || input.mutatesRepo)) {
+              this.store.invalidateRepositoryEvidence(
+                input.missionId,
+                input.repoId,
+                backend === "integration" ? "integration started" : "candidate-affecting execution started",
+              );
+            }
             writerStarted = true;
             const backendSettlement: Promise<BackendSettlement> = this.dispatch(
               input,
@@ -1609,12 +1619,8 @@ export class ExecutionBroker {
                 this.failedBranches.set(input.missionId, byBranch);
               }
             }
-            // Publish terminal result evidence only after every mutation and
-            // handoff decision has passed the live execution fence. The status
-            // transition itself revokes that fence.
-            input.authority?.assertAuthoritative();
-            this.store.assertExecutionAuthoritative(execution.execution_id);
-            await this.recordGateEvidence(input, execution.execution_id, backend, outcome, repository);
+            // Settle first: evidence is accepted only from a successfully
+            // completed authoritative execution, never from a live writer.
             input.authority?.assertAuthoritative();
             this.store.assertExecutionAuthoritative(execution.execution_id);
             const succeeded = outcome.exitStatus === "succeeded";
@@ -1627,6 +1633,7 @@ export class ExecutionBroker {
                 ? { reviewed_recovered: [...input.reviewedRecovered] }
                 : {}),
             });
+            if (succeeded) await this.recordGateEvidence(input, execution.execution_id, backend, outcome, repository);
             this.active.delete(execution.execution_id);
             emitActivity({
               kind: "execution",
@@ -1740,6 +1747,7 @@ export class ExecutionBroker {
       worktree,
       signal,
       onActivity,
+      acceptanceCriteria: input.acceptanceCriteria,
     };
     switch (backend) {
       case "agent":
@@ -1770,6 +1778,7 @@ export class ExecutionBroker {
           repoId: input.repoId,
           objective: input.objective,
           contextRef: input.contextRef,
+          acceptanceCriteria: input.acceptanceCriteria,
           signal,
           onActivity: base.onActivity,
         });

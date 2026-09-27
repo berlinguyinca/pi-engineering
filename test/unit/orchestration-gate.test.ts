@@ -5,12 +5,14 @@ import {
   buildCandidateEvidenceIdentity,
   hashCandidateEvidenceIdentity,
   normalizeReviewSeverity,
+  taskCoverageFingerprint,
 } from "../../src/orchestration/evidence.ts";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 
 function mission(requiredGates: string[], risk = "medium") {
-  const store = MissionStore.open(JsonlEventStore.inMemory());
+  const backend = JsonlEventStore.inMemory();
+  const store = MissionStore.open(backend);
   const m = store.createMission({
     title: "x",
     goal: "x",
@@ -21,7 +23,36 @@ function mission(requiredGates: string[], risk = "medium") {
     workflow_class: "engineering_review",
   });
   store.updateMission(m.mission_id, { required_gates: requiredGates as never[] });
-  return { store, m };
+  return { store, m, backend };
+}
+
+function successfulEvidenceExecution(
+  store: MissionStore,
+  missionId: string,
+  kind: "validation" | "review",
+  repoId: string,
+  baseSha: string,
+) {
+  const task = store.createTask({
+    mission_id: missionId,
+    kind,
+    role: kind === "review" ? "independent-reviewer" : "validator",
+    objective: kind,
+    repo_id: repoId,
+    acceptance_ids: kind === "review" ? [repoId === "repo-r" ? "AC-R" : "AC-1"] : [],
+  });
+  store.transitionTask(task.task_id, "READY");
+  store.transitionTask(task.task_id, "RUNNING");
+  const execution = store.createExecution({
+    task_id: task.task_id,
+    backend: kind,
+    mission_id: missionId,
+    repo_id: repoId,
+    base_sha: baseSha,
+  });
+  store.setExecutionStatus(execution.execution_id, "SUCCEEDED");
+  store.transitionTask(task.task_id, "SUCCEEDED");
+  return { taskId: task.task_id, executionId: execution.execution_id };
 }
 
 describe("CompletionGate (spec 07)", () => {
@@ -305,7 +336,7 @@ describe("CompletionGate (spec 07)", () => {
 
 describe("revision-bound completion evidence", () => {
   function currentEvidenceMission() {
-    const { store, m } = mission(["validation", "independent_review"]);
+    const { store, m, backend } = mission(["validation", "independent_review"]);
     const acceptance = store.addAcceptanceCriterion(m.mission_id, "current candidate is verified", undefined, "AC-1");
     const manifest = {
       manifestId: "WM-1",
@@ -336,12 +367,14 @@ describe("revision-bound completion evidence", () => {
       acceptanceIds: ["AC-1"],
       artifactHashes: ["sha256:artifact-a"],
     });
-    store.recordCandidate(m.mission_id, identity, "integration");
+    const validationRun = successfulEvidenceExecution(store, m.mission_id, "validation", "repo-1", "base-a");
+    const reviewRun = successfulEvidenceExecution(store, m.mission_id, "review", "repo-1", "base-a");
+    store.recordCandidate(m.mission_id, identity, "integration", validationRun);
     store.recordValidationEvidence({
       evidenceId: "VE-1",
       missionId: m.mission_id,
-      taskId: "validation-task",
-      executionId: "validation-execution",
+      taskId: validationRun.taskId,
+      executionId: validationRun.executionId,
       identity,
       identityHash: hashCandidateEvidenceIdentity(identity),
       command: "npm test",
@@ -350,13 +383,14 @@ describe("revision-bound completion evidence", () => {
       testSummary: { passed: 42, failed: 0 },
       noTargets: false,
       accessible: true,
+      acceptanceResults: [],
       recordedAt: new Date().toISOString(),
     });
     store.recordReviewEvidence({
       evidenceId: "RE-1",
       missionId: m.mission_id,
-      taskId: "review-task",
-      executionId: "review-execution",
+      taskId: reviewRun.taskId,
+      executionId: reviewRun.executionId,
       identity,
       identityHash: hashCandidateEvidenceIdentity(identity),
       reviewerSessionId: "review-session-1",
@@ -367,10 +401,11 @@ describe("revision-bound completion evidence", () => {
       findings: [],
       outputValid: true,
       accessible: true,
+      acceptanceResults: [{ acceptanceId: "AC-1", status: "passed", detail: "reviewed against criterion" }],
       recordedAt: new Date().toISOString(),
     });
     store.setCriterionStatus(m.mission_id, 0, "passed", hashCandidateEvidenceIdentity(identity));
-    return { store, mission: store.getMission(acceptance.mission_id)!, identity };
+    return { store, backend, mission: store.getMission(acceptance.mission_id)!, identity, validationRun };
   }
 
   it("hashes canonical identity JSON independent of set ordering", () => {
@@ -398,18 +433,84 @@ describe("revision-bound completion evidence", () => {
     assert.equal(verdict.can_complete, true, JSON.stringify(verdict.reasons));
   });
 
+  it("rejects generic green evidence without explicit per-acceptance results", () => {
+    const { store, mission } = currentEvidenceMission();
+    const review = store.listReviewEvidence(mission.mission_id)[0]!;
+    store.invalidateEvidence({
+      invalidationId: "EI-self-attestation",
+      missionId: mission.mission_id,
+      identity: review.identity,
+      reason: "replace explicit result",
+      invalidatedAt: new Date().toISOString(),
+    });
+    store.recordReviewEvidence({ ...review, evidenceId: "RE-generic", acceptanceResults: [] });
+    const verdict = new CompletionGate(store).evaluate(store.getMission(mission.mission_id)!);
+    assert.equal(verdict.can_complete, false);
+    assert.match(verdict.reasons.join("; "), /explicit current passing result/i);
+  });
+
+  it("quarantines forged replay evidence and fails the gate closed", async () => {
+    const { store, backend, mission, identity } = currentEvidenceMission();
+    await store.flush();
+    await backend.append({
+      event_id: "forged-candidate",
+      timestamp: new Date().toISOString(),
+      type: "candidate.changed",
+      project_id: null,
+      run_id: mission.mission_id,
+      worker_id: null,
+      payload: {
+        actor: "system",
+        candidate: {
+          missionId: mission.mission_id,
+          identity: { ...identity, candidateSha: "forged" },
+          identityHash: hashCandidateEvidenceIdentity(identity),
+          reason: "forged replay",
+          recordedAt: new Date().toISOString(),
+        },
+      },
+    });
+    const replayed = MissionStore.open(backend);
+    const verdict = new CompletionGate(replayed).evaluate(replayed.getMission(mission.mission_id)!);
+    assert.equal(verdict.can_complete, false);
+    assert.match(verdict.reasons.join("; "), /quarantined evidence|malformed candidate evidence hash/i);
+  });
+
+  it("fails closed for a mission with more than one authorized repository", () => {
+    const { store, mission } = currentEvidenceMission();
+    const manifest = store.getWorkspaceManifest(mission.mission_id)!;
+    store.bindWorkspaceManifest({
+      ...manifest,
+      hash: "manifest-two-repos",
+      repositories: [
+        ...manifest.repositories,
+        { repoId: "repo-2", canonicalRoot: "/repo-2", baseRef: "main", baseSha: "base-2", writableDomains: ["**"] },
+      ],
+    });
+    const verdict = new CompletionGate(store).evaluate(store.getMission(mission.mission_id)!);
+    assert.equal(verdict.can_complete, false);
+    assert.match(verdict.reasons.join("; "), /head-vector/i);
+  });
+
   for (const [field, stale] of [
     ["missionGeneration", 7],
     ["candidateSha", "candidate-b"],
     ["diffHash", "diff-b"],
   ] as const) {
     it(`fails closed when ${field} does not match the current candidate`, () => {
-      const { store, mission, identity } = currentEvidenceMission();
-      store.recordCandidate(
-        mission.mission_id,
-        buildCandidateEvidenceIdentity({ ...identity, [field]: stale }),
-        "candidate change",
-      );
+      const { store, mission, identity, validationRun } = currentEvidenceMission();
+      const record = () =>
+        store.recordCandidate(
+          mission.mission_id,
+          buildCandidateEvidenceIdentity({ ...identity, [field]: stale }),
+          "candidate change",
+          validationRun,
+        );
+      if (field === "missionGeneration") {
+        assert.throws(record, /generation/i);
+        return;
+      }
+      record();
       const verdict = new CompletionGate(store).evaluate(store.getMission(mission.mission_id)!);
       assert.equal(verdict.can_complete, false);
       assert.match(verdict.reasons.join("; "), /current validation evidence|current review evidence|acceptance/i);
@@ -433,20 +534,24 @@ describe("revision-bound completion evidence", () => {
         reason: "replace evidence",
         invalidatedAt: new Date().toISOString(),
       });
-      store.recordValidationEvidence({
-        ...validation,
-        evidenceId: `VE-${field}`,
-        identity: wrong,
-        identityHash,
-        recordedAt: new Date(Date.now() + 1_000).toISOString(),
-      });
-      store.recordReviewEvidence({
-        ...review,
-        evidenceId: `RE-${field}`,
-        identity: wrong,
-        identityHash,
-        recordedAt: new Date(Date.now() + 1_000).toISOString(),
-      });
+      assert.throws(() =>
+        store.recordValidationEvidence({
+          ...validation,
+          evidenceId: `VE-${field}`,
+          identity: wrong,
+          identityHash,
+          recordedAt: new Date(Date.now() + 1_000).toISOString(),
+        }),
+      );
+      assert.throws(() =>
+        store.recordReviewEvidence({
+          ...review,
+          evidenceId: `RE-${field}`,
+          identity: wrong,
+          identityHash,
+          recordedAt: new Date(Date.now() + 1_000).toISOString(),
+        }),
+      );
       const verdict = new CompletionGate(store).evaluate(store.getMission(mission.mission_id)!);
       assert.equal(verdict.can_complete, false);
       assert.match(verdict.reasons.join("; "), /current validation evidence|current review evidence/i);
@@ -543,9 +648,10 @@ describe("revision-bound completion evidence", () => {
       mission_id: mission.mission_id,
       kind: "agent",
       role: "implementer",
-      objective: "replacement",
+      objective: failed.objective,
       repo_id: "repo-1",
       acceptance_ids: ["AC-1"],
+      execution_requirements: { coverageFingerprint: taskCoverageFingerprint(failed) },
     });
     store.supersedeTask({
       supersessionId: "TS-1",
@@ -554,6 +660,7 @@ describe("revision-bound completion evidence", () => {
       replacementTaskIds: [replacement.task_id],
       repoId: "repo-1",
       acceptanceIds: ["AC-1"],
+      coverageFingerprint: taskCoverageFingerprint(failed),
       reason: "repair",
       createdAt: new Date().toISOString(),
     });
@@ -626,13 +733,15 @@ function currentEvidenceMissionForReview() {
     acceptanceIds: ["AC-R"],
     artifactHashes: [],
   });
-  store.recordCandidate(m.mission_id, identity, "integration");
   const identityHash = hashCandidateEvidenceIdentity(identity);
+  const validationRun = successfulEvidenceExecution(store, m.mission_id, "validation", "repo-r", "base-r");
+  const reviewRun = successfulEvidenceExecution(store, m.mission_id, "review", "repo-r", "base-r");
+  store.recordCandidate(m.mission_id, identity, "integration", validationRun);
   store.recordValidationEvidence({
     evidenceId: "VE-R",
     missionId: m.mission_id,
-    taskId: "v",
-    executionId: "ve",
+    taskId: validationRun.taskId,
+    executionId: validationRun.executionId,
     identity,
     identityHash,
     command: "npm test",
@@ -641,13 +750,14 @@ function currentEvidenceMissionForReview() {
     testSummary: { passed: 1 },
     noTargets: false,
     accessible: true,
+    acceptanceResults: [],
     recordedAt: new Date().toISOString(),
   });
   store.recordReviewEvidence({
     evidenceId: "RE-R",
     missionId: m.mission_id,
-    taskId: "r",
-    executionId: "re",
+    taskId: reviewRun.taskId,
+    executionId: reviewRun.executionId,
     identity,
     identityHash,
     reviewerSessionId: "session-r",
@@ -658,6 +768,7 @@ function currentEvidenceMissionForReview() {
     findings: [],
     outputValid: true,
     accessible: true,
+    acceptanceResults: [{ acceptanceId: "AC-R", status: "passed", detail: "reviewed against criterion" }],
     recordedAt: new Date().toISOString(),
   });
   store.setCriterionStatus(m.mission_id, 0, "passed", identityHash);

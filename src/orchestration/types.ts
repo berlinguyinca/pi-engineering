@@ -324,8 +324,16 @@ export interface TaskSupersession {
   replacementTaskIds: EntityId[];
   repoId: EntityId;
   acceptanceIds: EntityId[];
+  /** Immutable hash of the failed task's objective, deliverables, and repository coverage. */
+  coverageFingerprint?: string;
   reason: string;
   createdAt: string;
+}
+
+export interface AcceptanceEvidenceResult {
+  acceptanceId: EntityId;
+  status: "passed" | "failed";
+  detail: string;
 }
 
 /** Identity shared by validation, review, and invalidation records. */
@@ -343,6 +351,8 @@ export interface CandidateEvidenceIdentity {
 /** The independently persisted revision that gate evidence must match exactly. */
 export interface CandidateRevision {
   missionId: EntityId;
+  taskId: EntityId;
+  executionId: EntityId;
   identity: CandidateEvidenceIdentity;
   identityHash: string;
   reason: string;
@@ -362,6 +372,7 @@ export interface ValidationEvidence {
   testSummary: Record<string, unknown>;
   noTargets: boolean;
   accessible: boolean;
+  acceptanceResults?: AcceptanceEvidenceResult[];
   recordedAt: string;
 }
 
@@ -383,6 +394,7 @@ export interface ReviewEvidence {
   findings: Array<Pick<ReviewFinding, "severity" | "summary" | "status">>;
   outputValid: boolean;
   accessible: boolean;
+  acceptanceResults?: AcceptanceEvidenceResult[];
   recordedAt: string;
 }
 

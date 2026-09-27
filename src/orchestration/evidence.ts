@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import type { CandidateEvidenceIdentity, ReviewFinding } from "./types.ts";
+import type { AcceptanceEvidenceResult, CandidateEvidenceIdentity, OrchestrationTask, ReviewFinding } from "./types.ts";
 
 function required(value: string, field: string): string {
   const normalized = value.trim();
@@ -10,6 +10,15 @@ function required(value: string, field: string): string {
 function canonicalSet(values: string[], field: string): string[] {
   const normalized = values.map((value) => required(value, field));
   return [...new Set(normalized)].sort();
+}
+
+export class EvidenceUnavailableError extends Error {
+  readonly category = "EVIDENCE_UNAVAILABLE" as const;
+
+  constructor(message: string) {
+    super(`EVIDENCE_UNAVAILABLE: ${message}`);
+    this.name = "EvidenceUnavailableError";
+  }
 }
 
 /** Build the only accepted, deterministic representation of candidate evidence identity. */
@@ -49,6 +58,30 @@ export function hashCandidateEvidenceIdentity(input: CandidateEvidenceIdentity):
 
 export function evidenceIdentitiesEqual(a: CandidateEvidenceIdentity, b: CandidateEvidenceIdentity): boolean {
   return hashCandidateEvidenceIdentity(a) === hashCandidateEvidenceIdentity(b);
+}
+
+export function taskCoverageFingerprint(
+  task: Pick<OrchestrationTask, "objective" | "deliverables" | "repo_id">,
+): string {
+  const objective = required(task.objective, "objective");
+  const repoId = required(task.repo_id ?? "", "repoId");
+  const deliverables = canonicalSet(task.deliverables ?? [], "deliverables");
+  return `sha256:${createHash("sha256").update(JSON.stringify({ deliverables, objective, repoId })).digest("hex")}`;
+}
+
+export function validateAcceptanceResults(raw: unknown, allowedIds: string[]): AcceptanceEvidenceResult[] {
+  if (!Array.isArray(raw)) throw new Error("evidence requires explicit acceptance results");
+  const allowed = new Set(allowedIds);
+  const seen = new Set<string>();
+  return raw.map((entry) => {
+    if (!entry || typeof entry !== "object") throw new Error("malformed acceptance result");
+    const value = entry as Partial<AcceptanceEvidenceResult>;
+    const acceptanceId = required(value.acceptanceId ?? "", "acceptanceId");
+    if (!allowed.has(acceptanceId) || seen.has(acceptanceId)) throw new Error("invalid acceptance result ID");
+    if (value.status !== "passed" && value.status !== "failed") throw new Error("invalid acceptance result status");
+    seen.add(acceptanceId);
+    return { acceptanceId, status: value.status, detail: required(value.detail ?? "", "acceptance result detail") };
+  });
 }
 
 export function normalizeReviewSeverity(severity: unknown): ReviewFinding["severity"] {

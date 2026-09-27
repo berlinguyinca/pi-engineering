@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import { taskCoverageFingerprint } from "../../src/orchestration/evidence.ts";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
 import type {
   CandidateEvidenceIdentity,
@@ -413,6 +414,7 @@ describe("MissionStore", () => {
     s1.transitionTask(failed.task_id, "READY");
     s1.transitionTask(failed.task_id, "RUNNING");
     s1.transitionTask(failed.task_id, "FAILED");
+    const coverageFingerprint = taskCoverageFingerprint(failed);
     const replacement = s1.createTask({
       task_id: "TSK-replacement",
       mission_id: mission.mission_id,
@@ -424,6 +426,7 @@ describe("MissionStore", () => {
       candidate_generation: 5,
       mission_generation: 4,
       fencing_token: 8,
+      execution_requirements: { coverageFingerprint },
     });
     const execution = s1.createExecution({
       task_id: replacement.task_id,
@@ -496,6 +499,7 @@ describe("MissionStore", () => {
       replacementTaskIds: [replacement.task_id],
       repoId: "repo-a",
       acceptanceIds: ["AC-1"],
+      coverageFingerprint,
       reason: "resume remaining work from checkpoint",
       createdAt: "2026-09-26T10:03:00.000Z",
     });
@@ -591,6 +595,7 @@ describe("MissionStore", () => {
     s.transitionTask(failed.task_id, "READY");
     s.transitionTask(failed.task_id, "RUNNING");
     s.transitionTask(failed.task_id, "FAILED");
+    const coverageFingerprint = taskCoverageFingerprint(failed);
     const immutableFailure = s.getTask(failed.task_id)!;
     assert.throws(() => s.transitionTask(failed.task_id, "READY"), /illegal task transition FAILED -> READY/);
     assert.throws(
@@ -618,6 +623,7 @@ describe("MissionStore", () => {
           replacementTaskIds: [wrongRepo.task_id],
           repoId: "repo-a",
           acceptanceIds: ["AC-1"],
+          coverageFingerprint,
           reason: "wrong repository",
           createdAt: "2026-09-26T11:00:00.000Z",
         }),
@@ -646,6 +652,7 @@ describe("MissionStore", () => {
       objective: failed.objective,
       repo_id: "repo-a",
       acceptance_ids: ["AC-1"],
+      execution_requirements: { coverageFingerprint },
     });
     assert.throws(
       () =>
@@ -683,6 +690,7 @@ describe("MissionStore", () => {
       replacementTaskIds: [replacement.task_id],
       repoId: "repo-a",
       acceptanceIds: ["AC-1"],
+      coverageFingerprint,
       reason: "valid lineage",
       createdAt: "2026-09-26T11:03:00.000Z",
     });

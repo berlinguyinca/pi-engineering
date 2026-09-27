@@ -42,6 +42,12 @@ const specGapSchema = Type.Object({
   severity: Type.Union(SEVERITIES.map((s) => Type.Literal(s))),
 });
 
+const acceptanceResultSchema = Type.Object({
+  acceptance_id: Type.String({ minLength: 1, maxLength: 200 }),
+  status: Type.Union([Type.Literal("passed"), Type.Literal("failed")]),
+  detail: Type.String({ minLength: 1, maxLength: 2000 }),
+});
+
 export const reviewResultTool = defineTool({
   name: "review_result",
   label: "Review Result",
@@ -60,6 +66,7 @@ export const reviewResultTool = defineTool({
     findings: Type.Array(findingSchema, { maxItems: 40 }),
     missing_tests: Type.Array(missingTestSchema, { maxItems: 20 }),
     spec_gaps: Type.Array(specGapSchema, { maxItems: 20 }),
+    acceptance_results: Type.Array(acceptanceResultSchema, { maxItems: 100 }),
   }),
 
   async execute(_toolCallId, params) {
@@ -98,7 +105,19 @@ export const reviewResultTool = defineTool({
     const verdict = params.verdict === "approve" ? "approve" : "request_changes";
     return {
       content: [{ type: "text" as const, text: `Review recorded: ${verdict} (${findings.length} findings)` }],
-      details: { verdict, findings, missingTests, specGaps, confidence: params.confidence, summary: params.summary },
+      details: {
+        verdict,
+        findings,
+        missingTests,
+        specGaps,
+        acceptanceResults: (params.acceptance_results ?? []).map((result) => ({
+          acceptanceId: cap(result.acceptance_id, 200),
+          status: result.status,
+          detail: cap(result.detail, 2000),
+        })),
+        confidence: params.confidence,
+        summary: params.summary,
+      },
       terminate: true,
     };
   },
@@ -112,6 +131,7 @@ export interface ReviewVerdictPayload {
   findings: ReviewFinding[];
   missingTests: MissingTestPayload[];
   specGaps: SpecGap[];
+  acceptanceResults?: Array<{ acceptanceId: string; status: "passed" | "failed"; detail: string }>;
 }
 
 export interface MissingTestPayload {

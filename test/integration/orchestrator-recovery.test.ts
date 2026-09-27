@@ -60,11 +60,12 @@ async function run() {
           testSummary: { passed: 1 },
           noTargets: false,
           accessible: true,
+          acceptanceResults: [],
         },
       }),
     },
     review: {
-      runReview: async ({ objective }) => {
+      runReview: async ({ objective, acceptanceCriteria }) => {
         reviewObjectives.push(objective);
         return {
           executionId: "r",
@@ -82,6 +83,11 @@ async function run() {
             findings: [],
             outputValid: true,
             accessible: true,
+            acceptanceResults: (acceptanceCriteria ?? []).map((criterion) => ({
+              acceptanceId: criterion.acceptanceId,
+              status: "passed" as const,
+              detail: "recovered objective checked",
+            })),
           },
         };
       },

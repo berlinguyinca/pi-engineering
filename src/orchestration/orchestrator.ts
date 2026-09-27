@@ -1331,6 +1331,11 @@ export class Orchestrator {
         executionBudgetMs: task.execution_budget_ms,
         checkpointPolicy: task.checkpoint_policy,
         requiredOutputArtifacts: task.required_output_artifacts,
+        acceptanceCriteria: this.store
+          .getMission(missionId)
+          ?.acceptance_criteria.flatMap((criterion) =>
+            criterion.acceptance_id ? [{ acceptanceId: criterion.acceptance_id, criterion: criterion.criterion }] : [],
+          ),
         authority,
         ...(extra.reviewedRecovered?.length ? { reviewedRecovered: extra.reviewedRecovered } : {}),
       });
@@ -1436,7 +1441,8 @@ export class Orchestrator {
 
   private markAcceptanceFromCurrentEvidence(missionId: string): void {
     const mission = this.store.getMission(missionId);
-    const candidate = this.store.getCandidate(missionId);
+    const repoId = this.repoIdForMission(missionId);
+    const candidate = repoId ? this.store.getCandidate(missionId, repoId) : undefined;
     if (!mission || !candidate) return;
     const validation = this.store
       .listValidationEvidence(missionId)
@@ -1463,8 +1469,17 @@ export class Orchestrator {
         review.verdict === "approve" &&
         review.findings.every((finding) => finding.severity !== "blocking" || finding.status === "resolved"));
     if (!validationOk || !reviewOk) return;
+    const explicitPassed = new Set(
+      [...(validation?.acceptanceResults ?? []), ...(review?.acceptanceResults ?? [])]
+        .filter((result) => result.status === "passed")
+        .map((result) => result.acceptanceId),
+    );
     mission.acceptance_criteria.forEach((criterion, index) => {
-      if (criterion.acceptance_id && candidate.identity.acceptanceIds.includes(criterion.acceptance_id)) {
+      if (
+        criterion.acceptance_id &&
+        candidate.identity.acceptanceIds.includes(criterion.acceptance_id) &&
+        explicitPassed.has(criterion.acceptance_id)
+      ) {
         this.store.setCriterionStatus(missionId, index, "passed", candidate.identityHash);
       }
     });

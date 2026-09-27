@@ -13,6 +13,7 @@
 
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import type { GitRepo } from "../../src/git/GitRepo.ts";
 import type { BrokerBackends } from "../../src/orchestration/broker.ts";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
 import { MissionObservability } from "../../src/orchestration/observability/MissionObservability.ts";
@@ -70,6 +71,7 @@ interface HarnessOpts {
   validationFailTimes?: number;
   /** Fail every validation run AFTER the Nth (a late failure must not be masked). */
   validationFailAfter?: number;
+  noGitEvidenceTarget?: boolean;
 }
 
 function harness(opts: HarnessOpts = {}): Harness {
@@ -87,7 +89,7 @@ function harness(opts: HarnessOpts = {}): Harness {
       },
     },
     review: {
-      runReview: async () => {
+      runReview: async ({ acceptanceCriteria }) => {
         calls.review.push("review");
         if (opts.reviewExitStatus && opts.reviewExitStatus !== "succeeded") {
           return {
@@ -120,6 +122,11 @@ function harness(opts: HarnessOpts = {}): Harness {
             })),
             outputValid: true,
             accessible: true,
+            acceptanceResults: (acceptanceCriteria ?? []).map((criterion) => ({
+              acceptanceId: criterion.acceptanceId,
+              status: findings.length > 0 ? ("failed" as const) : ("passed" as const),
+              detail: "deterministic reviewer checked this criterion",
+            })),
           },
         };
       },
@@ -162,6 +169,7 @@ function harness(opts: HarnessOpts = {}): Harness {
             testSummary: { passed: 1, failed: 0 },
             noTargets: false,
             accessible: true,
+            acceptanceResults: [],
           },
         };
       },
@@ -176,6 +184,16 @@ function harness(opts: HarnessOpts = {}): Harness {
   const orchestrator = new Orchestrator({
     store,
     backends,
+    ...(opts.noGitEvidenceTarget
+      ? {}
+      : {
+          git: {
+            root: process.cwd(),
+            headCommit: async () => "candidate-test-sha",
+            captureDiff: async () => "diff --git a/src/health.ts b/src/health.ts",
+            changedFiles: async () => ["src/health.ts"],
+          } as unknown as GitRepo,
+        }),
     planner: async (mission) => [
       {
         kind: "agent" as const,
@@ -222,6 +240,18 @@ describe("acceptance scenario A — simple feature auto-invokes engineering+vali
     // Completion gate passed -> COMPLETE.
     assert.equal(mission.status, "COMPLETE");
     assert.equal(result.completed, true);
+  });
+
+  it("fails closed instead of synthesizing mutation evidence without repository Git access", async () => {
+    const h = harness({ noGitEvidenceTarget: true });
+    const result = await h.orchestrator.orchestrate("Add a health endpoint", {
+      repository: ".",
+      baseRef: "abc",
+      mutationRequested: true,
+    });
+    assert.equal(result.completed, false);
+    assert.equal(h.store.getCandidate(result.mission.mission_id), undefined);
+    assert.match(result.failureReason ?? "", /validation evidence|candidate|task\(s\) failed/i);
   });
 });
 
@@ -385,7 +415,22 @@ describe("mission caller cancellation", () => {
         validation: {
           runValidation: async () => {
             validationCalls++;
-            return { executionId: "v", exitStatus: "succeeded", summary: "valid", artifactRefs: [], usage: {} };
+            return {
+              executionId: "v",
+              exitStatus: "succeeded",
+              summary: "valid",
+              artifactRefs: [],
+              usage: {},
+              validationEvidence: {
+                command: "npm test",
+                profile: "test",
+                exitCode: 0,
+                testSummary: { passed: 1 },
+                noTargets: false,
+                accessible: true,
+                acceptanceResults: [],
+              },
+            };
           },
         },
         review: {
@@ -513,6 +558,12 @@ describe("mission caller cancellation", () => {
     let validationCalls = 0;
     const orchestrator = new Orchestrator({
       store,
+      git: {
+        root: process.cwd(),
+        headCommit: async () => "candidate-repair-sha",
+        captureDiff: async () => "diff --git a/src/repair.ts b/src/repair.ts",
+        changedFiles: async () => ["src/repair.ts"],
+      } as unknown as GitRepo,
       planner: async (mission) => [
         {
           kind: "agent" as const,
@@ -729,11 +780,12 @@ describe("mission progress visibility — onProgress streams while the mission r
             testSummary: { passed: 1 },
             noTargets: false,
             accessible: true,
+            acceptanceResults: [],
           },
         }),
       },
       review: {
-        runReview: async () => ({
+        runReview: async ({ acceptanceCriteria }) => ({
           executionId: "r",
           exitStatus: "succeeded",
           summary: "ok",
@@ -749,6 +801,11 @@ describe("mission progress visibility — onProgress streams while the mission r
             findings: [],
             outputValid: true,
             accessible: true,
+            acceptanceResults: (acceptanceCriteria ?? []).map((criterion) => ({
+              acceptanceId: criterion.acceptanceId,
+              status: "passed" as const,
+              detail: "checked",
+            })),
           },
         }),
       },
@@ -756,6 +813,12 @@ describe("mission progress visibility — onProgress streams while the mission r
     const orchestrator = new Orchestrator({
       store,
       backends,
+      git: {
+        root: process.cwd(),
+        headCommit: async () => "candidate-observability-sha",
+        captureDiff: async () => "diff --git a/src/activity.ts b/src/activity.ts",
+        changedFiles: async () => ["src/activity.ts"],
+      } as unknown as GitRepo,
       observability: obs,
       planner: async (mission) => [
         {
@@ -1056,11 +1119,12 @@ describe("acceptance scenario F — state survives orchestrator restart", () => 
             testSummary: { passed: 1 },
             noTargets: false,
             accessible: true,
+            acceptanceResults: [],
           },
         }),
       },
       review: {
-        runReview: async () => ({
+        runReview: async ({ acceptanceCriteria }) => ({
           executionId: "e",
           exitStatus: "succeeded",
           summary: "reviewed",
@@ -1075,6 +1139,11 @@ describe("acceptance scenario F — state survives orchestrator restart", () => 
             findings: [],
             outputValid: true,
             accessible: true,
+            acceptanceResults: (acceptanceCriteria ?? []).map((criterion) => ({
+              acceptanceId: criterion.acceptanceId,
+              status: "passed" as const,
+              detail: "checked before restart",
+            })),
           },
         }),
       },
@@ -1082,6 +1151,12 @@ describe("acceptance scenario F — state survives orchestrator restart", () => 
     const o1 = new Orchestrator({
       store: store1,
       backends: backends1,
+      git: {
+        root: process.cwd(),
+        headCommit: async () => "candidate-restart-sha",
+        captureDiff: async () => "diff --git a/src/restart.ts b/src/restart.ts",
+        changedFiles: async () => ["src/restart.ts"],
+      } as unknown as GitRepo,
       planner: async (mission) => [
         {
           kind: "agent" as const,
