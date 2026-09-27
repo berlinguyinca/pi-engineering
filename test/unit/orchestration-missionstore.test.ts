@@ -413,6 +413,7 @@ describe("MissionStore", () => {
 
     const checkpoint: TaskCheckpoint = {
       checkpointId: "TCP-1",
+      executionId: execution.execution_id,
       missionId: mission.mission_id,
       taskId: failed.task_id,
       repoId: "repo-a",

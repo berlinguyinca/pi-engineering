@@ -1,4 +1,3 @@
-import { id } from "../core/ids.ts";
 import type { MissionStore } from "./missionStore.ts";
 import type { TaskCheckpoint } from "./types.ts";
 
@@ -12,7 +11,7 @@ export interface CheckpointSnapshot {
 
 export interface CheckpointPersistInput {
   taskId: string;
-  checkpointId?: string;
+  executionId: string;
   completedDeliverables?: string[];
   artifactRefs?: string[];
   artifactHashes?: string[];
@@ -56,15 +55,60 @@ export class CheckpointManager {
   }
 
   async persist(input: CheckpointPersistInput): Promise<TaskCheckpoint> {
-    const task = this.store.getTask(input.taskId);
-    if (!task) throw new Error(`unknown task ${input.taskId}`);
-    if (!task.repo_id) throw new Error(`checkpoint requires repository binding for task ${input.taskId}`);
-    const manifest = this.store.getWorkspaceManifest(task.mission_id);
-    const repository = manifest?.repositories.find((candidate) => candidate.repoId === task.repo_id);
-    if (manifest && !repository) throw new Error(`unknown repository binding ${task.repo_id}`);
-    const previous = this.latest(task.task_id, input.checkpointId);
-    const checkpointId = input.checkpointId ?? previous?.checkpointId ?? id("TCP");
-    const snapshot = input.snapshot ?? (await this.snapshot?.(task.task_id)) ?? EMPTY_SNAPSHOT;
+    const execution = this.store.getExecution(input.executionId);
+    const originatingTask = this.store.getTask(input.taskId);
+    if (
+      !originatingTask ||
+      !execution ||
+      execution.task_id !== originatingTask.task_id ||
+      execution.mission_id !== originatingTask.mission_id
+    ) {
+      throw new Error(`checkpoint origin mismatch: execution ${input.executionId} does not own task ${input.taskId}`);
+    }
+    if (!execution.checkpoint_id || !execution.repo_id || !execution.base_sha) {
+      throw new Error(`checkpoint origin mismatch: execution ${input.executionId} lacks repository/base identity`);
+    }
+    const assertCurrentOrigin = () => {
+      const task = this.store.getTask(input.taskId);
+      const repository = this.store
+        .getWorkspaceManifest(execution.mission_id)
+        ?.repositories.find((candidate) => candidate.repoId === execution.repo_id);
+      const mismatches = [
+        !task || task.mission_id !== execution.mission_id ? "task" : null,
+        task?.assigned_execution_id && task.assigned_execution_id !== execution.execution_id
+          ? "execution assignment"
+          : null,
+        task?.repo_id !== execution.repo_id ? "repository" : null,
+        !repository || repository.baseSha !== execution.base_sha ? "base" : null,
+        (task?.mission_generation ?? 0) !== (execution.mission_generation ?? 0) ? "mission generation" : null,
+        (task?.candidate_generation ?? 0) !== (execution.candidate_generation ?? 0) ? "candidate generation" : null,
+        (task?.fencing_token ?? 0) !== (execution.fencing_token ?? 0) ? "fencing token" : null,
+      ].filter((value): value is string => value !== null);
+      if (mismatches.length > 0) throw new Error(`checkpoint origin mismatch: ${mismatches.join(", ")}`);
+      return task!;
+    };
+    assertCurrentOrigin();
+    const snapshot = input.snapshot ?? (await this.snapshot?.(originatingTask.task_id)) ?? EMPTY_SNAPSHOT;
+    const task = assertCurrentOrigin();
+    const checkpointId = execution.checkpoint_id;
+    const previous = this.latest(task.task_id, checkpointId);
+    const usefulSnapshot =
+      snapshot.candidateSha !== null ||
+      snapshot.branch !== null ||
+      snapshot.worktree !== null ||
+      snapshot.committedChanges.length > 0 ||
+      snapshot.preservedUncommittedChanges.length > 0;
+    const preservedSnapshot = usefulSnapshot
+      ? snapshot
+      : previous
+        ? {
+            candidateSha: previous.candidateSha,
+            branch: previous.branch,
+            worktree: previous.worktree,
+            committedChanges: previous.committedChanges,
+            preservedUncommittedChanges: previous.preservedUncommittedChanges,
+          }
+        : snapshot;
     const declared = task.deliverables ?? [];
     const completed = dedupe([
       ...(previous?.completedDeliverables ?? []),
@@ -73,15 +117,16 @@ export class CheckpointManager {
     const completedSet = new Set(completed);
     const checkpoint: TaskCheckpoint = {
       checkpointId,
+      executionId: execution.execution_id,
       missionId: task.mission_id,
       taskId: task.task_id,
-      repoId: task.repo_id,
-      baseSha: repository?.baseSha ?? this.store.getMission(task.mission_id)?.base_ref ?? "",
-      candidateSha: snapshot.candidateSha,
-      branch: snapshot.branch,
-      worktree: snapshot.worktree,
-      committedChanges: dedupe(snapshot.committedChanges),
-      preservedUncommittedChanges: dedupe(snapshot.preservedUncommittedChanges),
+      repoId: execution.repo_id,
+      baseSha: execution.base_sha,
+      candidateSha: preservedSnapshot.candidateSha,
+      branch: preservedSnapshot.branch,
+      worktree: preservedSnapshot.worktree,
+      committedChanges: dedupe(preservedSnapshot.committedChanges),
+      preservedUncommittedChanges: dedupe(preservedSnapshot.preservedUncommittedChanges),
       completedDeliverables: completed,
       remainingDeliverables: declared.filter((deliverable) => !completedSet.has(deliverable)),
       acceptanceIds: [...(task.acceptance_ids ?? [])],
@@ -95,12 +140,14 @@ export class CheckpointManager {
       sessionId: input.sessionId ?? previous?.sessionId ?? null,
       model: input.model ?? previous?.model ?? null,
       sequence: (previous?.sequence ?? 0) + 1,
-      missionGeneration: task.mission_generation ?? 0,
-      candidateGeneration: task.candidate_generation ?? 0,
-      fencingToken: task.fencing_token ?? 0,
+      missionGeneration: execution.mission_generation ?? 0,
+      candidateGeneration: execution.candidate_generation ?? 0,
+      fencingToken: execution.fencing_token ?? 0,
       createdAt: this.now().toISOString(),
     };
-    return this.store.checkpointTask(checkpoint);
+    const persisted = this.store.checkpointTask(checkpoint);
+    await this.store.flush();
+    return persisted;
   }
 
   reconcile(taskId: string): ReconciledCheckpoint | null {

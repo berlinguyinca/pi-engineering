@@ -148,7 +148,7 @@ function harness(opts: HarnessOpts = {}): Harness {
   const orchestrator = new Orchestrator({
     store,
     backends,
-    planner: async () => [
+    planner: async (mission) => [
       {
         kind: "agent" as const,
         role: "implementer",
@@ -162,6 +162,9 @@ function harness(opts: HarnessOpts = {}): Harness {
         depends_on: [],
         priority: 0,
         execution_requirements: {},
+        acceptance_ids: mission.acceptance_criteria.flatMap((criterion) =>
+          criterion.acceptance_id ? [criterion.acceptance_id] : [],
+        ),
         max_attempts: 3,
         failure_policy: "retry" as const,
       },
@@ -180,6 +183,7 @@ describe("acceptance scenario A — simple feature auto-invokes engineering+vali
     });
     assert.equal(result.intent.intent.includes("implement"), true);
     const mission = h.store.getMission(result.mission.mission_id)!;
+    assert.equal(h.store.getWorkspaceManifest(mission.mission_id)?.repositories.length, 1);
     assert.ok(["engineering_review", "engineering"].includes(mission.workflow_class));
     assert.ok(mission.required_gates.includes("validation"));
     assert.ok(mission.required_gates.includes("independent_review"));
@@ -190,6 +194,95 @@ describe("acceptance scenario A — simple feature auto-invokes engineering+vali
     // Completion gate passed -> COMPLETE.
     assert.equal(mission.status, "COMPLETE");
     assert.equal(result.completed, true);
+  });
+});
+
+describe("material legacy orchestration workset safety", () => {
+  it("blocks a traversal domain before a legacy worker can dispatch", async () => {
+    const store = MissionStore.open(JsonlEventStore.inMemory());
+    let calls = 0;
+    const orchestrator = new Orchestrator({
+      store,
+      backends: {
+        agent: {
+          runAgent: async () => {
+            calls++;
+            return { executionId: "unsafe", exitStatus: "succeeded", summary: "unsafe", artifactRefs: [], usage: {} };
+          },
+        },
+      },
+      planner: async (mission) => [
+        {
+          kind: "agent",
+          role: "implementer",
+          objective: "escape",
+          mutates_repo: true,
+          write_domains: ["src/../../outside/**"],
+          isolation: "none",
+          depends_on: [],
+          priority: 0,
+          execution_requirements: {},
+          max_attempts: 1,
+          failure_policy: "block",
+          acceptance_ids: mission.acceptance_criteria.flatMap((criterion) =>
+            criterion.acceptance_id ? [criterion.acceptance_id] : [],
+          ),
+        },
+      ],
+    });
+
+    const result = await orchestrator.orchestrate("Make a material change", {
+      repository: ".",
+      baseRef: "abc",
+      mutationRequested: true,
+      acceptanceCriteria: ["stay inside the repository"],
+    });
+
+    assert.equal(result.mission.status, "BLOCKED");
+    assert.match(result.failureReason ?? "", /INVALID_WRITE_DOMAIN/);
+    assert.equal(calls, 0);
+  });
+
+  it("blocks missing planner acceptance mapping instead of assigning every criterion", async () => {
+    const store = MissionStore.open(JsonlEventStore.inMemory());
+    let calls = 0;
+    const orchestrator = new Orchestrator({
+      store,
+      backends: {
+        agent: {
+          runAgent: async () => {
+            calls++;
+            return { executionId: "worker", exitStatus: "succeeded", summary: "done", artifactRefs: [], usage: {} };
+          },
+        },
+      },
+      planner: async () => [
+        {
+          kind: "agent",
+          role: "implementer",
+          objective: "unmapped work",
+          mutates_repo: true,
+          write_domains: ["src/**"],
+          isolation: "none",
+          depends_on: [],
+          priority: 0,
+          execution_requirements: {},
+          max_attempts: 1,
+          failure_policy: "block",
+        },
+      ],
+    });
+
+    const result = await orchestrator.orchestrate("Implement explicit acceptance", {
+      repository: ".",
+      baseRef: "abc",
+      mutationRequested: true,
+      acceptanceCriteria: ["AC is explicitly implemented"],
+    });
+
+    assert.equal(result.mission.status, "BLOCKED");
+    assert.match(result.failureReason ?? "", /UNCOVERED_ACCEPTANCE/);
+    assert.equal(calls, 0);
   });
 });
 
@@ -205,7 +298,7 @@ describe("mission caller cancellation", () => {
     let reviewCalls = 0;
     const orchestrator = new Orchestrator({
       store,
-      planner: async () => [
+      planner: async (mission) => [
         {
           kind: "agent" as const,
           role: "implementer",
@@ -216,6 +309,9 @@ describe("mission caller cancellation", () => {
           depends_on: [],
           priority: 0,
           execution_requirements: {},
+          acceptance_ids: mission.acceptance_criteria.flatMap((criterion) =>
+            criterion.acceptance_id ? [criterion.acceptance_id] : [],
+          ),
           max_attempts: 1,
           failure_policy: "block" as const,
         },
@@ -279,7 +375,7 @@ describe("mission caller cancellation", () => {
       };
       const orchestrator = new Orchestrator({
         store,
-        planner: async () => [
+        planner: async (mission) => [
           {
             kind: "agent" as const,
             role: "implementer",
@@ -290,6 +386,9 @@ describe("mission caller cancellation", () => {
             depends_on: [],
             priority: 0,
             execution_requirements: {},
+            acceptance_ids: mission.acceptance_criteria.flatMap((criterion) =>
+              criterion.acceptance_id ? [criterion.acceptance_id] : [],
+            ),
             max_attempts: 1,
             failure_policy: "block" as const,
           },
@@ -357,7 +456,7 @@ describe("mission caller cancellation", () => {
     let validationCalls = 0;
     const orchestrator = new Orchestrator({
       store,
-      planner: async () => [
+      planner: async (mission) => [
         {
           kind: "agent" as const,
           role: "implementer",
@@ -368,6 +467,9 @@ describe("mission caller cancellation", () => {
           depends_on: [],
           priority: 0,
           execution_requirements: {},
+          acceptance_ids: mission.acceptance_criteria.flatMap((criterion) =>
+            criterion.acceptance_id ? [criterion.acceptance_id] : [],
+          ),
           max_attempts: 1,
           failure_policy: "block" as const,
         },
@@ -580,7 +682,7 @@ describe("mission progress visibility — onProgress streams while the mission r
       store,
       backends,
       observability: obs,
-      planner: async () => [
+      planner: async (mission) => [
         {
           kind: "agent",
           role: "implementer",
@@ -591,6 +693,9 @@ describe("mission progress visibility — onProgress streams while the mission r
           depends_on: [],
           priority: 0,
           execution_requirements: {},
+          acceptance_ids: mission.acceptance_criteria.flatMap((criterion) =>
+            criterion.acceptance_id ? [criterion.acceptance_id] : [],
+          ),
           max_attempts: 1,
           failure_policy: "block" as const,
         },
@@ -660,6 +765,11 @@ describe("passive requests — gate-bypass and illegal-transition regressions", 
     assert.equal(h.store.getMission(result.mission.mission_id)!.status, "COMPLETE");
     // Nothing was scheduled for a pure conversation.
     assert.equal(h.store.listTasks(result.mission.mission_id).length, 0);
+    assert.equal(
+      h.store.getWorkspaceManifest(result.mission.mission_id),
+      undefined,
+      "passive compatibility must not invent executable repository authority",
+    );
   });
 
   it("a passive classification with policy gates is NOT short-circuited to COMPLETE", async () => {
@@ -735,7 +845,7 @@ describe("acceptance scenario C — independent tasks run concurrently with isol
         removeWorktree: async () => {},
         isAncestor: async () => false,
       } as never,
-      planner: async () => [
+      planner: async (mission) => [
         {
           kind: "agent" as const,
           role: "implementer",
@@ -746,6 +856,9 @@ describe("acceptance scenario C — independent tasks run concurrently with isol
           depends_on: [],
           priority: 0,
           execution_requirements: {},
+          acceptance_ids: mission.acceptance_criteria.flatMap((criterion) =>
+            criterion.acceptance_id ? [criterion.acceptance_id] : [],
+          ),
           max_attempts: 3,
           failure_policy: "retry" as const,
         },
@@ -864,7 +977,7 @@ describe("acceptance scenario F — state survives orchestrator restart", () => 
     const o1 = new Orchestrator({
       store: store1,
       backends: backends1,
-      planner: async () => [
+      planner: async (mission) => [
         {
           kind: "agent" as const,
           role: "implementer",
@@ -875,6 +988,9 @@ describe("acceptance scenario F — state survives orchestrator restart", () => 
           depends_on: [],
           priority: 0,
           execution_requirements: {},
+          acceptance_ids: mission.acceptance_criteria.flatMap((criterion) =>
+            criterion.acceptance_id ? [criterion.acceptance_id] : [],
+          ),
           max_attempts: 3,
           failure_policy: "retry" as const,
         },
@@ -1020,7 +1136,7 @@ describe("missing backends must degrade, not explode", () => {
     const orchestrator = new Orchestrator({
       store,
       backends,
-      planner: async () => [
+      planner: async (mission) => [
         {
           kind: "agent" as const,
           role: "implementer",
@@ -1031,6 +1147,9 @@ describe("missing backends must degrade, not explode", () => {
           depends_on: [],
           priority: 0,
           execution_requirements: {},
+          acceptance_ids: mission.acceptance_criteria.flatMap((criterion) =>
+            criterion.acceptance_id ? [criterion.acceptance_id] : [],
+          ),
           max_attempts: 1,
           failure_policy: "retry" as const,
         },

@@ -98,6 +98,24 @@ describe("MissionScheduler (spec 02)", () => {
   it("attaches checkpoint identity and checkpoints progress without passing acceptance", async () => {
     const store = MissionStore.open(JsonlEventStore.inMemory());
     const mission = createExecutingMission(store);
+    store.bindWorkspaceManifest({
+      manifestId: "WM-checkpoint",
+      missionId: mission.mission_id,
+      generation: 1,
+      authorizedRoots: [{ canonicalPath: "/repo", source: "existing_manifest", access: "read" }],
+      repositories: [
+        {
+          repoId: "repo-1",
+          canonicalRoot: "/repo",
+          baseRef: "main",
+          baseSha: "base-1",
+          writableDomains: ["**"],
+        },
+      ],
+      dependencyEdges: [],
+      hash: "manifest-checkpoint",
+      createdAt: "2026-09-26T10:00:00.000Z",
+    });
     store.addAcceptanceCriterion(mission.mission_id, "the implementation is validated", undefined, "AC-1");
     const task = store.createTask({
       mission_id: mission.mission_id,
@@ -109,6 +127,7 @@ describe("MissionScheduler (spec 02)", () => {
       deliverables: ["implementation", "tests"],
       execution_budget_ms: 10_000,
       checkpoint_policy: { activity_milestone: 1, before_deadline_ms: 1_000 },
+      required_output_artifacts: ["handoff"],
       mutates_repo: false,
       isolation: "none",
       mission_generation: 3,
@@ -127,7 +146,7 @@ describe("MissionScheduler (spec 02)", () => {
               executionId: "worker",
               exitStatus: "succeeded",
               summary: "done",
-              artifactRefs: ["artifact://handoff"],
+              artifactRefs: ["artifact://handoff/sha256:abc"],
               usage: {},
             };
           },
@@ -142,7 +161,8 @@ describe("MissionScheduler (spec 02)", () => {
     const checkpoint = store.getTaskCheckpoint(execution.checkpoint_id!);
     assert.ok(checkpoint);
     assert.deepEqual(checkpoint.completedDeliverables, ["implementation", "tests"]);
-    assert.deepEqual(checkpoint.artifactRefs, ["artifact://handoff"]);
+    assert.deepEqual(checkpoint.artifactRefs, ["artifact://handoff/sha256:abc"]);
+    assert.equal(checkpoint.artifactHashes.length, 1);
     assert.equal(checkpoint.missionGeneration, task.mission_generation);
     assert.equal(checkpoint.candidateGeneration, task.candidate_generation);
     assert.equal(checkpoint.fencingToken, task.fencing_token);

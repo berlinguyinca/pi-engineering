@@ -3,7 +3,12 @@ import { describe, it } from "node:test";
 import { CheckpointManager } from "../../src/orchestration/checkpoints.ts";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
 import type { WorkspaceManifest } from "../../src/orchestration/types.ts";
-import { WorksetValidationError, decompositionInput, validateWorkset } from "../../src/orchestration/workset.ts";
+import {
+  WorksetValidationError,
+  decompositionInput,
+  splitWorksetDeliverables,
+  validateWorkset,
+} from "../../src/orchestration/workset.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 
 const manifest: WorkspaceManifest = {
@@ -71,6 +76,14 @@ describe("repository-scoped workset validation", () => {
     );
   });
 
+  it("rejects absolute and traversal write domains before prefix comparison", () => {
+    for (const writeDomain of ["/src/**", "C:\\src\\**", "src/../../outside/**", "src/../test/**"]) {
+      expectCode("INVALID_WRITE_DOMAIN", () =>
+        validateWorkset({ manifest, acceptanceIds: ["AC-1"], tasks: [task({ write_domains: [writeDomain] })] }),
+      );
+    }
+  });
+
   it("rejects material acceptance criteria that no task covers", () => {
     expectCode("UNCOVERED_ACCEPTANCE", () =>
       validateWorkset({ manifest, acceptanceIds: ["AC-1", "AC-2"], tasks: [task()] }),
@@ -103,6 +116,34 @@ describe("repository-scoped workset validation", () => {
         acceptanceIds: ["AC-1"],
         tasks: [task({ execution_budget_ms: 120_001 })],
         policy: { maxTaskBudgetMs: 120_000 },
+      }),
+    );
+  });
+
+  it("rejects non-positive/non-finite budgets and invalid checkpoint cadence", () => {
+    for (const execution_budget_ms of [0, -1, Number.POSITIVE_INFINITY]) {
+      expectCode("INVALID_TASK_BUDGET", () =>
+        validateWorkset({ manifest, acceptanceIds: ["AC-1"], tasks: [task({ execution_budget_ms })] }),
+      );
+    }
+    for (const checkpoint_policy of [
+      { activity_milestone: 0, before_deadline_ms: 1 },
+      { activity_milestone: 1.5, before_deadline_ms: 1 },
+      { activity_milestone: 1, before_deadline_ms: -1 },
+      { activity_milestone: 1, before_deadline_ms: 60_000 },
+    ]) {
+      expectCode("INVALID_CHECKPOINT_POLICY", () =>
+        validateWorkset({ manifest, acceptanceIds: ["AC-1"], tasks: [task({ checkpoint_policy })] }),
+      );
+    }
+  });
+
+  it("rejects duplicate original task IDs before dependency planning", () => {
+    expectCode("DUPLICATE_TASK_ID", () =>
+      validateWorkset({
+        manifest,
+        acceptanceIds: ["AC-1"],
+        tasks: [task({ task_id: "duplicate" }), task({ task_id: "duplicate", acceptance_ids: [] })],
       }),
     );
   });
@@ -164,6 +205,27 @@ describe("repository-scoped workset validation", () => {
       },
     );
   });
+
+  it("splits with collision-proof IDs and rewrites dependencies through an exact final-child map", () => {
+    const split = splitWorksetDeliverables(
+      [
+        task({ task_id: "build", deliverables: ["one", "two", "three"] }),
+        task({ task_id: "build::part:1", acceptance_ids: [], deliverables: ["reserved"] }),
+        task({ task_id: "verify", acceptance_ids: [], deliverables: ["verify"], depends_on: ["build"] }),
+      ],
+      2,
+    );
+
+    assert.deepEqual(
+      split.tasks.map((candidate) => candidate.task_id),
+      ["build::part:1:1", "build::part:2", "build::part:1", "verify"],
+    );
+    assert.equal(split.finalTaskIdByOriginal.get("build"), "build::part:2");
+    assert.deepEqual(split.tasks.find((candidate) => candidate.task_id === "verify")?.depends_on, ["build::part:2"]);
+    assert.deepEqual(split.tasks.find((candidate) => candidate.task_id === "build::part:2")?.depends_on, [
+      "build::part:1:1",
+    ]);
+  });
 });
 
 describe("CheckpointManager", () => {
@@ -206,8 +268,23 @@ describe("CheckpointManager", () => {
         preservedUncommittedChanges: ["test/api.test.ts"],
       }),
     });
+    const execution = store.createExecution({
+      task_id: planned.task_id,
+      mission_id: mission.mission_id,
+      backend: "agent",
+      checkpoint_id: "TCP-restart",
+      repo_id: "repo-api",
+      base_sha: "base-api",
+      candidate_generation: planned.candidate_generation,
+      mission_generation: planned.mission_generation,
+      fencing_token: planned.fencing_token,
+    });
 
-    const checkpoint = await manager.persist({ taskId: planned.task_id, completedDeliverables: ["implementation"] });
+    const checkpoint = await manager.persist({
+      taskId: planned.task_id,
+      executionId: execution.execution_id,
+      completedDeliverables: ["implementation"],
+    });
     assert.deepEqual(checkpoint.committedChanges, ["src/api.ts"]);
     assert.deepEqual(checkpoint.preservedUncommittedChanges, ["test/api.test.ts"]);
     assert.equal(checkpoint.missionGeneration, 7);

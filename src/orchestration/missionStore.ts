@@ -822,6 +822,9 @@ export class MissionStore {
     mission_generation?: number;
     fencing_token?: number;
     checkpoint_id?: string;
+    repo_id?: string;
+    base_sha?: string;
+    candidate_generation?: number;
   }): Execution {
     const task = this.tasks.get(input.task_id);
     const ex: Execution = {
@@ -844,6 +847,9 @@ export class MissionStore {
       mission_generation: input.mission_generation ?? task?.mission_generation ?? 0,
       fencing_token: input.fencing_token ?? task?.fencing_token ?? 0,
       checkpoint_id: input.checkpoint_id,
+      repo_id: input.repo_id,
+      base_sha: input.base_sha,
+      candidate_generation: input.candidate_generation ?? task?.candidate_generation ?? 0,
     };
     this.executions.set(ex.execution_id, ex);
     this.emit("execution.created", input.mission_id, { actor: "system", execution: ex });

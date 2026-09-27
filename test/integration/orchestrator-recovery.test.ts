@@ -66,7 +66,7 @@ async function run() {
     store,
     backends,
     git,
-    planner: async () => [
+    planner: async (mission) => [
       {
         kind: "agent" as const,
         role: "implementer",
@@ -77,6 +77,9 @@ async function run() {
         depends_on: [],
         priority: 0,
         execution_requirements: {},
+        acceptance_ids: mission.acceptance_criteria.flatMap((criterion) =>
+          criterion.acceptance_id ? [criterion.acceptance_id] : [],
+        ),
         max_attempts: 1,
         failure_policy: "retry" as const,
       },

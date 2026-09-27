@@ -6,6 +6,7 @@ import { describe, it } from "node:test";
 import { promisify } from "node:util";
 import { GitRepo } from "../../src/git/GitRepo.ts";
 import { type BrokerBackends, ExecutionBroker, workerTimeoutMs } from "../../src/orchestration/broker.ts";
+import { CheckpointManager } from "../../src/orchestration/checkpoints.ts";
 import { Integrator } from "../../src/orchestration/integrator.ts";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
@@ -137,6 +138,170 @@ async function assertCrossBoundaryRenameRejected(commitRename: boolean): Promise
 }
 
 describe("ExecutionBroker (spec 03)", () => {
+  it("does not complete declared deliverables when required artifact identities are missing", async () => {
+    const { broker, m, t, store } = setup({
+      agent: {
+        runAgent: async () => ({
+          executionId: "worker",
+          exitStatus: "succeeded",
+          summary: "claimed success without evidence",
+          artifactRefs: [],
+          usage: {},
+        }),
+      },
+    });
+    const outcome = await (
+      await broker.execute({
+        taskId: t.task_id,
+        missionId: m.mission_id,
+        kind: "agent",
+        objective: "produce a diff",
+        deliverables: ["implementation"],
+        requiredOutputArtifacts: ["diff"],
+      })
+    ).result();
+
+    assert.equal(outcome.exitStatus, "failed");
+    assert.match(outcome.summary, /required output artifact.*diff/i);
+    assert.equal(store.listExecutions(m.mission_id, t.task_id)[0]?.status, "FAILED");
+  });
+
+  it("anchors the hard timeout to execution creation and rejects invalid checkpoint lead time", async () => {
+    const { broker, m, t } = setup({
+      agent: {
+        runAgent: async ({ signal }) => {
+          await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+          return { executionId: "late", exitStatus: "failed", summary: "deadline", artifactRefs: [], usage: {} };
+        },
+      },
+    });
+    await assert.rejects(
+      broker.execute({
+        taskId: t.task_id,
+        missionId: m.mission_id,
+        kind: "agent",
+        objective: "invalid cadence",
+        executionBudgetMs: 50,
+        checkpointPolicy: { activity_milestone: 1, before_deadline_ms: 50 },
+      }),
+      /INVALID_CHECKPOINT_POLICY/,
+    );
+
+    const handle = await broker.execute({
+      taskId: t.task_id,
+      missionId: m.mission_id,
+      kind: "agent",
+      objective: "absolute deadline",
+      executionBudgetMs: 80,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 55));
+    const startedResultAt = Date.now();
+    await handle.result();
+    assert.ok(Date.now() - startedResultAt < 60, "result() must use the existing deadline, not start a fresh budget");
+  });
+
+  it("checkpoints dirty work before cancellation removes the worktree and disables the deadline timer", async () => {
+    const fx = await makeFixtureRepo();
+    try {
+      const git = await GitRepo.open(fx.root);
+      assert.ok(git);
+      const store = MissionStore.open(JsonlEventStore.inMemory());
+      const mission = store.createMission({
+        title: "cancel checkpoint",
+        goal: "cancel checkpoint",
+        user_request: "cancel checkpoint",
+        repository: fx.root,
+        base_ref: await git.headCommit(),
+        risk_profile: "medium",
+        workflow_class: "engineering_review",
+      });
+      store.bindWorkspaceManifest({
+        manifestId: "WM-cancel",
+        missionId: mission.mission_id,
+        generation: 1,
+        authorizedRoots: [{ canonicalPath: fx.root, source: "existing_manifest", access: "write" }],
+        repositories: [
+          {
+            repoId: "repo-cancel",
+            canonicalRoot: fx.root,
+            baseRef: "main",
+            baseSha: mission.base_ref,
+            writableDomains: ["src/**"],
+          },
+        ],
+        dependencyEdges: [],
+        hash: "manifest-cancel",
+        createdAt: "2026-09-26T10:00:00.000Z",
+      });
+      const task = store.createTask({
+        mission_id: mission.mission_id,
+        repo_id: "repo-cancel",
+        kind: "agent",
+        role: "implementer",
+        objective: "write then cancel",
+        mutates_repo: true,
+        isolation: "worktree",
+        write_domains: ["src/**"],
+        deliverables: ["implementation"],
+        execution_budget_ms: 200,
+        checkpoint_policy: { activity_milestone: 10, before_deadline_ms: 100 },
+        mission_generation: 2,
+        candidate_generation: 3,
+        fencing_token: 4,
+      });
+      store.transitionTask(task.task_id, "READY");
+      let dirty!: () => void;
+      const dirtyWritten = new Promise<void>((resolve) => {
+        dirty = resolve;
+      });
+      const broker = new ExecutionBroker({
+        store,
+        git,
+        checkpoints: new CheckpointManager({ store }),
+        resolveRepository: async (repoId) => ({ repoId, root: fx.root, git }),
+        backends: {
+          agent: {
+            runAgent: async ({ worktree, signal }) => {
+              assert.ok(worktree);
+              await writeFile(join(worktree, "src", "cancelled.ts"), "export const cancelled = true;\n", "utf8");
+              dirty();
+              await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+              return { executionId: "late", exitStatus: "succeeded", summary: "late", artifactRefs: [], usage: {} };
+            },
+          },
+        },
+      });
+      const handle = await broker.execute({
+        taskId: task.task_id,
+        missionId: mission.mission_id,
+        repoId: "repo-cancel",
+        kind: "agent",
+        role: "implementer",
+        objective: task.objective,
+        mutatesRepo: true,
+        writeDomains: task.write_domains,
+        isolation: "worktree",
+        deliverables: task.deliverables,
+        executionBudgetMs: task.execution_budget_ms,
+        checkpointPolicy: task.checkpoint_policy,
+      });
+      const result = handle.result().catch(() => undefined);
+      await dirtyWritten;
+      await handle.cancel();
+      await result;
+
+      const execution = store.getExecution(handle.executionId)!;
+      const checkpoint = store.getTaskCheckpoint(execution.checkpoint_id!);
+      assert.ok(checkpoint);
+      assert.deepEqual(checkpoint.preservedUncommittedChanges, ["src/cancelled.ts"]);
+      const sequence = checkpoint.sequence;
+      await new Promise((resolve) => setTimeout(resolve, 130));
+      assert.equal(store.getTaskCheckpoint(execution.checkpoint_id!)?.sequence, sequence);
+    } finally {
+      await fx.cleanup();
+    }
+  });
+
   it("rejects a committed rename from outside into an authorized domain and never integrates it", async () => {
     await assertCrossBoundaryRenameRejected(true);
   });

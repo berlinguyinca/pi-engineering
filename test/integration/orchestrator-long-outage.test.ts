@@ -39,7 +39,7 @@ function run(outageMs: number) {
   const orchestrator = new Orchestrator({
     store,
     backends,
-    planner: async () => [
+    planner: async (mission) => [
       {
         kind: "agent" as const,
         role: "implementer",
@@ -52,6 +52,9 @@ function run(outageMs: number) {
         depends_on: [],
         priority: 0,
         execution_requirements: {},
+        acceptance_ids: mission.acceptance_criteria.flatMap((criterion) =>
+          criterion.acceptance_id ? [criterion.acceptance_id] : [],
+        ),
         max_attempts: 3,
         failure_policy: "retry" as const,
       },

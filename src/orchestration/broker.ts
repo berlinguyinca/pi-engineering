@@ -18,6 +18,7 @@
  * orchestrator; tests inject deterministic fakes.
  */
 
+import { createHash } from "node:crypto";
 import { id } from "../core/ids.ts";
 import type { GitRepo } from "../git/GitRepo.ts";
 import type { WorkerActivity } from "../workers/WorkerExecutor.ts";
@@ -45,6 +46,7 @@ export interface ExecutionRequestInput {
   deliverables?: string[];
   executionBudgetMs?: number;
   checkpointPolicy?: { activity_milestone: number; before_deadline_ms: number };
+  requiredOutputArtifacts?: string[];
   /**
    * Review only: recovered tasks whose objective the review request asks to
    * verify. Recorded on the execution as `reviewed_recovered`.
@@ -87,6 +89,15 @@ export interface ExecutionOutcome {
    * `recovered_merged` for the completion gate.
    */
   recoveredMerged?: RecoveredMerge[];
+}
+
+function artifactIdentity(ref: string): string | null {
+  const match = /^artifact:\/\/([^/]+)\/.+/.exec(ref);
+  return match?.[1] ?? null;
+}
+
+function artifactHash(ref: string): string {
+  return `sha256:${createHash("sha256").update(ref).digest("hex")}`;
 }
 
 /** Backend runner contracts — injected, so the broker stays deterministic-testable. */
@@ -240,7 +251,13 @@ export class ExecutionBroker {
   /** In-flight execution state for cancellation + allocated worktrees. */
   private readonly active = new Map<
     string,
-    { abort: AbortController; status: string; worktree: string | null; taskId: string }
+    {
+      abort: AbortController;
+      status: string;
+      worktree: string | null;
+      taskId: string;
+      cancelCheckpoint?: () => Promise<void>;
+    }
   >();
   /** Allocated worktrees, cleaned up when their execution settles. */
   readonly allocatedWorktrees = new Map<
@@ -320,7 +337,15 @@ export class ExecutionBroker {
     input: ExecutionRequestInput,
   ): Promise<{ repoId?: string; root: string; git: GitRepo } | null> {
     if (input.repoId) {
-      if (!this.resolveRepository) throw new Error(`WORKSPACE_SCOPE_MISMATCH: no resolver for ${input.repoId}`);
+      if (!this.resolveRepository) {
+        const binding = this.store
+          .getWorkspaceManifest(input.missionId)
+          ?.repositories.find((repository) => repository.repoId === input.repoId);
+        if (!binding) throw new Error(`WORKSPACE_SCOPE_MISMATCH: unknown repository binding ${input.repoId}`);
+        if (this.git) return { repoId: input.repoId, root: binding.canonicalRoot, git: this.git };
+        if (!input.mutatesRepo || input.isolation === "none") return null;
+        throw new Error(`WORKSPACE_SCOPE_MISMATCH: no repository provider for ${input.repoId}`);
+      }
       const resolved = await this.resolveRepository(input.repoId, input.writeDomains ?? []);
       if (resolved.repoId !== input.repoId) {
         throw new Error(`WORKSPACE_SCOPE_MISMATCH: resolved ${resolved.repoId} for ${input.repoId}`);
@@ -343,7 +368,9 @@ export class ExecutionBroker {
   async cancelExecution(executionId: string, taskId?: string): Promise<boolean> {
     const entry = this.active.get(executionId);
     if (!entry) return false;
+    const checkpoint = entry.cancelCheckpoint?.();
     entry.abort.abort();
+    await checkpoint;
     this.store.setExecutionStatus(executionId, "CANCELED", { exit_status: "canceled" });
     const id = taskId ?? entry.taskId;
     if (id && this.store.getTask(id) && this.store.getTask(id)!.status === "RUNNING") {
@@ -733,8 +760,28 @@ export class ExecutionBroker {
 
   async execute(input: ExecutionRequestInput): Promise<ExecutionHandle> {
     input.authority?.assertAuthoritative();
+    const executionStartedAt = Date.now();
+    const executionBudgetMs = input.executionBudgetMs ?? input.timeoutPolicy?.timeoutMs ?? this.defaultTimeoutMs;
+    if (!Number.isFinite(executionBudgetMs) || executionBudgetMs <= 0) {
+      throw new Error("INVALID_TASK_BUDGET: execution budget must be finite and positive");
+    }
+    if (
+      input.checkpointPolicy &&
+      (!Number.isInteger(input.checkpointPolicy.activity_milestone) ||
+        input.checkpointPolicy.activity_milestone <= 0 ||
+        !Number.isFinite(input.checkpointPolicy.before_deadline_ms) ||
+        input.checkpointPolicy.before_deadline_ms < 0 ||
+        input.checkpointPolicy.before_deadline_ms >= executionBudgetMs)
+    ) {
+      throw new Error("INVALID_CHECKPOINT_POLICY: checkpoint lead must be finite, non-negative, and below budget");
+    }
+    const executionDeadlineAt = executionStartedAt + executionBudgetMs;
     const backend = this.backendForKind(input.kind);
     const checkpointId = input.checkpointId ?? (this.checkpoints && input.repoId ? id("TCP") : undefined);
+    const task = this.store.getTask(input.taskId);
+    const binding = this.store
+      .getWorkspaceManifest(input.missionId)
+      ?.repositories.find((repository) => repository.repoId === input.repoId);
     const execution = this.store.createExecution({
       task_id: input.taskId,
       mission_id: input.missionId,
@@ -744,6 +791,9 @@ export class ExecutionBroker {
       mission_generation: input.authority?.missionIdentity.generation,
       fencing_token: input.authority?.missionIdentity.fencingToken,
       checkpoint_id: checkpointId,
+      repo_id: input.repoId,
+      base_sha: binding?.baseSha ?? this.store.getMission(input.missionId)?.base_ref,
+      candidate_generation: task?.candidate_generation,
     });
 
     const abort = new AbortController();
@@ -763,10 +813,9 @@ export class ExecutionBroker {
       },
       result: async () => {
         if (abort.signal.aborted) throw new Error("execution aborted before dispatch");
-        const timeoutMs = input.executionBudgetMs ?? input.timeoutPolicy?.timeoutMs ?? this.defaultTimeoutMs;
         const timer = setTimeout(
-          () => abort.abort(new DOMException(`Execution exceeded its ${timeoutMs}ms deadline`, "TimeoutError")),
-          timeoutMs,
+          () => abort.abort(new DOMException(`Execution exceeded its ${executionBudgetMs}ms deadline`, "TimeoutError")),
+          Math.max(0, executionDeadlineAt - Date.now()),
         );
         const activityStartedAt = Date.now();
         let lastActivityAt = activityStartedAt;
@@ -775,22 +824,38 @@ export class ExecutionBroker {
         let checkpointTimer: ReturnType<typeof setTimeout> | undefined;
         let repository: { repoId?: string; root: string; git: GitRepo } | null = null;
         let meaningfulActivity = 0;
+        let checkpointScheduling = true;
+        let cancelCheckpointPromise: Promise<void> | undefined;
         let checkpointChain = Promise.resolve();
-        const queueCheckpoint = (completedDeliverables: string[] = [], artifactRefs: string[] = []): void => {
-          if (!this.checkpoints || !checkpointId || !input.repoId) return;
+        const persistCheckpoint = (
+          completedDeliverables: string[] = [],
+          artifactRefs: string[] = [],
+          artifactHashes: string[] = [],
+        ): Promise<void> => {
+          if (!this.checkpoints || !checkpointId || !input.repoId) return Promise.resolve();
           checkpointChain = checkpointChain.then(async () => {
             input.authority?.assertAuthoritative();
             const snapshot = await this.checkpointSnapshot(execution.execution_id, input, repository);
             input.authority?.assertAuthoritative();
             await this.checkpoints!.persist({
               taskId: input.taskId,
-              checkpointId,
+              executionId: execution.execution_id,
               completedDeliverables,
               artifactRefs,
+              artifactHashes,
               model: execution.model,
               snapshot,
             });
           });
+          return checkpointChain;
+        };
+        const queueCheckpoint = (
+          completedDeliverables: string[] = [],
+          artifactRefs: string[] = [],
+          artifactHashes: string[] = [],
+        ): void => {
+          if (!checkpointScheduling) return;
+          void persistCheckpoint(completedDeliverables, artifactRefs, artifactHashes);
         };
         const emitActivity = (event: WorkerActivity): void => {
           if (activitySettled || abort.signal.aborted) return;
@@ -865,6 +930,7 @@ export class ExecutionBroker {
             input.mutatesRepo &&
             input.kind !== "integration" &&
             input.isolation !== "worktree" &&
+            this.resolveRepository !== undefined &&
             !(input.writeDomains ?? []).includes("**")
           ) {
             throw new Error(
@@ -881,9 +947,19 @@ export class ExecutionBroker {
           if (this.checkpoints && checkpointId && input.checkpointPolicy) {
             checkpointTimer = setTimeout(
               () => queueCheckpoint(),
-              Math.max(0, timeoutMs - input.checkpointPolicy.before_deadline_ms),
+              Math.max(0, executionDeadlineAt - input.checkpointPolicy.before_deadline_ms - Date.now()),
             );
             checkpointTimer.unref?.();
+          }
+          const activeForCheckpoint = this.active.get(execution.execution_id);
+          if (activeForCheckpoint && this.checkpoints && checkpointId) {
+            activeForCheckpoint.cancelCheckpoint = () => {
+              checkpointScheduling = false;
+              if (checkpointTimer) clearTimeout(checkpointTimer);
+              if (activityTimer) clearInterval(activityTimer);
+              cancelCheckpointPromise ??= persistCheckpoint();
+              return cancelCheckpointPromise;
+            };
           }
           if (abort.signal.aborted) throw new Error("execution aborted before dispatch");
           input.authority?.assertAuthoritative();
@@ -907,9 +983,22 @@ export class ExecutionBroker {
               error: "WORKSPACE_SCOPE_MISMATCH",
             };
           }
+          if (outcome.exitStatus === "succeeded" && input.requiredOutputArtifacts?.length) {
+            const identities = new Set(outcome.artifactRefs.map(artifactIdentity).filter((value) => value !== null));
+            const missing = input.requiredOutputArtifacts.filter((identity) => !identities.has(identity));
+            if (missing.length > 0) {
+              outcome = {
+                ...outcome,
+                exitStatus: "failed",
+                summary: `Required output artifact identities missing: ${missing.join(", ")}`,
+                error: "INVALID_WORKER_OUTPUT",
+              };
+            }
+          }
           queueCheckpoint(
             outcome.exitStatus === "succeeded" ? [...(input.deliverables ?? [])] : [],
             outcome.artifactRefs,
+            outcome.artifactRefs.map(artifactHash),
           );
           await checkpointChain;
           // A cancellation that already settled this execution must not be
@@ -1015,6 +1104,8 @@ export class ExecutionBroker {
           activitySettled = true;
           if (activityTimer) clearInterval(activityTimer);
           if (checkpointTimer) clearTimeout(checkpointTimer);
+          checkpointScheduling = false;
+          await cancelCheckpointPromise?.catch(() => undefined);
           await checkpointChain.catch(() => undefined);
           abort.signal.removeEventListener("abort", onAbort);
           clearTimeout(timer);

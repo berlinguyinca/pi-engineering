@@ -7,9 +7,13 @@ export type WorksetValidationCode =
   | "UNCOVERED_ACCEPTANCE"
   | "UNKNOWN_ACCEPTANCE"
   | "UNKNOWN_DEPENDENCY"
+  | "DUPLICATE_TASK_ID"
   | "CYCLIC_DEPENDENCY"
   | "DECOMPOSITION_REQUIRED"
   | "TASK_BUDGET_EXCEEDED"
+  | "INVALID_TASK_BUDGET"
+  | "INVALID_CHECKPOINT_POLICY"
+  | "INVALID_WRITE_DOMAIN"
   | "CROSS_REPOSITORY_MUTATION_UNSUPPORTED";
 
 export class WorksetValidationError extends Error {
@@ -44,6 +48,7 @@ export interface WorksetTask {
   acceptance_ids?: string[];
   deliverables?: string[];
   execution_budget_ms?: number;
+  checkpoint_policy?: { activity_milestone: number; before_deadline_ms: number };
 }
 
 export interface ValidateWorksetInput {
@@ -53,19 +58,36 @@ export interface ValidateWorksetInput {
   policy?: Partial<WorksetPolicy>;
 }
 
-function normalizeDomain(domain: string): string {
-  return domain.replaceAll("\\", "/").replace(/^\.\//, "").replace(/\/$/, "");
+function domainSegments(domain: string): string[] {
+  const normalized = domain.replaceAll("\\", "/");
+  if (normalized.startsWith("/") || /^[A-Za-z]:\//.test(normalized)) {
+    throw new WorksetValidationError(
+      "INVALID_WRITE_DOMAIN",
+      `absolute write domain ${domain} is not repository-relative`,
+      "Use a normalized path relative to the bound repository",
+    );
+  }
+  const segments = normalized.replace(/\/$/, "").split("/");
+  if (segments.length === 0 || segments.some((segment) => segment === "" || segment === "." || segment === "..")) {
+    throw new WorksetValidationError(
+      "INVALID_WRITE_DOMAIN",
+      `write domain ${domain} contains empty, dot, or traversal components`,
+      "Use canonical repository-relative path segments without . or ..",
+    );
+  }
+  return segments;
 }
 
 function domainWithin(requested: string, authorized: string): boolean {
-  const target = normalizeDomain(requested);
-  const allowed = normalizeDomain(authorized);
-  if (allowed === "**") return true;
-  if (target === "**") return false;
-  if (!allowed.endsWith("/**")) return target === allowed;
-  const allowedPrefix = allowed.slice(0, -3).replace(/\/$/, "");
-  const targetPrefix = target.endsWith("/**") ? target.slice(0, -3).replace(/\/$/, "") : target;
-  return targetPrefix === allowedPrefix || targetPrefix.startsWith(`${allowedPrefix}/`);
+  const target = domainSegments(requested);
+  const allowed = domainSegments(authorized);
+  if (allowed.length === 1 && allowed[0] === "**") return true;
+  if (target.length === 1 && target[0] === "**") return false;
+  const recursive = allowed.at(-1) === "**";
+  const prefix = recursive ? allowed.slice(0, -1) : allowed;
+  if (!recursive && target.length !== prefix.length) return false;
+  if (target.length < prefix.length) return false;
+  return prefix.every((segment, index) => target[index] === segment);
 }
 
 function assertAcyclic(tasks: WorksetTask[]): void {
@@ -106,6 +128,17 @@ export function validateWorkset(input: ValidateWorksetInput): WorksetTask[] {
   const repositories = new Map(input.manifest.repositories.map((repository) => [repository.repoId, repository]));
   const knownAcceptance = new Set(input.acceptanceIds);
 
+  const taskIds = new Set<string>();
+  for (const task of input.tasks) {
+    if (taskIds.has(task.task_id)) {
+      throw new WorksetValidationError(
+        "DUPLICATE_TASK_ID",
+        `task ID ${task.task_id} appears more than once`,
+        "Assign every original planner task a unique stable ID",
+      );
+    }
+    taskIds.add(task.task_id);
+  }
   assertAcyclic(input.tasks);
   const mutatingRepositories = new Set(
     input.tasks.filter((task) => task.mutates_repo).flatMap((task) => (task.repo_id ? [task.repo_id] : [])),
@@ -118,6 +151,7 @@ export function validateWorkset(input: ValidateWorksetInput): WorksetTask[] {
     );
   }
   for (const task of input.tasks) {
+    for (const domain of task.write_domains) domainSegments(domain);
     if (task.kind === "aggregation" && task.mutates_repo) {
       throw new WorksetValidationError(
         "CROSS_REPOSITORY_MUTATION_UNSUPPORTED",
@@ -153,11 +187,33 @@ export function validateWorkset(input: ValidateWorksetInput): WorksetTask[] {
         `Split it into tasks of at most ${policy.maxDeliverablesPerTask} deliverables`,
       );
     }
+    if (!Number.isFinite(task.execution_budget_ms) || (task.execution_budget_ms ?? 0) <= 0) {
+      throw new WorksetValidationError(
+        "INVALID_TASK_BUDGET",
+        `task ${task.task_id} has invalid execution budget ${task.execution_budget_ms}`,
+        "Use a finite positive execution budget",
+      );
+    }
     if ((task.execution_budget_ms ?? 0) > policy.maxTaskBudgetMs) {
       throw new WorksetValidationError(
         "TASK_BUDGET_EXCEEDED",
         `task ${task.task_id} budget ${task.execution_budget_ms}ms exceeds ${policy.maxTaskBudgetMs}ms`,
         "Reduce the budget or split the task into checkpointed deliverables",
+      );
+    }
+    const checkpointPolicy = task.checkpoint_policy;
+    if (
+      !checkpointPolicy ||
+      !Number.isInteger(checkpointPolicy.activity_milestone) ||
+      checkpointPolicy.activity_milestone <= 0 ||
+      !Number.isFinite(checkpointPolicy.before_deadline_ms) ||
+      checkpointPolicy.before_deadline_ms < 0 ||
+      checkpointPolicy.before_deadline_ms >= (task.execution_budget_ms ?? 0)
+    ) {
+      throw new WorksetValidationError(
+        "INVALID_CHECKPOINT_POLICY",
+        `task ${task.task_id} checkpoint cadence is outside its execution budget`,
+        "Use a positive integer activity milestone and a finite lead time smaller than the task budget",
       );
     }
     const repository = task.repo_id ? repositories.get(task.repo_id) : undefined;
@@ -226,23 +282,64 @@ export function decompositionInput(
 }
 
 /** Deterministically split an oversized task into dependency-ordered deliverable chunks. */
-export function splitTaskDeliverables<T extends WorksetTask>(task: T, maxDeliverablesPerTask: number): T[] {
-  const deliverables = task.deliverables ?? [];
-  if (deliverables.length <= maxDeliverablesPerTask) return [task];
-  const chunks: string[][] = [];
-  for (let index = 0; index < deliverables.length; index += maxDeliverablesPerTask) {
-    chunks.push(deliverables.slice(index, index + maxDeliverablesPerTask));
+export function splitWorksetDeliverables<T extends WorksetTask>(
+  tasks: T[],
+  maxDeliverablesPerTask: number,
+): { tasks: T[]; finalTaskIdByOriginal: Map<string, string> } {
+  if (!Number.isInteger(maxDeliverablesPerTask) || maxDeliverablesPerTask <= 0) {
+    throw new Error("maxDeliverablesPerTask must be a positive integer");
   }
-  return chunks.map((chunk, index) => {
-    const taskId = `${task.task_id}-${index + 1}`;
-    return {
+  const occupied = new Set<string>();
+  for (const task of tasks) {
+    if (occupied.has(task.task_id)) {
+      throw new WorksetValidationError(
+        "DUPLICATE_TASK_ID",
+        `task ID ${task.task_id} appears more than once`,
+        "Assign every original planner task a unique stable ID",
+      );
+    }
+    occupied.add(task.task_id);
+  }
+  const split: T[] = [];
+  const finalTaskIdByOriginal = new Map<string, string>();
+  for (const task of tasks) {
+    const deliverables = task.deliverables ?? [];
+    if (deliverables.length <= maxDeliverablesPerTask) {
+      split.push({ ...task, depends_on: [...task.depends_on] });
+      finalTaskIdByOriginal.set(task.task_id, task.task_id);
+      continue;
+    }
+    let previous: string | undefined;
+    for (let index = 0; index < deliverables.length; index += maxDeliverablesPerTask) {
+      const part = index / maxDeliverablesPerTask + 1;
+      const baseId = `${task.task_id}::part:${part}`;
+      let taskId = baseId;
+      let collision = 1;
+      while (occupied.has(taskId)) taskId = `${baseId}:${collision++}`;
+      occupied.add(taskId);
+      const chunk = deliverables.slice(index, index + maxDeliverablesPerTask);
+      split.push({
+        ...task,
+        task_id: taskId,
+        objective: `${(task as T & { objective?: string }).objective ?? task.task_id} [deliverables: ${chunk.join(", ")}]`,
+        deliverables: chunk,
+        depends_on: previous ? [previous] : [...task.depends_on],
+      });
+      previous = taskId;
+    }
+    finalTaskIdByOriginal.set(task.task_id, previous!);
+  }
+  return {
+    tasks: split.map((task) => ({
       ...task,
-      task_id: taskId,
-      objective: `${(task as T & { objective?: string }).objective ?? task.task_id} [deliverables: ${chunk.join(", ")}]`,
-      deliverables: chunk,
-      depends_on: index === 0 ? [...task.depends_on] : [`${task.task_id}-${index}`],
-    };
-  });
+      depends_on: task.depends_on.map((dependency) => finalTaskIdByOriginal.get(dependency) ?? dependency),
+    })),
+    finalTaskIdByOriginal,
+  };
+}
+
+export function splitTaskDeliverables<T extends WorksetTask>(task: T, maxDeliverablesPerTask: number): T[] {
+  return splitWorksetDeliverables([task], maxDeliverablesPerTask).tasks;
 }
 
 export type ValidatableOrchestrationTask = Pick<

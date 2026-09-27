@@ -239,7 +239,8 @@ export class MissionScheduler {
         const conflict = active.some(
           (a) =>
             a.mutates_repo &&
-            ((t.repo_id !== undefined && a.repo_id === t.repo_id) || domainsOverlap(a.write_domains, t.write_domains)),
+            (t.repo_id === undefined || a.repo_id === undefined || t.repo_id === a.repo_id) &&
+            domainsOverlap(a.write_domains, t.write_domains),
         );
         if (conflict) continue;
       }
@@ -370,7 +371,8 @@ export class MissionScheduler {
     return [...this.activeTasks.values()].some(
       (a) =>
         a.mutates_repo &&
-        ((t.repo_id !== undefined && a.repo_id === t.repo_id) || domainsOverlap(a.write_domains, t.write_domains)),
+        (t.repo_id === undefined || a.repo_id === undefined || t.repo_id === a.repo_id) &&
+        domainsOverlap(a.write_domains, t.write_domains),
     );
   }
 
@@ -435,6 +437,7 @@ export class MissionScheduler {
           deliverables: task.deliverables,
           executionBudgetMs: task.execution_budget_ms,
           checkpointPolicy: task.checkpoint_policy,
+          requiredOutputArtifacts: task.required_output_artifacts,
           authority,
         });
         authority?.onInvalidated(() => {

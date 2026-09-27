@@ -50,10 +50,15 @@ import {
   DEFAULT_WORKSET_POLICY,
   type WorksetPolicy,
   WorksetValidationError,
-  splitTaskDeliverables,
+  splitWorksetDeliverables,
   validateWorkset,
 } from "./workset.ts";
-import { type WorkspaceManifestResolver, WorkspaceScopeError, createWorkspaceManifest } from "./workspaceManifest.ts";
+import {
+  type WorkspaceManifestResolver,
+  WorkspaceScopeError,
+  createCompatibilityWorkspaceManifest,
+  createWorkspaceManifest,
+} from "./workspaceManifest.ts";
 
 /** A task planned by the planner; the orchestrator fills lifecycle fields. */
 export type PlanTaskInput = Omit<
@@ -475,6 +480,15 @@ export class Orchestrator {
       workflow_class: intent.suggested_workflow,
       parent_session_id: this.parentSessionId,
     });
+    if (material && !workspace && !workspaceError) {
+      const compatibilityManifest = createCompatibilityWorkspaceManifest(
+        mission.mission_id,
+        opts.repository,
+        selectedBaseRef,
+      );
+      this.store.bindWorkspaceManifest(compatibilityManifest);
+      this.missionRepoIds.set(mission.mission_id, compatibilityManifest.repositories[0]!.repoId);
+    }
     if (this.ownership) {
       this.ownershipByMission.set(mission.mission_id, await this.ownership.acquire(mission.mission_id));
     }
@@ -622,19 +636,25 @@ export class Orchestrator {
       const normalized = planned.map((task) => ({
         ...task,
         task_id: task.task_id ?? id("TSK"),
-        acceptance_ids: task.acceptance_ids?.length ? [...task.acceptance_ids] : [...acceptanceIds],
+        acceptance_ids: task.acceptance_ids ? [...task.acceptance_ids] : [],
         deliverables: task.deliverables?.length ? [...task.deliverables] : [task.objective],
         execution_budget_ms: task.execution_budget_ms ?? this.worksetPolicy.maxTaskBudgetMs,
         checkpoint_policy: task.checkpoint_policy ?? {
           activity_milestone: 5,
           before_deadline_ms: 30_000,
         },
-        required_output_artifacts: task.required_output_artifacts?.length
-          ? [...task.required_output_artifacts]
-          : ["worker-output"],
+        required_output_artifacts: [...(task.required_output_artifacts ?? [])],
       }));
+      let worksetError: WorksetValidationError | undefined;
+      let decomposedPlan: typeof normalized = [];
+      try {
+        decomposedPlan = splitWorksetDeliverables(normalized, this.worksetPolicy.maxDeliverablesPerTask).tasks;
+      } catch (error) {
+        if (error instanceof WorksetValidationError) worksetError = error;
+        else throw error;
+      }
       const expandedByOriginal = new Map<string, typeof normalized>();
-      for (const task of normalized) {
+      for (const task of decomposedPlan) {
         const repositories =
           manifest && manifest.repositories.length > 1 && !task.repo_id && task.kind !== "aggregation"
             ? manifest.repositories
@@ -669,23 +689,8 @@ export class Orchestrator {
           return sameRepository ? [sameRepository.task_id] : candidates.map((candidate) => candidate.task_id);
         }),
       }));
-      const split = expanded.flatMap((task) => splitTaskDeliverables(task, this.worksetPolicy.maxDeliverablesPerTask));
-      const finalId = new Map(
-        expanded.map((task) => [
-          task.task_id,
-          split
-            .filter(
-              (candidate) => candidate.task_id === task.task_id || candidate.task_id.startsWith(`${task.task_id}-`),
-            )
-            .at(-1)!.task_id,
-        ]),
-      );
-      const scopedPlan = split.map((task) => ({
-        ...task,
-        depends_on: task.depends_on.map((dependency) => finalId.get(dependency) ?? dependency),
-      }));
-      let worksetError: WorksetValidationError | undefined;
-      if (manifest) {
+      const scopedPlan = expanded;
+      if (manifest && !worksetError) {
         try {
           validateWorkset({ manifest, acceptanceIds, tasks: scopedPlan, policy: this.worksetPolicy });
         } catch (error) {
@@ -949,7 +954,7 @@ export class Orchestrator {
           write_domains: this.writableDomainsForMission(missionId),
           isolation: repairIsolation,
           repo_id: this.repoIdForMission(missionId),
-          ...this.boundedTaskFields(missionId, ["repair"], ["diff", "test-results"]),
+          ...this.boundedTaskFields(missionId, ["repair"], []),
         });
         this.store.transitionTask(repair.task_id, "READY");
         const repaired = await this.runSingleTask(missionId, repair.task_id, { signal });
@@ -1084,7 +1089,7 @@ export class Orchestrator {
         write_domains: this.writableDomainsForMission(mission.mission_id),
         isolation: "none",
         repo_id: this.repoIdForMission(mission.mission_id),
-        ...this.boundedTaskFields(mission.mission_id, ["integration"], ["integrated-candidate"]),
+        ...this.boundedTaskFields(mission.mission_id, ["integration"], []),
       });
       this.store.transitionTask(integ.task_id, "READY");
       integrationOk = await this.runSingleTask(mission.mission_id, integ.task_id, { signal });
@@ -1154,7 +1159,7 @@ export class Orchestrator {
         mutates_repo: false,
         isolation: "none",
         repo_id: this.repoIdForMission(mission.mission_id),
-        ...this.boundedTaskFields(mission.mission_id, ["validation"], ["test-results"]),
+        ...this.boundedTaskFields(mission.mission_id, ["validation"], []),
       });
       this.store.transitionTask(task.task_id, "READY");
       validationAttempted = true;
@@ -1202,7 +1207,7 @@ export class Orchestrator {
         isolation: "none",
         depends_on: this.lastValidationTaskId(mission.mission_id),
         repo_id: this.repoIdForMission(mission.mission_id),
-        ...this.boundedTaskFields(mission.mission_id, ["independent-review"], ["review-result"]),
+        ...this.boundedTaskFields(mission.mission_id, ["independent-review"], []),
       });
       this.store.transitionTask(task.task_id, "READY");
       reviewAttempted = true;
@@ -1304,6 +1309,7 @@ export class Orchestrator {
         deliverables: task.deliverables,
         executionBudgetMs: task.execution_budget_ms,
         checkpointPolicy: task.checkpoint_policy,
+        requiredOutputArtifacts: task.required_output_artifacts,
         authority,
         ...(extra.reviewedRecovered?.length ? { reviewedRecovered: extra.reviewedRecovered } : {}),
       });

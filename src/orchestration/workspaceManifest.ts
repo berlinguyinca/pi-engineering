@@ -160,3 +160,33 @@ export function createWorkspaceManifest(
     createdAt: new Date().toISOString(),
   };
 }
+
+/**
+ * Compatibility authority for callers that predate WorkspaceManifestResolver.
+ * The caller's repository/base arguments are the complete single-repository
+ * authority; material work still flows through the same workset validator.
+ */
+export function createCompatibilityWorkspaceManifest(
+  missionId: string,
+  repository: string,
+  baseSha: string,
+): WorkspaceManifest {
+  const canonicalRoot = resolve(repository);
+  return createWorkspaceManifest(
+    {
+      authorizedRoots: [{ canonicalPath: canonicalRoot, source: "existing_manifest", access: "write" }],
+      repositories: [
+        {
+          repoId: repoIdFor(canonicalRoot),
+          canonicalRoot,
+          baseRef: baseSha || "HEAD",
+          baseSha: baseSha || "legacy-unversioned",
+          writableDomains: ["**"],
+        },
+      ],
+      dependencyEdges: [],
+      primaryRepoId: repoIdFor(canonicalRoot),
+    },
+    missionId,
+  );
+}

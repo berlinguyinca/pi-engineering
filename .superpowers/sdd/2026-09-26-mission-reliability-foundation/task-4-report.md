@@ -90,3 +90,73 @@ Result: exit 0; 2,332 tests total, 2,331 passed, 0 failed, 1 skipped. The only s
 - Git path-enumeration failures retain the pre-existing fail-open behavior called out for final-review triage; this task did not expand into that deferred issue.
 - Authority-loss reconciliation of already-`RUNNING` work remains deferred to Tasks 8/9.
 - `CheckpointManager.reconcile()` is read-only and creates no replacement/resume work, preserving the explicit deferral of autonomous recovery.
+
+## Fix Round 1
+
+### Outcome
+
+Addressed all nine review findings against `3d0169d`:
+
+- Write domains are parsed as repository-relative path segments; absolute, empty/dot, and traversal components fail before authorization comparison.
+- Material legacy calls receive a documented, single-repository compatibility manifest and pass through the same workset validator. Pure passive conversation remains manifest-free and non-executable.
+- Missing planner `acceptance_ids` remain missing and block uncovered material acceptance; only explicit planner mappings and deterministic split inheritance are retained.
+- Original task IDs must be unique. Deliverable splitting uses collision-proof deterministic child IDs and an exact original-to-final-child map for dependency rewriting.
+- Checkpoint persistence awaits `MissionStore.flush()` and rejects when the backend cannot durably append the event.
+- Cancellation disables checkpoint scheduling synchronously, persists the latest dirty/committed work before worktree removal, and preserves the last useful snapshot when later collection is empty/unavailable.
+- Execution budgets and checkpoint cadence are finite and positive, checkpoint lead time is smaller than budget, and both timers derive from one absolute execution deadline.
+- Required artifact identities are propagated through scheduler/orchestrator dispatch; successful backend exit is downgraded when required artifacts are absent, and checkpoint artifact hashes are retained.
+- Checkpoint identity comes from the originating execution. Repository, base, execution assignment, mission/candidate generations, and fencing token are checked before and after snapshot collection so rebind/takeover races reject atomically before append.
+- Checkpoints still do not pass acceptance or gates, and no autonomous resume path was added.
+
+The repository binding correction also restored safe same-repository parallelism for disjoint write domains; overlapping domains remain serialized.
+
+### RED evidence
+
+- `node --test test/unit/orchestration-workset.test.ts` initially failed on missing collision-safe split support and invalid path/budget/cadence behavior.
+- `node --test test/unit/orchestration-checkpoints.test.ts` initially failed all new durability/origin/preservation cases. The later race-only run failed 2/2 because manifest rebind and authority takeover during snapshot collection were not rechecked.
+- Focused broker tests initially failed required-artifact and cancellation dirty-work expectations.
+- Focused orchestrator tests initially failed because material legacy work had no compatibility manifest and missing planner acceptance mapping was still implicitly completed.
+
+### GREEN evidence
+
+Focused workset/checkpoint/broker/scheduler/orchestrator matrix:
+
+```text
+node --test test/unit/orchestration-workset.test.ts test/unit/orchestration-checkpoints.test.ts test/unit/orchestration-broker.test.ts test/unit/orchestration-scheduler.test.ts test/integration/orchestrator-e2e.test.ts test/integration/orchestrator-long-outage.test.ts test/integration/orchestrator-recovery.test.ts test/integration/orchestrator-resilience.test.ts
+```
+
+Result: exit 0; 105 passed, 0 failed.
+
+Static verification:
+
+```text
+npm run typecheck
+npm run lint
+git diff --check
+```
+
+Result: all exit 0; TypeScript emitted no diagnostics, Biome checked 582 files with no findings, and the diff has no whitespace errors.
+
+Full suite (single requested run):
+
+```text
+npm test
+```
+
+Result: exit 1; 2,347 total, 2,345 passed, 1 failed, 1 skipped. The only failure was the existing timing-sensitive `mission-ownership` lease-renewal test under parallel full-suite load (`mission M-1 lease expired`). Its exact isolated rerun passed: 1 passed, 0 failed. The existing Postgres OpenViking test remained skipped because `TEST_DATABASE_URL` is unset.
+
+### Files
+
+- `src/orchestration/workset.ts`, `src/orchestration/orchestrator.ts`, `src/orchestration/workspaceManifest.ts` — canonical path validation, compatibility authority, explicit acceptance coverage, and collision-safe exact decomposition.
+- `src/orchestration/checkpoints.ts`, `src/orchestration/missionStore.ts`, `src/orchestration/types.ts` — durable checkpoint flush and immutable execution-origin identity/race fencing.
+- `src/orchestration/broker.ts`, `src/orchestration/scheduler.ts` — absolute deadlines, required-artifact enforcement, synchronous cancellation checkpointing, and safe disjoint-domain concurrency.
+- `src/runtime/EngineeringRuntime.ts` — explicit default acceptance mapping without fabricated artifact requirements.
+- `test/unit/orchestration-workset.test.ts`, `test/unit/orchestration-checkpoints.test.ts`, `test/unit/orchestration-broker.test.ts`, `test/unit/orchestration-scheduler.test.ts`, `test/unit/orchestration-missionstore.test.ts` — focused unit regressions.
+- `test/integration/orchestrator-e2e.test.ts`, `test/integration/orchestrator-long-outage.test.ts`, `test/integration/orchestrator-recovery.test.ts`, `test/integration/orchestrator-resilience.test.ts` — explicit planner mappings plus legacy/passive compatibility and cancellation coverage.
+
+### Self-review and concerns
+
+- The full suite has one unrelated, isolated-green lease timing failure as recorded above; no ownership implementation was changed in this round.
+- Git path-enumeration fail-open behavior and authority-loss `RUNNING` reconciliation remain deliberately deferred per the task ruling.
+- Artifact identity enforcement uses the stable `artifact://<identity>/<id-or-hash>` contract. Hashes retained by checkpoints are SHA-256 fingerprints of the returned artifact references; content verification remains the artifact store's responsibility.
+- Compatibility manifests intentionally authorize only the caller-provided canonical repository root and base, with a broad single-repository domain. They do not authorize multi-repository mutation or create authority for passive conversations.

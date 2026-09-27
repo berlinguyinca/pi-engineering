@@ -689,6 +689,9 @@ export class EngineeringRuntime {
       // request write to the repository.)
       const defaultPlanner: NonNullable<typeof opts.orchestrationPlanner> = async (mission) => {
         const mutates = workflowMutatesRepo(mission.workflow_class);
+        const acceptanceIds = mission.acceptance_criteria.flatMap((criterion) =>
+          criterion.acceptance_id ? [criterion.acceptance_id] : [],
+        );
         return [
           {
             kind: "agent",
@@ -700,10 +703,10 @@ export class EngineeringRuntime {
             depends_on: [],
             priority: 0,
             execution_requirements: {},
+            acceptance_ids: acceptanceIds,
             deliverables: mutates ? ["implementation", "targeted-tests"] : ["investigation-report"],
             execution_budget_ms: 30 * 60_000,
             checkpoint_policy: { activity_milestone: 5, before_deadline_ms: 30_000 },
-            required_output_artifacts: mutates ? ["diff", "test-results"] : ["report"],
             max_attempts: 3,
             failure_policy: "retry",
           },

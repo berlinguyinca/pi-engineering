@@ -251,6 +251,10 @@ export interface Execution {
   fencing_token?: number;
   /** Checkpoint lineage for this bounded execution. */
   checkpoint_id?: EntityId;
+  /** Immutable repository/base/candidate identity captured at execution creation. */
+  repo_id?: EntityId;
+  base_sha?: string;
+  candidate_generation?: number;
 }
 
 /** A canonical filesystem root explicitly authorized for a mission. */
@@ -286,6 +290,7 @@ export interface WorkspaceManifest {
 /** Preserved task work. A checkpoint is not validation or approval evidence. */
 export interface TaskCheckpoint {
   checkpointId: EntityId;
+  executionId: EntityId;
   missionId: EntityId;
   taskId: EntityId;
   repoId: EntityId;
