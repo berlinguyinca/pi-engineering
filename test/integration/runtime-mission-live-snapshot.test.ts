@@ -8,7 +8,7 @@ import { promisify } from "node:util";
 import { BlackholeManager } from "../../src/blackhole/BlackholeManager.ts";
 import type { MissionSnapshotFile } from "../../src/orchestration/missionSnapshot.ts";
 import { Orchestrator } from "../../src/orchestration/orchestrator.ts";
-import { MissionSupervisor } from "../../src/orchestration/supervisor.ts";
+import { MissionSupervisor, type SupervisorStatus } from "../../src/orchestration/supervisor.ts";
 import { EngineeringRuntime } from "../../src/runtime/EngineeringRuntime.ts";
 import { FakeWorkerExecutor } from "../../src/workers/FakeWorkerExecutor.ts";
 import { PiWorkerExecutor } from "../../src/workers/PiWorkerExecutor.ts";
@@ -160,6 +160,416 @@ test("periodic supervisor ticks consume orphan recovery, normalize BLOCKED, and 
     await runtime.close();
   } finally {
     Orchestrator.prototype.repairBlockedMission = originalRepair;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("startup supervisor probes and resumes paused infrastructure missions through Orchestrator.resume", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-eng-paused-startup-resume-"));
+  const workDir = join(root, ".pi-eng");
+  const originalResume = Orchestrator.prototype.resume;
+  try {
+    const first = await EngineeringRuntime.open({ cwd: root, workDir, worker: new FakeWorkerExecutor({}) });
+    const mission = first.missionStore!.createMission({
+      title: "paused startup",
+      goal: "resume through gateway probe",
+      user_request: "resume through gateway probe",
+      repository: root,
+      base_ref: "",
+      risk_profile: "low",
+      workflow_class: "engineering",
+    });
+    for (const status of ["CLASSIFYING", "READY", "EXECUTING", "PAUSED_INFRASTRUCTURE"] as const) {
+      first.missionStore!.transitionMission(mission.mission_id, status);
+    }
+    const task = first.missionStore!.createTask({
+      mission_id: mission.mission_id,
+      kind: "agent",
+      role: "implementer",
+      objective: "paused work",
+    });
+    first.missionStore!.transitionTask(task.task_id, "READY");
+    await first.close();
+    const resumed: string[] = [];
+    Orchestrator.prototype.resume = async function (missionId: string) {
+      resumed.push(missionId);
+      this.store.transitionMission(missionId, "EXECUTING");
+      return this.store.getMission(missionId)!;
+    };
+
+    const reopened = await EngineeringRuntime.open({ cwd: root, workDir, worker: new FakeWorkerExecutor({}) });
+
+    assert.deepEqual(resumed, [mission.mission_id]);
+    assert.equal(reopened.missionStore!.getMission(mission.mission_id)?.status, "EXECUTING");
+    await reopened.close();
+  } finally {
+    Orchestrator.prototype.resume = originalResume;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("periodic supervisor leaves an unhealthy paused infrastructure mission durably actionable", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-eng-paused-periodic-stop-"));
+  const originalResume = Orchestrator.prototype.resume;
+  let resumeCalls = 0;
+  try {
+    const runtime = await EngineeringRuntime.open({ cwd: root, worker: new FakeWorkerExecutor({}) });
+    const mission = runtime.missionStore!.createMission({
+      title: "paused periodic",
+      goal: "remain actionable while gateway is down",
+      user_request: "remain actionable while gateway is down",
+      repository: root,
+      base_ref: "",
+      risk_profile: "low",
+      workflow_class: "engineering",
+    });
+    for (const status of ["CLASSIFYING", "READY", "EXECUTING", "PAUSED_INFRASTRUCTURE"] as const) {
+      runtime.missionStore!.transitionMission(mission.mission_id, status);
+    }
+    const task = runtime.missionStore!.createTask({
+      mission_id: mission.mission_id,
+      kind: "agent",
+      role: "implementer",
+      objective: "paused work",
+    });
+    runtime.missionStore!.transitionTask(task.task_id, "READY");
+    Orchestrator.prototype.resume = async function (missionId: string) {
+      resumeCalls++;
+      return this.store.getMission(missionId)!;
+    };
+
+    await runtime.missionSupervisor!.tick(mission.mission_id);
+    await runtime.missionSupervisor!.tick(mission.mission_id);
+
+    assert.equal(runtime.missionStore!.getMission(mission.mission_id)?.status, "PAUSED_INFRASTRUCTURE");
+    assert.match(
+      runtime.missionStore!.listMissionStops(mission.mission_id).at(-1)?.resumeCondition ?? "",
+      /fence|resume/i,
+    );
+    assert.equal(resumeCalls, 1, "an actionable stop must suppress repeated unhealthy probes");
+    assert.equal(runtime.missionStore!.listMissionStops(mission.mission_id).length, 1);
+    await runtime.close();
+  } finally {
+    Orchestrator.prototype.resume = originalResume;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("status consumer never stops or reclassifies a mission that becomes terminal during repair", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-eng-terminal-repair-race-"));
+  const originalRepair = Orchestrator.prototype.repairBlockedMission;
+  try {
+    const runtime = await EngineeringRuntime.open({ cwd: root, worker: new FakeWorkerExecutor({}) });
+    const mission = runtime.missionStore!.createMission({
+      title: "terminal race",
+      goal: "do not overwrite terminal state",
+      user_request: "do not overwrite terminal state",
+      repository: root,
+      base_ref: "",
+      risk_profile: "low",
+      workflow_class: "engineering",
+    });
+    for (const status of ["CLASSIFYING", "READY", "EXECUTING"] as const) {
+      runtime.missionStore!.transitionMission(mission.mission_id, status);
+    }
+    const task = runtime.missionStore!.createTask({
+      mission_id: mission.mission_id,
+      kind: "agent",
+      role: "implementer",
+      objective: "race work",
+    });
+    runtime.missionStore!.transitionTask(task.task_id, "READY");
+    Orchestrator.prototype.repairBlockedMission = async (missionId: string) => {
+      runtime.missionStore!.transitionMission(missionId, "FAILED");
+      throw new Error("validation failed after terminal settlement");
+    };
+
+    await runtime.missionSupervisor!.tick(mission.mission_id);
+
+    assert.equal(runtime.missionStore!.getMission(mission.mission_id)?.status, "FAILED");
+    assert.equal(runtime.missionStore!.listMissionStops(mission.mission_id).length, 0);
+    assert.deepEqual(
+      runtime.missionStore!.listFailureClassifications(mission.mission_id).map((item) => item.category),
+      ["ORPHANED_EXECUTION"],
+    );
+    await runtime.close();
+  } finally {
+    Orchestrator.prototype.repairBlockedMission = originalRepair;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("status consumer classifies repair failures by their actual category", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-eng-repair-category-"));
+  const originalRepair = Orchestrator.prototype.repairBlockedMission;
+  try {
+    const runtime = await EngineeringRuntime.open({ cwd: root, worker: new FakeWorkerExecutor({}) });
+    const mission = runtime.missionStore!.createMission({
+      title: "repair classification",
+      goal: "preserve error semantics",
+      user_request: "preserve error semantics",
+      repository: root,
+      base_ref: "",
+      risk_profile: "low",
+      workflow_class: "engineering",
+    });
+    for (const status of ["CLASSIFYING", "READY", "EXECUTING"] as const) {
+      runtime.missionStore!.transitionMission(mission.mission_id, status);
+    }
+    const task = runtime.missionStore!.createTask({
+      mission_id: mission.mission_id,
+      kind: "agent",
+      role: "implementer",
+      objective: "repair work",
+    });
+    runtime.missionStore!.transitionTask(task.task_id, "READY");
+    Orchestrator.prototype.repairBlockedMission = async () => {
+      throw new Error("validation test suite failed during repair");
+    };
+
+    await runtime.missionSupervisor!.tick(mission.mission_id);
+
+    assert.equal(
+      runtime.missionStore!.listFailureClassifications(mission.mission_id).at(-1)?.category,
+      "VALIDATION_FAILED",
+    );
+    assert.ok(runtime.missionStore!.listMissionStops(mission.mission_id).at(-1));
+    await runtime.close();
+  } finally {
+    Orchestrator.prototype.repairBlockedMission = originalRepair;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("status consumer rejects unsupported actions as invalid output without dispatching repair", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-eng-unsupported-supervisor-action-"));
+  const originalRepair = Orchestrator.prototype.repairBlockedMission;
+  let repairCalls = 0;
+  try {
+    const runtime = await EngineeringRuntime.open({ cwd: root, worker: new FakeWorkerExecutor({}) });
+    const mission = runtime.missionStore!.createMission({
+      title: "unsupported recovery",
+      goal: "stop unknown recovery protocol",
+      user_request: "stop unknown recovery protocol",
+      repository: root,
+      base_ref: "",
+      risk_profile: "low",
+      workflow_class: "engineering",
+    });
+    runtime.missionStore!.transitionMission(mission.mission_id, "CLASSIFYING");
+    const current = runtime.missionStore!.getMission(mission.mission_id)!;
+    Orchestrator.prototype.repairBlockedMission = async () => {
+      repairCalls++;
+      return current;
+    };
+    const status: SupervisorStatus = {
+      missionId: mission.mission_id,
+      missionStatus: current.status,
+      missionUpdatedAt: current.updated_at,
+      resumptionGeneration: 0,
+      health: "ORPHANED",
+      action: "UNSUPPORTED_RECOVERY",
+      lastMeaningfulProgressAt: null,
+      reason: "unknown recovery protocol",
+      recovery: { attempt: 1, maxAttempts: 1 },
+      nextAction: "stop and require a supported recovery decision",
+      nextActionAt: null,
+      owner: null,
+      repository: root,
+      task: null,
+      preservedWork: [],
+      decision: {
+        recoveryId: "RCV-unsupported",
+        missionId: mission.mission_id,
+        classificationId: "FC-unsupported",
+        action: "UNSUPPORTED_RECOVERY" as never,
+        expectedMaterialChange: "none",
+        attempt: 1,
+        maxAttempts: 1,
+        deadline: new Date(Date.now() + 60_000).toISOString(),
+        nextActionAt: new Date().toISOString(),
+        status: "planned",
+        decidedAt: new Date().toISOString(),
+      },
+    };
+
+    await (
+      runtime as unknown as { consumeSupervisorStatuses(statuses: SupervisorStatus[]): Promise<void> }
+    ).consumeSupervisorStatuses([status]);
+
+    assert.equal(repairCalls, 0);
+    assert.equal(
+      runtime.missionStore!.listFailureClassifications(mission.mission_id).at(-1)?.category,
+      "INVALID_WORKER_OUTPUT",
+    );
+    assert.ok(runtime.missionStore!.listMissionStops(mission.mission_id).at(-1));
+    await runtime.close();
+  } finally {
+    Orchestrator.prototype.repairBlockedMission = originalRepair;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("status consumer does not settle a repair failure into a newer resumption generation", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-eng-stale-status-generation-"));
+  const originalRepair = Orchestrator.prototype.repairBlockedMission;
+  try {
+    const runtime = await EngineeringRuntime.open({ cwd: root, worker: new FakeWorkerExecutor({}) });
+    const mission = runtime.missionStore!.createMission({
+      title: "stale generation",
+      goal: "fence old supervisor work",
+      user_request: "fence old supervisor work",
+      repository: root,
+      base_ref: "",
+      risk_profile: "low",
+      workflow_class: "engineering",
+    });
+    for (const status of ["CLASSIFYING", "READY", "EXECUTING"] as const) {
+      runtime.missionStore!.transitionMission(mission.mission_id, status);
+    }
+    const task = runtime.missionStore!.createTask({
+      mission_id: mission.mission_id,
+      kind: "agent",
+      role: "implementer",
+      objective: "generation work",
+    });
+    runtime.missionStore!.transitionTask(task.task_id, "READY");
+    Orchestrator.prototype.repairBlockedMission = async (missionId: string) => {
+      runtime.missionStore!.resumeMission(missionId, "new generation won the race");
+      throw new Error("validation failed in stale generation");
+    };
+
+    await runtime.missionSupervisor!.tick(mission.mission_id);
+
+    assert.equal(runtime.missionStore!.listMissionResumptions(mission.mission_id).at(-1)?.generation, 1);
+    assert.equal(runtime.missionStore!.listMissionStops(mission.mission_id).length, 0);
+    assert.deepEqual(
+      runtime.missionStore!.listFailureClassifications(mission.mission_id).map((item) => item.category),
+      ["ORPHANED_EXECUTION"],
+    );
+    await runtime.close();
+  } finally {
+    Orchestrator.prototype.repairBlockedMission = originalRepair;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("status consumer does not settle a repair failure after a newer nonterminal status wins", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-eng-stale-status-transition-"));
+  const originalRepair = Orchestrator.prototype.repairBlockedMission;
+  try {
+    const runtime = await EngineeringRuntime.open({ cwd: root, worker: new FakeWorkerExecutor({}) });
+    const mission = runtime.missionStore!.createMission({
+      title: "stale status",
+      goal: "respect newer mission status",
+      user_request: "respect newer mission status",
+      repository: root,
+      base_ref: "",
+      risk_profile: "low",
+      workflow_class: "engineering",
+    });
+    for (const status of ["CLASSIFYING", "READY", "EXECUTING"] as const) {
+      runtime.missionStore!.transitionMission(mission.mission_id, status);
+    }
+    const task = runtime.missionStore!.createTask({
+      mission_id: mission.mission_id,
+      kind: "agent",
+      role: "implementer",
+      objective: "status work",
+    });
+    runtime.missionStore!.transitionTask(task.task_id, "READY");
+    Orchestrator.prototype.repairBlockedMission = async (missionId: string) => {
+      runtime.missionStore!.transitionMission(missionId, "WAITING_FOR_USER");
+      throw new Error("validation failed after newer wait state");
+    };
+
+    await runtime.missionSupervisor!.tick(mission.mission_id);
+
+    assert.equal(runtime.missionStore!.getMission(mission.mission_id)?.status, "WAITING_FOR_USER");
+    assert.equal(runtime.missionStore!.listMissionStops(mission.mission_id).length, 0);
+    assert.deepEqual(
+      runtime.missionStore!.listFailureClassifications(mission.mission_id).map((item) => item.category),
+      ["ORPHANED_EXECUTION"],
+    );
+    await runtime.close();
+  } finally {
+    Orchestrator.prototype.repairBlockedMission = originalRepair;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("status consumer distinguishes persistence failures from repair validation failures", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-eng-persistence-category-"));
+  const originalRepair = Orchestrator.prototype.repairBlockedMission;
+  try {
+    const runtime = await EngineeringRuntime.open({ cwd: root, worker: new FakeWorkerExecutor({}) });
+    const mission = runtime.missionStore!.createMission({
+      title: "persistence classification",
+      goal: "preserve persistence semantics",
+      user_request: "preserve persistence semantics",
+      repository: root,
+      base_ref: "",
+      risk_profile: "low",
+      workflow_class: "engineering",
+    });
+    for (const status of ["CLASSIFYING", "READY", "EXECUTING"] as const) {
+      runtime.missionStore!.transitionMission(mission.mission_id, status);
+    }
+    const task = runtime.missionStore!.createTask({
+      mission_id: mission.mission_id,
+      kind: "agent",
+      role: "implementer",
+      objective: "persistence work",
+    });
+    runtime.missionStore!.transitionTask(task.task_id, "READY");
+    Orchestrator.prototype.repairBlockedMission = async () => {
+      throw new Error("event store durable write failed during repair");
+    };
+
+    await runtime.missionSupervisor!.tick(mission.mission_id);
+
+    assert.equal(
+      runtime.missionStore!.listFailureClassifications(mission.mission_id).at(-1)?.category,
+      "PERSISTENCE_FAILURE",
+    );
+    assert.ok(runtime.missionStore!.listMissionStops(mission.mission_id).at(-1));
+    await runtime.close();
+  } finally {
+    Orchestrator.prototype.repairBlockedMission = originalRepair;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("runtime close awaits supervisor shutdown before flushing durable state", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-eng-close-drains-supervisor-"));
+  const prototype = MissionSupervisor.prototype as MissionSupervisor["constructor"]["prototype"] & {
+    shutdown?: () => Promise<void>;
+  };
+  const originalShutdown = prototype.shutdown;
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  try {
+    const runtime = await EngineeringRuntime.open({ cwd: root, worker: new FakeWorkerExecutor({}) });
+    let flushes = 0;
+    const originalFlush = runtime.missionStore!.flush.bind(runtime.missionStore!);
+    runtime.missionStore!.flush = async () => {
+      flushes++;
+      await originalFlush();
+    };
+    prototype.shutdown = async () => gate;
+
+    const close = runtime.close();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(flushes, 0, "durable flush must wait until supervisor work drains");
+    release();
+    await close;
+    assert.ok(flushes > 0);
+  } finally {
+    if (originalShutdown) prototype.shutdown = originalShutdown;
+    else delete prototype.shutdown;
+    release();
     await rm(root, { recursive: true, force: true });
   }
 });

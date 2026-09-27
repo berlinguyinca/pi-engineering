@@ -525,4 +525,46 @@ describe("MissionSupervisor", () => {
       process.off("unhandledRejection", onUnhandled);
     }
   });
+
+  it("shutdown blocks new ticks and drains an active status consumer before resolving", async () => {
+    const h = harness();
+    const task = h.store.createTask({
+      mission_id: h.mission.mission_id,
+      kind: "agent",
+      role: "implementer",
+      objective: "drain before shutdown",
+    });
+    h.store.transitionTask(task.task_id, "READY");
+    let entered!: () => void;
+    let release!: () => void;
+    const consumerEntered = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const consumerGate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const supervisor = new MissionSupervisor({
+      store: h.store,
+      observability: h.observability,
+      onStatuses: async () => {
+        entered();
+        await consumerGate;
+      },
+    });
+
+    const tick = supervisor.tick();
+    await consumerEntered;
+    const shutdown = supervisor.shutdown();
+    let shutdownSettled = false;
+    void shutdown.finally(() => {
+      shutdownSettled = true;
+    });
+
+    await assert.rejects(supervisor.tick(), /shutting down/i);
+    assert.equal(shutdownSettled, false, "shutdown must wait for the active consumer");
+    release();
+    await tick;
+    await shutdown;
+    assert.equal(shutdownSettled, true);
+  });
 });

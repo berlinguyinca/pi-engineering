@@ -19,6 +19,9 @@ export type SupervisorHealth =
 
 export interface SupervisorStatus {
   missionId: string;
+  missionStatus: Mission["status"];
+  missionUpdatedAt: string;
+  resumptionGeneration: number;
   health: SupervisorHealth;
   action: string;
   lastMeaningfulProgressAt: string | null;
@@ -84,6 +87,8 @@ export class MissionSupervisor {
   private readonly supervisorDiagnostics: SupervisorDiagnostic[] = [];
   private timer?: ReturnType<typeof setInterval>;
   private readonly missionTicks = new Map<string, Promise<SupervisorStatus>>();
+  private readonly activeTicks = new Set<Promise<SupervisorStatus[]>>();
+  private acceptingTicks = true;
 
   constructor(options: MissionSupervisorOptions) {
     this.store = options.store;
@@ -100,6 +105,7 @@ export class MissionSupervisor {
 
   start(): void {
     if (this.timer) return;
+    this.acceptingTicks = true;
     this.timer = setInterval(() => {
       void this.tick().catch((error: unknown) => this.handleIntervalFailure(error));
     }, this.intervalMs);
@@ -110,6 +116,17 @@ export class MissionSupervisor {
     if (!this.timer) return;
     clearInterval(this.timer);
     this.timer = undefined;
+  }
+
+  /** Stop scheduling, reject new ticks, and drain every reconciliation/consumer flight. */
+  async shutdown(): Promise<void> {
+    this.acceptingTicks = false;
+    this.stop();
+    const settled = await Promise.allSettled([...this.activeTicks]);
+    const failures = settled
+      .filter((result): result is PromiseRejectedResult => result.status === "rejected")
+      .map((result) => result.reason);
+    if (failures.length > 0) throw new AggregateError(failures, "MissionSupervisor shutdown failed while draining");
   }
 
   diagnostics(): SupervisorDiagnostic[] {
@@ -135,7 +152,12 @@ export class MissionSupervisor {
   }
 
   tick(missionId?: string): Promise<SupervisorStatus[]> {
-    return this.runTick(missionId);
+    if (!this.acceptingTicks) return Promise.reject(new Error("MissionSupervisor is shutting down"));
+    const flight = this.runTick(missionId).finally(() => {
+      this.activeTicks.delete(flight);
+    });
+    this.activeTicks.add(flight);
+    return flight;
   }
 
   private async runTick(missionId?: string): Promise<SupervisorStatus[]> {
@@ -347,6 +369,7 @@ export class MissionSupervisor {
     diagnosedTask?: OrchestrationTask,
     decision?: RecoveryDecision,
   ): SupervisorStatus {
+    const currentMission = this.store.getMission(mission.mission_id) ?? mission;
     const summary = this.observability?.summary(mission.mission_id);
     const task =
       diagnosedTask ?? this.store.listTasks(mission.mission_id).find((candidate) => candidate.status === "RUNNING");
@@ -355,6 +378,9 @@ export class MissionSupervisor {
     const preservedWork = this.preservedWork(mission.mission_id);
     return {
       missionId: mission.mission_id,
+      missionStatus: currentMission.status,
+      missionUpdatedAt: currentMission.updated_at,
+      resumptionGeneration: this.currentResumptionGeneration(mission.mission_id),
       health,
       action: decision?.action ?? (health === "HEALTHY" ? "MONITOR" : "STOP"),
       lastMeaningfulProgressAt: summary?.lastMeaningfulProgressAt ?? null,

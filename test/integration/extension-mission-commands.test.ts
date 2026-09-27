@@ -318,6 +318,79 @@ test("session shutdown closes the runtime and stops its mission supervisor", asy
   }
 });
 
+test("session shutdown surfaces close failures and retains the cached runtime for retry", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-eng-extension-shutdown-retry-"));
+  const originalClose = EngineeringRuntime.prototype.close;
+  let failClose = true;
+  try {
+    EngineeringRuntime.prototype.close = async function () {
+      if (failClose) {
+        failClose = false;
+        throw new Error("injected cached runtime close failure");
+      }
+      return originalClose.call(this);
+    };
+    const { commands, handlers } = loadHarness();
+    const { ctx, notices } = commandContext(root);
+    for (const handler of handlers.get("session_start") ?? []) await handler({}, ctx);
+
+    await assert.rejects(async () => {
+      for (const handler of handlers.get("session_shutdown") ?? []) await handler({}, ctx);
+    }, /cached runtime close failure/i);
+
+    await commands.get("mission-status")!.handler("", ctx);
+    assert.match(notices.at(-1)?.text ?? "", /No missions yet/i, "failed close must retain usable cache ownership");
+    for (const handler of handlers.get("session_shutdown") ?? []) await handler({}, ctx);
+  } finally {
+    EngineeringRuntime.prototype.close = originalClose;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("an open superseded by session shutdown cannot repopulate the cache and the next command reopens", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-eng-extension-shutdown-open-race-"));
+  const originalOpen = EngineeringRuntime.open;
+  let entered!: () => void;
+  let release!: () => void;
+  const openEntered = new Promise<void>((resolve) => {
+    entered = resolve;
+  });
+  const openGate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let delayFirst = true;
+  try {
+    EngineeringRuntime.open = async (options) => {
+      if (delayFirst) {
+        delayFirst = false;
+        entered();
+        await openGate;
+      }
+      return originalOpen.call(EngineeringRuntime, options);
+    };
+    const { commands, handlers } = loadHarness();
+    const firstContext = commandContext(root);
+    const openingCommand = commands.get("mission-status")!.handler("", firstContext.ctx);
+    await openEntered;
+    const shutdown = (async () => {
+      for (const handler of handlers.get("session_shutdown") ?? []) await handler({}, firstContext.ctx);
+    })();
+    release();
+
+    await assert.rejects(Promise.resolve(openingCommand), /superseded by session shutdown/i);
+    await shutdown;
+
+    const nextContext = commandContext(root);
+    await commands.get("mission-status")!.handler("", nextContext.ctx);
+    assert.match(nextContext.notices.at(-1)?.text ?? "", /No missions yet/i);
+    for (const handler of handlers.get("session_shutdown") ?? []) await handler({}, nextContext.ctx);
+  } finally {
+    EngineeringRuntime.open = originalOpen;
+    release();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("persistent mission surfaces always pair a static percentage or zero workers with an actionable explanation", () => {
   const format = (extensionModule as Record<string, unknown>).formatMissionActivity;
   assert.equal(typeof format, "function", "the persistent panel and footer need one shared detailed formatter");

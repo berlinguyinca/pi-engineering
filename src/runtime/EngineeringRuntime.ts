@@ -191,6 +191,20 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+const SUPPORTED_SUPERVISOR_REPAIR_ACTIONS = new Set([
+  "REBUILD_WORKSPACE_MANIFEST",
+  "RECONSTRUCT_EVIDENCE",
+  "CHECKPOINT_SPLIT_AND_REPLACE",
+  "PROBE_AND_BACKOFF",
+  "REPAIR_WORKER_OUTPUT",
+  "CREATE_REPAIR_TASKS",
+  "REBUILD_INTEGRATION_CANDIDATE",
+  "FENCE_RECONCILE_AND_RESUME",
+  "WAIT_FOR_REQUIREMENT",
+  "PAUSE_FOR_PERSISTENCE",
+  "REPAIR_BLOCKED_MISSION",
+]);
+
 /** One tournament entrant and its independent assessment. */
 export interface TournamentEntry {
   candidate: Candidate;
@@ -829,7 +843,7 @@ export class EngineeringRuntime {
       rt.missionSupervisor.start();
       return rt;
     } catch (error) {
-      rt.missionSupervisor?.stop();
+      await rt.missionSupervisor?.shutdown();
       EngineeringRuntime.releaseOrchestrationReference(orchestrationPath);
       throw error;
     }
@@ -844,8 +858,8 @@ export class EngineeringRuntime {
       return;
     }
     const path = this.orchestrationPath;
-    this.missionSupervisor?.stop();
     try {
+      await this.missionSupervisor?.shutdown();
       await this.missionStore?.flush();
       await this.missionObservability?.flush();
     } catch (error) {
@@ -910,25 +924,57 @@ export class EngineeringRuntime {
   private async consumeSupervisorStatuses(statuses: SupervisorStatus[]): Promise<void> {
     if (!this.missionStore || !this.orchestrator) return;
     for (const status of statuses) {
+      let failureFence: Mission | null = null;
       try {
         const mission = this.missionStore.getMission(status.missionId);
-        // Infrastructure pauses have a distinct scheduler-owned resume path.
-        // Converting one into generic repair work destroys its persisted retry
-        // semantics and prevents Orchestrator.resume() from continuing it.
-        if (mission?.status === "PAUSED_INFRASTRUCTURE") continue;
+        if (!mission || !this.isCurrentSupervisorStatus(status, mission)) continue;
+        failureFence = mission;
+        if (mission.status === "PAUSED_INFRASTRUCTURE") {
+          if (status.action === "STOP" || status.action === "MONITOR") continue;
+          if (status.action !== "FENCE_RECONCILE_AND_RESUME") {
+            throw new Error(`invalid worker output: unsupported supervisor action ${status.action}`);
+          }
+          const resumed = await this.orchestrator.resume(status.missionId);
+          if (resumed.status === "PAUSED_INFRASTRUCTURE") {
+            await this.persistRecoveryStop(
+              status.missionId,
+              `Automatic recovery ${status.action} is waiting for a healthy infrastructure probe: ${status.reason}`,
+              {
+                attemptedRecoveries: status.decision ? [status.decision.recoveryId] : [],
+                preservedWork: status.preservedWork,
+                resumeCondition: status.nextAction,
+              },
+              status.resumptionGeneration,
+            );
+          }
+          continue;
+        }
         if (status.decision && status.action !== "STOP") {
-          await this.normalizeMissionForRepair(status.missionId);
+          if (status.action !== status.decision.action || !SUPPORTED_SUPERVISOR_REPAIR_ACTIONS.has(status.action)) {
+            throw new Error(`invalid worker output: unsupported supervisor action ${status.action}`);
+          }
+          failureFence = await this.normalizeMissionForRepair(status.missionId);
           await this.orchestrator.repairBlockedMission(status.missionId);
         } else if (status.health !== "HEALTHY" && status.action !== "STOP") {
-          throw new Error(`unsupported supervisor action ${status.action}`);
+          throw new Error(`invalid worker output: unsupported supervisor action ${status.action}`);
         }
       } catch (error) {
-        await this.persistSupervisorFailure(status, error);
+        await this.persistSupervisorFailure(status, error, failureFence);
       } finally {
         await this.publishMissionSnapshot();
         this.emitMissionActivity(status.missionId);
       }
     }
+  }
+
+  private isCurrentSupervisorStatus(status: SupervisorStatus, mission: Mission): boolean {
+    if (["COMPLETE", "FAILED", "CANCELED"].includes(mission.status)) return false;
+    const generation = this.missionStore?.listMissionResumptions(status.missionId).at(-1)?.generation ?? 0;
+    return (
+      generation === status.resumptionGeneration &&
+      mission.status === status.missionStatus &&
+      mission.updated_at === status.missionUpdatedAt
+    );
   }
 
   private async normalizeMissionForRepair(missionId: string): Promise<Mission> {
@@ -948,14 +994,31 @@ export class EngineeringRuntime {
     return mission;
   }
 
-  private async persistSupervisorFailure(status: SupervisorStatus, error: unknown): Promise<void> {
+  private async persistSupervisorFailure(
+    status: SupervisorStatus,
+    error: unknown,
+    failureFence: Mission | null,
+  ): Promise<void> {
     if (!this.missionStore) throw error;
+    const mission = this.missionStore.getMission(status.missionId);
+    const generation = this.missionStore.listMissionResumptions(status.missionId).at(-1)?.generation ?? 0;
+    if (!mission || ["COMPLETE", "FAILED", "CANCELED"].includes(mission.status)) return;
+    if (generation !== status.resumptionGeneration) return;
+    if (!failureFence) return;
+    const exactFence =
+      mission.status === failureFence.status &&
+      mission.updated_at === failureFence.updated_at &&
+      mission.blocked_episode_id === failureFence.blocked_episode_id;
+    const enteredFencedRepair =
+      failureFence.status === "BLOCKED" &&
+      mission.status === "REPAIRING" &&
+      mission.blocked_episode_id === failureFence.blocked_episode_id;
+    if (!exactFence && !enteredFencedRepair) return;
     const reason = `Automatic recovery ${status.action} failed: ${errorMessage(error)}`;
     const classification = new FailureClassifier().classify({
       missionId: status.missionId,
       taskId: status.task,
       summary: reason,
-      category: "PERSISTENCE_FAILURE",
       observedAt: new Date().toISOString(),
     });
     if (
@@ -965,19 +1028,29 @@ export class EngineeringRuntime {
     ) {
       this.missionStore.classifyFailure(classification);
     }
-    await this.persistRecoveryStop(status.missionId, reason, {
-      attemptedRecoveries: status.decision ? [status.decision.recoveryId] : [],
-      preservedWork: status.preservedWork,
-      resumeCondition: status.nextAction,
-    });
+    await this.persistRecoveryStop(
+      status.missionId,
+      reason,
+      {
+        attemptedRecoveries: status.decision ? [status.decision.recoveryId] : [],
+        preservedWork: status.preservedWork,
+        resumeCondition: status.nextAction,
+      },
+      status.resumptionGeneration,
+    );
   }
 
   private async persistRecoveryStop(
     missionId: string,
     reason: string,
     source: Pick<MissionStop, "attemptedRecoveries" | "preservedWork" | "resumeCondition">,
+    expectedResumptionGeneration?: number,
   ): Promise<void> {
     if (!this.missionStore) throw new Error("Mission store is not initialized");
+    const mission = this.missionStore.getMission(missionId);
+    if (!mission || ["COMPLETE", "FAILED", "CANCELED"].includes(mission.status)) return;
+    const currentGeneration = this.missionStore.listMissionResumptions(missionId).at(-1)?.generation ?? 0;
+    if (expectedResumptionGeneration !== undefined && currentGeneration !== expectedResumptionGeneration) return;
     const decisions = this.missionStore.listRecoveryDecisions(missionId).map((decision) => decision.recoveryId);
     this.missionStore.stopMission(missionId, {
       reason,

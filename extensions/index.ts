@@ -82,7 +82,13 @@ import { PiWorkerExecutor } from "../src/workers/PiWorkerExecutor.ts";
  */
 
 const runtimes = new Map<string, { runtime: EngineeringRuntime; memoryIdentity: string }>();
-const runtimeOpens = new Map<string, Promise<{ runtime: EngineeringRuntime; memoryIdentity: string }>>();
+interface RuntimeOpen {
+  generation: number;
+  promise: Promise<{ runtime: EngineeringRuntime; memoryIdentity: string }>;
+}
+const runtimeOpens = new Map<string, RuntimeOpen>();
+let runtimeShutdownGeneration = 0;
+let runtimeShutdownFlight: Promise<void> | null = null;
 const allowRuntimeDiagnostic = createRepeatThrottle();
 
 // Live status bar: the harness owns the Pi footer through a single composable
@@ -204,7 +210,13 @@ async function getRuntime(ctx: ExtensionCommandContext, worker?: EngineeringRunt
  * stale in-memory ledger over the same shared `.pi-eng/ledger.jsonl` file.
  */
 async function getRuntimeByCwd(cwd: string, model?: Model<any>): Promise<EngineeringRuntime> {
+  if (runtimeShutdownFlight) await runtimeShutdownFlight;
+  const openGeneration = runtimeShutdownGeneration;
   const key = await repoCacheKey(cwd);
+  if (runtimeShutdownFlight) await runtimeShutdownFlight;
+  if (openGeneration !== runtimeShutdownGeneration) {
+    throw new Error("Runtime request was superseded by session shutdown");
+  }
   const blackhole = openVikingBlackholeOption(resolveMemoryEnvironment());
   const memoryIdentity = createHash("sha256")
     .update(JSON.stringify(blackhole ?? null))
@@ -212,7 +224,13 @@ async function getRuntimeByCwd(cwd: string, model?: Model<any>): Promise<Enginee
   const existing = runtimes.get(key);
   if (existing?.memoryIdentity === memoryIdentity) return existing.runtime;
   const pending = runtimeOpens.get(`${key}\0${memoryIdentity}`);
-  if (pending) return (await pending).runtime;
+  if (pending) {
+    const opened = await pending.promise;
+    if (pending.generation !== runtimeShutdownGeneration) {
+      throw new Error("Runtime open was superseded by session shutdown");
+    }
+    return opened.runtime;
+  }
   // OpenViking connection from the environment. If PI_OPENVIKING_BASE_URL is
   // set, blackhole is enabled with the openviking durable store for EVERY repo
   // this extension runs in — set it once per install and all repos share the
@@ -259,14 +277,20 @@ async function getRuntimeByCwd(cwd: string, model?: Model<any>): Promise<Enginee
     ...(blackhole ? { blackhole } : {}),
   }).then((runtime) => ({ runtime, memoryIdentity }));
   const openKey = `${key}\0${memoryIdentity}`;
-  runtimeOpens.set(openKey, opening);
+  const entry: RuntimeOpen = { generation: openGeneration, promise: opening };
+  runtimeOpens.set(openKey, entry);
   try {
     const opened = await opening;
+    if (openGeneration !== runtimeShutdownGeneration) {
+      throw new Error("Runtime open was superseded by session shutdown");
+    }
     runtimes.set(key, opened);
     panelFor(key, opened.runtime);
     return opened.runtime;
   } finally {
-    if (runtimeOpens.get(openKey) === opening) runtimeOpens.delete(openKey);
+    if (runtimeOpens.get(openKey) === entry && openGeneration === runtimeShutdownGeneration) {
+      runtimeOpens.delete(openKey);
+    }
   }
 }
 
@@ -338,15 +362,51 @@ function publishMissionActivity(key: string, event: RuntimeMissionActivityEvent)
   });
 }
 
-async function shutdownCachedRuntimes(): Promise<void> {
-  const opened = [...runtimes.values()].map((entry) => entry.runtime);
-  const pending = [...runtimeOpens.values()];
-  runtimes.clear();
-  runtimeOpens.clear();
-  for (const result of await Promise.allSettled(pending)) {
-    if (result.status === "fulfilled") opened.push(result.value.runtime);
-  }
-  for (const runtime of new Set(opened)) await runtime.close().catch(() => undefined);
+function shutdownCachedRuntimes(): Promise<void> {
+  if (runtimeShutdownFlight) return runtimeShutdownFlight;
+  runtimeShutdownGeneration++;
+  const openedEntries = [...runtimes.entries()];
+  const pendingEntries = [...runtimeOpens.entries()];
+  const shutdown = (async () => {
+    const opened = openedEntries.map(([, entry]) => entry.runtime);
+    const failures: unknown[] = [];
+    const pendingResults = await Promise.allSettled(pendingEntries.map(([, entry]) => entry.promise));
+    for (const result of pendingResults) {
+      if (result.status === "fulfilled") opened.push(result.value.runtime);
+      else failures.push(result.reason);
+    }
+    const unique = [...new Set(opened)];
+    const closeResults = await Promise.allSettled(unique.map((runtime) => runtime.close()));
+    for (const [index, result] of closeResults.entries()) {
+      const runtime = unique[index];
+      if (!runtime) continue;
+      if (result.status === "rejected") {
+        failures.push(result.reason);
+        continue;
+      }
+      for (const [key, entry] of openedEntries) {
+        if (entry.runtime === runtime && runtimes.get(key) === entry) runtimes.delete(key);
+      }
+      for (const [pendingIndex, [key, entry]] of pendingEntries.entries()) {
+        const pending = pendingResults[pendingIndex];
+        if (pending?.status === "fulfilled" && pending.value.runtime === runtime && runtimeOpens.get(key) === entry) {
+          runtimeOpens.delete(key);
+        }
+      }
+    }
+    for (const [index, [key, entry]] of pendingEntries.entries()) {
+      if (pendingResults[index]?.status === "rejected" && runtimeOpens.get(key) === entry) runtimeOpens.delete(key);
+    }
+    if (failures.length > 0) {
+      const detail = failures.map((error) => (error instanceof Error ? error.message : String(error))).join("; ");
+      throw new AggregateError(failures, `Failed to shut down cached engineering runtimes: ${detail}`);
+    }
+  })();
+  const flight = shutdown.finally(() => {
+    if (runtimeShutdownFlight === flight) runtimeShutdownFlight = null;
+  });
+  runtimeShutdownFlight = flight;
+  return flight;
 }
 
 /**
