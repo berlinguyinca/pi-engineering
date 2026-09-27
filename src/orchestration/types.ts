@@ -115,6 +115,10 @@ export interface Mission {
   required_gates: RequiredGate[];
   failure_reason: string | null;
   completed_at: string | null;
+  /** Timestamp identifying the current/most recent durable BLOCKED episode. */
+  blocked_at?: string;
+  /** Unique authority token for the current/most recent durable BLOCKED episode. */
+  blocked_episode_id?: EntityId;
 }
 
 export type TaskKind =
@@ -177,6 +181,15 @@ export interface OrchestrationTask {
   mission_generation?: number;
   /** Fences results from revoked or expired owners. */
   fencing_token?: number;
+  /** Durable diagnostic attached by a lifecycle transition. */
+  failure_reason?: string;
+}
+
+/** The complete allow-list of metadata a task lifecycle transition may update. */
+export interface TaskTransitionMetadata {
+  attempt?: number;
+  assigned_execution_id?: EntityId | null;
+  failure_reason?: string;
 }
 
 /** Execution backends the broker can dispatch to (spec 03). */
@@ -360,6 +373,8 @@ export interface RecoveryDecision {
   nextActionAt: string;
   status: RecoveryStatus;
   decidedAt: string;
+  /** Durable identity of the BLOCKED episode this repair decision may consume. */
+  blockedEpisodeId?: EntityId;
 }
 
 export interface EvidenceInvalidation {

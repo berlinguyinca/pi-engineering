@@ -32,6 +32,7 @@ import type {
   TaskCheckpoint,
   TaskStatus,
   TaskSupersession,
+  TaskTransitionMetadata,
   WorkspaceManifest,
 } from "./types.ts";
 
@@ -131,6 +132,19 @@ export interface MissionPersistenceDiagnostic {
 }
 
 const MAX_PERSISTENCE_DIAGNOSTICS = 50;
+const TASK_TRANSITION_METADATA_FIELDS = new Set<keyof TaskTransitionMetadata>([
+  "attempt",
+  "assigned_execution_id",
+  "failure_reason",
+]);
+const TERMINAL_TASK_STATUSES = new Set<TaskStatus>(["SUCCEEDED", "FAILED", "CANCELED", "SKIPPED"]);
+const RECOVERY_TRANSITIONS: Record<RecoveryStatus, ReadonlyArray<RecoveryStatus>> = {
+  planned: ["started", "failed", "exhausted"],
+  started: ["succeeded", "failed", "exhausted"],
+  succeeded: [],
+  failed: [],
+  exhausted: [],
+};
 
 function persistenceErrorMessage(error: unknown): string {
   if (error instanceof Error) return error.message;
@@ -181,12 +195,17 @@ export class MissionStore {
     return store;
   }
 
-  private emit(type: OrchestrationEventType, missionId: string, payload: Record<string, unknown>): OrchestrationEvent {
+  private emit(
+    type: OrchestrationEventType,
+    missionId: string,
+    payload: Record<string, unknown>,
+    timestamp = new Date().toISOString(),
+  ): OrchestrationEvent {
     const durablePayload = structuredClone(payload);
     const event: OrchestrationEvent = {
       event_id: id("oevt"),
       mission_id: missionId,
-      timestamp: new Date().toISOString(),
+      timestamp,
       type,
       actor: (durablePayload.actor as OrchestrationEvent["actor"]) ?? "system",
       payload: durablePayload,
@@ -318,6 +337,7 @@ export class MissionStore {
           if (e.payload.assigned_execution_id !== undefined) {
             t.assigned_execution_id = e.payload.assigned_execution_id as string | null;
           }
+          if (e.payload.failure_reason !== undefined) t.failure_reason = e.payload.failure_reason as string;
           this.tasks.set(tid, t);
         }
         break;
@@ -393,6 +413,11 @@ export class MissionStore {
       case "recovery.exhausted": {
         const decision = e.payload.decision as RecoveryDecision;
         if (decision) this.recoveryDecisions.set(decision.recoveryId, { ...decision });
+        const missionPatch = e.payload.mission_patch as Partial<Mission> | undefined;
+        if (decision && missionPatch) {
+          const mission = this.missions.get(decision.missionId);
+          if (mission) this.missions.set(decision.missionId, { ...mission, ...missionPatch });
+        }
         break;
       }
       case "task.superseded": {
@@ -485,22 +510,45 @@ export class MissionStore {
     return (projectFilter ? all.filter(projectFilter) : all).map(copyMission);
   }
 
-  transitionMission(missionId: string, to: MissionStatus, actor = "system"): Mission {
+  transitionMission(missionId: string, to: MissionStatus, actor = "system", repairRecoveryId?: string): Mission {
     const m = this.missions.get(missionId);
     if (!m) throw new Error(`unknown mission ${missionId}`);
-    if (
-      m.status === "BLOCKED" &&
-      to === "REPAIRING" &&
-      !this.listRecoveryDecisions(missionId).some(
-        (decision) => decision.action === "REPAIR_BLOCKED_MISSION" && decision.status === "planned",
-      )
-    ) {
-      throw new Error("BLOCKED -> REPAIRING requires a durable repair recovery decision");
+    let repairDecision: RecoveryDecision | undefined;
+    if (m.status === "BLOCKED" && to === "REPAIRING") {
+      repairDecision = repairRecoveryId ? this.recoveryDecisions.get(repairRecoveryId) : undefined;
+      if (!repairDecision) {
+        throw new Error("BLOCKED -> REPAIRING requires a durable repair recovery decision ID");
+      }
+      if (repairDecision.missionId !== missionId || repairDecision.action !== "REPAIR_BLOCKED_MISSION") {
+        throw new Error(`recovery ${repairRecoveryId} is not a repair decision for mission ${missionId}`);
+      }
+      if (repairDecision.status !== "planned") {
+        throw new Error(`repair recovery ${repairRecoveryId} must be planned, not ${repairDecision.status}`);
+      }
+      if (!m.blocked_episode_id || repairDecision.blockedEpisodeId !== m.blocked_episode_id) {
+        throw new Error(`repair recovery ${repairRecoveryId} does not belong to the current blocked episode`);
+      }
     }
     assertMissionTransition(m.status, to);
-    const patch: Partial<Mission> = { status: to, updated_at: new Date().toISOString() };
+    const now = new Date().toISOString();
+    const patch: Partial<Mission> = {
+      status: to,
+      updated_at: now,
+      ...(to === "BLOCKED" ? { blocked_at: now, blocked_episode_id: id("BLK") } : {}),
+    };
     this.missions.set(missionId, { ...m, ...patch });
-    this.emit("mission.updated", missionId, { actor, mission_id: missionId, patch });
+    if (repairDecision) {
+      const started: RecoveryDecision = { ...repairDecision, status: "started" };
+      this.recoveryDecisions.set(started.recoveryId, started);
+      this.emit(
+        "recovery.started",
+        missionId,
+        { actor, decision: started, mission_id: missionId, mission_patch: patch },
+        now,
+      );
+    } else {
+      this.emit("mission.updated", missionId, { actor, mission_id: missionId, patch }, now);
+    }
     return this.getMission(missionId)!;
   }
 
@@ -644,13 +692,14 @@ export class MissionStore {
     taskId: string,
     to: TaskStatus,
     actor = "system",
-    extra: Record<string, unknown> = {},
+    metadata: TaskTransitionMetadata = {},
   ): OrchestrationTask {
     const t = this.tasks.get(taskId);
     if (!t) throw new Error(`unknown task ${taskId}`);
-    if (Object.hasOwn(extra, "status")) {
+    if (Object.hasOwn(metadata, "status")) {
       throw new Error("task status must be changed through transitionTask");
     }
+    const extra = validateTaskTransitionMetadata(metadata);
     assertTaskTransition(t.status, to);
     const type =
       to === "READY"
@@ -680,6 +729,9 @@ export class MissionStore {
   steerTask(taskId: string, request: string, actor = "system"): OrchestrationTask {
     const t = this.tasks.get(taskId);
     if (!t) throw new Error(`unknown task ${taskId}`);
+    if (TERMINAL_TASK_STATUSES.has(t.status)) {
+      throw new Error(`terminal task ${taskId} is immutable`);
+    }
     const next = { ...t, steer_requests: [...t.steer_requests, request] };
     this.tasks.set(taskId, next);
     this.emit("task.steered", t.mission_id, { actor, task_id: taskId, request });
@@ -850,7 +902,18 @@ export class MissionStore {
     if (!classification || classification.missionId !== decision.missionId) {
       throw new Error(`unknown failure classification ${decision.classificationId}`);
     }
-    const copy = { ...decision, status: "planned" as const };
+    if (this.recoveryDecisions.has(decision.recoveryId)) {
+      throw new Error(`duplicate recovery ID ${decision.recoveryId}`);
+    }
+    const mission = this.missions.get(decision.missionId)!;
+    if (decision.action === "REPAIR_BLOCKED_MISSION" && (mission.status !== "BLOCKED" || !mission.blocked_episode_id)) {
+      throw new Error("blocked-mission repair must be planned during a durable BLOCKED episode");
+    }
+    const copy: RecoveryDecision = {
+      ...decision,
+      status: "planned",
+      ...(decision.action === "REPAIR_BLOCKED_MISSION" ? { blockedEpisodeId: mission.blocked_episode_id } : {}),
+    };
     this.recoveryDecisions.set(copy.recoveryId, copy);
     this.emit("recovery.planned", decision.missionId, { actor: "system", decision: copy });
     return { ...copy };
@@ -859,6 +922,9 @@ export class MissionStore {
   transitionRecovery(recoveryId: string, status: Exclude<RecoveryStatus, "planned">): RecoveryDecision {
     const decision = this.recoveryDecisions.get(recoveryId);
     if (!decision) throw new Error(`unknown recovery ${recoveryId}`);
+    if (!RECOVERY_TRANSITIONS[decision.status].includes(status)) {
+      throw new Error(`illegal recovery transition ${decision.status} -> ${status}`);
+    }
     const next = { ...decision, status };
     this.recoveryDecisions.set(recoveryId, next);
     this.emit(`recovery.${status}` as OrchestrationEventType, decision.missionId, {
@@ -885,6 +951,15 @@ export class MissionStore {
       throw new Error(`supersession requires a failed task ${supersession.failedTaskId}`);
     }
     if (supersession.replacementTaskIds.length === 0) throw new Error("supersession requires replacement task IDs");
+    if (this.taskSupersessions.has(supersession.supersessionId)) {
+      throw new Error(`duplicate supersession ID ${supersession.supersessionId}`);
+    }
+    if (new Set(supersession.replacementTaskIds).size !== supersession.replacementTaskIds.length) {
+      throw new Error("supersession requires unique replacement task IDs");
+    }
+    if (supersession.replacementTaskIds.includes(failed.task_id)) {
+      throw new Error(`failed task ${failed.task_id} cannot replace itself`);
+    }
     if (this.listTaskSupersessions(supersession.missionId).some((entry) => entry.failedTaskId === failed.task_id)) {
       throw new Error(`task ${failed.task_id} is already superseded`);
     }
@@ -1113,4 +1188,33 @@ function copyMissionStop(stop: MissionStop): MissionStop {
 
 function repositoryLeaseKey(missionId: string, repoId: string): string {
   return `${missionId}\u0000${repoId}`;
+}
+
+function validateTaskTransitionMetadata(metadata: TaskTransitionMetadata): TaskTransitionMetadata {
+  for (const key of Object.keys(metadata)) {
+    if (!TASK_TRANSITION_METADATA_FIELDS.has(key as keyof TaskTransitionMetadata)) {
+      throw new Error(`unsupported task transition metadata field ${key}`);
+    }
+  }
+
+  const copy: TaskTransitionMetadata = {};
+  if (metadata.attempt !== undefined) {
+    if (!Number.isInteger(metadata.attempt) || metadata.attempt < 0) {
+      throw new Error("task transition attempt must be a non-negative integer");
+    }
+    copy.attempt = metadata.attempt;
+  }
+  if (metadata.assigned_execution_id !== undefined) {
+    if (metadata.assigned_execution_id !== null && typeof metadata.assigned_execution_id !== "string") {
+      throw new Error("task transition assigned_execution_id must be a string or null");
+    }
+    copy.assigned_execution_id = metadata.assigned_execution_id;
+  }
+  if (metadata.failure_reason !== undefined) {
+    if (typeof metadata.failure_reason !== "string") {
+      throw new Error("task transition failure_reason must be a string");
+    }
+    copy.failure_reason = metadata.failure_reason;
+  }
+  return copy;
 }

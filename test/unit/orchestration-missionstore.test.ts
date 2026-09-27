@@ -199,6 +199,56 @@ describe("MissionStore", () => {
     assert.equal(task.status, "RUNNING");
   });
 
+  it("replays every supported task transition metadata field and rejects all others", async () => {
+    const backend = JsonlEventStore.inMemory();
+    const s1 = MissionStore.open(backend);
+    const mission = s1.createMission({
+      title: "task metadata",
+      goal: "replay task metadata",
+      user_request: "persist task metadata",
+      repository: ".",
+      base_ref: "main",
+      risk_profile: "low",
+      workflow_class: "engineering_review",
+    });
+    const task = s1.createTask({
+      task_id: "TSK-metadata",
+      mission_id: mission.mission_id,
+      kind: "agent",
+      role: "implementer",
+      objective: "persist metadata",
+      mission_generation: 4,
+      fencing_token: 9,
+    });
+    s1.transitionTask(task.task_id, "READY");
+    const running = s1.transitionTask(task.task_id, "RUNNING", "system", {
+      attempt: 2,
+      assigned_execution_id: "EXC-metadata",
+      failure_reason: "resumed after a durable wait",
+    });
+    assert.equal(running.attempt, 2);
+    assert.equal(running.assigned_execution_id, "EXC-metadata");
+    assert.equal(running.failure_reason, "resumed after a durable wait");
+
+    for (const metadata of [
+      { task_id: "TSK-other" },
+      { mission_id: "MSN-other" },
+      { mission_generation: 99 },
+      { candidate_generation: 99 },
+      { fencing_token: 99 },
+      { arbitrary: "value" },
+    ]) {
+      assert.throws(
+        () => s1.transitionTask(task.task_id, "FAILED", "system", metadata as never),
+        /unsupported task transition metadata/,
+      );
+    }
+    assert.deepEqual(s1.getTask(task.task_id), running, "rejected metadata leaves live state unchanged");
+
+    await s1.flush();
+    assert.deepEqual(MissionStore.open(backend).getTask(task.task_id), running);
+  });
+
   it("retries a failed append in order so restart replays the complete semantic state", async () => {
     const backend = new FailOnceBackend();
     const s = MissionStore.open(backend);
@@ -515,11 +565,14 @@ describe("MissionStore", () => {
     s.transitionTask(failed.task_id, "READY");
     s.transitionTask(failed.task_id, "RUNNING");
     s.transitionTask(failed.task_id, "FAILED");
+    const immutableFailure = s.getTask(failed.task_id)!;
     assert.throws(() => s.transitionTask(failed.task_id, "READY"), /illegal task transition FAILED -> READY/);
     assert.throws(
-      () => s.transitionTask(failed.task_id, "FAILED", "system", { status: "READY" }),
+      () => s.transitionTask(failed.task_id, "FAILED", "system", { status: "READY" } as never),
       /status must be changed through transitionTask/,
     );
+    assert.throws(() => s.steerTask(failed.task_id, "change the failed task"), /terminal task.*immutable/);
+    assert.deepEqual(s.getTask(failed.task_id), immutableFailure, "every field on the failed task remains unchanged");
 
     const wrongRepo = s.createTask({
       task_id: "TSK-wrong-repo",
@@ -558,10 +611,88 @@ describe("MissionStore", () => {
         }),
       /replacement task IDs/,
     );
+
+    const replacement = s.createTask({
+      task_id: "TSK-valid-replacement",
+      mission_id: mission.mission_id,
+      kind: "agent",
+      role: "implementer",
+      objective: failed.objective,
+      repo_id: "repo-a",
+      acceptance_ids: ["AC-1"],
+    });
+    assert.throws(
+      () =>
+        s.supersedeTask({
+          supersessionId: "SUP-self",
+          missionId: mission.mission_id,
+          failedTaskId: failed.task_id,
+          replacementTaskIds: [failed.task_id],
+          repoId: "repo-a",
+          acceptanceIds: ["AC-1"],
+          reason: "self replacement",
+          createdAt: "2026-09-26T11:01:00.000Z",
+        }),
+      /cannot replace itself/,
+    );
+    assert.throws(
+      () =>
+        s.supersedeTask({
+          supersessionId: "SUP-duplicate-replacements",
+          missionId: mission.mission_id,
+          failedTaskId: failed.task_id,
+          replacementTaskIds: [replacement.task_id, replacement.task_id],
+          repoId: "repo-a",
+          acceptanceIds: ["AC-1"],
+          reason: "duplicate replacement IDs",
+          createdAt: "2026-09-26T11:02:00.000Z",
+        }),
+      /unique replacement task IDs/,
+    );
+
+    s.supersedeTask({
+      supersessionId: "SUP-shared-id",
+      missionId: mission.mission_id,
+      failedTaskId: failed.task_id,
+      replacementTaskIds: [replacement.task_id],
+      repoId: "repo-a",
+      acceptanceIds: ["AC-1"],
+      reason: "valid lineage",
+      createdAt: "2026-09-26T11:03:00.000Z",
+    });
+    const secondFailed = s.createTask({
+      task_id: "TSK-second-failed",
+      mission_id: mission.mission_id,
+      kind: "agent",
+      role: "implementer",
+      objective: "second objective",
+      repo_id: "repo-a",
+      acceptance_ids: ["AC-1"],
+    });
+    s.transitionTask(secondFailed.task_id, "READY");
+    s.transitionTask(secondFailed.task_id, "RUNNING");
+    s.transitionTask(secondFailed.task_id, "FAILED");
+    assert.throws(
+      () =>
+        s.supersedeTask({
+          supersessionId: "SUP-shared-id",
+          missionId: mission.mission_id,
+          failedTaskId: secondFailed.task_id,
+          replacementTaskIds: [replacement.task_id],
+          repoId: "repo-a",
+          acceptanceIds: ["AC-1"],
+          reason: "overwrite existing lineage",
+          createdAt: "2026-09-26T11:04:00.000Z",
+        }),
+      /duplicate supersession ID/,
+    );
+    assert.equal(s.getTaskSupersession("SUP-shared-id")?.failedTaskId, failed.task_id);
+    assert.deepEqual(s.getTask(failed.task_id), immutableFailure, "supersession records never rewrite failed history");
   });
 
-  it("rejects BLOCKED to EXECUTING bypass and permits durable repair routing", () => {
-    const s = store();
+  it("rejects BLOCKED to EXECUTING bypass and atomically consumes durable repair authority", async () => {
+    const backend = JsonlEventStore.inMemory();
+    const s = MissionStore.open(backend);
     const mission = s.createMission({
       title: "blocked mission",
       goal: "repair durably",
@@ -610,7 +741,48 @@ describe("MissionStore", () => {
       status: "planned",
       decidedAt: "2026-09-26T11:20:00.000Z",
     });
-    s.transitionMission(mission.mission_id, "REPAIRING");
+    s.planRecovery({
+      recoveryId: "RCV-stale-planned",
+      missionId: mission.mission_id,
+      classificationId: "FCL-blocked",
+      action: "REPAIR_BLOCKED_MISSION",
+      expectedMaterialChange: "an alternative repair for the first blocked episode",
+      attempt: 1,
+      maxAttempts: 2,
+      deadline: "2026-09-26T12:00:00.000Z",
+      nextActionAt: "2026-09-26T11:30:00.000Z",
+      status: "planned",
+      decidedAt: "2026-09-26T11:20:30.000Z",
+    });
+    s.transitionMission(mission.mission_id, "REPAIRING", "system", "RCV-repair");
+    assert.equal(s.getRecoveryDecision("RCV-repair")?.status, "started");
     assert.equal(s.transitionMission(mission.mission_id, "EXECUTING").status, "EXECUTING");
+    s.transitionMission(mission.mission_id, "BLOCKED");
+    assert.throws(
+      () => s.transitionMission(mission.mission_id, "REPAIRING", "system", "RCV-stale-planned"),
+      /does not belong to the current blocked episode/,
+    );
+    assert.equal(s.getRecoveryDecision("RCV-stale-planned")?.status, "planned");
+
+    s.transitionRecovery("RCV-repair", "exhausted");
+    assert.throws(
+      () => s.transitionRecovery("RCV-repair", "started"),
+      /illegal recovery transition exhausted -> started/,
+    );
+
+    await s.flush();
+    const repairStart = backend.all().find((event) => event.type === "recovery.started");
+    assert.equal((repairStart?.payload.mission_patch as { status?: string } | undefined)?.status, "REPAIRING");
+    assert.equal(
+      backend
+        .all()
+        .filter((event) => event.type === "mission.updated")
+        .some((event) => (event.payload.patch as { status?: string } | undefined)?.status === "REPAIRING"),
+      false,
+      "repair authority consumption and BLOCKED -> REPAIRING persist in one event",
+    );
+    const reopened = MissionStore.open(backend);
+    assert.equal(reopened.getMission(mission.mission_id)?.status, "BLOCKED");
+    assert.equal(reopened.getRecoveryDecision("RCV-repair")?.status, "exhausted");
   });
 });
