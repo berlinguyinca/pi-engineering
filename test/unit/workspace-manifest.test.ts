@@ -149,12 +149,20 @@ describe("WorkspaceManifestResolver path policy", () => {
     cleanup.push(repo.cleanup, () => rm(outside, { recursive: true, force: true }));
     const resolved = await new WorkspaceManifestResolver().resolve(`Implement in ${join(repo.root, "src")}`, tmpdir());
     const registry = new RepositoryRegistry();
-    await registry.register(createWorkspaceManifest(resolved, "MSN-toctou"));
-    await registry.resolveForExecution(resolved.primaryRepoId, ["src/new-directory/**"]);
+    const manifest = createWorkspaceManifest(resolved, "MSN-toctou");
+    await registry.register(manifest);
+    await registry.resolveForExecution(manifest.missionId, manifest.generation, manifest.hash, resolved.primaryRepoId, [
+      "src/new-directory/**",
+    ]);
     await rm(join(repo.root, "src"), { recursive: true, force: true });
     await symlink(outside, join(repo.root, "src"), "dir");
 
-    await assert.rejects(registry.resolveForExecution(resolved.primaryRepoId, ["src/**"]), /authorized root changed/i);
+    await assert.rejects(
+      registry.resolveForExecution(manifest.missionId, manifest.generation, manifest.hash, resolved.primaryRepoId, [
+        "src/**",
+      ]),
+      /authorized root changed/i,
+    );
   });
 
   it("uses a canonical Git launch cwd only when the request names no absolute path", async () => {
@@ -182,6 +190,89 @@ describe("WorkspaceManifestResolver path policy", () => {
 
     assert.equal(resolved.repositories[0]?.canonicalRoot, root);
     assert.equal(probes.find((probe) => probe.role === "reviewer")?.ok, true);
+  });
+
+  it("isolates identical repo ids by mission and exposes a staged manifest only after activation", async () => {
+    const first = await makeFixtureRepo();
+    const second = await makeFixtureRepo();
+    cleanup.push(first.cleanup, second.cleanup);
+    const firstResolved = await new WorkspaceManifestResolver().resolve(`Implement in ${first.root}`, tmpdir());
+    const secondResolved = await new WorkspaceManifestResolver().resolve(`Implement in ${second.root}`, tmpdir());
+    const firstManifest = createWorkspaceManifest(firstResolved, "MSN-first");
+    const secondManifest = {
+      ...createWorkspaceManifest(secondResolved, "MSN-second"),
+      repositories: createWorkspaceManifest(secondResolved, "MSN-second").repositories.map((binding) => ({
+        ...binding,
+        repoId: firstResolved.primaryRepoId,
+      })),
+      hash: "manifest-second-distinct",
+    };
+    const registry = new RepositoryRegistry();
+    await registry.register(firstManifest);
+    const staged = await registry.stage(secondManifest);
+    await assert.rejects(
+      registry.resolveForExecution(
+        secondManifest.missionId,
+        secondManifest.generation,
+        secondManifest.hash,
+        firstResolved.primaryRepoId,
+      ),
+      /inactive workspace manifest/i,
+    );
+    assert.equal(
+      (
+        await registry.resolveForExecution(
+          firstManifest.missionId,
+          firstManifest.generation,
+          firstManifest.hash,
+          firstResolved.primaryRepoId,
+        )
+      ).root,
+      first.root,
+    );
+    staged.activate();
+    assert.equal(
+      (
+        await registry.resolveForExecution(
+          secondManifest.missionId,
+          secondManifest.generation,
+          secondManifest.hash,
+          firstResolved.primaryRepoId,
+        )
+      ).root,
+      second.root,
+    );
+  });
+
+  it("removes repository membership when a newer exact manifest is activated", async () => {
+    const repo = await makeFixtureRepo();
+    cleanup.push(repo.cleanup);
+    const resolved = await new WorkspaceManifestResolver().resolve(`Implement in ${repo.root}`, tmpdir());
+    const original = createWorkspaceManifest(resolved, "MSN-removal");
+    const registry = new RepositoryRegistry();
+    await registry.register(original);
+    const replacement = {
+      ...original,
+      manifestId: "WM-removed",
+      generation: original.generation + 1,
+      hash: "manifest-with-repository-removed",
+      repositories: [],
+    };
+    const staged = await registry.stage(replacement);
+    staged.activate();
+    await assert.rejects(
+      registry.resolveForExecution(
+        replacement.missionId,
+        replacement.generation,
+        replacement.hash,
+        resolved.primaryRepoId,
+      ),
+      /unknown repository binding/i,
+    );
+    await assert.rejects(
+      registry.resolveForExecution(original.missionId, original.generation, original.hash, resolved.primaryRepoId),
+      /inactive workspace manifest/i,
+    );
   });
 
   it("does not treat a repository path found in repository content as user authorization", async () => {

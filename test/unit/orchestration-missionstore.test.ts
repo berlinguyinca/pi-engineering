@@ -101,6 +101,38 @@ function store(): MissionStore {
 }
 
 describe("MissionStore", () => {
+  it("does not expose or replay a manifest whose durable bind fails", async () => {
+    const backend = new FailOnceBackend();
+    const s = MissionStore.open(backend);
+    const mission = s.createMission({
+      title: "manifest transaction",
+      goal: "manifest transaction",
+      user_request: "manifest transaction",
+      repository: ".",
+      base_ref: "base",
+      risk_profile: "low",
+      workflow_class: "engineering",
+    });
+    const original: WorkspaceManifest = {
+      manifestId: "WM-original",
+      missionId: mission.mission_id,
+      generation: 1,
+      authorizedRoots: [],
+      repositories: [],
+      dependencyEdges: [],
+      hash: "original",
+      createdAt: "2026-09-27T00:00:00.000Z",
+    };
+    await s.bindWorkspaceManifestDurably(original);
+    backend.failNextAppend();
+    await assert.rejects(
+      s.bindWorkspaceManifestDurably({ ...original, manifestId: "WM-rebuilt", generation: 2, hash: "rebuilt" }),
+      /persistence unavailable/i,
+    );
+    assert.equal(s.getWorkspaceManifest(mission.mission_id)?.hash, "original");
+    assert.equal(MissionStore.open(backend).getWorkspaceManifest(mission.mission_id)?.hash, "original");
+  });
+
   it("creates and transitions a mission through its lifecycle", async () => {
     const s = store();
     const m = s.createMission({

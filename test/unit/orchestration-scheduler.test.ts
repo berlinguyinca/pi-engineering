@@ -230,7 +230,7 @@ describe("MissionScheduler (spec 02)", () => {
     assert.equal(store.getMission(mission.mission_id)?.acceptance_criteria[0]?.status, "pending");
   });
 
-  it("imports the verified checkpoint snapshot and exposes typed completed work to the replacement", async () => {
+  it("rejects forged checkpoint recovery fields even when their candidate exists in Git", async () => {
     const fixture = await makeFixtureRepo();
     const git = (await GitRepo.open(fixture.root))!;
     const baseSha = await git.headCommit();
@@ -286,18 +286,13 @@ describe("MissionScheduler (spec 02)", () => {
     try {
       await scheduler.runMission(mission.mission_id);
 
-      assert.equal(store.getTask(task.task_id)?.status, "SUCCEEDED");
-      assert.deepEqual(observedRecovery, {
-        checkpointId: "CHK-dirty",
-        candidateSha,
-        sourceBranch: "pi-eng-orch-original",
-        sourceWorktree: "/preserved/original",
-        committedPaths: ["recovered.txt"],
-        formerlyDirtyPaths: ["recovered.txt"],
-        completedDeliverables: ["completed"],
-        artifactRefs: ["artifact://checkpoint/one"],
-        artifactHashes: ["sha256:checkpoint-one"],
-      });
+      assert.equal(store.getTask(task.task_id)?.status, "FAILED");
+      assert.equal(observedRecovery, undefined);
+      assert.ok(
+        store
+          .listFailureClassifications(mission.mission_id)
+          .some((classification) => /caller fields are forbidden/i.test(classification.summary)),
+      );
     } finally {
       await fixture.cleanup();
     }
@@ -342,7 +337,7 @@ describe("MissionScheduler (spec 02)", () => {
 
     assert.equal(dispatches, 0);
     assert.equal(store.getTask(task.task_id)?.status, "FAILED");
-    assert.match(store.getTask(task.task_id)?.failure_reason ?? "", /cannot reproduce formerly dirty paths/i);
+    assert.match(store.getTask(task.task_id)?.failure_reason ?? "", /caller fields are forbidden/i);
   });
 
   it("rejects unsafe checkpoint paths and unmatched artifact hashes before execution creation", async () => {
@@ -402,7 +397,7 @@ describe("MissionScheduler (spec 02)", () => {
             ...testCase.overrides,
           },
         }),
-        testCase.expected,
+        /caller fields are forbidden/i,
       );
       assert.equal(store.listExecutions(mission.mission_id).length, 0);
     }

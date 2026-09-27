@@ -319,7 +319,7 @@ export class PiWorkerExecutor implements WorkerExecutor {
     // Specialist roles may supply their own prompt wholesale.
     const baseSystemPrompt =
       req.systemPromptOverride ??
-      `${buildSystemPrompt(req.role, req.task, req.context, { isolatedWorktree: req.isolatedWorktree })}
+      `${buildSystemPrompt(req.role, req.task, workerContext(req), { isolatedWorktree: req.isolatedWorktree })}
 
 ${TOOL_TRANSITION_RULE}`;
 
@@ -1190,8 +1190,9 @@ export function buildCompactedWorkerPrompt(req: WorkerRequest, recoveryPrompt: s
 
   // Include only a compact slice of the context (first 500 chars) to avoid
   // re-introducing the verbose context that may have contributed to the loop.
-  if (req.context?.trim()) {
-    const compactContext = req.context.trim();
+  const verifiedContext = workerContext(req);
+  if (verifiedContext?.trim()) {
+    const compactContext = verifiedContext.trim();
     const sliced = compactContext.length > 500 ? `${compactContext.slice(0, 500)}… [truncated]` : compactContext;
     parts.push(`# Context (compacted)`);
     parts.push(sliced);
@@ -1219,4 +1220,21 @@ export function buildCompactedWorkerPrompt(req: WorkerRequest, recoveryPrompt: s
   parts.push(`- Do not ask questions. Do not emit an assistant answer after calling worker_result.`);
 
   return parts.join("\n");
+}
+
+export function workerContext(req: WorkerRequest): string | undefined {
+  if (!req.recovery) return req.context;
+  const recovery = req.recovery;
+  const durable = [
+    "Verified durable checkpoint recovery context (immutable):",
+    `decision=${recovery.recoveryDecisionId}`,
+    `checkpoint=${recovery.checkpointId}`,
+    `originalTask=${recovery.originalTaskId}`,
+    `originalExecution=${recovery.originalExecutionId}`,
+    `candidateSha=${recovery.candidateSha}`,
+    `sourceBranch=${recovery.sourceBranch}`,
+    `completedDeliverables=${recovery.completedDeliverables.join(",")}`,
+    `artifactHashes=${recovery.artifactHashes.join(",")}`,
+  ].join("\n");
+  return req.context?.trim() ? `${req.context.trim()}\n\n${durable}` : durable;
 }

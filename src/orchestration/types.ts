@@ -155,6 +155,17 @@ export interface TaskCheckpointPolicy {
   before_deadline_ms: number;
 }
 
+/** Immutable durable authority for a checkpoint-derived replacement task. */
+export interface TaskRecoveryAuthority {
+  recoveryDecisionId: EntityId;
+  expectedReplacementFingerprint: string;
+  originalTaskId: EntityId;
+  originalExecutionId: EntityId;
+  checkpointId: EntityId;
+  supersessionId: EntityId;
+  resumptionGeneration: number;
+}
+
 /** A task: one node in a mission's dependency graph. */
 export interface OrchestrationTask {
   task_id: EntityId;
@@ -199,6 +210,8 @@ export interface OrchestrationTask {
   fencing_token?: number;
   /** Durable diagnostic attached by a lifecycle transition. */
   failure_reason?: string;
+  /** Durable checkpoint lineage; never reconstructed from model requirements. */
+  recovery_authority?: TaskRecoveryAuthority;
 }
 
 /** The complete allow-list of metadata a task lifecycle transition may update. */
@@ -328,6 +341,8 @@ export interface TaskSupersession {
   coverageFingerprint?: string;
   reason: string;
   createdAt: string;
+  recoveryDecisionId?: EntityId;
+  expectedReplacementFingerprints?: Record<EntityId, string>;
 }
 
 export interface AcceptanceEvidenceResult {
@@ -467,6 +482,8 @@ export interface RecoveryDecision {
   resumptionGeneration?: number;
   /** Candidate evidence baseline that a mutating repair must durably supersede. */
   startingCandidateIdentityHash?: string | null;
+  /** Git content baseline; metadata/artifact changes do not satisfy mutation recovery. */
+  startingCandidateContent?: { candidateSha: string; diffHash: string } | null;
 }
 
 export interface EvidenceInvalidation {

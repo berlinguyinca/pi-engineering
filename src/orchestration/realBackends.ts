@@ -19,7 +19,12 @@ import type { CandidateLifecycle, GitRepo, IntegrationRunRecord } from "../git/G
 import type { WorktreeInfo } from "../git/GitRepo.ts";
 import type { VerificationProvider } from "../verify/Verifier.ts";
 import type { WorkerActivity, WorkerExecutor, WorkerRequest } from "../workers/WorkerExecutor.ts";
-import { type ExecutionOutcome, type IntegrationHandoff, workerTimeoutMs } from "./broker.ts";
+import {
+  type CheckpointRecoveryContext,
+  type ExecutionOutcome,
+  type IntegrationHandoff,
+  workerTimeoutMs,
+} from "./broker.ts";
 import { normalizeReviewSeverity, validateAcceptanceResults } from "./evidence.ts";
 
 export interface RealBackendsOptions {
@@ -233,6 +238,7 @@ export function realBackends(opts: RealBackendsOptions) {
         worktree?: string | null;
         isolatedWorktree?: boolean;
         modelRequirements?: Record<string, unknown>;
+        recovery?: CheckpointRecoveryContext;
         signal: AbortSignal;
         onActivity?: (event: WorkerActivity) => void;
       }): Promise<ExecutionOutcome> {
@@ -250,6 +256,7 @@ export function realBackends(opts: RealBackendsOptions) {
           // Only the broker's word makes a directory an isolated worktree; the
           // fallback (no worktree) runs in the user's checkout.
           isolatedWorktree: input.isolatedWorktree === true && !!input.worktree,
+          recovery: input.recovery,
         };
         // Place the worker on the model the capability router chose for this
         // role (honours `policy.routing.roles`); fall back to the executor

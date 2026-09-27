@@ -8,6 +8,8 @@ Fix round 1 closes all nine adversarial findings: complete canonical candidate/p
 
 Fix round 2 closes six replay and materiality findings: durable recovery-owned phase replay, typed immutable checkpoint import, resumption-generation decision rollover, provider-first terminal gate classification, genuinely mutating repair tasks with candidate-delta proof, and staged workspace-manifest replacement.
 
+Fix round 3 closes the six remaining authority findings: checkpoint context now comes only from an exact durable task/checkpoint/execution/supersession lineage; the production `WorkerRequest` carries that immutable typed context; replacement replay is bound by an explicit decision ID and complete fingerprint; every awaited recovery phase is fenced by resumption generation; mutating recovery requires Git-recomputed candidate SHA and diff identity; and repository contexts are scoped to the exact mission/manifest generation/hash with durable bind before activation.
+
 The two carried Task 7 prerequisites are enforced before recovery:
 
 - candidate, integration-run, and promotion journals use canonical complete-payload filenames and reject impossible identity/generation relationships;
@@ -42,6 +44,12 @@ Metabolomics remains disabled. No model or package dependency was added.
 - `CREATE_REPAIR_TASKS` initially cloned failed validation/review tasks. It now creates bounded mutating implementer work in isolated worktrees and durably records the starting candidate identity; recovery cannot succeed without changed candidate evidence and fresh gates.
 - Manifest rebuild initially bound generation 2 before probes, so a failed probe survived restart as authoritative. Registry contexts are now staged and probed before commit and durable manifest bind; the restart regression retains generation 1 on failure.
 - The full suite exposed a filesystem-order-dependent promotion test that sometimes forged a stale intent instead of the completed record. The regression now selects the completed promotion explicitly and remains deterministic under concurrent full-suite load.
+- Forged recovery fields in `execution_requirements` initially reached a replacement worker. The broker now rejects all caller-supplied recovery fields and reconstructs context only from the durable checkpoint authority attached to the task.
+- A deterministic replacement task ID with a forged role/lineage fingerprint initially reused recovery work. Exact decision, task, execution, checkpoint, supersession, role, mutation, repository, generation, and fence equality is now required before execution creation.
+- A repair blocked in an awaited preflight initially remained the mission's single-flight after an operator resumption. Flights are now generation-scoped, and the stale generation fails before publishing any subsequent side effect.
+- Candidate invalidation/metadata churn initially counted as repair material. The materiality regression now requires a Git-recomputed candidate SHA and diff hash/content for every repository-mutating recovery lineage.
+- Registry contexts were keyed only by `repoId`, allowing same-ID bindings from different missions to overwrite each other, and a staged manifest was activated before its bind flushed. Contexts now use mission + manifest generation + manifest hash; removed bindings disappear on activation, staged contexts remain invisible, and a failed durable bind leaves the old manifest authoritative after restart.
+- The first bounded full-suite pass found one repository-tool regression after manifest scoping: an explicit repository lookup outside the execution async context returned “Not a git repository.” Resolution now permits one unambiguous path match across active exact manifests while rejecting ambiguous shared bindings; the 18-test real-runtime acceptance file passes after the fix.
 
 ## GREEN evidence
 
@@ -50,6 +58,9 @@ Metabolomics remains disabled. No model or package dependency was added.
 - `npm run lint` — passed (585 files checked).
 - `npm test` — 2,483 passed, 0 failed, 1 skipped; the skip requires `TEST_DATABASE_URL` for the optional Postgres OpenViking round trip.
 - `git diff --check` — passed.
+- Fix-round-3 focused set (`orchestrator-recovery`, mission store, scheduler, real backends, workspace manifest) — 100 passed, 0 failed.
+- `test/integration/orchestration-runtime.test.ts` after the full-suite-discovered scoped-tool regression — 18 passed, 0 failed.
+- Fix-round-3 bounded full suite: `npm test` — 2,490 passed, 0 failed, 1 skipped (optional Postgres test).
 
 ## Decisions
 
@@ -65,6 +76,9 @@ Metabolomics remains disabled. No model or package dependency was added.
 - Recovery phase is reconstructed from the generation-bound decision plus deterministic recovery-owned task/supersession IDs. Existing current leaves are resumed, not recreated, across every write-ahead crash boundary.
 - Checkpoint recovery always creates a fresh worktree at the exact verified candidate commit. The typed backend context carries preserved completed work and artifact identities; no opaque requirement alone can claim imported state.
 - Workspace registry replacement is a stage/probe/commit operation. The durable manifest generation advances only after every staged role probe succeeds.
+- Replacement recovery authority is a first-class persisted task field, not prompt/model input. Its fingerprint binds every immutable execution and lineage field, and the broker recomputes it before allocating a worktree or creating an execution.
+- Manifest replacement uses a durable conditional append that applies in-memory authority only on commit. Registry activation is synchronous and occurs strictly after that durable bind succeeds.
+- Explicit repository execution resolution always supplies mission ID, manifest generation, and manifest hash. Path-only tool resolution is allowed only when exactly one active manifest context matches.
 
 ## Residual risk / reviewer focus
 
@@ -75,4 +89,8 @@ Metabolomics remains disabled. No model or package dependency was added.
 - Review exact checkpoint recovery requirements (`candidateSha`, committed/dirty paths, artifacts) and transitive supersession leaf behavior in scheduler and completion gates.
 - Review the durable `startingCandidateIdentityHash` baseline and the post-integration material-delta gate for `CREATE_REPAIR_TASKS`.
 - Review staged registry replacement for the invariant that failed probes cannot mutate either active in-memory repository authority or replayed manifest generation.
+- Review `durableRecoveryContext` for the exact task/checkpoint/execution/supersession comparisons and the deliberate rejection of all caller recovery fields.
+- Review resumption fencing after awaits, especially stale-flight settlement and generation-scoped single-flight keys.
+- Review Git materiality: candidate SHA and diff hash are recomputed from the exact active repository binding; artifacts, generation increments, and invalidations cannot satisfy a mutating repair.
+- Review registry ambiguity behavior for shared repository paths: mission-aware execution is exact, while path-only tools fail closed when more than one active manifest matches.
 - The optional Postgres-backed OpenViking test was not run because `TEST_DATABASE_URL` is not configured; it is unrelated to this change.

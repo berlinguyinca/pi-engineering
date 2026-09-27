@@ -31,6 +31,47 @@ function capturingWorker(seen: WorkerRequest[]): WorkerExecutor {
 }
 
 describe("realBackends capability routing", () => {
+  it("passes immutable verified checkpoint recovery context into the production WorkerRequest", async () => {
+    const seen: WorkerRequest[] = [];
+    const backends = realBackends({
+      worker: capturingWorker(seen),
+      verifier: {} as never,
+      artifacts: {} as never,
+      git: null,
+      cwd: "/repo",
+    });
+    const recovery = Object.freeze({
+      recoveryDecisionId: "REC-1",
+      expectedReplacementFingerprint: "sha256:fingerprint",
+      originalTaskId: "TSK-old",
+      originalExecutionId: "EXE-old",
+      supersessionId: "SUP-1",
+      missionId: "MSN-1",
+      repoId: "repo-1",
+      missionGeneration: 4,
+      candidateGeneration: 2,
+      fencingToken: 7,
+      resumptionGeneration: 1,
+      checkpointId: "CHK-1",
+      candidateSha: "abc",
+      sourceBranch: "repair/old",
+      sourceWorktree: "/tmp/old",
+      committedPaths: Object.freeze(["src/a.ts"]),
+      formerlyDirtyPaths: Object.freeze([]),
+      completedDeliverables: Object.freeze(["first"]),
+      artifactRefs: Object.freeze([]),
+      artifactHashes: Object.freeze([]),
+    });
+    await backends.agent.runAgent({
+      role: "implementer",
+      objective: "finish",
+      recovery,
+      signal: new AbortController().signal,
+    });
+    assert.equal(seen[0]?.recovery, recovery);
+    assert.equal(seen[0]?.recovery?.checkpointId, "CHK-1");
+  });
+
   it("does not start or publish activity for a pre-aborted worker", async () => {
     let runs = 0;
     const activity: import("../../src/workers/WorkerExecutor.ts").WorkerActivity[] = [];

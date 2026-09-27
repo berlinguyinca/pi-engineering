@@ -150,6 +150,7 @@ export interface TaskCreateInput {
   candidate_generation?: number;
   mission_generation?: number;
   fencing_token?: number;
+  recovery_authority?: OrchestrationTask["recovery_authority"];
 }
 
 /** Non-authority mission metadata that may be changed without a lifecycle operation. */
@@ -823,6 +824,7 @@ export class MissionStore {
       candidate_generation: input.candidate_generation ?? 0,
       mission_generation: input.mission_generation ?? authority?.generation ?? 0,
       fencing_token: input.fencing_token ?? authority?.fencingToken ?? 0,
+      recovery_authority: input.recovery_authority ? { ...input.recovery_authority } : undefined,
     };
     this.tasks.set(task.task_id, task);
     const mission = this.missions.get(input.mission_id);
@@ -1219,6 +1221,54 @@ export class MissionStore {
     return copyWorkspaceManifest(copy);
   }
 
+  /** Publish a manifest only after its event is durably appended. */
+  bindWorkspaceManifestDurably(manifest: WorkspaceManifest): Promise<WorkspaceManifest> {
+    const publish = this.emitChain.then(async () => {
+      await this.drainPending();
+      if (!this.missions.has(manifest.missionId)) throw new Error(`unknown mission ${manifest.missionId}`);
+      const copy = copyWorkspaceManifest(manifest);
+      const prior = this.workspaceManifests.get(manifest.missionId);
+      const type = prior ? "workspace.rebound" : "workspace.authorized";
+      const payload = structuredClone({ actor: "system", manifest: copy });
+      const event: OrchestrationEvent = {
+        event_id: id("oevt"),
+        mission_id: manifest.missionId,
+        timestamp: new Date().toISOString(),
+        type,
+        actor: "system",
+        payload,
+      };
+      const stored: StoredEvent = {
+        event_id: event.event_id,
+        timestamp: event.timestamp,
+        type: event.type,
+        project_id: null,
+        run_id: manifest.missionId,
+        worker_id: null,
+        payload,
+      };
+      try {
+        const appended = await this.backend.appendConditionally(
+          stored,
+          () => true,
+          () => this.apply(event),
+        );
+        if (!appended) throw new Error("workspace manifest durable bind was rejected");
+      } catch (error) {
+        this.recordPersistenceFailure(event, error);
+        throw error;
+      }
+      this.clearPersistenceFailure(event.event_id);
+      if (prior) this.invalidateCurrentCandidate(manifest.missionId, "workspace manifest rebound");
+      return copyWorkspaceManifest(copy);
+    });
+    this.emitChain = publish.then(
+      () => undefined,
+      () => undefined,
+    );
+    return publish;
+  }
+
   getWorkspaceManifest(missionId: string): WorkspaceManifest | undefined {
     const manifest = this.workspaceManifests.get(missionId);
     return manifest ? copyWorkspaceManifest(manifest) : undefined;
@@ -1358,6 +1408,9 @@ export class MissionStore {
     }
     const copy: RecoveryDecision = {
       ...decision,
+      ...(decision.startingCandidateContent
+        ? { startingCandidateContent: { ...decision.startingCandidateContent } }
+        : {}),
       status: "planned",
       resumptionGeneration: this.listMissionResumptions(decision.missionId).at(-1)?.generation ?? 0,
       ...(mission.status === "BLOCKED" && decision.action !== "STOP"
@@ -1366,7 +1419,7 @@ export class MissionStore {
     };
     this.recoveryDecisions.set(copy.recoveryId, copy);
     this.emit("recovery.planned", decision.missionId, { actor: "system", decision: copy });
-    return { ...copy };
+    return copyRecoveryDecision(copy);
   }
 
   transitionRecovery(recoveryId: string, status: Exclude<RecoveryStatus, "planned">): RecoveryDecision {
@@ -1384,18 +1437,18 @@ export class MissionStore {
       actor: "system",
       decision: next,
     });
-    return { ...next };
+    return copyRecoveryDecision(next);
   }
 
   listRecoveryDecisions(missionId?: string): RecoveryDecision[] {
     return [...this.recoveryDecisions.values()]
       .filter((decision) => (missionId ? decision.missionId === missionId : true))
-      .map((decision) => ({ ...decision }));
+      .map(copyRecoveryDecision);
   }
 
   getRecoveryDecision(recoveryId: string): RecoveryDecision | undefined {
     const decision = this.recoveryDecisions.get(recoveryId);
-    return decision ? { ...decision } : undefined;
+    return decision ? copyRecoveryDecision(decision) : undefined;
   }
 
   supersedeTask(supersession: TaskSupersession): TaskSupersession {
@@ -1435,6 +1488,25 @@ export class MissionStore {
       [...declaredAcceptance].some((id) => !coveredAcceptance.has(id))
     ) {
       throw new Error("replacement tasks do not provide matching repository coverage and acceptance coverage");
+    }
+    if (supersession.recoveryDecisionId) {
+      const decision = this.recoveryDecisions.get(supersession.recoveryDecisionId);
+      if (!decision || decision.missionId !== supersession.missionId) {
+        throw new Error("supersession recovery decision does not match mission");
+      }
+      for (const replacement of supersession.expectedReplacementFingerprints ? replacements : []) {
+        const authority = replacement?.recovery_authority;
+        if (
+          !authority ||
+          authority.recoveryDecisionId !== supersession.recoveryDecisionId ||
+          authority.supersessionId !== supersession.supersessionId ||
+          authority.originalTaskId !== supersession.failedTaskId ||
+          supersession.expectedReplacementFingerprints?.[replacement!.task_id] !==
+            authority.expectedReplacementFingerprint
+        ) {
+          throw new Error("supersession replacement recovery fingerprint mismatch");
+        }
+      }
     }
     const copy = copyTaskSupersession(supersession);
     this.taskSupersessions.set(copy.supersessionId, copy);
@@ -1892,6 +1964,7 @@ function copyTask(task: OrchestrationTask): OrchestrationTask {
     ...(task.deliverables ? { deliverables: [...task.deliverables] } : {}),
     ...(task.checkpoint_policy ? { checkpoint_policy: { ...task.checkpoint_policy } } : {}),
     ...(task.required_output_artifacts ? { required_output_artifacts: [...task.required_output_artifacts] } : {}),
+    ...(task.recovery_authority ? { recovery_authority: { ...task.recovery_authority } } : {}),
   };
 }
 
@@ -1930,6 +2003,18 @@ function copyTaskSupersession(supersession: TaskSupersession): TaskSupersession 
     ...supersession,
     replacementTaskIds: [...supersession.replacementTaskIds],
     acceptanceIds: [...supersession.acceptanceIds],
+    ...(supersession.expectedReplacementFingerprints
+      ? { expectedReplacementFingerprints: { ...supersession.expectedReplacementFingerprints } }
+      : {}),
+  };
+}
+
+function copyRecoveryDecision(decision: RecoveryDecision): RecoveryDecision {
+  return {
+    ...decision,
+    ...(decision.startingCandidateContent
+      ? { startingCandidateContent: { ...decision.startingCandidateContent } }
+      : {}),
   };
 }
 

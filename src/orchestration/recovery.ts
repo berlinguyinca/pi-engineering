@@ -63,6 +63,24 @@ function hash(value: unknown): string {
   return createHash("sha256").update(JSON.stringify(value)).digest("hex");
 }
 
+export function replacementRecoveryFingerprint(input: {
+  recoveryDecisionId: string;
+  taskId: string;
+  originalTaskId: string;
+  originalExecutionId: string;
+  checkpointId: string;
+  supersessionId: string;
+  role: string;
+  mutatesRepo: boolean;
+  repoId: string;
+  missionGeneration: number;
+  candidateGeneration: number;
+  fencingToken: number;
+  resumptionGeneration: number;
+}): string {
+  return `sha256:${hash(input)}`;
+}
+
 function normalizedSummary(summary: string): string {
   return summary.trim().toLowerCase().replace(/\s+/g, " ");
 }

@@ -1,4 +1,5 @@
 import type { WorkerResult, WorkerRole, WorkerUsage } from "../core/types.ts";
+import type { CheckpointRecoveryContext } from "../orchestration/broker.ts";
 
 /** Bounded, operator-safe live state from a worker session. */
 export interface WorkerActivity {
@@ -54,6 +55,8 @@ export interface WorkerRequest {
    * own checkout (any fallback path) must never be told to commit there.
    */
   isolatedWorktree?: boolean;
+  /** Store-verified immutable checkpoint context for a fresh recovery worker. */
+  recovery?: Readonly<CheckpointRecoveryContext>;
   /** Live bounded activity; never includes prompts, model text, tool arguments, or secrets. */
   onActivity?: (event: WorkerActivity) => void;
   /** Abort the active model session when the owning execution is canceled. */

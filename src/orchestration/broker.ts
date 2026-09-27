@@ -34,6 +34,7 @@ import type { CheckpointManager, CheckpointSnapshot } from "./checkpoints.ts";
 import { EvidenceUnavailableError, buildCandidateEvidenceIdentity, hashCandidateEvidenceIdentity } from "./evidence.ts";
 import type { LateExecutionEvidence, MissionStore } from "./missionStore.ts";
 import type { DispatchAuthority } from "./ownership.ts";
+import { replacementRecoveryFingerprint } from "./recovery.ts";
 import type { ExecutionBackend, RecoveredMerge, ReviewEvidence, ValidationEvidence } from "./types.ts";
 import { canonicalizeWriteDomain } from "./workset.ts";
 
@@ -69,15 +70,26 @@ export interface ExecutionRequestInput {
 }
 
 export interface CheckpointRecoveryContext {
+  recoveryDecisionId: string;
+  expectedReplacementFingerprint: string;
+  originalTaskId: string;
+  originalExecutionId: string;
+  supersessionId: string;
+  missionId: string;
+  repoId: string;
+  missionGeneration: number;
+  candidateGeneration: number;
+  fencingToken: number;
+  resumptionGeneration: number;
   checkpointId: string;
   candidateSha: string;
   sourceBranch: string;
   sourceWorktree: string;
-  committedPaths: string[];
-  formerlyDirtyPaths: string[];
-  completedDeliverables: string[];
-  artifactRefs: string[];
-  artifactHashes: string[];
+  committedPaths: readonly string[];
+  formerlyDirtyPaths: readonly string[];
+  completedDeliverables: readonly string[];
+  artifactRefs: readonly string[];
+  artifactHashes: readonly string[];
 }
 
 export interface ExecutionHandle {
@@ -220,46 +232,20 @@ export interface AgentRunner {
   onSteer?: (steer: string) => void;
 }
 
-function checkpointRecoveryContext(requirements?: Record<string, unknown>): CheckpointRecoveryContext | undefined {
-  if (typeof requirements?.recoveryFromCheckpoint !== "string") return undefined;
+function validateRecoveryPaths(values: string[], field: string): string[] {
   const strings = (value: unknown, field: string): string[] => {
     if (!Array.isArray(value) || value.some((entry) => typeof entry !== "string" || !entry.trim())) {
       throw new Error(`checkpoint recovery ${field} is invalid`);
     }
     return [...value];
   };
-  const required = (value: unknown, field: string): string => {
-    if (typeof value !== "string" || !value.trim()) throw new Error(`checkpoint recovery ${field} is invalid`);
-    return value;
-  };
-  const committedPaths = strings(requirements.recoveryCommittedChanges, "committed paths");
-  const formerlyDirtyPaths = strings(requirements.recoveryUncommittedChanges, "formerly dirty paths");
+  const paths = strings(values, field);
   const unsafePath = (path: string): boolean =>
     path.startsWith("/") || path.includes("\\") || path.split("/").some((segment) => segment === "..");
-  if ([...committedPaths, ...formerlyDirtyPaths].some(unsafePath)) {
+  if (paths.some(unsafePath)) {
     throw new Error("checkpoint recovery committed paths are unsafe");
   }
-  if (formerlyDirtyPaths.some((path) => !committedPaths.includes(path))) {
-    throw new Error("checkpoint recovery cannot reproduce formerly dirty paths from the immutable candidate");
-  }
-  const artifactRefs = strings(requirements.recoveryArtifactRefs, "artifact refs");
-  const artifactHashes = strings(requirements.recoveryArtifactHashes, "artifact hashes");
-  if (artifactRefs.length !== artifactHashes.length) {
-    throw new Error("checkpoint recovery artifact identities do not match");
-  }
-  const sourceWorktree = required(requirements.recoveryWorktree, "source worktree");
-  if (!isAbsolute(sourceWorktree)) throw new Error("checkpoint recovery source worktree must be absolute");
-  return {
-    checkpointId: required(requirements.recoveryFromCheckpoint, "checkpoint identity"),
-    candidateSha: required(requirements.recoveryCandidateSha, "candidate SHA"),
-    sourceBranch: required(requirements.recoveryBranch, "source branch"),
-    sourceWorktree,
-    committedPaths,
-    formerlyDirtyPaths,
-    completedDeliverables: strings(requirements.recoveryCompletedDeliverables, "completed deliverables"),
-    artifactRefs,
-    artifactHashes,
-  };
+  return paths;
 }
 
 export interface ProcessRunner {
@@ -384,6 +370,7 @@ export interface BrokerOptions {
   resolveRepository?: (
     repoId: string,
     writableDomains: string[],
+    missionId: string,
   ) => Promise<{ repoId: string; root: string; git: GitRepo }>;
   /** Execution-local live worker activity with durable orchestration identity. */
   onActivity?: (event: WorkerActivity & { missionId: string; taskId: string; executionId: string }) => void;
@@ -472,6 +459,118 @@ export class ExecutionBroker {
     this.activityHeartbeatMs = opts.activityHeartbeatMs ?? 15_000;
     this.checkpoints = opts.checkpoints;
     this.cancellationAckTimeoutMs = opts.cancellationAckTimeoutMs ?? 5_000;
+  }
+
+  private durableRecoveryContext(input: ExecutionRequestInput): CheckpointRecoveryContext | undefined {
+    const task = this.store.getTask(input.taskId);
+    const authority = task?.recovery_authority;
+    if (!authority) return undefined;
+    const checkpoint = this.store.getTaskCheckpoint(authority.checkpointId);
+    const original = this.store.getTask(authority.originalTaskId);
+    const execution = this.store.getExecution(authority.originalExecutionId);
+    const decision = this.store.getRecoveryDecision(authority.recoveryDecisionId);
+    const lineage = this.store
+      .listTaskSupersessions(input.missionId)
+      .find((entry) => entry.supersessionId === authority.supersessionId);
+    const expected = replacementRecoveryFingerprint({
+      recoveryDecisionId: authority.recoveryDecisionId,
+      taskId: input.taskId,
+      originalTaskId: authority.originalTaskId,
+      originalExecutionId: authority.originalExecutionId,
+      checkpointId: authority.checkpointId,
+      supersessionId: authority.supersessionId,
+      role: task?.role ?? "",
+      mutatesRepo: task?.mutates_repo ?? false,
+      repoId: task?.repo_id ?? "",
+      missionGeneration: checkpoint?.missionGeneration ?? -1,
+      candidateGeneration: checkpoint?.candidateGeneration ?? -1,
+      fencingToken: checkpoint?.fencingToken ?? -1,
+      resumptionGeneration: authority.resumptionGeneration,
+    });
+    const invalid = [
+      !task || task.mission_id !== input.missionId ? "replacement task" : null,
+      !checkpoint || checkpoint.missionId !== input.missionId || checkpoint.taskId !== authority.originalTaskId
+        ? "checkpoint"
+        : null,
+      !original || original.mission_id !== input.missionId ? "original task" : null,
+      !execution || execution.execution_id !== checkpoint?.executionId || execution.task_id !== authority.originalTaskId
+        ? "original execution"
+        : null,
+      execution?.mission_id !== input.missionId || original?.assigned_execution_id !== authority.originalExecutionId
+        ? "execution lineage"
+        : null,
+      execution?.repo_id !== checkpoint?.repoId || execution?.base_sha !== checkpoint?.baseSha
+        ? "execution repository"
+        : null,
+      execution?.mission_generation !== checkpoint?.missionGeneration ||
+      execution?.candidate_generation !== checkpoint?.candidateGeneration ||
+      execution?.fencing_token !== checkpoint?.fencingToken ||
+      execution?.checkpoint_id !== checkpoint?.checkpointId
+        ? "execution authority"
+        : null,
+      checkpoint?.repoId !== task?.repo_id || input.repoId !== task?.repo_id ? "repository" : null,
+      checkpoint?.missionGeneration !== original?.mission_generation ? "mission generation" : null,
+      checkpoint?.candidateGeneration !== original?.candidate_generation ? "candidate generation" : null,
+      checkpoint?.fencingToken !== original?.fencing_token ? "fencing token" : null,
+      !decision ||
+      decision.missionId !== input.missionId ||
+      decision.resumptionGeneration !== authority.resumptionGeneration
+        ? "recovery decision"
+        : null,
+      !lineage ||
+      lineage.failedTaskId !== authority.originalTaskId ||
+      !lineage.replacementTaskIds.includes(input.taskId)
+        ? "supersession"
+        : null,
+      lineage?.recoveryDecisionId !== authority.recoveryDecisionId ? "supersession decision" : null,
+      lineage?.expectedReplacementFingerprints?.[input.taskId] !== expected ? "lineage fingerprint" : null,
+      authority.expectedReplacementFingerprint !== expected ? "replacement fingerprint" : null,
+    ].filter((entry): entry is string => entry !== null);
+    if (
+      invalid.length > 0 ||
+      !checkpoint?.candidateSha?.trim() ||
+      !checkpoint.branch?.trim() ||
+      !checkpoint.worktree?.trim()
+    ) {
+      throw new Error(
+        `checkpoint recovery identity/integrity mismatch: ${[...invalid, "preserved work"].filter((v, i, a) => (invalid.length > 0 ? i < invalid.length : v === "preserved work")).join(", ")}`,
+      );
+    }
+    if (!isAbsolute(checkpoint.worktree)) throw new Error("checkpoint recovery source worktree must be absolute");
+    const committedPaths = validateRecoveryPaths(checkpoint.committedChanges, "committed paths");
+    const formerlyDirtyPaths = validateRecoveryPaths(checkpoint.preservedUncommittedChanges, "formerly dirty paths");
+    if (formerlyDirtyPaths.some((path) => !committedPaths.includes(path))) {
+      throw new Error("checkpoint recovery cannot reproduce formerly dirty paths from the immutable candidate");
+    }
+    if (
+      checkpoint.artifactRefs.length !== checkpoint.artifactHashes.length ||
+      checkpoint.artifactRefs.some((ref) => !ref.trim()) ||
+      checkpoint.artifactHashes.some((hash) => !/^sha256:[a-f0-9]{64}$/i.test(hash))
+    ) {
+      throw new Error("checkpoint recovery artifact identities do not match");
+    }
+    return Object.freeze({
+      recoveryDecisionId: authority.recoveryDecisionId,
+      expectedReplacementFingerprint: expected,
+      originalTaskId: authority.originalTaskId,
+      originalExecutionId: authority.originalExecutionId,
+      supersessionId: authority.supersessionId,
+      missionId: input.missionId,
+      repoId: checkpoint.repoId,
+      missionGeneration: checkpoint.missionGeneration,
+      candidateGeneration: checkpoint.candidateGeneration,
+      fencingToken: checkpoint.fencingToken,
+      resumptionGeneration: authority.resumptionGeneration,
+      checkpointId: checkpoint.checkpointId,
+      candidateSha: checkpoint.candidateSha,
+      sourceBranch: checkpoint.branch,
+      sourceWorktree: checkpoint.worktree,
+      committedPaths: Object.freeze(committedPaths),
+      formerlyDirtyPaths: Object.freeze(formerlyDirtyPaths),
+      completedDeliverables: Object.freeze([...checkpoint.completedDeliverables]),
+      artifactRefs: Object.freeze([...checkpoint.artifactRefs]),
+      artifactHashes: Object.freeze([...checkpoint.artifactHashes]),
+    }) as CheckpointRecoveryContext;
   }
 
   private async checkpointSnapshot(
@@ -605,7 +704,7 @@ export class ExecutionBroker {
         if (!input.mutatesRepo || input.isolation === "none") return null;
         throw new Error(`WORKSPACE_SCOPE_MISMATCH: no repository provider for ${input.repoId}`);
       }
-      const resolved = await this.resolveRepository(input.repoId, input.writeDomains ?? []);
+      const resolved = await this.resolveRepository(input.repoId, input.writeDomains ?? [], input.missionId);
       if (resolved.repoId !== input.repoId) {
         throw new Error(`WORKSPACE_SCOPE_MISMATCH: resolved ${resolved.repoId} for ${input.repoId}`);
       }
@@ -1172,6 +1271,27 @@ export class ExecutionBroker {
     }
   }
 
+  /** Recompute candidate content identity from Git; durable metadata is not trusted as mutation proof. */
+  async verifiedCandidateContent(
+    missionId: string,
+  ): Promise<{ candidateSha: string; diffHash: string; hasChanges: boolean } | null> {
+    const manifest = this.store.getWorkspaceManifest(missionId);
+    const candidate = this.store.getCandidate(missionId);
+    if (!manifest || !candidate || !this.resolveRepository) return null;
+    const binding = manifest.repositories.find((entry) => entry.repoId === candidate.identity.repoId);
+    if (!binding) return null;
+    const repository = await this.resolveRepository(binding.repoId, [], missionId);
+    const target = this.missionCandidates.get(missionId);
+    const candidateSha = target
+      ? await target.git.headCommitIn(target.lifecycle.path)
+      : await repository.git.resolveCommit(candidate.identity.candidateSha);
+    if (candidateSha !== candidate.identity.candidateSha) return null;
+    const diff = await repository.git.captureDiff(binding.baseSha, candidateSha);
+    const diffHash = artifactHash(diff);
+    if (diffHash !== candidate.identity.diffHash) return null;
+    return { candidateSha, diffHash, hasChanges: candidateSha !== binding.baseSha && diff.trim().length > 0 };
+  }
+
   /** Read-only fail-closed preflight for Git journals consumed by recovery. */
   async durableRepositoryDiagnostics(missionId: string): Promise<DurableRepositoryDiagnostic[]> {
     const repoIds = [
@@ -1185,7 +1305,7 @@ export class ExecutionBroker {
     const diagnostics: DurableRepositoryDiagnostic[] = [];
     for (const repoId of repoIds) {
       try {
-        const git = this.resolveRepository ? (await this.resolveRepository(repoId, [])).git : this.git;
+        const git = this.resolveRepository ? (await this.resolveRepository(repoId, [], missionId)).git : this.git;
         if (!git) continue;
         const inventories = [
           ["candidate", await git.loadCandidateLifecycleInventory(missionId, repoId)],
@@ -1220,7 +1340,7 @@ export class ExecutionBroker {
     ];
     const refs: string[] = [];
     for (const repoId of repoIds) {
-      const git = this.resolveRepository ? (await this.resolveRepository(repoId, [])).git : this.git;
+      const git = this.resolveRepository ? (await this.resolveRepository(repoId, [], missionId)).git : this.git;
       if (!git) continue;
       const [candidates, runs, promotions, cleanups] = await Promise.all([
         git.loadCandidateLifecycleInventory(missionId, repoId),
@@ -1291,7 +1411,8 @@ export class ExecutionBroker {
             ? this.missionCandidates.get(missionId)?.git
             : undefined);
         const cleanupGit =
-          trackedGit ?? (this.resolveRepository ? (await this.resolveRepository(repoId, [])).git : undefined);
+          trackedGit ??
+          (this.resolveRepository ? (await this.resolveRepository(repoId, [], missionId)).git : undefined);
         const cleanupInventory = cleanupGit
           ? await cleanupGit.loadPendingBranchCleanupInventory(missionId, repoId)
           : { records: [], diagnostics: [] };
@@ -1539,7 +1660,7 @@ export class ExecutionBroker {
       .filter((task) => task.kind === "integration" && task.repo_id && task.status === "SUCCEEDED")
       .at(-1);
     if (!integrationTask?.repo_id) return false;
-    const repository = await this.resolveRepository(integrationTask.repo_id, integrationTask.write_domains);
+    const repository = await this.resolveRepository(integrationTask.repo_id, integrationTask.write_domains, missionId);
     const boundBase =
       this.store
         .getWorkspaceManifest(missionId)
@@ -1578,7 +1699,11 @@ export class ExecutionBroker {
         )
         .at(-1);
       if (integrationTask?.repo_id) {
-        const repository = await this.resolveRepository(integrationTask.repo_id, integrationTask.write_domains);
+        const repository = await this.resolveRepository(
+          integrationTask.repo_id,
+          integrationTask.write_domains,
+          missionId,
+        );
         const boundBase =
           this.store
             .getWorkspaceManifest(missionId)
@@ -1640,7 +1765,7 @@ export class ExecutionBroker {
   ): Promise<PromotionResult[]> {
     if (!this.resolveRepository) return [];
     authority.assertAuthoritative();
-    const repository = await this.resolveRepository(repoId, []);
+    const repository = await this.resolveRepository(repoId, [], missionId);
     authority.assertAuthoritative();
     return repository.git.reconcileCommittedPromotions(missionId, repoId, authority);
   }
@@ -1664,11 +1789,14 @@ export class ExecutionBroker {
   }
 
   async execute(rawInput: ExecutionRequestInput): Promise<ExecutionHandle> {
+    if (rawInput.recovery || Object.keys(rawInput.modelRequirements ?? {}).some((key) => key.startsWith("recovery"))) {
+      throw new Error("checkpoint recovery caller fields are forbidden; durable task authority is required");
+    }
     const input: ExecutionRequestInput = {
       ...rawInput,
       writeDomains: (rawInput.writeDomains ?? []).map(canonicalizeWriteDomain),
-      recovery: rawInput.recovery ?? checkpointRecoveryContext(rawInput.modelRequirements),
     };
+    input.recovery = this.durableRecoveryContext(input);
     input.authority?.assertAuthoritative();
     const executionStartedAt = Date.now();
     const executionBudgetMs = input.executionBudgetMs ?? input.timeoutPolicy?.timeoutMs ?? this.defaultTimeoutMs;

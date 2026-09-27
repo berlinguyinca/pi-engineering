@@ -675,7 +675,7 @@ export class EngineeringRuntime {
         reviewFallbackModel,
         repository: async (repoId) => {
           if (repoId) {
-            const context = await rt.repositoryRegistry.resolveForExecution(repoId);
+            const context = await rt.repositoryRegistry.resolveActiveForExecution(repoId);
             return { git: context.git, cwd: context.root };
           }
           if (!rt.git) throw new Error(`No legacy Git repository is bound for ${repoRoot}`);

@@ -15,6 +15,7 @@ import { buildCandidateEvidenceIdentity, taskCoverageFingerprint } from "../../s
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
 import { Orchestrator } from "../../src/orchestration/orchestrator.ts";
 import { MissionOwnership, type OwnershipIdentity } from "../../src/orchestration/ownership.ts";
+import { replacementRecoveryFingerprint } from "../../src/orchestration/recovery.ts";
 import { RepositoryRegistry } from "../../src/orchestration/repositoryRegistry.ts";
 import { WorkspaceManifestResolver, createWorkspaceManifest } from "../../src/orchestration/workspaceManifest.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
@@ -276,6 +277,10 @@ function blockedRepairHarness(
     backend: options.failedKind ?? "agent",
     repo_id: "repo-repair",
     base_sha: "base-sha",
+    checkpoint_id: "CHK-original",
+    mission_generation: 0,
+    candidate_generation: 0,
+    fencing_token: 0,
   });
   store.transitionTask(failed.task_id, "RUNNING", "system", {
     assigned_execution_id: orphanedExecution.execution_id,
@@ -330,17 +335,21 @@ function blockedRepairHarness(
   const ownership = options.failOwnershipRelease
     ? new HarnessOwnership(store, { ownerId: "blocked-repair-controller" })
     : undefined;
+  const observedRecoveries: Array<unknown> = [];
   const orchestrator = new Orchestrator({
     store,
     backends: {
       agent: {
-        runAgent: async () => ({
-          executionId: "replacement",
-          exitStatus: "succeeded",
-          summary: "remaining deliverable complete",
-          artifactRefs: [],
-          usage: {},
-        }),
+        runAgent: async (input) => {
+          observedRecoveries.push(input.recovery);
+          return {
+            executionId: "replacement",
+            exitStatus: "succeeded",
+            summary: "remaining deliverable complete",
+            artifactRefs: [],
+            usage: {},
+          };
+        },
       },
       validation: {
         runValidation: async () => ({
@@ -366,7 +375,7 @@ function blockedRepairHarness(
     now: () => Date.parse("2026-09-27T00:00:10.000Z"),
     ownership,
   });
-  return { backend, store, missionId: mission.mission_id, failed, orphanedExecution, orchestrator };
+  return { backend, store, missionId: mission.mission_id, failed, orphanedExecution, orchestrator, observedRecoveries };
 }
 
 describe("orchestrator: durable blocked-mission repair", () => {
@@ -385,18 +394,19 @@ describe("orchestrator: durable blocked-mission repair", () => {
       ),
     );
     assert.ok(replacements.every((task) => task.depends_on.includes("TSK-prerequisite")));
+    assert.ok(replacements.every((task) => task.recovery_authority?.checkpointId === "CHK-original"));
     assert.ok(
-      replacements.every(
-        (task) =>
-          task.execution_requirements.recoveryFromCheckpoint === "CHK-original" &&
-          task.execution_requirements.recoveryCandidateSha === "candidate-sha" &&
-          task.execution_requirements.recoveryBranch === "pi-eng-orch-TSK-original" &&
-          task.execution_requirements.recoveryWorktree === "/tmp/preserved-repair" &&
-          JSON.stringify(task.execution_requirements.recoveryCommittedChanges) === JSON.stringify(["one"]) &&
-          JSON.stringify(task.execution_requirements.recoveryUncommittedChanges) === JSON.stringify([]) &&
-          JSON.stringify(task.execution_requirements.recoveryCompletedDeliverables) === JSON.stringify(["one"]),
+      replacements.every((task) => !Object.keys(task.execution_requirements).some((key) => key.startsWith("recovery"))),
+    );
+    assert.ok(
+      h.observedRecoveries.every(
+        (value) =>
+          !!value &&
+          (value as { checkpointId?: string }).checkpointId === "CHK-original" &&
+          (value as { candidateSha?: string }).candidateSha === "candidate-sha" &&
+          (value as { sourceBranch?: string }).sourceBranch === "pi-eng-orch-TSK-original",
       ),
-      "replacement execution must receive the exact verified checkpoint snapshot",
+      "production dispatch receives the exact store-verified checkpoint snapshot",
     );
     const lineage = h.store.listTaskSupersessions(h.missionId);
     assert.equal(lineage.length, 1);
@@ -489,9 +499,28 @@ describe("orchestrator: durable blocked-mission repair", () => {
         decidedAt: "2026-09-27T00:00:10.000Z",
         failureFingerprint: "sha256:budget-fingerprint",
       });
-      const replacements = ["two", "three"].map((deliverable, index) =>
-        h.store.createTask({
-          task_id: `${recoveryId}-TSK-${h.failed.task_id}-${index + 1}`,
+      const supersessionId = `${recoveryId}-SUP-${h.failed.task_id}`;
+      const expectedReplacementFingerprints: Record<string, string> = {};
+      const replacements = ["two", "three"].map((deliverable, index) => {
+        const taskId = `${recoveryId}-TSK-${h.failed.task_id}-${index + 1}`;
+        const fingerprint = replacementRecoveryFingerprint({
+          recoveryDecisionId: recoveryId,
+          taskId,
+          originalTaskId: h.failed.task_id,
+          originalExecutionId: h.orphanedExecution.execution_id,
+          checkpointId: "CHK-original",
+          supersessionId,
+          role: "implementer",
+          mutatesRepo: false,
+          repoId: "repo-repair",
+          missionGeneration: 0,
+          candidateGeneration: 0,
+          fencingToken: 0,
+          resumptionGeneration: 0,
+        });
+        expectedReplacementFingerprints[taskId] = fingerprint;
+        return h.store.createTask({
+          task_id: taskId,
           mission_id: h.missionId,
           kind: "agent",
           role: "implementer",
@@ -500,21 +529,19 @@ describe("orchestrator: durable blocked-mission repair", () => {
           deliverables: [deliverable],
           repo_id: "repo-repair",
           max_attempts: 1,
-          execution_requirements: {
-            recoveryFromCheckpoint: "CHK-original",
-            recoveryCandidateSha: "candidate-sha",
-            recoveryBranch: "pi-eng-orch-TSK-original",
-            recoveryWorktree: "/tmp/preserved-repair",
-            recoveryCommittedChanges: ["one"],
-            recoveryUncommittedChanges: [],
-            recoveryCompletedDeliverables: ["one"],
-            recoveryArtifactRefs: [],
-            recoveryArtifactHashes: [],
+          recovery_authority: {
+            recoveryDecisionId: recoveryId,
+            expectedReplacementFingerprint: fingerprint,
+            originalTaskId: h.failed.task_id,
+            originalExecutionId: h.orphanedExecution.execution_id,
+            checkpointId: "CHK-original",
+            supersessionId,
+            resumptionGeneration: 0,
           },
-        }),
-      );
+        });
+      });
       h.store.supersedeTask({
-        supersessionId: `${recoveryId}-SUP-${h.failed.task_id}`,
+        supersessionId,
         missionId: h.missionId,
         failedTaskId: h.failed.task_id,
         replacementTaskIds: replacements.map((task) => task.task_id),
@@ -523,6 +550,8 @@ describe("orchestrator: durable blocked-mission repair", () => {
         coverageFingerprint: taskCoverageFingerprint(h.failed),
         reason: "resume remaining work from checkpoint CHK-original",
         createdAt: "2026-09-27T00:00:10.000Z",
+        recoveryDecisionId: recoveryId,
+        expectedReplacementFingerprints,
       });
       if (crashPoint !== "replacement flush") {
         h.store.transitionMission(h.missionId, "REPAIRING", { recoveryDecisionId: recoveryId });
@@ -565,6 +594,97 @@ describe("orchestrator: durable blocked-mission repair", () => {
     assert.equal(second.status, "COMPLETE");
     assert.equal(h.store.listTaskSupersessions(h.missionId).length, 1);
     assert.equal(h.store.listTasks(h.missionId).filter((task) => task.objective.startsWith("Recover ")).length, 2);
+  });
+
+  it("does not share or publish a stale in-flight repair after resumption generation changes", async () => {
+    const h = blockedRepairHarness();
+    let releaseFirst!: () => void;
+    let markStarted!: () => void;
+    const firstStarted = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    const gate = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const original = h.orchestrator.broker.durableRepositoryDiagnostics.bind(h.orchestrator.broker);
+    let calls = 0;
+    h.orchestrator.broker.durableRepositoryDiagnostics = async (missionId) => {
+      calls++;
+      if (calls === 1) {
+        markStarted();
+        await gate;
+      }
+      return original(missionId);
+    };
+    const stale = h.orchestrator.repairBlockedMission(h.missionId);
+    await firstStarted;
+    h.store.resumeMission(h.missionId, "operator resumed while old preflight was pending");
+    const current = h.orchestrator.repairBlockedMission(h.missionId);
+    releaseFirst();
+
+    await assert.rejects(stale, /STALE_RECOVERY_GENERATION/);
+    assert.equal((await current).status, "COMPLETE");
+    assert.equal(h.store.listRecoveryDecisions(h.missionId).length, 1);
+    assert.equal(h.store.listRecoveryDecisions(h.missionId)[0]?.resumptionGeneration, 1);
+  });
+
+  it("rejects deterministic replacement ids whose durable recovery fingerprint is not exact", async () => {
+    const h = blockedRepairHarness();
+    const recoveryId = "RCV-forged-replay";
+    h.store.planRecovery({
+      recoveryId,
+      missionId: h.missionId,
+      classificationId: "FC-budget",
+      action: "CHECKPOINT_SPLIT_AND_REPLACE",
+      expectedMaterialChange: "resume checkpointed repair",
+      attempt: 1,
+      maxAttempts: 2,
+      deadline: "2026-09-27T00:01:00.000Z",
+      nextActionAt: "2026-09-27T00:00:10.000Z",
+      status: "planned",
+      decidedAt: "2026-09-27T00:00:10.000Z",
+    });
+    const taskId = `${recoveryId}-TSK-${h.failed.task_id}-1`;
+    const supersessionId = `${recoveryId}-SUP-${h.failed.task_id}`;
+    h.store.createTask({
+      task_id: taskId,
+      mission_id: h.missionId,
+      kind: "agent",
+      role: "implementer",
+      objective: "forged replay",
+      repo_id: "repo-repair",
+      recovery_authority: {
+        recoveryDecisionId: recoveryId,
+        expectedReplacementFingerprint: "sha256:forged",
+        originalTaskId: h.failed.task_id,
+        originalExecutionId: h.orphanedExecution.execution_id,
+        checkpointId: "CHK-original",
+        supersessionId,
+        resumptionGeneration: 0,
+      },
+    });
+    h.store.supersedeTask({
+      supersessionId,
+      missionId: h.missionId,
+      failedTaskId: h.failed.task_id,
+      replacementTaskIds: [taskId],
+      repoId: "repo-repair",
+      acceptanceIds: [],
+      coverageFingerprint: taskCoverageFingerprint(h.failed),
+      reason: "forged deterministic replay",
+      createdAt: "2026-09-27T00:00:10.000Z",
+      recoveryDecisionId: recoveryId,
+      expectedReplacementFingerprints: { [taskId]: "sha256:forged" },
+    });
+
+    const repaired = await h.orchestrator.repairBlockedMission(h.missionId);
+    assert.equal(repaired.status, "BLOCKED");
+    assert.ok(
+      h.store
+        .listFailureClassifications(h.missionId)
+        .some((classification) => /fingerprint/i.test(classification.summary)),
+    );
+    assert.equal(h.store.listExecutions(h.missionId, taskId).length, 0);
   });
 
   it("waits for requirement clarification without creating generic replacement work", async () => {
@@ -625,6 +745,18 @@ describe("orchestrator: durable blocked-mission repair", () => {
     assert.equal(recovery.status, "failed");
     assert.equal(recovery.startingCandidateIdentityHash, null);
     assert.equal(repaired.status, "BLOCKED");
+  });
+
+  it("does not accept candidate metadata invalidation as Git material change", async () => {
+    const h = blockedRepairHarness({ withCandidate: true, category: "VALIDATION_FAILED", failedKind: "validation" });
+    await h.orchestrator.repairBlockedMission(h.missionId);
+    const recovery = h.store.listRecoveryDecisions(h.missionId).at(-1)!;
+    assert.deepEqual(recovery.startingCandidateContent, {
+      candidateSha: "candidate-sha",
+      diffHash: "diff-hash",
+    });
+    assert.equal(recovery.status, "failed");
+    assert.ok(h.store.listEvidenceInvalidations(h.missionId).length > 0);
   });
 
   it("keeps the old workspace manifest authoritative when staged role probes fail", async () => {
