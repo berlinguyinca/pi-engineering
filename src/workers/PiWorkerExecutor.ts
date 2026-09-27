@@ -208,7 +208,7 @@ export class PiWorkerExecutor implements WorkerExecutor {
   readonly transientTelemetry: TransientTelemetry = initialTransientTelemetry();
 
   constructor(opts: PiWorkerExecutorOptions = {}) {
-    this.agentDir = opts.agentDir ?? process.env.PI_AGENT_DIR ?? "~/.pi/agent";
+    this.agentDir = opts.agentDir ?? process.env.PI_CODING_AGENT_DIR ?? process.env.PI_AGENT_DIR ?? "~/.pi/agent";
     this.customTools = opts.customTools ?? [];
     this.model = opts.model;
     this.allowModelNetwork = opts.allowModelNetwork ?? false;

@@ -48,7 +48,7 @@ function joinExpand(base: string, file: string): string {
  * never builds one.
  */
 export function createSummarize(opts: SummarizeOptions = {}): (prompt: string) => Promise<string> {
-  const agentDir = opts.agentDir ?? process.env.PI_AGENT_DIR ?? "~/.pi/agent";
+  const agentDir = opts.agentDir ?? process.env.PI_CODING_AGENT_DIR ?? process.env.PI_AGENT_DIR ?? "~/.pi/agent";
   let runtimePromise: Promise<SummarizeRuntime> | undefined;
 
   const getRuntime = (): Promise<SummarizeRuntime> => {
