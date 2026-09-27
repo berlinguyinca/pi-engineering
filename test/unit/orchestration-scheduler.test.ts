@@ -602,6 +602,34 @@ describe("MissionScheduler (spec 02)", () => {
     assert.equal(concurrency.peak(), 1);
   });
 
+  it("treats bare ** as overlapping every write domain in the same repository", async () => {
+    const store = MissionStore.open(JsonlEventStore.inMemory());
+    const m = createExecutingMission(store);
+    for (const [objective, writeDomain] of [
+      ["repository-wide", "**"],
+      ["bounded", "src/api/**"],
+    ] as const) {
+      store.createTask({
+        mission_id: m.mission_id,
+        kind: "agent",
+        role: objective,
+        objective,
+        write_domains: [writeDomain],
+        mutates_repo: true,
+        isolation: "none",
+      });
+    }
+    const concurrency = delayedConcurrencyTracker(20);
+    const scheduler = new MissionScheduler({
+      store,
+      broker: makeBroker(store, { agent: { runAgent: async () => concurrency.run() } }),
+    });
+
+    await scheduler.runMission(m.mission_id);
+    assert.equal(concurrency.peak(), 1);
+    assert.equal(domainsOverlap(["**"], ["src/api/**"]), true);
+  });
+
   it("respects dependency order", async () => {
     const store = MissionStore.open(JsonlEventStore.inMemory());
     const m = store.createMission({

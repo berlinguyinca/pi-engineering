@@ -50,6 +50,7 @@ import {
   DEFAULT_WORKSET_POLICY,
   type WorksetPolicy,
   WorksetValidationError,
+  canonicalizeWriteDomain,
   splitWorksetDeliverables,
   validateWorkset,
 } from "./workset.ts";
@@ -650,31 +651,38 @@ export class Orchestrator {
         else throw error;
       }
       const expandedByOriginal = new Map<string, typeof normalized>();
-      for (const task of decomposedPlan) {
-        const repositories =
-          manifest && manifest.repositories.length > 1 && !task.repo_id && task.kind !== "aggregation"
-            ? manifest.repositories
-            : [
-                manifest?.repositories.find(
-                  (repository) => repository.repoId === (task.repo_id ?? this.repoIdForMission(mission.mission_id)),
-                ),
-              ];
-        const expanded = repositories.map((repository) => {
-          const repoId = repository?.repoId ?? task.repo_id ?? this.repoIdForMission(mission.mission_id);
-          return {
-            ...task,
-            task_id: repositories.length > 1 && repoId ? `${task.task_id}@${repoId}` : task.task_id,
-            ...(repoId ? { repo_id: repoId } : {}),
-            write_domains:
-              task.mutates_repo && repository
-                ? intersectWriteDomains(
-                    task.write_domains.length > 0 ? task.write_domains : ["**"],
-                    repository.writableDomains,
-                  )
-                : task.write_domains,
-          };
-        });
-        expandedByOriginal.set(task.task_id, expanded);
+      if (!worksetError) {
+        try {
+          for (const task of decomposedPlan) {
+            const repositories =
+              manifest && manifest.repositories.length > 1 && !task.repo_id && task.kind !== "aggregation"
+                ? manifest.repositories
+                : [
+                    manifest?.repositories.find(
+                      (repository) => repository.repoId === (task.repo_id ?? this.repoIdForMission(mission.mission_id)),
+                    ),
+                  ];
+            const expanded = repositories.map((repository) => {
+              const repoId = repository?.repoId ?? task.repo_id ?? this.repoIdForMission(mission.mission_id);
+              return {
+                ...task,
+                task_id: repositories.length > 1 && repoId ? `${task.task_id}@${repoId}` : task.task_id,
+                ...(repoId ? { repo_id: repoId } : {}),
+                write_domains:
+                  task.mutates_repo && repository
+                    ? intersectWriteDomains(
+                        task.write_domains.length > 0 ? task.write_domains : ["**"],
+                        repository.writableDomains,
+                      )
+                    : task.write_domains,
+              };
+            });
+            expandedByOriginal.set(task.task_id, expanded);
+          }
+        } catch (error) {
+          if (error instanceof WorksetValidationError) worksetError = error;
+          else throw error;
+        }
       }
       const expanded = [...expandedByOriginal.values()].flat().map((task) => ({
         ...task,
@@ -1492,7 +1500,9 @@ function dedupe<T>(arr: T[]): T[] {
   return [...new Set(arr)];
 }
 
-function intersectWriteDomains(requested: string[], authorized: string[]): string[] {
+export function intersectWriteDomains(requested: string[], authorized: string[]): string[] {
+  const canonicalRequested = requested.map(canonicalizeWriteDomain);
+  const canonicalAuthorized = authorized.map(canonicalizeWriteDomain);
   const intersection = new Set<string>();
   const contains = (outer: string, inner: string): boolean => {
     if (outer === "**") return true;
@@ -1501,8 +1511,8 @@ function intersectWriteDomains(requested: string[], authorized: string[]): strin
     const prefix = outer.slice(0, -3).replace(/\/$/, "");
     return inner === prefix || inner.startsWith(`${prefix}/`);
   };
-  for (const request of requested) {
-    for (const allow of authorized) {
+  for (const request of canonicalRequested) {
+    for (const allow of canonicalAuthorized) {
       if (contains(request, allow)) intersection.add(allow);
       else if (contains(allow, request)) intersection.add(request);
     }

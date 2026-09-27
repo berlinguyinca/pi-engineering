@@ -16,7 +16,7 @@ import { describe, it } from "node:test";
 import type { BrokerBackends } from "../../src/orchestration/broker.ts";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
 import { MissionObservability } from "../../src/orchestration/observability/MissionObservability.ts";
-import { Orchestrator } from "../../src/orchestration/orchestrator.ts";
+import { Orchestrator, intersectWriteDomains } from "../../src/orchestration/orchestrator.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 
 /** Deterministic overlap barrier (see dag-parallel/blackhole tests). */
@@ -198,6 +198,10 @@ describe("acceptance scenario A — simple feature auto-invokes engineering+vali
 });
 
 describe("material legacy orchestration workset safety", () => {
+  it("canonicalizes both sides of planner/manifest write-domain intersection", () => {
+    assert.deepEqual(intersectWriteDomains(["src\\api\\**"], ["src/**"]), ["src/api/**"]);
+  });
+
   it("rejects a protected legacy repository before any executable investigation planning", async () => {
     const store = MissionStore.open(JsonlEventStore.inMemory());
     let plannerCalls = 0;

@@ -275,6 +275,8 @@ export class ExecutionBroker {
   private readonly resolvedBases = new Map<string, string>();
   /** Branches intentionally kept after cleanup because their work never merged. */
   private readonly preserved = new Map<string, string[]>();
+  /** Worktree paths whose dirty contents could not be made immutable and therefore must remain mounted. */
+  private readonly retainedWorktrees = new Map<string, Set<string>>();
   /**
    * Worker branches whose execution FAILED. Their partial edits are preserved
    * (never merged, never force-deleted) so a failed run's work stays
@@ -334,13 +336,43 @@ export class ExecutionBroker {
     };
   }
 
-  /** Commit dirty cancellation state onto the checkpoint's retained branch before its worktree can be removed. */
-  private async preserveCheckpointWork(executionId: string, checkpointId: string): Promise<void> {
+  /** Commit cancellation state until hooks leave a clean, immutable branch tip. */
+  private async preserveCheckpointWork(executionId: string, checkpointId: string): Promise<string[] | null> {
+    const info = this.allocatedWorktrees.get(executionId);
+    if (!info) return null;
+    const preserved = new Set<string>();
+    // A successful hook may mutate files after Git has staged the current
+    // snapshot. Re-scan and commit those mutations before claiming durability.
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      const dirty = await info.git.statusPathsIn(info.path);
+      for (const path of dirty) preserved.add(path);
+      if (dirty.length === 0) return [...preserved].sort();
+      await info.git.commitAll(
+        info.path,
+        `pi-eng: preserve checkpoint ${checkpointId} for ${executionId} (${attempt})`,
+      );
+    }
+    const remaining = await info.git.statusPathsIn(info.path);
+    for (const path of remaining) preserved.add(path);
+    if (remaining.length > 0) {
+      throw new Error(`checkpoint preservation did not reach an immutable snapshot: ${remaining.join(", ")}`);
+    }
+    return [...preserved].sort();
+  }
+
+  private retainWorktree(missionId: string, executionId: string): void {
     const info = this.allocatedWorktrees.get(executionId);
     if (!info) return;
-    const status = (await info.git.statusIn(info.path)).trim();
-    if (!status) return;
-    await info.git.commitAll(info.path, `pi-eng: preserve checkpoint ${checkpointId} for ${executionId}`);
+    const retained = this.retainedWorktrees.get(missionId) ?? new Set<string>();
+    retained.add(info.path);
+    this.retainedWorktrees.set(missionId, retained);
+    const preserved = this.preserved.get(missionId) ?? [];
+    if (!preserved.includes(info.branch)) preserved.push(info.branch);
+    this.preserved.set(missionId, preserved);
+  }
+
+  private isRetainedWorktree(path: string): boolean {
+    return [...this.retainedWorktrees.values()].some((paths) => paths.has(path));
   }
 
   private async repositoryFor(
@@ -652,6 +684,7 @@ export class ExecutionBroker {
 
   private async releaseWorktree(executionId: string, keepBranch = true): Promise<void> {
     const wt = this.allocatedWorktrees.get(executionId);
+    if (wt && this.isRetainedWorktree(wt.path)) return;
     if (wt) {
       // Keep the branch: it carries the harvested work until integration merges it.
       await wt.git.removeWorktree({ path: wt.path, branch: wt.branch }, { keepBranch }).catch(() => {});
@@ -721,7 +754,13 @@ export class ExecutionBroker {
   /** Remove + clean all mission worktrees (after integration). */
   private async releaseMissionWorktrees(missionId: string, keepBranches = false): Promise<void> {
     const wts = this.missionWorktrees.get(missionId) ?? [];
+    const retained = this.retainedWorktrees.get(missionId) ?? new Set<string>();
+    const survivors: typeof wts = [];
     for (const wt of wts) {
+      if (retained.has(wt.path)) {
+        survivors.push(wt);
+        continue;
+      }
       // SAFETY: a worker branch must never be force-deleted (git branch -D)
       // while its work is not contained in the integrated checkout. A branch
       // whose tip IS an ancestor of HEAD was merged (its work landed) and may be
@@ -745,9 +784,12 @@ export class ExecutionBroker {
         }
       }
     }
-    this.missionWorktrees.delete(missionId);
+    if (survivors.length > 0) this.missionWorktrees.set(missionId, survivors);
+    else this.missionWorktrees.delete(missionId);
     for (const [execId, info] of [...this.allocatedWorktrees]) {
-      if (wts.some((w) => w.branch === info.branch)) this.allocatedWorktrees.delete(execId);
+      if (wts.some((w) => w.branch === info.branch) && !retained.has(info.path)) {
+        this.allocatedWorktrees.delete(execId);
+      }
     }
   }
 
@@ -849,11 +891,20 @@ export class ExecutionBroker {
           completedDeliverables: string[] = [],
           artifactRefs: string[] = [],
           artifactHashes: string[] = [],
-        ): Promise<void> => {
-          if (!this.checkpoints || !checkpointId || !input.repoId) return Promise.resolve();
+          requiredPreservedPaths: string[] | null = null,
+        ): Promise<CheckpointSnapshot | undefined> => {
+          if (!this.checkpoints || !checkpointId || !input.repoId) return undefined;
           input.authority?.assertAuthoritative();
           const snapshot = await this.checkpointSnapshot(execution.execution_id, input, repository);
           input.authority?.assertAuthoritative();
+          if (
+            requiredPreservedPaths !== null &&
+            (!snapshot.candidateSha ||
+              snapshot.preservedUncommittedChanges.length > 0 ||
+              requiredPreservedPaths.some((path) => !snapshot.committedChanges.includes(path)))
+          ) {
+            throw new Error("checkpoint final snapshot does not contain every preserved path");
+          }
           await this.checkpoints.persist({
             taskId: input.taskId,
             executionId: execution.execution_id,
@@ -863,15 +914,16 @@ export class ExecutionBroker {
             model: execution.model,
             snapshot,
           });
+          return snapshot;
         };
         const persistCheckpoint = (
           completedDeliverables: string[] = [],
           artifactRefs: string[] = [],
           artifactHashes: string[] = [],
         ): Promise<void> => {
-          checkpointChain = checkpointChain.then(() =>
-            writeCheckpoint(completedDeliverables, artifactRefs, artifactHashes),
-          );
+          checkpointChain = checkpointChain.then(async () => {
+            await writeCheckpoint(completedDeliverables, artifactRefs, artifactHashes);
+          });
           return checkpointChain;
         };
         const queueCheckpoint = (
@@ -992,11 +1044,12 @@ export class ExecutionBroker {
               if (activityTimer) clearInterval(activityTimer);
               if (!cancelCheckpointPromise) {
                 checkpointChain = checkpointChain.then(async () => {
-                  await this.preserveCheckpointWork(execution.execution_id, checkpointId);
-                  await writeCheckpoint();
+                  const preservedPaths = await this.preserveCheckpointWork(execution.execution_id, checkpointId);
+                  await writeCheckpoint([], [], [], preservedPaths);
                 });
                 cancelCheckpointPromise = checkpointChain.catch((error) => {
                   retainWorktreeOnCleanup = true;
+                  this.retainWorktree(input.missionId, execution.execution_id);
                   throw error;
                 });
               }

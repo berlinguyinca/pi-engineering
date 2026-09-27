@@ -230,3 +230,67 @@ Result: exit 0; 2,352 total, 2,351 passed, 0 failed, 1 skipped. The sole skip is
 - A preservation failure intentionally leaves the worktree allocated/on disk. This is a safety tradeoff: operator cleanup is preferable to deleting the only dirty copy.
 - Legacy executable workflows now use the repository's resolved HEAD as their manifest base. Registry-backed workflows retain explicit base-ref ownership validation.
 - Git path-enumeration fail-open behavior and authority-loss `RUNNING` reconciliation remain deferred exactly as previously ruled.
+
+## Fix Round 3
+
+### Outcome
+
+- Cancellation now repeats status/commit collection after successful hooks, then verifies the final candidate SHA contains every observed preserved path and has no remaining dirty state before durable checkpoint persistence or cleanup.
+- A failed immutable snapshot records the exact retained worktree path at mission scope. Direct execution cleanup, mission cleanup, and integration cleanup all leave that sole content-bearing copy mounted.
+- Planner and manifest write domains are canonicalized through the same validator before intersection; canonical POSIX domains are returned for persistence and downstream enforcement.
+- Shared overlap semantics now treat bare `**` as repository-wide, so scheduler dispatch cannot run it concurrently with any same-repository mutation.
+
+Checkpointing remains preserve-only and non-approving. No automatic checkpoint resume path was added.
+
+### RED evidence
+
+```text
+node --test --test-name-pattern='checkpoints dirty work|retains the dirty worktree|bare \\*\\*' test/unit/orchestration-broker.test.ts test/unit/orchestration-scheduler.test.ts
+```
+
+Result: exit 1; 0 passed, 3 failed. The checkpoint SHA omitted a hook-created file, `cleanupMission` deleted the retained worktree, and bare `**` did not serialize with `src/api/**`.
+
+The first expanded focused run also exposed a legacy traversal validation error escaping orchestration rather than entering its fail-closed workset result. The canonical intersection call is now inside the existing `WorksetValidationError` boundary.
+
+### GREEN evidence
+
+Focused broker/workset/checkpoint/scheduler/orchestrator matrix:
+
+```text
+node --test test/unit/orchestration-broker.test.ts test/unit/orchestration-broker-recovery.test.ts test/unit/orchestration-workset.test.ts test/unit/orchestration-checkpoints.test.ts test/unit/orchestration-scheduler.test.ts test/unit/orchestration-scheduler-resilience.test.ts test/integration/orchestrator-e2e.test.ts test/integration/orchestrator-long-outage.test.ts test/integration/orchestrator-recovery.test.ts test/integration/orchestrator-resilience.test.ts
+```
+
+Result: exit 0; 128 passed, 0 failed.
+
+Static verification:
+
+```text
+npm run typecheck
+npm run lint
+git diff --check
+```
+
+Result: all exit 0; TypeScript emitted no diagnostics, Biome checked 582 files with no findings, and the diff has no whitespace errors.
+
+Full suite (serialized to avoid unrelated browser resource contention, with an empty agent config so the optional live vision reviewer takes its documented unavailable path):
+
+```text
+PI_CODING_AGENT_DIR=/tmp/pi-eng-task4-empty-agent node --test --test-concurrency=1 "test/unit/**/*.test.ts" "test/integration/**/*.test.ts"
+```
+
+Result: exit 0; 2,354 total, 2,353 passed, 0 failed, 1 skipped. The sole skip is the existing Postgres OpenViking test gated by `TEST_DATABASE_URL`.
+
+### Files
+
+- `src/orchestration/broker.ts` — post-hook immutable snapshot loop, pre-persist content verification, and mission-scoped retained-worktree ownership honored by all cleanup paths.
+- `src/orchestration/orchestrator.ts` — canonical planner/manifest intersection returned through the existing fail-closed workset path.
+- `src/orchestration/scheduler.ts` — bare `**` repository-wide overlap semantics.
+- `test/unit/orchestration-broker.test.ts` — actual hook-created content recovery and post-`cleanupMission` retained-content regressions.
+- `test/unit/orchestration-scheduler.test.ts` — bare `**` serialization regression.
+- `test/integration/orchestrator-e2e.test.ts` — mixed Windows/POSIX intersection canonicalization regression.
+
+### Self-review and concerns
+
+- Retained dirty worktrees are intentionally not reclaimed by ordinary mission cleanup because they remain the only proven content-bearing copy. Operator-directed recovery/cleanup belongs with the later recovery work; no automatic resume was introduced here.
+- Final snapshot verification happens before persistence, so a race that leaves new dirt cannot publish a falsely durable checkpoint; it retains the worktree instead.
+- Git path-enumeration fail-open behavior and authority-loss `RUNNING` reconciliation remain deferred exactly as ruled.

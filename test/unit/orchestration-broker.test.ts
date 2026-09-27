@@ -216,6 +216,18 @@ describe("ExecutionBroker (spec 03)", () => {
     try {
       const git = await GitRepo.open(fx.root);
       assert.ok(git);
+      await writeFile(
+        join(fx.root, ".git", "hooks", "pre-commit"),
+        [
+          "#!/bin/sh",
+          "if [ ! -f src/hook-added.ts ]; then",
+          "  printf 'export const hookAdded = true;\\n' > src/hook-added.ts",
+          "fi",
+          "exit 0",
+          "",
+        ].join("\n"),
+        { mode: 0o755 },
+      );
       const store = MissionStore.open(JsonlEventStore.inMemory());
       const mission = store.createMission({
         title: "cancel checkpoint",
@@ -309,6 +321,11 @@ describe("ExecutionBroker (spec 03)", () => {
       await assert.rejects(access(removedWorktree), "the canceled worktree should be cleaned up");
       const recovered = await exec("git", ["-C", fx.root, "show", `${checkpoint.candidateSha}:src/cancelled.ts`]);
       assert.equal(recovered.stdout, "export const cancelled = true;\n");
+      const hookAdded = await exec("git", ["-C", fx.root, "show", `${checkpoint.candidateSha}:src/hook-added.ts`]);
+      assert.equal(hookAdded.stdout, "export const hookAdded = true;\n");
+      assert.deepEqual(checkpoint.preservedUncommittedChanges, []);
+      assert.ok(checkpoint.committedChanges.includes("src/cancelled.ts"));
+      assert.ok(checkpoint.committedChanges.includes("src/hook-added.ts"));
       const sequence = checkpoint.sequence;
       await new Promise((resolve) => setTimeout(resolve, 130));
       assert.equal(store.getTaskCheckpoint(execution.checkpoint_id!)?.sequence, sequence);
@@ -403,6 +420,7 @@ describe("ExecutionBroker (spec 03)", () => {
 
       await assert.rejects(handle.cancel(), /git commit failed/i);
       await result;
+      await broker.cleanupMission(mission.mission_id);
       await access(worktree);
       assert.equal(await readFile(join(worktree, "src", "retained.ts"), "utf8"), "export const retained = true;\n");
     } finally {

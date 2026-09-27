@@ -154,6 +154,7 @@ export function domainsOverlap(a: string[], b: string[]): boolean {
     for (const rawY of b) {
       const x = normalizeDomain(rawX);
       const y = normalizeDomain(rawY);
+      if (x === "**" || y === "**") return true;
       if (x === y) return true;
       if (x.startsWith(`${y}/`) || y.startsWith(`${x}/`)) return true;
     }
