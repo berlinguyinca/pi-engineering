@@ -149,6 +149,7 @@ export interface TaskCreateInput {
   required_output_artifacts?: string[];
   candidate_generation?: number;
   mission_generation?: number;
+  resumption_generation?: number;
   fencing_token?: number;
   recovery_authority?: OrchestrationTask["recovery_authority"];
   repair_base_candidate_sha?: string;
@@ -416,6 +417,9 @@ export class MissionStore {
         if (task) {
           task.mission_generation = e.payload.mission_generation as number;
           task.fencing_token = e.payload.fencing_token as number;
+          if (e.payload.resumption_generation !== undefined) {
+            task.resumption_generation = e.payload.resumption_generation as number;
+          }
           if (e.payload.assigned_execution_id !== undefined) {
             task.assigned_execution_id = e.payload.assigned_execution_id as string;
           }
@@ -825,6 +829,11 @@ export class MissionStore {
       required_output_artifacts: input.required_output_artifacts ? [...input.required_output_artifacts] : [],
       candidate_generation: input.candidate_generation ?? 0,
       mission_generation: input.mission_generation ?? authority?.generation ?? 0,
+      resumption_generation:
+        input.resumption_generation ??
+        authority?.resumptionGeneration ??
+        this.listMissionResumptions(input.mission_id).at(-1)?.generation ??
+        0,
       fencing_token: input.fencing_token ?? authority?.fencingToken ?? 0,
       recovery_authority: input.recovery_authority ? { ...input.recovery_authority } : undefined,
       repair_base_candidate_sha: input.repair_base_candidate_sha,
@@ -853,11 +862,13 @@ export class MissionStore {
     if (!task) throw new Error(`unknown task ${taskId}`);
     if (task.mission_id !== lease.missionId) throw new Error(`lease mission does not match task ${taskId}`);
     task.mission_generation = lease.generation;
+    task.resumption_generation = lease.resumptionGeneration ?? 0;
     task.fencing_token = lease.fencingToken;
     this.emit("task.authority_assigned", task.mission_id, {
       actor: "system",
       task_id: taskId,
       mission_generation: lease.generation,
+      resumption_generation: lease.resumptionGeneration ?? 0,
       fencing_token: lease.fencingToken,
     });
     return copyTask(task);
@@ -878,6 +889,7 @@ export class MissionStore {
       actor: "system",
       task_id: taskId,
       mission_generation: task.mission_generation,
+      resumption_generation: task.resumption_generation,
       fencing_token: task.fencing_token,
       assigned_execution_id: executionId,
     });
@@ -950,6 +962,7 @@ export class MissionStore {
     model?: string | null;
     thinking_level?: string | null;
     mission_generation?: number;
+    resumption_generation?: number;
     fencing_token?: number;
     checkpoint_id?: string;
     repo_id?: string;
@@ -975,6 +988,7 @@ export class MissionStore {
       artifact_refs: [],
       status: "PENDING",
       mission_generation: input.mission_generation ?? task?.mission_generation ?? 0,
+      resumption_generation: input.resumption_generation ?? task?.resumption_generation ?? 0,
       fencing_token: input.fencing_token ?? task?.fencing_token ?? 0,
       checkpoint_id: input.checkpoint_id,
       repo_id: input.repo_id,
@@ -1035,6 +1049,7 @@ export class MissionStore {
       task.mission_id !== execution.mission_id ||
       task.assigned_execution_id !== execution.execution_id ||
       task.mission_generation !== execution.mission_generation ||
+      task.resumption_generation !== execution.resumption_generation ||
       task.candidate_generation !== execution.candidate_generation ||
       task.fencing_token !== execution.fencing_token
     )
@@ -1061,6 +1076,10 @@ export class MissionStore {
     if (!task) throw new Error(`unknown task ${execution.task_id}`);
     const mismatches = [
       task.mission_generation !== execution.mission_generation ? "mission generation" : null,
+      task.resumption_generation !== execution.resumption_generation ? "resumption generation" : null,
+      execution.resumption_generation !== (this.listMissionResumptions(execution.mission_id).at(-1)?.generation ?? 0)
+        ? "current resumption generation"
+        : null,
       task.candidate_generation !== execution.candidate_generation ? "candidate generation" : null,
       task.fencing_token !== execution.fencing_token ? "fencing token" : null,
       task.assigned_execution_id && task.assigned_execution_id !== executionId ? "assigned execution" : null,
@@ -1523,7 +1542,13 @@ export class MissionStore {
       if (!decision || decision.missionId !== supersession.missionId) {
         throw new Error("supersession recovery decision does not match mission");
       }
-      for (const replacement of supersession.expectedReplacementFingerprints ? replacements : []) {
+      if (!supersession.expectedReplacementFingerprints) {
+        throw new Error("recovery supersession requires replacement fingerprints");
+      }
+      if (Object.keys(supersession.expectedReplacementFingerprints).length !== replacements.length) {
+        throw new Error("recovery supersession requires exactly one fingerprint per ordered replacement");
+      }
+      for (const replacement of replacements) {
         const authority = replacement?.recovery_authority;
         const expected = supersession.expectedReplacementFingerprints?.[replacement!.task_id];
         if (
@@ -1899,6 +1924,13 @@ export class MissionStore {
 
   resumeMission(missionId: string, reason: string): MissionResumption {
     if (!this.missions.has(missionId)) throw new Error(`unknown mission ${missionId}`);
+    const currentLease = this.missionLeases.get(missionId);
+    if (currentLease) {
+      this.applyLeaseTransition("fenced", "mission", currentLease);
+      for (const repository of this.listRepositoryLeases(missionId)) {
+        this.applyLeaseTransition("fenced", "repository", repository);
+      }
+    }
     const resumption = {
       missionId,
       reason,

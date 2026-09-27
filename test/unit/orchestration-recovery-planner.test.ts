@@ -234,9 +234,32 @@ describe("replacement recovery fingerprint", () => {
     createdAt: "2026-09-27T00:00:01.000Z",
   };
   const base = {
-    recoveryDecisionId: "RCV-exact",
-    supersessionId: "SUP-exact",
-    resumptionGeneration: 8,
+    decision: {
+      recoveryId: "RCV-exact",
+      missionId: "MSN-exact",
+      classificationId: "FC-exact",
+      action: "CHECKPOINT_SPLIT_AND_REPLACE" as const,
+      expectedMaterialChange: "replace exact work",
+      attempt: 1,
+      maxAttempts: 2,
+      deadline: "2026-09-27T00:05:00.000Z",
+      nextActionAt: "2026-09-27T00:00:02.000Z",
+      status: "planned" as const,
+      decidedAt: "2026-09-27T00:00:02.000Z",
+      failureFingerprint: "sha256:failure",
+      blockedEpisodeId: "BLK-exact",
+      resumptionGeneration: 8,
+      startingCandidateIdentityHash: "sha256:baseline",
+      startingCandidateContent: { candidateSha: "candidate-before", diffHash: "diff-before" },
+    },
+    lineage: {
+      supersessionId: "SUP-exact",
+      failedTaskId: "TSK-original",
+      repoId: "repo-exact",
+      acceptanceIds: ["AC-1"],
+      coverageFingerprint: "sha256:coverage",
+      replacementTaskIds: ["TSK-replacement", "TSK-replacement-2"],
+    },
     replacement: {
       task_id: "TSK-replacement",
       mission_id: "MSN-exact",
@@ -268,9 +291,21 @@ describe("replacement recovery fingerprint", () => {
   };
 
   for (const [label, mutate] of [
-    ["decision", (value: typeof base) => change(value, { recoveryDecisionId: "RCV-forged" })],
-    ["supersession", (value: typeof base) => change(value, { supersessionId: "SUP-forged" })],
-    ["resumption generation", (value: typeof base) => change(value, { resumptionGeneration: 9 })],
+    ["decision identity", (value: typeof base) => change(value.decision, { recoveryId: "RCV-forged" })],
+    ["decision mission", (value: typeof base) => change(value.decision, { missionId: "MSN-forged" })],
+    ["decision action", (value: typeof base) => change(value.decision, { action: "CREATE_REPAIR_TASKS" })],
+    ["blocked episode", (value: typeof base) => change(value.decision, { blockedEpisodeId: "BLK-forged" })],
+    ["resumption generation", (value: typeof base) => change(value.decision, { resumptionGeneration: 9 })],
+    ["candidate baseline", (value: typeof base) => change(value.decision, { startingCandidateIdentityHash: null })],
+    [
+      "content baseline",
+      (value: typeof base) => change(value.decision.startingCandidateContent!, { diffHash: "forged" }),
+    ],
+    ["supersession", (value: typeof base) => change(value.lineage, { supersessionId: "SUP-forged" })],
+    ["failed task", (value: typeof base) => change(value.lineage, { failedTaskId: "TSK-forged" })],
+    ["lineage repository", (value: typeof base) => change(value.lineage, { repoId: "repo-forged" })],
+    ["lineage coverage", (value: typeof base) => change(value.lineage, { coverageFingerprint: "forged" })],
+    ["ordered replacements", (value: typeof base) => void value.lineage.replacementTaskIds.reverse()],
     ["task identity", (value: typeof base) => change(value.replacement, { task_id: "TSK-forged" })],
     ["mission identity", (value: typeof base) => change(value.replacement, { mission_id: "MSN-forged" })],
     ["kind", (value: typeof base) => change(value.replacement, { kind: "process" })],
@@ -305,6 +340,7 @@ describe("replacement recovery fingerprint", () => {
     ["checkpoint base", (value: typeof base) => change(value.checkpoint, { baseSha: "base-forged" })],
     ["checkpoint path", (value: typeof base) => change(value.checkpoint, { worktree: "/forged" })],
     ["artifact ref", (value: typeof base) => change(value.checkpoint.artifactRefs, { 0: "artifact://forged" })],
+    ["artifact proof deletion", (value: typeof base) => void value.checkpoint.artifactRefs.pop()],
     [
       "artifact hash",
       (value: typeof base) => change(value.checkpoint.artifactHashes, { 0: `sha256:${"b".repeat(64)}` }),

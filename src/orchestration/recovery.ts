@@ -123,17 +123,47 @@ export function replacementTaskFingerprintSpec(task: ReplacementTaskFingerprintS
 }
 
 export function replacementRecoveryFingerprint(input: {
-  recoveryDecisionId: string;
-  supersessionId: string;
-  resumptionGeneration: number;
+  decision: RecoveryDecision;
+  lineage: {
+    supersessionId: string;
+    failedTaskId: string;
+    repoId: string;
+    acceptanceIds: string[];
+    coverageFingerprint?: string;
+    replacementTaskIds: string[];
+  };
   replacement: ReplacementTaskFingerprintSpec;
   manifest: WorkspaceManifest;
   checkpoint: TaskCheckpoint | null;
 }): string {
   return `sha256:${hash({
-    recoveryDecisionId: input.recoveryDecisionId,
-    supersessionId: input.supersessionId,
-    resumptionGeneration: input.resumptionGeneration,
+    decision: {
+      recoveryId: input.decision.recoveryId,
+      missionId: input.decision.missionId,
+      classificationId: input.decision.classificationId,
+      action: input.decision.action,
+      expectedMaterialChange: input.decision.expectedMaterialChange,
+      attempt: input.decision.attempt,
+      maxAttempts: input.decision.maxAttempts,
+      deadline: input.decision.deadline,
+      nextActionAt: input.decision.nextActionAt,
+      decidedAt: input.decision.decidedAt,
+      failureFingerprint: input.decision.failureFingerprint,
+      blockedEpisodeId: input.decision.blockedEpisodeId,
+      resumptionGeneration: input.decision.resumptionGeneration ?? 0,
+      startingCandidateIdentityHash: input.decision.startingCandidateIdentityHash,
+      startingCandidateContent: input.decision.startingCandidateContent
+        ? { ...input.decision.startingCandidateContent }
+        : input.decision.startingCandidateContent,
+    },
+    lineage: {
+      supersessionId: input.lineage.supersessionId,
+      failedTaskId: input.lineage.failedTaskId,
+      repoId: input.lineage.repoId,
+      acceptanceIds: [...input.lineage.acceptanceIds],
+      coverageFingerprint: input.lineage.coverageFingerprint,
+      replacementTaskIds: [...input.lineage.replacementTaskIds],
+    },
     replacement: replacementTaskFingerprintSpec(input.replacement),
     manifest: structuredClone(input.manifest),
     checkpoint: input.checkpoint

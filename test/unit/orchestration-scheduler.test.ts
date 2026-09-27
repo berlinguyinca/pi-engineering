@@ -515,18 +515,18 @@ describe("MissionScheduler (spec 02)", () => {
     assert.match(finding.evidence ?? "", /injected repository release failure/);
   });
 
-  it("cancels and rejects a late worker result after mission takeover", async () => {
+  it("cancels and rejects a late worker settlement before dispatching an explicit resumption", async () => {
     const eventStore = JsonlEventStore.inMemory();
     const store = MissionStore.open(eventStore);
     const mission = createExecutingMission(store);
-    let now = Date.parse("2026-09-26T10:00:00.000Z");
+    const now = Date.parse("2026-09-26T10:00:00.000Z");
     const firstOwner = new MissionOwnership(store, {
       ownerId: "controller-a",
       leaseMs: 100,
       heartbeatMs: 10,
       now: () => now,
     });
-    let identity = await firstOwner.acquire(mission.mission_id);
+    let identity = await firstOwner.acquire(mission.mission_id, { resumptionGeneration: 0 });
     const task = store.createTask({
       mission_id: mission.mission_id,
       kind: "agent",
@@ -573,14 +573,9 @@ describe("MissionScheduler (spec 02)", () => {
     const running = scheduler.runMission(mission.mission_id);
     await dispatched;
 
-    now += 101;
-    const secondOwner = new MissionOwnership(store, {
-      ownerId: "controller-b",
-      leaseMs: 100,
-      heartbeatMs: 10,
-      now: () => now,
-    });
-    const takeover = await secondOwner.acquire(mission.mission_id);
+    store.resumeMission(mission.mission_id, "operator resumed during worker settlement");
+    const takeover = await firstOwner.acquire(mission.mission_id, { resumptionGeneration: 1 });
+    await broker.cancelStaleResumptionExecutions(mission.mission_id, 1);
     await running;
 
     assert.equal(takeover.generation, 2);

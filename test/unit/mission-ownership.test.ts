@@ -71,6 +71,39 @@ describe("MissionOwnership", () => {
     assert.deepEqual(store.getMissionLease("M-1"), renewed);
   });
 
+  it("does not let one overlapping same-owner flight release another flight's epoch", async () => {
+    const store = MissionStore.open(JsonlEventStore.inMemory());
+    mission(store, "M-overlap");
+    const ownership = new MissionOwnership(store, { ownerId: "controller", leaseMs: 60_000 });
+
+    const first = await ownership.acquire("M-overlap", { resumptionGeneration: 0 });
+    const second = await ownership.acquire("M-overlap", { resumptionGeneration: 0 });
+    assert.equal(first.generation, second.generation);
+
+    await ownership.release(first);
+
+    assert.doesNotThrow(() => ownership.assertAuthoritative(second));
+    assert.deepEqual(store.getMissionLease("M-overlap"), second);
+    await ownership.release(second);
+    assert.equal(store.getMissionLease("M-overlap"), undefined);
+  });
+
+  it("fences the prior resumption epoch before the same owner acquires the next one", async () => {
+    const store = MissionStore.open(JsonlEventStore.inMemory());
+    mission(store, "M-resume");
+    const ownership = new MissionOwnership(store, { ownerId: "controller", leaseMs: 60_000 });
+    const stale = await ownership.acquire("M-resume", { resumptionGeneration: 0 });
+
+    store.resumeMission("M-resume", "explicit operator resumption");
+    const current = await ownership.acquire("M-resume", { resumptionGeneration: 1 });
+
+    assert.equal(current.generation, stale.generation + 1);
+    assert.equal(current.resumptionGeneration, 1);
+    assert.throws(() => ownership.assertAuthoritative(stale), /stale.*resumption|stale.*fencing/i);
+    await assert.rejects(() => ownership.release(stale), /stale.*resumption|stale.*fencing/i);
+    assert.doesNotThrow(() => ownership.assertAuthoritative(current));
+  });
+
   it("expires an overdue lease and reacquires it with a higher epoch", async () => {
     const { MissionOwnership } = await import("../../src/orchestration/ownership.ts");
     let now = Date.parse("2026-09-26T10:00:00.000Z");

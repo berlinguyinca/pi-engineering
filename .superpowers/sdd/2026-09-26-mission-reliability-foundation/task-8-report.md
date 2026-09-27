@@ -129,3 +129,34 @@ Metabolomics remains disabled. No model or package dependency was added.
 - Confirm manifest CAS checks the exact persisted predecessor at append time and restart activation cannot expose an uncommitted manifest.
 - Confirm mutating repair materiality is evaluated only after fenced integration and requires a changed diff, not merely a new commit SHA.
 - Confirm path-only registry resolution fails closed for zero or multiple matches and stale async-local scopes cannot reach removed bindings.
+
+## Fix round 5
+
+### Outcome
+
+- Explicit resumption is now a durable dispatch epoch carried by mission leases, tasks, executions, scheduler authority, broker settlement, integration, and promotion guards. Recording a resumption fences the prior mission/repository leases, and blocked repair cancels active older-generation backends before any new dispatch.
+- Same-owner overlapping acquisitions are reference-counted per lease epoch. Releasing one flight cannot fence a second holder, while a new resumption receives a distinct generation/fencing epoch and stale release cannot affect it.
+- Recovery authority is reconstructed from durable current-lineage decisions instead of depending on the orchestrator's in-memory task map. Ownership-enabled restart tests now cover replacement flush, `REPAIRING`, and already-dispatched replacement crash points.
+- Replacement fingerprints now bind the authoritative recovery decision (mission, classification, action, blocked episode, resumption, deadlines, and candidate baselines), supersession identity (failed task, repository, coverage, and ordered replacements), complete immutable replacement spec, manifest, checkpoint snapshot, and ordered artifact proof. Recovery supersessions require exactly one fingerprint per replacement, and broker dispatch rejects missing, zero-lineage, multiple-lineage, or unequal fingerprints.
+- Once any mission manifest is active, unmatched repository paths throw `WorkspaceScopeError`; `EngineeringRuntime` core tools can no longer fall back to the launch broker, Git provider, or base ref for an out-of-scope execution cwd.
+
+### Adversarial TDD evidence
+
+- RED: same-owner overlapping release fenced the live lease; explicit resumption reused the old epoch; active-manifest path misses returned `null` and core tools used the runtime-global broker; full fingerprint mutations for decision/blocked episode/baseline/lineage ordering/proof deletion were not bound.
+- GREEN: real backend races cover stale worker settlement, candidate integration, and incumbent promotion during explicit resumption; every stale path remains nonterminal and leaves incumbent HEAD unchanged.
+- Ownership-enabled crash replay passes after replacement flush, after `BLOCKED -> REPAIRING`, and after replacement dispatch with the original failed task excluded by its durable supersession.
+
+### Verification
+
+- Focused authority/recovery/runtime set — 205 passed, 0 failed.
+- `npm run typecheck` — passed.
+- `npm run lint` — passed; 585 files checked.
+- `npm test` — 2,548 passed, 0 failed, 1 skipped in 40.4 seconds. The skip remains the optional Postgres OpenViking round trip because `TEST_DATABASE_URL` is unset.
+- `git diff --check` — passed.
+
+### Reviewer focus
+
+- Confirm no mutation path trusts only the outer recovery-generation checks: broker settlement and Git guards must observe the lease/task/execution resumption epoch directly.
+- Confirm `resumeMission` fences the old durable lease before a new recovery flight can acquire or dispatch, and stale release never fences a newer same-owner epoch.
+- Confirm fingerprint recomputation starts from exactly one durable supersession lineage and cannot omit a decision baseline, ordered replacement, checkpoint field, or artifact proof.
+- Confirm runtime-global repository dependencies are reachable only while no mission manifest is active.

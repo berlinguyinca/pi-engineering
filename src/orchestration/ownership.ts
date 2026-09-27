@@ -13,6 +13,7 @@ export type OwnershipIdentity = MissionLease | RepositoryLease;
 export interface DispatchAuthority {
   readonly missionIdentity: MissionLease;
   readonly repositoryIdentity?: RepositoryLease;
+  readonly resumptionGeneration?: number;
   assertAuthoritative(): void;
   onInvalidated(listener: (error: Error) => void): void;
   /** Stops renewal and releases repository authority. Release failures are returned, never thrown. */
@@ -30,6 +31,7 @@ export class MissionOwnership {
   private readonly leaseMs: number;
   private readonly heartbeatMs: number;
   private readonly now: () => number;
+  private readonly missionHolders = new Map<string, number>();
 
   constructor(store: MissionStore, options: MissionOwnershipOptions) {
     if (!options.ownerId.trim()) throw new Error("MissionOwnership ownerId is required");
@@ -52,7 +54,7 @@ export class MissionOwnership {
     return new RenewableDispatchAuthority(this, mission, repository, this.heartbeatMs);
   }
 
-  async acquire(missionId: string): Promise<MissionLease> {
+  async acquire(missionId: string, options: { resumptionGeneration?: number } = {}): Promise<MissionLease> {
     this.assertWriterAuthority();
     const current = this.store.getMissionLease(missionId);
     const now = this.now();
@@ -60,9 +62,24 @@ export class MissionOwnership {
       if (current.ownerId !== this.ownerId) {
         throw new Error(`mission ${missionId} is owned by ${current.ownerId} until ${current.renewBy}`);
       }
-      return this.renew(current);
+      if (
+        options.resumptionGeneration !== undefined &&
+        (current.resumptionGeneration ?? 0) !== options.resumptionGeneration
+      ) {
+        this.store.transitionMissionLease("fenced", current);
+        for (const repository of this.store.listRepositoryLeases(missionId)) {
+          this.store.transitionRepositoryLease("fenced", repository);
+        }
+        this.missionHolders.delete(this.epochKey(current));
+        await this.store.flush();
+      } else {
+        const renewed = await this.renew(current);
+        const key = this.epochKey(renewed);
+        this.missionHolders.set(key, (this.missionHolders.get(key) ?? 0) + 1);
+        return renewed;
+      }
     }
-    if (current) {
+    if (current && this.store.getMissionLease(missionId)) {
       this.store.transitionMissionLease("expired", current);
       for (const repository of this.store.listRepositoryLeases(missionId)) {
         this.store.transitionRepositoryLease("expired", repository);
@@ -78,9 +95,12 @@ export class MissionOwnership {
       acquiredAt: new Date(now).toISOString(),
       renewBy: new Date(now + this.leaseMs).toISOString(),
       fencingToken: (previous?.fencingToken ?? 0) + 1,
+      resumptionGeneration:
+        options.resumptionGeneration ?? this.store.listMissionResumptions(missionId).at(-1)?.generation ?? 0,
     };
     this.store.transitionMissionLease("acquired", lease);
     await this.store.flush();
+    this.missionHolders.set(this.epochKey(lease), 1);
     return { ...lease };
   }
 
@@ -162,8 +182,18 @@ export class MissionOwnership {
       : this.store.getMissionLease(identity.missionId);
     if (!current) return;
     this.assertAuthoritative(identity);
-    if (isRepositoryIdentity(identity)) this.store.transitionRepositoryLease("fenced", identity);
-    else this.store.transitionMissionLease("fenced", identity);
+    if (isRepositoryIdentity(identity)) {
+      this.store.transitionRepositoryLease("fenced", identity);
+    } else {
+      const key = this.epochKey(identity);
+      const holders = this.missionHolders.get(key) ?? 1;
+      if (holders > 1) {
+        this.missionHolders.set(key, holders - 1);
+        return;
+      }
+      this.missionHolders.delete(key);
+      this.store.transitionMissionLease("fenced", identity);
+    }
     await this.store.flush();
   }
 
@@ -177,7 +207,17 @@ export class MissionOwnership {
     }
     const current = this.store.getMissionLease(identity.missionId);
     this.assertSameEpoch(identity, current, "mission");
+    const resumptionGeneration = this.store.listMissionResumptions(identity.missionId).at(-1)?.generation ?? 0;
+    if ((identity.resumptionGeneration ?? 0) !== resumptionGeneration) {
+      throw new Error(
+        `stale mission resumption identity for ${identity.missionId}: generation=${identity.resumptionGeneration ?? 0}, current=${resumptionGeneration}`,
+      );
+    }
     this.assertNotExpired(current!, "mission", identity.missionId);
+  }
+
+  private epochKey(identity: MissionLease): string {
+    return `${identity.missionId}:${identity.generation}:${identity.fencingToken}`;
   }
 
   private assertMissionOwner(missionId: string, ownerId: string): void {
@@ -255,6 +295,10 @@ class RenewableDispatchAuthority implements DispatchAuthority {
 
   get repositoryIdentity(): RepositoryLease | undefined {
     return this.repository ? { ...this.repository } : undefined;
+  }
+
+  get resumptionGeneration(): number {
+    return this.mission.resumptionGeneration ?? 0;
   }
 
   assertAuthoritative(): void {

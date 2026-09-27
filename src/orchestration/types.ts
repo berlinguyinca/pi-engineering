@@ -206,6 +206,8 @@ export interface OrchestrationTask {
   candidate_generation?: number;
   /** Mission ownership generation at dispatch. */
   mission_generation?: number;
+  /** Explicit mission-resumption epoch at dispatch. */
+  resumption_generation?: number;
   /** Fences results from revoked or expired owners. */
   fencing_token?: number;
   /** Durable diagnostic attached by a lifecycle transition. */
@@ -264,6 +266,8 @@ export interface Execution {
   reviewed_recovered?: EntityId[];
   /** Mission ownership generation at dispatch. Absent on legacy events. */
   mission_generation?: number;
+  /** Explicit mission-resumption epoch at dispatch. Absent on legacy events. */
+  resumption_generation?: number;
   /** Fences results from revoked or expired owners. */
   fencing_token?: number;
   /** Checkpoint lineage for this bounded execution. */
@@ -507,6 +511,8 @@ export interface MissionLease {
   acquiredAt: string;
   renewBy: string;
   fencingToken: number;
+  /** Explicit resumption epoch this lease may dispatch for. */
+  resumptionGeneration?: number;
 }
 
 export interface RepositoryLease extends MissionLease {

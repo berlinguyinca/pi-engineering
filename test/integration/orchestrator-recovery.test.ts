@@ -176,6 +176,7 @@ function blockedRepairHarness(
       | "REVIEW_FAILED";
     failedKind?: "agent" | "validation" | "review";
     failOwnershipRelease?: boolean;
+    withOwnership?: boolean;
     ownership?: MissionOwnership;
   } = {},
 ) {
@@ -340,7 +341,11 @@ function blockedRepairHarness(
   }
   const ownership =
     options.ownership ??
-    (options.failOwnershipRelease ? new HarnessOwnership(store, { ownerId: "blocked-repair-controller" }) : undefined);
+    (options.failOwnershipRelease
+      ? new HarnessOwnership(store, { ownerId: "blocked-repair-controller" })
+      : options.withOwnership
+        ? new MissionOwnership(store, { ownerId: "blocked-repair-controller" })
+        : undefined);
   const observedRecoveries: Array<unknown> = [];
   const orchestrator = new Orchestrator({
     store,
@@ -391,7 +396,7 @@ function blockedRepairHarness(
   return { backend, store, missionId: mission.mission_id, failed, orphanedExecution, orchestrator, observedRecoveries };
 }
 
-async function realGateRepairHarness(emptyRepair: boolean) {
+async function realGateRepairHarness(emptyRepair: boolean, race?: "integration" | "promotion") {
   const fixture = await makeFixtureRepo();
   const git = (await GitRepo.open(fixture.root))!;
   const baseSha = await git.headCommit();
@@ -509,6 +514,15 @@ async function realGateRepairHarness(emptyRepair: boolean) {
   store.transitionMission(mission.mission_id, "BLOCKED");
   const registry = new RepositoryRegistry();
   await registry.register(manifest);
+  const ownership = race ? new MissionOwnership(store, { ownerId: `race-${race}` }) : undefined;
+  const promotionGit = registry.get("repo-real-repair").git;
+  const originalPromotion = promotionGit.promoteCandidate.bind(promotionGit);
+  if (race === "promotion") {
+    promotionGit.promoteCandidate = async (...args) => {
+      store.resumeMission(mission.mission_id, "explicit resumption during promotion");
+      return originalPromotion(...args);
+    };
+  }
   const orchestrator = new Orchestrator({
     store,
     repositoryRegistry: registry,
@@ -534,6 +548,9 @@ async function realGateRepairHarness(emptyRepair: boolean) {
       integration: {
         candidateScoped: true,
         runIntegration: async (input) => {
+          if (race === "integration") {
+            store.resumeMission(mission.mission_id, "explicit resumption during integration");
+          }
           for (const [sequence, handoff] of input.handoffs.entries()) {
             const merged = await git.mergeRefInWorktree(
               input.candidate!,
@@ -608,15 +625,19 @@ async function realGateRepairHarness(emptyRepair: boolean) {
     planner: async () => [],
     recovery: { missionCeiling: 4, strategyMaxAttempts: 2, decisionTtlMs: 60_000 },
     now: () => Date.parse("2026-09-27T00:00:10.000Z"),
+    ownership,
   });
   return {
     fixture,
     store,
     missionId: mission.mission_id,
     orchestrator,
+    git,
+    baseSha,
     baselineDiffHash,
     candidateSha,
     cleanup: async () => {
+      promotionGit.promoteCandidate = originalPromotion;
       await git.removeWorktree(baselineWorktree, { keepBranch: false }).catch(() => undefined);
       await fixture.cleanup();
     },
@@ -728,7 +749,7 @@ describe("orchestrator: durable blocked-mission repair", () => {
 
   for (const crashPoint of ["replacement flush", "REPAIRING transition", "replacement dispatch"] as const) {
     it(`resumes the recovery-owned lineage after a crash at ${crashPoint}`, async () => {
-      const h = blockedRepairHarness();
+      const h = blockedRepairHarness({ withOwnership: true });
       const recoveryId = `RCV-phase-${crashPoint.replaceAll(" ", "-")}`;
       h.store.planRecovery({
         recoveryId,
@@ -745,9 +766,18 @@ describe("orchestrator: durable blocked-mission repair", () => {
         failureFingerprint: "sha256:budget-fingerprint",
       });
       const supersessionId = `${recoveryId}-SUP-${h.failed.task_id}`;
+      const replacementTaskIds = [1, 2].map((index) => `${recoveryId}-TSK-${h.failed.task_id}-${index}`);
+      const lineageFingerprintSpec = {
+        supersessionId,
+        failedTaskId: h.failed.task_id,
+        replacementTaskIds,
+        repoId: "repo-repair",
+        acceptanceIds: [] as string[],
+        coverageFingerprint: taskCoverageFingerprint(h.failed),
+      };
       const expectedReplacementFingerprints: Record<string, string> = {};
       const replacements = ["two", "three"].map((deliverable, index) => {
-        const taskId = `${recoveryId}-TSK-${h.failed.task_id}-${index + 1}`;
+        const taskId = replacementTaskIds[index]!;
         const replacement = {
           task_id: taskId,
           mission_id: h.missionId,
@@ -771,9 +801,8 @@ describe("orchestrator: durable blocked-mission repair", () => {
           candidate_generation: index + 1,
         };
         const fingerprint = replacementRecoveryFingerprint({
-          recoveryDecisionId: recoveryId,
-          supersessionId,
-          resumptionGeneration: 0,
+          decision: h.store.getRecoveryDecision(recoveryId)!,
+          lineage: lineageFingerprintSpec,
           replacement,
           manifest: h.store.getWorkspaceManifest(h.missionId)!,
           checkpoint: h.store.getTaskCheckpoint("CHK-original")!,
@@ -876,7 +905,15 @@ describe("orchestrator: durable blocked-mission repair", () => {
     releaseFirst();
 
     await assert.rejects(stale, /STALE_RECOVERY_GENERATION/);
-    assert.equal((await current).status, "COMPLETE");
+    assert.equal(
+      (await current).status,
+      "COMPLETE",
+      JSON.stringify({
+        decisions: h.store.listRecoveryDecisions(h.missionId),
+        tasks: h.store.listTasks(h.missionId),
+        findings: h.store.listFindings(h.missionId),
+      }),
+    );
     assert.equal(h.store.listRecoveryDecisions(h.missionId).length, 1);
     assert.equal(h.store.listRecoveryDecisions(h.missionId)[0]?.resumptionGeneration, 1);
   });
@@ -1173,6 +1210,20 @@ describe("orchestrator: durable blocked-mission repair", () => {
       await h.cleanup();
     }
   });
+
+  for (const phase of ["integration", "promotion"] as const) {
+    it(`prevents a stale real-backend repair from mutating the incumbent during ${phase}`, async () => {
+      const h = await realGateRepairHarness(false, phase);
+      try {
+        await assert.rejects(h.orchestrator.repairBlockedMission(h.missionId), /STALE_RECOVERY_GENERATION/);
+        assert.equal(h.store.listMissionResumptions(h.missionId).at(-1)?.generation, 1);
+        assert.equal(await h.git.headCommit(), h.baseSha);
+        assert.notEqual(h.store.getMission(h.missionId)?.status, "COMPLETE");
+      } finally {
+        await h.cleanup();
+      }
+    });
+  }
 
   it("does not accept candidate metadata invalidation as Git material change", async () => {
     const h = blockedRepairHarness({ withCandidate: true, category: "VALIDATION_FAILED", failedKind: "validation" });

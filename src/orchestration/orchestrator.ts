@@ -333,11 +333,15 @@ export class Orchestrator {
     let acquiredLease: Awaited<ReturnType<MissionOwnership["acquire"]>> | undefined;
     const recoveryLeaseKey = `${missionId}:${expectedResumptionGeneration}`;
     if (this.ownership) {
-      acquiredLease = await this.ownership.acquire(missionId);
+      acquiredLease = await this.ownership.acquire(missionId, {
+        resumptionGeneration: expectedResumptionGeneration,
+      });
       this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
       this.recoveryOwnershipByFlight.set(recoveryLeaseKey, acquiredLease);
     }
     try {
+      await this.broker.cancelStaleResumptionExecutions(missionId, expectedResumptionGeneration);
+      this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
       const repositoryDiagnostics = await this.broker.durableRepositoryDiagnostics(missionId);
       this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
       if (repositoryDiagnostics.length > 0) {
@@ -625,8 +629,19 @@ export class Orchestrator {
             : [failed.objective];
         const supersessionId = `${repairDecision.recoveryId}-SUP-${failed.task_id}`;
         const replacementFingerprints: Record<string, string> = {};
+        const replacementTaskIds = remaining.map(
+          (_deliverable, index) => `${repairDecision.recoveryId}-TSK-${failed.task_id}-${index + 1}`,
+        );
+        const lineageFingerprintSpec = {
+          supersessionId,
+          failedTaskId: failed.task_id,
+          repoId: failed.repo_id ?? "",
+          acceptanceIds: [...(failed.acceptance_ids ?? [])],
+          coverageFingerprint: taskCoverageFingerprint(failed),
+          replacementTaskIds,
+        };
         const replacements = remaining.map((deliverable, index) => {
-          const replacementId = `${repairDecision.recoveryId}-TSK-${failed.task_id}-${index + 1}`;
+          const replacementId = replacementTaskIds[index]!;
           const createsRepair = repairDecision.action === "CREATE_REPAIR_TASKS";
           const role = createsRepair ? "implementer" : failed.role;
           const mutatesRepo = createsRepair ? true : failed.mutates_repo;
@@ -659,9 +674,8 @@ export class Orchestrator {
           });
           const manifest = this.store.getWorkspaceManifest(missionId);
           const fingerprint = replacementRecoveryFingerprint({
-            recoveryDecisionId: repairDecision.recoveryId,
-            supersessionId,
-            resumptionGeneration: repairDecision.resumptionGeneration ?? 0,
+            decision: repairDecision,
+            lineage: lineageFingerprintSpec,
             replacement: replacementSpec,
             manifest: manifest!,
             checkpoint: checkpoint ?? null,
@@ -672,9 +686,8 @@ export class Orchestrator {
             this.recoveryTaskGenerations.set(existing.task_id, expectedResumptionGeneration);
             const existingFingerprint = manifest
               ? replacementRecoveryFingerprint({
-                  recoveryDecisionId: repairDecision.recoveryId,
-                  supersessionId,
-                  resumptionGeneration: repairDecision.resumptionGeneration ?? 0,
+                  decision: repairDecision,
+                  lineage: lineageFingerprintSpec,
                   replacement: replacementTaskFingerprintSpec(existing),
                   manifest,
                   checkpoint: checkpoint ?? null,
@@ -2318,7 +2331,30 @@ export class Orchestrator {
   }
 
   private async acquireTaskAuthority(task: OrchestrationTask): Promise<DispatchAuthority> {
-    const recoveryGeneration = this.recoveryTaskGenerations.get(task.task_id);
+    const currentResumptionGeneration = this.store.listMissionResumptions(task.mission_id).at(-1)?.generation ?? 0;
+    const lineageDecisions = this.store
+      .listTaskSupersessions(task.mission_id)
+      .filter((lineage) => lineage.replacementTaskIds.includes(task.task_id))
+      .flatMap((lineage) =>
+        lineage.recoveryDecisionId ? [this.store.getRecoveryDecision(lineage.recoveryDecisionId)] : [],
+      )
+      .filter((decision): decision is NonNullable<typeof decision> => decision !== undefined);
+    if (lineageDecisions.length > 1) {
+      throw new Error(`replacement task ${task.task_id} belongs to multiple recovery lineages`);
+    }
+    const activeRecoveryDecisions = this.store
+      .listRecoveryDecisions(task.mission_id)
+      .filter(
+        (decision) =>
+          (decision.resumptionGeneration ?? 0) === currentResumptionGeneration &&
+          decision.blockedEpisodeId !== undefined &&
+          (decision.status === "planned" || decision.status === "started") &&
+          !["STOP", "WAIT_FOR_REQUIREMENT", "PAUSE_FOR_PERSISTENCE", "PROBE_AND_BACKOFF"].includes(decision.action),
+      );
+    const durableRecoveryGeneration =
+      lineageDecisions[0]?.resumptionGeneration ??
+      (activeRecoveryDecisions.length === 1 ? activeRecoveryDecisions[0]?.resumptionGeneration : undefined);
+    const recoveryGeneration = durableRecoveryGeneration ?? this.recoveryTaskGenerations.get(task.task_id);
     const recoveryKey = recoveryGeneration === undefined ? undefined : `${task.mission_id}:${recoveryGeneration}`;
     const identity = recoveryKey
       ? this.recoveryOwnershipByFlight.get(recoveryKey)
@@ -2334,6 +2370,9 @@ export class Orchestrator {
       },
       get repositoryIdentity() {
         return held.repositoryIdentity;
+      },
+      get resumptionGeneration() {
+        return held.resumptionGeneration;
       },
       assertAuthoritative: () => held.assertAuthoritative(),
       onInvalidated: (listener) => held.onInvalidated(listener),

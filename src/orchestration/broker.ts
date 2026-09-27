@@ -476,11 +476,10 @@ export class ExecutionBroker {
       .find((entry) => entry.supersessionId === authority.supersessionId);
     const manifest = this.store.getWorkspaceManifest(input.missionId);
     const expected =
-      task && checkpoint && manifest
+      task && checkpoint && manifest && decision && lineage
         ? replacementRecoveryFingerprint({
-            recoveryDecisionId: authority.recoveryDecisionId,
-            supersessionId: authority.supersessionId,
-            resumptionGeneration: authority.resumptionGeneration,
+            decision,
+            lineage,
             replacement: replacementTaskFingerprintSpec(task),
             manifest,
             checkpoint,
@@ -575,10 +574,23 @@ export class ExecutionBroker {
 
   private assertReplacementSpec(input: ExecutionRequestInput): void {
     const task = this.store.getTask(input.taskId);
-    if (!task?.replacement_spec_fingerprint) return;
-    const lineage = this.store
+    if (!task) return;
+    const lineages = this.store
       .listTaskSupersessions(input.missionId)
-      .find((entry) => entry.replacementTaskIds.includes(input.taskId));
+      .filter((entry) => entry.replacementTaskIds.includes(input.taskId));
+    if (lineages.length === 0) {
+      if (task.replacement_spec_fingerprint) {
+        throw new Error("replacement replay fingerprint/full-spec mismatch: missing durable recovery lineage");
+      }
+      return;
+    }
+    if (lineages.length !== 1) {
+      throw new Error("replacement replay fingerprint/full-spec mismatch: multiple durable recovery lineages");
+    }
+    if (!task.replacement_spec_fingerprint) {
+      throw new Error("replacement replay fingerprint/full-spec mismatch: missing replacement fingerprint");
+    }
+    const lineage = lineages[0]!;
     const decision = lineage?.recoveryDecisionId
       ? this.store.getRecoveryDecision(lineage.recoveryDecisionId)
       : undefined;
@@ -590,9 +602,8 @@ export class ExecutionBroker {
       throw new Error("replacement replay fingerprint/full-spec mismatch: incomplete durable authority");
     }
     const expected = replacementRecoveryFingerprint({
-      recoveryDecisionId: decision.recoveryId,
-      supersessionId: lineage.supersessionId,
-      resumptionGeneration: decision.resumptionGeneration ?? 0,
+      decision,
+      lineage,
       replacement: replacementTaskFingerprintSpec(task),
       manifest,
       checkpoint,
@@ -833,6 +844,17 @@ export class ExecutionBroker {
     entry.abort.abort();
     await this.terminalizeAfterGrace(executionId, "canceled", taskId ?? entry.taskId);
     return true;
+  }
+
+  /** Revoke every active backend from an older explicit resumption before new dispatch. */
+  async cancelStaleResumptionExecutions(missionId: string, currentGeneration: number): Promise<void> {
+    const stale = [...this.active.entries()].filter(
+      ([, entry]) =>
+        entry.missionId === missionId &&
+        (entry.authority?.resumptionGeneration ?? entry.authority?.missionIdentity.resumptionGeneration ?? 0) !==
+          currentGeneration,
+    );
+    await Promise.all(stale.map(([executionId, entry]) => this.cancelExecution(executionId, entry.taskId)));
   }
 
   private terminalizeAfterGrace(
@@ -1861,6 +1883,8 @@ export class ExecutionBroker {
       model: (input.modelRequirements as { model?: string } | undefined)?.model ?? null,
       thinking_level: (input.modelRequirements as { thinking?: string } | undefined)?.thinking ?? null,
       mission_generation: input.authority?.missionIdentity.generation,
+      resumption_generation:
+        input.authority?.resumptionGeneration ?? input.authority?.missionIdentity.resumptionGeneration,
       fencing_token: input.authority?.missionIdentity.fencingToken,
       checkpoint_id: checkpointId,
       repo_id: input.repoId,

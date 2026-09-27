@@ -224,6 +224,9 @@ export class RepositoryRegistry {
     if (basename(canonical).includes("pi-eng-candidate-")) {
       throw new WorkspaceScopeError(`Candidate repository context is unavailable: ${canonical}`);
     }
+    if (this.activeManifests.size > 0) {
+      throw new WorkspaceScopeError(`Repository path is outside every active workspace manifest: ${canonical}`);
+    }
     return null;
   }
 

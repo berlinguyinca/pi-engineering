@@ -306,7 +306,7 @@ describe("WorkspaceManifestResolver path policy", () => {
     await registry.register(manifest);
     registry.activate(manifest.missionId, manifest.generation, manifest.hash, resolved.primaryRepoId);
 
-    assert.equal(await registry.resolve(unmatchedRepo.root), null);
+    await assert.rejects(registry.resolve(unmatchedRepo.root), /outside every active workspace manifest/i);
   });
 
   it("fails closed when a path matches more than one active manifest", async () => {

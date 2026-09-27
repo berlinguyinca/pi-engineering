@@ -257,6 +257,10 @@ describe("orchestration via real EngineeringRuntime (acceptance scenarios)", () 
     assert.match(search.content[0]?.text ?? "", /src\/scoped\.ts/);
     assert.doesNotMatch(search.content[0]?.text ?? "", /runtime not initialized|not a git repository/i);
     assert.equal(search.details.repoId, manifest.repositories[0]?.repoId);
+    await assert.rejects(
+      execute("scope-search-unmatched", { query: "scoped" }, undefined, undefined, { cwd: metaRoot }),
+      /outside every active workspace manifest/i,
+    );
   });
 
   it("blocks a protected explicit workspace as WORKSPACE_SCOPE_MISMATCH before planning", async () => {
