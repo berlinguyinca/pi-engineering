@@ -13,6 +13,7 @@ import {
 } from "../../src/orchestration/missionSnapshot.ts";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
 import { MissionObservability } from "../../src/orchestration/observability/MissionObservability.ts";
+import { MissionSupervisor } from "../../src/orchestration/supervisor.ts";
 import type { TaskCheckpoint } from "../../src/orchestration/types.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 
@@ -86,6 +87,74 @@ test("latest checkpoints use cross-execution chronology and durable order instea
     "CHK-same-time-later-event",
     "replay of the same durable event order selects the same checkpoint",
   );
+});
+
+test("equal-time checkpoint lineage updates retain durable event order live and after reopen", async () => {
+  const backend = JsonlEventStore.inMemory();
+  const store = MissionStore.open(backend);
+  const m = mission(store, "Durably ordered checkpoints");
+  for (const status of ["CLASSIFYING", "PLANNING", "READY", "EXECUTING"] as const) {
+    store.transitionMission(m.mission_id, status);
+  }
+  const task = store.createTask({
+    task_id: "TSK-checkpoint-order",
+    mission_id: m.mission_id,
+    kind: "agent",
+    role: "implementer",
+    objective: "retain the newest lineage event",
+  });
+  store.checkpointTask(
+    checkpoint({
+      checkpointId: "CHK-A",
+      executionId: "EXE-A",
+      missionId: m.mission_id,
+      taskId: task.task_id,
+      artifactRefs: ["artifact://A1"],
+      sequence: 1,
+    }),
+  );
+  store.checkpointTask(
+    checkpoint({
+      checkpointId: "CHK-B",
+      executionId: "EXE-B",
+      missionId: m.mission_id,
+      taskId: task.task_id,
+      artifactRefs: ["artifact://B1"],
+      sequence: 1,
+    }),
+  );
+  store.checkpointTask(
+    checkpoint({
+      checkpointId: "CHK-A",
+      executionId: "EXE-A",
+      missionId: m.mission_id,
+      taskId: task.task_id,
+      artifactRefs: ["artifact://A2"],
+      sequence: 2,
+    }),
+  );
+  const observability = new MissionObservability({ backend, store });
+  observability.missionCreated(m.mission_id, m.title);
+  await observability.flush();
+
+  assert.equal(latestTaskCheckpoints(store.listTaskCheckpoints(m.mission_id))[0]?.artifactRefs[0], "artifact://A2");
+  assert.deepEqual(observability.projection(m.mission_id)?.summary.preservedWork, ["artifact://A2"]);
+  const [liveStatus] = await new MissionSupervisor({ store, observability }).tick(m.mission_id);
+  assert.deepEqual(liveStatus?.preservedWork, ["artifact://A2"]);
+
+  await observability.flush();
+  const reopenedStore = MissionStore.open(backend);
+  const reopenedObservability = MissionObservability.open({ backend, store: reopenedStore });
+  assert.equal(
+    latestTaskCheckpoints(reopenedStore.listTaskCheckpoints(m.mission_id))[0]?.artifactRefs[0],
+    "artifact://A2",
+  );
+  assert.deepEqual(reopenedObservability.projection(m.mission_id)?.summary.preservedWork, ["artifact://A2"]);
+  const [reopenedStatus] = await new MissionSupervisor({
+    store: reopenedStore,
+    observability: reopenedObservability,
+  }).tick(m.mission_id);
+  assert.deepEqual(reopenedStatus?.preservedWork, ["artifact://A2"]);
 });
 
 test("snapshot contract remains additive after the reliability bump", async () => {

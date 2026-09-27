@@ -39,6 +39,13 @@ export interface MissionSupervisorOptions {
   recoveryPlanner?: RecoveryPlanner;
   now?: () => number;
   intervalMs?: number;
+  onError?: (diagnostic: SupervisorDiagnostic) => void;
+}
+
+export interface SupervisorDiagnostic {
+  occurredAt: string;
+  name: string;
+  message: string;
 }
 
 interface Diagnosis {
@@ -46,6 +53,13 @@ interface Diagnosis {
   category: FailureCategory;
   reason: string;
   task?: OrchestrationTask;
+}
+
+class StaleSupervisorResumptionError extends Error {
+  constructor(missionId: string, expectedGeneration: number, currentGeneration: number) {
+    super(`stale supervisor resumption for ${missionId}: expected ${expectedGeneration}, current ${currentGeneration}`);
+    this.name = "StaleSupervisorResumptionError";
+  }
 }
 
 /** Clock-driven mission watchdog. It never depends on a worker event to run. */
@@ -56,6 +70,8 @@ export class MissionSupervisor {
   private readonly classifier = new FailureClassifier();
   private readonly now: () => number;
   private readonly intervalMs: number;
+  private readonly onError?: (diagnostic: SupervisorDiagnostic) => void;
+  private readonly supervisorDiagnostics: SupervisorDiagnostic[] = [];
   private timer?: ReturnType<typeof setInterval>;
   private readonly missionTicks = new Map<string, Promise<SupervisorStatus>>();
 
@@ -65,6 +81,7 @@ export class MissionSupervisor {
     this.planner = options.recoveryPlanner ?? new RecoveryPlanner();
     this.now = options.now ?? Date.now;
     this.intervalMs = options.intervalMs ?? 30_000;
+    this.onError = options.onError;
     if (!Number.isFinite(this.intervalMs) || this.intervalMs <= 0) {
       throw new Error("MissionSupervisor intervalMs must be positive");
     }
@@ -72,7 +89,9 @@ export class MissionSupervisor {
 
   start(): void {
     if (this.timer) return;
-    this.timer = setInterval(() => void this.tick(), this.intervalMs);
+    this.timer = setInterval(() => {
+      void this.tick().catch((error: unknown) => this.handleIntervalFailure(error));
+    }, this.intervalMs);
     this.timer.unref?.();
   }
 
@@ -80,6 +99,10 @@ export class MissionSupervisor {
     if (!this.timer) return;
     clearInterval(this.timer);
     this.timer = undefined;
+  }
+
+  diagnostics(): SupervisorDiagnostic[] {
+    return this.supervisorDiagnostics.map((diagnostic) => ({ ...diagnostic }));
   }
 
   async reconcileOnStartup(beforeDispatch?: () => void | Promise<void>): Promise<SupervisorStatus[]> {
@@ -378,7 +401,30 @@ export class MissionSupervisor {
   private assertResumptionGeneration(missionId: string, expected: number): void {
     const current = this.currentResumptionGeneration(missionId);
     if (current !== expected) {
-      throw new Error(`stale supervisor resumption for ${missionId}: expected ${expected}, current ${current}`);
+      throw new StaleSupervisorResumptionError(missionId, expected, current);
+    }
+  }
+
+  private handleIntervalFailure(error: unknown): void {
+    if (error instanceof StaleSupervisorResumptionError) return;
+    const normalized = error instanceof Error ? error : new Error(String(error));
+    const diagnostic: SupervisorDiagnostic = {
+      occurredAt: new Date(this.now()).toISOString(),
+      name: normalized.name,
+      message: normalized.message,
+    };
+    this.supervisorDiagnostics.push(diagnostic);
+    if (this.supervisorDiagnostics.length > 100) this.supervisorDiagnostics.shift();
+    try {
+      this.onError?.({ ...diagnostic });
+    } catch (callbackError) {
+      const callbackFailure = callbackError instanceof Error ? callbackError : new Error(String(callbackError));
+      this.supervisorDiagnostics.push({
+        occurredAt: new Date(this.now()).toISOString(),
+        name: callbackFailure.name,
+        message: `Supervisor error callback failed: ${callbackFailure.message}`,
+      });
+      if (this.supervisorDiagnostics.length > 100) this.supervisorDiagnostics.shift();
     }
   }
 }

@@ -239,6 +239,9 @@ export class MissionStore {
   private readonly findings = new Map<string, ReviewFinding>();
   private readonly workspaceManifests = new Map<string, WorkspaceManifest>();
   private readonly taskCheckpoints = new Map<string, TaskCheckpoint>();
+  /** Replay-stable position of the most recent durable event for each checkpoint lineage. */
+  private readonly taskCheckpointLastEventOrdinals = new Map<string, number>();
+  private taskCheckpointEventOrdinal = 0;
   private readonly failureClassifications = new Map<string, FailureClassification>();
   private readonly recoveryDecisions = new Map<string, RecoveryDecision>();
   private readonly taskSupersessions = new Map<string, TaskSupersession>();
@@ -507,7 +510,7 @@ export class MissionStore {
       }
       case "task.checkpointed": {
         const checkpoint = e.payload.checkpoint as TaskCheckpoint;
-        if (checkpoint) this.taskCheckpoints.set(checkpoint.checkpointId, copyTaskCheckpoint(checkpoint));
+        if (checkpoint) this.recordTaskCheckpoint(checkpoint);
         break;
       }
       case "failure.classified": {
@@ -1634,7 +1637,7 @@ export class MissionStore {
     const task = this.tasks.get(checkpoint.taskId);
     if (!task || task.mission_id !== checkpoint.missionId) throw new Error(`unknown task ${checkpoint.taskId}`);
     const copy = copyTaskCheckpoint(checkpoint);
-    this.taskCheckpoints.set(copy.checkpointId, copy);
+    this.recordTaskCheckpoint(copy);
     this.emit("task.checkpointed", checkpoint.missionId, {
       actor: "system",
       checkpoint: copy,
@@ -1725,7 +1728,18 @@ export class MissionStore {
     return [...this.taskCheckpoints.values()]
       .filter((checkpoint) => (missionId ? checkpoint.missionId === missionId : true))
       .filter((checkpoint) => (taskId ? checkpoint.taskId === taskId : true))
+      .sort(
+        (left, right) =>
+          (this.taskCheckpointLastEventOrdinals.get(left.checkpointId) ?? 0) -
+          (this.taskCheckpointLastEventOrdinals.get(right.checkpointId) ?? 0),
+      )
       .map(copyTaskCheckpoint);
+  }
+
+  private recordTaskCheckpoint(checkpoint: TaskCheckpoint): void {
+    const copy = copyTaskCheckpoint(checkpoint);
+    this.taskCheckpoints.set(copy.checkpointId, copy);
+    this.taskCheckpointLastEventOrdinals.set(copy.checkpointId, ++this.taskCheckpointEventOrdinal);
   }
 
   classifyFailure(classification: FailureClassification): FailureClassification {

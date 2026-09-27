@@ -337,4 +337,72 @@ describe("MissionSupervisor", () => {
     );
     assert.notEqual(decisions[0]?.recoveryId, decisions[1]?.recoveryId);
   });
+
+  it("treats an interval tick invalidated by resume as cancellation without an unhandled rejection", async () => {
+    const h = harness();
+    const originalFlush = h.store.flush.bind(h.store);
+    let releaseFlush!: () => void;
+    let flushEntered!: () => void;
+    const entered = new Promise<void>((resolve) => {
+      flushEntered = resolve;
+    });
+    const gate = new Promise<void>((resolve) => {
+      releaseFlush = resolve;
+    });
+    let blocked = false;
+    h.store.flush = async () => {
+      if (!blocked) {
+        blocked = true;
+        flushEntered();
+        await gate;
+      }
+      await originalFlush();
+    };
+    const supervisor = new MissionSupervisor({
+      store: h.store,
+      observability: h.observability,
+      intervalMs: 1,
+    });
+    const unhandled: unknown[] = [];
+    const onUnhandled = (error: unknown) => unhandled.push(error);
+    process.on("unhandledRejection", onUnhandled);
+
+    try {
+      supervisor.start();
+      await entered;
+      supervisor.stop();
+      h.store.resumeMission(h.mission.mission_id, "invalidate blocked interval tick");
+      releaseFlush();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.deepEqual(unhandled, []);
+      assert.deepEqual(supervisor.diagnostics(), []);
+    } finally {
+      supervisor.stop();
+      releaseFlush();
+      process.off("unhandledRejection", onUnhandled);
+    }
+  });
+
+  it("surfaces unexpected interval tick failures through diagnostics and the error callback", async () => {
+    const h = harness();
+    let supervisor!: MissionSupervisor;
+    const reported = new Promise<{ message: string }>((resolve) => {
+      supervisor = new MissionSupervisor({
+        store: h.store,
+        observability: h.observability,
+        intervalMs: 1,
+        onError: resolve,
+      });
+      h.store.flush = async () => {
+        supervisor.stop();
+        throw new Error("injected interval failure");
+      };
+      supervisor.start();
+    });
+
+    const diagnostic = await reported;
+    assert.match(diagnostic.message, /injected interval failure/);
+    assert.match(supervisor.diagnostics()[0]?.message ?? "", /injected interval failure/);
+  });
 });

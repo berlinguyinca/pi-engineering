@@ -42,22 +42,35 @@ const EMPTY_SNAPSHOT: CheckpointSnapshot = {
   preservedUncommittedChanges: [],
 };
 
-/** Select one current checkpoint per task from durable event order. */
+/**
+ * Select one current checkpoint per task. Input order is the durable last-event
+ * ordinal exposed by MissionStore, and breaks ties between equal timestamps.
+ */
 export function latestTaskCheckpoints(checkpoints: readonly TaskCheckpoint[]): TaskCheckpoint[] {
-  const latestByTask = new Map<string, TaskCheckpoint>();
-  for (const checkpoint of checkpoints) {
+  const latestByTask = new Map<string, { checkpoint: TaskCheckpoint; durableEventOrdinal: number }>();
+  for (const [durableEventOrdinal, checkpoint] of checkpoints.entries()) {
     const current = latestByTask.get(checkpoint.taskId);
-    if (!current || checkpointSupersedes(checkpoint, current)) latestByTask.set(checkpoint.taskId, checkpoint);
+    if (
+      !current ||
+      checkpointSupersedes(checkpoint, durableEventOrdinal, current.checkpoint, current.durableEventOrdinal)
+    ) {
+      latestByTask.set(checkpoint.taskId, { checkpoint, durableEventOrdinal });
+    }
   }
-  return [...latestByTask.values()];
+  return [...latestByTask.values()].map(({ checkpoint }) => checkpoint);
 }
 
-function checkpointSupersedes(candidate: TaskCheckpoint, current: TaskCheckpoint): boolean {
+function checkpointSupersedes(
+  candidate: TaskCheckpoint,
+  candidateEventOrdinal: number,
+  current: TaskCheckpoint,
+  currentEventOrdinal: number,
+): boolean {
   if (candidate.checkpointId === current.checkpointId && candidate.sequence !== current.sequence) {
     return candidate.sequence > current.sequence;
   }
   const chronology = candidate.createdAt.localeCompare(current.createdAt);
-  return chronology >= 0;
+  return chronology > 0 || (chronology === 0 && candidateEventOrdinal > currentEventOrdinal);
 }
 
 /** Persists recoverable work only. It never changes task or acceptance status. */

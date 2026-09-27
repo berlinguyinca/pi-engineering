@@ -112,3 +112,29 @@ Addressed both high-severity follow-up findings with failing regressions before 
 - Generation checks surrounding `MissionStore.flush()` and the startup `beforeDispatch` callback.
 - Cleanup and coexistence of overlapping per-generation supervisor flight keys.
 - Checkpoint ordering when different lineages share an identical `createdAt`; later durable event order is the replay-stable tie-breaker.
+
+## Fix round 3
+
+Addressed both high-severity replay and detached-timer findings with failing regressions before implementation:
+
+- `MissionStore` now materializes an explicit last-event ordinal for each checkpoint lineage on both live publication and replay. Checkpoint listings are sorted by that replay-stable ordinal, so the centralized latest-checkpoint helper compares cross-lineage timestamps and then durable event order. Equal-time `A1, B1, A2` events therefore select `A2` in the live store and after reopen; supervisor status and observability preserved-work projections consume the same result.
+- Supervisor interval ticks now attach a rejection handler. A typed stale-resumption error is treated as expected cancellation when a blocked tick is invalidated by resume. Every other detached tick failure is retained in bounded, inspectable diagnostics and delivered to the optional error callback; callback failures are also retained rather than creating another unhandled rejection.
+
+### Fix-round RED evidence
+
+- `node --test --experimental-strip-types test/unit/orchestration-snapshot-observability.test.ts test/unit/mission-supervisor.test.ts`
+  - Result before implementation: **14 passed, 3 failed**. The real-store equal-time lineage test selected `B1`; stale and unexpected interval failures both escaped as unhandled rejected promises.
+
+### Fix-round verification
+
+- Expanded focused reliability/checkpoint matrix: **192 passed, 0 failed**.
+- `npm run typecheck`: passed.
+- `npm run lint -- --diagnostic-level=error`: passed; Biome checked 587 files.
+- `npm test`: **2572 passed, 0 failed, 1 skipped** (Postgres integration requires `TEST_DATABASE_URL`).
+- `git diff --check`: passed.
+
+### Fix-round reviewer focus
+
+- Replay parity of the per-lineage last-event ordinal when one checkpoint ID is updated after another lineage at the same `createdAt`.
+- Centralized selection precedence: sequence is lineage-local, while cross-lineage chronology uses `createdAt` then durable event ordinal.
+- Detached interval behavior: only typed stale-generation cancellation is ignored; operational failures remain visible through `diagnostics()` and `onError`.
