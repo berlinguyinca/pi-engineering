@@ -159,3 +159,45 @@ Implemented a real cross-process JSONL writer lock and replay-backed mission/rep
 - If persistence is temporarily unavailable, the diagnostic event remains in the MissionStore ordered retry queue and the persistence failure is immediately operator-visible through `persistenceDiagnostics()`; a later successful flush makes it durable.
 - Authority loss still leaves the task `RUNNING` for the explicit orphan-reconciliation work in Tasks 8/9. This round preserves the typed late-result rejection and does not falsely mark the task successful.
 - Local recovery still assumes one shared filesystem, hostname, and PID namespace. The deferred Git path-enumeration fail-open boundary remains unchanged.
+
+## Fix Round 3
+
+### Outcome
+
+- Recovery claim identity is now encoded in the sole entry of a fully prepared, non-empty candidate directory and published by one atomic rename. A killed claimant cannot leave a visible partial identity payload.
+- Dead claims are atomically moved to an identity-specific, non-empty tombstone. The tombstone is retained so a delayed second reaper of claim C cannot rename or remove replacement claim D.
+- Live, foreign-host, malformed, and otherwise unverifiable claims remain fail-closed. The local shared-filesystem/hostname/PID-namespace boundary is unchanged.
+- Deterministic recovery hooks exercise exact post-publication crash and pre-reap race points without timing-dependent tests.
+
+### RED evidence
+
+- `node --test --test-name-pattern="recovery claimant is killed|live process|reapers race" test/unit/platform-eventstore.test.ts`
+  - 3 tests, 0 passed, 3 failed.
+  - The prior implementation had no atomic claim-publication/reap hooks; each claimant exited before reaching the required post-publication checkpoint, proving the new crash/race scenarios were unsupported.
+
+### GREEN evidence
+
+- `node --test --test-name-pattern="recovery claimant is killed|live process|reapers race" test/unit/platform-eventstore.test.ts`
+  - 3 passed, 0 failed.
+- `node --test test/unit/platform-eventstore.test.ts test/unit/mission-ownership.test.ts test/unit/orchestration-missionstore.test.ts`
+  - 38 passed, 0 failed.
+- `npm run typecheck`
+  - Passed (`tsc --noEmit`).
+- `npm run lint`
+  - Passed (`biome check .`; 578 files checked, no fixes applied).
+- `npm test`
+  - 2,319 tests discovered: 2,318 passed, 0 failed, 1 skipped in 30.329s.
+  - The sole skip remains the OpenViking Postgres round-trip because `TEST_DATABASE_URL` is unset.
+
+### Files changed
+
+- `src/platform/eventstore/fileLock.ts` — atomic non-empty claim-directory publication, path-encoded claimant identity, exact-identity reaping tombstones, and deterministic recovery hooks.
+- `test/unit/platform-eventstore.test.ts` — actual killed claimant after atomic publication, live claimant preservation, and controlled two-reaper/replacement race coverage.
+
+### Self-review and concerns
+
+- Publishing a claim no longer depends on readable file contents: incomplete candidates are never installed at the fixed claim path.
+- A successful reaper leaves the moved claim directory as a tombstone keyed by claimant token. This deliberately trades bounded per-crash filesystem debris for safety against arbitrarily delayed reapers; normal live-claim release is still cleaned up.
+- The fixed claim path accepts only one well-formed identity entry. Legacy file claims and malformed directories are unverifiable and therefore fail closed rather than being guessed stale.
+- Existing live-winner exclusion remains covered after the replacement-claim race settles.
+- The deferred Git path-enumeration fail-open boundary and Tasks 8/9 orphan reconciliation remain out of scope.

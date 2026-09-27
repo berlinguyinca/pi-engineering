@@ -1,13 +1,13 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { createHash } from "node:crypto";
-import { appendFile, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { appendFile, mkdtemp, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { EventStore } from "../../src/ledger/EventStore.ts";
 import { LedgerEventStoreBackend } from "../../src/platform/eventstore/adapters.ts";
+import { ExclusiveFileLock } from "../../src/platform/eventstore/fileLock.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 
 const evt = (i: number) => ({
@@ -22,6 +22,9 @@ const evt = (i: number) => ({
 
 const jsonlModule = pathToFileURL(
   fileURLToPath(new URL("../../src/platform/eventstore/jsonl.ts", import.meta.url)),
+).href;
+const fileLockModule = pathToFileURL(
+  fileURLToPath(new URL("../../src/platform/eventstore/fileLock.ts", import.meta.url)),
 ).href;
 
 async function startStoreOwner(file: string) {
@@ -57,33 +60,40 @@ async function waitForExit(child: ReturnType<typeof spawn>): Promise<void> {
   await new Promise<void>((resolve) => child.once("exit", () => resolve()));
 }
 
-async function startRecoveryClaimant(claimPath: string) {
+async function startRecoveryClaimant(file: string) {
   const script = `
-    import { writeFile } from "node:fs/promises";
-    import { hostname } from "node:os";
-    await writeFile(${JSON.stringify(claimPath)}, JSON.stringify({
-      pid: process.pid,
-      host: hostname(),
-      openedAt: new Date().toISOString(),
-      ownerToken: "killed-recovery-claimant",
-    }) + "\\n", { flag: "wx" });
-    process.stdout.write("READY\\n");
-    setInterval(() => {}, 1_000);
+    import { ExclusiveFileLock } from ${JSON.stringify(fileLockModule)};
+    await ExclusiveFileLock.acquire(${JSON.stringify(file)}, {
+      afterRecoveryClaimPublished: async (claimPath) => {
+        process.stdout.write("READY:" + claimPath + "\\n");
+        setInterval(() => {}, 1_000);
+        await new Promise(() => {});
+      },
+    });
   `;
   const child = spawn(process.execPath, ["--input-type=module", "--eval", script], {
     stdio: ["ignore", "pipe", "pipe"],
   });
-  await new Promise<void>((resolve, reject) => {
+  const claimPath = await new Promise<string>((resolve, reject) => {
     let stderr = "";
     child.stderr!.on("data", (chunk) => {
       stderr += String(chunk);
     });
     child.stdout!.on("data", (chunk) => {
-      if (String(chunk).includes("READY")) resolve();
+      const match = String(chunk).match(/READY:(.+)\n/);
+      if (match?.[1]) resolve(match[1]);
     });
     child.once("exit", (code) => reject(new Error(`recovery claimant exited early (${code}): ${stderr}`)));
   });
-  return child;
+  return { child, claimPath };
+}
+
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
 }
 
 function startRacingOwner(file: string) {
@@ -242,10 +252,13 @@ describe("EventStore backends", () => {
         ownerToken: staleOwnerToken,
       })}\n`,
     );
-    const staleHash = createHash("sha256").update(staleOwnerToken).digest("hex").slice(0, 24);
-    const killedClaimant = await startRecoveryClaimant(`${file}.lock.recover.${staleHash}`);
-    killedClaimant.kill("SIGKILL");
-    await waitForExit(killedClaimant);
+    const killedClaimant = await startRecoveryClaimant(file);
+    assert.equal((await stat(killedClaimant.claimPath)).isDirectory(), true);
+    const atomicIdentity = await readdir(killedClaimant.claimPath);
+    assert.equal(atomicIdentity.length, 1, "published claim identity is complete in one directory entry");
+    assert.match(atomicIdentity[0]!, /^owner\./);
+    killedClaimant.child.kill("SIGKILL");
+    await waitForExit(killedClaimant.child);
 
     const contender = startRacingOwner(file);
     const outcome = await outcomeWithin(contender);
@@ -272,28 +285,83 @@ describe("EventStore backends", () => {
         ownerToken: staleOwnerToken,
       })}\n`,
     );
-    const staleHash = createHash("sha256").update(staleOwnerToken).digest("hex").slice(0, 24);
-    const claimPath = `${file}.lock.recover.${staleHash}`;
-    await writeFile(
-      claimPath,
-      `${JSON.stringify({
-        pid: process.pid,
-        host: hostname(),
-        openedAt: "2026-01-01T00:00:01.000Z",
-        ownerToken: "live-recovery-claimant",
-      })}\n`,
-    );
+    const claimant = await startRecoveryClaimant(file);
+    const before = await readdir(claimant.claimPath);
 
     const contender = startRacingOwner(file);
     const outcome = await outcomeWithin(contender);
     try {
       assert.equal(outcome, "blocked");
-      const claim = JSON.parse(await readFile(claimPath, "utf8")) as { ownerToken: string };
-      assert.equal(claim.ownerToken, "live-recovery-claimant");
+      assert.deepEqual(await readdir(claimant.claimPath), before);
     } finally {
       if (outcome === "ready") contender.child.send("close");
       else contender.child.kill("SIGKILL");
       await waitForExit(contender.child);
+      claimant.child.kill("SIGKILL");
+      await waitForExit(claimant.child);
+    }
+  });
+
+  it("keeps a replacement live claim when two dead-claim reapers race", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pie-store-reaper-race-"));
+    const file = join(dir, "events.jsonl");
+    await writeFile(
+      `${file}.lock`,
+      `${JSON.stringify({
+        pid: 2_000_000_000,
+        host: hostname(),
+        openedAt: "2026-01-01T00:00:00.000Z",
+        ownerToken: "stale-owner-reaper-race",
+      })}\n`,
+    );
+    const deadClaimant = await startRecoveryClaimant(file);
+    deadClaimant.child.kill("SIGKILL");
+    await waitForExit(deadClaimant.child);
+
+    const aBefore = deferred();
+    const bBefore = deferred();
+    const releaseAReap = deferred();
+    const releaseBReap = deferred();
+    const aReplacement = deferred();
+    const releaseAReplacement = deferred();
+    let lockA: ExclusiveFileLock | undefined;
+    const acquireA = ExclusiveFileLock.acquire(file, {
+      beforeRecoveryClaimReap: async () => {
+        aBefore.resolve();
+        await releaseAReap.promise;
+      },
+      afterRecoveryClaimPublished: async () => {
+        aReplacement.resolve();
+        await releaseAReplacement.promise;
+      },
+    }).then((lock) => {
+      lockA = lock;
+      return lock;
+    });
+    const acquireB = ExclusiveFileLock.acquire(file, {
+      beforeRecoveryClaimReap: async () => {
+        bBefore.resolve();
+        await releaseBReap.promise;
+      },
+    });
+
+    try {
+      await Promise.all([aBefore.promise, bBefore.promise]);
+      releaseAReap.resolve();
+      await aReplacement.promise;
+      releaseBReap.resolve();
+      await assert.rejects(acquireB, /recovery.*claimed/i);
+      await assert.rejects(() => ExclusiveFileLock.acquire(file), /recovery.*claimed/i);
+      releaseAReplacement.resolve();
+      const winner = await acquireA;
+      assert.equal(winner.owner.ownerToken, lockA?.owner.ownerToken);
+      await assert.rejects(() => ExclusiveFileLock.acquire(file), /writer lock.*pid/i);
+    } finally {
+      releaseAReap.resolve();
+      releaseBReap.resolve();
+      releaseAReplacement.resolve();
+      await Promise.allSettled([acquireA, acquireB]);
+      lockA?.release();
     }
   });
 
