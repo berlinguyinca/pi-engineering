@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { visibleWidth } from "@earendil-works/pi-tui";
 import type { PanelStateShape } from "../../src/panel/PanelState.ts";
 import { buildRows, clampSelection } from "../../src/panel/tree.ts";
 
@@ -46,6 +47,32 @@ test("tree: a run renders its work item, files, findings and spend across the ta
   assert.match(labelsOn("files"), /src\/gateway\/signals\.ts/);
   assert.match(labelsOn("reviews"), /retry loop can spin/);
   assert.match(labelsOn("tokens"), /opus-5/);
+});
+
+test("tree: mission recovery is rendered as compact token, reason, and next-action rows at narrow width", () => {
+  const rows = buildRows(
+    {
+      ...runState,
+      run: {
+        ...runState.run!,
+        phase: "acceptance 0/14 (0%)",
+        goal: "Agent failed · workers 0 active",
+        missionStatus: {
+          token: "R2/3 STOP→provide",
+          reason: `repeated recovery fingerprint exhausted ${"detail ".repeat(30)}`,
+          next: `provide new material evidence ${"condition ".repeat(30)}`,
+        },
+      },
+    } as PanelStateShape,
+    allExpanded,
+    "files",
+    0,
+    34,
+  );
+  assert.match(rows[0]?.label ?? "", /^R2\/3 STOP→provide/);
+  assert.match(rows[1]?.label ?? "", /^Why: repeated recovery/);
+  assert.match(rows[2]?.label ?? "", /^Next: provide new material/);
+  assert.ok(rows.slice(0, 3).every((row) => visibleWidth(row.label) <= 34));
 });
 
 test("tree: a finding carries its severity, reviewing role and model", () => {

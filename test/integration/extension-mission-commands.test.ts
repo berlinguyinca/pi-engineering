@@ -7,16 +7,19 @@ import { test } from "node:test";
 import { promisify } from "node:util";
 import extension, * as extensionModule from "../../extensions/index.ts";
 import { Orchestrator } from "../../src/orchestration/orchestrator.ts";
+import { MissionSupervisor } from "../../src/orchestration/supervisor.ts";
 import { EngineeringRuntime, type RuntimeMissionActivityEvent } from "../../src/runtime/EngineeringRuntime.ts";
 import { FakeWorkerExecutor } from "../../src/workers/FakeWorkerExecutor.ts";
 
 const execFileAsync = promisify(execFile);
 type Command = { handler: (args: string, ctx: unknown) => Promise<void> | void };
+type Handler = (event: unknown, ctx: unknown) => Promise<unknown> | unknown;
 
-function loadCommands(): Map<string, Command> {
+function loadHarness(): { commands: Map<string, Command>; handlers: Map<string, Handler[]> } {
   const commands = new Map<string, Command>();
+  const handlers = new Map<string, Handler[]>();
   const pi = {
-    on: () => {},
+    on: (name: string, handler: Handler) => handlers.set(name, [...(handlers.get(name) ?? []), handler]),
     registerCommand: (name: string, options: Command) => commands.set(name, options),
     registerTool: () => {},
     registerShortcut: () => {},
@@ -29,7 +32,11 @@ function loadCommands(): Map<string, Command> {
     events: { on: () => {}, emit: () => {} },
   };
   (extension as unknown as (api: unknown) => void)(pi);
-  return commands;
+  return { commands, handlers };
+}
+
+function loadCommands(): Map<string, Command> {
+  return loadHarness().commands;
 }
 
 function commandContext(cwd: string) {
@@ -96,15 +103,98 @@ test("/mission resume parses before a new request and is idempotent through repa
     const command = loadCommands().get("mission");
     assert.ok(command);
     const { ctx, notices } = commandContext(root);
-    await command.handler(`resume ${mission.mission_id}`, ctx);
-    await command.handler(`resume ${mission.mission_id}`, ctx);
+    await Promise.all([
+      command.handler(`resume ${mission.mission_id}`, ctx),
+      command.handler(`resume ${mission.mission_id}`, ctx),
+    ]);
 
-    assert.deepEqual(repaired, [mission.mission_id, mission.mission_id]);
+    assert.deepEqual(repaired, [mission.mission_id]);
     assert.equal(runtime.missionStore!.listMissionResumptions(mission.mission_id).length, 1);
     assert.match(notices.at(-1)?.text ?? "", /Recovery .*manual recovery.*BLOCKED/i);
     await runtime.close();
   } finally {
     Orchestrator.prototype.repairBlockedMission = originalRepair;
+    Orchestrator.prototype.orchestrate = originalOrchestrate;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("/mission resume requires a current stop, normalizes executing state, and rejects terminal or unstopped missions", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-eng-extension-resume-contract-"));
+  const originalRepair = Orchestrator.prototype.repairBlockedMission;
+  const repairedStatuses: string[] = [];
+  try {
+    const runtime = await EngineeringRuntime.open({ cwd: root, worker: new FakeWorkerExecutor({}) });
+    runtime.missionSupervisor?.stop();
+    const create = (title: string) =>
+      runtime.missionStore!.createMission({
+        title,
+        goal: title,
+        user_request: title,
+        repository: root,
+        base_ref: "",
+        risk_profile: "low",
+        workflow_class: "engineering",
+      });
+    const stopped = create("stopped executing");
+    runtime.missionStore!.transitionMission(stopped.mission_id, "CLASSIFYING");
+    runtime.missionStore!.transitionMission(stopped.mission_id, "READY");
+    runtime.missionStore!.transitionMission(stopped.mission_id, "EXECUTING");
+    runtime.missionStore!.stopMission(stopped.mission_id, {
+      reason: "worker vanished",
+      attemptedRecoveries: ["R-1"],
+      preservedWork: ["candidate/ref"],
+      resumeCondition: "worker capacity returns",
+    });
+    const unstopped = create("not stopped");
+    const terminal = create("terminal");
+    runtime.missionStore!.transitionMission(terminal.mission_id, "CLASSIFYING");
+    runtime.missionStore!.transitionMission(terminal.mission_id, "CANCELED");
+    Orchestrator.prototype.repairBlockedMission = async (missionId: string) => {
+      repairedStatuses.push(runtime.missionStore!.getMission(missionId)!.status);
+      return runtime.missionStore!.getMission(missionId)!;
+    };
+
+    const command = loadCommands().get("mission")!;
+    const { ctx, notices } = commandContext(root);
+    await command.handler(`resume ${stopped.mission_id}`, ctx);
+    await command.handler(`resume ${unstopped.mission_id}`, ctx);
+    await command.handler(`resume ${terminal.mission_id}`, ctx);
+
+    assert.ok(repairedStatuses.length >= 1);
+    assert.ok(repairedStatuses.every((status) => status === "BLOCKED"));
+    assert.equal(runtime.missionStore!.listMissionResumptions(stopped.mission_id).length, 1);
+    assert.match(notices.at(-2)?.text ?? "", /no current durable stop/i);
+    assert.match(notices.at(-1)?.text ?? "", /terminal/i);
+    assert.ok(
+      runtime.missionStore!.listMissionStops(stopped.mission_id).length >= 2,
+      "failed material recovery stays stopped",
+    );
+    await runtime.close();
+  } finally {
+    Orchestrator.prototype.repairBlockedMission = originalRepair;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("/mission rejects every malformed resume prefix without creating a new mission", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-eng-extension-resume-syntax-"));
+  const originalOrchestrate = Orchestrator.prototype.orchestrate;
+  let orchestrated = 0;
+  try {
+    Orchestrator.prototype.orchestrate = (async () => {
+      orchestrated++;
+      throw new Error("malformed resume reached orchestration");
+    }) as typeof Orchestrator.prototype.orchestrate;
+    const command = loadCommands().get("mission")!;
+    const { ctx, notices } = commandContext(root);
+    for (const input of ["resume", "resume MSN-1 extra", "resume:MSN-1", "resume=MSN-1"]) {
+      await command.handler(input, ctx);
+    }
+    assert.equal(orchestrated, 0);
+    assert.equal(notices.length, 4);
+    assert.ok(notices.every((notice) => /\/mission resume <missionId>/.test(notice.text)));
+  } finally {
     Orchestrator.prototype.orchestrate = originalOrchestrate;
     await rm(root, { recursive: true, force: true });
   }
@@ -150,6 +240,80 @@ test("/mission-status renders acceptance-first progress and actionable stop deta
     assert.match(text, /stop: repeated recovery fingerprint exhausted/i);
     await runtime.close();
   } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("/mission-status labels legacy acceptance unavailable and derives truthful workflow progress", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-eng-extension-legacy-status-"));
+  try {
+    const runtime = await EngineeringRuntime.open({ cwd: root, worker: new FakeWorkerExecutor({}) });
+    const mission = runtime.missionStore!.createMission({
+      title: "legacy mission",
+      goal: "legacy mission",
+      user_request: "legacy mission",
+      repository: root,
+      base_ref: "",
+      risk_profile: "low",
+      workflow_class: "engineering",
+    });
+    const done = runtime.missionStore!.createTask({
+      mission_id: mission.mission_id,
+      kind: "process",
+      role: "planner",
+      objective: "done",
+    });
+    runtime.missionStore!.transitionTask(done.task_id, "READY");
+    runtime.missionStore!.transitionTask(done.task_id, "SUCCEEDED");
+    runtime.missionStore!.createTask({
+      mission_id: mission.mission_id,
+      kind: "agent",
+      role: "implementer",
+      objective: "pending",
+    });
+    runtime.missionStore!.transitionMission(mission.mission_id, "CLASSIFYING");
+    runtime.missionStore!.transitionMission(mission.mission_id, "CANCELED");
+    const command = loadCommands().get("mission-status")!;
+    const { ctx, notices } = commandContext(root);
+    await command.handler("", ctx);
+    const text = notices.at(-1)?.text ?? "";
+    assert.match(text, /acceptance unavailable \(legacy\)/i);
+    assert.match(text, /workflow 1\/2 \(50%\)/i);
+    assert.doesNotMatch(text, /acceptance 0\/0 \(0%\)/i);
+    await runtime.close();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("session shutdown closes the runtime and stops its mission supervisor", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-eng-extension-shutdown-"));
+  const originalStop = MissionSupervisor.prototype.stop;
+  let stops = 0;
+  const previous = new Map<string, string | undefined>();
+  const optionalProviderKeys = Object.keys(process.env).filter((key) =>
+    /METABOLOMICS|OPENVIKING|INFERWEAVE|PI_GATEWAY_HEALTH/.test(key),
+  );
+  for (const key of optionalProviderKeys) {
+    previous.set(key, process.env[key]);
+    delete process.env[key];
+  }
+  try {
+    MissionSupervisor.prototype.stop = function () {
+      stops++;
+      return originalStop.call(this);
+    };
+    const { handlers } = loadHarness();
+    const { ctx } = commandContext(root);
+    for (const handler of handlers.get("session_start") ?? []) await handler({}, ctx);
+    for (const handler of handlers.get("session_shutdown") ?? []) await handler({}, ctx);
+    assert.ok(stops > 0, "session shutdown must stop the cached runtime's supervisor");
+  } finally {
+    MissionSupervisor.prototype.stop = originalStop;
+    for (const [key, value] of previous) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
     await rm(root, { recursive: true, force: true });
   }
 });

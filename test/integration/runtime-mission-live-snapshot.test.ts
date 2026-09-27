@@ -5,11 +5,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { promisify } from "node:util";
+import { BlackholeManager } from "../../src/blackhole/BlackholeManager.ts";
 import type { MissionSnapshotFile } from "../../src/orchestration/missionSnapshot.ts";
 import { Orchestrator } from "../../src/orchestration/orchestrator.ts";
 import { MissionSupervisor } from "../../src/orchestration/supervisor.ts";
 import { EngineeringRuntime } from "../../src/runtime/EngineeringRuntime.ts";
 import { FakeWorkerExecutor } from "../../src/workers/FakeWorkerExecutor.ts";
+import { PiWorkerExecutor } from "../../src/workers/PiWorkerExecutor.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -114,6 +116,160 @@ test("snapshot preserves the complete actionable stop payload", async () => {
     );
     await runtime.close();
   } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("periodic supervisor ticks consume orphan recovery, normalize BLOCKED, and republish status", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-eng-periodic-supervisor-"));
+  const activities: string[] = [];
+  const originalRepair = Orchestrator.prototype.repairBlockedMission;
+  try {
+    const runtime = await EngineeringRuntime.open({
+      cwd: root,
+      worker: new FakeWorkerExecutor({}),
+      onMissionActivity: (event) => activities.push(`${event.missionId}:${event.state}`),
+    });
+    const mission = runtime.missionStore!.createMission({
+      title: "periodic orphan",
+      goal: "repair after startup",
+      user_request: "repair after startup",
+      repository: root,
+      base_ref: "",
+      risk_profile: "low",
+      workflow_class: "engineering",
+    });
+    runtime.missionStore!.transitionMission(mission.mission_id, "CLASSIFYING");
+    runtime.missionStore!.transitionMission(mission.mission_id, "READY");
+    runtime.missionStore!.transitionMission(mission.mission_id, "EXECUTING");
+    runtime.missionObservability!.missionCreated(mission.mission_id, mission.title);
+    activities.length = 0;
+    const repaired: string[] = [];
+    Orchestrator.prototype.repairBlockedMission = async (missionId: string) => {
+      repaired.push(missionId);
+      return runtime.missionStore!.getMission(missionId)!;
+    };
+
+    await runtime.missionSupervisor!.tick(mission.mission_id);
+
+    assert.deepEqual(repaired, [mission.mission_id]);
+    assert.equal(runtime.missionStore!.getMission(mission.mission_id)?.status, "BLOCKED");
+    assert.ok(activities.some((entry) => entry.startsWith(`${mission.mission_id}:`)));
+    const snapshot = await runtime.publishMissionSnapshot();
+    assert.equal(snapshot?.missions[0]?.status, "BLOCKED");
+    await runtime.close();
+  } finally {
+    Orchestrator.prototype.repairBlockedMission = originalRepair;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("startup settles one failed repair durably and continues repairing other missions", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-eng-startup-independent-"));
+  const workDir = join(root, ".pi-eng");
+  const originalRepair = Orchestrator.prototype.repairBlockedMission;
+  try {
+    const first = await EngineeringRuntime.open({ cwd: root, workDir, worker: new FakeWorkerExecutor({}) });
+    const createBlocked = (title: string) => {
+      const mission = first.missionStore!.createMission({
+        title,
+        goal: title,
+        user_request: title,
+        repository: root,
+        base_ref: "",
+        risk_profile: "low",
+        workflow_class: "engineering",
+      });
+      first.missionStore!.transitionMission(mission.mission_id, "CLASSIFYING");
+      first.missionStore!.transitionMission(mission.mission_id, "BLOCKED");
+      return mission;
+    };
+    const broken = createBlocked("broken repair");
+    const healthy = createBlocked("healthy repair");
+    await first.close();
+    const calls: string[] = [];
+    Orchestrator.prototype.repairBlockedMission = async (missionId: string) => {
+      calls.push(missionId);
+      if (missionId === broken.mission_id) throw new Error("one mission repair failed");
+      return healthy;
+    };
+
+    const reopened = await EngineeringRuntime.open({ cwd: root, workDir, worker: new FakeWorkerExecutor({}) });
+
+    assert.deepEqual(new Set(calls), new Set([broken.mission_id, healthy.mission_id]));
+    assert.match(reopened.missionStore!.listMissionStops(broken.mission_id).at(-1)?.reason ?? "", /repair failed/i);
+    assert.ok(reopened.missionStore!.listFailureClassifications(broken.mission_id).length > 0);
+    assert.ok(reopened.missionSupervisor, "one mission failure must not prevent periodic supervision");
+    await reopened.close();
+  } finally {
+    Orchestrator.prototype.repairBlockedMission = originalRepair;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("fallible initialization completes before the supervisor starts", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-eng-supervisor-init-order-"));
+  const originalOpen = BlackholeManager.open;
+  const originalStart = MissionSupervisor.prototype.start;
+  let starts = 0;
+  try {
+    BlackholeManager.open = async () => {
+      throw new Error("blackhole init failed");
+    };
+    MissionSupervisor.prototype.start = function () {
+      starts++;
+      return originalStart.call(this);
+    };
+    await assert.rejects(
+      EngineeringRuntime.open({
+        cwd: root,
+        worker: new FakeWorkerExecutor({}),
+        blackhole: { config: { enabled: true } },
+      }),
+      /blackhole init failed/,
+    );
+    assert.equal(starts, 0, "no supervisor interval may survive failed initialization");
+  } finally {
+    BlackholeManager.open = originalOpen;
+    MissionSupervisor.prototype.start = originalStart;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("custom tools are bound before startup recovery can dispatch a repair worker", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-eng-repair-tool-order-"));
+  const workDir = join(root, ".pi-eng");
+  const originalSetTools = PiWorkerExecutor.prototype.setCustomTools;
+  const originalRepair = Orchestrator.prototype.repairBlockedMission;
+  let toolsBound = false;
+  try {
+    const first = await EngineeringRuntime.open({ cwd: root, workDir, worker: new FakeWorkerExecutor({}) });
+    const mission = first.missionStore!.createMission({
+      title: "tool-bound repair",
+      goal: "repair with tools",
+      user_request: "repair with tools",
+      repository: root,
+      base_ref: "",
+      risk_profile: "low",
+      workflow_class: "engineering",
+    });
+    first.missionStore!.transitionMission(mission.mission_id, "CLASSIFYING");
+    first.missionStore!.transitionMission(mission.mission_id, "BLOCKED");
+    await first.close();
+    PiWorkerExecutor.prototype.setCustomTools = function (tools) {
+      toolsBound = true;
+      return originalSetTools.call(this, tools);
+    };
+    Orchestrator.prototype.repairBlockedMission = async () => {
+      assert.equal(toolsBound, true, "repair dispatch must see the runtime's semantic tools");
+      return mission;
+    };
+
+    const reopened = await EngineeringRuntime.open({ cwd: root, workDir });
+    await reopened.close();
+  } finally {
+    PiWorkerExecutor.prototype.setCustomTools = originalSetTools;
+    Orchestrator.prototype.repairBlockedMission = originalRepair;
     await rm(root, { recursive: true, force: true });
   }
 });

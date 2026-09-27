@@ -221,6 +221,27 @@ test("task: names the work item and phase", () => {
   assert.match(renderStatus(s, 200, cfg, 0), /WI-12 implement/);
 });
 
+test("mission status: recovery token survives narrow layout and reason plus next action survive wide layout", () => {
+  const task = {
+    workItemId: "MSN-1",
+    phase: "acceptance 0/14 (0%)",
+    label: "Agent failed · workers 0 active",
+    missionStatus: {
+      token: "R2/3 STOP→provide",
+      reason: `repeated recovery fingerprint exhausted ${"detail ".repeat(30)}`,
+      next: `provide new material evidence ${"condition ".repeat(30)}`,
+    },
+  } as HarnessStatusState["task"];
+
+  const narrow = renderStatus(state({ task }), 24, cfg, 0);
+  assert.match(narrow, /^R2\/3 STOP→provide/);
+  assert.doesNotMatch(narrow, /^MSN-1 .*0%/);
+
+  const wide = renderStatus(state({ task }), 2_000, cfg, 0);
+  assert.match(wide, /why repeated recovery fingerprint exhausted/);
+  assert.match(wide, /next provide new material evidence/);
+});
+
 test("task: appends a truncated goal label when there is room", () => {
   const s = state({
     task: { workItemId: "WI-12", phase: "implement", label: "add retry to the gateway client for real" },

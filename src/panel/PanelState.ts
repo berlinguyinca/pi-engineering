@@ -61,6 +61,12 @@ export interface PanelRunView {
   files: PanelFileEntry[];
   findings: PanelFinding[];
   spend: PanelSpend[];
+  /** Actionable mission status rendered as dedicated rows, never only in the run title. */
+  missionStatus?: {
+    token: string;
+    reason: string;
+    next: string;
+  };
 }
 
 /** What the repository looks like when no run is active. */

@@ -233,12 +233,26 @@ export function buildRows(
   expanded: ReadonlySet<string>,
   tab: PanelTabId = "files",
   nowMs: number = Date.now(),
+  width: number = Number.POSITIVE_INFINITY,
 ): PanelRow[] {
   const rows: PanelRow[] = [];
   const run = state.run;
 
   // The run header orients every tab that describes a run.
   if (run && tab !== "session" && tab !== "memory") {
+    if (run.missionStatus) {
+      const missionRow = (label: string, tone: RowTone = "note"): PanelRow => ({
+        depth: 0,
+        glyph: "·",
+        label: Number.isFinite(width) ? truncateToWidth(label, Math.max(0, width), "…") : label,
+        payload: { kind: "section", id: "run" },
+        selectable: false,
+        tone,
+      });
+      rows.push(missionRow(run.missionStatus.token, "high"));
+      rows.push(missionRow(`Why: ${run.missionStatus.reason}`));
+      rows.push(missionRow(`Next: ${run.missionStatus.next}`));
+    }
     rows.push({
       depth: 0,
       glyph: "●",

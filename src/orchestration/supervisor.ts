@@ -40,6 +40,8 @@ export interface MissionSupervisorOptions {
   now?: () => number;
   intervalMs?: number;
   onError?: (diagnostic: SupervisorDiagnostic) => void | Promise<void>;
+  /** Consume settled durable decisions. Called for startup and every periodic/explicit tick. */
+  onStatuses?: (statuses: SupervisorStatus[]) => void | Promise<void>;
 }
 
 export interface SupervisorDiagnostic {
@@ -78,6 +80,7 @@ export class MissionSupervisor {
   private readonly now: () => number;
   private readonly intervalMs: number;
   private readonly onError?: (diagnostic: SupervisorDiagnostic) => void | Promise<void>;
+  private readonly onStatuses?: (statuses: SupervisorStatus[]) => void | Promise<void>;
   private readonly supervisorDiagnostics: SupervisorDiagnostic[] = [];
   private timer?: ReturnType<typeof setInterval>;
   private readonly missionTicks = new Map<string, Promise<SupervisorStatus>>();
@@ -89,6 +92,7 @@ export class MissionSupervisor {
     this.now = options.now ?? Date.now;
     this.intervalMs = options.intervalMs ?? 30_000;
     this.onError = options.onError;
+    this.onStatuses = options.onStatuses;
     if (!Number.isFinite(this.intervalMs) || this.intervalMs <= 0) {
       throw new Error("MissionSupervisor intervalMs must be positive");
     }
@@ -154,6 +158,8 @@ export class MissionSupervisor {
     for (const { mission, expectedResumptionGeneration } of flights) {
       this.assertResumptionGeneration(mission.mission_id, expectedResumptionGeneration);
     }
+    await this.onStatuses?.(statuses);
+    await this.store.flush();
     return statuses;
   }
 

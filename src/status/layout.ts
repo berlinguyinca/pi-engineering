@@ -94,6 +94,11 @@ function renderUnsafe(state: HarnessStatusState, width: number, config: StatusBa
     full.push({ text: formatTask(state.task, 32), priority: 7 });
     short.push({ text: formatTask(state.task, 0), priority: 7 });
   }
+  if (config.showTask && state.task?.missionStatus) {
+    const mission = state.task.missionStatus;
+    full.push({ text: `${mission.token} · why ${mission.reason} · next ${mission.next}`, priority: 10 });
+    short.push({ text: mission.token, priority: 10 });
+  }
   if (config.showWait && state.wait) {
     const wait = formatWait(state.wait, nowMs);
     full.push({ text: wait, priority: 8 });
@@ -116,6 +121,10 @@ function renderUnsafe(state: HarnessStatusState, width: number, config: StatusBa
   stages.push(short.filter((s) => s.priority >= 6));
   stages.push(short.filter((s) => s.priority >= 7));
   stages.push(short.filter((s) => s.priority >= 8));
+  if (state.task?.missionStatus) {
+    stages.push(short.filter((s) => s.priority >= 9));
+    stages.push(short.filter((s) => s.priority >= 10));
+  }
 
   for (const stage of stages) {
     const line = assemble(stage);

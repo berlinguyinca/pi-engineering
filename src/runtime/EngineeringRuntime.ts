@@ -32,8 +32,11 @@ import { Orchestrator } from "../orchestration/orchestrator.ts";
 import type { PlanTaskInput } from "../orchestration/orchestrator.ts";
 import { MissionOwnership } from "../orchestration/ownership.ts";
 import { realBackends } from "../orchestration/realBackends.ts";
+import { FailureClassifier } from "../orchestration/recovery.ts";
 import { RepositoryRegistry } from "../orchestration/repositoryRegistry.ts";
-import { MissionSupervisor } from "../orchestration/supervisor.ts";
+import { canTransitionMission } from "../orchestration/state.ts";
+import { MissionSupervisor, type SupervisorStatus } from "../orchestration/supervisor.ts";
+import type { Mission, MissionStop } from "../orchestration/types.ts";
 import { WorkspaceManifestResolver } from "../orchestration/workspaceManifest.ts";
 import { tasksConflict, topoSort } from "../plan/taskDag.ts";
 import { JsonlEventStore } from "../platform/eventstore/jsonl.ts";
@@ -182,6 +185,10 @@ function materialFindings(ledger: Ledger, candidateId: string | null): string[] 
 function findingsBlock(findings: string[]): string {
   const joined = findings.join("\n");
   return joined.length > 8000 ? `${joined.slice(0, 8000)}\n… [truncated]` : joined;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 /** One tournament entrant and its independent assessment. */
@@ -786,23 +793,6 @@ export class EngineeringRuntime {
           void rt.publishMissionSnapshot();
         },
       });
-      rt.missionSupervisor = new MissionSupervisor({
-        store: rt.missionStore,
-        observability: rt.missionObservability,
-      });
-      const startupStatuses = await rt.missionSupervisor.reconcileOnStartup();
-      for (const status of startupStatuses) {
-        const current = rt.missionStore.getMission(status.missionId);
-        if (
-          status.decision &&
-          status.action !== "STOP" &&
-          current &&
-          (current.status === "BLOCKED" || current.status === "REPAIRING")
-        ) {
-          await rt.orchestrator.repairBlockedMission(status.missionId);
-        }
-      }
-      rt.missionSupervisor.start();
       if (opts.blackhole) rt.blackhole = await BlackholeManager.open({ ...opts.blackhole, ledger: rt.ledger });
       // Bind the semantic tools (ledger_read, repo_search, ...) to THIS runtime so
       // worker sessions get the tools their prompts require and always address the
@@ -826,8 +816,20 @@ export class EngineeringRuntime {
       if (rt.worker instanceof PiWorkerExecutor) rt.worker.setCustomTools(tools);
       // A distinct reviewer worker also needs the shared-ledger tools bound.
       if (rt.reviewerWorker instanceof PiWorkerExecutor) rt.reviewerWorker.setCustomTools(tools);
+      // Supervision is the final initialized service: reconciliation can
+      // dispatch repair workers, so every fallible backend and every semantic
+      // tool binding must already be ready. The same consumer handles startup,
+      // explicit ticks, and interval ticks.
+      rt.missionSupervisor = new MissionSupervisor({
+        store: rt.missionStore,
+        observability: rt.missionObservability,
+        onStatuses: (statuses) => rt.consumeSupervisorStatuses(statuses),
+      });
+      await rt.missionSupervisor.reconcileOnStartup();
+      rt.missionSupervisor.start();
       return rt;
     } catch (error) {
+      rt.missionSupervisor?.stop();
       EngineeringRuntime.releaseOrchestrationReference(orchestrationPath);
       throw error;
     }
@@ -841,10 +843,18 @@ export class EngineeringRuntime {
       if (this.orchestrationPath) EngineeringRuntime.releaseOrchestrationReference(this.orchestrationPath);
       return;
     }
-    this.missionSupervisor?.stop();
-    await this.missionStore?.flush();
-    await this.missionObservability?.flush();
     const path = this.orchestrationPath;
+    this.missionSupervisor?.stop();
+    try {
+      await this.missionStore?.flush();
+      await this.missionObservability?.flush();
+    } catch (error) {
+      // A failed flush has not completed shutdown. Keep the runtime and writer
+      // reference live so callers can retry without losing the only durable
+      // owner; supervision resumes because close did not succeed.
+      this.missionSupervisor?.start();
+      throw error;
+    }
     if (path) EngineeringRuntime.releaseOrchestrationReference(path);
     this.closed = true;
     this.orchestrator = null;
@@ -870,15 +880,112 @@ export class EngineeringRuntime {
     signal?: AbortSignal,
   ): Promise<import("../orchestration/types.ts").Mission> {
     if (!this.missionStore || !this.orchestrator) throw new Error("Orchestrator not initialized for this directory.");
-    const mission = this.missionStore.getMission(missionId);
+    let mission = this.missionStore.getMission(missionId);
     if (!mission) throw new Error(`unknown mission ${missionId}`);
-    const stop = this.missionStore.listMissionStops(missionId).at(-1);
-    const resumption = this.missionStore.listMissionResumptions(missionId).at(-1);
-    if (stop && (!resumption || resumption.stopGeneration < stop.generation)) {
-      this.missionStore.resumeMission(missionId, "operator requested mission recovery");
-      await this.missionStore.flush();
+    if (["COMPLETE", "FAILED", "CANCELED"].includes(mission.status)) {
+      throw new Error(`mission ${missionId} is terminal (${mission.status}) and cannot be resumed`);
     }
-    return this.orchestrator.repairBlockedMission(missionId, signal);
+    const generation = this.missionStore.listMissionResumptions(missionId).at(-1)?.generation ?? 0;
+    const stop = this.missionStore
+      .listMissionStops(missionId)
+      .filter((candidate) => candidate.resumptionGeneration === generation)
+      .at(-1);
+    if (!stop) throw new Error(`mission ${missionId} has no current durable stop to resume`);
+    mission = await this.normalizeMissionForRepair(missionId);
+    this.missionStore.resumeMission(missionId, "operator requested mission recovery");
+    await this.missionStore.flush();
+    try {
+      await this.orchestrator.repairBlockedMission(missionId, signal);
+    } catch (error) {
+      await this.persistRecoveryStop(missionId, `Manual recovery failed: ${errorMessage(error)}`, stop);
+      throw error;
+    }
+    mission = this.missionStore.getMission(missionId)!;
+    if ((mission.status === "BLOCKED" || mission.status === "REPAIRING") && !this.currentMissionStop(missionId)) {
+      await this.persistRecoveryStop(missionId, `Recovery did not produce material progress: ${stop.reason}`, stop);
+    }
+    return this.missionStore.getMission(missionId)!;
+  }
+
+  private async consumeSupervisorStatuses(statuses: SupervisorStatus[]): Promise<void> {
+    if (!this.missionStore || !this.orchestrator) return;
+    for (const status of statuses) {
+      try {
+        const mission = this.missionStore.getMission(status.missionId);
+        // Infrastructure pauses have a distinct scheduler-owned resume path.
+        // Converting one into generic repair work destroys its persisted retry
+        // semantics and prevents Orchestrator.resume() from continuing it.
+        if (mission?.status === "PAUSED_INFRASTRUCTURE") continue;
+        if (status.decision && status.action !== "STOP") {
+          await this.normalizeMissionForRepair(status.missionId);
+          await this.orchestrator.repairBlockedMission(status.missionId);
+        } else if (status.health !== "HEALTHY" && status.action !== "STOP") {
+          throw new Error(`unsupported supervisor action ${status.action}`);
+        }
+      } catch (error) {
+        await this.persistSupervisorFailure(status, error);
+      } finally {
+        await this.publishMissionSnapshot();
+        this.emitMissionActivity(status.missionId);
+      }
+    }
+  }
+
+  private async normalizeMissionForRepair(missionId: string): Promise<Mission> {
+    if (!this.missionStore) throw new Error("Mission store is not initialized");
+    let mission = this.missionStore.getMission(missionId);
+    if (!mission) throw new Error(`unknown mission ${missionId}`);
+    if (["COMPLETE", "FAILED", "CANCELED"].includes(mission.status)) {
+      throw new Error(`mission ${missionId} is terminal (${mission.status}) and cannot enter repair`);
+    }
+    if (mission.status === "REPAIRING" || mission.status === "BLOCKED") return mission;
+    if (mission.status === "NEW") mission = this.missionStore.transitionMission(missionId, "CLASSIFYING");
+    if (!canTransitionMission(mission.status, "BLOCKED")) {
+      throw new Error(`mission ${missionId} cannot normalize ${mission.status} into a repairable BLOCKED episode`);
+    }
+    mission = this.missionStore.transitionMission(missionId, "BLOCKED");
+    await this.missionStore.flush();
+    return mission;
+  }
+
+  private async persistSupervisorFailure(status: SupervisorStatus, error: unknown): Promise<void> {
+    if (!this.missionStore) throw error;
+    const reason = `Automatic recovery ${status.action} failed: ${errorMessage(error)}`;
+    const classification = new FailureClassifier().classify({
+      missionId: status.missionId,
+      taskId: status.task,
+      summary: reason,
+      category: "PERSISTENCE_FAILURE",
+      observedAt: new Date().toISOString(),
+    });
+    if (
+      !this.missionStore
+        .listFailureClassifications(status.missionId)
+        .some((item) => item.fingerprint === classification.fingerprint)
+    ) {
+      this.missionStore.classifyFailure(classification);
+    }
+    await this.persistRecoveryStop(status.missionId, reason, {
+      attemptedRecoveries: status.decision ? [status.decision.recoveryId] : [],
+      preservedWork: status.preservedWork,
+      resumeCondition: status.nextAction,
+    });
+  }
+
+  private async persistRecoveryStop(
+    missionId: string,
+    reason: string,
+    source: Pick<MissionStop, "attemptedRecoveries" | "preservedWork" | "resumeCondition">,
+  ): Promise<void> {
+    if (!this.missionStore) throw new Error("Mission store is not initialized");
+    const decisions = this.missionStore.listRecoveryDecisions(missionId).map((decision) => decision.recoveryId);
+    this.missionStore.stopMission(missionId, {
+      reason,
+      attemptedRecoveries: [...new Set([...source.attemptedRecoveries, ...decisions])],
+      preservedWork: [...source.preservedWork],
+      resumeCondition: source.resumeCondition,
+    });
+    await this.missionStore.flush();
   }
 
   private retainOpenReference(): void {

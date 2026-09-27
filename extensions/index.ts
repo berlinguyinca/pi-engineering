@@ -271,7 +271,11 @@ async function getRuntimeByCwd(cwd: string, model?: Model<any>): Promise<Enginee
 }
 
 /** Feed live mission detail into persistent surfaces without creating notices. */
-export function formatMissionActivity(event: RuntimeMissionActivityEvent): { phase: string; detail: string } {
+export function formatMissionActivity(event: RuntimeMissionActivityEvent): {
+  phase: string;
+  detail: string;
+  missionStatus: { token: string; reason: string; next: string };
+} {
   const heartbeat = event.lastHeartbeatAt ? ` · hb ${new Date(event.lastHeartbeatAt).toISOString().slice(11, 19)}` : "";
   const workers = ` · workers ${event.activeWorkers} active/${event.waitingWorkers} waiting/${event.failedWorkers} failed`;
   const lastProgress = event.lastMeaningfulProgressAt ?? "none";
@@ -283,6 +287,10 @@ export function formatMissionActivity(event: RuntimeMissionActivityEvent): { pha
   const next = `next ${event.nextAction.slice(0, 120)}${event.nextActionAt ? ` at ${event.nextActionAt}` : ""}`;
   const preserved =
     event.preservedWork.length > 0 ? ` · preserved ${event.preservedWork.join(", ").slice(0, 120)}` : "";
+  const nextVerb = event.nextAction.trim().split(/\s+/)[0]?.slice(0, 12) || "monitor";
+  const recoveryToken =
+    event.recovery.maxAttempts > 0 ? `R${event.recovery.attempt}/${event.recovery.maxAttempts}` : "R–";
+  const token = `${recoveryToken} ${event.action.slice(0, 12).toUpperCase()}→${nextVerb}`;
   return {
     phase:
       `acceptance ${event.acceptanceCoverage.completed}/${event.acceptanceCoverage.total} ` +
@@ -291,6 +299,11 @@ export function formatMissionActivity(event: RuntimeMissionActivityEvent): { pha
     detail:
       `${event.summary.slice(0, 120)}${workers}${heartbeat} · ${scope} · last progress ${lastProgress} · ` +
       `${recovery}${preserved} · ${event.action}: ${event.reason.slice(0, 120)} · ${next}`,
+    missionStatus: {
+      token,
+      reason: event.reason.slice(0, 160),
+      next: `${event.nextAction.slice(0, 160)}${event.nextActionAt ? ` at ${event.nextActionAt}` : ""}`,
+    },
   };
 }
 
@@ -311,6 +324,7 @@ function publishMissionActivity(key: string, event: RuntimeMissionActivityEvent)
         files: sameMission ? previous.files : [],
         findings: sameMission ? previous.findings : [],
         spend: sameMission ? previous.spend : [],
+        missionStatus: rendered.missionStatus,
       },
       updatedAt: Date.now(),
     });
@@ -320,7 +334,19 @@ function publishMissionActivity(key: string, event: RuntimeMissionActivityEvent)
     workItemId: event.missionId,
     phase: rendered.phase,
     label: detail,
+    missionStatus: rendered.missionStatus,
   });
+}
+
+async function shutdownCachedRuntimes(): Promise<void> {
+  const opened = [...runtimes.values()].map((entry) => entry.runtime);
+  const pending = [...runtimeOpens.values()];
+  runtimes.clear();
+  runtimeOpens.clear();
+  for (const result of await Promise.allSettled(pending)) {
+    if (result.status === "fulfilled") opened.push(result.value.runtime);
+  }
+  for (const runtime of new Set(opened)) await runtime.close().catch(() => undefined);
 }
 
 /**
@@ -1478,7 +1504,7 @@ ${RECOVERY_PROMPT}`;
       }
     });
 
-    pi.on("session_shutdown", () => {
+    pi.on("session_shutdown", async () => {
       // A sink pointing at a torn-down session's UI is worse than none.
       telemetryUninstall?.();
       telemetryUninstall = undefined;
@@ -1490,6 +1516,7 @@ ${RECOVERY_PROMPT}`;
       // `startPanelRefresh` returns early when one is already set, stops the
       // NEXT session from ever refreshing.
       stopPanelRefresh();
+      await shutdownCachedRuntimes();
     });
   }
 
@@ -1522,12 +1549,17 @@ ${RECOVERY_PROMPT}`;
         ctx.ui.notify("/mission <normal-language request> | /mission resume <missionId>", "error");
         return;
       }
+      const resumePrefix = /^resume(?:\b|[:=])/i.test(request);
+      const resume = /^resume\s+(\S+)\s*$/i.exec(request);
+      if (resumePrefix && !resume) {
+        ctx.ui.notify("/mission resume <missionId>", "error");
+        return;
+      }
       const rt = await getRuntime(ctx);
       if (!rt.orchestrator) {
         ctx.ui.notify("Orchestrator not initialized for this directory.", "error");
         return;
       }
-      const resume = /^resume(?:\s+(\S+))?\s*$/i.exec(request);
       if (resume) {
         const missionId = resume[1];
         if (!missionId) {
@@ -1604,21 +1636,27 @@ ${RECOVERY_PROMPT}`;
           .listMissionStops(m.mission_id)
           .filter((candidate) => candidate.resumptionGeneration === currentGeneration)
           .at(-1);
-        const acceptance = summary?.acceptanceCoverage ?? {
-          completed: m.acceptance_criteria.filter((criterion) => criterion.status === "passed").length,
-          total: m.acceptance_criteria.length,
-          approximatePercent: 0,
-        };
-        const workflow = summary?.workflowProgress ?? {
+        const acceptance = summary?.acceptanceCoverage;
+        const acceptanceText =
+          (acceptance?.total ?? m.acceptance_criteria.length) === 0
+            ? `acceptance unavailable (${summary && tasks.length === 0 ? "no material criteria" : "legacy"})`
+            : `acceptance ${acceptance?.completed ?? 0}/${acceptance?.total ?? m.acceptance_criteria.length} (${acceptance?.approximatePercent ?? 0}%)`;
+        const derivedWorkflow = {
           completed: tasks.filter((task) => task.status === "SUCCEEDED").length,
           total: tasks.length,
-          approximatePercent: 0,
         };
+        const workflow =
+          summary?.workflowProgress.total || derivedWorkflow.total === 0
+            ? (summary?.workflowProgress ?? { ...derivedWorkflow, approximatePercent: 0 })
+            : {
+                ...derivedWorkflow,
+                approximatePercent: Math.round((derivedWorkflow.completed / derivedWorkflow.total) * 100),
+              };
         const recovery = summary?.recovery ?? { attempt: 0, maxAttempts: 0 };
         const preserved = stop?.preservedWork ?? summary?.preservedWork ?? [];
         return [
           `- ${m.mission_id} [${m.status}] ${m.workflow_class} — ${m.title}`,
-          `  acceptance ${acceptance.completed}/${acceptance.total} (${acceptance.approximatePercent}%) · workflow ${workflow.completed}/${workflow.total} (${workflow.approximatePercent}%) · health ${summary?.health ?? "unknown"}`,
+          `  ${acceptanceText} · workflow ${workflow.completed}/${workflow.total} (${workflow.approximatePercent}%) · health ${summary?.health ?? "unknown"}`,
           `  repo ${summary?.repository ?? m.repository} · task ${summary?.task ?? "none"} · owner ${summary?.owner ?? "unowned"} · last progress ${summary?.lastMeaningfulProgressAt ?? "none"}`,
           `  recovery ${recovery.attempt}/${recovery.maxAttempts}; attempted ${stop?.attemptedRecoveries.length ?? 0} · next: ${stop?.resumeCondition ?? summary?.nextAction ?? "No further action is scheduled"}${summary?.nextActionAt ? ` at ${summary.nextActionAt}` : ""}`,
           `  ${stop ? `stop: ${stop.reason}` : `action: ${summary?.action ?? m.status} — ${summary?.reason ?? "No additional reason recorded"}`} · preserved: ${preserved.join(", ") || "none"}`,
