@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { type BrokerBackends, ExecutionBroker } from "../../src/orchestration/broker.ts";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
-import { MissionOwnership } from "../../src/orchestration/ownership.ts";
+import { MissionOwnership, type OwnershipIdentity } from "../../src/orchestration/ownership.ts";
 import { MissionScheduler, classifyFailure, domainsOverlap } from "../../src/orchestration/scheduler.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 import type { GatewayResilienceConfig } from "../../src/resilience/config.ts";
@@ -152,6 +152,58 @@ describe("MissionScheduler (spec 02)", () => {
     assert.equal(execution.mission_generation, settled.mission_generation);
     assert.equal(execution.fencing_token, settled.fencing_token);
     assert.equal(store.getRepositoryLeaseByRepoId("repo-1"), undefined);
+  });
+
+  it("preserves task success and durably reports a repository release failure", async () => {
+    const backend = JsonlEventStore.inMemory();
+    const store = MissionStore.open(backend);
+    const mission = createExecutingMission(store);
+    class FailingRepositoryReleaseOwnership extends MissionOwnership {
+      override async release(identity: OwnershipIdentity): Promise<void> {
+        if ("repoId" in identity) throw new Error("injected repository release failure");
+        await super.release(identity);
+      }
+    }
+    const ownership = new FailingRepositoryReleaseOwnership(store, { ownerId: "controller-release-failure" });
+    const missionIdentity = await ownership.acquire(mission.mission_id);
+    const task = store.createTask({
+      mission_id: mission.mission_id,
+      kind: "agent",
+      role: "implementer",
+      objective: "successful mutation with failed release",
+      mutates_repo: true,
+      isolation: "none",
+    });
+    const broker = makeBroker(store, {
+      agent: {
+        runAgent: async () => ({
+          executionId: "e",
+          exitStatus: "succeeded",
+          summary: "done",
+          artifactRefs: [],
+          usage: {},
+        }),
+      },
+    });
+    const scheduler = new MissionScheduler({
+      store,
+      broker,
+      acquireAuthority: async () => ownership.maintain(missionIdentity, "repo-release-failure"),
+    });
+
+    await scheduler.runMission(mission.mission_id);
+
+    assert.equal(store.getTask(task.task_id)?.status, "SUCCEEDED");
+    await store.flush();
+    const finding = MissionStore.open(backend)
+      .listFindings(mission.mission_id)
+      .find((candidate) => candidate.category === "ownership_release");
+    assert.ok(finding, "repository release failure must be durable and operator-visible");
+    assert.equal(finding.task_id, task.task_id);
+    assert.match(finding.summary, /repository ownership release failed/i);
+    assert.match(finding.evidence ?? "", /repo-release-failure/);
+    assert.match(finding.evidence ?? "", /fencingToken.*1/);
+    assert.match(finding.evidence ?? "", /injected repository release failure/);
   });
 
   it("cancels and rejects a late worker result after mission takeover", async () => {

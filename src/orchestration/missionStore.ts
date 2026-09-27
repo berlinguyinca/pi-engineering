@@ -921,6 +921,46 @@ export class MissionStore {
       .map((f) => ({ ...f }));
   }
 
+  /** Preserve a settled outcome while making failed lease cleanup durable and visible. */
+  async recordOwnershipReleaseFailure(input: {
+    missionId: string;
+    taskId?: string;
+    repoId?: string;
+    generation: number;
+    fencingToken: number;
+    ownerId: string;
+    renewBy: string;
+    error: unknown;
+  }): Promise<ReviewFinding> {
+    const scope = input.repoId ? "repository" : "mission";
+    const message = persistenceErrorMessage(input.error);
+    const finding = this.addFinding({
+      mission_id: input.missionId,
+      task_id: input.taskId ?? null,
+      severity: "major",
+      category: "ownership_release",
+      file: null,
+      line: null,
+      summary: `${scope} ownership release failed after outcome settlement`,
+      evidence: JSON.stringify({
+        scope,
+        missionId: input.missionId,
+        taskId: input.taskId ?? null,
+        repoId: input.repoId ?? null,
+        generation: input.generation,
+        fencingToken: input.fencingToken,
+        ownerId: input.ownerId,
+        renewBy: input.renewBy,
+        error: message,
+      }),
+      recommended_action: "Inspect writer health and reconcile the durable lease before the next mutation.",
+    });
+    // A failed flush remains queued and is also exposed through
+    // persistenceDiagnostics(); never rewrite the already-settled outcome.
+    await this.flush().catch(() => undefined);
+    return finding;
+  }
+
   // ── Durable reliability authority ──────────────────────────────────────
 
   bindWorkspaceManifest(manifest: WorkspaceManifest): WorkspaceManifest {

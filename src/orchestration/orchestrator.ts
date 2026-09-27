@@ -720,7 +720,18 @@ export class Orchestrator {
       this.progress.delete(mission.mission_id);
       const identity = this.ownershipByMission.get(mission.mission_id);
       if (identity && this.ownership) {
-        await this.ownership.release(identity).catch(() => undefined);
+        try {
+          await this.ownership.release(identity);
+        } catch (error) {
+          await this.store.recordOwnershipReleaseFailure({
+            missionId: identity.missionId,
+            generation: identity.generation,
+            fencingToken: identity.fencingToken,
+            ownerId: identity.ownerId,
+            renewBy: identity.renewBy,
+            error,
+          });
+        }
         this.ownershipByMission.delete(mission.mission_id);
       }
     }
@@ -756,7 +767,20 @@ export class Orchestrator {
       return (await this.finalizeMission(missionId, opts?.signal)).mission;
     } finally {
       const identity = this.ownershipByMission.get(missionId);
-      if (identity && this.ownership) await this.ownership.release(identity).catch(() => undefined);
+      if (identity && this.ownership) {
+        try {
+          await this.ownership.release(identity);
+        } catch (error) {
+          await this.store.recordOwnershipReleaseFailure({
+            missionId: identity.missionId,
+            generation: identity.generation,
+            fencingToken: identity.fencingToken,
+            ownerId: identity.ownerId,
+            renewBy: identity.renewBy,
+            error,
+          });
+        }
+      }
       this.ownershipByMission.delete(missionId);
     }
   }
@@ -1241,7 +1265,20 @@ export class Orchestrator {
       this.report(missionId, `[mission ${missionId}] ${task.kind}:${task.role} errored`);
       return false;
     } finally {
-      await authority?.close();
+      const closeError = await authority?.close();
+      if (authority && closeError) {
+        const identity = authority.repositoryIdentity ?? authority.missionIdentity;
+        await this.store.recordOwnershipReleaseFailure({
+          missionId: identity.missionId,
+          taskId,
+          ...(authority.repositoryIdentity ? { repoId: authority.repositoryIdentity.repoId } : {}),
+          generation: identity.generation,
+          fencingToken: identity.fencingToken,
+          ownerId: identity.ownerId,
+          renewBy: identity.renewBy,
+          error: closeError,
+        });
+      }
     }
   }
 

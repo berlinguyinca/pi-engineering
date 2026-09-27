@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { appendFile, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
@@ -56,6 +57,35 @@ async function waitForExit(child: ReturnType<typeof spawn>): Promise<void> {
   await new Promise<void>((resolve) => child.once("exit", () => resolve()));
 }
 
+async function startRecoveryClaimant(claimPath: string) {
+  const script = `
+    import { writeFile } from "node:fs/promises";
+    import { hostname } from "node:os";
+    await writeFile(${JSON.stringify(claimPath)}, JSON.stringify({
+      pid: process.pid,
+      host: hostname(),
+      openedAt: new Date().toISOString(),
+      ownerToken: "killed-recovery-claimant",
+    }) + "\\n", { flag: "wx" });
+    process.stdout.write("READY\\n");
+    setInterval(() => {}, 1_000);
+  `;
+  const child = spawn(process.execPath, ["--input-type=module", "--eval", script], {
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  await new Promise<void>((resolve, reject) => {
+    let stderr = "";
+    child.stderr!.on("data", (chunk) => {
+      stderr += String(chunk);
+    });
+    child.stdout!.on("data", (chunk) => {
+      if (String(chunk).includes("READY")) resolve();
+    });
+    child.once("exit", (code) => reject(new Error(`recovery claimant exited early (${code}): ${stderr}`)));
+  });
+  return child;
+}
+
 function startRacingOwner(file: string) {
   const script = `
     import { JsonlEventStore } from ${JSON.stringify(jsonlModule)};
@@ -85,6 +115,16 @@ function startRacingOwner(file: string) {
     child.once("error", reject);
   });
   return { child, outcome };
+}
+
+async function outcomeWithin(
+  contender: ReturnType<typeof startRacingOwner>,
+  timeoutMs = 500,
+): Promise<"ready" | "blocked" | "timeout"> {
+  return Promise.race([
+    contender.outcome,
+    new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), timeoutMs)),
+  ]);
 }
 
 describe("EventStore backends", () => {
@@ -186,6 +226,74 @@ describe("EventStore backends", () => {
     await waitForExit(winner);
     for (const contender of contenders) {
       if (contender.child !== winner) await waitForExit(contender.child);
+    }
+  });
+
+  it("recovers a stale lock after the recovery claimant is killed", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pie-store-dead-recovery-claim-"));
+    const file = join(dir, "events.jsonl");
+    const staleOwnerToken = "stale-owner-with-killed-claimant";
+    await writeFile(
+      `${file}.lock`,
+      `${JSON.stringify({
+        pid: 2_000_000_000,
+        host: hostname(),
+        openedAt: "2026-01-01T00:00:00.000Z",
+        ownerToken: staleOwnerToken,
+      })}\n`,
+    );
+    const staleHash = createHash("sha256").update(staleOwnerToken).digest("hex").slice(0, 24);
+    const killedClaimant = await startRecoveryClaimant(`${file}.lock.recover.${staleHash}`);
+    killedClaimant.kill("SIGKILL");
+    await waitForExit(killedClaimant);
+
+    const contender = startRacingOwner(file);
+    const outcome = await outcomeWithin(contender);
+    try {
+      assert.equal(outcome, "ready", "a dead recovery claimant must not wedge stale-lock recovery");
+      await assert.rejects(() => JsonlEventStore.open(file), /writer lock.*pid/i);
+    } finally {
+      if (outcome === "ready") contender.child.send("close");
+      else contender.child.kill("SIGKILL");
+      await waitForExit(contender.child);
+    }
+  });
+
+  it("does not remove a recovery claim held by a live process", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pie-store-live-recovery-claim-"));
+    const file = join(dir, "events.jsonl");
+    const staleOwnerToken = "stale-owner-with-live-claimant";
+    await writeFile(
+      `${file}.lock`,
+      `${JSON.stringify({
+        pid: 2_000_000_000,
+        host: hostname(),
+        openedAt: "2026-01-01T00:00:00.000Z",
+        ownerToken: staleOwnerToken,
+      })}\n`,
+    );
+    const staleHash = createHash("sha256").update(staleOwnerToken).digest("hex").slice(0, 24);
+    const claimPath = `${file}.lock.recover.${staleHash}`;
+    await writeFile(
+      claimPath,
+      `${JSON.stringify({
+        pid: process.pid,
+        host: hostname(),
+        openedAt: "2026-01-01T00:00:01.000Z",
+        ownerToken: "live-recovery-claimant",
+      })}\n`,
+    );
+
+    const contender = startRacingOwner(file);
+    const outcome = await outcomeWithin(contender);
+    try {
+      assert.equal(outcome, "blocked");
+      const claim = JSON.parse(await readFile(claimPath, "utf8")) as { ownerToken: string };
+      assert.equal(claim.ownerToken, "live-recovery-claimant");
+    } finally {
+      if (outcome === "ready") contender.child.send("close");
+      else contender.child.kill("SIGKILL");
+      await waitForExit(contender.child);
     }
   });
 

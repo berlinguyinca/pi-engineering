@@ -228,7 +228,8 @@ describe("MissionOwnership", () => {
         throw new Error("injected lease release failure");
       }
     }
-    const store = MissionStore.open(JsonlEventStore.inMemory());
+    const backend = JsonlEventStore.inMemory();
+    const store = MissionStore.open(backend);
     const orchestrator = new Orchestrator({
       store,
       backends: {},
@@ -244,5 +245,13 @@ describe("MissionOwnership", () => {
 
     assert.equal(result.completed, true);
     assert.equal(result.mission.status, "COMPLETE");
+    await store.flush();
+    const finding = MissionStore.open(backend)
+      .listFindings(result.mission.mission_id)
+      .find((candidate) => candidate.category === "ownership_release");
+    assert.ok(finding, "mission release failure must be durable and operator-visible");
+    assert.match(finding.summary, /mission ownership release failed/i);
+    assert.match(finding.evidence ?? "", /injected lease release failure/);
+    assert.match(finding.evidence ?? "", /fencingToken/);
   });
 });

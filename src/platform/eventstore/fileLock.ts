@@ -99,7 +99,20 @@ export class ExclusiveFileLock {
           await writeFile(claimPath, `${JSON.stringify(owner)}\n`, { encoding: "utf8", flag: "wx" });
         } catch (claimError) {
           if ((claimError as NodeJS.ErrnoException).code !== "EEXIST") throw claimError;
-          await new Promise((resolve) => setTimeout(resolve, 2));
+          const claimant = await readOwner(claimPath);
+          if (!claimant || !verifiedStale(claimant)) {
+            const diagnostic = claimant
+              ? `pid=${claimant.pid} host=${claimant.host} openedAt=${claimant.openedAt} ownerToken=${claimant.ownerToken}`
+              : "claimant metadata is missing or unreadable";
+            throw new Error(`JSONL writer lock recovery for ${file} is claimed (${diagnostic})`);
+          }
+          // A claim is removed only after proving its exact claimant dead. The
+          // token check prevents a delayed recovery attempt from unlinking a
+          // different claim that replaced the one it observed.
+          const observed = await readOwner(claimPath);
+          if (observed?.ownerToken === claimant.ownerToken && verifiedStale(observed)) {
+            removeSync(claimPath, { force: true });
+          }
           continue;
         }
         try {

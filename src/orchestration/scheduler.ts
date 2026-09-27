@@ -543,7 +543,20 @@ export class MissionScheduler {
         this.store.transitionTask(task.task_id, "FAILED", "system", { failure_reason: reason });
         return;
       } finally {
-        await authority?.close();
+        const closeError = await authority?.close();
+        if (authority && closeError) {
+          const identity = authority.repositoryIdentity ?? authority.missionIdentity;
+          await this.store.recordOwnershipReleaseFailure({
+            missionId: identity.missionId,
+            taskId: task.task_id,
+            ...(authority.repositoryIdentity ? { repoId: authority.repositoryIdentity.repoId } : {}),
+            generation: identity.generation,
+            fencingToken: identity.fencingToken,
+            ownerId: identity.ownerId,
+            renewBy: identity.renewBy,
+            error: closeError,
+          });
+        }
       }
     }
   }

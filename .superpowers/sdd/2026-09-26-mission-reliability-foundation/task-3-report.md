@@ -110,3 +110,52 @@ Implemented a real cross-process JSONL writer lock and replay-backed mission/rep
 - The lock is intentionally a local-filesystem primitive. Correct stale-owner proof requires every contender to share the same filesystem, hostname, and PID namespace. Network filesystems and containers with differing PID namespaces require a separate distributed/advisory ownership design and are unsupported here.
 - A release/flush failure cannot rewrite a successful or failed mission result; repository authority then fails closed until its durable expiry.
 - The deferred Task 2 Git path-enumeration fail-open boundary was not encountered and remains unchanged.
+
+## Fix Round 2
+
+### Outcome
+
+- Recovery claims now carry claimant PID, hostname, opened-at time, and owner token. A later contender fails closed for a live or unverifiable claimant and reaps only an exact-token claimant proven dead in the shared host/PID namespace.
+- Repository and mission lease cleanup failures no longer disappear. They produce a durable, replayable `ownership_release` finding with mission/task/repository scope, generation, fencing token, owner, renewal deadline, and error details while preserving the already-settled task or mission result.
+- Dispatch-authority close diagnostics cover scheduled workers and single-task repair/integration/validation/review paths; final mission release diagnostics cover both initial orchestration and resume.
+
+### RED evidence
+
+- `node --test --test-name-pattern="recovery claimant|release failure" test/unit/platform-eventstore.test.ts test/unit/mission-ownership.test.ts test/unit/orchestration-scheduler.test.ts`
+  - 3 tests, 0 passed, 3 failed.
+  - Dead recovery claimant timed out instead of recovering; repository and mission release failures had no durable visible finding.
+- `node --test --test-name-pattern="live process" test/unit/platform-eventstore.test.ts`
+  - 1 test, 0 passed, 1 failed.
+  - A live recovery claim timed out in the retry loop instead of failing closed while preserving the claimant.
+
+### GREEN evidence
+
+- `node --test --test-name-pattern="recovery claimant|live process|release failure" test/unit/platform-eventstore.test.ts test/unit/mission-ownership.test.ts test/unit/orchestration-scheduler.test.ts`
+  - 4 passed, 0 failed.
+- `node --test test/unit/platform-eventstore.test.ts test/unit/mission-ownership.test.ts test/unit/orchestration-missionstore.test.ts test/unit/orchestration-scheduler.test.ts test/integration/orchestrator-e2e.test.ts`
+  - 80 passed, 0 failed.
+- `npm run typecheck`
+  - Passed (`tsc --noEmit`).
+- `npm run lint`
+  - Passed (`biome check .`; 578 files checked, no fixes applied).
+- `npm test`
+  - 2,318 tests discovered: 2,317 passed, 0 failed, 1 skipped in 29.617s.
+  - The sole skip remains the OpenViking Postgres round-trip because `TEST_DATABASE_URL` is unset.
+
+### Files changed
+
+- `src/platform/eventstore/fileLock.ts` — dead-claim recovery and live/unverifiable claimant fail-closed diagnostics.
+- `src/orchestration/missionStore.ts` — durable ownership-release finding with bounded lease context and flush retry/visibility behavior.
+- `src/orchestration/scheduler.ts` — records repository authority close failures after task settlement.
+- `src/orchestration/orchestrator.ts` — records single-task and final mission release failures without altering outcomes.
+- `test/unit/platform-eventstore.test.ts` — killed claimant recovery plus live claimant/winner preservation.
+- `test/unit/mission-ownership.test.ts` — completed-mission preservation and durable release evidence.
+- `test/unit/orchestration-scheduler.test.ts` — successful mutation preservation and durable repository release evidence through the real `DispatchAuthority.close()` path.
+
+### Self-review and concerns
+
+- A live or foreign-host recovery claimant is never removed; recovery requires a same-host PID proven absent and the same claimant token on re-read.
+- Diagnostic findings use `major`, not `blocking`, so recording cleanup damage cannot retroactively invalidate a task or mission outcome. The unreleased lease itself remains fail-closed until reconciled or expired.
+- If persistence is temporarily unavailable, the diagnostic event remains in the MissionStore ordered retry queue and the persistence failure is immediately operator-visible through `persistenceDiagnostics()`; a later successful flush makes it durable.
+- Authority loss still leaves the task `RUNNING` for the explicit orphan-reconciliation work in Tasks 8/9. This round preserves the typed late-result rejection and does not falsely mark the task successful.
+- Local recovery still assumes one shared filesystem, hostname, and PID namespace. The deferred Git path-enumeration fail-open boundary remains unchanged.
