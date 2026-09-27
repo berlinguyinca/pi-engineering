@@ -11,6 +11,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
 import { MISSION_SNAPSHOT_CONTRACT_VERSION } from "../../src/orchestration/missionSnapshot.ts";
+import { MissionStore } from "../../src/orchestration/missionStore.ts";
+import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 import { EngineeringRuntime } from "../../src/runtime/EngineeringRuntime.ts";
 import type { WorkerExecutor } from "../../src/workers/WorkerExecutor.ts";
 import { makeFixtureRepo } from "../fixtures/make-fixture.ts";
@@ -437,6 +439,99 @@ describe("orchestration via real EngineeringRuntime (acceptance scenarios)", () 
     const rt2 = await openRuntime(metaRoot);
 
     assert.equal(rt2.repositoryRegistry.get(repoId).root, target.root);
+  });
+
+  it("reopens and resumes a paused external mission on the persisted repository binding", async () => {
+    const target = await greenFixture();
+    const metaRoot = await mkdtemp(join(tmpdir(), "pi-eng-meta-root-"));
+    fixtures.push(target, { root: metaRoot, cleanup: () => rm(metaRoot, { recursive: true, force: true }) });
+    const unavailable: WorkerExecutor = {
+      async run() {
+        return {
+          result: {
+            status: "failed",
+            summary: "gateway unavailable",
+            claims: [],
+            evidence_refs: [],
+            new_hypotheses: [],
+            proposed_tasks: [],
+            details: {},
+            error: "transient:server_unavailable",
+          },
+          usage: null,
+          toolCalls: 0,
+        };
+      },
+    };
+    const rt1 = await EngineeringRuntime.open({
+      cwd: metaRoot,
+      worker: unavailable,
+      verifier: new (await import("../../src/verify/Verifier.ts")).CommandVerifier(),
+    });
+    Object.assign(rt1.resilience, {
+      retry_window_ms: 0,
+      auto_resume_horizon_ms: 0,
+      probe_interval_ms: 1,
+      jitter_ms: 0,
+    });
+    const paused = await rt1.orchestrator!.orchestrate(`Add resumed support in ${target.root}`, {
+      repository: metaRoot,
+      baseRef: "",
+      mutationRequested: true,
+    });
+    assert.equal(paused.mission.status, "PAUSED_INFRASTRUCTURE");
+    await rt1.missionStore!.flush();
+    const persistedEvents = (await readFile(join(rt1.workDir, "orchestration.jsonl"), "utf8"))
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line));
+    const replayBackend = JsonlEventStore.inMemory();
+    await replayBackend.appendAll(persistedEvents);
+    const replayedStore = MissionStore.open(replayBackend);
+    assert.equal(replayedStore.getMission(paused.mission.mission_id)?.status, "PAUSED_INFRASTRUCTURE");
+    assert.equal(
+      replayedStore.getWorkspaceManifest(paused.mission.mission_id)?.repositories[0]?.canonicalRoot,
+      target.root,
+    );
+
+    const resumedCwds: string[] = [];
+    const recovered: WorkerExecutor = {
+      async run(req) {
+        resumedCwds.push(req.cwd);
+        if (req.role === "implementer") {
+          await writeFile(join(req.cwd, "src", "resumed.ts"), "export const resumed = true;\n", "utf8");
+        }
+        return {
+          result: {
+            status: "completed",
+            summary: "recovered",
+            claims: [],
+            evidence_refs: [],
+            new_hypotheses: [],
+            proposed_tasks: [],
+            details: {},
+          },
+          usage: null,
+          toolCalls: 0,
+        };
+      },
+    };
+    const rt2 = await EngineeringRuntime.open({
+      cwd: metaRoot,
+      worker: recovered,
+      verifier: new (await import("../../src/verify/Verifier.ts")).CommandVerifier(),
+    });
+    assert.notEqual(rt2, rt1);
+    const resumed = await rt2.orchestrator!.resume(paused.mission.mission_id, { force: true });
+
+    assert.equal(resumed.status, "COMPLETE");
+    assert.match(await readFile(join(target.root, "src", "resumed.ts"), "utf8"), /resumed/);
+    await assert.rejects(readFile(join(metaRoot, "src", "resumed.ts"), "utf8"), /ENOENT/);
+    assert.ok(resumedCwds.length >= 2);
+    assert.ok(resumedCwds.every((cwd) => cwd.startsWith(target.root) || cwd.includes("pi-eng-")));
+    const repoId = rt2.missionStore!.getWorkspaceManifest(paused.mission.mission_id)!.repositories[0]!.repoId;
+    assert.ok(rt2.missionStore!.listTasks(paused.mission.mission_id).every((task) => task.repo_id === repoId));
   });
 
   it("scenario B: investigation escalates to engineering+review when source changes", async () => {

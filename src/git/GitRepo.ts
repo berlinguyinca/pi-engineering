@@ -56,18 +56,18 @@ export class GitRepo {
     }
   }
 
-  private async git(args: string[], opts: { timeout?: number } = {}): Promise<GitResult> {
+  private async git(args: string[], opts: { timeout?: number; preserveStdout?: boolean } = {}): Promise<GitResult> {
     const timeoutMs = opts.timeout ?? 120_000;
     try {
       const { stdout, stderr } = await exec("git", [...this.gitArgs, ...args], {
         timeout: timeoutMs,
         maxBuffer: 64 * 1024 * 1024,
       });
-      return { stdout: stdout.trim(), stderr: stderr.trim(), code: 0 };
+      return { stdout: opts.preserveStdout ? stdout : stdout.trim(), stderr: stderr.trim(), code: 0 };
     } catch (err) {
       const e = err as NodeJS.ErrnoException & { code?: number; stdout?: string; stderr?: string };
       return {
-        stdout: (e.stdout as string) ?? "",
+        stdout: opts.preserveStdout ? ((e.stdout as string) ?? "") : ((e.stdout as string) ?? "").trim(),
         stderr: (e.stderr as string) ?? e.message ?? String(e),
         code: typeof e.code === "number" ? e.code : 1,
       };
@@ -295,8 +295,32 @@ export class GitRepo {
   }
 
   async changedFiles(baseCommit: string, headCommit: string): Promise<string[]> {
-    const r = await this.git(["diff", "--name-only", baseCommit, headCommit]);
-    return r.stdout ? r.stdout.split("\n").filter(Boolean) : [];
+    const r = await this.git(["diff", "--no-renames", "--name-only", "-z", baseCommit, headCommit], {
+      preserveStdout: true,
+    });
+    return r.stdout ? r.stdout.split("\0").filter(Boolean) : [];
+  }
+
+  /** NUL-safe working-tree paths, including both endpoints of renames/copies. */
+  async statusPathsIn(path: string): Promise<string[]> {
+    const r = await this.git(["-C", path, "status", "--porcelain=v1", "-z", "--untracked-files=all"], {
+      preserveStdout: true,
+    });
+    if (r.code !== 0 || !r.stdout) return [];
+    const records = r.stdout.split("\0");
+    const paths: string[] = [];
+    for (let i = 0; i < records.length; i++) {
+      const record = records[i];
+      if (!record) continue;
+      const status = record.slice(0, 2);
+      const destination = record.slice(3);
+      if (destination) paths.push(destination);
+      if (status.includes("R") || status.includes("C")) {
+        const source = records[++i];
+        if (source) paths.push(source);
+      }
+    }
+    return paths;
   }
 
   /**

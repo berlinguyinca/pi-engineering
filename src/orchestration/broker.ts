@@ -181,14 +181,6 @@ function pathAllowed(path: string, domains: string[]): boolean {
   });
 }
 
-function statusPaths(status: string): string[] {
-  return status
-    .split("\n")
-    .filter(Boolean)
-    .map((line) => line.slice(3).split(" -> ").at(-1)?.trim() ?? "")
-    .filter(Boolean);
-}
-
 /**
  * Default execution wall-clock budget in ms. The historical 10-minute default
  * repeatedly aborted fresh-context implementation workers at the boundary
@@ -571,7 +563,7 @@ export class ExecutionBroker {
       const tip = await wt.git.headCommitIn(wt.path);
       for (const path of await wt.git.changedFiles(base, tip)) changed.add(path);
     }
-    for (const path of statusPaths(await wt.git.statusIn(wt.path))) changed.add(path);
+    for (const path of await wt.git.statusPathsIn(wt.path)) changed.add(path);
     return [...changed].filter((path) => !pathAllowed(path, domains)).sort();
   }
 

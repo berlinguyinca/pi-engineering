@@ -1,12 +1,17 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
+import { access, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { describe, it } from "node:test";
+import { promisify } from "node:util";
 import { GitRepo } from "../../src/git/GitRepo.ts";
 import { type BrokerBackends, ExecutionBroker, workerTimeoutMs } from "../../src/orchestration/broker.ts";
 import { Integrator } from "../../src/orchestration/integrator.ts";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 import { makeFixtureRepo } from "../fixtures/make-fixture.ts";
+
+const exec = promisify(execFile);
 
 function setup(backends: BrokerBackends) {
   const store = MissionStore.open(JsonlEventStore.inMemory());
@@ -24,7 +29,122 @@ function setup(backends: BrokerBackends) {
   return { store, m, t, broker: new ExecutionBroker({ store, backends }) };
 }
 
+async function assertCrossBoundaryRenameRejected(commitRename: boolean): Promise<void> {
+  const fx = await makeFixtureRepo();
+  try {
+    await writeFile(join(fx.root, "outside.ts"), "export const outside = true;\n", "utf8");
+    await exec("git", ["-C", fx.root, "add", "outside.ts"]);
+    await exec("git", ["-C", fx.root, "commit", "-q", "-m", "add outside file"]);
+    const git = await GitRepo.open(fx.root);
+    assert.ok(git);
+    const store = MissionStore.open(JsonlEventStore.inMemory());
+    const mission = store.createMission({
+      title: "rename confinement",
+      goal: "rename confinement",
+      user_request: "rename confinement",
+      repository: fx.root,
+      base_ref: await git.headCommit(),
+      risk_profile: "medium",
+      workflow_class: "engineering_review",
+    });
+    const task = store.createTask({
+      mission_id: mission.mission_id,
+      repo_id: "repo-target",
+      kind: "agent",
+      role: "implementer",
+      objective: "rename into authorized scope",
+      mutates_repo: true,
+      isolation: "worktree",
+      write_domains: ["src/**"],
+    });
+    store.transitionTask(task.task_id, "READY");
+    const integrator = new Integrator(git);
+    const broker = new ExecutionBroker({
+      store,
+      git,
+      baseRef: mission.base_ref,
+      resolveRepository: async (repoId) => ({ repoId, root: fx.root, git }),
+      backends: {
+        agent: {
+          runAgent: async ({ worktree }) => {
+            assert.ok(worktree);
+            await exec("git", ["-C", worktree, "mv", "outside.ts", "src/inside.ts"]);
+            if (commitRename) await exec("git", ["-C", worktree, "commit", "-q", "-m", "cross-boundary rename"]);
+            return { executionId: "worker", exitStatus: "succeeded", summary: "renamed", artifactRefs: [], usage: {} };
+          },
+        },
+        integration: {
+          runIntegration: (input) =>
+            integrator.integrate({
+              objective: input.objective,
+              baseCommit: mission.base_ref,
+              handoffs: input.handoffs,
+              signal: input.signal,
+            }),
+        },
+      },
+    });
+
+    const worker = await broker.execute({
+      taskId: task.task_id,
+      missionId: mission.mission_id,
+      repoId: "repo-target",
+      kind: "agent",
+      role: "implementer",
+      objective: task.objective,
+      mutatesRepo: true,
+      isolation: "worktree",
+      writeDomains: ["src/**"],
+    });
+    const outcome = await worker.result();
+    assert.equal(outcome.exitStatus, "failed");
+    assert.match(outcome.summary, /WORKSPACE_SCOPE_MISMATCH/);
+
+    const integrationTask = store.createTask({
+      mission_id: mission.mission_id,
+      repo_id: "repo-target",
+      kind: "integration",
+      role: "integrator",
+      objective: "must not land escaped rename",
+      mutates_repo: true,
+      isolation: "none",
+      write_domains: ["src/**"],
+    });
+    store.transitionTask(integrationTask.task_id, "READY");
+    const integration = await broker.execute({
+      taskId: integrationTask.task_id,
+      missionId: mission.mission_id,
+      repoId: "repo-target",
+      kind: "integration",
+      role: "integrator",
+      objective: integrationTask.objective,
+      mutatesRepo: true,
+      isolation: "none",
+      writeDomains: ["src/**"],
+    });
+    await integration.result();
+
+    await access(join(fx.root, "outside.ts"));
+    await assert.rejects(access(join(fx.root, "src", "inside.ts")));
+    assert.ok(
+      store
+        .listFailureClassifications(mission.mission_id)
+        .some((classification) => classification.category === "WORKSPACE_SCOPE_MISMATCH"),
+    );
+  } finally {
+    await fx.cleanup();
+  }
+}
+
 describe("ExecutionBroker (spec 03)", () => {
+  it("rejects a committed rename from outside into an authorized domain and never integrates it", async () => {
+    await assertCrossBoundaryRenameRejected(true);
+  });
+
+  it("rejects a staged rename from outside into an authorized domain and never integrates it", async () => {
+    await assertCrossBoundaryRenameRejected(false);
+  });
+
   it("passes repoId explicitly to the backend and rejects a missing binding before dispatch", async () => {
     const seen: string[] = [];
     const { m, t, store } = setup({});

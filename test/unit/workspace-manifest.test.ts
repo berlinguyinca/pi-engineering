@@ -176,8 +176,12 @@ describe("WorkspaceManifestResolver path policy", () => {
     await exec("git", ["-C", root, "commit", "--allow-empty", "-q", "-m", "empty baseline"]);
 
     const resolved = await new WorkspaceManifestResolver().resolve(`Review ${root}`, tmpdir());
+    const registry = new RepositoryRegistry();
+    await registry.register(createWorkspaceManifest(resolved, "MSN-empty"));
+    const probes = await registry.probe(resolved.primaryRepoId);
 
     assert.equal(resolved.repositories[0]?.canonicalRoot, root);
+    assert.equal(probes.find((probe) => probe.role === "reviewer")?.ok, true);
   });
 
   it("does not treat a repository path found in repository content as user authorization", async () => {
