@@ -131,3 +131,33 @@ Cleanup now inventories by repository, acquires and closes authority independent
 ### Fix-round-3 residual concerns
 
 - `ExclusiveFileLock` remains intentionally local-filesystem scoped, as noted above. No new distributed-lock behavior was introduced.
+
+## Fix round 4
+
+Post-commit recovery now distinguishes a completed promotion from an uncommitted intent. Candidate-scoped validation/review may restore a `promoted` candidate only when an exact completed promotion record matches its candidate ID, SHA, repository, base, mission generation, and candidate generation. This preserves the exact candidate cwd for crash recovery without allowing stale-generation gate work to become current.
+
+A base-only historical intent remains mutation-free during pre-gate reconciliation. After fresh current-generation gates pass, normal promotion remounts that exact candidate, writes a newly authorized intent using the current repository generation, and performs the base-bound CAS. A committed candidate HEAD continues through the separate already-promoted reconciliation path.
+
+Cleanup now checks both worktree removal and branch deletion results. Once a worktree is removed, a repository-local branch-only cleanup record is persisted before branch deletion and removed only after deletion succeeds, allowing retry after process restart. Authority-release errors returned or thrown by `DispatchAuthority.close()` become structured per-repository cleanup failures and durable findings.
+
+### Fix-round-4 RED/GREEN evidence
+
+- RED: promoted records were excluded from candidate restoration after committed reconciliation, so a restarted candidate-scoped gate failed closed with `CANDIDATE_UNAVAILABLE` despite exact completed promotion proof.
+- RED: a base-only intent was routed into committed-promotion reconciliation after fresh gates and could not perform a newly authorized CAS.
+- RED: branch deletion results and authority-release errors were discarded, leaving no retryable branch-only cleanup state or structured failure.
+- GREEN: focused Task 7 suite passed 91/91, including promoted-candidate cwd restoration, takeover-before-CAS followed by fresh-authority promotion, durable branch-only deletion retry, and authority-release failure reporting.
+- GREEN: `npm run typecheck` passed.
+- GREEN: `npm run lint` passed (`Checked 583 files`).
+- GREEN: bounded `timeout 180 npm test` passed: 2,433 tests; 2,432 passed, 0 failed, 1 skipped.
+- GREEN: `git diff --check` passed.
+
+### Fix-round-4 reviewer focus
+
+- Verify promoted candidate restoration requires an exact completed promotion record and exact current task generations; incomplete or stale promotion evidence must not authorize a gate cwd.
+- Verify `HEAD == baseSha` recovery performs no CAS, while a later normal promotion overwrites intent origin with fresh repository authority after current gates.
+- Verify a failed `git branch -D` leaves a durable cleanup record even though its worktree path is gone, and retry clears both branch and journal.
+- Verify returned and thrown authority-close failures both become structured cleanup failures/findings while other repositories continue.
+
+### Fix-round-4 residual concerns
+
+- `ExclusiveFileLock` remains local-filesystem scoped; distributed promotion locking remains outside Task 7.

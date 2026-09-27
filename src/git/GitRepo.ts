@@ -26,6 +26,7 @@ export interface GitResult {
 
 export interface GitMutationGuard {
   assertAuthoritative(): void;
+  repositoryIdentity?: { generation: number };
 }
 
 export interface PromotionResult {
@@ -134,6 +135,18 @@ export interface MergeJournalHooks {
   afterConflict?: () => Promise<void> | void;
   afterAbortIntent?: () => Promise<void> | void;
   abortMerge?: () => Promise<GitResult>;
+}
+
+export interface WorktreeRemovalHooks {
+  deleteBranch?: () => Promise<GitResult>;
+}
+
+export interface PendingBranchCleanup {
+  missionId: string;
+  repoId: string;
+  path: string;
+  branch: string;
+  updatedAt: string;
 }
 
 /**
@@ -248,6 +261,44 @@ export class GitRepo {
     return `run.${[candidateId, runId].map((part) => Buffer.from(part).toString("base64url")).join(".")}.json`;
   }
 
+  private branchCleanupStateName(record: Pick<PendingBranchCleanup, "missionId" | "repoId" | "branch">): string {
+    return `cleanup.${[record.missionId, record.repoId, record.branch]
+      .map((part) => Buffer.from(part).toString("base64url"))
+      .join(".")}.json`;
+  }
+
+  private async persistPendingBranchCleanup(record: PendingBranchCleanup, guard?: GitMutationGuard): Promise<void> {
+    guard?.assertAuthoritative();
+    const dir = await this.candidateStateDir();
+    const target = join(dir, this.branchCleanupStateName(record));
+    const temporary = `${target}.${process.pid}.tmp`;
+    await writeFile(temporary, JSON.stringify(record), "utf8");
+    guard?.assertAuthoritative();
+    await rename(temporary, target);
+  }
+
+  async loadPendingBranchCleanups(missionId: string, repoId: string): Promise<PendingBranchCleanup[]> {
+    const dir = await this.candidateStateDir(false);
+    const records: PendingBranchCleanup[] = [];
+    for (const name of await readdir(dir).catch(() => [] as string[])) {
+      if (!name.startsWith("cleanup.") || !name.endsWith(".json")) continue;
+      try {
+        const parsed = JSON.parse(await readFile(join(dir, name), "utf8")) as PendingBranchCleanup;
+        if (
+          parsed.missionId === missionId &&
+          parsed.repoId === repoId &&
+          typeof parsed.path === "string" &&
+          typeof parsed.branch === "string"
+        ) {
+          records.push(parsed);
+        }
+      } catch {
+        // Unreadable cleanup state cannot authorize a destructive retry.
+      }
+    }
+    return records;
+  }
+
   private promotionStateName(
     record: Pick<
       PromotionLifecycle,
@@ -310,7 +361,7 @@ export class GitRepo {
     for (const name of await readdir(dir).catch(() => [] as string[])) {
       if (!name.endsWith(".json")) continue;
       try {
-        if (name.startsWith("promotion.") || name.startsWith("run.")) continue;
+        if (name.startsWith("promotion.") || name.startsWith("run.") || name.startsWith("cleanup.")) continue;
         const parsed = JSON.parse(await readFile(join(dir, name), "utf8")) as CandidateLifecycle;
         if (
           parsed.missionId === missionId &&
@@ -685,22 +736,48 @@ export class GitRepo {
   /** Remove a worktree (cleanup/recovery). Optionally keep the branch for lineage. */
   async removeWorktree(
     info: WorktreeInfo,
-    opts: { keepBranch?: boolean } = {},
+    opts: { keepBranch?: boolean; cleanupIdentity?: { missionId: string; repoId: string } } = {},
     guard?: GitMutationGuard,
+    hooks: WorktreeRemovalHooks = {},
   ): Promise<void> {
     await this.assertPromotionUnlocked();
-    guard?.assertAuthoritative();
-    const removed = await this.git(["worktree", "remove", "--force", info.path]);
-    if (removed.code !== 0) {
-      throw new Error(`git worktree remove failed for ${info.path}: ${removed.stderr || removed.stdout}`);
+    let worktreeExists = true;
+    try {
+      await access(info.path);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") worktreeExists = false;
+      else throw error;
+    }
+    if (worktreeExists) {
+      guard?.assertAuthoritative();
+      const removed = await this.git(["worktree", "remove", "--force", info.path]);
+      if (removed.code !== 0) {
+        throw new Error(`git worktree remove failed for ${info.path}: ${removed.stderr || removed.stdout}`);
+      }
     }
     // Targeted, for the same reason creation is: a global prune here would be
     // able to delete a concurrently-created sibling's administrative directory.
     guard?.assertAuthoritative();
     await this.forgetWorktreeAdmin(info.path);
     if (!opts.keepBranch) {
+      const pending = opts.cleanupIdentity
+        ? {
+            ...opts.cleanupIdentity,
+            path: info.path,
+            branch: info.branch,
+            updatedAt: new Date().toISOString(),
+          }
+        : undefined;
+      if (pending) await this.persistPendingBranchCleanup(pending, guard);
       guard?.assertAuthoritative();
-      await this.git(["branch", "-D", info.branch]).catch(() => {});
+      const deleted = hooks.deleteBranch ? await hooks.deleteBranch() : await this.git(["branch", "-D", info.branch]);
+      if (deleted.code !== 0) {
+        throw new Error(`git branch delete failed for ${info.branch}: ${deleted.stderr || deleted.stdout}`);
+      }
+      if (pending) {
+        guard?.assertAuthoritative();
+        await rm(join(await this.candidateStateDir(), this.branchCleanupStateName(pending)), { force: true });
+      }
     }
   }
 
@@ -1014,7 +1091,7 @@ export class GitRepo {
             repoId: lifecycle.repoId,
             missionGeneration: lifecycle.missionGeneration,
             candidateGeneration: lifecycle.candidateGeneration,
-            repositoryGeneration: lifecycle.repositoryGeneration,
+            repositoryGeneration: guard?.repositoryIdentity?.generation ?? lifecycle.repositoryGeneration,
             attempt: lifecycle.attempt,
             baseSha: boundBase,
             candidateSha,
@@ -1121,7 +1198,7 @@ export class GitRepo {
           repoId: lifecycle.repoId,
           missionGeneration: lifecycle.missionGeneration,
           candidateGeneration: lifecycle.candidateGeneration,
-          repositoryGeneration: lifecycle.repositoryGeneration,
+          repositoryGeneration: guard?.repositoryIdentity?.generation ?? lifecycle.repositoryGeneration,
           attempt: lifecycle.attempt,
           candidateSha,
           baseSha: boundBase,

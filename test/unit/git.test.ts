@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
-import { writeFile } from "node:fs/promises";
+import { access, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -818,6 +818,44 @@ test("locked worktree removal fails explicitly and succeeds on authoritative ret
     await exec("git", ["-C", fixture.root, "worktree", "unlock", worktree.path]);
     await repo.removeWorktree(worktree);
     assert.equal(await repo.resolveCommit(worktree.branch), null);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("branch deletion failure remains retryable after the worktree has already been removed", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const repo = (await GitRepo.open(fixture.root))!;
+    const worktree = await repo.createWorktree(await repo.headCommit(), "branch-delete-retry");
+    await assert.rejects(
+      repo.removeWorktree(
+        worktree,
+        { cleanupIdentity: { missionId: "MSN-cleanup", repoId: "repo-cleanup" } },
+        undefined,
+        {
+          deleteBranch: async () => ({ stdout: "", stderr: "simulated branch lock", code: 1 }),
+        },
+      ),
+      /branch delete failed.*simulated branch lock/i,
+    );
+    await assert.rejects(access(worktree.path));
+    assert.ok(await repo.resolveCommit(worktree.branch), "branch-only pending cleanup must remain addressable");
+    const pending = await repo.loadPendingBranchCleanups("MSN-cleanup", "repo-cleanup");
+    assert.equal(pending.length, 1);
+    assert.deepEqual(
+      {
+        missionId: pending[0]?.missionId,
+        repoId: pending[0]?.repoId,
+        path: pending[0]?.path,
+        branch: pending[0]?.branch,
+      },
+      { missionId: "MSN-cleanup", repoId: "repo-cleanup", path: worktree.path, branch: worktree.branch },
+    );
+
+    await repo.removeWorktree(worktree, { cleanupIdentity: { missionId: "MSN-cleanup", repoId: "repo-cleanup" } });
+    assert.equal(await repo.resolveCommit(worktree.branch), null);
+    assert.deepEqual(await repo.loadPendingBranchCleanups("MSN-cleanup", "repo-cleanup"), []);
   } finally {
     await fixture.cleanup();
   }

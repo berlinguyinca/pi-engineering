@@ -1123,6 +1123,10 @@ export class ExecutionBroker {
       ...new Set([
         ...(this.missionWorktrees.get(missionId) ?? []).map((worktree) => worktree.repoId ?? ""),
         ...(candidateRepoId ? [candidateRepoId] : []),
+        ...this.store
+          .listTasks(missionId)
+          .map((task) => task.repo_id)
+          .filter((repoId): repoId is string => typeof repoId === "string"),
       ]),
     ];
     const failures: CleanupFailure[] = [];
@@ -1131,9 +1135,39 @@ export class ExecutionBroker {
       try {
         acquired = opts.authorityForRepo ? await opts.authorityForRepo(repoId) : opts.authority;
         const assertOrigin = acquired ? () => acquired!.assertAuthoritative() : undefined;
+        const trackedGit =
+          (this.missionWorktrees.get(missionId) ?? []).find((worktree) => (worktree.repoId ?? "") === repoId)?.git ??
+          (this.missionCandidates.get(missionId)?.lifecycle.repoId === repoId
+            ? this.missionCandidates.get(missionId)?.git
+            : undefined);
+        const cleanupGit =
+          trackedGit ?? (this.resolveRepository ? (await this.resolveRepository(repoId, [])).git : undefined);
+        const pendingBranchCleanups = cleanupGit ? await cleanupGit.loadPendingBranchCleanups(missionId, repoId) : [];
+        const trackedBranches = new Set(
+          (this.missionWorktrees.get(missionId) ?? [])
+            .filter((worktree) => (worktree.repoId ?? "") === repoId)
+            .map((worktree) => worktree.branch),
+        );
         failures.push(
           ...(await this.releaseMissionWorktrees(missionId, opts.keepBranches === true, assertOrigin, repoId)),
         );
+        for (const pending of pendingBranchCleanups.filter((record) => !trackedBranches.has(record.branch))) {
+          try {
+            await cleanupGit!.removeWorktree(
+              { path: pending.path, branch: pending.branch },
+              { cleanupIdentity: { missionId, repoId } },
+              acquired,
+            );
+          } catch (error) {
+            failures.push({
+              repoId,
+              path: pending.path,
+              branch: pending.branch,
+              preserved: true,
+              reason: error instanceof Error ? error.message : String(error),
+            });
+          }
+        }
         const candidate = this.missionCandidates.get(missionId);
         if (candidate?.lifecycle.repoId === repoId && candidate.lifecycle.state === "promoted") {
           try {
@@ -1178,7 +1212,28 @@ export class ExecutionBroker {
           });
         }
       } finally {
-        if (opts.authorityForRepo && acquired) await acquired.close();
+        if (opts.authorityForRepo && acquired) {
+          try {
+            const closeError = await acquired.close();
+            if (closeError) {
+              failures.push({
+                repoId,
+                path: "",
+                branch: "",
+                preserved: false,
+                reason: `repository cleanup authority release failed: ${closeError.message}`,
+              });
+            }
+          } catch (error) {
+            failures.push({
+              repoId,
+              path: "",
+              branch: "",
+              preserved: false,
+              reason: `repository cleanup authority release failed: ${error instanceof Error ? error.message : String(error)}`,
+            });
+          }
+        }
       }
     }
     for (const failure of failures) {
@@ -1256,7 +1311,7 @@ export class ExecutionBroker {
           try {
             await wt.git.removeWorktree(
               { path: wt.path, branch: wt.branch },
-              { keepBranch: keep },
+              { keepBranch: keep, cleanupIdentity: { missionId, repoId: wt.repoId ?? "" } },
               assertOrigin ? { assertAuthoritative: assertOrigin } : undefined,
             );
           } catch (error) {
@@ -1376,12 +1431,7 @@ export class ExecutionBroker {
         );
         if (lifecycles.length > 1) throw new Error("CANDIDATE_AMBIGUOUS: multiple open candidates match promotion");
         const lifecycle = lifecycles[0];
-        if (lifecycle?.state === "promotion_intent" || lifecycle?.state === "promoted") {
-          const recovered = await repository.git.reconcilePromotion(lifecycle, authority);
-          if (!recovered.promoted) throw new Error(recovered.reason ?? "candidate promotion recovery failed");
-          return true;
-        }
-        if (lifecycle?.state === "integrating") {
+        if (lifecycle) {
           const reconciled = await repository.git.reconcileCandidateWorktree(lifecycle, authority);
           if (reconciled) {
             candidate = { lifecycle, git: repository.git };
@@ -2098,6 +2148,24 @@ export class ExecutionBroker {
       let matching = exactGeneration.filter(
         (record) => record.state === "integrating" || record.state === "promotion_intent",
       );
+      if (matching.length === 0 && backend !== "integration") {
+        const completedPromotions = await repository.git.loadPromotionLifecycles(input.missionId, input.repoId);
+        const completedCandidateIds = new Set(
+          completedPromotions
+            .filter(
+              (promotion) =>
+                promotion.state === "completed" &&
+                promotion.missionGeneration === missionGeneration &&
+                promotion.candidateGeneration === candidateGeneration &&
+                promotion.baseSha === boundBase,
+            )
+            .map((promotion) => `${promotion.candidateId}:${promotion.candidateSha}`),
+        );
+        matching = exactGeneration.filter(
+          (record) =>
+            record.state === "promoted" && completedCandidateIds.has(`${record.candidateId}:${record.candidateSha}`),
+        );
+      }
       if (matching.length === 0 && backend === "integration") {
         const parentIds = new Set(exactGeneration.map((record) => record.parentCandidateId).filter(Boolean));
         matching = exactGeneration.filter(

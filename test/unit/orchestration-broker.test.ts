@@ -1552,14 +1552,161 @@ describe("ExecutionBroker (spec 03)", () => {
       );
       await git.removeWorktree(candidate, { keepBranch: true });
 
+      let recoveredGatePath: string | null = null;
       const restarted = new ExecutionBroker({
         store,
         resolveRepository: async () => ({ repoId: "repo-promotion-restart", root: fx.root, git }),
-        backends: {},
+        backends: {
+          validation: {
+            candidateScoped: true,
+            runValidation: async ({ worktree }) => {
+              recoveredGatePath = worktree ?? null;
+              return {
+                executionId: "recovered-gate",
+                exitStatus: "succeeded",
+                summary: "exact promoted candidate inspected",
+                artifactRefs: [],
+                usage: {},
+              };
+            },
+          },
+        },
       });
+
+      const validationTask = store.createTask({
+        mission_id: mission.mission_id,
+        kind: "validation",
+        role: "validator",
+        objective: "recover exact promoted candidate context",
+        repo_id: "repo-promotion-restart",
+        mission_generation: 0,
+        candidate_generation: 0,
+      });
+      await (
+        await restarted.execute({
+          taskId: validationTask.task_id,
+          missionId: mission.mission_id,
+          repoId: "repo-promotion-restart",
+          kind: "validation",
+          objective: validationTask.objective,
+        })
+      ).result();
+      assert.equal(recoveredGatePath, candidate.path, "completed promotion must restore only its exact candidate cwd");
 
       assert.equal(await restarted.promoteCandidate(mission.mission_id), true);
       assert.equal(await git.headCommit(), candidate.candidateSha);
+    } finally {
+      await fx.cleanup();
+    }
+  });
+
+  it("fresh current gates reauthorize a base-only stale intent and promote under current authority", async () => {
+    const fx = await makeFixtureRepo();
+    try {
+      const git = (await GitRepo.open(fx.root))!;
+      const store = MissionStore.open(JsonlEventStore.inMemory());
+      const base = await git.headCommit();
+      const mission = store.createMission({
+        title: "reauthorize promotion",
+        goal: "reauthorize promotion",
+        user_request: "reauthorize promotion",
+        repository: fx.root,
+        base_ref: base,
+        risk_profile: "medium",
+        workflow_class: "engineering_review",
+      });
+      store.bindWorkspaceManifest({
+        manifestId: "WM-reauthorize-promotion",
+        missionId: mission.mission_id,
+        generation: 1,
+        authorizedRoots: [{ canonicalPath: fx.root, source: "existing_manifest", access: "write" }],
+        repositories: [
+          {
+            repoId: "repo-reauthorize-promotion",
+            canonicalRoot: fx.root,
+            baseRef: "main",
+            baseSha: base,
+            writableDomains: ["**"],
+          },
+        ],
+        dependencyEdges: [],
+        hash: "manifest-reauthorize-promotion",
+        createdAt: new Date().toISOString(),
+      });
+      const integrationTask = store.createTask({
+        mission_id: mission.mission_id,
+        kind: "integration",
+        role: "integrator",
+        objective: "integrate",
+        repo_id: "repo-reauthorize-promotion",
+        mission_generation: 0,
+        candidate_generation: 0,
+      });
+      store.transitionTask(integrationTask.task_id, "READY");
+      store.transitionTask(integrationTask.task_id, "RUNNING");
+      const execution = store.createExecution({
+        task_id: integrationTask.task_id,
+        mission_id: mission.mission_id,
+        backend: "integration",
+        repo_id: "repo-reauthorize-promotion",
+        base_sha: base,
+        mission_generation: 0,
+        candidate_generation: 0,
+      });
+      store.assignTaskExecution(integrationTask.task_id, execution.execution_id);
+      store.setExecutionStatus(execution.execution_id, "RUNNING");
+      store.setExecutionStatus(execution.execution_id, "SUCCEEDED");
+      store.transitionTask(integrationTask.task_id, "SUCCEEDED");
+      const candidate = await git.createCandidateWorktree(base, {
+        missionId: mission.mission_id,
+        repoId: "repo-reauthorize-promotion",
+        missionGeneration: 0,
+        candidateGeneration: 0,
+        repositoryGeneration: 1,
+        attempt: execution.execution_id,
+      });
+      await writeFile(join(candidate.path, "src", "reauthorized.ts"), "export const current = true;\n");
+      await git.commitAll(candidate.path, "reauthorized candidate");
+      candidate.candidateSha = await git.headCommitIn(candidate.path);
+      await git.persistCandidateLifecycle(candidate);
+      let stale = false;
+      await assert.rejects(
+        git.promoteCandidate(
+          candidate,
+          base,
+          {
+            assertAuthoritative: () => {
+              if (stale) throw new Error("takeover before CAS");
+            },
+          },
+          candidate,
+          {
+            beforeCas: () => {
+              stale = true;
+            },
+          },
+        ),
+        /takeover before CAS/,
+      );
+      assert.equal(await git.headCommit(), base);
+
+      const broker = new ExecutionBroker({
+        store,
+        resolveRepository: async () => ({ repoId: "repo-reauthorize-promotion", root: fx.root, git }),
+        backends: {},
+      });
+      const authority = {
+        missionIdentity: { missionId: mission.mission_id, generation: 0, fencingToken: 8 },
+        repositoryIdentity: { repoId: "repo-reauthorize-promotion", generation: 99, fencingToken: 12 },
+        assertAuthoritative: () => {},
+        onInvalidated: () => () => {},
+        close: async () => undefined,
+      } as never;
+      assert.equal(await broker.promoteCandidate(mission.mission_id, authority), true);
+      assert.equal(await git.headCommit(), candidate.candidateSha);
+      const promotions = await git.loadPromotionLifecycles(candidate.missionId, candidate.repoId);
+      assert.equal(promotions.at(-1)?.state, "completed");
+      assert.equal(promotions.at(-1)?.repositoryGeneration, 99, "fresh authority must supersede stale origin intent");
     } finally {
       await fx.cleanup();
     }
@@ -2905,6 +3052,7 @@ it("cleans repositories independently and durably reports a locked removal for r
     ]);
     const acquired: string[] = [];
     const closed: string[] = [];
+    let failRepoTwoRelease = true;
     const authorityForRepo = async (repoId: string) => {
       acquired.push(repoId);
       return {
@@ -2914,7 +3062,7 @@ it("cleans repositories independently and durably reports a locked removal for r
         onInvalidated: () => () => {},
         close: async () => {
           closed.push(repoId);
-          return undefined;
+          return repoId === "repo-two" && failRepoTwoRelease ? new Error("simulated lease release failure") : undefined;
         },
       } as never;
     };
@@ -2922,8 +3070,13 @@ it("cleans repositories independently and durably reports a locked removal for r
     const firstPass = await broker.cleanupMission(mission.mission_id, { authorityForRepo });
     assert.deepEqual(acquired.sort(), ["repo-one", "repo-two"]);
     assert.deepEqual(closed.sort(), ["repo-one", "repo-two"]);
-    assert.equal(firstPass.failures.length, 1);
-    assert.equal(firstPass.failures[0]?.repoId, "repo-one");
+    assert.equal(firstPass.failures.length, 2);
+    assert.ok(firstPass.failures.some((failure) => failure.repoId === "repo-one" && failure.preserved));
+    assert.ok(
+      firstPass.failures.some(
+        (failure) => failure.repoId === "repo-two" && failure.reason.includes("simulated lease release failure"),
+      ),
+    );
     await assert.rejects(access(second.path));
     assert.equal(await firstGit.headCommitIn(first.path), await firstGit.headCommit());
     assert.ok(
@@ -2931,6 +3084,7 @@ it("cleans repositories independently and durably reports a locked removal for r
     );
 
     await exec("git", ["-C", firstFixture.root, "worktree", "unlock", first.path]);
+    failRepoTwoRelease = false;
     const retry = await broker.cleanupMission(mission.mission_id, { authorityForRepo });
     assert.deepEqual(retry.failures, []);
     await assert.rejects(access(first.path));
