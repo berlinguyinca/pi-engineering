@@ -2872,3 +2872,70 @@ it("preserves a failed worker's uncommitted edits (never merges or discards them
     await fx.cleanup();
   }
 });
+
+it("cleans repositories independently and durably reports a locked removal for retry", async () => {
+  const firstFixture = await makeFixtureRepo();
+  const secondFixture = await makeFixtureRepo();
+  try {
+    const firstGit = (await GitRepo.open(firstFixture.root))!;
+    const secondGit = (await GitRepo.open(secondFixture.root))!;
+    const first = await firstGit.createWorktree(await firstGit.headCommit(), "multi-cleanup-first");
+    const second = await secondGit.createWorktree(await secondGit.headCommit(), "multi-cleanup-second");
+    await exec("git", ["-C", firstFixture.root, "worktree", "lock", first.path]);
+    const store = MissionStore.open(JsonlEventStore.inMemory());
+    const mission = store.createMission({
+      title: "multi cleanup",
+      goal: "multi cleanup",
+      user_request: "multi cleanup",
+      repository: firstFixture.root,
+      base_ref: await firstGit.headCommit(),
+      risk_profile: "medium",
+      workflow_class: "engineering_review",
+    });
+    const broker = new ExecutionBroker({ store, backends: {} });
+    const internals = broker as unknown as {
+      missionWorktrees: Map<
+        string,
+        Array<{ path: string; branch: string; git: GitRepo; repoId: string; writeDomains: string[] }>
+      >;
+    };
+    internals.missionWorktrees.set(mission.mission_id, [
+      { ...first, git: firstGit, repoId: "repo-one", writeDomains: [] },
+      { ...second, git: secondGit, repoId: "repo-two", writeDomains: [] },
+    ]);
+    const acquired: string[] = [];
+    const closed: string[] = [];
+    const authorityForRepo = async (repoId: string) => {
+      acquired.push(repoId);
+      return {
+        missionIdentity: { missionId: mission.mission_id, generation: 1, fencingToken: 1 },
+        repositoryIdentity: { repoId, generation: 1, fencingToken: 1 },
+        assertAuthoritative: () => {},
+        onInvalidated: () => () => {},
+        close: async () => {
+          closed.push(repoId);
+          return undefined;
+        },
+      } as never;
+    };
+
+    const firstPass = await broker.cleanupMission(mission.mission_id, { authorityForRepo });
+    assert.deepEqual(acquired.sort(), ["repo-one", "repo-two"]);
+    assert.deepEqual(closed.sort(), ["repo-one", "repo-two"]);
+    assert.equal(firstPass.failures.length, 1);
+    assert.equal(firstPass.failures[0]?.repoId, "repo-one");
+    await assert.rejects(access(second.path));
+    assert.equal(await firstGit.headCommitIn(first.path), await firstGit.headCommit());
+    assert.ok(
+      store.listFindings(mission.mission_id).some((finding) => finding.summary.includes("Pending repository cleanup")),
+    );
+
+    await exec("git", ["-C", firstFixture.root, "worktree", "unlock", first.path]);
+    const retry = await broker.cleanupMission(mission.mission_id, { authorityForRepo });
+    assert.deepEqual(retry.failures, []);
+    await assert.rejects(access(first.path));
+  } finally {
+    await firstFixture.cleanup();
+    await secondFixture.cleanup();
+  }
+});

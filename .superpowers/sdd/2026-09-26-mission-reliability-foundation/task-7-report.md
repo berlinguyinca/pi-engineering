@@ -99,3 +99,35 @@ The second review round hardened restart and concurrency boundaries:
 ### Fix-round-2 residual concerns
 
 - `ExclusiveFileLock` is intentionally a local-filesystem protocol. Shared/network filesystems or hosts with different PID namespaces still require a distributed lock and remain outside the local-promotion contract.
+
+## Fix round 3
+
+Candidate identity is now stable across integration retries. A `CandidateRecord` owns the durable branch/path/base/current SHA, creation execution, and optional parent/seed lineage; each integration execution owns a separate `IntegrationRunRecord` keyed by candidate ID and execution ID. Every run freezes the complete handoff plan to exact commit SHAs before its first merge, journals each sequence independently, and updates both the run SHA and candidate SHA after mutation. Preserved repair work creates a child candidate seeded from the preserved parent rather than reusing or deleting it.
+
+Merge restart handling now inspects `MERGE_HEAD`, unmerged index entries, and full worktree status. Conflict recovery persists `abort_intent` before `git merge --abort`, checks the command result, and proves the original clean HEAD/no-merge state before recording a completed conflict. Advanced candidate refs reconcile from the exact pending run journal and ancestry proof before exact-SHA restoration rejects them.
+
+Committed-promotion reconciliation is a dedicated pre-gate operation. Historical intent identity remains unchanged, while a newly acquired repository authority guards recovery. Only `HEAD == candidateSha` with an exact durable intent is reconciled; `HEAD == baseSha` remains an uncommitted intent and performs no compare-and-swap, while any other HEAD is reported as divergence.
+
+Cleanup now inventories by repository, acquires and closes authority independently for each repository, continues after another repository fails, checks `git worktree remove` exit status, returns structured failures, and records durable pending-cleanup findings containing repository/path/branch/preservation details. Failed removals remain retryable; candidate preservation and promoted-candidate cleanup failures are explicit.
+
+### Fix-round-3 RED/GREEN evidence
+
+- RED: the new two-repository cleanup regression failed because a failed removal was placed in the permanently retained set, preventing the required retry.
+- RED: adversarial tests captured the pre-fix collision model: sequence zero lived on the candidate rather than a run, handoff refs were resolved during each merge, and conflict abort had no durable intermediate state.
+- GREEN: focused Task 7 suite passed 89/89, including two run-local sequence-zero journals, frozen future handoffs, advanced-ref replay, dirty conflict replay, abort failure, fresh-authority promotion recovery, exact-intent/no-CAS behavior, child candidate lineage, locked removal retry, and independent two-repository cleanup.
+- GREEN: `npm run typecheck` passed.
+- GREEN: `npm run lint` passed (`Checked 583 files`).
+- GREEN: `git diff --check` passed.
+- GREEN: bounded `timeout 180 npm test` passed: 2,431 tests; 2,430 passed, 0 failed, 1 skipped.
+
+### Fix-round-3 reviewer focus
+
+- Verify candidate creation identity never changes when later `IntegrationRunRecord`s use sequence zero, and run restoration remains exact to repository/mission/candidate generation and candidate ID.
+- Verify the frozen run plan merges pinned `refSha` values even if source refs advance after planning.
+- Verify conflict completion is impossible until abort succeeds and clean HEAD/no `MERGE_HEAD`/no unmerged index is proven.
+- Verify pre-gate promotion reconciliation requires exact historical intent but uses fresh current authority immediately before recovery reset; an old base-only intent never performs CAS.
+- Verify cleanup authority and failure reporting are repository-scoped, independent, durable, and retryable.
+
+### Fix-round-3 residual concerns
+
+- `ExclusiveFileLock` remains intentionally local-filesystem scoped, as noted above. No new distributed-lock behavior was introduced.

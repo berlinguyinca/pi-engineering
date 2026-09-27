@@ -35,22 +35,30 @@ export interface PromotionResult {
   candidateSha: string | null;
 }
 
-export interface CandidateLifecycle {
+export interface CandidateRecord {
+  candidateId: string;
   missionId: string;
   repoId: string;
   missionGeneration: number;
   candidateGeneration: number;
   repositoryGeneration: number;
+  /** Execution which created this candidate. It never changes across later integration runs. */
   attempt: string;
+  parentCandidateId?: string;
+  seedSha?: string;
   branch: string;
   path: string;
   baseSha: string;
   candidateSha: string;
   state: "integrating" | "preserved" | "promotion_intent" | "promoted";
+  /** Legacy journals are read for backwards compatibility only. */
   merges?: CandidateMergeLifecycle[];
   checks?: CandidateCheckLifecycle[];
   updatedAt: string;
 }
+
+/** @deprecated Use CandidateRecord; retained for source compatibility with backend adapters. */
+export type CandidateLifecycle = CandidateRecord;
 
 export interface CandidateMergeLifecycle {
   sequence: number;
@@ -58,10 +66,25 @@ export interface CandidateMergeLifecycle {
   refSha: string;
   beforeSha: string;
   afterSha?: string;
-  state: "intent" | "completed";
+  state: "planned" | "intent" | "abort_intent" | "completed";
   merged?: boolean;
   conflict?: boolean;
   reason?: string | null;
+}
+
+export interface IntegrationRunRecord {
+  candidateId: string;
+  runId: string;
+  missionId: string;
+  repoId: string;
+  missionGeneration: number;
+  candidateGeneration: number;
+  startingCandidateSha: string;
+  candidateSha: string;
+  state: "planned" | "running" | "completed" | "preserved";
+  merges: CandidateMergeLifecycle[];
+  checks: CandidateCheckLifecycle[];
+  updatedAt: string;
 }
 
 export interface CandidateCheckLifecycle {
@@ -72,6 +95,7 @@ export interface CandidateCheckLifecycle {
 }
 
 export interface PromotionLifecycle {
+  candidateId: string;
   missionId: string;
   repoId: string;
   missionGeneration: number;
@@ -84,8 +108,21 @@ export interface PromotionLifecycle {
   updatedAt: string;
 }
 
+type PromotionIdentity = Pick<
+  CandidateRecord,
+  | "missionId"
+  | "repoId"
+  | "missionGeneration"
+  | "candidateGeneration"
+  | "repositoryGeneration"
+  | "attempt"
+  | "baseSha"
+  | "candidateSha"
+> & { candidateId?: string };
+
 export interface PromotionHooks {
   afterLockAcquired?: () => Promise<void> | void;
+  beforeCas?: () => Promise<void> | void;
   afterCas?: () => Promise<void> | void;
   afterReset?: () => Promise<void> | void;
   afterCandidateState?: () => Promise<void> | void;
@@ -94,6 +131,9 @@ export interface PromotionHooks {
 
 export interface MergeJournalHooks {
   afterMutation?: () => Promise<void> | void;
+  afterConflict?: () => Promise<void> | void;
+  afterAbortIntent?: () => Promise<void> | void;
+  abortMerge?: () => Promise<GitResult>;
 }
 
 /**
@@ -186,6 +226,28 @@ export class GitRepo {
       .join(".")}.json`;
   }
 
+  private candidateId(identity: {
+    missionId: string;
+    repoId: string;
+    missionGeneration: number;
+    candidateGeneration: number;
+    attempt: string;
+  }): string {
+    return [
+      identity.missionId,
+      identity.repoId,
+      String(identity.missionGeneration),
+      String(identity.candidateGeneration),
+      identity.attempt,
+    ]
+      .map((part) => Buffer.from(part).toString("base64url"))
+      .join(".");
+  }
+
+  private integrationRunStateName(candidateId: string, runId: string): string {
+    return `run.${[candidateId, runId].map((part) => Buffer.from(part).toString("base64url")).join(".")}.json`;
+  }
+
   private promotionStateName(
     record: Pick<
       PromotionLifecycle,
@@ -232,12 +294,23 @@ export class GitRepo {
     await rename(temporary, target);
   }
 
+  async persistIntegrationRun(record: IntegrationRunRecord, guard?: GitMutationGuard): Promise<void> {
+    guard?.assertAuthoritative();
+    const dir = await this.candidateStateDir();
+    const target = join(dir, this.integrationRunStateName(record.candidateId, record.runId));
+    const temporary = `${target}.${process.pid}.tmp`;
+    await writeFile(temporary, JSON.stringify(record), "utf8");
+    guard?.assertAuthoritative();
+    await rename(temporary, target);
+  }
+
   async loadCandidateLifecycles(missionId: string, repoId: string): Promise<CandidateLifecycle[]> {
     const dir = await this.candidateStateDir(false);
     const records: CandidateLifecycle[] = [];
     for (const name of await readdir(dir).catch(() => [] as string[])) {
       if (!name.endsWith(".json")) continue;
       try {
+        if (name.startsWith("promotion.") || name.startsWith("run.")) continue;
         const parsed = JSON.parse(await readFile(join(dir, name), "utf8")) as CandidateLifecycle;
         if (
           parsed.missionId === missionId &&
@@ -250,7 +323,7 @@ export class GitRepo {
           typeof parsed.path === "string" &&
           typeof parsed.candidateSha === "string"
         ) {
-          records.push(parsed);
+          records.push({ ...parsed, candidateId: parsed.candidateId ?? this.candidateId(parsed) });
         }
       } catch {
         // Malformed lifecycle records are ignored here and fail closed when no
@@ -263,6 +336,73 @@ export class GitRepo {
         a.candidateGeneration - b.candidateGeneration ||
         a.updatedAt.localeCompare(b.updatedAt),
     );
+  }
+
+  async loadIntegrationRuns(missionId: string, repoId: string): Promise<IntegrationRunRecord[]> {
+    const dir = await this.candidateStateDir(false);
+    const records: IntegrationRunRecord[] = [];
+    for (const name of await readdir(dir).catch(() => [] as string[])) {
+      if (!name.startsWith("run.") || !name.endsWith(".json")) continue;
+      try {
+        const parsed = JSON.parse(await readFile(join(dir, name), "utf8")) as IntegrationRunRecord;
+        if (
+          parsed.missionId === missionId &&
+          parsed.repoId === repoId &&
+          typeof parsed.candidateId === "string" &&
+          typeof parsed.runId === "string" &&
+          Array.isArray(parsed.merges)
+        ) {
+          records.push(parsed);
+        }
+      } catch {
+        // Unreadable run state is never used to authorize replay.
+      }
+    }
+    return records.sort((a, b) => a.updatedAt.localeCompare(b.updatedAt));
+  }
+
+  async beginIntegrationRun(
+    candidate: CandidateRecord,
+    runId: string,
+    refs: string[],
+    guard?: GitMutationGuard,
+  ): Promise<IntegrationRunRecord> {
+    if (candidate.state !== "integrating") {
+      throw new Error(`candidate ${candidate.candidateId} is not open for integration (${candidate.state})`);
+    }
+    const prior = (await this.loadIntegrationRuns(candidate.missionId, candidate.repoId)).find(
+      (run) => run.candidateId === candidate.candidateId && run.runId === runId,
+    );
+    if (prior) return prior;
+    const pinned: Array<{ ref: string; refSha: string }> = [];
+    for (const ref of refs) {
+      const refSha = await this.resolveCommit(ref);
+      if (!refSha) throw new Error(`handoff ref is unavailable: ${ref}`);
+      pinned.push({ ref, refSha });
+    }
+    guard?.assertAuthoritative();
+    const record: IntegrationRunRecord = {
+      candidateId: candidate.candidateId,
+      runId,
+      missionId: candidate.missionId,
+      repoId: candidate.repoId,
+      missionGeneration: candidate.missionGeneration,
+      candidateGeneration: candidate.candidateGeneration,
+      startingCandidateSha: candidate.candidateSha,
+      candidateSha: candidate.candidateSha,
+      state: "planned",
+      merges: pinned.map(({ ref, refSha }, sequence) => ({
+        sequence,
+        ref,
+        refSha,
+        beforeSha: sequence === 0 ? candidate.candidateSha : "",
+        state: "planned",
+      })),
+      checks: [],
+      updatedAt: new Date().toISOString(),
+    };
+    await this.persistIntegrationRun(record, guard);
+    return record;
   }
 
   async loadPromotionLifecycles(missionId: string, repoId: string): Promise<PromotionLifecycle[]> {
@@ -283,7 +423,7 @@ export class GitRepo {
           typeof parsed.candidateSha === "string" &&
           (parsed.state === "intent" || parsed.state === "completed")
         ) {
-          records.push(parsed);
+          records.push({ ...parsed, candidateId: parsed.candidateId ?? this.candidateId(parsed) });
         }
       } catch {
         // Unreadable promotion state cannot authorize recovery.
@@ -301,6 +441,8 @@ export class GitRepo {
       candidateGeneration: number;
       repositoryGeneration: number;
       attempt: string;
+      parentCandidateId?: string;
+      seedSha?: string;
     },
     guard?: GitMutationGuard,
   ): Promise<CandidateLifecycle> {
@@ -327,11 +469,14 @@ export class GitRepo {
     ]
       .join("-")
       .replace(/[^a-zA-Z0-9._-]/g, "-");
-    const worktree = await this.createWorktree(baseSha, `pi-eng-candidate-${suffix}`, guard);
+    const seedSha = identity.seedSha ?? baseSha;
+    const worktree = await this.createWorktree(seedSha, `pi-eng-candidate-${suffix}`, guard);
     const record: CandidateLifecycle = {
       ...identity,
+      candidateId: this.candidateId(identity),
       ...worktree,
       baseSha,
+      seedSha,
       candidateSha: await this.headCommitIn(worktree.path),
       state: "integrating",
       updatedAt: new Date().toISOString(),
@@ -343,7 +488,40 @@ export class GitRepo {
   /** Re-open the exact persisted candidate, mounting its worktree if a crash removed only the checkout. */
   async reconcileCandidateWorktree(record: CandidateLifecycle, guard?: GitMutationGuard): Promise<WorktreeInfo | null> {
     const ref = await this.resolveCommit(record.branch);
-    if (ref !== record.candidateSha) return null;
+    if (ref !== record.candidateSha) {
+      const runs = (await this.loadIntegrationRuns(record.missionId, record.repoId)).filter(
+        (run) => run.candidateId === record.candidateId,
+      );
+      const proof = runs.find(
+        (run) =>
+          run.candidateSha === ref ||
+          run.merges.some(
+            (merge) =>
+              merge.state !== "completed" &&
+              merge.beforeSha === record.candidateSha &&
+              ref !== null &&
+              merge.refSha.length > 0,
+          ),
+      );
+      if (!ref || !proof) return null;
+      const pending = proof.merges.find(
+        (merge) => merge.state !== "completed" && merge.beforeSha === record.candidateSha,
+      );
+      if (pending && !(await this.isAncestor(pending.refSha, ref))) return null;
+      if (pending) {
+        proof.merges = proof.merges.map((merge) =>
+          merge.sequence === pending.sequence
+            ? { ...merge, state: "completed", merged: true, conflict: false, reason: null, afterSha: ref! }
+            : merge,
+        );
+      }
+      proof.candidateSha = ref;
+      proof.updatedAt = new Date().toISOString();
+      await this.persistIntegrationRun(proof, guard);
+      record.candidateSha = ref;
+      record.updatedAt = proof.updatedAt;
+      await this.persistCandidateLifecycle(record, guard);
+    }
     const mountedHead = await this.headCommitIn(record.path).catch(() => null);
     if (mountedHead === record.candidateSha) return { path: record.path, branch: record.branch };
     if (mountedHead !== null) return null;
@@ -357,11 +535,23 @@ export class GitRepo {
       : null;
   }
 
-  async beginCandidateCheck(lifecycle: CandidateLifecycle, checkId: string, guard?: GitMutationGuard): Promise<void> {
-    const prior = lifecycle.checks?.find((check) => check.checkId === checkId);
+  async beginCandidateCheck(
+    lifecycle: CandidateLifecycle,
+    checkId: string,
+    guard?: GitMutationGuard,
+    run?: IntegrationRunRecord,
+  ): Promise<void> {
+    const checks = run?.checks ?? lifecycle.checks ?? [];
+    const prior = checks.find((check) => check.checkId === checkId);
     if (prior?.state === "completed") return;
     const intent: CandidateCheckLifecycle = { checkId, state: "intent", updatedAt: new Date().toISOString() };
-    lifecycle.checks = [...(lifecycle.checks ?? []).filter((check) => check.checkId !== checkId), intent];
+    if (run) {
+      run.checks = [...run.checks.filter((check) => check.checkId !== checkId), intent];
+      run.updatedAt = intent.updatedAt;
+      await this.persistIntegrationRun(run, guard);
+    } else {
+      lifecycle.checks = [...checks.filter((check) => check.checkId !== checkId), intent];
+    }
     lifecycle.updatedAt = intent.updatedAt;
     await this.persistCandidateLifecycle(lifecycle, guard);
   }
@@ -371,6 +561,7 @@ export class GitRepo {
     checkId: string,
     passed: boolean,
     guard?: GitMutationGuard,
+    run?: IntegrationRunRecord,
   ): Promise<void> {
     const completed: CandidateCheckLifecycle = {
       checkId,
@@ -378,7 +569,14 @@ export class GitRepo {
       passed,
       updatedAt: new Date().toISOString(),
     };
-    lifecycle.checks = [...(lifecycle.checks ?? []).filter((check) => check.checkId !== checkId), completed];
+    if (run) {
+      run.checks = [...run.checks.filter((check) => check.checkId !== checkId), completed];
+      run.state = passed ? "completed" : "preserved";
+      run.updatedAt = completed.updatedAt;
+      await this.persistIntegrationRun(run, guard);
+    } else {
+      lifecycle.checks = [...(lifecycle.checks ?? []).filter((check) => check.checkId !== checkId), completed];
+    }
     lifecycle.updatedAt = completed.updatedAt;
     await this.persistCandidateLifecycle(lifecycle, guard);
   }
@@ -492,7 +690,10 @@ export class GitRepo {
   ): Promise<void> {
     await this.assertPromotionUnlocked();
     guard?.assertAuthoritative();
-    await this.git(["worktree", "remove", "--force", info.path]);
+    const removed = await this.git(["worktree", "remove", "--force", info.path]);
+    if (removed.code !== 0) {
+      throw new Error(`git worktree remove failed for ${info.path}: ${removed.stderr || removed.stdout}`);
+    }
     // Targeted, for the same reason creation is: a global prune here would be
     // able to delete a concurrently-created sibling's administrative directory.
     guard?.assertAuthoritative();
@@ -604,17 +805,76 @@ export class GitRepo {
     lifecycle?: CandidateLifecycle,
     sequence?: number,
     hooks: MergeJournalHooks = {},
+    run?: IntegrationRunRecord,
   ): Promise<{ merged: boolean; conflict: boolean; reason: string | null }> {
     await this.assertPromotionUnlocked();
     guard?.assertAuthoritative();
-    const refSha = await this.resolveCommit(ref);
+    let journal =
+      run && sequence !== undefined
+        ? run.merges.find((entry) => entry.sequence === sequence)
+        : lifecycle && sequence !== undefined
+          ? lifecycle.merges?.find((entry) => entry.sequence === sequence)
+          : undefined;
+    const refSha = journal?.refSha ?? (await this.resolveCommit(ref));
     if (!refSha) return { merged: false, conflict: false, reason: `handoff ref is unavailable: ${ref}` };
     const beforeSha = await this.headCommitIn(candidate.path);
-    let journal =
-      lifecycle && sequence !== undefined ? lifecycle.merges?.find((entry) => entry.sequence === sequence) : undefined;
     if (journal && (journal.ref !== ref || journal.refSha !== refSha)) {
       throw new Error(`candidate merge journal identity mismatch at sequence ${sequence}`);
     }
+    const persistJournal = async (entry: CandidateMergeLifecycle, candidateSha: string): Promise<void> => {
+      const now = new Date().toISOString();
+      if (run) {
+        run.merges = run.merges.map((item) => (item.sequence === entry.sequence ? entry : item));
+        run.candidateSha = candidateSha;
+        run.state = "running";
+        run.updatedAt = now;
+        await this.persistIntegrationRun(run, guard);
+      } else if (lifecycle && sequence !== undefined) {
+        lifecycle.merges = [...(lifecycle.merges ?? []).filter((item) => item.sequence !== sequence), entry];
+      }
+      if (lifecycle) {
+        lifecycle.candidateSha = candidateSha;
+        lifecycle.updatedAt = now;
+        await this.persistCandidateLifecycle(lifecycle, guard);
+      }
+    };
+    const mergeState = async (): Promise<{ mergeHead: boolean; unmerged: boolean; dirty: boolean }> => {
+      const [mergeHead, unmerged, status] = await Promise.all([
+        this.git(["-C", candidate.path, "rev-parse", "-q", "--verify", "MERGE_HEAD"]),
+        this.git(["-C", candidate.path, "diff", "--name-only", "--diff-filter=U"]),
+        this.git(["-C", candidate.path, "status", "--porcelain", "--untracked-files=all"]),
+      ]);
+      return {
+        mergeHead: mergeHead.code === 0 && mergeHead.stdout.length > 0,
+        unmerged: unmerged.stdout.length > 0,
+        dirty: status.stdout.length > 0,
+      };
+    };
+    const abortConflict = async (entry: CandidateMergeLifecycle, reason: string) => {
+      const abortIntent: CandidateMergeLifecycle = { ...entry, state: "abort_intent", conflict: true, reason };
+      await persistJournal(abortIntent, entry.beforeSha);
+      await hooks.afterAbortIntent?.();
+      guard?.assertAuthoritative();
+      const aborted = hooks.abortMerge
+        ? await hooks.abortMerge()
+        : await this.git(["-C", candidate.path, "merge", "--abort"]);
+      if (aborted.code !== 0) throw new Error(`candidate conflict abort failed: ${aborted.stderr || aborted.stdout}`);
+      const current = await this.headCommitIn(candidate.path);
+      const state = await mergeState();
+      if (current !== entry.beforeSha || state.mergeHead || state.unmerged || state.dirty) {
+        throw new Error(`candidate conflict abort did not restore clean HEAD ${entry.beforeSha}`);
+      }
+      const completed: CandidateMergeLifecycle = {
+        ...abortIntent,
+        state: "completed",
+        merged: false,
+        conflict: true,
+        reason,
+        afterSha: current,
+      };
+      await persistJournal(completed, current);
+      return { merged: false, conflict: true, reason };
+    };
     if (journal?.state === "completed") {
       const current = await this.headCommitIn(candidate.path);
       if (journal.afterSha && (await this.isAncestor(journal.afterSha, current))) {
@@ -626,31 +886,58 @@ export class GitRepo {
       }
       throw new Error(`candidate merge journal result is not present at HEAD for sequence ${sequence}`);
     }
+    if (journal?.state === "abort_intent") {
+      const state = await mergeState();
+      if (!state.mergeHead && !state.unmerged && !state.dirty && beforeSha === journal.beforeSha) {
+        const completed = {
+          ...journal,
+          state: "completed" as const,
+          merged: false,
+          conflict: true,
+          afterSha: beforeSha,
+        };
+        await persistJournal(completed, beforeSha);
+        return { merged: false, conflict: true, reason: journal.reason ?? "merge conflict" };
+      }
+      return abortConflict(journal, journal.reason ?? "merge conflict");
+    }
     if (journal?.state === "intent") {
       const current = await this.headCommitIn(candidate.path);
       if (current !== journal.beforeSha && (await this.isAncestor(journal.refSha, current))) {
         journal = { ...journal, state: "completed", merged: true, conflict: false, reason: null, afterSha: current };
-        lifecycle!.merges = [...(lifecycle!.merges ?? []).filter((entry) => entry.sequence !== sequence), journal];
-        lifecycle!.candidateSha = current;
-        lifecycle!.updatedAt = new Date().toISOString();
-        await this.persistCandidateLifecycle(lifecycle!, guard);
+        await persistJournal(journal, current);
         return { merged: true, conflict: false, reason: null };
       }
       if (current !== journal.beforeSha) {
         throw new Error(`candidate HEAD cannot reconcile merge intent at sequence ${sequence}`);
       }
-    } else if (lifecycle && sequence !== undefined) {
+      const state = await mergeState();
+      if (state.mergeHead || state.unmerged) {
+        return abortConflict(journal, journal.reason ?? "merge conflict recovered from interrupted merge");
+      }
+      if (state.dirty) throw new Error(`candidate merge intent has unexpected dirty worktree at sequence ${sequence}`);
+    } else if ((lifecycle || run) && sequence !== undefined) {
       journal = { sequence, ref, refSha, beforeSha, state: "intent" };
-      lifecycle.merges = [...(lifecycle.merges ?? []), journal];
-      lifecycle.updatedAt = new Date().toISOString();
-      await this.persistCandidateLifecycle(lifecycle, guard);
+      await persistJournal(journal, beforeSha);
+    } else if (journal?.state === "planned") {
+      journal = { ...journal, beforeSha, state: "intent" };
+      await persistJournal(journal, beforeSha);
     }
     guard?.assertAuthoritative();
-    const r = await this.git(["-C", candidate.path, "--no-pager", "merge", "--no-ff", "-m", `integrate ${ref}`, ref]);
+    const r = await this.git([
+      "-C",
+      candidate.path,
+      "--no-pager",
+      "merge",
+      "--no-ff",
+      "-m",
+      `integrate ${ref}`,
+      refSha,
+    ]);
     if (r.code === 0) {
       await hooks.afterMutation?.();
       const afterSha = await this.headCommitIn(candidate.path);
-      if (lifecycle && journal && sequence !== undefined) {
+      if ((lifecycle || run) && journal && sequence !== undefined) {
         const completed: CandidateMergeLifecycle = {
           ...journal,
           state: "completed",
@@ -659,20 +946,20 @@ export class GitRepo {
           reason: null,
           afterSha,
         };
-        lifecycle.merges = [...(lifecycle.merges ?? []).filter((entry) => entry.sequence !== sequence), completed];
-        lifecycle.candidateSha = afterSha;
-        lifecycle.updatedAt = new Date().toISOString();
-        await this.persistCandidateLifecycle(lifecycle, guard);
+        await persistJournal(completed, afterSha);
       }
       return { merged: true, conflict: false, reason: null };
     }
     const conflicted = r.stdout.includes("CONFLICT") || r.stderr.includes("CONFLICT");
     const reason = (r.stderr || r.stdout || "merge failed").split("\n")[0]?.slice(0, 200) ?? "merge failed";
     if (conflicted) {
+      await hooks.afterConflict?.();
+      if (journal) return abortConflict(journal, reason);
       guard?.assertAuthoritative();
-      await this.git(["-C", candidate.path, "merge", "--abort"]);
+      const aborted = await this.git(["-C", candidate.path, "merge", "--abort"]);
+      if (aborted.code !== 0) throw new Error(`candidate conflict abort failed: ${aborted.stderr || aborted.stdout}`);
     }
-    if (lifecycle && journal && sequence !== undefined) {
+    if ((lifecycle || run) && journal && sequence !== undefined) {
       const afterSha = await this.headCommitIn(candidate.path);
       const completed: CandidateMergeLifecycle = {
         ...journal,
@@ -682,10 +969,7 @@ export class GitRepo {
         reason,
         afterSha,
       };
-      lifecycle.merges = [...(lifecycle.merges ?? []).filter((entry) => entry.sequence !== sequence), completed];
-      lifecycle.candidateSha = afterSha;
-      lifecycle.updatedAt = new Date().toISOString();
-      await this.persistCandidateLifecycle(lifecycle, guard);
+      await persistJournal(completed, afterSha);
     }
     return { merged: false, conflict: conflicted, reason };
   }
@@ -725,6 +1009,7 @@ export class GitRepo {
         }
         return await this.reconcilePromotionLocked(
           {
+            candidateId: lifecycle.candidateId,
             missionId: lifecycle.missionId,
             repoId: lifecycle.repoId,
             missionGeneration: lifecycle.missionGeneration,
@@ -771,6 +1056,7 @@ export class GitRepo {
       if (lifecycle) {
         await this.persistPromotionLifecycle(
           {
+            candidateId: lifecycle.candidateId,
             missionId: lifecycle.missionId,
             repoId: lifecycle.repoId,
             missionGeneration: lifecycle.missionGeneration,
@@ -794,6 +1080,7 @@ export class GitRepo {
       if ((await this.headCommit()) !== boundBase) {
         return { promoted: false, reason: `incumbent diverged from bound base ${boundBase}`, candidateSha };
       }
+      await hooks.beforeCas?.();
       guard?.assertAuthoritative();
       const advanced = await this.git(["update-ref", "HEAD", candidateSha, boundBase]);
       if (advanced.code !== 0) {
@@ -819,14 +1106,17 @@ export class GitRepo {
       if (lifecycle) {
         // Once HEAD moved, authority loss is reconciled as a committed promotion,
         // never reported as an ordinary rejection that callers might retry.
-        await this.persistCandidateLifecycle({
+        const promotedLifecycle: CandidateLifecycle = {
           ...lifecycle,
           candidateSha,
           state: "promoted",
           updatedAt: new Date().toISOString(),
-        });
+        };
+        await this.persistCandidateLifecycle(promotedLifecycle);
+        Object.assign(lifecycle, promotedLifecycle);
         await hooks.afterCandidateState?.();
         await this.persistPromotionLifecycle({
+          candidateId: lifecycle.candidateId,
           missionId: lifecycle.missionId,
           repoId: lifecycle.repoId,
           missionGeneration: lifecycle.missionGeneration,
@@ -846,20 +1136,7 @@ export class GitRepo {
     }
   }
 
-  async reconcilePromotion(
-    identity: Pick<
-      CandidateLifecycle,
-      | "missionId"
-      | "repoId"
-      | "missionGeneration"
-      | "candidateGeneration"
-      | "repositoryGeneration"
-      | "attempt"
-      | "baseSha"
-      | "candidateSha"
-    >,
-    guard?: GitMutationGuard,
-  ): Promise<PromotionResult> {
+  async reconcilePromotion(identity: PromotionIdentity, guard?: GitMutationGuard): Promise<PromotionResult> {
     guard?.assertAuthoritative();
     const lockFile = join(await this.commonDir(), "pi-engineering-promotion");
     let lock: ExclusiveFileLock;
@@ -875,6 +1152,7 @@ export class GitRepo {
     try {
       const lifecycle = (await this.loadCandidateLifecycles(identity.missionId, identity.repoId)).find(
         (record) =>
+          record.candidateId === (identity.candidateId ?? this.candidateId(identity)) &&
           record.missionGeneration === identity.missionGeneration &&
           record.candidateGeneration === identity.candidateGeneration &&
           record.attempt === identity.attempt &&
@@ -887,24 +1165,49 @@ export class GitRepo {
     }
   }
 
+  /**
+   * Recover only promotion side effects already committed by an exact durable
+   * intent. The caller supplies fresh authority; the intent retains the
+   * historical authority identity which originated the CAS.
+   */
+  async reconcileCommittedPromotions(
+    missionId: string,
+    repoId: string,
+    guard: GitMutationGuard,
+  ): Promise<PromotionResult[]> {
+    guard.assertAuthoritative();
+    const intents = (await this.loadPromotionLifecycles(missionId, repoId)).filter(
+      (record) => record.state === "intent",
+    );
+    if (intents.length === 0) return [];
+    const incumbent = await this.headCommit();
+    const committed = intents.find((intent) => intent.candidateSha === incumbent);
+    if (committed) return [await this.reconcilePromotion(committed, guard)];
+    return intents.map((intent) => {
+      if (incumbent === intent.baseSha) {
+        return {
+          promoted: false,
+          reason: "durable promotion intent has no committed compare-and-swap",
+          candidateSha: intent.candidateSha,
+        };
+      }
+      return {
+        promoted: false,
+        reason: `incumbent diverged from durable promotion intent (${incumbent})`,
+        candidateSha: intent.candidateSha,
+      };
+    });
+  }
+
   private async reconcilePromotionLocked(
-    identity: Pick<
-      CandidateLifecycle,
-      | "missionId"
-      | "repoId"
-      | "missionGeneration"
-      | "candidateGeneration"
-      | "repositoryGeneration"
-      | "attempt"
-      | "baseSha"
-      | "candidateSha"
-    >,
+    identity: PromotionIdentity,
     guard?: GitMutationGuard,
     lifecycle?: CandidateLifecycle,
     hooks: PromotionHooks = {},
   ): Promise<PromotionResult> {
     const intent = (await this.loadPromotionLifecycles(identity.missionId, identity.repoId)).find(
       (record) =>
+        record.candidateId === (identity.candidateId ?? this.candidateId(identity)) &&
         record.missionGeneration === identity.missionGeneration &&
         record.candidateGeneration === identity.candidateGeneration &&
         record.repositoryGeneration === identity.repositoryGeneration &&
@@ -941,6 +1244,7 @@ export class GitRepo {
         updatedAt: new Date().toISOString(),
       };
       await this.persistCandidateLifecycle(promotedLifecycle);
+      Object.assign(lifecycle, promotedLifecycle);
       await hooks.afterCandidateState?.();
     }
     await this.persistPromotionLifecycle({

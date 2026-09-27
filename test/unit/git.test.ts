@@ -364,8 +364,13 @@ test("candidate lifecycle preserves an earlier attempt and remounts its exact pe
         candidateGeneration: 0,
         repositoryGeneration: 10,
         attempt: "attempt-2",
+        parentCandidateId: first.candidateId,
+        seedSha: first.candidateSha,
       });
       assert.notEqual(second.branch, first.branch);
+      assert.equal(second.parentCandidateId, first.candidateId);
+      assert.equal(second.seedSha, first.candidateSha);
+      assert.equal(second.candidateSha, first.candidateSha, "repair child must start from the preserved parent tip");
       assert.equal(await repo.resolveCommit(first.branch), first.candidateSha, "retry must not delete preserved ref");
 
       await repo.removeWorktree(first, { keepBranch: true });
@@ -603,6 +608,281 @@ test("promotion uses the tokenized exclusive lock across child-process acquisiti
     await repo.removeWorktree(candidate, { keepBranch: true });
   } finally {
     child?.kill("SIGKILL");
+    await fixture.cleanup();
+  }
+});
+
+test("integration runs keep independent sequence-zero journals and freeze every handoff SHA", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const repo = (await GitRepo.open(fixture.root))!;
+    const base = await repo.headCommit();
+    const first = await repo.createWorktree(base, "run-journal-first");
+    const second = await repo.createWorktree(base, "run-journal-second");
+    const candidate = await repo.createCandidateWorktree(base, {
+      missionId: "MSN-run-journals",
+      repoId: "repo-run-journals",
+      missionGeneration: 4,
+      candidateGeneration: 2,
+      repositoryGeneration: 8,
+      attempt: "creation-execution",
+    });
+    try {
+      await writeFile(join(first.path, "src", "first-run.ts"), "export const first = 1;\n");
+      await repo.commitAll(first.path, "first run handoff");
+      const frozenFirst = await repo.headCommitIn(first.path);
+      const runOne = await repo.beginIntegrationRun(candidate, "integration-run-one", [first.branch]);
+      await writeFile(join(first.path, "src", "future.ts"), "export const future = true;\n");
+      await repo.commitAll(first.path, "future handoff mutation");
+      const futureTip = await repo.headCommitIn(first.path);
+      await repo.mergeRefInWorktree(candidate, first.branch, undefined, candidate, 0, {}, runOne);
+      assert.equal(await repo.isAncestor(frozenFirst, candidate.candidateSha), true);
+      assert.equal(
+        await repo.isAncestor(futureTip, candidate.candidateSha),
+        false,
+        "future ref movement is not merged",
+      );
+
+      await writeFile(join(second.path, "src", "second-run.ts"), "export const second = 2;\n");
+      await repo.commitAll(second.path, "second run handoff");
+      const runTwo = await repo.beginIntegrationRun(candidate, "integration-run-two", [second.branch]);
+      await repo.mergeRefInWorktree(candidate, second.branch, undefined, candidate, 0, {}, runTwo);
+
+      const persisted = await repo.loadIntegrationRuns(candidate.missionId, candidate.repoId);
+      assert.deepEqual(
+        persisted.map((run) => [run.runId, run.merges[0]?.sequence, run.merges[0]?.state]),
+        [
+          ["integration-run-one", 0, "completed"],
+          ["integration-run-two", 0, "completed"],
+        ],
+      );
+      assert.equal(candidate.attempt, "creation-execution", "later runs never rewrite candidate creation identity");
+    } finally {
+      await repo.removeWorktree(first, { keepBranch: true }).catch(() => {});
+      await repo.removeWorktree(second, { keepBranch: true }).catch(() => {});
+      await repo.removeWorktree(candidate, { keepBranch: true }).catch(() => {});
+    }
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("conflict recovery journals abort intent and refuses to complete a failed abort", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const repo = (await GitRepo.open(fixture.root))!;
+    const base = await repo.headCommit();
+    const first = await repo.createWorktree(base, "abort-first");
+    const conflict = await repo.createWorktree(base, "abort-conflict");
+    const candidate = await repo.createCandidateWorktree(base, {
+      missionId: "MSN-abort-journal",
+      repoId: "repo-abort-journal",
+      missionGeneration: 1,
+      candidateGeneration: 1,
+      repositoryGeneration: 1,
+      attempt: "creator",
+    });
+    try {
+      await writeFile(join(first.path, "src", "abort.ts"), "export const value = 'first';\n");
+      await repo.commitAll(first.path, "first");
+      await writeFile(join(conflict.path, "src", "abort.ts"), "export const value = 'conflict';\n");
+      await repo.commitAll(conflict.path, "conflict");
+      const runOne = await repo.beginIntegrationRun(candidate, "run-one", [first.branch]);
+      await repo.mergeRefInWorktree(candidate, first.branch, undefined, candidate, 0, {}, runOne);
+      const stableHead = candidate.candidateSha;
+      const runTwo = await repo.beginIntegrationRun(candidate, "run-two", [conflict.branch]);
+
+      await assert.rejects(
+        repo.mergeRefInWorktree(
+          candidate,
+          conflict.branch,
+          undefined,
+          candidate,
+          0,
+          {
+            abortMerge: async () => ({ stdout: "", stderr: "locked", code: 1 }),
+          },
+          runTwo,
+        ),
+        /conflict abort failed.*locked/i,
+      );
+      const interrupted = (await repo.loadIntegrationRuns(candidate.missionId, candidate.repoId)).find(
+        (run) => run.runId === "run-two",
+      );
+      assert.equal(interrupted?.merges[0]?.state, "abort_intent");
+
+      const reopened = (await GitRepo.open(fixture.root))!;
+      const recoveredCandidate = (await reopened.loadCandidateLifecycles(candidate.missionId, candidate.repoId))[0]!;
+      const recoveredRun = (await reopened.loadIntegrationRuns(candidate.missionId, candidate.repoId)).find(
+        (run) => run.runId === "run-two",
+      )!;
+      const result = await reopened.mergeRefInWorktree(
+        recoveredCandidate,
+        conflict.branch,
+        undefined,
+        recoveredCandidate,
+        0,
+        {},
+        recoveredRun,
+      );
+      assert.equal(result.conflict, true);
+      assert.equal(await reopened.headCommitIn(candidate.path), stableHead);
+      assert.equal(recoveredRun.merges[0]?.state, "completed");
+    } finally {
+      await repo.removeWorktree(first, { keepBranch: true }).catch(() => {});
+      await repo.removeWorktree(conflict, { keepBranch: true }).catch(() => {});
+      await repo.removeWorktree(candidate, { keepBranch: true }).catch(() => {});
+    }
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("restart detects a dirty conflicted merge intent and aborts it before recording conflict", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const repo = (await GitRepo.open(fixture.root))!;
+    const base = await repo.headCommit();
+    const first = await repo.createWorktree(base, "dirty-replay-first");
+    const conflict = await repo.createWorktree(base, "dirty-replay-conflict");
+    const candidate = await repo.createCandidateWorktree(base, {
+      missionId: "MSN-dirty-replay",
+      repoId: "repo-dirty-replay",
+      missionGeneration: 1,
+      candidateGeneration: 1,
+      repositoryGeneration: 1,
+      attempt: "creator",
+    });
+    try {
+      await writeFile(join(first.path, "src", "dirty-replay.ts"), "export const value = 'first';\n");
+      await repo.commitAll(first.path, "first");
+      await writeFile(join(conflict.path, "src", "dirty-replay.ts"), "export const value = 'conflict';\n");
+      await repo.commitAll(conflict.path, "conflict");
+      const firstRun = await repo.beginIntegrationRun(candidate, "first-run", [first.branch]);
+      await repo.mergeRefInWorktree(candidate, first.branch, undefined, candidate, 0, {}, firstRun);
+      const stableHead = candidate.candidateSha;
+      const conflictRun = await repo.beginIntegrationRun(candidate, "conflict-run", [conflict.branch]);
+      await assert.rejects(
+        repo.mergeRefInWorktree(
+          candidate,
+          conflict.branch,
+          undefined,
+          candidate,
+          0,
+          {
+            afterConflict: () => {
+              throw new Error("crash with MERGE_HEAD");
+            },
+          },
+          conflictRun,
+        ),
+        /crash with MERGE_HEAD/,
+      );
+
+      const reopened = (await GitRepo.open(fixture.root))!;
+      const durableCandidate = (await reopened.loadCandidateLifecycles(candidate.missionId, candidate.repoId))[0]!;
+      const durableRun = (await reopened.loadIntegrationRuns(candidate.missionId, candidate.repoId)).find(
+        (run) => run.runId === "conflict-run",
+      )!;
+      assert.equal(durableRun.merges[0]?.state, "intent");
+      const recovered = await reopened.mergeRefInWorktree(
+        durableCandidate,
+        conflict.branch,
+        undefined,
+        durableCandidate,
+        0,
+        {},
+        durableRun,
+      );
+      assert.equal(recovered.conflict, true);
+      assert.equal(await reopened.headCommitIn(candidate.path), stableHead);
+      assert.equal(await reopened.statusIn(candidate.path), "");
+    } finally {
+      await repo.removeWorktree(first, { keepBranch: true }).catch(() => {});
+      await repo.removeWorktree(conflict, { keepBranch: true }).catch(() => {});
+      await repo.removeWorktree(candidate, { keepBranch: true }).catch(() => {});
+    }
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("locked worktree removal fails explicitly and succeeds on authoritative retry", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const repo = (await GitRepo.open(fixture.root))!;
+    const worktree = await repo.createWorktree(await repo.headCommit(), "locked-removal");
+    await exec("git", ["-C", fixture.root, "worktree", "lock", worktree.path]);
+    await assert.rejects(repo.removeWorktree(worktree), /worktree remove failed.*locked/i);
+    assert.equal(await repo.headCommitIn(worktree.path), await repo.headCommit());
+    await exec("git", ["-C", fixture.root, "worktree", "unlock", worktree.path]);
+    await repo.removeWorktree(worktree);
+    assert.equal(await repo.resolveCommit(worktree.branch), null);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("fresh authority reconciles only a committed exact promotion intent and never advances an old base intent", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const repo = (await GitRepo.open(fixture.root))!;
+    const base = await repo.headCommit();
+    const candidate = await repo.createCandidateWorktree(base, {
+      missionId: "MSN-fresh-reconcile",
+      repoId: "repo-fresh-reconcile",
+      missionGeneration: 2,
+      candidateGeneration: 3,
+      repositoryGeneration: 5,
+      attempt: "origin-execution",
+    });
+    await writeFile(join(candidate.path, "src", "fresh-reconcile.ts"), "export const recovered = true;\n");
+    await repo.commitAll(candidate.path, "fresh reconciliation candidate");
+    candidate.candidateSha = await repo.headCommitIn(candidate.path);
+    await repo.persistCandidateLifecycle(candidate);
+
+    let invalidated = false;
+    await assert.rejects(
+      repo.promoteCandidate(
+        candidate,
+        base,
+        {
+          assertAuthoritative: () => {
+            if (invalidated) throw new Error("origin authority lost before CAS");
+          },
+        },
+        candidate,
+        {
+          beforeCas: () => {
+            invalidated = true;
+          },
+        },
+      ),
+      /origin authority lost before CAS/,
+    );
+    assert.equal(await repo.headCommit(), base);
+    const pending = await repo.reconcileCommittedPromotions(candidate.missionId, candidate.repoId, {
+      assertAuthoritative: () => {},
+    });
+    assert.equal(pending[0]?.promoted, false);
+    assert.match(pending[0]?.reason ?? "", /no committed compare-and-swap/i);
+    assert.equal(await repo.headCommit(), base, "recovery must not execute the old intent's CAS");
+
+    await assert.rejects(
+      repo.promoteCandidate(candidate, base, undefined, candidate, {
+        afterCas: () => {
+          throw new Error("crash after committed CAS");
+        },
+      }),
+      /crash after committed CAS/,
+    );
+    const recovered = await repo.reconcileCommittedPromotions(candidate.missionId, candidate.repoId, {
+      assertAuthoritative: () => {},
+    });
+    assert.ok(recovered.some((result) => result.promoted && result.alreadyPromoted));
+    assert.equal(await repo.headCommit(), candidate.candidateSha);
+    await repo.removeWorktree(candidate, { keepBranch: true }).catch(() => {});
+  } finally {
     await fixture.cleanup();
   }
 });

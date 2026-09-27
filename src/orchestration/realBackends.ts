@@ -15,7 +15,7 @@
 import { createHash } from "node:crypto";
 import type { ArtifactStore } from "../artifacts/ArtifactStore.ts";
 import { id } from "../core/ids.ts";
-import type { CandidateLifecycle, GitRepo } from "../git/GitRepo.ts";
+import type { CandidateLifecycle, GitRepo, IntegrationRunRecord } from "../git/GitRepo.ts";
 import type { WorktreeInfo } from "../git/GitRepo.ts";
 import type { VerificationProvider } from "../verify/Verifier.ts";
 import type { WorkerActivity, WorkerExecutor, WorkerRequest } from "../workers/WorkerExecutor.ts";
@@ -481,6 +481,7 @@ export function realBackends(opts: RealBackendsOptions) {
         handoffs: IntegrationHandoff[];
         candidate?: WorktreeInfo;
         candidateLifecycle?: CandidateLifecycle;
+        integrationRun?: IntegrationRunRecord;
         authority?: import("./ownership.ts").DispatchAuthority;
         signal: AbortSignal;
       }): Promise<ExecutionOutcome> {
@@ -516,6 +517,8 @@ export function realBackends(opts: RealBackendsOptions) {
                 input.authority,
                 input.candidateLifecycle,
                 sequence,
+                {},
+                input.integrationRun,
               )
             : repo.git.mergeBranch(h.ref ?? h.worktree.branch)
           ).catch((e: Error) => ({
@@ -544,7 +547,12 @@ export function realBackends(opts: RealBackendsOptions) {
         input.signal.throwIfAborted();
         const candidateCwd = input.candidate?.path ?? repo.cwd;
         if (input.candidateLifecycle) {
-          await repo.git.beginCandidateCheck(input.candidateLifecycle, "integration-verifier", input.authority);
+          await repo.git.beginCandidateCheck(
+            input.candidateLifecycle,
+            "integration-verifier",
+            input.authority,
+            input.integrationRun,
+          );
         }
         const checks = await opts.verifier.detect(candidateCwd);
         input.signal.throwIfAborted();
@@ -555,6 +563,7 @@ export function realBackends(opts: RealBackendsOptions) {
             "integration-verifier",
             result.passed,
             input.authority,
+            input.integrationRun,
           );
         }
         const artifactRefs = result.evidence.flatMap((e) => e.artifacts).filter(Boolean);
