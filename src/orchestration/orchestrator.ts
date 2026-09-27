@@ -15,6 +15,7 @@
  * No slash command is required: call `orchestrate(request)`.
  */
 
+import { id } from "../core/ids.ts";
 import type { GitRepo } from "../git/GitRepo.ts";
 import type { EventStoreBackend } from "../platform/eventstore/backend.ts";
 import type { GatewayResilienceConfig } from "../resilience/config.ts";
@@ -28,6 +29,7 @@ import type { MissionObservability } from "./observability/MissionObservability.
 import { computeProgress } from "./observability/progress.ts";
 import type { ActivityType, WaitingReason } from "./observability/types.ts";
 import { deriveRequiredGates, mutationFactFromChangedFiles } from "./policies.ts";
+import type { RepositoryRegistry } from "./repositoryRegistry.ts";
 import { brokerKind } from "./scheduler.ts";
 import { MissionScheduler } from "./scheduler.ts";
 import { canTransitionMission } from "./state.ts";
@@ -42,6 +44,7 @@ import type {
   TaskStatus,
   WorkflowClass,
 } from "./types.ts";
+import { type WorkspaceManifestResolver, WorkspaceScopeError, createWorkspaceManifest } from "./workspaceManifest.ts";
 
 /** A task planned by the planner; the orchestrator fills lifecycle fields. */
 export type PlanTaskInput = Omit<
@@ -107,6 +110,12 @@ export interface OrchestratorOptions {
   sleep?: (ms: number) => Promise<void>;
   /** Injectable RNG passed to the scheduler (default Math.random). For tests. */
   rand?: () => number;
+  /** Resolve explicit user workspace authority before material planning. */
+  workspaceResolver?: WorkspaceManifestResolver;
+  /** Repository-scoped execution dependencies populated from the manifest. */
+  repositoryRegistry?: RepositoryRegistry;
+  /** Process launch directory; never assumed to be the requested repository. */
+  launchCwd?: string;
 }
 
 export interface OrchestrateResult {
@@ -143,6 +152,10 @@ export class Orchestrator {
   private readonly progress = new Map<string, (line: string) => void>();
   private readonly observedExecutions = new Set<string>();
   private readonly taskExecutions = new Map<string, string>();
+  private readonly workspaceResolver?: WorkspaceManifestResolver;
+  private readonly repositoryRegistry?: RepositoryRegistry;
+  private readonly launchCwd: string;
+  private readonly missionRepoIds = new Map<string, string>();
 
   constructor(opts: OrchestratorOptions) {
     this.store = opts.store;
@@ -209,6 +222,21 @@ export class Orchestrator {
     this.onPhase = opts.onPhase;
     this.observability = opts.observability ?? null;
     this.parentSessionId = opts.parentSessionId ?? null;
+    this.workspaceResolver = opts.workspaceResolver;
+    this.repositoryRegistry = opts.repositoryRegistry;
+    this.launchCwd = opts.launchCwd ?? ".";
+  }
+
+  private repoIdForMission(missionId: string): string | undefined {
+    return this.missionRepoIds.get(missionId) ?? this.store.getWorkspaceManifest(missionId)?.repositories[0]?.repoId;
+  }
+
+  private activateMissionRepository(missionId: string): void {
+    const repoId = this.repoIdForMission(missionId);
+    if (repoId && this.repositoryRegistry) {
+      this.missionRepoIds.set(missionId, repoId);
+      this.repositoryRegistry.activate(repoId);
+    }
   }
 
   private phase(mission: Mission, phase: string): void {
@@ -373,6 +401,19 @@ export class Orchestrator {
         opts.mutationRequested ?? workflowMutatesRepo(this.router.route({ request }).suggested_workflow),
     });
     const risk = this.router.risk({ request });
+    const material = workflowMutatesRepo(intent.suggested_workflow) || opts.mutationRequested === true;
+    let workspace: Awaited<ReturnType<WorkspaceManifestResolver["resolve"]>> | undefined;
+    let workspaceError: WorkspaceScopeError | undefined;
+    if (material && this.workspaceResolver && this.repositoryRegistry) {
+      try {
+        workspace = await this.workspaceResolver.resolve(request, this.launchCwd);
+      } catch (error) {
+        workspaceError =
+          error instanceof WorkspaceScopeError
+            ? error
+            : new WorkspaceScopeError(error instanceof Error ? error.message : String(error));
+      }
+    }
 
     // Install the per-call progress hook for the duration of this mission so
     // task/phase transitions stream to the caller (e.g. the /mission command).
@@ -382,12 +423,13 @@ export class Orchestrator {
       // A progress listener is an observer, never a participant.
     }
 
+    const primaryBinding = workspace?.repositories.find((repository) => repository.repoId === workspace?.primaryRepoId);
     const mission = this.store.createMission({
       title: opts.title ?? request,
       goal: request,
       user_request: request,
-      repository: opts.repository,
-      base_ref: opts.baseRef,
+      repository: primaryBinding?.canonicalRoot ?? opts.repository,
+      base_ref: opts.baseRef || primaryBinding?.baseSha || "",
       constraints: opts.constraints ?? [],
       risk_profile: risk,
       workflow_class: intent.suggested_workflow,
@@ -397,6 +439,90 @@ export class Orchestrator {
     try {
       this.observability?.missionCreated(mission.mission_id, mission.title);
       this.store.transitionMission(mission.mission_id, "CLASSIFYING");
+
+      if (workspaceError) {
+        this.store.classifyFailure({
+          classificationId: id("FC"),
+          missionId: mission.mission_id,
+          taskId: null,
+          executionId: null,
+          category: "WORKSPACE_SCOPE_MISMATCH",
+          evidenceRefs: [],
+          fingerprint: `workspace:${workspaceError.message}`,
+          summary: workspaceError.message,
+          classifiedAt: new Date().toISOString(),
+        });
+        this.store.transitionMission(mission.mission_id, "BLOCKED");
+        const blocked = this.store.getMission(mission.mission_id)!;
+        return {
+          mission: blocked,
+          intent,
+          verdict: this.gate.evaluate(blocked),
+          completed: false,
+          failureReason: workspaceError.message,
+        };
+      }
+
+      if (workspace && this.repositoryRegistry) {
+        let probes: Awaited<ReturnType<RepositoryRegistry["probe"]>>;
+        try {
+          const manifest = createWorkspaceManifest(workspace, mission.mission_id);
+          this.store.bindWorkspaceManifest(manifest);
+          await this.store.flush();
+          await this.repositoryRegistry.register(manifest);
+          probes = await this.repositoryRegistry.probe(workspace.primaryRepoId);
+        } catch (error) {
+          const summary = error instanceof Error ? error.message : String(error);
+          this.store.classifyFailure({
+            classificationId: id("FC"),
+            missionId: mission.mission_id,
+            taskId: null,
+            executionId: null,
+            category: "WORKSPACE_SCOPE_MISMATCH",
+            evidenceRefs: [],
+            fingerprint: `workspace-preflight:${workspace.primaryRepoId}`,
+            summary,
+            classifiedAt: new Date().toISOString(),
+          });
+          this.store.transitionMission(mission.mission_id, "BLOCKED");
+          const blocked = this.store.getMission(mission.mission_id)!;
+          return {
+            mission: blocked,
+            intent,
+            verdict: this.gate.evaluate(blocked),
+            completed: false,
+            failureReason: summary,
+          };
+        }
+        const failed = probes.filter((probe) => !probe.ok);
+        if (failed.length > 0 || probes.some((probe) => probe.repoId !== workspace.primaryRepoId)) {
+          const summary = `Repository role preflight mismatch: ${failed
+            .map((probe) => `${probe.role}: ${probe.reason ?? "binding mismatch"}`)
+            .join("; ")}`;
+          this.store.classifyFailure({
+            classificationId: id("FC"),
+            missionId: mission.mission_id,
+            taskId: null,
+            executionId: null,
+            category: "WORKSPACE_SCOPE_MISMATCH",
+            evidenceRefs: [],
+            fingerprint: `workspace-probe:${workspace.primaryRepoId}`,
+            summary,
+            classifiedAt: new Date().toISOString(),
+          });
+          this.store.transitionMission(mission.mission_id, "BLOCKED");
+          const blocked = this.store.getMission(mission.mission_id)!;
+          return {
+            mission: blocked,
+            intent,
+            verdict: this.gate.evaluate(blocked),
+            completed: false,
+            failureReason: summary,
+          };
+        }
+        this.missionRepoIds.set(mission.mission_id, workspace.primaryRepoId);
+        this.repositoryRegistry.activate(workspace.primaryRepoId);
+      }
 
       // Derive acceptance criteria.
       const criteria = opts.acceptanceCriteria ?? (await this.deriveAcceptance?.(mission)) ?? [];
@@ -446,7 +572,11 @@ export class Orchestrator {
       // Plan/decompose into tasks.
       const planned = await this.planner(this.store.getMission(mission.mission_id)!, risk);
       for (const t of planned) {
-        this.store.createTask({ mission_id: mission.mission_id, ...t });
+        this.store.createTask({
+          mission_id: mission.mission_id,
+          ...t,
+          ...(this.repoIdForMission(mission.mission_id) ? { repo_id: this.repoIdForMission(mission.mission_id) } : {}),
+        });
       }
       this.store.transitionMission(mission.mission_id, "READY");
 
@@ -537,6 +667,7 @@ export class Orchestrator {
    * down the mission is left paused (call again on the next probe).
    */
   async resume(missionId: string, opts?: { force?: boolean; signal?: AbortSignal }): Promise<Mission> {
+    this.activateMissionRepository(missionId);
     const mission = this.store.getMission(missionId);
     if (!mission) throw new Error(`unknown mission ${missionId}`);
     if (mission.status !== "PAUSED_INFRASTRUCTURE") return mission;
@@ -623,6 +754,7 @@ export class Orchestrator {
           mutates_repo: true,
           write_domains: ["**"],
           isolation: repairIsolation,
+          repo_id: this.repoIdForMission(missionId),
         });
         this.store.transitionTask(repair.task_id, "READY");
         const repaired = await this.runSingleTask(missionId, repair.task_id, { signal });
@@ -755,6 +887,7 @@ export class Orchestrator {
         objective: "Merge worker/repair branches into the base checkout.",
         mutates_repo: true,
         isolation: "none",
+        repo_id: this.repoIdForMission(mission.mission_id),
       });
       this.store.transitionTask(integ.task_id, "READY");
       integrationOk = await this.runSingleTask(mission.mission_id, integ.task_id, { signal });
@@ -823,6 +956,7 @@ export class Orchestrator {
         objective: "Run deterministic validation (typecheck/tests/lint) over the integrated result.",
         mutates_repo: false,
         isolation: "none",
+        repo_id: this.repoIdForMission(mission.mission_id),
       });
       this.store.transitionTask(task.task_id, "READY");
       validationAttempted = true;
@@ -869,6 +1003,7 @@ export class Orchestrator {
         mutates_repo: false,
         isolation: "none",
         depends_on: this.lastValidationTaskId(mission.mission_id),
+        repo_id: this.repoIdForMission(mission.mission_id),
       });
       this.store.transitionTask(task.task_id, "READY");
       reviewAttempted = true;

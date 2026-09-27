@@ -31,6 +31,8 @@ import { MissionObservability } from "../orchestration/observability/MissionObse
 import { Orchestrator } from "../orchestration/orchestrator.ts";
 import type { PlanTaskInput } from "../orchestration/orchestrator.ts";
 import { realBackends } from "../orchestration/realBackends.ts";
+import { RepositoryRegistry } from "../orchestration/repositoryRegistry.ts";
+import { WorkspaceManifestResolver } from "../orchestration/workspaceManifest.ts";
 import { tasksConflict, topoSort } from "../plan/taskDag.ts";
 import { JsonlEventStore } from "../platform/eventstore/jsonl.ts";
 import { redactSecrets } from "../platform/redact.ts";
@@ -361,6 +363,10 @@ export class EngineeringRuntime {
    * BESIDE the controller; the controller remains authoritative. Additive.
    */
   missionObservability: MissionObservability | null;
+  /** Repository bindings authorized for orchestration missions in this runtime. */
+  repositoryRegistry: RepositoryRegistry;
+  /** Semantic tools whose repository services are selected from execution cwd. */
+  coreTools: ReturnType<typeof buildCoreTools>;
   /**
    * Mission-level gateway resilience config (spec §resilience). Time-based
    * retry window (default 90m), 10s recovery probes, circuit breaker, and
@@ -526,6 +532,8 @@ export class EngineeringRuntime {
     this.missionStore = null;
     this.orchestrator = null;
     this.missionObservability = null;
+    this.repositoryRegistry = new RepositoryRegistry();
+    this.coreTools = [];
     // Resolve the time-based gateway resilience config from environment.
     this.resilience = resolveGatewayResilienceConfig();
   }
@@ -577,6 +585,10 @@ export class EngineeringRuntime {
     }
     rt.missionStore = openedMissionStores.get(orchestrationPath) ?? MissionStore.open(orchestrationBackend);
     openedMissionStores.set(orchestrationPath, rt.missionStore);
+    for (const mission of rt.missionStore.listMissions()) {
+      const manifest = rt.missionStore.getWorkspaceManifest(mission.mission_id);
+      if (manifest) await rt.repositoryRegistry.register(manifest);
+    }
     // Mission observability shares the SAME durable event store as the mission
     // controller: its `mission.obs.*` events are ignored by MissionStore replay
     // and replayed by the observability service, so progress/activity/workers/
@@ -637,6 +649,15 @@ export class EngineeringRuntime {
       cwd: repoRoot,
       routeModel,
       reviewFallbackModel,
+      repository: () => {
+        try {
+          const context = rt.repositoryRegistry.current();
+          return { git: context.git, cwd: context.root };
+        } catch {
+          if (!rt.git) throw new Error(`No Git repository is bound for ${repoRoot}`);
+          return { git: rt.git, cwd: repoRoot };
+        }
+      },
     });
     // The default plan honours the routed workflow class. A research or
     // investigation mission MUST NOT get a repo-mutating worker: mutation is
@@ -667,8 +688,11 @@ export class EngineeringRuntime {
       observability: rt.missionObservability,
       planner: opts.orchestrationPlanner ?? defaultPlanner,
       parentSessionId: null,
-      git: rt.git,
+      git: rt.repositoryRegistry.gitFacade(),
       baseRef: rt.git ? await rt.git.headCommit() : "",
+      workspaceResolver: new WorkspaceManifestResolver(),
+      repositoryRegistry: rt.repositoryRegistry,
+      launchCwd: opts.cwd,
       // Mission-level gateway resilience: a worker transient-infra failure retries
       // within the (env-resolved) time-based window, parking the mission in a
       // WAITING state, and pauses (not fails) on exhaustion. When an operator sets
@@ -690,13 +714,21 @@ export class EngineeringRuntime {
     // worker sessions get the tools their prompts require and always address the
     // shared ledger/broker regardless of their cwd (a candidate worktree must not
     // open a separate empty ledger).
-    const tools = buildCoreTools(() => ({
-      ledger: rt.ledger,
-      artifacts: rt.artifacts,
-      broker: rt.broker,
-      currentWorkItemId: () => rt.ledger.listWorkItems().at(-1)?.id ?? null,
-      actor: () => ({ type: "system" }),
-    }));
+    const tools = buildCoreTools(async (cwd) => {
+      const context = await rt.repositoryRegistry.resolve(cwd);
+      return {
+        ledger: rt.ledger,
+        artifacts: rt.artifacts,
+        broker: context?.contextBroker ?? rt.broker,
+        currentWorkItemId: () => rt.ledger.listWorkItems().at(-1)?.id ?? null,
+        actor: () => ({ type: "system" }),
+        orchestrator: rt.orchestrator,
+        baseRef: async () => (context ? context.git.headCommit() : (rt.git?.headCommit() ?? "")),
+        repoId: context?.repoId,
+        repositoryRoot: context?.root,
+      };
+    });
+    rt.coreTools = tools;
     if (rt.worker instanceof PiWorkerExecutor) rt.worker.setCustomTools(tools);
     // A distinct reviewer worker also needs the shared-ledger tools bound.
     if (rt.reviewerWorker instanceof PiWorkerExecutor) rt.reviewerWorker.setCustomTools(tools);

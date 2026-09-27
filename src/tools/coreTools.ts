@@ -17,6 +17,9 @@ export interface CoreServices {
   orchestrator?: Orchestrator | null;
   /** Resolve the current repo base ref. */
   baseRef?: () => Promise<string> | string;
+  /** Authorized repository selected for this tool execution. */
+  repoId?: string;
+  repositoryRoot?: string;
 }
 
 /**
@@ -223,7 +226,10 @@ export function buildCoreTools(
       if (!services.broker) return { content: [{ type: "text", text: "Not a git repository." }], details: {} };
       const hits = await services.broker.search(String(params.query), params.limit ?? 40);
       const text = hits.length ? hits.map((h) => `${h.path}:${h.line} — ${h.text}`).join("\n") : "No matches.";
-      return { content: [{ type: "text", text }], details: { hits: hits.length } };
+      return {
+        content: [{ type: "text", text }],
+        details: { hits: hits.length, ...(services.repoId ? { repoId: services.repoId } : {}) },
+      };
     },
   });
 
@@ -299,7 +305,7 @@ export function buildCoreTools(
       const request = String(params.request);
       const baseRef = typeof services.baseRef === "function" ? await services.baseRef() : "";
       const result = await services.orchestrator.orchestrate(request, {
-        repository: ctx.cwd,
+        repository: services.repositoryRoot ?? ctx.cwd,
         baseRef,
         constraints: (params.constraints as string[] | undefined) ?? [],
         mutationRequested: params.mutate ?? true,

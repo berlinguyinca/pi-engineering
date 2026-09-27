@@ -6,7 +6,9 @@
  */
 
 import assert from "node:assert/strict";
-import { readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { after, describe, it } from "node:test";
 import { MISSION_SNAPSHOT_CONTRACT_VERSION } from "../../src/orchestration/missionSnapshot.ts";
 import { EngineeringRuntime } from "../../src/runtime/EngineeringRuntime.ts";
@@ -114,6 +116,120 @@ describe("orchestration via real EngineeringRuntime (acceptance scenarios)", () 
     assert.ok(tasks.some((t) => t.kind === "agent" && t.status === "SUCCEEDED"));
     assert.ok(tasks.some((t) => t.kind === "validation" && t.status === "SUCCEEDED"));
     assert.ok(tasks.some((t) => t.kind === "review" && t.status === "SUCCEEDED"));
+  });
+
+  it("binds implementer, validator, integrator, reviewer, and repository tools to an explicit repo outside the launch cwd", async () => {
+    const target = await greenFixture();
+    const metaRoot = await mkdtemp(join(tmpdir(), "pi-eng-meta-root-"));
+    fixtures.push(target, { root: metaRoot, cleanup: () => rm(metaRoot, { recursive: true, force: true }) });
+    const workerCwds: Array<{ role: string; cwd: string }> = [];
+    const verifierCwds: string[] = [];
+    const runtimeRef: { current?: EngineeringRuntime } = {};
+    const worker: WorkerExecutor = {
+      async run(req) {
+        workerCwds.push({ role: req.role, cwd: req.cwd ?? "" });
+        if (req.role === "implementer") {
+          const activeRuntime = runtimeRef.current;
+          assert.ok(activeRuntime);
+          assert.ok(
+            activeRuntime
+              .missionStore!.listMissions()
+              .some((mission) => activeRuntime.missionStore!.getWorkspaceManifest(mission.mission_id)),
+            "workspace authorization must be durable before implementer dispatch",
+          );
+          await writeFile(join(req.cwd!, "src", "scoped.ts"), "export const scoped = true;\n", "utf8");
+        }
+        return {
+          result: {
+            status: "completed",
+            summary: `${req.role} completed`,
+            claims: [],
+            evidence_refs: [],
+            new_hypotheses: [],
+            proposed_tasks: [],
+            details: {},
+          },
+          usage: {
+            input: 1,
+            output: 1,
+            cacheRead: 0,
+            cacheWrite: 0,
+            cost: 0,
+            contextTokens: 1,
+            turns: 1,
+            model: "fake",
+          },
+          toolCalls: 0,
+        };
+      },
+    };
+    const { CommandVerifier } = await import("../../src/verify/Verifier.ts");
+    class RecordingVerifier extends CommandVerifier {
+      override async detect(cwd: string) {
+        verifierCwds.push(cwd);
+        return super.detect(cwd);
+      }
+    }
+    const rt = await EngineeringRuntime.open({ cwd: metaRoot, worker, verifier: new RecordingVerifier() });
+    runtimeRef.current = rt;
+    const targetGit = await (await import("../../src/git/GitRepo.ts")).GitRepo.open(target.root);
+    assert.ok(targetGit);
+
+    const result = await rt.orchestrator!.orchestrate(`Add scoped support in ${target.root}`, {
+      repository: metaRoot,
+      baseRef: await targetGit.headCommit(),
+      mutationRequested: true,
+    });
+
+    assert.equal(result.completed, true, result.failureReason ?? "");
+    const manifest = rt.missionStore!.getWorkspaceManifest(result.mission.mission_id);
+    assert.ok(manifest);
+    assert.equal(manifest.repositories.length, 1);
+    assert.equal(manifest.repositories[0]?.canonicalRoot, target.root);
+    assert.ok(
+      rt
+        .missionStore!.listTasks(result.mission.mission_id)
+        .every((task) => task.repo_id === manifest.repositories[0]?.repoId),
+      "every executable task must carry the selected repository binding",
+    );
+    assert.ok(workerCwds.some(({ role, cwd }) => role === "implementer" && cwd !== metaRoot));
+    assert.ok(workerCwds.some(({ role, cwd }) => role === "reviewer" && cwd === target.root));
+    assert.ok(verifierCwds.length > 0 && verifierCwds.every((cwd) => cwd === target.root));
+    assert.equal(await readFile(join(target.root, "src", "scoped.ts"), "utf8"), "export const scoped = true;\n");
+
+    const repoSearch = rt.coreTools.find((tool) => tool.name === "repo_search");
+    assert.ok(repoSearch);
+    const execute = repoSearch.execute as unknown as (
+      id: string,
+      params: { query: string },
+      signal: AbortSignal | undefined,
+      onUpdate: unknown,
+      ctx: { cwd: string },
+    ) => Promise<{ content: Array<{ text: string }>; details: { repoId?: string } }>;
+    const search = await execute("scope-search", { query: "scoped" }, undefined, undefined, { cwd: target.root });
+    assert.match(search.content[0]?.text ?? "", /src\/scoped\.ts/);
+    assert.doesNotMatch(search.content[0]?.text ?? "", /runtime not initialized|not a git repository/i);
+    assert.equal(search.details.repoId, manifest.repositories[0]?.repoId);
+  });
+
+  it("blocks a protected explicit workspace as WORKSPACE_SCOPE_MISMATCH before planning", async () => {
+    const fx = await greenFixture();
+    fixtures.push(fx);
+    const rt = await openRuntime(fx.root);
+    const result = await rt.orchestrator!.orchestrate("Modify files in /", {
+      repository: fx.root,
+      baseRef: await rt.git!.headCommit(),
+      mutationRequested: true,
+    });
+
+    assert.equal(result.completed, false);
+    assert.equal(result.mission.status, "BLOCKED");
+    assert.equal(rt.missionStore!.listTasks(result.mission.mission_id).length, 0, "planning must not run");
+    assert.ok(
+      rt
+        .missionStore!.listFailureClassifications(result.mission.mission_id)
+        .some((classification) => classification.category === "WORKSPACE_SCOPE_MISMATCH"),
+    );
   });
 
   it("scenario B: investigation escalates to engineering+review when source changes", async () => {

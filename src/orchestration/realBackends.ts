@@ -36,6 +36,8 @@ export interface RealBackendsOptions {
   routeModel?: (role: WorkerRequest["role"]) => Promise<ModelRoute | undefined>;
   /** Current/session model used when review cannot be placed on a distinct model. */
   reviewFallbackModel?: { provider: string; id: string };
+  /** Resolve the repository selected by the current mission's async binding. */
+  repository?: () => { git: GitRepo; cwd: string };
 }
 
 export interface ModelRoute {
@@ -122,6 +124,8 @@ function outcomeOf(result: Awaited<ReturnType<WorkerExecutor["run"]>>): Executio
 }
 
 export function realBackends(opts: RealBackendsOptions) {
+  const repository = (): { git: GitRepo | null; cwd: string } =>
+    opts.repository?.() ?? { git: opts.git, cwd: opts.cwd };
   const runWorker = async (
     req: WorkerRequest,
     input: { signal: AbortSignal; onActivity?: (event: WorkerActivity) => void },
@@ -176,7 +180,7 @@ export function realBackends(opts: RealBackendsOptions) {
           task: input.objective,
           context: input.contextRef,
           tools: ["ledger_read", "ledger_claim", "artifact_read", "repo_search", "symbol", "tests_for", "bash"],
-          cwd: input.worktree ?? opts.cwd,
+          cwd: input.worktree ?? repository().cwd,
           // Fresh-context implementation workers need headroom to explore the
           // repo, implement, run verification, and commit. Configurable so an
           // operator can tune per environment without recompiling.
@@ -208,7 +212,7 @@ export function realBackends(opts: RealBackendsOptions) {
             task: input.objective,
             context: input.contextRef,
             tools: ["ledger_read", "repo_search", "symbol", "tests_for"],
-            cwd: opts.cwd,
+            cwd: repository().cwd,
           },
           input,
         ).then(outcomeOf);
@@ -222,7 +226,7 @@ export function realBackends(opts: RealBackendsOptions) {
         onActivity?: (event: WorkerActivity) => void;
       }): Promise<ExecutionOutcome> {
         input.signal.throwIfAborted();
-        const cwd = input.worktree ?? opts.cwd;
+        const cwd = input.worktree ?? repository().cwd;
         const profile = await opts.verifier.detect(cwd);
         input.signal.throwIfAborted();
         const outcome = await opts.verifier.run(cwd, profile, opts.artifacts, { signal: input.signal });
@@ -254,7 +258,7 @@ export function realBackends(opts: RealBackendsOptions) {
           task: input.objective,
           context: input.contextRef,
           tools: ["ledger_read", "artifact_read", "repo_search", "symbol"],
-          cwd: opts.cwd,
+          cwd: repository().cwd,
           maxContextTokens: 64_000,
           // Same generous wall-clock budget as implementation workers: a review
           // must inspect the integrated change before writing findings, and the
@@ -300,7 +304,7 @@ export function realBackends(opts: RealBackendsOptions) {
         // Deterministic process execution falls back to verification-style
         // commands; a generic subprocess runner can be attached here later.
         input.signal.throwIfAborted();
-        const cwd = input.worktree ?? opts.cwd;
+        const cwd = input.worktree ?? repository().cwd;
         const profile = await opts.verifier.detect(cwd);
         input.signal.throwIfAborted();
         const outcome = await opts.verifier.run(cwd, profile, opts.artifacts, { signal: input.signal });
@@ -320,7 +324,8 @@ export function realBackends(opts: RealBackendsOptions) {
         signal: AbortSignal;
       }): Promise<ExecutionOutcome> {
         input.signal.throwIfAborted();
-        if (!opts.git)
+        const repo = repository();
+        if (!repo.git)
           return {
             executionId: "integration",
             exitStatus: "failed",
@@ -340,7 +345,7 @@ export function realBackends(opts: RealBackendsOptions) {
         const skippedRecovered: string[] = [];
         for (const h of input.handoffs) {
           input.signal.throwIfAborted();
-          const r = await opts.git.mergeBranch(h.ref ?? h.worktree.branch).catch((e: Error) => ({
+          const r = await repo.git.mergeBranch(h.ref ?? h.worktree.branch).catch((e: Error) => ({
             merged: false,
             reason: e.message,
           }));
@@ -364,9 +369,9 @@ export function realBackends(opts: RealBackendsOptions) {
           };
         }
         input.signal.throwIfAborted();
-        const checks = await opts.verifier.detect(opts.cwd);
+        const checks = await opts.verifier.detect(repo.cwd);
         input.signal.throwIfAborted();
-        const result = await opts.verifier.run(opts.cwd, checks, opts.artifacts, { signal: input.signal });
+        const result = await opts.verifier.run(repo.cwd, checks, opts.artifacts, { signal: input.signal });
         return {
           executionId: "integration",
           exitStatus: result.passed ? "succeeded" : "failed",
