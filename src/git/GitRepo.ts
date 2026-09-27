@@ -47,6 +47,7 @@ export interface CandidateRecord {
   attempt: string;
   parentCandidateId?: string;
   seedSha?: string;
+  integrationRunId?: string;
   branch: string;
   path: string;
   baseSha: string;
@@ -102,7 +103,11 @@ export interface PromotionLifecycle {
   missionGeneration: number;
   candidateGeneration: number;
   repositoryGeneration: number;
+  candidateRepositoryGeneration: number;
+  originRepositoryGeneration: number;
+  reconciliationRepositoryGeneration?: number;
   attempt: string;
+  integrationRunId: string;
   candidateSha: string;
   baseSha: string;
   state: "intent" | "completed";
@@ -139,6 +144,9 @@ export interface MergeJournalHooks {
 
 export interface WorktreeRemovalHooks {
   deleteBranch?: () => Promise<GitResult>;
+  afterIntent?: () => Promise<void> | void;
+  afterWorktreeRemoved?: () => Promise<void> | void;
+  afterBranchDeleted?: () => Promise<void> | void;
 }
 
 export interface PendingBranchCleanup {
@@ -146,7 +154,13 @@ export interface PendingBranchCleanup {
   repoId: string;
   path: string;
   branch: string;
+  state: "intent" | "worktree_removed" | "branch_deleted";
   updatedAt: string;
+}
+
+export interface PendingBranchCleanupInventory {
+  records: PendingBranchCleanup[];
+  diagnostics: Array<{ file: string; reason: string }>;
 }
 
 /**
@@ -277,26 +291,38 @@ export class GitRepo {
     await rename(temporary, target);
   }
 
-  async loadPendingBranchCleanups(missionId: string, repoId: string): Promise<PendingBranchCleanup[]> {
+  async loadPendingBranchCleanupInventory(missionId: string, repoId: string): Promise<PendingBranchCleanupInventory> {
     const dir = await this.candidateStateDir(false);
     const records: PendingBranchCleanup[] = [];
+    const diagnostics: Array<{ file: string; reason: string }> = [];
+    const prefix = `cleanup.${[missionId, repoId].map((part) => Buffer.from(part).toString("base64url")).join(".")}.`;
     for (const name of await readdir(dir).catch(() => [] as string[])) {
-      if (!name.startsWith("cleanup.") || !name.endsWith(".json")) continue;
+      if (!name.startsWith(prefix) || !name.endsWith(".json")) continue;
       try {
         const parsed = JSON.parse(await readFile(join(dir, name), "utf8")) as PendingBranchCleanup;
         if (
           parsed.missionId === missionId &&
           parsed.repoId === repoId &&
           typeof parsed.path === "string" &&
-          typeof parsed.branch === "string"
+          typeof parsed.branch === "string" &&
+          ["intent", "worktree_removed", "branch_deleted"].includes(parsed.state)
         ) {
           records.push(parsed);
+        } else {
+          diagnostics.push({ file: name, reason: "cleanup journal has invalid identity or phase" });
         }
-      } catch {
-        // Unreadable cleanup state cannot authorize a destructive retry.
+      } catch (error) {
+        diagnostics.push({
+          file: name,
+          reason: `cleanup journal is unreadable: ${error instanceof Error ? error.message : String(error)}`,
+        });
       }
     }
-    return records;
+    return { records, diagnostics };
+  }
+
+  async loadPendingBranchCleanups(missionId: string, repoId: string): Promise<PendingBranchCleanup[]> {
+    return (await this.loadPendingBranchCleanupInventory(missionId, repoId)).records;
   }
 
   private promotionStateName(
@@ -372,9 +398,12 @@ export class GitRepo {
           typeof parsed.attempt === "string" &&
           typeof parsed.branch === "string" &&
           typeof parsed.path === "string" &&
+          typeof parsed.baseSha === "string" &&
           typeof parsed.candidateSha === "string"
         ) {
-          records.push({ ...parsed, candidateId: parsed.candidateId ?? this.candidateId(parsed) });
+          const derivedCandidateId = this.candidateId(parsed);
+          if (parsed.candidateId && parsed.candidateId !== derivedCandidateId) continue;
+          records.push({ ...parsed, candidateId: derivedCandidateId });
         }
       } catch {
         // Malformed lifecycle records are ignored here and fail closed when no
@@ -469,12 +498,22 @@ export class GitRepo {
           typeof parsed.missionGeneration === "number" &&
           typeof parsed.candidateGeneration === "number" &&
           typeof parsed.repositoryGeneration === "number" &&
+          typeof parsed.candidateRepositoryGeneration === "number" &&
+          typeof parsed.originRepositoryGeneration === "number" &&
           typeof parsed.attempt === "string" &&
+          typeof parsed.integrationRunId === "string" &&
           typeof parsed.baseSha === "string" &&
           typeof parsed.candidateSha === "string" &&
+          parsed.repositoryGeneration === parsed.originRepositoryGeneration &&
+          (parsed.reconciliationRepositoryGeneration === undefined ||
+            (typeof parsed.reconciliationRepositoryGeneration === "number" &&
+              parsed.reconciliationRepositoryGeneration >= parsed.originRepositoryGeneration)) &&
+          (parsed.state !== "intent" || parsed.reconciliationRepositoryGeneration === undefined) &&
           (parsed.state === "intent" || parsed.state === "completed")
         ) {
-          records.push({ ...parsed, candidateId: parsed.candidateId ?? this.candidateId(parsed) });
+          const derivedCandidateId = this.candidateId(parsed);
+          if (parsed.candidateId !== derivedCandidateId) continue;
+          records.push(parsed);
         }
       } catch {
         // Unreadable promotion state cannot authorize recovery.
@@ -741,43 +780,66 @@ export class GitRepo {
     hooks: WorktreeRemovalHooks = {},
   ): Promise<void> {
     await this.assertPromotionUnlocked();
-    let worktreeExists = true;
-    try {
-      await access(info.path);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") worktreeExists = false;
-      else throw error;
-    }
-    if (worktreeExists) {
-      guard?.assertAuthoritative();
-      const removed = await this.git(["worktree", "remove", "--force", info.path]);
-      if (removed.code !== 0) {
-        throw new Error(`git worktree remove failed for ${info.path}: ${removed.stderr || removed.stdout}`);
+    let pending: PendingBranchCleanup | undefined;
+    if (!opts.keepBranch && opts.cleanupIdentity) {
+      pending = (
+        await this.loadPendingBranchCleanups(opts.cleanupIdentity.missionId, opts.cleanupIdentity.repoId)
+      ).find((record) => record.branch === info.branch && record.path === info.path);
+      if (!pending) {
+        pending = {
+          ...opts.cleanupIdentity,
+          path: info.path,
+          branch: info.branch,
+          state: "intent",
+          updatedAt: new Date().toISOString(),
+        };
+        await this.persistPendingBranchCleanup(pending, guard);
+        await hooks.afterIntent?.();
       }
     }
-    // Targeted, for the same reason creation is: a global prune here would be
-    // able to delete a concurrently-created sibling's administrative directory.
-    guard?.assertAuthoritative();
-    await this.forgetWorktreeAdmin(info.path);
-    if (!opts.keepBranch) {
-      const pending = opts.cleanupIdentity
-        ? {
-            ...opts.cleanupIdentity,
-            path: info.path,
-            branch: info.branch,
-            updatedAt: new Date().toISOString(),
-          }
-        : undefined;
-      if (pending) await this.persistPendingBranchCleanup(pending, guard);
+    if (!pending || pending.state === "intent") {
+      let worktreeExists = true;
+      try {
+        await access(info.path);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") worktreeExists = false;
+        else throw error;
+      }
+      if (worktreeExists) {
+        guard?.assertAuthoritative();
+        const removed = await this.git(["worktree", "remove", "--force", info.path]);
+        if (removed.code !== 0) {
+          throw new Error(`git worktree remove failed for ${info.path}: ${removed.stderr || removed.stdout}`);
+        }
+      }
+      // Targeted, for the same reason creation is: a global prune here would
+      // be able to delete a concurrently-created sibling's administration.
       guard?.assertAuthoritative();
-      const deleted = hooks.deleteBranch ? await hooks.deleteBranch() : await this.git(["branch", "-D", info.branch]);
-      if (deleted.code !== 0) {
-        throw new Error(`git branch delete failed for ${info.branch}: ${deleted.stderr || deleted.stdout}`);
+      await this.forgetWorktreeAdmin(info.path);
+      if (pending) {
+        pending = { ...pending, state: "worktree_removed", updatedAt: new Date().toISOString() };
+        await this.persistPendingBranchCleanup(pending, guard);
+        await hooks.afterWorktreeRemoved?.();
+      }
+    }
+    if (!opts.keepBranch && (!pending || pending.state === "worktree_removed")) {
+      const branchExists = (await this.resolveCommit(info.branch)) !== null;
+      if (branchExists) {
+        guard?.assertAuthoritative();
+        const deleted = hooks.deleteBranch ? await hooks.deleteBranch() : await this.git(["branch", "-D", info.branch]);
+        if (deleted.code !== 0) {
+          throw new Error(`git branch delete failed for ${info.branch}: ${deleted.stderr || deleted.stdout}`);
+        }
       }
       if (pending) {
-        guard?.assertAuthoritative();
-        await rm(join(await this.candidateStateDir(), this.branchCleanupStateName(pending)), { force: true });
+        pending = { ...pending, state: "branch_deleted", updatedAt: new Date().toISOString() };
+        await this.persistPendingBranchCleanup(pending, guard);
+        await hooks.afterBranchDeleted?.();
       }
+    }
+    if (pending?.state === "branch_deleted") {
+      guard?.assertAuthoritative();
+      await rm(join(await this.candidateStateDir(), this.branchCleanupStateName(pending)), { force: true });
     }
   }
 
@@ -1066,6 +1128,7 @@ export class GitRepo {
     guard?.assertAuthoritative();
     const lockFile = join(await this.commonDir(), "pi-engineering-promotion");
     let lock: ExclusiveFileLock;
+    let promotionIntent: PromotionLifecycle | undefined;
     try {
       lock = await ExclusiveFileLock.acquire(lockFile);
     } catch (error) {
@@ -1131,22 +1194,24 @@ export class GitRepo {
       }
       guard?.assertAuthoritative();
       if (lifecycle) {
-        await this.persistPromotionLifecycle(
-          {
-            candidateId: lifecycle.candidateId,
-            missionId: lifecycle.missionId,
-            repoId: lifecycle.repoId,
-            missionGeneration: lifecycle.missionGeneration,
-            candidateGeneration: lifecycle.candidateGeneration,
-            repositoryGeneration: lifecycle.repositoryGeneration,
-            attempt: lifecycle.attempt,
-            candidateSha,
-            baseSha: boundBase,
-            state: "intent",
-            updatedAt: new Date().toISOString(),
-          },
-          guard,
-        );
+        const originRepositoryGeneration = guard?.repositoryIdentity?.generation ?? lifecycle.repositoryGeneration;
+        promotionIntent = {
+          candidateId: lifecycle.candidateId,
+          missionId: lifecycle.missionId,
+          repoId: lifecycle.repoId,
+          missionGeneration: lifecycle.missionGeneration,
+          candidateGeneration: lifecycle.candidateGeneration,
+          repositoryGeneration: originRepositoryGeneration,
+          candidateRepositoryGeneration: lifecycle.repositoryGeneration,
+          originRepositoryGeneration,
+          attempt: lifecycle.attempt,
+          integrationRunId: lifecycle.integrationRunId ?? "",
+          candidateSha,
+          baseSha: boundBase,
+          state: "intent",
+          updatedAt: new Date().toISOString(),
+        };
+        await this.persistPromotionLifecycle(promotionIntent, guard);
         await this.persistCandidateLifecycle(
           { ...lifecycle, candidateSha, state: "promotion_intent", updatedAt: new Date().toISOString() },
           guard,
@@ -1193,15 +1258,7 @@ export class GitRepo {
         Object.assign(lifecycle, promotedLifecycle);
         await hooks.afterCandidateState?.();
         await this.persistPromotionLifecycle({
-          candidateId: lifecycle.candidateId,
-          missionId: lifecycle.missionId,
-          repoId: lifecycle.repoId,
-          missionGeneration: lifecycle.missionGeneration,
-          candidateGeneration: lifecycle.candidateGeneration,
-          repositoryGeneration: guard?.repositoryIdentity?.generation ?? lifecycle.repositoryGeneration,
-          attempt: lifecycle.attempt,
-          candidateSha,
-          baseSha: boundBase,
+          ...promotionIntent!,
           state: "completed",
           updatedAt: new Date().toISOString(),
         });
@@ -1282,15 +1339,25 @@ export class GitRepo {
     lifecycle?: CandidateLifecycle,
     hooks: PromotionHooks = {},
   ): Promise<PromotionResult> {
+    if (!lifecycle) {
+      return {
+        promoted: false,
+        reason: "exact durable candidate lifecycle is required for promotion reconciliation",
+        candidateSha: identity.candidateSha,
+      };
+    }
     const intent = (await this.loadPromotionLifecycles(identity.missionId, identity.repoId)).find(
       (record) =>
-        record.candidateId === (identity.candidateId ?? this.candidateId(identity)) &&
-        record.missionGeneration === identity.missionGeneration &&
-        record.candidateGeneration === identity.candidateGeneration &&
-        record.repositoryGeneration === identity.repositoryGeneration &&
-        record.attempt === identity.attempt &&
-        record.baseSha === identity.baseSha &&
-        record.candidateSha === identity.candidateSha &&
+        record.candidateId === lifecycle.candidateId &&
+        record.missionId === lifecycle.missionId &&
+        record.repoId === lifecycle.repoId &&
+        record.missionGeneration === lifecycle.missionGeneration &&
+        record.candidateGeneration === lifecycle.candidateGeneration &&
+        record.candidateRepositoryGeneration === lifecycle.repositoryGeneration &&
+        record.attempt === lifecycle.attempt &&
+        record.integrationRunId === (lifecycle.integrationRunId ?? "") &&
+        record.baseSha === lifecycle.baseSha &&
+        record.candidateSha === lifecycle.candidateSha &&
         (record.state === "intent" || record.state === "completed"),
     );
     if (!intent) {
@@ -1326,6 +1393,8 @@ export class GitRepo {
     }
     await this.persistPromotionLifecycle({
       ...intent,
+      reconciliationRepositoryGeneration:
+        guard?.repositoryIdentity?.generation ?? intent.reconciliationRepositoryGeneration,
       state: "completed",
       updatedAt: new Date().toISOString(),
     });

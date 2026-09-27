@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
-import { access, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -861,6 +861,75 @@ test("branch deletion failure remains retryable after the worktree has already b
   }
 });
 
+test("cleanup write-ahead phases reconcile after crashes with absent worktree or branch", async () => {
+  for (const crashAt of ["afterIntent", "afterWorktreeRemoved", "afterBranchDeleted"] as const) {
+    const fixture = await makeFixtureRepo();
+    try {
+      const repo = (await GitRepo.open(fixture.root))!;
+      const worktree = await repo.createWorktree(await repo.headCommit(), `cleanup-${crashAt}`);
+      const identity = { missionId: `MSN-${crashAt}`, repoId: "repo-cleanup-phases" };
+      await assert.rejects(
+        repo.removeWorktree(worktree, { cleanupIdentity: identity }, undefined, {
+          [crashAt]: () => {
+            throw new Error(`crash:${crashAt}`);
+          },
+        }),
+        new RegExp(`crash:${crashAt}`),
+      );
+      const pending = await repo.loadPendingBranchCleanups(identity.missionId, identity.repoId);
+      assert.equal(pending.length, 1);
+      assert.equal(
+        pending[0]?.state,
+        crashAt === "afterIntent"
+          ? "intent"
+          : crashAt === "afterWorktreeRemoved"
+            ? "worktree_removed"
+            : "branch_deleted",
+      );
+
+      const reopened = (await GitRepo.open(fixture.root))!;
+      await reopened.removeWorktree(worktree, { cleanupIdentity: identity });
+      assert.equal(await reopened.resolveCommit(worktree.branch), null);
+      await assert.rejects(access(worktree.path));
+      assert.deepEqual(await reopened.loadPendingBranchCleanups(identity.missionId, identity.repoId), []);
+    } finally {
+      await fixture.cleanup();
+    }
+  }
+});
+
+test("cleanup inventory reports a matching journal filename with a corrupt payload identity", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const repo = (await GitRepo.open(fixture.root))!;
+    const stateDir = join(await repo.commonDir(), "pi-engineering-candidates");
+    await mkdir(stateDir, { recursive: true });
+    const missionId = "MSN-cleanup-payload";
+    const repoId = "repo-cleanup-payload";
+    const name = `cleanup.${[missionId, repoId, "branch"]
+      .map((part) => Buffer.from(part).toString("base64url"))
+      .join(".")}.json`;
+    await writeFile(
+      join(stateDir, name),
+      JSON.stringify({
+        missionId: "MSN-forged",
+        repoId,
+        path: "/tmp/forged",
+        branch: "branch",
+        state: "intent",
+        updatedAt: new Date().toISOString(),
+      }),
+    );
+
+    const inventory = await repo.loadPendingBranchCleanupInventory(missionId, repoId);
+    assert.deepEqual(inventory.records, []);
+    assert.equal(inventory.diagnostics.length, 1);
+    assert.match(inventory.diagnostics[0]?.reason ?? "", /invalid identity or phase/);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
 test("fresh authority reconciles only a committed exact promotion intent and never advances an old base intent", async () => {
   const fixture = await makeFixtureRepo();
   try {
@@ -920,6 +989,113 @@ test("fresh authority reconciles only a committed exact promotion intent and nev
     assert.ok(recovered.some((result) => result.promoted && result.alreadyPromoted));
     assert.equal(await repo.headCommit(), candidate.candidateSha);
     await repo.removeWorktree(candidate, { keepBranch: true }).catch(() => {});
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("historical promotion identity remains idempotent across CAS origin, takeover reconciliation, and final authority", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const repo = (await GitRepo.open(fixture.root))!;
+    const base = await repo.headCommit();
+    const candidate = await repo.createCandidateWorktree(base, {
+      missionId: "MSN-three-generations",
+      repoId: "repo-three-generations",
+      missionGeneration: 4,
+      candidateGeneration: 2,
+      repositoryGeneration: 1,
+      attempt: "creation-execution",
+    });
+    await writeFile(join(candidate.path, "src", "three-generations.ts"), "export const stable = true;\n");
+    await repo.commitAll(candidate.path, "three generation candidate");
+    candidate.candidateSha = await repo.headCommitIn(candidate.path);
+    const run = await repo.beginIntegrationRun(candidate, "integration-run", []);
+    run.state = "completed";
+    run.candidateSha = candidate.candidateSha;
+    await repo.persistIntegrationRun(run);
+    candidate.integrationRunId = run.runId;
+    await repo.persistCandidateLifecycle(candidate);
+    const authority = (generation: number) => ({
+      repositoryIdentity: { generation },
+      assertAuthoritative: () => {},
+    });
+
+    await assert.rejects(
+      repo.promoteCandidate(candidate, base, authority(1), candidate, {
+        afterCas: () => {
+          throw new Error("crash after generation-one CAS");
+        },
+      }),
+      /generation-one CAS/,
+    );
+    const takeover = await repo.reconcileCommittedPromotions(candidate.missionId, candidate.repoId, authority(2));
+    assert.equal(takeover[0]?.alreadyPromoted, true);
+    const finalization = await repo.promoteCandidate(candidate, base, authority(3), candidate);
+    assert.equal(finalization.promoted, true);
+    assert.equal(finalization.alreadyPromoted, true);
+    const completed = (await repo.loadPromotionLifecycles(candidate.missionId, candidate.repoId)).at(-1)!;
+    assert.equal(completed.originRepositoryGeneration, 1);
+    assert.equal(completed.reconciliationRepositoryGeneration, 3);
+    assert.equal(completed.candidateRepositoryGeneration, 1);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("forged candidate and promotion identities are rejected while loading durable state", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const repo = (await GitRepo.open(fixture.root))!;
+    const base = await repo.headCommit();
+    const candidate = await repo.createCandidateWorktree(base, {
+      missionId: "MSN-forged-identity",
+      repoId: "repo-forged-identity",
+      missionGeneration: 1,
+      candidateGeneration: 1,
+      repositoryGeneration: 1,
+      attempt: "creation-attempt",
+    });
+    const stateDir = join(await repo.commonDir(), "pi-engineering-candidates");
+    const candidateFile = (await readdir(stateDir)).find(
+      (name) => !name.startsWith("promotion.") && !name.startsWith("run.") && !name.startsWith("cleanup."),
+    )!;
+    const forgedCandidate = JSON.parse(await readFile(join(stateDir, candidateFile), "utf8")) as Record<
+      string,
+      unknown
+    >;
+    forgedCandidate.candidateId = "forged-candidate-id";
+    await writeFile(join(stateDir, candidateFile), JSON.stringify(forgedCandidate));
+    assert.deepEqual(await repo.loadCandidateLifecycles(candidate.missionId, candidate.repoId), []);
+
+    candidate.candidateId = [
+      candidate.missionId,
+      candidate.repoId,
+      String(candidate.missionGeneration),
+      String(candidate.candidateGeneration),
+      candidate.attempt,
+    ]
+      .map((part) => Buffer.from(part).toString("base64url"))
+      .join(".");
+    await repo.persistCandidateLifecycle(candidate);
+    await writeFile(join(candidate.path, "src", "forged.ts"), "export const forged = false;\n");
+    await repo.commitAll(candidate.path, "valid candidate");
+    candidate.candidateSha = await repo.headCommitIn(candidate.path);
+    await repo.persistCandidateLifecycle(candidate);
+    await repo.promoteCandidate(candidate, base, undefined, candidate);
+    const promotionFile = (await readdir(stateDir)).find((name) => name.startsWith("promotion."))!;
+    const forgedPromotion = JSON.parse(await readFile(join(stateDir, promotionFile), "utf8")) as Record<
+      string,
+      unknown
+    >;
+    forgedPromotion.originRepositoryGeneration = 999;
+    await writeFile(join(stateDir, promotionFile), JSON.stringify(forgedPromotion));
+    assert.deepEqual(await repo.loadPromotionLifecycles(candidate.missionId, candidate.repoId), []);
+
+    forgedPromotion.originRepositoryGeneration = forgedPromotion.repositoryGeneration;
+    forgedPromotion.attempt = "different-attempt";
+    await writeFile(join(stateDir, promotionFile), JSON.stringify(forgedPromotion));
+    assert.deepEqual(await repo.loadPromotionLifecycles(candidate.missionId, candidate.repoId), []);
   } finally {
     await fixture.cleanup();
   }

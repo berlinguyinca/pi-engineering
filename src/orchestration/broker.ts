@@ -1142,7 +1142,19 @@ export class ExecutionBroker {
             : undefined);
         const cleanupGit =
           trackedGit ?? (this.resolveRepository ? (await this.resolveRepository(repoId, [])).git : undefined);
-        const pendingBranchCleanups = cleanupGit ? await cleanupGit.loadPendingBranchCleanups(missionId, repoId) : [];
+        const cleanupInventory = cleanupGit
+          ? await cleanupGit.loadPendingBranchCleanupInventory(missionId, repoId)
+          : { records: [], diagnostics: [] };
+        const pendingBranchCleanups = cleanupInventory.records;
+        for (const diagnostic of cleanupInventory.diagnostics) {
+          failures.push({
+            repoId,
+            path: diagnostic.file,
+            branch: "",
+            preserved: true,
+            reason: diagnostic.reason,
+          });
+        }
         const trackedBranches = new Set(
           (this.missionWorktrees.get(missionId) ?? [])
             .filter((worktree) => (worktree.repoId ?? "") === repoId)
@@ -2149,22 +2161,38 @@ export class ExecutionBroker {
         (record) => record.state === "integrating" || record.state === "promotion_intent",
       );
       if (matching.length === 0 && backend !== "integration") {
-        const completedPromotions = await repository.git.loadPromotionLifecycles(input.missionId, input.repoId);
-        const completedCandidateIds = new Set(
-          completedPromotions
-            .filter(
-              (promotion) =>
-                promotion.state === "completed" &&
-                promotion.missionGeneration === missionGeneration &&
-                promotion.candidateGeneration === candidateGeneration &&
-                promotion.baseSha === boundBase,
-            )
-            .map((promotion) => `${promotion.candidateId}:${promotion.candidateSha}`),
-        );
-        matching = exactGeneration.filter(
-          (record) =>
-            record.state === "promoted" && completedCandidateIds.has(`${record.candidateId}:${record.candidateSha}`),
-        );
+        const [completedPromotions, integrationRuns] = await Promise.all([
+          repository.git.loadPromotionLifecycles(input.missionId, input.repoId),
+          repository.git.loadIntegrationRuns(input.missionId, input.repoId),
+        ]);
+        matching = exactGeneration.filter((record) => {
+          if (record.state !== "promoted" || !record.integrationRunId) return false;
+          const run = integrationRuns.find(
+            (candidateRun) =>
+              candidateRun.candidateId === record.candidateId &&
+              candidateRun.runId === record.integrationRunId &&
+              candidateRun.missionId === record.missionId &&
+              candidateRun.repoId === record.repoId &&
+              candidateRun.missionGeneration === record.missionGeneration &&
+              candidateRun.candidateGeneration === record.candidateGeneration &&
+              candidateRun.candidateSha === record.candidateSha &&
+              candidateRun.state === "completed",
+          );
+          if (!run) return false;
+          return completedPromotions.some(
+            (promotion) =>
+              promotion.state === "completed" &&
+              promotion.candidateId === record.candidateId &&
+              promotion.attempt === record.attempt &&
+              promotion.integrationRunId === record.integrationRunId &&
+              promotion.repoId === record.repoId &&
+              promotion.missionGeneration === missionGeneration &&
+              promotion.candidateGeneration === candidateGeneration &&
+              promotion.candidateRepositoryGeneration === record.repositoryGeneration &&
+              promotion.baseSha === record.baseSha &&
+              promotion.candidateSha === record.candidateSha,
+          );
+        });
       }
       if (matching.length === 0 && backend === "integration") {
         const parentIds = new Set(exactGeneration.map((record) => record.parentCandidateId).filter(Boolean));
@@ -2390,9 +2418,17 @@ export class ExecutionBroker {
         if (candidate) {
           const candidateSha = await candidate.git.headCommitIn(candidate.lifecycle.path);
           assertOrigin();
+          if (integrationRun) {
+            integrationRun.candidateSha = candidateSha;
+            integrationRun.state = outcome.exitStatus === "succeeded" ? "completed" : "preserved";
+            integrationRun.updatedAt = new Date().toISOString();
+            await candidate.git.persistIntegrationRun(integrationRun, input.authority);
+          }
           candidate.lifecycle = {
             ...candidate.lifecycle,
             candidateSha,
+            integrationRunId:
+              outcome.exitStatus === "succeeded" ? integrationRun?.runId : candidate.lifecycle.integrationRunId,
             state: outcome.exitStatus === "succeeded" ? "integrating" : "preserved",
             updatedAt: new Date().toISOString(),
           };

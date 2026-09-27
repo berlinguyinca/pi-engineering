@@ -161,3 +161,32 @@ Cleanup now checks both worktree removal and branch deletion results. Once a wor
 ### Fix-round-4 residual concerns
 
 - `ExclusiveFileLock` remains local-filesystem scoped; distributed promotion locking remains outside Task 7.
+
+## Fix round 5
+
+Promotion completion now preserves two separate authority facts: the immutable repository generation that originated the compare-and-swap and the latest fresh repository generation that reconciled its committed side effect. A generation-one crash after CAS can therefore be reconciled by generation two and finalized idempotently by generation three without rewriting or losing the historical origin. Every recovery reset still requires freshly asserted current authority.
+
+Promoted-candidate restoration now joins the candidate, completed integration run, and completed promotion across the derived candidate ID, creation attempt, repository, mission/candidate generations, candidate-creation repository generation, integration run ID, base SHA, and candidate SHA. Candidate and promotion IDs are re-derived while loading; mismatched IDs, attempts, repository generations, or inconsistent origin/reconciliation authority fields fail closed.
+
+Cleanup is now a write-ahead state machine (`intent` -> `worktree_removed` -> `branch_deleted`). Each phase is durable before the next destructive step, and restart treats an already-absent worktree or branch as proof that the corresponding mutation completed. Journals are removed only after the durable branch-deleted phase. Unreadable journals and matching filenames with invalid payload identities/phases become structured cleanup failures and durable findings instead of disappearing during inventory.
+
+### Fix-round-5 RED/GREEN evidence
+
+- RED: the three-generation regression exposed final promotion rejecting its exact historical completion after takeover reconciliation.
+- RED: forged candidate/promotion identity regressions exposed candidate IDs and authority-generation fields being trusted independently rather than joined as one durable identity.
+- RED: cleanup crash injection exposed missing pre-removal intent and missing durable phase transitions; a matching cleanup filename with a forged payload identity was silently ignored.
+- GREEN: focused Task 7 suite passed 96/96, including generation-one CAS crash -> generation-two reconciliation -> generation-three finalization, forged identity rejection, promoted broker restoration, every cleanup crash phase, and corrupt-journal restart diagnostics.
+- GREEN: `npm run typecheck` passed.
+- GREEN: `npm run lint` passed (`Checked 583 files`).
+- GREEN: bounded `timeout 180 npm test` passed on rerun: 2,438 tests; 2,437 passed, 0 failed, 1 skipped. The first run had one transient Playwright screenshot capture failure; that exact test passed in isolation before the clean full rerun.
+- GREEN: `git diff --check` passed.
+
+### Fix-round-5 reviewer focus
+
+- Verify origin authority remains immutable while reconciliation authority may advance, and current authority is asserted separately immediately before every recovery reset.
+- Verify promoted restoration requires the complete candidate/run/promotion identity join and cannot be authorized by a forged candidate ID, creation attempt, repository generation, base SHA, candidate SHA, or integration run.
+- Verify cleanup persists intent before worktree removal, persists each completed phase before continuing, reconciles absent resources idempotently, and reports unreadable or identity-corrupt journals durably.
+
+### Fix-round-5 residual concerns
+
+- `ExclusiveFileLock` remains intentionally local-filesystem scoped. Distributed promotion locking is outside Task 7.

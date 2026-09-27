@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { writeFileSync } from "node:fs";
-import { access, readFile, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import { promisify } from "node:util";
@@ -1541,6 +1541,11 @@ describe("ExecutionBroker (spec 03)", () => {
       await writeFile(join(candidate.path, "src", "promotion-restart.ts"), "export const recovered = true;\n");
       await git.commitAll(candidate.path, "promotion restart candidate");
       candidate.candidateSha = await git.headCommitIn(candidate.path);
+      const integrationRun = await git.beginIntegrationRun(candidate, execution.execution_id, []);
+      integrationRun.state = "completed";
+      integrationRun.candidateSha = candidate.candidateSha;
+      await git.persistIntegrationRun(integrationRun);
+      candidate.integrationRunId = integrationRun.runId;
       await git.persistCandidateLifecycle(candidate);
       await assert.rejects(
         git.promoteCandidate(candidate, base, undefined, candidate, {
@@ -1595,6 +1600,45 @@ describe("ExecutionBroker (spec 03)", () => {
 
       assert.equal(await restarted.promoteCandidate(mission.mission_id), true);
       assert.equal(await git.headCommit(), candidate.candidateSha);
+
+      const stateDir = join(await git.commonDir(), "pi-engineering-candidates");
+      const promotionFile = (await readdir(stateDir)).find((name) => name.startsWith("promotion."))!;
+      const forged = JSON.parse(await readFile(join(stateDir, promotionFile), "utf8")) as Record<string, unknown>;
+      forged.candidateRepositoryGeneration = 999;
+      await writeFile(join(stateDir, promotionFile), JSON.stringify(forged));
+      const forgedTask = store.createTask({
+        mission_id: mission.mission_id,
+        kind: "validation",
+        role: "validator",
+        objective: "reject forged completion",
+        repo_id: "repo-promotion-restart",
+        mission_generation: 0,
+        candidate_generation: 0,
+      });
+      const forgedRestart = new ExecutionBroker({
+        store,
+        resolveRepository: async () => ({ repoId: "repo-promotion-restart", root: fx.root, git }),
+        backends: {
+          validation: {
+            candidateScoped: true,
+            runValidation: async () => {
+              throw new Error("forged promotion must never dispatch");
+            },
+          },
+        },
+      });
+      await assert.rejects(
+        (
+          await forgedRestart.execute({
+            taskId: forgedTask.task_id,
+            missionId: mission.mission_id,
+            repoId: "repo-promotion-restart",
+            kind: "validation",
+            objective: forgedTask.objective,
+          })
+        ).result(),
+        /CANDIDATE_UNAVAILABLE/,
+      );
     } finally {
       await fx.cleanup();
     }
@@ -3091,5 +3135,54 @@ it("cleans repositories independently and durably reports a locked removal for r
   } finally {
     await firstFixture.cleanup();
     await secondFixture.cleanup();
+  }
+});
+
+it("turns a corrupt durable cleanup journal into a structured finding after broker restart", async () => {
+  const fx = await makeFixtureRepo();
+  try {
+    const git = (await GitRepo.open(fx.root))!;
+    const store = MissionStore.open(JsonlEventStore.inMemory());
+    const mission = store.createMission({
+      title: "corrupt cleanup",
+      goal: "corrupt cleanup",
+      user_request: "corrupt cleanup",
+      repository: fx.root,
+      base_ref: await git.headCommit(),
+      risk_profile: "medium",
+      workflow_class: "engineering_review",
+    });
+    store.createTask({
+      mission_id: mission.mission_id,
+      repo_id: "repo-corrupt-cleanup",
+      kind: "agent",
+      role: "implementer",
+      objective: "cleanup",
+      mutates_repo: true,
+      isolation: "worktree",
+    });
+    const stateDir = join(await git.commonDir(), "pi-engineering-candidates");
+    await mkdir(stateDir, { recursive: true });
+    const name = `cleanup.${[mission.mission_id, "repo-corrupt-cleanup", "orphan-branch"]
+      .map((part) => Buffer.from(part).toString("base64url"))
+      .join(".")}.json`;
+    await writeFile(join(stateDir, name), "{not-json", "utf8");
+
+    const restarted = new ExecutionBroker({
+      store,
+      resolveRepository: async () => ({ repoId: "repo-corrupt-cleanup", root: fx.root, git }),
+      backends: {},
+    });
+    const result = await restarted.cleanupMission(mission.mission_id);
+    assert.equal(result.failures.length, 1);
+    assert.equal(result.failures[0]?.repoId, "repo-corrupt-cleanup");
+    assert.match(result.failures[0]?.reason ?? "", /cleanup journal is unreadable/i);
+    assert.ok(
+      store
+        .listFindings(mission.mission_id)
+        .some((finding) => finding.summary.includes(name) && finding.summary.includes("unreadable")),
+    );
+  } finally {
+    await fx.cleanup();
   }
 });
