@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import { test } from "node:test";
 import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
+import { normalizeAgentDir } from "../../src/core/piAgentDir.ts";
+import { PiWorkerExecutor } from "../../src/workers/PiWorkerExecutor.ts";
 import {
   DEFAULT_MAX_TOKENS,
   partitionByToolSupport,
@@ -31,17 +33,21 @@ function onlyConfig(registered: Array<{ id: string; config: any }>): any {
 }
 
 /** Run `fn` with QWEN_NODES_FILE pointing at a temp file holding `nodes`. */
-async function withNodesFile(nodes: unknown, fn: () => Promise<void>): Promise<void> {
+async function withNodesFile(nodes: unknown, fn: (dir: string) => Promise<void>): Promise<void> {
   const dir = await mkdtemp(join(tmpdir(), "localproviders-"));
   const path = join(dir, "qwen-nodes.json");
   await writeFile(path, JSON.stringify(nodes), "utf-8");
   const prior = process.env.QWEN_NODES_FILE;
+  const priorAgentDir = process.env.PI_CODING_AGENT_DIR;
   process.env.QWEN_NODES_FILE = path;
+  process.env.PI_CODING_AGENT_DIR = dir;
   try {
-    await fn();
+    await fn(dir);
   } finally {
     if (prior === undefined) delete process.env.QWEN_NODES_FILE;
     else process.env.QWEN_NODES_FILE = prior;
+    if (priorAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = priorAgentDir;
     await rm(dir, { recursive: true, force: true });
   }
 }
@@ -68,6 +74,11 @@ const nodeWith = (models: unknown[]) => ({
       models,
     },
   ],
+});
+
+test("normalizeAgentDir expands both Pi-supported tilde separator forms", () => {
+  assert.equal(normalizeAgentDir("~/.pi/agent"), join(process.env.HOME ?? "", ".pi", "agent"));
+  assert.equal(normalizeAgentDir("~\\.pi\\agent"), join(process.env.HOME ?? "", ".pi", "agent"));
 });
 
 test("partition: a model probed unable to call tools is held out", () => {
@@ -151,6 +162,117 @@ test("register: a tool-incapable model is never registered on a worker", async (
       assert.deepEqual(ids, ["working-model"]);
     },
   );
+});
+
+test("register: a Pi-disabled qwen-turing extension is not mirrored into workers", async () => {
+  await withNodesFile(nodeWith([{ id: "disabled-model" }]), async (homeDir) => {
+    const agentDir = join(homeDir, ".pi", "agent");
+    await mkdir(agentDir, { recursive: true });
+    await writeFile(
+      join(agentDir, "settings.json"),
+      JSON.stringify({ extensions: ["-extensions/qwen-turing.ts"] }),
+      "utf-8",
+    );
+    await withEnv("HOME", homeDir, async () => {
+      const { registered, runtime } = fakeRuntime();
+      await registerLocalProviders(runtime, { verdicts: {}, agentDir: "~/.pi/agent" });
+      assert.equal(registered.length, 0, "workers must honor the same extension exclusion as interactive Pi");
+    });
+  });
+});
+
+test("register: a backslash tilde profile finds Pi's disabled extension settings", async () => {
+  await withNodesFile(nodeWith([{ id: "windows-profile-model" }]), async (homeDir) => {
+    const agentDir = join(homeDir, ".pi", "agent");
+    await mkdir(agentDir, { recursive: true });
+    await writeFile(
+      join(agentDir, "settings.json"),
+      JSON.stringify({ extensions: ["-extensions/qwen-turing.ts"] }),
+      "utf-8",
+    );
+    await withEnv("HOME", homeDir, async () => {
+      const { registered, runtime } = fakeRuntime();
+      await registerLocalProviders(runtime, { verdicts: {}, agentDir: "~\\.pi\\agent" });
+      assert.equal(registered.length, 0);
+    });
+  });
+});
+
+test("register: Pi glob and exact override precedence controls worker mirroring", async () => {
+  await withNodesFile(nodeWith([{ id: "controlled-model" }]), async (agentDir) => {
+    const cases = [
+      { extensions: ["!extensions/qwen-*.ts"], registered: 0 },
+      { extensions: ["!qwen-turing.ts"], registered: 0 },
+      { extensions: ["!extensions/qwen-*.ts", "+extensions/qwen-turing.ts"], registered: 1 },
+      {
+        extensions: ["!extensions/qwen-*.ts", "+extensions/qwen-turing.ts", "-./extensions/qwen-turing.ts"],
+        registered: 0,
+      },
+      { extensions: [`+${join(agentDir, "extensions", "qwen-turing.ts")}`], registered: 1 },
+      { extensions: [`-${join(agentDir, "extensions", "qwen-turing.ts")}`], registered: 0 },
+    ];
+    for (const entry of cases) {
+      await writeFile(join(agentDir, "settings.json"), JSON.stringify({ extensions: entry.extensions }), "utf-8");
+      const { registered, runtime } = fakeRuntime();
+      await registerLocalProviders(runtime, { verdicts: {}, agentDir });
+      assert.equal(registered.length, entry.registered, JSON.stringify(entry.extensions));
+    }
+  });
+});
+
+test("register: absolute exclusions work when the selected agent directory is relative", async () => {
+  await withNodesFile(nodeWith([{ id: "relative-profile-model" }]), async (agentDir) => {
+    const absoluteExtension = join(agentDir, "extensions", "qwen-turing.ts");
+    await writeFile(
+      join(agentDir, "settings.json"),
+      JSON.stringify({ extensions: [`-${absoluteExtension}`] }),
+      "utf-8",
+    );
+    const { registered, runtime } = fakeRuntime();
+    await registerLocalProviders(runtime, { verdicts: {}, agentDir: relative(process.cwd(), agentDir) });
+    assert.equal(registered.length, 0);
+  });
+});
+
+test("register: malformed or unreadable settings fail closed", async () => {
+  await withNodesFile(nodeWith([{ id: "guarded-model" }]), async (agentDir) => {
+    await writeFile(join(agentDir, "settings.json"), "{not-json", "utf-8");
+    const malformed = fakeRuntime();
+    await registerLocalProviders(malformed.runtime, { verdicts: {}, agentDir });
+    assert.equal(malformed.registered.length, 0);
+
+    await rm(join(agentDir, "settings.json"));
+    await mkdir(join(agentDir, "settings.json"));
+    const unreadable = fakeRuntime();
+    await registerLocalProviders(unreadable.runtime, { verdicts: {}, agentDir });
+    assert.equal(unreadable.registered.length, 0);
+  });
+});
+
+test("PiWorkerExecutor prefers PI_CODING_AGENT_DIR over the legacy PI_AGENT_DIR", async () => {
+  await withNodesFile(nodeWith([{ id: "profile-model" }]), async (dir) => {
+    const canonicalDir = join(dir, "canonical");
+    const legacyDir = join(dir, "legacy");
+    await mkdir(canonicalDir, { recursive: true });
+    await mkdir(legacyDir, { recursive: true });
+    for (const profile of [canonicalDir, legacyDir]) {
+      await writeFile(join(profile, "models.json"), JSON.stringify({ providers: {} }), "utf-8");
+      await writeFile(join(profile, "auth.json"), "{}", "utf-8");
+    }
+    await writeFile(
+      join(canonicalDir, "settings.json"),
+      JSON.stringify({ extensions: ["-extensions/qwen-turing.ts"] }),
+      "utf-8",
+    );
+    await writeFile(join(legacyDir, "settings.json"), "{}", "utf-8");
+
+    await withEnv("PI_CODING_AGENT_DIR", canonicalDir, async () => {
+      await withEnv("PI_AGENT_DIR", legacyDir, async () => {
+        const runtime = await new PiWorkerExecutor({ allowModelNetwork: false }).getModelRuntime();
+        assert.equal(runtime.getModel("metabolomics", "profile-model"), undefined);
+      });
+    });
+  });
 });
 
 test("register: a verdict held in the capability files is honoured too", async () => {

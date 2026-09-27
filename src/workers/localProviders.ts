@@ -1,7 +1,8 @@
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { basename, join, matchesGlob, relative } from "node:path";
 import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
+import { normalizeAgentDir } from "../core/piAgentDir.ts";
 import type { AdmissionRetryConfig } from "../inference/admissionConfig.ts";
 import type { AdmissionEventBus } from "../inference/admissionEvents.ts";
 import {
@@ -141,6 +142,58 @@ export function nodesFilePath(): string {
   return join(homedir(), ".pi", "agent", "qwen-nodes.json");
 }
 
+async function isInteractiveProviderExtensionDisabled(agentDir: string): Promise<boolean> {
+  const settingsPath = join(agentDir, "settings.json");
+  let raw: string;
+  try {
+    raw = await readFile(settingsPath, "utf-8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    emitTelemetry({
+      level: "warning",
+      text: "localProviders: Pi settings are unreadable; local provider mirroring is disabled for safety",
+    });
+    return true;
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    emitTelemetry({
+      level: "warning",
+      text: "localProviders: Pi settings are malformed; local provider mirroring is disabled for safety",
+    });
+    return true;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return true;
+  const extensions = (parsed as { extensions?: unknown }).extensions;
+  if (extensions === undefined) return false;
+  if (!Array.isArray(extensions) || extensions.some((entry) => typeof entry !== "string")) return true;
+
+  const extensionPath = join(agentDir, "extensions", "qwen-turing.ts");
+  const rel = relative(agentDir, extensionPath).replaceAll("\\", "/");
+  const name = basename(extensionPath);
+  const absolute = extensionPath.replaceAll("\\", "/");
+  const normalizeExact = (pattern: string): string =>
+    (pattern.startsWith("./") || pattern.startsWith(".\\") ? pattern.slice(2) : pattern).replaceAll("\\", "/");
+  const globMatches = (pattern: string): boolean => {
+    const normalized = pattern.replaceAll("\\", "/");
+    return matchesGlob(rel, normalized) || matchesGlob(name, normalized) || matchesGlob(absolute, normalized);
+  };
+  const exactMatches = (pattern: string): boolean => {
+    const normalized = normalizeExact(pattern);
+    return normalized === rel || normalized === absolute;
+  };
+
+  const overrides = extensions.filter((entry): entry is string => /^[!+-]/.test(String(entry)));
+  let enabled = true;
+  if (overrides.some((entry) => entry.startsWith("!") && globMatches(entry.slice(1)))) enabled = false;
+  if (overrides.some((entry) => entry.startsWith("+") && exactMatches(entry.slice(1)))) enabled = true;
+  if (overrides.some((entry) => entry.startsWith("-") && exactMatches(entry.slice(1)))) enabled = false;
+  return !enabled;
+}
+
 export async function readNodeSpecs(): Promise<NodeSpec[]> {
   try {
     const raw = await readFile(nodesFilePath(), "utf-8");
@@ -204,8 +257,13 @@ export async function registerLocalProviders(
     verdicts?: Record<string, boolean>;
     allowNoTools?: boolean;
     admission?: LocalAdmissionOptions;
+    agentDir?: string;
   },
 ): Promise<string[]> {
+  const agentDir = normalizeAgentDir(
+    opts?.agentDir ?? process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent"),
+  );
+  if (await isInteractiveProviderExtensionDisabled(agentDir)) return [];
   const specs = await readNodeSpecs();
   const verdicts = opts?.verdicts ?? (await readCapabilityVerdicts());
   const allowNoTools = opts?.allowNoTools === true || process.env.QWEN_ALLOW_NO_TOOLS === "1";

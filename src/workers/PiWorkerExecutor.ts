@@ -1,4 +1,4 @@
-import { homedir } from "node:os";
+import { join } from "node:path";
 import type { Model } from "@earendil-works/pi-ai/compat";
 import {
   ModelRuntime,
@@ -26,6 +26,7 @@ import { DEFAULT_ROLLOUT_PHASE, resolveRollout } from "../aps/rollout.ts";
 import { AGENT_LOOP_PREVENTED_EVENT, type AgentProgressSupervisorOptions } from "../aps/supervisor.ts";
 import { type AgentLoopPreventedEvent, DEFAULT_LOOP_PREVENTION } from "../aps/types.ts";
 import { WorkerActivityAdapter } from "../aps/workerActivity.ts";
+import { normalizeAgentDir } from "../core/piAgentDir.ts";
 import type { WorkerResult, WorkerRole, WorkerUsage } from "../core/types.ts";
 import type { AdmissionController } from "../gateway/AdmissionController.ts";
 import { type GatewayAdmissionConfig, sharedAdmissionController, sharedGatewayConfig } from "../gateway/config.ts";
@@ -208,7 +209,9 @@ export class PiWorkerExecutor implements WorkerExecutor {
   readonly transientTelemetry: TransientTelemetry = initialTransientTelemetry();
 
   constructor(opts: PiWorkerExecutorOptions = {}) {
-    this.agentDir = opts.agentDir ?? process.env.PI_AGENT_DIR ?? "~/.pi/agent";
+    this.agentDir = normalizeAgentDir(
+      opts.agentDir ?? process.env.PI_CODING_AGENT_DIR ?? process.env.PI_AGENT_DIR ?? "~/.pi/agent",
+    );
     this.customTools = opts.customTools ?? [];
     this.model = opts.model;
     this.allowModelNetwork = opts.allowModelNetwork ?? false;
@@ -243,11 +246,11 @@ export class PiWorkerExecutor implements WorkerExecutor {
     if (this.runtimePromise) return this.runtimePromise;
     this.runtimePromise = (async () => {
       const rt = await ModelRuntime.create({
-        authPath: joinExpand(this.agentDir, "auth.json"),
-        modelsPath: joinExpand(this.agentDir, "models.json"),
+        authPath: join(this.agentDir, "auth.json"),
+        modelsPath: join(this.agentDir, "models.json"),
         allowModelNetwork: this.allowModelNetwork,
       });
-      await registerLocalProviders(rt).catch(() => {});
+      await registerLocalProviders(rt, { agentDir: this.agentDir }).catch(() => {});
       guardRuntimeRequestBody(rt, this.requestBodyBudget, this.thinkingPolicy);
       return rt;
     })();
@@ -1126,11 +1129,6 @@ ${recovery.recoveryPrompt}`;
     if (turns === 0) return null;
     return { input, output, cacheRead, cacheWrite, cost, contextTokens, turns, model };
   }
-}
-
-function joinExpand(base: string, rel: string): string {
-  const expanded = base.replace(/^~(?=$|\/)/, homedir());
-  return expanded.endsWith("/") ? `${expanded}${rel}` : `${expanded}/${rel}`;
 }
 
 /**

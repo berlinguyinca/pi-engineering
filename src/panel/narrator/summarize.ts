@@ -12,8 +12,10 @@
  * could not be updated.
  */
 
+import { join } from "node:path";
 import type { Model } from "@earendil-works/pi-ai/compat";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
+import { normalizeAgentDir } from "../../core/piAgentDir.ts";
 import { registerLocalProviders } from "../../workers/localProviders.ts";
 
 /** The slice of a ModelRuntime this adapter uses (injected in tests). */
@@ -36,11 +38,6 @@ export interface SummarizeOptions {
   runtime?: () => Promise<SummarizeRuntime>;
 }
 
-function joinExpand(base: string, file: string): string {
-  const root = base.startsWith("~") ? `${process.env.HOME ?? ""}${base.slice(1)}` : base;
-  return `${root.replace(/\/+$/, "")}/${file}`;
-}
-
 /**
  * Build the `summarize` function the `Narrator` calls.
  *
@@ -48,18 +45,20 @@ function joinExpand(base: string, file: string): string {
  * never builds one.
  */
 export function createSummarize(opts: SummarizeOptions = {}): (prompt: string) => Promise<string> {
-  const agentDir = opts.agentDir ?? process.env.PI_AGENT_DIR ?? "~/.pi/agent";
+  const agentDir = normalizeAgentDir(
+    opts.agentDir ?? process.env.PI_CODING_AGENT_DIR ?? process.env.PI_AGENT_DIR ?? "~/.pi/agent",
+  );
   let runtimePromise: Promise<SummarizeRuntime> | undefined;
 
   const getRuntime = (): Promise<SummarizeRuntime> => {
     if (opts.runtime) return opts.runtime();
     runtimePromise ??= (async () => {
       const runtime = await ModelRuntime.create({
-        authPath: joinExpand(agentDir, "auth.json"),
-        modelsPath: joinExpand(agentDir, "models.json"),
+        authPath: join(agentDir, "auth.json"),
+        modelsPath: join(agentDir, "models.json"),
         allowModelNetwork: opts.allowModelNetwork ?? false,
       });
-      await registerLocalProviders(runtime).catch(() => {});
+      await registerLocalProviders(runtime, { agentDir }).catch(() => {});
       return runtime as unknown as SummarizeRuntime;
     })();
     return runtimePromise;
