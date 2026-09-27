@@ -87,6 +87,8 @@ export interface MissionObservabilitySnapshot {
 
 export interface MissionSnapshotMission {
   id: string;
+  /** Replay-stable authoritative mission event ordinal. */
+  revision: number;
   title: string;
   goal: string;
   workflowClass: string;
@@ -199,6 +201,7 @@ export function buildMissionSnapshot(
 ): MissionSnapshotMission {
   return {
     id: mission.mission_id,
+    revision: mission.revision,
     title: mission.title,
     goal: mission.goal,
     workflowClass: mission.workflow_class,

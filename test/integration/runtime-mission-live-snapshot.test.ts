@@ -102,6 +102,7 @@ test("snapshot preserves the complete actionable stop payload", async () => {
 
     const snapshot = await runtime.publishMissionSnapshot();
     const stop = snapshot?.missions[0]?.stop;
+    assert.equal(snapshot?.missions[0]?.revision, runtime.missionStore!.getMission(mission.mission_id)?.revision);
     assert.ok(stop);
     assert.match(stop.stoppedAt, /^\d{4}-\d{2}-\d{2}T/);
     assert.deepEqual(
@@ -289,9 +290,8 @@ test("stale paused probe snapshots cannot stop a concurrently advanced mission",
     },
     {
       name: "newer paused status snapshot",
-      advance: async (runtime, missionId) => {
+      advance: (runtime, missionId) => {
         runtime.missionStore!.transitionMission(missionId, "EXECUTING");
-        await new Promise<void>((resolve) => setTimeout(resolve, 2));
         runtime.missionStore!.transitionMission(missionId, "PAUSED_INFRASTRUCTURE");
       },
       expectedStatus: "PAUSED_INFRASTRUCTURE",
@@ -386,6 +386,142 @@ test("stale paused probe snapshots cannot stop a concurrently advanced mission",
         await rm(root, { recursive: true, force: true });
       }
     });
+  }
+});
+
+test("a fixed-clock paused probe fence remains stale after JSONL reopen", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-eng-replayed-paused-fence-"));
+  const workDir = join(root, ".pi-eng");
+  const originalResume = Orchestrator.prototype.resume;
+  const OriginalDate = globalThis.Date;
+  const fixed = "2026-09-27T12:00:00.000Z";
+  class FixedDate extends OriginalDate {
+    constructor(value?: string | number | Date) {
+      super(value ?? fixed);
+    }
+    static override now(): number {
+      return OriginalDate.parse(fixed);
+    }
+  }
+  try {
+    globalThis.Date = FixedDate as DateConstructor;
+    const first = await EngineeringRuntime.open({ cwd: root, workDir, worker: new FakeWorkerExecutor({}) });
+    const mission = first.missionStore!.createMission({
+      title: "replayed revision fence",
+      goal: "reject an old paused probe after replay",
+      user_request: "reject an old paused probe after replay",
+      repository: root,
+      base_ref: "",
+      risk_profile: "low",
+      workflow_class: "engineering",
+    });
+    for (const status of ["CLASSIFYING", "READY", "EXECUTING", "PAUSED_INFRASTRUCTURE"] as const) {
+      first.missionStore!.transitionMission(mission.mission_id, status);
+    }
+    const stale = first.missionStore!.getMission(mission.mission_id)!;
+    first.missionStore!.transitionMission(mission.mission_id, "EXECUTING");
+    first.missionStore!.transitionMission(mission.mission_id, "PAUSED_INFRASTRUCTURE");
+    await first.close();
+
+    Orchestrator.prototype.resume = async () => stale;
+    const reopened = await EngineeringRuntime.open({ cwd: root, workDir, worker: new FakeWorkerExecutor({}) });
+    const stopsBeforeStaleSettlement = reopened.missionStore!.listMissionStops(mission.mission_id).length;
+    const status: SupervisorStatus = {
+      missionId: mission.mission_id,
+      missionStatus: stale.status,
+      missionUpdatedAt: stale.updated_at,
+      missionRevision: stale.revision,
+      missionBlockedEpisodeId: stale.blocked_episode_id ?? null,
+      resumptionGeneration: 0,
+      health: "ORPHANED",
+      action: "FENCE_RECONCILE_AND_RESUME",
+      lastMeaningfulProgressAt: null,
+      reason: "stale paused probe",
+      recovery: { attempt: 1, maxAttempts: 1 },
+      nextAction: "probe again",
+      nextActionAt: null,
+      owner: null,
+      repository: root,
+      task: null,
+      preservedWork: [],
+    };
+    await (
+      reopened as unknown as { consumeSupervisorStatuses(statuses: SupervisorStatus[]): Promise<void> }
+    ).consumeSupervisorStatuses([status]);
+
+    assert.equal(reopened.missionStore!.listMissionStops(mission.mission_id).length, stopsBeforeStaleSettlement);
+    assert.ok(reopened.missionStore!.getMission(mission.mission_id)!.revision > stale.revision);
+    await reopened.close();
+  } finally {
+    globalThis.Date = OriginalDate;
+    Orchestrator.prototype.resume = originalResume;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("concurrent callbacks claim one paused snapshot before invoking resume", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-eng-paused-settlement-singleflight-"));
+  const originalResume = Orchestrator.prototype.resume;
+  try {
+    const runtime = await EngineeringRuntime.open({ cwd: root, worker: new FakeWorkerExecutor({}) });
+    const mission = runtime.missionStore!.createMission({
+      title: "single paused settlement",
+      goal: "coalesce concurrent supervisor callbacks",
+      user_request: "coalesce concurrent supervisor callbacks",
+      repository: root,
+      base_ref: "",
+      risk_profile: "low",
+      workflow_class: "engineering",
+    });
+    for (const status of ["CLASSIFYING", "READY", "EXECUTING", "PAUSED_INFRASTRUCTURE"] as const) {
+      runtime.missionStore!.transitionMission(mission.mission_id, status);
+    }
+    const current = runtime.missionStore!.getMission(mission.mission_id)!;
+    const status: SupervisorStatus = {
+      missionId: mission.mission_id,
+      missionStatus: current.status,
+      missionUpdatedAt: current.updated_at,
+      missionRevision: current.revision,
+      missionBlockedEpisodeId: current.blocked_episode_id ?? null,
+      resumptionGeneration: 0,
+      health: "ORPHANED",
+      action: "FENCE_RECONCILE_AND_RESUME",
+      lastMeaningfulProgressAt: null,
+      reason: "probe paused mission",
+      recovery: { attempt: 1, maxAttempts: 1 },
+      nextAction: "probe again",
+      nextActionAt: null,
+      owner: null,
+      repository: root,
+      task: null,
+      preservedWork: [],
+    };
+    let resumeCalls = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    Orchestrator.prototype.resume = async function (missionId: string) {
+      resumeCalls++;
+      await gate;
+      return this.store.getMission(missionId)!;
+    };
+    const consume = () =>
+      (
+        runtime as unknown as { consumeSupervisorStatuses(statuses: SupervisorStatus[]): Promise<void> }
+      ).consumeSupervisorStatuses([status]);
+    const settlements = Promise.all([consume(), consume()]);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const callsBeforeRelease = resumeCalls;
+    release();
+    await settlements;
+
+    assert.equal(callsBeforeRelease, 1);
+    assert.equal(runtime.missionStore!.listMissionStops(mission.mission_id).length, 1);
+    await runtime.close();
+  } finally {
+    Orchestrator.prototype.resume = originalResume;
+    await rm(root, { recursive: true, force: true });
   }
 });
 
@@ -500,6 +636,8 @@ test("status consumer rejects unsupported actions as invalid output without disp
       missionId: mission.mission_id,
       missionStatus: current.status,
       missionUpdatedAt: current.updated_at,
+      missionRevision: current.revision,
+      missionBlockedEpisodeId: current.blocked_episode_id ?? null,
       resumptionGeneration: 0,
       health: "ORPHANED",
       action: "UNSUPPORTED_RECOVERY",

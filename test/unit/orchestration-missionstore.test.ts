@@ -433,6 +433,78 @@ describe("MissionStore", () => {
     assert.equal(task.status, "RUNNING");
   });
 
+  it("keeps a monotonic mission revision stable across replay", async () => {
+    const backend = JsonlEventStore.inMemory();
+    const first = MissionStore.open(backend);
+    const mission = first.createMission({
+      title: "revision replay",
+      goal: "revision replay",
+      user_request: "revision replay",
+      repository: ".",
+      base_ref: "",
+      risk_profile: "low",
+      workflow_class: "engineering",
+    });
+    first.transitionMission(mission.mission_id, "CLASSIFYING");
+    first.transitionMission(mission.mission_id, "READY");
+    const beforeStop = first.getMission(mission.mission_id)!;
+    const settled = first.stopMissionIfCurrent(
+      mission.mission_id,
+      {
+        reason: "revision settlement",
+        attemptedRecoveries: [],
+        preservedWork: [],
+        resumeCondition: "operator resumes",
+      },
+      {
+        revision: beforeStop.revision,
+        status: beforeStop.status,
+        resumptionGeneration: 0,
+        blockedEpisodeId: beforeStop.blocked_episode_id ?? null,
+      },
+    );
+    assert.ok(settled);
+    const liveRevision = first.getMission(mission.mission_id)!.revision;
+    assert.ok(liveRevision > beforeStop.revision, "the stop mutation advances the mission event token");
+    await first.flush();
+
+    const reopened = MissionStore.open(backend);
+    assert.equal(reopened.getMission(mission.mission_id)?.revision, liveRevision);
+  });
+
+  it("atomically returns the existing stop for concurrent settlement of one mission revision", () => {
+    const s = store();
+    const mission = s.createMission({
+      title: "single stop",
+      goal: "single stop",
+      user_request: "single stop",
+      repository: ".",
+      base_ref: "",
+      risk_profile: "low",
+      workflow_class: "engineering",
+    });
+    const current = s.getMission(mission.mission_id)!;
+    const expected = {
+      revision: current.revision,
+      status: current.status,
+      resumptionGeneration: 0,
+      blockedEpisodeId: current.blocked_episode_id ?? null,
+    };
+    const input = {
+      reason: "settled once",
+      attemptedRecoveries: [],
+      preservedWork: [],
+      resumeCondition: "operator resumes",
+    };
+
+    const first = s.stopMissionIfCurrent(mission.mission_id, input, expected);
+    const second = s.stopMissionIfCurrent(mission.mission_id, input, expected);
+
+    assert.ok(first);
+    assert.deepEqual(second, first);
+    assert.equal(s.listMissionStops(mission.mission_id).length, 1);
+  });
+
   it("replays every supported task transition metadata field and rejects all others", async () => {
     const backend = JsonlEventStore.inMemory();
     const s1 = MissionStore.open(backend);

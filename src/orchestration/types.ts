@@ -96,6 +96,8 @@ export interface AcceptanceCriterion {
 /** A mission: the durable unit of engineering work. */
 export interface Mission {
   mission_id: EntityId;
+  /** Replay-stable ordinal of the latest authoritative event for this mission. */
+  revision: number;
   title: string;
   goal: string;
   user_request: string;

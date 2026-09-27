@@ -426,6 +426,7 @@ export class EngineeringRuntime {
   private closed = false;
   private openReferences = 1;
   private readonly missionResumeFlights = new Map<string, Promise<import("../orchestration/types.ts").Mission>>();
+  private readonly supervisorSettlementFlights = new Map<string, Promise<void>>();
 
   /**
    * Serializes git mutations that touch the shared main repo (worktree create,
@@ -924,47 +925,69 @@ export class EngineeringRuntime {
   private async consumeSupervisorStatuses(statuses: SupervisorStatus[]): Promise<void> {
     if (!this.missionStore || !this.orchestrator) return;
     for (const status of statuses) {
-      let failureFence: Mission | null = null;
-      try {
-        const mission = this.missionStore.getMission(status.missionId);
-        if (!mission || !this.isCurrentSupervisorStatus(status, mission)) continue;
-        failureFence = mission;
-        if (mission.status === "PAUSED_INFRASTRUCTURE") {
-          if (status.action === "STOP" || status.action === "MONITOR") continue;
-          if (status.action !== "FENCE_RECONCILE_AND_RESUME") {
-            throw new Error(`invalid worker output: unsupported supervisor action ${status.action}`);
-          }
-          const resumed = await this.orchestrator.resume(status.missionId);
-          if (resumed.status === "PAUSED_INFRASTRUCTURE") {
-            await this.persistRecoveryStop(
-              status.missionId,
-              `Automatic recovery ${status.action} is waiting for a healthy infrastructure probe: ${status.reason}`,
-              {
-                attemptedRecoveries: status.decision ? [status.decision.recoveryId] : [],
-                preservedWork: status.preservedWork,
-                resumeCondition: status.nextAction,
-              },
-              status.resumptionGeneration,
-              failureFence,
-            );
-          }
-          continue;
-        }
-        if (status.decision && status.action !== "STOP") {
-          if (status.action !== status.decision.action || !SUPPORTED_SUPERVISOR_REPAIR_ACTIONS.has(status.action)) {
-            throw new Error(`invalid worker output: unsupported supervisor action ${status.action}`);
-          }
-          failureFence = await this.normalizeMissionForRepair(status.missionId);
-          await this.orchestrator.repairBlockedMission(status.missionId);
-        } else if (status.health !== "HEALTHY" && status.action !== "STOP") {
+      await this.consumeSupervisorStatus(status);
+    }
+  }
+
+  private consumeSupervisorStatus(status: SupervisorStatus): Promise<void> {
+    const key = [
+      status.missionId,
+      status.missionRevision,
+      status.missionStatus,
+      status.missionBlockedEpisodeId ?? "",
+      status.resumptionGeneration,
+    ].join(":");
+    const active = this.supervisorSettlementFlights.get(key);
+    if (active) return active;
+    const flight = this.settleSupervisorStatus(status).finally(() => {
+      if (this.supervisorSettlementFlights.get(key) === flight) this.supervisorSettlementFlights.delete(key);
+    });
+    this.supervisorSettlementFlights.set(key, flight);
+    return flight;
+  }
+
+  private async settleSupervisorStatus(status: SupervisorStatus): Promise<void> {
+    if (!this.missionStore || !this.orchestrator) return;
+    let failureFence: Mission | null = null;
+    try {
+      const mission = this.missionStore.getMission(status.missionId);
+      if (!mission || !this.isCurrentSupervisorStatus(status, mission)) return;
+      failureFence = mission;
+      if (mission.status === "PAUSED_INFRASTRUCTURE") {
+        if (status.action === "STOP" || status.action === "MONITOR") return;
+        if (status.action !== "FENCE_RECONCILE_AND_RESUME") {
           throw new Error(`invalid worker output: unsupported supervisor action ${status.action}`);
         }
-      } catch (error) {
-        await this.persistSupervisorFailure(status, error, failureFence);
-      } finally {
-        await this.publishMissionSnapshot();
-        this.emitMissionActivity(status.missionId);
+        const resumed = await this.orchestrator.resume(status.missionId);
+        if (resumed.status === "PAUSED_INFRASTRUCTURE") {
+          await this.persistRecoveryStop(
+            status.missionId,
+            `Automatic recovery ${status.action} is waiting for a healthy infrastructure probe: ${status.reason}`,
+            {
+              attemptedRecoveries: status.decision ? [status.decision.recoveryId] : [],
+              preservedWork: status.preservedWork,
+              resumeCondition: status.nextAction,
+            },
+            status.resumptionGeneration,
+            failureFence,
+          );
+        }
+        return;
       }
+      if (status.decision && status.action !== "STOP") {
+        if (status.action !== status.decision.action || !SUPPORTED_SUPERVISOR_REPAIR_ACTIONS.has(status.action)) {
+          throw new Error(`invalid worker output: unsupported supervisor action ${status.action}`);
+        }
+        failureFence = await this.normalizeMissionForRepair(status.missionId);
+        await this.orchestrator.repairBlockedMission(status.missionId);
+      } else if (status.health !== "HEALTHY" && status.action !== "STOP") {
+        throw new Error(`invalid worker output: unsupported supervisor action ${status.action}`);
+      }
+    } catch (error) {
+      await this.persistSupervisorFailure(status, error, failureFence);
+    } finally {
+      await this.publishMissionSnapshot();
+      this.emitMissionActivity(status.missionId);
     }
   }
 
@@ -974,7 +997,8 @@ export class EngineeringRuntime {
     return (
       generation === status.resumptionGeneration &&
       mission.status === status.missionStatus &&
-      mission.updated_at === status.missionUpdatedAt
+      mission.revision === status.missionRevision &&
+      (mission.blocked_episode_id ?? null) === status.missionBlockedEpisodeId
     );
   }
 
@@ -1008,7 +1032,7 @@ export class EngineeringRuntime {
     if (!failureFence) return;
     const exactFence =
       mission.status === failureFence.status &&
-      mission.updated_at === failureFence.updated_at &&
+      mission.revision === failureFence.revision &&
       mission.blocked_episode_id === failureFence.blocked_episode_id;
     const enteredFencedRepair =
       failureFence.status === "BLOCKED" &&
@@ -1053,21 +1077,23 @@ export class EngineeringRuntime {
     if (!mission || ["COMPLETE", "FAILED", "CANCELED"].includes(mission.status)) return;
     const currentGeneration = this.missionStore.listMissionResumptions(missionId).at(-1)?.generation ?? 0;
     if (expectedResumptionGeneration !== undefined && currentGeneration !== expectedResumptionGeneration) return;
-    if (
-      expectedMission &&
-      (mission.status !== expectedMission.status ||
-        mission.updated_at !== expectedMission.updated_at ||
-        mission.blocked_episode_id !== expectedMission.blocked_episode_id)
-    ) {
-      return;
-    }
     const decisions = this.missionStore.listRecoveryDecisions(missionId).map((decision) => decision.recoveryId);
-    this.missionStore.stopMission(missionId, {
-      reason,
-      attemptedRecoveries: [...new Set([...source.attemptedRecoveries, ...decisions])],
-      preservedWork: [...source.preservedWork],
-      resumeCondition: source.resumeCondition,
-    });
+    const fence = expectedMission ?? mission;
+    this.missionStore.stopMissionIfCurrent(
+      missionId,
+      {
+        reason,
+        attemptedRecoveries: [...new Set([...source.attemptedRecoveries, ...decisions])],
+        preservedWork: [...source.preservedWork],
+        resumeCondition: source.resumeCondition,
+      },
+      {
+        revision: fence.revision,
+        status: fence.status,
+        resumptionGeneration: expectedResumptionGeneration ?? currentGeneration,
+        blockedEpisodeId: fence.blocked_episode_id ?? null,
+      },
+    );
     await this.missionStore.flush();
   }
 

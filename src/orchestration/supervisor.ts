@@ -20,6 +20,8 @@ export type SupervisorHealth =
 export interface SupervisorStatus {
   missionId: string;
   missionStatus: Mission["status"];
+  missionRevision: number;
+  missionBlockedEpisodeId: string | null;
   missionUpdatedAt: string;
   resumptionGeneration: number;
   health: SupervisorHealth;
@@ -379,6 +381,8 @@ export class MissionSupervisor {
     return {
       missionId: mission.mission_id,
       missionStatus: currentMission.status,
+      missionRevision: currentMission.revision,
+      missionBlockedEpisodeId: currentMission.blocked_episode_id ?? null,
       missionUpdatedAt: currentMission.updated_at,
       resumptionGeneration: this.currentResumptionGeneration(mission.mission_id),
       health,

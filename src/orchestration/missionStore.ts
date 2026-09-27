@@ -170,6 +170,13 @@ export interface MissionCompletionOptions {
   expectedResumptionGeneration: number;
 }
 
+export interface MissionRevisionFence {
+  revision: number;
+  status: MissionStatus;
+  resumptionGeneration: number;
+  blockedEpisodeId: string | null;
+}
+
 export interface GateEvidencePublication {
   executionId: string;
   exitStatus: string;
@@ -223,7 +230,7 @@ function persistenceErrorMessage(error: unknown): string {
 function fromStored(e: StoredEvent): OrchestrationEvent {
   return {
     event_id: e.event_id,
-    mission_id: (e.payload.mission_id as string) ?? "",
+    mission_id: (e.payload.mission_id as string) ?? e.run_id ?? "",
     timestamp: e.timestamp,
     type: e.type as OrchestrationEventType,
     actor: (e.payload.actor as OrchestrationEvent["actor"]) ?? "system",
@@ -302,6 +309,7 @@ export class MissionStore {
       worker_id: null,
       payload: durablePayload,
     };
+    this.advanceMissionRevision(missionId);
     this.pendingWrites.push({ event, stored });
     this.scheduleDrain();
     return event;
@@ -634,6 +642,13 @@ export class MissionStore {
         break;
       }
     }
+    this.advanceMissionRevision(e.mission_id);
+  }
+
+  private advanceMissionRevision(missionId: string): void {
+    const mission = this.missions.get(missionId);
+    if (!mission) return;
+    mission.revision = (mission.revision ?? 0) + 1;
   }
 
   // ── Missions ────────────────────────────────────────────────────────────
@@ -642,6 +657,7 @@ export class MissionStore {
     const now = new Date().toISOString();
     const mission: Mission = {
       mission_id: input.mission_id ?? id("MSN"),
+      revision: 0,
       title: input.title,
       goal: input.goal,
       user_request: input.user_request,
@@ -2338,6 +2354,37 @@ export class MissionStore {
     this.missionStops.push(stop);
     this.emit("mission.stopped", missionId, { actor: "system", stop });
     return copyMissionStop(stop);
+  }
+
+  /**
+   * Settle an exact mission snapshot once. The check and in-memory append are
+   * synchronous, so another callback on this store observes the first stop.
+   */
+  stopMissionIfCurrent(
+    missionId: string,
+    input: Omit<
+      MissionStop,
+      "missionId" | "stoppedAt" | "generation" | "resumptionGeneration" | "blockedEpisodeId" | "recoveryDeadline"
+    >,
+    expected: MissionRevisionFence,
+  ): MissionStop | undefined {
+    const currentGeneration = this.listMissionResumptions(missionId).at(-1)?.generation ?? 0;
+    const existing = this.listMissionStops(missionId)
+      .filter((stop) => stop.resumptionGeneration === currentGeneration)
+      .at(-1);
+    if (existing) return existing;
+    const mission = this.missions.get(missionId);
+    if (
+      !mission ||
+      ["COMPLETE", "FAILED", "CANCELED"].includes(mission.status) ||
+      currentGeneration !== expected.resumptionGeneration ||
+      mission.revision !== expected.revision ||
+      mission.status !== expected.status ||
+      (mission.blocked_episode_id ?? null) !== expected.blockedEpisodeId
+    ) {
+      return undefined;
+    }
+    return this.stopMission(missionId, input);
   }
 
   listMissionStops(missionId?: string): MissionStop[] {

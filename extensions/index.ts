@@ -1715,7 +1715,7 @@ ${RECOVERY_PROMPT}`;
         const recovery = summary?.recovery ?? { attempt: 0, maxAttempts: 0 };
         const preserved = stop?.preservedWork ?? summary?.preservedWork ?? [];
         return [
-          `- ${m.mission_id} [${m.status}] ${m.workflow_class} — ${m.title}`,
+          `- ${m.mission_id} [${m.status}] rev ${m.revision} ${m.workflow_class} — ${m.title}`,
           `  ${acceptanceText} · workflow ${workflow.completed}/${workflow.total} (${workflow.approximatePercent}%) · health ${summary?.health ?? "unknown"}`,
           `  repo ${summary?.repository ?? m.repository} · task ${summary?.task ?? "none"} · owner ${summary?.owner ?? "unowned"} · last progress ${summary?.lastMeaningfulProgressAt ?? "none"}`,
           `  recovery ${recovery.attempt}/${recovery.maxAttempts}; attempted ${stop?.attemptedRecoveries.length ?? 0} · next: ${stop?.resumeCondition ?? summary?.nextAction ?? "No further action is scheduled"}${summary?.nextActionAt ? ` at ${summary.nextActionAt}` : ""}`,
