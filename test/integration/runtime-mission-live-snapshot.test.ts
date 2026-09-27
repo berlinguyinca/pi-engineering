@@ -255,6 +255,140 @@ test("periodic supervisor leaves an unhealthy paused infrastructure mission dura
   }
 });
 
+test("stale paused probe snapshots cannot stop a concurrently advanced mission", async (t) => {
+  const cases: Array<{
+    name: string;
+    advance: (runtime: EngineeringRuntime, missionId: string) => Promise<void> | void;
+    expectedStatus: string;
+    expectedGeneration: number;
+    expectedCategories?: string[];
+  }> = [
+    {
+      name: "waiting for user",
+      advance: (runtime, missionId) => {
+        runtime.missionStore!.transitionMission(missionId, "WAITING_FOR_USER");
+      },
+      expectedStatus: "WAITING_FOR_USER",
+      expectedGeneration: 0,
+    },
+    {
+      name: "executing",
+      advance: (runtime, missionId) => {
+        runtime.missionStore!.transitionMission(missionId, "EXECUTING");
+      },
+      expectedStatus: "EXECUTING",
+      expectedGeneration: 0,
+    },
+    {
+      name: "new resumption generation",
+      advance: (runtime, missionId) => {
+        runtime.missionStore!.resumeMission(missionId, "concurrent operator resumption");
+      },
+      expectedStatus: "PAUSED_INFRASTRUCTURE",
+      expectedGeneration: 1,
+    },
+    {
+      name: "newer paused status snapshot",
+      advance: async (runtime, missionId) => {
+        runtime.missionStore!.transitionMission(missionId, "EXECUTING");
+        await new Promise<void>((resolve) => setTimeout(resolve, 2));
+        runtime.missionStore!.transitionMission(missionId, "PAUSED_INFRASTRUCTURE");
+      },
+      expectedStatus: "PAUSED_INFRASTRUCTURE",
+      expectedGeneration: 0,
+    },
+    {
+      name: "new blocked episode returning to paused",
+      advance: (runtime, missionId) => {
+        runtime.missionStore!.transitionMission(missionId, "EXECUTING");
+        runtime.missionStore!.transitionMission(missionId, "BLOCKED");
+        const classification = runtime.missionStore!.classifyFailure({
+          classificationId: "FC-concurrent-blocked-episode",
+          missionId,
+          taskId: null,
+          executionId: null,
+          category: "IMPLEMENTATION_DEFECT",
+          evidenceRefs: [],
+          fingerprint: "sha256:concurrent-blocked-episode",
+          summary: "concurrent blocked episode",
+          classifiedAt: new Date().toISOString(),
+        });
+        const decision = runtime.missionStore!.planRecovery({
+          recoveryId: "RCV-concurrent-blocked-episode",
+          missionId,
+          classificationId: classification.classificationId,
+          action: "REPAIR_BLOCKED_MISSION",
+          expectedMaterialChange: "repair concurrent blocked episode",
+          attempt: 1,
+          maxAttempts: 2,
+          deadline: new Date(Date.now() + 60_000).toISOString(),
+          nextActionAt: new Date().toISOString(),
+          status: "planned",
+          decidedAt: new Date().toISOString(),
+        });
+        runtime.missionStore!.transitionMission(missionId, "REPAIRING", {
+          recoveryDecisionId: decision.recoveryId,
+        });
+        runtime.missionStore!.transitionMission(missionId, "PAUSED_INFRASTRUCTURE");
+      },
+      expectedStatus: "PAUSED_INFRASTRUCTURE",
+      expectedGeneration: 0,
+      expectedCategories: ["ORPHANED_EXECUTION", "IMPLEMENTATION_DEFECT"],
+    },
+  ];
+
+  for (const scenario of cases) {
+    await t.test(scenario.name, async () => {
+      const root = await mkdtemp(join(tmpdir(), "pi-eng-stale-paused-probe-"));
+      const originalResume = Orchestrator.prototype.resume;
+      try {
+        const runtime = await EngineeringRuntime.open({ cwd: root, worker: new FakeWorkerExecutor({}) });
+        const mission = runtime.missionStore!.createMission({
+          title: scenario.name,
+          goal: "do not settle stale paused probe",
+          user_request: "do not settle stale paused probe",
+          repository: root,
+          base_ref: "",
+          risk_profile: "low",
+          workflow_class: "engineering",
+        });
+        for (const status of ["CLASSIFYING", "READY", "EXECUTING", "PAUSED_INFRASTRUCTURE"] as const) {
+          runtime.missionStore!.transitionMission(mission.mission_id, status);
+        }
+        const task = runtime.missionStore!.createTask({
+          mission_id: mission.mission_id,
+          kind: "agent",
+          role: "implementer",
+          objective: "paused race work",
+        });
+        runtime.missionStore!.transitionTask(task.task_id, "READY");
+        Orchestrator.prototype.resume = async function (missionId: string) {
+          const stalePaused = this.store.getMission(missionId)!;
+          await scenario.advance(runtime, missionId);
+          return stalePaused;
+        };
+
+        await runtime.missionSupervisor!.tick(mission.mission_id);
+
+        assert.equal(runtime.missionStore!.getMission(mission.mission_id)?.status, scenario.expectedStatus);
+        assert.equal(
+          runtime.missionStore!.listMissionResumptions(mission.mission_id).at(-1)?.generation ?? 0,
+          scenario.expectedGeneration,
+        );
+        assert.equal(runtime.missionStore!.listMissionStops(mission.mission_id).length, 0);
+        assert.deepEqual(
+          runtime.missionStore!.listFailureClassifications(mission.mission_id).map((item) => item.category),
+          scenario.expectedCategories ?? ["ORPHANED_EXECUTION"],
+        );
+        await runtime.close();
+      } finally {
+        Orchestrator.prototype.resume = originalResume;
+        await rm(root, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
 test("status consumer never stops or reclassifies a mission that becomes terminal during repair", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-eng-terminal-repair-race-"));
   const originalRepair = Orchestrator.prototype.repairBlockedMission;

@@ -945,6 +945,7 @@ export class EngineeringRuntime {
                 resumeCondition: status.nextAction,
               },
               status.resumptionGeneration,
+              failureFence,
             );
           }
           continue;
@@ -1045,12 +1046,21 @@ export class EngineeringRuntime {
     reason: string,
     source: Pick<MissionStop, "attemptedRecoveries" | "preservedWork" | "resumeCondition">,
     expectedResumptionGeneration?: number,
+    expectedMission?: Mission,
   ): Promise<void> {
     if (!this.missionStore) throw new Error("Mission store is not initialized");
     const mission = this.missionStore.getMission(missionId);
     if (!mission || ["COMPLETE", "FAILED", "CANCELED"].includes(mission.status)) return;
     const currentGeneration = this.missionStore.listMissionResumptions(missionId).at(-1)?.generation ?? 0;
     if (expectedResumptionGeneration !== undefined && currentGeneration !== expectedResumptionGeneration) return;
+    if (
+      expectedMission &&
+      (mission.status !== expectedMission.status ||
+        mission.updated_at !== expectedMission.updated_at ||
+        mission.blocked_episode_id !== expectedMission.blocked_episode_id)
+    ) {
+      return;
+    }
     const decisions = this.missionStore.listRecoveryDecisions(missionId).map((decision) => decision.recoveryId);
     this.missionStore.stopMission(missionId, {
       reason,
