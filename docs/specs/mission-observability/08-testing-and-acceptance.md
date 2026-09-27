@@ -15,6 +15,11 @@ Cover:
 - loop heuristics,
 - event projection,
 - reconnect/idempotency.
+- orphan/deadlock/controller-disconnect classification,
+- wait deadline expiry,
+- acceptance coverage independent of workflow progress,
+- recovery fingerprint exhaustion,
+- stale execution fencing.
 
 ## Integration tests
 
@@ -61,6 +66,30 @@ The current progress, activity, worker state, and history must reconstruct corre
 Run two missions concurrently.
 Progress/output for one must not suppress or corrupt the other.
 
+### Wrong workspace and blocked repair
+
+Start a mission at a meta-root while its explicitly named repositories live in
+another authorized workspace. Preflight binds the real repositories. If a role
+cannot access candidate evidence, classify and repair the scope once; repeated
+unchanged failure stops with a precise actionable reason.
+
+### Timeout checkpoint recovery
+
+Interrupt a worker after two of three bounded deliverables. Preserve and verify
+the checkpoint, fence the old execution, split the remaining deliverable, and
+resume without replaying completed work.
+
+### Revision-bound gates
+
+Change the candidate after green validation/review. Old evidence becomes invalid
+and completion is refused until the final candidate is revalidated and
+re-reviewed.
+
+### Incumbent immutability
+
+Cause an integration conflict and a validation failure in separate runs. In both
+cases the incumbent HEAD, index, and tree remain byte-for-byte unchanged.
+
 ## UI tests
 
 Test at desktop/tablet/phone widths.
@@ -97,6 +126,11 @@ Create a synthetic mission:
 12. final validation succeeds,
 13. CompletionGate passes.
 
+Run an additional real local-only scenario using `local/local`: interrupt the
+mission, recover its checkpoint under the same mission ID, perform a fresh
+same-model review with the reduced-independence warning, and complete with
+revision-bound evidence.
+
 The UI and activity stream must make every phase understandable.
 
 ## Acceptance criteria
@@ -115,3 +149,9 @@ The feature is accepted only when:
 - progress survives reconnect/restart;
 - 100% appears only after CompletionGate pass;
 - existing mission/review/autospec behavior remains functional.
+- primary percentage reflects verified acceptance coverage,
+- workflow progress remains separately visible,
+- workerless missions are never generically ACTIVE,
+- every wait and recovery has a next action/deadline,
+- blocked missions can resume safely without losing mission identity,
+- stale evidence and late worker results cannot authorize completion.

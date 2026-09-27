@@ -103,6 +103,26 @@ dead end -> replan
 ambiguous requirement -> WAITING_FOR_USER
 ```
 
+### Typed recovery and task replacement
+
+Generic retry is insufficient. Persist a machine-readable failure
+classification, fingerprint, expected material change, attempt budget, deadline,
+and next action. Recovery budgets survive process restart.
+
+Multi-repository, high-risk, or oversized objectives must be split into bounded,
+repository-scoped tasks before implementation. A timeout after useful work is
+`TASK_BUDGET_EXHAUSTED`: checkpoint and validate partial work, supersede the
+failed task with explicit replacement lineage, and schedule only remaining
+deliverables. Do not replay the same oversized prompt.
+
+`BLOCKED` missions are repairable through an idempotent
+`repairBlockedMission(missionId)` path. Repair acquires ownership, reconciles old
+executions and side effects, requires a material change, invalidates stale
+evidence, transitions through `REPAIRING`, and re-runs affected gates.
+
+Repeated identical failure fingerprints without new evidence exhaust the
+strategy and stop explicitly rather than loop.
+
 ## Persistence
 
 Mission and scheduler state must survive process restart.
@@ -111,3 +131,8 @@ Minimum acceptable persistence:
 
 - SQLite or durable equivalent for state
 - append-only event stream for replay/audit
+
+Persist retry windows, recovery budgets, failure fingerprints, ownership
+generations, fencing tokens, next-action deadlines, checkpoints, and task
+supersession. Replaying entity state without reconciling workers, worktrees, and
+external side effects is not recovery.

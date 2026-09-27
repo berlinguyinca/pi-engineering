@@ -51,6 +51,21 @@ The system cannot proceed without resolving an explicit dependency or external c
 
 A required task/process failed and automatic recovery is exhausted or impossible.
 
+### ORPHANED
+
+The mission has unfinished runnable work but no active owned execution, named
+wait, or scheduled recovery.
+
+### DEADLOCKED
+
+The mission has unfinished work but no runnable node and no legitimate external
+wait. The projection must name the unresolved dependency cycle or blocker.
+
+### CONTROLLER_DISCONNECTED
+
+The mission owner's durable lease expired. The UI must not retain its previous
+`EXECUTING` label while waiting for ownership reconciliation.
+
 ## Meaningful progress
 
 Examples:
@@ -113,11 +128,24 @@ Recovery actions may include:
 
 All recovery attempts become mission events.
 
+Recovery decisions are durable and typed. Each records the failure fingerprint,
+material condition expected to change, attempt `N/M`, deadline, next action, and
+preserved work. Repeating the same fingerprint without new evidence eventually
+exhausts that strategy and produces an actionable stop.
+
+A named waiting reason is not indefinite immunity from stall detection. Every
+wait has an owner, next probe/action, freshness timestamp, and deadline. Missing
+the deadline triggers a recovery decision.
+
 ## Config
 
 Thresholds should be configurable per activity type because a test suite, compile, model request, and file edit have different normal latencies.
 
 Do not apply one universal "stuck after N seconds" value.
+
+A production watchdog evaluates every nonterminal mission independently of
+worker events. Broker-generated timers are controller liveness, not proof of
+worker progress.
 
 ## UI
 

@@ -17,6 +17,11 @@ The project is not complete until all of these are true.
 - Independent tasks run concurrently.
 - Conflicting write domains are protected.
 - Execution survives/reconciles after restart.
+- Explicit user-named workspaces outside launch cwd are safely authorized and
+  bound before workers start.
+- Multi-repository missions use repository-scoped bounded tasks.
+- Blocked missions can be repaired and resumed under the same mission identity.
+- Recovery budgets, ownership, checkpoints, and next actions survive restart.
 
 ## Agents
 
@@ -38,12 +43,20 @@ The project is not complete until all of these are true.
 - Security-sensitive changes automatically receive security review.
 - Review findings can create repair tasks.
 - Failed gates block completion.
+- Validation/review evidence is bound to current repository revisions and diffs.
+- Pending or failed material acceptance criteria block completion.
+- Critical/high review findings are blocking.
+- Worker success alone cannot resolve a review finding.
+- Integration, validation, and review occur before incumbent promotion.
 
 ## PI WEB
 
 - Uses existing `jmfederico/pi-web`.
 - No alternate PI WEB clone is created.
 - Mission/task/execution state is visible through supported integration.
+- Acceptance coverage and workflow progress are shown separately.
+- Every workerless mission shows a wait, recovery, orphan/deadlock diagnosis,
+  or actionable terminal reason with next action/deadline.
 - Existing PI WEB sessions/worktrees are reused where possible.
 
 ## Architecture constraints
@@ -63,6 +76,14 @@ The project is not complete until all of these are true.
 - worktree conflict tests
 - review gate tests
 - PI WEB integration tests where practical
+- wrong-root and external-workspace recovery tests
+- timeout checkpoint/split/resume tests
+- stale/late execution fencing tests
+- candidate-bound evidence invalidation tests
+- isolated integration/incumbent immutability tests
+- blocked-mission repair idempotency tests
+- repeated-fingerprint recovery exhaustion tests
+- real `local/local` interrupted-mission recovery test
 
 ## Documentation
 
