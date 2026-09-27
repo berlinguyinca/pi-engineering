@@ -6,10 +6,117 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { promisify } from "node:util";
 import type { MissionSnapshotFile } from "../../src/orchestration/missionSnapshot.ts";
+import { Orchestrator } from "../../src/orchestration/orchestrator.ts";
+import { MissionSupervisor } from "../../src/orchestration/supervisor.ts";
 import { EngineeringRuntime } from "../../src/runtime/EngineeringRuntime.ts";
 import { FakeWorkerExecutor } from "../../src/workers/FakeWorkerExecutor.ts";
 
 const execFileAsync = promisify(execFile);
+
+async function initGit(root: string): Promise<void> {
+  await execFileAsync("git", ["init", "-q"], { cwd: root });
+  await execFileAsync(
+    "git",
+    ["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-qm", "init"],
+    { cwd: root },
+  );
+}
+
+test("runtime starts the supervisor, repairs blocked missions before open returns, and stops it on close", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-eng-supervised-reopen-"));
+  const workDir = join(root, ".pi-eng");
+  const starts: MissionSupervisor[] = [];
+  const stops: MissionSupervisor[] = [];
+  const repairs: string[] = [];
+  const originalStart = MissionSupervisor.prototype.start;
+  const originalStop = MissionSupervisor.prototype.stop;
+  const originalRepair = Orchestrator.prototype.repairBlockedMission;
+  try {
+    await initGit(root);
+    const first = await EngineeringRuntime.open({ cwd: root, workDir, worker: new FakeWorkerExecutor({}) });
+    const mission = first.missionStore!.createMission({
+      title: "resume on reopen",
+      goal: "recover durable work",
+      user_request: "recover durable work",
+      repository: root,
+      base_ref: await first.git!.headCommit(),
+      risk_profile: "low",
+      workflow_class: "engineering",
+    });
+    first.missionStore!.transitionMission(mission.mission_id, "CLASSIFYING");
+    first.missionStore!.transitionMission(mission.mission_id, "BLOCKED");
+    await first.close();
+
+    MissionSupervisor.prototype.start = function () {
+      starts.push(this);
+      return originalStart.call(this);
+    };
+    MissionSupervisor.prototype.stop = function () {
+      stops.push(this);
+      return originalStop.call(this);
+    };
+    Orchestrator.prototype.repairBlockedMission = async (missionId: string) => {
+      repairs.push(missionId);
+      return mission;
+    };
+
+    const reopened = await EngineeringRuntime.open({ cwd: root, workDir, worker: new FakeWorkerExecutor({}) });
+    assert.deepEqual(
+      repairs,
+      [mission.mission_id],
+      "startup reconciliation must dispatch supported repair before open returns",
+    );
+    assert.equal(starts.length, 1, "runtime owns one supervisor interval");
+    await reopened.close();
+    assert.deepEqual(stops, starts, "runtime close must stop the exact supervisor it started");
+  } finally {
+    MissionSupervisor.prototype.start = originalStart;
+    MissionSupervisor.prototype.stop = originalStop;
+    Orchestrator.prototype.repairBlockedMission = originalRepair;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("snapshot preserves the complete actionable stop payload", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-eng-actionable-stop-"));
+  try {
+    const runtime = await EngineeringRuntime.open({ cwd: root, worker: new FakeWorkerExecutor({}) });
+    const mission = runtime.missionStore!.createMission({
+      title: "stopped recovery",
+      goal: "retain exact recovery evidence",
+      user_request: "retain exact recovery evidence",
+      repository: root,
+      base_ref: "",
+      risk_profile: "high",
+      workflow_class: "engineering",
+    });
+    runtime.missionObservability!.missionCreated(mission.mission_id, mission.title);
+    runtime.missionStore!.stopMission(mission.mission_id, {
+      reason: "repeated recovery fingerprint exhausted",
+      attemptedRecoveries: ["recovery-1", "recovery-2"],
+      preservedWork: ["refs/pi-engineering/candidate", "/tmp/preserved-worktree"],
+      resumeCondition: "provide new material evidence",
+    });
+
+    const snapshot = await runtime.publishMissionSnapshot();
+    const stop = snapshot?.missions[0]?.stop;
+    assert.ok(stop);
+    assert.match(stop.stoppedAt, /^\d{4}-\d{2}-\d{2}T/);
+    assert.deepEqual(
+      { ...stop, stoppedAt: "<timestamp>" },
+      {
+        reason: "repeated recovery fingerprint exhausted",
+        attemptedRecoveries: ["recovery-1", "recovery-2"],
+        preservedWork: ["refs/pi-engineering/candidate", "/tmp/preserved-worktree"],
+        resumeCondition: "provide new material evidence",
+        stoppedAt: "<timestamp>",
+      },
+    );
+    await runtime.close();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 test("concurrent opens for one repository share a single live runtime", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-eng-single-flight-"));

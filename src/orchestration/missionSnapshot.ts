@@ -12,7 +12,7 @@
  */
 
 import type { MissionProjection } from "./observability/types.ts";
-import type { Mission, OrchestrationTask, ReviewFinding } from "./types.ts";
+import type { Mission, MissionStop, OrchestrationTask, ReviewFinding } from "./types.ts";
 
 export const MISSION_SNAPSHOT_CONTRACT_VERSION = 3;
 export const MISSION_SNAPSHOT_FILENAME = "orchestration-snapshot.json";
@@ -97,6 +97,8 @@ export interface MissionSnapshotMission {
   acceptanceCriteria: Array<{ id?: string; criterion: string; status: string }>;
   tasks: Array<MissionSnapshotTask>;
   findings: Array<MissionSnapshotFinding>;
+  /** Latest durable stop for the current resumption generation, when present. */
+  stop?: Pick<MissionStop, "reason" | "attemptedRecoveries" | "preservedWork" | "resumeCondition" | "stoppedAt">;
   /** Additive v2 — absent for legacy publishers / pre-observability missions. */
   observability?: MissionObservabilitySnapshot;
 }
@@ -193,6 +195,7 @@ export function buildMissionSnapshot(
   tasks: OrchestrationTask[],
   findings: ReviewFinding[],
   observability?: MissionProjection | null,
+  stop?: MissionStop | null,
 ): MissionSnapshotMission {
   return {
     id: mission.mission_id,
@@ -241,6 +244,17 @@ export function buildMissionSnapshot(
       taskId: f.task_id,
     })),
     ...(observability ? { observability: toObservabilitySnapshot(observability) } : {}),
+    ...(stop
+      ? {
+          stop: {
+            reason: stop.reason,
+            attemptedRecoveries: [...stop.attemptedRecoveries],
+            preservedWork: [...stop.preservedWork],
+            resumeCondition: stop.resumeCondition,
+            stoppedAt: stop.stoppedAt,
+          },
+        }
+      : {}),
   };
 }
 
@@ -250,11 +264,12 @@ export function buildMissionSnapshotFile(
     tasks: OrchestrationTask[];
     findings: ReviewFinding[];
     observability?: MissionProjection | null;
+    stop?: MissionStop | null;
   }>,
 ): MissionSnapshotFile {
   return {
     contractVersion: MISSION_SNAPSHOT_CONTRACT_VERSION,
     generatedAt: new Date().toISOString(),
-    missions: missions.map((m) => buildMissionSnapshot(m.mission, m.tasks, m.findings, m.observability)),
+    missions: missions.map((m) => buildMissionSnapshot(m.mission, m.tasks, m.findings, m.observability, m.stop)),
   };
 }

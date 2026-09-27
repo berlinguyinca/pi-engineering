@@ -271,10 +271,33 @@ async function getRuntimeByCwd(cwd: string, model?: Model<any>): Promise<Enginee
 }
 
 /** Feed live mission detail into persistent surfaces without creating notices. */
-function publishMissionActivity(key: string, event: RuntimeMissionActivityEvent): void {
+export function formatMissionActivity(event: RuntimeMissionActivityEvent): { phase: string; detail: string } {
   const heartbeat = event.lastHeartbeatAt ? ` · hb ${new Date(event.lastHeartbeatAt).toISOString().slice(11, 19)}` : "";
   const workers = ` · workers ${event.activeWorkers} active/${event.waitingWorkers} waiting/${event.failedWorkers} failed`;
-  const detail = `${event.summary}${workers}${heartbeat}`.slice(0, 320);
+  const lastProgress = event.lastMeaningfulProgressAt ?? "none";
+  const compact = (value: string | null, fallback: string, length = 80) => (value ?? fallback).slice(0, length);
+  const scope =
+    `repo ${compact(event.repository, "unknown")} · task ${compact(event.task, "none")} · ` +
+    `owner ${compact(event.owner, "unowned")}`;
+  const recovery = `recovery ${event.recovery.attempt}/${event.recovery.maxAttempts}`;
+  const next = `next ${event.nextAction.slice(0, 120)}${event.nextActionAt ? ` at ${event.nextActionAt}` : ""}`;
+  const preserved =
+    event.preservedWork.length > 0 ? ` · preserved ${event.preservedWork.join(", ").slice(0, 120)}` : "";
+  return {
+    phase:
+      `acceptance ${event.acceptanceCoverage.completed}/${event.acceptanceCoverage.total} ` +
+      `(${event.acceptanceCoverage.approximatePercent}%) · workflow ${event.workflowProgress.completed}/` +
+      `${event.workflowProgress.total} (${event.workflowProgress.approximatePercent}%) · ${event.health}`,
+    detail:
+      `${event.summary.slice(0, 120)}${workers}${heartbeat} · ${scope} · last progress ${lastProgress} · ` +
+      `${recovery}${preserved} · ${event.action}: ${event.reason.slice(0, 120)} · ${next}`,
+  };
+}
+
+/** Feed live mission detail into persistent surfaces without creating notices. */
+function publishMissionActivity(key: string, event: RuntimeMissionActivityEvent): void {
+  const rendered = formatMissionActivity(event);
+  const detail = rendered.detail.slice(0, 640);
   const plumbing = panels.get(key);
   if (plumbing) {
     const previous = plumbing.state.snapshot.run;
@@ -283,7 +306,7 @@ function publishMissionActivity(key: string, event: RuntimeMissionActivityEvent)
       run: {
         workItemId: event.missionId,
         goal: detail,
-        phase: `${event.phase} · ${event.approximatePercent}% · ${event.health}`,
+        phase: rendered.phase,
         risk: "mission",
         files: sameMission ? previous.files : [],
         findings: sameMission ? previous.findings : [],
@@ -295,7 +318,7 @@ function publishMissionActivity(key: string, event: RuntimeMissionActivityEvent)
   if (ambientPanel?.key !== key) return;
   activeFooter?.setTask({
     workItemId: event.missionId,
-    phase: `${event.phase} ${event.approximatePercent}%`,
+    phase: rendered.phase,
     label: detail,
   });
 }
@@ -1492,16 +1515,33 @@ ${RECOVERY_PROMPT}`;
   // Orchestrator. `/mission` is an optional power-user control; correctness
   // never depends on it (the semantic tool + runtime gate enforce policy).
   pi.registerCommand("mission", {
-    description:
-      "Run the orchestration mission pipeline for a normal-language request (intent -> plan -> execute -> validate -> review -> complete).",
+    description: "Run an orchestration mission, or resume one with /mission resume <missionId>.",
     handler: async (args, ctx) => {
-      if (!args.trim()) {
-        ctx.ui.notify("/mission <normal-language request>", "error");
+      const request = args.trim();
+      if (!request) {
+        ctx.ui.notify("/mission <normal-language request> | /mission resume <missionId>", "error");
         return;
       }
       const rt = await getRuntime(ctx);
       if (!rt.orchestrator) {
         ctx.ui.notify("Orchestrator not initialized for this directory.", "error");
+        return;
+      }
+      const resume = /^resume(?:\s+(\S+))?\s*$/i.exec(request);
+      if (resume) {
+        const missionId = resume[1];
+        if (!missionId) {
+          ctx.ui.notify("/mission resume <missionId>", "error");
+          return;
+        }
+        try {
+          await rt.resumeBlockedMission(missionId, ctx.signal);
+          const mission = rt.missionStore?.getMission(missionId);
+          if (!mission) throw new Error(`unknown mission ${missionId}`);
+          ctx.ui.notify(`Recovery ${mission.mission_id} — ${mission.title} [${mission.status}]`, "info");
+        } catch (error) {
+          ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+        }
         return;
       }
       const baseRef = (await rt.git?.headCommit().catch(() => "")) ?? "";
@@ -1511,7 +1551,7 @@ ${RECOVERY_PROMPT}`;
       // line, then nothing for 30+ minutes). Each task/phase transition is
       // surfaced as a compact progress line as it happens.
       let lastLine = "";
-      const result = await rt.orchestrator.orchestrate(args.trim(), {
+      const result = await rt.orchestrator.orchestrate(request, {
         repository: rt.cwd,
         baseRef,
         mutationRequested: true,
@@ -1558,8 +1598,31 @@ ${RECOVERY_PROMPT}`;
       }
       const lines = missions.slice(-10).map((m) => {
         const tasks = store.listTasks(m.mission_id);
-        const done = tasks.filter((t) => t.status === "SUCCEEDED").length;
-        return `- ${m.mission_id} [${m.status}] ${m.workflow_class} — ${m.title} (${done}/${tasks.length} tasks)`;
+        const summary = rt.missionObservability?.summary(m.mission_id);
+        const currentGeneration = store.listMissionResumptions(m.mission_id).at(-1)?.generation ?? 0;
+        const stop = store
+          .listMissionStops(m.mission_id)
+          .filter((candidate) => candidate.resumptionGeneration === currentGeneration)
+          .at(-1);
+        const acceptance = summary?.acceptanceCoverage ?? {
+          completed: m.acceptance_criteria.filter((criterion) => criterion.status === "passed").length,
+          total: m.acceptance_criteria.length,
+          approximatePercent: 0,
+        };
+        const workflow = summary?.workflowProgress ?? {
+          completed: tasks.filter((task) => task.status === "SUCCEEDED").length,
+          total: tasks.length,
+          approximatePercent: 0,
+        };
+        const recovery = summary?.recovery ?? { attempt: 0, maxAttempts: 0 };
+        const preserved = stop?.preservedWork ?? summary?.preservedWork ?? [];
+        return [
+          `- ${m.mission_id} [${m.status}] ${m.workflow_class} — ${m.title}`,
+          `  acceptance ${acceptance.completed}/${acceptance.total} (${acceptance.approximatePercent}%) · workflow ${workflow.completed}/${workflow.total} (${workflow.approximatePercent}%) · health ${summary?.health ?? "unknown"}`,
+          `  repo ${summary?.repository ?? m.repository} · task ${summary?.task ?? "none"} · owner ${summary?.owner ?? "unowned"} · last progress ${summary?.lastMeaningfulProgressAt ?? "none"}`,
+          `  recovery ${recovery.attempt}/${recovery.maxAttempts}; attempted ${stop?.attemptedRecoveries.length ?? 0} · next: ${stop?.resumeCondition ?? summary?.nextAction ?? "No further action is scheduled"}${summary?.nextActionAt ? ` at ${summary.nextActionAt}` : ""}`,
+          `  ${stop ? `stop: ${stop.reason}` : `action: ${summary?.action ?? m.status} — ${summary?.reason ?? "No additional reason recorded"}`} · preserved: ${preserved.join(", ") || "none"}`,
+        ].join("\n");
       });
       ctx.ui.notify(lines.join("\n"), "info");
     },

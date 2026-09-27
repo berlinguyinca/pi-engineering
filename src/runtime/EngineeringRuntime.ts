@@ -33,6 +33,7 @@ import type { PlanTaskInput } from "../orchestration/orchestrator.ts";
 import { MissionOwnership } from "../orchestration/ownership.ts";
 import { realBackends } from "../orchestration/realBackends.ts";
 import { RepositoryRegistry } from "../orchestration/repositoryRegistry.ts";
+import { MissionSupervisor } from "../orchestration/supervisor.ts";
 import { WorkspaceManifestResolver } from "../orchestration/workspaceManifest.ts";
 import { tasksConflict, topoSort } from "../plan/taskDag.ts";
 import { JsonlEventStore } from "../platform/eventstore/jsonl.ts";
@@ -272,11 +273,23 @@ export interface RuntimeMissionActivityEvent {
   state: string;
   health: string;
   approximatePercent: number;
+  acceptanceCoverage: { completed: number; total: number; approximatePercent: number };
+  workflowProgress: { completed: number; total: number; approximatePercent: number };
   summary: string;
   activeWorkers: number;
   waitingWorkers: number;
   failedWorkers: number;
   lastHeartbeatAt?: string;
+  lastMeaningfulProgressAt: string | null;
+  action: string;
+  reason: string;
+  recovery: { attempt: number; maxAttempts: number };
+  nextAction: string;
+  nextActionAt: string | null;
+  owner: string | null;
+  repository: string | null;
+  task: string | null;
+  preservedWork: string[];
 }
 
 export interface EngineeringRuntimeOptions {
@@ -359,6 +372,8 @@ export class EngineeringRuntime {
   missionStore: MissionStore | null;
   /** Durable fenced authority used by orchestration dispatch. */
   missionOwnership: MissionOwnership | null;
+  /** Clock-driven owner of startup and periodic nonterminal-mission reconciliation. */
+  missionSupervisor: MissionSupervisor | null;
   /** Orchestrator facade (spec 06) — auto-invokes workflows from intent. */
   orchestrator: Orchestrator | null;
   /**
@@ -389,6 +404,7 @@ export class EngineeringRuntime {
   private orchestrationPath: string | null = null;
   private closed = false;
   private openReferences = 1;
+  private readonly missionResumeFlights = new Map<string, Promise<import("../orchestration/types.ts").Mission>>();
 
   /**
    * Serializes git mutations that touch the shared main repo (worktree create,
@@ -434,6 +450,7 @@ export class EngineeringRuntime {
             tasks: this.missionStore!.listTasks(m.mission_id),
             findings: this.missionStore!.listFindings(m.mission_id),
             observability: this.missionObservability?.projection(m.mission_id) ?? null,
+            stop: this.currentMissionStop(m.mission_id),
           }));
           latest = buildMissionSnapshotFile(missions);
           const path = join(this.workDir, MISSION_SNAPSHOT_FILENAME);
@@ -464,6 +481,16 @@ export class EngineeringRuntime {
       if (this.snapshotPublishDirty) void this.publishMissionSnapshot();
     });
     return this.snapshotPublishPending;
+  }
+
+  private currentMissionStop(missionId: string) {
+    const generation = this.missionStore?.listMissionResumptions(missionId).at(-1)?.generation ?? 0;
+    return (
+      this.missionStore
+        ?.listMissionStops(missionId)
+        .filter((stop) => stop.resumptionGeneration === generation)
+        .at(-1) ?? null
+    );
   }
 
   /** Notify status surfaces of pipeline progress. Never throws into the run. */
@@ -498,11 +525,29 @@ export class EngineeringRuntime {
         state: summary.state,
         health: summary.health,
         approximatePercent: summary.progress.approximatePercent,
+        acceptanceCoverage: { ...summary.acceptanceCoverage },
+        workflowProgress: { ...summary.workflowProgress },
         summary: bounded,
         activeWorkers: summary.workers.active,
         waitingWorkers: summary.workers.waiting,
         failedWorkers: summary.workers.failed,
         ...(summary.lastHeartbeatAt ? { lastHeartbeatAt: summary.lastHeartbeatAt } : {}),
+        lastMeaningfulProgressAt: summary.lastMeaningfulProgressAt,
+        action: summary.action,
+        reason: redactSecrets(summary.reason)
+          .replace(/[\r\n\t]+/g, " ")
+          .trim()
+          .slice(0, 240),
+        recovery: { ...summary.recovery },
+        nextAction: redactSecrets(summary.nextAction)
+          .replace(/[\r\n\t]+/g, " ")
+          .trim()
+          .slice(0, 240),
+        nextActionAt: summary.nextActionAt,
+        owner: summary.owner,
+        repository: summary.repository,
+        task: summary.task,
+        preservedWork: summary.preservedWork.map((value) => redactSecrets(value).slice(0, 240)).slice(0, 8),
       });
     } catch {
       // UI listeners are observers, never participants in mission execution.
@@ -538,6 +583,7 @@ export class EngineeringRuntime {
     this.git = null;
     this.missionStore = null;
     this.missionOwnership = null;
+    this.missionSupervisor = null;
     this.orchestrator = null;
     this.missionObservability = null;
     this.repositoryRegistry = new RepositoryRegistry();
@@ -740,6 +786,23 @@ export class EngineeringRuntime {
           void rt.publishMissionSnapshot();
         },
       });
+      rt.missionSupervisor = new MissionSupervisor({
+        store: rt.missionStore,
+        observability: rt.missionObservability,
+      });
+      const startupStatuses = await rt.missionSupervisor.reconcileOnStartup();
+      for (const status of startupStatuses) {
+        const current = rt.missionStore.getMission(status.missionId);
+        if (
+          status.decision &&
+          status.action !== "STOP" &&
+          current &&
+          (current.status === "BLOCKED" || current.status === "REPAIRING")
+        ) {
+          await rt.orchestrator.repairBlockedMission(status.missionId);
+        }
+      }
+      rt.missionSupervisor.start();
       if (opts.blackhole) rt.blackhole = await BlackholeManager.open({ ...opts.blackhole, ledger: rt.ledger });
       // Bind the semantic tools (ledger_read, repo_search, ...) to THIS runtime so
       // worker sessions get the tools their prompts require and always address the
@@ -778,15 +841,44 @@ export class EngineeringRuntime {
       if (this.orchestrationPath) EngineeringRuntime.releaseOrchestrationReference(this.orchestrationPath);
       return;
     }
+    this.missionSupervisor?.stop();
     await this.missionStore?.flush();
     await this.missionObservability?.flush();
     const path = this.orchestrationPath;
     if (path) EngineeringRuntime.releaseOrchestrationReference(path);
     this.closed = true;
     this.orchestrator = null;
+    this.missionSupervisor = null;
     this.missionOwnership = null;
     this.missionObservability = null;
     this.missionStore = null;
+  }
+
+  /** Explicit, idempotent operator fallback for one durably stopped blocked mission. */
+  resumeBlockedMission(missionId: string, signal?: AbortSignal): Promise<import("../orchestration/types.ts").Mission> {
+    const active = this.missionResumeFlights.get(missionId);
+    if (active) return active;
+    const flight = this.performBlockedMissionResume(missionId, signal).finally(() => {
+      if (this.missionResumeFlights.get(missionId) === flight) this.missionResumeFlights.delete(missionId);
+    });
+    this.missionResumeFlights.set(missionId, flight);
+    return flight;
+  }
+
+  private async performBlockedMissionResume(
+    missionId: string,
+    signal?: AbortSignal,
+  ): Promise<import("../orchestration/types.ts").Mission> {
+    if (!this.missionStore || !this.orchestrator) throw new Error("Orchestrator not initialized for this directory.");
+    const mission = this.missionStore.getMission(missionId);
+    if (!mission) throw new Error(`unknown mission ${missionId}`);
+    const stop = this.missionStore.listMissionStops(missionId).at(-1);
+    const resumption = this.missionStore.listMissionResumptions(missionId).at(-1);
+    if (stop && (!resumption || resumption.stopGeneration < stop.generation)) {
+      this.missionStore.resumeMission(missionId, "operator requested mission recovery");
+      await this.missionStore.flush();
+    }
+    return this.orchestrator.repairBlockedMission(missionId, signal);
   }
 
   private retainOpenReference(): void {
