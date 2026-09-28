@@ -146,3 +146,72 @@ fail 0
 
 - The repository-wide suite intentionally skipped the optional Postgres OpenViking round-trip because `TEST_DATABASE_URL` was absent; this is unrelated to both blockers.
 - Legacy `prepared` bootstrap markers remain conservatively supported for upgrade recovery. New bootstraps never publish an unbound named directory: they publish only after staging, token creation, descriptor pinning, and inode binding.
+
+## Independent-review fix round — claimant/helper publication race
+
+### Finding
+
+Independent review found one remaining legitimate concurrency failure: after the winning claimant published the bound bootstrap marker, a helper opener could rename the claimant's exact staged inode into `.artifact-locks` and complete publication first. When the claimant resumed, it treated the now-present final path as hostile substitution even though the final device/inode was its own still-pinned staged directory.
+
+### TDD RED
+
+Added a deterministic two-process interleaving regression. The claimant blocks in `afterLockBootstrapBound`; the helper opens the same root, publishes the exact staged inode, writes through the resulting store, and then releases the claimant.
+
+Command:
+
+```text
+node --test --test-name-pattern='original bootstrap claimant accepts' test/unit/artifacts.test.ts
+```
+
+Expected RED:
+
+```text
+tests 1
+pass 0
+fail 1
+Error: ARTIFACT INTEGRITY: artifact lock root path was substituted during bootstrap
+```
+
+This reproduces the independent review finding exactly and proves the prior probabilistic concurrent-open test did not lock the critical ordering.
+
+### Minimal fix
+
+At the final-name arbitration point, the claimant now compares the named path's device/inode with its still-pinned staged descriptor:
+
+- exact device/inode equality means another legitimate opener published the already-authoritative staged inode, so the claimant converges on it;
+- any different device/inode remains a same-name substitution and fails closed;
+- a missing final name still follows the original rename-and-fsync publication path;
+- token and bound bootstrap identity validation still occur before this decision, and final named identity validation still occurs afterward.
+
+### GREEN and verification
+
+Focused command:
+
+```text
+node --test --test-name-pattern='original bootstrap claimant accepts|bootstrap binds|concurrent first openers|prepared bootstrap|bootstrap recovers|bootstrap fails closed' test/unit/artifacts.test.ts
+```
+
+Output:
+
+```text
+tests 6
+pass 6
+fail 0
+```
+
+Broader evidence after the fix:
+
+- `node --test test/unit/artifacts.test.ts` — 28 passed, 0 failed.
+- `npm run typecheck` — core and scripts passed.
+- `npm run lint` — 592 files checked, no fixes required.
+- `npm test` — 2,697 passed, 0 failed, 1 optional Postgres test skipped because `TEST_DATABASE_URL` was absent.
+- `npm run test:e2e` — command registration and package loading passed (`21 commands`, `7 tools`).
+- `git diff --check` — passed.
+
+### Fix-round self-review
+
+- The new acceptance branch cannot authorize a replacement inode: it requires equality with the already-bound and descriptor-pinned staged inode.
+- A symlink, independently created directory, or renamed replacement has a different inode and still triggers the substitution error.
+- The claimant continues using its pinned descriptor after a helper rename, so there is no second name-based reopen.
+- Either opener may publish the durable domain record first; existing hard-link no-clobber publication makes both converge on the same token/device/inode record.
+- Crash hooks and legacy prepared-marker recovery remain unchanged and passed their complete artifact regression suite.

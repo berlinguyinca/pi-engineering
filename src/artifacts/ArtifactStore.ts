@@ -318,14 +318,20 @@ export class ArtifactStore {
           if ((await this.readLockDomainToken(stagedHandle)) !== bootstrap.token) {
             throw integrityError("artifact lock root bootstrap token changed");
           }
+          let exactInodeAlreadyPublished = false;
           try {
-            await lstat(path);
-            throw integrityError("artifact lock root path was substituted during bootstrap");
+            const namedIdentity = await lstat(path, { bigint: true });
+            if (namedIdentity.dev !== stagedIdentity.dev || namedIdentity.ino !== stagedIdentity.ino) {
+              throw integrityError("artifact lock root path was substituted during bootstrap");
+            }
+            exactInodeAlreadyPublished = true;
           } catch (error) {
             if (!isMissing(error)) throw error;
           }
-          await rename(stagingPath, path);
-          await root.sync();
+          if (!exactInodeAlreadyPublished) {
+            await rename(stagingPath, path);
+            await root.sync();
+          }
           createdLockRoot = true;
           createdIdentity = stagedIdentity;
           handle = stagedHandle;

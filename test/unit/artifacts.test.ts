@@ -777,6 +777,47 @@ test("concurrent first openers converge on one no-clobber bootstrap authority", 
   }
 });
 
+test("the original bootstrap claimant accepts a helper publishing its exact staged inode", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-eng-art-lock-bootstrap-helper-publish-"));
+  const ready = join(dir, "claimant-ready");
+  const release = join(dir, "release-claimant");
+  let claimant: ReturnType<typeof exec> | undefined;
+  try {
+    const root = join(dir, "artifacts");
+    const moduleUrl = new URL("../../src/artifacts/ArtifactStore.ts", import.meta.url).href;
+    claimant = exec(process.execPath, [
+      "--experimental-strip-types",
+      "--input-type=module",
+      "--eval",
+      `import { existsSync, writeFileSync } from "node:fs"; import { ArtifactStore } from ${JSON.stringify(moduleUrl)}; await ArtifactStore.create(${JSON.stringify(root)}, { afterLockBootstrapBound: () => { writeFileSync(${JSON.stringify(ready)}, "ready"); while (!existsSync(${JSON.stringify(release)})) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10); } });`,
+    ]);
+
+    const deadline = Date.now() + 5_000;
+    while (true) {
+      try {
+        await readFile(ready);
+        break;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        if (Date.now() >= deadline) throw new Error("bootstrap claimant did not reach the bound barrier");
+        await new Promise((resolveDelay) => setTimeout(resolveDelay, 10));
+      }
+    }
+
+    const helper = await ArtifactStore.create(root);
+    await helper.put("logs", "helper", "published", "helper published winning inode");
+    await writeFile(release, "release\n");
+    await claimant;
+
+    const reopened = await ArtifactStore.create(root);
+    assert.equal(await reopened.readContent("logs", "helper"), "published");
+  } finally {
+    await writeFile(release, "release\n").catch(() => undefined);
+    await claimant?.catch(() => undefined);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("artifact lock bootstrap recovers each durable two-phase crash boundary", async () => {
   for (const phase of [
     "afterLockBootstrapPrepared",
