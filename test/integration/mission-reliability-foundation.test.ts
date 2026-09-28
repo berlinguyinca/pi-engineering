@@ -2,10 +2,13 @@ import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { chmod, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { type IncomingMessage, type ServerResponse, createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { describe, it } from "node:test";
 import { promisify } from "node:util";
+import { resolveGatewayConfig } from "../../src/gateway/config.ts";
 import { EngineeringRuntime, GitRepo } from "../../src/index.ts";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
 import { MissionObservability } from "../../src/orchestration/observability/MissionObservability.ts";
@@ -14,10 +17,81 @@ import { MissionOwnership } from "../../src/orchestration/ownership.ts";
 import { MissionSupervisor } from "../../src/orchestration/supervisor.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 import type { VerificationProvider } from "../../src/verify/Verifier.ts";
-import type { WorkerExecutor } from "../../src/workers/WorkerExecutor.ts";
+import { PiWorkerExecutor } from "../../src/workers/PiWorkerExecutor.ts";
+import type { WorkerExecutor, WorkerRequest, WorkerRun } from "../../src/workers/WorkerExecutor.ts";
 import { makeFixtureRepo } from "../fixtures/make-fixture.ts";
 
 const exec = promisify(execFile);
+
+function modelChunk(delta: Record<string, unknown>, finishReason: string | null = null): string {
+  return `data: ${JSON.stringify({
+    id: "chatcmpl-mission-checkpoint",
+    object: "chat.completion.chunk",
+    created: 0,
+    model: "local",
+    choices: [{ index: 0, delta, finish_reason: finishReason }],
+  })}\n\n`;
+}
+
+function modelTool(res: ServerResponse, name: string, args: Record<string, unknown>): void {
+  res.writeHead(200, { "content-type": "text/event-stream" });
+  res.write(
+    modelChunk({
+      role: "assistant",
+      tool_calls: [
+        { index: 0, id: `call-${name}`, type: "function", function: { name, arguments: JSON.stringify(args) } },
+      ],
+    }),
+  );
+  res.write(modelChunk({}, "tool_calls"));
+  res.end("data: [DONE]\n\n");
+}
+
+async function checkpointModelProbe(): Promise<{
+  baseUrl: string;
+  requests: () => number;
+  close: () => Promise<void>;
+}> {
+  let requests = 0;
+  const server = createServer((req: IncomingMessage, res: ServerResponse) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+    req.on("end", () => {
+      requests++;
+      const body = Buffer.concat(chunks).toString("utf8");
+      if (requests === 1) {
+        modelTool(res, "bash", {
+          command:
+            "mkdir -p src && printf 'export const one = 1;\\n' > src/one.js && printf 'export const two = 2;\\n' > src/two.js && git add -A && git commit -q -m 'checkpoint two of three' && git rev-parse HEAD",
+        });
+        return;
+      }
+      if (requests === 2) {
+        const candidateSha = body.match(/[0-9a-f]{40}/g)?.at(-1);
+        assert.ok(candidateSha, `bash tool result did not expose a candidate SHA: ${body.slice(-1000)}`);
+        modelTool(res, "checkpoint_progress", {
+          claims: [
+            { deliverable: "one", candidate_sha: candidateSha, evidence_paths: ["src/one.js"] },
+            { deliverable: "two", candidate_sha: candidateSha, evidence_paths: ["src/two.js"] },
+          ],
+        });
+        return;
+      }
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write(modelChunk({ role: "assistant", content: "waiting past the broker deadline" }));
+    });
+  });
+  await new Promise<void>((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
+  const port = (server.address() as AddressInfo).port;
+  return {
+    baseUrl: `http://127.0.0.1:${port}/v1`,
+    requests: () => requests,
+    close: async () => {
+      server.closeAllConnections();
+      await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+    },
+  };
+}
 
 function reviewAcceptance(task: string) {
   return [...task.matchAll(/Acceptance criterion ([^:]+):/g)].map((match) => ({
@@ -129,24 +203,31 @@ if (process.env.FAKE_SNAPSHOT_MODE === "malformed") {
   await writeFile(join(process.cwd(), ".pi-eng", "orchestration-snapshot.json"), JSON.stringify({ contractVersion: 3, generatedAt: 42, missions: [{ id: "MSN-bad", revision: -1, status: "COMPLETE", observability: { acceptanceCoverage: { completed: "1", total: 1 } } }] }));
   process.exit(0);
 }
-await writeFile(join(process.cwd(), ".pi-eng", "orchestration-snapshot.json"), JSON.stringify({
+const snapshot = {
   contractVersion: 3,
   generatedAt: new Date().toISOString(),
   missions: [{
     id: "MSN-fake-dogfood", revision: 7, title: "fake", goal: "fake", workflowClass: "engineering_review",
     status: ${JSON.stringify(status)}, riskProfile: "high", constraints: [], requiredGates: [],
-    acceptanceCriteria: [{ id: "AC-fake", criterion: "dogfood completes", status: "verified" }], tasks: [], findings: [],
+    acceptanceCriteria: [{ id: "AC-fake", criterion: "dogfood completes", status: "passed" }], tasks: [], findings: [],
     observability: {
       progress: { approximatePercent: 100, verifiedComplete: true, basis: "weighted_dag" },
       acceptanceCoverage: { completed: 1, total: 1, approximatePercent: 100 },
       workflowProgress: { completed: 1, total: 1, approximatePercent: 100, basis: "weighted_dag" },
       health: "complete", workers: { active: 0, waiting: 0, failed: 0 }, lastMeaningfulProgressAt: new Date().toISOString(),
       completionStatus: "verified_complete", progressHistory: [], tests: { running: false, completed: 1, total: 1, passed: 1, failed: 0, skipped: 0, failures: [] },
-      review: { status: "approved", blockingOpen: 0, findings: [] }, workerDetails: [], activity: [], errors: [], recovery: [], changes: { changedFiles: [], commits: [], integrationState: "complete" }, artifacts: [],
+      review: { status: "completed", blockingOpen: 0, findings: [] }, workerDetails: [], activity: [], errors: [], recovery: [], changes: { changedFiles: [], commits: [], integrationState: "complete" }, artifacts: [],
       action: "done", reason: "verified", recoveryAttempt: { attempt: 0, maxAttempts: 2 }, nextAction: "none", nextActionAt: null, owner: null, repository: process.cwd(), task: null, preservedWork: [process.cwd()]
     }
   }]
-}));
+};
+if (process.env.FAKE_SNAPSHOT_MODE === "acceptance-not-passed") snapshot.missions[0].acceptanceCriteria[0].status = "pending";
+if (process.env.FAKE_SNAPSHOT_MODE === "acceptance-coverage") snapshot.missions[0].observability.acceptanceCoverage.total = 2;
+if (process.env.FAKE_SNAPSHOT_MODE === "test-accounting") snapshot.missions[0].observability.tests.passed = 0;
+if (process.env.FAKE_SNAPSHOT_MODE === "test-failed") { snapshot.missions[0].observability.tests.passed = 0; snapshot.missions[0].observability.tests.failed = 1; }
+if (process.env.FAKE_SNAPSHOT_MODE === "review-findings") snapshot.missions[0].observability.review.findings = [{ id: "F-open", severity: "blocking", status: "open", summary: "open", repaired: false }];
+if (process.env.FAKE_SNAPSHOT_MODE === "review-incomplete") snapshot.missions[0].observability.review.status = "running";
+await writeFile(join(process.cwd(), ".pi-eng", "orchestration-snapshot.json"), JSON.stringify(snapshot));
 `,
   );
   await chmod(executable, 0o755);
@@ -172,9 +253,11 @@ function transitionToExecuting(store: MissionStore, missionId: string): void {
   }
 }
 
-function blockedCheckpointHarness(roots: [string, string]) {
+async function blockedCheckpointHarness(roots: [string, string]) {
   const backend = JsonlEventStore.inMemory();
   const store = MissionStore.open(backend);
+  const git = (await GitRepo.open(roots[0]))!;
+  const baseSha = await git.headCommit();
   const mission = createMission(store, "MSN-qSLaeM", roots[0]);
   store.bindWorkspaceManifest({
     manifestId: "WM-qSLaeM",
@@ -192,7 +275,7 @@ function blockedCheckpointHarness(roots: [string, string]) {
         repoId: "repo-1",
         canonicalRoot: roots[0],
         baseRef: "main",
-        baseSha: "base-sha",
+        baseSha,
         writableDomains: ["src/**"],
       },
     ],
@@ -218,7 +301,7 @@ function blockedCheckpointHarness(roots: [string, string]) {
     mission_id: mission.mission_id,
     backend: "agent",
     repo_id: "repo-1",
-    base_sha: "base-sha",
+    base_sha: baseSha,
     checkpoint_id: "CHK-qSLaeM",
     mission_generation: 0,
     candidate_generation: 0,
@@ -233,7 +316,7 @@ function blockedCheckpointHarness(roots: [string, string]) {
     missionId: mission.mission_id,
     taskId: task.task_id,
     repoId: "repo-1",
-    baseSha: "base-sha",
+    baseSha,
     candidateSha: "checkpoint-sha",
     branch: "pi-eng-orch-TSK-qSLaeM-original",
     worktree: "/tmp/preserved-qSLaeM",
@@ -302,6 +385,7 @@ function blockedCheckpointHarness(roots: [string, string]) {
       },
     },
     planner: async () => [],
+    git,
     recovery: { missionCeiling: 4, strategyMaxAttempts: 2, decisionTtlMs: 60_000 },
     now: () => Date.parse("2026-09-27T00:00:10.000Z"),
   });
@@ -323,8 +407,30 @@ describe("mission reliability foundation — synthetic MSN-qSLaeM", () => {
       });
       const sessions: Array<{ role: string; session: string | undefined; recovery: boolean }> = [];
       let initial = true;
+      let initialPiRun: WorkerRun | undefined;
+      let modelProbe: Awaited<ReturnType<typeof checkpointModelProbe>> | undefined;
       try {
         const repoId = `repo-${createHash("sha256").update(first.root).digest("hex").slice(0, 16)}`;
+        modelProbe = await checkpointModelProbe();
+        const agentDir = join(metaRoot, "agent");
+        await mkdir(agentDir, { recursive: true });
+        await writeFile(
+          join(agentDir, "settings.json"),
+          JSON.stringify({ extensions: ["-extensions/qwen-turing.ts"] }),
+        );
+        await writeFile(
+          join(agentDir, "models.json"),
+          JSON.stringify({
+            providers: {
+              local: {
+                baseUrl: modelProbe.baseUrl,
+                api: "openai-completions",
+                apiKey: "local-test",
+                models: [{ id: "local", contextWindow: 256_000, maxTokens: 32_768 }],
+              },
+            },
+          }),
+        );
         const verifier: VerificationProvider = {
           async detect() {
             return { name: "synthetic-current-candidate", stages: [] };
@@ -333,8 +439,8 @@ describe("mission reliability foundation — synthetic MSN-qSLaeM", () => {
             return { passed: true, noTargets: false, stages: [], failedStage: null, evidence: [] };
           },
         };
-        const worker: WorkerExecutor = {
-          async run(request) {
+        class ScenarioWorker extends PiWorkerExecutor {
+          override async run(request: WorkerRequest): Promise<WorkerRun> {
             sessions.push({ role: request.role, session: request.sessionId, recovery: Boolean(request.recovery) });
             if (request.role === "reviewer") {
               return {
@@ -370,20 +476,7 @@ describe("mission reliability foundation — synthetic MSN-qSLaeM", () => {
             }
             if (initial) {
               initial = false;
-              await writeFile(join(request.cwd, "src", "one.js"), "export const one = 1;\n");
-              await writeFile(join(request.cwd, "src", "two.js"), "export const two = 2;\n");
-              await exec("git", ["-C", request.cwd, "add", "-A"]);
-              await exec("git", ["-C", request.cwd, "commit", "-q", "-m", "checkpoint two of three"]);
-              const candidateSha = (await exec("git", ["-C", request.cwd, "rev-parse", "HEAD"])).stdout.trim();
-              request.onActivity?.({
-                kind: "checkpoint",
-                summary: "Checkpoint progress recorded",
-                meaningfulProgress: true,
-                claims: [
-                  { deliverable: "one", candidateSha, evidencePaths: ["src/one.js"], artifactRefs: [] },
-                  { deliverable: "two", candidateSha, evidencePaths: ["src/two.js"], artifactRefs: [] },
-                ],
-              });
+              initialPiRun = await super.run({ ...request, modelOverride: { provider: "local", id: "local" } });
               await late;
               return {
                 result: {
@@ -433,8 +526,27 @@ describe("mission reliability foundation — synthetic MSN-qSLaeM", () => {
               },
               toolCalls: 0,
             };
-          },
-        };
+          }
+        }
+        const worker: WorkerExecutor = new ScenarioWorker({
+          agentDir,
+          model: {
+            provider: "local",
+            id: "local",
+            name: "local",
+            api: "openai-completions",
+            baseUrl: modelProbe.baseUrl,
+            apiKey: "local-test",
+            contextWindow: 256_000,
+            maxTokens: 32_768,
+            input: ["text"],
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+          } as never,
+          aps: false,
+          gatewayConfig: resolveGatewayConfig({ enabled: false }),
+          transientSleep: async () => {},
+          transientRand: () => 0,
+        });
         runtime = await EngineeringRuntime.open({
           cwd: metaRoot,
           workDir: join(metaRoot, "state"),
@@ -491,8 +603,20 @@ describe("mission reliability foundation — synthetic MSN-qSLaeM", () => {
         const checkpoint = runtime
           .missionStore!.listTaskCheckpoints(started.mission.mission_id, original.task_id)
           .at(-1)!;
-        assert.deepEqual(checkpoint.completedDeliverables, ["one", "two"]);
+        assert.deepEqual(
+          checkpoint.completedDeliverables,
+          ["one", "two"],
+          JSON.stringify({
+            requests: modelProbe.requests(),
+            sessions,
+            initialPiRun,
+            executions: runtime.missionStore!.listExecutions(started.mission.mission_id),
+            findings: runtime.missionStore!.listFindings(started.mission.mission_id),
+            checkpoint,
+          }),
+        );
         assert.deepEqual(checkpoint.remainingDeliverables, ["three"]);
+        assert.ok(modelProbe.requests() >= 3, "the real Pi executor reached checkpoint_progress before timing out");
         releaseLate();
         await new Promise((resolveWait) => setTimeout(resolveWait, 100));
         assert.ok(runtime.missionStore!.getExecution(checkpoint.executionId)?.status !== "SUCCEEDED");
@@ -534,13 +658,14 @@ describe("mission reliability foundation — synthetic MSN-qSLaeM", () => {
         assert.equal(review.verdict, "approve");
         assert.equal(review.outputValid, true);
         assert.equal(review.accessible, true);
-        assert.equal(review.independenceMode, "same_model_reduced");
+        assert.equal(review.independenceMode, "same_model_reduced", JSON.stringify(review));
         const implementerSession = sessions.find((entry) => entry.role === "implementer")?.session;
         const reviewerSession = sessions.find((entry) => entry.role === "reviewer")?.session;
         assert.ok(implementerSession && reviewerSession && implementerSession !== reviewerSession);
       } finally {
         releaseLate();
         await runtime?.close();
+        await modelProbe?.close();
         await Promise.all([rm(metaRoot, { recursive: true, force: true }), first.cleanup(), second.cleanup()]);
       }
     },
@@ -771,7 +896,7 @@ describe("mission reliability foundation — synthetic MSN-qSLaeM", () => {
     const first = await greenFixture();
     const second = await greenFixture();
     try {
-      const h = blockedCheckpointHarness([first.root, second.root]);
+      const h = await blockedCheckpointHarness([first.root, second.root]);
       for (const attempt of [1, 2]) {
         h.store.planRecovery({
           recoveryId: `RCV-qSLaeM-${attempt}`,
@@ -966,7 +1091,16 @@ describe("mission reliability foundation — synthetic MSN-qSLaeM", () => {
     }
   });
 
-  for (const mode of ["missing", "malformed"] as const) {
+  for (const mode of [
+    "missing",
+    "malformed",
+    "acceptance-not-passed",
+    "acceptance-coverage",
+    "test-accounting",
+    "test-failed",
+    "review-findings",
+    "review-incomplete",
+  ] as const) {
     it(`returns nonzero for a ${mode} runtime v3 snapshot`, async () => {
       const fake = await fakeInstalledPi();
       try {

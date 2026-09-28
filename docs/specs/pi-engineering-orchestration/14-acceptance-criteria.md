@@ -99,14 +99,20 @@ installed tree's exact HEAD, tracked changes, index, and untracked files are
 checked before any Pi invocation that can load extensions. Worker checkpoint
 progress is accepted only from the production tool path when every completed
 declared deliverable is bound to the broker-observed candidate SHA and
-committed path evidence; ordinary activity names and spoofed claims are
-rejected. Required lifecycle inventories are fail-closed, and only concrete
+committed path evidence. Artifact references are resolved through the artifact
+store and persisted with aligned SHA-256 content hashes; missing, spoofed, and
+unreadable references are rejected. Ordinary activity names and spoofed claims
+are rejected. An absent Git provider and missing lifecycle inventory methods
+both fail closed with typed `PERSISTENCE_UNAVAILABLE`, and only concrete
 candidate, worktree, branch, committed-path, and artifact references count as
 preserved work. The separately labeled source-only diagnostic disables
 extension discovery before every preliminary command and before loading
 exactly one explicit source extension. The full snapshot contract/version,
 `id`, `observability.acceptanceCoverage`, `observability.preservedWork`, and
 the typed `stop`, field types, and finite nonnegative counters are validated;
+`COMPLETE` additionally requires every declared criterion passed, exact
+coverage, consistent test accounting with a passing nonfailure result, and a
+completed review whose blocking count agrees with its findings.
 `FAILED`/`CANCELED` are nonzero outcomes.
 
 ## Implemented status and recovery semantics

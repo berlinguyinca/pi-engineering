@@ -364,8 +364,15 @@ function blockedRepairHarness(
         ? new MissionOwnership(store, { ownerId: "blocked-repair-controller" })
         : undefined);
   const observedRecoveries: Array<unknown> = [];
+  const lifecycleInventoryGit = {
+    loadCandidateLifecycleInventory: async () => ({ records: [], diagnostics: [] }),
+    loadIntegrationRunInventory: async () => ({ records: [], diagnostics: [] }),
+    loadPromotionLifecycleInventory: async () => ({ records: [], diagnostics: [] }),
+    loadPendingBranchCleanupInventory: async () => ({ records: [], diagnostics: [] }),
+  } as never;
   const orchestrator = new Orchestrator({
     store,
+    git: lifecycleInventoryGit,
     backends: {
       agent: {
         runAgent: async (input) => {

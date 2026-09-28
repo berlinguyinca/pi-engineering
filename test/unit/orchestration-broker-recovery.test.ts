@@ -5,10 +5,13 @@
  */
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
+import { ArtifactStore } from "../../src/artifacts/ArtifactStore.ts";
 import { GitRepo } from "../../src/git/GitRepo.ts";
 import {
   ExecutionBroker,
@@ -377,6 +380,7 @@ describe("ExecutionBroker: recovering a timed-out worker's committed work", () =
 
   it("preserves a pre-timeout checkpoint but keeps the uncooperative branch ineligible for integration", async () => {
     const fx = await makeFixtureRepo();
+    const artifactRoot = await mkdtemp(join(tmpdir(), "checkpoint-artifacts-"));
     let release!: () => void;
     const blocked = new Promise<void>((resolve) => {
       release = resolve;
@@ -384,6 +388,9 @@ describe("ExecutionBroker: recovering a timed-out worker's committed work", () =
     try {
       const git = (await GitRepo.open(fx.root))!;
       const store = MissionStore.open(JsonlEventStore.inMemory());
+      const artifacts = await ArtifactStore.create(artifactRoot);
+      const validArtifact = await artifacts.put("checkpoint", "implementation", "verified artifact body", "proof");
+      const secondValidArtifact = await artifacts.put("checkpoint", "tests", "verified artifact body", "proof");
       const base = await git.headCommit();
       const mission = store.createMission({
         title: "preserve timeout checkpoint",
@@ -430,6 +437,7 @@ describe("ExecutionBroker: recovering a timed-out worker's committed work", () =
         store,
         git,
         checkpoints: new CheckpointManager({ store }),
+        artifacts,
         cancellationAckTimeoutMs: 20,
         resolveRepository: async (repoId) => ({ repoId, root: fx.root, git }),
         backends: {
@@ -447,20 +455,41 @@ describe("ExecutionBroker: recovering a timed-out worker's committed work", () =
               } as never);
               onActivity?.({
                 kind: "checkpoint",
-                summary: "spoofed candidate",
+                summary: "missing artifact",
                 meaningfulProgress: true,
                 claims: [
                   {
                     deliverable: "implementation",
-                    candidateSha: "spoofed-sha",
+                    candidateSha,
                     evidencePaths: ["src/preserved.ts"],
-                    artifactRefs: [],
+                    artifactRefs: ["artifact://checkpoint/missing"],
                   },
                 ],
               });
               for (let attempt = 0; attempt < 100; attempt++) {
                 if (
                   store.listFindings(mission.mission_id).some((finding) => finding.category === "checkpoint_progress")
+                )
+                  break;
+                await new Promise((resolve) => setTimeout(resolve, 10));
+              }
+              onActivity?.({
+                kind: "checkpoint",
+                summary: "spoofed artifact",
+                meaningfulProgress: true,
+                claims: [
+                  {
+                    deliverable: "implementation",
+                    candidateSha,
+                    evidencePaths: ["src/preserved.ts"],
+                    artifactRefs: ["artifact://other/implementation"],
+                  },
+                ],
+              });
+              for (let attempt = 0; attempt < 100; attempt++) {
+                if (
+                  store.listFindings(mission.mission_id).filter((finding) => finding.category === "checkpoint_progress")
+                    .length >= 2
                 )
                   break;
                 await new Promise((resolve) => setTimeout(resolve, 10));
@@ -474,7 +503,7 @@ describe("ExecutionBroker: recovering a timed-out worker's committed work", () =
                     deliverable: "implementation",
                     candidateSha,
                     evidencePaths: ["src/preserved.ts"],
-                    artifactRefs: [],
+                    artifactRefs: [validArtifact.uri, secondValidArtifact.uri],
                   },
                 ],
               });
@@ -528,17 +557,29 @@ describe("ExecutionBroker: recovering a timed-out worker's committed work", () =
       assert.equal(outcome.error, "timeout");
       const checkpoint = store.getTaskCheckpoint(store.getExecution(handle.executionId)!.checkpoint_id!);
       assert.ok(checkpoint?.candidateSha, "the last stable checkpoint remains recoverable evidence");
-      assert.deepEqual(checkpoint.completedDeliverables, ["implementation"]);
-      assert.deepEqual(checkpoint.remainingDeliverables, []);
-      assert.ok(
-        store
-          .listFindings(mission.mission_id)
-          .some(
-            (finding) =>
-              finding.category === "checkpoint_progress" && finding.summary.includes("Rejected unauthenticated"),
-          ),
-        `a spoofed candidate SHA is rejected visibly: ${JSON.stringify(store.listFindings(mission.mission_id))}`,
+      assert.deepEqual(
+        checkpoint.completedDeliverables,
+        ["implementation"],
+        JSON.stringify({
+          findings: store.listFindings(mission.mission_id),
+          artifact: await artifacts.readContentByUri(validArtifact.uri),
+        }),
       );
+      assert.deepEqual(checkpoint.remainingDeliverables, []);
+      assert.deepEqual(checkpoint.artifactRefs, [validArtifact.uri, secondValidArtifact.uri]);
+      assert.deepEqual(checkpoint.artifactHashes, [
+        `sha256:${createHash("sha256").update("verified artifact body").digest("hex")}`,
+        `sha256:${createHash("sha256").update("verified artifact body").digest("hex")}`,
+      ]);
+      const rejectedClaims = store
+        .listFindings(mission.mission_id)
+        .filter(
+          (finding) =>
+            finding.category === "checkpoint_progress" && finding.summary.includes("Rejected unauthenticated"),
+        );
+      assert.equal(rejectedClaims.length, 2, JSON.stringify(rejectedClaims));
+      assert.ok(rejectedClaims.some((finding) => finding.evidence?.includes("artifact://checkpoint/missing")));
+      assert.ok(rejectedClaims.some((finding) => finding.evidence?.includes("artifact://other/implementation")));
       execFileSync("git", ["-C", fx.root, "cat-file", "-e", `${checkpoint.candidateSha}:src/preserved.ts`]);
 
       const integrationTask = store.createTask({
@@ -564,6 +605,7 @@ describe("ExecutionBroker: recovering a timed-out worker's committed work", () =
       await new Promise((resolve) => setTimeout(resolve, 20));
     } finally {
       release();
+      await rm(artifactRoot, { recursive: true, force: true });
       await fx.cleanup();
     }
   });
@@ -754,5 +796,38 @@ describe("ExecutionBroker durable lifecycle inventory", () => {
         error.code === "PERSISTENCE_UNAVAILABLE" &&
         error.repoId === "repo-inventory",
     );
+  });
+
+  it("fails closed for both diagnostics and preserved refs when repository-bound work has no Git provider", async () => {
+    const store = MissionStore.open(JsonlEventStore.inMemory());
+    const mission = store.createMission({
+      title: "missing git",
+      goal: "missing git",
+      user_request: "missing git",
+      repository: "/tmp/not-evidence",
+      base_ref: "base",
+      risk_profile: "high",
+      workflow_class: "engineering_review",
+    });
+    store.createTask({
+      mission_id: mission.mission_id,
+      repo_id: "repo-no-git",
+      kind: "agent",
+      role: "implementer",
+      objective: "work",
+    });
+    const broker = new ExecutionBroker({ store, git: null, backends: {} });
+    for (const read of [
+      () => broker.durableRepositoryDiagnostics(mission.mission_id),
+      () => broker.durableRepositoryStateRefs(mission.mission_id),
+    ]) {
+      await assert.rejects(
+        read,
+        (error: unknown) =>
+          error instanceof RepositoryLifecycleInventoryUnavailableError &&
+          error.code === "PERSISTENCE_UNAVAILABLE" &&
+          error.repoId === "repo-no-git",
+      );
+    }
   });
 });

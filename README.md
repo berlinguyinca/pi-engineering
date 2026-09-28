@@ -447,8 +447,11 @@ evidence and cannot change task, candidate, gate, or repository state.
 Checkpoint completion is accepted only through the production
 `checkpoint_progress` tool: each declared deliverable must name the exact
 current candidate SHA and committed evidence paths present in the broker's own
-Git snapshot. Plain activity text and spoofed SHA/path claims carry no
-authority. Missing lifecycle inventory fails closed with a typed
+Git snapshot. Any artifact URI is resolved through the runtime artifact store;
+missing, unreadable, or invented references reject the claim, while accepted
+references persist one aligned SHA-256 content hash each. Plain activity text
+and spoofed SHA/path/artifact claims carry no authority. Missing Git providers
+and incomplete lifecycle inventory APIs fail closed with a typed
 `PERSISTENCE_UNAVAILABLE` diagnostic; a repository root is never substituted
 for actual candidate, branch, worktree, artifact, or committed-path evidence.
 
@@ -484,9 +487,11 @@ enabled/advertised metabolomics, and a temporary parent that is or overlaps the
 current checkout, extension/package installation, or any Git worktree. It then
 creates a temporary Git repository only and validates every required snapshot
 contract-v3 field and numeric counter. `COMPLETE` additionally requires a
-nonzero declared acceptance total, exact coverage, and current verified review
-evidence; stopped states require nonempty reason, resume condition, recovery
-IDs, and actual preserved-work references.
+nonzero declared acceptance total, every declared criterion passed, exact
+coverage, internally consistent passed/failed/skipped test accounting with a
+passing nonfailure result, and a completed review whose blocking count matches
+its findings; stopped states require nonempty reason, resume condition,
+recovery IDs, and actual preserved-work references.
 Only `COMPLETE` with verified current acceptance evidence, or an explicitly
 allowed stopped state with a complete actionable stop, exits zero;
 `FAILED`/`CANCELED` retain and print the inspection path and exit nonzero.

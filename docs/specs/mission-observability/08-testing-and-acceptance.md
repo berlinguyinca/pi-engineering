@@ -149,8 +149,22 @@ explicitly labeled source-only diagnostic uses `--no-extensions` plus one
 source `--extension` and is not the installed-package proof.
 Every preliminary source-mode Pi command uses `--no-extensions`. Runtime-v3
 validation rejects malformed field types, non-finite/negative/non-integer
-counters, zero-acceptance `COMPLETE`, incomplete current evidence, and stopped
-states without a complete typed recovery/preservation payload.
+counters, zero-acceptance `COMPLETE`, criteria not marked passed, coverage that
+does not exactly match the declarations, inconsistent test totals, validation
+without a passing nonfailure result, review blocking counts inconsistent with
+their findings, incomplete current evidence, and stopped states without a
+complete typed recovery/preservation payload.
+
+The headline synthetic mission sends its first worker through the real
+`PiWorkerExecutor` and a deterministic OpenAI-compatible transport. The model
+invokes the production `checkpoint_progress` tool after committing two of
+three deliverables; the broker authenticates that checkpoint, times out the
+subsequent stalled turn, and repairs only the remainder. Checkpoint artifact
+URIs, when present, must resolve through the artifact store and receive aligned
+SHA-256 content hashes. Missing, spoofed, or unreadable references cannot
+become preserved work. Repository-bound lifecycle diagnostics and preserved
+references both fail closed with typed `PERSISTENCE_UNAVAILABLE` when Git or
+any required inventory API is absent.
 
 Status text is contractual: workerless runnable work is `ORPHANED`, unresolved
 dependency-only work is `DEADLOCKED`, heartbeat without meaningful progress is

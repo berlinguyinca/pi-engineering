@@ -3,13 +3,15 @@
 ## Outcome
 
 The public `MSN-qSLaeM` proof runs from a real non-Git meta-root across two
-explicitly authorized repositories. Its Pi worker uses the production
-`checkpoint_progress` tool after committing two of three deliverables. The
+explicitly authorized repositories. Its initial worker is a real
+`PiWorkerExecutor` driven by a deterministic OpenAI-compatible transport and
+uses the production `checkpoint_progress` tool after committing two of three
+deliverables. The
 broker independently checks the exact candidate SHA and committed evidence
-paths, rejects a spoofed claim visibly, times the worker out, rejects its late
-result, and repairs only the remaining deliverable. Validation and a distinct
-same-model review session are bound to the current candidate; reduced
-independence is recorded as `same_model_reduced`.
+paths, times the worker out, rejects its late result, and repairs only the
+remaining deliverable. Validation and a distinct same-model review session are
+bound to the current candidate; reduced independence is recorded as
+`same_model_reduced`.
 
 Conflict and red-validation paths compare the complete incumbent HEAD, index,
 status, and tracked/untracked content. Restart replay, exhausted fingerprints,
@@ -17,6 +19,26 @@ zero-worker orphan recovery, and independent second-mission repository leases
 remain covered. A mission succeeds only as `COMPLETE` with current verified
 evidence or as an explicitly allowed stopped state with a structurally complete
 actionable stop.
+
+## Fix Round 3 Evidence Boundaries
+
+- Checkpoint artifact references are now resolved through the runtime artifact
+  store. Missing, invented, or unreadable references reject the whole progress
+  claim. Accepted references persist content-derived SHA-256 hashes in exact
+  one-to-one order, including distinct references with identical content.
+- Repository-bound lifecycle diagnostics and preserved-reference collection
+  both throw typed `RepositoryLifecycleInventoryUnavailableError` with
+  `PERSISTENCE_UNAVAILABLE` when the Git provider itself is absent or any
+  required inventory API is missing. Recovery fixtures now provide a complete
+  inventory double or real temporary `GitRepo`.
+- The headline scenario no longer fabricates an activity callback. Its model
+  transport invokes `bash`, then `checkpoint_progress`, then stalls; the public
+  runtime/broker path records and recovers the authenticated 2/3 checkpoint.
+- Snapshot-v3 `COMPLETE` validation now requires every declared criterion to be
+  `passed`, exact acceptance totals, `completed = passed + failed + skipped`, a
+  passing nonfailure validation result, completed review, and a blocking count
+  consistent with review findings. Adversarial fixtures cover each
+  contradiction.
 
 ## Fix Round 2 Trust Boundaries
 
@@ -58,23 +80,19 @@ The new regressions were observed red before production repair:
 
 ## Verification
 
-Fresh final verification:
+Fresh round-3 final verification:
 
-- `npm run test:mission-reliability` — 16 passed.
-- broker plus real Pi-tool focused tests — 21 passed.
-- `npm run test:unit` — 2,315 passed.
-- `npm run test:integration` — 318 passed, 1 optional Postgres skip because
+- `npm run test:mission-reliability` — 22 passed.
+- artifact/inventory and snapshot-contract focused tests — 11 passed; the
+  public Pi-tool chain is also covered by the 22-test mission suite.
+- `npm run test:unit` — 2,316 passed.
+- `npm run test:integration` — 324 passed, 1 optional Postgres skip because
   `TEST_DATABASE_URL` is unset.
-- `npm test` — 2,633 passed, the same 1 optional Postgres skip.
+- `npm test` — 2,640 passed, the same 1 optional Postgres skip.
 - `npm run typecheck` — core and dedicated script configs passed.
 - `npm run lint` — 592 files checked, no errors.
 - `npm run test:e2e` — 21 commands and 7 tools loaded.
 - `git diff --check` — passed.
-
-One unrelated unit test (`cav-explore.test.ts`, page-exception fail-closed) was
-flaky during the first broad unit run; the Task 11 regression itself was also
-made deterministically wait for its queued checkpoint diagnostic rather than
-depending on wall time. Fresh final results supersede that intermediate run.
 
 ## Dogfood Safety and Installed Result
 
@@ -94,9 +112,12 @@ coverage, observability preserved work, and typed stop.
   repository-head vectors, and remote branch/PR/check/merge reconciliation.
 - Slice 3 still owns database-backed distributed leases/controllers and remote
   worker reconciliation.
-- Review the tool-event translation and broker SHA/path validation, especially
-  late activity after authority loss and final checkpoint merging.
-- Review fail-closed lifecycle inventory and confirm stopped-work surfaces
-  contain no repository-root fallback.
+- Review artifact-store resolution and the one-to-one URI/content-hash merge,
+  especially equal-content artifacts and late activity after authority loss.
+- Review fail-closed lifecycle inventory for both absent Git and incomplete
+  providers, and confirm stopped-work surfaces contain no repository-root
+  fallback.
+- Review the headline transport sequence to confirm the initial 2/3 progress is
+  emitted only by the real Pi tool path.
 - Review installed-package call order/cleanliness and exhaustive v3 snapshot
   validation. The default Task 12 path remains installed-package verification.

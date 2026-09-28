@@ -20,6 +20,7 @@
 
 import { createHash } from "node:crypto";
 import { isAbsolute } from "node:path";
+import type { ArtifactStore } from "../artifacts/ArtifactStore.ts";
 import { id } from "../core/ids.ts";
 import type {
   CandidateLifecycle,
@@ -400,6 +401,8 @@ export interface BrokerOptions {
   /** Periodic liveness detail for every backend while it is running. */
   activityHeartbeatMs?: number;
   checkpoints?: CheckpointManager;
+  /** Content authority for artifact-backed checkpoint progress claims. */
+  artifacts?: Pick<ArtifactStore, "readContentByUri">;
   /** Maximum cancellation delay while waiting for the backend writer to acknowledge abort. */
   cancellationAckTimeoutMs?: number;
 }
@@ -414,6 +417,7 @@ export class ExecutionBroker {
   private readonly onActivity?: BrokerOptions["onActivity"];
   private readonly activityHeartbeatMs: number;
   private readonly checkpoints?: CheckpointManager;
+  private readonly artifacts?: BrokerOptions["artifacts"];
   private readonly cancellationAckTimeoutMs: number;
   /** In-flight execution state for cancellation + allocated worktrees. */
   private readonly active = new Map<
@@ -499,6 +503,7 @@ export class ExecutionBroker {
     this.onActivity = opts.onActivity;
     this.activityHeartbeatMs = opts.activityHeartbeatMs ?? 15_000;
     this.checkpoints = opts.checkpoints;
+    this.artifacts = opts.artifacts;
     this.cancellationAckTimeoutMs = opts.cancellationAckTimeoutMs ?? 5_000;
   }
 
@@ -1414,7 +1419,15 @@ export class ExecutionBroker {
     for (const repoId of repoIds) {
       try {
         const git = this.resolveRepository ? (await this.resolveRepository(repoId, [], missionId)).git : this.git;
-        if (!git) continue;
+        if (!git) throw new RepositoryLifecycleInventoryUnavailableError(repoId);
+        if (
+          typeof git.loadCandidateLifecycleInventory !== "function" ||
+          typeof git.loadIntegrationRunInventory !== "function" ||
+          typeof git.loadPromotionLifecycleInventory !== "function" ||
+          typeof git.loadPendingBranchCleanupInventory !== "function"
+        ) {
+          throw new RepositoryLifecycleInventoryUnavailableError(repoId);
+        }
         const inventories = [
           ["candidate", await git.loadCandidateLifecycleInventory(missionId, repoId)],
           ["integration-run", await git.loadIntegrationRunInventory(missionId, repoId)],
@@ -1431,6 +1444,7 @@ export class ExecutionBroker {
           );
         }
       } catch (error) {
+        if (error instanceof RepositoryLifecycleInventoryUnavailableError) throw error;
         diagnostics.push({
           repoId,
           recordKind: "repository",
@@ -1455,7 +1469,7 @@ export class ExecutionBroker {
     const refs: string[] = [];
     for (const repoId of repoIds) {
       const git = this.resolveRepository ? (await this.resolveRepository(repoId, [], missionId)).git : this.git;
-      if (!git) continue;
+      if (!git) throw new RepositoryLifecycleInventoryUnavailableError(repoId);
       if (
         typeof git.loadCandidateLifecycleInventory !== "function" ||
         typeof git.loadIntegrationRunInventory !== "function" ||
@@ -2068,18 +2082,38 @@ export class ExecutionBroker {
             const snapshot = await this.checkpointSnapshot(execution.execution_id, input, repository, assertOrigin);
             assertOrigin();
             for (const claim of checkpointClaims.values()) {
+              const claimArtifactHashes: string[] = [];
+              let artifactsValid = claim.artifactRefs.length === 0;
+              if (claim.artifactRefs.length > 0 && this.artifacts) {
+                artifactsValid = true;
+                for (const ref of claim.artifactRefs) {
+                  let content: string | undefined;
+                  try {
+                    content = await this.artifacts.readContentByUri(ref);
+                  } catch {
+                    content = undefined;
+                  }
+                  if (content === undefined) {
+                    artifactsValid = false;
+                    break;
+                  }
+                  claimArtifactHashes.push(`sha256:${createHash("sha256").update(content).digest("hex")}`);
+                }
+              }
               const valid =
                 input.deliverables?.includes(claim.deliverable) === true &&
                 snapshot.candidateSha !== null &&
                 claim.candidateSha === snapshot.candidateSha &&
                 claim.evidencePaths.length > 0 &&
-                claim.evidencePaths.every((path) => snapshot.committedChanges.includes(path));
+                claim.evidencePaths.every((path) => snapshot.committedChanges.includes(path)) &&
+                artifactsValid;
               if (valid) {
                 completedDeliverables.add(claim.deliverable);
                 artifactRefs.push(...claim.artifactRefs);
+                artifactHashes.push(...claimArtifactHashes);
                 continue;
               }
-              const identity = `${claim.deliverable}:${claim.candidateSha}:${claim.evidencePaths.join(",")}`;
+              const identity = `${claim.deliverable}:${claim.candidateSha}:${claim.evidencePaths.join(",")}:${claim.artifactRefs.join(",")}`;
               if (!rejectedCheckpointClaims.has(identity)) {
                 rejectedCheckpointClaims.add(identity);
                 this.store.addFinding({
@@ -2090,7 +2124,7 @@ export class ExecutionBroker {
                   file: null,
                   line: null,
                   summary: `Rejected unauthenticated checkpoint progress for ${claim.deliverable}`,
-                  evidence: `claimed=${claim.candidateSha}; actual=${snapshot.candidateSha ?? "none"}; paths=${claim.evidencePaths.join(",")}`,
+                  evidence: `claimed=${claim.candidateSha}; actual=${snapshot.candidateSha ?? "none"}; paths=${claim.evidencePaths.join(",")}; artifacts=${claim.artifactRefs.join(",") || "none"}`,
                   recommended_action:
                     "Commit the declared deliverable, then report the exact current candidate SHA and committed evidence paths.",
                 });
@@ -2109,7 +2143,7 @@ export class ExecutionBroker {
               taskId: input.taskId,
               executionId: execution.execution_id,
               completedDeliverables: [...new Set([...completedDeliverables, ...declaredCompleted])],
-              artifactRefs: [...new Set(artifactRefs)],
+              artifactRefs,
               artifactHashes,
               model: execution.model,
               snapshot,

@@ -31,7 +31,7 @@ import { MissionObservability } from "../orchestration/observability/MissionObse
 import { Orchestrator } from "../orchestration/orchestrator.ts";
 import type { PlanTaskInput } from "../orchestration/orchestrator.ts";
 import { MissionOwnership } from "../orchestration/ownership.ts";
-import { realBackends } from "../orchestration/realBackends.ts";
+import { type ModelRoute, realBackends } from "../orchestration/realBackends.ts";
 import { FailureClassifier } from "../orchestration/recovery.ts";
 import { RepositoryRegistry } from "../orchestration/repositoryRegistry.ts";
 import { canTransitionMission } from "../orchestration/state.ts";
@@ -67,7 +67,7 @@ import type { WorkerExecutor, WorkerRequest } from "../workers/WorkerExecutor.ts
  */
 function buildGatewayRecoveryProbe(
   worker: WorkerExecutor,
-  routeModel: ((role: WorkerRequest["role"]) => Promise<{ provider: string; id: string } | undefined>) | undefined,
+  routeModel: ((role: WorkerRequest["role"]) => Promise<ModelRoute | undefined>) | undefined,
 ): RecoveryProbe | undefined {
   const url = process.env.PI_GATEWAY_HEALTH_URL;
   if (url) return new HttpRecoveryProbe({ baseUrl: url, timeoutMs: 5_000 });
@@ -701,9 +701,7 @@ export class EngineeringRuntime {
       // is honored by the mission pipeline, matching the lifecycle roleRunner
       // path. Degrades to the worker's construction-time default model when the
       // router cannot be built, so core never requires discovery or network.
-      let routeModel:
-        | ((role: WorkerRequest["role"]) => Promise<{ provider: string; id: string } | undefined>)
-        | undefined;
+      let routeModel: ((role: WorkerRequest["role"]) => Promise<ModelRoute | undefined>) | undefined;
       let reviewFallbackModel = opts.model ? { provider: opts.model.provider, id: opts.model.id } : undefined;
       try {
         const { createRoleRouter } = await import("../capability/adapter.ts");
@@ -722,10 +720,23 @@ export class EngineeringRuntime {
         routeModel = async (role) => {
           if (!isRoleName(role)) return undefined;
           try {
-            return await routerAdapter.route(
+            const routed = await routerAdapter.route(
               role,
               reviewFallbackModel ? { requester: reviewFallbackModel } : undefined,
             );
+            if (
+              role === "reviewer" &&
+              routed &&
+              reviewFallbackModel &&
+              routed.provider === reviewFallbackModel.provider &&
+              routed.id === reviewFallbackModel.id
+            ) {
+              return {
+                ...routed,
+                warning: `Warning: no distinct reviewer model is available; reviewing with ${routed.provider}/${routed.id} in a fresh session with reduced independence.`,
+              };
+            }
+            return routed;
           } catch {
             return undefined;
           }
@@ -787,6 +798,7 @@ export class EngineeringRuntime {
         planner: opts.orchestrationPlanner ?? defaultPlanner,
         parentSessionId: null,
         git: rt.git,
+        artifacts: rt.artifacts,
         baseRef: rt.git ? await rt.git.headCommit() : "",
         workspaceResolver: new WorkspaceManifestResolver(),
         repositoryRegistry: rt.repositoryRegistry,

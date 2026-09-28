@@ -249,6 +249,8 @@ function validateSnapshot(value: unknown): MissionSnapshotFile {
     for (const field of ["completed", "total", "passed", "failed", "skipped"])
       count(tests[field], `${path}.observability.tests.${field}`);
     stringArray(tests.failures, `${path}.observability.tests.failures`);
+    if ((tests.completed as number) !== (tests.passed as number) + (tests.failed as number) + (tests.skipped as number))
+      throw new Error(`${path}.observability.tests counters are inconsistent`);
     const review = record(observability.review, `${path}.observability.review`);
     nonempty(review.status, `${path}.observability.review.status`);
     count(review.blockingOpen, `${path}.observability.review.blockingOpen`);
@@ -283,6 +285,11 @@ function validateSnapshot(value: unknown): MissionSnapshotFile {
       if (typeof finding.repaired !== "boolean")
         throw new Error(`${path}.observability.review.findings[${findingIndex}].repaired must be boolean`);
     }
+    const openBlockingFindings = (review.findings as Array<Record<string, unknown>>).filter(
+      (finding) => finding.severity === "blocking" && finding.status === "open" && finding.repaired === false,
+    ).length;
+    if (review.blockingOpen !== openBlockingFindings)
+      throw new Error(`${path}.observability.review blocking count is inconsistent with findings`);
     const changes = record(observability.changes, `${path}.observability.changes`);
     optionalString(changes, "branch", `${path}.observability.changes`);
     optionalString(changes, "worktree", `${path}.observability.changes`);
@@ -304,13 +311,17 @@ function validateSnapshot(value: unknown): MissionSnapshotFile {
         observability.completionStatus !== "verified_complete"
       )
         throw new Error(`${path} is COMPLETE without current verified acceptance evidence`);
-      if (review.status !== "approved" || review.blockingOpen !== 0)
-        throw new Error(`${path} is COMPLETE without current approved review evidence`);
+      if (review.status !== "completed" || review.blockingOpen !== 0)
+        throw new Error(`${path} is COMPLETE without current completed review evidence`);
       if (tests.running !== false || tests.total === 0 || tests.completed !== tests.total || tests.failed !== 0)
         throw new Error(`${path} is COMPLETE without current successful validation evidence`);
+      if (tests.passed === 0) throw new Error(`${path} is COMPLETE without a passing validation result`);
       if (
         (mission.acceptanceCriteria as unknown[]).length === 0 ||
-        coverage.total !== (mission.acceptanceCriteria as unknown[]).length
+        coverage.total !== (mission.acceptanceCriteria as unknown[]).length ||
+        (mission.acceptanceCriteria as Array<Record<string, unknown>>).some(
+          (criterion) => criterion.status !== "passed",
+        )
       )
         throw new Error(`${path} is COMPLETE without acceptance coverage for the declared criteria`);
     } else if (STOPPED_STATES.has(mission.status as string)) {

@@ -73,6 +73,25 @@ function checkpointSupersedes(
   return chronology > 0 || (chronology === 0 && candidateEventOrdinal > currentEventOrdinal);
 }
 
+function mergeArtifactEvidence(...sources: Array<{ refs: readonly string[]; hashes: readonly string[] }>): {
+  refs: string[];
+  hashes: string[];
+} {
+  const byRef = new Map<string, string>();
+  for (const source of sources) {
+    if (source.refs.length !== source.hashes.length) {
+      throw new Error("checkpoint artifact references and content hashes must be aligned");
+    }
+    for (const [index, ref] of source.refs.entries()) {
+      const hash = source.hashes[index]!;
+      const prior = byRef.get(ref);
+      if (prior && prior !== hash) throw new Error(`checkpoint artifact content changed for ${ref}`);
+      byRef.set(ref, hash);
+    }
+  }
+  return { refs: [...byRef.keys()], hashes: [...byRef.values()] };
+}
+
 /** Persists recoverable work only. It never changes task or acceptance status. */
 export class CheckpointManager {
   private readonly store: MissionStore;
@@ -148,6 +167,10 @@ export class CheckpointManager {
         ...(input.completedDeliverables ?? []),
       ]).filter((deliverable) => declared.includes(deliverable));
       const completedSet = new Set(completed);
+      const artifactEvidence = mergeArtifactEvidence(
+        { refs: previous?.artifactRefs ?? [], hashes: previous?.artifactHashes ?? [] },
+        { refs: input.artifactRefs ?? [], hashes: input.artifactHashes ?? [] },
+      );
       const checkpoint: TaskCheckpoint = {
         checkpointId,
         executionId: execution.execution_id,
@@ -167,8 +190,8 @@ export class CheckpointManager {
           ...(previous?.validationEvidenceRefs ?? []),
           ...(input.validationEvidenceRefs ?? []),
         ]),
-        artifactRefs: dedupe([...(previous?.artifactRefs ?? []), ...(input.artifactRefs ?? [])]),
-        artifactHashes: dedupe([...(previous?.artifactHashes ?? []), ...(input.artifactHashes ?? [])]),
+        artifactRefs: artifactEvidence.refs,
+        artifactHashes: artifactEvidence.hashes,
         workerId: input.workerId ?? previous?.workerId ?? null,
         sessionId: input.sessionId ?? previous?.sessionId ?? null,
         model: input.model ?? previous?.model ?? null,

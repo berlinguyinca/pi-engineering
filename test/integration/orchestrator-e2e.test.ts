@@ -14,7 +14,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import type { GitRepo } from "../../src/git/GitRepo.ts";
-import type { BrokerBackends } from "../../src/orchestration/broker.ts";
+import { type BrokerBackends, RepositoryLifecycleInventoryUnavailableError } from "../../src/orchestration/broker.ts";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
 import { MissionObservability } from "../../src/orchestration/observability/MissionObservability.ts";
 import { Orchestrator, intersectWriteDomains } from "../../src/orchestration/orchestrator.ts";
@@ -290,14 +290,16 @@ describe("acceptance scenario A — simple feature auto-invokes engineering+vali
 
   it("fails closed instead of synthesizing mutation evidence without repository Git access", async () => {
     const h = harness({ noGitEvidenceTarget: true });
-    const result = await h.orchestrator.orchestrate("Add a health endpoint", {
-      repository: ".",
-      baseRef: "abc",
-      mutationRequested: true,
-    });
-    assert.equal(result.completed, false);
-    assert.equal(h.store.getCandidate(result.mission.mission_id), undefined);
-    assert.match(result.failureReason ?? "", /validation evidence|candidate|task\(s\) failed/i);
+    await assert.rejects(
+      h.orchestrator.orchestrate("Add a health endpoint", {
+        repository: ".",
+        baseRef: "abc",
+        mutationRequested: true,
+      }),
+      (error: unknown) =>
+        error instanceof RepositoryLifecycleInventoryUnavailableError && error.code === "PERSISTENCE_UNAVAILABLE",
+    );
+    assert.ok(h.store.listMissions().every((mission) => h.store.getCandidate(mission.mission_id) === undefined));
   });
 });
 
@@ -1466,8 +1468,8 @@ describe("repair of failed gate tasks", () => {
   });
 });
 
-describe("missing backends must degrade, not explode", () => {
-  it("an agent-only runtime does not throw and does not complete a mutation mission", async () => {
+describe("missing persistence authority fails closed", () => {
+  it("an agent-only runtime cannot complete a repository-bound mutation mission without Git", async () => {
     const store = MissionStore.open(JsonlEventStore.inMemory());
     const backends: BrokerBackends = {
       agent: {
@@ -1502,26 +1504,14 @@ describe("missing backends must degrade, not explode", () => {
         },
       ],
     });
-    // No validation / review / integration backend exists. That must surface as a
-    // blocked mission, not an exception escaping orchestrate with the mission
-    // stranded in INTEGRATING / VALIDATING / REVIEWING.
-    let result: Awaited<ReturnType<Orchestrator["orchestrate"]>> | undefined;
-    let threw: unknown;
-    try {
-      result = await orchestrator.orchestrate("Add an endpoint and fix the build", {
+    await assert.rejects(
+      orchestrator.orchestrate("Add an endpoint and fix the build", {
         repository: ".",
         baseRef: "abc",
         mutationRequested: true,
-      });
-    } catch (err) {
-      threw = err;
-    }
-    assert.equal(threw, undefined, `orchestrate must not throw, got ${String(threw)}`);
-    assert.ok(result);
-    assert.equal(result.completed, false, "gates that cannot run must not be treated as passed");
-    assert.ok(
-      ["BLOCKED", "FAILED"].includes(result.mission.status),
-      `mission must settle, got ${result.mission.status}`,
+      }),
+      (error: unknown) =>
+        error instanceof RepositoryLifecycleInventoryUnavailableError && error.code === "PERSISTENCE_UNAVAILABLE",
     );
   });
 });

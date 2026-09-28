@@ -15,6 +15,7 @@
  * No slash command is required: call `orchestrate(request)`.
  */
 
+import type { ArtifactStore } from "../artifacts/ArtifactStore.ts";
 import { id } from "../core/ids.ts";
 import { GitRepo } from "../git/GitRepo.ts";
 import type { EventStoreBackend } from "../platform/eventstore/backend.ts";
@@ -114,6 +115,8 @@ export interface OrchestratorOptions {
   maxRepairRounds?: number;
   /** Git provider used to allocate isolated worktrees for mutating tasks. */
   git?: GitRepo | null;
+  /** Artifact authority used to validate checkpoint evidence references. */
+  artifacts?: Pick<ArtifactStore, "readContentByUri">;
   /** Base ref (commit) worktrees are created at. Defaults to current HEAD. */
   baseRef?: string;
   /**
@@ -229,6 +232,7 @@ export class Orchestrator {
       baseRef: opts.baseRef ?? "",
       onActivity: (event) => this.observeWorkerActivity(event),
       checkpoints,
+      artifacts: opts.artifacts,
     });
     this.scheduler = new MissionScheduler({
       store: this.store,
