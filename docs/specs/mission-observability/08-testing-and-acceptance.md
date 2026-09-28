@@ -131,6 +131,27 @@ mission, recover its checkpoint under the same mission ID, perform a fresh
 same-model review with the reduced-independence warning, and complete with
 revision-bound evidence.
 
+The deterministic public-surface proof is
+`npm run test:mission-reliability`. The opt-in installed-Pi check is
+`npm run dogfood:mission-recovery`; it exits before repository creation unless
+the effective model is exactly `local/local` and metabolomics is absent or
+disabled. The command creates and retains a temporary repository, then prints
+the durable mission ID, revision, status, acceptance coverage, preserved work,
+typed stop (when present), and snapshot path. It never points Pi at the runtime
+checkout or another real project.
+
+Status text is contractual: workerless runnable work is `ORPHANED`, unresolved
+dependency-only work is `DEADLOCKED`, heartbeat without meaningful progress is
+`STALLED`, and an exhausted recovery is `BLOCKED` with an actionable stop.
+`BLOCKED` is resumable with `/mission resume <missionId>`; `COMPLETE`, `FAILED`,
+and `CANCELED` are terminal. Preserved checkpoints and candidate branches are
+recoverable work, not approval evidence.
+
+This acceptance suite proves Slice 1 only. Multiple authorized local roots do
+not imply cross-repository atomic publication (Slice 2), and local durable
+leases do not imply distributed-controller or remote-worker ownership (Slice
+3).
+
 The UI and activity stream must make every phase understandable.
 
 ## Acceptance criteria

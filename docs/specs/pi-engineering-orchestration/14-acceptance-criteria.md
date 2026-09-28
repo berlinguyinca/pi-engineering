@@ -85,6 +85,48 @@ The project is not complete until all of these are true.
 - repeated-fingerprint recovery exhaustion tests
 - real `local/local` interrupted-mission recovery test
 
+The executable Slice 1 acceptance proof is
+`npm run test:mission-reliability`. It covers the synthetic `MSN-qSLaeM`
+multi-root authorization case, timeout checkpoint remainder repair, late-result
+rejection, restart replay, repeated-fingerprint exhaustion, zero-worker orphan
+detection, repository-lease isolation, integration conflict, red validation,
+and incumbent immutability. `npm run dogfood:mission-recovery` is the opt-in
+installed-Pi live check; it refuses every model except `local/local`, refuses an
+enabled/advertised metabolomics provider, and operates only on a retained
+temporary Git repository.
+
+## Implemented status and recovery semantics
+
+- `EXECUTING` means an authoritative worker or controller owns runnable work;
+  it is not a generic label for a workerless mission.
+- `WAITING_*` names the wait, next action, and deadline. An expired wait enters
+  recovery instead of remaining indefinitely waiting.
+- `BLOCKED` is nonterminal. It must have a durable failure classification and
+  either a scheduled bounded recovery or an actionable stop containing the
+  reason, preserved-work locations, attempted recovery IDs, and exact resume
+  condition.
+- `REPAIRING` means a durable repair decision and replacement lineage exist;
+  failed tasks remain immutable audit history.
+- `COMPLETE` requires current candidate-bound validation/review evidence,
+  passed material acceptance criteria, accounted failed/canceled/skipped work,
+  and no unfenced execution that can still mutate the candidate.
+- `FAILED` and `CANCELED` are terminal outcomes and never imply approval.
+
+Operators resume a stopped mission with `/mission resume <missionId>`. The
+runtime preserves the mission ID, increments the resumption epoch, fences stale
+owners, reconciles side effects, and resumes only remaining checkpoint work.
+The old worker's later output is stored as inert
+`execution.late_result_rejected` evidence.
+
+## Explicit exclusions
+
+Slice 1 authorizes multiple local roots but executes and promotes one repository
+per task. Slice 2 still owns dependency-aware cross-repository worksets,
+repository-head vectors, publication ordering, and branch/PR/check/merge
+reconciliation. Slice 3 still owns database-backed leases, distributed or
+multi-process controllers, and remote-worker reconciliation. Local JSONL
+leases and one local controller do not claim Slice 3 guarantees.
+
 ## Documentation
 
 Document:
