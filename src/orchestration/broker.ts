@@ -507,7 +507,7 @@ export class ExecutionBroker {
     this.cancellationAckTimeoutMs = opts.cancellationAckTimeoutMs ?? 5_000;
   }
 
-  private async durableRecoveryContext(input: ExecutionRequestInput): Promise<CheckpointRecoveryContext | undefined> {
+  private durableRecoveryContext(input: ExecutionRequestInput): CheckpointRecoveryContext | undefined {
     const task = this.store.getTask(input.taskId);
     const authority = task?.recovery_authority;
     if (!authority) return undefined;
@@ -592,19 +592,6 @@ export class ExecutionBroker {
     ) {
       throw new Error("checkpoint recovery artifact identities do not match");
     }
-    for (const [index, ref] of checkpoint.artifactRefs.entries()) {
-      let content: string | undefined;
-      try {
-        content = await this.artifacts?.readContentByUri(ref);
-      } catch {
-        content = undefined;
-      }
-      const expectedHash = checkpoint.artifactHashes[index]!;
-      const actualHash = content === undefined ? null : `sha256:${createHash("sha256").update(content).digest("hex")}`;
-      if (actualHash !== expectedHash) {
-        throw new Error(`checkpoint recovery artifact content mismatch for ${ref}`);
-      }
-    }
     return Object.freeze({
       recoveryDecisionId: authority.recoveryDecisionId,
       expectedReplacementFingerprint: expected,
@@ -627,6 +614,40 @@ export class ExecutionBroker {
       artifactRefs: Object.freeze([...checkpoint.artifactRefs]),
       artifactHashes: Object.freeze([...checkpoint.artifactHashes]),
     }) as CheckpointRecoveryContext;
+  }
+
+  /**
+   * Resolve and hash recovery artifacts, then invoke the selected backend in
+   * that same promise continuation. Keeping the backend call inside the hash
+   * callback prevents an already-queued microtask from changing bytes between
+   * the final verification and dispatch.
+   */
+  private dispatchWithVerifiedRecovery<T>(
+    input: ExecutionRequestInput,
+    dispatch: (recovery: CheckpointRecoveryContext | undefined) => Promise<T>,
+  ): Promise<T> {
+    const recovery = this.durableRecoveryContext(input);
+    if (!recovery) return dispatch(undefined);
+    const reads = recovery.artifactRefs.map((ref) => {
+      try {
+        return Promise.resolve(this.artifacts?.readContentByUri(ref)).catch(() => undefined);
+      } catch {
+        return Promise.resolve(undefined);
+      }
+    });
+    return Promise.all(reads).then((contents) => {
+      for (const [index, ref] of recovery.artifactRefs.entries()) {
+        const content = contents[index];
+        const expectedHash = recovery.artifactHashes[index]!;
+        const actualHash =
+          content === undefined ? null : `sha256:${createHash("sha256").update(content).digest("hex")}`;
+        if (actualHash !== expectedHash) {
+          throw new Error(`checkpoint recovery artifact content mismatch for ${ref}`);
+        }
+      }
+      input.recovery = recovery;
+      return dispatch(recovery);
+    });
   }
 
   private assertReplacementSpec(input: ExecutionRequestInput): void {
@@ -1959,7 +1980,7 @@ export class ExecutionBroker {
       writeDomains: (rawInput.writeDomains ?? []).map(canonicalizeWriteDomain),
     };
     this.assertReplacementSpec(input);
-    input.recovery = await this.durableRecoveryContext(input);
+    input.recovery = await this.dispatchWithVerifiedRecovery(input, async (recovery) => recovery);
     input.authority?.assertAuthoritative();
     const executionStartedAt = Date.now();
     const executionBudgetMs = input.executionBudgetMs ?? input.timeoutPolicy?.timeoutMs ?? this.defaultTimeoutMs;
@@ -2365,13 +2386,6 @@ export class ExecutionBroker {
                 input.taskId,
               );
             }
-            // execute() resolves recovery authority before returning its lazy
-            // handle. Repository/worktree setup can await after that point, so
-            // re-resolve and hash every checkpoint artifact at the last
-            // possible boundary. No await may be inserted between this check
-            // and dispatch: the artifact store rejects mutations through its
-            // public API, while this closes the pre-result/setup race.
-            input.recovery = await this.durableRecoveryContext(input);
             writerStarted = true;
             const backendSettlement: Promise<BackendSettlement> = this.dispatch(
               input,
@@ -2781,29 +2795,33 @@ export class ExecutionBroker {
       case "research": {
         const runner = this.backends.agent;
         if (!runner) throw new Error(`no agent backend registered for ${backend}`);
-        return runner.runAgent({
-          repoId: input.repoId,
-          role: input.role ?? "worker",
-          objective: input.objective,
-          contextRef: input.contextRef,
-          worktree: base.worktree,
-          isolatedWorktree: worktree !== null,
-          modelRequirements: input.modelRequirements,
-          recovery: input.recovery,
-          deliverables: input.deliverables,
-          signal,
-          onActivity: base.onActivity,
-        });
+        return this.dispatchWithVerifiedRecovery(input, (recovery) =>
+          runner.runAgent({
+            repoId: input.repoId,
+            role: input.role ?? "worker",
+            objective: input.objective,
+            contextRef: input.contextRef,
+            worktree: base.worktree,
+            isolatedWorktree: worktree !== null,
+            modelRequirements: input.modelRequirements,
+            recovery,
+            deliverables: input.deliverables,
+            signal,
+            onActivity: base.onActivity,
+          }),
+        );
       }
       case "process": {
         const runner = this.backends.process;
         if (!runner) throw new Error("no process backend registered");
-        return runner.runProcess({
-          repoId: input.repoId,
-          objective: input.objective,
-          worktree: base.worktree,
-          signal,
-        });
+        return this.dispatchWithVerifiedRecovery(input, () =>
+          runner.runProcess({
+            repoId: input.repoId,
+            objective: input.objective,
+            worktree: base.worktree,
+            signal,
+          }),
+        );
       }
       case "review": {
         const runner = this.backends.review;
@@ -2812,15 +2830,17 @@ export class ExecutionBroker {
         if (input.repoId && runner.candidateScoped === true && !candidatePath) {
           throw new Error("CANDIDATE_UNAVAILABLE: review cannot fall back to the incumbent checkout");
         }
-        return runner.runReview({
-          repoId: input.repoId,
-          objective: input.objective,
-          contextRef: input.contextRef,
-          acceptanceCriteria: input.acceptanceCriteria,
-          worktree: candidatePath ?? null,
-          signal,
-          onActivity: base.onActivity,
-        });
+        return this.dispatchWithVerifiedRecovery(input, () =>
+          runner.runReview({
+            repoId: input.repoId,
+            objective: input.objective,
+            contextRef: input.contextRef,
+            acceptanceCriteria: input.acceptanceCriteria,
+            worktree: candidatePath ?? null,
+            signal,
+            onActivity: base.onActivity,
+          }),
+        );
       }
       case "integration": {
         const runner = this.backends.integration;
@@ -2963,21 +2983,23 @@ export class ExecutionBroker {
         // (a skipped or conflicting recovered handoff is not). This is the
         // completion gate's evidence for superseding the timed-out task.
         const git = repository?.git ?? null;
-        let outcome = await runner.runIntegration({
-          repoId: input.repoId,
-          objective: input.objective,
-          handoffs,
-          candidate: candidate
-            ? {
-                path: candidate.lifecycle.path,
-                branch: candidate.lifecycle.branch,
-              }
-            : undefined,
-          candidateLifecycle: candidate?.lifecycle,
-          integrationRun,
-          authority: input.authority,
-          signal,
-        });
+        let outcome = await this.dispatchWithVerifiedRecovery(input, () =>
+          runner.runIntegration({
+            repoId: input.repoId,
+            objective: input.objective,
+            handoffs,
+            candidate: candidate
+              ? {
+                  path: candidate.lifecycle.path,
+                  branch: candidate.lifecycle.branch,
+                }
+              : undefined,
+            candidateLifecycle: candidate?.lifecycle,
+            integrationRun,
+            authority: input.authority,
+            signal,
+          }),
+        );
         try {
           assertOrigin();
         } catch (error) {
@@ -3048,12 +3070,14 @@ export class ExecutionBroker {
         if (input.repoId && runner.candidateScoped === true && !candidatePath) {
           throw new Error("CANDIDATE_UNAVAILABLE: validation cannot fall back to the incumbent checkout");
         }
-        return runner.runValidation({
-          repoId: input.repoId,
-          objective: input.objective,
-          worktree: candidatePath ?? base.worktree,
-          signal,
-        });
+        return this.dispatchWithVerifiedRecovery(input, () =>
+          runner.runValidation({
+            repoId: input.repoId,
+            objective: input.objective,
+            worktree: candidatePath ?? base.worktree,
+            signal,
+          }),
+        );
       }
     }
   }

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -116,6 +116,74 @@ test("checkpoint-owned immutable writes keep concurrent equal-content claims dis
       /immutable checkpoint artifact/i,
     );
     await assert.rejects(() => replayed.delete(second.uri), /immutable checkpoint artifact/i);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("artifact coordinates reject path aliases and remain contained in the exact category", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-eng-art-canonical-"));
+  try {
+    const root = join(dir, "artifacts");
+    const store = await ArtifactStore.create(root);
+    const invalidSegments = [".", "..", "a/b", "a\\b", "%2e%2e", "x%2Fy"];
+
+    for (const segment of invalidSegments) {
+      await assert.rejects(() => store.put(segment, "safe", "bad", "bad"), /canonical artifact/i);
+      await assert.rejects(() => store.put("safe", segment, "bad", "bad"), /canonical artifact/i);
+      await assert.rejects(() => store.readContent(segment, "safe"), /canonical artifact/i);
+      await assert.rejects(() => store.readContent("safe", segment), /canonical artifact/i);
+    }
+
+    const meta = await store.put("safe", "item-1", "contained", "proof");
+    assert.equal(await readFile(join(root, "safe", "item-1.txt"), "utf8"), "contained");
+    assert.throws(() => store.getByUri(`artifact://safe/../${meta.id}`), /canonical artifact/i);
+    assert.throws(() => store.getByUri(`artifact://safe/%2e%2e`), /canonical artifact/i);
+    await assert.rejects(() => store.delete(`artifact://safe/../${meta.id}`), /canonical artifact/i);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("immutable policy uses private canonical keys and frozen metadata across live and reopened stores", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-eng-art-policy-"));
+  try {
+    const root = join(dir, "artifacts");
+    const store = await ArtifactStore.create(root);
+    const immutable = await store.putImmutable("checkpoint", "TCP-policy", "trusted bytes", "proof");
+
+    assert.ok(Object.isFrozen(immutable));
+    assert.throws(() => Object.assign(immutable, { id: "alias", category: "other", uri: "artifact://other/alias" }));
+    const live = store.getByUri(immutable.uri)!;
+    assert.ok(Object.isFrozen(live));
+    assert.notEqual(live, immutable);
+    assert.throws(() => Object.assign(live, { summary: "mutable policy" }));
+    const listed = store.list("checkpoint");
+    assert.ok(listed.every(Object.isFrozen));
+    assert.notEqual(listed[0], live);
+
+    const reopened = await ArtifactStore.create(root);
+
+    const collisionResults = await Promise.allSettled([
+      store.put("checkpoint", immutable.id, "collision", "collision"),
+      reopened.delete(immutable.uri),
+      reopened.put("checkpoint", immutable.id, "replay collision", "collision"),
+      store.put("checkpoint/..", immutable.id, "alias collision", "collision"),
+      store.delete(`artifact://checkpoint/%2e%2e/${immutable.id}`),
+    ]);
+    assert.ok(collisionResults.every((result) => result.status === "rejected"));
+    assert.equal(await store.readContentByUri(immutable.uri), "trusted bytes");
+
+    const replayed = reopened.getByUri(immutable.uri)!;
+    assert.ok(Object.isFrozen(replayed));
+    assert.notEqual(replayed, live);
+    assert.throws(() => Object.assign(replayed, { id: "replayed-alias" }));
+    await assert.rejects(
+      () => reopened.put("checkpoint", immutable.id, "replay collision", "collision"),
+      /immutable checkpoint artifact/i,
+    );
+    await assert.rejects(() => reopened.delete(immutable.uri), /immutable checkpoint artifact/i);
+    assert.equal(await reopened.readContentByUri(immutable.uri), "trusted bytes");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

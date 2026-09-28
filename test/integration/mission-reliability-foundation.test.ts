@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
+import { writeFileSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { type IncomingMessage, type ServerResponse, createServer } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -985,6 +986,43 @@ describe("mission reliability foundation — synthetic MSN-qSLaeM", () => {
       await h.orchestrator.repairBlockedMission(h.mission.mission_id).catch(() => undefined);
 
       assert.equal(h.replacementDispatches(), 0, "the final artifact check must precede runAgent without an await gap");
+      assert.equal(h.store.getMission(h.mission.mission_id)?.status, "BLOCKED");
+    } finally {
+      await rm(artifactRoot, { recursive: true, force: true });
+      await first.cleanup();
+      await second.cleanup();
+    }
+  });
+
+  it("does not dispatch recovery across a double-queued post-verification mutation", async () => {
+    const first = await greenFixture();
+    const second = await greenFixture();
+    const artifactRoot = await mkdtemp(join(tmpdir(), "pi-eng-checkpoint-microtask-tamper-"));
+    try {
+      const artifacts = await ArtifactStore.create(artifactRoot);
+      const body = "immutable checkpoint evidence";
+      const immutable = await artifacts.putImmutable("checkpoint", "CHK-qSLaeM", body, "proof");
+      const originalRead = artifacts.readContentByUri.bind(artifacts);
+      let reads = 0;
+      artifacts.readContentByUri = ((uri: string) => {
+        reads++;
+        if (reads !== 2) return originalRead(uri);
+        const verifiedBytes = Promise.resolve<string | undefined>(body);
+        void verifiedBytes.then(() =>
+          queueMicrotask(() =>
+            writeFileSync(join(artifactRoot, "checkpoint", `${immutable.id}.txt`), "microtask tamper", "utf8"),
+          ),
+        );
+        return verifiedBytes;
+      }) as typeof artifacts.readContentByUri;
+      const h = await blockedCheckpointHarness([first.root, second.root], {
+        store: artifacts,
+        refs: [immutable.uri],
+        hashes: [`sha256:${createHash("sha256").update(body).digest("hex")}`],
+      });
+      await h.orchestrator.repairBlockedMission(h.mission.mission_id).catch(() => undefined);
+
+      assert.equal(h.replacementDispatches(), 0, "tampered recovery bytes must never enter runAgent");
       assert.equal(h.store.getMission(h.mission.mission_id)?.status, "BLOCKED");
     } finally {
       await rm(artifactRoot, { recursive: true, force: true });
