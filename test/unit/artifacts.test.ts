@@ -84,3 +84,26 @@ test("artifact slices are read lazily and page correctly", async () => {
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("checkpoint-owned immutable writes keep concurrent equal-content claims distinct and replayable", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-eng-art-"));
+  try {
+    const root = join(dir, "artifacts");
+    const store = await ArtifactStore.create(root);
+    const [first, second] = await Promise.all([
+      store.putImmutable("checkpoint", "TCP-same", "same bytes", "first claim"),
+      store.putImmutable("checkpoint", "TCP-same", "same bytes", "second claim"),
+    ]);
+
+    assert.notEqual(first.uri, second.uri);
+    assert.match(first.uri, /^artifact:\/\/checkpoint\/TCP-same-[a-f0-9]{64}-/);
+    assert.equal(await store.readContentByUri(first.uri), "same bytes");
+    assert.equal(await store.readContentByUri(second.uri), "same bytes");
+
+    const replayed = await ArtifactStore.create(root);
+    assert.equal(await replayed.readContentByUri(first.uri), "same bytes");
+    assert.equal(await replayed.readContentByUri(second.uri), "same bytes");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});

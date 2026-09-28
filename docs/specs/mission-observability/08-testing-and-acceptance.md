@@ -131,6 +131,11 @@ mission, recover its checkpoint under the same mission ID, perform a fresh
 same-model review with the reduced-independence warning, and complete with
 revision-bound evidence.
 
+Checkpoint artifact claims are snapshotted to unique checkpoint-owned,
+content-addressed URIs. Recovery must resolve every persisted URI and recompute
+its aligned SHA-256 hash before dispatch. Equal-content claims remain separate;
+missing, overwritten, or replay-corrupt evidence rejects recovery.
+
 The deterministic public-surface proof is
 `npm run test:mission-reliability`. The opt-in installed-Pi check is
 `npm run dogfood:mission-recovery`; it exits before repository creation unless
@@ -143,6 +148,10 @@ It rejects any temp parent in/overlapping a Git worktree, checkout, extension, o
 installation before `mkdtemp`. It validates contract v3 and prints the durable
 mission `id`, revision, status, `observability.acceptanceCoverage`,
 `observability.preservedWork`, typed `stop` (when present), and snapshot path.
+For `COMPLETE`, review finding severity/status values must be valid runtime
+enums, `repaired` must equal `(status === "resolved")`, and `blockingOpen` must
+equal every blocking finding whose status is not resolved. Thus an `accepted`
+blocking finding is still unresolved and cannot pass dogfood.
 Only verified `COMPLETE` or an allowed stopped state with a complete actionable
 stop succeeds; `FAILED`/`CANCELED` exit nonzero and retain the exact path. The
 explicitly labeled source-only diagnostic uses `--no-extensions` plus one

@@ -101,7 +101,11 @@ progress is accepted only from the production tool path when every completed
 declared deliverable is bound to the broker-observed candidate SHA and
 committed path evidence. Artifact references are resolved through the artifact
 store and persisted with aligned SHA-256 content hashes; missing, spoofed, and
-unreadable references are rejected. Ordinary activity names and spoofed claims
+unreadable references are rejected. Accepted bodies are copied to unique
+checkpoint-owned content-addressed URIs, preserving one reference per claim
+even when bodies are equal. Recovery resolves those URIs and recomputes every
+aligned hash before dispatch; deletion or overwrite rejects recovery. Ordinary
+activity names and spoofed claims
 are rejected. An absent Git provider and missing lifecycle inventory methods
 both fail closed with typed `PERSISTENCE_UNAVAILABLE`, and only concrete
 candidate, worktree, branch, committed-path, and artifact references count as
@@ -113,6 +117,9 @@ the typed `stop`, field types, and finite nonnegative counters are validated;
 `COMPLETE` additionally requires every declared criterion passed, exact
 coverage, consistent test accounting with a passing nonfailure result, and a
 completed review whose blocking count agrees with its findings.
+Review evidence uses only the runtime severity/status enums, `repaired` is true
+exactly for `resolved`, and a blocking `accepted` finding still blocks just as
+CompletionGate does.
 `FAILED`/`CANCELED` are nonzero outcomes.
 
 ## Implemented status and recovery semantics

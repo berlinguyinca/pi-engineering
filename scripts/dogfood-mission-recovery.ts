@@ -282,11 +282,17 @@ function validateSnapshot(value: unknown): MissionSnapshotFile {
       const finding = record(rawFinding, `${path}.observability.review.findings[${findingIndex}]`);
       for (const field of ["id", "severity", "status", "summary"])
         nonempty(finding[field], `${path}.observability.review.findings[${findingIndex}].${field}`);
+      if (!["blocking", "major", "minor"].includes(finding.severity as string))
+        throw new Error(`${path}.observability.review.findings[${findingIndex}].severity is invalid`);
+      if (!["open", "accepted", "resolved"].includes(finding.status as string))
+        throw new Error(`${path}.observability.review.findings[${findingIndex}].status is invalid`);
       if (typeof finding.repaired !== "boolean")
         throw new Error(`${path}.observability.review.findings[${findingIndex}].repaired must be boolean`);
+      if (finding.repaired !== (finding.status === "resolved"))
+        throw new Error(`${path}.observability.review.findings[${findingIndex}] repaired/status are inconsistent`);
     }
     const openBlockingFindings = (review.findings as Array<Record<string, unknown>>).filter(
-      (finding) => finding.severity === "blocking" && finding.status === "open" && finding.repaired === false,
+      (finding) => finding.severity === "blocking" && finding.status !== "resolved",
     ).length;
     if (review.blockingOpen !== openBlockingFindings)
       throw new Error(`${path}.observability.review blocking count is inconsistent with findings`);

@@ -449,7 +449,11 @@ Checkpoint completion is accepted only through the production
 current candidate SHA and committed evidence paths present in the broker's own
 Git snapshot. Any artifact URI is resolved through the runtime artifact store;
 missing, unreadable, or invented references reject the claim, while accepted
-references persist one aligned SHA-256 content hash each. Plain activity text
+references are copied to unique checkpoint-owned, content-addressed URIs with
+one aligned SHA-256 content hash each. Equal-content claims remain distinct.
+Recovery re-resolves every checkpoint-owned URI and recomputes its exact hash
+before dispatch, so deleted or overwritten checkpoint evidence fails closed.
+Plain activity text
 and spoofed SHA/path/artifact claims carry no authority. Missing Git providers
 and incomplete lifecycle inventory APIs fail closed with a typed
 `PERSISTENCE_UNAVAILABLE` diagnostic; a repository root is never substituted
@@ -490,7 +494,10 @@ contract-v3 field and numeric counter. `COMPLETE` additionally requires a
 nonzero declared acceptance total, every declared criterion passed, exact
 coverage, internally consistent passed/failed/skipped test accounting with a
 passing nonfailure result, and a completed review whose blocking count matches
-its findings; stopped states require nonempty reason, resume condition,
+its findings. Review severities and statuses must be valid runtime enums,
+`repaired` must agree exactly with `resolved`, and every blocking finding whose
+status is not `resolved` remains unresolved (including `accepted`). Stopped
+states require nonempty reason, resume condition,
 recovery IDs, and actual preserved-work references.
 Only `COMPLETE` with verified current acceptance evidence, or an explicitly
 allowed stopped state with a complete actionable stop, exits zero;

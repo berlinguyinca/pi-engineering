@@ -20,6 +20,20 @@ remain covered. A mission succeeds only as `COMPLETE` with current verified
 evidence or as an explicitly allowed stopped state with a structurally complete
 actionable stop.
 
+## Fix Round 4 Trust Boundaries
+
+- Accepted `checkpoint_progress` artifact bodies are copied to unique,
+  checkpoint-owned content-addressed URIs. Persisted URI/hash arrays stay
+  one-to-one even for concurrent equal-content claims and survive artifact-store
+  replay. Worker-owned source mutation or deletion cannot change the snapshot.
+- Immediately before recovery dispatch, every checkpoint artifact is resolved
+  and SHA-256 hashed again. Missing, overwritten, or replay-corrupt checkpoint
+  content rejects recovery before a replacement worker runs.
+- Dogfood `COMPLETE` review findings now require the runtime severity and status
+  enums, exact `repaired`/`resolved` consistency, and an exact `blockingOpen`
+  count using CompletionGate semantics (`blocking && status !== resolved`). An
+  accepted blocking finding therefore rejects completion.
+
 ## Fix Round 3 Evidence Boundaries
 
 - Checkpoint artifact references are now resolved through the runtime artifact
@@ -67,6 +81,9 @@ actionable stop.
 
 The new regressions were observed red before production repair:
 
+- checkpoint claims retained their mutable worker-owned artifact URIs;
+- COMPLETE dogfood accepted invalid review severity/status values, an accepted
+  blocker, and contradictory `repaired`/`status` pairs;
 - the real OpenAI-compatible Pi executor completed without emitting any
   authenticated checkpoint activity;
 - installed dogfood called model discovery before package resolution and did
@@ -79,6 +96,20 @@ The new regressions were observed red before production repair:
 - malformed and missing v3 snapshots were not comprehensively rejected.
 
 ## Verification
+
+Fresh round-4 final verification:
+
+- `npm run test:mission-reliability` — 30 passed.
+- artifact and broker-recovery focused suites — 20 passed.
+- `PI_CODING_AGENT_DIR=/tmp/pi-task11-empty-agent npm run test:unit && npm run test:integration`
+  — 2,317 unit tests passed; 332 integration tests passed; 1 optional Postgres
+  test skipped because `TEST_DATABASE_URL` is unset. The empty unit-only agent
+  catalog prevents the advisory vision unit test from contacting a configured
+  local model; integration runs with the real catalog for same-model fallback.
+- `npm run typecheck` — core and dedicated script configs passed.
+- `npm run lint` — 592 files checked, no errors.
+- `npm run test:e2e` — 21 commands and 7 tools loaded.
+- `git diff --check` — passed.
 
 Fresh round-3 final verification:
 

@@ -8,6 +8,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { describe, it } from "node:test";
 import { promisify } from "node:util";
+import { ArtifactStore } from "../../src/artifacts/ArtifactStore.ts";
 import { resolveGatewayConfig } from "../../src/gateway/config.ts";
 import { EngineeringRuntime, GitRepo } from "../../src/index.ts";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
@@ -227,6 +228,11 @@ if (process.env.FAKE_SNAPSHOT_MODE === "test-accounting") snapshot.missions[0].o
 if (process.env.FAKE_SNAPSHOT_MODE === "test-failed") { snapshot.missions[0].observability.tests.passed = 0; snapshot.missions[0].observability.tests.failed = 1; }
 if (process.env.FAKE_SNAPSHOT_MODE === "review-findings") snapshot.missions[0].observability.review.findings = [{ id: "F-open", severity: "blocking", status: "open", summary: "open", repaired: false }];
 if (process.env.FAKE_SNAPSHOT_MODE === "review-incomplete") snapshot.missions[0].observability.review.status = "running";
+if (process.env.FAKE_SNAPSHOT_MODE === "review-invalid-severity") snapshot.missions[0].observability.review.findings = [{ id: "F-invalid", severity: "critical", status: "resolved", summary: "invalid", repaired: true }];
+if (process.env.FAKE_SNAPSHOT_MODE === "review-invalid-status") snapshot.missions[0].observability.review.findings = [{ id: "F-invalid", severity: "major", status: "closed", summary: "invalid", repaired: false }];
+if (process.env.FAKE_SNAPSHOT_MODE === "review-accepted-blocker") snapshot.missions[0].observability.review.findings = [{ id: "F-accepted", severity: "blocking", status: "accepted", summary: "still blocks", repaired: false }];
+if (process.env.FAKE_SNAPSHOT_MODE === "review-resolved-not-repaired") snapshot.missions[0].observability.review.findings = [{ id: "F-resolved", severity: "major", status: "resolved", summary: "resolved", repaired: false }];
+if (process.env.FAKE_SNAPSHOT_MODE === "review-open-repaired") snapshot.missions[0].observability.review.findings = [{ id: "F-open", severity: "major", status: "open", summary: "open", repaired: true }];
 await writeFile(join(process.cwd(), ".pi-eng", "orchestration-snapshot.json"), JSON.stringify(snapshot));
 `,
   );
@@ -253,7 +259,10 @@ function transitionToExecuting(store: MissionStore, missionId: string): void {
   }
 }
 
-async function blockedCheckpointHarness(roots: [string, string]) {
+async function blockedCheckpointHarness(
+  roots: [string, string],
+  checkpointArtifacts?: { store: ArtifactStore; refs: string[]; hashes: string[] },
+) {
   const backend = JsonlEventStore.inMemory();
   const store = MissionStore.open(backend);
   const git = (await GitRepo.open(roots[0]))!;
@@ -326,8 +335,8 @@ async function blockedCheckpointHarness(roots: [string, string]) {
     remainingDeliverables: ["two", "three"],
     acceptanceIds: [],
     validationEvidenceRefs: [],
-    artifactRefs: [],
-    artifactHashes: [],
+    artifactRefs: checkpointArtifacts?.refs ?? [],
+    artifactHashes: checkpointArtifacts?.hashes ?? [],
     workerId: "worker-old",
     sessionId: "session-old",
     model: "local/local",
@@ -350,17 +359,21 @@ async function blockedCheckpointHarness(roots: [string, string]) {
   });
   store.transitionMission(mission.mission_id, "BLOCKED");
   const reviewSessions: string[] = [];
+  let replacementDispatches = 0;
   const orchestrator = new Orchestrator({
     store,
     backends: {
       agent: {
-        runAgent: async () => ({
-          executionId: "replacement",
-          exitStatus: "succeeded",
-          summary: "remaining deliverable completed",
-          artifactRefs: [],
-          usage: {},
-        }),
+        runAgent: async () => {
+          replacementDispatches++;
+          return {
+            executionId: "replacement",
+            exitStatus: "succeeded",
+            summary: "remaining deliverable completed",
+            artifactRefs: [],
+            usage: {},
+          };
+        },
       },
       validation: {
         runValidation: async () => ({
@@ -386,10 +399,20 @@ async function blockedCheckpointHarness(roots: [string, string]) {
     },
     planner: async () => [],
     git,
+    artifacts: checkpointArtifacts?.store,
     recovery: { missionCeiling: 4, strategyMaxAttempts: 2, decisionTtlMs: 60_000 },
     now: () => Date.parse("2026-09-27T00:00:10.000Z"),
   });
-  return { backend, store, mission, task, execution, orchestrator, reviewSessions };
+  return {
+    backend,
+    store,
+    mission,
+    task,
+    execution,
+    orchestrator,
+    reviewSessions,
+    replacementDispatches: () => replacementDispatches,
+  };
 }
 
 describe("mission reliability foundation — synthetic MSN-qSLaeM", () => {
@@ -892,6 +915,63 @@ describe("mission reliability foundation — synthetic MSN-qSLaeM", () => {
     }
   });
 
+  for (const tamper of ["overwrite", "delete"] as const) {
+    it(`rejects recovery before replacement dispatch when checkpoint artifact content is ${tamper === "overwrite" ? "overwritten" : "deleted"}`, async () => {
+      const first = await greenFixture();
+      const second = await greenFixture();
+      const artifactRoot = await mkdtemp(join(tmpdir(), "pi-eng-checkpoint-recovery-artifacts-"));
+      try {
+        const artifacts = await ArtifactStore.create(artifactRoot);
+        const body = "immutable checkpoint evidence";
+        const immutable = await artifacts.putImmutable("checkpoint", "CHK-qSLaeM", body, "proof");
+        const h = await blockedCheckpointHarness([first.root, second.root], {
+          store: artifacts,
+          refs: [immutable.uri],
+          hashes: [`sha256:${createHash("sha256").update(body).digest("hex")}`],
+        });
+        if (tamper === "delete") {
+          await artifacts.delete(immutable.uri);
+        } else {
+          await artifacts.put("checkpoint", immutable.id, "tampered bytes", "tampered");
+        }
+
+        await h.orchestrator.repairBlockedMission(h.mission.mission_id).catch(() => undefined);
+
+        assert.equal(h.replacementDispatches(), 0, "artifact verification must precede recovery dispatch");
+        assert.equal(h.store.getMission(h.mission.mission_id)?.status, "BLOCKED");
+      } finally {
+        await rm(artifactRoot, { recursive: true, force: true });
+        await first.cleanup();
+        await second.cleanup();
+      }
+    });
+  }
+
+  it("replays checkpoint-owned artifact bytes and verifies them before recovery dispatch", async () => {
+    const first = await greenFixture();
+    const second = await greenFixture();
+    const artifactRoot = await mkdtemp(join(tmpdir(), "pi-eng-checkpoint-replay-artifacts-"));
+    try {
+      const writer = await ArtifactStore.create(artifactRoot);
+      const body = "replay-stable checkpoint evidence";
+      const immutable = await writer.putImmutable("checkpoint", "CHK-qSLaeM", body, "proof");
+      const replayed = await ArtifactStore.create(artifactRoot);
+      const h = await blockedCheckpointHarness([first.root, second.root], {
+        store: replayed,
+        refs: [immutable.uri],
+        hashes: [`sha256:${createHash("sha256").update(body).digest("hex")}`],
+      });
+
+      await h.orchestrator.repairBlockedMission(h.mission.mission_id);
+
+      assert.ok(h.replacementDispatches() > 0, "verified replayed evidence permits recovery dispatch");
+    } finally {
+      await rm(artifactRoot, { recursive: true, force: true });
+      await first.cleanup();
+      await second.cleanup();
+    }
+  });
+
   it("stops with preserved work and an exact resume condition when a fingerprint is exhausted", async () => {
     const first = await greenFixture();
     const second = await greenFixture();
@@ -1100,6 +1180,11 @@ describe("mission reliability foundation — synthetic MSN-qSLaeM", () => {
     "test-failed",
     "review-findings",
     "review-incomplete",
+    "review-invalid-severity",
+    "review-invalid-status",
+    "review-accepted-blocker",
+    "review-resolved-not-repaired",
+    "review-open-repaired",
   ] as const) {
     it(`returns nonzero for a ${mode} runtime v3 snapshot`, async () => {
       const fake = await fakeInstalledPi();

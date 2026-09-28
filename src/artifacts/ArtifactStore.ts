@@ -1,3 +1,4 @@
+import { createHash, randomUUID } from "node:crypto";
 import { mkdir, open, readFile, readdir, unlink, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type { ArtifactMeta } from "../core/types.ts";
@@ -79,6 +80,37 @@ export class ArtifactStore {
     };
     await writeFile(this.metaPath(category, id), JSON.stringify(meta, null, 2), "utf-8");
     this.index.set(`${category}/${id}`, meta);
+    return meta;
+  }
+
+  /**
+   * Store a uniquely named, content-addressed artifact without an overwrite
+   * path. The owner prefix keeps checkpoint evidence attributable while the
+   * digest and nonce preserve one URI per claim, even for equal content.
+   */
+  async putImmutable(category: string, ownerId: string, content: string, summary: string): Promise<ArtifactMeta> {
+    await mkdir(join(this.root, category), { recursive: true });
+    const owner = ownerId.replace(/[^A-Za-z0-9._-]/g, "-");
+    const digest = createHash("sha256").update(content).digest("hex");
+    const artifactId = `${owner}-${digest}-${randomUUID()}`;
+    const contentPath = this.contentPath(category, artifactId);
+    const metaPath = this.metaPath(category, artifactId);
+    const meta: ArtifactMeta = {
+      id: artifactId,
+      category,
+      uri: this.uri(category, artifactId),
+      size: Buffer.byteLength(content, "utf-8"),
+      created_at: new Date().toISOString(),
+      summary,
+    };
+    await writeFile(contentPath, content, { encoding: "utf-8", flag: "wx" });
+    try {
+      await writeFile(metaPath, JSON.stringify(meta, null, 2), { encoding: "utf-8", flag: "wx" });
+    } catch (error) {
+      await unlink(contentPath).catch(() => {});
+      throw error;
+    }
+    this.index.set(`${category}/${artifactId}`, meta);
     return meta;
   }
 

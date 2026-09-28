@@ -402,7 +402,7 @@ export interface BrokerOptions {
   activityHeartbeatMs?: number;
   checkpoints?: CheckpointManager;
   /** Content authority for artifact-backed checkpoint progress claims. */
-  artifacts?: Pick<ArtifactStore, "readContentByUri">;
+  artifacts?: Pick<ArtifactStore, "readContentByUri" | "putImmutable">;
   /** Maximum cancellation delay while waiting for the backend writer to acknowledge abort. */
   cancellationAckTimeoutMs?: number;
 }
@@ -507,7 +507,7 @@ export class ExecutionBroker {
     this.cancellationAckTimeoutMs = opts.cancellationAckTimeoutMs ?? 5_000;
   }
 
-  private durableRecoveryContext(input: ExecutionRequestInput): CheckpointRecoveryContext | undefined {
+  private async durableRecoveryContext(input: ExecutionRequestInput): Promise<CheckpointRecoveryContext | undefined> {
     const task = this.store.getTask(input.taskId);
     const authority = task?.recovery_authority;
     if (!authority) return undefined;
@@ -591,6 +591,19 @@ export class ExecutionBroker {
       checkpoint.artifactHashes.some((hash) => !/^sha256:[a-f0-9]{64}$/i.test(hash))
     ) {
       throw new Error("checkpoint recovery artifact identities do not match");
+    }
+    for (const [index, ref] of checkpoint.artifactRefs.entries()) {
+      let content: string | undefined;
+      try {
+        content = await this.artifacts?.readContentByUri(ref);
+      } catch {
+        content = undefined;
+      }
+      const expectedHash = checkpoint.artifactHashes[index]!;
+      const actualHash = content === undefined ? null : `sha256:${createHash("sha256").update(content).digest("hex")}`;
+      if (actualHash !== expectedHash) {
+        throw new Error(`checkpoint recovery artifact content mismatch for ${ref}`);
+      }
     }
     return Object.freeze({
       recoveryDecisionId: authority.recoveryDecisionId,
@@ -1946,7 +1959,7 @@ export class ExecutionBroker {
       writeDomains: (rawInput.writeDomains ?? []).map(canonicalizeWriteDomain),
     };
     this.assertReplacementSpec(input);
-    input.recovery = this.durableRecoveryContext(input);
+    input.recovery = await this.durableRecoveryContext(input);
     input.authority?.assertAuthoritative();
     const executionStartedAt = Date.now();
     const executionBudgetMs = input.executionBudgetMs ?? input.timeoutPolicy?.timeoutMs ?? this.defaultTimeoutMs;
@@ -2038,6 +2051,7 @@ export class ExecutionBroker {
           let meaningfulActivity = 0;
           const completedDeliverables = new Set<string>();
           const checkpointClaims = new Map<string, CheckpointProgressClaim>();
+          const capturedCheckpointArtifacts = new Map<string, { refs: string[]; hashes: string[] }>();
           const rejectedCheckpointClaims = new Set<string>();
           let checkpointScheduling = true;
           let retainWorktreeOnCleanup = false;
@@ -2082,9 +2096,12 @@ export class ExecutionBroker {
             const snapshot = await this.checkpointSnapshot(execution.execution_id, input, repository, assertOrigin);
             assertOrigin();
             for (const claim of checkpointClaims.values()) {
-              const claimArtifactHashes: string[] = [];
+              const claimIdentity = `${claim.deliverable}:${claim.candidateSha}:${claim.evidencePaths.join(",")}:${claim.artifactRefs.join(",")}`;
+              let captured = capturedCheckpointArtifacts.get(claimIdentity);
               let artifactsValid = claim.artifactRefs.length === 0;
-              if (claim.artifactRefs.length > 0 && this.artifacts) {
+              if (!captured && claim.artifactRefs.length > 0 && this.artifacts) {
+                const refs: string[] = [];
+                const hashes: string[] = [];
                 artifactsValid = true;
                 for (const ref of claim.artifactRefs) {
                   let content: string | undefined;
@@ -2097,8 +2114,22 @@ export class ExecutionBroker {
                     artifactsValid = false;
                     break;
                   }
-                  claimArtifactHashes.push(`sha256:${createHash("sha256").update(content).digest("hex")}`);
+                  const digest = createHash("sha256").update(content).digest("hex");
+                  const immutable = await this.artifacts.putImmutable(
+                    "checkpoint",
+                    checkpointId,
+                    content,
+                    `Immutable checkpoint evidence captured from ${ref}`,
+                  );
+                  refs.push(immutable.uri);
+                  hashes.push(`sha256:${digest}`);
                 }
+                if (artifactsValid) {
+                  captured = { refs, hashes };
+                  capturedCheckpointArtifacts.set(claimIdentity, captured);
+                }
+              } else if (captured) {
+                artifactsValid = true;
               }
               const valid =
                 input.deliverables?.includes(claim.deliverable) === true &&
@@ -2109,13 +2140,12 @@ export class ExecutionBroker {
                 artifactsValid;
               if (valid) {
                 completedDeliverables.add(claim.deliverable);
-                artifactRefs.push(...claim.artifactRefs);
-                artifactHashes.push(...claimArtifactHashes);
+                artifactRefs.push(...(captured?.refs ?? []));
+                artifactHashes.push(...(captured?.hashes ?? []));
                 continue;
               }
-              const identity = `${claim.deliverable}:${claim.candidateSha}:${claim.evidencePaths.join(",")}:${claim.artifactRefs.join(",")}`;
-              if (!rejectedCheckpointClaims.has(identity)) {
-                rejectedCheckpointClaims.add(identity);
+              if (!rejectedCheckpointClaims.has(claimIdentity)) {
+                rejectedCheckpointClaims.add(claimIdentity);
                 this.store.addFinding({
                   mission_id: input.missionId,
                   task_id: input.taskId,

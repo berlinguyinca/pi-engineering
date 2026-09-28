@@ -70,7 +70,7 @@ async function artifactContentHashes(
     }
     hashes.push(`sha256:${createHash("sha256").update(content).digest("hex")}`);
   }
-  return { hashes: [...new Set(hashes)].sort(), allAccessible };
+  return { hashes, allAccessible };
 }
 
 /**

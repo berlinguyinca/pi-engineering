@@ -566,7 +566,31 @@ describe("ExecutionBroker: recovering a timed-out worker's committed work", () =
         }),
       );
       assert.deepEqual(checkpoint.remainingDeliverables, []);
-      assert.deepEqual(checkpoint.artifactRefs, [validArtifact.uri, secondValidArtifact.uri]);
+      assert.equal(checkpoint.artifactRefs.length, 2);
+      assert.equal(
+        new Set(checkpoint.artifactRefs).size,
+        2,
+        "equal content from distinct claims keeps one URI per claim",
+      );
+      assert.ok(
+        checkpoint.artifactRefs.every((ref) => ref.startsWith("artifact://checkpoint/")),
+        JSON.stringify(checkpoint.artifactRefs),
+      );
+      assert.ok(
+        checkpoint.artifactRefs.every((ref) => ref !== validArtifact.uri && ref !== secondValidArtifact.uri),
+        "checkpoint evidence must not retain mutable worker-owned URIs",
+      );
+      assert.deepEqual(await Promise.all(checkpoint.artifactRefs.map((ref) => artifacts.readContentByUri(ref))), [
+        "verified artifact body",
+        "verified artifact body",
+      ]);
+      await artifacts.put("checkpoint", "implementation", "worker-owned artifact changed", "changed");
+      await artifacts.delete(secondValidArtifact.uri);
+      assert.deepEqual(
+        await Promise.all(checkpoint.artifactRefs.map((ref) => artifacts.readContentByUri(ref))),
+        ["verified artifact body", "verified artifact body"],
+        "worker-owned artifact mutation/deletion cannot alter checkpoint-owned evidence",
+      );
       assert.deepEqual(checkpoint.artifactHashes, [
         `sha256:${createHash("sha256").update("verified artifact body").digest("hex")}`,
         `sha256:${createHash("sha256").update("verified artifact body").digest("hex")}`,
