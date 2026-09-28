@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { lstatSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rm, symlink, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -13,6 +13,18 @@ const exec = promisify(execFile);
 
 function sha256(content: string): string {
   return createHash("sha256").update(content).digest("hex");
+}
+
+async function processIncarnation(): Promise<{ bootId: string; processStartTime: string }> {
+  const bootId = (await readFile("/proc/sys/kernel/random/boot_id", "utf8")).trim();
+  const statLine = await readFile(`/proc/${process.pid}/stat`, "utf8");
+  return {
+    bootId,
+    processStartTime: statLine
+      .slice(statLine.lastIndexOf(")") + 2)
+      .trim()
+      .split(/\s+/)[19]!,
+  };
 }
 
 test("artifacts are stored on disk and read lazily by URI", async () => {
@@ -380,18 +392,22 @@ test("pinned category descriptors prevent deterministic read write delete and ve
       const outside = join(dir, "outside");
       await mkdir(outside);
       const seed = await ArtifactStore.create(root);
-      const artifact = await seed.put("safe", "item", "trusted", "proof");
-      await writeFile(join(outside, "item.txt"), "outside", "utf8");
+      const artifact =
+        operation === "verify"
+          ? await seed.putImmutable("safe", "TCP-race", "trusted", "proof")
+          : await seed.put("safe", "item", "trusted", "proof");
+      await writeFile(join(outside, `${artifact.id}.txt`), "outside", "utf8");
       await writeFile(
-        join(outside, "item.json"),
+        join(outside, `${artifact.id}.json`),
         JSON.stringify({
-          id: "item",
+          id: artifact.id,
           category: "safe",
-          uri: "artifact://safe/item",
+          uri: artifact.uri,
           size: 7,
           sha256: sha256("outside"),
           created_at: "2026-09-27T00:00:00.000Z",
           summary: "outside",
+          ...(operation === "verify" ? { immutable: true } : {}),
         }),
         "utf8",
       );
@@ -412,8 +428,8 @@ test("pinned category descriptors prevent deterministic read write delete and ve
         store.verifyAndDispatch([artifact.uri], [`sha256:${sha256("trusted")}`], () => undefined);
       }
       assert.equal(swapped, true, "the deterministic swap hook must exercise the race window");
-      assert.equal(await readFile(join(outside, "item.txt"), "utf8"), "outside");
-      assert.equal(JSON.parse(await readFile(join(outside, "item.json"), "utf8")).summary, "outside");
+      assert.equal(await readFile(join(outside, `${artifact.id}.txt`), "utf8"), "outside");
+      assert.equal(JSON.parse(await readFile(join(outside, `${artifact.id}.json`), "utf8")).summary, "outside");
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
@@ -430,6 +446,7 @@ test(
       const store = await ArtifactStore.create(root);
       const lockBase = join(root, ".artifact-locks", sha256("logs/shared"));
       const lockPath = `${lockBase}.lock`;
+      const incarnation = await processIncarnation();
       await writeFile(
         lockPath,
         `${JSON.stringify({
@@ -437,6 +454,8 @@ test(
           host: hostname(),
           openedAt: "2026-01-01T00:00:00.000Z",
           ownerToken: "killed-owner",
+          bootId: incarnation.bootId,
+          processStartTime: "1",
         })}\n`,
         "utf8",
       );
@@ -514,6 +533,7 @@ test("simultaneous stale-lock reapers serialize the artifact critical section at
     const root = join(dir, "artifacts");
     await ArtifactStore.create(root);
     const lockPath = join(root, ".artifact-locks", `${sha256("logs/shared")}.lock`);
+    const incarnation = await processIncarnation();
     await writeFile(
       lockPath,
       `${JSON.stringify({
@@ -521,6 +541,8 @@ test("simultaneous stale-lock reapers serialize the artifact critical section at
         host: hostname(),
         openedAt: "2026-01-01T00:00:00.000Z",
         ownerToken: "dead-owner-for-simultaneous-reapers",
+        bootId: incarnation.bootId,
+        processStartTime: "1",
       })}\n`,
       "utf8",
     );
@@ -565,6 +587,78 @@ test("simultaneous stale-lock reapers serialize the artifact critical section at
     }
     assert.equal(active, 0);
     assert.equal(maximum, 1);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("verify-and-dispatch rejects a mutable artifact even when its bytes and digest are valid", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-eng-art-dispatch-mutable-"));
+  try {
+    const store = await ArtifactStore.create(join(dir, "artifacts"));
+    const mutable = await store.put("logs", "mutable", "valid bytes", "mutable");
+    let dispatches = 0;
+    assert.throws(
+      () =>
+        store.verifyAndDispatch([mutable.uri], [`sha256:${sha256("valid bytes")}`], () => {
+          dispatches += 1;
+        }),
+      /artifact integrity.*immutable/i,
+    );
+    assert.equal(dispatches, 0);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("delete recovery is durable across both category-fsync crash phases", async () => {
+  for (const phase of ["afterDeleteFilesSynced", "afterDeleteJournalRemoved"] as const) {
+    const dir = await mkdtemp(join(tmpdir(), `pi-eng-art-delete-crash-${phase}-`));
+    try {
+      const root = join(dir, "artifacts");
+      const seed = await ArtifactStore.create(root);
+      const artifact = await seed.put("logs", "delete-me", "bytes", "delete");
+      const moduleUrl = new URL("../../src/artifacts/ArtifactStore.ts", import.meta.url).href;
+      await assert.rejects(
+        () =>
+          exec(process.execPath, [
+            "--experimental-strip-types",
+            "--input-type=module",
+            "--eval",
+            `import { ArtifactStore } from ${JSON.stringify(moduleUrl)}; const store = await ArtifactStore.create(${JSON.stringify(root)}, { ${phase}: () => process.kill(process.pid, "SIGKILL") }); await store.delete(${JSON.stringify(artifact.uri)});`,
+          ]),
+        /SIGKILL|killed/i,
+      );
+
+      const replayed = await ArtifactStore.create(root);
+      assert.equal(await replayed.readContentByUri(artifact.uri), undefined);
+      assert.equal(replayed.getByUri(artifact.uri), undefined);
+      await assert.rejects(() => readFile(join(root, "logs", "delete-me.txn.json")), /ENOENT/);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+});
+
+test("a pinned lock-directory descriptor prevents a deterministic lock-root swap escape", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-eng-art-lock-dir-race-"));
+  try {
+    const root = join(dir, "artifacts");
+    const outside = join(dir, "outside-locks");
+    await mkdir(outside, { mode: 0o700 });
+    let swapped = false;
+    const store = await ArtifactStore.create(root, {
+      afterLockDirectoryOpened: () => {
+        if (swapped) return;
+        swapped = true;
+        renameSync(join(root, ".artifact-locks"), join(root, ".artifact-locks-pinned"));
+        symlinkSync(outside, join(root, ".artifact-locks"), "dir");
+      },
+    });
+    await store.put("logs", "safe", "bytes", "safe");
+    assert.equal(swapped, true);
+    assert.deepEqual(await readdir(outside), []);
+    assert.equal(await store.readContent("logs", "safe"), "bytes");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

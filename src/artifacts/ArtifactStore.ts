@@ -16,8 +16,14 @@ export interface ArtifactStoreHooks {
   afterCategoryOpened?: (operation: ArtifactOperation, category: string) => void;
   /** Deterministic lock-owner injection point used by integrity tests. */
   afterKeyLockAcquired?: (key: string) => Promise<void> | void;
+  /** Deterministic lock-directory swap injection after its descriptor is pinned. */
+  afterLockDirectoryOpened?: () => void;
   /** Deterministic crash injection after the durable journal is published. */
   afterJournalCommitted?: (key: string) => Promise<void> | void;
+  /** Deterministic delete crash injection after final-file removals are durable. */
+  afterDeleteFilesSynced?: (key: string) => Promise<void> | void;
+  /** Deterministic delete crash injection after journal removal, before its directory fsync. */
+  afterDeleteJournalRemoved?: (key: string) => Promise<void> | void;
 }
 
 const CANONICAL_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
@@ -223,13 +229,33 @@ export class ArtifactStore {
     }
   }
 
+  private async openLockRoot(root: FileHandle): Promise<FileHandle> {
+    const handle = await open(
+      `${procFd(root.fd)}/.artifact-locks`,
+      constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+    );
+    try {
+      assertTrustedDirectory(await handle.stat(), "artifact lock root");
+      if ((await realpath(procFd(handle.fd))) !== resolve(this.rootReal, ".artifact-locks")) {
+        throw integrityError("artifact lock root identity changed");
+      }
+      this.hooks.afterLockDirectoryOpened?.();
+      return handle;
+    } catch (error) {
+      await handle.close();
+      throw error;
+    }
+  }
+
   private async withKeyLock<T>(category: string, id: string, operation: (root: FileHandle) => Promise<T>): Promise<T> {
     const key = this.key(category, id);
     const root = await this.openRoot();
-    const lockTarget = `${procFd(root.fd)}/.artifact-locks/${digest(key)}`;
+    let lockRoot: FileHandle | undefined;
     const deadline = Date.now() + LOCK_WAIT_MS;
     let lock: ExclusiveFileLock | undefined;
     try {
+      lockRoot = await this.openLockRoot(root);
+      const lockTarget = `${procFd(lockRoot.fd)}/${digest(key)}`;
       while (!lock) {
         try {
           lock = await ExclusiveFileLock.acquire(lockTarget);
@@ -244,6 +270,7 @@ export class ArtifactStore {
       return await operation(root);
     } finally {
       lock?.release();
+      await lockRoot?.close();
       await root.close();
     }
   }
@@ -415,8 +442,13 @@ export class ArtifactStore {
       await unlink(this.filePath(opened, id, "json")).catch((error) => {
         if (!isMissing(error)) throw error;
       });
+      await opened.category.sync();
+      await this.hooks.afterDeleteFilesSynced?.(this.key(category, id));
     }
     await unlink(transactionPath);
+    if (transaction.operation === "delete") {
+      await this.hooks.afterDeleteJournalRemoved?.(this.key(category, id));
+    }
     await opened.category.sync();
   }
 
@@ -677,6 +709,10 @@ export class ArtifactStore {
             throw integrityError(`artifact metadata is corrupt for ${category}/${id}`);
           }
           meta = this.validateStoredMeta(parsed, category, id);
+          const embeddedDigest = IMMUTABLE_ID.exec(id)?.[1]?.toLowerCase();
+          if (meta.immutable !== true || !embeddedDigest || embeddedDigest !== meta.sha256) {
+            throw integrityError(`dispatch artifact ${category}/${id} is not immutable or digest-bound`);
+          }
         } finally {
           closeSync(metaFd);
         }

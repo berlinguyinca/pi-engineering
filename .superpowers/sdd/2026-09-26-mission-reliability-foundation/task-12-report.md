@@ -28,6 +28,9 @@ pinned category descriptor with `O_NOFOLLOW`. It validates metadata
 filename/category/URI identity, the immutable marker and embedded digest, the
 stored size/digest binding, and the caller's expected hash before invoking the
 backend callback. Missing or corrupt metadata therefore produces zero dispatch.
+Mutable records are rejected explicitly: dispatch additionally requires
+`immutable: true`, an `IMMUTABLE_ID`, and equality between the digest embedded
+in that ID and the persisted SHA-256.
 Every runner entry point uses this boundary, including agent/research, process,
 review, integration, and validation.
 
@@ -55,10 +58,21 @@ remain covered.
   reads, mutation authority, and synchronous dispatch;
 - publishes a fsynced transaction journal before replacing content/metadata and
   completes an interrupted put/delete on replay, preventing mixed generations;
+- durably deletes content and metadata, fsyncs the category while the recovery
+  journal still exists, then removes the journal and fsyncs the category again;
 - serializes mutation with the tokenized `ExclusiveFileLock`, then rereads
   durable metadata under that lock before put/delete decisions;
-- binds lock release to the acquired token, device, and inode, while the
-  existing recovery-claim protocol serializes stale-owner takeover;
+- pins and validates the `.artifact-locks` directory from the already pinned
+  root, addresses locks through that descriptor, and retains it through
+  owner-conditional release so a directory swap cannot redirect or split the
+  lock domain;
+- binds stale takeover and release to the acquired token, device, and inode.
+  Replacement is quarantined atomically, revalidated, and either removed,
+  restored without replacement, or preserved as a diagnostic instead of
+  deleting an unproven inode;
+- records the Linux boot ID and `/proc/<pid>/stat` start time in each lock owner.
+  PID reuse and boot changes are stale; unavailable or incomplete incarnation
+  evidence fails closed;
 - reconstructs private immutable canonical keys during replay and validates
   replay metadata against its category directory, metadata filename, canonical
   URI, content file, and required immutable marker;
@@ -87,25 +101,35 @@ failed for the three remaining high-severity gaps:
 Fix round 2 added four red groups: metadata corruption still dispatched; stored
 records lacked digests; deterministic category swaps escaped the validation
 window; and the PID-only lock could remove a replacement. A fifth red crash
-test proved no journal recovery existed. After repair, all seventeen artifact
-tests pass, including SIGKILL recovery, simultaneous stale-lock reapers with
-observed maximum concurrency one, and same-token/new-inode replacement safety.
+test proved no journal recovery existed.
+
+Fix round 3 added five red groups: mutable records could reach dispatch; delete
+did not expose or prove both durability barriers; `.artifact-locks` was not
+pinned from the root through release; same-token replacement inodes could be
+removed during stale takeover or release; and PID existence alone treated a
+reused PID as its prior owner. The repaired suites cover both SIGKILL delete
+phases, deterministic lock-directory replacement, same-token/new-inode
+replacement at takeover and release, reused-PID and changed-boot recovery, and
+fail-closed missing incarnation evidence.
 
 ## Verification
 
 Fresh verification on the final working tree:
 
 - `npm run test:mission-reliability` — 37 passed.
-- `node --test test/unit/artifacts.test.ts` — 17 passed twice.
-- focused broker/recovery/platform lock suites — 81 passed.
+- focused ArtifactStore and platform lock suites — 40 passed.
+- focused broker/recovery/artifact/platform lock suites — 137 passed.
 - focused tools/verifier suites — 15 passed.
-- `npm test` — 2,668 passed; 1 optional Postgres test skipped because
+- `npm test` — 2,674 passed; 1 optional Postgres test skipped because
   `TEST_DATABASE_URL` is unset.
+- `node --test test/unit/cav-explore.test.ts` — 3 passed twice after the page
+  exception fixture was made deterministic for either focus or click selection.
 - `npm run build` — core and scripts TypeScript checks passed.
 - `npm run lint` — 592 files checked, no errors.
 - `npm run test:e2e` — package load passed with 21 commands and 7 tools.
 - `git diff --check` — passed.
 
+Fix-round-3 base: `c821026b7780b12086f544f633b9c35afd9ee87c`.
 Fix-round-2 base: `dc0d1adfbf1796434d40b2413553d25426ccf6ad`.
 Fix-round-1 base: `2a7c038997df92c8cafc2e0bb12fa0c567381ee9`.
 Original Task 12 base: `8c8bede63a82250f67d1cdead56938d3fbe67f62`
@@ -120,15 +144,20 @@ The final Lore commit SHA is recorded in the Task 12 prerequisite handoff.
 - Confirm candidate reconciliation and integration preparation may await only
   before the runner-local final verification.
 - Confirm put/delete always acquire the canonical-key token lock before reading
-  durable authority and retain the root descriptor until conditional release.
+  durable authority and retain both the root and `.artifact-locks` descriptors
+  until conditional release.
 - Attack replay with missing immutable markers, metadata
   filename/category/URI disagreement, orphan content, and symlinked category or
   final files; all must fail closed without touching outside files.
 - Confirm the journal is durable before either final file changes, replay
   completes only a digest-valid transaction, and no dispatch occurs while a
-  journal remains incomplete.
+  journal remains incomplete. For delete, confirm the first category fsync
+  precedes journal removal and a second category fsync follows it.
 - Confirm directory ownership/mode checks plus pinned `/proc/self/fd` traversal
   close category-parent swaps without relying on lexical containment.
+- Confirm stale takeover and release never unlink a lock by token alone: the
+  named token/device/inode identity must survive quarantine revalidation, and
+  process liveness must include boot ID plus process start time.
 
 ## Remaining Scope Boundaries
 
