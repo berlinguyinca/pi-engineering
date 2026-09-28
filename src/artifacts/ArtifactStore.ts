@@ -20,6 +20,8 @@ export interface ArtifactStoreHooks {
   afterLockDirectoryOpened?: () => void;
   /** Crash boundaries for the root-authoritative lock-domain bootstrap. */
   afterLockBootstrapPrepared?: () => void;
+  /** Deterministic substitution/crash point after the created inode is durably bound but before it is opened. */
+  afterLockDirectoryCreatedBeforeOpen?: () => void;
   afterLockDirectoryCreated?: () => void;
   afterLockBootstrapBound?: () => void;
   afterLockDomainPublished?: () => void;
@@ -232,10 +234,12 @@ export class ArtifactStore {
 
   private async ensureLockRoot(): Promise<void> {
     const root = await this.openRoot();
+    let stagedHandle: FileHandle | undefined;
     try {
       const path = `${procFd(root.fd)}/.artifact-locks`;
       const existingRecord = await this.readLockDomainRecord(root);
       let bootstrap = await this.readLockBootstrapRecord(root);
+      let createdLockRoot = false;
       if (!existingRecord && !bootstrap) {
         try {
           await lstat(path);
@@ -243,11 +247,35 @@ export class ArtifactStore {
         } catch (error) {
           if (!isMissing(error)) throw error;
         }
-        bootstrap = { version: 1, phase: "prepared", token: randomUUID() };
-        await this.writeLockBootstrapRecord(root, bootstrap);
-        this.hooks.afterLockBootstrapPrepared?.();
+        const token = randomUUID();
+        const stagingPath = `${procFd(root.fd)}/.artifact-locks.stage.${token}`;
+        await mkdir(stagingPath, { mode: 0o700 });
+        stagedHandle = await open(stagingPath, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+        assertTrustedDirectory(await stagedHandle.stat(), "staged artifact lock root");
+        const stagedIdentity = await stagedHandle.stat({ bigint: true });
+        await this.ensureLockDomainToken(stagedHandle, token);
+        const proposed: LockBootstrapRecord = {
+          version: 1,
+          phase: "bound",
+          token,
+          device: stagedIdentity.dev,
+          inode: stagedIdentity.ino,
+        };
+        const claim = await this.claimLockBootstrapRecord(root, proposed);
+        bootstrap = claim.record;
+        if (!claim.claimed) {
+          await stagedHandle.close();
+          stagedHandle = undefined;
+          await rm(stagingPath, { recursive: true, force: true });
+        } else {
+          this.hooks.afterLockBootstrapPrepared?.();
+          this.hooks.afterLockBootstrapBound?.();
+        }
       }
-      let createdLockRoot = false;
+      let createdIdentity: { dev: bigint; ino: bigint } | undefined;
+      // Compatibility recovery for a prepared marker written by an older
+      // release. New bootstraps stage and pin the directory before publishing
+      // a bound marker, so no fresh crash can land in this ambiguous state.
       if (!existingRecord && bootstrap?.phase === "prepared") {
         try {
           await mkdir(path, { mode: 0o700 });
@@ -256,13 +284,63 @@ export class ArtifactStore {
         } catch (error) {
           if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
         }
+        if (createdLockRoot) {
+          createdIdentity = await lstat(path, { bigint: true });
+          bootstrap = {
+            version: 1,
+            phase: "bound",
+            token: bootstrap.token,
+            device: createdIdentity.dev,
+            inode: createdIdentity.ino,
+          };
+          await this.writeLockBootstrapRecord(root, bootstrap);
+          this.hooks.afterLockBootstrapBound?.();
+        } else {
+          bootstrap = await this.waitForBoundLockBootstrap(root, bootstrap.token);
+        }
       }
       let handle: FileHandle;
-      try {
-        handle = await open(path, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
-      } catch (error) {
-        if (existingRecord && isMissing(error)) throw integrityError("artifact lock root identity changed");
-        throw error;
+      if (!existingRecord && bootstrap?.phase === "bound" && !createdLockRoot) {
+        const stagingPath = `${procFd(root.fd)}/.artifact-locks.stage.${bootstrap.token}`;
+        if (!stagedHandle) {
+          try {
+            stagedHandle = await open(stagingPath, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+          } catch (error) {
+            if (!isMissing(error)) throw error;
+          }
+        }
+        if (stagedHandle) {
+          assertTrustedDirectory(await stagedHandle.stat(), "staged artifact lock root");
+          const stagedIdentity = await stagedHandle.stat({ bigint: true });
+          if (stagedIdentity.dev !== bootstrap.device || stagedIdentity.ino !== bootstrap.inode) {
+            throw integrityError("artifact lock root bootstrap identity changed");
+          }
+          if ((await this.readLockDomainToken(stagedHandle)) !== bootstrap.token) {
+            throw integrityError("artifact lock root bootstrap token changed");
+          }
+          try {
+            await lstat(path);
+            throw integrityError("artifact lock root path was substituted during bootstrap");
+          } catch (error) {
+            if (!isMissing(error)) throw error;
+          }
+          await rename(stagingPath, path);
+          await root.sync();
+          createdLockRoot = true;
+          createdIdentity = stagedIdentity;
+          handle = stagedHandle;
+          stagedHandle = undefined;
+          this.hooks.afterLockDirectoryCreatedBeforeOpen?.();
+        } else {
+          handle = await open(path, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+        }
+      } else {
+        try {
+          handle = await open(path, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+        } catch (error) {
+          if (existingRecord && isMissing(error)) throw integrityError("artifact lock root identity changed");
+          throw error;
+        }
       }
       try {
         assertTrustedDirectory(await handle.stat(), "artifact lock root");
@@ -273,28 +351,20 @@ export class ArtifactStore {
         let record = existingRecord;
         if (!record) {
           if (!bootstrap) throw integrityError("artifact lock root bootstrap marker disappeared");
-          // A prepared marker authorizes creating one new domain. It cannot
-          // authorize adopting a directory that appeared after the marker.
-          const token = createdLockRoot
-            ? await this.ensureLockDomainToken(handle, bootstrap.token)
-            : bootstrap.phase === "prepared"
-              ? await this.waitForPreparedLockDomainToken(handle)
-              : await this.readLockDomainToken(handle);
-          if (token !== bootstrap.token) throw integrityError("artifact lock root bootstrap token changed");
-          if (bootstrap.phase === "prepared") {
-            await root.sync();
-            this.hooks.afterLockDirectoryCreated?.();
-            bootstrap = {
-              version: 1,
-              phase: "bound",
-              token,
-              device: identity.dev,
-              inode: identity.ino,
-            };
-            await this.writeLockBootstrapRecord(root, bootstrap);
-            this.hooks.afterLockBootstrapBound?.();
-          } else if (bootstrap.device !== identity.dev || bootstrap.inode !== identity.ino) {
+          if (bootstrap.phase !== "bound") throw integrityError("artifact lock root bootstrap was not bound");
+          if (bootstrap.device !== identity.dev || bootstrap.inode !== identity.ino) {
             throw integrityError("artifact lock root bootstrap identity changed");
+          }
+          if (createdIdentity && (createdIdentity.dev !== identity.dev || createdIdentity.ino !== identity.ino)) {
+            throw integrityError("artifact lock root identity changed after creation");
+          }
+          // The bound marker makes a crash before token creation recoverable:
+          // the descriptor must still be the exact inode recorded before the
+          // token can be created through that descriptor.
+          const token = await this.ensureLockDomainToken(handle, bootstrap.token);
+          if (token !== bootstrap.token) throw integrityError("artifact lock root bootstrap token changed");
+          if (createdLockRoot) {
+            this.hooks.afterLockDirectoryCreated?.();
           }
           record = await this.publishLockDomainRecord(root, {
             version: 1,
@@ -324,6 +394,7 @@ export class ArtifactStore {
         await handle.close();
       }
     } finally {
+      if (stagedHandle) await stagedHandle.close();
       await root.close();
     }
   }
@@ -408,6 +479,66 @@ export class ArtifactStore {
     }
   }
 
+  private async claimLockBootstrapRecord(
+    root: FileHandle,
+    record: LockBootstrapRecord,
+  ): Promise<{ record: LockBootstrapRecord; claimed: boolean }> {
+    const finalPath = `${procFd(root.fd)}/${LOCK_BOOTSTRAP_RECORD}`;
+    const candidate = `${procFd(root.fd)}/.${LOCK_BOOTSTRAP_RECORD}.${process.pid}.${randomUUID()}.claim`;
+    const handle = await open(
+      candidate,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+      0o600,
+    );
+    try {
+      await handle.writeFile(
+        `${JSON.stringify({
+          ...record,
+          ...(record.phase === "bound" ? { device: record.device.toString(), inode: record.inode.toString() } : {}),
+        })}\n`,
+        "utf8",
+      );
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    try {
+      await link(candidate, finalPath);
+      await root.sync();
+      return { record, claimed: true };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      const existing = await this.readLockBootstrapRecord(root);
+      if (!existing) throw integrityError("artifact lock bootstrap marker disappeared during arbitration");
+      return { record: existing, claimed: false };
+    } finally {
+      await rm(candidate, { force: true });
+    }
+  }
+
+  private async waitForBoundLockBootstrap(root: FileHandle, token: string): Promise<LockBootstrapRecord> {
+    const deadline = Date.now() + LOCK_BOOTSTRAP_BIND_WAIT_MS;
+    while (true) {
+      const current = await this.readLockBootstrapRecord(root);
+      const domain = await this.readLockDomainRecord(root);
+      if (domain?.token === token) {
+        return {
+          version: 1,
+          phase: "bound",
+          token: domain.token,
+          device: domain.device,
+          inode: domain.inode,
+        };
+      }
+      if (!current || current.token !== token) {
+        throw integrityError("artifact lock root bootstrap authority changed");
+      }
+      if (current.phase === "bound") return current;
+      if (Date.now() >= deadline) throw integrityError("artifact lock root domain token is missing");
+      await delay(10);
+    }
+  }
+
   private async readLockDomainRecord(root: FileHandle): Promise<LockDomainRecord | undefined> {
     const path = `${procFd(root.fd)}/${LOCK_DOMAIN_RECORD}`;
     let handle: FileHandle;
@@ -488,19 +619,6 @@ export class ArtifactStore {
       return token;
     } finally {
       await handle.close();
-    }
-  }
-
-  private async waitForPreparedLockDomainToken(lockRoot: FileHandle): Promise<string> {
-    const deadline = Date.now() + LOCK_BOOTSTRAP_BIND_WAIT_MS;
-    while (true) {
-      try {
-        return await this.readLockDomainToken(lockRoot);
-      } catch (error) {
-        if (!(error instanceof Error) || !error.message.endsWith("artifact lock domain token is missing")) throw error;
-        if (Date.now() >= deadline) throw error;
-        await delay(10);
-      }
     }
   }
 

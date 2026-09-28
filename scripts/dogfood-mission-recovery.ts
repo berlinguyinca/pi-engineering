@@ -152,21 +152,197 @@ function assertActionableOutcome(mission: MissionSnapshotMission, repository: st
   }
 }
 
-function assertRecoveryDogfood(mission: MissionSnapshotMission, durableEvents: string): void {
+interface DurableEvent {
+  type: string;
+  run_id: string | null;
+  payload: Record<string, unknown>;
+}
+
+interface RecoveryDogfoodProof {
+  checkpointPreserved: true;
+  lateResultRejected: true;
+  recoverySucceeded: true;
+  sameModelReducedReview: true;
+}
+
+function parseDurableEvents(contents: string, path: string): DurableEvent[] {
+  const events: DurableEvent[] = [];
+  for (const [index, line] of contents.split(/\r?\n/).entries()) {
+    if (!line.trim()) continue;
+    let value: unknown;
+    try {
+      value = JSON.parse(line);
+    } catch (error) {
+      throw new Error(`${path} line ${index + 1} is malformed JSON: ${error instanceof Error ? error.message : error}`);
+    }
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      throw new Error(`${path} line ${index + 1} must contain one event object`);
+    }
+    const candidate = value as Record<string, unknown>;
+    if (
+      typeof candidate.type !== "string" ||
+      (candidate.run_id !== null && typeof candidate.run_id !== "string") ||
+      !candidate.payload ||
+      typeof candidate.payload !== "object" ||
+      Array.isArray(candidate.payload)
+    ) {
+      throw new Error(`${path} line ${index + 1} is not a valid stored event`);
+    }
+    events.push({
+      type: candidate.type,
+      run_id: candidate.run_id,
+      payload: candidate.payload as Record<string, unknown>,
+    });
+  }
+  return events;
+}
+
+function eventRecord(event: DurableEvent, field: string): Record<string, unknown> | undefined {
+  const value = event.payload[field];
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
+}
+
+function sameCandidateIdentity(left: Record<string, unknown>, right: Record<string, unknown>): boolean {
+  return (
+    left.workspaceManifestHash === right.workspaceManifestHash &&
+    left.missionGeneration === right.missionGeneration &&
+    left.repoId === right.repoId &&
+    left.baseSha === right.baseSha &&
+    left.candidateSha === right.candidateSha &&
+    left.diffHash === right.diffHash &&
+    JSON.stringify(left.acceptanceIds) === JSON.stringify(right.acceptanceIds) &&
+    JSON.stringify(left.artifactHashes) === JSON.stringify(right.artifactHashes)
+  );
+}
+
+function assertRecoveryDogfood(mission: MissionSnapshotMission, durableEvents: DurableEvent[]): RecoveryDogfoodProof {
   const observability = mission.observability;
   if (!observability) throw new Error(`mission ${mission.id} has no observability recovery proof`);
   if (observability.recoveryAttempt.attempt <= 0 || observability.recovery.length === 0) {
     throw new Error(`mission ${mission.id} did not execute a durable recovery transition`);
   }
-  if (!durableEvents.includes('"type":"task.checkpointed"')) {
-    throw new Error(`mission ${mission.id} did not preserve a durable checkpoint before interruption`);
+  const events = durableEvents.filter((event) => event.run_id === mission.id);
+  const checkpointIndex = events.findIndex((event) => {
+    const checkpoint = eventRecord(event, "checkpoint");
+    return (
+      event.type === "task.checkpointed" &&
+      checkpoint?.missionId === mission.id &&
+      typeof checkpoint.checkpointId === "string" &&
+      typeof checkpoint.executionId === "string" &&
+      typeof checkpoint.taskId === "string" &&
+      typeof checkpoint.repoId === "string" &&
+      typeof checkpoint.baseSha === "string" &&
+      typeof checkpoint.missionGeneration === "number"
+    );
+  });
+  if (checkpointIndex < 0) throw new Error(`mission ${mission.id} has no mission-bound durable checkpoint event`);
+  const checkpoint = eventRecord(events[checkpointIndex]!, "checkpoint")!;
+
+  const lateIndex = events.findIndex((event, index) => {
+    const execution = eventRecord(event, "execution");
+    return (
+      index > checkpointIndex &&
+      event.type === "execution.late_result_rejected" &&
+      execution?.mission_id === mission.id &&
+      execution.execution_id === checkpoint.executionId &&
+      execution.task_id === checkpoint.taskId &&
+      execution.checkpoint_id === checkpoint.checkpointId &&
+      execution.mission_generation === checkpoint.missionGeneration
+    );
+  });
+  if (lateIndex < 0) {
+    throw new Error(`mission ${mission.id} did not reject the superseded checkpoint execution after checkpointing`);
   }
-  if (!durableEvents.includes('"type":"execution.late_result_rejected"')) {
-    throw new Error(`mission ${mission.id} did not reject a stale late worker result`);
+
+  const recoveryStartedIndex = events.findIndex((event, index) => {
+    const decision = eventRecord(event, "decision");
+    return (
+      index > lateIndex &&
+      event.type === "recovery.started" &&
+      decision?.missionId === mission.id &&
+      decision.status === "started" &&
+      typeof decision.recoveryId === "string"
+    );
+  });
+  if (recoveryStartedIndex < 0) throw new Error(`mission ${mission.id} has no ordered recovery start`);
+  const recovery = eventRecord(events[recoveryStartedIndex]!, "decision")!;
+
+  const supersessionIndex = events.findIndex((event, index) => {
+    const supersession = eventRecord(event, "supersession");
+    return (
+      index > recoveryStartedIndex &&
+      event.type === "task.superseded" &&
+      supersession?.missionId === mission.id &&
+      supersession.failedTaskId === checkpoint.taskId &&
+      supersession.recoveryDecisionId === recovery.recoveryId &&
+      Array.isArray(supersession.replacementTaskIds) &&
+      supersession.replacementTaskIds.length > 0
+    );
+  });
+  if (supersessionIndex < 0) throw new Error(`mission ${mission.id} recovery is not bound to a replacement lineage`);
+  const supersession = eventRecord(events[supersessionIndex]!, "supersession")!;
+  const replacementTaskIds = supersession.replacementTaskIds as string[];
+
+  const candidateIndex = events.findIndex((event, index) => {
+    const candidate = eventRecord(event, "candidate");
+    const identity = candidate?.identity;
+    return (
+      index > supersessionIndex &&
+      event.type === "candidate.changed" &&
+      candidate?.missionId === mission.id &&
+      typeof candidate.taskId === "string" &&
+      replacementTaskIds.includes(candidate.taskId) &&
+      identity !== null &&
+      typeof identity === "object" &&
+      !Array.isArray(identity) &&
+      (identity as Record<string, unknown>).missionGeneration === checkpoint.missionGeneration &&
+      (identity as Record<string, unknown>).repoId === checkpoint.repoId &&
+      (identity as Record<string, unknown>).baseSha === checkpoint.baseSha &&
+      typeof (identity as Record<string, unknown>).candidateSha === "string"
+    );
+  });
+  if (candidateIndex < 0) throw new Error(`mission ${mission.id} recovery produced no bound recovered candidate`);
+  const candidate = eventRecord(events[candidateIndex]!, "candidate")!;
+  const candidateIdentity = candidate.identity as Record<string, unknown>;
+
+  const reviewIndex = events.findIndex((event, index) => {
+    const evidence = eventRecord(event, "evidence");
+    const identity = evidence?.identity;
+    return (
+      index > candidateIndex &&
+      event.type === "evidence.review_recorded" &&
+      evidence?.missionId === mission.id &&
+      evidence.model === REQUIRED_MODEL &&
+      evidence.independenceMode === "same_model_reduced" &&
+      evidence.verdict === "approve" &&
+      evidence.outputValid === true &&
+      evidence.accessible === true &&
+      typeof evidence.reviewerSessionId === "string" &&
+      evidence.reviewerSessionId.length > 0 &&
+      identity !== null &&
+      typeof identity === "object" &&
+      !Array.isArray(identity) &&
+      sameCandidateIdentity(identity as Record<string, unknown>, candidateIdentity)
+    );
+  });
+  if (reviewIndex < 0) {
+    throw new Error(
+      `mission ${mission.id} lacks fresh local/local same_model_reduced review for the recovered candidate`,
+    );
   }
-  if (!durableEvents.includes('"independenceMode":"same_model_reduced"')) {
-    throw new Error(`mission ${mission.id} lacks the fresh same-model reduced-independence review warning`);
-  }
+
+  const succeededIndex = events.findIndex((event, index) => {
+    const decision = eventRecord(event, "decision");
+    return (
+      index > reviewIndex &&
+      event.type === "recovery.succeeded" &&
+      decision?.missionId === mission.id &&
+      decision.recoveryId === recovery.recoveryId &&
+      decision.status === "succeeded"
+    );
+  });
+  if (succeededIndex < 0)
+    throw new Error(`mission ${mission.id} recovery lineage did not succeed after recovered review`);
   if (observability.preservedWork.length === 0) {
     throw new Error(`mission ${mission.id} did not retain preserved work through recovery`);
   }
@@ -178,6 +354,12 @@ function assertRecoveryDogfood(mission: MissionSnapshotMission, durableEvents: s
   ) {
     throw new Error(`mission ${mission.id} is nonterminal with zero workers and no next action`);
   }
+  return {
+    checkpointPreserved: true,
+    lateResultRejected: true,
+    recoverySucceeded: true,
+    sameModelReducedReview: true,
+  };
 }
 
 function record(value: unknown, path: string): Record<string, unknown> {
@@ -496,8 +678,8 @@ async function main(): Promise<void> {
   const mission = snapshot.missions.at(-1);
   if (!mission?.id) throw new Error(`Pi produced no durable mission in ${snapshotPath}`);
   const eventPath = join(repository, ".pi-eng", "orchestration.jsonl");
-  const durableEvents = await readFile(eventPath, "utf8");
-  assertRecoveryDogfood(mission, durableEvents);
+  const durableEvents = parseDurableEvents(await readFile(eventPath, "utf8"), eventPath);
+  const recoveryProof = assertRecoveryDogfood(mission, durableEvents);
   assertActionableOutcome(mission, repository);
 
   process.stdout.write(
@@ -520,8 +702,10 @@ async function main(): Promise<void> {
           snapshotPath,
           eventPath,
           recoveryAttempt: mission.observability?.recoveryAttempt ?? null,
-          lateResultRejected: durableEvents.includes('"type":"execution.late_result_rejected"'),
-          sameModelReducedReview: durableEvents.includes('"independenceMode":"same_model_reduced"'),
+          checkpointPreserved: recoveryProof.checkpointPreserved,
+          lateResultRejected: recoveryProof.lateResultRejected,
+          recoverySucceeded: recoveryProof.recoverySucceeded,
+          sameModelReducedReview: recoveryProof.sameModelReducedReview,
           acceptanceCoverage: mission.observability?.acceptanceCoverage ?? null,
           preservedWork: mission.observability?.preservedWork ?? [],
           stop: mission.stop ?? null,

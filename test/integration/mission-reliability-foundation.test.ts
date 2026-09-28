@@ -248,12 +248,25 @@ if (process.env.FAKE_SNAPSHOT_MODE === "top-finding-projection-mismatch") {
   snapshot.missions[0].observability.review.findings = [{ id: "F-projected", severity: "major", status: "open", summary: "projected", repaired: false }];
 }
 await writeFile(join(process.cwd(), ".pi-eng", "orchestration-snapshot.json"), JSON.stringify(snapshot));
-await writeFile(join(process.cwd(), ".pi-eng", "orchestration.jsonl"), [
-  JSON.stringify({ type: "task.checkpointed", payload: { checkpoint: { completedDeliverables: ["decrement helper"], remainingDeliverables: ["test and review"] } } }),
-  JSON.stringify({ type: "execution.late_result_rejected", payload: { reason: "execution fenced after timeout" } }),
-  JSON.stringify({ type: "recovery.started", payload: { attempt: 1, preservedWork: [process.cwd()] } }),
-  JSON.stringify({ type: "evidence.review_recorded", payload: { evidence: { model: "local/local", independenceMode: "same_model_reduced", warning: "fresh same-model session with reduced independence" } } }),
-].join("\\n") + "\\n");
+const eventMode = process.env.FAKE_EVENT_MODE ?? "valid";
+const eventMission = eventMode === "wrong-mission" ? "MSN-unrelated" : "MSN-fake-dogfood";
+const identity = { workspaceManifestHash: "manifest", missionGeneration: 1, repoId: "repo", baseSha: "base", candidateSha: "candidate-recovered", diffHash: "diff", acceptanceIds: ["AC-fake"], artifactHashes: [] };
+const event = (type, payload) => ({ event_id: "EV-" + type, timestamp: new Date().toISOString(), type, project_id: null, run_id: eventMission, worker_id: null, payload });
+let events = [
+  event("task.checkpointed", { checkpoint: { checkpointId: "CHK-original", executionId: "EXE-original", missionId: eventMission, taskId: "TSK-original", repoId: "repo", baseSha: "base", candidateSha: "candidate-checkpoint", completedDeliverables: ["decrement helper"], remainingDeliverables: ["test and review"], missionGeneration: 1, candidateGeneration: 1 } }),
+  event("execution.late_result_rejected", { execution: { execution_id: "EXE-original", task_id: "TSK-original", mission_id: eventMission, checkpoint_id: "CHK-original", mission_generation: 1, candidate_generation: 1, status: "CANCELED" }, reason: "execution fenced after timeout" }),
+  event("recovery.started", { decision: { recoveryId: "RCV-recovery", missionId: eventMission, status: "started" } }),
+  event("task.superseded", { supersession: { supersessionId: "SUP-recovery", missionId: eventMission, failedTaskId: "TSK-original", replacementTaskIds: ["TSK-recovered"], repoId: "repo", acceptanceIds: ["AC-fake"], reason: "resume checkpoint", createdAt: new Date().toISOString(), recoveryDecisionId: "RCV-recovery" } }),
+  event("candidate.changed", { candidate: { missionId: eventMission, taskId: "TSK-recovered", executionId: "EXE-recovered", identity, identityHash: "candidate-identity", reason: "recovered candidate", recordedAt: new Date().toISOString() } }),
+  event("evidence.review_recorded", { evidence: { evidenceId: "REV-recovered", missionId: eventMission, taskId: "TSK-review", executionId: "EXE-review", identity, identityHash: "candidate-identity", reviewerSessionId: "fresh-review", model: "local/local", provider: "local", verdict: "approve", independenceMode: "same_model_reduced", findings: [], outputValid: true, accessible: true, acceptanceResults: [{ acceptanceId: "AC-fake", status: "passed", detail: "reviewed recovered candidate" }], recordedAt: new Date().toISOString() } }),
+  event("recovery.succeeded", { decision: { recoveryId: "RCV-recovery", missionId: eventMission, status: "succeeded" } }),
+];
+if (eventMode === "nested-counterfeit") events = [event("diagnostic.recorded", { message: JSON.stringify(events) })];
+if (eventMode === "out-of-order") [events[0], events[1]] = [events[1], events[0]];
+if (eventMode === "failed-recovery") events[events.length - 1] = event("recovery.failed", { decision: { recoveryId: "RCV-recovery", missionId: eventMission, status: "failed" } });
+if (eventMode === "wrong-recovery") events[events.length - 1] = event("recovery.succeeded", { decision: { recoveryId: "RCV-other", missionId: eventMission, status: "succeeded" } });
+const serializedEvents = events.map((entry) => JSON.stringify(entry)).join("\\n") + "\\n" + (eventMode === "malformed" ? "{not-json\\n" : "");
+await writeFile(join(process.cwd(), ".pi-eng", "orchestration.jsonl"), serializedEvents);
 `,
   );
   await chmod(executable, 0o755);
@@ -1225,6 +1238,44 @@ describe("mission reliability foundation — synthetic MSN-qSLaeM", () => {
       await fake.cleanup();
     }
   });
+
+  for (const eventMode of [
+    "wrong-mission",
+    "nested-counterfeit",
+    "out-of-order",
+    "failed-recovery",
+    "wrong-recovery",
+    "malformed",
+  ] as const) {
+    it(`rejects ${eventMode} dogfood event evidence`, async () => {
+      const fake = await fakeInstalledPi();
+      try {
+        await assert.rejects(
+          () =>
+            exec(
+              process.execPath,
+              ["scripts/dogfood-mission-recovery.ts", "--pi", fake.executable, "--expected-sha", fake.sha],
+              {
+                cwd: process.cwd(),
+                env: {
+                  ...process.env,
+                  FAKE_INSTALLED_PATH: fake.installed,
+                  FAKE_ARGS_LOG: fake.log,
+                  FAKE_EVENT_MODE: eventMode,
+                },
+              },
+            ),
+          (error: unknown) => {
+            const stderr = (error as { stderr?: string }).stderr ?? "";
+            assert.match(stderr, /event|checkpoint|recovery|mission|jsonl|line/i);
+            return true;
+          },
+        );
+      } finally {
+        await fake.cleanup();
+      }
+    });
+  }
 
   it("labels source-only dogfood and disables extension discovery before loading the source extension", async () => {
     const fake = await fakeInstalledPi();

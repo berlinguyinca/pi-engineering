@@ -734,7 +734,44 @@ test("a prepared bootstrap marker cannot authorize a substituted unbound lock di
       /SIGKILL|killed/i,
     );
     await mkdir(join(root, ".artifact-locks"), { mode: 0o700 });
-    await assert.rejects(() => ArtifactStore.create(root), /artifact integrity.*domain token/i);
+    await assert.rejects(
+      () => ArtifactStore.create(root),
+      /artifact integrity.*(?:domain token|path was substituted)/i,
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("the bootstrap binds the directory inode created before its name can be substituted", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-eng-art-lock-bootstrap-inode-"));
+  try {
+    const root = join(dir, "artifacts");
+    let swapped = false;
+    const hooks = {
+      afterLockDirectoryCreatedBeforeOpen: () => {
+        swapped = true;
+        renameSync(join(root, ".artifact-locks"), join(root, ".artifact-locks-created"));
+        mkdirSync(join(root, ".artifact-locks"), { mode: 0o700 });
+      },
+    };
+    await assert.rejects(() => ArtifactStore.create(root, hooks), /artifact integrity.*lock root.*identity/i);
+    assert.equal(swapped, true);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("concurrent first openers converge on one no-clobber bootstrap authority", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-eng-art-lock-bootstrap-race-"));
+  try {
+    const root = join(dir, "artifacts");
+    const stores = await Promise.all(Array.from({ length: 12 }, () => ArtifactStore.create(root)));
+    assert.equal(stores.length, 12);
+
+    const reopened = await ArtifactStore.create(root);
+    await reopened.put("logs", "converged", "one-domain", "converged");
+    assert.equal(await reopened.readContent("logs", "converged"), "one-domain");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -743,6 +780,7 @@ test("a prepared bootstrap marker cannot authorize a substituted unbound lock di
 test("artifact lock bootstrap recovers each durable two-phase crash boundary", async () => {
   for (const phase of [
     "afterLockBootstrapPrepared",
+    "afterLockDirectoryCreatedBeforeOpen",
     "afterLockDirectoryCreated",
     "afterLockBootstrapBound",
     "afterLockDomainPublished",
