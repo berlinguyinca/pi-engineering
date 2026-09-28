@@ -128,6 +128,23 @@ test("models config: a write leaves a restorable backup", () => {
   }
 });
 
+test("models config: writes in the same second allocate distinct backups", () => {
+  const s = scratch();
+  try {
+    writeFileSync(s.path, JSON.stringify(CONFIG), { mode: 0o600 });
+    const now = new Date("2026-09-28T12:00:00Z");
+    const first = writeModelsConfig(s.path, withProviderModels(CONFIG, "metabolomics", [{ id: "first" }]), now);
+    const second = writeModelsConfig(s.path, withProviderModels(CONFIG, "metabolomics", [{ id: "second" }]), now);
+
+    assert.ok(first.backupPath && second.backupPath);
+    assert.notEqual(first.backupPath, second.backupPath);
+    assert.ok(existsSync(first.backupPath));
+    assert.ok(existsSync(second.backupPath));
+  } finally {
+    s.cleanup();
+  }
+});
+
 test("models config: a first write needs no backup", () => {
   const s = scratch();
   try {

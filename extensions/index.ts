@@ -807,43 +807,41 @@ ${RECOVERY_PROMPT}`;
       const dryRun = argv.includes("--dry-run");
       const pruneMissing = argv.includes("--prune");
       const explicitProvider = argv.find((a) => !a.startsWith("--"));
-      const configuredProviders = Object.keys(safeModelsConfig().providers ?? {});
-      const providerIds = explicitProvider
-        ? [explicitProvider]
-        : configuredProviders.length > 0
-          ? configuredProviders
-          : ctx.model?.provider
-            ? [ctx.model.provider]
-            : [];
-      if (providerIds.length === 0) {
-        ctx.ui.notify("No provider to refresh. Select a model first, or pass a provider name.", "warning");
-        return;
-      }
 
       try {
+        // Unlike status-only commands, refresh must surface malformed JSON:
+        // treating it as an empty config could overwrite the operator's file.
+        const configuredProviders = Object.keys(readModelsConfig(defaultModelsPath()).providers ?? {});
+        const providerIds = explicitProvider
+          ? [explicitProvider]
+          : configuredProviders.length > 0
+            ? configuredProviders
+            : ctx.model?.provider
+              ? [ctx.model.provider]
+              : [];
+        if (providerIds.length === 0) {
+          ctx.ui.notify("No provider to refresh. Select a model first, or pass a provider name.", "warning");
+          return;
+        }
+
         const result = await refreshConfiguredProviders({
           modelsPath: defaultModelsPath(),
           providerIds,
           authForProvider: async (providerId) => {
-            const model =
-              (ctx.model?.provider === providerId ? ctx.model : undefined) ??
-              ctx.modelRegistry?.getAll().find((candidate) => candidate.provider === providerId);
-            if (!model) return {};
-            try {
-              const resolved = await ctx.modelRegistry?.getApiKeyAndHeaders(model);
-              if (!resolved?.ok) return {};
-              const headers = Object.fromEntries(
-                Object.entries(resolved.headers ?? {}).filter((entry): entry is [string, string] => entry[1] !== null),
-              );
-              return {
-                ...(resolved.apiKey ? { apiKey: resolved.apiKey } : {}),
-                ...(Object.keys(headers).length > 0 ? { headers } : {}),
-              };
-            } catch {
-              // Fall through unauthenticated; this provider's gateway decides
-              // whether that works without blocking the other providers.
+            if (!ctx.modelRegistry) return {};
+            const status = ctx.modelRegistry.getProviderAuthStatus(providerId);
+            const resolved = await ctx.modelRegistry.getProviderAuth(providerId);
+            if (!resolved) {
+              if (status.configured) {
+                throw new Error(`Authentication for ${providerId} is configured but could not be resolved`);
+              }
               return {};
             }
+            return {
+              ...(resolved.auth.apiKey ? { apiKey: resolved.auth.apiKey } : {}),
+              ...(resolved.auth.headers ? { headers: resolved.auth.headers } : {}),
+              ...(resolved.auth.baseUrl ? { baseUrl: resolved.auth.baseUrl } : {}),
+            };
           },
           ...(dryRun ? { dryRun: true } : {}),
           ...(pruneMissing ? { pruneMissing: true } : {}),

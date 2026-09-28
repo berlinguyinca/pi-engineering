@@ -246,6 +246,24 @@ test("catalog: a fetch sends the key and reads the gateway's list", async () => 
   assert.equal(models.length, 5);
 });
 
+test("catalog: a null Authorization header suppresses the default bearer credential", async () => {
+  let seenHeaders: Record<string, string> = {};
+  await fetchGatewayModels({
+    baseUrl: "https://llm.metabolomics.us/v1",
+    apiKey: "must-not-leak",
+    headers: { Authorization: null },
+    fetchImpl: (async (_url: string, init: RequestInit) => {
+      seenHeaders = init.headers as Record<string, string>;
+      return { ok: true, status: 200, json: async () => LIVE_PAYLOAD };
+    }) as unknown as typeof fetch,
+  });
+
+  assert.equal(
+    Object.keys(seenHeaders).some((name) => name.toLowerCase() === "authorization"),
+    false,
+  );
+});
+
 test("catalog: an HTTP failure is reported with its status, not swallowed", async () => {
   await assert.rejects(
     () =>

@@ -16,6 +16,7 @@
  */
 
 import {
+  constants,
   chmodSync,
   copyFileSync,
   existsSync,
@@ -97,6 +98,20 @@ function stamp(now: Date): string {
   return now.toISOString().replace(/[-:]/g, "").replace(/\..+$/, "").replace("T", "-");
 }
 
+function createBackup(path: string, mode: number, now: Date): string {
+  const prefix = `${path}.bak-${stamp(now)}`;
+  for (let suffix = 0; ; suffix++) {
+    const candidate = suffix === 0 ? prefix : `${prefix}-${suffix}`;
+    try {
+      copyFileSync(path, candidate, constants.COPYFILE_EXCL);
+      chmodSync(candidate, mode);
+      return candidate;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    }
+  }
+}
+
 /**
  * Write the config atomically, preserving its mode and leaving a backup.
  *
@@ -110,9 +125,7 @@ export function writeModelsConfig(path: string, config: ModelsConfig, now: Date 
   const result: WriteResult = {};
 
   if (existed) {
-    const backupPath = `${path}.bak-${stamp(now)}`;
-    copyFileSync(path, backupPath);
-    chmodSync(backupPath, mode);
+    const backupPath = createBackup(path, mode, now);
     result.backupPath = backupPath;
   }
 

@@ -292,7 +292,7 @@ test("refresh: one unavailable host does not block healthy configured providers"
   }
 });
 
-test("refresh: multiple successful providers keep distinct restorable backups", async () => {
+test("refresh: multiple successful providers share one restorable batch backup", async () => {
   const original = {
     providers: {
       first: { baseUrl: "https://first.example/v1", models: [{ id: "old-first", contextWindow: 8_192 }] },
@@ -311,9 +311,12 @@ test("refresh: multiple successful providers keep distinct restorable backups", 
       }) as typeof fetch,
     });
 
-    const backups = result.results.map(({ result: entry }) => entry.backupPath);
-    assert.equal(new Set(backups).size, 2, "each write needs its own recovery point");
-    assert.deepEqual(JSON.parse(readFileSync(backups[0]!, "utf8")), original);
+    assert.ok(result.backupPath);
+    assert.deepEqual(JSON.parse(readFileSync(result.backupPath, "utf8")), original);
+    assert.equal(
+      result.results.every(({ result: entry }) => entry.backupPath === result.backupPath),
+      true,
+    );
   } finally {
     s.cleanup();
   }

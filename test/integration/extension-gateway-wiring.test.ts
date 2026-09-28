@@ -289,11 +289,8 @@ test("wiring: /refresh-models refreshes healthy providers when the selected host
       ...ctx,
       model: { provider: "local", id: "local", api: "openai-completions" },
       modelRegistry: {
-        getAll: () => [
-          { provider: "local", id: "local" },
-          { provider: "remote", id: "old" },
-        ],
-        getApiKeyAndHeaders: async () => ({ ok: true }),
+        getProviderAuthStatus: () => ({ configured: false }),
+        getProviderAuth: async () => undefined,
       },
     });
 
@@ -325,6 +322,81 @@ test("wiring: a failing /refresh-models reports that nothing was changed", async
   assert.equal(notices.length, 1);
   assert.equal(notices[0]?.level, "error");
   assert.match(notices[0]?.text ?? "", /was not changed/);
+});
+
+test("wiring: provider auth failure cannot fall through to an anonymous catalog write", async () => {
+  const commands = loadWithCommands();
+  const cmd = commands.get("refresh-models");
+  assert.ok(cmd);
+
+  const dir = mkdtempSync(join(tmpdir(), "refresh-auth-"));
+  const modelsPath = join(dir, "models.json");
+  const previousAgentDir = process.env.PI_AGENT_DIR;
+  const previousFetch = globalThis.fetch;
+  const before = JSON.stringify({
+    providers: {
+      secured: {
+        baseUrl: "https://secured.example/v1",
+        models: [{ id: "old", contextWindow: 8_192 }],
+      },
+    },
+  });
+  writeFileSync(modelsPath, before, { mode: 0o600 });
+  process.env.PI_AGENT_DIR = dir;
+  globalThis.fetch = (async () => ({
+    ok: true,
+    status: 200,
+    json: async () => ({ data: [{ id: "anonymous", ctx_per_request: 262_144 }] }),
+  })) as unknown as typeof fetch;
+
+  const { ctx, notices } = notifyingCtx();
+  try {
+    await cmd.handler("secured", {
+      ...ctx,
+      model: { provider: "secured", id: "old", api: "openai-completions" },
+      modelRegistry: {
+        getProviderAuthStatus: () => ({ configured: true, source: "stored" }),
+        getProviderAuth: async () => {
+          throw new Error("credential store unavailable");
+        },
+      },
+    });
+
+    assert.equal(notices[0]?.level, "error");
+    assert.match(notices[0]?.text ?? "", /credential store unavailable/);
+    assert.equal(readFileSync(modelsPath, "utf8"), before);
+  } finally {
+    globalThis.fetch = previousFetch;
+    if (previousAgentDir === undefined) delete process.env.PI_AGENT_DIR;
+    else process.env.PI_AGENT_DIR = previousAgentDir;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("wiring: malformed models.json is reported instead of disguised as no provider", async () => {
+  const commands = loadWithCommands();
+  const cmd = commands.get("refresh-models");
+  assert.ok(cmd);
+
+  const dir = mkdtempSync(join(tmpdir(), "refresh-malformed-"));
+  const modelsPath = join(dir, "models.json");
+  const previousAgentDir = process.env.PI_AGENT_DIR;
+  writeFileSync(modelsPath, "{not json", { mode: 0o600 });
+  process.env.PI_AGENT_DIR = dir;
+
+  const { ctx, notices } = notifyingCtx();
+  try {
+    await cmd.handler("", ctx);
+
+    assert.equal(notices[0]?.level, "error");
+    assert.match(notices[0]?.text ?? "", /refresh-models failed:/);
+    assert.match(notices[0]?.text ?? "", /configuration was not changed/i);
+    assert.equal(readFileSync(modelsPath, "utf8"), "{not json");
+  } finally {
+    if (previousAgentDir === undefined) delete process.env.PI_AGENT_DIR;
+    else process.env.PI_AGENT_DIR = previousAgentDir;
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("wiring: /update is registered and reports without mutating anything", async () => {
