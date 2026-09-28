@@ -20,6 +20,7 @@ import { BlackholeManager } from "../src/blackhole/BlackholeManager.ts";
 import { blackholeTelemetry, formatBlackholeTelemetry } from "../src/blackhole/telemetry.ts";
 import { Ledger } from "../src/ledger/Ledger.ts";
 import { defaultCliPaths, runRoadmapCheck, runRoadmapStatus } from "../src/roadmap/cli.ts";
+import { runSessionsCommand } from "../src/sessionControl/cli.ts";
 
 const REPO_ROOT = resolve(import.meta.dirname, "..");
 
@@ -27,6 +28,7 @@ async function main(): Promise<number> {
   const args = process.argv.slice(2);
   const cmd = args[0];
   const rest = args.slice(1);
+  if (cmd === "sessions") return runSessionsCommand(rest);
   if (cmd === "blackhole") {
     const sub = rest.find((a) => !a.startsWith("--"));
     return blackholeCommand(sub ?? "status", rest);

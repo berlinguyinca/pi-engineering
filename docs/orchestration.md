@@ -185,3 +185,29 @@ reconstructable/auditable from events (not stored only in semantic memory).
 ```
 
 Or use the `mission` semantic tool from any normal-language request.
+
+## Cross-session status
+
+An active PI session now owns a private Unix socket and descriptor under
+`$XDG_RUNTIME_DIR/pi-engineering` (or a mode-0700 per-user directory under the
+system temporary directory). Use the package CLI from another terminal or agent:
+
+```bash
+pi-engineering sessions list --json
+pi-engineering sessions ping <instance-id> --json
+pi-engineering sessions status <instance-id> --json
+pi-engineering sessions note <instance-id> "Please report progress"
+pi-engineering sessions watch --repo=/path/to/repository
+```
+
+`ping` is a fresh reply from the target process. `status` adds bounded mission
+state from that repository's snapshot; process heartbeat and mission progress
+have separate timestamps. `note` shows an informational UI notification and
+does not inject text into the model or steer an in-flight tool. Instance IDs
+are unique to a process, even when two processes resume the same PI session.
+`list` queries at most eight instances at once; an unreachable descriptor is
+reported rather than silently selecting another process. Existing PI
+processes acquire this channel after restarting with the updated extension.
+
+The protocol and trust boundary are defined in
+[`docs/specs/session-control.md`](specs/session-control.md).
