@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
-import { readFileSync, rmSync as removeSync } from "node:fs";
-import { link, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { constants, closeSync, fstatSync, lstatSync, openSync, readFileSync, rmSync as removeSync } from "node:fs";
+import { link, lstat, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { hostname } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -119,11 +119,15 @@ export interface FileLockRecoveryHooks {
 export class ExclusiveFileLock {
   readonly owner: FileLockOwner;
   readonly path: string;
+  private readonly device: bigint;
+  private readonly inode: bigint;
   private released = false;
 
-  private constructor(path: string, owner: FileLockOwner) {
+  private constructor(path: string, owner: FileLockOwner, device: bigint, inode: bigint) {
     this.path = path;
     this.owner = owner;
+    this.device = device;
+    this.inode = inode;
   }
 
   static async acquire(file: string, hooks: FileLockRecoveryHooks = {}): Promise<ExclusiveFileLock> {
@@ -139,7 +143,8 @@ export class ExclusiveFileLock {
     for (;;) {
       try {
         await writeFile(path, `${JSON.stringify(owner)}\n`, { encoding: "utf8", flag: "wx" });
-        return new ExclusiveFileLock(path, owner);
+        const identity = await lstat(path, { bigint: true });
+        return new ExclusiveFileLock(path, owner, identity.dev, identity.ino);
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
         const current = await readOwner(path);
@@ -216,14 +221,23 @@ export class ExclusiveFileLock {
   /** Release only this owner's lock. Safe to call repeatedly. */
   release(): void {
     if (this.released) return;
-    let current: Partial<FileLockOwner> | undefined;
+    let fd: number | undefined;
     try {
-      current = JSON.parse(readFileSync(this.path, "utf8")) as Partial<FileLockOwner>;
+      fd = openSync(this.path, constants.O_RDONLY | constants.O_NOFOLLOW);
+      const identity = fstatSync(fd, { bigint: true });
+      if (identity.dev !== this.device || identity.ino !== this.inode) return;
+      const current = JSON.parse(readFileSync(fd, "utf8")) as Partial<FileLockOwner>;
+      if (current.ownerToken !== this.owner.ownerToken) return;
+      // Revalidate the fixed name immediately before removal. A replacement
+      // may copy the token, but it cannot copy the acquired inode identity.
+      const named = lstatSync(this.path, { bigint: true });
+      if (named.dev !== this.device || named.ino !== this.inode) return;
+      removeSync(this.path, { recursive: true, force: true });
+      this.released = true;
     } catch {
       return;
+    } finally {
+      if (fd !== undefined) closeSync(fd);
     }
-    if (current.ownerToken !== this.owner.ownerToken) return;
-    removeSync(this.path, { recursive: true, force: true });
-    this.released = true;
   }
 }

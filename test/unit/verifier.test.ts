@@ -93,7 +93,7 @@ test("verifier records passing evidence lazily (AC-010)", async () => {
     "package.json": JSON.stringify({ scripts: { test: 'node -e "process.exit(0)"' } }),
   });
   try {
-    const store = await ArtifactStore.create(join(dir, "..", "artifacts"));
+    const store = await ArtifactStore.create(join(dir, "artifacts"));
     const v = new CommandVerifier();
     const profile = await v.detect(dir);
     const outcome = await v.run(dir, profile, store);
@@ -128,7 +128,7 @@ test("verifier runs quoted test args instead of silently passing (regression)", 
     "fail.test.js": 'import { test } from "node:test";\ntest("boom", () => { throw new Error("x"); });\n',
   });
   try {
-    const store = await ArtifactStore.create(join(dir, "..", "artifacts"));
+    const store = await ArtifactStore.create(join(dir, "artifacts"));
     const v = new CommandVerifier();
     const profile = await v.detect(dir);
     const outcome = await v.run(dir, profile, store);
@@ -150,7 +150,7 @@ test("scriptless repo without a JS entry is reported as noTargets, not a doomed 
     "package.json": JSON.stringify({}),
   });
   try {
-    const store = await ArtifactStore.create(join(dir, "..", "artifacts"));
+    const store = await ArtifactStore.create(join(dir, "artifacts"));
     const v = new CommandVerifier();
     const profile = await v.detect(dir);
     assert.equal(profile.stages.length, 0, "no doomed node --check stage for a scriptless repo");
@@ -169,7 +169,7 @@ test("scriptless repo with a real index.js runs the node-syntax stage (FINDING-2
     "index.js": "export const x = 1;\n",
   });
   try {
-    const store = await ArtifactStore.create(join(dir, "..", "artifacts"));
+    const store = await ArtifactStore.create(join(dir, "artifacts"));
     const v = new CommandVerifier();
     const profile = await v.detect(dir);
     assert.equal(profile.stages.length, 1, "syntax stage emitted when a real entry exists");
@@ -188,7 +188,7 @@ test("scriptless repo resolves entry from package.json main (FINDING-2CcenM)", a
     "lib/main.js": "export const y = 2;\n",
   });
   try {
-    const store = await ArtifactStore.create(join(dir, "..", "artifacts"));
+    const store = await ArtifactStore.create(join(dir, "artifacts"));
     const v = new CommandVerifier();
     const profile = await v.detect(dir);
     assert.equal(profile.stages.length, 1);
@@ -216,7 +216,7 @@ test("verifier resolves bare local binaries from node_modules/.bin (regression: 
   await writeFile(binPath, "#!/bin/sh\necho hello-from-local-bin\n");
   await chmod(binPath, 0o755);
   try {
-    const store = await ArtifactStore.create(join(dir, "..", "artifacts"));
+    const store = await ArtifactStore.create(join(dir, "artifacts"));
     const v = new CommandVerifier();
     const profile = await v.detect(dir);
     const stage = profile.stages.find((s) => s.name === "test");
@@ -234,7 +234,7 @@ test("verifier fails a candidate whose required test fails (AC-005)", async () =
     "package.json": JSON.stringify({ scripts: { test: "node -e process.exit(1)" } }),
   });
   try {
-    const store = await ArtifactStore.create(join(dir, "..", "artifacts"));
+    const store = await ArtifactStore.create(join(dir, "artifacts"));
     const v = new CommandVerifier();
     const profile = await v.detect(dir);
     const outcome = await v.run(dir, profile, store);
@@ -250,7 +250,7 @@ test("verifier aborts an active command promptly", async () => {
     "package.json": JSON.stringify({}),
   });
   try {
-    const store = await ArtifactStore.create(join(dir, "..", "artifacts"));
+    const store = await ArtifactStore.create(join(dir, "artifacts"));
     const verifier = new CommandVerifier();
     const controller = new AbortController();
     const profile = {

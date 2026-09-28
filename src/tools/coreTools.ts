@@ -183,9 +183,16 @@ export function buildCoreTools(
         return { content: [{ type: "text", text: "Artifact not found." }], details: { found: false }, isError: true };
       const offset = params.offset ? Math.max(0, Number(params.offset)) : 0;
       const cap = params.max_chars ? Math.max(1, Number(params.max_chars)) : 12000;
-      // Read only the requested byte range from disk (true lazy retrieval for
-      // large outputs) rather than loading the whole file and slicing in memory.
-      const read = await services.artifacts.readSliceByUri(String(params.uri), offset, cap);
+      let read;
+      try {
+        read = await services.artifacts.readSliceByUri(String(params.uri), offset, cap);
+      } catch (error) {
+        return {
+          content: [{ type: "text", text: `Artifact integrity failure: ${String(error)}` }],
+          details: { found: false },
+          isError: true,
+        };
+      }
       // A missing content file must surface as an error, not a silent empty
       // result (a reviewer would otherwise judge an empty diff and could
       // report no findings, enabling silent promotion).
