@@ -285,6 +285,24 @@ export class MissionSupervisor {
 
   private diagnose(mission: Mission): Diagnosis | null {
     const now = this.now();
+    // A mission paused in PLANNING with a current, deadline-bounded autonomous
+    // spec-approval stage is healthy: the controller is doing bounded spec work,
+    // so it must NOT be diagnosed as an orphaned taskless PLANNING mission.
+    if (mission.status === "PLANNING") {
+      const specStages = this.store.listSpecStages(mission.mission_id);
+      const latestStage = specStages.at(-1);
+      if (latestStage && latestStage.outcome === "running") {
+        const deadline = Date.parse(latestStage.deadlineAt);
+        if (Number.isFinite(deadline)) {
+          if (now < deadline) return null;
+          return {
+            health: "ORPHANED",
+            category: "ORPHANED_EXECUTION",
+            reason: `Autonomous spec stage ${latestStage.stage} deadline expired at ${latestStage.deadlineAt}`,
+          };
+        }
+      }
+    }
     const lease = this.store.getMissionLease(mission.mission_id);
     if (lease && now >= Date.parse(lease.renewBy)) {
       return {

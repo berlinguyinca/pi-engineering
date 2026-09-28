@@ -64,6 +64,14 @@ import {
   validateWorkset,
 } from "./workset.ts";
 import { WorkspaceManifestResolver, WorkspaceScopeError, createWorkspaceManifest } from "./workspaceManifest.ts";
+import type {
+  ProtectedUserCriteria,
+  SpecControllerResult,
+  SpecScopeEnvelope,
+} from "./specApproval.ts";
+
+/** Effective autonomous-spec-approval policy version bound into every approval. */
+const SPEC_APPROVAL_POLICY_VERSION = "spec-approval-policy-v1";
 
 /** A task planned by the planner; the orchestrator fills lifecycle fields. */
 export type PlanTaskInput = Omit<
@@ -147,6 +155,19 @@ export interface OrchestratorOptions {
   ownership?: MissionOwnership;
   /** Bounds planner work before the first executable dispatch. */
   worksetPolicy?: Partial<WorksetPolicy>;
+  /**
+   * Autonomous spec approval hook (design 2026-09-28). When provided and the
+   * routed workflow is a material mutation, the orchestrator runs the durable
+   * spec controller to review + approve the exact plan and materializes tasks
+   * ONLY from the current approval before dispatch. Defaults to off so the
+   * existing fast path is preserved for non-material workflows and legacy runs.
+   */
+  specApproval?: (input: {
+    missionId: string;
+    protectedInputs: ProtectedUserCriteria;
+    acceptanceIds: string[];
+    envelope: SpecScopeEnvelope;
+  }) => Promise<SpecControllerResult>;
   /** Durable mission-wide recovery budget shared by retries and blocked repair. */
   recovery?: RecoveryPlannerOptions;
 }
@@ -194,6 +215,7 @@ export class Orchestrator {
   private readonly recoveryTaskGenerations = new Map<string, number>();
   private readonly missionRepoIds = new Map<string, string>();
   private readonly worksetPolicy: WorksetPolicy;
+  private readonly specApproval?: OrchestratorOptions["specApproval"];
   private readonly recoveryPlanner: RecoveryPlanner;
   private readonly failureClassifier = new FailureClassifier();
   private readonly blockedRepairFlights = new Map<string, Promise<Mission>>();
@@ -205,6 +227,7 @@ export class Orchestrator {
     this.limits = opts.limits ?? {};
     this.maxRepairRounds = opts.maxRepairRounds ?? 2;
     this.worksetPolicy = { ...DEFAULT_WORKSET_POLICY, ...opts.worksetPolicy };
+    this.specApproval = opts.specApproval;
     this.recoveryPlanner = new RecoveryPlanner(opts.recovery);
     const checkpoints = new CheckpointManager({ store: this.store });
     this.broker = new ExecutionBroker({
@@ -1369,6 +1392,72 @@ export class Orchestrator {
         };
       }
 
+      // ── Autonomous spec approval ──────────────────────────────────────────
+      // Material mutations must pass a reviewed, approved, exact-revision contract
+      // before any implementation task is created. When configured, the durable
+      // controller reviews/refines/approves and materializes the approved task set
+      // idempotently from the current approval; the downstream planner loop is
+      // skipped so no task is created without a current approval.
+      let specApprovalMaterialized = false;
+      if (this.specApproval && workflowMutatesRepo(intent.suggested_workflow)) {
+        const manifest = this.store.getWorkspaceManifest(mission.mission_id);
+        if (!manifest || manifest.repositories.length === 0) {
+          this.store.transitionMission(mission.mission_id, "BLOCKED");
+          const blocked = this.store.getMission(mission.mission_id)!;
+          return {
+            mission: blocked,
+            intent,
+            verdict: this.gate.evaluate(blocked),
+            completed: false,
+            failureReason:
+              "SPEC_APPROVAL_UNAVAILABLE: autonomous spec approval requires an authorized repository-bound workspace manifest",
+          };
+        }
+        const plannedMission = this.store.getMission(mission.mission_id)!;
+        const repository = manifest.repositories[0]!;
+        const protectedInputs: ProtectedUserCriteria = {
+          userRequest: mission.user_request,
+          constraints: [...mission.constraints],
+          acceptance: plannedMission.acceptance_criteria.flatMap((criterion) =>
+            criterion.acceptance_id ? [{ id: criterion.acceptance_id, text: criterion.criterion }] : [],
+          ),
+          requiredGates: [...plannedMission.required_gates],
+          workspace: {
+            manifestHash: manifest.hash,
+            manifestGeneration: manifest.generation,
+            repositoryId: repository.repoId,
+            repositoryRoot: repository.canonicalRoot,
+            baseSha: repository.baseSha,
+          },
+          policyVersion: SPEC_APPROVAL_POLICY_VERSION,
+        };
+        const envelope: SpecScopeEnvelope = {
+          repositoryId: repository.repoId,
+          repositoryRoot: repository.canonicalRoot,
+          writableDomains: repository.writableDomains,
+          baseSha: repository.baseSha,
+        };
+        const specResult = await this.specApproval({
+          missionId: mission.mission_id,
+          protectedInputs,
+          acceptanceIds: protectedInputs.acceptance.map((entry) => entry.id),
+          envelope,
+        });
+        if (!specResult.approved || !specResult.approval) {
+          this.store.transitionMission(mission.mission_id, "BLOCKED");
+          const blocked = this.store.getMission(mission.mission_id)!;
+          return {
+            mission: blocked,
+            intent,
+            verdict: this.gate.evaluate(blocked),
+            completed: false,
+            failureReason: specResult.state.stopReason ?? "SPEC_APPROVAL_STOPPED",
+          };
+        }
+        specApprovalMaterialized = true;
+      }
+
+      if (!specApprovalMaterialized) {
       // Plan/decompose into tasks.
       const planned = await this.planner(this.store.getMission(mission.mission_id)!, risk);
       const plannedMission = this.store.getMission(mission.mission_id)!;
@@ -1493,6 +1582,7 @@ export class Orchestrator {
           mission_id: mission.mission_id,
           ...t,
         });
+      }
       }
       this.store.transitionMission(mission.mission_id, "READY");
 

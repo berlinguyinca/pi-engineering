@@ -85,6 +85,24 @@ export interface MissionObservabilitySnapshot {
   preservedWork: string[];
 }
 
+/** Additive autonomous-spec-approval projection (design 2026-09-28). */
+export interface MissionSpecApprovalSnapshot {
+  phase: string;
+  revisionNumber: number;
+  semanticSpecHash: string | null;
+  planHash: string | null;
+  semanticRoundsUsed: number;
+  semanticRoundsLimit: number;
+  activeStage: string | null;
+  activeStageDeadlineAt: string | null;
+  overallDeadlineAt: string | null;
+  approvalId: string | null;
+  invalidatedApprovalId: string | null;
+  warning: string | null;
+  stopReason: string | null;
+  resumeCondition: string | null;
+}
+
 export interface MissionSnapshotMission {
   id: string;
   /** Replay-stable authoritative mission event ordinal. */
@@ -103,6 +121,8 @@ export interface MissionSnapshotMission {
   stop?: Pick<MissionStop, "reason" | "attemptedRecoveries" | "preservedWork" | "resumeCondition" | "stoppedAt">;
   /** Additive v2 — absent for legacy publishers / pre-observability missions. */
   observability?: MissionObservabilitySnapshot;
+  /** Additive autonomous-spec-approval projection; absent when no spec work exists. */
+  specApproval?: MissionSpecApprovalSnapshot;
 }
 
 export interface MissionSnapshotTask {
@@ -193,12 +213,30 @@ function toObservabilitySnapshot(projection: MissionProjection): MissionObservab
   };
 }
 
+export interface MissionSpecInput {
+  phase: string;
+  revisionNumber: number;
+  semanticSpecHash: string | null;
+  planHash: string | null;
+  semanticRoundsUsed: number;
+  semanticRoundsLimit: number;
+  activeStage: string | null;
+  activeStageDeadlineAt: string | null;
+  overallDeadlineAt: string | null;
+  approvalId: string | null;
+  invalidatedApprovalId: string | null;
+  warning: string | null;
+  stopReason: string | null;
+  resumeCondition: string | null;
+}
+
 export function buildMissionSnapshot(
   mission: Mission,
   tasks: OrchestrationTask[],
   findings: ReviewFinding[],
   observability?: MissionProjection | null,
   stop?: MissionStop | null,
+  spec?: MissionSpecInput | null,
 ): MissionSnapshotMission {
   return {
     id: mission.mission_id,
@@ -249,6 +287,26 @@ export function buildMissionSnapshot(
       repaired: f.status === "resolved",
     })),
     ...(observability ? { observability: toObservabilitySnapshot(observability) } : {}),
+    ...(spec
+      ? {
+          specApproval: {
+            phase: spec.phase,
+            revisionNumber: spec.revisionNumber,
+            semanticSpecHash: spec.semanticSpecHash,
+            planHash: spec.planHash,
+            semanticRoundsUsed: spec.semanticRoundsUsed,
+            semanticRoundsLimit: spec.semanticRoundsLimit,
+            activeStage: spec.activeStage,
+            activeStageDeadlineAt: spec.activeStageDeadlineAt,
+            overallDeadlineAt: spec.overallDeadlineAt,
+            approvalId: spec.approvalId,
+            invalidatedApprovalId: spec.invalidatedApprovalId,
+            warning: spec.warning,
+            stopReason: spec.stopReason,
+            resumeCondition: spec.resumeCondition,
+          },
+        }
+      : {}),
     ...(stop
       ? {
           stop: {
@@ -270,11 +328,12 @@ export function buildMissionSnapshotFile(
     findings: ReviewFinding[];
     observability?: MissionProjection | null;
     stop?: MissionStop | null;
+    spec?: MissionSpecInput | null;
   }>,
 ): MissionSnapshotFile {
   return {
     contractVersion: MISSION_SNAPSHOT_CONTRACT_VERSION,
     generatedAt: new Date().toISOString(),
-    missions: missions.map((m) => buildMissionSnapshot(m.mission, m.tasks, m.findings, m.observability, m.stop)),
+    missions: missions.map((m) => buildMissionSnapshot(m.mission, m.tasks, m.findings, m.observability, m.stop, m.spec)),
   };
 }

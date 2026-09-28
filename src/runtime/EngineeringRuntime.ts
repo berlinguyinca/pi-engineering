@@ -473,6 +473,7 @@ export class EngineeringRuntime {
             findings: this.missionStore!.listFindings(m.mission_id),
             observability: this.missionObservability?.projection(m.mission_id) ?? null,
             stop: this.currentMissionStop(m.mission_id),
+            spec: this.buildSpecApprovalSnapshot(m.mission_id),
           }));
           latest = buildMissionSnapshotFile(missions);
           const path = join(this.workDir, MISSION_SNAPSHOT_FILENAME);
@@ -513,6 +514,34 @@ export class EngineeringRuntime {
         .filter((stop) => stop.resumptionGeneration === generation)
         .at(-1) ?? null
     );
+  }
+
+  /** Project the durable autonomous-spec-approval state into the mission snapshot. */
+  private buildSpecApprovalSnapshot(missionId: string): import("../orchestration/missionSnapshot.ts").MissionSpecInput | null {
+    const store = this.missionStore;
+    if (!store) return null;
+    const approval = store.getSpecApproval(missionId);
+    const revision = store.getSpecRevision(missionId);
+    const invalidation = store.getSpecInvalidation(missionId);
+    const stages = store.listSpecStages(missionId);
+    if (!approval && !revision && stages.length === 0) return null;
+    const latestStage = stages.at(-1) ?? null;
+    return {
+      phase: approval ? "materialize" : latestStage ? latestStage.stage : "idle",
+      revisionNumber: revision?.revisionNumber ?? 0,
+      semanticSpecHash: revision?.semanticSpecHash ?? null,
+      planHash: revision?.planHash ?? null,
+      semanticRoundsUsed: 0,
+      semanticRoundsLimit: 2,
+      activeStage: latestStage?.stage ?? null,
+      activeStageDeadlineAt: latestStage?.deadlineAt ?? null,
+      overallDeadlineAt: latestStage?.deadlineAt ?? null,
+      approvalId: approval?.approvalId ?? null,
+      invalidatedApprovalId: invalidation?.approvalId ?? null,
+      warning: null,
+      stopReason: null,
+      resumeCondition: null,
+    };
   }
 
   /** Notify status surfaces of pipeline progress. Never throws into the run. */
