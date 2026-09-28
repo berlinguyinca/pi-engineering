@@ -864,6 +864,73 @@ test("a stale pre-claim opener converges after another opener publishes and clea
   }
 });
 
+test("a stale absence observer joins a bootstrap whose directory is published before its domain", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-eng-art-lock-bootstrap-published-directory-"));
+  const staleReady = join(dir, "stale-ready");
+  const releaseStale = join(dir, "release-stale");
+  const winnerReady = join(dir, "winner-ready");
+  const releaseWinner = join(dir, "release-winner");
+  let stale: ReturnType<typeof exec> | undefined;
+  let winner: ReturnType<typeof exec> | undefined;
+  try {
+    const root = join(dir, "artifacts");
+    const moduleUrl = new URL("../../src/artifacts/ArtifactStore.ts", import.meta.url).href;
+    stale = exec(process.execPath, [
+      "--experimental-strip-types",
+      "--input-type=module",
+      "--eval",
+      `import { existsSync, writeFileSync } from "node:fs"; import { ArtifactStore } from ${JSON.stringify(moduleUrl)}; await ArtifactStore.create(${JSON.stringify(root)}, { afterLockBootstrapAbsenceObserved: () => { writeFileSync(${JSON.stringify(staleReady)}, "ready"); while (!existsSync(${JSON.stringify(releaseStale)})) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10); } });`,
+    ]);
+
+    const staleDeadline = Date.now() + 5_000;
+    while (true) {
+      try {
+        await readFile(staleReady);
+        break;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        if (Date.now() >= staleDeadline) throw new Error("stale opener did not observe initial bootstrap absence");
+        await new Promise((resolveDelay) => setTimeout(resolveDelay, 10));
+      }
+    }
+
+    winner = exec(process.execPath, [
+      "--experimental-strip-types",
+      "--input-type=module",
+      "--eval",
+      `import { existsSync, writeFileSync } from "node:fs"; import { ArtifactStore } from ${JSON.stringify(moduleUrl)}; await ArtifactStore.create(${JSON.stringify(root)}, { afterLockDirectoryCreated: () => { writeFileSync(${JSON.stringify(winnerReady)}, "ready"); while (!existsSync(${JSON.stringify(releaseWinner)})) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10); } });`,
+    ]);
+
+    const winnerDeadline = Date.now() + 5_000;
+    while (true) {
+      try {
+        await readFile(winnerReady);
+        break;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        if (Date.now() >= winnerDeadline) throw new Error("winner did not publish its lock directory");
+        await new Promise((resolveDelay) => setTimeout(resolveDelay, 10));
+      }
+    }
+
+    await writeFile(releaseStale, "release\n");
+    await stale;
+    await writeFile(releaseWinner, "release\n");
+    await winner;
+
+    await assert.rejects(() => readFile(join(root, ".artifact-lock-bootstrap.json")), /ENOENT/);
+    const reopened = await ArtifactStore.create(root);
+    await reopened.put("logs", "joined", "durable", "joined published bootstrap");
+    assert.equal(await reopened.readContent("logs", "joined"), "durable");
+  } finally {
+    await writeFile(releaseStale, "release\n").catch(() => undefined);
+    await writeFile(releaseWinner, "release\n").catch(() => undefined);
+    await stale?.catch(() => undefined);
+    await winner?.catch(() => undefined);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("cross-process first-open stress converges without a lingering conflicting bootstrap", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-eng-art-lock-bootstrap-process-stress-"));
   try {

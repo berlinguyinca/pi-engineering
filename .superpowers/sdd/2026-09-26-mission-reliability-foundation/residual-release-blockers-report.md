@@ -295,3 +295,84 @@ each run: tests 3, pass 3, fail 0
 - Directory acceptance remains exact device/inode/token based. Marker retirement does not weaken same-name directory substitution checks.
 - Crash hooks execute only after a successful claim has revalidated that no durable domain exists, so injected crashes cannot leave a post-domain conflicting marker.
 - The process stress test checks actual cross-process filesystem ordering, not only in-process Promise scheduling.
+
+## Final lifecycle-window fix round — published directory before durable domain
+
+### Finding
+
+Fresh review found one remaining valid bootstrap ordering. A stale opener could observe no domain and no bootstrap, pause, then resume after another process had claimed a bound bootstrap and published `.artifact-locks` but before that process published the durable domain record. The stale opener noticed the directory but rechecked only the domain, so it rejected the transient valid state as an unproven lock root instead of joining the current bootstrap authority.
+
+### Deterministic TDD RED
+
+Added the `afterLockBootstrapAbsenceObserved` seam immediately after the initial absence reads and before the final-directory `lstat`. The regression starts a stale child at that seam, then starts a winner and pauses it at the existing `afterLockDirectoryCreated` seam after the exact bound inode is published but before durable-domain publication. Releasing the stale child deterministically reproduced the intermittent production ordering.
+
+Command:
+
+```text
+node --test --test-name-pattern='stale absence observer joins' test/unit/artifacts.test.ts
+```
+
+Behavioral RED:
+
+```text
+tests 1
+pass 0
+fail 1
+Error: ARTIFACT INTEGRITY: artifact lock root is unproven without a durable bootstrap marker
+```
+
+### Minimal fix and GREEN
+
+When the final lock directory appears after the initial absence snapshot, the opener now reads the current bootstrap marker and then rereads the durable domain. A durable domain retains terminal precedence. If the domain is still absent, a valid current bootstrap is carried into the existing exact token/device/inode validation and publication path. The opener still fails closed when neither authority exists.
+
+No directory is accepted from the marker read alone: the existing path open, trusted-directory check, canonical realpath check, bootstrap device/inode comparison, domain-token comparison, no-clobber durable publication, and final named-inode comparison all remain required.
+
+GREEN command:
+
+```text
+node --test --test-name-pattern='stale absence observer joins' test/unit/artifacts.test.ts
+```
+
+Output:
+
+```text
+tests 1
+pass 1
+fail 0
+```
+
+### Deterministic and multi-process verification
+
+Focused bootstrap command:
+
+```text
+node --test --test-name-pattern='bootstrap|lock directory|lock root|lock record' test/unit/artifacts.test.ts
+```
+
+Output: 10 passed, 0 failed.
+
+Extensive real-process command:
+
+```text
+for run in $(seq 1 20); do node --test --test-name-pattern='stale absence observer joins|stale pre-claim opener converges|original bootstrap claimant accepts|cross-process first-open stress' test/unit/artifacts.test.ts >/dev/null || exit 1; echo "stress run $run passed"; done
+```
+
+Output: all 20 consecutive runs passed. The stress case creates four fresh roots with 24 simultaneous Node processes per run, so this command exercised 1,920 additional cross-process first opens plus all three deterministic lifecycle interleavings on every run.
+
+### Final verification
+
+- `node --test test/unit/artifacts.test.ts` — 31 passed, 0 failed.
+- `npm test` — 2,700 passed, 0 failed, 1 optional Postgres test skipped because `TEST_DATABASE_URL` was absent.
+- `npm run typecheck` — core and scripts passed.
+- `npm run lint` — 592 files checked, no fixes required.
+- `npm run test:e2e` — command registration and package loading passed (`21 commands`, `7 tools`).
+- `git diff --check` — passed.
+
+### Final lifecycle-window self-review
+
+- The authority resample orders bootstrap before durable-domain reads, so marker cleanup racing the reads cannot create a false absence: cleanup follows durable publication, and the later domain read observes terminal authority.
+- When both records are visible, the durable domain wins; a bootstrap marker cannot supersede it.
+- When only the bootstrap is visible, existing exact token/device/inode validation binds it to the opened final directory before domain publication.
+- When neither authority is visible, an independently introduced final directory remains rejected as unproven.
+- The stale observer creates no staging directory in this path, so it introduces no private descriptor or cleanup obligation; all opened lock/root descriptors retain their existing `finally` closure paths.
+- Hostile symlink, realpath, inode, token, bootstrap-substitution, and final-name substitution failures remain covered by the focused bootstrap and full artifact suites.

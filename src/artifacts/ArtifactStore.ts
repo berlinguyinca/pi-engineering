@@ -18,7 +18,8 @@ export interface ArtifactStoreHooks {
   afterKeyLockAcquired?: (key: string) => Promise<void> | void;
   /** Deterministic lock-directory swap injection after its descriptor is pinned. */
   afterLockDirectoryOpened?: () => void;
-  /** Crash boundaries for the root-authoritative lock-domain bootstrap. */
+  /** Deterministic race and crash boundaries for the root-authoritative lock-domain bootstrap. */
+  afterLockBootstrapAbsenceObserved?: () => void;
   beforeLockBootstrapClaim?: () => void;
   afterLockBootstrapPrepared?: () => void;
   /** Deterministic substitution/crash point after the created inode is durably bound but before it is opened. */
@@ -293,11 +294,18 @@ export class ArtifactStore {
       }
       let createdLockRoot = false;
       if (!existingRecord && !bootstrap) {
+        this.hooks.afterLockBootstrapAbsenceObserved?.();
         try {
           await lstat(path);
+          const currentBootstrap = await this.readLockBootstrapRecord(root);
           const durable = await this.readLockDomainRecord(root);
-          if (!durable) throw integrityError("artifact lock root is unproven without a durable bootstrap marker");
-          existingRecord = durable;
+          if (durable) {
+            existingRecord = durable;
+          } else if (currentBootstrap) {
+            bootstrap = currentBootstrap;
+          } else {
+            throw integrityError("artifact lock root is unproven without a durable bootstrap marker");
+          }
         } catch (error) {
           if (!isMissing(error)) throw error;
         }
