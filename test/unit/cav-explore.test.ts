@@ -31,7 +31,7 @@ test("explorer fails closed when exploration triggers a page exception", async (
   const url = await writeHarness(
     dir,
     `<!doctype html><html><head><title>exp</title></head><body>
-<button id="boom" onclick="throw new Error('explore-js-exception')">Boom</button></body></html>`,
+<button id="boom" onfocus="throw new Error('explore-js-exception')" onclick="throw new Error('explore-js-exception')">Boom</button></body></html>`,
   );
   const result = await exploreUi({ url, artifactsDir: `${dir}/out`, maxSteps: 5, seed: 1 });
   assert.equal(result.passed, false);

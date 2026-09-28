@@ -15,19 +15,32 @@
  * No slash command is required: call `orchestrate(request)`.
  */
 
-import type { GitRepo } from "../git/GitRepo.ts";
+import type { ArtifactStore } from "../artifacts/ArtifactStore.ts";
+import { id } from "../core/ids.ts";
+import { GitRepo } from "../git/GitRepo.ts";
 import type { EventStoreBackend } from "../platform/eventstore/backend.ts";
 import type { GatewayResilienceConfig } from "../resilience/config.ts";
 import type { RecoveryProbe } from "../resilience/probe.ts";
 import type { WorkerActivity } from "../workers/WorkerExecutor.ts";
 import { type BrokerBackends, ExecutionBroker } from "./broker.ts";
+import { CheckpointManager } from "./checkpoints.ts";
 import { CompletionGate } from "./completionGate.ts";
+import { hashCandidateEvidenceIdentity, normalizeReviewSeverity, taskCoverageFingerprint } from "./evidence.ts";
 import { IntentRouter, workflowMutatesRepo } from "./intentRouter.ts";
 import type { MissionStore } from "./missionStore.ts";
 import type { MissionObservability } from "./observability/MissionObservability.ts";
 import { computeProgress } from "./observability/progress.ts";
 import type { ActivityType, WaitingReason } from "./observability/types.ts";
+import type { DispatchAuthority, MissionOwnership } from "./ownership.ts";
 import { deriveRequiredGates, mutationFactFromChangedFiles } from "./policies.ts";
+import {
+  FailureClassifier,
+  RecoveryPlanner,
+  type RecoveryPlannerOptions,
+  replacementRecoveryFingerprint,
+  replacementTaskFingerprintSpec,
+} from "./recovery.ts";
+import type { RepositoryRegistry } from "./repositoryRegistry.ts";
 import { brokerKind } from "./scheduler.ts";
 import { MissionScheduler } from "./scheduler.ts";
 import { canTransitionMission } from "./state.ts";
@@ -42,6 +55,15 @@ import type {
   TaskStatus,
   WorkflowClass,
 } from "./types.ts";
+import {
+  DEFAULT_WORKSET_POLICY,
+  type WorksetPolicy,
+  WorksetValidationError,
+  canonicalizeWriteDomain,
+  splitWorksetDeliverables,
+  validateWorkset,
+} from "./workset.ts";
+import { WorkspaceManifestResolver, WorkspaceScopeError, createWorkspaceManifest } from "./workspaceManifest.ts";
 
 /** A task planned by the planner; the orchestrator fills lifecycle fields. */
 export type PlanTaskInput = Omit<
@@ -56,7 +78,8 @@ export type PlanTaskInput = Omit<
   | "steer_requests"
   | "artifacts"
   | "assigned_execution_id"
->;
+  | "task_id"
+> & { task_id?: string };
 
 export interface OrchestratorOptions {
   store: MissionStore;
@@ -76,7 +99,12 @@ export interface OrchestratorOptions {
   /** Called on each mission phase transition. */
   onPhase?: (mission: Mission, phase: string) => void;
   parentSessionId?: string | null;
-  limits?: { maxActive?: number; maxAgents?: number; maxSubprocesses?: number; maxPerRole?: number };
+  limits?: {
+    maxActive?: number;
+    maxAgents?: number;
+    maxSubprocesses?: number;
+    maxPerRole?: number;
+  };
   router?: IntentRouter;
   /**
    * Maximum gate-driven repair rounds (spec 07). Each round repairs the open
@@ -87,6 +115,8 @@ export interface OrchestratorOptions {
   maxRepairRounds?: number;
   /** Git provider used to allocate isolated worktrees for mutating tasks. */
   git?: GitRepo | null;
+  /** Artifact authority used to validate checkpoint evidence references. */
+  artifacts?: Pick<ArtifactStore, "readContentByUri" | "putImmutable" | "verifyAndDispatch">;
   /** Base ref (commit) worktrees are created at. Defaults to current HEAD. */
   baseRef?: string;
   /**
@@ -107,6 +137,18 @@ export interface OrchestratorOptions {
   sleep?: (ms: number) => Promise<void>;
   /** Injectable RNG passed to the scheduler (default Math.random). For tests. */
   rand?: () => number;
+  /** Resolve explicit user workspace authority before material planning. */
+  workspaceResolver?: WorkspaceManifestResolver;
+  /** Repository-scoped execution dependencies populated from the manifest. */
+  repositoryRegistry?: RepositoryRegistry;
+  /** Process launch directory; never assumed to be the requested repository. */
+  launchCwd?: string;
+  /** Durable controller authority renewed immediately before worker dispatch. */
+  ownership?: MissionOwnership;
+  /** Bounds planner work before the first executable dispatch. */
+  worksetPolicy?: Partial<WorksetPolicy>;
+  /** Durable mission-wide recovery budget shared by retries and blocked repair. */
+  recovery?: RecoveryPlannerOptions;
 }
 
 export interface OrchestrateResult {
@@ -143,18 +185,54 @@ export class Orchestrator {
   private readonly progress = new Map<string, (line: string) => void>();
   private readonly observedExecutions = new Set<string>();
   private readonly taskExecutions = new Map<string, string>();
+  private readonly workspaceResolver?: WorkspaceManifestResolver;
+  private readonly repositoryRegistry?: RepositoryRegistry;
+  private readonly launchCwd: string;
+  private readonly ownership?: MissionOwnership;
+  private readonly ownershipByMission = new Map<string, import("./types.ts").MissionLease>();
+  private readonly recoveryOwnershipByFlight = new Map<string, import("./types.ts").MissionLease>();
+  private readonly recoveryTaskGenerations = new Map<string, number>();
+  private readonly missionRepoIds = new Map<string, string>();
+  private readonly worksetPolicy: WorksetPolicy;
+  private readonly recoveryPlanner: RecoveryPlanner;
+  private readonly failureClassifier = new FailureClassifier();
+  private readonly blockedRepairFlights = new Map<string, Promise<Mission>>();
 
   constructor(opts: OrchestratorOptions) {
     this.store = opts.store;
+    this.ownership = opts.ownership;
     this.router = opts.router ?? new IntentRouter();
     this.limits = opts.limits ?? {};
     this.maxRepairRounds = opts.maxRepairRounds ?? 2;
+    this.worksetPolicy = { ...DEFAULT_WORKSET_POLICY, ...opts.worksetPolicy };
+    this.recoveryPlanner = new RecoveryPlanner(opts.recovery);
+    const checkpoints = new CheckpointManager({ store: this.store });
     this.broker = new ExecutionBroker({
       store: this.store,
       backends: opts.backends,
       git: opts.git ?? null,
+      resolveRepository: opts.repositoryRegistry
+        ? async (repoId, writableDomains, missionId) => {
+            const manifest = this.store.getWorkspaceManifest(missionId);
+            if (!manifest) throw new Error(`WORKSPACE_SCOPE_MISMATCH: mission ${missionId} has no active manifest`);
+            const context = await opts.repositoryRegistry!.resolveForExecution(
+              missionId,
+              manifest.generation,
+              manifest.hash,
+              repoId,
+              writableDomains,
+            );
+            return {
+              repoId: context.repoId,
+              root: context.root,
+              git: context.git,
+            };
+          }
+        : undefined,
       baseRef: opts.baseRef ?? "",
       onActivity: (event) => this.observeWorkerActivity(event),
+      checkpoints,
+      artifacts: opts.artifacts,
     });
     this.scheduler = new MissionScheduler({
       store: this.store,
@@ -168,6 +246,8 @@ export class Orchestrator {
       now: opts.now,
       sleep: opts.sleep,
       rand: opts.rand,
+      acquireAuthority: this.ownership ? (task) => this.acquireTaskAuthority(task) : undefined,
+      recovery: opts.recovery,
       onStatus: (notice) => {
         const obs = this.observability;
         if (notice.action === "resumed") {
@@ -209,6 +289,702 @@ export class Orchestrator {
     this.onPhase = opts.onPhase;
     this.observability = opts.observability ?? null;
     this.parentSessionId = opts.parentSessionId ?? null;
+    this.workspaceResolver = opts.workspaceResolver ?? new WorkspaceManifestResolver();
+    this.repositoryRegistry = opts.repositoryRegistry;
+    this.launchCwd = opts.launchCwd ?? ".";
+  }
+
+  /**
+   * Repair one durable BLOCKED episode. Every material side effect is preceded
+   * by its durable recovery plan, and replay observes the existing episode
+   * instead of creating duplicate replacement work.
+   */
+  async repairBlockedMission(missionId: string, signal?: AbortSignal): Promise<Mission> {
+    const resumptionGeneration = this.store.listMissionResumptions(missionId).at(-1)?.generation ?? 0;
+    const flightKey = `${missionId}:${resumptionGeneration}`;
+    const active = this.blockedRepairFlights.get(flightKey);
+    if (active) return active;
+    const flight = this.performBlockedMissionRepair(missionId, resumptionGeneration, signal);
+    this.blockedRepairFlights.set(flightKey, flight);
+    try {
+      return await flight;
+    } finally {
+      if (this.blockedRepairFlights.get(flightKey) === flight) this.blockedRepairFlights.delete(flightKey);
+    }
+  }
+
+  private assertRecoveryGeneration(missionId: string, expected: number): void {
+    const current = this.store.listMissionResumptions(missionId).at(-1)?.generation ?? 0;
+    if (current !== expected) throw new Error(`STALE_RECOVERY_GENERATION: expected ${expected}, current ${current}`);
+  }
+
+  private async performBlockedMissionRepair(
+    missionId: string,
+    expectedResumptionGeneration: number,
+    signal?: AbortSignal,
+  ): Promise<Mission> {
+    await this.activateMissionRepository(missionId);
+    this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
+    const mission = this.store.getMission(missionId);
+    if (!mission) throw new Error(`unknown mission ${missionId}`);
+    if (["COMPLETE", "FAILED", "CANCELED"].includes(mission.status)) {
+      for (const decision of this.store
+        .listRecoveryDecisions(missionId)
+        .filter((entry) => entry.status === "started")) {
+        this.store.transitionRecovery(decision.recoveryId, mission.status === "COMPLETE" ? "succeeded" : "failed");
+      }
+      await this.store.flush();
+      this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
+      return this.store.getMission(missionId)!;
+    }
+    if (mission.status !== "BLOCKED" && mission.status !== "REPAIRING") return mission;
+    const blockedEpisodeId = mission.blocked_episode_id;
+    const priorStop = this.store.listMissionStops(missionId).at(-1);
+    const priorResumption = this.store.listMissionResumptions(missionId).at(-1);
+    if (priorStop && (!priorResumption || priorResumption.stopGeneration < priorStop.generation)) return mission;
+
+    let acquiredLease: Awaited<ReturnType<MissionOwnership["acquire"]>> | undefined;
+    const recoveryLeaseKey = `${missionId}:${expectedResumptionGeneration}`;
+    if (this.ownership) {
+      acquiredLease = await this.ownership.acquire(missionId, {
+        resumptionGeneration: expectedResumptionGeneration,
+      });
+      this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
+      this.recoveryOwnershipByFlight.set(recoveryLeaseKey, acquiredLease);
+    }
+    try {
+      await this.broker.cancelStaleResumptionExecutions(missionId, expectedResumptionGeneration);
+      this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
+      const repositoryDiagnostics = await this.broker.durableRepositoryDiagnostics(missionId);
+      this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
+      if (repositoryDiagnostics.length > 0) {
+        for (const diagnostic of repositoryDiagnostics) {
+          this.store.addFinding({
+            mission_id: missionId,
+            task_id: null,
+            severity: "blocking",
+            category: "persistence",
+            file: diagnostic.file || null,
+            line: null,
+            summary: `Corrupt durable ${diagnostic.recordKind} record for ${diagnostic.repoId}`,
+            evidence: diagnostic.reason,
+            recommended_action: "Repair or quarantine the named durable record before mission recovery.",
+          });
+        }
+        this.store.stopMission(missionId, {
+          reason: "durable repository recovery records failed canonical identity validation",
+          preservedWork: this.store
+            .listTaskCheckpoints(missionId)
+            .flatMap((checkpoint) => [checkpoint.worktree, checkpoint.branch])
+            .filter((value): value is string => !!value?.trim()),
+          attemptedRecoveries: [],
+          resumeCondition: "repair or quarantine every reported durable repository record",
+        });
+        await this.store.flush();
+        this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
+        return this.store.getMission(missionId)!;
+      }
+      const reconciledOrphans = this.store.reconcileOrphanedExecutions(missionId);
+      await this.store.flush();
+      this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
+      const classifications = this.store.listFailureClassifications(missionId);
+      const classification = classifications.at(-1);
+      if (!classification) throw new Error(`blocked mission ${missionId} has no durable failure classification`);
+      const resumptionGeneration = this.store.listMissionResumptions(missionId).at(-1)?.generation ?? 0;
+      this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
+      const recoveryStartRecord = this.store.getCandidate(missionId);
+      const verifiedRecoveryStart = recoveryStartRecord ? await this.broker.verifiedCandidateContent(missionId) : null;
+      this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
+      const recoveryStartCandidate = recoveryStartRecord?.identityHash ?? null;
+      const recoveryStartContent = verifiedRecoveryStart
+        ? {
+            candidateSha: verifiedRecoveryStart.candidateSha,
+            diffHash: verifiedRecoveryStart.diffHash,
+          }
+        : null;
+      for (const stale of this.store
+        .listRecoveryDecisions(missionId)
+        .filter((entry) => entry.status === "started" && (entry.resumptionGeneration ?? 0) !== resumptionGeneration)) {
+        this.store.transitionRecovery(stale.recoveryId, "failed");
+      }
+      let repairDecision = this.store
+        .listRecoveryDecisions(missionId)
+        .find(
+          (entry) =>
+            entry.blockedEpisodeId === blockedEpisodeId &&
+            (entry.resumptionGeneration ?? 0) === resumptionGeneration &&
+            (entry.status === "planned" || entry.status === "started"),
+        );
+      if (!repairDecision) {
+        const history = this.store.listRecoveryDecisions(missionId);
+        const choice = this.recoveryPlanner.decide({
+          classification,
+          history,
+          now: this.scheduler.now(),
+          resumptionGeneration,
+        });
+
+        if (choice.action === "STOP") {
+          const existing = this.store.getRecoveryDecision(choice.recoveryId);
+          const decision = existing ?? this.store.planRecovery(choice);
+          await this.store.flush();
+          this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
+          if (decision.status === "planned") this.store.transitionRecovery(decision.recoveryId, "exhausted");
+          const attemptedRecoveries = history.map((entry) => entry.recoveryId);
+          const preservedWork = await this.preservedMissionWork(missionId);
+          this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
+          this.store.stopMission(missionId, {
+            reason: choice.expectedMaterialChange,
+            preservedWork,
+            attemptedRecoveries,
+            resumeCondition: "provide new material evidence or increase the approved recovery budget",
+          });
+          await this.store.flush();
+          this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
+          return this.store.getMission(missionId)!;
+        }
+
+        repairDecision = this.store.planRecovery({
+          ...choice,
+          startingCandidateIdentityHash: recoveryStartCandidate,
+          startingCandidateContent: recoveryStartContent,
+        });
+        await this.store.flush();
+        this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
+      }
+
+      if (repairDecision.action === "WAIT_FOR_REQUIREMENT") {
+        if (repairDecision.status === "planned") this.store.transitionRecovery(repairDecision.recoveryId, "started");
+        if (this.store.getMission(missionId)?.status === "BLOCKED") {
+          this.store.transitionMission(missionId, "WAITING_FOR_USER");
+        }
+        await this.store.flush();
+        this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
+        return this.store.getMission(missionId)!;
+      }
+      if (repairDecision.action === "CREATE_REPAIR_TASKS" && !repairDecision.startingCandidateContent) {
+        if (repairDecision.status === "planned") this.store.transitionRecovery(repairDecision.recoveryId, "failed");
+        this.store.addFinding({
+          mission_id: missionId,
+          task_id: classification.taskId,
+          severity: "blocking",
+          category: "recovery_candidate_baseline",
+          file: null,
+          line: null,
+          summary: "Gate repair requires an independently Git-verified current candidate.",
+          evidence: repairDecision.recoveryId,
+          recommended_action: "Reconstruct the current candidate from Git before dispatching repair work.",
+        });
+        await this.store.flush();
+        this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
+        return this.store.getMission(missionId)!;
+      }
+      if (repairDecision.action === "PAUSE_FOR_PERSISTENCE" || repairDecision.action === "PROBE_AND_BACKOFF") {
+        if (repairDecision.status === "planned") this.store.transitionRecovery(repairDecision.recoveryId, "started");
+        const preservedWork = await this.preservedMissionWork(missionId);
+        this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
+        this.store.stopMission(missionId, {
+          reason: repairDecision.expectedMaterialChange,
+          preservedWork,
+          attemptedRecoveries: [repairDecision.recoveryId],
+          resumeCondition:
+            repairDecision.action === "PAUSE_FOR_PERSISTENCE"
+              ? "durable writes must succeed and persistence diagnostics must clear"
+              : `a healthy provider probe must succeed before ${repairDecision.deadline}`,
+        });
+        await this.store.flush();
+        this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
+        return this.store.getMission(missionId)!;
+      }
+
+      const manifestGenerationBefore = this.store.getWorkspaceManifest(missionId)?.generation;
+      if (repairDecision.action === "REBUILD_WORKSPACE_MANIFEST") {
+        try {
+          const current = this.store.getWorkspaceManifest(missionId);
+          const resolved = this.repositoryRegistry
+            ? await this.workspaceResolver!.resolve(mission.user_request, this.launchCwd)
+            : await this.workspaceResolver!.resolveRepository(mission.repository);
+          this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
+          const rebuilt = createWorkspaceManifest(resolved, missionId, (current?.generation ?? 0) + 1);
+          if (this.repositoryRegistry) {
+            const staged = await this.repositoryRegistry.stage(rebuilt);
+            this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
+            const probes = await staged.probe(resolved.primaryRepoId);
+            this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
+            if (probes.some((probe) => !probe.ok)) throw new Error("rebuilt workspace manifest failed role probes");
+            await this.store.bindWorkspaceManifestDurably(
+              rebuilt,
+              current ? { generation: current.generation, hash: current.hash } : null,
+            );
+            this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
+            try {
+              staged.activate();
+            } catch {
+              await this.repositoryRegistry.ensureActive(rebuilt, resolved.primaryRepoId);
+              this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
+            }
+          } else {
+            await this.store.bindWorkspaceManifestDurably(
+              rebuilt,
+              current ? { generation: current.generation, hash: current.hash } : null,
+            );
+            this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
+          }
+          this.missionRepoIds.set(missionId, resolved.primaryRepoId);
+        } catch (error) {
+          if (error instanceof Error && error.message.startsWith("STALE_RECOVERY_GENERATION")) throw error;
+          const summary = `workspace manifest rebuild failed: ${error instanceof Error ? error.message : String(error)}`;
+          this.store.addFinding({
+            mission_id: missionId,
+            task_id: classification.taskId,
+            severity: "blocking",
+            category: "workspace_manifest_rebuild",
+            file: null,
+            line: null,
+            summary,
+            evidence: repairDecision.recoveryId,
+            recommended_action: "Correct the repository binding or role probe failure before resuming recovery.",
+          });
+          if (repairDecision.status === "planned") this.store.transitionRecovery(repairDecision.recoveryId, "failed");
+          await this.store.flush();
+          this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
+          return this.store.getMission(missionId)!;
+        }
+      }
+
+      const invalidationsBefore = this.store.listEvidenceInvalidations(missionId).length;
+      const candidateIdentityBefore =
+        repairDecision.startingCandidateIdentityHash !== undefined
+          ? repairDecision.startingCandidateIdentityHash
+          : recoveryStartCandidate;
+
+      const unresolvedFailedTasks = this.store
+        .listTasks(missionId)
+        .filter(
+          (task) =>
+            task.status === "FAILED" &&
+            !this.store.listTaskSupersessions(missionId).some((lineage) => lineage.failedTaskId === task.task_id),
+        );
+      const actionTaskId = classification.taskId;
+      const failedTasks = unresolvedFailedTasks.filter((task) => {
+        switch (repairDecision.action) {
+          case "CHECKPOINT_SPLIT_AND_REPLACE":
+          case "REPAIR_WORKER_OUTPUT":
+          case "FENCE_RECONCILE_AND_RESUME":
+            return actionTaskId ? task.task_id === actionTaskId : false;
+          case "REBUILD_INTEGRATION_CANDIDATE":
+            return task.kind === "integration" && (!actionTaskId || task.task_id === actionTaskId);
+          case "CREATE_REPAIR_TASKS":
+            return (
+              ["validation", "review", "agent"].includes(task.kind) && (!actionTaskId || task.task_id === actionTaskId)
+            );
+          case "REBUILD_WORKSPACE_MANIFEST":
+          case "REPAIR_BLOCKED_MISSION":
+            return true;
+          case "RECONSTRUCT_EVIDENCE":
+            return false;
+          default:
+            return false;
+        }
+      });
+      const importsCheckpoint = [
+        "CHECKPOINT_SPLIT_AND_REPLACE",
+        "REPAIR_WORKER_OUTPUT",
+        "FENCE_RECONCILE_AND_RESUME",
+        "REPAIR_BLOCKED_MISSION",
+      ].includes(repairDecision.action);
+      for (const failed of failedTasks) {
+        const checkpoint = importsCheckpoint
+          ? this.store.listTaskCheckpoints(missionId, failed.task_id).at(-1)
+          : undefined;
+        try {
+          if (!checkpoint && repairDecision.action === "CHECKPOINT_SPLIT_AND_REPLACE") {
+            throw new Error("checkpoint repair identity/integrity mismatch: durable checkpoint is missing");
+          }
+          if (!checkpoint) continue;
+          this.assertRepairCheckpoint(failed, checkpoint);
+        } catch (error) {
+          const summary = error instanceof Error ? error.message : String(error);
+          this.store.addFinding({
+            mission_id: missionId,
+            task_id: failed.task_id,
+            severity: "blocking",
+            category: "checkpoint_integrity",
+            file: checkpoint?.worktree ?? null,
+            line: null,
+            summary,
+            evidence: checkpoint?.checkpointId ?? null,
+            recommended_action: "Reconcile the exact checkpoint origin and preserved work before retrying recovery.",
+          });
+          if (repairDecision.status === "planned") this.store.transitionRecovery(repairDecision.recoveryId, "failed");
+          const preservedWork = await this.preservedMissionWork(missionId);
+          this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
+          this.store.stopMission(missionId, {
+            reason: summary,
+            preservedWork,
+            attemptedRecoveries: [repairDecision.recoveryId],
+            resumeCondition:
+              "a canonical checkpoint with matching execution, generation, repository, and artifacts is required",
+          });
+          await this.store.flush();
+          this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
+          return this.store.getMission(missionId)!;
+        }
+      }
+      for (const failed of failedTasks) {
+        const checkpoint = importsCheckpoint
+          ? this.store.listTaskCheckpoints(missionId, failed.task_id).at(-1)
+          : undefined;
+        const remaining = checkpoint?.remainingDeliverables.length
+          ? checkpoint.remainingDeliverables
+          : (failed.deliverables ?? []).length
+            ? (failed.deliverables ?? [])
+            : [failed.objective];
+        const supersessionId = `${repairDecision.recoveryId}-SUP-${failed.task_id}`;
+        const replacementFingerprints: Record<string, string> = {};
+        const replacementTaskIds = remaining.map(
+          (_deliverable, index) => `${repairDecision.recoveryId}-TSK-${failed.task_id}-${index + 1}`,
+        );
+        const lineageFingerprintSpec = {
+          supersessionId,
+          failedTaskId: failed.task_id,
+          repoId: failed.repo_id ?? "",
+          acceptanceIds: [...(failed.acceptance_ids ?? [])],
+          coverageFingerprint: taskCoverageFingerprint(failed),
+          replacementTaskIds,
+        };
+        const replacements = remaining.map((deliverable, index) => {
+          const replacementId = replacementTaskIds[index]!;
+          const createsRepair = repairDecision.action === "CREATE_REPAIR_TASKS";
+          const role = createsRepair ? "implementer" : failed.role;
+          const mutatesRepo = createsRepair ? true : failed.mutates_repo;
+          const replacementSpec = replacementTaskFingerprintSpec({
+            task_id: replacementId,
+            mission_id: missionId,
+            kind: createsRepair ? "agent" : failed.kind,
+            role,
+            objective: createsRepair
+              ? `Repair the repository defect exposed by ${failed.kind}: ${failed.objective}. Then leave the candidate ready for fresh gates.`
+              : `Recover ${failed.objective}: complete remaining deliverable ${deliverable}`,
+            depends_on: [...failed.depends_on],
+            priority: failed.priority,
+            mutates_repo: mutatesRepo,
+            write_domains: createsRepair ? this.writableDomainsForMission(missionId) : [...failed.write_domains],
+            isolation: createsRepair ? "worktree" : failed.isolation,
+            execution_requirements: { ...failed.execution_requirements },
+            max_attempts: 1,
+            failure_policy: "block",
+            repo_id: failed.repo_id,
+            acceptance_ids: [...(failed.acceptance_ids ?? [])],
+            deliverables: [deliverable],
+            execution_budget_ms: failed.execution_budget_ms,
+            checkpoint_policy: failed.checkpoint_policy,
+            required_output_artifacts: [...(failed.required_output_artifacts ?? [])],
+            candidate_generation: (failed.candidate_generation ?? 0) + index + 1,
+            repair_base_candidate_sha: createsRepair
+              ? (repairDecision.startingCandidateContent?.candidateSha ?? undefined)
+              : undefined,
+          });
+          const manifest = this.store.getWorkspaceManifest(missionId);
+          const fingerprint = replacementRecoveryFingerprint({
+            decision: repairDecision,
+            lineage: lineageFingerprintSpec,
+            replacement: replacementSpec,
+            manifest: manifest!,
+            checkpoint: checkpoint ?? null,
+          });
+          replacementFingerprints[replacementId] = fingerprint;
+          const existing = this.store.getTask(replacementId);
+          if (existing) {
+            this.recoveryTaskGenerations.set(existing.task_id, expectedResumptionGeneration);
+            const existingFingerprint = manifest
+              ? replacementRecoveryFingerprint({
+                  decision: repairDecision,
+                  lineage: lineageFingerprintSpec,
+                  replacement: replacementTaskFingerprintSpec(existing),
+                  manifest,
+                  checkpoint: checkpoint ?? null,
+                })
+              : "";
+            const exact =
+              existingFingerprint === fingerprint &&
+              existing.replacement_spec_fingerprint === fingerprint &&
+              (!checkpoint ||
+                (existing.recovery_authority?.expectedReplacementFingerprint === fingerprint &&
+                  existing.recovery_authority?.recoveryDecisionId === repairDecision.recoveryId &&
+                  existing.recovery_authority?.checkpointId === checkpoint.checkpointId &&
+                  existing.recovery_authority?.supersessionId === supersessionId));
+            if (!exact) throw new Error(`replacement replay fingerprint/full-spec mismatch: ${replacementId}`);
+            return existing;
+          }
+          const created = this.store.createTask({
+            ...replacementSpec,
+            replacement_spec_fingerprint: fingerprint,
+            recovery_authority: checkpoint
+              ? {
+                  recoveryDecisionId: repairDecision.recoveryId,
+                  expectedReplacementFingerprint: fingerprint,
+                  originalTaskId: failed.task_id,
+                  originalExecutionId: checkpoint.executionId,
+                  checkpointId: checkpoint.checkpointId,
+                  supersessionId,
+                  resumptionGeneration: repairDecision.resumptionGeneration ?? 0,
+                }
+              : undefined,
+          });
+          this.recoveryTaskGenerations.set(created.task_id, expectedResumptionGeneration);
+          return created;
+        });
+        if (!this.store.listTaskSupersessions(missionId).some((lineage) => lineage.failedTaskId === failed.task_id)) {
+          this.store.supersedeTask({
+            supersessionId,
+            missionId,
+            failedTaskId: failed.task_id,
+            replacementTaskIds: replacements.map((task) => task.task_id),
+            repoId: failed.repo_id ?? "",
+            acceptanceIds: [...(failed.acceptance_ids ?? [])],
+            coverageFingerprint: taskCoverageFingerprint(failed),
+            reason: checkpoint
+              ? `resume remaining work from checkpoint ${checkpoint.checkpointId}`
+              : "bounded replacement",
+            createdAt: new Date(this.scheduler.now()).toISOString(),
+            recoveryDecisionId: repairDecision.recoveryId,
+            expectedReplacementFingerprints: replacementFingerprints,
+          });
+        }
+      }
+      for (const candidate of this.store.listCandidates(missionId)) {
+        const reason = `blocked mission repair ${repairDecision.recoveryId}`;
+        if (
+          this.store
+            .listEvidenceInvalidations(missionId)
+            .some(
+              (entry) =>
+                entry.reason === reason && hashCandidateEvidenceIdentity(entry.identity) === candidate.identityHash,
+            )
+        )
+          continue;
+        this.store.invalidateEvidence({
+          invalidationId: id("EI"),
+          missionId,
+          identity: candidate.identity,
+          reason,
+          invalidatedAt: new Date(this.scheduler.now()).toISOString(),
+        });
+      }
+      await this.store.flush();
+      this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
+      if (this.store.getMission(missionId)?.status === "BLOCKED") {
+        this.store.transitionMission(missionId, "REPAIRING", "system", {
+          recoveryDecisionId: repairDecision.recoveryId,
+        });
+      }
+      const recoveryLineages = this.store
+        .listTaskSupersessions(missionId)
+        .filter((lineage) => lineage.recoveryDecisionId === repairDecision.recoveryId);
+      for (const lineage of recoveryLineages) {
+        for (const taskId of lineage.replacementTaskIds) {
+          if (this.store.getTask(taskId)?.status === "PENDING") this.store.transitionTask(taskId, "READY");
+        }
+      }
+      await this.store.flush();
+      this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
+      await this.scheduler.runMission(missionId, signal);
+      this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
+      const replacementsFailed = recoveryLineages.some(
+        (lineage) => !this.store.isTaskSatisfiedBySupersession(lineage.failedTaskId),
+      );
+      if (replacementsFailed) {
+        this.store.transitionRecovery(repairDecision.recoveryId, "failed");
+        if (this.store.getMission(missionId)?.status === "REPAIRING") {
+          this.store.transitionMission(missionId, "BLOCKED");
+        }
+        await this.store.flush();
+        this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
+        return this.store.getMission(missionId)!;
+      }
+      const recoveryMutatesRepository = recoveryLineages.some((lineage) =>
+        lineage.replacementTaskIds.some((taskId) => this.store.getTask(taskId)?.mutates_repo === true),
+      );
+      if (recoveryMutatesRepository && this.broker.pendingIntegrations(missionId) > 0) {
+        const integrationTaskId = `${repairDecision.recoveryId}-integration`;
+        let integrationTask = this.store.getTask(integrationTaskId);
+        if (!integrationTask) {
+          integrationTask = this.store.createTask({
+            task_id: integrationTaskId,
+            mission_id: missionId,
+            kind: "integration",
+            role: "integrator",
+            objective: `Integrate recovery repair ${repairDecision.recoveryId} before evaluating materiality.`,
+            mutates_repo: true,
+            write_domains: this.writableDomainsForMission(missionId),
+            isolation: "none",
+            repo_id: this.repoIdForMission(missionId),
+            ...this.boundedTaskFields(missionId, ["integrated recovery candidate"], []),
+          });
+        }
+        this.recoveryTaskGenerations.set(integrationTask.task_id, expectedResumptionGeneration);
+        if (integrationTask.status === "PENDING") this.store.transitionTask(integrationTask.task_id, "READY");
+        const currentStatus = this.store.getMission(missionId)?.status;
+        if (currentStatus && currentStatus !== "INTEGRATING" && canTransitionMission(currentStatus, "INTEGRATING")) {
+          this.store.transitionMission(missionId, "INTEGRATING");
+        }
+        await this.store.flush();
+        this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
+        const integrated = await this.runSingleTask(missionId, integrationTask.task_id, { signal });
+        this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
+        if (!integrated) {
+          this.store.transitionRecovery(repairDecision.recoveryId, "failed");
+          if (canTransitionMission(this.store.getMission(missionId)!.status, "BLOCKED")) {
+            this.store.transitionMission(missionId, "BLOCKED");
+          }
+          await this.store.flush();
+          this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
+          return this.store.getMission(missionId)!;
+        }
+      }
+      const verifiedCandidateContent = await this.broker.verifiedCandidateContent(missionId);
+      this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
+      const contentBaseline = repairDecision.startingCandidateContent;
+      const gitMaterialDelta =
+        !!verifiedCandidateContent?.hasChanges &&
+        (!contentBaseline ||
+          (verifiedCandidateContent.candidateSha !== contentBaseline.candidateSha &&
+            verifiedCandidateContent.diffHash !== contentBaseline.diffHash));
+      const materialDelta = (() => {
+        switch (repairDecision.action) {
+          case "REBUILD_WORKSPACE_MANIFEST":
+            return this.store.getWorkspaceManifest(missionId)?.generation !== manifestGenerationBefore;
+          case "RECONSTRUCT_EVIDENCE":
+            return this.store.listEvidenceInvalidations(missionId).length > invalidationsBefore;
+          case "FENCE_RECONCILE_AND_RESUME":
+            return reconciledOrphans.length > 0 || failedTasks.length > 0;
+          case "CHECKPOINT_SPLIT_AND_REPLACE":
+          case "REPAIR_WORKER_OUTPUT":
+          case "REBUILD_INTEGRATION_CANDIDATE":
+          case "REPAIR_BLOCKED_MISSION":
+            return recoveryMutatesRepository ? gitMaterialDelta : failedTasks.length > 0 || recoveryLineages.length > 0;
+          case "CREATE_REPAIR_TASKS":
+            return gitMaterialDelta;
+          default:
+            return false;
+        }
+      })();
+      if (!materialDelta) {
+        this.store.transitionRecovery(repairDecision.recoveryId, "failed");
+        const currentStatus = this.store.getMission(missionId)?.status;
+        if (currentStatus && canTransitionMission(currentStatus, "BLOCKED"))
+          this.store.transitionMission(missionId, "BLOCKED");
+        await this.store.flush();
+        this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
+        return this.store.getMission(missionId)!;
+      }
+      const finalized = await this.finalizeMission(
+        missionId,
+        expectedResumptionGeneration,
+        signal,
+        repairDecision.action === "CREATE_REPAIR_TASKS" ? candidateIdentityBefore : undefined,
+      );
+      this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
+      this.store.transitionRecovery(repairDecision.recoveryId, finalized.completed ? "succeeded" : "failed");
+      await this.store.flush();
+      this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
+      return finalized.mission;
+    } finally {
+      const leaseToRelease = this.recoveryOwnershipByFlight.get(recoveryLeaseKey) ?? acquiredLease;
+      if (leaseToRelease && this.ownership) {
+        try {
+          await this.ownership.release(leaseToRelease);
+        } catch (error) {
+          await this.store.recordOwnershipReleaseFailure({
+            missionId,
+            generation: leaseToRelease.generation,
+            fencingToken: leaseToRelease.fencingToken,
+            ownerId: leaseToRelease.ownerId,
+            renewBy: leaseToRelease.renewBy,
+            error,
+          });
+        }
+      }
+      if (this.recoveryOwnershipByFlight.get(recoveryLeaseKey) === leaseToRelease) {
+        this.recoveryOwnershipByFlight.delete(recoveryLeaseKey);
+      }
+      for (const [taskId, generation] of this.recoveryTaskGenerations) {
+        if (generation === expectedResumptionGeneration) this.recoveryTaskGenerations.delete(taskId);
+      }
+    }
+  }
+
+  private repoIdForMission(missionId: string): string | undefined {
+    return this.missionRepoIds.get(missionId) ?? this.store.getWorkspaceManifest(missionId)?.repositories[0]?.repoId;
+  }
+
+  private async preservedMissionWork(missionId: string): Promise<string[]> {
+    const durableRepositoryRefs = await this.broker.durableRepositoryStateRefs(missionId);
+    const preserved = [
+      ...new Set(
+        [
+          ...this.store
+            .listTaskCheckpoints(missionId)
+            .flatMap((checkpoint) => [
+              checkpoint.worktree,
+              checkpoint.branch,
+              checkpoint.candidateSha,
+              ...checkpoint.committedChanges,
+              ...checkpoint.preservedUncommittedChanges,
+              ...checkpoint.artifactRefs,
+            ]),
+          ...this.store
+            .listCandidates(missionId)
+            .flatMap((candidate) => [
+              candidate.identity.candidateSha,
+              candidate.identity.diffHash,
+              ...candidate.identity.artifactHashes,
+            ]),
+          ...durableRepositoryRefs,
+        ].filter((value): value is string => !!value?.trim()),
+      ),
+    ];
+    return preserved;
+  }
+
+  private assertRepairCheckpoint(failed: OrchestrationTask, checkpoint: import("./types.ts").TaskCheckpoint): void {
+    const execution = this.store.getExecution(checkpoint.executionId);
+    const manifestRepository = this.store
+      .getWorkspaceManifest(checkpoint.missionId)
+      ?.repositories.find((repository) => repository.repoId === checkpoint.repoId);
+    const sameAcceptance =
+      JSON.stringify([...checkpoint.acceptanceIds].sort()) ===
+      JSON.stringify([...(failed.acceptance_ids ?? [])].sort());
+    const invalid = [
+      checkpoint.missionId !== failed.mission_id ? "mission" : null,
+      checkpoint.taskId !== failed.task_id ? "task" : null,
+      checkpoint.repoId !== failed.repo_id ? "repository" : null,
+      !execution || execution.task_id !== failed.task_id || execution.mission_id !== failed.mission_id
+        ? "execution"
+        : null,
+      !manifestRepository || manifestRepository.baseSha !== checkpoint.baseSha ? "base" : null,
+      checkpoint.missionGeneration !== (failed.mission_generation ?? 0) ? "mission generation" : null,
+      checkpoint.candidateGeneration !== (failed.candidate_generation ?? 0) ? "candidate generation" : null,
+      checkpoint.fencingToken !== (failed.fencing_token ?? 0) ? "fencing token" : null,
+      !sameAcceptance ? "acceptance coverage" : null,
+      checkpoint.committedChanges.some((entry) => !entry.trim()) ? "committed changes" : null,
+      checkpoint.preservedUncommittedChanges.some((entry) => !entry.trim()) ? "uncommitted changes" : null,
+      (checkpoint.committedChanges.length > 0 || checkpoint.preservedUncommittedChanges.length > 0) &&
+      (!checkpoint.branch?.trim() || !checkpoint.worktree?.trim())
+        ? "preserved work identity"
+        : null,
+    ].filter((entry): entry is string => entry !== null);
+    if (invalid.length > 0) throw new Error(`checkpoint repair identity/integrity mismatch: ${invalid.join(", ")}`);
+  }
+
+  private async activateMissionRepository(missionId: string): Promise<void> {
+    const repoId = this.repoIdForMission(missionId);
+    const manifest = this.store.getWorkspaceManifest(missionId);
+    if (repoId && manifest && this.repositoryRegistry) {
+      this.missionRepoIds.set(missionId, repoId);
+      await this.repositoryRegistry.ensureActive(manifest, repoId);
+    }
   }
 
   private phase(mission: Mission, phase: string): void {
@@ -218,14 +994,21 @@ export class Orchestrator {
   }
 
   private observeWorkerActivity(
-    event: WorkerActivity & { missionId: string; taskId: string; executionId: string },
+    event: WorkerActivity & {
+      missionId: string;
+      taskId: string;
+      executionId: string;
+    },
   ): void {
     const obs = this.observability;
     if (!this.observedExecutions.has(event.executionId)) {
       this.observedExecutions.add(event.executionId);
       this.taskExecutions.set(`${event.missionId}:${event.taskId}`, event.executionId);
       const task = this.store.getTask(event.taskId);
-      obs?.workerStarted(event.missionId, event.executionId, { taskId: event.taskId, runtime: "pi" });
+      obs?.workerStarted(event.missionId, event.executionId, {
+        taskId: event.taskId,
+        runtime: "pi",
+      });
       if (task) {
         obs?.taskStarted(event.missionId, event.taskId, task.objective);
         obs?.setCurrentObjective(event.missionId, task.objective);
@@ -303,10 +1086,18 @@ export class Orchestrator {
       obs.taskStarted(missionId, taskId, label);
       obs.taskCompleted(missionId, taskId, label);
       obs.workerCompleted(missionId, workerId);
-      obs.activity(missionId, { type: "worker_completed", summary: "Task completed", workerId });
+      obs.activity(missionId, {
+        type: "worker_completed",
+        summary: "Task completed",
+        workerId,
+      });
     } else if (obs && status === "FAILED") {
       obs.workerFailed(missionId, workerId);
-      obs.activity(missionId, { type: "error", summary: "Task failed", workerId });
+      obs.activity(missionId, {
+        type: "error",
+        summary: "Task failed",
+        workerId,
+      });
       obs.recordError(missionId, "task_failed", `task ${taskId} settled ${status}`);
     }
     this.taskExecutions.delete(`${missionId}:${taskId}`);
@@ -373,6 +1164,22 @@ export class Orchestrator {
         opts.mutationRequested ?? workflowMutatesRepo(this.router.route({ request }).suggested_workflow),
     });
     const risk = this.router.risk({ request });
+    const material = workflowMutatesRepo(intent.suggested_workflow) || opts.mutationRequested === true;
+    const executable = intent.suggested_workflow !== "conversation" || material || (opts.changedFiles?.length ?? 0) > 0;
+    let workspace: Awaited<ReturnType<WorkspaceManifestResolver["resolve"]>> | undefined;
+    let workspaceError: WorkspaceScopeError | undefined;
+    if (executable && this.workspaceResolver) {
+      try {
+        workspace = this.repositoryRegistry
+          ? await this.workspaceResolver.resolve(request, this.launchCwd)
+          : await this.workspaceResolver.resolveRepository(opts.repository);
+      } catch (error) {
+        workspaceError =
+          error instanceof WorkspaceScopeError
+            ? error
+            : new WorkspaceScopeError(error instanceof Error ? error.message : String(error));
+      }
+    }
 
     // Install the per-call progress hook for the duration of this mission so
     // task/phase transitions stream to the caller (e.g. the /mission command).
@@ -382,21 +1189,136 @@ export class Orchestrator {
       // A progress listener is an observer, never a participant.
     }
 
+    const primaryBinding = workspace?.repositories.find((repository) => repository.repoId === workspace?.primaryRepoId);
+    let selectedBaseRef = primaryBinding?.baseSha ?? opts.baseRef;
+    if (primaryBinding && opts.baseRef && !workspaceError && this.repositoryRegistry) {
+      const targetGit = await GitRepo.open(primaryBinding.canonicalRoot);
+      const targetCommit = await targetGit?.resolveCommit(opts.baseRef);
+      if (!targetCommit) {
+        workspaceError = new WorkspaceScopeError(
+          `Requested base ${opts.baseRef} does not belong to selected repository ${primaryBinding.canonicalRoot}`,
+        );
+      } else {
+        selectedBaseRef = targetCommit;
+      }
+    }
     const mission = this.store.createMission({
       title: opts.title ?? request,
       goal: request,
       user_request: request,
-      repository: opts.repository,
-      base_ref: opts.baseRef,
+      repository: primaryBinding?.canonicalRoot ?? opts.repository,
+      base_ref: selectedBaseRef || "",
       constraints: opts.constraints ?? [],
       risk_profile: risk,
       workflow_class: intent.suggested_workflow,
       parent_session_id: this.parentSessionId,
     });
+    const expectedResumptionGeneration = this.store.listMissionResumptions(mission.mission_id).at(-1)?.generation ?? 0;
+    if (this.ownership) {
+      this.ownershipByMission.set(mission.mission_id, await this.ownership.acquire(mission.mission_id));
+    }
     if (opts.onProgress) this.progress.set(mission.mission_id, opts.onProgress);
     try {
       this.observability?.missionCreated(mission.mission_id, mission.title);
       this.store.transitionMission(mission.mission_id, "CLASSIFYING");
+
+      if (workspaceError) {
+        this.store.classifyFailure({
+          classificationId: id("FC"),
+          missionId: mission.mission_id,
+          taskId: null,
+          executionId: null,
+          category: "WORKSPACE_SCOPE_MISMATCH",
+          evidenceRefs: [],
+          fingerprint: `workspace:${workspaceError.message}`,
+          summary: workspaceError.message,
+          classifiedAt: new Date().toISOString(),
+        });
+        this.store.transitionMission(mission.mission_id, "BLOCKED");
+        const blocked = this.store.getMission(mission.mission_id)!;
+        return {
+          mission: blocked,
+          intent,
+          verdict: this.gate.evaluate(blocked),
+          completed: false,
+          failureReason: workspaceError.message,
+        };
+      }
+
+      if (workspace && !this.repositoryRegistry) {
+        const manifest = createWorkspaceManifest(workspace, mission.mission_id);
+        this.store.bindWorkspaceManifest(manifest);
+        await this.store.flush();
+        this.missionRepoIds.set(mission.mission_id, workspace.primaryRepoId);
+      }
+
+      if (workspace && this.repositoryRegistry) {
+        let probes: Awaited<ReturnType<RepositoryRegistry["probe"]>>;
+        try {
+          const manifest = createWorkspaceManifest(workspace, mission.mission_id);
+          const staged = await this.repositoryRegistry.stage(manifest);
+          probes = await staged.probe(workspace.primaryRepoId);
+          if (probes.some((probe) => !probe.ok)) throw new Error("workspace manifest failed role probes");
+          await this.store.bindWorkspaceManifestDurably(manifest, null);
+          staged.activate();
+        } catch (error) {
+          const summary = error instanceof Error ? error.message : String(error);
+          this.store.classifyFailure({
+            classificationId: id("FC"),
+            missionId: mission.mission_id,
+            taskId: null,
+            executionId: null,
+            category: "WORKSPACE_SCOPE_MISMATCH",
+            evidenceRefs: [],
+            fingerprint: `workspace-preflight:${workspace.primaryRepoId}`,
+            summary,
+            classifiedAt: new Date().toISOString(),
+          });
+          this.store.transitionMission(mission.mission_id, "BLOCKED");
+          const blocked = this.store.getMission(mission.mission_id)!;
+          return {
+            mission: blocked,
+            intent,
+            verdict: this.gate.evaluate(blocked),
+            completed: false,
+            failureReason: summary,
+          };
+        }
+        const failed = probes.filter((probe) => !probe.ok);
+        if (failed.length > 0 || probes.some((probe) => probe.repoId !== workspace.primaryRepoId)) {
+          const summary = `Repository role preflight mismatch: ${failed
+            .map((probe) => `${probe.role}: ${probe.reason ?? "binding mismatch"}`)
+            .join("; ")}`;
+          this.store.classifyFailure({
+            classificationId: id("FC"),
+            missionId: mission.mission_id,
+            taskId: null,
+            executionId: null,
+            category: "WORKSPACE_SCOPE_MISMATCH",
+            evidenceRefs: [],
+            fingerprint: `workspace-probe:${workspace.primaryRepoId}`,
+            summary,
+            classifiedAt: new Date().toISOString(),
+          });
+          this.store.transitionMission(mission.mission_id, "BLOCKED");
+          const blocked = this.store.getMission(mission.mission_id)!;
+          return {
+            mission: blocked,
+            intent,
+            verdict: this.gate.evaluate(blocked),
+            completed: false,
+            failureReason: summary,
+          };
+        }
+        this.missionRepoIds.set(mission.mission_id, workspace.primaryRepoId);
+        const activeManifest = this.store.getWorkspaceManifest(mission.mission_id)!;
+        this.repositoryRegistry.activate(
+          mission.mission_id,
+          activeManifest.generation,
+          activeManifest.hash,
+          workspace.primaryRepoId,
+        );
+      }
 
       // Derive acceptance criteria.
       const criteria = opts.acceptanceCriteria ?? (await this.deriveAcceptance?.(mission)) ?? [];
@@ -413,7 +1335,9 @@ export class Orchestrator {
           fact.changedFiles = [request];
         }
         const { gates } = deriveRequiredGates(fact);
-        this.store.updateMission(mission.mission_id, { required_gates: dedupe([...gates]) });
+        this.store.updateMission(mission.mission_id, {
+          required_gates: dedupe([...gates]),
+        });
       }
       this.phase(this.store.getMission(mission.mission_id)!, "classified");
       this.store.transitionMission(mission.mission_id, "PLANNING");
@@ -430,8 +1354,10 @@ export class Orchestrator {
         this.store.transitionMission(mission.mission_id, "READY");
         this.store.transitionMission(mission.mission_id, "EXECUTING");
         this.store.transitionMission(mission.mission_id, "FINAL_VALIDATION");
+        this.store.completeMission(mission.mission_id, {
+          expectedResumptionGeneration,
+        });
         this.observeGatePassed(mission.mission_id);
-        this.store.completeMission(mission.mission_id);
         const final = this.store.getMission(mission.mission_id)!;
         const verdict = this.gate.evaluate(final);
         return {
@@ -445,14 +1371,135 @@ export class Orchestrator {
 
       // Plan/decompose into tasks.
       const planned = await this.planner(this.store.getMission(mission.mission_id)!, risk);
-      for (const t of planned) {
-        this.store.createTask({ mission_id: mission.mission_id, ...t });
+      const plannedMission = this.store.getMission(mission.mission_id)!;
+      const manifest = this.store.getWorkspaceManifest(mission.mission_id);
+      const acceptanceIds = plannedMission.acceptance_criteria.flatMap((criterion) =>
+        criterion.acceptance_id ? [criterion.acceptance_id] : [],
+      );
+      const normalized = planned.map((task) => ({
+        ...task,
+        task_id: task.task_id ?? id("TSK"),
+        acceptance_ids: task.acceptance_ids ? [...task.acceptance_ids] : [],
+        deliverables: task.deliverables?.length ? [...task.deliverables] : [task.objective],
+        execution_budget_ms: task.execution_budget_ms ?? this.worksetPolicy.maxTaskBudgetMs,
+        checkpoint_policy: task.checkpoint_policy ?? {
+          activity_milestone: 5,
+          before_deadline_ms: 30_000,
+        },
+        required_output_artifacts: [...(task.required_output_artifacts ?? [])],
+      }));
+      let worksetError: WorksetValidationError | undefined;
+      let decomposedPlan: typeof normalized = [];
+      try {
+        decomposedPlan = splitWorksetDeliverables(normalized, this.worksetPolicy.maxDeliverablesPerTask).tasks;
+      } catch (error) {
+        if (error instanceof WorksetValidationError) worksetError = error;
+        else throw error;
+      }
+      const expandedByOriginal = new Map<string, typeof normalized>();
+      if (!worksetError) {
+        try {
+          for (const task of decomposedPlan) {
+            const repositories =
+              manifest && manifest.repositories.length > 1 && !task.repo_id && task.kind !== "aggregation"
+                ? manifest.repositories
+                : [
+                    manifest?.repositories.find(
+                      (repository) => repository.repoId === (task.repo_id ?? this.repoIdForMission(mission.mission_id)),
+                    ),
+                  ];
+            const expanded = repositories.map((repository) => {
+              const repoId = repository?.repoId ?? task.repo_id ?? this.repoIdForMission(mission.mission_id);
+              return {
+                ...task,
+                task_id: repositories.length > 1 && repoId ? `${task.task_id}@${repoId}` : task.task_id,
+                ...(repoId ? { repo_id: repoId } : {}),
+                write_domains:
+                  task.mutates_repo && repository
+                    ? intersectWriteDomains(
+                        task.write_domains.length > 0 ? task.write_domains : ["**"],
+                        repository.writableDomains,
+                      )
+                    : task.write_domains,
+              };
+            });
+            expandedByOriginal.set(task.task_id, expanded);
+          }
+        } catch (error) {
+          if (error instanceof WorksetValidationError) worksetError = error;
+          else throw error;
+        }
+      }
+      const expanded = [...expandedByOriginal.values()].flat().map((task) => ({
+        ...task,
+        depends_on: task.depends_on.flatMap((dependency) => {
+          const candidates = expandedByOriginal.get(dependency);
+          if (!candidates) return [dependency];
+          const sameRepository = candidates.find((candidate) => candidate.repo_id === task.repo_id);
+          return sameRepository ? [sameRepository.task_id] : candidates.map((candidate) => candidate.task_id);
+        }),
+      }));
+      let scopedPlan = expanded;
+      if (manifest && !worksetError) {
+        try {
+          scopedPlan = validateWorkset({
+            manifest,
+            acceptanceIds,
+            tasks: scopedPlan,
+            policy: this.worksetPolicy,
+          }) as typeof scopedPlan;
+        } catch (error) {
+          if (error instanceof WorksetValidationError) worksetError = error;
+          else throw error;
+        }
+      }
+      if (scopedPlan.some((task) => task.mutates_repo && task.write_domains.length === 0) || worksetError) {
+        const summary =
+          worksetError?.message ?? "Planner requested mutation outside the workspace manifest's writable domains";
+        const category =
+          worksetError?.code === "TASK_BUDGET_EXCEEDED"
+            ? "TASK_BUDGET_EXHAUSTED"
+            : worksetError?.code === "CYCLIC_DEPENDENCY" || worksetError?.code === "UNKNOWN_DEPENDENCY"
+              ? "DEADLOCKED_DAG"
+              : worksetError?.code === "UNKNOWN_REPOSITORY" ||
+                  worksetError?.code === "MISSING_REPOSITORY_BINDING" ||
+                  worksetError?.code === "WRITE_DOMAIN_OUTSIDE_REPOSITORY" ||
+                  worksetError?.code === "CROSS_REPOSITORY_MUTATION_UNSUPPORTED"
+                ? "WORKSPACE_SCOPE_MISMATCH"
+                : "REQUIREMENT_AMBIGUITY";
+        this.store.classifyFailure({
+          classificationId: id("FC"),
+          missionId: mission.mission_id,
+          taskId: null,
+          executionId: null,
+          category,
+          evidenceRefs: [],
+          fingerprint: `workspace-plan:${this.repoIdForMission(mission.mission_id) ?? "none"}`,
+          summary,
+          classifiedAt: new Date().toISOString(),
+        });
+        this.store.transitionMission(mission.mission_id, "BLOCKED");
+        const blocked = this.store.getMission(mission.mission_id)!;
+        return {
+          mission: blocked,
+          intent,
+          verdict: this.gate.evaluate(blocked),
+          completed: false,
+          failureReason: summary,
+        };
+      }
+      for (const t of scopedPlan) {
+        this.store.createTask({
+          mission_id: mission.mission_id,
+          ...t,
+        });
       }
       this.store.transitionMission(mission.mission_id, "READY");
 
       // Schedule + execute.
       this.store.transitionMission(mission.mission_id, "EXECUTING");
       this.phase(this.store.getMission(mission.mission_id)!, "executing");
+      await this.renewMissionOwnership(mission.mission_id);
       await this.scheduler.runMission(mission.mission_id, opts.signal);
 
       if (opts.signal?.aborted) {
@@ -465,7 +1512,7 @@ export class Orchestrator {
             this.store.transitionMission(mission.mission_id, "CANCELED");
           }
         }
-        await this.broker.cleanupMission(mission.mission_id);
+        await this.cleanupCanceledMission(mission.mission_id);
         const canceled = this.store.getMission(mission.mission_id)!;
         this.report(mission.mission_id, `[mission ${mission.mission_id}] canceled by caller`);
         return {
@@ -520,10 +1567,64 @@ export class Orchestrator {
         };
       }
 
-      const finalized = await this.finalizeMission(mission.mission_id, opts.signal);
+      // A wall-clock timeout with a durable partial checkpoint is not an
+      // integration candidate. Stop at the public repair boundary so recovery
+      // can split exactly the remaining deliverables and fence the late worker.
+      const timedCheckpoint = this.store
+        .listTasks(mission.mission_id)
+        .filter((task) => task.status === "FAILED" && task.assigned_execution_id)
+        .map((task) => ({
+          task,
+          execution: this.store.getExecution(task.assigned_execution_id!),
+          checkpoint: this.store.listTaskCheckpoints(mission.mission_id, task.task_id).at(-1),
+        }))
+        .find(
+          ({ execution, checkpoint }) =>
+            execution?.exit_status === "timeout" && (checkpoint?.remainingDeliverables.length ?? 0) > 0,
+        );
+      if (timedCheckpoint) {
+        const summary = "task execution budget exhausted after a durable partial checkpoint";
+        const classification = this.failureClassifier.classify({
+          missionId: mission.mission_id,
+          taskId: timedCheckpoint.task.task_id,
+          executionId: timedCheckpoint.execution!.execution_id,
+          summary,
+          evidenceRefs: [timedCheckpoint.checkpoint!.checkpointId],
+          category: "TASK_BUDGET_EXHAUSTED",
+          observedAt: new Date(this.scheduler.now()).toISOString(),
+        });
+        this.store.classifyFailure(classification);
+        this.store.transitionMission(mission.mission_id, "BLOCKED");
+        const blocked = this.store.getMission(mission.mission_id)!;
+        return {
+          mission: blocked,
+          intent,
+          verdict: this.gate.evaluate(blocked),
+          completed: false,
+          failureReason: summary,
+        };
+      }
+
+      const finalized = await this.finalizeMission(mission.mission_id, expectedResumptionGeneration, opts.signal);
       return { ...finalized, intent };
     } finally {
       this.progress.delete(mission.mission_id);
+      const identity = this.ownershipByMission.get(mission.mission_id);
+      if (identity && this.ownership) {
+        try {
+          await this.ownership.release(identity);
+        } catch (error) {
+          await this.store.recordOwnershipReleaseFailure({
+            missionId: identity.missionId,
+            generation: identity.generation,
+            fencingToken: identity.fencingToken,
+            ownerId: identity.ownerId,
+            renewBy: identity.renewBy,
+            error,
+          });
+        }
+        this.ownershipByMission.delete(mission.mission_id);
+      }
     }
   }
 
@@ -537,6 +1638,8 @@ export class Orchestrator {
    * down the mission is left paused (call again on the next probe).
    */
   async resume(missionId: string, opts?: { force?: boolean; signal?: AbortSignal }): Promise<Mission> {
+    const expectedResumptionGeneration = this.store.listMissionResumptions(missionId).at(-1)?.generation ?? 0;
+    this.activateMissionRepository(missionId);
     const mission = this.store.getMission(missionId);
     if (!mission) throw new Error(`unknown mission ${missionId}`);
     if (mission.status !== "PAUSED_INFRASTRUCTURE") return mission;
@@ -544,17 +1647,45 @@ export class Orchestrator {
     if (!opts?.force && !(await this.scheduler.gatewayHealthy(opts?.signal))) {
       return opts?.signal?.aborted ? this.cancelMission(missionId) : mission;
     }
-    this.phase(mission, "executing");
-    this.report(missionId, `[mission ${missionId}] resuming after infrastructure recovery`);
-    await this.scheduler.resumePausedMission(missionId, opts?.signal);
-    const resumed = this.store.getMission(missionId)!;
-    if (resumed.status === "PAUSED_INFRASTRUCTURE") return resumed;
-    if (opts?.signal?.aborted) return this.cancelMission(missionId);
-    return (await this.finalizeMission(missionId, opts?.signal)).mission;
+    if (this.ownership) this.ownershipByMission.set(missionId, await this.ownership.acquire(missionId));
+    try {
+      this.phase(mission, "executing");
+      this.report(missionId, `[mission ${missionId}] resuming after infrastructure recovery`);
+      await this.renewMissionOwnership(missionId);
+      await this.scheduler.resumePausedMission(missionId, opts?.signal);
+      const resumed = this.store.getMission(missionId)!;
+      if (resumed.status === "PAUSED_INFRASTRUCTURE") return resumed;
+      if (opts?.signal?.aborted) return this.cancelMission(missionId);
+      return (await this.finalizeMission(missionId, expectedResumptionGeneration, opts?.signal)).mission;
+    } finally {
+      const identity = this.ownershipByMission.get(missionId);
+      if (identity && this.ownership) {
+        try {
+          await this.ownership.release(identity);
+        } catch (error) {
+          await this.store.recordOwnershipReleaseFailure({
+            missionId: identity.missionId,
+            generation: identity.generation,
+            fencingToken: identity.fencingToken,
+            ownerId: identity.ownerId,
+            renewBy: identity.renewBy,
+            error,
+          });
+        }
+      }
+      this.ownershipByMission.delete(missionId);
+    }
   }
 
   /** Complete the lifecycle after scheduler work settles, whether initial or resumed. */
-  private async finalizeMission(missionId: string, signal?: AbortSignal): Promise<FinalizationResult> {
+  private async finalizeMission(
+    missionId: string,
+    expectedResumptionGeneration: number,
+    signal?: AbortSignal,
+    requiredCandidateChangeFrom?: string | null,
+  ): Promise<FinalizationResult> {
+    if (signal?.aborted) return this.canceledFinalization(missionId);
+    await this.reconcileCommittedPromotions(missionId);
     if (signal?.aborted) return this.canceledFinalization(missionId);
     // Post-execution: integrate, validate + review if the mission mutated or
     // requires gates. If integration did not land the change, the mission must
@@ -562,12 +1693,39 @@ export class Orchestrator {
     let post = await this.postExecution(this.store.getMission(missionId)!, signal);
     if (signal?.aborted) return this.canceledFinalization(missionId);
     let integrated = post.integrationOk;
+    if (
+      requiredCandidateChangeFrom !== undefined &&
+      (this.store.getCandidate(missionId)?.identityHash ?? null) === requiredCandidateChangeFrom
+    ) {
+      const evidence = requiredCandidateChangeFrom ?? "no-prior-candidate";
+      if (
+        !this.store
+          .listFindings(missionId)
+          .some((finding) => finding.category === "recovery_material_delta" && finding.evidence === evidence)
+      ) {
+        this.store.addFinding({
+          mission_id: missionId,
+          task_id: null,
+          severity: "blocking",
+          category: "recovery_material_delta",
+          file: null,
+          line: null,
+          summary: "Recovery repair did not produce a new candidate evidence identity.",
+          evidence,
+          recommended_action: "Produce a repository mutation and rebuild candidate evidence before rerunning gates.",
+        });
+      }
+    }
 
     // Completion gate, with bounded repair rounds (spec 07): a blocking reviewer
     // finding creates repair work, and the repaired result is re-validated and
     // re-reviewed before the gate is consulted again.
     let verdict = this.gate.evaluate(this.store.getMission(missionId)!);
-    let repairRounds = 0;
+    let repairRounds =
+      requiredCandidateChangeFrom !== undefined
+        ? this.maxRepairRounds
+        : this.store.listRecoveryDecisions(missionId).filter((decision) => decision.action === "CREATE_REPAIR_TASKS")
+            .length;
     while ((!verdict.can_complete || !integrated) && repairRounds < this.maxRepairRounds) {
       if (signal?.aborted) return this.canceledFinalization(missionId);
       const openBlocking = this.store
@@ -583,6 +1741,62 @@ export class Orchestrator {
         );
       if (openBlocking.length === 0 && failedGates.length === 0) break;
       repairRounds++;
+
+      const blockerTask = failedGates.at(-1);
+      let classification = this.store
+        .listFailureClassifications(missionId)
+        .reverse()
+        .find((entry) => entry.taskId === blockerTask?.task_id);
+      if (!classification) {
+        classification = this.failureClassifier.classify({
+          missionId,
+          taskId: blockerTask?.task_id ?? openBlocking.at(-1)?.task_id ?? null,
+          executionId: blockerTask?.assigned_execution_id ?? null,
+          summary: blockerTask?.failure_reason ?? openBlocking.at(-1)?.summary ?? "review repair required",
+          evidenceRefs: openBlocking.map((finding) => finding.finding_id),
+          category: blockerTask?.kind === "validation" ? "VALIDATION_FAILED" : "REVIEW_FAILED",
+          observedAt: new Date(this.scheduler.now()).toISOString(),
+        });
+        this.store.classifyFailure(classification);
+      }
+      const recoveryChoice = this.recoveryPlanner.decide({
+        classification,
+        history: this.store.listRecoveryDecisions(missionId),
+        now: this.scheduler.now(),
+        resumptionGeneration: this.store.listMissionResumptions(missionId).at(-1)?.generation ?? 0,
+      });
+      if (recoveryChoice.action === "STOP") {
+        const stopped =
+          this.store.getRecoveryDecision(recoveryChoice.recoveryId) ?? this.store.planRecovery(recoveryChoice);
+        if (stopped.status === "planned") this.store.transitionRecovery(stopped.recoveryId, "exhausted");
+        this.store.stopMission(missionId, {
+          reason: recoveryChoice.expectedMaterialChange,
+          preservedWork: await this.preservedMissionWork(missionId),
+          attemptedRecoveries: this.store.listRecoveryDecisions(missionId).map((decision) => decision.recoveryId),
+          resumeCondition: "new candidate evidence or an explicitly increased recovery budget is required",
+        });
+        await this.store.flush();
+        break;
+      }
+      const gateRecovery =
+        this.store.getRecoveryDecision(recoveryChoice.recoveryId) ??
+        this.store.planRecovery({
+          ...recoveryChoice,
+          startingCandidateIdentityHash: this.store.getCandidate(missionId)?.identityHash ?? null,
+        });
+      if (gateRecovery.status === "planned") this.store.transitionRecovery(gateRecovery.recoveryId, "started");
+      await this.store.flush();
+
+      const repairCandidate = this.store.getCandidate(missionId);
+      if (repairCandidate) {
+        this.store.invalidateEvidence({
+          invalidationId: id("EI"),
+          missionId,
+          identity: repairCandidate.identity,
+          reason: "repair changed candidate-relevant inputs",
+          invalidatedAt: new Date().toISOString(),
+        });
+      }
 
       if (this.store.getMission(missionId)!.status !== "REPAIRING") {
         this.store.transitionMission(missionId, "REPAIRING");
@@ -621,11 +1835,15 @@ export class Orchestrator {
           role: "implementer",
           objective: obj.objective,
           mutates_repo: true,
-          write_domains: ["**"],
+          write_domains: this.writableDomainsForMission(missionId),
           isolation: repairIsolation,
+          repo_id: this.repoIdForMission(missionId),
+          ...this.boundedTaskFields(missionId, ["repair"], []),
         });
         this.store.transitionTask(repair.task_id, "READY");
-        const repaired = await this.runSingleTask(missionId, repair.task_id, { signal });
+        const repaired = await this.runSingleTask(missionId, repair.task_id, {
+          signal,
+        });
         if (signal?.aborted) return this.canceledFinalization(missionId);
         if (repaired && obj.findingId) this.store.resolveFinding(obj.findingId);
       }
@@ -634,12 +1852,63 @@ export class Orchestrator {
       integrated = post.integrationOk;
       if (post.reviewAttempted && !post.reviewOk) {
         verdict = this.gate.evaluate(this.store.getMission(missionId)!);
+        if (this.store.getRecoveryDecision(gateRecovery.recoveryId)?.status === "started") {
+          this.store.transitionRecovery(gateRecovery.recoveryId, "failed");
+          await this.store.flush();
+        }
         break;
       }
       verdict = this.gate.evaluate(this.store.getMission(missionId)!);
+      if (this.store.getRecoveryDecision(gateRecovery.recoveryId)?.status === "started") {
+        this.store.transitionRecovery(
+          gateRecovery.recoveryId,
+          verdict.can_complete && integrated ? "succeeded" : "failed",
+        );
+        await this.store.flush();
+      }
     }
 
-    await this.broker.cleanupMission(missionId, { keepBranches: !integrated });
+    // Promotion is the only incumbent mutation. It occurs after both gate
+    // attempts are current and green, under a fresh repository fencing check.
+    // Failed/red/canceled candidates remain mounted/ref-addressable for diagnosis.
+    const hasCandidateForPromotion = await this.broker.hasCandidateForPromotion(missionId);
+    if (verdict.can_complete && integrated && hasCandidateForPromotion) {
+      const integrationTask = this.store
+        .listTasks(missionId)
+        .filter((task) => task.kind === "integration" && task.repo_id)
+        .at(-1);
+      if (!integrationTask) {
+        integrated = false;
+      } else if (!this.ownership) {
+        // Legacy in-memory orchestrators have no lease provider. Production
+        // runtimes always supply ownership; retain compatibility for isolated
+        // deterministic harnesses while still using the guarded Git primitive.
+        integrated = await this.broker.promoteCandidate(missionId);
+      } else {
+        const promotionAuthority = await this.acquireTaskAuthority(integrationTask);
+        try {
+          promotionAuthority.assertAuthoritative();
+          integrated = await this.broker.promoteCandidate(missionId, promotionAuthority);
+        } catch (error) {
+          integrated = false;
+          this.store.addFinding({
+            mission_id: missionId,
+            task_id: integrationTask.task_id,
+            severity: "blocking",
+            category: "integration",
+            file: null,
+            line: null,
+            summary: `Candidate promotion rejected: ${error instanceof Error ? error.message : String(error)}`,
+            evidence: null,
+            recommended_action:
+              "Inspect the preserved candidate and retry only from the originally bound incumbent base.",
+          });
+        } finally {
+          await promotionAuthority.close();
+        }
+      }
+    }
+    await this.cleanupMissionWithAuthorities(missionId, !integrated);
     if (!integrated) {
       const preserved = this.broker.preservedBranches(missionId);
       if (preserved.length > 0) {
@@ -663,7 +1932,7 @@ export class Orchestrator {
       if (pre !== "FINAL_VALIDATION" && pre !== "REVIEWING") {
         this.store.transitionMission(missionId, "FINAL_VALIDATION");
       }
-      this.observeGatePassed(missionId);
+      this.store.completeMission(missionId, { expectedResumptionGeneration });
       for (const taskId of verdict.superseded_by_recovery ?? []) {
         this.store.addFinding({
           mission_id: missionId,
@@ -677,7 +1946,7 @@ export class Orchestrator {
           recommended_action: "None required; recorded so the completion over a failed task is auditable.",
         });
       }
-      this.store.completeMission(missionId);
+      this.observeGatePassed(missionId);
       this.phase(this.store.getMission(missionId)!, "complete");
       return {
         mission: this.store.getMission(missionId)!,
@@ -694,6 +1963,14 @@ export class Orchestrator {
       unresolvedBlocking > 0 || (finalMission.required_gates.length > 0 && verdict.reasons.length > 0);
     if (hasBlocking) {
       if (finalMission.status !== "BLOCKED") this.store.transitionMission(missionId, "BLOCKED");
+      if (!this.store.listMissionStops(missionId).at(-1)) {
+        this.store.stopMission(missionId, {
+          reason: verdict.reasons.join("; ") || "completion requirements remain blocked",
+          preservedWork: await this.preservedMissionWork(missionId),
+          attemptedRecoveries: this.store.listRecoveryDecisions(missionId).map((decision) => decision.recoveryId),
+          resumeCondition: "provide the missing current-candidate evidence or repair the reported blocking condition",
+        });
+      }
     } else {
       this.store.failMission(missionId, verdict.reasons.join("; "));
     }
@@ -701,7 +1978,11 @@ export class Orchestrator {
     const reason = verdict.reasons.join("; ") || "completion requirements were not satisfied";
     const summary = `Mission ${stopped.status.toLowerCase()}: ${reason}. No workers remain active.`;
     this.observability?.clearWaiting(missionId);
-    this.observability?.activity(missionId, { type: "error", summary, meaningfulProgress: true });
+    this.observability?.activity(missionId, {
+      type: "error",
+      summary,
+      meaningfulProgress: true,
+    });
     this.report(missionId, `[mission ${missionId}] ${summary}`);
     return {
       mission: stopped,
@@ -754,12 +2035,21 @@ export class Orchestrator {
         role: "integrator",
         objective: "Merge worker/repair branches into the base checkout.",
         mutates_repo: true,
+        write_domains: this.writableDomainsForMission(mission.mission_id),
         isolation: "none",
+        repo_id: this.repoIdForMission(mission.mission_id),
+        ...this.boundedTaskFields(mission.mission_id, ["integration"], []),
       });
       this.store.transitionTask(integ.task_id, "READY");
       integrationOk = await this.runSingleTask(mission.mission_id, integ.task_id, { signal });
       if (signal?.aborted) {
-        return { validationAttempted, validationOk, reviewAttempted, reviewOk, integrationOk: false };
+        return {
+          validationAttempted,
+          validationOk,
+          reviewAttempted,
+          reviewOk,
+          integrationOk: false,
+        };
       }
       // A green merge is not proof the work landed: harvesting a worktree can
       // fail silently, and merging an empty branch is trivially clean. Require
@@ -793,7 +2083,14 @@ export class Orchestrator {
       }
       // A conflicted or failed integration means the change is not in the tree;
       // report it so the caller does not complete on top of an unchanged repo.
-      if (!integrationOk) return { validationAttempted, validationOk, reviewAttempted, reviewOk, integrationOk };
+      if (!integrationOk)
+        return {
+          validationAttempted,
+          validationOk,
+          reviewAttempted,
+          reviewOk,
+          integrationOk,
+        };
     } else if (anyMutation) {
       // No worktree/merge path exists because the runtime has no git provider, so
       // there is no base commit to diff against and nothing can PROVE the repo
@@ -823,12 +2120,20 @@ export class Orchestrator {
         objective: "Run deterministic validation (typecheck/tests/lint) over the integrated result.",
         mutates_repo: false,
         isolation: "none",
+        repo_id: this.repoIdForMission(mission.mission_id),
+        ...this.boundedTaskFields(mission.mission_id, ["validation"], []),
       });
       this.store.transitionTask(task.task_id, "READY");
       validationAttempted = true;
       validationOk = await this.runSingleTask(mission.mission_id, task.task_id, { signal });
       if (signal?.aborted) {
-        return { validationAttempted, validationOk, reviewAttempted, reviewOk, integrationOk };
+        return {
+          validationAttempted,
+          validationOk,
+          reviewAttempted,
+          reviewOk,
+          integrationOk,
+        };
       }
       // From VALIDATING the mission may move on to review or final validation.
       if (
@@ -869,6 +2174,8 @@ export class Orchestrator {
         mutates_repo: false,
         isolation: "none",
         depends_on: this.lastValidationTaskId(mission.mission_id),
+        repo_id: this.repoIdForMission(mission.mission_id),
+        ...this.boundedTaskFields(mission.mission_id, ["independent-review"], []),
       });
       this.store.transitionTask(task.task_id, "READY");
       reviewAttempted = true;
@@ -877,13 +2184,25 @@ export class Orchestrator {
         signal,
       });
       if (signal?.aborted) {
-        return { validationAttempted, validationOk, reviewAttempted, reviewOk, integrationOk };
+        return {
+          validationAttempted,
+          validationOk,
+          reviewAttempted,
+          reviewOk,
+          integrationOk,
+        };
       }
       // From REVIEWING the mission moves to final validation (or repair handled
       // by the caller via the completion gate).
       this.store.transitionMission(mission.mission_id, "FINAL_VALIDATION");
     }
-    return { validationAttempted, validationOk, reviewAttempted, reviewOk, integrationOk };
+    return {
+      validationAttempted,
+      validationOk,
+      reviewAttempted,
+      reviewOk,
+      integrationOk,
+    };
   }
 
   /** Tasks whose recovered commits a SUCCEEDED integration merged (broker evidence). */
@@ -895,6 +2214,36 @@ export class Orchestrator {
         .flatMap((e) => (e.recovered_merged ?? []).map((r) => r.task_id)),
     );
     return [...ids].map((id) => this.store.getTask(id)).filter((t): t is OrchestrationTask => t !== undefined);
+  }
+
+  private writableDomainsForMission(missionId: string): string[] {
+    const repoId = this.repoIdForMission(missionId);
+    return (
+      this.store
+        .getWorkspaceManifest(missionId)
+        ?.repositories.find((repository) => repository.repoId === repoId)
+        ?.writableDomains.slice() ?? ["**"]
+    );
+  }
+
+  private boundedTaskFields(
+    missionId: string,
+    deliverables: string[],
+    requiredOutputArtifacts: string[],
+  ): Pick<
+    OrchestrationTask,
+    "acceptance_ids" | "deliverables" | "execution_budget_ms" | "checkpoint_policy" | "required_output_artifacts"
+  > {
+    const mission = this.store.getMission(missionId);
+    return {
+      acceptance_ids: mission?.acceptance_criteria.flatMap((criterion) =>
+        criterion.acceptance_id ? [criterion.acceptance_id] : [],
+      ),
+      deliverables,
+      execution_budget_ms: this.worksetPolicy.maxTaskBudgetMs,
+      checkpoint_policy: { activity_milestone: 5, before_deadline_ms: 30_000 },
+      required_output_artifacts: requiredOutputArtifacts,
+    };
   }
 
   private lastValidationTaskId(missionId: string): string[] {
@@ -910,20 +2259,26 @@ export class Orchestrator {
     taskId: string,
     extra: { reviewedRecovered?: string[]; signal?: AbortSignal } = {},
   ): Promise<boolean> {
-    const task = this.store.getTask(taskId)!;
+    if (!this.recoveryTaskGenerations.has(taskId)) await this.renewMissionOwnership(missionId);
+    let task = this.store.getTask(taskId)!;
+    const authority = this.ownership ? await this.acquireTaskAuthority(task) : undefined;
+    if (authority) task = this.store.assignTaskAuthority(taskId, authority.missionIdentity);
+    authority?.assertAuthoritative();
     this.store.transitionTask(taskId, "RUNNING");
     this.report(
       missionId,
       `[mission ${missionId}] ${task.kind}:${task.role} starting — ${task.objective.slice(0, 120)}`,
     );
+    let handle: Awaited<ReturnType<ExecutionBroker["execute"]>> | undefined;
     try {
       // execute() itself can throw — e.g. no backend is registered for the task
       // kind. Left outside the try it propagated out of postExecution and
       // orchestrate and left the mission stranded in INTEGRATING / VALIDATING /
       // REVIEWING. The scheduler path was hardened the same way; this one was not.
-      const handle = await this.broker.execute({
+      handle = await this.broker.execute({
         taskId,
         missionId,
+        repoId: task.repo_id,
         kind: brokerKind(task.kind),
         role: task.role,
         objective: task.objective,
@@ -931,22 +2286,47 @@ export class Orchestrator {
         writeDomains: task.write_domains,
         isolation: task.isolation,
         modelRequirements: task.execution_requirements,
+        deliverables: task.deliverables,
+        executionBudgetMs: task.execution_budget_ms,
+        checkpointPolicy: task.checkpoint_policy,
+        requiredOutputArtifacts: task.required_output_artifacts,
+        candidateBaseSha: task.repair_base_candidate_sha,
+        acceptanceCriteria: this.store.getMission(missionId)?.acceptance_criteria.flatMap((criterion) =>
+          criterion.acceptance_id
+            ? [
+                {
+                  acceptanceId: criterion.acceptance_id,
+                  criterion: criterion.criterion,
+                },
+              ]
+            : [],
+        ),
+        authority,
         ...(extra.reviewedRecovered?.length ? { reviewedRecovered: extra.reviewedRecovered } : {}),
       });
+      const executionHandle = handle;
+      authority?.onInvalidated(() => {
+        void executionHandle.cancel();
+      });
       const onAbort = (): void => {
-        void handle.cancel();
+        void executionHandle.cancel();
       };
-      if (extra.signal?.aborted) await handle.cancel();
+      if (extra.signal?.aborted) await executionHandle.cancel();
       else extra.signal?.addEventListener("abort", onAbort, { once: true });
-      const outcome = await handle.result().finally(() => extra.signal?.removeEventListener("abort", onAbort));
+      const outcome = await executionHandle.result().finally(() => extra.signal?.removeEventListener("abort", onAbort));
+      authority?.assertAuthoritative();
       // Record reviewer findings so the completion gate can block on them.
       for (const f of outcome.findings ?? []) {
-        const severity =
-          (f.severity as string) === "blocking" ? "blocking" : (f.severity as string) === "major" ? "major" : "minor";
+        let severity: ReviewFinding["severity"];
+        try {
+          severity = normalizeReviewSeverity(f.severity);
+        } catch {
+          severity = "blocking";
+        }
         this.store.addFinding({
           mission_id: missionId,
           task_id: taskId,
-          severity: severity as ReviewFinding["severity"],
+          severity,
           category: (f.category as string) ?? "correctness",
           file: (f.file as string | null) ?? null,
           line: (f.line as number | null) ?? null,
@@ -979,9 +2359,24 @@ export class Orchestrator {
         return false;
       }
       this.store.transitionTask(taskId, "SUCCEEDED");
+      if (task.kind === "validation" || task.kind === "review") this.markAcceptanceFromCurrentEvidence(missionId);
       this.report(missionId, `[mission ${missionId}] ${task.kind}:${task.role} succeeded`);
       return true;
     } catch (err) {
+      if (authority) {
+        try {
+          authority.assertAuthoritative();
+        } catch (authorityError) {
+          await handle?.cancel().catch(() => undefined);
+          if (handle) {
+            this.store.rejectLateExecution(
+              handle.executionId,
+              authorityError instanceof Error ? authorityError.message : String(authorityError),
+            );
+          }
+          return false;
+        }
+      }
       if (extra.signal?.aborted) {
         await this.broker.cancelByTask(taskId);
         if (this.store.getTask(taskId)?.status === "RUNNING") this.store.transitionTask(taskId, "CANCELED");
@@ -991,6 +2386,207 @@ export class Orchestrator {
       if (this.store.getTask(taskId)?.status === "RUNNING") this.store.transitionTask(taskId, "FAILED");
       this.report(missionId, `[mission ${missionId}] ${task.kind}:${task.role} errored`);
       return false;
+    } finally {
+      const closeError = await authority?.close();
+      if (authority && closeError) {
+        const identity = authority.repositoryIdentity ?? authority.missionIdentity;
+        await this.store.recordOwnershipReleaseFailure({
+          missionId: identity.missionId,
+          taskId,
+          ...(authority.repositoryIdentity ? { repoId: authority.repositoryIdentity.repoId } : {}),
+          generation: identity.generation,
+          fencingToken: identity.fencingToken,
+          ownerId: identity.ownerId,
+          renewBy: identity.renewBy,
+          error: closeError,
+        });
+      }
+    }
+  }
+
+  private markAcceptanceFromCurrentEvidence(missionId: string): void {
+    const mission = this.store.getMission(missionId);
+    const repoId = this.repoIdForMission(missionId);
+    const candidate = repoId ? this.store.getCandidate(missionId, repoId) : undefined;
+    if (!mission || !candidate) return;
+    const validation = this.store
+      .listValidationEvidence(missionId)
+      .filter((evidence) => evidence.identityHash === candidate.identityHash)
+      .at(-1);
+    const review = this.store
+      .listReviewEvidence(missionId)
+      .filter((evidence) => evidence.identityHash === candidate.identityHash)
+      .at(-1);
+    const requiresValidation = mission.required_gates.some((gate) =>
+      ["validation", "migration_validation", "dependency_validation"].includes(gate),
+    );
+    const requiresReview = mission.required_gates.some((gate) =>
+      ["independent_review", "security_review", "compatibility_review"].includes(gate),
+    );
+    const validationOk =
+      !requiresValidation ||
+      (!!validation && validation.accessible && !validation.noTargets && validation.exitCode === 0);
+    const reviewOk =
+      !requiresReview ||
+      (!!review &&
+        review.accessible &&
+        review.outputValid &&
+        review.verdict === "approve" &&
+        review.findings.every((finding) => finding.severity !== "blocking" || finding.status === "resolved"));
+    if (!validationOk || !reviewOk) return;
+    const explicitPassed = new Set(
+      [...(validation?.acceptanceResults ?? []), ...(review?.acceptanceResults ?? [])]
+        .filter((result) => result.status === "passed")
+        .map((result) => result.acceptanceId),
+    );
+    mission.acceptance_criteria.forEach((criterion, index) => {
+      if (
+        criterion.acceptance_id &&
+        candidate.identity.acceptanceIds.includes(criterion.acceptance_id) &&
+        explicitPassed.has(criterion.acceptance_id)
+      ) {
+        this.store.setCriterionStatus(missionId, index, "passed", candidate.identityHash);
+      }
+    });
+  }
+
+  private async renewMissionOwnership(missionId: string): Promise<void> {
+    const identity = this.ownershipByMission.get(missionId);
+    if (!identity || !this.ownership) return;
+    this.ownershipByMission.set(missionId, await this.ownership.renew(identity));
+  }
+
+  private async acquireTaskAuthority(task: OrchestrationTask): Promise<DispatchAuthority> {
+    const currentResumptionGeneration = this.store.listMissionResumptions(task.mission_id).at(-1)?.generation ?? 0;
+    const lineageDecisions = this.store
+      .listTaskSupersessions(task.mission_id)
+      .filter((lineage) => lineage.replacementTaskIds.includes(task.task_id))
+      .flatMap((lineage) =>
+        lineage.recoveryDecisionId ? [this.store.getRecoveryDecision(lineage.recoveryDecisionId)] : [],
+      )
+      .filter((decision): decision is NonNullable<typeof decision> => decision !== undefined);
+    if (lineageDecisions.length > 1) {
+      throw new Error(`replacement task ${task.task_id} belongs to multiple recovery lineages`);
+    }
+    const activeRecoveryDecisions = this.store
+      .listRecoveryDecisions(task.mission_id)
+      .filter(
+        (decision) =>
+          (decision.resumptionGeneration ?? 0) === currentResumptionGeneration &&
+          decision.blockedEpisodeId !== undefined &&
+          (decision.status === "planned" || decision.status === "started") &&
+          !["STOP", "WAIT_FOR_REQUIREMENT", "PAUSE_FOR_PERSISTENCE", "PROBE_AND_BACKOFF"].includes(decision.action),
+      );
+    const durableRecoveryGeneration =
+      lineageDecisions[0]?.resumptionGeneration ??
+      (activeRecoveryDecisions.length === 1 ? activeRecoveryDecisions[0]?.resumptionGeneration : undefined);
+    const recoveryGeneration = durableRecoveryGeneration ?? this.recoveryTaskGenerations.get(task.task_id);
+    const recoveryKey = recoveryGeneration === undefined ? undefined : `${task.mission_id}:${recoveryGeneration}`;
+    const identity = recoveryKey
+      ? this.recoveryOwnershipByFlight.get(recoveryKey)
+      : this.ownershipByMission.get(task.mission_id);
+    if (!identity || !this.ownership) throw new Error(`mission ${task.mission_id} has no active ownership`);
+    if (task.mutates_repo && !task.repo_id) {
+      throw new Error(`mutating task ${task.task_id} has no repository identity`);
+    }
+    const held = await this.ownership.maintain(identity, task.mutates_repo ? task.repo_id : undefined);
+    return {
+      get missionIdentity() {
+        return held.missionIdentity;
+      },
+      get repositoryIdentity() {
+        return held.repositoryIdentity;
+      },
+      get resumptionGeneration() {
+        return held.resumptionGeneration;
+      },
+      assertAuthoritative: () => held.assertAuthoritative(),
+      onInvalidated: (listener) => held.onInvalidated(listener),
+      close: async () => {
+        const error = await held.close();
+        if (recoveryKey) {
+          if (this.recoveryOwnershipByFlight.get(recoveryKey) === identity) {
+            this.recoveryOwnershipByFlight.set(recoveryKey, held.missionIdentity);
+          }
+        } else {
+          this.ownershipByMission.set(task.mission_id, held.missionIdentity);
+        }
+        return error;
+      },
+    };
+  }
+
+  /** Clean canceled mission work only while holding fresh repository authority. */
+  private async cleanupCanceledMission(missionId: string): Promise<void> {
+    try {
+      await this.cleanupMissionWithAuthorities(missionId, true);
+    } catch (error) {
+      this.store.addFinding({
+        mission_id: missionId,
+        task_id: null,
+        severity: "major",
+        category: "integration",
+        file: null,
+        line: null,
+        summary: `Cancellation cleanup could not acquire or retain repository authority; diagnostics preserved: ${error instanceof Error ? error.message : String(error)}`,
+        evidence: null,
+        recommended_action: "Reacquire repository authority before retrying cleanup.",
+      });
+    }
+  }
+
+  private async cleanupMissionWithAuthorities(missionId: string, keepBranches: boolean): Promise<void> {
+    if (!this.ownership) {
+      await this.broker.cleanupMission(missionId, { keepBranches });
+      return;
+    }
+    const taskByRepo = new Map(
+      this.store
+        .listTasks(missionId)
+        .filter((task) => task.repo_id && task.mutates_repo)
+        .map((task) => [task.repo_id!, task]),
+    );
+    await this.broker.cleanupMission(missionId, {
+      keepBranches,
+      authorityForRepo: async (repoId) => {
+        const task = taskByRepo.get(repoId);
+        if (!task) throw new Error(`no authority-bearing task for repository ${repoId}`);
+        return this.acquireTaskAuthority(task);
+      },
+    });
+  }
+
+  /** Reconcile a previously committed CAS before any new validation or review gates run. */
+  private async reconcileCommittedPromotions(missionId: string): Promise<void> {
+    if (!this.ownership) return;
+    const taskByRepo = new Map(
+      this.store
+        .listTasks(missionId)
+        .filter((task) => task.kind === "integration" && task.repo_id)
+        .map((task) => [task.repo_id!, task]),
+    );
+    for (const [repoId, task] of taskByRepo) {
+      const authority = await this.acquireTaskAuthority(task);
+      try {
+        const results = await this.broker.reconcileCommittedPromotions(missionId, repoId, authority);
+        for (const result of results) {
+          if (!result.promoted && result.reason?.includes("diverged")) {
+            this.store.addFinding({
+              mission_id: missionId,
+              task_id: task.task_id,
+              severity: "blocking",
+              category: "integration",
+              file: null,
+              line: null,
+              summary: `Committed promotion reconciliation failed: ${result.reason}`,
+              evidence: result.candidateSha,
+              recommended_action: "Inspect the exact durable promotion intent and incumbent divergence.",
+            });
+          }
+        }
+      } finally {
+        await authority.close();
+      }
     }
   }
 
@@ -1004,7 +2600,7 @@ export class Orchestrator {
     if (canTransitionMission(mission.status, "CANCELED")) {
       mission = this.store.transitionMission(missionId, "CANCELED");
     }
-    await this.broker.cleanupMission(missionId);
+    await this.cleanupCanceledMission(missionId);
     this.report(missionId, `[mission ${missionId}] canceled by caller`);
     return mission;
   }
@@ -1045,4 +2641,24 @@ export class Orchestrator {
 
 function dedupe<T>(arr: T[]): T[] {
   return [...new Set(arr)];
+}
+
+export function intersectWriteDomains(requested: string[], authorized: string[]): string[] {
+  const canonicalRequested = requested.map(canonicalizeWriteDomain);
+  const canonicalAuthorized = authorized.map(canonicalizeWriteDomain);
+  const intersection = new Set<string>();
+  const contains = (outer: string, inner: string): boolean => {
+    if (outer === "**") return true;
+    if (outer === inner) return true;
+    if (!outer.endsWith("/**")) return false;
+    const prefix = outer.slice(0, -3).replace(/\/$/, "");
+    return inner === prefix || inner.startsWith(`${prefix}/`);
+  };
+  for (const request of canonicalRequested) {
+    for (const allow of canonicalAuthorized) {
+      if (contains(request, allow)) intersection.add(allow);
+      else if (contains(allow, request)) intersection.add(request);
+    }
+  }
+  return [...intersection];
 }

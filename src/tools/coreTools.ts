@@ -17,6 +17,9 @@ export interface CoreServices {
   orchestrator?: Orchestrator | null;
   /** Resolve the current repo base ref. */
   baseRef?: () => Promise<string> | string;
+  /** Authorized repository selected for this tool execution. */
+  repoId?: string;
+  repositoryRoot?: string;
 }
 
 /**
@@ -180,9 +183,16 @@ export function buildCoreTools(
         return { content: [{ type: "text", text: "Artifact not found." }], details: { found: false }, isError: true };
       const offset = params.offset ? Math.max(0, Number(params.offset)) : 0;
       const cap = params.max_chars ? Math.max(1, Number(params.max_chars)) : 12000;
-      // Read only the requested byte range from disk (true lazy retrieval for
-      // large outputs) rather than loading the whole file and slicing in memory.
-      const read = await services.artifacts.readSliceByUri(String(params.uri), offset, cap);
+      let read;
+      try {
+        read = await services.artifacts.readSliceByUri(String(params.uri), offset, cap);
+      } catch (error) {
+        return {
+          content: [{ type: "text", text: `Artifact integrity failure: ${String(error)}` }],
+          details: { found: false },
+          isError: true,
+        };
+      }
       // A missing content file must surface as an error, not a silent empty
       // result (a reviewer would otherwise judge an empty diff and could
       // report no findings, enabling silent promotion).
@@ -223,7 +233,10 @@ export function buildCoreTools(
       if (!services.broker) return { content: [{ type: "text", text: "Not a git repository." }], details: {} };
       const hits = await services.broker.search(String(params.query), params.limit ?? 40);
       const text = hits.length ? hits.map((h) => `${h.path}:${h.line} — ${h.text}`).join("\n") : "No matches.";
-      return { content: [{ type: "text", text }], details: { hits: hits.length } };
+      return {
+        content: [{ type: "text", text }],
+        details: { hits: hits.length, ...(services.repoId ? { repoId: services.repoId } : {}) },
+      };
     },
   });
 
@@ -297,10 +310,12 @@ export function buildCoreTools(
           details: {},
         };
       const request = String(params.request);
-      const baseRef = typeof services.baseRef === "function" ? await services.baseRef() : "";
       const result = await services.orchestrator.orchestrate(request, {
-        repository: ctx.cwd,
-        baseRef,
+        repository: services.repositoryRoot ?? ctx.cwd,
+        // The orchestrator resolves the request's explicit repository before
+        // choosing a base. Forwarding the caller cwd's SHA can bind an external
+        // target mission to an unrelated launch repository commit.
+        baseRef: "",
         constraints: (params.constraints as string[] | undefined) ?? [],
         mutationRequested: params.mutate ?? true,
         signal,

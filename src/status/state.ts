@@ -55,6 +55,12 @@ export interface TaskState {
   phase: string;
   /** Short human label (the goal), optional. */
   label?: string;
+  /** Actionable mission state kept structured so layout cannot elide its explanation. */
+  missionStatus?: {
+    token: string;
+    reason: string;
+    next: string;
+  };
 }
 
 export interface HarnessStatusState {

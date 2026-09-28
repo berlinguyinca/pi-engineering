@@ -1,10 +1,15 @@
 import assert from "node:assert/strict";
-import { appendFile, mkdtemp, readFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
+import { lstatSync, rmSync, writeFileSync } from "node:fs";
+import { appendFile, mkdir, mkdtemp, readFile, readdir, stat, writeFile } from "node:fs/promises";
+import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { EventStore } from "../../src/ledger/EventStore.ts";
 import { LedgerEventStoreBackend } from "../../src/platform/eventstore/adapters.ts";
+import { ExclusiveFileLock } from "../../src/platform/eventstore/fileLock.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 
 const evt = (i: number) => ({
@@ -16,6 +21,160 @@ const evt = (i: number) => ({
   worker_id: null,
   payload: { i },
 });
+
+const jsonlModule = pathToFileURL(
+  fileURLToPath(new URL("../../src/platform/eventstore/jsonl.ts", import.meta.url)),
+).href;
+const fileLockModule = pathToFileURL(
+  fileURLToPath(new URL("../../src/platform/eventstore/fileLock.ts", import.meta.url)),
+).href;
+
+async function startStoreOwner(file: string) {
+  const script = `
+    import { JsonlEventStore } from ${JSON.stringify(jsonlModule)};
+    const store = await JsonlEventStore.open(${JSON.stringify(file)});
+    process.stdout.write("READY\\n");
+    process.on("message", (message) => {
+      if (message === "close") {
+        store.close();
+        process.exit(0);
+      }
+    });
+  `;
+  const child = spawn(process.execPath, ["--input-type=module", "--eval", script], {
+    stdio: ["ignore", "pipe", "pipe", "ipc"],
+  });
+  await new Promise<void>((resolve, reject) => {
+    let stderr = "";
+    child.stderr!.on("data", (chunk) => {
+      stderr += String(chunk);
+    });
+    child.stdout!.on("data", (chunk) => {
+      if (String(chunk).includes("READY")) resolve();
+    });
+    child.once("exit", (code) => reject(new Error(`store owner exited early (${code}): ${stderr}`)));
+  });
+  return child;
+}
+
+async function waitForExit(child: ReturnType<typeof spawn>): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  await new Promise<void>((resolve) => child.once("exit", () => resolve()));
+}
+
+async function currentProcessIncarnation(): Promise<{ bootId: string; processStartTime: string }> {
+  const bootId = (await readFile("/proc/sys/kernel/random/boot_id", "utf8")).trim();
+  const statLine = await readFile(`/proc/${process.pid}/stat`, "utf8");
+  const processStartTime = statLine
+    .slice(statLine.lastIndexOf(")") + 2)
+    .trim()
+    .split(/\s+/)[19]!;
+  return { bootId, processStartTime };
+}
+
+async function deadLockOwner(ownerToken: string): Promise<Record<string, unknown>> {
+  const { bootId } = await currentProcessIncarnation();
+  return {
+    pid: 2_000_000_000,
+    host: hostname(),
+    openedAt: "2026-01-01T00:00:00.000Z",
+    ownerToken,
+    bootId,
+    processStartTime: "1",
+  };
+}
+
+async function startRecoveryClaimant(file: string) {
+  const script = `
+    import { ExclusiveFileLock } from ${JSON.stringify(fileLockModule)};
+    await ExclusiveFileLock.acquire(${JSON.stringify(file)}, {
+      afterRecoveryClaimPublished: async (claimPath) => {
+        process.stdout.write("READY:" + claimPath + "\\n");
+        setInterval(() => {}, 1_000);
+        await new Promise(() => {});
+      },
+    });
+  `;
+  const child = spawn(process.execPath, ["--input-type=module", "--eval", script], {
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const claimPath = await new Promise<string>((resolve, reject) => {
+    let stderr = "";
+    child.stderr!.on("data", (chunk) => {
+      stderr += String(chunk);
+    });
+    child.stdout!.on("data", (chunk) => {
+      const match = String(chunk).match(/READY:(.+)\n/);
+      if (match?.[1]) resolve(match[1]);
+    });
+    child.once("exit", (code) => reject(new Error(`recovery claimant exited early (${code}): ${stderr}`)));
+  });
+  return { child, claimPath };
+}
+
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
+function replaceImmediately(path: string, bytes: string): void {
+  const originalInode = lstatSync(path).ino;
+  for (let attempt = 0; attempt < 256; attempt += 1) {
+    rmSync(path, { force: true });
+    writeFileSync(path, bytes, "utf8");
+    if (lstatSync(path).ino === originalInode) return;
+  }
+}
+
+function startRacingOwner(file: string) {
+  const script = `
+    import { JsonlEventStore } from ${JSON.stringify(jsonlModule)};
+    try {
+      const store = await JsonlEventStore.open(${JSON.stringify(file)});
+      process.stdout.write("READY\\n");
+      process.on("message", (message) => {
+        if (message === "close") {
+          store.close();
+          process.exit(0);
+        }
+      });
+    } catch (error) {
+      process.stdout.write("BLOCKED:" + String(error) + "\\n");
+      process.exit(2);
+    }
+  `;
+  const child = spawn(process.execPath, ["--input-type=module", "--eval", script], {
+    stdio: ["ignore", "pipe", "pipe", "ipc"],
+  });
+  const outcome = new Promise<"ready" | "blocked">((resolve, reject) => {
+    child.stdout!.on("data", (chunk) => {
+      const line = String(chunk);
+      if (line.includes("READY")) resolve("ready");
+      if (line.includes("BLOCKED:")) resolve("blocked");
+    });
+    child.once("error", reject);
+  });
+  const blockedMessage = new Promise<string>((resolve) => {
+    child.stdout!.on("data", (chunk) => {
+      const match = String(chunk).match(/BLOCKED:(.+)\n/);
+      if (match?.[1]) resolve(match[1]);
+    });
+  });
+  return { child, outcome, blockedMessage };
+}
+
+async function outcomeWithin(
+  contender: ReturnType<typeof startRacingOwner>,
+  timeoutMs = 500,
+): Promise<"ready" | "blocked" | "timeout"> {
+  return Promise.race([
+    contender.outcome,
+    new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), timeoutMs)),
+  ]);
+}
 
 describe("EventStore backends", () => {
   it("JsonlEventStore in-memory appends and replays in order", async () => {
@@ -48,6 +207,15 @@ describe("EventStore backends", () => {
     s2.close();
   });
 
+  it("creates a missing parent directory before acquiring its writer lock", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pie-store-parent-"));
+    const file = join(dir, "nested", "events.jsonl");
+    const store = await JsonlEventStore.open(file);
+    await store.append(evt(1));
+    store.close();
+    assert.equal((await readFile(file, "utf8")).trim().length > 0, true);
+  });
+
   it("refuses a second instance over one file rather than diverging silently", async () => {
     // Two instances each held their own array and never re-read, so each
     // reported a silently partial history — and every consumer built on `all()`
@@ -60,6 +228,418 @@ describe("EventStore backends", () => {
     const second = await JsonlEventStore.open(file);
     assert.equal(second.count(), 0);
     second.close();
+  });
+
+  it("holds the JSONL writer lock across processes and recovers only after release or verified death", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pie-store-process-lock-"));
+    const file = join(dir, "events.jsonl");
+
+    const cleanOwner = await startStoreOwner(file);
+    try {
+      await assert.rejects(() => JsonlEventStore.open(file), /writer lock.*pid/i);
+    } finally {
+      cleanOwner.send("close");
+      await waitForExit(cleanOwner);
+    }
+
+    const afterCleanRelease = await JsonlEventStore.open(file);
+    afterCleanRelease.close();
+
+    const crashedOwner = await startStoreOwner(file);
+    crashedOwner.kill("SIGKILL");
+    await waitForExit(crashedOwner);
+
+    const afterVerifiedDeath = await JsonlEventStore.open(file);
+    afterVerifiedDeath.close();
+  });
+
+  it("preserves the live winner when two processes race to recover one stale lock", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pie-store-stale-race-"));
+    const file = join(dir, "events.jsonl");
+    await writeFile(`${file}.lock`, `${JSON.stringify(await deadLockOwner("stale-race-owner"))}\n`);
+    const contenders = [startRacingOwner(file), startRacingOwner(file)];
+    const outcomes = await Promise.all(contenders.map((contender) => contender.outcome));
+    assert.deepEqual(outcomes.slice().sort(), ["blocked", "ready"]);
+    await assert.rejects(() => JsonlEventStore.open(file), /writer lock.*pid/i);
+
+    const winner = contenders[outcomes.indexOf("ready")]!.child;
+    winner.send("close");
+    await waitForExit(winner);
+    for (const contender of contenders) {
+      if (contender.child !== winner) await waitForExit(contender.child);
+    }
+  });
+
+  it("recovers a stale lock after the recovery claimant is killed", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pie-store-dead-recovery-claim-"));
+    const file = join(dir, "events.jsonl");
+    const staleOwnerToken = "stale-owner-with-killed-claimant";
+    await writeFile(`${file}.lock`, `${JSON.stringify(await deadLockOwner(staleOwnerToken))}\n`);
+    const killedClaimant = await startRecoveryClaimant(file);
+    assert.equal((await stat(killedClaimant.claimPath)).isFile(), true);
+    const atomicIdentity = JSON.parse(await readFile(killedClaimant.claimPath, "utf8")) as {
+      ownerToken?: string;
+    };
+    assert.equal(typeof atomicIdentity.ownerToken, "string", "published claim identity is complete");
+    killedClaimant.child.kill("SIGKILL");
+    await waitForExit(killedClaimant.child);
+
+    const contender = startRacingOwner(file);
+    const outcome = await outcomeWithin(contender);
+    try {
+      assert.equal(outcome, "ready", "a dead recovery claimant must not wedge stale-lock recovery");
+      await assert.rejects(() => JsonlEventStore.open(file), /writer lock.*pid/i);
+    } finally {
+      if (outcome === "ready") contender.child.send("close");
+      else contender.child.kill("SIGKILL");
+      await waitForExit(contender.child);
+    }
+  });
+
+  it("fails closed when a reaper crashes after publishing its tombstone", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pie-store-reaper-tombstone-crash-"));
+    const file = join(dir, "events.jsonl");
+    await writeFile(`${file}.lock`, `${JSON.stringify(await deadLockOwner("stale-owner-with-crashed-reaper"))}\n`);
+    const deadClaimant = await startRecoveryClaimant(file);
+    deadClaimant.child.kill("SIGKILL");
+    await waitForExit(deadClaimant.child);
+
+    let tombstonePath: string | undefined;
+    await assert.rejects(
+      () =>
+        ExclusiveFileLock.acquire(file, {
+          afterRecoveryClaimTombstonePublished: async (claimPath, tombstone) => {
+            tombstonePath = tombstone;
+            assert.equal(await readFile(claimPath, "utf8"), await readFile(tombstone, "utf8"));
+            throw new Error("injected reaper crash after tombstone publication");
+          },
+        }),
+      /injected reaper crash/,
+    );
+    assert.ok(tombstonePath);
+    const fixedClaimBefore = await readFile(deadClaimant.claimPath, "utf8");
+    const tombstoneBefore = await readFile(tombstonePath, "utf8");
+
+    const contender = startRacingOwner(file);
+    const outcome = await outcomeWithin(contender);
+    try {
+      assert.equal(outcome, "blocked", "an existing tombstone must reject rather than spin");
+      assert.match(await contender.blockedMessage, /recovery.*blocked.*tombstone/i);
+      assert.equal(await readFile(deadClaimant.claimPath, "utf8"), fixedClaimBefore);
+      assert.equal(await readFile(tombstonePath, "utf8"), tombstoneBefore);
+    } finally {
+      if (outcome === "ready") contender.child.send("close");
+      else contender.child.kill("SIGKILL");
+      await waitForExit(contender.child);
+    }
+  });
+
+  it("does not remove a recovery claim held by a live process", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pie-store-live-recovery-claim-"));
+    const file = join(dir, "events.jsonl");
+    const staleOwnerToken = "stale-owner-with-live-claimant";
+    await writeFile(`${file}.lock`, `${JSON.stringify(await deadLockOwner(staleOwnerToken))}\n`);
+    const claimant = await startRecoveryClaimant(file);
+    const before = await readFile(claimant.claimPath, "utf8");
+
+    const contender = startRacingOwner(file);
+    const outcome = await outcomeWithin(contender);
+    try {
+      assert.equal(outcome, "blocked");
+      assert.equal(await readFile(claimant.claimPath, "utf8"), before);
+    } finally {
+      if (outcome === "ready") contender.child.send("close");
+      else contender.child.kill("SIGKILL");
+      await waitForExit(contender.child);
+      claimant.child.kill("SIGKILL");
+      await waitForExit(claimant.child);
+    }
+  });
+
+  it("fails closed when the fixed recovery claim is an empty directory", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pie-store-empty-recovery-claim-"));
+    const file = join(dir, "events.jsonl");
+    const staleOwnerToken = "stale-owner-with-empty-claim";
+    await writeFile(`${file}.lock`, `${JSON.stringify(await deadLockOwner(staleOwnerToken))}\n`);
+    const tokenHash = createHash("sha256").update(staleOwnerToken).digest("hex").slice(0, 24);
+    const claimPath = `${file}.lock.recover.${tokenHash}`;
+    await mkdir(claimPath);
+
+    await assert.rejects(() => ExclusiveFileLock.acquire(file), /recovery.*claimed/i);
+    assert.deepEqual(await readdir(claimPath), [], "the unverifiable pre-existing claim is preserved");
+  });
+
+  it("keeps a replacement live claim when two dead-claim reapers race", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pie-store-reaper-race-"));
+    const file = join(dir, "events.jsonl");
+    await writeFile(`${file}.lock`, `${JSON.stringify(await deadLockOwner("stale-owner-reaper-race"))}\n`);
+    const deadClaimant = await startRecoveryClaimant(file);
+    deadClaimant.child.kill("SIGKILL");
+    await waitForExit(deadClaimant.child);
+
+    const aBefore = deferred();
+    const bBefore = deferred();
+    const releaseAReap = deferred();
+    const releaseBReap = deferred();
+    const aReplacement = deferred();
+    const releaseAReplacement = deferred();
+    let lockA: ExclusiveFileLock | undefined;
+    const acquireA = ExclusiveFileLock.acquire(file, {
+      beforeRecoveryClaimReap: async () => {
+        aBefore.resolve();
+        await releaseAReap.promise;
+      },
+      afterRecoveryClaimPublished: async () => {
+        aReplacement.resolve();
+        await releaseAReplacement.promise;
+      },
+    }).then((lock) => {
+      lockA = lock;
+      return lock;
+    });
+    const acquireB = ExclusiveFileLock.acquire(file, {
+      beforeRecoveryClaimReap: async () => {
+        bBefore.resolve();
+        await releaseBReap.promise;
+      },
+    });
+
+    try {
+      await Promise.all([aBefore.promise, bBefore.promise]);
+      releaseAReap.resolve();
+      await aReplacement.promise;
+      releaseBReap.resolve();
+      await assert.rejects(acquireB, /recovery.*blocked.*tombstone/i);
+      await assert.rejects(() => ExclusiveFileLock.acquire(file), /recovery.*claimed/i);
+      releaseAReplacement.resolve();
+      const winner = await acquireA;
+      assert.equal(winner.owner.ownerToken, lockA?.owner.ownerToken);
+      await assert.rejects(() => ExclusiveFileLock.acquire(file), /writer lock.*pid/i);
+    } finally {
+      releaseAReap.resolve();
+      releaseBReap.resolve();
+      releaseAReplacement.resolve();
+      await Promise.allSettled([acquireA, acquireB]);
+      lockA?.release();
+    }
+  });
+
+  it("treats a reused PID or prior boot as stale but fails closed without trustworthy incarnation", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pie-store-pid-incarnation-"));
+    const incarnation = await currentProcessIncarnation();
+    for (const [label, identity] of [
+      ["reused-pid", { ...incarnation, processStartTime: "1" }],
+      ["prior-boot", { ...incarnation, bootId: "00000000-0000-0000-0000-000000000000" }],
+    ] as const) {
+      const file = join(dir, `${label}.jsonl`);
+      await writeFile(
+        `${file}.lock`,
+        `${JSON.stringify({
+          pid: process.pid,
+          host: hostname(),
+          openedAt: "2026-01-01T00:00:00.000Z",
+          ownerToken: label,
+          ...identity,
+        })}\n`,
+      );
+      const recovered = await ExclusiveFileLock.acquire(file);
+      recovered.release();
+    }
+
+    const unavailable = join(dir, "unavailable.jsonl");
+    await writeFile(
+      `${unavailable}.lock`,
+      `${JSON.stringify({
+        pid: process.pid,
+        host: hostname(),
+        openedAt: "2026-01-01T00:00:00.000Z",
+        ownerToken: "missing-incarnation",
+      })}\n`,
+    );
+    await assert.rejects(() => ExclusiveFileLock.acquire(unavailable), /held.*unreadable|incarnation/i);
+  });
+
+  it("fails closed for every malformed owner-incarnation field", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pie-store-owner-schema-"));
+    const incarnation = await currentProcessIncarnation();
+    const valid = {
+      pid: process.pid,
+      host: hostname(),
+      openedAt: "2026-01-01T00:00:00.000Z",
+      ownerToken: "valid-owner-token",
+      ...incarnation,
+    };
+    const malformed: Array<[string, Record<string, unknown>]> = [
+      ["numeric-string-pid", { ...valid, pid: String(process.pid) }],
+      ["object-pid", { ...valid, pid: { value: process.pid } }],
+      ["nan-pid", { ...valid, pid: Number.NaN }],
+      ["zero-pid", { ...valid, pid: 0 }],
+      ["fractional-pid", { ...valid, pid: 1.5 }],
+      ["empty-host", { ...valid, host: "" }],
+      ["empty-token", { ...valid, ownerToken: "" }],
+      ["bad-boot-id", { ...valid, bootId: "not-a-boot-uuid" }],
+      ["nondigit-start", { ...valid, processStartTime: "12x" }],
+      ["zero-start", { ...valid, processStartTime: "0" }],
+    ];
+
+    for (const [label, owner] of malformed) {
+      const file = join(dir, `${label}.jsonl`);
+      const lockPath = `${file}.lock`;
+      const bytes = `${JSON.stringify(owner)}\n`;
+      await writeFile(lockPath, bytes);
+      await assert.rejects(
+        () => ExclusiveFileLock.acquire(file),
+        /held.*(?:missing|unreadable|incarnation)/i,
+        `${label} must not be classified stale`,
+      );
+      assert.equal(await readFile(lockPath, "utf8"), bytes, `${label} must be preserved for diagnosis`);
+    }
+  });
+
+  it("release of a recovery claim preserves a same-token replacement inode and aborts", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pie-store-recovery-release-identity-"));
+    const file = join(dir, "events.jsonl");
+    await writeFile(`${file}.lock`, `${JSON.stringify(await deadLockOwner("stale-owner-release-identity"))}\n`);
+    let replacement = "";
+    let replacementPath = "";
+
+    await assert.rejects(
+      () =>
+        ExclusiveFileLock.acquire(file, {
+          afterRecoveryClaimPublished: async (claimPath, owner) => {
+            replacementPath = claimPath;
+            replacement = `${JSON.stringify(owner)}\n`;
+            replaceImmediately(claimPath, replacement);
+          },
+        }),
+      /recovery claim identity changed/i,
+    );
+    assert.equal(await readFile(replacementPath, "utf8"), replacement);
+  });
+
+  it("dead-claim reaping preserves a same-token replacement inode and aborts", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pie-store-recovery-reap-identity-"));
+    const file = join(dir, "events.jsonl");
+    await writeFile(`${file}.lock`, `${JSON.stringify(await deadLockOwner("stale-owner-reap-identity"))}\n`);
+    const deadClaimant = await startRecoveryClaimant(file);
+    deadClaimant.child.kill("SIGKILL");
+    await waitForExit(deadClaimant.child);
+    let replacement = "";
+
+    await assert.rejects(
+      () =>
+        ExclusiveFileLock.acquire(file, {
+          afterRecoveryClaimTombstonePublished: async (claimPath, _tombstone, claimant) => {
+            replacement = `${JSON.stringify(claimant)}\n`;
+            replaceImmediately(claimPath, replacement);
+          },
+        }),
+      /recovery claim identity changed/i,
+    );
+    assert.equal(await readFile(deadClaimant.claimPath, "utf8"), replacement);
+  });
+
+  it("quarantines by inode so a same-token live replacement survives stale takeover", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pie-store-stale-quarantine-"));
+    const file = join(dir, "events.jsonl");
+    const path = `${file}.lock`;
+    const incarnation = await currentProcessIncarnation();
+    const token = "same-token-new-inode";
+    await writeFile(
+      path,
+      `${JSON.stringify({
+        pid: 2_000_000_000,
+        host: hostname(),
+        openedAt: "2026-01-01T00:00:00.000Z",
+        ownerToken: token,
+        bootId: incarnation.bootId,
+        processStartTime: "1",
+      })}\n`,
+    );
+    let replaced = false;
+    await assert.rejects(
+      () =>
+        ExclusiveFileLock.acquire(file, {
+          beforeStaleOwnerQuarantine: (lockPath, owner) => {
+            replaced = true;
+            replaceImmediately(lockPath, `${JSON.stringify({ ...owner, pid: process.pid, ...incarnation })}\n`);
+          },
+        }),
+      /held|identity changed/i,
+    );
+    assert.equal(replaced, true);
+    assert.equal(
+      (JSON.parse(await readFile(path, "utf8")) as { processStartTime: string }).processStartTime,
+      incarnation.processStartTime,
+    );
+  });
+
+  it("release quarantines by inode and restores a same-token replacement", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pie-store-release-quarantine-"));
+    const file = join(dir, "events.jsonl");
+    let replacement = "";
+    const lock = await ExclusiveFileLock.acquire(file, {
+      beforeReleaseQuarantine: (path, owner) => {
+        rmSync(path, { force: true });
+        replacement = `${JSON.stringify(owner)}\n`;
+        writeFileSync(path, replacement, "utf8");
+      },
+    });
+    assert.throws(() => lock.release(), /release failed.*identity changed/i);
+    assert.equal(await readFile(`${file}.lock`, "utf8"), replacement);
+  });
+
+  it("retains the pinned descriptor when recovery-claim candidate cleanup fails", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pie-store-claim-cleanup-fault-"));
+    const file = join(dir, "events.jsonl");
+    await writeFile(`${file}.lock`, `${JSON.stringify(await deadLockOwner("stale-owner-cleanup-fault"))}\n`);
+    await assert.rejects(
+      () =>
+        ExclusiveFileLock.acquire(file, {
+          beforeRecoveryClaimCandidateCleanup: () => {
+            throw new Error("injected candidate cleanup failure");
+          },
+        }),
+      /injected candidate cleanup failure/,
+    );
+    await assert.rejects(() => ExclusiveFileLock.acquire(file), /recovery.*claimed/i);
+  });
+
+  it("release failure retains ownership and Jsonl close surfaces the cleanup error", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pie-store-release-fault-"));
+    const file = join(dir, "events.jsonl");
+    let failCleanup = true;
+    const store = await JsonlEventStore.open(file, {
+      beforeReleaseCleanup: () => {
+        if (failCleanup) {
+          failCleanup = false;
+          throw new Error("injected release cleanup failure");
+        }
+      },
+    });
+    assert.throws(() => store.close(), /injected release cleanup failure/);
+    assert.equal(store.ownsWriterLock(), true);
+    await assert.rejects(() => JsonlEventStore.open(file), /already open|writer lock/i);
+    store.close();
+    assert.equal(store.ownsWriterLock(), false);
+    assert.deepEqual(
+      (await readdir(dir)).filter((entry) => entry.includes(".release.")),
+      [],
+    );
+    const reacquired = await JsonlEventStore.open(file);
+    reacquired.close();
+  });
+
+  it("closes every pinned descriptor across repeated acquire and release cycles", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pie-store-descriptor-count-"));
+    const file = join(dir, "events.jsonl");
+    const before = (await readdir("/proc/self/fd")).length;
+    for (let index = 0; index < 50; index += 1) {
+      const lock = await ExclusiveFileLock.acquire(file);
+      lock.release();
+    }
+    const after = (await readdir("/proc/self/fd")).length;
+    assert.ok(after <= before + 2, `descriptor count grew from ${before} to ${after}`);
   });
 
   it("repairs a torn final record instead of swallowing the next event", async () => {
@@ -102,6 +682,21 @@ describe("EventStore backends", () => {
     const reopened = await JsonlEventStore.open(file);
     const payload = reopened.all()[0]?.payload.run as { status: string };
     assert.equal(payload.status, "PENDING", "history records what was true when the event was appended");
+    reopened.close();
+  });
+
+  it("does not release the writer lock while a queued append is still draining", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pie-store-close-drain-"));
+    const file = join(dir, "events.jsonl");
+    const store = await JsonlEventStore.open(file);
+    const pending = store.append(evt(10));
+    store.close();
+
+    await assert.rejects(() => JsonlEventStore.open(file), /already open|writer lock/i);
+    await pending;
+
+    const reopened = await JsonlEventStore.open(file);
+    assert.ok(reopened.get("evt-10"));
     reopened.close();
   });
 

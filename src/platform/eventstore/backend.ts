@@ -27,6 +27,17 @@ export interface StoredEvent {
 export interface EventStoreBackend {
   /** Append a single event; returns the stored event. Must be serialized/atomic. */
   append(event: StoredEvent): Promise<StoredEvent>;
+  /**
+   * Append only if a synchronous condition still holds at the durable commit
+   * point. The condition, commit, and optional materialized-state update must
+   * share one non-yielding critical section so an in-process authority
+   * transition cannot interleave them.
+   */
+  appendConditionally(
+    event: StoredEvent,
+    condition: () => boolean,
+    onCommit?: () => void,
+  ): Promise<StoredEvent | undefined>;
   /** Append many events as one write. */
   appendAll(events: StoredEvent[]): Promise<void>;
   /** All events in append order. */

@@ -1,5 +1,6 @@
 import { redactSecrets } from "../security/SecurityPolicy.ts";
 import type { WorkerActivity } from "./WorkerExecutor.ts";
+import type { CheckpointProgressClaim } from "./checkpointProgressTool.ts";
 
 export const MAX_WORKER_ACTIVITY_SUMMARY = 160;
 
@@ -31,6 +32,34 @@ function safeDuration(value: unknown): number | undefined {
     : undefined;
 }
 
+function safeCheckpointClaims(value: unknown): CheckpointProgressClaim[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const claims = value.slice(0, 32).flatMap((entry) => {
+    if (!entry || typeof entry !== "object") return [];
+    const claim = entry as Partial<CheckpointProgressClaim>;
+    const deliverable = typeof claim.deliverable === "string" ? safeText(claim.deliverable) : "";
+    const candidateSha = typeof claim.candidateSha === "string" ? safeText(claim.candidateSha) : "";
+    const evidencePaths = Array.isArray(claim.evidencePaths)
+      ? claim.evidencePaths
+          .filter((path): path is string => typeof path === "string")
+          .map((path) => safeText(path, 1000))
+          .filter(Boolean)
+          .slice(0, 64)
+      : [];
+    const artifactRefs = Array.isArray(claim.artifactRefs)
+      ? claim.artifactRefs
+          .filter((ref): ref is string => typeof ref === "string")
+          .map((ref) => safeText(ref, 1000))
+          .filter(Boolean)
+          .slice(0, 32)
+      : [];
+    return deliverable && candidateSha && evidencePaths.length > 0
+      ? [{ deliverable, candidateSha, evidencePaths, artifactRefs }]
+      : [];
+  });
+  return claims.length > 0 ? claims : undefined;
+}
+
 const STAGES = new Set(["agent", "process", "review", "integration", "validation", "research"] as const);
 
 function safeStage(value: unknown): WorkerActivity["stage"] {
@@ -47,6 +76,11 @@ function stageLabel(stage: WorkerActivity["stage"]): string {
 export function sanitizeWorkerActivity(value: unknown): WorkerActivity | null {
   if (!value || typeof value !== "object") return null;
   const input = value as Partial<WorkerActivity>;
+  if (input.kind === "checkpoint") {
+    const claims = safeCheckpointClaims(input.claims);
+    if (!claims) return null;
+    return { kind: "checkpoint", summary: "Checkpoint progress recorded", meaningfulProgress: true, claims };
+  }
   if (input.kind === "tool") {
     if (input.phase !== "started" && input.phase !== "completed" && input.phase !== "failed") return null;
     const toolName = safeToolName(input.toolName);
@@ -103,7 +137,12 @@ export function sanitizeWorkerActivity(value: unknown): WorkerActivity | null {
       return { kind: "state", phase: "canceled", summary: "Worker session canceled", meaningfulProgress: false };
     }
     const summary = input.summary === "Model response received" ? input.summary : "Worker session started";
-    return { kind: "state", ...(input.phase ? { phase: input.phase } : {}), summary, meaningfulProgress: false };
+    return {
+      kind: "state",
+      ...(input.phase ? { phase: input.phase } : {}),
+      summary,
+      meaningfulProgress: false,
+    };
   }
   return null;
 }

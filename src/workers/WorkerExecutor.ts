@@ -1,8 +1,10 @@
 import type { WorkerResult, WorkerRole, WorkerUsage } from "../core/types.ts";
+import type { CheckpointRecoveryContext } from "../orchestration/broker.ts";
+import type { CheckpointProgressClaim } from "./checkpointProgressTool.ts";
 
 /** Bounded, operator-safe live state from a worker session. */
 export interface WorkerActivity {
-  kind: "state" | "tool" | "heartbeat" | "execution";
+  kind: "state" | "tool" | "heartbeat" | "execution" | "checkpoint";
   summary: string;
   phase?: "started" | "completed" | "failed" | "canceled";
   stage?: "agent" | "process" | "review" | "integration" | "validation" | "research";
@@ -10,6 +12,7 @@ export interface WorkerActivity {
   meaningfulProgress: boolean;
   elapsedMs?: number;
   lastActivityMs?: number;
+  claims?: CheckpointProgressClaim[];
 }
 
 /** A delegated task for a fresh-context worker (INV-002, §12). */
@@ -54,6 +57,10 @@ export interface WorkerRequest {
    * own checkout (any fallback path) must never be told to commit there.
    */
   isolatedWorktree?: boolean;
+  /** Store-verified immutable checkpoint context for a fresh recovery worker. */
+  recovery?: Readonly<CheckpointRecoveryContext>;
+  /** Broker-declared deliverables eligible for candidate-bound checkpoint progress. */
+  deliverables?: readonly string[];
   /** Live bounded activity; never includes prompts, model text, tool arguments, or secrets. */
   onActivity?: (event: WorkerActivity) => void;
   /** Abort the active model session when the owning execution is canceled. */

@@ -33,6 +33,19 @@ class FailOnceBackend implements EventStoreBackend {
     return this.inner.append(event);
   }
 
+  async appendConditionally(
+    event: StoredEvent,
+    condition: () => boolean,
+    onCommit?: () => void,
+  ): Promise<StoredEvent | undefined> {
+    this.attempts += 1;
+    if (this.rejectNext) {
+      this.rejectNext = false;
+      throw new Error("observability persistence unavailable");
+    }
+    return this.inner.appendConditionally(event, condition, onCommit);
+  }
+
   async appendAll(events: StoredEvent[]): Promise<void> {
     await this.inner.appendAll(events);
   }
@@ -59,6 +72,17 @@ class UnavailableObservabilityBackend implements EventStoreBackend {
       throw new Error("observability persistence unavailable");
     }
     return this.seed.append(event);
+  }
+
+  async appendConditionally(
+    event: StoredEvent,
+    condition: () => boolean,
+    onCommit?: () => void,
+  ): Promise<StoredEvent | undefined> {
+    if (this.unavailable && event.type.startsWith("mission.obs.")) {
+      throw new Error("observability persistence unavailable");
+    }
+    return this.seed.appendConditionally(event, condition, onCommit);
   }
 
   async appendAll(events: StoredEvent[]): Promise<void> {
@@ -142,7 +166,12 @@ test("records a mission and projects weighted progress through its DAG", async (
     role: "implementer",
     objective: "Implement EventDrawer",
   });
-  const t2 = h.store.createTask({ mission_id: id, kind: "agent", role: "implementer", objective: "Wire state" });
+  const t2 = h.store.createTask({
+    mission_id: id,
+    kind: "agent",
+    role: "implementer",
+    objective: "Wire state",
+  });
   h.obs.phaseChanged(id, "EXECUTING");
   h.obs.workerStarted(id, "wk-1", { taskId: t1.task_id });
   h.obs.taskStarted(id, t1.task_id, "Implement EventDrawer");
@@ -158,7 +187,11 @@ test("records a mission and projects weighted progress through its DAG", async (
 
   const proj = h.obs.projection(id)!;
   assert.equal(proj.summary.progress.basis, "weighted_dag");
-  assert.ok(proj.summary.progress.approximatePercent > 0 && proj.summary.progress.approximatePercent < 100);
+  assert.equal(proj.summary.acceptanceCoverage.approximatePercent, 0);
+  assert.equal(proj.summary.progress.approximatePercent, 0, "primary progress remains verified acceptance coverage");
+  assert.ok(
+    proj.summary.workflowProgress.approximatePercent > 0 && proj.summary.workflowProgress.approximatePercent < 100,
+  );
   assert.equal(proj.summary.workers.active, 0);
   assert.equal(proj.tasks.length, 2);
   assert.equal(proj.tasks[0]!.state, "completed");
@@ -207,7 +240,11 @@ test("retries observability appends in order so restart restores the complete pr
   );
   assert.deepEqual(obs.persistenceDiagnostics(), [], "a recovered append is no longer unresolved");
 
-  const reopened = MissionObservability.open({ backend, store, now: clock().now });
+  const reopened = MissionObservability.open({
+    backend,
+    store,
+    now: clock().now,
+  });
   assert.equal(reopened.projection(id)?.summary.title, "M");
   assert.equal(reopened.projection(id)?.progressHistory.at(-1)?.label, "EXECUTING");
 });
@@ -233,8 +270,18 @@ test("observability flush rejects and later events remain queued while persisten
     "the phase does not overtake the failed creation",
   );
   assert.deepEqual(
-    obs.persistenceDiagnostics().map(({ eventType, missionId, message }) => ({ eventType, missionId, message })),
-    [{ eventType: "MISSION_CREATED", missionId: id, message: "observability persistence unavailable" }],
+    obs.persistenceDiagnostics().map(({ eventType, missionId, message }) => ({
+      eventType,
+      missionId,
+      message,
+    })),
+    [
+      {
+        eventType: "MISSION_CREATED",
+        missionId: id,
+        message: "observability persistence unavailable",
+      },
+    ],
   );
 });
 
@@ -255,7 +302,11 @@ test("change hook fires for activity and sampled heartbeats so snapshot publishe
   obs.workerStarted(id, "wk-1");
   changed.length = 0;
 
-  obs.activity(id, { type: "running_command", summary: "Running tool: bash", workerId: "wk-1" });
+  obs.activity(id, {
+    type: "running_command",
+    summary: "Running tool: bash",
+    workerId: "wk-1",
+  });
   obs.heartbeat(id, "wk-1", { elapsedMs: 10_000, lastActivityMs: 2_000 });
   clk.advance(1_000);
   obs.heartbeat(id, "wk-1", { elapsedMs: 11_000, lastActivityMs: 3_000 });
@@ -264,11 +315,16 @@ test("change hook fires for activity and sampled heartbeats so snapshot publishe
   assert.equal(obs.projection(id)?.summary.lastHeartbeatAt, clk.now());
 });
 
-test("100% VERIFIED COMPLETE only after the CompletionGate passes", async () => {
+test("verified completion does not turn an explicit empty acceptance contract into 100%", async () => {
   const h = harness();
   const id = makeMission(h);
   h.obs.missionCreated(id, "M");
-  const t = h.store.createTask({ mission_id: id, kind: "agent", role: "implementer", objective: "O" });
+  const t = h.store.createTask({
+    mission_id: id,
+    kind: "agent",
+    role: "implementer",
+    objective: "O",
+  });
   h.obs.taskStarted(id, t.task_id, "O");
   h.obs.taskCompleted(id, t.task_id, "O");
   h.store.transitionTask(t.task_id, "READY");
@@ -285,7 +341,8 @@ test("100% VERIFIED COMPLETE only after the CompletionGate passes", async () => 
   // Gate passes.
   h.obs.markVerifiedComplete(id);
   await h.obs.flush();
-  assert.equal(h.obs.summary(id)!.progress.approximatePercent, 100);
+  assert.equal(h.obs.summary(id)!.progress.approximatePercent, 0);
+  assert.equal(h.obs.summary(id)!.workflowProgress.approximatePercent, 100);
   assert.equal(h.obs.summary(id)!.progress.verifiedComplete, true);
   assert.ok(h.updates.some((m) => m.includes("100% · VERIFIED COMPLETE ✓")));
 });
@@ -362,7 +419,12 @@ test("reconnect replays persisted state instead of resetting progress", async ()
   const store = MissionStore.open(backend);
   const updates: string[] = [];
   const clk = clock();
-  const obs1 = new MissionObservability({ backend, store, onUpdate: (_i, m) => updates.push(m), now: clk.now });
+  const obs1 = new MissionObservability({
+    backend,
+    store,
+    onUpdate: (_i, m) => updates.push(m),
+    now: clk.now,
+  });
   const id = store.createMission({
     title: "M",
     goal: "g",
@@ -373,7 +435,12 @@ test("reconnect replays persisted state instead of resetting progress", async ()
     workflow_class: "engineering",
   }).mission_id;
   obs1.missionCreated(id, "M");
-  const t = store.createTask({ mission_id: id, kind: "agent", role: "implementer", objective: "O" });
+  const t = store.createTask({
+    mission_id: id,
+    kind: "agent",
+    role: "implementer",
+    objective: "O",
+  });
   obs1.taskStarted(id, t.task_id, "O");
   obs1.workerStarted(id, "wk-1");
   obs1.workerCompleted(id, "wk-1");
@@ -388,7 +455,12 @@ test("reconnect replays persisted state instead of resetting progress", async ()
   await obs1.flush();
 
   // Simulate a restart: a fresh observability service over the same backend.
-  const obs2 = MissionObservability.open({ backend, store, onUpdate: () => {}, now: clk.now });
+  const obs2 = MissionObservability.open({
+    backend,
+    store,
+    onUpdate: () => {},
+    now: clk.now,
+  });
   const proj = obs2.projection(id)!;
   assert.equal(proj.summary.title, "M");
   assert.ok(proj.summary.lastMeaningfulProgressAt, "progress survives restart");
@@ -406,7 +478,11 @@ test("activity log and errors are bounded and grouped", async () => {
   const id = makeMission(h);
   h.obs.missionCreated(id, "M");
   for (let i = 0; i < 50; i++) {
-    h.obs.activity(id, { type: "running_test", summary: `test ${i}`, meaningfulProgress: true });
+    h.obs.activity(id, {
+      type: "running_test",
+      summary: `test ${i}`,
+      meaningfulProgress: true,
+    });
   }
   h.obs.recordError(id, "EADDRINUSE", "port in use");
   h.obs.recordError(id, "EADDRINUSE", "port in use again");

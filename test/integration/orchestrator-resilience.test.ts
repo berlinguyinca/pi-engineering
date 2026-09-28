@@ -10,6 +10,7 @@
 
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import type { GitRepo } from "../../src/git/GitRepo.ts";
 import type { BrokerBackends } from "../../src/orchestration/broker.ts";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
 import { Orchestrator } from "../../src/orchestration/orchestrator.ts";
@@ -74,11 +75,26 @@ function harness(opts: HarnessOpts) {
         if (calls.validation <= (opts.validationFailTimes ?? 0)) {
           return { executionId: "e", exitStatus: "failed", summary: "suite red", artifactRefs: [], usage: {} };
         }
-        return { executionId: "e", exitStatus: "succeeded", summary: "valid", artifactRefs: [], usage: {} };
+        return {
+          executionId: "e",
+          exitStatus: "succeeded",
+          summary: "valid",
+          artifactRefs: [],
+          usage: {},
+          validationEvidence: {
+            command: "npm test",
+            profile: "test",
+            exitCode: 0,
+            testSummary: { passed: 1 },
+            noTargets: false,
+            accessible: true,
+            acceptanceResults: [],
+          },
+        };
       },
     },
     review: {
-      runReview: async () => {
+      runReview: async ({ acceptanceCriteria }) => {
         calls.review++;
         return {
           executionId: "e",
@@ -87,6 +103,21 @@ function harness(opts: HarnessOpts) {
           artifactRefs: [],
           usage: {},
           findings: [],
+          reviewEvidence: {
+            reviewerSessionId: "review-resilience",
+            model: "test",
+            provider: "test",
+            verdict: "approve",
+            independenceMode: "independent",
+            findings: [],
+            outputValid: true,
+            accessible: true,
+            acceptanceResults: (acceptanceCriteria ?? []).map((criterion) => ({
+              acceptanceId: criterion.acceptanceId,
+              status: "passed" as const,
+              detail: "checked",
+            })),
+          },
         };
       },
     },
@@ -105,7 +136,17 @@ function harness(opts: HarnessOpts) {
   const orchestrator = new Orchestrator({
     store,
     backends,
-    planner: async () => [
+    git: {
+      root: process.cwd(),
+      headCommit: async () => "candidate-test-sha",
+      captureDiff: async () => "diff --git a/src/health.ts b/src/health.ts",
+      changedFiles: async () => ["src/health.ts"],
+      loadCandidateLifecycleInventory: async () => ({ records: [], diagnostics: [] }),
+      loadIntegrationRunInventory: async () => ({ records: [], diagnostics: [] }),
+      loadPromotionLifecycleInventory: async () => ({ records: [], diagnostics: [] }),
+      loadPendingBranchCleanupInventory: async () => ({ records: [], diagnostics: [] }),
+    } as unknown as GitRepo,
+    planner: async (mission) => [
       {
         kind: "agent" as const,
         role: "implementer",
@@ -116,6 +157,9 @@ function harness(opts: HarnessOpts) {
         depends_on: [],
         priority: 0,
         execution_requirements: {},
+        acceptance_ids: mission.acceptance_criteria.flatMap((criterion) =>
+          criterion.acceptance_id ? [criterion.acceptance_id] : [],
+        ),
         max_attempts: 3,
         failure_policy: "retry" as const,
       },

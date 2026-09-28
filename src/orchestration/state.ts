@@ -273,7 +273,9 @@ const MISSION_TRANSITIONS: Record<MissionStatus, ReadonlyArray<MissionStatus>> =
     "BLOCKED",
     "FAILED",
   ],
-  BLOCKED: ["EXECUTING", "REPAIRING", "QUEUED", "STARTING", "WAITING_FOR_USER", "CANCELED", "FAILED"],
+  // A blocked mission may only resume execution through a durably recorded
+  // repair operation and the REPAIRING state.
+  BLOCKED: ["REPAIRING", "WAITING_FOR_USER", "CANCELED", "FAILED"],
   CANCELING: ["CANCELED", "BLOCKED", "FAILED"],
   CANCELED: [],
   FAILED: [],
@@ -281,11 +283,13 @@ const MISSION_TRANSITIONS: Record<MissionStatus, ReadonlyArray<MissionStatus>> =
 
 const TASK_TRANSITIONS: Record<TaskStatus, ReadonlyArray<TaskStatus>> = {
   PENDING: ["READY", "CANCELED", "SKIPPED", "BLOCKED"],
-  READY: ["RUNNING", "CANCELED", "SKIPPED", "BLOCKED", "SUCCEEDED"],
+  READY: ["RUNNING", "CANCELED", "SKIPPED", "BLOCKED", "SUCCEEDED", "FAILED"],
   RUNNING: ["SUCCEEDED", "FAILED", "RETRYING", "CANCELED", "BLOCKED"],
   WAITING: ["READY", "RUNNING", "CANCELED", "BLOCKED", "FAILED"],
   SUCCEEDED: [],
-  FAILED: ["RETRYING", "READY", "CANCELED", "SKIPPED", "BLOCKED"],
+  // Failure is immutable audit history. Recovery creates explicit replacement
+  // tasks and records supersession lineage instead of rewriting this task.
+  FAILED: [],
   RETRYING: ["READY", "RUNNING", "CANCELED", "FAILED", "SKIPPED", "BLOCKED"],
   CANCELED: [],
   SKIPPED: [],

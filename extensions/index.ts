@@ -82,7 +82,13 @@ import { PiWorkerExecutor } from "../src/workers/PiWorkerExecutor.ts";
  */
 
 const runtimes = new Map<string, { runtime: EngineeringRuntime; memoryIdentity: string }>();
-const runtimeOpens = new Map<string, Promise<{ runtime: EngineeringRuntime; memoryIdentity: string }>>();
+interface RuntimeOpen {
+  generation: number;
+  promise: Promise<{ runtime: EngineeringRuntime; memoryIdentity: string }>;
+}
+const runtimeOpens = new Map<string, RuntimeOpen>();
+let runtimeShutdownGeneration = 0;
+let runtimeShutdownFlight: Promise<void> | null = null;
 const allowRuntimeDiagnostic = createRepeatThrottle();
 
 // Live status bar: the harness owns the Pi footer through a single composable
@@ -204,7 +210,13 @@ async function getRuntime(ctx: ExtensionCommandContext, worker?: EngineeringRunt
  * stale in-memory ledger over the same shared `.pi-eng/ledger.jsonl` file.
  */
 async function getRuntimeByCwd(cwd: string, model?: Model<any>): Promise<EngineeringRuntime> {
+  if (runtimeShutdownFlight) await runtimeShutdownFlight;
+  const openGeneration = runtimeShutdownGeneration;
   const key = await repoCacheKey(cwd);
+  if (runtimeShutdownFlight) await runtimeShutdownFlight;
+  if (openGeneration !== runtimeShutdownGeneration) {
+    throw new Error("Runtime request was superseded by session shutdown");
+  }
   const blackhole = openVikingBlackholeOption(resolveMemoryEnvironment());
   const memoryIdentity = createHash("sha256")
     .update(JSON.stringify(blackhole ?? null))
@@ -212,7 +224,13 @@ async function getRuntimeByCwd(cwd: string, model?: Model<any>): Promise<Enginee
   const existing = runtimes.get(key);
   if (existing?.memoryIdentity === memoryIdentity) return existing.runtime;
   const pending = runtimeOpens.get(`${key}\0${memoryIdentity}`);
-  if (pending) return (await pending).runtime;
+  if (pending) {
+    const opened = await pending.promise;
+    if (pending.generation !== runtimeShutdownGeneration) {
+      throw new Error("Runtime open was superseded by session shutdown");
+    }
+    return opened.runtime;
+  }
   // OpenViking connection from the environment. If PI_OPENVIKING_BASE_URL is
   // set, blackhole is enabled with the openviking durable store for EVERY repo
   // this extension runs in — set it once per install and all repos share the
@@ -259,22 +277,64 @@ async function getRuntimeByCwd(cwd: string, model?: Model<any>): Promise<Enginee
     ...(blackhole ? { blackhole } : {}),
   }).then((runtime) => ({ runtime, memoryIdentity }));
   const openKey = `${key}\0${memoryIdentity}`;
-  runtimeOpens.set(openKey, opening);
+  const entry: RuntimeOpen = { generation: openGeneration, promise: opening };
+  runtimeOpens.set(openKey, entry);
   try {
     const opened = await opening;
+    if (openGeneration !== runtimeShutdownGeneration) {
+      throw new Error("Runtime open was superseded by session shutdown");
+    }
     runtimes.set(key, opened);
     panelFor(key, opened.runtime);
     return opened.runtime;
   } finally {
-    if (runtimeOpens.get(openKey) === opening) runtimeOpens.delete(openKey);
+    if (runtimeOpens.get(openKey) === entry && openGeneration === runtimeShutdownGeneration) {
+      runtimeOpens.delete(openKey);
+    }
   }
 }
 
 /** Feed live mission detail into persistent surfaces without creating notices. */
-function publishMissionActivity(key: string, event: RuntimeMissionActivityEvent): void {
+export function formatMissionActivity(event: RuntimeMissionActivityEvent): {
+  phase: string;
+  detail: string;
+  missionStatus: { token: string; reason: string; next: string };
+} {
   const heartbeat = event.lastHeartbeatAt ? ` · hb ${new Date(event.lastHeartbeatAt).toISOString().slice(11, 19)}` : "";
   const workers = ` · workers ${event.activeWorkers} active/${event.waitingWorkers} waiting/${event.failedWorkers} failed`;
-  const detail = `${event.summary}${workers}${heartbeat}`.slice(0, 320);
+  const lastProgress = event.lastMeaningfulProgressAt ?? "none";
+  const compact = (value: string | null, fallback: string, length = 80) => (value ?? fallback).slice(0, length);
+  const scope =
+    `repo ${compact(event.repository, "unknown")} · task ${compact(event.task, "none")} · ` +
+    `owner ${compact(event.owner, "unowned")}`;
+  const recovery = `recovery ${event.recovery.attempt}/${event.recovery.maxAttempts}`;
+  const next = `next ${event.nextAction.slice(0, 120)}${event.nextActionAt ? ` at ${event.nextActionAt}` : ""}`;
+  const preserved =
+    event.preservedWork.length > 0 ? ` · preserved ${event.preservedWork.join(", ").slice(0, 120)}` : "";
+  const nextVerb = event.nextAction.trim().split(/\s+/)[0]?.slice(0, 12) || "monitor";
+  const recoveryToken =
+    event.recovery.maxAttempts > 0 ? `R${event.recovery.attempt}/${event.recovery.maxAttempts}` : "R–";
+  const token = `${recoveryToken} ${event.action.slice(0, 12).toUpperCase()}→${nextVerb}`;
+  return {
+    phase:
+      `acceptance ${event.acceptanceCoverage.completed}/${event.acceptanceCoverage.total} ` +
+      `(${event.acceptanceCoverage.approximatePercent}%) · workflow ${event.workflowProgress.completed}/` +
+      `${event.workflowProgress.total} (${event.workflowProgress.approximatePercent}%) · ${event.health}`,
+    detail:
+      `${event.summary.slice(0, 120)}${workers}${heartbeat} · ${scope} · last progress ${lastProgress} · ` +
+      `${recovery}${preserved} · ${event.action}: ${event.reason.slice(0, 120)} · ${next}`,
+    missionStatus: {
+      token,
+      reason: event.reason.slice(0, 160),
+      next: `${event.nextAction.slice(0, 160)}${event.nextActionAt ? ` at ${event.nextActionAt}` : ""}`,
+    },
+  };
+}
+
+/** Feed live mission detail into persistent surfaces without creating notices. */
+function publishMissionActivity(key: string, event: RuntimeMissionActivityEvent): void {
+  const rendered = formatMissionActivity(event);
+  const detail = rendered.detail.slice(0, 640);
   const plumbing = panels.get(key);
   if (plumbing) {
     const previous = plumbing.state.snapshot.run;
@@ -283,11 +343,12 @@ function publishMissionActivity(key: string, event: RuntimeMissionActivityEvent)
       run: {
         workItemId: event.missionId,
         goal: detail,
-        phase: `${event.phase} · ${event.approximatePercent}% · ${event.health}`,
+        phase: rendered.phase,
         risk: "mission",
         files: sameMission ? previous.files : [],
         findings: sameMission ? previous.findings : [],
         spend: sameMission ? previous.spend : [],
+        missionStatus: rendered.missionStatus,
       },
       updatedAt: Date.now(),
     });
@@ -295,9 +356,57 @@ function publishMissionActivity(key: string, event: RuntimeMissionActivityEvent)
   if (ambientPanel?.key !== key) return;
   activeFooter?.setTask({
     workItemId: event.missionId,
-    phase: `${event.phase} ${event.approximatePercent}%`,
+    phase: rendered.phase,
     label: detail,
+    missionStatus: rendered.missionStatus,
   });
+}
+
+function shutdownCachedRuntimes(): Promise<void> {
+  if (runtimeShutdownFlight) return runtimeShutdownFlight;
+  runtimeShutdownGeneration++;
+  const openedEntries = [...runtimes.entries()];
+  const pendingEntries = [...runtimeOpens.entries()];
+  const shutdown = (async () => {
+    const opened = openedEntries.map(([, entry]) => entry.runtime);
+    const failures: unknown[] = [];
+    const pendingResults = await Promise.allSettled(pendingEntries.map(([, entry]) => entry.promise));
+    for (const result of pendingResults) {
+      if (result.status === "fulfilled") opened.push(result.value.runtime);
+      else failures.push(result.reason);
+    }
+    const unique = [...new Set(opened)];
+    const closeResults = await Promise.allSettled(unique.map((runtime) => runtime.close()));
+    for (const [index, result] of closeResults.entries()) {
+      const runtime = unique[index];
+      if (!runtime) continue;
+      if (result.status === "rejected") {
+        failures.push(result.reason);
+        continue;
+      }
+      for (const [key, entry] of openedEntries) {
+        if (entry.runtime === runtime && runtimes.get(key) === entry) runtimes.delete(key);
+      }
+      for (const [pendingIndex, [key, entry]] of pendingEntries.entries()) {
+        const pending = pendingResults[pendingIndex];
+        if (pending?.status === "fulfilled" && pending.value.runtime === runtime && runtimeOpens.get(key) === entry) {
+          runtimeOpens.delete(key);
+        }
+      }
+    }
+    for (const [index, [key, entry]] of pendingEntries.entries()) {
+      if (pendingResults[index]?.status === "rejected" && runtimeOpens.get(key) === entry) runtimeOpens.delete(key);
+    }
+    if (failures.length > 0) {
+      const detail = failures.map((error) => (error instanceof Error ? error.message : String(error))).join("; ");
+      throw new AggregateError(failures, `Failed to shut down cached engineering runtimes: ${detail}`);
+    }
+  })();
+  const flight = shutdown.finally(() => {
+    if (runtimeShutdownFlight === flight) runtimeShutdownFlight = null;
+  });
+  runtimeShutdownFlight = flight;
+  return flight;
 }
 
 /**
@@ -1455,7 +1564,7 @@ ${RECOVERY_PROMPT}`;
       }
     });
 
-    pi.on("session_shutdown", () => {
+    pi.on("session_shutdown", async () => {
       // A sink pointing at a torn-down session's UI is worse than none.
       telemetryUninstall?.();
       telemetryUninstall = undefined;
@@ -1467,6 +1576,7 @@ ${RECOVERY_PROMPT}`;
       // `startPanelRefresh` returns early when one is already set, stops the
       // NEXT session from ever refreshing.
       stopPanelRefresh();
+      await shutdownCachedRuntimes();
     });
   }
 
@@ -1492,16 +1602,38 @@ ${RECOVERY_PROMPT}`;
   // Orchestrator. `/mission` is an optional power-user control; correctness
   // never depends on it (the semantic tool + runtime gate enforce policy).
   pi.registerCommand("mission", {
-    description:
-      "Run the orchestration mission pipeline for a normal-language request (intent -> plan -> execute -> validate -> review -> complete).",
+    description: "Run an orchestration mission, or resume one with /mission resume <missionId>.",
     handler: async (args, ctx) => {
-      if (!args.trim()) {
-        ctx.ui.notify("/mission <normal-language request>", "error");
+      const request = args.trim();
+      if (!request) {
+        ctx.ui.notify("/mission <normal-language request> | /mission resume <missionId>", "error");
+        return;
+      }
+      const resumePrefix = /^resume(?:\b|[:=])/i.test(request);
+      const resume = /^resume\s+(\S+)\s*$/i.exec(request);
+      if (resumePrefix && !resume) {
+        ctx.ui.notify("/mission resume <missionId>", "error");
         return;
       }
       const rt = await getRuntime(ctx);
       if (!rt.orchestrator) {
         ctx.ui.notify("Orchestrator not initialized for this directory.", "error");
+        return;
+      }
+      if (resume) {
+        const missionId = resume[1];
+        if (!missionId) {
+          ctx.ui.notify("/mission resume <missionId>", "error");
+          return;
+        }
+        try {
+          await rt.resumeBlockedMission(missionId, ctx.signal);
+          const mission = rt.missionStore?.getMission(missionId);
+          if (!mission) throw new Error(`unknown mission ${missionId}`);
+          ctx.ui.notify(`Recovery ${mission.mission_id} — ${mission.title} [${mission.status}]`, "info");
+        } catch (error) {
+          ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+        }
         return;
       }
       const baseRef = (await rt.git?.headCommit().catch(() => "")) ?? "";
@@ -1511,7 +1643,7 @@ ${RECOVERY_PROMPT}`;
       // line, then nothing for 30+ minutes). Each task/phase transition is
       // surfaced as a compact progress line as it happens.
       let lastLine = "";
-      const result = await rt.orchestrator.orchestrate(args.trim(), {
+      const result = await rt.orchestrator.orchestrate(request, {
         repository: rt.cwd,
         baseRef,
         mutationRequested: true,
@@ -1558,8 +1690,37 @@ ${RECOVERY_PROMPT}`;
       }
       const lines = missions.slice(-10).map((m) => {
         const tasks = store.listTasks(m.mission_id);
-        const done = tasks.filter((t) => t.status === "SUCCEEDED").length;
-        return `- ${m.mission_id} [${m.status}] ${m.workflow_class} — ${m.title} (${done}/${tasks.length} tasks)`;
+        const summary = rt.missionObservability?.summary(m.mission_id);
+        const currentGeneration = store.listMissionResumptions(m.mission_id).at(-1)?.generation ?? 0;
+        const stop = store
+          .listMissionStops(m.mission_id)
+          .filter((candidate) => candidate.resumptionGeneration === currentGeneration)
+          .at(-1);
+        const acceptance = summary?.acceptanceCoverage;
+        const acceptanceText =
+          (acceptance?.total ?? m.acceptance_criteria.length) === 0
+            ? `acceptance unavailable (${summary && tasks.length === 0 ? "no material criteria" : "legacy"})`
+            : `acceptance ${acceptance?.completed ?? 0}/${acceptance?.total ?? m.acceptance_criteria.length} (${acceptance?.approximatePercent ?? 0}%)`;
+        const derivedWorkflow = {
+          completed: tasks.filter((task) => task.status === "SUCCEEDED").length,
+          total: tasks.length,
+        };
+        const workflow =
+          summary?.workflowProgress.total || derivedWorkflow.total === 0
+            ? (summary?.workflowProgress ?? { ...derivedWorkflow, approximatePercent: 0 })
+            : {
+                ...derivedWorkflow,
+                approximatePercent: Math.round((derivedWorkflow.completed / derivedWorkflow.total) * 100),
+              };
+        const recovery = summary?.recovery ?? { attempt: 0, maxAttempts: 0 };
+        const preserved = stop?.preservedWork ?? summary?.preservedWork ?? [];
+        return [
+          `- ${m.mission_id} [${m.status}] rev ${m.revision} ${m.workflow_class} — ${m.title}`,
+          `  ${acceptanceText} · workflow ${workflow.completed}/${workflow.total} (${workflow.approximatePercent}%) · health ${summary?.health ?? "unknown"}`,
+          `  repo ${summary?.repository ?? m.repository} · task ${summary?.task ?? "none"} · owner ${summary?.owner ?? "unowned"} · last progress ${summary?.lastMeaningfulProgressAt ?? "none"}`,
+          `  recovery ${recovery.attempt}/${recovery.maxAttempts}; attempted ${stop?.attemptedRecoveries.length ?? 0} · next: ${stop?.resumeCondition ?? summary?.nextAction ?? "No further action is scheduled"}${summary?.nextActionAt ? ` at ${summary.nextActionAt}` : ""}`,
+          `  ${stop ? `stop: ${stop.reason}` : `action: ${summary?.action ?? m.status} — ${summary?.reason ?? "No additional reason recorded"}`} · preserved: ${preserved.join(", ") || "none"}`,
+        ].join("\n");
       });
       ctx.ui.notify(lines.join("\n"), "info");
     },

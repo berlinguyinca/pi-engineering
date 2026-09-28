@@ -45,3 +45,9 @@ This bundle defines the next architecture for **Pi Engineering**: one persistent
 10. Adaptive routing, model selection, and optimization.
 
 Read `00-master-spec.md` first.
+
+The approved mission reliability foundation is specified in
+`docs/superpowers/specs/2026-09-26-mission-reliability-foundation-design.md`.
+It is normative where it strengthens workspace authorization, task sizing,
+blocked-mission repair, ownership fencing, transactional integration,
+revision-bound evidence, and operator-visible recovery.

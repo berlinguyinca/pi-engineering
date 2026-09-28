@@ -23,7 +23,10 @@ import { type RetryWindowState, recordProbe, startRetryWindow, windowOpen } from
 import { type SchedulableTask, Scheduler } from "../sched/Scheduler.ts";
 import type { ExecutionBroker, ExecutionHandle, ExecutionRequestInput } from "./broker.ts";
 import type { MissionStore } from "./missionStore.ts";
+import type { DispatchAuthority } from "./ownership.ts";
+import { FailureClassifier, type FailureEvidence, RecoveryPlanner, type RecoveryPlannerOptions } from "./recovery.ts";
 import type { MissionStatus, OrchestrationTask, TaskKind, TaskStatus } from "./types.ts";
+import { canonicalizeWriteDomain } from "./workset.ts";
 
 /** Real clock/sleep for production; tests inject deterministic fakes. */
 const realNow = (): number => Date.now();
@@ -104,6 +107,10 @@ export interface SchedulerOptions {
   sleep?: (ms: number) => Promise<void>;
   /** Injectable RNG (default Math.random) for probe jitter. */
   rand?: () => number;
+  /** Acquires renewable mission/repository fencing immediately before each dispatch. */
+  acquireAuthority?: (task: OrchestrationTask) => Promise<DispatchAuthority>;
+  /** Mission-wide durable retry/repair ceiling. */
+  recovery?: RecoveryPlannerOptions;
 }
 
 export interface MissionSchedulerStatusNotice {
@@ -141,7 +148,7 @@ export function classifyFailure(
 
 /** Normalize a write domain: strip trailing slash and a trailing `/**` glob. */
 export function normalizeDomain(d: string): string {
-  return d.replace(/\/$/, "").replace(/\/\*\*$/, "");
+  return canonicalizeWriteDomain(d).replace(/\/\*\*$/, "");
 }
 
 /** True when two mutating tasks have overlapping write domains. */
@@ -150,6 +157,7 @@ export function domainsOverlap(a: string[], b: string[]): boolean {
     for (const rawY of b) {
       const x = normalizeDomain(rawX);
       const y = normalizeDomain(rawY);
+      if (x === "**" || y === "**") return true;
       if (x === y) return true;
       if (x.startsWith(`${y}/`) || y.startsWith(`${x}/`)) return true;
     }
@@ -181,6 +189,9 @@ export class MissionScheduler {
   private readonly clockNow: () => number;
   private readonly sleepFn: (ms: number) => Promise<void>;
   private readonly rand: () => number;
+  private readonly acquireAuthority?: SchedulerOptions["acquireAuthority"];
+  private readonly failureClassifier = new FailureClassifier();
+  private readonly recoveryPlanner: RecoveryPlanner;
   /** Per-task active retry window (created on the first infra failure). */
   private readonly windows = new Map<string, RetryWindowState>();
   /**
@@ -210,6 +221,11 @@ export class MissionScheduler {
     this.clockNow = opts.now ?? realNow;
     this.sleepFn = opts.sleep ?? realSleep;
     this.rand = opts.rand ?? Math.random;
+    this.acquireAuthority = opts.acquireAuthority;
+    this.recoveryPlanner = new RecoveryPlanner({
+      decisionTtlMs: this.resilience.max_outage_ms,
+      ...opts.recovery,
+    });
     this.queue = new Scheduler({ concurrency: this.limits.maxActive });
   }
 
@@ -228,10 +244,18 @@ export class MissionScheduler {
         // Approvals etc. handled by caller; treat as not runnable here.
         continue;
       }
-      const depsDone = t.depends_on.every((d) => byId.get(d)?.status === "SUCCEEDED");
+      const depsDone = t.depends_on.every(
+        (dependencyId) =>
+          byId.get(dependencyId)?.status === "SUCCEEDED" || this.store.isTaskSatisfiedBySupersession(dependencyId),
+      );
       if (!depsDone) continue;
       if (t.mutates_repo) {
-        const conflict = active.some((a) => a.mutates_repo && domainsOverlap(a.write_domains, t.write_domains));
+        const conflict = active.some(
+          (a) =>
+            a.mutates_repo &&
+            (t.repo_id === undefined || a.repo_id === undefined || t.repo_id === a.repo_id) &&
+            domainsOverlap(a.write_domains, t.write_domains),
+        );
         if (conflict) continue;
       }
       if (!this.hasCapacity(t)) continue;
@@ -359,7 +383,10 @@ export class MissionScheduler {
   private hasConflict(t: OrchestrationTask): boolean {
     if (!t.mutates_repo) return false;
     return [...this.activeTasks.values()].some(
-      (a) => a.mutates_repo && domainsOverlap(a.write_domains, t.write_domains),
+      (a) =>
+        a.mutates_repo &&
+        (t.repo_id === undefined || a.repo_id === undefined || t.repo_id === a.repo_id) &&
+        domainsOverlap(a.write_domains, t.write_domains),
     );
   }
 
@@ -394,7 +421,17 @@ export class MissionScheduler {
       if (gate === "paused") return;
       if (gate === "wait") continue;
 
-      let handle: ExecutionHandle;
+      let authority: DispatchAuthority | undefined;
+      try {
+        authority = await this.acquireAuthority?.(this.store.getTask(task.task_id) ?? task);
+        if (authority) this.store.assignTaskAuthority(task.task_id, authority.missionIdentity);
+      } catch (error) {
+        this.store.transitionTask(task.task_id, "BLOCKED", "system", {
+          failure_reason: error instanceof Error ? error.message : String(error),
+        });
+        return;
+      }
+      let handle: ExecutionHandle | undefined;
       try {
         // execute() itself can throw (e.g. no backend registered for the kind).
         // Left outside the try it escaped the fire-and-forget run as an
@@ -403,6 +440,7 @@ export class MissionScheduler {
         handle = await this.broker.execute({
           taskId: task.task_id,
           missionId: task.mission_id,
+          repoId: task.repo_id,
           kind: brokerKind(task.kind),
           role: task.role,
           objective: task.objective,
@@ -410,16 +448,27 @@ export class MissionScheduler {
           writeDomains: task.write_domains,
           isolation: task.isolation,
           modelRequirements: task.execution_requirements,
+          deliverables: task.deliverables,
+          executionBudgetMs: task.execution_budget_ms,
+          checkpointPolicy: task.checkpoint_policy,
+          requiredOutputArtifacts: task.required_output_artifacts,
+          candidateBaseSha: task.repair_base_candidate_sha,
+          authority,
+        });
+        authority?.onInvalidated(() => {
+          void handle?.cancel();
         });
         if (signal?.aborted) {
           await handle.cancel();
           return;
         }
+        authority?.assertAuthoritative();
         this.store.transitionTask(task.task_id, "RUNNING", "system", {
           attempt,
           assigned_execution_id: handle.executionId,
         });
         const outcome = await handle.result();
+        authority?.assertAuthoritative();
         // A task canceled underneath the runner (constraint steering) is already
         // CANCELED; CANCELED -> SUCCEEDED is an illegal transition and used to
         // escape as an unhandled rejection from the fire-and-forget run.
@@ -435,6 +484,9 @@ export class MissionScheduler {
           const infraCat = infraCategoryFromWorkerMarker(outcome.error);
           const ceiling = infraCat ? this.outageCeiling(task, outcome) : null;
           if (ceiling) {
+            authority?.assertAuthoritative();
+            this.settleTaskRecoveries(task, "failed");
+            this.recordTerminalFailure(task, ceiling, handle.executionId, outcome.error);
             this.store.transitionTask(task.task_id, "FAILED", "system", { failure_reason: ceiling });
             this.forgetOutage(task);
             return;
@@ -443,6 +495,23 @@ export class MissionScheduler {
             const res = this.resilienceGate(task, infraCat);
             if (res.paused) return;
             if (res.retry) {
+              const recoveryStop = await this.authorizeRetry(task, {
+                missionId: task.mission_id,
+                taskId: task.task_id,
+                executionId: handle.executionId,
+                summary: outcome.summary ?? outcome.error ?? "provider transient failure",
+                evidenceRefs: outcome.artifactRefs,
+                category: "PROVIDER_TRANSIENT",
+                observedAt: new Date(this.clockNow()).toISOString(),
+              });
+              if (recoveryStop) {
+                authority?.assertAuthoritative();
+                this.settleTaskRecoveries(task, "failed");
+                this.recordTerminalFailure(task, recoveryStop, handle.executionId, outcome.error);
+                this.store.transitionTask(task.task_id, "FAILED", "system", { failure_reason: recoveryStop });
+                return;
+              }
+              authority?.assertAuthoritative();
               this.store.transitionTask(task.task_id, "RETRYING", "system", { attempt });
               const waited = await this.abortable(this.sleepFn(res.waitMs), signal);
               if (waited.aborted) {
@@ -455,6 +524,14 @@ export class MissionScheduler {
           // Surface the worker's own result summary (guard aborts, budget
           // exhaustion, timeouts, no-result) — exitStatus alone hid the cause.
           const detail = outcome.summary ? `: ${outcome.summary}` : "";
+          authority?.assertAuthoritative();
+          this.settleTaskRecoveries(task, "failed");
+          this.recordTerminalFailure(
+            task,
+            `backend reported ${outcome.exitStatus}${detail}`,
+            handle.executionId,
+            outcome.error,
+          );
           this.store.transitionTask(task.task_id, "FAILED", "system", {
             failure_reason: `backend reported ${outcome.exitStatus}${detail}`,
           });
@@ -476,9 +553,25 @@ export class MissionScheduler {
             terminal: false,
           });
         }
+        authority?.assertAuthoritative();
         this.store.transitionTask(task.task_id, "SUCCEEDED");
+        this.settleTaskRecoveries(task, "succeeded");
         return;
       } catch (err) {
+        if (authority) {
+          try {
+            authority.assertAuthoritative();
+          } catch (authorityError) {
+            await handle?.cancel().catch(() => undefined);
+            if (handle) {
+              this.store.rejectLateExecution(
+                handle.executionId,
+                authorityError instanceof Error ? authorityError.message : String(authorityError),
+              );
+            }
+            return;
+          }
+        }
         if (signal?.aborted) {
           this.cancelTask(task);
           return;
@@ -489,11 +582,132 @@ export class MissionScheduler {
         // worker's non-throwing transient-infrastructure outcomes above.
         const { action, reason } = classifyFailure(err, task);
         if (action === "retry" && attempt < task.max_attempts) {
+          const recoveryStop = await this.authorizeRetry(task, {
+            missionId: task.mission_id,
+            taskId: task.task_id,
+            executionId: handle?.executionId ?? null,
+            summary: reason,
+            evidenceRefs: [],
+            category: /^transient:/i.test(reason) ? "PROVIDER_TRANSIENT" : undefined,
+            observedAt: new Date(this.clockNow()).toISOString(),
+          });
+          if (recoveryStop) {
+            authority?.assertAuthoritative();
+            this.settleTaskRecoveries(task, "failed");
+            this.recordTerminalFailure(
+              task,
+              recoveryStop,
+              handle?.executionId ?? null,
+              err instanceof Error ? err.message : String(err),
+            );
+            this.store.transitionTask(task.task_id, "FAILED", "system", { failure_reason: recoveryStop });
+            return;
+          }
+          authority?.assertAuthoritative();
           this.store.transitionTask(task.task_id, "RETRYING", "system", { attempt });
           continue;
         }
+        authority?.assertAuthoritative();
+        this.settleTaskRecoveries(task, "failed");
+        this.recordTerminalFailure(
+          task,
+          reason,
+          handle?.executionId ?? null,
+          err instanceof Error ? err.message : String(err),
+        );
         this.store.transitionTask(task.task_id, "FAILED", "system", { failure_reason: reason });
         return;
+      } finally {
+        const closeError = await authority?.close();
+        if (authority && closeError) {
+          const identity = authority.repositoryIdentity ?? authority.missionIdentity;
+          await this.store.recordOwnershipReleaseFailure({
+            missionId: identity.missionId,
+            taskId: task.task_id,
+            ...(authority.repositoryIdentity ? { repoId: authority.repositoryIdentity.repoId } : {}),
+            generation: identity.generation,
+            fencingToken: identity.fencingToken,
+            ownerId: identity.ownerId,
+            renewBy: identity.renewBy,
+            error: closeError,
+          });
+        }
+      }
+    }
+  }
+
+  private async authorizeRetry(task: OrchestrationTask, evidence: FailureEvidence): Promise<string | null> {
+    const classification = this.failureClassifier.classify(evidence);
+    if (!this.store.getFailureClassification(classification.classificationId)) {
+      this.store.classifyFailure(classification);
+    }
+    const decision = this.recoveryPlanner.decide({
+      classification,
+      history: this.store.listRecoveryDecisions(task.mission_id),
+      now: this.clockNow(),
+      resumptionGeneration: this.store.listMissionResumptions(task.mission_id).at(-1)?.generation ?? 0,
+    });
+    const persisted = this.store.getRecoveryDecision(decision.recoveryId) ?? this.store.planRecovery(decision);
+    if (persisted.status === "planned") {
+      this.store.transitionRecovery(persisted.recoveryId, decision.action === "STOP" ? "exhausted" : "started");
+    }
+    await this.store.flush();
+    return decision.action === "STOP" ? decision.expectedMaterialChange : null;
+  }
+
+  private recordTerminalFailure(
+    task: OrchestrationTask,
+    summary: string,
+    executionId: string | null,
+    structuredError?: string,
+  ): void {
+    const evidence = {
+      missionId: task.mission_id,
+      taskId: task.task_id,
+      executionId,
+      summary: [structuredError, summary].filter(Boolean).join(": "),
+      evidenceRefs: [],
+      observedAt: new Date(this.clockNow()).toISOString(),
+    };
+    const inferred = this.failureClassifier.classify(evidence);
+    const structuredCategory =
+      !!structuredError &&
+      !/repository-scoped git provider|git provider/i.test(structuredError) &&
+      [
+        "PROVIDER_TRANSIENT",
+        "PROVIDER_PERMANENT",
+        "AUTHORIZATION_OR_CREDENTIAL",
+        "PERSISTENCE_FAILURE",
+        "WORKSPACE_SCOPE_MISMATCH",
+      ].includes(inferred.category);
+    const gateCategory =
+      task.kind === "validation"
+        ? "VALIDATION_FAILED"
+        : task.kind === "review"
+          ? "REVIEW_FAILED"
+          : task.kind === "integration"
+            ? "MERGE_CONFLICT"
+            : undefined;
+    const classification = structuredCategory
+      ? inferred
+      : this.failureClassifier.classify({ ...evidence, ...(gateCategory ? { category: gateCategory } : {}) });
+    if (this.store.getFailureClassification(classification.classificationId)) return;
+    this.store.classifyFailure({
+      ...classification,
+      blockerEpisodeId: this.store.getMission(task.mission_id)?.blocked_episode_id,
+    });
+  }
+
+  private settleTaskRecoveries(task: OrchestrationTask, status: "succeeded" | "failed"): void {
+    const taskClassifications = new Set(
+      this.store
+        .listFailureClassifications(task.mission_id)
+        .filter((classification) => classification.taskId === task.task_id)
+        .map((classification) => classification.classificationId),
+    );
+    for (const decision of this.store.listRecoveryDecisions(task.mission_id)) {
+      if (decision.status === "started" && taskClassifications.has(decision.classificationId)) {
+        this.store.transitionRecovery(decision.recoveryId, status);
       }
     }
   }

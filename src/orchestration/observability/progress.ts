@@ -102,6 +102,10 @@ export interface ProgressInput {
    * weights are only a fallback split (no weight-bearing metadata).
    */
   basis?: "weighted_dag" | "inferred";
+  /** Stable material acceptance IDs. Presence makes acceptance coverage primary. */
+  acceptanceIds?: string[];
+  /** Acceptance IDs backed by current candidate evidence. */
+  verifiedAcceptanceIds?: string[];
 }
 
 export interface ProgressResult {
@@ -110,6 +114,17 @@ export interface ProgressResult {
   verifiedComplete: boolean;
   tasks: MissionTaskProgress[];
   historyPoint: ProgressHistoryPoint;
+  acceptanceCoverage: {
+    completed: number;
+    total: number;
+    approximatePercent: number;
+  };
+  workflowProgress: {
+    completed: number;
+    total: number;
+    approximatePercent: number;
+    basis: "weighted_dag" | "inferred";
+  };
 }
 
 /**
@@ -155,31 +170,55 @@ export function computeProgress(input: ProgressInput): ProgressResult {
   const raw = total > 0 ? (contributed / total) * 100 : 0;
   const complete = verifiedComplete && tasks.length > 0;
 
-  let approximatePercent: number;
+  let workflowPercent: number;
   if (complete) {
     // Only a passed CompletionGate may render 100.
-    approximatePercent = 100;
+    workflowPercent = 100;
   } else if (raw >= 100) {
     // Final validation before gate passes: show ~99, never 100.
-    approximatePercent = 99;
+    workflowPercent = 99;
   } else {
-    approximatePercent = Math.floor(raw);
+    workflowPercent = Math.floor(raw);
   }
+
+  const acceptanceIds = input.acceptanceIds === undefined ? undefined : [...new Set(input.acceptanceIds)];
+  const verifiedAcceptanceIds = new Set(input.verifiedAcceptanceIds ?? []);
+  const acceptanceCompleted =
+    acceptanceIds?.filter((acceptanceId) => verifiedAcceptanceIds.has(acceptanceId)).length ?? 0;
+  const acceptanceTotal = acceptanceIds?.length ?? 0;
+  const acceptancePercent =
+    acceptanceIds === undefined
+      ? workflowPercent
+      : acceptanceTotal > 0
+        ? Math.floor((acceptanceCompleted / acceptanceTotal) * 100)
+        : 0;
+  const basis = input.basis ?? "weighted_dag";
 
   const historyPoint: ProgressHistoryPoint = {
     at: new Date().toISOString(),
-    approximatePercent,
+    approximatePercent: acceptancePercent,
     label: input.historyLabel,
     meaningfulProgress: contributed > 0,
   };
 
   return {
-    approximatePercent,
+    approximatePercent: acceptancePercent,
     // Weights are derived from the DAG (explicit or kind/role) by default;
     // "inferred" is only set explicitly for legacy missions.
-    basis: input.basis ?? "weighted_dag",
+    basis,
     verifiedComplete: complete,
     tasks: taskRecords,
     historyPoint,
+    acceptanceCoverage: {
+      completed: acceptanceCompleted,
+      total: acceptanceTotal,
+      approximatePercent: acceptancePercent,
+    },
+    workflowProgress: {
+      completed: contributed,
+      total,
+      approximatePercent: workflowPercent,
+      basis,
+    },
   };
 }

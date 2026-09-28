@@ -13,10 +13,11 @@
 
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import type { BrokerBackends } from "../../src/orchestration/broker.ts";
+import type { GitRepo } from "../../src/git/GitRepo.ts";
+import { type BrokerBackends, RepositoryLifecycleInventoryUnavailableError } from "../../src/orchestration/broker.ts";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
 import { MissionObservability } from "../../src/orchestration/observability/MissionObservability.ts";
-import { Orchestrator } from "../../src/orchestration/orchestrator.ts";
+import { Orchestrator, intersectWriteDomains } from "../../src/orchestration/orchestrator.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 
 /** Deterministic overlap barrier (see dag-parallel/blackhole tests). */
@@ -49,7 +50,12 @@ function parallelBarrier(needed: number, timeoutMs = 5000): { arrived: () => Pro
 interface Harness {
   orchestrator: Orchestrator;
   store: MissionStore;
-  calls: { agent: string[]; review: string[]; validation: string[]; process: string[] };
+  calls: {
+    agent: string[];
+    review: string[];
+    validation: string[];
+    process: string[];
+  };
 }
 
 interface HarnessOpts {
@@ -70,24 +76,42 @@ interface HarnessOpts {
   validationFailTimes?: number;
   /** Fail every validation run AFTER the Nth (a late failure must not be masked). */
   validationFailAfter?: number;
+  noGitEvidenceTarget?: boolean;
+  /** Emit a distinct candidate identity after a repair worker runs. */
+  materialRepairEvidence?: boolean;
 }
 
 function harness(opts: HarnessOpts = {}): Harness {
   const store = MissionStore.open(JsonlEventStore.inMemory());
-  const calls = { agent: [] as string[], review: [] as string[], validation: [] as string[], process: [] as string[] };
+  const calls = {
+    agent: [] as string[],
+    review: [] as string[],
+    validation: [] as string[],
+    process: [] as string[],
+  };
   const backends: BrokerBackends = {
     agent: {
       runAgent: async ({ role, objective, onActivity }) => {
         calls.agent.push(role ?? objective);
         if (opts.emitActivity) {
-          onActivity?.({ kind: "state", summary: "Worker session started", meaningfulProgress: false });
+          onActivity?.({
+            kind: "state",
+            summary: "Worker session started",
+            meaningfulProgress: false,
+          });
         }
         const exit = opts.agentExitStatus ?? "succeeded";
-        return { executionId: "e", exitStatus: exit, summary: "implemented", artifactRefs: [], usage: {} };
+        return {
+          executionId: "e",
+          exitStatus: exit,
+          summary: "implemented",
+          artifactRefs: [],
+          usage: {},
+        };
       },
     },
     review: {
-      runReview: async () => {
+      runReview: async ({ acceptanceCriteria }) => {
         calls.review.push("review");
         if (opts.reviewExitStatus && opts.reviewExitStatus !== "succeeded") {
           return {
@@ -99,7 +123,11 @@ function harness(opts: HarnessOpts = {}): Harness {
             findings: [],
           };
         }
-        const findings = (opts.findings ?? []).map((f) => ({ summary: f, severity: "blocking", status: "open" }));
+        const findings = (opts.findings ?? []).map((f) => ({
+          summary: f,
+          severity: "blocking",
+          status: "open",
+        }));
         return {
           executionId: "e",
           exitStatus: "succeeded",
@@ -107,6 +135,25 @@ function harness(opts: HarnessOpts = {}): Harness {
           artifactRefs: [],
           usage: {},
           findings,
+          reviewEvidence: {
+            reviewerSessionId: "review-session",
+            model: "test-reviewer",
+            provider: "test",
+            verdict: findings.length > 0 ? ("request_changes" as const) : ("approve" as const),
+            independenceMode: "independent" as const,
+            findings: findings.map((finding) => ({
+              severity: "blocking" as const,
+              summary: String(finding.summary),
+              status: "open" as const,
+            })),
+            outputValid: true,
+            accessible: true,
+            acceptanceResults: (acceptanceCriteria ?? []).map((criterion) => ({
+              acceptanceId: criterion.acceptanceId,
+              status: findings.length > 0 ? ("failed" as const) : ("passed" as const),
+              detail: "deterministic reviewer checked this criterion",
+            })),
+          },
         };
       },
     },
@@ -124,7 +171,13 @@ function harness(opts: HarnessOpts = {}): Harness {
           };
         }
         if (opts.validationFailTimes && calls.validation.length <= opts.validationFailTimes) {
-          return { executionId: "e", exitStatus: "failed", summary: "suite red", artifactRefs: [], usage: {} };
+          return {
+            executionId: "e",
+            exitStatus: "failed",
+            summary: "suite red",
+            artifactRefs: [],
+            usage: {},
+          };
         }
         if (opts.validationExitStatus && opts.validationExitStatus !== "succeeded") {
           return {
@@ -135,20 +188,59 @@ function harness(opts: HarnessOpts = {}): Harness {
             usage: {},
           };
         }
-        return { executionId: "e", exitStatus: "succeeded", summary: "valid", artifactRefs: [], usage: {} };
+        return {
+          executionId: "e",
+          exitStatus: "succeeded",
+          summary: "valid",
+          artifactRefs: [],
+          usage: {},
+          validationEvidence: {
+            command: "npm test",
+            profile: "test",
+            exitCode: 0,
+            testSummary: { passed: 1, failed: 0 },
+            noTargets: false,
+            accessible: true,
+            acceptanceResults: [],
+          },
+        };
       },
     },
     process: {
       runProcess: async () => {
         calls.process.push("process");
-        return { executionId: "e", exitStatus: "succeeded", summary: "ran", artifactRefs: [], usage: {} };
+        return {
+          executionId: "e",
+          exitStatus: "succeeded",
+          summary: "ran",
+          artifactRefs: [],
+          usage: {},
+        };
       },
     },
   };
   const orchestrator = new Orchestrator({
     store,
     backends,
-    planner: async () => [
+    ...(opts.noGitEvidenceTarget
+      ? {}
+      : {
+          git: {
+            root: process.cwd(),
+            headCommit: async () =>
+              opts.materialRepairEvidence && calls.agent.length > 1 ? "candidate-repair-sha" : "candidate-test-sha",
+            captureDiff: async () =>
+              opts.materialRepairEvidence && calls.agent.length > 1
+                ? "diff --git a/src/repair.ts b/src/repair.ts"
+                : "diff --git a/src/health.ts b/src/health.ts",
+            changedFiles: async () => ["src/health.ts"],
+            loadCandidateLifecycleInventory: async () => ({ records: [], diagnostics: [] }),
+            loadIntegrationRunInventory: async () => ({ records: [], diagnostics: [] }),
+            loadPromotionLifecycleInventory: async () => ({ records: [], diagnostics: [] }),
+            loadPendingBranchCleanupInventory: async () => ({ records: [], diagnostics: [] }),
+          } as unknown as GitRepo,
+        }),
+    planner: async (mission) => [
       {
         kind: "agent" as const,
         role: "implementer",
@@ -162,6 +254,9 @@ function harness(opts: HarnessOpts = {}): Harness {
         depends_on: [],
         priority: 0,
         execution_requirements: {},
+        acceptance_ids: mission.acceptance_criteria.flatMap((criterion) =>
+          criterion.acceptance_id ? [criterion.acceptance_id] : [],
+        ),
         max_attempts: 3,
         failure_policy: "retry" as const,
       },
@@ -180,6 +275,7 @@ describe("acceptance scenario A — simple feature auto-invokes engineering+vali
     });
     assert.equal(result.intent.intent.includes("implement"), true);
     const mission = h.store.getMission(result.mission.mission_id)!;
+    assert.equal(h.store.getWorkspaceManifest(mission.mission_id)?.repositories.length, 1);
     assert.ok(["engineering_review", "engineering"].includes(mission.workflow_class));
     assert.ok(mission.required_gates.includes("validation"));
     assert.ok(mission.required_gates.includes("independent_review"));
@@ -190,6 +286,150 @@ describe("acceptance scenario A — simple feature auto-invokes engineering+vali
     // Completion gate passed -> COMPLETE.
     assert.equal(mission.status, "COMPLETE");
     assert.equal(result.completed, true);
+  });
+
+  it("fails closed instead of synthesizing mutation evidence without repository Git access", async () => {
+    const h = harness({ noGitEvidenceTarget: true });
+    await assert.rejects(
+      h.orchestrator.orchestrate("Add a health endpoint", {
+        repository: ".",
+        baseRef: "abc",
+        mutationRequested: true,
+      }),
+      (error: unknown) =>
+        error instanceof RepositoryLifecycleInventoryUnavailableError && error.code === "PERSISTENCE_UNAVAILABLE",
+    );
+    assert.ok(h.store.listMissions().every((mission) => h.store.getCandidate(mission.mission_id) === undefined));
+  });
+});
+
+describe("material legacy orchestration workset safety", () => {
+  it("canonicalizes both sides of planner/manifest write-domain intersection", () => {
+    assert.deepEqual(intersectWriteDomains(["src\\api\\**"], ["src/**"]), ["src/api/**"]);
+  });
+
+  it("rejects a protected legacy repository before any executable investigation planning", async () => {
+    const store = MissionStore.open(JsonlEventStore.inMemory());
+    let plannerCalls = 0;
+    const orchestrator = new Orchestrator({
+      store,
+      backends: {},
+      planner: async () => {
+        plannerCalls++;
+        return [];
+      },
+    });
+
+    const result = await orchestrator.orchestrate("Find out why login fails", {
+      repository: "/",
+      baseRef: "",
+      mutationRequested: false,
+    });
+
+    assert.equal(result.mission.workflow_class, "investigation");
+    assert.equal(result.mission.status, "BLOCKED");
+    assert.match(result.failureReason ?? "", /protected filesystem root/i);
+    assert.equal(plannerCalls, 0);
+    assert.equal(store.getWorkspaceManifest(result.mission.mission_id), undefined);
+  });
+
+  it("blocks a traversal domain before a legacy worker can dispatch", async () => {
+    const store = MissionStore.open(JsonlEventStore.inMemory());
+    let calls = 0;
+    const orchestrator = new Orchestrator({
+      store,
+      backends: {
+        agent: {
+          runAgent: async () => {
+            calls++;
+            return {
+              executionId: "unsafe",
+              exitStatus: "succeeded",
+              summary: "unsafe",
+              artifactRefs: [],
+              usage: {},
+            };
+          },
+        },
+      },
+      planner: async (mission) => [
+        {
+          kind: "agent",
+          role: "implementer",
+          objective: "escape",
+          mutates_repo: true,
+          write_domains: ["src/../../outside/**"],
+          isolation: "none",
+          depends_on: [],
+          priority: 0,
+          execution_requirements: {},
+          max_attempts: 1,
+          failure_policy: "block",
+          acceptance_ids: mission.acceptance_criteria.flatMap((criterion) =>
+            criterion.acceptance_id ? [criterion.acceptance_id] : [],
+          ),
+        },
+      ],
+    });
+
+    const result = await orchestrator.orchestrate("Make a material change", {
+      repository: ".",
+      baseRef: "abc",
+      mutationRequested: true,
+      acceptanceCriteria: ["stay inside the repository"],
+    });
+
+    assert.equal(result.mission.status, "BLOCKED");
+    assert.match(result.failureReason ?? "", /INVALID_WRITE_DOMAIN/);
+    assert.equal(calls, 0);
+  });
+
+  it("blocks missing planner acceptance mapping instead of assigning every criterion", async () => {
+    const store = MissionStore.open(JsonlEventStore.inMemory());
+    let calls = 0;
+    const orchestrator = new Orchestrator({
+      store,
+      backends: {
+        agent: {
+          runAgent: async () => {
+            calls++;
+            return {
+              executionId: "worker",
+              exitStatus: "succeeded",
+              summary: "done",
+              artifactRefs: [],
+              usage: {},
+            };
+          },
+        },
+      },
+      planner: async () => [
+        {
+          kind: "agent",
+          role: "implementer",
+          objective: "unmapped work",
+          mutates_repo: true,
+          write_domains: ["src/**"],
+          isolation: "none",
+          depends_on: [],
+          priority: 0,
+          execution_requirements: {},
+          max_attempts: 1,
+          failure_policy: "block",
+        },
+      ],
+    });
+
+    const result = await orchestrator.orchestrate("Implement explicit acceptance", {
+      repository: ".",
+      baseRef: "abc",
+      mutationRequested: true,
+      acceptanceCriteria: ["AC is explicitly implemented"],
+    });
+
+    assert.equal(result.mission.status, "BLOCKED");
+    assert.match(result.failureReason ?? "", /UNCOVERED_ACCEPTANCE/);
+    assert.equal(calls, 0);
   });
 });
 
@@ -205,7 +445,7 @@ describe("mission caller cancellation", () => {
     let reviewCalls = 0;
     const orchestrator = new Orchestrator({
       store,
-      planner: async () => [
+      planner: async (mission) => [
         {
           kind: "agent" as const,
           role: "implementer",
@@ -216,6 +456,9 @@ describe("mission caller cancellation", () => {
           depends_on: [],
           priority: 0,
           execution_requirements: {},
+          acceptance_ids: mission.acceptance_criteria.flatMap((criterion) =>
+            criterion.acceptance_id ? [criterion.acceptance_id] : [],
+          ),
           max_attempts: 1,
           failure_policy: "block" as const,
         },
@@ -226,19 +469,46 @@ describe("mission caller cancellation", () => {
             backendSignal = signal;
             started();
             await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
-            return { executionId: "late", exitStatus: "succeeded", summary: "late", artifactRefs: [], usage: {} };
+            return {
+              executionId: "late",
+              exitStatus: "succeeded",
+              summary: "late",
+              artifactRefs: [],
+              usage: {},
+            };
           },
         },
         validation: {
           runValidation: async () => {
             validationCalls++;
-            return { executionId: "v", exitStatus: "succeeded", summary: "valid", artifactRefs: [], usage: {} };
+            return {
+              executionId: "v",
+              exitStatus: "succeeded",
+              summary: "valid",
+              artifactRefs: [],
+              usage: {},
+              validationEvidence: {
+                command: "npm test",
+                profile: "test",
+                exitCode: 0,
+                testSummary: { passed: 1 },
+                noTargets: false,
+                accessible: true,
+                acceptanceResults: [],
+              },
+            };
           },
         },
         review: {
           runReview: async () => {
             reviewCalls++;
-            return { executionId: "r", exitStatus: "succeeded", summary: "reviewed", artifactRefs: [], usage: {} };
+            return {
+              executionId: "r",
+              exitStatus: "succeeded",
+              summary: "reviewed",
+              artifactRefs: [],
+              usage: {},
+            };
           },
         },
       },
@@ -275,11 +545,17 @@ describe("mission caller cancellation", () => {
         if (!signal.aborted) {
           await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
         }
-        return { executionId: stage, exitStatus: "succeeded", summary: "late", artifactRefs: [], usage: {} };
+        return {
+          executionId: stage,
+          exitStatus: "succeeded",
+          summary: "late",
+          artifactRefs: [],
+          usage: {},
+        };
       };
       const orchestrator = new Orchestrator({
         store,
-        planner: async () => [
+        planner: async (mission) => [
           {
             kind: "agent" as const,
             role: "implementer",
@@ -290,6 +566,9 @@ describe("mission caller cancellation", () => {
             depends_on: [],
             priority: 0,
             execution_requirements: {},
+            acceptance_ids: mission.acceptance_criteria.flatMap((criterion) =>
+              criterion.acceptance_id ? [criterion.acceptance_id] : [],
+            ),
             max_attempts: 1,
             failure_policy: "block" as const,
           },
@@ -308,7 +587,13 @@ describe("mission caller cancellation", () => {
             runValidation: async ({ signal }) =>
               stage === "validation"
                 ? waitForAbort(signal)
-                : { executionId: "v", exitStatus: "succeeded", summary: "valid", artifactRefs: [], usage: {} },
+                : {
+                    executionId: "v",
+                    exitStatus: "succeeded",
+                    summary: "valid",
+                    artifactRefs: [],
+                    usage: {},
+                  },
           },
           review: {
             runReview: async ({ signal }) => {
@@ -357,7 +642,13 @@ describe("mission caller cancellation", () => {
     let validationCalls = 0;
     const orchestrator = new Orchestrator({
       store,
-      planner: async () => [
+      git: {
+        root: process.cwd(),
+        headCommit: async () => "candidate-repair-sha",
+        captureDiff: async () => "diff --git a/src/repair.ts b/src/repair.ts",
+        changedFiles: async () => ["src/repair.ts"],
+      } as unknown as GitRepo,
+      planner: async (mission) => [
         {
           kind: "agent" as const,
           role: "implementer",
@@ -368,6 +659,9 @@ describe("mission caller cancellation", () => {
           depends_on: [],
           priority: 0,
           execution_requirements: {},
+          acceptance_ids: mission.acceptance_criteria.flatMap((criterion) =>
+            criterion.acceptance_id ? [criterion.acceptance_id] : [],
+          ),
           max_attempts: 1,
           failure_policy: "block" as const,
         },
@@ -378,16 +672,32 @@ describe("mission caller cancellation", () => {
             if (objective.includes("Repair review finding")) {
               repairStarted();
               if (!signal.aborted) {
-                await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+                await new Promise<void>((resolve) =>
+                  signal.addEventListener("abort", () => resolve(), {
+                    once: true,
+                  }),
+                );
               }
             }
-            return { executionId: "a", exitStatus: "succeeded", summary: "done", artifactRefs: [], usage: {} };
+            return {
+              executionId: "a",
+              exitStatus: "succeeded",
+              summary: "done",
+              artifactRefs: [],
+              usage: {},
+            };
           },
         },
         validation: {
           runValidation: async () => {
             validationCalls++;
-            return { executionId: "v", exitStatus: "succeeded", summary: "valid", artifactRefs: [], usage: {} };
+            return {
+              executionId: "v",
+              exitStatus: "succeeded",
+              summary: "valid",
+              artifactRefs: [],
+              usage: {},
+            };
           },
         },
         review: {
@@ -445,7 +755,12 @@ describe("mission progress visibility — onProgress streams while the mission r
       objective: "check",
     });
     obs.missionCreated(mission.mission_id, mission.title);
-    const orchestrator = new Orchestrator({ store, backends: {}, observability: obs, planner: async () => [] });
+    const orchestrator = new Orchestrator({
+      store,
+      backends: {},
+      observability: obs,
+      planner: async () => [],
+    });
     const observe = (
       orchestrator as unknown as {
         observeWorkerActivity: (event: {
@@ -505,7 +820,11 @@ describe("mission progress visibility — onProgress streams while the mission r
       /planner unavailable/,
     );
 
-    const callbacks = (orchestrator as unknown as { progress: Map<string, (line: string) => void> }).progress;
+    const callbacks = (
+      orchestrator as unknown as {
+        progress: Map<string, (line: string) => void>;
+      }
+    ).progress;
     assert.equal(callbacks.size, 0, "failed orchestration must release the captured caller callback");
   });
 
@@ -553,7 +872,13 @@ describe("mission progress visibility — onProgress streams while the mission r
             elapsedMs: 15_000,
             lastActivityMs: 4_000,
           });
-          return { executionId: "e", exitStatus: "succeeded", summary: "done", artifactRefs: [], usage: {} };
+          return {
+            executionId: "e",
+            exitStatus: "succeeded",
+            summary: "done",
+            artifactRefs: [],
+            usage: {},
+          };
         },
       },
       validation: {
@@ -563,24 +888,54 @@ describe("mission progress visibility — onProgress streams while the mission r
           summary: "ok",
           artifactRefs: [],
           usage: {},
+          validationEvidence: {
+            command: "npm test",
+            profile: "test",
+            exitCode: 0,
+            testSummary: { passed: 1 },
+            noTargets: false,
+            accessible: true,
+            acceptanceResults: [],
+          },
         }),
       },
       review: {
-        runReview: async () => ({
+        runReview: async ({ acceptanceCriteria }) => ({
           executionId: "r",
           exitStatus: "succeeded",
           summary: "ok",
           artifactRefs: [],
           usage: {},
           findings: [],
+          reviewEvidence: {
+            reviewerSessionId: "review-observability",
+            model: "test",
+            provider: "test",
+            verdict: "approve",
+            independenceMode: "independent",
+            findings: [],
+            outputValid: true,
+            accessible: true,
+            acceptanceResults: (acceptanceCriteria ?? []).map((criterion) => ({
+              acceptanceId: criterion.acceptanceId,
+              status: "passed" as const,
+              detail: "checked",
+            })),
+          },
         }),
       },
     };
     const orchestrator = new Orchestrator({
       store,
       backends,
+      git: {
+        root: process.cwd(),
+        headCommit: async () => "candidate-observability-sha",
+        captureDiff: async () => "diff --git a/src/activity.ts b/src/activity.ts",
+        changedFiles: async () => ["src/activity.ts"],
+      } as unknown as GitRepo,
       observability: obs,
-      planner: async () => [
+      planner: async (mission) => [
         {
           kind: "agent",
           role: "implementer",
@@ -591,6 +946,9 @@ describe("mission progress visibility — onProgress streams while the mission r
           depends_on: [],
           priority: 0,
           execution_requirements: {},
+          acceptance_ids: mission.acceptance_criteria.flatMap((criterion) =>
+            criterion.acceptance_id ? [criterion.acceptance_id] : [],
+          ),
           max_attempts: 1,
           failure_policy: "block" as const,
         },
@@ -660,6 +1018,56 @@ describe("passive requests — gate-bypass and illegal-transition regressions", 
     assert.equal(h.store.getMission(result.mission.mission_id)!.status, "COMPLETE");
     // Nothing was scheduled for a pure conversation.
     assert.equal(h.store.listTasks(result.mission.mission_id).length, 0);
+    assert.equal(
+      h.store.getWorkspaceManifest(result.mission.mission_id),
+      undefined,
+      "passive compatibility must not invent executable repository authority",
+    );
+  });
+
+  it("rejects a reentrant resumption without publishing verified completion", async () => {
+    const backend = JsonlEventStore.inMemory();
+    const store = MissionStore.open(backend);
+    const observability = new MissionObservability({ backend, store });
+    const orchestrator = new Orchestrator({
+      store,
+      observability,
+      backends: {},
+      planner: async () => [],
+    });
+    let resumed = false;
+
+    await assert.rejects(
+      orchestrator.orchestrate("Explain this function", {
+        repository: ".",
+        baseRef: "abc",
+        mutationRequested: false,
+        onProgress: () => {
+          const active = store.listMissions().at(-1);
+          if (active && !resumed) {
+            resumed = true;
+            store.resumeMission(active.mission_id, "reentrant observer resumed mission");
+          }
+        },
+      }),
+      /stale mission resumption at completion/,
+    );
+
+    const missionId = store.listMissions().at(-1)!.mission_id;
+    assert.equal(store.getMission(missionId)?.status, "FINAL_VALIDATION");
+    assert.equal(observability.summary(missionId)?.progress.verifiedComplete, false);
+  });
+
+  it("a truly non-executable conversation does not resolve even a protected repository path", async () => {
+    const h = harness();
+    const result = await h.orchestrator.orchestrate("Explain this function", {
+      repository: "/",
+      baseRef: "",
+      mutationRequested: false,
+    });
+
+    assert.equal(result.completed, true);
+    assert.equal(h.store.getWorkspaceManifest(result.mission.mission_id), undefined);
   });
 
   it("a passive classification with policy gates is NOT short-circuited to COMPLETE", async () => {
@@ -720,7 +1128,13 @@ describe("acceptance scenario C — independent tasks run concurrently with isol
           await barrier.arrived();
           calls.push(role ?? "agent");
           concurrent--;
-          return { executionId: "e", exitStatus: "succeeded", summary: "done", artifactRefs: [], usage: {} };
+          return {
+            executionId: "e",
+            exitStatus: "succeeded",
+            summary: "done",
+            artifactRefs: [],
+            usage: {},
+          };
         },
       },
     };
@@ -729,13 +1143,20 @@ describe("acceptance scenario C — independent tasks run concurrently with isol
       backends,
       git: {
         headCommit: async () => "abc",
-        createWorktree: async (_base: string, branch: string) => ({ path: ".", branch }),
+        createWorktree: async (_base: string, branch: string) => ({
+          path: ".",
+          branch,
+        }),
         branchAheadOf: async () => false,
         statusIn: async () => "",
         removeWorktree: async () => {},
         isAncestor: async () => false,
+        loadCandidateLifecycleInventory: async () => ({ records: [], diagnostics: [] }),
+        loadIntegrationRunInventory: async () => ({ records: [], diagnostics: [] }),
+        loadPromotionLifecycleInventory: async () => ({ records: [], diagnostics: [] }),
+        loadPendingBranchCleanupInventory: async () => ({ records: [], diagnostics: [] }),
       } as never,
-      planner: async () => [
+      planner: async (mission) => [
         {
           kind: "agent" as const,
           role: "implementer",
@@ -746,6 +1167,9 @@ describe("acceptance scenario C — independent tasks run concurrently with isol
           depends_on: [],
           priority: 0,
           execution_requirements: {},
+          acceptance_ids: mission.acceptance_criteria.flatMap((criterion) =>
+            criterion.acceptance_id ? [criterion.acceptance_id] : [],
+          ),
           max_attempts: 3,
           failure_policy: "retry" as const,
         },
@@ -849,22 +1273,52 @@ describe("acceptance scenario F — state survives orchestrator restart", () => 
           summary: "valid",
           artifactRefs: [],
           usage: {},
+          validationEvidence: {
+            command: "npm test",
+            profile: "test",
+            exitCode: 0,
+            testSummary: { passed: 1 },
+            noTargets: false,
+            accessible: true,
+            acceptanceResults: [],
+          },
         }),
       },
       review: {
-        runReview: async () => ({
+        runReview: async ({ acceptanceCriteria }) => ({
           executionId: "e",
           exitStatus: "succeeded",
           summary: "reviewed",
           artifactRefs: [],
           usage: {},
+          reviewEvidence: {
+            reviewerSessionId: "review-restart",
+            model: "test",
+            provider: "test",
+            verdict: "approve",
+            independenceMode: "independent",
+            findings: [],
+            outputValid: true,
+            accessible: true,
+            acceptanceResults: (acceptanceCriteria ?? []).map((criterion) => ({
+              acceptanceId: criterion.acceptanceId,
+              status: "passed" as const,
+              detail: "checked before restart",
+            })),
+          },
         }),
       },
     };
     const o1 = new Orchestrator({
       store: store1,
       backends: backends1,
-      planner: async () => [
+      git: {
+        root: process.cwd(),
+        headCommit: async () => "candidate-restart-sha",
+        captureDiff: async () => "diff --git a/src/restart.ts b/src/restart.ts",
+        changedFiles: async () => ["src/restart.ts"],
+      } as unknown as GitRepo,
+      planner: async (mission) => [
         {
           kind: "agent" as const,
           role: "implementer",
@@ -875,6 +1329,9 @@ describe("acceptance scenario F — state survives orchestrator restart", () => 
           depends_on: [],
           priority: 0,
           execution_requirements: {},
+          acceptance_ids: mission.acceptance_criteria.flatMap((criterion) =>
+            criterion.acceptance_id ? [criterion.acceptance_id] : [],
+          ),
           max_attempts: 3,
           failure_policy: "retry" as const,
         },
@@ -962,7 +1419,7 @@ describe("exitStatus is authoritative (non-throwing backend failures)", () => {
 
 describe("repair of failed gate tasks", () => {
   it("a first-red validation creates repair work and a later green one completes the mission", async () => {
-    const h = harness({ validationFailTimes: 1 });
+    const h = harness({ validationFailTimes: 1, materialRepairEvidence: true });
     const result = await h.orchestrator.orchestrate("Add an endpoint and fix the build", {
       repository: ".",
       baseRef: "abc",
@@ -983,6 +1440,14 @@ describe("repair of failed gate tasks", () => {
       .listTasks(result.mission.mission_id)
       .filter((t) => t.kind === "agent" && t.objective.includes("Fix the failing validation"));
     assert.ok(repairs.length >= 1, "a failed validation must spawn repair work, not wedge the mission");
+    assert.ok(
+      h.store
+        .listRecoveryDecisions(result.mission.mission_id)
+        .some((decision) => decision.action === "CREATE_REPAIR_TASKS" && decision.status === "succeeded"),
+      `gate repair must consume the same durable recovery ledger: ${JSON.stringify(
+        h.store.listRecoveryDecisions(result.mission.mission_id),
+      )}`,
+    );
     // ...and a stale failure must not keep the gate closed once it is green.
     assert.equal(result.completed, true, "a superseded validation failure must not block completion");
   });
@@ -1003,8 +1468,8 @@ describe("repair of failed gate tasks", () => {
   });
 });
 
-describe("missing backends must degrade, not explode", () => {
-  it("an agent-only runtime does not throw and does not complete a mutation mission", async () => {
+describe("missing persistence authority fails closed", () => {
+  it("an agent-only runtime cannot complete a repository-bound mutation mission without Git", async () => {
     const store = MissionStore.open(JsonlEventStore.inMemory());
     const backends: BrokerBackends = {
       agent: {
@@ -1020,7 +1485,7 @@ describe("missing backends must degrade, not explode", () => {
     const orchestrator = new Orchestrator({
       store,
       backends,
-      planner: async () => [
+      planner: async (mission) => [
         {
           kind: "agent" as const,
           role: "implementer",
@@ -1031,31 +1496,22 @@ describe("missing backends must degrade, not explode", () => {
           depends_on: [],
           priority: 0,
           execution_requirements: {},
+          acceptance_ids: mission.acceptance_criteria.flatMap((criterion) =>
+            criterion.acceptance_id ? [criterion.acceptance_id] : [],
+          ),
           max_attempts: 1,
           failure_policy: "retry" as const,
         },
       ],
     });
-    // No validation / review / integration backend exists. That must surface as a
-    // blocked mission, not an exception escaping orchestrate with the mission
-    // stranded in INTEGRATING / VALIDATING / REVIEWING.
-    let result: Awaited<ReturnType<Orchestrator["orchestrate"]>> | undefined;
-    let threw: unknown;
-    try {
-      result = await orchestrator.orchestrate("Add an endpoint and fix the build", {
+    await assert.rejects(
+      orchestrator.orchestrate("Add an endpoint and fix the build", {
         repository: ".",
         baseRef: "abc",
         mutationRequested: true,
-      });
-    } catch (err) {
-      threw = err;
-    }
-    assert.equal(threw, undefined, `orchestrate must not throw, got ${String(threw)}`);
-    assert.ok(result);
-    assert.equal(result.completed, false, "gates that cannot run must not be treated as passed");
-    assert.ok(
-      ["BLOCKED", "FAILED"].includes(result.mission.status),
-      `mission must settle, got ${result.mission.status}`,
+      }),
+      (error: unknown) =>
+        error instanceof RepositoryLifecycleInventoryUnavailableError && error.code === "PERSISTENCE_UNAVAILABLE",
     );
   });
 });
@@ -1091,7 +1547,10 @@ describe("a late failure is never masked by an earlier success", () => {
   it("validation that goes red AFTER a green run still blocks completion", async () => {
     // A blocking finding forces a repair round, which re-runs validation; that
     // second run goes red, so a SUCCEEDED validation precedes a FAILED one.
-    const h = harness({ findings: ["the endpoint still leaks a file handle"], validationFailAfter: 1 });
+    const h = harness({
+      findings: ["the endpoint still leaks a file handle"],
+      validationFailAfter: 1,
+    });
     const result = await h.orchestrator.orchestrate("Add an endpoint and fix the build", {
       repository: ".",
       baseRef: "abc",

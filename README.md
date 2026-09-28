@@ -437,11 +437,96 @@ workers and the interactive session can retrieve task context cheaply.
    verified change is merged into your working tree, and the ledger records
    every claim, hypothesis, finding, and piece of evidence.
 
+### Mission recovery and status semantics
+
+Mission state is durable under `.pi-eng/`. `/mission resume <missionId>` resumes
+an actionable stopped mission under the same ID: it fences stale ownership,
+reconciles side effects, preserves completed checkpoint work, and schedules
+only the remaining deliverables. A late old-worker result is retained as audit
+evidence and cannot change task, candidate, gate, or repository state.
+Checkpoint completion is accepted only through the production
+`checkpoint_progress` tool: each declared deliverable must name the exact
+current candidate SHA and committed evidence paths present in the broker's own
+Git snapshot. Any artifact URI is resolved through the runtime artifact store;
+missing, unreadable, or invented references reject the claim, while accepted
+references are copied to unique checkpoint-owned, content-addressed URIs with
+one aligned SHA-256 content hash each. Equal-content claims remain distinct.
+Recovery re-resolves every checkpoint-owned URI and recomputes its exact hash
+before dispatch, so deleted or overwritten checkpoint evidence fails closed.
+Plain activity text
+and spoofed SHA/path/artifact claims carry no authority. Missing Git providers
+and incomplete lifecycle inventory APIs fail closed with a typed
+`PERSISTENCE_UNAVAILABLE` diagnostic; a repository root is never substituted
+for actual candidate, branch, worktree, artifact, or committed-path evidence.
+
+- `EXECUTING`: authoritative owned work is active.
+- `WAITING_*`: a named condition has a next action and deadline.
+- `BLOCKED`: recovery is scheduled or a typed stop explains the reason,
+  preserved work, attempts, and exact resume condition.
+- `REPAIRING`: durable replacement lineage is running; failed tasks remain
+  immutable history.
+- `COMPLETE`: the final candidate has current validation/review evidence and
+  every material acceptance criterion passed.
+- `FAILED` / `CANCELED`: terminal without an approval claim.
+
+Run the deterministic foundation proof with:
+
+```bash
+npm run test:mission-reliability
+```
+
+For an opt-in installed-Pi live check:
+
+```bash
+npm run dogfood:mission-recovery
+```
+
+The default dogfood path verifies exactly one installed
+`pi-engineering-runtime` package, requires its Git SHA to match this checkout
+(or `--expected-sha`), requires its tracked tree, index, and untracked set to
+be clean before any extension-loading Pi command, and then lets Pi discover
+that installed extension normally;
+it does not also pass `--extension`. It refuses non-`local/local` models,
+enabled/advertised metabolomics, and a temporary parent that is or overlaps the
+current checkout, extension/package installation, or any Git worktree. It then
+creates a temporary Git repository only and drives the installed public mission
+surface through a checkpoint, bounded interruption, stale late-result
+rejection, and recovery/resume. Success requires durable `task.checkpointed`,
+`execution.late_result_rejected`, recovery attempt `> 0`, preserved work, and a
+fresh `local/local` review carrying `same_model_reduced`; a nonterminal mission
+with zero active workers must expose a next action or complete stop/resume
+condition. The script validates every required snapshot contract-v3 field and
+numeric counter. `COMPLETE` additionally requires a
+nonzero declared acceptance total, every declared criterion passed, exact
+coverage, internally consistent passed/failed/skipped test accounting with a
+passing nonfailure result, and a completed review whose blocking count matches
+its findings. Review severities and statuses must be valid runtime enums,
+`repaired` must agree exactly with `resolved`, and every blocking finding whose
+status is not `resolved` remains unresolved (including `accepted`). Stopped
+states require nonempty reason, resume condition,
+recovery IDs, and actual preserved-work references.
+Only `COMPLETE` with verified current acceptance evidence, or an explicitly
+allowed stopped state with a complete actionable stop, exits zero;
+`FAILED`/`CANCELED` retain and print the inspection path and exit nonzero.
+
+For source-only diagnostics (not the Task 12 installed-package proof), run
+`node scripts/dogfood-mission-recovery.ts --source-only`. That mode is labeled
+in its JSON output and uses `--no-extensions` before one explicit source
+`--extension`, preventing duplicate discovery. Every preliminary source-mode
+Pi invocation also uses `--no-extensions`.
+
+Slice 1 supports multiple explicitly authorized local roots, with one
+repository-bound executable task and promotion at a time. Cross-repository
+dependency coordination, repository-head vectors, and external
+branch/PR/check/merge reconciliation remain Slice 2. Database-backed leases,
+distributed controllers, and remote-worker reconciliation remain Slice 3; the
+local JSONL runtime does not claim those guarantees.
+
 ## Development
 
 ```bash
 npm install
-npm run typecheck     # tsc --noEmit
+npm run typecheck     # core + mission-recovery script tsconfigs
 npm test              # node --test (unit + integration, deterministic)
 ```
 

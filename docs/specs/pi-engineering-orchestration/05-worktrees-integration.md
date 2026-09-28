@@ -29,6 +29,17 @@ allocate
 
 Cleanup must not destroy evidence needed for debugging/replay.
 
+## Workspace manifest
+
+Allocate worktrees only from repository bindings in the mission's durable
+workspace manifest. Each binding records canonical root, remote identity, base
+SHA, write domains, and validation profile. Absolute paths explicitly named by
+the user may be authorized autonomously after canonicalization and safety
+validation; discovery cannot escape an authorized root.
+
+Preflight implementer, validator, integrator, and reviewer access through the
+actual tools they will use. Mentioning a path in a prompt is not proof of access.
+
 ## Integration role
 
 Create an explicit `integrator` task/role.
@@ -48,6 +59,18 @@ Integrator integrates.
 Reviewers review.
 
 Do not make the parent manually stitch together large parallel patches unless required.
+
+Integration occurs in an isolated candidate worktree/ref. It must not merge
+worker branches directly into the incumbent checkout before validation and
+review. Conflict, cancellation, validation failure, and review failure leave the
+incumbent HEAD, index, and tree unchanged.
+
+All repository mutations require a durable repository-scoped lease and fencing
+token. Late results from superseded executions cannot mutate the candidate.
+
+Multi-repository missions record a repository-head vector and promotion order.
+Push, PR, review, check, and merge actions carry durable idempotency keys and
+must reconcile existing external state before retry.
 
 ## Candidate/tournament mode
 

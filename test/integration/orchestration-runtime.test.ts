@@ -6,12 +6,24 @@
  */
 
 import assert from "node:assert/strict";
-import { readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { after, describe, it } from "node:test";
 import { MISSION_SNAPSHOT_CONTRACT_VERSION } from "../../src/orchestration/missionSnapshot.ts";
+import { MissionStore } from "../../src/orchestration/missionStore.ts";
+import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 import { EngineeringRuntime } from "../../src/runtime/EngineeringRuntime.ts";
 import type { WorkerExecutor } from "../../src/workers/WorkerExecutor.ts";
 import { makeFixtureRepo } from "../fixtures/make-fixture.ts";
+
+function acceptanceResults(task: string) {
+  return [...task.matchAll(/Acceptance criterion ([^:]+):/g)].map((match) => ({
+    acceptanceId: match[1]!,
+    status: "passed" as const,
+    detail: "fake reviewer checked the criterion",
+  }));
+}
 
 async function openRuntime(
   root: string,
@@ -39,8 +51,8 @@ async function openRuntime(
         result: {
           status: "completed",
           summary: `worker ${req.role} did ${req.task}`,
-          claims: [{ claim: "done", evidence: "artifact://test" }],
-          evidence_refs: ["artifact://test"],
+          claims: [],
+          evidence_refs: [],
           new_hypotheses: [],
           proposed_tasks: [],
           details: reviewFindings.length ? { findings: reviewFindings } : {},
@@ -56,6 +68,17 @@ async function openRuntime(
           model: "fake",
         },
         toolCalls: 1,
+        structured:
+          req.resultTool === "review_result"
+            ? {
+                verdict: reviewFindings.length > 0 ? "request_changes" : "approve",
+                findings: reviewFindings,
+                missingTests: [],
+                specGaps: [],
+                acceptanceResults: acceptanceResults(req.task),
+                summary: reviewFindings.length > 0 ? "changes requested" : "approved",
+              }
+            : undefined,
       };
     },
   };
@@ -104,7 +127,18 @@ describe("orchestration via real EngineeringRuntime (acceptance scenarios)", () 
       baseRef,
       mutationRequested: true,
     });
-    assert.equal(result.completed, true);
+    assert.equal(
+      result.completed,
+      true,
+      JSON.stringify({
+        reason: result.failureReason,
+        verdict: result.verdict,
+        tasks: rt
+          .missionStore!.listTasks(result.mission.mission_id)
+          .map((task) => ({ kind: task.kind, status: task.status, failure: task.failure_reason })),
+        findings: rt.missionStore!.listFindings(result.mission.mission_id).map((finding) => finding.summary),
+      }),
+    );
     assert.equal(result.mission.status, "COMPLETE");
     assert.ok(result.mission.required_gates.includes("validation"));
     assert.ok(result.mission.required_gates.includes("independent_review"));
@@ -114,6 +148,472 @@ describe("orchestration via real EngineeringRuntime (acceptance scenarios)", () 
     assert.ok(tasks.some((t) => t.kind === "agent" && t.status === "SUCCEEDED"));
     assert.ok(tasks.some((t) => t.kind === "validation" && t.status === "SUCCEEDED"));
     assert.ok(tasks.some((t) => t.kind === "review" && t.status === "SUCCEEDED"));
+  });
+
+  it("binds implementer, validator, integrator, reviewer, and repository tools to an explicit repo outside the launch cwd", async () => {
+    const target = await greenFixture();
+    const metaRoot = await mkdtemp(join(tmpdir(), "pi-eng-meta-root-"));
+    fixtures.push(target, { root: metaRoot, cleanup: () => rm(metaRoot, { recursive: true, force: true }) });
+    const workerCwds: Array<{ role: string; cwd: string }> = [];
+    const verifierCwds: string[] = [];
+    const runtimeRef: { current?: EngineeringRuntime } = {};
+    const worker: WorkerExecutor = {
+      async run(req) {
+        workerCwds.push({ role: req.role, cwd: req.cwd ?? "" });
+        if (req.role === "implementer") {
+          const activeRuntime = runtimeRef.current;
+          assert.ok(activeRuntime);
+          assert.ok(
+            activeRuntime
+              .missionStore!.listMissions()
+              .some((mission) => activeRuntime.missionStore!.getWorkspaceManifest(mission.mission_id)),
+            "workspace authorization must be durable before implementer dispatch",
+          );
+          await writeFile(join(req.cwd!, "src", "scoped.ts"), "export const scoped = true;\n", "utf8");
+        }
+        return {
+          result: {
+            status: "completed",
+            summary: `${req.role} completed`,
+            claims: [],
+            evidence_refs: [],
+            new_hypotheses: [],
+            proposed_tasks: [],
+            details: {},
+          },
+          usage: {
+            input: 1,
+            output: 1,
+            cacheRead: 0,
+            cacheWrite: 0,
+            cost: 0,
+            contextTokens: 1,
+            turns: 1,
+            model: "fake",
+          },
+          toolCalls: 0,
+          structured:
+            req.resultTool === "review_result"
+              ? {
+                  verdict: "approve",
+                  findings: [],
+                  missingTests: [],
+                  specGaps: [],
+                  acceptanceResults: acceptanceResults(req.task),
+                  summary: "approved",
+                }
+              : undefined,
+        };
+      },
+    };
+    const { CommandVerifier } = await import("../../src/verify/Verifier.ts");
+    class RecordingVerifier extends CommandVerifier {
+      override async detect(cwd: string) {
+        verifierCwds.push(cwd);
+        return super.detect(cwd);
+      }
+    }
+    const rt = await EngineeringRuntime.open({ cwd: metaRoot, worker, verifier: new RecordingVerifier() });
+    runtimeRef.current = rt;
+    const targetGit = await (await import("../../src/git/GitRepo.ts")).GitRepo.open(target.root);
+    assert.ok(targetGit);
+
+    const result = await rt.orchestrator!.orchestrate(`Add scoped support in ${target.root}`, {
+      repository: metaRoot,
+      baseRef: await targetGit.headCommit(),
+      mutationRequested: true,
+    });
+
+    assert.equal(result.completed, true, result.failureReason ?? "");
+    const manifest = rt.missionStore!.getWorkspaceManifest(result.mission.mission_id);
+    assert.ok(manifest);
+    assert.equal(manifest.repositories.length, 1);
+    assert.equal(manifest.repositories[0]?.canonicalRoot, target.root);
+    assert.ok(
+      rt
+        .missionStore!.listTasks(result.mission.mission_id)
+        .every((task) => task.repo_id === manifest.repositories[0]?.repoId),
+      "every executable task must carry the selected repository binding",
+    );
+    assert.ok(workerCwds.some(({ role, cwd }) => role === "implementer" && cwd !== metaRoot));
+    const reviewerCwd = workerCwds.find(({ role }) => role === "reviewer")?.cwd;
+    assert.ok(reviewerCwd && reviewerCwd !== target.root && reviewerCwd !== metaRoot);
+    assert.ok(verifierCwds.length > 0 && verifierCwds.every((cwd) => cwd === reviewerCwd));
+    const candidate = rt.missionStore!.getCandidate(result.mission.mission_id, manifest.repositories[0]!.repoId);
+    assert.ok(candidate, "candidate-scoped gate evidence must be recorded");
+    assert.equal(candidate.identity.candidateSha, await targetGit.headCommit());
+    assert.equal(await readFile(join(target.root, "src", "scoped.ts"), "utf8"), "export const scoped = true;\n");
+
+    const repoSearch = rt.coreTools.find((tool) => tool.name === "repo_search");
+    assert.ok(repoSearch);
+    const execute = repoSearch.execute as unknown as (
+      id: string,
+      params: { query: string },
+      signal: AbortSignal | undefined,
+      onUpdate: unknown,
+      ctx: { cwd: string },
+    ) => Promise<{ content: Array<{ text: string }>; details: { repoId?: string } }>;
+    const search = await execute("scope-search", { query: "scoped" }, undefined, undefined, { cwd: target.root });
+    assert.match(search.content[0]?.text ?? "", /src\/scoped\.ts/);
+    assert.doesNotMatch(search.content[0]?.text ?? "", /runtime not initialized|not a git repository/i);
+    assert.equal(search.details.repoId, manifest.repositories[0]?.repoId);
+    await assert.rejects(
+      execute("scope-search-unmatched", { query: "scoped" }, undefined, undefined, { cwd: metaRoot }),
+      /outside every active workspace manifest/i,
+    );
+  });
+
+  it("blocks a protected explicit workspace as WORKSPACE_SCOPE_MISMATCH before planning", async () => {
+    const fx = await greenFixture();
+    fixtures.push(fx);
+    const rt = await openRuntime(fx.root);
+    const result = await rt.orchestrator!.orchestrate("Modify files in /", {
+      repository: fx.root,
+      baseRef: await rt.git!.headCommit(),
+      mutationRequested: true,
+    });
+
+    assert.equal(result.completed, false);
+    assert.equal(result.mission.status, "BLOCKED");
+    assert.equal(rt.missionStore!.listTasks(result.mission.mission_id).length, 0, "planning must not run");
+    assert.ok(
+      rt
+        .missionStore!.listFailureClassifications(result.mission.mission_id)
+        .some((classification) => classification.category === "WORKSPACE_SCOPE_MISMATCH"),
+    );
+  });
+
+  it("confines a subdirectory-authorized worker and never integrates out-of-scope changes", async () => {
+    const target = await greenFixture();
+    const metaRoot = await mkdtemp(join(tmpdir(), "pi-eng-meta-root-"));
+    fixtures.push(target, { root: metaRoot, cleanup: () => rm(metaRoot, { recursive: true, force: true }) });
+    const worker: WorkerExecutor = {
+      async run(req) {
+        if (req.role === "implementer") {
+          await writeFile(join(req.cwd!, "src", "allowed.ts"), "export const allowed = true;\n", "utf8");
+          await writeFile(join(req.cwd!, "outside.ts"), "export const escaped = true;\n", "utf8");
+        }
+        return {
+          result: {
+            status: "completed",
+            summary: "worker completed",
+            claims: [],
+            evidence_refs: [],
+            new_hypotheses: [],
+            proposed_tasks: [],
+            details: {},
+          },
+          usage: {
+            input: 1,
+            output: 1,
+            cacheRead: 0,
+            cacheWrite: 0,
+            cost: 0,
+            contextTokens: 1,
+            turns: 1,
+            model: "fake",
+          },
+          toolCalls: 0,
+          structured:
+            req.resultTool === "review_result"
+              ? {
+                  verdict: "approve",
+                  findings: [],
+                  missingTests: [],
+                  specGaps: [],
+                  acceptanceResults: acceptanceResults(req.task),
+                  summary: "approved",
+                }
+              : undefined,
+        };
+      },
+    };
+    const rt = await EngineeringRuntime.open({
+      cwd: metaRoot,
+      worker,
+      verifier: new (await import("../../src/verify/Verifier.ts")).CommandVerifier(),
+    });
+
+    const result = await rt.orchestrator!.orchestrate(`Implement only in ${join(target.root, "src")}`, {
+      repository: metaRoot,
+      baseRef: "",
+      mutationRequested: true,
+    });
+
+    assert.equal(result.completed, false);
+    const manifest = rt.missionStore!.getWorkspaceManifest(result.mission.mission_id)!;
+    assert.deepEqual(manifest.repositories[0]?.writableDomains, ["src/**"]);
+    assert.ok(
+      rt
+        .missionStore!.listTasks(result.mission.mission_id)
+        .filter((task) => task.mutates_repo)
+        .every((task) => task.write_domains.every((domain) => domain === "src/**")),
+    );
+    await assert.rejects(readFile(join(target.root, "outside.ts"), "utf8"), /ENOENT/);
+    await assert.rejects(readFile(join(target.root, "src", "allowed.ts"), "utf8"), /ENOENT/);
+    assert.ok(
+      rt
+        .missionStore!.listFailureClassifications(result.mission.mission_id)
+        .some((classification) => classification.category === "WORKSPACE_SCOPE_MISMATCH"),
+    );
+  });
+
+  it("keeps concurrent external missions bound to their explicit repoIds", async () => {
+    const first = await greenFixture();
+    const second = await greenFixture();
+    const metaRoot = await mkdtemp(join(tmpdir(), "pi-eng-meta-root-"));
+    fixtures.push(first, second, { root: metaRoot, cleanup: () => rm(metaRoot, { recursive: true, force: true }) });
+    const worker: WorkerExecutor = {
+      async run(req) {
+        if (req.role === "implementer") {
+          const marker = req.task.includes(first.root) ? "first" : "second";
+          await writeFile(join(req.cwd!, "src", `${marker}.ts`), `export const ${marker} = true;\n`, "utf8");
+          await new Promise((resolve) => setTimeout(resolve, 25));
+        }
+        return {
+          result: {
+            status: "completed",
+            summary: "done",
+            claims: [],
+            evidence_refs: [],
+            new_hypotheses: [],
+            proposed_tasks: [],
+            details: {},
+          },
+          usage: {
+            input: 1,
+            output: 1,
+            cacheRead: 0,
+            cacheWrite: 0,
+            cost: 0,
+            contextTokens: 1,
+            turns: 1,
+            model: "fake",
+          },
+          toolCalls: 0,
+          structured:
+            req.resultTool === "review_result"
+              ? {
+                  verdict: "approve",
+                  findings: [],
+                  missingTests: [],
+                  specGaps: [],
+                  acceptanceResults: acceptanceResults(req.task),
+                  summary: "approved",
+                }
+              : undefined,
+        };
+      },
+    };
+    const rt = await EngineeringRuntime.open({
+      cwd: metaRoot,
+      worker,
+      verifier: new (await import("../../src/verify/Verifier.ts")).CommandVerifier(),
+    });
+
+    const [a, b] = await Promise.all([
+      rt.orchestrator!.orchestrate(`Add first support in ${first.root}`, {
+        repository: metaRoot,
+        baseRef: "",
+        mutationRequested: true,
+      }),
+      rt.orchestrator!.orchestrate(`Add second support in ${second.root}`, {
+        repository: metaRoot,
+        baseRef: "",
+        mutationRequested: true,
+      }),
+    ]);
+
+    assert.equal(a.completed, true, a.failureReason ?? "");
+    assert.equal(b.completed, true, b.failureReason ?? "");
+    assert.match(await readFile(join(first.root, "src", "first.ts"), "utf8"), /first/);
+    assert.match(await readFile(join(second.root, "src", "second.ts"), "utf8"), /second/);
+    await assert.rejects(readFile(join(first.root, "src", "second.ts"), "utf8"), /ENOENT/);
+    await assert.rejects(readFile(join(second.root, "src", "first.ts"), "utf8"), /ENOENT/);
+  });
+
+  it("mission tool derives the external target base instead of forwarding the launch repo SHA", async () => {
+    const launch = await greenFixture();
+    const target = await greenFixture();
+    fixtures.push(launch, target);
+    await writeFile(join(launch.root, "launch-only.txt"), "different history\n", "utf8");
+    const { execFile } = await import("node:child_process");
+    const { promisify } = await import("node:util");
+    await promisify(execFile)("git", ["-C", launch.root, "add", "launch-only.txt"]);
+    await promisify(execFile)("git", ["-C", launch.root, "commit", "-q", "-m", "launch-only history"]);
+    const rt = await openRuntime(launch.root);
+    const targetGit = await (await import("../../src/git/GitRepo.ts")).GitRepo.open(target.root);
+    assert.ok(targetGit);
+    const targetBase = await targetGit.headCommit();
+    const launchBase = await rt.git!.headCommit();
+    assert.notEqual(targetBase, launchBase);
+    const missionTool = rt.coreTools.find((tool) => tool.name === "mission")!;
+    const execute = missionTool.execute as unknown as (
+      id: string,
+      params: { request: string; mutate: boolean },
+      signal: AbortSignal | undefined,
+      onUpdate: unknown,
+      ctx: { cwd: string },
+    ) => Promise<{ details: { missionId: string } }>;
+
+    const response = await execute(
+      "external-base",
+      { request: `Add external support in ${target.root}`, mutate: true },
+      undefined,
+      undefined,
+      { cwd: launch.root },
+    );
+
+    const mission = rt.missionStore!.getMission(response.details.missionId)!;
+    assert.equal(mission.repository, target.root);
+    assert.equal(mission.base_ref, targetBase);
+  });
+
+  it("rejects a supplied base commit that does not belong to the selected external repository", async () => {
+    const launch = await greenFixture();
+    const target = await greenFixture();
+    const metaRoot = await mkdtemp(join(tmpdir(), "pi-eng-meta-root-"));
+    fixtures.push(launch, target, { root: metaRoot, cleanup: () => rm(metaRoot, { recursive: true, force: true }) });
+    await writeFile(join(launch.root, "launch-only.txt"), "unique launch commit\n", "utf8");
+    const { execFile } = await import("node:child_process");
+    const { promisify } = await import("node:util");
+    await promisify(execFile)("git", ["-C", launch.root, "add", "launch-only.txt"]);
+    await promisify(execFile)("git", ["-C", launch.root, "commit", "-q", "-m", "unique launch commit"]);
+    const launchGit = await (await import("../../src/git/GitRepo.ts")).GitRepo.open(launch.root);
+    assert.ok(launchGit);
+    const rt = await openRuntime(metaRoot);
+
+    const result = await rt.orchestrator!.orchestrate(`Modify ${target.root}`, {
+      repository: metaRoot,
+      baseRef: await launchGit.headCommit(),
+      mutationRequested: true,
+    });
+
+    assert.equal(result.mission.status, "BLOCKED");
+    assert.match(result.failureReason ?? "", /does not belong to selected repository/i);
+    assert.equal(rt.missionStore!.listTasks(result.mission.mission_id).length, 0);
+  });
+
+  it("reloads an external manifest binding when the meta-root runtime reopens", async () => {
+    const target = await greenFixture();
+    const metaRoot = await mkdtemp(join(tmpdir(), "pi-eng-meta-root-"));
+    fixtures.push(target, { root: metaRoot, cleanup: () => rm(metaRoot, { recursive: true, force: true }) });
+    const rt1 = await openRuntime(metaRoot);
+    const result = await rt1.orchestrator!.orchestrate(`Add support in ${target.root}`, {
+      repository: metaRoot,
+      baseRef: "",
+      mutationRequested: true,
+    });
+    await rt1.missionStore!.flush();
+    const repoId = rt1.missionStore!.getWorkspaceManifest(result.mission.mission_id)!.repositories[0]!.repoId;
+
+    const rt2 = await openRuntime(metaRoot);
+
+    assert.equal(rt2.repositoryRegistry.get(repoId).root, target.root);
+  });
+
+  it("reopens and resumes a paused external mission on the persisted repository binding", async () => {
+    const target = await greenFixture();
+    const metaRoot = await mkdtemp(join(tmpdir(), "pi-eng-meta-root-"));
+    fixtures.push(target, { root: metaRoot, cleanup: () => rm(metaRoot, { recursive: true, force: true }) });
+    const unavailable: WorkerExecutor = {
+      async run() {
+        return {
+          result: {
+            status: "failed",
+            summary: "gateway unavailable",
+            claims: [],
+            evidence_refs: [],
+            new_hypotheses: [],
+            proposed_tasks: [],
+            details: {},
+            error: "transient:server_unavailable",
+          },
+          usage: null,
+          toolCalls: 0,
+        };
+      },
+    };
+    const rt1 = await EngineeringRuntime.open({
+      cwd: metaRoot,
+      worker: unavailable,
+      verifier: new (await import("../../src/verify/Verifier.ts")).CommandVerifier(),
+    });
+    Object.assign(rt1.resilience, {
+      retry_window_ms: 0,
+      auto_resume_horizon_ms: 0,
+      probe_interval_ms: 1,
+      jitter_ms: 0,
+    });
+    const paused = await rt1.orchestrator!.orchestrate(`Add resumed support in ${target.root}`, {
+      repository: metaRoot,
+      baseRef: "",
+      mutationRequested: true,
+    });
+    assert.equal(paused.mission.status, "PAUSED_INFRASTRUCTURE");
+    await rt1.missionStore!.flush();
+    const persistedEvents = (await readFile(join(rt1.workDir, "orchestration.jsonl"), "utf8"))
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line));
+    const replayBackend = JsonlEventStore.inMemory();
+    await replayBackend.appendAll(persistedEvents);
+    const replayedStore = MissionStore.open(replayBackend);
+    assert.equal(replayedStore.getMission(paused.mission.mission_id)?.status, "PAUSED_INFRASTRUCTURE");
+    assert.equal(
+      replayedStore.getWorkspaceManifest(paused.mission.mission_id)?.repositories[0]?.canonicalRoot,
+      target.root,
+    );
+
+    const resumedCwds: string[] = [];
+    const recovered: WorkerExecutor = {
+      async run(req) {
+        resumedCwds.push(req.cwd);
+        if (req.role === "implementer") {
+          await writeFile(join(req.cwd, "src", "resumed.ts"), "export const resumed = true;\n", "utf8");
+        }
+        return {
+          result: {
+            status: "completed",
+            summary: "recovered",
+            claims: [],
+            evidence_refs: [],
+            new_hypotheses: [],
+            proposed_tasks: [],
+            details: {},
+          },
+          usage: null,
+          toolCalls: 0,
+          structured:
+            req.resultTool === "review_result"
+              ? {
+                  verdict: "approve",
+                  findings: [],
+                  missingTests: [],
+                  specGaps: [],
+                  acceptanceResults: acceptanceResults(req.task),
+                  summary: "approved",
+                }
+              : undefined,
+        };
+      },
+    };
+    const rt2 = await EngineeringRuntime.open({
+      cwd: metaRoot,
+      worker: recovered,
+      verifier: new (await import("../../src/verify/Verifier.ts")).CommandVerifier(),
+    });
+    assert.notEqual(rt2, rt1);
+    const resumed = await rt2.orchestrator!.resume(paused.mission.mission_id, { force: true });
+
+    assert.equal(resumed.status, "COMPLETE");
+    assert.match(await readFile(join(target.root, "src", "resumed.ts"), "utf8"), /resumed/);
+    await assert.rejects(readFile(join(metaRoot, "src", "resumed.ts"), "utf8"), /ENOENT/);
+    assert.ok(resumedCwds.length >= 2);
+    assert.ok(resumedCwds.every((cwd) => cwd.startsWith(target.root) || cwd.includes("pi-eng-")));
+    const repoId = rt2.missionStore!.getWorkspaceManifest(paused.mission.mission_id)!.repositories[0]!.repoId;
+    assert.ok(rt2.missionStore!.listTasks(paused.mission.mission_id).every((task) => task.repo_id === repoId));
   });
 
   it("scenario B: investigation escalates to engineering+review when source changes", async () => {
@@ -308,8 +808,10 @@ describe("orchestration via real EngineeringRuntime (acceptance scenarios)", () 
     const integ = rt.missionStore!.listTasks(result.mission.mission_id).filter((t) => t.kind === "integration");
     assert.ok(integ.length >= 1, "integration step should have been created");
     assert.ok(
-      integ.some((t) => t.status === "FAILED"),
-      `a conflicted merge must be recorded as FAILED, got ${integ.map((t) => t.status).join(",")}`,
+      rt
+        .missionStore!.listFindings(result.mission.mission_id)
+        .some((finding) => /promotion rejected.*diverged/i.test(finding.summary)),
+      "incumbent divergence must reject promotion",
     );
     assert.equal(result.completed, false, "a conflicted integration must never complete the mission");
     // mergeBranch aborts a conflicted merge, so the incumbent content survives
@@ -318,6 +820,12 @@ describe("orchestration via real EngineeringRuntime (acceptance scenarios)", () 
     assert.ok(mainSrc.includes("// main"), "incumbent content must survive a conflicted merge");
     assert.ok(!mainSrc.includes("// worker"), "conflicted worker change must not be applied");
     assert.ok(!mainSrc.includes("<<<<<<<"), "no conflict markers may be left in the working tree");
+    assert.ok(
+      rt
+        .orchestrator!.broker.preservedBranches(result.mission.mission_id)
+        .some((branch) => branch.includes("candidate")),
+      "the rejected candidate must remain inspectable",
+    );
 
     // Recovery must remain possible: after a conflict the worker branch is the
     // only copy of its output, so cleanup MUST NOT have run `git branch -D` on it.

@@ -85,12 +85,12 @@ describe("orchestration state machines", () => {
     assert.ok(canTransitionMission("NEEDS_ATTENTION", "QUEUED"));
   });
 
-  it("task transitions: READY->RUNNING->SUCCEEDED and retry", () => {
+  it("task transitions preserve failed tasks as immutable history", () => {
     assert.ok(canTransitionTask("PENDING", "READY"));
     assert.ok(canTransitionTask("READY", "RUNNING"));
     assert.ok(canTransitionTask("RUNNING", "SUCCEEDED"));
     assert.ok(canTransitionTask("RUNNING", "FAILED"));
-    assert.ok(canTransitionTask("FAILED", "RETRYING"));
+    assert.equal(canTransitionTask("FAILED", "RETRYING"), false);
     assert.ok(canTransitionTask("RETRYING", "READY"));
     assert.throws(() => assertTaskTransition("SUCCEEDED", "RUNNING"));
     assert.throws(() => assertTaskTransition("PENDING", "RUNNING"));

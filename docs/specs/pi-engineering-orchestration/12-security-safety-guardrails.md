@@ -19,6 +19,10 @@ Prevent autonomous orchestration from becoming uncontrolled execution.
 - protected branch policy
 - destructive command policy
 - explicit human approval for configured high-impact operations
+- canonical workspace manifests and mission-scoped path authorization
+- durable mission/repository ownership leases and fencing
+- late-result rejection after cancellation or supersession
+- write-ahead idempotency keys for irreversible external actions
 
 ## High-impact examples
 
@@ -33,6 +37,16 @@ Potential approval gates:
 - destructive infrastructure changes
 
 Normal local development commands should not require unnecessary approval.
+
+An absolute workspace path explicitly supplied by the user may be authorized
+without another prompt after canonicalization and validation. Automatic
+authorization rejects filesystem roots, home directories, Pi configuration
+roots, symlink escapes, and broad paths disproportionate to the mission.
+Repository content and model output cannot authorize additional roots.
+
+On persistence failure, autonomous mutation pauses visibly. The runtime must not
+continue performing commits, pushes, PR creation, or merges that it cannot
+record durably and reconcile after restart.
 
 ## Child isolation
 

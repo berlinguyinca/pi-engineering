@@ -112,6 +112,46 @@ test("all tasks completed but unverified renders ~99, never 100", () => {
   assert.equal(res.verifiedComplete, false);
 });
 
+test("completed process work with zero verified acceptance IDs reports 0% primary coverage", () => {
+  const tasks = [
+    task({
+      task_id: "process",
+      kind: "process",
+      role: "process",
+      status: "SUCCEEDED",
+    }),
+  ];
+  const res = computeProgress({
+    missionId: "MSN",
+    tasks,
+    missionStatus: "FINAL_VALIDATION",
+    verifiedComplete: false,
+    completionStatus: "final_validation",
+    acceptanceIds: [],
+    verifiedAcceptanceIds: [],
+  });
+
+  assert.equal(res.acceptanceCoverage.approximatePercent, 0);
+  assert.equal(res.approximatePercent, 0, "the primary percentage is acceptance coverage");
+  assert.equal(res.workflowProgress.approximatePercent, 99, "workflow mechanics remain a secondary diagnostic");
+});
+
+test("explicitly empty acceptance IDs stay at 0% after verified completion", () => {
+  const res = computeProgress({
+    missionId: "MSN",
+    tasks: [task({ task_id: "process", kind: "process", role: "process", status: "SUCCEEDED" })],
+    missionStatus: "COMPLETE",
+    verifiedComplete: true,
+    completionStatus: "verified_complete",
+    acceptanceIds: [],
+    verifiedAcceptanceIds: [],
+  });
+
+  assert.equal(res.acceptanceCoverage.approximatePercent, 0);
+  assert.equal(res.approximatePercent, 0, "an explicit empty acceptance contract is not a legacy fallback");
+  assert.equal(res.workflowProgress.approximatePercent, 100, "workflow completion remains separately visible");
+});
+
 test("100 is only rendered after verifiedComplete", () => {
   const tasks = [task({ task_id: "A", status: "SUCCEEDED" })];
   const res = computeProgress({
@@ -314,7 +354,12 @@ test("health: terminal states map directly", () => {
 function tracker(threshold = 4) {
   return new WorkerLoopTracker({
     ...DEFAULT_OBSERVABILITY_CONFIG,
-    loopThresholds: { reading_file: threshold, tool_invocation: threshold, error: threshold, default: threshold },
+    loopThresholds: {
+      reading_file: threshold,
+      tool_invocation: threshold,
+      error: threshold,
+      default: threshold,
+    },
   });
 }
 

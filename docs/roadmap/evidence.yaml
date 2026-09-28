@@ -567,4 +567,42 @@
   findings:
     critical: 0
     high: 0
+- id: dogfood-mission-reliability-foundation
+  milestone: __global__
+  type: dogfood
+  status: pass
+  commit: 8606b871961fde551fef512a275beb14f66637ac
+  generatedAt: 2026-09-28T07:29:38.998Z
+  paths: &a12
+    - src/
+    - extensions/
+    - scripts/
+    - test/
+    - README.md
+    - docs/specs/
+  proof: Deterministic orchestration dogfood passed 24/24 and roadmap lifecycle
+    dogfood passed all six stages on commit 8606b87; live local/local source
+    dogfood was attempted separately but its configured endpoint 127.0.0.1:8082
+    was unavailable.
+  summary: "Mission reliability foundation: observable progress and stop reasons,
+    bounded autonomous recovery, same-model reduced-independence review
+    fallback, durable bootstrap authority, current-candidate evidence gates, and
+    deterministic release dogfood."
+- id: review-mission-reliability-foundation
+  milestone: __global__
+  type: fresh_review
+  status: pass
+  commit: 8606b871961fde551fef512a275beb14f66637ac
+  generatedAt: 2026-09-28T07:29:38.998Z
+  paths: *a12
+  proof: Independent scoped review of the final dogfood compatibility diff
+    reported CLEAN after four consecutive targeted passes; prior adversarial
+    reviews covered the mission reliability implementation through 30f07da.
+  summary: "Mission reliability foundation: observable progress and stop reasons,
+    bounded autonomous recovery, same-model reduced-independence review
+    fallback, durable bootstrap authority, current-candidate evidence gates, and
+    deterministic release dogfood."
+  findings:
+    critical: 0
+    high: 0
 

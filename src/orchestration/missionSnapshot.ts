@@ -12,9 +12,9 @@
  */
 
 import type { MissionProjection } from "./observability/types.ts";
-import type { Mission, OrchestrationTask, ReviewFinding } from "./types.ts";
+import type { Mission, MissionStop, OrchestrationTask, ReviewFinding } from "./types.ts";
 
-export const MISSION_SNAPSHOT_CONTRACT_VERSION = 2;
+export const MISSION_SNAPSHOT_CONTRACT_VERSION = 3;
 export const MISSION_SNAPSHOT_FILENAME = "orchestration-snapshot.json";
 
 /**
@@ -28,16 +28,26 @@ export interface MissionSnapshotFile {
 }
 
 export interface MissionObservabilitySnapshot {
-  progress: { approximatePercent: number; verifiedComplete: boolean; basis: string };
+  progress: {
+    approximatePercent: number;
+    verifiedComplete: boolean;
+    basis: string;
+  };
+  acceptanceCoverage: MissionProjection["summary"]["acceptanceCoverage"];
+  workflowProgress: MissionProjection["summary"]["workflowProgress"];
   health: string;
   currentObjective?: string;
   currentActivity?: { type: string; summary: string; workerId?: string } | null;
   workers: { active: number; waiting: number; failed: number };
   lastHeartbeatAt?: string;
-  lastMeaningfulProgressAt?: string;
+  lastMeaningfulProgressAt: string | null;
   waitingReason?: string;
   completionStatus: string;
-  progressHistory: Array<{ at: string; approximatePercent: number; label?: string }>;
+  progressHistory: Array<{
+    at: string;
+    approximatePercent: number;
+    label?: string;
+  }>;
   tests: {
     running: boolean;
     completed: number;
@@ -50,7 +60,13 @@ export interface MissionObservabilitySnapshot {
   review: {
     status: string;
     blockingOpen: number;
-    findings: Array<{ id: string; severity: string; status: string; summary: string; repaired: boolean }>;
+    findings: Array<{
+      id: string;
+      severity: string;
+      status: string;
+      summary: string;
+      repaired: boolean;
+    }>;
   };
   workerDetails: MissionProjection["workers"];
   activity: MissionProjection["activity"];
@@ -58,10 +74,21 @@ export interface MissionObservabilitySnapshot {
   recovery: MissionProjection["recovery"];
   changes: MissionProjection["changes"];
   artifacts: MissionProjection["artifacts"];
+  action: string;
+  reason: string;
+  recoveryAttempt: { attempt: number; maxAttempts: number };
+  nextAction: string;
+  nextActionAt: string | null;
+  owner: string | null;
+  repository: string | null;
+  task: string | null;
+  preservedWork: string[];
 }
 
 export interface MissionSnapshotMission {
   id: string;
+  /** Replay-stable authoritative mission event ordinal. */
+  revision: number;
   title: string;
   goal: string;
   workflowClass: string;
@@ -69,9 +96,11 @@ export interface MissionSnapshotMission {
   riskProfile: string;
   constraints: string[];
   requiredGates: string[];
-  acceptanceCriteria: Array<{ criterion: string; status: string }>;
+  acceptanceCriteria: Array<{ id?: string; criterion: string; status: string }>;
   tasks: Array<MissionSnapshotTask>;
   findings: Array<MissionSnapshotFinding>;
+  /** Latest durable stop for the current resumption generation, when present. */
+  stop?: Pick<MissionStop, "reason" | "attemptedRecoveries" | "preservedWork" | "resumeCondition" | "stoppedAt">;
   /** Additive v2 — absent for legacy publishers / pre-observability missions. */
   observability?: MissionObservabilitySnapshot;
 }
@@ -85,6 +114,14 @@ export interface MissionSnapshotTask {
   mutatesRepo: boolean;
   isolation: string;
   dependsOn: string[];
+  /** Additive v3 — absent for tasks replayed from pre-reliability events. */
+  reliability?: {
+    repoId?: string;
+    acceptanceIds: string[];
+    candidateGeneration: number;
+    missionGeneration: number;
+    fencingToken: number;
+  };
 }
 
 export interface MissionSnapshotFinding {
@@ -93,6 +130,7 @@ export interface MissionSnapshotFinding {
   status: string;
   summary: string;
   taskId: string | null;
+  repaired: boolean;
 }
 
 /**
@@ -102,6 +140,8 @@ export interface MissionSnapshotFinding {
 function toObservabilitySnapshot(projection: MissionProjection): MissionObservabilitySnapshot {
   return {
     progress: { ...projection.summary.progress },
+    acceptanceCoverage: { ...projection.summary.acceptanceCoverage },
+    workflowProgress: { ...projection.summary.workflowProgress },
     health: projection.summary.health,
     currentObjective: projection.summary.currentObjective,
     currentActivity: projection.summary.currentActivity,
@@ -141,6 +181,15 @@ function toObservabilitySnapshot(projection: MissionProjection): MissionObservab
     recovery: projection.recovery,
     changes: projection.changes,
     artifacts: projection.artifacts,
+    action: projection.summary.action,
+    reason: projection.summary.reason,
+    recoveryAttempt: { ...projection.summary.recovery },
+    nextAction: projection.summary.nextAction,
+    nextActionAt: projection.summary.nextActionAt,
+    owner: projection.summary.owner,
+    repository: projection.summary.repository,
+    task: projection.summary.task,
+    preservedWork: [...projection.summary.preservedWork],
   };
 }
 
@@ -149,9 +198,11 @@ export function buildMissionSnapshot(
   tasks: OrchestrationTask[],
   findings: ReviewFinding[],
   observability?: MissionProjection | null,
+  stop?: MissionStop | null,
 ): MissionSnapshotMission {
   return {
     id: mission.mission_id,
+    revision: mission.revision,
     title: mission.title,
     goal: mission.goal,
     workflowClass: mission.workflow_class,
@@ -160,6 +211,7 @@ export function buildMissionSnapshot(
     constraints: mission.constraints,
     requiredGates: mission.required_gates,
     acceptanceCriteria: mission.acceptance_criteria.map((c) => ({
+      ...(c.acceptance_id ? { id: c.acceptance_id } : {}),
       criterion: c.criterion,
       status: c.status,
     })),
@@ -172,6 +224,21 @@ export function buildMissionSnapshot(
       mutatesRepo: t.mutates_repo,
       isolation: t.isolation,
       dependsOn: t.depends_on,
+      ...(t.repo_id !== undefined ||
+      t.acceptance_ids !== undefined ||
+      t.candidate_generation !== undefined ||
+      t.mission_generation !== undefined ||
+      t.fencing_token !== undefined
+        ? {
+            reliability: {
+              ...(t.repo_id !== undefined ? { repoId: t.repo_id } : {}),
+              acceptanceIds: t.acceptance_ids ?? [],
+              candidateGeneration: t.candidate_generation ?? 0,
+              missionGeneration: t.mission_generation ?? 0,
+              fencingToken: t.fencing_token ?? 0,
+            },
+          }
+        : {}),
     })),
     findings: findings.map((f) => ({
       id: f.finding_id,
@@ -179,8 +246,20 @@ export function buildMissionSnapshot(
       status: f.status,
       summary: f.summary,
       taskId: f.task_id,
+      repaired: f.status === "resolved",
     })),
     ...(observability ? { observability: toObservabilitySnapshot(observability) } : {}),
+    ...(stop
+      ? {
+          stop: {
+            reason: stop.reason,
+            attemptedRecoveries: [...stop.attemptedRecoveries],
+            preservedWork: [...stop.preservedWork],
+            resumeCondition: stop.resumeCondition,
+            stoppedAt: stop.stoppedAt,
+          },
+        }
+      : {}),
   };
 }
 
@@ -190,11 +269,12 @@ export function buildMissionSnapshotFile(
     tasks: OrchestrationTask[];
     findings: ReviewFinding[];
     observability?: MissionProjection | null;
+    stop?: MissionStop | null;
   }>,
 ): MissionSnapshotFile {
   return {
     contractVersion: MISSION_SNAPSHOT_CONTRACT_VERSION,
     generatedAt: new Date().toISOString(),
-    missions: missions.map((m) => buildMissionSnapshot(m.mission, m.tasks, m.findings, m.observability)),
+    missions: missions.map((m) => buildMissionSnapshot(m.mission, m.tasks, m.findings, m.observability, m.stop)),
   };
 }

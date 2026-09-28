@@ -290,3 +290,23 @@ The implementation is successful when:
 - mission state survives restart,
 - PI WEB can display mission/task/execution status without becoming the orchestration engine,
 - completion cannot be declared while mandatory gates remain unresolved.
+
+## 11. Reliability foundation
+
+The normative recovery, workspace, ownership, evidence, and transactional
+integration contracts are defined in
+`docs/superpowers/specs/2026-09-26-mission-reliability-foundation-design.md`.
+
+Material missions additionally require a durable workspace manifest,
+repository-scoped tasks, candidate generations, fenced ownership, typed recovery
+decisions, checkpoints, replacement lineage, revision-bound gate evidence, and
+separate workflow progress versus verified acceptance coverage.
+
+An explicitly named absolute workspace path may be authorized autonomously only
+after canonicalization and safety validation. Repository content or model output
+must never expand mission authority.
+
+Every unfinished mission must have an active owner, a named wait with deadline,
+a scheduled bounded recovery, or an explicit actionable stop. A mission must
+never remain at an unexplained percentage with no active worker and no next
+action.

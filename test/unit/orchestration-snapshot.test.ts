@@ -56,11 +56,53 @@ describe("mission snapshot publisher (spec 08 §API boundary)", () => {
     assert.equal(snap.tasks[0]!.isolation, "worktree");
     assert.equal(snap.findings.length, 1);
     assert.equal(snap.findings[0]!.severity, "blocking");
+    assert.equal(snap.findings[0]!.status, "open");
+    assert.equal(snap.findings[0]!.repaired, false);
     assert.equal(snap.findings[0]!.summary, "crashes on empty body");
 
     // The snapshot must round-trip through JSON (the plugin reads the file).
     const roundTripped = JSON.parse(JSON.stringify(file)) as typeof file;
     assert.equal(roundTripped.contractVersion, MISSION_SNAPSHOT_CONTRACT_VERSION);
     assert.equal(roundTripped.missions[0]!.tasks[0]!.mutatesRepo, true);
+  });
+
+  it("publishes additive reliability fields under a bumped contract", () => {
+    const store = MissionStore.open(JsonlEventStore.inMemory());
+    const mission = store.createMission({
+      mission_id: "MSN-reliability-snapshot",
+      title: "Reliable mission",
+      goal: "Expose durable authority",
+      user_request: "show recovery state",
+      repository: "/workspace/repo-a",
+      base_ref: "main",
+      risk_profile: "high",
+      workflow_class: "engineering_review",
+    });
+    store.addAcceptanceCriterion(mission.mission_id, "verified output", undefined, "AC-verified");
+    const current = store.getMission(mission.mission_id)!;
+    const task = store.createTask({
+      mission_id: mission.mission_id,
+      kind: "agent",
+      role: "implementer",
+      objective: "produce output",
+      repo_id: "repo-a",
+      acceptance_ids: ["AC-verified"],
+      candidate_generation: 2,
+      mission_generation: 3,
+      fencing_token: 5,
+    });
+
+    const file = buildMissionSnapshotFile([{ mission: current, tasks: [task], findings: [] }]);
+    assert.equal(file.contractVersion, 3);
+    assert.deepEqual(file.missions[0]!.acceptanceCriteria, [
+      { id: "AC-verified", criterion: "verified output", status: "pending" },
+    ]);
+    assert.deepEqual(file.missions[0]!.tasks[0]!.reliability, {
+      repoId: "repo-a",
+      acceptanceIds: ["AC-verified"],
+      candidateGeneration: 2,
+      missionGeneration: 3,
+      fencingToken: 5,
+    });
   });
 });

@@ -1,0 +1,328 @@
+import { AsyncLocalStorage } from "node:async_hooks";
+import { constants } from "node:fs";
+import { access, realpath } from "node:fs/promises";
+import { basename, resolve, sep } from "node:path";
+import { ContextBroker } from "../context/ContextBroker.ts";
+import { GitRepo } from "../git/GitRepo.ts";
+import type { RepositoryBinding, WorkspaceManifest } from "./types.ts";
+import { WorkspaceScopeError } from "./workspaceManifest.ts";
+
+export interface RepositoryExecutionContext {
+  repoId: string;
+  root: string;
+  git: GitRepo;
+  contextBroker: ContextBroker;
+  verifierCwd: string;
+  writableDomains: string[];
+}
+
+export type RepositoryRole = "implementer" | "validator" | "integrator" | "reviewer";
+
+export interface RoleAccessProbe {
+  role: RepositoryRole;
+  repoId: string;
+  root: string;
+  ok: boolean;
+  reason?: string;
+}
+
+export interface StagedRepositoryRegistration {
+  probe(repoId: string): Promise<RoleAccessProbe[]>;
+  activate(): void;
+  /** @deprecated use activate after the durable manifest bind has flushed. */
+  commit(): void;
+}
+
+interface ManifestScope {
+  missionId: string;
+  generation: number;
+  hash: string;
+}
+
+function scopeKey(scope: ManifestScope): string {
+  return `${scope.missionId}\0${scope.generation}\0${scope.hash}`;
+}
+
+function contains(root: string, cwd: string): boolean {
+  const parent = resolve(root);
+  const child = resolve(cwd);
+  return child === parent || child.startsWith(`${parent}${sep}`);
+}
+
+function domainAuthorized(requested: string, authorized: string[]): boolean {
+  const request = requested.replace(/\/$/, "").replace(/\/\*\*$/, "");
+  return authorized.some((domain) => {
+    const allow = domain.replace(/\/$/, "").replace(/\/\*\*$/, "");
+    return allow === "**" || request === allow || request.startsWith(`${allow}/`);
+  });
+}
+
+/** Repository-scoped Git, semantic-context, and verifier dependencies. */
+export class RepositoryRegistry {
+  private readonly contexts = new Map<string, Map<string, RepositoryExecutionContext>>();
+  private readonly activeManifests = new Map<string, ManifestScope>();
+  private readonly activeRepo = new AsyncLocalStorage<ManifestScope & { repoId: string }>();
+
+  async register(manifest: WorkspaceManifest): Promise<void> {
+    const staged = await this.stage(manifest);
+    staged.activate();
+  }
+
+  /** Restage durable manifest authority after a crash between bind and activation. */
+  async ensureActive(manifest: WorkspaceManifest, repoId: string): Promise<void> {
+    const active = this.activeManifests.get(manifest.missionId);
+    const expected = { missionId: manifest.missionId, generation: manifest.generation, hash: manifest.hash };
+    if (
+      !active ||
+      active.generation !== manifest.generation ||
+      active.hash !== manifest.hash ||
+      !this.contexts.get(scopeKey(expected))?.has(repoId)
+    ) {
+      const staged = await this.stage(manifest);
+      staged.activate();
+    }
+    this.activate(manifest.missionId, manifest.generation, manifest.hash, repoId);
+  }
+
+  /** Build and probe replacement contexts without changing current execution authority. */
+  async stage(manifest: WorkspaceManifest): Promise<StagedRepositoryRegistration> {
+    const scope: ManifestScope = {
+      missionId: manifest.missionId,
+      generation: manifest.generation,
+      hash: manifest.hash,
+    };
+    const stagedContexts = new Map<string, RepositoryExecutionContext>();
+    for (const binding of manifest.repositories) await this.registerBinding(binding, stagedContexts);
+    const activate = (): void => {
+      const prior = this.activeManifests.get(scope.missionId);
+      this.contexts.set(scopeKey(scope), stagedContexts);
+      this.activeManifests.set(scope.missionId, { ...scope });
+      if (prior && scopeKey(prior) !== scopeKey(scope)) this.contexts.delete(scopeKey(prior));
+    };
+    return {
+      probe: (repoId) => this.probeContext(stagedContexts, repoId),
+      activate,
+      commit: activate,
+    };
+  }
+
+  private async registerBinding(
+    binding: RepositoryBinding,
+    target: Map<string, RepositoryExecutionContext>,
+  ): Promise<void> {
+    if (target.has(binding.repoId)) return;
+    const git = await GitRepo.open(binding.canonicalRoot);
+    const contextBroker = await ContextBroker.open(binding.canonicalRoot);
+    if (!git || !contextBroker) {
+      throw new WorkspaceScopeError(
+        `Repository binding cannot be opened: ${binding.repoId} (${binding.canonicalRoot})`,
+      );
+    }
+    const canonicalRoot = await realpath(git.root);
+    if (canonicalRoot !== binding.canonicalRoot) {
+      throw new WorkspaceScopeError(
+        `Repository binding changed during preflight: ${binding.canonicalRoot} -> ${canonicalRoot}`,
+      );
+    }
+    target.set(binding.repoId, {
+      repoId: binding.repoId,
+      root: canonicalRoot,
+      git,
+      contextBroker,
+      verifierCwd: canonicalRoot,
+      writableDomains: [...binding.writableDomains],
+    });
+  }
+
+  get(repoId: string): RepositoryExecutionContext {
+    const active =
+      this.activeRepo.getStore() ??
+      ([...this.activeManifests.values()].length === 1
+        ? { ...[...this.activeManifests.values()][0]!, repoId }
+        : undefined);
+    if (!active) throw new WorkspaceScopeError("No mission manifest is active for this execution");
+    this.assertActiveScope(active);
+    const context = this.contexts.get(scopeKey(active))?.get(repoId);
+    if (!context) throw new WorkspaceScopeError(`Unknown repository binding: ${repoId}`);
+    return context;
+  }
+
+  current(): RepositoryExecutionContext {
+    const active = this.activeRepo.getStore();
+    if (!active) throw new WorkspaceScopeError("No repository binding is active for this execution");
+    return this.get(active.repoId);
+  }
+
+  private assertActiveScope(scope: ManifestScope): void {
+    const current = this.activeManifests.get(scope.missionId);
+    if (!current || current.generation !== scope.generation || current.hash !== scope.hash) {
+      throw new WorkspaceScopeError(`Inactive workspace manifest for mission ${scope.missionId}`);
+    }
+  }
+
+  activate(missionId: string, generation: number, hash: string, repoId: string): void {
+    const expected = this.activeManifests.get(missionId);
+    if (!expected || expected.generation !== generation || expected.hash !== hash) {
+      throw new WorkspaceScopeError(`Inactive workspace manifest for mission ${missionId}`);
+    }
+    const active = { missionId, generation, hash, repoId };
+    if (!this.contexts.get(scopeKey(active))?.has(repoId)) {
+      throw new WorkspaceScopeError(`Unknown repository binding: ${repoId}`);
+    }
+    this.activeRepo.enterWith(active);
+  }
+
+  async resolve(cwd: string): Promise<RepositoryExecutionContext | null> {
+    let canonical = resolve(cwd);
+    try {
+      canonical = await realpath(cwd);
+    } catch {
+      // Candidate worktrees can disappear during cleanup; the active binding is
+      // still the only authority and is safer than falling back to launch cwd.
+    }
+    const active = this.activeRepo.getStore();
+    if (active) this.assertActiveScope(active);
+    const activeContexts = active
+      ? [...(this.contexts.get(scopeKey(active))?.values() ?? [])]
+      : [...this.activeManifests.values()].flatMap((scope) => [
+          ...(this.contexts.get(scopeKey(scope))?.values() ?? []),
+        ]);
+    const directMatches = activeContexts.filter((context) => contains(context.root, canonical));
+    if (directMatches.length === 1) return directMatches[0]!;
+    if (directMatches.length > 1) {
+      throw new WorkspaceScopeError(`Repository path is ambiguous across active mission manifests: ${canonical}`);
+    }
+    // Linked candidate worktrees are siblings, not descendants, of the bound
+    // incumbent. Match their shared Git common directory and construct every
+    // cwd-sensitive dependency from the candidate root so repository tools,
+    // validation, and review cannot silently inspect the incumbent.
+    const candidateGit = await GitRepo.open(canonical);
+    if (candidateGit) {
+      const candidateCommon = await candidateGit.commonDir().catch(() => "");
+      const commonMatches: RepositoryExecutionContext[] = [];
+      for (const context of activeContexts) {
+        if (candidateCommon && candidateCommon === (await context.git.commonDir().catch(() => ""))) {
+          commonMatches.push(context);
+        }
+      }
+      if (commonMatches.length > 1) {
+        throw new WorkspaceScopeError(`Candidate path is ambiguous across active mission manifests: ${canonical}`);
+      }
+      for (const context of commonMatches) {
+        const contextBroker = await ContextBroker.open(candidateGit.root);
+        if (!contextBroker)
+          throw new WorkspaceScopeError(`Candidate repository cannot be opened: ${candidateGit.root}`);
+        return {
+          ...context,
+          root: candidateGit.root,
+          git: candidateGit,
+          contextBroker,
+          verifierCwd: candidateGit.root,
+        };
+      }
+    }
+    if (basename(canonical).includes("pi-eng-candidate-")) {
+      throw new WorkspaceScopeError(`Candidate repository context is unavailable: ${canonical}`);
+    }
+    if (this.activeManifests.size > 0) {
+      throw new WorkspaceScopeError(`Repository path is outside every active workspace manifest: ${canonical}`);
+    }
+    return null;
+  }
+
+  async probe(repoId: string): Promise<RoleAccessProbe[]> {
+    const asyncActive = this.activeRepo.getStore();
+    if (asyncActive) this.assertActiveScope(asyncActive);
+    const active =
+      asyncActive ??
+      ([...this.activeManifests.values()].length === 1
+        ? { ...[...this.activeManifests.values()][0]!, repoId }
+        : undefined);
+    if (!active) throw new WorkspaceScopeError("No mission manifest is active for probing");
+    return this.probeContext(this.contexts.get(scopeKey(active)) ?? new Map(), repoId);
+  }
+
+  private async probeContext(
+    contexts: Map<string, RepositoryExecutionContext>,
+    repoId: string,
+  ): Promise<RoleAccessProbe[]> {
+    const context = contexts.get(repoId);
+    if (!context) throw new WorkspaceScopeError(`Unknown repository binding: ${repoId}`);
+    const roles: RepositoryRole[] = ["implementer", "validator", "integrator", "reviewer"];
+    const probes = await Promise.all(
+      roles.map(async (role): Promise<RoleAccessProbe> => {
+        try {
+          await access(
+            context.root,
+            role === "implementer" || role === "integrator" ? constants.R_OK | constants.W_OK : constants.R_OK,
+          );
+          if (role === "integrator" && context.git.root !== context.root)
+            throw new Error("Git root differs from binding");
+          if (role === "validator" && context.verifierCwd !== context.root)
+            throw new Error("verifier cwd differs from binding");
+          if (role === "reviewer") await context.contextBroker.repoMap(1);
+          return { role, repoId, root: context.root, ok: true };
+        } catch (error) {
+          return {
+            role,
+            repoId,
+            root: context.root,
+            ok: false,
+            reason: error instanceof Error ? error.message : String(error),
+          };
+        }
+      }),
+    );
+    return probes;
+  }
+
+  async resolveForExecution(
+    missionId: string,
+    generation: number,
+    hash: string,
+    repoId: string,
+    writableDomains: string[] = [],
+  ): Promise<RepositoryExecutionContext> {
+    const expected = this.activeManifests.get(missionId);
+    if (!expected || expected.generation !== generation || expected.hash !== hash) {
+      throw new WorkspaceScopeError(`Inactive workspace manifest for mission ${missionId}`);
+    }
+    const context = this.contexts.get(scopeKey(expected))?.get(repoId);
+    if (!context) throw new WorkspaceScopeError(`Unknown repository binding: ${repoId}`);
+    const canonicalRoot = await realpath(context.root).catch(() => "");
+    const git = canonicalRoot ? await GitRepo.open(canonicalRoot) : null;
+    if (!git || canonicalRoot !== context.root || (await realpath(git.root)) !== context.root) {
+      throw new WorkspaceScopeError(`Repository binding changed before execution: ${repoId}`);
+    }
+    const requested = writableDomains.length > 0 ? writableDomains : context.writableDomains;
+    if (requested.some((domain) => !domainAuthorized(domain, context.writableDomains))) {
+      throw new WorkspaceScopeError(`Requested writable domains exceed repository binding: ${repoId}`);
+    }
+    for (const domain of context.writableDomains) {
+      const prefix = domain.split("*")[0]?.replace(/\/$/, "") ?? "";
+      if (!prefix) continue;
+      const authorizedRoot = resolve(context.root, prefix);
+      const canonical = await realpath(authorizedRoot).catch(() => "");
+      if (canonical !== authorizedRoot || !contains(context.root, canonical)) {
+        throw new WorkspaceScopeError(`Authorized root changed before execution: ${authorizedRoot}`);
+      }
+    }
+    return context;
+  }
+
+  async resolveActiveForExecution(repoId: string, writableDomains: string[] = []): Promise<RepositoryExecutionContext> {
+    const active = this.activeRepo.getStore();
+    if (!active) throw new WorkspaceScopeError("No mission manifest is active for this execution");
+    return this.resolveForExecution(active.missionId, active.generation, active.hash, repoId, writableDomains);
+  }
+
+  /** Git facade selected from the async repository binding of the mission. */
+  gitFacade(): GitRepo {
+    return new Proxy({} as GitRepo, {
+      get: (_target, property) => {
+        const value = (this.current().git as unknown as Record<PropertyKey, unknown>)[property];
+        return typeof value === "function" ? value.bind(this.current().git) : value;
+      },
+    });
+  }
+}

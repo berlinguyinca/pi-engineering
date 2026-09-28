@@ -11,6 +11,8 @@ request
  -> classify
  -> create mission
  -> derive acceptance criteria
+ -> resolve and authorize workspace manifest
+ -> preflight role access and repository bindings
  -> scout if needed
  -> plan/decompose
  -> schedule workers
@@ -21,6 +23,11 @@ request
  -> revalidate
  -> completion gate
 ```
+
+Preflight must occur before mutating work. A mission that explicitly names an
+absolute workspace may authorize it autonomously after canonicalization and
+safety validation. Broad or multi-repository work must be decomposed into
+bounded repository-scoped tasks with acceptance coverage before dispatch.
 
 ## Fast path
 
@@ -63,6 +70,10 @@ They may be:
 
 Changes to acceptance criteria must be logged.
 
+Every material acceptance criterion has a stable ID and must be covered by a
+task and current revision-bound evidence. Workflow activity does not substitute
+for verified acceptance coverage.
+
 ## Escalation
 
 Workflow class may escalate dynamically.
@@ -84,3 +95,7 @@ When the user adds a constraint while work is active:
 3. steer or cancel affected executions,
 4. invalidate stale results if necessary,
 5. reschedule.
+
+The same invalidation and rescheduling rules apply to automatic scope repair,
+checkpoint recovery, task splitting, and blocked-mission resumption. Preserve
+the mission ID and failed-attempt audit history.

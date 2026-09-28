@@ -1,9 +1,31 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { execFile, spawn } from "node:child_process";
+import { createHash } from "node:crypto";
+import { lstatSync, mkdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdir, mkdtemp, readFile, readdir, rm, symlink, utimes, writeFile } from "node:fs/promises";
+import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { promisify } from "node:util";
 import { ArtifactStore } from "../../src/artifacts/ArtifactStore.ts";
+
+const exec = promisify(execFile);
+
+function sha256(content: string): string {
+  return createHash("sha256").update(content).digest("hex");
+}
+
+async function processIncarnation(): Promise<{ bootId: string; processStartTime: string }> {
+  const bootId = (await readFile("/proc/sys/kernel/random/boot_id", "utf8")).trim();
+  const statLine = await readFile(`/proc/${process.pid}/stat`, "utf8");
+  return {
+    bootId,
+    processStartTime: statLine
+      .slice(statLine.lastIndexOf(")") + 2)
+      .trim()
+      .split(/\s+/)[19]!,
+  };
+}
 
 test("artifacts are stored on disk and read lazily by URI", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-eng-art-"));
@@ -77,9 +99,906 @@ test("artifact slices are read lazily and page correctly", async () => {
     assert.equal(tail?.content, "ij");
     assert.equal(tail?.nextOffset, 10);
 
-    // Missing content file surfaces as undefined (not an empty string).
+    // Metadata with missing content is a fail-closed integrity violation.
     await rm(join(dir, "artifacts", "logs", "paged.txt"));
-    assert.equal(await store.readSliceByUri("artifact://logs/paged", 0, 4), undefined);
+    await assert.rejects(() => store.readSliceByUri("artifact://logs/paged", 0, 4), /artifact integrity/i);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("checkpoint-owned immutable writes keep concurrent equal-content claims distinct and replayable", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-eng-art-"));
+  try {
+    const root = join(dir, "artifacts");
+    const store = await ArtifactStore.create(root);
+    const [first, second] = await Promise.all([
+      store.putImmutable("checkpoint", "TCP-same", "same bytes", "first claim"),
+      store.putImmutable("checkpoint", "TCP-same", "same bytes", "second claim"),
+    ]);
+
+    assert.notEqual(first.uri, second.uri);
+    assert.match(first.uri, /^artifact:\/\/checkpoint\/TCP-same-[a-f0-9]{64}-/);
+    assert.equal(await store.readContentByUri(first.uri), "same bytes");
+    assert.equal(await store.readContentByUri(second.uri), "same bytes");
+
+    await assert.rejects(
+      () => store.put("checkpoint", first.id, "mutated bytes", "overwrite attempt"),
+      /immutable checkpoint artifact/i,
+    );
+    await assert.rejects(() => store.delete(second.uri), /immutable checkpoint artifact/i);
+    assert.equal(await store.readContentByUri(first.uri), "same bytes");
+    assert.equal(await store.readContentByUri(second.uri), "same bytes");
+
+    const replayed = await ArtifactStore.create(root);
+    assert.equal(await replayed.readContentByUri(first.uri), "same bytes");
+    assert.equal(await replayed.readContentByUri(second.uri), "same bytes");
+    await assert.rejects(
+      () => replayed.put("checkpoint", first.id, "replayed mutation", "overwrite attempt"),
+      /immutable checkpoint artifact/i,
+    );
+    await assert.rejects(() => replayed.delete(second.uri), /immutable checkpoint artifact/i);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("artifact coordinates reject path aliases and remain contained in the exact category", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-eng-art-canonical-"));
+  try {
+    const root = join(dir, "artifacts");
+    const store = await ArtifactStore.create(root);
+    const invalidSegments = [".", "..", "a/b", "a\\b", "%2e%2e", "x%2Fy"];
+
+    for (const segment of invalidSegments) {
+      await assert.rejects(() => store.put(segment, "safe", "bad", "bad"), /canonical artifact/i);
+      await assert.rejects(() => store.put("safe", segment, "bad", "bad"), /canonical artifact/i);
+      await assert.rejects(() => store.readContent(segment, "safe"), /canonical artifact/i);
+      await assert.rejects(() => store.readContent("safe", segment), /canonical artifact/i);
+    }
+
+    const meta = await store.put("safe", "item-1", "contained", "proof");
+    assert.equal(await readFile(join(root, "safe", "item-1.txt"), "utf8"), "contained");
+    assert.throws(() => store.getByUri(`artifact://safe/../${meta.id}`), /canonical artifact/i);
+    assert.throws(() => store.getByUri(`artifact://safe/%2e%2e`), /canonical artifact/i);
+    await assert.rejects(() => store.delete(`artifact://safe/../${meta.id}`), /canonical artifact/i);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("immutable policy uses private canonical keys and frozen metadata across live and reopened stores", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-eng-art-policy-"));
+  try {
+    const root = join(dir, "artifacts");
+    const store = await ArtifactStore.create(root);
+    const immutable = await store.putImmutable("checkpoint", "TCP-policy", "trusted bytes", "proof");
+
+    assert.ok(Object.isFrozen(immutable));
+    assert.throws(() => Object.assign(immutable, { id: "alias", category: "other", uri: "artifact://other/alias" }));
+    const live = store.getByUri(immutable.uri)!;
+    assert.ok(Object.isFrozen(live));
+    assert.notEqual(live, immutable);
+    assert.throws(() => Object.assign(live, { summary: "mutable policy" }));
+    const listed = store.list("checkpoint");
+    assert.ok(listed.every(Object.isFrozen));
+    assert.notEqual(listed[0], live);
+
+    const reopened = await ArtifactStore.create(root);
+
+    const collisionResults = await Promise.allSettled([
+      store.put("checkpoint", immutable.id, "collision", "collision"),
+      reopened.delete(immutable.uri),
+      reopened.put("checkpoint", immutable.id, "replay collision", "collision"),
+      store.put("checkpoint/..", immutable.id, "alias collision", "collision"),
+      store.delete(`artifact://checkpoint/%2e%2e/${immutable.id}`),
+    ]);
+    assert.ok(collisionResults.every((result) => result.status === "rejected"));
+    assert.equal(await store.readContentByUri(immutable.uri), "trusted bytes");
+
+    const replayed = reopened.getByUri(immutable.uri)!;
+    assert.ok(Object.isFrozen(replayed));
+    assert.notEqual(replayed, live);
+    assert.throws(() => Object.assign(replayed, { id: "replayed-alias" }));
+    await assert.rejects(
+      () => reopened.put("checkpoint", immutable.id, "replay collision", "collision"),
+      /immutable checkpoint artifact/i,
+    );
+    await assert.rejects(() => reopened.delete(immutable.uri), /immutable checkpoint artifact/i);
+    assert.equal(await reopened.readContentByUri(immutable.uri), "trusted bytes");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a stale store and a separate process cannot overwrite a newly durable immutable key", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-eng-art-cross-process-"));
+  try {
+    const root = join(dir, "artifacts");
+    const stale = await ArtifactStore.create(root);
+    const moduleUrl = new URL("../../src/artifacts/ArtifactStore.ts", import.meta.url).href;
+    const child = await exec(
+      process.execPath,
+      [
+        "--experimental-strip-types",
+        "--input-type=module",
+        "--eval",
+        `import { ArtifactStore } from ${JSON.stringify(moduleUrl)}; const store = await ArtifactStore.create(${JSON.stringify(root)}); const meta = await store.putImmutable("checkpoint", "TCP-child", "child trusted bytes", "child"); process.stdout.write(meta.id);`,
+      ],
+      { encoding: "utf8" },
+    );
+    const id = child.stdout.trim();
+    assert.match(id, /^TCP-child-/);
+
+    await assert.rejects(
+      () => stale.put("checkpoint", id, "stale overwrite", "stale"),
+      /immutable checkpoint artifact/i,
+    );
+    assert.equal(await stale.readContent("checkpoint", id), "child trusted bytes");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("concurrent processes serialize one canonical key without mixing content and metadata", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-eng-art-process-race-"));
+  try {
+    const root = join(dir, "artifacts");
+    const moduleUrl = new URL("../../src/artifacts/ArtifactStore.ts", import.meta.url).href;
+    const writer = (label: string, byte: string) =>
+      exec(process.execPath, [
+        "--experimental-strip-types",
+        "--input-type=module",
+        "--eval",
+        `import { ArtifactStore } from ${JSON.stringify(moduleUrl)}; const store = await ArtifactStore.create(${JSON.stringify(root)}); await new Promise((resolve) => setTimeout(resolve, 200)); await store.put("logs", "shared", ${JSON.stringify(byte)}.repeat(1048576), ${JSON.stringify(label)});`,
+      ]);
+
+    await Promise.all([writer("first", "a"), writer("second", "b")]);
+
+    const reopened = await ArtifactStore.create(root);
+    const meta = reopened.getByUri("artifact://logs/shared")!;
+    const content = await reopened.readContentByUri(meta.uri);
+    assert.equal(meta.size, 1_048_576);
+    assert.equal(content, meta.summary === "first" ? "a".repeat(1_048_576) : "b".repeat(1_048_576));
+    assert.ok(meta.summary === "first" || meta.summary === "second");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("corrupt immutable replay reserves the canonical key instead of permitting overwrite", async () => {
+  for (const corruption of ["mismatched-uri", "missing-marker"] as const) {
+    const dir = await mkdtemp(join(tmpdir(), `pi-eng-art-corrupt-${corruption}-`));
+    try {
+      const root = join(dir, "artifacts");
+      const stale = await ArtifactStore.create(root);
+      const writer = await ArtifactStore.create(root);
+      const immutable = await writer.putImmutable("checkpoint", "TCP-corrupt", "trusted bytes", "proof");
+      const metadataPath = join(root, "checkpoint", `${immutable.id}.json`);
+      const metadata = JSON.parse(await readFile(metadataPath, "utf8")) as Record<string, unknown>;
+      if (corruption === "mismatched-uri") metadata.uri = `artifact://other/${immutable.id}`;
+      else delete metadata.immutable;
+      await writeFile(metadataPath, JSON.stringify(metadata), "utf8");
+
+      await assert.rejects(() => ArtifactStore.create(root), /artifact integrity/i);
+      await assert.rejects(
+        () => stale.put("checkpoint", immutable.id, "overwrite", "overwrite"),
+        /artifact integrity/i,
+      );
+      assert.equal(await readFile(join(root, "checkpoint", `${immutable.id}.txt`), "utf8"), "trusted bytes");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+});
+
+test("artifact reads, writes, and deletes reject symlinked categories and final files", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-eng-art-symlink-"));
+  try {
+    const root = join(dir, "artifacts");
+    const outside = join(dir, "outside");
+    await mkdir(root, { recursive: true, mode: 0o700 });
+    await mkdir(outside, { recursive: true });
+    const store = await ArtifactStore.create(root);
+    await symlink(outside, join(root, "linked"), "dir");
+
+    await assert.rejects(() => store.put("linked", "escape", "outside", "bad"), /symlink|containment/i);
+    await assert.rejects(() => store.readContent("linked", "escape"), /symlink|containment/i);
+
+    const meta = await store.put("safe", "item", "trusted", "proof");
+    const contentPath = join(root, "safe", "item.txt");
+    const outsideFile = join(outside, "outside.txt");
+    await writeFile(outsideFile, "outside", "utf8");
+    await rm(contentPath);
+    await symlink(outsideFile, contentPath);
+
+    await assert.rejects(() => store.readContent("safe", "item"), /symlink|containment/i);
+    await assert.rejects(() => store.put("safe", "item", "overwrite", "bad"), /symlink|containment/i);
+    await assert.rejects(() => store.delete(meta.uri), /symlink|containment/i);
+    assert.equal(await readFile(outsideFile, "utf8"), "outside");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("verify-and-dispatch validates canonical metadata and immutable binding before dispatch", async () => {
+  for (const corruption of ["missing-meta", "missing-marker", "mismatched-uri"] as const) {
+    const dir = await mkdtemp(join(tmpdir(), `pi-eng-art-verify-meta-${corruption}-`));
+    try {
+      const root = join(dir, "artifacts");
+      const store = await ArtifactStore.create(root);
+      const content = "dispatch evidence";
+      const artifact = await store.putImmutable("checkpoint", "TCP-dispatch", content, "proof");
+      const metadataPath = join(root, "checkpoint", `${artifact.id}.json`);
+      if (corruption === "missing-meta") {
+        await rm(metadataPath);
+      } else {
+        const metadata = JSON.parse(await readFile(metadataPath, "utf8")) as Record<string, unknown>;
+        if (corruption === "missing-marker") delete metadata.immutable;
+        else metadata.uri = `artifact://other/${artifact.id}`;
+        await writeFile(metadataPath, JSON.stringify(metadata), "utf8");
+      }
+
+      let dispatches = 0;
+      assert.throws(
+        () =>
+          store.verifyAndDispatch([artifact.uri], [`sha256:${sha256(content)}`], () => {
+            dispatches += 1;
+          }),
+        /artifact integrity|ENOENT/i,
+      );
+      assert.equal(dispatches, 0);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+});
+
+test("durable metadata binds every record to exact size and digest", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-eng-art-digest-"));
+  try {
+    const root = join(dir, "artifacts");
+    const store = await ArtifactStore.create(root);
+    const mutable = await store.put("logs", "mutable", "old content", "old");
+    const immutable = await store.putImmutable("checkpoint", "TCP-digest", "trusted bytes", "proof");
+
+    const mutableMetadataPath = join(root, "logs", "mutable.json");
+    const mutableMetadata = JSON.parse(await readFile(mutableMetadataPath, "utf8")) as Record<string, unknown>;
+    assert.equal(mutableMetadata.sha256, sha256("old content"));
+    const immutableMetadata = JSON.parse(
+      await readFile(join(root, "checkpoint", `${immutable.id}.json`), "utf8"),
+    ) as Record<string, unknown>;
+    assert.equal(immutableMetadata.sha256, sha256("trusted bytes"));
+    assert.match(immutable.id, new RegExp(String.raw`-${immutableMetadata.sha256}-`));
+
+    await store.put("logs", "mutable", "new content", "new");
+    await writeFile(mutableMetadataPath, JSON.stringify(mutableMetadata), "utf8");
+    await assert.rejects(() => ArtifactStore.create(root), /artifact integrity.*(digest|size)/i);
+
+    await writeFile(join(root, "logs", "mutable.txt"), "old", "utf8");
+    await assert.rejects(() => ArtifactStore.create(root), /artifact integrity.*(digest|size)/i);
+
+    assert.equal(mutable.uri, "artifact://logs/mutable");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("pinned category descriptors prevent deterministic read write delete and verify swap escapes", async () => {
+  for (const operation of ["read", "write", "delete", "verify"] as const) {
+    const dir = await mkdtemp(join(tmpdir(), `pi-eng-art-dir-race-${operation}-`));
+    try {
+      const root = join(dir, "artifacts");
+      const outside = join(dir, "outside");
+      await mkdir(outside);
+      const seed = await ArtifactStore.create(root);
+      const artifact =
+        operation === "verify"
+          ? await seed.putImmutable("safe", "TCP-race", "trusted", "proof")
+          : await seed.put("safe", "item", "trusted", "proof");
+      await writeFile(join(outside, `${artifact.id}.txt`), "outside", "utf8");
+      await writeFile(
+        join(outside, `${artifact.id}.json`),
+        JSON.stringify({
+          id: artifact.id,
+          category: "safe",
+          uri: artifact.uri,
+          size: 7,
+          sha256: sha256("outside"),
+          created_at: "2026-09-27T00:00:00.000Z",
+          summary: "outside",
+          ...(operation === "verify" ? { immutable: true } : {}),
+        }),
+        "utf8",
+      );
+      let swapped = false;
+      const store = await ArtifactStore.create(root, {
+        afterCategoryOpened: (kind: string, category: string) => {
+          if (swapped || kind !== operation || category !== "safe") return;
+          swapped = true;
+          renameSync(join(root, "safe"), join(root, "safe-pinned"));
+          symlinkSync(outside, join(root, "safe"), "dir");
+        },
+      });
+
+      if (operation === "read") assert.equal(await store.readContentByUri(artifact.uri), "trusted");
+      if (operation === "write") await store.put("safe", "item", "updated", "updated");
+      if (operation === "delete") await store.delete(artifact.uri);
+      if (operation === "verify") {
+        store.verifyAndDispatch([artifact.uri], [`sha256:${sha256("trusted")}`], () => undefined);
+      }
+      assert.equal(swapped, true, "the deterministic swap hook must exercise the race window");
+      assert.equal(await readFile(join(outside, `${artifact.id}.txt`), "utf8"), "outside");
+      assert.equal(JSON.parse(await readFile(join(outside, `${artifact.id}.json`), "utf8")).summary, "outside");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+});
+
+test(
+  "artifact key locks recover killed owners and release only their matching owner token",
+  { timeout: 2_000 },
+  async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pi-eng-art-lock-owner-"));
+    try {
+      const root = join(dir, "artifacts");
+      const store = await ArtifactStore.create(root);
+      const lockBase = join(root, ".artifact-locks", sha256("logs/shared"));
+      const lockPath = `${lockBase}.lock`;
+      const incarnation = await processIncarnation();
+      await writeFile(
+        lockPath,
+        `${JSON.stringify({
+          pid: 2_000_000_000,
+          host: hostname(),
+          openedAt: "2026-01-01T00:00:00.000Z",
+          ownerToken: "killed-owner",
+          bootId: incarnation.bootId,
+          processStartTime: "1",
+        })}\n`,
+        "utf8",
+      );
+      await utimes(lockPath, new Date(0), new Date(0));
+      await store.put("logs", "shared", "recovered", "recovered");
+
+      let releaseOperation: (() => void) | undefined;
+      const operationPaused = new Promise<void>((resolve) => {
+        releaseOperation = resolve;
+      });
+      let lockAcquired: (() => void) | undefined;
+      const acquired = new Promise<void>((resolve) => {
+        lockAcquired = resolve;
+      });
+      const pausing = await ArtifactStore.create(root, {
+        afterKeyLockAcquired: async (key: string) => {
+          if (key !== "logs/replacement") return;
+          lockAcquired?.();
+          await operationPaused;
+        },
+      });
+      const pending = pausing.put("logs", "replacement", "owner-a", "a");
+      await acquired;
+      const replacementLock = `${join(root, ".artifact-locks", sha256("logs/replacement"))}.lock`;
+      const originalIdentity = readFileSync(replacementLock, "utf8");
+      const originalInode = lstatSync(replacementLock).ino;
+      rmSync(replacementLock, { force: true });
+      for (let index = 0; index < 16; index += 1) {
+        writeFileSync(join(root, ".artifact-locks", `inode-reservation-${index}`), "reserved", "utf8");
+      }
+      writeFileSync(replacementLock, originalIdentity, "utf8");
+      assert.notEqual(lstatSync(replacementLock).ino, originalInode, "the replacement fixture needs a new inode");
+      releaseOperation?.();
+      await assert.rejects(pending, /release failed.*identity changed/i);
+      assert.equal(
+        readFileSync(replacementLock, "utf8"),
+        originalIdentity,
+        "release must also match the acquired inode",
+      );
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  },
+);
+
+test("a journal published before SIGKILL recovers one complete content-metadata generation", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-eng-art-journal-crash-"));
+  try {
+    const root = join(dir, "artifacts");
+    const seed = await ArtifactStore.create(root);
+    await seed.put("logs", "crash", "old bytes", "old");
+    const moduleUrl = new URL("../../src/artifacts/ArtifactStore.ts", import.meta.url).href;
+    await assert.rejects(
+      () =>
+        exec(process.execPath, [
+          "--experimental-strip-types",
+          "--input-type=module",
+          "--eval",
+          `import { ArtifactStore } from ${JSON.stringify(moduleUrl)}; const store = await ArtifactStore.create(${JSON.stringify(root)}, { afterJournalCommitted: () => process.kill(process.pid, "SIGKILL") }); await store.put("logs", "crash", "new bytes", "new");`,
+        ]),
+      /SIGKILL|killed/i,
+    );
+
+    const replayed = await ArtifactStore.create(root);
+    assert.equal(await replayed.readContent("logs", "crash"), "new bytes");
+    assert.equal(replayed.getByUri("artifact://logs/crash")?.summary, "new");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("simultaneous stale-lock reapers serialize the artifact critical section at max concurrency one", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-eng-art-reaper-concurrency-"));
+  try {
+    const root = join(dir, "artifacts");
+    await ArtifactStore.create(root);
+    const lockPath = join(root, ".artifact-locks", `${sha256("logs/shared")}.lock`);
+    const incarnation = await processIncarnation();
+    await writeFile(
+      lockPath,
+      `${JSON.stringify({
+        pid: 2_000_000_000,
+        host: hostname(),
+        openedAt: "2026-01-01T00:00:00.000Z",
+        ownerToken: "dead-owner-for-simultaneous-reapers",
+        bootId: incarnation.bootId,
+        processStartTime: "1",
+      })}\n`,
+      "utf8",
+    );
+    const events = join(dir, "events.jsonl");
+    const moduleUrl = new URL("../../src/artifacts/ArtifactStore.ts", import.meta.url).href;
+    const children = Array.from({ length: 4 }, (_, index) =>
+      spawn(
+        process.execPath,
+        [
+          "--experimental-strip-types",
+          "--input-type=module",
+          "--eval",
+          `import { appendFile } from "node:fs/promises"; import { ArtifactStore } from ${JSON.stringify(moduleUrl)}; const store = await ArtifactStore.create(${JSON.stringify(root)}, { afterKeyLockAcquired: async (key) => { if (key !== "logs/shared") return; await appendFile(${JSON.stringify(events)}, JSON.stringify({type:"start", pid:process.pid})+"\\n"); await new Promise((resolve) => setTimeout(resolve, 75)); await appendFile(${JSON.stringify(events)}, JSON.stringify({type:"end", pid:process.pid})+"\\n"); } }); await store.put("logs", "shared", ${JSON.stringify(`writer-${index}`)}, ${JSON.stringify(`writer-${index}`)});`,
+        ],
+        { stdio: "inherit" },
+      ),
+    );
+    await Promise.all(
+      children.map(
+        (child) =>
+          new Promise<void>((resolve, reject) => {
+            child.once("error", reject);
+            child.once("exit", (code, signal) => {
+              if (code === 0) resolve();
+              else reject(new Error(`artifact contender failed code=${code} signal=${signal}`));
+            });
+          }),
+      ),
+    );
+
+    let active = 0;
+    let maximum = 0;
+    for (const event of (await readFile(events, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line)) as Array<{
+      type: "start" | "end";
+    }>) {
+      active += event.type === "start" ? 1 : -1;
+      maximum = Math.max(maximum, active);
+      assert.ok(active >= 0);
+    }
+    assert.equal(active, 0);
+    assert.equal(maximum, 1);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("verify-and-dispatch rejects a mutable artifact even when its bytes and digest are valid", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-eng-art-dispatch-mutable-"));
+  try {
+    const store = await ArtifactStore.create(join(dir, "artifacts"));
+    const mutable = await store.put("logs", "mutable", "valid bytes", "mutable");
+    let dispatches = 0;
+    assert.throws(
+      () =>
+        store.verifyAndDispatch([mutable.uri], [`sha256:${sha256("valid bytes")}`], () => {
+          dispatches += 1;
+        }),
+      /artifact integrity.*immutable/i,
+    );
+    assert.equal(dispatches, 0);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("delete recovery is durable across both category-fsync crash phases", async () => {
+  for (const phase of ["afterDeleteFilesSynced", "afterDeleteJournalRemoved"] as const) {
+    const dir = await mkdtemp(join(tmpdir(), `pi-eng-art-delete-crash-${phase}-`));
+    try {
+      const root = join(dir, "artifacts");
+      const seed = await ArtifactStore.create(root);
+      const artifact = await seed.put("logs", "delete-me", "bytes", "delete");
+      const moduleUrl = new URL("../../src/artifacts/ArtifactStore.ts", import.meta.url).href;
+      await assert.rejects(
+        () =>
+          exec(process.execPath, [
+            "--experimental-strip-types",
+            "--input-type=module",
+            "--eval",
+            `import { ArtifactStore } from ${JSON.stringify(moduleUrl)}; const store = await ArtifactStore.create(${JSON.stringify(root)}, { ${phase}: () => process.kill(process.pid, "SIGKILL") }); await store.delete(${JSON.stringify(artifact.uri)});`,
+          ]),
+        /SIGKILL|killed/i,
+      );
+
+      const replayed = await ArtifactStore.create(root);
+      assert.equal(await replayed.readContentByUri(artifact.uri), undefined);
+      assert.equal(replayed.getByUri(artifact.uri), undefined);
+      await assert.rejects(() => readFile(join(root, "logs", "delete-me.txn.json")), /ENOENT/);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+});
+
+test("a pinned lock-directory descriptor prevents a deterministic lock-root swap escape", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-eng-art-lock-dir-race-"));
+  try {
+    const root = join(dir, "artifacts");
+    const outside = join(dir, "outside-locks");
+    await mkdir(outside, { mode: 0o700 });
+    let swapped = false;
+    const store = await ArtifactStore.create(root, {
+      afterLockDirectoryOpened: () => {
+        if (swapped) return;
+        swapped = true;
+        renameSync(join(root, ".artifact-locks"), join(root, ".artifact-locks-pinned"));
+        symlinkSync(outside, join(root, ".artifact-locks"), "dir");
+      },
+    });
+    await store.put("logs", "safe", "bytes", "safe");
+    assert.equal(swapped, true);
+    assert.deepEqual(await readdir(outside), []);
+    assert.equal(await store.readContent("logs", "safe"), "bytes");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a reopened store rejects a replaced lock directory while an older store holds the original domain", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-eng-art-lock-dir-identity-"));
+  try {
+    const root = join(dir, "artifacts");
+    let releaseFirst!: () => void;
+    const firstMayFinish = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    let firstEntered!: () => void;
+    const firstHoldingOldDirectory = new Promise<void>((resolve) => {
+      firstEntered = resolve;
+    });
+    const first = await ArtifactStore.create(root, {
+      afterKeyLockAcquired: async (key) => {
+        if (key !== "logs/shared") return;
+        renameSync(join(root, ".artifact-locks"), join(root, ".artifact-locks-pinned"));
+        mkdirSync(join(root, ".artifact-locks"), { mode: 0o700 });
+        firstEntered();
+        await firstMayFinish;
+      },
+    });
+    const durableDomain = JSON.parse(await readFile(join(root, ".artifact-lock-domain.json"), "utf8")) as {
+      device: string;
+      inode: string;
+      token: string;
+    };
+    const initialDomain = lstatSync(join(root, ".artifact-locks"), { bigint: true });
+    assert.equal(durableDomain.device, initialDomain.dev.toString());
+    assert.equal(durableDomain.inode, initialDomain.ino.toString());
+    assert.match(durableDomain.token, /^[0-9a-f-]{36}$/i);
+    const firstWrite = first.put("logs", "shared", "first", "first");
+    await firstHoldingOldDirectory;
+    try {
+      await assert.rejects(() => ArtifactStore.create(root), /artifact integrity.*lock root identity changed/i);
+    } finally {
+      releaseFirst();
+      await firstWrite;
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("artifact lock bootstrap fails closed when an unproven lock directory predates every durable marker", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-eng-art-lock-unproven-"));
+  try {
+    const root = join(dir, "artifacts");
+    await mkdir(join(root, ".artifact-locks"), { recursive: true, mode: 0o700 });
+    await assert.rejects(() => ArtifactStore.create(root), /artifact integrity.*lock root.*(?:unproven|bootstrap)/i);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a prepared bootstrap marker cannot authorize a substituted unbound lock directory", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-eng-art-lock-prepared-substitution-"));
+  try {
+    const root = join(dir, "artifacts");
+    const moduleUrl = new URL("../../src/artifacts/ArtifactStore.ts", import.meta.url).href;
+    await assert.rejects(
+      () =>
+        exec(process.execPath, [
+          "--experimental-strip-types",
+          "--input-type=module",
+          "--eval",
+          `import { ArtifactStore } from ${JSON.stringify(moduleUrl)}; await ArtifactStore.create(${JSON.stringify(root)}, { afterLockBootstrapPrepared: () => process.kill(process.pid, "SIGKILL") });`,
+        ]),
+      /SIGKILL|killed/i,
+    );
+    await mkdir(join(root, ".artifact-locks"), { mode: 0o700 });
+    await assert.rejects(
+      () => ArtifactStore.create(root),
+      /artifact integrity.*(?:domain token|path was substituted)/i,
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("the bootstrap binds the directory inode created before its name can be substituted", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-eng-art-lock-bootstrap-inode-"));
+  try {
+    const root = join(dir, "artifacts");
+    let swapped = false;
+    const hooks = {
+      afterLockDirectoryCreatedBeforeOpen: () => {
+        swapped = true;
+        renameSync(join(root, ".artifact-locks"), join(root, ".artifact-locks-created"));
+        mkdirSync(join(root, ".artifact-locks"), { mode: 0o700 });
+      },
+    };
+    await assert.rejects(() => ArtifactStore.create(root, hooks), /artifact integrity.*lock root.*identity/i);
+    assert.equal(swapped, true);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("concurrent first openers converge on one no-clobber bootstrap authority", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-eng-art-lock-bootstrap-race-"));
+  try {
+    const root = join(dir, "artifacts");
+    const stores = await Promise.all(Array.from({ length: 12 }, () => ArtifactStore.create(root)));
+    assert.equal(stores.length, 12);
+
+    const reopened = await ArtifactStore.create(root);
+    await reopened.put("logs", "converged", "one-domain", "converged");
+    assert.equal(await reopened.readContent("logs", "converged"), "one-domain");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("the original bootstrap claimant accepts a helper publishing its exact staged inode", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-eng-art-lock-bootstrap-helper-publish-"));
+  const ready = join(dir, "claimant-ready");
+  const release = join(dir, "release-claimant");
+  let claimant: ReturnType<typeof exec> | undefined;
+  try {
+    const root = join(dir, "artifacts");
+    const moduleUrl = new URL("../../src/artifacts/ArtifactStore.ts", import.meta.url).href;
+    claimant = exec(process.execPath, [
+      "--experimental-strip-types",
+      "--input-type=module",
+      "--eval",
+      `import { existsSync, writeFileSync } from "node:fs"; import { ArtifactStore } from ${JSON.stringify(moduleUrl)}; await ArtifactStore.create(${JSON.stringify(root)}, { afterLockBootstrapBound: () => { writeFileSync(${JSON.stringify(ready)}, "ready"); while (!existsSync(${JSON.stringify(release)})) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10); } });`,
+    ]);
+
+    const deadline = Date.now() + 5_000;
+    while (true) {
+      try {
+        await readFile(ready);
+        break;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        if (Date.now() >= deadline) throw new Error("bootstrap claimant did not reach the bound barrier");
+        await new Promise((resolveDelay) => setTimeout(resolveDelay, 10));
+      }
+    }
+
+    const helper = await ArtifactStore.create(root);
+    await helper.put("logs", "helper", "published", "helper published winning inode");
+    await writeFile(release, "release\n");
+    await claimant;
+
+    const reopened = await ArtifactStore.create(root);
+    assert.equal(await reopened.readContent("logs", "helper"), "published");
+  } finally {
+    await writeFile(release, "release\n").catch(() => undefined);
+    await claimant?.catch(() => undefined);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a stale pre-claim opener converges after another opener publishes and cleans the domain", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-eng-art-lock-bootstrap-aba-"));
+  const ready = join(dir, "stale-ready");
+  const release = join(dir, "release-stale");
+  let stale: ReturnType<typeof exec> | undefined;
+  try {
+    const root = join(dir, "artifacts");
+    const moduleUrl = new URL("../../src/artifacts/ArtifactStore.ts", import.meta.url).href;
+    stale = exec(process.execPath, [
+      "--experimental-strip-types",
+      "--input-type=module",
+      "--eval",
+      `import { existsSync, writeFileSync } from "node:fs"; import { ArtifactStore } from ${JSON.stringify(moduleUrl)}; await ArtifactStore.create(${JSON.stringify(root)}, { beforeLockBootstrapClaim: () => { writeFileSync(${JSON.stringify(ready)}, "ready"); while (!existsSync(${JSON.stringify(release)})) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10); } });`,
+    ]);
+
+    const deadline = Date.now() + 5_000;
+    while (true) {
+      try {
+        await readFile(ready);
+        break;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        if (Date.now() >= deadline) throw new Error("stale opener did not reach the pre-claim barrier");
+        await new Promise((resolveDelay) => setTimeout(resolveDelay, 10));
+      }
+    }
+
+    const winner = await ArtifactStore.create(root);
+    await winner.put("logs", "winner", "durable", "winner published domain");
+    const durableBefore = await readFile(join(root, ".artifact-lock-domain.json"), "utf8");
+    await assert.rejects(() => readFile(join(root, ".artifact-lock-bootstrap.json")), /ENOENT/);
+
+    await writeFile(release, "release\n");
+    await stale;
+
+    assert.equal(await readFile(join(root, ".artifact-lock-domain.json"), "utf8"), durableBefore);
+    await assert.rejects(() => readFile(join(root, ".artifact-lock-bootstrap.json")), /ENOENT/);
+    const reopened = await ArtifactStore.create(root);
+    assert.equal(await reopened.readContent("logs", "winner"), "durable");
+  } finally {
+    await writeFile(release, "release\n").catch(() => undefined);
+    await stale?.catch(() => undefined);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a stale absence observer joins a bootstrap whose directory is published before its domain", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-eng-art-lock-bootstrap-published-directory-"));
+  const staleReady = join(dir, "stale-ready");
+  const releaseStale = join(dir, "release-stale");
+  const winnerReady = join(dir, "winner-ready");
+  const releaseWinner = join(dir, "release-winner");
+  let stale: ReturnType<typeof exec> | undefined;
+  let winner: ReturnType<typeof exec> | undefined;
+  try {
+    const root = join(dir, "artifacts");
+    const moduleUrl = new URL("../../src/artifacts/ArtifactStore.ts", import.meta.url).href;
+    stale = exec(process.execPath, [
+      "--experimental-strip-types",
+      "--input-type=module",
+      "--eval",
+      `import { existsSync, writeFileSync } from "node:fs"; import { ArtifactStore } from ${JSON.stringify(moduleUrl)}; await ArtifactStore.create(${JSON.stringify(root)}, { afterLockBootstrapAbsenceObserved: () => { writeFileSync(${JSON.stringify(staleReady)}, "ready"); while (!existsSync(${JSON.stringify(releaseStale)})) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10); } });`,
+    ]);
+
+    const staleDeadline = Date.now() + 5_000;
+    while (true) {
+      try {
+        await readFile(staleReady);
+        break;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        if (Date.now() >= staleDeadline) throw new Error("stale opener did not observe initial bootstrap absence");
+        await new Promise((resolveDelay) => setTimeout(resolveDelay, 10));
+      }
+    }
+
+    winner = exec(process.execPath, [
+      "--experimental-strip-types",
+      "--input-type=module",
+      "--eval",
+      `import { existsSync, writeFileSync } from "node:fs"; import { ArtifactStore } from ${JSON.stringify(moduleUrl)}; await ArtifactStore.create(${JSON.stringify(root)}, { afterLockDirectoryCreated: () => { writeFileSync(${JSON.stringify(winnerReady)}, "ready"); while (!existsSync(${JSON.stringify(releaseWinner)})) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10); } });`,
+    ]);
+
+    const winnerDeadline = Date.now() + 5_000;
+    while (true) {
+      try {
+        await readFile(winnerReady);
+        break;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        if (Date.now() >= winnerDeadline) throw new Error("winner did not publish its lock directory");
+        await new Promise((resolveDelay) => setTimeout(resolveDelay, 10));
+      }
+    }
+
+    await writeFile(releaseStale, "release\n");
+    await stale;
+    await writeFile(releaseWinner, "release\n");
+    await winner;
+
+    await assert.rejects(() => readFile(join(root, ".artifact-lock-bootstrap.json")), /ENOENT/);
+    const reopened = await ArtifactStore.create(root);
+    await reopened.put("logs", "joined", "durable", "joined published bootstrap");
+    assert.equal(await reopened.readContent("logs", "joined"), "durable");
+  } finally {
+    await writeFile(releaseStale, "release\n").catch(() => undefined);
+    await writeFile(releaseWinner, "release\n").catch(() => undefined);
+    await stale?.catch(() => undefined);
+    await winner?.catch(() => undefined);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("cross-process first-open stress converges without a lingering conflicting bootstrap", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-eng-art-lock-bootstrap-process-stress-"));
+  try {
+    const moduleUrl = new URL("../../src/artifacts/ArtifactStore.ts", import.meta.url).href;
+    for (let iteration = 0; iteration < 4; iteration++) {
+      const root = join(dir, `artifacts-${iteration}`);
+      await Promise.all(
+        Array.from({ length: 24 }, () =>
+          exec(process.execPath, [
+            "--experimental-strip-types",
+            "--input-type=module",
+            "--eval",
+            `import { ArtifactStore } from ${JSON.stringify(moduleUrl)}; await ArtifactStore.create(${JSON.stringify(root)});`,
+          ]),
+        ),
+      );
+      await assert.rejects(() => readFile(join(root, ".artifact-lock-bootstrap.json")), /ENOENT/);
+      const reopened = await ArtifactStore.create(root);
+      await reopened.put("logs", "stress", `${iteration}`, "cross-process convergence");
+      assert.equal(await reopened.readContent("logs", "stress"), `${iteration}`);
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("artifact lock bootstrap recovers each durable two-phase crash boundary", async () => {
+  for (const phase of [
+    "afterLockBootstrapPrepared",
+    "afterLockDirectoryCreatedBeforeOpen",
+    "afterLockDirectoryCreated",
+    "afterLockBootstrapBound",
+    "afterLockDomainPublished",
+  ] as const) {
+    const dir = await mkdtemp(join(tmpdir(), `pi-eng-art-lock-bootstrap-${phase}-`));
+    try {
+      const root = join(dir, "artifacts");
+      const moduleUrl = new URL("../../src/artifacts/ArtifactStore.ts", import.meta.url).href;
+      await assert.rejects(
+        () =>
+          exec(process.execPath, [
+            "--experimental-strip-types",
+            "--input-type=module",
+            "--eval",
+            `import { ArtifactStore } from ${JSON.stringify(moduleUrl)}; await ArtifactStore.create(${JSON.stringify(root)}, { ${phase}: () => process.kill(process.pid, "SIGKILL") });`,
+          ]),
+        /SIGKILL|killed/i,
+      );
+      const recovered = await ArtifactStore.create(root);
+      await recovered.put("logs", "recovered", phase, phase);
+      assert.equal(await recovered.readContent("logs", "recovered"), phase);
+      await assert.rejects(() => readFile(join(root, ".artifact-lock-bootstrap.json")), /ENOENT/);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+});
+
+test("deleting the final lock record cannot authorize a replacement while the old holder remains live", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-eng-art-lock-record-delete-"));
+  try {
+    const root = join(dir, "artifacts");
+    const first = await ArtifactStore.create(root);
+    renameSync(join(root, ".artifact-locks"), join(root, ".artifact-locks-old"));
+    mkdirSync(join(root, ".artifact-locks"), { mode: 0o700 });
+    rmSync(join(root, ".artifact-lock-domain.json"));
+    await assert.rejects(() => ArtifactStore.create(root), /artifact integrity.*lock root.*(?:unproven|bootstrap)/i);
+    await assert.rejects(() => first.put("logs", "blocked", "bytes", "blocked"), /artifact integrity.*lock root/i);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

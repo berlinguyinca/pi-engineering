@@ -9,21 +9,25 @@
     ".": "./src/index.ts"
   },
   "scripts": {
-    "typecheck": "tsc --noEmit",
+    "typecheck": "npm run typecheck:core && npm run typecheck:scripts",
+    "typecheck:core": "tsc --noEmit",
+    "typecheck:scripts": "tsc --noEmit -p tsconfig.scripts.json",
     "test": "node --test \"test/unit/**/*.test.ts\" \"test/integration/**/*.test.ts\"",
     "test:unit": "node --test \"test/unit/**/*.test.ts\"",
     "test:integration": "node --test \"test/integration/**/*.test.ts\"",
+    "test:mission-reliability": "node --test test/integration/mission-reliability-foundation.test.ts",
     "test:e2e": "node scripts/smoke-commands.ts && node scripts/smoke-load.ts",
     "test:platform": "node --test \"test/unit/platform-*.test.ts\" \"test/integration/platform-*.test.ts\"",
     "platform:e2e": "node --experimental-strip-types scripts/platform-e2e.ts",
     "platform:serve": "node --experimental-strip-types scripts/control-server.ts",
     "test:roadmap": "node --test \"test/unit/roadmap*.test.ts\" \"test/integration/roadmap*.test.ts\"",
     "test:dogfood:lifecycle": "node scripts/dogfood-lifecycle.ts",
+    "dogfood:mission-recovery": "node scripts/dogfood-mission-recovery.ts --model local/local",
     "roadmap:check": "node scripts/pi-engineering.ts roadmap check",
     "roadmap:status": "node scripts/pi-engineering.ts roadmap status",
     "lint": "biome check .",
     "format": "biome format --write .",
-    "build": "tsc --noEmit"
+    "build": "npm run typecheck"
   },
   "bin": {
     "pi-engineering": "./scripts/pi-engineering.ts"

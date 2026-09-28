@@ -30,7 +30,14 @@ import { MissionStore } from "../orchestration/missionStore.ts";
 import { MissionObservability } from "../orchestration/observability/MissionObservability.ts";
 import { Orchestrator } from "../orchestration/orchestrator.ts";
 import type { PlanTaskInput } from "../orchestration/orchestrator.ts";
-import { realBackends } from "../orchestration/realBackends.ts";
+import { MissionOwnership } from "../orchestration/ownership.ts";
+import { type ModelRoute, realBackends } from "../orchestration/realBackends.ts";
+import { FailureClassifier } from "../orchestration/recovery.ts";
+import { RepositoryRegistry } from "../orchestration/repositoryRegistry.ts";
+import { canTransitionMission } from "../orchestration/state.ts";
+import { MissionSupervisor, type SupervisorStatus } from "../orchestration/supervisor.ts";
+import type { Mission, MissionStop } from "../orchestration/types.ts";
+import { WorkspaceManifestResolver } from "../orchestration/workspaceManifest.ts";
 import { tasksConflict, topoSort } from "../plan/taskDag.ts";
 import { JsonlEventStore } from "../platform/eventstore/jsonl.ts";
 import { redactSecrets } from "../platform/redact.ts";
@@ -60,7 +67,7 @@ import type { WorkerExecutor, WorkerRequest } from "../workers/WorkerExecutor.ts
  */
 function buildGatewayRecoveryProbe(
   worker: WorkerExecutor,
-  routeModel: ((role: WorkerRequest["role"]) => Promise<{ provider: string; id: string } | undefined>) | undefined,
+  routeModel: ((role: WorkerRequest["role"]) => Promise<ModelRoute | undefined>) | undefined,
 ): RecoveryProbe | undefined {
   const url = process.env.PI_GATEWAY_HEALTH_URL;
   if (url) return new HttpRecoveryProbe({ baseUrl: url, timeoutMs: 5_000 });
@@ -180,6 +187,24 @@ function findingsBlock(findings: string[]): string {
   return joined.length > 8000 ? `${joined.slice(0, 8000)}\n… [truncated]` : joined;
 }
 
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+const SUPPORTED_SUPERVISOR_REPAIR_ACTIONS = new Set([
+  "REBUILD_WORKSPACE_MANIFEST",
+  "RECONSTRUCT_EVIDENCE",
+  "CHECKPOINT_SPLIT_AND_REPLACE",
+  "PROBE_AND_BACKOFF",
+  "REPAIR_WORKER_OUTPUT",
+  "CREATE_REPAIR_TASKS",
+  "REBUILD_INTEGRATION_CANDIDATE",
+  "FENCE_RECONCILE_AND_RESUME",
+  "WAIT_FOR_REQUIREMENT",
+  "PAUSE_FOR_PERSISTENCE",
+  "REPAIR_BLOCKED_MISSION",
+]);
+
 /** One tournament entrant and its independent assessment. */
 export interface TournamentEntry {
   candidate: Candidate;
@@ -240,6 +265,7 @@ const openedOrchestrationStores = new Map<string, JsonlEventStore>();
 /** Live mission state owners shared by sequential runtimes for one work dir. */
 const openedMissionStores = new Map<string, MissionStore>();
 const openedMissionObservability = new Map<string, MissionObservability>();
+const openedOrchestrationStoreReferences = new Map<string, number>();
 /** Concurrent same-repository initialization is single-flight. */
 const openingRuntimes = new Map<string, Promise<EngineeringRuntime>>();
 
@@ -268,11 +294,23 @@ export interface RuntimeMissionActivityEvent {
   state: string;
   health: string;
   approximatePercent: number;
+  acceptanceCoverage: { completed: number; total: number; approximatePercent: number };
+  workflowProgress: { completed: number; total: number; approximatePercent: number };
   summary: string;
   activeWorkers: number;
   waitingWorkers: number;
   failedWorkers: number;
   lastHeartbeatAt?: string;
+  lastMeaningfulProgressAt: string | null;
+  action: string;
+  reason: string;
+  recovery: { attempt: number; maxAttempts: number };
+  nextAction: string;
+  nextActionAt: string | null;
+  owner: string | null;
+  repository: string | null;
+  task: string | null;
+  preservedWork: string[];
 }
 
 export interface EngineeringRuntimeOptions {
@@ -353,6 +391,10 @@ export class EngineeringRuntime {
   blackhole: BlackholeManager | null;
   /** Orchestration mission store (spec 00 §3) — durable, restart-recoverable. */
   missionStore: MissionStore | null;
+  /** Durable fenced authority used by orchestration dispatch. */
+  missionOwnership: MissionOwnership | null;
+  /** Clock-driven owner of startup and periodic nonterminal-mission reconciliation. */
+  missionSupervisor: MissionSupervisor | null;
   /** Orchestrator facade (spec 06) — auto-invokes workflows from intent. */
   orchestrator: Orchestrator | null;
   /**
@@ -361,6 +403,10 @@ export class EngineeringRuntime {
    * BESIDE the controller; the controller remains authoritative. Additive.
    */
   missionObservability: MissionObservability | null;
+  /** Repository bindings authorized for orchestration missions in this runtime. */
+  repositoryRegistry: RepositoryRegistry;
+  /** Semantic tools whose repository services are selected from execution cwd. */
+  coreTools: ReturnType<typeof buildCoreTools>;
   /**
    * Mission-level gateway resilience config (spec §resilience). Time-based
    * retry window (default 90m), 10s recovery probes, circuit breaker, and
@@ -376,6 +422,11 @@ export class EngineeringRuntime {
   private currentPhaseGoal = "";
   private snapshotPublishPending: Promise<MissionSnapshotFile | null> | null = null;
   private snapshotPublishDirty = false;
+  private orchestrationPath: string | null = null;
+  private closed = false;
+  private openReferences = 1;
+  private readonly missionResumeFlights = new Map<string, Promise<import("../orchestration/types.ts").Mission>>();
+  private readonly supervisorSettlementFlights = new Map<string, Promise<void>>();
 
   /**
    * Serializes git mutations that touch the shared main repo (worktree create,
@@ -421,6 +472,7 @@ export class EngineeringRuntime {
             tasks: this.missionStore!.listTasks(m.mission_id),
             findings: this.missionStore!.listFindings(m.mission_id),
             observability: this.missionObservability?.projection(m.mission_id) ?? null,
+            stop: this.currentMissionStop(m.mission_id),
           }));
           latest = buildMissionSnapshotFile(missions);
           const path = join(this.workDir, MISSION_SNAPSHOT_FILENAME);
@@ -451,6 +503,16 @@ export class EngineeringRuntime {
       if (this.snapshotPublishDirty) void this.publishMissionSnapshot();
     });
     return this.snapshotPublishPending;
+  }
+
+  private currentMissionStop(missionId: string) {
+    const generation = this.missionStore?.listMissionResumptions(missionId).at(-1)?.generation ?? 0;
+    return (
+      this.missionStore
+        ?.listMissionStops(missionId)
+        .filter((stop) => stop.resumptionGeneration === generation)
+        .at(-1) ?? null
+    );
   }
 
   /** Notify status surfaces of pipeline progress. Never throws into the run. */
@@ -485,11 +547,29 @@ export class EngineeringRuntime {
         state: summary.state,
         health: summary.health,
         approximatePercent: summary.progress.approximatePercent,
+        acceptanceCoverage: { ...summary.acceptanceCoverage },
+        workflowProgress: { ...summary.workflowProgress },
         summary: bounded,
         activeWorkers: summary.workers.active,
         waitingWorkers: summary.workers.waiting,
         failedWorkers: summary.workers.failed,
         ...(summary.lastHeartbeatAt ? { lastHeartbeatAt: summary.lastHeartbeatAt } : {}),
+        lastMeaningfulProgressAt: summary.lastMeaningfulProgressAt,
+        action: summary.action,
+        reason: redactSecrets(summary.reason)
+          .replace(/[\r\n\t]+/g, " ")
+          .trim()
+          .slice(0, 240),
+        recovery: { ...summary.recovery },
+        nextAction: redactSecrets(summary.nextAction)
+          .replace(/[\r\n\t]+/g, " ")
+          .trim()
+          .slice(0, 240),
+        nextActionAt: summary.nextActionAt,
+        owner: summary.owner,
+        repository: summary.repository,
+        task: summary.task,
+        preservedWork: summary.preservedWork.map((value) => redactSecrets(value).slice(0, 240)).slice(0, 8),
       });
     } catch {
       // UI listeners are observers, never participants in mission execution.
@@ -524,8 +604,12 @@ export class EngineeringRuntime {
     this.broker = null;
     this.git = null;
     this.missionStore = null;
+    this.missionOwnership = null;
+    this.missionSupervisor = null;
     this.orchestrator = null;
     this.missionObservability = null;
+    this.repositoryRegistry = new RepositoryRegistry();
+    this.coreTools = [];
     // Resolve the time-based gateway resilience config from environment.
     this.resilience = resolveGatewayResilienceConfig();
   }
@@ -536,7 +620,11 @@ export class EngineeringRuntime {
     const workDir = opts.workDir ?? join(repoRoot, ".pi-eng");
     const openKey = `${resolve(repoRoot)}\0${resolve(workDir)}`;
     const existing = openingRuntimes.get(openKey);
-    if (existing) return existing;
+    if (existing) {
+      const runtime = await existing;
+      runtime.retainOpenReference();
+      return runtime;
+    }
     const opening = EngineeringRuntime.openResolved(opts, git, repoRoot, workDir);
     openingRuntimes.set(openKey, opening);
     try {
@@ -570,137 +658,477 @@ export class EngineeringRuntime {
     // JSONL backend is single-instance per process, so reuse an already-open
     // store for the same path (a second runtime must not open the same file).
     const orchestrationPath = join(workDir, "orchestration.jsonl");
-    let orchestrationBackend = openedOrchestrationStores.get(orchestrationPath);
-    if (!orchestrationBackend) {
-      orchestrationBackend = await JsonlEventStore.open(orchestrationPath);
-      openedOrchestrationStores.set(orchestrationPath, orchestrationBackend);
-    }
-    rt.missionStore = openedMissionStores.get(orchestrationPath) ?? MissionStore.open(orchestrationBackend);
-    openedMissionStores.set(orchestrationPath, rt.missionStore);
-    // Mission observability shares the SAME durable event store as the mission
-    // controller: its `mission.obs.*` events are ignored by MissionStore replay
-    // and replayed by the observability service, so progress/activity/workers/
-    // tests/review survive restart/reconnect (spec 01/05). Communication gate
-    // is always open — the update emitter never suppresses ordinary Pi output.
-    rt.missionObservability = openedMissionObservability.get(orchestrationPath) ?? null;
-    if (!rt.missionObservability) {
-      rt.missionObservability = MissionObservability.open({
-        backend: orchestrationBackend,
-        store: rt.missionStore,
-        onUpdate: opts.onMissionObservabilityUpdate,
-        onChange: (missionId) => {
-          void rt.publishMissionSnapshot();
-          rt.emitMissionActivity(missionId);
-        },
-      });
-      openedMissionObservability.set(orchestrationPath, rt.missionObservability);
-    }
-    // Route orchestration worker roles through the capability router so per-role
-    // model placement (policy.routing.roles, e.g. a pinned implementer/reviewer)
-    // is honored by the mission pipeline, matching the lifecycle roleRunner
-    // path. Degrades to the worker's construction-time default model when the
-    // router cannot be built, so core never requires discovery or network.
-    let routeModel:
-      | ((role: WorkerRequest["role"]) => Promise<{ provider: string; id: string } | undefined>)
-      | undefined;
-    let reviewFallbackModel = opts.model ? { provider: opts.model.provider, id: opts.model.id } : undefined;
     try {
-      const { createRoleRouter } = await import("../capability/adapter.ts");
-      const { isRoleName } = await import("../capability/roles.ts");
-      const sharedRuntime = rt.worker instanceof PiWorkerExecutor ? await rt.worker.getModelRuntime() : undefined;
-      if (!reviewFallbackModel && sharedRuntime) {
-        const available = (await sharedRuntime.getAvailable())[0];
-        if (available) reviewFallbackModel = { provider: available.provider, id: available.id };
+      let orchestrationBackend = openedOrchestrationStores.get(orchestrationPath);
+      if (!orchestrationBackend) {
+        orchestrationBackend = await JsonlEventStore.open(orchestrationPath);
+        openedOrchestrationStores.set(orchestrationPath, orchestrationBackend);
       }
-      const routerAdapter = await createRoleRouter({
-        cwd: repoRoot,
-        agentDir: opts.agentDir,
-        modelRuntime: sharedRuntime,
-        allowModelNetwork: false,
+      openedOrchestrationStoreReferences.set(
+        orchestrationPath,
+        (openedOrchestrationStoreReferences.get(orchestrationPath) ?? 0) + 1,
+      );
+      rt.orchestrationPath = orchestrationPath;
+      rt.missionStore = openedMissionStores.get(orchestrationPath) ?? MissionStore.open(orchestrationBackend);
+      openedMissionStores.set(orchestrationPath, rt.missionStore);
+      rt.missionOwnership = new MissionOwnership(rt.missionStore, {
+        ownerId: `runtime-${process.pid}-${randomUUID()}`,
       });
-      routeModel = async (role) => {
-        if (!isRoleName(role)) return undefined;
-        try {
-          return await routerAdapter.route(role, reviewFallbackModel ? { requester: reviewFallbackModel } : undefined);
-        } catch {
-          return undefined;
+      for (const mission of rt.missionStore.listMissions()) {
+        const manifest = rt.missionStore.getWorkspaceManifest(mission.mission_id);
+        if (manifest) await rt.repositoryRegistry.register(manifest);
+      }
+      // Mission observability shares the SAME durable event store as the mission
+      // controller: its `mission.obs.*` events are ignored by MissionStore replay
+      // and replayed by the observability service, so progress/activity/workers/
+      // tests/review survive restart/reconnect (spec 01/05). Communication gate
+      // is always open — the update emitter never suppresses ordinary Pi output.
+      rt.missionObservability = openedMissionObservability.get(orchestrationPath) ?? null;
+      if (!rt.missionObservability) {
+        rt.missionObservability = MissionObservability.open({
+          backend: orchestrationBackend,
+          store: rt.missionStore,
+          onUpdate: opts.onMissionObservabilityUpdate,
+          onChange: (missionId) => {
+            void rt.publishMissionSnapshot();
+            rt.emitMissionActivity(missionId);
+          },
+        });
+        openedMissionObservability.set(orchestrationPath, rt.missionObservability);
+      }
+      // Route orchestration worker roles through the capability router so per-role
+      // model placement (policy.routing.roles, e.g. a pinned implementer/reviewer)
+      // is honored by the mission pipeline, matching the lifecycle roleRunner
+      // path. Degrades to the worker's construction-time default model when the
+      // router cannot be built, so core never requires discovery or network.
+      let routeModel: ((role: WorkerRequest["role"]) => Promise<ModelRoute | undefined>) | undefined;
+      let reviewFallbackModel = opts.model ? { provider: opts.model.provider, id: opts.model.id } : undefined;
+      try {
+        const { createRoleRouter } = await import("../capability/adapter.ts");
+        const { isRoleName } = await import("../capability/roles.ts");
+        const sharedRuntime = rt.worker instanceof PiWorkerExecutor ? await rt.worker.getModelRuntime() : undefined;
+        if (!reviewFallbackModel && sharedRuntime) {
+          const available = (await sharedRuntime.getAvailable())[0];
+          if (available) reviewFallbackModel = { provider: available.provider, id: available.id };
         }
-      };
-    } catch {
-      routeModel = undefined;
-    }
-    const backends = realBackends({
-      worker: rt.worker,
-      verifier: rt.verifier,
-      artifacts: rt.artifacts,
-      git: rt.git,
-      cwd: repoRoot,
-      routeModel,
-      reviewFallbackModel,
-    });
-    // The default plan honours the routed workflow class. A research or
-    // investigation mission MUST NOT get a repo-mutating worker: mutation is
-    // derived from the workflow, never assumed. (Dogfood caught the planner
-    // hardcoding mutates_repo:true, which let a read-only "why is this failing?"
-    // request write to the repository.)
-    const defaultPlanner: NonNullable<typeof opts.orchestrationPlanner> = async (mission) => {
-      const mutates = workflowMutatesRepo(mission.workflow_class);
-      return [
-        {
-          kind: "agent",
-          role: mutates ? "implementer" : "investigator",
-          objective: mission.goal,
-          mutates_repo: mutates,
-          write_domains: mutates ? ["**"] : [],
-          isolation: mutates ? "worktree" : "none",
-          depends_on: [],
-          priority: 0,
-          execution_requirements: {},
-          max_attempts: 3,
-          failure_policy: "retry",
+        const routerAdapter = await createRoleRouter({
+          cwd: repoRoot,
+          agentDir: opts.agentDir,
+          modelRuntime: sharedRuntime,
+          allowModelNetwork: false,
+        });
+        routeModel = async (role) => {
+          if (!isRoleName(role)) return undefined;
+          try {
+            const routed = await routerAdapter.route(
+              role,
+              reviewFallbackModel ? { requester: reviewFallbackModel } : undefined,
+            );
+            if (
+              role === "reviewer" &&
+              routed &&
+              reviewFallbackModel &&
+              routed.provider === reviewFallbackModel.provider &&
+              routed.id === reviewFallbackModel.id
+            ) {
+              return {
+                ...routed,
+                warning: `Warning: no distinct reviewer model is available; reviewing with ${routed.provider}/${routed.id} in a fresh session with reduced independence.`,
+              };
+            }
+            return routed;
+          } catch {
+            return undefined;
+          }
+        };
+      } catch {
+        routeModel = undefined;
+      }
+      const backends = realBackends({
+        worker: rt.worker,
+        verifier: rt.verifier,
+        artifacts: rt.artifacts,
+        git: rt.git,
+        cwd: repoRoot,
+        routeModel,
+        reviewFallbackModel,
+        repository: async (repoId) => {
+          if (repoId) {
+            const context = await rt.repositoryRegistry.resolveActiveForExecution(repoId);
+            return { git: context.git, cwd: context.root };
+          }
+          if (!rt.git) throw new Error(`No legacy Git repository is bound for ${repoRoot}`);
+          return { git: rt.git, cwd: repoRoot };
         },
-      ];
-    };
-    rt.orchestrator = new Orchestrator({
-      store: rt.missionStore,
-      backends,
-      observability: rt.missionObservability,
-      planner: opts.orchestrationPlanner ?? defaultPlanner,
-      parentSessionId: null,
-      git: rt.git,
-      baseRef: rt.git ? await rt.git.headCommit() : "",
-      // Mission-level gateway resilience: a worker transient-infra failure retries
-      // within the (env-resolved) time-based window, parking the mission in a
-      // WAITING state, and pauses (not fails) on exhaustion. When an operator sets
-      // PI_GATEWAY_HEALTH_URL, a real HTTP recovery probe is used so recovery is
-      // detected without burning a full worker session; otherwise the scheduler's
-      // pass-through probe applies.
-      resilience: rt.resilience,
-      probe: buildGatewayRecoveryProbe(rt.worker, routeModel),
-      onPhase: (mission, phase) => {
-        const mapped: RuntimePhaseEvent["phase"] =
-          phase === "complete" ? "settled" : phase === "classified" ? "scout" : "implement";
-        rt.emitPhase({ workItemId: mission.mission_id, goal: mission.goal, phase: mapped });
-        // Keep the PI WEB mission snapshot fresh as missions progress.
-        void rt.publishMissionSnapshot();
-      },
+      });
+      // The default plan honours the routed workflow class. A research or
+      // investigation mission MUST NOT get a repo-mutating worker: mutation is
+      // derived from the workflow, never assumed. (Dogfood caught the planner
+      // hardcoding mutates_repo:true, which let a read-only "why is this failing?"
+      // request write to the repository.)
+      const defaultPlanner: NonNullable<typeof opts.orchestrationPlanner> = async (mission) => {
+        const mutates = workflowMutatesRepo(mission.workflow_class);
+        const acceptanceIds = mission.acceptance_criteria.flatMap((criterion) =>
+          criterion.acceptance_id ? [criterion.acceptance_id] : [],
+        );
+        return [
+          {
+            kind: "agent",
+            role: mutates ? "implementer" : "investigator",
+            objective: mission.goal,
+            mutates_repo: mutates,
+            write_domains: mutates ? ["**"] : [],
+            isolation: mutates ? "worktree" : "none",
+            depends_on: [],
+            priority: 0,
+            execution_requirements: {},
+            acceptance_ids: acceptanceIds,
+            deliverables: mutates ? ["implementation", "targeted-tests"] : ["investigation-report"],
+            execution_budget_ms: 30 * 60_000,
+            checkpoint_policy: { activity_milestone: 5, before_deadline_ms: 30_000 },
+            max_attempts: 3,
+            failure_policy: "retry",
+          },
+        ];
+      };
+      rt.orchestrator = new Orchestrator({
+        store: rt.missionStore,
+        backends,
+        observability: rt.missionObservability,
+        planner: opts.orchestrationPlanner ?? defaultPlanner,
+        parentSessionId: null,
+        git: rt.git,
+        artifacts: rt.artifacts,
+        baseRef: rt.git ? await rt.git.headCommit() : "",
+        workspaceResolver: new WorkspaceManifestResolver(),
+        repositoryRegistry: rt.repositoryRegistry,
+        launchCwd: opts.cwd,
+        ownership: rt.missionOwnership,
+        // Mission-level gateway resilience: a worker transient-infra failure retries
+        // within the (env-resolved) time-based window, parking the mission in a
+        // WAITING state, and pauses (not fails) on exhaustion. When an operator sets
+        // PI_GATEWAY_HEALTH_URL, a real HTTP recovery probe is used so recovery is
+        // detected without burning a full worker session; otherwise the scheduler's
+        // pass-through probe applies.
+        resilience: rt.resilience,
+        probe: buildGatewayRecoveryProbe(rt.worker, routeModel),
+        onPhase: (mission, phase) => {
+          const mapped: RuntimePhaseEvent["phase"] =
+            phase === "complete" ? "settled" : phase === "classified" ? "scout" : "implement";
+          rt.emitPhase({ workItemId: mission.mission_id, goal: mission.goal, phase: mapped });
+          // Keep the PI WEB mission snapshot fresh as missions progress.
+          void rt.publishMissionSnapshot();
+        },
+      });
+      if (opts.blackhole) rt.blackhole = await BlackholeManager.open({ ...opts.blackhole, ledger: rt.ledger });
+      // Bind the semantic tools (ledger_read, repo_search, ...) to THIS runtime so
+      // worker sessions get the tools their prompts require and always address the
+      // shared ledger/broker regardless of their cwd (a candidate worktree must not
+      // open a separate empty ledger).
+      const tools = buildCoreTools(async (cwd) => {
+        const context = await rt.repositoryRegistry.resolve(cwd);
+        return {
+          ledger: rt.ledger,
+          artifacts: rt.artifacts,
+          broker: context?.contextBroker ?? rt.broker,
+          currentWorkItemId: () => rt.ledger.listWorkItems().at(-1)?.id ?? null,
+          actor: () => ({ type: "system" }),
+          orchestrator: rt.orchestrator,
+          baseRef: async () => (context ? context.git.headCommit() : (rt.git?.headCommit() ?? "")),
+          repoId: context?.repoId,
+          repositoryRoot: context?.root,
+        };
+      });
+      rt.coreTools = tools;
+      if (rt.worker instanceof PiWorkerExecutor) rt.worker.setCustomTools(tools);
+      // A distinct reviewer worker also needs the shared-ledger tools bound.
+      if (rt.reviewerWorker instanceof PiWorkerExecutor) rt.reviewerWorker.setCustomTools(tools);
+      // Supervision is the final initialized service: reconciliation can
+      // dispatch repair workers, so every fallible backend and every semantic
+      // tool binding must already be ready. The same consumer handles startup,
+      // explicit ticks, and interval ticks.
+      rt.missionSupervisor = new MissionSupervisor({
+        store: rt.missionStore,
+        observability: rt.missionObservability,
+        onStatuses: (statuses) => rt.consumeSupervisorStatuses(statuses),
+      });
+      await rt.missionSupervisor.reconcileOnStartup();
+      rt.missionSupervisor.start();
+      return rt;
+    } catch (error) {
+      await rt.missionSupervisor?.shutdown();
+      EngineeringRuntime.releaseOrchestrationReference(orchestrationPath);
+      throw error;
+    }
+  }
+
+  /** Release this runtime's share of the orchestration writer lock. Idempotent. */
+  async close(): Promise<void> {
+    if (this.closed) return;
+    if (this.openReferences > 1) {
+      this.openReferences--;
+      if (this.orchestrationPath) EngineeringRuntime.releaseOrchestrationReference(this.orchestrationPath);
+      return;
+    }
+    const path = this.orchestrationPath;
+    try {
+      await this.missionSupervisor?.shutdown();
+      await this.missionStore?.flush();
+      await this.missionObservability?.flush();
+    } catch (error) {
+      // A failed flush has not completed shutdown. Keep the runtime and writer
+      // reference live so callers can retry without losing the only durable
+      // owner; supervision resumes because close did not succeed.
+      this.missionSupervisor?.start();
+      throw error;
+    }
+    if (path) EngineeringRuntime.releaseOrchestrationReference(path);
+    this.closed = true;
+    this.orchestrator = null;
+    this.missionSupervisor = null;
+    this.missionOwnership = null;
+    this.missionObservability = null;
+    this.missionStore = null;
+  }
+
+  /** Explicit, idempotent operator fallback for one durably stopped blocked mission. */
+  resumeBlockedMission(missionId: string, signal?: AbortSignal): Promise<import("../orchestration/types.ts").Mission> {
+    const active = this.missionResumeFlights.get(missionId);
+    if (active) return active;
+    const flight = this.performBlockedMissionResume(missionId, signal).finally(() => {
+      if (this.missionResumeFlights.get(missionId) === flight) this.missionResumeFlights.delete(missionId);
     });
-    if (opts.blackhole) rt.blackhole = await BlackholeManager.open({ ...opts.blackhole, ledger: rt.ledger });
-    // Bind the semantic tools (ledger_read, repo_search, ...) to THIS runtime so
-    // worker sessions get the tools their prompts require and always address the
-    // shared ledger/broker regardless of their cwd (a candidate worktree must not
-    // open a separate empty ledger).
-    const tools = buildCoreTools(() => ({
-      ledger: rt.ledger,
-      artifacts: rt.artifacts,
-      broker: rt.broker,
-      currentWorkItemId: () => rt.ledger.listWorkItems().at(-1)?.id ?? null,
-      actor: () => ({ type: "system" }),
-    }));
-    if (rt.worker instanceof PiWorkerExecutor) rt.worker.setCustomTools(tools);
-    // A distinct reviewer worker also needs the shared-ledger tools bound.
-    if (rt.reviewerWorker instanceof PiWorkerExecutor) rt.reviewerWorker.setCustomTools(tools);
-    return rt;
+    this.missionResumeFlights.set(missionId, flight);
+    return flight;
+  }
+
+  private async performBlockedMissionResume(
+    missionId: string,
+    signal?: AbortSignal,
+  ): Promise<import("../orchestration/types.ts").Mission> {
+    if (!this.missionStore || !this.orchestrator) throw new Error("Orchestrator not initialized for this directory.");
+    let mission = this.missionStore.getMission(missionId);
+    if (!mission) throw new Error(`unknown mission ${missionId}`);
+    if (["COMPLETE", "FAILED", "CANCELED"].includes(mission.status)) {
+      throw new Error(`mission ${missionId} is terminal (${mission.status}) and cannot be resumed`);
+    }
+    const generation = this.missionStore.listMissionResumptions(missionId).at(-1)?.generation ?? 0;
+    const stop = this.missionStore
+      .listMissionStops(missionId)
+      .filter((candidate) => candidate.resumptionGeneration === generation)
+      .at(-1);
+    if (!stop) throw new Error(`mission ${missionId} has no current durable stop to resume`);
+    mission = await this.normalizeMissionForRepair(missionId);
+    this.missionStore.resumeMission(missionId, "operator requested mission recovery");
+    await this.missionStore.flush();
+    try {
+      await this.orchestrator.repairBlockedMission(missionId, signal);
+    } catch (error) {
+      await this.persistRecoveryStop(missionId, `Manual recovery failed: ${errorMessage(error)}`, stop);
+      throw error;
+    }
+    mission = this.missionStore.getMission(missionId)!;
+    if ((mission.status === "BLOCKED" || mission.status === "REPAIRING") && !this.currentMissionStop(missionId)) {
+      await this.persistRecoveryStop(missionId, `Recovery did not produce material progress: ${stop.reason}`, stop);
+    }
+    return this.missionStore.getMission(missionId)!;
+  }
+
+  private async consumeSupervisorStatuses(statuses: SupervisorStatus[]): Promise<void> {
+    if (!this.missionStore || !this.orchestrator) return;
+    for (const status of statuses) {
+      await this.consumeSupervisorStatus(status);
+    }
+  }
+
+  private consumeSupervisorStatus(status: SupervisorStatus): Promise<void> {
+    const key = [
+      status.missionId,
+      status.missionRevision,
+      status.missionStatus,
+      status.missionBlockedEpisodeId ?? "",
+      status.resumptionGeneration,
+    ].join(":");
+    const active = this.supervisorSettlementFlights.get(key);
+    if (active) return active;
+    const flight = this.settleSupervisorStatus(status).finally(() => {
+      if (this.supervisorSettlementFlights.get(key) === flight) this.supervisorSettlementFlights.delete(key);
+    });
+    this.supervisorSettlementFlights.set(key, flight);
+    return flight;
+  }
+
+  private async settleSupervisorStatus(status: SupervisorStatus): Promise<void> {
+    if (!this.missionStore || !this.orchestrator) return;
+    let failureFence: Mission | null = null;
+    try {
+      const mission = this.missionStore.getMission(status.missionId);
+      if (!mission || !this.isCurrentSupervisorStatus(status, mission)) return;
+      failureFence = mission;
+      if (mission.status === "PAUSED_INFRASTRUCTURE") {
+        if (status.action === "STOP" || status.action === "MONITOR") return;
+        if (status.action !== "FENCE_RECONCILE_AND_RESUME") {
+          throw new Error(`invalid worker output: unsupported supervisor action ${status.action}`);
+        }
+        const resumed = await this.orchestrator.resume(status.missionId);
+        if (resumed.status === "PAUSED_INFRASTRUCTURE") {
+          await this.persistRecoveryStop(
+            status.missionId,
+            `Automatic recovery ${status.action} is waiting for a healthy infrastructure probe: ${status.reason}`,
+            {
+              attemptedRecoveries: status.decision ? [status.decision.recoveryId] : [],
+              preservedWork: status.preservedWork,
+              resumeCondition: status.nextAction,
+            },
+            status.resumptionGeneration,
+            failureFence,
+          );
+        }
+        return;
+      }
+      if (status.decision && status.action !== "STOP") {
+        if (status.action !== status.decision.action || !SUPPORTED_SUPERVISOR_REPAIR_ACTIONS.has(status.action)) {
+          throw new Error(`invalid worker output: unsupported supervisor action ${status.action}`);
+        }
+        failureFence = await this.normalizeMissionForRepair(status.missionId);
+        await this.orchestrator.repairBlockedMission(status.missionId);
+      } else if (status.health !== "HEALTHY" && status.action !== "STOP") {
+        throw new Error(`invalid worker output: unsupported supervisor action ${status.action}`);
+      }
+    } catch (error) {
+      await this.persistSupervisorFailure(status, error, failureFence);
+    } finally {
+      await this.publishMissionSnapshot();
+      this.emitMissionActivity(status.missionId);
+    }
+  }
+
+  private isCurrentSupervisorStatus(status: SupervisorStatus, mission: Mission): boolean {
+    if (["COMPLETE", "FAILED", "CANCELED"].includes(mission.status)) return false;
+    const generation = this.missionStore?.listMissionResumptions(status.missionId).at(-1)?.generation ?? 0;
+    return (
+      generation === status.resumptionGeneration &&
+      mission.status === status.missionStatus &&
+      mission.revision === status.missionRevision &&
+      (mission.blocked_episode_id ?? null) === status.missionBlockedEpisodeId
+    );
+  }
+
+  private async normalizeMissionForRepair(missionId: string): Promise<Mission> {
+    if (!this.missionStore) throw new Error("Mission store is not initialized");
+    let mission = this.missionStore.getMission(missionId);
+    if (!mission) throw new Error(`unknown mission ${missionId}`);
+    if (["COMPLETE", "FAILED", "CANCELED"].includes(mission.status)) {
+      throw new Error(`mission ${missionId} is terminal (${mission.status}) and cannot enter repair`);
+    }
+    if (mission.status === "REPAIRING" || mission.status === "BLOCKED") return mission;
+    if (mission.status === "NEW") mission = this.missionStore.transitionMission(missionId, "CLASSIFYING");
+    if (!canTransitionMission(mission.status, "BLOCKED")) {
+      throw new Error(`mission ${missionId} cannot normalize ${mission.status} into a repairable BLOCKED episode`);
+    }
+    mission = this.missionStore.transitionMission(missionId, "BLOCKED");
+    await this.missionStore.flush();
+    return mission;
+  }
+
+  private async persistSupervisorFailure(
+    status: SupervisorStatus,
+    error: unknown,
+    failureFence: Mission | null,
+  ): Promise<void> {
+    if (!this.missionStore) throw error;
+    const mission = this.missionStore.getMission(status.missionId);
+    const generation = this.missionStore.listMissionResumptions(status.missionId).at(-1)?.generation ?? 0;
+    if (!mission || ["COMPLETE", "FAILED", "CANCELED"].includes(mission.status)) return;
+    if (generation !== status.resumptionGeneration) return;
+    if (!failureFence) return;
+    const exactFence =
+      mission.status === failureFence.status &&
+      mission.revision === failureFence.revision &&
+      mission.blocked_episode_id === failureFence.blocked_episode_id;
+    const enteredFencedRepair =
+      failureFence.status === "BLOCKED" &&
+      mission.status === "REPAIRING" &&
+      mission.blocked_episode_id === failureFence.blocked_episode_id;
+    if (!exactFence && !enteredFencedRepair) return;
+    const reason = `Automatic recovery ${status.action} failed: ${errorMessage(error)}`;
+    const classification = new FailureClassifier().classify({
+      missionId: status.missionId,
+      taskId: status.task,
+      summary: reason,
+      observedAt: new Date().toISOString(),
+    });
+    if (
+      !this.missionStore
+        .listFailureClassifications(status.missionId)
+        .some((item) => item.fingerprint === classification.fingerprint)
+    ) {
+      this.missionStore.classifyFailure(classification);
+    }
+    await this.persistRecoveryStop(
+      status.missionId,
+      reason,
+      {
+        attemptedRecoveries: status.decision ? [status.decision.recoveryId] : [],
+        preservedWork: status.preservedWork,
+        resumeCondition: status.nextAction,
+      },
+      status.resumptionGeneration,
+    );
+  }
+
+  private async persistRecoveryStop(
+    missionId: string,
+    reason: string,
+    source: Pick<MissionStop, "attemptedRecoveries" | "preservedWork" | "resumeCondition">,
+    expectedResumptionGeneration?: number,
+    expectedMission?: Mission,
+  ): Promise<void> {
+    if (!this.missionStore) throw new Error("Mission store is not initialized");
+    const mission = this.missionStore.getMission(missionId);
+    if (!mission || ["COMPLETE", "FAILED", "CANCELED"].includes(mission.status)) return;
+    const currentGeneration = this.missionStore.listMissionResumptions(missionId).at(-1)?.generation ?? 0;
+    if (expectedResumptionGeneration !== undefined && currentGeneration !== expectedResumptionGeneration) return;
+    const decisions = this.missionStore.listRecoveryDecisions(missionId).map((decision) => decision.recoveryId);
+    const fence = expectedMission ?? mission;
+    await this.missionStore.stopMissionIfCurrent(
+      missionId,
+      {
+        reason,
+        attemptedRecoveries: [...new Set([...source.attemptedRecoveries, ...decisions])],
+        preservedWork: [...source.preservedWork],
+        resumeCondition: source.resumeCondition,
+      },
+      {
+        revision: fence.revision,
+        status: fence.status,
+        resumptionGeneration: expectedResumptionGeneration ?? currentGeneration,
+        blockedEpisodeId: fence.blocked_episode_id ?? null,
+      },
+    );
+    await this.missionStore.flush();
+  }
+
+  private retainOpenReference(): void {
+    if (this.closed || !this.orchestrationPath) throw new Error("cannot retain a closed EngineeringRuntime");
+    this.openReferences++;
+    openedOrchestrationStoreReferences.set(
+      this.orchestrationPath,
+      (openedOrchestrationStoreReferences.get(this.orchestrationPath) ?? 0) + 1,
+    );
+  }
+
+  private static releaseOrchestrationReference(path: string): void {
+    const references = (openedOrchestrationStoreReferences.get(path) ?? 1) - 1;
+    if (references > 0) {
+      openedOrchestrationStoreReferences.set(path, references);
+      return;
+    }
+    openedOrchestrationStoreReferences.delete(path);
+    openedMissionObservability.delete(path);
+    openedMissionStores.delete(path);
+    openedOrchestrationStores.get(path)?.close();
+    openedOrchestrationStores.delete(path);
   }
 
   actor(runId: string, role?: WorkerRole): Actor {

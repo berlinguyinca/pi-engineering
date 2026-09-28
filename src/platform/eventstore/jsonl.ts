@@ -22,16 +22,18 @@
  *    domain calls produced two different durable histories depending only on
  *    whether the write had been awaited.
  *
- * This backend remains SINGLE-PROCESS. Two instances over one file do not see
- * each other's appends — there is no lock and no re-read — which is why
- * `open()` refuses a file another live instance already holds.
+ * This backend remains single-writer. A local-filesystem process lock prevents
+ * distinct runtimes from opening the same file concurrently; the in-process
+ * registry provides the same protection before a second lock attempt.
  */
 
 import { randomUUID } from "node:crypto";
+import { appendFileSync } from "node:fs";
 import { appendFile, mkdir, readFile, rename, truncate, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { emitTelemetry } from "../../telemetry/sink.ts";
 import type { EventStoreBackend, StoredEvent } from "./backend.ts";
+import { ExclusiveFileLock, type FileLockRecoveryHooks } from "./fileLock.ts";
 
 /** Files held by a live instance in this process, so two cannot diverge silently. */
 const openFiles = new Set<string>();
@@ -43,6 +45,8 @@ export class JsonlEventStore implements EventStoreBackend {
   /** Serializes concurrent appends so writes + in-memory state stay ordered. */
   private appendChain: Promise<void> = Promise.resolve();
   private readonly memoryOnly: boolean;
+  private writerLock: ExclusiveFileLock | null = null;
+  private pendingAppends = 0;
   private closed = false;
 
   private constructor(file: string, memoryOnly: boolean) {
@@ -50,7 +54,7 @@ export class JsonlEventStore implements EventStoreBackend {
     this.memoryOnly = memoryOnly;
   }
 
-  static async open(file: string): Promise<JsonlEventStore> {
+  static async open(file: string, lockHooks: FileLockRecoveryHooks = {}): Promise<JsonlEventStore> {
     // Two instances over one file each hold their own array and never re-read,
     // so each reports a silently partial history — and every consumer built on
     // `all()` (the control plane's feed, a rebuild, a health rollup) inherits
@@ -62,9 +66,16 @@ export class JsonlEventStore implements EventStoreBackend {
       );
     }
     const store = new JsonlEventStore(file, false);
-    await store.load();
-    openFiles.add(file);
-    return store;
+    store.writerLock = await ExclusiveFileLock.acquire(file, lockHooks);
+    try {
+      await store.load();
+      openFiles.add(file);
+      return store;
+    } catch (error) {
+      store.writerLock.release();
+      store.writerLock = null;
+      throw error;
+    }
   }
 
   /** In-memory JSONL-shaped store (no persistence) for tests and ephemeral use. */
@@ -74,8 +85,14 @@ export class JsonlEventStore implements EventStoreBackend {
 
   /** Release the file so another instance may open it. */
   close(): void {
+    if (this.closed && this.writerLock === null) return;
     this.closed = true;
-    if (!this.memoryOnly) openFiles.delete(this.file);
+    if (this.pendingAppends === 0) this.releaseWriterLock();
+  }
+
+  /** True when this backend can prove it owns the local mutation boundary. */
+  ownsWriterLock(): boolean {
+    return this.memoryOnly || this.writerLock !== null;
   }
 
   private async load(): Promise<void> {
@@ -119,17 +136,48 @@ export class JsonlEventStore implements EventStoreBackend {
     // mutate the entity before the bytes were produced, so what history
     // recorded depended on when the write happened to drain.
     const line = `${JSON.stringify(event)}\n`;
-    const op = this.appendChain.then(async () => {
-      if (!this.memoryOnly) {
-        await mkdir(dirname(this.file), { recursive: true });
-        await appendFile(this.file, line, "utf-8");
-      }
-      this.events.push(event);
-      this.byId.set(event.event_id, event);
-    });
+    this.pendingAppends++;
+    const op = this.appendChain
+      .then(async () => {
+        if (!this.memoryOnly) {
+          await mkdir(dirname(this.file), { recursive: true });
+          await appendFile(this.file, line, "utf-8");
+        }
+        this.events.push(event);
+        this.byId.set(event.event_id, event);
+      })
+      .finally(() => this.appendSettled());
     this.appendChain = op.catch(() => {});
     await op;
     return event;
+  }
+
+  async appendConditionally(
+    event: StoredEvent,
+    condition: () => boolean,
+    onCommit?: () => void,
+  ): Promise<StoredEvent | undefined> {
+    if (this.closed) throw new Error("JsonlEventStore: append after close");
+    const line = `${JSON.stringify(event)}\n`;
+    this.pendingAppends++;
+    const op = this.appendChain
+      .then(async (): Promise<StoredEvent | undefined> => {
+        if (!this.memoryOnly) await mkdir(dirname(this.file), { recursive: true });
+        if (!condition()) return undefined;
+        // The predicate and commit intentionally do not yield. Mission authority
+        // changes synchronously, so none can interleave this critical section.
+        if (!this.memoryOnly) appendFileSync(this.file, line, "utf-8");
+        this.events.push(event);
+        this.byId.set(event.event_id, event);
+        onCommit?.();
+        return event;
+      })
+      .finally(() => this.appendSettled());
+    this.appendChain = op.then(
+      () => undefined,
+      () => undefined,
+    );
+    return await op;
   }
 
   /**
@@ -144,16 +192,19 @@ export class JsonlEventStore implements EventStoreBackend {
     if (this.closed) throw new Error("JsonlEventStore: appendAll after close");
     if (events.length === 0) return;
     const body = events.map((event) => `${JSON.stringify(event)}\n`).join("");
-    const op = this.appendChain.then(async () => {
-      if (!this.memoryOnly) {
-        await mkdir(dirname(this.file), { recursive: true });
-        await appendFile(this.file, body, "utf-8");
-      }
-      for (const event of events) {
-        this.events.push(event);
-        this.byId.set(event.event_id, event);
-      }
-    });
+    this.pendingAppends++;
+    const op = this.appendChain
+      .then(async () => {
+        if (!this.memoryOnly) {
+          await mkdir(dirname(this.file), { recursive: true });
+          await appendFile(this.file, body, "utf-8");
+        }
+        for (const event of events) {
+          this.events.push(event);
+          this.byId.set(event.event_id, event);
+        }
+      })
+      .finally(() => this.appendSettled());
     this.appendChain = op.catch(() => {});
     await op;
   }
@@ -168,6 +219,18 @@ export class JsonlEventStore implements EventStoreBackend {
 
   count(): number {
     return this.events.length;
+  }
+
+  private appendSettled(): void {
+    this.pendingAppends--;
+    if (this.closed && this.pendingAppends === 0) this.releaseWriterLock();
+  }
+
+  private releaseWriterLock(): void {
+    if (this.memoryOnly) return;
+    this.writerLock?.release();
+    this.writerLock = null;
+    openFiles.delete(this.file);
   }
 }
 

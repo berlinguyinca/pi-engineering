@@ -5,6 +5,7 @@
  */
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import type { GitRepo } from "../../src/git/GitRepo.ts";
 import type { BrokerBackends } from "../../src/orchestration/broker.ts";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
 import { Orchestrator } from "../../src/orchestration/orchestrator.ts";
@@ -33,13 +34,52 @@ function run(outageMs: number) {
             }
           : ok,
     },
-    validation: { runValidation: async () => ok },
-    review: { runReview: async () => ({ ...ok, findings: [] }) },
+    validation: {
+      runValidation: async () => ({
+        ...ok,
+        validationEvidence: {
+          command: "npm test",
+          profile: "test",
+          exitCode: 0,
+          testSummary: { passed: 1 },
+          noTargets: false,
+          accessible: true,
+          acceptanceResults: [],
+        },
+      }),
+    },
+    review: {
+      runReview: async ({ acceptanceCriteria }) => ({
+        ...ok,
+        findings: [],
+        reviewEvidence: {
+          reviewerSessionId: "review-long-outage",
+          model: "test",
+          provider: "test",
+          verdict: "approve",
+          independenceMode: "independent",
+          findings: [],
+          outputValid: true,
+          accessible: true,
+          acceptanceResults: (acceptanceCriteria ?? []).map((criterion) => ({
+            acceptanceId: criterion.acceptanceId,
+            status: "passed" as const,
+            detail: "checked",
+          })),
+        },
+      }),
+    },
   };
   const orchestrator = new Orchestrator({
     store,
     backends,
-    planner: async () => [
+    git: {
+      root: process.cwd(),
+      headCommit: async () => "candidate-test-sha",
+      captureDiff: async () => "diff --git a/src/health.ts b/src/health.ts",
+      changedFiles: async () => ["src/health.ts"],
+    } as unknown as GitRepo,
+    planner: async (mission) => [
       {
         kind: "agent" as const,
         role: "implementer",
@@ -52,6 +92,9 @@ function run(outageMs: number) {
         depends_on: [],
         priority: 0,
         execution_requirements: {},
+        acceptance_ids: mission.acceptance_criteria.flatMap((criterion) =>
+          criterion.acceptance_id ? [criterion.acceptance_id] : [],
+        ),
         max_attempts: 3,
         failure_policy: "retry" as const,
       },
