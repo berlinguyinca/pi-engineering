@@ -53,10 +53,16 @@ import { type PanelLayout, type PanelLayoutPatch, PanelLayoutStore } from "../sr
 import { Narrator } from "../src/panel/narrator/Narrator.ts";
 import { createSummarize } from "../src/panel/narrator/summarize.ts";
 import { PanelRefreshLoop } from "../src/panel/refreshLoop.ts";
+import { redactSecrets } from "../src/platform/redact.ts";
 import { resolveRequestBodyBudgetConfig } from "../src/request/bodyBudget.ts";
 import { resolveThinkingOffConfig } from "../src/request/thinkingPolicy.ts";
 import { RoadmapEngine } from "../src/roadmap/RoadmapEngine.ts";
 import { EngineeringRuntime, type RuntimeMissionActivityEvent } from "../src/runtime/EngineeringRuntime.ts";
+import {
+  type MissionBrief,
+  type SessionControlServer,
+  startSessionControl,
+} from "../src/sessionControl/SessionControl.ts";
 import { resolveStatusBarConfig } from "../src/status/config.ts";
 import { FooterController } from "../src/status/footer.ts";
 import { renderStatus } from "../src/status/layout.ts";
@@ -495,6 +501,65 @@ function formatEntities(rt: EngineeringRuntime, kind?: string): string {
 
 export default function (pi: ExtensionAPI) {
   registerInteractiveMemory(pi);
+  // One control socket per live PI session. The socket answers directly while
+  // a mission tool is awaiting a worker; another PI process never opens this
+  // session's transcript or writes its event store to ask for status.
+  let activeControl: SessionControlServer | null = null;
+  if (typeof pi.on === "function") {
+    pi.on("session_start", async (_event, ctx) => {
+      await activeControl?.close();
+      activeControl = null;
+      const sessionId = ctx.sessionManager?.getSessionId?.();
+      if (!sessionId) return;
+      try {
+        activeControl = await startSessionControl({
+          cwd: ctx.cwd,
+          sessionId,
+          onNote: (note) => ctx.ui.notify(`[PI session note] ${redactSecrets(note)}`, "info"),
+          getMissions: async (missionIds) => {
+            const runtime = await getRuntimeByCwd(ctx.cwd).catch(() => null);
+            if (!runtime?.missionStore) return null;
+            return missionIds.flatMap((id): MissionBrief[] => {
+              const mission = runtime.missionStore?.getMission(id);
+              if (!mission) return [];
+              const tasks = runtime.missionStore!.listTasks(id);
+              const summary = runtime.missionObservability?.summary(id);
+              const failedTask = tasks.filter((task) => task.status === "FAILED").at(-1);
+              const reason = failedTask?.failure_reason ?? mission.failure_reason;
+              return [
+                {
+                  id,
+                  status: mission.status,
+                  health: summary?.health ?? null,
+                  lastHeartbeatAt: summary?.lastHeartbeatAt ?? null,
+                  lastMeaningfulProgressAt: summary?.lastMeaningfulProgressAt ?? null,
+                  tasks: tasks.slice(-40).map((task) => ({ id: task.task_id, status: task.status })),
+                  lastError: reason ? redactSecrets(reason).slice(0, 200) : null,
+                },
+              ];
+            });
+          },
+        });
+      } catch (error) {
+        ctx.ui.notify(
+          `Session status socket unavailable: ${error instanceof Error ? error.message : "unknown error"}`,
+          "warning",
+        );
+      }
+    });
+    pi.on("tool_execution_start", (event) => activeControl?.toolStarted(event.toolName, event.toolCallId));
+    pi.on("tool_execution_update", (event) => {
+      const content = event.toolName === "mission" ? event.partialResult?.content : null;
+      const progress = Array.isArray(content) && typeof content[0]?.text === "string" ? content[0].text : undefined;
+      activeControl?.toolUpdated(event.toolName, progress, event.toolCallId);
+    });
+    pi.on("tool_execution_end", (event) => activeControl?.toolEnded(event.toolName, event.toolCallId));
+    pi.on("session_shutdown", async () => {
+      const previous = activeControl;
+      activeControl = null;
+      await previous?.close();
+    });
+  }
   // Semantic tools resolved against the runtime for the calling cwd.
   for (const tool of buildCoreTools(resolveServices)) {
     pi.registerTool(tool);
@@ -1645,6 +1710,7 @@ ${RECOVERY_PROMPT}`;
           return;
         }
         try {
+          activeControl?.missionProgress(`[mission ${missionId}] resuming`);
           await rt.resumeBlockedMission(missionId, ctx.signal);
           const mission = rt.missionStore?.getMission(missionId);
           if (!mission) throw new Error(`unknown mission ${missionId}`);
@@ -1671,6 +1737,7 @@ ${RECOVERY_PROMPT}`;
           // task settlements can fire within the same tick).
           if (line === lastLine) return;
           lastLine = line;
+          activeControl?.missionProgress(line);
           ctx.ui.notify(line, "info");
         },
       });
