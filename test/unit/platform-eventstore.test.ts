@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { rmSync, writeFileSync } from "node:fs";
+import { lstatSync, rmSync, writeFileSync } from "node:fs";
 import { appendFile, mkdir, mkdtemp, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { hostname, tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { describe, it } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { EventStore } from "../../src/ledger/EventStore.ts";
@@ -118,6 +118,15 @@ function deferred(): { promise: Promise<void>; resolve: () => void } {
     resolve = done;
   });
   return { promise, resolve };
+}
+
+function replaceImmediately(path: string, bytes: string): void {
+  const originalInode = lstatSync(path).ino;
+  for (let attempt = 0; attempt < 256; attempt += 1) {
+    rmSync(path, { force: true });
+    writeFileSync(path, bytes, "utf8");
+    if (lstatSync(path).ino === originalInode) return;
+  }
 }
 
 function startRacingOwner(file: string) {
@@ -499,12 +508,8 @@ describe("EventStore backends", () => {
         ExclusiveFileLock.acquire(file, {
           afterRecoveryClaimPublished: async (claimPath, owner) => {
             replacementPath = claimPath;
-            rmSync(claimPath, { force: true });
-            for (let index = 0; index < 16; index += 1) {
-              writeFileSync(join(dirname(claimPath), `release-claim-inode-reservation-${index}`), "reserved", "utf8");
-            }
             replacement = `${JSON.stringify(owner)}\n`;
-            writeFileSync(claimPath, replacement, "utf8");
+            replaceImmediately(claimPath, replacement);
           },
         }),
       /recovery claim identity changed/i,
@@ -525,12 +530,8 @@ describe("EventStore backends", () => {
       () =>
         ExclusiveFileLock.acquire(file, {
           afterRecoveryClaimTombstonePublished: async (claimPath, _tombstone, claimant) => {
-            rmSync(claimPath, { force: true });
-            for (let index = 0; index < 16; index += 1) {
-              writeFileSync(join(dirname(claimPath), `reap-claim-inode-reservation-${index}`), "reserved", "utf8");
-            }
             replacement = `${JSON.stringify(claimant)}\n`;
-            writeFileSync(claimPath, replacement, "utf8");
+            replaceImmediately(claimPath, replacement);
           },
         }),
       /recovery claim identity changed/i,
@@ -561,11 +562,7 @@ describe("EventStore backends", () => {
         ExclusiveFileLock.acquire(file, {
           beforeStaleOwnerQuarantine: (lockPath, owner) => {
             replaced = true;
-            rmSync(lockPath, { force: true });
-            for (let index = 0; index < 16; index += 1) {
-              writeFileSync(join(dirname(lockPath), `stale-inode-reservation-${index}`), "reserved", "utf8");
-            }
-            writeFileSync(lockPath, `${JSON.stringify({ ...owner, pid: process.pid, ...incarnation })}\n`, "utf8");
+            replaceImmediately(lockPath, `${JSON.stringify({ ...owner, pid: process.pid, ...incarnation })}\n`);
           },
         }),
       /held|identity changed/i,

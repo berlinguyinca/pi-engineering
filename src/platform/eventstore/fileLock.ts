@@ -7,10 +7,11 @@ import {
   lstatSync,
   openSync,
   readFileSync,
+  readSync,
   rmSync as removeSync,
   renameSync,
 } from "node:fs";
-import { link, lstat, mkdir, open, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { link, lstat, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { hostname } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -30,6 +31,7 @@ interface FileIdentity {
 
 interface OwnerRecord extends FileIdentity {
   owner: FileLockOwner;
+  descriptor: number;
 }
 
 const BOOT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -72,18 +74,24 @@ async function readOwner(path: string): Promise<FileLockOwner | undefined> {
 }
 
 async function readOwnerRecord(path: string): Promise<OwnerRecord | undefined> {
-  let handle;
+  let descriptor: number | undefined;
   try {
-    handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
-    const stat = await handle.stat({ bigint: true });
-    const value: unknown = JSON.parse(await handle.readFile({ encoding: "utf8" }));
-    if (!isFileLockOwner(value)) return undefined;
-    return { owner: value, device: stat.dev, inode: stat.ino };
+    descriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const stat = fstatSync(descriptor, { bigint: true });
+    const value: unknown = readOwnerFromDescriptor(descriptor);
+    if (!isFileLockOwner(value)) {
+      closeSync(descriptor);
+      return undefined;
+    }
+    return { owner: value, device: stat.dev, inode: stat.ino, descriptor };
   } catch {
+    if (descriptor !== undefined) closeSync(descriptor);
     return undefined;
-  } finally {
-    await handle?.close();
   }
+}
+
+async function closeOwnerRecord(record: OwnerRecord | undefined): Promise<void> {
+  if (record) closeSync(record.descriptor);
 }
 
 function readBootId(): string | undefined {
@@ -142,15 +150,28 @@ function sameIdentity(left: FileIdentity, right: FileIdentity): boolean {
   return left.device === right.device && left.inode === right.inode;
 }
 
+function readOwnerFromDescriptor(descriptor: number): Partial<FileLockOwner> {
+  const size = fstatSync(descriptor).size;
+  const bytes = Buffer.alloc(size);
+  let offset = 0;
+  while (offset < size) {
+    const count = readSync(descriptor, bytes, offset, size - offset, offset);
+    if (count === 0) break;
+    offset += count;
+  }
+  if (offset !== size) throw new Error("JSONL writer lock owner record was truncated while pinned");
+  return JSON.parse(bytes.toString("utf8")) as Partial<FileLockOwner>;
+}
+
 async function restoreQuarantined(path: string, quarantine: string): Promise<void> {
   try {
     await link(quarantine, path);
-    await rm(quarantine, { force: true });
   } catch (error) {
     if (!claimCollision(error)) throw error;
-    // A new fixed-path owner won. Preserve both it and the quarantine for
-    // diagnosis rather than overwriting or deleting an unproven identity.
   }
+  // Recovery only runs after an identity mismatch. Preserve the quarantine
+  // even when its inode was restored at the fixed path: deleting a diagnostic
+  // through a name that may itself have changed would not be owner-conditional.
 }
 
 async function quarantineObserved(
@@ -166,12 +187,21 @@ async function quarantineObserved(
     throw error;
   }
   const moved = await readOwnerRecord(quarantine);
-  if (!moved || !sameIdentity(moved, observed) || moved.owner.ownerToken !== observed.owner.ownerToken) {
-    await restoreQuarantined(path, quarantine);
-    throw new Error(identityError);
+  try {
+    if (!moved || !sameIdentity(moved, observed) || moved.owner.ownerToken !== observed.owner.ownerToken) {
+      await restoreQuarantined(path, quarantine);
+      throw new Error(identityError);
+    }
+    const named = await lstat(quarantine, { bigint: true });
+    if (named.dev !== observed.device || named.ino !== observed.inode) {
+      await restoreQuarantined(path, quarantine);
+      throw new Error(identityError);
+    }
+    await rm(quarantine, { force: true });
+    return true;
+  } finally {
+    await closeOwnerRecord(moved);
   }
-  await rm(quarantine, { force: true });
-  return true;
 }
 
 async function publishRecoveryClaim(path: string, owner: FileLockOwner): Promise<OwnerRecord | undefined> {
@@ -186,6 +216,7 @@ async function publishRecoveryClaim(path: string, owner: FileLockOwner): Promise
       await link(candidate, path);
       return candidateRecord;
     } catch (error) {
+      await closeOwnerRecord(candidateRecord);
       if (!claimCollision(error)) throw error;
       return undefined;
     }
@@ -200,17 +231,25 @@ function reapedClaimPath(path: string, ownerToken: string): string {
 }
 
 async function releaseRecoveryClaim(path: string, observed: OwnerRecord): Promise<void> {
-  const current = await readOwnerRecord(path);
-  if (!current || !sameIdentity(current, observed) || current.owner.ownerToken !== observed.owner.ownerToken) {
-    throw new Error("JSONL writer recovery claim identity changed during release");
+  try {
+    const current = await readOwnerRecord(path);
+    try {
+      if (!current || !sameIdentity(current, observed) || current.owner.ownerToken !== observed.owner.ownerToken) {
+        throw new Error("JSONL writer recovery claim identity changed during release");
+      }
+    } finally {
+      await closeOwnerRecord(current);
+    }
+    const released = `${path}.released.${observed.owner.ownerToken}.${randomUUID()}`;
+    await quarantineObserved(
+      path,
+      observed,
+      released,
+      "JSONL writer recovery claim identity changed during release; replacement was restored or preserved",
+    );
+  } finally {
+    await closeOwnerRecord(observed);
   }
-  const released = `${path}.released.${observed.owner.ownerToken}.${randomUUID()}`;
-  await quarantineObserved(
-    path,
-    observed,
-    released,
-    "JSONL writer recovery claim identity changed during release; replacement was restored or preserved",
-  );
 }
 
 export interface FileLockRecoveryHooks {
@@ -238,14 +277,23 @@ export class ExclusiveFileLock {
   readonly path: string;
   private readonly device: bigint;
   private readonly inode: bigint;
+  private descriptor: number | undefined;
   private readonly hooks: FileLockRecoveryHooks;
   private released = false;
 
-  private constructor(path: string, owner: FileLockOwner, device: bigint, inode: bigint, hooks: FileLockRecoveryHooks) {
+  private constructor(
+    path: string,
+    owner: FileLockOwner,
+    device: bigint,
+    inode: bigint,
+    descriptor: number,
+    hooks: FileLockRecoveryHooks,
+  ) {
     this.path = path;
     this.owner = owner;
     this.device = device;
     this.inode = inode;
+    this.descriptor = descriptor;
     this.hooks = hooks;
   }
 
@@ -269,92 +317,114 @@ export class ExclusiveFileLock {
     for (;;) {
       try {
         await writeFile(path, `${JSON.stringify(owner)}\n`, { encoding: "utf8", flag: "wx" });
-        const identity = await lstat(path, { bigint: true });
-        return new ExclusiveFileLock(path, owner, identity.dev, identity.ino, hooks);
+        const descriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+        try {
+          const identity = fstatSync(descriptor, { bigint: true });
+          const persisted = readOwnerFromDescriptor(descriptor);
+          if (persisted.ownerToken !== owner.ownerToken) {
+            throw new Error(`JSONL writer lock for ${file} changed during acquisition`);
+          }
+          return new ExclusiveFileLock(path, owner, identity.dev, identity.ino, descriptor, hooks);
+        } catch (error) {
+          closeSync(descriptor);
+          throw error;
+        }
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
         const currentRecord = await readOwnerRecord(path);
         if (!currentRecord) {
           throw new Error(`JSONL writer lock for ${file} is held (owner metadata is missing or unreadable)`);
         }
-        const current = currentRecord.owner;
-        if (ownerState(current) !== "stale") {
-          const diagnostic = `pid=${current.pid} host=${current.host} openedAt=${current.openedAt} ownerToken=${current.ownerToken} incarnation=${ownerState(current)}`;
-          throw new Error(`JSONL writer lock for ${file} is held (${diagnostic})`);
-        }
+        try {
+          const current = currentRecord.owner;
+          if (ownerState(current) !== "stale") {
+            const diagnostic = `pid=${current.pid} host=${current.host} openedAt=${current.openedAt} ownerToken=${current.ownerToken} incarnation=${ownerState(current)}`;
+            throw new Error(`JSONL writer lock for ${file} is held (${diagnostic})`);
+          }
 
-        // Serialize recovery by the exact stale token observed. Claim identity
-        // is complete before its directory is atomically published.
-        const claimPath = recoveryClaimPath(path, current.ownerToken);
-        const publishedClaim = await publishRecoveryClaim(claimPath, owner);
-        if (!publishedClaim) {
-          const claimantRecord = await readOwnerRecord(claimPath);
-          if (!claimantRecord) {
-            throw new Error(
-              `JSONL writer lock recovery for ${file} is claimed (claimant metadata is missing or unreadable)`,
-            );
-          }
-          const claimant = claimantRecord.owner;
-          if (ownerState(claimant) !== "stale") {
-            const diagnostic = `pid=${claimant.pid} host=${claimant.host} openedAt=${claimant.openedAt} ownerToken=${claimant.ownerToken}`;
-            throw new Error(`JSONL writer lock recovery for ${file} is claimed (${diagnostic})`);
-          }
-          await hooks.beforeRecoveryClaimReap?.(claimPath, { ...claimant });
-          const tombstone = reapedClaimPath(claimPath, claimant.ownerToken);
-          try {
-            // Only the reaper that atomically creates this identity-specific
-            // hard-link tombstone may unlink the fixed path. A delayed loser
-            // cannot remove a replacement claim published afterward.
-            await link(claimPath, tombstone);
-          } catch (reapError) {
-            if ((reapError as NodeJS.ErrnoException).code === "ENOENT") continue;
-            if (claimCollision(reapError)) {
-              const fixed = await readRecoveryClaim(claimPath);
-              const existingTombstone = await readRecoveryClaim(tombstone);
-              const fixedToken = fixed?.ownerToken ?? "missing-or-unreadable";
-              const tombstoneToken = existingTombstone?.ownerToken ?? "missing-or-unreadable";
+          // Serialize recovery by the exact stale token observed. Both the
+          // stale owner and every claim remain descriptor-pinned until their
+          // owner-conditional deletion completes.
+          const claimPath = recoveryClaimPath(path, current.ownerToken);
+          const publishedClaim = await publishRecoveryClaim(claimPath, owner);
+          if (!publishedClaim) {
+            const claimantRecord = await readOwnerRecord(claimPath);
+            if (!claimantRecord) {
               throw new Error(
-                `JSONL writer lock recovery for ${file} is blocked by existing tombstone ${tombstone} (fixedClaimToken=${fixedToken} tombstoneToken=${tombstoneToken}); the fixed recovery claim and tombstone were preserved`,
+                `JSONL writer lock recovery for ${file} is claimed (claimant metadata is missing or unreadable)`,
               );
             }
-            throw reapError;
+            try {
+              const claimant = claimantRecord.owner;
+              if (ownerState(claimant) !== "stale") {
+                const diagnostic = `pid=${claimant.pid} host=${claimant.host} openedAt=${claimant.openedAt} ownerToken=${claimant.ownerToken}`;
+                throw new Error(`JSONL writer lock recovery for ${file} is claimed (${diagnostic})`);
+              }
+              await hooks.beforeRecoveryClaimReap?.(claimPath, { ...claimant });
+              const tombstone = reapedClaimPath(claimPath, claimant.ownerToken);
+              try {
+                await link(claimPath, tombstone);
+              } catch (reapError) {
+                if ((reapError as NodeJS.ErrnoException).code === "ENOENT") continue;
+                if (claimCollision(reapError)) {
+                  const fixed = await readRecoveryClaim(claimPath);
+                  const existingTombstone = await readRecoveryClaim(tombstone);
+                  const fixedToken = fixed?.ownerToken ?? "missing-or-unreadable";
+                  const tombstoneToken = existingTombstone?.ownerToken ?? "missing-or-unreadable";
+                  throw new Error(
+                    `JSONL writer lock recovery for ${file} is blocked by existing tombstone ${tombstone} (fixedClaimToken=${fixedToken} tombstoneToken=${tombstoneToken}); the fixed recovery claim and tombstone were preserved`,
+                  );
+                }
+                throw reapError;
+              }
+              await hooks.afterRecoveryClaimTombstonePublished?.(claimPath, tombstone, { ...claimant });
+              const reapedRecord = await readOwnerRecord(tombstone);
+              try {
+                if (
+                  !reapedRecord ||
+                  !sameIdentity(reapedRecord, claimantRecord) ||
+                  reapedRecord.owner.ownerToken !== claimant.ownerToken
+                ) {
+                  throw new Error(`JSONL writer recovery claim identity changed unexpectedly for ${file}`);
+                }
+                const quarantined = await quarantineObserved(
+                  claimPath,
+                  claimantRecord,
+                  `${claimPath}.reap.${process.pid}.${randomUUID()}`,
+                  `JSONL writer recovery claim identity changed unexpectedly for ${file}; replacement was restored or preserved`,
+                );
+                if (!quarantined) continue;
+              } finally {
+                await closeOwnerRecord(reapedRecord);
+              }
+              continue;
+            } finally {
+              await closeOwnerRecord(claimantRecord);
+            }
           }
-          await hooks.afterRecoveryClaimTombstonePublished?.(claimPath, tombstone, { ...claimant });
-          const reaped = await readRecoveryClaim(tombstone);
-          const reapedRecord = await readOwnerRecord(tombstone);
-          if (
-            !reaped ||
-            !reapedRecord ||
-            !sameIdentity(reapedRecord, claimantRecord) ||
-            reaped.ownerToken !== claimant.ownerToken
-          ) {
-            throw new Error(`JSONL writer recovery claim identity changed unexpectedly for ${file}`);
+          try {
+            await hooks.afterRecoveryClaimPublished?.(claimPath, { ...owner });
+            const claimed = await readOwnerRecord(path);
+            try {
+              if (
+                !claimed ||
+                !sameIdentity(claimed, currentRecord) ||
+                claimed.owner.ownerToken !== current.ownerToken ||
+                ownerState(claimed.owner) !== "stale"
+              ) {
+                continue;
+              }
+            } finally {
+              await closeOwnerRecord(claimed);
+            }
+            await hooks.beforeStaleOwnerQuarantine?.(path, { ...current });
+            const stalePath = `${path}.stale.${process.pid}.${randomUUID()}`;
+            if (!(await quarantineObserved(path, currentRecord, stalePath))) continue;
+          } finally {
+            await releaseRecoveryClaim(claimPath, publishedClaim);
           }
-          const quarantined = await quarantineObserved(
-            claimPath,
-            reapedRecord,
-            `${claimPath}.reap.${process.pid}.${randomUUID()}`,
-            `JSONL writer recovery claim identity changed unexpectedly for ${file}; replacement was restored or preserved`,
-          );
-          if (!quarantined) continue;
-          continue;
-        }
-        try {
-          await hooks.afterRecoveryClaimPublished?.(claimPath, { ...owner });
-          const claimed = await readOwnerRecord(path);
-          if (
-            !claimed ||
-            !sameIdentity(claimed, currentRecord) ||
-            claimed.owner.ownerToken !== current.ownerToken ||
-            ownerState(claimed.owner) !== "stale"
-          ) {
-            continue;
-          }
-          await hooks.beforeStaleOwnerQuarantine?.(path, { ...claimed.owner });
-          const stalePath = `${path}.stale.${process.pid}.${randomUUID()}`;
-          if (!(await quarantineObserved(path, claimed, stalePath))) continue;
         } finally {
-          await releaseRecoveryClaim(claimPath, publishedClaim);
+          await closeOwnerRecord(currentRecord);
         }
       }
     }
@@ -363,12 +433,14 @@ export class ExclusiveFileLock {
   /** Release only this owner's lock. Safe to call repeatedly. */
   release(): void {
     if (this.released) return;
-    let fd: number | undefined;
+    const fd = this.descriptor;
+    this.descriptor = undefined;
+    this.released = true;
+    if (fd === undefined) return;
     try {
-      fd = openSync(this.path, constants.O_RDONLY | constants.O_NOFOLLOW);
       const identity = fstatSync(fd, { bigint: true });
       if (identity.dev !== this.device || identity.ino !== this.inode) return;
-      const current = JSON.parse(readFileSync(fd, "utf8")) as Partial<FileLockOwner>;
+      const current = readOwnerFromDescriptor(fd);
       if (current.ownerToken !== this.owner.ownerToken) return;
       this.hooks.beforeReleaseQuarantine?.(this.path, { ...this.owner });
       const named = lstatSync(this.path, { bigint: true });
@@ -386,11 +458,10 @@ export class ExclusiveFileLock {
         return;
       }
       removeSync(quarantine, { force: true });
-      this.released = true;
     } catch {
       return;
     } finally {
-      if (fd !== undefined) closeSync(fd);
+      closeSync(fd);
     }
   }
 }

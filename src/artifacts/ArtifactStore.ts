@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { constants, closeSync, fstatSync, openSync, readFileSync, realpathSync } from "node:fs";
-import { type FileHandle, lstat, mkdir, open, readdir, realpath, rename, unlink } from "node:fs/promises";
+import { type FileHandle, link, lstat, mkdir, open, readdir, realpath, rename, rm, unlink } from "node:fs/promises";
 import { resolve } from "node:path";
 import type { ArtifactMeta } from "../core/types.ts";
 import { ExclusiveFileLock } from "../platform/eventstore/fileLock.ts";
@@ -30,6 +30,9 @@ const CANONICAL_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 const IMMUTABLE_ID = /^.+-([a-f0-9]{64})-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const DIGEST = /^[a-f0-9]{64}$/;
 const LOCK_WAIT_MS = 10_000;
+const LOCK_DOMAIN_RECORD = ".artifact-lock-domain.json";
+const LOCK_DOMAIN_TOKEN = ".domain-token";
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 function integrityError(message: string): Error {
   return new Error(`ARTIFACT INTEGRITY: ${message}`);
@@ -95,6 +98,11 @@ interface DirectoryIdentity {
   inode: bigint;
 }
 
+interface LockDomainRecord extends DirectoryIdentity {
+  version: 1;
+  token: string;
+}
+
 /** Filesystem-backed lazy artifact store (spec §25, AC-010). */
 export class ArtifactStore {
   private readonly root: string;
@@ -102,7 +110,7 @@ export class ArtifactStore {
   private readonly hooks: ArtifactStoreHooks;
   private readonly index = new Map<string, Readonly<ArtifactMeta>>();
   private readonly immutableKeys = new Set<string>();
-  private lockRootIdentity?: DirectoryIdentity;
+  private lockDomain?: LockDomainRecord;
 
   private constructor(root: string, rootReal: string, hooks: ArtifactStoreHooks) {
     this.root = root;
@@ -215,31 +223,176 @@ export class ArtifactStore {
     const root = await this.openRoot();
     try {
       const path = `${procFd(root.fd)}/.artifact-locks`;
-      try {
-        await mkdir(path, { mode: 0o700 });
-        await root.sync();
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      const existingRecord = await this.readLockDomainRecord(root);
+      if (!existingRecord) {
+        try {
+          await mkdir(path, { mode: 0o700 });
+          await root.sync();
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        }
       }
-      const handle = await open(path, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+      let handle: FileHandle;
+      try {
+        handle = await open(path, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+      } catch (error) {
+        if (existingRecord && isMissing(error)) throw integrityError("artifact lock root identity changed");
+        throw error;
+      }
       try {
         assertTrustedDirectory(await handle.stat(), "artifact lock root");
         if ((await realpath(procFd(handle.fd))) !== resolve(this.rootReal, ".artifact-locks")) {
           throw integrityError("artifact lock root identity changed");
         }
         const identity = await handle.stat({ bigint: true });
-        if (
-          this.lockRootIdentity &&
-          (identity.dev !== this.lockRootIdentity.device || identity.ino !== this.lockRootIdentity.inode)
-        ) {
+        let record = existingRecord;
+        if (!record) {
+          const token = await this.ensureLockDomainToken(handle);
+          record = await this.publishLockDomainRecord(root, {
+            version: 1,
+            token,
+            device: identity.dev,
+            inode: identity.ino,
+          });
+        }
+        await this.validateLockDomain(handle, record, identity);
+        const namedIdentity = await lstat(path, { bigint: true });
+        if (namedIdentity.dev !== record.device || namedIdentity.ino !== record.inode) {
           throw integrityError("artifact lock root identity changed");
         }
-        this.lockRootIdentity = { device: identity.dev, inode: identity.ino };
+        this.lockDomain = record;
       } finally {
         await handle.close();
       }
     } finally {
       await root.close();
+    }
+  }
+
+  private async readLockDomainRecord(root: FileHandle): Promise<LockDomainRecord | undefined> {
+    const path = `${procFd(root.fd)}/${LOCK_DOMAIN_RECORD}`;
+    let handle: FileHandle;
+    try {
+      handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    } catch (error) {
+      if (isMissing(error)) return undefined;
+      throw error;
+    }
+    try {
+      const stat = await handle.stat();
+      if (!stat.isFile() || (stat.mode & 0o022) !== 0) throw integrityError("artifact lock domain record is unsafe");
+      let value: unknown;
+      try {
+        value = JSON.parse(await handle.readFile({ encoding: "utf8" }));
+      } catch {
+        throw integrityError("artifact lock domain record is corrupt");
+      }
+      const candidate = value as Partial<{ version: number; token: string; device: string; inode: string }>;
+      if (
+        candidate.version !== 1 ||
+        typeof candidate.token !== "string" ||
+        !UUID.test(candidate.token) ||
+        typeof candidate.device !== "string" ||
+        !/^\d+$/.test(candidate.device) ||
+        typeof candidate.inode !== "string" ||
+        !/^\d+$/.test(candidate.inode)
+      ) {
+        throw integrityError("artifact lock domain record is corrupt");
+      }
+      return {
+        version: 1,
+        token: candidate.token,
+        device: BigInt(candidate.device),
+        inode: BigInt(candidate.inode),
+      };
+    } finally {
+      await handle.close();
+    }
+  }
+
+  private async ensureLockDomainToken(lockRoot: FileHandle): Promise<string> {
+    const path = `${procFd(lockRoot.fd)}/${LOCK_DOMAIN_TOKEN}`;
+    const token = randomUUID();
+    try {
+      const handle = await open(
+        path,
+        constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+        0o600,
+      );
+      try {
+        await handle.writeFile(`${token}\n`, "utf8");
+        await handle.sync();
+      } finally {
+        await handle.close();
+      }
+      await lockRoot.sync();
+      return token;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      return this.readLockDomainToken(lockRoot);
+    }
+  }
+
+  private async readLockDomainToken(lockRoot: FileHandle): Promise<string> {
+    const handle = await open(`${procFd(lockRoot.fd)}/${LOCK_DOMAIN_TOKEN}`, constants.O_RDONLY | constants.O_NOFOLLOW);
+    try {
+      const stat = await handle.stat();
+      if (!stat.isFile() || (stat.mode & 0o022) !== 0) throw integrityError("artifact lock domain token is unsafe");
+      const token = (await handle.readFile({ encoding: "utf8" })).trim();
+      if (!UUID.test(token)) throw integrityError("artifact lock domain token is corrupt");
+      return token;
+    } finally {
+      await handle.close();
+    }
+  }
+
+  private async publishLockDomainRecord(root: FileHandle, record: LockDomainRecord): Promise<LockDomainRecord> {
+    const finalPath = `${procFd(root.fd)}/${LOCK_DOMAIN_RECORD}`;
+    const candidate = `${procFd(root.fd)}/.${LOCK_DOMAIN_RECORD}.${process.pid}.${randomUUID()}.tmp`;
+    const handle = await open(
+      candidate,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+      0o600,
+    );
+    try {
+      await handle.writeFile(
+        `${JSON.stringify({
+          version: record.version,
+          token: record.token,
+          device: record.device.toString(),
+          inode: record.inode.toString(),
+        })}\n`,
+        "utf8",
+      );
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    try {
+      await link(candidate, finalPath);
+      await root.sync();
+      return record;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      const existing = await this.readLockDomainRecord(root);
+      if (!existing) throw integrityError("artifact lock domain record disappeared during publication");
+      return existing;
+    } finally {
+      await rm(candidate, { force: true });
+    }
+  }
+
+  private async validateLockDomain(
+    lockRoot: FileHandle,
+    record: LockDomainRecord,
+    suppliedIdentity?: { dev: bigint; ino: bigint },
+  ): Promise<void> {
+    const identity = suppliedIdentity ?? (await lockRoot.stat({ bigint: true }));
+    const token = await this.readLockDomainToken(lockRoot).catch(() => {
+      throw integrityError("artifact lock root identity changed");
+    });
+    if (identity.dev !== record.device || identity.ino !== record.inode || token !== record.token) {
+      throw integrityError("artifact lock root identity changed");
     }
   }
 
@@ -254,13 +407,17 @@ export class ArtifactStore {
         throw integrityError("artifact lock root identity changed");
       }
       const identity = await handle.stat({ bigint: true });
+      const durable = await this.readLockDomainRecord(root);
       if (
-        !this.lockRootIdentity ||
-        identity.dev !== this.lockRootIdentity.device ||
-        identity.ino !== this.lockRootIdentity.inode
+        !durable ||
+        !this.lockDomain ||
+        durable.device !== this.lockDomain.device ||
+        durable.inode !== this.lockDomain.inode ||
+        durable.token !== this.lockDomain.token
       ) {
         throw integrityError("artifact lock root identity changed");
       }
+      await this.validateLockDomain(handle, durable, identity);
       this.hooks.afterLockDirectoryOpened?.();
       return handle;
     } catch (error) {

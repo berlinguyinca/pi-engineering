@@ -664,7 +664,7 @@ test("a pinned lock-directory descriptor prevents a deterministic lock-root swap
   }
 });
 
-test("two stores reject a real lock-directory replacement instead of splitting one key's critical section", async () => {
+test("a reopened store rejects a replaced lock directory while an older store holds the original domain", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-eng-art-lock-dir-identity-"));
   try {
     const root = join(dir, "artifacts");
@@ -676,7 +676,6 @@ test("two stores reject a real lock-directory replacement instead of splitting o
     const firstHoldingOldDirectory = new Promise<void>((resolve) => {
       firstEntered = resolve;
     });
-    let secondEntered = false;
     const first = await ArtifactStore.create(root, {
       afterKeyLockAcquired: async (key) => {
         if (key !== "logs/shared") return;
@@ -686,20 +685,19 @@ test("two stores reject a real lock-directory replacement instead of splitting o
         await firstMayFinish;
       },
     });
-    const second = await ArtifactStore.create(root, {
-      afterKeyLockAcquired: (key) => {
-        if (key === "logs/shared") secondEntered = true;
-      },
-    });
-
+    const durableDomain = JSON.parse(await readFile(join(root, ".artifact-lock-domain.json"), "utf8")) as {
+      device: string;
+      inode: string;
+      token: string;
+    };
+    const initialDomain = lstatSync(join(root, ".artifact-locks"), { bigint: true });
+    assert.equal(durableDomain.device, initialDomain.dev.toString());
+    assert.equal(durableDomain.inode, initialDomain.ino.toString());
+    assert.match(durableDomain.token, /^[0-9a-f-]{36}$/i);
     const firstWrite = first.put("logs", "shared", "first", "first");
     await firstHoldingOldDirectory;
     try {
-      await assert.rejects(
-        () => second.put("logs", "shared", "second", "second"),
-        /artifact integrity.*lock root identity changed/i,
-      );
-      assert.equal(secondEntered, false, "the replacement lock domain must never enter the critical section");
+      await assert.rejects(() => ArtifactStore.create(root), /artifact integrity.*lock root identity changed/i);
     } finally {
       releaseFirst();
       await firstWrite;

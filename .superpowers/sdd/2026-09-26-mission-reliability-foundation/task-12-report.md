@@ -17,6 +17,10 @@ The Task 12 prerequisite rulings are closed before independent review:
   real directory is rejected before a second store can enter the same key's
   critical section. Lock and recovery-claim owner records use a strict process
   incarnation schema, and recovery claim reaping/release is device/inode bound.
+- Lock-domain authority is now durably rooted in `.artifact-lock-domain.json`,
+  outside the replaceable lock directory. Its fsynced device/inode/token binding
+  is checked during store creation and every lock-root open, so a store opened
+  only after replacement cannot adopt the replacement as a new domain.
 
 Task 12 PR, merge, reinstall, and installed `local/local` dogfood were not
 performed in this prerequisite commit.
@@ -71,6 +75,9 @@ remain covered.
   owner-conditional release so a directory swap cannot redirect or split the
   lock domain; the store also preserves the directory's initial device/inode
   identity and rejects a later real-directory replacement before lock entry;
+- publishes a private token inside the pinned lock directory and atomically
+  hard-links a fsynced device/inode/token record into the artifact root. A
+  missing lock directory is never recreated once that durable authority exists;
 - binds stale takeover and release to the acquired token, device, and inode.
   Replacement is quarantined atomically, revalidated, and either removed,
   restored without replacement, or preserved as a diagnostic instead of
@@ -80,6 +87,11 @@ remain covered.
   evidence fails closed. Owner records require a positive safe-integer PID,
   nonempty hostname/token, UUID-shaped boot ID, and positive digit-only process
   start time; malformed or unsupported values are never classified stale;
+- keeps every observed lock and claim inode pinned by an explicitly owned file
+  descriptor until publication, quarantine, reaping, or release has completed.
+  Quarantine names are revalidated against that pin immediately before removal,
+  and all retry, mismatch, malformed-record, exception, and success paths close
+  their descriptors deterministically;
 - binds recovery claims to their published device/inode identity. Dead-claim
   reaping and release both quarantine and revalidate that exact identity, so a
   same-token replacement is restored or preserved and recovery aborts instead
@@ -131,13 +143,23 @@ same-token replacement after tombstone publication. The repaired suites also
 retain the simultaneous stale-reaper proof that critical-section concurrency
 never exceeds one.
 
+Fix round 5 added a red reopened-store proof: while an older holder retained the
+original directory, replacing `.artifact-locks` let a newly opened store adopt
+the replacement. The inode-race fixtures now attempt immediate reuse at the
+fixed name without reservation files for claim release, dead-claim reaping, and
+stale takeover. The first full-suite run also exposed a descriptor-lifecycle
+fault: Node could garbage-collect a `FileHandle` wrapper across a deliberately
+nonsettling recovery hook, closing the intended pin and crashing the claimant.
+Pins now use explicitly owned numeric descriptors; the live-claim process race
+then passed 20 consecutive runs before the focused and full suites.
+
 ## Verification
 
 Fresh verification on the final working tree:
 
 - `npm run test:mission-reliability` — 37 passed.
 - focused ArtifactStore and platform lock suites — 44 passed.
-- focused broker/recovery/artifact/platform lock suites — 108 passed.
+- expanded broker/recovery/artifact/platform lock suites — 209 passed.
 - focused tools/verifier suites — 15 passed.
 - `npm test` — 2,678 passed; 1 optional Postgres test skipped because
   `TEST_DATABASE_URL` is unset.
@@ -148,6 +170,7 @@ Fresh verification on the final working tree:
 - `npm run test:e2e` — package load passed with 21 commands and 7 tools.
 - `git diff --check` — passed.
 
+Fix-round-5 base: `bf4dd89`.
 Fix-round-4 base: `4839e67`.
 Fix-round-3 base: `c821026b7780b12086f544f633b9c35afd9ee87c`.
 Fix-round-2 base: `dc0d1adfbf1796434d40b2413553d25426ccf6ad`.
