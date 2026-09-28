@@ -25,7 +25,7 @@ export interface RefreshOptions {
   /** Overrides the configured base URL. */
   baseUrl?: string;
   apiKey?: string;
-  headers?: Record<string, string>;
+  headers?: Record<string, string | null>;
   /** Report what would change without touching the file. */
   dryRun?: boolean;
   /** Remove configured models the gateway no longer lists. Off by default. */
@@ -46,15 +46,28 @@ export interface RefreshResult {
   lines: string[];
 }
 
-/**
- * Refresh one provider's models from its gateway.
- *
- * Reads the config BEFORE fetching so a malformed `models.json` fails before
- * any network call, and writes only when something actually changed — a refresh
- * that rewrites an identical file still churns a backup and a mtime for nothing.
- */
-export async function refreshProviderModels(opts: RefreshOptions): Promise<RefreshResult> {
-  const config: ModelsConfig = readModelsConfig(opts.modelsPath);
+export interface ProviderRefreshAuth {
+  apiKey?: string;
+  headers?: Record<string, string | null>;
+  baseUrl?: string;
+}
+
+export interface RefreshConfiguredProvidersOptions
+  extends Pick<RefreshOptions, "modelsPath" | "dryRun" | "pruneMissing" | "signal" | "fetchImpl" | "now"> {
+  providerIds: string[];
+  authForProvider?: (providerId: string) => ProviderRefreshAuth | Promise<ProviderRefreshAuth>;
+}
+
+export interface ConfiguredProviderRefreshResult {
+  results: Array<{ providerId: string; result: RefreshResult }>;
+  failures: Array<{ providerId: string; error: Error }>;
+  /** One restore point for the complete successful batch. */
+  backupPath?: string;
+  written: boolean;
+  lines: string[];
+}
+
+async function planProviderRefresh(config: ModelsConfig, opts: RefreshOptions): Promise<RefreshResult> {
   const existing: ConfiguredModel[] = providerModels(config, opts.providerId);
   const baseUrl = opts.baseUrl ?? providerBaseUrl(config, opts.providerId) ?? DEFAULT_GATEWAY_BASE_URL;
 
@@ -68,27 +81,108 @@ export async function refreshProviderModels(opts: RefreshOptions): Promise<Refre
 
   const plan = planCatalogUpdate(existing, gateway, opts.pruneMissing ? { pruneMissing: true } : {});
   const lines = [`${opts.providerId} — ${gateway.length} model(s) on ${baseUrl}`, ...describeCatalogPlan(plan)];
+  return { plan, gateway, baseUrl, written: false, lines };
+}
 
-  if (!plan.dirty || opts.dryRun) {
-    if (plan.dirty && opts.dryRun) lines.push("Dry run — nothing written.");
-    return { plan, gateway, baseUrl, written: false, lines };
+/**
+ * Refresh one provider's models from its gateway.
+ *
+ * Reads the config BEFORE fetching so a malformed `models.json` fails before
+ * any network call, and writes only when something actually changed — a refresh
+ * that rewrites an identical file still churns a backup and a mtime for nothing.
+ */
+export async function refreshProviderModels(opts: RefreshOptions): Promise<RefreshResult> {
+  const config: ModelsConfig = readModelsConfig(opts.modelsPath);
+  const result = await planProviderRefresh(config, opts);
+
+  if (!result.plan.dirty || opts.dryRun) {
+    if (result.plan.dirty && opts.dryRun) result.lines.push("Dry run — nothing written.");
+    return result;
   }
 
+  opts.signal?.throwIfAborted();
   const write = writeModelsConfig(
     opts.modelsPath,
-    withProviderModels(config, opts.providerId, plan.next),
+    withProviderModels(config, opts.providerId, result.plan.next),
     (opts.now ?? (() => new Date()))(),
   );
-  lines.push(`Wrote ${opts.modelsPath}`);
-  if (write.backupPath) lines.push(`Previous version kept at ${write.backupPath}`);
-  lines.push("Restart Pi or run /reload for the new models to take effect.");
+  result.lines.push(`Wrote ${opts.modelsPath}`);
+  if (write.backupPath) result.lines.push(`Previous version kept at ${write.backupPath}`);
+  result.lines.push("Restart Pi or run /reload for the new models to take effect.");
 
   return {
-    plan,
-    gateway,
-    baseUrl,
+    ...result,
     written: true,
     ...(write.backupPath ? { backupPath: write.backupPath } : {}),
+  };
+}
+
+/** Refresh configured providers independently so one bad host cannot block the rest. */
+export async function refreshConfiguredProviders(
+  opts: RefreshConfiguredProvidersOptions,
+): Promise<ConfiguredProviderRefreshResult> {
+  // Parse once before entering the per-provider recovery loop. A malformed
+  // source file is not a provider failure and must never be replaced.
+  let nextConfig = readModelsConfig(opts.modelsPath);
+  const results: ConfiguredProviderRefreshResult["results"] = [];
+  const failures: ConfiguredProviderRefreshResult["failures"] = [];
+  const lines: string[] = [];
+
+  for (const providerId of opts.providerIds) {
+    try {
+      opts.signal?.throwIfAborted();
+      const auth = (await opts.authForProvider?.(providerId)) ?? {};
+      opts.signal?.throwIfAborted();
+      const result = await planProviderRefresh(nextConfig, {
+        modelsPath: opts.modelsPath,
+        providerId,
+        ...(auth.baseUrl ? { baseUrl: auth.baseUrl } : {}),
+        ...(auth.apiKey ? { apiKey: auth.apiKey } : {}),
+        ...(auth.headers ? { headers: auth.headers } : {}),
+        ...(opts.dryRun ? { dryRun: true } : {}),
+        ...(opts.pruneMissing ? { pruneMissing: true } : {}),
+        ...(opts.signal ? { signal: opts.signal } : {}),
+        ...(opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}),
+      });
+      opts.signal?.throwIfAborted();
+      if (result.plan.dirty && opts.dryRun) result.lines.push("Dry run — nothing written.");
+      if (result.plan.dirty && !opts.dryRun) {
+        nextConfig = withProviderModels(nextConfig, providerId, result.plan.next);
+      }
+      results.push({ providerId, result });
+      lines.push(...result.lines);
+    } catch (cause) {
+      opts.signal?.throwIfAborted();
+      const error = cause instanceof Error ? cause : new Error(String(cause));
+      failures.push({ providerId, error });
+      lines.push(`${providerId} — skipped: ${error.message}. Existing configuration kept.`);
+    }
+  }
+
+  const dirty = results.some(({ result }) => result.plan.dirty);
+  if (!dirty || opts.dryRun) return { results, failures, written: false, lines };
+
+  opts.signal?.throwIfAborted();
+  const write = writeModelsConfig(opts.modelsPath, nextConfig, (opts.now ?? (() => new Date()))());
+  const commonLines = [`Wrote ${opts.modelsPath}`];
+  if (write.backupPath) commonLines.push(`Previous version kept at ${write.backupPath}`);
+  commonLines.push("Restart Pi or run /reload for the new models to take effect.");
+  lines.push(...commonLines);
+
+  for (const entry of results) {
+    if (!entry.result.plan.dirty) continue;
+    entry.result = {
+      ...entry.result,
+      written: true,
+      ...(write.backupPath ? { backupPath: write.backupPath } : {}),
+    };
+  }
+
+  return {
+    results,
+    failures,
+    ...(write.backupPath ? { backupPath: write.backupPath } : {}),
+    written: true,
     lines,
   };
 }

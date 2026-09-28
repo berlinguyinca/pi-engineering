@@ -40,7 +40,7 @@ import { resolveGuardConfig } from "../src/guard/config.ts";
 import { guardFeedFor } from "../src/guard/streamText.ts";
 import { ModelHealthProvider } from "../src/models/health.ts";
 import { defaultModelsPath, providerBaseUrl, readModelsConfig } from "../src/models/modelsConfig.ts";
-import { refreshProviderModels } from "../src/models/refresh.ts";
+import { refreshConfiguredProviders } from "../src/models/refresh.ts";
 import { classifyIntent, workflowForIntent } from "../src/orchestration/intentRouter.ts";
 import type { Intent, WorkflowClass } from "../src/orchestration/types.ts";
 import { PanelController } from "../src/panel/PanelController.ts";
@@ -801,38 +801,56 @@ ${RECOVERY_PROMPT}`;
   // fails, and because Pi computes usage from the configured window, compaction
   // fires far too late to save the turn.
   pi.registerCommand("refresh-models", {
-    description: "Refresh models.json from the provider's gateway (names, context sizes). --dry-run to preview.",
+    description: "Refresh models.json from configured gateways (names, context sizes). --dry-run to preview.",
     handler: async (args: string, ctx: ExtensionCommandContext) => {
       const argv = (args ?? "").trim().split(/\s+/).filter(Boolean);
       const dryRun = argv.includes("--dry-run");
       const pruneMissing = argv.includes("--prune");
-      const model = ctx.model;
-      const providerId = argv.find((a) => !a.startsWith("--")) ?? model?.provider;
-      if (!providerId) {
-        ctx.ui.notify("No provider to refresh. Select a model first, or pass a provider name.", "warning");
-        return;
-      }
-
-      // Resolve auth through the registry rather than reading the key here, so
-      // the credential is never handled by this extension directly.
-      let apiKey: string | undefined;
-      try {
-        const resolved = model ? await ctx.modelRegistry?.getApiKeyAndHeaders(model) : undefined;
-        if (resolved?.ok) apiKey = resolved.apiKey;
-      } catch {
-        // Fall through unauthenticated; the gateway decides whether that works.
-      }
+      const explicitProvider = argv.find((a) => !a.startsWith("--"));
 
       try {
-        const result = await refreshProviderModels({
+        // Unlike status-only commands, refresh must surface malformed JSON:
+        // treating it as an empty config could overwrite the operator's file.
+        const configuredProviders = Object.keys(readModelsConfig(defaultModelsPath()).providers ?? {});
+        const providerIds = explicitProvider
+          ? [explicitProvider]
+          : configuredProviders.length > 0
+            ? configuredProviders
+            : ctx.model?.provider
+              ? [ctx.model.provider]
+              : [];
+        if (providerIds.length === 0) {
+          ctx.ui.notify("No provider to refresh. Select a model first, or pass a provider name.", "warning");
+          return;
+        }
+
+        const result = await refreshConfiguredProviders({
           modelsPath: defaultModelsPath(),
-          providerId,
-          ...(apiKey ? { apiKey } : {}),
+          providerIds,
+          authForProvider: async (providerId) => {
+            if (!ctx.modelRegistry) return {};
+            const status = ctx.modelRegistry.getProviderAuthStatus(providerId);
+            const resolved = await ctx.modelRegistry.getProviderAuth(providerId);
+            if (!resolved) {
+              if (status.configured) {
+                throw new Error(`Authentication for ${providerId} is configured but could not be resolved`);
+              }
+              return {};
+            }
+            return {
+              ...(resolved.auth.apiKey ? { apiKey: resolved.auth.apiKey } : {}),
+              ...(resolved.auth.headers ? { headers: resolved.auth.headers } : {}),
+              ...(resolved.auth.baseUrl ? { baseUrl: resolved.auth.baseUrl } : {}),
+            };
+          },
           ...(dryRun ? { dryRun: true } : {}),
           ...(pruneMissing ? { pruneMissing: true } : {}),
           ...(ctx.signal ? { signal: ctx.signal } : {}),
         });
-        ctx.ui.notify(result.lines.join("\n"), "info");
+        if (result.results.length === 0) {
+          throw new Error(result.failures.map(({ providerId, error }) => `${providerId}: ${error.message}`).join("; "));
+        }
+        ctx.ui.notify(result.lines.join("\n"), result.failures.length > 0 ? "warning" : "info");
       } catch (err) {
         ctx.ui.notify(
           `refresh-models failed: ${err instanceof Error ? err.message : String(err)}. Your configuration was not changed.`,

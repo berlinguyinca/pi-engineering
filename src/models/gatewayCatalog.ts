@@ -88,7 +88,7 @@ export interface FetchCatalogOptions {
   /** Provider base URL, e.g. `https://llm.metabolomics.us/v1`. */
   baseUrl: string;
   apiKey?: string;
-  headers?: Record<string, string>;
+  headers?: Record<string, string | null>;
   signal?: AbortSignal;
   timeoutMs?: number;
   fetchImpl?: typeof fetch;
@@ -108,6 +108,7 @@ export class CatalogFetchError extends Error {
 
 /** Fetch and parse the gateway's catalogue. Throws `CatalogFetchError`. */
 export async function fetchGatewayModels(opts: FetchCatalogOptions): Promise<GatewayModelEntry[]> {
+  opts.signal?.throwIfAborted();
   const base = (opts.baseUrl || DEFAULT_GATEWAY_BASE_URL).replace(/\/+$/, "");
   const doFetch = opts.fetchImpl ?? fetch;
   const timer = new AbortController();
@@ -116,13 +117,17 @@ export async function fetchGatewayModels(opts: FetchCatalogOptions): Promise<Gat
   const onAbort = () => timer.abort();
   opts.signal?.addEventListener("abort", onAbort, { once: true });
   try {
+    const headers: Record<string, string> = opts.apiKey ? { Authorization: `Bearer ${opts.apiKey}` } : {};
+    for (const [name, value] of Object.entries(opts.headers ?? {})) {
+      const existing = Object.keys(headers).find((candidate) => candidate.toLowerCase() === name.toLowerCase());
+      if (existing) delete headers[existing];
+      if (value !== null) headers[name] = value;
+    }
     const res = await doFetch(`${base}/models`, {
-      headers: {
-        ...(opts.apiKey ? { Authorization: `Bearer ${opts.apiKey}` } : {}),
-        ...(opts.headers ?? {}),
-      },
+      headers,
       signal: timer.signal,
     });
+    opts.signal?.throwIfAborted();
     if (!res.ok) throw new CatalogFetchError(`gateway returned ${res.status} for ${base}/models`, res.status);
     const body: unknown = await res.json().catch(() => null);
     const models = parseGatewayModels(body);
@@ -142,6 +147,7 @@ export async function fetchGatewayModels(opts: FetchCatalogOptions): Promise<Gat
     }
     return models;
   } catch (err) {
+    opts.signal?.throwIfAborted();
     if (err instanceof CatalogFetchError) throw err;
     throw new CatalogFetchError(err instanceof Error ? err.message : String(err));
   } finally {

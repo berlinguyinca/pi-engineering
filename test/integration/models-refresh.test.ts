@@ -11,7 +11,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { refreshProviderModels } from "../../src/models/refresh.ts";
+import { refreshConfiguredProviders, refreshProviderModels } from "../../src/models/refresh.ts";
 
 const PAYLOAD = {
   data: [
@@ -240,6 +240,114 @@ test("refresh: an empty gateway list never empties the config", async () => {
       }),
     );
     assert.equal(readFileSync(s.path, "utf8"), before);
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("refresh: one unavailable host does not block healthy configured providers", async () => {
+  const localModels = [{ id: "local", contextWindow: 250_000, maxTokens: 32_768 }];
+  const s = scratch({
+    providers: {
+      local: {
+        baseUrl: "http://127.0.0.1:8082/v1",
+        models: localModels,
+      },
+      metabolomics: STARTING_CONFIG.providers.metabolomics,
+    },
+  });
+  try {
+    const result = await refreshConfiguredProviders({
+      modelsPath: s.path,
+      providerIds: ["local", "metabolomics"],
+      fetchImpl: (async (input: string | URL | Request) => {
+        const url = String(input);
+        if (url.startsWith("http://127.0.0.1:8082/")) {
+          return { ok: true, status: 200, json: async () => ({ data: [] }) };
+        }
+        return { ok: true, status: 200, json: async () => PAYLOAD };
+      }) as typeof fetch,
+    });
+
+    assert.deepEqual(
+      result.results.map((entry) => entry.providerId),
+      ["metabolomics"],
+    );
+    assert.deepEqual(
+      result.failures.map((entry) => entry.providerId),
+      ["local"],
+    );
+    assert.match(result.lines.join("\n"), /local — skipped:/);
+
+    const config = JSON.parse(readFileSync(s.path, "utf8")) as {
+      providers: {
+        local: { models: Array<{ id: string; contextWindow?: number; maxTokens?: number }> };
+        metabolomics: { models: Array<{ id: string; contextWindow?: number; maxTokens?: number }> };
+      };
+    };
+    assert.deepEqual(config.providers.local.models, localModels, "the failed host keeps its last-known models");
+    assert.equal(config.providers.metabolomics.models.length, 5, "the healthy host is still refreshed");
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("refresh: multiple successful providers share one restorable batch backup", async () => {
+  const original = {
+    providers: {
+      first: { baseUrl: "https://first.example/v1", models: [{ id: "old-first", contextWindow: 8_192 }] },
+      second: { baseUrl: "https://second.example/v1", models: [{ id: "old-second", contextWindow: 8_192 }] },
+    },
+  };
+  const s = scratch(original);
+  try {
+    const result = await refreshConfiguredProviders({
+      modelsPath: s.path,
+      providerIds: ["first", "second"],
+      now: () => new Date("2026-09-28T12:00:00Z"),
+      fetchImpl: (async (input: string | URL | Request) => {
+        const id = String(input).includes("first.example") ? "new-first" : "new-second";
+        return { ok: true, status: 200, json: async () => ({ data: [{ id, ctx_per_request: 262_144 }] }) };
+      }) as typeof fetch,
+    });
+
+    assert.ok(result.backupPath);
+    assert.deepEqual(JSON.parse(readFileSync(result.backupPath, "utf8")), original);
+    assert.equal(
+      result.results.every(({ result: entry }) => entry.backupPath === result.backupPath),
+      true,
+    );
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("refresh: cancellation stops later providers and prevents a partial write", async () => {
+  const original = {
+    providers: {
+      first: { baseUrl: "https://first.example/v1", models: [{ id: "old-first", contextWindow: 8_192 }] },
+      second: { baseUrl: "https://second.example/v1", models: [{ id: "old-second", contextWindow: 8_192 }] },
+    },
+  };
+  const s = scratch(original);
+  const controller = new AbortController();
+  const requested: string[] = [];
+  try {
+    await assert.rejects(() =>
+      refreshConfiguredProviders({
+        modelsPath: s.path,
+        providerIds: ["first", "second"],
+        signal: controller.signal,
+        fetchImpl: (async (input: string | URL | Request) => {
+          requested.push(String(input));
+          controller.abort();
+          return { ok: true, status: 200, json: async () => ({ data: [{ id: "new", ctx_per_request: 262_144 }] }) };
+        }) as typeof fetch,
+      }),
+    );
+
+    assert.equal(requested.length, 1);
+    assert.deepEqual(JSON.parse(readFileSync(s.path, "utf8")), original);
   } finally {
     s.cleanup();
   }
