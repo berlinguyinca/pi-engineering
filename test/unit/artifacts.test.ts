@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { lstatSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { lstatSync, mkdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, readdir, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
@@ -659,6 +659,51 @@ test("a pinned lock-directory descriptor prevents a deterministic lock-root swap
     assert.equal(swapped, true);
     assert.deepEqual(await readdir(outside), []);
     assert.equal(await store.readContent("logs", "safe"), "bytes");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("two stores reject a real lock-directory replacement instead of splitting one key's critical section", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-eng-art-lock-dir-identity-"));
+  try {
+    const root = join(dir, "artifacts");
+    let releaseFirst!: () => void;
+    const firstMayFinish = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    let firstEntered!: () => void;
+    const firstHoldingOldDirectory = new Promise<void>((resolve) => {
+      firstEntered = resolve;
+    });
+    let secondEntered = false;
+    const first = await ArtifactStore.create(root, {
+      afterKeyLockAcquired: async (key) => {
+        if (key !== "logs/shared") return;
+        renameSync(join(root, ".artifact-locks"), join(root, ".artifact-locks-pinned"));
+        mkdirSync(join(root, ".artifact-locks"), { mode: 0o700 });
+        firstEntered();
+        await firstMayFinish;
+      },
+    });
+    const second = await ArtifactStore.create(root, {
+      afterKeyLockAcquired: (key) => {
+        if (key === "logs/shared") secondEntered = true;
+      },
+    });
+
+    const firstWrite = first.put("logs", "shared", "first", "first");
+    await firstHoldingOldDirectory;
+    try {
+      await assert.rejects(
+        () => second.put("logs", "shared", "second", "second"),
+        /artifact integrity.*lock root identity changed/i,
+      );
+      assert.equal(secondEntered, false, "the replacement lock domain must never enter the critical section");
+    } finally {
+      releaseFirst();
+      await firstWrite;
+    }
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

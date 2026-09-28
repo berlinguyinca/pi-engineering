@@ -90,6 +90,11 @@ interface OpenCategory {
   path: string;
 }
 
+interface DirectoryIdentity {
+  device: bigint;
+  inode: bigint;
+}
+
 /** Filesystem-backed lazy artifact store (spec §25, AC-010). */
 export class ArtifactStore {
   private readonly root: string;
@@ -97,6 +102,7 @@ export class ArtifactStore {
   private readonly hooks: ArtifactStoreHooks;
   private readonly index = new Map<string, Readonly<ArtifactMeta>>();
   private readonly immutableKeys = new Set<string>();
+  private lockRootIdentity?: DirectoryIdentity;
 
   private constructor(root: string, rootReal: string, hooks: ArtifactStoreHooks) {
     this.root = root;
@@ -221,6 +227,14 @@ export class ArtifactStore {
         if ((await realpath(procFd(handle.fd))) !== resolve(this.rootReal, ".artifact-locks")) {
           throw integrityError("artifact lock root identity changed");
         }
+        const identity = await handle.stat({ bigint: true });
+        if (
+          this.lockRootIdentity &&
+          (identity.dev !== this.lockRootIdentity.device || identity.ino !== this.lockRootIdentity.inode)
+        ) {
+          throw integrityError("artifact lock root identity changed");
+        }
+        this.lockRootIdentity = { device: identity.dev, inode: identity.ino };
       } finally {
         await handle.close();
       }
@@ -237,6 +251,14 @@ export class ArtifactStore {
     try {
       assertTrustedDirectory(await handle.stat(), "artifact lock root");
       if ((await realpath(procFd(handle.fd))) !== resolve(this.rootReal, ".artifact-locks")) {
+        throw integrityError("artifact lock root identity changed");
+      }
+      const identity = await handle.stat({ bigint: true });
+      if (
+        !this.lockRootIdentity ||
+        identity.dev !== this.lockRootIdentity.device ||
+        identity.ino !== this.lockRootIdentity.inode
+      ) {
         throw integrityError("artifact lock root identity changed");
       }
       this.hooks.afterLockDirectoryOpened?.();

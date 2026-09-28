@@ -13,6 +13,10 @@ The Task 12 prerequisite rulings are closed before independent review:
   symlinks are rejected, and public metadata is returned as a fresh frozen
   clone. Immutable authority is also rechecked from durable metadata while a
   cross-process canonical-key lock is held.
+- Each store pins the device/inode identity of `.artifact-locks`; a replacement
+  real directory is rejected before a second store can enter the same key's
+  critical section. Lock and recovery-claim owner records use a strict process
+  incarnation schema, and recovery claim reaping/release is device/inode bound.
 
 Task 12 PR, merge, reinstall, and installed `local/local` dogfood were not
 performed in this prerequisite commit.
@@ -65,14 +69,21 @@ remain covered.
 - pins and validates the `.artifact-locks` directory from the already pinned
   root, addresses locks through that descriptor, and retains it through
   owner-conditional release so a directory swap cannot redirect or split the
-  lock domain;
+  lock domain; the store also preserves the directory's initial device/inode
+  identity and rejects a later real-directory replacement before lock entry;
 - binds stale takeover and release to the acquired token, device, and inode.
   Replacement is quarantined atomically, revalidated, and either removed,
   restored without replacement, or preserved as a diagnostic instead of
   deleting an unproven inode;
 - records the Linux boot ID and `/proc/<pid>/stat` start time in each lock owner.
   PID reuse and boot changes are stale; unavailable or incomplete incarnation
-  evidence fails closed;
+  evidence fails closed. Owner records require a positive safe-integer PID,
+  nonempty hostname/token, UUID-shaped boot ID, and positive digit-only process
+  start time; malformed or unsupported values are never classified stale;
+- binds recovery claims to their published device/inode identity. Dead-claim
+  reaping and release both quarantine and revalidate that exact identity, so a
+  same-token replacement is restored or preserved and recovery aborts instead
+  of deleting an unproven inode;
 - reconstructs private immutable canonical keys during replay and validates
   replay metadata against its category directory, metadata filename, canonical
   URI, content file, and required immutable marker;
@@ -112,15 +123,23 @@ phases, deterministic lock-directory replacement, same-token/new-inode
 replacement at takeover and release, reused-PID and changed-boot recovery, and
 fail-closed missing incarnation evidence.
 
+Fix round 4 added four red groups: two existing stores could enter split lock
+domains after a real `.artifact-locks` replacement; zero/fractional PID and
+malformed boot/start fields could be recovered as stale; recovery-claim release
+could delete a same-token replacement; and the dead-claim reaper could unlink a
+same-token replacement after tombstone publication. The repaired suites also
+retain the simultaneous stale-reaper proof that critical-section concurrency
+never exceeds one.
+
 ## Verification
 
 Fresh verification on the final working tree:
 
 - `npm run test:mission-reliability` — 37 passed.
-- focused ArtifactStore and platform lock suites — 40 passed.
-- focused broker/recovery/artifact/platform lock suites — 137 passed.
+- focused ArtifactStore and platform lock suites — 44 passed.
+- focused broker/recovery/artifact/platform lock suites — 108 passed.
 - focused tools/verifier suites — 15 passed.
-- `npm test` — 2,674 passed; 1 optional Postgres test skipped because
+- `npm test` — 2,678 passed; 1 optional Postgres test skipped because
   `TEST_DATABASE_URL` is unset.
 - `node --test test/unit/cav-explore.test.ts` — 3 passed twice after the page
   exception fixture was made deterministic for either focus or click selection.
@@ -129,6 +148,7 @@ Fresh verification on the final working tree:
 - `npm run test:e2e` — package load passed with 21 commands and 7 tools.
 - `git diff --check` — passed.
 
+Fix-round-4 base: `4839e67`.
 Fix-round-3 base: `c821026b7780b12086f544f633b9c35afd9ee87c`.
 Fix-round-2 base: `dc0d1adfbf1796434d40b2413553d25426ccf6ad`.
 Fix-round-1 base: `2a7c038997df92c8cafc2e0bb12fa0c567381ee9`.

@@ -450,6 +450,94 @@ describe("EventStore backends", () => {
     await assert.rejects(() => ExclusiveFileLock.acquire(unavailable), /held.*unreadable|incarnation/i);
   });
 
+  it("fails closed for every malformed owner-incarnation field", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pie-store-owner-schema-"));
+    const incarnation = await currentProcessIncarnation();
+    const valid = {
+      pid: process.pid,
+      host: hostname(),
+      openedAt: "2026-01-01T00:00:00.000Z",
+      ownerToken: "valid-owner-token",
+      ...incarnation,
+    };
+    const malformed: Array<[string, Record<string, unknown>]> = [
+      ["numeric-string-pid", { ...valid, pid: String(process.pid) }],
+      ["object-pid", { ...valid, pid: { value: process.pid } }],
+      ["nan-pid", { ...valid, pid: Number.NaN }],
+      ["zero-pid", { ...valid, pid: 0 }],
+      ["fractional-pid", { ...valid, pid: 1.5 }],
+      ["empty-host", { ...valid, host: "" }],
+      ["empty-token", { ...valid, ownerToken: "" }],
+      ["bad-boot-id", { ...valid, bootId: "not-a-boot-uuid" }],
+      ["nondigit-start", { ...valid, processStartTime: "12x" }],
+      ["zero-start", { ...valid, processStartTime: "0" }],
+    ];
+
+    for (const [label, owner] of malformed) {
+      const file = join(dir, `${label}.jsonl`);
+      const lockPath = `${file}.lock`;
+      const bytes = `${JSON.stringify(owner)}\n`;
+      await writeFile(lockPath, bytes);
+      await assert.rejects(
+        () => ExclusiveFileLock.acquire(file),
+        /held.*(?:missing|unreadable|incarnation)/i,
+        `${label} must not be classified stale`,
+      );
+      assert.equal(await readFile(lockPath, "utf8"), bytes, `${label} must be preserved for diagnosis`);
+    }
+  });
+
+  it("release of a recovery claim preserves a same-token replacement inode and aborts", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pie-store-recovery-release-identity-"));
+    const file = join(dir, "events.jsonl");
+    await writeFile(`${file}.lock`, `${JSON.stringify(await deadLockOwner("stale-owner-release-identity"))}\n`);
+    let replacement = "";
+    let replacementPath = "";
+
+    await assert.rejects(
+      () =>
+        ExclusiveFileLock.acquire(file, {
+          afterRecoveryClaimPublished: async (claimPath, owner) => {
+            replacementPath = claimPath;
+            rmSync(claimPath, { force: true });
+            for (let index = 0; index < 16; index += 1) {
+              writeFileSync(join(dirname(claimPath), `release-claim-inode-reservation-${index}`), "reserved", "utf8");
+            }
+            replacement = `${JSON.stringify(owner)}\n`;
+            writeFileSync(claimPath, replacement, "utf8");
+          },
+        }),
+      /recovery claim identity changed/i,
+    );
+    assert.equal(await readFile(replacementPath, "utf8"), replacement);
+  });
+
+  it("dead-claim reaping preserves a same-token replacement inode and aborts", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pie-store-recovery-reap-identity-"));
+    const file = join(dir, "events.jsonl");
+    await writeFile(`${file}.lock`, `${JSON.stringify(await deadLockOwner("stale-owner-reap-identity"))}\n`);
+    const deadClaimant = await startRecoveryClaimant(file);
+    deadClaimant.child.kill("SIGKILL");
+    await waitForExit(deadClaimant.child);
+    let replacement = "";
+
+    await assert.rejects(
+      () =>
+        ExclusiveFileLock.acquire(file, {
+          afterRecoveryClaimTombstonePublished: async (claimPath, _tombstone, claimant) => {
+            rmSync(claimPath, { force: true });
+            for (let index = 0; index < 16; index += 1) {
+              writeFileSync(join(dirname(claimPath), `reap-claim-inode-reservation-${index}`), "reserved", "utf8");
+            }
+            replacement = `${JSON.stringify(claimant)}\n`;
+            writeFileSync(claimPath, replacement, "utf8");
+          },
+        }),
+      /recovery claim identity changed/i,
+    );
+    assert.equal(await readFile(deadClaimant.claimPath, "utf8"), replacement);
+  });
+
   it("quarantines by inode so a same-token live replacement survives stale takeover", async () => {
     const dir = await mkdtemp(join(tmpdir(), "pie-store-stale-quarantine-"));
     const file = join(dir, "events.jsonl");
