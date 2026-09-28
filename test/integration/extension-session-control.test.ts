@@ -39,6 +39,7 @@ test("extension publishes one live session, tool progress, UI-only note and life
   const ctx = {
     cwd: root,
     mode: "tui",
+    hasUI: true,
     signal: undefined,
     model: undefined,
     modelRegistry: undefined,
@@ -48,6 +49,7 @@ test("extension publishes one live session, tool progress, UI-only note and life
     ui: {
       notify: (text: string) => notices.push(text),
       custom: () => ({ close: () => {} }),
+      setStatus: () => {},
       setFooter: () => {},
       onTerminalInput: () => () => {},
     },
@@ -104,7 +106,25 @@ test("extension publishes one live session, tool progress, UI-only note and life
     assert.equal(nextNote.ok, true);
     assert.ok(nextNotices.some((line) => line.includes("New session only")));
     assert.ok(!notices.some((line) => line.includes("New session only")));
-    for (const handler of handlers.get("session_shutdown") ?? []) await handler({}, nextCtx);
+    const headlessCtx = {
+      ...nextCtx,
+      hasUI: false,
+      mode: "print",
+      sessionManager: { getSessionId: () => "pi-session-headless" },
+      ui: { ...nextCtx.ui, notify: () => {} },
+    };
+    for (const handler of handlers.get("session_start") ?? []) await handler({}, headlessCtx);
+    const headless = await discoverSessions(control);
+    assert.equal(headless.length, 1);
+    const refused = await requestSession(headless[0]!, {
+      version: 1,
+      op: "note",
+      messageId: "33333333-3333-4333-8333-333333333333",
+      text: "Nobody can see this",
+    });
+    assert.equal(refused.ok, false);
+    if (!refused.ok) assert.equal(refused.error, "notes_unavailable");
+    for (const handler of handlers.get("session_shutdown") ?? []) await handler({}, headlessCtx);
     assert.equal((await discoverSessions(control)).length, 0);
   } finally {
     for (const [key, value] of Object.entries({

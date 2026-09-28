@@ -274,6 +274,83 @@ test("oversized raw requests are refused without delivering a note", async () =>
   }
 });
 
+test("session shutdown does not wait on a client holding its write side open", async () => {
+  const dir = await root();
+  const server = await startSessionControl({ rootDir: join(dir, "control"), cwd: dir, sessionId: "half-open" });
+  const client = createConnection({ path: server.socketPath, allowHalfOpen: true });
+  let closing: Promise<void> | null = null;
+  try {
+    await new Promise<void>((resolve, reject) => {
+      client.on("connect", () => client.write('{"version":1,"op":"status"}\n'));
+      client.on("data", () => resolve());
+      client.on("error", reject);
+    });
+    let complete = false;
+    closing = server.close().then(() => {
+      complete = true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    assert.equal(complete, true, "shutdown must close accepted sockets before awaiting the listener");
+  } finally {
+    client.destroy();
+    await (closing ?? server.close());
+  }
+});
+
+test("notes and status preserve UTF-8 characters split across socket frames", async () => {
+  const dir = await root();
+  const control = join(dir, "control");
+  const notes: string[] = [];
+  const server = await startSessionControl({
+    rootDir: control,
+    cwd: dir,
+    sessionId: "utf8",
+    onNote: (note) => {
+      notes.push(note);
+    },
+  });
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const client = createConnection(server.socketPath);
+      const body = Buffer.from(
+        `${JSON.stringify({ version: 1, op: "note", messageId: randomUUID(), text: "Hello café" })}\n`,
+      );
+      const split = body.indexOf(Buffer.from("é")) + 1;
+      client.on("connect", () => {
+        client.write(body.subarray(0, split));
+        setTimeout(() => client.write(body.subarray(split)), 12);
+      });
+      client.on("data", () => resolve());
+      client.on("error", reject);
+    });
+    assert.deepEqual(notes, ["Hello café"]);
+
+    const fakeId = randomUUID();
+    const fakePath = join(control, `${fakeId}.sock`);
+    const fake = (await import("node:net")).createServer((socket) => {
+      socket.on("data", () => {
+        const reply = Buffer.from(
+          `${JSON.stringify({ version: 1, ok: true, data: { instanceId: fakeId, lastToolProgress: "café" } })}\n`,
+        );
+        const split = reply.indexOf(Buffer.from("é")) + 1;
+        socket.write(reply.subarray(0, split));
+        setTimeout(() => socket.end(reply.subarray(split)), 12);
+      });
+    });
+    try {
+      await new Promise<void>((resolve) => fake.listen(fakePath, resolve));
+      const descriptor = { ...server.descriptor, instanceId: fakeId, socketPath: fakePath };
+      const response = await requestSession(descriptor, { version: 1, op: "status" });
+      if (response.ok) assert.equal(response.data.lastToolProgress, "café");
+      else assert.fail("fake status must be decoded");
+    } finally {
+      await new Promise<void>((resolve) => fake.close(() => resolve()));
+    }
+  } finally {
+    await server.close();
+  }
+});
+
 test("discovery does not trust a socket that replies with the wrong ping nonce", async () => {
   const dir = await root();
   const control = join(dir, "control");

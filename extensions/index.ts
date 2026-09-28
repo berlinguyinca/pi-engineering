@@ -515,7 +515,7 @@ export default function (pi: ExtensionAPI) {
         activeControl = await startSessionControl({
           cwd: ctx.cwd,
           sessionId,
-          onNote: (note) => ctx.ui.notify(`[PI session note] ${redactSecrets(note)}`, "info"),
+          onNote: ctx.hasUI ? (note) => ctx.ui.notify(`[PI session note] ${redactSecrets(note)}`, "info") : undefined,
           getMissions: async (missionIds) => {
             const runtime = await getRuntimeByCwd(ctx.cwd).catch(() => null);
             if (!runtime?.missionStore) return null;

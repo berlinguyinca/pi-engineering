@@ -162,6 +162,7 @@ export class SessionControlServer {
   private readonly onNote?: (text: string) => void | Promise<void>;
   private readonly getMissions?: (missionIds: readonly string[]) => Promise<MissionBrief[] | null>;
   private readonly noteIds = new Set<string>();
+  private readonly sockets = new Set<Socket>();
   private timer: ReturnType<typeof setInterval> | null = null;
   private update: Promise<void> = Promise.resolve();
   private closed = false;
@@ -342,19 +343,25 @@ export class SessionControlServer {
   }
 
   private handle(socket: Socket): void {
-    socket.setTimeout(SOCKET_TIMEOUT_MS);
+    this.sockets.add(socket);
+    socket.setEncoding("utf8");
     let body = "";
     let done = false;
     const respond = (reply: ControlReply) => {
       if (done) return;
       done = true;
-      socket.end(`${JSON.stringify(reply)}\n`);
+      socket.end(`${JSON.stringify(reply)}\n`, () => socket.destroy());
     };
-    socket.on("timeout", () => respond(failure("request_timeout")));
+    const deadline = setTimeout(() => respond(failure("request_timeout")), SOCKET_TIMEOUT_MS);
+    deadline.unref();
+    socket.once("close", () => {
+      clearTimeout(deadline);
+      this.sockets.delete(socket);
+    });
     socket.on("error", () => {});
-    socket.on("data", (chunk: Buffer) => {
+    socket.on("data", (chunk: string) => {
       if (done) return;
-      body += chunk.toString("utf8");
+      body += chunk;
       if (Buffer.byteLength(body) > MAX_REQUEST_BYTES) return respond(failure("request_too_large"));
       const newline = body.indexOf("\n");
       if (newline === -1) return;
@@ -374,6 +381,7 @@ export class SessionControlServer {
     this.closed = true;
     if (this.timer) clearInterval(this.timer);
     await this.update;
+    for (const socket of this.sockets) socket.destroy();
     await new Promise<void>((resolve) => this.server.close(() => resolve()));
     await unlink(this.socketPath).catch(() => {});
     try {
@@ -428,6 +436,7 @@ export async function requestSession(
 ): Promise<ControlReply> {
   return new Promise((resolve, reject) => {
     const socket = createConnection(descriptor.socketPath);
+    socket.setEncoding("utf8");
     let body = "";
     let settled = false;
     const fail = (error: Error) => {
@@ -441,9 +450,9 @@ export async function requestSession(
     socket.on("timeout", () => fail(new Error("session_unresponsive")));
     socket.on("error", fail);
     socket.on("connect", () => socket.write(`${JSON.stringify(request)}\n`));
-    socket.on("data", (chunk: Buffer) => {
+    socket.on("data", (chunk: string) => {
       if (settled) return;
-      body += chunk.toString("utf8");
+      body += chunk;
       if (Buffer.byteLength(body) > MAX_RESPONSE_BYTES) return fail(new Error("response_too_large"));
       const newline = body.indexOf("\n");
       if (newline === -1) return;
