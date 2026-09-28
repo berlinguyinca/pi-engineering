@@ -14,6 +14,9 @@
  */
 
 import assert from "node:assert/strict";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 import extension from "../../extensions/index.ts";
 import { AdmissionController } from "../../src/gateway/AdmissionController.ts";
@@ -242,19 +245,71 @@ test("wiring: /gateway is registered and renders without a model or registry", a
   assert.match(notices[0]?.text ?? "", /Policy:/);
 });
 
-test("wiring: /refresh-models is registered and refuses without a provider", async () => {
+test("wiring: /refresh-models refreshes healthy providers when the selected host is unavailable", async () => {
   const commands = loadWithCommands();
   const cmd = commands.get("refresh-models");
   assert.ok(cmd, "/refresh-models must be registered");
 
-  const { ctx, notices } = notifyingCtx();
-  // No model selected and no provider argument: the command must say so rather
-  // than guessing a provider and rewriting the operator's config against it.
-  await cmd.handler("", ctx);
+  const dir = mkdtempSync(join(tmpdir(), "refresh-wiring-"));
+  const modelsPath = join(dir, "models.json");
+  const previousAgentDir = process.env.PI_AGENT_DIR;
+  const previousFetch = globalThis.fetch;
+  writeFileSync(
+    modelsPath,
+    JSON.stringify({
+      providers: {
+        local: {
+          baseUrl: "http://127.0.0.1:8082/v1",
+          models: [{ id: "local", contextWindow: 250_000, maxTokens: 32_768 }],
+        },
+        remote: {
+          baseUrl: "https://healthy.example/v1",
+          models: [{ id: "old", contextWindow: 8_192, maxTokens: 1_024 }],
+        },
+      },
+    }),
+    { mode: 0o600 },
+  );
+  process.env.PI_AGENT_DIR = dir;
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    const url = String(input);
+    if (url.startsWith("http://127.0.0.1:8082/")) {
+      return { ok: true, status: 200, json: async () => ({ data: [] }) };
+    }
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({ data: [{ id: "fresh", ctx_per_request: 262_144 }] }),
+    };
+  }) as typeof fetch;
 
-  assert.equal(notices.length, 1);
-  assert.equal(notices[0]?.level, "warning");
-  assert.match(notices[0]?.text ?? "", /No provider to refresh/);
+  const { ctx, notices } = notifyingCtx();
+  try {
+    await cmd.handler("", {
+      ...ctx,
+      model: { provider: "local", id: "local", api: "openai-completions" },
+      modelRegistry: {
+        getAll: () => [
+          { provider: "local", id: "local" },
+          { provider: "remote", id: "old" },
+        ],
+        getApiKeyAndHeaders: async () => ({ ok: true }),
+      },
+    });
+
+    assert.equal(notices.length, 1);
+    assert.equal(notices[0]?.level, "warning");
+    assert.match(notices[0]?.text ?? "", /local — skipped:/);
+    assert.match(notices[0]?.text ?? "", /remote — 1 model/);
+    const written = JSON.parse(readFileSync(modelsPath, "utf8"));
+    assert.equal(written.providers.local.models[0].id, "local");
+    assert.equal(written.providers.remote.models[0].id, "fresh");
+  } finally {
+    globalThis.fetch = previousFetch;
+    if (previousAgentDir === undefined) delete process.env.PI_AGENT_DIR;
+    else process.env.PI_AGENT_DIR = previousAgentDir;
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("wiring: a failing /refresh-models reports that nothing was changed", async () => {

@@ -46,6 +46,24 @@ export interface RefreshResult {
   lines: string[];
 }
 
+export interface ProviderRefreshAuth {
+  apiKey?: string;
+  headers?: Record<string, string>;
+}
+
+export interface RefreshConfiguredProvidersOptions
+  extends Pick<RefreshOptions, "modelsPath" | "dryRun" | "pruneMissing" | "signal" | "fetchImpl" | "now"> {
+  providerIds: string[];
+  authForProvider?: (providerId: string) => ProviderRefreshAuth | Promise<ProviderRefreshAuth>;
+}
+
+export interface ConfiguredProviderRefreshResult {
+  results: Array<{ providerId: string; result: RefreshResult }>;
+  failures: Array<{ providerId: string; error: Error }>;
+  written: boolean;
+  lines: string[];
+}
+
 /**
  * Refresh one provider's models from its gateway.
  *
@@ -89,6 +107,48 @@ export async function refreshProviderModels(opts: RefreshOptions): Promise<Refre
     baseUrl,
     written: true,
     ...(write.backupPath ? { backupPath: write.backupPath } : {}),
+    lines,
+  };
+}
+
+/** Refresh configured providers independently so one bad host cannot block the rest. */
+export async function refreshConfiguredProviders(
+  opts: RefreshConfiguredProvidersOptions,
+): Promise<ConfiguredProviderRefreshResult> {
+  const results: ConfiguredProviderRefreshResult["results"] = [];
+  const failures: ConfiguredProviderRefreshResult["failures"] = [];
+  const lines: string[] = [];
+  const writeClockStart = (opts.now ?? (() => new Date()))();
+  let writeOrdinal = 0;
+  const nextWriteTime = () => new Date(writeClockStart.getTime() + writeOrdinal++ * 1_000);
+
+  for (const providerId of opts.providerIds) {
+    try {
+      const auth = (await opts.authForProvider?.(providerId)) ?? {};
+      const result = await refreshProviderModels({
+        modelsPath: opts.modelsPath,
+        providerId,
+        ...(auth.apiKey ? { apiKey: auth.apiKey } : {}),
+        ...(auth.headers ? { headers: auth.headers } : {}),
+        ...(opts.dryRun ? { dryRun: true } : {}),
+        ...(opts.pruneMissing ? { pruneMissing: true } : {}),
+        ...(opts.signal ? { signal: opts.signal } : {}),
+        ...(opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}),
+        now: nextWriteTime,
+      });
+      results.push({ providerId, result });
+      lines.push(...result.lines);
+    } catch (cause) {
+      const error = cause instanceof Error ? cause : new Error(String(cause));
+      failures.push({ providerId, error });
+      lines.push(`${providerId} — skipped: ${error.message}. Existing configuration kept.`);
+    }
+  }
+
+  return {
+    results,
+    failures,
+    written: results.some(({ result }) => result.written),
     lines,
   };
 }
