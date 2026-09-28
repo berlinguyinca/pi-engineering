@@ -100,7 +100,8 @@ test("/mission resume parses before a new request and is idempotent through repa
       throw new Error("resume was incorrectly parsed as a new mission request");
     }) as typeof Orchestrator.prototype.orchestrate;
 
-    const command = loadCommands().get("mission");
+    const { commands, handlers } = loadHarness();
+    const command = commands.get("mission");
     assert.ok(command);
     const { ctx, notices } = commandContext(root);
     await Promise.all([
@@ -111,6 +112,7 @@ test("/mission resume parses before a new request and is idempotent through repa
     assert.deepEqual(repaired, [mission.mission_id]);
     assert.equal(runtime.missionStore!.listMissionResumptions(mission.mission_id).length, 1);
     assert.match(notices.at(-1)?.text ?? "", /Recovery .*manual recovery.*BLOCKED/i);
+    for (const handler of handlers.get("session_shutdown") ?? []) await handler({}, ctx);
     await runtime.close();
   } finally {
     Orchestrator.prototype.repairBlockedMission = originalRepair;
@@ -155,7 +157,8 @@ test("/mission resume requires a current stop, normalizes executing state, and r
       return runtime.missionStore!.getMission(missionId)!;
     };
 
-    const command = loadCommands().get("mission")!;
+    const { commands, handlers } = loadHarness();
+    const command = commands.get("mission")!;
     const { ctx, notices } = commandContext(root);
     await command.handler(`resume ${stopped.mission_id}`, ctx);
     await command.handler(`resume ${unstopped.mission_id}`, ctx);
@@ -170,6 +173,7 @@ test("/mission resume requires a current stop, normalizes executing state, and r
       runtime.missionStore!.listMissionStops(stopped.mission_id).length >= 2,
       "failed material recovery stays stopped",
     );
+    for (const handler of handlers.get("session_shutdown") ?? []) await handler({}, ctx);
     await runtime.close();
   } finally {
     Orchestrator.prototype.repairBlockedMission = originalRepair;
@@ -224,7 +228,8 @@ test("/mission-status renders acceptance-first progress and actionable stop deta
     });
     await runtime.publishMissionSnapshot();
 
-    const command = loadCommands().get("mission-status");
+    const { commands, handlers } = loadHarness();
+    const command = commands.get("mission-status");
     assert.ok(command);
     const { ctx, notices } = commandContext(root);
     await command.handler("", ctx);
@@ -238,6 +243,7 @@ test("/mission-status renders acceptance-first progress and actionable stop deta
     assert.match(text, /next: provide new material evidence/i);
     assert.match(text, /preserved: candidate\/ref/i);
     assert.match(text, /stop: repeated recovery fingerprint exhausted/i);
+    for (const handler of handlers.get("session_shutdown") ?? []) await handler({}, ctx);
     await runtime.close();
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -273,13 +279,15 @@ test("/mission-status labels legacy acceptance unavailable and derives truthful 
     });
     runtime.missionStore!.transitionMission(mission.mission_id, "CLASSIFYING");
     runtime.missionStore!.transitionMission(mission.mission_id, "CANCELED");
-    const command = loadCommands().get("mission-status")!;
+    const { commands, handlers } = loadHarness();
+    const command = commands.get("mission-status")!;
     const { ctx, notices } = commandContext(root);
     await command.handler("", ctx);
     const text = notices.at(-1)?.text ?? "";
     assert.match(text, /acceptance unavailable \(legacy\)/i);
     assert.match(text, /workflow 1\/2 \(50%\)/i);
     assert.doesNotMatch(text, /acceptance 0\/0 \(0%\)/i);
+    for (const handler of handlers.get("session_shutdown") ?? []) await handler({}, ctx);
     await runtime.close();
   } finally {
     await rm(root, { recursive: true, force: true });

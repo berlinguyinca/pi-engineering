@@ -1146,9 +1146,12 @@ export class ExecutionBroker {
    * recorded so operators and the PI WEB panel see exactly why the work did not
    * land.
    */
-  private async harvestWorktree(executionId: string, authority?: DispatchAuthority): Promise<boolean> {
+  private async harvestWorktree(
+    executionId: string,
+    authority?: DispatchAuthority,
+  ): Promise<"harvested" | "empty" | "unverified"> {
     const wt = this.allocatedWorktrees.get(executionId);
-    if (!wt) return false;
+    if (!wt) return "empty";
     const git = wt.git;
     const ex = this.store.getExecution(executionId);
     const missionId = ex?.mission_id;
@@ -1164,23 +1167,32 @@ export class ExecutionBroker {
     // (Timeout recovery is unaffected: its ref is captured before this runs,
     // so this harvest commit is still excluded from a recovered merge.)
     let ahead = false;
-    if (base) {
-      try {
+    let status: string;
+    try {
+      if (base) {
         ahead = await git.branchAheadOf(base, wt.branch);
         if (ahead && missionId) this.committedWork.set(missionId, true);
-      } catch {
-        // Fall through to the status-based harvest below.
       }
-    }
-    let status = "";
-    try {
       status = (await git.statusIn(wt.path)).trim();
-    } catch {
-      // Could not even read the worktree status: the worker's own commits are
-      // still harvestable work; nothing else can be said.
-      return ahead;
+    } catch (error) {
+      if (missionId) this.retainWorktree(missionId, executionId);
+      if (ex) {
+        this.store.addFinding({
+          mission_id: ex.mission_id,
+          task_id: ex.task_id,
+          severity: "major",
+          category: "integration",
+          file: null,
+          line: null,
+          summary: "Git harvest safety query failed; no handoff was published and the worktree was retained",
+          evidence: error instanceof Error ? error.message : String(error),
+          recommended_action:
+            "Restore trustworthy Git query access, then inspect and re-harvest the retained worktree.",
+        });
+      }
+      return "unverified";
     }
-    if (status.length === 0 && ahead) return true;
+    if (status.length === 0 && ahead) return "harvested";
     if (status.length === 0) {
       // A mutating worker reported SUCCESS but produced nothing to commit.
       // Without this, the mission surfaces only the later opaque "Integration
@@ -1202,12 +1214,12 @@ export class ExecutionBroker {
             "The implementer must actually edit files and commit them; an empty worktree cannot integrate.",
         });
       }
-      return false;
+      return "empty";
     }
     try {
       await git.commitAll(wt.path, `pi-eng: orchestration work for ${executionId}`, authority);
       if (missionId) this.committedWork.set(missionId, true);
-      return true;
+      return "harvested";
     } catch (err) {
       const ex = this.store.getExecution(executionId);
       if (ex) {
@@ -1224,7 +1236,7 @@ export class ExecutionBroker {
             "Resolve the commit failure and re-run the mission, or recover the worker's uncommitted edits from the preserved worktree branch.",
         });
       }
-      return false;
+      return "unverified";
     }
   }
 
@@ -1406,13 +1418,9 @@ export class ExecutionBroker {
     if (!git) return null;
     const base = this.store.getMission(missionId)?.base_ref?.trim() || this.resolvedBases.get(missionId);
     if (!base) return null;
-    try {
-      const candidate = this.missionCandidates.get(missionId);
-      const head = candidate ? await git.headCommitIn(candidate.lifecycle.path) : await git.headCommit();
-      return await git.changedFiles(base, head);
-    } catch {
-      return null;
-    }
+    const candidate = this.missionCandidates.get(missionId);
+    const head = candidate ? await git.headCommitIn(candidate.lifecycle.path) : await git.headCommit();
+    return await git.changedFiles(base, head);
   }
 
   /** Recompute candidate content identity from Git; durable metadata is not trusted as mutation proof. */
@@ -1761,10 +1769,16 @@ export class ExecutionBroker {
             if (!(await wt.git.isAncestor(wt.branch, head))) keep = true;
             assertOrigin?.();
           } catch (error) {
-            if (assertOrigin) {
-              assertOrigin();
-            }
-            keep = true; // cannot verify the work merged -> preserve (safe).
+            assertOrigin?.();
+            survivors.push(wt);
+            failures.push({
+              repoId: wt.repoId ?? "",
+              path: wt.path,
+              branch: wt.branch,
+              preserved: true,
+              reason: `Git cleanup safety query failed; worktree and branch retained: ${error instanceof Error ? error.message : String(error)}`,
+            });
+            continue;
           }
           assertOrigin?.();
           try {
@@ -2502,7 +2516,7 @@ export class ExecutionBroker {
               input.authority?.assertAuthoritative();
               this.store.assertExecutionAuthoritative(execution.execution_id);
               const info = this.allocatedWorktrees.get(execution.execution_id);
-              const failed = outcome.exitStatus !== "succeeded";
+              let failed = outcome.exitStatus !== "succeeded";
               // Captured BEFORE the harvest: the harvest commits the worker's
               // uncommitted edits too, and those are exactly what a timed-out
               // worker had not finished.
@@ -2510,7 +2524,22 @@ export class ExecutionBroker {
                 failed && outcome.error === WALL_CLOCK_TIMEOUT_MARKER && info
                   ? await this.workerCommittedTip(execution.execution_id, input.missionId, worktree)
                   : undefined;
-              await this.harvestWorktree(execution.execution_id, input.authority);
+              const harvest = await this.harvestWorktree(execution.execution_id, input.authority);
+              if (harvest === "unverified") {
+                this.markBranchIntegrationIneligible(
+                  execution.execution_id,
+                  input.missionId,
+                  input.taskId,
+                  "git_harvest_unverified",
+                );
+                outcome = {
+                  ...outcome,
+                  exitStatus: "failed",
+                  summary: "Worker result rejected because Git harvest could not be verified",
+                  error: "GIT_HARVEST_UNVERIFIED",
+                };
+                failed = true;
+              }
               input.authority?.assertAuthoritative();
               this.store.assertExecutionAuthoritative(execution.execution_id);
               if (info) {

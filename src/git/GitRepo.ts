@@ -25,6 +25,21 @@ export interface GitResult {
   code: number;
 }
 
+export class GitQueryError extends Error {
+  readonly code = "GIT_QUERY_FAILED";
+  readonly operation: string;
+  readonly args: readonly string[];
+  readonly exitCode: number;
+
+  constructor(operation: string, args: readonly string[], exitCode: number, stderr: string) {
+    super(`git ${operation} failed (exit ${exitCode}): ${stderr || "no diagnostic output"}`);
+    this.name = "GitQueryError";
+    this.operation = operation;
+    this.args = args;
+    this.exitCode = exitCode;
+  }
+}
+
 export interface GitMutationGuard {
   assertAuthoritative(): void;
   repositoryIdentity?: { generation: number };
@@ -218,6 +233,11 @@ export class GitRepo {
         code: typeof e.code === "number" ? e.code : 1,
       };
     }
+  }
+
+  private requireQuery(result: GitResult, operation: string, args: readonly string[]): GitResult {
+    if (result.code !== 0) throw new GitQueryError(operation, args, result.code, result.stderr || result.stdout);
+    return result;
   }
 
   get root(): string {
@@ -869,8 +889,17 @@ export class GitRepo {
 
   /** Resolve a ref only when this repository owns the referenced commit. */
   async resolveCommit(ref: string): Promise<string | null> {
-    const r = await this.git(["rev-parse", "--verify", `${ref}^{commit}`]);
-    return r.code === 0 && r.stdout ? r.stdout : null;
+    const args = ["rev-parse", "--verify", `${ref}^{commit}`];
+    const r = await this.git(args);
+    if (r.code === 0 && r.stdout) return r.stdout;
+    if (
+      /needed a single revision|unknown revision|ambiguous argument|not a valid object name|bad revision/i.test(
+        r.stderr,
+      )
+    ) {
+      return null;
+    }
+    throw new GitQueryError("commit resolution query", args, r.code, r.stderr || r.stdout);
   }
 
   /** Resolve HEAD commit inside a specific worktree path. */
@@ -881,8 +910,9 @@ export class GitRepo {
   }
 
   async currentBranch(): Promise<string | null> {
-    const r = await this.git(["branch", "--show-current"]);
-    return r.code === 0 && r.stdout ? r.stdout : null;
+    const args = ["branch", "--show-current"];
+    const r = this.requireQuery(await this.git(args), "current branch query", args);
+    return r.stdout || null;
   }
 
   async isClean(): Promise<boolean> {
@@ -890,6 +920,7 @@ export class GitRepo {
     return r.code === 0 && r.stdout.length === 0;
   }
 
+  /** Noncritical panel-only best effort; safety decisions use the checked query methods below. */
   async status(): Promise<string> {
     const r = await this.git(["status", "--short"]);
     return r.stdout;
@@ -897,7 +928,8 @@ export class GitRepo {
 
   /** Working-tree status inside a specific path (e.g. a candidate worktree). */
   async statusIn(path: string): Promise<string> {
-    const r = await this.git(["-C", path, "status", "--short"]);
+    const args = ["-C", path, "status", "--short"];
+    const r = this.requireQuery(await this.git(args), `status query in ${path}`, args);
     return r.stdout;
   }
 
@@ -1077,6 +1109,7 @@ export class GitRepo {
    * because commit subjects routinely contain every punctuation character a
    * naive split would choke on.
    */
+  /** Noncritical panel-only best effort; an unavailable history renders as no rows. */
   async recentCommits(limit = 5): Promise<Array<{ sha: string; subject: string; relative: string }>> {
     const r = await this.git(["--no-pager", "log", `-n${Math.max(1, limit)}`, "--format=%h%x1f%s%x1f%cr"]);
     if (r.code !== 0) return [];
@@ -1101,6 +1134,7 @@ export class GitRepo {
    * `--first-parent` is what makes this work on a merge, which by default shows
    * no patch at all — an empty pane where the operator asked to see a change.
    */
+  /** Noncritical panel-only best effort; failure renders an empty preview. */
   async commitDiff(sha: string): Promise<string> {
     const r = await this.git(["--no-pager", "show", "--format=", "--patch", "--first-parent", sha]);
     if (r.code !== 0) return "";
@@ -1114,6 +1148,7 @@ export class GitRepo {
    * reports `-` for binary files instead of a count, which is a distinction the
    * panel should show rather than render as zero.
    */
+  /** Noncritical panel-only best effort; failure renders no statistics. */
   async diffStats(): Promise<Map<string, { added: number; removed: number; binary: boolean }>> {
     const out = new Map<string, { added: number; removed: number; binary: boolean }>();
     const r = await this.git(["--no-pager", "diff", "--numstat", "HEAD"]);
@@ -1656,23 +1691,34 @@ export class GitRepo {
 
   /** Unified diff between two commits (or base and worktree HEAD). */
   async captureDiff(baseCommit: string, headCommit: string): Promise<string> {
-    const r = await this.git(["diff", baseCommit, headCommit, "--", ":!package-lock.json"]);
+    const args = ["diff", baseCommit, headCommit, "--", ":!package-lock.json"];
+    const r = this.requireQuery(await this.git(args), "candidate diff capture", args);
     return r.stdout;
   }
 
   async changedFiles(baseCommit: string, headCommit: string): Promise<string[]> {
-    const r = await this.git(["diff", "--no-renames", "--name-only", "-z", baseCommit, headCommit], {
-      preserveStdout: true,
-    });
+    const args = ["diff", "--no-renames", "--name-only", "-z", baseCommit, headCommit];
+    const r = this.requireQuery(
+      await this.git(args, {
+        preserveStdout: true,
+      }),
+      "changed-file query",
+      args,
+    );
     return r.stdout ? r.stdout.split("\0").filter(Boolean) : [];
   }
 
   /** NUL-safe working-tree paths, including both endpoints of renames/copies. */
   async statusPathsIn(path: string): Promise<string[]> {
-    const r = await this.git(["-C", path, "status", "--porcelain=v1", "-z", "--untracked-files=all"], {
-      preserveStdout: true,
-    });
-    if (r.code !== 0 || !r.stdout) return [];
+    const args = ["-C", path, "status", "--porcelain=v1", "-z", "--untracked-files=all"];
+    const r = this.requireQuery(
+      await this.git(args, {
+        preserveStdout: true,
+      }),
+      `changed working-tree path query in ${path}`,
+      args,
+    );
+    if (!r.stdout) return [];
     const records = r.stdout.split("\0");
     const paths: string[] = [];
     for (let i = 0; i < records.length; i++) {
@@ -1734,8 +1780,8 @@ export class GitRepo {
    * beyond base.
    */
   async branchAheadOf(baseCommit: string, branch: string): Promise<boolean> {
-    const r = await this.git(["rev-list", "--count", `${baseCommit}..${branch}`]);
-    if (r.code !== 0) return false;
+    const args = ["rev-list", "--count", `${baseCommit}..${branch}`];
+    const r = this.requireQuery(await this.git(args), "branch handoff query", args);
     const n = Number.parseInt(r.stdout, 10);
     return Number.isFinite(n) && n > 0;
   }
@@ -1750,7 +1796,10 @@ export class GitRepo {
    * the safe side (preserve rather than destroy).
    */
   async isAncestor(commit: string, ancestorOf: string): Promise<boolean> {
-    const r = await this.git(["merge-base", "--is-ancestor", commit, ancestorOf]);
-    return r.code === 0;
+    const args = ["merge-base", "--is-ancestor", commit, ancestorOf];
+    const r = await this.git(args);
+    if (r.code === 0) return true;
+    if (r.code === 1) return false;
+    throw new GitQueryError("ancestry safety query", args, r.code, r.stderr || r.stdout);
   }
 }

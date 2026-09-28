@@ -18,6 +18,11 @@ export interface ArtifactStoreHooks {
   afterKeyLockAcquired?: (key: string) => Promise<void> | void;
   /** Deterministic lock-directory swap injection after its descriptor is pinned. */
   afterLockDirectoryOpened?: () => void;
+  /** Crash boundaries for the root-authoritative lock-domain bootstrap. */
+  afterLockBootstrapPrepared?: () => void;
+  afterLockDirectoryCreated?: () => void;
+  afterLockBootstrapBound?: () => void;
+  afterLockDomainPublished?: () => void;
   /** Deterministic crash injection after the durable journal is published. */
   afterJournalCommitted?: (key: string) => Promise<void> | void;
   /** Deterministic delete crash injection after final-file removals are durable. */
@@ -30,7 +35,9 @@ const CANONICAL_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 const IMMUTABLE_ID = /^.+-([a-f0-9]{64})-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const DIGEST = /^[a-f0-9]{64}$/;
 const LOCK_WAIT_MS = 10_000;
+const LOCK_BOOTSTRAP_BIND_WAIT_MS = 1_000;
 const LOCK_DOMAIN_RECORD = ".artifact-lock-domain.json";
+const LOCK_BOOTSTRAP_RECORD = ".artifact-lock-bootstrap.json";
 const LOCK_DOMAIN_TOKEN = ".domain-token";
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -102,6 +109,10 @@ interface LockDomainRecord extends DirectoryIdentity {
   version: 1;
   token: string;
 }
+
+type LockBootstrapRecord =
+  | { version: 1; phase: "prepared"; token: string }
+  | ({ version: 1; phase: "bound"; token: string } & DirectoryIdentity);
 
 /** Filesystem-backed lazy artifact store (spec §25, AC-010). */
 export class ArtifactStore {
@@ -224,9 +235,23 @@ export class ArtifactStore {
     try {
       const path = `${procFd(root.fd)}/.artifact-locks`;
       const existingRecord = await this.readLockDomainRecord(root);
-      if (!existingRecord) {
+      let bootstrap = await this.readLockBootstrapRecord(root);
+      if (!existingRecord && !bootstrap) {
+        try {
+          await lstat(path);
+          throw integrityError("artifact lock root is unproven without a durable bootstrap marker");
+        } catch (error) {
+          if (!isMissing(error)) throw error;
+        }
+        bootstrap = { version: 1, phase: "prepared", token: randomUUID() };
+        await this.writeLockBootstrapRecord(root, bootstrap);
+        this.hooks.afterLockBootstrapPrepared?.();
+      }
+      let createdLockRoot = false;
+      if (!existingRecord && bootstrap?.phase === "prepared") {
         try {
           await mkdir(path, { mode: 0o700 });
+          createdLockRoot = true;
           await root.sync();
         } catch (error) {
           if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
@@ -247,15 +272,49 @@ export class ArtifactStore {
         const identity = await handle.stat({ bigint: true });
         let record = existingRecord;
         if (!record) {
-          const token = await this.ensureLockDomainToken(handle);
+          if (!bootstrap) throw integrityError("artifact lock root bootstrap marker disappeared");
+          // A prepared marker authorizes creating one new domain. It cannot
+          // authorize adopting a directory that appeared after the marker.
+          const token = createdLockRoot
+            ? await this.ensureLockDomainToken(handle, bootstrap.token)
+            : bootstrap.phase === "prepared"
+              ? await this.waitForPreparedLockDomainToken(handle)
+              : await this.readLockDomainToken(handle);
+          if (token !== bootstrap.token) throw integrityError("artifact lock root bootstrap token changed");
+          if (bootstrap.phase === "prepared") {
+            await root.sync();
+            this.hooks.afterLockDirectoryCreated?.();
+            bootstrap = {
+              version: 1,
+              phase: "bound",
+              token,
+              device: identity.dev,
+              inode: identity.ino,
+            };
+            await this.writeLockBootstrapRecord(root, bootstrap);
+            this.hooks.afterLockBootstrapBound?.();
+          } else if (bootstrap.device !== identity.dev || bootstrap.inode !== identity.ino) {
+            throw integrityError("artifact lock root bootstrap identity changed");
+          }
           record = await this.publishLockDomainRecord(root, {
             version: 1,
             token,
             device: identity.dev,
             inode: identity.ino,
           });
+          this.hooks.afterLockDomainPublished?.();
         }
         await this.validateLockDomain(handle, record, identity);
+        if (bootstrap) {
+          if (
+            bootstrap.token !== record.token ||
+            (bootstrap.phase === "bound" && (bootstrap.device !== record.device || bootstrap.inode !== record.inode))
+          ) {
+            throw integrityError("artifact lock root bootstrap does not match the durable domain");
+          }
+          await rm(`${procFd(root.fd)}/${LOCK_BOOTSTRAP_RECORD}`, { force: true });
+          await root.sync();
+        }
         const namedIdentity = await lstat(path, { bigint: true });
         if (namedIdentity.dev !== record.device || namedIdentity.ino !== record.inode) {
           throw integrityError("artifact lock root identity changed");
@@ -266,6 +325,86 @@ export class ArtifactStore {
       }
     } finally {
       await root.close();
+    }
+  }
+
+  private async readLockBootstrapRecord(root: FileHandle): Promise<LockBootstrapRecord | undefined> {
+    const path = `${procFd(root.fd)}/${LOCK_BOOTSTRAP_RECORD}`;
+    let handle: FileHandle;
+    try {
+      handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    } catch (error) {
+      if (isMissing(error)) return undefined;
+      throw error;
+    }
+    try {
+      const stat = await handle.stat();
+      if (!stat.isFile() || (stat.mode & 0o022) !== 0) throw integrityError("artifact lock bootstrap marker is unsafe");
+      let value: unknown;
+      try {
+        value = JSON.parse(await handle.readFile({ encoding: "utf8" }));
+      } catch {
+        throw integrityError("artifact lock bootstrap marker is corrupt");
+      }
+      const candidate = value as Partial<{
+        version: number;
+        phase: string;
+        token: string;
+        device: string;
+        inode: string;
+      }>;
+      if (candidate.version !== 1 || !UUID.test(candidate.token ?? "")) {
+        throw integrityError("artifact lock bootstrap marker is corrupt");
+      }
+      if (candidate.phase === "prepared" && candidate.device === undefined && candidate.inode === undefined) {
+        return { version: 1, phase: "prepared", token: candidate.token! };
+      }
+      if (
+        candidate.phase === "bound" &&
+        typeof candidate.device === "string" &&
+        /^\d+$/.test(candidate.device) &&
+        typeof candidate.inode === "string" &&
+        /^\d+$/.test(candidate.inode)
+      ) {
+        return {
+          version: 1,
+          phase: "bound",
+          token: candidate.token!,
+          device: BigInt(candidate.device),
+          inode: BigInt(candidate.inode),
+        };
+      }
+      throw integrityError("artifact lock bootstrap marker is corrupt");
+    } finally {
+      await handle.close();
+    }
+  }
+
+  private async writeLockBootstrapRecord(root: FileHandle, record: LockBootstrapRecord): Promise<void> {
+    const finalPath = `${procFd(root.fd)}/${LOCK_BOOTSTRAP_RECORD}`;
+    const temporary = `${procFd(root.fd)}/.${LOCK_BOOTSTRAP_RECORD}.${process.pid}.${randomUUID()}.tmp`;
+    const handle = await open(
+      temporary,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+      0o600,
+    );
+    try {
+      await handle.writeFile(
+        `${JSON.stringify({
+          ...record,
+          ...(record.phase === "bound" ? { device: record.device.toString(), inode: record.inode.toString() } : {}),
+        })}\n`,
+        "utf8",
+      );
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    try {
+      await rename(temporary, finalPath);
+      await root.sync();
+    } finally {
+      await rm(temporary, { force: true });
     }
   }
 
@@ -310,9 +449,9 @@ export class ArtifactStore {
     }
   }
 
-  private async ensureLockDomainToken(lockRoot: FileHandle): Promise<string> {
+  private async ensureLockDomainToken(lockRoot: FileHandle, expectedToken?: string): Promise<string> {
     const path = `${procFd(lockRoot.fd)}/${LOCK_DOMAIN_TOKEN}`;
-    const token = randomUUID();
+    const token = expectedToken ?? randomUUID();
     try {
       const handle = await open(
         path,
@@ -334,7 +473,13 @@ export class ArtifactStore {
   }
 
   private async readLockDomainToken(lockRoot: FileHandle): Promise<string> {
-    const handle = await open(`${procFd(lockRoot.fd)}/${LOCK_DOMAIN_TOKEN}`, constants.O_RDONLY | constants.O_NOFOLLOW);
+    let handle: FileHandle;
+    try {
+      handle = await open(`${procFd(lockRoot.fd)}/${LOCK_DOMAIN_TOKEN}`, constants.O_RDONLY | constants.O_NOFOLLOW);
+    } catch (error) {
+      if (isMissing(error)) throw integrityError("artifact lock domain token is missing");
+      throw error;
+    }
     try {
       const stat = await handle.stat();
       if (!stat.isFile() || (stat.mode & 0o022) !== 0) throw integrityError("artifact lock domain token is unsafe");
@@ -343,6 +488,19 @@ export class ArtifactStore {
       return token;
     } finally {
       await handle.close();
+    }
+  }
+
+  private async waitForPreparedLockDomainToken(lockRoot: FileHandle): Promise<string> {
+    const deadline = Date.now() + LOCK_BOOTSTRAP_BIND_WAIT_MS;
+    while (true) {
+      try {
+        return await this.readLockDomainToken(lockRoot);
+      } catch (error) {
+        if (!(error instanceof Error) || !error.message.endsWith("artifact lock domain token is missing")) throw error;
+        if (Date.now() >= deadline) throw error;
+        await delay(10);
+      }
     }
   }
 
@@ -432,6 +590,8 @@ export class ArtifactStore {
     let lockRoot: FileHandle | undefined;
     const deadline = Date.now() + LOCK_WAIT_MS;
     let lock: ExclusiveFileLock | undefined;
+    let result: T | undefined;
+    let operationError: unknown;
     try {
       lockRoot = await this.openLockRoot(root);
       const lockTarget = `${procFd(lockRoot.fd)}/${digest(key)}`;
@@ -446,12 +606,24 @@ export class ArtifactStore {
         }
       }
       await this.hooks.afterKeyLockAcquired?.(key);
-      return await operation(root);
-    } finally {
-      lock?.release();
-      await lockRoot?.close();
-      await root.close();
+      result = await operation(root);
+    } catch (error) {
+      operationError = error;
     }
+    let releaseError: unknown;
+    try {
+      lock?.release();
+    } catch (error) {
+      releaseError = error;
+    }
+    await lockRoot?.close();
+    await root.close();
+    if (operationError && releaseError) {
+      throw new AggregateError([operationError, releaseError], "artifact operation and lock release both failed");
+    }
+    if (operationError) throw operationError;
+    if (releaseError) throw releaseError;
+    return result as T;
   }
 
   private filePath(opened: OpenCategory, id: string, suffix: "json" | "txt" | "txn.json"): string {

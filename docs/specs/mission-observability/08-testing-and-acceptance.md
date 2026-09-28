@@ -148,6 +148,12 @@ It rejects any temp parent in/overlapping a Git worktree, checkout, extension, o
 installation before `mkdtemp`. It validates contract v3 and prints the durable
 mission `id`, revision, status, `observability.acceptanceCoverage`,
 `observability.preservedWork`, typed `stop` (when present), and snapshot path.
+The default installed scenario is not a straight-line completion: it requests
+a production `checkpoint_progress` checkpoint, uses the bounded worker timeout
+to interrupt the public mission, and requires durable checkpoint, recovery,
+stale late-result rejection, preserved-work, and fresh same-model reduced-
+independence review evidence. Recovery attempt must be greater than zero; a
+nonterminal zero-worker result without a next action or actionable stop fails.
 For `COMPLETE`, review finding severity/status values must be valid runtime
 enums, `repaired` must equal `(status === "resolved")`, and `blockingOpen` must
 equal every blocking finding whose status is not resolved. Thus an `accepted`

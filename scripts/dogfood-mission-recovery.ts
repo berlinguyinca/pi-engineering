@@ -152,6 +152,34 @@ function assertActionableOutcome(mission: MissionSnapshotMission, repository: st
   }
 }
 
+function assertRecoveryDogfood(mission: MissionSnapshotMission, durableEvents: string): void {
+  const observability = mission.observability;
+  if (!observability) throw new Error(`mission ${mission.id} has no observability recovery proof`);
+  if (observability.recoveryAttempt.attempt <= 0 || observability.recovery.length === 0) {
+    throw new Error(`mission ${mission.id} did not execute a durable recovery transition`);
+  }
+  if (!durableEvents.includes('"type":"task.checkpointed"')) {
+    throw new Error(`mission ${mission.id} did not preserve a durable checkpoint before interruption`);
+  }
+  if (!durableEvents.includes('"type":"execution.late_result_rejected"')) {
+    throw new Error(`mission ${mission.id} did not reject a stale late worker result`);
+  }
+  if (!durableEvents.includes('"independenceMode":"same_model_reduced"')) {
+    throw new Error(`mission ${mission.id} lacks the fresh same-model reduced-independence review warning`);
+  }
+  if (observability.preservedWork.length === 0) {
+    throw new Error(`mission ${mission.id} did not retain preserved work through recovery`);
+  }
+  if (
+    mission.status !== "COMPLETE" &&
+    observability.workers.active === 0 &&
+    !observability.nextAction.trim() &&
+    !mission.stop?.resumeCondition.trim()
+  ) {
+    throw new Error(`mission ${mission.id} is nonterminal with zero workers and no next action`);
+  }
+}
+
 function record(value: unknown, path: string): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${path} must be an object`);
   return value as Record<string, unknown>;
@@ -415,7 +443,9 @@ async function main(): Promise<void> {
 
   const prompt = [
     "Work only in this temporary repository.",
-    "Add a decrement helper beside next(), add a focused test, run the tests, and finish the durable engineering mission.",
+    "Add a decrement helper beside next() and a focused test.",
+    "After the first edit, publish a checkpoint_progress checkpoint, then run a deliberately slow command so the bounded worker is interrupted.",
+    "Let the public mission supervisor reject the old late result, recover only the remaining work, run tests, and finish or persist a fully actionable stop.",
     "Do not access or modify any parent or unrelated project.",
   ].join(" ");
   const extensionArgs = sourceOnly ? ["--no-extensions", "--extension", extension] : [];
@@ -438,7 +468,11 @@ async function main(): Promise<void> {
         cwd: repository,
         timeout: 15 * 60_000,
         maxBuffer: 16 * 1024 * 1024,
-        env: { ...process.env, PI_MISSION_DOGFOOD_MODEL: REQUIRED_MODEL },
+        env: {
+          ...process.env,
+          PI_MISSION_DOGFOOD_MODEL: REQUIRED_MODEL,
+          PI_ENGINEERING_WORKER_TIMEOUT_MS: process.env.PI_ENGINEERING_WORKER_TIMEOUT_MS ?? "30000",
+        },
       },
     );
   } catch (error) {
@@ -461,6 +495,9 @@ async function main(): Promise<void> {
   const snapshot = validateSnapshot(JSON.parse(await readFile(snapshotPath, "utf8")));
   const mission = snapshot.missions.at(-1);
   if (!mission?.id) throw new Error(`Pi produced no durable mission in ${snapshotPath}`);
+  const eventPath = join(repository, ".pi-eng", "orchestration.jsonl");
+  const durableEvents = await readFile(eventPath, "utf8");
+  assertRecoveryDogfood(mission, durableEvents);
   assertActionableOutcome(mission, repository);
 
   process.stdout.write(
@@ -481,6 +518,10 @@ async function main(): Promise<void> {
           revision: mission.revision,
           contractVersion: snapshot.contractVersion,
           snapshotPath,
+          eventPath,
+          recoveryAttempt: mission.observability?.recoveryAttempt ?? null,
+          lateResultRejected: durableEvents.includes('"type":"execution.late_result_rejected"'),
+          sameModelReducedReview: durableEvents.includes('"independenceMode":"same_model_reduced"'),
           acceptanceCoverage: mission.observability?.acceptanceCoverage ?? null,
           preservedWork: mission.observability?.preservedWork ?? [],
           stop: mission.stop ?? null,

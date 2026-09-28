@@ -204,24 +204,42 @@ async function quarantineObserved(
   }
 }
 
-async function publishRecoveryClaim(path: string, owner: FileLockOwner): Promise<OwnerRecord | undefined> {
+async function publishRecoveryClaim(
+  path: string,
+  owner: FileLockOwner,
+  hooks: FileLockRecoveryHooks,
+): Promise<OwnerRecord | undefined> {
   const candidate = `${path}.candidate.${owner.ownerToken}`;
   await writeFile(candidate, `${JSON.stringify(owner)}\n`, { encoding: "utf8", flag: "wx" });
+  let candidateRecord: OwnerRecord | undefined;
+  let published = false;
   try {
-    const candidateRecord = await readOwnerRecord(candidate);
+    candidateRecord = await readOwnerRecord(candidate);
     if (!candidateRecord) throw new Error("JSONL writer recovery claim candidate is unreadable");
     try {
       // A hard link publishes the fully written identity atomically and, unlike
       // POSIX rename, refuses every pre-existing destination type.
       await link(candidate, path);
-      return candidateRecord;
+      published = true;
     } catch (error) {
-      await closeOwnerRecord(candidateRecord);
       if (!claimCollision(error)) throw error;
       return undefined;
     }
-  } finally {
+    await hooks.beforeRecoveryClaimCandidateCleanup?.(candidate);
     await rm(candidate, { force: true });
+    const transferred = candidateRecord;
+    candidateRecord = undefined;
+    return transferred;
+  } catch (error) {
+    if (published) {
+      // The published claim intentionally remains as a conservative recovery
+      // barrier. Its descriptor is still closed below; no ownership transfer
+      // occurs until candidate cleanup has succeeded.
+    }
+    throw error;
+  } finally {
+    await closeOwnerRecord(candidateRecord);
+    if (!published) await rm(candidate, { force: true });
   }
 }
 
@@ -263,6 +281,18 @@ export interface FileLockRecoveryHooks {
   ) => Promise<void> | void;
   beforeStaleOwnerQuarantine?: (path: string, owner: FileLockOwner) => Promise<void> | void;
   beforeReleaseQuarantine?: (path: string, owner: FileLockOwner) => void;
+  beforeRecoveryClaimCandidateCleanup?: (candidatePath: string) => Promise<void> | void;
+  beforeReleaseCleanup?: (quarantinePath: string, owner: FileLockOwner) => void;
+}
+
+export class FileLockReleaseError extends Error {
+  readonly code = "FILE_LOCK_RELEASE_FAILED";
+
+  constructor(path: string, cause: unknown) {
+    super(`JSONL writer lock release failed for ${path}: ${cause instanceof Error ? cause.message : String(cause)}`);
+    this.name = "FileLockReleaseError";
+    this.cause = cause;
+  }
 }
 
 /**
@@ -346,7 +376,7 @@ export class ExclusiveFileLock {
           // stale owner and every claim remain descriptor-pinned until their
           // owner-conditional deletion completes.
           const claimPath = recoveryClaimPath(path, current.ownerToken);
-          const publishedClaim = await publishRecoveryClaim(claimPath, owner);
+          const publishedClaim = await publishRecoveryClaim(claimPath, owner, hooks);
           if (!publishedClaim) {
             const claimantRecord = await readOwnerRecord(claimPath);
             if (!claimantRecord) {
@@ -434,34 +464,43 @@ export class ExclusiveFileLock {
   release(): void {
     if (this.released) return;
     const fd = this.descriptor;
-    this.descriptor = undefined;
-    this.released = true;
     if (fd === undefined) return;
+    let quarantine: string | undefined;
     try {
       const identity = fstatSync(fd, { bigint: true });
-      if (identity.dev !== this.device || identity.ino !== this.inode) return;
+      if (identity.dev !== this.device || identity.ino !== this.inode) {
+        throw new Error("pinned descriptor identity changed");
+      }
       const current = readOwnerFromDescriptor(fd);
-      if (current.ownerToken !== this.owner.ownerToken) return;
+      if (current.ownerToken !== this.owner.ownerToken) throw new Error("pinned owner token changed");
       this.hooks.beforeReleaseQuarantine?.(this.path, { ...this.owner });
       const named = lstatSync(this.path, { bigint: true });
-      if (named.dev !== this.device || named.ino !== this.inode) return;
-      const quarantine = `${this.path}.release.${this.owner.ownerToken}.${randomUUID()}`;
+      if (named.dev !== this.device || named.ino !== this.inode) throw new Error("named lock identity changed");
+      quarantine = `${this.path}.release.${this.owner.ownerToken}.${randomUUID()}`;
       renameSync(this.path, quarantine);
       const moved = lstatSync(quarantine, { bigint: true });
       if (moved.dev !== this.device || moved.ino !== this.inode) {
+        throw new Error("quarantined lock identity changed");
+      }
+      this.hooks.beforeReleaseCleanup?.(quarantine, { ...this.owner });
+      removeSync(quarantine, { force: true });
+      quarantine = undefined;
+      closeSync(fd);
+      this.descriptor = undefined;
+      this.released = true;
+    } catch (error) {
+      if (quarantine) {
         try {
           linkSync(quarantine, this.path);
           removeSync(quarantine, { force: true });
-        } catch (error) {
-          if (!claimCollision(error)) throw error;
+          quarantine = undefined;
+        } catch (restoreError) {
+          if (!claimCollision(restoreError)) {
+            throw new FileLockReleaseError(this.path, restoreError);
+          }
         }
-        return;
       }
-      removeSync(quarantine, { force: true });
-    } catch {
-      return;
-    } finally {
-      closeSync(fd);
+      throw error instanceof FileLockReleaseError ? error : new FileLockReleaseError(this.path, error);
     }
   }
 }

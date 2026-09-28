@@ -489,7 +489,7 @@ test(
       writeFileSync(replacementLock, originalIdentity, "utf8");
       assert.notEqual(lstatSync(replacementLock).ino, originalInode, "the replacement fixture needs a new inode");
       releaseOperation?.();
-      await pending;
+      await assert.rejects(pending, /release failed.*identity changed/i);
       assert.equal(
         readFileSync(replacementLock, "utf8"),
         originalIdentity,
@@ -702,6 +702,85 @@ test("a reopened store rejects a replaced lock directory while an older store ho
       releaseFirst();
       await firstWrite;
     }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("artifact lock bootstrap fails closed when an unproven lock directory predates every durable marker", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-eng-art-lock-unproven-"));
+  try {
+    const root = join(dir, "artifacts");
+    await mkdir(join(root, ".artifact-locks"), { recursive: true, mode: 0o700 });
+    await assert.rejects(() => ArtifactStore.create(root), /artifact integrity.*lock root.*(?:unproven|bootstrap)/i);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a prepared bootstrap marker cannot authorize a substituted unbound lock directory", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-eng-art-lock-prepared-substitution-"));
+  try {
+    const root = join(dir, "artifacts");
+    const moduleUrl = new URL("../../src/artifacts/ArtifactStore.ts", import.meta.url).href;
+    await assert.rejects(
+      () =>
+        exec(process.execPath, [
+          "--experimental-strip-types",
+          "--input-type=module",
+          "--eval",
+          `import { ArtifactStore } from ${JSON.stringify(moduleUrl)}; await ArtifactStore.create(${JSON.stringify(root)}, { afterLockBootstrapPrepared: () => process.kill(process.pid, "SIGKILL") });`,
+        ]),
+      /SIGKILL|killed/i,
+    );
+    await mkdir(join(root, ".artifact-locks"), { mode: 0o700 });
+    await assert.rejects(() => ArtifactStore.create(root), /artifact integrity.*domain token/i);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("artifact lock bootstrap recovers each durable two-phase crash boundary", async () => {
+  for (const phase of [
+    "afterLockBootstrapPrepared",
+    "afterLockDirectoryCreated",
+    "afterLockBootstrapBound",
+    "afterLockDomainPublished",
+  ] as const) {
+    const dir = await mkdtemp(join(tmpdir(), `pi-eng-art-lock-bootstrap-${phase}-`));
+    try {
+      const root = join(dir, "artifacts");
+      const moduleUrl = new URL("../../src/artifacts/ArtifactStore.ts", import.meta.url).href;
+      await assert.rejects(
+        () =>
+          exec(process.execPath, [
+            "--experimental-strip-types",
+            "--input-type=module",
+            "--eval",
+            `import { ArtifactStore } from ${JSON.stringify(moduleUrl)}; await ArtifactStore.create(${JSON.stringify(root)}, { ${phase}: () => process.kill(process.pid, "SIGKILL") });`,
+          ]),
+        /SIGKILL|killed/i,
+      );
+      const recovered = await ArtifactStore.create(root);
+      await recovered.put("logs", "recovered", phase, phase);
+      assert.equal(await recovered.readContent("logs", "recovered"), phase);
+      await assert.rejects(() => readFile(join(root, ".artifact-lock-bootstrap.json")), /ENOENT/);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+});
+
+test("deleting the final lock record cannot authorize a replacement while the old holder remains live", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-eng-art-lock-record-delete-"));
+  try {
+    const root = join(dir, "artifacts");
+    const first = await ArtifactStore.create(root);
+    renameSync(join(root, ".artifact-locks"), join(root, ".artifact-locks-old"));
+    mkdirSync(join(root, ".artifact-locks"), { mode: 0o700 });
+    rmSync(join(root, ".artifact-lock-domain.json"));
+    await assert.rejects(() => ArtifactStore.create(root), /artifact integrity.*lock root.*(?:unproven|bootstrap)/i);
+    await assert.rejects(() => first.put("logs", "blocked", "bytes", "blocked"), /artifact integrity.*lock root/i);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

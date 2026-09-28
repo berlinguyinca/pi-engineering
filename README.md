@@ -489,8 +489,14 @@ that installed extension normally;
 it does not also pass `--extension`. It refuses non-`local/local` models,
 enabled/advertised metabolomics, and a temporary parent that is or overlaps the
 current checkout, extension/package installation, or any Git worktree. It then
-creates a temporary Git repository only and validates every required snapshot
-contract-v3 field and numeric counter. `COMPLETE` additionally requires a
+creates a temporary Git repository only and drives the installed public mission
+surface through a checkpoint, bounded interruption, stale late-result
+rejection, and recovery/resume. Success requires durable `task.checkpointed`,
+`execution.late_result_rejected`, recovery attempt `> 0`, preserved work, and a
+fresh `local/local` review carrying `same_model_reduced`; a nonterminal mission
+with zero active workers must expose a next action or complete stop/resume
+condition. The script validates every required snapshot contract-v3 field and
+numeric counter. `COMPLETE` additionally requires a
 nonzero declared acceptance total, every declared criterion passed, exact
 coverage, internally consistent passed/failed/skipped test accounting with a
 passing nonfailure result, and a completed review whose blocking count matches

@@ -96,7 +96,12 @@ enabled/advertised metabolomics provider, verifies the unique installed package
 path and exact Git SHA without an explicit `--extension`, and operates only on
 a retained temporary Git repository outside every real Git worktree. The
 installed tree's exact HEAD, tracked changes, index, and untracked files are
-checked before any Pi invocation that can load extensions. Worker checkpoint
+checked before any Pi invocation that can load extensions. The installed
+scenario must traverse the public checkpoint/interruption/recovery path and
+prove a durable recovery attempt greater than zero, `task.checkpointed`, stale
+`execution.late_result_rejected`, preserved work, a fresh same-model
+`same_model_reduced` review, and an explicit next action/stop whenever no worker
+is active. Worker checkpoint
 progress is accepted only from the production tool path when every completed
 declared deliverable is bound to the broker-observed candidate SHA and
 committed path evidence. Artifact references are resolved through the artifact

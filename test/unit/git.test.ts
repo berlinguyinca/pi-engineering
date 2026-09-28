@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
-import { GitRepo } from "../../src/git/GitRepo.ts";
+import { GitQueryError, GitRepo } from "../../src/git/GitRepo.ts";
 import { makeFixtureRepo } from "../fixtures/make-fixture.ts";
 
 const exec = promisify(execFile);
@@ -23,6 +23,51 @@ test("git repo detection and head commit", async () => {
     assert.match(head, /^[0-9a-f]{40}$/);
     const branch = await repo.currentBranch();
     assert.ok(branch === "master" || branch === "main");
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("safety-critical Git queries throw typed errors instead of synthesizing empty state", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const repo = (await GitRepo.open(fixture.root))!;
+    const head = await repo.headCommit();
+    const injectable = repo as unknown as {
+      git(args: string[]): Promise<{ stdout: string; stderr: string; code: number }>;
+    };
+    injectable.git = async () => ({ stdout: "", stderr: "injected query failure", code: 77 });
+    for (const query of [
+      () => repo.captureDiff(head, head),
+      () => repo.changedFiles(head, head),
+      () => repo.statusPathsIn(fixture.root),
+      () => repo.statusIn(fixture.root),
+    ]) {
+      await assert.rejects(query, (error: unknown) => {
+        assert.ok(error instanceof GitQueryError);
+        assert.equal(error.code, "GIT_QUERY_FAILED");
+        assert.match(error.message, /injected query failure/);
+        return true;
+      });
+    }
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("candidate promotion performs no mutation when its clean-status query fails", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const repo = (await GitRepo.open(fixture.root))!;
+    const base = await repo.headCommit();
+    const candidate = await repo.createWorktree(base, "promotion-query-failure");
+    await writeFile(join(candidate.path, "src", "promotion-query.ts"), "export const promoted = true;\n");
+    await repo.commitAll(candidate.path, "candidate change");
+    repo.statusIn = async () => {
+      throw new GitQueryError("candidate status", ["status"], 77, "injected promotion query failure");
+    };
+    await assert.rejects(() => repo.promoteCandidate(candidate, base), /injected promotion query failure/);
+    assert.equal(await repo.headCommit(), base);
   } finally {
     await fixture.cleanup();
   }

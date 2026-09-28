@@ -218,8 +218,8 @@ const snapshot = {
       workflowProgress: { completed: 1, total: 1, approximatePercent: 100, basis: "weighted_dag" },
       health: "complete", workers: { active: 0, waiting: 0, failed: 0 }, lastMeaningfulProgressAt: new Date().toISOString(),
       completionStatus: "verified_complete", progressHistory: [], tests: { running: false, completed: 1, total: 1, passed: 1, failed: 0, skipped: 0, failures: [] },
-      review: { status: "completed", blockingOpen: 0, findings: [] }, workerDetails: [], activity: [], errors: [], recovery: [], changes: { changedFiles: [], commits: [], integrationState: "complete" }, artifacts: [],
-      action: "done", reason: "verified", recoveryAttempt: { attempt: 0, maxAttempts: 2 }, nextAction: "none", nextActionAt: null, owner: null, repository: process.cwd(), task: null, preservedWork: [process.cwd()]
+      review: { status: "completed", blockingOpen: 0, findings: [] }, workerDetails: [], activity: [], errors: [], recovery: [{ attempt: 1, action: "resume_checkpoint", startedAt: new Date().toISOString(), completedAt: new Date().toISOString(), status: "succeeded", summary: "resumed preserved checkpoint work" }], changes: { changedFiles: ["src/counter.js", "test/counter.test.js"], commits: ["fake-recovery"], integrationState: "complete" }, artifacts: ["artifact://checkpoint/fake"],
+      action: "done", reason: "verified after recovery", recoveryAttempt: { attempt: 1, maxAttempts: 2 }, nextAction: "none", nextActionAt: null, owner: null, repository: process.cwd(), task: null, preservedWork: [process.cwd()]
     }
   }]
 };
@@ -248,6 +248,12 @@ if (process.env.FAKE_SNAPSHOT_MODE === "top-finding-projection-mismatch") {
   snapshot.missions[0].observability.review.findings = [{ id: "F-projected", severity: "major", status: "open", summary: "projected", repaired: false }];
 }
 await writeFile(join(process.cwd(), ".pi-eng", "orchestration-snapshot.json"), JSON.stringify(snapshot));
+await writeFile(join(process.cwd(), ".pi-eng", "orchestration.jsonl"), [
+  JSON.stringify({ type: "task.checkpointed", payload: { checkpoint: { completedDeliverables: ["decrement helper"], remainingDeliverables: ["test and review"] } } }),
+  JSON.stringify({ type: "execution.late_result_rejected", payload: { reason: "execution fenced after timeout" } }),
+  JSON.stringify({ type: "recovery.started", payload: { attempt: 1, preservedWork: [process.cwd()] } }),
+  JSON.stringify({ type: "evidence.review_recorded", payload: { evidence: { model: "local/local", independenceMode: "same_model_reduced", warning: "fresh same-model session with reduced independence" } } }),
+].join("\\n") + "\\n");
 `,
   );
   await chmod(executable, 0o755);
@@ -1184,7 +1190,14 @@ describe("mission reliability foundation — synthetic MSN-qSLaeM", () => {
         verificationMode: string;
         installedPackage: string;
         temporaryRepository: string;
-        durableEvidence: { missionId: string; contractVersion: number; acceptanceCoverage: { completed: number } };
+        durableEvidence: {
+          missionId: string;
+          contractVersion: number;
+          acceptanceCoverage: { completed: number };
+          recoveryAttempt: { attempt: number };
+          lateResultRejected: boolean;
+          sameModelReducedReview: boolean;
+        };
       };
       const invocations = (await readFile(fake.log, "utf8"))
         .trim()
@@ -1198,6 +1211,9 @@ describe("mission reliability foundation — synthetic MSN-qSLaeM", () => {
       assert.equal(evidence.durableEvidence.missionId, "MSN-fake-dogfood");
       assert.equal(evidence.durableEvidence.contractVersion, 3);
       assert.equal(evidence.durableEvidence.acceptanceCoverage.completed, 1);
+      assert.equal(evidence.durableEvidence.recoveryAttempt.attempt, 1);
+      assert.equal(evidence.durableEvidence.lateResultRejected, true);
+      assert.equal(evidence.durableEvidence.sameModelReducedReview, true);
       assert.equal(
         args.includes("--extension"),
         false,

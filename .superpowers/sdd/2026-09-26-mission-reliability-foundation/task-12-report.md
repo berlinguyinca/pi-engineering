@@ -1,5 +1,57 @@
 # Task 12 Prerequisite Report — Final Artifact Integrity
 
+## Final Whole-Branch Fix Wave (base `eb37f17`)
+
+The final blocking review findings are closed in one cohesive package:
+
+- Artifact lock-domain initialization now publishes a private, root-level,
+  fsynced `.artifact-lock-bootstrap.json` before `.artifact-locks` can be
+  created. Its `prepared` token and `bound` device/inode/token phases are
+  recovered explicitly; an absent final domain record without this proof fails
+  closed. Crash tests cover every durable bootstrap boundary, legitimate first
+  initialization/concurrent recovery, an unproven preexisting directory, a
+  directory substituted after the prepared marker but before binding, and
+  deletion of the final record followed by directory replacement while the old
+  domain is still held.
+- Recovery-claim publication transfers its pinned descriptor only after the
+  candidate name is cleaned successfully, and all collision/error paths close
+  their owned descriptor. `ExclusiveFileLock.release()` now throws structured
+  `FILE_LOCK_RELEASE_FAILED`, keeps its descriptor and ownership state until
+  quarantine cleanup succeeds, and restores the fixed name on a cleanup fault.
+  `JsonlEventStore.close()` retains the writer lock/open-file registration and
+  surfaces that error. Fault injection, replacement, reacquisition, and
+  repeated descriptor-count tests cover the lifecycle.
+- Safety-critical Git queries now throw `GitQueryError` with
+  `GIT_QUERY_FAILED`; `captureDiff`, `changedFiles`, `statusPathsIn`,
+  `statusIn`, branch-ahead/current-branch/ancestry, and non-missing commit
+  resolution no longer synthesize empty or clean state. Broker harvest,
+  evidence/materiality, cleanup, and promotion paths propagate or preserve on
+  query failure. Injected failures prove no unverified handoff or promotion,
+  no gate evidence on an invalidated capture, and retention of cleanup targets
+  when ancestry cannot be established.
+- Installed/default mission-recovery dogfood now requests the production
+  checkpoint tool and a bounded interruption rather than accepting a
+  straight-line completion. The result must contain durable checkpoint and
+  recovery history with attempt greater than zero, a stale late-result
+  rejection, preserved work, a fresh `local/local`
+  `same_model_reduced` review record, and an actionable next step/stop whenever
+  zero workers remain. The fake installed fixture exercises the same contract;
+  local-only, metabolomics-disabled, temp-only, exact installed SHA, and clean
+  installed-tree guards remain mandatory.
+
+### Final verification evidence
+
+- Focused artifact/lock/Git/broker/recovery/mission suites passed.
+- `npm run test:unit`: 2,349 passed.
+- `npm run test:integration`: 339 passed; 1 optional test skipped.
+- `npm run test:mission-reliability`: 37 passed.
+- `npm run build`: core and scripts TypeScript checks passed.
+- `npm run lint`: 592 files checked, no errors.
+- `npm run test:e2e`: package load passed with 21 commands and 7 tools.
+- `git diff --check`: passed.
+
+No push, PR, merge, or installation was performed in this final fix wave.
+
 ## Outcome
 
 The Task 12 prerequisite rulings are closed before independent review:

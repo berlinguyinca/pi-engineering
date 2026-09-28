@@ -585,8 +585,61 @@ describe("EventStore backends", () => {
         writeFileSync(path, replacement, "utf8");
       },
     });
-    lock.release();
+    assert.throws(() => lock.release(), /release failed.*identity changed/i);
     assert.equal(await readFile(`${file}.lock`, "utf8"), replacement);
+  });
+
+  it("retains the pinned descriptor when recovery-claim candidate cleanup fails", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pie-store-claim-cleanup-fault-"));
+    const file = join(dir, "events.jsonl");
+    await writeFile(`${file}.lock`, `${JSON.stringify(await deadLockOwner("stale-owner-cleanup-fault"))}\n`);
+    await assert.rejects(
+      () =>
+        ExclusiveFileLock.acquire(file, {
+          beforeRecoveryClaimCandidateCleanup: () => {
+            throw new Error("injected candidate cleanup failure");
+          },
+        }),
+      /injected candidate cleanup failure/,
+    );
+    await assert.rejects(() => ExclusiveFileLock.acquire(file), /recovery.*claimed/i);
+  });
+
+  it("release failure retains ownership and Jsonl close surfaces the cleanup error", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pie-store-release-fault-"));
+    const file = join(dir, "events.jsonl");
+    let failCleanup = true;
+    const store = await JsonlEventStore.open(file, {
+      beforeReleaseCleanup: () => {
+        if (failCleanup) {
+          failCleanup = false;
+          throw new Error("injected release cleanup failure");
+        }
+      },
+    });
+    assert.throws(() => store.close(), /injected release cleanup failure/);
+    assert.equal(store.ownsWriterLock(), true);
+    await assert.rejects(() => JsonlEventStore.open(file), /already open|writer lock/i);
+    store.close();
+    assert.equal(store.ownsWriterLock(), false);
+    assert.deepEqual(
+      (await readdir(dir)).filter((entry) => entry.includes(".release.")),
+      [],
+    );
+    const reacquired = await JsonlEventStore.open(file);
+    reacquired.close();
+  });
+
+  it("closes every pinned descriptor across repeated acquire and release cycles", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pie-store-descriptor-count-"));
+    const file = join(dir, "events.jsonl");
+    const before = (await readdir("/proc/self/fd")).length;
+    for (let index = 0; index < 50; index += 1) {
+      const lock = await ExclusiveFileLock.acquire(file);
+      lock.release();
+    }
+    const after = (await readdir("/proc/self/fd")).length;
+    assert.ok(after <= before + 2, `descriptor count grew from ${before} to ${after}`);
   });
 
   it("repairs a torn final record instead of swallowing the next event", async () => {

@@ -3076,6 +3076,99 @@ describe("ExecutionBroker (spec 03)", () => {
     }
   });
 
+  it("publishes no handoff when the Git harvest safety query fails", async () => {
+    const fx = await makeFixtureRepo();
+    try {
+      const git = (await GitRepo.open(fx.root))!;
+      const store = MissionStore.open(JsonlEventStore.inMemory());
+      const mission = store.createMission({
+        title: "query failure",
+        goal: "query failure",
+        user_request: "query failure",
+        repository: fx.root,
+        base_ref: await git.headCommit(),
+        risk_profile: "medium",
+        workflow_class: "engineering_review",
+      });
+      const task = store.createTask({
+        mission_id: mission.mission_id,
+        kind: "agent",
+        role: "implementer",
+        objective: "query failure",
+        mutates_repo: true,
+        isolation: "worktree",
+        write_domains: ["src/**"],
+      });
+      store.transitionTask(task.task_id, "READY");
+      git.branchAheadOf = async () => {
+        throw new Error("injected Git handoff query failure");
+      };
+      const seenHandoffs: unknown[] = [];
+      const broker = new ExecutionBroker({
+        store,
+        git,
+        baseRef: mission.base_ref,
+        backends: {
+          agent: {
+            runAgent: async ({ worktree }) => {
+              await writeFile(join(worktree!, "src", "query-failure.ts"), "export const value = 1;\n");
+              return {
+                executionId: "query-failure",
+                exitStatus: "succeeded",
+                summary: "done",
+                artifactRefs: [],
+                usage: {},
+              };
+            },
+          },
+          integration: {
+            runIntegration: async ({ handoffs }) => {
+              seenHandoffs.push(...handoffs);
+              return {
+                executionId: "integration",
+                exitStatus: "succeeded",
+                summary: "integrated",
+                artifactRefs: [],
+                usage: {},
+              };
+            },
+          },
+        },
+      });
+      const outcome = await (
+        await broker.execute({
+          taskId: task.task_id,
+          missionId: mission.mission_id,
+          kind: "agent",
+          role: "implementer",
+          objective: task.objective,
+          mutatesRepo: true,
+          isolation: "worktree",
+        })
+      ).result();
+      assert.equal(outcome.exitStatus, "failed");
+      assert.ok(store.listFindings(mission.mission_id).some((finding) => finding.severity === "major"));
+      const integration = store.createTask({
+        mission_id: mission.mission_id,
+        kind: "integration",
+        role: "integrator",
+        objective: "integrate only verified handoffs",
+      });
+      await (
+        await broker.execute({
+          taskId: integration.task_id,
+          missionId: mission.mission_id,
+          kind: "integration",
+          role: "integrator",
+          objective: integration.objective,
+        })
+      ).result();
+      assert.deepEqual(seenHandoffs, []);
+    } finally {
+      await fx.cleanup();
+    }
+  });
+
   it("surfaces an attributable finding when a mutating worker succeeds with no edits to harvest", async () => {
     const fx = await makeFixtureRepo();
     try {

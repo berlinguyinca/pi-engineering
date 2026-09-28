@@ -33,7 +33,7 @@ import { appendFile, mkdir, readFile, rename, truncate, writeFile } from "node:f
 import { dirname } from "node:path";
 import { emitTelemetry } from "../../telemetry/sink.ts";
 import type { EventStoreBackend, StoredEvent } from "./backend.ts";
-import { ExclusiveFileLock } from "./fileLock.ts";
+import { ExclusiveFileLock, type FileLockRecoveryHooks } from "./fileLock.ts";
 
 /** Files held by a live instance in this process, so two cannot diverge silently. */
 const openFiles = new Set<string>();
@@ -54,7 +54,7 @@ export class JsonlEventStore implements EventStoreBackend {
     this.memoryOnly = memoryOnly;
   }
 
-  static async open(file: string): Promise<JsonlEventStore> {
+  static async open(file: string, lockHooks: FileLockRecoveryHooks = {}): Promise<JsonlEventStore> {
     // Two instances over one file each hold their own array and never re-read,
     // so each reports a silently partial history — and every consumer built on
     // `all()` (the control plane's feed, a rebuild, a health rollup) inherits
@@ -66,7 +66,7 @@ export class JsonlEventStore implements EventStoreBackend {
       );
     }
     const store = new JsonlEventStore(file, false);
-    store.writerLock = await ExclusiveFileLock.acquire(file);
+    store.writerLock = await ExclusiveFileLock.acquire(file, lockHooks);
     try {
       await store.load();
       openFiles.add(file);
@@ -85,14 +85,14 @@ export class JsonlEventStore implements EventStoreBackend {
 
   /** Release the file so another instance may open it. */
   close(): void {
-    if (this.closed) return;
+    if (this.closed && this.writerLock === null) return;
     this.closed = true;
     if (this.pendingAppends === 0) this.releaseWriterLock();
   }
 
   /** True when this backend can prove it owns the local mutation boundary. */
   ownsWriterLock(): boolean {
-    return this.memoryOnly || (this.writerLock !== null && !this.closed);
+    return this.memoryOnly || this.writerLock !== null;
   }
 
   private async load(): Promise<void> {
@@ -228,9 +228,9 @@ export class JsonlEventStore implements EventStoreBackend {
 
   private releaseWriterLock(): void {
     if (this.memoryOnly) return;
-    openFiles.delete(this.file);
     this.writerLock?.release();
     this.writerLock = null;
+    openFiles.delete(this.file);
   }
 }
 
