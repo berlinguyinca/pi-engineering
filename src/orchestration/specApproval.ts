@@ -429,7 +429,7 @@ export function validateReviewResult(raw: unknown, allowedAcceptanceIds: string[
       throw new SpecApprovalError("MALFORMED_REVIEW", `invalid acceptance result status ${value.result}`);
     }
     seen.add(acceptanceId);
-    return { acceptanceId, result: value.result };
+    return { acceptanceId, result: value.result as "covered" | "uncovered" | "not_applicable" };
   });
   if (allowedAcceptanceIds.some((acceptanceId) => !seen.has(acceptanceId))) {
     throw new SpecApprovalError("INCOMPLETE_REVIEW", "review omitted a required acceptance result");
@@ -942,7 +942,7 @@ export class SpecApprovalController {
       summary: result.summary ?? "",
       confidence: result.confidence ?? 0,
       reviewerSession: sessionId,
-      reviewerModel: result.modelId,
+      reviewerModel: result.modelId ?? model.id,
       provider: model.provider,
       independenceMode,
       reviewedAt: this.now(),

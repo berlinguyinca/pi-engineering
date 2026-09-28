@@ -2603,27 +2603,27 @@ export class MissionStore {
   // ── Autonomous spec approval records ────────────────────────────────────
 
   appendSpecStage(stage: import("./specApproval.ts").SpecStageAttempt): void {
-    this.emit("spec.stage", stage.missionId, { actor: "system", stage });
+    this.apply(this.emit("spec.stage", stage.missionId, { actor: "system", stage }));
   }
 
   appendSpecRevision(revision: import("./specApproval.ts").MissionSpecRevision): void {
-    this.emit("spec.revision", revision.missionId, { actor: "system", revision });
+    this.apply(this.emit("spec.revision", revision.missionId, { actor: "system", revision }));
   }
 
   appendSpecReview(review: import("./specApproval.ts").SpecReviewEvidence): void {
-    this.emit("spec.review", review.missionId, { actor: "system", review });
+    this.apply(this.emit("spec.review", review.missionId, { actor: "system", review }));
   }
 
   appendSpecApproval(approval: import("./specApproval.ts").SpecApproval): void {
-    this.emit("spec.approval", approval.missionId, { actor: "system", approval });
+    this.apply(this.emit("spec.approval", approval.missionId, { actor: "system", approval }));
   }
 
   /** Durable invalidation event carrying the prior approval ID + new fencing identity. */
   invalidateSpecApproval(missionId: string, approvalId: string, reason: string, fencingToken: number): void {
-    this.emit("spec.invalidation", missionId, {
+    this.apply(this.emit("spec.invalidation", missionId, {
       actor: "system",
       invalidation: { missionId, approvalId, reason, fencingToken },
-    });
+    }));
   }
 
   appendSpecMaterialization(
@@ -2633,10 +2633,10 @@ export class MissionStore {
     created: string[],
     reused: string[],
   ): void {
-    this.emit("spec.materialized", missionId, {
+    this.apply(this.emit("spec.materialized", missionId, {
       actor: "system",
       materialization: { missionId, approvalId, semanticSpecHash, created, reused },
-    });
+    }));
   }
 
   getSpecRevision(missionId: string): import("./specApproval.ts").MissionSpecRevision | null {

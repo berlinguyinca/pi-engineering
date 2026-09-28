@@ -368,6 +368,13 @@ export interface EngineeringRuntimeOptions {
     mission: import("../orchestration/types.ts").Mission,
     risk: import("../orchestration/types.ts").RiskProfile,
   ) => Promise<PlanTaskInput[]>;
+  /**
+   * Optional autonomous spec approval hook (design 2026-09-28). When provided,
+   * material mutations are reviewed/refined/approved and their tasks are
+   * materialized only from the current approval before dispatch. Defaults to
+   * off so the existing fast path is preserved.
+   */
+  orchestrationSpecApproval?: OrchestratorOptions["specApproval"];
 }
 
 /**
@@ -825,6 +832,7 @@ export class EngineeringRuntime {
         backends,
         observability: rt.missionObservability,
         planner: opts.orchestrationPlanner ?? defaultPlanner,
+        specApproval: opts.orchestrationSpecApproval,
         parentSessionId: null,
         git: rt.git,
         artifacts: rt.artifacts,

@@ -24,8 +24,8 @@ import {
   type SpecPlannedTask,
   type SpecReviewEvidence,
   type SpecScopeEnvelope,
-  type SpecWorkerModel,
 } from "../../src/orchestration/specApproval.ts";
+import type { SpecWorkerModel } from "../../src/orchestration/specBackends.ts";
 
 function protectedInputs(overrides: Partial<ProtectedUserCriteria> = {}): ProtectedUserCriteria {
   return {
