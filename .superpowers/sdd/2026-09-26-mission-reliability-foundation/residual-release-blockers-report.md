@@ -215,3 +215,83 @@ Broader evidence after the fix:
 - The claimant continues using its pinned descriptor after a helper rename, so there is no second name-based reopen.
 - Either opener may publish the durable domain record first; existing hard-link no-clobber publication makes both converge on the same token/device/inode record.
 - Crash hooks and legacy prepared-marker recovery remain unchanged and passed their complete artifact regression suite.
+
+## Fresh re-review fix round — bootstrap lifecycle ABA
+
+### Finding
+
+Fresh re-review found that absence of both durable-domain and bootstrap records was read once, before staging. A paused stale opener could therefore resume after another opener had published the durable domain and safely removed its marker, claim a new conflicting bootstrap, and split the lifecycle metadata. Cleanup was also a name-only removal, so it was not conditional on the marker inode that had actually been inspected.
+
+### Deterministic TDD RED
+
+Added a `beforeLockBootstrapClaim` deterministic test seam and a two-process regression. The stale opener observes absence, stages/pins its directory, and pauses immediately before the no-clobber claim. The winner then publishes the final directory and durable domain and removes its marker. Releasing the stale opener reproduced the critical failure.
+
+Command:
+
+```text
+node --test --test-name-pattern='stale pre-claim opener converges' test/unit/artifacts.test.ts
+```
+
+Behavioral RED after installing only the deterministic seam:
+
+```text
+tests 1
+pass 0
+fail 1
+Error: ARTIFACT INTEGRITY: artifact lock root path was substituted during bootstrap
+```
+
+Before the seam was wired, the same test failed at its barrier (`stale opener did not reach the pre-claim barrier`), confirming the test could not silently pass without exercising the intended ordering.
+
+### Fix
+
+- Revalidate the durable domain after every bootstrap claim result, including successful stale claims and claim collisions.
+- When a durable domain exists, retire the obsolete marker and converge on the durable domain instead of attempting to publish staged authority.
+- Revalidate the domain when the final directory appears after the initial absence read.
+- Treat `EEXIST` followed by marker disappearance as legitimate only when the durable domain is already present.
+- Replace name-only marker deletion with descriptor-pinned cleanup: parse and validate the opened marker, rename it to a unique quarantine, verify the moved device/inode, then remove it. If the name changed, preserve/restore the replacement and do not delete it.
+- Resolve helper rename races by accepting `ENOENT` from staging rename only when the final name is the exact pinned staged inode.
+- Once the durable domain is validated against the open lock directory, an obsolete conflicting bootstrap cannot supersede it; cleanup remains conditional on the exact record/inode observed.
+
+### Cross-process stress
+
+Added a real subprocess stress test with four fresh roots per test run and 24 simultaneous Node processes per root. Each process independently imports and opens `ArtifactStore`; every iteration then verifies no bootstrap marker remains and reopens/writes through the durable domain.
+
+During GREEN iteration, this stress test exposed and drove fixes for three additional legitimate interleavings:
+
+1. a helper renamed the staged inode between another helper's `lstat` and `rename` (`ENOENT`);
+2. a stale absence observer encountered the final path after the durable domain was published;
+3. a no-clobber claim loser observed marker cleanup before it could read the marker.
+
+Final stress command:
+
+```text
+for run in 1 2 3 4 5 6 7 8 9 10; do node --test --test-name-pattern='stale pre-claim opener converges|cross-process first-open stress|original bootstrap claimant accepts' test/unit/artifacts.test.ts || exit 1; done
+```
+
+Meaningful output:
+
+```text
+10 consecutive runs passed
+each run: tests 3, pass 3, fail 0
+960 cross-process first opens exercised across the 10 stress runs
+```
+
+### Final verification
+
+- Focused bootstrap set: 8 passed, 0 failed.
+- `node --test test/unit/artifacts.test.ts` — 30 passed, 0 failed.
+- `npm run typecheck` — core and scripts passed.
+- `npm run lint` — 592 files checked, no fixes required.
+- `npm test` — 2,699 passed, 0 failed, 1 optional Postgres test skipped because `TEST_DATABASE_URL` was absent.
+- `npm run test:e2e` — command registration and package loading passed (`21 commands`, `7 tools`).
+- `git diff --check` — passed.
+
+### ABA fix-round self-review
+
+- Durable domain publication remains the terminal authority; bootstrap records are creation/recovery arbitration only and can never supersede an existing validated domain.
+- Every stale-claim convergence path closes its private staged descriptor and never adopts its staged inode.
+- Marker cleanup never unlinks by unchecked name. A changed inode is restored/preserved and is not deleted.
+- Directory acceptance remains exact device/inode/token based. Marker retirement does not weaken same-name directory substitution checks.
+- Crash hooks execute only after a successful claim has revalidated that no durable domain exists, so injected crashes cannot leave a post-domain conflicting marker.
+- The process stress test checks actual cross-process filesystem ordering, not only in-process Promise scheduling.

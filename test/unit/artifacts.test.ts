@@ -818,6 +818,78 @@ test("the original bootstrap claimant accepts a helper publishing its exact stag
   }
 });
 
+test("a stale pre-claim opener converges after another opener publishes and cleans the domain", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-eng-art-lock-bootstrap-aba-"));
+  const ready = join(dir, "stale-ready");
+  const release = join(dir, "release-stale");
+  let stale: ReturnType<typeof exec> | undefined;
+  try {
+    const root = join(dir, "artifacts");
+    const moduleUrl = new URL("../../src/artifacts/ArtifactStore.ts", import.meta.url).href;
+    stale = exec(process.execPath, [
+      "--experimental-strip-types",
+      "--input-type=module",
+      "--eval",
+      `import { existsSync, writeFileSync } from "node:fs"; import { ArtifactStore } from ${JSON.stringify(moduleUrl)}; await ArtifactStore.create(${JSON.stringify(root)}, { beforeLockBootstrapClaim: () => { writeFileSync(${JSON.stringify(ready)}, "ready"); while (!existsSync(${JSON.stringify(release)})) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10); } });`,
+    ]);
+
+    const deadline = Date.now() + 5_000;
+    while (true) {
+      try {
+        await readFile(ready);
+        break;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        if (Date.now() >= deadline) throw new Error("stale opener did not reach the pre-claim barrier");
+        await new Promise((resolveDelay) => setTimeout(resolveDelay, 10));
+      }
+    }
+
+    const winner = await ArtifactStore.create(root);
+    await winner.put("logs", "winner", "durable", "winner published domain");
+    const durableBefore = await readFile(join(root, ".artifact-lock-domain.json"), "utf8");
+    await assert.rejects(() => readFile(join(root, ".artifact-lock-bootstrap.json")), /ENOENT/);
+
+    await writeFile(release, "release\n");
+    await stale;
+
+    assert.equal(await readFile(join(root, ".artifact-lock-domain.json"), "utf8"), durableBefore);
+    await assert.rejects(() => readFile(join(root, ".artifact-lock-bootstrap.json")), /ENOENT/);
+    const reopened = await ArtifactStore.create(root);
+    assert.equal(await reopened.readContent("logs", "winner"), "durable");
+  } finally {
+    await writeFile(release, "release\n").catch(() => undefined);
+    await stale?.catch(() => undefined);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("cross-process first-open stress converges without a lingering conflicting bootstrap", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-eng-art-lock-bootstrap-process-stress-"));
+  try {
+    const moduleUrl = new URL("../../src/artifacts/ArtifactStore.ts", import.meta.url).href;
+    for (let iteration = 0; iteration < 4; iteration++) {
+      const root = join(dir, `artifacts-${iteration}`);
+      await Promise.all(
+        Array.from({ length: 24 }, () =>
+          exec(process.execPath, [
+            "--experimental-strip-types",
+            "--input-type=module",
+            "--eval",
+            `import { ArtifactStore } from ${JSON.stringify(moduleUrl)}; await ArtifactStore.create(${JSON.stringify(root)});`,
+          ]),
+        ),
+      );
+      await assert.rejects(() => readFile(join(root, ".artifact-lock-bootstrap.json")), /ENOENT/);
+      const reopened = await ArtifactStore.create(root);
+      await reopened.put("logs", "stress", `${iteration}`, "cross-process convergence");
+      assert.equal(await reopened.readContent("logs", "stress"), `${iteration}`);
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("artifact lock bootstrap recovers each durable two-phase crash boundary", async () => {
   for (const phase of [
     "afterLockBootstrapPrepared",

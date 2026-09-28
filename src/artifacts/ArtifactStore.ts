@@ -19,6 +19,7 @@ export interface ArtifactStoreHooks {
   /** Deterministic lock-directory swap injection after its descriptor is pinned. */
   afterLockDirectoryOpened?: () => void;
   /** Crash boundaries for the root-authoritative lock-domain bootstrap. */
+  beforeLockBootstrapClaim?: () => void;
   afterLockBootstrapPrepared?: () => void;
   /** Deterministic substitution/crash point after the created inode is durably bound but before it is opened. */
   afterLockDirectoryCreatedBeforeOpen?: () => void;
@@ -115,6 +116,53 @@ interface LockDomainRecord extends DirectoryIdentity {
 type LockBootstrapRecord =
   | { version: 1; phase: "prepared"; token: string }
   | ({ version: 1; phase: "bound"; token: string } & DirectoryIdentity);
+
+function parseLockBootstrapRecord(contents: string): LockBootstrapRecord {
+  let value: unknown;
+  try {
+    value = JSON.parse(contents);
+  } catch {
+    throw integrityError("artifact lock bootstrap marker is corrupt");
+  }
+  const candidate = value as Partial<{
+    version: number;
+    phase: string;
+    token: string;
+    device: string;
+    inode: string;
+  }>;
+  if (candidate.version !== 1 || !UUID.test(candidate.token ?? "")) {
+    throw integrityError("artifact lock bootstrap marker is corrupt");
+  }
+  if (candidate.phase === "prepared" && candidate.device === undefined && candidate.inode === undefined) {
+    return { version: 1, phase: "prepared", token: candidate.token! };
+  }
+  if (
+    candidate.phase === "bound" &&
+    typeof candidate.device === "string" &&
+    /^\d+$/.test(candidate.device) &&
+    typeof candidate.inode === "string" &&
+    /^\d+$/.test(candidate.inode)
+  ) {
+    return {
+      version: 1,
+      phase: "bound",
+      token: candidate.token!,
+      device: BigInt(candidate.device),
+      inode: BigInt(candidate.inode),
+    };
+  }
+  throw integrityError("artifact lock bootstrap marker is corrupt");
+}
+
+function sameLockBootstrapRecord(left: LockBootstrapRecord, right: LockBootstrapRecord): boolean {
+  return (
+    left.phase === right.phase &&
+    left.token === right.token &&
+    (left.phase === "prepared" ||
+      (right.phase === "bound" && left.device === right.device && left.inode === right.inode))
+  );
+}
 
 /** Filesystem-backed lazy artifact store (spec §25, AC-010). */
 export class ArtifactStore {
@@ -237,39 +285,59 @@ export class ArtifactStore {
     let stagedHandle: FileHandle | undefined;
     try {
       const path = `${procFd(root.fd)}/.artifact-locks`;
-      const existingRecord = await this.readLockDomainRecord(root);
+      let existingRecord = await this.readLockDomainRecord(root);
       let bootstrap = await this.readLockBootstrapRecord(root);
+      if (existingRecord && bootstrap) {
+        await this.removeLockBootstrapRecord(root, bootstrap);
+        bootstrap = undefined;
+      }
       let createdLockRoot = false;
       if (!existingRecord && !bootstrap) {
         try {
           await lstat(path);
-          throw integrityError("artifact lock root is unproven without a durable bootstrap marker");
+          const durable = await this.readLockDomainRecord(root);
+          if (!durable) throw integrityError("artifact lock root is unproven without a durable bootstrap marker");
+          existingRecord = durable;
         } catch (error) {
           if (!isMissing(error)) throw error;
         }
-        const token = randomUUID();
-        const stagingPath = `${procFd(root.fd)}/.artifact-locks.stage.${token}`;
-        await mkdir(stagingPath, { mode: 0o700 });
-        stagedHandle = await open(stagingPath, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
-        assertTrustedDirectory(await stagedHandle.stat(), "staged artifact lock root");
-        const stagedIdentity = await stagedHandle.stat({ bigint: true });
-        await this.ensureLockDomainToken(stagedHandle, token);
-        const proposed: LockBootstrapRecord = {
-          version: 1,
-          phase: "bound",
-          token,
-          device: stagedIdentity.dev,
-          inode: stagedIdentity.ino,
-        };
-        const claim = await this.claimLockBootstrapRecord(root, proposed);
-        bootstrap = claim.record;
-        if (!claim.claimed) {
-          await stagedHandle.close();
-          stagedHandle = undefined;
-          await rm(stagingPath, { recursive: true, force: true });
-        } else {
-          this.hooks.afterLockBootstrapPrepared?.();
-          this.hooks.afterLockBootstrapBound?.();
+        if (!existingRecord) {
+          const token = randomUUID();
+          const stagingPath = `${procFd(root.fd)}/.artifact-locks.stage.${token}`;
+          await mkdir(stagingPath, { mode: 0o700 });
+          stagedHandle = await open(stagingPath, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+          assertTrustedDirectory(await stagedHandle.stat(), "staged artifact lock root");
+          const stagedIdentity = await stagedHandle.stat({ bigint: true });
+          await this.ensureLockDomainToken(stagedHandle, token);
+          const proposed: LockBootstrapRecord = {
+            version: 1,
+            phase: "bound",
+            token,
+            device: stagedIdentity.dev,
+            inode: stagedIdentity.ino,
+          };
+          this.hooks.beforeLockBootstrapClaim?.();
+          const claim = await this.claimLockBootstrapRecord(root, proposed);
+          bootstrap = claim.record;
+          if (!claim.claimed) {
+            await stagedHandle.close();
+            stagedHandle = undefined;
+            await rm(stagingPath, { recursive: true, force: true });
+          }
+          const durable = await this.readLockDomainRecord(root);
+          if (durable) {
+            await this.removeLockBootstrapRecord(root, claim.record);
+            if (claim.claimed && stagedHandle) {
+              await stagedHandle.close();
+              stagedHandle = undefined;
+              await rm(stagingPath, { recursive: true, force: true });
+            }
+            bootstrap = undefined;
+            existingRecord = durable;
+          } else if (claim.claimed) {
+            this.hooks.afterLockBootstrapPrepared?.();
+            this.hooks.afterLockBootstrapBound?.();
+          }
         }
       }
       let createdIdentity: { dev: bigint; ino: bigint } | undefined;
@@ -329,8 +397,16 @@ export class ArtifactStore {
             if (!isMissing(error)) throw error;
           }
           if (!exactInodeAlreadyPublished) {
-            await rename(stagingPath, path);
-            await root.sync();
+            try {
+              await rename(stagingPath, path);
+              await root.sync();
+            } catch (error) {
+              if (!isMissing(error)) throw error;
+              const namedIdentity = await lstat(path, { bigint: true }).catch(() => undefined);
+              if (namedIdentity?.dev !== stagedIdentity.dev || namedIdentity.ino !== stagedIdentity.ino) {
+                throw integrityError("artifact lock root path was substituted during bootstrap");
+              }
+            }
           }
           createdLockRoot = true;
           createdIdentity = stagedIdentity;
@@ -386,10 +462,19 @@ export class ArtifactStore {
             bootstrap.token !== record.token ||
             (bootstrap.phase === "bound" && (bootstrap.device !== record.device || bootstrap.inode !== record.inode))
           ) {
-            throw integrityError("artifact lock root bootstrap does not match the durable domain");
+            const durable = await this.readLockDomainRecord(root);
+            if (
+              !durable ||
+              durable.token !== record.token ||
+              durable.device !== record.device ||
+              durable.inode !== record.inode
+            ) {
+              throw integrityError("artifact lock root bootstrap does not match the durable domain");
+            }
+            await this.removeLockBootstrapRecord(root, bootstrap);
+            bootstrap = undefined;
           }
-          await rm(`${procFd(root.fd)}/${LOCK_BOOTSTRAP_RECORD}`, { force: true });
-          await root.sync();
+          if (bootstrap) await this.removeLockBootstrapRecord(root, bootstrap);
         }
         const namedIdentity = await lstat(path, { bigint: true });
         if (namedIdentity.dev !== record.device || namedIdentity.ino !== record.inode) {
@@ -417,41 +502,50 @@ export class ArtifactStore {
     try {
       const stat = await handle.stat();
       if (!stat.isFile() || (stat.mode & 0o022) !== 0) throw integrityError("artifact lock bootstrap marker is unsafe");
-      let value: unknown;
+      return parseLockBootstrapRecord(await handle.readFile({ encoding: "utf8" }));
+    } finally {
+      await handle.close();
+    }
+  }
+
+  private async removeLockBootstrapRecord(root: FileHandle, expected: LockBootstrapRecord): Promise<boolean> {
+    const path = `${procFd(root.fd)}/${LOCK_BOOTSTRAP_RECORD}`;
+    let handle: FileHandle;
+    try {
+      handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    } catch (error) {
+      if (isMissing(error)) return true;
+      throw error;
+    }
+    try {
+      const stat = await handle.stat();
+      if (!stat.isFile() || (stat.mode & 0o022) !== 0) {
+        throw integrityError("artifact lock bootstrap marker is unsafe");
+      }
+      const identity = await handle.stat({ bigint: true });
+      const current = parseLockBootstrapRecord(await handle.readFile({ encoding: "utf8" }));
+      if (!sameLockBootstrapRecord(current, expected)) {
+        return false;
+      }
+      const quarantine = `${procFd(root.fd)}/.${LOCK_BOOTSTRAP_RECORD}.${expected.token}.${randomUUID()}.cleanup`;
       try {
-        value = JSON.parse(await handle.readFile({ encoding: "utf8" }));
-      } catch {
-        throw integrityError("artifact lock bootstrap marker is corrupt");
+        await rename(path, quarantine);
+      } catch (error) {
+        if (isMissing(error)) return true;
+        throw error;
       }
-      const candidate = value as Partial<{
-        version: number;
-        phase: string;
-        token: string;
-        device: string;
-        inode: string;
-      }>;
-      if (candidate.version !== 1 || !UUID.test(candidate.token ?? "")) {
-        throw integrityError("artifact lock bootstrap marker is corrupt");
+      const moved = await lstat(quarantine, { bigint: true });
+      if (moved.dev !== identity.dev || moved.ino !== identity.ino) {
+        try {
+          await link(quarantine, path);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        }
+        return false;
       }
-      if (candidate.phase === "prepared" && candidate.device === undefined && candidate.inode === undefined) {
-        return { version: 1, phase: "prepared", token: candidate.token! };
-      }
-      if (
-        candidate.phase === "bound" &&
-        typeof candidate.device === "string" &&
-        /^\d+$/.test(candidate.device) &&
-        typeof candidate.inode === "string" &&
-        /^\d+$/.test(candidate.inode)
-      ) {
-        return {
-          version: 1,
-          phase: "bound",
-          token: candidate.token!,
-          device: BigInt(candidate.device),
-          inode: BigInt(candidate.inode),
-        };
-      }
-      throw integrityError("artifact lock bootstrap marker is corrupt");
+      await rm(quarantine, { force: true });
+      await root.sync();
+      return true;
     } finally {
       await handle.close();
     }
@@ -515,7 +609,22 @@ export class ArtifactStore {
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
       const existing = await this.readLockBootstrapRecord(root);
-      if (!existing) throw integrityError("artifact lock bootstrap marker disappeared during arbitration");
+      if (!existing) {
+        const durable = await this.readLockDomainRecord(root);
+        if (durable) {
+          return {
+            record: {
+              version: 1,
+              phase: "bound",
+              token: durable.token,
+              device: durable.device,
+              inode: durable.inode,
+            },
+            claimed: false,
+          };
+        }
+        throw integrityError("artifact lock bootstrap marker disappeared during arbitration");
+      }
       return { record: existing, claimed: false };
     } finally {
       await rm(candidate, { force: true });
