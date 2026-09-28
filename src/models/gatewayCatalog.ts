@@ -108,6 +108,7 @@ export class CatalogFetchError extends Error {
 
 /** Fetch and parse the gateway's catalogue. Throws `CatalogFetchError`. */
 export async function fetchGatewayModels(opts: FetchCatalogOptions): Promise<GatewayModelEntry[]> {
+  opts.signal?.throwIfAborted();
   const base = (opts.baseUrl || DEFAULT_GATEWAY_BASE_URL).replace(/\/+$/, "");
   const doFetch = opts.fetchImpl ?? fetch;
   const timer = new AbortController();
@@ -126,6 +127,7 @@ export async function fetchGatewayModels(opts: FetchCatalogOptions): Promise<Gat
       headers,
       signal: timer.signal,
     });
+    opts.signal?.throwIfAborted();
     if (!res.ok) throw new CatalogFetchError(`gateway returned ${res.status} for ${base}/models`, res.status);
     const body: unknown = await res.json().catch(() => null);
     const models = parseGatewayModels(body);
@@ -145,6 +147,7 @@ export async function fetchGatewayModels(opts: FetchCatalogOptions): Promise<Gat
     }
     return models;
   } catch (err) {
+    opts.signal?.throwIfAborted();
     if (err instanceof CatalogFetchError) throw err;
     throw new CatalogFetchError(err instanceof Error ? err.message : String(err));
   } finally {

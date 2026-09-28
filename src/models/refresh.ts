@@ -100,6 +100,7 @@ export async function refreshProviderModels(opts: RefreshOptions): Promise<Refre
     return result;
   }
 
+  opts.signal?.throwIfAborted();
   const write = writeModelsConfig(
     opts.modelsPath,
     withProviderModels(config, opts.providerId, result.plan.next),
@@ -129,7 +130,9 @@ export async function refreshConfiguredProviders(
 
   for (const providerId of opts.providerIds) {
     try {
+      opts.signal?.throwIfAborted();
       const auth = (await opts.authForProvider?.(providerId)) ?? {};
+      opts.signal?.throwIfAborted();
       const result = await planProviderRefresh(nextConfig, {
         modelsPath: opts.modelsPath,
         providerId,
@@ -141,6 +144,7 @@ export async function refreshConfiguredProviders(
         ...(opts.signal ? { signal: opts.signal } : {}),
         ...(opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}),
       });
+      opts.signal?.throwIfAborted();
       if (result.plan.dirty && opts.dryRun) result.lines.push("Dry run — nothing written.");
       if (result.plan.dirty && !opts.dryRun) {
         nextConfig = withProviderModels(nextConfig, providerId, result.plan.next);
@@ -148,6 +152,7 @@ export async function refreshConfiguredProviders(
       results.push({ providerId, result });
       lines.push(...result.lines);
     } catch (cause) {
+      opts.signal?.throwIfAborted();
       const error = cause instanceof Error ? cause : new Error(String(cause));
       failures.push({ providerId, error });
       lines.push(`${providerId} — skipped: ${error.message}. Existing configuration kept.`);
@@ -157,6 +162,7 @@ export async function refreshConfiguredProviders(
   const dirty = results.some(({ result }) => result.plan.dirty);
   if (!dirty || opts.dryRun) return { results, failures, written: false, lines };
 
+  opts.signal?.throwIfAborted();
   const write = writeModelsConfig(opts.modelsPath, nextConfig, (opts.now ?? (() => new Date()))());
   const commonLines = [`Wrote ${opts.modelsPath}`];
   if (write.backupPath) commonLines.push(`Previous version kept at ${write.backupPath}`);

@@ -15,6 +15,7 @@
  *     used to be.
  */
 
+import { randomUUID } from "node:crypto";
 import {
   constants,
   chmodSync,
@@ -95,13 +96,13 @@ export const MAX_BACKUPS = 5;
 
 /** A filesystem-safe timestamp for backup filenames. */
 function stamp(now: Date): string {
-  return now.toISOString().replace(/[-:]/g, "").replace(/\..+$/, "").replace("T", "-");
+  return now.toISOString().replace(/[-:]/g, "").replace("T", "-").replace(".", "-");
 }
 
 function createBackup(path: string, mode: number, now: Date): string {
   const prefix = `${path}.bak-${stamp(now)}`;
-  for (let suffix = 0; ; suffix++) {
-    const candidate = suffix === 0 ? prefix : `${prefix}-${suffix}`;
+  for (;;) {
+    const candidate = `${prefix}-${randomUUID()}`;
     try {
       copyFileSync(path, candidate, constants.COPYFILE_EXCL);
       chmodSync(candidate, mode);
@@ -138,16 +139,17 @@ export function writeModelsConfig(path: string, config: ModelsConfig, now: Date 
     // The temporary file holds the API key. Leaving one behind after a failed
     // write is a stray credential copy nobody will think to look for.
     rmSync(tmp, { force: true });
+    if (result.backupPath) rmSync(result.backupPath, { force: true });
     throw err;
   }
 
-  const pruned = pruneBackups(path);
+  const pruned = pruneBackups(path, result.backupPath);
   if (pruned.length > 0) result.prunedBackups = pruned;
   return result;
 }
 
 /** Remove all but the newest `MAX_BACKUPS` backups of `path`. */
-function pruneBackups(path: string): string[] {
+function pruneBackups(path: string, protectedPath?: string): string[] {
   const dir = dirname(path);
   const prefix = `${path.slice(dir.length + 1)}.bak-`;
   let names: string[];
@@ -156,8 +158,11 @@ function pruneBackups(path: string): string[] {
   } catch {
     return [];
   }
-  // Names embed a sortable timestamp, so lexical order is chronological.
-  const stale = names.sort().slice(0, Math.max(0, names.length - MAX_BACKUPS));
+  // Names embed a sortable timestamp. Never select the backup just returned:
+  // clocks can move backwards and same-millisecond writes sort by UUID.
+  const protectedName = protectedPath?.slice(dir.length + 1);
+  const candidates = names.filter((name) => name !== protectedName).sort();
+  const stale = candidates.slice(0, Math.max(0, names.length - MAX_BACKUPS));
   const removed: string[] = [];
   for (const name of stale) {
     const full = join(dir, name);

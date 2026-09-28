@@ -145,6 +145,24 @@ test("models config: writes in the same second allocate distinct backups", () =>
   }
 });
 
+test("models config: rapid rotation keeps the reported restore point", () => {
+  const s = scratch();
+  try {
+    writeFileSync(s.path, JSON.stringify(CONFIG), { mode: 0o600 });
+    const now = new Date("2026-09-28T12:00:00.123Z");
+    let expected = CONFIG;
+    for (let i = 0; i < MAX_BACKUPS + 2; i++) {
+      const next = withProviderModels(CONFIG, "metabolomics", [{ id: `rapid-${i}` }]);
+      const result = writeModelsConfig(s.path, next, now);
+      assert.ok(result.backupPath && existsSync(result.backupPath), "the returned restore point must still exist");
+      assert.deepEqual(JSON.parse(readFileSync(result.backupPath, "utf8")), expected);
+      expected = next;
+    }
+  } finally {
+    s.cleanup();
+  }
+});
+
 test("models config: a first write needs no backup", () => {
   const s = scratch();
   try {
@@ -193,11 +211,18 @@ test("models config: a failed write leaves no key-bearing temp file behind", () 
     writeFileSync(s.path, JSON.stringify(CONFIG), { mode: 0o600 });
     // A value JSON.stringify refuses, so the write throws mid-operation.
     const poison = { ...CONFIG, bad: 1n as unknown as number };
-    assert.throws(() => writeModelsConfig(s.path, poison as ModelsConfig));
+    for (let i = 0; i < MAX_BACKUPS + 2; i++) {
+      assert.throws(() => writeModelsConfig(s.path, poison as ModelsConfig));
+    }
 
     assert.deepEqual(
       readdirSync(s.dir).filter((f) => f.includes("tmp")),
       [],
+    );
+    assert.deepEqual(
+      readdirSync(s.dir).filter((f) => f.includes(".bak-")),
+      [],
+      "a failed replacement must not leave another credential copy",
     );
     assert.deepEqual(readModelsConfig(s.path), CONFIG, "and the original is intact");
   } finally {

@@ -322,6 +322,37 @@ test("refresh: multiple successful providers share one restorable batch backup",
   }
 });
 
+test("refresh: cancellation stops later providers and prevents a partial write", async () => {
+  const original = {
+    providers: {
+      first: { baseUrl: "https://first.example/v1", models: [{ id: "old-first", contextWindow: 8_192 }] },
+      second: { baseUrl: "https://second.example/v1", models: [{ id: "old-second", contextWindow: 8_192 }] },
+    },
+  };
+  const s = scratch(original);
+  const controller = new AbortController();
+  const requested: string[] = [];
+  try {
+    await assert.rejects(() =>
+      refreshConfiguredProviders({
+        modelsPath: s.path,
+        providerIds: ["first", "second"],
+        signal: controller.signal,
+        fetchImpl: (async (input: string | URL | Request) => {
+          requested.push(String(input));
+          controller.abort();
+          return { ok: true, status: 200, json: async () => ({ data: [{ id: "new", ctx_per_request: 262_144 }] }) };
+        }) as typeof fetch,
+      }),
+    );
+
+    assert.equal(requested.length, 1);
+    assert.deepEqual(JSON.parse(readFileSync(s.path, "utf8")), original);
+  } finally {
+    s.cleanup();
+  }
+});
+
 test("refresh: a malformed config fails before any network call", async () => {
   const s = scratch(null);
   writeFileSync(s.path, "{ not json", { mode: 0o600 });

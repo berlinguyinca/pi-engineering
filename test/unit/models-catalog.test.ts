@@ -264,6 +264,21 @@ test("catalog: a null Authorization header suppresses the default bearer credent
   );
 });
 
+test("catalog: a pre-aborted signal performs no request", async () => {
+  let fetched = false;
+  await assert.rejects(() =>
+    fetchGatewayModels({
+      baseUrl: "https://gateway.invalid/v1",
+      signal: AbortSignal.abort(),
+      fetchImpl: (async () => {
+        fetched = true;
+        throw new Error("must not fetch");
+      }) as unknown as typeof fetch,
+    }),
+  );
+  assert.equal(fetched, false);
+});
+
 test("catalog: an HTTP failure is reported with its status, not swallowed", async () => {
   await assert.rejects(
     () =>
