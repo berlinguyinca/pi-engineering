@@ -402,7 +402,7 @@ export interface BrokerOptions {
   activityHeartbeatMs?: number;
   checkpoints?: CheckpointManager;
   /** Content authority for artifact-backed checkpoint progress claims. */
-  artifacts?: Pick<ArtifactStore, "readContentByUri" | "putImmutable">;
+  artifacts?: Pick<ArtifactStore, "readContentByUri" | "putImmutable" | "verifyAndDispatch">;
   /** Maximum cancellation delay while waiting for the backend writer to acknowledge abort. */
   cancellationAckTimeoutMs?: number;
 }
@@ -616,35 +616,38 @@ export class ExecutionBroker {
     }) as CheckpointRecoveryContext;
   }
 
-  /**
-   * Resolve and hash recovery artifacts, then invoke the selected backend in
-   * that same promise continuation. Keeping the backend call inside the hash
-   * callback prevents an already-queued microtask from changing bytes between
-   * the final verification and dispatch.
-   */
+  private async preliminaryRecoveryContext(
+    input: ExecutionRequestInput,
+  ): Promise<CheckpointRecoveryContext | undefined> {
+    const recovery = this.durableRecoveryContext(input);
+    if (!recovery) return undefined;
+    for (const [index, ref] of recovery.artifactRefs.entries()) {
+      let content: string | undefined;
+      try {
+        content = await this.artifacts?.readContentByUri(ref);
+      } catch {
+        content = undefined;
+      }
+      const expectedHash = recovery.artifactHashes[index]!;
+      const actualHash = content === undefined ? null : `sha256:${createHash("sha256").update(content).digest("hex")}`;
+      if (actualHash !== expectedHash) throw new Error(`checkpoint recovery artifact content mismatch for ${ref}`);
+    }
+    return recovery;
+  }
+
+  /** Read/hash current canonical bytes and invoke the runner in one call stack. */
   private dispatchWithVerifiedRecovery<T>(
     input: ExecutionRequestInput,
-    dispatch: (recovery: CheckpointRecoveryContext | undefined) => Promise<T>,
-  ): Promise<T> {
+    dispatch: (recovery: CheckpointRecoveryContext | undefined) => T,
+  ): T {
     const recovery = this.durableRecoveryContext(input);
     if (!recovery) return dispatch(undefined);
-    const reads = recovery.artifactRefs.map((ref) => {
-      try {
-        return Promise.resolve(this.artifacts?.readContentByUri(ref)).catch(() => undefined);
-      } catch {
-        return Promise.resolve(undefined);
-      }
-    });
-    return Promise.all(reads).then((contents) => {
-      for (const [index, ref] of recovery.artifactRefs.entries()) {
-        const content = contents[index];
-        const expectedHash = recovery.artifactHashes[index]!;
-        const actualHash =
-          content === undefined ? null : `sha256:${createHash("sha256").update(content).digest("hex")}`;
-        if (actualHash !== expectedHash) {
-          throw new Error(`checkpoint recovery artifact content mismatch for ${ref}`);
-        }
-      }
+    if (!this.artifacts) {
+      if (recovery.artifactRefs.length > 0) throw new Error("checkpoint recovery artifact store is unavailable");
+      input.recovery = recovery;
+      return dispatch(recovery);
+    }
+    return this.artifacts.verifyAndDispatch(recovery.artifactRefs, recovery.artifactHashes, () => {
       input.recovery = recovery;
       return dispatch(recovery);
     });
@@ -1980,7 +1983,7 @@ export class ExecutionBroker {
       writeDomains: (rawInput.writeDomains ?? []).map(canonicalizeWriteDomain),
     };
     this.assertReplacementSpec(input);
-    input.recovery = await this.dispatchWithVerifiedRecovery(input, async (recovery) => recovery);
+    input.recovery = await this.preliminaryRecoveryContext(input);
     input.authority?.assertAuthoritative();
     const executionStartedAt = Date.now();
     const executionBudgetMs = input.executionBudgetMs ?? input.timeoutPolicy?.timeoutMs ?? this.defaultTimeoutMs;

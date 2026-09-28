@@ -994,7 +994,7 @@ describe("mission reliability foundation — synthetic MSN-qSLaeM", () => {
     }
   });
 
-  it("does not dispatch recovery across a double-queued post-verification mutation", async () => {
+  it("reads current canonical bytes in the true-final synchronous verify-and-dispatch call", async () => {
     const first = await greenFixture();
     const second = await greenFixture();
     const artifactRoot = await mkdtemp(join(tmpdir(), "pi-eng-checkpoint-microtask-tamper-"));
@@ -1002,26 +1002,31 @@ describe("mission reliability foundation — synthetic MSN-qSLaeM", () => {
       const artifacts = await ArtifactStore.create(artifactRoot);
       const body = "immutable checkpoint evidence";
       const immutable = await artifacts.putImmutable("checkpoint", "CHK-qSLaeM", body, "proof");
-      const originalRead = artifacts.readContentByUri.bind(artifacts);
-      let reads = 0;
-      artifacts.readContentByUri = ((uri: string) => {
-        reads++;
-        if (reads !== 2) return originalRead(uri);
-        const verifiedBytes = Promise.resolve<string | undefined>(body);
-        void verifiedBytes.then(() =>
-          queueMicrotask(() =>
-            writeFileSync(join(artifactRoot, "checkpoint", `${immutable.id}.txt`), "microtask tamper", "utf8"),
-          ),
-        );
-        return verifiedBytes;
-      }) as typeof artifacts.readContentByUri;
       const h = await blockedCheckpointHarness([first.root, second.root], {
         store: artifacts,
         refs: [immutable.uri],
         hashes: [`sha256:${createHash("sha256").update(body).digest("hex")}`],
       });
+      const originalRead = artifacts.readContentByUri.bind(artifacts);
+      let preliminaryReads = 0;
+      artifacts.readContentByUri = ((uri: string) => {
+        preliminaryReads++;
+        return originalRead(uri);
+      }) as typeof artifacts.readContentByUri;
+      const integrityStore = artifacts as ArtifactStore & {
+        verifyAndDispatch<T>(refs: readonly string[], hashes: readonly string[], dispatch: () => T): T;
+      };
+      const originalFinalRead = integrityStore.verifyAndDispatch.bind(integrityStore);
+      let finalReads = 0;
+      integrityStore.verifyAndDispatch = ((refs, hashes, dispatch) => {
+        finalReads += refs.length;
+        writeFileSync(join(artifactRoot, "checkpoint", `${immutable.id}.txt`), "microtask tamper", "utf8");
+        return originalFinalRead(refs, hashes, dispatch);
+      }) as typeof integrityStore.verifyAndDispatch;
       await h.orchestrator.repairBlockedMission(h.mission.mission_id).catch(() => undefined);
 
+      assert.equal(finalReads, 2, "both concurrently prepared replacements perform a true-final synchronous read");
+      assert.equal(preliminaryReads, 2, "each replacement still performs its fail-fast preliminary read");
       assert.equal(h.replacementDispatches(), 0, "tampered recovery bytes must never enter runAgent");
       assert.equal(h.store.getMission(h.mission.mission_id)?.status, "BLOCKED");
     } finally {

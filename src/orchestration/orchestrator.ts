@@ -116,7 +116,7 @@ export interface OrchestratorOptions {
   /** Git provider used to allocate isolated worktrees for mutating tasks. */
   git?: GitRepo | null;
   /** Artifact authority used to validate checkpoint evidence references. */
-  artifacts?: Pick<ArtifactStore, "readContentByUri" | "putImmutable">;
+  artifacts?: Pick<ArtifactStore, "readContentByUri" | "putImmutable" | "verifyAndDispatch">;
   /** Base ref (commit) worktrees are created at. Defaults to current HEAD. */
   baseRef?: string;
   /**

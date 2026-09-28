@@ -1,9 +1,13 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { promisify } from "node:util";
 import { ArtifactStore } from "../../src/artifacts/ArtifactStore.ts";
+
+const exec = promisify(execFile);
 
 test("artifacts are stored on disk and read lazily by URI", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-eng-art-"));
@@ -184,6 +188,116 @@ test("immutable policy uses private canonical keys and frozen metadata across li
     );
     await assert.rejects(() => reopened.delete(immutable.uri), /immutable checkpoint artifact/i);
     assert.equal(await reopened.readContentByUri(immutable.uri), "trusted bytes");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a stale store and a separate process cannot overwrite a newly durable immutable key", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-eng-art-cross-process-"));
+  try {
+    const root = join(dir, "artifacts");
+    const stale = await ArtifactStore.create(root);
+    const moduleUrl = new URL("../../src/artifacts/ArtifactStore.ts", import.meta.url).href;
+    const child = await exec(
+      process.execPath,
+      [
+        "--experimental-strip-types",
+        "--input-type=module",
+        "--eval",
+        `import { ArtifactStore } from ${JSON.stringify(moduleUrl)}; const store = await ArtifactStore.create(${JSON.stringify(root)}); const meta = await store.putImmutable("checkpoint", "TCP-child", "child trusted bytes", "child"); process.stdout.write(meta.id);`,
+      ],
+      { encoding: "utf8" },
+    );
+    const id = child.stdout.trim();
+    assert.match(id, /^TCP-child-/);
+
+    await assert.rejects(
+      () => stale.put("checkpoint", id, "stale overwrite", "stale"),
+      /immutable checkpoint artifact/i,
+    );
+    assert.equal(await stale.readContent("checkpoint", id), "child trusted bytes");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("concurrent processes serialize one canonical key without mixing content and metadata", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-eng-art-process-race-"));
+  try {
+    const root = join(dir, "artifacts");
+    const moduleUrl = new URL("../../src/artifacts/ArtifactStore.ts", import.meta.url).href;
+    const writer = (label: string, byte: string) =>
+      exec(process.execPath, [
+        "--experimental-strip-types",
+        "--input-type=module",
+        "--eval",
+        `import { ArtifactStore } from ${JSON.stringify(moduleUrl)}; const store = await ArtifactStore.create(${JSON.stringify(root)}); await new Promise((resolve) => setTimeout(resolve, 200)); await store.put("logs", "shared", ${JSON.stringify(byte)}.repeat(1048576), ${JSON.stringify(label)});`,
+      ]);
+
+    await Promise.all([writer("first", "a"), writer("second", "b")]);
+
+    const reopened = await ArtifactStore.create(root);
+    const meta = reopened.getByUri("artifact://logs/shared")!;
+    const content = await reopened.readContentByUri(meta.uri);
+    assert.equal(meta.size, 1_048_576);
+    assert.equal(content, meta.summary === "first" ? "a".repeat(1_048_576) : "b".repeat(1_048_576));
+    assert.ok(meta.summary === "first" || meta.summary === "second");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("corrupt immutable replay reserves the canonical key instead of permitting overwrite", async () => {
+  for (const corruption of ["mismatched-uri", "missing-marker"] as const) {
+    const dir = await mkdtemp(join(tmpdir(), `pi-eng-art-corrupt-${corruption}-`));
+    try {
+      const root = join(dir, "artifacts");
+      const stale = await ArtifactStore.create(root);
+      const writer = await ArtifactStore.create(root);
+      const immutable = await writer.putImmutable("checkpoint", "TCP-corrupt", "trusted bytes", "proof");
+      const metadataPath = join(root, "checkpoint", `${immutable.id}.json`);
+      const metadata = JSON.parse(await readFile(metadataPath, "utf8")) as Record<string, unknown>;
+      if (corruption === "mismatched-uri") metadata.uri = `artifact://other/${immutable.id}`;
+      else delete metadata.immutable;
+      await writeFile(metadataPath, JSON.stringify(metadata), "utf8");
+
+      await assert.rejects(() => ArtifactStore.create(root), /artifact integrity/i);
+      await assert.rejects(
+        () => stale.put("checkpoint", immutable.id, "overwrite", "overwrite"),
+        /artifact integrity/i,
+      );
+      assert.equal(await readFile(join(root, "checkpoint", `${immutable.id}.txt`), "utf8"), "trusted bytes");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+});
+
+test("artifact reads, writes, and deletes reject symlinked categories and final files", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-eng-art-symlink-"));
+  try {
+    const root = join(dir, "artifacts");
+    const outside = join(dir, "outside");
+    await mkdir(root, { recursive: true });
+    await mkdir(outside, { recursive: true });
+    const store = await ArtifactStore.create(root);
+    await symlink(outside, join(root, "linked"), "dir");
+
+    await assert.rejects(() => store.put("linked", "escape", "outside", "bad"), /symlink|containment/i);
+    await assert.rejects(() => store.readContent("linked", "escape"), /symlink|containment/i);
+
+    const meta = await store.put("safe", "item", "trusted", "proof");
+    const contentPath = join(root, "safe", "item.txt");
+    const outsideFile = join(outside, "outside.txt");
+    await writeFile(outsideFile, "outside", "utf8");
+    await rm(contentPath);
+    await symlink(outsideFile, contentPath);
+
+    await assert.rejects(() => store.readContent("safe", "item"), /symlink|containment/i);
+    await assert.rejects(() => store.put("safe", "item", "overwrite", "bad"), /symlink|containment/i);
+    await assert.rejects(() => store.delete(meta.uri), /symlink|containment/i);
+    assert.equal(await readFile(outsideFile, "utf8"), "outside");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
