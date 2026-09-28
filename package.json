@@ -9,7 +9,9 @@
     ".": "./src/index.ts"
   },
   "scripts": {
-    "typecheck": "tsc --noEmit",
+    "typecheck": "npm run typecheck:core && npm run typecheck:scripts",
+    "typecheck:core": "tsc --noEmit",
+    "typecheck:scripts": "tsc --noEmit -p tsconfig.scripts.json",
     "test": "node --test \"test/unit/**/*.test.ts\" \"test/integration/**/*.test.ts\"",
     "test:unit": "node --test \"test/unit/**/*.test.ts\"",
     "test:integration": "node --test \"test/integration/**/*.test.ts\"",
@@ -25,7 +27,7 @@
     "roadmap:status": "node scripts/pi-engineering.ts roadmap status",
     "lint": "biome check .",
     "format": "biome format --write .",
-    "build": "tsc --noEmit"
+    "build": "npm run typecheck"
   },
   "bin": {
     "pi-engineering": "./scripts/pi-engineering.ts"

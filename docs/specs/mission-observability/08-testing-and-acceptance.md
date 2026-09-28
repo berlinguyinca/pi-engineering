@@ -135,10 +135,16 @@ The deterministic public-surface proof is
 `npm run test:mission-reliability`. The opt-in installed-Pi check is
 `npm run dogfood:mission-recovery`; it exits before repository creation unless
 the effective model is exactly `local/local` and metabolomics is absent or
-disabled. The command creates and retains a temporary repository, then prints
-the durable mission ID, revision, status, acceptance coverage, preserved work,
-typed stop (when present), and snapshot path. It never points Pi at the runtime
-checkout or another real project.
+disabled. Its default Task 12 path validates one installed package path and its
+exact Git SHA, relies on installed discovery (no duplicate `--extension`), and
+rejects any temp parent in/overlapping a Git worktree, checkout, extension, or
+installation before `mkdtemp`. It validates contract v3 and prints the durable
+mission `id`, revision, status, `observability.acceptanceCoverage`,
+`observability.preservedWork`, typed `stop` (when present), and snapshot path.
+Only verified `COMPLETE` or an allowed stopped state with a complete actionable
+stop succeeds; `FAILED`/`CANCELED` exit nonzero and retain the exact path. The
+explicitly labeled source-only diagnostic uses `--no-extensions` plus one
+source `--extension` and is not the installed-package proof.
 
 Status text is contractual: workerless runnable work is `ORPHANED`, unresolved
 dependency-only work is `DEADLOCKED`, heartbeat without meaningful progress is

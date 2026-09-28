@@ -1443,6 +1443,18 @@ export class ExecutionBroker {
     for (const repoId of repoIds) {
       const git = this.resolveRepository ? (await this.resolveRepository(repoId, [], missionId)).git : this.git;
       if (!git) continue;
+      // Narrow Git fault doubles used by public orchestration tests may not
+      // implement the optional lifecycle-inventory diagnostics. They can still
+      // provide authoritative execution behavior; simply omit unavailable
+      // diagnostic refs from an actionable stop.
+      if (
+        typeof git.loadCandidateLifecycleInventory !== "function" ||
+        typeof git.loadIntegrationRunInventory !== "function" ||
+        typeof git.loadPromotionLifecycleInventory !== "function" ||
+        typeof git.loadPendingBranchCleanupInventory !== "function"
+      ) {
+        continue;
+      }
       const [candidates, runs, promotions, cleanups] = await Promise.all([
         git.loadCandidateLifecycleInventory(missionId, repoId),
         git.loadIntegrationRunInventory(missionId, repoId),
@@ -2001,6 +2013,7 @@ export class ExecutionBroker {
             git: GitRepo;
           } | null = null;
           let meaningfulActivity = 0;
+          const completedDeliverables = new Set<string>();
           let checkpointScheduling = true;
           let retainWorktreeOnCleanup = false;
           let detachedAfterTerminalAbort = false;
@@ -2075,12 +2088,12 @@ export class ExecutionBroker {
             return checkpointChain;
           };
           const queueCheckpoint = (
-            completedDeliverables: string[] = [],
+            completed: string[] = [...completedDeliverables],
             artifactRefs: string[] = [],
             artifactHashes: string[] = [],
           ): void => {
             if (!checkpointScheduling) return;
-            void persistCheckpoint(completedDeliverables, artifactRefs, artifactHashes).catch((error) => {
+            void persistCheckpoint(completed, artifactRefs, artifactHashes).catch((error) => {
               retainWorktreeOnCleanup = true;
               this.retainWorktree(input.missionId, execution.execution_id);
               if (this.store.getExecution(execution.execution_id)?.status !== "RUNNING") {
@@ -2102,6 +2115,9 @@ export class ExecutionBroker {
             if (activitySettled || abort.signal.aborted) return;
             const safe = sanitizeWorkerActivity(event);
             if (!safe) return;
+            for (const deliverable of safe.completedDeliverables ?? []) {
+              if (input.deliverables?.includes(deliverable)) completedDeliverables.add(deliverable);
+            }
             if (safe.kind !== "heartbeat") lastActivityAt = Date.now();
             if (safe.meaningfulProgress && input.checkpointPolicy?.activity_milestone) {
               meaningfulActivity++;
@@ -2224,7 +2240,7 @@ export class ExecutionBroker {
                       assertOrigin,
                     );
                     assertOrigin();
-                    await writeCheckpoint([], [], [], preservedPaths);
+                    await writeCheckpoint([...completedDeliverables], [], [], preservedPaths);
                   });
                   cancelCheckpointPromise = checkpointChain.catch((error) => {
                     retainWorktreeOnCleanup = true;

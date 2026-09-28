@@ -11,6 +11,12 @@ export interface WorkerActivity {
   meaningfulProgress: boolean;
   elapsedMs?: number;
   lastActivityMs?: number;
+  /**
+   * Deliverable identities the worker has completed so far. The broker treats
+   * these as progress hints only after intersecting them with the durable task
+   * declaration; arbitrary worker-provided identities never gain authority.
+   */
+  completedDeliverables?: string[];
 }
 
 /** A delegated task for a fresh-context worker (INV-002, §12). */

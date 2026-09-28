@@ -916,7 +916,9 @@ export class Orchestrator {
   }
 
   private async preservedMissionWork(missionId: string): Promise<string[]> {
-    return [
+    const durableRepositoryRefs = await this.broker.durableRepositoryStateRefs(missionId);
+    const repository = this.store.getMission(missionId)?.repository;
+    const preserved = [
       ...new Set(
         [
           ...this.store
@@ -936,10 +938,11 @@ export class Orchestrator {
               candidate.identity.diffHash,
               ...candidate.identity.artifactHashes,
             ]),
-          ...(await this.broker.durableRepositoryStateRefs(missionId)),
+          ...durableRepositoryRefs,
         ].filter((value): value is string => !!value?.trim()),
       ),
     ];
+    return preserved.length > 0 ? preserved : repository?.trim() ? [repository] : [];
   }
 
   private assertRepairCheckpoint(failed: OrchestrationTask, checkpoint: import("./types.ts").TaskCheckpoint): void {
@@ -1561,6 +1564,44 @@ export class Orchestrator {
         };
       }
 
+      // A wall-clock timeout with a durable partial checkpoint is not an
+      // integration candidate. Stop at the public repair boundary so recovery
+      // can split exactly the remaining deliverables and fence the late worker.
+      const timedCheckpoint = this.store
+        .listTasks(mission.mission_id)
+        .filter((task) => task.status === "FAILED" && task.assigned_execution_id)
+        .map((task) => ({
+          task,
+          execution: this.store.getExecution(task.assigned_execution_id!),
+          checkpoint: this.store.listTaskCheckpoints(mission.mission_id, task.task_id).at(-1),
+        }))
+        .find(
+          ({ execution, checkpoint }) =>
+            execution?.exit_status === "timeout" && (checkpoint?.remainingDeliverables.length ?? 0) > 0,
+        );
+      if (timedCheckpoint) {
+        const summary = "task execution budget exhausted after a durable partial checkpoint";
+        const classification = this.failureClassifier.classify({
+          missionId: mission.mission_id,
+          taskId: timedCheckpoint.task.task_id,
+          executionId: timedCheckpoint.execution!.execution_id,
+          summary,
+          evidenceRefs: [timedCheckpoint.checkpoint!.checkpointId],
+          category: "TASK_BUDGET_EXHAUSTED",
+          observedAt: new Date(this.scheduler.now()).toISOString(),
+        });
+        this.store.classifyFailure(classification);
+        this.store.transitionMission(mission.mission_id, "BLOCKED");
+        const blocked = this.store.getMission(mission.mission_id)!;
+        return {
+          mission: blocked,
+          intent,
+          verdict: this.gate.evaluate(blocked),
+          completed: false,
+          failureReason: summary,
+        };
+      }
+
       const finalized = await this.finalizeMission(mission.mission_id, expectedResumptionGeneration, opts.signal);
       return { ...finalized, intent };
     } finally {
@@ -1919,6 +1960,14 @@ export class Orchestrator {
       unresolvedBlocking > 0 || (finalMission.required_gates.length > 0 && verdict.reasons.length > 0);
     if (hasBlocking) {
       if (finalMission.status !== "BLOCKED") this.store.transitionMission(missionId, "BLOCKED");
+      if (!this.store.listMissionStops(missionId).at(-1)) {
+        this.store.stopMission(missionId, {
+          reason: verdict.reasons.join("; ") || "completion requirements remain blocked",
+          preservedWork: await this.preservedMissionWork(missionId),
+          attemptedRecoveries: this.store.listRecoveryDecisions(missionId).map((decision) => decision.recoveryId),
+          resumeCondition: "provide the missing current-candidate evidence or repair the reported blocking condition",
+        });
+      }
     } else {
       this.store.failMission(missionId, verdict.reasons.join("; "));
     }

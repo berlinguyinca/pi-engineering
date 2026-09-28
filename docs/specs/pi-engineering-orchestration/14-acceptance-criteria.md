@@ -92,8 +92,13 @@ rejection, restart replay, repeated-fingerprint exhaustion, zero-worker orphan
 detection, repository-lease isolation, integration conflict, red validation,
 and incumbent immutability. `npm run dogfood:mission-recovery` is the opt-in
 installed-Pi live check; it refuses every model except `local/local`, refuses an
-enabled/advertised metabolomics provider, and operates only on a retained
-temporary Git repository.
+enabled/advertised metabolomics provider, verifies the unique installed package
+path and exact Git SHA without an explicit `--extension`, and operates only on
+a retained temporary Git repository outside every real Git worktree. The
+separately labeled source-only diagnostic disables extension discovery before
+loading exactly one explicit source extension. Snapshot contract/version,
+`id`, `observability.acceptanceCoverage`, `observability.preservedWork`, and
+the typed `stop` are validated; `FAILED`/`CANCELED` are nonzero outcomes.
 
 ## Implemented status and recovery semantics
 

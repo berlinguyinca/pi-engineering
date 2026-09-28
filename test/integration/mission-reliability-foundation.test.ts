@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { describe, it } from "node:test";
 import { promisify } from "node:util";
 import { EngineeringRuntime, GitRepo } from "../../src/index.ts";
@@ -76,6 +77,75 @@ async function greenFixture() {
   await exec("git", ["-C", fixture.root, "add", "-A"]);
   await exec("git", ["-C", fixture.root, "commit", "-q", "-m", "green baseline"]);
   return fixture;
+}
+
+async function repositoryState(root: string) {
+  const [head, indexTree, status, tracked, untracked] = await Promise.all([
+    exec("git", ["-C", root, "rev-parse", "HEAD"]),
+    exec("git", ["-C", root, "write-tree"]),
+    exec("git", ["-C", root, "status", "--porcelain=v2", "-z"]),
+    exec("git", ["-C", root, "ls-files", "-z"]),
+    exec("git", ["-C", root, "ls-files", "--others", "--exclude-standard", "-z"]),
+  ]);
+  const files = [...new Set([...tracked.stdout.split("\0"), ...untracked.stdout.split("\0")].filter(Boolean))].sort();
+  const worktree = Object.fromEntries(
+    await Promise.all(
+      files.map(async (path) => [
+        path,
+        createHash("sha256")
+          .update(await readFile(join(root, path)))
+          .digest("hex"),
+      ]),
+    ),
+  );
+  return { head: head.stdout.trim(), indexTree: indexTree.stdout.trim(), status: status.stdout, worktree };
+}
+
+async function fakeInstalledPi(status = "COMPLETE") {
+  const directory = await mkdtemp(join(resolve(process.cwd(), ".."), "pi-eng-fake-installed-"));
+  const installed = join(directory, "installed");
+  const executable = join(directory, "pi.mjs");
+  const log = join(directory, "args.json");
+  await mkdir(installed);
+  await writeFile(join(installed, "package.json"), '{"name":"pi-engineering-runtime"}\n');
+  await exec("git", ["init", "-q", installed]);
+  await exec("git", ["-C", installed, "config", "user.email", "fake@example.invalid"]);
+  await exec("git", ["-C", installed, "config", "user.name", "Fake Pi"]);
+  await exec("git", ["-C", installed, "add", "package.json"]);
+  await exec("git", ["-C", installed, "commit", "-q", "-m", "installed"]);
+  const sha = (await exec("git", ["-C", installed, "rev-parse", "HEAD"])).stdout.trim();
+  await writeFile(
+    executable,
+    `#!/usr/bin/env node
+import { mkdir, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+const args = process.argv.slice(2);
+if (args[0] === "--list-models") { process.stdout.write("local local ready\\n"); process.exit(0); }
+if (args[0] === "list") { process.stdout.write(process.env.FAKE_INSTALLED_PATH + "\\n"); process.exit(0); }
+await writeFile(process.env.FAKE_ARGS_LOG, JSON.stringify(args));
+await mkdir(join(process.cwd(), ".pi-eng"), { recursive: true });
+await writeFile(join(process.cwd(), ".pi-eng", "orchestration-snapshot.json"), JSON.stringify({
+  contractVersion: 3,
+  generatedAt: new Date().toISOString(),
+  missions: [{
+    id: "MSN-fake-dogfood", revision: 7, title: "fake", goal: "fake", workflowClass: "engineering_review",
+    status: ${JSON.stringify(status)}, riskProfile: "high", constraints: [], requiredGates: [],
+    acceptanceCriteria: [], tasks: [], findings: [],
+    observability: {
+      progress: { approximatePercent: 100, verifiedComplete: true, basis: "weighted_dag" },
+      acceptanceCoverage: { completed: 1, total: 1, approximatePercent: 100 },
+      workflowProgress: { completed: 1, total: 1, approximatePercent: 100, basis: "weighted_dag" },
+      health: "complete", workers: { active: 0, waiting: 0, failed: 0 }, lastMeaningfulProgressAt: new Date().toISOString(),
+      completionStatus: "verified_complete", progressHistory: [], tests: { running: false, completed: 1, total: 1, passed: 1, failed: 0, skipped: 0, failures: [] },
+      review: { status: "approved", blockingOpen: 0, findings: [] }, workerDetails: [], activity: [], errors: [], recovery: [], changes: { changedFiles: [], commits: [], integrationState: "complete" }, artifacts: [],
+      action: "done", reason: "verified", recoveryAttempt: { attempt: 0, maxAttempts: 2 }, nextAction: "none", nextActionAt: null, owner: null, repository: process.cwd(), task: null, preservedWork: [process.cwd()]
+    }
+  }]
+}));
+`,
+  );
+  await chmod(executable, 0o755);
+  return { directory, installed, executable, log, sha, cleanup: () => rm(directory, { recursive: true, force: true }) };
 }
 
 function createMission(store: MissionStore, missionId: string, repository = "/tmp/repo") {
@@ -234,61 +304,242 @@ function blockedCheckpointHarness(roots: [string, string]) {
 }
 
 describe("mission reliability foundation — synthetic MSN-qSLaeM", () => {
-  it("repairs only checkpoint remainder, rejects the old late result, and reaches a durable outcome", async () => {
-    const first = await greenFixture();
-    const second = await greenFixture();
-    try {
-      const h = blockedCheckpointHarness([first.root, second.root]);
-      const manifest = h.store.getWorkspaceManifest(h.mission.mission_id)!;
-      assert.deepEqual(
-        manifest.authorizedRoots.map((root) => root.canonicalPath),
-        [first.root, second.root],
-      );
-
-      const repaired = await h.orchestrator.repairBlockedMission(h.mission.mission_id);
-      await h.store.recordLateExecution(h.execution.execution_id, "fenced after timeout", {
-        kind: "backend_result",
-        exitStatus: "succeeded",
-        summary: "old worker claimed all three deliverables",
-        error: null,
-        artifactRefs: ["artifact://late-result"],
-        findings: [],
-        handoffs: [],
-        recovery: [],
-        gate: null,
+  it(
+    "runs MSN-qSLaeM through the public runtime, times out after 2/3, and repairs only the remainder",
+    { timeout: 30_000 },
+    async () => {
+      const metaRoot = await mkdtemp(join(tmpdir(), "pi-eng-meta-root-"));
+      const first = await greenFixture();
+      const second = await greenFixture();
+      let runtime: EngineeringRuntime | undefined;
+      let releaseLate!: () => void;
+      const late = new Promise<void>((resolveLate) => {
+        releaseLate = resolveLate;
       });
-      const replacements = h.store
-        .listTasks(h.mission.mission_id)
-        .filter((candidate) => candidate.objective.startsWith("Recover "));
-
-      assert.deepEqual(replacements.map((task) => task.deliverables?.[0]).sort(), ["three", "two"]);
-      assert.equal(h.store.getExecution(h.execution.execution_id)?.exit_status, "orphaned_execution_reconciled");
-      assert.ok(
-        h.backend
-          .all()
-          .some(
-            (event) =>
-              event.type === "execution.late_result_rejected" && event.payload.reason === "fenced after timeout",
-          ),
-      );
-      assert.ok(["COMPLETE", "BLOCKED"].includes(repaired.status), `unexpected repaired status: ${repaired.status}`);
-      if (repaired.status === "BLOCKED") {
-        const stop = h.store.listMissionStops(h.mission.mission_id).at(-1);
-        assert.ok(stop?.reason);
-        assert.ok(stop?.resumeCondition);
-        assert.ok(stop?.preservedWork.length);
+      const sessions: Array<{ role: string; session: string | undefined; recovery: boolean }> = [];
+      let initial = true;
+      try {
+        const repoId = `repo-${createHash("sha256").update(first.root).digest("hex").slice(0, 16)}`;
+        const verifier: VerificationProvider = {
+          async detect() {
+            return { name: "synthetic-current-candidate", stages: [] };
+          },
+          async run() {
+            return { passed: true, noTargets: false, stages: [], failedStage: null, evidence: [] };
+          },
+        };
+        const worker: WorkerExecutor = {
+          async run(request) {
+            sessions.push({ role: request.role, session: request.sessionId, recovery: Boolean(request.recovery) });
+            if (request.role === "reviewer") {
+              return {
+                result: {
+                  status: "completed",
+                  summary: "fresh same-model review",
+                  claims: [],
+                  evidence_refs: [],
+                  new_hypotheses: [],
+                  proposed_tasks: [],
+                  details: {},
+                },
+                usage: {
+                  input: 1,
+                  output: 1,
+                  cacheRead: 0,
+                  cacheWrite: 0,
+                  cost: 0,
+                  contextTokens: 1,
+                  turns: 1,
+                  model: "local/local",
+                },
+                toolCalls: 0,
+                structured: {
+                  verdict: "approve",
+                  findings: [],
+                  missingTests: [],
+                  specGaps: [],
+                  acceptanceResults: reviewAcceptance(request.task),
+                  summary: "current candidate approved",
+                },
+              };
+            }
+            if (initial) {
+              initial = false;
+              await writeFile(join(request.cwd, "src", "one.js"), "export const one = 1;\n");
+              await writeFile(join(request.cwd, "src", "two.js"), "export const two = 2;\n");
+              await exec("git", ["-C", request.cwd, "add", "-A"]);
+              await exec("git", ["-C", request.cwd, "commit", "-q", "-m", "checkpoint two of three"]);
+              request.onActivity?.({
+                kind: "state",
+                summary: "two of three",
+                meaningfulProgress: true,
+                completedDeliverables: ["one", "two"],
+              });
+              await late;
+              return {
+                result: {
+                  status: "completed",
+                  summary: "late obsolete completion",
+                  claims: [],
+                  evidence_refs: [],
+                  new_hypotheses: [],
+                  proposed_tasks: [],
+                  details: {},
+                },
+                usage: {
+                  input: 1,
+                  output: 1,
+                  cacheRead: 0,
+                  cacheWrite: 0,
+                  cost: 0,
+                  contextTokens: 1,
+                  turns: 1,
+                  model: "local/local",
+                },
+                toolCalls: 0,
+              };
+            }
+            assert.ok(request.recovery, "replacement worker receives store-verified checkpoint recovery context");
+            assert.match(request.task, /remaining deliverable three/i);
+            await writeFile(join(request.cwd, "src", "three.js"), "export const three = 3;\n");
+            return {
+              result: {
+                status: "completed",
+                summary: "remainder completed",
+                claims: [],
+                evidence_refs: [],
+                new_hypotheses: [],
+                proposed_tasks: [],
+                details: {},
+              },
+              usage: {
+                input: 1,
+                output: 1,
+                cacheRead: 0,
+                cacheWrite: 0,
+                cost: 0,
+                contextTokens: 1,
+                turns: 1,
+                model: "local/local",
+              },
+              toolCalls: 0,
+            };
+          },
+        };
+        runtime = await EngineeringRuntime.open({
+          cwd: metaRoot,
+          workDir: join(metaRoot, "state"),
+          model: {
+            provider: "local",
+            id: "local",
+            api: "openai-completions",
+            contextWindow: 256_000,
+            maxTokens: 32_768,
+          } as never,
+          worker,
+          verifier,
+          orchestrationPlanner: async (mission) => [
+            {
+              kind: "agent",
+              role: "implementer",
+              objective: "finish one, two, and three",
+              repo_id: repoId,
+              mutates_repo: true,
+              write_domains: ["src/**"],
+              isolation: "worktree",
+              depends_on: [],
+              priority: 0,
+              execution_requirements: {},
+              acceptance_ids: mission.acceptance_criteria.flatMap((criterion) =>
+                criterion.acceptance_id ? [criterion.acceptance_id] : [],
+              ),
+              deliverables: ["one", "two", "three"],
+              execution_budget_ms: 1_000,
+              checkpoint_policy: { activity_milestone: 1, before_deadline_ms: 200 },
+              max_attempts: 1,
+              failure_policy: "block",
+            },
+          ],
+        });
+        const base = (await GitRepo.open(first.root))!;
+        const started = await runtime.orchestrator!.orchestrate(
+          `Ensure all three modules are current and verified. Work in ${first.root} and authorize ${second.root}.`,
+          { repository: first.root, baseRef: await base.headCommit(), mutationRequested: true },
+        );
+        assert.equal(started.mission.status, "BLOCKED");
+        assert.deepEqual(
+          runtime
+            .missionStore!.getWorkspaceManifest(started.mission.mission_id)!
+            .authorizedRoots.map((root) => root.canonicalPath),
+          [first.root, second.root],
+        );
+        const missionTasks = runtime.missionStore!.listTasks(started.mission.mission_id);
+        const original = missionTasks.find((task) => task.objective === "finish one, two, and three");
+        assert.ok(
+          original,
+          JSON.stringify({ status: started.mission.status, failure: started.failureReason, missionTasks }),
+        );
+        const checkpoint = runtime
+          .missionStore!.listTaskCheckpoints(started.mission.mission_id, original.task_id)
+          .at(-1)!;
+        assert.deepEqual(checkpoint.completedDeliverables, ["one", "two"]);
+        assert.deepEqual(checkpoint.remainingDeliverables, ["three"]);
+        releaseLate();
+        await new Promise((resolveWait) => setTimeout(resolveWait, 100));
+        assert.ok(runtime.missionStore!.getExecution(checkpoint.executionId)?.status !== "SUCCEEDED");
+        assert.throws(
+          () => runtime!.missionStore!.assertExecutionAuthoritative(checkpoint.executionId),
+          /no longer authoritative|stale execution identity/i,
+        );
+        const durableEvents = await readFile(join(metaRoot, "state", "orchestration.jsonl"), "utf8");
+        assert.match(durableEvents, /"type":"execution\.late_result_rejected"/);
+        const repaired = await runtime.orchestrator!.repairBlockedMission(started.mission.mission_id);
+        const replacements = runtime
+          .missionStore!.listTasks(started.mission.mission_id)
+          .filter((task) => task.objective.startsWith("Recover "));
+        assert.deepEqual(
+          replacements.map((task) => task.deliverables),
+          [["three"]],
+          JSON.stringify({
+            repaired,
+            tasks: runtime.missionStore!.listTasks(started.mission.mission_id),
+            classifications: runtime.missionStore!.listFailureClassifications(started.mission.mission_id),
+            recoveries: runtime.missionStore!.listRecoveryDecisions(started.mission.mission_id),
+          }),
+        );
+        assert.ok(["COMPLETE", "BLOCKED"].includes(repaired.status));
+        if (repaired.status === "BLOCKED") {
+          const stop = runtime.missionStore!.listMissionStops(started.mission.mission_id).at(-1);
+          assert.ok(stop?.reason);
+          assert.ok(stop?.resumeCondition);
+          assert.ok(stop?.preservedWork.length);
+          assert.ok(stop?.attemptedRecoveries.length);
+        }
+        const candidate = runtime.missionStore!.getCandidate(started.mission.mission_id)!;
+        const validation = runtime.missionStore!.listValidationEvidence(started.mission.mission_id).at(-1)!;
+        const review = runtime.missionStore!.listReviewEvidence(started.mission.mission_id).at(-1)!;
+        assert.equal(validation.identityHash, candidate.identityHash);
+        assert.equal(validation.exitCode, 0);
+        assert.equal(validation.noTargets, false);
+        assert.equal(review.identityHash, candidate.identityHash);
+        assert.equal(review.verdict, "approve");
+        assert.equal(review.outputValid, true);
+        assert.equal(review.accessible, true);
+        assert.equal(review.independenceMode, "same_model_reduced");
+        const implementerSession = sessions.find((entry) => entry.role === "implementer")?.session;
+        const reviewerSession = sessions.find((entry) => entry.role === "reviewer")?.session;
+        assert.ok(implementerSession && reviewerSession && implementerSession !== reviewerSession);
+      } finally {
+        releaseLate();
+        await runtime?.close();
+        await Promise.all([rm(metaRoot, { recursive: true, force: true }), first.cleanup(), second.cleanup()]);
       }
-      assert.ok(
-        h.store.listTaskSupersessions(h.mission.mission_id).some((lineage) => lineage.failedTaskId === h.task.task_id),
-      );
-    } finally {
-      await first.cleanup();
-      await second.cleanup();
-    }
-  });
+    },
+  );
 
   it("keeps the incumbent unchanged when integration conflicts", async () => {
     const fixture = await greenFixture();
+    const state = await mkdtemp(join(tmpdir(), "pi-eng-conflict-state-"));
     let runtime: EngineeringRuntime | undefined;
     try {
       const git = (await GitRepo.open(fixture.root))!;
@@ -300,8 +551,10 @@ describe("mission reliability foundation — synthetic MSN-qSLaeM", () => {
       await exec("git", ["-C", fixture.root, "add", "-A"]);
       await exec("git", ["-C", fixture.root, "commit", "-q", "-m", "incumbent divergence"]);
       const incumbent = await git.headCommit();
+      const incumbentState = await repositoryState(fixture.root);
       runtime = await EngineeringRuntime.open({
         cwd: fixture.root,
+        workDir: state,
         worker: workerFor(async (cwd) => {
           await writeFile(join(cwd, "src", "add.js"), "export function add(a, b) { return a + b; // worker\n}\n");
         }),
@@ -316,8 +569,10 @@ describe("mission reliability foundation — synthetic MSN-qSLaeM", () => {
       assert.equal(result.completed, false);
       assert.equal(await git.headCommit(), incumbent);
       assert.match(await readFile(join(fixture.root, "src", "add.js"), "utf8"), /incumbent/);
+      assert.deepEqual(await repositoryState(fixture.root), incumbentState);
     } finally {
       await runtime?.close();
+      await rm(state, { recursive: true, force: true });
       await fixture.cleanup();
     }
   });
@@ -361,10 +616,12 @@ describe("mission reliability foundation — synthetic MSN-qSLaeM", () => {
 
   it("keeps the incumbent unchanged when current-candidate validation is red", async () => {
     const fixture = await greenFixture();
+    const state = await mkdtemp(join(tmpdir(), "pi-eng-red-state-"));
     let runtime: EngineeringRuntime | undefined;
     try {
       const git = (await GitRepo.open(fixture.root))!;
       const incumbent = await git.headCommit();
+      const incumbentState = await repositoryState(fixture.root);
       const redVerifier: VerificationProvider = {
         async detect() {
           return { name: "red", stages: [] };
@@ -381,6 +638,7 @@ describe("mission reliability foundation — synthetic MSN-qSLaeM", () => {
       };
       runtime = await EngineeringRuntime.open({
         cwd: fixture.root,
+        workDir: state,
         verifier: redVerifier,
         worker: workerFor(async (cwd) => {
           await writeFile(join(cwd, "src", "candidate-only.js"), "export const candidateOnly = true;\n");
@@ -396,8 +654,10 @@ describe("mission reliability foundation — synthetic MSN-qSLaeM", () => {
       assert.equal(result.completed, false);
       assert.equal(await git.headCommit(), incumbent);
       await assert.rejects(() => readFile(join(fixture.root, "src", "candidate-only.js"), "utf8"), /ENOENT/);
+      assert.deepEqual(await repositoryState(fixture.root), incumbentState);
     } finally {
       await runtime?.close();
+      await rm(state, { recursive: true, force: true });
       await fixture.cleanup();
     }
   });
@@ -563,6 +823,7 @@ describe("mission reliability foundation — synthetic MSN-qSLaeM", () => {
     try {
       const git = (await GitRepo.open(fixture.root))!;
       const incumbent = await git.headCommit();
+      const incumbentState = await repositoryState(fixture.root);
       const store = MissionStore.open(JsonlEventStore.inMemory());
       createMission(store, "MSN-lease-first", fixture.root);
       createMission(store, "MSN-lease-second", fixture.root);
@@ -576,7 +837,7 @@ describe("mission reliability foundation — synthetic MSN-qSLaeM", () => {
         /repo-shared.*MSN-lease-first/i,
       );
       assert.equal(await git.headCommit(), incumbent);
-      assert.equal((await git.status()).trim(), "");
+      assert.deepEqual(await repositoryState(fixture.root), incumbentState);
     } finally {
       await fixture.cleanup();
     }
@@ -587,7 +848,7 @@ describe("mission reliability foundation — synthetic MSN-qSLaeM", () => {
       () =>
         exec(process.execPath, ["scripts/dogfood-mission-recovery.ts", "--model", "metabolomics/remote"], {
           cwd: process.cwd(),
-          env: { ...process.env, PI_MISSION_DOGFOOD_TEMP_PARENT: "/definitely-not-created" },
+          env: { ...process.env },
         }),
       (error: unknown) => {
         const failure = error as { stderr?: string };
@@ -595,5 +856,127 @@ describe("mission reliability foundation — synthetic MSN-qSLaeM", () => {
         return true;
       },
     );
+  });
+
+  it("dogfoods the uniquely installed package and validates the versioned snapshot contract", async () => {
+    const fake = await fakeInstalledPi();
+    try {
+      const result = await exec(
+        process.execPath,
+        [
+          "scripts/dogfood-mission-recovery.ts",
+          "--pi",
+          fake.executable,
+          "--model",
+          "local/local",
+          "--expected-sha",
+          fake.sha,
+        ],
+        {
+          cwd: process.cwd(),
+          env: { ...process.env, FAKE_INSTALLED_PATH: fake.installed, FAKE_ARGS_LOG: fake.log },
+        },
+      );
+      const evidence = JSON.parse(result.stdout) as {
+        verificationMode: string;
+        installedPackage: string;
+        temporaryRepository: string;
+        durableEvidence: { missionId: string; contractVersion: number; acceptanceCoverage: { completed: number } };
+      };
+      const args = JSON.parse(await readFile(fake.log, "utf8")) as string[];
+      assert.equal(evidence.verificationMode, "installed-package");
+      assert.equal(evidence.installedPackage, fake.installed);
+      assert.equal(evidence.durableEvidence.missionId, "MSN-fake-dogfood");
+      assert.equal(evidence.durableEvidence.contractVersion, 3);
+      assert.equal(evidence.durableEvidence.acceptanceCoverage.completed, 1);
+      assert.equal(
+        args.includes("--extension"),
+        false,
+        "installed verification must not duplicate extension discovery",
+      );
+      assert.equal(args.includes("--no-extensions"), false);
+      await rm(evidence.temporaryRepository, { recursive: true, force: true });
+    } finally {
+      await fake.cleanup();
+    }
+  });
+
+  it("labels source-only dogfood and disables extension discovery before loading the source extension", async () => {
+    const fake = await fakeInstalledPi();
+    try {
+      const result = await exec(
+        process.execPath,
+        ["scripts/dogfood-mission-recovery.ts", "--pi", fake.executable, "--source-only", "--model", "local/local"],
+        { cwd: process.cwd(), env: { ...process.env, FAKE_INSTALLED_PATH: fake.installed, FAKE_ARGS_LOG: fake.log } },
+      );
+      const evidence = JSON.parse(result.stdout) as { verificationMode: string; temporaryRepository: string };
+      const args = JSON.parse(await readFile(fake.log, "utf8")) as string[];
+      assert.match(evidence.verificationMode, /^source-only/);
+      assert.ok(args.indexOf("--no-extensions") >= 0);
+      assert.ok(args.indexOf("--extension") > args.indexOf("--no-extensions"));
+      await rm(evidence.temporaryRepository, { recursive: true, force: true });
+    } finally {
+      await fake.cleanup();
+    }
+  });
+
+  it("refuses a temporary parent inside any Git worktree before creating a repository", async () => {
+    const fake = await fakeInstalledPi();
+    const before = (await readdir(process.cwd())).filter((entry) => entry.startsWith("pi-mission-recovery-dogfood-"));
+    try {
+      await assert.rejects(
+        () =>
+          exec(
+            process.execPath,
+            [
+              "scripts/dogfood-mission-recovery.ts",
+              "--pi",
+              fake.executable,
+              "--expected-sha",
+              fake.sha,
+              "--temp-parent",
+              process.cwd(),
+            ],
+            {
+              cwd: process.cwd(),
+              env: { ...process.env, FAKE_INSTALLED_PATH: fake.installed, FAKE_ARGS_LOG: fake.log },
+            },
+          ),
+        /refusing temporary parent inside Git worktree/i,
+      );
+      const after = (await readdir(process.cwd())).filter((entry) => entry.startsWith("pi-mission-recovery-dogfood-"));
+      assert.deepEqual(after, before);
+    } finally {
+      await fake.cleanup();
+    }
+  });
+
+  it("returns nonzero and retains the temporary path for FAILED or CANCELED dogfood missions", async () => {
+    const fake = await fakeInstalledPi("FAILED");
+    let retained: string | undefined;
+    try {
+      await assert.rejects(
+        () =>
+          exec(
+            process.execPath,
+            ["scripts/dogfood-mission-recovery.ts", "--pi", fake.executable, "--expected-sha", fake.sha],
+            {
+              cwd: process.cwd(),
+              env: { ...process.env, FAKE_INSTALLED_PATH: fake.installed, FAKE_ARGS_LOG: fake.log },
+            },
+          ),
+        (error: unknown) => {
+          const stderr = (error as { stderr?: string }).stderr ?? "";
+          assert.match(stderr, /ended FAILED/i);
+          assert.match(stderr, /pi-mission-recovery-dogfood-/);
+          retained = stderr.match(/(\/[^\s]*pi-mission-recovery-dogfood-[^\s]*)/)?.[1];
+          return true;
+        },
+      );
+      assert.ok(retained);
+      await rm(retained, { recursive: true, force: true });
+    } finally {
+      await fake.cleanup();
+    }
   });
 });

@@ -467,10 +467,21 @@ For an opt-in installed-Pi live check:
 npm run dogfood:mission-recovery
 ```
 
-The dogfood command refuses non-`local/local` models and any enabled or
-advertised metabolomics provider. It creates a temporary Git repository only,
-never targets the current project, and prints durable mission/snapshot evidence
-including the retained temporary path.
+The default dogfood path verifies exactly one installed
+`pi-engineering-runtime` package, requires its Git SHA to match this checkout
+(or `--expected-sha`), and lets Pi discover that installed extension normally;
+it does not also pass `--extension`. It refuses non-`local/local` models,
+enabled/advertised metabolomics, and a temporary parent that is or overlaps the
+current checkout, extension/package installation, or any Git worktree. It then
+creates a temporary Git repository only and validates snapshot contract v3.
+Only `COMPLETE` with verified current acceptance evidence, or an explicitly
+allowed stopped state with a complete actionable stop, exits zero;
+`FAILED`/`CANCELED` retain and print the inspection path and exit nonzero.
+
+For source-only diagnostics (not the Task 12 installed-package proof), run
+`node scripts/dogfood-mission-recovery.ts --source-only`. That mode is labeled
+in its JSON output and uses `--no-extensions` before one explicit source
+`--extension`, preventing duplicate discovery.
 
 Slice 1 supports multiple explicitly authorized local roots, with one
 repository-bound executable task and promotion at a time. Cross-repository
@@ -483,7 +494,7 @@ local JSONL runtime does not claim those guarantees.
 
 ```bash
 npm install
-npm run typecheck     # tsc --noEmit
+npm run typecheck     # core + mission-recovery script tsconfigs
 npm test              # node --test (unit + integration, deterministic)
 ```
 

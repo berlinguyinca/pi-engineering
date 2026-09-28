@@ -31,6 +31,19 @@ function safeDuration(value: unknown): number | undefined {
     : undefined;
 }
 
+function safeCompletedDeliverables(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const safe = [
+    ...new Set(
+      value
+        .filter((entry): entry is string => typeof entry === "string")
+        .map((entry) => safeText(entry))
+        .filter(Boolean),
+    ),
+  ].slice(0, 32);
+  return safe.length > 0 ? safe : undefined;
+}
+
 const STAGES = new Set(["agent", "process", "review", "integration", "validation", "research"] as const);
 
 function safeStage(value: unknown): WorkerActivity["stage"] {
@@ -102,8 +115,15 @@ export function sanitizeWorkerActivity(value: unknown): WorkerActivity | null {
     if (input.phase === "canceled") {
       return { kind: "state", phase: "canceled", summary: "Worker session canceled", meaningfulProgress: false };
     }
+    const completedDeliverables = safeCompletedDeliverables(input.completedDeliverables);
     const summary = input.summary === "Model response received" ? input.summary : "Worker session started";
-    return { kind: "state", ...(input.phase ? { phase: input.phase } : {}), summary, meaningfulProgress: false };
+    return {
+      kind: "state",
+      ...(input.phase ? { phase: input.phase } : {}),
+      summary,
+      meaningfulProgress: completedDeliverables !== undefined,
+      ...(completedDeliverables ? { completedDeliverables } : {}),
+    };
   }
   return null;
 }

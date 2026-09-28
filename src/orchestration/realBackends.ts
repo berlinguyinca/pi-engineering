@@ -257,6 +257,10 @@ export function realBackends(opts: RealBackendsOptions) {
           // fallback (no worktree) runs in the user's checkout.
           isolatedWorktree: input.isolatedWorktree === true && !!input.worktree,
           recovery: input.recovery,
+          // Every delegated implementation/recovery run is a fresh session;
+          // carrying the identity through the public worker request makes its
+          // separation from the later reviewer independently auditable.
+          sessionId: id("WKS"),
         };
         // Place the worker on the model the capability router chose for this
         // role (honours `policy.routing.roles`); fall back to the executor

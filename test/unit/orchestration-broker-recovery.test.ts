@@ -434,7 +434,12 @@ describe("ExecutionBroker: recovering a timed-out worker's committed work", () =
               await mkdir(join(worktree!, "src"), { recursive: true });
               await writeFile(join(worktree!, "src", "preserved.ts"), "export const preserved = true;\n");
               await git.commitAll(worktree!, "worker checkpoint commit");
-              onActivity?.({ kind: "state", summary: "checkpoint", meaningfulProgress: true });
+              onActivity?.({
+                kind: "state",
+                summary: "checkpoint",
+                meaningfulProgress: true,
+                completedDeliverables: ["implementation"],
+              });
               await blocked;
               return {
                 executionId: "late-worker",
@@ -485,6 +490,8 @@ describe("ExecutionBroker: recovering a timed-out worker's committed work", () =
       assert.equal(outcome.error, "timeout");
       const checkpoint = store.getTaskCheckpoint(store.getExecution(handle.executionId)!.checkpoint_id!);
       assert.ok(checkpoint?.candidateSha, "the last stable checkpoint remains recoverable evidence");
+      assert.deepEqual(checkpoint.completedDeliverables, ["implementation"]);
+      assert.deepEqual(checkpoint.remainingDeliverables, []);
       execFileSync("git", ["-C", fx.root, "cat-file", "-e", `${checkpoint.candidateSha}:src/preserved.ts`]);
 
       const integrationTask = store.createTask({
