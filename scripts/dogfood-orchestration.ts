@@ -25,6 +25,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
+import { MISSION_SNAPSHOT_CONTRACT_VERSION } from "../src/orchestration/missionSnapshot.ts";
 import { EngineeringRuntime } from "../src/runtime/EngineeringRuntime.ts";
 import { CommandVerifier } from "../src/verify/Verifier.ts";
 
@@ -59,15 +60,42 @@ function makeWorker(findings: unknown[] = [], onRun?: (cwd: string, role: string
           await writeFile(`${cwd}/src/orchestrated.ts`, "export const orchestrated = true;\n", "utf8").catch(() => {});
         }
       }
+      const acceptanceIds = [...req.task.matchAll(/Acceptance criterion ([^:]+):/g)].map((match) => match[1]!);
+      const structuredFindings = findings.map((finding, index) => {
+        const record = finding && typeof finding === "object" ? (finding as Record<string, unknown>) : {};
+        const title = String(record.summary ?? record.title ?? `dogfood finding ${index + 1}`);
+        return {
+          ...record,
+          severity: String(record.severity ?? "major"),
+          title,
+          detail: String(record.detail ?? record.evidence ?? title),
+        };
+      });
+      const structured =
+        req.role === "reviewer"
+          ? {
+              verdict: structuredFindings.length ? ("request_changes" as const) : ("approve" as const),
+              findings: structuredFindings,
+              missingTests: [],
+              specGaps: [],
+              acceptanceResults: acceptanceIds.map((acceptanceId) => ({
+                acceptanceId,
+                status: structuredFindings.length ? ("failed" as const) : ("passed" as const),
+                detail: structuredFindings.length
+                  ? "The blocking dogfood finding prevents acceptance."
+                  : "The deterministic reviewer verified this acceptance criterion.",
+              })),
+            }
+          : undefined;
       return {
         result: {
           status: "completed" as const,
           summary: `worker ${req.role} did ${req.task}`,
-          claims: [{ claim: "implemented", evidence: "artifact://dogfood" }],
-          evidence_refs: ["artifact://dogfood"],
+          claims: [{ claim: "implemented", evidence: "deterministic dogfood worker" }],
+          evidence_refs: [],
           new_hypotheses: [],
           proposed_tasks: [],
-          details: findings.length ? { findings } : {},
+          details: structured ?? (findings.length ? { findings } : {}),
         },
         usage: {
           input: 10,
@@ -80,6 +108,7 @@ function makeWorker(findings: unknown[] = [], onRun?: (cwd: string, role: string
           model: "deterministic",
         },
         toolCalls: 1,
+        structured,
       };
     },
   };
@@ -109,6 +138,13 @@ async function open(root: string, findings: unknown[] = [], onRun?: (cwd: string
     cwd: root,
     worker: makeWorker(findings, onRun) as never,
     verifier: new CommandVerifier(),
+    model: {
+      provider: "local",
+      id: "local",
+      api: "openai-completions",
+      contextWindow: 256_000,
+      maxTokens: 32_768,
+    } as never,
   });
 }
 
@@ -141,13 +177,40 @@ try {
     res.mission.required_gates.includes("independent_review"),
     res.mission.required_gates.join(","),
   );
-  check("mission reached COMPLETE", res.completed && res.mission.status === "COMPLETE", res.mission.status);
+  check(
+    "mission reached COMPLETE",
+    res.completed && res.mission.status === "COMPLETE",
+    JSON.stringify({
+      status: res.mission.status,
+      failureReason: res.failureReason,
+      stop: rt.missionStore!.listMissionStops(res.mission.mission_id).at(-1),
+      findings: rt.missionStore!.listFindings(res.mission.mission_id),
+      reviewEvidence: rt.missionStore!.listReviewEvidence(res.mission.mission_id),
+      validationEvidence: rt.missionStore!.listValidationEvidence(res.mission.mission_id),
+      tasks: rt.missionStore!.listTasks(res.mission.mission_id).map((task) => ({
+        id: task.task_id,
+        role: task.role,
+        kind: task.kind,
+        status: task.status,
+      })),
+      executions: rt.missionStore!.listExecutions(res.mission.mission_id).map((execution) => ({
+        id: execution.execution_id,
+        taskId: execution.task_id,
+        status: execution.status,
+        exitStatus: execution.exit_status,
+      })),
+    }),
+  );
   const tasks = rt.missionStore!.listTasks(res.mission.mission_id);
   check("tasks were recorded", tasks.length > 0, String(tasks.length));
 
   // ---- 6: versioned PI WEB snapshot published
   const snap = await rt.publishMissionSnapshot();
-  check("snapshot published with contractVersion 1", snap?.contractVersion === 1, String(snap?.contractVersion));
+  check(
+    "snapshot published with the current contract version",
+    snap?.contractVersion === MISSION_SNAPSHOT_CONTRACT_VERSION,
+    String(snap?.contractVersion),
+  );
   check("snapshot contains the mission", (snap?.missions.length ?? 0) >= 1);
   const onDisk = JSON.parse(await readFile(join(rt.workDir, "orchestration-snapshot.json"), "utf8")) as {
     missions: Array<{ status: string }>;
@@ -178,17 +241,13 @@ try {
   const observedCwd: string[] = [];
   const wtRt = await open(wtFx.root, [], (cwd) => observedCwd.push(cwd));
   const executionBroker = wtRt.orchestrator!.broker;
-  const handle = await executionBroker.execute({
-    taskId: "dogfood-task",
-    missionId: "dogfood-mission",
-    kind: "agent",
-    role: "implementer",
-    objective: "mutate",
-    mutatesRepo: true,
-    isolation: "worktree",
+  const isolationBase = await wtRt.git!.headCommit();
+  await wtRt.orchestrator!.orchestrate("Add an isolated worktree proof", {
+    repository: wtFx.root,
+    baseRef: isolationBase,
+    mutationRequested: true,
   });
-  await handle.result();
-  check("the worker actually ran somewhere", observedCwd.length === 1, JSON.stringify(observedCwd));
+  check("the worker actually ran somewhere", observedCwd.length > 0, JSON.stringify(observedCwd));
   check(
     "worker ran in an isolated worktree, not the main checkout",
     observedCwd[0] !== wtFx.root && observedCwd[0]!.length > 0,
