@@ -20,6 +20,25 @@ remain covered. A mission succeeds only as `COMPLETE` with current verified
 evidence or as an explicitly allowed stopped state with a structurally complete
 actionable stop.
 
+## Fix Round 5 Final Trust Boundaries
+
+- Recovery now re-resolves durable checkpoint authority and re-hashes every
+  checkpoint-owned artifact inside the lazy execution operation, after all
+  repository/worktree setup awaits and immediately before backend dispatch.
+  Mutation or deletion after `execute()` returns therefore rejects the
+  replacement without entering `runAgent`.
+- Checkpoint-owned artifact metadata persists an immutable marker. Public
+  artifact-store `put` and `delete` operations reject immutable targets both
+  live and after store replay; direct filesystem corruption remains detected by
+  the final pre-dispatch hash check.
+- Runtime snapshot v3 publishes a derived `repaired` flag on authoritative
+  top-level findings. Dogfood validates top-level severity/status enums and
+  repaired/status consistency, computes blocking findings with CompletionGate
+  semantics (`blocking && status !== resolved`), and requires the observability
+  review projection to match authoritative finding identities, statuses, count,
+  and `blockingOpen`. An empty projection can no longer mask a top-level
+  blocker.
+
 ## Fix Round 4 Trust Boundaries
 
 - Accepted `checkpoint_progress` artifact bodies are copied to unique,
@@ -81,6 +100,15 @@ actionable stop.
 
 The new regressions were observed red before production repair:
 
+- mutation after `execute()` returned but before lazy `runAgent` dispatch still
+  launched two replacement workers;
+- public artifact-store overwrite/delete calls modified checkpoint-owned
+  immutable evidence, including after replay;
+- authoritative top-level invalid finding enums, repaired/status
+  contradictions, an accepted blocker, and a mismatched/empty review projection
+  all exited dogfood successfully;
+- top-level snapshot findings omitted the repaired state required for strict
+  validation;
 - checkpoint claims retained their mutable worker-owned artifact URIs;
 - COMPLETE dogfood accepted invalid review severity/status values, an accepted
   blocker, and contradictory `repaired`/`status` pairs;
@@ -96,6 +124,19 @@ The new regressions were observed red before production repair:
 - malformed and missing v3 snapshots were not comprehensively rejected.
 
 ## Verification
+
+Fresh round-5 final verification:
+
+- `npm run test:mission-reliability` — 36 passed.
+- focused artifact, broker-recovery, and snapshot suites — 27 passed.
+- `PI_CODING_AGENT_DIR=<empty> npm run test:unit` — 2,317 passed.
+- `npm run test:integration` — 338 passed, 1 optional Postgres test skipped
+  because `TEST_DATABASE_URL` is unset.
+- `npm test` — 2,655 passed, the same 1 optional Postgres skip.
+- `npm run build` — core and dedicated script typechecks passed.
+- `npm run lint` — 592 files checked, no errors.
+- `npm run test:e2e` — 21 commands and 7 tools loaded.
+- `git diff --check` — passed.
 
 Fresh round-4 final verification:
 

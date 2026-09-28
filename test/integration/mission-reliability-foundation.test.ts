@@ -233,6 +233,19 @@ if (process.env.FAKE_SNAPSHOT_MODE === "review-invalid-status") snapshot.mission
 if (process.env.FAKE_SNAPSHOT_MODE === "review-accepted-blocker") snapshot.missions[0].observability.review.findings = [{ id: "F-accepted", severity: "blocking", status: "accepted", summary: "still blocks", repaired: false }];
 if (process.env.FAKE_SNAPSHOT_MODE === "review-resolved-not-repaired") snapshot.missions[0].observability.review.findings = [{ id: "F-resolved", severity: "major", status: "resolved", summary: "resolved", repaired: false }];
 if (process.env.FAKE_SNAPSHOT_MODE === "review-open-repaired") snapshot.missions[0].observability.review.findings = [{ id: "F-open", severity: "major", status: "open", summary: "open", repaired: true }];
+if (process.env.FAKE_SNAPSHOT_MODE === "top-finding-invalid-severity") snapshot.missions[0].findings = [{ id: "F-invalid", severity: "critical", status: "resolved", summary: "invalid", taskId: null, repaired: true }];
+if (process.env.FAKE_SNAPSHOT_MODE === "top-finding-invalid-status") snapshot.missions[0].findings = [{ id: "F-invalid", severity: "major", status: "closed", summary: "invalid", taskId: null, repaired: false }];
+if (process.env.FAKE_SNAPSHOT_MODE === "top-finding-resolved-not-repaired") snapshot.missions[0].findings = [{ id: "F-resolved", severity: "major", status: "resolved", summary: "invalid", taskId: null, repaired: false }];
+if (process.env.FAKE_SNAPSHOT_MODE === "top-finding-accepted-blocker") {
+  const finding = { id: "F-accepted", severity: "blocking", status: "accepted", summary: "still blocks", taskId: null, repaired: false };
+  snapshot.missions[0].findings = [finding];
+  snapshot.missions[0].observability.review.findings = [{ id: finding.id, severity: finding.severity, status: finding.status, summary: finding.summary, repaired: finding.repaired }];
+  snapshot.missions[0].observability.review.blockingOpen = 1;
+}
+if (process.env.FAKE_SNAPSHOT_MODE === "top-finding-projection-mismatch") {
+  snapshot.missions[0].findings = [{ id: "F-authoritative", severity: "major", status: "open", summary: "authoritative", taskId: null, repaired: false }];
+  snapshot.missions[0].observability.review.findings = [{ id: "F-projected", severity: "major", status: "open", summary: "projected", repaired: false }];
+}
 await writeFile(join(process.cwd(), ".pi-eng", "orchestration-snapshot.json"), JSON.stringify(snapshot));
 `,
   );
@@ -930,9 +943,9 @@ describe("mission reliability foundation — synthetic MSN-qSLaeM", () => {
           hashes: [`sha256:${createHash("sha256").update(body).digest("hex")}`],
         });
         if (tamper === "delete") {
-          await artifacts.delete(immutable.uri);
+          await rm(join(artifactRoot, "checkpoint", `${immutable.id}.txt`));
         } else {
-          await artifacts.put("checkpoint", immutable.id, "tampered bytes", "tampered");
+          await writeFile(join(artifactRoot, "checkpoint", `${immutable.id}.txt`), "tampered bytes", "utf8");
         }
 
         await h.orchestrator.repairBlockedMission(h.mission.mission_id).catch(() => undefined);
@@ -946,6 +959,39 @@ describe("mission reliability foundation — synthetic MSN-qSLaeM", () => {
       }
     });
   }
+
+  it("re-verifies checkpoint artifacts after execute returns and immediately before replacement dispatch", async () => {
+    const first = await greenFixture();
+    const second = await greenFixture();
+    const artifactRoot = await mkdtemp(join(tmpdir(), "pi-eng-checkpoint-late-tamper-"));
+    try {
+      const artifacts = await ArtifactStore.create(artifactRoot);
+      const body = "immutable checkpoint evidence";
+      const immutable = await artifacts.putImmutable("checkpoint", "CHK-qSLaeM", body, "proof");
+      const h = await blockedCheckpointHarness([first.root, second.root], {
+        store: artifacts,
+        refs: [immutable.uri],
+        hashes: [`sha256:${createHash("sha256").update(body).digest("hex")}`],
+      });
+      const execute = h.orchestrator.broker.execute.bind(h.orchestrator.broker);
+      h.orchestrator.broker.execute = async (input) => {
+        const handle = await execute(input);
+        if (input.kind === "agent" && input.taskId !== h.task.task_id) {
+          await writeFile(join(artifactRoot, "checkpoint", `${immutable.id}.txt`), "late tamper", "utf8");
+        }
+        return handle;
+      };
+
+      await h.orchestrator.repairBlockedMission(h.mission.mission_id).catch(() => undefined);
+
+      assert.equal(h.replacementDispatches(), 0, "the final artifact check must precede runAgent without an await gap");
+      assert.equal(h.store.getMission(h.mission.mission_id)?.status, "BLOCKED");
+    } finally {
+      await rm(artifactRoot, { recursive: true, force: true });
+      await first.cleanup();
+      await second.cleanup();
+    }
+  });
 
   it("replays checkpoint-owned artifact bytes and verifies them before recovery dispatch", async () => {
     const first = await greenFixture();
@@ -1185,6 +1231,11 @@ describe("mission reliability foundation — synthetic MSN-qSLaeM", () => {
     "review-accepted-blocker",
     "review-resolved-not-repaired",
     "review-open-repaired",
+    "top-finding-invalid-severity",
+    "top-finding-invalid-status",
+    "top-finding-resolved-not-repaired",
+    "top-finding-accepted-blocker",
+    "top-finding-projection-mismatch",
   ] as const) {
     it(`returns nonzero for a ${mode} runtime v3 snapshot`, async () => {
       const fake = await fakeInstalledPi();

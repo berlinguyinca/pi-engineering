@@ -224,6 +224,14 @@ function validateSnapshot(value: unknown): MissionSnapshotFile {
       const finding = record(rawFinding, `${path}.findings[${findingIndex}]`);
       for (const field of ["id", "severity", "status", "summary"])
         nonempty(finding[field], `${path}.findings[${findingIndex}].${field}`);
+      if (!["blocking", "major", "minor"].includes(finding.severity as string))
+        throw new Error(`${path}.findings[${findingIndex}].severity is invalid`);
+      if (!["open", "accepted", "resolved"].includes(finding.status as string))
+        throw new Error(`${path}.findings[${findingIndex}].status is invalid`);
+      if (typeof finding.repaired !== "boolean")
+        throw new Error(`${path}.findings[${findingIndex}].repaired must be boolean`);
+      if (finding.repaired !== (finding.status === "resolved"))
+        throw new Error(`${path}.findings[${findingIndex}] repaired/status are inconsistent`);
       stringValue(finding.taskId, `${path}.findings[${findingIndex}].taskId`, true);
     }
     const observability = record(mission.observability, `${path}.observability`);
@@ -296,6 +304,24 @@ function validateSnapshot(value: unknown): MissionSnapshotFile {
     ).length;
     if (review.blockingOpen !== openBlockingFindings)
       throw new Error(`${path}.observability.review blocking count is inconsistent with findings`);
+    const authoritativeFindings = mission.findings as Array<Record<string, unknown>>;
+    const projectedFindings = review.findings as Array<Record<string, unknown>>;
+    const authoritativeById = new Map(authoritativeFindings.map((finding) => [finding.id as string, finding]));
+    const projectedById = new Map(projectedFindings.map((finding) => [finding.id as string, finding]));
+    if (
+      authoritativeById.size !== authoritativeFindings.length ||
+      projectedById.size !== projectedFindings.length ||
+      authoritativeFindings.length !== projectedFindings.length ||
+      authoritativeFindings.some((finding) => projectedById.get(finding.id as string)?.status !== finding.status) ||
+      projectedFindings.some((finding) => !authoritativeById.has(finding.id as string))
+    ) {
+      throw new Error(`${path}.observability.review findings do not match authoritative mission findings`);
+    }
+    const authoritativeBlockingOpen = authoritativeFindings.filter(
+      (finding) => finding.severity === "blocking" && finding.status !== "resolved",
+    ).length;
+    if (review.blockingOpen !== authoritativeBlockingOpen)
+      throw new Error(`${path}.observability.review blocking count does not match authoritative mission findings`);
     const changes = record(observability.changes, `${path}.observability.changes`);
     optionalString(changes, "branch", `${path}.observability.changes`);
     optionalString(changes, "worktree", `${path}.observability.changes`);
@@ -319,6 +345,8 @@ function validateSnapshot(value: unknown): MissionSnapshotFile {
         throw new Error(`${path} is COMPLETE without current verified acceptance evidence`);
       if (review.status !== "completed" || review.blockingOpen !== 0)
         throw new Error(`${path} is COMPLETE without current completed review evidence`);
+      if (authoritativeBlockingOpen !== 0)
+        throw new Error(`${path} is COMPLETE with an unresolved authoritative blocking finding`);
       if (tests.running !== false || tests.total === 0 || tests.completed !== tests.total || tests.failed !== 0)
         throw new Error(`${path} is COMPLETE without current successful validation evidence`);
       if (tests.passed === 0) throw new Error(`${path} is COMPLETE without a passing validation result`);

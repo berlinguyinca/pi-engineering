@@ -2365,6 +2365,13 @@ export class ExecutionBroker {
                 input.taskId,
               );
             }
+            // execute() resolves recovery authority before returning its lazy
+            // handle. Repository/worktree setup can await after that point, so
+            // re-resolve and hash every checkpoint artifact at the last
+            // possible boundary. No await may be inserted between this check
+            // and dispatch: the artifact store rejects mutations through its
+            // public API, while this closes the pre-result/setup race.
+            input.recovery = await this.durableRecoveryContext(input);
             writerStarted = true;
             const backendSettlement: Promise<BackendSettlement> = this.dispatch(
               input,

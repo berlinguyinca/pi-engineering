@@ -130,6 +130,7 @@ export interface MissionSnapshotFinding {
   status: string;
   summary: string;
   taskId: string | null;
+  repaired: boolean;
 }
 
 /**
@@ -245,6 +246,7 @@ export function buildMissionSnapshot(
       status: f.status,
       summary: f.summary,
       taskId: f.task_id,
+      repaired: f.status === "resolved",
     })),
     ...(observability ? { observability: toObservabilitySnapshot(observability) } : {}),
     ...(stop

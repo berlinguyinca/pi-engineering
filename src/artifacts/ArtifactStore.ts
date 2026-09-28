@@ -3,6 +3,8 @@ import { mkdir, open, readFile, readdir, unlink, writeFile } from "node:fs/promi
 import { dirname, join } from "node:path";
 import type { ArtifactMeta } from "../core/types.ts";
 
+type StoredArtifactMeta = ArtifactMeta & { immutable?: true };
+
 /**
  * Filesystem-backed artifact store (spec §25, AC-010).
  *
@@ -12,7 +14,7 @@ import type { ArtifactMeta } from "../core/types.ts";
  */
 export class ArtifactStore {
   private readonly root: string;
-  private readonly index = new Map<string, ArtifactMeta>();
+  private readonly index = new Map<string, StoredArtifactMeta>();
 
   private constructor(root: string) {
     this.root = root;
@@ -36,7 +38,7 @@ export class ArtifactStore {
             if (!f.endsWith(".json")) continue;
             const full = join(dir, f);
             try {
-              const meta = JSON.parse(await readFile(full, "utf-8")) as ArtifactMeta;
+              const meta = JSON.parse(await readFile(full, "utf-8")) as StoredArtifactMeta;
               if (meta?.id && meta?.uri) {
                 this.index.set(`${entry.name}/${meta.id}`, meta);
               }
@@ -67,10 +69,13 @@ export class ArtifactStore {
 
   /** Store an artifact; content stays on disk, meta (incl. summary) is indexed. */
   async put(category: string, id: string, content: string, summary: string): Promise<ArtifactMeta> {
+    if (this.index.get(`${category}/${id}`)?.immutable) {
+      throw new Error(`cannot overwrite immutable checkpoint artifact ${this.uri(category, id)}`);
+    }
     await mkdir(join(this.root, category), { recursive: true });
     const contentPath = this.contentPath(category, id);
     await writeFile(contentPath, content, "utf-8");
-    const meta: ArtifactMeta = {
+    const meta: StoredArtifactMeta = {
       id,
       category,
       uri: this.uri(category, id),
@@ -95,13 +100,14 @@ export class ArtifactStore {
     const artifactId = `${owner}-${digest}-${randomUUID()}`;
     const contentPath = this.contentPath(category, artifactId);
     const metaPath = this.metaPath(category, artifactId);
-    const meta: ArtifactMeta = {
+    const meta: StoredArtifactMeta = {
       id: artifactId,
       category,
       uri: this.uri(category, artifactId),
       size: Buffer.byteLength(content, "utf-8"),
       created_at: new Date().toISOString(),
       summary,
+      immutable: true,
     };
     await writeFile(contentPath, content, { encoding: "utf-8", flag: "wx" });
     try {
@@ -195,6 +201,9 @@ export class ArtifactStore {
   async delete(uri: string): Promise<void> {
     const meta = this.getByUri(uri);
     if (!meta) return;
+    if ((meta as StoredArtifactMeta).immutable) {
+      throw new Error(`cannot delete immutable checkpoint artifact ${uri}`);
+    }
     await unlink(this.contentPath(meta.category, meta.id)).catch(() => {});
     await unlink(this.metaPath(meta.category, meta.id)).catch(() => {});
     this.index.delete(`${meta.category}/${meta.id}`);

@@ -56,6 +56,8 @@ describe("mission snapshot publisher (spec 08 §API boundary)", () => {
     assert.equal(snap.tasks[0]!.isolation, "worktree");
     assert.equal(snap.findings.length, 1);
     assert.equal(snap.findings[0]!.severity, "blocking");
+    assert.equal(snap.findings[0]!.status, "open");
+    assert.equal(snap.findings[0]!.repaired, false);
     assert.equal(snap.findings[0]!.summary, "crashes on empty body");
 
     // The snapshot must round-trip through JSON (the plugin reads the file).

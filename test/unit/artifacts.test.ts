@@ -100,9 +100,22 @@ test("checkpoint-owned immutable writes keep concurrent equal-content claims dis
     assert.equal(await store.readContentByUri(first.uri), "same bytes");
     assert.equal(await store.readContentByUri(second.uri), "same bytes");
 
+    await assert.rejects(
+      () => store.put("checkpoint", first.id, "mutated bytes", "overwrite attempt"),
+      /immutable checkpoint artifact/i,
+    );
+    await assert.rejects(() => store.delete(second.uri), /immutable checkpoint artifact/i);
+    assert.equal(await store.readContentByUri(first.uri), "same bytes");
+    assert.equal(await store.readContentByUri(second.uri), "same bytes");
+
     const replayed = await ArtifactStore.create(root);
     assert.equal(await replayed.readContentByUri(first.uri), "same bytes");
     assert.equal(await replayed.readContentByUri(second.uri), "same bytes");
+    await assert.rejects(
+      () => replayed.put("checkpoint", first.id, "replayed mutation", "overwrite attempt"),
+      /immutable checkpoint artifact/i,
+    );
+    await assert.rejects(() => replayed.delete(second.uri), /immutable checkpoint artifact/i);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
