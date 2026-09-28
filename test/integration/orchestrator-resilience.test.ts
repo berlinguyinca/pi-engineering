@@ -141,6 +141,10 @@ function harness(opts: HarnessOpts) {
       headCommit: async () => "candidate-test-sha",
       captureDiff: async () => "diff --git a/src/health.ts b/src/health.ts",
       changedFiles: async () => ["src/health.ts"],
+      loadCandidateLifecycleInventory: async () => ({ records: [], diagnostics: [] }),
+      loadIntegrationRunInventory: async () => ({ records: [], diagnostics: [] }),
+      loadPromotionLifecycleInventory: async () => ({ records: [], diagnostics: [] }),
+      loadPendingBranchCleanupInventory: async () => ({ records: [], diagnostics: [] }),
     } as unknown as GitRepo,
     planner: async (mission) => [
       {

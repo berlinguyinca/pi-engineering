@@ -444,6 +444,13 @@ an actionable stopped mission under the same ID: it fences stale ownership,
 reconciles side effects, preserves completed checkpoint work, and schedules
 only the remaining deliverables. A late old-worker result is retained as audit
 evidence and cannot change task, candidate, gate, or repository state.
+Checkpoint completion is accepted only through the production
+`checkpoint_progress` tool: each declared deliverable must name the exact
+current candidate SHA and committed evidence paths present in the broker's own
+Git snapshot. Plain activity text and spoofed SHA/path claims carry no
+authority. Missing lifecycle inventory fails closed with a typed
+`PERSISTENCE_UNAVAILABLE` diagnostic; a repository root is never substituted
+for actual candidate, branch, worktree, artifact, or committed-path evidence.
 
 - `EXECUTING`: authoritative owned work is active.
 - `WAITING_*`: a named condition has a next action and deadline.
@@ -469,11 +476,17 @@ npm run dogfood:mission-recovery
 
 The default dogfood path verifies exactly one installed
 `pi-engineering-runtime` package, requires its Git SHA to match this checkout
-(or `--expected-sha`), and lets Pi discover that installed extension normally;
+(or `--expected-sha`), requires its tracked tree, index, and untracked set to
+be clean before any extension-loading Pi command, and then lets Pi discover
+that installed extension normally;
 it does not also pass `--extension`. It refuses non-`local/local` models,
 enabled/advertised metabolomics, and a temporary parent that is or overlaps the
 current checkout, extension/package installation, or any Git worktree. It then
-creates a temporary Git repository only and validates snapshot contract v3.
+creates a temporary Git repository only and validates every required snapshot
+contract-v3 field and numeric counter. `COMPLETE` additionally requires a
+nonzero declared acceptance total, exact coverage, and current verified review
+evidence; stopped states require nonempty reason, resume condition, recovery
+IDs, and actual preserved-work references.
 Only `COMPLETE` with verified current acceptance evidence, or an explicitly
 allowed stopped state with a complete actionable stop, exits zero;
 `FAILED`/`CANCELED` retain and print the inspection path and exit nonzero.
@@ -481,7 +494,8 @@ allowed stopped state with a complete actionable stop, exits zero;
 For source-only diagnostics (not the Task 12 installed-package proof), run
 `node scripts/dogfood-mission-recovery.ts --source-only`. That mode is labeled
 in its JSON output and uses `--no-extensions` before one explicit source
-`--extension`, preventing duplicate discovery.
+`--extension`, preventing duplicate discovery. Every preliminary source-mode
+Pi invocation also uses `--no-extensions`.
 
 Slice 1 supports multiple explicitly authorized local roots, with one
 repository-bound executable task and promotion at a time. Cross-repository

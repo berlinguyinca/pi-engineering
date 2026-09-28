@@ -105,7 +105,7 @@ async function fakeInstalledPi(status = "COMPLETE") {
   const directory = await mkdtemp(join(resolve(process.cwd(), ".."), "pi-eng-fake-installed-"));
   const installed = join(directory, "installed");
   const executable = join(directory, "pi.mjs");
-  const log = join(directory, "args.json");
+  const log = join(directory, "args.jsonl");
   await mkdir(installed);
   await writeFile(join(installed, "package.json"), '{"name":"pi-engineering-runtime"}\n');
   await exec("git", ["init", "-q", installed]);
@@ -117,20 +117,25 @@ async function fakeInstalledPi(status = "COMPLETE") {
   await writeFile(
     executable,
     `#!/usr/bin/env node
-import { mkdir, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 const args = process.argv.slice(2);
-if (args[0] === "--list-models") { process.stdout.write("local local ready\\n"); process.exit(0); }
-if (args[0] === "list") { process.stdout.write(process.env.FAKE_INSTALLED_PATH + "\\n"); process.exit(0); }
-await writeFile(process.env.FAKE_ARGS_LOG, JSON.stringify(args));
+await appendFile(process.env.FAKE_ARGS_LOG, JSON.stringify(args) + "\\n");
+if (args.join(" ") === "--no-extensions --list-models" || args[0] === "--list-models") { process.stdout.write("local local ready\\n"); process.exit(0); }
+if (args.join(" ") === "--no-extensions list") { process.stdout.write(process.env.FAKE_INSTALLED_PATH + "\\n"); process.exit(0); }
 await mkdir(join(process.cwd(), ".pi-eng"), { recursive: true });
+if (process.env.FAKE_SNAPSHOT_MODE === "missing") process.exit(0);
+if (process.env.FAKE_SNAPSHOT_MODE === "malformed") {
+  await writeFile(join(process.cwd(), ".pi-eng", "orchestration-snapshot.json"), JSON.stringify({ contractVersion: 3, generatedAt: 42, missions: [{ id: "MSN-bad", revision: -1, status: "COMPLETE", observability: { acceptanceCoverage: { completed: "1", total: 1 } } }] }));
+  process.exit(0);
+}
 await writeFile(join(process.cwd(), ".pi-eng", "orchestration-snapshot.json"), JSON.stringify({
   contractVersion: 3,
   generatedAt: new Date().toISOString(),
   missions: [{
     id: "MSN-fake-dogfood", revision: 7, title: "fake", goal: "fake", workflowClass: "engineering_review",
     status: ${JSON.stringify(status)}, riskProfile: "high", constraints: [], requiredGates: [],
-    acceptanceCriteria: [], tasks: [], findings: [],
+    acceptanceCriteria: [{ id: "AC-fake", criterion: "dogfood completes", status: "verified" }], tasks: [], findings: [],
     observability: {
       progress: { approximatePercent: 100, verifiedComplete: true, basis: "weighted_dag" },
       acceptanceCoverage: { completed: 1, total: 1, approximatePercent: 100 },
@@ -369,11 +374,15 @@ describe("mission reliability foundation — synthetic MSN-qSLaeM", () => {
               await writeFile(join(request.cwd, "src", "two.js"), "export const two = 2;\n");
               await exec("git", ["-C", request.cwd, "add", "-A"]);
               await exec("git", ["-C", request.cwd, "commit", "-q", "-m", "checkpoint two of three"]);
+              const candidateSha = (await exec("git", ["-C", request.cwd, "rev-parse", "HEAD"])).stdout.trim();
               request.onActivity?.({
-                kind: "state",
-                summary: "two of three",
+                kind: "checkpoint",
+                summary: "Checkpoint progress recorded",
                 meaningfulProgress: true,
-                completedDeliverables: ["one", "two"],
+                claims: [
+                  { deliverable: "one", candidateSha, evidencePaths: ["src/one.js"], artifactRefs: [] },
+                  { deliverable: "two", candidateSha, evidencePaths: ["src/two.js"], artifactRefs: [] },
+                ],
               });
               await late;
               return {
@@ -883,7 +892,13 @@ describe("mission reliability foundation — synthetic MSN-qSLaeM", () => {
         temporaryRepository: string;
         durableEvidence: { missionId: string; contractVersion: number; acceptanceCoverage: { completed: number } };
       };
-      const args = JSON.parse(await readFile(fake.log, "utf8")) as string[];
+      const invocations = (await readFile(fake.log, "utf8"))
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as string[]);
+      const args = invocations.at(-1)!;
+      assert.deepEqual(invocations[0], ["--no-extensions", "list"]);
+      assert.ok(invocations.findIndex((entry) => entry.includes("--list-models")) > 0);
       assert.equal(evidence.verificationMode, "installed-package");
       assert.equal(evidence.installedPackage, fake.installed);
       assert.equal(evidence.durableEvidence.missionId, "MSN-fake-dogfood");
@@ -910,7 +925,12 @@ describe("mission reliability foundation — synthetic MSN-qSLaeM", () => {
         { cwd: process.cwd(), env: { ...process.env, FAKE_INSTALLED_PATH: fake.installed, FAKE_ARGS_LOG: fake.log } },
       );
       const evidence = JSON.parse(result.stdout) as { verificationMode: string; temporaryRepository: string };
-      const args = JSON.parse(await readFile(fake.log, "utf8")) as string[];
+      const invocations = (await readFile(fake.log, "utf8"))
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as string[]);
+      const args = invocations.at(-1)!;
+      assert.deepEqual(invocations[0], ["--no-extensions", "--list-models"]);
       assert.match(evidence.verificationMode, /^source-only/);
       assert.ok(args.indexOf("--no-extensions") >= 0);
       assert.ok(args.indexOf("--extension") > args.indexOf("--no-extensions"));
@@ -919,6 +939,57 @@ describe("mission reliability foundation — synthetic MSN-qSLaeM", () => {
       await fake.cleanup();
     }
   });
+
+  it("refuses a dirty installed package before any extension-loading Pi invocation", async () => {
+    const fake = await fakeInstalledPi();
+    try {
+      await writeFile(join(fake.installed, "untracked.txt"), "dirty\n");
+      await assert.rejects(
+        () =>
+          exec(
+            process.execPath,
+            ["scripts/dogfood-mission-recovery.ts", "--pi", fake.executable, "--expected-sha", fake.sha],
+            {
+              cwd: process.cwd(),
+              env: { ...process.env, FAKE_INSTALLED_PATH: fake.installed, FAKE_ARGS_LOG: fake.log },
+            },
+          ),
+        /installed package is not clean/i,
+      );
+      const invocations = (await readFile(fake.log, "utf8"))
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as string[]);
+      assert.deepEqual(invocations, [["--no-extensions", "list"]]);
+    } finally {
+      await fake.cleanup();
+    }
+  });
+
+  for (const mode of ["missing", "malformed"] as const) {
+    it(`returns nonzero for a ${mode} runtime v3 snapshot`, async () => {
+      const fake = await fakeInstalledPi();
+      try {
+        await assert.rejects(() =>
+          exec(
+            process.execPath,
+            ["scripts/dogfood-mission-recovery.ts", "--pi", fake.executable, "--expected-sha", fake.sha],
+            {
+              cwd: process.cwd(),
+              env: {
+                ...process.env,
+                FAKE_INSTALLED_PATH: fake.installed,
+                FAKE_ARGS_LOG: fake.log,
+                FAKE_SNAPSHOT_MODE: mode,
+              },
+            },
+          ),
+        );
+      } finally {
+        await fake.cleanup();
+      }
+    });
+  }
 
   it("refuses a temporary parent inside any Git worktree before creating a repository", async () => {
     const fake = await fakeInstalledPi();

@@ -30,6 +30,7 @@ import type {
 } from "../git/GitRepo.ts";
 import type { WorkerActivity } from "../workers/WorkerExecutor.ts";
 import { sanitizeWorkerActivity } from "../workers/activity.ts";
+import type { CheckpointProgressClaim } from "../workers/checkpointProgressTool.ts";
 import type { CheckpointManager, CheckpointSnapshot } from "./checkpoints.ts";
 import { EvidenceUnavailableError, buildCandidateEvidenceIdentity } from "./evidence.ts";
 import type { GateEvidencePublication, LateExecutionEvidence, MissionStore } from "./missionStore.ts";
@@ -147,6 +148,17 @@ export interface ExecutionOutcome {
   >;
 }
 
+export class RepositoryLifecycleInventoryUnavailableError extends Error {
+  readonly code = "PERSISTENCE_UNAVAILABLE";
+  readonly repoId: string;
+
+  constructor(repoId: string) {
+    super(`PERSISTENCE_UNAVAILABLE: required Git lifecycle inventory is unavailable for repository ${repoId}`);
+    this.name = "RepositoryLifecycleInventoryUnavailableError";
+    this.repoId = repoId;
+  }
+}
+
 export interface CleanupFailure {
   repoId: string;
   path: string;
@@ -230,6 +242,7 @@ export interface AgentRunner {
     isolatedWorktree?: boolean;
     modelRequirements?: Record<string, unknown>;
     recovery?: CheckpointRecoveryContext;
+    deliverables?: readonly string[];
     signal: AbortSignal;
     onActivity?: (event: WorkerActivity) => void;
   }): Promise<ExecutionOutcome>;
@@ -1443,17 +1456,13 @@ export class ExecutionBroker {
     for (const repoId of repoIds) {
       const git = this.resolveRepository ? (await this.resolveRepository(repoId, [], missionId)).git : this.git;
       if (!git) continue;
-      // Narrow Git fault doubles used by public orchestration tests may not
-      // implement the optional lifecycle-inventory diagnostics. They can still
-      // provide authoritative execution behavior; simply omit unavailable
-      // diagnostic refs from an actionable stop.
       if (
         typeof git.loadCandidateLifecycleInventory !== "function" ||
         typeof git.loadIntegrationRunInventory !== "function" ||
         typeof git.loadPromotionLifecycleInventory !== "function" ||
         typeof git.loadPendingBranchCleanupInventory !== "function"
       ) {
-        continue;
+        throw new RepositoryLifecycleInventoryUnavailableError(repoId);
       }
       const [candidates, runs, promotions, cleanups] = await Promise.all([
         git.loadCandidateLifecycleInventory(missionId, repoId),
@@ -2014,6 +2023,8 @@ export class ExecutionBroker {
           } | null = null;
           let meaningfulActivity = 0;
           const completedDeliverables = new Set<string>();
+          const checkpointClaims = new Map<string, CheckpointProgressClaim>();
+          const rejectedCheckpointClaims = new Set<string>();
           let checkpointScheduling = true;
           let retainWorktreeOnCleanup = false;
           let detachedAfterTerminalAbort = false;
@@ -2047,7 +2058,7 @@ export class ExecutionBroker {
             this.store.assertExecutionAuthoritative(execution.execution_id);
           };
           const writeCheckpoint = async (
-            completedDeliverables: string[] = [],
+            declaredCompleted: string[] = [],
             artifactRefs: string[] = [],
             artifactHashes: string[] = [],
             requiredPreservedPaths: string[] | null = null,
@@ -2056,6 +2067,35 @@ export class ExecutionBroker {
             assertOrigin();
             const snapshot = await this.checkpointSnapshot(execution.execution_id, input, repository, assertOrigin);
             assertOrigin();
+            for (const claim of checkpointClaims.values()) {
+              const valid =
+                input.deliverables?.includes(claim.deliverable) === true &&
+                snapshot.candidateSha !== null &&
+                claim.candidateSha === snapshot.candidateSha &&
+                claim.evidencePaths.length > 0 &&
+                claim.evidencePaths.every((path) => snapshot.committedChanges.includes(path));
+              if (valid) {
+                completedDeliverables.add(claim.deliverable);
+                artifactRefs.push(...claim.artifactRefs);
+                continue;
+              }
+              const identity = `${claim.deliverable}:${claim.candidateSha}:${claim.evidencePaths.join(",")}`;
+              if (!rejectedCheckpointClaims.has(identity)) {
+                rejectedCheckpointClaims.add(identity);
+                this.store.addFinding({
+                  mission_id: input.missionId,
+                  task_id: input.taskId,
+                  severity: "major",
+                  category: "checkpoint_progress",
+                  file: null,
+                  line: null,
+                  summary: `Rejected unauthenticated checkpoint progress for ${claim.deliverable}`,
+                  evidence: `claimed=${claim.candidateSha}; actual=${snapshot.candidateSha ?? "none"}; paths=${claim.evidencePaths.join(",")}`,
+                  recommended_action:
+                    "Commit the declared deliverable, then report the exact current candidate SHA and committed evidence paths.",
+                });
+              }
+            }
             if (
               requiredPreservedPaths !== null &&
               (!snapshot.candidateSha ||
@@ -2068,8 +2108,8 @@ export class ExecutionBroker {
             await this.checkpoints.persist({
               taskId: input.taskId,
               executionId: execution.execution_id,
-              completedDeliverables,
-              artifactRefs,
+              completedDeliverables: [...new Set([...completedDeliverables, ...declaredCompleted])],
+              artifactRefs: [...new Set(artifactRefs)],
               artifactHashes,
               model: execution.model,
               snapshot,
@@ -2115,8 +2155,8 @@ export class ExecutionBroker {
             if (activitySettled || abort.signal.aborted) return;
             const safe = sanitizeWorkerActivity(event);
             if (!safe) return;
-            for (const deliverable of safe.completedDeliverables ?? []) {
-              if (input.deliverables?.includes(deliverable)) completedDeliverables.add(deliverable);
+            for (const claim of safe.claims ?? []) {
+              checkpointClaims.set(claim.deliverable, claim);
             }
             if (safe.kind !== "heartbeat") lastActivityAt = Date.now();
             if (safe.meaningfulProgress && input.checkpointPolicy?.activity_milestone) {
@@ -2679,6 +2719,7 @@ export class ExecutionBroker {
           isolatedWorktree: worktree !== null,
           modelRequirements: input.modelRequirements,
           recovery: input.recovery,
+          deliverables: input.deliverables,
           signal,
           onActivity: base.onActivity,
         });

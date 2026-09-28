@@ -917,7 +917,6 @@ export class Orchestrator {
 
   private async preservedMissionWork(missionId: string): Promise<string[]> {
     const durableRepositoryRefs = await this.broker.durableRepositoryStateRefs(missionId);
-    const repository = this.store.getMission(missionId)?.repository;
     const preserved = [
       ...new Set(
         [
@@ -942,7 +941,7 @@ export class Orchestrator {
         ].filter((value): value is string => !!value?.trim()),
       ),
     ];
-    return preserved.length > 0 ? preserved : repository?.trim() ? [repository] : [];
+    return preserved;
   }
 
   private assertRepairCheckpoint(failed: OrchestrationTask, checkpoint: import("./types.ts").TaskCheckpoint): void {

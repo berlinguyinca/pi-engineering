@@ -239,6 +239,7 @@ export function realBackends(opts: RealBackendsOptions) {
         isolatedWorktree?: boolean;
         modelRequirements?: Record<string, unknown>;
         recovery?: CheckpointRecoveryContext;
+        deliverables?: readonly string[];
         signal: AbortSignal;
         onActivity?: (event: WorkerActivity) => void;
       }): Promise<ExecutionOutcome> {
@@ -257,6 +258,7 @@ export function realBackends(opts: RealBackendsOptions) {
           // fallback (no worktree) runs in the user's checkout.
           isolatedWorktree: input.isolatedWorktree === true && !!input.worktree,
           recovery: input.recovery,
+          deliverables: input.deliverables,
           // Every delegated implementation/recovery run is a fresh session;
           // carrying the identity through the public worker request makes its
           // separation from the later reviewer independently auditable.

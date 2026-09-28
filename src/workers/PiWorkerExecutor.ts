@@ -72,6 +72,7 @@ import { type ThinkingOffConfig, resolveThinkingOffConfig } from "../request/thi
 import { emitTelemetry } from "../telemetry/sink.ts";
 import type { WorkerExecutor, WorkerRequest, WorkerRun } from "./WorkerExecutor.ts";
 import { activityFromSessionEvent, emitWorkerActivity } from "./activity.ts";
+import { checkpointProgressTool } from "./checkpointProgressTool.ts";
 import { registerLocalProviders } from "./localProviders.ts";
 import { WORKER_KICKOFF, buildSystemPrompt, wantsCommitDiscipline } from "./prompts.ts";
 import { guardRuntimeRequestBody } from "./requestBodyGuard.ts";
@@ -342,7 +343,11 @@ ${TOOL_TRANSITION_RULE}`;
     modelRuntime: ModelRuntime,
   ): Promise<WorkerRun> {
     const terminating = req.resultTool === "review_result" ? reviewResultTool : workerResultTool;
-    const customTools = [...this.customTools, terminating];
+    const customTools = [
+      ...this.customTools,
+      ...(req.deliverables?.length ? [checkpointProgressTool] : []),
+      terminating,
+    ];
     const tools = [...new Set([...req.tools, ...customTools.map((t) => t.name)])];
     let model: Model<any> = initialModel;
     let systemPrompt: string = initialPrompt;
@@ -842,7 +847,18 @@ ${recovery.recoveryPrompt}`;
     const unsubscribe = session.subscribe((event) => {
       const activity = activityFromSessionEvent(event);
       const activityToolName = "toolName" in event ? event.toolName : undefined;
-      if (activity && activityToolName !== terminatingName) emitWorkerActivity(req, activity);
+      if (activity && activityToolName !== terminatingName && activityToolName !== checkpointProgressTool.name) {
+        emitWorkerActivity(req, activity);
+      }
+      if (event.type === "tool_execution_end" && event.toolName === checkpointProgressTool.name && !event.isError) {
+        const details = event.result?.details as { claims?: unknown } | undefined;
+        emitWorkerActivity(req, {
+          kind: "checkpoint",
+          summary: "Checkpoint progress recorded",
+          meaningfulProgress: true,
+          claims: details?.claims as never,
+        });
+      }
       // Capture the terminating tool (worker_result or review_result).
       if (event.type === "tool_execution_end" && event.toolName === terminatingName) {
         if (!event.isError) {
@@ -1223,6 +1239,11 @@ export function buildCompactedWorkerPrompt(req: WorkerRequest, recoveryPrompt: s
       "- Commit your work on the current branch after each coherent change. If your session is terminated by the time budget, only your own commits are recovered; uncommitted edits at that point are not merged. Never switch branches, rebase, amend others' commits, or push.",
     );
   }
+  if (req.deliverables?.length) {
+    parts.push(
+      `- Declared checkpoint deliverables: ${req.deliverables.join(", ")}. After a coherent commit, call checkpoint_progress with the exact git rev-parse HEAD and committed evidence paths.`,
+    );
+  }
   parts.push(`- Your final action MUST be calling the worker_result tool.`);
   parts.push(`- Do not ask questions. Do not emit an assistant answer after calling worker_result.`);
 
@@ -1230,9 +1251,12 @@ export function buildCompactedWorkerPrompt(req: WorkerRequest, recoveryPrompt: s
 }
 
 export function workerContext(req: WorkerRequest): string | undefined {
-  if (!req.recovery) return req.context;
+  const checkpoint = req.deliverables?.length
+    ? `Declared checkpoint deliverables: ${req.deliverables.join(", ")}. After each coherent commit, run git rev-parse HEAD and call checkpoint_progress with the completed deliverable, that exact candidate SHA, and committed evidence paths.`
+    : undefined;
+  if (!req.recovery) return [req.context, checkpoint].filter(Boolean).join("\n\n") || undefined;
   const durable = durableRecoveryContext(req)!;
-  return req.context?.trim() ? `${req.context.trim()}\n\n${durable}` : durable;
+  return [req.context?.trim(), checkpoint, durable].filter(Boolean).join("\n\n");
 }
 
 function durableRecoveryContext(req: WorkerRequest): string | undefined {

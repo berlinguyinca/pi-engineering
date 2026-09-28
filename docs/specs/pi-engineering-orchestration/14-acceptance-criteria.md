@@ -95,10 +95,19 @@ installed-Pi live check; it refuses every model except `local/local`, refuses an
 enabled/advertised metabolomics provider, verifies the unique installed package
 path and exact Git SHA without an explicit `--extension`, and operates only on
 a retained temporary Git repository outside every real Git worktree. The
-separately labeled source-only diagnostic disables extension discovery before
-loading exactly one explicit source extension. Snapshot contract/version,
+installed tree's exact HEAD, tracked changes, index, and untracked files are
+checked before any Pi invocation that can load extensions. Worker checkpoint
+progress is accepted only from the production tool path when every completed
+declared deliverable is bound to the broker-observed candidate SHA and
+committed path evidence; ordinary activity names and spoofed claims are
+rejected. Required lifecycle inventories are fail-closed, and only concrete
+candidate, worktree, branch, committed-path, and artifact references count as
+preserved work. The separately labeled source-only diagnostic disables
+extension discovery before every preliminary command and before loading
+exactly one explicit source extension. The full snapshot contract/version,
 `id`, `observability.acceptanceCoverage`, `observability.preservedWork`, and
-the typed `stop` are validated; `FAILED`/`CANCELED` are nonzero outcomes.
+the typed `stop`, field types, and finite nonnegative counters are validated;
+`FAILED`/`CANCELED` are nonzero outcomes.
 
 ## Implemented status and recovery semantics
 

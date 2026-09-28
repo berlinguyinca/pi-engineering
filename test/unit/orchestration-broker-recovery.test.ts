@@ -10,7 +10,11 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import { GitRepo } from "../../src/git/GitRepo.ts";
-import { ExecutionBroker, type ExecutionOutcome } from "../../src/orchestration/broker.ts";
+import {
+  ExecutionBroker,
+  type ExecutionOutcome,
+  RepositoryLifecycleInventoryUnavailableError,
+} from "../../src/orchestration/broker.ts";
 import { CheckpointManager } from "../../src/orchestration/checkpoints.ts";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
@@ -434,11 +438,45 @@ describe("ExecutionBroker: recovering a timed-out worker's committed work", () =
               await mkdir(join(worktree!, "src"), { recursive: true });
               await writeFile(join(worktree!, "src", "preserved.ts"), "export const preserved = true;\n");
               await git.commitAll(worktree!, "worker checkpoint commit");
+              const candidateSha = await git.headCommitIn(worktree!);
               onActivity?.({
                 kind: "state",
-                summary: "checkpoint",
+                summary: "spoofed legacy checkpoint",
                 meaningfulProgress: true,
                 completedDeliverables: ["implementation"],
+              } as never);
+              onActivity?.({
+                kind: "checkpoint",
+                summary: "spoofed candidate",
+                meaningfulProgress: true,
+                claims: [
+                  {
+                    deliverable: "implementation",
+                    candidateSha: "spoofed-sha",
+                    evidencePaths: ["src/preserved.ts"],
+                    artifactRefs: [],
+                  },
+                ],
+              });
+              for (let attempt = 0; attempt < 100; attempt++) {
+                if (
+                  store.listFindings(mission.mission_id).some((finding) => finding.category === "checkpoint_progress")
+                )
+                  break;
+                await new Promise((resolve) => setTimeout(resolve, 10));
+              }
+              onActivity?.({
+                kind: "checkpoint",
+                summary: "Checkpoint progress recorded",
+                meaningfulProgress: true,
+                claims: [
+                  {
+                    deliverable: "implementation",
+                    candidateSha,
+                    evidencePaths: ["src/preserved.ts"],
+                    artifactRefs: [],
+                  },
+                ],
               });
               await blocked;
               return {
@@ -492,6 +530,15 @@ describe("ExecutionBroker: recovering a timed-out worker's committed work", () =
       assert.ok(checkpoint?.candidateSha, "the last stable checkpoint remains recoverable evidence");
       assert.deepEqual(checkpoint.completedDeliverables, ["implementation"]);
       assert.deepEqual(checkpoint.remainingDeliverables, []);
+      assert.ok(
+        store
+          .listFindings(mission.mission_id)
+          .some(
+            (finding) =>
+              finding.category === "checkpoint_progress" && finding.summary.includes("Rejected unauthenticated"),
+          ),
+        `a spoofed candidate SHA is rejected visibly: ${JSON.stringify(store.listFindings(mission.mission_id))}`,
+      );
       execFileSync("git", ["-C", fx.root, "cat-file", "-e", `${checkpoint.candidateSha}:src/preserved.ts`]);
 
       const integrationTask = store.createTask({
@@ -673,5 +720,39 @@ describe("GitRepo.revListCount", () => {
     } finally {
       await fx.cleanup();
     }
+  });
+});
+
+describe("ExecutionBroker durable lifecycle inventory", () => {
+  it("fails closed with a typed diagnostic when a Git provider omits required inventories", async () => {
+    const store = MissionStore.open(JsonlEventStore.inMemory());
+    const mission = store.createMission({
+      title: "inventory",
+      goal: "inventory",
+      user_request: "inventory",
+      repository: "/tmp/not-evidence",
+      base_ref: "base",
+      risk_profile: "high",
+      workflow_class: "engineering_review",
+    });
+    store.createTask({
+      mission_id: mission.mission_id,
+      repo_id: "repo-inventory",
+      kind: "agent",
+      role: "implementer",
+      objective: "work",
+    });
+    const broker = new ExecutionBroker({
+      store,
+      resolveRepository: async () => ({ repoId: "repo-inventory", root: "/tmp/not-evidence", git: {} as GitRepo }),
+      backends: {},
+    });
+    await assert.rejects(
+      () => broker.durableRepositoryStateRefs(mission.mission_id),
+      (error: unknown) =>
+        error instanceof RepositoryLifecycleInventoryUnavailableError &&
+        error.code === "PERSISTENCE_UNAVAILABLE" &&
+        error.repoId === "repo-inventory",
+    );
   });
 });

@@ -142,6 +142,53 @@ test("worker: a stream cut before any finish_reason is retried in a fresh sessio
   assert.equal(requests, 2, "one truncated attempt, one fresh retry");
 });
 
+test("worker: the production checkpoint tool emits candidate-bound progress for two of three deliverables", async () => {
+  await withProbe(
+    [
+      toolCalls([
+        {
+          name: "checkpoint_progress",
+          args: {
+            claims: [
+              { deliverable: "implementation", candidate_sha: "abc123", evidence_paths: ["src/a.ts"] },
+              { deliverable: "tests", candidate_sha: "abc123", evidence_paths: ["test/a.test.ts"] },
+            ],
+          },
+        },
+        { name: "worker_result", args: WORKER_RESULT },
+      ]),
+    ],
+    async (executor, cwd) => {
+      const activities: unknown[] = [];
+      const run = await executor.run({
+        role: "implementer",
+        task: "implement and test",
+        tools: [],
+        cwd,
+        deliverables: ["implementation", "tests", "docs"],
+        isolatedWorktree: true,
+        onActivity: (activity) => activities.push(activity),
+        modelOverride: { provider: "probe", id: "probe-model" },
+      });
+      assert.equal(run.result.status, "completed");
+      assert.deepEqual(
+        activities.filter((activity: any) => activity.kind === "checkpoint"),
+        [
+          {
+            kind: "checkpoint",
+            summary: "Checkpoint progress recorded",
+            meaningfulProgress: true,
+            claims: [
+              { deliverable: "implementation", candidateSha: "abc123", evidencePaths: ["src/a.ts"], artifactRefs: [] },
+              { deliverable: "tests", candidateSha: "abc123", evidencePaths: ["test/a.test.ts"], artifactRefs: [] },
+            ],
+          },
+        ],
+      );
+    },
+  );
+});
+
 test("reviewer: a cut AFTER review_result was delivered does not re-run the review", async () => {
   // review_result arrives alongside a non-terminating tool, so the loop takes
   // one more turn — and that turn is cut. The verdict was already delivered, so

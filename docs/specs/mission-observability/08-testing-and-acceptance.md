@@ -137,7 +137,9 @@ The deterministic public-surface proof is
 the effective model is exactly `local/local` and metabolomics is absent or
 disabled. Its default Task 12 path validates one installed package path and its
 exact Git SHA, relies on installed discovery (no duplicate `--extension`), and
-rejects any temp parent in/overlapping a Git worktree, checkout, extension, or
+verifies a clean tracked tree, index, and untracked set before any
+extension-loading Pi command. Package discovery itself uses `--no-extensions`.
+It rejects any temp parent in/overlapping a Git worktree, checkout, extension, or
 installation before `mkdtemp`. It validates contract v3 and prints the durable
 mission `id`, revision, status, `observability.acceptanceCoverage`,
 `observability.preservedWork`, typed `stop` (when present), and snapshot path.
@@ -145,6 +147,10 @@ Only verified `COMPLETE` or an allowed stopped state with a complete actionable
 stop succeeds; `FAILED`/`CANCELED` exit nonzero and retain the exact path. The
 explicitly labeled source-only diagnostic uses `--no-extensions` plus one
 source `--extension` and is not the installed-package proof.
+Every preliminary source-mode Pi command uses `--no-extensions`. Runtime-v3
+validation rejects malformed field types, non-finite/negative/non-integer
+counters, zero-acceptance `COMPLETE`, incomplete current evidence, and stopped
+states without a complete typed recovery/preservation payload.
 
 Status text is contractual: workerless runnable work is `ORPHANED`, unresolved
 dependency-only work is `DEADLOCKED`, heartbeat without meaningful progress is

@@ -234,6 +234,10 @@ function harness(opts: HarnessOpts = {}): Harness {
                 ? "diff --git a/src/repair.ts b/src/repair.ts"
                 : "diff --git a/src/health.ts b/src/health.ts",
             changedFiles: async () => ["src/health.ts"],
+            loadCandidateLifecycleInventory: async () => ({ records: [], diagnostics: [] }),
+            loadIntegrationRunInventory: async () => ({ records: [], diagnostics: [] }),
+            loadPromotionLifecycleInventory: async () => ({ records: [], diagnostics: [] }),
+            loadPendingBranchCleanupInventory: async () => ({ records: [], diagnostics: [] }),
           } as unknown as GitRepo,
         }),
     planner: async (mission) => [
@@ -1145,6 +1149,10 @@ describe("acceptance scenario C — independent tasks run concurrently with isol
         statusIn: async () => "",
         removeWorktree: async () => {},
         isAncestor: async () => false,
+        loadCandidateLifecycleInventory: async () => ({ records: [], diagnostics: [] }),
+        loadIntegrationRunInventory: async () => ({ records: [], diagnostics: [] }),
+        loadPromotionLifecycleInventory: async () => ({ records: [], diagnostics: [] }),
+        loadPendingBranchCleanupInventory: async () => ({ records: [], diagnostics: [] }),
       } as never,
       planner: async (mission) => [
         {
