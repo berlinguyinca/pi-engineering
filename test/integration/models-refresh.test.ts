@@ -443,3 +443,186 @@ test("refresh: a model the gateway dropped is kept unless pruning is asked for",
     s.cleanup();
   }
 });
+
+test("refresh: verification writes only models that produce a visible completion", async () => {
+  const s = scratch();
+  const requested: string[] = [];
+  let inFlight = 0;
+  let maxInFlight = 0;
+  try {
+    await refreshProviderModels({
+      modelsPath: s.path,
+      providerId: "metabolomics",
+      apiKey: "k",
+      probeModels: true,
+      fetchImpl: (async (input: string | URL | Request, init?: RequestInit) => {
+        const url = String(input);
+        if (url.endsWith("/models")) {
+          return { ok: true, status: 200, headers: new Headers(), json: async () => PAYLOAD };
+        }
+        const body = JSON.parse(String(init?.body)) as {
+          model: string;
+          reasoning_effort?: string;
+          chat_template_kwargs?: { enable_thinking?: boolean };
+        };
+        requested.push(body.model);
+        assert.equal((init?.headers as Record<string, string>)?.Authorization, "Bearer k");
+        assert.equal(body.reasoning_effort, "none", "known reasoning gateways must not spend the probe on thinking");
+        assert.equal(body.chat_template_kwargs?.enable_thinking, false);
+        inFlight += 1;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        try {
+          if (body.model === "qwen3.8-27b-q4-250k" || body.model === "deepseek-v4-flash") {
+            return {
+              ok: true,
+              status: 200,
+              json: async () => ({ choices: [{ message: { content: "OK" } }] }),
+            };
+          }
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({ choices: [{ message: { content: "", reasoning_content: "still thinking" } }] }),
+          };
+        } finally {
+          inFlight -= 1;
+        }
+      }) as typeof fetch,
+    });
+
+    assert.deepEqual(requested.sort(), PAYLOAD.data.map((model) => model.id).sort());
+    assert.equal(maxInFlight, 1, "default probing must not create its own capacity contention");
+    assert.deepEqual(
+      read(s.path).providers.metabolomics.models.map((model) => model.id),
+      ["deepseek-v4-flash", "qwen3.8-27b-q4-250k"],
+      "advertised-but-failing and empty-answer models must leave the picker",
+    );
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("refresh: one success plus an account-wide refusal preserves the provider", async () => {
+  const s = scratch();
+  const before = readFileSync(s.path, "utf8");
+  try {
+    await assert.rejects(
+      () =>
+        refreshProviderModels({
+          modelsPath: s.path,
+          providerId: "metabolomics",
+          apiKey: "k",
+          probeModels: true,
+          fetchImpl: (async (input: string | URL | Request, init?: RequestInit) => {
+            if (String(input).endsWith("/models")) {
+              return { ok: true, status: 200, headers: new Headers(), json: async () => PAYLOAD };
+            }
+            const body = JSON.parse(String(init?.body)) as { model: string };
+            if (body.model === PAYLOAD.data[0]!.id) {
+              return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: "OK" } }] }) };
+            }
+            return {
+              ok: false,
+              status: 429,
+              json: async () => ({ error: { code: "caller_concurrency", scope: "account" } }),
+            };
+          }) as typeof fetch,
+        }),
+      /verification was inconclusive.*HTTP 429/,
+    );
+    assert.equal(readFileSync(s.path, "utf8"), before);
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("refresh: a model is excluded only after two bounded probe timeouts", async () => {
+  const s = scratch();
+  const payload = { data: PAYLOAD.data.slice(0, 2) };
+  let timedOutAttempts = 0;
+  try {
+    const result = await refreshProviderModels({
+      modelsPath: s.path,
+      providerId: "metabolomics",
+      apiKey: "k",
+      probeModels: true,
+      probeTimeoutMs: 5,
+      fetchImpl: (async (input: string | URL | Request, init?: RequestInit) => {
+        if (String(input).endsWith("/models")) {
+          return { ok: true, status: 200, headers: new Headers(), json: async () => payload };
+        }
+        const body = JSON.parse(String(init?.body)) as { model: string };
+        if (body.model === payload.data[0]!.id) {
+          return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: "OK" } }] }) };
+        }
+        timedOutAttempts += 1;
+        return await new Promise((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), {
+            once: true,
+          });
+        });
+      }) as typeof fetch,
+    });
+
+    assert.equal(timedOutAttempts, 2);
+    assert.deepEqual(
+      result.gateway.map((model) => model.id),
+      [payload.data[0]!.id],
+    );
+    assert.match(result.lines.join("\n"), /probe timed out/);
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("refresh: unsupported inference APIs retain metadata-only refresh semantics", async () => {
+  const config = JSON.parse(JSON.stringify(STARTING_CONFIG)) as typeof STARTING_CONFIG;
+  config.providers.metabolomics.api = "anthropic-messages";
+  const s = scratch(config);
+  let posts = 0;
+  try {
+    const result = await refreshProviderModels({
+      modelsPath: s.path,
+      providerId: "metabolomics",
+      apiKey: "k",
+      probeModels: true,
+      fetchImpl: (async (_input: string | URL | Request, init?: RequestInit) => {
+        if (init?.method === "POST") posts += 1;
+        return { ok: true, status: 200, headers: new Headers(), json: async () => PAYLOAD };
+      }) as typeof fetch,
+    });
+
+    assert.equal(posts, 0);
+    assert.match(result.lines.join("\n"), /5 advertised model\(s\)/);
+    assert.match(result.lines.join("\n"), /probe skipped.*anthropic-messages/i);
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("refresh: zero successful verification probes preserve the last-known-good config", async () => {
+  const s = scratch();
+  const before = readFileSync(s.path, "utf8");
+  try {
+    await assert.rejects(
+      () =>
+        refreshProviderModels({
+          modelsPath: s.path,
+          providerId: "metabolomics",
+          apiKey: "k",
+          probeModels: true,
+          fetchImpl: (async (input: string | URL | Request) => {
+            if (String(input).endsWith("/models")) {
+              return { ok: true, status: 200, headers: new Headers(), json: async () => PAYLOAD };
+            }
+            return { ok: false, status: 503, json: async () => ({ error: { code: "capacity_unavailable" } }) };
+          }) as typeof fetch,
+        }),
+      /none of the 5 advertised models produced a usable completion/,
+    );
+    assert.equal(readFileSync(s.path, "utf8"), before);
+  } finally {
+    s.cleanup();
+  }
+});

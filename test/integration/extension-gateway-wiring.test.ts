@@ -271,10 +271,13 @@ test("wiring: /refresh-models refreshes healthy providers when the selected host
     { mode: 0o600 },
   );
   process.env.PI_AGENT_DIR = dir;
-  globalThis.fetch = (async (input: string | URL | Request) => {
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
     const url = String(input);
     if (url.startsWith("http://127.0.0.1:8082/")) {
       return { ok: true, status: 200, json: async () => ({ data: [] }) };
+    }
+    if (init?.method === "POST") {
+      return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: "OK" } }] }) };
     }
     return {
       ok: true,
@@ -297,7 +300,7 @@ test("wiring: /refresh-models refreshes healthy providers when the selected host
     assert.equal(notices.length, 1);
     assert.equal(notices[0]?.level, "warning");
     assert.match(notices[0]?.text ?? "", /local — skipped:/);
-    assert.match(notices[0]?.text ?? "", /remote — 1 model/);
+    assert.match(notices[0]?.text ?? "", /remote — 1 working model/);
     const written = JSON.parse(readFileSync(modelsPath, "utf8"));
     assert.equal(written.providers.local.models[0].id, "local");
     assert.equal(written.providers.remote.models[0].id, "fresh");

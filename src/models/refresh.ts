@@ -8,6 +8,7 @@
  * wiring.
  */
 
+import { acceptsThinkingOff, resolveThinkingOffConfig } from "../request/thinkingPolicy.ts";
 import { type CatalogPlan, type ConfiguredModel, describeCatalogPlan, planCatalogUpdate } from "./catalogPlan.ts";
 import { DEFAULT_GATEWAY_BASE_URL, type GatewayModelEntry, fetchGatewayModels } from "./gatewayCatalog.ts";
 import {
@@ -30,6 +31,12 @@ export interface RefreshOptions {
   dryRun?: boolean;
   /** Remove configured models the gateway no longer lists. Off by default. */
   pruneMissing?: boolean;
+  /** Generate a tiny completion with every advertised model and keep only successful ones. */
+  probeModels?: boolean;
+  /** Deadline for one inference probe. */
+  probeTimeoutMs?: number;
+  /** Maximum inference probes in flight at once. */
+  probeConcurrency?: number;
   signal?: AbortSignal;
   fetchImpl?: typeof fetch;
   now?: () => Date;
@@ -53,9 +60,154 @@ export interface ProviderRefreshAuth {
 }
 
 export interface RefreshConfiguredProvidersOptions
-  extends Pick<RefreshOptions, "modelsPath" | "dryRun" | "pruneMissing" | "signal" | "fetchImpl" | "now"> {
+  extends Pick<
+    RefreshOptions,
+    | "modelsPath"
+    | "dryRun"
+    | "pruneMissing"
+    | "probeModels"
+    | "probeTimeoutMs"
+    | "probeConcurrency"
+    | "signal"
+    | "fetchImpl"
+    | "now"
+  > {
   providerIds: string[];
   authForProvider?: (providerId: string) => ProviderRefreshAuth | Promise<ProviderRefreshAuth>;
+}
+
+const DEFAULT_PROBE_TIMEOUT_MS = 15_000;
+// Backends commonly expose several model aliases through one GPU worker. Probe
+// sequentially by default so refresh itself does not manufacture a capacity
+// failure and hide an otherwise healthy model. Callers may opt into bounded
+// parallelism when their gateway is known to have independent capacity.
+const DEFAULT_PROBE_CONCURRENCY = 1;
+
+type ProbeResult =
+  | { verdict: "working" }
+  | { verdict: "unavailable"; reason: string }
+  | { verdict: "systemic"; reason: string };
+
+function requestHeaders(opts: Pick<RefreshOptions, "apiKey" | "headers">): Record<string, string> {
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    ...(opts.apiKey ? { Authorization: `Bearer ${opts.apiKey}` } : {}),
+  };
+  for (const [name, value] of Object.entries(opts.headers ?? {})) {
+    const existing = Object.keys(headers).find((candidate) => candidate.toLowerCase() === name.toLowerCase());
+    if (existing) delete headers[existing];
+    if (value !== null) headers[name] = value;
+  }
+  return headers;
+}
+
+function visibleCompletion(payload: unknown): boolean {
+  const content = (payload as { choices?: Array<{ message?: { content?: unknown } }> })?.choices?.[0]?.message?.content;
+  return typeof content === "string" && content.trim().length > 0;
+}
+
+function errorCode(payload: unknown): string {
+  const error = (payload as { error?: { code?: unknown; reason?: unknown; type?: unknown } })?.error;
+  for (const value of [error?.code, error?.reason, error?.type]) {
+    if (typeof value === "string" && value.length > 0) return value.toLowerCase();
+  }
+  return "";
+}
+
+async function probeGatewayModel(
+  model: GatewayModelEntry,
+  baseUrl: string,
+  opts: RefreshOptions,
+  disableThinking: boolean,
+): Promise<ProbeResult> {
+  opts.signal?.throwIfAborted();
+  const controller = new AbortController();
+  let timedOut = false;
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, opts.probeTimeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS);
+  const onAbort = () => controller.abort();
+  opts.signal?.addEventListener("abort", onAbort, { once: true });
+  try {
+    const response = await (opts.fetchImpl ?? fetch)(`${baseUrl.replace(/\/+$/, "")}/chat/completions`, {
+      method: "POST",
+      headers: requestHeaders(opts),
+      body: JSON.stringify({
+        model: model.id,
+        messages: [{ role: "user", content: "Reply with exactly OK." }],
+        max_tokens: 64,
+        temperature: 0,
+        stream: false,
+        ...(disableThinking ? { reasoning_effort: "none", chat_template_kwargs: { enable_thinking: false } } : {}),
+      }),
+      signal: controller.signal,
+    });
+    const payload = await response.json().catch(() => null);
+    if (response.ok) {
+      return visibleCompletion(payload)
+        ? { verdict: "working" }
+        : { verdict: "unavailable", reason: "returned no visible completion" };
+    }
+    const code = errorCode(payload);
+    if (response.status === 404 || /model_not_found|capacity_unavailable|no_context_capacity/.test(code)) {
+      return { verdict: "unavailable", reason: code || `HTTP ${response.status}` };
+    }
+    if (response.status === 401 || response.status === 403 || response.status === 429) {
+      return { verdict: "systemic", reason: `HTTP ${response.status}${code ? ` ${code}` : ""}` };
+    }
+    return { verdict: "systemic", reason: `HTTP ${response.status}${code ? ` ${code}` : ""}` };
+  } catch (error) {
+    opts.signal?.throwIfAborted();
+    if (timedOut || controller.signal.aborted) return { verdict: "unavailable", reason: "probe timed out" };
+    return { verdict: "systemic", reason: error instanceof Error ? error.message : String(error) };
+  } finally {
+    clearTimeout(timeout);
+    opts.signal?.removeEventListener("abort", onAbort);
+  }
+}
+
+async function verifiedGatewayModels(
+  gateway: GatewayModelEntry[],
+  baseUrl: string,
+  opts: RefreshOptions,
+  disableThinking: boolean,
+): Promise<{ working: GatewayModelEntry[]; excluded: Array<{ id: string; reason: string }> }> {
+  const verdicts = new Array<ProbeResult>(gateway.length);
+  let next = 0;
+  const workers = Math.max(1, Math.min(opts.probeConcurrency ?? DEFAULT_PROBE_CONCURRENCY, gateway.length));
+  await Promise.all(
+    Array.from({ length: workers }, async () => {
+      for (;;) {
+        const index = next++;
+        if (index >= gateway.length) return;
+        let result = await probeGatewayModel(gateway[index]!, baseUrl, opts, disableThinking);
+        if (result.verdict === "unavailable" && result.reason === "probe timed out") {
+          result = await probeGatewayModel(gateway[index]!, baseUrl, opts, disableThinking);
+        }
+        verdicts[index] = result;
+      }
+    }),
+  );
+  const systemic = gateway
+    .map((model, index) => ({ model, result: verdicts[index]! }))
+    .filter((entry) => entry.result.verdict === "systemic");
+  if (systemic.length > 0) {
+    throw new Error(
+      `model verification was inconclusive: ${systemic
+        .map(({ model, result }) => `${model.id}: ${"reason" in result ? result.reason : "systemic failure"}`)
+        .join("; ")}`,
+    );
+  }
+  const working = gateway.filter((_, index) => verdicts[index]?.verdict === "working");
+  const excluded = gateway.flatMap((model, index) => {
+    const result = verdicts[index];
+    return result?.verdict === "unavailable" ? [{ id: model.id, reason: result.reason }] : [];
+  });
+  if (working.length === 0) {
+    throw new Error(`none of the ${gateway.length} advertised models produced a usable completion`);
+  }
+  return { working, excluded };
 }
 
 export interface ConfiguredProviderRefreshResult {
@@ -70,8 +222,10 @@ export interface ConfiguredProviderRefreshResult {
 async function planProviderRefresh(config: ModelsConfig, opts: RefreshOptions): Promise<RefreshResult> {
   const existing: ConfiguredModel[] = providerModels(config, opts.providerId);
   const baseUrl = opts.baseUrl ?? providerBaseUrl(config, opts.providerId) ?? DEFAULT_GATEWAY_BASE_URL;
+  const configuredProvider = config.providers?.[opts.providerId];
+  const api = typeof configuredProvider?.api === "string" ? configuredProvider.api : "openai-completions";
 
-  const gateway = await fetchGatewayModels({
+  const advertised = await fetchGatewayModels({
     baseUrl,
     ...(opts.apiKey ? { apiKey: opts.apiKey } : {}),
     ...(opts.headers ? { headers: opts.headers } : {}),
@@ -79,8 +233,27 @@ async function planProviderRefresh(config: ModelsConfig, opts: RefreshOptions): 
     ...(opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}),
   });
 
-  const plan = planCatalogUpdate(existing, gateway, opts.pruneMissing ? { pruneMissing: true } : {});
-  const lines = [`${opts.providerId} — ${gateway.length} model(s) on ${baseUrl}`, ...describeCatalogPlan(plan)];
+  const canProbe = opts.probeModels && api === "openai-completions";
+  const disableThinking = acceptsThinkingOff({ provider: opts.providerId, api, baseUrl }, resolveThinkingOffConfig());
+  const verified = canProbe
+    ? await verifiedGatewayModels(advertised, baseUrl, opts, disableThinking)
+    : { working: advertised, excluded: [] };
+  const gateway = verified.working;
+  const plan = planCatalogUpdate(existing, gateway, opts.pruneMissing || canProbe ? { pruneMissing: true } : {});
+  const planLines = describeCatalogPlan(plan).map((line) =>
+    canProbe
+      ? line
+          .replace(/^not on the gateway/, "not working")
+          .replace(" — the gateway no longer lists it", " — not advertised or inference probe failed")
+      : line,
+  );
+  const lines = [
+    `${opts.providerId} — ${gateway.length} ${canProbe ? "working" : "advertised"} model(s) on ${baseUrl}`,
+    ...(canProbe ? [`Inference-tested ${advertised.length}; excluded ${verified.excluded.length}.`] : []),
+    ...(opts.probeModels && !canProbe ? [`Inference probe skipped for unsupported provider API ${api}.`] : []),
+    ...verified.excluded.map(({ id, reason }) => `  excluded: ${id} — ${reason}`),
+    ...planLines,
+  ];
   return { plan, gateway, baseUrl, written: false, lines };
 }
 
@@ -141,6 +314,9 @@ export async function refreshConfiguredProviders(
         ...(auth.headers ? { headers: auth.headers } : {}),
         ...(opts.dryRun ? { dryRun: true } : {}),
         ...(opts.pruneMissing ? { pruneMissing: true } : {}),
+        ...(opts.probeModels ? { probeModels: true } : {}),
+        ...(opts.probeTimeoutMs !== undefined ? { probeTimeoutMs: opts.probeTimeoutMs } : {}),
+        ...(opts.probeConcurrency !== undefined ? { probeConcurrency: opts.probeConcurrency } : {}),
         ...(opts.signal ? { signal: opts.signal } : {}),
         ...(opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}),
       });
