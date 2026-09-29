@@ -463,12 +463,10 @@ test("refresh: verification writes only models that produce a visible completion
         const body = JSON.parse(String(init?.body)) as {
           model: string;
           reasoning_effort?: string;
-          chat_template_kwargs?: { enable_thinking?: boolean };
         };
         requested.push(body.model);
         assert.equal((init?.headers as Record<string, string>)?.Authorization, "Bearer k");
         assert.equal(body.reasoning_effort, "none", "known reasoning gateways must not spend the probe on thinking");
-        assert.equal(body.chat_template_kwargs?.enable_thinking, false);
         inFlight += 1;
         maxInFlight = Math.max(maxInFlight, inFlight);
         await new Promise<void>((resolve) => setImmediate(resolve));
@@ -597,6 +595,38 @@ test("refresh: unsupported inference APIs retain metadata-only refresh semantics
     assert.match(result.lines.join("\n"), /5 advertised model\(s\)/);
     assert.match(result.lines.join("\n"), /probe skipped.*anthropic-messages/i);
   } finally {
+    s.cleanup();
+  }
+});
+
+test("refresh: thinking-off environment allowlists can disable probe parameters", async () => {
+  const s = scratch();
+  const previousProviders = process.env.PI_THINKING_OFF_PROVIDERS;
+  const previousGateways = process.env.PI_THINKING_OFF_GATEWAYS;
+  let probeBody: { reasoning_effort?: string } | undefined;
+  process.env.PI_THINKING_OFF_PROVIDERS = "";
+  process.env.PI_THINKING_OFF_GATEWAYS = "";
+  try {
+    await refreshProviderModels({
+      modelsPath: s.path,
+      providerId: "metabolomics",
+      apiKey: "k",
+      probeModels: true,
+      fetchImpl: (async (input: string | URL | Request, init?: RequestInit) => {
+        if (String(input).endsWith("/models")) {
+          return { ok: true, status: 200, headers: new Headers(), json: async () => ({ data: [PAYLOAD.data[0]] }) };
+        }
+        probeBody = JSON.parse(String(init?.body)) as { reasoning_effort?: string };
+        return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: "OK" } }] }) };
+      }) as typeof fetch,
+    });
+
+    assert.equal(probeBody?.reasoning_effort, undefined);
+  } finally {
+    if (previousProviders === undefined) delete process.env.PI_THINKING_OFF_PROVIDERS;
+    else process.env.PI_THINKING_OFF_PROVIDERS = previousProviders;
+    if (previousGateways === undefined) delete process.env.PI_THINKING_OFF_GATEWAYS;
+    else process.env.PI_THINKING_OFF_GATEWAYS = previousGateways;
     s.cleanup();
   }
 });
