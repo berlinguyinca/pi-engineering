@@ -866,7 +866,7 @@ ${RECOVERY_PROMPT}`;
   // fails, and because Pi computes usage from the configured window, compaction
   // fires far too late to save the turn.
   pi.registerCommand("refresh-models", {
-    description: "Refresh models.json from configured gateways (names, context sizes). --dry-run to preview.",
+    description: "Refresh models.json with inference-tested working models. --dry-run to preview.",
     handler: async (args: string, ctx: ExtensionCommandContext) => {
       const argv = (args ?? "").trim().split(/\s+/).filter(Boolean);
       const dryRun = argv.includes("--dry-run");
@@ -910,6 +910,7 @@ ${RECOVERY_PROMPT}`;
           },
           ...(dryRun ? { dryRun: true } : {}),
           ...(pruneMissing ? { pruneMissing: true } : {}),
+          probeModels: true,
           ...(ctx.signal ? { signal: ctx.signal } : {}),
         });
         if (result.results.length === 0) {
