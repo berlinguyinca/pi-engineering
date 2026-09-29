@@ -8,7 +8,6 @@
  * wiring.
  */
 
-import { acceptsThinkingOff, resolveThinkingOffConfig } from "../request/thinkingPolicy.ts";
 import { type CatalogPlan, type ConfiguredModel, describeCatalogPlan, planCatalogUpdate } from "./catalogPlan.ts";
 import { DEFAULT_GATEWAY_BASE_URL, type GatewayModelEntry, fetchGatewayModels } from "./gatewayCatalog.ts";
 import {
@@ -114,6 +113,20 @@ function errorCode(payload: unknown): string {
   return "";
 }
 
+function supportsThinkingOff(providerId: string, api: string, baseUrl: string): boolean {
+  if (api !== "openai-completions") return false;
+  const configuredList = (value: string | undefined, fallback: string[]): string[] =>
+    (value === undefined ? fallback : value.split(",")).map((entry) => entry.trim().toLowerCase()).filter(Boolean);
+  const providers = configuredList(process.env.PI_THINKING_OFF_PROVIDERS, ["metabolomics"]);
+  if (providers.includes(providerId.toLowerCase())) return true;
+  const hosts = configuredList(process.env.PI_THINKING_OFF_GATEWAYS, ["llm.metabolomics.us"]);
+  try {
+    return hosts.includes(new URL(baseUrl).host.toLowerCase());
+  } catch {
+    return false;
+  }
+}
+
 async function probeGatewayModel(
   model: GatewayModelEntry,
   baseUrl: string,
@@ -139,7 +152,7 @@ async function probeGatewayModel(
         max_tokens: 64,
         temperature: 0,
         stream: false,
-        ...(disableThinking ? { reasoning_effort: "none", chat_template_kwargs: { enable_thinking: false } } : {}),
+        ...(disableThinking ? { reasoning_effort: "none" } : {}),
       }),
       signal: controller.signal,
     });
@@ -234,7 +247,7 @@ async function planProviderRefresh(config: ModelsConfig, opts: RefreshOptions): 
   });
 
   const canProbe = opts.probeModels && api === "openai-completions";
-  const disableThinking = acceptsThinkingOff({ provider: opts.providerId, api, baseUrl }, resolveThinkingOffConfig());
+  const disableThinking = supportsThinkingOff(opts.providerId, api, baseUrl);
   const verified = canProbe
     ? await verifiedGatewayModels(advertised, baseUrl, opts, disableThinking)
     : { working: advertised, excluded: [] };
