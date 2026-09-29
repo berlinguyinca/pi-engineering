@@ -371,6 +371,34 @@ export interface EngineeringRuntimeOptions {
 }
 
 /**
+ * Resolve the directory that holds the durable orchestration store
+ * (`orchestration.jsonl`) and, with it, the store's single-writer file lock.
+ *
+ * By default this is the runtime workDir (`<repoRoot>/.pi-eng`), so the store
+ * lives in the git toplevel of the session's launch directory. That is a FIXED
+ * location: when several pi sessions are launched from a shared parent
+ * directory (one per project / branch / worktree) they all resolve to the SAME
+ * store and therefore serialize on one writer lock — a session working on
+ * worktree A cannot start a mission while a session working on worktree B holds
+ * the parent store, even though the two never touch the same files.
+ *
+ * Setting `PI_ENGINEERING_ORCHESTRATION_DIR` relocates the store (and its lock)
+ * to a per-worktree / per-session directory, so concurrent sessions each own an
+ * independent single-writer store and run in parallel. Sessions launched from
+ * WITHIN a worktree already get this automatically (their git toplevel is the
+ * worktree); this override covers sessions launched from a shared parent.
+ *
+ * The override changes only the orchestration store location. The engineering
+ * ledger, artifact store, and mission snapshot stay in the workDir so shared
+ * per-repo memory is preserved across concurrent sessions.
+ */
+function resolveOrchestrationDir(workDir: string): string {
+  const override = process.env.PI_ENGINEERING_ORCHESTRATION_DIR;
+  if (override && override.trim() !== "") return resolve(override);
+  return workDir;
+}
+
+/**
  * The Engineering Runtime facade. Owns the ledger, artifact store, context
  * broker, git provider, verifier, and worker executor for one repository, and
  * exposes the vertical-slice workflows: scout, implement, verify, review,
@@ -618,14 +646,15 @@ export class EngineeringRuntime {
     const git = await GitRepo.open(opts.cwd);
     const repoRoot = git ? git.root : opts.cwd;
     const workDir = opts.workDir ?? join(repoRoot, ".pi-eng");
-    const openKey = `${resolve(repoRoot)}\0${resolve(workDir)}`;
+    const orchestrationDir = resolveOrchestrationDir(workDir);
+    const openKey = `${resolve(repoRoot)}\0${resolve(workDir)}\0${resolve(orchestrationDir)}`;
     const existing = openingRuntimes.get(openKey);
     if (existing) {
       const runtime = await existing;
       runtime.retainOpenReference();
       return runtime;
     }
-    const opening = EngineeringRuntime.openResolved(opts, git, repoRoot, workDir);
+    const opening = EngineeringRuntime.openResolved(opts, git, repoRoot, workDir, orchestrationDir);
     openingRuntimes.set(openKey, opening);
     try {
       return await opening;
@@ -641,6 +670,7 @@ export class EngineeringRuntime {
     git: GitRepo | null,
     repoRoot: string,
     workDir: string,
+    orchestrationDir: string,
   ): Promise<EngineeringRuntime> {
     await mkdir(workDir, { recursive: true });
     const ledger = await Ledger.create(join(workDir, "ledger.jsonl"));
@@ -654,10 +684,15 @@ export class EngineeringRuntime {
     rt.workDir = workDir;
     // Orchestration: durable mission store + orchestrator wired to the existing
     // worker/verifier/git primitives. Restart-recoverable via the JSONL store.
-    // Multiple runtimes over the same repo share one orchestration store. The
-    // JSONL backend is single-instance per process, so reuse an already-open
-    // store for the same path (a second runtime must not open the same file).
-    const orchestrationPath = join(workDir, "orchestration.jsonl");
+    // The store (and its single-writer lock) lives in `orchestrationDir`, which
+    // defaults to the workDir but may be relocated by
+    // PI_ENGINEERING_ORCHESTRATION_DIR so concurrent sessions working on
+    // different worktrees do not serialize on one fixed parent store. Runtimes
+    // over the same store path share it; the JSONL backend is single-instance
+    // per process, so reuse an already-open store for the same path (a second
+    // runtime must not open the same file).
+    await mkdir(orchestrationDir, { recursive: true });
+    const orchestrationPath = join(orchestrationDir, "orchestration.jsonl");
     try {
       let orchestrationBackend = openedOrchestrationStores.get(orchestrationPath);
       if (!orchestrationBackend) {
