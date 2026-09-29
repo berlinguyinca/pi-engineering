@@ -111,6 +111,44 @@ describe("WorkspaceManifestResolver path policy", () => {
     });
   }
 
+  it("authorizes a Pi-managed git checkout under the agent git root instead of refusing it as configuration", async () => {
+    // The runtime installs itself under <home>/.pi/agent/git/<host>/<owner>/<repo>,
+    // so a checkout there is a workspace, while the rest of <home>/.pi stays
+    // protected. A fake HOME keeps the check hermetic.
+    const fakeHome = await mkdtemp(join(tmpdir(), "pi-eng-fakehome-"));
+    const agentRepo = join(fakeHome, ".pi", "agent", "git", "example.com", "acme", "fixture");
+    const configRepo = join(fakeHome, ".pi", "other", "fixture");
+    for (const root of [agentRepo, configRepo]) {
+      await mkdir(root, { recursive: true });
+      await exec("git", ["init", "-q", root]);
+      await exec("git", ["-C", root, "config", "user.email", "test@example.com"]);
+      await exec("git", ["-C", root, "config", "user.name", "Test"]);
+      await exec("git", ["-C", root, "commit", "--allow-empty", "-q", "-m", "initial"]);
+    }
+    cleanup.push(() => rm(fakeHome, { recursive: true, force: true }));
+
+    const previousHome = process.env.HOME;
+    process.env.HOME = fakeHome;
+    try {
+      const resolver = new WorkspaceManifestResolver();
+      const resolved = await resolver.resolve("Implement the requested change", agentRepo);
+
+      assert.equal(resolved.repositories[0]?.canonicalRoot, agentRepo);
+      assert.equal(resolved.authorizedRoots[0]?.source, "launch_cwd");
+
+      await assert.rejects(
+        resolver.resolve("Implement the requested change", configRepo),
+        (error: unknown) =>
+          error instanceof WorkspaceScopeError &&
+          error.category === "WORKSPACE_SCOPE_MISMATCH" &&
+          /Pi\/Codex configuration directory/.test(error.message),
+      );
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+    }
+  });
+
   it("rejects nonexistent targets whose parent has not been authorized", async () => {
     const launchCwd = await mkdtemp(join(tmpdir(), "pi-eng-meta-"));
     const unauthorizedParent = await mkdtemp(join(tmpdir(), "pi-eng-unauthorized-"));
