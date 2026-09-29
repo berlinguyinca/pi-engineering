@@ -69,6 +69,15 @@ All state lives under `<repoRoot>/.pi-eng/`:
   materialized view on open (INV-001).
 - `artifacts/<category>/<id>.json` (meta) + `<id>.txt` (content) — candidate
   diffs, verification logs, scout context. Read lazily by `artifact://` URI.
+- `orchestration.jsonl` — the durable mission/task/execution store (event-
+  sourced, replayed on open). It is **single-writer**, guarded by a process
+  file lock (`orchestration.jsonl.lock`). By default it lives in the git
+  toplevel of the session's launch directory; set
+  `PI_ENGINEERING_ORCHESTRATION_DIR` to relocate it (and its lock) to a
+  per-worktree directory so concurrent sessions working on different
+  branches/worktrees do not serialize on one shared parent store. Only the
+  store and its lock move — the ledger, artifacts, and mission snapshot stay in
+  the workDir.
 
 ## The Engineering Ledger
 

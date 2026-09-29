@@ -463,8 +463,27 @@ async function repoCacheKey(cwd: string): Promise<string> {
  * semantic tools work in the interactive session without a prior command.
  */
 async function resolveServices(cwd: string): Promise<CoreServices | null> {
-  const rt = await getRuntimeByCwd(cwd).catch(() => null);
-  if (!rt) return null;
+  let rt: EngineeringRuntime;
+  try {
+    rt = await getRuntimeByCwd(cwd);
+  } catch (error) {
+    // Surface the REAL reason the runtime did not open (most commonly the
+    // orchestration store's single-writer lock being held by another session
+    // launched from the same parent directory) instead of a bare "not
+    // initialized" — and point the operator at the remedy.
+    const message = error instanceof Error ? error.message : String(error);
+    const held = /writer lock/i.test(message);
+    const remedy = held
+      ? " Set PI_ENGINEERING_ORCHESTRATION_DIR to a per-worktree directory (or launch the session from within the worktree) so concurrent sessions do not share one orchestration store lock."
+      : ".";
+    const notice: TelemetryNotice = {
+      level: "warning",
+      text: `Engineering runtime did not open for ${cwd}: ${message}${remedy}`,
+      key: `runtime-open:${cwd}`,
+    };
+    if (allowRuntimeDiagnostic(notice)) emitTelemetry(notice);
+    return null;
+  }
   return {
     ledger: rt.ledger,
     artifacts: rt.artifacts,

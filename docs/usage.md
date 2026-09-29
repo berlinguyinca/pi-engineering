@@ -186,6 +186,44 @@ The ledger is event-sourced and replayed on open, so **no run depends on the
 interactive transcript surviving** — you can close and reopen pi and `/ledger`
 still shows prior work items, candidates, and evidence.
 
+### Concurrent sessions and per-worktree stores
+
+The durable mission store — `.pi-eng/orchestration.jsonl` — is **single-writer**:
+its file lock is held by exactly one process at a time. By default it lives in
+the git toplevel of the session's launch directory, so every session launched
+from the *same* parent directory shares one store and serializes on that one
+lock. That is wrong when you run several sessions at once — one per project,
+branch, or worktree — that never touch the same files: a session working on
+worktree A is blocked from starting a mission while a session working on
+worktree B holds the shared parent store.
+
+Relocate the store (and its lock) to a per-worktree / per-session directory with
+the `PI_ENGINEERING_ORCHESTRATION_DIR` environment variable:
+
+```bash
+# one store per worktree (kept inside the git-ignored .pi-eng/), so concurrent
+# sessions launched from the same parent do not share one writer lock
+PI_ENGINEERING_ORCHESTRATION_DIR="$PWD/.pi-eng/orch-$(basename "$PWD")" pi ...
+```
+
+Keep the override inside `.pi-eng/` (or elsewhere git-ignored) so the relocated
+store never shows up as an untracked file in `git status`.
+
+Notes:
+- Sessions launched **from within** a worktree already get a per-worktree store
+  automatically (their git toplevel is the worktree), so the variable is only
+  needed for sessions launched from a shared parent directory.
+- The variable moves **only the orchestration store and its lock**. The
+  engineering ledger, artifact store, and mission snapshot stay in
+  `<repoRoot>/.pi-eng/`, so shared per-repo memory is preserved across
+  concurrent sessions.
+- Two sessions pointed at the *same* directory intentionally share one store
+  and serialize (they are coordinating on the same mission state). Point each
+  independent worktree at its own directory to run in parallel.
+- If a `mission`/semantic tool reports the runtime as not initialized, the
+  console now shows the real reason (e.g. the writer lock held by another
+  session) and this remedy instead of a bare "not initialized".
+
 ## Interacting with the ledger
 
 - `/ledger` — all work items and their incumbent candidates.
