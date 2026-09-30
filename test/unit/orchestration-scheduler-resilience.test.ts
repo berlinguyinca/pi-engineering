@@ -2,9 +2,14 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { type BrokerBackends, ExecutionBroker } from "../../src/orchestration/broker.ts";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
-import { MissionScheduler, type MissionSchedulerStatusNotice } from "../../src/orchestration/scheduler.ts";
+import {
+  MissionScheduler,
+  type MissionSchedulerStatusNotice,
+  UNLISTED_PROBES_BEFORE_VERIFY,
+} from "../../src/orchestration/scheduler.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 import type { GatewayResilienceConfig } from "../../src/resilience/config.ts";
+import type { ProbeResult } from "../../src/resilience/probe.ts";
 
 /** A short, deterministic resilience config for tests (no jitter). */
 const testResilience: GatewayResilienceConfig = {
@@ -317,7 +322,15 @@ describe("MissionScheduler resilience (time-based gateway window)", () => {
   // Issue #76: a gateway that answers but no longer lists the mission's model
   // said "not served" forever, so no worker ran, model_not_found never
   // surfaced, and the mission paused instead of failing.
-  const unlisted = { healthy: false, reason: "model m is not served", authoritative: true, model_unlisted: true };
+  const unlisted: ProbeResult = {
+    healthy: false,
+    reason: "model m is not served",
+    authoritative: true,
+    model_unlisted: true,
+    model_id: "m",
+  };
+  const down: ProbeResult = { healthy: false, reason: "gateway unreachable: ECONNREFUSED", authoritative: true };
+  const noSlots: ProbeResult = { healthy: false, reason: "model m has no capacity (0 slots)", authoritative: true };
   const modelNotFound = {
     executionId: "e",
     exitStatus: "failed" as const,
@@ -326,56 +339,201 @@ describe("MissionScheduler resilience (time-based gateway window)", () => {
     usage: {},
     error: "transient:model_unavailable",
   };
+  type Outcome = ReturnType<typeof transientOutcome> | typeof successOutcome | typeof modelNotFound;
 
+  /**
+   * `outcomes` are the agent's answers in order (the last repeats); `probes`
+   * the probe's answers in order (the last repeats). Records how many probes
+   * had been made when each agent attempt started.
+   */
   function unlistedScheduler(
-    outcomes: Array<ReturnType<typeof transientOutcome> | typeof successOutcome | typeof modelNotFound>,
-    probeResult: Record<string, unknown>,
+    outcomes: Outcome[],
+    probes: ProbeResult[],
+    resilience: GatewayResilienceConfig = testResilience,
   ) {
     const store = MissionStore.open(JsonlEventStore.inMemory());
     const m = makeMission(store);
     const t = store.createTask({ mission_id: m.mission_id, kind: "agent", role: "implementer", objective: "x" });
     let calls = 0;
+    let probeCalls = 0;
+    const probesAtAttempt: number[] = [];
+    const notices: MissionSchedulerStatusNotice[] = [];
     const backends: BrokerBackends = {
-      agent: { runAgent: async () => outcomes[Math.min(calls++, outcomes.length - 1)]! },
+      agent: {
+        runAgent: async () => {
+          probesAtAttempt.push(probeCalls);
+          return outcomes[Math.min(calls++, outcomes.length - 1)]!;
+        },
+      },
     };
     const clk = clock();
     const scheduler = new MissionScheduler({
       store,
       broker: new ExecutionBroker({ store, backends }),
-      resilience: testResilience,
-      probe: { probe: async () => probeResult as never },
+      resilience,
+      probe: { probe: async () => probes[Math.min(probeCalls++, probes.length - 1)]! },
       now: clk.now,
       sleep: clk.sleep,
       rand: () => 0,
+      onStatus: (notice) => {
+        notices.push(notice);
+      },
     });
-    return { store, m, t, scheduler, calls: () => calls };
+    return {
+      store,
+      m,
+      t,
+      scheduler,
+      notices,
+      probesAtAttempt,
+      calls: () => calls,
+      probeCalls: () => probeCalls,
+    };
   }
 
   it("a model removed from the catalog mid-outage fails with model_not_found instead of pausing", async () => {
-    const { store, m, t, scheduler, calls } = unlistedScheduler([transientOutcome(), modelNotFound], unlisted);
+    const { store, m, t, scheduler, calls } = unlistedScheduler([transientOutcome(), modelNotFound], [unlisted]);
     await scheduler.runMission(m.mission_id);
     assert.equal(calls(), 2, "one verification attempt was let through the probe gate");
     assert.equal(store.getTask(t.task_id)!.status, "FAILED");
-    assert.notEqual(store.getMission(m.mission_id)!.status, "PAUSED_INFRASTRUCTURE");
+    // The failed task leaves the resilience window: the mission is un-parked.
+    assert.equal(store.getMission(m.mission_id)!.status, "EXECUTING");
     const failed = store.getTask(t.task_id) as unknown as { failure_reason?: string };
     assert.match(failed.failure_reason ?? "", /model_not_found/);
   });
 
   it("a legacy alias that routes but is not listed completes instead of pausing", async () => {
-    const { store, m, t, scheduler, calls } = unlistedScheduler([transientOutcome(), successOutcome], unlisted);
+    const { store, m, t, scheduler, calls } = unlistedScheduler([transientOutcome(), successOutcome], [unlisted]);
     await scheduler.runMission(m.mission_id);
     assert.equal(calls(), 2);
     assert.equal(store.getTask(t.task_id)!.status, "SUCCEEDED");
+    assert.equal(store.getMission(m.mission_id)!.status, "EXECUTING");
   });
 
   it("a gateway that is down (not merely unlisting the model) gets no verification attempt", async () => {
-    const { store, m, scheduler, calls } = unlistedScheduler([transientOutcome()], {
-      healthy: false,
-      reason: "gateway unreachable: ECONNREFUSED",
-      authoritative: true,
-    });
+    const { store, m, scheduler, calls } = unlistedScheduler([transientOutcome()], [down]);
     await scheduler.runMission(m.mission_id);
     assert.equal(calls(), 1, "only the original attempt; the gate waited out the outage");
     assert.equal(store.getMission(m.mission_id)!.status, "PAUSED_INFRASTRUCTURE");
+  });
+
+  it("lets the verification attempt through on exactly the threshold-th unlisted probe, and says so", async () => {
+    const { scheduler, m, probesAtAttempt, notices } = unlistedScheduler(
+      [transientOutcome(), successOutcome],
+      [unlisted],
+    );
+    await scheduler.runMission(m.mission_id);
+    assert.deepEqual(probesAtAttempt, [0, UNLISTED_PROBES_BEFORE_VERIFY]);
+    assert.ok(
+      notices.some(
+        (n) =>
+          n.action === "retrying" &&
+          n.terminal === false &&
+          /model m is not listed by the gateway; trying it once to confirm/.test(n.reason),
+      ),
+      JSON.stringify(notices),
+    );
+  });
+
+  it("a verification attempt that comes back transient resets the count, stays bounded, and ends paused", async () => {
+    const { store, m, t, scheduler, probesAtAttempt } = unlistedScheduler([transientOutcome()], [unlisted]);
+    await scheduler.runMission(m.mission_id);
+    // Each relaunch needs a fresh run of UNLISTED_PROBES_BEFORE_VERIFY probes,
+    // the backoff between relaunches grows, and the 1000 ms window then closes
+    // and the mission pauses.
+    assert.deepEqual(probesAtAttempt, [0, 3, 6, 9]);
+    assert.equal(store.getMission(m.mission_id)!.status, "PAUSED_INFRASTRUCTURE");
+    assert.equal(store.getTask(t.task_id)!.status, "RETRYING");
+  });
+
+  it("an unlisted answer interleaved with an outage or 0 slots restarts the count", async () => {
+    const { m, scheduler, probesAtAttempt } = unlistedScheduler(
+      [transientOutcome(), successOutcome],
+      [unlisted, unlisted, down, unlisted, unlisted, noSlots, unlisted, unlisted, unlisted],
+    );
+    await scheduler.runMission(m.mission_id);
+    assert.deepEqual(probesAtAttempt, [0, 9], "only three consecutive unlisted answers let an attempt through");
+  });
+
+  it("a paused window does not carry its unlisted count into the next window", async () => {
+    // retry_after_ms paces the first two probes so the window closes after two
+    // unlisted answers: that count (2) must not survive the pause.
+    const paced: ProbeResult = { ...unlisted, retry_after_ms: 450 };
+    const { store, m, scheduler, probesAtAttempt } = unlistedScheduler(
+      [transientOutcome(), transientOutcome(), successOutcome],
+      [paced, paced, unlisted],
+    );
+    await scheduler.runMission(m.mission_id);
+    assert.equal(store.getMission(m.mission_id)!.status, "PAUSED_INFRASTRUCTURE");
+    assert.deepEqual(probesAtAttempt, [0]);
+    await scheduler.resumePausedMission(m.mission_id);
+    // After resume: one real attempt (no window yet), then a fresh window that
+    // needs three new unlisted probes, not one.
+    assert.deepEqual(probesAtAttempt, [0, 2, 5]);
+    assert.equal(store.getMission(m.mission_id)!.status, "EXECUTING");
+  });
+
+  it("names the relaunch ceiling without claiming the gateway looked healthy", async () => {
+    const { store, m, t, scheduler } = unlistedScheduler([transientOutcome()], [unlisted], {
+      ...testResilience,
+      retry_window_ms: 60_000,
+      max_relaunches: 1,
+    });
+    await scheduler.runMission(m.mission_id);
+    assert.equal(store.getTask(t.task_id)!.status, "FAILED");
+    assert.equal(store.getMission(m.mission_id)!.status, "EXECUTING");
+    const failed = store.getTask(t.task_id) as unknown as { failure_reason?: string };
+    assert.match(failed.failure_reason ?? "", /^task relaunched 1 times through a transient outage without success;/);
+    assert.doesNotMatch(failed.failure_reason ?? "", /looked healthy/);
+  });
+
+  describe("awaitRecovery (paused mission)", () => {
+    /** Pause a mission, then watch it with a scheduler whose probe answers `probes`. */
+    async function pausedMission(probes: ProbeResult[]) {
+      const h = unlistedScheduler([transientOutcome()], [down]);
+      await h.scheduler.runMission(h.m.mission_id);
+      assert.equal(h.store.getMission(h.m.mission_id)!.status, "PAUSED_INFRASTRUCTURE");
+      let probed = 0;
+      const clk = clock();
+      const scheduler = new MissionScheduler({
+        store: h.store,
+        broker: new ExecutionBroker({ store: h.store, backends: {} }),
+        resilience: testResilience,
+        probe: { probe: async () => probes[Math.min(probed++, probes.length - 1)]! },
+        now: clk.now,
+        sleep: clk.sleep,
+        rand: () => 0,
+        onStatus: (notice) => {
+          h.notices.push(notice);
+        },
+      });
+      return { ...h, scheduler, probed: () => probed };
+    }
+
+    it("resumes after the threshold of consecutive unlisted answers so a real attempt can take over", async () => {
+      const h = await pausedMission([unlisted]);
+      assert.equal(await h.scheduler.awaitRecovery(1_000_000, undefined, h.m.mission_id), true);
+      assert.equal(h.probed(), UNLISTED_PROBES_BEFORE_VERIFY);
+      assert.ok(
+        h.notices.some(
+          (n) =>
+            n.status === "PAUSED_INFRASTRUCTURE" &&
+            /model m is not listed by the gateway; trying it once to confirm/.test(n.reason),
+        ),
+        JSON.stringify(h.notices),
+      );
+    });
+
+    it("an outage or 0-slot answer between unlisted answers restarts the count", async () => {
+      const h = await pausedMission([unlisted, unlisted, down, unlisted, noSlots, unlisted, unlisted, unlisted]);
+      assert.equal(await h.scheduler.awaitRecovery(1_000_000, undefined, h.m.mission_id), true);
+      assert.equal(h.probed(), 8);
+    });
+
+    it("still waits out a gateway that is down", async () => {
+      const h = await pausedMission([down]);
+      assert.equal(await h.scheduler.awaitRecovery(5_000, undefined, h.m.mission_id), false);
+      assert.equal(h.store.getMission(h.m.mission_id)!.status, "PAUSED_INFRASTRUCTURE");
+    });
   });
 });

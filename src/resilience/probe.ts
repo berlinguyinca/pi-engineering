@@ -28,6 +28,8 @@ export interface ProbeResult {
    * attempt through after a few of these rather than waiting forever.
    */
   model_unlisted?: boolean;
+  /** The model the probe asked about, when it resolved one. */
+  model_id?: string;
 }
 
 /** A probe adapter: answer "is the gateway ready for a real request?" */
@@ -171,6 +173,7 @@ export class CatalogRecoveryProbe implements RecoveryProbe {
           reason: `model ${target.modelId} is not served`,
           authoritative: true,
           model_unlisted: true,
+          model_id: target.modelId,
         };
       }
       if (typeof row.slots === "number" && row.slots <= 0) {

@@ -72,6 +72,7 @@ describe("CatalogRecoveryProbe: authenticated model listing", () => {
       const unlisted = await probe.probe();
       assert.equal(unlisted.healthy, false, "the mission's model is not served");
       assert.equal(unlisted.model_unlisted, true, "the gateway answered without the model");
+      assert.equal(unlisted.model_id, "qwen-27b", "names the unlisted model");
 
       state.down = true;
       const down = await probe.probe();
