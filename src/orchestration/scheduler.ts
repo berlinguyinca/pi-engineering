@@ -440,6 +440,7 @@ export class MissionScheduler {
         this.store.transitionTask(task.task_id, "BLOCKED", "system", {
           failure_reason: error instanceof Error ? error.message : String(error),
         });
+        this.leaveResilienceWindow(task);
         return;
       }
       let handle: ExecutionHandle | undefined;
@@ -499,7 +500,7 @@ export class MissionScheduler {
             this.settleTaskRecoveries(task, "failed");
             this.recordTerminalFailure(task, ceiling, handle.executionId, outcome.error);
             this.store.transitionTask(task.task_id, "FAILED", "system", { failure_reason: ceiling });
-            this.forgetOutage(task);
+            this.leaveResilienceWindow(task);
             return;
           }
           if (infraCat) {
@@ -520,6 +521,7 @@ export class MissionScheduler {
                 this.settleTaskRecoveries(task, "failed");
                 this.recordTerminalFailure(task, recoveryStop, handle.executionId, outcome.error);
                 this.store.transitionTask(task.task_id, "FAILED", "system", { failure_reason: recoveryStop });
+                this.leaveResilienceWindow(task);
                 return;
               }
               authority?.assertAuthoritative();
@@ -546,6 +548,7 @@ export class MissionScheduler {
           this.store.transitionTask(task.task_id, "FAILED", "system", {
             failure_reason: `backend reported ${outcome.exitStatus}${detail}`,
           });
+          this.leaveResilienceWindow(task);
           return;
         }
         // Success: clear the resilience window, close the breaker, and resume the
@@ -612,6 +615,7 @@ export class MissionScheduler {
               err instanceof Error ? err.message : String(err),
             );
             this.store.transitionTask(task.task_id, "FAILED", "system", { failure_reason: recoveryStop });
+            this.leaveResilienceWindow(task);
             return;
           }
           authority?.assertAuthoritative();
@@ -627,6 +631,7 @@ export class MissionScheduler {
           err instanceof Error ? err.message : String(err),
         );
         this.store.transitionTask(task.task_id, "FAILED", "system", { failure_reason: reason });
+        this.leaveResilienceWindow(task);
         return;
       } finally {
         const closeError = await authority?.close();
@@ -887,9 +892,10 @@ export class MissionScheduler {
     }
   }
 
-  /** Resume a parked mission back to EXECUTING after a task succeeds. Only when
-   * no other task in the mission is still paused (RETRYING), so a mission with a
-   * paused task never reports EXECUTING. */
+  /** Move a parked mission back to EXECUTING once a task leaves the resilience
+   * window (success or terminal failure). Only when no other task in the
+   * mission is still paused (RETRYING), so a mission with a paused task never
+   * reports EXECUTING. */
   private resumeToExecuting(missionId: string): boolean {
     const mission = this.store.getMission(missionId);
     if (!mission || mission.status === "EXECUTING") return false;
@@ -912,6 +918,18 @@ export class MissionScheduler {
     } catch {
       return false;
     }
+  }
+
+  /**
+   * A task ended terminally (FAILED/BLOCKED). Drop its resilience bookkeeping
+   * and un-park the mission from any WAITING_* or RECOVERING_* state the window
+   * put it in, so the orchestrator's normal failure handling runs instead of
+   * hitting an illegal transition out of the parked state.
+   */
+  private leaveResilienceWindow(task: OrchestrationTask): void {
+    this.clearResilience(task);
+    this.forgetOutage(task);
+    this.resumeToExecuting(task.mission_id);
   }
 
   /** Pause a mission on retry-window exhaustion: PAUSED (not FAILED), resumable. */
@@ -961,10 +979,11 @@ export class MissionScheduler {
     this.breakers.delete(task.task_id);
   }
 
-  /** Drop the task's retry window + breaker (used on success and pause). */
+  /** Drop the task's retry window, breaker and unlisted-probe count. */
   private clearResilience(task: OrchestrationTask): void {
     this.windows.delete(task.task_id);
     this.breakers.delete(task.task_id);
+    this.unlistedProbes.delete(task.task_id);
   }
 
   /**
