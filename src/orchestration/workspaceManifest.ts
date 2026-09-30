@@ -57,6 +57,12 @@ function protectedReason(candidate: string): string | null {
   if (absolute === filesystemRoot) return "filesystem root";
   const home = resolve(homedir());
   if (absolute === home) return "home directory";
+  // Pi-managed git checkouts live under <home>/.pi/agent/git/<host>/<owner>/<repo>.
+  // Those are the operator's working repositories — this runtime is installed
+  // there — not Pi configuration, so they must remain resolvable as workspaces;
+  // everything else under .pi/.codex stays protected.
+  const agentGitRoot = join(home, ".pi", "agent", "git");
+  if (isWithin(agentGitRoot, absolute)) return null;
   for (const configRoot of [join(home, ".pi"), join(home, ".codex")]) {
     if (isWithin(configRoot, absolute)) return "Pi/Codex configuration directory";
   }
