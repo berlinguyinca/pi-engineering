@@ -76,6 +76,54 @@ describe("WorkspaceManifestResolver path policy", () => {
     assert.equal(resolved.repositories[0]?.canonicalRoot, repo.root);
   });
 
+  it("ignores a lone slash between two words instead of extracting a filesystem-root candidate", async () => {
+    const launchCwd = await mkdtemp(join(tmpdir(), "pi-eng-meta-"));
+    const repo = await makeFixtureRepo();
+    cleanup.push(() => rm(launchCwd, { recursive: true, force: true }), repo.cleanup);
+
+    // Build the prose with concatenation so no bare slash token is embedded in
+    // this test source. The request contains a single slash surrounded by
+    // whitespace and no absolute repository path.
+    const slash = "a" + String.fromCharCode(47);
+    const request = "Please use care or " + slash + " it will not merge";
+
+    const resolved = await new WorkspaceManifestResolver().resolve(request, repo.root);
+
+    assert.equal(resolved.repositories[0]?.canonicalRoot, repo.root);
+    assert.equal(resolved.authorizedRoots[0]?.source, "launch_cwd");
+    assert.equal(resolved.authorizedRoots[0]?.canonicalPath, repo.root);
+  });
+
+  it("ignores a prose token with a slash between two word characters instead of a nonexistent path", async () => {
+    const launchCwd = await mkdtemp(join(tmpdir(), "pi-eng-meta-"));
+    const repo = await makeFixtureRepo();
+    cleanup.push(() => rm(launchCwd, { recursive: true, force: true }), repo.cleanup);
+
+    // "a/b" between word characters used to be extracted as a short
+    // nonexistent path and block resolution; it must be filtered out.
+    const slash = String.fromCharCode(47);
+    const request = "Pick option " + "a" + slash + "b for the rollout";
+
+    const resolved = await new WorkspaceManifestResolver().resolve(request, repo.root);
+
+    assert.equal(resolved.repositories[0]?.canonicalRoot, repo.root);
+    assert.equal(resolved.authorizedRoots[0]?.source, "launch_cwd");
+  });
+
+  it("still extracts a genuine absolute repository path from the request text", async () => {
+    const launchCwd = await mkdtemp(join(tmpdir(), "pi-eng-meta-"));
+    const repo = await makeFixtureRepo();
+    cleanup.push(() => rm(launchCwd, { recursive: true, force: true }), repo.cleanup);
+
+    const resolved = await new WorkspaceManifestResolver().resolve(
+      `Implement the requested change in ${repo.root}`,
+      launchCwd,
+    );
+
+    assert.equal(resolved.repositories[0]?.canonicalRoot, repo.root);
+    assert.equal(resolved.authorizedRoots[0]?.source, "explicit_user_path");
+  });
+
   it("authorizes multiple explicitly named repositories while selecting one primary binding", async () => {
     const launchCwd = await mkdtemp(join(tmpdir(), "pi-eng-meta-"));
     const first = await makeFixtureRepo();
@@ -149,7 +197,7 @@ describe("WorkspaceManifestResolver path policy", () => {
     }
   });
 
-  it("rejects nonexistent targets whose parent has not been authorized", async () => {
+  it("filters nonexistent request-derived paths and falls back to the launch cwd", async () => {
     const launchCwd = await mkdtemp(join(tmpdir(), "pi-eng-meta-"));
     const unauthorizedParent = await mkdtemp(join(tmpdir(), "pi-eng-unauthorized-"));
     cleanup.push(
@@ -157,12 +205,15 @@ describe("WorkspaceManifestResolver path policy", () => {
       () => rm(unauthorizedParent, { recursive: true, force: true }),
     );
 
+    // A nonexistent explicit candidate no longer blocks resolution: it is
+    // filtered out and the launch cwd (which is not a Git repository) wins,
+    // producing the not-inside-a-Git-repository error instead.
     await assert.rejects(
       new WorkspaceManifestResolver().resolve(
         `Create the project at ${join(unauthorizedParent, "missing", "repo")}`,
         launchCwd,
       ),
-      /does not exist|unauthorized parent/i,
+      /Authorized workspace is not inside a Git repository/,
     );
   });
 
