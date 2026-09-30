@@ -37,10 +37,10 @@ function explicitAbsolutePaths(request: string): string[] {
     if (isAbsolute(candidate)) paths.push(candidate);
     quotedRanges.push({ start: match.index, end: match.index + match[0].length });
   }
-  for (const match of request.matchAll(/(?<![/:])\/(?:[^\s"'`<>()[\]{}])*/g)) {
+  for (const match of request.matchAll(/(?<![/:])\/[A-Za-z0-9._~][^\s"'`<>()[\]{}]*/g)) {
     if (quotedRanges.some((range) => match.index >= range.start && match.index < range.end)) continue;
     const candidate = stripUnquotedPunctuation(match[0]);
-    if (candidate.length > 0 && isAbsolute(candidate)) paths.push(candidate);
+    if (candidate.length > 1 && isAbsolute(candidate)) paths.push(candidate);
   }
   return paths;
 }
@@ -99,10 +99,25 @@ function repoIdFor(root: string): string {
 /** Resolve repository authority only from the user's request or launch cwd. */
 export class WorkspaceManifestResolver {
   async resolve(request: string, launchCwd: string): Promise<ResolvedWorkspace> {
-    const explicit = explicitAbsolutePaths(request);
+    // Filter request-derived candidates down to existing directories so prose
+    // tokens that survive extraction never block resolution. Symlinks are
+    // accepted here via lstat; the downstream symlink-boundary check still applies.
+    // resolveRepository (legacy explicit repository argument) keeps failing loudly.
+    const existing = (
+      await Promise.all(
+        explicitAbsolutePaths(request).map(async (path) => {
+          try {
+            const stat = await lstat(path);
+            return stat.isDirectory() || stat.isSymbolicLink() ? path : null;
+          } catch {
+            return null;
+          }
+        }),
+      )
+    ).filter((path): path is string => path !== null);
     const candidates =
-      explicit.length > 0
-        ? explicit.map((path) => ({ path, source: "explicit_user_path" as const }))
+      existing.length > 0
+        ? existing.map((path) => ({ path, source: "explicit_user_path" as const }))
         : [{ path: launchCwd, source: "launch_cwd" as const }];
     return this.resolveCandidates(candidates, launchCwd);
   }
