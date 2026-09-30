@@ -685,7 +685,8 @@ describe("MissionScheduler resilience (time-based gateway window)", () => {
   // unavailable to the probe (whose routing then moves to another model)
   // instead of being relaunched until max_relaunches.
   describe("a verification attempt that comes back transient", () => {
-    function reporting(probeAfterReport: ProbeResult) {
+    /** `ranOn`: the model each attempt reports it ran on (the probed model is gw/m). */
+    function reporting(probeAfterReport: ProbeResult, ranOn = { provider: "gw", id: "m" }) {
       const store = MissionStore.open(JsonlEventStore.inMemory());
       const m = makeMission(store);
       const t = store.createTask({ mission_id: m.mission_id, kind: "agent", role: "implementer", objective: "x" });
@@ -702,7 +703,7 @@ describe("MissionScheduler resilience (time-based gateway window)", () => {
               // Transient on the dead model; the replacement (after the report) succeeds.
               runAgent: async () => {
                 calls++;
-                return reported ? successOutcome : transientOutcome();
+                return reported ? successOutcome : { ...transientOutcome(), model: ranOn };
               },
             },
           },
@@ -762,6 +763,63 @@ describe("MissionScheduler resilience (time-based gateway window)", () => {
       await scheduler.runMission(m.mission_id);
       assert.equal(calls, 3);
       assert.equal(reports, 0);
+      assert.equal(store.getMission(m.mission_id)!.status, "EXECUTING");
+    });
+
+    it("does not report when the attempt ran on a different model than the probe's", async () => {
+      // The probe targets the implementer's model gw/m; this attempt (say, a
+      // reviewer) ran on gw/other, so its 503 says nothing about gw/m.
+      const h = reporting({ healthy: true, authoritative: true }, { provider: "gw", id: "other" });
+      await h.scheduler.runMission(h.m.mission_id);
+      assert.deepEqual(h.reports, []);
+      assert.equal(h.store.getMission(h.m.mission_id)!.status, "PAUSED_INFRASTRUCTURE");
+    });
+
+    it("a verification attempt that throws leaves nothing for a later ordinary transient to report", async () => {
+      const store = MissionStore.open(JsonlEventStore.inMemory());
+      const m = makeMission(store);
+      store.createTask({
+        mission_id: m.mission_id,
+        kind: "agent",
+        role: "implementer",
+        objective: "x",
+        max_attempts: 5,
+      });
+      const ranOn = { provider: "gw", id: "m" };
+      let calls = 0;
+      let probes = 0;
+      let reports = 0;
+      const clk = clock();
+      const scheduler = new MissionScheduler({
+        store,
+        broker: new ExecutionBroker({
+          store,
+          backends: {
+            agent: {
+              runAgent: async () => {
+                calls++;
+                if (calls === 2) throw new Error("transient network failure");
+                return calls === 4 ? successOutcome : { ...transientOutcome(), model: ranOn };
+              },
+            },
+          },
+        }),
+        resilience: { ...testResilience, retry_window_ms: 60_000 },
+        probe: {
+          // Unlisted until the verification attempt has run, then healthy.
+          probe: async () =>
+            probes++ < UNLISTED_PROBES_BEFORE_VERIFY ? { ...unlisted, model_provider: "gw" } : { healthy: true },
+          reportModelUnavailable: () => {
+            reports++;
+          },
+        },
+        now: clk.now,
+        sleep: clk.sleep,
+        rand: () => 0,
+      });
+      await scheduler.runMission(m.mission_id);
+      assert.equal(calls, 4);
+      assert.equal(reports, 0, "the ordinary transient after a healthy probe is not a verification");
       assert.equal(store.getMission(m.mission_id)!.status, "EXECUTING");
     });
   });

@@ -445,6 +445,11 @@ export class MissionScheduler {
       }
       if (gate === "paused") return;
       if (gate === "wait") continue;
+      // Consume the unlisted answer that let this attempt through (if any) now,
+      // so an attempt that never produces an outcome cannot leave it behind
+      // for a later, ordinary transient to report.
+      const verifying = this.verifyingUnlisted.get(task.task_id);
+      this.verifyingUnlisted.delete(task.task_id);
 
       let authority: DispatchAuthority | undefined;
       try {
@@ -493,8 +498,6 @@ export class MissionScheduler {
           assigned_execution_id: handle.executionId,
         });
         const outcome = await handle.result();
-        const verifying = this.verifyingUnlisted.get(task.task_id);
-        this.verifyingUnlisted.delete(task.task_id);
         authority?.assertAuthoritative();
         // A task canceled underneath the runner (constraint steering) is already
         // CANCELED; CANCELED -> SUCCEEDED is an illegal transition and used to
@@ -1008,6 +1011,7 @@ export class MissionScheduler {
     this.windows.delete(task.task_id);
     this.breakers.delete(task.task_id);
     this.unlistedProbes.delete(task.task_id);
+    this.verifyingUnlisted.delete(task.task_id);
   }
 
   /**
@@ -1020,9 +1024,13 @@ export class MissionScheduler {
   private reportUnlistedModel(
     task: OrchestrationTask,
     verifying: ProbeResult,
-    outcome: { error?: string; summary?: string },
+    outcome: { error?: string; summary?: string; model?: { provider: string; id: string } },
   ): void {
     if (!verifying.model_id || !verifying.model_provider) return;
+    // Only an attempt that really ran on the probed model says anything about
+    // it: the probe targets the implementer's model, while the attempt may be
+    // another role on another model (or report no model at all).
+    if (outcome.model?.provider !== verifying.model_provider || outcome.model.id !== verifying.model_id) return;
     this.probe.reportModelUnavailable?.(
       { provider: verifying.model_provider, id: verifying.model_id },
       {
