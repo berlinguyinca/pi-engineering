@@ -30,11 +30,22 @@ export interface ProbeResult {
   model_unlisted?: boolean;
   /** The model the probe asked about, when it resolved one. */
   model_id?: string;
+  /** That model's provider, when known. */
+  model_provider?: string;
 }
 
 /** A probe adapter: answer "is the gateway ready for a real request?" */
 export interface RecoveryProbe {
   probe(): Promise<ProbeResult>;
+  /**
+   * Optional: the scheduler found a model unavailable (an attempt let through
+   * for an unlisted model still failed). A routing-aware probe records it so
+   * its next target, and the next attempt, move to another model.
+   */
+  reportModelUnavailable?(
+    model: { provider: string; id: string },
+    context: { missionId?: string; taskId?: string; reason: string },
+  ): void;
 }
 
 /** A probe that always reports healthy — used when no real gateway is present. */
@@ -110,6 +121,8 @@ export interface CatalogProbeTarget {
   headers?: Record<string, string>;
   /** The mission's model; when set it must be listed (with capacity). */
   modelId?: string;
+  /** The model's provider, reported with an unlisted answer. */
+  provider?: string;
 }
 
 /**
@@ -174,6 +187,7 @@ export class CatalogRecoveryProbe implements RecoveryProbe {
           authoritative: true,
           model_unlisted: true,
           model_id: target.modelId,
+          ...(target.provider ? { model_provider: target.provider } : {}),
         };
       }
       if (typeof row.slots === "number" && row.slots <= 0) {
@@ -220,5 +234,6 @@ export async function resolveCatalogProbeTarget(
       ? { headers: headers as Record<string, string> }
       : {}),
     modelId: ref.id,
+    provider: ref.provider,
   };
 }

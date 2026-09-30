@@ -679,4 +679,90 @@ describe("MissionScheduler resilience (time-based gateway window)", () => {
       assert.equal(store.getMission(m.mission_id)!.status, "EXECUTING");
     });
   });
+
+  // A removed model that answers 503 instead of 404: the attempt the gate let
+  // through for an unlisted model comes back transient. The model is reported
+  // unavailable to the probe (whose routing then moves to another model)
+  // instead of being relaunched until max_relaunches.
+  describe("a verification attempt that comes back transient", () => {
+    function reporting(probeAfterReport: ProbeResult) {
+      const store = MissionStore.open(JsonlEventStore.inMemory());
+      const m = makeMission(store);
+      const t = store.createTask({ mission_id: m.mission_id, kind: "agent", role: "implementer", objective: "x" });
+      const reports: Array<{ model: string; missionId?: string; taskId?: string; reason: string }> = [];
+      let calls = 0;
+      let reported = false;
+      const clk = clock();
+      const scheduler = new MissionScheduler({
+        store,
+        broker: new ExecutionBroker({
+          store,
+          backends: {
+            agent: {
+              // Transient on the dead model; the replacement (after the report) succeeds.
+              runAgent: async () => {
+                calls++;
+                return reported ? successOutcome : transientOutcome();
+              },
+            },
+          },
+        }),
+        resilience: { ...testResilience, retry_window_ms: 60_000 },
+        probe: {
+          probe: async () => (reported ? probeAfterReport : { ...unlisted, model_provider: "gw" }),
+          reportModelUnavailable: (model, context) => {
+            reported = true;
+            reports.push({ model: `${model.provider}/${model.id}`, ...context });
+          },
+        },
+        now: clk.now,
+        sleep: clk.sleep,
+        rand: () => 0,
+      });
+      return { store, m, t, scheduler, reports, calls: () => calls };
+    }
+
+    it("reports the unlisted model unavailable so the probe follows the new route", async () => {
+      const h = reporting({ healthy: true, authoritative: true });
+      await h.scheduler.runMission(h.m.mission_id);
+      assert.equal(h.reports.length, 1);
+      assert.equal(h.reports[0]!.model, "gw/m");
+      assert.equal(h.reports[0]!.missionId, h.m.mission_id);
+      assert.equal(h.reports[0]!.taskId, h.t.task_id);
+      assert.match(h.reports[0]!.reason, /503/);
+      assert.equal(h.calls(), 3, "original, verification, then the replacement model");
+      assert.equal(h.store.getTask(h.t.task_id)!.status, "SUCCEEDED");
+      assert.equal(h.store.getMission(h.m.mission_id)!.status, "EXECUTING");
+    });
+
+    it("an ordinary transient relaunch (not an unlisted verification) reports nothing", async () => {
+      const store = MissionStore.open(JsonlEventStore.inMemory());
+      const m = makeMission(store);
+      store.createTask({ mission_id: m.mission_id, kind: "agent", role: "implementer", objective: "x" });
+      let calls = 0;
+      let reports = 0;
+      const clk = clock();
+      const scheduler = new MissionScheduler({
+        store,
+        broker: new ExecutionBroker({
+          store,
+          backends: { agent: { runAgent: async () => (calls++ < 2 ? transientOutcome() : successOutcome) } },
+        }),
+        resilience: { ...testResilience, retry_window_ms: 60_000 },
+        probe: {
+          probe: async () => ({ healthy: true, authoritative: true }),
+          reportModelUnavailable: () => {
+            reports++;
+          },
+        },
+        now: clk.now,
+        sleep: clk.sleep,
+        rand: () => 0,
+      });
+      await scheduler.runMission(m.mission_id);
+      assert.equal(calls, 3);
+      assert.equal(reports, 0);
+      assert.equal(store.getMission(m.mission_id)!.status, "EXECUTING");
+    });
+  });
 });

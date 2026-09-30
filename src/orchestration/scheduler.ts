@@ -216,6 +216,8 @@ export class MissionScheduler {
   private readonly breakers = new Map<string, CircuitBreaker>();
   /** Consecutive "model not listed" probe answers per task (see probeGate). */
   private readonly unlistedProbes = new Map<string, number>();
+  /** The unlisted probe answer that let a task's next attempt through to verify the model. */
+  private readonly verifyingUnlisted = new Map<string, ProbeResult>();
   /** In-flight runners, retained so mission cancellation can await cleanup. */
   private readonly activeRuns = new Map<string, Set<Promise<void>>>();
 
@@ -491,6 +493,8 @@ export class MissionScheduler {
           assigned_execution_id: handle.executionId,
         });
         const outcome = await handle.result();
+        const verifying = this.verifyingUnlisted.get(task.task_id);
+        this.verifyingUnlisted.delete(task.task_id);
         authority?.assertAuthoritative();
         // A task canceled underneath the runner (constraint steering) is already
         // CANCELED; CANCELED -> SUCCEEDED is an illegal transition and used to
@@ -505,6 +509,7 @@ export class MissionScheduler {
           // pause on exhaustion) instead of immediately failing the task. Other
           // non-throwing failures keep the existing behaviour.
           const infraCat = infraCategoryFromWorkerMarker(outcome.error);
+          if (infraCat && verifying) this.reportUnlistedModel(task, verifying, outcome);
           const ceiling = infraCat ? this.outageCeiling(task, outcome) : null;
           if (ceiling) {
             authority?.assertAuthoritative();
@@ -786,6 +791,7 @@ export class MissionScheduler {
       const unlisted = (this.unlistedProbes.get(task.task_id) ?? 0) + 1;
       if (unlisted >= UNLISTED_PROBES_BEFORE_VERIFY) {
         this.unlistedProbes.delete(task.task_id);
+        this.verifyingUnlisted.set(task.task_id, result);
         this.onStatus?.({
           missionId: task.mission_id,
           taskId: task.task_id,
@@ -822,6 +828,7 @@ export class MissionScheduler {
 
   private cancelTask(task: OrchestrationTask): void {
     this.unlistedProbes.delete(task.task_id);
+    this.verifyingUnlisted.delete(task.task_id);
     const status = this.store.getTask(task.task_id)?.status;
     if (!status || ["SUCCEEDED", "FAILED", "CANCELED", "SKIPPED"].includes(status)) return;
     this.store.transitionTask(task.task_id, "CANCELED");
@@ -1004,6 +1011,29 @@ export class MissionScheduler {
   }
 
   /**
+   * The attempt let through to verify an unlisted model came back transient
+   * (a removed model that answers 503 rather than 404). The model is not
+   * coming back: report it so a routing-aware probe moves its target, and the
+   * next attempt, to another model instead of relaunching the dead one until
+   * max_relaunches.
+   */
+  private reportUnlistedModel(
+    task: OrchestrationTask,
+    verifying: ProbeResult,
+    outcome: { error?: string; summary?: string },
+  ): void {
+    if (!verifying.model_id || !verifying.model_provider) return;
+    this.probe.reportModelUnavailable?.(
+      { provider: verifying.model_provider, id: verifying.model_id },
+      {
+        missionId: task.mission_id,
+        taskId: task.task_id,
+        reason: `unlisted by the gateway and the verification attempt failed: ${outcome.summary ?? outcome.error ?? "transient"}`,
+      },
+    );
+  }
+
+  /**
    * Record one more infra failure for the task and decide whether its outage
    * has hit a ceiling: the total duration (across pause and resume) or the
    * relaunch count. Returns the failure reason when it has, else null.
@@ -1075,6 +1105,7 @@ export class MissionScheduler {
       if (unlisted >= UNLISTED_PROBES_BEFORE_VERIFY) {
         if (missionId !== undefined) {
           const task = recoveryTask();
+          if (task) this.verifyingUnlisted.set(task.task_id, result);
           this.onStatus?.({
             missionId,
             taskId: task?.task_id ?? "recovery",

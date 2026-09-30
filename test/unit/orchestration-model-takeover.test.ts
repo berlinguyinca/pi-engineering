@@ -25,7 +25,13 @@ import { MissionStore } from "../../src/orchestration/missionStore.ts";
 import { type RouteModel, realBackends } from "../../src/orchestration/realBackends.ts";
 import { MissionScheduler } from "../../src/orchestration/scheduler.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
-import { MODEL_UNAVAILABLE_TTL_MS, UnavailableModels, createRouteModel } from "../../src/runtime/modelRouting.ts";
+import type { ProbeResult } from "../../src/resilience/probe.ts";
+import {
+  MODEL_UNAVAILABLE_TTL_MS,
+  UnavailableModels,
+  createRouteModel,
+  followUnavailableModels,
+} from "../../src/runtime/modelRouting.ts";
 import { type TelemetryNotice, setTelemetrySink } from "../../src/telemetry/sink.ts";
 import type { WorkerActivity, WorkerExecutor, WorkerRequest, WorkerRun } from "../../src/workers/WorkerExecutor.ts";
 
@@ -433,5 +439,41 @@ describe("model takeover through the mission scheduler", () => {
     assert.equal(h.seen.length, 1);
     const failed = store.getTask(t.task_id) as unknown as { failure_reason?: string };
     assert.match(failed.failure_reason ?? "", /model_not_found/);
+  });
+});
+
+describe("the recovery probe follows unavailable models", () => {
+  const unlistedA: ProbeResult = {
+    healthy: false,
+    authoritative: true,
+    model_unlisted: true,
+    model_id: A.id,
+    model_provider: A.provider,
+    reason: "model model-a is not served",
+  };
+
+  it("a model reported unavailable by the scheduler is marked and logged", () => {
+    const unavailable = new UnavailableModels();
+    const probe = followUnavailableModels({ probe: async () => unlistedA }, unavailable);
+    probe.reportModelUnavailable?.(A, { missionId: "MSN-1", taskId: "TSK-1", reason: "503" });
+    assert.deepEqual(unavailable.list(), [A]);
+  });
+
+  it("an expired mark is refreshed when the probe still finds the model unlisted", async () => {
+    let now = 0;
+    const unavailable = new UnavailableModels({ now: () => now });
+    unavailable.mark(A);
+    now += MODEL_UNAVAILABLE_TTL_MS;
+    assert.equal(unavailable.has(A), false, "the TTL expired during a long pause");
+    const probe = followUnavailableModels({ probe: async () => unlistedA }, unavailable);
+    assert.deepEqual(await probe.probe(), unlistedA);
+    assert.equal(unavailable.has(A), true, "still gone: excluded again without a 404");
+  });
+
+  it("a model never confirmed gone (an unlisted alias) is not marked by the probe", async () => {
+    const unavailable = new UnavailableModels();
+    const probe = followUnavailableModels({ probe: async () => unlistedA }, unavailable);
+    await probe.probe();
+    assert.deepEqual(unavailable.list(), []);
   });
 });

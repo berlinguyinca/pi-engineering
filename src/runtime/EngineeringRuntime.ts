@@ -55,7 +55,7 @@ import { buildCoreTools } from "../tools/coreTools.ts";
 import { CommandVerifier, type VerificationProvider, type VerifyOutcome } from "../verify/Verifier.ts";
 import { PiWorkerExecutor } from "../workers/PiWorkerExecutor.ts";
 import type { WorkerExecutor, WorkerRequest } from "../workers/WorkerExecutor.ts";
-import { UnavailableModels, createRouteModel } from "./modelRouting.ts";
+import { UnavailableModels, createRouteModel, followUnavailableModels } from "./modelRouting.ts";
 
 /**
  * Build the mission gateway recovery probe.
@@ -70,11 +70,14 @@ import { UnavailableModels, createRouteModel } from "./modelRouting.ts";
 function buildGatewayRecoveryProbe(
   worker: WorkerExecutor,
   routeModel: RouteModel | undefined,
+  unavailable: UnavailableModels,
 ): RecoveryProbe | undefined {
   const url = process.env.PI_GATEWAY_HEALTH_URL;
   if (url) return new HttpRecoveryProbe({ baseUrl: url, timeoutMs: 5_000 });
   if (!(worker instanceof PiWorkerExecutor)) return undefined;
-  return new CatalogRecoveryProbe({
+  // The target is resolved through routeModel, which skips unavailable models;
+  // following the record keeps a removed model out of the probe too.
+  const catalog = new CatalogRecoveryProbe({
     resolve: async () => {
       const runtime = await worker.getModelRuntime();
       const routed = await routeModel?.("implementer").catch(() => undefined);
@@ -83,6 +86,7 @@ function buildGatewayRecoveryProbe(
       return ref ? resolveCatalogProbeTarget(runtime as never, ref) : undefined;
     },
   });
+  return followUnavailableModels(catalog, unavailable);
 }
 
 export interface EngineerReport {
@@ -848,7 +852,7 @@ export class EngineeringRuntime {
         // detected without burning a full worker session; otherwise the scheduler's
         // pass-through probe applies.
         resilience: rt.resilience,
-        probe: buildGatewayRecoveryProbe(rt.worker, routeModel),
+        probe: buildGatewayRecoveryProbe(rt.worker, routeModel, rt.unavailableModels),
         onPhase: (mission, phase) => {
           const mapped: RuntimePhaseEvent["phase"] =
             phase === "complete" ? "settled" : phase === "classified" ? "scout" : "implement";

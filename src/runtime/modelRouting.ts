@@ -12,6 +12,7 @@ import type { RoleRouterAdapter } from "../capability/adapter.ts";
 import { ROLE_REQUIREMENTS, routerRoleFor } from "../capability/roles.ts";
 import { type ModelRef, modelKey } from "../lifecycle/types.ts";
 import type { ModelRoute, RouteModel } from "../orchestration/realBackends.ts";
+import type { RecoveryProbe } from "../resilience/probe.ts";
 import { emitTelemetry } from "../telemetry/sink.ts";
 
 /** How long a model confirmed unavailable stays excluded from routing. */
@@ -27,6 +28,8 @@ export interface ModelUnavailableContext {
 /** Runtime-wide record of models the gateway confirmed it does not serve. */
 export class UnavailableModels {
   private readonly entries = new Map<string, { model: ModelRef; expiresAt: number }>();
+  /** Every model ever confirmed unavailable (survives the TTL). */
+  private readonly confirmed = new Set<string>();
   private readonly ttlMs: number;
   private readonly now: () => number;
 
@@ -38,6 +41,7 @@ export class UnavailableModels {
   /** Record (or refresh) a model as unavailable for the TTL; logged when a context is given. */
   mark(model: ModelRef, context?: ModelUnavailableContext): void {
     const key = modelKey(model);
+    this.confirmed.add(key);
     this.entries.set(key, {
       model: { provider: model.provider, id: model.id },
       expiresAt: this.now() + this.ttlMs,
@@ -49,6 +53,17 @@ export class UnavailableModels {
       key: `model-unavailable:${key}`,
       detail: { model: key, ...context },
     });
+  }
+
+  /**
+   * Re-mark a model that was once confirmed unavailable and is still not
+   * listed. After the TTL expires during a long pause the probe resolves back
+   * to it; its unlisted answer is enough to exclude it again, without a 404.
+   * A model never confirmed gone (e.g. an unlisted alias that still routes) is
+   * left alone.
+   */
+  refreshIfConfirmed(model: ModelRef): void {
+    if (this.confirmed.has(modelKey(model))) this.mark(model);
   }
 
   /** True while the model is inside its TTL. */
@@ -105,5 +120,24 @@ export function createRouteModel(opts: {
     } catch {
       return undefined;
     }
+  };
+}
+
+/**
+ * Make a mission recovery probe follow the unavailable-model record: a model
+ * the scheduler reports unavailable is marked (so routing, and with it the
+ * probe's own target, move on), and a once-confirmed model the probe still
+ * finds unlisted is re-marked when its TTL has run out.
+ */
+export function followUnavailableModels(probe: RecoveryProbe, unavailable: UnavailableModels): RecoveryProbe {
+  return {
+    probe: async () => {
+      const result = await probe.probe();
+      if (result.model_unlisted && result.model_id && result.model_provider) {
+        unavailable.refreshIfConfirmed({ provider: result.model_provider, id: result.model_id });
+      }
+      return result;
+    },
+    reportModelUnavailable: (model, context) => unavailable.mark(model, context),
   };
 }
