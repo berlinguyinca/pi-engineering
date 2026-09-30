@@ -23,22 +23,27 @@
 routing:
   mode: auto
   roles:
+    # NOTE (2026-09-30): the remote metabolomics gateway stopped serving the
+    # pinned text models (flash_next planner and the c262k/c250k text
+    # implementer); /v1/models now lists only the two 27b vision models. A pin
+    # to an unserved model parks the mission in the 12h retry window instead of
+    # degrading (observed: MSN-RYWo5u, MSN-ISP5aA). Repoint every role to a
+    # model verified served right now, across THREE physically distinct
+    # serving instances (local llama.cpp, remote, local ollama) so
+    # plan/implement/review stay independent as far as the current lineup
+    # allows:
+    #   planner     -> beast local llama.cpp 27b q4 (distinct, low latency)
+    #   implementer -> metabolomics remote 27b vision q8 (strongest served)
+    #   reviewer    -> bender local ollama 27b vision q4 (vision, distinct box)
     planner:
-      model: "metabolomics/qwen3.8-flash_next-modality-text-quant-q4_k_xl"
-      timeout_ms: 1200000
+      model: "beast/qwen3.8-27b-q4"
+      timeout_ms: 3600000
       max_context_tokens: 128000
-    # NOTE: the previously pinned `qwen3.8-27b-modality-text-quant-q8_k_xl` is
-    # not present in the gateway's available set, so the degrade-safe router fell
-    # back to auto-scoring and picked `deepseek_v4-flash…-mxfp4` as "best
-    # implementer" — a looping, non-functional model that burned the whole worker
-    # budget without committing. Repoint to an AVAILABLE qwen-27b text model with
-    # 262k context (explicit text modality, distinct from the planner and the
-    # vision reviewer).
     implementer:
-      model: "metabolomics/qwen3.8-27b-modality-text-ctx-c262k-quant-q4_k_xl"
+      model: "metabolomics/qwen3.8-27b-modality-vision-quant-q8_k_xl"
       timeout_ms: 3600000
       max_context_tokens: 256000
     reviewer:
-      model: "metabolomics/qwen3.8-27b-modality-vision-quant-q8_k_xl"
+      model: "bender/qwen3.8-27b-modality-vision-quant-q4_k_m"
       timeout_ms: 1800000
       max_context_tokens: 128000
