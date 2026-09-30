@@ -4,6 +4,7 @@ import { join, resolve } from "node:path";
 import type { Model } from "@earendil-works/pi-ai/compat";
 import { ArtifactStore } from "../artifacts/ArtifactStore.ts";
 import { BlackholeManager, type BlackholeManagerOptions } from "../blackhole/BlackholeManager.ts";
+import type { RoleRouterAdapter } from "../capability/adapter.ts";
 import { ContextBroker } from "../context/ContextBroker.ts";
 import { newRunId } from "../core/ids.ts";
 import type {
@@ -328,6 +329,12 @@ export interface EngineeringRuntimeOptions {
   verifier?: VerificationProvider;
   model?: Model<any>;
   agentDir?: string;
+  /**
+   * Route mission roles through this instead of a router built from the
+   * agent dir's policy and discovered models. Hosts and tests that must not
+   * depend on the operator's installed providers supply their own.
+   */
+  roleRouter?: Pick<RoleRouterAdapter, "route">;
   /** Override the durable state directory (default: <repoRoot>/.pi-eng). */
   workDir?: string;
   /**
@@ -746,12 +753,14 @@ export class EngineeringRuntime {
           const available = (await sharedRuntime.getAvailable())[0];
           if (available) reviewFallbackModel = { provider: available.provider, id: available.id };
         }
-        const routerAdapter = await createRoleRouter({
-          cwd: repoRoot,
-          agentDir: opts.agentDir,
-          modelRuntime: sharedRuntime,
-          allowModelNetwork: false,
-        });
+        const routerAdapter =
+          opts.roleRouter ??
+          (await createRoleRouter({
+            cwd: repoRoot,
+            agentDir: opts.agentDir,
+            modelRuntime: sharedRuntime,
+            allowModelNetwork: false,
+          }));
         routeModel = async (role) => {
           if (!isRoleName(role)) return undefined;
           try {

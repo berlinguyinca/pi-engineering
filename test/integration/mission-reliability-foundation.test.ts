@@ -155,6 +155,15 @@ async function greenFixture() {
   return fixture;
 }
 
+// Without an injected router the runtime builds one from the operator's real
+// ~/.pi/agent and the served gateway models, so on a developer machine the
+// reviewer routes to a distinct model and these assertions see "independent".
+// A router that answers every role with the requester's own model is the
+// single-model deployment this suite describes, on any machine.
+const sameModelRouter = {
+  route: async (_role: string, query?: { requester?: { provider: string; id: string } }) => query?.requester,
+};
+
 async function repositoryState(root: string) {
   const [head, indexTree, status, tracked, untracked] = await Promise.all([
     exec("git", ["-C", root, "rev-parse", "HEAD"]),
@@ -605,6 +614,7 @@ describe("mission reliability foundation — synthetic MSN-qSLaeM", () => {
         });
         runtime = await EngineeringRuntime.open({
           cwd: metaRoot,
+          roleRouter: sameModelRouter,
           workDir: join(metaRoot, "state"),
           model: {
             provider: "local",
@@ -744,6 +754,7 @@ describe("mission reliability foundation — synthetic MSN-qSLaeM", () => {
       const incumbentState = await repositoryState(fixture.root);
       runtime = await EngineeringRuntime.open({
         cwd: fixture.root,
+        roleRouter: sameModelRouter,
         workDir: state,
         worker: workerFor(async (cwd) => {
           await writeFile(join(cwd, "src", "add.js"), "export function add(a, b) { return a + b; // worker\n}\n");
@@ -773,6 +784,7 @@ describe("mission reliability foundation — synthetic MSN-qSLaeM", () => {
     try {
       runtime = await EngineeringRuntime.open({
         cwd: fixture.root,
+        roleRouter: sameModelRouter,
         model: {
           provider: "local",
           id: "local",
@@ -828,6 +840,7 @@ describe("mission reliability foundation — synthetic MSN-qSLaeM", () => {
       };
       runtime = await EngineeringRuntime.open({
         cwd: fixture.root,
+        roleRouter: sameModelRouter,
         workDir: state,
         verifier: redVerifier,
         worker: workerFor(async (cwd) => {
