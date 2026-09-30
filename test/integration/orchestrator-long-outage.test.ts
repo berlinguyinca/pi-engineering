@@ -9,9 +9,13 @@ import type { GitRepo } from "../../src/git/GitRepo.ts";
 import type { BrokerBackends } from "../../src/orchestration/broker.ts";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
 import { Orchestrator } from "../../src/orchestration/orchestrator.ts";
+import { realBackends } from "../../src/orchestration/realBackends.ts";
+import { UNLISTED_PROBES_BEFORE_VERIFY } from "../../src/orchestration/scheduler.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 import { DEFAULT_GATEWAY_RESILIENCE, type GatewayResilienceConfig } from "../../src/resilience/config.ts";
 import type { ProbeResult } from "../../src/resilience/probe.ts";
+import { UnavailableModels, createRouteModel } from "../../src/runtime/modelRouting.ts";
+import type { WorkerExecutor, WorkerRun } from "../../src/workers/WorkerExecutor.ts";
 
 const HOUR = 3_600_000;
 
@@ -20,6 +24,8 @@ type AgentOutcome = Awaited<ReturnType<NonNullable<BrokerBackends["agent"]>["run
 interface HarnessOverrides {
   /** Replace the outage-driven agent: receives the 0-based call index. */
   agent?: (call: number) => AgentOutcome;
+  /** Replace the agent backend entirely (e.g. with realBackends over a stub worker). */
+  agentBackend?: BrokerBackends["agent"];
   /** Replace the outage-driven probe answer. */
   probe?: () => ProbeResult;
   resilience?: GatewayResilienceConfig;
@@ -33,7 +39,7 @@ function run(outageMs: number, overrides: HarnessOverrides = {}) {
   const down = () => now < outageMs;
   const ok = { executionId: "e", exitStatus: "succeeded", summary: "ok", artifactRefs: [], usage: {} };
   const backends: BrokerBackends = {
-    agent: {
+    agent: overrides.agentBackend ?? {
       runAgent: async () =>
         overrides.agent
           ? overrides.agent(agentCalls++)
@@ -231,5 +237,94 @@ describe("orchestrator: a task that fails terminally inside the resilience windo
     assert.equal(result.completed, false);
     // BLOCKED is the orchestrator's normal end state for a failed implementer.
     assert.equal(h.store.getMission(result.mission.mission_id)!.status, "BLOCKED");
+  });
+});
+
+// Issue #76 end to end: the gateway drops the mission's model mid-outage. The
+// probe reports it unlisted, a verification attempt hits model_not_found, and
+// the next eligible model takes over in that same attempt, so the mission
+// completes instead of failing or pausing.
+describe("orchestrator: another model takes over when the mission's model leaves the gateway", () => {
+  it("transient outage -> unlisted probes -> model_not_found -> takeover model completes the mission", async () => {
+    const A = { provider: "gw", id: "model-a" };
+    const B = { provider: "gw", id: "model-b" };
+    const unavailable = new UnavailableModels();
+    const models: string[] = [];
+    const activity: string[] = [];
+    const worker: WorkerExecutor = {
+      async run(req) {
+        const model = req.modelOverride ? `${req.modelOverride.provider}/${req.modelOverride.id}` : "default";
+        models.push(model);
+        const result = (status: "completed" | "failed", summary: string, error?: string): WorkerRun => ({
+          result: {
+            status,
+            summary,
+            claims: [],
+            evidence_refs: [],
+            new_hypotheses: [],
+            proposed_tasks: [],
+            details: {},
+            ...(error ? { error } : {}),
+          },
+          usage: null,
+        });
+        if (model === "gw/model-b") return result("completed", "implemented on model-b");
+        // model-a: first the outage, then the gateway no longer has it.
+        return models.length === 1
+          ? result("failed", "capacity_unavailable", "transient:server_unavailable")
+          : result("failed", 'Worker failed: 404 {"code":"model_not_found"}', "transient:model_unavailable");
+      },
+    };
+    const real = realBackends({
+      worker,
+      verifier: {} as never,
+      artifacts: {} as never,
+      git: null,
+      cwd: process.cwd(),
+      routeModel: createRouteModel({
+        router: {
+          route: async (_role, query) => {
+            const excluded = new Set((query?.exclude ?? []).map((m) => `${m.provider}/${m.id}`));
+            return [A, B].find((m) => !excluded.has(`${m.provider}/${m.id}`));
+          },
+        },
+        unavailable,
+      }),
+      onModelUnavailable: (route) => unavailable.mark(route),
+    });
+    const h = run(0, {
+      agentBackend: {
+        runAgent: (input) =>
+          real.agent.runAgent({
+            ...input,
+            onActivity: (event) => {
+              activity.push(event.summary);
+              input.onActivity?.(event);
+            },
+          }),
+      },
+      probe: () => ({
+        healthy: false,
+        authoritative: true,
+        model_unlisted: true,
+        model_id: "model-a",
+        reason: "model model-a is not served",
+      }),
+    });
+    const result = await h.orchestrator.orchestrate("Add a health endpoint", {
+      repository: ".",
+      baseRef: "abc",
+      mutationRequested: true,
+    });
+    assert.deepEqual(models, ["gw/model-a", "gw/model-a", "gw/model-b"]);
+    assert.ok(
+      activity.includes("model gw/model-a is no longer served — switched implementer to gw/model-b"),
+      JSON.stringify(activity),
+    );
+    assert.equal(result.completed, true, JSON.stringify(result.verdict.reasons));
+    assert.equal(h.store.getMission(result.mission.mission_id)!.status, "COMPLETE");
+    assert.deepEqual(unavailable.list(), [A]);
+    // The verification attempt ran after exactly the unlisted-probe threshold.
+    assert.equal(h.statuses.length, UNLISTED_PROBES_BEFORE_VERIFY);
   });
 });
