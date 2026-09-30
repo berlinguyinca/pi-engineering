@@ -23,27 +23,38 @@
 routing:
   mode: auto
   roles:
-    # NOTE (2026-09-30): the remote metabolomics gateway stopped serving the
-    # pinned text models (flash_next planner and the c262k/c250k text
-    # implementer); /v1/models now lists only the two 27b vision models. A pin
-    # to an unserved model parks the mission in the 12h retry window instead of
-    # degrading (observed: MSN-RYWo5u, MSN-ISP5aA). Repoint every role to a
-    # model verified served right now, across THREE physically distinct
-    # serving instances (local llama.cpp, remote, local ollama) so
-    # plan/implement/review stay independent as far as the current lineup
-    # allows:
-    #   planner     -> beast local llama.cpp 27b q4 (distinct, low latency)
-    #   implementer -> metabolomics remote 27b vision q8 (strongest served)
-    #   reviewer    -> bender local ollama 27b vision q4 (vision, distinct box)
+    # NOTE (2026-09-30, rev 2): the remote metabolomics gateway serves only
+    # the two 27b vision models (flash_next and the text lineup are gone), and
+    # the global agent policy pins every role to one q8 model — which the
+    # default separation-of-duties pairs (implementer≠reviewer,
+    # implementer≠verifier, reviewer≠spec_verifier, plus reviewer≠session
+    # requester) reject, pushing the router onto the scored fallback
+    # flash_next (marked healthy in the capability cache but actually at zero
+    # capacity: 503 inferweave_backpressure, observed MSN-NlD53D). So pin ALL
+    # roles here (repo layer overrides global) to models verified served, in an
+    # assignment that satisfies every distinct-pair AND keeps the reviewer off
+    # the driver session's model (metabolomics q8):
+    #   planner       -> beast local llama.cpp 27b q4 (distinct, low latency)
+    #   implementer   -> beast local llama.cpp 27b q4 (≠ reviewer, ≠ verifier)
+    #   reviewer      -> bender local ollama 27b vision q4 (vision; ≠ implementer, ≠ session)
+    #   verifier      -> metabolomics remote 27b vision q4 (≠ implementer, ≠ session)
+    #   spec_verifier -> metabolomics remote 27b vision q4 (≠ reviewer)
+    #   test_reviewer -> metabolomics remote 27b vision q4
     planner:
       model: "beast/qwen3.8-27b-q4"
       timeout_ms: 3600000
       max_context_tokens: 128000
     implementer:
-      model: "metabolomics/qwen3.8-27b-modality-vision-quant-q8_k_xl"
+      model: "beast/qwen3.8-27b-q4"
       timeout_ms: 3600000
       max_context_tokens: 256000
     reviewer:
       model: "bender/qwen3.8-27b-modality-vision-quant-q4_k_m"
       timeout_ms: 1800000
       max_context_tokens: 128000
+    verifier:
+      model: "metabolomics/qwen3.8-27b-modality-vision-quant-q4_k_m"
+    spec_verifier:
+      model: "metabolomics/qwen3.8-27b-modality-vision-quant-q4_k_m"
+    test_reviewer:
+      model: "metabolomics/qwen3.8-27b-modality-vision-quant-q4_k_m"
