@@ -81,9 +81,9 @@ describe("WorkspaceManifestResolver path policy", () => {
     const repo = await makeFixtureRepo();
     cleanup.push(() => rm(launchCwd, { recursive: true, force: true }), repo.cleanup);
 
-    // Build the prose with concatenation so no bare slash token is embedded in
-    // this test source. The request contains a single slash surrounded by
-    // whitespace and no absolute repository path.
+    // Build the slash with fromCharCode so no bare slash token is embedded in
+    // this test source. The request contains "a" + slash + space (the case the
+    // old extraction read as "/") and no absolute repository path.
     const slash = `a${String.fromCharCode(47)}`;
     const request = `Please use care or ${slash} it will not merge`;
 
