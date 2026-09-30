@@ -19,7 +19,7 @@ import type { CandidateLifecycle, GitRepo, IntegrationRunRecord } from "../git/G
 import type { WorktreeInfo } from "../git/GitRepo.ts";
 import { type ModelRef, modelKey } from "../lifecycle/types.ts";
 import type { VerificationProvider } from "../verify/Verifier.ts";
-import type { WorkerActivity, WorkerExecutor, WorkerRequest } from "../workers/WorkerExecutor.ts";
+import type { WorkerActivity, WorkerExecutor, WorkerRequest, WorkerRun } from "../workers/WorkerExecutor.ts";
 import {
   type CheckpointRecoveryContext,
   type ExecutionOutcome,
@@ -51,6 +51,8 @@ export interface RealBackendsOptions {
    * handed to the next eligible model right away (see runWithModelTakeover).
    */
   onModelUnavailable?: (model: ModelRef, context: { missionId?: string; taskId?: string; reason: string }) => void;
+  /** Called when an attempt succeeded on a model: it is served again. */
+  onModelServed?: (model: ModelRef) => void;
   /** True for a model currently recorded as unavailable (never a reviewer fallback). */
   isModelUnavailable?: (model: ModelRef) => boolean;
   /**
@@ -70,6 +72,12 @@ export interface ModelRoute extends ModelRef {
 export interface RouteModelOptions {
   /** Models not to place the role on (already tried, or that produced the work). */
   exclude?: ModelRef[];
+  /**
+   * Choosing a replacement after the model was found gone. Only then is a
+   * worker role the router has no native role for (investigator, scout, ...)
+   * mapped onto one; its first attempt stays on the executor default.
+   */
+  replacement?: boolean;
 }
 
 /** Resolve a worker role to a model placement, or undefined for the executor default. */
@@ -90,6 +98,22 @@ const MODEL_GONE_MARKERS: ReadonlySet<string> = new Set(["transient:model_unavai
 const REQUEST_SPECIFIC_REFUSAL = /invalid model name/i;
 
 const sameModel = (a: ModelRef, b: ModelRef): boolean => modelKey(a) === modelKey(b);
+
+/** Missions whose producing models are remembered for reviewer separation. */
+export const MAX_TRACKED_MISSIONS = 256;
+
+/** The model a worker run says it ran on (PiWorkerExecutor names it on failure). */
+function ranOn(run: WorkerRun): ModelRef | undefined {
+  const named = run.result.details?.model;
+  if (!named || typeof named !== "object") return undefined;
+  const { provider, id } = named as Record<string, unknown>;
+  return typeof provider === "string" && typeof id === "string" ? { provider, id } : undefined;
+}
+
+/** Attach the model an attempt ran on to its outcome. */
+function withModel(outcome: ExecutionOutcome, model: ModelRef | undefined): ExecutionOutcome {
+  return model ? { ...outcome, model: { provider: model.provider, id: model.id } } : outcome;
+}
 
 const reducedIndependence = (model: ModelRef, why: string): string =>
   `Warning: ${why}; reviewing with ${modelKey(model)} in a fresh session with reduced independence.`;
@@ -275,7 +299,14 @@ export function realBackends(opts: RealBackendsOptions) {
     if (!missionId || !model) return;
     const models = producedBy.get(missionId) ?? [];
     if (!models.some((known) => sameModel(known, model))) models.push({ provider: model.provider, id: model.id });
+    // Most recently active last; the oldest mission is forgotten past the bound
+    // (realBackends has no mission-settled hook to prune on).
+    producedBy.delete(missionId);
     producedBy.set(missionId, models);
+    if (producedBy.size > MAX_TRACKED_MISSIONS) {
+      const oldest = producedBy.keys().next().value;
+      if (oldest !== undefined) producedBy.delete(oldest);
+    }
   };
   /**
    * Run a worker on `plan.initial` (or, unrouted, on the executor default).
@@ -298,10 +329,11 @@ export function realBackends(opts: RealBackendsOptions) {
     },
   ): Promise<{ run: Awaited<ReturnType<WorkerExecutor["run"]>>; route: ModelRoute | undefined; model?: ModelRef }> => {
     let route = plan.initial;
-    // The model the attempt really runs on: the route, else the executor default.
-    let model: ModelRef | undefined = route ?? opts.reviewFallbackModel;
     if (route) req.modelOverride = { provider: route.provider, id: route.id };
     let run = await runWorker(req, input);
+    // The model the attempt ran on: the route; unrouted, the model the worker
+    // names, else the session model (normally the executor's default).
+    let model: ModelRef | undefined = route ?? ranOn(run) ?? opts.reviewFallbackModel;
     const tried: ModelRef[] = [];
     const switches: string[] = [];
     while (model && MODEL_GONE_MARKERS.has(outcomeOf(run).error ?? "") && !input.signal.aborted) {
@@ -325,6 +357,8 @@ export function realBackends(opts: RealBackendsOptions) {
       req.modelOverride = { provider: next.provider, id: next.id };
       run = await runWorker(req, input);
     }
+    // A model that serves an attempt again is no longer considered gone.
+    if (model && run.result.status === "completed") opts.onModelServed?.(model);
     if (switches.length > 0) {
       run = { ...run, result: { ...run.result, summary: `${switches.join("; ")}. ${run.result.summary}` } };
     }
@@ -333,7 +367,7 @@ export function realBackends(opts: RealBackendsOptions) {
   /** Takeover plan for a routed worker role: the next model the router offers. */
   const routedPlan = async (role: string, context: { missionId?: string; taskId?: string }, prefix: string) => ({
     initial: await opts.routeModel?.(role),
-    next: async (tried: ModelRef[]) => opts.routeModel?.(role, { exclude: tried }),
+    next: async (tried: ModelRef[]) => opts.routeModel?.(role, { exclude: tried, replacement: true }),
     freshSessionId: () => id(prefix),
     context,
   });
@@ -386,7 +420,7 @@ export function realBackends(opts: RealBackendsOptions) {
           await routedPlan(req.role, { missionId: input.missionId, taskId: input.taskId }, "WKS"),
         );
         recordProducer(input.missionId, model);
-        return outcomeOf(run);
+        return withModel(outcomeOf(run), model);
       },
     },
     research: {
@@ -406,8 +440,8 @@ export function realBackends(opts: RealBackendsOptions) {
           tools: ["ledger_read", "repo_search", "symbol", "tests_for"],
           cwd: bound.cwd,
         };
-        const { run } = await runWithModelTakeover(req, input, await routedPlan(req.role, {}, "WKS"));
-        return outcomeOf(run);
+        const { run, model } = await runWithModelTakeover(req, input, await routedPlan(req.role, {}, "WKS"));
+        return withModel(outcomeOf(run), model);
       },
     },
     validation: {
@@ -543,7 +577,7 @@ export function realBackends(opts: RealBackendsOptions) {
         // Independence is judged on the model that actually reviewed.
         const modelRoute = takeover.route;
         const independent = !!modelRoute && !reviewWarning(modelRoute);
-        const outcome = outcomeOf(run);
+        const outcome = withModel(outcomeOf(run), takeover.model);
         // If the reviewer emitted structured findings, normalize and surface them
         // so the completion gate can block on blocking findings. Handles three
         // shapes: a list of objects ({severity, message|summary|text}), a list of

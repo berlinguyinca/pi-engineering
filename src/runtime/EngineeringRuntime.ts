@@ -73,6 +73,11 @@ function buildGatewayRecoveryProbe(
   unavailable: UnavailableModels,
 ): RecoveryProbe | undefined {
   const url = process.env.PI_GATEWAY_HEALTH_URL;
+  // Not wrapped with followUnavailableModels: the health-URL probe has no model
+  // target, so it never reports a model unlisted, the unlisted-model gate never
+  // engages, and the scheduler has no model to report through it. A removed
+  // model is still taken over on the worker's own 404; one that answers 503
+  // instead is relaunched like any outage, up to max_relaunches.
   if (url) return new HttpRecoveryProbe({ baseUrl: url, timeoutMs: 5_000 });
   if (!(worker instanceof PiWorkerExecutor)) return undefined;
   // The target is resolved through routeModel, which skips unavailable models;
@@ -790,7 +795,10 @@ export class EngineeringRuntime {
         git: rt.git,
         cwd: repoRoot,
         routeModel,
-        onModelUnavailable: (model, context) => rt.unavailableModels.mark(model, context),
+        // A takeover mark is gateway-confirmed (404 model_not_found or a model
+        // pruned from the runtime); an attempt that succeeds clears it.
+        onModelUnavailable: (model, context) => rt.unavailableModels.mark(model, context, { confirmed: true }),
+        onModelServed: (model) => rt.unavailableModels.clear(model),
         isModelUnavailable: (model) => rt.unavailableModels.has(model),
         reviewFallbackModel,
         repository: async (repoId) => {

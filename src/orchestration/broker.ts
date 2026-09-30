@@ -131,6 +131,8 @@ export interface ExecutionOutcome {
   recoveredMerged?: RecoveredMerge[];
   /** Content hashes of accessible artifacts produced by this backend. */
   artifactHashes?: string[];
+  /** The model the attempt ran on, when the backend knows it. */
+  model?: { provider: string; id: string };
   validationEvidence?: Pick<
     ValidationEvidence,
     "command" | "profile" | "exitCode" | "testSummary" | "noTargets" | "accessible" | "acceptanceResults"

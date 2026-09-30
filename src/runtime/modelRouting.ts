@@ -9,7 +9,7 @@
  */
 
 import type { RoleRouterAdapter } from "../capability/adapter.ts";
-import { ROLE_REQUIREMENTS, routerRoleFor } from "../capability/roles.ts";
+import { ROLE_REQUIREMENTS, isRoleName, routerRoleFor } from "../capability/roles.ts";
 import { type ModelRef, modelKey } from "../lifecycle/types.ts";
 import type { ModelRoute, RouteModel } from "../orchestration/realBackends.ts";
 import type { RecoveryProbe } from "../resilience/probe.ts";
@@ -28,7 +28,10 @@ export interface ModelUnavailableContext {
 /** Runtime-wide record of models the gateway confirmed it does not serve. */
 export class UnavailableModels {
   private readonly entries = new Map<string, { model: ModelRef; expiresAt: number }>();
-  /** Every model ever confirmed unavailable (survives the TTL). */
+  /**
+   * Models the gateway confirmed gone (404 model_not_found, or pruned from the
+   * local runtime). Survives the TTL until an attempt on the model succeeds.
+   */
   private readonly confirmed = new Set<string>();
   private readonly ttlMs: number;
   private readonly now: () => number;
@@ -38,10 +41,15 @@ export class UnavailableModels {
     this.now = opts.now ?? Date.now;
   }
 
-  /** Record (or refresh) a model as unavailable for the TTL; logged when a context is given. */
-  mark(model: ModelRef, context?: ModelUnavailableContext): void {
+  /**
+   * Record (or refresh) a model as unavailable for the TTL; logged when a
+   * context is given. `confirmed` only for a gateway-confirmed absence: a
+   * heuristic mark (e.g. a 503 on an unlisted model, which may be an alias
+   * that still routes) must never outlive its TTL.
+   */
+  mark(model: ModelRef, context?: ModelUnavailableContext, opts: { confirmed?: boolean } = {}): void {
     const key = modelKey(model);
-    this.confirmed.add(key);
+    if (opts.confirmed) this.confirmed.add(key);
     this.entries.set(key, {
       model: { provider: model.provider, id: model.id },
       expiresAt: this.now() + this.ttlMs,
@@ -64,6 +72,12 @@ export class UnavailableModels {
    */
   refreshIfConfirmed(model: ModelRef): void {
     if (this.confirmed.has(modelKey(model))) this.mark(model);
+  }
+
+  /** An attempt on the model succeeded: it is served again. */
+  clear(model: ModelRef): void {
+    this.entries.delete(modelKey(model));
+    this.confirmed.delete(modelKey(model));
   }
 
   /** True while the model is inside its TTL. */
@@ -94,7 +108,10 @@ export function createRouteModel(opts: {
 }): RouteModel {
   const requester = opts.reviewFallbackModel;
   return async (role, routeOpts) => {
-    const routerRole = routerRoleFor(role);
+    // Native roles are routed as always. Any other worker role keeps running on
+    // the executor default and is mapped onto a router role only to choose a
+    // replacement for a model that is gone.
+    const routerRole = isRoleName(role) ? role : routeOpts?.replacement ? routerRoleFor(role) : undefined;
     if (!routerRole) return undefined;
     const exclude = [...opts.unavailable.list(), ...(routeOpts?.exclude ?? [])].map((model) => ({
       provider: model.provider,
@@ -125,9 +142,9 @@ export function createRouteModel(opts: {
 
 /**
  * Make a mission recovery probe follow the unavailable-model record: a model
- * the scheduler reports unavailable is marked (so routing, and with it the
- * probe's own target, move on), and a once-confirmed model the probe still
- * finds unlisted is re-marked when its TTL has run out.
+ * the scheduler reports unavailable gets a TTL-only mark (so routing, and with
+ * it the probe's own target, move on), and a gateway-confirmed model the probe
+ * still finds unlisted is re-marked when its TTL has run out.
  */
 export function followUnavailableModels(probe: RecoveryProbe, unavailable: UnavailableModels): RecoveryProbe {
   return {

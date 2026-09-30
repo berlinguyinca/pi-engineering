@@ -22,7 +22,7 @@ import { DEFAULT_POLICY } from "../../src/lifecycle/policy.ts";
 import { type ModelRecord, type ModelRef, modelKey } from "../../src/lifecycle/types.ts";
 import { type BrokerBackends, ExecutionBroker } from "../../src/orchestration/broker.ts";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
-import { type RouteModel, realBackends } from "../../src/orchestration/realBackends.ts";
+import { MAX_TRACKED_MISSIONS, realBackends } from "../../src/orchestration/realBackends.ts";
 import { MissionScheduler } from "../../src/orchestration/scheduler.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 import type { ProbeResult } from "../../src/resilience/probe.ts";
@@ -100,13 +100,20 @@ function gatewayWorker(
   gone: Set<string>,
   seen: WorkerRequest[],
   failure: WorkerRun = notFound,
-  session: ModelRef = SESSION,
+  executorDefault: ModelRef = SESSION,
+  reportsModel = false,
 ): WorkerExecutor {
   return {
     async run(req) {
       seen.push({ ...req });
-      const model = modelKey(req.modelOverride ?? session);
-      if (gone.has(model)) return failure;
+      const ran = req.modelOverride ?? executorDefault;
+      const model = modelKey(ran);
+      if (gone.has(model)) {
+        // A real PiWorkerExecutor names the model a failed attempt ran on.
+        return reportsModel
+          ? { ...failure, result: { ...failure.result, details: { model: { provider: ran.provider, id: ran.id } } } }
+          : failure;
+      }
       return req.role === "reviewer" ? reviewed() : workerRun({ status: "completed", summary: `done on ${model}` });
     },
   };
@@ -116,20 +123,26 @@ async function harness(opts: {
   pool: ModelRef[];
   gone: ModelRef[];
   failure?: WorkerRun;
-  routeModel?: RouteModel;
-  /** The session/executor default model (default SESSION). */
+  /** The session model (default SESSION). */
   session?: ModelRef;
+  /** The model the executor really runs unrouted work on (default: the session model). */
+  executorDefault?: ModelRef;
+  /** Whether a failed attempt names the model it ran on (as PiWorkerExecutor does). */
+  reportsModel?: boolean;
 }) {
   const session = opts.session ?? SESSION;
+  const executorDefault = opts.executorDefault ?? session;
   let now = 0;
   const unavailable = new UnavailableModels({ now: () => now });
-  const routeModel =
-    opts.routeModel ??
-    createRouteModel({ router: await realRouter(opts.pool), unavailable, reviewFallbackModel: session });
+  const routeModel = createRouteModel({
+    router: await realRouter(opts.pool),
+    unavailable,
+    reviewFallbackModel: session,
+  });
   const seen: WorkerRequest[] = [];
   const marks: Array<{ model: string; reason: string; missionId?: string; taskId?: string }> = [];
   const backends = realBackends({
-    worker: gatewayWorker(new Set(opts.gone.map(modelKey)), seen, opts.failure, session),
+    worker: gatewayWorker(new Set(opts.gone.map(modelKey)), seen, opts.failure, executorDefault, opts.reportsModel),
     verifier: {} as never,
     artifacts: { readContentByUri: async () => undefined } as never,
     git: null,
@@ -138,8 +151,9 @@ async function harness(opts: {
     reviewFallbackModel: session,
     onModelUnavailable: (model, context) => {
       marks.push({ model: modelKey(model), ...context });
-      unavailable.mark(model, context);
+      unavailable.mark(model, context, { confirmed: true });
     },
+    onModelServed: (model) => unavailable.clear(model),
     isModelUnavailable: (model) => unavailable.has(model),
   });
   return {
@@ -148,7 +162,7 @@ async function harness(opts: {
     marks,
     routeModel,
     unavailable,
-    models: () => seen.map((r) => modelKey(r.modelOverride ?? session)),
+    models: () => seen.map((r) => modelKey(r.modelOverride ?? executorDefault)),
     advance: (ms: number) => {
       now += ms;
     },
@@ -262,38 +276,74 @@ describe("model takeover: agent workers", () => {
     assert.deepEqual(h.unavailable.list(), []);
   });
 
-  it("routes roles the router names differently (investigator) and takes them over", async () => {
-    const h = await harness({ pool: [A, B], gone: [A] });
+  // Roles the router has no native role for keep running on the executor
+  // default on their first attempt, exactly as before; the router only picks
+  // the replacement once that model is gone.
+  it("an investigator's first attempt runs on the executor default; only its takeover is routed", async () => {
+    const h = await harness({ pool: [A, B], gone: [SESSION] });
     const outcome = await h.backends.agent.runAgent({ role: "investigator", objective: "x", signal: signal() });
     assert.equal(outcome.exitStatus, "succeeded");
-    assert.deepEqual(h.models(), [modelKey(A), modelKey(B)]);
-  });
-
-  it("maps worker roles onto router roles", async () => {
-    const h = await harness({ pool: [A], gone: [] });
-    for (const role of ["investigator", "scout", "debugger", "architecture-reviewer", "security-review"]) {
-      assert.deepEqual(await h.routeModel(role as WorkerRequest["role"]), A, role);
-    }
-  });
-
-  it("an unrouted worker on the executor default model hands over when that model is gone", async () => {
-    // Routing yields no placement until the default model is excluded.
-    const router = await realRouter([B]);
-    const routeModel: RouteModel = async (role, opts) =>
-      opts?.exclude?.some((m) => modelKey(m) === modelKey(SESSION)) ? router.route("implementer", {}) : undefined;
-    const h = await harness({ pool: [B], gone: [SESSION], routeModel });
-    const outcome = await h.backends.agent.runAgent({ role: "implementer", objective: "x", signal: signal() });
-    assert.equal(outcome.exitStatus, "succeeded");
-    assert.equal(h.seen[0]!.modelOverride, undefined, "first attempt ran on the executor default");
-    assert.deepEqual(h.models(), [modelKey(SESSION), modelKey(B)]);
+    assert.equal(h.seen[0]!.modelOverride, undefined, "first attempt: no model override");
+    assert.deepEqual(h.models(), [modelKey(SESSION), modelKey(A)]);
     assert.deepEqual(h.unavailable.list().map(modelKey), [modelKey(SESSION)]);
   });
 
-  it("the research backend takes over too", async () => {
+  it("an investigator on a healthy default is never routed", async () => {
+    const h = await harness({ pool: [A, B], gone: [] });
+    await h.backends.agent.runAgent({ role: "investigator", objective: "x", signal: signal() });
+    assert.deepEqual(
+      h.seen.map((r) => r.modelOverride),
+      [undefined],
+    );
+  });
+
+  it("maps worker roles onto router roles only when choosing a replacement", async () => {
+    const h = await harness({ pool: [A], gone: [] });
+    assert.deepEqual(await h.routeModel("implementer"), A, "native roles are routed as before");
+    for (const role of ["investigator", "scout", "debugger", "architecture-reviewer", "security-review"]) {
+      assert.equal(await h.routeModel(role), undefined, `${role}: first attempt stays on the executor default`);
+      assert.deepEqual(await h.routeModel(role, { replacement: true }), A, `${role}: replacement is routed`);
+    }
+  });
+
+  it("marks the model an unrouted attempt really ran on, not the assumed session model", async () => {
+    const D: ModelRef = { provider: "gw", id: "executor-default" };
+    const h = await harness({ pool: [A], gone: [D], executorDefault: D, reportsModel: true });
+    const outcome = await h.backends.agent.runAgent({ role: "investigator", objective: "x", signal: signal() });
+    assert.equal(outcome.exitStatus, "succeeded");
+    assert.deepEqual(h.models(), [modelKey(D), modelKey(A)]);
+    assert.deepEqual(h.unavailable.list().map(modelKey), [modelKey(D)], "the session model is left alone");
+  });
+
+  it("the outcome names the model the attempt ran on", async () => {
     const h = await harness({ pool: [A, B], gone: [A] });
+    const outcome = await h.backends.agent.runAgent({ role: "implementer", objective: "x", signal: signal() });
+    assert.deepEqual(outcome.model, B);
+  });
+
+  it("the research backend takes over too, starting on the executor default", async () => {
+    const h = await harness({ pool: [A, B], gone: [SESSION] });
     const outcome = await h.backends.research.runAgent({ objective: "look around", signal: signal() });
     assert.equal(outcome.exitStatus, "succeeded");
-    assert.deepEqual(h.models(), [modelKey(A), modelKey(B)]);
+    assert.equal(h.seen[0]!.modelOverride, undefined);
+    assert.deepEqual(h.models(), [modelKey(SESSION), modelKey(A)]);
+  });
+
+  it("forgets the producing models of old missions beyond a bound", async () => {
+    const h = await harness({ pool: [A, B, Z], gone: [] });
+    // Mission 0's implementer runs on A; then enough other missions to evict it.
+    await h.backends.agent.runAgent({ role: "implementer", objective: "x", missionId: "MSN-0", signal: signal() });
+    for (let i = 1; i <= MAX_TRACKED_MISSIONS; i++) {
+      await h.backends.agent.runAgent({ role: "implementer", objective: "x", missionId: `MSN-${i}`, signal: signal() });
+    }
+    const recent = await h.backends.review.runReview({
+      objective: "r",
+      missionId: `MSN-${MAX_TRACKED_MISSIONS}`,
+      signal: signal(),
+    });
+    assert.equal(recent.reviewEvidence?.model, B.id, "a tracked mission still avoids its producer A");
+    const evicted = await h.backends.review.runReview({ objective: "r", missionId: "MSN-0", signal: signal() });
+    assert.equal(evicted.reviewEvidence?.model, A.id, "the evicted mission's record is gone");
   });
 
   it("logs every mark with the mission, task and reason", () => {
@@ -452,17 +502,31 @@ describe("the recovery probe follows unavailable models", () => {
     reason: "model model-a is not served",
   };
 
-  it("a model reported unavailable by the scheduler is marked and logged", () => {
-    const unavailable = new UnavailableModels();
+  it("a model reported unavailable by the scheduler gets a TTL-only mark (never confirmed)", async () => {
+    let now = 0;
+    const unavailable = new UnavailableModels({ now: () => now });
     const probe = followUnavailableModels({ probe: async () => unlistedA }, unavailable);
     probe.reportModelUnavailable?.(A, { missionId: "MSN-1", taskId: "TSK-1", reason: "503" });
     assert.deepEqual(unavailable.list(), [A]);
+    now += MODEL_UNAVAILABLE_TTL_MS;
+    await probe.probe();
+    assert.equal(unavailable.has(A), false, "a 503 is heuristic: an unlisted alias is not excluded for good");
+  });
+
+  it("a model that serves an attempt again is unmarked and no longer confirmed", async () => {
+    const h = await harness({ pool: [A], gone: [] });
+    h.unavailable.mark(A, undefined, { confirmed: true });
+    h.advance(MODEL_UNAVAILABLE_TTL_MS);
+    const outcome = await h.backends.agent.runAgent({ role: "implementer", objective: "x", signal: signal() });
+    assert.equal(outcome.exitStatus, "succeeded");
+    h.unavailable.refreshIfConfirmed(A);
+    assert.equal(h.unavailable.has(A), false, "A came back: an unlisted answer no longer re-marks it");
   });
 
   it("an expired mark is refreshed when the probe still finds the model unlisted", async () => {
     let now = 0;
     const unavailable = new UnavailableModels({ now: () => now });
-    unavailable.mark(A);
+    unavailable.mark(A, undefined, { confirmed: true });
     now += MODEL_UNAVAILABLE_TTL_MS;
     assert.equal(unavailable.has(A), false, "the TTL expired during a long pause");
     const probe = followUnavailableModels({ probe: async () => unlistedA }, unavailable);

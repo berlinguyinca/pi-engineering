@@ -451,7 +451,9 @@ ${TOOL_TRANSITION_RULE}`;
             evidence_refs: [],
             new_hypotheses: [],
             proposed_tasks: [],
-            details: { transient_category: category, attempts },
+            // Name the model the attempt ran on: unrouted work runs on the
+            // executor default, and a model takeover must mark that model.
+            details: { transient_category: category, attempts, model: { provider: model.provider, id: model.id } },
             error: `transient:${category}`,
           },
           usage: null,
@@ -620,6 +622,14 @@ ${TOOL_TRANSITION_RULE}`;
       if (!guardAborted || !this.guardConfig.enabled) {
         // Non-guard failure (timeout, budget, gateway, no-result) — no recovery ladder.
         const gateway = lastAssistantError ? parseGatewayWait({ text: lastAssistantError }) : null;
+        // A 404 model_not_found usually arrives as an assistant-message error,
+        // not a throw, so the transient layer never saw it. Give it the same
+        // marker as the thrown path, so the mission hands the work to another
+        // model instead of failing on an unclassified error text.
+        const modelGone =
+          !gateway &&
+          lastAssistantError !== undefined &&
+          classifyError(lastAssistantError).category === "model_unavailable";
         const reason = budgetExhausted
           ? "Worker exceeded the hard context-token budget."
           : timedOut
@@ -633,9 +643,11 @@ ${TOOL_TRANSITION_RULE}`;
             ? "timeout"
             : gateway
               ? gatewayFailureMarker(gateway)
-              : isTruncatedStream(lastAssistantError)
-                ? "truncated_after_progress"
-                : (lastAssistantError ?? "no-result");
+              : modelGone
+                ? "transient:model_unavailable"
+                : isTruncatedStream(lastAssistantError)
+                  ? "truncated_after_progress"
+                  : (lastAssistantError ?? "no-result");
         return {
           result: {
             status: "failed",
@@ -644,7 +656,11 @@ ${TOOL_TRANSITION_RULE}`;
             evidence_refs: [],
             new_hypotheses: [],
             proposed_tasks: [],
-            details: gateway ? { gateway_wait: gateway, gateway_retries: gatewayRetries } : {},
+            details: gateway
+              ? { gateway_wait: gateway, gateway_retries: gatewayRetries }
+              : modelGone
+                ? { model: { provider: model.provider, id: model.id } }
+                : {},
             error,
           },
           usage: this.collectUsage(this.asMessages(session.messages)),
