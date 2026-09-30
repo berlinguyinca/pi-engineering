@@ -18,6 +18,7 @@ import { Orchestrator } from "../../src/orchestration/orchestrator.ts";
 import { MissionOwnership } from "../../src/orchestration/ownership.ts";
 import { MissionSupervisor } from "../../src/orchestration/supervisor.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
+import type { EngineeringRuntimeOptions } from "../../src/runtime/EngineeringRuntime.ts";
 import type { VerificationProvider } from "../../src/verify/Verifier.ts";
 import { PiWorkerExecutor } from "../../src/workers/PiWorkerExecutor.ts";
 import type { WorkerExecutor, WorkerRequest, WorkerRun } from "../../src/workers/WorkerExecutor.ts";
@@ -160,8 +161,8 @@ async function greenFixture() {
 // reviewer routes to a distinct model and these assertions see "independent".
 // A router that answers every role with the requester's own model is the
 // single-model deployment this suite describes, on any machine.
-const sameModelRouter = {
-  route: async (_role: string, query?: { requester?: { provider: string; id: string } }) => query?.requester,
+const sameModelRouter: NonNullable<EngineeringRuntimeOptions["roleRouter"]> = {
+  route: async (_role, query) => query?.requester,
 };
 
 async function repositoryState(root: string) {

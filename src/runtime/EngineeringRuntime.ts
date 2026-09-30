@@ -332,7 +332,9 @@ export interface EngineeringRuntimeOptions {
   /**
    * Route mission roles through this instead of a router built from the
    * agent dir's policy and discovered models. Hosts and tests that must not
-   * depend on the operator's installed providers supply their own.
+   * depend on the operator's installed providers supply their own. Only
+   * routing is replaced: without `model`, a Pi worker still discovers the
+   * review fallback model from its runtime.
    */
   roleRouter?: Pick<RoleRouterAdapter, "route">;
   /** Override the durable state directory (default: <repoRoot>/.pi-eng). */
