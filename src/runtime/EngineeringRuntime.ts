@@ -786,7 +786,8 @@ export class EngineeringRuntime {
         git: rt.git,
         cwd: repoRoot,
         routeModel,
-        onModelUnavailable: (route) => rt.unavailableModels.mark(route),
+        onModelUnavailable: (model, context) => rt.unavailableModels.mark(model, context),
+        isModelUnavailable: (model) => rt.unavailableModels.has(model),
         reviewFallbackModel,
         repository: async (repoId) => {
           if (repoId) {
