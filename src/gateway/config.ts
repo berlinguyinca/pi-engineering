@@ -14,7 +14,7 @@ import { describeAdmissionEvent } from "./admissionNotice.ts";
 export interface GatewayAdmissionConfig {
   enabled: boolean;
   /** Allow model-scoped gateway outages to change the active session model. */
-  modelFallbackEnabled?: boolean;
+  modelFallbackEnabled: boolean;
   /** Concurrent model sessions allowed before a gateway says otherwise. */
   maxConcurrency: number;
   /** Slots held back for the operator's own interactive turn. */
@@ -84,7 +84,8 @@ export function parseGatewayElapsedMs(value: string | undefined): number | null 
  *
  * Env vars:
  *   PI_GATEWAY_ADMISSION_ENABLED — "true"/"false" (default true)
- *   PI_GATEWAY_MODEL_FALLBACK_ENABLED — "true"/"false" (default false)
+ *   PI_GATEWAY_MODEL_FALLBACK_ENABLED — on only for 1/true/yes/on (any case); anything else,
+ *                                  including unset or a typo, is off (default false)
  *   PI_GATEWAY_MAX_CONCURRENCY   — int, concurrent model sessions (default 4)
  *   PI_GATEWAY_RESERVED_SLOTS    — int, slots kept for the interactive turn (default 1)
  *   PI_GATEWAY_MAX_WAIT_MS       — int, cap on one honoured wait (default: none)
@@ -100,6 +101,8 @@ export function resolveGatewayConfig(overrides?: Partial<GatewayAdmissionConfig>
   const env = typeof process !== "undefined" && process.env ? process.env : {};
 
   cfg.enabled = bool(env.PI_GATEWAY_ADMISSION_ENABLED, cfg.enabled);
+  // Deliberately not `bool(env, cfg.x)`: a safety-sensitive switch has no
+  // fallback to inherit — only an explicit affirmative turns it on.
   cfg.modelFallbackEnabled = optIn(env.PI_GATEWAY_MODEL_FALLBACK_ENABLED);
   cfg.maxConcurrency = Math.max(1, int(env.PI_GATEWAY_MAX_CONCURRENCY, cfg.maxConcurrency));
   cfg.reservedSlots = Math.max(0, int(env.PI_GATEWAY_RESERVED_SLOTS, cfg.reservedSlots));
