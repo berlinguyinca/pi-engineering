@@ -536,4 +536,147 @@ describe("MissionScheduler resilience (time-based gateway window)", () => {
       assert.equal(h.store.getMission(h.m.mission_id)!.status, "PAUSED_INFRASTRUCTURE");
     });
   });
+
+  // A task that ends terminally inside the resilience window must take the
+  // mission out of its WAITING_* park on EVERY path, or orchestrate() hits an
+  // illegal transition out of the parked state.
+  describe("terminal paths un-park the mission", () => {
+    function parked(
+      runAgent: NonNullable<BrokerBackends["agent"]>["runAgent"],
+      extra: Partial<ConstructorParameters<typeof MissionScheduler>[0]> = {},
+    ) {
+      const store = MissionStore.open(JsonlEventStore.inMemory());
+      const m = makeMission(store);
+      const t = store.createTask({ mission_id: m.mission_id, kind: "agent", role: "implementer", objective: "x" });
+      const clk = clock();
+      const scheduler = new MissionScheduler({
+        store,
+        broker: new ExecutionBroker({ store, backends: { agent: { runAgent } } }),
+        resilience: { ...testResilience, retry_window_ms: 60_000 },
+        probe: { probe: async () => ({ healthy: true }) },
+        now: clk.now,
+        sleep: clk.sleep,
+        rand: () => 0,
+        ...extra,
+      });
+      return { store, m, t, scheduler };
+    }
+
+    it("recovery STOP on a transient outcome", async () => {
+      const h = parked(async () => transientOutcome(), { recovery: { missionCeiling: 1 } });
+      await h.scheduler.runMission(h.m.mission_id);
+      assert.equal(h.store.getTask(h.t.task_id)!.status, "FAILED");
+      assert.equal(h.store.getMission(h.m.mission_id)!.status, "EXECUTING");
+    });
+
+    it("recovery STOP on a thrown failure after the mission parked", async () => {
+      let calls = 0;
+      const h = parked(
+        async () => {
+          if (calls++ === 0) return transientOutcome();
+          throw new Error("transient network failure");
+        },
+        { recovery: { missionCeiling: 1 } },
+      );
+      await h.scheduler.runMission(h.m.mission_id);
+      assert.equal(h.store.getTask(h.t.task_id)!.status, "FAILED");
+      assert.equal(h.store.getMission(h.m.mission_id)!.status, "EXECUTING");
+    });
+
+    it("dispatch authority lost while parked (task BLOCKED)", async () => {
+      let acquired = 0;
+      const h = parked(async () => transientOutcome(), {
+        acquireAuthority: async () => {
+          if (acquired++ > 0) throw new Error("lease lost");
+          return undefined as never;
+        },
+      });
+      await h.scheduler.runMission(h.m.mission_id);
+      assert.equal(h.store.getTask(h.t.task_id)!.status, "BLOCKED");
+      assert.equal(h.store.getMission(h.m.mission_id)!.status, "EXECUTING");
+    });
+
+    it("task canceled underneath a running attempt", async () => {
+      let calls = 0;
+      const box: { store?: MissionStore; taskId?: string } = {};
+      const h = parked(async () => {
+        if (calls++ === 0) return transientOutcome();
+        box.store!.transitionTask(box.taskId!, "CANCELED");
+        return successOutcome;
+      });
+      box.store = h.store;
+      box.taskId = h.t.task_id;
+      await h.scheduler.runMission(h.m.mission_id);
+      assert.equal(h.store.getTask(h.t.task_id)!.status, "CANCELED");
+      assert.equal(h.store.getMission(h.m.mission_id)!.status, "EXECUTING");
+    });
+
+    it("task canceled underneath an attempt that then throws", async () => {
+      let calls = 0;
+      const box: { store?: MissionStore; taskId?: string } = {};
+      const h = parked(async () => {
+        if (calls++ === 0) return transientOutcome();
+        box.store!.transitionTask(box.taskId!, "CANCELED");
+        throw new Error("worker torn down");
+      });
+      box.store = h.store;
+      box.taskId = h.t.task_id;
+      await h.scheduler.runMission(h.m.mission_id);
+      assert.equal(h.store.getTask(h.t.task_id)!.status, "CANCELED");
+      assert.equal(h.store.getMission(h.m.mission_id)!.status, "EXECUTING");
+    });
+
+    it("two tasks: A fails while B is still retrying, then B succeeds and the mission un-parks", async () => {
+      const store = MissionStore.open(JsonlEventStore.inMemory());
+      const m = makeMission(store);
+      const a = store.createTask({ mission_id: m.mission_id, kind: "agent", role: "implementer", objective: "a" });
+      const b = store.createTask({ mission_id: m.mission_id, kind: "agent", role: "reviewer", objective: "b" });
+      let bCalls = 0;
+      let releaseProbe!: () => void;
+      const aSettled = new Promise<void>((resolve) => {
+        releaseProbe = resolve;
+      });
+      const missionWhenAFailed: string[] = [];
+      const clk = clock();
+      const scheduler = new MissionScheduler({
+        store,
+        broker: new ExecutionBroker({
+          store,
+          backends: {
+            agent: {
+              runAgent: async ({ objective }) => {
+                if (objective === "b") return bCalls++ === 0 ? transientOutcome() : successOutcome;
+                // A fails for good only once B sits parked in its retry window.
+                while (store.getTask(b.task_id)!.status !== "RETRYING") {
+                  await new Promise((resolve) => setTimeout(resolve, 1));
+                }
+                return { ...modelNotFound, error: "permanent" };
+              },
+            },
+          },
+        }),
+        resilience: { ...testResilience, retry_window_ms: 60_000 },
+        // B's gate holds on the probe until A has settled.
+        probe: {
+          probe: async () => {
+            await aSettled;
+            return { healthy: true };
+          },
+        },
+        now: clk.now,
+        sleep: clk.sleep,
+        rand: () => 0,
+        onTaskSettled: (missionId, taskId) => {
+          if (taskId !== a.task_id) return;
+          missionWhenAFailed.push(store.getMission(missionId)!.status);
+          releaseProbe();
+        },
+      });
+      await scheduler.runMission(m.mission_id);
+      assert.equal(store.getTask(a.task_id)!.status, "FAILED");
+      assert.equal(store.getTask(b.task_id)!.status, "SUCCEEDED");
+      assert.deepEqual(missionWhenAFailed, ["WAITING_FOR_LLM"], "B was still retrying, so A's failure kept the park");
+      assert.equal(store.getMission(m.mission_id)!.status, "EXECUTING");
+    });
+  });
 });

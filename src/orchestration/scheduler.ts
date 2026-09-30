@@ -412,6 +412,12 @@ export class MissionScheduler {
     try {
       await this.executeWithRetry(task, signal);
     } finally {
+      // Whatever path ended the task, a terminal task leaves the resilience
+      // window (a paused task stays RETRYING and keeps its park).
+      const status = this.store.getTask(task.task_id)?.status;
+      if (status && ["SUCCEEDED", "FAILED", "BLOCKED", "CANCELED", "SKIPPED"].includes(status)) {
+        this.leaveResilienceWindow(task);
+      }
       this.release(task);
       this.onTaskSettled?.(task.mission_id, task.task_id, this.store.getTask(task.task_id)?.status ?? "FAILED");
     }
@@ -446,7 +452,6 @@ export class MissionScheduler {
         this.store.transitionTask(task.task_id, "BLOCKED", "system", {
           failure_reason: error instanceof Error ? error.message : String(error),
         });
-        this.leaveResilienceWindow(task);
         return;
       }
       let handle: ExecutionHandle | undefined;
@@ -506,7 +511,6 @@ export class MissionScheduler {
             this.settleTaskRecoveries(task, "failed");
             this.recordTerminalFailure(task, ceiling, handle.executionId, outcome.error);
             this.store.transitionTask(task.task_id, "FAILED", "system", { failure_reason: ceiling });
-            this.leaveResilienceWindow(task);
             return;
           }
           if (infraCat) {
@@ -527,7 +531,6 @@ export class MissionScheduler {
                 this.settleTaskRecoveries(task, "failed");
                 this.recordTerminalFailure(task, recoveryStop, handle.executionId, outcome.error);
                 this.store.transitionTask(task.task_id, "FAILED", "system", { failure_reason: recoveryStop });
-                this.leaveResilienceWindow(task);
                 return;
               }
               authority?.assertAuthoritative();
@@ -554,7 +557,6 @@ export class MissionScheduler {
           this.store.transitionTask(task.task_id, "FAILED", "system", {
             failure_reason: `backend reported ${outcome.exitStatus}${detail}`,
           });
-          this.leaveResilienceWindow(task);
           return;
         }
         // Success: clear the resilience window, close the breaker, and resume the
@@ -621,7 +623,6 @@ export class MissionScheduler {
               err instanceof Error ? err.message : String(err),
             );
             this.store.transitionTask(task.task_id, "FAILED", "system", { failure_reason: recoveryStop });
-            this.leaveResilienceWindow(task);
             return;
           }
           authority?.assertAuthoritative();
@@ -637,7 +638,6 @@ export class MissionScheduler {
           err instanceof Error ? err.message : String(err),
         );
         this.store.transitionTask(task.task_id, "FAILED", "system", { failure_reason: reason });
-        this.leaveResilienceWindow(task);
         return;
       } finally {
         const closeError = await authority?.close();
@@ -938,7 +938,7 @@ export class MissionScheduler {
   }
 
   /**
-   * A task ended terminally (FAILED/BLOCKED). Drop its resilience bookkeeping
+   * A task ended terminally (any terminal status). Drop its resilience bookkeeping
    * and un-park the mission from any WAITING_* or RECOVERING_* state the window
    * put it in, so the orchestrator's normal failure handling runs instead of
    * hitting an illegal transition out of the parked state.
