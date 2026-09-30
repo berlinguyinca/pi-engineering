@@ -32,7 +32,7 @@ import { MissionObservability } from "../orchestration/observability/MissionObse
 import { Orchestrator } from "../orchestration/orchestrator.ts";
 import type { PlanTaskInput } from "../orchestration/orchestrator.ts";
 import { MissionOwnership } from "../orchestration/ownership.ts";
-import { type ModelRoute, realBackends } from "../orchestration/realBackends.ts";
+import { type RouteModel, realBackends } from "../orchestration/realBackends.ts";
 import { FailureClassifier } from "../orchestration/recovery.ts";
 import { RepositoryRegistry } from "../orchestration/repositoryRegistry.ts";
 import { canTransitionMission } from "../orchestration/state.ts";
@@ -55,6 +55,7 @@ import { buildCoreTools } from "../tools/coreTools.ts";
 import { CommandVerifier, type VerificationProvider, type VerifyOutcome } from "../verify/Verifier.ts";
 import { PiWorkerExecutor } from "../workers/PiWorkerExecutor.ts";
 import type { WorkerExecutor, WorkerRequest } from "../workers/WorkerExecutor.ts";
+import { UnavailableModels, createRouteModel } from "./modelRouting.ts";
 
 /**
  * Build the mission gateway recovery probe.
@@ -68,7 +69,7 @@ import type { WorkerExecutor, WorkerRequest } from "../workers/WorkerExecutor.ts
  */
 function buildGatewayRecoveryProbe(
   worker: WorkerExecutor,
-  routeModel: ((role: WorkerRequest["role"]) => Promise<ModelRoute | undefined>) | undefined,
+  routeModel: RouteModel | undefined,
 ): RecoveryProbe | undefined {
   const url = process.env.PI_GATEWAY_HEALTH_URL;
   if (url) return new HttpRecoveryProbe({ baseUrl: url, timeoutMs: 5_000 });
@@ -451,6 +452,12 @@ export class EngineeringRuntime {
    * beside the orchestrator; the orchestrator remains authoritative.
    */
   resilience: import("../resilience/config.ts").GatewayResilienceConfig;
+  /**
+   * Models the gateway confirmed it no longer serves (a mission worker got
+   * model_not_found). Mission routing excludes them for a TTL so another model
+   * takes over; the interactive session model is not affected.
+   */
+  readonly unavailableModels = new UnavailableModels();
   private readonly onPhase: ((event: RuntimePhaseEvent) => void) | null;
   private readonly onMissionSnapshotError: ((message: string) => void) | null;
   private readonly onMissionActivity: ((event: RuntimeMissionActivityEvent) => void) | null;
@@ -745,11 +752,10 @@ export class EngineeringRuntime {
       // is honored by the mission pipeline, matching the lifecycle roleRunner
       // path. Degrades to the worker's construction-time default model when the
       // router cannot be built, so core never requires discovery or network.
-      let routeModel: ((role: WorkerRequest["role"]) => Promise<ModelRoute | undefined>) | undefined;
+      let routeModel: RouteModel | undefined;
       let reviewFallbackModel = opts.model ? { provider: opts.model.provider, id: opts.model.id } : undefined;
       try {
         const { createRoleRouter } = await import("../capability/adapter.ts");
-        const { isRoleName } = await import("../capability/roles.ts");
         const sharedRuntime = rt.worker instanceof PiWorkerExecutor ? await rt.worker.getModelRuntime() : undefined;
         if (!reviewFallbackModel && sharedRuntime) {
           const available = (await sharedRuntime.getAvailable())[0];
@@ -763,30 +769,13 @@ export class EngineeringRuntime {
             modelRuntime: sharedRuntime,
             allowModelNetwork: false,
           }));
-        routeModel = async (role) => {
-          if (!isRoleName(role)) return undefined;
-          try {
-            const routed = await routerAdapter.route(
-              role,
-              reviewFallbackModel ? { requester: reviewFallbackModel } : undefined,
-            );
-            if (
-              role === "reviewer" &&
-              routed &&
-              reviewFallbackModel &&
-              routed.provider === reviewFallbackModel.provider &&
-              routed.id === reviewFallbackModel.id
-            ) {
-              return {
-                ...routed,
-                warning: `Warning: no distinct reviewer model is available; reviewing with ${routed.provider}/${routed.id} in a fresh session with reduced independence.`,
-              };
-            }
-            return routed;
-          } catch {
-            return undefined;
-          }
-        };
+        // Models the gateway stopped serving are excluded for a TTL, so a
+        // mission's workers (and the recovery probe) move to another model.
+        routeModel = createRouteModel({
+          router: routerAdapter,
+          unavailable: rt.unavailableModels,
+          reviewFallbackModel,
+        });
       } catch {
         routeModel = undefined;
       }
@@ -797,6 +786,7 @@ export class EngineeringRuntime {
         git: rt.git,
         cwd: repoRoot,
         routeModel,
+        onModelUnavailable: (route) => rt.unavailableModels.mark(route),
         reviewFallbackModel,
         repository: async (repoId) => {
           if (repoId) {

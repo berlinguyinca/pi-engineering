@@ -42,7 +42,14 @@ export interface RealBackendsOptions {
    * model placement (a pinned implementer/reviewer) take effect in the mission
    * pipeline, matching the lifecycle `roleRunner` path.
    */
-  routeModel?: (role: WorkerRequest["role"]) => Promise<ModelRoute | undefined>;
+  routeModel?: RouteModel;
+  /**
+   * Called when the gateway confirmed it no longer serves a routed model (the
+   * worker failed with `transient:model_unavailable`). The runtime records it
+   * so later routing excludes it; the attempt itself is handed to the next
+   * eligible model right away (see runWithModelTakeover).
+   */
+  onModelUnavailable?: (route: ModelRoute) => void;
   /** Current/session model used when review cannot be placed on a distinct model. */
   reviewFallbackModel?: { provider: string; id: string };
   /** Resolve the repository selected by the current mission's async binding. */
@@ -55,6 +62,19 @@ export interface ModelRoute {
   /** Operator-visible notice when policy had to degrade model separation. */
   warning?: string;
 }
+
+export interface RouteModelOptions {
+  /** Models not to place the role on (already tried in this execution). */
+  exclude?: ModelRoute[];
+}
+
+/** Resolve a worker role to a model placement, or undefined for the executor default. */
+export type RouteModel = (role: WorkerRequest["role"], opts?: RouteModelOptions) => Promise<ModelRoute | undefined>;
+
+/** The worker failure marker for a model the gateway does not serve (404 model_not_found). */
+const MODEL_UNAVAILABLE = "transient:model_unavailable";
+
+const routeKey = (route: ModelRoute): string => `${route.provider}/${route.id}`;
 
 async function artifactContentHashes(
   store: ArtifactStore,
@@ -228,6 +248,48 @@ export function realBackends(opts: RealBackendsOptions) {
       input.signal.removeEventListener("abort", markAborted);
     }
   };
+  /**
+   * Run a worker on `route`; while the gateway answers model_unavailable,
+   * record the model as unavailable, re-route with every tried model
+   * excluded, and rerun on the replacement in a fresh session. Stops on
+   * success, any other outcome, or when no new model is offered (the last
+   * model_unavailable outcome is then returned, so the task fails as before).
+   * Every switch is announced as activity and prefixed to the summary.
+   */
+  const runWithModelTakeover = async (
+    req: WorkerRequest,
+    input: { signal: AbortSignal; onActivity?: (event: WorkerActivity) => void },
+    initial: ModelRoute | undefined,
+    freshSessionId: () => string,
+  ): Promise<{ run: Awaited<ReturnType<WorkerExecutor["run"]>>; route: ModelRoute | undefined }> => {
+    let route = initial;
+    if (route) req.modelOverride = { provider: route.provider, id: route.id };
+    let run = await runWorker(req, input);
+    const tried: ModelRoute[] = [];
+    const switches: string[] = [];
+    while (route && opts.routeModel && outcomeOf(run).error === MODEL_UNAVAILABLE && !input.signal.aborted) {
+      const failed: ModelRoute = route;
+      opts.onModelUnavailable?.(failed);
+      tried.push(failed);
+      const next = await opts.routeModel(req.role, { exclude: tried });
+      if (!next || tried.some((model) => routeKey(model) === routeKey(next))) break;
+      const notice = `model ${routeKey(failed)} is no longer served — switched ${req.role} to ${routeKey(next)}`;
+      switches.push(notice);
+      try {
+        input.onActivity?.({ kind: "state", phase: "started", summary: notice, meaningfulProgress: false });
+      } catch {
+        // Activity consumers are observers, never participants.
+      }
+      route = next;
+      req.sessionId = freshSessionId();
+      req.modelOverride = { provider: next.provider, id: next.id };
+      run = await runWorker(req, input);
+    }
+    if (switches.length > 0) {
+      run = { ...run, result: { ...run.result, summary: `${switches.join("; ")}. ${run.result.summary}` } };
+    }
+    return { run, route };
+  };
   return {
     agent: {
       async runAgent(input: {
@@ -267,9 +329,9 @@ export function realBackends(opts: RealBackendsOptions) {
         // Place the worker on the model the capability router chose for this
         // role (honours `policy.routing.roles`); fall back to the executor
         // default when routing is unavailable or the role is unknown.
-        const modelRoute = await opts.routeModel?.(req.role);
-        if (modelRoute) req.modelOverride = { provider: modelRoute.provider, id: modelRoute.id };
-        const run = await runWorker(req, input);
+        // A model the gateway no longer serves is handed over to the next
+        // eligible one in this same execution.
+        const { run } = await runWithModelTakeover(req, input, await opts.routeModel?.(req.role), () => id("WKS"));
         return outcomeOf(run);
       },
     },
@@ -375,16 +437,12 @@ export function realBackends(opts: RealBackendsOptions) {
           sessionId: reviewerSessionId,
           resultTool: "review_result",
         };
-        const routed = await opts.routeModel?.(req.role);
-        const modelRoute = routed ?? opts.reviewFallbackModel;
-        const fallbackWarning = routed
-          ? routed.warning
+        const initiallyRouted = await opts.routeModel?.(req.role);
+        const fallbackWarning = initiallyRouted
+          ? initiallyRouted.warning
           : opts.reviewFallbackModel
             ? `Warning: no distinct reviewer model is available; reviewing with ${opts.reviewFallbackModel.provider}/${opts.reviewFallbackModel.id} in a fresh session with reduced independence.`
             : "Warning: no distinct reviewer model is available; reviewing with the current worker model in a fresh session with reduced independence.";
-        if (modelRoute) {
-          req.modelOverride = { provider: modelRoute.provider, id: modelRoute.id };
-        }
         if (fallbackWarning) {
           input.onActivity?.({
             kind: "execution",
@@ -394,7 +452,25 @@ export function realBackends(opts: RealBackendsOptions) {
             meaningfulProgress: false,
           });
         }
-        const run = await runWorker(req, input);
+        // A reviewer model the gateway no longer serves is handed over too.
+        // Independence is judged on the model that actually reviewed: after a
+        // takeover that is always a routed model, with its own warning.
+        const takeover = await runWithModelTakeover(req, input, initiallyRouted ?? opts.reviewFallbackModel, () =>
+          id("RVS"),
+        );
+        const run = takeover.run;
+        const modelRoute = takeover.route;
+        const tookOver = takeover.route !== (initiallyRouted ?? opts.reviewFallbackModel);
+        const routed = tookOver ? takeover.route : initiallyRouted;
+        if (tookOver && routed?.warning) {
+          input.onActivity?.({
+            kind: "execution",
+            stage: "review",
+            phase: "started",
+            summary: routed.warning,
+            meaningfulProgress: false,
+          });
+        }
         const outcome = outcomeOf(run);
         // If the reviewer emitted structured findings, normalize and surface them
         // so the completion gate can block on blocking findings. Handles three
@@ -449,7 +525,7 @@ export function realBackends(opts: RealBackendsOptions) {
         }
         const artifactEvidence = await artifactContentHashes(opts.artifacts, outcome.artifactRefs);
         outcome.reviewEvidence = {
-          reviewerSessionId,
+          reviewerSessionId: req.sessionId ?? reviewerSessionId,
           model: modelRoute?.id ?? "",
           provider: modelRoute?.provider ?? "",
           verdict: verdict === "approve" ? "approve" : "request_changes",
