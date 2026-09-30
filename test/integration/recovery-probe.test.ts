@@ -66,12 +66,17 @@ describe("CatalogRecoveryProbe: authenticated model listing", () => {
       const noSlots = await probe.probe();
       assert.equal(noSlots.healthy, false);
       assert.match(noSlots.reason ?? "", /no capacity/);
+      assert.equal(noSlots.model_unlisted, undefined, "listed without capacity is an outage, not an unlisting");
 
       state.models = [{ id: "other-model", slots: 4 }];
-      assert.equal((await probe.probe()).healthy, false, "the mission's model is not served");
+      const unlisted = await probe.probe();
+      assert.equal(unlisted.healthy, false, "the mission's model is not served");
+      assert.equal(unlisted.model_unlisted, true, "the gateway answered without the model");
 
       state.down = true;
-      assert.equal((await probe.probe()).healthy, false, "unreachable");
+      const down = await probe.probe();
+      assert.equal(down.healthy, false, "unreachable");
+      assert.equal(down.model_unlisted, undefined, "an unreachable gateway says nothing about the listing");
     });
     assert.ok(
       seen.every((h) => h === "Bearer secret"),

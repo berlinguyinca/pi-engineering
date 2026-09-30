@@ -31,6 +31,11 @@ import { canonicalizeWriteDomain } from "./workset.ts";
 /** Real clock/sleep for production; tests inject deterministic fakes. */
 const realNow = (): number => Date.now();
 const realSleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+/**
+ * Consecutive "gateway up, model not listed" probes before one real attempt is
+ * let through the probe gate (issue #76).
+ */
+export const UNLISTED_PROBES_BEFORE_VERIFY = 3;
 
 type AbortableResult<T> = { aborted: true } | { aborted: false; value: T };
 
@@ -203,6 +208,8 @@ export class MissionScheduler {
   private readonly relaunches = new Map<string, number>();
   /** Per-task circuit breaker (prevents a request storm during recovery). */
   private readonly breakers = new Map<string, CircuitBreaker>();
+  /** Consecutive "model not listed" probe answers per task (see probeGate). */
+  private readonly unlistedProbes = new Map<string, number>();
   /** In-flight runners, retained so mission cancellation can await cleanup. */
   private readonly activeRuns = new Map<string, Set<Promise<void>>>();
 
@@ -217,6 +224,10 @@ export class MissionScheduler {
     // are injectable for deterministic fault-injection tests.
     this.resilience = opts.resilience ?? resolveGatewayResilienceConfig();
     this.probe = opts.probe ?? healthyProbe();
+    // For a Pi worker the runtime injects its CatalogRecoveryProbe (or an
+    // HttpRecoveryProbe for PI_GATEWAY_HEALTH_URL), so this is true in
+    // production even when the catalog probe has no target to ask: that
+    // answer is a non-authoritative "healthy" and passes straight through.
     this.hasRealProbe = opts.probe !== undefined;
     this.clockNow = opts.now ?? realNow;
     this.sleepFn = opts.sleep ?? realSleep;
@@ -751,7 +762,25 @@ export class MissionScheduler {
     const probed = await this.abortable(this.probe.probe(), signal);
     if (probed.aborted) return "aborted";
     const result = probed.value;
-    if (result.healthy) return "proceed";
+    if (result.healthy) {
+      this.unlistedProbes.delete(task.task_id);
+      return "proceed";
+    }
+    // The gateway is up but does not list the model. That never clears if the
+    // model was removed, and does not matter for a legacy alias that still
+    // routes, so after a few in a row let one real attempt through: a removed
+    // model then fails fast with model_not_found instead of pausing forever,
+    // and an alias simply runs. Auto-resume still requires a listed model.
+    if (result.model_unlisted) {
+      const unlisted = (this.unlistedProbes.get(task.task_id) ?? 0) + 1;
+      if (unlisted >= UNLISTED_PROBES_BEFORE_VERIFY) {
+        this.unlistedProbes.delete(task.task_id);
+        return "proceed";
+      }
+      this.unlistedProbes.set(task.task_id, unlisted);
+    } else {
+      this.unlistedProbes.delete(task.task_id);
+    }
     // Gateway still down: honour the reported wait (else the probe interval),
     // then re-probe without a real attempt.
     const waitMs = result.retry_after_ms ?? cfg.probe_interval_ms;

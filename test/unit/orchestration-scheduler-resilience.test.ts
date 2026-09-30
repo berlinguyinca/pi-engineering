@@ -314,4 +314,68 @@ describe("MissionScheduler resilience (time-based gateway window)", () => {
     const failed = store.getTask(t.task_id) as unknown as { failure_reason?: string };
     assert.match(failed.failure_reason ?? "", /model_not_found/);
   });
+  // Issue #76: a gateway that answers but no longer lists the mission's model
+  // said "not served" forever, so no worker ran, model_not_found never
+  // surfaced, and the mission paused instead of failing.
+  const unlisted = { healthy: false, reason: "model m is not served", authoritative: true, model_unlisted: true };
+  const modelNotFound = {
+    executionId: "e",
+    exitStatus: "failed" as const,
+    summary: 'Worker failed after 2 attempt(s): 404: {"code":"model_not_found"}',
+    artifactRefs: [],
+    usage: {},
+    error: "transient:model_unavailable",
+  };
+
+  function unlistedScheduler(
+    outcomes: Array<ReturnType<typeof transientOutcome> | typeof successOutcome | typeof modelNotFound>,
+    probeResult: Record<string, unknown>,
+  ) {
+    const store = MissionStore.open(JsonlEventStore.inMemory());
+    const m = makeMission(store);
+    const t = store.createTask({ mission_id: m.mission_id, kind: "agent", role: "implementer", objective: "x" });
+    let calls = 0;
+    const backends: BrokerBackends = {
+      agent: { runAgent: async () => outcomes[Math.min(calls++, outcomes.length - 1)]! },
+    };
+    const clk = clock();
+    const scheduler = new MissionScheduler({
+      store,
+      broker: new ExecutionBroker({ store, backends }),
+      resilience: testResilience,
+      probe: { probe: async () => probeResult as never },
+      now: clk.now,
+      sleep: clk.sleep,
+      rand: () => 0,
+    });
+    return { store, m, t, scheduler, calls: () => calls };
+  }
+
+  it("a model removed from the catalog mid-outage fails with model_not_found instead of pausing", async () => {
+    const { store, m, t, scheduler, calls } = unlistedScheduler([transientOutcome(), modelNotFound], unlisted);
+    await scheduler.runMission(m.mission_id);
+    assert.equal(calls(), 2, "one verification attempt was let through the probe gate");
+    assert.equal(store.getTask(t.task_id)!.status, "FAILED");
+    assert.notEqual(store.getMission(m.mission_id)!.status, "PAUSED_INFRASTRUCTURE");
+    const failed = store.getTask(t.task_id) as unknown as { failure_reason?: string };
+    assert.match(failed.failure_reason ?? "", /model_not_found/);
+  });
+
+  it("a legacy alias that routes but is not listed completes instead of pausing", async () => {
+    const { store, m, t, scheduler, calls } = unlistedScheduler([transientOutcome(), successOutcome], unlisted);
+    await scheduler.runMission(m.mission_id);
+    assert.equal(calls(), 2);
+    assert.equal(store.getTask(t.task_id)!.status, "SUCCEEDED");
+  });
+
+  it("a gateway that is down (not merely unlisting the model) gets no verification attempt", async () => {
+    const { store, m, scheduler, calls } = unlistedScheduler([transientOutcome()], {
+      healthy: false,
+      reason: "gateway unreachable: ECONNREFUSED",
+      authoritative: true,
+    });
+    await scheduler.runMission(m.mission_id);
+    assert.equal(calls(), 1, "only the original attempt; the gate waited out the outage");
+    assert.equal(store.getMission(m.mission_id)!.status, "PAUSED_INFRASTRUCTURE");
+  });
 });

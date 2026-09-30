@@ -21,6 +21,13 @@ export interface ProbeResult {
   retry_after_ms?: number;
   /** True when the probe is authoritative (real health check vs. default). */
   authoritative?: boolean;
+  /**
+   * The gateway answered but does not list the mission's model. Unlike an
+   * outage this may never clear (the model was removed) or may not matter (a
+   * legacy alias that still routes), so the scheduler lets a verification
+   * attempt through after a few of these rather than waiting forever.
+   */
+  model_unlisted?: boolean;
 }
 
 /** A probe adapter: answer "is the gateway ready for a real request?" */
@@ -158,7 +165,14 @@ export class CatalogRecoveryProbe implements RecoveryProbe {
       if (!target.modelId) return { healthy: true, authoritative: true };
       const rows = Array.isArray(body?.data) ? (body.data as Array<Record<string, unknown>>) : [];
       const row = rows.find((r) => r && typeof r === "object" && r.id === target.modelId);
-      if (!row) return { healthy: false, reason: `model ${target.modelId} is not served`, authoritative: true };
+      if (!row) {
+        return {
+          healthy: false,
+          reason: `model ${target.modelId} is not served`,
+          authoritative: true,
+          model_unlisted: true,
+        };
+      }
       if (typeof row.slots === "number" && row.slots <= 0) {
         return { healthy: false, reason: `model ${target.modelId} has no capacity (0 slots)`, authoritative: true };
       }
