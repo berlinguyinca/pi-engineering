@@ -131,6 +131,8 @@ export interface ExecutionOutcome {
   recoveredMerged?: RecoveredMerge[];
   /** Content hashes of accessible artifacts produced by this backend. */
   artifactHashes?: string[];
+  /** The model the attempt ran on, when the backend knows it. */
+  model?: { provider: string; id: string };
   validationEvidence?: Pick<
     ValidationEvidence,
     "command" | "profile" | "exitCode" | "testSummary" | "noTargets" | "accessible" | "acceptanceResults"
@@ -244,6 +246,9 @@ export interface AgentRunner {
     modelRequirements?: Record<string, unknown>;
     recovery?: CheckpointRecoveryContext;
     deliverables?: readonly string[];
+    /** Owning mission and task, for model bookkeeping and operator logs. */
+    missionId?: string;
+    taskId?: string;
     signal: AbortSignal;
     onActivity?: (event: WorkerActivity) => void;
   }): Promise<ExecutionOutcome>;
@@ -283,6 +288,9 @@ export interface ReviewRunner {
     contextRef?: string;
     acceptanceCriteria?: Array<{ acceptanceId: string; criterion: string }>;
     worktree?: string | null;
+    /** Owning mission and task: the reviewer avoids the mission's producing models. */
+    missionId?: string;
+    taskId?: string;
     signal: AbortSignal;
     onActivity?: (event: WorkerActivity) => void;
   }): Promise<ExecutionOutcome & { findings?: Array<Record<string, unknown>> }>;
@@ -2838,6 +2846,8 @@ export class ExecutionBroker {
             modelRequirements: input.modelRequirements,
             recovery,
             deliverables: input.deliverables,
+            missionId: input.missionId,
+            taskId: input.taskId,
             signal,
             onActivity: base.onActivity,
           }),
@@ -2869,6 +2879,8 @@ export class ExecutionBroker {
             contextRef: input.contextRef,
             acceptanceCriteria: input.acceptanceCriteria,
             worktree: candidatePath ?? null,
+            missionId: input.missionId,
+            taskId: input.taskId,
             signal,
             onActivity: base.onActivity,
           }),

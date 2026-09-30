@@ -461,14 +461,6 @@ export function escalateSyntheticWait(signal: GatewayWaitSignal, attempt: number
 }
 
 /**
- * The worker failure marker for a gateway wait budget that ran out.
- *
- * A flattened refusal is the same failure the transient layer sees when it is
- * thrown, so it exhausts into the same `transient:server_unavailable` marker —
- * the scheduler's resilience window then waits out a long warm-up instead of
- * failing the task. Everything else keeps its `gateway:<reason>` marker.
- */
-/**
  * Does this wait carry POSITIVE evidence of a transient condition, the kind
  * that can last hours and does clear (a model reloading or moving GPUs,
  * capacity_unavailable, a gateway restart, a queue timeout)? Only those earn
@@ -488,6 +480,11 @@ export function isLongWaitTransient(signal: GatewayWaitSignal): boolean {
   return signal.status === 429 || signal.status === 503 || signal.status === 529;
 }
 
+/**
+ * The worker failure marker for a gateway wait budget that ran out: a
+ * `transient:*` marker for a long-wait transient (the scheduler's resilience
+ * window takes over), else `gateway:<reason>`, which fails the task.
+ */
 export function gatewayFailureMarker(signal: GatewayWaitSignal): string {
   // A retryable wait that outlasted the worker's own budget is transient
   // infrastructure: the mission scheduler owns the long wait (hours, with

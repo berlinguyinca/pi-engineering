@@ -34,6 +34,32 @@ export function isRoleName(value: string): value is RoleName {
   return (ROLE_NAMES as readonly string[]).includes(value);
 }
 
+/**
+ * Worker roles the router has no role for, mapped onto the closest one:
+ * read-only exploration and design onto the planner, code-writing roles onto
+ * the implementer, and the short review names onto their reviewer roles.
+ */
+const WORKER_ROLE_ALIASES: Readonly<Record<string, RoleName>> = {
+  scout: "planner",
+  investigator: "planner",
+  summarizer: "planner",
+  "test-designer": "planner",
+  debugger: "implementer",
+  "test-generator": "implementer",
+  "clean-room-challenger": "implementer",
+  worker: "implementer",
+  "security-review": "security_reviewer",
+  "performance-review": "performance_reviewer",
+};
+
+/** The router role for a worker role (e.g. `architecture-reviewer` -> `architecture_reviewer`). */
+export function routerRoleFor(role: string): RoleName | undefined {
+  if (isRoleName(role)) return role;
+  const snake = role.replaceAll("-", "_");
+  if (isRoleName(snake)) return snake;
+  return WORKER_ROLE_ALIASES[role];
+}
+
 const READ_ONLY_TOOLS = [
   "read",
   "grep",

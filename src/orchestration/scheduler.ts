@@ -18,7 +18,7 @@ import { CircuitBreaker } from "../resilience/circuitBreaker.ts";
 import type { InfraErrorCategory } from "../resilience/classify.ts";
 import { CATEGORY_TO_STATE } from "../resilience/classify.ts";
 import { type GatewayResilienceConfig, resolveGatewayResilienceConfig } from "../resilience/config.ts";
-import { type RecoveryProbe, healthyProbe } from "../resilience/probe.ts";
+import { type ProbeResult, type RecoveryProbe, healthyProbe } from "../resilience/probe.ts";
 import { type RetryWindowState, recordProbe, startRetryWindow, windowOpen } from "../resilience/retryWindow.ts";
 import { type SchedulableTask, Scheduler } from "../sched/Scheduler.ts";
 import type { ExecutionBroker, ExecutionHandle, ExecutionRequestInput } from "./broker.ts";
@@ -31,6 +31,17 @@ import { canonicalizeWriteDomain } from "./workset.ts";
 /** Real clock/sleep for production; tests inject deterministic fakes. */
 const realNow = (): number => Date.now();
 const realSleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+/**
+ * Consecutive "gateway up, model not listed" probes before one real attempt is
+ * let through the probe gate (issue #76).
+ */
+export const UNLISTED_PROBES_BEFORE_VERIFY = 3;
+
+/** Status reason when an unlisted model gets one real attempt to confirm. */
+function unlistedVerifyReason(result: ProbeResult): string {
+  const model = result.model_id ? `model ${result.model_id}` : "the model";
+  return `${model} is not listed by the gateway; trying it once to confirm`;
+}
 
 type AbortableResult<T> = { aborted: true } | { aborted: false; value: T };
 
@@ -203,6 +214,10 @@ export class MissionScheduler {
   private readonly relaunches = new Map<string, number>();
   /** Per-task circuit breaker (prevents a request storm during recovery). */
   private readonly breakers = new Map<string, CircuitBreaker>();
+  /** Consecutive "model not listed" probe answers per task (see probeGate). */
+  private readonly unlistedProbes = new Map<string, number>();
+  /** The unlisted probe answer that let a task's next attempt through to verify the model. */
+  private readonly verifyingUnlisted = new Map<string, ProbeResult>();
   /** In-flight runners, retained so mission cancellation can await cleanup. */
   private readonly activeRuns = new Map<string, Set<Promise<void>>>();
 
@@ -217,6 +232,10 @@ export class MissionScheduler {
     // are injectable for deterministic fault-injection tests.
     this.resilience = opts.resilience ?? resolveGatewayResilienceConfig();
     this.probe = opts.probe ?? healthyProbe();
+    // For a Pi worker the runtime injects its CatalogRecoveryProbe (or an
+    // HttpRecoveryProbe for PI_GATEWAY_HEALTH_URL), so this is true in
+    // production even when the catalog probe has no target to ask: that
+    // answer is a non-authoritative "healthy" and passes straight through.
     this.hasRealProbe = opts.probe !== undefined;
     this.clockNow = opts.now ?? realNow;
     this.sleepFn = opts.sleep ?? realSleep;
@@ -395,6 +414,12 @@ export class MissionScheduler {
     try {
       await this.executeWithRetry(task, signal);
     } finally {
+      // Whatever path ended the task, a terminal task leaves the resilience
+      // window (a paused task stays RETRYING and keeps its park).
+      const status = this.store.getTask(task.task_id)?.status;
+      if (status && ["SUCCEEDED", "FAILED", "BLOCKED", "CANCELED", "SKIPPED"].includes(status)) {
+        this.leaveResilienceWindow(task);
+      }
       this.release(task);
       this.onTaskSettled?.(task.mission_id, task.task_id, this.store.getTask(task.task_id)?.status ?? "FAILED");
     }
@@ -420,6 +445,11 @@ export class MissionScheduler {
       }
       if (gate === "paused") return;
       if (gate === "wait") continue;
+      // Consume the unlisted answer that let this attempt through (if any) now,
+      // so an attempt that never produces an outcome cannot leave it behind
+      // for a later, ordinary transient to report.
+      const verifying = this.verifyingUnlisted.get(task.task_id);
+      this.verifyingUnlisted.delete(task.task_id);
 
       let authority: DispatchAuthority | undefined;
       try {
@@ -482,13 +512,13 @@ export class MissionScheduler {
           // pause on exhaustion) instead of immediately failing the task. Other
           // non-throwing failures keep the existing behaviour.
           const infraCat = infraCategoryFromWorkerMarker(outcome.error);
+          if (infraCat && verifying) this.reportUnlistedModel(task, verifying, outcome);
           const ceiling = infraCat ? this.outageCeiling(task, outcome) : null;
           if (ceiling) {
             authority?.assertAuthoritative();
             this.settleTaskRecoveries(task, "failed");
             this.recordTerminalFailure(task, ceiling, handle.executionId, outcome.error);
             this.store.transitionTask(task.task_id, "FAILED", "system", { failure_reason: ceiling });
-            this.forgetOutage(task);
             return;
           }
           if (infraCat) {
@@ -751,7 +781,36 @@ export class MissionScheduler {
     const probed = await this.abortable(this.probe.probe(), signal);
     if (probed.aborted) return "aborted";
     const result = probed.value;
-    if (result.healthy) return "proceed";
+    if (result.healthy) {
+      this.unlistedProbes.delete(task.task_id);
+      return "proceed";
+    }
+    // The gateway is up but does not list the model. That never clears if the
+    // model was removed, and does not matter for a legacy alias that still
+    // routes, so after a few in a row let one real attempt through: a removed
+    // model then fails fast with model_not_found instead of pausing forever,
+    // and an alias simply runs. Auto-resume still requires a listed model.
+    if (result.model_unlisted) {
+      const unlisted = (this.unlistedProbes.get(task.task_id) ?? 0) + 1;
+      if (unlisted >= UNLISTED_PROBES_BEFORE_VERIFY) {
+        this.unlistedProbes.delete(task.task_id);
+        this.verifyingUnlisted.set(task.task_id, result);
+        this.onStatus?.({
+          missionId: task.mission_id,
+          taskId: task.task_id,
+          status: this.store.getMission(task.mission_id)?.status ?? "WAITING_FOR_LLM",
+          action: "retrying",
+          reason: unlistedVerifyReason(result),
+          attempt: this.store.getTask(task.task_id)?.attempt ?? task.attempt,
+          nextActionAt: this.clockNow(),
+          terminal: false,
+        });
+        return "proceed";
+      }
+      this.unlistedProbes.set(task.task_id, unlisted);
+    } else {
+      this.unlistedProbes.delete(task.task_id);
+    }
     // Gateway still down: honour the reported wait (else the probe interval),
     // then re-probe without a real attempt.
     const waitMs = result.retry_after_ms ?? cfg.probe_interval_ms;
@@ -771,6 +830,8 @@ export class MissionScheduler {
   }
 
   private cancelTask(task: OrchestrationTask): void {
+    this.unlistedProbes.delete(task.task_id);
+    this.verifyingUnlisted.delete(task.task_id);
     const status = this.store.getTask(task.task_id)?.status;
     if (!status || ["SUCCEEDED", "FAILED", "CANCELED", "SKIPPED"].includes(status)) return;
     this.store.transitionTask(task.task_id, "CANCELED");
@@ -858,9 +919,10 @@ export class MissionScheduler {
     }
   }
 
-  /** Resume a parked mission back to EXECUTING after a task succeeds. Only when
-   * no other task in the mission is still paused (RETRYING), so a mission with a
-   * paused task never reports EXECUTING. */
+  /** Move a parked mission back to EXECUTING once a task leaves the resilience
+   * window (success or terminal failure). Only when no other task in the
+   * mission is still paused (RETRYING), so a mission with a paused task never
+   * reports EXECUTING. */
   private resumeToExecuting(missionId: string): boolean {
     const mission = this.store.getMission(missionId);
     if (!mission || mission.status === "EXECUTING") return false;
@@ -883,6 +945,18 @@ export class MissionScheduler {
     } catch {
       return false;
     }
+  }
+
+  /**
+   * A task ended terminally (any terminal status). Drop its resilience bookkeeping
+   * and un-park the mission from any WAITING_* or RECOVERING_* state the window
+   * put it in, so the orchestrator's normal failure handling runs instead of
+   * hitting an illegal transition out of the parked state.
+   */
+  private leaveResilienceWindow(task: OrchestrationTask): void {
+    this.clearResilience(task);
+    this.forgetOutage(task);
+    this.resumeToExecuting(task.mission_id);
   }
 
   /** Pause a mission on retry-window exhaustion: PAUSED (not FAILED), resumable. */
@@ -932,10 +1006,39 @@ export class MissionScheduler {
     this.breakers.delete(task.task_id);
   }
 
-  /** Drop the task's retry window + breaker (used on success and pause). */
+  /** Drop the task's retry window, breaker and unlisted-probe count. */
   private clearResilience(task: OrchestrationTask): void {
     this.windows.delete(task.task_id);
     this.breakers.delete(task.task_id);
+    this.unlistedProbes.delete(task.task_id);
+    this.verifyingUnlisted.delete(task.task_id);
+  }
+
+  /**
+   * The attempt let through to verify an unlisted model came back transient
+   * (a removed model that answers 503 rather than 404). The model is not
+   * coming back: report it so a routing-aware probe moves its target, and the
+   * next attempt, to another model instead of relaunching the dead one until
+   * max_relaunches.
+   */
+  private reportUnlistedModel(
+    task: OrchestrationTask,
+    verifying: ProbeResult,
+    outcome: { error?: string; summary?: string; model?: { provider: string; id: string } },
+  ): void {
+    if (!verifying.model_id || !verifying.model_provider) return;
+    // Only an attempt that really ran on the probed model says anything about
+    // it: the probe targets the implementer's model, while the attempt may be
+    // another role on another model (or report no model at all).
+    if (outcome.model?.provider !== verifying.model_provider || outcome.model.id !== verifying.model_id) return;
+    this.probe.reportModelUnavailable?.(
+      { provider: verifying.model_provider, id: verifying.model_id },
+      {
+        missionId: task.mission_id,
+        taskId: task.task_id,
+        reason: `unlisted by the gateway and the verification attempt failed: ${outcome.summary ?? outcome.error ?? "transient"}`,
+      },
+    );
   }
 
   /**
@@ -957,7 +1060,7 @@ export class MissionScheduler {
     }
     const maxRelaunches = cfg.max_relaunches ?? Number.POSITIVE_INFINITY;
     if (relaunches > maxRelaunches) {
-      return `task relaunched ${maxRelaunches} times through a transient outage without success while the gateway looked healthy; ${last}`;
+      return `task relaunched ${maxRelaunches} times through a transient outage without success; ${last}`;
     }
     return null;
   }
@@ -993,6 +1096,7 @@ export class MissionScheduler {
       missionId === undefined || this.store.getMission(missionId)?.status === "PAUSED_INFRASTRUCTURE";
     const recoveryTask = () =>
       missionId === undefined ? undefined : this.store.listTasks(missionId).find((task) => task.status === "RETRYING");
+    let unlisted = 0;
     for (let n = 0; this.clockNow() < deadlineMs; n++) {
       if (signal?.aborted || !stillPaused()) return false;
       const probed = await this.abortable(this.probe.probe(), signal);
@@ -1001,6 +1105,28 @@ export class MissionScheduler {
       // Only a real answer resumes: a probe that could not even resolve its
       // target (authoritative: false) says nothing about a recovery.
       if (result.healthy && result.authoritative !== false) return true;
+      // Same rule as probeGate: a model the gateway keeps not listing never
+      // "recovers", so after a few answers in a row resume anyway. The real
+      // attempt then either runs (an alias), hands the task to another model,
+      // or fails with model_not_found, instead of staying paused.
+      unlisted = result.model_unlisted ? unlisted + 1 : 0;
+      if (unlisted >= UNLISTED_PROBES_BEFORE_VERIFY) {
+        if (missionId !== undefined) {
+          const task = recoveryTask();
+          if (task) this.verifyingUnlisted.set(task.task_id, result);
+          this.onStatus?.({
+            missionId,
+            taskId: task?.task_id ?? "recovery",
+            status: "PAUSED_INFRASTRUCTURE",
+            action: "retrying",
+            reason: unlistedVerifyReason(result),
+            attempt: task?.attempt ?? n + 1,
+            nextActionAt: this.clockNow(),
+            terminal: false,
+          });
+        }
+        return true;
+      }
       const backoff = Math.min(
         cfg.max_backoff_ms ?? cfg.probe_interval_ms,
         cfg.probe_interval_ms * 2 ** Math.min(n, 30),

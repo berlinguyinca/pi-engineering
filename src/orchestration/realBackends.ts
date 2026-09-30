@@ -17,8 +17,9 @@ import type { ArtifactStore } from "../artifacts/ArtifactStore.ts";
 import { id } from "../core/ids.ts";
 import type { CandidateLifecycle, GitRepo, IntegrationRunRecord } from "../git/GitRepo.ts";
 import type { WorktreeInfo } from "../git/GitRepo.ts";
+import { type ModelRef, modelKey } from "../lifecycle/types.ts";
 import type { VerificationProvider } from "../verify/Verifier.ts";
-import type { WorkerActivity, WorkerExecutor, WorkerRequest } from "../workers/WorkerExecutor.ts";
+import type { WorkerActivity, WorkerExecutor, WorkerRequest, WorkerRun } from "../workers/WorkerExecutor.ts";
 import {
   type CheckpointRecoveryContext,
   type ExecutionOutcome,
@@ -42,19 +43,80 @@ export interface RealBackendsOptions {
    * model placement (a pinned implementer/reviewer) take effect in the mission
    * pipeline, matching the lifecycle `roleRunner` path.
    */
-  routeModel?: (role: WorkerRequest["role"]) => Promise<ModelRoute | undefined>;
-  /** Current/session model used when review cannot be placed on a distinct model. */
-  reviewFallbackModel?: { provider: string; id: string };
+  routeModel?: RouteModel;
+  /**
+   * Called when the gateway confirmed it no longer serves a model (the worker
+   * failed with `transient:model_unavailable` or `unknown-model`). The runtime
+   * records and logs it so later routing excludes it; the attempt itself is
+   * handed to the next eligible model right away (see runWithModelTakeover).
+   */
+  onModelUnavailable?: (model: ModelRef, context: { missionId?: string; taskId?: string; reason: string }) => void;
+  /** Called when an attempt succeeded on a model: it is served again. */
+  onModelServed?: (model: ModelRef) => void;
+  /** True for a model currently recorded as unavailable (never a reviewer fallback). */
+  isModelUnavailable?: (model: ModelRef) => boolean;
+  /**
+   * Current/session model: the executor's default when a role is not routed,
+   * and the reviewer's last resort when no distinct model is available.
+   */
+  reviewFallbackModel?: ModelRef;
   /** Resolve the repository selected by the current mission's async binding. */
   repository?: (repoId?: string) => Promise<{ git: GitRepo; cwd: string }> | { git: GitRepo; cwd: string };
 }
 
-export interface ModelRoute {
-  provider: string;
-  id: string;
+export interface ModelRoute extends ModelRef {
   /** Operator-visible notice when policy had to degrade model separation. */
   warning?: string;
 }
+
+export interface RouteModelOptions {
+  /** Models not to place the role on (already tried, or that produced the work). */
+  exclude?: ModelRef[];
+  /**
+   * Choosing a replacement after the model was found gone. Only then is a
+   * worker role the router has no native role for (investigator, scout, ...)
+   * mapped onto one; its first attempt stays on the executor default.
+   */
+  replacement?: boolean;
+}
+
+/** Resolve a worker role to a model placement, or undefined for the executor default. */
+export type RouteModel = (role: string, opts?: RouteModelOptions) => Promise<ModelRoute | undefined>;
+
+/**
+ * Worker failure markers for a model that is not served: a gateway 404
+ * model_not_found (`transient:model_unavailable`) or a model pruned from the
+ * local model runtime (`unknown-model`). Both hand the attempt to another model.
+ */
+const MODEL_GONE_MARKERS: ReadonlySet<string> = new Set(["transient:model_unavailable", "unknown-model"]);
+
+/**
+ * An "invalid model name" refusal comes from one route of the gateway (the
+ * multimodal one), so it is specific to the request: hand the attempt over,
+ * but do not mark the model unavailable for every other worker.
+ */
+const REQUEST_SPECIFIC_REFUSAL = /invalid model name/i;
+
+const sameModel = (a: ModelRef, b: ModelRef): boolean => modelKey(a) === modelKey(b);
+
+/** Missions whose producing models are remembered for reviewer separation. */
+export const MAX_TRACKED_MISSIONS = 256;
+
+/** The model a worker run says it ran on (PiWorkerExecutor names it on failure). */
+function ranOn(run: WorkerRun): ModelRef | undefined {
+  const named = run.result.details?.model;
+  if (!named || typeof named !== "object") return undefined;
+  const { provider, id } = named as Record<string, unknown>;
+  return typeof provider === "string" && typeof id === "string" ? { provider, id } : undefined;
+}
+
+/** Attach the model an attempt ran on to its outcome. */
+function withModel(outcome: ExecutionOutcome, model: ModelRef | undefined): ExecutionOutcome {
+  return model ? { ...outcome, model: { provider: model.provider, id: model.id } } : outcome;
+}
+
+const reducedIndependence = (model: ModelRef, why: string): string =>
+  `Warning: ${why}; reviewing with ${modelKey(model)} in a fresh session with reduced independence.`;
 
 async function artifactContentHashes(
   store: ArtifactStore,
@@ -228,6 +290,87 @@ export function realBackends(opts: RealBackendsOptions) {
       input.signal.removeEventListener("abort", markAborted);
     }
   };
+  /**
+   * Models that produced each mission's work (the final model of every agent
+   * run), so the reviewer can keep separation of duties after a takeover.
+   */
+  const producedBy = new Map<string, ModelRef[]>();
+  const recordProducer = (missionId: string | undefined, model: ModelRef | undefined): void => {
+    if (!missionId || !model) return;
+    const models = producedBy.get(missionId) ?? [];
+    if (!models.some((known) => sameModel(known, model))) models.push({ provider: model.provider, id: model.id });
+    // Most recently active last; the oldest mission is forgotten past the bound
+    // (realBackends has no mission-settled hook to prune on).
+    producedBy.delete(missionId);
+    producedBy.set(missionId, models);
+    if (producedBy.size > MAX_TRACKED_MISSIONS) {
+      const oldest = producedBy.keys().next().value;
+      if (oldest !== undefined) producedBy.delete(oldest);
+    }
+  };
+  /**
+   * Run a worker on `plan.initial` (or, unrouted, on the executor default).
+   * While the attempt fails because its model is not served, record the model
+   * as unavailable, ask `plan.next` for another with every tried model
+   * excluded, and rerun on it in a fresh session. Stops on success, any other
+   * outcome, or when no new model is offered (the last failure is then
+   * returned, so the task fails as before). Every switch is announced as
+   * activity and prefixed to the summary.
+   */
+  const runWithModelTakeover = async (
+    req: WorkerRequest,
+    input: { signal: AbortSignal; onActivity?: (event: WorkerActivity) => void },
+    plan: {
+      initial: ModelRoute | undefined;
+      next: (tried: ModelRef[]) => Promise<ModelRoute | undefined>;
+      freshSessionId: () => string;
+      context: { missionId?: string; taskId?: string };
+      onSwitch?: (from: ModelRef, to: ModelRoute) => void;
+    },
+  ): Promise<{ run: Awaited<ReturnType<WorkerExecutor["run"]>>; route: ModelRoute | undefined; model?: ModelRef }> => {
+    let route = plan.initial;
+    if (route) req.modelOverride = { provider: route.provider, id: route.id };
+    let run = await runWorker(req, input);
+    // The model the attempt ran on: the route; unrouted, the model the worker
+    // names, else the session model (normally the executor's default).
+    let model: ModelRef | undefined = route ?? ranOn(run) ?? opts.reviewFallbackModel;
+    const tried: ModelRef[] = [];
+    const switches: string[] = [];
+    while (model && MODEL_GONE_MARKERS.has(outcomeOf(run).error ?? "") && !input.signal.aborted) {
+      const failed: ModelRef = model;
+      const reason = run.result.summary;
+      if (!REQUEST_SPECIFIC_REFUSAL.test(reason)) opts.onModelUnavailable?.(failed, { ...plan.context, reason });
+      tried.push(failed);
+      const next = await plan.next(tried);
+      if (!next || tried.some((known) => sameModel(known, next))) break;
+      const notice = `model ${modelKey(failed)} is no longer served — switched ${req.role} to ${modelKey(next)}`;
+      switches.push(notice);
+      try {
+        input.onActivity?.({ kind: "state", phase: "started", summary: notice, meaningfulProgress: false });
+      } catch {
+        // Activity consumers are observers, never participants.
+      }
+      plan.onSwitch?.(failed, next);
+      route = next;
+      model = next;
+      req.sessionId = plan.freshSessionId();
+      req.modelOverride = { provider: next.provider, id: next.id };
+      run = await runWorker(req, input);
+    }
+    // A model that serves an attempt again is no longer considered gone.
+    if (model && run.result.status === "completed") opts.onModelServed?.(model);
+    if (switches.length > 0) {
+      run = { ...run, result: { ...run.result, summary: `${switches.join("; ")}. ${run.result.summary}` } };
+    }
+    return { run, route, model };
+  };
+  /** Takeover plan for a routed worker role: the next model the router offers. */
+  const routedPlan = async (role: string, context: { missionId?: string; taskId?: string }, prefix: string) => ({
+    initial: await opts.routeModel?.(role),
+    next: async (tried: ModelRef[]) => opts.routeModel?.(role, { exclude: tried, replacement: true }),
+    freshSessionId: () => id(prefix),
+    context,
+  });
   return {
     agent: {
       async runAgent(input: {
@@ -240,6 +383,8 @@ export function realBackends(opts: RealBackendsOptions) {
         modelRequirements?: Record<string, unknown>;
         recovery?: CheckpointRecoveryContext;
         deliverables?: readonly string[];
+        missionId?: string;
+        taskId?: string;
         signal: AbortSignal;
         onActivity?: (event: WorkerActivity) => void;
       }): Promise<ExecutionOutcome> {
@@ -267,10 +412,15 @@ export function realBackends(opts: RealBackendsOptions) {
         // Place the worker on the model the capability router chose for this
         // role (honours `policy.routing.roles`); fall back to the executor
         // default when routing is unavailable or the role is unknown.
-        const modelRoute = await opts.routeModel?.(req.role);
-        if (modelRoute) req.modelOverride = { provider: modelRoute.provider, id: modelRoute.id };
-        const run = await runWorker(req, input);
-        return outcomeOf(run);
+        // A model the gateway no longer serves is handed over to the next
+        // eligible one in this same execution.
+        const { run, model } = await runWithModelTakeover(
+          req,
+          input,
+          await routedPlan(req.role, { missionId: input.missionId, taskId: input.taskId }, "WKS"),
+        );
+        recordProducer(input.missionId, model);
+        return withModel(outcomeOf(run), model);
       },
     },
     research: {
@@ -283,16 +433,15 @@ export function realBackends(opts: RealBackendsOptions) {
         onActivity?: (event: WorkerActivity) => void;
       }): Promise<ExecutionOutcome> {
         const bound = await repository(input.repoId);
-        return runWorker(
-          {
-            role: "scout",
-            task: input.objective,
-            context: input.contextRef,
-            tools: ["ledger_read", "repo_search", "symbol", "tests_for"],
-            cwd: bound.cwd,
-          },
-          input,
-        ).then(outcomeOf);
+        const req: WorkerRequest = {
+          role: "scout",
+          task: input.objective,
+          context: input.contextRef,
+          tools: ["ledger_read", "repo_search", "symbol", "tests_for"],
+          cwd: bound.cwd,
+        };
+        const { run, model } = await runWithModelTakeover(req, input, await routedPlan(req.role, {}, "WKS"));
+        return withModel(outcomeOf(run), model);
       },
     },
     validation: {
@@ -349,6 +498,8 @@ export function realBackends(opts: RealBackendsOptions) {
         contextRef?: string;
         acceptanceCriteria?: Array<{ acceptanceId: string; criterion: string }>;
         worktree?: string | null;
+        missionId?: string;
+        taskId?: string;
         signal: AbortSignal;
         onActivity?: (event: WorkerActivity) => void;
       }): Promise<ExecutionOutcome> {
@@ -375,27 +526,58 @@ export function realBackends(opts: RealBackendsOptions) {
           sessionId: reviewerSessionId,
           resultTool: "review_result",
         };
-        const routed = await opts.routeModel?.(req.role);
-        const modelRoute = routed ?? opts.reviewFallbackModel;
-        const fallbackWarning = routed
-          ? routed.warning
-          : opts.reviewFallbackModel
-            ? `Warning: no distinct reviewer model is available; reviewing with ${opts.reviewFallbackModel.provider}/${opts.reviewFallbackModel.id} in a fresh session with reduced independence.`
-            : "Warning: no distinct reviewer model is available; reviewing with the current worker model in a fresh session with reduced independence.";
-        if (modelRoute) {
-          req.modelOverride = { provider: modelRoute.provider, id: modelRoute.id };
-        }
-        if (fallbackWarning) {
+        // Separation of duties: the reviewer must not run on a model that
+        // produced this mission's work, including one an implementer took over
+        // onto. Candidates in order: a distinct routed model; once, the session
+        // model (reduced independence) unless it is itself unavailable; and,
+        // only when nothing else is left, a producing model (reduced).
+        const producers = producedBy.get(input.missionId ?? "") ?? [];
+        const fallback = opts.reviewFallbackModel;
+        const pickReviewer = async (tried: ModelRef[]): Promise<ModelRoute | undefined> => {
+          const distinct = await opts.routeModel?.(req.role, { exclude: [...producers, ...tried] });
+          if (distinct) return distinct;
+          if (fallback && !tried.some((m) => sameModel(m, fallback)) && !opts.isModelUnavailable?.(fallback)) {
+            return { ...fallback, warning: reducedIndependence(fallback, "no distinct reviewer model is available") };
+          }
+          return producers.length > 0 ? opts.routeModel?.(req.role, { exclude: tried }) : undefined;
+        };
+        const reviewWarning = (route: ModelRoute): string | undefined =>
+          route.warning ??
+          (producers.some((m) => sameModel(m, route))
+            ? reducedIndependence(route, "the only reviewer model left produced this work")
+            : undefined);
+        const notify = (summary: string): void => {
           input.onActivity?.({
             kind: "execution",
             stage: "review",
             phase: "started",
-            summary: fallbackWarning,
+            summary,
             meaningfulProgress: false,
           });
-        }
-        const run = await runWorker(req, input);
-        const outcome = outcomeOf(run);
+        };
+        const initial = await pickReviewer([]);
+        const initialWarning = initial
+          ? reviewWarning(initial)
+          : "Warning: no distinct reviewer model is available; reviewing with the current worker model in a fresh session with reduced independence.";
+        if (initialWarning) notify(initialWarning);
+        // A reviewer model the gateway no longer serves is handed over too, and
+        // every switch says whether the review is still independent.
+        const takeover = await runWithModelTakeover(req, input, {
+          initial,
+          next: pickReviewer,
+          freshSessionId: () => id("RVS"),
+          context: { missionId: input.missionId, taskId: input.taskId },
+          onSwitch: (_from, to) =>
+            notify(
+              reviewWarning(to) ??
+                `Reviewer moved to ${modelKey(to)}; the review stays independent of the model that produced the work.`,
+            ),
+        });
+        const run = takeover.run;
+        // Independence is judged on the model that actually reviewed.
+        const modelRoute = takeover.route;
+        const independent = !!modelRoute && !reviewWarning(modelRoute);
+        const outcome = withModel(outcomeOf(run), takeover.model);
         // If the reviewer emitted structured findings, normalize and surface them
         // so the completion gate can block on blocking findings. Handles three
         // shapes: a list of objects ({severity, message|summary|text}), a list of
@@ -449,11 +631,11 @@ export function realBackends(opts: RealBackendsOptions) {
         }
         const artifactEvidence = await artifactContentHashes(opts.artifacts, outcome.artifactRefs);
         outcome.reviewEvidence = {
-          reviewerSessionId,
+          reviewerSessionId: req.sessionId ?? reviewerSessionId,
           model: modelRoute?.id ?? "",
           provider: modelRoute?.provider ?? "",
           verdict: verdict === "approve" ? "approve" : "request_changes",
-          independenceMode: routed && !routed.warning ? "independent" : "same_model_reduced",
+          independenceMode: independent ? "independent" : "same_model_reduced",
           findings: normalizedFindings,
           outputValid,
           accessible: artifactEvidence.allAccessible,

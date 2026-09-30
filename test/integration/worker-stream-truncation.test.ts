@@ -334,3 +334,17 @@ test("broker deadline preceding the worker timer is classified as a wall-clock t
     assert.equal(store.listExecutions(mission.mission_id)[0]?.status, "FAILED");
   });
 });
+
+test("worker: a model_not_found failure names the model the attempt ran on", async () => {
+  // Unrouted work runs on the executor default. When that model is gone the
+  // failure must say which model it was, so the takeover marks the right one.
+  const notFound: Reply = (res) =>
+    res
+      .writeHead(404, { "content-type": "application/json" })
+      .end(JSON.stringify({ error: { code: "model_not_found", message: "model_not_found: probe-model" } }));
+  await withProbe([notFound, notFound, notFound, notFound], async (executor, cwd) => {
+    const run = await executor.run({ role: "implementer", task: "t", tools: [], cwd });
+    assert.equal(run.result.error, "transient:model_unavailable", run.result.summary);
+    assert.deepEqual(run.result.details.model, { provider: "probe", id: "probe-model" });
+  });
+});

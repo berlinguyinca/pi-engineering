@@ -21,11 +21,31 @@ export interface ProbeResult {
   retry_after_ms?: number;
   /** True when the probe is authoritative (real health check vs. default). */
   authoritative?: boolean;
+  /**
+   * The gateway answered but does not list the mission's model. Unlike an
+   * outage this may never clear (the model was removed) or may not matter (a
+   * legacy alias that still routes), so the scheduler lets a verification
+   * attempt through after a few of these rather than waiting forever.
+   */
+  model_unlisted?: boolean;
+  /** The model the probe asked about, when it resolved one. */
+  model_id?: string;
+  /** That model's provider, when known. */
+  model_provider?: string;
 }
 
 /** A probe adapter: answer "is the gateway ready for a real request?" */
 export interface RecoveryProbe {
   probe(): Promise<ProbeResult>;
+  /**
+   * Optional: the scheduler found a model unavailable (an attempt let through
+   * for an unlisted model still failed). A routing-aware probe records it so
+   * its next target, and the next attempt, move to another model.
+   */
+  reportModelUnavailable?(
+    model: { provider: string; id: string },
+    context: { missionId?: string; taskId?: string; reason: string },
+  ): void;
 }
 
 /** A probe that always reports healthy — used when no real gateway is present. */
@@ -101,6 +121,8 @@ export interface CatalogProbeTarget {
   headers?: Record<string, string>;
   /** The mission's model; when set it must be listed (with capacity). */
   modelId?: string;
+  /** The model's provider, reported with an unlisted answer. */
+  provider?: string;
 }
 
 /**
@@ -158,7 +180,16 @@ export class CatalogRecoveryProbe implements RecoveryProbe {
       if (!target.modelId) return { healthy: true, authoritative: true };
       const rows = Array.isArray(body?.data) ? (body.data as Array<Record<string, unknown>>) : [];
       const row = rows.find((r) => r && typeof r === "object" && r.id === target.modelId);
-      if (!row) return { healthy: false, reason: `model ${target.modelId} is not served`, authoritative: true };
+      if (!row) {
+        return {
+          healthy: false,
+          reason: `model ${target.modelId} is not served`,
+          authoritative: true,
+          model_unlisted: true,
+          model_id: target.modelId,
+          ...(target.provider ? { model_provider: target.provider } : {}),
+        };
+      }
       if (typeof row.slots === "number" && row.slots <= 0) {
         return { healthy: false, reason: `model ${target.modelId} has no capacity (0 slots)`, authoritative: true };
       }
@@ -203,5 +234,6 @@ export async function resolveCatalogProbeTarget(
       ? { headers: headers as Record<string, string> }
       : {}),
     modelId: ref.id,
+    provider: ref.provider,
   };
 }

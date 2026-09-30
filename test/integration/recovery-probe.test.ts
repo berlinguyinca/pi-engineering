@@ -58,7 +58,7 @@ describe("CatalogRecoveryProbe: authenticated model listing", () => {
     const state: Gateway = { models: [{ id: "qwen-27b", slots: 2 }], healthz: 503, down: false };
     const seen = await withGateway(state, async (baseUrl) => {
       const probe = new CatalogRecoveryProbe({
-        resolve: async () => ({ baseUrl, apiKey: "secret", modelId: "qwen-27b" }),
+        resolve: async () => ({ baseUrl, apiKey: "secret", modelId: "qwen-27b", provider: "metabolomics" }),
       });
       assert.equal((await probe.probe()).healthy, true, "listed with slots, even while /healthz says degraded");
 
@@ -66,12 +66,19 @@ describe("CatalogRecoveryProbe: authenticated model listing", () => {
       const noSlots = await probe.probe();
       assert.equal(noSlots.healthy, false);
       assert.match(noSlots.reason ?? "", /no capacity/);
+      assert.equal(noSlots.model_unlisted, undefined, "listed without capacity is an outage, not an unlisting");
 
       state.models = [{ id: "other-model", slots: 4 }];
-      assert.equal((await probe.probe()).healthy, false, "the mission's model is not served");
+      const unlisted = await probe.probe();
+      assert.equal(unlisted.healthy, false, "the mission's model is not served");
+      assert.equal(unlisted.model_unlisted, true, "the gateway answered without the model");
+      assert.equal(unlisted.model_id, "qwen-27b", "names the unlisted model");
+      assert.equal(unlisted.model_provider, "metabolomics", "and its provider");
 
       state.down = true;
-      assert.equal((await probe.probe()).healthy, false, "unreachable");
+      const down = await probe.probe();
+      assert.equal(down.healthy, false, "unreachable");
+      assert.equal(down.model_unlisted, undefined, "an unreachable gateway says nothing about the listing");
     });
     assert.ok(
       seen.every((h) => h === "Bearer secret"),
@@ -117,7 +124,12 @@ describe("CatalogRecoveryProbe: authenticated model listing", () => {
         allowModelNetwork: false,
       });
       const target = await resolveCatalogProbeTarget(runtime, { provider: "metabolomics", id: "qwen-27b" });
-      assert.deepEqual(target, { baseUrl: "https://gateway.example/v1", apiKey: "secret", modelId: "qwen-27b" });
+      assert.deepEqual(target, {
+        baseUrl: "https://gateway.example/v1",
+        apiKey: "secret",
+        modelId: "qwen-27b",
+        provider: "metabolomics",
+      });
       assert.equal(await resolveCatalogProbeTarget(runtime, { provider: "nope", id: "x" }), undefined);
     } finally {
       rmSync(dir, { recursive: true, force: true });
