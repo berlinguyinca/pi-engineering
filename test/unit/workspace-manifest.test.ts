@@ -81,11 +81,11 @@ describe("WorkspaceManifestResolver path policy", () => {
     const repo = await makeFixtureRepo();
     cleanup.push(() => rm(launchCwd, { recursive: true, force: true }), repo.cleanup);
 
-    // Build the prose with concatenation so no bare slash token is embedded in
-    // this test source. The request contains a single slash surrounded by
-    // whitespace and no absolute repository path.
-    const slash = "a" + String.fromCharCode(47);
-    const request = "Please use care or " + slash + " it will not merge";
+    // Build the slash with fromCharCode so no bare slash token is embedded in
+    // this test source. The request contains "a" + slash + space (the case the
+    // old extraction read as "/") and no absolute repository path.
+    const slash = `a${String.fromCharCode(47)}`;
+    const request = `Please use care or ${slash} it will not merge`;
 
     const resolved = await new WorkspaceManifestResolver().resolve(request, repo.root);
 
@@ -102,7 +102,7 @@ describe("WorkspaceManifestResolver path policy", () => {
     // "a/b" between word characters used to be extracted as a short
     // nonexistent path and block resolution; it must be filtered out.
     const slash = String.fromCharCode(47);
-    const request = "Pick option " + "a" + slash + "b for the rollout";
+    const request = `Pick option a${slash}b for the rollout`;
 
     const resolved = await new WorkspaceManifestResolver().resolve(request, repo.root);
 

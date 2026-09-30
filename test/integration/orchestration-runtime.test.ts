@@ -267,7 +267,8 @@ describe("orchestration via real EngineeringRuntime (acceptance scenarios)", () 
     const fx = await greenFixture();
     fixtures.push(fx);
     const rt = await openRuntime(fx.root);
-    const result = await rt.orchestrator!.orchestrate("Modify files in /", {
+    // A bare "/" is prose since #91; a quoted one still names the filesystem root.
+    const result = await rt.orchestrator!.orchestrate('Modify files in "/"', {
       repository: fx.root,
       baseRef: await rt.git!.headCommit(),
       mutationRequested: true,
@@ -279,7 +280,12 @@ describe("orchestration via real EngineeringRuntime (acceptance scenarios)", () 
     assert.ok(
       rt
         .missionStore!.listFailureClassifications(result.mission.mission_id)
-        .some((classification) => classification.category === "WORKSPACE_SCOPE_MISMATCH"),
+        .some(
+          (classification) =>
+            classification.category === "WORKSPACE_SCOPE_MISMATCH" &&
+            /protected filesystem root/.test(classification.summary),
+        ),
+      "blocked because the root is protected, not merely because it is not a repository",
     );
   });
 
