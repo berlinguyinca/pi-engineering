@@ -92,3 +92,12 @@ are both invalid.
 Completion gating is mission-local.
 
 Mission A being active or blocked must not prevent Mission B or ordinary conversation from producing output.
+
+## Spec approval is not a completion gate
+
+An autonomous spec-approval stage may precede implementation and contributes
+durable workflow-progress units (draft, normalize, review, refine, approve,
+materialize). Its approval is **exact-revision policy authorization**, not
+human approval, not Plannotator approval, and not implementation correctness
+evidence. It never satisfies the completion gate; verified acceptance coverage
+remains zero until implementation evidence exists.

@@ -136,3 +136,15 @@ Persist retry windows, recovery budgets, failure fingerprints, ownership
 generations, fencing tokens, next-action deadlines, checkpoints, and task
 supersession. Replaying entity state without reconciling workers, worktrees, and
 external side effects is not recovery.
+
+## Autonomous spec approval
+
+An autonomous spec-approval stage may precede implementation task creation. It
+persists an **exact-revision policy approval** binding the spec hash, normalized
+plan hash, acceptance hash, workspace identity, base commit, and policy version.
+Implementation tasks are materialized only from the current approval.
+
+Autonomous spec approval is not human approval, not Plannotator approval, and
+not implementation correctness evidence. Changed bound inputs invalidate
+approval before further dispatch. See
+`docs/superpowers/specs/2026-09-28-autonomous-spec-approval-design.md`.

@@ -433,3 +433,13 @@ scenario either completes bounded multi-repository work with current,
 revision-bound evidence or stops with a typed actionable reason—without a
 meta-root workaround, stale percentage, duplicate side effect, indefinite wait,
 late-result authority, or incumbent mutation before all gates pass.
+
+## Autonomous spec approval is not gate evidence
+
+An autonomous spec-approval stage may precede implementation. Its approval is
+**exact-revision policy authorization**: it authorizes only the exact reviewed
+spec revision and normalized task plan to enter the execution pipeline. It is
+**not** human approval, **not** Plannotator approval, and **not** implementation
+correctness evidence. It never satisfies validation, candidate review,
+acceptance evidence, or mission completion gates above. See
+`docs/superpowers/specs/2026-09-28-autonomous-spec-approval-design.md`.

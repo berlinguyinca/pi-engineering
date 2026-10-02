@@ -310,3 +310,18 @@ Every unfinished mission must have an active owner, a named wait with deadline,
 a scheduled bounded recovery, or an explicit actionable stop. A mission must
 never remain at an unexplained percentage with no active worker and no next
 action.
+
+## 12. Autonomous spec approval
+
+Autonomous spec approval is **exact-revision policy authorization**: it
+authorizes only the exact reviewed spec revision and normalized task plan to
+enter the existing execution pipeline. It is **not** human approval, **not**
+Plannotator approval, and **not** implementation correctness evidence.
+
+- An approval binds the spec hash, normalized plan hash, acceptance ID/text
+  hash, workspace manifest identity, base commit, and policy version. Any
+  change to a bound input invalidates approval before further dispatch.
+- Approval authorizes execution only. It never satisfies implementation
+  validation, candidate review, acceptance evidence, or mission completion.
+- The normative design is
+  `docs/superpowers/specs/2026-09-28-autonomous-spec-approval-design.md`.

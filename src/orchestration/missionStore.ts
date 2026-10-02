@@ -92,7 +92,13 @@ export type OrchestrationEventType =
   | "evidence.review_recorded"
   | "execution.gate_evidence_published"
   | "mission.resumed"
-  | "mission.stopped";
+  | "mission.stopped"
+  | "spec.stage"
+  | "spec.revision"
+  | "spec.review"
+  | "spec.approval"
+  | "spec.invalidation"
+  | "spec.materialized";
 
 const ORCHESTRATION_EVENT_TYPES: ReadonlySet<string> = new Set<OrchestrationEventType>([
   "mission.created",
@@ -141,6 +147,12 @@ const ORCHESTRATION_EVENT_TYPES: ReadonlySet<string> = new Set<OrchestrationEven
   "execution.gate_evidence_published",
   "mission.resumed",
   "mission.stopped",
+  "spec.stage",
+  "spec.revision",
+  "spec.review",
+  "spec.approval",
+  "spec.invalidation",
+  "spec.materialized",
 ]);
 
 export interface OrchestrationEvent {
@@ -316,6 +328,18 @@ export class MissionStore {
   private readonly repositoryLeaseEpochs = new Map<string, RepositoryLease>();
   private readonly missionResumptions: MissionResumption[] = [];
   private readonly missionStops: MissionStop[] = [];
+  private readonly specRevisions = new Map<string, import("./specApproval.ts").MissionSpecRevision>();
+  private readonly specReviews = new Map<string, import("./specApproval.ts").SpecReviewEvidence>();
+  private readonly specApprovals = new Map<string, import("./specApproval.ts").SpecApproval>();
+  private readonly specStages: import("./specApproval.ts").SpecStageAttempt[] = [];
+  private readonly specInvalidations = new Map<string, { approvalId: string; reason: string; fencingToken: number }>();
+  private readonly specMaterializations: Array<{
+    missionId: string;
+    approvalId: string;
+    semanticSpecHash: string;
+    created: string[];
+    reused: string[];
+  }> = [];
   private readonly persistenceErrors: MissionPersistenceDiagnostic[] = [];
   private readonly pendingWrites: Array<{
     event: OrchestrationEvent;
@@ -689,6 +713,47 @@ export class MissionStore {
       case "mission.stopped": {
         const stop = e.payload.stop as MissionStop;
         if (stop) this.missionStops.push(copyMissionStop(stop));
+        break;
+      }
+      case "spec.stage": {
+        const stage = e.payload.stage as import("./specApproval.ts").SpecStageAttempt;
+        if (stage) this.specStages.push({ ...stage });
+        break;
+      }
+      case "spec.revision": {
+        const revision = e.payload.revision as import("./specApproval.ts").MissionSpecRevision;
+        if (revision) this.specRevisions.set(revision.revisionId, structuredClone(revision));
+        break;
+      }
+      case "spec.review": {
+        const review = e.payload.review as import("./specApproval.ts").SpecReviewEvidence;
+        if (review) this.specReviews.set(review.reviewId, structuredClone(review));
+        break;
+      }
+      case "spec.approval": {
+        const approval = e.payload.approval as import("./specApproval.ts").SpecApproval;
+        if (approval) this.specApprovals.set(approval.missionId, structuredClone(approval));
+        break;
+      }
+      case "spec.invalidation": {
+        const invalidation = e.payload.invalidation as {
+          missionId: string;
+          approvalId: string;
+          reason: string;
+          fencingToken: number;
+        };
+        if (invalidation) this.specInvalidations.set(invalidation.missionId, invalidation);
+        break;
+      }
+      case "spec.materialized": {
+        const materialization = e.payload.materialization as {
+          missionId: string;
+          approvalId: string;
+          semanticSpecHash: string;
+          created: string[];
+          reused: string[];
+        };
+        if (materialization) this.specMaterializations.push(materialization);
         break;
       }
     }
@@ -2533,6 +2598,97 @@ export class MissionStore {
 
   listMissionStops(missionId?: string): MissionStop[] {
     return this.missionStops.filter((stop) => (missionId ? stop.missionId === missionId : true)).map(copyMissionStop);
+  }
+
+  // ── Autonomous spec approval records ────────────────────────────────────
+
+  appendSpecStage(stage: import("./specApproval.ts").SpecStageAttempt): void {
+    this.apply(this.emit("spec.stage", stage.missionId, { actor: "system", stage }));
+  }
+
+  appendSpecRevision(revision: import("./specApproval.ts").MissionSpecRevision): void {
+    this.apply(this.emit("spec.revision", revision.missionId, { actor: "system", revision }));
+  }
+
+  appendSpecReview(review: import("./specApproval.ts").SpecReviewEvidence): void {
+    this.apply(this.emit("spec.review", review.missionId, { actor: "system", review }));
+  }
+
+  appendSpecApproval(approval: import("./specApproval.ts").SpecApproval): void {
+    this.apply(this.emit("spec.approval", approval.missionId, { actor: "system", approval }));
+  }
+
+  /** Durable invalidation event carrying the prior approval ID + new fencing identity. */
+  invalidateSpecApproval(missionId: string, approvalId: string, reason: string, fencingToken: number): void {
+    this.apply(
+      this.emit("spec.invalidation", missionId, {
+        actor: "system",
+        invalidation: { missionId, approvalId, reason, fencingToken },
+      }),
+    );
+  }
+
+  appendSpecMaterialization(
+    missionId: string,
+    approvalId: string,
+    semanticSpecHash: string,
+    created: string[],
+    reused: string[],
+  ): void {
+    this.apply(
+      this.emit("spec.materialized", missionId, {
+        actor: "system",
+        materialization: { missionId, approvalId, semanticSpecHash, created, reused },
+      }),
+    );
+  }
+
+  getSpecRevision(missionId: string): import("./specApproval.ts").MissionSpecRevision | null {
+    let latest: import("./specApproval.ts").MissionSpecRevision | null = null;
+    for (const revision of this.specRevisions.values()) {
+      if (revision.missionId !== missionId) continue;
+      if (!latest || revision.revisionNumber > latest.revisionNumber) latest = revision;
+    }
+    return latest ? structuredClone(latest) : null;
+  }
+
+  getSpecReview(missionId: string): import("./specApproval.ts").SpecReviewEvidence | null {
+    let latest: import("./specApproval.ts").SpecReviewEvidence | null = null;
+    for (const review of this.specReviews.values()) {
+      if (review.missionId !== missionId) continue;
+      if (!latest || review.reviewedAt > latest.reviewedAt) latest = review;
+    }
+    return latest ? structuredClone(latest) : null;
+  }
+
+  getSpecApproval(missionId: string): import("./specApproval.ts").SpecApproval | null {
+    const approval = this.specApprovals.get(missionId);
+    return approval ? structuredClone(approval) : null;
+  }
+
+  listSpecStages(missionId: string): import("./specApproval.ts").SpecStageAttempt[] {
+    return this.specStages.filter((stage) => stage.missionId === missionId).map((stage) => ({ ...stage }));
+  }
+
+  getSpecInvalidation(missionId: string): { approvalId: string; reason: string; fencingToken: number } | null {
+    const invalidation = this.specInvalidations.get(missionId);
+    return invalidation ? { ...invalidation } : null;
+  }
+
+  listSpecMaterializations(missionId: string): Array<{
+    approvalId: string;
+    semanticSpecHash: string;
+    created: string[];
+    reused: string[];
+  }> {
+    return this.specMaterializations
+      .filter((materialization) => materialization.missionId === missionId)
+      .map((materialization) => ({
+        approvalId: materialization.approvalId,
+        semanticSpecHash: materialization.semanticSpecHash,
+        created: [...materialization.created],
+        reused: [...materialization.reused],
+      }));
   }
 }
 
