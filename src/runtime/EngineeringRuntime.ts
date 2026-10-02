@@ -29,7 +29,7 @@ import {
 import { MissionStore } from "../orchestration/missionStore.ts";
 import { MissionObservability } from "../orchestration/observability/MissionObservability.ts";
 import { Orchestrator } from "../orchestration/orchestrator.ts";
-import type { PlanTaskInput } from "../orchestration/orchestrator.ts";
+import type { OrchestratorOptions, PlanTaskInput } from "../orchestration/orchestrator.ts";
 import { MissionOwnership } from "../orchestration/ownership.ts";
 import { type ModelRoute, realBackends } from "../orchestration/realBackends.ts";
 import { FailureClassifier } from "../orchestration/recovery.ts";
