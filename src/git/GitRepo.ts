@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { access, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
+import { access, lstat, mkdir, readFile, readdir, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { promisify } from "node:util";
 import { ExclusiveFileLock } from "../platform/eventstore/fileLock.ts";
@@ -963,7 +963,50 @@ export class GitRepo {
     guard?.assertAuthoritative();
     const add = await this.git(["worktree", "add", path, "-b", branch, baseCommit]);
     if (add.code !== 0) throw new Error(`git worktree add failed: ${add.stderr}`);
+    await this.linkSharedNodeModules(path);
     return { path, branch };
+  }
+
+  /**
+   * Link the repo root's `node_modules` into a freshly created worktree.
+   *
+   * Worktrees are created as SIBLINGS of the repo root, so the verifier's
+   * walk-up from the worktree cwd never reaches the repo root's
+   * `node_modules` and bare binaries (`tsc`, `biome`, `tsx`, ...) are not
+   * found — every deterministic check (the integration verifier, recovery)
+   * fails with "tsc: not found". Symlinking the shared `node_modules`
+   * (rather than reinstalling) is the documented convention (AGENTS.md) and
+   * keeps the dependency cache singular. No-op when the repo declares no
+   * `node_modules` or the worktree already has one. Best-effort: a link
+   * failure never breaks worktree creation (git operations don't need it).
+   */
+  private async linkSharedNodeModules(worktreePath: string): Promise<void> {
+    const source = join(this.repoRoot, "node_modules");
+    try {
+      await access(source);
+    } catch {
+      return; // no node_modules at the repo root; nothing to share
+    }
+    const target = join(worktreePath, "node_modules");
+    try {
+      await lstat(target);
+      return; // already present (a real dir from a prior provisioning)
+    } catch {
+      // absent: create the symlink below
+    }
+    let linkTarget = source;
+    try {
+      // Point at the real directory so a symlinked repo node_modules does not
+      // produce a chain of symlinks in the worktree.
+      linkTarget = await realpath(source);
+    } catch {
+      // keep the plain path if realpath fails
+    }
+    try {
+      await symlink(linkTarget, target);
+    } catch (err) {
+      void err; // best-effort provisioning; never break worktree creation
+    }
   }
 
   /**
