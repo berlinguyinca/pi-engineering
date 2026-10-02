@@ -7,7 +7,8 @@
  * durable `spec.materialized` record so replay can reconstruct the approved set.
  */
 
-import { stableTaskId, type MissionSpecRevision, type SpecApproval } from "./specApproval.ts";
+import type { MissionStore } from "./missionStore.ts";
+import { type MissionSpecRevision, type SpecApproval, stableTaskId } from "./specApproval.ts";
 import type {
   SpecMaterializeResult,
   SpecReviewEvidence,
@@ -15,7 +16,6 @@ import type {
   SpecStore,
   SpecWorkflowState,
 } from "./specApproval.ts";
-import type { MissionStore } from "./missionStore.ts";
 import type { OrchestrationTask } from "./types.ts";
 
 export class MissionSpecStore implements SpecStore {
@@ -45,7 +45,7 @@ export class MissionSpecStore implements SpecStore {
       approval,
       invalidatedApprovalId: invalidation?.approvalId ?? null,
       warning: null,
-      nextAction: approval ? "materialize" : latestStage?.stage ?? "idle",
+      nextAction: approval ? "materialize" : (latestStage?.stage ?? "idle"),
       nextActionAt: latestStage?.deadlineAt ?? null,
       stopReason: null,
       resumeCondition: null,
@@ -100,8 +100,7 @@ export class MissionSpecStore implements SpecStore {
     const reused: string[] = [];
     for (let index = 0; index < revision.plan.length; index += 1) {
       const planned = revision.plan[index]!;
-      const taskId =
-        planned.task_id || stableTaskId(missionId, revision.semanticSpecHash, planned.repo_id, index);
+      const taskId = planned.task_id || stableTaskId(missionId, revision.semanticSpecHash, planned.repo_id, index);
       const existingTask = existing.get(taskId);
       if (existingTask) {
         if (priorMaterialization?.created.includes(taskId) || priorMaterialization?.reused.includes(taskId)) {

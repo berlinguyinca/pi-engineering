@@ -2620,10 +2620,12 @@ export class MissionStore {
 
   /** Durable invalidation event carrying the prior approval ID + new fencing identity. */
   invalidateSpecApproval(missionId: string, approvalId: string, reason: string, fencingToken: number): void {
-    this.apply(this.emit("spec.invalidation", missionId, {
-      actor: "system",
-      invalidation: { missionId, approvalId, reason, fencingToken },
-    }));
+    this.apply(
+      this.emit("spec.invalidation", missionId, {
+        actor: "system",
+        invalidation: { missionId, approvalId, reason, fencingToken },
+      }),
+    );
   }
 
   appendSpecMaterialization(
@@ -2633,10 +2635,12 @@ export class MissionStore {
     created: string[],
     reused: string[],
   ): void {
-    this.apply(this.emit("spec.materialized", missionId, {
-      actor: "system",
-      materialization: { missionId, approvalId, semanticSpecHash, created, reused },
-    }));
+    this.apply(
+      this.emit("spec.materialized", missionId, {
+        actor: "system",
+        materialization: { missionId, approvalId, semanticSpecHash, created, reused },
+      }),
+    );
   }
 
   getSpecRevision(missionId: string): import("./specApproval.ts").MissionSpecRevision | null {

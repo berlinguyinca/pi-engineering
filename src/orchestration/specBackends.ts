@@ -12,8 +12,8 @@ import type {
   ProtectedUserCriteria,
   SpecReviewEvidence,
   SpecReviewVerdict,
-  SpecWorkflowState,
   SpecStageAttempt,
+  SpecWorkflowState,
 } from "./specApproval.ts";
 
 export interface SpecWorkerModel {
@@ -178,7 +178,7 @@ export function resolveReviewerModel(
   if (!currentModel || !currentModel.id) {
     return { model: null, independenceMode: "fresh_context" };
   }
-  if (distinctReviewerModel && distinctReviewerModel.id && distinctReviewerModel.id !== currentModel.id) {
+  if (distinctReviewerModel?.id && distinctReviewerModel.id !== currentModel.id) {
     return { model: distinctReviewerModel, independenceMode: "fresh_context" };
   }
   // Same model in a NEW session without the author transcript.

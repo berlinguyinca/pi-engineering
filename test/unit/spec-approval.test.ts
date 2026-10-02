@@ -2,8 +2,14 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
   MemorySpecStore,
+  type MissionSpecRevision,
+  type ProtectedUserCriteria,
   SpecApprovalController,
   SpecApprovalError,
+  type SpecPlannedTask,
+  type SpecReviewEvidence,
+  type SpecScopeEnvelope,
+  acceptanceHash,
   approvalEligible,
   approvalInvalidated,
   blockingFindingFingerprint,
@@ -18,12 +24,6 @@ import {
   validatePlannedTasks,
   validateReviewResult,
   workspaceIdentityHash,
-  acceptanceHash,
-  type MissionSpecRevision,
-  type ProtectedUserCriteria,
-  type SpecPlannedTask,
-  type SpecReviewEvidence,
-  type SpecScopeEnvelope,
 } from "../../src/orchestration/specApproval.ts";
 import type { SpecWorkerModel } from "../../src/orchestration/specBackends.ts";
 
@@ -109,9 +109,7 @@ describe("canonical hashing", () => {
       { severity: "blocking" as const, title: "x", detail: "d" },
       { severity: "major" as const, title: "y", detail: "d" },
     ]);
-    const b = blockingFindingFingerprint([
-      { severity: "blocking" as const, title: "x", detail: "d" },
-    ]);
+    const b = blockingFindingFingerprint([{ severity: "blocking" as const, title: "x", detail: "d" }]);
     // Major findings do not affect the blocking fingerprint.
     assert.equal(a, b);
     assert.equal(
@@ -268,14 +266,21 @@ describe("approval eligibility and invalidation", () => {
     assert.equal(approvalInvalidated(approval, prot, revision.planHash), null);
     // A changed base SHA invalidates.
     assert.equal(
-      approvalInvalidated(approval, { ...prot, workspace: { ...prot.workspace, baseSha: "changed" } }, revision.planHash),
+      approvalInvalidated(
+        approval,
+        { ...prot, workspace: { ...prot.workspace, baseSha: "changed" } },
+        revision.planHash,
+      ),
       "BASE_SHA",
     );
     // A changed acceptance set invalidates.
     const changedAcceptance = { ...prot, acceptance: [{ id: "AC-9", text: "different" }] };
     assert.equal(approvalInvalidated(approval, changedAcceptance, revision.planHash), "ACCEPTANCE");
     // A changed policy version invalidates first.
-    assert.equal(approvalInvalidated(approval, { ...prot, policyVersion: "policy-v2" }, revision.planHash), "POLICY_VERSION");
+    assert.equal(
+      approvalInvalidated(approval, { ...prot, policyVersion: "policy-v2" }, revision.planHash),
+      "POLICY_VERSION",
+    );
     // A changed normalized plan invalidates.
     assert.equal(approvalInvalidated(approval, prot, "other-plan-hash"), "NORMALIZED_PLAN");
   });

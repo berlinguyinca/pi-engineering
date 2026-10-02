@@ -14,12 +14,7 @@
  */
 
 import { createHash } from "node:crypto";
-import type {
-  SpecAuthorBackend,
-  SpecRefinerBackend,
-  SpecReviewerBackend,
-  SpecWorkerModel,
-} from "./specBackends.ts";
+import type { SpecAuthorBackend, SpecRefinerBackend, SpecReviewerBackend, SpecWorkerModel } from "./specBackends.ts";
 
 export type SpecStage = "draft" | "review" | "refine" | "approve" | "materialize";
 export type SpecReviewVerdict = "approve" | "request_changes";
@@ -216,7 +211,9 @@ export function canonicalSort(value: unknown): unknown {
 }
 
 export function sha256(input: unknown): string {
-  return `sha256:${createHash("sha256").update(JSON.stringify(canonicalSort(input))).digest("hex")}`;
+  return `sha256:${createHash("sha256")
+    .update(JSON.stringify(canonicalSort(input)))
+    .digest("hex")}`;
 }
 
 /** Protected requirement + design content only; excludes plan, ids, provenance, timestamps. */
@@ -268,7 +265,12 @@ export function computeFullRecordHash(revision: Omit<MissionSpecRevision, "fullR
  * Stable deterministic task ID derived from mission ID, semantic spec hash,
  * repository ID, and the normalized task ordinal.
  */
-export function stableTaskId(missionId: string, semanticSpecHash: string, repositoryId: string, ordinal: number): string {
+export function stableTaskId(
+  missionId: string,
+  semanticSpecHash: string,
+  repositoryId: string,
+  ordinal: number,
+): string {
   const digest = createHash("sha256")
     .update(JSON.stringify([missionId, semanticSpecHash, repositoryId, ordinal]))
     .digest("hex")
@@ -355,9 +357,10 @@ export function validatePlannedTasks(
         `task at ordinal ${index} has ${deliverables.length} deliverables (max ${maxDeliverablesPerTask})`,
       );
     }
-    const executionBudget = Number.isFinite(task.execution_budget_ms) && (task.execution_budget_ms ?? 0) > 0
-      ? task.execution_budget_ms!
-      : 30 * 60_000;
+    const executionBudget =
+      Number.isFinite(task.execution_budget_ms) && (task.execution_budget_ms ?? 0) > 0
+        ? task.execution_budget_ms!
+        : 30 * 60_000;
     const taskId = task.task_id?.trim() || stableTaskId("", "", envelope.repositoryId, index);
     if (seen.has(taskId)) throw new SpecApprovalError("DUPLICATE_TASK_ID", `task ID ${taskId} repeated`);
     seen.add(taskId);
@@ -400,8 +403,12 @@ function writeDomainWithin(requested: string[], authorized: string[]): boolean {
 }
 
 /** Strict reviewer-output validation; throws SpecApprovalError when malformed. */
-export function validateReviewResult(raw: unknown, allowedAcceptanceIds: string[]): SpecReviewEvidence["acceptanceResults"] {
-  if (!raw || typeof raw !== "object") throw new SpecApprovalError("MALFORMED_REVIEW", "review result must be an object");
+export function validateReviewResult(
+  raw: unknown,
+  allowedAcceptanceIds: string[],
+): SpecReviewEvidence["acceptanceResults"] {
+  if (!raw || typeof raw !== "object")
+    throw new SpecApprovalError("MALFORMED_REVIEW", "review result must be an object");
   const result = raw as {
     verdict?: unknown;
     findings?: unknown;
@@ -419,7 +426,8 @@ export function validateReviewResult(raw: unknown, allowedAcceptanceIds: string[
   const allowed = new Set(allowedAcceptanceIds);
   const seen = new Set<string>();
   const acceptanceResults = result.acceptanceResults.map((entry) => {
-    if (!entry || typeof entry !== "object") throw new SpecApprovalError("MALFORMED_REVIEW", "malformed acceptance result");
+    if (!entry || typeof entry !== "object")
+      throw new SpecApprovalError("MALFORMED_REVIEW", "malformed acceptance result");
     const value = entry as { acceptanceId?: unknown; result?: unknown };
     const acceptanceId = String(value.acceptanceId ?? "").trim();
     if (!allowed.has(acceptanceId) || seen.has(acceptanceId)) {
@@ -438,7 +446,10 @@ export function validateReviewResult(raw: unknown, allowedAcceptanceIds: string[
     throw new SpecApprovalError("MALFORMED_REVIEW", "review must include a findings array");
   }
   if (!result.reviewerSession || !result.reviewerModel || !result.provider) {
-    throw new SpecApprovalError("INVENTED_PROVENANCE", "review must carry reviewer session, model, and provider provenance");
+    throw new SpecApprovalError(
+      "INVENTED_PROVENANCE",
+      "review must carry reviewer session, model, and provider provenance",
+    );
   }
   return acceptanceResults;
 }
@@ -531,7 +542,11 @@ export interface SpecStore {
   appendReview(review: SpecReviewEvidence): Promise<void>;
   appendApproval(approval: SpecApproval): Promise<void>;
   invalidateApproval(missionId: string, approvalId: string, reason: string, newFencingToken: number): Promise<void>;
-  materializeTasks(missionId: string, revision: MissionSpecRevision, approval: SpecApproval): Promise<SpecMaterializeResult>;
+  materializeTasks(
+    missionId: string,
+    revision: MissionSpecRevision,
+    approval: SpecApproval,
+  ): Promise<SpecMaterializeResult>;
   /** Optional durable state projection hook. */
   persistWorkflowState?(state: SpecWorkflowState): void;
   listTasks(missionId: string): Array<{ task_id: string; approval_id?: string; semantic_spec_hash?: string }>;
@@ -596,7 +611,10 @@ export class MemorySpecStore implements SpecStore {
     for (const task of revision.plan) {
       const existingTask = existing.get(task.task_id);
       if (existingTask) {
-        if (existingTask.approval_id !== approval.approvalId || existingTask.semantic_spec_hash !== approval.semanticSpecHash) {
+        if (
+          existingTask.approval_id !== approval.approvalId ||
+          existingTask.semantic_spec_hash !== approval.semanticSpecHash
+        ) {
           result.mismatched.push(task.task_id);
           mismatched = true;
         } else {
@@ -632,7 +650,6 @@ export class MemorySpecStore implements SpecStore {
 /* ------------------------------------------------------------------ */
 /* Bounded controller state machine                                    */
 /* ------------------------------------------------------------------ */
-
 
 export interface SpecControllerInput {
   missionId: string;
@@ -744,7 +761,12 @@ export class SpecApprovalController {
         };
       }
       // Invalidate stale approval atomically before further dispatch.
-      await this.store.invalidateApproval(this.missionId, existingApproval.approvalId, invalidated, this.attemptCounter);
+      await this.store.invalidateApproval(
+        this.missionId,
+        existingApproval.approvalId,
+        invalidated,
+        this.attemptCounter,
+      );
       this.state = { ...this.state, invalidatedApprovalId: existingApproval.approvalId, approval: null };
     }
 
@@ -814,7 +836,11 @@ export class SpecApprovalController {
       }
       const currentBlockingFingerprint = blockingFindingFingerprint(review.findings);
       const noSemanticChange = previousSemanticHash !== null && previousSemanticHash === revision.semanticSpecHash;
-      if (noSemanticChange && previousBlockingFingerprint !== null && currentBlockingFingerprint === previousBlockingFingerprint) {
+      if (
+        noSemanticChange &&
+        previousBlockingFingerprint !== null &&
+        currentBlockingFingerprint === previousBlockingFingerprint
+      ) {
         return this.stop(
           "REFINEMENT_PLATEAU",
           "Refinement plateaued: identical semantic spec hash and unchanged blocking findings persisted across a round",
@@ -1045,7 +1071,10 @@ export class SpecApprovalController {
     return approval;
   }
 
-  private resolveReviewerModel(): { model: SpecWorkerModel | null; independenceMode: "fresh_context" | "same_model_reduced" } {
+  private resolveReviewerModel(): {
+    model: SpecWorkerModel | null;
+    independenceMode: "fresh_context" | "same_model_reduced";
+  } {
     if (!this.reviewerModel || !this.reviewerModel.id) {
       // No distinct reviewer model: current model in a new session, reduced independence.
       return { model: this.authorModel, independenceMode: "same_model_reduced" };

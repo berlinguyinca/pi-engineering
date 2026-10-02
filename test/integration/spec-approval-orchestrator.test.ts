@@ -14,10 +14,10 @@ import { join } from "node:path";
 import { after, describe, it } from "node:test";
 import { promisify } from "node:util";
 import { MissionSpecStore } from "../../src/orchestration/missionSpecStore.ts";
-import { MissionStore } from "../../src/orchestration/missionStore.ts";
+import type { MissionStore } from "../../src/orchestration/missionStore.ts";
 import {
-  SpecApprovalController,
   type ProtectedUserCriteria,
+  SpecApprovalController,
   type SpecControllerResult,
   type SpecScopeEnvelope,
 } from "../../src/orchestration/specApproval.ts";
@@ -158,7 +158,16 @@ async function openSpecApprovalRuntime(
           proposed_tasks: [],
           details: {},
         },
-        usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 100, turns: 1, model: "fake" },
+        usage: {
+          input: 10,
+          output: 5,
+          cacheRead: 0,
+          cacheWrite: 0,
+          cost: 0,
+          contextTokens: 100,
+          turns: 1,
+          model: "fake",
+        },
         toolCalls: 1,
         structured:
           req.resultTool === "review_result"

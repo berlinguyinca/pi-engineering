@@ -334,6 +334,8 @@ export function buildMissionSnapshotFile(
   return {
     contractVersion: MISSION_SNAPSHOT_CONTRACT_VERSION,
     generatedAt: new Date().toISOString(),
-    missions: missions.map((m) => buildMissionSnapshot(m.mission, m.tasks, m.findings, m.observability, m.stop, m.spec)),
+    missions: missions.map((m) =>
+      buildMissionSnapshot(m.mission, m.tasks, m.findings, m.observability, m.stop, m.spec),
+    ),
   };
 }

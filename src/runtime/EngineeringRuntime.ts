@@ -524,7 +524,9 @@ export class EngineeringRuntime {
   }
 
   /** Project the durable autonomous-spec-approval state into the mission snapshot. */
-  private buildSpecApprovalSnapshot(missionId: string): import("../orchestration/missionSnapshot.ts").MissionSpecInput | null {
+  private buildSpecApprovalSnapshot(
+    missionId: string,
+  ): import("../orchestration/missionSnapshot.ts").MissionSpecInput | null {
     const store = this.missionStore;
     if (!store) return null;
     const approval = store.getSpecApproval(missionId);
