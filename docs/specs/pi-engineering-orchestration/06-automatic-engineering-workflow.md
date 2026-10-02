@@ -99,3 +99,18 @@ When the user adds a constraint while work is active:
 The same invalidation and rescheduling rules apply to automatic scope repair,
 checkpoint recovery, task splitting, and blocked-mission resumption. Preserve
 the mission ID and failed-attempt audit history.
+
+## Autonomous spec approval
+
+Material mutation workflows may run an autonomous spec-approval stage before
+implementation tasks exist. That stage drafts a structured spec, reviews the
+exact revision and normalized plan, refines within a bounded budget, and
+persists an exact-revision policy approval.
+
+Autonomous spec approval is **exact-revision policy authorization**, not human
+approval, not Plannotator approval, and not implementation correctness
+evidence. It authorizes only the exact reviewed spec revision and normalized
+task plan to enter the execution pipeline, and never satisfies implementation
+validation, candidate review, acceptance evidence, or mission completion.
+
+See `docs/superpowers/specs/2026-09-28-autonomous-spec-approval-design.md`.

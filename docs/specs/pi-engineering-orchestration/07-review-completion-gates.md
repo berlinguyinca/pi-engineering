@@ -136,3 +136,15 @@ Produce:
   ]
 }
 ```
+
+## Spec approval is not review evidence
+
+Autonomous spec approval is **exact-revision policy authorization**: it
+authorizes only the exact reviewed spec revision and normalized task plan to
+enter the execution pipeline. It is **not** human approval, **not** Plannotator
+approval, and **not** implementation correctness evidence.
+
+Spec approval occurs before implementation and is a distinct gate from
+candidate review and completion. It never satisfies the independent-review
+gate, validation, acceptance evidence, or the completion gate above. Verified
+acceptance coverage remains zero until implementation evidence exists.

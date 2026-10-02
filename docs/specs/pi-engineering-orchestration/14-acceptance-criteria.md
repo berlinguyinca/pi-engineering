@@ -172,3 +172,12 @@ Document:
 - configuration
 - debugging
 - migration from existing workflow behavior
+
+## Autonomous spec approval semantics
+
+Autonomous spec approval is **exact-revision policy authorization**, not human
+approval, not Plannotator approval, and not implementation correctness evidence.
+It authorizes only the exact reviewed spec revision and normalized task plan to
+enter the execution pipeline. It never satisfies implementation validation,
+candidate review, acceptance evidence, or mission completion; verified
+acceptance coverage remains zero until implementation evidence exists.
