@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { access, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
+import { access, lstat, mkdir, readFile, readdir, realpath, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -120,6 +120,52 @@ test("worktrees are created OUTSIDE the repo tree, even when opened from a subdi
       );
     } finally {
       await subdirRepo.removeWorktree(wt);
+    }
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("createWorktree links the repo root's node_modules into the worktree (verifier binary resolution)", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const repo = (await GitRepo.open(fixture.root))!;
+    const head = await repo.headCommit();
+    // A node_modules at the repo root with a marker so the link target is
+    // verifiable. The verifier resolves bare binaries (tsc, biome, ...) by
+    // walking up from the worktree cwd for node_modules/.bin; a sibling
+    // worktree never reaches the repo root otherwise ("tsc: not found").
+    const nmRoot = join(fixture.root, "node_modules");
+    await mkdir(join(nmRoot, ".bin"), { recursive: true });
+    await writeFile(join(nmRoot, "marker.txt"), "shared\n");
+    const branch = `pi-eng-node-modules-${Date.now()}`;
+    const wt = await repo.createWorktree(head, branch);
+    try {
+      const linkPath = join(wt.path, "node_modules");
+      const st = await lstat(linkPath);
+      assert.ok(st.isSymbolicLink(), `expected a node_modules symlink in ${wt.path}`);
+      assert.equal(await realpath(linkPath), await realpath(nmRoot));
+      // The shared content is reachable through the worktree link.
+      assert.equal((await readFile(join(linkPath, "marker.txt"), "utf8")).trim(), "shared");
+    } finally {
+      await repo.removeWorktree(wt);
+    }
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("createWorktree leaves node_modules absent when the repo root has none", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const repo = (await GitRepo.open(fixture.root))!;
+    const head = await repo.headCommit();
+    const branch = `pi-eng-no-node-modules-${Date.now()}`;
+    const wt = await repo.createWorktree(head, branch);
+    try {
+      await assert.rejects(lstat(join(wt.path, "node_modules")), /ENOENT/);
+    } finally {
+      await repo.removeWorktree(wt);
     }
   } finally {
     await fixture.cleanup();
