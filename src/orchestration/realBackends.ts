@@ -693,8 +693,16 @@ export function realBackends(opts: RealBackendsOptions) {
         if (input.repoId && !input.candidate) {
           throw new Error("CANDIDATE_UNAVAILABLE: integration cannot fall back to the incumbent checkout");
         }
-        // Integrator (spec 05): merge each worker worktree branch into the
-        // current checkout sequentially, then run integration checks.
+        // Integrator (spec 05): merge each worker worktree branch into an
+        // ISOLATED worktree, then run integration checks there. Integration MUST
+        // never merge into the incumbent/shared checkout's branch (AGENTS.md
+        // no-direct-to-main; INV-004 isolation). Candidate-scoped missions pass
+        // an existing candidate worktree; the legacy in-process path (no
+        // candidate) previously merged into the current checkout's main and
+        // dirtied the shared local main — now it gets a dedicated integration
+        // worktree from HEAD instead, and the integration branch is the
+        // deliverable.
+        //
         // Recovered work (from a timed-out execution) merges its exact worker
         // commit, and a conflict on it is reported but does not fail the
         // integration: the branch stays preserved, and clean work is not held
@@ -703,11 +711,26 @@ export function realBackends(opts: RealBackendsOptions) {
         const recovered: string[] = [];
         const conflicts: string[] = [];
         const skippedRecovered: string[] = [];
-        for (const [sequence, h] of input.handoffs.entries()) {
-          input.signal.throwIfAborted();
-          const r = await (input.candidate
-            ? repo.git.mergeRefInWorktree(
-                input.candidate,
+        const base = await repo.git.headCommit();
+        const integrationWt = input.candidate
+          ? undefined
+          : await repo.git.createWorktree(base, `pi-eng-integrate-${base.slice(0, 7)}-${Date.now().toString(36)}`);
+        const target = input.candidate ?? integrationWt;
+        if (!target) {
+          return {
+            executionId: "integration",
+            exitStatus: "failed",
+            summary: "no isolated integration target available",
+            artifactRefs: [],
+            usage: {},
+          };
+        }
+        try {
+          for (const [sequence, h] of input.handoffs.entries()) {
+            input.signal.throwIfAborted();
+            const r = await repo.git
+              .mergeRefInWorktree(
+                target,
                 h.ref ?? h.worktree.branch,
                 input.authority,
                 input.candidateLifecycle,
@@ -715,62 +738,72 @@ export function realBackends(opts: RealBackendsOptions) {
                 {},
                 input.integrationRun,
               )
-            : repo.git.mergeBranch(h.ref ?? h.worktree.branch)
-          ).catch((e: Error) => ({
-            merged: false,
-            reason: e.message,
-          }));
+              .catch((e: Error) => ({
+                merged: false,
+                reason: e.message,
+              }));
+            input.signal.throwIfAborted();
+            const reason = `${h.worktree.branch}: ${(r as { reason?: string }).reason ?? "conflict"}`;
+            if (r.merged) (h.recovered ? recovered : merged).push(h.worktree.branch);
+            else (h.recovered ? skippedRecovered : conflicts).push(reason);
+          }
+          const recoveredNote =
+            (recovered.length ? `; recovered from timed-out execution(s): ${recovered.join(", ")}` : "") +
+            (skippedRecovered.length
+              ? `; recovered work NOT merged (kept on its branch): ${skippedRecovered.join("; ")}`
+              : "");
+          if (conflicts.length > 0) {
+            return {
+              executionId: "integration",
+              exitStatus: "conflict",
+              summary: `integration conflicts: ${conflicts.join("; ")}${recoveredNote}`,
+              artifactRefs: [],
+              usage: { mergedBranches: merged.length + recovered.length, conflicts: conflicts.length },
+            };
+          }
           input.signal.throwIfAborted();
-          const reason = `${h.worktree.branch}: ${(r as { reason?: string }).reason ?? "conflict"}`;
-          if (r.merged) (h.recovered ? recovered : merged).push(h.worktree.branch);
-          else (h.recovered ? skippedRecovered : conflicts).push(reason);
-        }
-        const recoveredNote =
-          (recovered.length ? `; recovered from timed-out execution(s): ${recovered.join(", ")}` : "") +
-          (skippedRecovered.length
-            ? `; recovered work NOT merged (kept on its branch): ${skippedRecovered.join("; ")}`
-            : "");
-        if (conflicts.length > 0) {
+          const candidateCwd = target.path;
+          if (input.candidateLifecycle) {
+            await repo.git.beginCandidateCheck(
+              input.candidateLifecycle,
+              "integration-verifier",
+              input.authority,
+              input.integrationRun,
+            );
+          }
+          const checks = await opts.verifier.detect(candidateCwd);
+          input.signal.throwIfAborted();
+          const result = await opts.verifier.run(candidateCwd, checks, opts.artifacts, { signal: input.signal });
+          if (input.candidateLifecycle) {
+            await repo.git.completeCandidateCheck(
+              input.candidateLifecycle,
+              "integration-verifier",
+              result.passed,
+              input.authority,
+              input.integrationRun,
+            );
+          }
+          const artifactRefs = result.evidence.flatMap((e) => e.artifacts).filter(Boolean);
+          const artifactState = await artifactContentHashes(opts.artifacts, artifactRefs);
           return {
             executionId: "integration",
-            exitStatus: "conflict",
-            summary: `integration conflicts: ${conflicts.join("; ")}${recoveredNote}`,
-            artifactRefs: [],
-            usage: { mergedBranches: merged.length + recovered.length, conflicts: conflicts.length },
+            exitStatus: result.passed ? "succeeded" : "failed",
+            summary: `integrated ${merged.join(", ") || "nothing"}${recoveredNote} into ${target.branch}; checks: ${result.passed ? "pass" : "fail"}`,
+            artifactRefs,
+            artifactHashes: artifactState.hashes,
+            usage: {
+              mergedBranches: merged.length + recovered.length,
+              conflicts: conflicts.length,
+              integrationBranch: target.branch,
+            },
           };
+        } finally {
+          // Keep the integration branch (it is the deliverable); remove only the
+          // worktree directory we created.
+          if (integrationWt) {
+            await repo.git.removeWorktree(integrationWt, { keepBranch: true }).catch(() => {});
+          }
         }
-        input.signal.throwIfAborted();
-        const candidateCwd = input.candidate?.path ?? repo.cwd;
-        if (input.candidateLifecycle) {
-          await repo.git.beginCandidateCheck(
-            input.candidateLifecycle,
-            "integration-verifier",
-            input.authority,
-            input.integrationRun,
-          );
-        }
-        const checks = await opts.verifier.detect(candidateCwd);
-        input.signal.throwIfAborted();
-        const result = await opts.verifier.run(candidateCwd, checks, opts.artifacts, { signal: input.signal });
-        if (input.candidateLifecycle) {
-          await repo.git.completeCandidateCheck(
-            input.candidateLifecycle,
-            "integration-verifier",
-            result.passed,
-            input.authority,
-            input.integrationRun,
-          );
-        }
-        const artifactRefs = result.evidence.flatMap((e) => e.artifacts).filter(Boolean);
-        const artifactState = await artifactContentHashes(opts.artifacts, artifactRefs);
-        return {
-          executionId: "integration",
-          exitStatus: result.passed ? "succeeded" : "failed",
-          summary: `integrated ${merged.join(", ") || "nothing"}${recoveredNote}; checks: ${result.passed ? "pass" : "fail"}`,
-          artifactRefs,
-          artifactHashes: artifactState.hashes,
-          usage: { mergedBranches: merged.length + recovered.length, conflicts: conflicts.length },
-        };
       },
     },
   };
