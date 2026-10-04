@@ -496,9 +496,30 @@ describe("realBackends integration: recovered handoffs", () => {
       assert.equal(out.exitStatus, "succeeded", out.summary);
       assert.match(out.summary, /recovered/);
       assert.match(out.summary, /rec-conflict/);
-      assert.equal(readFileSync(join(fx.root, "src", "add.js"), "utf8"), "export const add = (a, b) => a + b;\n");
-      assert.ok(existsSync(join(fx.root, "src", "extra.js")), "the recovered worker commit is merged");
-      assert.ok(!existsSync(join(fx.root, "src", "half.js")), "the harvest commit on the branch tip is not");
+      // Integration must be ISOLATED: it merges into a dedicated integration
+      // worktree/branch, never the shared checkout. fx.root stays on its own
+      // branch with the fixture's original files; the worker's files only land
+      // on the integration branch (add.js exists in the fixture, so use the
+      // worker-only files as the isolation marker).
+      assert.equal(
+        readFileSync(join(fx.root, "src", "add.js"), "utf8"),
+        'export function add(a, b) {\n  throw new Error("not implemented");\n}\n',
+        "shared checkout's add.js is untouched by integration",
+      );
+      assert.ok(!existsSync(join(fx.root, "src", "extra.js")), "shared checkout is not modified by integration");
+      assert.ok(!existsSync(join(fx.root, "src", "half.js")), "harvest commit is not in the shared checkout");
+      const branch = (out.usage as { integrationBranch?: string }).integrationBranch;
+      assert.ok(branch, "integration branch is reported as the deliverable");
+      assert.equal(sh(fx.root, "show", `${branch}:src/add.js`), "export const add = (a, b) => a + b;");
+      assert.equal(sh(fx.root, "show", `${branch}:src/extra.js`), "export const extra = 1;");
+      // The harvest auto-commit on the recovered branch tip must NOT be merged.
+      let halfPresent = true;
+      try {
+        sh(fx.root, "show", `${branch}:src/half.js`);
+      } catch {
+        halfPresent = false;
+      }
+      assert.equal(halfPresent, false, "the harvest commit on the branch tip is not merged");
     } finally {
       await fx.cleanup();
     }
@@ -509,7 +530,14 @@ describe("realBackends integration: recovered handoffs", () => {
     const merged: string[] = [];
     let verificationRuns = 0;
     const git = {
-      async mergeBranch(branch: string) {
+      async headCommit() {
+        return "base";
+      },
+      async createWorktree() {
+        return { path: "/wt", branch: "pi-eng-integrate-base" };
+      },
+      async removeWorktree() {},
+      async mergeRefInWorktree(_target: unknown, branch: string) {
         merged.push(branch);
         controller.abort();
         return { merged: true };
