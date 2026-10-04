@@ -12,10 +12,14 @@
  * tests pin the location semantics and reproduce + resolve the contention.
  */
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { promisify } from "node:util";
+
+const exec = promisify(execFile);
 import { after, describe, it } from "node:test";
 import { ExclusiveFileLock } from "../../src/platform/eventstore/fileLock.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
@@ -75,6 +79,33 @@ describe("orchestration store location (per-worktree lock)", () => {
         const lockAtDefault = join(fx.root, ".pi-eng", "orchestration.jsonl.lock");
         assert.ok(existsSync(join(fx.root, ".pi-eng")), "workDir .pi-eng is created");
         assert.ok(existsSync(lockAtDefault), "writer lock lives at the default <workDir> location");
+      } finally {
+        await rt.close();
+      }
+    });
+  });
+
+  it("isolates the store + lock per linked git worktree by default (no env var)", async () => {
+    await withEnv(undefined, async () => {
+      const fx = await makeFixtureRepo();
+      cleanupFns.push(fx.cleanup);
+      const wtPath = join(await mkdtemp(join(tmpdir(), "pi-orch-wt-")), "checkout");
+      cleanupFns.push(() => rm(wtPath, { recursive: true, force: true }));
+      await exec("git", ["-C", fx.root, "worktree", "add", "-b", "iso-wt", wtPath, "HEAD"]);
+      const rt = await EngineeringRuntime.open({
+        cwd: wtPath,
+        worker: noopWorker(),
+        verifier: new CommandVerifier(),
+      });
+      try {
+        assert.ok(
+          existsSync(join(wtPath, ".pi-eng", "orchestration.jsonl.lock")),
+          "writer lock lives in the worktree's own .pi-eng (isolated)",
+        );
+        assert.ok(
+          !existsSync(join(fx.root, ".pi-eng", "orchestration.jsonl.lock")),
+          "no writer lock is written to the primary checkout's shared store",
+        );
       } finally {
         await rt.close();
       }

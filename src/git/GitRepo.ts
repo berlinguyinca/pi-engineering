@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { access, lstat, mkdir, readFile, readdir, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
-import { basename, join } from "node:path";
+import { basename, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { ExclusiveFileLock } from "../platform/eventstore/fileLock.ts";
 
@@ -249,6 +249,23 @@ export class GitRepo {
     const r = await this.git(["rev-parse", "--path-format=absolute", "--git-common-dir"]);
     if (r.code !== 0) throw new Error(`git common directory lookup failed: ${r.stderr}`);
     return r.stdout;
+  }
+
+  /** This checkout's git administration dir: `<repo>/.git` for a primary
+   *  checkout, or `<commonDir>/worktrees/<name>` for a linked worktree. */
+  async gitDir(): Promise<string> {
+    const r = await this.git(["rev-parse", "--path-format=absolute", "--git-dir"]);
+    if (r.code !== 0) throw new Error(`git directory lookup failed: ${r.stderr}`);
+    return r.stdout;
+  }
+
+  /** True when this checkout is a linked git worktree (its per-checkout git-dir
+   *  is a `worktrees/<name>` subdir of the shared common dir), rather than the
+   *  primary checkout. Used to decide whether orchestration state is already
+   *  isolated per worktree. */
+  async isLinkedWorktree(): Promise<boolean> {
+    const [gitDir, common] = await Promise.all([this.gitDir(), this.commonDir()]);
+    return resolve(gitDir) !== resolve(common);
   }
 
   private async candidateStateDir(create = true): Promise<string> {

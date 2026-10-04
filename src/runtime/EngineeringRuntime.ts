@@ -425,6 +425,33 @@ function resolveOrchestrationDir(workDir: string): string {
 }
 
 /**
+ * Surface the isolation contract once per process. The durable orchestration
+ * store (and its single-writer lock) lives per repo ROOT. When a session runs
+ * inside a linked git worktree, `repoRoot` is already the worktree root, so the
+ * store is isolated per worktree with no env var. When a session runs at the
+ * primary checkout (or an unrelated root), the store is shared by every session
+ * launched from that root — the contention incident. Tell the operator once so
+ * the remedy is known up front rather than only when the lock is refused.
+ */
+let sharedStoreWarned = false;
+async function maybeWarnSharedStore(git: GitRepo | null): Promise<void> {
+  if (sharedStoreWarned) return;
+  const override = process.env.PI_ENGINEERING_ORCHESTRATION_DIR;
+  if (override && override.trim() !== "") return; // explicitly isolated
+  if (!git) return;
+  try {
+    if (await git.isLinkedWorktree()) return; // already isolated per worktree
+  } catch {
+    return; // never block startup on a probe
+  }
+  sharedStoreWarned = true;
+  emitTelemetry({
+    level: "info",
+    text: "Engineering orchestration store is shared per repository root. Run missions from a git worktree (or set PI_ENGINEERING_ORCHESTRATION_DIR) so concurrent sessions do not serialize on one store lock.",
+  });
+}
+
+/**
  * The Engineering Runtime facade. Owns the ledger, artifact store, context
  * broker, git provider, verifier, and worker executor for one repository, and
  * exposes the vertical-slice workflows: scout, implement, verify, review,
@@ -710,6 +737,7 @@ export class EngineeringRuntime {
     const repoRoot = git ? git.root : opts.cwd;
     const workDir = opts.workDir ?? join(repoRoot, ".pi-eng");
     const orchestrationDir = resolveOrchestrationDir(workDir);
+    await maybeWarnSharedStore(git);
     const openKey = `${resolve(repoRoot)}\0${resolve(workDir)}\0${resolve(orchestrationDir)}`;
     const existing = openingRuntimes.get(openKey);
     if (existing) {
