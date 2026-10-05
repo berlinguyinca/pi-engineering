@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { access, lstat, mkdir, readFile, readdir, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { promisify } from "node:util";
@@ -355,7 +355,7 @@ export class GitRepo {
     guard?.assertAuthoritative();
     const dir = await this.candidateStateDir();
     const target = join(dir, this.branchCleanupStateName(record));
-    const temporary = `${target}.${process.pid}.tmp`;
+    const temporary = `${target}.${process.pid}.${randomUUID()}.tmp`;
     await writeFile(temporary, JSON.stringify(record), "utf8");
     guard?.assertAuthoritative();
     await rename(temporary, target);
@@ -420,7 +420,7 @@ export class GitRepo {
     guard?.assertAuthoritative();
     const dir = await this.candidateStateDir();
     const target = join(dir, this.promotionStateName(record));
-    const temporary = `${target}.${process.pid}.tmp`;
+    const temporary = `${target}.${process.pid}.${randomUUID()}.tmp`;
     await writeFile(temporary, JSON.stringify(record), "utf8");
     guard?.assertAuthoritative();
     await rename(temporary, target);
@@ -430,7 +430,7 @@ export class GitRepo {
     guard?.assertAuthoritative();
     const dir = await this.candidateStateDir();
     const target = join(dir, this.candidateStateName(record));
-    const temporary = `${target}.${process.pid}.tmp`;
+    const temporary = `${target}.${process.pid}.${randomUUID()}.tmp`;
     await writeFile(temporary, JSON.stringify(record), "utf8");
     guard?.assertAuthoritative();
     await rename(temporary, target);
@@ -449,7 +449,7 @@ export class GitRepo {
     guard?.assertAuthoritative();
     const dir = await this.candidateStateDir();
     const target = join(dir, this.integrationRunStateName(record));
-    const temporary = `${target}.${process.pid}.tmp`;
+    const temporary = `${target}.${process.pid}.${randomUUID()}.tmp`;
     await writeFile(temporary, JSON.stringify(record), "utf8");
     guard?.assertAuthoritative();
     await rename(temporary, target);
