@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { describe, it } from "node:test";
+import { after, describe, it } from "node:test";
 import { taskCoverageFingerprint } from "../../src/orchestration/evidence.ts";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
 import { MissionObservability } from "../../src/orchestration/observability/MissionObservability.ts";
@@ -48,6 +48,17 @@ function harness(initialNow = Date.parse("2026-09-27T12:00:00.000Z")) {
 }
 
 describe("MissionSupervisor", () => {
+  const keepAliveHandles = new Set<NodeJS.Timeout>();
+  // Keep the event loop alive across the unref'd supervisor-tick tests so the
+  // awaited 1ms ticks fire deterministically (see keepAlive in those subtests).
+  const trackKeepAlive = (h: NodeJS.Timeout) => {
+    keepAliveHandles.add(h);
+    return h;
+  };
+  after(() => {
+    for (const h of keepAliveHandles) clearInterval(h);
+    keepAliveHandles.clear();
+  });
   it("schedules durable orphan recovery for zero-worker runnable work", async () => {
     const h = harness();
     const task = h.store.createTask({
@@ -385,6 +396,10 @@ describe("MissionSupervisor", () => {
   });
 
   it("treats an interval tick invalidated by resume as cancellation without an unhandled rejection", async () => {
+    // The supervisor tick timer is unref'd so it never keeps the process
+    // alive; a ref'd keep-alive keeps the event loop running so the awaited
+    // 1ms ticks fire deterministically. Cleared in the test's finally/afterAll.
+    const keepAlive = trackKeepAlive(setInterval(() => {}, 100));
     const h = harness();
     const originalFlush = h.store.flush.bind(h.store);
     let releaseFlush!: () => void;
@@ -431,6 +446,10 @@ describe("MissionSupervisor", () => {
   });
 
   it("surfaces unexpected interval tick failures through diagnostics and the error callback", async () => {
+    // The supervisor tick timer is unref'd so it never keeps the process
+    // alive; a ref'd keep-alive keeps the event loop running so the awaited
+    // 1ms ticks fire deterministically. Cleared in the test's finally/afterAll.
+    const keepAlive = trackKeepAlive(setInterval(() => {}, 100));
     const h = harness();
     let supervisor!: MissionSupervisor;
     const reported = new Promise<{ message: string }>((resolve) => {
@@ -453,6 +472,10 @@ describe("MissionSupervisor", () => {
   });
 
   it("captures an async error callback rejection without emitting an unhandled rejection", async () => {
+    // The supervisor tick timer is unref'd so it never keeps the process
+    // alive; a ref'd keep-alive keeps the event loop running so the awaited
+    // 1ms ticks fire deterministically. Cleared in the test's finally/afterAll.
+    const keepAlive = trackKeepAlive(setInterval(() => {}, 100));
     const h = harness();
     let callbackInvoked!: () => void;
     const invoked = new Promise<void>((resolve) => {
@@ -501,6 +524,10 @@ describe("MissionSupervisor", () => {
   });
 
   it("caps overlapping interval failures as atomic incidents with their async callback failures", async () => {
+    // The supervisor tick timer is unref'd so it never keeps the process
+    // alive; a ref'd keep-alive keeps the event loop running so the awaited
+    // 1ms ticks fire deterministically. Cleared in the test's finally/afterAll.
+    const keepAlive = trackKeepAlive(setInterval(() => {}, 100));
     const h = harness();
     const failureCount = 125;
     let releaseCallbacks!: () => void;
@@ -573,6 +600,10 @@ describe("MissionSupervisor", () => {
   });
 
   it("shutdown blocks new ticks and drains an active status consumer before resolving", async () => {
+    // The supervisor tick timer is unref'd so it never keeps the process
+    // alive; a ref'd keep-alive keeps the event loop running so the awaited
+    // 1ms ticks fire deterministically. Cleared in the test's finally/afterAll.
+    const keepAlive = trackKeepAlive(setInterval(() => {}, 100));
     const h = harness();
     const task = h.store.createTask({
       mission_id: h.mission.mission_id,
