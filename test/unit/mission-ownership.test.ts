@@ -11,6 +11,11 @@ import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 import { EngineeringRuntime } from "../../src/runtime/EngineeringRuntime.ts";
 import { FakeWorkerExecutor } from "../../src/workers/FakeWorkerExecutor.ts";
 
+function restoreOrchestrationDir(prior: string | undefined): void {
+  if (prior === undefined) delete process.env.PI_ENGINEERING_ORCHESTRATION_DIR;
+  else process.env.PI_ENGINEERING_ORCHESTRATION_DIR = prior;
+}
+
 function mission(store: MissionStore, missionId: string) {
   return store.createMission({
     mission_id: missionId,
@@ -281,96 +286,124 @@ describe("MissionOwnership", () => {
   it("keeps a shared runtime writer lock until the final runtime closes", async () => {
     const root = await mkdtemp(join(tmpdir(), "pie-runtime-ownership-"));
     const workDir = join(root, ".pi-eng");
-    const file = join(workDir, "orchestration.jsonl");
-    const first = await EngineeringRuntime.open({
-      cwd: root,
-      workDir,
-      worker: new FakeWorkerExecutor({}),
-    });
-    const second = await EngineeringRuntime.open({
-      cwd: root,
-      workDir,
-      worker: new FakeWorkerExecutor({}),
-    });
+    const orchestrationDir = join(root, "orch-store");
+    const file = join(orchestrationDir, "orchestration.jsonl");
+    const priorOrchestrationDir = process.env.PI_ENGINEERING_ORCHESTRATION_DIR;
+    process.env.PI_ENGINEERING_ORCHESTRATION_DIR = orchestrationDir;
+    try {
+      const first = await EngineeringRuntime.open({
+        cwd: root,
+        workDir,
+        worker: new FakeWorkerExecutor({}),
+      });
+      const second = await EngineeringRuntime.open({
+        cwd: root,
+        workDir,
+        worker: new FakeWorkerExecutor({}),
+      });
 
-    await first.close();
-    await assert.rejects(() => JsonlEventStore.open(file), /already open|writer lock/i);
-    await second.close();
+      await first.close();
+      await assert.rejects(() => JsonlEventStore.open(file), /already open|writer lock/i);
+      await second.close();
 
-    const afterFinalClose = await JsonlEventStore.open(file);
-    afterFinalClose.close();
+      const afterFinalClose = await JsonlEventStore.open(file);
+      afterFinalClose.close();
+    } finally {
+      restoreOrchestrationDir(priorOrchestrationDir);
+    }
   });
 
   it("accounts for every concurrent open of the single-flight runtime", async () => {
     const root = await mkdtemp(join(tmpdir(), "pie-runtime-concurrent-ownership-"));
     const workDir = join(root, ".pi-eng");
-    const file = join(workDir, "orchestration.jsonl");
-    const [first, second] = await Promise.all([
-      EngineeringRuntime.open({
-        cwd: root,
-        workDir,
-        worker: new FakeWorkerExecutor({}),
-      }),
-      EngineeringRuntime.open({
-        cwd: root,
-        workDir,
-        worker: new FakeWorkerExecutor({}),
-      }),
-    ]);
-    assert.strictEqual(first, second);
+    const orchestrationDir = join(root, "orch-store");
+    const file = join(orchestrationDir, "orchestration.jsonl");
+    const priorOrchestrationDir = process.env.PI_ENGINEERING_ORCHESTRATION_DIR;
+    process.env.PI_ENGINEERING_ORCHESTRATION_DIR = orchestrationDir;
+    try {
+      const [first, second] = await Promise.all([
+        EngineeringRuntime.open({
+          cwd: root,
+          workDir,
+          worker: new FakeWorkerExecutor({}),
+        }),
+        EngineeringRuntime.open({
+          cwd: root,
+          workDir,
+          worker: new FakeWorkerExecutor({}),
+        }),
+      ]);
+      assert.strictEqual(first, second);
 
-    await first.close();
-    await assert.rejects(() => JsonlEventStore.open(file), /already open|writer lock/i);
-    await second.close();
+      await first.close();
+      await assert.rejects(() => JsonlEventStore.open(file), /already open|writer lock/i);
+      await second.close();
 
-    const reopened = await JsonlEventStore.open(file);
-    reopened.close();
+      const reopened = await JsonlEventStore.open(file);
+      reopened.close();
+    } finally {
+      restoreOrchestrationDir(priorOrchestrationDir);
+    }
   });
 
   it("rolls back the writer reference when runtime initialization fails", async () => {
     const root = await mkdtemp(join(tmpdir(), "pie-runtime-failed-open-"));
     const workDir = join(root, ".pi-eng");
-    const file = join(workDir, "orchestration.jsonl");
-    await assert.rejects(
-      () =>
-        EngineeringRuntime.open({
-          cwd: root,
-          workDir,
-          worker: new FakeWorkerExecutor({}),
-          blackhole: { config: { memoryWorkerConcurrency: 0 } },
-        }),
-      /memoryWorkerConcurrency/,
-    );
+    const orchestrationDir = join(root, "orch-store");
+    const file = join(orchestrationDir, "orchestration.jsonl");
+    const priorOrchestrationDir = process.env.PI_ENGINEERING_ORCHESTRATION_DIR;
+    process.env.PI_ENGINEERING_ORCHESTRATION_DIR = orchestrationDir;
+    try {
+      await assert.rejects(
+        () =>
+          EngineeringRuntime.open({
+            cwd: root,
+            workDir,
+            worker: new FakeWorkerExecutor({}),
+            blackhole: { config: { memoryWorkerConcurrency: 0 } },
+          }),
+        /memoryWorkerConcurrency/,
+      );
 
-    const reopened = await JsonlEventStore.open(file);
-    reopened.close();
+      const reopened = await JsonlEventStore.open(file);
+      reopened.close();
+    } finally {
+      restoreOrchestrationDir(priorOrchestrationDir);
+    }
   });
 
   it("keeps close retryable when flushing fails", async () => {
     const root = await mkdtemp(join(tmpdir(), "pie-runtime-close-retry-"));
     const workDir = join(root, ".pi-eng");
-    const file = join(workDir, "orchestration.jsonl");
-    const runtime = await EngineeringRuntime.open({
-      cwd: root,
-      workDir,
-      worker: new FakeWorkerExecutor({}),
-    });
-    const store = runtime.missionStore!;
-    const originalFlush = store.flush.bind(store);
-    let attempts = 0;
-    store.flush = async () => {
-      attempts++;
-      if (attempts === 1) throw new Error("injected close flush failure");
-      await originalFlush();
-    };
+    const orchestrationDir = join(root, "orch-store");
+    const file = join(orchestrationDir, "orchestration.jsonl");
+    const priorOrchestrationDir = process.env.PI_ENGINEERING_ORCHESTRATION_DIR;
+    process.env.PI_ENGINEERING_ORCHESTRATION_DIR = orchestrationDir;
+    try {
+      const runtime = await EngineeringRuntime.open({
+        cwd: root,
+        workDir,
+        worker: new FakeWorkerExecutor({}),
+      });
+      const store = runtime.missionStore!;
+      const originalFlush = store.flush.bind(store);
+      let attempts = 0;
+      store.flush = async () => {
+        attempts++;
+        if (attempts === 1) throw new Error("injected close flush failure");
+        await originalFlush();
+      };
 
-    await assert.rejects(() => runtime.close(), /injected close flush failure/);
-    assert.strictEqual(runtime.missionStore, store, "failed close must leave the runtime usable");
-    await assert.rejects(() => JsonlEventStore.open(file), /already open|writer lock/i);
+      await assert.rejects(() => runtime.close(), /injected close flush failure/);
+      assert.strictEqual(runtime.missionStore, store, "failed close must leave the runtime usable");
+      await assert.rejects(() => JsonlEventStore.open(file), /already open|writer lock/i);
 
-    await runtime.close();
-    const reopened = await JsonlEventStore.open(file);
-    reopened.close();
+      await runtime.close();
+      const reopened = await JsonlEventStore.open(file);
+      reopened.close();
+    } finally {
+      restoreOrchestrationDir(priorOrchestrationDir);
+    }
   });
 
   it("does not let lease release failure mask a completed mission outcome", async () => {
