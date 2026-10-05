@@ -1050,6 +1050,41 @@ export class ArtifactStore {
     await this.recoverTransaction(opened, transaction.category, transaction.id);
   }
 
+  /**
+   * Legacy stores (pre-digest metadata) wrote artifact metas without the
+   * `sha256` field. Backfill the digest from the stored content once so the
+   * strict validation below accepts genuinely intact legacy artifacts instead
+   * of refusing to open the whole store. Anything actually corrupt (size or
+   * digest mismatch after backfill) still fails closed.
+   */
+  private async backfillLegacyMeta(opened: OpenCategory, category: string, id: string): Promise<void> {
+    const metaPath = this.filePath(opened, id, "json");
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse((await this.readFileNoFollow(metaPath, `artifact metadata ${category}/${id}`)).toString("utf8"));
+    } catch {
+      return; // unreadable/corrupt: let normal validation produce the precise error
+    }
+    const candidate = parsed as Partial<StoredArtifactMeta> | null;
+    if (!candidate || typeof candidate !== "object" || candidate.sha256 !== undefined) return;
+    if (
+      candidate.id !== id ||
+      candidate.category !== category ||
+      candidate.uri !== this.uri(category, id) ||
+      typeof candidate.size !== "number" ||
+      !Number.isSafeInteger(candidate.size) ||
+      candidate.size < 0 ||
+      typeof candidate.created_at !== "string" ||
+      typeof candidate.summary !== "string"
+    ) {
+      return; // malformed beyond the missing digest: fail closed via normal validation
+    }
+    const content = await this.readFileNoFollow(this.filePath(opened, id, "txt"), `artifact content ${category}/${id}`);
+    if (content.byteLength !== candidate.size) return; // real corruption: fail closed below
+    const migrated: StoredArtifactMeta = { ...candidate, sha256: digest(content) } as StoredArtifactMeta;
+    await this.writeAtomic(opened, `${id}.json`, JSON.stringify(migrated, null, 2));
+  }
+
   private async scan(): Promise<void> {
     const root = await this.openRoot();
     let entries;
@@ -1098,6 +1133,7 @@ export class ArtifactStore {
           const id = file.name.slice(0, -".json".length);
           this.key(entry.name, id);
           if (file.isSymbolicLink()) throw integrityError(`artifact metadata ${entry.name}/${id} is a symlink`);
+          await this.backfillLegacyMeta(rescanned, entry.name, id);
           const durable = await this.readDurableFromCategory(rescanned, entry.name, id);
           if (!durable) throw integrityError(`artifact metadata disappeared during replay for ${entry.name}/${id}`);
           metadataIds.add(id);
