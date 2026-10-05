@@ -10,7 +10,7 @@ import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, it } from "node:test";
+import { after, describe, it } from "node:test";
 import { ArtifactStore } from "../../src/artifacts/ArtifactStore.ts";
 import { GitRepo } from "../../src/git/GitRepo.ts";
 import {
@@ -159,6 +159,12 @@ async function scenario(steps: Step[], mode: IntegrationMode = {}) {
 }
 
 describe("ExecutionBroker: recovering a timed-out worker's committed work", () => {
+  // Keep the event loop alive: the broker's deadline/activity timers are
+  // unref'd (correct in production, where worker child processes keep the
+  // loop alive), but these tests await timers with no other pending handle,
+  // so a ref'd keep-alive lets the awaited ticks fire deterministically.
+  const keepAlive = setInterval(() => {}, 100);
+  after(() => clearInterval(keepAlive));
   it("rejects late integration findings and cleanup while retaining uncertain branches", async () => {
     const fx = await makeFixtureRepo();
     try {
@@ -733,6 +739,12 @@ describe("ExecutionBroker: recovering a timed-out worker's committed work", () =
 });
 
 describe("ExecutionBroker: recording what recovery actually merged (completion-gate evidence)", () => {
+  // Keep the event loop alive: the broker's deadline/activity timers are
+  // unref'd (correct in production, where worker child processes keep the
+  // loop alive), but these tests await timers with no other pending handle,
+  // so a ref'd keep-alive lets the awaited ticks fire deterministically.
+  const keepAlive = setInterval(() => {}, 100);
+  after(() => clearInterval(keepAlive));
   it("records the recovered task, branch and exact ref on the integration execution once merged", async () => {
     const s = await scenario(
       [
@@ -777,6 +789,12 @@ describe("ExecutionBroker: recording what recovery actually merged (completion-g
 });
 
 describe("GitRepo.revListCount", () => {
+  // Keep the event loop alive: the broker's deadline/activity timers are
+  // unref'd (correct in production, where worker child processes keep the
+  // loop alive), but these tests await timers with no other pending handle,
+  // so a ref'd keep-alive lets the awaited ticks fire deterministically.
+  const keepAlive = setInterval(() => {}, 100);
+  after(() => clearInterval(keepAlive));
   it("reports an unknown count as null, not as 'no commits'", async () => {
     const fx = await makeFixtureRepo();
     try {
@@ -790,6 +808,12 @@ describe("GitRepo.revListCount", () => {
 });
 
 describe("ExecutionBroker durable lifecycle inventory", () => {
+  // Keep the event loop alive: the broker's deadline/activity timers are
+  // unref'd (correct in production, where worker child processes keep the
+  // loop alive), but these tests await timers with no other pending handle,
+  // so a ref'd keep-alive lets the awaited ticks fire deterministically.
+  const keepAlive = setInterval(() => {}, 100);
+  after(() => clearInterval(keepAlive));
   it("fails closed with a typed diagnostic when a Git provider omits required inventories", async () => {
     const store = MissionStore.open(JsonlEventStore.inMemory());
     const mission = store.createMission({
