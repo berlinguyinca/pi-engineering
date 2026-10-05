@@ -1997,7 +1997,11 @@ export class Orchestrator {
     }
     await this.cleanupMissionWithAuthorities(missionId, !integrated);
     if (!integrated) {
-      const preserved = this.broker.preservedBranches(missionId);
+      // Prune preserved branches that are byte-identical to the base (zero
+      // unique commits) so they are not reported as unmerged worker work and do
+      // not force manual cleanup. Only branches carrying real unmerged commits
+      // stay preserved and are named in the finding.
+      const preserved = await this.broker.pruneEmptyPreservedBranches(missionId);
       if (preserved.length > 0) {
         this.store.addFinding({
           mission_id: missionId,

@@ -1837,6 +1837,59 @@ export class ExecutionBroker {
     return failures;
   }
 
+  /**
+   * Drop preserved worker branches that carry zero unique commits since the
+   * mission base (byte-identical "empty shell" branches) and return the
+   * branches that still hold unmerged worker work. An empty branch is deleted
+   * (it carries nothing, so preserving it only forces manual cleanup) and
+   * excluded from the preserved inventory; a branch with real unmerged commits
+   * is left untouched. If the base or git cannot be determined the branch is
+   * conservatively kept (fail-closed), preserving today's behavior.
+   */
+  async pruneEmptyPreservedBranches(missionId: string): Promise<string[]> {
+    const branches = this.preservedBranches(missionId);
+    if (branches.length === 0) return branches;
+    const git = this.missionRepositories.get(missionId)?.git ?? this.git;
+    const base =
+      this.store.getMission(missionId)?.base_ref?.trim() || this.resolvedBases.get(missionId) || this.baseRef.trim();
+    if (!git || !base) return branches;
+    const survivors: string[] = [];
+    for (const branch of branches) {
+      let count: number | null = null;
+      try {
+        count = await git.revListCount(`${base}..${branch}`);
+      } catch {
+        count = null;
+      }
+      // "unknown" is not "no commits": when the count cannot be determined we
+      // keep the branch preserved so unmerged work is never silently lost.
+      if (count === null || count > 0) {
+        survivors.push(branch);
+        continue;
+      }
+      try {
+        await git.deleteBranch(branch);
+      } catch {
+        survivors.push(branch);
+        continue;
+      }
+      this.forgetPreservedBranch(missionId, branch);
+    }
+    return survivors;
+  }
+
+  private forgetPreservedBranch(missionId: string, branch: string): void {
+    const preserved = (this.preserved.get(missionId) ?? []).filter((name) => name !== branch);
+    if (preserved.length > 0) this.preserved.set(missionId, preserved);
+    else this.preserved.delete(missionId);
+    const worktrees = this.missionWorktrees.get(missionId);
+    if (worktrees) {
+      const remaining = worktrees.filter((worktree) => worktree.branch !== branch);
+      if (remaining.length > 0) this.missionWorktrees.set(missionId, remaining);
+      else this.missionWorktrees.delete(missionId);
+    }
+  }
+
   /** Branches kept after cleanup so unmerged worker work stays recoverable. */
   preservedBranches(missionId: string): string[] {
     const branches = [...(this.preserved.get(missionId) ?? [])];
