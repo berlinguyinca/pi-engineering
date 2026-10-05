@@ -379,10 +379,12 @@ test("heartbeat alone does not advance meaningful progress", async () => {
   // Advance the clock well past the stall threshold; the worker is alive but
   // produces only heartbeats (no meaningful progress).
   h.clock.advance(11 * 60_000);
+  await h.obs.flush();
+  assert.equal(h.obs.summary(id)!.health, "stalled", "silent worker past the stall threshold is STALLED");
   h.obs.heartbeat(id, "wk-1");
   await h.obs.flush();
   const sum = h.obs.summary(id)!;
-  assert.equal(sum.health, "stalled", "alive worker with no meaningful progress is STALLED");
+  assert.equal(sum.health, "slow", "a fresh raw-activity heartbeat alone never STALLS an alive worker (at most slow)");
   assert.equal(
     sum.lastMeaningfulProgressAt,
     "2024-01-01T00:00:00.000Z",
