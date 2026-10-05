@@ -81,7 +81,10 @@ describe("pruneEmptyPreservedBranches (unmerged-work false positive)", () => {
       // An un-integrated mission cleans up with keepBranches=true, so the
       // empty-shell branch is preserved exactly like an unmerged one today.
       await broker.cleanupMission(m.mission_id, { keepBranches: true });
-      assert.ok(broker.preservedBranches(m.mission_id).includes(branch), "empty branch must be preserved before pruning");
+      assert.ok(
+        broker.preservedBranches(m.mission_id).includes(branch),
+        "empty branch must be preserved before pruning",
+      );
       assert.equal(await git.revListCount(`${base}..${branch}`), 0, "empty shell carries zero unique commits");
 
       const survivors = await broker.pruneEmptyPreservedBranches(m.mission_id);
@@ -89,7 +92,11 @@ describe("pruneEmptyPreservedBranches (unmerged-work false positive)", () => {
       // (a) No survivors -> the orchestrator's `if (preserved.length > 0)` does
       // not fire, so no "Unmerged worker work" finding is raised.
       assert.deepEqual(survivors, [], "empty-shell branches must be excluded from the finding");
-      assert.equal(broker.preservedBranches(m.mission_id).length, 0, "empty branches must be dropped from preserved state");
+      assert.equal(
+        broker.preservedBranches(m.mission_id).length,
+        0,
+        "empty branches must be dropped from preserved state",
+      );
       assert.equal(
         await branchExists(git, branch),
         false,
@@ -108,7 +115,10 @@ describe("pruneEmptyPreservedBranches (unmerged-work false positive)", () => {
     });
     try {
       await broker.cleanupMission(m.mission_id, { keepBranches: true });
-      assert.ok(broker.preservedBranches(m.mission_id).includes(branch), "unmerged branch must be preserved before pruning");
+      assert.ok(
+        broker.preservedBranches(m.mission_id).includes(branch),
+        "unmerged branch must be preserved before pruning",
+      );
       assert.equal(await git.revListCount(`${base}..${branch}`), 1, "real worker commit since base");
 
       const survivors = await broker.pruneEmptyPreservedBranches(m.mission_id);
