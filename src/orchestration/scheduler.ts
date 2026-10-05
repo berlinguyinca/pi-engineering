@@ -51,7 +51,15 @@ type AbortableResult<T> = { aborted: true } | { aborted: false; value: T };
  * transient-infrastructure failure (so those keep the existing failure path).
  */
 function infraCategoryFromWorkerMarker(marker?: string): InfraErrorCategory | null {
-  if (!marker || !marker.startsWith("transient:")) return null;
+  if (!marker) return null;
+  // A mid-session stream cut (`truncated_after_progress`) is a gateway
+  // transport hiccup, not a worker verdict. The executor refuses to replay
+  // the session inline (the tools already ran), but at the mission level a
+  // relaunch is the standard retry: park the task in the outage window and
+  // relaunch once the probe is healthy, instead of failing the task and
+  // leaving the mission with no candidate.
+  if (marker === "truncated_after_progress") return "TRANSIENT_INFRASTRUCTURE";
+  if (!marker.startsWith("transient:")) return null;
   const sub = marker.slice("transient:".length);
   switch (sub) {
     case "rate_limit":
