@@ -91,6 +91,8 @@ export class MissionSupervisor {
   private readonly missionTicks = new Map<string, Promise<SupervisorStatus>>();
   private readonly activeTicks = new Set<Promise<SupervisorStatus[]>>();
   private acceptingTicks = true;
+  /** Consecutive STALLED projections per mission, used to debounce recovery. */
+  private readonly stalledProjections = new Map<string, number>();
 
   constructor(options: MissionSupervisorOptions) {
     this.store = options.store;
@@ -332,12 +334,22 @@ export class MissionSupervisor {
     if (wait) return null;
     const projectedHealth = this.observability?.summary(mission.mission_id)?.health;
     if (projectedHealth === "stalled") {
-      return {
-        health: "STALLED",
-        category: "ORPHANED_EXECUTION",
-        reason: "Worker heartbeat is live but meaningful progress exceeded the stall threshold",
-      };
+      // Debounce: only classify after the STALLED projection persists across
+      // consecutive supervisor evaluations. A single stale tick (e.g. a worker
+      // between tool calls) must not fence a live worker. A genuinely dead
+      // worker is recovered one tick later.
+      const consecutive = (this.stalledProjections.get(mission.mission_id) ?? 0) + 1;
+      this.stalledProjections.set(mission.mission_id, consecutive);
+      if (consecutive >= 2) {
+        return {
+          health: "STALLED",
+          category: "ORPHANED_EXECUTION",
+          reason: "Worker heartbeat is live but meaningful progress exceeded the stall threshold",
+        };
+      }
+      return null;
     }
+    this.stalledProjections.delete(mission.mission_id);
     const tasks = this.store.listTasks(mission.mission_id);
     const activeExecution = this.store
       .listExecutions(mission.mission_id)

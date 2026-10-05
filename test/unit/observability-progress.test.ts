@@ -238,14 +238,14 @@ test("health: heartbeat without meaningful progress => SLOW then STALLED", () =>
     alive: true,
   });
   assert.equal(slow.health, "slow");
-  // 6 minutes => stalled.
+  // 6 minutes => stalled only when raw-activity heartbeat is stale too.
   const stalled = deriveHealth({
     missionStatus: "EXECUTING",
     blocked: false,
     failed: false,
     complete: false,
     verifiedComplete: false,
-    lastHeartbeatAt: t("2024-01-01T00:06:00Z"),
+    lastHeartbeatAt: t("2024-01-01T00:00:30Z"),
     lastMeaningfulProgressAt: t("2024-01-01T00:00:00Z"),
     slowAfterMs: 120_000,
     stallAfterMs: 300_000,

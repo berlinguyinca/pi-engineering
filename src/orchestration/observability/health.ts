@@ -60,9 +60,16 @@ export function deriveHealth(input: HealthInput): HealthResult {
   }
 
   // Meaningful-progress age drives SLOW/STALLED. Heartbeat alone is not progress.
+  // STALLED additionally requires the raw-activity heartbeat to be stale: a
+  // worker actively running tools (meaningfulProgress:false by design) with a
+  // recent heartbeat is at most SLOW, never STALLED.
   const progressAge = ageMs(input.lastMeaningfulProgressAt, now);
   if (progressAge !== undefined) {
-    if (progressAge > input.stallAfterMs && input.alive) return { health: "stalled" };
+    if (progressAge > input.stallAfterMs && input.alive) {
+      const heartbeatAge = ageMs(input.lastHeartbeatAt, now);
+      if (heartbeatAge !== undefined && heartbeatAge > input.stallAfterMs) return { health: "stalled" };
+      return { health: "slow" };
+    }
     if (progressAge > input.slowAfterMs) return { health: "slow" };
   } else if (input.alive) {
     // No meaningful progress ever recorded but worker alive: watch it.
