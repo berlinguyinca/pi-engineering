@@ -3,7 +3,7 @@ import { execFile } from "node:child_process";
 import { writeFileSync } from "node:fs";
 import { access, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { describe, it } from "node:test";
+import { after, describe, it } from "node:test";
 import { promisify } from "node:util";
 import { GitRepo } from "../../src/git/GitRepo.ts";
 import { type BrokerBackends, ExecutionBroker, workerTimeoutMs } from "../../src/orchestration/broker.ts";
@@ -262,6 +262,12 @@ async function assertCrossBoundaryRenameRejected(commitRename: boolean): Promise
 }
 
 describe("ExecutionBroker (spec 03)", () => {
+  // Keep the event loop alive: the broker's deadline/activity timers are
+  // unref'd (correct in production, where worker child processes keep the
+  // loop alive), but these tests await timers with no other pending handle,
+  // so a ref'd keep-alive lets the awaited ticks fire deterministically.
+  const keepAlive = setInterval(() => {}, 100);
+  after(() => clearInterval(keepAlive));
   it("publishes no gate evidence when the mission resumes during diff capture", async () => {
     const fx = await makeFixtureRepo();
     try {
