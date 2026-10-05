@@ -431,6 +431,41 @@ describe("WorkspaceManifestResolver path policy", () => {
     );
   });
 
+  it("binds owner/repo request references to child git checkouts when launching from a non-git workspace parent", async () => {
+    const launchCwd = await mkdtemp(join(tmpdir(), "pi-eng-parent-"));
+    const repoA = await makeFixtureRepo();
+    const repoB = await makeFixtureRepo();
+    // Move the fixture checkouts so they are immediate children of the parent.
+    const dirA = join(launchCwd, "alpha");
+    const dirB = join(launchCwd, "beta-gateway");
+    await rename(repoA.root, dirA);
+    await rename(repoB.root, dirB);
+    cleanup.push(() => rm(launchCwd, { recursive: true, force: true }));
+
+    const resolved = await new WorkspaceManifestResolver().resolve(
+      "Implement the subsystem in some-org/alpha and integrate the GUI in beta-gateway, exposing /inferweave/v1 APIs",
+      launchCwd,
+    );
+
+    const roots = resolved.authorizedRoots.map((root) => root.canonicalPath).sort();
+    assert.deepEqual(roots, [dirA, dirB].sort());
+    assert.ok(resolved.authorizedRoots.every((root) => root.source === "request_repo_reference"));
+    assert.equal(resolved.repositories.length, 2);
+  });
+
+  it("never widens authority to the parent directory itself when request references do not match child checkouts", async () => {
+    const launchCwd = await mkdtemp(join(tmpdir(), "pi-eng-parent-"));
+    cleanup.push(() => rm(launchCwd, { recursive: true, force: true }));
+
+    await assert.rejects(
+      new WorkspaceManifestResolver().resolve(
+        "Implement the feature in some-org/does-not-exist and /inferweave/v1/events",
+        launchCwd,
+      ),
+      (error: unknown) => error instanceof WorkspaceScopeError,
+    );
+  });
+
   it("does not treat a repository path found in repository content as user authorization", async () => {
     const launchRepo = await makeFixtureRepo();
     const otherRepo = await makeFixtureRepo();

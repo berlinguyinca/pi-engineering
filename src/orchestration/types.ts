@@ -283,7 +283,7 @@ export interface Execution {
 /** A canonical filesystem root explicitly authorized for a mission. */
 export interface AuthorizedRoot {
   canonicalPath: string;
-  source: "launch_cwd" | "explicit_user_path" | "existing_manifest";
+  source: "launch_cwd" | "explicit_user_path" | "existing_manifest" | "request_repo_reference";
   access: "read" | "write";
 }
 

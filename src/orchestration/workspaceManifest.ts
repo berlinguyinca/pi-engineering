@@ -45,6 +45,29 @@ function explicitAbsolutePaths(request: string): string[] {
   return paths;
 }
 
+/**
+ * Extract candidate repository names from the request: the tail of every
+ * `x/y` reference (e.g. `inferweave/inferweave`,
+ * `metabolomics-us/inferweave-gateway`) plus bare path-like tokens (e.g.
+ * `inferweave-gateway`). URLs are excluded by refusing tokens preceded by a
+ * path character. Extraction alone grants nothing: every candidate is still
+ * filtered by the immediate-child-git-checkout check in
+ * resolveChildRepoCandidates, so prose tokens, API paths, and package names
+ * that do not name a child checkout are inert.
+ */
+function requestRepoReferenceNames(request: string): string[] {
+  const names = new Set<string>();
+  for (const match of request.matchAll(
+    /(?<![\w.@/-])([A-Za-z0-9][A-Za-z0-9._-]*)\/([A-Za-z0-9][A-Za-z0-9._-]*)/g,
+  )) {
+    names.add(match[2]!);
+  }
+  for (const match of request.matchAll(/(?<![\w./@-])([A-Za-z0-9][A-Za-z0-9._-]*[A-Za-z0-9_-])/g)) {
+    names.add(match[1]!);
+  }
+  return [...names];
+}
+
 function isWithin(parent: string, child: string): boolean {
   const canonicalParent = resolve(parent);
   const canonicalChild = resolve(child);
@@ -115,11 +138,50 @@ export class WorkspaceManifestResolver {
         }),
       )
     ).filter((path): path is string => path !== null);
-    const candidates =
+    let candidates: Array<{ path: string; source: AuthorizedRoot["source"] }> =
       existing.length > 0
         ? existing.map((path) => ({ path, source: "explicit_user_path" as const }))
-        : [{ path: launchCwd, source: "launch_cwd" as const }];
+        : [];
+    if (candidates.length === 0) {
+      // Workspace-parent mode: launching from a directory that is itself not a
+      // git checkout (e.g. a projects root containing many checkouts) is a
+      // first-class workflow. The launch cwd cannot be authorized directly, so
+      // bind the repositories the request explicitly names (as `owner/repo` or
+      // `repo` prose references) when they exist as immediate child git
+      // checkouts of the launch cwd. This keeps authority consented — only
+      // repositories the request itself names are authorized, never the parent.
+      const launchGit = await GitRepo.open(launchCwd).catch(() => null);
+      if (!launchGit) {
+        const childRepos = await this.resolveChildRepoCandidates(request, launchCwd);
+        if (childRepos.length > 0) candidates = childRepos;
+      }
+    }
+    if (candidates.length === 0) candidates = [{ path: launchCwd, source: "launch_cwd" as const }];
     return this.resolveCandidates(candidates, launchCwd);
+  }
+
+  /**
+   * Resolve `owner/repo`-style references from the request to immediate child
+   * git checkouts of the launch cwd. A reference only binds when the named
+   * directory exists directly under the launch cwd and is itself a git
+   * repository rooted exactly there — prose tokens, API paths, and URLs never
+   * widen authority.
+   */
+  private async resolveChildRepoCandidates(
+    request: string,
+    launchCwd: string,
+  ): Promise<Array<{ path: string; source: AuthorizedRoot["source"] }>> {
+    const parent = resolve(launchCwd);
+    const candidates: Array<{ path: string; source: AuthorizedRoot["source"] }> = [];
+    const seen = new Set<string>();
+    for (const name of requestRepoReferenceNames(request)) {
+      const path = resolve(parent, name);
+      if (dirname(path) !== parent || seen.has(path)) continue;
+      seen.add(path);
+      const git = await GitRepo.open(path).catch(() => null);
+      if (git && resolve(git.root) === path) candidates.push({ path, source: "request_repo_reference" });
+    }
+    return candidates;
   }
 
   /** Resolve a legacy repository argument through the same authority checks as request-derived roots. */
