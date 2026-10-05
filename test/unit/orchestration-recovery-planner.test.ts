@@ -53,6 +53,29 @@ describe("FailureClassifier", () => {
     });
   }
 
+  it("classifies a mid-session stream cut (truncated_after_progress) as a transient provider failure", () => {
+    // recordTerminalFailure prepends the executor's structured marker to the
+    // summary. A gateway that closed the SSE stream after the worker made
+    // progress is a transport hiccup, not a permanent provider verdict — the
+    // old text-matching fallback classified it PROVIDER_PERMANENT, and the
+    // planner's STOP action permanently parked the mission on a stream cut.
+    const classifier = new FailureClassifier();
+    assert.equal(
+      classifier.classify(
+        baseEvidence(
+          "truncated_after_progress: backend reported failed: Worker returned no worker_result. Stream ended without finish_reason",
+        ),
+      ).category,
+      "PROVIDER_TRANSIENT",
+    );
+    // Backstop for the bare error text without the structured marker.
+    assert.equal(
+      classifier.classify(baseEvidence("Worker returned no worker_result. Stream ended without finish_reason"))
+        .category,
+      "PROVIDER_TRANSIENT",
+    );
+  });
+
   it("distinguishes permanent provider refusal from transient provider outage", () => {
     const classifier = new FailureClassifier();
     assert.equal(

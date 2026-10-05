@@ -589,8 +589,17 @@ export class Orchestrator {
         switch (repairDecision.action) {
           case "CHECKPOINT_SPLIT_AND_REPLACE":
           case "REPAIR_WORKER_OUTPUT":
-          case "FENCE_RECONCILE_AND_RESUME":
             return actionTaskId ? task.task_id === actionTaskId : false;
+          case "FENCE_RECONCILE_AND_RESUME":
+            // A named task is the classification's subject. An orphaned
+            // mission that names no task is blocked by its unresolved failed
+            // WORKERS: reconcile alone can never produce a candidate, so the
+            // repair must re-run that work (from its checkpoint when one
+            // exists, from scratch otherwise). Replacing only the named task
+            // turned every no-candidate orphan into a no-op that burned the
+            // strategy budget and STOPped the mission permanently.
+            if (actionTaskId) return task.task_id === actionTaskId;
+            return task.kind === "agent";
           case "REBUILD_INTEGRATION_CANDIDATE":
             return task.kind === "integration" && (!actionTaskId || task.task_id === actionTaskId);
           case "CREATE_REPAIR_TASKS":

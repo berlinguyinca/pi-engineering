@@ -278,6 +278,89 @@ describe("MissionScheduler resilience (time-based gateway window)", () => {
     const failed = store.getTask(t.task_id) as unknown as { failure_reason?: string };
     assert.equal(failed.failure_reason, "backend reported failed: worker gave up");
   });
+  it("parks (not fails) a mid-session stream cut in the resilience window", async () => {
+    // A gateway that closes the SSE stream after the worker ran tools reports
+    // `truncated_after_progress`. That is a transport hiccup: the task must
+    // enter the time-based outage window and pause with the mission when the
+    // gateway stays down — not fail the task and leave the mission with no
+    // candidate (the old death spiral into a permanent BLOCKED).
+    const store = MissionStore.open(JsonlEventStore.inMemory());
+    const m = makeMission(store);
+    const t = store.createTask({ mission_id: m.mission_id, kind: "agent", role: "implementer", objective: "x" });
+    let calls = 0;
+    const backends: BrokerBackends = {
+      agent: {
+        runAgent: async () => {
+          calls++;
+          return {
+            executionId: "e",
+            exitStatus: "failed" as const,
+            summary: "Worker returned no worker_result. Stream ended without finish_reason",
+            artifactRefs: [],
+            usage: {},
+            error: "truncated_after_progress",
+          };
+        },
+      },
+    };
+    const broker = new ExecutionBroker({ store, backends });
+    const clk = clock();
+    const scheduler = new MissionScheduler({
+      store,
+      broker,
+      resilience: testResilience,
+      probe: { probe: async () => ({ healthy: false }) },
+      now: clk.now,
+      sleep: clk.sleep,
+      rand: () => 0,
+    });
+    await scheduler.runMission(m.mission_id);
+    assert.equal(store.getMission(m.mission_id)!.status, "PAUSED_INFRASTRUCTURE");
+    assert.notEqual(store.getTask(t.task_id)!.status, "FAILED");
+    assert.equal(store.getTask(t.task_id)!.status, "RETRYING");
+    assert.ok(calls >= 1, "the worker was attempted at least once");
+  });
+
+  it("recovers a mid-session stream cut when the gateway returns healthy", async () => {
+    const store = MissionStore.open(JsonlEventStore.inMemory());
+    const m = makeMission(store);
+    const t = store.createTask({ mission_id: m.mission_id, kind: "agent", role: "implementer", objective: "x" });
+    let calls = 0;
+    let probeCalls = 0;
+    const backends: BrokerBackends = {
+      agent: {
+        runAgent: async () => {
+          calls++;
+          return calls < 2
+            ? {
+                executionId: "e",
+                exitStatus: "failed" as const,
+                summary: "Worker returned no worker_result. Stream ended without finish_reason",
+                artifactRefs: [],
+                usage: {},
+                error: "truncated_after_progress",
+              }
+            : successOutcome;
+        },
+      },
+    };
+    const broker = new ExecutionBroker({ store, backends });
+    const clk = clock();
+    const scheduler = new MissionScheduler({
+      store,
+      broker,
+      resilience: testResilience,
+      probe: { probe: async () => ({ healthy: ++probeCalls > 3 }) },
+      now: clk.now,
+      sleep: clk.sleep,
+      rand: () => 0,
+    });
+    await scheduler.runMission(m.mission_id);
+    assert.equal(calls, 2, "one truncation, one successful relaunch after the probe recovers");
+    assert.equal(store.getTask(t.task_id)!.status, "SUCCEEDED");
+    assert.notEqual(store.getMission(m.mission_id)!.status, "PAUSED_INFRASTRUCTURE");
+  });
+
   it("fails an unknown-model task with its real cause instead of parking it in the infra window", async () => {
     // The worker already spent its one catalog-resync retry. A healthy gateway
     // plus a model it does not know is a configuration problem: waiting 90

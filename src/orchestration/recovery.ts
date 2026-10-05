@@ -245,7 +245,16 @@ export class FailureClassifier {
     ) {
       return /provider|api key|model|config/.test(summary) ? "PROVIDER_PERMANENT" : "AUTHORIZATION_OR_CREDENTIAL";
     }
-    if (/429|502|503|504|rate limit|network|econn|temporar|gateway|timeout|connection reset/.test(summary)) {
+    // `truncated_after_progress` and the provider's own "Stream ended without
+    // finish_reason" wording are transport failures: the gateway closed the
+    // SSE stream mid-session. The old fallback classified them
+    // PROVIDER_PERMANENT (no rule matched), and the planner's STOP action
+    // permanently parked the mission on a hiccup that clears seconds later.
+    if (
+      /429|502|503|504|rate limit|network|econn|temporar|gateway|timeout|connection reset|truncated_after_progress|finish_reason|stream ended/.test(
+        summary,
+      )
+    ) {
       return "PROVIDER_TRANSIENT";
     }
     if (/provider/.test(summary)) return "PROVIDER_PERMANENT";

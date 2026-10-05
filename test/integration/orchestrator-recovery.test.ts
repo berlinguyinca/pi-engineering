@@ -183,11 +183,16 @@ function blockedRepairHarness(
       | "REQUIREMENT_AMBIGUITY"
       | "PERSISTENCE_FAILURE"
       | "VALIDATION_FAILED"
-      | "REVIEW_FAILED";
+      | "REVIEW_FAILED"
+      | "ORPHANED_EXECUTION";
     failedKind?: "agent" | "validation" | "review";
     failOwnershipRelease?: boolean;
     withOwnership?: boolean;
     ownership?: MissionOwnership;
+    /** Task id named by the failure classification (null = orphan catch-all). */
+    classificationTaskId?: string | null;
+    /** Record the durable checkpoint for the failed task (default true). */
+    withCheckpoint?: boolean;
   } = {},
 ) {
   const backend = JsonlEventStore.inMemory();
@@ -311,125 +316,146 @@ function blockedRepairHarness(
   store.transitionTask(failed.task_id, "FAILED", "system", {
     failure_reason: "task execution budget exhausted",
   });
-  store.checkpointTask({
-    checkpointId: "CHK-original",
-    executionId: orphanedExecution.execution_id,
-    missionId: mission.mission_id,
-    taskId: failed.task_id,
-    repoId: "repo-repair",
-    baseSha: "base-sha",
-    candidateSha: "candidate-sha",
-    branch: "pi-eng-orch-TSK-original",
-    worktree: "/tmp/preserved-repair",
-    committedChanges: ["one"],
-    preservedUncommittedChanges: [],
-    completedDeliverables: ["one"],
-    remainingDeliverables: ["two", "three"],
-    acceptanceIds: [],
-    validationEvidenceRefs: [],
-    artifactRefs: [],
-    artifactHashes: [],
-    workerId: "worker",
-    sessionId: "session",
-    model: "local/local",
-    sequence: 1,
-    missionGeneration: 0,
-    candidateGeneration: 0,
-    fencingToken: 0,
-    createdAt: "2026-09-27T00:00:00.000Z",
-  });
-  store.classifyFailure({
-    classificationId: "FC-budget",
-    missionId: mission.mission_id,
-    taskId: failed.task_id,
-    executionId: orphanedExecution.execution_id,
-    category: options.category ?? "TASK_BUDGET_EXHAUSTED",
-    evidenceRefs: ["CHK-original"],
-    fingerprint: "sha256:budget-fingerprint",
-    summary: "task execution budget exhausted",
-    classifiedAt: "2026-09-27T00:00:00.000Z",
-  });
-  store.transitionMission(mission.mission_id, "BLOCKED");
-  class HarnessOwnership extends MissionOwnership {
-    override async release(identity: OwnershipIdentity): Promise<void> {
-      if (options.failOwnershipRelease && !("repoId" in identity)) throw new Error("injected mission release failure");
-      await super.release(identity);
-    }
-  }
-  const ownership =
-    options.ownership ??
-    (options.failOwnershipRelease
-      ? new HarnessOwnership(store, { ownerId: "blocked-repair-controller" })
-      : options.withOwnership
-        ? new MissionOwnership(store, { ownerId: "blocked-repair-controller" })
-        : undefined);
-  const observedRecoveries: Array<unknown> = [];
-  const lifecycleInventoryGit = {
-    loadCandidateLifecycleInventory: async () => ({ records: [], diagnostics: [] }),
-    loadIntegrationRunInventory: async () => ({ records: [], diagnostics: [] }),
-    loadPromotionLifecycleInventory: async () => ({ records: [], diagnostics: [] }),
-    loadPendingBranchCleanupInventory: async () => ({ records: [], diagnostics: [] }),
-  } as never;
-  const orchestrator = new Orchestrator({
-    store,
-    git: lifecycleInventoryGit,
-    backends: {
-      agent: {
-        runAgent: async (input) => {
-          observedRecoveries.push(input.recovery);
-          return {
-            executionId: "replacement",
-            exitStatus: "succeeded",
-            summary: "remaining deliverable complete",
-            artifactRefs: [],
-            usage: {},
-          };
-        },
-      },
-      validation: {
-        runValidation: async () => ({
-          executionId: "replacement-validation",
-          exitStatus: "succeeded",
-          summary: "validation rerun succeeded",
-          artifactRefs: [],
-          usage: {},
-        }),
-      },
-      review: {
-        runReview: async () => ({
-          executionId: "replacement-review",
-          exitStatus: "succeeded",
-          summary: "review rerun succeeded",
-          artifactRefs: [],
-          usage: {},
-        }),
-      },
-    },
-    planner: async () => [],
-    recovery: {
-      missionCeiling: 4,
-      strategyMaxAttempts: 2,
-      decisionTtlMs: 60_000,
-    },
-    now: () => Date.parse("2026-09-27T00:00:10.000Z"),
-    ownership,
-  });
-  if (options.withCandidate) {
-    orchestrator.broker.verifiedCandidateContent = async () => ({
+  if (options.withCheckpoint === false) {
+    // Orphan catch-all: no named task, no durable checkpoint — the shape of a
+    // worker that died mid-session (e.g. a stream cut) before recording
+    // progress. The repair must re-run the failed work from scratch.
+    store.classifyFailure({
+      classificationId: "FC-orphan",
+      missionId: mission.mission_id,
+      taskId: null,
+      executionId: orphanedExecution.execution_id,
+      category: options.category ?? "ORPHANED_EXECUTION",
+      evidenceRefs: [],
+      fingerprint: "sha256:orphan-fingerprint",
+      summary: `Nonterminal mission ${mission.mission_id} has no active worker, runnable task, dependency wait, or named wait`,
+      classifiedAt: "2026-09-27T00:00:00.000Z",
+    });
+  } else {
+    store.checkpointTask({
+      checkpointId: "CHK-original",
+      executionId: orphanedExecution.execution_id,
+      missionId: mission.mission_id,
+      taskId: failed.task_id,
+      repoId: "repo-repair",
+      baseSha: "base-sha",
       candidateSha: "candidate-sha",
-      diffHash: "diff-hash",
-      hasChanges: true,
+      branch: "pi-eng-orch-TSK-original",
+      worktree: "/tmp/preserved-repair",
+      committedChanges: ["one"],
+      preservedUncommittedChanges: [],
+      completedDeliverables: ["one"],
+      remainingDeliverables: ["two", "three"],
+      acceptanceIds: [],
+      validationEvidenceRefs: [],
+      artifactRefs: [],
+      artifactHashes: [],
+      workerId: "worker",
+      sessionId: "session",
+      model: "local/local",
+      sequence: 1,
+      missionGeneration: 0,
+      candidateGeneration: 0,
+      fencingToken: 0,
+      createdAt: "2026-09-27T00:00:00.000Z",
+    });
+    store.classifyFailure({
+      classificationId: "FC-budget",
+      missionId: mission.mission_id,
+      taskId: options.classificationTaskId === null ? null : (options.classificationTaskId ?? failed.task_id),
+      executionId: orphanedExecution.execution_id,
+      category: options.category ?? "TASK_BUDGET_EXHAUSTED",
+      evidenceRefs: ["CHK-original"],
+      fingerprint: "sha256:budget-fingerprint",
+      summary: "task execution budget exhausted",
+      classifiedAt: "2026-09-27T00:00:00.000Z",
     });
   }
-  return {
-    backend,
-    store,
-    missionId: mission.mission_id,
-    failed,
-    orphanedExecution,
-    orchestrator,
-    observedRecoveries,
+  store.transitionMission(mission.mission_id, "BLOCKED");
+  const finishHarness = () => {
+    class HarnessOwnership extends MissionOwnership {
+      override async release(identity: OwnershipIdentity): Promise<void> {
+        if (options.failOwnershipRelease && !("repoId" in identity))
+          throw new Error("injected mission release failure");
+        await super.release(identity);
+      }
+    }
+    const ownership =
+      options.ownership ??
+      (options.failOwnershipRelease
+        ? new HarnessOwnership(store, { ownerId: "blocked-repair-controller" })
+        : options.withOwnership
+          ? new MissionOwnership(store, { ownerId: "blocked-repair-controller" })
+          : undefined);
+    const observedRecoveries: Array<unknown> = [];
+    const lifecycleInventoryGit = {
+      loadCandidateLifecycleInventory: async () => ({ records: [], diagnostics: [] }),
+      loadIntegrationRunInventory: async () => ({ records: [], diagnostics: [] }),
+      loadPromotionLifecycleInventory: async () => ({ records: [], diagnostics: [] }),
+      loadPendingBranchCleanupInventory: async () => ({ records: [], diagnostics: [] }),
+    } as never;
+    const orchestrator = new Orchestrator({
+      store,
+      git: lifecycleInventoryGit,
+      backends: {
+        agent: {
+          runAgent: async (input) => {
+            observedRecoveries.push(input.recovery);
+            return {
+              executionId: "replacement",
+              exitStatus: "succeeded",
+              summary: "remaining deliverable complete",
+              artifactRefs: [],
+              usage: {},
+            };
+          },
+        },
+        validation: {
+          runValidation: async () => ({
+            executionId: "replacement-validation",
+            exitStatus: "succeeded",
+            summary: "validation rerun succeeded",
+            artifactRefs: [],
+            usage: {},
+          }),
+        },
+        review: {
+          runReview: async () => ({
+            executionId: "replacement-review",
+            exitStatus: "succeeded",
+            summary: "review rerun succeeded",
+            artifactRefs: [],
+            usage: {},
+          }),
+        },
+      },
+      planner: async () => [],
+      recovery: {
+        missionCeiling: 4,
+        strategyMaxAttempts: 2,
+        decisionTtlMs: 60_000,
+      },
+      now: () => Date.parse("2026-09-27T00:00:10.000Z"),
+      ownership,
+    });
+    if (options.withCandidate) {
+      orchestrator.broker.verifiedCandidateContent = async () => ({
+        candidateSha: "candidate-sha",
+        diffHash: "diff-hash",
+        hasChanges: true,
+      });
+    }
+    return {
+      backend,
+      store,
+      missionId: mission.mission_id,
+      failed,
+      orphanedExecution,
+      orchestrator,
+      observedRecoveries,
+    };
   };
+  return finishHarness();
 }
 
 async function realGateRepairHarness(emptyRepair: boolean, race?: "integration" | "promotion" | "captureDiff") {
@@ -790,6 +816,38 @@ describe("orchestrator: durable blocked-mission repair", () => {
     const invalidations = h.store.listEvidenceInvalidations(h.missionId);
     assert.equal(invalidations.length, 1);
     assert.match(invalidations[0]?.reason ?? "", /blocked mission repair/i);
+  });
+
+  it("re-runs a failed worker when an orphaned mission names no task and recorded no checkpoint", async () => {
+    // The orphan catch-all (no active worker, no runnable task) names no task,
+    // so a reconcile-only repair can never produce a candidate: the mission
+    // looped BLOCKED -> reconcile -> BLOCKED until the strategy budget STOPped
+    // it permanently. The repair must create replacement work for the failed
+    // worker instead, so the mission can reach a candidate and the gates.
+    const h = blockedRepairHarness({ category: "ORPHANED_EXECUTION", withCheckpoint: false });
+    const repaired = await h.orchestrator.repairBlockedMission(h.missionId);
+
+    // No checkpoint recorded progress, so every deliverable of the failed
+    // worker is replaced (the bounded-replacement split), not just one task.
+    const replacements = h.store
+      .listTasks(h.missionId)
+      .filter((task) => task.task_id !== h.failed.task_id && task.kind === "agent");
+    assert.equal(replacements.length, 3, "the orphan repair must create replacement work for the failed worker");
+    assert.ok(
+      replacements.every((task) => task.status === "SUCCEEDED"),
+      JSON.stringify(replacements.map((task) => ({ id: task.task_id, status: task.status }))),
+    );
+    assert.ok(
+      replacements.every((task) => task.recovery_authority === undefined),
+      "no checkpoint exists to resume from",
+    );
+    assert.deepEqual(replacements.map((task) => task.deliverables?.[0]).sort(), ["one", "three", "two"]);
+    const lineage = h.store.listTaskSupersessions(h.missionId);
+    assert.equal(lineage.length, 1);
+    assert.equal(lineage[0]?.failedTaskId, h.failed.task_id);
+    assert.deepEqual(lineage[0]?.replacementTaskIds.sort(), replacements.map((task) => task.task_id).sort());
+    assert.equal(repaired.status, "COMPLETE", JSON.stringify({ failure: repaired.failure_reason }));
+    assert.equal(h.store.listRecoveryDecisions(h.missionId).at(-1)?.status, "succeeded");
   });
 
   it("resumes an atomically-started repair after restart without duplicating replacement lineage", async () => {
