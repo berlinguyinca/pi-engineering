@@ -27,6 +27,7 @@ import type {
   CandidateLifecycle,
   GitRepo,
   IntegrationRunRecord,
+  NestedRepoPublication,
   PromotionResult,
   WorktreeInfo,
 } from "../git/GitRepo.ts";
@@ -35,6 +36,7 @@ import { WAITING_FOR_INFERENCE_SUMMARY, sanitizeWorkerActivity } from "../worker
 import type { CheckpointProgressClaim } from "../workers/checkpointProgressTool.ts";
 import type { CheckpointManager, CheckpointSnapshot } from "./checkpoints.ts";
 import { EvidenceUnavailableError, buildCandidateEvidenceIdentity } from "./evidence.ts";
+import { isNestedPublicationAcceptable } from "./nestedPublicationGate.ts";
 import type { GateEvidencePublication, LateExecutionEvidence, MissionStore } from "./missionStore.ts";
 import type { DispatchAuthority } from "./ownership.ts";
 import { replacementRecoveryFingerprint, replacementTaskFingerprintSpec } from "./recovery.ts";
@@ -545,6 +547,12 @@ export class ExecutionBroker {
     }>
   >();
   private readonly missionRepositories = new Map<string, { repoId?: string; root: string; git: GitRepo }>();
+  /**
+   * ADDITIVE (defect-4): per-mission execution-start baseline of nested
+   * standalone repo HEADs, captured once when the mission's first task
+   * resolves its repository.
+   */
+  private readonly nestedBaselines = new Map<string, Promise<Map<string, string>>>();
   /** Isolated integration candidates. Failed/red/canceled candidates remain inspectable. */
   private readonly missionCandidates = new Map<string, { lifecycle: CandidateLifecycle; git: GitRepo }>();
   /** Commit each mission's worktrees were actually forked from (landing invariant). */
@@ -2017,6 +2025,10 @@ export class ExecutionBroker {
 
   async hasCandidateForPromotion(missionId: string): Promise<boolean> {
     if (this.missionCandidates.has(missionId)) return true;
+    // ADDITIVE (defect-4): a recorded nested standalone repo publication is
+    // candidate evidence for the mission even without an anchored worktree or
+    // integration task.
+    if (await this.hasAcceptableNestedPublication(missionId)) return true;
     if (!this.resolveRepository) return false;
     const integrationTask = this.store
       .listTasks(missionId)
@@ -2036,6 +2048,88 @@ export class ExecutionBroker {
         record.baseSha === boundBase &&
         ["integrating", "promotion_intent", "promoted"].includes(record.state),
     );
+  }
+
+  /**
+   * ADDITIVE (defect-4): recorded nested standalone repo publications for this
+   * mission that are acceptable candidate evidence (nested HEAD advanced and
+   * the work is on the nested remote, or the repo has no remote) AND whose
+   * nested HEAD still equals the recorded headSha (the validation step's
+   * re-verification). Fail-closed: no git provider, no anchored repo, or any
+   * error yields no evidence.
+   */
+  async nestedPublicationsForMission(missionId: string): Promise<NestedRepoPublication[]> {
+    const repository = this.missionRepositories.get(missionId);
+    const git = repository?.git ?? this.git;
+    if (!git) return [];
+    const repoId = repository?.repoId ?? this.store.getWorkspaceManifest(missionId)?.repositories[0]?.repoId;
+    if (!repoId) return [];
+    try {
+      const inventory = await git.loadNestedRepoPublications(missionId, repoId);
+      const verified: NestedRepoPublication[] = [];
+      for (const record of inventory.records) {
+        if (!isNestedPublicationAcceptable(record)) continue;
+        const { verified: headMatches } = await git.verifyNestedRepoPublication(record);
+        if (headMatches) verified.push(record);
+      }
+      return verified;
+    } catch {
+      return [];
+    }
+  }
+
+  /** ADDITIVE (defect-4): true when the mission has acceptable, re-verified nested publication evidence. */
+  async hasAcceptableNestedPublication(missionId: string): Promise<boolean> {
+    return (await this.nestedPublicationsForMission(missionId)).length > 0;
+  }
+
+  /**
+   * ADDITIVE (defect-4): the review evidence for the mission's nested
+   * publications — the recorded diff stats, so review does not need the nested
+   * worktree. Empty string when there is no nested evidence.
+   */
+  async nestedPublicationReviewDiffs(missionId: string): Promise<string> {
+    const records = await this.nestedPublicationsForMission(missionId);
+    if (records.length === 0) return "";
+    return records
+      .map(
+        (record) =>
+          `=== ${record.nestedPath} (${record.baseSha.slice(0, 7)}..${record.headSha.slice(0, 7)}) ===\n${record.diffStat}`,
+      )
+      .join("\n\n");
+  }
+
+  /**
+   * ADDITIVE (defect-4): memoized per-mission nested HEAD baseline. Captured
+   * at execution start (first task repository resolution) so that
+   * recordNestedPublicationsForMission can detect nested HEAD advancement over
+   * the execution window.
+   */
+  private nestedBaselineFor(missionId: string, git: GitRepo): void {
+    if (!this.nestedBaselines.has(missionId)) {
+      this.nestedBaselines.set(missionId, git.captureNestedRepoHeads().catch(() => new Map<string, string>()));
+    }
+  }
+
+  /**
+   * ADDITIVE (defect-4): record a durable nested repo publication for every
+   * nested standalone repo whose HEAD advanced between execution start and
+   * now. Called at finalization, before the completion gate evaluates
+   * candidate evidence. Without a captured baseline (e.g. after a process
+   * restart) no records are produced — fail-closed, no false evidence.
+   */
+  async recordNestedPublicationsForMission(missionId: string): Promise<NestedRepoPublication[]> {
+    const repository = this.missionRepositories.get(missionId);
+    const git = repository?.git ?? this.git;
+    if (!git) return [];
+    const repoId = repository?.repoId ?? this.store.getWorkspaceManifest(missionId)?.repositories[0]?.repoId;
+    if (!repoId) return [];
+    try {
+      const baseHeads = (await this.nestedBaselines.get(missionId)) ?? undefined;
+      return await git.recordNestedRepoPublications({ missionId, anchoredRepoId: repoId, baseHeads });
+    } catch {
+      return [];
+    }
   }
 
   private async preserveCandidate(missionId: string, authority?: DispatchAuthority): Promise<void> {
@@ -2564,6 +2658,7 @@ export class ExecutionBroker {
               } catch {
                 // provider without the nested repo API — no baseline, no records
               }
+
             }
             const repositoryBinding = input.repoId
               ? this.store
