@@ -62,7 +62,9 @@ import { EngineeringRuntime, type RuntimeMissionActivityEvent } from "../src/run
 import { sessionBindingInfo } from "../src/runtime/isolation/RuntimeBinding.ts";
 import { RuntimeSession } from "../src/runtime/isolation/RuntimeSession.ts";
 import { effectiveWorkspace, workspaceForPath } from "../src/runtime/isolation/WorkspaceResolver.ts";
+import { formatDoctorReport, runDoctor } from "../src/runtime/isolation/doctor.ts";
 import { emitRuntimeEvent } from "../src/runtime/isolation/runtimeEvents.ts";
+import { formatRuntimeStatus, runtimeStatus } from "../src/runtime/isolation/status.ts";
 import {
   type MissionBrief,
   type SessionControlServer,
@@ -2232,6 +2234,28 @@ ${RECOVERY_PROMPT}`;
         `render: ${renderStatus(s, 120, statusBarConfig)}`,
       ];
       ctx.ui.notify(lines.join("\n"), "info");
+    },
+  });
+
+  pi.registerCommand("pi-engineering", {
+    description:
+      "Engineering runtime introspection: `status` (default), `events` (recent runtime decisions), `doctor [--repair]`.",
+    handler: async (args, ctx) => {
+      const words = (args ?? "").trim().split(/\s+/).filter(Boolean);
+      const sub = words[0] ?? "status";
+      if (sub === "status" || sub === "events") {
+        // Opening the runtime for this cwd binds an unbound session first.
+        await resolveServices(ctx.cwd);
+        const report = runtimeStatus({ events: sub === "events" ? 25 : 0 });
+        ctx.ui.notify(formatRuntimeStatus(report), "info");
+        return;
+      }
+      if (sub === "doctor") {
+        const report = await runDoctor({ cwd: runtimeCwd(ctx.cwd), repair: words.includes("--repair") });
+        ctx.ui.notify(formatDoctorReport(report), report.fatal ? "error" : "info");
+        return;
+      }
+      ctx.ui.notify("/pi-engineering [status | events | doctor [--repair]]", "error");
     },
   });
 

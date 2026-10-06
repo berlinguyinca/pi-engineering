@@ -11,10 +11,10 @@
 import { randomUUID } from "node:crypto";
 import { mkdirSync, renameSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
+import { ExclusiveFileLock } from "../../platform/eventstore/fileLock.ts";
 import type { LeaseOwner } from "./LeaseManager.ts";
 import { type ReconciliationReport, RecoveryManager } from "./RecoveryManager.ts";
 import { RuntimeRegistry, type SessionBindingUpdate } from "./RuntimeRegistry.ts";
-import { ExclusiveFileLock } from "../../platform/eventstore/fileLock.ts";
 import { type ProcessIdentity, currentProcessIdentity } from "./processIdentity.ts";
 import { emitRuntimeEvent, setRuntimeEventLog } from "./runtimeEvents.ts";
 import { resolveRegistryLocation, resolveStateRoot, sessionRuntimeDir } from "./stateDir.ts";
@@ -125,7 +125,10 @@ function quarantineAndReopen(file: string, sessionId: string): RuntimeRegistry {
     if (!isCorruptDatabase(error)) throw error;
     const recoveryDir = join(dirname(file), "recovery");
     mkdirSync(recoveryDir, { recursive: true });
-    const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z");
+    const stamp = new Date()
+      .toISOString()
+      .replace(/[-:]/g, "")
+      .replace(/\.\d+Z$/, "Z");
     const quarantine = join(recoveryDir, `${basename(file, ".db")}-corrupt-${stamp}-${process.pid}.db`);
     try {
       renameSync(file, quarantine);

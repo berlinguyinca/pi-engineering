@@ -8,6 +8,7 @@
  */
 import { appendFileSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
+import { emitTelemetry } from "../../telemetry/sink.ts";
 
 export type RuntimeEventName =
   | "runtime.started"
@@ -87,6 +88,19 @@ export function emitRuntimeEvent(event: RuntimeEventName, fields: Record<string,
     } catch {
       // Diagnostics are observers; a full disk must not break the runtime.
     }
+  }
+  // Debug view: opt in to see every runtime decision on the Pi surface.
+  if (process.env.PI_ENGINEERING_DEBUG_RUNTIME === "1" && event !== "session.heartbeat") {
+    const detail = Object.entries(fields)
+      .filter(([, value]) => value !== undefined && value !== null)
+      .map(([key, value]) => `${key}=${typeof value === "string" ? value : JSON.stringify(value)}`)
+      .join(" ");
+    emitTelemetry({
+      level: "info",
+      text: `[runtime] ${event} ${detail}`.slice(0, 300),
+      key: `runtime:${event}`,
+      detail: record,
+    });
   }
   for (const listener of s.listeners) {
     try {
