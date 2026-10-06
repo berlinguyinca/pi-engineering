@@ -33,3 +33,16 @@ test("a very long latest request is clipped", () => {
   const text = summaryInstructions([{ type: "message", message: { role: "user", content: long } }], undefined);
   assert.ok(text.length < 6_000, `instructions stay bounded (${text.length})`);
 });
+
+test("a bare continuation does not become the Goal anchor; the last substantive request does (PR #106 review)", () => {
+  for (const nudge of ["yes", "continue", "ok", "go on", "retry", "Continue."]) {
+    const withNudge = [...entries, { type: "message", message: { role: "user", content: nudge } }];
+    assert.equal(latestUserRequest(withNudge), "New spec: replace CSV with Parquet export.", nudge);
+    assert.match(summaryInstructions(withNudge, undefined), /New spec: replace CSV with Parquet export\./);
+  }
+  assert.equal(
+    latestUserRequest([{ type: "message", message: { role: "user", content: "continue" } }]),
+    undefined,
+    "a session with only nudges has no request to anchor on",
+  );
+});

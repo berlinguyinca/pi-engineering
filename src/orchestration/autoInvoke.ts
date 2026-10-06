@@ -34,6 +34,10 @@ const RESUBMIT_WINDOW_MS = 30_000;
 
 const BARE_CONTINUATION =
   /^(?:please\s+)?(?:retry|re-?try|try again|again|continue|go on|go ahead|keep going|carry on|resume|proceed|next|ok(?:ay)?|yes|y|yep|sure|do it|done)[\s.!]*$/i;
+/** True for a bare "continue"/"yes"/"retry" nudge that carries no request of its own. */
+export function isBareContinuation(prompt: string): boolean {
+  return BARE_CONTINUATION.test(prompt.trim());
+}
 const CHAT_OPENER = /^(?:hi|hello|hey|thanks|thank you|thx|cool|nice|great|lol)\b/i;
 
 export interface AutoInvokeInput {
