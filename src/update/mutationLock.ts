@@ -1,25 +1,38 @@
 /**
  * Runtime mutation lock (spec §28): update, reload, rollback, activation and
  * migration exclude each other, in this process (mutex) and across processes
- * sharing an install root (an O_EXCL lock file naming its owner).
+ * sharing an install root (a lock file naming its owner).
  *
  * A lock file whose owning process is gone is stale and is taken over: a Pi
  * killed mid-update must not lock Pi Engineering out forever. "Gone" is judged
  * on the owner's process incarnation (boot id + kernel start time, as the
  * isolation file locks do), not the PID alone: a reused PID must not make a
  * dead owner's lock read busy forever.
+ *
+ * Race-freedom (the same protocol as src/plannerWorker/missionLock.ts): the
+ * lock file is never deleted or renamed away by anyone but its owner. A fresh
+ * lock is created exclusively (hard link of a fully written draft, or an
+ * O_EXCL create where hard links are unsupported). A dead owner's lock is
+ * replaced IN PLACE (atomic rename over it) only by the single claimant that
+ * exclusively created `<lock>.takeover-<dead token>`, after re-checking under
+ * that claim that the lock still names the dead owner. A claim abandoned by a
+ * crashed claimant is itself taken over the same way, which leaves it in
+ * place so nobody can create it afresh meanwhile. A live claimant's claim is
+ * never touched.
  */
 
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   closeSync,
+  fsyncSync,
   linkSync,
   mkdirSync,
   openSync,
   readFileSync,
   renameSync,
+  rmSync,
   statSync,
-  unlinkSync,
+  writeFileSync,
   writeSync,
 } from "node:fs";
 import { dirname } from "node:path";
@@ -50,12 +63,117 @@ export interface MutationLockHandle {
   release(): void;
 }
 
+/** Test seams; production callers omit them. */
+export interface MutationLockHooks {
+  /** Runs while this process holds the takeover claim, before it replaces the stale lock. */
+  afterTakeoverClaimed?: (claim: string) => void;
+}
+
 /** In-process holders by lock file: the mutex half. */
 const held = new Map<string, LockOwner>();
 
-export interface MutationLockHooks {
-  /** Deterministic race injection: runs after a claim was judged stale, before it is broken. Tests only. */
-  beforeClaimExpire?: (claim: string) => void;
+/**
+ * An unreadable (empty or partial) lock or claim younger than this may still
+ * be being written by an O_EXCL creator (no hard links, or a writer killed
+ * mid-write is indistinguishable for a moment): it is held, not abandoned.
+ */
+const FRESH_MS = 5_000;
+
+type Read =
+  | { kind: "record"; owner: LockOwner }
+  | { kind: "missing" }
+  | { kind: "corrupt"; token: string; ageMs: number };
+
+function readRecord(path: string): Read {
+  let text: string;
+  try {
+    text = readFileSync(path, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { kind: "missing" };
+    throw error;
+  }
+  try {
+    const value: unknown = JSON.parse(text);
+    if (value && typeof value === "object" && !Array.isArray(value)) {
+      const owner = value as Partial<LockOwner>;
+      if (
+        typeof owner.pid === "number" &&
+        Number.isInteger(owner.pid) &&
+        owner.pid > 0 &&
+        typeof owner.token === "string" &&
+        owner.token.length > 0
+      ) {
+        return { kind: "record", owner: owner as LockOwner };
+      }
+    }
+  } catch {
+    // Unreadable: judged by age below.
+  }
+  const mtime = statSync(path, { throwIfNoEntry: false })?.mtimeMs ?? Date.now();
+  return {
+    kind: "corrupt",
+    token: `corrupt-${createHash("sha256").update(text).digest("hex").slice(0, 16)}`,
+    ageMs: Date.now() - mtime,
+  };
+}
+
+const isDead = (r: Read): boolean =>
+  r.kind === "corrupt" ? r.ageMs > FRESH_MS : r.kind === "record" && !isAlive(r.owner);
+const tokenOf = (r: Read): string | null =>
+  r.kind === "record" ? r.owner.token : r.kind === "corrupt" ? r.token : null;
+
+/** A token as a file-name-safe suffix. */
+function suffix(token: string): string {
+  return /^[A-Za-z0-9-]{1,64}$/.test(token) ? token : createHash("sha256").update(token).digest("hex").slice(0, 32);
+}
+
+/**
+ * Create `path` exclusively with `content`: a hard link of the written draft
+ * (never visible half-written), or an O_EXCL create on filesystems without
+ * hard links. False when it already exists.
+ */
+function createExclusive(path: string, draft: string, content: string): boolean {
+  try {
+    linkSync(draft, path);
+    return true;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "EEXIST") return false;
+    if (!["EPERM", "ENOTSUP", "EOPNOTSUPP", "ENOSYS", "EXDEV", "EMLINK"].includes(code ?? "")) throw error;
+  }
+  let fd: number;
+  try {
+    fd = openSync(path, "wx", 0o600);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
+    throw error;
+  }
+  try {
+    writeSync(fd, content);
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+  return true;
+}
+
+/**
+ * Become the single claimant allowed to replace `target`, whose holder (token
+ * `deadToken`) is dead. Returns the claim files created, outermost first, or
+ * null when a live claimant got there first.
+ */
+function claimTakeover(target: string, deadToken: string, draft: string, content: string): string[] | null {
+  const marker = `${target}.takeover-${suffix(deadToken)}`;
+  for (let tries = 0; tries < 5; tries++) {
+    if (createExclusive(marker, draft, content)) return [marker];
+    const holder = readRecord(marker);
+    if (holder.kind === "missing") continue;
+    if (!isDead(holder)) return null;
+    // A claimant crashed mid-takeover: take over its claim (left in place).
+    const inner = claimTakeover(marker, tokenOf(holder) as string, draft, content);
+    return inner ? [...inner, marker] : null;
+  }
+  return null;
 }
 
 export class RuntimeMutationLock {
@@ -80,112 +198,60 @@ export class RuntimeMutationLock {
       bootId: self.bootId,
       processStartTime: self.processStartTime,
     };
+    const content = `${JSON.stringify(owner)}\n`;
     mkdirSync(dirname(this.file), { recursive: true });
-    for (let attempt = 0; attempt < 3; attempt++) {
-      try {
-        const fd = openSync(this.file, "wx", 0o600);
+    const draft = `${this.file}.${owner.token}.tmp`;
+    writeFileSync(draft, content, { mode: 0o600 });
+    try {
+      for (let tries = 0; tries < 5; tries++) {
+        if (createExclusive(this.file, draft, content)) return this.handle(owner);
+        const holder = readRecord(this.file);
+        if (holder.kind === "missing") continue;
+        if (!isDead(holder)) throw new MutationLockBusyError(holder.kind === "record" ? holder.owner : null);
+        const stale = tokenOf(holder) as string;
+        const claims = claimTakeover(this.file, stale, draft, content);
+        if (!claims) throw new MutationLockBusyError(null);
         try {
-          writeSync(fd, `${JSON.stringify(owner)}\n`);
+          this.hooks.afterTakeoverClaimed?.(claims[0] as string);
+          // Exclusive claimant now: replace the lock only if it still names the dead owner.
+          if (tokenOf(readRecord(this.file)) !== stale) continue;
+          const replacement = `${draft}.replace`;
+          writeFileSync(replacement, content, { mode: 0o600 });
+          renameSync(replacement, this.file);
+          return this.handle(owner);
         } finally {
-          closeSync(fd);
+          // Only after the lock was replaced (or found changed): a later
+          // claimant re-checks the lock and finds it no longer names the dead owner.
+          for (const file of claims) rmSync(file, { force: true });
         }
-        held.set(this.file, owner);
-        let released = false;
-        return {
-          owner,
-          release: () => {
-            if (released) return;
-            released = true;
-            held.delete(this.file);
-            // Only remove our own file: a stale-takeover by another process
-            // must not be undone by our late release.
-            if (this.readOwner()?.token === owner.token) {
-              try {
-                unlinkSync(this.file);
-              } catch {
-                // Already gone.
-              }
-            }
-          },
-        };
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-        const existing = this.readOwner();
-        if (existing && isAlive(existing)) throw new MutationLockBusyError(existing);
-        // Unreadable but fresh: a holder between create and write, not garbage.
-        if (!existing && ageMs(this.file) < FRESH_MS) throw new MutationLockBusyError(null);
-        if (!this.breakStale(existing)) throw new MutationLockBusyError(this.readOwner());
       }
+      throw new MutationLockBusyError(this.readOwner());
+    } finally {
+      rmSync(draft, { force: true });
     }
-    throw new MutationLockBusyError(this.readOwner());
   }
 
-  /**
-   * Remove a stale lock file, but only the one we judged stale.
-   *
-   * Two processes may both see the same dead owner. Without care, the slower
-   * one deletes the file the faster one has just created, and both "hold" the
-   * lock. Breaking therefore requires an exclusive claim file, and under that
-   * claim the owner is re-read: the file is removed only when it still names
-   * the owner we judged dead.
-   */
-  private breakStale(judged: LockOwner | null, retried = false): boolean {
-    const claim = `${this.file}.claim`;
-    let fd: number;
-    try {
-      fd = openSync(claim, "wx", 0o600);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      // Someone else is breaking it. A claim left by a dead claimant expires,
-      // and so does one that never got its content (killed between create and
-      // write, disk full): unreadable, but only once no writer can still be
-      // filling it in.
-      const observed = statSync(claim, { throwIfNoEntry: false });
-      if (!observed) return retried ? false : this.breakStale(judged, true); // Just went away.
-      const claimant = readClaimant(claim);
-      const age = Date.now() - observed.mtimeMs;
-      const expired = age > FRESH_MS && (claimant === null || !isAlive(claimant));
-      if (!expired) return false;
-      this.hooks.beforeClaimExpire?.(claim);
-      if (!expireClaim(claim, observed)) return false;
-      return retried ? false : this.breakStale(judged, true);
-    }
-    try {
-      const self = currentProcessIdentity();
-      writeSync(
-        fd,
-        JSON.stringify({
-          pid: self.pid,
-          host: self.host,
-          bootId: self.bootId,
-          processStartTime: self.processStartTime,
-        }),
-      );
-      const now = this.readOwner();
-      const same = judged === null ? now === null : now?.token === judged.token;
-      if (same) {
-        try {
-          unlinkSync(this.file);
-        } catch {
-          // Already gone; the retry creates it.
-        }
-      }
-      return true;
-    } finally {
-      closeSync(fd);
-      try {
-        unlinkSync(claim);
-      } catch {
-        // Already gone.
-      }
-    }
+  private handle(owner: LockOwner): MutationLockHandle {
+    held.set(this.file, owner);
+    let released = false;
+    return {
+      owner,
+      release: () => {
+        if (released) return;
+        released = true;
+        held.delete(this.file);
+        // Only remove our own file: a stale-takeover by another process
+        // must not be undone by our late release.
+        if (this.readOwner()?.token === owner.token) rmSync(this.file, { force: true });
+      },
+    };
   }
 
   /** Who holds the lock, if anyone. */
   readOwner(): LockOwner | null {
     try {
-      const owner = JSON.parse(readFileSync(this.file, "utf8")) as LockOwner;
-      return typeof owner.pid === "number" && typeof owner.token === "string" ? owner : null;
+      const r = readRecord(this.file);
+      return r.kind === "record" ? r.owner : null;
     } catch {
       return null;
     }
@@ -194,79 +260,6 @@ export class RuntimeMutationLock {
   isHeldByLiveProcess(): boolean {
     const owner = this.readOwner();
     return !!owner && isAlive(owner);
-  }
-}
-
-/**
- * Remove the stale claim we judged, and only that one. Check-then-unlink by
- * name could delete a fresh claim another process created in between, so the
- * claim is first renamed to a unique tombstone (atomic), the tombstone is
- * checked to be the very file judged (inode, mtime, size), and only then
- * deleted. A different file is put back (or, if a newer claim already
- * exists, discarded: that newer one guards the lock). True when ours went.
- */
-function expireClaim(claim: string, observed: { ino: number; mtimeMs: number; size: number }): boolean {
-  const tombstone = `${claim}.reap.${process.pid}.${randomUUID()}`;
-  try {
-    renameSync(claim, tombstone);
-  } catch {
-    return false; // Already gone (another expirer); the next attempt decides.
-  }
-  const moved = statSync(tombstone, { throwIfNoEntry: false });
-  const same =
-    !!moved && moved.ino === observed.ino && moved.mtimeMs === observed.mtimeMs && moved.size === observed.size;
-  if (same) {
-    try {
-      unlinkSync(tombstone);
-    } catch {
-      // Already gone.
-    }
-    return true;
-  }
-  // Not what we judged: a live claimant's fresh claim. Put it back.
-  try {
-    linkSync(tombstone, claim);
-  } catch {
-    // A newer claim took the name; it guards the lock.
-  }
-  try {
-    unlinkSync(tombstone);
-  } catch {
-    // Already gone.
-  }
-  return false;
-}
-
-type Claimant = Pick<LockOwner, "pid" | "host" | "bootId" | "processStartTime">;
-
-/** The process named by a claim file, or null when it is unreadable or incomplete. */
-function readClaimant(claim: string): Claimant | null {
-  let raw: string;
-  try {
-    raw = readFileSync(claim, "utf8").trim();
-  } catch {
-    return null;
-  }
-  // Older runtimes wrote a bare PID.
-  if (/^\d+$/.test(raw)) return { pid: Number(raw) };
-  try {
-    const parsed: unknown = JSON.parse(raw);
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
-    const pid = (parsed as { pid?: unknown }).pid;
-    return typeof pid === "number" && Number.isInteger(pid) && pid > 0 ? (parsed as Claimant) : null;
-  } catch {
-    return null;
-  }
-}
-
-/** A just-created lock file may not have its owner written yet. */
-const FRESH_MS = 5_000;
-
-function ageMs(file: string): number {
-  try {
-    return Date.now() - statSync(file).mtimeMs;
-  } catch {
-    return Number.POSITIVE_INFINITY;
   }
 }
 
