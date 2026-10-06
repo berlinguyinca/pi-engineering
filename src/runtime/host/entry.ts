@@ -83,14 +83,16 @@ export async function installPiEngineering(pi: ExtensionAPI, modules: EntryModul
     setFallbackReason(null);
     return;
   } catch (error) {
-    undo();
     setFallbackReason(`runtime host ${stage} failed: ${describe(error)}`);
     if ((error as { generationStillRunning?: unknown } | null)?.generationStillRunning === true) {
       // The Host started a runtime it could not stop: a second (legacy) one
-      // would run beside it. Stay with what runs; report the failure.
+      // would run beside it. Stay with what runs, handlers (shutdown
+      // included) intact; report the failure.
       process.stderr.write(`[pi-engineering] ${hostFallbackReason()}; its runtime is still running, no fallback\n`);
       return;
     }
+    // Falling back: the failed Host's handlers must not run beside the legacy ones.
+    undo();
   }
   const reason = hostFallbackReason() as string;
   // One line on stderr: the TUI is not up yet while extensions load.
