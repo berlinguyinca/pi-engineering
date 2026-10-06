@@ -8,8 +8,10 @@
  *
  * Actions:
  *   open   open, create + fail one mission (a durable write), report, close
- *   hold   open, create one nonterminal mission, report "ready", then idle
- *          until killed (SIGKILL tests)
+ *   hold   open, create one nonterminal mission, take custody + its lease,
+ *          report, then idle until killed (SIGKILL tests)
+ *   adopt  open and take over mission $PI_TEST_ADOPT_MISSION (custody + lease),
+ *          report the acquired lease generation, close
  */
 import { EngineeringRuntime } from "../../src/runtime/EngineeringRuntime.ts";
 import { RuntimeSession } from "../../src/runtime/isolation/RuntimeSession.ts";
@@ -46,12 +48,34 @@ function report(value: Record<string, unknown>): void {
 }
 
 async function main(): Promise<void> {
-  if (!action || !cwd) throw new Error("usage: runtimeChild <open|hold> <cwd> [startAt]");
+  if (!action || !cwd) throw new Error("usage: runtimeChild <open|hold|adopt> <cwd> [startAt]");
   if (startAt) await waitUntil(Number(startAt));
   const openedAt = Date.now();
   const rt = await EngineeringRuntime.open({ cwd, worker, verifier: new CommandVerifier() });
   const store = rt.missionStore;
   if (!store || !rt.orchestrator) throw new Error("orchestrator not initialized");
+  if (action === "adopt") {
+    const target = process.env.PI_TEST_ADOPT_MISSION ?? "";
+    const lease = await rt.missionOwnership!.acquire(target);
+    const session = RuntimeSession.current();
+    report({
+      ok: true,
+      action,
+      pid: process.pid,
+      sessionId: session.sessionId,
+      missionId: target,
+      adoptedGeneration: lease.generation,
+      heldLeases:
+        session
+          .registry()
+          ?.leases.list({ sessionId: session.sessionId })
+          .map((l) => l.resourceId) ?? [],
+      reconciliation: session.lastReconciliation,
+      health: session.health.state,
+    });
+    await rt.close();
+    return;
+  }
   const mission = store.createMission({
     title: `child ${process.pid}`,
     goal: "concurrency probe",
@@ -62,8 +86,11 @@ async function main(): Promise<void> {
     workflow_class: "conversation",
   });
   if (action === "open") store.failMission(mission.mission_id, "probe complete");
+  // A holder takes real custody + an in-store lease, like a dispatching mission.
+  if (action === "hold") await rt.missionOwnership?.acquire(mission.mission_id);
   await store.flush();
   const session = RuntimeSession.current();
+  const registry = session.registry();
   report({
     ok: true,
     action,
@@ -74,6 +101,9 @@ async function main(): Promise<void> {
     bindingKind: rt.runtimeBinding?.kind ?? null,
     eventsDir: rt.runtimeBinding?.eventsDir ?? null,
     visibleMissions: store.listMissions().map((m) => m.mission_id),
+    heldLeases: registry?.leases.list({ sessionId: session.sessionId }).map((lease) => lease.resourceId) ?? [],
+    reconciliation: session.lastReconciliation,
+    health: session.health.state,
     openMs: Date.now() - openedAt,
   });
   if (action === "hold") {

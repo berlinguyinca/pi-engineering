@@ -103,9 +103,15 @@ export function listStreamFiles(eventsDir: string): string[] {
 /** Read-only merged view of a namespace (doctor, tooling) — opens no writer. */
 export function readMergedEvents(eventsDir: string): StoredEvent[] {
   const seen = new Set<string>();
-  return mergeStreams(listStreamFiles(eventsDir).map((name) => readJsonlFrom(join(eventsDir, name), 0).events)).filter(
-    (event) => (seen.has(event.event_id) ? false : (seen.add(event.event_id), true)),
-  );
+  const merged: StoredEvent[] = [];
+  for (const event of mergeStreams(
+    listStreamFiles(eventsDir).map((name) => readJsonlFrom(join(eventsDir, name), 0).events),
+  )) {
+    if (seen.has(event.event_id)) continue;
+    seen.add(event.event_id);
+    merged.push(event);
+  }
+  return merged;
 }
 
 export class SessionEventStore implements EventStoreBackend {

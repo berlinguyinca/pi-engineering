@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, rename, unlink, writeFile } from "node:fs/promises";
+import { hostname } from "node:os";
 import { join, resolve } from "node:path";
 import type { Model } from "@earendil-works/pi-ai/compat";
 import { ArtifactStore } from "../artifacts/ArtifactStore.ts";
@@ -63,6 +64,7 @@ import {
   namespaceKey,
   openOrchestrationNamespace,
 } from "./isolation/orchestrationNamespace.ts";
+import { assessProcess } from "./isolation/processIdentity.ts";
 import { UnavailableModels, createRouteModel, followUnavailableModels } from "./modelRouting.ts";
 
 /**
@@ -406,6 +408,32 @@ export interface EngineeringRuntimeOptions {
 }
 
 /**
+ * Whether the runtime that wrote an in-store mission/repository lease is
+ * provably gone, so custody may take the mission over without waiting for the
+ * lease to expire. Owners are `session-<uuid>-…` (checked against the machine
+ * registry) or legacy `runtime-<pid>-…` (checked by pid).
+ */
+function isLeaseOwnerGone(ownerId: string, session: RuntimeSession): boolean {
+  const sessionOwner = /^session-([0-9a-f-]{36})-/.exec(ownerId);
+  if (sessionOwner) {
+    if (sessionOwner[1] === session.sessionId) return false;
+    const registry = session.registry();
+    if (!registry) return false;
+    try {
+      return !registry.isSessionLive(sessionOwner[1]!);
+    } catch {
+      return false;
+    }
+  }
+  const legacy = /^runtime-(\d+)-/.exec(ownerId);
+  if (legacy) {
+    const liveness = assessProcess({ pid: Number(legacy[1]), host: hostname(), bootId: null, processStartTime: null });
+    return liveness.state === "dead";
+  }
+  return false;
+}
+
+/**
  * The Engineering Runtime facade. Owns the ledger, artifact store, context
  * broker, git provider, verifier, and worker executor for one repository, and
  * exposes the vertical-slice workflows: scout, implement, verify, review,
@@ -746,7 +774,14 @@ export class EngineeringRuntime {
     try {
       let namespace = openedOrchestrationStores.get(orchestrationPath);
       if (!namespace) {
-        namespace = await openOrchestrationNamespace({ binding, sessionId: session.sessionId });
+        const registry = session.ensureRegistered();
+        namespace = await openOrchestrationNamespace({
+          binding,
+          sessionId: session.sessionId,
+          registry,
+          leases: () => RuntimeSession.current().registry()?.leases ?? null,
+          leaseOwner: () => session.leaseOwner(),
+        });
         openedOrchestrationStores.set(orchestrationPath, namespace);
       }
       const orchestrationBackend = namespace.backend;
@@ -761,6 +796,7 @@ export class EngineeringRuntime {
       rt.missionOwnership = new MissionOwnership(rt.missionStore, {
         ownerId: `session-${session.sessionId}-${randomUUID()}`,
         custody,
+        isOwnerGone: (ownerId) => isLeaseOwnerGone(ownerId, session),
       });
       for (const mission of rt.missionStore.listMissions()) {
         const manifest = rt.missionStore.getWorkspaceManifest(mission.mission_id);

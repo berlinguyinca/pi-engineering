@@ -9,8 +9,15 @@
 import { join } from "node:path";
 import type { EventStoreBackend } from "../../platform/eventstore/backend.ts";
 import { JsonlEventStore } from "../../platform/eventstore/jsonl.ts";
-import { FileLockMissionCustody, LocalMissionCustody, type MissionCustody } from "./MissionCustody.ts";
+import type { LeaseManager, LeaseOwner } from "./LeaseManager.ts";
+import {
+  FileLockMissionCustody,
+  LeaseMissionCustody,
+  LocalMissionCustody,
+  type MissionCustody,
+} from "./MissionCustody.ts";
 import type { RuntimeBinding } from "./RuntimeBinding.ts";
+import type { RuntimeRegistry } from "./RuntimeRegistry.ts";
 import { SessionEventStore } from "./SessionEventStore.ts";
 import { readJsonlFrom } from "./jsonlFiles.ts";
 import { type LegacyMigrationResult, migrateLegacyStore } from "./legacyMigration.ts";
@@ -35,6 +42,11 @@ export async function openOrchestrationNamespace(options: {
   binding: RuntimeBinding;
   sessionId: string;
   writerAuthority?: () => boolean;
+  /** Machine registry for cross-process custody; null degrades to file locks. */
+  registry?: RuntimeRegistry | null;
+  /** Resolves the live registry's leases at claim time. */
+  leases?: () => LeaseManager | null;
+  leaseOwner?: () => LeaseOwner;
 }): Promise<OrchestrationNamespace> {
   const { binding, sessionId } = options;
   const migrations: LegacyMigrationResult[] = [];
@@ -71,7 +83,14 @@ export async function openOrchestrationNamespace(options: {
       key: namespaceKey(binding),
       binding,
       backend,
-      custody: new FileLockMissionCustody(join(binding.runtimeDir, "custody")),
+      custody:
+        options.registry && options.leaseOwner
+          ? new LeaseMissionCustody(
+              options.leases ?? (() => options.registry?.leases ?? null),
+              namespaceKey(binding),
+              options.leaseOwner,
+            )
+          : new FileLockMissionCustody(join(binding.runtimeDir, "custody")),
       migrations,
     };
   }

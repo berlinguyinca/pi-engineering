@@ -23,6 +23,13 @@ export interface ChildReport {
   bindingKind?: string | null;
   eventsDir?: string | null;
   visibleMissions?: string[];
+  heldLeases?: string[];
+  adoptedGeneration?: number;
+  reconciliation?: {
+    orphanedSessions: Array<{ sessionId: string; pid: number; reason: string }>;
+    reclaimedLeases: Array<{ resourceId: string; sessionId: string; reason: string }>;
+  } | null;
+  health?: string;
   error?: string;
 }
 
@@ -35,7 +42,7 @@ export interface RunningChild {
 }
 
 export function startChild(
-  action: "open" | "hold",
+  action: "open" | "hold" | "adopt",
   cwd: string,
   stateDir: string,
   options: { startAt?: number; env?: NodeJS.ProcessEnv } = {},

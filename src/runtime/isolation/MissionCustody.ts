@@ -11,6 +11,7 @@
  */
 import { join } from "node:path";
 import { ExclusiveFileLock } from "../../platform/eventstore/fileLock.ts";
+import type { LeaseManager, LeaseOwner } from "./LeaseManager.ts";
 
 export type CustodyClaim = { ok: true; reclaimed: boolean } | { ok: false; holder: string };
 
@@ -26,7 +27,70 @@ export interface MissionCustody {
 }
 
 /**
- * Custody backed by one stale-reclaimable process lock per mission in the
+ * Custody backed by generation-fenced SQLite leases in the machine registry
+ * (the normal path). Every claim re-validates against the registry, so a
+ * session that lost custody (e.g. it was declared dead while suspended) finds
+ * out instead of acting on a stale belief.
+ */
+export class LeaseMissionCustody implements MissionCustody {
+  private readonly leases: () => LeaseManager | null;
+  private readonly namespace: string;
+  private readonly owner: () => LeaseOwner;
+  private readonly held = new Map<string, string>();
+
+  /** `leases` is resolved per call: the registry may be reopened (e.g. relocated state dir). */
+  constructor(leases: () => LeaseManager | null, namespace: string, owner: () => LeaseOwner) {
+    this.leases = leases;
+    this.namespace = namespace;
+    this.owner = owner;
+  }
+
+  private key(resource: string): string {
+    return `${this.namespace}#${resource}`;
+  }
+
+  async claim(resource: string): Promise<CustodyClaim> {
+    let outcome: ReturnType<LeaseManager["acquire"]>;
+    try {
+      const leases = this.leases();
+      if (!leases) throw new Error("not registered");
+      outcome = leases.acquire(this.key(resource), this.owner());
+    } catch (error) {
+      // Coordination is unreachable right now: act on nothing rather than guess.
+      this.held.delete(resource);
+      return { ok: false, holder: `registry unavailable: ${error instanceof Error ? error.message : String(error)}` };
+    }
+    if (!outcome.ok) {
+      this.held.delete(resource);
+      return { ok: false, holder: `session ${outcome.holder.sessionId.slice(0, 8)} (pid ${outcome.holder.pid})` };
+    }
+    this.held.set(resource, outcome.lease.generationId);
+    return { ok: true, reclaimed: outcome.reclaimed !== null };
+  }
+
+  holds(resource: string): boolean {
+    return this.held.has(resource);
+  }
+
+  async release(resource: string): Promise<void> {
+    const generationId = this.held.get(resource);
+    if (!generationId) return;
+    this.held.delete(resource);
+    try {
+      this.leases()?.release(this.key(resource), generationId);
+    } catch {
+      // An unreleased lease is reclaimed once this session stops heartbeating.
+    }
+  }
+
+  async releaseAll(): Promise<void> {
+    for (const resource of [...this.held.keys()]) await this.release(resource);
+  }
+}
+
+/**
+ * Degraded-mode custody (the registry database is unavailable): one
+ * stale-reclaimable process lock per mission in the
  * namespace's `custody/` directory. The lock records pid + boot id + process
  * start time, so a dead (or PID-reused) holder is reclaimed automatically.
  */

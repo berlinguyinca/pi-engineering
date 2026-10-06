@@ -13,6 +13,12 @@ export interface MissionOwnershipOptions {
    * repository) may take a lease on it. Omitted for single-writer stores.
    */
   custody?: MissionCustody;
+  /**
+   * True when the runtime that holds an in-store lease is provably gone (dead
+   * process / unregistered session). Lets the custodian take over at once
+   * instead of waiting for the dead owner's lease to expire.
+   */
+  isOwnerGone?: (ownerId: string) => boolean;
 }
 
 export const missionCustodyKey = (missionId: string): string => `mission:${missionId}`;
@@ -42,6 +48,7 @@ export class MissionOwnership {
   private readonly heartbeatMs: number;
   private readonly now: () => number;
   private readonly custody: MissionCustody | undefined;
+  private readonly isOwnerGone: ((ownerId: string) => boolean) | undefined;
   private readonly missionHolders = new Map<string, number>();
   private readonly repositoryHolders = new Map<string, number>();
 
@@ -59,6 +66,19 @@ export class MissionOwnership {
     }
     this.now = options.now ?? Date.now;
     this.custody = options.custody;
+    this.isOwnerGone = options.isOwnerGone;
+  }
+
+  /** A lease held by another runtime that is provably gone counts as expired. */
+  private heldByGoneOwner(lease: { ownerId: string }): boolean {
+    return lease.ownerId !== this.ownerId && this.isOwnerGone?.(lease.ownerId) === true;
+  }
+
+  /** Renewal is only valid while this session still holds custody. */
+  private async confirmCustody(resource: string, what: string): Promise<void> {
+    if (!this.custody) return;
+    const claim = await this.custody.claim(resource);
+    if (!claim.ok) throw new Error(`${what} custody was lost to another live session (${claim.holder})`);
   }
 
   /** Claim custody of a resource and catch up on other sessions' events. */
@@ -84,7 +104,7 @@ export class MissionOwnership {
     await this.claimCustody(missionCustodyKey(missionId), `mission ${missionId}`);
     const current = this.store.getMissionLease(missionId);
     const now = this.now();
-    if (current && !this.isExpired(current, now)) {
+    if (current && !this.isExpired(current, now) && !this.heldByGoneOwner(current)) {
       if (current.ownerId !== this.ownerId) {
         throw new Error(`mission ${missionId} is owned by ${current.ownerId} until ${current.renewBy}`);
       }
@@ -131,6 +151,7 @@ export class MissionOwnership {
   }
 
   async renew(identity: MissionLease): Promise<MissionLease> {
+    await this.confirmCustody(missionCustodyKey(identity.missionId), `mission ${identity.missionId}`);
     const current = this.store.getMissionLease(identity.missionId);
     this.assertSameEpoch(identity, current, "mission");
     const now = this.now();
@@ -157,7 +178,7 @@ export class MissionOwnership {
     await this.claimCustody(repositoryCustodyKey(repoId), `repository ${repoId}`);
     const current = this.store.getRepositoryLeaseByRepoId(repoId);
     const now = this.now();
-    if (current && !this.isExpired(current, now)) {
+    if (current && !this.isExpired(current, now) && !this.heldByGoneOwner(current)) {
       if (current.missionId !== identity.missionId || current.ownerId !== identity.ownerId) {
         throw new Error(`repository ${repoId} is leased to mission ${current.missionId} by ${current.ownerId}`);
       }
@@ -188,6 +209,7 @@ export class MissionOwnership {
   }
 
   async renewRepository(identity: RepositoryLease): Promise<RepositoryLease> {
+    await this.confirmCustody(repositoryCustodyKey(identity.repoId), `repository ${identity.repoId}`);
     const current = this.store.getRepositoryLeaseByRepoId(identity.repoId);
     this.assertSameEpoch(identity, current, "repository");
     this.assertMissionOwner(identity.missionId, identity.ownerId);

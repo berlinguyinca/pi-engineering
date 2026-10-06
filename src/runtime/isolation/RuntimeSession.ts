@@ -1,58 +1,133 @@
 /**
- * The Pi Engineering session: one UUID per Pi process.
+ * The Pi Engineering session: one UUID per Pi process, registered in the
+ * machine registry, heartbeating, and unregistered on graceful exit.
  *
- * The identity lives on `globalThis`, so an in-process reload of Pi Engineering
- * (a fresh module graph in the same process) continues the SAME logical session
- * instead of looking like a second one — no false stale ownership, no duplicate
- * event writer, no orphaned runtime state.
+ * All mutable session state lives on `globalThis`, so an in-process reload of
+ * Pi Engineering (a fresh module graph in the same process) continues the SAME
+ * logical session — same id, same registry generation, one heartbeat timer —
+ * instead of looking like a second session: no false stale ownership, no
+ * duplicate event writer, no orphaned runtime state.
  */
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
+import type { LeaseOwner } from "./LeaseManager.ts";
+import { type ReconciliationReport, RecoveryManager } from "./RecoveryManager.ts";
+import { RuntimeRegistry, type SessionBindingUpdate } from "./RuntimeRegistry.ts";
 import { type ProcessIdentity, currentProcessIdentity } from "./processIdentity.ts";
-import { setRuntimeEventLog } from "./runtimeEvents.ts";
+import { emitRuntimeEvent, setRuntimeEventLog } from "./runtimeEvents.ts";
 import { resolveStateRoot, sessionRuntimeDir } from "./stateDir.ts";
 
-interface SessionIdentityRecord {
+export type RuntimeHealth = "healthy" | "degraded" | "recovering" | "rebound" | "isolated" | "failed";
+
+export interface SessionBindingInfo extends SessionBindingUpdate {
+  repoName: string | null;
+  kind: string;
+}
+
+interface SessionGlobalState {
   sessionId: string;
   startedAt: string;
   pid: number;
+  registry: RuntimeRegistry | null;
+  registryFile: string | null;
+  generationId: string | null;
+  heartbeatTimer: ReturnType<typeof setInterval> | null;
+  lastHeartbeatMs: number | null;
+  health: RuntimeHealth;
+  healthReason: string | null;
+  binding: SessionBindingInfo | null;
+  lastReconciliation: ReconciliationReport | null;
+  exitHookInstalled: boolean;
+  metadata: Record<string, unknown>;
 }
 
-const SESSION_KEY = Symbol.for("pi-engineering.runtime-session");
+const SESSION_KEY = Symbol.for("pi-engineering.runtime-session.v2");
 
-function sessionHolder(): Record<symbol, SessionIdentityRecord | undefined> {
-  return globalThis as unknown as Record<symbol, SessionIdentityRecord | undefined>;
+export const DEFAULT_HEARTBEAT_MS = 10_000;
+
+function heartbeatIntervalMs(): number {
+  const raw = Number(process.env.PI_ENGINEERING_HEARTBEAT_MS);
+  return Number.isFinite(raw) && raw >= 50 ? raw : DEFAULT_HEARTBEAT_MS;
+}
+
+function globalState(): SessionGlobalState {
+  const holder = globalThis as unknown as Record<symbol, SessionGlobalState | undefined>;
+  let state = holder[SESSION_KEY];
+  // A session identity belongs to exactly one process.
+  if (!state || state.pid !== process.pid) {
+    state = {
+      sessionId: randomUUID(),
+      startedAt: new Date().toISOString(),
+      pid: process.pid,
+      registry: null,
+      registryFile: null,
+      generationId: null,
+      heartbeatTimer: null,
+      lastHeartbeatMs: null,
+      health: "healthy",
+      healthReason: null,
+      binding: null,
+      lastReconciliation: null,
+      exitHookInstalled: false,
+      metadata: {},
+    };
+    holder[SESSION_KEY] = state;
+  }
+  return state;
 }
 
 /** Stable session identity for this process (survives in-process reloads). */
-export function currentSessionIdentity(): SessionIdentityRecord {
-  const holder = sessionHolder();
-  let record = holder[SESSION_KEY];
-  // A forked child inherits globals only through explicit serialization, but be
-  // strict anyway: a session identity belongs to exactly one process.
-  if (!record || record.pid !== process.pid) {
-    record = { sessionId: randomUUID(), startedAt: new Date().toISOString(), pid: process.pid };
-    holder[SESSION_KEY] = record;
-  }
-  return record;
+export function currentSessionIdentity(): { sessionId: string; startedAt: string; pid: number } {
+  const state = globalState();
+  return { sessionId: state.sessionId, startedAt: state.startedAt, pid: state.pid };
+}
+
+export function registryFileFor(stateRoot: string): string {
+  return join(stateRoot, "registry.db");
 }
 
 export class RuntimeSession {
-  readonly sessionId: string;
-  readonly startedAt: string;
+  private readonly state: SessionGlobalState;
   readonly process: ProcessIdentity;
 
-  private constructor(record: SessionIdentityRecord) {
-    this.sessionId = record.sessionId;
-    this.startedAt = record.startedAt;
+  private constructor(state: SessionGlobalState) {
+    this.state = state;
     this.process = currentProcessIdentity();
   }
 
   /** The session of this process. Cheap; safe to call from anywhere. */
   static current(): RuntimeSession {
-    const session = new RuntimeSession(currentSessionIdentity());
+    const session = new RuntimeSession(globalState());
     setRuntimeEventLog(join(session.sessionDir(), "runtime.jsonl"));
     return session;
+  }
+
+  get sessionId(): string {
+    return this.state.sessionId;
+  }
+
+  get startedAt(): string {
+    return this.state.startedAt;
+  }
+
+  get generationId(): string | null {
+    return this.state.generationId;
+  }
+
+  get health(): { state: RuntimeHealth; reason: string | null } {
+    return { state: this.state.health, reason: this.state.healthReason };
+  }
+
+  get binding(): SessionBindingInfo | null {
+    return this.state.binding ? { ...this.state.binding } : null;
+  }
+
+  get lastHeartbeatMs(): number | null {
+    return this.state.lastHeartbeatMs;
+  }
+
+  get lastReconciliation(): ReconciliationReport | null {
+    return this.state.lastReconciliation;
   }
 
   stateRoot(): string {
@@ -62,5 +137,188 @@ export class RuntimeSession {
   /** Session scope: unbound/fallback runtime state and the debug log. */
   sessionDir(): string {
     return sessionRuntimeDir(this.stateRoot(), this.sessionId);
+  }
+
+  leaseOwner(): LeaseOwner {
+    return { sessionId: this.sessionId, process: this.process };
+  }
+
+  setHealth(health: RuntimeHealth, reason: string | null = null): void {
+    this.state.health = health;
+    this.state.healthReason = reason;
+  }
+
+  /**
+   * Register in the machine registry (idempotent), run startup
+   * reconciliation once per registry, and start heartbeating. Returns null —
+   * and marks the session degraded — when no registry can be opened; callers
+   * keep working with local fallbacks.
+   */
+  ensureRegistered(): RuntimeRegistry | null {
+    const file = registryFileFor(this.stateRoot());
+    const state = this.state;
+    if (state.registry && state.registryFile === file && state.generationId) return state.registry;
+    if (state.registry && state.registryFile !== file) this.shutdown("relocated");
+    let registry: RuntimeRegistry;
+    try {
+      registry = RuntimeRegistry.open(file);
+    } catch (error) {
+      this.setHealth(
+        "degraded",
+        `runtime registry unavailable: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      emitRuntimeEvent("runtime.degraded", { session_id: this.sessionId, reason: state.healthReason });
+      return null;
+    }
+    try {
+      const record = registry.register({
+        sessionId: this.sessionId,
+        process: this.process,
+        startedAt: this.startedAt,
+        binding: state.binding ?? undefined,
+        metadata: state.metadata,
+        state: "starting",
+      });
+      state.registry = registry;
+      state.registryFile = file;
+      state.generationId = record.generationId;
+      state.lastHeartbeatMs = record.lastHeartbeatMs;
+      emitRuntimeEvent("session.registered", {
+        session_id: this.sessionId,
+        generation_id: record.generationId,
+        pid: this.process.pid,
+      });
+      this.setHealth("recovering");
+      emitRuntimeEvent("runtime.recovering", { session_id: this.sessionId, phase: "startup_reconciliation" });
+      state.lastReconciliation = new RecoveryManager(registry, { selfSessionId: this.sessionId }).reconcile();
+      registry.setState(this.sessionId, record.generationId, "healthy");
+      this.setHealth("healthy");
+      emitRuntimeEvent("runtime.started", { session_id: this.sessionId, generation_id: record.generationId });
+      this.startHeartbeat();
+      this.installExitHook();
+      return registry;
+    } catch (error) {
+      registry.close();
+      state.registry = null;
+      state.registryFile = null;
+      state.generationId = null;
+      this.setHealth(
+        "degraded",
+        `runtime registry unavailable: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      emitRuntimeEvent("runtime.degraded", { session_id: this.sessionId, reason: state.healthReason });
+      return null;
+    }
+  }
+
+  /** The open registry, if this session is registered. */
+  registry(): RuntimeRegistry | null {
+    return this.state.registry;
+  }
+
+  private startHeartbeat(): void {
+    if (this.state.heartbeatTimer) clearInterval(this.state.heartbeatTimer);
+    const timer = setInterval(() => {
+      // Re-resolve through globalThis so a reloaded module's code takes over.
+      RuntimeSession.current().heartbeat();
+    }, heartbeatIntervalMs());
+    timer.unref?.();
+    this.state.heartbeatTimer = timer;
+  }
+
+  private installExitHook(): void {
+    if (this.state.exitHookInstalled) return;
+    this.state.exitHookInstalled = true;
+    // node:sqlite is synchronous, so a graceful unregister fits in 'exit'.
+    process.once("exit", () => {
+      try {
+        RuntimeSession.current().shutdown("process_exit");
+      } catch {
+        // Ungraceful paths are repaired by the next startup reconciliation.
+      }
+    });
+  }
+
+  /**
+   * Prove liveness. If the registry no longer recognizes this generation (we
+   * were declared dead while suspended, or the row vanished), re-register under
+   * a NEW generation instead of resurrecting the old one.
+   */
+  heartbeat(): boolean {
+    const { registry, generationId } = this.state;
+    if (!registry || !generationId) return false;
+    try {
+      if (registry.heartbeat(this.sessionId, generationId)) {
+        this.state.lastHeartbeatMs = Date.now();
+        if (this.state.health === "recovering") this.setHealth("healthy");
+        emitRuntimeEvent("session.heartbeat", { session_id: this.sessionId });
+        return true;
+      }
+      this.setHealth("recovering", "registry generation superseded; re-registering");
+      const record = registry.register({
+        sessionId: this.sessionId,
+        process: this.process,
+        startedAt: this.startedAt,
+        binding: this.state.binding ?? undefined,
+        metadata: this.state.metadata,
+      });
+      this.state.generationId = record.generationId;
+      this.state.lastHeartbeatMs = record.lastHeartbeatMs;
+      this.setHealth("healthy");
+      emitRuntimeEvent("session.recovered", {
+        session_id: this.sessionId,
+        previous_generation: generationId,
+        generation_id: record.generationId,
+      });
+      return true;
+    } catch (error) {
+      this.setHealth("degraded", `heartbeat failed: ${error instanceof Error ? error.message : String(error)}`);
+      return false;
+    }
+  }
+
+  setMetadata(metadata: Record<string, unknown>): void {
+    this.state.metadata = { ...this.state.metadata, ...metadata };
+    const { registry, generationId } = this.state;
+    if (registry && generationId) {
+      try {
+        registry.setMetadata(this.sessionId, generationId, this.state.metadata);
+      } catch {
+        // Metadata is descriptive only.
+      }
+    }
+  }
+
+  /** Record the current binding (worktree) of this session. */
+  recordBinding(binding: SessionBindingInfo, beforeCommit?: () => void): boolean {
+    const { registry, generationId } = this.state;
+    if (registry && generationId) {
+      const committed = registry.rebind(this.sessionId, generationId, binding, beforeCommit);
+      if (!committed) return false;
+    } else {
+      beforeCommit?.();
+    }
+    this.state.binding = { ...binding };
+    return true;
+  }
+
+  /** Graceful shutdown: unregister, release leases, stop heartbeating. Idempotent. */
+  shutdown(reason = "shutdown"): void {
+    const state = this.state;
+    if (state.heartbeatTimer) clearInterval(state.heartbeatTimer);
+    state.heartbeatTimer = null;
+    const { registry, generationId } = state;
+    state.registry = null;
+    state.registryFile = null;
+    state.generationId = null;
+    if (!registry || !generationId) return;
+    try {
+      registry.unregister(this.sessionId, generationId);
+      emitRuntimeEvent("runtime.stopped", { session_id: this.sessionId, reason });
+    } catch {
+      // Startup reconciliation of the next session repairs this.
+    } finally {
+      registry.close();
+    }
   }
 }
