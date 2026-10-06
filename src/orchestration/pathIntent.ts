@@ -57,17 +57,46 @@ const OPEN = "\uE000";
 const CLOSE = "\uE001";
 const PLACEHOLDER = /\uE000(\d+)\uE001/g;
 
-/** Restriction lexicon: any hit makes the sentence's paths read-only. */
-const RESTRICTION =
-  /\b(?:not|no|never|nothing|none|nor|neither|dont|cannot|without|avoid\w*|skip\w*|ignor\w*|exclud\w*|except\w*|leav(?:e|es|ing)|left|alone|untouched|unchanged|unmodified|remain\w*|stay\w*|keep\w*|kept|refrain\w*|forbid\w*|prohibit\w*|disallow\w*|reference\w*|inspect\w*|analy[sz]\w*|audit\w*|review\w*|compar\w*|cop(?:y|ies|ied|ying)|mirror\w*|follow\w*|preserve\w*|intact|frozen|protect\w*|restrict\w*)\b|n't\b|\bas[- ]is\b|\bhands[- ]off\b|\boff[- ]limits\b|\bread[- ]?only\b|\bfor context\b|\bas (?:an? |the )?(?:guide|example|template|model|baseline|inspiration)\b|\blook(?:s|ing)? at\b|\bbased on\b|\bfrom\s+["'`]?\uE000/i;
-const ONLY = /\bonly\b/i;
+/**
+ * STRONG exclusion words: they taint every path of their sentence (subject
+ * to two narrow exceptions, see analyzeRequest).
+ */
+const STRONG =
+  /\b(?:do not|don'?t|dont|never|must not|mustn'?t|should not|shouldn'?t|shall not|may not|cannot|can'?t|won'?t|will not|avoid\w*|skip\w*|ignor\w*|exclud\w*|except\w*|untouched|unchanged|unmodified|refrain\w*|forbid\w*|prohibit\w*|disallow\w*|reference\w*|intact|frozen|off[- ]limits|hands[- ]off|read[- ]?only|as[- ]is|for context|not allowed|not permitted|under no circumstances|in no case|by no means|at no point|under any circumstances)\b|\bleave\b.*\balone\b|\bleft alone\b|\b(?:must|should|shall|will|to|has to|needs? to)\s+(?:stay|remain)\b|\bstays?\b|\bremains?\s+(?:as|the same|unchanged|untouched|intact)\b|\bkeep\b.*\b(?:as[- ]is|unchanged|intact|the same|untouched)\b|\bnot\s+(?:to\s+)?be\s+(?:modified|changed|touched|edited|altered|written|updated|mutated|deleted|removed)\b|\bas (?:an? |the )?(?:guide|example|template|model|baseline|inspiration)\b/i;
+/** Weak exclusionary words: they taint a path only when they directly govern it. */
+const WEAK_EXCLUSION = /^(?:no|not|nothing|none|neither|nor|without|longer|\w+n't)$/i;
+/** Weak reference words: a governed path is a source, unless it is its sentence's only path and a mutation follows. */
+const WEAK_REFERENCE =
+  /^(?:review\w*|analy[sz]\w*|inspect\w*|audit\w*|look\w*|compar\w*|cop(?:y|ies|ied|ying)|mirror\w*|follow\w*|based|study|studying|consult\w*|port\w*)$/i;
+/** How many tokens before a path a weak word may sit and still govern it. */
+const GOVERNING_WINDOW = 4;
+/** A negation right after a path ("/R is not …", "/R isn't …") governs it. */
+const TRAILING_NEGATION = /^(?:not|never|\w+n't)$/i;
+const TRAILING_WINDOW = 2;
+
+/**
+ * Result and conditional clauses ("so it no longer crashes", "so that it does
+ * not leak", "to not use", "only if") describe the outcome of the change, not
+ * an exclusion: their negation is dropped before any restriction test. A
+ * path inside the clause keeps the negation (fail-safe).
+ */
+function neutralizeResultClauses(text: string): string {
+  return text
+    .replace(
+      /\b(so(?: that)?|such that|unless|if|whether|to)\s+((?:[^\s\uE000]+\s+){0,3}?)(?:not|never|no longer)\b/gi,
+      "$1 $2",
+    )
+    .replace(/\b(so(?: that)?|such that|unless|if|whether)\s+((?:[^\s\uE000]+\s+){0,3}?)(\w+)n't\b/gi, "$1 $2$3");
+}
+const FROM_PATH = /\bfrom\s+["'`]?\uE000(\d+)\uE001/gi;
+const ONLY_PATH = /\bonly\s+(?:[^\s\uE000]+\s+){0,2}["'`]?\uE000(\d+)\uE001/gi;
 /** Broad mutation vocabulary (stems). */
 const MUTATION =
-  /\b(?:add|creat|install|implement|fix|patch|build|appl|updat|chang|edit|modif|writ|wrote|refactor|renam|delet|remov|migrat|port|upgrad|bump|mov|merg|commit|push|configur|wir|clean|improv|extend|replac|convert|restructur|repair|debug|resolv|harden|set ?up|work|coordinat|integrat|rewrit|optimi[sz]|generat|scaffold|initiali[sz]|bootstrap|introduc|insert|append|tweak|adjust|correct|rework|make|implement|ship|develop|code)\w*\b/i;
+  /\b(?:add|creat|install|implement|fix|patch|build|appl|updat|chang|edit|modif|writ|wrote|refactor|renam|delet|remov|migrat|port|upgrad|bump|mov|merg|commit|push|configur|wir|clean|improv|extend|replac|convert|restructur|repair|debug|resolv|harden|set ?up|work|coordinat|integrat|rewrit|optimi[sz]|generat|scaffold|initiali[sz]|bootstrap|introduc|insert|append|tweak|adjust|correct|rework|make|ship|develop|code|finish|complete|continue|land|wire)\w*\b/i;
 const REMOVAL = /\b(?:remov|delet|strip|drop|purg|eras|clean)\w*\b/i;
-/** Words that make a restriction clause refer back to another path. */
+/** Words that make a restriction clause refer back to a path (or the repository itself). */
 const PRONOUN =
-  /\b(?:it|its|itself|them|they|this|that|these|those|there|here|either|both|all|any|former|latter|first|second|same|above|below|previous|rest|everything|anything|others?)\b/i;
+  /\b(?:it|its|itself|them|they|this|these|those|there|here|either|both|former|latter|everything|anything|others?|repo|repos|repository|repositories|codebase|project|directory|folder|workspace|checkout|tree|files?)\b/i;
 /** Restriction aimed at the launch directory when no path is named. */
 const LAUNCH_LOCATION =
   /\b(?:here|this (?:repo|repository|directory|dir|folder|project|workspace|codebase|checkout)|the (?:repo|repository|codebase|workspace|directory|folder|project|code)|anything|everything|any files?|files)\b/i;
@@ -172,6 +201,8 @@ function lineMentions(line: string, launchCwd: string): Span[] {
 interface Unit {
   /** Masked, normalized text. */
   text: string;
+  /** Header / list intro the unit sits under. */
+  context: string;
 }
 
 const SENTENCE_SPLIT = /(?<=[.!?;])\s+|(?<=[.!?;])(?=[A-Z])/;
@@ -242,14 +273,14 @@ export function analyzeRequest(request: string, launchCwd: string): RequestAnaly
     if (/^#{1,6}\s/.test(trimmed)) {
       header = trimmed.replace(/^#{1,6}\s+/, "");
       intro = "";
-      units.push({ text: header });
+      units.push({ text: header, context: "" });
       continue;
     }
     const isItem = LIST_ITEM.test(trimmed);
     const body = trimmed.replace(LIST_ITEM, "");
     const context = [header, isItem ? intro : ""].filter(Boolean).join(": ");
     for (const sentence of body.split(SENTENCE_SPLIT)) {
-      if (sentence.trim()) units.push({ text: context ? `${context}: ${sentence}` : sentence });
+      if (sentence.trim()) units.push({ text: context ? `${context}: ${sentence}` : sentence, context });
     }
     if (!isItem) intro = body.replace(/[:.]\s*$/, "");
   }
@@ -257,44 +288,87 @@ export function analyzeRequest(request: string, launchCwd: string): RequestAnaly
   const tainted = mentions.map(() => false);
   const granted = mentions.map(() => false);
   const mutationAimed = mentions.map(() => false);
+  const mutationLed = mentions.map(() => false);
   let launchRestricted = false;
-  let anyRestriction = false;
   const onlyTargets: number[] = [];
   let previousPaths: number[] = [];
+  // A bare "/" counts as a path only when a mutation verb leads it ('Modify files in "/"').
+  const distinctPaths = new Set(
+    mentions.filter((mention) => mention.raw !== "/").map((mention) => mention.path ?? mention.raw),
+  );
+  /** Every strong hit of the request sits in a pathless clause about something else. */
+  let strongAboutOtherThings = true;
 
   for (const unit of units) {
-    const text = unit.text;
+    const text = neutralizeResultClauses(unit.text);
     const paths = placeholders(text);
     const words = prose(text);
-    const restricted = RESTRICTION.test(text);
-    const hasOnly = ONLY.test(words) && !/\b(?:not|n't)\s+only\b/i.test(words);
+    const strong = STRONG.test(words);
     const mutation = MUTATION.test(words);
-    if (restricted || (hasOnly && paths.length === 0)) anyRestriction = true;
     for (const index of paths) if (mutation) mutationAimed[index] = true;
 
     if (paths.length === 0) {
-      if ((restricted || hasOnly) && LAUNCH_LOCATION.test(words)) launchRestricted = true;
+      if (strong && LAUNCH_LOCATION.test(words)) launchRestricted = true;
       // "Modify /R? No." — a bare negation retracts the previous sentence.
       if (PURE_NEGATION.test(words.trim())) for (const index of previousPaths) tainted[index] = true;
+      // "Fix /T. Do not modify it." — a pathless restriction that points back at a path.
+      if (strong && PRONOUN.test(words.replace(/\b(?:anything|everything|nothing) else\b/gi, " "))) {
+        strongAboutOtherThings = false;
+        tainted.fill(true);
+      }
       continue;
     }
     previousPaths = paths;
 
-    if (hasOnly && mutation && !restricted) onlyTargets.push(...paths);
+    const clauses = text.split(CLAUSE_SPLIT).filter((clause) => clause.trim());
 
-    if (!restricted) {
+    // A header or list intro with any restriction word taints the whole list under it.
+    if (unit.context) {
+      const contextWords = prose(neutralizeResultClauses(unit.context));
+      const contextTokens = contextWords.split(/\s+/).map((token) => token.replace(/[^\w']/g, ""));
+      if (
+        STRONG.test(contextWords) ||
+        contextTokens.some((token) => WEAK_EXCLUSION.test(token) || WEAK_REFERENCE.test(token))
+      ) {
+        for (const index of paths) tainted[index] = true;
+      }
+    }
+
+    // Path-local rules: "from /R" is a source; weak words govern the path right after them.
+    const sentencePaths = new Set(paths.map((index) => mentions[index]?.path ?? mentions[index]?.raw));
+    const removalOfSinglePath = sentencePaths.size === 1 && REMOVAL.test(words);
+    if (!removalOfSinglePath) for (const match of text.matchAll(FROM_PATH)) tainted[Number(match[1])] = true;
+    for (const match of text.matchAll(ONLY_PATH)) if (mutation) onlyTargets.push(Number(match[1]));
+    for (const clause of clauses) {
+      for (const match of clause.matchAll(PLACEHOLDER)) {
+        const index = Number(match[1]);
+        const lead = clause.slice(0, match.index).split(OPEN).at(-1) ?? "";
+        const tokens = lead
+          .split(/\s+/)
+          .map((token) => token.replace(/^["'`(*_]+|["'`)*_.,:;!?]+$/g, ""))
+          .filter(Boolean)
+          .slice(-GOVERNING_WINDOW);
+        if (tokens.some((token) => WEAK_EXCLUSION.test(token))) tainted[index] = true;
+        if (tokens.some((token) => MUTATION.test(token))) mutationLed[index] = true;
+        const trail = clause
+          .slice(match.index + match[0].length)
+          .split(OPEN)[0]!
+          .split(/\s+/)
+          .map((token) => token.replace(/^["'`(*_]+|["'`)*_.,:;!?]+$/g, ""))
+          .filter(Boolean)
+          .slice(0, TRAILING_WINDOW);
+        if (trail.some((token) => TRAILING_NEGATION.test(token))) tainted[index] = true;
+        if (tokens.some((token) => WEAK_REFERENCE.test(token)) && !(sentencePaths.size === 1 && mutation)) {
+          tainted[index] = true;
+        }
+      }
+    }
+
+    if (!strong) {
       if (mutation) for (const index of paths) granted[index] = true;
       continue;
     }
 
-    // Narrow exceptions for a sentence with a restriction word.
-    const removalFrom =
-      paths.length === 1 && REMOVAL.test(words) && !RESTRICTION.test(text.replace(/\bfrom\s+["'`]?\uE000/gi, " "));
-    if (removalFrom) {
-      granted[paths[0]!] = true;
-      continue;
-    }
-    const clauses = text.split(CLAUSE_SPLIT).filter((clause) => clause.trim());
     // A clause holding only paths ("…, /b", "and /c") continues the previous
     // clause's list: it inherits its verb and, fail-safe, its restriction.
     let previous = { mutation: false, restricted: false };
@@ -302,18 +376,27 @@ export function analyzeRequest(request: string, launchCwd: string): RequestAnaly
       const clauseWords = prose(clause);
       const clausePaths = placeholders(clause);
       const pathOnly = /^[\s,&]*(?:(?:and|or|nor|plus|&)\s*)?[\s,]*$/i.test(clauseWords);
-      const clauseRestricted = RESTRICTION.test(clause) || (pathOnly && previous.restricted);
+      const clauseRestricted = STRONG.test(clauseWords) || (pathOnly && previous.restricted);
       const clauseMutation = MUTATION.test(clauseWords) || (pathOnly && previous.mutation);
       previous = { mutation: clauseMutation, restricted: clauseRestricted };
-      return { clausePaths, restricted: clauseRestricted, clauseMutation, clauseWords };
+      const aboutRepository = PRONOUN.test(clauseWords.replace(/\b(?:anything|everything|nothing) else\b/gi, " "));
+      return { clausePaths, restricted: clauseRestricted, clauseMutation, aboutRepository };
     });
-    const restrictionsAttached = clauseInfo
-      .filter((info) => info.restricted)
-      .every((info) => info.clausePaths.length > 0 && !PRONOUN.test(info.clauseWords));
+    const restrictedClauses = clauseInfo.filter((info) => info.restricted);
+    // Exception 1: each restriction sits in its own clause, naming its own path.
+    const attachedToOtherPaths = restrictedClauses.every(
+      (info) => info.clausePaths.length > 0 && !info.aboutRepository,
+    );
+    // Exception 2: the restriction is about a non-path object ("do not change the public API").
+    const aboutOtherThings = restrictedClauses.every((info) => info.clausePaths.length === 0 && !info.aboutRepository);
+    if (!aboutOtherThings) strongAboutOtherThings = false;
     for (const info of clauseInfo) {
       for (const index of info.clausePaths) {
-        if (restrictionsAttached && !info.restricted && info.clauseMutation) granted[index] = true;
-        else tainted[index] = true;
+        if (info.restricted) tainted[index] = true;
+        else if (attachedToOtherPaths && info.clauseMutation) granted[index] = true;
+        else if (aboutOtherThings && distinctPaths.size === 1) {
+          if (mutation) granted[index] = true;
+        } else tainted[index] = true;
       }
     }
   }
@@ -351,13 +434,23 @@ export function analyzeRequest(request: string, launchCwd: string): RequestAnaly
     return granted[index] === true || directiveWrite.has(index);
   };
 
-  // A single path in a request without any restriction is its target.
-  const distinct = new Set(mentions.map((mention) => mention.path ?? mention.raw));
-  if (!hasDirectives && distinct.size === 1 && !anyRestriction && !mentions[0]?.unresolved) {
+  // A single path the request does not restrict is its target, verb or not;
+  // restrictions about other things ("do not change the public API") only
+  // count when exactly one path is named.
+  const singleUntainted =
+    !hasDirectives &&
+    distinctPaths.size === 1 &&
+    !mentions[0]?.unresolved &&
+    strongAboutOtherThings &&
+    tainted.every((value) => !value);
+  if (singleUntainted) {
     mentions.forEach((_, index) => {
       granted[index] = true;
     });
   }
+  mentions.forEach((mention, index) => {
+    if (mention.raw === "/" && !directiveWrite.has(index)) granted[index] = mutationLed[index] === true;
+  });
   if (directiveWrite.size > 0) {
     mentions.forEach((_, index) => {
       granted[index] = directiveWrite.has(index);
@@ -372,7 +465,7 @@ export function analyzeRequest(request: string, launchCwd: string): RequestAnaly
     hasDirectives,
     directiveConflict,
     launchRestricted,
-    anyRestriction,
+    anyRestriction: !strongAboutOtherThings || tainted.some(Boolean),
     writeEligible,
   };
 }

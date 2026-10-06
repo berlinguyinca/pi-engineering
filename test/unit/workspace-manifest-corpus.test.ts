@@ -61,12 +61,7 @@ const CORPUS: Row[] = [
   { prompt: (p) => `Update ${typo(p.T)}`, write: "refuse", message: /does not exist/ },
   { prompt: (p) => `Fix ${p.T.toUpperCase()}`, write: "refuse", message: /does not exist/ },
   { prompt: () => "Fix ~/pi-eng-repo-that-does-not-exist-7f3a", write: "refuse" },
-  {
-    prompt: (p) => `Port the change from ${p.R} into ${p.T}`,
-    write: "refuse",
-    excluded: ["R"],
-    message: DIRECTIVE_HINT,
-  },
+  { prompt: (p) => `Port the change from ${p.R} into ${p.T}`, write: ["T"], read: ["R"], excluded: ["R"] },
   { prompt: (p) => `Do not touch ${p.L}. Build the feature.`, write: "refuse", excluded: ["L"] },
   { prompt: (p) => `Implement the feature in ${typo(p.T)}`, write: "refuse", message: /does not exist/ },
   { prompt: (p) => `Leave ${p.R} alone and fix ${p.T}`, write: ["T"], read: ["R"], excluded: ["R"] },
@@ -78,7 +73,13 @@ const CORPUS: Row[] = [
     read: ["R"],
     excluded: ["R"],
   },
-  { prompt: (p) => `Analyze ${p.F} and fix the bug`, write: "refuse", excluded: ["F", "L"] },
+  // A file outside any repository with a fix verb: its directory is no repository.
+  {
+    prompt: (p) => `Analyze ${p.F} and fix the bug`,
+    write: "refuse",
+    excluded: ["L"],
+    message: /not inside a Git repository/,
+  },
   { prompt: () => "fix /etc/nginx", write: "refuse", message: /protected/ },
   { prompt: () => "Modify files in /etc", write: "refuse", message: /protected/ },
   {
@@ -93,13 +94,17 @@ const CORPUS: Row[] = [
   { prompt: (p) => `Never leave ${p.T} broken: fix the failing build`, write: "refuse", message: DIRECTIVE_HINT },
   { prompt: (p) => `Review ${p.T}`, write: "refuse" },
   { prompt: (p) => `The build does not pass in ${p.T}; fix it`, write: "refuse" },
-  { prompt: (p) => `Fix ${p.T} so it no longer crashes`, write: "refuse", message: DIRECTIVE_HINT },
   // The restriction sits in its own clause with its own path: the target stays writable.
   { prompt: (p) => `Do not touch ${p.R}, fix ${p.T}`, write: ["T"], read: ["R"], excluded: ["R"] },
   // Exclusion paraphrases, word orders, emphasis.
   { prompt: (p) => `DO NOT MODIFY ${p.R}. FIX ${p.T}.`, write: ["T"], read: ["R"], excluded: ["R"] },
   { prompt: (p) => `Never modify ${p.R}; implement the feature in ${p.T}`, write: ["T"], read: ["R"], excluded: ["R"] },
-  { prompt: (p) => `Implement the feature in ${p.T} without touching ${p.R}`, write: "refuse", excluded: ["R"] },
+  {
+    prompt: (p) => `Implement the feature in ${p.T} without touching ${p.R}`,
+    write: ["T"],
+    read: ["R"],
+    excluded: ["R"],
+  },
   {
     prompt: (p) => `Implement the feature in ${p.T}, but ${p.R} is read-only`,
     write: ["T"],
@@ -178,6 +183,7 @@ const CORPUS: Row[] = [
   },
   { prompt: (p) => `Refactor ${p.T}. Leave ${p.R} untouched.`, write: ["T"], read: ["R"], excluded: ["R"] },
   // Reference / direction.
+  // No mutation verb is aimed at T: refused (a directive fixes it).
   { prompt: (p) => `Mirror the layout of ${p.R} in ${p.T}`, write: "refuse", excluded: ["R"] },
   {
     prompt: (p) => `Follow the pattern in ${p.R} and fix the bug in ${p.T}`,
@@ -188,7 +194,7 @@ const CORPUS: Row[] = [
   { prompt: (p) => `Based on ${p.R}, implement the importer in ${p.T}`, write: ["T"], read: ["R"], excluded: ["R"] },
   { prompt: (p) => `Fix ${p.T} using ${p.R} as a guide`, write: "refuse", excluded: ["R"] },
   { prompt: (p) => `Look at ${p.R} and fix the same bug in ${p.T}`, write: ["T"], read: ["R"], excluded: ["R"] },
-  { prompt: (p) => `Apply the patch from ${p.R} to ${p.T}`, write: "refuse", excluded: ["R"] },
+  { prompt: (p) => `Apply the patch from ${p.R} to ${p.T}`, write: ["T"], read: ["R"], excluded: ["R"] },
   { prompt: (p) => `Compare ${p.R} with ${p.R2}`, write: "refuse", excluded: ["R", "R2"] },
   // Markdown structure.
   {
@@ -336,6 +342,15 @@ const CORPUS: Row[] = [
     excluded: ["L"],
     message: DIRECTIVE_HINT,
   },
+  // Tiered lexicon (final review C, round 2): weak words only govern a path right next to them.
+  { prompt: (p) => `Fix ${p.T}. Do not modify it.`, write: "refuse", excluded: ["T"] },
+  { prompt: (p) => `Fix ${p.T} but don't touch the repository`, write: "refuse", excluded: ["T"] },
+  { prompt: (p) => `Fix ${p.T} and ${p.R2}; do not change the public API`, write: ["T", "R2"] },
+  { prompt: (p) => `Fix ${p.T} and ${p.R2}, but do not change the public API`, write: "refuse" },
+  { prompt: (p) => `Fix ${p.T}. ${p.R} is not to be modified.`, write: ["T"], read: ["R"], excluded: ["R"] },
+  { prompt: (p) => `Fix ${p.T} and ${p.R}. ${p.R} is not ready yet.`, write: ["T"], read: ["R"], excluded: ["R"] },
+  { prompt: (p) => `Fix ${p.T}. It doesn't need changes in ${p.R}.`, write: ["T"], read: ["R"], excluded: ["R"] },
+  { prompt: (p) => `Fix everything, but not ${p.R}`, write: "refuse", excluded: ["R"] },
   // Explicit directives win over inference.
   {
     prompt: (p) => `writable: ${p.T}\nread-only: ${p.R}\nPort the change from ${p.R} into ${p.T}.`,
@@ -391,6 +406,21 @@ const LEGIT: Array<{ prompt: (p: Paths) => string; write: Name[] }> = [
   { prompt: (p) => `Fix ${p.T}. Do not modify the public API.`, write: ["T"] },
   { prompt: (p) => `Fix ${p.T}. Do not stop until all tests pass.`, write: ["T"] },
   { prompt: (p) => `Fix ${p.T}; don't add new dependencies`, write: ["T"] },
+  { prompt: (p) => `Fix ${p.T} so it no longer crashes`, write: ["T"] },
+  { prompt: (p) => `Fix ${p.T} without breaking the API`, write: ["T"] },
+  { prompt: (p) => `Fix ${p.T} so it does not leak memory`, write: ["T"] },
+  { prompt: (p) => `Fix ${p.T} so it doesn't leak memory`, write: ["T"] },
+  { prompt: (p) => `Make ${p.T} faster without changing its public API`, write: ["T"] },
+  { prompt: (p) => `Add retries to ${p.T}; do not change the public API`, write: ["T"] },
+  { prompt: (p) => `Fix the flaky test in ${p.T} and don't touch the CI config`, write: ["T"] },
+  { prompt: (p) => `Fix ${p.T}, but don't touch the tests`, write: ["T"] },
+  { prompt: (p) => `Fix the bug in ${p.T} but don't change anything else`, write: ["T"] },
+  { prompt: (p) => `Update ${p.T} to not use deprecated APIs`, write: ["T"] },
+  { prompt: (p) => `Refactor ${p.T} so no function exceeds 50 lines`, write: ["T"] },
+  { prompt: (p) => `Fix ${p.T} only if the tests pass`, write: ["T"] },
+  { prompt: (p) => `Add ${p.T}/docs but only for public items`, write: ["T"] },
+  { prompt: (p) => `Implement X in ${p.T}, nothing fancy`, write: ["T"] },
+  { prompt: (p) => `Review ${p.T} and fix any bugs`, write: ["T"] },
   { prompt: () => "Add a /health endpoint that returns build info", write: ["L"] },
   { prompt: () => "Expose GET /api/v1/users from the service", write: ["L"] },
   { prompt: () => 'Make the server mount the app at "/" and keep the existing routes', write: ["L"] },
