@@ -284,9 +284,9 @@ describe("realBackends capability routing", () => {
     assert.ok(activity.some((event) => /current worker model.*reduced independence/i.test(event.summary)));
   });
 
-  it("gives the reviewer the same wall-clock budget as implementation workers", async () => {
-    // Without an explicit budget the executor's 5-minute default aborted
-    // reviewers mid-analysis.
+  it("gives the reviewer the same (absent) duration cap and unbounded capacity wait as implementation workers", async () => {
+    // Without an owner-controlled budget the executor's 5-minute default
+    // aborted reviewers mid-analysis; now the broker owns liveness instead.
     const seen: WorkerRequest[] = [];
     const backends = realBackends({
       worker: capturingWorker(seen),
@@ -297,6 +297,7 @@ describe("realBackends capability routing", () => {
     });
     await backends.review.runReview({ objective: "review", signal: new AbortController().signal });
     assert.equal(seen[0]?.timeoutMs, workerTimeoutMs());
+    assert.equal(seen[0]?.unboundedInferenceWait, true, "a mission reviewer waits for capacity however long it takes");
   });
 
   it("fails closed for incomplete review payloads and invented model provenance", async () => {

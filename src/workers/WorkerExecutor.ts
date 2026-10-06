@@ -25,8 +25,17 @@ export interface WorkerRequest {
   tools: string[];
   /** Working directory (candidate worktree or repo root). */
   cwd: string;
-  /** Wall-clock budget in ms. */
+  /**
+   * Inactivity guard in ms for standalone runs (no owner `signal`): the session
+   * is aborted only after this long with no session event at all. It is not a
+   * total-duration budget.
+   */
   timeoutMs?: number;
+  /**
+   * Mission workers: wait for inference capacity with no elapsed cap (the
+   * interactive turn keeps its horizon). Only cancellation ends the wait.
+   */
+  unboundedInferenceWait?: boolean;
   /** Hard context-token budget; the session is aborted once exceeded (spec §10.6). */
   maxContextTokens?: number;
   /** Opening user message for the fresh session (defaults to the generic kickoff). */

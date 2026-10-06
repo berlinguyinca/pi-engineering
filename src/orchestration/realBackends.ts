@@ -395,10 +395,11 @@ export function realBackends(opts: RealBackendsOptions) {
           context: input.contextRef,
           tools: ["ledger_read", "ledger_claim", "artifact_read", "repo_search", "symbol", "tests_for", "bash"],
           cwd: input.worktree ?? bound.cwd,
-          // Fresh-context implementation workers need headroom to explore the
-          // repo, implement, run verification, and commit. Configurable so an
-          // operator can tune per environment without recompiling.
+          // No duration cap: the broker owns liveness (activity-based) and any
+          // opt-in limit. This only carries an explicit operator override.
           timeoutMs: workerTimeoutMs(),
+          // A mission worker waits for inference capacity however long it takes.
+          unboundedInferenceWait: true,
           // Only the broker's word makes a directory an isolated worktree; the
           // fallback (no worktree) runs in the user's checkout.
           isolatedWorktree: input.isolatedWorktree === true && !!input.worktree,
@@ -525,10 +526,11 @@ export function realBackends(opts: RealBackendsOptions) {
           tools: ["ledger_read", "artifact_read", "repo_search", "symbol"],
           cwd: input.worktree ?? bound.cwd,
           maxContextTokens: 64_000,
-          // Same generous wall-clock budget as implementation workers: a review
-          // must inspect the integrated change before writing findings, and the
-          // executor's default (5 min) aborted the reviewer mid-analysis.
+          // Same as implementation workers: no duration cap (the broker owns
+          // liveness), and inference waiting is unbounded. The executor's old
+          // 5-minute default aborted reviewers mid-analysis.
           timeoutMs: workerTimeoutMs(),
+          unboundedInferenceWait: true,
           sessionId: reviewerSessionId,
           resultTool: "review_result",
         };

@@ -137,7 +137,9 @@ export function sanitizeWorkerActivity(value: unknown): WorkerActivity | null {
       return { kind: "state", phase: "canceled", summary: "Worker session canceled", meaningfulProgress: false };
     }
     const summary =
-      input.summary === "Model response received" || input.summary === STREAMING_SUMMARY
+      input.summary === "Model response received" ||
+      input.summary === STREAMING_SUMMARY ||
+      input.summary === WAITING_FOR_INFERENCE_SUMMARY
         ? input.summary
         : "Worker session started";
     return {
@@ -194,6 +196,13 @@ export function activityFromSessionEvent(event: {
 }
 
 const STREAMING_SUMMARY = "Model streaming";
+
+/**
+ * A worker holding for the model gateway (admission, queue, cooldown). It is
+ * liveness, not progress: the owner's inactivity watchdog must never treat a
+ * worker waiting for inference capacity as hung.
+ */
+export const WAITING_FOR_INFERENCE_SUMMARY = "Waiting for inference capacity";
 
 /**
  * Streamed tokens are activity: a worker writing a long answer is not idle,
