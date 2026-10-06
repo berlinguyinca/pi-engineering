@@ -4,11 +4,19 @@
  *
  * Commands run with fixed argv and no shell. Nothing from the candidate's
  * metadata is executed or used as an argument except validated relative paths.
+ *
+ * Candidate code (the probe, its typecheck, its tests) runs with a scrubbed
+ * environment: an allow-list of locale/path variables, a temporary HOME and
+ * TMPDIR, and its own Pi Engineering state/install roots, all removed
+ * afterwards. Credentials and tokens in the operator's environment are not
+ * passed on. This limits accidents and casual exfiltration via env; it is NOT
+ * a sandbox: candidate code runs as the operator's user (see the trust model
+ * in docs/specs/live-self-update-hot-reload-notes.md).
  */
 
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync } from "node:fs";
 import { copyFile, link, mkdir, mkdtemp, readdir, readlink, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
@@ -44,14 +52,36 @@ export function nodeBinary(): string {
   return exec.startsWith("node") ? process.execPath : "node";
 }
 
+/** Variables candidate code may see from the operator's environment. */
+const PASSED_ENV = ["PATH", "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "LC_MESSAGES", "TZ", "SYSTEMROOT", "COMSPEC"];
+
+/** A scrubbed environment rooted in `sandbox` (a fresh temporary directory). */
+export function candidateEnv(sandbox: string): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  for (const key of PASSED_ENV) if (process.env[key] !== undefined) env[key] = process.env[key];
+  for (const dir of ["home", "tmp", "state", "install"]) mkdirSync(join(sandbox, dir), { recursive: true });
+  return {
+    ...env,
+    HOME: join(sandbox, "home"),
+    USERPROFILE: join(sandbox, "home"),
+    TMPDIR: join(sandbox, "tmp"),
+    PI_ENGINEERING_STATE_DIR: join(sandbox, "state"),
+    PI_ENGINEERING_HOME: join(sandbox, "install"),
+    PI_ENGINEERING_UPDATE_CHECK: "0",
+    CI: "1",
+  };
+}
+
 function run(
   file: string,
   args: string[],
   cwd: string,
   timeoutMs: number,
+  env?: NodeJS.ProcessEnv,
 ): Promise<{ code: number; stdout: string; stderr: string }> {
   return new Promise((resolveRun) => {
-    execFile(file, args, { cwd, timeout: timeoutMs, maxBuffer: 32 * 1024 * 1024 }, (error, stdout, stderr) => {
+    const options = { cwd, timeout: timeoutMs, maxBuffer: 32 * 1024 * 1024, ...(env ? { env } : {}) };
+    execFile(file, args, options, (error, stdout, stderr) => {
       const code = error
         ? typeof (error as { code?: unknown }).code === "number"
           ? (error as { code: number }).code
@@ -208,13 +238,29 @@ export async function validateCandidate(opts: ValidateOptions): Promise<Validati
     return fail();
   }
 
+  const sandbox = await mkdtemp(join(tmpdir(), "pi-eng-validate-"));
+  try {
+    return await runCandidateChecks(opts, steps, assessed, candidateEnv(sandbox));
+  } finally {
+    await rm(sandbox, { recursive: true, force: true });
+  }
+}
+
+async function runCandidateChecks(
+  opts: ValidateOptions,
+  steps: ValidationStep[],
+  assessed: ReturnType<typeof assessMigration>,
+  env: NodeJS.ProcessEnv,
+): Promise<ValidationResult> {
+  const fail = (): ValidationResult => ({ ok: false, steps });
+  const { dir, metadata } = opts;
   let migration: MigrationDecision;
-  const scratch = await mkdtemp(join(tmpdir(), "pi-eng-probe-"));
+  const scratch = await mkdtemp(join(env.TMPDIR as string, "pi-eng-probe-"));
   try {
     const probe = fileURLToPath(new URL("./probe.ts", import.meta.url));
     const args = ["--no-warnings", probe, dir, metadata.entry, scratch];
     if (assessed.needed && opts.stateDir) args.push(opts.stateDir);
-    const r = await run(nodeBinary(), args, dir, 180_000);
+    const r = await run(nodeBinary(), args, dir, 180_000, env);
     const line = r.stdout.split("\n").find((l) => l.startsWith("PROBE "));
     const report = line ? (JSON.parse(line.slice(6)) as ProbeReport) : null;
     if (!report) {
@@ -275,19 +321,19 @@ export async function validateCandidate(opts: ValidateOptions): Promise<Validati
   if (opts.mode !== "quick") {
     const tsc = join(dir, "node_modules", "typescript", "bin", "tsc");
     if (existsSync(join(dir, "tsconfig.json")) && existsSync(tsc)) {
-      const r = await run(nodeBinary(), [tsc, "--noEmit", "-p", "tsconfig.json"], dir, 600_000);
+      const r = await run(nodeBinary(), [tsc, "--noEmit", "-p", "tsconfig.json"], dir, 600_000, env);
       steps.push({
         name: "typecheck",
         status: r.code === 0 ? "passed" : "failed",
         ...(r.code === 0 ? {} : { detail: r.stdout.trim().split("\n").slice(0, 3).join(" | ") }),
       });
-      if (r.code !== 0) return fail({ migration });
+      if (r.code !== 0) return { ok: false, steps, migration };
     } else {
       steps.push({ name: "typecheck", status: "skipped", detail: "candidate ships no tsconfig/typescript" });
     }
     const critical = CRITICAL_TESTS.filter((t) => existsSync(join(dir, t)));
     if (critical.length > 0) {
-      const r = await run(nodeBinary(), ["--test", ...critical], dir, 600_000);
+      const r = await run(nodeBinary(), ["--test", ...critical], dir, 600_000, env);
       steps.push({
         name: "critical unit tests",
         status: r.code === 0 ? "passed" : "failed",
@@ -300,15 +346,15 @@ export async function validateCandidate(opts: ValidateOptions): Promise<Validati
                 .join(" | "),
             }),
       });
-      if (r.code !== 0) return fail({ migration });
+      if (r.code !== 0) return { ok: false, steps, migration };
     } else {
       steps.push({ name: "critical unit tests", status: "skipped", detail: "candidate ships none" });
     }
   }
   if (opts.mode === "full") {
-    const r = await run("npm", ["test"], dir, 1_800_000);
+    const r = await run("npm", ["test"], dir, 1_800_000, env);
     steps.push({ name: "full test suite", status: r.code === 0 ? "passed" : "failed" });
-    if (r.code !== 0) return fail({ migration });
+    if (r.code !== 0) return { ok: false, steps, migration };
   }
   return { ok: true, steps, migration };
 }

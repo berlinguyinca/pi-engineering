@@ -93,3 +93,25 @@ test("a passing candidate validates with its migration plan once the probe passe
     "dry-run reported from the probe",
   );
 });
+
+test("candidate code runs with a scrubbed environment and a temporary HOME, never the operator's", async () => {
+  const w = world("ok");
+  const marker = join(w.candidate, "..", "probe-env.json");
+  appendFileSync(
+    join(w.candidate, "runtime.ts"),
+    `import { writeFileSync as __env } from "node:fs";\n__env(${JSON.stringify(marker)}, JSON.stringify({ home: process.env.HOME ?? null, secret: process.env.PI_ENG_TEST_SECRET ?? null, state: process.env.PI_ENGINEERING_STATE_DIR ?? null, install: process.env.PI_ENGINEERING_HOME ?? null }));\n`,
+  );
+  process.env.PI_ENG_TEST_SECRET = "s3cret-token";
+  try {
+    const result = await validate(w);
+    assert.equal(result.ok, true, JSON.stringify(result.steps));
+  } finally {
+    delete process.env.PI_ENG_TEST_SECRET;
+  }
+  const seen = JSON.parse(readFileSync(marker, "utf8")) as Record<string, string | null>;
+  assert.equal(seen.secret, null, "unrelated environment (tokens, credentials) is not passed on");
+  assert.ok(seen.home && seen.home !== process.env.HOME && seen.home.startsWith(tmpdir()), `HOME=${seen.home}`);
+  assert.ok(seen.state && seen.state !== process.env.PI_ENGINEERING_STATE_DIR, "own runtime state dir");
+  assert.ok(seen.install && seen.install !== process.env.PI_ENGINEERING_HOME, "own install root");
+  assert.equal(existsSync(seen.home), false, "the temporary HOME is removed afterwards");
+});
