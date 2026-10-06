@@ -8,6 +8,8 @@
  * to the static role pins.
  */
 
+import { request as httpRequest } from "node:http";
+import { request as httpsRequest } from "node:https";
 import { parseAdmissionPayload } from "../inference/admissionContract.ts";
 
 /** A model or logical route as the gateway advertises it on `GET /models`. */
@@ -161,6 +163,45 @@ export type ChatOutcome =
   | { ok: true; content: string; usage: ChatUsage; served: ServedRoute; wallMs: number }
   | { ok: false; status: number; message: string; wallMs: number; error?: unknown };
 
+/**
+ * POST over node:http(s). Node's global fetch carries undici's default 300 s
+ * headers/body timeouts — a fixed wall clock on a non-streaming completion
+ * that may wait on admission and generate for far longer. This request has no
+ * timeout of its own: only `signal` ends it.
+ */
+function postNoTimeouts(
+  url: string,
+  opts: { headers: Record<string, string>; body: string; signal: AbortSignal },
+): Promise<{ ok: boolean; status: number; headers: Headers; text: string }> {
+  return new Promise((resolve, reject) => {
+    const target = new URL(url);
+    const send = target.protocol === "https:" ? httpsRequest : httpRequest;
+    const req = send(
+      target,
+      {
+        method: "POST",
+        headers: { ...opts.headers, "content-length": String(Buffer.byteLength(opts.body)) },
+        signal: opts.signal,
+      },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on("data", (c: Buffer) => chunks.push(c));
+        res.on("error", reject);
+        res.on("end", () => {
+          const headers = new Headers();
+          for (const [k, v] of Object.entries(res.headers)) {
+            if (v !== undefined) headers.set(k, Array.isArray(v) ? v.join(", ") : v);
+          }
+          const status = res.statusCode ?? 0;
+          resolve({ ok: status >= 200 && status < 300, status, headers, text: Buffer.concat(chunks).toString("utf8") });
+        });
+      },
+    );
+    req.on("error", reject);
+    req.end(opts.body);
+  });
+}
+
 /** One non-streaming chat completion. */
 export async function chatCompletion(
   conn: GatewayConnection,
@@ -178,8 +219,7 @@ export async function chatCompletion(
   if (req.capability?.minimumContext) extra["x-inferweave-min-context"] = String(req.capability.minimumContext);
   if (req.capability?.preferredFamily) extra["x-inferweave-prefer-family"] = req.capability.preferredFamily;
   try {
-    const res = await fetch(`${base(conn)}/chat/completions`, {
-      method: "POST",
+    const res = await postNoTimeouts(`${base(conn)}/chat/completions`, {
       headers: headersFor(conn, extra),
       body: JSON.stringify({
         model: req.model,
@@ -198,7 +238,7 @@ export async function chatCompletion(
         ...(req.signal ? [req.signal] : []),
       ]),
     });
-    const text = await res.text();
+    const text = res.text;
     let body: unknown = null;
     try {
       body = text ? JSON.parse(text) : null;
