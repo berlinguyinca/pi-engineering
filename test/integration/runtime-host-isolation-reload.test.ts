@@ -99,22 +99,23 @@ test("a Host reload keeps the session id, registry generation, leases and single
     const sessionId = session.sessionId;
     const registryGeneration = session.generationId;
 
-    // Durable work owned by this session: a mission and its ownership lease.
+    // A second runtime in this process writes through the same session (the
+    // writer check below), and the session holds a registry lease of its own.
     runtime = await EngineeringRuntime.open({ cwd: repo, worker: new FakeWorkerExecutor({}) });
     const mission = runtime.missionStore!.createMission({
       title: "survives a host reload",
-      goal: "keep ownership across /engineering reload",
-      user_request: "keep ownership across /engineering reload",
+      goal: "keep the session's state across /engineering reload",
+      user_request: "keep the session's state across /engineering reload",
       repository: repo,
       base_ref: "",
       risk_profile: "low",
       workflow_class: "conversation",
     });
-    const lease = await runtime.missionOwnership!.acquire(mission.mission_id);
     await runtime.missionStore!.flush();
-    const sessionLeases = () => session.registry()?.leases.list({ sessionId }) ?? [];
-    const leasesBefore = sessionLeases();
-    assert.ok(leasesBefore.length > 0, "the session holds a registry lease");
+    const probe = "test:host-reload-probe";
+    const acquired = session.registry()!.leases.acquire(probe, session.leaseOwner());
+    assert.ok(acquired.ok, "the session takes a registry lease");
+    const leaseGeneration = acquired.lease.generationId;
 
     // A forwarded planner/worker command writes repository state before the reload.
     await pi.run("/engineering-mode single");
@@ -132,13 +133,18 @@ test("a Host reload keeps the session id, registry generation, leases and single
       "exactly one live session row for this process",
     );
     assert.equal(afterSession.heartbeat(), true, "the session keeps heartbeating after the reload");
-    assert.deepEqual(
-      sessionLeases().map((l) => [l.resourceId, l.generationId]),
-      leasesBefore.map((l) => [l.resourceId, l.generationId]),
-      "the reload neither released nor fenced the session's leases",
-    );
-    const renewed = await runtime.missionOwnership!.acquire(mission.mission_id);
-    assert.equal(renewed.generation, lease.generation, "ownership is still this session's, not re-taken");
+    const leases = afterSession.registry()!.leases;
+    const kept = leases.get(probe);
+    assert.equal(kept?.sessionId, sessionId, "the session's lease was neither released nor reaped");
+    assert.equal(kept?.generationId, leaseGeneration, "and not fenced: same lease generation");
+    const reentrant = leases.acquire(probe, afterSession.leaseOwner());
+    assert.ok(reentrant.ok && reentrant.reentrant, "the session still owns it after the reload");
+    assert.equal(reentrant.ok && reentrant.lease.generationId, leaseGeneration);
+    // Mission custody may move from the retired generation to the new one,
+    // but it never leaves this session.
+    for (const lease of leases.list()) {
+      if (lease.resourceId.endsWith(`#mission:${mission.mission_id}`)) assert.equal(lease.sessionId, sessionId);
+    }
 
     // One writer: the session appends through one stream, before and after.
     runtime.missionStore!.createMission({
