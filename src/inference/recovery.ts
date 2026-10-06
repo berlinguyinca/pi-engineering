@@ -38,6 +38,7 @@ import {
   DEFAULT_STREAM_RETRY_POLICY,
   StreamRetryPolicy,
   type RetryDecision,
+  type StreamRetryDelaySource,
 } from "./retryPolicy.ts";
 import {
   describeFallbackStatus,
@@ -147,7 +148,7 @@ export interface LadderRunOutcome {
 // ─── Pure decision step ──────────────────────────────────────────────────────
 
 export type RecoveryStep =
-  | { kind: "retry"; model: ModelRef; delayMs: number; source: "server" | "server_plus_ladder" | "ladder"; note: string }
+  | { kind: "retry"; model: ModelRef; delayMs: number; source: StreamRetryDelaySource; note: string }
   | { kind: "refresh_and_retry"; model: ModelRef; note: string }
   | { kind: "fallback"; note: string }
   | { kind: "wait_capacity"; delayMs: number; note: string }
@@ -407,10 +408,6 @@ export class RecoveryLadder {
     this.hooks = opts.hooks;
   }
 
-  get config(): InferenceResilienceConfig {
-    return this.config;
-  }
-
   get streamPolicyConfig(): StreamRetryPolicy["config"] {
     return this.streamPolicy.config;
   }
@@ -466,6 +463,7 @@ export class RecoveryLadder {
           failure,
           reason: "capacity wait window exhausted; mission parked for recovery",
           waitingForCapacity: true,
+          incompleteGenerations: this.hooks.actions?.incompleteCount() ?? 0,
         };
       }
       // kind === "fallback": the model chain continues with the selected model
@@ -478,6 +476,7 @@ export class RecoveryLadder {
       attempts: state.totalAttempts,
       elapsedMs: this.hooks.now() - startedAt,
       reason: "aborted",
+      incompleteGenerations: this.hooks.actions?.incompleteCount() ?? 0,
     };
   }
 
@@ -670,7 +669,7 @@ export class RecoveryLadder {
     return { kind: "wait_capacity", failure: (failure as ClassifiedInferenceFailure) ?? this.unknownFailure(), note: "aborted mid-attempt" };
   }
 
-  private applyStep(
+  private async applyStep(
     input: LadderRunInput,
     base: InferenceTelemetryData,
     state: LadderState,
@@ -678,12 +677,9 @@ export class RecoveryLadder {
     failure: ClassifiedInferenceFailure,
     attempt: number,
     step: RecoveryStep,
-  ): ModelLoopResult {
+  ): Promise<ModelLoopResult> {
     switch (step.kind) {
       case "refresh_and_retry": {
-        if (failure.shouldRefreshCatalog || this.config.catalogRefreshOnNoWorkers) {
-          void this.refreshCatalog();
-        }
         if (attempt >= this.streamPolicy.config.maxAttempts) {
           return { kind: "wait_capacity", failure, note: step.note };
         }
@@ -704,6 +700,7 @@ export class RecoveryLadder {
               elapsedMs: this.hooks.now() - startedAt,
               failure,
               reason: "context overflow: compaction unavailable or budget exhausted",
+              incompleteGenerations: this.hooks.actions?.incompleteCount() ?? 0,
             },
           };
         }
@@ -735,6 +732,7 @@ export class RecoveryLadder {
             elapsedMs: this.hooks.now() - startedAt,
             failure,
             reason: step.reason,
+            incompleteGenerations: this.hooks.actions?.incompleteCount() ?? 0,
           },
         };
       }
@@ -745,7 +743,7 @@ export class RecoveryLadder {
     }
   }
 
-  // Async step wrappers (keep applyStep synchronous for testability).
+  // Async step wrappers (applyStep awaits them; the decision stays pure).
 
   private async refreshCatalog(): Promise<void> {
     try {
@@ -788,6 +786,7 @@ export class RecoveryLadder {
           elapsedMs: this.hooks.now() - startedAt,
           failure,
           reason: "context overflow: compaction unavailable or budget exhausted",
+          incompleteGenerations: this.hooks.actions?.incompleteCount() ?? 0,
         },
       };
     }
@@ -808,6 +807,7 @@ export class RecoveryLadder {
           elapsedMs: this.hooks.now() - startedAt,
           failure,
           reason: "context overflow: compaction produced no smaller context",
+          incompleteGenerations: this.hooks.actions?.incompleteCount() ?? 0,
         },
       };
     }
