@@ -43,10 +43,15 @@ routing:
       model: "metabolomics/qwen3.8-flash_next-modality-text-quant-q4_k_xl"
       timeout_ms: 3600000
       max_context_tokens: 128000
+    # NOTE (rev 4, 2026-10-06): implementer moved from qwen3.8-27b text q8 to
+    # qwen3.8-flash_next text q4 — the 27b text q8 endpoint flaps (repeatedly
+    # unlisted from /models mid-execution, "model is not served"), which burns
+    # the 30-min recovery deadline on long tasks. flash_next has been consistently
+    # served and is the model the planner role already runs successfully on.
     implementer:
-      model: "metabolomics/qwen3.8-27b-modality-text-ctx-c262k-quant-q8_k_xl"
+      model: "metabolomics/qwen3.8-flash_next-modality-text-quant-q4_k_xl"
       timeout_ms: 3600000
-      max_context_tokens: 256000
+      max_context_tokens: 128000
     reviewer:
       model: "metabolomics/qwen3.8-27b-modality-vision-quant-q8_k_xl"
       timeout_ms: 1800000
