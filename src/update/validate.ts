@@ -15,7 +15,7 @@ import { basename, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { type CandidateMetadata, piCompatible } from "./metadata.ts";
 import type { ProbeReport } from "./probe.ts";
-import { type MigrationDecision, prepareMigration } from "./transaction.ts";
+import { type MigrationDecision, assessMigration, prepareMigration } from "./transaction.ts";
 
 export type ValidationMode = "quick" | "default" | "full";
 
@@ -189,18 +189,15 @@ export async function validateCandidate(opts: ValidateOptions): Promise<Validati
   steps.push(deps);
   if (deps.status === "failed") return fail();
 
-  let migration: MigrationDecision;
+  // Decided from declared metadata only: candidate code (its migrations
+  // included) is loaded and dry-run in the probe child below, never here.
+  let assessed: ReturnType<typeof assessMigration>;
   try {
-    migration = await prepareMigration(dir, opts.stateDir);
+    assessed = assessMigration(dir, opts.stateDir);
     steps.push({
       name: "state schema compatibility",
       status: "passed",
       detail: `writes ${metadata.stateSchema.writes}`,
-    });
-    steps.push({
-      name: "migration dry-run",
-      status: migration.plan.length > 0 ? "passed" : "skipped",
-      detail: migration.plan.length > 0 ? migration.plan.map((m) => m.id).join(", ") : "no migration required",
     });
   } catch (error) {
     steps.push({
@@ -211,10 +208,13 @@ export async function validateCandidate(opts: ValidateOptions): Promise<Validati
     return fail();
   }
 
+  let migration: MigrationDecision;
   const scratch = await mkdtemp(join(tmpdir(), "pi-eng-probe-"));
   try {
     const probe = fileURLToPath(new URL("./probe.ts", import.meta.url));
-    const r = await run(nodeBinary(), ["--no-warnings", probe, dir, metadata.entry, scratch], dir, 180_000);
+    const args = ["--no-warnings", probe, dir, metadata.entry, scratch];
+    if (assessed.needed && opts.stateDir) args.push(opts.stateDir);
+    const r = await run(nodeBinary(), args, dir, 180_000);
     const line = r.stdout.split("\n").find((l) => l.startsWith("PROBE "));
     const report = line ? (JSON.parse(line.slice(6)) as ProbeReport) : null;
     if (!report) {
@@ -223,8 +223,18 @@ export async function validateCandidate(opts: ValidateOptions): Promise<Validati
         status: "failed",
         detail: `probe produced no verdict (exit ${r.code}): ${r.stderr.trim().split("\n").slice(-2).join(" ")}`,
       });
-      return fail({ migration });
+      return fail();
     }
+    if (report.stage === "migration") {
+      steps.push({ name: "migration dry-run", status: "failed", detail: report.failure ?? "failed" });
+      return fail();
+    }
+    steps.push({
+      name: "migration dry-run",
+      status: report.migration && report.migration.ids.length > 0 ? "passed" : "skipped",
+      detail:
+        report.migration && report.migration.ids.length > 0 ? report.migration.ids.join(", ") : "no migration required",
+    });
     const initOk = report.ok || report.stage === "reload";
     steps.push({
       name: "runtime initialization test",
@@ -239,13 +249,25 @@ export async function validateCandidate(opts: ValidateOptions): Promise<Validati
               .join(", ")
           }`,
     });
-    if (!initOk) return fail({ migration });
+    if (!initOk) return fail();
     steps.push({
       name: "hot-reload smoke test",
       status: report.ok ? "passed" : "failed",
       detail: report.ok ? "reloaded once; no duplicate registrations" : (report.failure ?? "failed"),
     });
-    if (!report.ok) return fail({ migration });
+    if (!report.ok) return fail();
+    // The probe passed: only now may this process load the candidate's
+    // migrations (the activation applies them). Already dry-run in the probe.
+    try {
+      migration = await prepareMigration(dir, opts.stateDir, { dryRun: false });
+    } catch (error) {
+      steps.push({
+        name: "migration plan",
+        status: "failed",
+        detail: error instanceof Error ? error.message : String(error),
+      });
+      return fail();
+    }
   } finally {
     await rm(scratch, { recursive: true, force: true });
   }
