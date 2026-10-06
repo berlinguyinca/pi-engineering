@@ -28,6 +28,7 @@ export interface ChildReport {
   reconciliation?: {
     orphanedSessions: Array<{ sessionId: string; pid: number; reason: string }>;
     reclaimedLeases: Array<{ resourceId: string; sessionId: string; reason: string }>;
+    repairedStreams: Array<{ stream: string; quarantine: string; bytes: number }>;
   } | null;
   health?: string;
   error?: string;
@@ -42,7 +43,7 @@ export interface RunningChild {
 }
 
 export function startChild(
-  action: "open" | "hold" | "adopt",
+  action: "open" | "hold" | "adopt" | "tear",
   cwd: string,
   stateDir: string,
   options: { startAt?: number; env?: NodeJS.ProcessEnv } = {},

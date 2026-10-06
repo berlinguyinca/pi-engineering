@@ -9,13 +9,15 @@
  * duplicate event writer, no orphaned runtime state.
  */
 import { randomUUID } from "node:crypto";
-import { join } from "node:path";
+import { mkdirSync, renameSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
 import type { LeaseOwner } from "./LeaseManager.ts";
 import { type ReconciliationReport, RecoveryManager } from "./RecoveryManager.ts";
 import { RuntimeRegistry, type SessionBindingUpdate } from "./RuntimeRegistry.ts";
+import { ExclusiveFileLock } from "../../platform/eventstore/fileLock.ts";
 import { type ProcessIdentity, currentProcessIdentity } from "./processIdentity.ts";
 import { emitRuntimeEvent, setRuntimeEventLog } from "./runtimeEvents.ts";
-import { resolveStateRoot, sessionRuntimeDir } from "./stateDir.ts";
+import { resolveRegistryLocation, resolveStateRoot, sessionRuntimeDir } from "./stateDir.ts";
 
 export type RuntimeHealth = "healthy" | "degraded" | "recovering" | "rebound" | "isolated" | "failed";
 
@@ -39,6 +41,7 @@ interface SessionGlobalState {
   lastReconciliation: ReconciliationReport | null;
   exitHookInstalled: boolean;
   metadata: Record<string, unknown>;
+  registering: { file: string; promise: Promise<RuntimeRegistry | null> } | null;
 }
 
 const SESSION_KEY = Symbol.for("pi-engineering.runtime-session.v2");
@@ -70,6 +73,7 @@ function globalState(): SessionGlobalState {
       lastReconciliation: null,
       exitHookInstalled: false,
       metadata: {},
+      registering: null,
     };
     holder[SESSION_KEY] = state;
   }
@@ -82,8 +86,73 @@ export function currentSessionIdentity(): { sessionId: string; startedAt: string
   return { sessionId: state.sessionId, startedAt: state.startedAt, pid: state.pid };
 }
 
+function isCorruptDatabase(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /not a database|malformed|corrupt|SQLITE_CORRUPT|SQLITE_NOTADB/i.test(message);
+}
+
+/**
+ * Open the registry; a database that is not a database / malformed is moved
+ * aside (kept for diagnostics, with its -wal/-shm) and a fresh one created.
+ * The registry only describes live processes, so nothing durable is lost —
+ * the next reconciliation rebuilds ownership from process state.
+ */
+export async function openRegistryWithRecovery(file: string, sessionId: string): Promise<RuntimeRegistry> {
+  try {
+    return RuntimeRegistry.open(file);
+  } catch (error) {
+    if (!isCorruptDatabase(error)) throw error;
+  }
+  // Serialize repair so a concurrent session never quarantines the fresh
+  // database another one just created.
+  let repairLock: ExclusiveFileLock | null = null;
+  try {
+    repairLock = await ExclusiveFileLock.acquire(`${file}.repair`);
+  } catch {
+    repairLock = null;
+  }
+  try {
+    return quarantineAndReopen(file, sessionId);
+  } finally {
+    repairLock?.release();
+  }
+}
+
+function quarantineAndReopen(file: string, sessionId: string): RuntimeRegistry {
+  try {
+    return RuntimeRegistry.open(file);
+  } catch (error) {
+    if (!isCorruptDatabase(error)) throw error;
+    const recoveryDir = join(dirname(file), "recovery");
+    mkdirSync(recoveryDir, { recursive: true });
+    const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z");
+    const quarantine = join(recoveryDir, `${basename(file, ".db")}-corrupt-${stamp}-${process.pid}.db`);
+    try {
+      renameSync(file, quarantine);
+    } catch (renameError) {
+      // A concurrent session already moved it aside; just open the fresh one.
+      if ((renameError as NodeJS.ErrnoException).code !== "ENOENT") throw renameError;
+      return RuntimeRegistry.open(file);
+    }
+    for (const suffix of ["-wal", "-shm"]) {
+      try {
+        renameSync(`${file}${suffix}`, `${quarantine}${suffix}`);
+      } catch {
+        // Absent sidecar.
+      }
+    }
+    emitRuntimeEvent("runtime.recovering", {
+      session_id: sessionId,
+      phase: "registry_corrupt",
+      quarantine,
+      reason: error instanceof Error ? error.message : String(error),
+    });
+    return RuntimeRegistry.open(file);
+  }
+}
+
 export function registryFileFor(stateRoot: string): string {
-  return join(stateRoot, "registry.db");
+  return resolveRegistryLocation(stateRoot).file;
 }
 
 export class RuntimeSession {
@@ -154,14 +223,25 @@ export class RuntimeSession {
    * and marks the session degraded — when no registry can be opened; callers
    * keep working with local fallbacks.
    */
-  ensureRegistered(): RuntimeRegistry | null {
+  ensureRegistered(): Promise<RuntimeRegistry | null> {
     const file = registryFileFor(this.stateRoot());
     const state = this.state;
-    if (state.registry && state.registryFile === file && state.generationId) return state.registry;
+    if (state.registry && state.registryFile === file && state.generationId) return Promise.resolve(state.registry);
+    // Single-flight: concurrent runtime opens in one process register once.
+    if (state.registering?.file === file) return state.registering.promise;
+    const promise = this.register(file).finally(() => {
+      if (state.registering?.promise === promise) state.registering = null;
+    });
+    state.registering = { file, promise };
+    return promise;
+  }
+
+  private async register(file: string): Promise<RuntimeRegistry | null> {
+    const state = this.state;
     if (state.registry && state.registryFile !== file) this.shutdown("relocated");
     let registry: RuntimeRegistry;
     try {
-      registry = RuntimeRegistry.open(file);
+      registry = await openRegistryWithRecovery(file, this.sessionId);
     } catch (error) {
       this.setHealth(
         "degraded",
@@ -190,7 +270,10 @@ export class RuntimeSession {
       });
       this.setHealth("recovering");
       emitRuntimeEvent("runtime.recovering", { session_id: this.sessionId, phase: "startup_reconciliation" });
-      state.lastReconciliation = new RecoveryManager(registry, { selfSessionId: this.sessionId }).reconcile();
+      state.lastReconciliation = new RecoveryManager(registry, {
+        selfSessionId: this.sessionId,
+        stateRoot: this.stateRoot(),
+      }).reconcile();
       registry.setState(this.sessionId, record.generationId, "healthy");
       this.setHealth("healthy");
       emitRuntimeEvent("runtime.started", { session_id: this.sessionId, generation_id: record.generationId });

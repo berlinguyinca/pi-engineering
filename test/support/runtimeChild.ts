@@ -12,7 +12,11 @@
  *          report, then idle until killed (SIGKILL tests)
  *   adopt  open and take over mission $PI_TEST_ADOPT_MISSION (custody + lease),
  *          report the acquired lease generation, close
+ *   tear   like hold, but then start writing one more record and stop halfway
+ *          through it (a writer killed mid-record)
  */
+import { appendFileSync } from "node:fs";
+import { join } from "node:path";
 import { EngineeringRuntime } from "../../src/runtime/EngineeringRuntime.ts";
 import { RuntimeSession } from "../../src/runtime/isolation/RuntimeSession.ts";
 import { CommandVerifier } from "../../src/verify/Verifier.ts";
@@ -48,7 +52,7 @@ function report(value: Record<string, unknown>): void {
 }
 
 async function main(): Promise<void> {
-  if (!action || !cwd) throw new Error("usage: runtimeChild <open|hold|adopt> <cwd> [startAt]");
+  if (!action || !cwd) throw new Error("usage: runtimeChild <open|hold|adopt|tear> <cwd> [startAt]");
   if (startAt) await waitUntil(Number(startAt));
   const openedAt = Date.now();
   const rt = await EngineeringRuntime.open({ cwd, worker, verifier: new CommandVerifier() });
@@ -87,8 +91,12 @@ async function main(): Promise<void> {
   });
   if (action === "open") store.failMission(mission.mission_id, "probe complete");
   // A holder takes real custody + an in-store lease, like a dispatching mission.
-  if (action === "hold") await rt.missionOwnership?.acquire(mission.mission_id);
+  if (action === "hold" || action === "tear") await rt.missionOwnership?.acquire(mission.mission_id);
   await store.flush();
+  if (action === "tear" && rt.runtimeBinding?.eventsDir) {
+    const stream = join(rt.runtimeBinding.eventsDir, `${RuntimeSession.current().sessionId}.jsonl`);
+    appendFileSync(stream, '{"event_id":"oevt-torn","timestamp":"2026-10-06T00:00:00.000Z","type":"mission.upd');
+  }
   const session = RuntimeSession.current();
   const registry = session.registry();
   report({
@@ -106,7 +114,7 @@ async function main(): Promise<void> {
     health: session.health.state,
     openMs: Date.now() - openedAt,
   });
-  if (action === "hold") {
+  if (action === "hold" || action === "tear") {
     // Stay alive (as a live custodian) until the test kills us.
     setInterval(() => undefined, 60_000);
     return;

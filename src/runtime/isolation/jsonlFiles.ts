@@ -171,3 +171,22 @@ export function quarantineRecord(recoveryDir: string, prefix: string, content: s
     return null;
   }
 }
+
+/** Cheap check (reads one byte): does the stream end on a complete record? */
+export function endsCleanly(file: string): boolean {
+  let descriptor: number;
+  try {
+    descriptor = openSync(file, "r");
+  } catch {
+    return true;
+  }
+  try {
+    const size = fstatSync(descriptor).size;
+    if (size === 0) return true;
+    const last = Buffer.alloc(1);
+    readSync(descriptor, last, 0, 1, size - 1);
+    return last[0] === 0x0a;
+  } finally {
+    closeSync(descriptor);
+  }
+}

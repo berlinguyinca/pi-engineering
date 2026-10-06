@@ -413,10 +413,27 @@ export interface EngineeringRuntimeOptions {
  * lease to expire. Owners are `session-<uuid>-…` (checked against the machine
  * registry) or legacy `runtime-<pid>-…` (checked by pid).
  */
+/**
+ * Mission-ownership ids of runtimes that are open in THIS process, on
+ * globalThis so it spans an in-process reload. A lease written by this session
+ * whose owner is no longer open here (closed, or from before a reload) belongs
+ * to no live controller and must not be mistaken for live ownership.
+ */
+function liveOwnerIds(): Set<string> {
+  const key = Symbol.for("pi-engineering.live-mission-owner-ids");
+  const holder = globalThis as unknown as Record<symbol, Set<string> | undefined>;
+  let set = holder[key];
+  if (!set) {
+    set = new Set();
+    holder[key] = set;
+  }
+  return set;
+}
+
 function isLeaseOwnerGone(ownerId: string, session: RuntimeSession): boolean {
   const sessionOwner = /^session-([0-9a-f-]{36})-/.exec(ownerId);
   if (sessionOwner) {
-    if (sessionOwner[1] === session.sessionId) return false;
+    if (sessionOwner[1] === session.sessionId) return !liveOwnerIds().has(ownerId);
     const registry = session.registry();
     if (!registry) return false;
     try {
@@ -491,6 +508,8 @@ export class EngineeringRuntime {
   private currentPhaseGoal = "";
   private snapshotPublishPending: Promise<MissionSnapshotFile | null> | null = null;
   private snapshotPublishDirty = false;
+  /** This runtime's mission-ownership identity (`session-<session-id>-<uuid>`). */
+  private ownershipId: string | null = null;
   /** In-process key of the orchestration namespace this runtime shares. */
   private orchestrationPath: string | null = null;
   /** Where this runtime's orchestration namespace lives (worktree / override / fallback). */
@@ -774,7 +793,7 @@ export class EngineeringRuntime {
     try {
       let namespace = openedOrchestrationStores.get(orchestrationPath);
       if (!namespace) {
-        const registry = session.ensureRegistered();
+        const registry = await session.ensureRegistered();
         namespace = await openOrchestrationNamespace({
           binding,
           sessionId: session.sessionId,
@@ -796,8 +815,10 @@ export class EngineeringRuntime {
       rt.orchestrationPath = orchestrationPath;
       rt.missionStore = openedMissionStores.get(orchestrationPath) ?? MissionStore.open(orchestrationBackend);
       openedMissionStores.set(orchestrationPath, rt.missionStore);
+      rt.ownershipId = `session-${session.sessionId}-${randomUUID()}`;
+      liveOwnerIds().add(rt.ownershipId);
       rt.missionOwnership = new MissionOwnership(rt.missionStore, {
-        ownerId: `session-${session.sessionId}-${randomUUID()}`,
+        ownerId: rt.ownershipId,
         custody,
         isOwnerGone: (ownerId) => isLeaseOwnerGone(ownerId, session),
       });
@@ -986,6 +1007,7 @@ export class EngineeringRuntime {
       return rt;
     } catch (error) {
       await rt.missionSupervisor?.shutdown();
+      if (rt.ownershipId) liveOwnerIds().delete(rt.ownershipId);
       EngineeringRuntime.releaseOrchestrationReference(orchestrationPath);
       throw error;
     }
@@ -1027,6 +1049,7 @@ export class EngineeringRuntime {
     }
     if (path) EngineeringRuntime.releaseOrchestrationReference(path);
     this.closed = true;
+    if (this.ownershipId) liveOwnerIds().delete(this.ownershipId);
     this.orchestrator = null;
     this.missionSupervisor = null;
     this.missionOwnership = null;
