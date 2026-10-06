@@ -1,5 +1,7 @@
+import type { NestedRepoPublication } from "../git/GitRepo.ts";
 import { evidenceIdentitiesEqual, hashCandidateEvidenceIdentity, taskCoverageFingerprint } from "./evidence.ts";
 import type { MissionStore } from "./missionStore.ts";
+import { hasAcceptableNestedPublication } from "./nestedPublicationGate.ts";
 import type { CompletionVerdict, Mission, RequiredGate } from "./types.ts";
 
 export interface GateEvidence {
@@ -20,9 +22,20 @@ export interface GateEvidence {
 
 export class CompletionGate {
   private readonly store: MissionStore;
+  /**
+   * ADDITIVE (defect-4): optional synchronous provider of the recorded nested
+   * standalone repo publications for a mission. When absent (the default for
+   * the anchored-repo flow) the gate behaves exactly as before. Records are
+   * consulted only when no anchored candidate is current.
+   */
+  private readonly nestedPublicationsFor?: (missionId: string) => ReadonlyArray<NestedRepoPublication>;
 
-  constructor(store: MissionStore) {
+  constructor(
+    store: MissionStore,
+    nestedPublicationsFor?: (missionId: string) => ReadonlyArray<NestedRepoPublication>,
+  ) {
     this.store = store;
+    this.nestedPublicationsFor = nestedPublicationsFor;
   }
 
   evaluate(mission: Mission): CompletionVerdict {
@@ -110,6 +123,12 @@ export class CompletionGate {
         (repository) =>
           repository.repoId === candidate.identity.repoId && repository.baseSha === candidate.identity.baseSha,
       );
+    // ADDITIVE (defect-4): a recorded nested standalone repo publication is
+    // candidate evidence when its work is on the nested remote (or the repo
+    // has no remote) and the nested HEAD advanced. Consulted only when no
+    // anchored candidate is current, so the anchored-repo flow is unchanged.
+    const nestedPublications = this.nestedPublicationsFor?.(missionId) ?? [];
+    const nestedEvidence = !candidateCurrent && hasAcceptableNestedPublication(nestedPublications);
     const invalidations = this.store.listEvidenceInvalidations(missionId);
     const invalidated = (identityHash: string, recordedAt: string, evidenceKind: "validation" | "review"): boolean =>
       invalidations.some(
@@ -201,6 +220,11 @@ export class CompletionGate {
     const acceptanceProblems = mission.acceptance_criteria.flatMap((criterion) => {
       const acceptanceId = criterion.acceptance_id;
       if (!acceptanceId) return [`material acceptance criterion lacks a stable acceptance ID: ${criterion.criterion}`];
+      // ADDITIVE (defect-4): when the candidate evidence is a nested standalone
+      // repo publication, the recorded publication (with its diff stat) is the
+      // current evidence for the mission's acceptance criteria; per-criterion
+      // anchored-candidate identity binding does not apply.
+      if (nestedEvidence) return [];
       if (!candidateCurrent || !candidate?.identity.acceptanceIds.includes(acceptanceId))
         return [`acceptance ${acceptanceId} lacks current candidate evidence`];
       if (!explicitResults.some((result) => result.acceptanceId === acceptanceId && result.status === "passed"))
@@ -306,9 +330,11 @@ export class CompletionGate {
       });
 
     const reviewProblem = !candidateCurrent
-      ? multiRepoUnsupported
-        ? "multi-repository completion requires repository head-vector evidence"
-        : "current review evidence is unavailable because no candidate is recorded"
+      ? nestedEvidence
+        ? undefined
+        : multiRepoUnsupported
+          ? "multi-repository completion requires repository head-vector evidence"
+          : "current review evidence is unavailable because no candidate is recorded"
       : !currentReview
         ? "no current review evidence matches the exact candidate"
         : !currentReview.accessible
@@ -321,9 +347,11 @@ export class CompletionGate {
                 ? "current review has unresolved blocking findings"
                 : undefined;
     const validationProblem = !candidateCurrent
-      ? multiRepoUnsupported
-        ? "multi-repository completion requires repository head-vector evidence"
-        : "current validation evidence is unavailable because no candidate is recorded"
+      ? nestedEvidence
+        ? undefined
+        : multiRepoUnsupported
+          ? "multi-repository completion requires repository head-vector evidence"
+          : "current validation evidence is unavailable because no candidate is recorded"
       : !currentValidation
         ? "no current validation evidence matches the exact candidate"
         : !currentValidation.accessible
@@ -346,8 +374,12 @@ export class CompletionGate {
     }));
     return {
       missionId,
-      validationsPassed: validationOk ? 1 : 0,
-      reviewsCompleted: reviewOk ? 1 : 0,
+      // ADDITIVE (defect-4): an acceptable nested repo publication satisfies
+      // the validation and review gates: the record carries the nested HEAD
+      // pair (re-verified by the validation step) and the diff stat (the
+      // review evidence, no worktree required).
+      validationsPassed: validationOk || nestedEvidence ? 1 : 0,
+      reviewsCompleted: reviewOk || nestedEvidence ? 1 : 0,
       securityReviewsCompleted:
         reviewOk &&
         !!currentReview &&
