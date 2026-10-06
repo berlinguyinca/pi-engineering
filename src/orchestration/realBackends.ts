@@ -508,6 +508,8 @@ export function realBackends(opts: RealBackendsOptions) {
         repoId?: string;
         objective: string;
         contextRef?: string;
+        missionId?: string;
+        taskId?: string;
         signal: AbortSignal;
         onActivity?: (event: WorkerActivity) => void;
       }): Promise<ExecutionOutcome> {
@@ -520,7 +522,12 @@ export function realBackends(opts: RealBackendsOptions) {
           cwd: bound.cwd,
           unboundedInferenceWait: true,
         };
-        const { run, model } = await runWithModelTakeover(req, input, await routedPlan(req.role, {}, "WKS"));
+        // A scout follows the mission's operator pin like every other worker.
+        const { run, model } = await runWithModelTakeover(
+          req,
+          input,
+          await routedPlan(req.role, { missionId: input.missionId, taskId: input.taskId }, "WKS"),
+        );
         return withModel(outcomeOf(run), model);
       },
     },

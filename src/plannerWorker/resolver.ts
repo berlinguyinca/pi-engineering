@@ -6,7 +6,14 @@
 import type { ModelProfile } from "./compatibility.ts";
 import type { CatalogModel } from "./gateway.ts";
 import type { ModelRef } from "./planner.ts";
-import { DEFAULT_ROLE_CONFIG, type ResolvedRole, type RoleConfig, resolveRole } from "./roles.ts";
+import {
+  DEFAULT_ROLE_CONFIG,
+  type ResolvedRole,
+  type RoleConfig,
+  resolveRole,
+  servedIdentity,
+  usable,
+} from "./roles.ts";
 import type { PlannerWorkerRole } from "./types.ts";
 
 export interface RoleResolverOptions {
@@ -15,6 +22,11 @@ export interface RoleResolverOptions {
   catalog?: CatalogModel[];
   loadCatalog?: () => Promise<CatalogModel[]>;
   fallback?: (role: PlannerWorkerRole, exclude: readonly string[]) => Promise<ModelRef | undefined>;
+  /**
+   * The operator's explicit model choice (Pi `/model`), read at every
+   * resolution so a switch lands at the next dispatch, replan or review.
+   */
+  operatorPin?: () => ModelRef | null | undefined;
 }
 
 export class RoleResolver {
@@ -58,7 +70,64 @@ export class RoleResolver {
     for (const c of candidates) if (!this.models.some((m) => m.id === c.id)) this.models.push(c);
   }
 
-  resolve(role: PlannerWorkerRole, avoid: readonly string[] = []): Promise<ResolvedRole | null> {
+  async resolve(role: PlannerWorkerRole, avoid: readonly string[] = []): Promise<ResolvedRole | null> {
+    const pin = this.opts.operatorPin?.();
+    if (!pin || this.excluded.has(pin.id)) return this.resolveUnpinned(role, avoid);
+    const pinName = `${pin.provider}/${pin.id}`;
+    const cfg = this.config[role];
+    const entry = this.models.find((m) => m.id === pin.id);
+    // Hard checks only: what the catalogue says the pinned model cannot do.
+    const refusal = !entry
+      ? null
+      : !usable(entry)
+        ? `state ${entry.state}`
+        : cfg.min_context !== undefined && entry.contextWindow !== undefined && entry.contextWindow < cfg.min_context
+          ? `context ${entry.contextWindow} < required ${cfg.min_context}`
+          : cfg.tools === true && entry.tools === false
+            ? "no tool calling"
+            : null;
+    if (refusal) {
+      const routed = await this.resolveUnpinned(role, avoid);
+      return (
+        routed && { ...routed, notes: [`operator pin ${pinName} cannot serve ${role} (${refusal})`, ...routed.notes] }
+      );
+    }
+    if (avoid.includes(pin.id)) {
+      // Separation of duties: keep the roles apart when another capable model exists.
+      const routed = await this.resolveUnpinned(role, avoid);
+      if (routed && servedIdentity(routed) !== pin.id) {
+        return {
+          ...routed,
+          notes: [
+            `operator pin ${pinName} also serves a role ${role} must differ from; using ${routed.model.id}`,
+            ...routed.notes,
+          ],
+        };
+      }
+      return this.pinned(role, pin, entry, [
+        `only the operator-pinned model ${pinName} can serve ${role}; it also serves a role ${role} must differ from`,
+      ]);
+    }
+    return this.pinned(role, pin, entry, [`operator pin ${pinName}`]);
+  }
+
+  private pinned(
+    role: PlannerWorkerRole,
+    pin: ModelRef,
+    entry: CatalogModel | undefined,
+    notes: string[],
+  ): ResolvedRole {
+    return {
+      role,
+      model: { provider: pin.provider, id: pin.id },
+      via: "operator_pin",
+      ...(entry?.contextWindow !== undefined ? { contextWindow: entry.contextWindow } : {}),
+      ...(entry ? { entry } : {}),
+      notes,
+    };
+  }
+
+  private resolveUnpinned(role: PlannerWorkerRole, avoid: readonly string[]): Promise<ResolvedRole | null> {
     return resolveRole(role, {
       catalog: this.models,
       config: this.config,

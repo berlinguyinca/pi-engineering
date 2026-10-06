@@ -265,6 +265,31 @@ describe("operator model pin: switch at the inference boundary", () => {
     return { seen, run };
   }
 
+  it("a scout research worker follows the mission's pin too", async () => {
+    const seen: Array<{ model: string | null; superseded: boolean }> = [];
+    const pin = () => DEEPSEEK;
+    const backends = realBackends({
+      worker: boundaryWorker(seen),
+      verifier: {} as never,
+      artifacts: { readContentByUri: async () => undefined } as never,
+      git: null,
+      cwd: tmpdir(),
+      routeModel: createRouteModel({
+        router: await pinnedPolicyRouter(),
+        unavailable: new UnavailableModels(),
+        operatorPin: pin,
+      }),
+      currentOperatorPin: pin,
+    });
+    const outcome = await backends.research.runAgent({
+      objective: "look around",
+      missionId: "MSN-scout",
+      signal: new AbortController().signal,
+    });
+    assert.equal(outcome.exitStatus, "succeeded");
+    assert.deepEqual(seen, [{ model: modelKey(DEEPSEEK), superseded: false }]);
+  });
+
   it("a pin naming the model the role already runs on does not restart the attempt", async () => {
     const h = await backendsFor(await pinnedPolicyRouter(), () => GLM);
     const outcome = await h.run("implementer");

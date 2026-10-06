@@ -66,6 +66,12 @@ export function newMissionId(at: Date = new Date()): string {
   return `PW-${stamp}-${randomBytes(3).toString("hex")}`;
 }
 
+/** This session's operator pin (Pi `/model`), read at every role resolution. */
+function currentOperatorPin(): { provider: string; id: string } | null {
+  const choice = sessionModelChoice(RuntimeSession.current().sessionId);
+  return choice?.kind === "pin" ? { provider: choice.pin.provider, id: choice.pin.id } : null;
+}
+
 /** Handle one of the `/engineering-*` commands; returns the operator text. */
 export async function engineeringCommand(
   name: "mode" | "status" | "plan" | "workers",
@@ -180,6 +186,7 @@ export function registerPlannerWorker(
     const resolver = new RoleResolver({
       provider,
       config: config.roles,
+      operatorPin: currentOperatorPin,
       // A short deadline: the mode decision must not stall /mission.
       loadCatalog: conn ? () => fetchCatalog({ ...conn, timeoutMs: 5_000 }) : async () => [],
       fallback: async (role, exclude) => {
@@ -292,7 +299,7 @@ export function registerPlannerWorker(
       if (!(await stat(join(stateDir, "state.json")).catch(() => null))) return false;
       const config = await loadPlannerWorkerConfig(host.repoRoot);
       const built = (await resolverFor(ctx, host.repoRoot, config)) ?? {
-        resolver: new RoleResolver({ provider: "default", config: config.roles }),
+        resolver: new RoleResolver({ provider: "default", config: config.roles, operatorPin: currentOperatorPin }),
         conn: null,
       };
       ctx.ui.notify(`[${missionId}] resuming planner-worker mission`, "info");

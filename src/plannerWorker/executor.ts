@@ -812,12 +812,15 @@ export class PlannerWorkerExecutor {
     task: string,
   ): void {
     const to = modelName(resolved);
-    const event = this.transitions.record({ lane, to, reason, task, role, context: "handoff" });
+    // Say why when the operator pin decided (or could not decide) the model.
+    const pinNotes = (resolved?.notes ?? []).filter((note) => /operator.pin/.test(note));
+    const why = pinNotes.length > 0 ? `${reason}; ${pinNotes.join("; ")}` : reason;
+    const event = this.transitions.record({ lane, to, reason: why, task, role, context: "handoff" });
     if (event)
       this.emit({
         type: "transition",
         task_id: task,
-        text: `MODEL_TRANSITION ${event.from ?? "-"} -> ${event.to} (${reason})`,
+        text: `MODEL_TRANSITION ${event.from ?? "-"} -> ${event.to} (${why})`,
       });
   }
 
