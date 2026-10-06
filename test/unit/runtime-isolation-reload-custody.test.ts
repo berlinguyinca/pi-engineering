@@ -12,12 +12,17 @@ import { after, afterEach, test } from "node:test";
 import { LeaseMissionCustody } from "../../src/runtime/isolation/MissionCustody.ts";
 import { RuntimeRegistry } from "../../src/runtime/isolation/RuntimeRegistry.ts";
 import { currentProcessIdentity } from "../../src/runtime/isolation/processIdentity.ts";
-import { releaseRetainedCustody, retainedCustodyCount } from "../../src/runtime/isolation/reloadCustody.ts";
+import {
+  noteHandover,
+  releaseRetainedCustody,
+  retainedCustodyCount,
+} from "../../src/runtime/isolation/reloadCustody.ts";
 
 const root = mkdtempSync(join(tmpdir(), "rt-reload-handback-"));
 after(() => rmSync(root, { recursive: true, force: true }));
 const saved = process.env.PI_ENGINEERING_RELOAD_CUSTODY_MS;
 afterEach(() => {
+  noteHandover(false);
   releaseRetainedCustody();
   if (saved === undefined) delete process.env.PI_ENGINEERING_RELOAD_CUSTODY_MS;
   else process.env.PI_ENGINEERING_RELOAD_CUSTODY_MS = saved;
@@ -76,5 +81,24 @@ test("a reload that leaves no runtime hands custody back at once", async () => {
   old.retainForReload();
   assert.equal(releaseRetainedCustody(), 1);
   assert.equal(w.registry.leases.get("ns#mission:M1"), undefined);
+  w.registry.close();
+});
+
+test("while the next generation is still starting (slow machine), custody is not handed back", async () => {
+  process.env.PI_ENGINEERING_RELOAD_CUSTODY_MS = "150";
+  const w = world();
+  const old = w.custody();
+  await old.claim("mission:M1");
+  noteHandover(true); // The Host is mid-handover: the new generation is loading/starting.
+  old.retainForReload();
+  await sleep(500);
+  assert.ok(w.registry.leases.get("ns#mission:M1"), "kept for the starting generation past the window");
+  assert.equal(retainedCustodyCount(), 1);
+  // The handover finished; the new generation never re-claims: one more window, then handed back.
+  noteHandover(false);
+  await sleep(80);
+  assert.ok(w.registry.leases.get("ns#mission:M1"), "a full window from the end of the handover");
+  await sleep(400);
+  assert.equal(w.registry.leases.get("ns#mission:M1"), undefined, "handed back");
   w.registry.close();
 });

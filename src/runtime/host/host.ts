@@ -21,7 +21,7 @@
 
 import { rm } from "node:fs/promises";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { releaseRetainedCustody } from "../isolation/reloadCustody.ts";
+import { noteHandover, releaseRetainedCustody } from "../isolation/reloadCustody.ts";
 import {
   type ActiveRuntimeOperation,
   type EngineeringRuntime,
@@ -587,6 +587,9 @@ export class RuntimeHost implements BridgeTarget {
 
   /** Never rejects: whatever goes wrong, the gate reopens and a result comes back. */
   private async runHandover(task: HandoverTask, request: HandoverRequest): Promise<HandoverResult> {
+    // Custody the stopped generation keeps for its successor is not handed
+    // back while the successor is still loading/starting (reloadCustody.ts).
+    noteHandover(true);
     try {
       return await this.handoverSteps(task, request);
     } catch (error) {
@@ -603,6 +606,8 @@ export class RuntimeHost implements BridgeTarget {
         durationMs: 0,
         ...(this.current ? { activeGeneration: this.current.generation } : {}),
       });
+    } finally {
+      noteHandover(false);
     }
   }
 
@@ -817,9 +822,9 @@ export class RuntimeHost implements BridgeTarget {
       if (this.starting === generation) this.starting = undefined;
       await phase("rolling_back");
       const rolled = await this.rollbackTo(old, snapshot, request, failure, base);
-      // Nothing runs that could re-claim the custody the stopped generation
-      // kept for its successor: hand it back now, not after the window.
-      if (!this.current) releaseRetainedCustody();
+      // The successor failed (rolled back or not): the custody the stopped
+      // generation kept for it is handed back now, not after the window.
+      releaseRetainedCustody();
       await phase(rolled ? "rolled_back" : "failed");
       return result({
         ok: false,
