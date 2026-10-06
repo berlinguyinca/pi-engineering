@@ -41,23 +41,76 @@ function trackProcessGroup(pid: number): void {
 /** Grace between SIGTERM and SIGKILL for processes a command left behind. */
 const LEFTOVER_GRACE_MS = 2_000;
 
-/** Members of a process group still alive (0 when none; at least 1 if `ps` is unavailable but the group lives). */
-function processGroupSize(pgid: number): number {
+interface GroupMember {
+  pid: number;
+  /** Process start time as `ps` reports it: with the pid, identifies this exact process. */
+  started: string;
+}
+
+/**
+ * Live (non-zombie) members of a process group, each with its start time.
+ * Null when `ps` is unavailable.
+ */
+function processGroupMembers(pgid: number): GroupMember[] | null {
+  try {
+    const listing = execFileSync("ps", ["-A", "-o", "pid=,pgid=,stat=,lstart="], {
+      encoding: "utf8",
+      env: { ...process.env, LC_ALL: "C" },
+    });
+    const members: GroupMember[] = [];
+    for (const line of listing.split("\n")) {
+      const [pid, group, stat, ...started] = line.trim().split(/\s+/);
+      if (Number(group) !== pgid || stat?.startsWith("Z")) continue;
+      members.push({ pid: Number(pid), started: started.join(" ") });
+    }
+    return members;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Terminate what a finished command left in its process group: SIGTERM now,
+ * then SIGKILL after a grace period to exactly the processes seen now (same
+ * pid AND start time), so a reused pid or pgid is never hit. The escalation
+ * timer is unref'd and outlives the stage, so a child that ignores SIGTERM is
+ * still killed. Returns how many processes were left behind.
+ */
+function reapLeftovers(pgid: number): number {
   try {
     process.kill(-pgid, 0);
   } catch {
     return 0;
   }
+  const members = processGroupMembers(pgid);
+  if (members !== null && members.length === 0) return 0;
   try {
-    const listing = execFileSync("ps", ["-A", "-o", "pgid=,stat="], { encoding: "utf8" });
-    const members = listing
-      .split("\n")
-      .map((line) => line.trim().split(/\s+/))
-      .filter(([group, stat]) => Number(group) === pgid && !stat?.startsWith("Z"));
-    return Math.max(members.length, 1);
+    process.kill(-pgid, "SIGTERM");
   } catch {
-    return 1;
+    return 0;
   }
+  const escalate = setTimeout(() => {
+    if (members === null) {
+      // No process listing: fall back to the group, if it still exists.
+      try {
+        process.kill(-pgid, "SIGKILL");
+      } catch {
+        // Already gone.
+      }
+      return;
+    }
+    const current = processGroupMembers(pgid) ?? [];
+    for (const member of current) {
+      if (!members.some((seen) => seen.pid === member.pid && seen.started === member.started)) continue;
+      try {
+        process.kill(member.pid, "SIGKILL");
+      } catch {
+        // Already gone.
+      }
+    }
+  }, LEFTOVER_GRACE_MS);
+  escalate.unref();
+  return members?.length ?? 1;
 }
 
 /**
@@ -86,7 +139,6 @@ export function runWithInactivityGuard(
     let hung = false;
     let settled = false;
     let leftoverProcesses = 0;
-    let leftoverKill: ReturnType<typeof setTimeout> | undefined;
     // Own process group, so a kill reaches grandchildren (npm -> node) that
     // would otherwise hold the output pipes open forever.
     const child = spawn(command, args, {
@@ -133,27 +185,13 @@ export function runWithInactivityGuard(
       settled = true;
       if (groupPid) liveProcessGroups.delete(groupPid);
       if (timer) clearTimeout(timer);
-      if (leftoverKill) clearTimeout(leftoverKill);
       opts.signal?.removeEventListener("abort", onAbort);
       fn();
     };
     child.on("exit", () => {
       if (!groupPid) return;
       // The command is done; whatever remains in its group was left behind.
-      leftoverProcesses = processGroupSize(groupPid);
-      if (leftoverProcesses === 0) return;
-      try {
-        process.kill(-groupPid, "SIGTERM");
-      } catch {
-        return;
-      }
-      leftoverKill = setTimeout(() => {
-        try {
-          process.kill(-groupPid, "SIGKILL");
-        } catch {
-          // Already gone.
-        }
-      }, LEFTOVER_GRACE_MS);
+      leftoverProcesses = reapLeftovers(groupPid);
     });
     child.on("error", (error) =>
       finish(() =>
