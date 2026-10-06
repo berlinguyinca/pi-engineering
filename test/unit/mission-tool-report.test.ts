@@ -29,7 +29,7 @@ function blockedMission() {
   store.transitionTask(failed.task_id, "READY");
   store.transitionTask(failed.task_id, "RUNNING");
   store.transitionTask(failed.task_id, "FAILED", "system", {
-    failure_reason: "backend reported failed: wall-clock timeout after 1800s",
+    failure_reason: "backend reported failed: configured wall-clock limit reached after 1800s",
   });
   store.checkpointTask({
     checkpointId: "CHK-1",
@@ -98,7 +98,8 @@ test("a BLOCKED run result names preserved work, failed tasks, remaining deliver
         mission: store.getMission(missionId)!,
         intent: { intent: ["implement"] },
         completed: false,
-        failureReason: "task execution budget exhausted after a durable partial checkpoint",
+        failureReason:
+          "configured task wall-clock limit (limits.max_task_wall_clock_ms) reached after a durable partial checkpoint",
       }),
     },
   });
@@ -107,7 +108,13 @@ test("a BLOCKED run result names preserved work, failed tasks, remaining deliver
   assert.match(text, /\[BLOCKED\]/);
   assert.match(text, /pi-eng-orch-TSK-health/, "preserved branch");
   assert.match(text, /0123456/, "preserved checkpoint commit");
-  assert.match(text, /wall-clock timeout/, "failed-task reason");
+  assert.match(text, /configured wall-clock limit/, "failed-task reason");
+  assert.doesNotMatch(text, /execution budget exhausted/, "time is never reported as an exhausted budget");
+  assert.match(
+    text,
+    /Elapsed: .* · last activity .* ago · stage BLOCKED/,
+    "a stopped mission still shows its timeline",
+  );
   assert.match(text, /build info payload/, "remaining deliverables");
   assert.match(text, /Next step:.*resume/i, "explicit next step");
   assert.match(text, new RegExp(missionId));
@@ -161,4 +168,40 @@ test("mission tool status for an unknown mission says so", async () => {
     cwd: "/repo",
   });
   assert.match(result.content[0]!.text, /unknown mission MSN-nope/i);
+});
+
+test("mission tool status shows elapsed time, last activity and the current stage of a long-running mission", async () => {
+  const store = MissionStore.open(JsonlEventStore.inMemory());
+  const mission = store.createMission({
+    title: "Rewrite the scheduler",
+    goal: "Rewrite the scheduler",
+    user_request: "Rewrite the scheduler",
+    repository: ".",
+    base_ref: "base",
+    risk_profile: "low",
+    workflow_class: "engineering",
+  });
+  store.transitionMission(mission.mission_id, "CLASSIFYING");
+  store.transitionMission(mission.mission_id, "PLANNING");
+  store.transitionMission(mission.mission_id, "READY");
+  store.transitionMission(mission.mission_id, "EXECUTING");
+  const task = store.createTask({
+    mission_id: mission.mission_id,
+    kind: "agent",
+    role: "implementer",
+    objective: "Rewrite the dispatch loop",
+  });
+  store.transitionTask(task.task_id, "READY");
+  store.transitionTask(task.task_id, "RUNNING");
+  const execute = missionTool({ orchestrator: { store, orchestrate: async () => assert.fail("no orchestrate") } });
+  const result = await execute("m", { action: "status", missionId: mission.mission_id }, undefined, undefined, {
+    cwd: "/repo",
+  });
+  const text = result.content[0]!.text;
+  assert.match(
+    text,
+    /Elapsed: \d+s · last activity \d+s ago · stage EXECUTING \(implementer "Rewrite the dispatch loop"\)/,
+  );
+  assert.match(text, /no deadline/);
+  assert.match(text, /cancel/);
 });
