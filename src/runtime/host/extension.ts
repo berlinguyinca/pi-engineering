@@ -242,7 +242,8 @@ export class EngineeringHostExtension {
     const host = new RuntimeHost({ pi, generationsDir: this.generationsDir, telemetry: this.telemetry });
     this.host = host;
     host.bridge.registerHostCommand("engineering", {
-      description: "Pi Engineering runtime: reload | update | rollback | version | cancel (and runtime subcommands)",
+      description:
+        "Pi Engineering runtime: reload | update | rollback [--yes] | version | cancel (and runtime subcommands)",
       handler: (args, ctx) => this.command(args, ctx as Ctx),
     });
     cleanupDeadGenerationDirs(join(this.config.installRoot, "generations"));
@@ -574,8 +575,16 @@ export class EngineeringHostExtension {
             : `The handover is past the point of cancellation (${task.phase}); it will finish or roll back.`,
         );
       }
-      case "rollback":
-        return this.rollback(argv[1], ctx);
+      case "rollback": {
+        const rest = argv.slice(1);
+        const unknown = rest.find((a) => a.startsWith("-") && a !== "--yes");
+        if (unknown) return notify(ctx, `unknown option ${unknown}\nusage: /engineering rollback [version] [--yes]`);
+        return this.rollback(
+          rest.find((a) => !a.startsWith("-")),
+          ctx,
+          rest.includes("--yes"),
+        );
+      }
       case "version":
         return notify(ctx, this.versionText());
       case "status":
@@ -646,8 +655,13 @@ export class EngineeringHostExtension {
     }
   }
 
-  /** `/engineering rollback [version]`: the same transactional handover as an update (spec §36). */
-  protected async rollback(requested: string | undefined, ctx: Ctx): Promise<void> {
+  /**
+   * `/engineering rollback [version] [--yes]`: the same transactional handover
+   * as an update (spec §36). When restoring the pre-migration checkpoint would
+   * drop state written after the update, it lists what would be lost and
+   * needs `--yes`.
+   */
+  protected async rollback(requested: string | undefined, ctx: Ctx, confirmed = false): Promise<void> {
     const lock = this.lockFor("rollback", ctx);
     if (!lock) return;
     let handedOver = false;
@@ -659,6 +673,20 @@ export class EngineeringHostExtension {
         plan = await planRollback(this.layout, this.journal, active?.source.root ?? null, stateDir, requested);
       } catch (error) {
         return notify(ctx, `Rollback refused: ${error instanceof Error ? error.message : String(error)}`, "warning");
+      }
+      if (plan.loss.paths.length > 0 && !confirmed) {
+        const shown = plan.loss.paths.slice(0, 20);
+        return notify(
+          ctx,
+          [
+            `Rolling back to ${plan.target.version} restores the state checkpoint taken before schema ${plan.migration.from} and discards these files written since the update (${plan.loss.since}):`,
+            ...shown.map((p) => `  ${p}`),
+            ...(plan.loss.paths.length > shown.length ? [`  … and ${plan.loss.paths.length - shown.length} more`] : []),
+            "",
+            `Nothing was changed. To proceed: /engineering rollback${requested ? ` ${requested}` : ""} --yes`,
+          ].join("\n"),
+          "warning",
+        );
       }
       const transaction = `rollback-${plan.target.id}-${randomBytes(3).toString("hex")}`;
       const record = this.journal.begin({
