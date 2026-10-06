@@ -725,13 +725,24 @@ export class EngineeringHostExtension {
         return notify(ctx, `Rollback refused: ${error instanceof Error ? error.message : String(error)}`, "warning");
       }
       if (plan.loss.paths.length > 0 && !confirmed) {
-        const shown = plan.loss.paths.slice(0, 20);
+        const list = (paths: string[]) => [
+          ...paths.slice(0, 20).map((p) => `  ${p}`),
+          ...(paths.length > 20 ? [`  … and ${paths.length - 20} more`] : []),
+        ];
+        const newer = new Set(plan.loss.paths);
+        const older = plan.loss.replaced.filter((p) => !newer.has(p));
         return notify(
           ctx,
           [
             `Rolling back to ${plan.target.version} restores the state checkpoint taken before schema ${plan.migration.from} and discards these files written since the update (${plan.loss.since}):`,
-            ...shown.map((p) => `  ${p}`),
-            ...(plan.loss.paths.length > shown.length ? [`  … and ${plan.loss.paths.length - shown.length} more`] : []),
+            ...list(plan.loss.paths),
+            ...(older.length > 0
+              ? [
+                  "",
+                  "It also returns these files (written by the update itself) to their pre-update content:",
+                  ...list(older),
+                ]
+              : []),
             "",
             `Nothing was changed. To proceed: /engineering rollback${requested ? ` ${requested}` : ""} --yes`,
           ].join("\n"),

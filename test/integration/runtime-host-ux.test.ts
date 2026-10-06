@@ -171,6 +171,7 @@ test("/engineering rollback refuses to drop state written after the update unles
   const refusal = notes.join("\n");
   assert.match(refusal, /--yes/, refusal);
   assert.match(refusal, /missions\.json/, "names what would be lost");
+  assert.match(refusal, /state-schema\.json/, "also lists files the restore replaces that were written before the commit");
   assert.equal(w.ext.layout.readPointer("current"), vC, "nothing rolled back");
   assert.equal(readFileSync(join(w.state, "missions.json"), "utf8"), newer, "newer state untouched");
   assert.equal(readStateSchema(w.state), 8);
