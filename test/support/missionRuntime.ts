@@ -40,7 +40,7 @@ export function writeMissionRuntime(dir: string, key: string, value: string): vo
     join(dir, "runtime.ts"),
     `import { EngineeringRuntime } from ${JSON.stringify(url("src/runtime/EngineeringRuntime.ts"))};
 import { CommandVerifier } from ${JSON.stringify(url("src/verify/Verifier.ts"))};
-import { orchestrationFile, readMissionFacts } from ${JSON.stringify(url("src/runtime/host/missionHandover.ts"))};
+import { discoverMissionHandover } from ${JSON.stringify(url("src/runtime/host/missionHandover.ts"))};
 import { writeFile, mkdir } from "node:fs/promises";
 
 const KEY = ${JSON.stringify(key)};
@@ -85,7 +85,7 @@ export async function createRuntime(ctx: any) {
       };
     },
   };
-  const facts = () => readMissionFacts(orchestrationFile(cfg.repo));
+  const facts = () => discoverMissionHandover(cfg.repo);
   return {
     async start() {
       rt = await EngineeringRuntime.open({ cwd: cfg.repo, worker, verifier: new CommandVerifier() });

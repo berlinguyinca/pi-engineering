@@ -18,7 +18,7 @@ import { promisify } from "node:util";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 import { EngineeringHostExtension } from "../../src/runtime/host/extension.ts";
-import { INFERENCE_WAIT_STATES, orchestrationFile } from "../../src/runtime/host/missionHandover.ts";
+import { INFERENCE_WAIT_STATES, readOrchestrationEvents } from "../../src/runtime/host/missionHandover.ts";
 import { makeFixtureRepo } from "../fixtures/make-fixture.ts";
 import { missionBag, writeMissionRuntime } from "../support/missionRuntime.ts";
 import { startPiSession } from "../support/piSession.ts";
@@ -101,9 +101,8 @@ async function waitUntil(what: string, cond: () => boolean, ms = 60_000): Promis
 }
 
 async function replayStore(repo: string): Promise<MissionStore> {
-  const lines = readFileSync(orchestrationFile(repo), "utf8").split("\n").filter(Boolean);
   const backend = JsonlEventStore.inMemory();
-  await backend.appendAll(lines.map((l) => JSON.parse(l)));
+  await backend.appendAll(await readOrchestrationEvents(repo));
   return MissionStore.open(backend);
 }
 
