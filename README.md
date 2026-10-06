@@ -244,8 +244,8 @@ multiply:
 | Who | Short retries (seconds) | Long wait (owner) | After the horizon |
 | --- | --- | --- | --- |
 | Interactive turn | — | the gateway pump: capped-exponential waits (≤60s between attempts, an advertised `Retry-After` / `retry_after_ms` honoured exactly), up to `PI_GATEWAY_MAX_ELAPSED_MS` | the error is shown; **Esc** ends the wait at any time |
-| Worker session | transient layer (`PI_GUARD_TRANSIENT_*`, 4 attempts) and up to `PI_GATEWAY_MAX_RETRIES` honoured gateway waits | hands off with a `transient:*` marker to the mission scheduler | — |
-| Mission | — | scheduler window `PI_GATEWAY_RETRY_WINDOW`: relaunches paced by the recovery probe (`PI_GATEWAY_HEALTH_URL`), or without one by a capped-exponential backoff up to `PI_GATEWAY_MAX_BACKOFF` | the mission **pauses** (never fails); with a real probe it resumes itself on the first healthy answer within `PI_GATEWAY_AUTO_RESUME_HORIZON` |
+| Worker session | transient layer (`PI_GUARD_TRANSIENT_*`, 4 attempts); a **mission** worker honours gateway waits for as long as the gateway asks (a standalone run stops after `PI_GATEWAY_MAX_RETRIES`) | hands off with a `transient:*` marker to the mission scheduler | — |
+| Mission | — | scheduler window `PI_GATEWAY_RETRY_WINDOW`: relaunches paced by the recovery probe (`PI_GATEWAY_HEALTH_URL`), or without one by a capped-exponential backoff up to `PI_GATEWAY_MAX_BACKOFF` | the mission **pauses** (never fails); with a real probe it keeps probing and resumes itself on the first healthy answer — with no horizon unless `PI_GATEWAY_AUTO_RESUME_HORIZON` sets one |
 
 While a turn waits, the status bar shows what it is waiting for, the next
 retry countdown and, once the outage passes a minute, how long it has lasted
@@ -262,18 +262,45 @@ and a link cut do not switch models.
 | `PI_GATEWAY_RESERVED_SLOTS` | `1` | Of that total, slots kept free for your interactive turn (so 3 worker sessions by default, held from the start) |
 | `PI_GATEWAY_MAX_WAIT_MS` | `300000` | Retained for compatibility; a server-advertised wait is never shortened |
 | `PI_GATEWAY_JITTER_MS` | `250` | Release stagger window |
-| `PI_GATEWAY_MAX_RETRIES` | `8` | Gateway waits one worker attempt honours before the mission scheduler takes over the wait |
+| `PI_GATEWAY_MAX_RETRIES` | `8` | Gateway waits a standalone (non-mission) worker attempt honours; mission workers wait as long as the gateway asks |
 | `PI_GATEWAY_MAX_ELAPSED_MS` | `12h` | How long an interactive turn waits out transient infrastructure (ms or a duration such as `12h`) |
 | `PI_GATEWAY_RETRY_WINDOW` | `12h` | How long a mission keeps relaunching a task through a transient outage before pausing |
 | `PI_GATEWAY_MAX_BACKOFF` | `3m` | Cap between relaunches when no recovery probe is configured |
 | `PI_GATEWAY_HEALTH_URL` | *none* | Gateway base URL for the recovery probe (`/ready`, `/health`, `/v1/models`) |
 | `PI_GATEWAY_PROBE_INTERVAL` | `10000` | Recovery probe cadence (ms) |
 | `PI_GATEWAY_AUTO_RESUME` | `true` | Whether a paused mission resumes itself when the probe reports healthy |
-| `PI_GATEWAY_AUTO_RESUME_HORIZON` | `24h` | How long a paused mission keeps probing for recovery |
+| `PI_GATEWAY_AUTO_RESUME_HORIZON` | *unbounded* | How long a paused mission keeps probing for recovery (set to give up and stay paused) |
+| `PI_GATEWAY_MAX_OUTAGE` | *none* | Opt-in: total outage after which a task FAILS (unset: an outage is waited out) |
 | `PI_GATEWAY_TELEMETRY` | `true` | Emit `[gateway-admission]` events on stderr |
 
 Pi's own retry (`.pi/settings.json` `retry`) is separate; the waits above do
 not depend on it and work with it disabled.
+
+### Mission time limits
+
+Missions have **no fixed wall-clock window**: a mission, its tasks, workers,
+reviews, validation and recovery run as long as they make progress — if it
+takes 8 hours, it takes 8 hours. A worker is treated as hung only after
+`limits.worker_inactivity_ms` (default 1 hour) with no activity at all (tool,
+model output, checkpoint, or waiting on the gateway); it is then resumed from
+its checkpoint, not failed. Verification commands are killed only after 15
+minutes of silence, never for running long. `mission {action:"status"}` shows
+elapsed time, last activity and the current stage; cancelling (Esc) is the
+only thing that ends a healthy mission early.
+
+Caps are opt-in, in `engineering.yaml`:
+
+```yaml
+limits:
+  worker_inactivity_ms: 3600000        # hung-worker window (default 1h)
+  # max_task_wall_clock_ms: 28800000   # opt-in per-task ceiling (unset = none)
+  # max_mission_wall_clock_ms: 86400000 # opt-in mission ceiling (unset = none)
+```
+
+`PI_ENGINEERING_WORKER_INACTIVITY_MS` overrides the hung-worker window and
+`PI_ENGINEERING_WORKER_TIMEOUT_MS` sets an opt-in per-execution ceiling. The
+full inventory of time limits and their classification is in
+[`docs/mission-time-limits.md`](docs/mission-time-limits.md).
 
 ## Engineering panel
 
