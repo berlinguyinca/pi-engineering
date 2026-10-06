@@ -1,95 +1,82 @@
 /**
- * What a request asks of each filesystem path it names (PR #106 final review).
+ * What a request allows for each filesystem path it names (PR #106 final
+ * review C). Structurally fail-safe; it does not try to understand English.
  *
- * Design, fail-safe by construction:
+ *  1. Explicit directives win. Lines such as `writable: /a, /b`,
+ *     `target: /a`, `read-only: /c`, `readonly:`, `reference:`,
+ *     `do not modify:` (also as list items, inside fenced blocks, or as a
+ *     header followed by a list) state scope unambiguously. When the request
+ *     has a writable directive, nothing else is writable.
+ *  2. Otherwise a path is writable only if a mutation verb is directed at it
+ *     AND its whole sentence (plus the list intro / markdown header it sits
+ *     under) contains no restriction word at all. Any restriction word
+ *     (not, never, avoid, skip, keep, leave, read-only, reference, analyze,
+ *     copy, from <path>, ...) makes every path in that sentence read-only.
+ *     Narrow exception: the verb-directed path's own clause (split on , ; but
+ *     and except ( - ) is clean and every restriction word sits in a clause
+ *     that names its own path and no pronoun ("Fix /T, but don't touch /R").
+ *  3. A path read-only anywhere is read-only everywhere.
  *
- *  1. Exclusions win, globally. A path written in ANY exclusion position
- *     anywhere in the request (a negated mutation verb before it, "except",
- *     "but not", or a clause that calls it read-only / unchanged / reference /
- *     off-limits / "leave … alone") is excluded, whatever other mentions say.
- *  2. A path is writable only on a positive grant: a mutation verb governs it
- *     (or it is a destination: "into X", "… of A in X"). Reference verbs and
- *     prepositions ("copy", "follow", "analyze", "from X", "based on X") make it
- *     a reference. With no verb at all it is neutral; the resolver promotes a
- *     single neutral repository to the target and treats everything else as
- *     read-only.
- *  3. Negation scope is not cut by commas, parentheticals, "please",
- *     "under any circumstances" or emphasis: it runs from the negation to the
- *     end of its clause. Clauses split only at explicit connectives ("and"
- *     followed by a new verb phrase, "but", "while", ", then", "using", …).
- *
- * The classifier works on a masked copy of the request in which every path
- * mention is replaced by a placeholder, so path characters (dots, commas,
- * spaces in quoted paths) never interfere with sentence or clause splitting.
+ * Anything that is not clearly a grant is read-only; the resolver refuses
+ * rather than guessing, and its message points at the directive syntax.
  */
 import { homedir } from "node:os";
-import { isAbsolute, join, resolve } from "node:path";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 
 export interface PathMention {
-  /** Absolute path (tilde and relative paths expanded). */
-  path: string;
-  start: number;
-  end: number;
+  /** Absolute, lexically normalized path; null when the token cannot be resolved. */
+  path: string | null;
+  raw: string;
+  /** Path-like token that cannot be resolved (`$HOME/x`, `C:\x`, `~user/x`, `../x` outside the launch dir). */
+  unresolved: boolean;
+  /** Reads like an HTTP route ("/api/v1/users", "the /health endpoint") rather than a filesystem path. */
+  routeLike: boolean;
 }
 
-export type PathRole = "positive" | "reference" | "neutral";
-
-export interface PathIntent {
-  mention: PathMention;
-  role: PathRole;
-  /** Named in an exclusion position: never writable. */
-  excluded: boolean;
-  /** Excluded by "do not touch/use/access": not even a read root. */
-  hardExcluded: boolean;
+export interface RequestAnalysis {
+  mentions: PathMention[];
+  /** Mention named with a restriction anywhere (directive or inference). */
+  tainted: boolean[];
+  /** Mention granted write by a directive or by a directed, unrestricted sentence. */
+  granted: boolean[];
+  /** Mention sits in a sentence with a mutation verb (for refusing unresolvable targets). */
+  mutationAimed: boolean[];
+  /** The request states scope with explicit directives. */
+  hasDirectives: boolean;
+  /** Path that both a writable and a read-only directive name. */
+  directiveConflict: string | null;
+  /** A restriction word refers to the launch directory ("do not modify anything here"). */
+  launchRestricted: boolean;
+  /** Any restriction word anywhere in the request. */
+  anyRestriction: boolean;
+  /** Whether mention `index` may become writable (granted, never tainted under any lexical alias). */
+  writeEligible(index: number): boolean;
 }
 
 const OPEN = "\uE000";
 const CLOSE = "\uE001";
 const PLACEHOLDER = /\uE000(\d+)\uE001/g;
 
-const TRAILING_PROSE = /[,:;!?]+$/;
+/** Restriction lexicon: any hit makes the sentence's paths read-only. */
+const RESTRICTION =
+  /\b(?:not|no|never|nothing|none|nor|neither|dont|cannot|without|avoid\w*|skip\w*|ignor\w*|exclud\w*|except\w*|leav(?:e|es|ing)|left|alone|untouched|unchanged|unmodified|remain\w*|stay\w*|keep\w*|kept|refrain\w*|forbid\w*|prohibit\w*|disallow\w*|reference\w*|inspect\w*|analy[sz]\w*|audit\w*|review\w*|compar\w*|cop(?:y|ies|ied|ying)|mirror\w*|follow\w*|preserve\w*|intact|frozen|protect\w*|restrict\w*)\b|n't\b|\bas[- ]is\b|\bhands[- ]off\b|\boff[- ]limits\b|\bread[- ]?only\b|\bfor context\b|\bas (?:an? |the )?(?:guide|example|template|model|baseline|inspiration)\b|\blook(?:s|ing)? at\b|\bbased on\b|\bfrom\s+["'`]?\uE000/i;
+const ONLY = /\bonly\b/i;
+/** Broad mutation vocabulary (stems). */
+const MUTATION =
+  /\b(?:add|creat|install|implement|fix|patch|build|appl|updat|chang|edit|modif|writ|wrote|refactor|renam|delet|remov|migrat|port|upgrad|bump|mov|merg|commit|push|configur|wir|clean|improv|extend|replac|convert|restructur|repair|debug|resolv|harden|set ?up|work|coordinat|integrat|rewrit|optimi[sz]|generat|scaffold|initiali[sz]|bootstrap|introduc|insert|append|tweak|adjust|correct|rework|make|implement|ship|develop|code)\w*\b/i;
+const REMOVAL = /\b(?:remov|delet|strip|drop|purg|eras|clean)\w*\b/i;
+/** Words that make a restriction clause refer back to another path. */
+const PRONOUN =
+  /\b(?:it|its|itself|them|they|this|that|these|those|there|here|either|both|all|any|former|latter|first|second|same|above|below|previous|rest|everything|anything|others?)\b/i;
+/** Restriction aimed at the launch directory when no path is named. */
+const LAUNCH_LOCATION =
+  /\b(?:here|this (?:repo|repository|directory|dir|folder|project|workspace|codebase|checkout)|the (?:repo|repository|codebase|workspace|directory|folder|project|code)|anything|everything|any files?|files)\b/i;
+const ROUTE_WORD =
+  /\b(?:endpoints?|routes?|apis?|urls?|uris?|handlers?|pages?|requests?|get|post|put|patch|delete|head|options|path|webhooks?)\b/i;
 
-function stripUnquotedPunctuation(candidate: string): string {
-  let stripped = candidate.replace(TRAILING_PROSE, "");
-  while (stripped.endsWith(".") && !stripped.endsWith("/.") && stripped !== "." && stripped !== "..") {
-    stripped = stripped.slice(0, -1);
-  }
-  return stripped.replace(TRAILING_PROSE, "");
-}
+const DIRECTIVE =
+  /^\s*(?:[-*+]\s+|\d+[.)]\s+)?(?:\*\*|__)?(writable|write|targets?|read[- ]?only|references?|do not modify|don't modify|do-not-modify)(?:\*\*|__)?\s*:\s*(.*)$/i;
 
-function expandPath(raw: string, launchCwd: string): string | null {
-  if (raw === "~") return homedir();
-  if (raw.startsWith("~/")) return join(homedir(), raw.slice(2));
-  if (raw.startsWith("./") || raw.startsWith("../")) return resolve(launchCwd, raw);
-  return isAbsolute(raw) ? raw : null;
-}
-
-/** Absolute, `~`, `~/…`, `./…` and `../…` paths, quoted (any of "'`) or bare. */
-export function extractPathMentions(request: string, launchCwd: string): PathMention[] {
-  const mentions: PathMention[] = [];
-  const quotedRanges: Array<{ start: number; end: number }> = [];
-  for (const match of request.matchAll(/(["'`])((?:\/|~\/|~(?=["'`])|\.\.?\/).*?)\1/gs)) {
-    const end = match.index + match[0].length;
-    quotedRanges.push({ start: match.index, end });
-    const path = expandPath(match[2] ?? "", launchCwd);
-    if (path) mentions.push({ path, start: match.index, end });
-  }
-  const bare = /(?<![\w/:.~-])(?:\/[A-Za-z0-9._~]|~(?=\/|[\s,.;:!?)]|$)|\.\.?\/)[^\s"'`<>()[\]{}]*/g;
-  for (const match of request.matchAll(bare)) {
-    if (quotedRanges.some((range) => match.index >= range.start && match.index < range.end)) continue;
-    const candidate = stripUnquotedPunctuation(match[0]);
-    if (candidate === "/" || candidate.length === 0) continue;
-    const path = expandPath(candidate, launchCwd);
-    if (path) mentions.push({ path, start: match.index, end: match.index + candidate.length });
-  }
-  return mentions.sort((left, right) => left.start - right.start);
-}
-
-/**
- * Canonical prose: compatibility-normalized (full-width letters), invisible
- * characters removed, typographic apostrophes folded, so look-alike text
- * cannot hide a negation.
- */
 function normalizeProse(text: string): string {
   return text
     .normalize("NFKC")
@@ -98,184 +85,294 @@ function normalizeProse(text: string): string {
     .replace(/[\u201C\u201D]/g, '"');
 }
 
-function mask(request: string, mentions: PathMention[]): string {
-  let masked = "";
-  let cursor = 0;
-  mentions.forEach((mention, index) => {
-    masked += normalizeProse(request.slice(cursor, mention.start));
-    masked += `${OPEN}${index}${CLOSE}`;
-    cursor = mention.end;
-  });
-  masked += normalizeProse(request.slice(cursor));
-  // "don't just read X" / "not only X" is emphasis, not a negation.
-  return masked.replace(/(?:\bnot|n't)\s+(?:just|only|merely|simply)\s+[\w-]+/gi, " ");
+function isWithin(parent: string, child: string): boolean {
+  return child === parent || child.startsWith(`${parent}${sep}`);
 }
 
-/**
- * Blocks: one per line, except that the items of a markdown list belong to the
- * header line that introduces them ("DO NOT MODIFY:" / "## Read-only"), so a
- * header's cue reaches every listed path.
- */
-function blocks(masked: string): string[] {
-  const out: string[] = [];
-  let headerOpen = false;
-  for (const line of masked.split(/\r?\n/)) {
-    const trimmed = line.trim();
-    if (!trimmed) {
-      headerOpen = false;
-      continue;
-    }
-    const isItem = /^(?:[-*+\u2022]|\d+[.)])\s+/.test(trimmed);
-    if (isItem && headerOpen && out.length > 0) {
-      out[out.length - 1] = `${out[out.length - 1]} ${trimmed.replace(/^(?:[-*+\u2022]|\d+[.)])\s+/, "")}`;
-      continue;
-    }
-    const content = trimmed.replace(/^(?:[-*+\u2022]|\d+[.)])\s+/, "");
-    out.push(content);
-    headerOpen = !isItem && (/:\s*$/.test(trimmed) || /^#{1,6}\s/.test(trimmed));
-  }
-  return out;
-}
-
-const SENTENCE_SPLIT = /(?<=[.!?;])\s+/;
-const CLAUSE_SPLIT =
-  /\s+(?:but|yet|while|whereas|however|so|then|using|and then|and also)\s+|\s+and\s+(?!\uE000)|,\s*(?=(?:and\s+)?(?:then|but|keeping|leaving|while|so|however|yet|using)\b)|\s+[\u2014\u2013-]{1,2}\s+/i;
-
-const NEGATION = /\bnot\b|n't\b|\bnever\b|\bno\b|\bwithout\b|\bavoid(?:ing)?\b|\bnor\b|\bdont\b/gi;
-const NEGATABLE_VERB =
-  /^(?:touch(?:es|ed|ing)?|modif(?:y|ies|ied|ying|ications?)|chang(?:e|es|ed|ing)|edit(?:s|ed|ing)?|alter(?:s|ed|ing)?|writ(?:e|es|ing|ten)|delet(?:e|es|ed|ing)|remov(?:e|es|ed|ing)|renam(?:e|es|ed|ing)|mov(?:e|es|ed|ing)|mutat(?:e|es|ed|ing)|updat(?:e|es|ed|ing)|refactor(?:s|ed|ing)?|rewrit(?:e|es|ing|ten)|commit(?:s|ted|ting)?|push(?:es|ed|ing)?|us(?:e|es|ed|ing)|access(?:es|ed|ing)?|make|making)$/i;
-const HARD_VERB = /^(?:touch(?:es|ed|ing)?|us(?:e|es|ed|ing)|access(?:es|ed|ing)?)$/i;
-/** Words after a negation that show it is not about mutating a path ("do not stop until …"). */
-const NEGATION_BLOCKER =
-  /^(?:until|unless|before|after|if|when|whenever|stop|forget|hesitate|wait|worry|longer|matter|fail|regress(?:ion)?|break)$/i;
-const MAX_NEGATION_GAP = 8;
-const EXCEPT = /\b(?:except|excluding|other than|apart from|save for)\b/gi;
-/** "but not X", "not in X": a bare negation directly before a path (only prepositions/articles between). */
-const BARE_NOT_BEFORE_PATH =
-  /\bnot\s+(?:(?:in|to|into|inside|under|within|on|at|for|from|with|the|a|an|any|of)\s+){0,2}["'`]?(?=\uE000)/gi;
-/** Clause-wide state cues: every path in the clause is excluded (read-only). */
-const STATE_CUE =
-  /\bread[- ]?only\b|\breference\b|\bfor context\b|\bas context\b|\buntouched\b|\bunchanged\b|\bunmodified\b|\bintact\b|\bas[- ]is\b|\bleave\b.*\balone\b|\bleft alone\b|\boff[- ]limits\b|\bfrozen\b|\b(?:must|should|shall|will|to|has to|needs to)\s+stay\b|\bstays?\s+(?:the same|put)\b|\bas (?:a |an |the )?(?:guide|example|template|model|baseline|inspiration)\b/i;
-const PASSIVE_PROHIBITION =
-  /\b(?:not|never|no)\b.*\bbe\s+(?:modified|changed|touched|edited|altered|written|updated|mutated|deleted|removed|refactored)\b|\b(?:not|never)\s+(?:to\s+)?(?:be\s+)?(?:modified|changed|touched|edited|altered|written to|updated|mutated)\b/i;
-
-const MUTATION_VERB =
-  /\b(?:modify|modifies|edit|change|write|delete|remove|create|refactor|implement|fix|update|rewrite|build|add|patch|work|commit|apply|coordinate|integrate|migrate|upgrade|bump|rename|move|merge|install|configure|wire|clean|optimi[sz]e|improve|extend|replace|convert|restructure|port|backport|repair|debug|resolve|address|harden|set up|setup|review)\b/gi;
-const REFERENCE_VERB =
-  /\b(?:copy|mirror|follow|imitate|replicate|emulate|analy[sz]e|inspect|examine|read|study|consult|compare|learn|look at|see|check out)\b/gi;
-const COPY_VERB = /^(?:copy|mirror|follow|imitate|replicate|emulate|port|backport|apply|move)$/i;
-const REMOVAL_VERB = /^(?:remove|delete|clean|strip|drop|purge|erase)$/i;
-const DESTINATION_LOCAL = /\b(?:into|onto)\s+(?:[^\s\uE000]+\s+){0,3}$/i;
-const COPY_DESTINATION_LOCAL = /\b(?:in|to|inside|within|under)\s+(?:the\s+)?(?:[^\s\uE000]+\s+)?$/i;
-const REFERENCE_LOCAL =
-  /\b(from|like|than|versus|vs\.?|based on|modell?ed (?:on|after)|inspired by|according to|similar to|same as)\s+(?:[^\s\uE000]+\s+){0,3}$/i;
-
-interface ClausePath {
-  index: number;
-  position: number;
+interface Span {
+  start: number;
   end: number;
+  mention: PathMention;
 }
 
-function placeholders(clause: string): ClausePath[] {
-  return [...clause.matchAll(PLACEHOLDER)].map((match) => ({
-    index: Number(match[1]),
-    position: match.index,
-    end: match.index + match[0].length,
-  }));
-}
+const TRAILING_PROSE = /[,:;!?)]+$/;
 
-/** Paths a negation/except operator at `at` reaches: those after it, or all when none follow and no mutation precedes. */
-function scoped(clause: string, paths: ClausePath[], at: number): ClausePath[] {
-  const after = paths.filter((path) => path.position > at);
-  if (after.length > 0) return after;
-  const mutationBefore = [...clause.slice(0, paths[0]?.position ?? 0).matchAll(MUTATION_VERB)].length > 0;
-  return mutationBefore ? [] : paths;
-}
-
-function lastVerb(text: string): { verb: string; kind: "mutation" | "reference" } | null {
-  let best: { verb: string; kind: "mutation" | "reference"; at: number } | null = null;
-  for (const match of text.matchAll(MUTATION_VERB)) {
-    if (!best || match.index >= best.at) best = { verb: match[0], kind: "mutation", at: match.index };
+function stripTrailing(candidate: string): string {
+  // "/repo.Do not …": a sentence glued to the path without a space.
+  let stripped = candidate.replace(/\.[A-Z][A-Za-z]*$/, "").replace(TRAILING_PROSE, "");
+  while (stripped.endsWith(".") && !stripped.endsWith("/.") && !/(?:^|\/)\.\.$/.test(stripped)) {
+    stripped = stripped.slice(0, -1).replace(TRAILING_PROSE, "");
   }
-  for (const match of text.matchAll(REFERENCE_VERB)) {
-    if (!best || match.index >= best.at) best = { verb: match[0], kind: "reference", at: match.index };
-  }
-  return best ? { verb: best.verb, kind: best.kind } : null;
+  return stripped;
 }
 
-function classifyClause(clause: string, intents: PathIntent[]): void {
-  const paths = placeholders(clause);
-  if (paths.length === 0) return;
-  const exclude = (path: ClausePath, hard: boolean) => {
-    const intent = intents[path.index]!;
-    intent.excluded = true;
-    if (hard) intent.hardExcluded = true;
+function routeLikeAt(line: string, start: number, end: number, raw: string): boolean {
+  if (/^\/(?:api|v\d+)(?:\/|$)|\/v\d+(?:\/|$)|\/:[A-Za-z]|\{[A-Za-z]/.test(raw)) return true;
+  const before = line
+    .slice(Math.max(0, start - 40), start)
+    .split(/\s+/)
+    .slice(-3)
+    .join(" ");
+  const after = line
+    .slice(end, end + 40)
+    .split(/\s+/)
+    .slice(0, 4)
+    .join(" ");
+  return ROUTE_WORD.test(before) || ROUTE_WORD.test(after);
+}
+
+function toMention(raw: string, launchCwd: string, line: string, start: number, end: number): PathMention | null {
+  const routeLike = routeLikeAt(line, start, end, raw);
+  if (
+    /^(?:\$\{?[A-Za-z_]\w*\}?|%[A-Za-z_]\w*%)[\\/]/.test(raw) ||
+    /^[A-Za-z]:\\/.test(raw) ||
+    /^~[A-Za-z_]/.test(raw)
+  ) {
+    return { path: null, raw, unresolved: true, routeLike: false };
+  }
+  if (raw === "~" || raw.startsWith("~/")) {
+    return { path: resolve(join(homedir(), raw.slice(2))), raw, unresolved: false, routeLike: false };
+  }
+  if (raw.startsWith("./") || raw.startsWith("../") || raw === "." || raw === "..") {
+    const path = resolve(launchCwd, raw);
+    const inside = !relative(launchCwd, path).startsWith("..") && !isAbsolute(relative(launchCwd, path));
+    return inside
+      ? { path, raw, unresolved: false, routeLike: false }
+      : { path: null, raw, unresolved: true, routeLike: false };
+  }
+  if (!isAbsolute(raw)) return null;
+  // A bare "/" is the filesystem root as a target ('Modify files in "/"'),
+  // otherwise prose ('mount the app at "/"').
+  if (raw === "/") return { path: "/", raw, unresolved: false, routeLike: true };
+  return { path: resolve(raw), raw, unresolved: false, routeLike };
+}
+
+/** Path-like tokens of one line, in order. */
+function lineMentions(line: string, launchCwd: string): Span[] {
+  const spans: Span[] = [];
+  const taken: Array<{ start: number; end: number }> = [];
+  for (const match of line.matchAll(/(["'`])((?:\/|~\/?|\.\.?\/|\$\{?\w+\}?\/|[A-Za-z]:\\).*?)\1/g)) {
+    const end = match.index + match[0].length;
+    taken.push({ start: match.index, end });
+    const mention = toMention(match[2] ?? "", launchCwd, line, match.index, end);
+    if (mention) spans.push({ start: match.index, end, mention });
+  }
+  const bare =
+    /(?<![\w/:.~$\\-])(?:\/[A-Za-z0-9._~]|~(?:[A-Za-z_][\w-]*)?(?=\/|[\s,.;:!?)]|$)|\.\.?\/|\$\{?[A-Za-z_]\w*\}?\/|%[A-Za-z_]\w*%\\|[A-Za-z]:\\)[^\s"'`<>()[\]{}]*/g;
+  for (const match of line.matchAll(bare)) {
+    if (taken.some((range) => match.index >= range.start && match.index < range.end)) continue;
+    const raw = stripTrailing(match[0]);
+    if (!raw) continue;
+    const mention = toMention(raw, launchCwd, line, match.index, match.index + raw.length);
+    if (mention) spans.push({ start: match.index, end: match.index + raw.length, mention });
+  }
+  return spans.sort((left, right) => left.start - right.start);
+}
+
+interface Unit {
+  /** Masked, normalized text. */
+  text: string;
+}
+
+const SENTENCE_SPLIT = /(?<=[.!?;])\s+|(?<=[.!?;])(?=[A-Z])/;
+const CLAUSE_SPLIT =
+  /\s*[,;()]\s*|\s+(?=(?:but|and|except|excepting|excluding|however|then|while|whereas)\s)|\s+(?=[-\u2013\u2014]{1,2}\s)/i;
+const LIST_ITEM = /^(?:[-*+\u2022]|\d+[.)])\s+/;
+const PURE_NEGATION = /^(?:\w+[,\s]+)?(?:no|nope|never|don'?t|do not|not)\W*$/i;
+
+function placeholders(text: string): number[] {
+  return [...text.matchAll(PLACEHOLDER)].map((match) => Number(match[1]));
+}
+
+function prose(text: string): string {
+  return text.replace(PLACEHOLDER, " ");
+}
+
+/** Analyze `request` against the launch directory. Pure: no filesystem access. */
+export function analyzeRequest(request: string, launchCwd: string): RequestAnalysis {
+  const mentions: PathMention[] = [];
+  const directiveWrite = new Set<number>();
+  const directiveRead = new Set<number>();
+  const maskedLines: Array<{ text: string; directive: boolean }> = [];
+
+  // Pass 1: mask every line; collect directives (a directive with an empty
+  // value applies to the list items that follow it).
+  let pendingDirective: "write" | "read" | null = null;
+  for (const rawLine of request.split(/\r?\n/)) {
+    if (/^\s*(?:```|~~~)/.test(rawLine)) {
+      maskedLines.push({ text: "", directive: true });
+      continue;
+    }
+    const spans = lineMentions(rawLine, launchCwd);
+    let masked = "";
+    let cursor = 0;
+    const indices: number[] = [];
+    for (const span of spans) {
+      masked += normalizeProse(rawLine.slice(cursor, span.start));
+      masked += `${OPEN}${mentions.length}${CLOSE}`;
+      indices.push(mentions.length);
+      mentions.push(span.mention);
+      cursor = span.end;
+    }
+    masked += normalizeProse(rawLine.slice(cursor));
+    const directive = DIRECTIVE.exec(rawLine);
+    if (directive) {
+      const kind = /^(?:writable|write|targets?)$/i.test(directive[1] ?? "") ? "write" : "read";
+      for (const index of indices) (kind === "write" ? directiveWrite : directiveRead).add(index);
+      pendingDirective = indices.length === 0 ? kind : null;
+      maskedLines.push({ text: "", directive: true });
+      continue;
+    }
+    if (pendingDirective && LIST_ITEM.test(masked.trim())) {
+      for (const index of indices) (pendingDirective === "write" ? directiveWrite : directiveRead).add(index);
+      maskedLines.push({ text: "", directive: true });
+      continue;
+    }
+    if (masked.trim()) pendingDirective = null;
+    maskedLines.push({ text: masked, directive: false });
+  }
+
+  // Pass 2: units = sentences, each carrying the header and list intro it sits under.
+  const units: Unit[] = [];
+  let header = "";
+  let intro = "";
+  for (const { text } of maskedLines) {
+    const trimmed = text.trim();
+    if (!trimmed) continue;
+    if (/^#{1,6}\s/.test(trimmed)) {
+      header = trimmed.replace(/^#{1,6}\s+/, "");
+      intro = "";
+      units.push({ text: header });
+      continue;
+    }
+    const isItem = LIST_ITEM.test(trimmed);
+    const body = trimmed.replace(LIST_ITEM, "");
+    const context = [header, isItem ? intro : ""].filter(Boolean).join(": ");
+    for (const sentence of body.split(SENTENCE_SPLIT)) {
+      if (sentence.trim()) units.push({ text: context ? `${context}: ${sentence}` : sentence });
+    }
+    if (!isItem) intro = body.replace(/[:.]\s*$/, "");
+  }
+
+  const tainted = mentions.map(() => false);
+  const granted = mentions.map(() => false);
+  const mutationAimed = mentions.map(() => false);
+  let launchRestricted = false;
+  let anyRestriction = false;
+  const onlyTargets: number[] = [];
+  let previousPaths: number[] = [];
+
+  for (const unit of units) {
+    const text = unit.text;
+    const paths = placeholders(text);
+    const words = prose(text);
+    const restricted = RESTRICTION.test(text);
+    const hasOnly = ONLY.test(words) && !/\b(?:not|n't)\s+only\b/i.test(words);
+    const mutation = MUTATION.test(words);
+    if (restricted || (hasOnly && paths.length === 0)) anyRestriction = true;
+    for (const index of paths) if (mutation) mutationAimed[index] = true;
+
+    if (paths.length === 0) {
+      if ((restricted || hasOnly) && LAUNCH_LOCATION.test(words)) launchRestricted = true;
+      // "Modify /R? No." — a bare negation retracts the previous sentence.
+      if (PURE_NEGATION.test(words.trim())) for (const index of previousPaths) tainted[index] = true;
+      continue;
+    }
+    previousPaths = paths;
+
+    if (hasOnly && mutation && !restricted) onlyTargets.push(...paths);
+
+    if (!restricted) {
+      if (mutation) for (const index of paths) granted[index] = true;
+      continue;
+    }
+
+    // Narrow exceptions for a sentence with a restriction word.
+    const removalFrom =
+      paths.length === 1 && REMOVAL.test(words) && !RESTRICTION.test(text.replace(/\bfrom\s+["'`]?\uE000/gi, " "));
+    if (removalFrom) {
+      granted[paths[0]!] = true;
+      continue;
+    }
+    const clauses = text.split(CLAUSE_SPLIT).filter((clause) => clause.trim());
+    // A clause holding only paths ("…, /b", "and /c") continues the previous
+    // clause's list: it inherits its verb and, fail-safe, its restriction.
+    let previous = { mutation: false, restricted: false };
+    const clauseInfo = clauses.map((clause) => {
+      const clauseWords = prose(clause);
+      const clausePaths = placeholders(clause);
+      const pathOnly = /^[\s,&]*(?:(?:and|or|nor|plus|&)\s*)?[\s,]*$/i.test(clauseWords);
+      const clauseRestricted = RESTRICTION.test(clause) || (pathOnly && previous.restricted);
+      const clauseMutation = MUTATION.test(clauseWords) || (pathOnly && previous.mutation);
+      previous = { mutation: clauseMutation, restricted: clauseRestricted };
+      return { clausePaths, restricted: clauseRestricted, clauseMutation, clauseWords };
+    });
+    const restrictionsAttached = clauseInfo
+      .filter((info) => info.restricted)
+      .every((info) => info.clausePaths.length > 0 && !PRONOUN.test(info.clauseWords));
+    for (const info of clauseInfo) {
+      for (const index of info.clausePaths) {
+        if (restrictionsAttached && !info.restricted && info.clauseMutation) granted[index] = true;
+        else tainted[index] = true;
+      }
+    }
+  }
+
+  // "Only change /T": every other path is read-only.
+  if (onlyTargets.length > 0) {
+    const onlyPaths = new Set(onlyTargets.map((index) => mentions[index]?.path));
+    mentions.forEach((mention, index) => {
+      if (!onlyPaths.has(mention.path)) tainted[index] = true;
+    });
+  }
+
+  const hasDirectives = directiveWrite.size > 0 || directiveRead.size > 0;
+  // Directives win over inference: a directive-written path is never tainted
+  // by prose; a directive-read path always is.
+  const directiveWritePaths = new Set([...directiveWrite].map((index) => mentions[index]?.path));
+  mentions.forEach((mention, index) => {
+    if (directiveWritePaths.has(mention.path)) tainted[index] = false;
+  });
+  for (const index of directiveRead) tainted[index] = true;
+  let directiveConflict: string | null = null;
+  for (const index of directiveWrite) {
+    const path = mentions[index]?.path;
+    if (path && [...directiveRead].some((other) => mentions[other]?.path === path)) directiveConflict = path;
+  }
+
+  const taintedPaths = mentions
+    .map((mention, index) => (tainted[index] && mention.path ? mention.path : null))
+    .filter((path): path is string => path !== null);
+  const writeEligible = (index: number): boolean => {
+    const path = mentions[index]?.path;
+    if (!path) return false;
+    if (taintedPaths.some((excluded) => isWithin(excluded, path))) return false;
+    if (directiveWrite.size > 0) return directiveWritePaths.has(path);
+    return granted[index] === true || directiveWrite.has(index);
   };
 
-  // Clause-wide state cues ("read-only", "unchanged", "leave X alone", …).
-  const prose = clause.replace(PLACEHOLDER, " ");
-  if (STATE_CUE.test(prose) || PASSIVE_PROHIBITION.test(prose)) for (const path of paths) exclude(path, false);
-
-  // Negated mutation verbs: scope runs from the negation to the clause end.
-  for (const match of clause.matchAll(NEGATION)) {
-    const tail = clause.slice(match.index + match[0].length);
-    const words = tail
-      .split(/[\s,()]+/)
-      .map((word) => word.replace(/^["'`*_]+|["'`*_.!?;:]+$/g, ""))
-      .filter(Boolean);
-    for (let i = 0; i < Math.min(words.length, MAX_NEGATION_GAP + 1); i++) {
-      const word = words[i]!;
-      if (word.includes(OPEN) || NEGATION_BLOCKER.test(word)) break;
-      if (NEGATABLE_VERB.test(word)) {
-        for (const path of scoped(clause, paths, match.index)) exclude(path, HARD_VERB.test(word));
-        break;
-      }
-    }
+  // A single path in a request without any restriction is its target.
+  const distinct = new Set(mentions.map((mention) => mention.path ?? mention.raw));
+  if (!hasDirectives && distinct.size === 1 && !anyRestriction && !mentions[0]?.unresolved) {
+    mentions.forEach((_, index) => {
+      granted[index] = true;
+    });
   }
-  for (const match of clause.matchAll(EXCEPT)) {
-    for (const path of scoped(clause, paths, match.index)) exclude(path, false);
-  }
-  for (const match of clause.matchAll(BARE_NOT_BEFORE_PATH)) {
-    for (const path of paths.filter((candidate) => candidate.position >= match.index + match[0].length)) {
-      exclude(path, false);
-      break;
-    }
+  if (directiveWrite.size > 0) {
+    mentions.forEach((_, index) => {
+      granted[index] = directiveWrite.has(index);
+    });
   }
 
-  // Role from the governing verb / preposition.
-  paths.forEach((path, position) => {
-    const intent = intents[path.index]!;
-    const previous = paths[position - 1];
-    const local = clause.slice(previous ? previous.end : 0, path.position);
-    const verb = lastVerb(clause.slice(0, path.position));
-    let role: PathRole = "neutral";
-    const referenceLocal = REFERENCE_LOCAL.exec(local);
-    if (DESTINATION_LOCAL.test(local)) role = "positive";
-    else if (previous && verb && COPY_VERB.test(verb.verb) && COPY_DESTINATION_LOCAL.test(local)) role = "positive";
-    else if (referenceLocal) {
-      role =
-        referenceLocal[1]?.toLowerCase() === "from" && verb && REMOVAL_VERB.test(verb.verb) ? "positive" : "reference";
-    } else if (verb) role = verb.kind === "mutation" ? "positive" : "reference";
-    // Strongest role wins across mentions of the same placeholder (one per index).
-    intent.role = role;
-  });
-}
-
-/** Classify every path mention of `request`. */
-export function classifyPathIntents(request: string, launchCwd: string): PathIntent[] {
-  const mentions = extractPathMentions(request, launchCwd);
-  const intents: PathIntent[] = mentions.map((mention) => ({
-    mention,
-    role: "neutral",
-    excluded: false,
-    hardExcluded: false,
-  }));
-  for (const block of blocks(mask(request, mentions))) {
-    for (const sentence of block.split(SENTENCE_SPLIT)) {
-      for (const clause of sentence.split(CLAUSE_SPLIT)) {
-        if (clause) classifyClause(clause, intents);
-      }
-    }
-  }
-  return intents;
+  return {
+    mentions,
+    tainted,
+    granted,
+    mutationAimed,
+    hasDirectives,
+    directiveConflict,
+    launchRestricted,
+    anyRestriction,
+    writeEligible,
+  };
 }

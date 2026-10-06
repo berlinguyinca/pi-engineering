@@ -46,6 +46,53 @@ The pipeline routes intent, creates a durable **mission**, plans/executes
 workers, runs validation, launches a fresh independent reviewer, and enforces
 the deterministic completion gate — no `/engineer` or `/review` needed.
 
+### Workspace scope
+
+A mission may write only to the repositories it was clearly asked to change.
+State the scope with directive lines. They take priority over everything else
+in the request:
+
+```text
+writable: /home/me/src/service, /home/me/src/client
+read-only: /home/me/src/shared-lib
+Port the retry logic from shared-lib into both apps.
+```
+
+Recognized keys (case-insensitive; also as list items, inside a fenced block,
+or as `do not modify:` followed by a list): `writable:`, `write:`, `target:`,
+`targets:` grant write; `read-only:`, `readonly:`, `read only:`,
+`reference:`, `references:`, `do not modify:` grant read only. If any
+`writable:`/`target:` line is present, no other path is writable. A path that
+is named both writable and read-only is refused. So is a writable root that
+contains a read-only path, because a writable root cannot have a read-only
+hole inside it.
+
+Without directives the request text is read conservatively:
+
+- A path is writable only if a change verb (fix, add, implement, update,
+  install, refactor, …) is aimed at it, and its sentence (with the list intro
+  or markdown header it sits under) contains no restriction word. Restriction
+  words include: not, no, never, don't, avoid, skip, ignore, exclude, except,
+  without, leave, keep, remain, stay, as is, hands off, off-limits, refrain,
+  forbidden, read-only, reference, look at, analyze, review, compare, copy,
+  mirror, follow, based on, and `from /path`. One exception: in
+  `Fix /a, but don't touch /b`, /a stays writable. This applies only when the
+  restriction sits in its own clause (split on `,` `;` `but` `and` `except`),
+  and that clause names its own path and no pronoun.
+- A path that is read-only anywhere in the request is read-only everywhere,
+  and so is everything inside it.
+- `Only change /a` makes every other named path read-only.
+- The launch directory is the default target only when the request names no
+  path and puts no restriction on "here", "the repo", "anything" and so on.
+  The resolver never substitutes the launch directory for a named path. A
+  missing path such as a typo, an uncloned repository or `~/x` is refused.
+  So is a path it cannot expand, such as `$HOME/x`, `C:\x`, `~user/x`, or
+  `../x` outside the launch directory.
+
+When the request does not grant write clearly, the mission is refused with a
+message that names the directive syntax. Adding one `writable:` line is the
+fix.
+
 ### Switching the model a mission uses
 
 An explicit switch with `/model` (or model cycling) becomes the **operator
