@@ -4,8 +4,16 @@
  * tool already reported it cannot run in this session.
  */
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
+import { promisify } from "node:util";
 import extension from "../../extensions/index.ts";
+import { MISSION_UNAVAILABLE_RETRY_TURNS } from "../../src/orchestration/autoInvoke.ts";
+
+const execFileAsync = promisify(execFile);
 
 type Handler = (event: unknown, ctx?: unknown) => unknown;
 
@@ -112,4 +120,81 @@ test("a later successful mission call re-enables auto-invoke after a transient n
     | { message?: { customType?: string } }
     | undefined;
   assert.equal(injected?.message?.customType, "pi-engineering:auto-invoke");
+});
+
+test("auto-invoke re-enables after enough user turns since the mission tool reported unavailable (PR #106 re-review)", async () => {
+  const handlers = loadExtension();
+  const hook = autoInvokeHandler(handlers);
+  await missionResultWatcher(handlers)(missionResult("Orchestrator not initialized for this directory."), {
+    mode: "tui",
+  });
+  for (let turn = 1; turn <= MISSION_UNAVAILABLE_RETRY_TURNS; turn++) {
+    assert.equal(
+      await hook({ type: "before_agent_start", prompt: `${PROMPT} variant ${turn}` }, { mode: "tui" }),
+      undefined,
+      `turn ${turn} stays quiet`,
+    );
+  }
+  const injected = (await hook({ type: "before_agent_start", prompt: `${PROMPT} once more` }, { mode: "tui" })) as
+    | { message?: { customType?: string } }
+    | undefined;
+  assert.equal(injected?.message?.customType, "pi-engineering:auto-invoke");
+});
+
+test("an explicit /mission that reaches an initialized orchestrator re-enables auto-invoke (PR #106 re-review)", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-eng-auto-invoke-mission-"));
+  try {
+    await execFileAsync("git", ["init", "-q"], { cwd: root });
+    await execFileAsync(
+      "git",
+      ["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-qm", "init"],
+      { cwd: root },
+    );
+    const commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<void> }>();
+    const handlers = new Map<string, Handler[]>();
+    (extension as unknown as (pi: unknown) => void)({
+      on: (name: string, handler: Handler) => handlers.set(name, [...(handlers.get(name) ?? []), handler]),
+      registerCommand: (name: string, command: { handler: (args: string, ctx: unknown) => Promise<void> }) =>
+        commands.set(name, command),
+      registerTool: () => {},
+      registerShortcut: () => {},
+      registerFlag: () => {},
+      getFlag: () => undefined,
+      registerMessageRenderer: () => {},
+      registerMarkdownTransformer: () => {},
+      registerEntryRenderer: () => {},
+      setModel: async () => false,
+      events: { on: () => {}, emit: () => {} },
+    });
+    const hook = autoInvokeHandler(handlers);
+    await missionResultWatcher(handlers)(missionResult("Orchestrator not initialized for this directory."), {
+      mode: "tui",
+    });
+    assert.equal(await hook({ type: "before_agent_start", prompt: PROMPT }, { mode: "tui" }), undefined);
+    const notices: string[] = [];
+    await commands.get("mission")!.handler("resume MSN-does-not-exist", {
+      cwd: root,
+      mode: "tui",
+      signal: undefined,
+      model: undefined,
+      modelRegistry: undefined,
+      getContextUsage: () => undefined,
+      isIdle: () => true,
+      ui: {
+        notify: (text: string) => notices.push(text),
+        custom: () => ({ close: () => {} }),
+        setFooter: () => {},
+        onTerminalInput: () => () => {},
+        setStatus: () => {},
+        setWidget: () => {},
+      },
+    });
+    assert.ok(!notices.some((text) => /not initialized/.test(text)), JSON.stringify(notices));
+    const injected = (await hook({ type: "before_agent_start", prompt: `${PROMPT} today` }, { mode: "tui" })) as
+      | { message?: { customType?: string } }
+      | undefined;
+    assert.equal(injected?.message?.customType, "pi-engineering:auto-invoke");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });

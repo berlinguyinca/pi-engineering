@@ -29,6 +29,12 @@ const workflowRank = (w: WorkflowClass): number => WORKFLOW_ORDER.indexOf(w);
 export const AUTO_INVOKE_MIN_CONFIDENCE = 0.6;
 /** Prompts with fewer words than this are treated as chat, not a mission request. */
 export const AUTO_INVOKE_MIN_WORDS = 4;
+/**
+ * User turns after which a "not initialized" mission tool is tried again.
+ * Auto-invoke is what calls the tool, so without a retry the flag could only
+ * clear on a call that auto-invoke itself suppresses.
+ */
+export const MISSION_UNAVAILABLE_RETRY_TURNS = 20;
 /** Re-submits of the same prompt within this window are harness retries. */
 const RESUBMIT_WINDOW_MS = 30_000;
 
