@@ -1,57 +1,78 @@
 /**
  * Planner/Worker execution mode — domain contracts.
  *
- * Engineering missions split into a cheap fast model that plans (structured
- * task contracts forming a DAG) and a strong coder model that implements each
- * contract, with the fast model reviewing. Models are NEVER named here: roles
- * resolve to models through capability requirements, deployment aliases, and
- * preferred model families, and the actual alias→model binding lives in
- * InferWeave. That is what makes the backing model of a role swappable at
- * runtime without touching this code or the Pi session.
+ * Engineering missions split cognitive roles across models: a planner turns the
+ * mission into structured task contracts forming a DAG, implementers carry out
+ * each contract in an isolated worktree, and a reviewer judges each result.
+ * Models are NEVER named here: roles resolve to models through capability
+ * requirements, deployment aliases and preferred model families, and the actual
+ * alias→model binding lives in the gateway (InferWeave). That is what makes the
+ * backing model of a role swappable at any inference boundary without touching
+ * this code or the Pi session.
  *
- * Responsibilities: this module owns planning, contracts, review, correction,
- * escalation, convergence, handoffs and role/model telemetry. It does not own
- * model hosting, routing, capacity or lifecycle — that is InferWeave's.
+ * This module owns planning, contracts, review, correction, escalation,
+ * convergence, handoffs and role/model telemetry. It does not own model hosting,
+ * routing, capacity or lifecycle — that belongs to the gateway.
  */
 
-/** Roles the planner/worker mode assigns. Kept small on purpose. */
-export const PLANNER_WORKER_ROLES = ["planner", "implementer", "reviewer", "escalation"] as const;
+/** Execution modes selectable with `/engineering-mode`. */
+export const ENGINEERING_MODES = ["auto", "planner-worker", "single"] as const;
+export type EngineeringMode = (typeof ENGINEERING_MODES)[number];
+
+/** Cognitive roles the planner/worker mode assigns. */
+export const PLANNER_WORKER_ROLES = [
+  "planner",
+  "researcher",
+  "implementer",
+  "reviewer",
+  "debugger",
+  "fixer",
+  "escalation",
+] as const;
 export type PlannerWorkerRole = (typeof PLANNER_WORKER_ROLES)[number];
 
-/**
- * Per-contract lifecycle. Distinct from the mission-level TaskStatus: this is
- * the contract's execution state as tracked by the planner/worker executor.
- */
-export type ContractStatus =
-  | "pending"
-  | "ready"
-  | "running"
-  | "reviewing"
-  | "needs_fix"
-  | "blocked"
-  | "passed"
-  | "failed"
-  | "escalated";
+export type ContractRisk = "low" | "medium" | "high";
 
-/** One structured task contract: the planner's output unit. */
+/** Per-contract lifecycle (spec §4). */
+export const CONTRACT_STATUSES = [
+  "pending",
+  "ready",
+  "running",
+  "reviewing",
+  "needs_fix",
+  "blocked",
+  "passed",
+  "failed",
+  "escalated",
+] as const;
+export type ContractStatus = (typeof CONTRACT_STATUSES)[number];
+
+/** Write scope of a contract: repository-relative globs. */
+export interface ContractScope {
+  allowed: string[];
+  forbidden: string[];
+}
+
+/** One structured task contract: the planner's output unit (spec §3). */
 export interface TaskContract {
-  id: string;
+  task_id: string;
   /** What must be true when this contract is done. */
   objective: string;
   /** Contract ids that must have passed before this one runs. */
   depends_on: string[];
-  /** Write-scope paths (directories or files) the contract may touch. */
-  scope: string[];
-  /** Machine-checkable acceptance criteria. */
+  scope: ContractScope;
+  /** Checkable acceptance criteria. */
   acceptance: string[];
-  /** Deterministic verification commands/checks that must pass. */
+  /** Deterministic verification commands that must exit 0. */
   verification: string[];
   /** Hard constraints the implementer must respect. */
   constraints: string[];
-  /** Per-contract risk; drives the review plan. */
-  risk: "low" | "medium" | "high";
-  /** Files most relevant to the contract (bounded; not a transcript). */
-  relevant_files?: string[];
+  /** Drives review frequency (spec §20). */
+  risk: ContractRisk;
+  /** Files most relevant to the contract (bounded; never a transcript). */
+  relevant_files: string[];
+  /** Planner decisions the implementer must follow (bounded). */
+  decisions: string[];
 }
 
 /** Bounded mission summary handed to the planner and every worker. */
@@ -59,144 +80,129 @@ export interface MissionBrief {
   mission_id: string;
   /** One-paragraph summary of the mission (bounded). */
   summary: string;
-  goal: string;
   /** Architectural context lines (bounded, verified). */
   architectural_context: string[];
   acceptance_criteria: string[];
   constraints: string[];
-  repository: string;
-  risk_profile: "low" | "medium" | "high" | "critical";
 }
 
-/** A model as InferWeave (or any gateway) advertises it. No hardcoded names. */
-export interface CatalogModel {
-  /** "provider/model-id" exactly as the gateway names it. */
-  model: string;
-  /** Deployment alias this model serves (e.g. "coding-implementation"). */
-  alias?: string;
-  /** Opaque family tag (e.g. "fast_reasoning", "code_implementation"). */
-  family?: string;
-  capabilities: string[];
-  contextWindow: number;
-  modalities: string[];
-  tools: boolean;
-  structuredOutput: boolean;
-  healthy: boolean;
-  /** Current load 0..1 reported by the gateway. */
-  load: number;
-  queuedJobs: number;
-  /** Resident in InferWeave: switching to it is cheap (no load latency). */
-  resident: boolean;
-  /** Recent-failure penalty 0..1 (failure-aware switching). */
-  penalty?: number;
+/** The planner's structured output. */
+export interface PlannerOutput {
+  contracts: TaskContract[];
+  /** Mission-wide decisions every handoff carries. */
+  decisions: string[];
+  architectural_context: string[];
 }
 
-/**
- * A role's model requirement: capability requirements (hard) plus
- * alias/family preferences (soft). This is the stable interface between pi
- * roles and InferWeave — never a model id.
- */
-export interface RoleModelSpec {
-  role: PlannerWorkerRole;
-  /** Hard capability requirements. */
-  requires: string[];
-  /** Preferred deployment alias (soft; deployment-defined, not a model id). */
-  preferred_alias?: string;
-  /** Preferred model family (soft; deployment-defined). */
-  preferred_family?: string;
-  /** Prefer a resident (already-loaded) model when equally capable. */
-  prefer_resident?: boolean;
-  /** Minimum context window the handoff must fit into. */
-  min_context?: number;
-}
-
-export interface RejectedCandidate {
-  model: string;
-  stage: "health" | "capability" | "context" | "excluded" | "denied";
-  reason: string;
-}
-
-/** Full, explainable resolution decision (mirrors the capability router's shape). */
-export interface RoleResolutionDecision {
-  role: PlannerWorkerRole;
-  selected: CatalogModel | null;
-  candidates: Array<{ model: string; score: number }>;
-  rejected: RejectedCandidate[];
-  rationale: string[];
-}
-
-/** One issue a reviewer raises against a contract's implementation. */
+/** One issue a reviewer raises against an implementation. */
 export interface ReviewIssue {
   severity: "blocking" | "major" | "minor";
   summary: string;
   file?: string;
 }
 
-/** Structured review verdict: the reviewer's ONLY output shape. */
+export type ReviewStatus = "pass" | "needs_fix" | "replan" | "escalate";
+
+/** Structured review verdict: the reviewer's ONLY output shape (spec §5). */
 export interface ReviewVerdict {
-  status: "pass" | "needs_fix" | "replan" | "escalate";
+  status: ReviewStatus;
   issues: ReviewIssue[];
   required_changes: string[];
   /** The implementation violated the contract's scope/acceptance/constraints. */
   contract_violation: boolean;
-  evidence?: string;
 }
 
 /**
- * A bounded correction contract: what to change next, generated from a failed
- * review. Never "fix the review comments" — a concrete, bounded re-statement.
+ * A bounded correction contract generated from a failed review or failed
+ * verification (spec §6). Never "fix the review comments".
  */
 export interface CorrectionContract {
-  contract_id: string;
+  task_id: string;
   attempt: number;
-  /** Bounded: at most MAX_CORRECTION_CHANGES entries. */
+  objective: string;
   required_changes: string[];
-  /** Bounded: at most MAX_CORRECTION_ISSUES entries, blocking/major first. */
   issues: ReviewIssue[];
-  /** Verification that must pass for the correction to count. */
   verification: string[];
+  /** Scope is inherited and may only narrow, never widen. */
+  scope: ContractScope;
 }
 
+/** What a finished dependency hands to its dependents (no transcripts). */
 export interface DependencyResult {
-  contract_id: string;
+  task_id: string;
   summary: string;
   changed_files: string[];
-  evidence_refs: string[];
 }
 
+export type HandoffKind = "planner_to_worker" | "worker_to_reviewer" | "reviewer_to_fixer" | "to_escalation";
+
 /**
- * The structured handoff between roles — the stable interface for passing
- * work. A planner→worker handoff carries the mission summary, architectural
- * context, the contract, dependency results and relevant files. It never
- * carries the planner's full transcript.
+ * The compact handoff between roles (spec §18) — the stable interface between
+ * agents. It never carries the planner's reasoning transcript.
  */
 export interface HandoffArtifact {
-  kind: "planner_to_worker" | "worker_to_reviewer" | "reviewer_to_corrector" | "dependency_result";
-  from_role: PlannerWorkerRole | "mission";
+  kind: HandoffKind;
+  mission_id: string;
+  task_id: string;
+  from_role: PlannerWorkerRole;
   to_role: PlannerWorkerRole;
   mission_summary: string;
   architectural_context: string[];
-  contract: TaskContract;
-  dependency_results: DependencyResult[];
+  objective: string;
   relevant_files: string[];
+  decisions: string[];
+  constraints: string[];
+  acceptance: string[];
+  verification: string[];
+  scope: ContractScope;
+  dependency_results: DependencyResult[];
   correction?: CorrectionContract;
   /** Worker outcome attached for worker→reviewer handoffs. */
-  worker_outcome?: { status: string; summary: string; evidence_refs: string[]; changed_files: string[] };
-  /** Rough token estimate of this handoff (compatibility checks use it). */
+  worker_outcome?: { summary: string; changed_files: string[]; diff: string; verification: VerificationRun[] };
+  /** Rough token estimate (chars/4) used by the compatibility check. */
   token_estimate: number;
 }
 
-export type CompatibilityVerdict =
-  | { compatible: true; notes: string[] }
-  | {
-      compatible: false;
-      reasons: string[];
-      /** compact: the handoff can be shrunk to fit; reject: it cannot. */
-      remedy: "compact" | "reject";
-    };
+/** One verification command run. */
+export interface VerificationRun {
+  command: string;
+  exit_code: number;
+  passed: boolean;
+  /** Bounded tail of the combined output. */
+  output_tail: string;
+  duration_ms: number;
+}
 
-/** Every role/model transition is an explicit, observable event. */
+/** Escalation ladder configuration (spec §8). */
+export interface EscalationLadder {
+  /** Implementation attempts by the local implementer before diagnosis. */
+  max_local_attempts: number;
+  /** Local retries after a debugger diagnosis before frontier escalation. */
+  max_diagnosed_attempts: number;
+  /** Escalation-model attempts before the contract fails. */
+  max_escalation_attempts: number;
+  /** Replans allowed per mission (BLOCKED+evidence / replan verdicts). */
+  max_replans: number;
+}
+
+export const DEFAULT_ESCALATION_LADDER: EscalationLadder = {
+  max_local_attempts: 2,
+  max_diagnosed_attempts: 1,
+  max_escalation_attempts: 1,
+  max_replans: 2,
+};
+
+/** Convergence configuration (spec §21). */
+export interface ConvergenceConfig {
+  /** Attempts with no measurable progress before LOCAL_LOOP_STALLED. */
+  stall_after: number;
+}
+
+export const DEFAULT_CONVERGENCE: ConvergenceConfig = { stall_after: 2 };
+
+/** Every role/model transition is an explicit, observable event (spec §12). */
 export interface ModelTransitionEvent {
+  type: "MODEL_TRANSITION";
   seq: number;
   at: string;
   from: string | null;
@@ -204,74 +210,67 @@ export interface ModelTransitionEvent {
   reason: string;
   task: string;
   role: PlannerWorkerRole;
+  /** How the context crossed the boundary (spec §17). */
+  context: "handoff" | "compact" | "direct";
 }
 
-/** Convergence failure: the same failure keeps repeating locally. */
+/** Convergence failure (spec §21). */
 export interface LocalLoopStalledEvent {
+  type: "LOCAL_LOOP_STALLED";
   at: string;
-  contract_id: string;
+  task_id: string;
   attempts: number;
-  failure_signature: string;
+  reasons: string[];
 }
 
-/** Per (role, model) accounting. */
+/** Per (role, model) accounting (spec §22). */
 export interface RoleModelMetrics {
   role: PlannerWorkerRole;
   model: string;
   invocations: number;
-  tokens_in: number;
-  tokens_out: number;
-  cache_read: number;
-  tool_calls: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  cached_tokens: number;
   wall_time_ms: number;
+  tool_calls: number;
   retries: number;
   failures: number;
+  review_failures: number;
+  accepted_tasks: number;
+  rejected_tasks: number;
   escalations: number;
-  findings: number;
 }
-
-/** Escalation ladder configuration (configurable repeated failures). */
-export interface EscalationLadder {
-  /** Failed attempts on one contract before the escalation role is used. */
-  max_local_attempts: number;
-  /** Failed escalation attempts before the contract is parked for a human. */
-  max_escalation_attempts: number;
-  /** Replans allowed for BLOCKED+evidence / contract violation. */
-  max_replans: number;
-}
-
-export const DEFAULT_ESCALATION_LADDER: EscalationLadder = {
-  max_local_attempts: 2,
-  max_escalation_attempts: 1,
-  max_replans: 2,
-};
 
 /** Contract-level state tracked by the executor. */
 export interface ContractState {
   contract: TaskContract;
   status: ContractStatus;
+  /** Implementation attempts so far (all models). */
   attempt: number;
-  escalation_attempt: number;
-  replans: number;
+  /** Which ladder rung the contract is on. */
+  rung: "local" | "diagnosed" | "escalated";
   last_model: string | null;
   correction: CorrectionContract | null;
-  failure_signatures: string[];
-  /** Evidence: summaries of what happened each attempt. */
-  history: Array<{ at: string; status: ContractStatus; note: string }>;
+  changed_files: string[];
+  summary: string;
+  worktree: string | null;
+  history: Array<{ at: string; from: ContractStatus; to: ContractStatus; note: string }>;
   stalled?: LocalLoopStalledEvent;
   blocked_reason?: string;
 }
 
-/** The executor's full report: everything an operator or benchmark can read. */
+export type PlannerWorkerOutcome = "completed" | "failed" | "escalated" | "stalled" | "rejected";
+
+/** The executor's full report: everything an operator or benchmark reads. */
 export interface PlannerWorkerReport {
   mission_id: string;
   mode: "planner-worker";
-  status: "completed" | "failed" | "escalated" | "stalled";
+  status: PlannerWorkerOutcome;
   contracts: ContractState[];
   transitions: ModelTransitionEvent[];
   stalled_events: LocalLoopStalledEvent[];
   metrics: RoleModelMetrics[];
+  replans: number;
   wall_time_ms: number;
-  evidence_refs: string[];
   failure_reason: string | null;
 }
