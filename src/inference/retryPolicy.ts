@@ -39,12 +39,12 @@ export const DEFAULT_STREAM_RETRY_POLICY: StreamRetryPolicyConfig = {
 };
 
 /** How the policy resolved the wait before the next attempt. */
-export type RetryDelaySource = "server" | "server_plus_ladder" | "ladder" | "exhausted" | "disabled";
+export type StreamRetryDelaySource = "server" | "server_plus_ladder" | "ladder" | "exhausted" | "disabled";
 
 export interface RetryDecision {
   shouldRetry: boolean;
   delayMs: number;
-  source: RetryDelaySource;
+  source: StreamRetryDelaySource;
   /** 1-based attempt that just failed. */
   attempt: number;
   attemptsUsed: number;
