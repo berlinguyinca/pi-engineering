@@ -12,8 +12,9 @@
  *
  * Retention is bounded: whatever the next generation has not re-claimed
  * within the handback window (PI_ENGINEERING_RELOAD_CUSTODY_MS, default 30 s)
- * is released, and the Host releases it at once when a handover leaves no
- * runtime running. Otherwise a reload that never re-claims would keep renewing
+ * after the handover ended is released; while the handover is still running
+ * (the new generation loading or starting) the window keeps re-arming. The
+ * Host releases at once when a handover fails or rolls back. Otherwise a reload that never re-claims would keep renewing
  * the leases (they belong to the live session) and lock other sessions out.
  *
  * State lives on `globalThis`: the generation being stopped and the one being
@@ -27,6 +28,8 @@ interface ReloadShutdownState {
   /** Custody kept for the next generation, by key, with how to give it back. */
   retained?: Map<string, () => void>;
   timer?: ReturnType<typeof setTimeout> | null;
+  /** A Host handover is in flight: the next generation may still be loading or starting. */
+  handover?: boolean;
 }
 
 export const DEFAULT_RELOAD_CUSTODY_MS = 30_000;
@@ -67,12 +70,33 @@ export function retainCustody(key: string, release: () => void): void {
   const s = state();
   s.retained ??= new Map();
   s.retained.set(key, release);
+  armHandback(s);
+}
+
+/**
+ * (Re)start the handback window. While a handover is still in flight the new
+ * generation may simply be slow to load or start (a loaded machine), so an
+ * expiring window is re-armed instead of releasing; the Host releases at once
+ * when the handover fails or rolls back.
+ */
+function armHandback(s: ReloadShutdownState): void {
   if (s.timer) clearTimeout(s.timer);
   s.timer = setTimeout(() => {
     s.timer = null;
-    releaseRetainedCustody();
+    if (s.handover) armHandback(s);
+    else releaseRetainedCustody();
   }, handbackMs());
   s.timer.unref?.();
+}
+
+/**
+ * The Host reports handover start/end. At the end, whatever is still retained
+ * gets one more full window (from now) for the new generation to re-claim.
+ */
+export function noteHandover(active: boolean): void {
+  const s = state();
+  s.handover = active;
+  if (!active && (s.retained?.size ?? 0) > 0) armHandback(s);
 }
 
 /** The next generation took `key` over. True when it was retained. */
