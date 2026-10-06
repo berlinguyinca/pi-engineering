@@ -435,3 +435,102 @@ describe("verification commands have an inactivity hang guard, not a duration li
     }
   });
 });
+
+describe("mixed repositories and orphaned verification processes (PR #106 review)", () => {
+  it("detects Cargo/Go checks when package.json has no typecheck/test/build script", async () => {
+    for (const [manifest, content, expect] of [
+      ["Cargo.toml", '[package]\nname = "x"\nversion = "0.1.0"\n', /^cargo test/],
+      ["go.mod", "module example.com/x\n\ngo 1.21\n", /^go test/],
+    ] as const) {
+      const dir = await makeProject({
+        "package.json": JSON.stringify({ scripts: { lint: "biome check .", format: "biome format ." } }),
+        [manifest]: content,
+      });
+      try {
+        for (const full of [false, true]) {
+          const commands = (await new CommandVerifier().detect(dir, { full })).stages.map((s) =>
+            [s.command, ...s.args].join(" "),
+          );
+          assert.ok(
+            commands.some((cmd) => expect.test(cmd)),
+            `${manifest} full=${full}: ${JSON.stringify(commands)}`,
+          );
+        }
+      } finally {
+        await rm(dir, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it("treats npm's placeholder test script as no test script", async () => {
+    const dir = await makeProject({
+      "package.json": JSON.stringify({ scripts: { test: 'echo "Error: no test specified" && exit 1' } }),
+      "Cargo.toml": '[package]\nname = "x"\nversion = "0.1.0"\n',
+    });
+    try {
+      const commands = (await new CommandVerifier().detect(dir)).stages.map((s) => [s.command, ...s.args].join(" "));
+      assert.ok(
+        commands.some((cmd) => /^cargo test/.test(cmd)),
+        JSON.stringify(commands),
+      );
+      assert.ok(!commands.some((cmd) => /no test specified/.test(cmd)), JSON.stringify(commands));
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps npm scripts authoritative when they declare a relevant script", async () => {
+    const dir = await makeProject({
+      "package.json": JSON.stringify({ scripts: { test: "node --test" } }),
+      "Cargo.toml": '[package]\nname = "x"\nversion = "0.1.0"\n',
+    });
+    try {
+      const commands = (await new CommandVerifier().detect(dir)).stages.map((s) => [s.command, ...s.args].join(" "));
+      assert.ok(!commands.some((cmd) => cmd.startsWith("cargo")), JSON.stringify(commands));
+      assert.ok(
+        commands.some((cmd) => cmd.startsWith("node --test")),
+        JSON.stringify(commands),
+      );
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("kills a verification process group when the parent process crashes", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pi-eng-ver-orphan-"));
+    const pidFile = join(dir, "grandchild.pid");
+    const verifierUrl = new URL("../../src/verify/Verifier.ts", import.meta.url).href;
+    const parentScript = join(dir, "parent.ts");
+    await writeFile(
+      parentScript,
+      [
+        `import { existsSync } from "node:fs";`,
+        `import { runWithInactivityGuard } from ${JSON.stringify(verifierUrl)};`,
+        `void runWithInactivityGuard(process.execPath, ["-e", ${JSON.stringify(
+          `require("fs").writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); setInterval(() => {}, 1000);`,
+        )}], { cwd: ${JSON.stringify(dir)}, inactivityMs: 600000 });`,
+        `const wait = setInterval(() => { if (existsSync(${JSON.stringify(pidFile)})) { clearInterval(wait); throw new Error("simulated Pi crash"); } }, 20);`,
+      ].join("\n"),
+    );
+    try {
+      const { spawnSync } = await import("node:child_process");
+      const parent = spawnSync(process.execPath, [parentScript], { encoding: "utf8", timeout: 60_000 });
+      assert.match(parent.stderr, /simulated Pi crash/, parent.stderr);
+      const pid = Number(await readFile(pidFile, "utf-8"));
+      const alive = (): boolean => {
+        try {
+          process.kill(pid, 0);
+          return true;
+        } catch {
+          return false;
+        }
+      };
+      for (let i = 0; i < 50 && alive(); i++) await new Promise((r) => setTimeout(r, 100));
+      const survived = alive();
+      if (survived) process.kill(pid, "SIGKILL");
+      assert.equal(survived, false, "the verification process must not outlive the crashed parent");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});

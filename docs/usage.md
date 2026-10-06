@@ -126,6 +126,18 @@ on by default):
 
 `PI_TOOL_CALL_GUARD=0` turns the guard off.
 
+## Verification commands
+
+`/verify` and the mission validators run the repository's own checks. npm
+`typecheck`/`check`, `test` and `build` scripts win when declared (npm's
+`no test specified` placeholder does not count); otherwise the root's
+`Cargo.toml`, `go.mod`, pytest configuration or `Makefile` decide, also in a
+mixed repository whose `package.json` only carries lint/format scripts. Each
+command runs in its own process group, killed after 15 minutes without output.
+When Pi exits — normally or on an uncaught exception — every running
+verification group is killed; a `SIGKILL` of Pi itself cannot run that cleanup,
+so a group can outlive it in that one case.
+
 ## Verifiable roadmap completion
 
 `node scripts/pi-engineering.ts roadmap check` (or `npm run roadmap:check`)
