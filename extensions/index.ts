@@ -41,8 +41,7 @@ import { guardFeedFor } from "../src/guard/streamText.ts";
 import { ModelHealthProvider } from "../src/models/health.ts";
 import { defaultModelsPath, providerBaseUrl, readModelsConfig } from "../src/models/modelsConfig.ts";
 import { refreshConfiguredProviders } from "../src/models/refresh.ts";
-import { classifyIntent, workflowForIntent } from "../src/orchestration/intentRouter.ts";
-import type { Intent, WorkflowClass } from "../src/orchestration/types.ts";
+import { decideAutoInvoke, missionToolReportedUnavailable } from "../src/orchestration/autoInvoke.ts";
 import { PanelController } from "../src/panel/PanelController.ts";
 import { PanelState } from "../src/panel/PanelState.ts";
 import { readCommitContent, readDiffContent, readFileContent } from "../src/panel/content.ts";
@@ -592,42 +591,34 @@ export default function (pi: ExtensionAPI) {
   // parent session stays the long-lived orchestrator, and the mission tool
   // does the heavy lifting. This is a directive, not enforcement: the runtime
   // completion gate is what actually enforces validation/review/completion.
-  // Ordered from passive (conversation/research) to fully-enforced
-  // (engineering_review). Anything at/above `engineering` (incl. `review` and
-  // `security_sensitive`) auto-invokes the mission pipeline.
-  const WORKFLOW_ORDER: WorkflowClass[] = [
-    "conversation",
-    "research",
-    "investigation",
-    "engineering",
-    "review",
-    "engineering_review",
-    "security_sensitive",
-  ];
-  const workflowRank = (w: WorkflowClass) => WORKFLOW_ORDER.indexOf(w);
-  const AUTO_INVOKE_THRESHOLD = workflowRank("engineering");
+  // The decision (bare retry/continue, questions, short chat, --print mode, a
+  // mission tool that already reported unavailable, low confidence) lives in
+  // decideAutoInvoke so it is testable without a pi session.
   let lastAutoInvoked: { prompt: string; at: number } | null = null;
+  let missionToolUnavailable = false;
   // The auto-invoke handler uses pi.on(), which is only available in a real pi
   // session (not in the smoke-test stub). Guard accordingly.
   if (typeof pi.on === "function") {
+    pi.on("tool_result", async (event) => {
+      if (event.toolName !== "mission") return;
+      const text = event.content.map((part) => (part.type === "text" ? part.text : "")).join("\n");
+      if (missionToolReportedUnavailable(text)) missionToolUnavailable = true;
+    });
     pi.on("before_agent_start", async (event, ctx) => {
       const prompt = (event.prompt ?? "").trim();
-      if (!prompt || /^\/\w/.test(prompt)) return; // slash commands already route explicitly
-      // Avoid re-injecting on harness auto-retries of the same prompt.
-      if (lastAutoInvoked && lastAutoInvoked.prompt === prompt && Date.now() - lastAutoInvoked.at < 30_000) return;
-      let intent: Intent[] = [];
-      try {
-        intent = classifyIntent(prompt).intent;
-      } catch {
-        return; // classification must never break the turn
-      }
-      const workflow = workflowForIntent(intent);
-      if (workflowRank(workflow) < AUTO_INVOKE_THRESHOLD) return; // conversation/research only
+      const decision = decideAutoInvoke({
+        prompt,
+        mode: ctx?.mode,
+        missionToolUnavailable,
+        lastAutoInvoked,
+        now: Date.now(),
+      });
+      if (!decision.invoke) return;
       lastAutoInvoked = { prompt, at: Date.now() };
       return {
         message: {
           customType: "pi-engineering:auto-invoke",
-          content: `[pi-engineering] This request expresses engineering intent (workflow: ${workflow}). Act as the long-lived orchestrator: call the \`mission\` tool with this request as the mission request so the runtime plans, executes, validates, reviews, and completes the work as a mission. Do not implement the change directly in this session; delegate it through the mission pipeline.`,
+          content: `[pi-engineering] This request expresses engineering intent (workflow: ${decision.workflow}). Act as the long-lived orchestrator: call the \`mission\` tool with this request as the mission request so the runtime plans, executes, validates, reviews, and completes the work as a mission. Do not implement the change directly in this session; delegate it through the mission pipeline.`,
           display: true,
         },
       };
