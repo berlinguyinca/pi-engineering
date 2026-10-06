@@ -478,4 +478,74 @@ describe("WorkspaceManifestResolver path policy", () => {
     assert.equal(resolved.repositories[0]?.canonicalRoot, launchRepo.root);
     assert.notEqual(resolved.repositories[0]?.canonicalRoot, otherRepo.root);
   });
+
+  it("ignores a quoted filesystem root in prose instead of refusing the mission (session review)", async () => {
+    const repo = await makeFixtureRepo();
+    cleanup.push(repo.cleanup);
+    const root = String.fromCharCode(47);
+    const resolved = await new WorkspaceManifestResolver().resolve(
+      `Make the server mount the app at "${root}" and keep the existing routes`,
+      repo.root,
+    );
+    assert.equal(resolved.repositories[0]?.canonicalRoot, repo.root);
+    assert.equal(resolved.authorizedRoots[0]?.source, "launch_cwd");
+  });
+
+  it("ignores an existing non-repository directory named in prose instead of refusing", async () => {
+    const repo = await makeFixtureRepo();
+    const dataDir = await mkdtemp(join(tmpdir(), "pi-eng-data-"));
+    cleanup.push(repo.cleanup, () => rm(dataDir, { recursive: true, force: true }));
+    const resolved = await new WorkspaceManifestResolver().resolve(
+      `Write the export files under ${dataDir} when the job runs`,
+      repo.root,
+    );
+    assert.equal(resolved.repositories.length, 1);
+    assert.equal(resolved.repositories[0]?.canonicalRoot, repo.root);
+  });
+
+  it("ignores paths named in a negation ('do not touch X')", async () => {
+    const repo = await makeFixtureRepo();
+    const other = await makeFixtureRepo();
+    cleanup.push(repo.cleanup, other.cleanup);
+    const resolved = await new WorkspaceManifestResolver().resolve(
+      `Fix the flaky test in ${repo.root}. Do not touch ${other.root} at all.`,
+      repo.root,
+    );
+    assert.deepEqual(
+      resolved.repositories.map((r) => r.canonicalRoot),
+      [repo.root],
+    );
+    assert.ok(!resolved.authorizedRoots.some((root) => root.canonicalPath === other.root));
+  });
+
+  it("still binds a path whose clause merely contains a negative statement", async () => {
+    const launchCwd = await mkdtemp(join(tmpdir(), "pi-eng-meta-"));
+    const repo = await makeFixtureRepo();
+    cleanup.push(() => rm(launchCwd, { recursive: true, force: true }), repo.cleanup);
+    const resolved = await new WorkspaceManifestResolver().resolve(
+      `The build does not pass in ${repo.root}; fix it`,
+      launchCwd,
+    );
+    assert.equal(resolved.repositories[0]?.canonicalRoot, repo.root);
+    assert.equal(resolved.authorizedRoots[0]?.access, "write");
+  });
+
+  it("binds a second repository described as read-only as a read root, not a writable repository", async () => {
+    const repo = await makeFixtureRepo();
+    const evidence = await makeFixtureRepo();
+    cleanup.push(repo.cleanup, evidence.cleanup);
+    const resolved = await new WorkspaceManifestResolver().resolve(
+      `Implement the importer in ${repo.root}. Use ${evidence.root} as read-only evidence for the expected format.`,
+      repo.root,
+    );
+    assert.deepEqual(
+      resolved.repositories.map((r) => r.canonicalRoot),
+      [repo.root],
+      "only one writable repository, so no cross-repository mutation",
+    );
+    assert.deepEqual(
+      resolved.authorizedRoots.find((root) => root.canonicalPath === evidence.root),
+      { canonicalPath: evidence.root, source: "explicit_user_path", access: "read" },
+    );
+  });
 });

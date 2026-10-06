@@ -29,20 +29,64 @@ function stripUnquotedPunctuation(candidate: string): string {
   return stripped;
 }
 
-function explicitAbsolutePaths(request: string): string[] {
-  const paths: string[] = [];
+interface PathMention {
+  path: string;
+  start: number;
+  end: number;
+}
+
+function explicitPathMentions(request: string): PathMention[] {
+  const mentions: PathMention[] = [];
   const quotedRanges: Array<{ start: number; end: number }> = [];
   for (const match of request.matchAll(/(["'`])(\/.*?)\1/gs)) {
     const candidate = match[2] ?? "";
-    if (isAbsolute(candidate)) paths.push(candidate);
-    quotedRanges.push({ start: match.index, end: match.index + match[0].length });
+    const end = match.index + match[0].length;
+    if (isAbsolute(candidate)) mentions.push({ path: candidate, start: match.index, end });
+    quotedRanges.push({ start: match.index, end });
   }
   for (const match of request.matchAll(/(?<![/:])\/[A-Za-z0-9._~][^\s"'`<>()[\]{}]*/g)) {
     if (quotedRanges.some((range) => match.index >= range.start && match.index < range.end)) continue;
     const candidate = stripUnquotedPunctuation(match[0]);
-    if (candidate.length > 1 && isAbsolute(candidate)) paths.push(candidate);
+    if (candidate.length > 1 && isAbsolute(candidate)) {
+      mentions.push({ path: candidate, start: match.index, end: match.index + match[0].length });
+    }
   }
-  return paths;
+  return mentions;
+}
+
+/** The sentence/clause of `request` containing [start, end): bounded by `.;!?` + space or newlines. */
+function clauseAround(request: string, start: number, end: number): { before: string; after: string } {
+  const boundary = /[.;!?](?=\s|$)|\n/g;
+  let clauseStart = 0;
+  let clauseEnd = request.length;
+  for (const match of request.matchAll(boundary)) {
+    if (match.index < start) clauseStart = match.index + 1;
+    else if (match.index >= end) {
+      clauseEnd = match.index;
+      break;
+    }
+  }
+  return { before: request.slice(clauseStart, start), after: request.slice(end, clauseEnd) };
+}
+
+// Imperative negation directly governing the path (at most three words
+// between), so "the build does not pass in /repo" still names /repo.
+const NEGATION =
+  /\b(?:do not|don'?t|never|must not|should not|shall not|avoid|without|except)\s+(?:[\w'-]+\s+){0,3}["'`]?$/i;
+const MUTATION_VERB = /\b(?:modify|change|edit|write|mutate|alter|commit)\b/i;
+const READ_ONLY = /\bread[- ]?only\b|\bfor reference\b|\breference only\b|\bas (?:a )?reference\b/i;
+
+/**
+ * What the request asks of a mentioned path. A path in a negation ("do not
+ * touch X") is not authority at all; one described as read-only ("use X as
+ * read-only evidence", "do not modify X") may be read but never written.
+ */
+function mentionIntent(request: string, mention: PathMention): "write" | "read" | "ignore" {
+  const { before, after } = clauseAround(request, mention.start, mention.end);
+  const clause = `${before} ${after}`;
+  if (READ_ONLY.test(clause)) return "read";
+  if (NEGATION.test(before)) return MUTATION_VERB.test(before) ? "read" : "ignore";
+  return "write";
 }
 
 /**
@@ -57,9 +101,7 @@ function explicitAbsolutePaths(request: string): string[] {
  */
 function requestRepoReferenceNames(request: string): string[] {
   const names = new Set<string>();
-  for (const match of request.matchAll(
-    /(?<![\w.@/-])([A-Za-z0-9][A-Za-z0-9._-]*)\/([A-Za-z0-9][A-Za-z0-9._-]*)/g,
-  )) {
+  for (const match of request.matchAll(/(?<![\w.@/-])([A-Za-z0-9][A-Za-z0-9._-]*)\/([A-Za-z0-9][A-Za-z0-9._-]*)/g)) {
     names.add(match[2]!);
   }
   for (const match of request.matchAll(/(?<![\w./@-])([A-Za-z0-9][A-Za-z0-9._-]*[A-Za-z0-9_-])/g)) {
@@ -126,22 +168,34 @@ export class WorkspaceManifestResolver {
     // tokens that survive extraction never block resolution. Symlinks are
     // accepted here via lstat; the downstream symlink-boundary check still applies.
     // resolveRepository (legacy explicit repository argument) keeps failing loudly.
-    const existing = (
-      await Promise.all(
-        explicitAbsolutePaths(request).map(async (path) => {
-          try {
-            const stat = await lstat(path);
-            return stat.isDirectory() || stat.isSymbolicLink() ? path : null;
-          } catch {
-            return null;
-          }
-        }),
-      )
-    ).filter((path): path is string => path !== null);
+    //
+    // A path extracted from prose is a candidate, never an obligation: a quoted
+    // "/" or a protected directory, a directory outside any Git repository, and
+    // a path in a negation ("do not touch X") are ignored rather than refusing
+    // the mission. A path described as read-only becomes a read root with no
+    // writable repository binding.
+    const existing: string[] = [];
+    const readOnly: string[] = [];
+    for (const mention of explicitPathMentions(request)) {
+      const intent = mentionIntent(request, mention);
+      if (intent === "ignore") continue;
+      const path = mention.path;
+      try {
+        const stat = await lstat(path);
+        if (!stat.isDirectory() && !stat.isSymbolicLink()) continue;
+      } catch {
+        continue;
+      }
+      if (protectedReason(path)) continue;
+      if (intent === "read") {
+        readOnly.push(path);
+        continue;
+      }
+      if (!(await GitRepo.open(path).catch(() => null))) continue;
+      existing.push(path);
+    }
     let candidates: Array<{ path: string; source: AuthorizedRoot["source"] }> =
-      existing.length > 0
-        ? existing.map((path) => ({ path, source: "explicit_user_path" as const }))
-        : [];
+      existing.length > 0 ? existing.map((path) => ({ path, source: "explicit_user_path" as const })) : [];
     if (candidates.length === 0) {
       // Workspace-parent mode: launching from a directory that is itself not a
       // git checkout (e.g. a projects root containing many checkouts) is a
@@ -157,7 +211,14 @@ export class WorkspaceManifestResolver {
       }
     }
     if (candidates.length === 0) candidates = [{ path: launchCwd, source: "launch_cwd" as const }];
-    return this.resolveCandidates(candidates, launchCwd);
+    const resolved = await this.resolveCandidates(candidates, launchCwd);
+    for (const path of readOnly) {
+      const canonical = await realpath(path).catch(() => null);
+      if (!canonical || protectedReason(canonical)) continue;
+      if (resolved.authorizedRoots.some((root) => root.canonicalPath === canonical)) continue;
+      resolved.authorizedRoots.push({ canonicalPath: canonical, source: "explicit_user_path", access: "read" });
+    }
+    return resolved;
   }
 
   /**
