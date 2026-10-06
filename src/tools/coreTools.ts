@@ -39,6 +39,22 @@ export interface CoreServices {
  * definitions work in the interactive session (resolved by the current cwd) and
  * in worker sessions (bound to the runtime's fixed services).
  */
+/** Why a mission's current stop waits for the user, or null when the runtime may resume it. */
+function awaitingUser(store: Orchestrator["store"], mission: Mission): string | null {
+  if (mission.status === "WAITING_FOR_USER") return "status WAITING_FOR_USER";
+  const generation = store.listMissionResumptions(mission.mission_id).at(-1)?.generation ?? 0;
+  const decision = store
+    .listRecoveryDecisions(mission.mission_id)
+    .filter((candidate) => (candidate.resumptionGeneration ?? 0) === generation)
+    .at(-1);
+  if (!decision) return null;
+  if (decision.action === "WAIT_FOR_REQUIREMENT") return "requirement clarification";
+  const category = store.getFailureClassification(decision.classificationId)?.category;
+  if (category === "AUTHORIZATION_OR_CREDENTIAL") return "authorization or credentials";
+  if (category === "REQUIREMENT_AMBIGUITY") return "requirement clarification";
+  return null;
+}
+
 export function buildCoreTools(
   resolve: (cwd: string) => CoreServices | null | Promise<CoreServices | null>,
   options: {
@@ -310,7 +326,7 @@ export function buildCoreTools(
     name: "mission",
     label: "Mission",
     description:
-      "Run the orchestration mission pipeline for a normal-language engineering request: route intent, plan, execute workers, validate, fresh-review, and gate completion. Use this for implement/fix/refactor/investigate requests so the engineering workflow runs automatically. action=status reports an existing mission; action=resume recovers a stopped/blocked mission (same as /mission resume <id>).",
+      "Run the orchestration mission pipeline for a normal-language engineering request: route intent, plan, execute workers, validate, fresh-review, and gate completion. Use this for implement/fix/refactor/investigate requests so the engineering workflow runs automatically. action=status reports an existing mission; action=resume recovers a stopped/blocked mission (same as /mission resume <id>); a stop that waits for the user is refused.",
     parameters: Type.Object({
       action: Type.Optional(
         Type.Union([Type.Literal("run"), Type.Literal("status"), Type.Literal("resume")], {
@@ -356,6 +372,15 @@ export function buildCoreTools(
         const current = store?.getMission(missionId);
         if (!current) return text(`Unknown mission ${missionId}.`);
         if (action === "status") return describe(current);
+        // Resuming a stop that waits for the user (a requirement question, a
+        // credential the user must fix) is the user's call, not the model's:
+        // the tool refuses and points at the operator command.
+        const awaiting = store ? awaitingUser(store, current) : null;
+        if (awaiting) {
+          return describe(current, [
+            `Resume refused: the mission is waiting for the user (${awaiting}). Ask the user; after they respond they can run /mission resume ${missionId}.`,
+          ]);
+        }
         if (!services.resumeMission) {
           return text(
             `Resume is not available through the tool in this session. Ask the operator to run /mission resume ${missionId}.`,
