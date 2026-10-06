@@ -2,28 +2,34 @@
  * Candidate probe, run in a SEPARATE Node process during validation (spec §16).
  * It covers the runtime initialization test and the hot-reload smoke test.
  *
- *   node probe.ts <candidateDir> <entry> <scratchDir>
+ *   node probe.ts <candidateDir> <entry> <scratchDir> [stateDir]
  *
- * It loads the candidate through a real RuntimeHost, starts it, checks its
- * health, reloads it once and checks that nothing was registered twice. It
- * prints one `PROBE {json}` line. The candidate's code never runs inside the
- * Pi process before it has passed this check. The probe's ExtensionAPI only
+ * Given a state directory whose schema the candidate must migrate, it first
+ * loads the candidate's migrations and dry-runs them on a scratch copy of that
+ * state (the real state is never written). It then loads the candidate through
+ * a real RuntimeHost, starts it, checks its health, reloads it once and checks
+ * that nothing was registered twice. It prints one `PROBE {json}` line. The
+ * candidate's code (runtime AND migrations) never runs inside the Pi process
+ * before it has passed this check. The probe's ExtensionAPI only
  * records what the candidate registers: there is no session, model or UI here.
  */
 
 import { pathToFileURL } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { RuntimeHost } from "../runtime/host/host.ts";
+import { prepareMigration } from "./transaction.ts";
 
 export interface ProbeReport {
   ok: boolean;
-  stage: "load" | "start" | "health" | "reload" | "done";
+  stage: "migration" | "load" | "start" | "health" | "reload" | "done";
   failure?: string;
   commands: string[];
   tools: string[];
   handlers: number;
   handlersAfterReload?: number;
   health?: Array<{ name: string; ok: boolean; detail?: string }>;
+  /** Migrations planned and dry-run against the state (absent: none required or no state given). */
+  migration?: { from: number | null; to: number; ids: string[] };
 }
 
 /** An ExtensionAPI that records registrations and performs no actions. */
@@ -67,11 +73,33 @@ export function recordingApi(): {
   return { api: api as unknown as ExtensionAPI, commands, tools, handlerCount: () => handlers.length };
 }
 
-export async function probeCandidate(candidateDir: string, entry: string, scratchDir: string): Promise<ProbeReport> {
+export async function probeCandidate(
+  candidateDir: string,
+  entry: string,
+  scratchDir: string,
+  stateDir: string | null = null,
+): Promise<ProbeReport> {
+  let migration: ProbeReport["migration"];
+  if (stateDir) {
+    try {
+      const decision = await prepareMigration(candidateDir, stateDir);
+      migration = { from: decision.from, to: decision.to, ids: decision.plan.map((m) => m.id) };
+    } catch (error) {
+      return {
+        ok: false,
+        stage: "migration",
+        failure: error instanceof Error ? error.message : String(error),
+        commands: [],
+        tools: [],
+        handlers: 0,
+      };
+    }
+  }
   const rec = recordingApi();
   const host = new RuntimeHost({ pi: rec.api, generationsDir: scratchDir, handoverWaitMs: 5_000 });
   const report = (r: Omit<ProbeReport, "commands" | "tools" | "handlers">): ProbeReport => ({
     ...r,
+    ...(migration ? { migration } : {}),
     commands: [...rec.commands].sort(),
     tools: [...rec.tools].sort(),
     handlers: rec.handlerCount(),
@@ -104,8 +132,13 @@ export async function probeCandidate(candidateDir: string, entry: string, scratc
 
 const isMain = !!process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
 if (isMain) {
-  const [candidateDir, entry, scratchDir] = process.argv.slice(2);
-  const out = await probeCandidate(candidateDir as string, entry as string, scratchDir as string).catch(
+  const [candidateDir, entry, scratchDir, stateDir] = process.argv.slice(2);
+  const out = await probeCandidate(
+    candidateDir as string,
+    entry as string,
+    scratchDir as string,
+    stateDir || null,
+  ).catch(
     (error: unknown): ProbeReport => ({
       ok: false,
       stage: "load",

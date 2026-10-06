@@ -242,7 +242,8 @@ export class EngineeringHostExtension {
     const host = new RuntimeHost({ pi, generationsDir: this.generationsDir, telemetry: this.telemetry });
     this.host = host;
     host.bridge.registerHostCommand("engineering", {
-      description: "Pi Engineering runtime: reload | update | rollback | version | cancel (and runtime subcommands)",
+      description:
+        "Pi Engineering runtime: reload | update | rollback [--yes] | version | cancel (and runtime subcommands)",
       handler: (args, ctx) => this.command(args, ctx as Ctx),
     });
     cleanupDeadGenerationDirs(join(this.config.installRoot, "generations"));
@@ -250,12 +251,23 @@ export class EngineeringHostExtension {
     this.recovery = await this.recoverOnStartup();
     const start = await this.startupSources();
     const result = await host.start(start[0] as RuntimeSource, start.slice(1));
+    this.startupFallback = startupFallbackText(result, host.activeGeneration()?.source);
+    if (this.startupFallback) {
+      this.telemetry.emit("runtime.health.failed", { failure_reason: this.startupFallback });
+    }
     await this.repairPointersAfterStart(result.ok ? host.activeGeneration()?.source : undefined);
     this.unpublish = publishRuntimeStatus(this, (now) => this.panelLines(now));
     host.bridge.onHostEvent("session_start", (_event, ctx) => this.onSessionStart(ctx as Ctx));
     host.bridge.onHostEvent("session_shutdown", () => this.dispose());
     await this.retain().catch(() => {});
   }
+
+  /**
+   * Set when startup could not run the preferred runtime: installed versions
+   * failed and an older one or the package checkout runs, or nothing runs.
+   * Shown in the status line, `/engineering version` and the panel.
+   */
+  startupFallback: string | undefined;
 
   private unpublish: () => void = () => {};
   private checkTimer: ReturnType<typeof setTimeout> | undefined;
@@ -279,6 +291,16 @@ export class EngineeringHostExtension {
    * Installation stays off unless the operator turned `autoInstall` on.
    */
   private onSessionStart(ctx: Ctx): void {
+    if (this.startupFallback) {
+      try {
+        ctx.ui?.setStatus?.(
+          "pi-engineering-runtime",
+          `Pi Engineering degraded: ${this.startupFallback.split("\n")[0]}`,
+        );
+      } catch {
+        // No UI in this session; /engineering version still says it.
+      }
+    }
     if (this.config.autoUpdateCheck === false) return;
     const prefs = readPreferences(this.layout.preferencesFile);
     if (!prefs.autoCheck) return;
@@ -574,8 +596,16 @@ export class EngineeringHostExtension {
             : `The handover is past the point of cancellation (${task.phase}); it will finish or roll back.`,
         );
       }
-      case "rollback":
-        return this.rollback(argv[1], ctx);
+      case "rollback": {
+        const rest = argv.slice(1);
+        const unknown = rest.find((a) => a.startsWith("-") && a !== "--yes");
+        if (unknown) return notify(ctx, `unknown option ${unknown}\nusage: /engineering rollback [version] [--yes]`);
+        return this.rollback(
+          rest.find((a) => !a.startsWith("-")),
+          ctx,
+          rest.includes("--yes"),
+        );
+      }
       case "version":
         return notify(ctx, this.versionText());
       case "status":
@@ -646,8 +676,13 @@ export class EngineeringHostExtension {
     }
   }
 
-  /** `/engineering rollback [version]`: the same transactional handover as an update (spec §36). */
-  protected async rollback(requested: string | undefined, ctx: Ctx): Promise<void> {
+  /**
+   * `/engineering rollback [version] [--yes]`: the same transactional handover
+   * as an update (spec §36). When restoring the pre-migration checkpoint would
+   * drop state written after the update, it lists what would be lost and
+   * needs `--yes`.
+   */
+  protected async rollback(requested: string | undefined, ctx: Ctx, confirmed = false): Promise<void> {
     const lock = this.lockFor("rollback", ctx);
     if (!lock) return;
     let handedOver = false;
@@ -659,6 +694,20 @@ export class EngineeringHostExtension {
         plan = await planRollback(this.layout, this.journal, active?.source.root ?? null, stateDir, requested);
       } catch (error) {
         return notify(ctx, `Rollback refused: ${error instanceof Error ? error.message : String(error)}`, "warning");
+      }
+      if (plan.loss.paths.length > 0 && !confirmed) {
+        const shown = plan.loss.paths.slice(0, 20);
+        return notify(
+          ctx,
+          [
+            `Rolling back to ${plan.target.version} restores the state checkpoint taken before schema ${plan.migration.from} and discards these files written since the update (${plan.loss.since}):`,
+            ...shown.map((p) => `  ${p}`),
+            ...(plan.loss.paths.length > shown.length ? [`  … and ${plan.loss.paths.length - shown.length} more`] : []),
+            "",
+            `Nothing was changed. To proceed: /engineering rollback${requested ? ` ${requested}` : ""} --yes`,
+          ].join("\n"),
+          "warning",
+        );
       }
       const transaction = `rollback-${plan.target.id}-${randomBytes(3).toString("hex")}`;
       const record = this.journal.begin({
@@ -739,7 +788,7 @@ export class EngineeringHostExtension {
       `Commit        ${short(active?.source.commit)}`,
       `Generation    ${active?.generation ?? "none"}`,
       `Channel       ${prefs.channel}`,
-      `Health        ${host?.lastFailure ? "degraded" : active ? "healthy" : "no runtime"}`,
+      `Health        ${host?.lastFailure || this.startupFallback ? "degraded" : active ? "healthy" : "no runtime"}`,
       "Update",
       `Latest        ${latest?.target?.metadata.version ?? prefs.lastAvailable?.version ?? "-"}`,
       `Status        ${
@@ -844,11 +893,29 @@ export class EngineeringHostExtension {
       "Last reload:",
       ago(host?.lastReloadAt),
     ];
+    if (this.startupFallback) lines.push("", `Startup: ${this.startupFallback}`);
     const pending = host?.pendingTask();
     if (pending) lines.push("", `Handover in progress: ${pending.kind} (${pending.phase})`);
     if (host?.lastFailure) lines.push("", `Last failure: ${host.lastFailure}`);
     return lines.join("\n");
   }
+}
+
+/** What the operator must know about how startup went, or undefined when it ran the preferred runtime. */
+export function startupFallbackText(result: HandoverResult, running: RuntimeSource | undefined): string | undefined {
+  const failures = result.startupFailures ?? [];
+  if (!result.ok) {
+    return `No Pi Engineering runtime could start (${failures.join("; ") || result.failure || "unknown failure"}).`;
+  }
+  if (failures.length === 0 || !running) return undefined;
+  const installedFailed = failures.filter((f) => f.startsWith("installed:"));
+  if (running.label.startsWith("installed:")) {
+    return `Running ${running.label} (${running.version}): ${failures.length} newer runtime(s) failed at startup: ${failures.join("; ")}`;
+  }
+  if (installedFailed.length > 0) {
+    return `Every installed runtime failed at startup; running the package checkout (${running.version}), so installed updates are NOT in effect. Failures: ${failures.join("; ")}`;
+  }
+  return `Running ${running.label} (${running.version}) after: ${failures.join("; ")}`;
 }
 
 export function formatCheck(c: UpdateCheckResult): string {

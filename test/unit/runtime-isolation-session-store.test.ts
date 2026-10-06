@@ -41,6 +41,34 @@ describe("SessionEventStore (per-session streams, merged read)", () => {
     reader.close();
   });
 
+  it("refresh() orders all() exactly as a fresh load() does (merged by timestamp, not appended after own events)", async () => {
+    const ns = await namespace();
+    const mine = SessionEventStore.open({ ...ns, sessionId: "aaaa", worktreeId: "wt" });
+    const other = SessionEventStore.open({ ...ns, sessionId: "bbbb", worktreeId: "wt" });
+    await mine.append(event("a1", "2026-01-01T00:00:01.000Z"));
+    await mine.append(event("a3", "2026-01-01T00:00:03.000Z"));
+    // Another session's event is older than this session's latest one.
+    await other.append(event("b2", "2026-01-01T00:00:02.000Z"));
+    await other.append(event("b4", "2026-01-01T00:00:04.000Z"));
+    assert.deepEqual(
+      mine.refresh().map((e) => e.event_id),
+      ["b2", "b4"],
+    );
+    const fresh = SessionEventStore.open({ ...ns, sessionId: "cccc", worktreeId: "wt" });
+    assert.deepEqual(
+      fresh.all().map((e) => e.event_id),
+      ["a1", "b2", "a3", "b4"],
+    );
+    assert.deepEqual(
+      mine.all().map((e) => e.event_id),
+      fresh.all().map((e) => e.event_id),
+      "refresh() and load() agree",
+    );
+    mine.close();
+    other.close();
+    fresh.close();
+  });
+
   it("refresh() delivers other sessions' later appends exactly once and waits for incomplete records", async () => {
     const ns = await namespace();
     const reader = SessionEventStore.open({ ...ns, sessionId: "reader", worktreeId: "wt" });

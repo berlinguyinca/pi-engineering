@@ -147,6 +147,40 @@ test("/engineering rollback: previous version, named version, migration undone f
   assert.equal(w.ext.layout.readPointer("current"), vB);
 });
 
+test("/engineering rollback refuses to drop state written after the update unless --yes; it says what would be lost", async () => {
+  const w = await world();
+  w.repo.publish({ version: "0.2.1", value: "B", stateSchema: { minReadable: 7, maxReadable: 7, writes: 7 } });
+  await w.run("/engineering update");
+  w.repo.publish({
+    version: "0.3.0",
+    value: "C",
+    stateSchema: { minReadable: 8, maxReadable: 8, writes: 8 },
+    migration: { from: 7, to: 8, behaviour: "ok" },
+  });
+  await w.run("/engineering update");
+  assert.equal(readStateSchema(w.state), 8);
+  const vC = w.ext.layout.readPointer("current") as string;
+  // The new runtime keeps working: a mission written AFTER the migration.
+  await new Promise((r) => setTimeout(r, 20));
+  const newer = JSON.stringify({ schema: 8, items: ["MSN-1", "MSN-2"] });
+  writeFileSync(join(w.state, "missions.json"), newer);
+
+  const notes: string[] = [];
+  const ctx = { cwd: join(w.state, ".."), ui: { notify: (text: string) => notes.push(text) } };
+  await w.ext.command("rollback", ctx);
+  const refusal = notes.join("\n");
+  assert.match(refusal, /--yes/, refusal);
+  assert.match(refusal, /missions\.json/, "names what would be lost");
+  assert.equal(w.ext.layout.readPointer("current"), vC, "nothing rolled back");
+  assert.equal(readFileSync(join(w.state, "missions.json"), "utf8"), newer, "newer state untouched");
+  assert.equal(readStateSchema(w.state), 8);
+
+  await w.ext.command("rollback --yes", ctx);
+  while (w.ext.lock.isHeldByLiveProcess()) await new Promise((r) => setTimeout(r, 5));
+  assert.equal(w.host.lastHandover?.ok, true, w.host.lastHandover?.failure);
+  assert.equal(readStateSchema(w.state), 7, "confirmed: the pre-migration checkpoint is restored");
+});
+
 test("automatic update check: on by default, reports availability, installs nothing (§14)", async () => {
   const w = await world({ autoUpdateCheck: true });
   await new Promise((r) => setTimeout(r, 1));

@@ -19,6 +19,7 @@
  * re-imported from a fresh snapshot of its own immutable directory.
  */
 
+import { rm } from "node:fs/promises";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
   type ActiveRuntimeOperation,
@@ -91,6 +92,8 @@ export interface HandoverResult {
   durationMs: number;
   snapshot?: RuntimeSnapshot;
   health?: RuntimeHealth;
+  /** start(): every source that failed before one came up (or all of them). */
+  startupFailures?: string[];
 }
 
 export class RuntimeBusyError extends Error {
@@ -308,6 +311,7 @@ export class RuntimeHost implements BridgeTarget {
   async start(source: RuntimeSource, fallbacks: RuntimeSource[] = []): Promise<HandoverResult> {
     const started = Date.now();
     let failure = "";
+    const failures: string[] = [];
     for (const candidate of [source, ...fallbacks]) {
       try {
         const live = await this.bringUp(candidate, undefined);
@@ -323,10 +327,11 @@ export class RuntimeHost implements BridgeTarget {
           untouched: false,
           waitedForSafePoint: false,
           durationMs: Date.now() - started,
-          ...(candidate !== source ? { failure } : {}),
+          ...(candidate !== source ? { failure, startupFailures: failures } : {}),
         });
       } catch (error) {
         failure = `${candidate.label}: ${message(error)}`;
+        failures.push(failure);
         this.lastFailure = failure;
       }
     }
@@ -340,6 +345,7 @@ export class RuntimeHost implements BridgeTarget {
       failedStage: "loading",
       waitedForSafePoint: false,
       durationMs: Date.now() - started,
+      startupFailures: failures,
     });
   }
 
@@ -639,6 +645,12 @@ export class RuntimeHost implements BridgeTarget {
         ...(old ? { fromGeneration: old.generation, activeGeneration: old.generation } : {}),
       });
     if (request.kind === "reload") this.telemetry.emit("runtime.reload.started", base);
+    // A handover that ends before the switch never runs its candidate: drop the
+    // snapshot it imported from (never a direct source: that is the checkout).
+    const discardCandidate = async (dir: string) => {
+      if (this.candidateDir === dir) this.candidateDir = undefined;
+      if (!request.source.direct) await rm(dir, { recursive: true, force: true }).catch(() => {});
+    };
 
     // 1. Import the candidate while the old generation keeps serving (§47).
     const generation = ++this.counter;
@@ -663,6 +675,7 @@ export class RuntimeHost implements BridgeTarget {
       try {
         await phase("waiting_safe_point");
       } catch (error) {
+        await discardCandidate(loaded.dir);
         await phase("failed");
         return untouched("waiting_safe_point", error, false);
       }
@@ -683,6 +696,7 @@ export class RuntimeHost implements BridgeTarget {
       if (!sp.reached || this.closing) {
         const reason = !sp.reached && sp.reason === "timeout" ? "timed out waiting for a safe point" : "cancelled";
         this.telemetry.emit("runtime.safe_point.cancelled", { ...base, reason });
+        await discardCandidate(loaded.dir);
         await phase("cancelled");
         return result({
           ok: false,
@@ -722,6 +736,7 @@ export class RuntimeHost implements BridgeTarget {
       // Nothing was stopped: resume the old generation where it was.
       await old?.runtime.resume?.().catch(() => {});
       this.operations.openGate();
+      await discardCandidate(loaded.dir);
       await phase("failed");
       return untouched(error instanceof HandoverAbort ? error.stage : "quiescing", error, waited);
     }

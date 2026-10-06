@@ -9,6 +9,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, test } from "node:test";
+import { currentProcessIdentity, readProcessStartTime } from "../../src/runtime/isolation/processIdentity.ts";
 import {
   type StateMigration,
   applyMigrations,
@@ -71,6 +72,40 @@ test("mutation lock: a lock held by a live process is respected, a dead owner's 
   const handle = new RuntimeMutationLock(file).acquire("crash-recovery");
   assert.equal(handle.owner.pid, process.pid);
   handle.release();
+});
+
+test("mutation lock: records its process incarnation; a lock whose PID was reused is stale (forged start time)", async () => {
+  const file = join(tmp(), "runtime-update.lock");
+  const own = new RuntimeMutationLock(file).acquire("update");
+  const recorded = new RuntimeMutationLock(file).readOwner();
+  assert.equal(recorded?.pid, process.pid);
+  assert.equal(recorded?.processStartTime, currentProcessIdentity().processStartTime);
+  assert.equal(recorded?.bootId, currentProcessIdentity().bootId);
+  own.release();
+
+  // A live PID (a real sleeper), but the recorded start time is not its own:
+  // the process that wrote the lock is gone and the PID was reused.
+  const sleeper = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000)"], { stdio: "ignore" });
+  try {
+    const identity = { ...currentProcessIdentity(), pid: sleeper.pid as number };
+    const forged = { ...identity, processStartTime: "1", token: "t", operation: "update", acquiredAt: "x" };
+    if (readProcessStartTime(sleeper.pid as number).state !== "present") return; // no /proc: nothing to forge
+    writeFileSync(file, JSON.stringify(forged));
+    const lock = new RuntimeMutationLock(file);
+    assert.equal(lock.isHeldByLiveProcess(), false, "PID reused: not held");
+    const handle = lock.acquire("crash-recovery");
+    assert.equal(handle.owner.pid, process.pid);
+    handle.release();
+
+    // The genuine incarnation of the same live PID is respected.
+    const start = readProcessStartTime(sleeper.pid as number);
+    const genuine = { ...forged, processStartTime: start.state === "present" ? start.value : null };
+    writeFileSync(file, JSON.stringify(genuine));
+    assert.equal(new RuntimeMutationLock(file).isHeldByLiveProcess(), true);
+    assert.throws(() => new RuntimeMutationLock(file).acquire("reload"), MutationLockBusyError);
+  } finally {
+    sleeper.kill("SIGKILL");
+  }
 });
 
 test("journal: atomic records, phases, incomplete detection, corrupt detection", () => {

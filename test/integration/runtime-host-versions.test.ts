@@ -163,3 +163,33 @@ test("startup: with no installed version the package checkout runs", async () =>
   await pi.emit({ type: "agent_settled" });
   assert.equal(b.values.at(-1), "PKG");
 });
+
+test("startup: when every installed version fails and the checkout runs, it is reported, not silent", async () => {
+  const { layout, key, b, root } = fresh();
+  const pkg = join(root, "package");
+  writeFixtureRuntime(pkg, key, { value: "PKG" });
+  const prev = await installFixture(layout, key, "0.2.0", "PREV", "throw-create");
+  const cur = await installFixture(layout, key, "0.2.1", "CUR", "throw-start");
+  await layout.activate(prev);
+  await layout.activate(cur);
+  const { host, pi, ext } = await session(root, layout, pkg);
+  assert.equal(host.activeGeneration()?.source.label, "package");
+  await pi.emit({ type: "agent_settled" });
+  assert.equal(b.values.at(-1), "PKG");
+  assert.ok(ext.startupFallback, "the fallback is recorded");
+  assert.match(ext.startupFallback ?? "", /installed runtime/i);
+  assert.match(ext.startupFallback ?? "", /installed:/);
+  assert.match(ext.versionText(), /Startup:/);
+  assert.match(ext.versionText(), /package checkout/);
+  assert.ok(ext.panelLines(Date.now()).some((l) => /Health\s+degraded/.test(l)));
+});
+
+test("startup: when no runtime at all can start, /engineering version says so", async () => {
+  const { layout, key, root } = fresh();
+  const pkg = join(root, "package");
+  writeFixtureRuntime(pkg, key, { value: "PKG", mode: "throw-create" });
+  const { host, ext } = await session(root, layout, pkg);
+  assert.equal(host.activeGeneration(), undefined);
+  assert.match(ext.startupFallback ?? "", /no Pi Engineering runtime could start/i);
+  assert.match(ext.versionText(), /no Pi Engineering runtime could start/i);
+});

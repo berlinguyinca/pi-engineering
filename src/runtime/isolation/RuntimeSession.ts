@@ -7,9 +7,18 @@
  * logical session — same id, same registry generation, one heartbeat timer —
  * instead of looking like a second session: no false stale ownership, no
  * duplicate event writer, no orphaned runtime state.
+ *
+ * Objects on `globalThis` were created by whichever module graph created them,
+ * so a reload must hand them over explicitly or the OLD code keeps running:
+ * the first `ensureRegistered()` from a new module graph re-opens the registry
+ * with that graph's RuntimeRegistry (same file, same registration) and makes
+ * that graph's code the heartbeat/exit driver. SessionEventStore writers are
+ * re-created by the new graph because a reload closes the old generation's
+ * namespaces first; a writer some other caller keeps open across a reload
+ * stays the old instance until it is closed.
  */
 import { randomUUID } from "node:crypto";
-import { mkdirSync, renameSync } from "node:fs";
+import { mkdirSync, renameSync, statSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { ExclusiveFileLock } from "../../platform/eventstore/fileLock.ts";
 import type { LeaseOwner } from "./LeaseManager.ts";
@@ -42,6 +51,16 @@ interface SessionGlobalState {
   exitHookInstalled: boolean;
   metadata: Record<string, unknown>;
   registering: { file: string; promise: Promise<RuntimeRegistry | null> } | null;
+  /**
+   * The newest module graph's entry point for timer and exit-hook work. The
+   * timer and the hook outlive a reload; they call through this, never through
+   * the class that happened to install them.
+   */
+  driver: (() => RuntimeSession) | null;
+  /** Module URL of the code currently driving heartbeats (diagnostics, tests). */
+  driverModule: string | null;
+  /** dev:ino of the registry file this session's handle has open. */
+  registryInode: string | null;
 }
 
 const SESSION_KEY = Symbol.for("pi-engineering.runtime-session.v2");
@@ -57,6 +76,11 @@ function globalState(): SessionGlobalState {
   const holder = globalThis as unknown as Record<symbol, SessionGlobalState | undefined>;
   let state = holder[SESSION_KEY];
   // A session identity belongs to exactly one process.
+  if (state && state.pid === process.pid && !("driver" in state)) {
+    // Created by a module graph that predates the driver hand-over.
+    (state as SessionGlobalState).driver = null;
+    (state as SessionGlobalState).driverModule = null;
+  }
   if (!state || state.pid !== process.pid) {
     state = {
       sessionId: randomUUID(),
@@ -74,6 +98,9 @@ function globalState(): SessionGlobalState {
       exitHookInstalled: false,
       metadata: {},
       registering: null,
+      driver: null,
+      driverModule: null,
+      registryInode: null,
     };
     holder[SESSION_KEY] = state;
   }
@@ -84,6 +111,16 @@ function globalState(): SessionGlobalState {
 export function currentSessionIdentity(): { sessionId: string; startedAt: string; pid: number } {
   const state = globalState();
   return { sessionId: state.sessionId, startedAt: state.startedAt, pid: state.pid };
+}
+
+/** `dev:ino` of a file, or null when it does not exist. */
+function fileInode(file: string): string | null {
+  try {
+    const info = statSync(file);
+    return `${info.dev}:${info.ino}`;
+  } catch {
+    return null;
+  }
 }
 
 function isCorruptDatabase(error: unknown): boolean {
@@ -229,7 +266,10 @@ export class RuntimeSession {
   ensureRegistered(): Promise<RuntimeRegistry | null> {
     const file = registryFileFor(this.stateRoot());
     const state = this.state;
-    if (state.registry && state.registryFile === file && state.generationId) return Promise.resolve(state.registry);
+    if (state.registry && state.registryFile === file && state.generationId) {
+      this.takeOver();
+      return Promise.resolve(state.registry);
+    }
     // Single-flight: concurrent runtime opens in one process register once.
     if (state.registering?.file === file) return state.registering.promise;
     const promise = this.register(file).finally(() => {
@@ -264,6 +304,7 @@ export class RuntimeSession {
       });
       state.registry = registry;
       state.registryFile = file;
+      state.registryInode = fileInode(file);
       state.generationId = record.generationId;
       state.lastHeartbeatMs = record.lastHeartbeatMs;
       emitRuntimeEvent("session.registered", {
@@ -280,6 +321,8 @@ export class RuntimeSession {
       registry.setState(this.sessionId, record.generationId, "healthy");
       this.setHealth("healthy");
       emitRuntimeEvent("runtime.started", { session_id: this.sessionId, generation_id: record.generationId });
+      this.state.driver = () => RuntimeSession.current();
+      this.state.driverModule = import.meta.url;
       this.startHeartbeat();
       this.installExitHook();
       return registry;
@@ -297,6 +340,33 @@ export class RuntimeSession {
     }
   }
 
+  /**
+   * Make THIS module graph's code the session's driver: re-open the registry
+   * with this graph's RuntimeRegistry class (same file and registration; the
+   * old instance is closed) and route the heartbeat and exit hook through
+   * this graph. A no-op when this graph already drives the session.
+   */
+  private takeOver(): void {
+    const state = this.state;
+    state.driver = () => RuntimeSession.current();
+    state.driverModule = import.meta.url;
+    const current = state.registry;
+    if (!current || current instanceof RuntimeRegistry || !state.registryFile) return;
+    try {
+      state.registry = RuntimeRegistry.open(state.registryFile);
+      state.registryInode = fileInode(state.registryFile);
+      emitRuntimeEvent("runtime.reload_takeover", { session_id: this.sessionId, module: import.meta.url });
+    } catch {
+      // Keep the working (older) instance rather than none.
+      return;
+    }
+    try {
+      (current as { close(): void }).close();
+    } catch {
+      // Already closed.
+    }
+  }
+
   /** The open registry, if this session is registered. */
   registry(): RuntimeRegistry | null {
     return this.state.registry;
@@ -304,9 +374,11 @@ export class RuntimeSession {
 
   private startHeartbeat(): void {
     if (this.state.heartbeatTimer) clearInterval(this.state.heartbeatTimer);
+    const state = this.state;
     const timer = setInterval(() => {
-      // Re-resolve through globalThis so a reloaded module's code takes over.
-      RuntimeSession.current().heartbeat();
+      // Through the driver: after a reload the NEW module graph's code runs
+      // (see takeOver), not the class that installed this timer.
+      (state.driver ?? (() => RuntimeSession.current()))().heartbeat();
     }, heartbeatIntervalMs());
     timer.unref?.();
     this.state.heartbeatTimer = timer;
@@ -315,10 +387,11 @@ export class RuntimeSession {
   private installExitHook(): void {
     if (this.state.exitHookInstalled) return;
     this.state.exitHookInstalled = true;
+    const state = this.state;
     // node:sqlite is synchronous, so a graceful unregister fits in 'exit'.
     process.once("exit", () => {
       try {
-        RuntimeSession.current().shutdown("process_exit");
+        (state.driver ?? (() => RuntimeSession.current()))().shutdown("process_exit");
       } catch {
         // Ungraceful paths are repaired by the next startup reconciliation.
       }
@@ -331,12 +404,18 @@ export class RuntimeSession {
    * a NEW generation instead of resurrecting the old one.
    */
   heartbeat(): boolean {
+    this.followQuarantinedRegistry();
     const { registry, generationId } = this.state;
     if (!registry || !generationId) return false;
     try {
       if (registry.heartbeat(this.sessionId, generationId)) {
         this.state.lastHeartbeatMs = Date.now();
-        if (this.state.health === "recovering" || this.state.health === "rebound") this.setHealth("healthy");
+        // A failed heartbeat (e.g. a bounded SQLite busy wait gave up) is
+        // transient: the next successful one clears it.
+        const transient = this.state.health === "degraded" && this.state.healthReason?.startsWith("heartbeat failed");
+        if (this.state.health === "recovering" || this.state.health === "rebound" || transient) {
+          this.setHealth("healthy");
+        }
         emitRuntimeEvent("session.heartbeat", { session_id: this.sessionId });
         return true;
       }
@@ -361,6 +440,41 @@ export class RuntimeSession {
       this.setHealth("degraded", `heartbeat failed: ${error instanceof Error ? error.message : String(error)}`);
       return false;
     }
+  }
+
+  /**
+   * Another session found the registry corrupt and moved it aside
+   * (quarantineAndReopen): our handle still points at the quarantined file.
+   * Detect the swap (different inode at the registry path) and re-open the
+   * fresh database; the heartbeat then re-registers under a new generation
+   * because the fresh database does not know ours. Leases held in the old
+   * database are gone; custody re-validates on every claim and re-takes them.
+   */
+  private followQuarantinedRegistry(): void {
+    const state = this.state;
+    if (!state.registry || !state.registryFile || !state.registryInode) return;
+    const now = fileInode(state.registryFile);
+    // Absent: mid-swap (the repairing session creates the fresh file next).
+    if (now === null || now === state.registryInode) return;
+    let fresh: RuntimeRegistry;
+    try {
+      fresh = RuntimeRegistry.open(state.registryFile);
+    } catch {
+      return; // Retried on the next heartbeat.
+    }
+    const old = state.registry;
+    state.registry = fresh;
+    state.registryInode = fileInode(state.registryFile);
+    try {
+      old.close();
+    } catch {
+      // Already closed / unusable.
+    }
+    emitRuntimeEvent("runtime.recovering", {
+      session_id: this.sessionId,
+      phase: "registry_replaced",
+      reason: "the registry file was replaced (quarantined by another session); re-opened",
+    });
   }
 
   setMetadata(metadata: Record<string, unknown>): void {

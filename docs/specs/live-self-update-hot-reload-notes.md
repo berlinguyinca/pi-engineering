@@ -71,12 +71,14 @@ The one exception is generation 1 at Pi startup: it imports the package
 checkout directly, so the legacy git-based behaviour is unchanged, and a
 baseline copy is taken first so that a failed reload can roll back to the exact
 code generation 1 ran. Installed versions are always snapshotted, so no process
-ever runs code straight out of `versions/`.
+ever runs code straight out of `versions/`. A snapshot whose source contains a
+symlink resolving outside the source tree is refused.
 
 ## Shape
 
 ```
-Pi ── src/runtime/host/extension.ts   EngineeringHostExtension (stable, loaded once)
+Pi ── src/runtime/host/entry.ts       stable shim: imports the Host; on failure loads extensions/index.ts
+       └─ src/runtime/host/extension.ts   EngineeringHostExtension (stable, loaded once)
         ├─ RuntimeHost (host.ts): generations, handover, health, rollback
         │    ├─ PiBridge (piBridge.ts): slots, forwarders, fenced API
         │    ├─ OperationRegistry (operations.ts): safe points, the gate
@@ -90,8 +92,19 @@ Pi ── src/runtime/host/extension.ts   EngineeringHostExtension (stable, load
                              adapter: the unchanged extensions/index.ts factory
 ```
 
-`package.json` `pi.extensions` now points at the Host. `extensions/index.ts`
-itself is unchanged and is the generation's feature code.
+`package.json` `pi.extensions` points at `src/runtime/host/entry.ts`, a tiny
+shim with no imports from the rest of the package. It imports the Host
+dynamically. If the Host throws at import or while installing, the shim removes
+the Host's event handlers, writes one line to stderr, loads
+`extensions/index.ts` directly (no hot reload or self-update) and registers an
+`/engineering` that explains the fallback. `extensions/index.ts` itself is
+unchanged and is the generation's feature code.
+
+If startup has to skip installed runtimes (a broken `current`/`previous`) or no
+runtime starts at all, the Host does not hide it: the status line, the panel's
+Health row and `/engineering version` ("Startup: …") say which runtime runs and
+why the others failed. In particular, "every installed runtime failed; running
+the package checkout" means installed updates are not in effect.
 
 ## User-visible behaviour
 
@@ -99,7 +112,7 @@ itself is unchanged and is the generation's feature code.
 |---|---|
 | `/engineering reload` | Re-reads the runtime source (the checkout, the dev override, or the installed `current`), imports it as a new generation, and hands over. The same Pi process and conversation continue. |
 | `/engineering update [--check] [--force] [--channel stable\|main] [--commit <sha>] [--verify-full]` | Runs CHECK → FETCH → STAGE → VALIDATE → install → handover → COMMIT. `--check` writes nothing except the download cache. |
-| `/engineering rollback [version]` | Runs the same journaled handover to a retained version. If the state was migrated past what the target can read, it is restored from that migration's checkpoint. |
+| `/engineering rollback [version] [--yes]` | Runs the same journaled handover to a retained version. If the state was migrated past what the target can read, it is restored from that migration's checkpoint. Files under the checkpointed paths written after that update committed would be discarded: the command lists them and changes nothing unless `--yes` is given. |
 | `/engineering version` | Shows version, commit, channel, runtime API, generation, state schema, Pi compatibility, previous version, last update and last reload. |
 | `/engineering status` | Shows the panel's Runtime/Update section as text. |
 | `/engineering cancel` | Cancels a handover that is still waiting for a safe point. |
@@ -144,9 +157,68 @@ unless `autoInstall` is set in `update-preferences.json`.
 - **Legacy `/update` only works when generation 1 runs from the git checkout.**
   A generation loaded from a snapshot reports "not a git checkout". Use
   `/engineering update`.
-- **Dependencies.** An unchanged lockfile reuses the running dependency tree.
-  A changed one runs `npm ci --ignore-scripts` in staging
+- **Dependencies.** An unchanged lockfile gives the candidate a hard-linked
+  copy of the running dependency tree (`cp -al` semantics; copied where the
+  filesystem cannot hard-link). Every installed version owns its own
+  `node_modules`, so retention can delete any version without breaking another.
+  Retention also keeps a version whose tree a kept version's legacy
+  `node_modules` symlink, or a live process's generation snapshot, points into.
+  A changed lockfile runs `npm ci --ignore-scripts` in staging
   (`PI_ENGINEERING_UPDATE_INSTALL_DEPS=0` refuses instead).
-- **Signatures.** Commits are not signature-verified. Source identity is the
-  repository's root commit plus reachability from a fetched branch or tag. The
-  trusted remote list, TLS and the protocol allow-list carry the rest.
+- **Candidate code before the probe.** The Pi process decides state schema
+  compatibility from the candidate's declared metadata only. The candidate's
+  migrations are loaded and dry-run inside the probe child process, together
+  with the runtime initialization and hot-reload checks. Only after the probe
+  passed does the Pi process load the migrations (the activation applies them).
+- **Mutation lock.** The lock file records the holder's host, boot id and
+  kernel start time. A lock whose PID was reused by another process is stale
+  and is taken over.
+- **Reload and custody.** A reload stops the old generation with a replayed
+  `session_shutdown`. That shutdown keeps the session's mission custody (the
+  next generation re-claims it), so another live session cannot admit those
+  missions during the reload window. A real Pi exit releases custody.
+- **Reloaded isolation code.** The first registration from a new module graph
+  re-opens the session registry with that graph's classes (same registration)
+  and routes the heartbeat timer and exit hook through it. Event-store writers
+  are re-created because a reload closes the old generation's namespaces; a
+  writer some caller keeps open across the reload stays the old instance until
+  it is closed. Changes to `RuntimeSession` state layout itself still need a
+  Pi restart.
+- **SQLite contention.** `node:sqlite` blocks Pi's main thread, so a registry
+  statement waits at most 2 s for another process's write lock and a
+  transaction gives up after 2 s in total. Callers degrade (the heartbeat marks
+  the session degraded, a custody claim reports "registry unavailable") and
+  retry on the next heartbeat or supervisor tick.
+- **Registry quarantine.** A session that finds the registry corrupt moves it
+  to `recovery/` and creates a fresh one. Other live sessions notice the swap
+  on their next heartbeat (the file's inode changed), re-open the fresh
+  database and re-register. Leases held in the old database are re-taken on the
+  next claim. `pi-engineering doctor` warns while quarantined registries exist.
+
+## Updater trust model
+
+What `/engineering update` trusts, and what it does not:
+
+- **Source.** Updates come from the package checkout's `origin` (or
+  `PI_ENGINEERING_UPDATE_REMOTE`), restricted to the trusted remote list and a
+  protocol allow-list. Transport security is TLS (or SSH) of that remote.
+- **Identity.** A candidate commit must share the repository's root commit:
+  recorded roots, else the installing checkout's, else trust on first use of
+  the first commit validated. `--channel` follows a branch or tag; `--commit`
+  accepts **any** commit reachable on the configured remote, including
+  unmerged branches.
+- **No signatures.** Commits and tags are not signature-verified. Whoever can
+  push to the trusted remote can ship code to every installation that updates
+  from it.
+- **Candidate code runs as you.** Validation executes candidate code: the
+  probe (runtime initialization, migration dry-run), the candidate's own
+  `tsc`, its critical tests and, with `--verify-full`, `npm test`. These run as
+  the operator's user with a scrubbed environment (PATH and locale only), a
+  temporary HOME/TMPDIR and temporary Pi Engineering state and install roots,
+  removed afterwards. That keeps tokens in the environment and the real state
+  out of reach of honest-but-buggy code; it is not a sandbox against
+  malicious code, which can still read and write anything the user can.
+  `npm ci --ignore-scripts` (changed lockfile) runs with the operator's
+  environment so registry configuration applies; it runs no package scripts.
+- **Validation is not review.** Passing validation means the candidate loads,
+  starts, reloads and passes its own checks; it says nothing about intent.

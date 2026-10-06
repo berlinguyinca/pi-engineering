@@ -92,20 +92,45 @@ export interface MigrationDecision {
 }
 
 /**
- * Decide (and dry-run) what the candidate needs from the state at `stateDir`.
- * Throws when the candidate cannot run on that state. Nothing is modified.
+ * What the candidate needs from the state at `stateDir`, decided from its
+ * declared schema support alone: no candidate code is loaded. Throws when the
+ * candidate cannot run on that state.
  */
-export async function prepareMigration(candidateDir: string, stateDir: string | null): Promise<MigrationDecision> {
+export function assessMigration(
+  candidateDir: string,
+  stateDir: string | null,
+): { needed: false; from: number | null; to: number } | { needed: true; from: number; to: number } {
   const support = candidateStateSchema(candidateDir);
-  if (!stateDir || !existsSync(stateDir)) return { plan: [], from: null, to: support.writes };
-  const schema = readStateSchema(stateDir);
-  const compat = schemaCompatibility(schema, support);
-  if (compat.kind === "compatible") return { plan: [], from: compat.schema, to: compat.schema };
+  if (!stateDir || !existsSync(stateDir)) return { needed: false, from: null, to: support.writes };
+  const compat = schemaCompatibility(readStateSchema(stateDir), support);
+  if (compat.kind === "compatible") return { needed: false, from: compat.schema, to: compat.schema };
   if (compat.kind === "incompatible") throw new Error(`state schema incompatible: ${compat.reason}`);
-  const plan = planMigrations(await candidateMigrations(candidateDir), compat.from, compat.to);
-  const dry = await dryRunMigrations(stateDir, plan);
-  if (!dry.ok) throw new Error(`migration dry-run failed: ${dry.error}`);
-  return { plan, from: compat.from, to: compat.to };
+  return { needed: true, from: compat.from, to: compat.to };
+}
+
+/**
+ * Decide (and, unless `dryRun` is false, dry-run) what the candidate needs
+ * from the state at `stateDir`. Throws when the candidate cannot run on that
+ * state. Nothing is modified.
+ *
+ * This LOADS the candidate's migrations module. Update validation therefore
+ * calls it with the dry-run only inside the isolated probe process
+ * (src/update/probe.ts); the Pi process calls it, without the dry-run, only
+ * after the probe passed.
+ */
+export async function prepareMigration(
+  candidateDir: string,
+  stateDir: string | null,
+  opts: { dryRun?: boolean } = {},
+): Promise<MigrationDecision> {
+  const assessed = assessMigration(candidateDir, stateDir);
+  if (!assessed.needed || !stateDir) return { plan: [], from: assessed.from, to: assessed.to };
+  const plan = planMigrations(await candidateMigrations(candidateDir), assessed.from, assessed.to);
+  if (opts.dryRun !== false) {
+    const dry = await dryRunMigrations(stateDir, plan);
+    if (!dry.ok) throw new Error(`migration dry-run failed: ${dry.error}`);
+  }
+  return { plan, from: assessed.from, to: assessed.to };
 }
 
 const PHASE_TO_JOURNAL: Partial<Record<HandoverPhase, JournalPhase>> = {

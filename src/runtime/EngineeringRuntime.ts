@@ -67,6 +67,7 @@ import {
   openOrchestrationNamespace,
 } from "./isolation/orchestrationNamespace.ts";
 import { assessProcess } from "./isolation/processIdentity.ts";
+import { isReloadShutdown } from "./isolation/reloadCustody.ts";
 import { UnavailableModels, createRouteModel, followUnavailableModels } from "./modelRouting.ts";
 
 /**
@@ -1316,7 +1317,11 @@ export class EngineeringRuntime {
     const namespace = openedOrchestrationStores.get(path);
     openedOrchestrationStores.delete(path);
     if (namespace) {
-      void namespace.custody.releaseAll().catch(() => undefined);
+      // A reload stops this generation but not the session: custody stays
+      // with the session, so no other live session can admit its missions in
+      // the window before the next generation re-claims them.
+      if (isReloadShutdown()) namespace.custody.retainForReload();
+      else void namespace.custody.releaseAll().catch(() => undefined);
       namespace.backend.close();
     }
   }
