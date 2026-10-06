@@ -21,7 +21,7 @@ import { type GatewayResilienceConfig, resolveGatewayResilienceConfig } from "..
 import { type ProbeResult, type RecoveryProbe, healthyProbe } from "../resilience/probe.ts";
 import { type RetryWindowState, recordProbe, startRetryWindow, windowOpen } from "../resilience/retryWindow.ts";
 import { type SchedulableTask, Scheduler } from "../sched/Scheduler.ts";
-import type { ExecutionBroker, ExecutionHandle, ExecutionRequestInput } from "./broker.ts";
+import { type ExecutionBroker, type ExecutionHandle, type ExecutionRequestInput, INACTIVITY_MARKER } from "./broker.ts";
 import type { MissionStore } from "./missionStore.ts";
 import type { DispatchAuthority } from "./ownership.ts";
 import { FailureClassifier, type FailureEvidence, RecoveryPlanner, type RecoveryPlannerOptions } from "./recovery.ts";
@@ -73,6 +73,9 @@ function infraCategoryFromWorkerMarker(marker?: string): InfraErrorCategory | nu
       return "TRANSIENT_INFRASTRUCTURE";
   }
 }
+
+/** Times one task run may be resumed after its worker went silent (hung). */
+const MAX_INACTIVITY_RESUMES = 3;
 
 export interface SchedulerLimits {
   maxActive: number;
@@ -427,6 +430,7 @@ export class MissionScheduler {
 
   private async executeWithRetry(task: OrchestrationTask, signal?: AbortSignal): Promise<void> {
     let attempt = task.attempt;
+    let inactivityResumes = 0;
     while (true) {
       if (signal?.aborted) {
         this.cancelTask(task);
@@ -548,6 +552,27 @@ export class MissionScheduler {
                 this.cancelTask(task);
                 return;
               }
+              continue;
+            }
+          }
+          // A hung worker (no activity for the whole inactivity window) is
+          // resumed, not failed: its checkpoint and branch are preserved and a
+          // fresh execution picks the task up. Bounded so a worker that hangs
+          // every time still surfaces as a failure.
+          if (outcome.error === INACTIVITY_MARKER && inactivityResumes < MAX_INACTIVITY_RESUMES) {
+            inactivityResumes++;
+            const recoveryStop = await this.authorizeRetry(task, {
+              missionId: task.mission_id,
+              taskId: task.task_id,
+              executionId: handle.executionId,
+              summary: outcome.summary ?? "worker showed no activity for the inactivity window",
+              evidenceRefs: outcome.artifactRefs,
+              category: "ORPHANED_EXECUTION",
+              observedAt: new Date(this.clockNow()).toISOString(),
+            });
+            if (!recoveryStop) {
+              authority?.assertAuthoritative();
+              this.store.transitionTask(task.task_id, "RETRYING", "system", { attempt });
               continue;
             }
           }

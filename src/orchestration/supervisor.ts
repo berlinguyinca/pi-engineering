@@ -323,7 +323,9 @@ export class MissionSupervisor {
           (decision.status === "planned" || decision.status === "started"),
       )
       .at(-1);
-    if (wait && now >= Date.parse(wait.deadline)) {
+    // A wait without a deadline (the default) never expires on a clock; it
+    // ends when its condition changes or the user cancels.
+    if (wait?.deadline && now >= Date.parse(wait.deadline)) {
       const classification = this.store.getFailureClassification(wait.classificationId);
       return {
         health: "EXPIRED_WAIT",

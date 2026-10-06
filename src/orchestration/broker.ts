@@ -22,6 +22,7 @@ import { createHash } from "node:crypto";
 import { isAbsolute } from "node:path";
 import type { ArtifactStore } from "../artifacts/ArtifactStore.ts";
 import { id } from "../core/ids.ts";
+import { sharedAdmissionController } from "../gateway/config.ts";
 import type {
   CandidateLifecycle,
   GitRepo,
@@ -350,8 +351,51 @@ export interface BrokerBackends {
 /** Largest delay setTimeout honours (2^31-1 ms, ~24.8 days). */
 const MAX_TIMER_MS = 2 ** 31 - 1;
 
-/** The worker's machine-readable failure marker for a wall-clock timeout. */
+/**
+ * The worker's machine-readable failure marker for a wall-clock timeout. Only
+ * an explicitly configured (opt-in) wall-clock limit produces it.
+ */
 const WALL_CLOCK_TIMEOUT_MARKER = "timeout";
+
+/**
+ * Failure marker for an execution that showed no activity (no tool, model,
+ * checkpoint or inference-wait signal) for the inactivity window: a hung
+ * worker, not a slow one. The scheduler resumes it rather than failing it.
+ */
+export const INACTIVITY_MARKER = "inactivity";
+
+/** Abort reason names, so every settlement path can tell the two apart. */
+const TIMEOUT_ABORT = "TimeoutError";
+const INACTIVITY_ABORT = "InactivityError";
+
+/** Why the broker itself aborted an execution, or null for a caller cancel. */
+function clockAbort(signal: AbortSignal): "timeout" | "inactivity" | null {
+  const reason = signal.reason;
+  if (!(reason instanceof DOMException)) return null;
+  if (reason.name === TIMEOUT_ABORT) return "timeout";
+  if (reason.name === INACTIVITY_ABORT) return "inactivity";
+  return null;
+}
+
+function terminalMarker(reason: "canceled" | "timeout" | "inactivity"): string {
+  return reason === "timeout" ? WALL_CLOCK_TIMEOUT_MARKER : reason === "inactivity" ? INACTIVITY_MARKER : "canceled";
+}
+
+/** Backends whose runners stream worker activity the inactivity watchdog can observe. */
+const ACTIVITY_REPORTING_BACKENDS: ReadonlySet<ExecutionBackend> = new Set(["agent", "research", "review"]);
+
+/** Default inactivity window: one full hour with no sign of life at all. */
+export const DEFAULT_WORKER_INACTIVITY_MS = 60 * 60_000;
+
+/**
+ * True while this process is waiting on the model gateway (an admission hold,
+ * a cooldown, or a queue for a slot). Waiting for inference capacity is not a
+ * stall: a mission waits as long as the gateway asks it to.
+ */
+export function processWaitingForInference(): boolean {
+  const status = sharedAdmissionController().status();
+  return status.waiting > 0 || status.cooldownMs > 0;
+}
 
 function pathAllowed(path: string, domains: string[]): boolean {
   const normalized = canonicalizeWriteDomain(path);
@@ -367,28 +411,47 @@ function pathAllowed(path: string, domains: string[]): boolean {
 }
 
 /**
- * Default execution wall-clock budget in ms. The historical 10-minute default
- * repeatedly aborted fresh-context implementation workers at the boundary
- * before they could commit real work (only a trivial file-copy ever landed in
- * time), which made the mission pipeline unable to integrate anything but
- * trivial changes. 30 minutes gives a worker room to explore the repo,
- * implement, verify, and commit within one bounded run. Overridable via
- * `PI_ENGINEERING_WORKER_TIMEOUT_MS` for the whole pipeline (broker abort
- * timer and worker budget stay in lockstep).
+ * OPT-IN execution wall-clock limit in ms, or undefined (the default): no
+ * execution has a maximum duration. Fixed windows (10, then 30 minutes) killed
+ * healthy workers mid-task far more often than they caught hung ones — a task
+ * that takes eight hours takes eight hours. Hung workers are caught by the
+ * inactivity watchdog instead (`workerInactivityMs`). An operator who really
+ * wants a ceiling sets `PI_ENGINEERING_WORKER_TIMEOUT_MS`.
  */
-export function workerTimeoutMs(): number {
+export function workerTimeoutMs(): number | undefined {
   const env = Number.parseInt(process.env.PI_ENGINEERING_WORKER_TIMEOUT_MS ?? "", 10);
   // setTimeout fires IMMEDIATELY for delays above 2^31-1 ms, which would turn a
   // generous override into an instant abort.
   if (Number.isFinite(env) && env > 0) return Math.min(env, MAX_TIMER_MS);
-  return 30 * 60_000;
+  return undefined;
+}
+
+/**
+ * How long an execution may show no activity at all before it is treated as
+ * hung. Default one hour; `PI_ENGINEERING_WORKER_INACTIVITY_MS` overrides it.
+ */
+export function workerInactivityMs(): number {
+  const env = Number.parseInt(process.env.PI_ENGINEERING_WORKER_INACTIVITY_MS ?? "", 10);
+  if (Number.isFinite(env) && env > 0) return Math.min(env, MAX_TIMER_MS);
+  return DEFAULT_WORKER_INACTIVITY_MS;
 }
 
 export interface BrokerOptions {
   store: MissionStore;
   backends: BrokerBackends;
-  /** Default timeout per execution. */
+  /**
+   * Explicit, opt-in wall-clock limit per execution. Unset (the default) means
+   * no execution has a maximum duration.
+   */
   defaultTimeoutMs?: number;
+  /**
+   * Abort an activity-reporting execution (agent/research/review) after this
+   * long with no worker activity. Time spent waiting for inference capacity
+   * never counts. Default `workerInactivityMs()`.
+   */
+  inactivityTimeoutMs?: number;
+  /** Whether the process is waiting on the model gateway right now. Default: the shared admission controller. */
+  inferenceWaiting?: () => boolean;
   /** Git provider used to allocate isolated worktrees for mutating tasks. */
   git?: GitRepo | null;
   /** Base ref (commit) worktrees are created at. Defaults to current HEAD. */
@@ -418,7 +481,9 @@ export interface BrokerOptions {
 export class ExecutionBroker {
   private readonly store: MissionStore;
   private readonly backends: BrokerBackends;
-  private readonly defaultTimeoutMs: number;
+  private readonly defaultTimeoutMs: number | undefined;
+  private readonly inactivityTimeoutMs: number;
+  private readonly inferenceWaiting: () => boolean;
   private readonly git: GitRepo | null;
   private readonly baseRef: string;
   private readonly resolveRepository?: BrokerOptions["resolveRepository"];
@@ -505,6 +570,11 @@ export class ExecutionBroker {
     this.store = opts.store;
     this.backends = opts.backends;
     this.defaultTimeoutMs = opts.defaultTimeoutMs ?? workerTimeoutMs();
+    this.inactivityTimeoutMs = opts.inactivityTimeoutMs ?? workerInactivityMs();
+    if (!Number.isFinite(this.inactivityTimeoutMs) || this.inactivityTimeoutMs <= 0) {
+      throw new Error("ExecutionBroker inactivityTimeoutMs must be finite and positive");
+    }
+    this.inferenceWaiting = opts.inferenceWaiting ?? processWaitingForInference;
     this.git = opts.git ?? null;
     this.baseRef = opts.baseRef ?? "";
     this.resolveRepository = opts.resolveRepository;
@@ -956,19 +1026,14 @@ export class ExecutionBroker {
 
   private terminalizeAfterGrace(
     executionId: string,
-    reason: "canceled" | "timeout",
+    reason: "canceled" | "timeout" | "inactivity",
     taskId: string,
   ): Promise<ExecutionOutcome> {
     const entry = this.active.get(executionId);
     if (!entry) return Promise.resolve(this.terminalizeExecution(executionId, reason, taskId));
     if (entry.terminalPromise) return entry.terminalPromise;
     entry.terminalPromise = (async () => {
-      this.markBranchIntegrationIneligible(
-        executionId,
-        entry.missionId,
-        taskId,
-        reason === "timeout" ? WALL_CLOCK_TIMEOUT_MARKER : "canceled",
-      );
+      this.markBranchIntegrationIneligible(executionId, entry.missionId, taskId, terminalMarker(reason));
       const checkpoint = entry.cancelCheckpoint?.();
       let graceTimer: ReturnType<typeof setTimeout> | undefined;
       let checkpointSettled = true;
@@ -988,7 +1053,7 @@ export class ExecutionBroker {
       } finally {
         if (graceTimer) clearTimeout(graceTimer);
       }
-      if ((reason === "timeout" || !checkpointSettled) && entry.worktree) {
+      if ((reason !== "canceled" || !checkpointSettled) && entry.worktree) {
         this.retainWorktree(entry.missionId, executionId);
       }
       const outcome = this.terminalizeExecution(executionId, reason, taskId);
@@ -1029,25 +1094,38 @@ export class ExecutionBroker {
     return entry.terminalPromise;
   }
 
-  private terminalizeExecution(executionId: string, reason: "canceled" | "timeout", taskId: string): ExecutionOutcome {
+  private terminalizeExecution(
+    executionId: string,
+    reason: "canceled" | "timeout" | "inactivity",
+    taskId: string,
+  ): ExecutionOutcome {
     const existing = this.store.getExecution(executionId);
-    const error = reason === "timeout" ? WALL_CLOCK_TIMEOUT_MARKER : "canceled";
+    const error = terminalMarker(reason);
+    const failed = reason !== "canceled";
     const outcome: ExecutionOutcome = {
       executionId,
       exitStatus: "failed",
       summary:
-        reason === "timeout" ? "Execution exceeded its deadline and cancellation grace" : "Execution was canceled",
+        reason === "timeout"
+          ? "Execution exceeded its configured wall-clock limit and cancellation grace"
+          : reason === "inactivity"
+            ? "Execution showed no activity for the inactivity window (hung worker); its work is preserved for resumption"
+            : "Execution was canceled",
       artifactRefs: [],
       usage: {},
       error,
     };
     if (existing?.status === "RUNNING") {
-      this.store.setExecutionStatus(executionId, reason === "timeout" ? "FAILED" : "CANCELED", {
+      this.store.setExecutionStatus(executionId, failed ? "FAILED" : "CANCELED", {
         exit_status: error,
       });
     }
     const task = this.store.getTask(taskId);
-    if (task?.status === "RUNNING") this.store.transitionTask(taskId, reason === "timeout" ? "FAILED" : "CANCELED");
+    // A hung (inactive) execution leaves its task RUNNING: the scheduler owns
+    // the decision to resume it from its checkpoint instead of failing it.
+    if (task?.status === "RUNNING" && reason !== "inactivity") {
+      this.store.transitionTask(taskId, failed ? "FAILED" : "CANCELED");
+    }
     this.active.delete(executionId);
     return outcome;
   }
@@ -2061,8 +2139,11 @@ export class ExecutionBroker {
     input.recovery = await this.preliminaryRecoveryContext(input);
     input.authority?.assertAuthoritative();
     const executionStartedAt = Date.now();
-    const executionBudgetMs = input.executionBudgetMs ?? input.timeoutPolicy?.timeoutMs ?? this.defaultTimeoutMs;
-    if (!Number.isFinite(executionBudgetMs) || executionBudgetMs <= 0) {
+    // No budget unless one was explicitly asked for (task-level or the opt-in
+    // broker default): an execution runs as long as it shows activity.
+    const executionBudgetMs: number | undefined =
+      input.executionBudgetMs ?? input.timeoutPolicy?.timeoutMs ?? this.defaultTimeoutMs;
+    if (executionBudgetMs !== undefined && (!Number.isFinite(executionBudgetMs) || executionBudgetMs <= 0)) {
       throw new Error("INVALID_TASK_BUDGET: execution budget must be finite and positive");
     }
     if (
@@ -2071,11 +2152,12 @@ export class ExecutionBroker {
         input.checkpointPolicy.activity_milestone <= 0 ||
         !Number.isFinite(input.checkpointPolicy.before_deadline_ms) ||
         input.checkpointPolicy.before_deadline_ms <= 0 ||
-        input.checkpointPolicy.before_deadline_ms >= executionBudgetMs)
+        (executionBudgetMs !== undefined && input.checkpointPolicy.before_deadline_ms >= executionBudgetMs))
     ) {
       throw new Error("INVALID_CHECKPOINT_POLICY: checkpoint lead must be finite, positive, and below budget");
     }
-    const executionDeadlineAt = executionStartedAt + executionBudgetMs;
+    const executionDeadlineAt = executionBudgetMs === undefined ? undefined : executionStartedAt + executionBudgetMs;
+    const watchInactivity = ACTIVITY_REPORTING_BACKENDS.has(this.backendForKind(input.kind));
     const backend = this.backendForKind(input.kind);
     const checkpointId = input.checkpointId ?? (this.checkpoints && input.repoId ? id("TCP") : undefined);
     const task = this.store.getTask(input.taskId);
@@ -2129,16 +2211,55 @@ export class ExecutionBroker {
             if (terminal?.status === "FAILED" && terminal.exit_status === WALL_CLOCK_TIMEOUT_MARKER) {
               return this.terminalizeExecution(execution.execution_id, "timeout", input.taskId);
             }
+            if (terminal?.status === "FAILED" && terminal.exit_status === INACTIVITY_MARKER) {
+              return this.terminalizeExecution(execution.execution_id, "inactivity", input.taskId);
+            }
             throw new Error("execution aborted before dispatch");
           }
-          const timer = setTimeout(
-            () =>
-              abort.abort(new DOMException(`Execution exceeded its ${executionBudgetMs}ms deadline`, "TimeoutError")),
-            Math.max(0, executionDeadlineAt - Date.now()),
-          );
-          timer.unref?.();
+          // Opt-in only: a configured wall-clock limit.
+          const timer =
+            executionDeadlineAt === undefined
+              ? undefined
+              : setTimeout(
+                  () =>
+                    abort.abort(
+                      new DOMException(`Execution exceeded its configured ${executionBudgetMs}ms limit`, TIMEOUT_ABORT),
+                    ),
+                  Math.max(0, executionDeadlineAt - Date.now()),
+                );
+          timer?.unref?.();
           const activityStartedAt = Date.now();
           let lastActivityAt = activityStartedAt;
+          // Hung-worker detection: abort only after a full inactivity window
+          // with no worker activity. Waiting on the model gateway is liveness,
+          // not silence, so it keeps the window open however long it lasts.
+          const inactivityTimer = watchInactivity
+            ? setInterval(
+                () => {
+                  if (abort.signal.aborted) return;
+                  const at = Date.now();
+                  let waiting = false;
+                  try {
+                    waiting = this.inferenceWaiting();
+                  } catch {
+                    waiting = false;
+                  }
+                  if (waiting) {
+                    lastActivityAt = at;
+                    return;
+                  }
+                  if (at - lastActivityAt < this.inactivityTimeoutMs) return;
+                  abort.abort(
+                    new DOMException(
+                      `Execution showed no activity for ${this.inactivityTimeoutMs}ms (hung worker)`,
+                      INACTIVITY_ABORT,
+                    ),
+                  );
+                },
+                Math.max(5, Math.min(30_000, Math.floor(this.inactivityTimeoutMs / 4))),
+              )
+            : undefined;
+          inactivityTimer?.unref?.();
           let activitySettled = false;
           let activityTimer: ReturnType<typeof setInterval> | undefined;
           let checkpointTimer: ReturnType<typeof setTimeout> | undefined;
@@ -2341,7 +2462,7 @@ export class ExecutionBroker {
             if (activitySettled) return;
             if (activityTimer) clearInterval(activityTimer);
             activityTimer = undefined;
-            const timedOut = abort.signal.reason instanceof DOMException && abort.signal.reason.name === "TimeoutError";
+            const timedOut = clockAbort(abort.signal) !== null;
             const safe = sanitizeWorkerActivity({
               kind: "execution",
               phase: timedOut ? "failed" : "canceled",
@@ -2420,7 +2541,7 @@ export class ExecutionBroker {
             worktree = await this.allocateWorktree(execution.execution_id, input, repository);
             const active = this.active.get(execution.execution_id);
             if (worktree && active) active.worktree = worktree;
-            if (this.checkpoints && checkpointId && input.checkpointPolicy) {
+            if (this.checkpoints && checkpointId && input.checkpointPolicy && executionDeadlineAt !== undefined) {
               checkpointTimer = setTimeout(
                 () => queueCheckpoint(),
                 Math.max(0, executionDeadlineAt - input.checkpointPolicy.before_deadline_ms - Date.now()),
@@ -2456,11 +2577,9 @@ export class ExecutionBroker {
             }
             if (abort.signal.aborted) {
               detachedAfterTerminalAbort = true;
-              const timedOut =
-                abort.signal.reason instanceof DOMException && abort.signal.reason.name === "TimeoutError";
               return this.terminalizeAfterGrace(
                 execution.execution_id,
-                timedOut ? "timeout" : "canceled",
+                clockAbort(abort.signal) ?? "canceled",
                 input.taskId,
               );
             }
@@ -2493,8 +2612,8 @@ export class ExecutionBroker {
             const first = await Promise.race([backendSettlement, aborted]);
             removeAbortRaceListener();
             if (first.kind === "aborted") {
-              const timedOut =
-                abort.signal.reason instanceof DOMException && abort.signal.reason.name === "TimeoutError";
+              const clock = clockAbort(abort.signal);
+              const timedOut = clock !== null;
               if (worktree && this.store.getExecution(execution.execution_id)?.status === "RUNNING") {
                 const info = this.allocatedWorktrees.get(execution.execution_id);
                 const byBranch =
@@ -2502,7 +2621,8 @@ export class ExecutionBroker {
                   new Map<string, { marker: string; taskId: string; recoverRef?: string }>();
                 if (info) {
                   byBranch.set(info.branch, {
-                    marker: timedOut ? WALL_CLOCK_TIMEOUT_MARKER : "canceled",
+                    marker:
+                      clock === "inactivity" ? INACTIVITY_MARKER : timedOut ? WALL_CLOCK_TIMEOUT_MARKER : "canceled",
                     taskId: input.taskId,
                   });
                   this.failedBranches.set(input.missionId, byBranch);
@@ -2510,14 +2630,19 @@ export class ExecutionBroker {
               }
               const terminalOutcome = await this.terminalizeAfterGrace(
                 execution.execution_id,
-                timedOut ? "timeout" : "canceled",
+                clock ?? "canceled",
                 input.taskId,
               );
               if (timedOut && worktree) retainWorktreeOnCleanup = true;
               detachedAfterTerminalAbort = true;
               cleanupOwnedByCancellation = true;
               void backendSettlement.then((late) =>
-                this.observeLate(execution.execution_id, timedOut ? "hard timeout" : "cancellation", late, input),
+                this.observeLate(
+                  execution.execution_id,
+                  clock === "inactivity" ? "inactivity abort" : timedOut ? "hard timeout" : "cancellation",
+                  late,
+                  input,
+                ),
               );
               emitActivity({
                 kind: "execution",
@@ -2689,13 +2814,19 @@ export class ExecutionBroker {
                 lateEvidence({ kind: "backend_error", error: err }, input),
               );
             } else if (!this.settledElsewhere(execution.execution_id)) {
-              const timedOut =
-                abort.signal.reason instanceof DOMException && abort.signal.reason.name === "TimeoutError";
-              if (abort.signal.aborted && !timedOut) {
+              const clock = clockAbort(abort.signal);
+              if (abort.signal.aborted && clock === null) {
                 this.store.setExecutionStatus(execution.execution_id, "CANCELED", { exit_status: "canceled" });
               } else {
                 this.store.setExecutionStatus(execution.execution_id, "FAILED", {
-                  exit_status: timedOut ? WALL_CLOCK_TIMEOUT_MARKER : err instanceof Error ? err.message : String(err),
+                  exit_status:
+                    clock === "inactivity"
+                      ? INACTIVITY_MARKER
+                      : clock === "timeout"
+                        ? WALL_CLOCK_TIMEOUT_MARKER
+                        : err instanceof Error
+                          ? err.message
+                          : String(err),
                 });
               }
             }
@@ -2718,7 +2849,8 @@ export class ExecutionBroker {
               await checkpointChain.catch(() => undefined);
             }
             abort.signal.removeEventListener("abort", onAbort);
-            clearTimeout(timer);
+            if (timer) clearTimeout(timer);
+            if (inactivityTimer) clearInterval(inactivityTimer);
             if (!retainWorktreeOnCleanup && !cleanupOwnedByCancellation) {
               await this.releaseWorktree(execution.execution_id, true, input.authority);
             }
@@ -2728,10 +2860,9 @@ export class ExecutionBroker {
         let removeAbortListener = (): void => {};
         const authoritativeAbort = new Promise<ExecutionOutcome>((resolve, reject) => {
           const settle = (): void => {
-            const timedOut = abort.signal.reason instanceof DOMException && abort.signal.reason.name === "TimeoutError";
             void this.terminalizeAfterGrace(
               execution.execution_id,
-              timedOut ? "timeout" : "canceled",
+              clockAbort(abort.signal) ?? "canceled",
               input.taskId,
             ).then(resolve, reject);
           };

@@ -30,12 +30,17 @@ export class WorksetValidationError extends Error {
 
 export interface WorksetPolicy {
   maxDeliverablesPerTask: number;
-  maxTaskBudgetMs: number;
+  /**
+   * OPT-IN ceiling on one task execution's wall-clock time. Undefined (the
+   * default) means tasks have no maximum duration: work is split by
+   * deliverables, never by a clock, and a task runs as long as it shows
+   * activity. Configure `limits.max_task_wall_clock_ms` to set one.
+   */
+  maxTaskBudgetMs?: number;
 }
 
 export const DEFAULT_WORKSET_POLICY: WorksetPolicy = {
   maxDeliverablesPerTask: 4,
-  maxTaskBudgetMs: 30 * 60_000,
 };
 
 export interface WorksetTask {
@@ -194,14 +199,15 @@ export function validateWorkset(input: ValidateWorksetInput): WorksetTask[] {
         `Split it into tasks of at most ${policy.maxDeliverablesPerTask} deliverables`,
       );
     }
-    if (!Number.isFinite(task.execution_budget_ms) || (task.execution_budget_ms ?? 0) <= 0) {
+    const budget = task.execution_budget_ms;
+    if (budget !== undefined && (!Number.isFinite(budget) || budget <= 0)) {
       throw new WorksetValidationError(
         "INVALID_TASK_BUDGET",
         `task ${task.task_id} has invalid execution budget ${task.execution_budget_ms}`,
-        "Use a finite positive execution budget",
+        "Omit the budget (no time limit) or use a finite positive one",
       );
     }
-    if ((task.execution_budget_ms ?? 0) > policy.maxTaskBudgetMs) {
+    if (budget !== undefined && policy.maxTaskBudgetMs !== undefined && budget > policy.maxTaskBudgetMs) {
       throw new WorksetValidationError(
         "TASK_BUDGET_EXCEEDED",
         `task ${task.task_id} budget ${task.execution_budget_ms}ms exceeds ${policy.maxTaskBudgetMs}ms`,
@@ -215,7 +221,7 @@ export function validateWorkset(input: ValidateWorksetInput): WorksetTask[] {
       checkpointPolicy.activity_milestone <= 0 ||
       !Number.isFinite(checkpointPolicy.before_deadline_ms) ||
       checkpointPolicy.before_deadline_ms <= 0 ||
-      checkpointPolicy.before_deadline_ms >= (task.execution_budget_ms ?? 0)
+      (budget !== undefined && checkpointPolicy.before_deadline_ms >= budget)
     ) {
       throw new WorksetValidationError(
         "INVALID_CHECKPOINT_POLICY",

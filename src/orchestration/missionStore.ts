@@ -2462,7 +2462,7 @@ export class MissionStore {
     const resumptionGeneration = this.listMissionResumptions(missionId).at(-1)?.generation ?? 0;
     const deadlines = this.listRecoveryDecisions(missionId)
       .filter((decision) => (decision.resumptionGeneration ?? 0) === resumptionGeneration)
-      .map((decision) => decision.deadline)
+      .flatMap((decision) => (decision.deadline ? [decision.deadline] : []))
       .filter((deadline) => Number.isFinite(Date.parse(deadline)))
       .sort();
     const stop: MissionStop = {
@@ -2512,7 +2512,7 @@ export class MissionStore {
       const deadlines = durableBefore
         .listRecoveryDecisions(missionId)
         .filter((decision) => (decision.resumptionGeneration ?? 0) === expected.resumptionGeneration)
-        .map((decision) => decision.deadline)
+        .flatMap((decision) => (decision.deadline ? [decision.deadline] : []))
         .filter((deadline) => Number.isFinite(Date.parse(deadline)))
         .sort();
       const stop: MissionStop = {

@@ -480,7 +480,8 @@ export interface RecoveryDecision {
   expectedMaterialChange: string;
   attempt: number;
   maxAttempts: number;
-  deadline: string;
+  /** Opt-in recovery deadline; null when recovery has no time limit (the default). */
+  deadline: string | null;
   nextActionAt: string;
   status: RecoveryStatus;
   decidedAt: string;

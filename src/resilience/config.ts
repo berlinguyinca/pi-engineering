@@ -8,9 +8,10 @@
  *   PI_GATEWAY_RETRY_WINDOW     total wall-clock retry budget (ms or "12h"; default 12h)
  *   PI_GATEWAY_MAX_BACKOFF      cap between worker relaunches (ms or "3m"; default 3m)
  *   PI_GATEWAY_MAX_RELAUNCHES   worker relaunches per task through one outage (default 100)
- *   PI_GATEWAY_MAX_OUTAGE       total ceiling across pause + resume, then FAIL (default 36h)
+ *   PI_GATEWAY_MAX_OUTAGE       OPT-IN total ceiling across pause + resume, then FAIL
+ *                               (default: none — a mission waits for capacity)
  *   PI_GATEWAY_AUTO_RESUME_HORIZON  how long a paused mission watches the recovery
- *                               probe to resume itself (ms or "24h"; default 24h)
+ *                               probe to resume itself (ms or "24h"; default: unbounded)
  *   PI_GATEWAY_PROBE_INTERVAL   recovery probe cadence in ms (default 10_000)
  *   PI_GATEWAY_REQUEST_TIMEOUT  per-request timeout in ms (default 120_000)
  *   PI_GATEWAY_AUTO_RESUME      auto-resume from PAUSED_INFRASTRUCTURE ("1"/"true")
@@ -35,7 +36,9 @@ export interface GatewayResilienceConfig {
   /**
    * After the window is exhausted the mission PAUSES; with a real recovery
    * probe it keeps probing this long and resumes itself on the first healthy
-   * answer. Default 24h. 0 disables auto-resume inside orchestrate().
+   * answer. Default unbounded (Infinity): waiting for inference capacity never
+   * ends a mission — only the user cancelling does. 0 disables auto-resume
+   * inside orchestrate().
    */
   auto_resume_horizon_ms?: number;
   /**
@@ -46,9 +49,9 @@ export interface GatewayResilienceConfig {
    */
   max_relaunches?: number;
   /**
-   * Total ceiling on one outage for a task, across pause and auto-resume.
-   * Past it the task FAILS with a clear reason. Default 36h (12h window +
-   * 24h auto-resume).
+   * OPT-IN total ceiling on one outage for a task, across pause and
+   * auto-resume. Past it the task FAILS with a clear reason. Default unset:
+   * an outage is waited out however long it lasts.
    */
   max_outage_ms?: number;
   /** Recovery-probe cadence, ms. Default 10s. */
@@ -72,9 +75,8 @@ export interface GatewayResilienceConfig {
 export const DEFAULT_GATEWAY_RESILIENCE: GatewayResilienceConfig = {
   retry_window_ms: 12 * 3_600_000,
   max_backoff_ms: 180_000,
-  auto_resume_horizon_ms: 24 * 3_600_000,
+  auto_resume_horizon_ms: Number.POSITIVE_INFINITY,
   max_relaunches: 100,
-  max_outage_ms: 36 * 3_600_000,
   probe_interval_ms: 10_000,
   request_timeout_ms: 120_000,
   connect_timeout_ms: 10_000,
