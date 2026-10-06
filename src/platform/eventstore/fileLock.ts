@@ -11,7 +11,7 @@ import {
   rmSync as removeSync,
   renameSync,
 } from "node:fs";
-import { link, lstat, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { link, lstat, mkdir, open, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { hostname } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -204,13 +204,48 @@ async function quarantineObserved(
   }
 }
 
+/** link(2) errors meaning "this filesystem cannot hard-link", not "the name exists". */
+const NO_HARD_LINKS = new Set(["EPERM", "ENOTSUP", "EOPNOTSUPP", "EXDEV", "EMLINK", "ENOSYS"]);
+
+/**
+ * Publish `content` at `path` only if nothing exists there. Preferred: hard-link
+ * the fully written `candidate` (the name never shows partial content, and
+ * link(2) refuses any existing destination). On a filesystem without hard links
+ * fall back to an O_EXCL create of `path` itself, write, fsync: still
+ * create-if-absent (EEXIST on collision), but a reader may briefly see the
+ * record half-written, which acquisition already tolerates (an unreadable
+ * owner gets a grace period before it counts as corrupt).
+ */
+async function publishExclusive(
+  candidate: string,
+  path: string,
+  content: string,
+  hooks: FileLockRecoveryHooks,
+): Promise<"linked" | "created"> {
+  try {
+    await (hooks.linkFile ?? link)(candidate, path);
+    return "linked";
+  } catch (error) {
+    if (!NO_HARD_LINKS.has((error as NodeJS.ErrnoException).code ?? "")) throw error;
+  }
+  const handle = await open(path, "wx", 0o644);
+  try {
+    await handle.writeFile(content, "utf8");
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  return "created";
+}
+
 async function publishRecoveryClaim(
   path: string,
   owner: FileLockOwner,
   hooks: FileLockRecoveryHooks,
 ): Promise<OwnerRecord | undefined> {
   const candidate = `${path}.candidate.${owner.ownerToken}`;
-  await writeFile(candidate, `${JSON.stringify(owner)}\n`, { encoding: "utf8", flag: "wx" });
+  const content = `${JSON.stringify(owner)}\n`;
+  await writeFile(candidate, content, { encoding: "utf8", flag: "wx" });
   let candidateRecord: OwnerRecord | undefined;
   let published = false;
   try {
@@ -219,8 +254,14 @@ async function publishRecoveryClaim(
     try {
       // A hard link publishes the fully written identity atomically and, unlike
       // POSIX rename, refuses every pre-existing destination type.
-      await link(candidate, path);
+      const how = await publishExclusive(candidate, path, content, hooks);
       published = true;
+      if (how === "created") {
+        // No hard link: the published claim is its own inode; pin that one.
+        await closeOwnerRecord(candidateRecord);
+        candidateRecord = await readOwnerRecord(path);
+        if (!candidateRecord) throw new Error("JSONL writer recovery claim is unreadable after publication");
+      }
     } catch (error) {
       if (!claimCollision(error)) throw error;
       return undefined;
@@ -270,13 +311,15 @@ async function releaseRecoveryClaim(path: string, observed: OwnerRecord): Promis
   }
 }
 
-async function publishOwnerRecord(path: string, owner: FileLockOwner): Promise<void> {
+async function publishOwnerRecord(path: string, owner: FileLockOwner, hooks: FileLockRecoveryHooks): Promise<void> {
   const candidate = `${path}.publish.${owner.ownerToken}`;
-  await writeFile(candidate, `${JSON.stringify(owner)}\n`, { encoding: "utf8", flag: "wx" });
+  const content = `${JSON.stringify(owner)}\n`;
+  await writeFile(candidate, content, { encoding: "utf8", flag: "wx" });
   try {
     // link(2) refuses an existing destination, so this is the same atomic
     // create-if-absent as O_EXCL — but of a name whose content is complete.
-    await link(candidate, path);
+    // Filesystems without hard links fall back to O_EXCL itself.
+    await publishExclusive(candidate, path, content, hooks);
   } finally {
     await rm(candidate, { force: true });
   }
@@ -436,6 +479,12 @@ export interface FileLockRecoveryHooks {
   beforeReleaseQuarantine?: (path: string, owner: FileLockOwner) => void;
   beforeRecoveryClaimCandidateCleanup?: (candidatePath: string) => Promise<void> | void;
   beforeReleaseCleanup?: (quarantinePath: string, owner: FileLockOwner) => void;
+  /**
+   * The hard-link primitive used to publish owner records and recovery claims
+   * (default fs.promises.link). A seam for filesystems without hard links,
+   * which tests reproduce by passing one that fails like such a filesystem.
+   */
+  linkFile?: (existingPath: string, newPath: string) => Promise<void>;
 }
 
 export class FileLockReleaseError extends Error {
@@ -501,7 +550,7 @@ export class ExclusiveFileLock {
       try {
         // Publish the fully written owner record atomically (write + link), so
         // the lock name is never visible with empty or partial metadata.
-        await publishOwnerRecord(path, owner);
+        await publishOwnerRecord(path, owner, hooks);
         const descriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
         try {
           const identity = fstatSync(descriptor, { bigint: true });
