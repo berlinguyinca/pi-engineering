@@ -577,6 +577,7 @@ async function resolveServices(cwd: string): Promise<CoreServices | null> {
       return w ? w.id : null;
     },
     actor: () => ({ type: "user" }),
+    resumeMission: (id, s) => rt.resumeBlockedMission(id, s),
     // A rebound parent launch targets the bound worktree by default.
     ...(effective !== cwd ? { repositoryRoot: rt.git?.root ?? effective } : {}),
   };
