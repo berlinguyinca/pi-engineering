@@ -146,7 +146,7 @@ async function removeRepo(root: string): Promise<void> {
 
 async function check(commands: string[], cwd: string): Promise<{ passed: number; total: number }> {
   let passed = 0;
-  for (const c of commands) if ((await runVerification(c, cwd, 120_000)).passed) passed++;
+  for (const c of commands) if ((await runVerification(c, cwd, { inactivityMs: 120_000 })).passed) passed++;
   return { passed, total: commands.length };
 }
 
@@ -190,7 +190,7 @@ async function runSolo(
     telemetry.invocation(role, model, run, Date.now() - t0);
     maxPrompt = Math.max(maxPrompt, run.usage?.input ?? 0);
     const results = [];
-    for (const c of task.acceptance) results.push(await runVerification(c, root, 120_000));
+    for (const c of task.acceptance) results.push(await runVerification(c, root, { inactivityMs: 120_000 }));
     const failed = results.filter((r) => !r.passed);
     if (failed.length === 0) break;
     feedback = failed.map((f) => `$ ${f.command}\n${f.output_tail.slice(-800)}`).join("\n");

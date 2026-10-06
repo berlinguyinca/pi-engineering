@@ -100,7 +100,7 @@ async function setup(
     resolver,
     stateDir: join(fixture.root, ".pi-eng", "planner-worker", "M"),
     concurrency: 3,
-    verificationTimeoutMs: 60_000,
+    verificationInactivityMs: 60_000,
     routeEvents: new RouteEventFollower(conn),
     onEvent: (e) => events.push(`${e.type}:${e.task_id ?? ""}:${e.status ?? ""}:${e.text}`),
   });

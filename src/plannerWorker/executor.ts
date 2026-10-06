@@ -19,7 +19,7 @@
  * model disappearing never loses the mission.
  */
 
-import { execFile, spawn } from "node:child_process";
+import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
@@ -27,6 +27,7 @@ import { promisify } from "node:util";
 import type { WorkerRole } from "../core/types.ts";
 import { GitRepo, type WorktreeInfo } from "../git/GitRepo.ts";
 import { Scheduler } from "../sched/Scheduler.ts";
+import { DEFAULT_STAGE_INACTIVITY_MS, runWithInactivityGuard } from "../verify/Verifier.ts";
 import type { WorkerExecutor, WorkerRequest, WorkerRun } from "../workers/WorkerExecutor.ts";
 import { planTransition } from "./compatibility.ts";
 import { dagLayers, scopeConflict } from "./contract.ts";
@@ -104,8 +105,11 @@ export interface PlannerWorkerOptions {
   convergence?: ConvergenceConfig;
   /** Concurrent contracts (existing scheduler limit). Default 2. */
   concurrency?: number;
-  /** Optional per-command limit; none by default (no wall-clock mission budgets). */
-  verificationTimeoutMs?: number;
+  /**
+   * Silence window per verification command (default 15 min). Not a duration
+   * limit: a command that keeps printing runs as long as it needs.
+   */
+  verificationInactivityMs?: number;
   workerTimeoutMs?: number;
   /** Fast-forward the checkout to the integrated result when it is clean. Default true. */
   applyToCheckout?: boolean;
@@ -142,37 +146,38 @@ async function git(cwd: string, args: string[]): Promise<{ code: number; stdout:
 }
 
 /**
- * Run one verification command in a worktree (real child process). No
- * wall-clock limit unless the caller configures one: missions are bounded by
- * attempts and convergence, not time.
+ * Run one verification command in a worktree (real child process, own process
+ * group). There is no total-duration limit — missions are bounded by attempts
+ * and convergence, not time — only an INACTIVITY guard: a command silent for
+ * `inactivityMs` (default 15 min) is killed with everything it spawned, so a
+ * dev server or watch mode holding the output open cannot wedge the mission.
+ * `signal` (the mission's abort) kills the process group at once.
  */
-export function runVerification(command: string, cwd: string, timeoutMs?: number): Promise<VerificationRun> {
+export async function runVerification(
+  command: string,
+  cwd: string,
+  opts: { inactivityMs?: number; signal?: AbortSignal } = {},
+): Promise<VerificationRun> {
   const started = Date.now();
-  return new Promise((resolve) => {
-    const child = spawn("sh", ["-c", command], { cwd, env: verificationEnv() });
-    let out = "";
-    const keep = (b: Buffer) => {
-      out = (out + b.toString("utf8")).slice(-4000);
+  try {
+    const r = await runWithInactivityGuard("sh", ["-c", command], {
+      cwd,
+      env: verificationEnv(),
+      inactivityMs: opts.inactivityMs ?? DEFAULT_STAGE_INACTIVITY_MS,
+      ...(opts.signal ? { signal: opts.signal } : {}),
+    });
+    const exit = r.hung ? 124 : r.code;
+    return {
+      command,
+      exit_code: exit,
+      passed: exit === 0,
+      output_tail: `${r.stdout}${r.stderr}`.slice(-4000),
+      duration_ms: Date.now() - started,
     };
-    child.stdout.on("data", keep);
-    child.stderr.on("data", keep);
-    const timer = timeoutMs !== undefined ? setTimeout(() => child.kill("SIGKILL"), timeoutMs) : undefined;
-    child.on("close", (code, signal) => {
-      clearTimeout(timer);
-      const exit = code ?? (signal ? 124 : 1);
-      resolve({
-        command,
-        exit_code: exit,
-        passed: exit === 0,
-        output_tail: signal ? `${out}\n[killed: ${signal}]` : out,
-        duration_ms: Date.now() - started,
-      });
-    });
-    child.on("error", (err) => {
-      clearTimeout(timer);
-      resolve({ command, exit_code: 127, passed: false, output_tail: String(err), duration_ms: Date.now() - started });
-    });
-  });
+  } catch {
+    // Only an abort rejects: the process group is already killed.
+    return { command, exit_code: 130, passed: false, output_tail: "[aborted]", duration_ms: Date.now() - started };
+  }
 }
 
 export class PlannerWorkerExecutor {
@@ -532,6 +537,11 @@ export class PlannerWorkerExecutor {
   /** One implementation attempt; returns "done" when the contract left the running loop. */
   private async attempt(rt: Runtime): Promise<"again" | "done"> {
     const c = rt.state.contract;
+    // An aborted mission starts no further work: the DAG driver waits for us.
+    if (this.opts.signal?.aborted) {
+      this.forceFail(rt, "aborted");
+      return "done";
+    }
     rt.state.attempt += 1;
     rt.attemptsOnRung += 1;
     const role: PlannerWorkerRole =
@@ -579,7 +589,15 @@ export class PlannerWorkerExecutor {
     rt.verification = [];
     if (run.result.status !== "failed") {
       for (const cmd of rt.state.correction?.verification ?? c.verification) {
-        rt.verification.push(await runVerification(cmd, rt.worktree!.path, this.opts.verificationTimeoutMs));
+        if (this.opts.signal?.aborted) break;
+        rt.verification.push(
+          await runVerification(cmd, rt.worktree!.path, {
+            ...(this.opts.verificationInactivityMs !== undefined
+              ? { inactivityMs: this.opts.verificationInactivityMs }
+              : {}),
+            ...(this.opts.signal ? { signal: this.opts.signal } : {}),
+          }),
+        );
       }
     }
     const failedVerification = rt.verification.filter((v) => !v.passed);
