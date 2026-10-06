@@ -75,7 +75,7 @@ export class FallbackCoordinator {
     // gateway restarting under the stream) or a link cut (retried on a fresh
     // route) says nothing about this model's capacity, so it neither counts
     // toward a switch nor ends a run of saturation holds.
-    if (info.source === "transport-drop" || info.source === "link-cut") return;
+    if (info.source === "transport-drop" || info.source === "link-cut" || info.source === "empty-failure") return;
     // An account-wide refusal (a 429 / admission queue every model shares) is
     // not this model's outage either: a stand-in would wait in the same queue.
     // Only a model-scoped outage — capacity_unavailable, a reload, a GPU move —

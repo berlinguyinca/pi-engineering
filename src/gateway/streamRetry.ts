@@ -51,8 +51,10 @@
 import { monotonicNow } from "../core/clock.ts";
 import { augmentInferenceErrorMessage, isAssistantOutputEvent } from "../inference/admissionContract.ts";
 import {
+  ALTERNATE_MODEL_ADVICE,
   type GatewayWaitInput,
   type GatewayWaitSignal,
+  advisesAlternateModel,
   escalateSyntheticWait,
   isLongWaitTransient,
   parseGatewayWait,
@@ -223,6 +225,13 @@ export function paceInteractiveWait(
   return signal.retryAfterMs >= floor ? signal : { ...signal, retryAfterMs: floor };
 }
 export const SHORT_TRANSIENT_MAX_ELAPSED_MS = 300_000;
+/**
+ * Ceiling for a wait the gateway itself says another model should serve
+ * (IW-ACT-RETRY-ALTERNATE). Without automatic model switching the operator is
+ * the only one who can act on that, so the turn ends with the advice after
+ * this long instead of holding silently for the 12-hour long-wait horizon.
+ */
+export const ALTERNATE_MODEL_MAX_ELAPSED_MS = 15 * 60_000;
 
 function finiteBudget(value: number | undefined, fallback: number, minimum: number): number {
   return typeof value === "number" && Number.isFinite(value) && value >= minimum ? value : fallback;
@@ -334,9 +343,12 @@ export async function pumpWithGatewayRetry<E extends RetryableEvent, R extends R
       : undefined;
     const longWait = held ? isLongWaitTransient(held) : false;
     const attemptCap = longWait ? maxAttempts : Math.min(maxAttempts, SHORT_TRANSIENT_MAX_ATTEMPTS);
-    const chainRemainingMs = longWait
-      ? remainingMs
-      : Math.min(maxElapsedMs, SHORT_TRANSIENT_MAX_ELAPSED_MS) - (now() - startedAt);
+    const chainBudgetMs = !longWait
+      ? Math.min(maxElapsedMs, SHORT_TRANSIENT_MAX_ELAPSED_MS)
+      : held && advisesAlternateModel(held)
+        ? Math.min(maxElapsedMs, ALTERNATE_MODEL_MAX_ELAPSED_MS)
+        : undefined;
+    const chainRemainingMs = chainBudgetMs === undefined ? remainingMs : chainBudgetMs - (now() - startedAt);
     const retryable =
       held?.retryable === true && attempt < attemptCap && chainRemainingMs > 0 && held.retryAfterMs <= chainRemainingMs;
 
@@ -378,7 +390,11 @@ export async function pumpWithGatewayRetry<E extends RetryableEvent, R extends R
 
 function withGuidance<R extends RetryableResult>(result: R | undefined, guidance: GatewayWaitSignal): R | undefined {
   if (!result) return result;
-  return { ...result, errorMessage: augmentInferenceErrorMessage(result.errorMessage, guidance) };
+  const message = augmentInferenceErrorMessage(result.errorMessage, guidance);
+  return {
+    ...result,
+    errorMessage: advisesAlternateModel(guidance) ? `${message} — ${ALTERNATE_MODEL_ADVICE}` : message,
+  };
 }
 
 function withEventGuidance<E extends RetryableEvent>(event: E, guidance: GatewayWaitSignal): E {
