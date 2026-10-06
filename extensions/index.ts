@@ -43,7 +43,11 @@ import { registerToolCallGuard } from "../src/guard/toolCallGuard.ts";
 import { ModelHealthProvider } from "../src/models/health.ts";
 import { defaultModelsPath, providerBaseUrl, readModelsConfig } from "../src/models/modelsConfig.ts";
 import { refreshConfiguredProviders } from "../src/models/refresh.ts";
-import { decideAutoInvoke, missionToolReportedUnavailable } from "../src/orchestration/autoInvoke.ts";
+import {
+  MISSION_UNAVAILABLE_RETRY_TURNS,
+  decideAutoInvoke,
+  missionToolReportedUnavailable,
+} from "../src/orchestration/autoInvoke.ts";
 import { PanelController } from "../src/panel/PanelController.ts";
 import { PanelState } from "../src/panel/PanelState.ts";
 import { readCommitContent, readDiffContent, readFileContent } from "../src/panel/content.ts";
@@ -689,6 +693,9 @@ export default function (pi: ExtensionAPI) {
   // decideAutoInvoke so it is testable without a pi session.
   let lastAutoInvoked: { prompt: string; at: number } | null = null;
   let missionToolUnavailable = false;
+  // User turns since the tool reported unavailable; after
+  // MISSION_UNAVAILABLE_RETRY_TURNS auto-invoke tries the tool again.
+  let turnsSinceMissionUnavailable = 0;
   // The auto-invoke handler uses pi.on(), which is only available in a real pi
   // session (not in the smoke-test stub). Guard accordingly.
   if (typeof pi.on === "function") {
@@ -700,11 +707,16 @@ export default function (pi: ExtensionAPI) {
       const text = event.content.map((part) => (part.type === "text" ? part.text : "")).join("\n");
       // A later mission call that the runtime served clears a transient
       // not-initialized (e.g. the runtime opened after a lock was released).
-      if (missionToolReportedUnavailable(text)) missionToolUnavailable = true;
-      else if (!event.isError) missionToolUnavailable = false;
+      if (missionToolReportedUnavailable(text)) {
+        missionToolUnavailable = true;
+        turnsSinceMissionUnavailable = 0;
+      } else if (!event.isError) missionToolUnavailable = false;
     });
     pi.on("before_agent_start", async (event, ctx) => {
       const prompt = (event.prompt ?? "").trim();
+      if (missionToolUnavailable && ++turnsSinceMissionUnavailable > MISSION_UNAVAILABLE_RETRY_TURNS) {
+        missionToolUnavailable = false;
+      }
       const decision = decideAutoInvoke({
         prompt,
         mode: ctx?.mode,
@@ -1824,6 +1836,9 @@ ${RECOVERY_PROMPT}`;
         ctx.ui.notify("Orchestrator not initialized for this directory.", "error");
         return;
       }
+      // The user reached an initialized orchestrator: the mission tool can
+      // serve this session again, so auto-invoke may use it.
+      missionToolUnavailable = false;
       if (resume) {
         const missionId = resume[1];
         if (!missionId) {

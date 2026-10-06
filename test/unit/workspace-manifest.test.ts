@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, rename, rm, symlink } from "node:fs/promises";
+import { mkdir, mkdtemp, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, it } from "node:test";
@@ -637,10 +637,9 @@ describe("WorkspaceManifestResolver per-clause path intent (PR #106 review)", ()
 
   it("cannot smuggle a write target past 'do not touch' with a list", async () => {
     const [launch, a, b, target] = await repos(4);
-    const negatedOnly = await new WorkspaceManifestResolver().resolve(`Do not touch ${a} or ${b}`, launch!);
-    assert.deepEqual(writable(negatedOnly), [launch], "a negated path is never a write target");
-    assert.equal(access(negatedOnly, a!), "none");
-    assert.equal(access(negatedOnly, b!), "none");
+    // Naming only excluded paths leaves no named target; the launch directory
+    // is not silently substituted (PR #106 re-review).
+    await assert.rejects(new WorkspaceManifestResolver().resolve(`Do not touch ${a} or ${b}`, launch!), isScopeError);
 
     const listed = await new WorkspaceManifestResolver().resolve(
       `Fix the bug in ${target}. Do not touch ${a}, ${b}`,
@@ -731,5 +730,86 @@ describe("WorkspaceManifestResolver per-clause path intent (PR #106 review)", ()
       new WorkspaceManifestResolver().resolve(`Change files in ${target} and ${homedir()}`, launch!),
       (error: unknown) => isScopeError(error) && /home directory/.test(String(error)),
     );
+  });
+});
+
+describe("WorkspaceManifestResolver re-review (PR #106)", () => {
+  const cleanup: Array<() => Promise<void>> = [];
+  afterEach(async () => {
+    for (const dispose of cleanup.splice(0).reverse()) await dispose();
+  });
+
+  async function repos(count: number): Promise<string[]> {
+    const roots: string[] = [];
+    for (let index = 0; index < count; index += 1) {
+      const repo = await makeFixtureRepo();
+      cleanup.push(repo.cleanup);
+      roots.push(repo.root);
+    }
+    return roots;
+  }
+  const writable = (resolved: { repositories: Array<{ canonicalRoot: string }> }) =>
+    resolved.repositories.map((repository) => repository.canonicalRoot);
+  const access = (resolved: { authorizedRoots: Array<{ canonicalPath: string; access: string }> }, path: string) =>
+    resolved.authorizedRoots.find((root) => root.canonicalPath === path)?.access ?? "none";
+  const isScopeError = (error: unknown) => error instanceof WorkspaceScopeError;
+
+  it("never falls back to a launch directory the request excluded", async () => {
+    const [launch] = await repos(1);
+    await assert.rejects(
+      new WorkspaceManifestResolver().resolve(`Do not touch ${launch}. Build the feature.`, launch!),
+      isScopeError,
+    );
+  });
+
+  it("refuses a mutation-directed path that does not exist instead of writing the launch repo", async () => {
+    const [launch, target] = await repos(2);
+    await assert.rejects(
+      new WorkspaceManifestResolver().resolve(`Implement the feature in ${target}e`, launch!),
+      (error: unknown) => isScopeError(error) && /does not exist/.test(String(error)),
+    );
+  });
+
+  for (const template of [
+    (ref: string, target: string) => `Leave ${ref} alone and fix ${target}`,
+    (ref: string, target: string) => `Do not make any changes to ${ref}; fix ${target}`,
+    (ref: string, target: string) => `${ref} must stay unchanged. Fix ${target}.`,
+    (ref: string, target: string) => `Copy the approach of ${ref}, then implement it in ${target}`,
+    (ref: string, target: string) => `Look at ${ref} and fix the same bug in ${target}`,
+  ]) {
+    it(`keeps a non-target path read-only: ${template("REF", "TARGET")}`, async () => {
+      const [launch, ref, target] = await repos(3);
+      const resolved = await new WorkspaceManifestResolver().resolve(template(ref!, target!), launch!);
+      assert.deepEqual(writable(resolved), [target]);
+      assert.equal(access(resolved, ref!), "read");
+    });
+  }
+
+  it("a mutation verb with 'from' still targets the path", async () => {
+    const [launch, target] = await repos(2);
+    const resolved = await new WorkspaceManifestResolver().resolve(`Remove the dead code from ${target}`, launch!);
+    assert.deepEqual(writable(resolved), [target]);
+  });
+
+  it("never makes a system or credential directory writable", async () => {
+    const [launch] = await repos(1);
+    for (const path of ["/etc/nginx", "/etc", join(homedir(), ".ssh"), "/proc/self", join(homedir(), ".claude")]) {
+      await assert.rejects(
+        new WorkspaceManifestResolver().resolve(`fix ${path}`, launch!),
+        (error: unknown) => isScopeError(error) && /protected/i.test(String(error)),
+        path,
+      );
+    }
+  });
+
+  it("treats a file under /tmp used as input as a read root, not a refusal", async () => {
+    const [launch] = await repos(1);
+    const dir = await mkdtemp(join(tmpdir(), "pi-eng-crash-"));
+    cleanup.push(() => rm(dir, { recursive: true, force: true }));
+    const log = join(dir, "crash.log");
+    await writeFile(log, "boom\n");
+    const resolved = await new WorkspaceManifestResolver().resolve(`Analyze ${log} and fix the bug`, launch!);
+    assert.deepEqual(writable(resolved), [launch]);
+    assert.equal(access(resolved, log), "read");
   });
 });
