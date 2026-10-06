@@ -220,3 +220,26 @@ test("a logical alias wins; unavailable aliases and plain gateways fall back to 
   const drained = await resolveRole("implementer", { catalog: draining, config: DEFAULT_ROLE_CONFIG, provider: "gw" });
   assert.notEqual(drained?.via, "alias");
 });
+
+test("a capability-speaking gateway with no listed serving model is asked with a cap: query", async () => {
+  const listed: CatalogModel[] = [
+    { id: "flash", alias: false, aliases: [], capabilities: ["coding.planning"], modalities: [], state: "hot" },
+  ];
+  const config = {
+    ...DEFAULT_ROLE_CONFIG,
+    implementer: { capability: "coding.implementation", preferred_family: "qwen-27b", min_context: 128000 },
+  };
+  const r = await resolveRole("implementer", { catalog: listed, config, provider: "iw" });
+  assert.equal(r?.via, "query");
+  assert.equal(r?.model.id, "cap:coding.implementation?minimum_context=128000&family=qwen-27b");
+  // Once the gateway refused the query, static routing takes over.
+  const fallback = async () => ({ provider: "pinned", id: "p" });
+  const after = await resolveRole("implementer", {
+    catalog: listed,
+    config,
+    provider: "iw",
+    exclude: [r!.model.id],
+    fallback,
+  });
+  assert.equal(after?.via, "static");
+});
