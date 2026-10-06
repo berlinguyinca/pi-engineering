@@ -72,14 +72,31 @@ with these exceptions:
 - A reviewer may run on the pinned model when that model did not produce the
   work. The pinned model is usually also your interactive model.
 
-The pin is held per Pi process, not per conversation. `/new` and
-`/engineering-model auto` clear it, and so does switching back to the model the
-session started on. Missions started by other Pi processes are not affected. The
-pin is stored on each mission that adopts it, so it survives a restart. Each
-adoption is logged as a `MODEL_TRANSITION`. `/engineering-status` and mission
-status show `model: X (operator pin)`. Automatic fallback of the interactive
-model (`PI_GATEWAY_MODEL_FALLBACK_ENABLED`) is still off by default, and a
-switch it makes is not an operator pin.
+**Scope.** The pin belongs to the Pi process, not to one conversation. The
+runtime session id is a single id per process, so every mission that process
+starts or resumes counts as "this session's". `/new` clears the pin for all of
+them. Missions started by other Pi processes are not affected.
+
+**Persistence.** Each mission that adopts the pin stores it, so the pin survives
+a restart. A stored pin keeps overriding role pins after the restart. It also
+keeps the mission waiting on that model when the model is out of capacity: a
+pinned model is never given up for an alternate. Each adoption is logged as a
+`MODEL_TRANSITION`. `/engineering-status` and mission status show
+`model: X (operator pin)`.
+
+**Releasing it.**
+
+- `/engineering-model auto` clears the process pin and releases the pins stored
+  on this process's live missions.
+- Switching back to the model the session started on clears the process pin.
+- `/mission resume <id> --model auto` releases one mission, for example a
+  mission from before a restart. The mission tool's `clear_pin` action does the
+  same.
+
+A released mission uses role pins and the router until you switch models again.
+
+Automatic fallback of the interactive model (`PI_GATEWAY_MODEL_FALLBACK_ENABLED`)
+is still off by default, and a switch it makes is not an operator pin.
 
 ### Interrupting and cancelling a mission
 
@@ -88,21 +105,35 @@ instead of cancelling it. In-flight work stops, interrupted tasks stay
 resumable, and progress is kept. The mission waits until you continue it with
 `/mission resume <id>` or the tool's `resume` action. A resumed mission keeps its
 operator pin. Only an explicit cancel ends a healthy mission: `/mission cancel
-<id>`, or the tool's `cancel` action. An interrupt that arrives before any work
-was planned still cancels, because there is nothing to keep.
+<id>`, or the tool's `cancel` action.
+
+The pause is recorded on the mission the moment Esc lands. Until you resume it,
+nothing automatic resumes it: not the supervisor, not infrastructure
+auto-resume, not repair.
+
+A mission that cannot pause stays in the state it is in and is not cancelled;
+the tool reports "interrupt noted". This covers a mission that is
+`NEEDS_ATTENTION`, `BLOCKED` or `WAITING_FOR_USER`. An interrupt that arrives
+before any work was planned still cancels, because there is nothing to keep.
 
 When a mission worker's model runs out of capacity (`queue_deadline_exceeded`,
 `queue_timeout`, `CAPACITY_EXHAUSTED`), the mission keeps waiting with no
 deadline. It shows `model X is out of capacity; … switch with /model to
-continue`, so you can move it without cancelling.
+continue`, so you can move it without cancelling. A switch ends a capacity hold
+within about a quarter of a second, without waiting out the gateway's advertised
+retry time. The next request then goes to the new model.
 
 `/refresh-models` probes each model with one minimal request: 64 output tokens, no
 streaming, no tools, no images. A model whose probe gets HTTP 400 is retried
 once without the optional parameters (`temperature`, `reasoning_effort`). Each
 model gets its own verdict:
 
-- **working**: applied.
-- **excluded**: 404, `model_not_found`, or an empty answer. Pruned.
+- **working**: any answer with a completion, applied. A reasoning model that
+  spends the whole budget thinking (empty text, `finish_reason: length`) is
+  served. Models configured with `reasoning: true` get a 256-token budget.
+- **excluded**: 404 or `model_not_found`, and the model is also gone from a
+  fresh `/models` listing. Pruned. A 404 for a model that is still listed, or
+  one the listing cannot confirm, is inconclusive.
 - **rejected**: still 400, 413 or 422 after the retry.
 - **inconclusive**: 429, 5xx or a timeout.
 

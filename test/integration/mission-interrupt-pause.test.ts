@@ -173,3 +173,137 @@ test("an explicit cancel is the only thing that terminates a paused or running m
     await fixture.cleanup();
   }
 });
+
+function missionToolFor(rt: EngineeringRuntime) {
+  return buildCoreTools(() => ({
+    ledger: rt.ledger,
+    artifacts: rt.artifacts,
+    broker: rt.broker,
+    orchestrator: rt.orchestrator,
+    baseRef: () => rt.git!.headCommit(),
+    currentWorkItemId: () => null,
+    actor: () => ({ type: "user" }),
+    resumeMission: (id, signal) => rt.resumeBlockedMission(id, signal),
+    cancelMission: (id) => rt.cancelMission(id),
+    clearMissionModelPin: (id) => rt.clearMissionModelPin(id),
+  })).find((tool) => tool.name === "mission")!;
+}
+
+test("the operator pause is recorded the instant Esc lands; supervisor ticks during the pause never resume it", async () => {
+  const fixture = await makeFixtureRepo();
+  const seen: WorkerRequest[] = [];
+  let started!: () => void;
+  const workerStarted = new Promise<void>((resolve) => {
+    started = resolve;
+  });
+  let runtime: EngineeringRuntime | undefined;
+  try {
+    runtime = await openRuntime(fixture.root, capacityWorker(seen, started));
+    const rt = runtime;
+    const esc = new AbortController();
+    let settled = false;
+    const running = missionToolFor(rt)
+      .execute("call-1", { request: "Make add return the sum", mutate: true }, esc.signal, undefined, {
+        cwd: fixture.root,
+      } as never)
+      .finally(() => {
+        settled = true;
+      });
+    await workerStarted;
+    const missionId = rt.missionStore!.listMissions().at(-1)!.mission_id;
+    esc.abort();
+    // Before any await: the pause is already on the mission record.
+    assert.ok(rt.missionStore!.getMission(missionId)?.operator_paused_at, "operator pause recorded synchronously");
+    // Real timers: the session's own supervisor keeps ticking through the
+    // whole pause window (task RETRYING, no worker, stop not yet written).
+    while (!settled) {
+      await rt.missionSupervisor!.tick(missionId).catch(() => []);
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    await running;
+    for (let i = 0; i < 5; i++) await rt.missionSupervisor!.tick(missionId);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(rt.missionStore!.getMission(missionId)?.status, "PAUSED_INFRASTRUCTURE");
+    assert.equal(seen.filter((request) => request.role === "implementer").length, 1, "nothing resumed it");
+    assert.equal(rt.missionStore!.listMissionResumptions(missionId).length, 0);
+  } finally {
+    await runtime?.close();
+    await fixture.cleanup();
+  }
+});
+
+test("Esc on a mission that cannot pause (NEEDS_ATTENTION) leaves it where it is instead of cancelling", async () => {
+  const fixture = await makeFixtureRepo();
+  let started!: () => void;
+  const workerStarted = new Promise<void>((resolve) => {
+    started = resolve;
+  });
+  let runtime: EngineeringRuntime | undefined;
+  try {
+    runtime = await openRuntime(fixture.root, capacityWorker([], started));
+    const rt = runtime;
+    const esc = new AbortController();
+    const running = missionToolFor(rt).execute(
+      "call-1",
+      { request: "Make add return the sum", mutate: true },
+      esc.signal,
+      undefined,
+      { cwd: fixture.root } as never,
+    );
+    await workerStarted;
+    const missionId = rt.missionStore!.listMissions().at(-1)!.mission_id;
+    rt.missionStore!.transitionMission(missionId, "NEEDS_ATTENTION");
+    esc.abort();
+    const result = await running;
+    const text = result.content.map((part) => ("text" in part ? part.text : "")).join("\n");
+    assert.equal(rt.missionStore!.getMission(missionId)?.status, "NEEDS_ATTENTION");
+    assert.match(text, /interrupt noted/i);
+  } finally {
+    await runtime?.close();
+    await fixture.cleanup();
+  }
+});
+
+test("clear_pin releases a paused mission from a persisted operator pin before it resumes", async () => {
+  const fixture = await makeFixtureRepo();
+  const seen: WorkerRequest[] = [];
+  let started!: () => void;
+  const workerStarted = new Promise<void>((resolve) => {
+    started = resolve;
+  });
+  let runtime: EngineeringRuntime | undefined;
+  try {
+    runtime = await openRuntime(fixture.root, capacityWorker(seen, started));
+    const rt = runtime;
+    const sessionId = RuntimeSession.current().sessionId;
+    resetSessionModelChoice(sessionId, GLM);
+    onOperatorModelSelect(sessionId, { model: DEEPSEEK, source: "set" }, new Date(Date.now() - 1_000));
+    const tool = missionToolFor(rt);
+    const ctx = { cwd: fixture.root } as never;
+    const esc = new AbortController();
+    const running = tool.execute(
+      "call-1",
+      { request: "Make add return the sum", mutate: true },
+      esc.signal,
+      undefined,
+      ctx,
+    );
+    await workerStarted;
+    esc.abort();
+    const paused = await running;
+    const missionId = String((paused.details as { missionId?: string }).missionId);
+    assert.equal(rt.missionStore!.getMission(missionId)?.operator_model_pin?.id, DEEPSEEK.id);
+
+    const cleared = await tool.execute("call-2", { action: "clear_pin", missionId }, undefined, undefined, ctx);
+    assert.match(cleared.content.map((part) => ("text" in part ? part.text : "")).join("\n"), /operator pin released/i);
+    assert.equal(rt.missionStore!.getMission(missionId)?.operator_model_pin, null);
+
+    await tool.execute("call-3", { action: "resume", missionId }, undefined, undefined, ctx);
+    const implementers = seen.filter((request) => request.role === "implementer");
+    assert.equal(implementers.length, 2);
+    assert.deepEqual(implementers[1]!.modelOverride, GLM, "back on the role pin, not the released operator pin");
+  } finally {
+    await runtime?.close();
+    await fixture.cleanup();
+  }
+});

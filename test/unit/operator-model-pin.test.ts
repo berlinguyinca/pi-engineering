@@ -13,7 +13,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, it } from "node:test";
+import { after, describe, it } from "node:test";
 import type { RoleRouterAdapter } from "../../src/capability/adapter.ts";
 import type { ModelSource } from "../../src/capability/discovery.ts";
 import { normalizeModelRecord } from "../../src/capability/modelRecord.ts";
@@ -33,13 +33,19 @@ import {
   describeMissionModel,
   describeModelChoice,
   onOperatorModelSelect,
+  releaseMissionModelPin,
+  releaseSessionMissionPins,
   resetSessionModelChoice,
   sessionModelChoice,
 } from "../../src/runtime/operatorModelPin.ts";
 import { missionReportLines } from "../../src/tools/missionReport.ts";
 import { MODEL_SUPERSEDED, type WorkerExecutor } from "../../src/workers/WorkerExecutor.ts";
 
+/** A private scratch directory (never the shared system temp dir itself). */
+const SCRATCH = mkdtempSync(join(tmpdir(), "operator-pin-ctx-"));
+after(() => rmSync(SCRATCH, { recursive: true, force: true }));
 const GLM: ModelRef = { provider: "gw", id: "glm5.3-flash-modality-vision-quant-q6_k_xl" };
+const QWEN: ModelRef = { provider: "gw", id: "qwen3.8-27b" };
 const DEEPSEEK: ModelRef = { provider: "gw", id: "deepseek_v4-flash-modality-text-quant-mxfp4" };
 
 class InventorySource implements ModelSource {
@@ -61,7 +67,7 @@ async function pinnedPolicyRouter(): Promise<Pick<RoleRouterAdapter, "route" | "
   ];
   const registry = await ModelCapabilityRegistry.open({
     sources: [new InventorySource(records)],
-    context: { cwd: tmpdir(), agentDir: tmpdir() },
+    context: { cwd: SCRATCH, agentDir: SCRATCH },
   });
   await registry.refresh();
   const policy = structuredClone(DEFAULT_POLICY);
@@ -251,7 +257,7 @@ describe("operator model pin: switch at the inference boundary", () => {
       verifier: {} as never,
       artifacts: { readContentByUri: async () => undefined } as never,
       git: null,
-      cwd: tmpdir(),
+      cwd: SCRATCH,
       routeModel: createRouteModel({ router, unavailable, operatorPin: pin }),
       currentOperatorPin: pin,
     });
@@ -274,7 +280,7 @@ describe("operator model pin: switch at the inference boundary", () => {
       verifier: {} as never,
       artifacts: { readContentByUri: async () => undefined } as never,
       git: null,
-      cwd: tmpdir(),
+      cwd: SCRATCH,
       routeModel: createRouteModel({
         router: await pinnedPolicyRouter(),
         unavailable: new UnavailableModels(),
@@ -307,7 +313,7 @@ describe("operator model pin: switch at the inference boundary", () => {
           normalizeModelRecord({ ...DEEPSEEK, source: "test", toolCall: true, contextWindow: 262_144 }),
         ]),
       ],
-      context: { cwd: tmpdir(), agentDir: tmpdir() },
+      context: { cwd: SCRATCH, agentDir: SCRATCH },
     });
     await registry.refresh();
     const router = new RoleRouter({ registry, policy: structuredClone(DEFAULT_POLICY) });
@@ -325,5 +331,52 @@ describe("operator model pin: switch at the inference boundary", () => {
     assert.equal(outcome.exitStatus, "succeeded");
     assert.ok(h.seen.length <= 2, JSON.stringify(h.seen));
     assert.equal(h.seen.at(-1)?.superseded, false);
+  });
+});
+
+describe("operator model pin: releasing a mission's pin", () => {
+  it("a released mission stays on automatic routing until the operator switches again", async () => {
+    const f = await storeFixture();
+    try {
+      const session = "S-release";
+      resetSessionModelChoice(session, GLM);
+      const ours = f.mission(session);
+      onOperatorModelSelect(session, { model: DEEPSEEK, source: "set" }, new Date(Date.now() - 1_000));
+      const adopt = () => adoptOperatorModelPin({ store: f.store, missionId: ours, sessionId: session });
+      assert.equal(adopt()?.id, DEEPSEEK.id);
+
+      releaseMissionModelPin({ store: f.store, missionId: ours });
+      assert.equal(f.store.getMission(ours)?.operator_model_pin, null);
+      assert.equal(adopt(), null, "the same session pin is not adopted again");
+
+      onOperatorModelSelect(session, { model: QWEN, source: "set" }, new Date(Date.now() + 1_000));
+      assert.equal(adopt()?.id, QWEN.id, "a later explicit switch is adopted");
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  it("/engineering-model auto releases the pins stored on this session's missions, not others'", async () => {
+    const f = await storeFixture();
+    try {
+      const session = "S-auto";
+      resetSessionModelChoice(session, GLM);
+      const ours = f.mission(session);
+      const theirs = f.mission("S-someone-else");
+      f.store.updateMission(theirs, {
+        operator_model_pin: { provider: "gw", id: DEEPSEEK.id, set_at: new Date().toISOString() },
+      });
+      onOperatorModelSelect(session, { model: DEEPSEEK, source: "set" });
+      adoptOperatorModelPin({ store: f.store, missionId: ours, sessionId: session });
+
+      clearOperatorModelPin(session);
+      const released = releaseSessionMissionPins({ store: f.store, sessionId: session });
+
+      assert.deepEqual(released, [ours]);
+      assert.equal(f.store.getMission(ours)?.operator_model_pin, null);
+      assert.equal(f.store.getMission(theirs)?.operator_model_pin?.id, DEEPSEEK.id);
+    } finally {
+      await f.cleanup();
+    }
   });
 });

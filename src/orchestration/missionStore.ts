@@ -220,7 +220,16 @@ export interface TaskCreateInput {
 
 /** Non-authority mission metadata that may be changed without a lifecycle operation. */
 export type MissionUpdatePatch = Partial<
-  Pick<Mission, "constraints" | "artifact_refs" | "decision_refs" | "required_gates" | "operator_model_pin">
+  Pick<
+    Mission,
+    | "constraints"
+    | "artifact_refs"
+    | "decision_refs"
+    | "required_gates"
+    | "operator_model_pin"
+    | "operator_model_decided_at"
+    | "operator_paused_at"
+  >
 >;
 
 export interface MissionTransitionOptions {
@@ -267,6 +276,8 @@ const MISSION_UPDATE_FIELDS = new Set<keyof MissionUpdatePatch>([
   "decision_refs",
   "required_gates",
   "operator_model_pin",
+  "operator_paused_at",
+  "operator_model_decided_at",
 ]);
 const TASK_TRANSITION_METADATA_FIELDS = new Set<keyof TaskTransitionMetadata>([
   "attempt",
@@ -905,6 +916,22 @@ export class MissionStore {
     this.missions.set(missionId, next);
     this.emit("mission.updated", missionId, { actor, mission_id: missionId, patch: safePatch }, now);
     return this.getMission(missionId)!;
+  }
+
+  /**
+   * Record an operator interrupt (pause) on the mission, synchronously and
+   * durably. Idempotent; a terminal mission is left alone.
+   */
+  markOperatorPause(missionId: string): void {
+    const mission = this.missions.get(missionId);
+    if (!mission || mission.operator_paused_at || ["COMPLETE", "FAILED", "CANCELED"].includes(mission.status)) return;
+    this.updateMission(missionId, { operator_paused_at: new Date().toISOString() }, "operator");
+  }
+
+  /** The operator resumed the mission: automatic recovery may act on it again. */
+  clearOperatorPause(missionId: string): void {
+    if (!this.missions.get(missionId)?.operator_paused_at) return;
+    this.updateMission(missionId, { operator_paused_at: null }, "operator");
   }
 
   completeMission(missionId: string, options: MissionCompletionOptions, actor = "system"): Mission {
@@ -2888,6 +2915,15 @@ function validateMissionUpdatePatch(patch: MissionUpdatePatch): MissionUpdatePat
     ...(patch.artifact_refs !== undefined ? { artifact_refs: [...patch.artifact_refs] } : {}),
     ...(patch.decision_refs !== undefined ? { decision_refs: [...patch.decision_refs] } : {}),
     ...(patch.required_gates !== undefined ? { required_gates: [...patch.required_gates] } : {}),
+    ...(patch.operator_model_decided_at !== undefined
+      ? {
+          operator_model_decided_at:
+            patch.operator_model_decided_at === null ? null : String(patch.operator_model_decided_at),
+        }
+      : {}),
+    ...(patch.operator_paused_at !== undefined
+      ? { operator_paused_at: patch.operator_paused_at === null ? null : String(patch.operator_paused_at) }
+      : {}),
     ...(patch.operator_model_pin !== undefined
       ? {
           operator_model_pin: patch.operator_model_pin

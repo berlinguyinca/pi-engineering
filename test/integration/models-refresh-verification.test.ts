@@ -60,10 +60,11 @@ interface Probe {
 }
 
 async function startGateway(
-  models: string[],
+  models: string[] | ((listing: number) => string[] | null),
   respond: (probe: Probe) => { status: number; body: unknown },
 ): Promise<{ baseUrl: string; probes: Probe[]; close: () => Promise<void> }> {
   const probes: Probe[] = [];
+  let listings = 0;
   const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
     const chunks: Buffer[] = [];
     for await (const chunk of req) chunks.push(chunk as Buffer);
@@ -72,8 +73,14 @@ async function startGateway(
       res.end(JSON.stringify(body));
     };
     if (req.method === "GET" && req.url === "/v1/models") {
+      listings += 1;
+      const listed = typeof models === "function" ? models(listings) : models;
+      if (listed === null) {
+        send(503, { error: { code: "capacity_unavailable", message: "listing unavailable" } });
+        return;
+      }
       send(200, {
-        data: models.map((id) => ({ id, ctx_per_request: 131072, x_context_window: 131072, x_state: "warm" })),
+        data: listed.map((id) => ({ id, ctx_per_request: 131072, x_context_window: 131072, x_state: "warm" })),
       });
       return;
     }
@@ -168,7 +175,7 @@ test("refresh: a per-model HTTP 400 is reported for that model and never aborts 
     const c80k = gateway.probes.filter((p) => p.model === VISION("c80k"));
     assert.equal(c80k.length, 2);
     for (const probe of gateway.probes) {
-      assert.ok(Number(probe.body.max_tokens) <= 64, "the probe asks for a small completion");
+      assert.ok(Number(probe.body.max_tokens) <= 256, "the probe asks for a small completion");
       assert.equal(probe.body.stream, false);
       for (const forbidden of ["tools", "stream_options", "response_format"]) {
         assert.equal(probe.body[forbidden], undefined, `the probe never sends ${forbidden}`);
@@ -233,6 +240,99 @@ test("refresh: an authentication refusal still stops the provider without writin
       /verification was inconclusive.*HTTP 401/,
     );
     assert.equal(readFileSync(s.path, "utf8"), before);
+  } finally {
+    s.cleanup();
+    await gateway.close();
+  }
+});
+
+/** A reasoning model that spends the whole budget thinking: served, no visible text. */
+const THINKING = {
+  status: 200,
+  body: {
+    choices: [
+      { message: { role: "assistant", content: "", reasoning_content: "Let me think…" }, finish_reason: "length" },
+    ],
+  },
+};
+const NOT_FOUND = {
+  status: 404,
+  body: { error: { code: "model_not_found", message: `The model is not served right now.` } },
+};
+
+const ids = (path: string) => read(path).providers.metabolomics.models.map((m) => m.id);
+
+test("refresh: a thinking model that returns no visible text within the budget is served, never pruned", async () => {
+  const gateway = await startGateway([DEEPSEEK, GLM], ({ model }) => (model === DEEPSEEK ? OK : THINKING));
+  const s = scratch(gateway.baseUrl);
+  try {
+    const result = await refreshProviderModels({
+      modelsPath: s.path,
+      providerId: "metabolomics",
+      apiKey: "sk-test",
+      probeModels: true,
+    });
+    assert.ok(ids(s.path).includes(GLM), result.lines.join("\n"));
+    const glmProbe = gateway.probes.find((p) => p.model === GLM);
+    assert.ok(Number(glmProbe?.body.max_tokens) >= 256, "a configured reasoning model gets room to answer");
+  } finally {
+    s.cleanup();
+    await gateway.close();
+  }
+});
+
+test("refresh: a 404 for a model the gateway still lists is transient and keeps the model", async () => {
+  const gateway = await startGateway([DEEPSEEK, GLM], ({ model }) => (model === DEEPSEEK ? OK : NOT_FOUND));
+  const s = scratch(gateway.baseUrl);
+  try {
+    const result = await refreshProviderModels({
+      modelsPath: s.path,
+      providerId: "metabolomics",
+      apiKey: "sk-test",
+      probeModels: true,
+    });
+    assert.ok(ids(s.path).includes(GLM), result.lines.join("\n"));
+    assert.match(result.lines.join("\n"), new RegExp(`inconclusive: ${GLM} — HTTP 404 model_not_found`));
+  } finally {
+    s.cleanup();
+    await gateway.close();
+  }
+});
+
+test("refresh: a 404 for a model that has left the gateway's listing removes it", async () => {
+  const gateway = await startGateway(
+    (listing) => (listing === 1 ? [DEEPSEEK, GLM] : [DEEPSEEK]),
+    ({ model }) => (model === DEEPSEEK ? OK : NOT_FOUND),
+  );
+  const s = scratch(gateway.baseUrl);
+  try {
+    await refreshProviderModels({
+      modelsPath: s.path,
+      providerId: "metabolomics",
+      apiKey: "sk-test",
+      probeModels: true,
+    });
+    assert.ok(!ids(s.path).includes(GLM));
+  } finally {
+    s.cleanup();
+    await gateway.close();
+  }
+});
+
+test("refresh: a 404 is never confirmed when the listing cannot be re-read; the model is kept", async () => {
+  const gateway = await startGateway(
+    (listing) => (listing === 1 ? [DEEPSEEK, GLM] : null),
+    ({ model }) => (model === DEEPSEEK ? OK : NOT_FOUND),
+  );
+  const s = scratch(gateway.baseUrl);
+  try {
+    await refreshProviderModels({
+      modelsPath: s.path,
+      providerId: "metabolomics",
+      apiKey: "sk-test",
+      probeModels: true,
+    });
+    assert.ok(ids(s.path).includes(GLM));
   } finally {
     s.cleanup();
     await gateway.close();

@@ -228,6 +228,12 @@ export class MissionSupervisor {
 
   private async reconcile(mission: Mission, expectedResumptionGeneration: number): Promise<SupervisorStatus> {
     this.assertResumptionGeneration(mission.mission_id, expectedResumptionGeneration);
+    // The operator paused it (Esc): only the operator resumes it. Checked
+    // first, because between the interrupt and the durable stop its tasks are
+    // RETRYING with no worker, which would otherwise read as an orphan.
+    if (this.store.getMission(mission.mission_id)?.operator_paused_at) {
+      return this.status(mission, "HEALTHY", "Paused by the operator; waiting for /mission resume");
+    }
     const currentStop = this.store
       .listMissionStops(mission.mission_id)
       .filter((stop) => stop.resumptionGeneration === expectedResumptionGeneration)

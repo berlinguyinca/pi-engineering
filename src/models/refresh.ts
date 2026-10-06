@@ -87,13 +87,17 @@ const DEFAULT_PROBE_CONCURRENCY = 1;
  * still needs room to reach a visible "OK".
  */
 const PROBE_MAX_TOKENS = 64;
+/** A configured reasoning model thinks before it answers: give it room. */
+const REASONING_PROBE_MAX_TOKENS = 256;
 
 /**
  * One model's verification verdict.
  *
  * - `working`: produced a completion.
- * - `unavailable` (definitive): the gateway does not serve it (404,
- *   `model_not_found`) or it answered with no visible text. Pruned as before.
+ * - `unavailable` (definitive): the gateway answered 404 / `model_not_found`
+ *   AND the model has left its `/models` listing on a re-read. Pruned. A 404
+ *   for a model still listed (a worker rejoining during a deploy), or one the
+ *   listing cannot confirm, is inconclusive.
  * - `rejected` (definitive): the request was refused as invalid (400/413/422)
  *   even after one retry without optional parameters — a probe incompatibility
  *   or a model fault, not "try again later". Kept as configured, never added.
@@ -178,6 +182,7 @@ async function probeGatewayModel(
   baseUrl: string,
   opts: RefreshOptions,
   optional: { disableThinking: boolean } | null,
+  maxTokens: number = PROBE_MAX_TOKENS,
 ): Promise<ProbeResult> {
   opts.signal?.throwIfAborted();
   const controller = new AbortController();
@@ -195,7 +200,7 @@ async function probeGatewayModel(
       body: JSON.stringify({
         model: model.id,
         messages: [{ role: "user", content: "Reply with exactly OK." }],
-        max_tokens: PROBE_MAX_TOKENS,
+        max_tokens: maxTokens,
         stream: false,
         ...(optional ? { temperature: 0 } : {}),
         ...(optional?.disableThinking ? { reasoning_effort: "none" } : {}),
@@ -211,14 +216,14 @@ async function probeGatewayModel(
     }
     if (response.ok) {
       if (visibleCompletion(payload)) return { verdict: "working" };
-      // Without the thinking-off parameter a reasoning model may spend the
-      // whole small budget thinking; an accepted request still proves it is
-      // served, which is all the retry has to establish.
+      // A reasoning model may spend the whole small budget thinking (empty
+      // content, finish_reason "length"): an answered request still proves the
+      // model is served, which is all verification has to establish.
       const choices = (payload as { choices?: unknown })?.choices;
-      if (!optional && Array.isArray(choices) && choices.length > 0) {
-        return { verdict: "working", note: "accepted without optional probe parameters" };
+      if (Array.isArray(choices) && choices.length > 0) {
+        return { verdict: "working", note: "served; no visible text within the probe budget" };
       }
-      return { verdict: "unavailable", reason: "returned no visible completion" };
+      return { verdict: "inconclusive", reason: "HTTP 200 without a completion" };
     }
     const code = errorCode(payload);
     const reason = describeRefusal(response.status, code, errorText(payload, raw));
@@ -255,6 +260,8 @@ async function verifiedGatewayModels(
   baseUrl: string,
   opts: RefreshOptions,
   disableThinking: boolean,
+  reasoningIds: ReadonlySet<string>,
+  relist: () => Promise<GatewayModelEntry[] | null>,
 ): Promise<Verification> {
   const verdicts = new Array<ProbeResult>(gateway.length);
   let next = 0;
@@ -265,14 +272,15 @@ async function verifiedGatewayModels(
         const index = next++;
         if (index >= gateway.length) return;
         const model = gateway[index]!;
-        let result = await probeGatewayModel(model, baseUrl, opts, { disableThinking });
+        const budget = reasoningIds.has(model.id) ? REASONING_PROBE_MAX_TOKENS : PROBE_MAX_TOKENS;
+        let result = await probeGatewayModel(model, baseUrl, opts, { disableThinking }, budget);
         if (result.verdict === "inconclusive" && result.reason === "probe timed out") {
-          result = await probeGatewayModel(model, baseUrl, opts, { disableThinking });
+          result = await probeGatewayModel(model, baseUrl, opts, { disableThinking }, budget);
         } else if (result.verdict === "rejected") {
           // A 400 is most often a parameter this model's backend does not
           // accept. Retry once with only the required fields; a second refusal
           // is the model's definitive answer to the minimal probe.
-          const retry = await probeGatewayModel(model, baseUrl, opts, null);
+          const retry = await probeGatewayModel(model, baseUrl, opts, null, budget);
           // Whatever else the retry says, the model answered the full probe with
           // a 400: it is never pruned on the retry's word alone.
           result =
@@ -286,6 +294,21 @@ async function verifiedGatewayModels(
       }
     }),
   );
+  // A single 404 never deletes a model: only one that has also left the
+  // gateway's listing is gone. A listing that cannot be re-read confirms nothing.
+  if (verdicts.some((result) => result.verdict === "unavailable")) {
+    const listed = await relist().catch(() => null);
+    const stillListed = new Set((listed ?? []).map((entry) => entry.id));
+    verdicts.forEach((result, index) => {
+      if (result.verdict !== "unavailable") return;
+      if (listed === null || stillListed.has(gateway[index]!.id)) {
+        verdicts[index] = {
+          verdict: "inconclusive",
+          reason: `${result.reason} (${listed === null ? "listing could not be re-read" : "still listed by the gateway"})`,
+        };
+      }
+    });
+  }
   const systemic = gateway
     .map((model, index) => ({ model, result: verdicts[index]! }))
     .filter((entry) => entry.result.verdict === "systemic");
@@ -332,18 +355,21 @@ async function planProviderRefresh(config: ModelsConfig, opts: RefreshOptions): 
   const configuredProvider = config.providers?.[opts.providerId];
   const api = typeof configuredProvider?.api === "string" ? configuredProvider.api : "openai-completions";
 
-  const advertised = await fetchGatewayModels({
-    baseUrl,
-    ...(opts.apiKey ? { apiKey: opts.apiKey } : {}),
-    ...(opts.headers ? { headers: opts.headers } : {}),
-    ...(opts.signal ? { signal: opts.signal } : {}),
-    ...(opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}),
-  });
+  const listing = () =>
+    fetchGatewayModels({
+      baseUrl,
+      ...(opts.apiKey ? { apiKey: opts.apiKey } : {}),
+      ...(opts.headers ? { headers: opts.headers } : {}),
+      ...(opts.signal ? { signal: opts.signal } : {}),
+      ...(opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}),
+    });
+  const advertised = await listing();
+  const reasoningIds = new Set(existing.filter((model) => model.reasoning === true).map((model) => model.id));
 
   const canProbe = opts.probeModels && api === "openai-completions";
   const disableThinking = supportsThinkingOff(opts.providerId, api, baseUrl);
   const verified: Verification = canProbe
-    ? await verifiedGatewayModels(advertised, baseUrl, opts, disableThinking)
+    ? await verifiedGatewayModels(advertised, baseUrl, opts, disableThinking, reasoningIds, listing)
     : { working: advertised, excluded: [], held: [], notes: [] };
   const gateway = verified.working;
   const configuredIds = new Set(existing.map((model) => model.id));

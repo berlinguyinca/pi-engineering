@@ -24,7 +24,7 @@ import { GitRepo } from "../git/GitRepo.ts";
 import { Ledger } from "../ledger/Ledger.ts";
 import { loadMissionLimits } from "../lifecycle/policy.ts";
 import { workflowMutatesRepo } from "../orchestration/intentRouter.ts";
-import { OPERATOR_PAUSE_STOP_REASON } from "../orchestration/interrupt.ts";
+import { OPERATOR_PAUSE_STOP_REASON, interruptibleRun } from "../orchestration/interrupt.ts";
 import {
   MISSION_SNAPSHOT_FILENAME,
   type MissionSnapshotFile,
@@ -70,7 +70,13 @@ import {
 import { assessProcess } from "./isolation/processIdentity.ts";
 import { isReloadShutdown } from "./isolation/reloadCustody.ts";
 import { UnavailableModels, createRouteModel, followUnavailableModels } from "./modelRouting.ts";
-import { adoptOperatorModelPin, claimMissionForSession } from "./operatorModelPin.ts";
+import {
+  type PinTransition,
+  adoptOperatorModelPin,
+  claimMissionForSession,
+  releaseMissionModelPin,
+  releaseSessionMissionPins,
+} from "./operatorModelPin.ts";
 
 /**
  * Build the mission gateway recovery probe.
@@ -867,16 +873,7 @@ export class EngineeringRuntime {
               store: rt.missionStore,
               missionId,
               sessionId: RuntimeSession.current().sessionId,
-              onTransition: (transition) => {
-                const text = `MODEL_TRANSITION mission ${transition.missionId}: ${transition.from ?? "auto"} → ${transition.to ?? "auto"} (${transition.reason})`;
-                rt.missionObservability?.activity(transition.missionId, { type: "model_request", summary: text });
-                emitTelemetry({
-                  level: "info",
-                  text: `[mission ${transition.missionId}] ${transition.to ? `model: ${transition.to} (operator pin)` : "model: auto (operator pin cleared)"} from its next worker dispatch`,
-                  key: `operator-pin:${transition.missionId}:${transition.to ?? "auto"}`,
-                  detail: { type: "MODEL_TRANSITION", ...transition },
-                });
-              },
+              onTransition: (transition) => rt.reportPinTransition(transition),
             })
           : null;
       try {
@@ -1104,6 +1101,45 @@ export class EngineeringRuntime {
     this.missionStore = null;
   }
 
+  /** Log a mission's operator-pin change as a MODEL_TRANSITION (observability + operator notice). */
+  private reportPinTransition(transition: PinTransition): void {
+    const text = `MODEL_TRANSITION mission ${transition.missionId}: ${transition.from ?? "auto"} → ${transition.to ?? "auto"} (${transition.reason})`;
+    this.missionObservability?.activity(transition.missionId, { type: "model_request", summary: text });
+    emitTelemetry({
+      level: "info",
+      text: `[mission ${transition.missionId}] ${transition.to ? `model: ${transition.to} (operator pin)` : "model: auto (operator pin cleared)"} from its next worker dispatch`,
+      key: `operator-pin:${transition.missionId}:${transition.to ?? "auto"}`,
+      detail: { type: "MODEL_TRANSITION", ...transition },
+    });
+  }
+
+  /**
+   * Release one mission from its operator pin: it returns to role pins and the
+   * capability router until the operator switches models again.
+   */
+  async clearMissionModelPin(missionId: string): Promise<import("../orchestration/types.ts").Mission> {
+    if (!this.missionStore) throw new Error("Orchestrator not initialized for this directory.");
+    releaseMissionModelPin({
+      store: this.missionStore,
+      missionId,
+      onTransition: (transition) => this.reportPinTransition(transition),
+    });
+    await this.missionStore.flush();
+    return this.missionStore.getMission(missionId)!;
+  }
+
+  /** `/engineering-model auto`: release the pins stored on this session's live missions. */
+  async releaseSessionMissionPins(): Promise<string[]> {
+    if (!this.missionStore) return [];
+    const released = releaseSessionMissionPins({
+      store: this.missionStore,
+      sessionId: RuntimeSession.current().sessionId,
+      onTransition: (transition) => this.reportPinTransition(transition),
+    });
+    await this.missionStore.flush();
+    return released;
+  }
+
   /** Explicitly cancel a mission: the only operator action that terminates a healthy mission. */
   async cancelMission(missionId: string): Promise<import("../orchestration/types.ts").Mission> {
     if (!this.missionStore || !this.orchestrator) throw new Error("Orchestrator not initialized for this directory.");
@@ -1135,11 +1171,20 @@ export class EngineeringRuntime {
     if (["COMPLETE", "FAILED", "CANCELED"].includes(mission.status)) {
       throw new Error(`mission ${missionId} is terminal (${mission.status}) and cannot be resumed`);
     }
+    // The operator resumes: automatic recovery may act on it again.
+    const wasOperatorPaused = !!mission.operator_paused_at;
+    this.missionStore.clearOperatorPause(missionId);
     const generation = this.missionStore.listMissionResumptions(missionId).at(-1)?.generation ?? 0;
     const stop = this.missionStore
       .listMissionStops(missionId)
       .filter((candidate) => candidate.resumptionGeneration === generation)
       .at(-1);
+    if (!stop && wasOperatorPaused) {
+      // Interrupted in a state it was left in (e.g. NEEDS_ATTENTION): handing
+      // it back to supervision is the resume.
+      await this.missionStore.flush();
+      return this.missionStore.getMission(missionId)!;
+    }
     if (!stop) throw new Error(`mission ${missionId} has no current durable stop to resume`);
     if (stop.reason === OPERATOR_PAUSE_STOP_REASON && mission.status === "PAUSED_INFRASTRUCTURE") {
       // Paused by an operator interrupt: continue exactly where it stopped. The
@@ -1151,11 +1196,16 @@ export class EngineeringRuntime {
     mission = await this.normalizeMissionForRepair(missionId);
     this.missionStore.resumeMission(missionId, "operator requested mission recovery");
     await this.missionStore.flush();
+    // An interrupt during the operator's recovery pauses it again; it never cancels.
+    const run = interruptibleRun(signal, "pause");
+    run.onPause(() => this.missionStore?.markOperatorPause(missionId));
     try {
-      await this.orchestrator.repairBlockedMission(missionId, signal);
+      await this.orchestrator.repairBlockedMission(missionId, run.signal);
     } catch (error) {
       await this.persistRecoveryStop(missionId, `Manual recovery failed: ${errorMessage(error)}`, stop);
       throw error;
+    } finally {
+      run.dispose();
     }
     mission = this.missionStore.getMission(missionId)!;
     if ((mission.status === "BLOCKED" || mission.status === "REPAIRING") && !this.currentMissionStop(missionId)) {
@@ -1194,6 +1244,8 @@ export class EngineeringRuntime {
     try {
       const mission = this.missionStore.getMission(status.missionId);
       if (!mission || !this.isCurrentSupervisorStatus(status, mission)) return;
+      // Only the operator resumes a mission the operator paused.
+      if (mission.operator_paused_at) return;
       failureFence = mission;
       if (mission.status === "PAUSED_INFRASTRUCTURE") {
         if (status.action === "STOP" || status.action === "MONITOR") return;

@@ -444,7 +444,7 @@ test("refresh: a model the gateway dropped is kept unless pruning is asked for",
   }
 });
 
-test("refresh: verification writes only models that produce a visible completion", async () => {
+test("refresh: verification keeps every model that answers, visible text or not", async () => {
   const s = scratch();
   const requested: string[] = [];
   let inFlight = 0;
@@ -491,10 +491,13 @@ test("refresh: verification writes only models that produce a visible completion
 
     assert.deepEqual(requested.sort(), PAYLOAD.data.map((model) => model.id).sort());
     assert.equal(maxInFlight, 1, "default probing must not create its own capacity contention");
+    // A reasoning model that spends the probe budget thinking (empty content)
+    // is still served: it must never be pruned from the picker for that.
     assert.deepEqual(
-      read(s.path).providers.metabolomics.models.map((model) => model.id),
-      ["deepseek-v4-flash", "qwen3.8-27b-q4-250k"],
-      "advertised-but-failing and empty-answer models must leave the picker",
+      read(s.path)
+        .providers.metabolomics.models.map((model) => model.id)
+        .sort(),
+      PAYLOAD.data.map((model) => model.id).sort(),
     );
   } finally {
     s.cleanup();

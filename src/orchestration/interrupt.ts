@@ -37,11 +37,31 @@ export type InterruptMode = "cancel" | "pause";
 export function interruptibleRun(
   caller: AbortSignal | undefined,
   mode: InterruptMode = "cancel",
-): { controller: AbortController; signal: AbortSignal; dispose: () => void } {
+): {
+  controller: AbortController;
+  signal: AbortSignal;
+  dispose: () => void;
+  /**
+   * Run `hook` synchronously the moment an operator interrupt pauses this run —
+   * before the abort reaches any worker — or at once if it already has.
+   */
+  onPause: (hook: () => void) => void;
+} {
   const controller = new AbortController();
+  let pauseHook: (() => void) | undefined;
+  let paused = false;
   const forward = (): void => {
     if (controller.signal.aborted) return;
-    controller.abort(mode === "pause" ? MISSION_PAUSE_REASON : caller?.reason);
+    if (mode === "pause") {
+      paused = true;
+      try {
+        pauseHook?.();
+      } finally {
+        controller.abort(MISSION_PAUSE_REASON);
+      }
+      return;
+    }
+    controller.abort(caller?.reason);
   };
   if (caller?.aborted) forward();
   else caller?.addEventListener("abort", forward, { once: true });
@@ -49,5 +69,9 @@ export function interruptibleRun(
     controller,
     signal: controller.signal,
     dispose: () => caller?.removeEventListener("abort", forward),
+    onPause: (hook) => {
+      pauseHook = hook;
+      if (paused) hook();
+    },
   };
 }

@@ -590,6 +590,7 @@ async function resolveServices(cwd: string): Promise<CoreServices | null> {
     actor: () => ({ type: "user" }),
     resumeMission: (id, s) => rt.resumeBlockedMission(id, s),
     cancelMission: (id) => rt.cancelMission(id),
+    clearMissionModelPin: (id) => rt.clearMissionModelPin(id),
     // A rebound parent launch targets the bound worktree by default.
     ...(effective !== cwd ? { repositoryRoot: rt.git?.root ?? effective } : {}),
   };
@@ -726,8 +727,13 @@ export default function (pi: ExtensionAPI) {
       const want = (args ?? "").trim();
       if (want === "auto") {
         clearOperatorModelPin(sessionId);
+        // Also release the pins already stored on this session's missions.
+        const released: string[] = [];
+        for (const entry of runtimes.values()) {
+          released.push(...(await entry.runtime.releaseSessionMissionPins().catch(() => [])));
+        }
         ctx.ui.notify(
-          "Operator model pin cleared; missions return to automatic routing at their next dispatch.",
+          `Operator model pin cleared; missions return to automatic routing at their next dispatch${released.length > 0 ? ` (released: ${released.join(", ")})` : ""}.`,
           "info",
         );
         return;
@@ -1888,7 +1894,7 @@ ${RECOVERY_PROMPT}`;
 
   pi.registerCommand("mission", {
     description:
-      "Run an orchestration mission; /mission resume <missionId> continues a stopped or paused one, /mission cancel <missionId> ends one.",
+      "Run an orchestration mission; /mission resume <missionId> [--model auto] continues a stopped or paused one (optionally releasing its operator model pin), /mission cancel <missionId> ends one.",
     handler: async (args, ctx) => {
       const request = args.trim();
       if (!request) {
@@ -1907,7 +1913,8 @@ ${RECOVERY_PROMPT}`;
         return;
       }
       const resumePrefix = /^resume(?:\b|[:=])/i.test(request);
-      const resume = /^resume\s+(\S+)\s*$/i.exec(request);
+      // `--model auto` releases the mission from a persisted operator pin first.
+      const resume = /^resume\s+(\S+)(\s+--model\s+auto)?\s*$/i.exec(request);
       if (resumePrefix && !resume) {
         ctx.ui.notify("/mission resume <missionId>", "error");
         return;
@@ -1928,6 +1935,13 @@ ${RECOVERY_PROMPT}`;
         }
         if (await plannerWorker.resumeIfOwned(missionId, ctx)) return;
         try {
+          if (resume[2]) {
+            await rt.clearMissionModelPin(missionId);
+            ctx.ui.notify(
+              `[mission ${missionId}] operator pin released; automatic routing from its next dispatch`,
+              "info",
+            );
+          }
           activeControl?.missionProgress(`[mission ${missionId}] resuming`);
           await rt.resumeBlockedMission(missionId, ctx.signal);
           const mission = rt.missionStore?.getMission(missionId);
@@ -1964,13 +1978,15 @@ ${RECOVERY_PROMPT}`;
       });
       const m = result.mission;
       const completion =
-        result.pausedBy === "operator"
-          ? `PAUSED by interrupt — progress preserved; /mission resume ${result.mission.mission_id} continues it, /mission cancel ${result.mission.mission_id} ends it`
-          : result.paused
-            ? "PAUSED — infrastructure retry window exhausted (auto-resumes on recovery; not a failure)"
-            : result.completed
-              ? "PASSED"
-              : `BLOCKED — ${result.failureReason ?? ""}`;
+        result.pausedBy === "operator" && result.mission.status !== "PAUSED_INFRASTRUCTURE"
+          ? `interrupt noted — mission left ${result.mission.status} (not canceled); /mission resume ${result.mission.mission_id} continues it`
+          : result.pausedBy === "operator"
+            ? `PAUSED by interrupt — progress preserved; /mission resume ${result.mission.mission_id} continues it, /mission cancel ${result.mission.mission_id} ends it`
+            : result.paused
+              ? "PAUSED — infrastructure retry window exhausted (auto-resumes on recovery; not a failure)"
+              : result.completed
+                ? "PASSED"
+                : `BLOCKED — ${result.failureReason ?? ""}`;
       const lines = [
         `Mission ${m.mission_id} [${m.status}] workflow=${m.workflow_class} risk=${m.risk_profile}`,
         `Intent: ${result.intent.intent.join(", ")} (confidence ${result.intent.confidence.toFixed(2)})`,
