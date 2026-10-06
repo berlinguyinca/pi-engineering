@@ -11,7 +11,17 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { closeSync, mkdirSync, openSync, readFileSync, statSync, unlinkSync, writeSync } from "node:fs";
+import {
+  closeSync,
+  linkSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+  writeSync,
+} from "node:fs";
 import { dirname } from "node:path";
 import { assessProcess, currentProcessIdentity } from "../runtime/isolation/processIdentity.ts";
 
@@ -43,11 +53,18 @@ export interface MutationLockHandle {
 /** In-process holders by lock file: the mutex half. */
 const held = new Map<string, LockOwner>();
 
+export interface MutationLockHooks {
+  /** Deterministic race injection: runs after a claim was judged stale, before it is broken. Tests only. */
+  beforeClaimExpire?: (claim: string) => void;
+}
+
 export class RuntimeMutationLock {
   readonly file: string;
+  private readonly hooks: MutationLockHooks;
 
-  constructor(file: string) {
+  constructor(file: string, hooks: MutationLockHooks = {}) {
     this.file = file;
+    this.hooks = hooks;
   }
 
   /** Acquire or throw MutationLockBusyError. Never waits: a concurrent request is told, not queued. */
@@ -123,16 +140,14 @@ export class RuntimeMutationLock {
       // and so does one that never got its content (killed between create and
       // write, disk full): unreadable, but only once no writer can still be
       // filling it in.
+      const observed = statSync(claim, { throwIfNoEntry: false });
+      if (!observed) return retried ? false : this.breakStale(judged, true); // Just went away.
       const claimant = readClaimant(claim);
-      const age = ageMs(claim);
-      if (age === Number.POSITIVE_INFINITY) return retried ? false : this.breakStale(judged, true); // Just went away.
-      const expired = claimant === null ? age > FRESH_MS : !isAlive(claimant) && age > FRESH_MS;
+      const age = Date.now() - observed.mtimeMs;
+      const expired = age > FRESH_MS && (claimant === null || !isAlive(claimant));
       if (!expired) return false;
-      try {
-        unlinkSync(claim);
-      } catch {
-        // Raced with another expirer.
-      }
+      this.hooks.beforeClaimExpire?.(claim);
+      if (!expireClaim(claim, observed)) return false;
       return retried ? false : this.breakStale(judged, true);
     }
     try {
@@ -180,6 +195,46 @@ export class RuntimeMutationLock {
     const owner = this.readOwner();
     return !!owner && isAlive(owner);
   }
+}
+
+/**
+ * Remove the stale claim we judged, and only that one. Check-then-unlink by
+ * name could delete a fresh claim another process created in between, so the
+ * claim is first renamed to a unique tombstone (atomic), the tombstone is
+ * checked to be the very file judged (inode, mtime, size), and only then
+ * deleted. A different file is put back (or, if a newer claim already
+ * exists, discarded: that newer one guards the lock). True when ours went.
+ */
+function expireClaim(claim: string, observed: { ino: number; mtimeMs: number; size: number }): boolean {
+  const tombstone = `${claim}.reap.${process.pid}.${randomUUID()}`;
+  try {
+    renameSync(claim, tombstone);
+  } catch {
+    return false; // Already gone (another expirer); the next attempt decides.
+  }
+  const moved = statSync(tombstone, { throwIfNoEntry: false });
+  const same =
+    !!moved && moved.ino === observed.ino && moved.mtimeMs === observed.mtimeMs && moved.size === observed.size;
+  if (same) {
+    try {
+      unlinkSync(tombstone);
+    } catch {
+      // Already gone.
+    }
+    return true;
+  }
+  // Not what we judged: a live claimant's fresh claim. Put it back.
+  try {
+    linkSync(tombstone, claim);
+  } catch {
+    // A newer claim took the name; it guards the lock.
+  }
+  try {
+    unlinkSync(tombstone);
+  } catch {
+    // Already gone.
+  }
+  return false;
 }
 
 type Claimant = Pick<LockOwner, "pid" | "host" | "bootId" | "processStartTime">;

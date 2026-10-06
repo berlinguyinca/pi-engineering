@@ -5,7 +5,16 @@
 
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, test } from "node:test";
@@ -127,6 +136,87 @@ test("mutation lock: an unreadable stale-break claim (empty, truncated, null) ex
   writeFileSync(claim, "");
   assert.throws(() => new RuntimeMutationLock(file).acquire("reload"), MutationLockBusyError);
   assert.equal(existsSync(claim), true, "a fresh unreadable claim is left alone");
+});
+
+test("mutation lock: expiring a stale claim never deletes a fresh claim that replaced it meanwhile", async () => {
+  const dir = tmp();
+  const file = join(dir, "runtime-update.lock");
+  const claim = `${file}.claim`;
+  const old = new Date(Date.now() - 60_000);
+  writeFileSync(file, JSON.stringify({ pid: await deadPid(), token: "t", operation: "update", acquiredAt: "x" }));
+  writeFileSync(claim, "");
+  utimesSync(claim, old, old);
+  const fresh = JSON.stringify({ pid: process.pid, note: "a live claimant that won the race" });
+  const lock = new RuntimeMutationLock(file, {
+    // Between judging the old claim stale and breaking it, another process
+    // expires it too and publishes its own (fresh, live) claim.
+    beforeClaimExpire: () => {
+      rmSync(claim);
+      writeFileSync(claim, fresh);
+    },
+  });
+  assert.throws(() => lock.acquire("reload"), MutationLockBusyError, "the live claimant is respected");
+  assert.equal(readFileSync(claim, "utf8"), fresh, "the fresh claim survived");
+  assert.deepEqual(
+    readdirSync(dir).filter((name) => name.includes(".claim.")),
+    [],
+    "no tombstone is left behind",
+  );
+});
+
+test("mutation lock: processes racing over a stale lock AND a stale claim never both hold it", async () => {
+  const file = join(tmp(), "runtime-update.lock");
+  const claim = `${file}.claim`;
+  for (let round = 0; round < 3; round++) {
+    writeFileSync(
+      file,
+      JSON.stringify({ pid: await deadPid(), token: `stale-${round}`, operation: "update", acquiredAt: "x" }),
+    );
+    writeFileSync(claim, round % 2 === 0 ? "" : JSON.stringify({ pid: await deadPid() }));
+    const old = new Date(Date.now() - 60_000);
+    utimesSync(claim, old, old);
+    const script = `
+      import { RuntimeMutationLock } from ${JSON.stringify(lockModule)};
+      const lock = new RuntimeMutationLock(${JSON.stringify(file)});
+      await new Promise((r) => setTimeout(r, 200 - Date.now() % 200));
+      let h;
+      for (let i = 0; i < 3 && !h; i++) {
+        try { h = lock.acquire("race"); } catch { await new Promise((r) => setTimeout(r, 5)); }
+      }
+      if (!h) { process.stdout.write("BUSY\\n"); process.exit(0); }
+      process.stdout.write("HELD " + Date.now() + "\\n");
+      await new Promise((r) => setTimeout(r, 300));
+      process.stdout.write("RELEASED " + Date.now() + "\\n");
+      h.release();
+    `;
+    const runs = await Promise.all(
+      Array.from(
+        { length: 6 },
+        () =>
+          new Promise<string>((resolveRun) => {
+            const child = spawn(process.execPath, ["--no-warnings", "--input-type=module", "-e", script], {
+              stdio: ["ignore", "pipe", "inherit"],
+            });
+            let out = "";
+            child.stdout.on("data", (d: Buffer) => {
+              out += d.toString();
+            });
+            child.on("exit", () => resolveRun(out));
+          }),
+      ),
+    );
+    const windows = runs
+      .filter((o) => o.includes("HELD"))
+      .map((o) => [Number(/HELD (\d+)/.exec(o)?.[1]), Number(/RELEASED (\d+)/.exec(o)?.[1])] as const)
+      .sort((a, b) => a[0] - b[0]);
+    assert.ok(windows.length >= 1, `someone took over the stale lock in round ${round}`);
+    for (let i = 1; i < windows.length; i++) {
+      assert.ok(
+        (windows[i]?.[0] as number) >= (windows[i - 1]?.[1] as number),
+        `overlapping holders in round ${round}`,
+      );
+    }
+  }
 });
 
 test("journal: atomic records, phases, incomplete detection, corrupt detection", () => {
