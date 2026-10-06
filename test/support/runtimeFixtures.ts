@@ -21,6 +21,16 @@ export interface FixtureOptions {
   runtimeApi?: number;
   /** Extra `piEngineering` metadata in package.json. */
   metadata?: Record<string, unknown>;
+  /** Declared state schema support. */
+  stateSchema?: { minReadable: number; maxReadable: number; writes: number };
+  /**
+   * A shipped migration over `.pi-eng/missions.json`:
+   *   ok    - {schema:N, missions:[...]} becomes {schema:N+1, items:[...]};
+   *   throw - writes a torn file, then fails;
+   *   crash - writes a torn file, prints MIGRATION_HALF and never returns
+   *           (the crash test kills the process there).
+   */
+  migration?: { from: number; to: number; behaviour: "ok" | "throw" | "crash" };
 }
 
 export interface FixtureBag {
@@ -65,13 +75,49 @@ export function writeFixtureRuntime(dir: string, key: string, opts: FixtureOptio
         name: "fixture-runtime",
         version: opts.version ?? "0.0.1",
         type: "module",
-        piEngineering: { runtimeApi: opts.runtimeApi ?? 1, entry: "runtime.ts", ...(opts.metadata ?? {}) },
+        piEngineering: {
+          runtimeApi: opts.runtimeApi ?? 1,
+          entry: "runtime.ts",
+          ...(opts.stateSchema ? { stateSchema: opts.stateSchema } : {}),
+          ...(opts.migration ? { migrations: "migrations.ts" } : {}),
+          ...(opts.metadata ?? {}),
+        },
       },
       null,
       2,
     )}\n`,
   );
   writeFileSync(join(dir, "dep.ts"), `export const VALUE: string = ${JSON.stringify(opts.value)};\n`);
+  if (opts.migration) {
+    const m = opts.migration;
+    writeFileSync(
+      join(dir, "migrations.ts"),
+      `import { readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+const BEHAVIOUR = ${JSON.stringify(m.behaviour)};
+export const migrations = [
+  {
+    id: "v${m.from}-v${m.to}",
+    from: ${m.from},
+    to: ${m.to},
+    description: "missions.json: missions -> items",
+    touches: ["missions.json"],
+    async apply(stateDir: string) {
+      const file = join(stateDir, "missions.json");
+      const before = JSON.parse(readFileSync(file, "utf8"));
+      if (BEHAVIOUR !== "ok") {
+        writeFileSync(file, '{"schema":${m.to},"items":[');
+        if (BEHAVIOUR === "throw") throw new Error("fixture migration exploded half way");
+        process.stdout.write("MIGRATION_HALF\\n");
+        await new Promise(() => {});
+      }
+      writeFileSync(file, JSON.stringify({ schema: ${m.to}, items: before.missions }));
+    },
+  },
+];
+`,
+    );
+  }
   const mode = opts.mode ?? "ok";
   writeFileSync(
     join(dir, "runtime.ts"),

@@ -17,6 +17,7 @@ import { existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import legacyFactory from "../../../extensions/index.ts";
+import { RUNTIME_STATE_SCHEMA, readStateSchema, schemaCompatibility } from "../migrations/schema.ts";
 import {
   type EngineeringRuntime,
   PI_ENGINEERING_RUNTIME_API,
@@ -157,6 +158,16 @@ export class ExtensionGenerationRuntime implements EngineeringRuntime {
       }
     }
     checks.push({ name: "persistent state readable", ok: readable, ...(detail ? { detail } : {}) });
+    if (existsSync(stateDir)) {
+      const compat = schemaCompatibility(readStateSchema(stateDir), RUNTIME_STATE_SCHEMA);
+      checks.push({
+        name: "state schema compatible",
+        ok: compat.kind === "compatible",
+        ...(compat.kind === "compatible"
+          ? {}
+          : { detail: compat.kind === "migrate" ? `needs migration ${compat.from} → ${compat.to}` : compat.reason }),
+      });
+    }
     // A handover must not turn a mission waiting for inference capacity into a
     // failure (spec §41). The durable store is the witness.
     const waits = this.context.restore?.inferenceWaitMissionIds ?? [];

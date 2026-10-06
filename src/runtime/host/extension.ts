@@ -15,6 +15,9 @@ import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { InstallLayout } from "../../update/installLayout.ts";
+import { UpdateJournal } from "../../update/journal.ts";
+import { MutationLockBusyError, type MutationLockHandle, RuntimeMutationLock } from "../../update/mutationLock.ts";
+import { type RecoveryOutcome, recoverInterruptedTransaction } from "../../update/recovery.ts";
 import { ago, formatHandover, short, waitingText } from "./format.ts";
 import { type HandoverHooks, type HandoverResult, type HandoverTask, RuntimeBusyError, RuntimeHost } from "./host.ts";
 import { type RuntimeSource, snapshotRuntimeSource } from "./loader.ts";
@@ -84,11 +87,16 @@ export class EngineeringHostExtension {
   host: RuntimeHost | undefined;
   readonly telemetry: RuntimeTelemetry;
   readonly layout: InstallLayout;
+  readonly journal: UpdateJournal;
+  readonly lock: RuntimeMutationLock;
+  recovery: RecoveryOutcome | undefined;
   private pi: ExtensionAPI | undefined;
 
   constructor(config: HostExtensionConfig) {
     this.config = config;
     this.layout = new InstallLayout(config.installRoot);
+    this.journal = new UpdateJournal(this.layout.journalFile);
+    this.lock = new RuntimeMutationLock(this.layout.lockFile);
     // Per process: another Pi process sharing the install root must never
     // prune a directory this one is still importing from.
     this.generationsDir = join(config.installRoot, "generations", `${process.pid}-${randomBytes(3).toString("hex")}`);
@@ -104,9 +112,66 @@ export class EngineeringHostExtension {
       handler: (args, ctx) => this.command(args, ctx as Ctx),
     });
     cleanupDeadGenerationDirs(join(this.config.installRoot, "generations"));
+    // Before anything loads: finish or undo a transaction a crash interrupted.
+    this.recovery = await this.recoverOnStartup();
     const start = await this.startupSources();
     const result = await host.start(start[0] as RuntimeSource, start.slice(1));
     await this.repairPointersAfterStart(result.ok ? host.activeGeneration()?.source : undefined);
+  }
+
+  /** Crash recovery under the mutation lock (spec §30). Never blocks startup. */
+  async recoverOnStartup(): Promise<RecoveryOutcome> {
+    let handle: MutationLockHandle;
+    try {
+      handle = this.lock.acquire("crash-recovery");
+    } catch (error) {
+      if (error instanceof MutationLockBusyError) {
+        return { action: "none", detail: `pid ${error.holder?.pid} is mid-update; it owns recovery` };
+      }
+      return { action: "none", detail: `recovery skipped: ${error instanceof Error ? error.message : String(error)}` };
+    }
+    try {
+      return await recoverInterruptedTransaction(this.layout, this.journal, this.telemetry);
+    } catch (error) {
+      // Recovery failing must not stop Pi: the Host's fallback chain still
+      // finds a runtime that passes health.
+      const detail = `crash recovery failed: ${error instanceof Error ? error.message : String(error)}`;
+      this.telemetry.emit("runtime.crash_recovery.completed", { failure_reason: detail });
+      return { action: "none", detail };
+    } finally {
+      handle.release();
+    }
+  }
+
+  /** Take the runtime mutation lock or tell the operator who has it (spec §28). */
+  protected lockFor(operation: string, ctx: Ctx): MutationLockHandle | undefined {
+    try {
+      return this.lock.acquire(operation);
+    } catch (error) {
+      if (error instanceof MutationLockBusyError) {
+        notify(ctx, error.message, "warning");
+        return undefined;
+      }
+      throw error;
+    }
+  }
+
+  /** `.pi-eng` of the repository the session works in (git toplevel, else cwd). */
+  stateDir(cwd?: string): string | null {
+    const dir = cwd ?? (this.host?.latestContext() as Ctx | undefined)?.cwd;
+    if (!dir) return null;
+    let root = dir;
+    try {
+      root = execFileSync("git", ["-C", dir, "rev-parse", "--show-toplevel"], {
+        timeout: 2000,
+        stdio: ["ignore", "pipe", "ignore"],
+      })
+        .toString()
+        .trim();
+    } catch {
+      root = dir;
+    }
+    return join(root, ".pi-eng");
   }
 
   /**
@@ -268,6 +333,8 @@ export class EngineeringHostExtension {
   protected async reload(ctx: Ctx): Promise<void> {
     const host = this.host as RuntimeHost;
     const source = this.reloadSource();
+    const lock = this.lockFor("reload", ctx);
+    if (!lock) return;
     let task: HandoverTask;
     try {
       task = host.begin({
@@ -276,9 +343,11 @@ export class EngineeringHostExtension {
         ...(this.config.safePointTimeoutMs ? { safePointTimeoutMs: this.config.safePointTimeoutMs } : {}),
       });
     } catch (error) {
+      lock.release();
       if (error instanceof RuntimeBusyError) return notify(ctx, error.message);
       throw error;
     }
+    void task.promise.finally(() => lock.release());
     const from = host.activeGeneration()?.source.version;
     const result = await this.awaitOrBackground(task, ctx, `Reloading Pi Engineering ${source.version}.`, (r) =>
       formatHandover(r, { from, to: source.version, action: "Reloaded" }),
