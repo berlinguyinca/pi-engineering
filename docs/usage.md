@@ -79,7 +79,12 @@ Configuration lives in `engineering.yaml` under `planner_worker:`. It covers
 `mode`, `provider`, `concurrency`, `roles.<role>` (`capability`, `alias`,
 `preferred_family`, `min_context`), `escalation` and `convergence`. State is
 written to `.pi-eng/planner-worker/<mission>/state.json` and
-`transitions.jsonl`.
+`transitions.jsonl`. An interrupted mission resumes with
+`/mission resume PW-<id>`. Contracts already merged into the mission branch
+are kept and are not run again. Missions are bounded by attempts and
+convergence (stall detection), not by wall-clock budgets. Route swaps on
+InferWeave (`/iw/v1/routes/events`) are followed between requests, without a
+restart.
 
 ## Individual commands
 
