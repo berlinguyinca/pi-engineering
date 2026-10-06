@@ -24,6 +24,7 @@ import { GitRepo } from "../git/GitRepo.ts";
 import { Ledger } from "../ledger/Ledger.ts";
 import { loadMissionLimits } from "../lifecycle/policy.ts";
 import { workflowMutatesRepo } from "../orchestration/intentRouter.ts";
+import { OPERATOR_PAUSE_STOP_REASON } from "../orchestration/interrupt.ts";
 import {
   MISSION_SNAPSHOT_FILENAME,
   type MissionSnapshotFile,
@@ -1103,6 +1104,14 @@ export class EngineeringRuntime {
     this.missionStore = null;
   }
 
+  /** Explicitly cancel a mission: the only operator action that terminates a healthy mission. */
+  async cancelMission(missionId: string): Promise<import("../orchestration/types.ts").Mission> {
+    if (!this.missionStore || !this.orchestrator) throw new Error("Orchestrator not initialized for this directory.");
+    const mission = await this.orchestrator.cancel(missionId);
+    await this.missionStore.flush();
+    return mission;
+  }
+
   /** Explicit, idempotent operator fallback for one durably stopped blocked mission. */
   resumeBlockedMission(missionId: string, signal?: AbortSignal): Promise<import("../orchestration/types.ts").Mission> {
     const active = this.missionResumeFlights.get(missionId);
@@ -1132,6 +1141,13 @@ export class EngineeringRuntime {
       .filter((candidate) => candidate.resumptionGeneration === generation)
       .at(-1);
     if (!stop) throw new Error(`mission ${missionId} has no current durable stop to resume`);
+    if (stop.reason === OPERATOR_PAUSE_STOP_REASON && mission.status === "PAUSED_INFRASTRUCTURE") {
+      // Paused by an operator interrupt: continue exactly where it stopped. The
+      // interrupted tasks were left resumable; another interrupt pauses again.
+      this.missionStore.resumeMission(missionId, "operator resumed an interrupted mission");
+      await this.missionStore.flush();
+      return this.orchestrator.resume(missionId, { force: true, ...(signal ? { signal } : {}), interrupt: "pause" });
+    }
     mission = await this.normalizeMissionForRepair(missionId);
     this.missionStore.resumeMission(missionId, "operator requested mission recovery");
     await this.missionStore.flush();

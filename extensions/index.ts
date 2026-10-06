@@ -585,6 +585,7 @@ async function resolveServices(cwd: string): Promise<CoreServices | null> {
     },
     actor: () => ({ type: "user" }),
     resumeMission: (id, s) => rt.resumeBlockedMission(id, s),
+    cancelMission: (id) => rt.cancelMission(id),
     // A rebound parent launch targets the bound worktree by default.
     ...(effective !== cwd ? { repositoryRoot: rt.git?.root ?? effective } : {}),
   };
@@ -692,7 +693,11 @@ export default function (pi: ExtensionAPI) {
   if (typeof pi.on === "function") {
     pi.on("session_start", (event, ctx) => {
       if (event.reason === "reload") return;
-      resetSessionModelChoice(RuntimeSession.current().sessionId, ctx.model);
+      const sessionId = RuntimeSession.current().sessionId;
+      resetSessionModelChoice(sessionId, ctx.model);
+      // The pin is process-wide; a fresh conversation (/new) explicitly
+      // returns this process's missions to automatic routing.
+      if (event.reason === "new") clearOperatorModelPin(sessionId);
     });
     pi.on("model_select", (event, ctx) => {
       const outcome = onOperatorModelSelect(RuntimeSession.current().sessionId, {
@@ -1870,11 +1875,23 @@ ${RECOVERY_PROMPT}`;
   });
 
   pi.registerCommand("mission", {
-    description: "Run an orchestration mission, or resume one with /mission resume <missionId>.",
+    description:
+      "Run an orchestration mission; /mission resume <missionId> continues a stopped or paused one, /mission cancel <missionId> ends one.",
     handler: async (args, ctx) => {
       const request = args.trim();
       if (!request) {
         ctx.ui.notify("/mission <normal-language request> | /mission resume <missionId>", "error");
+        return;
+      }
+      const cancel = /^cancel\s+(MSN-\S+)\s*$/i.exec(request);
+      if (cancel?.[1]) {
+        const rt = await getRuntime(ctx);
+        try {
+          const canceled = await rt.cancelMission(cancel[1]);
+          ctx.ui.notify(`Mission ${canceled.mission_id} — ${canceled.title} [${canceled.status}]`, "info");
+        } catch (error) {
+          ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+        }
         return;
       }
       const resumePrefix = /^resume(?:\b|[:=])/i.test(request);
@@ -1919,6 +1936,8 @@ ${RECOVERY_PROMPT}`;
         baseRef,
         mutationRequested: true,
         signal: ctx.signal,
+        // Esc pauses the mission (resumable); only /mission cancel ends it.
+        interrupt: "pause",
         onProgress: (line) => {
           // De-duplicate the trailing completion lines (phase transitions and
           // task settlements can fire within the same tick).
@@ -1929,11 +1948,14 @@ ${RECOVERY_PROMPT}`;
         },
       });
       const m = result.mission;
-      const completion = result.paused
-        ? "PAUSED — infrastructure retry window exhausted (auto-resumes on recovery; not a failure)"
-        : result.completed
-          ? "PASSED"
-          : `BLOCKED — ${result.failureReason ?? ""}`;
+      const completion =
+        result.pausedBy === "operator"
+          ? `PAUSED by interrupt — progress preserved; /mission resume ${result.mission.mission_id} continues it, /mission cancel ${result.mission.mission_id} ends it`
+          : result.paused
+            ? "PAUSED — infrastructure retry window exhausted (auto-resumes on recovery; not a failure)"
+            : result.completed
+              ? "PASSED"
+              : `BLOCKED — ${result.failureReason ?? ""}`;
       const lines = [
         `Mission ${m.mission_id} [${m.status}] workflow=${m.workflow_class} risk=${m.risk_profile}`,
         `Intent: ${result.intent.intent.join(", ")} (confidence ${result.intent.confidence.toFixed(2)})`,
