@@ -117,6 +117,96 @@ export function tokenizeCommand(script: string): { command: string; args: string
 }
 
 /**
+ * True when an npm-style script needs a shell to mean what it says: command
+ * chaining (`&&`, `||`, `;`), pipes, redirection, substitution, or a leading
+ * `VAR=value` assignment. npm itself runs scripts through `sh -c`; splitting
+ * such a script into words and exec'ing it passes `&&` as a literal argument,
+ * so every chained script fails.
+ */
+export function needsShell(script: string): boolean {
+  return /&&|\|\||[;|<>`$]/.test(script) || /^\s*[A-Za-z_][A-Za-z0-9_]*=/.test(script);
+}
+
+/** Command + args for a declared script: direct exec when safe, otherwise `sh -c` like npm. */
+export function scriptCommand(script: string): { command: string; args: string[] } {
+  if (needsShell(script)) return { command: "sh", args: ["-c", script] };
+  return tokenizeCommand(script);
+}
+
+async function exists(path: string): Promise<boolean> {
+  try {
+    await access(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function readText(path: string): Promise<string | null> {
+  try {
+    return await readFile(path, "utf-8");
+  } catch {
+    return null;
+  }
+}
+
+/** True when a Makefile declares `target:` (not `target :=` assignments). */
+function makefileHasTarget(makefile: string, target: string): boolean {
+  return new RegExp(`^${target}\\s*:(?!=)`, "m").test(makefile);
+}
+
+/**
+ * Checks for repositories that are not driven by package.json scripts. Each
+ * ecosystem is detected from its own manifest, so a Rust/Go/Python/Make repo
+ * gets real evidence instead of a zero-check run.
+ */
+async function nonNodeStages(cwd: string): Promise<VerifyStage[]> {
+  const stages: VerifyStage[] = [];
+  const stage = (name: string, command: string, args: string[]): VerifyStage => ({
+    name,
+    command,
+    args,
+    required: true,
+    timeoutMs: 600_000,
+  });
+  if (await exists(join(cwd, "Cargo.toml"))) {
+    stages.push(stage("typecheck", "cargo", ["check", "--all-targets"]));
+    stages.push(stage("test", "cargo", ["test"]));
+  }
+  if (await exists(join(cwd, "go.mod"))) {
+    stages.push(stage("build", "go", ["build", "./..."]));
+    stages.push(stage("test", "go", ["test", "./..."]));
+  }
+  const pyproject = (await readText(join(cwd, "pyproject.toml"))) ?? "";
+  const setupCfg = (await readText(join(cwd, "setup.cfg"))) ?? "";
+  if (
+    (await exists(join(cwd, "pytest.ini"))) ||
+    (await exists(join(cwd, "conftest.py"))) ||
+    /\[tool\.pytest/.test(pyproject) ||
+    /\[tool:pytest\]/.test(setupCfg)
+  ) {
+    stages.push(stage("test", "python3", ["-m", "pytest", "-q"]));
+  }
+  const makefile = (await readText(join(cwd, "Makefile"))) ?? (await readText(join(cwd, "makefile")));
+  if (makefile && !stages.some((s) => s.name === "test")) {
+    for (const target of ["check", "test"]) {
+      if (makefileHasTarget(makefile, target)) stages.push(stage(target, "make", [target]));
+    }
+  }
+  return stages;
+}
+
+/** Manifest fingerprint for the profile cache: detection depends on more than package.json. */
+async function manifestFingerprint(cwd: string): Promise<string> {
+  const parts: string[] = [];
+  for (const file of ["Cargo.toml", "go.mod", "pytest.ini", "conftest.py", "pyproject.toml", "setup.cfg", "Makefile"]) {
+    const text = await readText(join(cwd, file));
+    if (text !== null) parts.push(`${file}:${text.length}:${text.slice(0, 2048)}`);
+  }
+  return parts.join("\u0001");
+}
+
+/**
  * Child-process env with the node test-runner IPC context stripped. When the
  * runtime itself runs under `node --test`, spawned `node` commands inherit
  * NODE_TEST_CONTEXT and would otherwise behave as test children (reporting
@@ -235,7 +325,7 @@ export class CommandVerifier implements VerificationProvider {
     } catch {
       pkg = {};
     }
-    return { key: `${cwd}\u0000${content}\u0000full:${full ? 1 : 0}`, pkg };
+    return { key: `${cwd}\u0000${content}\u0000${await manifestFingerprint(cwd)}\u0000full:${full ? 1 : 0}`, pkg };
   }
 
   /** Invalidate the cache (e.g. after package.json changes). Primarily for tests. */
@@ -268,7 +358,7 @@ export class CommandVerifier implements VerificationProvider {
 
     const push = (name: string, script?: string, required = true): void => {
       if (!script) return;
-      const { command, args } = tokenizeCommand(script);
+      const { command, args } = scriptCommand(script);
       stages.push({
         name,
         command,
@@ -287,6 +377,7 @@ export class CommandVerifier implements VerificationProvider {
       push("lint", scripts.lint);
       push("test:full", scripts["test:full"] ?? scripts["test:all"]);
     }
+    if (stages.length === 0) stages.push(...(await nonNodeStages(cwd)));
     if (stages.length === 0) {
       // No declared scripts. Only fall back to a syntax check if a real JS
       // entry file exists — otherwise the stage is doomed to ENOENT and would

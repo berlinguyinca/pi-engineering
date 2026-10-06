@@ -616,3 +616,35 @@ describe("realBackends deterministic cancellation", () => {
     });
   }
 });
+
+describe("realBackends validation with no verification targets", () => {
+  it("reports missing evidence (noTargets), not a failed check that would spawn futile repairs", async () => {
+    const { mkdtemp, rm } = await import("node:fs/promises");
+    const { tmpdir } = await import("node:os");
+    const { ArtifactStore } = await import("../../src/artifacts/ArtifactStore.ts");
+    const { CommandVerifier } = await import("../../src/verify/Verifier.ts");
+    const dir = await mkdtemp(join(tmpdir(), "pi-eng-notargets-"));
+    try {
+      const backends = realBackends({
+        worker: capturingWorker([]),
+        verifier: new CommandVerifier(),
+        artifacts: await ArtifactStore.create(join(dir, ".artifacts")),
+        git: null,
+        cwd: dir,
+      });
+      const outcome = await backends.validation.runValidation({
+        objective: "check",
+        signal: new AbortController().signal,
+      });
+      assert.equal(outcome.validationEvidence?.noTargets, true);
+      assert.equal(
+        outcome.exitStatus,
+        "succeeded",
+        "zero checks is missing evidence for the completion gate, not a failed validation task",
+      );
+      assert.match(outcome.summary, /no verification targets/i);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});

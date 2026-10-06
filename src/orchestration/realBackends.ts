@@ -460,12 +460,18 @@ export function realBackends(opts: RealBackendsOptions) {
         const outcome = await opts.verifier.run(cwd, profile, opts.artifacts, { signal: input.signal });
         const artifactRefs = outcome.evidence.flatMap((e) => e.artifacts).filter(Boolean);
         const artifactState = await artifactContentHashes(opts.artifacts, artifactRefs);
+        // A repo with no detectable checks produced no evidence; nothing FAILED.
+        // Reporting it as a failed task made the repair loop spawn "Fix the
+        // failing validation step" work no implementer can satisfy. The
+        // noTargets evidence still keeps the completion gate closed.
         return {
           executionId: "validation",
-          exitStatus: outcome.passed ? "succeeded" : "failed",
-          summary: outcome.passed
-            ? `validation passed (${outcome.stages.length} stages)`
-            : `validation failed at ${outcome.failedStage ?? "unknown"}`,
+          exitStatus: outcome.passed || outcome.noTargets ? "succeeded" : "failed",
+          summary: outcome.noTargets
+            ? "no verification targets detected — recorded as missing evidence, not a failed check"
+            : outcome.passed
+              ? `validation passed (${outcome.stages.length} stages)`
+              : `validation failed at ${outcome.failedStage ?? "unknown"}`,
           artifactRefs,
           artifactHashes: artifactState.hashes,
           usage: { stages: outcome.stages.length },
