@@ -7,7 +7,7 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, test } from "node:test";
@@ -208,6 +208,29 @@ test("safe point: reload waits for active operations, reports them, and is cance
   assert.equal(done.ok, true);
   assert.equal(done.waitedForSafePoint, true);
   assert.ok(host.telemetry.recent().some((e) => e.event === "runtime.safe_point.reached"));
+});
+
+test("a handover cancelled before quiesce leaves no candidate snapshot behind", async () => {
+  const { pi, host, ext } = await setup();
+  const before = new Set(readdirSync(ext.generationsDir));
+  const op = host.operations.begin(1, "verification", "npm test");
+  await pi.run("/engineering reload");
+  const task = host.pendingTask();
+  assert.ok(task);
+  const created = readdirSync(ext.generationsDir).filter((name) => !before.has(name));
+  assert.equal(created.length, 1, "the candidate was snapshotted");
+  await pi.run("/engineering cancel");
+  assert.equal((await task.promise).phase, "cancelled");
+  op.end();
+  assert.equal(existsSync(join(ext.generationsDir, created[0] as string)), false, "the cancelled candidate is removed");
+  await host.pruneSnapshots();
+  assert.deepEqual(
+    readdirSync(ext.generationsDir)
+      .filter((name) => !before.has(name))
+      .sort(),
+    [],
+    "nothing the cancelled handover created is left",
+  );
 });
 
 test("work arriving during handover is queued and resumes on the new generation (§21)", async () => {
