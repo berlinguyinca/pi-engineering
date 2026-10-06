@@ -21,7 +21,7 @@
 
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { readFile, rm, writeFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { promisify } from "node:util";
 import type { WorkerRole } from "../core/types.ts";
@@ -44,6 +44,7 @@ import {
   parseAvailabilityError,
 } from "./gateway.ts";
 import { buildHandoff, renderHandoff } from "./handoff.ts";
+import { acquireMissionLock } from "./missionLock.ts";
 import { runPlanner } from "./planner.ts";
 import { DEBUGGER_PROMPT, IMPLEMENTER_PROMPT } from "./prompts.ts";
 import type { RoleResolver } from "./resolver.ts";
@@ -232,19 +233,24 @@ export class PlannerWorkerExecutor {
   async run(brief: MissionBrief): Promise<PlannerWorkerReport> {
     this.brief = brief;
     this.started = Date.now();
-    await mkdir(this.opts.stateDir, { recursive: true });
-    const repo = await GitRepo.open(this.opts.repoRoot);
-    if (!repo) throw new Error(`${this.opts.repoRoot} is not a git repository`);
-    this.repo = repo;
-    await this.opts.resolver.refresh();
-    const base = await repo.headCommit();
-    this.baseCommit = base;
-    this.integration = await repo.createWorktree(base, `pi-eng-pw-${slug(brief.mission_id)}`);
+    // One live owner per mission: a concurrent resume would delete our worktrees.
+    const lock = await acquireMissionLock(this.opts.stateDir);
     try {
-      if (!(await this.planMission())) return await this.finish("failed");
-      return await this.proceed();
+      const repo = await GitRepo.open(this.opts.repoRoot);
+      if (!repo) throw new Error(`${this.opts.repoRoot} is not a git repository`);
+      this.repo = repo;
+      await this.opts.resolver.refresh();
+      const base = await repo.headCommit();
+      this.baseCommit = base;
+      this.integration = await repo.createWorktree(base, `pi-eng-pw-${slug(brief.mission_id)}`);
+      try {
+        if (!(await this.planMission())) return await this.finish("failed");
+        return await this.proceed();
+      } finally {
+        await this.cleanup();
+      }
     } finally {
-      await this.cleanup();
+      await lock.release();
     }
   }
 
@@ -266,6 +272,17 @@ export class PlannerWorkerExecutor {
    * head. Works after a clean abort and after a crash that left worktrees.
    */
   async resume(): Promise<PlannerWorkerReport> {
+    // Refuse while another live process runs this mission: resuming rebuilds
+    // the integration worktree and discards unfinished contracts' worktrees.
+    const lock = await acquireMissionLock(this.opts.stateDir);
+    try {
+      return await this.resumeLocked();
+    } finally {
+      await lock.release();
+    }
+  }
+
+  private async resumeLocked(): Promise<PlannerWorkerReport> {
     const saved = JSON.parse(await readFile(join(this.opts.stateDir, "state.json"), "utf8")) as ResumableState;
     if (!saved.brief || !saved.integration_branch || !saved.base_commit) {
       throw new Error(`${this.opts.stateDir} has no resumable planner-worker state`);
