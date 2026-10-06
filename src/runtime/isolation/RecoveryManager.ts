@@ -15,6 +15,7 @@ import { readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type { RuntimeRegistry } from "./RuntimeRegistry.ts";
 import { endsCleanly, repairTornTail } from "./jsonlFiles.ts";
+import { currentProcessIdentity } from "./processIdentity.ts";
 import { emitRuntimeEvent } from "./runtimeEvents.ts";
 
 export interface ReconciliationReport {
@@ -83,7 +84,18 @@ export class RecoveryManager {
         if (endsCleanly(file)) continue;
         const sessionId = name.slice(0, -".jsonl".length);
         if (!this.writerIsGone(sessionId, file)) continue;
+        // Concurrent reconcilers (many sessions starting at once) repair each
+        // stream exactly once: the repair is itself a short lease.
+        const owner = { sessionId: this.selfSessionId ?? `recovery-${process.pid}`, process: currentProcessIdentity() };
+        let lease: ReturnType<RuntimeRegistry["leases"]["acquire"]>;
         try {
+          lease = this.registry.leases.acquire(`repair:${file}`, owner, 30_000);
+        } catch {
+          continue;
+        }
+        if (!lease.ok) continue;
+        try {
+          if (endsCleanly(file)) continue;
           const result = repairTornTail(file, join(dir, "recovery"));
           if (!result) continue;
           repaired.push({ stream: file, ...result });
@@ -96,6 +108,8 @@ export class RecoveryManager {
           });
         } catch {
           // Degraded, not fatal: readers already ignore incomplete tails.
+        } finally {
+          this.registry.leases.release(`repair:${file}`, lease.lease.generationId);
         }
       }
     }

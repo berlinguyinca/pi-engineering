@@ -94,6 +94,8 @@ export async function runChildren(
     startChild(action, cwdFor(index), stateDir, { startAt }),
   );
   const reports = await Promise.all(children.map((running) => running.report));
+  // "open" sessions close and exit on their own; wait so the state they leave is final.
+  if (action === "open") await Promise.all(children.map((running) => running.exited));
   return { reports, children };
 }
 
@@ -117,4 +119,41 @@ export async function makeGitRepo(root: string): Promise<string> {
 export async function addWorktree(repo: string, path: string, branch: string): Promise<string> {
   await exec("git", ["-C", repo, "worktree", "add", "-q", "-b", branch, path]);
   return path;
+}
+
+/** Run any support script as a real child process; resolves with its first JSON line. */
+export function runScript<T>(
+  script: string,
+  args: string[],
+  env: NodeJS.ProcessEnv,
+): { child: ChildProcess; report: Promise<T>; exited: Promise<number | null> } {
+  const path = fileURLToPath(new URL(`./${script}`, import.meta.url));
+  const child = spawn(process.execPath, ["--no-warnings", path, ...args], {
+    env: { ...process.env, ...env },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let stdout = "";
+  let stderr = "";
+  const report = new Promise<T>((resolve, reject) => {
+    child.stdout?.on("data", (chunk: Buffer) => {
+      stdout += chunk.toString("utf8");
+      const newline = stdout.indexOf("\n");
+      if (newline >= 0) {
+        try {
+          resolve(JSON.parse(stdout.slice(0, newline)) as T);
+        } catch (error) {
+          reject(error);
+        }
+      }
+    });
+    child.stderr?.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString("utf8");
+    });
+    child.on("exit", (code, signal) => {
+      if (!stdout.includes("\n"))
+        reject(new Error(`${script} exited (${code ?? signal}) without a report: ${stderr.slice(-2000)}`));
+    });
+  });
+  const exited = new Promise<number | null>((resolve) => child.on("exit", (code) => resolve(code)));
+  return { child, report, exited };
 }

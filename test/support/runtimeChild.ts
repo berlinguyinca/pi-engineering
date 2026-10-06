@@ -52,6 +52,8 @@ function report(value: Record<string, unknown>): void {
 }
 
 async function main(): Promise<void> {
+  // Never touch the developer's real ~/.local/state/pi-engineering.
+  if (!process.env.PI_ENGINEERING_STATE_DIR) throw new Error("runtimeChild requires PI_ENGINEERING_STATE_DIR");
   if (!action || !cwd) throw new Error("usage: runtimeChild <open|hold|adopt|tear> <cwd> [startAt]");
   if (startAt) await waitUntil(Number(startAt));
   const openedAt = Date.now();

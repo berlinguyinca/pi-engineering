@@ -63,21 +63,34 @@ means.
 
 ## Durable state
 
-All state lives under `<repoRoot>/.pi-eng/`:
+Repository-scoped state lives under `<repoRoot>/.pi-eng/`:
 
 - `ledger.jsonl` — append-only event stream; replayed into an in-memory
   materialized view on open (INV-001).
 - `artifacts/<category>/<id>.json` (meta) + `<id>.txt` (content) — candidate
   diffs, verification logs, scout context. Read lazily by `artifact://` URI.
-- `orchestration.jsonl` — the durable mission/task/execution store (event-
-  sourced, replayed on open). It is **single-writer**, guarded by a process
-  file lock (`orchestration.jsonl.lock`). By default it lives in the git
-  toplevel of the session's launch directory; set
-  `PI_ENGINEERING_ORCHESTRATION_DIR` to relocate it (and its lock) to a
-  per-worktree directory so concurrent sessions working on different
-  branches/worktrees do not serialize on one shared parent store. Only the
-  store and its lock move — the ledger, artifacts, and mission snapshot stay in
-  the workDir.
+
+Orchestration state (missions, tasks, executions) is machine-local runtime
+state, not repository content. It lives under the XDG state directory
+(`$XDG_STATE_HOME/pi-engineering`, default `~/.local/state/pi-engineering`;
+`PI_ENGINEERING_STATE_DIR` overrides it) — see `src/runtime/isolation/` and
+`docs/specs/zero-config-runtime-isolation.md`:
+
+- `registry.db` — SQLite (WAL, busy_timeout) machine registry: sessions (pid,
+  boot id, process start time, binding, heartbeat, state, generation) and
+  generation-fenced leases (mission/repository custody). Kept on a local
+  filesystem even when the state dir is on a network filesystem.
+- `worktrees/<worktree-id>/events/<session-id>.jsonl` — one append-only stream
+  per session; the `EventStoreBackend` (`SessionEventStore`) reads all streams
+  of the worktree merged by timestamp. A legacy `.pi-eng/orchestration.jsonl`
+  is imported as `events/legacy-<hash>.jsonl` and never modified.
+- `worktrees/<worktree-id>/recovery/` — quarantined evidence (torn tails,
+  corrupt metadata); never deleted automatically.
+- `sessions/<session-id>/runtime.jsonl` — structured runtime decisions.
+
+Only one live session drives a given mission (custody lease); every session sees
+every mission of the worktree. `PI_ENGINEERING_ORCHESTRATION_DIR` relocates the
+orchestration namespace but keeps per-session writers.
 
 ## The Engineering Ledger
 
