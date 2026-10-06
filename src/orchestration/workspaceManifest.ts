@@ -1,8 +1,9 @@
 import { createHash } from "node:crypto";
-import { lstat, realpath } from "node:fs/promises";
+import { lstat, readdir, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join, parse, relative, resolve, sep } from "node:path";
+import { basename, dirname, join, parse, relative, resolve, sep } from "node:path";
 import { GitRepo } from "../git/GitRepo.ts";
+import { type PathIntent, classifyPathIntents } from "./pathIntent.ts";
 import type { AuthorizedRoot, RepositoryBinding, WorkspaceManifest } from "./types.ts";
 
 export class WorkspaceScopeError extends Error {
@@ -19,173 +20,6 @@ export interface ResolvedWorkspace {
   repositories: RepositoryBinding[];
   dependencyEdges: WorkspaceManifest["dependencyEdges"];
   primaryRepoId: string;
-}
-
-const TRAILING_PROSE = /[,:;!?]+$/;
-
-function stripUnquotedPunctuation(candidate: string): string {
-  let stripped = candidate.replace(TRAILING_PROSE, "");
-  while (stripped.endsWith(".") && !stripped.endsWith("/.")) stripped = stripped.slice(0, -1);
-  return stripped;
-}
-
-interface PathMention {
-  path: string;
-  start: number;
-  end: number;
-}
-
-function explicitPathMentions(request: string): PathMention[] {
-  const mentions: PathMention[] = [];
-  const quotedRanges: Array<{ start: number; end: number }> = [];
-  for (const match of request.matchAll(/(["'`])(\/.*?)\1/gs)) {
-    const candidate = match[2] ?? "";
-    const end = match.index + match[0].length;
-    if (isAbsolute(candidate)) mentions.push({ path: candidate, start: match.index, end });
-    quotedRanges.push({ start: match.index, end });
-  }
-  for (const match of request.matchAll(/(?<![/:])\/[A-Za-z0-9._~][^\s"'`<>()[\]{}]*/g)) {
-    if (quotedRanges.some((range) => match.index >= range.start && match.index < range.end)) continue;
-    const candidate = stripUnquotedPunctuation(match[0]);
-    if (candidate.length > 1 && isAbsolute(candidate)) {
-      // The span ends at the path itself so trailing prose punctuation (", ")
-      // stays available as a clause boundary.
-      mentions.push({ path: candidate, start: match.index, end: match.index + candidate.length });
-    }
-  }
-  return mentions.sort((left, right) => left.start - right.start);
-}
-
-/** Sentence boundaries: a mention's intent never reaches past these. */
-const SENTENCE_BOUNDARY = /[.;!?](?=\s|$)|\n/g;
-/** Clause boundaries inside a sentence: each path is classified only within its own clause. */
-const CLAUSE_BOUNDARY = /[,:()]|\s(?:and|but|while|whereas|then)\s/gi;
-/** Text between two mentions that only joins them into one list ("X, Y and Z"). */
-const LIST_CONNECTOR = /^\s*(?:,\s*)?(?:(?:and|or|nor|&)\s+)?$/i;
-
-/**
- * Canonical form of prose for intent matching: compatibility-normalized
- * (full-width letters), invisible characters removed, typographic quotes
- * folded, so look-alike text cannot hide a negation or a read-only marker.
- */
-function normalizeProse(text: string): string {
-  return text.normalize("NFKC").replace(/[­​-‏⁠-⁤﻿]/g, "").replace(/[‘’ʼ]/g, "'").replace(/[“”]/g, '"');
-}
-
-// A negation only removes authority when it directs a verb at the path ("do
-// not touch X", "never modify X"); "do not stop until X passes" or "don't just
-// read X" still name X as the target.
-const NEGATED_VERB =
-  /\b(?:do not|don't|dont|never|must not|should not|shall not|may not|cannot|can't)\s+(?:ever\s+)?(touch|use|modify|edit|change|alter|mutate|delete|remove|make (?:any )?(?:changes|edits|modifications) (?:to|in)|write (?:to|into|in)|commit (?:to|into|in)|push to)\s+(?:(?:anything|files?|code)\s+(?:in|under|inside|within)\s+)?(?:the\s+(?:repo(?:sitory)?|directory|folder|checkout)\s+(?:at\s+)?)?["'`]?$/i;
-const AVOIDED_VERB =
-  /\b(?:avoid|without)\s+(touching|using|modifying|editing|changing|altering|mutating|deleting|writing to)\s+(?:(?:anything|files?|code)\s+(?:in|under|inside|within)\s+)?["'`]?$/i;
-/** Negated verbs that withdraw all authority; any other negated verb still permits reading. */
-const TOUCH_ONLY = /^(?:touch|touching|use|using)$/i;
-const READ_ONLY =
-  /\bread[- ]?only\b|\bfor reference\b|\breference only\b|\bas (?:a )?reference\b|\buntouched\b|\bunmodified\b|\bunchanged\b|\bleave\s.*\balone\b|\boff[- ]limits\b|\b(?:must|should|shall|may|is|are)\s+not\s+(?:be\s+)?(?:modified|changed|touched|edited|written|altered)\b/i;
-/** The path is a source to learn from ("copy the approach of X", "based on X"), not a target. */
-const REFERENCE_CUE =
-  /\b(?:copy|mirror|follow|imitate|replicate)\b(?:(?!\b(?:into|to)\b)[^"'`])*$|\b(?:based on|modell?ed (?:on|after)|like|from|look at|see|study|compare (?:with|to)|inspired by)\s+(?:the\s+\w+\s+(?:of|in)\s+)?["'`]?$/i;
-/** A mutation verb aimed at the path ("fix X", "implement the feature in X"). */
-const MUTATION_DIRECTED =
-  /\b(?:modify|edit|change|write|delete|remove|create|refactor|implement|fix|update|rewrite|build|add|patch|work|commit|apply|port)\b(?:\s+[\w'-]+){0,3}\s*(?:in|into|inside|within|under|on|to|at|from)?\s*["'`]?$/i;
-const MUTATION_INTO =
-  /\b(?:modify|edit|change|write|delete|remove|create|refactor|implement|fix|update|rewrite)\b(?:\s+[\w'-]+){0,3}\s+(?:in|into|inside|within|under)\s*["'`]?$/i;
-
-type MentionIntent = "write" | "read" | "ignore";
-
-interface ClassifiedMention extends PathMention {
-  intent: MentionIntent;
-  /** The mention's own lead-in text, used to detect a directed mutation into a protected path. */
-  before: string;
-  /** A mutation verb is aimed at this path (only meaningful for write intent). */
-  directed: boolean;
-}
-
-function boundariesOutside(text: string, pattern: RegExp, skip: PathMention[]): Array<{ start: number; end: number }> {
-  const found: Array<{ start: number; end: number }> = [];
-  for (const match of text.matchAll(pattern)) {
-    const end = match.index + match[0].length;
-    if (skip.some((range) => match.index < range.end && end > range.start)) continue;
-    found.push({ start: match.index, end });
-  }
-  return found;
-}
-
-/**
- * Classify what the request asks of each mentioned path, looking only at the
- * path's own clause. Consecutive mentions joined only by a list connector
- * ("X, Y and Z") share one intent. Between two mention groups, the text up to
- * the last clause boundary belongs to the earlier group and the rest to the
- * later one, so "Use X as read-only reference and implement in Y" reads X as
- * read-only and Y as the target. Ambiguity resolves toward read-only: a wrong
- * read-only verdict fails closed (no writable target), a wrong write does not.
- */
-function classifyMentions(request: string, mentions: PathMention[]): ClassifiedMention[] {
-  const sentenceBreaks = boundariesOutside(request, SENTENCE_BOUNDARY, mentions);
-  const clauseBreaks = boundariesOutside(request, CLAUSE_BOUNDARY, mentions);
-  const sentenceOf = (index: number) => sentenceBreaks.filter((range) => range.start < index).length;
-
-  const groups: PathMention[][] = [];
-  for (const mention of mentions) {
-    const group = groups.at(-1);
-    const last = group?.at(-1);
-    if (
-      group &&
-      last &&
-      sentenceOf(last.start) === sentenceOf(mention.start) &&
-      LIST_CONNECTOR.test(request.slice(last.end, mention.start))
-    ) {
-      group.push(mention);
-    } else {
-      groups.push([mention]);
-    }
-  }
-
-  const classified: ClassifiedMention[] = [];
-  groups.forEach((group, index) => {
-    const first = group[0]!;
-    const last = group.at(-1)!;
-    const sentenceStart = sentenceBreaks.filter((range) => range.end <= first.start).at(-1)?.end ?? 0;
-    const sentenceEnd = sentenceBreaks.find((range) => range.start >= last.end)?.start ?? request.length;
-    const previous = groups[index - 1]?.at(-1);
-    const next = groups[index + 1]?.[0];
-
-    // Lead-in: from the last clause boundary before the group, never earlier
-    // than the sentence start or the previous group.
-    const leadFloor = Math.max(sentenceStart, previous?.end ?? 0);
-    const leadStart =
-      clauseBreaks.filter((range) => range.start >= leadFloor && range.end <= first.start).at(-1)?.end ?? leadFloor;
-    // Tail: up to the last clause boundary before the next group in this
-    // sentence; for the sentence's last group, to the end of the sentence.
-    const nextInSentence = next && next.start < sentenceEnd ? next : undefined;
-    const tailEnd = nextInSentence
-      ? (clauseBreaks.filter((range) => range.start >= last.end && range.end <= nextInSentence.start).at(-1)?.start ??
-        nextInSentence.start)
-      : sentenceEnd;
-
-    const before = normalizeProse(request.slice(leadStart, first.start));
-    const after = normalizeProse(request.slice(last.end, tailEnd));
-    let intent: MentionIntent = "write";
-    const negated = NEGATED_VERB.exec(before) ?? AVOIDED_VERB.exec(before);
-    if (negated) intent = TOUCH_ONLY.test(negated[1] ?? "") ? "ignore" : "read";
-    else if (READ_ONLY.test(`${before} ${after}`)) intent = "read";
-    else if (
-      !MUTATION_DIRECTED.test(before) &&
-      REFERENCE_CUE.test(before) &&
-      !/\b(?:not|n't)\s+(?:just|only)\b/i.test(before)
-    ) {
-      intent = "read";
-    } else if (/^\s*(?:too|as well|also)\b/i.test(after) && classified.at(-1)?.intent === "read") intent = "read";
-    const directed = intent === "write" && MUTATION_DIRECTED.test(before);
-    for (const mention of group) classified.push({ ...mention, intent, before, directed });
-  });
-  // When some path is clearly the target, a path with no mutation aimed at it
-  // is context ("look at X and fix Y"): read-only, never writable by default.
-  if (classified.some((mention) => mention.directed)) {
-    for (const mention of classified) if (mention.intent === "write" && !mention.directed) mention.intent = "read";
-  }
-  return classified;
 }
 
 /**
@@ -271,6 +105,220 @@ async function canonicalExistingDirectory(candidate: string, source: AuthorizedR
   return canonical;
 }
 
+/** Damerau-Levenshtein distance at most one (one edit or one adjacent transposition). */
+function withinOneEdit(left: string, right: string): boolean {
+  if (left === right) return true;
+  if (Math.abs(left.length - right.length) > 1) return false;
+  let i = 0;
+  while (i < left.length && i < right.length && left[i] === right[i]) i++;
+  const tail = (a: string, b: string) => a.slice(i + 1) === b.slice(i + 1);
+  if (left.length === right.length) {
+    return (
+      tail(left, right) ||
+      (left[i] === right[i + 1] && left[i + 1] === right[i] && left.slice(i + 2) === right.slice(i + 2))
+    );
+  }
+  return left.length > right.length ? left.slice(i + 1) === right.slice(i) : left.slice(i) === right.slice(i + 1);
+}
+
+/** The deepest existing ancestor of a missing path, and the first missing segment below it. */
+async function nearestExisting(path: string): Promise<{ ancestor: string; missingSegment: string }> {
+  let current = resolve(path);
+  let missingSegment = basename(current);
+  while (true) {
+    const parent = dirname(current);
+    try {
+      await lstat(parent);
+      return { ancestor: parent, missingSegment: basename(current) };
+    } catch {
+      if (parent === current) return { ancestor: parent, missingSegment };
+      missingSegment = basename(current);
+      current = parent;
+    }
+  }
+}
+
+/**
+ * Whether a missing path is a filesystem path the user meant (a typo, a
+ * repository not cloned yet) rather than prose such as an API route
+ * ("/api/v1/users"): it lives under an existing directory other than the
+ * filesystem root, or its first missing segment is a near-miss of an existing
+ * sibling ("/TMP/…", "/hmoe/…").
+ */
+async function looksLikeMissingFilesystemPath(path: string): Promise<{ real: boolean; ancestor: string }> {
+  const { ancestor, missingSegment } = await nearestExisting(path);
+  if (ancestor !== parse(ancestor).root) return { real: true, ancestor };
+  const siblings = await readdir(ancestor).catch(() => [] as string[]);
+  const lower = missingSegment.toLowerCase();
+  const real = siblings.some(
+    (sibling) =>
+      sibling.toLowerCase() === lower || (missingSegment.length >= 5 && withinOneEdit(sibling.toLowerCase(), lower)),
+  );
+  return { real, ancestor };
+}
+
+interface AuthorityPlan {
+  writable: string[];
+  readOnly: string[];
+}
+
+/**
+ * Turn classified path intents into write and read roots, fail-safe:
+ *
+ * - an excluded path, its ancestors' grants and its descendants never become
+ *   writable; a writable root that would contain an excluded path is refused
+ *   (the manifest cannot express a deny-list inside a writable root);
+ * - a path is writable only on a positive grant, or as the single neutral
+ *   repository of a request without one; everything else named is read-only;
+ * - a protected path aimed at by a mutation is refused, and a missing path the
+ *   user plainly meant (see looksLikeMissingFilesystemPath) is refused unless
+ *   it lies inside a repository, which is then the target;
+ * - once the request names an excluded path, a repository, or a missing
+ *   filesystem path, the launch directory is never substituted: if nothing is
+ *   writable the request is refused. Only plain input files and directories
+ *   outside any repository ("analyze /tmp/crash.log") leave the launch
+ *   fallback open.
+ */
+async function planAuthority(intents: PathIntent[]): Promise<AuthorityPlan> {
+  interface Entry {
+    path: string;
+    canonical: string;
+    role: PathIntent["role"];
+    excluded: boolean;
+    hard: boolean;
+    isFile: boolean;
+    exists: boolean;
+    repository: boolean;
+  }
+  const entries = new Map<string, Entry>();
+  const rank = { positive: 2, neutral: 1, reference: 0 } as const;
+  for (const intent of intents) {
+    const lexical = resolve(intent.mention.path);
+    const entry = entries.get(lexical);
+    if (!entry) {
+      entries.set(lexical, {
+        path: lexical,
+        canonical: lexical,
+        role: intent.role,
+        excluded: intent.excluded,
+        hard: intent.hardExcluded,
+        isFile: false,
+        exists: false,
+        repository: false,
+      });
+      continue;
+    }
+    entry.excluded ||= intent.excluded;
+    entry.hard ||= intent.hardExcluded;
+    if (rank[intent.role] > rank[entry.role]) entry.role = intent.role;
+  }
+
+  let blocksFallback = false;
+  const missing: string[] = [];
+  for (const entry of entries.values()) {
+    const protectedTarget = protectedReason(entry.path);
+    if (protectedTarget) {
+      // Refused only when a mutation is aimed at it ('fix /etc/nginx',
+      // 'Modify files in "/"'); as prose it is never a workspace.
+      if (entry.role === "positive" && !entry.excluded) {
+        throw new WorkspaceScopeError(`Refusing protected ${protectedTarget}: ${entry.path}`);
+      }
+      entries.delete(entry.path);
+      continue;
+    }
+    try {
+      const stat = await lstat(entry.path);
+      entry.exists = true;
+      entry.isFile = stat.isFile();
+      entry.canonical = await realpath(entry.path).catch(() => entry.path);
+      const directory = entry.isFile ? dirname(entry.path) : entry.path;
+      entry.repository = Boolean(await GitRepo.open(directory).catch(() => null));
+    } catch {
+      const { real, ancestor } = await looksLikeMissingFilesystemPath(entry.path);
+      if (!real) {
+        entries.delete(entry.path);
+        continue;
+      }
+      blocksFallback = true;
+      const inRepository = !protectedReason(ancestor) && Boolean(await GitRepo.open(ancestor).catch(() => null));
+      if (entry.excluded || entry.role === "reference") {
+        entry.canonical = await realpath(ancestor).catch(() => ancestor);
+        continue;
+      }
+      if (!inRepository) {
+        missing.push(entry.path);
+        entries.delete(entry.path);
+        continue;
+      }
+      // A new path inside an existing repository: that directory is the target.
+      entry.exists = true;
+      entry.path = ancestor;
+      entry.canonical = await realpath(ancestor).catch(() => ancestor);
+      entry.repository = true;
+      entry.role = "positive";
+    }
+  }
+  if (missing.length > 0) {
+    throw new WorkspaceScopeError(
+      `Workspace target does not exist: ${missing.join(", ")}. Check the path (or clone the repository first); the launch directory is never used in its place.`,
+    );
+  }
+
+  const all = [...entries.values()].filter((entry) => entry.exists);
+  const excluded = all.filter((entry) => entry.excluded);
+  if (excluded.length > 0) blocksFallback = true;
+  let positives = all.filter((entry) => !entry.excluded && entry.role === "positive");
+  if (positives.length === 0) {
+    const neutralRepos = all.filter((entry) => !entry.excluded && entry.role === "neutral" && entry.repository);
+    if (new Set(neutralRepos.map((entry) => entry.canonical)).size === 1) positives = neutralRepos;
+  }
+  const writable: string[] = [];
+  const unbound: string[] = [];
+  for (const entry of positives) {
+    const covering = excluded.find((exclusion) => isWithin(exclusion.canonical, entry.canonical));
+    if (covering) {
+      blocksFallback = true;
+      continue;
+    }
+    const inner = excluded.find(
+      (exclusion) => exclusion.canonical !== entry.canonical && isWithin(entry.canonical, exclusion.canonical),
+    );
+    if (inner) {
+      throw new WorkspaceScopeError(
+        `Refusing ${entry.path}: the request excludes ${inner.path} inside it, and a writable workspace cannot carve out an excluded subpath. Name a target that does not contain the excluded path.`,
+      );
+    }
+    if (!entry.repository) {
+      unbound.push(entry.path);
+      blocksFallback = true;
+      continue;
+    }
+    writable.push(entry.isFile ? dirname(entry.path) : entry.path);
+  }
+
+  const readOnly: string[] = [];
+  for (const entry of all) {
+    if (writable.some((root) => isWithin(root, entry.canonical)) && !entry.excluded) continue;
+    if (entry.hard) continue;
+    if (positives.includes(entry) && !entry.excluded && !entry.repository) continue;
+    // A repository named but not granted (reference, ambiguous neutral) is a
+    // deliberate scope statement; an input outside any repository is not.
+    if (entry.repository) blocksFallback = true;
+    readOnly.push(entry.path);
+  }
+
+  if (writable.length === 0 && (blocksFallback || unbound.length > 0)) {
+    const reason =
+      unbound.length > 0
+        ? `the named target ${unbound.join(", ")} is not inside a Git repository`
+        : "every named path is excluded, read-only, or ambiguous";
+    throw new WorkspaceScopeError(
+      `No writable workspace: ${reason}. Name the repository to modify explicitly (e.g. "implement the change in /path/to/repo"); the launch directory is never used in place of a named path.`,
+    );
+  }
+  return { writable, readOnly };
+}
+
 function repoIdFor(root: string): string {
   return `repo-${createHash("sha256").update(root).digest("hex").slice(0, 16)}`;
 }
@@ -278,80 +326,15 @@ function repoIdFor(root: string): string {
 /** Resolve repository authority only from the user's request or launch cwd. */
 export class WorkspaceManifestResolver {
   async resolve(request: string, launchCwd: string): Promise<ResolvedWorkspace> {
-    // A path extracted from prose is a candidate, never an obligation: a
-    // nonexistent path nobody asked to change (an API route such as
-    // /v1/events) and a protected directory mentioned as prose ('mount the app
-    // at "/"') are ignored. Every other named path is classified within its own
-    // clause: read-only paths become read roots, targets must bind to a Git
-    // repository. The launch cwd is a fallback only when the request names no
-    // target, excludes nothing, and names no repository as reference: a
-    // request that names paths but leaves nothing writable is refused.
-    // resolveRepository (legacy explicit repository argument) keeps failing loudly.
-    const existing: string[] = [];
-    const readOnly: string[] = [];
-    const unbound: string[] = [];
-    const missing: string[] = [];
-    let blocksFallback = false;
-    for (const mention of classifyMentions(request, explicitPathMentions(request))) {
-      let path = mention.path;
-      const protectedTarget = protectedReason(path);
-      if (protectedTarget) {
-        // Refused only when the request directs mutation at it ('fix
-        // /etc/nginx', 'Modify files in "/"'); as prose it is never writable.
-        if (mention.intent === "write" && mention.directed) {
-          throw new WorkspaceScopeError(`Refusing protected ${protectedTarget}: ${resolve(path)}`);
-        }
-        continue;
-      }
-      let isFile = false;
-      try {
-        // Symlinks are accepted here via lstat; the downstream
-        // symlink-boundary check still applies.
-        const stat = await lstat(path);
-        isFile = stat.isFile();
-        if (!isFile && !stat.isDirectory() && !stat.isSymbolicLink()) continue;
-      } catch {
-        if (mention.intent === "write" && MUTATION_INTO.test(mention.before)) missing.push(path);
-        continue;
-      }
-      if (mention.intent === "ignore") {
-        blocksFallback = true;
-        continue;
-      }
-      const directory = isFile ? dirname(path) : path;
-      const isRepository = Boolean(await GitRepo.open(directory).catch(() => null));
-      if (mention.intent === "write" && isRepository) {
-        existing.push(directory);
-        continue;
-      }
-      if (mention.intent === "write" && mention.directed) {
-        unbound.push(path);
-        blocksFallback = true;
-        continue;
-      }
-      // Read-only, or an undirected input outside any repository ("analyze
-      // /tmp/crash.log"): a read root. A repository named only as reference
-      // still blocks the launch fallback; a plain input file does not.
-      if (isRepository) blocksFallback = true;
-      if (!isFile) path = directory;
-      readOnly.push(path);
-    }
-    if (missing.length > 0) {
-      throw new WorkspaceScopeError(
-        `Workspace target does not exist: ${missing.join(", ")}. Check the path (or clone the repository first); the launch directory is never used in its place.`,
-      );
-    }
-    if (blocksFallback && existing.length === 0) {
-      const reason =
-        unbound.length > 0
-          ? `the named target ${unbound.join(", ")} is not inside a Git repository`
-          : "every named path is read-only or excluded";
-      throw new WorkspaceScopeError(
-        `No writable workspace: ${reason}. Name the repository to modify explicitly (e.g. "implement the change in /path/to/repo"); the launch directory is never used in place of a named path.`,
-      );
-    }
-    let candidates: Array<{ path: string; source: AuthorizedRoot["source"] }> =
-      existing.length > 0 ? existing.map((path) => ({ path, source: "explicit_user_path" as const })) : [];
+    // Named paths decide authority (src/orchestration/pathIntent.ts,
+    // planAuthority); the launch cwd is only a fallback for requests that name
+    // nothing binding. resolveRepository (legacy explicit repository argument)
+    // keeps failing loudly.
+    const { writable, readOnly } = await planAuthority(classifyPathIntents(request, launchCwd));
+    let candidates: Array<{ path: string; source: AuthorizedRoot["source"] }> = writable.map((path) => ({
+      path,
+      source: "explicit_user_path" as const,
+    }));
     if (candidates.length === 0) {
       // Workspace-parent mode: launching from a directory that is itself not a
       // git checkout (e.g. a projects root containing many checkouts) is a
@@ -371,7 +354,7 @@ export class WorkspaceManifestResolver {
     for (const path of readOnly) {
       const canonical = await realpath(path).catch(() => null);
       if (!canonical || protectedReason(canonical)) continue;
-      if (resolved.authorizedRoots.some((root) => root.canonicalPath === canonical)) continue;
+      if (resolved.authorizedRoots.some((root) => isWithin(root.canonicalPath, canonical))) continue;
       resolved.authorizedRoots.push({ canonicalPath: canonical, source: "explicit_user_path", access: "read" });
     }
     return resolved;
