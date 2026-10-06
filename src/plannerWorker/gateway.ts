@@ -10,6 +10,7 @@
 
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
+import { DEFAULT_GATEWAY_MAX_ELAPSED_MS } from "../gateway/streamRetry.ts";
 import { parseAdmissionPayload } from "../inference/admissionContract.ts";
 
 /** A model or logical route as the gateway advertises it on `GET /models`. */
@@ -171,9 +172,31 @@ export type ChatOutcome =
  */
 function postNoTimeouts(
   url: string,
-  opts: { headers: Record<string, string>; body: string; signal: AbortSignal },
+  opts: { headers: Record<string, string>; body: string; signal: AbortSignal; alive?: InFlightKeepalive },
 ): Promise<{ ok: boolean; status: number; headers: Headers; text: string }> {
-  return new Promise((resolve, reject) => {
+  return new Promise((done, fail) => {
+    // The open request is the caller's sign of life: report it periodically
+    // while its socket is open (TCP keepalive detects a dead peer), and on
+    // every response chunk, until the keepalive bound runs out.
+    const alive = opts.alive;
+    const sentAt = Date.now();
+    let socketOpen = false;
+    const beat = alive
+      ? setInterval(
+          () => {
+            if (socketOpen && Date.now() - sentAt < (alive.limitMs ?? DEFAULT_GATEWAY_MAX_ELAPSED_MS)) alive.onAlive();
+          },
+          Math.max(10, alive.intervalMs ?? DEFAULT_KEEPALIVE_INTERVAL_MS),
+        )
+      : undefined;
+    const settle =
+      <T>(fn: (v: T) => void) =>
+      (v: T): void => {
+        if (beat) clearInterval(beat);
+        fn(v);
+      };
+    const resolve = settle(done);
+    const reject = settle(fail);
     const target = new URL(url);
     const send = target.protocol === "https:" ? httpsRequest : httpRequest;
     const req = send(
@@ -185,7 +208,10 @@ function postNoTimeouts(
       },
       (res) => {
         const chunks: Buffer[] = [];
-        res.on("data", (c: Buffer) => chunks.push(c));
+        res.on("data", (c: Buffer) => {
+          chunks.push(c);
+          alive?.onAlive();
+        });
         res.on("error", reject);
         res.on("end", () => {
           const headers = new Headers();
@@ -197,10 +223,28 @@ function postNoTimeouts(
         });
       },
     );
+    req.on("socket", (socket) => {
+      socket.setKeepAlive(true, 30_000);
+      socketOpen = true;
+      socket.once("close", () => {
+        socketOpen = false;
+      });
+    });
     req.on("error", reject);
     req.end(opts.body);
   });
 }
+
+/** Sign-of-life reporting for an in-flight request. */
+export interface InFlightKeepalive {
+  onAlive: () => void;
+  /** Cadence (default 30 s). */
+  intervalMs?: number;
+  /** Stop reporting after this long in flight (default the gateway's 12 h request horizon). */
+  limitMs?: number;
+}
+
+const DEFAULT_KEEPALIVE_INTERVAL_MS = 30_000;
 
 /** One non-streaming chat completion. */
 export async function chatCompletion(
@@ -211,6 +255,7 @@ export async function chatCompletion(
     user: string;
     capability?: CapabilityRequest;
     signal?: AbortSignal;
+    alive?: InFlightKeepalive;
   },
 ): Promise<ChatOutcome> {
   const started = Date.now();
@@ -237,6 +282,7 @@ export async function chatCompletion(
         ...(conn.timeoutMs !== undefined ? [AbortSignal.timeout(conn.timeoutMs)] : []),
         ...(req.signal ? [req.signal] : []),
       ]),
+      ...(req.alive ? { alive: req.alive } : {}),
     });
     const text = res.text;
     let body: unknown = null;

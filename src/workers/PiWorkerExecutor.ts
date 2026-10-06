@@ -426,15 +426,18 @@ ${TOOL_TRANSITION_RULE}`;
       //   * GATEWAY saturation (429 inference_admission) is deliberately NOT a
       //     transient category — see classifyError. It is handled below, where
       //     the gateway's own advertised wait is honoured process-wide.
-      // Queuing for a slot is waiting for inference capacity: tell the owner,
-      // per worker, so the wait is never mistaken for a hang.
-      if (gatewayConfig.enabled) {
-        const status = admission.status();
-        if (status.active >= Math.max(1, status.concurrency) || status.cooldownMs > 0) {
-          emitWorkerActivity(req, { kind: "state", summary: WAITING_FOR_INFERENCE_SUMMARY, meaningfulProgress: false });
-        }
-      }
-      const slot = gatewayConfig.enabled ? await admission.acquire() : null;
+      // Queuing for a slot is waiting for inference capacity: the queue itself
+      // tells the owner, per worker, so the wait is never mistaken for a hang.
+      const slot = gatewayConfig.enabled
+        ? await admission.acquire({
+            onWait: () =>
+              emitWorkerActivity(req, {
+                kind: "state",
+                summary: WAITING_FOR_INFERENCE_SUMMARY,
+                meaningfulProgress: false,
+              }),
+          })
+        : null;
       let transientOutcome: Awaited<
         ReturnType<typeof withTransientRetry<Awaited<ReturnType<typeof this.runSingleAttempt>>>>
       >;
@@ -991,11 +994,14 @@ ${recovery.recoveryPrompt}`;
 
     try {
       emitWorkerActivity(req, { kind: "state", summary: "Worker session started", meaningfulProgress: false });
+      // Canceled while queued for a slot: aborting a session that has not
+      // started prompting is a no-op, so never start it.
       if (req.signal?.aborted) abortFromOwner();
-      await session.prompt(req.kickoff ?? WORKER_KICKOFF, {
-        images: req.images?.map((img) => ({ type: "image" as const, data: img.data, mimeType: img.mimeType })),
-        expandPromptTemplates: false,
-      });
+      else
+        await session.prompt(req.kickoff ?? WORKER_KICKOFF, {
+          images: req.images?.map((img) => ({ type: "image" as const, data: img.data, mimeType: img.mimeType })),
+          expandPromptTemplates: false,
+        });
     } catch (err) {
       // Capture the error. An abort triggered by the guard/budget/timeout is
       // EXPECTED (session.abort()) and not a transport failure. A rejection

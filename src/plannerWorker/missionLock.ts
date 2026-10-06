@@ -7,10 +7,18 @@
  * records itself in `<stateDir>/mission.lock` by pid AND process incarnation
  * (boot id + `/proc/<pid>/stat` start time), so a reused pid is not mistaken
  * for the owner. A live (or undeterminable) owner refuses the lock; a dead
- * owner's lock — a crash, a SIGKILL — is reclaimed.
+ * owner's lock — a crash, a SIGKILL — is taken over.
+ *
+ * Race-freedom: the lock file is never deleted while anyone but its owner
+ * could act on it. A fresh lock is created exclusively (hard link of a fully
+ * written draft, or an O_EXCL create where hard links are unsupported). A
+ * dead owner's lock is replaced in place (atomic rename) only by the single
+ * claimant that exclusively created `<lock>.takeover-<dead token>`; it
+ * re-checks under that claim that the lock still names the dead owner. A
+ * claim abandoned by a crashed claimant is itself taken over the same way.
  */
 
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { link, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { type ProcessIdentity, assessProcess, currentProcessIdentity } from "../runtime/isolation/processIdentity.ts";
@@ -34,29 +42,93 @@ export class MissionLockedError extends Error {
 }
 
 export interface MissionLock {
-  /** Remove the lock if it is still ours (a no-op once reclaimed by another owner). */
+  /** Remove the lock if it is still ours (a no-op once taken over by another owner). */
   release(): Promise<void>;
 }
 
-async function readRecord(path: string): Promise<LockRecord | "missing" | "corrupt"> {
+type Read = { kind: "record"; record: LockRecord } | { kind: "missing" } | { kind: "corrupt"; token: string };
+
+async function readRecord(path: string): Promise<Read> {
   let text: string;
   try {
     text = await readFile(path, "utf8");
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return "missing";
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { kind: "missing" };
     throw error;
   }
   try {
     const r = JSON.parse(text) as Partial<LockRecord>;
-    return typeof r.pid === "number" && typeof r.token === "string" && typeof r.host === "string"
-      ? (r as LockRecord)
-      : "corrupt";
+    if (typeof r.pid === "number" && typeof r.token === "string" && typeof r.host === "string") {
+      return { kind: "record", record: r as LockRecord };
+    }
   } catch {
-    return "corrupt";
+    // fall through
+  }
+  return { kind: "corrupt", token: `corrupt-${createHash("sha256").update(text).digest("hex").slice(0, 16)}` };
+}
+
+/**
+ * Read a lock or claim, giving an O_EXCL creator (no hard links) a moment to
+ * finish writing it before calling it corrupt.
+ */
+async function settledRecord(path: string): Promise<Read> {
+  let r = await readRecord(path);
+  for (let i = 0; i < 20 && r.kind === "corrupt"; i++) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    r = await readRecord(path);
+  }
+  return r;
+}
+
+const dead = (r: Read): boolean =>
+  r.kind === "corrupt" || (r.kind === "record" && assessProcess(r.record).state === "dead");
+const tokenOf = (r: Read): string | null =>
+  r.kind === "record" ? r.record.token : r.kind === "corrupt" ? r.token : null;
+
+/**
+ * Create `path` exclusively with `content`: a hard link of the written draft
+ * (never visible half-written), or an O_EXCL create on filesystems without
+ * hard links. False when it already exists.
+ */
+async function createExclusive(path: string, draft: string, content: string): Promise<boolean> {
+  try {
+    await link(draft, path);
+    return true;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "EEXIST") return false;
+    if (!["EPERM", "ENOTSUP", "EOPNOTSUPP", "ENOSYS", "EXDEV", "EMLINK"].includes(code ?? "")) throw error;
+  }
+  try {
+    await writeFile(path, content, { flag: "wx" });
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
+    throw error;
   }
 }
 
-/** Take the mission's lock, reclaiming it from a dead owner; throws `MissionLockedError` when held. */
+/**
+ * Become the single claimant allowed to replace `target`, whose holder (token
+ * `deadToken`) is dead. Returns the claim files created, outermost first, or
+ * null when a live claimant got there first.
+ */
+async function claim(target: string, deadToken: string, draft: string, content: string): Promise<string[] | null> {
+  const marker = `${target}.takeover-${deadToken}`;
+  for (let tries = 0; tries < 5; tries++) {
+    if (await createExclusive(marker, draft, content)) return [marker];
+    const holder = await settledRecord(marker);
+    if (holder.kind === "missing") continue;
+    if (!dead(holder)) return null;
+    // A claimant crashed mid-takeover: take over its claim, which leaves the
+    // abandoned marker in place so nobody else can create it afresh.
+    const inner = await claim(marker, tokenOf(holder)!, draft, content);
+    return inner ? [...inner, marker] : null;
+  }
+  return null;
+}
+
+/** Take the mission's lock, taking it over from a dead owner; throws `MissionLockedError` when held. */
 export async function acquireMissionLock(stateDir: string): Promise<MissionLock> {
   await mkdir(stateDir, { recursive: true });
   const path = join(stateDir, LOCK_FILE);
@@ -65,39 +137,31 @@ export async function acquireMissionLock(stateDir: string): Promise<MissionLock>
     token: randomUUID(),
     acquired_at: new Date().toISOString(),
   };
-  // Written in full, then linked into place: the lock never exists half-written.
+  const content = `${JSON.stringify(record)}\n`;
+  const ours = { release: () => releaseIfOwned(path, record.token) };
   const draft = `${path}.${record.token}.tmp`;
-  await writeFile(draft, `${JSON.stringify(record)}\n`);
+  await writeFile(draft, content);
   try {
     for (let tries = 0; tries < 5; tries++) {
+      if (await createExclusive(path, draft, content)) return ours;
+      const holder = await settledRecord(path);
+      if (holder.kind === "missing") continue;
+      if (!dead(holder)) throw new MissionLockedError(stateDir, holder.kind === "record" ? holder.record : null);
+      const stale = tokenOf(holder)!;
+      const claims = await claim(path, stale, draft, content);
+      if (!claims) throw new MissionLockedError(stateDir, null);
       try {
-        await link(draft, path);
-        return { release: () => releaseIfOwned(path, record.token) };
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        // Exclusive claimant now: replace the lock only if it still names the dead owner.
+        if (tokenOf(await settledRecord(path)) !== stale) continue;
+        const replacement = `${draft}.replace`;
+        await writeFile(replacement, content);
+        await rename(replacement, path);
+        return ours;
+      } finally {
+        // Only after the lock is replaced (or found changed): a later claimant
+        // re-checks the lock and finds it no longer names the dead owner.
+        for (const file of claims) await rm(file, { force: true });
       }
-      const holder = await readRecord(path);
-      if (holder === "missing") continue;
-      if (holder !== "corrupt" && assessProcess(holder).state !== "dead")
-        throw new MissionLockedError(stateDir, holder);
-      // Reclaim: move the stale lock aside, and make sure it is the one judged
-      // dead — a racing claimant may have replaced it meanwhile.
-      const aside = `${path}.stale-${record.token}`;
-      try {
-        await rename(path, aside);
-      } catch {
-        continue;
-      }
-      const moved = await readRecord(aside);
-      const sameStale =
-        holder === "corrupt" ? moved === "corrupt" : typeof moved === "object" && moved.token === holder.token;
-      if (!sameStale) {
-        // We moved a fresh owner's lock: put it back and yield to it.
-        await link(aside, path).catch(() => undefined);
-        await rm(aside, { force: true });
-        throw new MissionLockedError(stateDir, typeof moved === "object" ? moved : null);
-      }
-      await rm(aside, { force: true });
     }
     throw new MissionLockedError(stateDir, null);
   } finally {
@@ -106,6 +170,6 @@ export async function acquireMissionLock(stateDir: string): Promise<MissionLock>
 }
 
 async function releaseIfOwned(path: string, token: string): Promise<void> {
-  const holder = await readRecord(path).catch(() => "missing" as const);
-  if (typeof holder === "object" && holder.token === token) await rm(path, { force: true });
+  const holder = await readRecord(path).catch(() => ({ kind: "missing" }) as const);
+  if (holder.kind === "record" && holder.record.token === token) await rm(path, { force: true });
 }

@@ -140,6 +140,7 @@ export function sanitizeWorkerActivity(value: unknown): WorkerActivity | null {
       input.summary === "Model response received" ||
       input.summary === STREAMING_SUMMARY ||
       input.summary === WAITING_FOR_INFERENCE_SUMMARY ||
+      input.summary === AWAITING_MODEL_RESPONSE_SUMMARY ||
       input.summary === TOOL_PROGRESS_SUMMARY
         ? input.summary
         : "Worker session started";
@@ -204,6 +205,12 @@ const STREAMING_SUMMARY = "Model streaming";
  * worker waiting for inference capacity as hung.
  */
 export const WAITING_FOR_INFERENCE_SUMMARY = "Waiting for inference capacity";
+
+/**
+ * A non-streaming model request still in flight on an open connection: the
+ * answer arrives all at once, so the open request is the sign of life.
+ */
+export const AWAITING_MODEL_RESPONSE_SUMMARY = "Awaiting model response";
 
 /**
  * A running tool (a long test suite, a build) that keeps producing output. It
