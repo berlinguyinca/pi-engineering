@@ -1,11 +1,82 @@
-import { execFile } from "node:child_process";
+import { spawn } from "node:child_process";
 import { access, readFile } from "node:fs/promises";
 import { basename, join } from "node:path";
-import { promisify } from "node:util";
 import type { ArtifactStore } from "../artifacts/ArtifactStore.ts";
 import type { Evidence, EvidenceTrust } from "../core/types.ts";
 
-const exec = promisify(execFile);
+/**
+ * Default hang guard for a verification command: killed only after this long
+ * with NO output at all. A long suite that keeps printing runs to completion.
+ */
+export const DEFAULT_STAGE_INACTIVITY_MS = 15 * 60_000;
+
+const MAX_STAGE_OUTPUT_BYTES = 16 * 1024 * 1024;
+
+/**
+ * Run a command with an INACTIVITY guard instead of a total-duration timeout:
+ * every chunk of stdout/stderr re-arms it, so only a silent (hung) command is
+ * killed. Resolves with the exit code; never rejects for a non-zero exit.
+ */
+export function runWithInactivityGuard(
+  command: string,
+  args: string[],
+  opts: { cwd: string; env?: NodeJS.ProcessEnv; signal?: AbortSignal; inactivityMs: number },
+): Promise<{ code: number; stdout: string; stderr: string; hung: boolean }> {
+  return new Promise((resolve, reject) => {
+    if (opts.signal?.aborted) {
+      reject(Object.assign(new Error("The operation was aborted"), { name: "AbortError" }));
+      return;
+    }
+    let stdout = "";
+    let stderr = "";
+    let hung = false;
+    let settled = false;
+    const child = spawn(command, args, { cwd: opts.cwd, env: opts.env, stdio: ["ignore", "pipe", "pipe"] });
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const arm = (): void => {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => {
+        hung = true;
+        stderr += `\n[pi-engineering] killed: no output for ${opts.inactivityMs}ms (hung command)\n`;
+        child.kill("SIGKILL");
+      }, opts.inactivityMs);
+    };
+    const onAbort = (): void => {
+      child.kill("SIGKILL");
+    };
+    opts.signal?.addEventListener("abort", onAbort, { once: true });
+    const append = (current: string, chunk: Buffer): string =>
+      current.length >= MAX_STAGE_OUTPUT_BYTES ? current : current + chunk.toString("utf8");
+    child.stdout.on("data", (chunk: Buffer) => {
+      stdout = append(stdout, chunk);
+      arm();
+    });
+    child.stderr.on("data", (chunk: Buffer) => {
+      stderr = append(stderr, chunk);
+      arm();
+    });
+    const finish = (fn: () => void): void => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      opts.signal?.removeEventListener("abort", onAbort);
+      fn();
+    };
+    child.on("error", (error) =>
+      finish(() => resolve({ code: 1, stdout, stderr: `${stderr}${error.message}`, hung: false })),
+    );
+    child.on("close", (code) =>
+      finish(() => {
+        if (opts.signal?.aborted) {
+          reject(Object.assign(new Error("The operation was aborted"), { name: "AbortError" }));
+          return;
+        }
+        resolve({ code: typeof code === "number" ? code : 1, stdout, stderr, hung });
+      }),
+    );
+    arm();
+  });
+}
 
 /** A verification stage from a profile (spec §15). */
 export interface VerifyStage {
@@ -15,6 +86,7 @@ export interface VerifyStage {
   /** Stop the profile on hard failure. */
   required: boolean;
   cwd?: string;
+  /** Hang guard: kill the command after this long with no output (not a total-duration limit). */
   timeoutMs?: number;
 }
 
@@ -167,7 +239,7 @@ async function nonNodeStages(cwd: string): Promise<VerifyStage[]> {
     command,
     args,
     required: true,
-    timeoutMs: 600_000,
+    timeoutMs: DEFAULT_STAGE_INACTIVITY_MS,
   });
   if (await exists(join(cwd, "Cargo.toml"))) {
     stages.push(stage("typecheck", "cargo", ["check", "--all-targets"]));
@@ -364,7 +436,7 @@ export class CommandVerifier implements VerificationProvider {
         command,
         args,
         required,
-        timeoutMs: 300_000,
+        timeoutMs: DEFAULT_STAGE_INACTIVITY_MS,
       });
     };
     push("typecheck", scripts.typecheck ?? scripts.check);
@@ -413,24 +485,15 @@ export class CommandVerifier implements VerificationProvider {
       let stdout = "";
       let stderr = "";
       let code = -1;
-      try {
-        const res = await exec(stage.command, stage.args, {
-          cwd: stage.cwd ?? cwd,
-          timeout: stage.timeoutMs ?? 300_000,
-          maxBuffer: 16 * 1024 * 1024,
-          env: await cleanEnv(stage.cwd ?? cwd),
-          signal: opts?.signal,
-        });
-        stdout = res.stdout;
-        stderr = res.stderr;
-        code = 0;
-      } catch (err) {
-        if (opts?.signal?.aborted || (err as { name?: string }).name === "AbortError") throw err;
-        const e = err as NodeJS.ErrnoException & { stdout?: string; stderr?: string; code?: number };
-        code = typeof e.code === "number" ? e.code : 1;
-        stdout = (e.stdout as string) ?? "";
-        stderr = (e.stderr as string) ?? e.message ?? String(e);
-      }
+      const res = await runWithInactivityGuard(stage.command, stage.args, {
+        cwd: stage.cwd ?? cwd,
+        inactivityMs: stage.timeoutMs ?? DEFAULT_STAGE_INACTIVITY_MS,
+        env: await cleanEnv(stage.cwd ?? cwd),
+        ...(opts?.signal ? { signal: opts.signal } : {}),
+      });
+      stdout = res.stdout;
+      stderr = res.stderr;
+      code = res.hung && res.code === 0 ? 1 : res.code;
       const finishedAt = new Date().toISOString();
       const passed = code === 0;
       const log = `$ ${stage.command} ${stage.args.join(" ")}\n--- stdout ---\n${stdout}\n--- stderr ---\n${stderr}`;

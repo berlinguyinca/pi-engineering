@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { test } from "node:test";
+import { describe, it, test } from "node:test";
 import { ArtifactStore } from "../../src/artifacts/ArtifactStore.ts";
 import { CommandVerifier, tokenizeCommand } from "../../src/verify/Verifier.ts";
 
@@ -365,4 +365,49 @@ test("verifier runs a Makefile test target and a real pytest suite", async () =>
     await rm(makeDir, { recursive: true, force: true });
     await rm(pyDir, { recursive: true, force: true });
   }
+});
+
+describe("verification commands have an inactivity hang guard, not a duration limit", () => {
+  const chatty =
+    'const t=setInterval(()=>console.log("test ok"),40);setTimeout(()=>{clearInterval(t);process.exit(0)},1500)';
+  const silent = "setTimeout(()=>process.exit(0),30000)";
+
+  it("lets a test command that keeps printing run past its hang guard", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pi-eng-ver-"));
+    try {
+      const store = await ArtifactStore.create(join(dir, "artifacts"));
+      const outcome = await new CommandVerifier().run(
+        dir,
+        {
+          name: "long-suite",
+          stages: [{ name: "test", command: process.execPath, args: ["-e", chatty], required: true, timeoutMs: 400 }],
+        },
+        store,
+      );
+      assert.equal(outcome.passed, true, "a suite that keeps producing output is never killed for running long");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("kills a test command that goes silent for the hang-guard window", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pi-eng-ver-"));
+    try {
+      const store = await ArtifactStore.create(join(dir, "artifacts"));
+      const started = Date.now();
+      const outcome = await new CommandVerifier().run(
+        dir,
+        {
+          name: "hung-suite",
+          stages: [{ name: "test", command: process.execPath, args: ["-e", silent], required: true, timeoutMs: 400 }],
+        },
+        store,
+      );
+      assert.equal(outcome.passed, false);
+      assert.equal(outcome.failedStage, "test");
+      assert.ok(Date.now() - started < 10_000, "the hung command is killed by inactivity, not left running");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
 });
