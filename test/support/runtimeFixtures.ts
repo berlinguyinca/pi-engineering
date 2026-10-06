@@ -128,7 +128,11 @@ export const runtimeApi = ${opts.runtimeApi ?? 1};
 export const value = VALUE;
 
 function bag(): any {
-  return (globalThis as any)[KEY];
+  // Self-initialising: a probe process (update validation) has no test bag.
+  return ((globalThis as any)[KEY] ??= {
+    reactions: 0, values: [], starts: 0, stops: 0, ticks: 0, stale: 0,
+    generations: [], restored: [], missions: [], lateFences: 0,
+  });
 }
 
 export async function createRuntime(ctx: any) {

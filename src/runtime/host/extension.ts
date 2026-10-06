@@ -13,11 +13,15 @@ import { existsSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { type ExtensionAPI, VERSION as PI_VERSION } from "@earendil-works/pi-coding-agent";
+import { SourceCache, type TrustedSource, type UpdateChannel } from "../../update/gitSource.ts";
 import { InstallLayout } from "../../update/installLayout.ts";
 import { UpdateJournal } from "../../update/journal.ts";
+import { type UpdateCheckResult, UpdateManager, type UpdateOutcome, type UpdateRequest } from "../../update/manager.ts";
 import { MutationLockBusyError, type MutationLockHandle, RuntimeMutationLock } from "../../update/mutationLock.ts";
 import { type RecoveryOutcome, recoverInterruptedTransaction } from "../../update/recovery.ts";
+import type { ValidationMode } from "../../update/validate.ts";
+import { HOST_SUPPORTED_RUNTIME_APIS } from "./contract.ts";
 import { ago, formatHandover, short, waitingText } from "./format.ts";
 import { type HandoverHooks, type HandoverResult, type HandoverTask, RuntimeBusyError, RuntimeHost } from "./host.ts";
 import { type RuntimeSource, snapshotRuntimeSource } from "./loader.ts";
@@ -38,6 +42,16 @@ export interface HostExtensionConfig {
   baseline?: boolean;
   /** Safe-point wait limit for handovers (ms). Absent: wait until cancelled. */
   safePointTimeoutMs?: number;
+  /** Update source (default: the package checkout's `origin`). */
+  updateRemote?: string;
+  /** Remotes updates may come from (default: just the update remote's default, `origin`). */
+  trustedRemotes?: string[];
+  /** Running Pi version (default: the loaded pi-coding-agent's VERSION). */
+  piVersion?: string;
+  /** Candidate validation depth (default "default"; "full" also runs the whole test suite). */
+  validation?: ValidationMode;
+  /** Allow `npm ci --ignore-scripts` in staging when a candidate's lockfile changed (default true). */
+  allowDependencyInstall?: boolean;
 }
 
 export function resolveHostConfig(env: NodeJS.ProcessEnv = process.env): HostExtensionConfig {
@@ -51,7 +65,75 @@ export function resolveHostConfig(env: NodeJS.ProcessEnv = process.env): HostExt
     ...(devSource ? { devSource: resolve(devSource) } : {}),
     baseline: env.PI_ENGINEERING_BASELINE !== "0",
     ...(Number.isFinite(timeout) && timeout > 0 ? { safePointTimeoutMs: timeout } : {}),
+    ...(env.PI_ENGINEERING_UPDATE_REMOTE?.trim() ? { updateRemote: env.PI_ENGINEERING_UPDATE_REMOTE.trim() } : {}),
+    ...(env.PI_ENGINEERING_UPDATE_TRUSTED?.trim()
+      ? {
+          trustedRemotes: env.PI_ENGINEERING_UPDATE_TRUSTED.split(",")
+            .map((r) => r.trim())
+            .filter(Boolean),
+        }
+      : {}),
+    ...(env.PI_ENGINEERING_UPDATE_VALIDATION === "quick" || env.PI_ENGINEERING_UPDATE_VALIDATION === "full"
+      ? { validation: env.PI_ENGINEERING_UPDATE_VALIDATION }
+      : {}),
+    allowDependencyInstall: env.PI_ENGINEERING_UPDATE_INSTALL_DEPS !== "0",
   };
+}
+
+/** The runtime entry a version declares (package.json `piEngineering.entry`), when well-formed. */
+export function declaredEntry(dir: string): string | null {
+  try {
+    const pkg = JSON.parse(readFileSync(join(dir, "package.json"), "utf8")) as { piEngineering?: { entry?: unknown } };
+    const entry = pkg.piEngineering?.entry;
+    return typeof entry === "string" &&
+      /^[A-Za-z0-9_][A-Za-z0-9_./-]{0,200}\.(?:ts|js|mjs)$/.test(entry) &&
+      !entry.includes("..")
+      ? entry
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The `origin` remote of a checkout, if any. */
+export function originRemote(root: string): string | null {
+  try {
+    const url = execFileSync("git", ["-C", root, "remote", "get-url", "origin"], {
+      timeout: 2000,
+      stdio: ["ignore", "pipe", "ignore"],
+    })
+      .toString()
+      .trim();
+    return url || null;
+  } catch {
+    return null;
+  }
+}
+
+export type UpdateArgs = { ok: true; check: boolean; request: UpdateRequest } | { ok: false; error: string };
+
+/** Parse `/engineering update` flags. Tokenised; values validated; unknown flags rejected. */
+export function parseUpdateArgs(argv: string[]): UpdateArgs {
+  const request: UpdateRequest = {};
+  let check = false;
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i] as string;
+    if (a === "--check") check = true;
+    else if (a === "--force") request.force = true;
+    else if (a === "--verify-full") request.verify = "full";
+    else if (a === "--channel") {
+      const v = argv[++i];
+      if (v !== "stable" && v !== "main") return { ok: false, error: "--channel must be stable or main" };
+      request.channel = v;
+    } else if (a === "--commit") {
+      const v = argv[++i];
+      if (!v || !/^[0-9a-fA-F]{7,40}$/.test(v))
+        return { ok: false, error: "--commit needs a 7-40 character commit id" };
+      request.commit = v.toLowerCase();
+    } else return { ok: false, error: `unknown option ${a}` };
+  }
+  if (request.channel && request.commit) return { ok: false, error: "use --channel or --commit, not both" };
+  return { ok: true, check, request };
 }
 
 /** Read version/commit for a runtime source directory. Never throws. */
@@ -90,6 +172,7 @@ export class EngineeringHostExtension {
   readonly journal: UpdateJournal;
   readonly lock: RuntimeMutationLock;
   recovery: RecoveryOutcome | undefined;
+  readonly updates: UpdateManager;
   private pi: ExtensionAPI | undefined;
 
   constructor(config: HostExtensionConfig) {
@@ -97,10 +180,37 @@ export class EngineeringHostExtension {
     this.layout = new InstallLayout(config.installRoot);
     this.journal = new UpdateJournal(this.layout.journalFile);
     this.lock = new RuntimeMutationLock(this.layout.lockFile);
+
     // Per process: another Pi process sharing the install root must never
     // prune a directory this one is still importing from.
     this.generationsDir = join(config.installRoot, "generations", `${process.pid}-${randomBytes(3).toString("hex")}`);
     this.telemetry = new RuntimeTelemetry(join(config.installRoot, "telemetry", "runtime-events.jsonl"));
+    this.updates = new UpdateManager({
+      layout: this.layout,
+      journal: this.journal,
+      lock: this.lock,
+      telemetry: this.telemetry,
+      cache: new SourceCache(this.layout.cacheRepo),
+      source: () => this.trustedSource(),
+      activation: this,
+      running: () => {
+        const a = this.host?.activeGeneration();
+        if (!a) return null;
+        return {
+          version: a.source.version,
+          commit: a.source.commit,
+          label: a.source.label,
+          root: a.source.root,
+          checkout: !a.source.label.startsWith("installed:"),
+        };
+      },
+      stateDir: () => this.stateDir(),
+      piVersion: config.piVersion ?? PI_VERSION,
+      supportedRuntimeApis: HOST_SUPPORTED_RUNTIME_APIS,
+      defaultValidation: config.validation ?? "default",
+      allowDependencyInstall: config.allowDependencyInstall !== false,
+      packageRoot: config.packageRoot,
+    });
   }
 
   async install(pi: ExtensionAPI): Promise<void> {
@@ -141,6 +251,15 @@ export class EngineeringHostExtension {
     } finally {
       handle.release();
     }
+  }
+
+  /** Where updates come from, and which sources are trusted (spec §46). */
+  trustedSource(): TrustedSource {
+    const origin = originRemote(this.config.packageRoot);
+    const remote = this.config.updateRemote ?? origin;
+    if (!remote) throw new Error("no update source: the package checkout has no origin and none is configured");
+    const trusted = this.config.trustedRemotes ?? (origin ? [origin] : []);
+    return { remote, trusted, identityRoots: [] };
   }
 
   /** Take the runtime mutation lock or tell the operator who has it (spec §28). */
@@ -215,7 +334,7 @@ export class EngineeringHostExtension {
     const described = describeSource(dir);
     return {
       root: dir,
-      entry: this.config.entry,
+      entry: declaredEntry(dir) ?? this.config.entry,
       version: meta?.version ?? described.version,
       commit: meta?.commit ?? described.commit,
       label: `installed:${meta?.id ?? dir.split("/").pop()}`,
@@ -306,6 +425,8 @@ export class EngineeringHostExtension {
     switch (sub) {
       case "reload":
         return this.reload(ctx);
+      case "update":
+        return this.update(argv.slice(1), ctx);
       case "cancel": {
         const task = host.pendingTask();
         if (!task) return notify(ctx, "No Pi Engineering runtime handover is pending.");
@@ -354,6 +475,37 @@ export class EngineeringHostExtension {
     );
     if (result) notify(ctx, formatHandover(result, { from, to: source.version, action: "Reloaded" }), level(result));
   }
+
+  protected async update(argv: string[], ctx: Ctx): Promise<void> {
+    const parsed = parseUpdateArgs(argv);
+    if (!parsed.ok) {
+      return notify(
+        ctx,
+        `${parsed.error}\nusage: /engineering update [--check] [--force] [--channel stable|main] [--commit <sha>] [--verify-full]`,
+        "warning",
+      );
+    }
+    if (parsed.check) {
+      const check = await this.updates.check(parsed.request);
+      return notify(ctx, formatCheck(check), check.failure ? "warning" : "info");
+    }
+    const progress: string[] = [];
+    const outcome = await this.updates.update(parsed.request, (line) => progress.push(line));
+    this.lastUpdateOutcome = outcome;
+    if (outcome.status !== "handover") return notify(ctx, formatOutcome(outcome), "warning");
+    const from = outcome.check.current?.version;
+    const to = outcome.check.target?.metadata.version;
+    const header = [`Pi Engineering ${from ?? "?"} → ${to ?? "?"}`, "", ...progress];
+    const format = (r: HandoverResult) =>
+      [...header, formatHandover(r, { from, to, action: "Updated" }).replace(/^Pi Engineering\n\n/, "")].join("\n");
+    const result = await this.awaitOrBackground(outcome.task, ctx, `Pi Engineering ${to} ready.`, format);
+    if (result) {
+      await outcome.done;
+      notify(ctx, format(result), level(result));
+    }
+  }
+
+  lastUpdateOutcome: UpdateOutcome | undefined;
 
   /**
    * Await a handover, unless it has to wait for a safe point: then report what
@@ -408,6 +560,49 @@ export class EngineeringHostExtension {
     if (pending) lines.push("", `Handover in progress: ${pending.kind} (${pending.phase})`);
     if (host?.lastFailure) lines.push("", `Last failure: ${host.lastFailure}`);
     return lines.join("\n");
+  }
+}
+
+export function formatCheck(c: UpdateCheckResult): string {
+  const lines = [
+    "Pi Engineering",
+    "",
+    `Current:      ${c.current?.version ?? "-"}`,
+    `Commit:       ${short(c.current?.commit)}`,
+    `Channel:      ${c.channel}`,
+    "",
+  ];
+  if (c.failure || !c.target) return [...lines, `Update check failed: ${c.failure ?? "no target"}`].join("\n");
+  lines.push(
+    `Available:    ${c.target.metadata.version}`,
+    `Commit:       ${short(c.target.sha)}`,
+    "",
+    `Pi compatible: ${c.pi.ok ? "yes" : `no (${c.pi.reason})`}`,
+    `Migration:     ${c.migration}`,
+    "",
+    c.upToDate ? "Up to date." : "Update available.",
+  );
+  return lines.join("\n");
+}
+
+export function formatOutcome(o: Exclude<UpdateOutcome, { status: "handover" }>): string {
+  switch (o.status) {
+    case "refused":
+      return o.reason;
+    case "up_to_date":
+      return `Pi Engineering ${o.check.current?.version ?? ""} is up to date (${short(o.check.target?.sha)} on ${o.check.channel}). Use --force to reinstall it.`;
+    case "pi_incompatible":
+      return o.reason;
+    case "failed":
+      return [
+        `Pi Engineering update failed during ${o.stage}: ${o.reason}`,
+        ...(o.steps ?? []).map(
+          (s) =>
+            `${s.status === "passed" ? "✓" : s.status === "skipped" ? "–" : "✗"} ${s.name}${s.detail ? ` (${s.detail})` : ""}`,
+        ),
+        "",
+        "The running runtime was not touched.",
+      ].join("\n");
   }
 }
 
