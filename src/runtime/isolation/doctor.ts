@@ -133,6 +133,23 @@ export async function runDoctor(options: {
     });
   }
 
+  // ── quarantined registries ──
+  // A quarantine replaces the database other live sessions have open. They
+  // follow it on their next heartbeat (re-open + re-register); leases held in
+  // the old database are re-taken on their next claim.
+  const recoveryDir = join(location.file, "..", "recovery");
+  const quarantined = existsSync(recoveryDir)
+    ? readdirSync(recoveryDir).filter((name) => /-corrupt-.*\.db$/.test(name))
+    : [];
+  if (quarantined.length > 0) {
+    checks.push({
+      name: "Registry quarantine",
+      status: "warn",
+      detail: `${quarantined.length} corrupt registr${quarantined.length === 1 ? "y" : "ies"} moved aside to ${recoveryDir} (newest ${quarantined.sort().at(-1)}). Live sessions re-open the rebuilt registry and re-register on their next heartbeat; their leases are re-taken on the next claim. Remove the quarantined files once inspected.`,
+      repairable: 0,
+    });
+  }
+
   // ── worktree resolution ──
   const identity = await resolveWorktreeIdentity(options.cwd);
   checks.push({

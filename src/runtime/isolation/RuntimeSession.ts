@@ -18,7 +18,7 @@
  * stays the old instance until it is closed.
  */
 import { randomUUID } from "node:crypto";
-import { mkdirSync, renameSync } from "node:fs";
+import { mkdirSync, renameSync, statSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { ExclusiveFileLock } from "../../platform/eventstore/fileLock.ts";
 import type { LeaseOwner } from "./LeaseManager.ts";
@@ -59,6 +59,8 @@ interface SessionGlobalState {
   driver: (() => RuntimeSession) | null;
   /** Module URL of the code currently driving heartbeats (diagnostics, tests). */
   driverModule: string | null;
+  /** dev:ino of the registry file this session's handle has open. */
+  registryInode: string | null;
 }
 
 const SESSION_KEY = Symbol.for("pi-engineering.runtime-session.v2");
@@ -98,6 +100,7 @@ function globalState(): SessionGlobalState {
       registering: null,
       driver: null,
       driverModule: null,
+      registryInode: null,
     };
     holder[SESSION_KEY] = state;
   }
@@ -108,6 +111,16 @@ function globalState(): SessionGlobalState {
 export function currentSessionIdentity(): { sessionId: string; startedAt: string; pid: number } {
   const state = globalState();
   return { sessionId: state.sessionId, startedAt: state.startedAt, pid: state.pid };
+}
+
+/** `dev:ino` of a file, or null when it does not exist. */
+function fileInode(file: string): string | null {
+  try {
+    const info = statSync(file);
+    return `${info.dev}:${info.ino}`;
+  } catch {
+    return null;
+  }
 }
 
 function isCorruptDatabase(error: unknown): boolean {
@@ -291,6 +304,7 @@ export class RuntimeSession {
       });
       state.registry = registry;
       state.registryFile = file;
+      state.registryInode = fileInode(file);
       state.generationId = record.generationId;
       state.lastHeartbeatMs = record.lastHeartbeatMs;
       emitRuntimeEvent("session.registered", {
@@ -340,6 +354,7 @@ export class RuntimeSession {
     if (!current || current instanceof RuntimeRegistry || !state.registryFile) return;
     try {
       state.registry = RuntimeRegistry.open(state.registryFile);
+      state.registryInode = fileInode(state.registryFile);
       emitRuntimeEvent("runtime.reload_takeover", { session_id: this.sessionId, module: import.meta.url });
     } catch {
       // Keep the working (older) instance rather than none.
@@ -389,6 +404,7 @@ export class RuntimeSession {
    * a NEW generation instead of resurrecting the old one.
    */
   heartbeat(): boolean {
+    this.followQuarantinedRegistry();
     const { registry, generationId } = this.state;
     if (!registry || !generationId) return false;
     try {
@@ -419,6 +435,41 @@ export class RuntimeSession {
       this.setHealth("degraded", `heartbeat failed: ${error instanceof Error ? error.message : String(error)}`);
       return false;
     }
+  }
+
+  /**
+   * Another session found the registry corrupt and moved it aside
+   * (quarantineAndReopen): our handle still points at the quarantined file.
+   * Detect the swap (different inode at the registry path) and re-open the
+   * fresh database; the heartbeat then re-registers under a new generation
+   * because the fresh database does not know ours. Leases held in the old
+   * database are gone; custody re-validates on every claim and re-takes them.
+   */
+  private followQuarantinedRegistry(): void {
+    const state = this.state;
+    if (!state.registry || !state.registryFile || !state.registryInode) return;
+    const now = fileInode(state.registryFile);
+    // Absent: mid-swap (the repairing session creates the fresh file next).
+    if (now === null || now === state.registryInode) return;
+    let fresh: RuntimeRegistry;
+    try {
+      fresh = RuntimeRegistry.open(state.registryFile);
+    } catch {
+      return; // Retried on the next heartbeat.
+    }
+    const old = state.registry;
+    state.registry = fresh;
+    state.registryInode = fileInode(state.registryFile);
+    try {
+      old.close();
+    } catch {
+      // Already closed / unusable.
+    }
+    emitRuntimeEvent("runtime.recovering", {
+      session_id: this.sessionId,
+      phase: "registry_replaced",
+      reason: "the registry file was replaced (quarantined by another session); re-opened",
+    });
   }
 
   setMetadata(metadata: Record<string, unknown>): void {
