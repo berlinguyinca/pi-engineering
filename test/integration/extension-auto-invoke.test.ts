@@ -68,3 +68,48 @@ test("auto-invoke stops after the mission tool reported not initialized", async 
   );
   assert.equal(await hook({ type: "before_agent_start", prompt: PROMPT }, { mode: "tui" }), undefined);
 });
+
+function missionResultWatcher(handlers: Map<string, Handler[]>): Handler {
+  const watcher = (handlers.get("tool_result") ?? []).find((f) =>
+    f.toString().includes("missionToolReportedUnavailable"),
+  );
+  assert.ok(watcher, "mission tool_result watcher is registered");
+  return watcher;
+}
+
+function missionResult(text: string, isError = false) {
+  return {
+    type: "tool_result",
+    toolName: "mission",
+    toolCallId: "c",
+    input: {},
+    isError,
+    content: [{ type: "text", text }],
+  };
+}
+
+test("a BLOCKED mission report mentioning 'unavailable' does not turn auto-invoke off (PR #106 review)", async () => {
+  const handlers = loadExtension();
+  const hook = autoInvokeHandler(handlers);
+  await missionResultWatcher(handlers)(
+    missionResult("Mission MSN-1 BLOCKED: current validation evidence is unavailable"),
+    { mode: "tui" },
+  );
+  const injected = (await hook({ type: "before_agent_start", prompt: PROMPT }, { mode: "tui" })) as
+    | { message?: { customType?: string } }
+    | undefined;
+  assert.equal(injected?.message?.customType, "pi-engineering:auto-invoke");
+});
+
+test("a later successful mission call re-enables auto-invoke after a transient not-initialized (PR #106 review)", async () => {
+  const handlers = loadExtension();
+  const hook = autoInvokeHandler(handlers);
+  const watcher = missionResultWatcher(handlers);
+  await watcher(missionResult("Orchestrator not initialized for this directory."), { mode: "tui" });
+  assert.equal(await hook({ type: "before_agent_start", prompt: PROMPT }, { mode: "tui" }), undefined);
+  await watcher(missionResult("Mission MSN-9 started for request: add a health endpoint"), { mode: "tui" });
+  const injected = (await hook({ type: "before_agent_start", prompt: `${PROMPT} again please` }, { mode: "tui" })) as
+    | { message?: { customType?: string } }
+    | undefined;
+  assert.equal(injected?.message?.customType, "pi-engineering:auto-invoke");
+});

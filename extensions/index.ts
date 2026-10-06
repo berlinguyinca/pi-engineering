@@ -698,7 +698,10 @@ export default function (pi: ExtensionAPI) {
     pi.on("tool_result", async (event) => {
       if (event.toolName !== "mission") return;
       const text = event.content.map((part) => (part.type === "text" ? part.text : "")).join("\n");
+      // A later mission call that the runtime served clears a transient
+      // not-initialized (e.g. the runtime opened after a lock was released).
       if (missionToolReportedUnavailable(text)) missionToolUnavailable = true;
+      else if (!event.isError) missionToolUnavailable = false;
     });
     pi.on("before_agent_start", async (event, ctx) => {
       const prompt = (event.prompt ?? "").trim();
