@@ -534,3 +534,42 @@ describe("mixed repositories and orphaned verification processes (PR #106 review
     }
   });
 });
+
+describe("leftover background processes after verification (PR #106 re-review)", () => {
+  const alive = (pid: number): boolean => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  for (const [label, background] of [
+    ["with its output redirected", "sleep 300 >/dev/null 2>&1 &"],
+    ["holding the output pipes", "sleep 300 &"],
+  ] as const) {
+    it(`kills a background child the stage left behind (${label}) and warns`, async () => {
+      const dir = await makeProject({
+        "package.json": JSON.stringify({ scripts: { test: `${background} echo $! > bg.pid; echo started` } }),
+      });
+      let pid = 0;
+      try {
+        const store = await ArtifactStore.create(join(dir, "artifacts"));
+        const v = new CommandVerifier();
+        const started = Date.now();
+        const outcome = await v.run(dir, await v.detect(dir), store);
+        pid = Number(await readFile(join(dir, "bg.pid"), "utf-8"));
+        assert.ok(Date.now() - started < 60_000, "verification did not wait for the background child");
+        assert.equal(outcome.passed, true, "leftover processes are a warning, not a failure");
+        for (let i = 0; i < 50 && alive(pid); i++) await new Promise((r) => setTimeout(r, 100));
+        assert.equal(alive(pid), false, "the background child is gone after verification");
+        assert.equal(outcome.stages[0]?.summary.leftoverProcesses, 1);
+        assert.match(String(outcome.stages[0]?.summary.warning ?? ""), /left 1 background process/);
+      } finally {
+        if (pid && alive(pid)) process.kill(pid, "SIGKILL");
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+  }
+});
