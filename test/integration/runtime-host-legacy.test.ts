@@ -7,6 +7,7 @@
 
 import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { type IncomingMessage, type ServerResponse, createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { after, before, test } from "node:test";
@@ -24,6 +25,7 @@ const ENV_KEYS = [
   "PI_PANEL_AUTO_OPEN",
   "PI_PANEL_NARRATOR",
   "PI_ENGINEERING_UPDATE_CHECK",
+  "INFERWEAVE_BASE_URL",
 ] as const;
 const saved: Record<string, string | undefined> = {};
 let root = "";
@@ -88,5 +90,51 @@ test("Pi loads the Host entry; the real extension reloads 5x with no duplicated 
     assert.equal(events.filter((e) => e.event === "runtime.rollback.started").length, 0);
   } finally {
     await pi.close();
+  }
+});
+
+test("InferWeave state is rediscovered after reload, never carried over (§42)", async () => {
+  let listing: { status: number; ids: string[] } = { status: 200, ids: ["fabric-model-x"] };
+  const hits: string[] = [];
+  const server = createServer((req: IncomingMessage, res: ServerResponse) => {
+    hits.push(req.url ?? "");
+    if (req.url?.startsWith("/v1/models") && listing.status === 200) {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(
+        JSON.stringify({ data: listing.ids.map((id) => ({ id, context_window: 131072, max_output_tokens: 8192 })) }),
+      );
+      return;
+    }
+    res.writeHead(listing.status === 200 ? 404 : listing.status);
+    res.end("{}");
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+  process.env.INFERWEAVE_BASE_URL = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+  const pi = await startPiSession({ extensionPaths: [hostEntry] });
+  const ids = () => pi.modelRuntime.getModels("inferweave").map((m) => m.id);
+  try {
+    await pi.modelRuntime.refresh({ allowNetwork: true });
+    assert.deepEqual(ids(), ["fabric-model-x"], "discovered");
+
+    // The fabric goes dark. Without a reload the provider serves what it knew.
+    listing = { status: 503, ids: [] };
+    await pi.modelRuntime.refresh({ allowNetwork: true });
+    assert.deepEqual(ids(), ["fabric-model-x"], "same generation keeps its last-known topology");
+
+    // A reload builds a fresh provider: nothing stale crosses the handover...
+    await pi.run("/engineering reload");
+    const hitsAtReload = hits.length;
+    await pi.modelRuntime.refresh({ allowNetwork: true });
+    assert.ok(hits.length > hitsAtReload, "the new generation asked the fabric itself");
+    assert.ok(!ids().includes("fabric-model-x"), "stale fabric topology not preserved across reload");
+
+    // ...and the new topology is rediscovered once the fabric answers.
+    listing = { status: 200, ids: ["fabric-model-y"] };
+    await pi.modelRuntime.refresh({ allowNetwork: true });
+    assert.deepEqual(ids(), ["fabric-model-y"]);
+  } finally {
+    await pi.close();
+    server.close();
+    delete process.env.INFERWEAVE_BASE_URL;
   }
 });

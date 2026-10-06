@@ -22,6 +22,7 @@ export interface PiTestSession {
   root: string;
   cwd: string;
   session: Awaited<ReturnType<typeof createAgentSession>>["session"];
+  modelRuntime: Awaited<ReturnType<typeof ModelRuntime.create>>;
   /** Run a slash command (or prompt) through Pi exactly as the TUI would. */
   run(text: string): Promise<void>;
   /** Emit an event through Pi's real ExtensionRunner. */
@@ -83,6 +84,7 @@ export async function startPiSession(
     root,
     cwd,
     session,
+    modelRuntime,
     run: (text) => session.prompt(text),
     emit: (event) => runner.emit(event),
     piHandlerCount: (event) => runner.extensions.reduce((n, ext) => n + (ext.handlers.get(event)?.length ?? 0), 0),
