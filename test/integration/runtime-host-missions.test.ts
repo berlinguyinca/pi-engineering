@@ -129,6 +129,7 @@ async function setup(name: string) {
     packageRoot: source,
     entry: "runtime.ts",
     baseline: true,
+    autoUpdateCheck: false,
   });
   const pi = await startPiSession({ factories: [(api: never) => ext.install(api)], cwd: fx.root });
   const host = ext.host as NonNullable<typeof ext.host>;

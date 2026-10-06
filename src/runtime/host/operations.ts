@@ -23,6 +23,7 @@ const DESCRIBE: Record<RuntimeOperationType, [string, string]> = {
   deployment: ["deployment", "deployments"],
   state_transaction: ["state transaction", "state transactions"],
   command: ["running command", "running commands"],
+  event: ["event handler", "event handlers"],
   migration: ["migration", "migrations"],
 };
 

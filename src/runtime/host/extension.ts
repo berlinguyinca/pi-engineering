@@ -254,8 +254,7 @@ export class EngineeringHostExtension {
     this.unpublish = publishRuntimeStatus(this, (now) => this.panelLines(now));
     host.bridge.onHostEvent("session_start", (_event, ctx) => this.onSessionStart(ctx as Ctx));
     host.bridge.onHostEvent("session_shutdown", () => this.dispose());
-    // Another process mid-update owns the install root's contents for now.
-    if (!this.lock.isHeldByLiveProcess()) await this.retain().catch(() => {});
+    await this.retain().catch(() => {});
   }
 
   private unpublish: () => void = () => {};
@@ -264,11 +263,14 @@ export class EngineeringHostExtension {
   lastCheck: UpdateCheckResult | undefined;
   private checking: Promise<UpdateCheckResult | undefined> | undefined;
 
-  /** Host shutdown: stop the update checker and stop publishing panel status. */
-  dispose(): void {
+  /** Host shutdown: stop the update checker, let a running check finish, stop publishing panel status. */
+  async dispose(): Promise<void> {
     if (this.checkTimer) clearTimeout(this.checkTimer);
     this.checkTimer = undefined;
     this.unpublish();
+    // A check in flight writes the preferences file; let it land before the
+    // session (and possibly the process) goes away.
+    await this.checking?.catch(() => undefined);
   }
 
   /**
@@ -334,8 +336,22 @@ export class EngineeringHostExtension {
 
   /** Retention after startup and after every committed transaction (spec §37). */
   async retain(): Promise<void> {
-    const running = this.host?.activeGeneration()?.source.root ?? null;
-    const removed = await applyRetention(this.layout, this.journal, { running });
+    // Under the mutation lock: another process's staging or install must never
+    // be swept from under it. Busy means someone is mid-update; skip this round.
+    let lock: MutationLockHandle;
+    try {
+      lock = this.lock.acquire("retention");
+    } catch (error) {
+      if (error instanceof MutationLockBusyError) return;
+      throw error;
+    }
+    let removed: Awaited<ReturnType<typeof applyRetention>>;
+    try {
+      const running = this.host?.activeGeneration()?.source.root ?? null;
+      removed = await applyRetention(this.layout, this.journal, { running });
+    } finally {
+      lock.release();
+    }
     if (removed.versions.length + removed.staging.length + removed.checkpoints.length > 0) {
       this.telemetry.emit("runtime.retention.pruned", {
         versions: removed.versions.length,

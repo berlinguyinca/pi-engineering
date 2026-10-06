@@ -8,7 +8,7 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { closeSync, mkdirSync, openSync, readFileSync, unlinkSync, writeSync } from "node:fs";
+import { closeSync, mkdirSync, openSync, readFileSync, statSync, unlinkSync, writeSync } from "node:fs";
 import { dirname } from "node:path";
 
 export class MutationLockBusyError extends Error {
@@ -47,7 +47,7 @@ export class RuntimeMutationLock {
     if (held.has(this.file)) throw new MutationLockBusyError(held.get(this.file) ?? null);
     const owner: LockOwner = { pid: process.pid, token: randomUUID(), operation, acquiredAt: new Date().toISOString() };
     mkdirSync(dirname(this.file), { recursive: true });
-    for (let attempt = 0; attempt < 2; attempt++) {
+    for (let attempt = 0; attempt < 3; attempt++) {
       try {
         const fd = openSync(this.file, "wx", 0o600);
         try {
@@ -78,15 +78,66 @@ export class RuntimeMutationLock {
         if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
         const existing = this.readOwner();
         if (existing && isAlive(existing.pid)) throw new MutationLockBusyError(existing);
-        // Owner died (or the file is unreadable garbage): stale, take it over.
-        try {
-          unlinkSync(this.file);
-        } catch {
-          // Someone else took it over first; the retry decides.
-        }
+        // Unreadable but fresh: a holder between create and write, not garbage.
+        if (!existing && ageMs(this.file) < FRESH_MS) throw new MutationLockBusyError(null);
+        if (!this.breakStale(existing)) throw new MutationLockBusyError(this.readOwner());
       }
     }
     throw new MutationLockBusyError(this.readOwner());
+  }
+
+  /**
+   * Remove a stale lock file, but only the one we judged stale.
+   *
+   * Two processes may both see the same dead owner. Without care, the slower
+   * one deletes the file the faster one has just created, and both "hold" the
+   * lock. Breaking therefore requires an exclusive claim file, and under that
+   * claim the owner is re-read: the file is removed only when it still names
+   * the owner we judged dead.
+   */
+  private breakStale(judged: LockOwner | null): boolean {
+    const claim = `${this.file}.claim`;
+    let fd: number;
+    try {
+      fd = openSync(claim, "wx", 0o600);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      // Someone else is breaking it. A claim left by a dead claimant expires.
+      let claimant = 0;
+      try {
+        claimant = Number(readFileSync(claim, "utf8").trim());
+      } catch {
+        return false; // The claim just went away; the next attempt decides.
+      }
+      if (!isAlive(claimant) && ageMs(claim) > FRESH_MS) {
+        try {
+          unlinkSync(claim);
+        } catch {
+          // Raced with another expirer.
+        }
+      }
+      return false;
+    }
+    try {
+      writeSync(fd, String(process.pid));
+      const now = this.readOwner();
+      const same = judged === null ? now === null : now?.token === judged.token;
+      if (same) {
+        try {
+          unlinkSync(this.file);
+        } catch {
+          // Already gone; the retry creates it.
+        }
+      }
+      return true;
+    } finally {
+      closeSync(fd);
+      try {
+        unlinkSync(claim);
+      } catch {
+        // Already gone.
+      }
+    }
   }
 
   /** Who holds the lock, if anyone. */
@@ -102,6 +153,17 @@ export class RuntimeMutationLock {
   isHeldByLiveProcess(): boolean {
     const owner = this.readOwner();
     return !!owner && isAlive(owner.pid);
+  }
+}
+
+/** A just-created lock file may not have its owner written yet. */
+const FRESH_MS = 5_000;
+
+function ageMs(file: string): number {
+  try {
+    return Date.now() - statSync(file).mtimeMs;
+  } catch {
+    return Number.POSITIVE_INFINITY;
   }
 }
 

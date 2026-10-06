@@ -41,9 +41,11 @@ test("resource registry disposes filesystem watchers", async () => {
     reg.add(() => w.close(), "watcher");
     assert.equal(process.getActiveResourcesInfo().filter((r) => r === "FSEventWrap").length, before + 1);
     await reg.disposeAll();
-    // A closed watcher's handle is released a loop turn or two later.
-    await new Promise((r) => setTimeout(r, 20));
-    assert.equal(process.getActiveResourcesInfo().filter((r) => r === "FSEventWrap").length, before);
+    // A closed watcher's handle is released some loop turns later (longer on
+    // a loaded machine); wait for it rather than guess a delay.
+    const watchers = () => process.getActiveResourcesInfo().filter((r) => r === "FSEventWrap").length;
+    for (let i = 0; i < 200 && watchers() !== before; i++) await new Promise((r) => setTimeout(r, 10));
+    assert.equal(watchers(), before);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

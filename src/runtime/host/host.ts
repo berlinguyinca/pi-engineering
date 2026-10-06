@@ -174,6 +174,8 @@ export interface RuntimeHostOptions {
   supportedRuntimeApis?: readonly number[];
   /** Longest an event/command waits for a handover in progress before being dropped. */
   handoverWaitMs?: number;
+  /** Bound on each runtime lifecycle call (createRuntime/start/quiesce/snapshot/stop). */
+  lifecycleTimeoutMs?: number;
 }
 
 export interface GenerationInfo {
@@ -205,6 +207,11 @@ export class RuntimeHost implements BridgeTarget {
   lastReloadAt: number | undefined;
   lastFailure: string | undefined;
   private readonly hostOps = new Map<string, { end(): void }>();
+  /** Set when Pi's session is ending: no handover may commit after it. */
+  private closing = false;
+  /** Snapshot directory of a candidate being handed over (kept by pruning). */
+  private candidateDir: string | undefined;
+  private readonly lifecycleTimeoutMs: number;
 
   private readonly opts: RuntimeHostOptions;
 
@@ -213,6 +220,7 @@ export class RuntimeHost implements BridgeTarget {
     this.telemetry = opts.telemetry ?? new RuntimeTelemetry();
     this.supported = opts.supportedRuntimeApis ?? HOST_SUPPORTED_RUNTIME_APIS;
     this.handoverWaitMs = opts.handoverWaitMs ?? 120_000;
+    this.lifecycleTimeoutMs = opts.lifecycleTimeoutMs ?? 120_000;
     this.bridge = new PiBridge(opts.pi, this, ["session_start", "session_shutdown"]);
     this.installHostHandlers();
   }
@@ -220,6 +228,9 @@ export class RuntimeHost implements BridgeTarget {
   // ─── BridgeTarget ───────────────────────────────────────────────────────
 
   dispatchGeneration(): number | undefined | Promise<number | undefined> {
+    // A generation that is starting receives the events its own start()
+    // provokes (e.g. a model switch); waiting for its own handover would wedge.
+    if (this.starting !== undefined && !this.retired.has(this.starting)) return this.starting;
     if (this.switching) {
       const switching = this.switching;
       return withTimeout(switching, this.handoverWaitMs).then(() => this.current?.generation);
@@ -233,6 +244,22 @@ export class RuntimeHost implements BridgeTarget {
 
   track<T>(generation: number, type: "command" | "tool", label: string, work: () => Promise<T>): Promise<T> {
     return this.operations.track(generation, type, label, work);
+  }
+
+  trackEvent(generation: number, event: string, run: () => unknown): unknown {
+    const op = this.operations.begin(generation, "event", event);
+    let result: unknown;
+    try {
+      result = run();
+    } catch (error) {
+      op.end();
+      throw error;
+    }
+    if (result && typeof (result as Promise<unknown>).then === "function") {
+      return (result as Promise<unknown>).finally(() => op.end());
+    }
+    op.end();
+    return result;
   }
 
   isLive(generation: number): boolean {
@@ -336,7 +363,17 @@ export class RuntimeHost implements BridgeTarget {
   /** Pi's session is ending: the generation shuts down with it and the Host closes. */
   async shutdown(event: unknown, ctx: unknown): Promise<void> {
     if (this.closed) return;
-    this.task?.cancel();
+    this.closing = true;
+    const task = this.task;
+    if (task) {
+      // Waiting for a safe point: cancel. Past that point: let it finish (it
+      // sees `closing` and will not commit) so two shutdowns never overlap.
+      task.cancel();
+      await withTimeout(
+        task.promise.then(() => undefined),
+        this.handoverWaitMs,
+      );
+    }
     this.sessionActive = false;
     const live = this.current;
     if (live) {
@@ -349,7 +386,10 @@ export class RuntimeHost implements BridgeTarget {
 
   /** Remove snapshot directories no generation can still import from. */
   async pruneSnapshots(): Promise<string[]> {
+    // A handover in flight may be importing from a fresh snapshot right now.
+    if (this.task) return [];
     const keep = [
+      this.candidateDir,
       this.current?.dir,
       this.current ? knownGoodDir(this.current) : undefined,
       this.previousGood?.dir,
@@ -379,22 +419,32 @@ export class RuntimeHost implements BridgeTarget {
       if ((event as { message?: { role?: string } }).message?.role !== "assistant") return;
       this.beginHostOp("inference:stream", "inference", "assistant message");
     });
+    // Ends are deferred a turn: the Host's handlers run before the
+    // generation's slots for the same event, and those slots (tracked as
+    // operations) must have started before the inference/tool op lets go.
     this.bridge.onHostEvent("message_end", (event) => {
       if ((event as { message?: { role?: string } }).message?.role !== "assistant") return;
-      this.endHostOp("inference:stream");
+      setImmediate(() => this.endHostOp("inference:stream"));
     });
     this.bridge.onHostEvent("tool_execution_start", (event, ctx) => {
       remember(ctx);
       const e = event as { toolCallId?: string; toolName?: string };
+      // A forwarded tool is tracked by its forwarder AFTER the gate; tracking
+      // it here too would make a handover's drain wait on a tool that is
+      // itself waiting for the handover.
+      if (e.toolName && this.bridge.isForwardedTool(e.toolName)) return;
       this.beginHostOp(`tool:${e.toolCallId ?? "?"}`, "tool", e.toolName ?? "tool");
     });
     this.bridge.onHostEvent("tool_execution_end", (event) => {
-      this.endHostOp(`tool:${(event as { toolCallId?: string }).toolCallId ?? "?"}`);
+      const key = `tool:${(event as { toolCallId?: string }).toolCallId ?? "?"}`;
+      setImmediate(() => this.endHostOp(key));
     });
     // A run that ends without the matching end events must not wedge a safe point.
     this.bridge.onHostEvent("agent_end", (_event, ctx) => {
       remember(ctx);
-      for (const key of [...this.hostOps.keys()]) this.endHostOp(key);
+      setImmediate(() => {
+        for (const key of [...this.hostOps.keys()]) this.endHostOp(key);
+      });
     });
     this.bridge.onHostEvent("before_agent_start", (_event, ctx) => remember(ctx));
   }
@@ -473,8 +523,8 @@ export class RuntimeHost implements BridgeTarget {
       startedAt: Date.now(),
     });
     try {
-      runtime = await module.createRuntime(context);
-      await runtime.start();
+      runtime = await this.timed(module.createRuntime(context), "createRuntime");
+      await this.timed(runtime.start(), "start");
       this.telemetry.emit("runtime.generation.started", { new_generation: generation, to_version: source.version });
       const health = await this.healthOf(live());
       if (!health.healthy) {
@@ -519,7 +569,7 @@ export class RuntimeHost implements BridgeTarget {
 
   private async retire(live: LiveGeneration): Promise<void> {
     try {
-      await live.runtime.stop();
+      await this.timed(live.runtime.stop(), "stop");
     } finally {
       await live.resources.disposeAll();
       this.retired.add(live.generation);
@@ -528,7 +578,28 @@ export class RuntimeHost implements BridgeTarget {
     }
   }
 
+  /** Never rejects: whatever goes wrong, the gate reopens and a result comes back. */
   private async runHandover(task: HandoverTask, request: HandoverRequest): Promise<HandoverResult> {
+    try {
+      return await this.handoverSteps(task, request);
+    } catch (error) {
+      this.operations.openGate();
+      this.lastFailure = `handover aborted: ${message(error)}`;
+      return this.finish({
+        ok: false,
+        kind: request.kind,
+        phase: "failed",
+        failure: this.lastFailure,
+        rolledBack: false,
+        untouched: false,
+        waitedForSafePoint: false,
+        durationMs: 0,
+        ...(this.current ? { activeGeneration: this.current.generation } : {}),
+      });
+    }
+  }
+
+  private async handoverSteps(task: HandoverTask, request: HandoverRequest): Promise<HandoverResult> {
     const started = Date.now();
     const old = this.current;
     const base: RuntimeEventFields = {
@@ -539,12 +610,34 @@ export class RuntimeHost implements BridgeTarget {
       to_version: request.source.version,
       to_commit: request.source.commit,
     };
+    // Phase hooks journal the transaction. Before and during the switch a
+    // failing hook aborts (nothing touched) or rolls back; once the outcome is
+    // decided, a failing hook is recorded and cannot change it.
     const phase = async (p: HandoverPhase) => {
       task.setPhase(p);
-      await request.hooks?.onPhase?.(p);
+      try {
+        await request.hooks?.onPhase?.(p);
+      } catch (error) {
+        if (TERMINAL_PHASES.has(p)) {
+          this.lastFailure = `could not record ${p}: ${message(error)}`;
+          return;
+        }
+        throw error;
+      }
     };
     const result = (r: Omit<HandoverResult, "kind" | "durationMs">): HandoverResult =>
       this.finish({ ...r, kind: request.kind, durationMs: Date.now() - started });
+    const untouched = (failedStage: HandoverPhase, error: unknown, waited: boolean): HandoverResult =>
+      result({
+        ok: false,
+        phase: "failed",
+        failedStage,
+        failure: message(error),
+        rolledBack: false,
+        untouched: true,
+        waitedForSafePoint: waited,
+        ...(old ? { fromGeneration: old.generation, activeGeneration: old.generation } : {}),
+      });
     if (request.kind === "reload") this.telemetry.emit("runtime.reload.started", base);
 
     // 1. Import the candidate while the old generation keeps serving (§47).
@@ -553,6 +646,7 @@ export class RuntimeHost implements BridgeTarget {
     try {
       await phase("preparing");
       loaded = await loadRuntimeSource(request.source, this.opts.generationsDir, generation, this.supported);
+      this.candidateDir = loaded.dir;
       this.telemetry.emit("runtime.generation.loaded", {
         ...base,
         new_generation: generation,
@@ -560,22 +654,18 @@ export class RuntimeHost implements BridgeTarget {
       });
     } catch (error) {
       await phase("failed");
-      return result({
-        ok: false,
-        phase: "failed",
-        failedStage: "loading",
-        failure: message(error),
-        rolledBack: false,
-        untouched: true,
-        waitedForSafePoint: false,
-        ...(old ? { fromGeneration: old.generation, activeGeneration: old.generation } : {}),
-      });
+      return untouched("loading", error, false);
     }
 
     // 2. Safe point with the gate open: cancelling here changes nothing.
     let waited = false;
     if (old) {
-      await phase("waiting_safe_point");
+      try {
+        await phase("waiting_safe_point");
+      } catch (error) {
+        await phase("failed");
+        return untouched("waiting_safe_point", error, false);
+      }
       const blockingNow = this.operations.blocking();
       if (blockingNow.length > 0) {
         waited = true;
@@ -590,14 +680,15 @@ export class RuntimeHost implements BridgeTarget {
         onWaiting: (blocking) => task.setBlocking(blocking),
       });
       task.setBlocking([]);
-      if (!sp.reached) {
-        this.telemetry.emit("runtime.safe_point.cancelled", { ...base, reason: sp.reason });
+      if (!sp.reached || this.closing) {
+        const reason = !sp.reached && sp.reason === "timeout" ? "timed out waiting for a safe point" : "cancelled";
+        this.telemetry.emit("runtime.safe_point.cancelled", { ...base, reason });
         await phase("cancelled");
         return result({
           ok: false,
           phase: "cancelled",
           failedStage: "waiting_safe_point",
-          failure: sp.reason === "timeout" ? "timed out waiting for a safe point" : "cancelled",
+          failure: reason,
           rolledBack: false,
           untouched: true,
           waitedForSafePoint: true,
@@ -615,13 +706,13 @@ export class RuntimeHost implements BridgeTarget {
       if (old) {
         await phase("quiescing");
         this.telemetry.emit("runtime.quiesce.started", base);
-        await old.runtime.quiesce(request.kind);
+        await this.timed(old.runtime.quiesce(request.kind), "quiesce");
         // Drain anything that started between the safe point and the gate.
         const drained = await this.operations.waitForSafePoint({ timeoutMs: request.safePointTimeoutMs ?? 300_000 });
         if (!drained.reached) throw new HandoverAbort("quiescing", "operations did not drain after quiesce");
         this.telemetry.emit("runtime.quiesce.completed", base);
         await phase("snapshotting");
-        snapshot = await old.runtime.snapshot();
+        snapshot = await this.timed(old.runtime.snapshot(), "snapshot");
         this.telemetry.emit("runtime.snapshot.created", {
           ...base,
           mission_ids: [...snapshot.activeMissionIds, ...snapshot.pendingMissionIds],
@@ -632,16 +723,7 @@ export class RuntimeHost implements BridgeTarget {
       await old?.runtime.resume?.().catch(() => {});
       this.operations.openGate();
       await phase("failed");
-      return result({
-        ok: false,
-        phase: "failed",
-        failedStage: error instanceof HandoverAbort ? error.stage : "quiescing",
-        failure: message(error),
-        rolledBack: false,
-        untouched: true,
-        waitedForSafePoint: waited,
-        ...(old ? { fromGeneration: old.generation, activeGeneration: old.generation } : {}),
-      });
+      return untouched(error instanceof HandoverAbort ? error.stage : "quiescing", error, waited);
     }
 
     // 4..7: from here the old generation is gone; failure means rollback.
@@ -650,11 +732,16 @@ export class RuntimeHost implements BridgeTarget {
       releaseSwitch = resolve;
     });
     let stage: HandoverPhase = "stopping";
+    let candidate: LiveGeneration | undefined;
     try {
       if (old) {
         await phase("stopping");
-        await this.retire(old);
-        this.current = undefined;
+        try {
+          await this.retire(old);
+        } finally {
+          // Retired either way: its tables are gone, so it must not stay `current`.
+          this.current = undefined;
+        }
       }
       if (request.hooks?.beforeLoad) {
         stage = "migrating";
@@ -668,15 +755,18 @@ export class RuntimeHost implements BridgeTarget {
       await phase("restoring");
       stage = "health_check";
       await phase("health_check");
-      const live = await this.instantiate(generation, loaded.module, request.source, loaded.dir, snapshot);
+      candidate = await this.instantiate(generation, loaded.module, request.source, loaded.dir, snapshot);
       stage = "committing";
       await phase("committing");
+      if (this.closing) throw new Error("the Pi session ended during the handover");
       await request.hooks?.onCommit?.();
       if (old) this.previousGood = { source: old.source, dir: knownGoodDir(old) };
-      this.current = live;
+      this.current = candidate;
       this.starting = undefined;
       this.lastReloadAt = Date.now();
       this.lastFailure = undefined;
+      const live = candidate;
+      candidate = undefined;
       await phase("committed");
       const health = await this.healthOf(live);
       if (request.kind === "reload") {
@@ -700,6 +790,15 @@ export class RuntimeHost implements BridgeTarget {
     } catch (error) {
       const failure = message(error);
       this.lastFailure = failure;
+      // A candidate that started but did not commit must not keep running
+      // beside the rolled-back generation.
+      if (candidate) {
+        const started = candidate;
+        candidate = undefined;
+        if (this.current === started) this.current = undefined;
+        await this.retire(started).catch(() => {});
+      }
+      if (this.starting === generation) this.starting = undefined;
       await phase("rolling_back");
       const rolled = await this.rollbackTo(old, snapshot, request, failure, base);
       await phase(rolled ? "rolled_back" : "failed");
@@ -716,6 +815,7 @@ export class RuntimeHost implements BridgeTarget {
         ...(snapshot ? { snapshot } : {}),
       });
     } finally {
+      this.candidateDir = undefined;
       this.switching = null;
       releaseSwitch();
       this.operations.openGate();
@@ -735,25 +835,55 @@ export class RuntimeHost implements BridgeTarget {
       failure_reason: failure,
       rollback_version: old?.source.version,
     });
+    let hookFailure = "";
     try {
       await request.hooks?.onRollback?.(failure);
+    } catch (error) {
+      // State or pointers could not be restored. Still try to bring the
+      // previous code back: no runtime at all is the worse outcome, and the
+      // previous runtime's own health check judges whether it can run.
+      hookFailure = `; restore failed: ${message(error)}`;
+    }
+    try {
       if (!old) throw new Error("no previous runtime to roll back to");
+      if (this.closing) throw new Error("the Pi session ended");
       // The old directory is immutable unless it was imported directly; either
       // way a fresh snapshot gives fresh module identities for the old code.
       const live = await this.bringUp(old.source, snapshot, knownGoodDir(old));
       this.current = live;
       this.starting = undefined;
+      if (hookFailure) this.lastFailure = `${failure}${hookFailure}`;
       this.telemetry.emit("runtime.rollback.completed", {
         ...base,
         new_generation: live.generation,
         rollback_version: old.source.version,
+        ...(hookFailure ? { failure_reason: hookFailure.slice(2) } : {}),
       });
       return true;
     } catch (error) {
-      this.lastFailure = `${failure}; rollback failed: ${message(error)}`;
+      this.lastFailure = `${failure}${hookFailure}; rollback failed: ${message(error)}`;
       this.telemetry.emit("runtime.rollback.failed", { ...base, failure_reason: this.lastFailure });
       return false;
     }
+  }
+
+  /** Bound a runtime lifecycle call (§23: never wedge). */
+  private timed<T>(work: Promise<T>, what: string): Promise<T> {
+    const ms = this.lifecycleTimeoutMs;
+    return new Promise<T>((resolveWork, reject) => {
+      const timer = setTimeout(() => reject(new Error(`runtime ${what}() did not finish within ${ms} ms`)), ms);
+      timer.unref?.();
+      work.then(
+        (value) => {
+          clearTimeout(timer);
+          resolveWork(value);
+        },
+        (error) => {
+          clearTimeout(timer);
+          reject(error);
+        },
+      );
+    });
   }
 
   private finish(result: HandoverResult): HandoverResult {
@@ -761,6 +891,14 @@ export class RuntimeHost implements BridgeTarget {
     return result;
   }
 }
+
+const TERMINAL_PHASES: ReadonlySet<HandoverPhase> = new Set([
+  "committed",
+  "rolling_back",
+  "rolled_back",
+  "failed",
+  "cancelled",
+]);
 
 class HandoverAbort extends Error {
   readonly stage: HandoverPhase;

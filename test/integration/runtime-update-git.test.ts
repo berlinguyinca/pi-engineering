@@ -6,7 +6,16 @@
  */
 
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, test } from "node:test";
@@ -238,6 +247,17 @@ test("security: untrusted source, argument-injection remote, malformed metadata,
   const escaped = await update(w3, "");
   assert.equal(escaped?.status, "failed");
   assert.match(escaped?.status === "failed" ? escaped.reason : "", /points outside the tree/);
+  assert.equal(w3.host.activeGeneration()?.generation, 1);
+
+  // A chain of in-tree links that resolves outside the tree on disk.
+  w3.repo.publish({ version: "0.2.3", value: "D" }, (dir) => {
+    rmSync(join(dir, "evil-link"));
+    symlinkSync(".", join(dir, "loop"));
+    symlinkSync("loop/../outside", join(dir, "chained"));
+  });
+  const chained = await update(w3, "");
+  assert.equal(chained?.status, "failed");
+  assert.match(chained?.status === "failed" ? chained.reason : "", /escapes the staging tree/);
   assert.equal(w3.host.activeGeneration()?.generation, 1);
 
   const w4 = await world();

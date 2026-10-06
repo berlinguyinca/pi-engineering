@@ -328,10 +328,15 @@ export function assertContained(root: string): void {
       const full = join(dir, name);
       const st = lstatSync(full);
       if (st.isSymbolicLink()) {
-        const target = resolve(dirname(full), readlinkSync(full));
-        const rel = relative(base, target);
-        if (rel.startsWith("..") || isAbsolute(rel)) {
-          throw new UpdateSourceError(`staged symlink ${relative(base, full)} escapes the staging tree`);
+        // Lexically AND as resolved on disk, component by component: a chain
+        // of in-tree links can still lead out (`m -> .`, `e -> m/../x`), and
+        // a dangling target defeats realpath.
+        const raw = readlinkSync(full);
+        for (const target of [resolve(dirname(full), raw), resolveOnDisk(`${dirname(full)}${sep}${raw}`)]) {
+          const rel = relative(base, target);
+          if (rel.startsWith("..") || isAbsolute(rel)) {
+            throw new UpdateSourceError(`staged symlink ${relative(base, full)} escapes the staging tree`);
+          }
         }
       } else if (st.isDirectory()) {
         walk(full);
@@ -339,6 +344,32 @@ export function assertContained(root: string): void {
     }
   };
   walk(base);
+}
+
+/**
+ * Resolve a path the way the filesystem would, following symlinks in every
+ * component, WITHOUT first collapsing `..` lexically (which is exactly what
+ * a link chain exploits) and tolerating components that do not exist.
+ */
+export function resolveOnDisk(path: string, depth = 0): string {
+  if (depth > 40) throw new UpdateSourceError("symlink chain too deep (loop?)");
+  let current: string = sep;
+  for (const comp of path.split(sep)) {
+    if (comp === "" || comp === ".") continue;
+    if (comp === "..") {
+      current = dirname(current);
+      continue;
+    }
+    const next = current === sep ? `${sep}${comp}` : `${current}${sep}${comp}`;
+    let link: string | null = null;
+    try {
+      if (lstatSync(next).isSymbolicLink()) link = readlinkSync(next);
+    } catch {
+      link = null; // does not exist: lexical from here
+    }
+    current = link === null ? next : resolveOnDisk(isAbsolute(link) ? link : `${current}${sep}${link}`, depth + 1);
+  }
+  return current;
 }
 
 function compareTags(a: string, b: string): number {

@@ -41,6 +41,11 @@ export interface BridgeTarget {
   track<T>(generation: number, type: "command" | "tool", label: string, work: () => Promise<T>): Promise<T>;
   /** False once the generation has been retired. */
   isLive(generation: number): boolean;
+  /**
+   * Run a generation's event handler as an operation, so a safe point is never
+   * declared while one is still running (or about to settle).
+   */
+  trackEvent?(generation: number, event: string, run: () => unknown): unknown;
 }
 
 /** Methods that register something. Passed through, keyed by Pi, overwrite-on-reregister. */
@@ -102,6 +107,11 @@ export class PiBridge {
     let n = 0;
     for (const count of this.slots.values()) n += count;
     return n;
+  }
+
+  /** A tool the bridge forwards (its execution is tracked after the gate). */
+  isForwardedTool(name: string): boolean {
+    return this.toolForwarders.has(name);
   }
 
   realCommandNames(): string[] {
@@ -298,7 +308,9 @@ export class PiBridge {
     const run = (generation: number | undefined) => {
       if (generation === undefined) return undefined;
       const handler = this.tables.get(generation)?.handlers.get(event)?.[slot];
-      return handler ? handler(payload, ctx) : undefined;
+      if (!handler) return undefined;
+      const track = this.target.trackEvent;
+      return track ? track.call(this.target, generation, event, () => handler(payload, ctx)) : handler(payload, ctx);
     };
     const target = this.target.dispatchGeneration();
     if (typeof target === "object" && target !== null) return target.then(run);

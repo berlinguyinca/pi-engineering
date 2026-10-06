@@ -27,6 +27,7 @@ export type RuntimeOperationType =
   | "deployment"
   | "state_transaction"
   | "command"
+  | "event"
   | "migration";
 
 /** One operation the runtime is in the middle of (spec §22). */

@@ -236,7 +236,13 @@ export class UpdateManager {
             if (finished.result.ok) {
               // A channel switch is remembered; a commit pin is one-off (§12).
               const prefs = this.prefs();
-              const roots = prefs.identityRoots.length > 0 ? prefs.identityRoots : this.identityRoots();
+              // Repository identity: recorded roots, else the installing
+              // checkout's, else trust-on-first-use of the commit just
+              // validated, so the check is never silently left off.
+              let roots = prefs.identityRoots.length > 0 ? prefs.identityRoots : this.identityRoots();
+              if (roots.length === 0 && outcome.check.target) {
+                roots = await this.deps.cache.rootsOf(outcome.check.target.sha).catch(() => []);
+              }
               await writePreferences(this.deps.layout.preferencesFile, {
                 ...prefs,
                 identityRoots: roots,

@@ -46,6 +46,8 @@ export interface FixtureBag {
   lateFences: number;
   /** When set, stop() waits for it: holds a handover mid-flight. */
   stopGate?: Promise<void>;
+  /** When set, the agent_settled handler waits for it. */
+  settleGate?: Promise<void>;
 }
 
 export function bag(key: string): FixtureBag {
@@ -146,6 +148,8 @@ export async function createRuntime(ctx: any) {
         if (!ctx.isActive()) b.stale++;
         b.reactions++;
         b.values.push(VALUE);
+        // A test can hold the handler open (an in-flight lifecycle reaction).
+        if (b.settleGate) return b.settleGate;
       });
       ctx.pi.on("session_start", () => b.values.push("session_start:" + VALUE));
       ctx.pi.registerCommand("probe", {

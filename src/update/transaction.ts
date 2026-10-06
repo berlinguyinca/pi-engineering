@@ -42,6 +42,7 @@ export interface ActivationHost {
     hooks: {
       beforeLoad?(): Promise<void>;
       onRollback?(reason: string): Promise<void>;
+      onCommit?(): Promise<void>;
       onPhase?(phase: HandoverPhase): void | Promise<void>;
     },
     fields: Record<string, unknown>,
@@ -179,6 +180,11 @@ export async function runActivation(opts: ActivationOptions): Promise<Activation
         // Journal first, then the pointer switch (done by activateInstalled).
         record = journal.advance(record, "activating");
       },
+      // Durable BEFORE the new generation takes over: a crash after this point
+      // keeps the update; a failure to write it rolls the handover back.
+      onCommit: async () => {
+        record = journal.advance(record, "committed");
+      },
       onRollback: async () => {
         if (record.phase !== "rolling_back") record = journal.advance(record, "rolling_back");
         if (migrated && stateDir && hasCheckpoint(checkpoint)) await restoreCheckpoint(checkpoint, stateDir);
@@ -188,18 +194,28 @@ export async function runActivation(opts: ActivationOptions): Promise<Activation
   );
 
   const done = task.promise.then((result) => {
-    if (result.ok) {
-      record = journal.advance(record, "committed");
-      host.telemetry.emit("runtime.update.committed", {
+    // `committed` was written by onCommit, before the gate opened. Everything
+    // else is recorded here; a journal that cannot be written must not turn
+    // the outcome into an unhandled rejection.
+    try {
+      if (result.ok) {
+        if (record.phase !== "committed") record = journal.advance(record, "committed");
+        host.telemetry.emit("runtime.update.committed", {
+          ...fields,
+          new_generation: result.activeGeneration,
+          old_generation: result.fromGeneration,
+          duration: result.durationMs,
+        });
+      } else if (result.rolledBack) {
+        record = journal.advance(record, "rolled_back", { failure: result.failure });
+      } else if (record.phase !== "failed") {
+        record = journal.advance(record, "failed", { failure: result.failure });
+      }
+    } catch (error) {
+      host.telemetry.emit("runtime.update.failed", {
         ...fields,
-        new_generation: result.activeGeneration,
-        old_generation: result.fromGeneration,
-        duration: result.durationMs,
+        failure_reason: `journal write failed: ${error instanceof Error ? error.message : String(error)}`,
       });
-    } else if (result.rolledBack) {
-      record = journal.advance(record, "rolled_back", { failure: result.failure });
-    } else {
-      record = journal.advance(record, "failed", { failure: result.failure });
     }
     return { result, record };
   });

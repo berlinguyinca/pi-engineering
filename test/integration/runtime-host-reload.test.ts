@@ -34,6 +34,7 @@ async function setup(value = "A") {
     packageRoot: source,
     entry: "runtime.ts",
     baseline: true,
+    autoUpdateCheck: false,
   });
   const pi: PiTestSession = await startPiSession({ factories: [(api: never) => ext.install(api)] });
   cleanups.push(async () => {
@@ -232,4 +233,72 @@ test("work arriving during handover is queued and resumes on the new generation 
   assert.equal(b.values.at(-1) === "B" || b.values.includes("B"), true);
   const restored = b.restored.at(-1) as { activeMissionIds: string[] };
   assert.deepEqual(restored.activeMissionIds, ["MSN-1"], "transient snapshot handed to the new generation");
+});
+
+test("a running event handler holds the safe point (no handover mid-reaction)", async () => {
+  const { pi, host, b } = await setup();
+  let release: () => void = () => {};
+  b.settleGate = new Promise<void>((r) => {
+    release = r;
+  });
+  const reaction = pi.emit({ type: "agent_settled" });
+  await new Promise((r) => setTimeout(r, 5));
+  await pi.run("/engineering reload");
+  const task = host.pendingTask();
+  assert.ok(task, "handover waits for the handler");
+  assert.deepEqual(host.operations.summarize(task.blocking), ["1 event handler"]);
+  b.settleGate = undefined;
+  release();
+  await reaction;
+  assert.equal((await task.promise).ok, true);
+});
+
+test("a commit hook failure rolls back without leaving the candidate running beside the old code", async () => {
+  const { pi, host, b, source, key } = await setup("A");
+  writeFixtureRuntime(source, key, { value: "B" });
+  const stops = b.stops;
+  const result = await host.handover({
+    kind: "reload",
+    source: { root: source, entry: "runtime.ts", version: "x", commit: null, label: "t" },
+    hooks: {
+      onCommit: async () => {
+        throw new Error("journal disk full");
+      },
+    },
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.rolledBack, true);
+  assert.equal(b.stops, stops + 2, "old generation and the uncommitted candidate both stopped");
+  b.values.length = 0;
+  b.reactions = 0;
+  await pi.emit({ type: "agent_settled" });
+  assert.deepEqual(b.values, ["A"], "exactly one generation (the restored one) reacts");
+});
+
+test("failing phase hooks: before the switch nothing is touched; during rollback the outcome still stands", async () => {
+  const { host, b, source } = await setup("A");
+  const stops = b.stops;
+  const early = await host.handover({
+    kind: "reload",
+    source: { root: source, entry: "runtime.ts", version: "x", commit: null, label: "t" },
+    hooks: {
+      onPhase: (p) => {
+        if (p === "waiting_safe_point") throw new Error("EACCES journal");
+      },
+    },
+  });
+  assert.equal(early.untouched, true);
+  assert.equal(b.stops, stops);
+  const late = await host.handover({
+    kind: "reload",
+    source: { root: source, entry: "runtime.ts", version: "x", commit: null, label: "t" },
+    hooks: {
+      onPhase: (p) => {
+        if (p === "health_check" || p === "rolling_back" || p === "rolled_back") throw new Error("EIO journal");
+      },
+    },
+  });
+  assert.equal(late.ok, false);
+  assert.equal(late.rolledBack, true, "rolled back even though the journal could not record it");
+  assert.equal((await host.health()).healthy, true);
 });

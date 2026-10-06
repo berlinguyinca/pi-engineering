@@ -58,6 +58,7 @@ async function session(root: string, layout: InstallLayout, packageRoot: string)
     packageRoot,
     entry: "runtime.ts",
     baseline: false,
+    autoUpdateCheck: false,
   });
   const pi: PiTestSession = await startPiSession({ factories: [(api: never) => ext.install(api)] });
   cleanups.push(() => pi.close());

@@ -50,6 +50,7 @@ export async function hostSession(opts: {
     packageRoot: opts.packageRoot,
     entry: "runtime.ts",
     baseline: false,
+    autoUpdateCheck: false,
   });
   const pi = await startPiSession({
     factories: [(api: never) => ext.install(api)],
