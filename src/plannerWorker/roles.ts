@@ -58,7 +58,7 @@ export function aliasFor(cfg: RoleConfig): string {
 export interface ResolvedRole {
   role: PlannerWorkerRole;
   model: ModelRef;
-  via: "alias" | "capability" | "family" | "query" | "static";
+  via: "alias" | "capability" | "family" | "query" | "static" | "operator_pin";
   /** Concrete model behind an alias, when the gateway advertises it. */
   backing?: string;
   contextWindow?: number;

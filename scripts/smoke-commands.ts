@@ -41,6 +41,7 @@ const EXPECTED_COMMANDS = [
   "engineering-status",
   "engineering-plan",
   "engineering-workers",
+  "engineering-model",
 ];
 const EXPECTED_TOOLS = ["ledger_read", "ledger_claim", "artifact_read", "repo_search", "symbol", "tests_for"];
 

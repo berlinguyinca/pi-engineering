@@ -21,6 +21,8 @@ import { createRoleRouter } from "../capability/adapter.ts";
 import type { RoleName } from "../capability/roles.ts";
 import { loadMissionLimits } from "../lifecycle/policy.ts";
 import { workerInactivityMs } from "../orchestration/broker.ts";
+import { RuntimeSession } from "../runtime/isolation/RuntimeSession.ts";
+import { describeModelChoice, sessionModelChoice } from "../runtime/operatorModelPin.ts";
 import type { WorkerExecutor } from "../workers/WorkerExecutor.ts";
 import {
   type PlannerWorkerConfig,
@@ -62,6 +64,12 @@ export function newMissionId(at: Date = new Date()): string {
     .replace(/[-:.TZ]/g, "")
     .slice(0, 14);
   return `PW-${stamp}-${randomBytes(3).toString("hex")}`;
+}
+
+/** This session's operator pin (Pi `/model`), read at every role resolution. */
+function currentOperatorPin(): { provider: string; id: string } | null {
+  const choice = sessionModelChoice(RuntimeSession.current().sessionId);
+  return choice?.kind === "pin" ? { provider: choice.pin.provider, id: choice.pin.id } : null;
 }
 
 /** Handle one of the `/engineering-*` commands; returns the operator text. */
@@ -126,7 +134,12 @@ export function registerPlannerWorker(
         const { repoRoot } = await deps.host(ctx);
         const config = await loadPlannerWorkerConfig(repoRoot);
         const out = await engineeringCommand(name, args, repoRoot, config);
-        ctx.ui.notify(out.text, out.level);
+        // Which model this session's missions run on: the operator pin, if any.
+        const text =
+          name === "status"
+            ? `${describeModelChoice(sessionModelChoice(RuntimeSession.current().sessionId))}\n${out.text}`
+            : out.text;
+        ctx.ui.notify(text, out.level);
       },
     });
   }
@@ -173,6 +186,7 @@ export function registerPlannerWorker(
     const resolver = new RoleResolver({
       provider,
       config: config.roles,
+      operatorPin: currentOperatorPin,
       // A short deadline: the mode decision must not stall /mission.
       loadCatalog: conn ? () => fetchCatalog({ ...conn, timeoutMs: 5_000 }) : async () => [],
       fallback: async (role, exclude) => {
@@ -285,7 +299,7 @@ export function registerPlannerWorker(
       if (!(await stat(join(stateDir, "state.json")).catch(() => null))) return false;
       const config = await loadPlannerWorkerConfig(host.repoRoot);
       const built = (await resolverFor(ctx, host.repoRoot, config)) ?? {
-        resolver: new RoleResolver({ provider: "default", config: config.roles }),
+        resolver: new RoleResolver({ provider: "default", config: config.roles, operatorPin: currentOperatorPin }),
         conn: null,
       };
       ctx.ui.notify(`[${missionId}] resuming planner-worker mission`, "info");

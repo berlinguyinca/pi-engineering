@@ -496,6 +496,8 @@ export class ExecutionBroker {
   private readonly artifacts?: BrokerOptions["artifacts"];
   private readonly cancellationAckTimeoutMs: number;
   /** In-flight execution state for cancellation + allocated worktrees. */
+  /** Executions canceled by an operator interrupt (pause): their tasks stay resumable. */
+  private readonly resumableCancels = new Set<string>();
   private readonly active = new Map<
     string,
     {
@@ -1011,16 +1013,26 @@ export class ExecutionBroker {
    * rather than poking the store, otherwise the runner keeps going, the worktree
    * leaks, and the eventual result overwrites CANCELED with SUCCEEDED.
    */
-  async cancelExecution(executionId: string, taskId?: string): Promise<boolean> {
+  async cancelExecution(executionId: string, taskId?: string, opts: { resumable?: boolean } = {}): Promise<boolean> {
     const entry = this.active.get(executionId);
     if (!entry) return false;
+    if (opts.resumable) this.resumableCancels.add(executionId);
     entry.abort.abort();
     await this.terminalizeAfterGrace(executionId, "canceled", taskId ?? entry.taskId);
     // A cancel that lands while a hung (inactive) execution is settling joins
     // that settlement, which leaves the task RUNNING for a resume. The caller
-    // asked for cancellation, so the task must not be resumed.
+    // asked for cancellation, so the task must not be resumed — unless this is
+    // an operator interrupt (pause), whose task must stay resumable.
     const cancelledTask = taskId ?? entry.taskId;
-    if (this.store.getTask(cancelledTask)?.status === "RUNNING") this.store.transitionTask(cancelledTask, "CANCELED");
+    if (this.store.getTask(cancelledTask)?.status === "RUNNING") {
+      if (opts.resumable) {
+        this.store.transitionTask(cancelledTask, "RETRYING", "system", {
+          failure_reason: "interrupted by the operator; resumable",
+        });
+      } else {
+        this.store.transitionTask(cancelledTask, "CANCELED");
+      }
+    }
     return true;
   }
 
@@ -1135,8 +1147,16 @@ export class ExecutionBroker {
     // A hung (inactive) execution leaves its task RUNNING: the scheduler owns
     // the decision to resume it from its checkpoint instead of failing it.
     if (task?.status === "RUNNING" && reason !== "inactivity") {
-      this.store.transitionTask(taskId, failed ? "FAILED" : "CANCELED");
+      if (reason === "canceled" && this.resumableCancels.has(executionId)) {
+        // An operator interrupt (pause): the task stays resumable.
+        this.store.transitionTask(taskId, "RETRYING", "system", {
+          failure_reason: "interrupted by the operator; resumable",
+        });
+      } else {
+        this.store.transitionTask(taskId, failed ? "FAILED" : "CANCELED");
+      }
     }
+    this.resumableCancels.delete(executionId);
     this.active.delete(executionId);
     return outcome;
   }
@@ -1152,11 +1172,11 @@ export class ExecutionBroker {
   }
 
   /** Cancel the in-flight execution of a task, if any. */
-  async cancelByTask(taskId: string): Promise<boolean> {
+  async cancelByTask(taskId: string, opts: { resumable?: boolean } = {}): Promise<boolean> {
     let canceled = false;
     for (const [executionId, entry] of [...this.active]) {
       if (entry.taskId === taskId) {
-        canceled = (await this.cancelExecution(executionId, taskId)) || canceled;
+        canceled = (await this.cancelExecution(executionId, taskId, opts)) || canceled;
       }
     }
     return canceled;

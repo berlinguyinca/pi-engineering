@@ -28,6 +28,8 @@ export interface CoreServices {
    * mission tool's `resume` action points at the slash command.
    */
   resumeMission?: (missionId: string, signal?: AbortSignal) => Promise<Mission>;
+  /** Explicitly cancel a mission (the only thing that terminates a healthy one). */
+  cancelMission?: (missionId: string) => Promise<Mission>;
 }
 
 /**
@@ -326,11 +328,11 @@ export function buildCoreTools(
     name: "mission",
     label: "Mission",
     description:
-      "Run the orchestration mission pipeline for a normal-language engineering request: route intent, plan, execute workers, validate, fresh-review, and gate completion. Use this for implement/fix/refactor/investigate requests so the engineering workflow runs automatically. action=status reports an existing mission; action=resume recovers a stopped/blocked mission (same as /mission resume <id>); a stop that waits for the user is refused.",
+      "Run the orchestration mission pipeline for a normal-language engineering request: route intent, plan, execute workers, validate, fresh-review, and gate completion. Use this for implement/fix/refactor/investigate requests so the engineering workflow runs automatically. action=status reports an existing mission; action=resume recovers a stopped/blocked/paused mission (same as /mission resume <id>); a stop that waits for the user is refused. Interrupting a run pauses the mission (resumable); only action=cancel ends it — use cancel only when the user explicitly asks to cancel.",
     parameters: Type.Object({
       action: Type.Optional(
-        Type.Union([Type.Literal("run"), Type.Literal("status"), Type.Literal("resume")], {
-          description: "run (default) starts a mission from `request`; status/resume act on `missionId`.",
+        Type.Union([Type.Literal("run"), Type.Literal("status"), Type.Literal("resume"), Type.Literal("cancel")], {
+          description: "run (default) starts a mission from `request`; status/resume/cancel act on `missionId`.",
         }),
       ),
       request: Type.Optional(
@@ -366,6 +368,23 @@ export function buildCoreTools(
           },
         );
 
+      if (action === "cancel") {
+        const missionId = String(params.missionId ?? "").trim();
+        if (!missionId) return text("The cancel action needs missionId.");
+        const current = store?.getMission(missionId);
+        if (!current) return text(`Unknown mission ${missionId}.`);
+        if (!services.cancelMission) {
+          return text(
+            `Cancel is not available through the tool in this session. Ask the operator to run /mission cancel ${missionId}.`,
+            {
+              missionId,
+              status: current.status,
+            },
+          );
+        }
+        const canceled = await services.cancelMission(missionId);
+        return describe(canceled, ["Canceled at the operator's request."]);
+      }
       if (action === "status" || action === "resume") {
         const missionId = String(params.missionId ?? "").trim();
         if (!missionId) return text(`The ${action} action needs missionId.`);
@@ -406,6 +425,8 @@ export function buildCoreTools(
         constraints: (params.constraints as string[] | undefined) ?? [],
         mutationRequested: params.mutate ?? true,
         signal,
+        // Interrupting the call (Esc) pauses the mission; it never cancels it.
+        interrupt: "pause",
         // Stream every live progress line (phase/task transitions + progress
         // bar) to the operator via the tool update callback instead of blocking
         // silently for the whole mission.
@@ -414,11 +435,14 @@ export function buildCoreTools(
         },
       });
       const m = result.mission;
-      const statusLine = result.paused
-        ? "PAUSED: infrastructure retry window exhausted. Progress is preserved; the mission auto-resumes when the gateway recovers (it is not a failure)."
-        : result.completed
-          ? "Completed: all gates passed."
-          : `Not completed: ${result.failureReason ?? "gates unmet"}.`;
+      const statusLine =
+        result.pausedBy === "operator"
+          ? `PAUSED by interrupt: the mission was not canceled and its progress is preserved. Resume it with /mission resume ${m.mission_id} (or this tool's resume action); /mission cancel ${m.mission_id} ends it.`
+          : result.paused
+            ? "PAUSED: infrastructure retry window exhausted. Progress is preserved; the mission auto-resumes when the gateway recovers (it is not a failure)."
+            : result.completed
+              ? "Completed: all gates passed."
+              : `Not completed: ${result.failureReason ?? "gates unmet"}.`;
       const lines = [
         `Mission ${m.mission_id} [${m.status}] workflow=${m.workflow_class}`,
         `Intent: ${result.intent.intent.join(", ")} | required gates: ${m.required_gates.join(", ") || "none"}`,
@@ -427,7 +451,12 @@ export function buildCoreTools(
       ];
       return {
         content: [{ type: "text", text: lines.join("\n") }],
-        details: { missionId: m.mission_id, status: m.status, paused: result.paused ?? false },
+        details: {
+          missionId: m.mission_id,
+          status: m.status,
+          paused: result.paused ?? false,
+          ...(result.pausedBy ? { pausedBy: result.pausedBy } : {}),
+        },
       };
     },
   });

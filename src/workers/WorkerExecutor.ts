@@ -16,6 +16,9 @@ export interface WorkerActivity {
 }
 
 /** A delegated task for a fresh-context worker (INV-002, §12). */
+/** A worker attempt ended at an inference boundary because the operator chose another model. */
+export const MODEL_SUPERSEDED = "model_superseded";
+
 export interface WorkerRequest {
   role: WorkerRole;
   task: string;
@@ -45,6 +48,18 @@ export interface WorkerRequest {
    * executor falls back to its construction-time model.
    */
   modelOverride?: { provider: string; id: string };
+  /**
+   * The operator pinned `modelOverride` (Pi `/model`): capacity exhaustion on
+   * it is waited out — however long — instead of handed back to the mission.
+   */
+  operatorPinned?: boolean;
+  /**
+   * True once the operator chose a different model for this mission. Checked
+   * at inference boundaries only (between requests, e.g. while held for
+   * capacity), never mid-stream; the attempt then ends with
+   * `model_superseded` so the mission re-dispatches on the new choice.
+   */
+  modelSuperseded?: () => boolean;
   /** Replace the role prompt entirely (specialist roles own their prompts). */
   systemPromptOverride?: string;
   /** Image attachments for vision-capable roles. */

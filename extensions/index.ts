@@ -71,6 +71,13 @@ import { formatDoctorReport, runDoctor } from "../src/runtime/isolation/doctor.t
 import { emitRuntimeEvent } from "../src/runtime/isolation/runtimeEvents.ts";
 import { formatRuntimeStatus, runtimeStatus } from "../src/runtime/isolation/status.ts";
 import {
+  clearOperatorModelPin,
+  describeModelChoice,
+  onOperatorModelSelect,
+  resetSessionModelChoice,
+  sessionModelChoice,
+} from "../src/runtime/operatorModelPin.ts";
+import {
   type MissionBrief,
   type SessionControlServer,
   startSessionControl,
@@ -582,6 +589,7 @@ async function resolveServices(cwd: string): Promise<CoreServices | null> {
     },
     actor: () => ({ type: "user" }),
     resumeMission: (id, s) => rt.resumeBlockedMission(id, s),
+    cancelMission: (id) => rt.cancelMission(id),
     // A rebound parent launch targets the bound worktree by default.
     ...(effective !== cwd ? { repositoryRoot: rt.git?.root ?? effective } : {}),
   };
@@ -609,6 +617,8 @@ function formatEntities(rt: EngineeringRuntime, kind?: string): string {
 
 export default function (pi: ExtensionAPI) {
   registerInteractiveMemory(pi);
+  /** True while our own (opt-in) fallback switches the interactive model. */
+  let automaticModelSwitch = false;
   // One control socket per live PI session. The socket answers directly while
   // a mission tool is awaiting a worker; another PI process never opens this
   // session's transcript or writes its event store to ask for status.
@@ -679,6 +689,56 @@ export default function (pi: ExtensionAPI) {
   })) {
     pi.registerTool(tool);
   }
+
+  // ─── Operator model pin: missions follow an explicit /model switch ───────
+  // The operator's switch becomes this session's operator pin; its missions
+  // adopt it at their next worker dispatch (src/runtime/operatorModelPin.ts).
+  // Automatic fallback of the interactive model stays opt-in and is not a pin.
+  if (typeof pi.on === "function") {
+    pi.on("session_start", (event, ctx) => {
+      if (event.reason === "reload") return;
+      const sessionId = RuntimeSession.current().sessionId;
+      resetSessionModelChoice(sessionId, ctx.model);
+      // The pin is process-wide; a fresh conversation (/new) explicitly
+      // returns this process's missions to automatic routing.
+      if (event.reason === "new") clearOperatorModelPin(sessionId);
+    });
+    pi.on("model_select", (event, ctx) => {
+      const outcome = onOperatorModelSelect(RuntimeSession.current().sessionId, {
+        model: event.model,
+        source: event.source,
+        automatic: automaticModelSwitch,
+      });
+      if (outcome.action === "pinned") {
+        ctx.ui.notify(
+          `Missions from this session now use ${outcome.pin.provider}/${outcome.pin.id} (operator pin) from their next worker dispatch. /engineering-model auto returns them to automatic routing.`,
+          "info",
+        );
+      } else if (outcome.action === "cleared") {
+        ctx.ui.notify(`Operator model pin cleared (${outcome.reason}); missions return to automatic routing.`, "info");
+      }
+    });
+  }
+  pi.registerCommand("engineering-model", {
+    description: "Show the model this session's missions use, or `auto` to clear the operator pin set by /model.",
+    handler: async (args, ctx) => {
+      const sessionId = RuntimeSession.current().sessionId;
+      const want = (args ?? "").trim();
+      if (want === "auto") {
+        clearOperatorModelPin(sessionId);
+        ctx.ui.notify(
+          "Operator model pin cleared; missions return to automatic routing at their next dispatch.",
+          "info",
+        );
+        return;
+      }
+      if (want) {
+        ctx.ui.notify("/engineering-model [auto] — pin a model for missions by switching with /model", "error");
+        return;
+      }
+      ctx.ui.notify(describeModelChoice(sessionModelChoice(sessionId)), "info");
+    },
+  });
 
   // ─── Automatic engineering/review workflow invocation (spec 06) ─────────
   // Normal-language intent must auto-invoke the orchestration pipeline without
@@ -1291,7 +1351,16 @@ ${RECOVERY_PROMPT}`;
       if (!pending) return;
       const result = await applyPendingFallback(
         {
-          setModel: (m) => pi.setModel(m),
+          // Our own fallback switch is not an operator choice: missions must
+          // not adopt it as an operator pin (see the model_select handler).
+          setModel: async (m) => {
+            automaticModelSwitch = true;
+            try {
+              return await pi.setModel(m);
+            } finally {
+              automaticModelSwitch = false;
+            }
+          },
           healthFor: (c) => healthFor(c as { model?: Model<any>; modelRegistry?: unknown }),
           log: (message) => console.error(message),
         } satisfies FallbackApplyDeps,
@@ -1818,11 +1887,23 @@ ${RECOVERY_PROMPT}`;
   });
 
   pi.registerCommand("mission", {
-    description: "Run an orchestration mission, or resume one with /mission resume <missionId>.",
+    description:
+      "Run an orchestration mission; /mission resume <missionId> continues a stopped or paused one, /mission cancel <missionId> ends one.",
     handler: async (args, ctx) => {
       const request = args.trim();
       if (!request) {
         ctx.ui.notify("/mission <normal-language request> | /mission resume <missionId>", "error");
+        return;
+      }
+      const cancel = /^cancel\s+(MSN-\S+)\s*$/i.exec(request);
+      if (cancel?.[1]) {
+        const rt = await getRuntime(ctx);
+        try {
+          const canceled = await rt.cancelMission(cancel[1]);
+          ctx.ui.notify(`Mission ${canceled.mission_id} — ${canceled.title} [${canceled.status}]`, "info");
+        } catch (error) {
+          ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+        }
         return;
       }
       const resumePrefix = /^resume(?:\b|[:=])/i.test(request);
@@ -1870,6 +1951,8 @@ ${RECOVERY_PROMPT}`;
         baseRef,
         mutationRequested: true,
         signal: ctx.signal,
+        // Esc pauses the mission (resumable); only /mission cancel ends it.
+        interrupt: "pause",
         onProgress: (line) => {
           // De-duplicate the trailing completion lines (phase transitions and
           // task settlements can fire within the same tick).
@@ -1880,11 +1963,14 @@ ${RECOVERY_PROMPT}`;
         },
       });
       const m = result.mission;
-      const completion = result.paused
-        ? "PAUSED — infrastructure retry window exhausted (auto-resumes on recovery; not a failure)"
-        : result.completed
-          ? "PASSED"
-          : `BLOCKED — ${result.failureReason ?? ""}`;
+      const completion =
+        result.pausedBy === "operator"
+          ? `PAUSED by interrupt — progress preserved; /mission resume ${result.mission.mission_id} continues it, /mission cancel ${result.mission.mission_id} ends it`
+          : result.paused
+            ? "PAUSED — infrastructure retry window exhausted (auto-resumes on recovery; not a failure)"
+            : result.completed
+              ? "PASSED"
+              : `BLOCKED — ${result.failureReason ?? ""}`;
       const lines = [
         `Mission ${m.mission_id} [${m.status}] workflow=${m.workflow_class} risk=${m.risk_profile}`,
         `Intent: ${result.intent.intent.join(", ")} (confidence ${result.intent.confidence.toFixed(2)})`,

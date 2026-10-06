@@ -22,6 +22,7 @@ import { type ProbeResult, type RecoveryProbe, healthyProbe } from "../resilienc
 import { type RetryWindowState, recordProbe, startRetryWindow, windowOpen } from "../resilience/retryWindow.ts";
 import { type SchedulableTask, Scheduler } from "../sched/Scheduler.ts";
 import { type ExecutionBroker, type ExecutionHandle, type ExecutionRequestInput, INACTIVITY_MARKER } from "./broker.ts";
+import { isPauseAbort } from "./interrupt.ts";
 import type { MissionStore } from "./missionStore.ts";
 import type { DispatchAuthority } from "./ownership.ts";
 import { FailureClassifier, type FailureEvidence, RecoveryPlanner, type RecoveryPlannerOptions } from "./recovery.ts";
@@ -321,7 +322,7 @@ export class MissionScheduler {
       canceling ??= Promise.all(
         [...this.activeTasks.values()]
           .filter((task) => task.mission_id === missionId)
-          .map((task) => this.broker.cancelByTask(task.task_id)),
+          .map((task) => this.broker.cancelByTask(task.task_id, { resumable: isPauseAbort(signal) })),
       ).then(() => undefined);
       return canceling;
     };
@@ -435,7 +436,7 @@ export class MissionScheduler {
     let resumeFromSha: string | undefined;
     while (true) {
       if (signal?.aborted) {
-        this.cancelTask(task);
+        this.stopTaskOnAbort(task, signal);
         return;
       }
       attempt++;
@@ -446,7 +447,7 @@ export class MissionScheduler {
       // On window exhaustion the mission is PAUSED (not FAILED).
       const gate = await this.probeGate(task, signal);
       if (gate === "aborted") {
-        this.cancelTask(task);
+        this.stopTaskOnAbort(task, signal);
         return;
       }
       if (gate === "paused") return;
@@ -551,7 +552,7 @@ export class MissionScheduler {
               this.store.transitionTask(task.task_id, "RETRYING", "system", { attempt });
               const waited = await this.abortable(this.sleepFn(res.waitMs), signal);
               if (waited.aborted) {
-                this.cancelTask(task);
+                this.stopTaskOnAbort(task, signal);
                 return;
               }
               continue;
@@ -640,7 +641,7 @@ export class MissionScheduler {
           }
         }
         if (signal?.aborted) {
-          this.cancelTask(task);
+          this.stopTaskOnAbort(task, signal);
           return;
         }
         if (this.store.getTask(task.task_id)?.status === "CANCELED") return;
@@ -864,6 +865,19 @@ export class MissionScheduler {
     const waited = await this.abortable(this.sleepFn(waitMs), signal);
     if (waited.aborted) return "aborted";
     return "wait";
+  }
+
+  /** An aborted run: an operator pause leaves the task resumable, anything else cancels it. */
+  private stopTaskOnAbort(task: OrchestrationTask, signal: AbortSignal | undefined): void {
+    if (!isPauseAbort(signal)) {
+      this.cancelTask(task);
+      return;
+    }
+    if (this.store.getTask(task.task_id)?.status === "RUNNING") {
+      this.store.transitionTask(task.task_id, "RETRYING", "system", {
+        failure_reason: "interrupted by the operator; resumable",
+      });
+    }
   }
 
   private cancelTask(task: OrchestrationTask): void {
