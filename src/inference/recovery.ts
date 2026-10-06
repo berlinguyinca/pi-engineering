@@ -28,27 +28,24 @@
 
 import type { ModelRef } from "../lifecycle/types.ts";
 import { modelKey } from "../lifecycle/types.ts";
-import type {
-  ClassifiedInferenceFailure,
-  StreamTerminationState,
-} from "./failureClassifier.ts";
+import type { RequiredModelEnvelope } from "./envelope.ts";
+import type { ClassifiedInferenceFailure, StreamTerminationState } from "./failureClassifier.ts";
 import type { InferenceResponseMetadata } from "./inferweaveMetadata.ts";
 import { DEFAULT_INFERENCE_RESILIENCE, type InferenceResilienceConfig } from "./resilienceConfig.ts";
 import {
   DEFAULT_STREAM_RETRY_POLICY,
-  StreamRetryPolicy,
   type RetryDecision,
   type StreamRetryDelaySource,
+  StreamRetryPolicy,
 } from "./retryPolicy.ts";
 import {
+  type InferenceTelemetryData,
+  type InferenceTelemetryEventName,
   describeFallbackStatus,
   describeRetryStatus,
   describeWaitingStatus,
   formatDurationMs,
-  type InferenceTelemetryData,
-  type InferenceTelemetryEventName,
 } from "./telemetry.ts";
-import type { RequiredModelEnvelope } from "./envelope.ts";
 
 /** One model invocation as seen by the ladder (transport seam). */
 export interface LadderOutcome {
@@ -59,7 +56,12 @@ export interface LadderOutcome {
 }
 
 export interface LadderTransport {
-  send(input: { model: ModelRef; request: LadderRequest; attempt: number; signal?: AbortSignal }): Promise<LadderOutcome>;
+  send(input: {
+    model: ModelRef;
+    request: LadderRequest;
+    attempt: number;
+    signal?: AbortSignal;
+  }): Promise<LadderOutcome>;
 }
 
 /** Opaque provider request payload; the ladder only adds retry evidence. */
@@ -150,6 +152,7 @@ export interface LadderRunOutcome {
 export type RecoveryStep =
   | { kind: "retry"; model: ModelRef; delayMs: number; source: StreamRetryDelaySource; note: string }
   | { kind: "refresh_and_retry"; model: ModelRef; note: string }
+  | { kind: "refresh_and_fail"; model: ModelRef; note: string }
   | { kind: "fallback"; note: string }
   | { kind: "wait_capacity"; delayMs: number; note: string }
   | { kind: "compact_and_retry"; model: ModelRef; note: string }
@@ -174,11 +177,13 @@ function waitOrExhaust(
   attempt: number,
   serverDelayMs: number | undefined,
   model: ModelRef,
-): { kind: "retry"; model: ModelRef; delayMs: number; source: RetryDecision["source"]; note: string } | {
-  kind: "wait_capacity";
-  delayMs: number;
-  note: string;
-} {
+):
+  | { kind: "retry"; model: ModelRef; delayMs: number; source: RetryDecision["source"]; note: string }
+  | {
+      kind: "wait_capacity";
+      delayMs: number;
+      note: string;
+    } {
   const decision = policy.decide(attempt, serverDelayMs);
   if (decision.shouldRetry) {
     return {
@@ -246,6 +251,19 @@ export function decideRecoveryStep(input: RecoveryStepInput): RecoveryStep {
       if (input.fallbackEnabled && !input.fallbackExhausted) {
         return { kind: "fallback", note: `model-scoped ${failure.class}: catalog refresh + comparable-model fallback` };
       }
+      // A 404 model_not_found is a routing ABSENCE, not a capacity wait: the
+      // spec's error matrix (§18) is "refresh catalog once, then
+      // fallback/fail". With no comparable fallback to select, failing fast
+      // with the model named is what lets the mission hand the work to another
+      // model (the `transient:model_unavailable` takeover marker). Parking in
+      // a capacity wait here would spin on a model the gateway never lists.
+      if (failure.class === "model_not_found") {
+        return {
+          kind: "refresh_and_fail",
+          model,
+          note: "model_not_found: catalog refreshed once; no comparable fallback — failing with the model named",
+        };
+      }
       return {
         kind: "wait_capacity",
         delayMs: streamPolicy.ladderDelayMs(attempt),
@@ -257,7 +275,11 @@ export function decideRecoveryStep(input: RecoveryStepInput): RecoveryStep {
       if (input.fallbackEnabled && !input.fallbackExhausted) {
         return { kind: "fallback", note: "quota exhausted: capability-based fallback" };
       }
-      return { kind: "wait_capacity", delayMs: streamPolicy.ladderDelayMs(attempt), note: "no eligible fallback model" };
+      return {
+        kind: "wait_capacity",
+        delayMs: streamPolicy.ladderDelayMs(attempt),
+        note: "no eligible fallback model",
+      };
 
     case "compact_and_retry":
       return { kind: "compact_and_retry", model, note: "context overflow: compact and retry" };
@@ -630,8 +652,7 @@ export class RecoveryLadder {
         attempt,
         fallbackEnabled: this.fallbackEnabledFor(input),
         fallbackExhausted: state.fallbackExhausted,
-        activationElapsedMs:
-          state.activationSince !== undefined ? this.hooks.now() - state.activationSince : undefined,
+        activationElapsedMs: state.activationSince !== undefined ? this.hooks.now() - state.activationSince : undefined,
         config: this.config,
         streamPolicy: this.streamPolicy,
       });
@@ -666,7 +687,11 @@ export class RecoveryLadder {
       return this.applyStep(input, base, state, startedAt, failure, attempt, step);
     }
 
-    return { kind: "wait_capacity", failure: (failure as ClassifiedInferenceFailure) ?? this.unknownFailure(), note: "aborted mid-attempt" };
+    return {
+      kind: "wait_capacity",
+      failure: (failure as ClassifiedInferenceFailure) ?? this.unknownFailure(),
+      note: "aborted mid-attempt",
+    };
   }
 
   private async applyStep(
@@ -721,6 +746,25 @@ export class RecoveryLadder {
       }
       case "wait_capacity": {
         return { kind: "wait_capacity", failure, note: step.note };
+      }
+      case "refresh_and_fail": {
+        // model_not_found with no comparable fallback (spec §18): refresh the
+        // catalog once, then settle the loop with the failure visible so the
+        // caller names the model it tried.
+        await this.refreshCatalog();
+        this.hooks.status?.(step.note);
+        return {
+          kind: "done",
+          result: {
+            ok: false,
+            model: state.current,
+            attempts: state.totalAttempts,
+            elapsedMs: this.hooks.now() - startedAt,
+            failure,
+            reason: step.note,
+            incompleteGenerations: this.hooks.actions?.incompleteCount() ?? 0,
+          },
+        };
       }
       case "fail": {
         return {

@@ -1061,7 +1061,9 @@ export class ArtifactStore {
     const metaPath = this.filePath(opened, id, "json");
     let parsed: unknown;
     try {
-      parsed = JSON.parse((await this.readFileNoFollow(metaPath, `artifact metadata ${category}/${id}`)).toString("utf8"));
+      parsed = JSON.parse(
+        (await this.readFileNoFollow(metaPath, `artifact metadata ${category}/${id}`)).toString("utf8"),
+      );
     } catch {
       return; // unreadable/corrupt: let normal validation produce the precise error
     }

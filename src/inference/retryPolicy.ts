@@ -88,7 +88,14 @@ export class StreamRetryPolicy {
     const attempt = Math.max(1, Math.floor(failedAttempt));
     const attemptsUsed = attempt;
     if (!this.config.enabled) {
-      return { shouldRetry: false, delayMs: 0, source: "disabled", attempt, attemptsUsed, reason: "stream retry disabled" };
+      return {
+        shouldRetry: false,
+        delayMs: 0,
+        source: "disabled",
+        attempt,
+        attemptsUsed,
+        reason: "stream retry disabled",
+      };
     }
     if (attempt >= this.config.maxAttempts) {
       return {

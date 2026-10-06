@@ -37,6 +37,15 @@
  * evidence block; the actions themselves are never replayed here.
  */
 
+import type { ModelCapabilityRegistry } from "../capability/registry.ts";
+import { ROLE_NAMES, ROLE_REQUIREMENTS, type RoleName, routerRoleFor } from "../capability/roles.ts";
+import type { RoleRouter } from "../capability/router.ts";
+import {
+  type ProviderResponseLike,
+  type ProviderResponseOptions,
+  captureGatewayAttemptResponse,
+} from "../gateway/installStreamRetry.ts";
+import type { GatewayWaitSignal } from "../gateway/signals.ts";
 import {
   type AttemptObservation,
   type RetrySink,
@@ -44,15 +53,6 @@ import {
   type RetryableResult,
   pumpWithGatewayRetry,
 } from "../gateway/streamRetry.ts";
-import {
-  type ProviderResponseLike,
-  type ProviderResponseOptions,
-  captureGatewayAttemptResponse,
-} from "../gateway/installStreamRetry.ts";
-import type { GatewayWaitSignal } from "../gateway/signals.ts";
-import type { ModelCapabilityRegistry } from "../capability/registry.ts";
-import { ROLE_NAMES, ROLE_REQUIREMENTS, type RoleName, routerRoleFor } from "../capability/roles.ts";
-import type { RoleRouter } from "../capability/router.ts";
 import type { ModelRef } from "../lifecycle/types.ts";
 import { modelKey } from "../lifecycle/types.ts";
 import { CircuitBreakerRegistry, type ModelCircuitBreaker } from "./circuitBreaker.ts";
@@ -60,19 +60,19 @@ import type { RequiredModelEnvelope } from "./envelope.ts";
 import { envelopeCapabilities, envelopeSatisfied } from "./envelope.ts";
 import type { ClassifiedInferenceFailure, StreamTerminationState } from "./failureClassifier.ts";
 import { classifyInferenceFailure } from "./failureClassifier.ts";
+import type { InferenceInvocation } from "./inferenceContext.ts";
 import { metadataFromResponse } from "./inferweaveMetadata.ts";
 import { ModelHealthRegistry } from "./modelHealth.ts";
-import type { InferenceInvocation } from "./inferenceContext.ts";
-import { type ExecutedActionTracker, decideRecoveryStep, type RecoveryStep } from "./recovery.ts";
-import { resolveInferenceResilienceConfig, type InferenceResilienceConfig } from "./resilienceConfig.ts";
+import { type ExecutedActionTracker, type RecoveryStep, decideRecoveryStep } from "./recovery.ts";
+import { type InferenceResilienceConfig, resolveInferenceResilienceConfig } from "./resilienceConfig.ts";
 import { StreamRetryPolicy } from "./retryPolicy.ts";
 import {
-  describeFallbackStatus,
-  describeRetryStatus,
-  describeWaitingStatus,
   type InferenceTelemetry,
   type InferenceTelemetryData,
   type InferenceTelemetryEventName,
+  describeFallbackStatus,
+  describeRetryStatus,
+  describeWaitingStatus,
 } from "./telemetry.ts";
 
 /** Mission-side capacity machinery (the same seam `resilientInference` uses). */
@@ -129,7 +129,11 @@ const DEFAULT_CAPACITY_WAIT_MAX_MS = 12 * 3_600_000;
 /** Short pacing floor for a model-scoped switch (never a wait the gateway asked for). */
 const FALLBACK_MIN_DELAY_MS = 1_000;
 
-function emit(telemetry: InferenceTelemetry | undefined, name: InferenceTelemetryEventName, data: InferenceTelemetryData): void {
+function emit(
+  telemetry: InferenceTelemetry | undefined,
+  name: InferenceTelemetryEventName,
+  data: InferenceTelemetryData,
+): void {
   telemetry?.emit(name, data);
 }
 
@@ -200,14 +204,11 @@ export class ResilientAttemptFlow {
     this.actions = call.actions ?? opts.actions;
     this.current = model;
     this.now = opts.now ?? (() => Date.now());
-    this.config = resolveInferenceResilienceConfig(
-      opts.env ?? (typeof process !== "undefined" ? process.env : {}),
-      {
-        ...opts.config,
-        // Interactive sessions never inherit the worker fallback default.
-        ...(this.interactive ? { modelFallbackForWorkers: false } : {}),
-      },
-    );
+    this.config = resolveInferenceResilienceConfig(opts.env ?? (typeof process !== "undefined" ? process.env : {}), {
+      ...opts.config,
+      // Interactive sessions never inherit the worker fallback default.
+      ...(this.interactive ? { modelFallbackForWorkers: false } : {}),
+    });
     this.policy = new StreamRetryPolicy({
       config: {
         enabled: this.config.streamRetryEnabled,
@@ -279,9 +280,7 @@ export class ResilientAttemptFlow {
     const streamState: StreamTerminationState = {
       finished: observed.streamState.finished,
       outputCommitted: observed.streamState.outputCommitted,
-      ...(observed.streamState.partialChars !== undefined
-        ? { partialChars: observed.streamState.partialChars }
-        : {}),
+      ...(observed.streamState.partialChars !== undefined ? { partialChars: observed.streamState.partialChars } : {}),
     };
     const failure = classifyInferenceFailure({
       ...(observed.thrown !== undefined ? { error: observed.thrown } : { error: new Error(observed.text) }),
@@ -313,6 +312,22 @@ export class ResilientAttemptFlow {
         attempt: observed.attempt,
         chars: observed.streamState.partialChars,
       });
+    }
+
+    // Spec §3 + §6: an incomplete stream retries the SAME model — but only
+    // while the attempt has executed no side-effecting tool calls. Once tools
+    // ran, a same-model retry would replay them (bash included) under a fresh
+    // budget, so settle with the distinct non-transient truncation marker
+    // instead and let the caller surface `truncated_after_progress`. Text-only
+    // partials still retry: replaying generated text is side-effect free.
+    if (failure.class === "incomplete_stream" && (this.actions?.list().length ?? 0) > 0) {
+      this.opts.status?.("stream interrupted after executed tool calls · not replaying side effects");
+      return {
+        retryAfterMs: 0,
+        retryable: false,
+        source: "default",
+        reason: "truncated_after_progress",
+      };
     }
 
     if (failure.modelScoped) {
@@ -391,7 +406,12 @@ export class ResilientAttemptFlow {
       case "compact_and_retry":
         // Request-body fitting owns this rung (src/request/bodyBudget.ts); the
         // classifier's word is recorded so the operator sees why we replay.
-        return this.wait(failure, failure.retryAfterMs ?? this.policy.ladderDelayMs(this.attemptOnModel), base, step.note);
+        return this.wait(
+          failure,
+          failure.retryAfterMs ?? this.policy.ladderDelayMs(this.attemptOnModel),
+          base,
+          step.note,
+        );
 
       case "fallback": {
         const next = await this.selectFallback(failure, base);
@@ -420,15 +440,24 @@ export class ResilientAttemptFlow {
           retryable: true,
           source: failure.retryAfterMs !== undefined ? "body" : "default",
           reason: failure.reason ?? failure.class,
-          ...(failure.model ?? this.current.id ? { model: failure.model ?? this.current.id } : {}),
+          ...((failure.model ?? this.current.id) ? { model: failure.model ?? this.current.id } : {}),
         };
       }
 
       case "wait_capacity":
         return this.capacityWait(failure, base, step.note);
 
-      case "refresh_and_retry":
-      case "retry":
+      case "refresh_and_fail":
+        // model_not_found with no comparable fallback (spec §18): refresh the
+        // catalog ONCE so a just-listed model is not chased, then settle with
+        // the failure visible so the caller names the model that was tried.
+        await this.refreshCatalog({ ...base, failure_class: failure.class });
+        this.opts.status?.(`${failure.class} · not retryable`);
+        return { retryAfterMs: 0, retryable: false, source: "default", reason: failure.reason ?? failure.class };
+
+      // "refresh_and_retry" and "retry" share the default branch (the block
+      // selects the delay/refresh by step.kind); explicit labels would be
+      // useless fall-throughs.
       default: {
         const delay = step.kind === "refresh_and_retry" ? this.policy.ladderDelayMs(this.attemptOnModel) : step.delayMs;
         if (step.kind === "refresh_and_retry") {
@@ -701,7 +730,11 @@ export function createResilientStreamSimple<M, C, O>(
             (options ?? {}) as ProviderResponseOptions<ProviderResponseLike, unknown>,
           );
           attemptCapture = capture;
-          return base(sentModel as M, withRetryEvidence(context, attempt > 1 ? flow.evidence() : undefined), capture.options as O);
+          return base(
+            sentModel as M,
+            withRetryEvidence(context, attempt > 1 ? flow.evidence() : undefined),
+            capture.options as O,
+          );
         },
         out,
         {
@@ -716,7 +749,11 @@ export function createResilientStreamSimple<M, C, O>(
           response: () => attemptCapture?.take(),
           onSettle: (settled) => {
             if (settled !== "ok") return;
-            emit(telemetry, "inference.request.completed", identity({ logical_model: modelKey(flow.model), attempts: flow.attempts }));
+            emit(
+              telemetry,
+              "inference.request.completed",
+              identity({ logical_model: modelKey(flow.model), attempts: flow.attempts }),
+            );
           },
         },
       );

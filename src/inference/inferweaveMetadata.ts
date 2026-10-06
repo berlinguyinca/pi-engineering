@@ -19,7 +19,7 @@ import {
   parseAdmissionPayload,
   serverRequestIdFromHeaders,
 } from "./admissionContract.ts";
-import { parseRetryAfterMsHeader, parseRetryAfterHeader } from "./retryDelay.ts";
+import { parseRetryAfterHeader, parseRetryAfterMsHeader } from "./retryDelay.ts";
 
 /** Response metadata preserved across the transport boundary (spec §8). */
 export interface InferenceResponseMetadata {
@@ -145,13 +145,13 @@ export function metadataFromResponse(input: ResponseMetadataInput): InferenceRes
   if (input.status !== undefined && input.status >= 400) {
     // Only error bodies are surfaced as `errorBody`; success bodies are never
     // buffered (they stream untouched upstream).
-    const nested = parsedBody ? asRecord(parsedBody.error) ?? asRecord(parsedBody.detail) ?? parsedBody : undefined;
+    const nested = parsedBody ? (asRecord(parsedBody.error) ?? asRecord(parsedBody.detail) ?? parsedBody) : undefined;
     errorBody = nested;
   }
 
   const admission = parsedBody ? parseAdmissionPayload(parsedBody) : undefined;
   const inferweaveProtocol =
-    Object.keys(inferweave).length > 0 || admission !== undefined || (errorBody?.type === "inference_admission");
+    Object.keys(inferweave).length > 0 || admission !== undefined || errorBody?.type === "inference_admission";
 
   const nowMs = input.nowMs ?? Date.now();
   let retryAfterMs = admission?.retryAfterMs;

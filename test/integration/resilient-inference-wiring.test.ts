@@ -23,9 +23,9 @@ import { ModelCapabilityRegistry } from "../../src/capability/registry.ts";
 import { RoleRouter } from "../../src/capability/router.ts";
 import type { GatewayWaitSignal } from "../../src/gateway/signals.ts";
 import { createAssistantMessageEventStream as createLocalStream } from "../../src/inference/admissionTransport.ts";
-import { isResilientRuntime } from "../../src/inference/resilientStream.ts";
-import { wireResilientModelRuntime } from "../../src/inference/resilientInstall.ts";
 import { ExecutedActionTracker } from "../../src/inference/recovery.ts";
+import { wireResilientModelRuntime } from "../../src/inference/resilientInstall.ts";
+import { isResilientRuntime } from "../../src/inference/resilientStream.ts";
 import { InferenceTelemetry } from "../../src/inference/telemetry.ts";
 import { DEFAULT_POLICY } from "../../src/lifecycle/policy.ts";
 import type { ModelRecord } from "../../src/lifecycle/types.ts";
@@ -58,7 +58,10 @@ interface Attempt {
 
 interface ProbeScript {
   /** Per attempt: the response head + what the stream does. */
-  respond: (attempt: number, modelId: string) => {
+  respond: (
+    attempt: number,
+    modelId: string,
+  ) => {
     status?: number;
     headers?: Record<string, string>;
     error?: string;
@@ -94,10 +97,7 @@ function probeProvider(script: ProbeScript, models = [PRIMARY, FALLBACK]) {
       const reply = script.respond(index, String(sentModel?.id ?? ""));
       const s = createAssistantMessageEventStream();
       queueMicrotask(async () => {
-        await options?.onResponse?.(
-          { status: reply.status ?? 200, headers: reply.headers ?? {} },
-          sentModel,
-        );
+        await options?.onResponse?.({ status: reply.status ?? 200, headers: reply.headers ?? {} }, sentModel);
         s.push({ type: "start", partial: { stopReason: "stop", content: [] } } as never);
         if (reply.cutAfter !== undefined) {
           s.push({ type: "text_start", contentIndex: 0, partial: {} } as never);
@@ -128,7 +128,9 @@ function probeProvider(script: ProbeScript, models = [PRIMARY, FALLBACK]) {
   return { attempts, providers: models.map((m) => provider(m)) };
 }
 
-function rec(input: Partial<Parameters<typeof normalizeModelRecord>[0]> & { provider: string; id: string }): ModelRecord {
+function rec(
+  input: Partial<Parameters<typeof normalizeModelRecord>[0]> & { provider: string; id: string },
+): ModelRecord {
   return normalizeModelRecord({
     source: "test",
     toolCall: true,
@@ -183,12 +185,15 @@ interface Harness {
   capacity: { available: boolean };
 }
 
-async function wireResilientHarness(script: ProbeScript, opts: {
-  env?: Record<string, string | undefined>;
-  records?: ModelRecord[];
-  interactive?: boolean;
-  statusPrefix?: string;
-} = {}): Promise<Harness> {
+async function wireResilientHarness(
+  script: ProbeScript,
+  opts: {
+    env?: Record<string, string | undefined>;
+    records?: ModelRecord[];
+    interactive?: boolean;
+    statusPrefix?: string;
+  } = {},
+): Promise<Harness> {
   const dir = tempDir();
   const runtime = await ModelRuntime.create({
     authPath: join(dir, "auth.json"),
@@ -230,7 +235,13 @@ async function wireResilientHarness(script: ProbeScript, opts: {
     status: (line) => statuses.push(line),
     probeIntervalMs: 1_000,
     scheduler: {
-      park: (info) => parks.push({ role: info.role, reason: info.reason, ...(info.missionId ? { missionId: info.missionId } : {}), untilMs: info.untilMs }),
+      park: (info) =>
+        parks.push({
+          role: info.role,
+          reason: info.reason,
+          ...(info.missionId ? { missionId: info.missionId } : {}),
+          untilMs: info.untilMs,
+        }),
       resumed: (info) => resumed.push({ role: info.role, waitedMs: info.waitedMs }),
       isCapacityAvailable: () => capacity.available,
     },
@@ -273,7 +284,11 @@ describe("live seam: gateway saturation is waited out on the SAME model (§32)",
         attempt === 1
           ? {
               status: 429,
-              headers: { "retry-after": "45", "x-inferweave-reason": "queue_timeout", "x-inferweave-gateway-id": "gw-1" },
+              headers: {
+                "retry-after": "45",
+                "x-inferweave-reason": "queue_timeout",
+                "x-inferweave-gateway-id": "gw-1",
+              },
               error: 'inference admission: queue_timeout {"reason":"queue_timeout","retry_after_ms":45000}',
             }
           : {},
@@ -313,17 +328,22 @@ describe("live seam: model-scoped no_workers falls back by capability (§31)", (
     assert.equal(selected.length, 1);
     assert.equal(selected[0]?.data.fallback_model, `${FALLBACK.provider}/${FALLBACK.id}`);
     assert.ok(h.telemetry.eventsNamed("inference.catalog.refreshed").length >= 1, "catalog refreshed first");
-    assert.ok(h.statuses.some((s) => s.includes("→")), `fallback line shown: ${JSON.stringify(h.statuses)}`);
+    assert.ok(
+      h.statuses.some((s) => s.includes("→")),
+      `fallback line shown: ${JSON.stringify(h.statuses)}`,
+    );
   });
 
   it("never falls back for a gateway-scoped outage", async () => {
     const h = await wireResilientHarness({
-      respond: (attempt) =>
-        attempt === 1 ? { status: 502, error: "bad gateway" } : {},
+      respond: (attempt) => (attempt === 1 ? { status: 502, error: "bad gateway" } : {}),
     });
     await h.runtime.streamSimple(PRIMARY as never, CONTEXT as never, { apiKey: "k" } as never).result();
     assert.equal(h.telemetry.eventsNamed("inference.fallback.selected").length, 0);
-    assert.deepEqual(h.attempts.map((a) => a.modelId), [PRIMARY.id, PRIMARY.id]);
+    assert.deepEqual(
+      h.attempts.map((a) => a.modelId),
+      [PRIMARY.id, PRIMARY.id],
+    );
   });
 });
 
@@ -371,9 +391,7 @@ describe("live seam: every model unavailable parks the mission (§34)", () => {
         },
       },
     );
-    const result = await h.runtime
-      .streamSimple(PRIMARY as never, CONTEXT as never, { apiKey: "k" } as never)
-      .result();
+    const result = await h.runtime.streamSimple(PRIMARY as never, CONTEXT as never, { apiKey: "k" } as never).result();
 
     assert.equal(result.stopReason, "stop", "the request resumes — a transient NEVER fails it");
     assert.ok(h.parks.length >= 1, `the mission was parked durably: ${JSON.stringify(h.parks)}`);
@@ -391,7 +409,10 @@ describe("live seam: every model unavailable parks the mission (§34)", () => {
 describe("live seam: idempotency evidence for executed tool calls (§6)", () => {
   it("lists already-executed actions in the retried request without replaying them", async () => {
     const h = await wireResilientHarness({
-      respond: (attempt) => (attempt === 1 ? { status: 503, headers: { "x-inferweave-reason": "worker_evicted" }, error: "worker evicted" } : {}),
+      respond: (attempt) =>
+        attempt === 1
+          ? { status: 503, headers: { "x-inferweave-reason": "worker_evicted" }, error: "worker evicted" }
+          : {},
     });
     h.actions.record({ id: "edit-1", kind: "edit", summary: "wrote src/foo.ts" });
     const before = h.attempts.length;

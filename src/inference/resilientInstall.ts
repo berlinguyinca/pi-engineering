@@ -29,13 +29,13 @@ import { sharedAdmissionController } from "../gateway/config.ts";
 import { gatewayHoldScope } from "../gateway/signals.ts";
 import type { ModelRef } from "../lifecycle/types.ts";
 import { createAssistantMessageEventStream, terminalAssistantMessage } from "./admissionTransport.ts";
-import { currentInferenceInvocation } from "./inferenceContext.ts";
 import { CircuitBreakerRegistry } from "./circuitBreaker.ts";
+import { currentInferenceInvocation } from "./inferenceContext.ts";
 import { ModelHealthRegistry } from "./modelHealth.ts";
-import type { ResilientStreamScheduler, ResilientStreamInstallOptions } from "./resilientStream.ts";
-import { installResilientRuntime } from "./resilientStream.ts";
-import { resolveInferenceResilienceConfig, type InferenceResilienceConfig } from "./resilienceConfig.ts";
 import type { ExecutedActionTracker } from "./recovery.ts";
+import { type InferenceResilienceConfig, resolveInferenceResilienceConfig } from "./resilienceConfig.ts";
+import type { ResilientStreamInstallOptions, ResilientStreamScheduler } from "./resilientStream.ts";
+import { installResilientRuntime } from "./resilientStream.ts";
 import { InferenceTelemetry } from "./telemetry.ts";
 
 /** Process-wide resilient services, shared by every armed runtime. */
@@ -57,7 +57,9 @@ export function resilientServices(
   shared = {
     config,
     telemetry: opts.services?.telemetry ?? new InferenceTelemetry(),
-    health: opts.services?.health ?? new ModelHealthRegistry({ config: { unavailabilityPenaltyMs: config.unavailabilityPenaltyMs } }),
+    health:
+      opts.services?.health ??
+      new ModelHealthRegistry({ config: { unavailabilityPenaltyMs: config.unavailabilityPenaltyMs } }),
     breakers:
       opts.services?.breakers ??
       new CircuitBreakerRegistry({

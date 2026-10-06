@@ -71,7 +71,14 @@ export interface ClassifiedInferenceFailure {
   /** Recommended next step on the recovery ladder. */
   action: InferenceFailureAction;
   /** Where the classification came from (telemetry: no re-parsing later). */
-  source: "inferweave_body" | "inferweave_header" | "http_status" | "stream_state" | "network_code" | "string_fallback" | "none";
+  source:
+    | "inferweave_body"
+    | "inferweave_header"
+    | "http_status"
+    | "stream_state"
+    | "network_code"
+    | "string_fallback"
+    | "none";
   rawStatus?: number;
   rawHeaders?: Record<string, string>;
 }
@@ -231,7 +238,8 @@ const CONTEXT_STRING_PATTERNS =
 const NO_WORKER_STRING_PATTERNS = /\b(no[_ -]?workers?|no available worker|no worker for model)\b/i;
 const ACTIVATING_STRING_PATTERNS = /\b(model[_ -]?activating|model[_ -]?loading|loading model|cold[_ -]?start)\b/i;
 const STALE_ROUTE_STRING_PATTERNS = /\b(routing[_ -]?snapshot[_ -]?expired|stale[_ -]?route|route[_ -]?expired)\b/i;
-const MODEL_NOT_FOUND_STRING_PATTERNS = /\b(model[_ -]?not[_ -]?found|unknown[_ -]?model|no[_ -]?such[_ -]?model|invalid model name)\b/i;
+const MODEL_NOT_FOUND_STRING_PATTERNS =
+  /\b(model[_ -]?not[_ -]?found|unknown[_ -]?model|no[_ -]?such[_ -]?model|invalid model name)\b/i;
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
   if (typeof value === "object" && value !== null && !Array.isArray(value)) return value as Record<string, unknown>;
@@ -277,7 +285,7 @@ function base(input: ClassifyInferenceFailureInput): Omit<ClassifiedInferenceFai
     requestScoped: false,
     ...(md?.retryAfterMs !== undefined ? { retryAfterMs: md.retryAfterMs } : {}),
     ...(model ? { model } : {}),
-    ...(input.provider ?? md?.provider ? { provider: input.provider ?? md?.provider } : {}),
+    ...((input.provider ?? md?.provider) ? { provider: input.provider ?? md?.provider } : {}),
     ...(md?.workerId ? { worker: md.workerId } : {}),
     ...(md?.gatewayId ? { gateway: md.gatewayId } : {}),
     canFallback: false,
@@ -443,7 +451,10 @@ export function classifyInferenceFailure(input: ClassifyInferenceFailureInput): 
   if (md?.inferweaveProtocol) {
     const headerReason = md.inferweave["x-inferweave-reason"] ?? md.inferweave["x-inferweave-failure"];
     if (headerReason) {
-      const fromHeader = classifyFromInferweave({ ...input, metadata: { ...md, errorBody: { reason: headerReason } } }, headerReason);
+      const fromHeader = classifyFromInferweave(
+        { ...input, metadata: { ...md, errorBody: { reason: headerReason } } },
+        headerReason,
+      );
       if (fromHeader) {
         fromHeader.source = "inferweave_header";
         fromHeader.reason = headerReason;
@@ -475,7 +486,8 @@ export function classifyInferenceFailure(input: ClassifyInferenceFailureInput): 
       // A 503 may be model-scoped; the body reason (checked above) decides.
       return finish(input, "gateway_unavailable", { source: "http_status", reason: `HTTP ${status}` });
     }
-    if (status === 529) return finish(input, "rate_limited", { source: "http_status", reason: "HTTP 529 (overloaded)" });
+    if (status === 529)
+      return finish(input, "rate_limited", { source: "http_status", reason: "HTTP 529 (overloaded)" });
     if (status >= 500) return finish(input, "gateway_unavailable", { source: "http_status", reason: `HTTP ${status}` });
   }
 
@@ -484,7 +496,9 @@ export function classifyInferenceFailure(input: ClassifyInferenceFailureInput): 
   if (stream && !stream.finished) {
     return finish(input, "incomplete_stream", {
       source: "stream_state",
-      reason: stream.outputCommitted ? "stream ended without finish_reason after output" : "stream ended without finish_reason",
+      reason: stream.outputCommitted
+        ? "stream ended without finish_reason after output"
+        : "stream ended without finish_reason",
     });
   }
 
@@ -501,13 +515,19 @@ export function classifyInferenceFailure(input: ClassifyInferenceFailureInput): 
         return finish(input, "incomplete_stream", { source: "string_fallback", reason: "stream termination phrasing" });
       }
     }
-    if (AUTH_STRING_PATTERNS.test(text)) return finish(input, "authentication", { source: "string_fallback", reason: "auth phrasing" });
-    if (STALE_ROUTE_STRING_PATTERNS.test(text)) return finish(input, "routing_stale", { source: "string_fallback", reason: "stale-route phrasing" });
-    if (MODEL_NOT_FOUND_STRING_PATTERNS.test(text)) return finish(input, "model_not_found", { source: "string_fallback", reason: "unknown-model phrasing" });
-    if (NO_WORKER_STRING_PATTERNS.test(text)) return finish(input, "no_workers", { source: "string_fallback", reason: "no-workers phrasing" });
-    if (ACTIVATING_STRING_PATTERNS.test(text)) return finish(input, "model_activating", { source: "string_fallback", reason: "activation phrasing" });
+    if (AUTH_STRING_PATTERNS.test(text))
+      return finish(input, "authentication", { source: "string_fallback", reason: "auth phrasing" });
+    if (STALE_ROUTE_STRING_PATTERNS.test(text))
+      return finish(input, "routing_stale", { source: "string_fallback", reason: "stale-route phrasing" });
+    if (MODEL_NOT_FOUND_STRING_PATTERNS.test(text))
+      return finish(input, "model_not_found", { source: "string_fallback", reason: "unknown-model phrasing" });
+    if (NO_WORKER_STRING_PATTERNS.test(text))
+      return finish(input, "no_workers", { source: "string_fallback", reason: "no-workers phrasing" });
+    if (ACTIVATING_STRING_PATTERNS.test(text))
+      return finish(input, "model_activating", { source: "string_fallback", reason: "activation phrasing" });
     if (CONTEXT_STRING_PATTERNS.test(text)) {
-      if (/\b413\b|too large/i.test(text)) return finish(input, "request_too_large", { source: "string_fallback", reason: "body-size phrasing" });
+      if (/\b413\b|too large/i.test(text))
+        return finish(input, "request_too_large", { source: "string_fallback", reason: "body-size phrasing" });
       return finish(input, "context_overflow", { source: "string_fallback", reason: "context phrasing" });
     }
     if (NETWORK_CODES.has(text.trim().toUpperCase()) || /\bfetch failed\b/i.test(text)) {

@@ -26,6 +26,8 @@ import { DEFAULT_ROLLOUT_PHASE, resolveRollout } from "../aps/rollout.ts";
 import { AGENT_LOOP_PREVENTED_EVENT, type AgentProgressSupervisorOptions } from "../aps/supervisor.ts";
 import { type AgentLoopPreventedEvent, DEFAULT_LOOP_PREVENTION } from "../aps/types.ts";
 import { WorkerActivityAdapter } from "../aps/workerActivity.ts";
+import type { ModelCapabilityRegistry } from "../capability/registry.ts";
+import type { RoleRouter } from "../capability/router.ts";
 import { normalizeAgentDir } from "../core/piAgentDir.ts";
 import type { WorkerResult, WorkerRole, WorkerUsage } from "../core/types.ts";
 import type { AdmissionController } from "../gateway/AdmissionController.ts";
@@ -54,12 +56,6 @@ import {
 } from "../guard/RecoveryController.ts";
 import { type GenerationGuardConfig, resolveGuardConfig } from "../guard/config.ts";
 import { guardFeedFor } from "../guard/streamText.ts";
-import type { ModelCapabilityRegistry } from "../capability/registry.ts";
-import type { RoleRouter } from "../capability/router.ts";
-import { currentInferenceInvocation, runWithInferenceInvocation } from "../inference/inferenceContext.ts";
-import type { ResilientStreamScheduler } from "../inference/resilientStream.ts";
-import { wireResilientModelRuntime } from "../inference/resilientInstall.ts";
-import { ExecutedActionTracker } from "../inference/recovery.ts";
 import {
   type BackoffConfig,
   TransientError,
@@ -72,6 +68,10 @@ import {
   resolveTransientRetryConfig,
   withTransientRetry,
 } from "../guard/transient.ts";
+import { currentInferenceInvocation, runWithInferenceInvocation } from "../inference/inferenceContext.ts";
+import { ExecutedActionTracker } from "../inference/recovery.ts";
+import { wireResilientModelRuntime } from "../inference/resilientInstall.ts";
+import type { ResilientStreamScheduler } from "../inference/resilientStream.ts";
 import { reviewResultTool } from "../lifecycle/reviewResultTool.ts";
 import { type RequestBodyBudgetConfig, resolveRequestBodyBudgetConfig } from "../request/bodyBudget.ts";
 import { type ThinkingOffConfig, resolveThinkingOffConfig } from "../request/thinkingPolicy.ts";
@@ -286,16 +286,11 @@ export class PiWorkerExecutor implements WorkerExecutor {
 
   /** The idempotency tracker of the run this session belongs to (spec §6). */
   private trackerFor(req: WorkerRequest): ExecutedActionTracker | undefined {
-    return (
-      currentInferenceInvocation()?.actions ?? this.runActions.get(req.sessionId ?? req.role)
-    );
+    return currentInferenceInvocation()?.actions ?? this.runActions.get(req.sessionId ?? req.role);
   }
 
   /** Record an executed tool call; a retry of this request must not repeat it. */
-  private trackAction(
-    req: WorkerRequest,
-    action: { id: string; kind: string; summary: string },
-  ): void {
+  private trackAction(req: WorkerRequest, action: { id: string; kind: string; summary: string }): void {
     this.trackerFor(req)?.record(action);
   }
 

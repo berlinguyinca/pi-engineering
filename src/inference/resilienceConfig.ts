@@ -81,7 +81,9 @@ type Env = Record<string, string | undefined>;
 
 function bool(value: string | undefined, fallback: boolean): boolean {
   if (value === undefined || value.trim() === "") return fallback;
-  return value.trim().toLowerCase() !== "false" && value.trim().toLowerCase() !== "0" && value.trim().toLowerCase() !== "off";
+  return (
+    value.trim().toLowerCase() !== "false" && value.trim().toLowerCase() !== "0" && value.trim().toLowerCase() !== "off"
+  );
 }
 
 /**

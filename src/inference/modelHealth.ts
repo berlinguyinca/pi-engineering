@@ -58,7 +58,7 @@ export class ModelHealthRegistry {
 
   constructor(opts: ModelHealthRegistryOptions = {}) {
     this.now = opts.now ?? (() => Date.now());
-    this.defaultTtlMs = (opts.config?.unavailabilityPenaltyMs ?? DEFAULT_INFERENCE_RESILIENCE.unavailabilityPenaltyMs);
+    this.defaultTtlMs = opts.config?.unavailabilityPenaltyMs ?? DEFAULT_INFERENCE_RESILIENCE.unavailabilityPenaltyMs;
   }
 
   bindCapabilityRegistry(reg: ModelCapabilityRegistry): void {

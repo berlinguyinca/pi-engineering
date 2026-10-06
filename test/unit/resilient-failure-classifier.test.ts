@@ -203,7 +203,11 @@ describe("HTTP status classification", () => {
   });
 
   it("classifies 429 queue_timeout as queue_saturated and honours Retry-After", () => {
-    const md = metadataFromResponse({ status: 429, headers: { "retry-after": "120" }, body: { reason: "queue_timeout" } });
+    const md = metadataFromResponse({
+      status: 429,
+      headers: { "retry-after": "120" },
+      body: { reason: "queue_timeout" },
+    });
     const f = classifyInferenceFailure({ error: Object.assign(new Error("429"), { status: 429 }), metadata: md });
     assert.equal(f.class, "queue_saturated");
     assert.equal(f.action, "honor_retry_after");
@@ -212,9 +216,18 @@ describe("HTTP status classification", () => {
   });
 
   it("classifies 401 as authentication, 400 as invalid_request, 413 as request_too_large", () => {
-    assert.equal(classifyInferenceFailure({ error: Object.assign(new Error("401"), { status: 401 }) }).class, "authentication");
-    assert.equal(classifyInferenceFailure({ error: Object.assign(new Error("400"), { status: 400 }) }).class, "invalid_request");
-    assert.equal(classifyInferenceFailure({ error: Object.assign(new Error("413"), { status: 413 }) }).class, "request_too_large");
+    assert.equal(
+      classifyInferenceFailure({ error: Object.assign(new Error("401"), { status: 401 }) }).class,
+      "authentication",
+    );
+    assert.equal(
+      classifyInferenceFailure({ error: Object.assign(new Error("400"), { status: 400 }) }).class,
+      "invalid_request",
+    );
+    assert.equal(
+      classifyInferenceFailure({ error: Object.assign(new Error("413"), { status: 413 }) }).class,
+      "request_too_large",
+    );
   });
 
   it("classifies bare 5xx as gateway_unavailable (wait the gateway, same model)", () => {
@@ -254,7 +267,13 @@ describe("model- vs gateway-scoped behaviour (spec §10)", () => {
   }
 
   it("treats connection refused / DNS failure as gateway scope", () => {
-    assert.equal(classifyInferenceFailure({ error: netError("ECONNREFUSED", "connect ECONNREFUSED") }).providerScoped, true);
-    assert.equal(classifyInferenceFailure({ error: netError("ENOTFOUND", "getaddrinfo ENOTFOUND gw.example") }).providerScoped, true);
+    assert.equal(
+      classifyInferenceFailure({ error: netError("ECONNREFUSED", "connect ECONNREFUSED") }).providerScoped,
+      true,
+    );
+    assert.equal(
+      classifyInferenceFailure({ error: netError("ENOTFOUND", "getaddrinfo ENOTFOUND gw.example") }).providerScoped,
+      true,
+    );
   });
 });

@@ -114,8 +114,7 @@ export function scoreFallbackCandidates(
   ctx: FallbackScoringContext = {},
 ): RankedFallback[] {
   const originalFamily = ctx.original ? detectFamily(ctx.original.id) : undefined;
-  const originalTier =
-    ctx.original && "capabilities" in ctx.original ? qualityClassOf(ctx.original) : undefined;
+  const originalTier = ctx.original && "capabilities" in ctx.original ? qualityClassOf(ctx.original) : undefined;
   const ranked = candidates
     .filter((rec) => envelopeSatisfied(rec, envelope))
     .map((rec) => {
@@ -129,7 +128,12 @@ export function scoreFallbackCandidates(
       // 2. Context capacity: headroom over the requirement.
       const minContext = envelope.minimumContextTokens ?? 0;
       const window = rec.contextWindow ?? 0;
-      parts.context = minContext > 0 && window > minContext ? Math.min(1, 0.5 + Math.log10(1 + window / minContext) / 2) : window > 0 ? 0.7 : 0.4;
+      parts.context =
+        minContext > 0 && window > minContext
+          ? Math.min(1, 0.5 + Math.log10(1 + window / minContext) / 2)
+          : window > 0
+            ? 0.7
+            : 0.4;
       // 3. Current availability.
       parts.availability = rec.available ? 1 : 0;
       // 4. Model health.
@@ -139,13 +143,20 @@ export function scoreFallbackCandidates(
       parts.family = originalFamily !== undefined && family === originalFamily ? 1 : 0.5;
       // 6. Same capability/quality tier.
       const tier = qualityClassOf(rec);
-      parts.tier = originalTier !== undefined && tier === originalTier ? 1 : QUALITY_ORDER[tier] ?? 0.5;
+      parts.tier = originalTier !== undefined && tier === originalTier ? 1 : (QUALITY_ORDER[tier] ?? 0.5);
       // 7. Observed role performance (neutral without samples).
       const observed = rec.observed;
       parts.observed = observed && observed.samples >= 3 ? Math.min(1, Math.max(0, observed.meanQuality)) : 0.5;
       // 8. Latency (observed, else local/price proxy).
       const lat = observed?.meanLatencyMs;
-      parts.latency = typeof lat === "number" ? Math.max(0, Math.min(1, 1 - lat / 120_000)) : rec.local ? 1 : (rec.priceOutputUsdPerMTok ?? 10) >= 30 ? 0.5 : 0.8;
+      parts.latency =
+        typeof lat === "number"
+          ? Math.max(0, Math.min(1, 1 - lat / 120_000))
+          : rec.local
+            ? 1
+            : (rec.priceOutputUsdPerMTok ?? 10) >= 30
+              ? 0.5
+              : 0.8;
       // 9. Cost.
       const cost = (rec.priceInputUsdPerMTok ?? 0) + (rec.priceOutputUsdPerMTok ?? 0);
       parts.cost = cost <= 0 ? 1 : Math.max(0, Math.min(1, 1 - Math.log10(1 + cost) / 2.5));

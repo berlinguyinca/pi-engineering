@@ -35,13 +35,13 @@ import { ROLE_NAMES, type RoleName } from "../capability/roles.ts";
 import type { RoleRouter } from "../capability/router.ts";
 import type { ModelRef } from "../lifecycle/types.ts";
 import { modelKey } from "../lifecycle/types.ts";
-import { CircuitBreakerRegistry } from "./circuitBreaker.ts";
 import type { AdmissionHeaders } from "./admissionContract.ts";
+import { CircuitBreakerRegistry } from "./circuitBreaker.ts";
 import {
+  type RequiredModelEnvelope,
   envelopeCapabilities,
   envelopeSatisfied,
   scoreFallbackCandidates,
-  type RequiredModelEnvelope,
 } from "./envelope.ts";
 import type { ClassifiedInferenceFailure, StreamTerminationState } from "./failureClassifier.ts";
 import { classifyInferenceFailure } from "./failureClassifier.ts";
@@ -56,7 +56,7 @@ import {
   type LadderTransport,
   RecoveryLadder,
 } from "./recovery.ts";
-import { resolveInferenceResilienceConfig, type InferenceResilienceConfig } from "./resilienceConfig.ts";
+import { type InferenceResilienceConfig, resolveInferenceResilienceConfig } from "./resilienceConfig.ts";
 import { InferenceTelemetry } from "./telemetry.ts";
 
 /** One raw model invocation at the transport seam (provider-agnostic). */
@@ -211,7 +211,8 @@ export class ResilientInference {
     this.telemetry = opts.telemetry ?? new InferenceTelemetry({ now: this.now });
     this.actions = opts.actions ?? new ExecutedActionTracker({ now: this.now });
     this.health =
-      opts.health ?? new ModelHealthRegistry({ now: this.now, config: { unavailabilityPenaltyMs: cfg.unavailabilityPenaltyMs } });
+      opts.health ??
+      new ModelHealthRegistry({ now: this.now, config: { unavailabilityPenaltyMs: cfg.unavailabilityPenaltyMs } });
     this.breakers =
       opts.breakers ??
       new CircuitBreakerRegistry({
@@ -377,10 +378,7 @@ export class ResilientInference {
     const registry = this.registry;
     if (!registry) return undefined;
     const envelope: RequiredModelEnvelope = query.envelope ?? { role: query.role, requiredCapabilities: [] };
-    const excluded = new Set([
-      ...query.exclude.map((m) => modelKey(m)),
-      ...(envelope.excludedModels ?? []),
-    ]);
+    const excluded = new Set([...query.exclude.map((m) => modelKey(m)), ...(envelope.excludedModels ?? [])]);
 
     // 1) The existing RoleRouter (hard filters + scoring + separation of
     //    duties). Its pool already excludes penalized/unavailable models via
@@ -407,12 +405,10 @@ export class ResilientInference {
 
     // 2) Direct capability scoring over the registry (unknown roles / no
     //    router): hard gate first, spec precedence after.
-    const pool = registry
-      .all()
-      .filter((rec) => {
-        const key = modelKey({ provider: rec.provider, id: rec.id });
-        return rec.enabled && rec.healthy && rec.available && !excluded.has(key);
-      });
+    const pool = registry.all().filter((rec) => {
+      const key = modelKey({ provider: rec.provider, id: rec.id });
+      return rec.enabled && rec.healthy && rec.available && !excluded.has(key);
+    });
     const ranked = scoreFallbackCandidates(pool, envelope, { now: this.now() });
     const best = ranked[0];
     return best ? { provider: best.record.provider, id: best.record.id } : undefined;
