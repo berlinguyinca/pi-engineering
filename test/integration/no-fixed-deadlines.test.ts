@@ -255,8 +255,8 @@ describe("no fixed mission deadlines: the scheduler", () => {
       agent: {
         runAgent: ({ signal, onActivity }) => {
           calls++;
-          // First run hangs; the resumed run makes steady progress.
-          return calls === 1
+          // Three runs hang; the third resume makes steady progress.
+          return calls <= 3
             ? childWorker({ everyMs: 0, forMs: 30_000, signal })
             : childWorker({ everyMs: 30, forMs: 1_200, signal, onActivity });
         },
@@ -271,12 +271,12 @@ describe("no fixed mission deadlines: the scheduler", () => {
     });
     const scheduler = new MissionScheduler({ store, broker });
     await scheduler.runMission(mission.mission_id);
-    assert.equal(calls, 2);
+    assert.equal(calls, 4, "every one of the three resumes is honoured");
     assert.equal(store.getTask(task.task_id)?.status, "SUCCEEDED");
     const executions = store.listExecutions(mission.mission_id);
     assert.deepEqual(
       executions.map((execution) => execution.exit_status),
-      [INACTIVITY_MARKER, "succeeded"],
+      [INACTIVITY_MARKER, INACTIVITY_MARKER, INACTIVITY_MARKER, "succeeded"],
     );
   });
 });

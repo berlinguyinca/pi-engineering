@@ -1297,10 +1297,11 @@ export class Orchestrator {
     // hours for gateway capacity (or between tasks) is alive, and an expired
     // lease used to fence its own next dispatch. A dead process stops renewing,
     // so crash recovery still sees the lease expire.
+    let leaseRenewal: Promise<void> = Promise.resolve();
     const leaseKeepAlive = this.ownership
       ? setInterval(() => {
           if (!this.ownershipByMission.has(mission.mission_id)) return;
-          void this.renewMissionOwnership(mission.mission_id).catch(() => undefined);
+          leaseRenewal = leaseRenewal.then(() => this.renewMissionOwnership(mission.mission_id)).catch(() => undefined);
         }, this.ownership.renewalIntervalMs)
       : undefined;
     leaseKeepAlive?.unref?.();
@@ -1767,6 +1768,9 @@ export class Orchestrator {
       return { ...finalized, intent };
     } finally {
       if (leaseKeepAlive) clearInterval(leaseKeepAlive);
+      // Never release under an in-flight renewal: it would write the stale
+      // lease back after the release.
+      await leaseRenewal;
       this.progress.delete(mission.mission_id);
       const identity = this.ownershipByMission.get(mission.mission_id);
       if (identity && this.ownership) {

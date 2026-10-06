@@ -31,18 +31,33 @@ export function runWithInactivityGuard(
     let stderr = "";
     let hung = false;
     let settled = false;
-    const child = spawn(command, args, { cwd: opts.cwd, env: opts.env, stdio: ["ignore", "pipe", "pipe"] });
+    // Own process group, so a kill reaches grandchildren (npm -> node) that
+    // would otherwise hold the output pipes open forever.
+    const child = spawn(command, args, {
+      cwd: opts.cwd,
+      env: opts.env,
+      stdio: ["ignore", "pipe", "pipe"],
+      detached: process.platform !== "win32",
+    });
+    const killTree = (): void => {
+      try {
+        if (child.pid && process.platform !== "win32") process.kill(-child.pid, "SIGKILL");
+        else child.kill("SIGKILL");
+      } catch {
+        child.kill("SIGKILL");
+      }
+    };
     let timer: ReturnType<typeof setTimeout> | undefined;
     const arm = (): void => {
       if (timer) clearTimeout(timer);
       timer = setTimeout(() => {
         hung = true;
         stderr += `\n[pi-engineering] killed: no output for ${opts.inactivityMs}ms (hung command)\n`;
-        child.kill("SIGKILL");
+        killTree();
       }, opts.inactivityMs);
     };
     const onAbort = (): void => {
-      child.kill("SIGKILL");
+      killTree();
     };
     opts.signal?.addEventListener("abort", onAbort, { once: true });
     const append = (current: string, chunk: Buffer): string =>

@@ -410,4 +410,28 @@ describe("verification commands have an inactivity hang guard, not a duration li
       await rm(dir, { recursive: true, force: true });
     }
   });
+
+  it("kills the whole process tree of a hung command, so a grandchild cannot keep it open", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pi-eng-ver-"));
+    const tree =
+      "require('node:child_process').spawn(process.execPath,['-e','setTimeout(()=>{},30000)'],{stdio:'inherit'});setTimeout(()=>{},30000)";
+    try {
+      const store = await ArtifactStore.create(join(dir, "artifacts"));
+      const outcome = await Promise.race([
+        new CommandVerifier().run(
+          dir,
+          {
+            name: "hung-tree",
+            stages: [{ name: "test", command: process.execPath, args: ["-e", tree], required: true, timeoutMs: 400 }],
+          },
+          store,
+        ),
+        new Promise<"stuck">((resolve) => setTimeout(() => resolve("stuck"), 10_000).unref()),
+      ]);
+      assert.notEqual(outcome, "stuck", "the hang guard itself must not hang");
+      if (outcome !== "stuck") assert.equal(outcome.passed, false);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
 });

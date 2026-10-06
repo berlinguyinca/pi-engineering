@@ -139,7 +139,8 @@ export function sanitizeWorkerActivity(value: unknown): WorkerActivity | null {
     const summary =
       input.summary === "Model response received" ||
       input.summary === STREAMING_SUMMARY ||
-      input.summary === WAITING_FOR_INFERENCE_SUMMARY
+      input.summary === WAITING_FOR_INFERENCE_SUMMARY ||
+      input.summary === TOOL_PROGRESS_SUMMARY
         ? input.summary
         : "Worker session started";
     return {
@@ -205,6 +206,12 @@ const STREAMING_SUMMARY = "Model streaming";
 export const WAITING_FOR_INFERENCE_SUMMARY = "Waiting for inference capacity";
 
 /**
+ * A running tool (a long test suite, a build) that keeps producing output. It
+ * is liveness: only a tool silent for the whole inactivity window looks hung.
+ */
+export const TOOL_PROGRESS_SUMMARY = "Tool still producing output";
+
+/**
  * Streamed tokens are activity: a worker writing a long answer is not idle,
  * and its heartbeat's "last activity" must not read as minutes of silence.
  * Token events arrive per delta, so they are reduced to one bounded state
@@ -212,6 +219,7 @@ export const WAITING_FOR_INFERENCE_SUMMARY = "Waiting for inference capacity";
  */
 export class StreamingActivityThrottle {
   private lastAt = Number.NEGATIVE_INFINITY;
+  private lastToolAt = Number.NEGATIVE_INFINITY;
   private readonly intervalMs: number;
 
   constructor(intervalMs = 30_000) {
@@ -219,6 +227,11 @@ export class StreamingActivityThrottle {
   }
 
   note(event: { type?: string; message?: unknown }, nowMs: number = Date.now()): WorkerActivity | null {
+    if (event.type === "tool_execution_update") {
+      if (nowMs - this.lastToolAt < this.intervalMs) return null;
+      this.lastToolAt = nowMs;
+      return { kind: "state", summary: TOOL_PROGRESS_SUMMARY, meaningfulProgress: false };
+    }
     if (event.type !== "message_update") return null;
     if ((event.message as { role?: unknown } | undefined)?.role !== "assistant") return null;
     if (nowMs - this.lastAt < this.intervalMs) return null;

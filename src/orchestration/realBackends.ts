@@ -440,6 +440,7 @@ export function realBackends(opts: RealBackendsOptions) {
           context: input.contextRef,
           tools: ["ledger_read", "repo_search", "symbol", "tests_for"],
           cwd: bound.cwd,
+          unboundedInferenceWait: true,
         };
         const { run, model } = await runWithModelTakeover(req, input, await routedPlan(req.role, {}, "WKS"));
         return withModel(outcomeOf(run), model);

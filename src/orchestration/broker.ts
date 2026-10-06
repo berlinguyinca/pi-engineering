@@ -1010,6 +1010,11 @@ export class ExecutionBroker {
     if (!entry) return false;
     entry.abort.abort();
     await this.terminalizeAfterGrace(executionId, "canceled", taskId ?? entry.taskId);
+    // A cancel that lands while a hung (inactive) execution is settling joins
+    // that settlement, which leaves the task RUNNING for a resume. The caller
+    // asked for cancellation, so the task must not be resumed.
+    const cancelledTask = taskId ?? entry.taskId;
+    if (this.store.getTask(cancelledTask)?.status === "RUNNING") this.store.transitionTask(cancelledTask, "CANCELED");
     return true;
   }
 

@@ -568,7 +568,9 @@ export class MissionScheduler {
               taskId: task.task_id,
               executionId: handle.executionId,
               summary: outcome.summary ?? "worker showed no activity for the inactivity window",
-              evidenceRefs: outcome.artifactRefs,
+              // Each hung execution is distinct evidence, so the per-fingerprint
+              // strategy budget does not cut the resume count short.
+              evidenceRefs: [...outcome.artifactRefs, `execution:${handle.executionId}`],
               category: "ORPHANED_EXECUTION",
               observedAt: new Date(this.clockNow()).toISOString(),
             });
