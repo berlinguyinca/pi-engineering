@@ -17,7 +17,7 @@
  */
 import { appendFileSync, mkdirSync, readdirSync } from "node:fs";
 import { appendFile } from "node:fs/promises";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import type { EventStoreBackend, StoredEvent } from "../../platform/eventstore/backend.ts";
 import { readJsonlFrom, repairTornTail } from "./jsonlFiles.ts";
 import { emitRuntimeEvent } from "./runtimeEvents.ts";
@@ -121,8 +121,10 @@ export class SessionEventStore implements EventStoreBackend {
   readonly ownFile: string;
   private readonly recoveryDir: string;
   private readonly writerAuthority: () => boolean;
-  private readonly events: StoredEvent[] = [];
+  private events: StoredEvent[] = [];
   private readonly byId = new Map<string, StoredEvent>();
+  /** Every stream's records in file order, keyed by file: the input of the merged order. */
+  private readonly streams = new Map<string, StoredEvent[]>();
   private readonly cursors = new Map<string, FileCursor>();
   private appendChain: Promise<void> = Promise.resolve();
   private sequence = 0;
@@ -200,6 +202,7 @@ export class SessionEventStore implements EventStoreBackend {
       if (result.tornTailBytes > 0) this.diagnosticsState.tornTailsSkipped++;
       if (file === this.ownFile) this.sequence = Math.max(result.lastSequence, result.events.length);
       streams.push(result.events);
+      this.streams.set(file, [...result.events]);
     }
     this.diagnosticsState.files = this.cursors.size;
     if (this.diagnosticsState.corruptLines > 0) {
@@ -211,6 +214,17 @@ export class SessionEventStore implements EventStoreBackend {
       });
     }
     for (const event of mergeStreams(streams)) this.admit(event);
+  }
+
+  /** Record an append of this session's own stream (mirrors the file). */
+  private admitOwn(event: StoredEvent): void {
+    let own = this.streams.get(this.ownFile);
+    if (!own) {
+      own = [];
+      this.streams.set(this.ownFile, own);
+    }
+    own.push(event);
+    this.admit(event);
   }
 
   private admit(event: StoredEvent): boolean {
@@ -234,9 +248,30 @@ export class SessionEventStore implements EventStoreBackend {
       const result = readJsonlFrom(file, cursor.offset);
       cursor.offset = result.consumedBytes;
       this.cursors.set(file, cursor);
+      if (result.events.length === 0) continue;
       fresh.push(result.events);
+      const stream = this.streams.get(file);
+      if (stream) stream.push(...result.events);
+      else this.streams.set(file, [...result.events]);
     }
-    return mergeStreams(fresh).filter((event) => this.admit(event));
+    const admitted = mergeStreams(fresh).filter((event) => this.admit(event));
+    // all() keeps the order load() would produce: the k-way timestamp merge of
+    // every stream, not "own events first, then whatever arrived later".
+    if (admitted.length > 0) this.reorder();
+    return admitted;
+  }
+
+  /** Rebuild the merged order from every stream, exactly as load() does. */
+  private reorder(): void {
+    const files = [...this.streams.keys()].sort((a, b) => streamOrder(basename(a), basename(b)));
+    const seen = new Set<string>();
+    const ordered: StoredEvent[] = [];
+    for (const event of mergeStreams(files.map((file) => this.streams.get(file) as StoredEvent[]))) {
+      if (seen.has(event.event_id)) continue;
+      seen.add(event.event_id);
+      ordered.push(this.byId.get(event.event_id) ?? event);
+    }
+    this.events = ordered;
   }
 
   private envelope(event: StoredEvent): string {
@@ -260,7 +295,7 @@ export class SessionEventStore implements EventStoreBackend {
     const op = this.appendChain.then(async () => {
       this.assertAuthority();
       await appendFile(this.ownFile, line, "utf8");
-      this.admit(event);
+      this.admitOwn(event);
     });
     this.appendChain = op.catch(() => undefined);
     await op;
@@ -278,7 +313,7 @@ export class SessionEventStore implements EventStoreBackend {
       this.assertAuthority();
       // Condition, commit, and materialization share one non-yielding section.
       appendFileSync(this.ownFile, this.envelope(event), "utf8");
-      this.admit(event);
+      this.admitOwn(event);
       onCommit?.();
       return event;
     });
@@ -296,7 +331,7 @@ export class SessionEventStore implements EventStoreBackend {
     const op = this.appendChain.then(async () => {
       this.assertAuthority();
       await appendFile(this.ownFile, body, "utf8");
-      for (const event of events) this.admit(event);
+      for (const event of events) this.admitOwn(event);
     });
     this.appendChain = op.catch(() => undefined);
     await op;
