@@ -10,7 +10,7 @@
 
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
-import { readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { after, test } from "node:test";
 import { promisify } from "node:util";
@@ -172,12 +172,14 @@ test("a lock held by this very process is refused, and released locks can be ret
   await again.release();
 });
 
-test("a corrupt lock file is reclaimed", async () => {
+test("a corrupt lock file is reclaimed once it is no longer fresh", async () => {
   const fixture = await makeFixtureRepo();
   cleanups.push(fixture.cleanup);
   const dir = join(fixture.root, ".pi-eng", "planner-worker", "PW-corrupt");
   const first = await acquireMissionLock(dir);
   await writeFile(join(dir, "mission.lock"), "{not json");
+  const old = new Date(Date.now() - 60_000);
+  await utimes(join(dir, "mission.lock"), old, old);
   const lock = await acquireMissionLock(dir);
   await lock.release();
   await first.release(); // not its lock any more: a no-op
@@ -195,7 +197,11 @@ async function deadOwner(stateDir: string): Promise<string> {
  * reports `won` (then checks after a pause that the lock is still its own)
  * or `refused`.
  */
-function resumer(stateDir: string, go: string): { done: Promise<string>; ready: Promise<void> } {
+function resumer(
+  stateDir: string,
+  go: string,
+  mode: "link" | "no-link-slow-writer" = "link",
+): { done: Promise<string>; ready: Promise<void> } {
   const child = spawn(
     process.execPath,
     [
@@ -203,20 +209,27 @@ function resumer(stateDir: string, go: string): { done: Promise<string>; ready: 
       "-e",
       `import { existsSync, readFileSync } from "node:fs";
 const { acquireMissionLock } = await import(${JSON.stringify(join(SRC, "missionLock.ts"))});
-const [dir, go] = process.argv.slice(1);
+const [dir, go, mode] = process.argv.slice(1);
+// A filesystem without hard links, and a writer slow to fill the file it created.
+const hooks = mode === "link" ? {} : {
+  linkFile: async () => { throw Object.assign(new Error("hard links not supported"), { code: "EPERM" }); },
+  // Slow to fill the lock itself; takeover claims are written promptly.
+  beforeRecordWrite: (path) => path.endsWith("/mission.lock") ? new Promise((r) => setTimeout(r, 1200)) : Promise.resolve(),
+};
 console.log("ready");
 while (!existsSync(go)) await new Promise((r) => setTimeout(r, 2));
 try {
-  await acquireMissionLock(dir);
+  await acquireMissionLock(dir, hooks);
 } catch (err) {
   console.log(err.name === "MissionLockedError" ? "refused" : "error " + err.message);
   process.exit(0);
 }
-await new Promise((r) => setTimeout(r, 1500));
+await new Promise((r) => setTimeout(r, mode === "link" ? 1500 : 3000));
 const lock = JSON.parse(readFileSync(dir + "/mission.lock", "utf8"));
 console.log(lock.pid === process.pid ? "won intact" : "won stolen");`,
       stateDir,
       go,
+      mode,
     ],
     { stdio: ["ignore", "pipe", "inherit"] },
   );
@@ -268,5 +281,42 @@ test("a takeover abandoned by a crashed claimant does not wedge the mission", as
   await writeFile(join(dir, `mission.lock.takeover-${stale.token}`), deadClaimant);
   const lock = await acquireMissionLock(dir);
   assert.equal(JSON.parse(await readFile(join(dir, "mission.lock"), "utf8")).pid, process.pid);
+  await lock.release();
+});
+
+for (const start of ["fresh", "dead owner"] as const) {
+  test(`without hard links and with slow writers (${start}): exactly one of several resumers wins`, async () => {
+    const fixture = await makeFixtureRepo();
+    cleanups.push(fixture.cleanup);
+    for (let round = 0; round < 3; round++) {
+      const dir = join(fixture.root, ".pi-eng", "planner-worker", `PW-nolink-${round}`);
+      if (start === "dead owner") await deadOwner(dir);
+      const go = join(dir, "go");
+      await mkdir(dir, { recursive: true });
+      const racers = Array.from({ length: 4 }, () => resumer(dir, go, "no-link-slow-writer"));
+      await Promise.all(racers.map((r) => r.ready));
+      await writeFile(go, "");
+      const outcomes = (await Promise.all(racers.map((r) => r.done))).sort();
+      assert.deepEqual(
+        outcomes,
+        ["refused", "refused", "refused", "won intact"],
+        `round ${round}: ${outcomes.join(", ")}`,
+      );
+    }
+  });
+}
+
+test("a partially written lock is only treated as abandoned once it is no longer fresh", async () => {
+  const fixture = await makeFixtureRepo();
+  cleanups.push(fixture.cleanup);
+  const dir = join(fixture.root, ".pi-eng", "planner-worker", "PW-partial");
+  await mkdir(dir, { recursive: true });
+  const lockPath = join(dir, "mission.lock");
+  await writeFile(lockPath, "");
+  await assert.rejects(acquireMissionLock(dir), MissionLockedError, "a writer may still be filling it");
+  const old = new Date(Date.now() - 60_000);
+  await utimes(lockPath, old, old);
+  const lock = await acquireMissionLock(dir);
+  assert.equal(JSON.parse(await readFile(lockPath, "utf8")).pid, process.pid);
   await lock.release();
 });
