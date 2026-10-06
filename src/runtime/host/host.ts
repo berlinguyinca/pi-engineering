@@ -479,15 +479,14 @@ export class RuntimeHost implements BridgeTarget {
       const health = await this.healthOf(live());
       if (!health.healthy) {
         const failed = health.checks.filter((c) => !c.ok).map((c) => `${c.name}${c.detail ? ` (${c.detail})` : ""}`);
-        this.telemetry.emit("runtime.health.failed", {
-          new_generation: generation,
-          failure_reason: failed.join("; "),
-        });
         throw new Error(`health check failed: ${failed.join("; ")}`);
       }
       this.telemetry.emit("runtime.health.passed", { new_generation: generation });
       return live();
     } catch (error) {
+      // load/start/restore failures are health failures too (§33: "start()
+      // completed", "no initialization exception").
+      this.telemetry.emit("runtime.health.failed", { new_generation: generation, failure_reason: message(error) });
       if (runtime) await runtime.stop().catch(() => {});
       await resources.disposeAll();
       this.retired.add(generation);

@@ -14,10 +14,11 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { InstallLayout } from "../../update/installLayout.ts";
 import { ago, formatHandover, short, waitingText } from "./format.ts";
-import { type HandoverResult, type HandoverTask, RuntimeBusyError, RuntimeHost } from "./host.ts";
+import { type HandoverHooks, type HandoverResult, type HandoverTask, RuntimeBusyError, RuntimeHost } from "./host.ts";
 import { type RuntimeSource, snapshotRuntimeSource } from "./loader.ts";
-import { RuntimeTelemetry } from "./telemetry.ts";
+import { type RuntimeEventFields, RuntimeTelemetry } from "./telemetry.ts";
 
 export const DEFAULT_RUNTIME_ENTRY = "src/runtime/host/runtimeEntry.ts";
 
@@ -82,10 +83,12 @@ export class EngineeringHostExtension {
   readonly generationsDir: string;
   host: RuntimeHost | undefined;
   readonly telemetry: RuntimeTelemetry;
+  readonly layout: InstallLayout;
   private pi: ExtensionAPI | undefined;
 
   constructor(config: HostExtensionConfig) {
     this.config = config;
+    this.layout = new InstallLayout(config.installRoot);
     // Per process: another Pi process sharing the install root must never
     // prune a directory this one is still importing from.
     this.generationsDir = join(config.installRoot, "generations", `${process.pid}-${randomBytes(3).toString("hex")}`);
@@ -101,35 +104,83 @@ export class EngineeringHostExtension {
       handler: (args, ctx) => this.command(args, ctx as Ctx),
     });
     cleanupDeadGenerationDirs(join(this.config.installRoot, "generations"));
-    const start = await this.startupSource();
-    await host.start(start.source, start.fallbacks);
+    const start = await this.startupSources();
+    const result = await host.start(start[0] as RuntimeSource, start.slice(1));
+    await this.repairPointersAfterStart(result.ok ? host.activeGeneration()?.source : undefined);
   }
 
-  /** Where generation 1 comes from. Later phases add installed versions and crash recovery. */
-  protected async startupSource(): Promise<{ source: RuntimeSource; fallbacks: RuntimeSource[] }> {
-    const root = this.config.devSource ?? this.config.packageRoot;
+  /**
+   * Generation 1, in order of preference: a development override, the
+   * installed `current` version, the installed `previous` version, then the
+   * package checkout Pi loaded this Host from. A source that fails to load,
+   * start or pass health falls through to the next (spec §30, §57).
+   */
+  protected async startupSources(): Promise<RuntimeSource[]> {
+    const sources: RuntimeSource[] = [];
+    if (this.config.devSource) sources.push(await this.checkoutSource(this.config.devSource, "dev"));
+    for (const pointer of ["current", "previous"] as const) {
+      const dir = this.layout.readPointer(pointer);
+      if (dir) sources.push(this.installedSource(dir, true));
+    }
+    if (!this.config.devSource) sources.push(await this.checkoutSource(this.config.packageRoot, "package"));
+    return sources;
+  }
+
+  /** A mutable checkout, imported directly; a baseline copy is the rollback image. */
+  protected async checkoutSource(root: string, label: string): Promise<RuntimeSource> {
     const meta = describeSource(root);
     let rollbackRoot: string | undefined;
     if (this.config.baseline !== false) {
       rollbackRoot = await snapshotRuntimeSource(root, this.generationsDir, "baseline").catch(() => undefined);
     }
     return {
-      source: {
-        root,
-        entry: this.config.entry,
-        version: meta.version,
-        commit: meta.commit,
-        label: this.config.devSource ? "dev" : "package",
-        direct: true,
-        ...(rollbackRoot ? { rollbackRoot } : {}),
-      },
-      fallbacks: [],
+      root,
+      entry: this.config.entry,
+      version: meta.version,
+      commit: meta.commit,
+      label,
+      direct: true,
+      ...(rollbackRoot ? { rollbackRoot } : {}),
     };
   }
 
-  /** What `/engineering reload` loads: the same source tree, re-read from disk. */
+  /** An installed version: immutable, so it is its own rollback image. */
+  installedSource(dir: string, direct = false): RuntimeSource {
+    const meta = this.layout.readMeta(dir);
+    const described = describeSource(dir);
+    return {
+      root: dir,
+      entry: this.config.entry,
+      version: meta?.version ?? described.version,
+      commit: meta?.commit ?? described.commit,
+      label: `installed:${meta?.id ?? dir.split("/").pop()}`,
+      direct,
+      ...(direct ? { rollbackRoot: dir } : {}),
+    };
+  }
+
+  /**
+   * If startup fell back from `current` to `previous`, make the pointers say
+   * what is actually running, so the next start does not retry the bad one.
+   */
+  private async repairPointersAfterStart(running: RuntimeSource | undefined): Promise<void> {
+    const current = this.layout.readPointer("current");
+    if (!running || !current || !running.label.startsWith("installed:")) return;
+    if (running.root === current) return;
+    await this.layout.setPointer("current", running.root).catch(() => {});
+    this.telemetry.emit("runtime.rollback.completed", {
+      rollback_version: running.version,
+      failure_reason: `startup could not run ${current}`,
+    });
+  }
+
+  /** What `/engineering reload` loads: the same source tree (or installed pointer), re-read from disk. */
   protected reloadSource(): RuntimeSource {
     const active = this.host?.activeGeneration();
+    if (!this.config.devSource && active?.source.label.startsWith("installed:")) {
+      const current = this.layout.readPointer("current");
+      return this.installedSource(current ?? active.source.root);
+    }
     const root = this.config.devSource ?? active?.source.root ?? this.config.packageRoot;
     const meta = describeSource(root);
     return {
@@ -139,6 +190,46 @@ export class EngineeringHostExtension {
       commit: meta.commit ?? active?.source.commit ?? null,
       label: active?.source.label ?? "package",
     };
+  }
+
+  /**
+   * Hand over to an installed version and make it `current` (spec §31-§35).
+   * The pointer switch happens only after the old generation stopped; any
+   * failure restores both pointers and the previous runtime.
+   */
+  async activateInstalled(
+    dir: string,
+    kind: "update" | "rollback",
+    hooks: HandoverHooks = {},
+    fields: RuntimeEventFields = {},
+  ): Promise<HandoverTask> {
+    const host = this.host as RuntimeHost;
+    const pointers = { current: this.layout.readPointer("current"), previous: this.layout.readPointer("previous") };
+    const activeDir = host.activeGeneration()?.source.root;
+    return host.begin({
+      kind,
+      source: this.installedSource(dir),
+      ...(this.config.safePointTimeoutMs ? { safePointTimeoutMs: this.config.safePointTimeoutMs } : {}),
+      fields,
+      hooks: {
+        ...hooks,
+        beforeLoad: async (snapshot) => {
+          await hooks.beforeLoad?.(snapshot);
+          this.telemetry.emit("runtime.activation.started", { ...fields });
+          await this.layout.activate(dir);
+          // Running from the checkout (no installed current yet): the previous
+          // pointer cannot name it, which is fine; the checkout stays the fallback.
+          if (!pointers.current && activeDir && this.layout.isVersionDir(activeDir)) {
+            await this.layout.setPointer("previous", activeDir);
+          }
+          this.telemetry.emit("runtime.activation.completed", { ...fields });
+        },
+        onRollback: async (reason) => {
+          await this.layout.restorePointers(pointers);
+          await hooks.onRollback?.(reason);
+        },
+      },
+    });
   }
 
   async command(args: string, ctx: Ctx): Promise<void> {
