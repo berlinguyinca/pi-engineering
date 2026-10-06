@@ -2552,7 +2552,19 @@ export class ExecutionBroker {
             repository = await this.repositoryFor(input);
             this.store.assertExecutionAuthoritative(execution.execution_id);
             input.authority?.assertAuthoritative();
-            if (repository) this.missionRepositories.set(input.missionId, repository);
+            if (repository) {
+              this.missionRepositories.set(input.missionId, repository);
+              // ADDITIVE (defect-4): capture the nested standalone repo HEADs
+              // once per mission as the execution-start baseline for
+              // publication detection. Fail-closed: if the provider lacks the
+              // nested API or the scan throws, there is simply no baseline and
+              // no publication records are produced (no false evidence).
+              try {
+                this.nestedBaselineFor(input.missionId, repository.git);
+              } catch {
+                // provider without the nested repo API — no baseline, no records
+              }
+            }
             const repositoryBinding = input.repoId
               ? this.store
                   .getWorkspaceManifest(input.missionId)
