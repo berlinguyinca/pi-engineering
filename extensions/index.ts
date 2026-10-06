@@ -53,6 +53,7 @@ import { type PanelLayout, type PanelLayoutPatch, PanelLayoutStore } from "../sr
 import { Narrator } from "../src/panel/narrator/Narrator.ts";
 import { createSummarize } from "../src/panel/narrator/summarize.ts";
 import { PanelRefreshLoop } from "../src/panel/refreshLoop.ts";
+import { registerPlannerWorker } from "../src/plannerWorker/extension.ts";
 import { redactSecrets } from "../src/platform/redact.ts";
 import { resolveRequestBodyBudgetConfig } from "../src/request/bodyBudget.ts";
 import { resolveThinkingOffConfig } from "../src/request/thinkingPolicy.ts";
@@ -1705,6 +1706,16 @@ ${RECOVERY_PROMPT}`;
   // Normal-language intent auto-invokes the engineering workflow through the
   // Orchestrator. `/mission` is an optional power-user control; correctness
   // never depends on it (the semantic tool + runtime gate enforce policy).
+  // Planner/worker execution mode (docs/specs/planner-worker-hot-model-routing.md):
+  // /engineering-* commands, and the mode `/mission` consults before orchestrating.
+  const plannerWorker = registerPlannerWorker(pi, {
+    host: async (ctx) => {
+      const rt = await getRuntime(ctx);
+      return { repoRoot: rt.git?.root ?? rt.cwd, worker: rt.worker };
+    },
+    sessionGuardActive: inferweave !== null,
+  });
+
   pi.registerCommand("mission", {
     description: "Run an orchestration mission, or resume one with /mission resume <missionId>.",
     handler: async (args, ctx) => {
@@ -1741,6 +1752,7 @@ ${RECOVERY_PROMPT}`;
         }
         return;
       }
+      if (await plannerWorker.runIfSelected(request, ctx)) return;
       const baseRef = (await rt.git?.headCommit().catch(() => "")) ?? "";
       ctx.ui.notify("Routing intent and running orchestration mission...", "info");
       // Stream live mission/task progress to the operator instead of blocking

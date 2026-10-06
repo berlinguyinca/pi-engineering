@@ -37,6 +37,10 @@ const EXPECTED_COMMANDS = [
   "remember",
   "memory",
   "panel",
+  "engineering-mode",
+  "engineering-status",
+  "engineering-plan",
+  "engineering-workers",
 ];
 const EXPECTED_TOOLS = ["ledger_read", "ledger_claim", "artifact_read", "repo_search", "symbol", "tests_for"];
 
