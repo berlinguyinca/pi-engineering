@@ -13,6 +13,7 @@ import { mkdir, realpath, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
 import type { WorkerResult } from "../core/types.ts";
 import type { WorkerExecutor, WorkerRequest, WorkerRun } from "../workers/WorkerExecutor.ts";
+import { AWAITING_MODEL_RESPONSE_SUMMARY } from "../workers/activity.ts";
 import { extractStructured } from "./contract.ts";
 import { type CapabilityRequest, type GatewayConnection, chatCompletion } from "./gateway.ts";
 
@@ -21,6 +22,10 @@ export interface GatewayWorkerOptions extends GatewayConnection {
   defaultModel: string;
   /** Optional capability constraints per worker role (sent as request headers). */
   capabilityFor?: (role: WorkerRequest["role"]) => CapabilityRequest | undefined;
+  /** Activity cadence while a completion is in flight (default 30 s). */
+  keepaliveIntervalMs?: number;
+  /** Stop reporting an in-flight completion as activity after this long (default 12 h). */
+  keepaliveLimitMs?: number;
 }
 
 function isRecord(v: unknown): v is Record<string, unknown> {
@@ -67,6 +72,22 @@ export class GatewayChatWorkerExecutor implements WorkerExecutor {
       user: [req.task, req.context].filter(Boolean).join("\n\n"),
       ...(capability ? { capability } : {}),
       ...(req.signal ? { signal: req.signal } : {}),
+      // Non-streaming: nothing arrives until the whole answer does, so the
+      // open request is the worker's activity for the owner's watchdog.
+      ...(req.onActivity
+        ? {
+            alive: {
+              onAlive: () =>
+                req.onActivity?.({
+                  kind: "state",
+                  summary: AWAITING_MODEL_RESPONSE_SUMMARY,
+                  meaningfulProgress: false,
+                }),
+              ...(this.opts.keepaliveIntervalMs !== undefined ? { intervalMs: this.opts.keepaliveIntervalMs } : {}),
+              ...(this.opts.keepaliveLimitMs !== undefined ? { limitMs: this.opts.keepaliveLimitMs } : {}),
+            },
+          }
+        : {}),
     });
     if (!outcome.ok) {
       const result: WorkerResult = {
