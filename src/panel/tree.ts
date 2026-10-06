@@ -11,6 +11,7 @@
 import { truncateToWidth } from "@earendil-works/pi-tui";
 import type { PanelFileEntry, PanelFinding, PanelSpend, PanelStateShape } from "./PanelState.ts";
 import { PANEL_TABS, type PanelTabId } from "./layout.ts";
+import { runtimeRows } from "./runtimeRows.ts";
 
 export type RowPayload =
   | { kind: "section"; id: string }
@@ -322,7 +323,7 @@ export function buildRows(
     }
   }
 
-  if (tab === "session") rows.push(...sessionRows(state, nowMs));
+  if (tab === "session") rows.push(...sessionRows(state, nowMs), ...runtimeRows(nowMs));
   if (tab === "memory") rows.push(...memoryRows(state));
 
   // Errors render alongside everything else: a broken feeder marks its own
