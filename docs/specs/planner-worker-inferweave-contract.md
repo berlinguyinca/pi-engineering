@@ -1,113 +1,125 @@
 # Planner/Worker ↔ InferWeave client contract
 
-Status: consumed by pi-engineering `src/plannerWorker/gateway.ts` and `roles.ts`.
-Parent spec: `planner-worker-hot-model-routing.md` (§9, §10, §15, §16, Phase 3).
+Status: consumed by pi-engineering `src/plannerWorker/gateway.ts`, `roles.ts`
+and `executor.ts`. Parent spec: `planner-worker-hot-model-routing.md` (§9, §10,
+§15, §16, §23, Phase 3). The server half is InferWeave
+`docs/specs/logical-routes.md` (branch `feat/logical-routes-hot-swap`); this
+document records how pi-engineering consumes it. Where the two differ,
+InferWeave's document is authoritative.
 
-pi-engineering requests **capabilities and logical routes**; InferWeave decides
+pi-engineering asks for **routes and capabilities**. InferWeave decides
 which runtime serves them. Every field below is optional. A plain
-OpenAI-compatible gateway that sends none of it still works, because
-pi-engineering then falls back to its static `routing.roles` pins.
+OpenAI-compatible gateway, or an older InferWeave, still works: it simply
+lacks the extensions, and pi-engineering falls back to its static
+`routing.roles` pins.
 
-## 1. Logical routes (aliases) on `GET /v1/models`
+## 1. Naming inference by need (`model` field)
 
-A logical route is listed as an ordinary model row, so every OpenAI client,
-including Pi's provider model list, can address it by `id`:
+| `model` | Use |
+|---|---|
+| A concrete model id | Unchanged behaviour. No route headers come back. |
+| A logical route, e.g. `coding-implementation` | The preferred form. A role's default route name is its capability with `.` replaced by `-`. Override it with `planner_worker.roles.<role>.alias`. |
+| `cap:coding.implementation?minimum_context=128000&family=qwen-27b` | Sent only when the catalogue advertises capabilities but lists no model that serves the role (for example, the model is restorable but not loaded). Capabilities and `minimum_context` are hard constraints and are never relaxed. `family` and `size_class` are preferences. |
+
+The hint headers `x-inferweave-capabilities`, `x-inferweave-min-context` and
+`x-inferweave-prefer-family` are also sent by the tool-less gateway
+executor. InferWeave applies them only when the `model` name resolves to
+nothing.
+
+## 2. Catalogue (`GET /v1/models`)
+
+- **Route rows:** `x_alias: true`, `x_backing_model`, `x_route_generation`,
+  `x_capabilities`, `x_context_window`, `x_state`. Route rows have no `slots`.
+- **Described models** add `x_capabilities`, `x_family`, `x_size_class`,
+  `x_tools`, `x_structured_output`, `x_modalities` and `x_aliases`.
+- **Context window** is read from `x_context_window`. Older gateways may send
+  `ctx_per_request` or `context_length`, which are still accepted.
+- **`x_state`** is `hot` or `cold` on concrete rows. `loading`, `draining` and
+  `lost` appear on route rows, on candidates and on retired models
+  (`draining`). Resolution never picks a row whose state is `draining`,
+  `lost` or `unavailable`.
+
+## 3. Served-route headers
+
+These headers come only for a route or capability request:
+
+- `X-InferWeave-Route`: the route name, or the canonical `cap:` query when a
+  query or hints were used.
+- `X-InferWeave-Model`
+- `X-InferWeave-Route-Generation`
+- `X-InferWeave-Route-Fallback`
+
+`RouteTracker` keys on `X-InferWeave-Route`. A changed model or generation on
+the same key becomes a `MODEL_TRANSITION` (`route_changed`). A request by
+model name has no route headers, and that is not treated as a change.
+
+## 4. Route table and events (hot swap without restart)
+
+- `GET /iw/v1/routes` returns `{generation, routes:{name:{target, fallbacks,
+  requires, availability, pending}}, models, retiring}`. It is read by
+  `fetchRouteTable`.
+- `GET /iw/v1/routes/events?after=<seq>` returns `{events, dropped, after}`.
+  `RouteEventFollower` polls it at every inference boundary, before a role is
+  resolved and before every request. There is no background timer.
+- The first read only sets the cursor. A 404 marks the gateway as
+  unsupported, and it is not polled again.
+
+| Event | Client reaction |
+|---|---|
+| `MODEL_ROUTE_CHANGED`, `MODEL_FALLBACK`, `MODEL_ROUTE_RESOLVED` (with `route` and `model`) | Log `MODEL_TRANSITION` on lane `route:<name>` (`from` = `previousModel`, `reason` = kind) and re-read the catalogue. A header-observed change already logged by an event is not logged twice. |
+| `MODEL_DRAINING` (except `retire_refused_still_routed`), `MODEL_UNLOADED` | Exclude the model from resolution. |
+| `MODEL_READY` | Make the model eligible again. |
+| `dropped > 0` | Re-read the catalogue. |
+
+Admin endpoints (`PUT`/`DELETE /v1/admin/routes/{name}`, `POST
+/v1/admin/routes/reload`) are operator tools. pi-engineering never calls them.
+
+## 5. Refusals
+
+The protocol body keeps `code` (for example `capacity_unavailable`,
+`model_activating`, `model_not_found`). The availability value is additive:
 
 ```json
-{ "id": "coding-implementation", "object": "model",
-  "x_alias": true,
-  "x_backing_model": "<concrete model id currently bound>",
-  "x_route_generation": 7,
-  "x_capabilities": ["coding.implementation"],
-  "ctx_per_request": 131072, "x_state": "hot" }
+{"error": {"code": "capacity_unavailable", "x_availability": "NODE_DRAINING",
+  "x_route": "coding-implementation", "x_route_generation": 7, "retry_after_ms": 4000,
+  "x_fallback_candidates": [{"id": "…", "x_context_window": 131072, "x_state": "hot",
+                             "x_capabilities": ["coding.implementation"]}]}}
 ```
 
-A concrete model row may carry the following extensions:
+The same value is also sent in the header `X-InferWeave-Error-Code: NODE_DRAINING`.
 
-| Field | Meaning |
+The availability code is read in this order:
+
+1. `X-InferWeave-Error-Code` header
+2. `error.x_availability`
+3. `error.code` or the admission `reason`, mapped as follows:
+
+| Value read | Code |
 |---|---|
-| `x_aliases` | Logical routes this model currently serves. |
-| `x_capabilities` | Capability tags, for example `coding.planning`, `coding.analysis`, `coding.implementation`, `coding.review`, `coding.debugging`, `coding.escalation`. |
-| `x_family`, `x_size_class` | Opaque family and size tags, matched against `preferred_family`. |
-| `ctx_per_request` | Per-request context window. Existing field. |
-| `x_modalities` | For example `["text", "image"]`. |
-| `x_tools`, `x_structured_output` | Booleans. |
-| `x_state` | One of `hot`, `warm`, `ready`, `cold`, `loading`, `draining`, `unavailable`, `lost`. |
-| `x_load` | Load from 0 to 1. |
+| `capacity_unavailable` | `NO_WORKERS` |
+| `model_activating` | `MODEL_LOADING` |
+| `queue_*`, `request_not_queueable`, `caller_hard_quota` | `CAPACITY_EXHAUSTED` |
+| `routing_snapshot_expired` | `NODE_LOST` |
+| `model_not_found`, `unsupported_model_capability`, … | `MODEL_UNAVAILABLE` |
 
-Each role's default alias is its capability name with `.` replaced by `-`.
-For example, `coding.planning` becomes `coding-planning`. The alias can be
-overridden in `.pi/engineering.yaml` under `planner_worker.roles.<role>.alias`.
+If none of these matches, a bare 404 that mentions a model is treated as
+`MODEL_UNAVAILABLE`.
 
-pi-engineering never sends the words planner, worker, reviewer or mission.
+Candidates come from `x_fallback_candidates`. The legacy `error.candidates`
+is still accepted.
 
-## 2. Capability hints on `POST /v1/chat/completions`
+Reactions are bounded and never repeat forever:
 
-When pi-engineering talks to the gateway directly, it sends these headers.
-Unknown headers must be ignored.
-
-```
-x-inferweave-capabilities: coding.implementation
-x-inferweave-min-context: 128000
-x-inferweave-prefer-family: <family tag>
-```
-
-The request's `model` field is the alias, or a concrete id when no alias exists.
-
-## 3. Served-route identity (route changes)
-
-Response headers on every completion. Streaming requests send them on the
-initial response.
-
-```
-x-inferweave-route: coding-implementation       # alias requested, if any
-x-inferweave-model: <concrete model that served>
-x-inferweave-route-generation: 8                # bumps on every rebinding
-```
-
-A route swap happens only at a request boundary. Requests already in flight
-stay pinned to their runtime. pi-engineering compares the served model and
-generation with those of the previous request on the same alias. A change is
-recorded as `MODEL_TRANSITION reason=route_changed`, and pi-engineering
-re-checks context compatibility. No client restart is involved.
-
-## 4. Availability errors
-
-The gateway responds with HTTP 429 or 503 (404 for an unknown model) and this
-body:
-
-```json
-{ "error": { "code": "MODEL_LOADING", "message": "...", "retry_after_ms": 4000,
-             "candidates": [ { "id": "...", "x_capabilities": ["coding.implementation"],
-                               "ctx_per_request": 131072, "x_state": "hot" } ] } }
-```
-
-`code` is one of `NO_WORKERS`, `MODEL_UNAVAILABLE`, `MODEL_LOADING`,
-`CAPACITY_EXHAUSTED`, `NODE_DRAINING`, `NODE_LOST`. The same code can also be
-sent in the `x-inferweave-error-code` header. The existing admission payload
-(`type: "inference_admission"`, `reason: model_loading | capacity_unavailable
-| worker_saturated | …`) is accepted as well. Its reasons are mapped onto the
-codes above.
-
-`candidates` uses the same row shape as `/v1/models`.
-
-| Code | Client reaction (bounded, never infinite) |
+| Code | Reaction |
 |---|---|
-| `MODEL_LOADING` | Wait `retry_after_ms` (capped at 30 s) up to 3 times, then switch. |
+| `MODEL_LOADING` | Wait `retry_after_ms` (at most 30 s per wait), up to 3 waits, then switch. |
 | `CAPACITY_EXHAUSTED`, `NO_WORKERS` | Wait once, then switch. |
-| `NODE_DRAINING` | Retry the same alias once (the route moves), then switch. |
-| `MODEL_UNAVAILABLE`, `NODE_LOST` | Switch immediately. |
+| `NODE_DRAINING` | Retry the same route once, then switch. |
+| `MODEL_UNAVAILABLE`, `NODE_LOST` | Switch. |
 
-"Switch" means the client excludes the failed model, merges `candidates` into
-the catalogue, re-resolves the role (keeping planner and implementer
-distinct), and records `MODEL_TRANSITION reason=failover:<CODE>`.
+To switch, the client:
 
-## 5. What the InferWeave side must satisfy
-
-1. List aliases as model rows with `x_alias`, `x_backing_model` and
-   `x_route_generation`.
-2. Send the three served-route headers on completions.
-3. Bump `x_route_generation` on every rebinding. Never move an in-flight
-   request.
-4. Return availability errors in the shape above, with `candidates` when it can.
-5. Advertise `x_capabilities` and `x_state` on concrete models.
+1. excludes the failed model;
+2. merges the candidates into the catalogue;
+3. re-resolves the role, keeping planner and implementer distinct;
+4. logs `MODEL_TRANSITION reason=failover:<CODE>`.

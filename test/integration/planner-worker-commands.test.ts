@@ -18,8 +18,8 @@ after(async () => {
 });
 
 const CATALOG = [
-  { id: "flash-a", x_capabilities: ["coding.planning", "coding.review"], ctx_per_request: 131072 },
-  { id: "big-b", x_capabilities: ["coding.implementation"], ctx_per_request: 262144 },
+  { id: "flash-a", x_capabilities: ["coding.planning", "coding.review"], x_context_window: 131072 },
+  { id: "big-b", x_capabilities: ["coding.implementation"], x_context_window: 262144 },
 ];
 
 test("planner_worker config: defaults, overrides and actionable issues", async () => {
@@ -70,14 +70,14 @@ test("auto selects planner-worker only for nontrivial missions on a gateway that
   assert.equal((await chooseExecutionMode("single", goal, resolver)).mode, "single");
 
   // A plain gateway (no capabilities) keeps the existing single-model workflow under auto…
-  server.setModels([{ id: "only-model", ctx_per_request: 32768 }]);
+  server.setModels([{ id: "only-model", x_context_window: 32768 }]);
   const plain = new RoleResolver({ provider: "iw", loadCatalog: () => fetchCatalog({ baseUrl: server.baseUrl }) });
   const decision = await chooseExecutionMode("auto", goal, plain);
   assert.equal(decision.mode, "single");
   assert.match(decision.reason, /does not advertise/);
   // …and one model for every role cannot separate planning from implementation.
   server.setModels([
-    { id: "solo", x_capabilities: ["coding.planning", "coding.implementation"], ctx_per_request: 32768 },
+    { id: "solo", x_capabilities: ["coding.planning", "coding.implementation"], x_context_window: 32768 },
   ]);
   const solo = new RoleResolver({ provider: "iw", loadCatalog: () => fetchCatalog({ baseUrl: server.baseUrl }) });
   assert.match((await chooseExecutionMode("auto", goal, solo)).reason, /no distinct planner and implementer/);

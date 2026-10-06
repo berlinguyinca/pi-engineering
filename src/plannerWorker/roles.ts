@@ -15,7 +15,7 @@
  * model is chosen whenever an alternative exists.
  */
 
-import type { CatalogModel } from "./gateway.ts";
+import { type CatalogModel, capabilityQuery } from "./gateway.ts";
 import type { ModelRef } from "./planner.ts";
 import type { PlannerWorkerRole } from "./types.ts";
 
@@ -58,7 +58,7 @@ export function aliasFor(cfg: RoleConfig): string {
 export interface ResolvedRole {
   role: PlannerWorkerRole;
   model: ModelRef;
-  via: "alias" | "capability" | "family" | "static";
+  via: "alias" | "capability" | "family" | "query" | "static";
   /** Concrete model behind an alias, when the gateway advertises it. */
   backing?: string;
   contextWindow?: number;
@@ -171,6 +171,20 @@ export async function resolveRole(role: PlannerWorkerRole, ctx: ResolveContext):
     };
   }
   if (!anyCapabilities) notes.push("gateway advertises no capabilities; using static role routing");
+
+  // 2b. A gateway that speaks capabilities may serve a model it does not list
+  //     yet (restorable): ask it directly with a capability query.
+  const query = anyCapabilities
+    ? capabilityQuery({
+        capabilities: [cfg.capability],
+        ...(cfg.min_context !== undefined ? { minimumContext: cfg.min_context } : {}),
+        ...(cfg.preferred_family ? { family: cfg.preferred_family } : {}),
+      })
+    : null;
+  if (query && !exclude.has(query)) {
+    notes.push(`no listed model serves ${cfg.capability}; asking the gateway with ${query}`);
+    return { role, model: { provider: ctx.provider, id: query }, via: "query", notes };
+  }
 
   // 3. Static role routing.
   const fallback = await ctx.fallback?.(role, [...exclude]).catch(() => undefined);

@@ -152,6 +152,8 @@ export interface ServedRoute {
   model: string;
   alias?: string;
   generation?: number;
+  /** True when a route resolved to something other than its target. */
+  fallback?: boolean;
 }
 
 export type ChatOutcome =
@@ -219,10 +221,16 @@ export async function chatCompletion(
       requested: req.model,
       model: res.headers.get("x-inferweave-model") ?? str(b.model) ?? req.model,
     };
+    // Route headers come only for a route or capability request (a request by
+    // model name keeps exactly the headers it always had).
     const alias = res.headers.get("x-inferweave-route");
-    if (alias) served.alias = alias;
-    const generation = num(res.headers.get("x-inferweave-route-generation"));
-    if (generation !== undefined) served.generation = generation;
+    if (alias) {
+      served.alias = alias;
+      const generation = num(res.headers.get("x-inferweave-route-generation"));
+      if (generation !== undefined) served.generation = generation;
+      const fallback = res.headers.get("x-inferweave-route-fallback");
+      if (fallback !== null) served.fallback = fallback.trim().toLowerCase() === "true";
+    }
     return {
       ok: true,
       content: typeof content === "string" ? content : "",
@@ -275,19 +283,36 @@ export interface AvailabilityError {
   retryAfterMs?: number;
   /** Comparable models the gateway suggests (same shape as `/models` rows). */
   candidates: CatalogModel[];
+  /** Route or canonical capability query the refusal concerns, when any. */
+  route?: string;
+  routeGeneration?: number;
 }
 
-/** Admission `reason` tokens (src/inference/admissionContract.ts) mapped onto availability codes. */
+/**
+ * Protocol `code`/admission `reason` tokens mapped onto availability codes,
+ * for gateways that do not send `x_availability` (older InferWeave, other
+ * gateways). InferWeave's own refusals carry the precise value in
+ * `x_availability` / `X-InferWeave-Error-Code`, which always wins.
+ */
 const REASON_CODES: Readonly<Record<string, AvailabilityCode>> = {
   no_workers: "NO_WORKERS",
+  capacity_unavailable: "NO_WORKERS",
   model_unavailable: "MODEL_UNAVAILABLE",
   model_not_found: "MODEL_UNAVAILABLE",
+  unsupported_model_capability: "MODEL_UNAVAILABLE",
+  context_window_exceeded: "MODEL_UNAVAILABLE",
+  model_weights_do_not_fit: "MODEL_UNAVAILABLE",
   model_loading: "MODEL_LOADING",
-  capacity_unavailable: "CAPACITY_EXHAUSTED",
+  model_activating: "MODEL_LOADING",
   capacity_exhausted: "CAPACITY_EXHAUSTED",
   worker_saturated: "CAPACITY_EXHAUSTED",
+  queue_limit_reached: "CAPACITY_EXHAUSTED",
+  queue_deadline_exceeded: "CAPACITY_EXHAUSTED",
+  request_not_queueable: "CAPACITY_EXHAUSTED",
+  caller_hard_quota: "CAPACITY_EXHAUSTED",
   node_draining: "NODE_DRAINING",
   node_lost: "NODE_LOST",
+  routing_snapshot_expired: "NODE_LOST",
 };
 
 function asCode(v: unknown): AvailabilityCode | undefined {
@@ -313,9 +338,10 @@ export function parseAvailabilityError(
   const admission = parseAdmissionPayload(body);
   const lower = Object.fromEntries(Object.entries(headers).map(([k, v]) => [k.toLowerCase(), v]));
   let code =
+    asCode(lower["x-inferweave-error-code"]) ??
+    asCode(err.x_availability) ??
     asCode(err.code) ??
     asCode(root.code) ??
-    asCode(lower["x-inferweave-error-code"]) ??
     asCode(admission?.reason) ??
     asCode(err.type);
   const message = messageOf(body) ?? `HTTP ${status}`;
@@ -326,17 +352,17 @@ export function parseAvailabilityError(
     num(root.retry_after_ms) ??
     admission?.retryAfterMs ??
     (num(lower["retry-after"]) !== undefined ? (num(lower["retry-after"]) as number) * 1000 : undefined);
-  const rawCandidates = Array.isArray(err.candidates)
-    ? err.candidates
-    : Array.isArray(root.candidates)
-      ? root.candidates
-      : [];
+  const rawCandidates = [err.x_fallback_candidates, err.candidates, root.candidates].find(Array.isArray) ?? [];
+  const route = str(err.x_route);
+  const routeGeneration = num(err.x_route_generation);
   return {
     code,
     status,
     message,
     ...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
     candidates: parseCatalog({ data: rawCandidates }),
+    ...(route ? { route } : {}),
+    ...(routeGeneration !== undefined ? { routeGeneration } : {}),
   };
 }
 
@@ -410,5 +436,126 @@ export class RouteTracker {
 
   current(alias: string): string | undefined {
     return this.last.get(alias)?.model;
+  }
+}
+
+const QUERY_NAME = /^[a-z0-9._-]+$/;
+
+/**
+ * A capability query in InferWeave's grammar, usable as the `model` field:
+ * `cap:<cap>[,<cap>…][?minimum_context=N&family=F&size_class=S]`. Capabilities
+ * and minimum context are hard constraints (never relaxed); family and size
+ * class are preferences. Returns null when a name is outside the grammar.
+ */
+export function capabilityQuery(q: {
+  capabilities: string[];
+  minimumContext?: number;
+  family?: string;
+  sizeClass?: string;
+}): string | null {
+  if (q.capabilities.length === 0 || !q.capabilities.every((c) => QUERY_NAME.test(c))) return null;
+  const params: string[] = [];
+  if (q.minimumContext !== undefined && Number.isInteger(q.minimumContext) && q.minimumContext > 0) {
+    params.push(`minimum_context=${q.minimumContext}`);
+  }
+  if (q.family && QUERY_NAME.test(q.family)) params.push(`family=${q.family}`);
+  if (q.sizeClass && ["small", "medium", "large", "xlarge"].includes(q.sizeClass))
+    params.push(`size_class=${q.sizeClass}`);
+  return `cap:${q.capabilities.join(",")}${params.length > 0 ? `?${params.join("&")}` : ""}`;
+}
+
+/** The gateway root for `/iw/v1/...` endpoints (base URLs end in `/v1`). */
+function gatewayRoot(conn: GatewayConnection): string {
+  return base(conn).replace(/\/v1$/, "");
+}
+
+async function getJson(conn: GatewayConnection, path: string): Promise<{ status: number; body: unknown } | null> {
+  try {
+    const res = await fetch(`${gatewayRoot(conn)}${path}`, {
+      headers: headersFor(conn),
+      signal: AbortSignal.timeout(conn.timeoutMs ?? 5_000),
+    });
+    return { status: res.status, body: await res.json().catch(() => null) };
+  } catch {
+    return null;
+  }
+}
+
+/** One InferWeave route lifecycle event (`route_event.json`). */
+export interface RouteEvent {
+  seq: number;
+  atMs: number;
+  kind:
+    | "MODEL_ROUTE_RESOLVED"
+    | "MODEL_LOADING"
+    | "MODEL_READY"
+    | "MODEL_DRAINING"
+    | "MODEL_UNLOADED"
+    | "MODEL_ROUTE_CHANGED"
+    | "MODEL_UNAVAILABLE"
+    | "MODEL_FALLBACK";
+  generation: number;
+  route?: string;
+  model?: string;
+  previousModel?: string;
+  availability?: AvailabilityCode;
+  reason?: string;
+  inFlight?: number;
+}
+
+export interface RouteTable {
+  generation: number;
+  routes: Record<string, { target: string; fallbacks?: string[]; availability?: AvailabilityCode | null }>;
+  retiring: string[];
+}
+
+/** `GET /iw/v1/routes`, or null when the gateway has no logical routes. */
+export async function fetchRouteTable(conn: GatewayConnection): Promise<RouteTable | null> {
+  const r = await getJson(conn, "/iw/v1/routes");
+  if (!r || r.status !== 200 || !r.body || typeof r.body !== "object") return null;
+  const b = r.body as { generation?: unknown; routes?: unknown; retiring?: unknown };
+  const generation = num(b.generation);
+  if (generation === undefined) return null;
+  return {
+    generation,
+    routes: (b.routes && typeof b.routes === "object" ? b.routes : {}) as RouteTable["routes"],
+    retiring: strs(b.retiring),
+  };
+}
+
+/**
+ * Incremental reader of `GET /iw/v1/routes/events?after=<seq>`. Polled at
+ * inference boundaries (no background timer): a route swap shows up before
+ * the next request is resolved, with no client restart. A gateway without
+ * the endpoint is remembered as unsupported and never asked again.
+ */
+export class RouteEventFollower {
+  private after: number | null = null;
+  supported = true;
+  private readonly conn: GatewayConnection;
+
+  constructor(conn: GatewayConnection) {
+    this.conn = conn;
+  }
+
+  async poll(): Promise<{ events: RouteEvent[]; dropped: number }> {
+    if (!this.supported) return { events: [], dropped: 0 };
+    const r = await getJson(this.conn, `/iw/v1/routes/events${this.after !== null ? `?after=${this.after}` : ""}`);
+    if (!r) return { events: [], dropped: 0 };
+    if (r.status === 404 || r.status === 405) {
+      this.supported = false;
+      return { events: [], dropped: 0 };
+    }
+    const b = (r.body ?? {}) as { events?: unknown; dropped?: unknown; after?: unknown };
+    const events = (Array.isArray(b.events) ? b.events : []).filter(
+      (e): e is RouteEvent => !!e && typeof e === "object" && typeof (e as RouteEvent).seq === "number",
+    );
+    const first = this.after === null;
+    const next = num(b.after) ?? events.at(-1)?.seq;
+    if (next !== undefined) this.after = next;
+    else if (first) this.after = 0;
+    // The first read only establishes the cursor: history before this
+    // mission is not a transition of this mission.
+    return first ? { events: [], dropped: 0 } : { events, dropped: num(b.dropped) ?? 0 };
   }
 }

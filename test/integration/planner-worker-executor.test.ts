@@ -11,7 +11,7 @@ import { join } from "node:path";
 import { after, test } from "node:test";
 import { promisify } from "node:util";
 import { PlannerWorkerExecutor, runVerification } from "../../src/plannerWorker/executor.ts";
-import { fetchCatalog } from "../../src/plannerWorker/gateway.ts";
+import { RouteEventFollower, fetchCatalog } from "../../src/plannerWorker/gateway.ts";
 import { GatewayChatWorkerExecutor } from "../../src/plannerWorker/gatewayWorker.ts";
 import { RoleResolver } from "../../src/plannerWorker/resolver.ts";
 import type { MissionBrief } from "../../src/plannerWorker/types.ts";
@@ -20,6 +20,7 @@ import {
   type ChatRequestRecord,
   type GatewayServer,
   type ScriptedReply,
+  inferweaveRefusal,
   startGatewayServer,
 } from "../support/gatewayServer.ts";
 
@@ -33,11 +34,11 @@ const CATALOG = [
   {
     id: "flash-a",
     x_capabilities: ["coding.planning", "coding.review", "coding.debugging", "coding.analysis"],
-    ctx_per_request: 131072,
+    x_context_window: 131072,
     x_state: "hot",
   },
-  { id: "big-b", x_capabilities: ["coding.implementation"], ctx_per_request: 262144, x_state: "hot" },
-  { id: "frontier-c", x_capabilities: ["coding.escalation"], ctx_per_request: 262144, x_state: "warm" },
+  { id: "big-b", x_capabilities: ["coding.implementation"], x_context_window: 262144, x_state: "hot" },
+  { id: "frontier-c", x_capabilities: ["coding.escalation"], x_context_window: 262144, x_state: "warm" },
 ];
 
 type Role = "planner" | "implementer" | "reviewer" | "debugger" | "replanner";
@@ -81,10 +82,13 @@ const brief = (id: string): MissionBrief => ({
   constraints: [],
 });
 
-async function setup(respond: (req: ChatRequestRecord, i: number) => ScriptedReply | Promise<ScriptedReply>) {
+async function setup(
+  respond: (req: ChatRequestRecord, i: number) => ScriptedReply | Promise<ScriptedReply>,
+  routes?: Record<string, string>,
+) {
   const fixture = await makeFixtureRepo();
   cleanups.push(fixture.cleanup);
-  const server: GatewayServer = await startGatewayServer({ models: CATALOG, respond });
+  const server: GatewayServer = await startGatewayServer({ models: CATALOG, respond, ...(routes ? { routes } : {}) });
   cleanups.push(() => server.close());
   const conn = { baseUrl: server.baseUrl };
   const resolver = new RoleResolver({ provider: "iw", loadCatalog: () => fetchCatalog(conn) });
@@ -97,6 +101,7 @@ async function setup(respond: (req: ChatRequestRecord, i: number) => ScriptedRep
     stateDir: join(fixture.root, ".pi-eng", "planner-worker", "M"),
     concurrency: 3,
     verificationTimeoutMs: 60_000,
+    routeEvents: new RouteEventFollower(conn),
     onEvent: (e) => events.push(`${e.type}:${e.task_id ?? ""}:${e.status ?? ""}:${e.text}`),
   });
   return { fixture, server, executor, events };
@@ -330,18 +335,15 @@ test("an unavailable implementer route fails over to a gateway candidate without
     const role = roleOf(req);
     if (role === "planner") return { content: JSON.stringify({ contracts: [contract("one")] }) };
     if (role === "implementer" && req.model === "big-b") {
-      return {
-        status: 503,
-        body: {
-          error: {
-            code: "MODEL_UNAVAILABLE",
-            message: "big-b lost its node",
-            candidates: [
-              { id: "big-b2", x_capabilities: ["coding.implementation"], ctx_per_request: 262144, x_state: "hot" },
-            ],
-          },
-        },
-      };
+      // InferWeave's refusal: protocol code kept, availability additive.
+      return inferweaveRefusal({
+        code: "capacity_unavailable",
+        availability: "NODE_LOST",
+        message: "big-b lost its node",
+        candidates: [
+          { id: "big-b2", x_capabilities: ["coding.implementation"], x_context_window: 262144, x_state: "hot" },
+        ],
+      });
     }
     if (role === "implementer") {
       return {
@@ -359,9 +361,7 @@ test("an unavailable implementer route fails over to a gateway candidate without
   const implModels = server.requests.filter((r) => roleOf(r) === "implementer").map((r) => r.model);
   assert.deepEqual(implModels, ["big-b", "big-b2"]);
   assert.ok(
-    report.transitions.some(
-      (t) => t.reason === "failover:MODEL_UNAVAILABLE" && t.from === "big-b" && t.to === "big-b2",
-    ),
+    report.transitions.some((t) => t.reason === "failover:NODE_LOST" && t.from === "big-b" && t.to === "big-b2"),
   );
 });
 
@@ -437,4 +437,50 @@ test("verification commands come from model output and never see credentials", a
   } finally {
     delete process.env.PW_TEST_API_TOKEN;
   }
+});
+
+test("a hot swap of the implementation route mid-mission is logged and followed without a restart", async () => {
+  let server: GatewayServer | null = null;
+  const { executor, server: srv } = await setup(
+    (req) => {
+      const role = roleOf(req);
+      if (role === "planner") {
+        return {
+          content: JSON.stringify({ contracts: [contract("first"), contract("second", { depends_on: ["first"] })] }),
+        };
+      }
+      if (role === "implementer") {
+        const id = taskOf(req);
+        // The operator re-binds the route while `first` is in flight: it stays pinned.
+        if (id === "first") server?.rebind("coding-implementation", "big-b2");
+        return {
+          content: JSON.stringify({
+            status: "completed",
+            summary: id,
+            files: [{ path: `src/${id}/done.txt`, content: id }],
+          }),
+        };
+      }
+      return pass;
+    },
+    { "coding-implementation": "big-b" },
+  );
+  server = srv;
+  srv.setModels([
+    ...CATALOG,
+    { id: "big-b2", x_capabilities: ["coding.implementation"], x_context_window: 262144, x_state: "hot" },
+  ]);
+  const report = await executor.run(brief("M-swap"));
+  assert.equal(report.status, "completed", report.failure_reason ?? "");
+  const impl = srv.requests.filter((r) => roleOf(r) === "implementer");
+  assert.deepEqual(
+    impl.map((r) => [r.model, r.resolved]),
+    [
+      ["coding-implementation", "big-b"],
+      ["coding-implementation", "big-b2"],
+    ],
+  );
+  const swaps = report.transitions.filter((t) => t.from === "big-b" && t.to === "big-b2");
+  assert.equal(swaps.length, 1, JSON.stringify(report.transitions));
+  assert.equal(swaps[0]?.reason, "MODEL_ROUTE_CHANGED");
 });

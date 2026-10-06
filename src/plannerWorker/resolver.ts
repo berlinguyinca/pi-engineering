@@ -44,6 +44,11 @@ export class RoleResolver {
     this.excluded.add(modelId);
   }
 
+  /** A model reported ready again (route events) is eligible again. */
+  include(modelId: string): void {
+    this.excluded.delete(modelId);
+  }
+
   excludedModels(): string[] {
     return [...this.excluded];
   }

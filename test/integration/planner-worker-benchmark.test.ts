@@ -72,9 +72,9 @@ test("benchmark modes A-D run real repositories through a real gateway and repor
       {
         id: "flash-a",
         x_capabilities: ["coding.planning", "coding.review", "coding.debugging"],
-        ctx_per_request: 131072,
+        x_context_window: 131072,
       },
-      { id: "big-b", x_capabilities: ["coding.implementation"], ctx_per_request: 262144 },
+      { id: "big-b", x_capabilities: ["coding.implementation"], x_context_window: 262144 },
     ],
     respond: async (req) => {
       const reply = scripted(req, inFlight);

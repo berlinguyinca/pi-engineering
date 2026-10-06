@@ -33,6 +33,7 @@ import { dagLayers, scopeConflict } from "./contract.ts";
 import { ConvergenceTracker, nextLadderAction, observeAttempt } from "./convergence.ts";
 import {
   type AvailabilityError,
+  type RouteEventFollower,
   RouteTracker,
   type ServedRoute,
   availabilityFromText,
@@ -108,6 +109,8 @@ export interface PlannerWorkerOptions {
   /** Fast-forward the checkout to the integrated result when it is clean. Default true. */
   applyToCheckout?: boolean;
   transitions?: TransitionLog;
+  /** InferWeave route events, polled at every inference boundary (no restart on a swap). */
+  routeEvents?: RouteEventFollower;
   onEvent?: (e: PlannerWorkerEvent) => void;
   signal?: AbortSignal;
 }
@@ -704,6 +707,7 @@ export class PlannerWorkerExecutor {
     let resolved = initial;
     let strikes = 0;
     for (let guard = 0; guard < 8; guard++) {
+      await this.syncRoutes(task, role);
       const t0 = Date.now();
       const run = await this.opts.worker.run({
         ...req,
@@ -735,11 +739,59 @@ export class PlannerWorkerExecutor {
     throw new Error(`${role} for ${task}: model availability did not settle`);
   }
 
+  /**
+   * Apply InferWeave route events before the next request is resolved: a
+   * re-bind or fallback becomes a MODEL_TRANSITION, drained/unloaded models
+   * leave resolution, ready ones return, and the catalogue is re-read.
+   */
+  private async syncRoutes(task: string, role: PlannerWorkerRole): Promise<void> {
+    if (!this.opts.routeEvents) return;
+    const { events, dropped } = await this.opts.routeEvents.poll();
+    let refresh = dropped > 0;
+    for (const e of events) {
+      if (
+        (e.kind === "MODEL_ROUTE_CHANGED" || e.kind === "MODEL_FALLBACK" || e.kind === "MODEL_ROUTE_RESOLVED") &&
+        e.route &&
+        e.model
+      ) {
+        refresh = true;
+        const lane = `route:${e.route}`;
+        const event = this.transitions.record({
+          lane,
+          from: e.previousModel ?? this.transitions.last(lane),
+          to: e.model,
+          reason: e.kind,
+          task,
+          role,
+          context: "direct",
+        });
+        if (event) {
+          this.emit({
+            type: "transition",
+            task_id: task,
+            text: `MODEL_TRANSITION ${event.from ?? "-"} -> ${event.to} (${e.kind} ${e.route})`,
+          });
+        }
+      } else if (
+        (e.kind === "MODEL_DRAINING" && e.reason !== "retire_refused_still_routed") ||
+        e.kind === "MODEL_UNLOADED"
+      ) {
+        if (e.model) this.opts.resolver.exclude(e.model);
+        refresh = true;
+      } else if (e.kind === "MODEL_READY" && e.model) {
+        this.opts.resolver.include(e.model);
+        refresh = true;
+      }
+    }
+    if (refresh) await this.opts.resolver.refresh();
+  }
+
   private observeRoute(run: WorkerRun, role: PlannerWorkerRole, task: string): void {
     const served = (run.result.details as { served?: ServedRoute } | undefined)?.served;
     if (!served) return;
     const change = this.routes.observe(served);
-    if (!change) return;
+    // Already logged from the route event stream.
+    if (!change || this.transitions.last(`route:${change.alias}`) === change.to) return;
     const event = this.transitions.record({
       lane: `route:${change.alias}`,
       from: change.from,

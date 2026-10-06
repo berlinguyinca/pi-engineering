@@ -26,7 +26,7 @@ import {
   writeStoredMode,
 } from "./config.ts";
 import { PlannerWorkerExecutor } from "./executor.ts";
-import { fetchCatalog } from "./gateway.ts";
+import { RouteEventFollower, fetchCatalog } from "./gateway.ts";
 import { chooseExecutionMode } from "./mode.ts";
 import { RoleResolver } from "./resolver.ts";
 import { STATIC_ROUTER_ROLE } from "./roles.ts";
@@ -173,7 +173,7 @@ export function registerPlannerWorker(
     });
     const decision = await chooseExecutionMode(requested, request, resolver);
     if (decision.mode === "single") return null;
-    return { host, config, resolver, reason: decision.reason };
+    return { host, config, resolver, conn, reason: decision.reason };
   }
 
   return {
@@ -181,7 +181,7 @@ export function registerPlannerWorker(
       // Any failure while deciding falls back to the existing orchestrator.
       const selected = await select(request, ctx).catch(() => null);
       if (!selected) return false;
-      const { host, config, resolver } = selected;
+      const { host, config, resolver, conn } = selected;
       const notify: Notify = (text, level) => ctx.ui.notify(text, level);
       notify(`engineering mode: planner-worker (${selected.reason})`, "info");
       const missionId = `PW-${new Date()
@@ -196,6 +196,7 @@ export function registerPlannerWorker(
         concurrency: config.concurrency,
         ladder: config.ladder,
         convergence: config.convergence,
+        ...(conn ? { routeEvents: new RouteEventFollower(conn) } : {}),
         ...(ctx.signal ? { signal: ctx.signal } : {}),
         onEvent: (e) => {
           if (e.type !== "contract" || e.status === "passed" || e.status === "failed" || e.status === "escalated") {
