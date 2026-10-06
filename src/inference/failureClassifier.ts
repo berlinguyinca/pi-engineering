@@ -170,11 +170,15 @@ const GATEWAY_SCOPED_CLASSES = new Set<InferenceFailureClass>([
 const FALLBACK_ALLOWED_CLASSES = new Set<InferenceFailureClass>([
   "no_workers",
   "model_unavailable",
+  "model_activating",
   "worker_evicted",
   "worker_restarting",
   "model_not_found",
   "quota",
-  "capacity_unavailable",
+  // NOTE: `capacity_unavailable` is NOT here by default: GLOBAL admission
+  // saturation (the class default) must wait/retry the gateway and NEVER
+  // model-switch (spec §10). A MODEL-scoped capacity payload (scope: "model")
+  // opts back in below, after the wait budget has elapsed.
 ]);
 const REFRESH_CATALOG_CLASSES = new Set<InferenceFailureClass>([
   "no_workers",
@@ -397,7 +401,12 @@ function classifyFromInferweave(
     overrides.modelScoped = true;
     overrides.providerScoped = false;
     overrides.requestScoped = false;
+    // A model-scoped capacity refusal says THIS model cannot be served:
+    // comparable-model fallback is allowed once the wait budget elapses.
+    if (cls === "capacity_unavailable") overrides.canFallback = true;
   } else if (payloadScope === "global") {
+    // Global saturation: wait on the gateway; never switch models.
+    overrides.canFallback = false;
     overrides.modelScoped = false;
     overrides.providerScoped = true;
   } else if (payloadScope === "request") {
