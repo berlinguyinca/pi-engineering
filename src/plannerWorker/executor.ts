@@ -19,15 +19,18 @@
  * model disappearing never loses the mission.
  */
 
-import { execFile, spawn } from "node:child_process";
+import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { readFile, rm, writeFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { promisify } from "node:util";
 import type { WorkerRole } from "../core/types.ts";
 import { GitRepo, type WorktreeInfo } from "../git/GitRepo.ts";
+import { workerInactivityMs, workerTimeoutMs } from "../orchestration/broker.ts";
 import { Scheduler } from "../sched/Scheduler.ts";
-import type { WorkerExecutor, WorkerRequest, WorkerRun } from "../workers/WorkerExecutor.ts";
+import { DEFAULT_STAGE_INACTIVITY_MS, runWithInactivityGuard } from "../verify/Verifier.ts";
+import type { WorkerActivity, WorkerExecutor, WorkerRequest, WorkerRun } from "../workers/WorkerExecutor.ts";
+import { WAITING_FOR_INFERENCE_SUMMARY } from "../workers/activity.ts";
 import { planTransition } from "./compatibility.ts";
 import { dagLayers, scopeConflict } from "./contract.ts";
 import { ConvergenceTracker, nextLadderAction, observeAttempt } from "./convergence.ts";
@@ -41,6 +44,7 @@ import {
   parseAvailabilityError,
 } from "./gateway.ts";
 import { buildHandoff, renderHandoff } from "./handoff.ts";
+import { acquireMissionLock } from "./missionLock.ts";
 import { runPlanner } from "./planner.ts";
 import { DEBUGGER_PROMPT, IMPLEMENTER_PROMPT } from "./prompts.ts";
 import type { RoleResolver } from "./resolver.ts";
@@ -104,8 +108,17 @@ export interface PlannerWorkerOptions {
   convergence?: ConvergenceConfig;
   /** Concurrent contracts (existing scheduler limit). Default 2. */
   concurrency?: number;
-  /** Optional per-command limit; none by default (no wall-clock mission budgets). */
-  verificationTimeoutMs?: number;
+  /**
+   * Silence window per verification command (default 15 min). Not a duration
+   * limit: a command that keeps printing runs as long as it needs.
+   */
+  verificationInactivityMs?: number;
+  /**
+   * A worker showing no activity for this long is treated as hung and
+   * aborted. Default `workerInactivityMs()` (1 h; PI_ENGINEERING_WORKER_INACTIVITY_MS).
+   */
+  workerInactivityMs?: number;
+  /** Opt-in total-duration limit per worker; none by default (`workerTimeoutMs()`). */
   workerTimeoutMs?: number;
   /** Fast-forward the checkout to the integrated result when it is clean. Default true. */
   applyToCheckout?: boolean;
@@ -142,37 +155,38 @@ async function git(cwd: string, args: string[]): Promise<{ code: number; stdout:
 }
 
 /**
- * Run one verification command in a worktree (real child process). No
- * wall-clock limit unless the caller configures one: missions are bounded by
- * attempts and convergence, not time.
+ * Run one verification command in a worktree (real child process, own process
+ * group). There is no total-duration limit — missions are bounded by attempts
+ * and convergence, not time — only an INACTIVITY guard: a command silent for
+ * `inactivityMs` (default 15 min) is killed with everything it spawned, so a
+ * dev server or watch mode holding the output open cannot wedge the mission.
+ * `signal` (the mission's abort) kills the process group at once.
  */
-export function runVerification(command: string, cwd: string, timeoutMs?: number): Promise<VerificationRun> {
+export async function runVerification(
+  command: string,
+  cwd: string,
+  opts: { inactivityMs?: number; signal?: AbortSignal } = {},
+): Promise<VerificationRun> {
   const started = Date.now();
-  return new Promise((resolve) => {
-    const child = spawn("sh", ["-c", command], { cwd, env: verificationEnv() });
-    let out = "";
-    const keep = (b: Buffer) => {
-      out = (out + b.toString("utf8")).slice(-4000);
+  try {
+    const r = await runWithInactivityGuard("sh", ["-c", command], {
+      cwd,
+      env: verificationEnv(),
+      inactivityMs: opts.inactivityMs ?? DEFAULT_STAGE_INACTIVITY_MS,
+      ...(opts.signal ? { signal: opts.signal } : {}),
+    });
+    const exit = r.hung ? 124 : r.code;
+    return {
+      command,
+      exit_code: exit,
+      passed: exit === 0,
+      output_tail: `${r.stdout}${r.stderr}`.slice(-4000),
+      duration_ms: Date.now() - started,
     };
-    child.stdout.on("data", keep);
-    child.stderr.on("data", keep);
-    const timer = timeoutMs !== undefined ? setTimeout(() => child.kill("SIGKILL"), timeoutMs) : undefined;
-    child.on("close", (code, signal) => {
-      clearTimeout(timer);
-      const exit = code ?? (signal ? 124 : 1);
-      resolve({
-        command,
-        exit_code: exit,
-        passed: exit === 0,
-        output_tail: signal ? `${out}\n[killed: ${signal}]` : out,
-        duration_ms: Date.now() - started,
-      });
-    });
-    child.on("error", (err) => {
-      clearTimeout(timer);
-      resolve({ command, exit_code: 127, passed: false, output_tail: String(err), duration_ms: Date.now() - started });
-    });
-  });
+  } catch {
+    // Only an abort rejects: the process group is already killed.
+    return { command, exit_code: 130, passed: false, output_tail: "[aborted]", duration_ms: Date.now() - started };
+  }
 }
 
 export class PlannerWorkerExecutor {
@@ -219,19 +233,24 @@ export class PlannerWorkerExecutor {
   async run(brief: MissionBrief): Promise<PlannerWorkerReport> {
     this.brief = brief;
     this.started = Date.now();
-    await mkdir(this.opts.stateDir, { recursive: true });
-    const repo = await GitRepo.open(this.opts.repoRoot);
-    if (!repo) throw new Error(`${this.opts.repoRoot} is not a git repository`);
-    this.repo = repo;
-    await this.opts.resolver.refresh();
-    const base = await repo.headCommit();
-    this.baseCommit = base;
-    this.integration = await repo.createWorktree(base, `pi-eng-pw-${slug(brief.mission_id)}`);
+    // One live owner per mission: a concurrent resume would delete our worktrees.
+    const lock = await acquireMissionLock(this.opts.stateDir);
     try {
-      if (!(await this.planMission())) return await this.finish("failed");
-      return await this.proceed();
+      const repo = await GitRepo.open(this.opts.repoRoot);
+      if (!repo) throw new Error(`${this.opts.repoRoot} is not a git repository`);
+      this.repo = repo;
+      await this.opts.resolver.refresh();
+      const base = await repo.headCommit();
+      this.baseCommit = base;
+      this.integration = await repo.createWorktree(base, `pi-eng-pw-${slug(brief.mission_id)}`);
+      try {
+        if (!(await this.planMission())) return await this.finish("failed");
+        return await this.proceed();
+      } finally {
+        await this.cleanup();
+      }
     } finally {
-      await this.cleanup();
+      await lock.release();
     }
   }
 
@@ -253,6 +272,17 @@ export class PlannerWorkerExecutor {
    * head. Works after a clean abort and after a crash that left worktrees.
    */
   async resume(): Promise<PlannerWorkerReport> {
+    // Refuse while another live process runs this mission: resuming rebuilds
+    // the integration worktree and discards unfinished contracts' worktrees.
+    const lock = await acquireMissionLock(this.opts.stateDir);
+    try {
+      return await this.resumeLocked();
+    } finally {
+      await lock.release();
+    }
+  }
+
+  private async resumeLocked(): Promise<PlannerWorkerReport> {
     const saved = JSON.parse(await readFile(join(this.opts.stateDir, "state.json"), "utf8")) as ResumableState;
     if (!saved.brief || !saved.integration_branch || !saved.base_commit) {
       throw new Error(`${this.opts.stateDir} has no resumable planner-worker state`);
@@ -268,6 +298,7 @@ export class PlannerWorkerExecutor {
     this.integration = await this.reattachIntegration(saved.integration_branch, saved.integration_path);
     try {
       this.plan = saved.plan;
+      this.plannerModel = saved.planner_model ?? null;
       this.replans = saved.replans ?? 0;
       this.finalFixUsed = saved.contracts.some((c) => c.contract.task_id === "final-fix");
       this.telemetry.seed(saved.metrics ?? []);
@@ -282,6 +313,8 @@ export class PlannerWorkerExecutor {
           this.addContract(prior.contract);
           const rt = this.contracts.get(id)!;
           rt.state = { ...prior, worktree: null };
+          // The final review covers every contract, so restore what this one integrated.
+          rt.diff = await this.integratedDiff(id);
           this.results.set(id, { task_id: id, summary: prior.summary, changed_files: prior.changed_files });
           kept++;
           continue;
@@ -532,6 +565,11 @@ export class PlannerWorkerExecutor {
   /** One implementation attempt; returns "done" when the contract left the running loop. */
   private async attempt(rt: Runtime): Promise<"again" | "done"> {
     const c = rt.state.contract;
+    // An aborted mission starts no further work: the DAG driver waits for us.
+    if (this.opts.signal?.aborted) {
+      this.forceFail(rt, "aborted");
+      return "done";
+    }
     rt.state.attempt += 1;
     rt.attemptsOnRung += 1;
     const role: PlannerWorkerRole =
@@ -579,7 +617,15 @@ export class PlannerWorkerExecutor {
     rt.verification = [];
     if (run.result.status !== "failed") {
       for (const cmd of rt.state.correction?.verification ?? c.verification) {
-        rt.verification.push(await runVerification(cmd, rt.worktree!.path, this.opts.verificationTimeoutMs));
+        if (this.opts.signal?.aborted) break;
+        rt.verification.push(
+          await runVerification(cmd, rt.worktree!.path, {
+            ...(this.opts.verificationInactivityMs !== undefined
+              ? { inactivityMs: this.opts.verificationInactivityMs }
+              : {}),
+            ...(this.opts.signal ? { signal: this.opts.signal } : {}),
+          }),
+        );
       }
     }
     const failedVerification = rt.verification.filter((v) => !v.passed);
@@ -803,14 +849,10 @@ export class PlannerWorkerExecutor {
     for (let guard = 0; guard < 8; guard++) {
       await this.syncRoutes(task, role);
       const t0 = Date.now();
-      const run = await this.opts.worker.run({
-        ...req,
-        ...(resolved ? { modelOverride: resolved.model } : {}),
-        ...(this.opts.signal ? { signal: this.opts.signal } : {}),
-        ...(this.opts.workerTimeoutMs ? { timeoutMs: this.opts.workerTimeoutMs } : {}),
-      });
+      const run = await this.watched({ ...req, ...(resolved ? { modelOverride: resolved.model } : {}) });
       this.telemetry.invocation(role, modelName(resolved), run, Date.now() - t0);
       this.observeRoute(run, role, task);
+      if (this.opts.signal?.aborted) return run;
       const availability = run.result.status === "failed" ? availabilityOf(run) : null;
       if (!availability || !resolved) return run;
       const decision = decideAvailability(availability.code, strikes, availability.retryAfterMs);
@@ -831,6 +873,61 @@ export class PlannerWorkerExecutor {
       strikes = 0;
     }
     throw new Error(`${role} for ${task}: model availability did not settle`);
+  }
+
+  /**
+   * Run one worker under its own liveness watchdog, whether or not the mission
+   * has an abort signal: the worker is aborted (`InactivityError`) only after
+   * `workerInactivityMs` with no activity at all. Any activity re-arms it, and
+   * while THIS worker reports it is waiting for inference capacity the window
+   * stays open however long the wait lasts — another worker's queue never
+   * hides this one hanging. The worker always gets an owner signal, so the
+   * executor's standalone fallback guard never applies, and waits for
+   * gateway capacity without a retry cap. A total-duration limit exists only
+   * when the operator opts in (`workerTimeoutMs`).
+   */
+  private async watched(req: WorkerRequest): Promise<WorkerRun> {
+    const ctl = new AbortController();
+    const mission = this.opts.signal;
+    const onMissionAbort = (): void => ctl.abort(mission?.reason);
+    if (mission?.aborted) onMissionAbort();
+    else mission?.addEventListener("abort", onMissionAbort, { once: true });
+    const windowMs = this.opts.workerInactivityMs ?? workerInactivityMs();
+    let lastActivity = Date.now();
+    let waitingForInference = false;
+    const onActivity = (event: WorkerActivity): void => {
+      if (event.kind !== "heartbeat") {
+        lastActivity = Date.now();
+        waitingForInference = event.summary === WAITING_FOR_INFERENCE_SUMMARY;
+      }
+      req.onActivity?.(event);
+    };
+    const watchdog = setInterval(
+      () => {
+        if (ctl.signal.aborted) return;
+        const now = Date.now();
+        if (waitingForInference) lastActivity = now;
+        else if (now - lastActivity >= windowMs) {
+          ctl.abort(new DOMException(`worker showed no activity for ${windowMs}ms (hung worker)`, "InactivityError"));
+        }
+      },
+      Math.max(5, Math.min(30_000, Math.floor(windowMs / 4))),
+    );
+    const limit = this.opts.workerTimeoutMs ?? workerTimeoutMs();
+    const deadline =
+      limit === undefined
+        ? undefined
+        : setTimeout(
+            () => ctl.abort(new DOMException(`worker exceeded its configured ${limit}ms limit`, "TimeoutError")),
+            limit,
+          );
+    try {
+      return await this.opts.worker.run({ ...req, signal: ctl.signal, onActivity, unboundedInferenceWait: true });
+    } finally {
+      clearInterval(watchdog);
+      if (deadline) clearTimeout(deadline);
+      mission?.removeEventListener("abort", onMissionAbort);
+    }
   }
 
   /**
@@ -1068,6 +1165,8 @@ export class PlannerWorkerExecutor {
       .map((x) => x.state.contract.task_id);
     const remaining = [...this.contracts.values()].filter((x) => x.state.status !== "passed");
     const planner = await this.opts.resolver.resolve("planner");
+    // Implementers must stay separated from whichever model plans next.
+    if (planner) this.plannerModel = servedIdentity(planner);
     this.recordTransition("planner", "planner", planner, "replanning", rt.state.contract.task_id);
     const result = await runPlanner({
       worker: this.roleWorker("planner", planner, "replan"),
@@ -1130,6 +1229,18 @@ export class PlannerWorkerExecutor {
     const names = (await git(path, ["diff", "--name-only", rt.baseCommit, head])).stdout;
     rt.state.changed_files = names.split("\n").filter(Boolean);
     return rt.state.changed_files;
+  }
+
+  /** The change a contract's integration merge brought in ("" when it changed nothing). */
+  private async integratedDiff(id: string): Promise<string> {
+    const subject = `pw: integrate ${id}`;
+    const log = await git(this.integration.path, ["log", "--merges", "--format=%H%x00%s"]);
+    const merge = log.stdout
+      .split("\n")
+      .map((line) => line.split("\0"))
+      .find(([, s]) => s === subject)?.[0];
+    if (!merge) return "";
+    return (await git(this.integration.path, ["diff", `${merge}^1`, merge, "--", ".", ":!package-lock.json"])).stdout;
   }
 
   private integrate(rt: Runtime): Promise<{ ok: boolean; reason: string }> {
@@ -1290,6 +1401,7 @@ export class PlannerWorkerExecutor {
       base_commit: this.baseCommit,
       integration_branch: this.integration?.branch ?? null,
       integration_path: this.integration?.path ?? null,
+      planner_model: this.plannerModel,
       plan: this.plan,
       updated_at: new Date().toISOString(),
     });
@@ -1327,6 +1439,7 @@ interface ResumableState {
   transitions?: PlannerWorkerReport["transitions"];
   metrics?: PlannerWorkerReport["metrics"];
   replans?: number;
+  planner_model?: string | null;
 }
 
 function slug(s: string): string {

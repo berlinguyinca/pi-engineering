@@ -13,11 +13,14 @@
  * as MODEL_TRANSITION events in the same log and checked for context fit.
  */
 
+import { randomBytes } from "node:crypto";
 import { stat } from "node:fs/promises";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { createRoleRouter } from "../capability/adapter.ts";
 import type { RoleName } from "../capability/roles.ts";
+import { loadMissionLimits } from "../lifecycle/policy.ts";
+import { workerInactivityMs } from "../orchestration/broker.ts";
 import type { WorkerExecutor } from "../workers/WorkerExecutor.ts";
 import {
   type PlannerWorkerConfig,
@@ -47,6 +50,18 @@ export interface PlannerWorkerIntegration {
   runIfSelected(request: string, ctx: ExtensionCommandContext): Promise<boolean>;
   /** Resume an interrupted planner-worker mission (`PW-…`); false when it is not one. */
   resumeIfOwned(missionId: string, ctx: ExtensionCommandContext): Promise<boolean>;
+}
+
+/**
+ * A fresh mission id: the start second plus a random suffix, so two missions
+ * started in the same second never share a state directory or branches.
+ */
+export function newMissionId(at: Date = new Date()): string {
+  const stamp = at
+    .toISOString()
+    .replace(/[-:.TZ]/g, "")
+    .slice(0, 14);
+  return `PW-${stamp}-${randomBytes(3).toString("hex")}`;
 }
 
 /** Handle one of the `/engineering-*` commands; returns the operator text. */
@@ -184,13 +199,16 @@ export function registerPlannerWorker(
     return { host, config, ...built, reason: decision.reason };
   }
 
-  function executorFor(
+  async function executorFor(
     ctx: ExtensionCommandContext,
     host: PlannerWorkerHost,
     config: PlannerWorkerConfig,
     built: { resolver: RoleResolver; conn: { baseUrl: string; apiKey?: string } | null },
     missionId: string,
-  ): PlannerWorkerExecutor {
+  ): Promise<PlannerWorkerExecutor> {
+    // Same hung-worker window as every other mission worker: the environment
+    // override wins, then `limits.worker_inactivity_ms`, then 1 h.
+    const limits = await loadMissionLimits(host.repoRoot);
     return new PlannerWorkerExecutor({
       repoRoot: host.repoRoot,
       worker: host.worker,
@@ -199,6 +217,9 @@ export function registerPlannerWorker(
       concurrency: config.concurrency,
       ladder: config.ladder,
       convergence: config.convergence,
+      workerInactivityMs: process.env.PI_ENGINEERING_WORKER_INACTIVITY_MS
+        ? workerInactivityMs()
+        : limits.worker_inactivity_ms,
       ...(built.conn ? { routeEvents: new RouteEventFollower(built.conn) } : {}),
       ...(ctx.signal ? { signal: ctx.signal } : {}),
       onEvent: (e) => {
@@ -243,11 +264,8 @@ export function registerPlannerWorker(
       const selected = await select(request, ctx).catch(() => null);
       if (!selected) return false;
       ctx.ui.notify(`engineering mode: planner-worker (${selected.reason})`, "info");
-      const missionId = `PW-${new Date()
-        .toISOString()
-        .replace(/[-:.TZ]/g, "")
-        .slice(0, 14)}`;
-      const executor = executorFor(ctx, selected.host, selected.config, selected, missionId);
+      const missionId = newMissionId();
+      const executor = await executorFor(ctx, selected.host, selected.config, selected, missionId);
       await report(ctx, missionId, () =>
         executor.run({
           mission_id: missionId,
@@ -271,7 +289,7 @@ export function registerPlannerWorker(
         conn: null,
       };
       ctx.ui.notify(`[${missionId}] resuming planner-worker mission`, "info");
-      await report(ctx, missionId, () => executorFor(ctx, host, config, built, missionId).resume());
+      await report(ctx, missionId, async () => (await executorFor(ctx, host, config, built, missionId)).resume());
       return true;
     },
   };

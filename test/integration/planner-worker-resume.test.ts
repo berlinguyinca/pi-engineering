@@ -98,6 +98,7 @@ await new PlannerWorkerExecutor({
   assert.equal(signal, "SIGKILL");
 
   const before = JSON.parse(await readFile(join(stateDir, "state.json"), "utf8"));
+  assert.equal(before.planner_model, "flash-a", "the planner model is part of the durable state");
   assert.equal(
     before.contracts.find((c: { contract: { task_id: string } }) => c.contract.task_id === "one").status,
     "passed",
@@ -125,6 +126,17 @@ await new PlannerWorkerExecutor({
   }
   assert.equal((await exec("git", ["-C", fixture.root, "worktree", "list"])).stdout.trim().split("\n").length, 1);
   assert.equal((await exec("git", ["-C", fixture.root, "branch", "--list", "pi-eng-pw-*"])).stdout.trim(), "");
+  // Implementers stay separated from the planner after a restart.
+  const after_ = JSON.parse(await readFile(join(stateDir, "state.json"), "utf8"));
+  assert.equal(after_.planner_model, "flash-a", "resume restores the planner model");
+  // The final review covers contracts integrated before the crash too.
+  const finalReview = server.requests.find(
+    (r) => r.system.startsWith("You are the REVIEWER") && taskOf(r) === "final-review",
+  );
+  assert.ok(finalReview, "a final review ran");
+  for (const id of ["one", "two", "three"]) {
+    assert.ok(finalReview.user.includes(`+++ b/src/${id}/done.txt`), `final review diff covers ${id}`);
+  }
   // Telemetry and transitions continue across the restart.
   assert.ok((report.metrics.find((m) => m.role === "implementer")?.accepted_tasks ?? 0) >= 3);
   await assert.rejects(

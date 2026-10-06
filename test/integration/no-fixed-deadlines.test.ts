@@ -13,6 +13,7 @@ import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import { AdmissionController } from "../../src/gateway/AdmissionController.ts";
+import { sharedAdmissionController } from "../../src/gateway/config.ts";
 import { GitRepo } from "../../src/git/GitRepo.ts";
 import {
   type BrokerBackends,
@@ -32,6 +33,7 @@ import { DEFAULT_WORKSET_POLICY } from "../../src/orchestration/workset.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 import { DEFAULT_GATEWAY_RESILIENCE } from "../../src/resilience/config.ts";
 import type { WorkerActivity } from "../../src/workers/WorkerExecutor.ts";
+import { WAITING_FOR_INFERENCE_SUMMARY } from "../../src/workers/activity.ts";
 import { makeFixtureRepo } from "../fixtures/make-fixture.ts";
 
 /**
@@ -218,6 +220,67 @@ describe("no fixed mission deadlines: the broker", () => {
     const outcome = await handle.result();
     assert.equal(outcome.exitStatus, "succeeded", outcome.summary);
     assert.equal(outcome.error, undefined);
+  });
+
+  it("does not let another caller queued for capacity hide this execution hanging", async () => {
+    const store = MissionStore.open(JsonlEventStore.inMemory());
+    const { mission, task } = missionWithTask(store);
+    // Someone else in this process is parked behind the gateway for a minute.
+    const other = new AbortController();
+    const parked = sharedAdmissionController().noteCallerWaitAndSleep(
+      { retryAfterMs: 60_000, source: "body", retryable: true, reason: "queue_timeout" },
+      { signal: other.signal },
+    );
+    try {
+      assert.ok(sharedAdmissionController().status().waiting > 0);
+      const broker = new ExecutionBroker({
+        store,
+        inactivityTimeoutMs: 400,
+        cancellationAckTimeoutMs: 200,
+        backends: { agent: { runAgent: ({ signal }) => childWorker({ everyMs: 0, forMs: 30_000, signal }) } },
+      });
+      const started = Date.now();
+      const handle = await broker.execute({
+        taskId: task.task_id,
+        missionId: mission.mission_id,
+        kind: "agent",
+        objective: task.objective,
+      });
+      const outcome = await handle.result();
+      assert.equal(outcome.error, INACTIVITY_MARKER, "the hung worker is caught although another caller waits");
+      assert.ok(Date.now() - started < 10_000);
+    } finally {
+      other.abort();
+      await parked;
+    }
+  });
+
+  it("keeps an execution alive while IT reports waiting for inference capacity", async () => {
+    const store = MissionStore.open(JsonlEventStore.inMemory());
+    const { mission, task } = missionWithTask(store);
+    const broker = new ExecutionBroker({
+      store,
+      inactivityTimeoutMs: 300,
+      backends: {
+        agent: {
+          runAgent: async ({ signal, onActivity }) => {
+            onActivity?.({ kind: "state", summary: WAITING_FOR_INFERENCE_SUMMARY, meaningfulProgress: false });
+            // A gateway hold far longer than the window, with no further signal.
+            await new Promise((r) => setTimeout(r, 1_500));
+            onActivity?.({ kind: "state", summary: "Worker session started", meaningfulProgress: false });
+            return childWorker({ everyMs: 40, forMs: 200, signal, ...(onActivity ? { onActivity } : {}) });
+          },
+        },
+      },
+    });
+    const handle = await broker.execute({
+      taskId: task.task_id,
+      missionId: mission.mission_id,
+      kind: "agent",
+      objective: task.objective,
+    });
+    const outcome = await handle.result();
+    assert.equal(outcome.exitStatus, "succeeded", outcome.summary);
   });
 
   it("still enforces an explicitly configured wall-clock limit", async () => {
