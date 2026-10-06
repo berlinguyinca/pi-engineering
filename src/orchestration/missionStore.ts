@@ -2377,6 +2377,18 @@ export class MissionStore {
     return lease ? { ...lease } : undefined;
   }
 
+  /**
+   * Apply events other sessions appended to this namespace since the last
+   * read (per-session streams). A no-op for single-stream backends. Returns how
+   * many events were applied.
+   */
+  syncExternal(): number {
+    const backend = this.backend as EventStoreBackend & { refresh?: () => StoredEvent[] };
+    const fresh = backend.refresh?.() ?? [];
+    for (const event of fresh) this.apply(fromStored(event));
+    return fresh.length;
+  }
+
   /** Local takeover is permitted only while this process owns the JSONL writer boundary. */
   hasExclusiveWriterAuthority(): boolean {
     const backend = this.backend as EventStoreBackend & {

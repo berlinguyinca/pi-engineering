@@ -558,11 +558,7 @@ describe("orchestration via real EngineeringRuntime (acceptance scenarios)", () 
     });
     assert.equal(paused.mission.status, "PAUSED_INFRASTRUCTURE");
     await rt1.missionStore!.flush();
-    const persistedEvents = (await readFile(join(rt1.workDir, "orchestration.jsonl"), "utf8"))
-      .trim()
-      .split("\n")
-      .filter(Boolean)
-      .map((line) => JSON.parse(line));
+    const persistedEvents = rt1.orchestrationEvents();
     const replayBackend = JsonlEventStore.inMemory();
     await replayBackend.appendAll(persistedEvents);
     const replayedStore = MissionStore.open(replayBackend);

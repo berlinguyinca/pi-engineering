@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
+import { realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import { promisify } from "node:util";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
@@ -58,6 +59,12 @@ import { resolveRequestBodyBudgetConfig } from "../src/request/bodyBudget.ts";
 import { resolveThinkingOffConfig } from "../src/request/thinkingPolicy.ts";
 import { RoadmapEngine } from "../src/roadmap/RoadmapEngine.ts";
 import { EngineeringRuntime, type RuntimeMissionActivityEvent } from "../src/runtime/EngineeringRuntime.ts";
+import { sessionBindingInfo } from "../src/runtime/isolation/RuntimeBinding.ts";
+import { RuntimeSession } from "../src/runtime/isolation/RuntimeSession.ts";
+import { effectiveWorkspace, workspaceForPath } from "../src/runtime/isolation/WorkspaceResolver.ts";
+import { formatDoctorReport, runDoctor } from "../src/runtime/isolation/doctor.ts";
+import { emitRuntimeEvent } from "../src/runtime/isolation/runtimeEvents.ts";
+import { formatRuntimeStatus, runtimeStatus } from "../src/runtime/isolation/status.ts";
 import {
   type MissionBrief,
   type SessionControlServer,
@@ -204,7 +211,79 @@ const inferweave: InferweaveProvider | null = inferweaveConfig.enabled
   : null;
 
 async function getRuntime(ctx: ExtensionCommandContext, worker?: EngineeringRuntime): Promise<EngineeringRuntime> {
-  return getRuntimeByCwd(worker ? worker.cwd : ctx.cwd, ctx.model);
+  return getRuntimeByCwd(worker ? worker.cwd : runtimeCwd(ctx.cwd), ctx.model);
+}
+
+/**
+ * The directory whose runtime serves a launch cwd. After a parent-directory
+ * launch rebinds to a nested worktree (spec §2/§3), the launch cwd resolves to
+ * that worktree; otherwise to itself.
+ */
+function runtimeCwd(cwd: string): string {
+  return effectiveWorkspace(cwd, RuntimeSession.current().binding?.worktreePath);
+}
+
+const workspaceRebinds = new Map<string, Promise<void>>();
+
+function canonicalPath(path: string): string {
+  try {
+    return realpathSync(path);
+  } catch {
+    return resolve(path);
+  }
+}
+
+/**
+ * Rebind the session when activity (a tool's `path`) shows work moving into a
+ * different git worktree beneath the launch directory. The destination runtime
+ * is opened (resolved, registered, migrated) BEFORE the session pointer moves,
+ * and the move itself is one registry transaction; any failure leaves the
+ * current binding in force.
+ */
+function observeWorkspaceActivity(cwd: string, args: unknown): Promise<void> {
+  const path = args && typeof args === "object" ? (args as { path?: unknown }).path : undefined;
+  if (typeof path !== "string" || !path.trim()) return Promise.resolve();
+  const flight = (async () => {
+    const session = RuntimeSession.current();
+    const launchKey = canonicalPath(await repoCacheKey(cwd).catch(() => cwd));
+    const target = await workspaceForPath(cwd, path, session.binding?.worktreePath ?? null);
+    // Never rebind back onto the launch directory's own worktree: in a parent
+    // launch that worktree is the container, not the project being worked on.
+    if (!target || target.worktreeRoot === launchKey) return;
+    const existing = workspaceRebinds.get(target.worktreeId);
+    if (existing) return existing;
+    const rebind = (async () => {
+      // Destination first: resolved, registered, migrated and open.
+      const runtime = await getRuntimeByCwd(target.worktreeRoot);
+      // Flush the current binding's pending writes so nothing is in flight
+      // across the switch.
+      const previous = session.binding?.worktreeId;
+      for (const entry of runtimes.values()) {
+        if (previous && entry.runtime.runtimeBinding?.identity.worktreeId === previous) {
+          await entry.runtime.missionStore?.flush();
+        }
+      }
+      if (runtime.runtimeBinding) session.bindTo(sessionBindingInfo(runtime.runtimeBinding));
+    })().finally(() => workspaceRebinds.delete(target.worktreeId));
+    workspaceRebinds.set(target.worktreeId, rebind);
+    return rebind;
+  })().catch((error: unknown) => {
+    emitRuntimeEvent("runtime.rebind_failed", {
+      session_id: RuntimeSession.current().sessionId,
+      path,
+      reason: error instanceof Error ? error.message : String(error),
+    });
+  });
+  workspaceActivity.add(flight);
+  void flight.finally(() => workspaceActivity.delete(flight));
+  return flight;
+}
+
+const workspaceActivity = new Set<Promise<void>>();
+
+/** Wait for in-flight workspace rebinding (tests and orderly shutdown). */
+export async function settleWorkspaceActivity(): Promise<void> {
+  while (workspaceActivity.size > 0) await Promise.allSettled([...workspaceActivity]);
 }
 
 /**
@@ -458,27 +537,29 @@ async function repoCacheKey(cwd: string): Promise<string> {
   return key;
 }
 
+/** The real reason the runtime did not open, by cwd, for tool results. */
+const runtimeOpenFailures = new Map<string, string>();
+
 /**
  * Resolve tools to the runtime for the calling cwd, opening it lazily so the
  * semantic tools work in the interactive session without a prior command.
  */
 async function resolveServices(cwd: string): Promise<CoreServices | null> {
   let rt: EngineeringRuntime;
+  const effective = runtimeCwd(cwd);
   try {
-    rt = await getRuntimeByCwd(cwd);
+    rt = await getRuntimeByCwd(effective);
+    runtimeOpenFailures.delete(cwd);
   } catch (error) {
-    // Surface the REAL reason the runtime did not open (most commonly the
-    // orchestration store's single-writer lock being held by another session
-    // launched from the same parent directory) instead of a bare "not
-    // initialized" — and point the operator at the remedy.
+    // Concurrency is not a failure mode any more (per-session event streams,
+    // automatic stale-owner recovery), so what reaches here is a genuine
+    // filesystem/permission problem. Surface the REAL reason — in the tool
+    // result too — and never ask the operator to tune internal coordination.
     const message = error instanceof Error ? error.message : String(error);
-    const held = /writer lock/i.test(message);
-    const remedy = held
-      ? " Set PI_ENGINEERING_ORCHESTRATION_DIR to a per-worktree directory (or launch the session from within the worktree) so concurrent sessions do not share one orchestration store lock."
-      : ".";
+    runtimeOpenFailures.set(cwd, message);
     const notice: TelemetryNotice = {
       level: "warning",
-      text: `Engineering runtime did not open for ${cwd}: ${message}${remedy}`,
+      text: `Engineering runtime did not open for ${cwd}: ${message}`,
       key: `runtime-open:${cwd}`,
     };
     if (allowRuntimeDiagnostic(notice)) emitTelemetry(notice);
@@ -495,6 +576,8 @@ async function resolveServices(cwd: string): Promise<CoreServices | null> {
       return w ? w.id : null;
     },
     actor: () => ({ type: "user" }),
+    // A rebound parent launch targets the bound worktree by default.
+    ...(effective !== cwd ? { repositoryRoot: rt.git?.root ?? effective } : {}),
   };
 }
 
@@ -567,6 +650,11 @@ export default function (pi: ExtensionAPI) {
       }
     });
     pi.on("tool_execution_start", (event) => activeControl?.toolStarted(event.toolName, event.toolCallId));
+    // Parent-directory launches follow the work: a touched path inside a nested
+    // worktree rebinds the session there (fire-and-forget; never blocks a tool).
+    pi.on("tool_execution_start", (event, ctx) => {
+      void observeWorkspaceActivity(ctx.cwd, event.args);
+    });
     pi.on("tool_execution_update", (event) => {
       const content = event.toolName === "mission" ? event.partialResult?.content : null;
       const progress = Array.isArray(content) && typeof content[0]?.text === "string" ? content[0].text : undefined;
@@ -580,7 +668,9 @@ export default function (pi: ExtensionAPI) {
     });
   }
   // Semantic tools resolved against the runtime for the calling cwd.
-  for (const tool of buildCoreTools(resolveServices)) {
+  for (const tool of buildCoreTools(resolveServices, {
+    unavailableReason: (cwd) => runtimeOpenFailures.get(cwd) ?? null,
+  })) {
     pi.registerTool(tool);
   }
 
@@ -2139,6 +2229,28 @@ ${RECOVERY_PROMPT}`;
         `render: ${renderStatus(s, 120, statusBarConfig)}`,
       ];
       ctx.ui.notify(lines.join("\n"), "info");
+    },
+  });
+
+  pi.registerCommand("pi-engineering", {
+    description:
+      "Engineering runtime introspection: `status` (default), `events` (recent runtime decisions), `doctor [--repair]`.",
+    handler: async (args, ctx) => {
+      const words = (args ?? "").trim().split(/\s+/).filter(Boolean);
+      const sub = words[0] ?? "status";
+      if (sub === "status" || sub === "events") {
+        // Opening the runtime for this cwd binds an unbound session first.
+        await resolveServices(ctx.cwd);
+        const report = runtimeStatus({ events: sub === "events" ? 25 : 0 });
+        ctx.ui.notify(formatRuntimeStatus(report), "info");
+        return;
+      }
+      if (sub === "doctor") {
+        const report = await runDoctor({ cwd: runtimeCwd(ctx.cwd), repair: words.includes("--repair") });
+        ctx.ui.notify(formatDoctorReport(report), report.fatal ? "error" : "info");
+        return;
+      }
+      ctx.ui.notify("/pi-engineering [status | events | doctor [--repair]]", "error");
     },
   });
 

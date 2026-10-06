@@ -270,7 +270,160 @@ async function releaseRecoveryClaim(path: string, observed: OwnerRecord): Promis
   }
 }
 
+async function publishOwnerRecord(path: string, owner: FileLockOwner): Promise<void> {
+  const candidate = `${path}.publish.${owner.ownerToken}`;
+  await writeFile(candidate, `${JSON.stringify(owner)}\n`, { encoding: "utf8", flag: "wx" });
+  try {
+    // link(2) refuses an existing destination, so this is the same atomic
+    // create-if-absent as O_EXCL — but of a name whose content is complete.
+    await link(candidate, path);
+  } finally {
+    await rm(candidate, { force: true });
+  }
+}
+
+/** A JSON owner record that names a usable pid even though it is not a complete owner. */
+async function readPartialOwner(path: string): Promise<{ pid: number; host: string } | undefined> {
+  try {
+    const value: unknown = JSON.parse(await readFile(path, "utf8"));
+    if (!value || typeof value !== "object") return undefined;
+    const record = value as { pid?: unknown; host?: unknown };
+    if (typeof record.pid !== "number" || !Number.isSafeInteger(record.pid) || record.pid <= 0) return undefined;
+    const host = typeof record.host === "string" && record.host.trim() ? record.host : hostname();
+    return { pid: record.pid, host };
+  } catch {
+    return undefined;
+  }
+}
+
+function pidExists(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+/** How long an unreadable owner record may be "being written" before it is treated as corrupt. */
+export const UNREADABLE_OWNER_GRACE_MS = 2_000;
+
+function stampNow(): string {
+  return new Date()
+    .toISOString()
+    .replace(/[-:]/g, "")
+    .replace(/\.\d+Z$/, "Z");
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolveDelay) => setTimeout(resolveDelay, ms));
+}
+
+/**
+ * Quarantine a lock whose owner record is missing, empty, partial, or not JSON.
+ *
+ * Writers that predate atomic publication created the name first and filled it
+ * second, and a crash between the two leaves exactly this state; a directory
+ * left by an older lock layout reads the same way. Neither proves a live owner,
+ * so after a grace period (no writer takes that long to write one line) the
+ * entry is renamed aside — never deleted — and acquisition retries. Recovery is
+ * serialized per observed inode by the same claim protocol as stale owners, and
+ * the rename is identity-checked, so a lock that a live process publishes in the
+ * meantime is restored rather than stolen.
+ */
+async function recoverUnreadableOwner(
+  file: string,
+  path: string,
+  owner: FileLockOwner,
+  hooks: FileLockRecoveryHooks,
+): Promise<void> {
+  let observed: { dev: bigint; ino: bigint; mtimeMs: bigint };
+  try {
+    observed = await lstat(path, { bigint: true });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw error;
+  }
+  const partial = await readPartialOwner(path);
+  if (partial) {
+    // An owner that names a usable pid but lacks a verifiable incarnation
+    // (e.g. written by an older layout). It is only reclaimable when that pid
+    // is provably gone; a live or remote pid fails closed.
+    if (partial.host !== hostname()) {
+      throw new Error(
+        `JSONL writer lock for ${file} is held (pid=${partial.pid} host=${partial.host}; incarnation unverifiable)`,
+      );
+    }
+    if (pidExists(partial.pid)) {
+      throw new Error(`JSONL writer lock for ${file} is held (pid=${partial.pid}; incarnation unverifiable)`);
+    }
+  }
+  const graceMs = partial ? 0 : (hooks.unreadableOwnerGraceMs ?? UNREADABLE_OWNER_GRACE_MS);
+  if (Date.now() - Number(observed.mtimeMs) < graceMs) {
+    await delay(Math.min(50, Math.max(5, graceMs / 10)));
+    return;
+  }
+  const claimPath = recoveryClaimPath(path, `unreadable-${observed.dev}-${observed.ino}`);
+  const claim = await publishRecoveryClaim(claimPath, owner, hooks);
+  if (!claim) {
+    const claimant = await readOwnerRecord(claimPath);
+    if (!claimant) {
+      await delay(10);
+      return;
+    }
+    try {
+      if (ownerState(claimant.owner) === "stale") {
+        await quarantineObserved(
+          claimPath,
+          claimant,
+          `${claimPath}.reap.${process.pid}.${randomUUID()}`,
+          `JSONL writer recovery claim identity changed unexpectedly for ${file}; replacement was restored or preserved`,
+        );
+      } else {
+        await delay(10);
+      }
+    } finally {
+      await closeOwnerRecord(claimant);
+    }
+    return;
+  }
+  try {
+    let current: { dev: bigint; ino: bigint };
+    try {
+      current = await lstat(path, { bigint: true });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+      throw error;
+    }
+    if (current.dev !== observed.dev || current.ino !== observed.ino) return;
+    const readable = await readOwnerRecord(path);
+    if (readable) {
+      await closeOwnerRecord(readable);
+      return;
+    }
+    const quarantine = `${path}.corrupt.${stampNow()}.${randomUUID()}`;
+    try {
+      await rename(path, quarantine);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+      throw error;
+    }
+    const moved = await lstat(quarantine, { bigint: true });
+    if (moved.dev !== observed.dev || moved.ino !== observed.ino) {
+      await restoreQuarantined(path, quarantine);
+      throw new Error(`JSONL writer lock identity changed during corrupt-owner quarantine for ${file}`);
+    }
+    hooks.onUnreadableOwnerQuarantined?.(path, quarantine);
+  } finally {
+    await releaseRecoveryClaim(claimPath, claim);
+  }
+}
+
 export interface FileLockRecoveryHooks {
+  /** Grace before an unreadable owner record counts as corrupt (tests shorten it). */
+  unreadableOwnerGraceMs?: number;
+  /** Observer: an unreadable owner record was moved aside (kept for diagnostics). */
+  onUnreadableOwnerQuarantined?: (path: string, quarantinePath: string) => void;
   /** Deterministic crash/race injection points; production callers omit these. */
   afterRecoveryClaimPublished?: (claimPath: string, owner: FileLockOwner) => Promise<void> | void;
   beforeRecoveryClaimReap?: (claimPath: string, claimant: FileLockOwner) => Promise<void> | void;
@@ -346,7 +499,9 @@ export class ExclusiveFileLock {
 
     for (;;) {
       try {
-        await writeFile(path, `${JSON.stringify(owner)}\n`, { encoding: "utf8", flag: "wx" });
+        // Publish the fully written owner record atomically (write + link), so
+        // the lock name is never visible with empty or partial metadata.
+        await publishOwnerRecord(path, owner);
         const descriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
         try {
           const identity = fstatSync(descriptor, { bigint: true });
@@ -363,7 +518,11 @@ export class ExclusiveFileLock {
         if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
         const currentRecord = await readOwnerRecord(path);
         if (!currentRecord) {
-          throw new Error(`JSONL writer lock for ${file} is held (owner metadata is missing or unreadable)`);
+          // Missing/unreadable owner metadata is recoverable, never fatal: once
+          // the record is old enough that no writer can still be filling it, it
+          // is quarantined (kept for diagnostics) and acquisition retries.
+          await recoverUnreadableOwner(file, path, owner, hooks);
+          continue;
         }
         try {
           const current = currentRecord.owner;

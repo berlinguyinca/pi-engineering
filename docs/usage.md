@@ -186,43 +186,44 @@ The ledger is event-sourced and replayed on open, so **no run depends on the
 interactive transcript surviving** — you can close and reopen pi and `/ledger`
 still shows prior work items, candidates, and evidence.
 
-### Concurrent sessions and per-worktree stores
+### Concurrent sessions, parent-directory launches, and recovery
 
-The durable mission store — `.pi-eng/orchestration.jsonl` — is **single-writer**:
-its file lock is held by exactly one process at a time. By default it lives in
-the git toplevel of the session's launch directory, so every session launched
-from the *same* parent directory shares one store and serializes on that one
-lock. That is wrong when you run several sessions at once — one per project,
-branch, or worktree — that never touch the same files: a session working on
-worktree A is blocked from starting a mission while a session working on
-worktree B holds the shared parent store.
+Concurrency is a supported operating mode — there is nothing to configure.
+Open as many Pi sessions as you like, from inside a repository or from a parent
+directory (`cd ~/IdeaProjects && pi`), on the same or different repositories and
+worktrees:
 
-Relocate the store (and its lock) to a per-worktree / per-session directory with
-the `PI_ENGINEERING_ORCHESTRATION_DIR` environment variable:
+- **Machine-local runtime state.** Coordination state lives under
+  `$XDG_STATE_HOME/pi-engineering` (default `~/.local/state/pi-engineering`):
+  a SQLite (WAL) session registry with generation-fenced leases, and one
+  orchestration namespace per git worktree (`worktrees/<worktree-id>/`,
+  identified by git common dir + worktree root, never by directory name).
+- **Per-session writers.** Each session appends only to its own stream
+  (`events/<session-id>.jsonl`); readers see one merged history. There is no
+  shared writer lock to contend on, so a second session never disables
+  engineering features.
+- **Parent launches follow the work.** A session started in a parent directory
+  binds to the worktree you actually work in (the first nested repository whose
+  files it touches) and rebinds transactionally when you move to another one.
+- **Self-healing.** Crashed sessions (SIGKILL, OOM, reboot) are detected from
+  PID + process start time + boot id at the next start; their ownership is
+  reclaimed, a torn final record is quarantined and truncated (valid history is
+  kept), and their missions are adopted by a live session. Stale or garbage lock
+  metadata is quarantined, never fatal.
+- **Legacy stores** (`.pi-eng/orchestration.jsonl`) are imported automatically
+  and left untouched.
+- **Introspection.** `/pi-engineering status` shows the bound worktree,
+  session, health, writer, concurrent sessions and heartbeat;
+  `/pi-engineering events` lists recent runtime decisions (also logged to
+  `sessions/<id>/runtime.jsonl`; set `PI_ENGINEERING_DEBUG_RUNTIME=1` to see them
+  live). `pi-engineering doctor [--repair]` (or `/pi-engineering doctor`)
+  inspects everything and performs only safe repairs.
 
-```bash
-# one store per worktree (kept inside the git-ignored .pi-eng/), so concurrent
-# sessions launched from the same parent do not share one writer lock
-PI_ENGINEERING_ORCHESTRATION_DIR="$PWD/.pi-eng/orch-$(basename "$PWD")" pi ...
-```
-
-Keep the override inside `.pi-eng/` (or elsewhere git-ignored) so the relocated
-store never shows up as an untracked file in `git status`.
-
-Notes:
-- Sessions launched **from within** a worktree already get a per-worktree store
-  automatically (their git toplevel is the worktree), so the variable is only
-  needed for sessions launched from a shared parent directory.
-- The variable moves **only the orchestration store and its lock**. The
-  engineering ledger, artifact store, and mission snapshot stay in
-  `<repoRoot>/.pi-eng/`, so shared per-repo memory is preserved across
-  concurrent sessions.
-- Two sessions pointed at the *same* directory intentionally share one store
-  and serialize (they are coordinating on the same mission state). Point each
-  independent worktree at its own directory to run in parallel.
-- If a `mission`/semantic tool reports the runtime as not initialized, the
-  console now shows the real reason (e.g. the writer lock held by another
-  session) and this remedy instead of a bare "not initialized".
+Expert overrides: `PI_ENGINEERING_STATE_DIR` relocates all runtime state;
+`PI_ENGINEERING_ORCHESTRATION_DIR` pins every worktree's orchestration namespace
+to one directory — still with per-session writers, never a single shared writer.
+If the state directory is on a network filesystem (NFS, SMB, Lustre, BeeGFS…),
+the SQLite registry is kept on a machine-local runtime directory automatically.
 
 ## Interacting with the ledger
 
