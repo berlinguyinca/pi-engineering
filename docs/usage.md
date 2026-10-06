@@ -101,8 +101,12 @@ streaming, no tools, no images. A model whose probe gets HTTP 400 is retried
 once without the optional parameters (`temperature`, `reasoning_effort`). Each
 model gets its own verdict:
 
-- **working**: applied.
-- **excluded**: 404, `model_not_found`, or an empty answer. Pruned.
+- **working**: any answer with a completion, applied. A reasoning model that
+  spends the whole budget thinking (empty text, `finish_reason: length`) is
+  served. Models configured with `reasoning: true` get a 256-token budget.
+- **excluded**: 404 or `model_not_found`, and the model is also gone from a
+  fresh `/models` listing. Pruned. A 404 for a model that is still listed, or
+  one the listing cannot confirm, is inconclusive.
 - **rejected**: still 400, 413 or 422 after the retry.
 - **inconclusive**: 429, 5xx or a timeout.
 
