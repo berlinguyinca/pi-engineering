@@ -18,13 +18,21 @@ import { SourceCache, type TrustedSource, type UpdateChannel } from "../../updat
 import { InstallLayout } from "../../update/installLayout.ts";
 import { UpdateJournal } from "../../update/journal.ts";
 import { type UpdateCheckResult, UpdateManager, type UpdateOutcome, type UpdateRequest } from "../../update/manager.ts";
+import { MetadataError, parseCandidateMetadata, piCompatible } from "../../update/metadata.ts";
 import { MutationLockBusyError, type MutationLockHandle, RuntimeMutationLock } from "../../update/mutationLock.ts";
+import { readPreferences, writePreferences } from "../../update/preferences.ts";
 import { type RecoveryOutcome, recoverInterruptedTransaction } from "../../update/recovery.ts";
+import { applyRetention } from "../../update/retention.ts";
+import { planRollback } from "../../update/rollback.ts";
+import { DEFAULT_CHECK_INTERVAL_MS, shouldCheck } from "../../update/selfUpdate.ts";
+import { runActivation } from "../../update/transaction.ts";
 import type { ValidationMode } from "../../update/validate.ts";
-import { HOST_SUPPORTED_RUNTIME_APIS } from "./contract.ts";
+import { readStateSchema } from "../migrations/schema.ts";
+import { HOST_SUPPORTED_RUNTIME_APIS, PI_ENGINEERING_RUNTIME_API } from "./contract.ts";
 import { ago, formatHandover, short, waitingText } from "./format.ts";
 import { type HandoverHooks, type HandoverResult, type HandoverTask, RuntimeBusyError, RuntimeHost } from "./host.ts";
 import { type RuntimeSource, snapshotRuntimeSource } from "./loader.ts";
+import { publishRuntimeStatus } from "./runtimeStatus.ts";
 import { type RuntimeEventFields, RuntimeTelemetry } from "./telemetry.ts";
 
 export const DEFAULT_RUNTIME_ENTRY = "src/runtime/host/runtimeEntry.ts";
@@ -52,6 +60,8 @@ export interface HostExtensionConfig {
   validation?: ValidationMode;
   /** Allow `npm ci --ignore-scripts` in staging when a candidate's lockfile changed (default true). */
   allowDependencyInstall?: boolean;
+  /** Check for updates automatically at session start (default true; installation stays opt-in). */
+  autoUpdateCheck?: boolean;
 }
 
 export function resolveHostConfig(env: NodeJS.ProcessEnv = process.env): HostExtensionConfig {
@@ -77,7 +87,18 @@ export function resolveHostConfig(env: NodeJS.ProcessEnv = process.env): HostExt
       ? { validation: env.PI_ENGINEERING_UPDATE_VALIDATION }
       : {}),
     allowDependencyInstall: env.PI_ENGINEERING_UPDATE_INSTALL_DEPS !== "0",
+    autoUpdateCheck: env.PI_ENGINEERING_UPDATE_CHECK !== "0",
   };
+}
+
+/** A runtime directory's declared metadata, or null when absent/malformed. */
+export function readCandidateMeta(dir: string): ReturnType<typeof parseCandidateMetadata> | null {
+  try {
+    return parseCandidateMetadata(readFileSync(join(dir, "package.json"), "utf8"), DEFAULT_RUNTIME_ENTRY);
+  } catch (error) {
+    if (error instanceof MetadataError) return null;
+    return null;
+  }
 }
 
 /** The runtime entry a version declares (package.json `piEngineering.entry`), when well-formed. */
@@ -161,7 +182,10 @@ export function describeSource(root: string): { version: string; commit: string 
   return { version, commit };
 }
 
-type Ctx = { ui?: { notify?: (text: string, level?: string) => void }; cwd?: string };
+type Ctx = {
+  ui?: { notify?: (text: string, level?: string) => void; setStatus?: (key: string, text: string | undefined) => void };
+  cwd?: string;
+};
 
 export class EngineeringHostExtension {
   readonly config: HostExtensionConfig;
@@ -227,6 +251,99 @@ export class EngineeringHostExtension {
     const start = await this.startupSources();
     const result = await host.start(start[0] as RuntimeSource, start.slice(1));
     await this.repairPointersAfterStart(result.ok ? host.activeGeneration()?.source : undefined);
+    this.unpublish = publishRuntimeStatus(this, (now) => this.panelLines(now));
+    host.bridge.onHostEvent("session_start", (_event, ctx) => this.onSessionStart(ctx as Ctx));
+    host.bridge.onHostEvent("session_shutdown", () => this.dispose());
+    // Another process mid-update owns the install root's contents for now.
+    if (!this.lock.isHeldByLiveProcess()) await this.retain().catch(() => {});
+  }
+
+  private unpublish: () => void = () => {};
+  private checkTimer: ReturnType<typeof setTimeout> | undefined;
+  /** The last automatic or explicit update check (in memory; spec §14). */
+  lastCheck: UpdateCheckResult | undefined;
+  private checking: Promise<UpdateCheckResult | undefined> | undefined;
+
+  /** Host shutdown: stop the update checker and stop publishing panel status. */
+  dispose(): void {
+    if (this.checkTimer) clearTimeout(this.checkTimer);
+    this.checkTimer = undefined;
+    this.unpublish();
+  }
+
+  /**
+   * Automatic update CHECK (spec §14): enabled by default, never blocks the
+   * session, at most every PI_ENGINEERING_UPDATE_CHECK_INTERVAL (default 4h).
+   * Installation stays off unless the operator turned `autoInstall` on.
+   */
+  private onSessionStart(ctx: Ctx): void {
+    if (this.config.autoUpdateCheck === false) return;
+    const prefs = readPreferences(this.layout.preferencesFile);
+    if (!prefs.autoCheck) return;
+    const last = prefs.lastCheckAt ? Date.parse(prefs.lastCheckAt) : undefined;
+    const interval = Number(process.env.PI_ENGINEERING_UPDATE_CHECK_INTERVAL_MS) || DEFAULT_CHECK_INTERVAL_MS;
+    if (!shouldCheck(Number.isFinite(last) ? last : undefined, Date.now(), interval)) return;
+    // Deferred and unref'd: a network round trip never delays a session start.
+    this.checkTimer = setTimeout(() => {
+      this.checkTimer = undefined;
+      void this.automaticCheck(ctx);
+    }, 0);
+    this.checkTimer.unref?.();
+  }
+
+  async automaticCheck(ctx?: Ctx): Promise<UpdateCheckResult | undefined> {
+    if (this.checking) return this.checking;
+    this.checking = (async () => {
+      try {
+        const check = await this.updates.check({});
+        this.lastCheck = check;
+        const prefs = readPreferences(this.layout.preferencesFile);
+        await writePreferences(this.layout.preferencesFile, {
+          ...prefs,
+          lastCheckAt: new Date().toISOString(),
+          lastAvailable:
+            check.target && !check.upToDate
+              ? { version: check.target.metadata.version, commit: check.target.sha, channel: check.channel }
+              : null,
+        }).catch(() => {});
+        if (check.target && !check.upToDate && !check.failure) {
+          const target = (ctx ?? (this.host?.latestContext() as Ctx | undefined)) as Ctx | undefined;
+          try {
+            target?.ui?.setStatus?.(
+              "pi-engineering-update",
+              `Pi Engineering ${check.current?.version ?? ""} · ${check.target.metadata.version} available`,
+            );
+          } catch {
+            // A stale ctx cannot show a status; the panel still does.
+          }
+          if (prefs.autoInstall && check.pi.ok) {
+            const outcome = await this.updates.update({});
+            this.lastUpdateOutcome = outcome;
+            if (outcome.status === "handover") await outcome.done;
+          }
+        }
+        return check;
+      } catch {
+        return undefined;
+      } finally {
+        this.checking = undefined;
+      }
+    })();
+    return this.checking;
+  }
+
+  /** Retention after startup and after every committed transaction (spec §37). */
+  async retain(): Promise<void> {
+    const running = this.host?.activeGeneration()?.source.root ?? null;
+    const removed = await applyRetention(this.layout, this.journal, { running });
+    if (removed.versions.length + removed.staging.length + removed.checkpoints.length > 0) {
+      this.telemetry.emit("runtime.retention.pruned", {
+        versions: removed.versions.length,
+        staging: removed.staging.length,
+        checkpoints: removed.checkpoints.length,
+      });
+    }
+    await this.host?.pruneSnapshots();
   }
 
   /** Crash recovery under the mutation lock (spec §30). Never blocks startup. */
@@ -304,17 +421,21 @@ export class EngineeringHostExtension {
     if (this.config.devSource) sources.push(await this.checkoutSource(this.config.devSource, "dev"));
     for (const pointer of ["current", "previous"] as const) {
       const dir = this.layout.readPointer(pointer);
-      if (dir) sources.push(this.installedSource(dir, true));
+      // Snapshotted, never imported in place: retention may later remove an
+      // old version, and no process may be running code straight from it.
+      if (dir) sources.push(this.installedSource(dir));
     }
-    if (!this.config.devSource) sources.push(await this.checkoutSource(this.config.packageRoot, "package"));
+    if (!this.config.devSource) {
+      sources.push(await this.checkoutSource(this.config.packageRoot, "package", sources.length === 0));
+    }
     return sources;
   }
 
   /** A mutable checkout, imported directly; a baseline copy is the rollback image. */
-  protected async checkoutSource(root: string, label: string): Promise<RuntimeSource> {
+  protected async checkoutSource(root: string, label: string, baseline = true): Promise<RuntimeSource> {
     const meta = describeSource(root);
     let rollbackRoot: string | undefined;
-    if (this.config.baseline !== false) {
+    if (baseline && this.config.baseline !== false) {
       rollbackRoot = await snapshotRuntimeSource(root, this.generationsDir, "baseline").catch(() => undefined);
     }
     return {
@@ -437,9 +558,12 @@ export class EngineeringHostExtension {
             : `The handover is past the point of cancellation (${task.phase}); it will finish or roll back.`,
         );
       }
+      case "rollback":
+        return this.rollback(argv[1], ctx);
       case "version":
-      case "status":
         return notify(ctx, this.versionText());
+      case "status":
+        return notify(ctx, this.panelLines(Date.now()).join("\n"));
       default: {
         // Subcommands owned by the runtime generation (if it provides /engineering).
         const generation = host.activeGeneration()?.generation;
@@ -498,11 +622,136 @@ export class EngineeringHostExtension {
     const header = [`Pi Engineering ${from ?? "?"} → ${to ?? "?"}`, "", ...progress];
     const format = (r: HandoverResult) =>
       [...header, formatHandover(r, { from, to, action: "Updated" }).replace(/^Pi Engineering\n\n/, "")].join("\n");
+    void outcome.done.then(({ result: r }) => (r.ok ? this.retain().catch(() => {}) : undefined));
     const result = await this.awaitOrBackground(outcome.task, ctx, `Pi Engineering ${to} ready.`, format);
     if (result) {
       await outcome.done;
       notify(ctx, format(result), level(result));
     }
+  }
+
+  /** `/engineering rollback [version]`: the same transactional handover as an update (spec §36). */
+  protected async rollback(requested: string | undefined, ctx: Ctx): Promise<void> {
+    const lock = this.lockFor("rollback", ctx);
+    if (!lock) return;
+    let handedOver = false;
+    try {
+      const active = this.host?.activeGeneration();
+      const stateDir = this.stateDir();
+      let plan: Awaited<ReturnType<typeof planRollback>>;
+      try {
+        plan = await planRollback(this.layout, this.journal, active?.source.root ?? null, stateDir, requested);
+      } catch (error) {
+        return notify(ctx, `Rollback refused: ${error instanceof Error ? error.message : String(error)}`, "warning");
+      }
+      const transaction = `rollback-${plan.target.id}-${randomBytes(3).toString("hex")}`;
+      const record = this.journal.begin({
+        transaction,
+        kind: "rollback",
+        fromVersion: active?.source.version ?? null,
+        fromCommit: active?.source.commit ?? null,
+        toVersion: plan.target.version,
+        toCommit: plan.target.commit,
+        previousRuntime: active?.source.root ?? null,
+        candidateRuntime: plan.target.dir,
+        pointers: { current: this.layout.readPointer("current"), previous: this.layout.readPointer("previous") },
+        phase: "validating",
+      });
+      const fields = {
+        transaction_id: transaction,
+        from_version: active?.source.version,
+        to_version: plan.target.version,
+        rollback_version: plan.target.version,
+      };
+      this.telemetry.emit("runtime.rollback.started", fields);
+      const tx = await runActivation({
+        host: this,
+        journal: this.journal,
+        record,
+        candidateDir: plan.target.dir,
+        kind: "rollback",
+        stateDir,
+        migration: plan.migration,
+        fields,
+      });
+      handedOver = true;
+      const done = tx.done.finally(() => lock.release());
+      void done.then(({ result }) => {
+        this.telemetry.emit(result.ok ? "runtime.rollback.completed" : "runtime.rollback.failed", {
+          ...fields,
+          ...(result.failure ? { failure_reason: result.failure } : {}),
+        });
+        if (result.ok) void this.retain().catch(() => {});
+      });
+      const from = active?.source.version;
+      const format = (r: HandoverResult) =>
+        formatHandover(r, { from, to: plan.target.version, action: "Rolled back" }) +
+        (plan.migration.plan.length > 0 && r.ok ? `\nState restored to schema ${plan.migration.to}.` : "");
+      const result = await this.awaitOrBackground(tx.task, ctx, `Rolling back to ${plan.target.version}.`, format);
+      if (result) {
+        await done;
+        notify(ctx, format(result), level(result));
+      }
+    } finally {
+      if (!handedOver) lock.release();
+    }
+  }
+
+  /** The Runtime/Update section of the Engineering panel (spec §44). */
+  panelLines(nowMs: number): string[] {
+    const host = this.host;
+    const active = host?.activeGeneration();
+    const prefs = readPreferences(this.layout.preferencesFile);
+    const task = host?.pendingTask();
+    const lines: string[] = [];
+    if (task) {
+      const label = task.kind === "reload" ? "Reloading" : task.kind === "rollback" ? "Rolling back" : "Updating";
+      const to =
+        this.lastUpdateOutcome?.status === "handover" ? this.lastUpdateOutcome.check.target?.metadata.version : "";
+      lines.push(`${label} ${active?.source.version ?? "?"}${to ? ` → ${to}` : ""}`);
+      if (task.kind === "update") lines.push("✓ staged", "✓ validation");
+      lines.push(
+        task.phase === "waiting_safe_point" ? "◌ waiting for safe point" : `◌ ${task.phase.replace(/_/g, " ")}`,
+      );
+      if (task.blocking.length > 0) lines.push("Active:", ...(host?.operations.summarize(task.blocking) ?? []));
+      lines.push("");
+    }
+    const latest = this.lastCheck;
+    lines.push(
+      "Runtime",
+      `Version       ${active?.source.version ?? "-"}`,
+      `Commit        ${short(active?.source.commit)}`,
+      `Generation    ${active?.generation ?? "none"}`,
+      `Channel       ${prefs.channel}`,
+      `Health        ${host?.lastFailure ? "degraded" : active ? "healthy" : "no runtime"}`,
+      "Update",
+      `Latest        ${latest?.target?.metadata.version ?? prefs.lastAvailable?.version ?? "-"}`,
+      `Status        ${
+        latest?.failure
+          ? "check failed"
+          : latest
+            ? latest.upToDate
+              ? "up to date"
+              : "available"
+            : prefs.lastAvailable
+              ? "available"
+              : "not checked"
+      }`,
+      "Previous",
+    );
+    const previous = this.layout.readPointer("previous");
+    const prevMeta = previous ? this.layout.readMeta(previous) : null;
+    const prevGood = host?.previousKnownGood();
+    lines.push(
+      prevMeta
+        ? `${prevMeta.version}         retained`
+        : prevGood
+          ? `${prevGood.source.version}         retained (this session)`
+          : "none",
+      "Last reload",
+      ago(host?.lastReloadAt, nowMs),
+    );
+    return lines;
   }
 
   lastUpdateOutcome: UpdateOutcome | undefined;
@@ -539,19 +788,42 @@ export class EngineeringHostExtension {
   versionText(): string {
     const host = this.host;
     const active = host?.activeGeneration();
-    const prev = host?.previousKnownGood();
+    const prefs = readPreferences(this.layout.preferencesFile);
+    const stateDir = this.stateDir();
+    const schema = stateDir && existsSync(stateDir) ? readStateSchema(stateDir) : null;
+    const meta = active ? readCandidateMeta(active.source.root) : null;
+    const piVersion = this.config.piVersion ?? PI_VERSION;
+    const compat = meta ? piCompatible(piVersion, meta.minimumPiVersion, meta.maximumPiVersion) : { ok: true as const };
+    const previous = this.layout.readPointer("previous");
+    const prevMeta = previous ? this.layout.readMeta(previous) : null;
+    const prevGood = host?.previousKnownGood();
+    const lastUpdate = this.journal
+      .history()
+      .filter((r) => r.phase === "committed")
+      .at(-1);
     const lines = [
       "Pi Engineering",
       "",
       `Version:        ${active?.source.version ?? "-"}`,
       `Commit:         ${short(active?.source.commit)}`,
+      `Channel:        ${prefs.channel}`,
       `Source:         ${active?.source.label ?? "-"}`,
       "",
-      "Runtime API:    1",
+      `Runtime API:    ${meta?.runtimeApi ?? PI_ENGINEERING_RUNTIME_API}`,
       `Generation:     ${active?.generation ?? "none"}`,
+      `State schema:   ${schema ?? "-"}`,
+      "",
+      `Pi compatibility: ${compat.ok ? "OK" : `NO (${compat.reason})`} (Pi ${piVersion})`,
       "",
       "Previous:",
-      prev ? `${prev.source.version} / ${short(prev.source.commit)}` : "none retained",
+      prevMeta
+        ? `${prevMeta.version} / ${short(prevMeta.commit)}`
+        : prevGood
+          ? `${prevGood.source.version} / ${short(prevGood.source.commit)} (this session)`
+          : "none retained",
+      "",
+      "Last update:",
+      lastUpdate ? ago(Date.parse(lastUpdate.updatedAt)) : "never",
       "",
       "Last reload:",
       ago(host?.lastReloadAt),

@@ -33,6 +33,7 @@ async function world(opts: { updateRemote?: string; trusted?: string[] } = {}) {
     packageRoot: repo.checkout,
     entry: "runtime.ts",
     baseline: true,
+    autoUpdateCheck: false,
     ...(opts.updateRemote ? { updateRemote: opts.updateRemote } : {}),
     ...(opts.trusted ? { trustedRemotes: opts.trusted } : {}),
   });

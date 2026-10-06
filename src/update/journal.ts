@@ -143,7 +143,41 @@ export class UpdateJournal {
       history: [...record.history, { phase, at: now }],
     };
     this.write(next);
+    // Finished transactions are also appended to a history log: rollback
+    // finds pre-migration checkpoints there and `/engineering version` the
+    // last update. The journal itself only ever holds the latest record.
+    if (TERMINAL.has(phase)) this.appendHistory(next);
     return next;
+  }
+
+  /** Every finished transaction, oldest first. */
+  history(): UpdateJournalRecord[] {
+    try {
+      return readFileSync(this.historyFile, "utf8")
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => JSON.parse(line) as UpdateJournalRecord);
+    } catch {
+      return [];
+    }
+  }
+
+  get historyFile(): string {
+    return join(dirname(this.file), "transactions.jsonl");
+  }
+
+  private appendHistory(record: UpdateJournalRecord): void {
+    try {
+      const fd = openSync(this.historyFile, "a", 0o600);
+      try {
+        writeSync(fd, `${JSON.stringify(record)}\n`);
+        fsyncSync(fd);
+      } finally {
+        closeSync(fd);
+      }
+    } catch {
+      // History is diagnostic; the journal record above is authoritative.
+    }
   }
 
   private write(record: UpdateJournalRecord): void {

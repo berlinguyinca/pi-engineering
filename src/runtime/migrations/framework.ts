@@ -138,6 +138,20 @@ export async function restoreCheckpoint(checkpointDir: string, stateDir: string)
   }
 }
 
+export interface CheckpointManifest {
+  stateDir: string;
+  createdAt: string;
+  entries: Array<{ path: string; existed: boolean }>;
+}
+
+export async function readCheckpointManifest(checkpointDir: string): Promise<CheckpointManifest | null> {
+  try {
+    return JSON.parse(await readFile(join(checkpointDir, MANIFEST), "utf8")) as CheckpointManifest;
+  } catch {
+    return null;
+  }
+}
+
 export function hasCheckpoint(checkpointDir: string): boolean {
   return existsSync(join(checkpointDir, MANIFEST));
 }
@@ -150,7 +164,10 @@ export async function applyMigrations(
 ): Promise<void> {
   for (const m of plan) {
     const at = readStateSchema(stateDir);
-    if (at !== null && at >= m.to) continue;
+    // Already applied? Forward steps are done once the marker reaches `to`; a
+    // backward step (a rollback restoring a checkpoint) once it is down to `to`.
+    const done = m.to >= m.from ? at !== null && at >= m.to : at !== null && at <= m.to;
+    if (done) continue;
     if (at !== m.from) throw new MigrationError(`migration ${m.id} expects schema ${m.from}, found ${at}`, m.id);
     await onStep?.(m);
     try {

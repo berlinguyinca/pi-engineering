@@ -115,8 +115,18 @@ export class UpdateManager {
     }
   }
 
+  private checkChain: Promise<unknown> = Promise.resolve();
+
   /** `/engineering update --check`: changes no runtime, state, pointer or journal (§13). */
-  async check(req: UpdateRequest = {}): Promise<UpdateCheckResult> {
+  check(req: UpdateRequest = {}): Promise<UpdateCheckResult> {
+    // One fetch at a time into the download cache (an automatic check may
+    // overlap an operator's command).
+    const run = this.checkChain.then(() => this.checkNow(req));
+    this.checkChain = run.catch(() => {});
+    return run;
+  }
+
+  private async checkNow(req: UpdateRequest): Promise<UpdateCheckResult> {
     const channel = req.channel ?? this.prefs().channel;
     const current = this.deps.running();
     const base: UpdateCheckResult = {
