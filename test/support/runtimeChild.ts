@@ -14,6 +14,8 @@
  *          report the acquired lease generation, close
  *   tear   like hold, but then start writing one more record and stop halfway
  *          through it (a writer killed mid-record)
+ *   admit  open (the supervisor admits every mission whose custody it can
+ *          take), report the leases this session then holds, close
  */
 import { appendFileSync } from "node:fs";
 import { join } from "node:path";
@@ -54,12 +56,28 @@ function report(value: Record<string, unknown>): void {
 async function main(): Promise<void> {
   // Never touch the developer's real ~/.local/state/pi-engineering.
   if (!process.env.PI_ENGINEERING_STATE_DIR) throw new Error("runtimeChild requires PI_ENGINEERING_STATE_DIR");
-  if (!action || !cwd) throw new Error("usage: runtimeChild <open|hold|adopt|tear> <cwd> [startAt]");
+  if (!action || !cwd) throw new Error("usage: runtimeChild <open|hold|adopt|tear|admit> <cwd> [startAt]");
   if (startAt) await waitUntil(Number(startAt));
   const openedAt = Date.now();
   const rt = await EngineeringRuntime.open({ cwd, worker, verifier: new CommandVerifier() });
   const store = rt.missionStore;
   if (!store || !rt.orchestrator) throw new Error("orchestrator not initialized");
+  if (action === "admit") {
+    const session = RuntimeSession.current();
+    report({
+      ok: true,
+      action,
+      pid: process.pid,
+      sessionId: session.sessionId,
+      heldLeases:
+        session
+          .registry()
+          ?.leases.list({ sessionId: session.sessionId })
+          .map((l) => l.resourceId) ?? [],
+    });
+    await rt.close();
+    return;
+  }
   if (action === "adopt") {
     const target = process.env.PI_TEST_ADOPT_MISSION ?? "";
     const lease = await rt.missionOwnership!.acquire(target);

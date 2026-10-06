@@ -43,7 +43,7 @@ export interface RunningChild {
 }
 
 export function startChild(
-  action: "open" | "hold" | "adopt" | "tear",
+  action: "open" | "hold" | "adopt" | "tear" | "admit",
   cwd: string,
   stateDir: string,
   options: { startAt?: number; env?: NodeJS.ProcessEnv } = {},

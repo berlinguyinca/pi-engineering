@@ -17,6 +17,7 @@ import { existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import legacyFactory from "../../../extensions/index.ts";
+import { withReloadShutdown } from "../isolation/reloadCustody.ts";
 import { RUNTIME_STATE_SCHEMA, readStateSchema, schemaCompatibility } from "../migrations/schema.ts";
 import {
   type EngineeringRuntime,
@@ -114,10 +115,10 @@ export class ExtensionGenerationRuntime implements EngineeringRuntime {
     const previous = process.env.PI_CLEAR_ON_EXIT;
     process.env.PI_CLEAR_ON_EXIT = "0";
     try {
-      const failures = await this.context.session.replay("session_shutdown", {
-        type: "session_shutdown",
-        reason: "reload",
-      });
+      // The session continues in the next generation: mission custody is kept.
+      const failures = await withReloadShutdown(() =>
+        this.context.session.replay("session_shutdown", { type: "session_shutdown", reason: "reload" }),
+      );
       if (failures.length > 0) throw new Error(`session shutdown failed: ${failures.join("; ")}`);
     } finally {
       if (previous === undefined) delete process.env.PI_CLEAR_ON_EXIT;
