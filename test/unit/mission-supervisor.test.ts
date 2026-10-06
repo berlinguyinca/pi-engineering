@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { describe, it } from "node:test";
+import { afterEach, beforeEach, describe, it } from "node:test";
 import { taskCoverageFingerprint } from "../../src/orchestration/evidence.ts";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
 import { MissionObservability } from "../../src/orchestration/observability/MissionObservability.ts";
@@ -48,6 +48,18 @@ function harness(initialNow = Date.parse("2026-09-27T12:00:00.000Z")) {
 }
 
 describe("MissionSupervisor", () => {
+  // MissionSupervisor.start() deliberately unrefs its interval so a background
+  // monitor never keeps a process alive. The interval tests await work that
+  // only that interval performs, so hold the event loop open for each test;
+  // otherwise node:test sees a drained loop and cancels the rest of the suite.
+  let keepAlive: ReturnType<typeof setInterval> | undefined;
+  beforeEach(() => {
+    keepAlive = setInterval(() => {}, 60_000);
+  });
+  afterEach(() => {
+    clearInterval(keepAlive);
+  });
+
   it("schedules durable orphan recovery for zero-worker runnable work", async () => {
     const h = harness();
     const task = h.store.createTask({
