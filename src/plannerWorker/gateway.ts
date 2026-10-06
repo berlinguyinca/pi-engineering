@@ -256,3 +256,159 @@ function messageOf(body: unknown): string | undefined {
   const admission = parseAdmissionPayload(body);
   return admission?.message;
 }
+
+/** Availability codes InferWeave reports (spec §16). */
+export const AVAILABILITY_CODES = [
+  "NO_WORKERS",
+  "MODEL_UNAVAILABLE",
+  "MODEL_LOADING",
+  "CAPACITY_EXHAUSTED",
+  "NODE_DRAINING",
+  "NODE_LOST",
+] as const;
+export type AvailabilityCode = (typeof AVAILABILITY_CODES)[number];
+
+export interface AvailabilityError {
+  code: AvailabilityCode;
+  status: number;
+  message: string;
+  retryAfterMs?: number;
+  /** Comparable models the gateway suggests (same shape as `/models` rows). */
+  candidates: CatalogModel[];
+}
+
+/** Admission `reason` tokens (src/inference/admissionContract.ts) mapped onto availability codes. */
+const REASON_CODES: Readonly<Record<string, AvailabilityCode>> = {
+  no_workers: "NO_WORKERS",
+  model_unavailable: "MODEL_UNAVAILABLE",
+  model_not_found: "MODEL_UNAVAILABLE",
+  model_loading: "MODEL_LOADING",
+  capacity_unavailable: "CAPACITY_EXHAUSTED",
+  capacity_exhausted: "CAPACITY_EXHAUSTED",
+  worker_saturated: "CAPACITY_EXHAUSTED",
+  node_draining: "NODE_DRAINING",
+  node_lost: "NODE_LOST",
+};
+
+function asCode(v: unknown): AvailabilityCode | undefined {
+  if (typeof v !== "string") return undefined;
+  const upper = v.trim().toUpperCase();
+  if ((AVAILABILITY_CODES as readonly string[]).includes(upper)) return upper as AvailabilityCode;
+  return REASON_CODES[v.trim().toLowerCase()];
+}
+
+/**
+ * Classify a failed response's availability metadata. Accepts the
+ * `error.code` / top-level `code` field, the `x-inferweave-error-code` header,
+ * the admission payload's `reason`, and a 404 for an unknown model. Returns
+ * null when the failure is not about availability.
+ */
+export function parseAvailabilityError(
+  status: number,
+  body: unknown,
+  headers: Record<string, string> = {},
+): AvailabilityError | null {
+  const root = body && typeof body === "object" ? (body as Record<string, unknown>) : {};
+  const err = root.error && typeof root.error === "object" ? (root.error as Record<string, unknown>) : {};
+  const admission = parseAdmissionPayload(body);
+  const lower = Object.fromEntries(Object.entries(headers).map(([k, v]) => [k.toLowerCase(), v]));
+  let code =
+    asCode(err.code) ??
+    asCode(root.code) ??
+    asCode(lower["x-inferweave-error-code"]) ??
+    asCode(admission?.reason) ??
+    asCode(err.type);
+  const message = messageOf(body) ?? `HTTP ${status}`;
+  if (!code && status === 404 && /model/i.test(message)) code = "MODEL_UNAVAILABLE";
+  if (!code) return null;
+  const retryAfterMs =
+    num(err.retry_after_ms) ??
+    num(root.retry_after_ms) ??
+    admission?.retryAfterMs ??
+    (num(lower["retry-after"]) !== undefined ? (num(lower["retry-after"]) as number) * 1000 : undefined);
+  const rawCandidates = Array.isArray(err.candidates)
+    ? err.candidates
+    : Array.isArray(root.candidates)
+      ? root.candidates
+      : [];
+  return {
+    code,
+    status,
+    message,
+    ...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
+    candidates: parseCatalog({ data: rawCandidates }),
+  };
+}
+
+/** Best-effort classification of a flattened error string (non-HTTP executors). */
+export function availabilityFromText(text: string | undefined): AvailabilityCode | null {
+  if (!text) return null;
+  const m = text.match(/\b(NO_WORKERS|MODEL_UNAVAILABLE|MODEL_LOADING|CAPACITY_EXHAUSTED|NODE_DRAINING|NODE_LOST)\b/);
+  if (m) return m[1] as AvailabilityCode;
+  if (/model_not_found|unknown-model|model .* (not found|is not served)/i.test(text)) return "MODEL_UNAVAILABLE";
+  return null;
+}
+
+export type AvailabilityDecision = { action: "wait"; ms: number } | { action: "retry_same" } | { action: "switch" };
+
+/**
+ * What to do about an availability failure (spec §16). Bounded: a model is
+ * never retried forever — waits are capped and the third strike switches.
+ */
+export function decideAvailability(
+  code: AvailabilityCode,
+  strikes: number,
+  retryAfterMs?: number,
+): AvailabilityDecision {
+  const wait = Math.min(Math.max(retryAfterMs ?? 2_000, 250), 30_000);
+  switch (code) {
+    case "MODEL_LOADING":
+      return strikes < 3 ? { action: "wait", ms: wait } : { action: "switch" };
+    case "CAPACITY_EXHAUSTED":
+    case "NO_WORKERS":
+      return strikes < 1 ? { action: "wait", ms: wait } : { action: "switch" };
+    case "NODE_DRAINING":
+      return strikes < 1 ? { action: "retry_same" } : { action: "switch" };
+    default:
+      return { action: "switch" };
+  }
+}
+
+/** A logical route's backing model changed between two requests (spec §10). */
+export interface RouteChange {
+  alias: string;
+  from: string;
+  to: string;
+  fromGeneration?: number;
+  toGeneration?: number;
+}
+
+/** Tracks which concrete model each logical route served last. */
+export class RouteTracker {
+  private readonly last = new Map<string, { model: string; generation?: number }>();
+
+  observe(served: ServedRoute): RouteChange | null {
+    const alias = served.alias ?? (served.requested !== served.model ? served.requested : undefined);
+    if (!alias) return null;
+    const prev = this.last.get(alias);
+    this.last.set(alias, {
+      model: served.model,
+      ...(served.generation !== undefined ? { generation: served.generation } : {}),
+    });
+    if (!prev) return null;
+    const generationChanged =
+      prev.generation !== undefined && served.generation !== undefined && prev.generation !== served.generation;
+    if (prev.model === served.model && !generationChanged) return null;
+    return {
+      alias,
+      from: prev.model,
+      to: served.model,
+      ...(prev.generation !== undefined ? { fromGeneration: prev.generation } : {}),
+      ...(served.generation !== undefined ? { toGeneration: served.generation } : {}),
+    };
+  }
+
+  current(alias: string): string | undefined {
+    return this.last.get(alias)?.model;
+  }
+}
