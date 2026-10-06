@@ -824,6 +824,11 @@ export class MissionStore {
       typeof actorOrOptions === "string" ? explicitOptions : actorOrOptions,
     );
     const repairRecoveryId = options.recoveryDecisionId;
+    // Re-entering the current state is an idempotent no-op. Throwing here
+    // ("illegal mission transition BLOCKED -> BLOCKED") turned an already
+    // recorded outcome into an exception that lost the mission id for the
+    // caller; writing it would open a spurious new blocked episode.
+    if (m.status === to && !repairRecoveryId) return m;
     let repairDecision: RecoveryDecision | undefined;
     if (m.status === "BLOCKED" && to === "REPAIRING") {
       repairDecision = repairRecoveryId ? this.recoveryDecisions.get(repairRecoveryId) : undefined;
@@ -2457,7 +2462,7 @@ export class MissionStore {
     const resumptionGeneration = this.listMissionResumptions(missionId).at(-1)?.generation ?? 0;
     const deadlines = this.listRecoveryDecisions(missionId)
       .filter((decision) => (decision.resumptionGeneration ?? 0) === resumptionGeneration)
-      .map((decision) => decision.deadline)
+      .flatMap((decision) => (decision.deadline ? [decision.deadline] : []))
       .filter((deadline) => Number.isFinite(Date.parse(deadline)))
       .sort();
     const stop: MissionStop = {
@@ -2507,7 +2512,7 @@ export class MissionStore {
       const deadlines = durableBefore
         .listRecoveryDecisions(missionId)
         .filter((decision) => (decision.resumptionGeneration ?? 0) === expected.resumptionGeneration)
-        .map((decision) => decision.deadline)
+        .flatMap((decision) => (decision.deadline ? [decision.deadline] : []))
         .filter((deadline) => Number.isFinite(Date.parse(deadline)))
         .sort();
       const stop: MissionStop = {

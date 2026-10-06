@@ -104,6 +104,28 @@ function store(): MissionStore {
 }
 
 describe("MissionStore", () => {
+  it("treats a self-transition into the current state as an idempotent no-op (BLOCKED -> BLOCKED)", () => {
+    const s = store();
+    const mission = s.createMission({
+      title: "self transition",
+      goal: "self transition",
+      user_request: "self transition",
+      repository: ".",
+      base_ref: "base",
+      risk_profile: "low",
+      workflow_class: "engineering",
+    });
+    s.transitionMission(mission.mission_id, "CLASSIFYING");
+    s.transitionMission(mission.mission_id, "BLOCKED");
+    const blocked = s.getMission(mission.mission_id)!;
+    const again = s.transitionMission(mission.mission_id, "BLOCKED");
+    assert.equal(again.mission_id, mission.mission_id, "the caller still gets the mission");
+    assert.equal(again.status, "BLOCKED");
+    assert.equal(again.blocked_episode_id, blocked.blocked_episode_id, "no new blocked episode is opened");
+    assert.equal(again.updated_at, blocked.updated_at, "nothing was written");
+    assert.throws(() => s.transitionMission(mission.mission_id, "COMPLETE"), /illegal mission transition/);
+  });
+
   it("does not expose or replay a manifest whose durable bind fails", async () => {
     const backend = new FailOnceBackend();
     const s = MissionStore.open(backend);

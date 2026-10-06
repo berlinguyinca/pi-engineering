@@ -45,6 +45,8 @@ interface HarnessOpts {
   /** Fail the first N post-resume validation runs, then recover. */
   validationFailTimes?: number;
   onValidation?: (signal: AbortSignal) => Promise<void>;
+  /** The repository declares no checks: validation returns noTargets evidence. */
+  validationNoTargets?: boolean;
   probe?: () => Promise<{ healthy: boolean }>;
 }
 
@@ -74,6 +76,24 @@ function harness(opts: HarnessOpts) {
         await opts.onValidation?.(signal);
         if (calls.validation <= (opts.validationFailTimes ?? 0)) {
           return { executionId: "e", exitStatus: "failed", summary: "suite red", artifactRefs: [], usage: {} };
+        }
+        if (opts.validationNoTargets) {
+          return {
+            executionId: "e",
+            exitStatus: "succeeded",
+            summary: "no verification targets detected — recorded as missing evidence, not a failed check",
+            artifactRefs: [],
+            usage: {},
+            validationEvidence: {
+              command: "<no-target>",
+              profile: "detected",
+              exitCode: 1,
+              testSummary: { stages: [], failedStage: null },
+              noTargets: true,
+              accessible: true,
+              acceptanceResults: [],
+            },
+          };
         }
         return {
           executionId: "e",
@@ -346,5 +366,21 @@ describe("resilience e2e — a gateway outage pauses (not fails) a live mission"
     const resumed = await pending;
 
     assert.equal(resumed.status, "CANCELED");
+  });
+
+  it("a repository with no checks blocks on missing evidence without futile repair tasks", async () => {
+    const h = harness({ failWhileDown: () => false, validationNoTargets: true });
+    const result = await h.orchestrator.orchestrate("Add a health endpoint", {
+      repository: ".",
+      baseRef: "abc",
+      mutationRequested: true,
+    });
+    const missionId = result.mission.mission_id;
+    assert.notEqual(h.store.getMission(missionId)!.status, "COMPLETE", "no-target evidence cannot complete a mutation");
+    const repairs = h.store
+      .listTasks(missionId)
+      .filter((task) => task.kind === "agent" && task.objective.startsWith("Fix the failing"));
+    assert.equal(repairs.length, 0, "missing verification evidence is not something a repair task can fix");
+    assert.equal(h.calls.validation, 1, "validation is not re-run in futile repair rounds");
   });
 });

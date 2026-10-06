@@ -5,6 +5,8 @@ import type { ContextBroker } from "../context/ContextBroker.ts";
 import { type Actor, isMachineEvidence } from "../core/types.ts";
 import type { Ledger } from "../ledger/Ledger.ts";
 import type { Orchestrator } from "../orchestration/orchestrator.ts";
+import type { Mission } from "../orchestration/types.ts";
+import { missionReportLines } from "./missionReport.ts";
 
 /** Shared services bound to the current repository's runtime. */
 export interface CoreServices {
@@ -20,6 +22,12 @@ export interface CoreServices {
   /** Authorized repository selected for this tool execution. */
   repoId?: string;
   repositoryRoot?: string;
+  /**
+   * Operator recovery of a durably stopped mission — what `/mission resume`
+   * runs (EngineeringRuntime.resumeBlockedMission). Optional: without it the
+   * mission tool's `resume` action points at the slash command.
+   */
+  resumeMission?: (missionId: string, signal?: AbortSignal) => Promise<Mission>;
 }
 
 /**
@@ -292,9 +300,17 @@ export function buildCoreTools(
     name: "mission",
     label: "Mission",
     description:
-      "Run the orchestration mission pipeline for a normal-language engineering request: route intent, plan, execute workers, validate, fresh-review, and gate completion. Use this for implement/fix/refactor/investigate requests so the engineering workflow runs automatically.",
+      "Run the orchestration mission pipeline for a normal-language engineering request: route intent, plan, execute workers, validate, fresh-review, and gate completion. Use this for implement/fix/refactor/investigate requests so the engineering workflow runs automatically. action=status reports an existing mission; action=resume recovers a stopped/blocked mission (same as /mission resume <id>).",
     parameters: Type.Object({
-      request: Type.String({ description: "The normal-language request (e.g. 'Add a health endpoint')." }),
+      action: Type.Optional(
+        Type.Union([Type.Literal("run"), Type.Literal("status"), Type.Literal("resume")], {
+          description: "run (default) starts a mission from `request`; status/resume act on `missionId`.",
+        }),
+      ),
+      request: Type.Optional(
+        Type.String({ description: "The normal-language request (e.g. 'Add a health endpoint'). Required for run." }),
+      ),
+      missionId: Type.Optional(Type.String({ description: "Mission id for status/resume (e.g. MSN-abc123)." })),
       mutate: Type.Optional(
         Type.Boolean({
           description: "Whether the request mutates repository source (default true for implement/fix).",
@@ -304,12 +320,48 @@ export function buildCoreTools(
     }),
     async execute(_id, params, signal, _onUpdate, ctx) {
       const services = await servicesFor(ctx.cwd);
-      if (!services?.orchestrator)
-        return {
-          content: [{ type: "text", text: "Orchestrator not initialized for this directory." }],
-          details: {},
-        };
-      const request = String(params.request);
+      const text = (body: string, details: Record<string, unknown> = {}) => ({
+        content: [{ type: "text" as const, text: body }],
+        details,
+      });
+      if (!services?.orchestrator) return text("Orchestrator not initialized for this directory.");
+      const store = services.orchestrator.store as Orchestrator["store"] | undefined;
+      const action = (params.action as string | undefined) ?? "run";
+      const describe = (m: Mission, extra: string[] = []) =>
+        text(
+          [
+            `Mission ${m.mission_id} [${m.status}] workflow=${m.workflow_class}`,
+            ...extra,
+            ...(store ? missionReportLines(store, m.mission_id) : []),
+          ].join("\n"),
+          {
+            missionId: m.mission_id,
+            status: m.status,
+          },
+        );
+
+      if (action === "status" || action === "resume") {
+        const missionId = String(params.missionId ?? "").trim();
+        if (!missionId) return text(`The ${action} action needs missionId.`);
+        const current = store?.getMission(missionId);
+        if (!current) return text(`Unknown mission ${missionId}.`);
+        if (action === "status") return describe(current);
+        if (!services.resumeMission) {
+          return text(
+            `Resume is not available through the tool in this session. Ask the operator to run /mission resume ${missionId}.`,
+            { missionId, status: current.status },
+          );
+        }
+        try {
+          const resumed = await services.resumeMission(missionId, signal);
+          return describe(resumed, ["Resume requested."]);
+        } catch (error) {
+          return describe(current, [`Resume failed: ${error instanceof Error ? error.message : String(error)}`]);
+        }
+      }
+
+      const request = String(params.request ?? "").trim();
+      if (!request) return text("The run action needs a request.");
       const result = await services.orchestrator.orchestrate(request, {
         repository: services.repositoryRoot ?? ctx.cwd,
         // The orchestrator resolves the request's explicit repository before
@@ -336,6 +388,7 @@ export function buildCoreTools(
         `Mission ${m.mission_id} [${m.status}] workflow=${m.workflow_class}`,
         `Intent: ${result.intent.intent.join(", ")} | required gates: ${m.required_gates.join(", ") || "none"}`,
         statusLine,
+        ...(!result.completed && !result.paused && store ? missionReportLines(store, m.mission_id) : []),
       ];
       return {
         content: [{ type: "text", text: lines.join("\n") }],

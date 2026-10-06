@@ -152,6 +152,19 @@ export interface OrchestratorOptions {
   /** Bounds planner work before the first executable dispatch. */
   worksetPolicy?: Partial<WorksetPolicy>;
   /**
+   * Time limits. Nothing here is a default duration cap: a mission and its
+   * tasks run as long as they show activity, and only the caller's signal
+   * (the user cancelling) ends a healthy mission early.
+   */
+  timeLimits?: {
+    /** Hung-worker window: abort a worker after this long with no activity. */
+    workerInactivityMs?: number;
+    /** OPT-IN: cancel the whole mission after this much wall-clock time. */
+    maxMissionWallClockMs?: number;
+    /** Whether the process is waiting on the model gateway (never a stall). */
+    inferenceWaiting?: () => boolean;
+  };
+  /**
    * Autonomous spec approval hook (design 2026-09-28). When provided and the
    * routed workflow is a material mutation, the orchestrator runs the durable
    * spec controller to review + approve the exact plan and materializes tasks
@@ -185,6 +198,20 @@ export interface OrchestrateResult {
 
 type FinalizationResult = Omit<OrchestrateResult, "intent" | "paused">;
 
+export interface OrchestrateOptions {
+  title?: string;
+  repository: string;
+  baseRef: string;
+  constraints?: string[];
+  changedFiles?: string[];
+  mutationRequested?: boolean;
+  acceptanceCriteria?: string[];
+  /** Live progress callback (per-call). Lines stream as the mission runs. */
+  onProgress?: (line: string) => void;
+  /** Cancels active work and stops any infrastructure-recovery wait. */
+  signal?: AbortSignal;
+}
+
 export class Orchestrator {
   readonly store: MissionStore;
   readonly broker: ExecutionBroker;
@@ -211,6 +238,7 @@ export class Orchestrator {
   private readonly recoveryTaskGenerations = new Map<string, number>();
   private readonly missionRepoIds = new Map<string, string>();
   private readonly worksetPolicy: WorksetPolicy;
+  private readonly maxMissionWallClockMs?: number;
   private readonly specApproval?: OrchestratorOptions["specApproval"];
   private readonly recoveryPlanner: RecoveryPlanner;
   private readonly failureClassifier = new FailureClassifier();
@@ -223,6 +251,7 @@ export class Orchestrator {
     this.limits = opts.limits ?? {};
     this.maxRepairRounds = opts.maxRepairRounds ?? 2;
     this.worksetPolicy = { ...DEFAULT_WORKSET_POLICY, ...opts.worksetPolicy };
+    this.maxMissionWallClockMs = opts.timeLimits?.maxMissionWallClockMs;
     this.specApproval = opts.specApproval;
     this.recoveryPlanner = new RecoveryPlanner(opts.recovery);
     const checkpoints = new CheckpointManager({ store: this.store });
@@ -252,6 +281,10 @@ export class Orchestrator {
       onActivity: (event) => this.observeWorkerActivity(event),
       checkpoints,
       artifacts: opts.artifacts,
+      ...(opts.timeLimits?.workerInactivityMs !== undefined
+        ? { inactivityTimeoutMs: opts.timeLimits.workerInactivityMs }
+        : {}),
+      ...(opts.timeLimits?.inferenceWaiting ? { inferenceWaiting: opts.timeLimits.inferenceWaiting } : {}),
     });
     this.scheduler = new MissionScheduler({
       store: this.store,
@@ -509,7 +542,9 @@ export class Orchestrator {
           resumeCondition:
             repairDecision.action === "PAUSE_FOR_PERSISTENCE"
               ? "durable writes must succeed and persistence diagnostics must clear"
-              : `a healthy provider probe must succeed before ${repairDecision.deadline}`,
+              : repairDecision.deadline
+                ? `a healthy provider probe must succeed before ${repairDecision.deadline}`
+                : "a healthy provider probe must succeed (no deadline: the mission waits for capacity)",
         });
         await this.store.flush();
         this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
@@ -696,7 +731,11 @@ export class Orchestrator {
             repo_id: failed.repo_id,
             acceptance_ids: [...(failed.acceptance_ids ?? [])],
             deliverables: [deliverable],
-            execution_budget_ms: failed.execution_budget_ms,
+            // A wall-clock budget is inherited only while limits are configured:
+            // tasks planned under the retired implicit 30-minute default must
+            // not pass that clock on to the work that recovers them.
+            execution_budget_ms:
+              this.worksetPolicy.maxTaskBudgetMs === undefined ? undefined : failed.execution_budget_ms,
             checkpoint_policy: failed.checkpoint_policy,
             required_output_artifacts: [...(failed.required_output_artifacts ?? [])],
             candidate_generation: (failed.candidate_generation ?? 0) + index + 1,
@@ -1162,20 +1201,37 @@ export class Orchestrator {
    */
   async orchestrate(
     request: string,
-    opts: {
-      title?: string;
-      repository: string;
-      baseRef: string;
-      constraints?: string[];
-      changedFiles?: string[];
-      mutationRequested?: boolean;
-      acceptanceCriteria?: string[];
-      /** Live progress callback (per-call). Lines stream as the mission runs. */
-      onProgress?: (line: string) => void;
-      /** Cancels active work and stops any infrastructure-recovery wait. */
-      signal?: AbortSignal;
-    } = { repository: ".", baseRef: "" },
+    opts: OrchestrateOptions = { repository: ".", baseRef: "" },
   ): Promise<OrchestrateResult> {
+    const limitMs = this.maxMissionWallClockMs;
+    if (limitMs === undefined) return this.orchestrateMission(request, opts);
+    // Opt-in mission wall-clock limit: reaching it cancels the mission exactly
+    // as the user would, so all work is preserved and the reason is named.
+    const limited = new AbortController();
+    const forward = (): void => limited.abort(opts.signal?.reason);
+    if (opts.signal?.aborted) forward();
+    else opts.signal?.addEventListener("abort", forward, { once: true });
+    let limitReached = false;
+    const timer = setTimeout(() => {
+      limitReached = true;
+      limited.abort(new DOMException(`configured mission wall-clock limit of ${limitMs}ms reached`, "TimeoutError"));
+    }, limitMs);
+    timer.unref?.();
+    try {
+      const result = await this.orchestrateMission(request, { ...opts, signal: limited.signal });
+      return limitReached && !result.completed
+        ? {
+            ...result,
+            failureReason: `configured mission wall-clock limit (limits.max_mission_wall_clock_ms = ${limitMs}ms) reached; work is preserved`,
+          }
+        : result;
+    } finally {
+      clearTimeout(timer);
+      opts.signal?.removeEventListener("abort", forward);
+    }
+  }
+
+  private async orchestrateMission(request: string, opts: OrchestrateOptions): Promise<OrchestrateResult> {
     const intent = this.router.route({
       request,
       changedFiles: opts.changedFiles,
@@ -1236,6 +1292,19 @@ export class Orchestrator {
     if (this.ownership) {
       this.ownershipByMission.set(mission.mission_id, await this.ownership.acquire(mission.mission_id));
     }
+    // A live controller keeps its mission lease alive for the whole mission,
+    // not only while a worker holds a dispatch authority: a mission waiting
+    // hours for gateway capacity (or between tasks) is alive, and an expired
+    // lease used to fence its own next dispatch. A dead process stops renewing,
+    // so crash recovery still sees the lease expire.
+    let leaseRenewal: Promise<void> = Promise.resolve();
+    const leaseKeepAlive = this.ownership
+      ? setInterval(() => {
+          if (!this.ownershipByMission.has(mission.mission_id)) return;
+          leaseRenewal = leaseRenewal.then(() => this.renewMissionOwnership(mission.mission_id)).catch(() => undefined);
+        }, this.ownership.renewalIntervalMs)
+      : undefined;
+    leaseKeepAlive?.unref?.();
     if (opts.onProgress) this.progress.set(mission.mission_id, opts.onProgress);
     try {
       this.observability?.missionCreated(mission.mission_id, mission.title);
@@ -1654,9 +1723,11 @@ export class Orchestrator {
         };
       }
 
-      // A wall-clock timeout with a durable partial checkpoint is not an
-      // integration candidate. Stop at the public repair boundary so recovery
-      // can split exactly the remaining deliverables and fence the late worker.
+      // Only an operator-configured (opt-in) wall-clock limit produces a
+      // "timeout" execution: there is no implicit time budget. Such a timeout
+      // with a durable partial checkpoint is not an integration candidate.
+      // Stop at the public repair boundary so recovery can split exactly the
+      // remaining deliverables and fence the late worker.
       const timedCheckpoint = this.store
         .listTasks(mission.mission_id)
         .filter((task) => task.status === "FAILED" && task.assigned_execution_id)
@@ -1670,7 +1741,8 @@ export class Orchestrator {
             execution?.exit_status === "timeout" && (checkpoint?.remainingDeliverables.length ?? 0) > 0,
         );
       if (timedCheckpoint) {
-        const summary = "task execution budget exhausted after a durable partial checkpoint";
+        const summary =
+          "configured task wall-clock limit (limits.max_task_wall_clock_ms) reached after a durable partial checkpoint";
         const classification = this.failureClassifier.classify({
           missionId: mission.mission_id,
           taskId: timedCheckpoint.task.task_id,
@@ -1695,6 +1767,10 @@ export class Orchestrator {
       const finalized = await this.finalizeMission(mission.mission_id, expectedResumptionGeneration, opts.signal);
       return { ...finalized, intent };
     } finally {
+      if (leaseKeepAlive) clearInterval(leaseKeepAlive);
+      // Never release under an in-flight renewal: it would write the stale
+      // lease back after the release.
+      await leaseRenewal;
       this.progress.delete(mission.mission_id);
       const identity = this.ownershipByMission.get(mission.mission_id);
       if (identity && this.ownership) {

@@ -49,6 +49,11 @@ export class MissionOwnership {
     this.now = options.now ?? Date.now;
   }
 
+  /** How often a live controller must renew a lease it holds. */
+  get renewalIntervalMs(): number {
+    return this.heartbeatMs;
+  }
+
   async maintain(identity: MissionLease, repoId?: string): Promise<DispatchAuthority> {
     const mission = await this.renew(identity);
     const repository = repoId ? await this.acquireRepository(mission, repoId) : undefined;

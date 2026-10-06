@@ -395,10 +395,11 @@ export function realBackends(opts: RealBackendsOptions) {
           context: input.contextRef,
           tools: ["ledger_read", "ledger_claim", "artifact_read", "repo_search", "symbol", "tests_for", "bash"],
           cwd: input.worktree ?? bound.cwd,
-          // Fresh-context implementation workers need headroom to explore the
-          // repo, implement, run verification, and commit. Configurable so an
-          // operator can tune per environment without recompiling.
+          // No duration cap: the broker owns liveness (activity-based) and any
+          // opt-in limit. This only carries an explicit operator override.
           timeoutMs: workerTimeoutMs(),
+          // A mission worker waits for inference capacity however long it takes.
+          unboundedInferenceWait: true,
           // Only the broker's word makes a directory an isolated worktree; the
           // fallback (no worktree) runs in the user's checkout.
           isolatedWorktree: input.isolatedWorktree === true && !!input.worktree,
@@ -439,6 +440,7 @@ export function realBackends(opts: RealBackendsOptions) {
           context: input.contextRef,
           tools: ["ledger_read", "repo_search", "symbol", "tests_for"],
           cwd: bound.cwd,
+          unboundedInferenceWait: true,
         };
         const { run, model } = await runWithModelTakeover(req, input, await routedPlan(req.role, {}, "WKS"));
         return withModel(outcomeOf(run), model);
@@ -460,12 +462,18 @@ export function realBackends(opts: RealBackendsOptions) {
         const outcome = await opts.verifier.run(cwd, profile, opts.artifacts, { signal: input.signal });
         const artifactRefs = outcome.evidence.flatMap((e) => e.artifacts).filter(Boolean);
         const artifactState = await artifactContentHashes(opts.artifacts, artifactRefs);
+        // A repo with no detectable checks produced no evidence; nothing FAILED.
+        // Reporting it as a failed task made the repair loop spawn "Fix the
+        // failing validation step" work no implementer can satisfy. The
+        // noTargets evidence still keeps the completion gate closed.
         return {
           executionId: "validation",
-          exitStatus: outcome.passed ? "succeeded" : "failed",
-          summary: outcome.passed
-            ? `validation passed (${outcome.stages.length} stages)`
-            : `validation failed at ${outcome.failedStage ?? "unknown"}`,
+          exitStatus: outcome.passed || outcome.noTargets ? "succeeded" : "failed",
+          summary: outcome.noTargets
+            ? "no verification targets detected — recorded as missing evidence, not a failed check"
+            : outcome.passed
+              ? `validation passed (${outcome.stages.length} stages)`
+              : `validation failed at ${outcome.failedStage ?? "unknown"}`,
           artifactRefs,
           artifactHashes: artifactState.hashes,
           usage: { stages: outcome.stages.length },
@@ -519,10 +527,11 @@ export function realBackends(opts: RealBackendsOptions) {
           tools: ["ledger_read", "artifact_read", "repo_search", "symbol"],
           cwd: input.worktree ?? bound.cwd,
           maxContextTokens: 64_000,
-          // Same generous wall-clock budget as implementation workers: a review
-          // must inspect the integrated change before writing findings, and the
-          // executor's default (5 min) aborted the reviewer mid-analysis.
+          // Same as implementation workers: no duration cap (the broker owns
+          // liveness), and inference waiting is unbounded. The executor's old
+          // 5-minute default aborted reviewers mid-analysis.
           timeoutMs: workerTimeoutMs(),
+          unboundedInferenceWait: true,
           sessionId: reviewerSessionId,
           resultTool: "review_result",
         };

@@ -31,7 +31,9 @@ import type { WorkerResult, WorkerRole, WorkerUsage } from "../core/types.ts";
 import type { AdmissionController } from "../gateway/AdmissionController.ts";
 import { type GatewayAdmissionConfig, sharedAdmissionController, sharedGatewayConfig } from "../gateway/config.ts";
 import {
+  type GatewayRetryDecision,
   type GatewayWaitSignal,
+  advisesAlternateModel,
   decideGatewayRetry,
   decideTransientHandover,
   escalateSyntheticWait,
@@ -71,7 +73,12 @@ import { type RequestBodyBudgetConfig, resolveRequestBodyBudgetConfig } from "..
 import { type ThinkingOffConfig, resolveThinkingOffConfig } from "../request/thinkingPolicy.ts";
 import { emitTelemetry } from "../telemetry/sink.ts";
 import type { WorkerExecutor, WorkerRequest, WorkerRun } from "./WorkerExecutor.ts";
-import { activityFromSessionEvent, emitWorkerActivity } from "./activity.ts";
+import {
+  StreamingActivityThrottle,
+  WAITING_FOR_INFERENCE_SUMMARY,
+  activityFromSessionEvent,
+  emitWorkerActivity,
+} from "./activity.ts";
 import { checkpointProgressTool } from "./checkpointProgressTool.ts";
 import { registerLocalProviders } from "./localProviders.ts";
 import { WORKER_KICKOFF, buildSystemPrompt, wantsCommitDiscipline } from "./prompts.ts";
@@ -373,12 +380,28 @@ ${TOOL_TRANSITION_RULE}`;
     // A flattened refusal's wait is synthesized, so it escalates like the
     // interactive pump's: a flat 5s x maxRetries gave up on a model_activating
     // warm-up that outlasts ~40s.
+    // A mission worker waits for inference capacity as long as the gateway
+    // asks it to: the hold count is not a budget (only cancellation ends it).
+    // Advice to move to another model is the exception — holding forever on a
+    // model the gateway says to leave helps nobody, so that keeps the finite
+    // count and hands the decision back to the mission.
+    const gatewayRetryCeiling = req.unboundedInferenceWait ? Number.POSITIVE_INFINITY : gatewayConfig.maxRetries;
+    const withinGatewayBudget = (decision: GatewayRetryDecision): GatewayRetryDecision =>
+      decision.action === "wait" &&
+      req.unboundedInferenceWait &&
+      advisesAlternateModel(decision.signal) &&
+      gatewayRetries >= gatewayConfig.maxRetries
+        ? { action: "give-up", signal: decision.signal, reason: "retries-exhausted" }
+        : decision;
     const holdForGateway = (signal: GatewayWaitSignal): Promise<number> => {
       const paced = signal.flattened ? escalateSyntheticWait(signal, gatewayRetries, MAX_ESCALATED_WAIT_MS) : signal;
       const scoped = { ...paced, provider: model.provider, model: model.id };
+      // Waiting for capacity is liveness: tell the owner, so the wait is
+      // never mistaken for a hung worker.
+      emitWorkerActivity(req, { kind: "state", summary: WAITING_FOR_INFERENCE_SUMMARY, meaningfulProgress: false });
       return gatewayHoldScope(scoped) === "caller"
-        ? admission.noteCallerWaitAndSleep(scoped)
-        : admission.noteWaitAndSleep(scoped);
+        ? admission.noteCallerWaitAndSleep(scoped, req.signal ? { signal: req.signal } : {})
+        : admission.noteWaitAndSleep(scoped, req.signal ? { signal: req.signal } : {});
     };
 
     // Prose-producing roles (reviewers, challenger, scout, summarizer) deliver
@@ -430,7 +453,7 @@ ${TOOL_TRANSITION_RULE}`;
         // A link cut is NOT handed over: the transient loop above already
         // owned its retries (decideTransientHandover).
         if (gatewayConfig.enabled) {
-          const handover = decideTransientHandover(detail, gatewayRetries, gatewayConfig.maxRetries);
+          const handover = withinGatewayBudget(decideTransientHandover(detail, gatewayRetries, gatewayRetryCeiling));
           if (handover.action === "wait") {
             gatewayRetries++;
             await holdForGateway(handover.signal);
@@ -497,7 +520,7 @@ ${TOOL_TRANSITION_RULE}`;
       // other model caller in this process behind the same cooldown, and retry
       // the SAME attempt (no recovery-ladder escalation).
       if (gatewayConfig.enabled) {
-        const decision = decideGatewayRetry(assistantError, gatewayRetries, gatewayConfig.maxRetries);
+        const decision = withinGatewayBudget(decideGatewayRetry(assistantError, gatewayRetries, gatewayRetryCeiling));
         if (decision.action === "wait") {
           gatewayRetries++;
           await holdForGateway(decision.signal);
@@ -860,7 +883,31 @@ ${recovery.recoveryPrompt}`;
       }
     };
 
+    const streaming = new StreamingActivityThrottle();
+    // Standalone callers (no owner signal) get an INACTIVITY guard, not a
+    // total-duration one: every session event re-arms it, and time spent
+    // waiting on the model gateway never counts. A long, busy session is never
+    // cut off for being long.
+    const inactivityMs = req.timeoutMs ?? 300_000;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const armInactivity = (): void => {
+      if (req.signal) return;
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => {
+        const admission = this.admission.status();
+        if (admission.waiting > 0 || admission.cooldownMs > 0) {
+          armInactivity();
+          return;
+        }
+        timedOut = true;
+        void session.abort();
+      }, inactivityMs);
+      timer.unref?.();
+    };
     const unsubscribe = session.subscribe((event) => {
+      armInactivity();
+      const streamed = streaming.note(event as { type?: string; message?: unknown });
+      if (streamed) emitWorkerActivity(req, streamed);
       const activity = activityFromSessionEvent(event);
       const activityToolName = "toolName" in event ? event.toolName : undefined;
       if (activity && activityToolName !== terminatingName && activityToolName !== checkpointProgressTool.name) {
@@ -922,20 +969,17 @@ ${recovery.recoveryPrompt}`;
       }
     });
 
-    // Wall-clock budget.
-    // The owner signal is the sole deadline authority when present (the broker
-    // starts its clock before setup/worktree allocation). Standalone executor
-    // callers without an owner signal retain the local worker timer.
-    const timer = req.signal
-      ? undefined
-      : setTimeout(() => {
-          timedOut = true;
-          void session.abort();
-        }, req.timeoutMs ?? 300_000);
+    // The owner signal is the sole liveness/limit authority when present (the
+    // broker watches activity from before setup/worktree allocation).
+    // Standalone executor callers without an owner signal keep the local
+    // inactivity guard armed above.
+    armInactivity();
     const abortFromOwner = (): void => {
       ownerAborted = true;
       const reason = req.signal?.reason;
-      if (reason instanceof DOMException && reason.name === "TimeoutError") timedOut = true;
+      if (reason instanceof DOMException && (reason.name === "TimeoutError" || reason.name === "InactivityError")) {
+        timedOut = true;
+      }
       void session.abort();
     };
     req.signal?.addEventListener("abort", abortFromOwner, { once: true });

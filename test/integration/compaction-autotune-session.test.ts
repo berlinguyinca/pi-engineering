@@ -466,3 +466,23 @@ test("Esc during a tuned boundary compaction is not a failure (no warning, trigg
     s.cleanup();
   }
 });
+
+test("every compaction summary is anchored on the latest user request (session review: stale Goal)", async () => {
+  // Default settings and an untuned path: Pi's manual /compact still gets the anchor.
+  const s = await startSession();
+  try {
+    await turn(s.session, 60_000, `Build the CSV importer. ${"x".repeat(60_000)}`);
+    await turn(s.session, 60_000, `Keep going on the CSV importer. ${"x".repeat(60_000)}`);
+    await turn(s.session, 60_000, `New spec: replace the CSV importer with a Parquet exporter. ${"y".repeat(60_000)}`);
+    gateway.requests.length = 0;
+    await s.session.compact();
+    const summaries = gateway.requests.filter((r) => r.summarization);
+    assert.equal(summaries.length, 1);
+    const sent = JSON.stringify(summaries[0]?.body);
+    assert.match(sent, /Anchor the summary's Goal on the user's most recent request/);
+    assert.match(sent, /New spec: replace the CSV importer with a Parquet exporter/);
+    assert.match(sent, /Drop completed goals/);
+  } finally {
+    s.cleanup();
+  }
+});

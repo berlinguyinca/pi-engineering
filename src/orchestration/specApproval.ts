@@ -51,7 +51,8 @@ export interface SpecPlannedTask {
   write_domains: string[];
   acceptance_ids: string[];
   deliverables: string[];
-  execution_budget_ms: number;
+  /** Opt-in wall-clock budget; absent means the task has no time limit. */
+  execution_budget_ms?: number;
   isolation: "none" | "worktree";
 }
 
@@ -357,10 +358,11 @@ export function validatePlannedTasks(
         `task at ordinal ${index} has ${deliverables.length} deliverables (max ${maxDeliverablesPerTask})`,
       );
     }
+    // No implicit budget: only an explicit positive budget is carried.
     const executionBudget =
       Number.isFinite(task.execution_budget_ms) && (task.execution_budget_ms ?? 0) > 0
-        ? task.execution_budget_ms!
-        : 30 * 60_000;
+        ? task.execution_budget_ms
+        : undefined;
     const taskId = task.task_id?.trim() || stableTaskId("", "", envelope.repositoryId, index);
     if (seen.has(taskId)) throw new SpecApprovalError("DUPLICATE_TASK_ID", `task ID ${taskId} repeated`);
     seen.add(taskId);
@@ -697,7 +699,7 @@ export class SpecApprovalController {
   private readonly reviewerModel: SpecWorkerModel | null;
   private readonly semanticRoundsLimit: number;
   private readonly stageDeadlineMs: number;
-  private readonly overallDeadlineMs: number;
+  private readonly overallDeadlineMs: number | undefined;
   private readonly now: () => string;
   private readonly semanticRoundsUsed: number;
   private state: SpecWorkflowState;
@@ -716,7 +718,9 @@ export class SpecApprovalController {
     this.reviewerModel = input.reviewerModel;
     this.semanticRoundsLimit = input.semanticRoundsLimit ?? DEFAULT_SEMANTIC_REFINEMENT_LIMIT;
     this.stageDeadlineMs = input.stageDeadlineMs ?? 5 * 60_000;
-    this.overallDeadlineMs = input.overallDeadlineMs ?? 40 * 60_000;
+    // Opt-in only: without an explicit overall deadline, spec approval is
+    // bounded by its semantic-round budget, never by a clock.
+    this.overallDeadlineMs = input.overallDeadlineMs;
     this.now = input.now ?? (() => new Date().toISOString());
     this.semanticRoundsUsed = input.semanticRoundsUsed ?? 0;
     this.state = input.store.getWorkflowState(this.missionId) ?? {
@@ -771,8 +775,10 @@ export class SpecApprovalController {
     }
 
     const startedAt = this.now();
-    const overallDeadline = new Date(new Date(startedAt).getTime() + this.overallDeadlineMs).toISOString();
-    if (!this.state.overallDeadlineAt) this.state = { ...this.state, overallDeadlineAt: overallDeadline };
+    if (!this.state.overallDeadlineAt && this.overallDeadlineMs !== undefined) {
+      const overallDeadline = new Date(new Date(startedAt).getTime() + this.overallDeadlineMs).toISOString();
+      this.state = { ...this.state, overallDeadlineAt: overallDeadline };
+    }
 
     // Resume from the last durable boundary: use the current revision if present.
     let revision = this.store.getCurrentRevision(this.missionId);
@@ -787,7 +793,10 @@ export class SpecApprovalController {
     let previousSemanticHash: string | null = null;
 
     while (true) {
-      if (new Date(this.now()).getTime() > new Date(this.state.overallDeadlineAt!).getTime()) {
+      if (
+        this.state.overallDeadlineAt &&
+        new Date(this.now()).getTime() > new Date(this.state.overallDeadlineAt).getTime()
+      ) {
         return this.stop(
           "SPEC_DEADLINE_EXHAUSTED",
           "Autonomous spec approval exceeded its overall deadline without reaching approval",

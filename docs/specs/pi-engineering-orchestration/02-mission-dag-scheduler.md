@@ -106,14 +106,19 @@ ambiguous requirement -> WAITING_FOR_USER
 ### Typed recovery and task replacement
 
 Generic retry is insufficient. Persist a machine-readable failure
-classification, fingerprint, expected material change, attempt budget, deadline,
-and next action. Recovery budgets survive process restart.
+classification, fingerprint, expected material change, attempt budget, an
+optional (opt-in) deadline, and next action. Recovery budgets survive process
+restart. Recovery is bounded by attempt counts, not by a clock.
 
 Multi-repository, high-risk, or oversized objectives must be split into bounded,
-repository-scoped tasks before implementation. A timeout after useful work is
-`TASK_BUDGET_EXHAUSTED`: checkpoint and validate partial work, supersede the
-failed task with explicit replacement lineage, and schedule only remaining
-deliverables. Do not replay the same oversized prompt.
+repository-scoped tasks before implementation — by deliverables, never by a
+clock. Tasks have no default wall-clock budget: a task runs as long as it shows
+activity, and a worker silent for the whole inactivity window is resumed from
+its checkpoint (see `docs/mission-time-limits.md`). Only an operator-configured
+limit (`limits.max_task_wall_clock_ms`) produces `TASK_BUDGET_EXHAUSTED`:
+checkpoint and validate partial work, supersede the failed task with explicit
+replacement lineage, and schedule only remaining deliverables. Do not replay the
+same oversized prompt.
 
 `BLOCKED` missions are repairable through an idempotent
 `repairBlockedMission(missionId)` path. Repair acquires ownership, reconciles old

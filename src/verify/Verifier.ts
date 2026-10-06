@@ -1,11 +1,97 @@
-import { execFile } from "node:child_process";
+import { spawn } from "node:child_process";
 import { access, readFile } from "node:fs/promises";
 import { basename, join } from "node:path";
-import { promisify } from "node:util";
 import type { ArtifactStore } from "../artifacts/ArtifactStore.ts";
 import type { Evidence, EvidenceTrust } from "../core/types.ts";
 
-const exec = promisify(execFile);
+/**
+ * Default hang guard for a verification command: killed only after this long
+ * with NO output at all. A long suite that keeps printing runs to completion.
+ */
+export const DEFAULT_STAGE_INACTIVITY_MS = 15 * 60_000;
+
+const MAX_STAGE_OUTPUT_BYTES = 16 * 1024 * 1024;
+
+/**
+ * Run a command with an INACTIVITY guard instead of a total-duration timeout:
+ * every chunk of stdout/stderr re-arms it, so only a silent (hung) command is
+ * killed. Resolves with the exit code; never rejects for a non-zero exit.
+ */
+export function runWithInactivityGuard(
+  command: string,
+  args: string[],
+  opts: { cwd: string; env?: NodeJS.ProcessEnv; signal?: AbortSignal; inactivityMs: number },
+): Promise<{ code: number; stdout: string; stderr: string; hung: boolean }> {
+  return new Promise((resolve, reject) => {
+    if (opts.signal?.aborted) {
+      reject(Object.assign(new Error("The operation was aborted"), { name: "AbortError" }));
+      return;
+    }
+    let stdout = "";
+    let stderr = "";
+    let hung = false;
+    let settled = false;
+    // Own process group, so a kill reaches grandchildren (npm -> node) that
+    // would otherwise hold the output pipes open forever.
+    const child = spawn(command, args, {
+      cwd: opts.cwd,
+      env: opts.env,
+      stdio: ["ignore", "pipe", "pipe"],
+      detached: process.platform !== "win32",
+    });
+    const killTree = (): void => {
+      try {
+        if (child.pid && process.platform !== "win32") process.kill(-child.pid, "SIGKILL");
+        else child.kill("SIGKILL");
+      } catch {
+        child.kill("SIGKILL");
+      }
+    };
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const arm = (): void => {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => {
+        hung = true;
+        stderr += `\n[pi-engineering] killed: no output for ${opts.inactivityMs}ms (hung command)\n`;
+        killTree();
+      }, opts.inactivityMs);
+    };
+    const onAbort = (): void => {
+      killTree();
+    };
+    opts.signal?.addEventListener("abort", onAbort, { once: true });
+    const append = (current: string, chunk: Buffer): string =>
+      current.length >= MAX_STAGE_OUTPUT_BYTES ? current : current + chunk.toString("utf8");
+    child.stdout.on("data", (chunk: Buffer) => {
+      stdout = append(stdout, chunk);
+      arm();
+    });
+    child.stderr.on("data", (chunk: Buffer) => {
+      stderr = append(stderr, chunk);
+      arm();
+    });
+    const finish = (fn: () => void): void => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      opts.signal?.removeEventListener("abort", onAbort);
+      fn();
+    };
+    child.on("error", (error) =>
+      finish(() => resolve({ code: 1, stdout, stderr: `${stderr}${error.message}`, hung: false })),
+    );
+    child.on("close", (code) =>
+      finish(() => {
+        if (opts.signal?.aborted) {
+          reject(Object.assign(new Error("The operation was aborted"), { name: "AbortError" }));
+          return;
+        }
+        resolve({ code: typeof code === "number" ? code : 1, stdout, stderr, hung });
+      }),
+    );
+    arm();
+  });
+}
 
 /** A verification stage from a profile (spec §15). */
 export interface VerifyStage {
@@ -15,6 +101,7 @@ export interface VerifyStage {
   /** Stop the profile on hard failure. */
   required: boolean;
   cwd?: string;
+  /** Hang guard: kill the command after this long with no output (not a total-duration limit). */
   timeoutMs?: number;
 }
 
@@ -114,6 +201,96 @@ export function tokenizeCommand(script: string): { command: string; args: string
   if (cur) tokens.push(cur);
   if (tokens.length === 0) return { command: "echo", args: [] };
   return { command: tokens[0]!, args: tokens.slice(1) };
+}
+
+/**
+ * True when an npm-style script needs a shell to mean what it says: command
+ * chaining (`&&`, `||`, `;`), pipes, redirection, substitution, or a leading
+ * `VAR=value` assignment. npm itself runs scripts through `sh -c`; splitting
+ * such a script into words and exec'ing it passes `&&` as a literal argument,
+ * so every chained script fails.
+ */
+export function needsShell(script: string): boolean {
+  return /&&|\|\||[;|<>`$]/.test(script) || /^\s*[A-Za-z_][A-Za-z0-9_]*=/.test(script);
+}
+
+/** Command + args for a declared script: direct exec when safe, otherwise `sh -c` like npm. */
+export function scriptCommand(script: string): { command: string; args: string[] } {
+  if (needsShell(script)) return { command: "sh", args: ["-c", script] };
+  return tokenizeCommand(script);
+}
+
+async function exists(path: string): Promise<boolean> {
+  try {
+    await access(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function readText(path: string): Promise<string | null> {
+  try {
+    return await readFile(path, "utf-8");
+  } catch {
+    return null;
+  }
+}
+
+/** True when a Makefile declares `target:` (not `target :=` assignments). */
+function makefileHasTarget(makefile: string, target: string): boolean {
+  return new RegExp(`^${target}\\s*:(?!=)`, "m").test(makefile);
+}
+
+/**
+ * Checks for repositories that are not driven by package.json scripts. Each
+ * ecosystem is detected from its own manifest, so a Rust/Go/Python/Make repo
+ * gets real evidence instead of a zero-check run.
+ */
+async function nonNodeStages(cwd: string): Promise<VerifyStage[]> {
+  const stages: VerifyStage[] = [];
+  const stage = (name: string, command: string, args: string[]): VerifyStage => ({
+    name,
+    command,
+    args,
+    required: true,
+    timeoutMs: DEFAULT_STAGE_INACTIVITY_MS,
+  });
+  if (await exists(join(cwd, "Cargo.toml"))) {
+    stages.push(stage("typecheck", "cargo", ["check", "--all-targets"]));
+    stages.push(stage("test", "cargo", ["test"]));
+  }
+  if (await exists(join(cwd, "go.mod"))) {
+    stages.push(stage("build", "go", ["build", "./..."]));
+    stages.push(stage("test", "go", ["test", "./..."]));
+  }
+  const pyproject = (await readText(join(cwd, "pyproject.toml"))) ?? "";
+  const setupCfg = (await readText(join(cwd, "setup.cfg"))) ?? "";
+  if (
+    (await exists(join(cwd, "pytest.ini"))) ||
+    (await exists(join(cwd, "conftest.py"))) ||
+    /\[tool\.pytest/.test(pyproject) ||
+    /\[tool:pytest\]/.test(setupCfg)
+  ) {
+    stages.push(stage("test", "python3", ["-m", "pytest", "-q"]));
+  }
+  const makefile = (await readText(join(cwd, "Makefile"))) ?? (await readText(join(cwd, "makefile")));
+  if (makefile && !stages.some((s) => s.name === "test")) {
+    for (const target of ["check", "test"]) {
+      if (makefileHasTarget(makefile, target)) stages.push(stage(target, "make", [target]));
+    }
+  }
+  return stages;
+}
+
+/** Manifest fingerprint for the profile cache: detection depends on more than package.json. */
+async function manifestFingerprint(cwd: string): Promise<string> {
+  const parts: string[] = [];
+  for (const file of ["Cargo.toml", "go.mod", "pytest.ini", "conftest.py", "pyproject.toml", "setup.cfg", "Makefile"]) {
+    const text = await readText(join(cwd, file));
+    if (text !== null) parts.push(`${file}:${text.length}:${text.slice(0, 2048)}`);
+  }
+  return parts.join("\u0001");
 }
 
 /**
@@ -235,7 +412,7 @@ export class CommandVerifier implements VerificationProvider {
     } catch {
       pkg = {};
     }
-    return { key: `${cwd}\u0000${content}\u0000full:${full ? 1 : 0}`, pkg };
+    return { key: `${cwd}\u0000${content}\u0000${await manifestFingerprint(cwd)}\u0000full:${full ? 1 : 0}`, pkg };
   }
 
   /** Invalidate the cache (e.g. after package.json changes). Primarily for tests. */
@@ -268,13 +445,13 @@ export class CommandVerifier implements VerificationProvider {
 
     const push = (name: string, script?: string, required = true): void => {
       if (!script) return;
-      const { command, args } = tokenizeCommand(script);
+      const { command, args } = scriptCommand(script);
       stages.push({
         name,
         command,
         args,
         required,
-        timeoutMs: 300_000,
+        timeoutMs: DEFAULT_STAGE_INACTIVITY_MS,
       });
     };
     push("typecheck", scripts.typecheck ?? scripts.check);
@@ -287,6 +464,7 @@ export class CommandVerifier implements VerificationProvider {
       push("lint", scripts.lint);
       push("test:full", scripts["test:full"] ?? scripts["test:all"]);
     }
+    if (stages.length === 0) stages.push(...(await nonNodeStages(cwd)));
     if (stages.length === 0) {
       // No declared scripts. Only fall back to a syntax check if a real JS
       // entry file exists — otherwise the stage is doomed to ENOENT and would
@@ -322,24 +500,15 @@ export class CommandVerifier implements VerificationProvider {
       let stdout = "";
       let stderr = "";
       let code = -1;
-      try {
-        const res = await exec(stage.command, stage.args, {
-          cwd: stage.cwd ?? cwd,
-          timeout: stage.timeoutMs ?? 300_000,
-          maxBuffer: 16 * 1024 * 1024,
-          env: await cleanEnv(stage.cwd ?? cwd),
-          signal: opts?.signal,
-        });
-        stdout = res.stdout;
-        stderr = res.stderr;
-        code = 0;
-      } catch (err) {
-        if (opts?.signal?.aborted || (err as { name?: string }).name === "AbortError") throw err;
-        const e = err as NodeJS.ErrnoException & { stdout?: string; stderr?: string; code?: number };
-        code = typeof e.code === "number" ? e.code : 1;
-        stdout = (e.stdout as string) ?? "";
-        stderr = (e.stderr as string) ?? e.message ?? String(e);
-      }
+      const res = await runWithInactivityGuard(stage.command, stage.args, {
+        cwd: stage.cwd ?? cwd,
+        inactivityMs: stage.timeoutMs ?? DEFAULT_STAGE_INACTIVITY_MS,
+        env: await cleanEnv(stage.cwd ?? cwd),
+        ...(opts?.signal ? { signal: opts.signal } : {}),
+      });
+      stdout = res.stdout;
+      stderr = res.stderr;
+      code = res.hung && res.code === 0 ? 1 : res.code;
       const finishedAt = new Date().toISOString();
       const passed = code === 0;
       const log = `$ ${stage.command} ${stage.args.join(" ")}\n--- stdout ---\n${stdout}\n--- stderr ---\n${stderr}`;

@@ -54,6 +54,7 @@ import {
   getAgentDir,
 } from "@earendil-works/pi-coding-agent";
 import { emitTelemetry } from "../telemetry/sink.ts";
+import { summaryInstructions } from "./summaryInstructions.ts";
 
 export const PI_DEFAULT_RESERVE_TOKENS = 16_384;
 export const PI_DEFAULT_KEEP_RECENT_TOKENS = 20_000;
@@ -450,10 +451,20 @@ export function registerAutoCompaction(pi: AutoCompactionHost, options: AutoComp
         : undefined;
     }
     if (!preparation) return undefined;
+    return summarize(ctx, preparation, customInstructions, signal);
+  };
+
+  /** Pi's compact() over `preparation`, through the session's composed provider. */
+  const summarize = (
+    ctx: AutoCompactionContext,
+    preparation: PreparationLike,
+    customInstructions: string | undefined,
+    signal: AbortSignal | undefined,
+  ): Promise<CompactionResult> => {
     const streamFn = ((m: never, c: never, o?: never) => ctx.modelRegistry.streamSimple(m, c, o)) as never;
     return compact(
       preparation as never,
-      model as never,
+      ctx.model as never,
       undefined,
       undefined,
       customInstructions,
@@ -497,12 +508,13 @@ export function registerAutoCompaction(pi: AutoCompactionHost, options: AutoComp
 
     ctx.ui?.setStatus?.(STATUS_KEY, "Compacting context (tuned for this model)…");
     try {
+      const branch = ctx.sessionManager.getBranch();
       const result = await tunedCompaction(
         ctx,
         effective,
-        ctx.sessionManager.getBranch(),
+        branch,
         undefined,
-        undefined,
+        summaryInstructions(branch, undefined),
         ctx.signal,
       );
       if (ctx.signal?.aborted) {
@@ -558,16 +570,19 @@ export function registerAutoCompaction(pi: AutoCompactionHost, options: AutoComp
   pi.on("session_before_compact", (async (event: BeforeCompactEvent, ctx: AutoCompactionContext) => {
     const effective = resolve(ctx);
     if (!effective || !ctx.model) return undefined;
-    if (effective.reserveSource !== "tuned" && effective.keepSource !== "tuned") return undefined;
+    // Every compaction runs here, tuned or not, so each summary is anchored on
+    // the latest user request (summaryInstructions). Untuned models keep Pi's
+    // own values, so only the instructions differ from Pi's compaction.
     try {
-      const compaction = await tunedCompaction(
-        ctx,
-        effective,
-        event.branchEntries,
-        event.preparation,
-        event.customInstructions,
-        event.signal,
-      );
+      const instructions = summaryInstructions(event.branchEntries, event.customInstructions);
+      const tuned =
+        effective.reserveSource === "tuned" || effective.keepSource === "tuned"
+          ? await tunedCompaction(ctx, effective, event.branchEntries, event.preparation, instructions, event.signal)
+          : undefined;
+      // Nothing to summarize at the tuned cut (or an untuned model): Pi's own
+      // cut, still with the anchored instructions.
+      const compaction =
+        tuned ?? (event.preparation ? await summarize(ctx, event.preparation, instructions, event.signal) : undefined);
       return compaction ? { compaction } : undefined;
     } catch (error) {
       if (event.signal.aborted) throw error;

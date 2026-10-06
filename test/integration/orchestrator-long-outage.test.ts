@@ -155,8 +155,21 @@ describe("orchestrator: an outage longer than the retry horizon", () => {
     assert.ok(h.statuses.includes("PAUSED_INFRASTRUCTURE"), "probed while paused");
   });
 
-  it("stays paused (never failed) when the gateway is still down after the auto-resume horizon", async () => {
+  it("keeps waiting past the old 24h/36h horizons and completes when capacity returns (100h outage)", async () => {
     const h = run(100 * HOUR);
+    const result = await h.orchestrator.orchestrate("Add a health endpoint", {
+      repository: ".",
+      baseRef: "abc",
+      mutationRequested: true,
+    });
+    assert.equal(result.completed, true, JSON.stringify(result.verdict.reasons));
+    assert.equal(h.store.getMission(result.mission.mission_id)!.status, "COMPLETE");
+    assert.ok(h.clock() >= 100 * HOUR, "waited the whole outage instead of giving up");
+    assert.ok(h.statuses.includes("PAUSED_INFRASTRUCTURE"), "paused (never failed) while waiting");
+  });
+
+  it("an operator-set auto-resume horizon still leaves the mission paused (never failed)", async () => {
+    const h = run(100 * HOUR, { resilience: { ...DEFAULT_GATEWAY_RESILIENCE, auto_resume_horizon_ms: 24 * HOUR } });
     const result = await h.orchestrator.orchestrate("Add a health endpoint", {
       repository: ".",
       baseRef: "abc",

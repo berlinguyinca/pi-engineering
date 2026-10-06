@@ -21,6 +21,7 @@ import type {
 import { ROLE_BUDGETS, isMachineEvidence } from "../core/types.ts";
 import { GitRepo } from "../git/GitRepo.ts";
 import { Ledger } from "../ledger/Ledger.ts";
+import { loadMissionLimits } from "../lifecycle/policy.ts";
 import { workflowMutatesRepo } from "../orchestration/intentRouter.ts";
 import {
   MISSION_SNAPSHOT_FILENAME,
@@ -37,6 +38,7 @@ import { FailureClassifier } from "../orchestration/recovery.ts";
 import { RepositoryRegistry } from "../orchestration/repositoryRegistry.ts";
 import { canTransitionMission } from "../orchestration/state.ts";
 import { MissionSupervisor, type SupervisorStatus } from "../orchestration/supervisor.ts";
+import { SupervisorRepairBackoff } from "../orchestration/supervisorBackoff.ts";
 import type { Mission, MissionStop } from "../orchestration/types.ts";
 import { WorkspaceManifestResolver } from "../orchestration/workspaceManifest.ts";
 import { tasksConflict, topoSort } from "../plan/taskDag.ts";
@@ -487,6 +489,8 @@ export class EngineeringRuntime {
   private openReferences = 1;
   private readonly missionResumeFlights = new Map<string, Promise<import("../orchestration/types.ts").Mission>>();
   private readonly supervisorSettlementFlights = new Map<string, Promise<void>>();
+  /** Spaces out supervisor repairs that keep reporting the same unchanged decision. */
+  private readonly supervisorRepairBackoff = new SupervisorRepairBackoff();
 
   /**
    * Serializes git mutations that touch the shared main repo (worktree create,
@@ -871,16 +875,25 @@ export class EngineeringRuntime {
             execution_requirements: {},
             acceptance_ids: acceptanceIds,
             deliverables: mutates ? ["implementation", "targeted-tests"] : ["investigation-report"],
-            execution_budget_ms: 30 * 60_000,
+            // No execution_budget_ms: a task runs as long as it shows activity
+            // (an opt-in limits.max_task_wall_clock_ms is applied by the
+            // orchestrator when configured).
             checkpoint_policy: { activity_milestone: 5, before_deadline_ms: 30_000 },
             max_attempts: 3,
             failure_policy: "retry",
           },
         ];
       };
+      const limits = await loadMissionLimits(repoRoot, opts.agentDir);
       rt.orchestrator = new Orchestrator({
         store: rt.missionStore,
         backends,
+        worksetPolicy: { maxTaskBudgetMs: limits.max_task_wall_clock_ms },
+        timeLimits: {
+          // The environment override (PI_ENGINEERING_WORKER_INACTIVITY_MS) wins.
+          workerInactivityMs: process.env.PI_ENGINEERING_WORKER_INACTIVITY_MS ? undefined : limits.worker_inactivity_ms,
+          maxMissionWallClockMs: limits.max_mission_wall_clock_ms,
+        },
         observability: rt.missionObservability,
         planner: opts.orchestrationPlanner ?? defaultPlanner,
         specApproval: opts.orchestrationSpecApproval,
@@ -1078,6 +1091,13 @@ export class EngineeringRuntime {
         if (status.action !== status.decision.action || !SUPPORTED_SUPERVISOR_REPAIR_ACTIONS.has(status.action)) {
           throw new Error(`invalid worker output: unsupported supervisor action ${status.action}`);
         }
+        const repairFingerprint = [
+          status.decision.recoveryId,
+          status.missionStatus,
+          status.missionBlockedEpisodeId ?? "",
+        ].join("|");
+        if (!this.supervisorRepairBackoff.shouldAttempt(status.missionId, repairFingerprint, Date.now())) return;
+        this.supervisorRepairBackoff.recordAttempt(status.missionId, repairFingerprint, Date.now());
         failureFence = await this.normalizeMissionForRepair(status.missionId);
         await this.orchestrator.repairBlockedMission(status.missionId);
       } else if (status.health !== "HEALTHY" && status.action !== "STOP") {

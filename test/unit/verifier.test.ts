@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
-import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { test } from "node:test";
+import { describe, it, test } from "node:test";
 import { ArtifactStore } from "../../src/artifacts/ArtifactStore.ts";
 import { CommandVerifier, tokenizeCommand } from "../../src/verify/Verifier.ts";
 
@@ -278,4 +278,160 @@ test("verifier aborts an active command promptly", async () => {
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test("verifier runs && chained npm scripts through a shell (session review: typecheck always failed)", async () => {
+  // pi-engineering's own `typecheck` is `npm run a && npm run b`. Exec'ing the
+  // split words without a shell passed `&&` as a literal argument, so every
+  // chained script failed ("Could not resolve the path &&").
+  const dir = await makeProject({
+    "package.json": JSON.stringify({
+      scripts: {
+        typecheck: "node -e \"process.exit(0)\" && node -e \"require('fs').writeFileSync('ran.txt', 'ok')\"",
+      },
+    }),
+  });
+  try {
+    const store = await ArtifactStore.create(join(dir, "artifacts"));
+    const v = new CommandVerifier();
+    const profile = await v.detect(dir);
+    const outcome = await v.run(dir, profile, store);
+    assert.ok(outcome.passed, "a chained script whose parts pass must pass");
+    assert.equal(await readFile(join(dir, "ran.txt"), "utf-8"), "ok", "the second command of the chain ran");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("verifier fails a chained script when a later command fails", async () => {
+  const dir = await makeProject({
+    "package.json": JSON.stringify({
+      scripts: { test: 'node -e "process.exit(0)" && node -e "process.exit(3)"' },
+    }),
+  });
+  try {
+    const store = await ArtifactStore.create(join(dir, "artifacts"));
+    const v = new CommandVerifier();
+    const outcome = await v.run(dir, await v.detect(dir), store);
+    assert.ok(!outcome.passed);
+    assert.equal(outcome.failedStage, "test");
+    assert.equal(outcome.stages[0]?.exitCode, 3);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("detect finds checks for non-Node repositories (Cargo, Go, pytest, Makefile)", async () => {
+  const cases: Array<{ files: Record<string, string>; expect: RegExp }> = [
+    { files: { "Cargo.toml": '[package]\nname = "x"\nversion = "0.1.0"\n' }, expect: /^cargo test/ },
+    { files: { "go.mod": "module example.com/x\n\ngo 1.21\n" }, expect: /^go test \.\/\.\.\./ },
+    { files: { "pyproject.toml": "[tool.pytest.ini_options]\n" }, expect: /pytest/ },
+    { files: { "pytest.ini": "[pytest]\n" }, expect: /pytest/ },
+    { files: { Makefile: "test:\n\t@echo ok\n" }, expect: /^make test/ },
+  ];
+  for (const c of cases) {
+    const dir = await makeProject(c.files);
+    try {
+      const profile = await new CommandVerifier().detect(dir);
+      const commands = profile.stages.map((s) => [s.command, ...s.args].join(" "));
+      assert.ok(
+        commands.some((cmd) => c.expect.test(cmd)),
+        `${Object.keys(c.files).join(",")}: expected a stage matching ${c.expect}, got ${JSON.stringify(commands)}`,
+      );
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+});
+
+test("verifier runs a Makefile test target and a real pytest suite", async () => {
+  const makeDir = await makeProject({ Makefile: "test:\n\t@echo make-ok\n" });
+  const pyDir = await makeProject({
+    "pytest.ini": "[pytest]\n",
+    "test_sample.py": "def test_ok():\n    assert 1 + 1 == 2\n",
+  });
+  try {
+    const v = new CommandVerifier();
+    const makeOutcome = await v.run(
+      makeDir,
+      await v.detect(makeDir),
+      await ArtifactStore.create(join(makeDir, "artifacts")),
+    );
+    assert.ok(makeOutcome.passed, "make test must pass");
+    assert.equal(makeOutcome.noTargets, false);
+    const pyOutcome = await v.run(pyDir, await v.detect(pyDir), await ArtifactStore.create(join(pyDir, "artifacts")));
+    assert.ok(pyOutcome.passed, `pytest must pass: ${JSON.stringify(pyOutcome.stages.map((s) => s.summary))}`);
+  } finally {
+    await rm(makeDir, { recursive: true, force: true });
+    await rm(pyDir, { recursive: true, force: true });
+  }
+});
+
+describe("verification commands have an inactivity hang guard, not a duration limit", () => {
+  const chatty =
+    'const t=setInterval(()=>console.log("test ok"),40);setTimeout(()=>{clearInterval(t);process.exit(0)},1500)';
+  const silent = "setTimeout(()=>process.exit(0),30000)";
+
+  it("lets a test command that keeps printing run past its hang guard", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pi-eng-ver-"));
+    try {
+      const store = await ArtifactStore.create(join(dir, "artifacts"));
+      const outcome = await new CommandVerifier().run(
+        dir,
+        {
+          name: "long-suite",
+          stages: [{ name: "test", command: process.execPath, args: ["-e", chatty], required: true, timeoutMs: 400 }],
+        },
+        store,
+      );
+      assert.equal(outcome.passed, true, "a suite that keeps producing output is never killed for running long");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("kills a test command that goes silent for the hang-guard window", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pi-eng-ver-"));
+    try {
+      const store = await ArtifactStore.create(join(dir, "artifacts"));
+      const started = Date.now();
+      const outcome = await new CommandVerifier().run(
+        dir,
+        {
+          name: "hung-suite",
+          stages: [{ name: "test", command: process.execPath, args: ["-e", silent], required: true, timeoutMs: 400 }],
+        },
+        store,
+      );
+      assert.equal(outcome.passed, false);
+      assert.equal(outcome.failedStage, "test");
+      assert.ok(Date.now() - started < 10_000, "the hung command is killed by inactivity, not left running");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("kills the whole process tree of a hung command, so a grandchild cannot keep it open", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pi-eng-ver-"));
+    const tree =
+      "require('node:child_process').spawn(process.execPath,['-e','setTimeout(()=>{},30000)'],{stdio:'inherit'});setTimeout(()=>{},30000)";
+    try {
+      const store = await ArtifactStore.create(join(dir, "artifacts"));
+      const outcome = await Promise.race([
+        new CommandVerifier().run(
+          dir,
+          {
+            name: "hung-tree",
+            stages: [{ name: "test", command: process.execPath, args: ["-e", tree], required: true, timeoutMs: 400 }],
+          },
+          store,
+        ),
+        new Promise<"stuck">((resolve) => setTimeout(() => resolve("stuck"), 10_000).unref()),
+      ]);
+      assert.notEqual(outcome, "stuck", "the hang guard itself must not hang");
+      if (outcome !== "stuck") assert.equal(outcome.passed, false);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
 });

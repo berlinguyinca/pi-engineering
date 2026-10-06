@@ -284,9 +284,9 @@ describe("realBackends capability routing", () => {
     assert.ok(activity.some((event) => /current worker model.*reduced independence/i.test(event.summary)));
   });
 
-  it("gives the reviewer the same wall-clock budget as implementation workers", async () => {
-    // Without an explicit budget the executor's 5-minute default aborted
-    // reviewers mid-analysis.
+  it("gives the reviewer the same (absent) duration cap and unbounded capacity wait as implementation workers", async () => {
+    // Without an owner-controlled budget the executor's 5-minute default
+    // aborted reviewers mid-analysis; now the broker owns liveness instead.
     const seen: WorkerRequest[] = [];
     const backends = realBackends({
       worker: capturingWorker(seen),
@@ -297,6 +297,7 @@ describe("realBackends capability routing", () => {
     });
     await backends.review.runReview({ objective: "review", signal: new AbortController().signal });
     assert.equal(seen[0]?.timeoutMs, workerTimeoutMs());
+    assert.equal(seen[0]?.unboundedInferenceWait, true, "a mission reviewer waits for capacity however long it takes");
   });
 
   it("fails closed for incomplete review payloads and invented model provenance", async () => {
@@ -615,4 +616,36 @@ describe("realBackends deterministic cancellation", () => {
       assert.equal(receivedSignal, controller.signal);
     });
   }
+});
+
+describe("realBackends validation with no verification targets", () => {
+  it("reports missing evidence (noTargets), not a failed check that would spawn futile repairs", async () => {
+    const { mkdtemp, rm } = await import("node:fs/promises");
+    const { tmpdir } = await import("node:os");
+    const { ArtifactStore } = await import("../../src/artifacts/ArtifactStore.ts");
+    const { CommandVerifier } = await import("../../src/verify/Verifier.ts");
+    const dir = await mkdtemp(join(tmpdir(), "pi-eng-notargets-"));
+    try {
+      const backends = realBackends({
+        worker: capturingWorker([]),
+        verifier: new CommandVerifier(),
+        artifacts: await ArtifactStore.create(join(dir, ".artifacts")),
+        git: null,
+        cwd: dir,
+      });
+      const outcome = await backends.validation.runValidation({
+        objective: "check",
+        signal: new AbortController().signal,
+      });
+      assert.equal(outcome.validationEvidence?.noTargets, true);
+      assert.equal(
+        outcome.exitStatus,
+        "succeeded",
+        "zero checks is missing evidence for the completion gate, not a failed validation task",
+      );
+      assert.match(outcome.summary, /no verification targets/i);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
 });

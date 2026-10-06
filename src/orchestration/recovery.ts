@@ -235,11 +235,16 @@ export class FailureClassifier {
     if (/evidence.*(unavailable|missing|inaccessible)|candidate evidence unavailable/.test(summary)) {
       return "EVIDENCE_UNAVAILABLE";
     }
-    if (/budget exhausted|execution budget|deadline exceeded|wall.clock timeout/.test(summary)) {
+    if (/budget exhausted|execution budget|deadline exceeded|wall.clock (timeout|limit)/.test(summary)) {
       return "TASK_BUDGET_EXHAUSTED";
     }
+    // A lost execution lease ("execution X is no longer authoritative") is an
+    // ownership problem, not a credential one; check it before the auth words.
+    if (/no longer authoritative|orphan|no owner|stale owner/.test(summary)) return "ORPHANED_EXECUTION";
+    // `auth` is anchored: unanchored it matched "authoritative" and "author",
+    // turning a recoverable ownership loss into a credential STOP.
     if (
-      /invalid.*(api key|credential|model|config)|model.*(not found|does not exist)|auth|unauthorized|forbidden/.test(
+      /invalid.*(api key|credential|model|config)|model.*(not found|does not exist)|\bauth(?:entication|enticate|orization|orize)?\b|unauthorized|forbidden/.test(
         summary,
       )
     ) {
@@ -268,13 +273,23 @@ export class FailureClassifier {
 export class RecoveryPlanner {
   private readonly missionCeiling: number;
   private readonly strategyMaxAttempts: number;
-  private readonly decisionTtlMs: number;
+  /**
+   * OPT-IN recovery deadline. Undefined (the default) means recovery is bounded
+   * by attempt counts (mission ceiling, per-fingerprint strategy budget), never
+   * by a clock: a 30-minute deadline used to STOP missions whose recovery was
+   * simply waiting for the gateway or still progressing.
+   */
+  private readonly decisionTtlMs: number | undefined;
 
   constructor(options: RecoveryPlannerOptions = {}) {
     this.missionCeiling = options.missionCeiling ?? 1_000;
     this.strategyMaxAttempts = options.strategyMaxAttempts ?? 2;
-    this.decisionTtlMs = options.decisionTtlMs ?? 30 * 60_000;
-    if (this.missionCeiling < 1 || this.strategyMaxAttempts < 1 || this.decisionTtlMs < 1) {
+    this.decisionTtlMs = options.decisionTtlMs;
+    if (
+      this.missionCeiling < 1 ||
+      this.strategyMaxAttempts < 1 ||
+      (this.decisionTtlMs !== undefined && this.decisionTtlMs < 1)
+    ) {
       throw new Error("recovery planner budgets and deadline must be positive");
     }
   }
@@ -291,12 +306,16 @@ export class RecoveryPlanner {
       input.resumptionGeneration ?? Math.max(0, ...input.history.map((decision) => decision.resumptionGeneration ?? 0));
     const durableDeadlines = input.history
       .filter((decision) => (decision.resumptionGeneration ?? 0) === resumptionGeneration)
-      .map((decision) => Date.parse(decision.deadline))
+      .map((decision) => (decision.deadline ? Date.parse(decision.deadline) : Number.NaN))
       .filter(Number.isFinite);
     const durableDeadline =
-      durableDeadlines.length > 0 ? Math.min(...durableDeadlines) : input.now + this.decisionTtlMs;
+      durableDeadlines.length > 0
+        ? Math.min(...durableDeadlines)
+        : this.decisionTtlMs === undefined
+          ? undefined
+          : input.now + this.decisionTtlMs;
     const missionExhausted = input.history.length >= this.missionCeiling;
-    const deadlineExhausted = input.now >= durableDeadline;
+    const deadlineExhausted = durableDeadline !== undefined && input.now >= durableDeadline;
     // Provider outages already have a durable probe/relaunch/outage budget.
     // They still consume the mission ceiling, but the generic two-shot schema
     // repair budget must not truncate a healthy long-outage policy.
@@ -305,7 +324,7 @@ export class RecoveryPlanner {
     const defaultAction = RecoveryPlanner.defaultAction(input.classification.category);
     const action = missionExhausted || deadlineExhausted || strategyExhausted ? "STOP" : defaultAction;
     const decidedAt = new Date(input.now).toISOString();
-    const deadline = new Date(durableDeadline).toISOString();
+    const deadline = durableDeadline === undefined ? null : new Date(durableDeadline).toISOString();
     const exhaustedReason = missionExhausted
       ? `mission recovery ceiling exhausted (${input.history.length}/${this.missionCeiling})`
       : deadlineExhausted
