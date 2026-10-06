@@ -238,6 +238,35 @@ export class EngineeringHostExtension {
   }
 
   async install(pi: ExtensionAPI): Promise<void> {
+    try {
+      await this.installSteps(pi);
+    } catch (error) {
+      // The entry shim falls back to the legacy extension after this throws.
+      // A generation this Host already started must not keep running beside
+      // it (two runtimes, two custody owners): stop it first, and say so if
+      // that is impossible.
+      if (!(await this.abandon())) {
+        throw Object.assign(error instanceof Error ? error : new Error(String(error)), {
+          generationStillRunning: true,
+        });
+      }
+      throw error;
+    }
+  }
+
+  /** Stop whatever this Host started. True when no generation is left running. */
+  async abandon(): Promise<boolean> {
+    try {
+      if (this.checkTimer) clearTimeout(this.checkTimer);
+      this.unpublish();
+      await this.host?.shutdown({ type: "session_shutdown", reason: "quit" }, undefined);
+      return !this.host?.activeGeneration();
+    } catch {
+      return !this.host?.activeGeneration();
+    }
+  }
+
+  private async installSteps(pi: ExtensionAPI): Promise<void> {
     this.pi = pi;
     const host = new RuntimeHost({ pi, generationsDir: this.generationsDir, telemetry: this.telemetry });
     this.host = host;
@@ -506,7 +535,7 @@ export class EngineeringHostExtension {
    * If startup fell back from `current` to `previous`, make the pointers say
    * what is actually running, so the next start does not retry the bad one.
    */
-  private async repairPointersAfterStart(running: RuntimeSource | undefined): Promise<void> {
+  protected async repairPointersAfterStart(running: RuntimeSource | undefined): Promise<void> {
     const current = this.layout.readPointer("current");
     if (!running || !current || !running.label.startsWith("installed:")) return;
     if (running.root === current) return;
@@ -696,13 +725,24 @@ export class EngineeringHostExtension {
         return notify(ctx, `Rollback refused: ${error instanceof Error ? error.message : String(error)}`, "warning");
       }
       if (plan.loss.paths.length > 0 && !confirmed) {
-        const shown = plan.loss.paths.slice(0, 20);
+        const list = (paths: string[]) => [
+          ...paths.slice(0, 20).map((p) => `  ${p}`),
+          ...(paths.length > 20 ? [`  … and ${paths.length - 20} more`] : []),
+        ];
+        const newer = new Set(plan.loss.paths);
+        const older = plan.loss.replaced.filter((p) => !newer.has(p));
         return notify(
           ctx,
           [
             `Rolling back to ${plan.target.version} restores the state checkpoint taken before schema ${plan.migration.from} and discards these files written since the update (${plan.loss.since}):`,
-            ...shown.map((p) => `  ${p}`),
-            ...(plan.loss.paths.length > shown.length ? [`  … and ${plan.loss.paths.length - shown.length} more`] : []),
+            ...list(plan.loss.paths),
+            ...(older.length > 0
+              ? [
+                  "",
+                  "It also returns these files (written by the update itself) to their pre-update content:",
+                  ...list(older),
+                ]
+              : []),
             "",
             `Nothing was changed. To proceed: /engineering rollback${requested ? ` ${requested}` : ""} --yes`,
           ].join("\n"),

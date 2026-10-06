@@ -15,7 +15,7 @@ import { after, test } from "node:test";
 import { RuntimeRegistry } from "../../src/runtime/isolation/RuntimeRegistry.ts";
 import { RuntimeSession, registryFileFor } from "../../src/runtime/isolation/RuntimeSession.ts";
 import { currentProcessIdentity } from "../../src/runtime/isolation/processIdentity.ts";
-import { MAX_SYNC_BLOCK_MS, SqliteBusyError, immediate } from "../../src/runtime/isolation/sqlite.ts";
+import { MAX_SYNC_BLOCK_MS, SqliteBusyError, immediate, openDatabase } from "../../src/runtime/isolation/sqlite.ts";
 
 const root = mkdtempSync(join(tmpdir(), "rt-sqlite-busy-"));
 after(() => rmSync(root, { recursive: true, force: true }));
@@ -96,4 +96,20 @@ test("a session heartbeat under a held write lock degrades within the bound and 
   assert.equal(session.heartbeat(), true);
   assert.equal(session.health.state, "healthy", "transient busy clears on the next successful beat");
   session.shutdown("test");
+});
+
+test("a narrowed wait restores the caller's own busy_timeout, not the default", async () => {
+  const file = join(root, "custom-timeout.db");
+  const db = openDatabase(file, { busyTimeoutMs: 700 });
+  db.exec("CREATE TABLE IF NOT EXISTS t (x INTEGER)");
+  const busyTimeout = () => (db.prepare("PRAGMA busy_timeout").get() as { timeout: number }).timeout;
+  assert.equal(busyTimeout(), 700);
+  const holder = await holdWriteLock(file);
+  try {
+    assert.throws(() => immediate(db, () => db.exec("INSERT INTO t VALUES (1)")), SqliteBusyError);
+  } finally {
+    await release(holder);
+  }
+  assert.equal(busyTimeout(), 700, "the connection keeps the busy_timeout its owner configured");
+  db.close();
 });

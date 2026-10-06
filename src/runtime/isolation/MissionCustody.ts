@@ -12,6 +12,7 @@
 import { join } from "node:path";
 import { ExclusiveFileLock } from "../../platform/eventstore/fileLock.ts";
 import type { LeaseManager, LeaseOwner } from "./LeaseManager.ts";
+import { reclaimCustody, retainCustody } from "./reloadCustody.ts";
 
 export type CustodyClaim = { ok: true; reclaimed: boolean } | { ok: false; holder: string };
 
@@ -70,6 +71,7 @@ export class LeaseMissionCustody implements MissionCustody {
       return { ok: false, holder: `session ${outcome.holder.sessionId.slice(0, 8)} (pid ${outcome.holder.pid})` };
     }
     this.held.set(resource, outcome.lease.generationId);
+    reclaimCustody(`lease:${this.key(resource)}`);
     return { ok: true, reclaimed: outcome.reclaimed !== null };
   }
 
@@ -92,8 +94,17 @@ export class LeaseMissionCustody implements MissionCustody {
     for (const resource of [...this.held.keys()]) await this.release(resource);
   }
 
-  /** The leases stay with the session (its heartbeat renews them); a re-claim is re-entrant. */
+  /**
+   * The leases stay with the session (its heartbeat renews them); a re-claim
+   * is re-entrant. Unclaimed ones are handed back after the reload window.
+   */
   retainForReload(): void {
+    for (const [resource, generationId] of this.held) {
+      const key = this.key(resource);
+      retainCustody(`lease:${key}`, () => {
+        this.leases()?.release(key, generationId);
+      });
+    }
     this.held.clear();
   }
 }
@@ -133,6 +144,7 @@ export class FileLockMissionCustody implements MissionCustody {
     const retained = retainedFileLocks().get(retainedKey);
     if (retained) {
       retainedFileLocks().delete(retainedKey);
+      reclaimCustody(`file:${retainedKey}`);
       this.held.set(resource, retained);
       return Promise.resolve({ ok: true, reclaimed: false });
     }
@@ -173,7 +185,15 @@ export class FileLockMissionCustody implements MissionCustody {
 
   /** Hand the open locks to the next generation of this session. */
   retainForReload(): void {
-    for (const [resource, lock] of this.held) retainedFileLocks().set(`${this.dir}\0${resource}`, lock);
+    for (const [resource, lock] of this.held) {
+      const key = `${this.dir}\0${resource}`;
+      retainedFileLocks().set(key, lock);
+      retainCustody(`file:${key}`, () => {
+        if (retainedFileLocks().get(key) !== lock) return;
+        retainedFileLocks().delete(key);
+        lock.release();
+      });
+    }
     this.held.clear();
   }
 }

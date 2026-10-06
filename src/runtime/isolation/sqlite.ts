@@ -105,16 +105,18 @@ function isBusy(error: unknown): boolean {
  */
 export function immediate<T>(db: Database, fn: () => T, budgetMs = MAX_SYNC_BLOCK_MS): T {
   const started = Date.now();
+  // The connection's own setting (openDatabase may have been given another one).
+  const configured = busyTimeoutOf(db);
   for (let attempt = 1; ; attempt++) {
     try {
       // SQLite's own wait inside BEGIN must fit the remaining budget too.
-      const wait = Math.max(1, Math.min(budgetMs - (Date.now() - started), DEFAULT_BUSY_TIMEOUT_MS));
-      const narrowed = wait < DEFAULT_BUSY_TIMEOUT_MS;
+      const wait = Math.max(1, Math.min(budgetMs - (Date.now() - started), configured));
+      const narrowed = wait < configured;
       if (narrowed) db.exec(`PRAGMA busy_timeout = ${wait}`);
       try {
         db.exec("BEGIN IMMEDIATE");
       } finally {
-        if (narrowed) db.exec(`PRAGMA busy_timeout = ${DEFAULT_BUSY_TIMEOUT_MS}`);
+        if (narrowed) db.exec(`PRAGMA busy_timeout = ${configured}`);
       }
     } catch (error) {
       if (!isBusy(error)) throw error;
@@ -137,6 +139,12 @@ export function immediate<T>(db: Database, fn: () => T, budgetMs = MAX_SYNC_BLOC
       throw error;
     }
   }
+}
+
+function busyTimeoutOf(db: Database): number {
+  const row = db.prepare("PRAGMA busy_timeout").get() as { timeout?: number } | undefined;
+  const value = Number(row?.timeout);
+  return Number.isFinite(value) && value >= 0 ? value : DEFAULT_BUSY_TIMEOUT_MS;
 }
 
 const sleeper = new Int32Array(new SharedArrayBuffer(4));

@@ -112,30 +112,28 @@ export class RuntimeMutationLock {
    * claim the owner is re-read: the file is removed only when it still names
    * the owner we judged dead.
    */
-  private breakStale(judged: LockOwner | null): boolean {
+  private breakStale(judged: LockOwner | null, retried = false): boolean {
     const claim = `${this.file}.claim`;
     let fd: number;
     try {
       fd = openSync(claim, "wx", 0o600);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      // Someone else is breaking it. A claim left by a dead claimant expires.
-      let claimant: Pick<LockOwner, "pid" | "host" | "bootId" | "processStartTime">;
+      // Someone else is breaking it. A claim left by a dead claimant expires,
+      // and so does one that never got its content (killed between create and
+      // write, disk full): unreadable, but only once no writer can still be
+      // filling it in.
+      const claimant = readClaimant(claim);
+      const age = ageMs(claim);
+      if (age === Number.POSITIVE_INFINITY) return retried ? false : this.breakStale(judged, true); // Just went away.
+      const expired = claimant === null ? age > FRESH_MS : !isAlive(claimant) && age > FRESH_MS;
+      if (!expired) return false;
       try {
-        const raw = readFileSync(claim, "utf8").trim();
-        // Older runtimes wrote a bare PID.
-        claimant = /^\d+$/.test(raw) ? { pid: Number(raw) } : JSON.parse(raw);
+        unlinkSync(claim);
       } catch {
-        return false; // The claim just went away (or is half-written); the next attempt decides.
+        // Raced with another expirer.
       }
-      if (!isAlive(claimant) && ageMs(claim) > FRESH_MS) {
-        try {
-          unlinkSync(claim);
-        } catch {
-          // Raced with another expirer.
-        }
-      }
-      return false;
+      return retried ? false : this.breakStale(judged, true);
     }
     try {
       const self = currentProcessIdentity();
@@ -181,6 +179,28 @@ export class RuntimeMutationLock {
   isHeldByLiveProcess(): boolean {
     const owner = this.readOwner();
     return !!owner && isAlive(owner);
+  }
+}
+
+type Claimant = Pick<LockOwner, "pid" | "host" | "bootId" | "processStartTime">;
+
+/** The process named by a claim file, or null when it is unreadable or incomplete. */
+function readClaimant(claim: string): Claimant | null {
+  let raw: string;
+  try {
+    raw = readFileSync(claim, "utf8").trim();
+  } catch {
+    return null;
+  }
+  // Older runtimes wrote a bare PID.
+  if (/^\d+$/.test(raw)) return { pid: Number(raw) };
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    const pid = (parsed as { pid?: unknown }).pid;
+    return typeof pid === "number" && Number.isInteger(pid) && pid > 0 ? (parsed as Claimant) : null;
+  } catch {
+    return null;
   }
 }
 

@@ -21,6 +21,7 @@
 
 import { rm } from "node:fs/promises";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { releaseRetainedCustody } from "../isolation/reloadCustody.ts";
 import {
   type ActiveRuntimeOperation,
   type EngineeringRuntime,
@@ -816,6 +817,9 @@ export class RuntimeHost implements BridgeTarget {
       if (this.starting === generation) this.starting = undefined;
       await phase("rolling_back");
       const rolled = await this.rollbackTo(old, snapshot, request, failure, base);
+      // Nothing runs that could re-claim the custody the stopped generation
+      // kept for its successor: hand it back now, not after the window.
+      if (!this.current) releaseRetainedCustody();
       await phase(rolled ? "rolled_back" : "failed");
       return result({
         ok: false,

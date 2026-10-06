@@ -29,7 +29,12 @@ export interface RollbackPlan {
    * remove although they were written after the update that migrated the
    * state committed. Empty when nothing newer would be lost.
    */
-  loss: { since: string; paths: string[] };
+  loss: {
+    since: string;
+    paths: string[];
+    /** Every file the restore overwrites or removes, whenever it was written. */
+    replaced: string[];
+  };
 }
 
 /** Retained versions a rollback may select: installed, not the one running. */
@@ -64,7 +69,7 @@ export async function planRollback(
   }
 
   const support = candidateStateSchema(target.dir);
-  const noLoss = { since: "", paths: [] };
+  const noLoss = { since: "", paths: [], replaced: [] };
   if (!stateDir || !existsSync(stateDir)) {
     return { target, migration: { plan: [], from: null, to: support.writes }, loss: noLoss };
   }
@@ -95,10 +100,11 @@ export async function planRollback(
   };
   const committedMs = Date.parse(restore.committedAt);
   const paths = touched.flatMap((rel) => writtenAfter(stateDir, rel, committedMs)).sort();
+  const replaced = touched.flatMap((rel) => writtenAfter(stateDir, rel, Number.NEGATIVE_INFINITY)).sort();
   return {
     target,
     migration: { plan: [step], from: schema, to: restore.from },
-    loss: { since: restore.committedAt, paths },
+    loss: { since: restore.committedAt, paths, replaced },
   };
 }
 
