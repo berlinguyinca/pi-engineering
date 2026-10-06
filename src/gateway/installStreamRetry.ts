@@ -60,12 +60,12 @@ export interface ProviderHost<M, C, O> {
   getRegisteredNativeProvider?(providerId: string): ProviderLike<M, C, O> | undefined;
 }
 
-interface ProviderResponseLike {
+export interface ProviderResponseLike {
   status: number;
   headers?: Record<string, string>;
 }
 
-interface ProviderResponseOptions<R extends ProviderResponseLike = ProviderResponseLike, M = unknown> {
+export interface ProviderResponseOptions<R extends ProviderResponseLike = ProviderResponseLike, M = unknown> {
   onResponse?: (response: R, model: M) => void | Promise<void>;
 }
 

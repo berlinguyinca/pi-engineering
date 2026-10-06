@@ -28,3 +28,6 @@ export * from "./envelope.ts";
 export * from "./modelHealth.ts";
 export * from "./recovery.ts";
 export * from "./resilientInference.ts";
+export * from "./resilientStream.ts";
+export * from "./resilientInstall.ts";
+export * from "./inferenceContext.ts";

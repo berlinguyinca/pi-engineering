@@ -35,7 +35,14 @@ import { monotonicNow } from "../core/clock.ts";
 // the `AssistantMessageEventStream` type but not its constructor, so build a
 // structurally-compatible empty stream locally instead. `AssistantMessage` and
 // `AssistantMessageEvent` are already imported as types from compat above.
-function createAssistantMessageEventStream(): AssistantMessageEventStream {
+/**
+ * A structurally-compatible Pi assistant event stream (see the note above).
+ *
+ * Exported so the resilient stream installer can hand Pi a stream whose
+ * lifetime spans several provider attempts without importing a second pi-ai
+ * instance (whose `EventStream` class would not be the same object).
+ */
+export function createAssistantMessageEventStream(): AssistantMessageEventStream {
   const queue: AssistantMessageEvent[] = [];
   const waiters: Array<() => void> = [];
   let done = false;
