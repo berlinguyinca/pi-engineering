@@ -102,6 +102,7 @@ export interface GatewayConnection {
   /** Base URL including `/v1`. */
   baseUrl: string;
   apiKey?: string;
+  /** Opt-in per-request limit. Catalogue/route probes default to a few seconds; completions have none. */
   timeoutMs?: number;
 }
 
@@ -189,7 +190,13 @@ export async function chatCompletion(
           { role: "user", content: req.user },
         ],
       }),
-      signal: AbortSignal.any([AbortSignal.timeout(conn.timeoutMs ?? 600_000), ...(req.signal ? [req.signal] : [])]),
+      // No default wall-clock cap (docs/mission-time-limits.md): a completion
+      // may wait on gateway admission or generate for as long as it needs.
+      // Only an explicit `timeoutMs` or the caller's signal ends it early.
+      signal: AbortSignal.any([
+        ...(conn.timeoutMs !== undefined ? [AbortSignal.timeout(conn.timeoutMs)] : []),
+        ...(req.signal ? [req.signal] : []),
+      ]),
     });
     const text = await res.text();
     let body: unknown = null;

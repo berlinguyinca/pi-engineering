@@ -297,3 +297,34 @@ test("capability queries use the InferWeave grammar", () => {
   assert.equal(capabilityQuery({ capabilities: ["coding.implementation"] }), "cap:coding.implementation");
   assert.equal(capabilityQuery({ capabilities: ["Bad Name"] }), null);
 });
+
+test("a chat completion has no default wall-clock cap; timeoutMs is opt-in", async () => {
+  const server = await startGatewayServer({ respond: () => ({ content: "done", delayMs: 300 }) });
+  servers.push(server);
+  const req = { model: "m", system: "s", user: "u" };
+
+  // Spy (not replace) AbortSignal.timeout: an uncapped completion must arm none.
+  const armed: number[] = [];
+  const original = AbortSignal.timeout;
+  AbortSignal.timeout = (ms: number) => {
+    armed.push(ms);
+    return original.call(AbortSignal, ms);
+  };
+  let slow: Awaited<ReturnType<typeof chatCompletion>>;
+  try {
+    slow = await chatCompletion({ baseUrl: server.baseUrl }, req);
+  } finally {
+    AbortSignal.timeout = original;
+  }
+  assert.deepEqual(armed, [], "no implicit request deadline");
+  assert.equal(slow.ok, true);
+  assert.equal(slow.ok && slow.content, "done");
+
+  const capped = await chatCompletion({ baseUrl: server.baseUrl, timeoutMs: 50 }, req);
+  assert.equal(capped.ok, false, "an explicit limit still applies");
+
+  const controller = new AbortController();
+  const cancelled = chatCompletion({ baseUrl: server.baseUrl }, { ...req, signal: controller.signal });
+  controller.abort();
+  assert.equal((await cancelled).ok, false, "the caller's signal still cancels");
+});
