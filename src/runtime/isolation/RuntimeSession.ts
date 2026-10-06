@@ -410,7 +410,12 @@ export class RuntimeSession {
     try {
       if (registry.heartbeat(this.sessionId, generationId)) {
         this.state.lastHeartbeatMs = Date.now();
-        if (this.state.health === "recovering" || this.state.health === "rebound") this.setHealth("healthy");
+        // A failed heartbeat (e.g. a bounded SQLite busy wait gave up) is
+        // transient: the next successful one clears it.
+        const transient = this.state.health === "degraded" && this.state.healthReason?.startsWith("heartbeat failed");
+        if (this.state.health === "recovering" || this.state.health === "rebound" || transient) {
+          this.setHealth("healthy");
+        }
         emitRuntimeEvent("session.heartbeat", { session_id: this.sessionId });
         return true;
       }
