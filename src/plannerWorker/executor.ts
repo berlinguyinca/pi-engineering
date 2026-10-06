@@ -298,6 +298,7 @@ export class PlannerWorkerExecutor {
     this.integration = await this.reattachIntegration(saved.integration_branch, saved.integration_path);
     try {
       this.plan = saved.plan;
+      this.plannerModel = saved.planner_model ?? null;
       this.replans = saved.replans ?? 0;
       this.finalFixUsed = saved.contracts.some((c) => c.contract.task_id === "final-fix");
       this.telemetry.seed(saved.metrics ?? []);
@@ -312,6 +313,8 @@ export class PlannerWorkerExecutor {
           this.addContract(prior.contract);
           const rt = this.contracts.get(id)!;
           rt.state = { ...prior, worktree: null };
+          // The final review covers every contract, so restore what this one integrated.
+          rt.diff = await this.integratedDiff(id);
           this.results.set(id, { task_id: id, summary: prior.summary, changed_files: prior.changed_files });
           kept++;
           continue;
@@ -1162,6 +1165,8 @@ export class PlannerWorkerExecutor {
       .map((x) => x.state.contract.task_id);
     const remaining = [...this.contracts.values()].filter((x) => x.state.status !== "passed");
     const planner = await this.opts.resolver.resolve("planner");
+    // Implementers must stay separated from whichever model plans next.
+    if (planner) this.plannerModel = servedIdentity(planner);
     this.recordTransition("planner", "planner", planner, "replanning", rt.state.contract.task_id);
     const result = await runPlanner({
       worker: this.roleWorker("planner", planner, "replan"),
@@ -1224,6 +1229,18 @@ export class PlannerWorkerExecutor {
     const names = (await git(path, ["diff", "--name-only", rt.baseCommit, head])).stdout;
     rt.state.changed_files = names.split("\n").filter(Boolean);
     return rt.state.changed_files;
+  }
+
+  /** The change a contract's integration merge brought in ("" when it changed nothing). */
+  private async integratedDiff(id: string): Promise<string> {
+    const subject = `pw: integrate ${id}`;
+    const log = await git(this.integration.path, ["log", "--merges", "--format=%H%x00%s"]);
+    const merge = log.stdout
+      .split("\n")
+      .map((line) => line.split("\0"))
+      .find(([, s]) => s === subject)?.[0];
+    if (!merge) return "";
+    return (await git(this.integration.path, ["diff", `${merge}^1`, merge, "--", ".", ":!package-lock.json"])).stdout;
   }
 
   private integrate(rt: Runtime): Promise<{ ok: boolean; reason: string }> {
@@ -1384,6 +1401,7 @@ export class PlannerWorkerExecutor {
       base_commit: this.baseCommit,
       integration_branch: this.integration?.branch ?? null,
       integration_path: this.integration?.path ?? null,
+      planner_model: this.plannerModel,
       plan: this.plan,
       updated_at: new Date().toISOString(),
     });
@@ -1421,6 +1439,7 @@ interface ResumableState {
   transitions?: PlannerWorkerReport["transitions"];
   metrics?: PlannerWorkerReport["metrics"];
   replans?: number;
+  planner_model?: string | null;
 }
 
 function slug(s: string): string {

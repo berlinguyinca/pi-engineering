@@ -19,6 +19,8 @@ export const CONTRACT_LIMITS = {
 } as const;
 
 const TASK_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+/** Ids the executor gives its own whole-mission review and fix contracts. */
+const RESERVED_TASK_IDS: ReadonlySet<string> = new Set(["final-review", "final-fix"]);
 const RISKS: readonly ContractRisk[] = ["low", "medium", "high"];
 
 export type ContractParse = { ok: true; contract: TaskContract } | { ok: false; errors: string[] };
@@ -74,6 +76,7 @@ export function parseTaskContract(raw: unknown): ContractParse {
   if (!isRecord(raw)) return { ok: false, errors: ["contract must be an object"] };
   const id = typeof raw.task_id === "string" ? raw.task_id.trim() : typeof raw.id === "string" ? raw.id.trim() : "";
   if (!TASK_ID.test(id)) errors.push(`task_id "${id}" must match ${TASK_ID}`);
+  if (RESERVED_TASK_IDS.has(id)) errors.push(`task_id "${id}" is reserved for the executor's final review`);
   const objective = typeof raw.objective === "string" ? raw.objective.trim() : "";
   if (!objective) errors.push(`${id || "contract"}: objective is required`);
   if (objective.length > CONTRACT_LIMITS.max_text) errors.push(`${id}: objective is too long`);

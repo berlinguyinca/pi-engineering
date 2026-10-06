@@ -77,6 +77,14 @@ test("parseTaskContract rejects missing objective, bad ids, self-dependency and 
   assert.equal(parseTaskContract("not an object").ok, false);
 });
 
+test("parseTaskContract reserves the executor's own final-review and final-fix ids", () => {
+  for (const id of ["final-review", "final-fix"]) {
+    const r = parseTaskContract(raw(id));
+    assert.equal(r.ok, false, id);
+    assert.match(r.ok ? "" : r.errors.join("; "), /reserved/);
+  }
+});
+
 test("validateContractDag rejects cycles, duplicates and unknown dependencies", () => {
   const cyc = validateContractDag([contract("a", ["c"]), contract("b", ["a"]), contract("c", ["b"])]);
   assert.equal(cyc.ok, false);

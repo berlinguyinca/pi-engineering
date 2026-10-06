@@ -13,6 +13,7 @@
  * as MODEL_TRANSITION events in the same log and checked for context fit.
  */
 
+import { randomBytes } from "node:crypto";
 import { stat } from "node:fs/promises";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
@@ -49,6 +50,18 @@ export interface PlannerWorkerIntegration {
   runIfSelected(request: string, ctx: ExtensionCommandContext): Promise<boolean>;
   /** Resume an interrupted planner-worker mission (`PW-…`); false when it is not one. */
   resumeIfOwned(missionId: string, ctx: ExtensionCommandContext): Promise<boolean>;
+}
+
+/**
+ * A fresh mission id: the start second plus a random suffix, so two missions
+ * started in the same second never share a state directory or branches.
+ */
+export function newMissionId(at: Date = new Date()): string {
+  const stamp = at
+    .toISOString()
+    .replace(/[-:.TZ]/g, "")
+    .slice(0, 14);
+  return `PW-${stamp}-${randomBytes(3).toString("hex")}`;
 }
 
 /** Handle one of the `/engineering-*` commands; returns the operator text. */
@@ -251,10 +264,7 @@ export function registerPlannerWorker(
       const selected = await select(request, ctx).catch(() => null);
       if (!selected) return false;
       ctx.ui.notify(`engineering mode: planner-worker (${selected.reason})`, "info");
-      const missionId = `PW-${new Date()
-        .toISOString()
-        .replace(/[-:.TZ]/g, "")
-        .slice(0, 14)}`;
+      const missionId = newMissionId();
       const executor = await executorFor(ctx, selected.host, selected.config, selected, missionId);
       await report(ctx, missionId, () =>
         executor.run({
