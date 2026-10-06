@@ -693,7 +693,7 @@ export default function (pi: ExtensionAPI) {
   // session (not in the smoke-test stub). Guard accordingly.
   if (typeof pi.on === "function") {
     // Identical-tool-call loops and unbounded bash test/build runs
-    // (src/guard/toolCallGuard.ts); PI_TOOL_CALL_GUARD=0 turns it off.
+    // (src/guard/toolCallGuard.ts; knobs in docs/usage.md, "Tool-call guard").
     registerToolCallGuard(pi as never);
     pi.on("tool_result", async (event) => {
       if (event.toolName !== "mission") return;
