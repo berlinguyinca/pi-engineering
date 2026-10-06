@@ -146,7 +146,10 @@ function findCycle(contracts: TaskContract[]): string[] | null {
 }
 
 /** Validate the contract set as an executable DAG. */
-export function validateContractDag(contracts: TaskContract[]): { ok: boolean; errors: string[] } {
+export function validateContractDag(
+  contracts: TaskContract[],
+  opts: { external?: ReadonlySet<string> } = {},
+): { ok: boolean; errors: string[] } {
   const errors: string[] = [];
   if (contracts.length === 0) errors.push("plan has no contracts");
   if (contracts.length > CONTRACT_LIMITS.max_contracts) {
@@ -158,7 +161,9 @@ export function validateContractDag(contracts: TaskContract[]): { ok: boolean; e
     ids.add(c.task_id);
   }
   for (const c of contracts) {
-    for (const d of c.depends_on) if (!ids.has(d)) errors.push(`${c.task_id} depends on unknown task ${d}`);
+    for (const d of c.depends_on) {
+      if (!ids.has(d) && !opts.external?.has(d)) errors.push(`${c.task_id} depends on unknown task ${d}`);
+    }
   }
   const cycle = findCycle(contracts);
   if (cycle) errors.push(`dependency cycle: ${cycle.join(" -> ")}`);
@@ -170,8 +175,10 @@ export function dagLayers(contracts: TaskContract[]): TaskContract[][] {
   const remaining = new Map(contracts.map((c) => [c.task_id, c]));
   const done = new Set<string>();
   const layers: TaskContract[][] = [];
+  // Dependencies outside the set (already passed before a replan) are satisfied.
+  const satisfied = (d: string) => done.has(d) || !contracts.some((x) => x.task_id === d);
   while (remaining.size > 0) {
-    const layer = [...remaining.values()].filter((c) => c.depends_on.every((d) => done.has(d)));
+    const layer = [...remaining.values()].filter((c) => c.depends_on.every(satisfied));
     if (layer.length === 0) throw new Error("dependency cycle");
     for (const c of layer) remaining.delete(c.task_id);
     for (const c of layer) done.add(c.task_id);
@@ -255,8 +262,11 @@ export function extractStructured(text: string): unknown {
   return undefined;
 }
 
-/** Parse and validate the planner's output into a contract DAG. */
-export function parsePlannerOutput(input: unknown): PlanParse {
+/**
+ * Parse and validate the planner's output into a contract DAG. `external`
+ * names contracts that already passed (replanning) and may be depended on.
+ */
+export function parsePlannerOutput(input: unknown, opts: { external?: ReadonlySet<string> } = {}): PlanParse {
   const data = typeof input === "string" ? extractStructured(input) : input;
   const root = isRecord(data) && isRecord(data.plan) ? data.plan : data;
   const rawContracts = Array.isArray(root) ? root : isRecord(root) ? root.contracts : undefined;
@@ -269,7 +279,7 @@ export function parsePlannerOutput(input: unknown): PlanParse {
     else errors.push(...r.errors);
   }
   if (errors.length > 0) return { ok: false, errors };
-  const dag = validateContractDag(contracts);
+  const dag = validateContractDag(contracts, opts);
   if (!dag.ok) return { ok: false, errors: dag.errors };
   const meta = isRecord(root) ? root : {};
   const metaErrors: string[] = [];
