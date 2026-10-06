@@ -186,6 +186,9 @@ export interface PiWorkerExecutorOptions {
  * prompt and tool allowlist, so no prior reasoning is inherited. The worker must
  * finish by calling `worker_result`; usage is captured from assistant messages.
  */
+/** How often a capacity hold checks for an operator model switch. */
+const OPERATOR_SWITCH_POLL_MS = 250;
+
 export class PiWorkerExecutor implements WorkerExecutor {
   private readonly agentDir: string;
   private readonly customTools: ToolDefinition[];
@@ -442,9 +445,27 @@ ${TOOL_TRANSITION_RULE}`;
       // Waiting for capacity is liveness: tell the owner, so the wait is
       // never mistaken for a hung worker.
       emitWorkerActivity(req, { kind: "state", summary: WAITING_FOR_INFERENCE_SUMMARY, meaningfulProgress: false });
-      return gatewayHoldScope(scoped) === "caller"
-        ? admission.noteCallerWaitAndSleep(scoped, req.signal ? { signal: req.signal } : {})
-        : admission.noteWaitAndSleep(scoped, req.signal ? { signal: req.signal } : {});
+      // A hold is an inference boundary: an operator model switch ends it at
+      // once (polled), so the mission moves without sitting out the gateway's
+      // whole advertised wait. The next loop pass reports the switch.
+      const hold = new AbortController();
+      const stop = (): void => hold.abort();
+      if (req.signal?.aborted) hold.abort();
+      else req.signal?.addEventListener("abort", stop, { once: true });
+      const poll = req.modelSuperseded
+        ? setInterval(() => {
+            if (operatorSwitched()) hold.abort();
+          }, OPERATOR_SWITCH_POLL_MS)
+        : undefined;
+      poll?.unref?.();
+      const sleeping =
+        gatewayHoldScope(scoped) === "caller"
+          ? admission.noteCallerWaitAndSleep(scoped, { signal: hold.signal })
+          : admission.noteWaitAndSleep(scoped, { signal: hold.signal });
+      return sleeping.finally(() => {
+        if (poll) clearInterval(poll);
+        req.signal?.removeEventListener("abort", stop);
+      });
     };
 
     // Prose-producing roles (reviewers, challenger, scout, summarizer) deliver

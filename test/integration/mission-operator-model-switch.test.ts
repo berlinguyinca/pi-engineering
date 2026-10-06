@@ -56,7 +56,7 @@ const WORKER_RESULT = {
 };
 
 /** InferWeave adaptive.rs: a per-model queue deadline on a serving model. */
-function queueDeadline(res: ServerResponse, model: string): void {
+function queueDeadline(res: ServerResponse, model: string, retryAfterMs = 20): void {
   res.writeHead(429, {
     "content-type": "application/json",
     "retry-after": "0",
@@ -75,7 +75,7 @@ function queueDeadline(res: ServerResponse, model: string): void {
         action: "retry_alternate",
         action_code: "IW-ACT-RETRY-ALTERNATE",
         scope: "model",
-        retry_after_ms: 20,
+        retry_after_ms: retryAfterMs,
         model_intent: model,
         x_availability: "CAPACITY_EXHAUSTED",
         x_fallback_candidates: [],
@@ -157,7 +157,7 @@ interface Harness {
 }
 
 async function withMission(
-  opts: { onRequest: (model: string, count: number, h: Harness) => "deadline" | "serve" },
+  opts: { onRequest: (model: string, count: number, h: Harness) => "deadline" | "serve"; retryAfterMs?: number },
   body: (h: Harness) => Promise<void>,
 ): Promise<void> {
   const dir = mkdtempSync(join(tmpdir(), "pi-operator-switch-"));
@@ -171,7 +171,7 @@ async function withMission(
       harness.requests.push(model);
       const count = (perModel.get(model) ?? 0) + 1;
       perModel.set(model, count);
-      if (opts.onRequest(model, count, harness) === "deadline") queueDeadline(res, model);
+      if (opts.onRequest(model, count, harness) === "deadline") queueDeadline(res, model, opts.retryAfterMs);
       else workerResult(res, model);
     });
   });
@@ -324,6 +324,28 @@ test("a mission keeps waiting on an exhausted operator-pinned model instead of g
         h.requests.every((m) => m === GLM.id),
         "the operator's choice is not abandoned for capacity",
       );
+    },
+  );
+});
+
+test("a /model switch ends a long capacity hold at once instead of after the gateway's whole wait", async () => {
+  // The gateway asks the worker to stay away for 60 s; the operator switches
+  // right after the first refusal. The mission must not sit out the minute.
+  await withMission(
+    {
+      retryAfterMs: 60_000,
+      onRequest: (model, _count, h) => {
+        if (model !== GLM.id) return "serve";
+        setTimeout(() => onOperatorModelSelect(h.sessionId, { model: DEEPSEEK, source: "set" }), 50);
+        return "deadline";
+      },
+    },
+    async (h) => {
+      const started = Date.now();
+      const outcome = await h.runImplementer();
+      assert.equal(outcome.exitStatus, "succeeded", outcome.summary);
+      assert.deepEqual(h.requests, [GLM.id, DEEPSEEK.id]);
+      assert.ok(Date.now() - started < 15_000, `the switch landed after ${Date.now() - started} ms`);
     },
   );
 });
