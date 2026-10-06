@@ -19,7 +19,7 @@ import { type IncomingMessage, type ServerResponse, createServer } from "node:ht
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { test } from "node:test";
+import { after, test } from "node:test";
 import type { RoleRouterAdapter } from "../../src/capability/adapter.ts";
 import type { ModelSource } from "../../src/capability/discovery.ts";
 import { normalizeModelRecord } from "../../src/capability/modelRecord.ts";
@@ -43,6 +43,9 @@ import { type TelemetryNotice, setTelemetrySink } from "../../src/telemetry/sink
 import { PiWorkerExecutor } from "../../src/workers/PiWorkerExecutor.ts";
 import type { WorkerActivity } from "../../src/workers/WorkerExecutor.ts";
 
+/** A private scratch directory (never the shared system temp dir itself). */
+const SCRATCH = mkdtempSync(join(tmpdir(), "operator-pin-ctx-"));
+after(() => rmSync(SCRATCH, { recursive: true, force: true }));
 const GLM: ModelRef = { provider: "gw", id: "glm5.3-flash-modality-vision-quant-q6_k_xl" };
 const DEEPSEEK: ModelRef = { provider: "gw", id: "deepseek_v4-flash-modality-text-quant-mxfp4" };
 
@@ -129,7 +132,7 @@ async function rolePinnedRouter(): Promise<Pick<RoleRouterAdapter, "route" | "se
   );
   const registry = await ModelCapabilityRegistry.open({
     sources: [new InventorySource(records)],
-    context: { cwd: tmpdir(), agentDir: tmpdir() },
+    context: { cwd: SCRATCH, agentDir: SCRATCH },
   });
   await registry.refresh();
   const policy = structuredClone(DEFAULT_POLICY);

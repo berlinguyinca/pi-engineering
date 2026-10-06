@@ -150,10 +150,7 @@ export interface PinTransition {
  * chose anything — keeps what it persisted.
  */
 export function adoptOperatorModelPin(opts: {
-  store: {
-    getMission(id: string): Mission | undefined;
-    updateMission(id: string, patch: { operator_model_pin: OperatorModelPin | null }): unknown;
-  };
+  store: PinStore;
   missionId: string;
   sessionId: string;
   onTransition?: (transition: PinTransition) => void;
@@ -163,12 +160,20 @@ export function adoptOperatorModelPin(opts: {
   const current = mission.operator_model_pin ?? null;
   if (["COMPLETE", "FAILED", "CANCELED"].includes(mission.status)) return current;
   const state = sessions().get(opts.sessionId);
-  const ours = mission.parent_session_id === opts.sessionId || !!state?.claimed.has(opts.missionId);
   const choice = state?.choice;
-  if (!ours || !choice) return current;
+  if (!isMissionOfSession(opts.sessionId, mission) || !choice) return current;
+  // A decision about this mission newer than the session's choice (the
+  // operator released its pin) wins until the operator switches again.
+  const chosenAt = choice.kind === "pin" ? choice.pin.set_at : choice.set_at;
+  if (mission.operator_model_decided_at && Date.parse(chosenAt) <= Date.parse(mission.operator_model_decided_at)) {
+    return current;
+  }
   const desired = choice.kind === "pin" ? choice.pin : null;
   if (sameModel(current, desired) || (!current && !desired)) return current;
-  opts.store.updateMission(opts.missionId, { operator_model_pin: desired ? { ...desired } : null });
+  opts.store.updateMission(opts.missionId, {
+    operator_model_pin: desired ? { ...desired } : null,
+    operator_model_decided_at: chosenAt,
+  });
   try {
     opts.onTransition?.({
       missionId: opts.missionId,
@@ -180,4 +185,74 @@ export function adoptOperatorModelPin(opts: {
     // Observers never break dispatch.
   }
   return desired;
+}
+
+interface PinStore {
+  getMission(id: string): Mission | undefined;
+  updateMission(
+    id: string,
+    patch: { operator_model_pin: OperatorModelPin | null; operator_model_decided_at?: string | null },
+  ): unknown;
+}
+
+/** True when the mission was started from, or resumed in, this session. */
+export function isMissionOfSession(
+  sessionId: string,
+  mission: Pick<Mission, "mission_id" | "parent_session_id">,
+): boolean {
+  return mission.parent_session_id === sessionId || !!sessions().get(sessionId)?.claimed.has(mission.mission_id);
+}
+
+/**
+ * Release one mission from its operator pin (`/mission resume <id> --model
+ * auto`, the mission tool's `clear_pin`): it returns to role pins and the
+ * router, and stays there until the operator switches models again.
+ */
+export function releaseMissionModelPin(opts: {
+  store: PinStore;
+  missionId: string;
+  now?: Date;
+  onTransition?: (transition: PinTransition) => void;
+}): boolean {
+  const mission = opts.store.getMission(opts.missionId);
+  if (!mission) throw new Error(`unknown mission ${opts.missionId}`);
+  const current = mission.operator_model_pin ?? null;
+  opts.store.updateMission(opts.missionId, {
+    operator_model_pin: null,
+    operator_model_decided_at: (opts.now ?? new Date()).toISOString(),
+  });
+  if (!current) return false;
+  try {
+    opts.onTransition?.({
+      missionId: opts.missionId,
+      from: modelKey(current),
+      to: null,
+      reason: "operator pin released",
+    });
+  } catch {
+    // Observers never break the operator's command.
+  }
+  return true;
+}
+
+/** `/engineering-model auto`: release the pins stored on this session's live missions. */
+export function releaseSessionMissionPins(opts: {
+  store: PinStore & { listMissions(): Mission[] };
+  sessionId: string;
+  now?: Date;
+  onTransition?: (transition: PinTransition) => void;
+}): string[] {
+  const released: string[] = [];
+  for (const mission of opts.store.listMissions()) {
+    if (["COMPLETE", "FAILED", "CANCELED"].includes(mission.status)) continue;
+    if (!mission.operator_model_pin || !isMissionOfSession(opts.sessionId, mission)) continue;
+    releaseMissionModelPin({
+      store: opts.store,
+      missionId: mission.mission_id,
+      ...(opts.now ? { now: opts.now } : {}),
+      ...(opts.onTransition ? { onTransition: opts.onTransition } : {}),
+    });
+    released.push(mission.mission_id);
+  }
+  return released;
 }

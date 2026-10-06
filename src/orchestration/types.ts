@@ -127,6 +127,18 @@ export interface Mission {
    * Absent/null: automatic routing.
    */
   operator_model_pin?: OperatorModelPin | null;
+  /**
+   * When this mission's model choice was last decided (a pin adopted, or the
+   * operator released it). Only a session choice made after this is adopted,
+   * so a released mission is not re-pinned by the same old switch.
+   */
+  operator_model_decided_at?: string | null;
+  /**
+   * Set the instant an operator interrupt (Esc) pauses the mission, before any
+   * other bookkeeping; cleared only when the operator resumes it. While set,
+   * nothing automatic (supervisor, auto-resume, repair) may resume the mission.
+   */
+  operator_paused_at?: string | null;
 }
 
 /** A model the operator chose explicitly for a session's missions. */
