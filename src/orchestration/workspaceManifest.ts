@@ -76,6 +76,13 @@ const NEGATION =
 const MUTATION_VERB = /\b(?:modify|change|edit|write|mutate|alter|commit)\b/i;
 const READ_ONLY = /\bread[- ]?only\b|\bfor reference\b|\breference only\b|\bas (?:a )?reference\b/i;
 
+const MUTATION_INTO =
+  /\b(?:modify|edit|change|write|delete|remove|create|refactor|implement|fix|update|rewrite)\b(?:\s+[\w'-]+){0,3}\s+(?:in|into|inside|within|under)\s*["'`]?$/i;
+
+function directsMutationInto(before: string): boolean {
+  return MUTATION_INTO.test(before);
+}
+
 /**
  * What the request asks of a mentioned path. A path in a negation ("do not
  * touch X") is not authority at all; one described as read-only ("use X as
@@ -186,7 +193,13 @@ export class WorkspaceManifestResolver {
       } catch {
         continue;
       }
-      if (protectedReason(path)) continue;
+      // A protected target (filesystem root, home, Pi/Codex config) is only
+      // refused when the request directs mutation INTO it ('Modify files in
+      // "/"'); mentioned anywhere else ('mount the app at "/"') it is prose.
+      if (protectedReason(path)) {
+        if (directsMutationInto(clauseAround(request, mention.start, mention.end).before)) existing.push(path);
+        continue;
+      }
       if (intent === "read") {
         readOnly.push(path);
         continue;
