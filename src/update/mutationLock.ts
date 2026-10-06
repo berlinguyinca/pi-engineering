@@ -4,12 +4,16 @@
  * sharing an install root (an O_EXCL lock file naming its owner).
  *
  * A lock file whose owning process is gone is stale and is taken over: a Pi
- * killed mid-update must not lock Pi Engineering out forever.
+ * killed mid-update must not lock Pi Engineering out forever. "Gone" is judged
+ * on the owner's process incarnation (boot id + kernel start time, as the
+ * isolation file locks do), not the PID alone: a reused PID must not make a
+ * dead owner's lock read busy forever.
  */
 
 import { randomUUID } from "node:crypto";
 import { closeSync, mkdirSync, openSync, readFileSync, statSync, unlinkSync, writeSync } from "node:fs";
 import { dirname } from "node:path";
+import { assessProcess, currentProcessIdentity } from "../runtime/isolation/processIdentity.ts";
 
 export class MutationLockBusyError extends Error {
   readonly holder: LockOwner | null;
@@ -25,6 +29,10 @@ export interface LockOwner {
   token: string;
   operation: string;
   acquiredAt: string;
+  /** Owner's process incarnation (absent in locks written by older runtimes). */
+  host?: string;
+  bootId?: string | null;
+  processStartTime?: string | null;
 }
 
 export interface MutationLockHandle {
@@ -45,7 +53,16 @@ export class RuntimeMutationLock {
   /** Acquire or throw MutationLockBusyError. Never waits: a concurrent request is told, not queued. */
   acquire(operation: string): MutationLockHandle {
     if (held.has(this.file)) throw new MutationLockBusyError(held.get(this.file) ?? null);
-    const owner: LockOwner = { pid: process.pid, token: randomUUID(), operation, acquiredAt: new Date().toISOString() };
+    const self = currentProcessIdentity();
+    const owner: LockOwner = {
+      pid: process.pid,
+      token: randomUUID(),
+      operation,
+      acquiredAt: new Date().toISOString(),
+      host: self.host,
+      bootId: self.bootId,
+      processStartTime: self.processStartTime,
+    };
     mkdirSync(dirname(this.file), { recursive: true });
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
@@ -77,7 +94,7 @@ export class RuntimeMutationLock {
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
         const existing = this.readOwner();
-        if (existing && isAlive(existing.pid)) throw new MutationLockBusyError(existing);
+        if (existing && isAlive(existing)) throw new MutationLockBusyError(existing);
         // Unreadable but fresh: a holder between create and write, not garbage.
         if (!existing && ageMs(this.file) < FRESH_MS) throw new MutationLockBusyError(null);
         if (!this.breakStale(existing)) throw new MutationLockBusyError(this.readOwner());
@@ -103,11 +120,13 @@ export class RuntimeMutationLock {
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
       // Someone else is breaking it. A claim left by a dead claimant expires.
-      let claimant = 0;
+      let claimant: Pick<LockOwner, "pid" | "host" | "bootId" | "processStartTime">;
       try {
-        claimant = Number(readFileSync(claim, "utf8").trim());
+        const raw = readFileSync(claim, "utf8").trim();
+        // Older runtimes wrote a bare PID.
+        claimant = /^\d+$/.test(raw) ? { pid: Number(raw) } : JSON.parse(raw);
       } catch {
-        return false; // The claim just went away; the next attempt decides.
+        return false; // The claim just went away (or is half-written); the next attempt decides.
       }
       if (!isAlive(claimant) && ageMs(claim) > FRESH_MS) {
         try {
@@ -119,7 +138,16 @@ export class RuntimeMutationLock {
       return false;
     }
     try {
-      writeSync(fd, String(process.pid));
+      const self = currentProcessIdentity();
+      writeSync(
+        fd,
+        JSON.stringify({
+          pid: self.pid,
+          host: self.host,
+          bootId: self.bootId,
+          processStartTime: self.processStartTime,
+        }),
+      );
       const now = this.readOwner();
       const same = judged === null ? now === null : now?.token === judged.token;
       if (same) {
@@ -152,7 +180,7 @@ export class RuntimeMutationLock {
 
   isHeldByLiveProcess(): boolean {
     const owner = this.readOwner();
-    return !!owner && isAlive(owner.pid);
+    return !!owner && isAlive(owner);
   }
 }
 
@@ -167,12 +195,28 @@ function ageMs(file: string): number {
   }
 }
 
-function isAlive(pid: number): boolean {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "EPERM";
+/**
+ * Is the owner's process (that incarnation) still alive? Unknown liveness
+ * (another host, /proc hidden, no permission) counts as alive: a lock is
+ * never broken without proof that its holder is gone.
+ */
+function isAlive(owner: Pick<LockOwner, "pid" | "host" | "bootId" | "processStartTime">): boolean {
+  if (!Number.isInteger(owner.pid) || owner.pid <= 0) return false;
+  if (owner.host === undefined) {
+    // Written by an older runtime: only the PID is known.
+    try {
+      process.kill(owner.pid, 0);
+      return true;
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code === "EPERM";
+    }
   }
+  return (
+    assessProcess({
+      pid: owner.pid,
+      host: owner.host,
+      bootId: owner.bootId ?? null,
+      processStartTime: owner.processStartTime ?? null,
+    }).state !== "dead"
+  );
 }
