@@ -548,6 +548,7 @@ describe("leftover background processes after verification (PR #106 re-review)",
   for (const [label, background] of [
     ["with its output redirected", "sleep 300 >/dev/null 2>&1 &"],
     ["holding the output pipes", "sleep 300 &"],
+    ["ignoring SIGTERM (final review)", "trap '' TERM; sleep 47 >/dev/null 2>&1 &"],
   ] as const) {
     it(`kills a background child the stage left behind (${label}) and warns`, async () => {
       const dir = await makeProject({

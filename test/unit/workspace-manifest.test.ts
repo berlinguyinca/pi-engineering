@@ -197,7 +197,7 @@ describe("WorkspaceManifestResolver path policy", () => {
     }
   });
 
-  it("filters nonexistent request-derived paths and falls back to the launch cwd", async () => {
+  it("refuses a nonexistent filesystem target instead of falling back to the launch cwd", async () => {
     const launchCwd = await mkdtemp(join(tmpdir(), "pi-eng-meta-"));
     const unauthorizedParent = await mkdtemp(join(tmpdir(), "pi-eng-unauthorized-"));
     cleanup.push(
@@ -205,15 +205,14 @@ describe("WorkspaceManifestResolver path policy", () => {
       () => rm(unauthorizedParent, { recursive: true, force: true }),
     );
 
-    // A nonexistent explicit candidate no longer blocks resolution: it is
-    // filtered out and the launch cwd (which is not a Git repository) wins,
-    // producing the not-inside-a-Git-repository error instead.
+    // A missing path under an existing directory is a filesystem path the
+    // user meant (PR #106 final review): refused, never replaced by the launch cwd.
     await assert.rejects(
       new WorkspaceManifestResolver().resolve(
         `Create the project at ${join(unauthorizedParent, "missing", "repo")}`,
         launchCwd,
       ),
-      /Authorized workspace is not inside a Git repository/,
+      /does not exist/,
     );
   });
 
