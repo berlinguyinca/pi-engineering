@@ -13,6 +13,7 @@ import { join, resolve } from "node:path";
 import { after, before, test } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { startPiSession } from "../support/piSession.ts";
+import { bag, writeFixtureRuntime } from "../support/runtimeFixtures.ts";
 
 const repoRoot = resolve(fileURLToPath(new URL("../../", import.meta.url)));
 
@@ -105,6 +106,52 @@ test("a Host that fails while installing: its handlers are undone, then the lega
     assert.ok(pi.piCommands().includes("engineering"), "/engineering explains the fallback");
     const { hostFallbackReason } = await import("../../src/runtime/host/entry.ts");
     assert.match(hostFallbackReason() ?? "", /initialization failed: host install exploded/);
+  } finally {
+    await pi.close();
+  }
+});
+
+test("a Host that fails AFTER its generation started stops that generation before the legacy fallback runs", async () => {
+  const dir = join(root, "after-start");
+  const key = `__rt_entry_after_start_${process.pid}`;
+  writeFixtureRuntime(join(dir, "runtime"), key, { value: "HOST-GEN" });
+  const extensionUrl = pathToFileURL(join(repoRoot, "src", "runtime", "host", "extension.ts")).href;
+  await writeFile(
+    join(dir, "host.ts"),
+    `import { EngineeringHostExtension } from ${JSON.stringify(extensionUrl)};
+     class FailsAfterStart extends EngineeringHostExtension {
+       protected override async repairPointersAfterStart(): Promise<void> {
+         throw new Error("host failed after start");
+       }
+     }
+     export default (pi: any) => new FailsAfterStart({
+       installRoot: ${JSON.stringify(join(dir, "install"))},
+       packageRoot: ${JSON.stringify(join(dir, "runtime"))},
+       entry: "runtime.ts",
+       baseline: false,
+       autoUpdateCheck: false,
+     }).install(pi);\n`,
+  );
+  await writeFile(
+    join(dir, "legacy.ts"),
+    `export default function (pi: any) {
+       pi.registerCommand("engineer", { description: "legacy", handler: async () => {} });
+     }\n`,
+  );
+  const { installPiEngineering, hostFallbackReason } = await import("../../src/runtime/host/entry.ts");
+  const modules = {
+    host: () => import(pathToFileURL(join(dir, "host.ts")).href),
+    legacy: () => import(pathToFileURL(join(dir, "legacy.ts")).href),
+  };
+  const b = bag(key);
+  const pi = await startPiSession({ factories: [(api: never) => installPiEngineering(api, modules)] });
+  try {
+    assert.equal(b.starts, 1, "the Host's generation had started");
+    assert.equal(b.stops, 1, "and was stopped before falling back: never two runtimes");
+    assert.match(hostFallbackReason() ?? "", /host failed after start/);
+    assert.ok(pi.piCommands().includes("engineer"), "legacy extension loaded");
+    await pi.emit({ type: "agent_settled" });
+    assert.equal(b.reactions, 0, "the stopped generation no longer reacts");
   } finally {
     await pi.close();
   }
