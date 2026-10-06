@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
+import { realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import { promisify } from "node:util";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
@@ -58,6 +59,10 @@ import { resolveRequestBodyBudgetConfig } from "../src/request/bodyBudget.ts";
 import { resolveThinkingOffConfig } from "../src/request/thinkingPolicy.ts";
 import { RoadmapEngine } from "../src/roadmap/RoadmapEngine.ts";
 import { EngineeringRuntime, type RuntimeMissionActivityEvent } from "../src/runtime/EngineeringRuntime.ts";
+import { sessionBindingInfo } from "../src/runtime/isolation/RuntimeBinding.ts";
+import { RuntimeSession } from "../src/runtime/isolation/RuntimeSession.ts";
+import { effectiveWorkspace, workspaceForPath } from "../src/runtime/isolation/WorkspaceResolver.ts";
+import { emitRuntimeEvent } from "../src/runtime/isolation/runtimeEvents.ts";
 import {
   type MissionBrief,
   type SessionControlServer,
@@ -204,7 +209,79 @@ const inferweave: InferweaveProvider | null = inferweaveConfig.enabled
   : null;
 
 async function getRuntime(ctx: ExtensionCommandContext, worker?: EngineeringRuntime): Promise<EngineeringRuntime> {
-  return getRuntimeByCwd(worker ? worker.cwd : ctx.cwd, ctx.model);
+  return getRuntimeByCwd(worker ? worker.cwd : runtimeCwd(ctx.cwd), ctx.model);
+}
+
+/**
+ * The directory whose runtime serves a launch cwd. After a parent-directory
+ * launch rebinds to a nested worktree (spec §2/§3), the launch cwd resolves to
+ * that worktree; otherwise to itself.
+ */
+function runtimeCwd(cwd: string): string {
+  return effectiveWorkspace(cwd, RuntimeSession.current().binding?.worktreePath);
+}
+
+const workspaceRebinds = new Map<string, Promise<void>>();
+
+function canonicalPath(path: string): string {
+  try {
+    return realpathSync(path);
+  } catch {
+    return resolve(path);
+  }
+}
+
+/**
+ * Rebind the session when activity (a tool's `path`) shows work moving into a
+ * different git worktree beneath the launch directory. The destination runtime
+ * is opened (resolved, registered, migrated) BEFORE the session pointer moves,
+ * and the move itself is one registry transaction; any failure leaves the
+ * current binding in force.
+ */
+function observeWorkspaceActivity(cwd: string, args: unknown): Promise<void> {
+  const path = args && typeof args === "object" ? (args as { path?: unknown }).path : undefined;
+  if (typeof path !== "string" || !path.trim()) return Promise.resolve();
+  const flight = (async () => {
+    const session = RuntimeSession.current();
+    const launchKey = canonicalPath(await repoCacheKey(cwd).catch(() => cwd));
+    const target = await workspaceForPath(cwd, path, session.binding?.worktreePath ?? null);
+    // Never rebind back onto the launch directory's own worktree: in a parent
+    // launch that worktree is the container, not the project being worked on.
+    if (!target || target.worktreeRoot === launchKey) return;
+    const existing = workspaceRebinds.get(target.worktreeId);
+    if (existing) return existing;
+    const rebind = (async () => {
+      // Destination first: resolved, registered, migrated and open.
+      const runtime = await getRuntimeByCwd(target.worktreeRoot);
+      // Flush the current binding's pending writes so nothing is in flight
+      // across the switch.
+      const previous = session.binding?.worktreeId;
+      for (const entry of runtimes.values()) {
+        if (previous && entry.runtime.runtimeBinding?.identity.worktreeId === previous) {
+          await entry.runtime.missionStore?.flush();
+        }
+      }
+      if (runtime.runtimeBinding) session.bindTo(sessionBindingInfo(runtime.runtimeBinding));
+    })().finally(() => workspaceRebinds.delete(target.worktreeId));
+    workspaceRebinds.set(target.worktreeId, rebind);
+    return rebind;
+  })().catch((error: unknown) => {
+    emitRuntimeEvent("runtime.rebind_failed", {
+      session_id: RuntimeSession.current().sessionId,
+      path,
+      reason: error instanceof Error ? error.message : String(error),
+    });
+  });
+  workspaceActivity.add(flight);
+  void flight.finally(() => workspaceActivity.delete(flight));
+  return flight;
+}
+
+const workspaceActivity = new Set<Promise<void>>();
+
+/** Wait for in-flight workspace rebinding (tests and orderly shutdown). */
+export async function settleWorkspaceActivity(): Promise<void> {
+  while (workspaceActivity.size > 0) await Promise.allSettled([...workspaceActivity]);
 }
 
 /**
@@ -467,8 +544,9 @@ const runtimeOpenFailures = new Map<string, string>();
  */
 async function resolveServices(cwd: string): Promise<CoreServices | null> {
   let rt: EngineeringRuntime;
+  const effective = runtimeCwd(cwd);
   try {
-    rt = await getRuntimeByCwd(cwd);
+    rt = await getRuntimeByCwd(effective);
     runtimeOpenFailures.delete(cwd);
   } catch (error) {
     // Concurrency is not a failure mode any more (per-session event streams,
@@ -496,6 +574,8 @@ async function resolveServices(cwd: string): Promise<CoreServices | null> {
       return w ? w.id : null;
     },
     actor: () => ({ type: "user" }),
+    // A rebound parent launch targets the bound worktree by default.
+    ...(effective !== cwd ? { repositoryRoot: rt.git?.root ?? effective } : {}),
   };
 }
 
@@ -568,6 +648,11 @@ export default function (pi: ExtensionAPI) {
       }
     });
     pi.on("tool_execution_start", (event) => activeControl?.toolStarted(event.toolName, event.toolCallId));
+    // Parent-directory launches follow the work: a touched path inside a nested
+    // worktree rebinds the session there (fire-and-forget; never blocks a tool).
+    pi.on("tool_execution_start", (event, ctx) => {
+      void observeWorkspaceActivity(ctx.cwd, event.args);
+    });
     pi.on("tool_execution_update", (event) => {
       const content = event.toolName === "mission" ? event.partialResult?.content : null;
       const progress = Array.isArray(content) && typeof content[0]?.text === "string" ? content[0].text : undefined;

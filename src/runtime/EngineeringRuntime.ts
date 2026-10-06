@@ -56,7 +56,7 @@ import { buildCoreTools } from "../tools/coreTools.ts";
 import { CommandVerifier, type VerificationProvider, type VerifyOutcome } from "../verify/Verifier.ts";
 import { PiWorkerExecutor } from "../workers/PiWorkerExecutor.ts";
 import type { WorkerExecutor, WorkerRequest } from "../workers/WorkerExecutor.ts";
-import { type RuntimeBinding, resolveRuntimeBinding } from "./isolation/RuntimeBinding.ts";
+import { type RuntimeBinding, resolveRuntimeBinding, sessionBindingInfo } from "./isolation/RuntimeBinding.ts";
 import { RuntimeSession } from "./isolation/RuntimeSession.ts";
 import { resolveWorktreeIdentity } from "./isolation/WorktreeIdentity.ts";
 import {
@@ -786,6 +786,9 @@ export class EngineeringRuntime {
       }
       const orchestrationBackend = namespace.backend;
       const custody = namespace.custody;
+      // An unbound session binds to the first worktree runtime it opens;
+      // later moves are explicit rebinds driven by workspace activity.
+      if (!session.binding) session.bindTo(sessionBindingInfo(binding));
       openedOrchestrationStoreReferences.set(
         orchestrationPath,
         (openedOrchestrationStoreReferences.get(orchestrationPath) ?? 0) + 1,

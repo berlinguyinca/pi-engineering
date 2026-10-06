@@ -250,7 +250,7 @@ export class RuntimeSession {
     try {
       if (registry.heartbeat(this.sessionId, generationId)) {
         this.state.lastHeartbeatMs = Date.now();
-        if (this.state.health === "recovering") this.setHealth("healthy");
+        if (this.state.health === "recovering" || this.state.health === "rebound") this.setHealth("healthy");
         emitRuntimeEvent("session.heartbeat", { session_id: this.sessionId });
         return true;
       }
@@ -300,6 +300,44 @@ export class RuntimeSession {
     }
     this.state.binding = { ...binding };
     return true;
+  }
+
+  /**
+   * Bind (first time) or rebind this session to a worktree runtime.
+   *
+   * Transactional: the registry attachment and the session pointer change in
+   * one SQLite transaction, and the in-memory binding moves only after it
+   * commits. On failure the previous binding stays fully in force — the
+   * session is never half-attached to two runtimes.
+   */
+  bindTo(info: SessionBindingInfo): { changed: boolean; from: string | null; error?: string } {
+    const previous = this.state.binding;
+    if (previous?.worktreeId === info.worktreeId) return { changed: false, from: previous.worktreePath };
+    const fields = {
+      session_id: this.sessionId,
+      worktree_id: info.worktreeId,
+      from: previous?.worktreePath ?? null,
+      to: info.worktreePath,
+    };
+    let committed = false;
+    try {
+      committed = this.recordBinding(info);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      emitRuntimeEvent("runtime.rebind_failed", { ...fields, reason: message });
+      return { changed: false, from: previous?.worktreePath ?? null, error: message };
+    }
+    if (!committed) {
+      emitRuntimeEvent("runtime.rebind_failed", { ...fields, reason: "registry generation superseded" });
+      return { changed: false, from: previous?.worktreePath ?? null, error: "registry generation superseded" };
+    }
+    if (previous) {
+      this.setHealth("rebound");
+      emitRuntimeEvent("runtime.rebound", fields);
+    } else {
+      emitRuntimeEvent("runtime.bound", fields);
+    }
+    return { changed: true, from: previous?.worktreePath ?? null };
   }
 
   /** Graceful shutdown: unregister, release leases, stop heartbeating. Idempotent. */

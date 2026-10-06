@@ -14,6 +14,7 @@ import { randomUUID } from "node:crypto";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
+import type { SessionBindingInfo } from "./RuntimeSession.ts";
 import type { WorktreeIdentity } from "./WorktreeIdentity.ts";
 import { emitRuntimeEvent } from "./runtimeEvents.ts";
 import { resolveOrchestrationOverride, resolveStateRoot, sessionRuntimeDir, worktreeRuntimeDir } from "./stateDir.ts";
@@ -112,5 +113,17 @@ export function resolveRuntimeBinding(options: {
     recoveryDir: null,
     legacyFiles: [...new Set(legacyFiles)],
     degradedReason: failures.join("; "),
+  };
+}
+
+/** The registry/session view of a runtime binding. */
+export function sessionBindingInfo(binding: RuntimeBinding): SessionBindingInfo {
+  return {
+    repoId: binding.identity.repoId,
+    worktreeId: binding.identity.worktreeId,
+    worktreePath: binding.identity.worktreeRoot,
+    runtimePath: binding.runtimeDir,
+    repoName: binding.identity.repoName,
+    kind: binding.kind,
   };
 }
