@@ -255,3 +255,37 @@ test("a worker queued for an admission slot reports that it is waiting for infer
     await pending;
   });
 });
+
+test("two workers racing for the last slot: the one left queued reports that it is waiting", async () => {
+  const admission = new AdmissionController({ maxConcurrency: 1, jitterMs: 0 });
+  await withSilentGateway(admission, async (executor, cwd) => {
+    const owners = [new AbortController(), new AbortController()];
+    const activity: WorkerActivity[][] = [[], []];
+    // Both start in the same tick, so both see a free slot before either takes it.
+    const runs = owners.map((owner, i) =>
+      executor.run({
+        role: "implementer",
+        task: "t",
+        tools: [],
+        cwd,
+        modelOverride: { provider: "silent", id: "silent-model" },
+        signal: owner.signal,
+        unboundedInferenceWait: true,
+        onActivity: (event) => activity[i]?.push(event),
+      }),
+    );
+    const started = (i: number) => activity[i]?.some((e) => e.summary === "Worker session started") ?? false;
+    for (let i = 0; i < 200 && !(started(0) || started(1)); i++) await new Promise((r) => setTimeout(r, 20));
+    await new Promise((r) => setTimeout(r, 200));
+    const queued = started(0) ? 1 : 0;
+    assert.equal(started(queued), false, "only one worker holds the slot");
+    assert.ok(
+      activity[queued]?.some((e) => e.summary === WAITING_FOR_INFERENCE_SUMMARY),
+      `the queued worker reports its wait: ${JSON.stringify(activity[queued])}`,
+    );
+    for (const owner of owners) owner.abort();
+    // Both settle: the one canceled while queued never starts its session.
+    const settled = await Promise.all(runs);
+    for (const run of settled) assert.equal(run.result.status, "failed");
+  });
+});
