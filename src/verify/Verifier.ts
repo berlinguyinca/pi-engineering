@@ -38,6 +38,8 @@ function trackProcessGroup(pid: number): void {
   });
 }
 
+/** How long output may stay open after the command exits before a leftover counts as holding it. */
+const PIPE_CLOSE_GRACE_MS = 250;
 /** Grace between SIGTERM and SIGKILL for processes a command left behind. */
 const LEFTOVER_GRACE_MS = 2_000;
 
@@ -139,6 +141,9 @@ export function runWithInactivityGuard(
     let hung = false;
     let settled = false;
     let leftoverProcesses = 0;
+    /** A process the command left behind kept stdout/stderr open after it exited. */
+    let pipesHeld = false;
+    let pipeGrace: ReturnType<typeof setTimeout> | undefined;
     // Own process group, so a kill reaches grandchildren (npm -> node) that
     // would otherwise hold the output pipes open forever.
     const child = spawn(command, args, {
@@ -185,13 +190,22 @@ export function runWithInactivityGuard(
       settled = true;
       if (groupPid) liveProcessGroups.delete(groupPid);
       if (timer) clearTimeout(timer);
+      if (pipeGrace) clearTimeout(pipeGrace);
       opts.signal?.removeEventListener("abort", onAbort);
       fn();
     };
     child.on("exit", () => {
       if (!groupPid) return;
-      // The command is done; whatever remains in its group was left behind.
-      leftoverProcesses = reapLeftovers(groupPid);
+      // The command is done. If its output does not close shortly, a process
+      // it left behind holds the pipes: the output never completed, so the
+      // group is reaped now and the stage fails (no waiting for the
+      // inactivity guard). Otherwise leftovers are reaped on close.
+      pipeGrace = setTimeout(() => {
+        pipesHeld = true;
+        stderr +=
+          "\n[pi-engineering] a background process kept the command's output open after it exited; terminated\n";
+        leftoverProcesses = reapLeftovers(groupPid);
+      }, PIPE_CLOSE_GRACE_MS);
     });
     child.on("error", (error) =>
       finish(() =>
@@ -200,11 +214,13 @@ export function runWithInactivityGuard(
     );
     child.on("close", (code) =>
       finish(() => {
+        if (groupPid && !pipesHeld) leftoverProcesses = reapLeftovers(groupPid);
         if (opts.signal?.aborted) {
           reject(Object.assign(new Error("The operation was aborted"), { name: "AbortError" }));
           return;
         }
-        resolve({ code: typeof code === "number" ? code : 1, stdout, stderr, hung, leftoverProcesses });
+        const exitCode = typeof code === "number" ? code : 1;
+        resolve({ code: pipesHeld && exitCode === 0 ? 1 : exitCode, stdout, stderr, hung, leftoverProcesses });
       }),
     );
     arm();
