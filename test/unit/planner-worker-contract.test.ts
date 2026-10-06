@@ -48,7 +48,20 @@ test("parseTaskContract accepts the spec example shape and fills defaults", () =
 });
 
 test("parseTaskContract rejects unsafe or unbounded scope globs", () => {
-  for (const bad of ["/etc/**", "../outside/**", "**", "*", ".", "", "src\\win", "src/ space/**"]) {
+  for (const bad of [
+    "/etc/**",
+    "../outside/**",
+    "**",
+    "*",
+    ".",
+    "",
+    "src\\win",
+    "src/ space/**",
+    ".git/**",
+    "src/.git/hooks/x",
+    "src/*.{ts,tsx}",
+    "src/[ab].ts",
+  ]) {
     const r = parseTaskContract(raw("t1", [], [bad]));
     assert.equal(r.ok, false, `scope ${JSON.stringify(bad)} must be rejected`);
   }

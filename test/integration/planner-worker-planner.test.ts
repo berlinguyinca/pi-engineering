@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
@@ -130,6 +130,9 @@ test("the gateway executor writes an implementer's files inside its worktree onl
           { path: "src/greet.mjs", content: "export const greet = (n) => `hello ${n}`;\n" },
           { path: "../escape.txt", content: "no" },
           { path: "/etc/evil", content: "no" },
+          { path: ".git", content: "gitdir: /tmp/evil" },
+          { path: "sub/.git/config", content: "[core]" },
+          { path: "link/out.txt", content: "no" },
         ],
       }),
       usage: { prompt_tokens: 120, completion_tokens: 30, cached_tokens: 64 },
@@ -139,8 +142,12 @@ test("the gateway executor writes an implementer's files inside its worktree onl
   servers.push(server);
   const cwd = await mkdtemp(join(tmpdir(), "pw-impl-"));
   dirs.push(cwd);
+  const outside = await mkdtemp(join(tmpdir(), "pw-outside-"));
+  dirs.push(outside);
+  await symlink(outside, join(cwd, "link"));
   const worker = new GatewayChatWorkerExecutor({ baseUrl: server.baseUrl, defaultModel: "coding-implementation" });
   const run = await worker.run({ role: "implementer", task: "do it", tools: ["read", "write"], cwd });
+  assert.deepEqual(await readdir(outside), [], "a symlinked directory must not redirect writes");
   assert.equal(run.result.status, "completed");
   assert.deepEqual(run.result.details.files_written, ["src/greet.mjs"]);
   assert.match(await readFile(join(cwd, "src/greet.mjs"), "utf8"), /hello/);

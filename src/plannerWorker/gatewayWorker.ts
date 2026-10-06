@@ -9,7 +9,7 @@
  * worktree, not the transcript.
  */
 
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, realpath, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
 import type { WorkerResult } from "../core/types.ts";
 import type { WorkerExecutor, WorkerRequest, WorkerRun } from "../workers/WorkerExecutor.ts";
@@ -27,17 +27,26 @@ function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
+/** True when `path` stays inside `root` (no escape, no git metadata). */
+function inside(root: string, path: string): boolean {
+  const rel = relative(root, path);
+  return rel !== "" && !rel.startsWith("..") && !isAbsolute(rel) && !rel.split(/[\\/]/).includes(".git");
+}
+
 async function applyFiles(cwd: string, files: unknown[]): Promise<string[]> {
   const written: string[] = [];
+  const root = await realpath(cwd);
   for (const f of files) {
     if (!isRecord(f) || typeof f.path !== "string" || typeof f.content !== "string") continue;
     if (isAbsolute(f.path)) continue;
-    const target = resolve(cwd, f.path);
-    const rel = relative(cwd, target);
-    if (rel.startsWith("..") || isAbsolute(rel) || rel === "") continue;
+    const target = resolve(root, f.path);
+    if (!inside(root, target)) continue;
     await mkdir(dirname(target), { recursive: true });
+    // A symlinked directory inside the worktree must not redirect the write outside it.
+    const parent = await realpath(dirname(target));
+    if (parent !== root && !inside(root, parent)) continue;
     await writeFile(target, f.content);
-    written.push(rel);
+    written.push(relative(root, target));
   }
   return written;
 }

@@ -6,11 +6,11 @@
 
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { readFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { after, test } from "node:test";
 import { promisify } from "node:util";
-import { PlannerWorkerExecutor } from "../../src/plannerWorker/executor.ts";
+import { PlannerWorkerExecutor, runVerification } from "../../src/plannerWorker/executor.ts";
 import { fetchCatalog } from "../../src/plannerWorker/gateway.ts";
 import { GatewayChatWorkerExecutor } from "../../src/plannerWorker/gatewayWorker.ts";
 import { RoleResolver } from "../../src/plannerWorker/resolver.ts";
@@ -387,4 +387,54 @@ test("the checkout is left alone when it moved during the mission", async () => 
   await assert.rejects(readFile(join(fixture.root, "src", "solo", "done.txt"), "utf8"));
   const branch = await exec("git", ["-C", fixture.root, "show", "pi-eng-pw-M-dirty:src/solo/done.txt"]);
   assert.equal(branch.stdout, "solo");
+});
+
+test("long task ids never share a branch, and a rejecting pre-commit hook cannot drop an attempt", async () => {
+  const long = "x".repeat(50);
+  const ids = [`${long}-one`, `${long}-two`];
+  const { fixture, executor } = await setup((req) => {
+    const role = roleOf(req);
+    if (role === "planner") {
+      return {
+        content: JSON.stringify({
+          contracts: ids.map((id, i) => ({
+            ...contract(id),
+            scope: { allowed: [`src/p${i}/**`] },
+            verification: [`test -f src/p${i}/done.txt`],
+          })),
+        }),
+      };
+    }
+    if (role === "implementer") {
+      const i = ids.indexOf(taskOf(req));
+      return {
+        content: JSON.stringify({
+          status: "completed",
+          summary: "ok",
+          files: [{ path: `src/p${i}/done.txt`, content: String(i) }],
+        }),
+      };
+    }
+    return pass;
+  });
+  await mkdir(join(fixture.root, ".git", "hooks"), { recursive: true });
+  await writeFile(join(fixture.root, ".git", "hooks", "pre-commit"), "#!/bin/sh\necho 'hook says no' >&2\nexit 1\n");
+  await chmod(join(fixture.root, ".git", "hooks", "pre-commit"), 0o755);
+  const report = await executor.run(brief("M-long"));
+  assert.equal(report.status, "completed", report.failure_reason ?? "");
+  assert.equal(await readFile(join(fixture.root, "src", "p0", "done.txt"), "utf8"), "0");
+  assert.equal(await readFile(join(fixture.root, "src", "p1", "done.txt"), "utf8"), "1");
+  // Contract and review branches are cleaned up; nothing is left but the checkout's own branch.
+  const branches = await exec("git", ["-C", fixture.root, "branch", "--list", "pi-eng-pw-*"]);
+  assert.equal(branches.stdout.trim(), "");
+});
+
+test("verification commands come from model output and never see credentials", async () => {
+  process.env.PW_TEST_API_TOKEN = "secret";
+  try {
+    const run = await runVerification('test -z "$PW_TEST_API_TOKEN" && test -n "$PATH"', process.cwd());
+    assert.equal(run.passed, true, run.output_tail);
+  } finally {
+    delete process.env.PW_TEST_API_TOKEN;
+  }
 });

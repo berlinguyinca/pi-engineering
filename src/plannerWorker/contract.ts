@@ -58,6 +58,9 @@ export function scopeGlobError(glob: string): string | null {
   if (glob.startsWith("/") || /^[A-Za-z]:/.test(glob)) return `scope glob "${glob}" must be repository-relative`;
   const segments = glob.split("/");
   if (segments.some((s) => s === "..")) return `scope glob "${glob}" escapes the repository`;
+  if (segments.some((s) => s === ".git")) return `scope glob "${glob}" targets git metadata`;
+  // Only *, ** and ? are supported; brace/bracket sets would silently never match.
+  if (/[[\]{}]/.test(glob)) return `scope glob "${glob}" uses unsupported {…} or […] syntax`;
   const first = segments[0] ?? "";
   if (first === "" || first === "." || /[*?[\]{}]/.test(first)) {
     return `scope glob "${glob}" is unbounded (its first path segment must be literal)`;

@@ -79,10 +79,17 @@ export class RoleResolver {
   }
 
   /** Other concrete catalogue models that could serve `role` (compatibility alternatives). */
-  alternatives(role: PlannerWorkerRole, besides: string): ModelProfile[] {
+  alternatives(role: PlannerWorkerRole, besides: string, avoid: readonly string[] = []): ModelProfile[] {
     const cap = this.config[role].capability;
     return this.models
-      .filter((m) => !m.alias && m.id !== besides && !this.excluded.has(m.id) && m.capabilities.includes(cap))
+      .filter(
+        (m) =>
+          !m.alias &&
+          m.id !== besides &&
+          !avoid.includes(m.id) &&
+          !this.excluded.has(m.id) &&
+          m.capabilities.includes(cap),
+      )
       .map((m) => ({
         id: m.id,
         ...(m.contextWindow !== undefined ? { contextWindow: m.contextWindow } : {}),

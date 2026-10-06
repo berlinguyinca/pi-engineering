@@ -20,6 +20,7 @@
  */
 
 import { execFile, spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -73,6 +74,7 @@ import {
 } from "./types.ts";
 
 const exec = promisify(execFile);
+const COMMITTER = ["-c", "user.name=pi-engineering", "-c", "user.email=pi-engineering@localhost"];
 
 const IMPLEMENT_TOOLS = ["read", "grep", "find", "ls", "write", "edit", "bash"];
 const WORKER_ROLE: Readonly<Record<PlannerWorkerRole, WorkerRole>> = {
@@ -139,9 +141,7 @@ async function git(cwd: string, args: string[]): Promise<{ code: number; stdout:
 export function runVerification(command: string, cwd: string, timeoutMs = 300_000): Promise<VerificationRun> {
   const started = Date.now();
   return new Promise((resolve) => {
-    // A parent node test runner's context must not leak into the repo's own test command.
-    const { NODE_TEST_CONTEXT: _parentRunner, ...env } = process.env;
-    const child = spawn("sh", ["-c", command], { cwd, env: { ...env, CI: "1" } });
+    const child = spawn("sh", ["-c", command], { cwd, env: verificationEnv() });
     let out = "";
     const keep = (b: Buffer) => {
       out = (out + b.toString("utf8")).slice(-4000);
@@ -185,6 +185,9 @@ export class PlannerWorkerExecutor {
   private plannerModel: string | null = null;
   private replans = 0;
   private finalFixUsed = false;
+  private applied = false;
+  /** Worktrees of contracts superseded by a replan, removed at cleanup. */
+  private readonly retired: WorktreeInfo[] = [];
   private status: PlannerWorkerReport["status"] | "running" = "running";
   private failureReason: string | null = null;
   private started = 0;
@@ -295,6 +298,8 @@ export class PlannerWorkerExecutor {
     const running = new Map<string, Promise<void>>();
     for (;;) {
       if (this.opts.signal?.aborted) {
+        // Never tear worktrees down under running workers.
+        await Promise.allSettled(running.values());
         this.status = "failed";
         this.failureReason = "aborted";
         break;
@@ -352,10 +357,13 @@ export class PlannerWorkerExecutor {
     if (this.status !== "running") return;
     if (states.every((s) => s.status === "passed")) return;
     const failed = states.filter((s) => s.status !== "passed");
-    this.status = failed.some((s) => s.stalled)
-      ? "stalled"
-      : failed.some((s) => s.rung === "escalated")
-        ? "escalated"
+    // "stalled" only when a stalled contract failed because the ladder ran out.
+    const ladderExhausted = (s: ContractState) =>
+      s.stalled !== undefined && /exhausted|no escalation model/.test(s.blocked_reason ?? "");
+    this.status = failed.some((s) => s.rung === "escalated")
+      ? "escalated"
+      : failed.some(ladderExhausted)
+        ? "stalled"
         : "failed";
     this.failureReason = failed
       .map((s) => `${s.contract.task_id}: ${s.status}${s.blocked_reason ? ` (${s.blocked_reason})` : ""}`)
@@ -404,10 +412,16 @@ export class PlannerWorkerExecutor {
         this.setStatus(rt, "blocked", "pre-implementation review requires a revised contract");
         return;
       }
+      if (verdict?.status === "escalate") {
+        // Beyond the local implementer: start on the escalation rung.
+        rt.state.rung = "escalated";
+        this.setStatus(rt, "escalated", "pre-implementation review asked for escalation");
+        this.setStatus(rt, "running", "escalated implementation");
+      }
     }
     if (!rt.worktree) {
       const head = (await git(this.integration.path, ["rev-parse", "HEAD"])).stdout.trim();
-      rt.worktree = await this.repo.createWorktree(head, `pi-eng-pw-${slug(this.brief.mission_id)}-${slug(c.task_id)}`);
+      rt.worktree = await this.repo.createWorktree(head, this.branchFor(c.task_id));
       rt.baseCommit = head;
       rt.lastHead = head;
       rt.state.worktree = rt.worktree.path;
@@ -494,8 +508,7 @@ export class PlannerWorkerExecutor {
       }
       verdict = await this.review(rt);
       if (verdict.status === "pass") {
-        await this.accept(rt, role);
-        return "done";
+        return this.accept(rt, role);
       }
       this.telemetry.count(role, rt.state.last_model ?? "default", "review_failed");
       if (verdict.status === "replan") {
@@ -587,13 +600,14 @@ export class PlannerWorkerExecutor {
     return "again";
   }
 
-  private async accept(rt: Runtime, role: PlannerWorkerRole): Promise<void> {
+  /** Integrate a reviewed contract; "again" when a merge conflict needs another attempt. */
+  private async accept(rt: Runtime, role: PlannerWorkerRole): Promise<"again" | "done"> {
     const c = rt.state.contract;
     const merged = await this.integrate(rt);
     if (!merged.ok) {
       // Conflicting with integrated work: start over from the integration head.
       await this.resetWorktree(rt);
-      await this.afterFailure(
+      return this.afterFailure(
         rt,
         role,
         {
@@ -605,8 +619,6 @@ export class PlannerWorkerExecutor {
         [],
         [],
       );
-      if (rt.state.status === "running") await this.executeContractLoop(rt);
-      return;
     }
     this.telemetry.count(role, rt.state.last_model ?? "default", "accepted");
     this.results.set(c.task_id, {
@@ -615,6 +627,7 @@ export class PlannerWorkerExecutor {
       changed_files: rt.state.changed_files,
     });
     this.setStatus(rt, "passed", "review passed; integrated");
+    return "done";
   }
 
   private async executeContractLoop(rt: Runtime): Promise<void> {
@@ -634,7 +647,7 @@ export class PlannerWorkerExecutor {
     const plan = planTransition(
       this.opts.resolver.profileOf(resolved),
       { contextTokens: handoffTokens, handoffTokens, preferHandoff: true, needsTools: role !== "reviewer" },
-      this.opts.resolver.alternatives(role, resolved.model.id),
+      this.opts.resolver.alternatives(role, resolved.model.id, avoid),
     );
     if (plan.outcome === "reject") return "reject";
     if (plan.outcome === "other_model") {
@@ -669,8 +682,16 @@ export class PlannerWorkerExecutor {
    * Invoke a role with failure-aware switching (spec §16): availability errors
    * wait, retry or switch model — bounded, never forever.
    */
-  private roleWorker(role: PlannerWorkerRole, resolved: ResolvedRole | null, task: string): WorkerExecutor {
-    return { run: (req) => this.invoke(role, resolved, req, task) };
+  /** A WorkerExecutor bound to a role; `avoid` keeps failover replacements separated too. */
+  private roleWorker(
+    role: PlannerWorkerRole,
+    resolved: ResolvedRole | null,
+    task: string,
+    avoid?: string[],
+  ): WorkerExecutor {
+    return {
+      run: (req) => this.invoke(role, resolved, req, task, avoid ?? this.avoidFor(role, this.contracts.get(task))),
+    };
   }
 
   private async invoke(
@@ -678,6 +699,7 @@ export class PlannerWorkerExecutor {
     initial: ResolvedRole | null,
     req: WorkerRequest,
     task: string,
+    avoid: string[],
   ): Promise<WorkerRun> {
     let resolved = initial;
     let strikes = 0;
@@ -704,7 +726,7 @@ export class PlannerWorkerExecutor {
       this.opts.resolver.exclude(servedIdentity(resolved));
       this.opts.resolver.exclude(resolved.model.id);
       this.opts.resolver.mergeCandidates(availability.candidates);
-      const next = await this.opts.resolver.resolve(role, this.avoidFor(role, this.contracts.get(task)));
+      const next = await this.opts.resolver.resolve(role, avoid);
       if (!next) return run;
       this.recordTransition(task, role, next, `failover:${availability.code}`, task);
       resolved = next;
@@ -789,34 +811,59 @@ export class PlannerWorkerExecutor {
   private async batchReview(batch: Runtime[]): Promise<void> {
     for (const rt of batch) rt.pendingBatch = false;
     const implementers = [...new Set(batch.map((rt) => rt.state.last_model).filter((m): m is string => m !== null))];
-    const reviewer = await this.opts.resolver.resolve("reviewer", implementers);
-    this.recordTransition(
-      "batch-review",
-      "reviewer",
-      reviewer,
-      "batch review",
-      batch.map((rt) => rt.state.contract.task_id).join(","),
-    );
-    const { verdicts } = await runBatchReview({
-      worker: this.roleWorker("reviewer", reviewer, "batch-review"),
-      handoffs: batch.map((rt) => this.reviewHandoff(rt)),
-      cwd: this.integration.path,
-    });
+    const ids = batch.map((rt) => rt.state.contract.task_id);
+    let verdicts: Map<string, ReviewVerdict>;
+    // The reviewer reads a worktree holding the integrated work plus every batch candidate.
+    let reviewTree: WorktreeInfo | null = null;
+    try {
+      const head = (await git(this.integration.path, ["rev-parse", "HEAD"])).stdout.trim();
+      reviewTree = await this.repo.createWorktree(head, this.branchFor(`batch-review-${ids.join("-")}`));
+      for (const rt of batch) {
+        const merged = await git(reviewTree.path, [
+          ...COMMITTER,
+          "merge",
+          "--no-ff",
+          "-q",
+          "-m",
+          `review ${rt.state.contract.task_id}`,
+          rt.worktree!.branch,
+        ]);
+        if (merged.code !== 0) await git(reviewTree.path, ["merge", "--abort"]);
+      }
+      const reviewer = await this.opts.resolver.resolve("reviewer", implementers);
+      this.recordTransition("batch-review", "reviewer", reviewer, "batch review", ids.join(","));
+      ({ verdicts } = await runBatchReview({
+        worker: this.roleWorker("reviewer", reviewer, "batch-review", implementers),
+        handoffs: batch.map((rt) => this.reviewHandoff(rt)),
+        cwd: reviewTree.path,
+      }));
+    } catch (err) {
+      for (const rt of batch)
+        this.forceFail(rt, `batch review failed: ${err instanceof Error ? err.message : String(err)}`);
+      return;
+    } finally {
+      if (reviewTree) await this.dropWorktree(reviewTree);
+    }
     for (const rt of batch) {
-      const verdict = verdicts.get(rt.state.contract.task_id)!;
-      const role: PlannerWorkerRole = rt.state.correction ? "fixer" : "implementer";
-      if (verdict.status === "pass") {
-        await this.accept(rt, role);
-        continue;
+      try {
+        const verdict = verdicts.get(rt.state.contract.task_id)!;
+        const role: PlannerWorkerRole = rt.state.correction ? "fixer" : "implementer";
+        let outcome: "again" | "done";
+        if (verdict.status === "pass") {
+          outcome = await this.accept(rt, role);
+        } else if (verdict.status === "replan") {
+          rt.state.blocked_reason = `evidence: reviewer requested replan: ${verdict.issues.map((i) => i.summary).join("; ")}`;
+          this.setStatus(rt, "blocked", "reviewer requested a replan");
+          outcome = "done";
+        } else {
+          this.telemetry.count(role, rt.state.last_model ?? "default", "review_failed");
+          outcome = await this.afterFailure(rt, role, verdict, [], []);
+        }
+        // Corrections run in parallel through the DAG driver.
+        if (outcome === "again") rt.resume = true;
+      } catch (err) {
+        this.forceFail(rt, `executor error: ${err instanceof Error ? err.message : String(err)}`);
       }
-      if (verdict.status === "replan") {
-        rt.state.blocked_reason = `evidence: reviewer requested replan: ${verdict.issues.map((i) => i.summary).join("; ")}`;
-        this.setStatus(rt, "blocked", "reviewer requested a replan");
-        continue;
-      }
-      this.telemetry.count(role, rt.state.last_model ?? "default", "review_failed");
-      // Corrections run in parallel through the DAG driver.
-      if ((await this.afterFailure(rt, role, verdict, [], [])) === "again") rt.resume = true;
     }
   }
 
@@ -894,7 +941,7 @@ export class PlannerWorkerExecutor {
       return true;
     }
     for (const old of remaining) {
-      if (old.worktree) await git(this.opts.repoRoot, ["worktree", "remove", "--force", old.worktree.path]);
+      if (old.worktree) this.retired.push(old.worktree);
       this.contracts.delete(old.state.contract.task_id);
     }
     this.plan = {
@@ -917,16 +964,19 @@ export class PlannerWorkerExecutor {
     await git(path, ["add", "-A"]);
     const dirty = (await git(path, ["status", "--porcelain"])).stdout.trim() !== "";
     if (dirty) {
-      await git(path, [
-        "-c",
-        "user.name=pi-engineering",
-        "-c",
-        "user.email=pi-engineering@localhost",
+      // Repository hooks must not silently drop an attempt: a lost commit would
+      // integrate nothing while verification passed on the working tree.
+      const r = await git(path, [
+        ...COMMITTER,
         "commit",
         "-q",
+        "--no-verify",
         "-m",
         `pw: ${rt.state.contract.task_id} attempt ${rt.state.attempt}`,
       ]);
+      if (r.code !== 0 || (await git(path, ["status", "--porcelain"])).stdout.trim() !== "") {
+        throw new Error(`could not commit attempt ${rt.state.attempt}: ${(r.stderr || r.stdout).trim().slice(0, 300)}`);
+      }
     }
     const head = (await git(path, ["rev-parse", "HEAD"])).stdout.trim();
     rt.diff = (await git(path, ["diff", rt.baseCommit, head, "--", ".", ":!package-lock.json"])).stdout;
@@ -940,10 +990,7 @@ export class PlannerWorkerExecutor {
     const run = async () => {
       if (rt.state.changed_files.length === 0) return { ok: true, reason: "" };
       const r = await git(this.integration.path, [
-        "-c",
-        "user.name=pi-engineering",
-        "-c",
-        "user.email=pi-engineering@localhost",
+        ...COMMITTER,
         "merge",
         "--no-ff",
         "-q",
@@ -992,7 +1039,7 @@ export class PlannerWorkerExecutor {
       decisions: [],
     };
     const r = await runReview({
-      worker: this.roleWorker("reviewer", reviewer, "final"),
+      worker: this.roleWorker("reviewer", reviewer, "final", implementers),
       handoff: buildHandoff({
         kind: "worker_to_reviewer",
         brief: this.brief,
@@ -1041,17 +1088,27 @@ export class PlannerWorkerExecutor {
       return;
     }
     const r = await git(this.opts.repoRoot, ["merge", "--ff-only", "-q", this.integration.branch]);
+    this.applied = r.code === 0;
     this.emit({
       type: "phase",
       text: r.code === 0 ? "applied to checkout" : `fast-forward failed; result on ${this.integration.branch}`,
     });
   }
 
+  private branchFor(id: string): string {
+    return `pi-eng-pw-${slug(this.brief.mission_id)}-${slug(id)}`;
+  }
+
+  private async dropWorktree(info: WorktreeInfo, keepBranch = false): Promise<void> {
+    await git(this.opts.repoRoot, ["worktree", "remove", "--force", info.path]);
+    if (!keepBranch) await git(this.opts.repoRoot, ["branch", "-D", info.branch]);
+  }
+
   private async cleanup(): Promise<void> {
-    for (const rt of this.contracts.values()) {
-      if (rt.worktree) await git(this.opts.repoRoot, ["worktree", "remove", "--force", rt.worktree.path]);
-    }
-    if (this.integration) await git(this.opts.repoRoot, ["worktree", "remove", "--force", this.integration.path]);
+    for (const rt of this.contracts.values()) if (rt.worktree) await this.dropWorktree(rt.worktree);
+    for (const info of this.retired) await this.dropWorktree(info);
+    // The integration branch is the result when it was not applied to the checkout.
+    if (this.integration) await this.dropWorktree(this.integration, !this.applied);
     await this.transitions.flush();
   }
 
@@ -1094,8 +1151,26 @@ export class PlannerWorkerExecutor {
   }
 }
 
+/**
+ * Environment for verification commands. They come from planner output, so
+ * credentials are withheld; a parent node test runner's context must not leak
+ * into the repository's own test command either.
+ */
+function verificationEnv(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { CI: "1" };
+  for (const [k, v] of Object.entries(process.env)) {
+    if (k === "NODE_TEST_CONTEXT" || /KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|AUTH/i.test(k)) continue;
+    env[k] = v;
+  }
+  return env;
+}
+
 function slug(s: string): string {
-  return s.replace(/[^A-Za-z0-9._-]+/g, "-").slice(0, 40);
+  const clean = s.replace(/[^A-Za-z0-9._-]+/g, "-");
+  // Truncation must never make two ids share a branch: keep a hash of the full id.
+  return clean.length <= 40
+    ? clean
+    : `${clean.slice(0, 31)}-${createHash("sha256").update(s).digest("hex").slice(0, 8)}`;
 }
 
 function modelName(r: ResolvedRole | null): string {
@@ -1116,11 +1191,15 @@ function availabilityOf(run: WorkerRun): AvailabilityError | null {
 
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve) => {
-    const t = setTimeout(resolve, ms);
-    signal?.addEventListener("abort", () => {
+    const onAbort = () => {
       clearTimeout(t);
       resolve();
-    });
+    };
+    const t = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
   });
 }
 

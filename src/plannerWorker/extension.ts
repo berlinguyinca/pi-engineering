@@ -147,36 +147,43 @@ export function registerPlannerWorker(
     });
   }
 
+  /** Decide whether planner-worker runs; null keeps the existing /mission flow. */
+  async function select(request: string, ctx: ExtensionCommandContext) {
+    const host = await deps.host(ctx);
+    const config = await loadPlannerWorkerConfig(host.repoRoot);
+    const requested = await effectiveMode(host.repoRoot, config);
+    if (requested === "single") return null;
+    const provider = config.provider ?? ctx.model?.provider;
+    if (!provider) return null;
+    const conn = await gatewayFor(ctx, provider);
+    // Static role routing (engineering.yaml pins) is built only if needed.
+    let router: ReturnType<typeof createRoleRouter> | null = null;
+    const resolver = new RoleResolver({
+      provider,
+      config: config.roles,
+      // A short deadline: the mode decision must not stall /mission.
+      loadCatalog: conn ? () => fetchCatalog({ ...conn, timeoutMs: 5_000 }) : async () => [],
+      fallback: async (role, exclude) => {
+        router ??= createRoleRouter({ cwd: host.repoRoot });
+        const adapter = await router.catch(() => null);
+        return adapter?.route(STATIC_ROUTER_ROLE[role] as RoleName, {
+          exclude: exclude.map((id) => ({ provider, id })),
+        });
+      },
+    });
+    const decision = await chooseExecutionMode(requested, request, resolver);
+    if (decision.mode === "single") return null;
+    return { host, config, resolver, reason: decision.reason };
+  }
+
   return {
     async runIfSelected(request, ctx) {
-      const host = await deps.host(ctx);
-      const config = await loadPlannerWorkerConfig(host.repoRoot);
-      const requested = await effectiveMode(host.repoRoot, config);
-      if (requested === "single") return false;
-      const provider = config.provider ?? ctx.model?.provider;
-      if (!provider) return false;
-      const conn = await gatewayFor(ctx, provider);
-      // Static role routing (engineering.yaml pins) is built only if needed.
-      let router: ReturnType<typeof createRoleRouter> | null = null;
-      const resolver = new RoleResolver({
-        provider,
-        config: config.roles,
-        loadCatalog: conn ? () => fetchCatalog(conn) : async () => [],
-        fallback: async (role, exclude) => {
-          router ??= createRoleRouter({ cwd: host.repoRoot });
-          const adapter = await router.catch(() => null);
-          return adapter?.route(STATIC_ROUTER_ROLE[role] as RoleName, {
-            exclude: exclude.map((id) => ({ provider, id })),
-          });
-        },
-      });
-      const decision = await chooseExecutionMode(requested, request, resolver);
-      if (decision.mode === "single") {
-        if (requested === "auto") ctx.ui.notify(`engineering mode: single (${decision.reason})`, "info");
-        return false;
-      }
+      // Any failure while deciding falls back to the existing orchestrator.
+      const selected = await select(request, ctx).catch(() => null);
+      if (!selected) return false;
+      const { host, config, resolver } = selected;
       const notify: Notify = (text, level) => ctx.ui.notify(text, level);
-      notify(`engineering mode: planner-worker (${decision.reason})`, "info");
+      notify(`engineering mode: planner-worker (${selected.reason})`, "info");
       const missionId = `PW-${new Date()
         .toISOString()
         .replace(/[-:.TZ]/g, "")
