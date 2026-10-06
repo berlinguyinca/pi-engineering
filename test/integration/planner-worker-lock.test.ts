@@ -182,3 +182,91 @@ test("a corrupt lock file is reclaimed", async () => {
   await lock.release();
   await first.release(); // not its lock any more: a no-op
 });
+
+/** A real process that takes the lock and is SIGKILLed: its lock is left behind, owned by a dead pid. */
+async function deadOwner(stateDir: string): Promise<string> {
+  const holder = await lockHolder(stateDir);
+  await killed(holder);
+  return readFile(join(stateDir, "mission.lock"), "utf8");
+}
+
+/**
+ * Real resumer processes: each waits for `go`, races for the lock, and
+ * reports `won` (then checks after a pause that the lock is still its own)
+ * or `refused`.
+ */
+function resumer(stateDir: string, go: string): { done: Promise<string>; ready: Promise<void> } {
+  const child = spawn(
+    process.execPath,
+    [
+      "--input-type=module",
+      "-e",
+      `import { existsSync, readFileSync } from "node:fs";
+const { acquireMissionLock } = await import(${JSON.stringify(join(SRC, "missionLock.ts"))});
+const [dir, go] = process.argv.slice(1);
+console.log("ready");
+while (!existsSync(go)) await new Promise((r) => setTimeout(r, 2));
+try {
+  await acquireMissionLock(dir);
+} catch (err) {
+  console.log(err.name === "MissionLockedError" ? "refused" : "error " + err.message);
+  process.exit(0);
+}
+await new Promise((r) => setTimeout(r, 1500));
+const lock = JSON.parse(readFileSync(dir + "/mission.lock", "utf8"));
+console.log(lock.pid === process.pid ? "won intact" : "won stolen");`,
+      stateDir,
+      go,
+    ],
+    { stdio: ["ignore", "pipe", "inherit"] },
+  );
+  cleanups.push(async () => {
+    child.kill("SIGKILL");
+  });
+  let out = "";
+  let markReady!: () => void;
+  const ready = new Promise<void>((r) => {
+    markReady = r;
+  });
+  child.stdout?.on("data", (b: Buffer) => {
+    out += b.toString();
+    if (out.includes("ready")) markReady();
+  });
+  const done = new Promise<string>((r) => child.on("exit", () => r(out.replace("ready", "").trim())));
+  return { done, ready };
+}
+
+const ROUNDS = Number(process.env.PW_LOCK_ROUNDS ?? 6);
+const RACERS = 6;
+
+test("concurrent resumers over a dead owner's lock: exactly one wins and nobody deletes the winner's lock", async () => {
+  const fixture = await makeFixtureRepo();
+  cleanups.push(fixture.cleanup);
+  for (let round = 0; round < ROUNDS; round++) {
+    const dir = join(fixture.root, ".pi-eng", "planner-worker", `PW-race-${round}`);
+    await deadOwner(dir);
+    const go = join(dir, "go");
+    const racers = Array.from({ length: RACERS }, () => resumer(dir, go));
+    await Promise.all(racers.map((r) => r.ready));
+    await writeFile(go, "");
+    const outcomes = (await Promise.all(racers.map((r) => r.done))).sort();
+    assert.deepEqual(
+      outcomes,
+      [...Array.from({ length: RACERS - 1 }, () => "refused"), "won intact"],
+      `round ${round}: ${outcomes.join(", ")}`,
+    );
+  }
+});
+
+test("a takeover abandoned by a crashed claimant does not wedge the mission", async () => {
+  const fixture = await makeFixtureRepo();
+  cleanups.push(fixture.cleanup);
+  const dir = join(fixture.root, ".pi-eng", "planner-worker", "PW-abandoned");
+  const stale = JSON.parse(await deadOwner(dir));
+  // A claimant died mid-takeover: its claim marker names a dead process too.
+  const deadClaimant = await deadOwner(join(fixture.root, ".pi-eng", "planner-worker", "PW-other"));
+  await writeFile(join(dir, `mission.lock.takeover-${stale.token}`), deadClaimant);
+  const lock = await acquireMissionLock(dir);
+  assert.equal(JSON.parse(await readFile(join(dir, "mission.lock"), "utf8")).pid, process.pid);
+  await lock.release();
+});
