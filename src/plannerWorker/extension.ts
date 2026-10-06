@@ -18,6 +18,8 @@ import { join } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { createRoleRouter } from "../capability/adapter.ts";
 import type { RoleName } from "../capability/roles.ts";
+import { loadMissionLimits } from "../lifecycle/policy.ts";
+import { workerInactivityMs } from "../orchestration/broker.ts";
 import type { WorkerExecutor } from "../workers/WorkerExecutor.ts";
 import {
   type PlannerWorkerConfig,
@@ -184,13 +186,16 @@ export function registerPlannerWorker(
     return { host, config, ...built, reason: decision.reason };
   }
 
-  function executorFor(
+  async function executorFor(
     ctx: ExtensionCommandContext,
     host: PlannerWorkerHost,
     config: PlannerWorkerConfig,
     built: { resolver: RoleResolver; conn: { baseUrl: string; apiKey?: string } | null },
     missionId: string,
-  ): PlannerWorkerExecutor {
+  ): Promise<PlannerWorkerExecutor> {
+    // Same hung-worker window as every other mission worker: the environment
+    // override wins, then `limits.worker_inactivity_ms`, then 1 h.
+    const limits = await loadMissionLimits(host.repoRoot);
     return new PlannerWorkerExecutor({
       repoRoot: host.repoRoot,
       worker: host.worker,
@@ -199,6 +204,9 @@ export function registerPlannerWorker(
       concurrency: config.concurrency,
       ladder: config.ladder,
       convergence: config.convergence,
+      workerInactivityMs: process.env.PI_ENGINEERING_WORKER_INACTIVITY_MS
+        ? workerInactivityMs()
+        : limits.worker_inactivity_ms,
       ...(built.conn ? { routeEvents: new RouteEventFollower(built.conn) } : {}),
       ...(ctx.signal ? { signal: ctx.signal } : {}),
       onEvent: (e) => {
@@ -247,7 +255,7 @@ export function registerPlannerWorker(
         .toISOString()
         .replace(/[-:.TZ]/g, "")
         .slice(0, 14)}`;
-      const executor = executorFor(ctx, selected.host, selected.config, selected, missionId);
+      const executor = await executorFor(ctx, selected.host, selected.config, selected, missionId);
       await report(ctx, missionId, () =>
         executor.run({
           mission_id: missionId,
@@ -271,7 +279,7 @@ export function registerPlannerWorker(
         conn: null,
       };
       ctx.ui.notify(`[${missionId}] resuming planner-worker mission`, "info");
-      await report(ctx, missionId, () => executorFor(ctx, host, config, built, missionId).resume());
+      await report(ctx, missionId, async () => (await executorFor(ctx, host, config, built, missionId)).resume());
       return true;
     },
   };

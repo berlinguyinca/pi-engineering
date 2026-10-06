@@ -26,9 +26,11 @@ import { basename, dirname, join } from "node:path";
 import { promisify } from "node:util";
 import type { WorkerRole } from "../core/types.ts";
 import { GitRepo, type WorktreeInfo } from "../git/GitRepo.ts";
+import { workerInactivityMs, workerTimeoutMs } from "../orchestration/broker.ts";
 import { Scheduler } from "../sched/Scheduler.ts";
 import { DEFAULT_STAGE_INACTIVITY_MS, runWithInactivityGuard } from "../verify/Verifier.ts";
-import type { WorkerExecutor, WorkerRequest, WorkerRun } from "../workers/WorkerExecutor.ts";
+import type { WorkerActivity, WorkerExecutor, WorkerRequest, WorkerRun } from "../workers/WorkerExecutor.ts";
+import { WAITING_FOR_INFERENCE_SUMMARY } from "../workers/activity.ts";
 import { planTransition } from "./compatibility.ts";
 import { dagLayers, scopeConflict } from "./contract.ts";
 import { ConvergenceTracker, nextLadderAction, observeAttempt } from "./convergence.ts";
@@ -110,6 +112,12 @@ export interface PlannerWorkerOptions {
    * limit: a command that keeps printing runs as long as it needs.
    */
   verificationInactivityMs?: number;
+  /**
+   * A worker showing no activity for this long is treated as hung and
+   * aborted. Default `workerInactivityMs()` (1 h; PI_ENGINEERING_WORKER_INACTIVITY_MS).
+   */
+  workerInactivityMs?: number;
+  /** Opt-in total-duration limit per worker; none by default (`workerTimeoutMs()`). */
   workerTimeoutMs?: number;
   /** Fast-forward the checkout to the integrated result when it is clean. Default true. */
   applyToCheckout?: boolean;
@@ -821,14 +829,10 @@ export class PlannerWorkerExecutor {
     for (let guard = 0; guard < 8; guard++) {
       await this.syncRoutes(task, role);
       const t0 = Date.now();
-      const run = await this.opts.worker.run({
-        ...req,
-        ...(resolved ? { modelOverride: resolved.model } : {}),
-        ...(this.opts.signal ? { signal: this.opts.signal } : {}),
-        ...(this.opts.workerTimeoutMs ? { timeoutMs: this.opts.workerTimeoutMs } : {}),
-      });
+      const run = await this.watched({ ...req, ...(resolved ? { modelOverride: resolved.model } : {}) });
       this.telemetry.invocation(role, modelName(resolved), run, Date.now() - t0);
       this.observeRoute(run, role, task);
+      if (this.opts.signal?.aborted) return run;
       const availability = run.result.status === "failed" ? availabilityOf(run) : null;
       if (!availability || !resolved) return run;
       const decision = decideAvailability(availability.code, strikes, availability.retryAfterMs);
@@ -849,6 +853,61 @@ export class PlannerWorkerExecutor {
       strikes = 0;
     }
     throw new Error(`${role} for ${task}: model availability did not settle`);
+  }
+
+  /**
+   * Run one worker under its own liveness watchdog, whether or not the mission
+   * has an abort signal: the worker is aborted (`InactivityError`) only after
+   * `workerInactivityMs` with no activity at all. Any activity re-arms it, and
+   * while THIS worker reports it is waiting for inference capacity the window
+   * stays open however long the wait lasts — another worker's queue never
+   * hides this one hanging. The worker always gets an owner signal, so the
+   * executor's standalone fallback guard never applies, and waits for
+   * gateway capacity without a retry cap. A total-duration limit exists only
+   * when the operator opts in (`workerTimeoutMs`).
+   */
+  private async watched(req: WorkerRequest): Promise<WorkerRun> {
+    const ctl = new AbortController();
+    const mission = this.opts.signal;
+    const onMissionAbort = (): void => ctl.abort(mission?.reason);
+    if (mission?.aborted) onMissionAbort();
+    else mission?.addEventListener("abort", onMissionAbort, { once: true });
+    const windowMs = this.opts.workerInactivityMs ?? workerInactivityMs();
+    let lastActivity = Date.now();
+    let waitingForInference = false;
+    const onActivity = (event: WorkerActivity): void => {
+      if (event.kind !== "heartbeat") {
+        lastActivity = Date.now();
+        waitingForInference = event.summary === WAITING_FOR_INFERENCE_SUMMARY;
+      }
+      req.onActivity?.(event);
+    };
+    const watchdog = setInterval(
+      () => {
+        if (ctl.signal.aborted) return;
+        const now = Date.now();
+        if (waitingForInference) lastActivity = now;
+        else if (now - lastActivity >= windowMs) {
+          ctl.abort(new DOMException(`worker showed no activity for ${windowMs}ms (hung worker)`, "InactivityError"));
+        }
+      },
+      Math.max(5, Math.min(30_000, Math.floor(windowMs / 4))),
+    );
+    const limit = this.opts.workerTimeoutMs ?? workerTimeoutMs();
+    const deadline =
+      limit === undefined
+        ? undefined
+        : setTimeout(
+            () => ctl.abort(new DOMException(`worker exceeded its configured ${limit}ms limit`, "TimeoutError")),
+            limit,
+          );
+    try {
+      return await this.opts.worker.run({ ...req, signal: ctl.signal, onActivity, unboundedInferenceWait: true });
+    } finally {
+      clearInterval(watchdog);
+      if (deadline) clearTimeout(deadline);
+      mission?.removeEventListener("abort", onMissionAbort);
+    }
   }
 
   /**

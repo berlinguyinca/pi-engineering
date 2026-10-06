@@ -426,6 +426,14 @@ ${TOOL_TRANSITION_RULE}`;
       //   * GATEWAY saturation (429 inference_admission) is deliberately NOT a
       //     transient category — see classifyError. It is handled below, where
       //     the gateway's own advertised wait is honoured process-wide.
+      // Queuing for a slot is waiting for inference capacity: tell the owner,
+      // per worker, so the wait is never mistaken for a hang.
+      if (gatewayConfig.enabled) {
+        const status = admission.status();
+        if (status.active >= Math.max(1, status.concurrency) || status.cooldownMs > 0) {
+          emitWorkerActivity(req, { kind: "state", summary: WAITING_FOR_INFERENCE_SUMMARY, meaningfulProgress: false });
+        }
+      }
       const slot = gatewayConfig.enabled ? await admission.acquire() : null;
       let transientOutcome: Awaited<
         ReturnType<typeof withTransientRetry<Awaited<ReturnType<typeof this.runSingleAttempt>>>>
@@ -885,20 +893,17 @@ ${recovery.recoveryPrompt}`;
 
     const streaming = new StreamingActivityThrottle();
     // Standalone callers (no owner signal) get an INACTIVITY guard, not a
-    // total-duration one: every session event re-arms it, and time spent
-    // waiting on the model gateway never counts. A long, busy session is never
-    // cut off for being long.
+    // total-duration one: every session event re-arms it. A long, busy session
+    // is never cut off for being long. It runs only while THIS worker holds an
+    // admission slot (its gateway waits happen between attempts, when no
+    // guard is armed), so another caller queued for capacity elsewhere in the
+    // process must not keep a hung session alive.
     const inactivityMs = req.timeoutMs ?? 300_000;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const armInactivity = (): void => {
       if (req.signal) return;
       if (timer) clearTimeout(timer);
       timer = setTimeout(() => {
-        const admission = this.admission.status();
-        if (admission.waiting > 0 || admission.cooldownMs > 0) {
-          armInactivity();
-          return;
-        }
         timedOut = true;
         void session.abort();
       }, inactivityMs);

@@ -154,3 +154,104 @@ test("a standalone worker keeps its finite gateway hold budget", async () => {
   });
   assert.equal(requests, 3, "one attempt plus two honoured waits");
 });
+
+/** A gateway that accepts every request and never answers (a hung model server). */
+async function withSilentGateway(
+  admission: AdmissionController,
+  body: (executor: PiWorkerExecutor, cwd: string) => Promise<void>,
+): Promise<void> {
+  const server = createServer((req: IncomingMessage) => {
+    req.resume();
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = (server.address() as AddressInfo).port;
+  const dir = mkdtempSync(join(tmpdir(), "pi-silent-gateway-"));
+  writeFileSync(
+    join(dir, "models.json"),
+    JSON.stringify({
+      providers: {
+        silent: {
+          baseUrl: `http://127.0.0.1:${port}/v1`,
+          api: "openai-completions",
+          apiKey: "k",
+          models: [{ id: "silent-model", contextWindow: 100_000, maxTokens: 4096 }],
+        },
+      },
+    }),
+  );
+  const executor = new PiWorkerExecutor({
+    agentDir: dir,
+    aps: false,
+    gatewayConfig: resolveGatewayConfig({ enabled: true, maxRetries: 2, jitterMs: 0 }),
+    admission,
+    transientSleep: async () => {},
+    transientRand: () => 0,
+  });
+  try {
+    await body(executor, dir);
+  } finally {
+    server.closeAllConnections();
+    server.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test("another worker queued for capacity does not hide this worker hanging", async () => {
+  const admission = new AdmissionController({ maxConcurrency: 4, jitterMs: 0 });
+  // Some other caller in the process is parked behind the gateway for a minute.
+  const other = new AbortController();
+  const parked = admission.noteCallerWaitAndSleep(
+    { retryAfterMs: 60_000, source: "body", retryable: true, reason: "queue_timeout" },
+    { signal: other.signal },
+  );
+  try {
+    await withSilentGateway(admission, async (executor, cwd) => {
+      assert.ok(admission.status().waiting > 0, "the process has a caller waiting for inference");
+      const started = Date.now();
+      const run = await executor.run({
+        role: "implementer",
+        task: "t",
+        tools: [],
+        cwd,
+        modelOverride: { provider: "silent", id: "silent-model" },
+        timeoutMs: 600,
+      });
+      const took = Date.now() - started;
+      assert.equal(run.result.status, "failed");
+      assert.ok(took >= 550, `not before the window (${took}ms)`);
+      assert.ok(took < 30_000, `the hung worker is caught although another caller waits (${took}ms)`);
+    });
+  } finally {
+    other.abort();
+    await parked;
+  }
+});
+
+test("a worker queued for an admission slot reports that it is waiting for inference capacity", async () => {
+  const admission = new AdmissionController({ maxConcurrency: 1, jitterMs: 0 });
+  const held = await admission.acquire();
+  const activity: WorkerActivity[] = [];
+  const owner = new AbortController();
+  await withSilentGateway(admission, async (executor, cwd) => {
+    const pending = executor.run({
+      role: "implementer",
+      task: "t",
+      tools: [],
+      cwd,
+      modelOverride: { provider: "silent", id: "silent-model" },
+      signal: owner.signal,
+      unboundedInferenceWait: true,
+      onActivity: (event) => activity.push(event),
+    });
+    for (let i = 0; i < 50 && activity.length === 0; i++) await new Promise((r) => setTimeout(r, 20));
+    assert.equal(activity[0]?.summary, WAITING_FOR_INFERENCE_SUMMARY, "the slot wait is liveness for the owner");
+    held.release();
+    for (let i = 0; i < 100 && activity.length < 2; i++) await new Promise((r) => setTimeout(r, 20));
+    assert.ok(
+      activity.slice(1).some((event) => event.summary !== WAITING_FOR_INFERENCE_SUMMARY),
+      "once admitted, the worker's own activity ends the wait",
+    );
+    owner.abort();
+    await pending;
+  });
+});

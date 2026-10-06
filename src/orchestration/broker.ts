@@ -31,7 +31,7 @@ import type {
   WorktreeInfo,
 } from "../git/GitRepo.ts";
 import type { WorkerActivity } from "../workers/WorkerExecutor.ts";
-import { sanitizeWorkerActivity } from "../workers/activity.ts";
+import { WAITING_FOR_INFERENCE_SUMMARY, sanitizeWorkerActivity } from "../workers/activity.ts";
 import type { CheckpointProgressClaim } from "../workers/checkpointProgressTool.ts";
 import type { CheckpointManager, CheckpointSnapshot } from "./checkpoints.ts";
 import { EvidenceUnavailableError, buildCandidateEvidenceIdentity } from "./evidence.ts";
@@ -450,7 +450,10 @@ export interface BrokerOptions {
    * never counts. Default `workerInactivityMs()`.
    */
   inactivityTimeoutMs?: number;
-  /** Whether the process is waiting on the model gateway right now. Default: the shared admission controller. */
+  /**
+   * Extra probe: true keeps every execution's window open. Default none — an
+   * execution is waiting only while its own worker reports it.
+   */
   inferenceWaiting?: () => boolean;
   /** Git provider used to allocate isolated worktrees for mutating tasks. */
   git?: GitRepo | null;
@@ -574,7 +577,10 @@ export class ExecutionBroker {
     if (!Number.isFinite(this.inactivityTimeoutMs) || this.inactivityTimeoutMs <= 0) {
       throw new Error("ExecutionBroker inactivityTimeoutMs must be finite and positive");
     }
-    this.inferenceWaiting = opts.inferenceWaiting ?? processWaitingForInference;
+    // Per execution by default: each execution's own "waiting for inference
+    // capacity" activity keeps its window open. A process-wide probe would let
+    // one queued worker hide every other worker hanging.
+    this.inferenceWaiting = opts.inferenceWaiting ?? (() => false);
     this.git = opts.git ?? null;
     this.baseRef = opts.baseRef ?? "";
     this.resolveRepository = opts.resolveRepository;
@@ -2239,6 +2245,8 @@ export class ExecutionBroker {
           // execution settles, so they never outlive it.
           const activityStartedAt = Date.now();
           let lastActivityAt = activityStartedAt;
+          // THIS execution's worker last said it is waiting for inference capacity.
+          let waitingForInference = false;
           // Hung-worker detection: abort only after a full inactivity window
           // with no worker activity. Waiting on the model gateway is liveness,
           // not silence, so it keeps the window open however long it lasts.
@@ -2247,11 +2255,11 @@ export class ExecutionBroker {
                 () => {
                   if (abort.signal.aborted) return;
                   const at = Date.now();
-                  let waiting = false;
+                  let waiting = waitingForInference;
                   try {
-                    waiting = this.inferenceWaiting();
+                    waiting ||= this.inferenceWaiting();
                   } catch {
-                    waiting = false;
+                    // an injected probe failing never counts as waiting
                   }
                   if (waiting) {
                     lastActivityAt = at;
@@ -2450,7 +2458,10 @@ export class ExecutionBroker {
             for (const claim of safe.claims ?? []) {
               checkpointClaims.set(claim.deliverable, claim);
             }
-            if (safe.kind !== "heartbeat") lastActivityAt = Date.now();
+            if (safe.kind !== "heartbeat") {
+              lastActivityAt = Date.now();
+              waitingForInference = safe.summary === WAITING_FOR_INFERENCE_SUMMARY;
+            }
             if (safe.meaningfulProgress && input.checkpointPolicy?.activity_milestone) {
               meaningfulActivity++;
               if (meaningfulActivity % input.checkpointPolicy.activity_milestone === 0) queueCheckpoint();
