@@ -58,6 +58,11 @@ export class RoleModelTelemetry {
     else if (outcome === "escalated") r.escalations += 1;
   }
 
+  /** Continue from persisted rows (mission resume). */
+  seed(rows: RoleModelMetrics[]): void {
+    for (const r of rows) this.rows.set(`${r.role}\u0000${r.model}`, { ...r });
+  }
+
   list(): RoleModelMetrics[] {
     return [...this.rows.values()].map((r) => ({ ...r }));
   }

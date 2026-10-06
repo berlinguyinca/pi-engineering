@@ -13,6 +13,7 @@
  * as MODEL_TRANSITION events in the same log and checked for context fit.
  */
 
+import { stat } from "node:fs/promises";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { createRoleRouter } from "../capability/adapter.ts";
@@ -44,9 +45,9 @@ export interface PlannerWorkerHost {
 export interface PlannerWorkerIntegration {
   /** Run `request` in planner-worker mode when selected; false lets `/mission` continue. */
   runIfSelected(request: string, ctx: ExtensionCommandContext): Promise<boolean>;
+  /** Resume an interrupted planner-worker mission (`PW-…`); false when it is not one. */
+  resumeIfOwned(missionId: string, ctx: ExtensionCommandContext): Promise<boolean>;
 }
-
-type Notify = (text: string, level: "info" | "error") => void;
 
 /** Handle one of the `/engineering-*` commands; returns the operator text. */
 export async function engineeringCommand(
@@ -147,12 +148,8 @@ export function registerPlannerWorker(
     });
   }
 
-  /** Decide whether planner-worker runs; null keeps the existing /mission flow. */
-  async function select(request: string, ctx: ExtensionCommandContext) {
-    const host = await deps.host(ctx);
-    const config = await loadPlannerWorkerConfig(host.repoRoot);
-    const requested = await effectiveMode(host.repoRoot, config);
-    if (requested === "single") return null;
+  /** Role resolution for this host: gateway catalogue, then static role pins. */
+  async function resolverFor(ctx: ExtensionCommandContext, repoRoot: string, config: PlannerWorkerConfig) {
     const provider = config.provider ?? ctx.model?.provider;
     if (!provider) return null;
     const conn = await gatewayFor(ctx, provider);
@@ -164,16 +161,80 @@ export function registerPlannerWorker(
       // A short deadline: the mode decision must not stall /mission.
       loadCatalog: conn ? () => fetchCatalog({ ...conn, timeoutMs: 5_000 }) : async () => [],
       fallback: async (role, exclude) => {
-        router ??= createRoleRouter({ cwd: host.repoRoot });
+        router ??= createRoleRouter({ cwd: repoRoot });
         const adapter = await router.catch(() => null);
         return adapter?.route(STATIC_ROUTER_ROLE[role] as RoleName, {
           exclude: exclude.map((id) => ({ provider, id })),
         });
       },
     });
-    const decision = await chooseExecutionMode(requested, request, resolver);
+    return { resolver, conn };
+  }
+
+  /** Decide whether planner-worker runs; null keeps the existing /mission flow. */
+  async function select(request: string, ctx: ExtensionCommandContext) {
+    const host = await deps.host(ctx);
+    const config = await loadPlannerWorkerConfig(host.repoRoot);
+    const requested = await effectiveMode(host.repoRoot, config);
+    if (requested === "single") return null;
+    const built = await resolverFor(ctx, host.repoRoot, config);
+    if (!built) return null;
+    const decision = await chooseExecutionMode(requested, request, built.resolver);
     if (decision.mode === "single") return null;
-    return { host, config, resolver, conn, reason: decision.reason };
+    return { host, config, ...built, reason: decision.reason };
+  }
+
+  function executorFor(
+    ctx: ExtensionCommandContext,
+    host: PlannerWorkerHost,
+    config: PlannerWorkerConfig,
+    built: { resolver: RoleResolver; conn: { baseUrl: string; apiKey?: string } | null },
+    missionId: string,
+  ): PlannerWorkerExecutor {
+    return new PlannerWorkerExecutor({
+      repoRoot: host.repoRoot,
+      worker: host.worker,
+      resolver: built.resolver,
+      stateDir: join(plannerWorkerDir(host.repoRoot), missionId),
+      concurrency: config.concurrency,
+      ladder: config.ladder,
+      convergence: config.convergence,
+      ...(built.conn ? { routeEvents: new RouteEventFollower(built.conn) } : {}),
+      ...(ctx.signal ? { signal: ctx.signal } : {}),
+      onEvent: (e) => {
+        if (e.type !== "contract" || e.status === "passed" || e.status === "failed" || e.status === "escalated") {
+          ctx.ui.notify(
+            `[${missionId}] ${e.task_id ? `${e.task_id}: ` : ""}${e.status ?? ""} ${e.text}`.trim(),
+            "info",
+          );
+        }
+      },
+    });
+  }
+
+  async function report(ctx: ExtensionCommandContext, missionId: string, work: () => Promise<PlannerWorkerReport>) {
+    let r: PlannerWorkerReport;
+    try {
+      r = await work();
+    } catch (error) {
+      ctx.ui.notify(
+        `planner-worker mission failed: ${error instanceof Error ? error.message : String(error)}`,
+        "error",
+      );
+      return;
+    }
+    const passed = r.contracts.filter((c) => c.status === "passed").length;
+    ctx.ui.notify(
+      [
+        `Mission ${missionId} [${r.status}] ${passed}/${r.contracts.length} contracts passed, ${r.transitions.length} model transitions, ${r.replans} replans`,
+        r.failure_reason ? `Reason: ${r.failure_reason}` : "",
+        r.status === "completed" ? "" : `Resume with /mission resume ${missionId}`,
+        "Details: /engineering-status, /engineering-plan, /engineering-workers",
+      ]
+        .filter(Boolean)
+        .join("\n"),
+      r.status === "completed" ? "info" : "error",
+    );
   }
 
   return {
@@ -181,53 +242,36 @@ export function registerPlannerWorker(
       // Any failure while deciding falls back to the existing orchestrator.
       const selected = await select(request, ctx).catch(() => null);
       if (!selected) return false;
-      const { host, config, resolver, conn } = selected;
-      const notify: Notify = (text, level) => ctx.ui.notify(text, level);
-      notify(`engineering mode: planner-worker (${selected.reason})`, "info");
+      ctx.ui.notify(`engineering mode: planner-worker (${selected.reason})`, "info");
       const missionId = `PW-${new Date()
         .toISOString()
         .replace(/[-:.TZ]/g, "")
         .slice(0, 14)}`;
-      const executor = new PlannerWorkerExecutor({
-        repoRoot: host.repoRoot,
-        worker: host.worker,
-        resolver,
-        stateDir: join(plannerWorkerDir(host.repoRoot), missionId),
-        concurrency: config.concurrency,
-        ladder: config.ladder,
-        convergence: config.convergence,
-        ...(conn ? { routeEvents: new RouteEventFollower(conn) } : {}),
-        ...(ctx.signal ? { signal: ctx.signal } : {}),
-        onEvent: (e) => {
-          if (e.type !== "contract" || e.status === "passed" || e.status === "failed" || e.status === "escalated") {
-            notify(`[${missionId}] ${e.task_id ? `${e.task_id}: ` : ""}${e.status ?? ""} ${e.text}`.trim(), "info");
-          }
-        },
-      });
-      let report: PlannerWorkerReport;
-      try {
-        report = await executor.run({
+      const executor = executorFor(ctx, selected.host, selected.config, selected, missionId);
+      await report(ctx, missionId, () =>
+        executor.run({
           mission_id: missionId,
           summary: request,
           architectural_context: [],
           acceptance_criteria: [],
           constraints: [],
-        });
-      } catch (error) {
-        notify(`planner-worker mission failed: ${error instanceof Error ? error.message : String(error)}`, "error");
-        return true;
-      }
-      const passed = report.contracts.filter((c) => c.status === "passed").length;
-      notify(
-        [
-          `Mission ${missionId} [${report.status}] ${passed}/${report.contracts.length} contracts passed, ${report.transitions.length} model transitions, ${report.replans} replans`,
-          report.failure_reason ? `Reason: ${report.failure_reason}` : "",
-          "Details: /engineering-status, /engineering-plan, /engineering-workers",
-        ]
-          .filter(Boolean)
-          .join("\n"),
-        report.status === "completed" ? "info" : "error",
+        }),
       );
+      return true;
+    },
+
+    async resumeIfOwned(missionId, ctx) {
+      if (!/^PW-[\w.-]+$/.test(missionId)) return false;
+      const host = await deps.host(ctx);
+      const stateDir = join(plannerWorkerDir(host.repoRoot), missionId);
+      if (!(await stat(join(stateDir, "state.json")).catch(() => null))) return false;
+      const config = await loadPlannerWorkerConfig(host.repoRoot);
+      const built = (await resolverFor(ctx, host.repoRoot, config)) ?? {
+        resolver: new RoleResolver({ provider: "default", config: config.roles }),
+        conn: null,
+      };
+      ctx.ui.notify(`[${missionId}] resuming planner-worker mission`, "info");
+      await report(ctx, missionId, () => executorFor(ctx, host, config, built, missionId).resume());
       return true;
     },
   };

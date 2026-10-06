@@ -76,6 +76,14 @@ export class TransitionLog {
     return event;
   }
 
+  /** Continue from persisted events (mission resume); nothing is re-written. */
+  seed(events: ModelTransitionEvent[]): void {
+    for (const e of events) {
+      this.events.push(e);
+      this.lastByKey.set(e.task, e.to);
+    }
+  }
+
   list(): ModelTransitionEvent[] {
     return [...this.events];
   }

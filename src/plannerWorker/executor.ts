@@ -21,8 +21,8 @@
 
 import { execFile, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdir, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { basename, dirname, join } from "node:path";
 import { promisify } from "node:util";
 import type { WorkerRole } from "../core/types.ts";
 import { GitRepo, type WorktreeInfo } from "../git/GitRepo.ts";
@@ -104,6 +104,7 @@ export interface PlannerWorkerOptions {
   convergence?: ConvergenceConfig;
   /** Concurrent contracts (existing scheduler limit). Default 2. */
   concurrency?: number;
+  /** Optional per-command limit; none by default (no wall-clock mission budgets). */
   verificationTimeoutMs?: number;
   workerTimeoutMs?: number;
   /** Fast-forward the checkout to the integrated result when it is clean. Default true. */
@@ -140,8 +141,12 @@ async function git(cwd: string, args: string[]): Promise<{ code: number; stdout:
   }
 }
 
-/** Run one verification command in a worktree (real child process). */
-export function runVerification(command: string, cwd: string, timeoutMs = 300_000): Promise<VerificationRun> {
+/**
+ * Run one verification command in a worktree (real child process). No
+ * wall-clock limit unless the caller configures one: missions are bounded by
+ * attempts and convergence, not time.
+ */
+export function runVerification(command: string, cwd: string, timeoutMs?: number): Promise<VerificationRun> {
   const started = Date.now();
   return new Promise((resolve) => {
     const child = spawn("sh", ["-c", command], { cwd, env: verificationEnv() });
@@ -151,7 +156,7 @@ export function runVerification(command: string, cwd: string, timeoutMs = 300_00
     };
     child.stdout.on("data", keep);
     child.stderr.on("data", keep);
-    const timer = setTimeout(() => child.kill("SIGKILL"), timeoutMs);
+    const timer = timeoutMs !== undefined ? setTimeout(() => child.kill("SIGKILL"), timeoutMs) : undefined;
     child.on("close", (code, signal) => {
       clearTimeout(timer);
       const exit = code ?? (signal ? 124 : 1);
@@ -188,6 +193,7 @@ export class PlannerWorkerExecutor {
   private plannerModel: string | null = null;
   private replans = 0;
   private finalFixUsed = false;
+  private baseCommit = "";
   private applied = false;
   /** Worktrees of contracts superseded by a replan, removed at cleanup. */
   private readonly retired: WorktreeInfo[] = [];
@@ -219,19 +225,107 @@ export class PlannerWorkerExecutor {
     this.repo = repo;
     await this.opts.resolver.refresh();
     const base = await repo.headCommit();
+    this.baseCommit = base;
     this.integration = await repo.createWorktree(base, `pi-eng-pw-${slug(brief.mission_id)}`);
     try {
       if (!(await this.planMission())) return await this.finish("failed");
-      await this.executeDag();
-      if (this.status === "running") await this.finalReview();
-      if (this.status === "running") {
-        await this.apply(base);
-        return await this.finish("completed");
-      }
-      return await this.finish(this.status);
+      return await this.proceed();
     } finally {
       await this.cleanup();
     }
+  }
+
+  /** Execute the DAG, review the whole, apply. Shared by `run` and `resume`. */
+  private async proceed(): Promise<PlannerWorkerReport> {
+    await this.executeDag();
+    if (this.status === "running") await this.finalReview();
+    if (this.status === "running") {
+      await this.apply(this.baseCommit);
+      return await this.finish("completed");
+    }
+    return await this.finish(this.status);
+  }
+
+  /**
+   * Resume an interrupted mission from `stateDir/state.json`, contract by
+   * contract: contracts whose merge is in the integration branch stay passed
+   * (never re-run); everything else restarts from pending on the integration
+   * head. Works after a clean abort and after a crash that left worktrees.
+   */
+  async resume(): Promise<PlannerWorkerReport> {
+    const saved = JSON.parse(await readFile(join(this.opts.stateDir, "state.json"), "utf8")) as ResumableState;
+    if (!saved.brief || !saved.integration_branch || !saved.base_commit) {
+      throw new Error(`${this.opts.stateDir} has no resumable planner-worker state`);
+    }
+    if (saved.status === "completed") throw new Error(`mission ${saved.mission_id} already completed`);
+    this.brief = saved.brief;
+    this.started = Date.now();
+    const repo = await GitRepo.open(this.opts.repoRoot);
+    if (!repo) throw new Error(`${this.opts.repoRoot} is not a git repository`);
+    this.repo = repo;
+    await this.opts.resolver.refresh();
+    this.baseCommit = saved.base_commit;
+    this.integration = await this.reattachIntegration(saved.integration_branch, saved.integration_path);
+    try {
+      this.plan = saved.plan;
+      this.replans = saved.replans ?? 0;
+      this.finalFixUsed = saved.contracts.some((c) => c.contract.task_id === "final-fix");
+      this.telemetry.seed(saved.metrics ?? []);
+      this.transitions.seed(saved.transitions ?? []);
+      const integrated = (await git(this.integration.path, ["log", "--format=%s"])).stdout;
+      let kept = 0;
+      for (const prior of saved.contracts) {
+        const id = prior.contract.task_id;
+        const merged = prior.changed_files.length === 0 || integrated.includes(`pw: integrate ${id}\n`);
+        if (prior.status === "passed" && merged) {
+          if (prior.worktree) await this.dropWorktree({ path: prior.worktree, branch: this.branchFor(id) });
+          this.addContract(prior.contract);
+          const rt = this.contracts.get(id)!;
+          rt.state = { ...prior, worktree: null };
+          this.results.set(id, { task_id: id, summary: prior.summary, changed_files: prior.changed_files });
+          kept++;
+          continue;
+        }
+        // Interrupted, failed or never integrated: discard its worktree and start over.
+        if (prior.worktree) await this.dropWorktree({ path: prior.worktree, branch: this.branchFor(id) });
+        else await git(this.opts.repoRoot, ["branch", "-D", this.branchFor(id)]);
+        this.addContract(prior.contract);
+        const rt = this.contracts.get(id)!;
+        rt.state.history = [
+          ...prior.history,
+          { at: new Date().toISOString(), from: prior.status, to: "pending", note: "resumed after interruption" },
+        ];
+      }
+      this.emit({
+        type: "phase",
+        text: `resumed: ${kept} passed contract(s) kept, ${this.contracts.size - kept} to run`,
+      });
+      await this.persist();
+      return await this.proceed();
+    } finally {
+      await this.cleanup();
+    }
+  }
+
+  /** Re-open the mission's integration branch in a worktree (reusing a live one). */
+  private async reattachIntegration(branch: string, path: string | undefined): Promise<WorktreeInfo> {
+    if ((await git(this.opts.repoRoot, ["rev-parse", "--verify", "-q", `refs/heads/${branch}`])).code !== 0) {
+      throw new Error(`integration branch ${branch} is gone; the mission cannot be resumed`);
+    }
+    const target = path ?? join(dirname(this.repo.root), `pi-eng-resume-${branch}`);
+    const live = (await git(target, ["rev-parse", "--abbrev-ref", "HEAD"])).stdout.trim() === branch;
+    if (live) {
+      // A crash may have left a half-finished merge: drop it, keep the commits.
+      await git(target, ["merge", "--abort"]);
+      await git(target, ["reset", "-q", "--hard", "HEAD"]);
+      return { path: target, branch };
+    }
+    await git(this.opts.repoRoot, ["worktree", "remove", "--force", target]);
+    if (basename(target).startsWith("pi-eng-")) await rm(target, { recursive: true, force: true });
+    // -f: a crashed worktree whose directory vanished may still register the branch.
+    const add = await git(this.opts.repoRoot, ["worktree", "add", "-f", target, branch]);
+    if (add.code !== 0) throw new Error(`cannot reattach ${branch}: ${add.stderr.trim()}`);
+    return { path: target, branch };
   }
 
   // ---------------------------------------------------------------- planning
@@ -1192,7 +1286,10 @@ export class PlannerWorkerExecutor {
     const snapshot = () => ({
       ...this.report(),
       status: this.status,
+      brief: this.brief,
+      base_commit: this.baseCommit,
       integration_branch: this.integration?.branch ?? null,
+      integration_path: this.integration?.path ?? null,
       plan: this.plan,
       updated_at: new Date().toISOString(),
     });
@@ -1215,6 +1312,21 @@ function verificationEnv(): NodeJS.ProcessEnv {
     env[k] = v;
   }
   return env;
+}
+
+/** What `resume` reads back from state.json. */
+interface ResumableState {
+  mission_id: string;
+  status: string;
+  brief?: MissionBrief;
+  base_commit?: string;
+  integration_branch?: string;
+  integration_path?: string;
+  plan: PlannerOutput;
+  contracts: ContractState[];
+  transitions?: PlannerWorkerReport["transitions"];
+  metrics?: PlannerWorkerReport["metrics"];
+  replans?: number;
 }
 
 function slug(s: string): string {

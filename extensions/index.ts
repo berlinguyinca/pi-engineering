@@ -1741,6 +1741,7 @@ ${RECOVERY_PROMPT}`;
           ctx.ui.notify("/mission resume <missionId>", "error");
           return;
         }
+        if (await plannerWorker.resumeIfOwned(missionId, ctx)) return;
         try {
           activeControl?.missionProgress(`[mission ${missionId}] resuming`);
           await rt.resumeBlockedMission(missionId, ctx.signal);
