@@ -156,8 +156,29 @@ export interface LifecycleConfig {
   notify: boolean;
 }
 
+/**
+ * Mission time limits. There is deliberately NO default duration cap: a
+ * mission, its tasks, workers and recovery run as long as they show activity
+ * ("if it takes 8h, then it takes 8h"), and the user cancelling is the only
+ * thing that ends a healthy mission early. The caps below are opt-in.
+ */
+export interface MissionLimitsConfig {
+  /** OPT-IN ceiling on one task execution's wall-clock time (ms). Unset = unlimited. */
+  max_task_wall_clock_ms?: number;
+  /** OPT-IN ceiling on a whole mission's wall-clock time (ms). Unset = unlimited. */
+  max_mission_wall_clock_ms?: number;
+  /**
+   * Hung-worker detection: a worker with no activity at all (no tool, model
+   * output, checkpoint, or inference-wait signal) for this long is resumed
+   * from its checkpoint. Default 1 hour.
+   */
+  worker_inactivity_ms: number;
+}
+
 export interface EngineeringPolicy {
   version: number;
+  /** Mission time limits (opt-in caps + the hung-worker window). */
+  limits: MissionLimitsConfig;
   /** Dotted keys from the global layer that repository config cannot weaken. */
   mandatory: string[];
   lifecycle: LifecycleConfig;
@@ -186,6 +207,9 @@ export interface EngineeringPolicy {
 
 export const DEFAULT_POLICY: EngineeringPolicy = {
   version: 1,
+  limits: {
+    worker_inactivity_ms: 3_600_000,
+  },
   mandatory: [
     "policies.review.require_independent_review",
     "policies.review.independent_reviewer",
@@ -355,7 +379,14 @@ function setPath(target: Plain, dotted: string, value: unknown): void {
   cur[parts[parts.length - 1] as string] = value;
 }
 
+/** Optional numeric fields: validated only when set (unset means unlimited). */
+const OPTIONAL_NUMBER_RANGE_FIELDS: Record<string, [number, number]> = {
+  "limits.max_task_wall_clock_ms": [60_000, 2_147_483_647],
+  "limits.max_mission_wall_clock_ms": [60_000, 2_147_483_647],
+};
+
 const NUMBER_RANGE_FIELDS: Record<string, [number, number]> = {
+  "limits.worker_inactivity_ms": [60_000, 2_147_483_647],
   "lifecycle.max_remediation_rounds": [0, 20],
   "lifecycle.budget_ms": [10_000, 7_200_000],
   "lifecycle.max_concurrency": [1, 16],
@@ -391,6 +422,18 @@ export function validatePolicy(policy: EngineeringPolicy): PolicyIssue[] {
       issues.push({ path, message: `expected a number between ${min} and ${max}`, severity: "error" });
     } else if (v < min || v > max) {
       issues.push({ path, message: `${v} is outside the allowed range ${min}..${max}`, severity: "error" });
+    }
+  }
+
+  for (const [path, [min, max]] of Object.entries(OPTIONAL_NUMBER_RANGE_FIELDS)) {
+    const v = getPath(flat, path);
+    if (v === undefined || v === null) continue;
+    if (typeof v !== "number" || Number.isNaN(v) || v < min || v > max) {
+      issues.push({
+        path,
+        message: `expected a number between ${min} and ${max}, or unset for no limit`,
+        severity: "error",
+      });
     }
   }
 
@@ -563,6 +606,23 @@ export async function loadPolicy(opts: LoadPolicyOptions): Promise<PolicyLoadRes
   const validation = validatePolicy(policy);
   issues.push(...validation);
   return { policy, issues, sources };
+}
+
+/**
+ * The effective mission time limits for a repository. A policy that fails to
+ * load or validate yields the defaults (no caps, one-hour hung-worker window):
+ * a broken config must never invent a deadline.
+ */
+export async function loadMissionLimits(cwd: string, agentDir?: string): Promise<MissionLimitsConfig> {
+  try {
+    const { policy, issues } = await loadPolicy({ cwd, ...(agentDir ? { agentDir } : {}) });
+    if (issues.some((issue) => issue.severity === "error" && issue.path.startsWith("limits."))) {
+      return { ...DEFAULT_POLICY.limits };
+    }
+    return { ...DEFAULT_POLICY.limits, ...policy.limits };
+  } catch {
+    return { ...DEFAULT_POLICY.limits };
+  }
 }
 
 /** Coerce the policy's admission block into a complete, validated config. */

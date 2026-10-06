@@ -10,7 +10,13 @@ import {
   gateOperation,
   isMutatingTool,
 } from "../../src/lifecycle/destructive.ts";
-import { DEFAULT_POLICY, deepMerge, loadPolicy, validatePolicy } from "../../src/lifecycle/policy.ts";
+import {
+  DEFAULT_POLICY,
+  deepMerge,
+  loadMissionLimits,
+  loadPolicy,
+  validatePolicy,
+} from "../../src/lifecycle/policy.ts";
 
 async function temp(prefix: string): Promise<string> {
   return mkdtemp(join(tmpdir(), prefix));
@@ -249,4 +255,35 @@ test("mutating tools are recognised and shell commands are extracted from tool i
   assert.equal(commandFromToolInput({ command: "kubectl version" }), "kubectl version");
   assert.equal(commandFromToolInput({ path: "src/x.ts" }), undefined);
   assert.equal(commandFromToolInput("kubectl version"), undefined, "a plain string is not a tool input record");
+});
+
+test("mission limits: no duration caps by default, a generous hung-worker window, opt-in caps from engineering.yaml", async () => {
+  assert.equal(DEFAULT_POLICY.limits.max_task_wall_clock_ms, undefined);
+  assert.equal(DEFAULT_POLICY.limits.max_mission_wall_clock_ms, undefined);
+  assert.equal(DEFAULT_POLICY.limits.worker_inactivity_ms, 3_600_000);
+
+  const cwd = await temp("pi-eng-limits-");
+  const agentDir = await temp("pi-eng-limits-agent-");
+  try {
+    assert.deepEqual(await loadMissionLimits(cwd, agentDir), { worker_inactivity_ms: 3_600_000 });
+    await mkdir(join(cwd, ".pi"), { recursive: true });
+    await writeFile(
+      join(cwd, ".pi", "engineering.yaml"),
+      ["limits:", "  worker_inactivity_ms: 7200000", "  max_task_wall_clock_ms: 28800000"].join("\n"),
+    );
+    assert.deepEqual(await loadMissionLimits(cwd, agentDir), {
+      worker_inactivity_ms: 7_200_000,
+      max_task_wall_clock_ms: 28_800_000,
+    });
+    // An invalid limit never invents a deadline: the defaults apply.
+    await writeFile(join(cwd, ".pi", "engineering.yaml"), ["limits:", "  max_task_wall_clock_ms: 5"].join("\n"));
+    const loaded = await loadPolicy({ cwd, agentDir, env: { HOME: agentDir } as NodeJS.ProcessEnv });
+    assert.ok(
+      loaded.issues.some((issue) => issue.path === "limits.max_task_wall_clock_ms" && issue.severity === "error"),
+    );
+    assert.deepEqual(await loadMissionLimits(cwd, agentDir), { worker_inactivity_ms: 3_600_000 });
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+    await rm(agentDir, { recursive: true, force: true });
+  }
 });

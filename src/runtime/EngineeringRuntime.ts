@@ -21,6 +21,7 @@ import type {
 import { ROLE_BUDGETS, isMachineEvidence } from "../core/types.ts";
 import { GitRepo } from "../git/GitRepo.ts";
 import { Ledger } from "../ledger/Ledger.ts";
+import { loadMissionLimits } from "../lifecycle/policy.ts";
 import { workflowMutatesRepo } from "../orchestration/intentRouter.ts";
 import {
   MISSION_SNAPSHOT_FILENAME,
@@ -874,16 +875,25 @@ export class EngineeringRuntime {
             execution_requirements: {},
             acceptance_ids: acceptanceIds,
             deliverables: mutates ? ["implementation", "targeted-tests"] : ["investigation-report"],
-            execution_budget_ms: 30 * 60_000,
+            // No execution_budget_ms: a task runs as long as it shows activity
+            // (an opt-in limits.max_task_wall_clock_ms is applied by the
+            // orchestrator when configured).
             checkpoint_policy: { activity_milestone: 5, before_deadline_ms: 30_000 },
             max_attempts: 3,
             failure_policy: "retry",
           },
         ];
       };
+      const limits = await loadMissionLimits(repoRoot, opts.agentDir);
       rt.orchestrator = new Orchestrator({
         store: rt.missionStore,
         backends,
+        worksetPolicy: { maxTaskBudgetMs: limits.max_task_wall_clock_ms },
+        timeLimits: {
+          // The environment override (PI_ENGINEERING_WORKER_INACTIVITY_MS) wins.
+          workerInactivityMs: process.env.PI_ENGINEERING_WORKER_INACTIVITY_MS ? undefined : limits.worker_inactivity_ms,
+          maxMissionWallClockMs: limits.max_mission_wall_clock_ms,
+        },
         observability: rt.missionObservability,
         planner: opts.orchestrationPlanner ?? defaultPlanner,
         specApproval: opts.orchestrationSpecApproval,
