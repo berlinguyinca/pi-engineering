@@ -46,6 +46,48 @@ The pipeline routes intent, creates a durable **mission**, plans/executes
 workers, runs validation, launches a fresh independent reviewer, and enforces
 the deterministic completion gate — no `/engineer` or `/review` needed.
 
+### Switching the model a mission uses
+
+An explicit switch with `/model` (or model cycling) becomes this session's
+**operator pin**. Every mission started from (or resumed in) this session adopts
+it at its next inference boundary: the next worker dispatch, or a worker that is
+waiting for gateway capacity. A stream already in progress is never interrupted.
+The pin wins over `engineering.yaml` role pins and the capability router for
+every worker role, with two exceptions:
+
+- If the router knows the pinned model cannot serve a role, that role is routed
+  as usual and the mission says why. Reasons include a missing capability such
+  as vision, a context window that is too small, or a model that is unhealthy.
+- An independent reviewer still never runs on the model that produced the work.
+
+The pin is stored on the mission, so it survives a restart. Each adoption is
+logged as a `MODEL_TRANSITION`. `/engineering-status` and mission status show
+`model: X (operator pin)`. To return missions to automatic routing, run
+`/engineering-model auto` or switch back to the model the session started on.
+Missions from other sessions are not affected. Automatic fallback of the
+interactive model (`PI_GATEWAY_MODEL_FALLBACK_ENABLED`) is still off by default,
+and a switch it makes is not an operator pin.
+
+When a mission worker's model runs out of capacity (`queue_deadline_exceeded`,
+`queue_timeout`, `CAPACITY_EXHAUSTED`), the mission keeps waiting with no
+deadline. It shows `model X is out of capacity; … switch with /model to
+continue`, so you can move it without cancelling.
+
+`/refresh-models` probes each model with one minimal request: 32 tokens, no
+streaming, no tools, no images. A model whose probe gets HTTP 400 is retried
+once without the optional parameters (`temperature`, `reasoning_effort`). Each
+model gets its own verdict:
+
+- **working**: applied.
+- **excluded**: 404, `model_not_found`, or an empty answer. Pruned.
+- **rejected**: still 400, 413 or 422 after the retry.
+- **inconclusive**: 429, 5xx or a timeout.
+
+Rejected and inconclusive models keep their configured entry, are never added,
+and are listed with the gateway's own error text. Only an authentication or
+account-wide refusal stops a provider's refresh. In that case its configuration
+is left as it was.
+
 ## Planner/worker execution mode
 
 `/mission` can split a mission across models by cognitive role. A planner turns
@@ -93,7 +135,8 @@ restart.
 | `/mission G`   | Orchestration mission pipeline (intent → plan → execute → validate → review → complete). |
 | `/mission-status` | Show orchestration mission/task/execution status.          |
 | `/engineering-mode [m]` | Show or set the execution mode (`auto`, `planner-worker`, `single`). |
-| `/engineering-status` / `-plan` / `-workers` | Planner/worker mission status, contract DAG, role/model telemetry. |
+| `/engineering-status` / `-plan` / `-workers` | Planner/worker mission status, contract DAG, role/model telemetry. `-status` also shows the session's mission model (`model: X (operator pin)`). |
+| `/engineering-model [auto]` | Show the model this session's missions use; `auto` clears the operator pin set by `/model`. |
 | `/engineer G`  | Full adaptive workflow (scout → implement → verify → review). |
 | `/tournament G [n]` | Candidate tournament: n independent implementations, verify+review each, promote the deterministic winner (default 3, `--parallel` opt-in). |
 | `/plan G`      | Decompose `G` into a dependency-aware task DAG (recorded in the ledger). |

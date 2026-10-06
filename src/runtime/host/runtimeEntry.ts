@@ -17,8 +17,10 @@ import { existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import legacyFactory from "../../../extensions/index.ts";
+import { RuntimeSession } from "../isolation/RuntimeSession.ts";
 import { withReloadShutdown } from "../isolation/reloadCustody.ts";
 import { RUNTIME_STATE_SCHEMA, readStateSchema, schemaCompatibility } from "../migrations/schema.ts";
+import { sessionModelChoice } from "../operatorModelPin.ts";
 import {
   type EngineeringRuntime,
   PI_ENGINEERING_RUNTIME_API,
@@ -98,11 +100,15 @@ export class ExtensionGenerationRuntime implements EngineeringRuntime {
 
   async snapshot(): Promise<RuntimeSnapshot> {
     const missions = await discoverMissionHandover(this.cwd());
+    const pin = sessionModelChoice(RuntimeSession.current().sessionId);
     return {
       generation: this.context.generation,
       activeMissionIds: missions.active,
       pendingMissionIds: missions.pending,
       inferenceWaitMissionIds: missions.inferenceWaits,
+      // The operator pin itself survives a reload on globalThis; the snapshot
+      // records it so a handover shows which model missions follow.
+      ...(pin?.kind === "pin" ? { selectedModels: { operator_pin: `${pin.pin.provider}/${pin.pin.id}` } } : {}),
       runtimePreferences: { quiesced: this.quiesced },
       createdAt: new Date().toISOString(),
     };

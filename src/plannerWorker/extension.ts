@@ -21,6 +21,8 @@ import { createRoleRouter } from "../capability/adapter.ts";
 import type { RoleName } from "../capability/roles.ts";
 import { loadMissionLimits } from "../lifecycle/policy.ts";
 import { workerInactivityMs } from "../orchestration/broker.ts";
+import { RuntimeSession } from "../runtime/isolation/RuntimeSession.ts";
+import { describeModelChoice, sessionModelChoice } from "../runtime/operatorModelPin.ts";
 import type { WorkerExecutor } from "../workers/WorkerExecutor.ts";
 import {
   type PlannerWorkerConfig,
@@ -126,7 +128,12 @@ export function registerPlannerWorker(
         const { repoRoot } = await deps.host(ctx);
         const config = await loadPlannerWorkerConfig(repoRoot);
         const out = await engineeringCommand(name, args, repoRoot, config);
-        ctx.ui.notify(out.text, out.level);
+        // Which model this session's missions run on: the operator pin, if any.
+        const text =
+          name === "status"
+            ? `${describeModelChoice(sessionModelChoice(RuntimeSession.current().sessionId))}\n${out.text}`
+            : out.text;
+        ctx.ui.notify(text, out.level);
       },
     });
   }
