@@ -557,7 +557,23 @@ ${TOOL_TRANSITION_RULE}`;
 
       session.dispose();
 
-      if (captured) {
+      // A reviewer's terminating tool is review_result (it is never given
+      // worker_result): a delivered verdict is a completed review.
+      const reviewDelivered = req.resultTool === "review_result" && structured !== undefined && structured !== null;
+      const result: WorkerResult | undefined =
+        captured ??
+        (reviewDelivered
+          ? {
+              status: "completed",
+              summary: String((structured as { summary?: unknown }).summary ?? "").slice(0, 4000) || "Review recorded.",
+              claims: [],
+              evidence_refs: [],
+              new_hypotheses: [],
+              proposed_tasks: [],
+              details: {},
+            }
+          : undefined);
+      if (result) {
         // Success — record recovery outcome if we were in a retry.
         if (attempt > 0) {
           recordRetryOutcome(this.recoveryTelemetry, true, false);
@@ -568,7 +584,7 @@ ${TOOL_TRANSITION_RULE}`;
         }
         if (gatewayConfig.enabled) admission.noteSuccess();
         const usage = this.collectUsage(this.asMessages(session.messages));
-        return { result: captured, usage, toolCalls, structured };
+        return { result, usage, toolCalls, structured };
       }
 
       // Gateway saturation: honour the wait the gateway reported, hold every
