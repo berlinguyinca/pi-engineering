@@ -32,6 +32,7 @@ import { MissionObservability } from "../orchestration/observability/MissionObse
 import { Orchestrator } from "../orchestration/orchestrator.ts";
 import type { OrchestratorOptions, PlanTaskInput } from "../orchestration/orchestrator.ts";
 import { MissionOwnership } from "../orchestration/ownership.ts";
+import { missionCustodyKey } from "../orchestration/ownership.ts";
 import { type RouteModel, realBackends } from "../orchestration/realBackends.ts";
 import { FailureClassifier } from "../orchestration/recovery.ts";
 import { RepositoryRegistry } from "../orchestration/repositoryRegistry.ts";
@@ -40,7 +41,6 @@ import { MissionSupervisor, type SupervisorStatus } from "../orchestration/super
 import type { Mission, MissionStop } from "../orchestration/types.ts";
 import { WorkspaceManifestResolver } from "../orchestration/workspaceManifest.ts";
 import { tasksConflict, topoSort } from "../plan/taskDag.ts";
-import { JsonlEventStore } from "../platform/eventstore/jsonl.ts";
 import { redactSecrets } from "../platform/redact.ts";
 import { resolveGatewayResilienceConfig } from "../resilience/config.ts";
 import {
@@ -55,6 +55,14 @@ import { buildCoreTools } from "../tools/coreTools.ts";
 import { CommandVerifier, type VerificationProvider, type VerifyOutcome } from "../verify/Verifier.ts";
 import { PiWorkerExecutor } from "../workers/PiWorkerExecutor.ts";
 import type { WorkerExecutor, WorkerRequest } from "../workers/WorkerExecutor.ts";
+import { type RuntimeBinding, resolveRuntimeBinding } from "./isolation/RuntimeBinding.ts";
+import { RuntimeSession } from "./isolation/RuntimeSession.ts";
+import { resolveWorktreeIdentity } from "./isolation/WorktreeIdentity.ts";
+import {
+  type OrchestrationNamespace,
+  namespaceKey,
+  openOrchestrationNamespace,
+} from "./isolation/orchestrationNamespace.ts";
 import { UnavailableModels, createRouteModel, followUnavailableModels } from "./modelRouting.ts";
 
 /**
@@ -269,10 +277,11 @@ const PHASE_FOR_ROLE: Partial<Record<WorkerRole, RuntimePhaseEvent["phase"]>> = 
  * participant, so a throwing or slow one must not affect an engineering run.
  */
 /**
- * Opened orchestration event stores by path, so multiple runtimes over one
- * repo share a single durable store (the JSONL backend is single-instance).
+ * Opened orchestration namespaces by key, so multiple runtimes over one
+ * worktree in this process share one session writer, mission store, and
+ * custody set.
  */
-const openedOrchestrationStores = new Map<string, JsonlEventStore>();
+const openedOrchestrationStores = new Map<string, OrchestrationNamespace>();
 /** Live mission state owners shared by sequential runtimes for one work dir. */
 const openedMissionStores = new Map<string, MissionStore>();
 const openedMissionObservability = new Map<string, MissionObservability>();
@@ -397,34 +406,6 @@ export interface EngineeringRuntimeOptions {
 }
 
 /**
- * Resolve the directory that holds the durable orchestration store
- * (`orchestration.jsonl`) and, with it, the store's single-writer file lock.
- *
- * By default this is the runtime workDir (`<repoRoot>/.pi-eng`), so the store
- * lives in the git toplevel of the session's launch directory. That is a FIXED
- * location: when several pi sessions are launched from a shared parent
- * directory (one per project / branch / worktree) they all resolve to the SAME
- * store and therefore serialize on one writer lock — a session working on
- * worktree A cannot start a mission while a session working on worktree B holds
- * the parent store, even though the two never touch the same files.
- *
- * Setting `PI_ENGINEERING_ORCHESTRATION_DIR` relocates the store (and its lock)
- * to a per-worktree / per-session directory, so concurrent sessions each own an
- * independent single-writer store and run in parallel. Sessions launched from
- * WITHIN a worktree already get this automatically (their git toplevel is the
- * worktree); this override covers sessions launched from a shared parent.
- *
- * The override changes only the orchestration store location. The engineering
- * ledger, artifact store, and mission snapshot stay in the workDir so shared
- * per-repo memory is preserved across concurrent sessions.
- */
-function resolveOrchestrationDir(workDir: string): string {
-  const override = process.env.PI_ENGINEERING_ORCHESTRATION_DIR;
-  if (override && override.trim() !== "") return resolve(override);
-  return workDir;
-}
-
-/**
  * The Engineering Runtime facade. Owns the ledger, artifact store, context
  * broker, git provider, verifier, and worker executor for one repository, and
  * exposes the vertical-slice workflows: scout, implement, verify, review,
@@ -482,7 +463,10 @@ export class EngineeringRuntime {
   private currentPhaseGoal = "";
   private snapshotPublishPending: Promise<MissionSnapshotFile | null> | null = null;
   private snapshotPublishDirty = false;
+  /** In-process key of the orchestration namespace this runtime shares. */
   private orchestrationPath: string | null = null;
+  /** Where this runtime's orchestration namespace lives (worktree / override / fallback). */
+  runtimeBinding: RuntimeBinding | null = null;
   private closed = false;
   private openReferences = 1;
   private readonly missionResumeFlights = new Map<string, Promise<import("../orchestration/types.ts").Mission>>();
@@ -709,15 +693,20 @@ export class EngineeringRuntime {
     const git = await GitRepo.open(opts.cwd);
     const repoRoot = git ? git.root : opts.cwd;
     const workDir = opts.workDir ?? join(repoRoot, ".pi-eng");
-    const orchestrationDir = resolveOrchestrationDir(workDir);
-    const openKey = `${resolve(repoRoot)}\0${resolve(workDir)}\0${resolve(orchestrationDir)}`;
+    // Orchestration state is namespaced by git WORKTREE identity (common dir +
+    // worktree root), never by launch directory or repository name, and every
+    // session writes its own stream, so concurrent sessions never contend.
+    const session = RuntimeSession.current();
+    const identity = await resolveWorktreeIdentity(repoRoot);
+    const binding = resolveRuntimeBinding({ identity, workDir, sessionId: session.sessionId });
+    const openKey = `${resolve(repoRoot)}\0${resolve(workDir)}\0${namespaceKey(binding)}`;
     const existing = openingRuntimes.get(openKey);
     if (existing) {
       const runtime = await existing;
       runtime.retainOpenReference();
       return runtime;
     }
-    const opening = EngineeringRuntime.openResolved(opts, git, repoRoot, workDir, orchestrationDir);
+    const opening = EngineeringRuntime.openResolved(opts, git, repoRoot, workDir, binding, session);
     openingRuntimes.set(openKey, opening);
     try {
       return await opening;
@@ -733,7 +722,8 @@ export class EngineeringRuntime {
     git: GitRepo | null,
     repoRoot: string,
     workDir: string,
-    orchestrationDir: string,
+    binding: RuntimeBinding,
+    session: RuntimeSession,
   ): Promise<EngineeringRuntime> {
     await mkdir(workDir, { recursive: true });
     const ledger = await Ledger.create(join(workDir, "ledger.jsonl"));
@@ -746,22 +736,21 @@ export class EngineeringRuntime {
     rt.git = git;
     rt.workDir = workDir;
     // Orchestration: durable mission store + orchestrator wired to the existing
-    // worker/verifier/git primitives. Restart-recoverable via the JSONL store.
-    // The store (and its single-writer lock) lives in `orchestrationDir`, which
-    // defaults to the workDir but may be relocated by
-    // PI_ENGINEERING_ORCHESTRATION_DIR so concurrent sessions working on
-    // different worktrees do not serialize on one fixed parent store. Runtimes
-    // over the same store path share it; the JSONL backend is single-instance
-    // per process, so reuse an already-open store for the same path (a second
-    // runtime must not open the same file).
-    await mkdir(orchestrationDir, { recursive: true });
-    const orchestrationPath = join(orchestrationDir, "orchestration.jsonl");
+    // worker/verifier/git primitives. Restart-recoverable via the session event
+    // streams of this worktree's namespace (merged on read). Runtimes over the
+    // same namespace in this process share one writer, mission store and
+    // custody set. A legacy `.pi-eng/orchestration.jsonl` is imported, never
+    // modified.
+    const orchestrationPath = namespaceKey(binding);
+    rt.runtimeBinding = binding;
     try {
-      let orchestrationBackend = openedOrchestrationStores.get(orchestrationPath);
-      if (!orchestrationBackend) {
-        orchestrationBackend = await JsonlEventStore.open(orchestrationPath);
-        openedOrchestrationStores.set(orchestrationPath, orchestrationBackend);
+      let namespace = openedOrchestrationStores.get(orchestrationPath);
+      if (!namespace) {
+        namespace = await openOrchestrationNamespace({ binding, sessionId: session.sessionId });
+        openedOrchestrationStores.set(orchestrationPath, namespace);
       }
+      const orchestrationBackend = namespace.backend;
+      const custody = namespace.custody;
       openedOrchestrationStoreReferences.set(
         orchestrationPath,
         (openedOrchestrationStoreReferences.get(orchestrationPath) ?? 0) + 1,
@@ -770,7 +759,8 @@ export class EngineeringRuntime {
       rt.missionStore = openedMissionStores.get(orchestrationPath) ?? MissionStore.open(orchestrationBackend);
       openedMissionStores.set(orchestrationPath, rt.missionStore);
       rt.missionOwnership = new MissionOwnership(rt.missionStore, {
-        ownerId: `runtime-${process.pid}-${randomUUID()}`,
+        ownerId: `session-${session.sessionId}-${randomUUID()}`,
+        custody,
       });
       for (const mission of rt.missionStore.listMissions()) {
         const manifest = rt.missionStore.getWorkspaceManifest(mission.mission_id);
@@ -935,10 +925,22 @@ export class EngineeringRuntime {
       // dispatch repair workers, so every fallible backend and every semantic
       // tool binding must already be ready. The same consumer handles startup,
       // explicit ticks, and interval ticks.
+      const supervisedStore = rt.missionStore;
       rt.missionSupervisor = new MissionSupervisor({
-        store: rt.missionStore,
+        store: supervisedStore,
         observability: rt.missionObservability,
         onStatuses: (statuses) => rt.consumeSupervisorStatuses(statuses),
+        // Other live sessions in this worktree see the same missions; each
+        // mission is supervised only by its custodian, and a dead custodian's
+        // missions are adopted automatically.
+        beforeTick: () => {
+          supervisedStore.syncExternal();
+        },
+        admit: async (mission) => {
+          const claim = await custody.claim(missionCustodyKey(mission.mission_id));
+          if (claim.ok) supervisedStore.syncExternal();
+          return claim.ok;
+        },
       });
       await rt.missionSupervisor.reconcileOnStartup();
       rt.missionSupervisor.start();
@@ -950,7 +952,21 @@ export class EngineeringRuntime {
     }
   }
 
-  /** Release this runtime's share of the orchestration writer lock. Idempotent. */
+  /**
+   * The logical orchestration event stream of this runtime's namespace: every
+   * session's stream (and imported legacy history) merged, with this session's
+   * unflushed appends included once they land. Consumers must use this rather
+   * than reading a particular JSONL file.
+   */
+  orchestrationEvents(): import("../platform/eventstore/backend.ts").StoredEvent[] {
+    const namespace = this.orchestrationPath ? openedOrchestrationStores.get(this.orchestrationPath) : undefined;
+    if (!namespace) return [];
+    const backend = namespace.backend as typeof namespace.backend & { refresh?: () => unknown };
+    backend.refresh?.();
+    return backend.all();
+  }
+
+  /** Release this runtime's share of its orchestration namespace. Idempotent. */
   async close(): Promise<void> {
     if (this.closed) return;
     if (this.openReferences > 1) {
@@ -1215,8 +1231,12 @@ export class EngineeringRuntime {
     openedOrchestrationStoreReferences.delete(path);
     openedMissionObservability.delete(path);
     openedMissionStores.delete(path);
-    openedOrchestrationStores.get(path)?.close();
+    const namespace = openedOrchestrationStores.get(path);
     openedOrchestrationStores.delete(path);
+    if (namespace) {
+      void namespace.custody.releaseAll().catch(() => undefined);
+      namespace.backend.close();
+    }
   }
 
   actor(runId: string, role?: WorkerRole): Actor {

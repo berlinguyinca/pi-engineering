@@ -1,3 +1,4 @@
+import type { MissionCustody } from "../runtime/isolation/MissionCustody.ts";
 import type { MissionStore } from "./missionStore.ts";
 import type { MissionLease, RepositoryLease } from "./types.ts";
 
@@ -6,7 +7,16 @@ export interface MissionOwnershipOptions {
   leaseMs?: number;
   heartbeatMs?: number;
   now?: () => number;
+  /**
+   * Cross-process custody. With per-session event streams several live
+   * sessions see the same missions; only the custodian of a mission (and of a
+   * repository) may take a lease on it. Omitted for single-writer stores.
+   */
+  custody?: MissionCustody;
 }
+
+export const missionCustodyKey = (missionId: string): string => `mission:${missionId}`;
+export const repositoryCustodyKey = (repoId: string): string => `repository:${repoId}`;
 
 export type OwnershipIdentity = MissionLease | RepositoryLease;
 
@@ -31,6 +41,7 @@ export class MissionOwnership {
   private readonly leaseMs: number;
   private readonly heartbeatMs: number;
   private readonly now: () => number;
+  private readonly custody: MissionCustody | undefined;
   private readonly missionHolders = new Map<string, number>();
   private readonly repositoryHolders = new Map<string, number>();
 
@@ -47,6 +58,19 @@ export class MissionOwnership {
       throw new Error("MissionOwnership heartbeatMs must be positive and shorter than leaseMs");
     }
     this.now = options.now ?? Date.now;
+    this.custody = options.custody;
+  }
+
+  /** Claim custody of a resource and catch up on other sessions' events. */
+  private async claimCustody(resource: string, what: string): Promise<void> {
+    if (!this.custody) return;
+    const claim = await this.custody.claim(resource);
+    if (!claim.ok) throw new Error(`${what} is in the custody of another live session (${claim.holder})`);
+    this.store.syncExternal();
+  }
+
+  private releaseCustody(resource: string): void {
+    void this.custody?.release(resource).catch(() => undefined);
   }
 
   async maintain(identity: MissionLease, repoId?: string): Promise<DispatchAuthority> {
@@ -57,6 +81,7 @@ export class MissionOwnership {
 
   async acquire(missionId: string, options: { resumptionGeneration?: number } = {}): Promise<MissionLease> {
     this.assertWriterAuthority();
+    await this.claimCustody(missionCustodyKey(missionId), `mission ${missionId}`);
     const current = this.store.getMissionLease(missionId);
     const now = this.now();
     if (current && !this.isExpired(current, now)) {
@@ -129,6 +154,7 @@ export class MissionOwnership {
   async acquireRepository(identity: MissionLease, repoId: string): Promise<RepositoryLease> {
     this.assertWriterAuthority();
     this.assertAuthoritative(identity);
+    await this.claimCustody(repositoryCustodyKey(repoId), `repository ${repoId}`);
     const current = this.store.getRepositoryLeaseByRepoId(repoId);
     const now = this.now();
     if (current && !this.isExpired(current, now)) {
@@ -213,6 +239,11 @@ export class MissionOwnership {
       this.store.transitionMissionLease("fenced", identity);
     }
     await this.store.flush();
+    // Custody follows the durable lease: once it is fenced and flushed, another
+    // live session may take the resource over.
+    this.releaseCustody(
+      isRepositoryIdentity(identity) ? repositoryCustodyKey(identity.repoId) : missionCustodyKey(identity.missionId),
+    );
   }
 
   assertAuthoritative(identity: OwnershipIdentity): void {

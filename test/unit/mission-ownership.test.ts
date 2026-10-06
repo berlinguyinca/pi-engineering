@@ -9,7 +9,19 @@ import { MissionOwnership } from "../../src/orchestration/ownership.ts";
 import type { EventStoreBackend, StoredEvent } from "../../src/platform/eventstore/backend.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 import { EngineeringRuntime } from "../../src/runtime/EngineeringRuntime.ts";
+import { resolveRuntimeBinding } from "../../src/runtime/isolation/RuntimeBinding.ts";
+import { RuntimeSession } from "../../src/runtime/isolation/RuntimeSession.ts";
+import { SessionEventStore } from "../../src/runtime/isolation/SessionEventStore.ts";
+import { resolveWorktreeIdentity } from "../../src/runtime/isolation/WorktreeIdentity.ts";
 import { FakeWorkerExecutor } from "../../src/workers/FakeWorkerExecutor.ts";
+
+/** Probe: does this process still hold the runtime's session event writer? */
+function sessionWriter(runtime: EngineeringRuntime): () => boolean {
+  const eventsDir = runtime.runtimeBinding?.eventsDir;
+  if (!eventsDir) throw new Error("runtime has no durable namespace");
+  const sessionId = RuntimeSession.current().sessionId;
+  return () => SessionEventStore.isOpen(eventsDir, sessionId);
+}
 
 function mission(store: MissionStore, missionId: string) {
   return store.createMission({
@@ -281,7 +293,6 @@ describe("MissionOwnership", () => {
   it("keeps a shared runtime writer lock until the final runtime closes", async () => {
     const root = await mkdtemp(join(tmpdir(), "pie-runtime-ownership-"));
     const workDir = join(root, ".pi-eng");
-    const file = join(workDir, "orchestration.jsonl");
     const first = await EngineeringRuntime.open({
       cwd: root,
       workDir,
@@ -293,18 +304,16 @@ describe("MissionOwnership", () => {
       worker: new FakeWorkerExecutor({}),
     });
 
+    const writer = sessionWriter(first);
     await first.close();
-    await assert.rejects(() => JsonlEventStore.open(file), /already open|writer lock/i);
+    assert.equal(writer(), true, "the shared session writer outlives the first close");
     await second.close();
-
-    const afterFinalClose = await JsonlEventStore.open(file);
-    afterFinalClose.close();
+    assert.equal(writer(), false, "the final close releases the session writer");
   });
 
   it("accounts for every concurrent open of the single-flight runtime", async () => {
     const root = await mkdtemp(join(tmpdir(), "pie-runtime-concurrent-ownership-"));
     const workDir = join(root, ".pi-eng");
-    const file = join(workDir, "orchestration.jsonl");
     const [first, second] = await Promise.all([
       EngineeringRuntime.open({
         cwd: root,
@@ -319,18 +328,16 @@ describe("MissionOwnership", () => {
     ]);
     assert.strictEqual(first, second);
 
+    const writer = sessionWriter(first);
     await first.close();
-    await assert.rejects(() => JsonlEventStore.open(file), /already open|writer lock/i);
+    assert.equal(writer(), true, "every concurrent open holds a reference");
     await second.close();
-
-    const reopened = await JsonlEventStore.open(file);
-    reopened.close();
+    assert.equal(writer(), false);
   });
 
   it("rolls back the writer reference when runtime initialization fails", async () => {
     const root = await mkdtemp(join(tmpdir(), "pie-runtime-failed-open-"));
     const workDir = join(root, ".pi-eng");
-    const file = join(workDir, "orchestration.jsonl");
     await assert.rejects(
       () =>
         EngineeringRuntime.open({
@@ -342,14 +349,14 @@ describe("MissionOwnership", () => {
       /memoryWorkerConcurrency/,
     );
 
-    const reopened = await JsonlEventStore.open(file);
-    reopened.close();
+    const sessionId = RuntimeSession.current().sessionId;
+    const binding = resolveRuntimeBinding({ identity: await resolveWorktreeIdentity(root), workDir, sessionId });
+    assert.equal(SessionEventStore.isOpen(binding.eventsDir!, sessionId), false, "no writer reference leaks");
   });
 
   it("keeps close retryable when flushing fails", async () => {
     const root = await mkdtemp(join(tmpdir(), "pie-runtime-close-retry-"));
     const workDir = join(root, ".pi-eng");
-    const file = join(workDir, "orchestration.jsonl");
     const runtime = await EngineeringRuntime.open({
       cwd: root,
       workDir,
@@ -364,13 +371,13 @@ describe("MissionOwnership", () => {
       await originalFlush();
     };
 
+    const writer = sessionWriter(runtime);
     await assert.rejects(() => runtime.close(), /injected close flush failure/);
     assert.strictEqual(runtime.missionStore, store, "failed close must leave the runtime usable");
-    await assert.rejects(() => JsonlEventStore.open(file), /already open|writer lock/i);
+    assert.equal(writer(), true, "a failed close keeps the session writer");
 
     await runtime.close();
-    const reopened = await JsonlEventStore.open(file);
-    reopened.close();
+    assert.equal(writer(), false);
   });
 
   it("does not let lease release failure mask a completed mission outcome", async () => {

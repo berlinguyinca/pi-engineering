@@ -47,6 +47,16 @@ export interface MissionSupervisorOptions {
   onError?: (diagnostic: SupervisorDiagnostic) => void | Promise<void>;
   /** Consume settled durable decisions. Called for startup and every periodic/explicit tick. */
   onStatuses?: (statuses: SupervisorStatus[]) => void | Promise<void>;
+  /**
+   * Runs before each tick lists missions (e.g. to catch up on events other
+   * sessions appended to a shared namespace).
+   */
+  beforeTick?: () => void | Promise<void>;
+  /**
+   * Whether THIS supervisor may act on a mission. Several live sessions can see
+   * one mission; only its custodian reconciles it. Defaults to every mission.
+   */
+  admit?: (mission: Mission) => boolean | Promise<boolean>;
 }
 
 export interface SupervisorDiagnostic {
@@ -86,6 +96,8 @@ export class MissionSupervisor {
   private readonly intervalMs: number;
   private readonly onError?: (diagnostic: SupervisorDiagnostic) => void | Promise<void>;
   private readonly onStatuses?: (statuses: SupervisorStatus[]) => void | Promise<void>;
+  private readonly beforeTick?: () => void | Promise<void>;
+  private readonly admit?: (mission: Mission) => boolean | Promise<boolean>;
   private readonly supervisorDiagnostics: SupervisorDiagnostic[] = [];
   private timer?: ReturnType<typeof setInterval>;
   private readonly missionTicks = new Map<string, Promise<SupervisorStatus>>();
@@ -102,6 +114,8 @@ export class MissionSupervisor {
     this.intervalMs = options.intervalMs ?? 30_000;
     this.onError = options.onError;
     this.onStatuses = options.onStatuses;
+    this.beforeTick = options.beforeTick;
+    this.admit = options.admit;
     if (!Number.isFinite(this.intervalMs) || this.intervalMs <= 0) {
       throw new Error("MissionSupervisor intervalMs must be positive");
     }
@@ -141,12 +155,15 @@ export class MissionSupervisor {
   }
 
   async reconcileOnStartup(beforeDispatch?: () => void | Promise<void>): Promise<SupervisorStatus[]> {
+    // Catch up BEFORE pinning generations, and not again inside this tick: a
+    // generation another session advances mid-startup must not fail the open.
+    await this.beforeTick?.();
     const expectedGenerations = new Map(
-      this.store
-        .listMissions((mission) => !TERMINAL.has(mission.status))
-        .map((mission) => [mission.mission_id, this.currentResumptionGeneration(mission.mission_id)] as const),
+      (await this.admitted(this.store.listMissions((mission) => !TERMINAL.has(mission.status)))).map(
+        (mission) => [mission.mission_id, this.currentResumptionGeneration(mission.mission_id)] as const,
+      ),
     );
-    const statuses = await this.tick();
+    const statuses = await this.tick(undefined, { catchUp: false });
     this.assertExpectedGenerations(expectedGenerations);
     await this.store.flush();
     this.assertExpectedGenerations(expectedGenerations);
@@ -155,23 +172,24 @@ export class MissionSupervisor {
     return statuses;
   }
 
-  tick(missionId?: string): Promise<SupervisorStatus[]> {
+  tick(missionId?: string, options: { catchUp?: boolean } = {}): Promise<SupervisorStatus[]> {
     if (!this.acceptingTicks) return Promise.reject(new Error("MissionSupervisor is shutting down"));
-    const flight = this.runTick(missionId).finally(() => {
+    const flight = this.runTick(missionId, options.catchUp ?? true).finally(() => {
       this.activeTicks.delete(flight);
     });
     this.activeTicks.add(flight);
     return flight;
   }
 
-  private async runTick(missionId?: string): Promise<SupervisorStatus[]> {
-    const flights = this.store
+  private async runTick(missionId: string | undefined, catchUp: boolean): Promise<SupervisorStatus[]> {
+    if (catchUp) await this.beforeTick?.();
+    const candidates = this.store
       .listMissions((mission) => !TERMINAL.has(mission.status))
-      .filter((mission) => (missionId ? mission.mission_id === missionId : true))
-      .map((mission) => ({
-        mission,
-        expectedResumptionGeneration: this.currentResumptionGeneration(mission.mission_id),
-      }));
+      .filter((mission) => (missionId ? mission.mission_id === missionId : true));
+    const flights = (await this.admitted(candidates)).map((mission) => ({
+      mission,
+      expectedResumptionGeneration: this.currentResumptionGeneration(mission.mission_id),
+    }));
     const statuses = await Promise.all(
       flights.map(({ mission, expectedResumptionGeneration }) =>
         this.reconcileFlight(mission, expectedResumptionGeneration),
@@ -187,6 +205,14 @@ export class MissionSupervisor {
     await this.onStatuses?.(statuses);
     await this.store.flush();
     return statuses;
+  }
+
+  /** The missions this supervisor may act on (its custody), in input order. */
+  private async admitted(missions: Mission[]): Promise<Mission[]> {
+    const admit = this.admit;
+    if (!admit) return missions;
+    const verdicts = await Promise.all(missions.map((mission) => admit(mission)));
+    return missions.filter((_, index) => verdicts[index]);
   }
 
   private reconcileFlight(mission: Mission, expectedResumptionGeneration: number): Promise<SupervisorStatus> {

@@ -458,6 +458,9 @@ async function repoCacheKey(cwd: string): Promise<string> {
   return key;
 }
 
+/** The real reason the runtime did not open, by cwd, for tool results. */
+const runtimeOpenFailures = new Map<string, string>();
+
 /**
  * Resolve tools to the runtime for the calling cwd, opening it lazily so the
  * semantic tools work in the interactive session without a prior command.
@@ -466,19 +469,17 @@ async function resolveServices(cwd: string): Promise<CoreServices | null> {
   let rt: EngineeringRuntime;
   try {
     rt = await getRuntimeByCwd(cwd);
+    runtimeOpenFailures.delete(cwd);
   } catch (error) {
-    // Surface the REAL reason the runtime did not open (most commonly the
-    // orchestration store's single-writer lock being held by another session
-    // launched from the same parent directory) instead of a bare "not
-    // initialized" — and point the operator at the remedy.
+    // Concurrency is not a failure mode any more (per-session event streams,
+    // automatic stale-owner recovery), so what reaches here is a genuine
+    // filesystem/permission problem. Surface the REAL reason — in the tool
+    // result too — and never ask the operator to tune internal coordination.
     const message = error instanceof Error ? error.message : String(error);
-    const held = /writer lock/i.test(message);
-    const remedy = held
-      ? " Set PI_ENGINEERING_ORCHESTRATION_DIR to a per-worktree directory (or launch the session from within the worktree) so concurrent sessions do not share one orchestration store lock."
-      : ".";
+    runtimeOpenFailures.set(cwd, message);
     const notice: TelemetryNotice = {
       level: "warning",
-      text: `Engineering runtime did not open for ${cwd}: ${message}${remedy}`,
+      text: `Engineering runtime did not open for ${cwd}: ${message}`,
       key: `runtime-open:${cwd}`,
     };
     if (allowRuntimeDiagnostic(notice)) emitTelemetry(notice);
@@ -580,7 +581,9 @@ export default function (pi: ExtensionAPI) {
     });
   }
   // Semantic tools resolved against the runtime for the calling cwd.
-  for (const tool of buildCoreTools(resolveServices)) {
+  for (const tool of buildCoreTools(resolveServices, {
+    unavailableReason: (cwd) => runtimeOpenFailures.get(cwd) ?? null,
+  })) {
     pi.registerTool(tool);
   }
 

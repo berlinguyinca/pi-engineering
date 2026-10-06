@@ -33,8 +33,18 @@ export interface CoreServices {
  */
 export function buildCoreTools(
   resolve: (cwd: string) => CoreServices | null | Promise<CoreServices | null>,
+  options: {
+    /** Why services are unavailable for a cwd (the real open failure), surfaced in tool results. */
+    unavailableReason?: (cwd: string) => string | null | undefined;
+  } = {},
 ): ToolDefinition[] {
   const servicesFor = (cwd: string): Promise<CoreServices | null> => Promise.resolve(resolve(cwd));
+  const notInitialized = (subject: string, cwd: string): string => {
+    const reason = options.unavailableReason?.(cwd);
+    return reason
+      ? `${subject} not initialized for this directory: ${reason}`
+      : `${subject} not initialized for this directory.`;
+  };
   const ledgerRead = defineTool({
     name: "ledger_read",
     label: "Ledger Read",
@@ -54,7 +64,7 @@ export function buildCoreTools(
       const services = await servicesFor(ctx.cwd);
       if (!services)
         return {
-          content: [{ type: "text", text: "Engineering runtime not initialized for this directory." }],
+          content: [{ type: "text", text: notInitialized("Engineering runtime", ctx.cwd) }],
           details: {},
         };
       const wi = (params.work_item_id as string | undefined) ?? services.currentWorkItemId();
@@ -132,7 +142,7 @@ export function buildCoreTools(
       const services = await servicesFor(ctx.cwd);
       if (!services)
         return {
-          content: [{ type: "text", text: "Engineering runtime not initialized for this directory." }],
+          content: [{ type: "text", text: notInitialized("Engineering runtime", ctx.cwd) }],
           details: {},
         };
       const ref = params.evidence ? String(params.evidence) : undefined;
@@ -175,7 +185,7 @@ export function buildCoreTools(
       const services = await servicesFor(ctx.cwd);
       if (!services)
         return {
-          content: [{ type: "text", text: "Engineering runtime not initialized for this directory." }],
+          content: [{ type: "text", text: notInitialized("Engineering runtime", ctx.cwd) }],
           details: {},
         };
       const meta = services.artifacts.getByUri(String(params.uri));
@@ -227,7 +237,7 @@ export function buildCoreTools(
       const services = await servicesFor(ctx.cwd);
       if (!services)
         return {
-          content: [{ type: "text", text: "Engineering runtime not initialized for this directory." }],
+          content: [{ type: "text", text: notInitialized("Engineering runtime", ctx.cwd) }],
           details: {},
         };
       if (!services.broker) return { content: [{ type: "text", text: "Not a git repository." }], details: {} };
@@ -253,7 +263,7 @@ export function buildCoreTools(
       const services = await servicesFor(ctx.cwd);
       if (!services)
         return {
-          content: [{ type: "text", text: "Engineering runtime not initialized for this directory." }],
+          content: [{ type: "text", text: notInitialized("Engineering runtime", ctx.cwd) }],
           details: {},
         };
       if (!services.broker) return { content: [{ type: "text", text: "Not a git repository." }], details: {} };
@@ -276,7 +286,7 @@ export function buildCoreTools(
       const services = await servicesFor(ctx.cwd);
       if (!services)
         return {
-          content: [{ type: "text", text: "Engineering runtime not initialized for this directory." }],
+          content: [{ type: "text", text: notInitialized("Engineering runtime", ctx.cwd) }],
           details: {},
         };
       if (!services.broker) return { content: [{ type: "text", text: "Not a git repository." }], details: {} };
@@ -306,7 +316,7 @@ export function buildCoreTools(
       const services = await servicesFor(ctx.cwd);
       if (!services?.orchestrator)
         return {
-          content: [{ type: "text", text: "Orchestrator not initialized for this directory." }],
+          content: [{ type: "text", text: notInitialized("Orchestrator", ctx.cwd) }],
           details: {},
         };
       const request = String(params.request);

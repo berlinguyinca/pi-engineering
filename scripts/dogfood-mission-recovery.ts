@@ -10,6 +10,7 @@ import {
   type MissionSnapshotFile,
   type MissionSnapshotMission,
 } from "../src/orchestration/missionSnapshot.ts";
+import { listStreamFiles } from "../src/runtime/isolation/SessionEventStore.ts";
 
 const exec = promisify(execFile);
 const REQUIRED_MODEL = "local/local";
@@ -631,6 +632,7 @@ async function main(): Promise<void> {
     "Do not access or modify any parent or unrelated project.",
   ].join(" ");
   const extensionArgs = sourceOnly ? ["--no-extensions", "--extension", extension] : [];
+  const orchestrationDir = `${repository}.orchestration`;
   try {
     await exec(
       pi,
@@ -652,6 +654,9 @@ async function main(): Promise<void> {
         maxBuffer: 16 * 1024 * 1024,
         env: {
           ...process.env,
+          // Pin the orchestration namespace next to the temporary repository so
+          // the proof below reads exactly this run's per-session event streams.
+          PI_ENGINEERING_ORCHESTRATION_DIR: orchestrationDir,
           PI_MISSION_DOGFOOD_MODEL: REQUIRED_MODEL,
           PI_ENGINEERING_WORKER_TIMEOUT_MS: process.env.PI_ENGINEERING_WORKER_TIMEOUT_MS ?? "30000",
         },
@@ -677,8 +682,14 @@ async function main(): Promise<void> {
   const snapshot = validateSnapshot(JSON.parse(await readFile(snapshotPath, "utf8")));
   const mission = snapshot.missions.at(-1);
   if (!mission?.id) throw new Error(`Pi produced no durable mission in ${snapshotPath}`);
-  const eventPath = join(repository, ".pi-eng", "orchestration.jsonl");
-  const durableEvents = parseDurableEvents(await readFile(eventPath, "utf8"), eventPath);
+  const eventPath = join(orchestrationDir, "events");
+  // Evidence is parsed strictly from the raw per-session streams (one per Pi
+  // process): a malformed line must fail the proof, not be skipped.
+  const streams = listStreamFiles(eventPath);
+  if (streams.length === 0) throw new Error(`Pi produced no durable event stream in ${eventPath}`);
+  let rawEvents = "";
+  for (const name of streams) rawEvents += await readFile(join(eventPath, name), "utf8");
+  const durableEvents = parseDurableEvents(rawEvents, eventPath);
   const recoveryProof = assertRecoveryDogfood(mission, durableEvents);
   assertActionableOutcome(mission, repository);
 
