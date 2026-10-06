@@ -19,6 +19,7 @@ export type RuntimeEventName =
   | "runtime.recovered"
   | "runtime.degraded"
   | "runtime.stopped"
+  | "runtime.reload_takeover"
   | "session.registered"
   | "session.heartbeat"
   | "session.orphaned"

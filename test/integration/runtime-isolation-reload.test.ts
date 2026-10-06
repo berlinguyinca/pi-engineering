@@ -110,4 +110,36 @@ describe("in-process reload of Pi Engineering", () => {
     assert.equal(reloaded.RuntimeSession.current().generationId, generationBefore);
     await after.close();
   });
+
+  it("hands the session's long-lived objects to the reloaded code: registry instance and heartbeat driver", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-eng-reload-takeover-"));
+    cleanup.push(root);
+    const repo = await makeGitRepo(join(root, `repo-${randomUUID().slice(0, 8)}`));
+    const before = await EngineeringRuntime.open({ cwd: repo, worker: new FakeWorkerExecutor({}) });
+    const generation = RuntimeSession.current().generationId;
+    const state = () =>
+      (globalThis as unknown as Record<symbol, { driverModule: string | null; registry: unknown }>)[
+        Symbol.for("pi-engineering.runtime-session.v2")
+      ]!;
+    assert.equal(state().driverModule, new URL("../../src/runtime/isolation/RuntimeSession.ts", import.meta.url).href);
+    await before.close();
+
+    const reloaded = await reloadedModules();
+    cleanup.push(reloaded.dir);
+    const registryModule = (await import(
+      pathToFileURL(join(reloaded.dir, "src", "runtime", "isolation", "RuntimeRegistry.ts")).href
+    )) as { RuntimeRegistry: new (...args: never[]) => unknown };
+    const after = await reloaded.EngineeringRuntime.open({ cwd: repo, worker: new FakeWorkerExecutor({}) });
+    const session = reloaded.RuntimeSession.current();
+    assert.equal(session.generationId, generation, "same registration: no re-register");
+    assert.ok(session.registry() instanceof registryModule.RuntimeRegistry, "registry re-opened by the new code");
+    assert.equal(
+      state().driverModule,
+      pathToFileURL(join(reloaded.dir, "src", "runtime", "isolation", "RuntimeSession.ts")).href,
+      "heartbeat and exit hook now run the reloaded code",
+    );
+    assert.equal(session.heartbeat(), true, "the re-opened registry still recognizes the registration");
+    assert.equal(session.registry()?.list().length, 1, "still exactly one live session row");
+    await after.close();
+  });
 });
