@@ -238,8 +238,13 @@ export class FailureClassifier {
     if (/budget exhausted|execution budget|deadline exceeded|wall.clock timeout/.test(summary)) {
       return "TASK_BUDGET_EXHAUSTED";
     }
+    // A lost execution lease ("execution X is no longer authoritative") is an
+    // ownership problem, not a credential one; check it before the auth words.
+    if (/no longer authoritative|orphan|no owner|stale owner/.test(summary)) return "ORPHANED_EXECUTION";
+    // `auth` is anchored: unanchored it matched "authoritative" and "author",
+    // turning a recoverable ownership loss into a credential STOP.
     if (
-      /invalid.*(api key|credential|model|config)|model.*(not found|does not exist)|auth|unauthorized|forbidden/.test(
+      /invalid.*(api key|credential|model|config)|model.*(not found|does not exist)|\bauth(?:entication|enticate|orization|orize)?\b|unauthorized|forbidden/.test(
         summary,
       )
     ) {

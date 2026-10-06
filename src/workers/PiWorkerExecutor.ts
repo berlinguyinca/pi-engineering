@@ -71,7 +71,7 @@ import { type RequestBodyBudgetConfig, resolveRequestBodyBudgetConfig } from "..
 import { type ThinkingOffConfig, resolveThinkingOffConfig } from "../request/thinkingPolicy.ts";
 import { emitTelemetry } from "../telemetry/sink.ts";
 import type { WorkerExecutor, WorkerRequest, WorkerRun } from "./WorkerExecutor.ts";
-import { activityFromSessionEvent, emitWorkerActivity } from "./activity.ts";
+import { StreamingActivityThrottle, activityFromSessionEvent, emitWorkerActivity } from "./activity.ts";
 import { checkpointProgressTool } from "./checkpointProgressTool.ts";
 import { registerLocalProviders } from "./localProviders.ts";
 import { WORKER_KICKOFF, buildSystemPrompt, wantsCommitDiscipline } from "./prompts.ts";
@@ -860,7 +860,10 @@ ${recovery.recoveryPrompt}`;
       }
     };
 
+    const streaming = new StreamingActivityThrottle();
     const unsubscribe = session.subscribe((event) => {
+      const streamed = streaming.note(event as { type?: string; message?: unknown });
+      if (streamed) emitWorkerActivity(req, streamed);
       const activity = activityFromSessionEvent(event);
       const activityToolName = "toolName" in event ? event.toolName : undefined;
       if (activity && activityToolName !== terminatingName && activityToolName !== checkpointProgressTool.name) {

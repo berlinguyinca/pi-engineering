@@ -34,3 +34,15 @@ test("worker activity rejects a secret-shaped tool name", () => {
   assert.equal(event?.toolName, "tool");
   assert.doesNotMatch(JSON.stringify(event), /sk-/);
 });
+
+test("streamed tokens count as worker activity, throttled (session review: streaming read as a stall)", async () => {
+  const { StreamingActivityThrottle } = await import("../../src/workers/activity.ts");
+  const throttle = new StreamingActivityThrottle(30_000);
+  const update = { type: "message_update", message: { role: "assistant", content: "secret tokens" } };
+  const first = throttle.note(update, 1_000);
+  assert.deepEqual(first, { kind: "state", summary: "Model streaming", meaningfulProgress: false });
+  assert.equal(throttle.note(update, 20_000), null, "throttled inside the interval");
+  assert.ok(throttle.note(update, 31_001), "emits again after the interval");
+  assert.equal(throttle.note({ type: "message_update", message: { role: "user" } }, 90_000), null);
+  assert.doesNotMatch(JSON.stringify(first), /secret/, "token content never enters mission activity");
+});
