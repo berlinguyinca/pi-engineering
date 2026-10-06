@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { access, readFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import type { ArtifactStore } from "../artifacts/ArtifactStore.ts";
@@ -38,16 +38,44 @@ function trackProcessGroup(pid: number): void {
   });
 }
 
+/** Grace between SIGTERM and SIGKILL for processes a command left behind. */
+const LEFTOVER_GRACE_MS = 2_000;
+
+/** Members of a process group still alive (0 when none; at least 1 if `ps` is unavailable but the group lives). */
+function processGroupSize(pgid: number): number {
+  try {
+    process.kill(-pgid, 0);
+  } catch {
+    return 0;
+  }
+  try {
+    const listing = execFileSync("ps", ["-A", "-o", "pgid=,stat="], { encoding: "utf8" });
+    const members = listing
+      .split("\n")
+      .map((line) => line.trim().split(/\s+/))
+      .filter(([group, stat]) => Number(group) === pgid && !stat?.startsWith("Z"));
+    return Math.max(members.length, 1);
+  } catch {
+    return 1;
+  }
+}
+
 /**
  * Run a command with an INACTIVITY guard instead of a total-duration timeout:
  * every chunk of stdout/stderr re-arms it, so only a silent (hung) command is
  * killed. Resolves with the exit code; never rejects for a non-zero exit.
+ *
+ * When the command itself exits, anything it left running in its process
+ * group (`npm test &`, a dev server a test started, a watcher) is terminated
+ * (SIGTERM, then SIGKILL after a short grace) and counted in
+ * `leftoverProcesses`, so verification never leaves processes behind and a
+ * background child holding the output pipes cannot stall the result.
  */
 export function runWithInactivityGuard(
   command: string,
   args: string[],
   opts: { cwd: string; env?: NodeJS.ProcessEnv; signal?: AbortSignal; inactivityMs: number },
-): Promise<{ code: number; stdout: string; stderr: string; hung: boolean }> {
+): Promise<{ code: number; stdout: string; stderr: string; hung: boolean; leftoverProcesses: number }> {
   return new Promise((resolve, reject) => {
     if (opts.signal?.aborted) {
       reject(Object.assign(new Error("The operation was aborted"), { name: "AbortError" }));
@@ -57,6 +85,8 @@ export function runWithInactivityGuard(
     let stderr = "";
     let hung = false;
     let settled = false;
+    let leftoverProcesses = 0;
+    let leftoverKill: ReturnType<typeof setTimeout> | undefined;
     // Own process group, so a kill reaches grandchildren (npm -> node) that
     // would otherwise hold the output pipes open forever.
     const child = spawn(command, args, {
@@ -103,11 +133,32 @@ export function runWithInactivityGuard(
       settled = true;
       if (groupPid) liveProcessGroups.delete(groupPid);
       if (timer) clearTimeout(timer);
+      if (leftoverKill) clearTimeout(leftoverKill);
       opts.signal?.removeEventListener("abort", onAbort);
       fn();
     };
+    child.on("exit", () => {
+      if (!groupPid) return;
+      // The command is done; whatever remains in its group was left behind.
+      leftoverProcesses = processGroupSize(groupPid);
+      if (leftoverProcesses === 0) return;
+      try {
+        process.kill(-groupPid, "SIGTERM");
+      } catch {
+        return;
+      }
+      leftoverKill = setTimeout(() => {
+        try {
+          process.kill(-groupPid, "SIGKILL");
+        } catch {
+          // Already gone.
+        }
+      }, LEFTOVER_GRACE_MS);
+    });
     child.on("error", (error) =>
-      finish(() => resolve({ code: 1, stdout, stderr: `${stderr}${error.message}`, hung: false })),
+      finish(() =>
+        resolve({ code: 1, stdout, stderr: `${stderr}${error.message}`, hung: false, leftoverProcesses: 0 }),
+      ),
     );
     child.on("close", (code) =>
       finish(() => {
@@ -115,7 +166,7 @@ export function runWithInactivityGuard(
           reject(Object.assign(new Error("The operation was aborted"), { name: "AbortError" }));
           return;
         }
-        resolve({ code: typeof code === "number" ? code : 1, stdout, stderr, hung });
+        resolve({ code: typeof code === "number" ? code : 1, stdout, stderr, hung, leftoverProcesses });
       }),
     );
     arm();
@@ -544,6 +595,7 @@ export class CommandVerifier implements VerificationProvider {
       stdout = res.stdout;
       stderr = res.stderr;
       code = res.hung && res.code === 0 ? 1 : res.code;
+      const leftoverProcesses = res.leftoverProcesses;
       const finishedAt = new Date().toISOString();
       const passed = code === 0;
       const log = `$ ${stage.command} ${stage.args.join(" ")}\n--- stdout ---\n${stdout}\n--- stderr ---\n${stderr}`;
@@ -564,6 +616,12 @@ export class CommandVerifier implements VerificationProvider {
         exitCode: code,
         stdoutBytes: Buffer.byteLength(stdout),
         stderrBytes: Buffer.byteLength(stderr),
+        ...(leftoverProcesses > 0
+          ? {
+              leftoverProcesses,
+              warning: `the command left ${leftoverProcesses} background process${leftoverProcesses === 1 ? "" : "es"} running; terminated after the stage`,
+            }
+          : {}),
       };
       const evidenceId = `EVID-${Math.random().toString(36).slice(2, 8)}`;
       const ev: Evidence = {
