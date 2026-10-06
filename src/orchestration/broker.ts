@@ -2232,7 +2232,11 @@ export class ExecutionBroker {
                     ),
                   Math.max(0, executionDeadlineAt - Date.now()),
                 );
-          timer?.unref?.();
+          // The limit timer and the inactivity watchdog stay referenced: while
+          // an execution is in flight they may be the only thing that will
+          // ever settle it, and an unref'd watchdog lets the event loop drain
+          // with the awaited result still pending. Both are cleared when the
+          // execution settles, so they never outlive it.
           const activityStartedAt = Date.now();
           let lastActivityAt = activityStartedAt;
           // Hung-worker detection: abort only after a full inactivity window
@@ -2264,7 +2268,6 @@ export class ExecutionBroker {
                 Math.max(5, Math.min(30_000, Math.floor(this.inactivityTimeoutMs / 4))),
               )
             : undefined;
-          inactivityTimer?.unref?.();
           let activitySettled = false;
           let activityTimer: ReturnType<typeof setInterval> | undefined;
           let checkpointTimer: ReturnType<typeof setTimeout> | undefined;
