@@ -6,7 +6,14 @@ import { registerInteractiveMemory } from "../../src/blackhole/interactiveMemory
 
 type Handler = (event: any, ctx: ExtensionContext) => any;
 function fixture(
-  options: { configured?: boolean; token?: string; hasUI?: boolean; noticeDir?: string; baseUrl?: string } = {},
+  options: {
+    configured?: boolean;
+    token?: string;
+    hasUI?: boolean;
+    noticeDir?: string;
+    baseUrl?: string;
+    stateDir?: string;
+  } = {},
 ) {
   const commands = new Map<string, { handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> }>();
   const events = new Map<string, Handler>();
@@ -20,6 +27,7 @@ function fixture(
           PI_OPENVIKING_BASE_URL: options.baseUrl ?? "https://memory.example",
           PI_OPENVIKING_TOKEN: options.token ?? "test-key",
         };
+  if (options.stateDir) env.PI_ENGINEERING_STATE_DIR = options.stateDir;
   const store = new InMemoryDurableMemory();
   const queries: string[] = [];
   let saves = 0;
@@ -317,5 +325,29 @@ test("headless automatic memory failures stay out of the transcript and log once
   } finally {
     uninstall();
     rmSync(noticeDir, { recursive: true, force: true });
+  }
+});
+
+test("headless notice markers live in the per-user state dir, private, without the host in clear (PR #106 review)", async () => {
+  const { mkdtempSync, readdirSync, readFileSync, rmSync, statSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { setTelemetrySink } = await import("../../src/telemetry/sink.ts");
+  const stateDir = mkdtempSync(join(tmpdir(), "pi-eng-memory-state-"));
+  const uninstall = setTelemetrySink(() => {});
+  try {
+    const f = fixture({ hasUI: false, stateDir, baseUrl: "https://private-memory.example" });
+    f.fail(new Error("unavailable"));
+    await f.emit("before_agent_start", { prompt: "metric units", systemPrompt: "" });
+    const dir = join(stateDir, "memory-notices");
+    assert.equal(statSync(dir).mode & 0o777, 0o700, "notice dir is private to the user");
+    const markers = readdirSync(dir);
+    assert.equal(markers.length, 1);
+    const marker = join(dir, markers[0]!);
+    assert.equal(statSync(marker).mode & 0o777, 0o600, "marker is private to the user");
+    assert.doesNotMatch(readFileSync(marker, "utf8"), /private-memory/, "the memory host is not written in clear");
+  } finally {
+    uninstall();
+    rmSync(stateDir, { recursive: true, force: true });
   }
 });
