@@ -141,3 +141,26 @@ export class ToolCallGuard {
     }
   }
 }
+
+interface ToolHookHost {
+  on(
+    event: "tool_call",
+    handler: (event: { toolName: string; input: unknown }) => Promise<ToolCallVerdict | undefined>,
+  ): unknown;
+  on(
+    event: "tool_result",
+    handler: (event: { toolName: string; input: unknown; isError: boolean; content?: unknown[] }) => Promise<void>,
+  ): unknown;
+}
+
+/** Attach one guard to a live session's tool_call / tool_result hooks. */
+export function registerToolCallGuard(pi: ToolHookHost, guard: ToolCallGuard = new ToolCallGuard()): ToolCallGuard {
+  pi.on("tool_call", async (event) => guard.onToolCall(String(event.toolName), event.input));
+  pi.on("tool_result", async (event) => {
+    const text = ((event.content ?? []) as { type?: string; text?: string }[])
+      .map((part) => (part?.type === "text" ? (part.text ?? "") : ""))
+      .join("\n");
+    guard.onToolResult(String(event.toolName), event.input, !!event.isError, text);
+  });
+  return guard;
+}

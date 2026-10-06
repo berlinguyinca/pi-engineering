@@ -19,7 +19,6 @@ import {
 import type { StaticModelDefinition } from "../capability/discovery.ts";
 import { ModelCapabilityRegistry } from "../capability/registry.ts";
 import { RoleRouter } from "../capability/router.ts";
-import { ToolCallGuard } from "../guard/toolCallGuard.ts";
 import {
   type AdmissionRetryConfig,
   DEFAULT_ADMISSION_RETRY_CONFIG,
@@ -100,8 +99,6 @@ export class LifecycleHarness {
   private admissionConfig: AdmissionRetryConfig = DEFAULT_ADMISSION_RETRY_CONFIG;
 
   private readonly opts: HarnessOptions;
-  /** Identical-tool-call / bash-timeout guard (src/guard/toolCallGuard.ts). */
-  private readonly toolCallGuard = new ToolCallGuard();
 
   private constructor(opts: HarnessOptions) {
     this.opts = opts;
@@ -142,24 +139,12 @@ export class LifecycleHarness {
 
     pi.on("tool_call", async (event, ctx) => {
       this.ctx = ctx;
-      // Loop/timeout guard first: it applies whether or not a lifecycle
-      // controller is bound to this directory.
-      const verdict = this.toolCallGuard.onToolCall(String(event.toolName), event.input);
-      if (verdict) return verdict;
       if (!this.controller) return undefined;
       return this.controller.observeToolCall(String(event.toolName), event.input as Record<string, unknown>);
     });
 
     pi.on("tool_result", async (event, ctx) => {
       this.ctx = ctx;
-      this.toolCallGuard.onToolResult(
-        String(event.toolName),
-        event.input,
-        !!event.isError,
-        ((event.content ?? []) as { type?: string; text?: string }[])
-          .map((part) => (part?.type === "text" ? (part.text ?? "") : ""))
-          .join("\n"),
-      );
       if (!this.controller) return undefined;
       const images = ((event.content ?? []) as { type?: string; data?: string; mimeType?: string }[])
         .filter((c) => c?.type === "image" && c.data)

@@ -38,6 +38,7 @@ import { GenerationGuard } from "../src/guard/GenerationGuard.ts";
 import { RECOVERY_PROMPT, TOOL_TRANSITION_RULE, buildDegenerationEvent } from "../src/guard/RecoveryController.ts";
 import { resolveGuardConfig } from "../src/guard/config.ts";
 import { guardFeedFor } from "../src/guard/streamText.ts";
+import { registerToolCallGuard } from "../src/guard/toolCallGuard.ts";
 import { ModelHealthProvider } from "../src/models/health.ts";
 import { defaultModelsPath, providerBaseUrl, readModelsConfig } from "../src/models/modelsConfig.ts";
 import { refreshConfiguredProviders } from "../src/models/refresh.ts";
@@ -599,6 +600,9 @@ export default function (pi: ExtensionAPI) {
   // The auto-invoke handler uses pi.on(), which is only available in a real pi
   // session (not in the smoke-test stub). Guard accordingly.
   if (typeof pi.on === "function") {
+    // Identical-tool-call loops and unbounded bash test/build runs
+    // (src/guard/toolCallGuard.ts); PI_TOOL_CALL_GUARD=0 turns it off.
+    registerToolCallGuard(pi as never);
     pi.on("tool_result", async (event) => {
       if (event.toolName !== "mission") return;
       const text = event.content.map((part) => (part.type === "text" ? part.text : "")).join("\n");

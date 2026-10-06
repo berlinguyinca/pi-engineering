@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import extension from "../../extensions/index.ts";
 import { ToolCallGuard, resolveToolCallGuardConfig } from "../../src/guard/toolCallGuard.ts";
-import { LifecycleHarness } from "../../src/lifecycle/harness.ts";
 
 const append = { command: "echo '- item' >> notes.md" };
 
@@ -62,13 +62,25 @@ test("config is conservative by default and can be turned off", () => {
   for (let i = 0; i < 50; i++) assert.equal(off.onToolCall("bash", { ...append }), undefined);
 });
 
-test("the lifecycle harness tool_call hook applies the guard", async () => {
-  const handlers = new Map<string, (event: unknown, ctx: unknown) => Promise<unknown>>();
-  LifecycleHarness.create({}).register({
-    on: (name: string, handler: (event: unknown, ctx: unknown) => Promise<unknown>) => handlers.set(name, handler),
-  } as never);
-  const toolCall = handlers.get("tool_call")!;
+test("the live extension's tool_call hook applies the guard", async () => {
+  const handlers = new Map<string, Array<(event: unknown, ctx: unknown) => Promise<unknown>>>();
+  (extension as unknown as (pi: unknown) => void)({
+    on: (name: string, handler: (event: unknown, ctx: unknown) => Promise<unknown>) =>
+      handlers.set(name, [...(handlers.get(name) ?? []), handler]),
+    registerCommand: () => {},
+    registerTool: () => {},
+    registerShortcut: () => {},
+    registerFlag: () => {},
+    getFlag: () => undefined,
+    registerMessageRenderer: () => {},
+    registerMarkdownTransformer: () => {},
+    registerEntryRenderer: () => {},
+    setModel: async () => false,
+    events: { on: () => {}, emit: () => {} },
+  });
   const input: Record<string, unknown> = { command: "npm test" };
-  await toolCall({ type: "tool_call", toolName: "bash", toolCallId: "c1", input }, {});
-  assert.ok(typeof input.timeout === "number", "default timeout applied through the hook");
+  for (const handler of handlers.get("tool_call") ?? []) {
+    await handler({ type: "tool_call", toolName: "bash", toolCallId: "c1", input }, { mode: "tui" });
+  }
+  assert.ok(typeof input.timeout === "number", "default timeout applied through the live hook");
 });
