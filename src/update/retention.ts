@@ -7,13 +7,17 @@
  * versions and `keepCheckpoints` checkpoints are kept, and staging trees of
  * finished transactions are removed.
  *
- * Other Pi processes never import from versions/ directly: each one
+ * A kept version whose node_modules is a link into another version's
+ * directory (installs made before every version owned its dependency tree)
+ * keeps that other version as well, so no kept version is left dangling.
+ *
+ * Other Pi processes never import code from versions/ directly: each one
  * materializes its generations under its own generations/<pid>-… directory.
- * So removing an old version cannot pull code out from under a running
- * process.
+ * Those snapshots link node_modules into the version they came from, so a
+ * version a live process's snapshot links to is kept as well.
  */
 
-import { existsSync, readdirSync, statSync } from "node:fs";
+import { existsSync, lstatSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { type InstallLayout, isInside } from "./installLayout.ts";
@@ -61,6 +65,27 @@ export async function applyRetention(
   // Versions: newest `keepVersions` stay, protected ones always.
   const versions = layout.listVersions();
   const newest = new Set(versions.slice(-keepVersions).map((v) => resolve(v.dir)));
+  // Installs made before each version owned its dependency tree link
+  // node_modules into another version's directory. A kept version must never
+  // be left with a dangling link: the version that owns the tree stays too.
+  for (const v of versions) {
+    const dir = resolve(v.dir);
+    if (!newest.has(dir) && !protectedPaths.has(dir)) continue;
+    const owner = linkedModulesOwner(versions, dir);
+    if (owner) protect(owner);
+  }
+  // Generation snapshots of live Pi processes (generations/<pid>-…/<snapshot>)
+  // link node_modules into the version they were taken from; that process may
+  // still import lazily from it.
+  for (const name of safeList(join(layout.root, "generations"))) {
+    const pid = Number(name.split("-")[0]);
+    if (!Number.isInteger(pid) || pid <= 0 || !pidAlive(pid)) continue;
+    const processDir = join(layout.root, "generations", name);
+    for (const snapshot of safeList(processDir)) {
+      const owner = linkedModulesOwner(versions, join(processDir, snapshot));
+      if (owner) protect(owner);
+    }
+  }
   for (const v of versions) {
     const dir = resolve(v.dir);
     if (newest.has(dir) || protectedPaths.has(dir)) continue;
@@ -89,6 +114,32 @@ export async function applyRetention(
     removed.checkpoints.push(dir);
   }
   return removed;
+}
+
+/** The installed version whose directory `dir`/node_modules links into, if any. */
+function linkedModulesOwner(versions: readonly { dir: string }[], dir: string): string | null {
+  const modules = join(dir, "node_modules");
+  try {
+    if (!lstatSync(modules).isSymbolicLink()) return null;
+    const target = realpathSync(modules);
+    for (const v of versions) {
+      const real = realpathSync(v.dir);
+      if (real !== realpathSync(dir) && isInside(real, target)) return resolve(v.dir);
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/** Conservative: a PID that might be alive (EPERM included) keeps its versions. */
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
 }
 
 function safeList(dir: string): string[] {

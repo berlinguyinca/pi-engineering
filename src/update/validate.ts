@@ -9,7 +9,7 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, realpathSync } from "node:fs";
-import { mkdtemp, rm, symlink } from "node:fs/promises";
+import { copyFile, link, mkdir, mkdtemp, readdir, readlink, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -74,9 +74,36 @@ function lockDigest(dir: string): string | null {
 }
 
 /**
+ * Copy a dependency tree as hard links (`cp -al` semantics): no bytes are
+ * duplicated, yet the copy owns its directory entries, so removing the source
+ * tree (retention, rollback cleanup) never takes the copy's files with it.
+ * Files that cannot be linked (another filesystem, no hard-link support) are
+ * copied. Symlinks are recreated verbatim (npm's `.bin` links are relative).
+ */
+export async function linkTree(source: string, target: string): Promise<void> {
+  await mkdir(target, { recursive: true });
+  for (const entry of await readdir(source, { withFileTypes: true })) {
+    const from = join(source, entry.name);
+    const to = join(target, entry.name);
+    if (entry.isSymbolicLink()) {
+      await symlink(await readlink(from), to);
+    } else if (entry.isDirectory()) {
+      await linkTree(from, to);
+    } else if (entry.isFile()) {
+      await link(from, to).catch(async (error: NodeJS.ErrnoException) => {
+        if (!["EXDEV", "EPERM", "ENOTSUP", "EMLINK", "EOPNOTSUPP"].includes(error.code ?? "")) throw error;
+        await copyFile(from, to);
+      });
+    }
+  }
+}
+
+/**
  * Give the staged candidate its dependencies. An unchanged lockfile reuses the
- * running runtime's tree (a symlink, nothing downloaded). A changed one needs
- * `npm ci --ignore-scripts` in the staging directory, never in the running one.
+ * running runtime's tree as a hard-linked copy (nothing downloaded, and the
+ * candidate never depends on another installed version's directory: retention
+ * may delete that one). A changed one needs `npm ci --ignore-scripts` in the
+ * staging directory, never in the running one.
  */
 export async function provisionDependencies(
   stagedDir: string,
@@ -88,8 +115,18 @@ export async function provisionDependencies(
   const same = runningRoot !== null && lockDigest(stagedDir) === lockDigest(runningRoot);
   const runningModules = runningRoot ? join(runningRoot, "node_modules") : null;
   if (same && runningModules && existsSync(runningModules)) {
-    await symlink(realpathSync(runningModules), join(stagedDir, "node_modules"), "dir");
-    return { name, status: "passed", detail: "lockfile unchanged; reusing the running dependency tree" };
+    const target = join(stagedDir, "node_modules");
+    try {
+      await linkTree(realpathSync(runningModules), target);
+    } catch (error) {
+      await rm(target, { recursive: true, force: true }).catch(() => {});
+      return {
+        name,
+        status: "failed",
+        detail: `copying the running dependency tree failed: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
+    return { name, status: "passed", detail: "lockfile unchanged; hard-linked copy of the running dependency tree" };
   }
   if (same) return { name, status: "skipped", detail: "no dependency tree to reuse and none required" };
   if (!opts.allowInstall) {
