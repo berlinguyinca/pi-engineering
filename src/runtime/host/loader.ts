@@ -10,8 +10,8 @@
 
 import { randomBytes } from "node:crypto";
 import { existsSync, realpathSync } from "node:fs";
-import { cp, mkdir, readdir, rm, stat, symlink } from "node:fs/promises";
-import { join, relative, resolve, sep } from "node:path";
+import { cp, mkdir, readdir, readlink, rm, stat, symlink } from "node:fs/promises";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import { type EngineeringRuntimeModule, HOST_SUPPORTED_RUNTIME_APIS, isEngineeringRuntimeModule } from "./contract.ts";
 
@@ -62,7 +62,7 @@ export async function snapshotRuntimeSource(
   try {
     await cp(root, dir, {
       recursive: true,
-      // Symlinks are copied as links; a link escaping the source is rejected below.
+      // Symlinks are copied as links; one escaping the source is rejected below.
       verbatimSymlinks: true,
       filter: (src) => {
         const rel = relative(root, src);
@@ -72,12 +72,34 @@ export async function snapshotRuntimeSource(
         return !rel.endsWith(".zip");
       },
     });
+    await rejectEscapingLinks(dir, dir, root);
     await linkDependencies(root, dir);
   } catch (error) {
     await rm(dir, { recursive: true, force: true }).catch(() => {});
     throw new RuntimeLoadError("snapshot", `could not snapshot ${root}: ${message(error)}`);
   }
   return dir;
+}
+
+/**
+ * Refuse a snapshot containing a symlink that resolves outside the source tree
+ * (judged from where the link sits in the source): the snapshot would import
+ * code that is neither the source nor immutable.
+ */
+async function rejectEscapingLinks(dir: string, snapshotRoot: string, sourceRoot: string): Promise<void> {
+  for (const entry of await readdir(dir, { withFileTypes: true })) {
+    const path = join(dir, entry.name);
+    if (entry.isSymbolicLink()) {
+      const target = await readlink(path);
+      const inSource = join(sourceRoot, relative(snapshotRoot, dirname(path)));
+      const resolved = isAbsolute(target) ? resolve(target) : resolve(inSource, target);
+      if (resolved !== sourceRoot && !resolved.startsWith(sourceRoot + sep)) {
+        throw new Error(`symlink ${relative(snapshotRoot, path)} -> ${target} escapes the source tree`);
+      }
+    } else if (entry.isDirectory()) {
+      await rejectEscapingLinks(path, snapshotRoot, sourceRoot);
+    }
+  }
 }
 
 /** Point the snapshot's node_modules at the real dependency tree of the source. */
