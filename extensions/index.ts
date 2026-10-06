@@ -72,6 +72,7 @@ import { emitRuntimeEvent } from "../src/runtime/isolation/runtimeEvents.ts";
 import { formatRuntimeStatus, runtimeStatus } from "../src/runtime/isolation/status.ts";
 import {
   clearOperatorModelPin,
+  describeMissionControl,
   describeModelChoice,
   onOperatorModelSelect,
   resetSessionModelChoice,
@@ -411,7 +412,13 @@ export function formatMissionActivity(event: RuntimeMissionActivityEvent): {
   const nextVerb = event.nextAction.trim().split(/\s+/)[0]?.slice(0, 12) || "monitor";
   const recoveryToken =
     event.recovery.maxAttempts > 0 ? `R${event.recovery.attempt}/${event.recovery.maxAttempts}` : "R–";
-  const token = `${recoveryToken} ${event.action.slice(0, 12).toUpperCase()}→${nextVerb}`;
+  const pausedByOperator = event.operatorPausedAt
+    ? `PAUSED by operator at ${event.operatorPausedAt} — automatic repair is off; resume with /mission resume ${event.missionId} (add --model auto to release a model pin)`
+    : null;
+  const pin = event.operatorModelPin ? ` · model: ${event.operatorModelPin} (operator pin)` : "";
+  const token = pausedByOperator
+    ? `${recoveryToken} PAUSED (operator)`
+    : `${recoveryToken} ${event.action.slice(0, 12).toUpperCase()}→${nextVerb}`;
   return {
     phase:
       `acceptance ${event.acceptanceCoverage.completed}/${event.acceptanceCoverage.total} ` +
@@ -419,12 +426,14 @@ export function formatMissionActivity(event: RuntimeMissionActivityEvent): {
       `${event.workflowProgress.total} (${event.workflowProgress.approximatePercent}%) · ${event.health}`,
     detail:
       `${event.summary.slice(0, 120)}${workers}${heartbeat} · ${scope} · last progress ${lastProgress} · ` +
-      `${recovery}${preserved} · ${event.action}: ${event.reason.slice(0, 120)} · ${next}`,
-    missionStatus: {
-      token,
-      reason: event.reason.slice(0, 160),
-      next: `${event.nextAction.slice(0, 160)}${event.nextActionAt ? ` at ${event.nextActionAt}` : ""}`,
-    },
+      `${recovery}${preserved} · ${event.action}: ${event.reason.slice(0, 120)} · ${next}${pin}`,
+    missionStatus: pausedByOperator
+      ? { token, reason: "paused by the operator (Esc); automatic repair is off", next: pausedByOperator }
+      : {
+          token,
+          reason: event.reason.slice(0, 160),
+          next: `${event.nextAction.slice(0, 160)}${event.nextActionAt ? ` at ${event.nextActionAt}` : ""}`,
+        },
   };
 }
 
@@ -1887,7 +1896,15 @@ ${RECOVERY_PROMPT}`;
   const plannerWorker = registerPlannerWorker(pi, {
     host: async (ctx) => {
       const rt = await getRuntime(ctx);
-      return { repoRoot: rt.git?.root ?? rt.cwd, worker: rt.worker };
+      return {
+        repoRoot: rt.git?.root ?? rt.cwd,
+        worker: rt.worker,
+        // Live missions an operator paused or pinned, for /engineering-status.
+        missionControlLines: () =>
+          (rt.missionStore?.listMissions() ?? [])
+            .filter((m) => !["COMPLETE", "FAILED", "CANCELED"].includes(m.status))
+            .flatMap((m) => describeMissionControl(m).map((line) => `${m.mission_id} [${m.status}] ${line}`)),
+      };
     },
     sessionGuardActive: inferweave !== null,
   });
@@ -2045,6 +2062,7 @@ ${RECOVERY_PROMPT}`;
           `  repo ${summary?.repository ?? m.repository} · task ${summary?.task ?? "none"} · owner ${summary?.owner ?? "unowned"} · last progress ${summary?.lastMeaningfulProgressAt ?? "none"}`,
           `  recovery ${recovery.attempt}/${recovery.maxAttempts}; attempted ${stop?.attemptedRecoveries.length ?? 0} · next: ${stop?.resumeCondition ?? summary?.nextAction ?? "No further action is scheduled"}${summary?.nextActionAt ? ` at ${summary.nextActionAt}` : ""}`,
           `  ${stop ? `stop: ${stop.reason}` : `action: ${summary?.action ?? m.status} — ${summary?.reason ?? "No additional reason recorded"}`} · preserved: ${preserved.join(", ") || "none"}`,
+          ...describeMissionControl(m).map((line) => `  ${line}`),
         ].join("\n");
       });
       ctx.ui.notify(lines.join("\n"), "info");

@@ -344,6 +344,10 @@ export interface RuntimeMissionActivityEvent {
   repository: string | null;
   task: string | null;
   preservedWork: string[];
+  /** Set while the operator has paused the mission (Esc); automatic repair is off. */
+  operatorPausedAt?: string | null;
+  /** The mission's operator model pin ("provider/id"), when it has one. */
+  operatorModelPin?: string | null;
 }
 
 export interface EngineeringRuntimeOptions {
@@ -666,6 +670,7 @@ export class EngineeringRuntime {
     const projection = this.missionObservability?.projection(missionId);
     if (!projection) return;
     const summary = projection.summary;
+    const mission = this.missionStore?.getMission(missionId);
     const raw = summary.currentActivity?.summary ?? summary.currentObjective ?? summary.title;
     const bounded = redactSecrets(raw)
       .replace(/[\r\n\t]+/g, " ")
@@ -705,6 +710,10 @@ export class EngineeringRuntime {
         repository: summary.repository,
         task: summary.task,
         preservedWork: summary.preservedWork.map((value) => redactSecrets(value).slice(0, 240)).slice(0, 8),
+        operatorPausedAt: mission?.operator_paused_at ?? null,
+        operatorModelPin: mission?.operator_model_pin
+          ? `${mission.operator_model_pin.provider}/${mission.operator_model_pin.id}`
+          : null,
       });
     } catch {
       // UI listeners are observers, never participants in mission execution.

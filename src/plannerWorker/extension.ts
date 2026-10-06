@@ -45,6 +45,8 @@ import { ENGINEERING_MODES, type EngineeringMode, type PlannerWorkerReport } fro
 export interface PlannerWorkerHost {
   repoRoot: string;
   worker: WorkerExecutor;
+  /** Operator-control lines (pause, model pin) of live orchestration missions. */
+  missionControlLines?: () => string[];
 }
 
 export interface PlannerWorkerIntegration {
@@ -131,13 +133,19 @@ export function registerPlannerWorker(
     pi.registerCommand(`engineering-${name}`, {
       description,
       handler: async (args, ctx) => {
-        const { repoRoot } = await deps.host(ctx);
+        const host = await deps.host(ctx);
+        const { repoRoot } = host;
         const config = await loadPlannerWorkerConfig(repoRoot);
         const out = await engineeringCommand(name, args, repoRoot, config);
-        // Which model this session's missions run on: the operator pin, if any.
+        // Which model this session's missions run on (the operator pin, if any),
+        // and every live mission an operator paused or pinned.
         const text =
           name === "status"
-            ? `${describeModelChoice(sessionModelChoice(RuntimeSession.current().sessionId))}\n${out.text}`
+            ? [
+                describeModelChoice(sessionModelChoice(RuntimeSession.current().sessionId)),
+                ...(host.missionControlLines?.() ?? []),
+                out.text,
+              ].join("\n")
             : out.text;
         ctx.ui.notify(text, out.level);
       },

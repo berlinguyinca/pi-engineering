@@ -86,6 +86,20 @@ test("/engineering-model auto and /mission resume --model auto release persisted
     const ours = make(RuntimeSession.current().sessionId);
     const restored = make("S-before-restart");
 
+    // A paused, pinned mission is visible in /mission-status and /engineering-status.
+    store.markOperatorPause(restored);
+    notices.length = 0;
+    await commands.get("mission-status")!.handler("", ctx);
+    const paused = new RegExp(
+      `PAUSED by operator at \\S+ — automatic repair is off; resume with /mission resume ${restored} \\(add --model auto to release a model pin\\)`,
+    );
+    assert.match(notices.join("\n"), paused);
+    assert.match(notices.join("\n"), /model: gw\/glm5\.3-flash \(operator pin\)/);
+    notices.length = 0;
+    await commands.get("engineering-status")!.handler("", ctx);
+    assert.match(notices.join("\n"), paused);
+    assert.match(notices.join("\n"), new RegExp(`${ours}.*model: gw/glm5\\.3-flash \\(operator pin\\)`));
+
     await commands.get("engineering-model")!.handler("auto", ctx);
     assert.equal(store.getMission(ours)?.operator_model_pin, null, notices.join("\n"));
     assert.equal(store.getMission(restored)?.operator_model_pin?.id, pin.id, "another session's mission is untouched");
