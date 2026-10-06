@@ -57,9 +57,7 @@ function explicitAbsolutePaths(request: string): string[] {
  */
 function requestRepoReferenceNames(request: string): string[] {
   const names = new Set<string>();
-  for (const match of request.matchAll(
-    /(?<![\w.@/-])([A-Za-z0-9][A-Za-z0-9._-]*)\/([A-Za-z0-9][A-Za-z0-9._-]*)/g,
-  )) {
+  for (const match of request.matchAll(/(?<![\w.@/-])([A-Za-z0-9][A-Za-z0-9._-]*)\/([A-Za-z0-9][A-Za-z0-9._-]*)/g)) {
     names.add(match[2]!);
   }
   for (const match of request.matchAll(/(?<![\w./@-])([A-Za-z0-9][A-Za-z0-9._-]*[A-Za-z0-9_-])/g)) {
@@ -139,9 +137,7 @@ export class WorkspaceManifestResolver {
       )
     ).filter((path): path is string => path !== null);
     let candidates: Array<{ path: string; source: AuthorizedRoot["source"] }> =
-      existing.length > 0
-        ? existing.map((path) => ({ path, source: "explicit_user_path" as const }))
-        : [];
+      existing.length > 0 ? existing.map((path) => ({ path, source: "explicit_user_path" as const })) : [];
     if (candidates.length === 0) {
       // Workspace-parent mode: launching from a directory that is itself not a
       // git checkout (e.g. a projects root containing many checkouts) is a
