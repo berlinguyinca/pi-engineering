@@ -15,7 +15,8 @@ import { fileURLToPath } from "node:url";
 import { type PiTestSession, startPiSession } from "../support/piSession.ts";
 
 const repoRoot = resolve(fileURLToPath(new URL("../../", import.meta.url)));
-const hostEntry = join(repoRoot, "src/runtime/host/extension.ts");
+// What package.json `pi.extensions` names: the stable shim in front of the Host.
+const hostEntry = join(repoRoot, "src/runtime/host/entry.ts");
 
 const ENV_KEYS = [
   "HOME",

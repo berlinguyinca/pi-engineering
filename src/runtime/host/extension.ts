@@ -251,12 +251,23 @@ export class EngineeringHostExtension {
     this.recovery = await this.recoverOnStartup();
     const start = await this.startupSources();
     const result = await host.start(start[0] as RuntimeSource, start.slice(1));
+    this.startupFallback = startupFallbackText(result, host.activeGeneration()?.source);
+    if (this.startupFallback) {
+      this.telemetry.emit("runtime.health.failed", { failure_reason: this.startupFallback });
+    }
     await this.repairPointersAfterStart(result.ok ? host.activeGeneration()?.source : undefined);
     this.unpublish = publishRuntimeStatus(this, (now) => this.panelLines(now));
     host.bridge.onHostEvent("session_start", (_event, ctx) => this.onSessionStart(ctx as Ctx));
     host.bridge.onHostEvent("session_shutdown", () => this.dispose());
     await this.retain().catch(() => {});
   }
+
+  /**
+   * Set when startup could not run the preferred runtime: installed versions
+   * failed and an older one or the package checkout runs, or nothing runs.
+   * Shown in the status line, `/engineering version` and the panel.
+   */
+  startupFallback: string | undefined;
 
   private unpublish: () => void = () => {};
   private checkTimer: ReturnType<typeof setTimeout> | undefined;
@@ -280,6 +291,16 @@ export class EngineeringHostExtension {
    * Installation stays off unless the operator turned `autoInstall` on.
    */
   private onSessionStart(ctx: Ctx): void {
+    if (this.startupFallback) {
+      try {
+        ctx.ui?.setStatus?.(
+          "pi-engineering-runtime",
+          `Pi Engineering degraded: ${this.startupFallback.split("\n")[0]}`,
+        );
+      } catch {
+        // No UI in this session; /engineering version still says it.
+      }
+    }
     if (this.config.autoUpdateCheck === false) return;
     const prefs = readPreferences(this.layout.preferencesFile);
     if (!prefs.autoCheck) return;
@@ -767,7 +788,7 @@ export class EngineeringHostExtension {
       `Commit        ${short(active?.source.commit)}`,
       `Generation    ${active?.generation ?? "none"}`,
       `Channel       ${prefs.channel}`,
-      `Health        ${host?.lastFailure ? "degraded" : active ? "healthy" : "no runtime"}`,
+      `Health        ${host?.lastFailure || this.startupFallback ? "degraded" : active ? "healthy" : "no runtime"}`,
       "Update",
       `Latest        ${latest?.target?.metadata.version ?? prefs.lastAvailable?.version ?? "-"}`,
       `Status        ${
@@ -872,11 +893,29 @@ export class EngineeringHostExtension {
       "Last reload:",
       ago(host?.lastReloadAt),
     ];
+    if (this.startupFallback) lines.push("", `Startup: ${this.startupFallback}`);
     const pending = host?.pendingTask();
     if (pending) lines.push("", `Handover in progress: ${pending.kind} (${pending.phase})`);
     if (host?.lastFailure) lines.push("", `Last failure: ${host.lastFailure}`);
     return lines.join("\n");
   }
+}
+
+/** What the operator must know about how startup went, or undefined when it ran the preferred runtime. */
+export function startupFallbackText(result: HandoverResult, running: RuntimeSource | undefined): string | undefined {
+  const failures = result.startupFailures ?? [];
+  if (!result.ok) {
+    return `No Pi Engineering runtime could start (${failures.join("; ") || result.failure || "unknown failure"}).`;
+  }
+  if (failures.length === 0 || !running) return undefined;
+  const installedFailed = failures.filter((f) => f.startsWith("installed:"));
+  if (running.label.startsWith("installed:")) {
+    return `Running ${running.label} (${running.version}): ${failures.length} newer runtime(s) failed at startup: ${failures.join("; ")}`;
+  }
+  if (installedFailed.length > 0) {
+    return `Every installed runtime failed at startup; running the package checkout (${running.version}), so installed updates are NOT in effect. Failures: ${failures.join("; ")}`;
+  }
+  return `Running ${running.label} (${running.version}) after: ${failures.join("; ")}`;
 }
 
 export function formatCheck(c: UpdateCheckResult): string {

@@ -92,6 +92,8 @@ export interface HandoverResult {
   durationMs: number;
   snapshot?: RuntimeSnapshot;
   health?: RuntimeHealth;
+  /** start(): every source that failed before one came up (or all of them). */
+  startupFailures?: string[];
 }
 
 export class RuntimeBusyError extends Error {
@@ -309,6 +311,7 @@ export class RuntimeHost implements BridgeTarget {
   async start(source: RuntimeSource, fallbacks: RuntimeSource[] = []): Promise<HandoverResult> {
     const started = Date.now();
     let failure = "";
+    const failures: string[] = [];
     for (const candidate of [source, ...fallbacks]) {
       try {
         const live = await this.bringUp(candidate, undefined);
@@ -324,10 +327,11 @@ export class RuntimeHost implements BridgeTarget {
           untouched: false,
           waitedForSafePoint: false,
           durationMs: Date.now() - started,
-          ...(candidate !== source ? { failure } : {}),
+          ...(candidate !== source ? { failure, startupFailures: failures } : {}),
         });
       } catch (error) {
         failure = `${candidate.label}: ${message(error)}`;
+        failures.push(failure);
         this.lastFailure = failure;
       }
     }
@@ -341,6 +345,7 @@ export class RuntimeHost implements BridgeTarget {
       failedStage: "loading",
       waitedForSafePoint: false,
       durationMs: Date.now() - started,
+      startupFailures: failures,
     });
   }
 
