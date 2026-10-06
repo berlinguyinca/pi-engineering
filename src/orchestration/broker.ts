@@ -2591,6 +2591,10 @@ export class ExecutionBroker {
                 input.taskId,
               );
             }
+            // The hung-worker window measures the WORKER's silence. Worktree
+            // allocation and checkpoint restore before this point are the
+            // broker's own work, so the window starts when the worker does.
+            lastActivityAt = Date.now();
             writerStarted = true;
             const backendSettlement: Promise<BackendSettlement> = this.dispatch(
               input,
