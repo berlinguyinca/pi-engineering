@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { lstat, readdir, realpath } from "node:fs/promises";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, parse, relative, resolve, sep } from "node:path";
 import { GitRepo } from "../git/GitRepo.ts";
 import { type RequestAnalysis, analyzeRequest } from "./pathIntent.ts";
@@ -145,22 +145,27 @@ async function nearestExisting(path: string): Promise<{ ancestor: string; missin
  * filesystem root, or its first missing segment is a near-miss of an existing
  * sibling ("/TMP/…", "/hmoe/…").
  */
-async function looksLikeMissingFilesystemPath(path: string): Promise<{ real: boolean; ancestor: string }> {
+async function looksLikeMissingFilesystemPath(
+  path: string,
+): Promise<{ real: boolean; ancestor: string; nearMiss: boolean }> {
   const { ancestor, missingSegment } = await nearestExisting(path);
-  if (ancestor !== parse(ancestor).root) return { real: true, ancestor };
   const siblings = await readdir(ancestor).catch(() => [] as string[]);
   const lower = missingSegment.toLowerCase();
-  const real = siblings.some(
+  const nearMiss = siblings.some(
     (sibling) =>
       sibling.toLowerCase() === lower || (missingSegment.length >= 5 && withinOneEdit(sibling.toLowerCase(), lower)),
   );
-  return { real, ancestor };
+  if (ancestor !== parse(ancestor).root) return { real: true, ancestor, nearMiss };
+  return { real: nearMiss, ancestor, nearMiss };
 }
 
 interface AuthorityPlan {
   writable: string[];
   readOnly: string[];
 }
+
+/** Taint that does not exclude a path: collateral from a restriction about something else, or a source. */
+const COLLATERAL_TAINT = new Set(["strong-sentence", "from-path", "weak-reference"]);
 
 /** Appended to every scope refusal: over-refusals are a one-line fix. */
 export const SCOPE_DIRECTIVE_HINT =
@@ -185,11 +190,22 @@ function scopeError(message: string): WorkspaceScopeError {
  *   directory ("do not modify anything here"), the launch directory is never
  *   substituted: nothing writable means a refusal.
  */
-async function planAuthority(analysis: RequestAnalysis): Promise<AuthorityPlan> {
+async function planAuthority(analysis: RequestAnalysis, launchCwd: string): Promise<AuthorityPlan> {
   if (analysis.directiveConflict) {
     throw scopeError(`${analysis.directiveConflict} is named both writable and read-only.`);
   }
+  // The launch directory stays the default target only while every named path
+  // is an input or scratch location outside any repository, or lies inside
+  // the launch repository and is not excluded. Another repository, an
+  // excluded launch directory, an unresolvable token or a restriction on
+  // "anything here" rules the default out.
   let blocksFallback = analysis.launchRestricted;
+  const launchGit = await GitRepo.open(launchCwd).catch(() => null);
+  const launchRoot = launchGit ? await realpath(launchGit.root).catch(() => launchGit.root) : null;
+  const repositoryRootOf = async (directory: string): Promise<string | null> => {
+    const git = await GitRepo.open(directory).catch(() => null);
+    return git ? await realpath(git.root).catch(() => git.root) : null;
+  };
   interface Resolved {
     index: number;
     path: string;
@@ -203,53 +219,97 @@ async function planAuthority(analysis: RequestAnalysis): Promise<AuthorityPlan> 
   const missing: string[] = [];
   for (const [index, mention] of analysis.mentions.entries()) {
     const eligible = analysis.writeEligible(index);
+    if (mention.glob) continue; // a pattern, never a target
+    if (mention.outsideLaunch && !(await lstat(mention.outsideLaunch).catch(() => null))) continue;
     if (!mention.path) {
       blocksFallback = true;
-      if (analysis.mutationAimed[index]) unresolvable.push(mention.raw);
+      if (analysis.mutationLed[index]) unresolvable.push(mention.raw);
       continue;
     }
     const protectedTarget = protectedReason(mention.path);
     if (protectedTarget) {
-      if (eligible) throw scopeError(`Refusing protected ${protectedTarget}: ${mention.path}.`);
-      if (!mention.routeLike) blocksFallback = true;
+      // A mutation aimed straight at a protected path refuses the request; a
+      // protected path that is merely mentioned in a brief is just never granted.
+      if (eligible && analysis.mutationLed[index]) {
+        throw scopeError(`Refusing protected ${protectedTarget}: ${mention.path}.`);
+      }
       continue;
     }
     try {
       const stat = await lstat(mention.path);
-      blocksFallback = true;
       const isFile = stat.isFile();
       const canonical = await realpath(mention.path).catch(() => mention.path!);
       const directory = isFile ? dirname(mention.path) : mention.path;
-      const repository = Boolean(await GitRepo.open(directory).catch(() => null));
-      resolved.push({ index, path: mention.path, canonical, isFile, repository, eligible });
+      const repositoryRoot = await repositoryRootOf(directory);
+      const repository = repositoryRoot !== null;
+      const dependency = /[\\/](?:node_modules|\.venv|venv|vendor|target|dist|build)(?:[\\/]|$)/.test(canonical);
+      if (repositoryRoot && repositoryRoot !== launchRoot && !dependency) blocksFallback = true;
+      // An exclusion at or around the launch repository rules the default out
+      // (it could not be carved out of a writable launch root). Collateral
+      // taint from a restriction about something else, or a path used as a
+      // source, does not.
+      const exclusion = analysis.taintReasons[index]?.some((reason) => !COLLATERAL_TAINT.has(reason));
+      if (
+        analysis.blocksWrite(index) &&
+        exclusion &&
+        launchRoot &&
+        (isWithin(canonical, launchRoot) || isWithin(launchRoot, canonical))
+      ) {
+        blocksFallback = true;
+      }
+      // An input outside any repository (a file, or a directory no verb is
+      // aimed at, like "the ZIP is in ~/Downloads") is read, never a target.
+      const inputFile = !repository && (isFile || !analysis.mutationLed[index]);
+      resolved.push({ index, path: mention.path, canonical, isFile, repository, eligible: eligible && !inputFile });
     } catch {
-      const { real, ancestor } = await looksLikeMissingFilesystemPath(mention.path);
-      if (!real && mention.routeLike) continue; // an HTTP route, not a filesystem path
-      blocksFallback = true;
+      const { real, ancestor, nearMiss } = await looksLikeMissingFilesystemPath(mention.path);
+      // Not under any existing directory and no near-miss of one: an HTTP
+      // route, an identifier or prose ("/OPENAI_API_KEY", "/season"), never a target.
+      if (!real) continue;
       if (!eligible) continue;
       const inRepository =
         real && !protectedReason(ancestor) && Boolean(await GitRepo.open(ancestor).catch(() => null));
       if (!inRepository) {
-        missing.push(mention.path);
+        // A missing file outside any repository is a gone input ("the spec
+        // ZIP in ~/Downloads"); a missing directory is a target typo.
+        // Only a verb aimed straight at it makes it a target ("fix ~/repo-typo");
+        // a new directory under the temp dir is a scratch output unless it is
+        // a near-miss of an existing one.
+        const scratch = isWithin(await realpath(tmpdir()).catch(() => tmpdir()), ancestor) && !nearMiss;
+        if (analysis.mutationLed[index] && !scratch && !/\.[A-Za-z0-9]{1,8}$/.test(basename(mention.path))) {
+          missing.push(mention.path);
+        }
         continue;
       }
-      // A new path inside an existing repository: that directory is the target.
+      // A new path inside an existing repository ("create the docs in /repo/docs")
+      // makes that directory the target — only when a verb is aimed at it, it
+      // adds at most two levels, and it is no dependency directory.
+      const newDepth = relative(ancestor, mention.path).split(sep).length;
+      const dependencyPath = /[\\/](?:node_modules|\.venv|venv|vendor|target|dist|build)(?:[\\/]|$)/.test(mention.path);
+      if (!analysis.mutationLed[index] || newDepth > 2 || dependencyPath) continue;
       const canonical = await realpath(ancestor).catch(() => ancestor);
       resolved.push({ index, path: ancestor, canonical, isFile: false, repository: true, eligible });
     }
   }
+  const refuseUnlessWritable: Array<() => WorkspaceScopeError> = [];
   if (unresolvable.length > 0) {
-    throw scopeError(
-      `Path ${unresolvable.join(", ")} cannot be resolved (variables, other drives, other users' homes and paths outside the launch directory are not expanded); write it as an absolute path.`,
+    refuseUnlessWritable.push(() =>
+      scopeError(
+        `Path ${unresolvable.join(", ")} cannot be resolved (variables, other drives, other users' homes and paths outside the launch directory are not expanded); write it as an absolute path.`,
+      ),
     );
   }
   if (missing.length > 0) {
-    throw scopeError(
-      `Workspace target does not exist: ${missing.join(", ")}. Check the path (or clone the repository first); the launch directory is never used in its place.`,
+    refuseUnlessWritable.push(() =>
+      scopeError(
+        `Workspace target does not exist: ${missing.join(", ")}. Check the path (or clone the repository first); the launch directory is never used in its place.`,
+      ),
     );
   }
 
-  const readOnlyCanonical = resolved.filter((entry) => analysis.tainted[entry.index]).map((entry) => entry.canonical);
+  const readOnlyCanonical = resolved
+    .filter((entry) => analysis.blocksWrite(entry.index))
+    .map((entry) => entry.canonical);
   const writable: string[] = [];
   const unbound: string[] = [];
   for (const entry of resolved.filter((candidate) => candidate.eligible)) {
@@ -275,6 +335,10 @@ async function planAuthority(analysis: RequestAnalysis): Promise<AuthorityPlan> 
   }
 
   if (writable.length === 0) {
+    // A protected, missing or unresolvable target is fatal only when it is
+    // the only target: in a multi-repository brief it is just not granted.
+    const first = refuseUnlessWritable[0];
+    if (first) throw first();
     if (unbound.length > 0) {
       throw scopeError(`No writable workspace: the named target ${unbound.join(", ")} is not inside a Git repository.`);
     }
@@ -298,7 +362,7 @@ export class WorkspaceManifestResolver {
     // planAuthority); the launch cwd is only a fallback for requests that name
     // nothing binding. resolveRepository (legacy explicit repository argument)
     // keeps failing loudly.
-    const { writable, readOnly } = await planAuthority(analyzeRequest(request, launchCwd));
+    const { writable, readOnly } = await planAuthority(analyzeRequest(request, launchCwd), launchCwd);
     let candidates: Array<{ path: string; source: AuthorizedRoot["source"] }> = writable.map((path) => ({
       path,
       source: "explicit_user_path" as const,

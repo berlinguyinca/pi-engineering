@@ -73,13 +73,8 @@ const CORPUS: Row[] = [
     read: ["R"],
     excluded: ["R"],
   },
-  // A file outside any repository with a fix verb: its directory is no repository.
-  {
-    prompt: (p) => `Analyze ${p.F} and fix the bug`,
-    write: "refuse",
-    excluded: ["L"],
-    message: /not inside a Git repository/,
-  },
+  // An input file outside any repository does not displace the launch repository (real-prompt review).
+  { prompt: (p) => `Analyze ${p.F} and fix the bug`, write: ["L"], read: ["F"] },
   { prompt: () => "fix /etc/nginx", write: "refuse", message: /protected/ },
   { prompt: () => "Modify files in /etc", write: "refuse", message: /protected/ },
   {

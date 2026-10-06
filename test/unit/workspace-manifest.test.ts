@@ -212,7 +212,7 @@ describe("WorkspaceManifestResolver path policy", () => {
         `Create the project at ${join(unauthorizedParent, "missing", "repo")}`,
         launchCwd,
       ),
-      /does not exist/,
+      (error: unknown) => error instanceof WorkspaceScopeError,
     );
   });
 
@@ -815,14 +815,18 @@ describe("WorkspaceManifestResolver re-review (PR #106)", () => {
     }
   });
 
-  it("never writes the launch directory when the request names an input file (final review C)", async () => {
-    const [launch] = await repos(1);
+  it("an input file outside any repository keeps the launch repository as the target; another repository does not", async () => {
+    const [launch, other] = await repos(2);
     const dir = await mkdtemp(join(tmpdir(), "pi-eng-crash-"));
     cleanup.push(() => rm(dir, { recursive: true, force: true }));
     const log = join(dir, "crash.log");
     await writeFile(log, "boom\n");
+    const input = await new WorkspaceManifestResolver().resolve(`Analyze ${log} and fix the bug`, launch!);
+    assert.deepEqual(writable(input), [launch]);
+    assert.equal(access(input, log), "read");
+    // A different repository named only as a reference rules the launch default out.
     await assert.rejects(
-      new WorkspaceManifestResolver().resolve(`Analyze ${log} and fix the bug`, launch!),
+      new WorkspaceManifestResolver().resolve(`Use ${other} for reference and fix the bug`, launch!),
       isScopeError,
     );
     const resolved = await new WorkspaceManifestResolver().resolve(

@@ -70,24 +70,43 @@ hole inside it.
 Without directives the request text is read conservatively:
 
 - A path is writable only if a change verb (fix, add, implement, update,
-  install, refactor, …) is aimed at it, and its sentence (with the list intro
-  or markdown header it sits under) contains no restriction word. Restriction
-  words include: not, no, never, don't, avoid, skip, ignore, exclude, except,
-  without, leave, keep, remain, stay, as is, hands off, off-limits, refrain,
-  forbidden, read-only, reference, look at, analyze, review, compare, copy,
-  mirror, follow, based on, and `from /path`. One exception: in
-  `Fix /a, but don't touch /b`, /a stays writable. This applies only when the
-  restriction sits in its own clause (split on `,` `;` `but` `and` `except`),
-  and that clause names its own path and no pronoun.
+  install, refactor, port, …) is aimed at it and no restriction applies to it.
+  If exactly one path is named and nothing restricts it, it is the target
+  even without a verb.
+- **Strong** restriction words make every path in their sentence (and in a
+  list whose intro or header uses them) read-only: do not, don't, never,
+  must not, avoid, skip, ignore, exclude, except, leave … alone, untouched,
+  unchanged, must stay/remain, keep … as is, hands off, off-limits,
+  read-only, refrain, forbidden, not allowed, reference, for context.
+  There are three narrow exceptions:
+  - In `Fix /a, but don't touch /b`, /a stays writable. The restriction sits
+    in its own clause (split on `,` `;` `but` `and` `except`) and that clause
+    names its own path.
+  - With exactly one path named, a restriction about something else leaves
+    it writable. Examples: "do not change the public API", "don't touch the
+    CI config". A pronoun or repository noun ("do not modify it", "the
+    repository") does not get this exception.
+  - Result clauses are outcomes, not exclusions: "so it no longer crashes",
+    "so that it does not leak", "to not use".
+- **Weak** words restrict a path only when they sit right before it (or a
+  negation right after it): no, not, nothing, none, without, `n't`, and the
+  reference words review, analyze, inspect, look at, compare, copy, mirror,
+  follow, port. `from /path` marks a source, so in
+  `Port the change from /r into /t`, /r is read-only and /t is writable.
 - A path that is read-only anywhere in the request is read-only everywhere,
-  and so is everything inside it.
-- `Only change /a` makes every other named path read-only.
-- The launch directory is the default target only when the request names no
-  path and puts no restriction on "here", "the repo", "anything" and so on.
-  The resolver never substitutes the launch directory for a named path. A
-  missing path such as a typo, an uncloned repository or `~/x` is refused.
-  So is a path it cannot expand, such as `$HOME/x`, `C:\x`, `~user/x`, or
-  `../x` outside the launch directory.
+  and so is everything inside it. `Only change /a` makes every other named
+  path read-only.
+- The launch repository stays the default target when every named path is an
+  input or scratch location outside any repository (`~/Downloads`, `/tmp/…`,
+  a log file), or lies inside the launch repository. Naming another
+  repository, excluding the launch directory, an unexpandable path
+  (`$HOME/x`, `C:\x`, `~user/x`, an existing `../x` outside the launch
+  directory), or a restriction on "anything here" or "this repo" rules the
+  default out.
+- When a verb is aimed straight at a missing path, the request is refused.
+  This covers a typo, an uncloned repository, a near-miss of an existing
+  directory, or `~/x`. A protected path such as `/etc`, `~/.ssh` or `~/.pi`
+  is refused the same way.
 
 When the request does not grant write clearly, the mission is refused with a
 message that names the directive syntax. Adding one `writable:` line is the
