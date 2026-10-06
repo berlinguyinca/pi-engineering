@@ -530,6 +530,34 @@ export function advisesAlternateModel(signal: Pick<GatewayWaitSignal, "actionCod
   return signal.actionCode === "IW-ACT-RETRY-ALTERNATE" || signal.action === "retry_alternate";
 }
 
+/** Gateway reasons that mean "this model has no capacity for you right now". */
+const CAPACITY_REASONS = new Set([
+  "queue_timeout",
+  "queue_deadline_exceeded",
+  "queue_limit_reached",
+  "request_not_queueable",
+  "caller_hard_quota",
+  "capacity_exhausted",
+  "capacity_unavailable",
+  "worker_saturated",
+]);
+
+/**
+ * Is this hold capacity exhaustion (a queue deadline, a full queue, no free
+ * worker) rather than a transport problem or a model warming up?
+ */
+export function isCapacityExhaustion(
+  signal: Pick<GatewayWaitSignal, "reason" | "code" | "status" | "source">,
+): boolean {
+  if (signal.source === "link-cut" || signal.source === "transport-drop" || signal.source === "empty-failure") {
+    return false;
+  }
+  for (const value of [signal.reason, signal.code]) {
+    if (value && CAPACITY_REASONS.has(value.toLowerCase())) return true;
+  }
+  return signal.status === 429 && !signal.reason && !signal.code;
+}
+
 export const ALTERNATE_MODEL_ADVICE = "gateway advises an alternate model — switch with /model";
 
 /** One-line human summary for notices and logs. */

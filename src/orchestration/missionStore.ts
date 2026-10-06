@@ -220,7 +220,7 @@ export interface TaskCreateInput {
 
 /** Non-authority mission metadata that may be changed without a lifecycle operation. */
 export type MissionUpdatePatch = Partial<
-  Pick<Mission, "constraints" | "artifact_refs" | "decision_refs" | "required_gates">
+  Pick<Mission, "constraints" | "artifact_refs" | "decision_refs" | "required_gates" | "operator_model_pin">
 >;
 
 export interface MissionTransitionOptions {
@@ -266,6 +266,7 @@ const MISSION_UPDATE_FIELDS = new Set<keyof MissionUpdatePatch>([
   "artifact_refs",
   "decision_refs",
   "required_gates",
+  "operator_model_pin",
 ]);
 const TASK_TRANSITION_METADATA_FIELDS = new Set<keyof TaskTransitionMetadata>([
   "attempt",
@@ -2739,6 +2740,7 @@ function copyMission(mission: Mission): Mission {
     artifact_refs: [...mission.artifact_refs],
     decision_refs: [...mission.decision_refs],
     required_gates: [...mission.required_gates],
+    ...(mission.operator_model_pin ? { operator_model_pin: { ...mission.operator_model_pin } } : {}),
   };
 }
 
@@ -2886,6 +2888,17 @@ function validateMissionUpdatePatch(patch: MissionUpdatePatch): MissionUpdatePat
     ...(patch.artifact_refs !== undefined ? { artifact_refs: [...patch.artifact_refs] } : {}),
     ...(patch.decision_refs !== undefined ? { decision_refs: [...patch.decision_refs] } : {}),
     ...(patch.required_gates !== undefined ? { required_gates: [...patch.required_gates] } : {}),
+    ...(patch.operator_model_pin !== undefined
+      ? {
+          operator_model_pin: patch.operator_model_pin
+            ? {
+                provider: String(patch.operator_model_pin.provider),
+                id: String(patch.operator_model_pin.id),
+                set_at: String(patch.operator_model_pin.set_at),
+              }
+            : null,
+        }
+      : {}),
   };
 }
 

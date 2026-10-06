@@ -39,6 +39,7 @@ import {
   escalateSyntheticWait,
   gatewayFailureMarker,
   gatewayHoldScope,
+  isCapacityExhaustion,
   isTransportDrop,
   parseGatewayWait,
 } from "../gateway/signals.ts";
@@ -72,6 +73,7 @@ import { reviewResultTool } from "../lifecycle/reviewResultTool.ts";
 import { type RequestBodyBudgetConfig, resolveRequestBodyBudgetConfig } from "../request/bodyBudget.ts";
 import { type ThinkingOffConfig, resolveThinkingOffConfig } from "../request/thinkingPolicy.ts";
 import { emitTelemetry } from "../telemetry/sink.ts";
+import { MODEL_SUPERSEDED } from "./WorkerExecutor.ts";
 import type { WorkerExecutor, WorkerRequest, WorkerRun } from "./WorkerExecutor.ts";
 import {
   StreamingActivityThrottle,
@@ -386,13 +388,45 @@ ${TOOL_TRANSITION_RULE}`;
     // model the gateway says to leave helps nobody, so that keeps the finite
     // count and hands the decision back to the mission.
     const gatewayRetryCeiling = req.unboundedInferenceWait ? Number.POSITIVE_INFINITY : gatewayConfig.maxRetries;
+    // An operator-pinned model is the exception to the exception: the operator
+    // chose it, so only the operator moves the mission off it (with /model,
+    // which ends the wait at the next boundary) — it is waited out.
     const withinGatewayBudget = (decision: GatewayRetryDecision): GatewayRetryDecision =>
       decision.action === "wait" &&
       req.unboundedInferenceWait &&
+      !req.operatorPinned &&
       advisesAlternateModel(decision.signal) &&
       gatewayRetries >= gatewayConfig.maxRetries
         ? { action: "give-up", signal: decision.signal, reason: "retries-exhausted" }
         : decision;
+    // A mission waiting on an exhausted model says so, once per model, and
+    // offers the way out: an operator switch the mission adopts at once.
+    const capacityNoticed = new Set<string>();
+    const noteCapacityWait = (signal: GatewayWaitSignal): void => {
+      if (!req.unboundedInferenceWait || !isCapacityExhaustion(signal)) return;
+      const key = `${model.provider}/${model.id}`;
+      if (capacityNoticed.has(key)) return;
+      capacityNoticed.add(key);
+      emitTelemetry({
+        level: "warning",
+        text: `model ${key} is out of capacity (${signal.reason ?? signal.code ?? `HTTP ${signal.status ?? 429}`}); the mission keeps waiting — switch with /model to continue on another model`,
+        key: `mission-capacity:${key}`,
+      });
+    };
+    const superseded = (): WorkerRun => ({
+      result: {
+        status: "failed",
+        summary: `The operator chose another model; the ${req.role} attempt on ${model.provider}/${model.id} stopped at an inference boundary.`,
+        claims: [],
+        evidence_refs: [],
+        new_hypotheses: [],
+        proposed_tasks: [],
+        details: { model: { provider: model.provider, id: model.id } },
+        error: MODEL_SUPERSEDED,
+      },
+      usage: null,
+      error: MODEL_SUPERSEDED,
+    });
     const holdForGateway = (signal: GatewayWaitSignal): Promise<number> => {
       const paced = signal.flattened ? escalateSyntheticWait(signal, gatewayRetries, MAX_ESCALATED_WAIT_MS) : signal;
       const scoped = { ...paced, provider: model.provider, model: model.id };
@@ -415,6 +449,9 @@ ${TOOL_TRANSITION_RULE}`;
     const guardConfig = guardConfigForRole(req.role, this.guardConfig);
 
     while (true) {
+      // Every pass of this loop starts a new inference request: the boundary
+      // at which an operator's model switch takes over (never mid-stream).
+      if (req.modelSuperseded?.()) return superseded();
       // Two retry layers, with a clean ownership split:
       //
       //   * the ADMISSION slot is held across the whole transient retry, because
@@ -464,6 +501,7 @@ ${TOOL_TRANSITION_RULE}`;
           const handover = withinGatewayBudget(decideTransientHandover(detail, gatewayRetries, gatewayRetryCeiling));
           if (handover.action === "wait") {
             gatewayRetries++;
+            noteCapacityWait(handover.signal);
             await holdForGateway(handover.signal);
             continue;
           }
@@ -531,6 +569,7 @@ ${TOOL_TRANSITION_RULE}`;
         const decision = withinGatewayBudget(decideGatewayRetry(assistantError, gatewayRetries, gatewayRetryCeiling));
         if (decision.action === "wait") {
           gatewayRetries++;
+          noteCapacityWait(decision.signal);
           await holdForGateway(decision.signal);
           continue;
         }

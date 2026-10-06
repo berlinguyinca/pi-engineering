@@ -121,6 +121,20 @@ export interface Mission {
   blocked_at?: string;
   /** Unique authority token for the current/most recent durable BLOCKED episode. */
   blocked_episode_id?: EntityId;
+  /**
+   * The operator's explicit model choice this mission adopted (Pi `/model`),
+   * honoured by every later worker dispatch over role pins and the router.
+   * Absent/null: automatic routing.
+   */
+  operator_model_pin?: OperatorModelPin | null;
+}
+
+/** A model the operator chose explicitly for a session's missions. */
+export interface OperatorModelPin {
+  provider: string;
+  id: string;
+  /** When the operator chose it. */
+  set_at: string;
 }
 
 export type TaskKind =
