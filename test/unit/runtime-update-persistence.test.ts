@@ -5,7 +5,7 @@
 
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, test } from "node:test";
@@ -106,6 +106,27 @@ test("mutation lock: records its process incarnation; a lock whose PID was reuse
   } finally {
     sleeper.kill("SIGKILL");
   }
+});
+
+test("mutation lock: an unreadable stale-break claim (empty, truncated, null) expires; a fresh one is respected", async () => {
+  const dir = tmp();
+  const file = join(dir, "runtime-update.lock");
+  const claim = `${file}.claim`;
+  const old = new Date(Date.now() - 60_000);
+  for (const content of ["", '{"pid":', "null", "42abc", "[]"]) {
+    writeFileSync(file, JSON.stringify({ pid: await deadPid(), token: "t", operation: "update", acquiredAt: "x" }));
+    writeFileSync(claim, content);
+    utimesSync(claim, old, old);
+    const handle = new RuntimeMutationLock(file).acquire("crash-recovery");
+    assert.equal(handle.owner.pid, process.pid, `claim ${JSON.stringify(content)} was broken`);
+    handle.release();
+    assert.equal(existsSync(claim), false);
+  }
+  // A claimant may be between creating and writing its claim: not broken yet.
+  writeFileSync(file, JSON.stringify({ pid: await deadPid(), token: "t", operation: "update", acquiredAt: "x" }));
+  writeFileSync(claim, "");
+  assert.throws(() => new RuntimeMutationLock(file).acquire("reload"), MutationLockBusyError);
+  assert.equal(existsSync(claim), true, "a fresh unreadable claim is left alone");
 });
 
 test("journal: atomic records, phases, incomplete detection, corrupt detection", () => {
