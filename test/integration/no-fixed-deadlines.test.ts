@@ -9,9 +9,11 @@
  */
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { readFile, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { describe, it } from "node:test";
 import { AdmissionController } from "../../src/gateway/AdmissionController.ts";
-import type { GitRepo } from "../../src/git/GitRepo.ts";
+import { GitRepo } from "../../src/git/GitRepo.ts";
 import {
   type BrokerBackends,
   DEFAULT_WORKER_INACTIVITY_MS,
@@ -21,6 +23,7 @@ import {
   workerTimeoutMs,
 } from "../../src/orchestration/broker.ts";
 import type { ExecutionOutcome } from "../../src/orchestration/broker.ts";
+import { CheckpointManager } from "../../src/orchestration/checkpoints.ts";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
 import { Orchestrator } from "../../src/orchestration/orchestrator.ts";
 import { MissionOwnership } from "../../src/orchestration/ownership.ts";
@@ -29,6 +32,7 @@ import { DEFAULT_WORKSET_POLICY } from "../../src/orchestration/workset.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 import { DEFAULT_GATEWAY_RESILIENCE } from "../../src/resilience/config.ts";
 import type { WorkerActivity } from "../../src/workers/WorkerExecutor.ts";
+import { makeFixtureRepo } from "../fixtures/make-fixture.ts";
 
 /**
  * A real worker process: prints one line every `everyMs` for `forMs` (or stays
@@ -389,5 +393,100 @@ describe("no fixed mission deadlines: controller ownership", () => {
       JSON.stringify({ reasons: result.verdict.reasons, tasks: tasks.map((t) => [t.status, t.failure_reason]) }),
     );
     assert.ok(h.agentCalls() >= 2, "the implementer ran again after the outage");
+  });
+});
+
+describe("no fixed mission deadlines: resuming a hung worker", () => {
+  it("resumes from the hung execution's preserved work instead of starting over", async () => {
+    const fx = await makeFixtureRepo();
+    try {
+      const git = (await GitRepo.open(fx.root))!;
+      const store = MissionStore.open(JsonlEventStore.inMemory());
+      const base = await git.headCommit();
+      const mission = store.createMission({
+        title: "resume",
+        goal: "resume",
+        user_request: "resume",
+        repository: fx.root,
+        base_ref: base,
+        risk_profile: "low",
+        workflow_class: "engineering_review",
+      });
+      store.bindWorkspaceManifest({
+        manifestId: "WM-resume",
+        missionId: mission.mission_id,
+        generation: 1,
+        authorizedRoots: [{ canonicalPath: fx.root, source: "existing_manifest", access: "write" }],
+        repositories: [
+          {
+            repoId: "repo-resume",
+            canonicalRoot: fx.root,
+            baseRef: "main",
+            baseSha: base,
+            writableDomains: ["src/**"],
+          },
+        ],
+        dependencyEdges: [],
+        hash: "manifest-resume",
+        createdAt: "2026-10-06T10:00:00.000Z",
+      });
+      for (const status of ["CLASSIFYING", "PLANNING", "READY", "EXECUTING"] as const) {
+        store.transitionMission(mission.mission_id, status);
+      }
+      const task = store.createTask({
+        mission_id: mission.mission_id,
+        repo_id: "repo-resume",
+        kind: "agent",
+        role: "implementer",
+        objective: "write the half-done module",
+        mutates_repo: true,
+        isolation: "worktree",
+        write_domains: ["src/**"],
+        deliverables: ["implementation"],
+        checkpoint_policy: { activity_milestone: 100, before_deadline_ms: 1_000 },
+        max_attempts: 1,
+      });
+      const seenOnResume: string[] = [];
+      let calls = 0;
+      const broker = new ExecutionBroker({
+        store,
+        git,
+        checkpoints: new CheckpointManager({ store }),
+        resolveRepository: async (repoId) => ({ repoId, root: fx.root, git }),
+        inactivityTimeoutMs: 400,
+        cancellationAckTimeoutMs: 5_000,
+        inferenceWaiting: () => false,
+        backends: {
+          agent: {
+            runAgent: async ({ worktree, signal, onActivity }) => {
+              calls++;
+              const file = join(worktree!, "src", "half.js");
+              if (calls === 1) {
+                // Real work, then the worker hangs without a word.
+                await writeFile(file, "export const half = 1;\n");
+                onActivity?.({
+                  kind: "tool",
+                  phase: "completed",
+                  toolName: "write",
+                  summary: "",
+                  meaningfulProgress: false,
+                });
+                await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+                return { executionId: "hung", exitStatus: "failed", summary: "aborted", artifactRefs: [], usage: {} };
+              }
+              seenOnResume.push(await readFile(file, "utf8").catch(() => "<missing>"));
+              await writeFile(file, "export const half = 2;\n");
+              return { executionId: "resumed", exitStatus: "succeeded", summary: "done", artifactRefs: [], usage: {} };
+            },
+          },
+        },
+      });
+      await new MissionScheduler({ store, broker }).runMission(mission.mission_id);
+      assert.equal(calls, 2);
+      assert.deepEqual(seenOnResume, ["export const half = 1;\n"], "the resumed worker continues the preserved work");
+      assert.equal(store.getTask(task.task_id)?.status, "SUCCEEDED");
+    } finally {
+      await fx.cleanup();
+    }
   });
 });

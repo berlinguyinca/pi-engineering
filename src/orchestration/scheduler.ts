@@ -431,6 +431,8 @@ export class MissionScheduler {
   private async executeWithRetry(task: OrchestrationTask, signal?: AbortSignal): Promise<void> {
     let attempt = task.attempt;
     let inactivityResumes = 0;
+    // A resumed run continues from the hung execution's preserved candidate.
+    let resumeFromSha: string | undefined;
     while (true) {
       if (signal?.aborted) {
         this.cancelTask(task);
@@ -486,7 +488,7 @@ export class MissionScheduler {
           executionBudgetMs: task.execution_budget_ms,
           checkpointPolicy: task.checkpoint_policy,
           requiredOutputArtifacts: task.required_output_artifacts,
-          candidateBaseSha: task.repair_base_candidate_sha,
+          candidateBaseSha: resumeFromSha ?? task.repair_base_candidate_sha,
           authority,
         });
         authority?.onInvalidated(() => {
@@ -571,6 +573,14 @@ export class MissionScheduler {
               observedAt: new Date(this.clockNow()).toISOString(),
             });
             if (!recoveryStop) {
+              // The broker checkpointed the hung run's work (dirty edits
+              // included) before releasing it; continue from that candidate
+              // rather than from the mission base.
+              const preserved = this.store
+                .listTaskCheckpoints(task.mission_id, task.task_id)
+                .filter((checkpoint) => checkpoint.executionId === handle?.executionId)
+                .at(-1)?.candidateSha;
+              if (preserved) resumeFromSha = preserved;
               authority?.assertAuthoritative();
               this.store.transitionTask(task.task_id, "RETRYING", "system", { attempt });
               continue;
