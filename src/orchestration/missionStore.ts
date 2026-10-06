@@ -827,8 +827,11 @@ export class MissionStore {
     // Re-entering the current state is an idempotent no-op. Throwing here
     // ("illegal mission transition BLOCKED -> BLOCKED") turned an already
     // recorded outcome into an exception that lost the mission id for the
-    // caller; writing it would open a spurious new blocked episode.
-    if (m.status === to && !repairRecoveryId) return m;
+    // caller; writing it would open a spurious new blocked episode. Options
+    // were validated above; a self-transition carrying a recovery decision
+    // still goes through the full transition checks below. Like every other
+    // read, the no-op hands out a copy, never the internal record.
+    if (m.status === to && !repairRecoveryId) return copyMission(m);
     let repairDecision: RecoveryDecision | undefined;
     if (m.status === "BLOCKED" && to === "REPAIRING") {
       repairDecision = repairRecoveryId ? this.recoveryDecisions.get(repairRecoveryId) : undefined;

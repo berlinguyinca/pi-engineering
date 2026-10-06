@@ -13,6 +13,32 @@ export const DEFAULT_STAGE_INACTIVITY_MS = 15 * 60_000;
 const MAX_STAGE_OUTPUT_BYTES = 16 * 1024 * 1024;
 
 /**
+ * Process groups of verification commands still running. `detached` gives each
+ * command its own group so a kill reaches grandchildren (npm -> node), but it
+ * also means the group is not taken down with this process. Best effort: when
+ * this process exits — normally, or on an uncaught exception — every live group
+ * is SIGKILLed. A SIGKILL of this process (or a signal without a handler)
+ * skips 'exit' handlers, so a group can still outlive it in that case.
+ */
+const liveProcessGroups = new Set<number>();
+let exitReaperInstalled = false;
+
+function trackProcessGroup(pid: number): void {
+  liveProcessGroups.add(pid);
+  if (exitReaperInstalled) return;
+  exitReaperInstalled = true;
+  process.on("exit", () => {
+    for (const group of liveProcessGroups) {
+      try {
+        process.kill(-group, "SIGKILL");
+      } catch {
+        // Already gone.
+      }
+    }
+  });
+}
+
+/**
  * Run a command with an INACTIVITY guard instead of a total-duration timeout:
  * every chunk of stdout/stderr re-arms it, so only a silent (hung) command is
  * killed. Resolves with the exit code; never rejects for a non-zero exit.
@@ -39,6 +65,8 @@ export function runWithInactivityGuard(
       stdio: ["ignore", "pipe", "pipe"],
       detached: process.platform !== "win32",
     });
+    const groupPid = process.platform !== "win32" ? child.pid : undefined;
+    if (groupPid) trackProcessGroup(groupPid);
     const killTree = (): void => {
       try {
         if (child.pid && process.platform !== "win32") process.kill(-child.pid, "SIGKILL");
@@ -73,6 +101,7 @@ export function runWithInactivityGuard(
     const finish = (fn: () => void): void => {
       if (settled) return;
       settled = true;
+      if (groupPid) liveProcessGroups.delete(groupPid);
       if (timer) clearTimeout(timer);
       opts.signal?.removeEventListener("abort", onAbort);
       fn();
@@ -236,6 +265,9 @@ async function readText(path: string): Promise<string | null> {
     return null;
   }
 }
+
+/** The test script `npm init` writes: it declares no tests and always fails. */
+const NPM_PLACEHOLDER_TEST = /^echo "Error: no test specified" && exit 1$/;
 
 /** True when a Makefile declares `target:` (not `target :=` assignments). */
 function makefileHasTarget(makefile: string, target: string): boolean {
@@ -455,8 +487,12 @@ export class CommandVerifier implements VerificationProvider {
       });
     };
     push("typecheck", scripts.typecheck ?? scripts.check);
-    push("test", scripts.test);
+    push("test", NPM_PLACEHOLDER_TEST.test(scripts.test ?? "") ? undefined : scripts.test);
     push("build", scripts.build);
+    // npm scripts win whenever they declare a typecheck/test/build. Otherwise
+    // (no package.json, or one carrying only lint/format/dev scripts in a
+    // mixed repository) the root's own ecosystem manifests decide.
+    if (stages.length === 0) stages.push(...(await nonNodeStages(cwd)));
     if (full) {
       // Broader suite: lint + an explicit full-test script, when declared.
       // Both are required so /verify full cannot report PASSED while the
@@ -464,7 +500,6 @@ export class CommandVerifier implements VerificationProvider {
       push("lint", scripts.lint);
       push("test:full", scripts["test:full"] ?? scripts["test:all"]);
     }
-    if (stages.length === 0) stages.push(...(await nonNodeStages(cwd)));
     if (stages.length === 0) {
       // No declared scripts. Only fall back to a syntax check if a real JS
       // entry file exists — otherwise the stage is doomed to ENOENT and would

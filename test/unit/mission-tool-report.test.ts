@@ -205,3 +205,95 @@ test("mission tool status shows elapsed time, last activity and the current stag
   assert.match(text, /no deadline/);
   assert.match(text, /cancel/);
 });
+
+function stopAwaitingUser(category: "REQUIREMENT_AMBIGUITY" | "AUTHORIZATION_OR_CREDENTIAL") {
+  const store = MissionStore.open(JsonlEventStore.inMemory());
+  const mission = store.createMission({
+    title: "Add an export",
+    goal: "Add an export",
+    user_request: "Add an export",
+    repository: ".",
+    base_ref: "base",
+    risk_profile: "low",
+    workflow_class: "engineering",
+  });
+  store.transitionMission(mission.mission_id, "CLASSIFYING");
+  store.transitionMission(mission.mission_id, "BLOCKED");
+  store.classifyFailure({
+    classificationId: "FCL-1",
+    missionId: mission.mission_id,
+    taskId: null,
+    executionId: null,
+    category,
+    evidenceRefs: [],
+    fingerprint: "fp",
+    summary: category === "REQUIREMENT_AMBIGUITY" ? "which export format?" : "OAuth token expired",
+    classifiedAt: "2026-10-01T00:00:00.000Z",
+  });
+  store.planRecovery({
+    recoveryId: "RCV-1",
+    missionId: mission.mission_id,
+    classificationId: "FCL-1",
+    action: category === "REQUIREMENT_AMBIGUITY" ? "WAIT_FOR_REQUIREMENT" : "STOP",
+    expectedMaterialChange: "user input",
+    attempt: 1,
+    maxAttempts: 1,
+    deadline: null,
+    nextActionAt: "2026-10-01T00:00:00.000Z",
+    status: "planned",
+    decidedAt: "2026-10-01T00:00:00.000Z",
+  });
+  store.stopMission(mission.mission_id, {
+    reason: "needs the user",
+    preservedWork: [],
+    attemptedRecoveries: ["RCV-1"],
+    resumeCondition: "the user answers",
+  });
+  return { store, missionId: mission.mission_id };
+}
+
+for (const category of ["REQUIREMENT_AMBIGUITY", "AUTHORIZATION_OR_CREDENTIAL"] as const) {
+  test(`mission tool refuses to resume a stop that waits for the user (${category}) (PR #106 review)`, async () => {
+    const { store, missionId } = stopAwaitingUser(category);
+    const resumed: string[] = [];
+    const execute = missionTool({
+      orchestrator: { store, orchestrate: async () => assert.fail("no orchestrate") },
+      resumeMission: async (id: string) => {
+        resumed.push(id);
+        return store.getMission(id)!;
+      },
+    });
+    const result = await execute("m", { action: "resume", missionId }, undefined, undefined, { cwd: "/repo" });
+    assert.deepEqual(resumed, [], "the model cannot resume a stop that waits for the user");
+    assert.match(result.content[0]!.text, /waiting for the user/i);
+    assert.match(result.content[0]!.text, new RegExp(`/mission resume ${missionId}`));
+  });
+}
+
+test("mission tool refuses to resume a WAITING_FOR_USER mission (PR #106 review)", async () => {
+  const store = MissionStore.open(JsonlEventStore.inMemory());
+  const mission = store.createMission({
+    title: "t",
+    goal: "t",
+    user_request: "t",
+    repository: ".",
+    base_ref: "base",
+    risk_profile: "low",
+    workflow_class: "engineering",
+  });
+  store.transitionMission(mission.mission_id, "CLASSIFYING");
+  store.transitionMission(mission.mission_id, "WAITING_FOR_USER");
+  const resumed: string[] = [];
+  const execute = missionTool({
+    orchestrator: { store, orchestrate: async () => assert.fail("no orchestrate") },
+    resumeMission: async (id: string) => {
+      resumed.push(id);
+      return store.getMission(id)!;
+    },
+  });
+  const result = await execute("m", { action: "resume", missionId: mission.mission_id }, undefined, undefined, {
+    cwd: "/repo",
+  });
+  assert.deepEqual(resumed, []);
+  assert.match(result.content[0]!.text, /waiting for the user/i);
+});

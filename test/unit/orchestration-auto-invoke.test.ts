@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { AUTO_INVOKE_MIN_CONFIDENCE, decideAutoInvoke } from "../../src/orchestration/autoInvoke.ts";
+import {
+  AUTO_INVOKE_MIN_CONFIDENCE,
+  decideAutoInvoke,
+  missionToolReportedUnavailable,
+} from "../../src/orchestration/autoInvoke.ts";
 
 const base = { mode: "tui" as const, missionToolUnavailable: false, lastAutoInvoked: null, now: 1_000_000 };
 
@@ -70,4 +74,25 @@ describe("mission auto-invoke keeps review requests", () => {
   it("still injects for an explicit code review request", () => {
     assert.equal(decideAutoInvoke({ ...base, prompt: "Review the changes on this branch for bugs" }).invoke, true);
   });
+});
+
+describe("missionToolReportedUnavailable (PR #106 review)", () => {
+  it("matches only the mission tool's own not-initialized message", () => {
+    assert.equal(missionToolReportedUnavailable("Orchestrator not initialized for this directory."), true);
+    assert.equal(
+      missionToolReportedUnavailable("Orchestrator not initialized for this directory: ledger locked by pid 42"),
+      true,
+    );
+    assert.equal(missionToolReportedUnavailable("Engineering runtime not initialized for this directory."), true);
+  });
+
+  for (const report of [
+    "Mission MSN-1 BLOCKED: current validation evidence is unavailable",
+    "Stop reason: the reviewer model is unavailable; retry later",
+    "Mission MSN-2 completed. Note: the cache was not initialized before the first run.",
+  ]) {
+    it(`does not treat an ordinary mission report as unavailability: ${JSON.stringify(report)}`, () => {
+      assert.equal(missionToolReportedUnavailable(report), false);
+    });
+  }
 });

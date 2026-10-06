@@ -239,17 +239,21 @@ export class FailureClassifier {
       return "TASK_BUDGET_EXHAUSTED";
     }
     // A lost execution lease ("execution X is no longer authoritative") is an
-    // ownership problem, not a credential one; check it before the auth words.
-    if (/no longer authoritative|orphan|no owner|stale owner/.test(summary)) return "ORPHANED_EXECUTION";
-    // `auth` is anchored: unanchored it matched "authoritative" and "author",
-    // turning a recoverable ownership loss into a credential STOP.
+    // ownership problem, not a credential one; that exact phrase is checked
+    // before the credential words. Loose ownership words ("orphan", "stale
+    // owner") are checked after them: "401 Unauthorized while pushing the
+    // orphaned branch" is a credential stop, not an ownership loss.
+    if (/no longer authoritative/.test(summary)) return "ORPHANED_EXECUTION";
+    // `auth` is anchored (optionally as OAuth): unanchored it matched
+    // "authoritative" and "author", turning an ownership loss into a STOP.
     if (
-      /invalid.*(api key|credential|model|config)|model.*(not found|does not exist)|\bauth(?:entication|enticate|orization|orize)?\b|unauthorized|forbidden/.test(
+      /invalid.*(api key|credential|model|config)|model.*(not found|does not exist)|\bo?auth(?:entication|enticate|orization|orize|orized)?\b|unauthori[sz]ed|forbidden|\b40[13]\b|credential|\btoken (?:expired|revoked|invalid)|\b(?:expired|revoked|invalid) (?:access |refresh |bearer )?token\b/.test(
         summary,
       )
     ) {
       return /provider|api key|model|config/.test(summary) ? "PROVIDER_PERMANENT" : "AUTHORIZATION_OR_CREDENTIAL";
     }
+    if (/orphan|no owner|stale owner/.test(summary)) return "ORPHANED_EXECUTION";
     if (/429|502|503|504|rate limit|network|econn|temporar|gateway|timeout|connection reset/.test(summary)) {
       return "PROVIDER_TRANSIENT";
     }

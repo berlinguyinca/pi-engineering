@@ -9,6 +9,8 @@
  * to whatever focus the caller (e.g. `/compact <focus>`) supplied.
  */
 
+import { isBareContinuation } from "../orchestration/autoInvoke.ts";
+
 /** Target ceiling for the summary, stated to the summarizer. */
 export const SUMMARY_WORD_CAP = 900;
 /** Longest slice of the latest request quoted into the instructions. */
@@ -32,13 +34,16 @@ function messageText(content: unknown): string {
     .join("\n");
 }
 
-/** The text of the most recent user message on the branch, if any. */
+/**
+ * The text of the most recent substantive user message on the branch, if any.
+ * A bare nudge ("yes", "continue", "retry") is skipped: it is not a new goal.
+ */
 export function latestUserRequest(entries: readonly unknown[]): string | undefined {
   for (let i = entries.length - 1; i >= 0; i--) {
     const entry = entries[i] as EntryLike | undefined;
     if (entry?.type !== "message" || entry.message?.role !== "user") continue;
     const text = messageText(entry.message.content).trim();
-    if (text) return text;
+    if (text && !isBareContinuation(text)) return text;
   }
   return undefined;
 }

@@ -34,6 +34,10 @@ const RESUBMIT_WINDOW_MS = 30_000;
 
 const BARE_CONTINUATION =
   /^(?:please\s+)?(?:retry|re-?try|try again|again|continue|go on|go ahead|keep going|carry on|resume|proceed|next|ok(?:ay)?|yes|y|yep|sure|do it|done)[\s.!]*$/i;
+/** True for a bare "continue"/"yes"/"retry" nudge that carries no request of its own. */
+export function isBareContinuation(prompt: string): boolean {
+  return BARE_CONTINUATION.test(prompt.trim());
+}
 const CHAT_OPENER = /^(?:hi|hello|hey|thanks|thank you|thx|cool|nice|great|lol)\b/i;
 
 export interface AutoInvokeInput {
@@ -95,7 +99,12 @@ export function decideAutoInvoke(input: AutoInvokeInput): AutoInvokeDecision {
   return { invoke: true, workflow, confidence: classified.confidence, reason: `engineering intent (${workflow})` };
 }
 
-/** True when a mission tool result says the runtime cannot serve missions here. */
+/**
+ * True when a mission tool result is the tool's own "cannot serve missions
+ * here" message (src/tools/coreTools.ts `notInitialized`). Matching only that
+ * prefix keeps an ordinary mission report ("validation evidence is
+ * unavailable") from switching auto-invoke off for the session.
+ */
 export function missionToolReportedUnavailable(text: string): boolean {
-  return /\bnot initialized\b|\bunavailable\b/i.test(text);
+  return /^(?:Orchestrator|Engineering runtime) not initialized for this directory\b/.test(text.trim());
 }

@@ -123,6 +123,14 @@ describe("MissionStore", () => {
     assert.equal(again.status, "BLOCKED");
     assert.equal(again.blocked_episode_id, blocked.blocked_episode_id, "no new blocked episode is opened");
     assert.equal(again.updated_at, blocked.updated_at, "nothing was written");
+    // PR #106 review: the no-op returns a copy, never the store's internal record.
+    (again as { status: string }).status = "COMPLETE";
+    assert.equal(s.getMission(mission.mission_id)!.status, "BLOCKED", "the caller cannot mutate the store");
+    assert.throws(
+      () => s.transitionMission(mission.mission_id, "BLOCKED", { bogus: true } as never),
+      /unsupported mission transition option/,
+      "options are still validated on a self-transition",
+    );
     assert.throws(() => s.transitionMission(mission.mission_id, "COMPLETE"), /illegal mission transition/);
   });
 

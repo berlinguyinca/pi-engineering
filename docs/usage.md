@@ -106,6 +106,38 @@ restart.
 | `/roadmap-status` | Show derived Roadmap 1.0 completion status for this repository. |
 | `/engineering admission` | Show a live InferWeave admission-retry summary (retries, waited time, reasons, saturation). |
 
+## Tool-call guard
+
+The extension guards the session's own tool calls (`src/guard/toolCallGuard.ts`,
+on by default):
+
+- An identical tool call (same tool, same arguments) repeated more than
+  `PI_REPEATED_TOOL_CALL_LIMIT` times in a row (default 8) is blocked. A single
+  read-only status query (`gh pr checks`, `gh run view`, `git status`,
+  `squeue`, …, optionally after `sleep N &&`) is polling and gets ten times
+  that limit.
+- A bash test/build command (`npm test`, `cargo build`, `make`, … at command
+  position) with no explicit `timeout` gets `PI_BASH_TEST_TIMEOUT_SEC`
+  (default 3600). This is a wall-clock limit: the hook cannot observe output
+  activity. Pass an explicit `timeout` for longer builds.
+- A command that just timed out is refused when re-run unchanged, unless the
+  re-run raises its `timeout`; the refusal expires after three other tool
+  calls. A user abort (Esc) never blocks a re-run.
+
+`PI_TOOL_CALL_GUARD=0` turns the guard off.
+
+## Verification commands
+
+`/verify` and the mission validators run the repository's own checks. npm
+`typecheck`/`check`, `test` and `build` scripts win when declared (npm's
+`no test specified` placeholder does not count); otherwise the root's
+`Cargo.toml`, `go.mod`, pytest configuration or `Makefile` decide, also in a
+mixed repository whose `package.json` only carries lint/format scripts. Each
+command runs in its own process group, killed after 15 minutes without output.
+When Pi exits — normally or on an uncaught exception — every running
+verification group is killed; a `SIGKILL` of Pi itself cannot run that cleanup,
+so a group can outlive it in that one case.
+
 ## Verifiable roadmap completion
 
 `node scripts/pi-engineering.ts roadmap check` (or `npm run roadmap:check`)
