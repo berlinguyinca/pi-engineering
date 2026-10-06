@@ -121,23 +121,25 @@ export function createRouteModel(opts: {
       id: model.id,
     }));
     const pin = routeOpts?.missionId ? opts.operatorPin?.(routeOpts.missionId) : undefined;
-    let pinRefused: string | undefined;
-    if (pin && !exclude.some((model) => modelKey(model) === modelKey(pin))) {
-      const refusal = await pinRefusal(opts.router, routerRoleFor(role) ?? "implementer", pin, {
-        ...(requester ? { requester } : {}),
-        ...(exclude.length > 0 ? { exclude } : {}),
-      });
-      if (!refusal) return { provider: pin.provider, id: pin.id, operatorPin: true } satisfies ModelRoute;
-      pinRefused = `operator pin ${modelKey(pin)} cannot serve ${role} (${refusal})`;
+    if (!pin) return routeRole(opts.router, role, !!routeOpts?.replacement, requester, exclude);
+    // A pin already tried, gone, or reserved by separation of duties (the
+    // reviewer of work the pin produced) is not forced back; the placement
+    // records it so an operator-switch check does not restart the attempt.
+    if (exclude.some((model) => modelKey(model) === modelKey(pin))) {
+      const routed = await routeRole(opts.router, role, !!routeOpts?.replacement, requester, exclude);
+      return routed && { ...routed, pinRefused: modelKey(pin) };
     }
-    const routed = await routeRole(opts.router, role, routeOpts?.replacement || !!pinRefused, requester, exclude);
-    if (!pinRefused) return routed;
+    const refusal = await pinRefusal(opts.router, routerRoleFor(role) ?? "implementer", pin, {
+      ...(requester ? { requester } : {}),
+      ...(exclude.length > 0 ? { exclude } : {}),
+    });
+    if (!refusal) return { provider: pin.provider, id: pin.id, operatorPin: true } satisfies ModelRoute;
+    const routed = await routeRole(opts.router, role, true, requester, exclude);
     if (!routed) return undefined;
-    const notice = `${pinRefused}; using ${modelKey(routed)} for this role`;
     return {
       ...routed,
-      warning: routed.warning ? `${notice}. ${routed.warning}` : notice,
-      ...(pin ? { pinRefused: modelKey(pin) } : {}),
+      pinRefused: modelKey(pin),
+      pinNotice: `operator pin ${modelKey(pin)} cannot serve ${role} (${refusal}); using ${modelKey(routed)} for this role`,
     };
   };
 }

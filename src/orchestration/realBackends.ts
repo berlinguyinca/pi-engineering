@@ -76,8 +76,10 @@ export interface ModelRoute extends ModelRef {
   warning?: string;
   /** The mission's operator pin (Pi `/model`) placed this role. */
   operatorPin?: boolean;
-  /** The operator pin ("provider/id") the router refused for this role, if any. */
+  /** The operator pin ("provider/id") not used for this role, if any. */
   pinRefused?: string;
+  /** Operator-visible reason the pin could not place this role. */
+  pinNotice?: string;
 }
 
 export interface RouteModelOptions {
@@ -387,6 +389,7 @@ export function realBackends(opts: RealBackendsOptions) {
     };
     let route = plan.initial;
     if (plan.announceWarnings && route?.warning) announce(route.warning);
+    if (route?.pinNotice) announce(route.pinNotice);
     arm(req, route, plan.context.missionId);
     let run = await runWorker(req, input);
     // The model the attempt ran on: the route; unrouted, the model the worker
@@ -402,6 +405,7 @@ export function realBackends(opts: RealBackendsOptions) {
         switches.push(notice);
         announce(notice);
         if (plan.announceWarnings && next?.warning) announce(next.warning);
+        if (next?.pinNotice) announce(next.pinNotice);
         if (model && next) plan.onSwitch?.(model, next);
         // Routing could not place the role on the new pin (the placement did
         // not change): run where routing says, and do not supersede again for

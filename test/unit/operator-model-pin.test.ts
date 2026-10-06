@@ -208,7 +208,8 @@ describe("operator model pin: routing", () => {
     const routed = await routeModel("vision_reviewer", { missionId: "MSN-pinned" });
     assert.equal(routed?.id, GLM.id);
     assert.notEqual(routed?.operatorPin, true);
-    assert.match(routed?.warning ?? "", /operator pin gw\/deepseek\S* cannot serve vision_reviewer \(missing vision/);
+    assert.match(routed?.pinNotice ?? "", /operator pin gw\/deepseek\S* cannot serve vision_reviewer \(missing vision/);
+    assert.equal(routed?.warning, undefined, "a pin refusal is not a review-independence warning");
   });
 
   it("a pinned model already tried or confirmed gone is not forced back", async () => {

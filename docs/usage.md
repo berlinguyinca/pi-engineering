@@ -48,25 +48,48 @@ the deterministic completion gate — no `/engineer` or `/review` needed.
 
 ### Switching the model a mission uses
 
-An explicit switch with `/model` (or model cycling) becomes this session's
-**operator pin**. Every mission started from (or resumed in) this session adopts
-it at its next inference boundary: the next worker dispatch, or a worker that is
-waiting for gateway capacity. A stream already in progress is never interrupted.
-The pin wins over `engineering.yaml` role pins and the capability router for
-every worker role, with two exceptions:
+An explicit switch with `/model` (or model cycling) becomes the **operator
+pin**. Every mission started from (or resumed in) this Pi process adopts it at
+its next inference boundary:
 
-- If the router knows the pinned model cannot serve a role, that role is routed
-  as usual and the mission says why. Reasons include a missing capability such
-  as vision, a context window that is too small, or a model that is unhealthy.
-- An independent reviewer still never runs on the model that produced the work.
+- the next worker dispatch, including scout workers;
+- for planner/worker (`PW-`) missions, the next contract dispatch, replan or
+  review;
+- a worker that is waiting for gateway capacity.
 
-The pin is stored on the mission, so it survives a restart. Each adoption is
-logged as a `MODEL_TRANSITION`. `/engineering-status` and mission status show
-`model: X (operator pin)`. To return missions to automatic routing, run
-`/engineering-model auto` or switch back to the model the session started on.
-Missions from other sessions are not affected. Automatic fallback of the
-interactive model (`PI_GATEWAY_MODEL_FALLBACK_ENABLED`) is still off by default,
-and a switch it makes is not an operator pin.
+A stream already in progress is never interrupted. The pin wins over
+`engineering.yaml` role pins and the capability router for every worker role,
+with these exceptions:
+
+- If the router or the gateway catalogue knows the pinned model cannot serve a
+  role, that role is routed as usual and the mission says why. Reasons include a
+  missing capability such as vision, a context window that is too small, no tool
+  calling, or an unhealthy model.
+- An independent reviewer never runs on the model that produced the work.
+- In planner/worker missions the planner and the implementer stay on different
+  models when another capable model exists. If the pinned model is the only one,
+  both use it and the `MODEL_TRANSITION` says why.
+- A reviewer may run on the pinned model when that model did not produce the
+  work. The pinned model is usually also your interactive model.
+
+The pin is held per Pi process, not per conversation. `/new` and
+`/engineering-model auto` clear it, and so does switching back to the model the
+session started on. Missions started by other Pi processes are not affected. The
+pin is stored on each mission that adopts it, so it survives a restart. Each
+adoption is logged as a `MODEL_TRANSITION`. `/engineering-status` and mission
+status show `model: X (operator pin)`. Automatic fallback of the interactive
+model (`PI_GATEWAY_MODEL_FALLBACK_ENABLED`) is still off by default, and a
+switch it makes is not an operator pin.
+
+### Interrupting and cancelling a mission
+
+Pressing Esc while the `mission` tool or `/mission` runs **pauses** the mission
+instead of cancelling it. In-flight work stops, interrupted tasks stay
+resumable, and progress is kept. The mission waits until you continue it with
+`/mission resume <id>` or the tool's `resume` action. A resumed mission keeps its
+operator pin. Only an explicit cancel ends a healthy mission: `/mission cancel
+<id>`, or the tool's `cancel` action. An interrupt that arrives before any work
+was planned still cancels, because there is nothing to keep.
 
 When a mission worker's model runs out of capacity (`queue_deadline_exceeded`,
 `queue_timeout`, `CAPACITY_EXHAUSTED`), the mission keeps waiting with no
@@ -132,7 +155,7 @@ restart.
 
 | Command        | Effect                                                        |
 | -------------- | ------------------------------------------------------------- |
-| `/mission G`   | Orchestration mission pipeline (intent → plan → execute → validate → review → complete). |
+| `/mission G`   | Orchestration mission pipeline (intent → plan → execute → validate → review → complete). Esc pauses it; `/mission resume <id>` continues it and `/mission cancel <id>` ends it. |
 | `/mission-status` | Show orchestration mission/task/execution status.          |
 | `/engineering-mode [m]` | Show or set the execution mode (`auto`, `planner-worker`, `single`). |
 | `/engineering-status` / `-plan` / `-workers` | Planner/worker mission status, contract DAG, role/model telemetry. `-status` also shows the session's mission model (`model: X (operator pin)`). |
