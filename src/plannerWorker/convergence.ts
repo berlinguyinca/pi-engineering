@@ -37,12 +37,18 @@ function hash(text: string): string {
 }
 
 function normalise(text: string): string {
-  return text
-    .toLowerCase()
-    .replace(/\d+(\.\d+)?m?s\b/g, "")
-    .replace(/0x[0-9a-f]+/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
+  return (
+    text
+      .toLowerCase()
+      // Timing noise must not make identical failures look different.
+      .replace(/\d{4}-\d\d-\d\dt[\d:.]+z?/g, "")
+      .replace(/duration_ms:?\s*[\d.]+/g, "")
+      .replace(/\d+\.\d+/g, "")
+      .replace(/\d+(\.\d+)?m?s\b/g, "")
+      .replace(/0x[0-9a-f]+/g, "")
+      .replace(/\s+/g, " ")
+      .trim()
+  );
 }
 
 export function contractHash(c: TaskContract): string {
