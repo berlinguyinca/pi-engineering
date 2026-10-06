@@ -1,0 +1,74 @@
+import assert from "node:assert/strict";
+import { test } from "node:test";
+import { ToolCallGuard, resolveToolCallGuardConfig } from "../../src/guard/toolCallGuard.ts";
+import { LifecycleHarness } from "../../src/lifecycle/harness.ts";
+
+const append = { command: "echo '- item' >> notes.md" };
+
+test("blocks the Nth identical consecutive tool call (session review: an append ran 153 times)", () => {
+  const guard = new ToolCallGuard({ enabled: true, maxIdenticalConsecutive: 5, testCommandTimeoutSec: 900 });
+  for (let i = 1; i <= 5; i++) assert.equal(guard.onToolCall("bash", { ...append }), undefined, `call ${i} allowed`);
+  const blocked = guard.onToolCall("bash", { ...append });
+  assert.equal(blocked?.block, true);
+  assert.match(blocked?.reason ?? "", /identical.*6 times/i);
+});
+
+test("a different call in between resets the identical-call run", () => {
+  const guard = new ToolCallGuard({ enabled: true, maxIdenticalConsecutive: 3, testCommandTimeoutSec: 900 });
+  for (let i = 0; i < 3; i++) guard.onToolCall("bash", { ...append });
+  guard.onToolCall("read", { path: "notes.md" });
+  assert.equal(guard.onToolCall("bash", { ...append }), undefined);
+});
+
+test("adds a default timeout to bash test/build commands, leaving explicit timeouts and other commands alone", () => {
+  const guard = new ToolCallGuard({ enabled: true, maxIdenticalConsecutive: 8, testCommandTimeoutSec: 600 });
+  for (const command of ["npm test", "npm run build", "npx tsc --noEmit", "cargo test", "go test ./...", "pytest -q"]) {
+    const input: Record<string, unknown> = { command };
+    guard.onToolCall("bash", input);
+    assert.equal(input.timeout, 600, command);
+  }
+  const explicit: Record<string, unknown> = { command: "npm test", timeout: 30 };
+  guard.onToolCall("bash", explicit);
+  assert.equal(explicit.timeout, 30);
+  const plain: Record<string, unknown> = { command: "ls -la" };
+  guard.onToolCall("bash", plain);
+  assert.equal(plain.timeout, undefined);
+});
+
+test("refuses to immediately re-run a command that just timed out or was aborted", () => {
+  const guard = new ToolCallGuard({ enabled: true, maxIdenticalConsecutive: 8, testCommandTimeoutSec: 600 });
+  const input = { command: "npm test" };
+  guard.onToolCall("bash", { ...input });
+  guard.onToolResult("bash", { ...input }, true, "...output...\n\nCommand timed out after 600 seconds");
+  const blocked = guard.onToolCall("bash", { ...input });
+  assert.equal(blocked?.block, true);
+  assert.match(blocked?.reason ?? "", /timed out/);
+  // A longer explicit timeout is a deliberate retry and is allowed.
+  assert.equal(guard.onToolCall("bash", { ...input, timeout: 1800 }), undefined);
+
+  guard.onToolResult("bash", { command: "make check" }, true, "Command aborted");
+  assert.equal(guard.onToolCall("bash", { command: "make check" })?.block, true);
+  assert.equal(guard.onToolCall("bash", { command: "make lint" }), undefined, "other commands run");
+});
+
+test("config is conservative by default and can be turned off", () => {
+  const defaults = resolveToolCallGuardConfig({});
+  assert.equal(defaults.enabled, true);
+  assert.ok(defaults.maxIdenticalConsecutive >= 8);
+  assert.equal(resolveToolCallGuardConfig({ PI_TOOL_CALL_GUARD: "0" }).enabled, false);
+  assert.equal(resolveToolCallGuardConfig({ PI_REPEATED_TOOL_CALL_LIMIT: "12" }).maxIdenticalConsecutive, 12);
+  assert.equal(resolveToolCallGuardConfig({ PI_BASH_TEST_TIMEOUT_SEC: "120" }).testCommandTimeoutSec, 120);
+  const off = new ToolCallGuard({ ...defaults, enabled: false });
+  for (let i = 0; i < 50; i++) assert.equal(off.onToolCall("bash", { ...append }), undefined);
+});
+
+test("the lifecycle harness tool_call hook applies the guard", async () => {
+  const handlers = new Map<string, (event: unknown, ctx: unknown) => Promise<unknown>>();
+  LifecycleHarness.create({}).register({
+    on: (name: string, handler: (event: unknown, ctx: unknown) => Promise<unknown>) => handlers.set(name, handler),
+  } as never);
+  const toolCall = handlers.get("tool_call")!;
+  const input: Record<string, unknown> = { command: "npm test" };
+  await toolCall({ type: "tool_call", toolName: "bash", toolCallId: "c1", input }, {});
+  assert.ok(typeof input.timeout === "number", "default timeout applied through the hook");
+});
