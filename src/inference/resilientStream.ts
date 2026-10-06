@@ -62,6 +62,7 @@ import type { ClassifiedInferenceFailure, StreamTerminationState } from "./failu
 import { classifyInferenceFailure } from "./failureClassifier.ts";
 import { metadataFromResponse } from "./inferweaveMetadata.ts";
 import { ModelHealthRegistry } from "./modelHealth.ts";
+import type { InferenceInvocation } from "./inferenceContext.ts";
 import { type ExecutedActionTracker, decideRecoveryStep, type RecoveryStep } from "./recovery.ts";
 import { resolveInferenceResilienceConfig, type InferenceResilienceConfig } from "./resilienceConfig.ts";
 import { StreamRetryPolicy } from "./retryPolicy.ts";
@@ -95,7 +96,7 @@ export interface ResilientStreamOptions {
    * Per-call identity (role / mission / worker / interactive). Consulted for
    * every provider call; wins over the static fields above.
    */
-  context?: () => { role?: string; missionId?: string; workerId?: string; interactive?: boolean } | undefined;
+  context?: () => Partial<InferenceInvocation> | undefined;
   /** Identity of the model object handed to the provider call. */
   refOf(model: unknown): ModelRef;
   /** Resolve a fallback selection back to a live model object. */
@@ -185,6 +186,7 @@ export class ResilientAttemptFlow {
   private capacitySince: number | undefined;
   private parked = false;
   /** The classification of the attempt currently being decided (for onHold). */
+  private readonly actions: ExecutedActionTracker | undefined;
   private lastFailure: ClassifiedInferenceFailure | undefined;
   private lastNote: string | undefined;
 
@@ -195,6 +197,7 @@ export class ResilientAttemptFlow {
     this.missionId = call.missionId ?? opts.missionId;
     this.workerId = call.workerId ?? opts.workerId;
     this.interactive = call.interactive ?? opts.interactive;
+    this.actions = call.actions ?? opts.actions;
     this.current = model;
     this.now = opts.now ?? (() => Date.now());
     this.config = resolveInferenceResilienceConfig(
@@ -294,6 +297,7 @@ export class ResilientAttemptFlow {
       retry_delay: failure.retryAfterMs,
       elapsed_wait: this.now() - this.startedAt,
       classified: failure,
+      metadata,
     });
 
     // A partial generation is recorded as `incomplete_generation` — never
@@ -304,7 +308,7 @@ export class ResilientAttemptFlow {
         partial_chars: observed.streamState.partialChars,
         kind: "incomplete_generation",
       });
-      this.opts.actions?.recordIncompleteGeneration({
+      this.actions?.recordIncompleteGeneration({
         model: modelKey(model),
         attempt: observed.attempt,
         chars: observed.streamState.partialChars,
@@ -359,7 +363,7 @@ export class ResilientAttemptFlow {
 
   /** Idempotency evidence for the retried request (spec §6), when any ran. */
   evidence(): string | undefined {
-    return this.opts.actions?.evidenceForRetry();
+    return this.actions?.evidenceForRetry();
   }
 
   private fallbackEnabled(): boolean {
@@ -428,8 +432,7 @@ export class ResilientAttemptFlow {
       default: {
         const delay = step.kind === "refresh_and_retry" ? this.policy.ladderDelayMs(this.attemptOnModel) : step.delayMs;
         if (step.kind === "refresh_and_retry") {
-          await this.refreshCatalog();
-          emit(this.opts.telemetry, "inference.catalog.refreshed", { ...base, failure_class: failure.class });
+          await this.refreshCatalog({ ...base, failure_class: failure.class });
         }
         if (failure.class === "model_activating" && this.activationSince === undefined) {
           this.activationSince = this.now();
@@ -515,7 +518,7 @@ export class ResilientAttemptFlow {
     const { registry, router } = this.opts;
     if (!registry) return undefined;
     if (failure.shouldRefreshCatalog || this.config.catalogRefreshOnNoWorkers) {
-      await this.refreshCatalog();
+      await this.refreshCatalog({ ...base, failure_class: failure.class });
     }
     const exclude = [...this.tried, this.current];
     const excluded = new Set(exclude.map(modelKey));
@@ -557,11 +560,21 @@ export class ResilientAttemptFlow {
     return undefined;
   }
 
-  private async refreshCatalog(): Promise<void> {
+  private async refreshCatalog(base?: InferenceTelemetryData): Promise<void> {
     try {
-      await this.opts.registry?.refresh();
+      const result = await this.opts.registry?.refresh();
+      emit(this.opts.telemetry, "inference.catalog.refreshed", {
+        ...(base ?? {}),
+        logical_model: modelKey(this.current),
+        ...(result ? { models: result.models, changed: result.changed } : {}),
+      });
     } catch {
       // A failed refresh must not block recovery; the stale catalog stays.
+      emit(this.opts.telemetry, "inference.catalog.refreshed", {
+        ...(base ?? {}),
+        logical_model: modelKey(this.current),
+        failed: true,
+      });
     }
   }
 }

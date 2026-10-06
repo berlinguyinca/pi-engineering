@@ -91,6 +91,12 @@ export interface WireResilientRuntimeOptions {
   status?: (line: string) => void;
   /** Idempotency tracker for tool calls already executed by this worker. */
   actions?: ExecutedActionTracker;
+  /**
+   * Telemetry bus to publish on. Defaults to the shared bus every armed
+   * runtime publishes to; pass a private one in tests or in a harness that
+   * owns its own observability surface.
+   */
+  telemetry?: InferenceTelemetry;
   env?: Record<string, string | undefined>;
   config?: Partial<InferenceResilienceConfig>;
   /** Elapsed budget for one logical request (PI_GATEWAY_RETRY_WINDOW default). */
@@ -114,7 +120,11 @@ export function wireResilientModelRuntime(
 ): "installed" | "already-installed" | "disabled" {
   const env = opts.env ?? (typeof process !== "undefined" ? process.env : {});
   const services = resilientServices({ env });
-  const config = resolveInferenceResilienceConfig(env, { ...services.config, ...opts.config });
+  // The caller's env + explicit config decide. The shared services' resolved
+  // config is NOT merged in: it came from a different environment (whatever
+  // armed the runtime first) and would silently outrank this one's
+  // PI_INFERENCE_* settings.
+  const config = resolveInferenceResilienceConfig(env, opts.config);
   const enabled = opts.enabled ?? config.enabled;
   if (!enabled) return "disabled";
   const admission = opts.admission ?? sharedAdmissionController();
@@ -127,7 +137,7 @@ export function wireResilientModelRuntime(
     router: opts.router,
     health: services.health,
     breakers: services.breakers,
-    telemetry: services.telemetry,
+    telemetry: opts.telemetry ?? services.telemetry,
     ...(opts.actions ? { actions: opts.actions } : {}),
     ...(opts.scheduler ? { scheduler: opts.scheduler } : {}),
     ...(opts.status ? { status: opts.status } : {}),

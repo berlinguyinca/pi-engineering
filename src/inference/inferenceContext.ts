@@ -18,6 +18,7 @@
  */
 
 import { AsyncLocalStorage } from "node:async_hooks";
+import type { ExecutedActionTracker } from "./recovery.ts";
 
 export interface InferenceInvocation {
   /** Worker/router role of the invocation ("implementer", "planner", ...). */
@@ -26,6 +27,12 @@ export interface InferenceInvocation {
   workerId?: string;
   /** Interactive turns keep their own fallback policy (opt-in, spec §21). */
   interactive?: boolean;
+  /**
+   * The tracker of the tool calls THIS invocation already executed (spec §6).
+   * Per invocation because a retried worker session must list — never replay —
+   * the edits/commits of the generation that was cut.
+   */
+  actions?: ExecutedActionTracker;
 }
 
 const storage = new AsyncLocalStorage<InferenceInvocation>();

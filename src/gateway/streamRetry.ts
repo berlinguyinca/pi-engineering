@@ -411,7 +411,9 @@ export async function pumpWithGatewayRetry<E extends RetryableEvent, R extends R
     // A classifier-supplied wait IS the ladder's pacing (server timing first,
     // then the retry policy): escalating or re-pacing it on top would move a
     // number the gateway chose. Text-derived waits keep both guards.
-    const escalated = classified ?? (wait ? escalateSyntheticWait(wait, attempt + priorHolds, capMs) : undefined);
+    // Nothing is escalated once output reached the sink: `wait` is null there,
+    // and a decision to replay after committed output would duplicate it.
+    const escalated = wait ? (classified ?? escalateSyntheticWait(wait, attempt + priorHolds, capMs)) : undefined;
     if (escalated && waitingSinceMs === undefined) waitingSinceMs = wallNow();
     const held = escalated
       ? classified
