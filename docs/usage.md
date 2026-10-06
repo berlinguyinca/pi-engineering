@@ -46,12 +46,54 @@ The pipeline routes intent, creates a durable **mission**, plans/executes
 workers, runs validation, launches a fresh independent reviewer, and enforces
 the deterministic completion gate — no `/engineer` or `/review` needed.
 
+## Planner/worker execution mode
+
+`/mission` can split a mission across models by cognitive role. A planner turns
+the mission into a validated DAG of bounded task contracts. Implementers then
+carry out each contract in its own git worktree, in parallel where the
+contracts are independent, and a reviewer judges every result. Roles resolve
+through gateway aliases and capabilities, never model names. Escalation,
+convergence detection and replanning are automatic. Design:
+[`docs/specs/planner-worker-hot-model-routing.md`](specs/planner-worker-hot-model-routing.md).
+Gateway contract:
+[`docs/specs/planner-worker-inferweave-contract.md`](specs/planner-worker-inferweave-contract.md).
+
+```bash
+/engineering-mode            # show: auto (default) | planner-worker | single
+/engineering-mode planner-worker
+/engineering-status          # planner, workers, reviewer, attempts, escalations
+/engineering-plan            # the contract DAG by layer
+/engineering-workers         # contracts + per role/model telemetry + MODEL_TRANSITIONs
+npm run bench:planner-worker -- --base-url http://localhost:8081/v1   # modes A-D
+```
+
+In `auto` mode, planner-worker runs only when all of these hold:
+
+- the mission is a nontrivial engineering change;
+- the gateway advertises role capabilities or aliases;
+- the gateway can serve the planner and the implementer on distinct models.
+
+Otherwise `/mission` runs the existing single-model orchestrator unchanged.
+
+Configuration lives in `engineering.yaml` under `planner_worker:`. It covers
+`mode`, `provider`, `concurrency`, `roles.<role>` (`capability`, `alias`,
+`preferred_family`, `min_context`), `escalation` and `convergence`. State is
+written to `.pi-eng/planner-worker/<mission>/state.json` and
+`transitions.jsonl`. An interrupted mission resumes with
+`/mission resume PW-<id>`. Contracts already merged into the mission branch
+are kept and are not run again. Missions are bounded by attempts and
+convergence (stall detection), not by wall-clock budgets. Route swaps on
+InferWeave (`/iw/v1/routes/events`) are followed between requests, without a
+restart.
+
 ## Individual commands
 
 | Command        | Effect                                                        |
 | -------------- | ------------------------------------------------------------- |
 | `/mission G`   | Orchestration mission pipeline (intent → plan → execute → validate → review → complete). |
 | `/mission-status` | Show orchestration mission/task/execution status.          |
+| `/engineering-mode [m]` | Show or set the execution mode (`auto`, `planner-worker`, `single`). |
+| `/engineering-status` / `-plan` / `-workers` | Planner/worker mission status, contract DAG, role/model telemetry. |
 | `/engineer G`  | Full adaptive workflow (scout → implement → verify → review). |
 | `/tournament G [n]` | Candidate tournament: n independent implementations, verify+review each, promote the deterministic winner (default 3, `--parallel` opt-in). |
 | `/plan G`      | Decompose `G` into a dependency-aware task DAG (recorded in the ledger). |
