@@ -73,7 +73,7 @@ When a mission worker's model runs out of capacity (`queue_deadline_exceeded`,
 deadline. It shows `model X is out of capacity; … switch with /model to
 continue`, so you can move it without cancelling.
 
-`/refresh-models` probes each model with one minimal request: 32 tokens, no
+`/refresh-models` probes each model with one minimal request: 64 output tokens, no
 streaming, no tools, no images. A model whose probe gets HTTP 400 is retried
 once without the optional parameters (`temperature`, `reasoning_effort`). Each
 model gets its own verdict:

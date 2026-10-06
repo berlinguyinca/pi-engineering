@@ -81,8 +81,12 @@ const DEFAULT_PROBE_TIMEOUT_MS = 15_000;
 // failure and hide an otherwise healthy model. Callers may opt into bounded
 // parallelism when their gateway is known to have independent capacity.
 const DEFAULT_PROBE_CONCURRENCY = 1;
-/** Enough for "OK"; small so the probe never brushes a model's per-slot context. */
-const PROBE_MAX_TOKENS = 32;
+/**
+ * Small, so the probe never brushes a model's per-slot context, yet the same
+ * budget as before: a reasoning model that ignores the thinking-off parameter
+ * still needs room to reach a visible "OK".
+ */
+const PROBE_MAX_TOKENS = 64;
 
 /**
  * One model's verification verdict.
@@ -210,7 +214,8 @@ async function probeGatewayModel(
       // Without the thinking-off parameter a reasoning model may spend the
       // whole small budget thinking; an accepted request still proves it is
       // served, which is all the retry has to establish.
-      if (!optional && Array.isArray((payload as { choices?: unknown })?.choices)) {
+      const choices = (payload as { choices?: unknown })?.choices;
+      if (!optional && Array.isArray(choices) && choices.length > 0) {
         return { verdict: "working", note: "accepted without optional probe parameters" };
       }
       return { verdict: "unavailable", reason: "returned no visible completion" };
@@ -268,10 +273,12 @@ async function verifiedGatewayModels(
           // accept. Retry once with only the required fields; a second refusal
           // is the model's definitive answer to the minimal probe.
           const retry = await probeGatewayModel(model, baseUrl, opts, null);
+          // Whatever else the retry says, the model answered the full probe with
+          // a 400: it is never pruned on the retry's word alone.
           result =
             retry.verdict === "working"
               ? { verdict: "working", note: "verified without optional probe parameters" }
-              : retry.verdict === "rejected"
+              : retry.verdict === "rejected" || retry.verdict === "unavailable"
                 ? result
                 : retry;
         }

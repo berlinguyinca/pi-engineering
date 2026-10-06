@@ -20,8 +20,9 @@ import { normalizeModelRecord } from "../../src/capability/modelRecord.ts";
 import { ModelCapabilityRegistry } from "../../src/capability/registry.ts";
 import { RoleRouter } from "../../src/capability/router.ts";
 import { DEFAULT_POLICY } from "../../src/lifecycle/policy.ts";
-import type { ModelRecord, ModelRef } from "../../src/lifecycle/types.ts";
+import { type ModelRecord, type ModelRef, modelKey } from "../../src/lifecycle/types.ts";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
+import { realBackends } from "../../src/orchestration/realBackends.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 import { UnavailableModels, createRouteModel } from "../../src/runtime/modelRouting.ts";
 import {
@@ -36,6 +37,7 @@ import {
   sessionModelChoice,
 } from "../../src/runtime/operatorModelPin.ts";
 import { missionReportLines } from "../../src/tools/missionReport.ts";
+import { MODEL_SUPERSEDED, type WorkerExecutor } from "../../src/workers/WorkerExecutor.ts";
 
 const GLM: ModelRef = { provider: "gw", id: "glm5.3-flash-modality-vision-quant-q6_k_xl" };
 const DEEPSEEK: ModelRef = { provider: "gw", id: "deepseek_v4-flash-modality-text-quant-mxfp4" };
@@ -120,6 +122,12 @@ describe("operator model pin: session choice", () => {
     onOperatorModelSelect(session, { model: DEEPSEEK, source: "set" });
     clearOperatorModelPin(session);
     assert.match(describeModelChoice(sessionModelChoice(session)), /^model: auto/);
+    assert.equal(
+      onOperatorModelSelect(session, { model: GLM, source: "set" }).action,
+      "ignored",
+      "returning to the session's own model after auto does not pin it",
+    );
+    assert.equal(sessionModelChoice(session)?.kind, "auto");
   });
 });
 
@@ -213,5 +221,83 @@ describe("operator model pin: routing", () => {
     assert.equal((await routeModel("implementer", { missionId: "M", exclude: [DEEPSEEK] }))?.id, GLM.id);
     unavailable.mark(DEEPSEEK);
     assert.equal((await routeModel("implementer", { missionId: "M" }))?.id, GLM.id);
+  });
+});
+
+describe("operator model pin: switch at the inference boundary", () => {
+  /** A worker that, like PiWorkerExecutor, checks for an operator switch before each request. */
+  function boundaryWorker(seen: Array<{ model: string | null; superseded: boolean }>): WorkerExecutor {
+    return {
+      async run(req) {
+        const superseded = req.modelSuperseded?.() === true;
+        seen.push({
+          model: req.modelOverride ? `${req.modelOverride.provider}/${req.modelOverride.id}` : null,
+          superseded,
+        });
+        const base = { claims: [], evidence_refs: [], new_hypotheses: [], proposed_tasks: [], details: {} };
+        return superseded
+          ? { result: { ...base, status: "failed", summary: "switched", error: MODEL_SUPERSEDED }, usage: null }
+          : { result: { ...base, status: "completed", summary: "done" }, usage: null };
+      },
+    };
+  }
+
+  async function backendsFor(router: Parameters<typeof createRouteModel>[0]["router"], pin: () => ModelRef | null) {
+    const seen: Array<{ model: string | null; superseded: boolean }> = [];
+    const unavailable = new UnavailableModels();
+    const backends = realBackends({
+      worker: boundaryWorker(seen),
+      verifier: {} as never,
+      artifacts: { readContentByUri: async () => undefined } as never,
+      git: null,
+      cwd: tmpdir(),
+      routeModel: createRouteModel({ router, unavailable, operatorPin: pin }),
+      currentOperatorPin: pin,
+    });
+    const run = (role: string) =>
+      backends.agent.runAgent({
+        role,
+        objective: "x",
+        missionId: "MSN-b",
+        taskId: "T",
+        signal: new AbortController().signal,
+      });
+    return { seen, run };
+  }
+
+  it("a pin naming the model the role already runs on does not restart the attempt", async () => {
+    const h = await backendsFor(await pinnedPolicyRouter(), () => GLM);
+    const outcome = await h.run("implementer");
+    assert.equal(outcome.exitStatus, "succeeded");
+    assert.deepEqual(h.seen, [{ model: modelKey(GLM), superseded: false }]);
+  });
+
+  it("a pin the router cannot place for the role ends after one re-dispatch instead of spinning", async () => {
+    // Only a text model exists, and the role needs vision: the pin is refused
+    // and routing has nowhere else to go.
+    const registry = await ModelCapabilityRegistry.open({
+      sources: [
+        new InventorySource([
+          normalizeModelRecord({ ...DEEPSEEK, source: "test", toolCall: true, contextWindow: 262_144 }),
+        ]),
+      ],
+      context: { cwd: tmpdir(), agentDir: tmpdir() },
+    });
+    await registry.refresh();
+    const router = new RoleRouter({ registry, policy: structuredClone(DEFAULT_POLICY) });
+    const h = await backendsFor(
+      {
+        select: (role, query) => router.select({ ...(query ?? {}), role }),
+        route: async (role, query) => {
+          const selected = (await router.select({ ...(query ?? {}), role })).selected;
+          return selected ? { provider: selected.provider, id: selected.id } : undefined;
+        },
+      },
+      () => DEEPSEEK,
+    );
+    const outcome = await h.run("vision_reviewer");
+    assert.equal(outcome.exitStatus, "succeeded");
+    assert.ok(h.seen.length <= 2, JSON.stringify(h.seen));
+    assert.equal(h.seen.at(-1)?.superseded, false);
   });
 });

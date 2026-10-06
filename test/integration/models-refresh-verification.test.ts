@@ -169,6 +169,7 @@ test("refresh: a per-model HTTP 400 is reported for that model and never aborts 
     assert.equal(c80k.length, 2);
     for (const probe of gateway.probes) {
       assert.ok(Number(probe.body.max_tokens) <= 64, "the probe asks for a small completion");
+      assert.equal(probe.body.stream, false);
       for (const forbidden of ["tools", "stream_options", "response_format"]) {
         assert.equal(probe.body[forbidden], undefined, `the probe never sends ${forbidden}`);
       }

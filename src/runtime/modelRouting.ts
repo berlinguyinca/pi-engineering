@@ -134,7 +134,11 @@ export function createRouteModel(opts: {
     if (!pinRefused) return routed;
     if (!routed) return undefined;
     const notice = `${pinRefused}; using ${modelKey(routed)} for this role`;
-    return { ...routed, warning: routed.warning ? `${notice}. ${routed.warning}` : notice };
+    return {
+      ...routed,
+      warning: routed.warning ? `${notice}. ${routed.warning}` : notice,
+      ...(pin ? { pinRefused: modelKey(pin) } : {}),
+    };
   };
 }
 

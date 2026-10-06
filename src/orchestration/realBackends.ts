@@ -76,6 +76,8 @@ export interface ModelRoute extends ModelRef {
   warning?: string;
   /** The mission's operator pin (Pi `/model`) placed this role. */
   operatorPin?: boolean;
+  /** The operator pin ("provider/id") the router refused for this role, if any. */
+  pinRefused?: string;
 }
 
 export interface RouteModelOptions {
@@ -325,14 +327,29 @@ export function realBackends(opts: RealBackendsOptions) {
     const pin = opts.currentOperatorPin(missionId);
     return pin ? modelKey(pin) : null;
   };
-  /** Place the attempt on `route` and arm the operator-switch check for it. */
-  const arm = (req: WorkerRequest, route: ModelRoute | undefined, missionId: string | undefined): void => {
+  /**
+   * Place the attempt on `route` and arm the operator-switch check for it: the
+   * attempt is superseded when the mission's pin names a model other than the
+   * one this attempt runs on — unless the router already refused that pin for
+   * this role, or the pin was cleared (a running attempt is not restarted just
+   * to return to automatic routing).
+   */
+  const arm = (
+    req: WorkerRequest,
+    route: ModelRoute | undefined,
+    missionId: string | undefined,
+    unservable: string | null = null,
+  ): void => {
     if (route) req.modelOverride = { provider: route.provider, id: route.id };
     else delete req.modelOverride;
     req.operatorPinned = route?.operatorPin === true;
     if (!missionId || !opts.currentOperatorPin) return;
-    const dispatchedWith = pinKeyOf(missionId);
-    req.modelSuperseded = () => pinKeyOf(missionId) !== dispatchedWith;
+    const running = route ? modelKey(route) : null;
+    const refused = route?.pinRefused ?? unservable;
+    req.modelSuperseded = () => {
+      const pin = pinKeyOf(missionId);
+      return pin !== null && pin !== running && pin !== refused;
+    };
   };
   /**
    * Run a worker on `plan.initial` (or, unrouted, on the executor default).
@@ -386,9 +403,13 @@ export function realBackends(opts: RealBackendsOptions) {
         announce(notice);
         if (plan.announceWarnings && next?.warning) announce(next.warning);
         if (model && next) plan.onSwitch?.(model, next);
+        // Routing could not place the role on the new pin (the placement did
+        // not change): run where routing says, and do not supersede again for
+        // that same pin — otherwise this would spin.
+        const unchanged = (next ? modelKey(next) : null) === (route ? modelKey(route) : null);
         route = next;
         req.sessionId = plan.freshSessionId();
-        arm(req, route, plan.context.missionId);
+        arm(req, route, plan.context.missionId, unchanged ? pinKeyOf(plan.context.missionId) : null);
         run = await runWorker(req, input);
         model = route ?? ranOn(run) ?? opts.reviewFallbackModel;
         continue;

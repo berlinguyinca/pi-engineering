@@ -413,6 +413,15 @@ ${TOOL_TRANSITION_RULE}`;
         key: `mission-capacity:${key}`,
       });
     };
+    // Asking may persist the mission's adoption of the new pin; a store error
+    // there must not end this run, so it reads as "not switched".
+    const operatorSwitched = (): boolean => {
+      try {
+        return req.modelSuperseded?.() === true;
+      } catch {
+        return false;
+      }
+    };
     const superseded = (): WorkerRun => ({
       result: {
         status: "failed",
@@ -451,7 +460,7 @@ ${TOOL_TRANSITION_RULE}`;
     while (true) {
       // Every pass of this loop starts a new inference request: the boundary
       // at which an operator's model switch takes over (never mid-stream).
-      if (req.modelSuperseded?.()) return superseded();
+      if (operatorSwitched()) return superseded();
       // Two retry layers, with a clean ownership split:
       //
       //   * the ADMISSION slot is held across the whole transient retry, because

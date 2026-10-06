@@ -111,7 +111,8 @@ export function onOperatorModelSelect(
     return { action: "ignored", reason: `source ${event.source ?? "unknown"}` };
   }
   const state = stateFor(sessionId);
-  if (state.choice?.kind === "pin" && sameModel(state.baseline, event.model)) {
+  if (sameModel(state.baseline, event.model)) {
+    if (state.choice?.kind !== "pin") return { action: "ignored", reason: "already on the session's own model" };
     clearOperatorModelPin(sessionId, now);
     return { action: "cleared", reason: `switched back to ${modelKey(event.model)}` };
   }
