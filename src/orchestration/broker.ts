@@ -2490,8 +2490,14 @@ export class ExecutionBroker {
               this.missionRepositories.set(input.missionId, repository);
               // ADDITIVE (defect-4): capture the nested standalone repo HEADs
               // once per mission as the execution-start baseline for
-              // publication detection.
-              this.nestedBaselineFor(input.missionId, repository.git);
+              // publication detection. Fail-closed: if the provider lacks the
+              // nested API or the scan throws, there is simply no baseline and
+              // no publication records are produced (no false evidence).
+              try {
+                this.nestedBaselineFor(input.missionId, repository.git);
+              } catch {
+                // provider without the nested repo API — no baseline, no records
+              }
             }
             const repositoryBinding = input.repoId
               ? this.store
