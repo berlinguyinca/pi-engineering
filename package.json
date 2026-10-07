@@ -58,7 +58,7 @@
     "runtimeApi": 1,
     "entry": "src/runtime/host/runtimeEntry.ts",
     "minimumPiVersion": "0.87.0",
-    "maximumPiVersion": "0.x",
+    "maximumPiVersion": "1.x",
     "stateSchema": { "minReadable": 1, "maxReadable": 1, "writes": 1 }
   },
   "dependencies": {

@@ -117,99 +117,118 @@ test("mutation lock: records its process incarnation; a lock whose PID was reuse
   }
 });
 
-test("mutation lock: an unreadable stale-break claim (empty, truncated, null) expires; a fresh one is respected", async () => {
+test("mutation lock: an unreadable lock or an abandoned takeover claim is taken over once old; fresh ones are respected", async () => {
   const dir = tmp();
   const file = join(dir, "runtime-update.lock");
-  const claim = `${file}.claim`;
   const old = new Date(Date.now() - 60_000);
-  for (const content of ["", '{"pid":', "null", "42abc", "[]"]) {
-    writeFileSync(file, JSON.stringify({ pid: await deadPid(), token: "t", operation: "update", acquiredAt: "x" }));
-    writeFileSync(claim, content);
-    utimesSync(claim, old, old);
+  const markers = () => readdirSync(dir).filter((name) => name.includes(".takeover-"));
+
+  // An unreadable lock: held while it may still be being written, taken over once old.
+  for (const content of ["", '{"pid":', "null", "[]"]) {
+    writeFileSync(file, content);
+    assert.throws(() => new RuntimeMutationLock(file).acquire("reload"), MutationLockBusyError, "fresh: busy");
+    utimesSync(file, old, old);
     const handle = new RuntimeMutationLock(file).acquire("crash-recovery");
-    assert.equal(handle.owner.pid, process.pid, `claim ${JSON.stringify(content)} was broken`);
+    assert.equal(
+      new RuntimeMutationLock(file).readOwner()?.token,
+      handle.owner.token,
+      `lock ${JSON.stringify(content)}`,
+    );
     handle.release();
-    assert.equal(existsSync(claim), false);
+    assert.deepEqual(markers(), []);
   }
-  // A claimant may be between creating and writing its claim: not broken yet.
-  writeFileSync(file, JSON.stringify({ pid: await deadPid(), token: "t", operation: "update", acquiredAt: "x" }));
-  writeFileSync(claim, "");
-  assert.throws(() => new RuntimeMutationLock(file).acquire("reload"), MutationLockBusyError);
-  assert.equal(existsSync(claim), true, "a fresh unreadable claim is left alone");
-});
 
-test("mutation lock: expiring a stale claim never deletes a fresh claim that replaced it meanwhile", async () => {
-  const dir = tmp();
-  const file = join(dir, "runtime-update.lock");
-  const claim = `${file}.claim`;
-  const old = new Date(Date.now() - 60_000);
-  writeFileSync(file, JSON.stringify({ pid: await deadPid(), token: "t", operation: "update", acquiredAt: "x" }));
-  writeFileSync(claim, "");
-  utimesSync(claim, old, old);
-  const fresh = JSON.stringify({ pid: process.pid, note: "a live claimant that won the race" });
-  const lock = new RuntimeMutationLock(file, {
-    // Between judging the old claim stale and breaking it, another process
-    // expires it too and publishes its own (fresh, live) claim.
-    beforeClaimExpire: () => {
-      rmSync(claim);
-      writeFileSync(claim, fresh);
-    },
-  });
-  assert.throws(() => lock.acquire("reload"), MutationLockBusyError, "the live claimant is respected");
-  assert.equal(readFileSync(claim, "utf8"), fresh, "the fresh claim survived");
-  assert.deepEqual(
-    readdirSync(dir).filter((name) => name.includes(".claim.")),
-    [],
-    "no tombstone is left behind",
+  // A dead owner whose takeover claim was abandoned (claimant crashed, or killed mid-write).
+  for (const claim of ["", '{"pid":', "null", "dead-claimant"]) {
+    writeFileSync(
+      file,
+      JSON.stringify({ pid: await deadPid(), token: "stale-owner", operation: "update", acquiredAt: "x" }),
+    );
+    const marker = `${file}.takeover-stale-owner`;
+    writeFileSync(
+      marker,
+      claim === "dead-claimant"
+        ? JSON.stringify({ pid: await deadPid(), token: "crashed-claimant", operation: "x", acquiredAt: "x" })
+        : claim,
+    );
+    utimesSync(marker, old, old);
+    const handle = new RuntimeMutationLock(file).acquire("crash-recovery");
+    assert.equal(handle.owner.pid, process.pid, `abandoned claim ${JSON.stringify(claim)} taken over`);
+    handle.release();
+    assert.deepEqual(markers(), [], "no claim files left behind");
+  }
+
+  // A LIVE claimant's takeover claim is never touched.
+  writeFileSync(
+    file,
+    JSON.stringify({ pid: await deadPid(), token: "stale-owner", operation: "update", acquiredAt: "x" }),
   );
+  const marker = `${file}.takeover-stale-owner`;
+  writeFileSync(
+    marker,
+    JSON.stringify({ ...currentProcessIdentity(), token: "live-claimant", operation: "x", acquiredAt: "x" }),
+  );
+  assert.throws(() => new RuntimeMutationLock(file).acquire("reload"), MutationLockBusyError);
+  assert.equal(JSON.parse(readFileSync(marker, "utf8")).token, "live-claimant", "the live claim survived");
 });
 
-test("mutation lock: processes racing over a stale lock AND a stale claim never both hold it", async () => {
+test("mutation lock: 6 processes racing a stale lock while one live claimant holds the takeover: one holder, claim survives", async () => {
   const file = join(tmp(), "runtime-update.lock");
-  const claim = `${file}.claim`;
-  for (let round = 0; round < 3; round++) {
+  const script = (slow: boolean) => `
+    import { readFileSync, existsSync } from "node:fs";
+    import { RuntimeMutationLock } from ${JSON.stringify(lockModule)};
+    const sleep = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+    let survived = "n/a";
+    const lock = new RuntimeMutationLock(${JSON.stringify(file)}, ${
+      slow
+        ? `{ afterTakeoverClaimed: (claim) => {
+            process.stdout.write("CLAIMED\\n");
+            const mine = readFileSync(claim, "utf8");
+            sleep(700); // racers run now
+            survived = existsSync(claim) && readFileSync(claim, "utf8") === mine ? "yes" : "no";
+          } }`
+        : "{}"
+    });
+    let h;
+    try { h = lock.acquire("race"); } catch { process.stdout.write("BUSY\\n"); process.exit(0); }
+    process.stdout.write("HELD " + Date.now() + " SURVIVED " + survived + "\\n");
+    await new Promise((r) => setTimeout(r, 300));
+    process.stdout.write("RELEASED " + Date.now() + "\\n");
+    h.release();
+  `;
+  const run = (slow: boolean, onClaimed?: () => void) =>
+    new Promise<string>((resolveRun) => {
+      const child = spawn(process.execPath, ["--no-warnings", "--input-type=module", "-e", script(slow)], {
+        stdio: ["ignore", "pipe", "inherit"],
+      });
+      let out = "";
+      child.stdout.on("data", (d: Buffer) => {
+        out += d.toString();
+        if (out.includes("CLAIMED")) onClaimed?.();
+      });
+      child.on("exit", () => resolveRun(out));
+    });
+  for (let round = 0; round < 2; round++) {
     writeFileSync(
       file,
       JSON.stringify({ pid: await deadPid(), token: `stale-${round}`, operation: "update", acquiredAt: "x" }),
     );
-    writeFileSync(claim, round % 2 === 0 ? "" : JSON.stringify({ pid: await deadPid() }));
-    const old = new Date(Date.now() - 60_000);
-    utimesSync(claim, old, old);
-    const script = `
-      import { RuntimeMutationLock } from ${JSON.stringify(lockModule)};
-      const lock = new RuntimeMutationLock(${JSON.stringify(file)});
-      await new Promise((r) => setTimeout(r, 200 - Date.now() % 200));
-      let h;
-      for (let i = 0; i < 3 && !h; i++) {
-        try { h = lock.acquire("race"); } catch { await new Promise((r) => setTimeout(r, 5)); }
-      }
-      if (!h) { process.stdout.write("BUSY\\n"); process.exit(0); }
-      process.stdout.write("HELD " + Date.now() + "\\n");
-      await new Promise((r) => setTimeout(r, 300));
-      process.stdout.write("RELEASED " + Date.now() + "\\n");
-      h.release();
-    `;
-    const runs = await Promise.all(
-      Array.from(
-        { length: 6 },
-        () =>
-          new Promise<string>((resolveRun) => {
-            const child = spawn(process.execPath, ["--no-warnings", "--input-type=module", "-e", script], {
-              stdio: ["ignore", "pipe", "inherit"],
-            });
-            let out = "";
-            child.stdout.on("data", (d: Buffer) => {
-              out += d.toString();
-            });
-            child.on("exit", () => resolveRun(out));
-          }),
-      ),
-    );
-    const windows = runs
+    // The racers start only once the live claimant holds the takeover claim.
+    let claimed: () => void = () => {};
+    const holding = new Promise<void>((r) => {
+      claimed = r;
+    });
+    const slow = run(true, () => claimed());
+    await holding;
+    const racers = Array.from({ length: 6 }, () => run(false));
+    const outs = await Promise.all([slow, ...racers]);
+    const slowOut = outs[0] as string;
+    assert.match(slowOut, /CLAIMED/);
+    assert.match(slowOut, /HELD \d+ SURVIVED yes/, "the live claimant's claim survived the racers; it took the lock");
+    const windows = outs
       .filter((o) => o.includes("HELD"))
       .map((o) => [Number(/HELD (\d+)/.exec(o)?.[1]), Number(/RELEASED (\d+)/.exec(o)?.[1])] as const)
       .sort((a, b) => a[0] - b[0]);
-    assert.ok(windows.length >= 1, `someone took over the stale lock in round ${round}`);
     for (let i = 1; i < windows.length; i++) {
       assert.ok(
         (windows[i]?.[0] as number) >= (windows[i - 1]?.[1] as number),
