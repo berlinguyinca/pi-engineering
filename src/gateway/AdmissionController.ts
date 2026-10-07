@@ -89,6 +89,12 @@ export interface AdmissionWaitOptions {
   signal?: AbortSignal;
   provider?: string;
   model?: string;
+  /**
+   * Called each time THIS caller actually has to wait (a cooldown or a queue
+   * for a slot) — from inside the wait, so it cannot miss a slot taken
+   * between a status check and the acquire.
+   */
+  onWait?: () => void;
 }
 
 /** A held admission slot. Release is idempotent. */
@@ -225,6 +231,7 @@ export class AdmissionController {
         if (signal?.aborted) return waited;
         const remaining = this.cooldownRemainingMs(opts);
         if (remaining <= 0) break;
+        opts.onWait?.();
         await this.sleepOrAbort(remaining, signal);
         if (signal?.aborted) return waited;
         waited += remaining;
@@ -268,6 +275,7 @@ export class AdmissionController {
         this.active++;
         break;
       }
+      opts.onWait?.();
       await this.waitForSlot();
       // Re-check: the cooldown may have re-armed while we queued.
     }

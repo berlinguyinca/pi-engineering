@@ -5,6 +5,7 @@ import { mkdir, writeFile } from "node:fs/promises";
  *
  *   node scripts/pi-engineering.ts roadmap check [--json] [--no-refresh]
  *   node scripts/pi-engineering.ts roadmap status [--json]
+ *   node scripts/pi-engineering.ts doctor [--repair] [--json] [--cwd <dir>]
  *
  * `roadmap check` exit codes:
  *   0  roadmap 1.0 complete (release gate passes)
@@ -20,6 +21,7 @@ import { BlackholeManager } from "../src/blackhole/BlackholeManager.ts";
 import { blackholeTelemetry, formatBlackholeTelemetry } from "../src/blackhole/telemetry.ts";
 import { Ledger } from "../src/ledger/Ledger.ts";
 import { defaultCliPaths, runRoadmapCheck, runRoadmapStatus } from "../src/roadmap/cli.ts";
+import { doctorExitCode, formatDoctorReport, runDoctor } from "../src/runtime/isolation/doctor.ts";
 import { runSessionsCommand } from "../src/sessionControl/cli.ts";
 
 const REPO_ROOT = resolve(import.meta.dirname, "..");
@@ -29,6 +31,7 @@ async function main(): Promise<number> {
   const cmd = args[0];
   const rest = args.slice(1);
   if (cmd === "sessions") return runSessionsCommand(rest);
+  if (cmd === "doctor") return doctorCommand(rest);
   if (cmd === "blackhole") {
     const sub = rest.find((a) => !a.startsWith("--"));
     return blackholeCommand(sub ?? "status", rest);
@@ -44,7 +47,7 @@ async function main(): Promise<number> {
   }
   if (cmd !== "roadmap") {
     console.error(
-      "usage: pi-engineering <roadmap check|roadmap status|blackhole ...|benchmark|cav status|...> [flags]",
+      "usage: pi-engineering <doctor [--repair] [--json]|roadmap check|roadmap status|blackhole ...|benchmark|cav status|...> [flags]",
     );
     return 2;
   }
@@ -64,6 +67,19 @@ async function main(): Promise<number> {
   }
   console.error("usage: pi-engineering <roadmap check|roadmap status|blackhole ...|benchmark> [flags]");
   return 2;
+}
+
+/**
+ * `pi-engineering doctor [--repair] [--json] [--cwd <dir>]`: inspect (and
+ * safely repair) runtime coordination state for the worktree containing cwd.
+ * Exit 0 healthy, 1 repairable issues remain, 2 fatal.
+ */
+async function doctorCommand(rest: string[]): Promise<number> {
+  const cwdIndex = rest.indexOf("--cwd");
+  const cwd = cwdIndex >= 0 && rest[cwdIndex + 1] ? resolve(rest[cwdIndex + 1]!) : process.cwd();
+  const report = await runDoctor({ cwd, repair: rest.includes("--repair") });
+  console.log(rest.includes("--json") ? JSON.stringify(report, null, 2) : formatDoctorReport(report));
+  return doctorExitCode(report);
 }
 
 async function cavCommand(rest: string[]): Promise<number> {

@@ -9,7 +9,7 @@
  */
 
 import type { RoleRouterAdapter } from "../capability/adapter.ts";
-import { ROLE_REQUIREMENTS, isRoleName, routerRoleFor } from "../capability/roles.ts";
+import { ROLE_REQUIREMENTS, type RoleName, isRoleName, routerRoleFor } from "../capability/roles.ts";
 import { type ModelRef, modelKey } from "../lifecycle/types.ts";
 import type { ModelRoute, RouteModel } from "../orchestration/realBackends.ts";
 import type { RecoveryProbe } from "../resilience/probe.ts";
@@ -100,44 +100,97 @@ export class UnavailableModels {
  * router's roles) through the capability router, excluding the unavailable
  * models plus any caller exclusions. An independent (review) role placed on
  * the requesting session model carries a reduced-independence warning.
+ *
+ * A mission's operator pin (`operatorPin`) wins over role pins and the
+ * router's ranking for EVERY worker role, unless the router knows the pinned
+ * model cannot serve the role (missing capability, too small a context,
+ * unhealthy, or reserved by separation of duties); then the role is routed as
+ * usual and the result says why the pin was not used.
  */
 export function createRouteModel(opts: {
-  router: Pick<RoleRouterAdapter, "route">;
+  router?: Pick<RoleRouterAdapter, "route"> & Partial<Pick<RoleRouterAdapter, "select">>;
   unavailable: UnavailableModels;
   reviewFallbackModel?: ModelRef;
+  /** The operator pin a mission dispatches with (adopted at this boundary). */
+  operatorPin?: (missionId: string) => ModelRef | null | undefined;
 }): RouteModel {
   const requester = opts.reviewFallbackModel;
   return async (role, routeOpts) => {
-    // Native roles are routed as always. Any other worker role keeps running on
-    // the executor default and is mapped onto a router role only to choose a
-    // replacement for a model that is gone.
-    const routerRole = isRoleName(role) ? role : routeOpts?.replacement ? routerRoleFor(role) : undefined;
-    if (!routerRole) return undefined;
     const exclude = [...opts.unavailable.list(), ...(routeOpts?.exclude ?? [])].map((model) => ({
       provider: model.provider,
       id: model.id,
     }));
-    try {
-      const routed = await opts.router.route(routerRole, {
-        ...(requester ? { requester } : {}),
-        ...(exclude.length > 0 ? { exclude } : {}),
-      });
-      if (
-        ROLE_REQUIREMENTS[routerRole].independent &&
-        routed &&
-        requester &&
-        modelKey(routed) === modelKey(requester)
-      ) {
-        return {
-          ...routed,
-          warning: `Warning: no distinct reviewer model is available; reviewing with ${modelKey(routed)} in a fresh session with reduced independence.`,
-        } satisfies ModelRoute;
-      }
-      return routed;
-    } catch {
-      return undefined;
+    const pin = routeOpts?.missionId ? opts.operatorPin?.(routeOpts.missionId) : undefined;
+    if (!pin) return routeRole(opts.router, role, !!routeOpts?.replacement, requester, exclude);
+    // A pin already tried, gone, or reserved by separation of duties (the
+    // reviewer of work the pin produced) is not forced back; the placement
+    // records it so an operator-switch check does not restart the attempt.
+    if (exclude.some((model) => modelKey(model) === modelKey(pin))) {
+      const routed = await routeRole(opts.router, role, !!routeOpts?.replacement, requester, exclude);
+      return routed && { ...routed, pinRefused: modelKey(pin) };
     }
+    const refusal = await pinRefusal(opts.router, routerRoleFor(role) ?? "implementer", pin, {
+      ...(requester ? { requester } : {}),
+      ...(exclude.length > 0 ? { exclude } : {}),
+    });
+    if (!refusal) return { provider: pin.provider, id: pin.id, operatorPin: true } satisfies ModelRoute;
+    const routed = await routeRole(opts.router, role, true, requester, exclude);
+    if (!routed) return undefined;
+    return {
+      ...routed,
+      pinRefused: modelKey(pin),
+      pinNotice: `operator pin ${modelKey(pin)} cannot serve ${role} (${refusal}); using ${modelKey(routed)} for this role`,
+    };
   };
+}
+
+/** Why the router says the pinned model cannot take `role`; undefined when it can (or nothing is known). */
+async function pinRefusal(
+  router: (Pick<RoleRouterAdapter, "route"> & Partial<Pick<RoleRouterAdapter, "select">>) | undefined,
+  role: RoleName,
+  pin: ModelRef,
+  query: { requester?: ModelRef; exclude?: ModelRef[] },
+): Promise<string | undefined> {
+  if (!router?.select) return undefined;
+  try {
+    const decision = await router.select(role, { ...query, taskOverride: modelKey(pin) });
+    if (decision.selected && modelKey(decision.selected) === modelKey(pin)) return undefined;
+    const rejection = decision.rejected.find((entry) => modelKey(entry.model) === modelKey(pin));
+    // A model the router never discovered is the operator's word against no
+    // evidence: honour the pin.
+    return rejection ? rejection.reason : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function routeRole(
+  router: Pick<RoleRouterAdapter, "route"> | undefined,
+  role: string,
+  replacement: boolean,
+  requester: ModelRef | undefined,
+  exclude: ModelRef[],
+): Promise<ModelRoute | undefined> {
+  // Native roles are routed as always. Any other worker role keeps running on
+  // the executor default and is mapped onto a router role only to choose a
+  // replacement for a model that is gone (or that a pin could not serve).
+  const routerRole = isRoleName(role) ? role : replacement ? routerRoleFor(role) : undefined;
+  if (!routerRole || !router) return undefined;
+  try {
+    const routed = await router.route(routerRole, {
+      ...(requester ? { requester } : {}),
+      ...(exclude.length > 0 ? { exclude } : {}),
+    });
+    if (ROLE_REQUIREMENTS[routerRole].independent && routed && requester && modelKey(routed) === modelKey(requester)) {
+      return {
+        ...routed,
+        warning: `Warning: no distinct reviewer model is available; reviewing with ${modelKey(routed)} in a fresh session with reduced independence.`,
+      } satisfies ModelRoute;
+    }
+    return routed;
+  } catch {
+    return undefined;
+  }
 }
 
 /**

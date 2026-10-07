@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
+import { realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import { promisify } from "node:util";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
@@ -38,11 +39,15 @@ import { GenerationGuard } from "../src/guard/GenerationGuard.ts";
 import { RECOVERY_PROMPT, TOOL_TRANSITION_RULE, buildDegenerationEvent } from "../src/guard/RecoveryController.ts";
 import { resolveGuardConfig } from "../src/guard/config.ts";
 import { guardFeedFor } from "../src/guard/streamText.ts";
+import { registerToolCallGuard } from "../src/guard/toolCallGuard.ts";
 import { ModelHealthProvider } from "../src/models/health.ts";
 import { defaultModelsPath, providerBaseUrl, readModelsConfig } from "../src/models/modelsConfig.ts";
 import { refreshConfiguredProviders } from "../src/models/refresh.ts";
-import { classifyIntent, workflowForIntent } from "../src/orchestration/intentRouter.ts";
-import type { Intent, WorkflowClass } from "../src/orchestration/types.ts";
+import {
+  MISSION_UNAVAILABLE_RETRY_TURNS,
+  decideAutoInvoke,
+  missionToolReportedUnavailable,
+} from "../src/orchestration/autoInvoke.ts";
 import { PanelController } from "../src/panel/PanelController.ts";
 import { PanelState } from "../src/panel/PanelState.ts";
 import { readCommitContent, readDiffContent, readFileContent } from "../src/panel/content.ts";
@@ -53,11 +58,26 @@ import { type PanelLayout, type PanelLayoutPatch, PanelLayoutStore } from "../sr
 import { Narrator } from "../src/panel/narrator/Narrator.ts";
 import { createSummarize } from "../src/panel/narrator/summarize.ts";
 import { PanelRefreshLoop } from "../src/panel/refreshLoop.ts";
+import { registerPlannerWorker } from "../src/plannerWorker/extension.ts";
 import { redactSecrets } from "../src/platform/redact.ts";
 import { resolveRequestBodyBudgetConfig } from "../src/request/bodyBudget.ts";
 import { resolveThinkingOffConfig } from "../src/request/thinkingPolicy.ts";
 import { RoadmapEngine } from "../src/roadmap/RoadmapEngine.ts";
 import { EngineeringRuntime, type RuntimeMissionActivityEvent } from "../src/runtime/EngineeringRuntime.ts";
+import { sessionBindingInfo } from "../src/runtime/isolation/RuntimeBinding.ts";
+import { RuntimeSession } from "../src/runtime/isolation/RuntimeSession.ts";
+import { effectiveWorkspace, workspaceForPath } from "../src/runtime/isolation/WorkspaceResolver.ts";
+import { formatDoctorReport, runDoctor } from "../src/runtime/isolation/doctor.ts";
+import { emitRuntimeEvent } from "../src/runtime/isolation/runtimeEvents.ts";
+import { formatRuntimeStatus, runtimeStatus } from "../src/runtime/isolation/status.ts";
+import {
+  clearOperatorModelPin,
+  describeMissionControl,
+  describeModelChoice,
+  onOperatorModelSelect,
+  resetSessionModelChoice,
+  sessionModelChoice,
+} from "../src/runtime/operatorModelPin.ts";
 import {
   type MissionBrief,
   type SessionControlServer,
@@ -204,7 +224,79 @@ const inferweave: InferweaveProvider | null = inferweaveConfig.enabled
   : null;
 
 async function getRuntime(ctx: ExtensionCommandContext, worker?: EngineeringRuntime): Promise<EngineeringRuntime> {
-  return getRuntimeByCwd(worker ? worker.cwd : ctx.cwd, ctx.model);
+  return getRuntimeByCwd(worker ? worker.cwd : runtimeCwd(ctx.cwd), ctx.model);
+}
+
+/**
+ * The directory whose runtime serves a launch cwd. After a parent-directory
+ * launch rebinds to a nested worktree (spec §2/§3), the launch cwd resolves to
+ * that worktree; otherwise to itself.
+ */
+function runtimeCwd(cwd: string): string {
+  return effectiveWorkspace(cwd, RuntimeSession.current().binding?.worktreePath);
+}
+
+const workspaceRebinds = new Map<string, Promise<void>>();
+
+function canonicalPath(path: string): string {
+  try {
+    return realpathSync(path);
+  } catch {
+    return resolve(path);
+  }
+}
+
+/**
+ * Rebind the session when activity (a tool's `path`) shows work moving into a
+ * different git worktree beneath the launch directory. The destination runtime
+ * is opened (resolved, registered, migrated) BEFORE the session pointer moves,
+ * and the move itself is one registry transaction; any failure leaves the
+ * current binding in force.
+ */
+function observeWorkspaceActivity(cwd: string, args: unknown): Promise<void> {
+  const path = args && typeof args === "object" ? (args as { path?: unknown }).path : undefined;
+  if (typeof path !== "string" || !path.trim()) return Promise.resolve();
+  const flight = (async () => {
+    const session = RuntimeSession.current();
+    const launchKey = canonicalPath(await repoCacheKey(cwd).catch(() => cwd));
+    const target = await workspaceForPath(cwd, path, session.binding?.worktreePath ?? null);
+    // Never rebind back onto the launch directory's own worktree: in a parent
+    // launch that worktree is the container, not the project being worked on.
+    if (!target || target.worktreeRoot === launchKey) return;
+    const existing = workspaceRebinds.get(target.worktreeId);
+    if (existing) return existing;
+    const rebind = (async () => {
+      // Destination first: resolved, registered, migrated and open.
+      const runtime = await getRuntimeByCwd(target.worktreeRoot);
+      // Flush the current binding's pending writes so nothing is in flight
+      // across the switch.
+      const previous = session.binding?.worktreeId;
+      for (const entry of runtimes.values()) {
+        if (previous && entry.runtime.runtimeBinding?.identity.worktreeId === previous) {
+          await entry.runtime.missionStore?.flush();
+        }
+      }
+      if (runtime.runtimeBinding) session.bindTo(sessionBindingInfo(runtime.runtimeBinding));
+    })().finally(() => workspaceRebinds.delete(target.worktreeId));
+    workspaceRebinds.set(target.worktreeId, rebind);
+    return rebind;
+  })().catch((error: unknown) => {
+    emitRuntimeEvent("runtime.rebind_failed", {
+      session_id: RuntimeSession.current().sessionId,
+      path,
+      reason: error instanceof Error ? error.message : String(error),
+    });
+  });
+  workspaceActivity.add(flight);
+  void flight.finally(() => workspaceActivity.delete(flight));
+  return flight;
+}
+
+const workspaceActivity = new Set<Promise<void>>();
+
+/** Wait for in-flight workspace rebinding (tests and orderly shutdown). */
+export async function settleWorkspaceActivity(): Promise<void> {
+  while (workspaceActivity.size > 0) await Promise.allSettled([...workspaceActivity]);
 }
 
 /**
@@ -320,7 +412,13 @@ export function formatMissionActivity(event: RuntimeMissionActivityEvent): {
   const nextVerb = event.nextAction.trim().split(/\s+/)[0]?.slice(0, 12) || "monitor";
   const recoveryToken =
     event.recovery.maxAttempts > 0 ? `R${event.recovery.attempt}/${event.recovery.maxAttempts}` : "R–";
-  const token = `${recoveryToken} ${event.action.slice(0, 12).toUpperCase()}→${nextVerb}`;
+  const pausedByOperator = event.operatorPausedAt
+    ? `PAUSED by operator at ${event.operatorPausedAt} — automatic repair is off; resume with /mission resume ${event.missionId} (add --model auto to release a model pin)`
+    : null;
+  const pin = event.operatorModelPin ? ` · model: ${event.operatorModelPin} (operator pin)` : "";
+  const token = pausedByOperator
+    ? `${recoveryToken} PAUSED (operator)`
+    : `${recoveryToken} ${event.action.slice(0, 12).toUpperCase()}→${nextVerb}`;
   return {
     phase:
       `acceptance ${event.acceptanceCoverage.completed}/${event.acceptanceCoverage.total} ` +
@@ -328,12 +426,14 @@ export function formatMissionActivity(event: RuntimeMissionActivityEvent): {
       `${event.workflowProgress.total} (${event.workflowProgress.approximatePercent}%) · ${event.health}`,
     detail:
       `${event.summary.slice(0, 120)}${workers}${heartbeat} · ${scope} · last progress ${lastProgress} · ` +
-      `${recovery}${preserved} · ${event.action}: ${event.reason.slice(0, 120)} · ${next}`,
-    missionStatus: {
-      token,
-      reason: event.reason.slice(0, 160),
-      next: `${event.nextAction.slice(0, 160)}${event.nextActionAt ? ` at ${event.nextActionAt}` : ""}`,
-    },
+      `${recovery}${preserved} · ${event.action}: ${event.reason.slice(0, 120)} · ${next}${pin}`,
+    missionStatus: pausedByOperator
+      ? { token, reason: "paused by the operator (Esc); automatic repair is off", next: pausedByOperator }
+      : {
+          token,
+          reason: event.reason.slice(0, 160),
+          next: `${event.nextAction.slice(0, 160)}${event.nextActionAt ? ` at ${event.nextActionAt}` : ""}`,
+        },
   };
 }
 
@@ -458,27 +558,29 @@ async function repoCacheKey(cwd: string): Promise<string> {
   return key;
 }
 
+/** The real reason the runtime did not open, by cwd, for tool results. */
+const runtimeOpenFailures = new Map<string, string>();
+
 /**
  * Resolve tools to the runtime for the calling cwd, opening it lazily so the
  * semantic tools work in the interactive session without a prior command.
  */
 async function resolveServices(cwd: string): Promise<CoreServices | null> {
   let rt: EngineeringRuntime;
+  const effective = runtimeCwd(cwd);
   try {
-    rt = await getRuntimeByCwd(cwd);
+    rt = await getRuntimeByCwd(effective);
+    runtimeOpenFailures.delete(cwd);
   } catch (error) {
-    // Surface the REAL reason the runtime did not open (most commonly the
-    // orchestration store's single-writer lock being held by another session
-    // launched from the same parent directory) instead of a bare "not
-    // initialized" — and point the operator at the remedy.
+    // Concurrency is not a failure mode any more (per-session event streams,
+    // automatic stale-owner recovery), so what reaches here is a genuine
+    // filesystem/permission problem. Surface the REAL reason — in the tool
+    // result too — and never ask the operator to tune internal coordination.
     const message = error instanceof Error ? error.message : String(error);
-    const held = /writer lock/i.test(message);
-    const remedy = held
-      ? " Set PI_ENGINEERING_ORCHESTRATION_DIR to a per-worktree directory (or launch the session from within the worktree) so concurrent sessions do not share one orchestration store lock."
-      : ".";
+    runtimeOpenFailures.set(cwd, message);
     const notice: TelemetryNotice = {
       level: "warning",
-      text: `Engineering runtime did not open for ${cwd}: ${message}${remedy}`,
+      text: `Engineering runtime did not open for ${cwd}: ${message}`,
       key: `runtime-open:${cwd}`,
     };
     if (allowRuntimeDiagnostic(notice)) emitTelemetry(notice);
@@ -495,6 +597,11 @@ async function resolveServices(cwd: string): Promise<CoreServices | null> {
       return w ? w.id : null;
     },
     actor: () => ({ type: "user" }),
+    resumeMission: (id, s) => rt.resumeBlockedMission(id, s),
+    cancelMission: (id) => rt.cancelMission(id),
+    clearMissionModelPin: (id) => rt.clearMissionModelPin(id),
+    // A rebound parent launch targets the bound worktree by default.
+    ...(effective !== cwd ? { repositoryRoot: rt.git?.root ?? effective } : {}),
   };
 }
 
@@ -520,6 +627,8 @@ function formatEntities(rt: EngineeringRuntime, kind?: string): string {
 
 export default function (pi: ExtensionAPI) {
   registerInteractiveMemory(pi);
+  /** True while our own (opt-in) fallback switches the interactive model. */
+  let automaticModelSwitch = false;
   // One control socket per live PI session. The socket answers directly while
   // a mission tool is awaiting a worker; another PI process never opens this
   // session's transcript or writes its event store to ask for status.
@@ -567,6 +676,11 @@ export default function (pi: ExtensionAPI) {
       }
     });
     pi.on("tool_execution_start", (event) => activeControl?.toolStarted(event.toolName, event.toolCallId));
+    // Parent-directory launches follow the work: a touched path inside a nested
+    // worktree rebinds the session there (fire-and-forget; never blocks a tool).
+    pi.on("tool_execution_start", (event, ctx) => {
+      void observeWorkspaceActivity(ctx.cwd, event.args);
+    });
     pi.on("tool_execution_update", (event) => {
       const content = event.toolName === "mission" ? event.partialResult?.content : null;
       const progress = Array.isArray(content) && typeof content[0]?.text === "string" ? content[0].text : undefined;
@@ -580,9 +694,66 @@ export default function (pi: ExtensionAPI) {
     });
   }
   // Semantic tools resolved against the runtime for the calling cwd.
-  for (const tool of buildCoreTools(resolveServices)) {
+  for (const tool of buildCoreTools(resolveServices, {
+    unavailableReason: (cwd) => runtimeOpenFailures.get(cwd) ?? null,
+  })) {
     pi.registerTool(tool);
   }
+
+  // ─── Operator model pin: missions follow an explicit /model switch ───────
+  // The operator's switch becomes this session's operator pin; its missions
+  // adopt it at their next worker dispatch (src/runtime/operatorModelPin.ts).
+  // Automatic fallback of the interactive model stays opt-in and is not a pin.
+  if (typeof pi.on === "function") {
+    pi.on("session_start", (event, ctx) => {
+      if (event.reason === "reload") return;
+      const sessionId = RuntimeSession.current().sessionId;
+      resetSessionModelChoice(sessionId, ctx.model);
+      // The pin is process-wide; a fresh conversation (/new) explicitly
+      // returns this process's missions to automatic routing.
+      if (event.reason === "new") clearOperatorModelPin(sessionId);
+    });
+    pi.on("model_select", (event, ctx) => {
+      const outcome = onOperatorModelSelect(RuntimeSession.current().sessionId, {
+        model: event.model,
+        source: event.source,
+        automatic: automaticModelSwitch,
+      });
+      if (outcome.action === "pinned") {
+        ctx.ui.notify(
+          `Missions from this session now use ${outcome.pin.provider}/${outcome.pin.id} (operator pin) from their next worker dispatch. /engineering-model auto returns them to automatic routing.`,
+          "info",
+        );
+      } else if (outcome.action === "cleared") {
+        ctx.ui.notify(`Operator model pin cleared (${outcome.reason}); missions return to automatic routing.`, "info");
+      }
+    });
+  }
+  pi.registerCommand("engineering-model", {
+    description: "Show the model this session's missions use, or `auto` to clear the operator pin set by /model.",
+    handler: async (args, ctx) => {
+      const sessionId = RuntimeSession.current().sessionId;
+      const want = (args ?? "").trim();
+      if (want === "auto") {
+        clearOperatorModelPin(sessionId);
+        // Also release the pins already stored on this session's missions.
+        const released: string[] = [];
+        for (const entry of runtimes.values()) {
+          released.push(...(await entry.runtime.releaseSessionMissionPins().catch(() => [])));
+        }
+        ctx.ui.notify(
+          `Operator model pin cleared; missions return to automatic routing at their next dispatch${released.length > 0 ? ` (released: ${released.join(", ")})` : ""}.`,
+          "info",
+        );
+        return;
+      }
+      if (want) {
+        ctx.ui.notify("/engineering-model [auto] — pin a model for missions by switching with /model", "error");
+        return;
+      }
+      ctx.ui.notify(describeModelChoice(sessionModelChoice(sessionId)), "info");
+    },
+  });
 
   // ─── Automatic engineering/review workflow invocation (spec 06) ─────────
   // Normal-language intent must auto-invoke the orchestration pipeline without
@@ -592,42 +763,48 @@ export default function (pi: ExtensionAPI) {
   // parent session stays the long-lived orchestrator, and the mission tool
   // does the heavy lifting. This is a directive, not enforcement: the runtime
   // completion gate is what actually enforces validation/review/completion.
-  // Ordered from passive (conversation/research) to fully-enforced
-  // (engineering_review). Anything at/above `engineering` (incl. `review` and
-  // `security_sensitive`) auto-invokes the mission pipeline.
-  const WORKFLOW_ORDER: WorkflowClass[] = [
-    "conversation",
-    "research",
-    "investigation",
-    "engineering",
-    "review",
-    "engineering_review",
-    "security_sensitive",
-  ];
-  const workflowRank = (w: WorkflowClass) => WORKFLOW_ORDER.indexOf(w);
-  const AUTO_INVOKE_THRESHOLD = workflowRank("engineering");
+  // The decision (bare retry/continue, questions, short chat, --print mode, a
+  // mission tool that already reported unavailable, low confidence) lives in
+  // decideAutoInvoke so it is testable without a pi session.
   let lastAutoInvoked: { prompt: string; at: number } | null = null;
+  let missionToolUnavailable = false;
+  // User turns since the tool reported unavailable; after
+  // MISSION_UNAVAILABLE_RETRY_TURNS auto-invoke tries the tool again.
+  let turnsSinceMissionUnavailable = 0;
   // The auto-invoke handler uses pi.on(), which is only available in a real pi
   // session (not in the smoke-test stub). Guard accordingly.
   if (typeof pi.on === "function") {
+    // Identical-tool-call loops and unbounded bash test/build runs
+    // (src/guard/toolCallGuard.ts; knobs in docs/usage.md, "Tool-call guard").
+    registerToolCallGuard(pi as never);
+    pi.on("tool_result", async (event) => {
+      if (event.toolName !== "mission") return;
+      const text = event.content.map((part) => (part.type === "text" ? part.text : "")).join("\n");
+      // A later mission call that the runtime served clears a transient
+      // not-initialized (e.g. the runtime opened after a lock was released).
+      if (missionToolReportedUnavailable(text)) {
+        missionToolUnavailable = true;
+        turnsSinceMissionUnavailable = 0;
+      } else if (!event.isError) missionToolUnavailable = false;
+    });
     pi.on("before_agent_start", async (event, ctx) => {
       const prompt = (event.prompt ?? "").trim();
-      if (!prompt || /^\/\w/.test(prompt)) return; // slash commands already route explicitly
-      // Avoid re-injecting on harness auto-retries of the same prompt.
-      if (lastAutoInvoked && lastAutoInvoked.prompt === prompt && Date.now() - lastAutoInvoked.at < 30_000) return;
-      let intent: Intent[] = [];
-      try {
-        intent = classifyIntent(prompt).intent;
-      } catch {
-        return; // classification must never break the turn
+      if (missionToolUnavailable && ++turnsSinceMissionUnavailable > MISSION_UNAVAILABLE_RETRY_TURNS) {
+        missionToolUnavailable = false;
       }
-      const workflow = workflowForIntent(intent);
-      if (workflowRank(workflow) < AUTO_INVOKE_THRESHOLD) return; // conversation/research only
+      const decision = decideAutoInvoke({
+        prompt,
+        mode: ctx?.mode,
+        missionToolUnavailable,
+        lastAutoInvoked,
+        now: Date.now(),
+      });
+      if (!decision.invoke) return;
       lastAutoInvoked = { prompt, at: Date.now() };
       return {
         message: {
           customType: "pi-engineering:auto-invoke",
-          content: `[pi-engineering] This request expresses engineering intent (workflow: ${workflow}). Act as the long-lived orchestrator: call the \`mission\` tool with this request as the mission request so the runtime plans, executes, validates, reviews, and completes the work as a mission. Do not implement the change directly in this session; delegate it through the mission pipeline.`,
+          content: `[pi-engineering] This request expresses engineering intent (workflow: ${decision.workflow}). Act as the long-lived orchestrator: call the \`mission\` tool with this request as the mission request so the runtime plans, executes, validates, reviews, and completes the work as a mission. Do not implement the change directly in this session; delegate it through the mission pipeline.`,
           display: true,
         },
       };
@@ -1189,7 +1366,16 @@ ${RECOVERY_PROMPT}`;
       if (!pending) return;
       const result = await applyPendingFallback(
         {
-          setModel: (m) => pi.setModel(m),
+          // Our own fallback switch is not an operator choice: missions must
+          // not adopt it as an operator pin (see the model_select handler).
+          setModel: async (m) => {
+            automaticModelSwitch = true;
+            try {
+              return await pi.setModel(m);
+            } finally {
+              automaticModelSwitch = false;
+            }
+          },
           healthFor: (c) => healthFor(c as { model?: Model<any>; modelRegistry?: unknown }),
           log: (message) => console.error(message),
         } satisfies FallbackApplyDeps,
@@ -1705,16 +1891,47 @@ ${RECOVERY_PROMPT}`;
   // Normal-language intent auto-invokes the engineering workflow through the
   // Orchestrator. `/mission` is an optional power-user control; correctness
   // never depends on it (the semantic tool + runtime gate enforce policy).
+  // Planner/worker execution mode (docs/specs/planner-worker-hot-model-routing.md):
+  // /engineering-* commands, and the mode `/mission` consults before orchestrating.
+  const plannerWorker = registerPlannerWorker(pi, {
+    host: async (ctx) => {
+      const rt = await getRuntime(ctx);
+      return {
+        repoRoot: rt.git?.root ?? rt.cwd,
+        worker: rt.worker,
+        // Live missions an operator paused or pinned, for /engineering-status.
+        missionControlLines: () =>
+          (rt.missionStore?.listMissions() ?? [])
+            .filter((m) => !["COMPLETE", "FAILED", "CANCELED"].includes(m.status))
+            .flatMap((m) => describeMissionControl(m).map((line) => `${m.mission_id} [${m.status}] ${line}`)),
+      };
+    },
+    sessionGuardActive: inferweave !== null,
+  });
+
   pi.registerCommand("mission", {
-    description: "Run an orchestration mission, or resume one with /mission resume <missionId>.",
+    description:
+      "Run an orchestration mission; /mission resume <missionId> [--model auto] continues a stopped or paused one (optionally releasing its operator model pin), /mission cancel <missionId> ends one.",
     handler: async (args, ctx) => {
       const request = args.trim();
       if (!request) {
         ctx.ui.notify("/mission <normal-language request> | /mission resume <missionId>", "error");
         return;
       }
+      const cancel = /^cancel\s+(MSN-\S+)\s*$/i.exec(request);
+      if (cancel?.[1]) {
+        const rt = await getRuntime(ctx);
+        try {
+          const canceled = await rt.cancelMission(cancel[1]);
+          ctx.ui.notify(`Mission ${canceled.mission_id} — ${canceled.title} [${canceled.status}]`, "info");
+        } catch (error) {
+          ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+        }
+        return;
+      }
       const resumePrefix = /^resume(?:\b|[:=])/i.test(request);
-      const resume = /^resume\s+(\S+)\s*$/i.exec(request);
+      // `--model auto` releases the mission from a persisted operator pin first.
+      const resume = /^resume\s+(\S+)(\s+--model\s+auto)?\s*$/i.exec(request);
       if (resumePrefix && !resume) {
         ctx.ui.notify("/mission resume <missionId>", "error");
         return;
@@ -1724,13 +1941,24 @@ ${RECOVERY_PROMPT}`;
         ctx.ui.notify("Orchestrator not initialized for this directory.", "error");
         return;
       }
+      // The user reached an initialized orchestrator: the mission tool can
+      // serve this session again, so auto-invoke may use it.
+      missionToolUnavailable = false;
       if (resume) {
         const missionId = resume[1];
         if (!missionId) {
           ctx.ui.notify("/mission resume <missionId>", "error");
           return;
         }
+        if (await plannerWorker.resumeIfOwned(missionId, ctx)) return;
         try {
+          if (resume[2]) {
+            await rt.clearMissionModelPin(missionId);
+            ctx.ui.notify(
+              `[mission ${missionId}] operator pin released; automatic routing from its next dispatch`,
+              "info",
+            );
+          }
           activeControl?.missionProgress(`[mission ${missionId}] resuming`);
           await rt.resumeBlockedMission(missionId, ctx.signal);
           const mission = rt.missionStore?.getMission(missionId);
@@ -1741,6 +1969,7 @@ ${RECOVERY_PROMPT}`;
         }
         return;
       }
+      if (await plannerWorker.runIfSelected(request, ctx)) return;
       const baseRef = (await rt.git?.headCommit().catch(() => "")) ?? "";
       ctx.ui.notify("Routing intent and running orchestration mission...", "info");
       // Stream live mission/task progress to the operator instead of blocking
@@ -1753,6 +1982,8 @@ ${RECOVERY_PROMPT}`;
         baseRef,
         mutationRequested: true,
         signal: ctx.signal,
+        // Esc pauses the mission (resumable); only /mission cancel ends it.
+        interrupt: "pause",
         onProgress: (line) => {
           // De-duplicate the trailing completion lines (phase transitions and
           // task settlements can fire within the same tick).
@@ -1763,11 +1994,16 @@ ${RECOVERY_PROMPT}`;
         },
       });
       const m = result.mission;
-      const completion = result.paused
-        ? "PAUSED — infrastructure retry window exhausted (auto-resumes on recovery; not a failure)"
-        : result.completed
-          ? "PASSED"
-          : `BLOCKED — ${result.failureReason ?? ""}`;
+      const completion =
+        result.pausedBy === "operator" && result.mission.status !== "PAUSED_INFRASTRUCTURE"
+          ? `interrupt noted — mission left ${result.mission.status} (not canceled); /mission resume ${result.mission.mission_id} continues it`
+          : result.pausedBy === "operator"
+            ? `PAUSED by interrupt — progress preserved; /mission resume ${result.mission.mission_id} continues it, /mission cancel ${result.mission.mission_id} ends it`
+            : result.paused
+              ? "PAUSED — infrastructure retry window exhausted (auto-resumes on recovery; not a failure)"
+              : result.completed
+                ? "PASSED"
+                : `BLOCKED — ${result.failureReason ?? ""}`;
       const lines = [
         `Mission ${m.mission_id} [${m.status}] workflow=${m.workflow_class} risk=${m.risk_profile}`,
         `Intent: ${result.intent.intent.join(", ")} (confidence ${result.intent.confidence.toFixed(2)})`,
@@ -1826,6 +2062,7 @@ ${RECOVERY_PROMPT}`;
           `  repo ${summary?.repository ?? m.repository} · task ${summary?.task ?? "none"} · owner ${summary?.owner ?? "unowned"} · last progress ${summary?.lastMeaningfulProgressAt ?? "none"}`,
           `  recovery ${recovery.attempt}/${recovery.maxAttempts}; attempted ${stop?.attemptedRecoveries.length ?? 0} · next: ${stop?.resumeCondition ?? summary?.nextAction ?? "No further action is scheduled"}${summary?.nextActionAt ? ` at ${summary.nextActionAt}` : ""}`,
           `  ${stop ? `stop: ${stop.reason}` : `action: ${summary?.action ?? m.status} — ${summary?.reason ?? "No additional reason recorded"}`} · preserved: ${preserved.join(", ") || "none"}`,
+          ...describeMissionControl(m).map((line) => `  ${line}`),
         ].join("\n");
       });
       ctx.ui.notify(lines.join("\n"), "info");
@@ -2144,6 +2381,28 @@ ${RECOVERY_PROMPT}`;
         `render: ${renderStatus(s, 120, statusBarConfig)}`,
       ];
       ctx.ui.notify(lines.join("\n"), "info");
+    },
+  });
+
+  pi.registerCommand("pi-engineering", {
+    description:
+      "Engineering runtime introspection: `status` (default), `events` (recent runtime decisions), `doctor [--repair]`.",
+    handler: async (args, ctx) => {
+      const words = (args ?? "").trim().split(/\s+/).filter(Boolean);
+      const sub = words[0] ?? "status";
+      if (sub === "status" || sub === "events") {
+        // Opening the runtime for this cwd binds an unbound session first.
+        await resolveServices(ctx.cwd);
+        const report = runtimeStatus({ events: sub === "events" ? 25 : 0 });
+        ctx.ui.notify(formatRuntimeStatus(report), "info");
+        return;
+      }
+      if (sub === "doctor") {
+        const report = await runDoctor({ cwd: runtimeCwd(ctx.cwd), repair: words.includes("--repair") });
+        ctx.ui.notify(formatDoctorReport(report), report.fatal ? "error" : "info");
+        return;
+      }
+      ctx.ui.notify("/pi-engineering [status | events | doctor [--repair]]", "error");
     },
   });
 

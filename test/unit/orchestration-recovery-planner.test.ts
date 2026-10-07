@@ -84,6 +84,46 @@ describe("FailureClassifier", () => {
     );
   });
 
+  it("does not read 'authoritative' or 'author' as a credential failure (session review)", () => {
+    const classifier = new FailureClassifier();
+    for (const summary of [
+      "execution EXE-aB3dE9 is no longer authoritative (CANCELED)",
+      "backend reported failed: execution EXE-x1 is no longer authoritative (RUNNING)",
+    ]) {
+      assert.equal(classifier.classify(baseEvidence(summary)).category, "ORPHANED_EXECUTION", summary);
+    }
+    assert.notEqual(
+      classifier.classify(baseEvidence("implementation defect in the author index handler")).category,
+      "AUTHORIZATION_OR_CREDENTIAL",
+    );
+    assert.equal(
+      classifier.classify(baseEvidence("authentication failed: 401 Unauthorized")).category,
+      "AUTHORIZATION_OR_CREDENTIAL",
+    );
+    assert.equal(classifier.classify(baseEvidence("git push: auth required")).category, "AUTHORIZATION_OR_CREDENTIAL");
+  });
+
+  it("classifies credential failures ahead of loose ownership words (PR #106 review)", () => {
+    const classifier = new FailureClassifier();
+    for (const summary of [
+      "OAuth token expired",
+      "oauth: refresh token revoked for github.com",
+      "401 unauthorized",
+      "HTTP 401 Unauthorized while pushing the orphaned branch",
+      "403 Forbidden: orphan ref cleanup requires admin",
+      "credential helper failed for the orphan worktree remote",
+    ]) {
+      assert.equal(classifier.classify(baseEvidence(summary)).category, "AUTHORIZATION_OR_CREDENTIAL", summary);
+    }
+    for (const summary of [
+      "execution EXE-1 is no longer authoritative (CANCELED)",
+      "orphaned execution EXE-2 found after restart",
+      "stale owner for lease on task TSK-3",
+    ]) {
+      assert.equal(classifier.classify(baseEvidence(summary)).category, "ORPHANED_EXECUTION", summary);
+    }
+  });
+
   it("canonicalizes evidence order but changes when material evidence changes", () => {
     const first = failureFingerprint({ ...baseEvidence("Validation failed"), category: "VALIDATION_FAILED" });
     const reordered = failureFingerprint({

@@ -21,12 +21,20 @@ import { GitRepo } from "../git/GitRepo.ts";
 import type { EventStoreBackend } from "../platform/eventstore/backend.ts";
 import type { GatewayResilienceConfig } from "../resilience/config.ts";
 import type { RecoveryProbe } from "../resilience/probe.ts";
+import { describeOperatorPause } from "../runtime/operatorModelPin.ts";
 import type { WorkerActivity } from "../workers/WorkerExecutor.ts";
 import { type BrokerBackends, ExecutionBroker } from "./broker.ts";
 import { CheckpointManager } from "./checkpoints.ts";
 import { CompletionGate } from "./completionGate.ts";
 import { hashCandidateEvidenceIdentity, normalizeReviewSeverity, taskCoverageFingerprint } from "./evidence.ts";
 import { IntentRouter, workflowMutatesRepo } from "./intentRouter.ts";
+import {
+  type InterruptMode,
+  MISSION_CANCEL_REASON,
+  OPERATOR_PAUSE_STOP_REASON,
+  interruptibleRun,
+  isPauseAbort,
+} from "./interrupt.ts";
 import type { MissionStore } from "./missionStore.ts";
 import type { MissionObservability } from "./observability/MissionObservability.ts";
 import { computeProgress } from "./observability/progress.ts";
@@ -44,7 +52,7 @@ import type { RepositoryRegistry } from "./repositoryRegistry.ts";
 import { brokerKind } from "./scheduler.ts";
 import { MissionScheduler } from "./scheduler.ts";
 import type { ProtectedUserCriteria, SpecControllerResult, SpecScopeEnvelope } from "./specApproval.ts";
-import { canTransitionMission } from "./state.ts";
+import { canTransitionMission, canTransitionTask } from "./state.ts";
 import type {
   AcceptanceCriterion,
   CompletionVerdict,
@@ -152,6 +160,19 @@ export interface OrchestratorOptions {
   /** Bounds planner work before the first executable dispatch. */
   worksetPolicy?: Partial<WorksetPolicy>;
   /**
+   * Time limits. Nothing here is a default duration cap: a mission and its
+   * tasks run as long as they show activity, and only the caller's signal
+   * (the user cancelling) ends a healthy mission early.
+   */
+  timeLimits?: {
+    /** Hung-worker window: abort a worker after this long with no activity. */
+    workerInactivityMs?: number;
+    /** OPT-IN: cancel the whole mission after this much wall-clock time. */
+    maxMissionWallClockMs?: number;
+    /** Whether the process is waiting on the model gateway (never a stall). */
+    inferenceWaiting?: () => boolean;
+  };
+  /**
    * Autonomous spec approval hook (design 2026-09-28). When provided and the
    * routed workflow is a material mutation, the orchestrator runs the durable
    * spec controller to review + approve the exact plan and materializes tasks
@@ -181,9 +202,32 @@ export interface OrchestrateResult {
    * recovers — it is NOT a terminal failure.
    */
   paused?: boolean;
+  /** "operator": paused by an interrupt (Esc), resumable with `/mission resume <id>`. */
+  pausedBy?: "infrastructure" | "operator";
 }
 
-type FinalizationResult = Omit<OrchestrateResult, "intent" | "paused">;
+type FinalizationResult = Omit<OrchestrateResult, "intent" | "paused" | "pausedBy">;
+
+export interface OrchestrateOptions {
+  title?: string;
+  repository: string;
+  baseRef: string;
+  constraints?: string[];
+  changedFiles?: string[];
+  mutationRequested?: boolean;
+  acceptanceCriteria?: string[];
+  /** Live progress callback (per-call). Lines stream as the mission runs. */
+  onProgress?: (line: string) => void;
+  /** Cancels active work and stops any infrastructure-recovery wait. */
+  signal?: AbortSignal;
+  /**
+   * What an abort of `signal` means. "cancel" (the default) terminates the
+   * mission. "pause" — an operator interrupt such as Esc on the mission tool —
+   * stops in-flight work and parks the mission durably, resumable with
+   * `/mission resume <id>`; only `Orchestrator.cancel` then terminates it.
+   */
+  interrupt?: InterruptMode;
+}
 
 export class Orchestrator {
   readonly store: MissionStore;
@@ -207,10 +251,15 @@ export class Orchestrator {
   private readonly launchCwd: string;
   private readonly ownership?: MissionOwnership;
   private readonly ownershipByMission = new Map<string, import("./types.ts").MissionLease>();
+  /** Run controllers of missions executing in this process, for an explicit cancel. */
+  private readonly liveRuns = new Map<string, AbortController>();
+  private readonly runControllers = new WeakMap<AbortSignal, AbortController>();
+  private readonly pauseHooks = new WeakMap<AbortController, (hook: () => void) => void>();
   private readonly recoveryOwnershipByFlight = new Map<string, import("./types.ts").MissionLease>();
   private readonly recoveryTaskGenerations = new Map<string, number>();
   private readonly missionRepoIds = new Map<string, string>();
   private readonly worksetPolicy: WorksetPolicy;
+  private readonly maxMissionWallClockMs?: number;
   private readonly specApproval?: OrchestratorOptions["specApproval"];
   private readonly recoveryPlanner: RecoveryPlanner;
   private readonly failureClassifier = new FailureClassifier();
@@ -223,6 +272,7 @@ export class Orchestrator {
     this.limits = opts.limits ?? {};
     this.maxRepairRounds = opts.maxRepairRounds ?? 2;
     this.worksetPolicy = { ...DEFAULT_WORKSET_POLICY, ...opts.worksetPolicy };
+    this.maxMissionWallClockMs = opts.timeLimits?.maxMissionWallClockMs;
     this.specApproval = opts.specApproval;
     this.recoveryPlanner = new RecoveryPlanner(opts.recovery);
     const checkpoints = new CheckpointManager({ store: this.store });
@@ -252,6 +302,10 @@ export class Orchestrator {
       onActivity: (event) => this.observeWorkerActivity(event),
       checkpoints,
       artifacts: opts.artifacts,
+      ...(opts.timeLimits?.workerInactivityMs !== undefined
+        ? { inactivityTimeoutMs: opts.timeLimits.workerInactivityMs }
+        : {}),
+      ...(opts.timeLimits?.inferenceWaiting ? { inferenceWaiting: opts.timeLimits.inferenceWaiting } : {}),
     });
     this.scheduler = new MissionScheduler({
       store: this.store,
@@ -319,6 +373,9 @@ export class Orchestrator {
    * instead of creating duplicate replacement work.
    */
   async repairBlockedMission(missionId: string, signal?: AbortSignal): Promise<Mission> {
+    const paused = this.store.getMission(missionId);
+    // Only the operator resumes a mission the operator paused.
+    if (paused?.operator_paused_at) return paused;
     const resumptionGeneration = this.store.listMissionResumptions(missionId).at(-1)?.generation ?? 0;
     const flightKey = `${missionId}:${resumptionGeneration}`;
     const active = this.blockedRepairFlights.get(flightKey);
@@ -509,7 +566,9 @@ export class Orchestrator {
           resumeCondition:
             repairDecision.action === "PAUSE_FOR_PERSISTENCE"
               ? "durable writes must succeed and persistence diagnostics must clear"
-              : `a healthy provider probe must succeed before ${repairDecision.deadline}`,
+              : repairDecision.deadline
+                ? `a healthy provider probe must succeed before ${repairDecision.deadline}`
+                : "a healthy provider probe must succeed (no deadline: the mission waits for capacity)",
         });
         await this.store.flush();
         this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
@@ -696,7 +755,11 @@ export class Orchestrator {
             repo_id: failed.repo_id,
             acceptance_ids: [...(failed.acceptance_ids ?? [])],
             deliverables: [deliverable],
-            execution_budget_ms: failed.execution_budget_ms,
+            // A wall-clock budget is inherited only while limits are configured:
+            // tasks planned under the retired implicit 30-minute default must
+            // not pass that clock on to the work that recovers them.
+            execution_budget_ms:
+              this.worksetPolicy.maxTaskBudgetMs === undefined ? undefined : failed.execution_budget_ms,
             checkpoint_policy: failed.checkpoint_policy,
             required_output_artifacts: [...(failed.required_output_artifacts ?? [])],
             candidate_generation: (failed.candidate_generation ?? 0) + index + 1,
@@ -1162,20 +1225,50 @@ export class Orchestrator {
    */
   async orchestrate(
     request: string,
-    opts: {
-      title?: string;
-      repository: string;
-      baseRef: string;
-      constraints?: string[];
-      changedFiles?: string[];
-      mutationRequested?: boolean;
-      acceptanceCriteria?: string[];
-      /** Live progress callback (per-call). Lines stream as the mission runs. */
-      onProgress?: (line: string) => void;
-      /** Cancels active work and stops any infrastructure-recovery wait. */
-      signal?: AbortSignal;
-    } = { repository: ".", baseRef: "" },
+    options: OrchestrateOptions = { repository: ".", baseRef: "" },
   ): Promise<OrchestrateResult> {
+    const run = interruptibleRun(options.signal, options.interrupt);
+    this.runControllers.set(run.signal, run.controller);
+    this.pauseHooks.set(run.controller, run.onPause);
+    try {
+      return await this.orchestrateLimited(request, { ...options, signal: run.signal });
+    } finally {
+      run.dispose();
+    }
+  }
+
+  private async orchestrateLimited(request: string, opts: OrchestrateOptions): Promise<OrchestrateResult> {
+    const limitMs = this.maxMissionWallClockMs;
+    if (limitMs === undefined) return this.orchestrateMission(request, opts);
+    // Opt-in mission wall-clock limit: reaching it cancels the mission exactly
+    // as the user would, so all work is preserved and the reason is named.
+    const limited = new AbortController();
+    const runController = opts.signal ? this.runControllers.get(opts.signal) : undefined;
+    if (runController) this.runControllers.set(limited.signal, runController);
+    const forward = (): void => limited.abort(opts.signal?.reason);
+    if (opts.signal?.aborted) forward();
+    else opts.signal?.addEventListener("abort", forward, { once: true });
+    let limitReached = false;
+    const timer = setTimeout(() => {
+      limitReached = true;
+      limited.abort(new DOMException(`configured mission wall-clock limit of ${limitMs}ms reached`, "TimeoutError"));
+    }, limitMs);
+    timer.unref?.();
+    try {
+      const result = await this.orchestrateMission(request, { ...opts, signal: limited.signal });
+      return limitReached && !result.completed
+        ? {
+            ...result,
+            failureReason: `configured mission wall-clock limit (limits.max_mission_wall_clock_ms = ${limitMs}ms) reached; work is preserved`,
+          }
+        : result;
+    } finally {
+      clearTimeout(timer);
+      opts.signal?.removeEventListener("abort", forward);
+    }
+  }
+
+  private async orchestrateMission(request: string, opts: OrchestrateOptions): Promise<OrchestrateResult> {
     const intent = this.router.route({
       request,
       changedFiles: opts.changedFiles,
@@ -1233,9 +1326,29 @@ export class Orchestrator {
       parent_session_id: this.parentSessionId,
     });
     const expectedResumptionGeneration = this.store.listMissionResumptions(mission.mission_id).at(-1)?.generation ?? 0;
+    const liveRun = opts.signal ? this.runControllers.get(opts.signal) : undefined;
+    if (liveRun) {
+      this.liveRuns.set(mission.mission_id, liveRun);
+      // An operator interrupt is recorded on the mission before anything
+      // else reacts to it, so no automatic recovery can resume it meanwhile.
+      this.pauseHooks.get(liveRun)?.(() => this.store.markOperatorPause(mission.mission_id));
+    }
     if (this.ownership) {
       this.ownershipByMission.set(mission.mission_id, await this.ownership.acquire(mission.mission_id));
     }
+    // A live controller keeps its mission lease alive for the whole mission,
+    // not only while a worker holds a dispatch authority: a mission waiting
+    // hours for gateway capacity (or between tasks) is alive, and an expired
+    // lease used to fence its own next dispatch. A dead process stops renewing,
+    // so crash recovery still sees the lease expire.
+    let leaseRenewal: Promise<void> = Promise.resolve();
+    const leaseKeepAlive = this.ownership
+      ? setInterval(() => {
+          if (!this.ownershipByMission.has(mission.mission_id)) return;
+          leaseRenewal = leaseRenewal.then(() => this.renewMissionOwnership(mission.mission_id)).catch(() => undefined);
+        }, this.ownership.renewalIntervalMs)
+      : undefined;
+    leaseKeepAlive?.unref?.();
     if (opts.onProgress) this.progress.set(mission.mission_id, opts.onProgress);
     try {
       this.observability?.missionCreated(mission.mission_id, mission.title);
@@ -1589,6 +1702,18 @@ export class Orchestrator {
       await this.renewMissionOwnership(mission.mission_id);
       await this.scheduler.runMission(mission.mission_id, opts.signal);
 
+      if (isPauseAbort(opts.signal)) {
+        const pausedByOperator = await this.pauseInterruptedMission(mission.mission_id);
+        return {
+          mission: pausedByOperator,
+          intent,
+          verdict: this.gate.evaluate(pausedByOperator),
+          completed: false,
+          failureReason: OPERATOR_PAUSE_STOP_REASON,
+          paused: true,
+          pausedBy: "operator",
+        };
+      }
       if (opts.signal?.aborted) {
         const current = this.store.getMission(mission.mission_id)!;
         if (current.status !== "CANCELED") {
@@ -1654,9 +1779,11 @@ export class Orchestrator {
         };
       }
 
-      // A wall-clock timeout with a durable partial checkpoint is not an
-      // integration candidate. Stop at the public repair boundary so recovery
-      // can split exactly the remaining deliverables and fence the late worker.
+      // Only an operator-configured (opt-in) wall-clock limit produces a
+      // "timeout" execution: there is no implicit time budget. Such a timeout
+      // with a durable partial checkpoint is not an integration candidate.
+      // Stop at the public repair boundary so recovery can split exactly the
+      // remaining deliverables and fence the late worker.
       const timedCheckpoint = this.store
         .listTasks(mission.mission_id)
         .filter((task) => task.status === "FAILED" && task.assigned_execution_id)
@@ -1670,7 +1797,8 @@ export class Orchestrator {
             execution?.exit_status === "timeout" && (checkpoint?.remainingDeliverables.length ?? 0) > 0,
         );
       if (timedCheckpoint) {
-        const summary = "task execution budget exhausted after a durable partial checkpoint";
+        const summary =
+          "configured task wall-clock limit (limits.max_task_wall_clock_ms) reached after a durable partial checkpoint";
         const classification = this.failureClassifier.classify({
           missionId: mission.mission_id,
           taskId: timedCheckpoint.task.task_id,
@@ -1695,6 +1823,11 @@ export class Orchestrator {
       const finalized = await this.finalizeMission(mission.mission_id, expectedResumptionGeneration, opts.signal);
       return { ...finalized, intent };
     } finally {
+      if (leaseKeepAlive) clearInterval(leaseKeepAlive);
+      if (liveRun && this.liveRuns.get(mission.mission_id) === liveRun) this.liveRuns.delete(mission.mission_id);
+      // Never release under an in-flight renewal: it would write the stale
+      // lease back after the release.
+      await leaseRenewal;
       this.progress.delete(mission.mission_id);
       const identity = this.ownershipByMission.get(mission.mission_id);
       if (identity && this.ownership) {
@@ -1724,15 +1857,32 @@ export class Orchestrator {
    * `{ force: true }`), returning the updated mission. When the gateway is still
    * down the mission is left paused (call again on the next probe).
    */
-  async resume(missionId: string, opts?: { force?: boolean; signal?: AbortSignal }): Promise<Mission> {
+  async resume(
+    missionId: string,
+    options?: { force?: boolean; signal?: AbortSignal; interrupt?: InterruptMode },
+  ): Promise<Mission> {
+    const run = interruptibleRun(options?.signal, options?.interrupt);
+    run.onPause(() => this.store.markOperatorPause(missionId));
+    this.liveRuns.set(missionId, run.controller);
+    try {
+      return await this.resumePaused(missionId, { ...options, signal: run.signal });
+    } finally {
+      run.dispose();
+      if (this.liveRuns.get(missionId) === run.controller) this.liveRuns.delete(missionId);
+    }
+  }
+
+  private async resumePaused(missionId: string, opts: { force?: boolean; signal: AbortSignal }): Promise<Mission> {
     const expectedResumptionGeneration = this.store.listMissionResumptions(missionId).at(-1)?.generation ?? 0;
     this.activateMissionRepository(missionId);
     const mission = this.store.getMission(missionId);
     if (!mission) throw new Error(`unknown mission ${missionId}`);
     if (mission.status !== "PAUSED_INFRASTRUCTURE") return mission;
-    if (opts?.signal?.aborted) return this.cancelMission(missionId);
+    // Only the operator resumes a mission the operator paused.
+    if (mission.operator_paused_at) return mission;
+    if (opts?.signal?.aborted) return this.interruptedMission(missionId, opts.signal);
     if (!opts?.force && !(await this.scheduler.gatewayHealthy(opts?.signal))) {
-      return opts?.signal?.aborted ? this.cancelMission(missionId) : mission;
+      return opts?.signal?.aborted ? this.interruptedMission(missionId, opts.signal) : mission;
     }
     if (this.ownership) this.ownershipByMission.set(missionId, await this.ownership.acquire(missionId));
     try {
@@ -1742,7 +1892,7 @@ export class Orchestrator {
       await this.scheduler.resumePausedMission(missionId, opts?.signal);
       const resumed = this.store.getMission(missionId)!;
       if (resumed.status === "PAUSED_INFRASTRUCTURE") return resumed;
-      if (opts?.signal?.aborted) return this.cancelMission(missionId);
+      if (opts?.signal?.aborted) return this.interruptedMission(missionId, opts.signal);
       return (await this.finalizeMission(missionId, expectedResumptionGeneration, opts?.signal)).mission;
     } finally {
       const identity = this.ownershipByMission.get(missionId);
@@ -1771,14 +1921,14 @@ export class Orchestrator {
     signal?: AbortSignal,
     requiredCandidateChangeFrom?: string | null,
   ): Promise<FinalizationResult> {
-    if (signal?.aborted) return this.canceledFinalization(missionId);
+    if (signal?.aborted) return this.canceledFinalization(missionId, signal);
     await this.reconcileCommittedPromotions(missionId);
-    if (signal?.aborted) return this.canceledFinalization(missionId);
+    if (signal?.aborted) return this.canceledFinalization(missionId, signal);
     // Post-execution: integrate, validate + review if the mission mutated or
     // requires gates. If integration did not land the change, the mission must
     // not complete — otherwise it reports success over an unchanged repository.
     let post = await this.postExecution(this.store.getMission(missionId)!, signal);
-    if (signal?.aborted) return this.canceledFinalization(missionId);
+    if (signal?.aborted) return this.canceledFinalization(missionId, signal);
     let integrated = post.integrationOk;
     if (
       requiredCandidateChangeFrom !== undefined &&
@@ -1814,7 +1964,7 @@ export class Orchestrator {
         : this.store.listRecoveryDecisions(missionId).filter((decision) => decision.action === "CREATE_REPAIR_TASKS")
             .length;
     while ((!verdict.can_complete || !integrated) && repairRounds < this.maxRepairRounds) {
-      if (signal?.aborted) return this.canceledFinalization(missionId);
+      if (signal?.aborted) return this.canceledFinalization(missionId, signal);
       const openBlocking = this.store
         .listFindings(missionId)
         .filter((f) => f.severity === "blocking" && f.status === "open");
@@ -1931,11 +2081,11 @@ export class Orchestrator {
         const repaired = await this.runSingleTask(missionId, repair.task_id, {
           signal,
         });
-        if (signal?.aborted) return this.canceledFinalization(missionId);
+        if (signal?.aborted) return this.canceledFinalization(missionId, signal);
         if (repaired && obj.findingId) this.store.resolveFinding(obj.findingId);
       }
       post = await this.postExecution(this.store.getMission(missionId)!, signal);
-      if (signal?.aborted) return this.canceledFinalization(missionId);
+      if (signal?.aborted) return this.canceledFinalization(missionId, signal);
       integrated = post.integrationOk;
       if (post.reviewAttempted && !post.reviewOk) {
         verdict = this.gate.evaluate(this.store.getMission(missionId)!);
@@ -2469,8 +2619,11 @@ export class Orchestrator {
         }
       }
       if (extra.signal?.aborted) {
-        await this.broker.cancelByTask(taskId);
-        if (this.store.getTask(taskId)?.status === "RUNNING") this.store.transitionTask(taskId, "CANCELED");
+        const resumable = isPauseAbort(extra.signal);
+        await this.broker.cancelByTask(taskId, { resumable });
+        if (this.store.getTask(taskId)?.status === "RUNNING") {
+          this.store.transitionTask(taskId, resumable ? "RETRYING" : "CANCELED");
+        }
         this.report(missionId, `[mission ${missionId}] ${task.kind}:${task.role} canceled`);
         return false;
       }
@@ -2685,6 +2838,14 @@ export class Orchestrator {
   private async cancelMission(missionId: string): Promise<Mission> {
     let mission = this.store.getMission(missionId)!;
     if (mission.status === "CANCELED") return mission;
+    // A canceled mission is no longer paused; never report it as waiting.
+    this.store.clearOperatorPause(missionId);
+    if (mission.status === "PAUSED_INFRASTRUCTURE") {
+      // Interrupted tasks were left resumable; an explicit cancel ends them.
+      for (const task of this.store.listTasks(missionId)) {
+        if (canTransitionTask(task.status, "CANCELED")) this.store.transitionTask(task.task_id, "CANCELED");
+      }
+    }
     if (canTransitionMission(mission.status, "CANCELING")) {
       mission = this.store.transitionMission(missionId, "CANCELING");
     }
@@ -2696,14 +2857,94 @@ export class Orchestrator {
     return mission;
   }
 
-  private async canceledFinalization(missionId: string): Promise<FinalizationResult> {
-    const mission = await this.cancelMission(missionId);
+  private async canceledFinalization(missionId: string, signal?: AbortSignal): Promise<FinalizationResult> {
+    const mission = await this.interruptedMission(missionId, signal);
     return {
       mission,
       verdict: this.gate.evaluate(mission),
       completed: false,
-      failureReason: "canceled by caller",
+      failureReason: isPauseAbort(signal) ? OPERATOR_PAUSE_STOP_REASON : "canceled by caller",
     };
+  }
+
+  /** An aborted run: a durable pause for an operator interrupt, otherwise a cancel. */
+  private interruptedMission(missionId: string, signal: AbortSignal | undefined): Promise<Mission> {
+    return isPauseAbort(signal) ? this.pauseInterruptedMission(missionId) : this.cancelMission(missionId);
+  }
+
+  /**
+   * Park an interrupted mission durably: in-flight work has stopped and its
+   * tasks stay resumable; nothing is cleaned up. The durable stop keeps the
+   * supervisor from resuming it on its own — the operator resumes it with
+   * `/mission resume <id>` (or the mission tool's resume action).
+   */
+  private async pauseInterruptedMission(missionId: string): Promise<Mission> {
+    // Normally recorded already, synchronously, when the interrupt landed.
+    this.store.markOperatorPause(missionId);
+    let mission = this.store.getMission(missionId)!;
+    if (["COMPLETE", "FAILED", "CANCELED", "CANCELING"].includes(mission.status)) return mission;
+    if (["NEW", "CLASSIFYING", "PLANNING"].includes(mission.status)) {
+      // Interrupted before any work was planned: nothing to preserve.
+      return this.cancelMission(missionId);
+    }
+    // Make the pause visible on the live surfaces (panel, footer) at once.
+    const pauseLine = describeOperatorPause(mission);
+    if (pauseLine) this.observability?.activity(missionId, { type: "recovery", summary: pauseLine });
+    if (["READY", "QUEUED", "STARTING"].includes(mission.status) && canTransitionMission(mission.status, "EXECUTING")) {
+      mission = this.store.transitionMission(missionId, "EXECUTING");
+    }
+    for (const task of this.store.listTasks(missionId)) {
+      if (task.status === "RUNNING") {
+        this.store.transitionTask(task.task_id, "RETRYING", "system", { failure_reason: OPERATOR_PAUSE_STOP_REASON });
+      }
+    }
+    if (mission.status !== "PAUSED_INFRASTRUCTURE") {
+      if (!canTransitionMission(mission.status, "PAUSED_INFRASTRUCTURE")) {
+        // BLOCKED, NEEDS_ATTENTION, WAITING_FOR_USER: already waiting for
+        // someone. Leave it exactly there — never cancel it — and say so.
+        await this.store.flush();
+        this.report(
+          missionId,
+          `[mission ${missionId}] interrupt noted — mission left ${mission.status}; /mission resume ${missionId} continues it, /mission cancel ${missionId} ends it`,
+        );
+        return mission;
+      }
+      mission = this.store.transitionMission(missionId, "PAUSED_INFRASTRUCTURE");
+    }
+    this.store.stopMission(missionId, {
+      reason: OPERATOR_PAUSE_STOP_REASON,
+      preservedWork: await this.preservedMissionWork(missionId),
+      attemptedRecoveries: [],
+      resumeCondition: `the operator resumes it: /mission resume ${missionId}`,
+    });
+    await this.store.flush();
+    this.report(
+      missionId,
+      `[mission ${missionId}] PAUSED by interrupt — progress preserved; /mission resume ${missionId} continues it, /mission cancel ${missionId} ends it`,
+    );
+    return this.store.getMission(missionId)!;
+  }
+
+  /**
+   * Explicitly cancel a mission — the only operator action that terminates a
+   * healthy mission. A run executing in this process is stopped through its
+   * own controller (and settles as canceled); a paused or idle one is
+   * canceled directly.
+   */
+  async cancel(missionId: string): Promise<Mission> {
+    const mission = this.store.getMission(missionId);
+    if (!mission) throw new Error(`unknown mission ${missionId}`);
+    if (["COMPLETE", "FAILED", "CANCELED"].includes(mission.status)) return mission;
+    const live = this.liveRuns.get(missionId);
+    if (live) {
+      live.abort(MISSION_CANCEL_REASON);
+      for (let waited = 0; waited < 600 && this.liveRuns.get(missionId) === live; waited++) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      const settled = this.store.getMission(missionId)!;
+      if (settled.status === "CANCELED") return settled;
+    }
+    return this.cancelMission(missionId);
   }
 
   // ── Steering ───────────────────────────────────────────────────────────

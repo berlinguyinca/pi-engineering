@@ -220,7 +220,16 @@ export interface TaskCreateInput {
 
 /** Non-authority mission metadata that may be changed without a lifecycle operation. */
 export type MissionUpdatePatch = Partial<
-  Pick<Mission, "constraints" | "artifact_refs" | "decision_refs" | "required_gates">
+  Pick<
+    Mission,
+    | "constraints"
+    | "artifact_refs"
+    | "decision_refs"
+    | "required_gates"
+    | "operator_model_pin"
+    | "operator_model_decided_at"
+    | "operator_paused_at"
+  >
 >;
 
 export interface MissionTransitionOptions {
@@ -266,6 +275,9 @@ const MISSION_UPDATE_FIELDS = new Set<keyof MissionUpdatePatch>([
   "artifact_refs",
   "decision_refs",
   "required_gates",
+  "operator_model_pin",
+  "operator_paused_at",
+  "operator_model_decided_at",
 ]);
 const TASK_TRANSITION_METADATA_FIELDS = new Set<keyof TaskTransitionMetadata>([
   "attempt",
@@ -824,6 +836,14 @@ export class MissionStore {
       typeof actorOrOptions === "string" ? explicitOptions : actorOrOptions,
     );
     const repairRecoveryId = options.recoveryDecisionId;
+    // Re-entering the current state is an idempotent no-op. Throwing here
+    // ("illegal mission transition BLOCKED -> BLOCKED") turned an already
+    // recorded outcome into an exception that lost the mission id for the
+    // caller; writing it would open a spurious new blocked episode. Options
+    // were validated above; a self-transition carrying a recovery decision
+    // still goes through the full transition checks below. Like every other
+    // read, the no-op hands out a copy, never the internal record.
+    if (m.status === to && !repairRecoveryId) return copyMission(m);
     let repairDecision: RecoveryDecision | undefined;
     if (m.status === "BLOCKED" && to === "REPAIRING") {
       repairDecision = repairRecoveryId ? this.recoveryDecisions.get(repairRecoveryId) : undefined;
@@ -896,6 +916,22 @@ export class MissionStore {
     this.missions.set(missionId, next);
     this.emit("mission.updated", missionId, { actor, mission_id: missionId, patch: safePatch }, now);
     return this.getMission(missionId)!;
+  }
+
+  /**
+   * Record an operator interrupt (pause) on the mission, synchronously and
+   * durably. Idempotent; a terminal mission is left alone.
+   */
+  markOperatorPause(missionId: string): void {
+    const mission = this.missions.get(missionId);
+    if (!mission || mission.operator_paused_at || ["COMPLETE", "FAILED", "CANCELED"].includes(mission.status)) return;
+    this.updateMission(missionId, { operator_paused_at: new Date().toISOString() }, "operator");
+  }
+
+  /** The operator resumed the mission: automatic recovery may act on it again. */
+  clearOperatorPause(missionId: string): void {
+    if (!this.missions.get(missionId)?.operator_paused_at) return;
+    this.updateMission(missionId, { operator_paused_at: null }, "operator");
   }
 
   completeMission(missionId: string, options: MissionCompletionOptions, actor = "system"): Mission {
@@ -2372,6 +2408,18 @@ export class MissionStore {
     return lease ? { ...lease } : undefined;
   }
 
+  /**
+   * Apply events other sessions appended to this namespace since the last
+   * read (per-session streams). A no-op for single-stream backends. Returns how
+   * many events were applied.
+   */
+  syncExternal(): number {
+    const backend = this.backend as EventStoreBackend & { refresh?: () => StoredEvent[] };
+    const fresh = backend.refresh?.() ?? [];
+    for (const event of fresh) this.apply(fromStored(event));
+    return fresh.length;
+  }
+
   /** Local takeover is permitted only while this process owns the JSONL writer boundary. */
   hasExclusiveWriterAuthority(): boolean {
     const backend = this.backend as EventStoreBackend & {
@@ -2457,7 +2505,7 @@ export class MissionStore {
     const resumptionGeneration = this.listMissionResumptions(missionId).at(-1)?.generation ?? 0;
     const deadlines = this.listRecoveryDecisions(missionId)
       .filter((decision) => (decision.resumptionGeneration ?? 0) === resumptionGeneration)
-      .map((decision) => decision.deadline)
+      .flatMap((decision) => (decision.deadline ? [decision.deadline] : []))
       .filter((deadline) => Number.isFinite(Date.parse(deadline)))
       .sort();
     const stop: MissionStop = {
@@ -2507,7 +2555,7 @@ export class MissionStore {
       const deadlines = durableBefore
         .listRecoveryDecisions(missionId)
         .filter((decision) => (decision.resumptionGeneration ?? 0) === expected.resumptionGeneration)
-        .map((decision) => decision.deadline)
+        .flatMap((decision) => (decision.deadline ? [decision.deadline] : []))
         .filter((deadline) => Number.isFinite(Date.parse(deadline)))
         .sort();
       const stop: MissionStop = {
@@ -2719,6 +2767,7 @@ function copyMission(mission: Mission): Mission {
     artifact_refs: [...mission.artifact_refs],
     decision_refs: [...mission.decision_refs],
     required_gates: [...mission.required_gates],
+    ...(mission.operator_model_pin ? { operator_model_pin: { ...mission.operator_model_pin } } : {}),
   };
 }
 
@@ -2866,6 +2915,26 @@ function validateMissionUpdatePatch(patch: MissionUpdatePatch): MissionUpdatePat
     ...(patch.artifact_refs !== undefined ? { artifact_refs: [...patch.artifact_refs] } : {}),
     ...(patch.decision_refs !== undefined ? { decision_refs: [...patch.decision_refs] } : {}),
     ...(patch.required_gates !== undefined ? { required_gates: [...patch.required_gates] } : {}),
+    ...(patch.operator_model_decided_at !== undefined
+      ? {
+          operator_model_decided_at:
+            patch.operator_model_decided_at === null ? null : String(patch.operator_model_decided_at),
+        }
+      : {}),
+    ...(patch.operator_paused_at !== undefined
+      ? { operator_paused_at: patch.operator_paused_at === null ? null : String(patch.operator_paused_at) }
+      : {}),
+    ...(patch.operator_model_pin !== undefined
+      ? {
+          operator_model_pin: patch.operator_model_pin
+            ? {
+                provider: String(patch.operator_model_pin.provider),
+                id: String(patch.operator_model_pin.id),
+                set_at: String(patch.operator_model_pin.set_at),
+              }
+            : null,
+        }
+      : {}),
   };
 }
 

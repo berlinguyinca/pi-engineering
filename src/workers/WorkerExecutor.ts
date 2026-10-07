@@ -16,6 +16,9 @@ export interface WorkerActivity {
 }
 
 /** A delegated task for a fresh-context worker (INV-002, §12). */
+/** A worker attempt ended at an inference boundary because the operator chose another model. */
+export const MODEL_SUPERSEDED = "model_superseded";
+
 export interface WorkerRequest {
   role: WorkerRole;
   task: string;
@@ -25,8 +28,17 @@ export interface WorkerRequest {
   tools: string[];
   /** Working directory (candidate worktree or repo root). */
   cwd: string;
-  /** Wall-clock budget in ms. */
+  /**
+   * Inactivity guard in ms for standalone runs (no owner `signal`): the session
+   * is aborted only after this long with no session event at all. It is not a
+   * total-duration budget.
+   */
   timeoutMs?: number;
+  /**
+   * Mission workers: wait for inference capacity with no elapsed cap (the
+   * interactive turn keeps its horizon). Only cancellation ends the wait.
+   */
+  unboundedInferenceWait?: boolean;
   /** Hard context-token budget; the session is aborted once exceeded (spec §10.6). */
   maxContextTokens?: number;
   /** Opening user message for the fresh session (defaults to the generic kickoff). */
@@ -36,6 +48,18 @@ export interface WorkerRequest {
    * executor falls back to its construction-time model.
    */
   modelOverride?: { provider: string; id: string };
+  /**
+   * The operator pinned `modelOverride` (Pi `/model`): capacity exhaustion on
+   * it is waited out — however long — instead of handed back to the mission.
+   */
+  operatorPinned?: boolean;
+  /**
+   * True once the operator chose a different model for this mission. Checked
+   * at inference boundaries only (between requests, e.g. while held for
+   * capacity), never mid-stream; the attempt then ends with
+   * `model_superseded` so the mission re-dispatches on the new choice.
+   */
+  modelSuperseded?: () => boolean;
   /** Replace the role prompt entirely (specialist roles own their prompts). */
   systemPromptOverride?: string;
   /** Image attachments for vision-capable roles. */

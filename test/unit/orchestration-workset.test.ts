@@ -120,6 +120,14 @@ describe("repository-scoped workset validation", () => {
     );
   });
 
+  it("accepts a task without any execution budget: no clock sizes the work by default", () => {
+    const unlimited = task({ execution_budget_ms: undefined });
+    const validated = validateWorkset({ manifest, acceptanceIds: ["AC-1"], tasks: [{ ...unlimited }] });
+    assert.equal(validated[0]?.execution_budget_ms, undefined);
+    // A huge explicit budget is fine too: the policy has no implicit ceiling.
+    validateWorkset({ manifest, acceptanceIds: ["AC-1"], tasks: [task({ execution_budget_ms: 8 * 3_600_000 })] });
+  });
+
   it("rejects non-positive/non-finite budgets and non-positive or out-of-budget checkpoint cadence", () => {
     for (const execution_budget_ms of [0, -1, Number.POSITIVE_INFINITY]) {
       expectCode("INVALID_TASK_BUDGET", () =>

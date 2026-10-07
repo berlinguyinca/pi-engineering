@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, rename, unlink, writeFile } from "node:fs/promises";
+import { hostname } from "node:os";
 import { join, resolve } from "node:path";
 import type { Model } from "@earendil-works/pi-ai/compat";
 import { ArtifactStore } from "../artifacts/ArtifactStore.ts";
@@ -21,7 +22,9 @@ import type {
 import { ROLE_BUDGETS, isMachineEvidence } from "../core/types.ts";
 import { GitRepo } from "../git/GitRepo.ts";
 import { Ledger } from "../ledger/Ledger.ts";
+import { loadMissionLimits } from "../lifecycle/policy.ts";
 import { workflowMutatesRepo } from "../orchestration/intentRouter.ts";
+import { OPERATOR_PAUSE_STOP_REASON, interruptibleRun } from "../orchestration/interrupt.ts";
 import {
   MISSION_SNAPSHOT_FILENAME,
   type MissionSnapshotFile,
@@ -32,15 +35,16 @@ import { MissionObservability } from "../orchestration/observability/MissionObse
 import { Orchestrator } from "../orchestration/orchestrator.ts";
 import type { OrchestratorOptions, PlanTaskInput } from "../orchestration/orchestrator.ts";
 import { MissionOwnership } from "../orchestration/ownership.ts";
+import { missionCustodyKey } from "../orchestration/ownership.ts";
 import { type RouteModel, realBackends } from "../orchestration/realBackends.ts";
 import { FailureClassifier } from "../orchestration/recovery.ts";
 import { RepositoryRegistry } from "../orchestration/repositoryRegistry.ts";
 import { canTransitionMission } from "../orchestration/state.ts";
 import { MissionSupervisor, type SupervisorStatus } from "../orchestration/supervisor.ts";
+import { SupervisorRepairBackoff } from "../orchestration/supervisorBackoff.ts";
 import type { Mission, MissionStop } from "../orchestration/types.ts";
 import { WorkspaceManifestResolver } from "../orchestration/workspaceManifest.ts";
 import { tasksConflict, topoSort } from "../plan/taskDag.ts";
-import { JsonlEventStore } from "../platform/eventstore/jsonl.ts";
 import { redactSecrets } from "../platform/redact.ts";
 import { resolveGatewayResilienceConfig } from "../resilience/config.ts";
 import {
@@ -55,7 +59,24 @@ import { buildCoreTools } from "../tools/coreTools.ts";
 import { CommandVerifier, type VerificationProvider, type VerifyOutcome } from "../verify/Verifier.ts";
 import { PiWorkerExecutor } from "../workers/PiWorkerExecutor.ts";
 import type { WorkerExecutor, WorkerRequest } from "../workers/WorkerExecutor.ts";
+import { type RuntimeBinding, resolveRuntimeBinding, sessionBindingInfo } from "./isolation/RuntimeBinding.ts";
+import { RuntimeSession } from "./isolation/RuntimeSession.ts";
+import { resolveWorktreeIdentity } from "./isolation/WorktreeIdentity.ts";
+import {
+  type OrchestrationNamespace,
+  namespaceKey,
+  openOrchestrationNamespace,
+} from "./isolation/orchestrationNamespace.ts";
+import { assessProcess } from "./isolation/processIdentity.ts";
+import { isReloadShutdown } from "./isolation/reloadCustody.ts";
 import { UnavailableModels, createRouteModel, followUnavailableModels } from "./modelRouting.ts";
+import {
+  type PinTransition,
+  adoptOperatorModelPin,
+  claimMissionForSession,
+  releaseMissionModelPin,
+  releaseSessionMissionPins,
+} from "./operatorModelPin.ts";
 
 /**
  * Build the mission gateway recovery probe.
@@ -269,10 +290,11 @@ const PHASE_FOR_ROLE: Partial<Record<WorkerRole, RuntimePhaseEvent["phase"]>> = 
  * participant, so a throwing or slow one must not affect an engineering run.
  */
 /**
- * Opened orchestration event stores by path, so multiple runtimes over one
- * repo share a single durable store (the JSONL backend is single-instance).
+ * Opened orchestration namespaces by key, so multiple runtimes over one
+ * worktree in this process share one session writer, mission store, and
+ * custody set.
  */
-const openedOrchestrationStores = new Map<string, JsonlEventStore>();
+const openedOrchestrationStores = new Map<string, OrchestrationNamespace>();
 /** Live mission state owners shared by sequential runtimes for one work dir. */
 const openedMissionStores = new Map<string, MissionStore>();
 const openedMissionObservability = new Map<string, MissionObservability>();
@@ -322,6 +344,10 @@ export interface RuntimeMissionActivityEvent {
   repository: string | null;
   task: string | null;
   preservedWork: string[];
+  /** Set while the operator has paused the mission (Esc); automatic repair is off. */
+  operatorPausedAt?: string | null;
+  /** The mission's operator model pin ("provider/id"), when it has one. */
+  operatorModelPin?: string | null;
 }
 
 export interface EngineeringRuntimeOptions {
@@ -397,31 +423,46 @@ export interface EngineeringRuntimeOptions {
 }
 
 /**
- * Resolve the directory that holds the durable orchestration store
- * (`orchestration.jsonl`) and, with it, the store's single-writer file lock.
- *
- * By default this is the runtime workDir (`<repoRoot>/.pi-eng`), so the store
- * lives in the git toplevel of the session's launch directory. That is a FIXED
- * location: when several pi sessions are launched from a shared parent
- * directory (one per project / branch / worktree) they all resolve to the SAME
- * store and therefore serialize on one writer lock — a session working on
- * worktree A cannot start a mission while a session working on worktree B holds
- * the parent store, even though the two never touch the same files.
- *
- * Setting `PI_ENGINEERING_ORCHESTRATION_DIR` relocates the store (and its lock)
- * to a per-worktree / per-session directory, so concurrent sessions each own an
- * independent single-writer store and run in parallel. Sessions launched from
- * WITHIN a worktree already get this automatically (their git toplevel is the
- * worktree); this override covers sessions launched from a shared parent.
- *
- * The override changes only the orchestration store location. The engineering
- * ledger, artifact store, and mission snapshot stay in the workDir so shared
- * per-repo memory is preserved across concurrent sessions.
+ * Whether the runtime that wrote an in-store mission/repository lease is
+ * provably gone, so custody may take the mission over without waiting for the
+ * lease to expire. Owners are `session-<uuid>-…` (checked against the machine
+ * registry) or legacy `runtime-<pid>-…` (checked by pid).
  */
-function resolveOrchestrationDir(workDir: string): string {
-  const override = process.env.PI_ENGINEERING_ORCHESTRATION_DIR;
-  if (override && override.trim() !== "") return resolve(override);
-  return workDir;
+/**
+ * Mission-ownership ids of runtimes that are open in THIS process, on
+ * globalThis so it spans an in-process reload. A lease written by this session
+ * whose owner is no longer open here (closed, or from before a reload) belongs
+ * to no live controller and must not be mistaken for live ownership.
+ */
+function liveOwnerIds(): Set<string> {
+  const key = Symbol.for("pi-engineering.live-mission-owner-ids");
+  const holder = globalThis as unknown as Record<symbol, Set<string> | undefined>;
+  let set = holder[key];
+  if (!set) {
+    set = new Set();
+    holder[key] = set;
+  }
+  return set;
+}
+
+function isLeaseOwnerGone(ownerId: string, session: RuntimeSession): boolean {
+  const sessionOwner = /^session-([0-9a-f-]{36})-/.exec(ownerId);
+  if (sessionOwner) {
+    if (sessionOwner[1] === session.sessionId) return !liveOwnerIds().has(ownerId);
+    const registry = session.registry();
+    if (!registry) return false;
+    try {
+      return !registry.isSessionLive(sessionOwner[1]!);
+    } catch {
+      return false;
+    }
+  }
+  const legacy = /^runtime-(\d+)-/.exec(ownerId);
+  if (legacy) {
+    const liveness = assessProcess({ pid: Number(legacy[1]), host: hostname(), bootId: null, processStartTime: null });
+    return liveness.state === "dead";
+  }
+  return false;
 }
 
 /**
@@ -482,11 +523,18 @@ export class EngineeringRuntime {
   private currentPhaseGoal = "";
   private snapshotPublishPending: Promise<MissionSnapshotFile | null> | null = null;
   private snapshotPublishDirty = false;
+  /** This runtime's mission-ownership identity (`session-<session-id>-<uuid>`). */
+  private ownershipId: string | null = null;
+  /** In-process key of the orchestration namespace this runtime shares. */
   private orchestrationPath: string | null = null;
+  /** Where this runtime's orchestration namespace lives (worktree / override / fallback). */
+  runtimeBinding: RuntimeBinding | null = null;
   private closed = false;
   private openReferences = 1;
   private readonly missionResumeFlights = new Map<string, Promise<import("../orchestration/types.ts").Mission>>();
   private readonly supervisorSettlementFlights = new Map<string, Promise<void>>();
+  /** Spaces out supervisor repairs that keep reporting the same unchanged decision. */
+  private readonly supervisorRepairBackoff = new SupervisorRepairBackoff();
 
   /**
    * Serializes git mutations that touch the shared main repo (worktree create,
@@ -622,6 +670,7 @@ export class EngineeringRuntime {
     const projection = this.missionObservability?.projection(missionId);
     if (!projection) return;
     const summary = projection.summary;
+    const mission = this.missionStore?.getMission(missionId);
     const raw = summary.currentActivity?.summary ?? summary.currentObjective ?? summary.title;
     const bounded = redactSecrets(raw)
       .replace(/[\r\n\t]+/g, " ")
@@ -661,6 +710,10 @@ export class EngineeringRuntime {
         repository: summary.repository,
         task: summary.task,
         preservedWork: summary.preservedWork.map((value) => redactSecrets(value).slice(0, 240)).slice(0, 8),
+        operatorPausedAt: mission?.operator_paused_at ?? null,
+        operatorModelPin: mission?.operator_model_pin
+          ? `${mission.operator_model_pin.provider}/${mission.operator_model_pin.id}`
+          : null,
       });
     } catch {
       // UI listeners are observers, never participants in mission execution.
@@ -709,15 +762,20 @@ export class EngineeringRuntime {
     const git = await GitRepo.open(opts.cwd);
     const repoRoot = git ? git.root : opts.cwd;
     const workDir = opts.workDir ?? join(repoRoot, ".pi-eng");
-    const orchestrationDir = resolveOrchestrationDir(workDir);
-    const openKey = `${resolve(repoRoot)}\0${resolve(workDir)}\0${resolve(orchestrationDir)}`;
+    // Orchestration state is namespaced by git WORKTREE identity (common dir +
+    // worktree root), never by launch directory or repository name, and every
+    // session writes its own stream, so concurrent sessions never contend.
+    const session = RuntimeSession.current();
+    const identity = await resolveWorktreeIdentity(repoRoot);
+    const binding = resolveRuntimeBinding({ identity, workDir, sessionId: session.sessionId });
+    const openKey = `${resolve(repoRoot)}\0${resolve(workDir)}\0${namespaceKey(binding)}`;
     const existing = openingRuntimes.get(openKey);
     if (existing) {
       const runtime = await existing;
       runtime.retainOpenReference();
       return runtime;
     }
-    const opening = EngineeringRuntime.openResolved(opts, git, repoRoot, workDir, orchestrationDir);
+    const opening = EngineeringRuntime.openResolved(opts, git, repoRoot, workDir, binding, session);
     openingRuntimes.set(openKey, opening);
     try {
       return await opening;
@@ -733,7 +791,8 @@ export class EngineeringRuntime {
     git: GitRepo | null,
     repoRoot: string,
     workDir: string,
-    orchestrationDir: string,
+    binding: RuntimeBinding,
+    session: RuntimeSession,
   ): Promise<EngineeringRuntime> {
     await mkdir(workDir, { recursive: true });
     const ledger = await Ledger.create(join(workDir, "ledger.jsonl"));
@@ -746,22 +805,31 @@ export class EngineeringRuntime {
     rt.git = git;
     rt.workDir = workDir;
     // Orchestration: durable mission store + orchestrator wired to the existing
-    // worker/verifier/git primitives. Restart-recoverable via the JSONL store.
-    // The store (and its single-writer lock) lives in `orchestrationDir`, which
-    // defaults to the workDir but may be relocated by
-    // PI_ENGINEERING_ORCHESTRATION_DIR so concurrent sessions working on
-    // different worktrees do not serialize on one fixed parent store. Runtimes
-    // over the same store path share it; the JSONL backend is single-instance
-    // per process, so reuse an already-open store for the same path (a second
-    // runtime must not open the same file).
-    await mkdir(orchestrationDir, { recursive: true });
-    const orchestrationPath = join(orchestrationDir, "orchestration.jsonl");
+    // worker/verifier/git primitives. Restart-recoverable via the session event
+    // streams of this worktree's namespace (merged on read). Runtimes over the
+    // same namespace in this process share one writer, mission store and
+    // custody set. A legacy `.pi-eng/orchestration.jsonl` is imported, never
+    // modified.
+    const orchestrationPath = namespaceKey(binding);
+    rt.runtimeBinding = binding;
     try {
-      let orchestrationBackend = openedOrchestrationStores.get(orchestrationPath);
-      if (!orchestrationBackend) {
-        orchestrationBackend = await JsonlEventStore.open(orchestrationPath);
-        openedOrchestrationStores.set(orchestrationPath, orchestrationBackend);
+      let namespace = openedOrchestrationStores.get(orchestrationPath);
+      if (!namespace) {
+        const registry = await session.ensureRegistered();
+        namespace = await openOrchestrationNamespace({
+          binding,
+          sessionId: session.sessionId,
+          registry,
+          leases: () => RuntimeSession.current().registry()?.leases ?? null,
+          leaseOwner: () => session.leaseOwner(),
+        });
+        openedOrchestrationStores.set(orchestrationPath, namespace);
       }
+      const orchestrationBackend = namespace.backend;
+      const custody = namespace.custody;
+      // An unbound session binds to the first worktree runtime it opens;
+      // later moves are explicit rebinds driven by workspace activity.
+      if (!session.binding) session.bindTo(sessionBindingInfo(binding));
       openedOrchestrationStoreReferences.set(
         orchestrationPath,
         (openedOrchestrationStoreReferences.get(orchestrationPath) ?? 0) + 1,
@@ -769,8 +837,12 @@ export class EngineeringRuntime {
       rt.orchestrationPath = orchestrationPath;
       rt.missionStore = openedMissionStores.get(orchestrationPath) ?? MissionStore.open(orchestrationBackend);
       openedMissionStores.set(orchestrationPath, rt.missionStore);
+      rt.ownershipId = `session-${session.sessionId}-${randomUUID()}`;
+      liveOwnerIds().add(rt.ownershipId);
       rt.missionOwnership = new MissionOwnership(rt.missionStore, {
-        ownerId: `runtime-${process.pid}-${randomUUID()}`,
+        ownerId: rt.ownershipId,
+        custody,
+        isOwnerGone: (ownerId) => isLeaseOwnerGone(ownerId, session),
       });
       for (const mission of rt.missionStore.listMissions()) {
         const manifest = rt.missionStore.getWorkspaceManifest(mission.mission_id);
@@ -801,6 +873,18 @@ export class EngineeringRuntime {
       // router cannot be built, so core never requires discovery or network.
       let routeModel: RouteModel | undefined;
       let reviewFallbackModel = opts.model ? { provider: opts.model.provider, id: opts.model.id } : undefined;
+      // The operator's explicit model switch (Pi `/model`), adopted by this
+      // session's missions at their next inference boundary and persisted on
+      // the mission (src/runtime/operatorModelPin.ts).
+      const currentOperatorPin = (missionId: string) =>
+        rt.missionStore
+          ? adoptOperatorModelPin({
+              store: rt.missionStore,
+              missionId,
+              sessionId: RuntimeSession.current().sessionId,
+              onTransition: (transition) => rt.reportPinTransition(transition),
+            })
+          : null;
       try {
         const { createRoleRouter } = await import("../capability/adapter.ts");
         const sharedRuntime = rt.worker instanceof PiWorkerExecutor ? await rt.worker.getModelRuntime() : undefined;
@@ -822,9 +906,16 @@ export class EngineeringRuntime {
           router: routerAdapter,
           unavailable: rt.unavailableModels,
           reviewFallbackModel,
+          operatorPin: currentOperatorPin,
         });
       } catch {
-        routeModel = undefined;
+        // No router: role pins and ranking are unavailable, an operator pin
+        // still places every role.
+        routeModel = createRouteModel({
+          unavailable: rt.unavailableModels,
+          reviewFallbackModel,
+          operatorPin: currentOperatorPin,
+        });
       }
       const backends = realBackends({
         worker: rt.worker,
@@ -839,6 +930,7 @@ export class EngineeringRuntime {
         onModelServed: (model) => rt.unavailableModels.clear(model),
         isModelUnavailable: (model) => rt.unavailableModels.has(model),
         reviewFallbackModel,
+        currentOperatorPin,
         repository: async (repoId) => {
           if (repoId) {
             const context = await rt.repositoryRegistry.resolveActiveForExecution(repoId);
@@ -871,20 +963,31 @@ export class EngineeringRuntime {
             execution_requirements: {},
             acceptance_ids: acceptanceIds,
             deliverables: mutates ? ["implementation", "targeted-tests"] : ["investigation-report"],
-            execution_budget_ms: 30 * 60_000,
+            // No execution_budget_ms: a task runs as long as it shows activity
+            // (an opt-in limits.max_task_wall_clock_ms is applied by the
+            // orchestrator when configured).
             checkpoint_policy: { activity_milestone: 5, before_deadline_ms: 30_000 },
             max_attempts: 3,
             failure_policy: "retry",
           },
         ];
       };
+      const limits = await loadMissionLimits(repoRoot, opts.agentDir);
       rt.orchestrator = new Orchestrator({
         store: rt.missionStore,
         backends,
+        worksetPolicy: { maxTaskBudgetMs: limits.max_task_wall_clock_ms },
+        timeLimits: {
+          // The environment override (PI_ENGINEERING_WORKER_INACTIVITY_MS) wins.
+          workerInactivityMs: process.env.PI_ENGINEERING_WORKER_INACTIVITY_MS ? undefined : limits.worker_inactivity_ms,
+          maxMissionWallClockMs: limits.max_mission_wall_clock_ms,
+        },
         observability: rt.missionObservability,
         planner: opts.orchestrationPlanner ?? defaultPlanner,
         specApproval: opts.orchestrationSpecApproval,
-        parentSessionId: null,
+        // Missions remember the session that started them: its operator
+        // model pin applies to them and to no other session's missions.
+        parentSessionId: session.sessionId,
         git: rt.git,
         artifacts: rt.artifacts,
         baseRef: rt.git ? await rt.git.headCommit() : "",
@@ -935,22 +1038,49 @@ export class EngineeringRuntime {
       // dispatch repair workers, so every fallible backend and every semantic
       // tool binding must already be ready. The same consumer handles startup,
       // explicit ticks, and interval ticks.
+      const supervisedStore = rt.missionStore;
       rt.missionSupervisor = new MissionSupervisor({
-        store: rt.missionStore,
+        store: supervisedStore,
         observability: rt.missionObservability,
         onStatuses: (statuses) => rt.consumeSupervisorStatuses(statuses),
+        // Other live sessions in this worktree see the same missions; each
+        // mission is supervised only by its custodian, and a dead custodian's
+        // missions are adopted automatically.
+        beforeTick: () => {
+          supervisedStore.syncExternal();
+        },
+        admit: async (mission) => {
+          const claim = await custody.claim(missionCustodyKey(mission.mission_id));
+          if (claim.ok) supervisedStore.syncExternal();
+          return claim.ok;
+        },
       });
       await rt.missionSupervisor.reconcileOnStartup();
       rt.missionSupervisor.start();
       return rt;
     } catch (error) {
       await rt.missionSupervisor?.shutdown();
+      if (rt.ownershipId) liveOwnerIds().delete(rt.ownershipId);
       EngineeringRuntime.releaseOrchestrationReference(orchestrationPath);
       throw error;
     }
   }
 
-  /** Release this runtime's share of the orchestration writer lock. Idempotent. */
+  /**
+   * The logical orchestration event stream of this runtime's namespace: every
+   * session's stream (and imported legacy history) merged, with this session's
+   * unflushed appends included once they land. Consumers must use this rather
+   * than reading a particular JSONL file.
+   */
+  orchestrationEvents(): import("../platform/eventstore/backend.ts").StoredEvent[] {
+    const namespace = this.orchestrationPath ? openedOrchestrationStores.get(this.orchestrationPath) : undefined;
+    if (!namespace) return [];
+    const backend = namespace.backend as typeof namespace.backend & { refresh?: () => unknown };
+    backend.refresh?.();
+    return backend.all();
+  }
+
+  /** Release this runtime's share of its orchestration namespace. Idempotent. */
   async close(): Promise<void> {
     if (this.closed) return;
     if (this.openReferences > 1) {
@@ -972,11 +1102,59 @@ export class EngineeringRuntime {
     }
     if (path) EngineeringRuntime.releaseOrchestrationReference(path);
     this.closed = true;
+    if (this.ownershipId) liveOwnerIds().delete(this.ownershipId);
     this.orchestrator = null;
     this.missionSupervisor = null;
     this.missionOwnership = null;
     this.missionObservability = null;
     this.missionStore = null;
+  }
+
+  /** Log a mission's operator-pin change as a MODEL_TRANSITION (observability + operator notice). */
+  private reportPinTransition(transition: PinTransition): void {
+    const text = `MODEL_TRANSITION mission ${transition.missionId}: ${transition.from ?? "auto"} → ${transition.to ?? "auto"} (${transition.reason})`;
+    this.missionObservability?.activity(transition.missionId, { type: "model_request", summary: text });
+    emitTelemetry({
+      level: "info",
+      text: `[mission ${transition.missionId}] ${transition.to ? `model: ${transition.to} (operator pin)` : "model: auto (operator pin cleared)"} from its next worker dispatch`,
+      key: `operator-pin:${transition.missionId}:${transition.to ?? "auto"}`,
+      detail: { type: "MODEL_TRANSITION", ...transition },
+    });
+  }
+
+  /**
+   * Release one mission from its operator pin: it returns to role pins and the
+   * capability router until the operator switches models again.
+   */
+  async clearMissionModelPin(missionId: string): Promise<import("../orchestration/types.ts").Mission> {
+    if (!this.missionStore) throw new Error("Orchestrator not initialized for this directory.");
+    releaseMissionModelPin({
+      store: this.missionStore,
+      missionId,
+      onTransition: (transition) => this.reportPinTransition(transition),
+    });
+    await this.missionStore.flush();
+    return this.missionStore.getMission(missionId)!;
+  }
+
+  /** `/engineering-model auto`: release the pins stored on this session's live missions. */
+  async releaseSessionMissionPins(): Promise<string[]> {
+    if (!this.missionStore) return [];
+    const released = releaseSessionMissionPins({
+      store: this.missionStore,
+      sessionId: RuntimeSession.current().sessionId,
+      onTransition: (transition) => this.reportPinTransition(transition),
+    });
+    await this.missionStore.flush();
+    return released;
+  }
+
+  /** Explicitly cancel a mission: the only operator action that terminates a healthy mission. */
+  async cancelMission(missionId: string): Promise<import("../orchestration/types.ts").Mission> {
+    if (!this.missionStore || !this.orchestrator) throw new Error("Orchestrator not initialized for this directory.");
+    const mission = await this.orchestrator.cancel(missionId);
+    await this.missionStore.flush();
+    return mission;
   }
 
   /** Explicit, idempotent operator fallback for one durably stopped blocked mission. */
@@ -997,23 +1175,46 @@ export class EngineeringRuntime {
     if (!this.missionStore || !this.orchestrator) throw new Error("Orchestrator not initialized for this directory.");
     let mission = this.missionStore.getMission(missionId);
     if (!mission) throw new Error(`unknown mission ${missionId}`);
+    // The session that resumes a mission is the one whose model choice it follows.
+    claimMissionForSession(RuntimeSession.current().sessionId, missionId);
     if (["COMPLETE", "FAILED", "CANCELED"].includes(mission.status)) {
       throw new Error(`mission ${missionId} is terminal (${mission.status}) and cannot be resumed`);
     }
+    // The operator resumes: automatic recovery may act on it again.
+    const wasOperatorPaused = !!mission.operator_paused_at;
+    this.missionStore.clearOperatorPause(missionId);
     const generation = this.missionStore.listMissionResumptions(missionId).at(-1)?.generation ?? 0;
     const stop = this.missionStore
       .listMissionStops(missionId)
       .filter((candidate) => candidate.resumptionGeneration === generation)
       .at(-1);
+    if (!stop && wasOperatorPaused) {
+      // Interrupted in a state it was left in (e.g. NEEDS_ATTENTION): handing
+      // it back to supervision is the resume.
+      await this.missionStore.flush();
+      return this.missionStore.getMission(missionId)!;
+    }
     if (!stop) throw new Error(`mission ${missionId} has no current durable stop to resume`);
+    if (stop.reason === OPERATOR_PAUSE_STOP_REASON && mission.status === "PAUSED_INFRASTRUCTURE") {
+      // Paused by an operator interrupt: continue exactly where it stopped. The
+      // interrupted tasks were left resumable; another interrupt pauses again.
+      this.missionStore.resumeMission(missionId, "operator resumed an interrupted mission");
+      await this.missionStore.flush();
+      return this.orchestrator.resume(missionId, { force: true, ...(signal ? { signal } : {}), interrupt: "pause" });
+    }
     mission = await this.normalizeMissionForRepair(missionId);
     this.missionStore.resumeMission(missionId, "operator requested mission recovery");
     await this.missionStore.flush();
+    // An interrupt during the operator's recovery pauses it again; it never cancels.
+    const run = interruptibleRun(signal, "pause");
+    run.onPause(() => this.missionStore?.markOperatorPause(missionId));
     try {
-      await this.orchestrator.repairBlockedMission(missionId, signal);
+      await this.orchestrator.repairBlockedMission(missionId, run.signal);
     } catch (error) {
       await this.persistRecoveryStop(missionId, `Manual recovery failed: ${errorMessage(error)}`, stop);
       throw error;
+    } finally {
+      run.dispose();
     }
     mission = this.missionStore.getMission(missionId)!;
     if ((mission.status === "BLOCKED" || mission.status === "REPAIRING") && !this.currentMissionStop(missionId)) {
@@ -1052,6 +1253,8 @@ export class EngineeringRuntime {
     try {
       const mission = this.missionStore.getMission(status.missionId);
       if (!mission || !this.isCurrentSupervisorStatus(status, mission)) return;
+      // Only the operator resumes a mission the operator paused.
+      if (mission.operator_paused_at) return;
       failureFence = mission;
       if (mission.status === "PAUSED_INFRASTRUCTURE") {
         if (status.action === "STOP" || status.action === "MONITOR") return;
@@ -1078,6 +1281,13 @@ export class EngineeringRuntime {
         if (status.action !== status.decision.action || !SUPPORTED_SUPERVISOR_REPAIR_ACTIONS.has(status.action)) {
           throw new Error(`invalid worker output: unsupported supervisor action ${status.action}`);
         }
+        const repairFingerprint = [
+          status.decision.recoveryId,
+          status.missionStatus,
+          status.missionBlockedEpisodeId ?? "",
+        ].join("|");
+        if (!this.supervisorRepairBackoff.shouldAttempt(status.missionId, repairFingerprint, Date.now())) return;
+        this.supervisorRepairBackoff.recordAttempt(status.missionId, repairFingerprint, Date.now());
         failureFence = await this.normalizeMissionForRepair(status.missionId);
         await this.orchestrator.repairBlockedMission(status.missionId);
       } else if (status.health !== "HEALTHY" && status.action !== "STOP") {
@@ -1215,8 +1425,16 @@ export class EngineeringRuntime {
     openedOrchestrationStoreReferences.delete(path);
     openedMissionObservability.delete(path);
     openedMissionStores.delete(path);
-    openedOrchestrationStores.get(path)?.close();
+    const namespace = openedOrchestrationStores.get(path);
     openedOrchestrationStores.delete(path);
+    if (namespace) {
+      // A reload stops this generation but not the session: custody stays
+      // with the session, so no other live session can admit its missions in
+      // the window before the next generation re-claims them.
+      if (isReloadShutdown()) namespace.custody.retainForReload();
+      else void namespace.custody.releaseAll().catch(() => undefined);
+      namespace.backend.close();
+    }
   }
 
   actor(runId: string, role?: WorkerRole): Actor {

@@ -1,5 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
+import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import type { ContextEvent, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { resolveStateRoot } from "../runtime/isolation/stateDir.ts";
+import { emitTelemetry } from "../telemetry/sink.ts";
 import type { DurableMemoryProvider, DurableMemoryRecord } from "./OpenViking.ts";
 import { ensureMemorySetup, resolveMemoryEnvironment } from "./connectionSetup.ts";
 import { OpenVikingProvider, OpenVikingRequestError } from "./durable.ts";
@@ -17,6 +21,40 @@ export interface InteractiveMemoryOptions {
   env?: () => NodeJS.ProcessEnv;
   provider?: (config: OpenVikingEnvConfig) => DurableMemoryProvider;
   setup?: (ctx: ExtensionContext, force?: boolean) => Promise<void>;
+  /**
+   * Where headless failure notices are stamped (once per host per day).
+   * Default: `<state root>/memory-notices` (PI_ENGINEERING_STATE_DIR,
+   * $XDG_STATE_HOME/pi-engineering or ~/.local/state/pi-engineering), private
+   * to the user, never a shared /tmp directory another local user could seed.
+   */
+  headlessNoticeDir?: string;
+}
+
+/**
+ * True the first time today this host's failure is noted on this machine.
+ * Headless runs are separate processes, so the stamp lives on disk; any
+ * filesystem error errs on the side of logging.
+ */
+function firstNoticeToday(dir: string, baseUrl: string): boolean {
+  const host = (() => {
+    try {
+      return new URL(baseUrl).host;
+    } catch {
+      return baseUrl;
+    }
+  })();
+  const day = new Date().toISOString().slice(0, 10);
+  // Only a hash of the memory host is stored: the marker never names it.
+  const hostHash = createHash("sha256").update(host).digest("hex").slice(0, 16);
+  const name = `${hostHash}-${day}`;
+  try {
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    chmodSync(dir, 0o700);
+    writeFileSync(join(dir, name), hostHash, { flag: "wx", mode: 0o600 });
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== "EEXIST";
+  }
 }
 
 function queryTokens(prompt: string): string[] {
@@ -87,11 +125,20 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
         { triggerTurn: false },
       );
   };
+  const noticeDir = () => options.headlessNoticeDir ?? join(resolveStateRoot(environment()), "memory-notices");
   const failure = (ctx: ExtensionContext, code: string, description: string, explicit = false) => {
     recalled = "";
     setStatus(ctx, description);
-    if (explicit || lastFailure !== code)
-      reply(ctx, `${description}. Use /memory setup to check your host and key.`, true);
+    const text = `${description}. Use /memory setup to check your host and key.`;
+    if (!ctx.hasUI && !explicit) {
+      // Headless (pi -p): an automatic status line is not part of the answer.
+      // Writing it into the transcript polluted every print-mode session, so
+      // log it to telemetry/stderr once per memory host per day instead.
+      const baseUrl = resolveOpenVikingFromEnv(environment())?.baseUrl ?? "unconfigured";
+      if (lastFailure !== code && firstNoticeToday(noticeDir(), baseUrl)) {
+        emitTelemetry({ level: "warning", key: `memory:${code}`, text: `Memory: ${text}` });
+      }
+    } else if (explicit || lastFailure !== code) reply(ctx, text, true);
     lastFailure = code;
   };
   const handleError = (ctx: ExtensionContext, error: unknown, explicit = false) => {

@@ -19,6 +19,7 @@ import type { CandidateLifecycle, GitRepo, IntegrationRunRecord } from "../git/G
 import type { WorktreeInfo } from "../git/GitRepo.ts";
 import { type ModelRef, modelKey } from "../lifecycle/types.ts";
 import type { VerificationProvider } from "../verify/Verifier.ts";
+import { MODEL_SUPERSEDED } from "../workers/WorkerExecutor.ts";
 import type { WorkerActivity, WorkerExecutor, WorkerRequest, WorkerRun } from "../workers/WorkerExecutor.ts";
 import {
   type CheckpointRecoveryContext,
@@ -60,6 +61,12 @@ export interface RealBackendsOptions {
    * and the reviewer's last resort when no distinct model is available.
    */
   reviewFallbackModel?: ModelRef;
+  /**
+   * The operator pin a mission dispatches with right now (Pi `/model`),
+   * adopting the session's latest choice. A change while a worker is waiting
+   * between inference requests re-dispatches it on the new choice.
+   */
+  currentOperatorPin?: (missionId: string) => ModelRef | null | undefined;
   /** Resolve the repository selected by the current mission's async binding. */
   repository?: (repoId?: string) => Promise<{ git: GitRepo; cwd: string }> | { git: GitRepo; cwd: string };
 }
@@ -67,6 +74,12 @@ export interface RealBackendsOptions {
 export interface ModelRoute extends ModelRef {
   /** Operator-visible notice when policy had to degrade model separation. */
   warning?: string;
+  /** The mission's operator pin (Pi `/model`) placed this role. */
+  operatorPin?: boolean;
+  /** The operator pin ("provider/id") not used for this role, if any. */
+  pinRefused?: string;
+  /** Operator-visible reason the pin could not place this role. */
+  pinNotice?: string;
 }
 
 export interface RouteModelOptions {
@@ -78,6 +91,8 @@ export interface RouteModelOptions {
    * mapped onto one; its first attempt stays on the executor default.
    */
   replacement?: boolean;
+  /** The mission being dispatched: its operator pin, if any, places the role. */
+  missionId?: string;
 }
 
 /** Resolve a worker role to a model placement, or undefined for the executor default. */
@@ -308,6 +323,36 @@ export function realBackends(opts: RealBackendsOptions) {
       if (oldest !== undefined) producedBy.delete(oldest);
     }
   };
+  /** The operator pin a mission dispatches with right now (adopting a new choice). */
+  const pinKeyOf = (missionId: string | undefined): string | null => {
+    if (!missionId || !opts.currentOperatorPin) return null;
+    const pin = opts.currentOperatorPin(missionId);
+    return pin ? modelKey(pin) : null;
+  };
+  /**
+   * Place the attempt on `route` and arm the operator-switch check for it: the
+   * attempt is superseded when the mission's pin names a model other than the
+   * one this attempt runs on — unless the router already refused that pin for
+   * this role, or the pin was cleared (a running attempt is not restarted just
+   * to return to automatic routing).
+   */
+  const arm = (
+    req: WorkerRequest,
+    route: ModelRoute | undefined,
+    missionId: string | undefined,
+    unservable: string | null = null,
+  ): void => {
+    if (route) req.modelOverride = { provider: route.provider, id: route.id };
+    else delete req.modelOverride;
+    req.operatorPinned = route?.operatorPin === true;
+    if (!missionId || !opts.currentOperatorPin) return;
+    const running = route ? modelKey(route) : null;
+    const refused = route?.pinRefused ?? unservable;
+    req.modelSuperseded = () => {
+      const pin = pinKeyOf(missionId);
+      return pin !== null && pin !== running && pin !== refused;
+    };
+  };
   /**
    * Run a worker on `plan.initial` (or, unrouted, on the executor default).
    * While the attempt fails because its model is not served, record the model
@@ -316,6 +361,10 @@ export function realBackends(opts: RealBackendsOptions) {
    * outcome, or when no new model is offered (the last failure is then
    * returned, so the task fails as before). Every switch is announced as
    * activity and prefixed to the summary.
+   *
+   * An attempt that ended because the operator chose another model
+   * (`model_superseded`, only ever at an inference boundary) is re-dispatched
+   * on `plan.repick()` — the new choice — without marking anything unavailable.
    */
   const runWithModelTakeover = async (
     req: WorkerRequest,
@@ -323,20 +372,53 @@ export function realBackends(opts: RealBackendsOptions) {
     plan: {
       initial: ModelRoute | undefined;
       next: (tried: ModelRef[]) => Promise<ModelRoute | undefined>;
+      repick: (tried: ModelRef[]) => Promise<ModelRoute | undefined>;
       freshSessionId: () => string;
       context: { missionId?: string; taskId?: string };
       onSwitch?: (from: ModelRef, to: ModelRoute) => void;
+      /** Announce a route's own warning (e.g. a pin the role could not use). */
+      announceWarnings?: boolean;
     },
   ): Promise<{ run: Awaited<ReturnType<WorkerExecutor["run"]>>; route: ModelRoute | undefined; model?: ModelRef }> => {
+    const announce = (summary: string): void => {
+      try {
+        input.onActivity?.({ kind: "state", phase: "started", summary, meaningfulProgress: false });
+      } catch {
+        // Activity consumers are observers, never participants.
+      }
+    };
     let route = plan.initial;
-    if (route) req.modelOverride = { provider: route.provider, id: route.id };
+    if (plan.announceWarnings && route?.warning) announce(route.warning);
+    if (route?.pinNotice) announce(route.pinNotice);
+    arm(req, route, plan.context.missionId);
     let run = await runWorker(req, input);
     // The model the attempt ran on: the route; unrouted, the model the worker
     // names, else the session model (normally the executor's default).
     let model: ModelRef | undefined = route ?? ranOn(run) ?? opts.reviewFallbackModel;
     const tried: ModelRef[] = [];
     const switches: string[] = [];
-    while (model && MODEL_GONE_MARKERS.has(outcomeOf(run).error ?? "") && !input.signal.aborted) {
+    while (!input.signal.aborted) {
+      const error = outcomeOf(run).error ?? "";
+      if (error === MODEL_SUPERSEDED) {
+        const next = await plan.repick(tried);
+        const notice = `operator switched models — ${req.role} moves from ${model ? modelKey(model) : "the default model"} to ${next ? modelKey(next) : "automatic routing"} at this inference boundary`;
+        switches.push(notice);
+        announce(notice);
+        if (plan.announceWarnings && next?.warning) announce(next.warning);
+        if (next?.pinNotice) announce(next.pinNotice);
+        if (model && next) plan.onSwitch?.(model, next);
+        // Routing could not place the role on the new pin (the placement did
+        // not change): run where routing says, and do not supersede again for
+        // that same pin — otherwise this would spin.
+        const unchanged = (next ? modelKey(next) : null) === (route ? modelKey(route) : null);
+        route = next;
+        req.sessionId = plan.freshSessionId();
+        arm(req, route, plan.context.missionId, unchanged ? pinKeyOf(plan.context.missionId) : null);
+        run = await runWorker(req, input);
+        model = route ?? ranOn(run) ?? opts.reviewFallbackModel;
+        continue;
+      }
+      if (!model || !MODEL_GONE_MARKERS.has(error)) break;
       const failed: ModelRef = model;
       const reason = run.result.summary;
       if (!REQUEST_SPECIFIC_REFUSAL.test(reason)) opts.onModelUnavailable?.(failed, { ...plan.context, reason });
@@ -345,16 +427,12 @@ export function realBackends(opts: RealBackendsOptions) {
       if (!next || tried.some((known) => sameModel(known, next))) break;
       const notice = `model ${modelKey(failed)} is no longer served — switched ${req.role} to ${modelKey(next)}`;
       switches.push(notice);
-      try {
-        input.onActivity?.({ kind: "state", phase: "started", summary: notice, meaningfulProgress: false });
-      } catch {
-        // Activity consumers are observers, never participants.
-      }
+      announce(notice);
       plan.onSwitch?.(failed, next);
       route = next;
       model = next;
       req.sessionId = plan.freshSessionId();
-      req.modelOverride = { provider: next.provider, id: next.id };
+      arm(req, route, plan.context.missionId);
       run = await runWorker(req, input);
     }
     // A model that serves an attempt again is no longer considered gone.
@@ -366,10 +444,14 @@ export function realBackends(opts: RealBackendsOptions) {
   };
   /** Takeover plan for a routed worker role: the next model the router offers. */
   const routedPlan = async (role: string, context: { missionId?: string; taskId?: string }, prefix: string) => ({
-    initial: await opts.routeModel?.(role),
-    next: async (tried: ModelRef[]) => opts.routeModel?.(role, { exclude: tried, replacement: true }),
+    initial: await opts.routeModel?.(role, { missionId: context.missionId }),
+    next: async (tried: ModelRef[]) =>
+      opts.routeModel?.(role, { exclude: tried, replacement: true, missionId: context.missionId }),
+    repick: async (tried: ModelRef[]) =>
+      opts.routeModel?.(role, { ...(tried.length > 0 ? { exclude: tried } : {}), missionId: context.missionId }),
     freshSessionId: () => id(prefix),
     context,
+    announceWarnings: true,
   });
   return {
     agent: {
@@ -395,10 +477,11 @@ export function realBackends(opts: RealBackendsOptions) {
           context: input.contextRef,
           tools: ["ledger_read", "ledger_claim", "artifact_read", "repo_search", "symbol", "tests_for", "bash"],
           cwd: input.worktree ?? bound.cwd,
-          // Fresh-context implementation workers need headroom to explore the
-          // repo, implement, run verification, and commit. Configurable so an
-          // operator can tune per environment without recompiling.
+          // No duration cap: the broker owns liveness (activity-based) and any
+          // opt-in limit. This only carries an explicit operator override.
           timeoutMs: workerTimeoutMs(),
+          // A mission worker waits for inference capacity however long it takes.
+          unboundedInferenceWait: true,
           // Only the broker's word makes a directory an isolated worktree; the
           // fallback (no worktree) runs in the user's checkout.
           isolatedWorktree: input.isolatedWorktree === true && !!input.worktree,
@@ -429,6 +512,8 @@ export function realBackends(opts: RealBackendsOptions) {
         repoId?: string;
         objective: string;
         contextRef?: string;
+        missionId?: string;
+        taskId?: string;
         signal: AbortSignal;
         onActivity?: (event: WorkerActivity) => void;
       }): Promise<ExecutionOutcome> {
@@ -439,8 +524,14 @@ export function realBackends(opts: RealBackendsOptions) {
           context: input.contextRef,
           tools: ["ledger_read", "repo_search", "symbol", "tests_for"],
           cwd: bound.cwd,
+          unboundedInferenceWait: true,
         };
-        const { run, model } = await runWithModelTakeover(req, input, await routedPlan(req.role, {}, "WKS"));
+        // A scout follows the mission's operator pin like every other worker.
+        const { run, model } = await runWithModelTakeover(
+          req,
+          input,
+          await routedPlan(req.role, { missionId: input.missionId, taskId: input.taskId }, "WKS"),
+        );
         return withModel(outcomeOf(run), model);
       },
     },
@@ -460,12 +551,18 @@ export function realBackends(opts: RealBackendsOptions) {
         const outcome = await opts.verifier.run(cwd, profile, opts.artifacts, { signal: input.signal });
         const artifactRefs = outcome.evidence.flatMap((e) => e.artifacts).filter(Boolean);
         const artifactState = await artifactContentHashes(opts.artifacts, artifactRefs);
+        // A repo with no detectable checks produced no evidence; nothing FAILED.
+        // Reporting it as a failed task made the repair loop spawn "Fix the
+        // failing validation step" work no implementer can satisfy. The
+        // noTargets evidence still keeps the completion gate closed.
         return {
           executionId: "validation",
-          exitStatus: outcome.passed ? "succeeded" : "failed",
-          summary: outcome.passed
-            ? `validation passed (${outcome.stages.length} stages)`
-            : `validation failed at ${outcome.failedStage ?? "unknown"}`,
+          exitStatus: outcome.passed || outcome.noTargets ? "succeeded" : "failed",
+          summary: outcome.noTargets
+            ? "no verification targets detected — recorded as missing evidence, not a failed check"
+            : outcome.passed
+              ? `validation passed (${outcome.stages.length} stages)`
+              : `validation failed at ${outcome.failedStage ?? "unknown"}`,
           artifactRefs,
           artifactHashes: artifactState.hashes,
           usage: { stages: outcome.stages.length },
@@ -519,10 +616,11 @@ export function realBackends(opts: RealBackendsOptions) {
           tools: ["ledger_read", "artifact_read", "repo_search", "symbol"],
           cwd: input.worktree ?? bound.cwd,
           maxContextTokens: 64_000,
-          // Same generous wall-clock budget as implementation workers: a review
-          // must inspect the integrated change before writing findings, and the
-          // executor's default (5 min) aborted the reviewer mid-analysis.
+          // Same as implementation workers: no duration cap (the broker owns
+          // liveness), and inference waiting is unbounded. The executor's old
+          // 5-minute default aborted reviewers mid-analysis.
           timeoutMs: workerTimeoutMs(),
+          unboundedInferenceWait: true,
           sessionId: reviewerSessionId,
           resultTool: "review_result",
         };
@@ -534,12 +632,17 @@ export function realBackends(opts: RealBackendsOptions) {
         const producers = producedBy.get(input.missionId ?? "") ?? [];
         const fallback = opts.reviewFallbackModel;
         const pickReviewer = async (tried: ModelRef[]): Promise<ModelRoute | undefined> => {
-          const distinct = await opts.routeModel?.(req.role, { exclude: [...producers, ...tried] });
+          const distinct = await opts.routeModel?.(req.role, {
+            exclude: [...producers, ...tried],
+            missionId: input.missionId,
+          });
           if (distinct) return distinct;
           if (fallback && !tried.some((m) => sameModel(m, fallback)) && !opts.isModelUnavailable?.(fallback)) {
             return { ...fallback, warning: reducedIndependence(fallback, "no distinct reviewer model is available") };
           }
-          return producers.length > 0 ? opts.routeModel?.(req.role, { exclude: tried }) : undefined;
+          return producers.length > 0
+            ? opts.routeModel?.(req.role, { exclude: tried, missionId: input.missionId })
+            : undefined;
         };
         const reviewWarning = (route: ModelRoute): string | undefined =>
           route.warning ??
@@ -565,6 +668,7 @@ export function realBackends(opts: RealBackendsOptions) {
         const takeover = await runWithModelTakeover(req, input, {
           initial,
           next: pickReviewer,
+          repick: pickReviewer,
           freshSessionId: () => id("RVS"),
           context: { missionId: input.missionId, taskId: input.taskId },
           onSwitch: (_from, to) =>
