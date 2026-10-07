@@ -2,7 +2,7 @@ import { execFile, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import type { Dirent } from "node:fs";
 import { access, lstat, mkdir, readFile, readdir, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
-import { basename, join } from "node:path";
+import { basename, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { ExclusiveFileLock } from "../platform/eventstore/fileLock.ts";
 

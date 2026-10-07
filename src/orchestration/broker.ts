@@ -36,8 +36,8 @@ import { WAITING_FOR_INFERENCE_SUMMARY, sanitizeWorkerActivity } from "../worker
 import type { CheckpointProgressClaim } from "../workers/checkpointProgressTool.ts";
 import type { CheckpointManager, CheckpointSnapshot } from "./checkpoints.ts";
 import { EvidenceUnavailableError, buildCandidateEvidenceIdentity } from "./evidence.ts";
-import { isNestedPublicationAcceptable } from "./nestedPublicationGate.ts";
 import type { GateEvidencePublication, LateExecutionEvidence, MissionStore } from "./missionStore.ts";
+import { isNestedPublicationAcceptable } from "./nestedPublicationGate.ts";
 import type { DispatchAuthority } from "./ownership.ts";
 import { replacementRecoveryFingerprint, replacementTaskFingerprintSpec } from "./recovery.ts";
 import type { ExecutionBackend, RecoveredMerge, ReviewEvidence, ValidationEvidence } from "./types.ts";
@@ -2107,7 +2107,10 @@ export class ExecutionBroker {
    */
   private nestedBaselineFor(missionId: string, git: GitRepo): void {
     if (!this.nestedBaselines.has(missionId)) {
-      this.nestedBaselines.set(missionId, git.captureNestedRepoHeads().catch(() => new Map<string, string>()));
+      this.nestedBaselines.set(
+        missionId,
+        git.captureNestedRepoHeads().catch(() => new Map<string, string>()),
+      );
     }
   }
 
@@ -2658,7 +2661,6 @@ export class ExecutionBroker {
               } catch {
                 // provider without the nested repo API — no baseline, no records
               }
-
             }
             const repositoryBinding = input.repoId
               ? this.store
