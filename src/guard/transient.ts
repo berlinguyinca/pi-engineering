@@ -17,6 +17,7 @@
 
 import {
   errorTextStatus,
+  hasLinkCutWording,
   isFlattenedInferWeaveRefusal,
   isGatewayAdmissionRefusal,
   isGatewayLinkCut,
@@ -181,11 +182,23 @@ export function classifyError(error: unknown): ErrorClass {
     };
   }
 
-  // Unified classifier next (single source of truth for retryability).
-  // It carries no model context here (host-agnostic layer): the class and
-  // retryability are model-independent for every class the mapping handles.
-  const unified = mapUnifiedToTransient(classifyInferenceFailure({ error }), status, retryAfterMs);
-  if (unified) return unified;
+  // A permanent status — on the error object or leading the text ("404
+  // routing_snapshot_expired") — excludes the whole retryable interpretation:
+  // waiting never fixes it. The unified classifier's string/status fallbacks
+  // do not model that guard (a 404 wins there as model_not_found), so such
+  // errors go straight to the legacy table, whose guards fail closed.
+  const textStatus = errorTextStatus(raw);
+  const permanentStatus = [status, textStatus].some((s) => s != null && PERMANENT_ADMISSION_STATUSES.includes(s));
+  // Link-cut wording is owned by the gateway layer's guarded rule: a quota- or
+  // billing-suffixed link cut is terminal, but the unified table's generic
+  // "response is incomplete" stream pattern would re-read it as retryable.
+  if (!permanentStatus && !hasLinkCutWording(raw)) {
+    // Unified classifier (single source of truth for retryability). It
+    // carries no model context here (host-agnostic layer): the class and
+    // retryability are model-independent for every class the mapping handles.
+    const unified = mapUnifiedToTransient(classifyInferenceFailure({ error }), status, retryAfterMs);
+    if (unified) return unified;
+  }
 
   // 429 / rate limiting / concurrency admission (the user's "caller_concurrency").
   // Still ours: a rate limit with no gateway envelope advertises no wait, so
@@ -248,9 +261,8 @@ export function classifyError(error: unknown): ErrorClass {
   // recognises, so both layers agree on what is retryable.
   //
   // A permanent status — on the error object or leading the text ("404
-  // routing_snapshot_expired") — excludes the whole rule: waiting never fixes it.
-  const textStatus = errorTextStatus(raw);
-  const permanentStatus = [status, textStatus].some((s) => s != null && PERMANENT_ADMISSION_STATUSES.includes(s));
+  // routing_snapshot_expired") — excludes the whole rule: waiting never fixes it
+  // (computed above, before the unified-classifier short-circuit).
   if (
     !permanentStatus &&
     ((!carriesEnvelope &&

@@ -115,9 +115,19 @@ export const LINK_CUT_WAIT_MS = 1_000;
  * cut here. A well-formed envelope is decided by the admission contract, and a
  * malformed one is terminal — both exactly as without the link-cut rule.
  */
+/**
+ * Raw link-cut wording, BEFORE the fail-closed guards of isGatewayLinkCut.
+ * Callers that must not re-interpret this wording with a looser table (a
+ * quota-suffixed link cut is terminal, not a stream cut) check this.
+ */
+export function hasLinkCutWording(text: string | undefined): boolean {
+  if (!text) return false;
+  return LINK_CUT_SENTENCE.test(text) || (LINK_CUT_REASON.test(text) && /inferweave/i.test(text));
+}
+
 export function isGatewayLinkCut(text: string | undefined): boolean {
   if (!text) return false;
-  const matches = LINK_CUT_SENTENCE.test(text) || (LINK_CUT_REASON.test(text) && /inferweave/i.test(text));
+  const matches = hasLinkCutWording(text);
   if (!matches) return false;
   if (text.includes("inferweave_backpressure")) return false;
   if (NON_RETRYABLE_PATTERNS.test(text)) return false;
