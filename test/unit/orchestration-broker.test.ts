@@ -3736,3 +3736,106 @@ it("turns a corrupt durable cleanup journal into a structured finding after brok
     await fx.cleanup();
   }
 });
+
+describe("backend failure visibility", () => {
+  it("records outcome error and summary on failed integration executions", async () => {
+    const store = MissionStore.open(JsonlEventStore.inMemory());
+    const m = store.createMission({
+      title: "x",
+      goal: "x",
+      user_request: "x",
+      repository: ".",
+      base_ref: "base-sha",
+      risk_profile: "medium",
+      workflow_class: "engineering_review",
+    });
+    const t = store.createTask({
+      mission_id: m.mission_id,
+      kind: "integration",
+      role: "integrator",
+      objective: "merge",
+    });
+    store.transitionTask(t.task_id, "READY");
+    const broker = new ExecutionBroker({
+      store,
+      git: {} as never,
+      backends: {
+        integration: {
+          runIntegration: async () => ({
+            executionId: "i-fail",
+            exitStatus: "failed",
+            summary: "integrated nothing into main; checks: fail",
+            error: "verification failed at stage: test",
+            artifactRefs: [],
+            usage: {},
+          }),
+        },
+      },
+    });
+    const outcome = await (
+      await broker.execute({
+        taskId: t.task_id,
+        missionId: m.mission_id,
+        kind: "integration",
+        role: "integrator",
+        objective: "merge",
+      })
+    ).result();
+    assert.equal(outcome.exitStatus, "failed");
+    const ex = store.listExecutions(m.mission_id).find((e) => e.task_id === t.task_id);
+    assert.ok(ex, "execution must be recorded");
+    assert.equal(ex?.status, "FAILED");
+    // The failure must be diagnosable from the store: error + summary propagated.
+    assert.equal(ex?.error, "verification failed at stage: test");
+    assert.equal(ex?.summary, "integrated nothing into main; checks: fail");
+  });
+
+  it("leaves error unset on successful executions", async () => {
+    const store = MissionStore.open(JsonlEventStore.inMemory());
+    const m = store.createMission({
+      title: "x",
+      goal: "x",
+      user_request: "x",
+      repository: ".",
+      base_ref: "base-sha",
+      risk_profile: "medium",
+      workflow_class: "engineering_review",
+    });
+    const t = store.createTask({
+      mission_id: m.mission_id,
+      kind: "integration",
+      role: "integrator",
+      objective: "merge",
+    });
+    store.transitionTask(t.task_id, "READY");
+    const broker = new ExecutionBroker({
+      store,
+      git: {} as never,
+      backends: {
+        integration: {
+          runIntegration: async () => ({
+            executionId: "i-ok",
+            exitStatus: "succeeded",
+            summary: "integrated worker/a into main; checks: pass",
+            artifactRefs: [],
+            usage: {},
+          }),
+        },
+      },
+    });
+    await (
+      await broker.execute({
+        taskId: t.task_id,
+        missionId: m.mission_id,
+        kind: "integration",
+        role: "integrator",
+        objective: "merge",
+      })
+    ).result();
+    const ex = store.listExecutions(m.mission_id).find((e) => e.task_id === t.task_id);
+    assert.ok(ex, "execution must be recorded");
+    assert.equal(ex?.status, "SUCCEEDED");
+    assert.equal(ex?.error, undefined);
+    assert.equal(ex?.summary, "integrated worker/a into main; checks: pass");
+  });
+});

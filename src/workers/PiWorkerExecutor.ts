@@ -81,7 +81,7 @@ import {
   activityFromSessionEvent,
   emitWorkerActivity,
 } from "./activity.ts";
-import { checkpointProgressTool } from "./checkpointProgressTool.ts";
+import { CHECKPOINT_PROGRESS_TOOL_NAME, createCheckpointProgressTool } from "./checkpointProgressTool.ts";
 import { registerLocalProviders } from "./localProviders.ts";
 import { WORKER_KICKOFF, buildSystemPrompt, wantsCommitDiscipline } from "./prompts.ts";
 import { guardRuntimeRequestBody } from "./requestBodyGuard.ts";
@@ -357,7 +357,7 @@ ${TOOL_TRANSITION_RULE}`;
     const terminating = req.resultTool === "review_result" ? reviewResultTool : workerResultTool;
     const customTools = [
       ...this.customTools,
-      ...(req.deliverables?.length ? [checkpointProgressTool] : []),
+      ...(req.deliverables?.length ? [createCheckpointProgressTool(req.deliverables)] : []),
       terminating,
     ];
     const tools = [...new Set([...req.tools, ...customTools.map((t) => t.name)])];
@@ -1003,10 +1003,10 @@ ${recovery.recoveryPrompt}`;
       if (streamed) emitWorkerActivity(req, streamed);
       const activity = activityFromSessionEvent(event);
       const activityToolName = "toolName" in event ? event.toolName : undefined;
-      if (activity && activityToolName !== terminatingName && activityToolName !== checkpointProgressTool.name) {
+      if (activity && activityToolName !== terminatingName && activityToolName !== CHECKPOINT_PROGRESS_TOOL_NAME) {
         emitWorkerActivity(req, activity);
       }
-      if (event.type === "tool_execution_end" && event.toolName === checkpointProgressTool.name && !event.isError) {
+      if (event.type === "tool_execution_end" && event.toolName === CHECKPOINT_PROGRESS_TOOL_NAME && !event.isError) {
         const details = event.result?.details as { claims?: unknown } | undefined;
         emitWorkerActivity(req, {
           kind: "checkpoint",
@@ -1397,7 +1397,7 @@ export function buildCompactedWorkerPrompt(req: WorkerRequest, recoveryPrompt: s
   }
   if (req.deliverables?.length) {
     parts.push(
-      `- Declared checkpoint deliverables: ${req.deliverables.join(", ")}. After a coherent commit, call checkpoint_progress with the exact git rev-parse HEAD and committed evidence paths.`,
+      `- Declared checkpoint deliverables: ${req.deliverables.map((d) => `"${d}"`).join(", ")}. After a coherent commit, call checkpoint_progress claiming the deliverable with the EXACT declared string (no paraphrasing) plus the exact git rev-parse HEAD and committed evidence paths.`,
     );
   }
   parts.push(`- Your final action MUST be calling the worker_result tool.`);
@@ -1408,7 +1408,7 @@ export function buildCompactedWorkerPrompt(req: WorkerRequest, recoveryPrompt: s
 
 export function workerContext(req: WorkerRequest): string | undefined {
   const checkpoint = req.deliverables?.length
-    ? `Declared checkpoint deliverables: ${req.deliverables.join(", ")}. After each coherent commit, run git rev-parse HEAD and call checkpoint_progress with the completed deliverable, that exact candidate SHA, and committed evidence paths.`
+    ? `Declared checkpoint deliverables: ${req.deliverables.map((d) => `"${d}"`).join(", ")}. After each coherent commit, run git rev-parse HEAD and call checkpoint_progress with the completed deliverable (using its EXACT declared string, no paraphrasing), that exact candidate SHA, and committed evidence paths.`
     : undefined;
   if (!req.recovery) return [req.context, checkpoint].filter(Boolean).join("\n\n") || undefined;
   const durable = durableRecoveryContext(req)!;
