@@ -23,6 +23,7 @@ import {
   isTransportDrop,
 } from "../gateway/signals.ts";
 import { PERMANENT_ADMISSION_STATUSES } from "../inference/admissionContract.ts";
+import { type ClassifiedInferenceFailure, classifyInferenceFailure } from "../inference/failureClassifier.ts";
 
 export type TransientErrorCategory =
   | "rate_limit" // 429 — too many requests / caller_concurrency admission
@@ -62,10 +63,96 @@ export class TransientError extends Error {
 }
 
 /**
+ * Map the unified classifier's canonical result onto this layer's
+ * execution categories (spec: single source of truth for what is retryable —
+ * the pump layer and the worker/mission layer must agree).
+ *
+ * The execution category is a SCHEDULER signal, not just a label:
+ * rate_limit → RATE_LIMITED, compaction → CONTEXT_RECOVERABLE,
+ * {permanent, model_unavailable, server_error} → the normal failure path,
+ * {server_unavailable, network, timeout} → the transient-infrastructure
+ * window (see infraCategoryFromWorkerMarker in orchestration/scheduler.ts).
+ * The mapping therefore preserves those buckets: a bare 5xx stays
+ * "server_error" (a deterministic upstream failure is not outage evidence),
+ * 503 stays "server_unavailable", and a truncated stream stays "network"
+ * (a connection-level cut, not a server verdict).
+ * Returns undefined for "unknown" so the legacy keyword table below stays
+ * the fallback for host-specific phrasing the unified table does not model.
+ */
+function mapUnifiedToTransient(
+  f: ClassifiedInferenceFailure,
+  status: number | null,
+  retryAfterMs: number | undefined,
+): ErrorClass | undefined {
+  const reason = `unified ${f.class}${f.reason ? ` — ${f.reason}` : ""}`;
+  switch (f.class) {
+    case "incomplete_stream":
+      // A connection-level truncation, not a server verdict: "network", so
+      // the scheduler treats it as a transient outage (a bare 5xx
+      // "server_error" is not).
+      return { category: "network", retryable: true, retryAfterMs, reason };
+    case "rate_limited":
+      return { category: "rate_limit", retryable: true, retryAfterMs, reason };
+    case "queue_saturated":
+    case "capacity_unavailable":
+    case "model_activating":
+    case "model_unavailable":
+    case "no_workers":
+    case "worker_evicted":
+    case "worker_restarting":
+    case "routing_stale":
+      return { category: "server_unavailable", retryable: true, retryAfterMs, reason };
+    case "gateway_unavailable":
+      // 503 is the infra "no worker" signal; a bare 5xx is a deterministic
+      // upstream failure (fail path, not the outage window); 408/504 and the
+      // rest are gateway outages that clear on retry.
+      return {
+        category:
+          status === 503
+            ? "server_unavailable"
+            : status != null && status >= 500 && status < 600
+              ? "server_error"
+              : "server_unavailable",
+        retryable: true,
+        retryAfterMs,
+        reason,
+      };
+    case "network_interruption":
+      return { category: "network", retryable: true, retryAfterMs, reason };
+    case "model_not_found":
+      // One retry covers a catalog that has not resynced yet; a configuration
+      // typo never clears (not an infrastructure category).
+      return { category: "model_unavailable", retryable: true, retryAfterMs, maxRetries: 1, reason };
+    case "context_overflow":
+      return { category: "compaction", retryable: true, retryAfterMs, reason };
+    case "request_too_large":
+    case "authentication":
+    case "authorization":
+    case "billing":
+    case "invalid_request":
+      return { category: "permanent", retryable: false, retryAfterMs, reason };
+    case "quota":
+      // Account-level exhaustion: the pump layer already tried the
+      // capability fallback; retrying the same account inside a transient
+      // budget only hides the cause.
+      return { category: "permanent", retryable: false, retryAfterMs, reason };
+    case "unknown":
+      return undefined;
+  }
+}
+
+/**
  * Classify an arbitrary thrown value into a transient-error class.
  * Message/status-based and host-agnostic: it does not depend on a particular
  * provider SDK, so the same classifier works across the model runtime, HTTP
  * clients, and provider error objects.
+ *
+ * The unified inference classifier (InferenceFailureClass) is consulted
+ * FIRST: both layers must agree on what is retryable, and the InferWeave
+ * protocol table (body reason, x-inferweave-* headers) is authoritative. The
+ * legacy keyword table below remains the fallback for host-specific
+ * phrasing the unified table does not model (timeouts, compaction wording,
+ * bare network codes as text).
  */
 export function classifyError(error: unknown): ErrorClass {
   const raw = error instanceof Error ? error.message : String(error ?? "");
@@ -83,7 +170,9 @@ export function classifyError(error: unknown): ErrorClass {
   // header and this gateway puts `retry_after_ms` in the BODY — walks straight
   // back into the queue that just refused us, and gives up after maxAttempts.
   // Handing it over as non-retryable lets the worker loop honour the exact wait,
-  // process-wide and without a ceiling. See src/gateway/signals.ts.
+  // process-wide and without a ceiling. See src/gateway/signals.ts. This
+  // precedes the unified classifier: a 429 refusal is rate_limited there, but
+  // the admission layer owns its exact wait.
   if (isGatewayAdmissionRefusal(raw)) {
     return {
       category: "permanent",
@@ -91,6 +180,12 @@ export function classifyError(error: unknown): ErrorClass {
       reason: "gateway admission refusal — handled by the admission controller",
     };
   }
+
+  // Unified classifier next (single source of truth for retryability).
+  // It carries no model context here (host-agnostic layer): the class and
+  // retryability are model-independent for every class the mapping handles.
+  const unified = mapUnifiedToTransient(classifyInferenceFailure({ error }), status, retryAfterMs);
+  if (unified) return unified;
 
   // 429 / rate limiting / concurrency admission (the user's "caller_concurrency").
   // Still ours: a rate limit with no gateway envelope advertises no wait, so

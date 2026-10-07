@@ -474,7 +474,18 @@ export function classifyInferenceFailure(input: ClassifyInferenceFailureInput): 
     }
     if (status === 413) return finish(input, "request_too_large", { source: "http_status", reason: "HTTP 413" });
     if (status === 422) return finish(input, "invalid_request", { source: "http_status", reason: "HTTP 422" });
-    if (status === 400) return finish(input, "invalid_request", { source: "http_status", reason: "HTTP 400" });
+    if (status === 400) {
+      // Unknown-model wording on a 400 (the multimodal route reports an
+      // unlisted model as "invalid model name"): a catalog resync can fix it
+      // — model_not_found, not a deterministic bad request.
+      if (/\binvalid model name\b|\bmodel[_ -]?not[_ -]?found\b|\bunknown model\b/i.test(text)) {
+        return finish(input, "model_not_found", {
+          source: "http_status",
+          reason: `HTTP 400 (unknown-model wording)`,
+        });
+      }
+      return finish(input, "invalid_request", { source: "http_status", reason: "HTTP 400" });
+    }
     if (status === 429) {
       const reason = bodyReason ?? md?.routingReason;
       if (reason && INFERWEAVE_REASON_CLASS[reason] === "queue_saturated") {
