@@ -212,7 +212,7 @@ describe("WorkspaceManifestResolver path policy", () => {
         `Create the project at ${join(unauthorizedParent, "missing", "repo")}`,
         launchCwd,
       ),
-      /does not exist/,
+      (error: unknown) => error instanceof WorkspaceScopeError,
     );
   });
 
@@ -271,7 +271,7 @@ describe("WorkspaceManifestResolver path policy", () => {
     await exec("git", ["-C", root, "config", "user.name", "Test"]);
     await exec("git", ["-C", root, "commit", "--allow-empty", "-q", "-m", "empty baseline"]);
 
-    const resolved = await new WorkspaceManifestResolver().resolve(`Review ${root}`, tmpdir());
+    const resolved = await new WorkspaceManifestResolver().resolve(`target: ${root}\nReview it.`, tmpdir());
     const registry = new RepositoryRegistry();
     await registry.register(createWorkspaceManifest(resolved, "MSN-empty"));
     const probes = await registry.probe(resolved.primaryRepoId);
@@ -514,15 +514,19 @@ describe("WorkspaceManifestResolver path policy", () => {
       resolved.repositories.map((r) => r.canonicalRoot),
       [repo.root],
     );
-    assert.ok(!resolved.authorizedRoots.some((root) => root.canonicalPath === other.root));
+    assert.ok(!resolved.authorizedRoots.some((root) => root.canonicalPath === other.root && root.access === "write"));
   });
 
-  it("still binds a path whose clause merely contains a negative statement", async () => {
+  it("refuses a target whose own sentence carries a restriction word, pointing at directives (final review C)", async () => {
     const launchCwd = await mkdtemp(join(tmpdir(), "pi-eng-meta-"));
     const repo = await makeFixtureRepo();
     cleanup.push(() => rm(launchCwd, { recursive: true, force: true }), repo.cleanup);
+    await assert.rejects(
+      new WorkspaceManifestResolver().resolve(`The build does not pass in ${repo.root}; fix it`, launchCwd),
+      (error: unknown) => error instanceof WorkspaceScopeError && /writable: \/path/.test(error.message),
+    );
     const resolved = await new WorkspaceManifestResolver().resolve(
-      `The build does not pass in ${repo.root}; fix it`,
+      `writable: ${repo.root}\nThe build does not pass; fix it`,
       launchCwd,
     );
     assert.equal(resolved.repositories[0]?.canonicalRoot, repo.root);
@@ -602,11 +606,19 @@ describe("WorkspaceManifestResolver per-clause path intent (PR #106 review)", ()
     (target: string) => `Never leave ${target} broken: fix the failing build`,
     (target: string) => `Don’t just read ${target}, fix the bug there`,
   ]) {
-    it(`reproduction: a non-directive negation still targets the path (${template("X")})`, async () => {
+    it(`a restriction word in the target's sentence refuses with the directive hint (${template("X")})`, async () => {
+      // Final review C: any restriction word makes the sentence's paths
+      // read-only; the launch directory is never substituted.
       const [launch, target] = await repos(2);
-      const resolved = await new WorkspaceManifestResolver().resolve(template(target!), launch!);
+      await assert.rejects(
+        new WorkspaceManifestResolver().resolve(template(target!), launch!),
+        (error: unknown) => isScopeError(error) && /writable: \/path/.test(String(error)),
+      );
+      const resolved = await new WorkspaceManifestResolver().resolve(
+        `writable: ${target}\n${template("the repository")}`,
+        launch!,
+      );
       assert.deepEqual(writable(resolved), [target]);
-      assert.equal(access(resolved, launch!), "none");
     });
   }
 
@@ -667,12 +679,14 @@ describe("WorkspaceManifestResolver per-clause path intent (PR #106 review)", ()
 
   it("does not let a read-only remark after a comma promote the path to writable", async () => {
     const [launch, ref, target] = await repos(3);
-    const resolved = await new WorkspaceManifestResolver().resolve(
-      `Use ${ref}, which is read-only, and implement the change in ${target}`,
-      launch!,
+    // The remark has no path of its own, so every path in the sentence stays read-only.
+    await assert.rejects(
+      new WorkspaceManifestResolver().resolve(
+        `Use ${ref}, which is read-only, and implement the change in ${target}`,
+        launch!,
+      ),
+      isScopeError,
     );
-    assert.deepEqual(writable(resolved), [target]);
-    assert.equal(access(resolved, ref!), "read");
   });
 
   it("separates 'do not modify X' from a write target joined by 'but'", async () => {
@@ -692,7 +706,7 @@ describe("WorkspaceManifestResolver per-clause path intent (PR #106 review)", ()
       launch!,
     );
     assert.deepEqual(writable(resolved), [target]);
-    assert.equal(access(resolved, ref!), "none");
+    assert.equal(access(resolved, ref!), "read");
   });
 
   it("classifies quoted paths per clause", async () => {
@@ -801,13 +815,24 @@ describe("WorkspaceManifestResolver re-review (PR #106)", () => {
     }
   });
 
-  it("treats a file under /tmp used as input as a read root, not a refusal", async () => {
-    const [launch] = await repos(1);
+  it("an input file outside any repository keeps the launch repository as the target; another repository does not", async () => {
+    const [launch, other] = await repos(2);
     const dir = await mkdtemp(join(tmpdir(), "pi-eng-crash-"));
     cleanup.push(() => rm(dir, { recursive: true, force: true }));
     const log = join(dir, "crash.log");
     await writeFile(log, "boom\n");
-    const resolved = await new WorkspaceManifestResolver().resolve(`Analyze ${log} and fix the bug`, launch!);
+    const input = await new WorkspaceManifestResolver().resolve(`Analyze ${log} and fix the bug`, launch!);
+    assert.deepEqual(writable(input), [launch]);
+    assert.equal(access(input, log), "read");
+    // A different repository named only as a reference rules the launch default out.
+    await assert.rejects(
+      new WorkspaceManifestResolver().resolve(`Use ${other} for reference and fix the bug`, launch!),
+      isScopeError,
+    );
+    const resolved = await new WorkspaceManifestResolver().resolve(
+      `writable: ${launch}\nread-only: ${log}\nAnalyze the log and fix the bug`,
+      launch!,
+    );
     assert.deepEqual(writable(resolved), [launch]);
     assert.equal(access(resolved, log), "read");
   });
