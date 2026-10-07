@@ -342,7 +342,7 @@ export class ResilientAttemptFlow {
       }
     }
 
-    const step = decideRecoveryStep({
+    let step = decideRecoveryStep({
       failure,
       model,
       attempt: observed.attempt,
@@ -352,7 +352,36 @@ export class ResilientAttemptFlow {
       config: this.config,
       streamPolicy: this.policy,
     });
+    // Breaker gating (spec §13): a model whose circuit is OPEN before its
+    // cooldown is not retried on the same model — repeated failures stop
+    // reselecting the bad model. Prefer the capability fallback; without one,
+    // wait for capacity until the cooldown's HALF_OPEN probe re-admits it.
+    // allowRequest() doubles as the re-admission: once the cooldown has
+    // elapsed it arms the single HALF_OPEN probe for this retry (and the
+    // probe re-opens the circuit if it fails), so the loop stays live. Only
+    // model-scoped failures open breakers, so this never touches a
+    // gateway/queue wait (spec §10).
+    if (failure.modelScoped && step.kind !== "fallback" && !(this.breakerFor(model)?.allowRequest() ?? true)) {
+      if (this.fallbackEnabled() && !this.fallbackExhausted) {
+        step = { kind: "fallback", note: `${failure.class}: circuit OPEN — capability fallback` };
+      } else {
+        step = {
+          kind: "wait_capacity",
+          delayMs: this.policy.ladderDelayMs(this.attemptOnModel),
+          note: `${failure.class}: circuit OPEN — waiting for capacity`,
+        };
+      }
+    }
     return this.runStep(step, failure, base);
+  }
+
+  /**
+   * Consume the HALF_OPEN single-probe slot at request start (spec §13):
+   * idempotent for CLOSED, single-use while HALF_OPEN, so a tripped model
+   * gets exactly one re-admission probe after its cooldown.
+   */
+  beginProbe(): void {
+    this.breakerFor(this.model)?.beginProbe();
   }
 
   /** A served attempt: clear the penalty, close the breaker, end any wait. */
@@ -570,6 +599,10 @@ export class ResilientAttemptFlow {
       for (const candidate of pool) {
         if (excluded.has(modelKey(candidate))) continue;
         if (this.health.isPenalized(candidate)) continue;
+        // Breaker gating (spec §13): a tripped model is not reselected. The
+        // check is allowRequest — OPEN before cooldown is refused, and the
+        // HALF_OPEN single probe is consumed here (one probe at a time).
+        if (!(this.breakerFor(candidate)?.allowRequest() ?? true)) continue;
         const record = registry.get(candidate);
         if (record && !envelopeSatisfied(record, envelope)) continue;
         if (this.opts.resolveModel && !this.opts.resolveModel(candidate)) continue;
@@ -582,6 +615,8 @@ export class ResilientAttemptFlow {
       if (excluded.has(modelKey(ref))) continue;
       if (!record.enabled || !record.healthy || !record.available) continue;
       if (this.health.isPenalized(ref)) continue;
+      // Breaker gating (spec §13) — same rule as the router path above.
+      if (!(this.breakerFor(ref)?.allowRequest() ?? true)) continue;
       if (!envelopeSatisfied(record, envelope)) continue;
       if (this.opts.resolveModel && !this.opts.resolveModel(ref)) continue;
       return ref;
@@ -731,6 +766,7 @@ export function createResilientStreamSimple<M, C, O>(
           const ref = flow.model;
           const resolved = inst.resolveModel?.(ref);
           sentModel = resolved ?? sentModel;
+          flow.beginProbe();
           const capture = captureGatewayAttemptResponse(
             (options ?? {}) as ProviderResponseOptions<ProviderResponseLike, unknown>,
           );

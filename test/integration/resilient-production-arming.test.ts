@@ -24,13 +24,19 @@ import { describe, it } from "node:test";
 import type { DiscoveryContext, ModelSource } from "../../src/capability/discovery.ts";
 import { normalizeModelRecord } from "../../src/capability/modelRecord.ts";
 import { ModelCapabilityRegistry } from "../../src/capability/registry.ts";
+import { RoleRouter } from "../../src/capability/router.ts";
+import { CircuitBreakerRegistry } from "../../src/inference/circuitBreaker.ts";
 import { MissionCapacityScheduler } from "../../src/inference/missionCapacityScheduler.ts";
+import { ModelHealthRegistry } from "../../src/inference/modelHealth.ts";
 import { resilientServices } from "../../src/inference/resilientInstall.ts";
 import {
+  ResilientAttemptFlow,
   type ResilientStreamInstallOptions,
   createResilientStreamSimple,
   installResilientRuntime,
 } from "../../src/inference/resilientStream.ts";
+import { InferenceTelemetry, type InferenceTelemetryEvent } from "../../src/inference/telemetry.ts";
+import { DEFAULT_POLICY } from "../../src/lifecycle/policy.ts";
 import { type ModelRef, modelKey } from "../../src/lifecycle/types.ts";
 import type { ModelRecord } from "../../src/lifecycle/types.ts";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
@@ -200,8 +206,7 @@ describe("re-arm of an already-wrapped runtime (spec §23 production arming)", (
       // Re-arm with a different errorMessage marker + status sink.
       holder.current = {
         ...holder.current,
-        errorMessage: (_model, error) =>
-          ({ error: `rearmed:${(error as Error).message}` }) as never,
+        errorMessage: (_model, error) => ({ error: `rearmed:${(error as Error).message}` }) as never,
         status: () => {},
       };
       const out2 = stream({ provider: "p", id: "m" } as never, {} as never, {} as never) as AsyncIterable<unknown>;
@@ -215,7 +220,110 @@ describe("re-arm of an already-wrapped runtime (spec §23 production arming)", (
   });
 });
 
-// ─── 2. MissionCapacityScheduler (the production scheduler) ─────────────────
+// ─── 2. Circuit-breaker gating of fallback selection ────────────────────
+
+describe("circuit-breaker gating of fallback selection (spec §13, FINDING-e63OXY)", () => {
+  it("an OPEN breaker blocks same-model retry, excludes the model from fallback, and stays live", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "pi-eng-breaker-"));
+    const provider = "breaktest";
+    const a: ModelRef = { provider, id: "model-a" };
+    const b: ModelRef = { provider, id: "model-b" };
+    const c: ModelRef = { provider, id: "model-c" };
+    const registry = await makeRegistry(cwd, [rec(a), rec(b), rec(c)]);
+    const router = new RoleRouter({ registry, policy: structuredClone(DEFAULT_POLICY) });
+    let t = 1_000_000;
+    const health = new ModelHealthRegistry({ now: () => t });
+    const breakers = new CircuitBreakerRegistry({
+      now: () => t,
+      failureThreshold: 3,
+      windowMs: 60_000,
+      cooldownMs: 60_000,
+    });
+    const telemetry = new InferenceTelemetry();
+    const events: InferenceTelemetryEvent[] = [];
+    telemetry.on((e) => events.push(e));
+    const flow = new ResilientAttemptFlow(
+      {
+        role: "worker",
+        refOf: (m) => m as ModelRef,
+        now: () => t,
+        env: {},
+        health,
+        breakers,
+        registry,
+        router,
+        telemetry,
+      },
+      a,
+    );
+    try {
+      // model_activating (InferWeave reason) is model-scoped AND has a
+      // same-model retry ladder (wait for activation), so the breaker gate
+      // is what diverts the flow once the circuit opens — not the ladder.
+      const fail = (attempt: number) =>
+        flow.decide({
+          attempt,
+          text: "model activating",
+          headers: { "x-inferweave-reason": "model_activating" },
+          streamState: { finished: false, outputCommitted: false },
+        });
+
+      // Three model-scoped failures on A: the first two wait on A, the
+      // third opens the circuit — and the gate must NOT wait on A a fourth
+      // time.
+      await fail(1);
+      assert.equal(modelKey(flow.model), modelKey(a), "attempt 1: still on A");
+      await fail(2);
+      assert.equal(modelKey(flow.model), modelKey(a), "attempt 2: still on A");
+      await fail(3);
+      assert.equal(breakers.forModel(a.provider, a.id)!.getState(), "OPEN", "3rd failure opens the circuit");
+      assert.notEqual(modelKey(flow.model), modelKey(a), "OPEN breaker diverts from the same model");
+      assert.ok(
+        events.some((e) => e.name === "inference.fallback.selected"),
+        "the gate routes to the capability fallback",
+      );
+      assert.equal(modelKey(flow.model), modelKey(b), "fallback lands on B");
+      // The tripped model is not reselected by any fallback decision.
+      for (const e of events.filter((x) => x.name === "inference.fallback.selected")) {
+        const to = (e.data as { fallback_model?: string }).fallback_model ?? "";
+        assert.ok(!to.includes("model-a"), `fallback never reselects the tripped model (got ${to})`);
+      }
+
+      // Trip B (as another flow would), then C: with every model
+      // OPEN/excluded, the fallback has no candidate → the flow waits for
+      // capacity instead of selecting a dead model.
+      const bBreaker = breakers.forModel(b.provider, b.id)!;
+      bBreaker.recordFailure();
+      bBreaker.recordFailure();
+      bBreaker.recordFailure();
+      await fail(4);
+      assert.equal(bBreaker.getState(), "OPEN");
+      assert.equal(modelKey(flow.model), modelKey(c), "fallback lands on C (A and B are OPEN)");
+      const cBreaker = breakers.forModel(c.provider, c.id)!;
+      cBreaker.recordFailure();
+      cBreaker.recordFailure();
+      cBreaker.recordFailure();
+      await fail(5);
+      assert.equal(modelKey(flow.model), modelKey(c), "no candidate: stays put (capacity wait)");
+      assert.equal(cBreaker.getState(), "OPEN");
+
+      // Liveness: once C's cooldown elapses, the gate re-admits a SINGLE
+      // HALF_OPEN probe on the same model instead of waiting forever.
+      t += 61_000;
+      await fail(6);
+      assert.equal(cBreaker.getState(), "HALF_OPEN", "cooldown elapsed → single probe armed");
+      assert.equal(modelKey(flow.model), modelKey(c), "the probe runs on C");
+
+      // A served probe closes the circuit.
+      flow.served(c);
+      assert.equal(cBreaker.getState(), "CLOSED");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+// ─── 3. MissionCapacityScheduler (the production scheduler) ─────────────────
 
 describe("MissionCapacityScheduler (production WAITING_FOR_INFERENCE_CAPACITY)", () => {
   it("capacity query: penalized models and OPEN breakers are excluded", async () => {
@@ -280,7 +388,7 @@ describe("MissionCapacityScheduler (production WAITING_FOR_INFERENCE_CAPACITY)",
   });
 });
 
-// ─── 3. Durable WAITING_FOR_CAPACITY mission state ──────────────────────────
+// ─── 4. Durable WAITING_FOR_CAPACITY mission state ──────────────────────────
 
 function createMission(store: MissionStore, missionId: string, repository = "/tmp/repo") {
   return store.createMission({
