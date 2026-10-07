@@ -200,7 +200,8 @@ describe("re-arm of an already-wrapped runtime (spec §23 production arming)", (
       // Re-arm with a different errorMessage marker + status sink.
       holder.current = {
         ...holder.current,
-        errorMessage: (_model, error) => `rearmed:${(error as Error).message}`,
+        errorMessage: (_model, error) =>
+          ({ error: `rearmed:${(error as Error).message}` }) as never,
         status: () => {},
       };
       const out2 = stream({ provider: "p", id: "m" } as never, {} as never, {} as never) as AsyncIterable<unknown>;
@@ -226,7 +227,7 @@ describe("MissionCapacityScheduler (production WAITING_FOR_INFERENCE_CAPACITY)",
     const registry = await makeRegistry(cwd, [rec(a), rec(b), rec(c)]);
     const scheduler = new MissionCapacityScheduler({ registry: () => registry });
     const services = resilientServices();
-    let breaker: ReturnType<typeof services.breakers.forModel>;
+    let breaker!: ReturnType<typeof services.breakers.forModel>;
     try {
       assert.equal(scheduler.isCapacityAvailable(), true, "all healthy → capacity");
 
