@@ -211,3 +211,28 @@ processes acquire this channel after restarting with the updated extension.
 
 The protocol and trust boundary are defined in
 [`docs/specs/session-control.md`](specs/session-control.md).
+
+## Closing out stale missions offline
+
+A mission whose controlling `pi` process is gone keeps being reported (and,
+when repairable, repaired) by the supervisor of every later runtime over the
+same store. To close such missions out, with no `pi` session open on that store:
+
+```bash
+pi-engineering missions list   --store <repo>/.pi-eng [--repo-id <id>] [--created-after <ISO>] [--all] [--json]
+pi-engineering missions cancel --store <repo>/.pi-eng --repo-id <id> --created-after <ISO>   # dry run
+pi-engineering missions cancel --store <repo>/.pi-eng --mission <id> [--mission <id> ...] --yes
+```
+
+`cancel` takes the store's single-writer lock (it refuses while a live session
+owns the store) and refuses a mission whose controller lease is still live. It
+cancels unfinished tasks and executions, fails open recovery decisions and
+moves the mission to `CANCELED` through the normal lifecycle transitions. It
+starts no supervisor and leaves Git alone: candidate worktrees and branches stay
+in place for diagnosis and are listed in the output.
+
+A gate repair that has no Git-verified current candidate (for example because
+the only integration failed, so no candidate evidence was ever published) is
+refused once, recorded as one `recovery_candidate_baseline` finding, and the
+mission is durably stopped with a `resumeCondition`. It is not retried on every
+supervisor tick.

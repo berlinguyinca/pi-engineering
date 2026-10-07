@@ -1245,6 +1245,47 @@ describe("orchestrator: durable blocked-mission repair", () => {
     assert.deepEqual(h.observedRecoveries, []);
   });
 
+  it("stops a started gate repair that has no verified candidate instead of re-raising it every tick", async () => {
+    // Field shape (MSN-25K8j6): finalization's gate-repair loop planned and
+    // started CREATE_REPAIR_TASKS while the mission was BLOCKED, with no
+    // candidate record because the failing integration never published one.
+    // Every supervisor tick re-selected that `started` decision, added an
+    // identical blocking finding and returned without a durable stop.
+    const h = blockedRepairHarness({ category: "REVIEW_FAILED", failedKind: "review" });
+    const started = h.store.planRecovery({
+      recoveryId: "RCV-gate-without-candidate",
+      missionId: h.missionId,
+      classificationId: "FC-budget",
+      action: "CREATE_REPAIR_TASKS",
+      expectedMaterialChange: "create bounded replacement tasks that materially change the candidate",
+      attempt: 1,
+      maxAttempts: 2,
+      deadline: "2026-09-27T00:30:00.000Z",
+      nextActionAt: "2026-09-27T00:00:00.000Z",
+      status: "planned",
+      decidedAt: "2026-09-27T00:00:00.000Z",
+      startingCandidateIdentityHash: null,
+    });
+    h.store.transitionRecovery(started.recoveryId, "started");
+    assert.equal(h.store.getCandidate(h.missionId), undefined);
+
+    for (let tick = 0; tick < 3; tick++) await h.orchestrator.repairBlockedMission(h.missionId);
+
+    const baseline = h.store
+      .listFindings(h.missionId)
+      .filter((finding) => finding.category === "recovery_candidate_baseline");
+    assert.equal(baseline.length, 1, "an identical blocking finding is recorded once");
+    const stop = h.store.listMissionStops(h.missionId).at(-1);
+    assert.ok(stop, "a recovery that cannot proceed records a durable stop");
+    assert.match(stop.resumeCondition, /candidate/i);
+    assert.ok(stop.attemptedRecoveries.includes(started.recoveryId));
+    const decision = h.store.getRecoveryDecision(started.recoveryId)!;
+    assert.ok(!["planned", "started"].includes(decision.status), `decision left ${decision.status}`);
+    assert.equal(h.store.listTaskSupersessions(h.missionId).length, 0, "no repair work without a verified baseline");
+    assert.deepEqual(h.observedRecoveries, []);
+    assert.equal(h.store.getMission(h.missionId)!.status, "BLOCKED");
+  });
+
   it("integrates genuine repair content before materiality is evaluated", async () => {
     const h = await realGateRepairHarness(false);
     try {

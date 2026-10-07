@@ -27,6 +27,7 @@ import { CheckpointManager } from "./checkpoints.ts";
 import { CompletionGate } from "./completionGate.ts";
 import { hashCandidateEvidenceIdentity, normalizeReviewSeverity, taskCoverageFingerprint } from "./evidence.ts";
 import { IntentRouter, workflowMutatesRepo } from "./intentRouter.ts";
+import { transitionMissionToCanceled } from "./missionCancel.ts";
 import type { MissionStore } from "./missionStore.ts";
 import type { MissionObservability } from "./observability/MissionObservability.ts";
 import { computeProgress } from "./observability/progress.ts";
@@ -482,17 +483,44 @@ export class Orchestrator {
         return this.store.getMission(missionId)!;
       }
       if (repairDecision.action === "CREATE_REPAIR_TASKS" && !repairDecision.startingCandidateContent) {
-        if (repairDecision.status === "planned") this.store.transitionRecovery(repairDecision.recoveryId, "failed");
-        this.store.addFinding({
-          mission_id: missionId,
-          task_id: classification.taskId,
-          severity: "blocking",
-          category: "recovery_candidate_baseline",
-          file: null,
-          line: null,
-          summary: "Gate repair requires an independently Git-verified current candidate.",
-          evidence: repairDecision.recoveryId,
-          recommended_action: "Reconstruct the current candidate from Git before dispatching repair work.",
+        // Gate repair without an independently Git-verified candidate baseline
+        // is refused (materiality could not be proven). The refusal is terminal
+        // for this resumption: settle the decision whether it was planned or
+        // already started (a decision left `started` was re-selected above on
+        // every supervisor tick, bypassing the planner's budget and deadline),
+        // record the finding once, and durably stop the mission so neither the
+        // supervisor nor a restart re-enters this branch until the operator acts.
+        if (repairDecision.status === "planned" || repairDecision.status === "started") {
+          this.store.transitionRecovery(repairDecision.recoveryId, "failed");
+        }
+        const recordedBaselineRefusal = this.store
+          .listFindings(missionId)
+          .some(
+            (finding) =>
+              finding.category === "recovery_candidate_baseline" &&
+              finding.status === "open" &&
+              finding.evidence === repairDecision.recoveryId,
+          );
+        if (!recordedBaselineRefusal) {
+          this.store.addFinding({
+            mission_id: missionId,
+            task_id: classification.taskId,
+            severity: "blocking",
+            category: "recovery_candidate_baseline",
+            file: null,
+            line: null,
+            summary: "Gate repair requires an independently Git-verified current candidate.",
+            evidence: repairDecision.recoveryId,
+            recommended_action: "Reconstruct the current candidate from Git before dispatching repair work.",
+          });
+        }
+        const preservedWork = await this.preservedMissionWork(missionId);
+        this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
+        this.store.stopMission(missionId, {
+          reason: "gate repair refused: no independently Git-verified current candidate exists for this mission",
+          preservedWork,
+          attemptedRecoveries: this.store.listRecoveryDecisions(missionId).map((decision) => decision.recoveryId),
+          resumeCondition: `a successful integration must publish Git-verified candidate evidence before gate repair can run; otherwise cancel the mission (pi-engineering missions cancel --store <.pi-eng dir> --mission ${missionId} --yes)`,
         });
         await this.store.flush();
         this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
@@ -2683,14 +2711,9 @@ export class Orchestrator {
 
   /** Settle a caller-aborted mission without allowing later gate work to run. */
   private async cancelMission(missionId: string): Promise<Mission> {
-    let mission = this.store.getMission(missionId)!;
-    if (mission.status === "CANCELED") return mission;
-    if (canTransitionMission(mission.status, "CANCELING")) {
-      mission = this.store.transitionMission(missionId, "CANCELING");
-    }
-    if (canTransitionMission(mission.status, "CANCELED")) {
-      mission = this.store.transitionMission(missionId, "CANCELED");
-    }
+    const current = this.store.getMission(missionId)!;
+    if (current.status === "CANCELED") return current;
+    const mission = transitionMissionToCanceled(this.store, missionId);
     await this.cleanupCanceledMission(missionId);
     this.report(missionId, `[mission ${missionId}] canceled by caller`);
     return mission;
