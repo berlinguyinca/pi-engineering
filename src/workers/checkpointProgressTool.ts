@@ -25,9 +25,7 @@ export const CHECKPOINT_PROGRESS_TOOL_NAME = "checkpoint_progress";
  * front and returns the exact declared list, while SHA/committed-path
  * validation remains at settlement (gate semantics unchanged).
  */
-export function createCheckpointProgressTool(
-  declaredDeliverables: readonly string[],
-): ReturnType<typeof defineTool> {
+export function createCheckpointProgressTool(declaredDeliverables: readonly string[]): ReturnType<typeof defineTool> {
   return defineTool({
     name: CHECKPOINT_PROGRESS_TOOL_NAME,
     label: "Checkpoint Progress",
@@ -82,7 +80,9 @@ export function createCheckpointProgressTool(
         lines.push(
           `Declared deliverables (claim using the EXACT string): ${declared
             .map((d) => `"${d}"`)
-            .join(", ")}. Re-claim with the exact declared deliverable, the current git rev-parse HEAD, and the committed evidence paths.`,
+            .join(
+              ", ",
+            )}. Re-claim with the exact declared deliverable, the current git rev-parse HEAD, and the committed evidence paths.`,
         );
       }
       return {

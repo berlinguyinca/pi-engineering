@@ -2487,11 +2487,13 @@ export class ExecutionBroker {
               // Which conjunct(s) failed — the rejection finding must name the
               // specific condition, not just that the claim was rejected.
               const failReasons: string[] = [];
-              if (input.deliverables?.includes(claim.deliverable) !== true) failReasons.push("deliverable-not-declared");
+              if (input.deliverables?.includes(claim.deliverable) !== true)
+                failReasons.push("deliverable-not-declared");
               if (snapshot.candidateSha === null) failReasons.push("no-candidate-sha");
               else if (claim.candidateSha !== snapshot.candidateSha) failReasons.push("sha-mismatch");
               if (claim.evidencePaths.length === 0) failReasons.push("no-evidence-paths");
-              else if (!claim.evidencePaths.every((path) => snapshot.committedChanges.includes(path))) failReasons.push("paths-not-committed");
+              else if (!claim.evidencePaths.every((path) => snapshot.committedChanges.includes(path)))
+                failReasons.push("paths-not-committed");
               if (!artifactsValid) failReasons.push("artifacts-invalid");
               const valid = failReasons.length === 0;
               if (valid) {
