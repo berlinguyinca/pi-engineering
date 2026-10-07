@@ -702,12 +702,17 @@ export interface ResilientStreamInstallOptions extends ResilientStreamOptions {
 export function createResilientStreamSimple<M, C, O>(
   base: ResilientStreamFunction<M, C, O>,
   install: ResilientStreamInstallOptions,
+  live?: () => ResilientStreamInstallOptions,
 ): ResilientStreamFunction<M, C, O> {
-  const telemetry = install.telemetry;
   return (model, context, options) => {
-    const out = install.createStream();
-    const signal = install.signalOf?.(options);
-    const flow = new ResilientAttemptFlow(install, install.refOf(model));
+    // Re-arm support: the install options are resolved per call, so a
+    // capability registry / router / mission scheduler / status sink that
+    // arrives after the first install takes effect without a second wrap.
+    const inst = live ? live() : install;
+    const telemetry = inst.telemetry;
+    const out = inst.createStream();
+    const signal = inst.signalOf?.(options);
+    const flow = new ResilientAttemptFlow(inst, inst.refOf(model));
     const identity = (extra: InferenceTelemetryData): InferenceTelemetryData => ({
       ...(flow.missionId ? { mission_id: flow.missionId } : {}),
       ...(flow.workerId ? { worker_id: flow.workerId } : {}),
@@ -724,7 +729,7 @@ export function createResilientStreamSimple<M, C, O>(
           // model; the request itself is unchanged apart from the idempotency
           // evidence for tool calls that already executed (spec §6).
           const ref = flow.model;
-          const resolved = install.resolveModel?.(ref);
+          const resolved = inst.resolveModel?.(ref);
           sentModel = resolved ?? sentModel;
           const capture = captureGatewayAttemptResponse(
             (options ?? {}) as ProviderResponseOptions<ProviderResponseLike, unknown>,
@@ -738,14 +743,14 @@ export function createResilientStreamSimple<M, C, O>(
         },
         out,
         {
-          hold: (waitSignal) => install.hold(waitSignal, signal, sentModel),
+          hold: (waitSignal) => inst.hold(waitSignal, signal, sentModel),
           classifyAttempt: (observed) => flow.decide(observed),
           // Anything reached the transcript: the model served, so its penalty
           // and circuit leave the picture and any capacity wait is over.
           onProgress: () => flow.served(flow.model),
-          onHold: (info) => install.status?.(flow.statusLineFor(info.signal.retryAfterMs)),
+          onHold: (info) => inst.status?.(flow.statusLineFor(info.signal.retryAfterMs)),
           ...(signal ? { signal } : {}),
-          ...(install.maxElapsedMs !== undefined ? { maxElapsedMs: install.maxElapsedMs } : {}),
+          ...(inst.maxElapsedMs !== undefined ? { maxElapsedMs: inst.maxElapsedMs } : {}),
           response: () => attemptCapture?.take(),
           onSettle: (settled) => {
             if (settled !== "ok") return;
@@ -760,7 +765,7 @@ export function createResilientStreamSimple<M, C, O>(
     })().catch((error: unknown) => {
       // A throw the pump could not represent (never a gateway wait): Pi
       // expects a terminal event, not a rejected promise.
-      const message = install.errorMessage(sentModel, error);
+      const message = inst.errorMessage(sentModel, error);
       out.push({ type: "error", reason: "error", error: message } as RetryableEvent);
       out.end(message);
     });
@@ -769,6 +774,38 @@ export function createResilientStreamSimple<M, C, O>(
 }
 
 const RUNTIME_WRAPPED = Symbol.for("pi-engineering.resilientInference");
+const INSTALL_HOLDER = Symbol.for("pi-engineering.resilientInference.install.holder");
+
+/** Options a re-arm may update on a live install (the rest are runtime-bound). */
+const RARMABLE_INSTALL_FIELDS = [
+  "role",
+  "context",
+  "env",
+  "config",
+  "registry",
+  "router",
+  "health",
+  "breakers",
+  "telemetry",
+  "actions",
+  "scheduler",
+  "status",
+  "probeIntervalMs",
+  "capacityWaitMaxMs",
+  "maxElapsedMs",
+] as const;
+
+function mergeInstallOptions(
+  current: ResilientStreamInstallOptions,
+  next: ResilientStreamInstallOptions,
+): ResilientStreamInstallOptions {
+  const merged: Record<string, unknown> = { ...current };
+  for (const key of RARMABLE_INSTALL_FIELDS) {
+    const value = next[key];
+    if (value !== undefined) merged[key] = value;
+  }
+  return merged as unknown as ResilientStreamInstallOptions;
+}
 
 /** True when `runtime.streamSimple` is the resilient wrapper. */
 export function isResilientRuntime(runtime: unknown): boolean {
@@ -789,10 +826,25 @@ export function installResilientRuntime<M, C, O>(
   runtime: { streamSimple: ResilientStreamFunction<M, C, O> },
   install: ResilientStreamInstallOptions,
 ): "installed" | "already-installed" {
-  const target = runtime as { [RUNTIME_WRAPPED]?: boolean };
-  if (target[RUNTIME_WRAPPED]) return "already-installed";
+  const target = runtime as {
+    [RUNTIME_WRAPPED]?: boolean;
+    [INSTALL_HOLDER]?: { current: ResilientStreamInstallOptions };
+  };
+  if (target[RUNTIME_WRAPPED]) {
+    // Re-arm: merge the new options into the live holder. The wrapper reads
+    // it on every call, so a capability registry / router / mission
+    // scheduler / status sink that arrives after the first install takes
+    // effect immediately — production builds the capability pool AFTER the
+    // worker executor (spec §23), so idempotence alone would leave the
+    // fallback, park and status rungs unarmed.
+    const holder = target[INSTALL_HOLDER];
+    if (holder) holder.current = mergeInstallOptions(holder.current, install);
+    return "already-installed";
+  }
+  const holder = { current: install };
   const base = runtime.streamSimple.bind(runtime) as ResilientStreamFunction<M, C, O>;
-  runtime.streamSimple = createResilientStreamSimple<M, C, O>(base, install);
+  runtime.streamSimple = createResilientStreamSimple<M, C, O>(base, install, () => holder.current);
+  target[INSTALL_HOLDER] = holder;
   target[RUNTIME_WRAPPED] = true;
   return "installed";
 }

@@ -223,10 +223,12 @@ export class PiWorkerExecutor implements WorkerExecutor {
   private readonly requestBodyBudget: RequestBodyBudgetConfig;
   private readonly thinkingPolicy: ThinkingOffConfig;
   /** Resilient-inference seams (capability registry / router / scheduler / status). */
-  private readonly capabilityRegistry: ModelCapabilityRegistry | undefined;
-  private readonly roleRouter: RoleRouter | undefined;
-  private readonly inferenceScheduler: ResilientStreamScheduler | undefined;
-  private readonly inferenceStatus: ((line: string) => void) | undefined;
+  // Not readonly: production arming (spec §23) updates these via
+  // rearmResilience() once the capability pool exists.
+  private capabilityRegistry: ModelCapabilityRegistry | undefined;
+  private roleRouter: RoleRouter | undefined;
+  private inferenceScheduler: ResilientStreamScheduler | undefined;
+  private inferenceStatus: ((line: string) => void) | undefined;
   /** Live tracker per worker run: tool calls already executed (spec §6). */
   private readonly runActions = new Map<string, ExecutedActionTracker>();
   /** Aggregate recovery telemetry across all worker runs. */
@@ -282,6 +284,31 @@ export class PiWorkerExecutor implements WorkerExecutor {
       ...(this.inferenceScheduler ? { scheduler: this.inferenceScheduler } : {}),
       ...(this.inferenceStatus ? { status: this.inferenceStatus } : {}),
     });
+  }
+
+  /**
+   * Production arming (spec §23): the capability pool (registry + router)
+   * and the mission scheduler are often built AFTER this executor, so the
+   * initial arm at runtime creation carries only what existed at
+   * construction. Call this once the pool is ready: the resilient install
+   * is idempotent but UPDATABLE, so the new registry/router/scheduler/status
+   * take effect on the live runtime without a second wrap — otherwise
+   * selectFallback bails without a registry and the WAITING_FOR_
+   * INFERENCE_CAPACITY park + operator status lines are unreachable in
+   * production.
+   */
+  rearmResilience(patch: {
+    capabilityRegistry?: ModelCapabilityRegistry;
+    roleRouter?: RoleRouter;
+    inferenceScheduler?: ResilientStreamScheduler;
+    inferenceStatus?: (line: string) => void;
+  }): void {
+    if (patch.capabilityRegistry) this.capabilityRegistry = patch.capabilityRegistry;
+    if (patch.roleRouter) this.roleRouter = patch.roleRouter;
+    if (patch.inferenceScheduler) this.inferenceScheduler = patch.inferenceScheduler;
+    if (patch.inferenceStatus) this.inferenceStatus = patch.inferenceStatus;
+    if (!this.runtimePromise) return; // the initial arm will pick the fields up
+    void this.runtimePromise.then((rt) => this.wireResilience(rt)).catch(() => {});
   }
 
   /** The idempotency tracker of the run this session belongs to (spec §6). */

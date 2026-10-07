@@ -20,6 +20,7 @@ import type {
 } from "../core/types.ts";
 import { ROLE_BUDGETS, isMachineEvidence } from "../core/types.ts";
 import { GitRepo } from "../git/GitRepo.ts";
+import { MissionCapacityScheduler } from "../inference/missionCapacityScheduler.ts";
 import { Ledger } from "../ledger/Ledger.ts";
 import { workflowMutatesRepo } from "../orchestration/intentRouter.ts";
 import {
@@ -347,6 +348,14 @@ export interface EngineeringRuntimeOptions {
    * review fallback model from its runtime.
    */
   roleRouter?: Pick<RoleRouterAdapter, "route">;
+  /**
+   * Concise operator-facing inference status lines (fault-tolerance spec
+   * §26): "model X penalized · falling back to Y", "waiting for inference
+   * capacity · 45s", … One short line per event, never a stack trace. The
+   * resilient runtime is armed with it in open() once the capability pool
+   * exists (spec §23 production arming).
+   */
+  inferenceStatus?: (line: string) => void;
   /** Override the durable state directory (default: <repoRoot>/.pi-eng). */
   workDir?: string;
   /**
@@ -801,6 +810,7 @@ export class EngineeringRuntime {
       // router cannot be built, so core never requires discovery or network.
       let routeModel: RouteModel | undefined;
       let reviewFallbackModel = opts.model ? { provider: opts.model.provider, id: opts.model.id } : undefined;
+      let routerAdapter: RoleRouterAdapter | Pick<RoleRouterAdapter, "route"> | undefined;
       try {
         const { createRoleRouter } = await import("../capability/adapter.ts");
         const sharedRuntime = rt.worker instanceof PiWorkerExecutor ? await rt.worker.getModelRuntime() : undefined;
@@ -808,7 +818,7 @@ export class EngineeringRuntime {
           const available = (await sharedRuntime.getAvailable())[0];
           if (available) reviewFallbackModel = { provider: available.provider, id: available.id };
         }
-        const routerAdapter =
+        routerAdapter =
           opts.roleRouter ??
           (await createRoleRouter({
             cwd: repoRoot,
@@ -825,6 +835,36 @@ export class EngineeringRuntime {
         });
       } catch {
         routeModel = undefined;
+      }
+      // Production arming (fault-tolerance spec §23): the capability pool
+      // (registry + router) now exists, so arm the worker's resilient runtime
+      // with capability-based fallback (RoleRouter + RequiredModelEnvelope),
+      // the durable WAITING_FOR_INFERENCE_CAPACITY park — persisted as the
+      // real mission state, not a comment — and operator status lines. The
+      // install is idempotent-but-updatable, so this re-arm updates the live
+      // runtime even though the executor armed itself earlier.
+      if (rt.worker instanceof PiWorkerExecutor) {
+        const pool = routerAdapter as RoleRouterAdapter | undefined;
+        if (pool?.registry && pool.router) {
+          rt.worker.rearmResilience({
+            capabilityRegistry: pool.registry,
+            roleRouter: pool.router,
+            inferenceScheduler: new MissionCapacityScheduler({
+              registry: () => pool.registry,
+              transitionMission: (missionId, state) => {
+                try {
+                  // The durable fact is the state transition itself; the
+                  // orchestrator's observability surfaces it like any other
+                  // mission transition.
+                  rt.missionStore?.transitionMission(missionId, state, "system");
+                } catch {
+                  // guarded transition — the orchestrator owns the state
+                }
+              },
+            }),
+            ...(opts.inferenceStatus ? { inferenceStatus: opts.inferenceStatus } : {}),
+          });
+        }
       }
       const backends = realBackends({
         worker: rt.worker,
