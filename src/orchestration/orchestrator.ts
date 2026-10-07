@@ -21,6 +21,7 @@ import { GitRepo } from "../git/GitRepo.ts";
 import type { EventStoreBackend } from "../platform/eventstore/backend.ts";
 import type { GatewayResilienceConfig } from "../resilience/config.ts";
 import type { RecoveryProbe } from "../resilience/probe.ts";
+import { describeOperatorPause } from "../runtime/operatorModelPin.ts";
 import type { WorkerActivity } from "../workers/WorkerExecutor.ts";
 import { type BrokerBackends, ExecutionBroker } from "./broker.ts";
 import { CheckpointManager } from "./checkpoints.ts";
@@ -2837,6 +2838,8 @@ export class Orchestrator {
   private async cancelMission(missionId: string): Promise<Mission> {
     let mission = this.store.getMission(missionId)!;
     if (mission.status === "CANCELED") return mission;
+    // A canceled mission is no longer paused; never report it as waiting.
+    this.store.clearOperatorPause(missionId);
     if (mission.status === "PAUSED_INFRASTRUCTURE") {
       // Interrupted tasks were left resumable; an explicit cancel ends them.
       for (const task of this.store.listTasks(missionId)) {
@@ -2884,6 +2887,9 @@ export class Orchestrator {
       // Interrupted before any work was planned: nothing to preserve.
       return this.cancelMission(missionId);
     }
+    // Make the pause visible on the live surfaces (panel, footer) at once.
+    const pauseLine = describeOperatorPause(mission);
+    if (pauseLine) this.observability?.activity(missionId, { type: "recovery", summary: pauseLine });
     if (["READY", "QUEUED", "STARTING"].includes(mission.status) && canTransitionMission(mission.status, "EXECUTING")) {
       mission = this.store.transitionMission(missionId, "EXECUTING");
     }

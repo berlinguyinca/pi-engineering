@@ -7,7 +7,7 @@
 import { formatWaitingFor } from "../gateway/admissionNotice.ts";
 import { latestTaskCheckpoints } from "../orchestration/checkpoints.ts";
 import type { MissionStore } from "../orchestration/missionStore.ts";
-import { describeMissionModel } from "../runtime/operatorModelPin.ts";
+import { describeMissionControl } from "../runtime/operatorModelPin.ts";
 
 const MAX_ITEMS = 5;
 
@@ -49,8 +49,7 @@ export function missionReportLines(store: MissionStore, missionId: string): stri
   const lines: string[] = [];
   const progress = missionProgressLine(store, missionId);
   if (progress) lines.push(progress);
-  const model = describeMissionModel(mission);
-  if (model) lines.push(model);
+  lines.push(...describeMissionControl(mission));
   const generation = store.listMissionResumptions(missionId).at(-1)?.generation ?? 0;
   const stop = store
     .listMissionStops(missionId)

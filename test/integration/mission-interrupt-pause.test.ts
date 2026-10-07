@@ -11,12 +11,15 @@ import assert from "node:assert/strict";
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { test } from "node:test";
+import { formatMissionActivity } from "../../extensions/index.ts";
 import { EngineeringRuntime } from "../../src/index.ts";
 import type { ModelRef } from "../../src/lifecycle/types.ts";
 import { OPERATOR_PAUSE_STOP_REASON } from "../../src/orchestration/interrupt.ts";
+import type { RuntimeMissionActivityEvent } from "../../src/runtime/EngineeringRuntime.ts";
 import { RuntimeSession } from "../../src/runtime/isolation/RuntimeSession.ts";
 import { onOperatorModelSelect, resetSessionModelChoice } from "../../src/runtime/operatorModelPin.ts";
 import { buildCoreTools } from "../../src/tools/coreTools.ts";
+import { missionReportLines } from "../../src/tools/missionReport.ts";
 import type { WorkerExecutor, WorkerRequest } from "../../src/workers/WorkerExecutor.ts";
 import { makeFixtureRepo } from "../fixtures/make-fixture.ts";
 
@@ -68,13 +71,18 @@ function capacityWorker(seen: WorkerRequest[], started: () => void): WorkerExecu
   };
 }
 
-async function openRuntime(root: string, worker: WorkerExecutor) {
+async function openRuntime(
+  root: string,
+  worker: WorkerExecutor,
+  onMissionActivity?: (event: RuntimeMissionActivityEvent) => void,
+) {
   return EngineeringRuntime.open({
     cwd: root,
     workDir: join(root, ".pi-eng"),
     roleRouter: { route: async () => ({ ...GLM }) },
     model: { ...GLM, api: "openai-completions", contextWindow: 262_144, maxTokens: 4096 } as never,
     worker,
+    ...(onMissionActivity ? { onMissionActivity } : {}),
   });
 }
 
@@ -167,6 +175,7 @@ test("an explicit cancel is the only thing that terminates a paused or running m
     const missionId = runtime.missionStore!.listMissions().at(-1)!.mission_id;
     const canceled = await runtime.cancelMission(missionId);
     assert.equal(canceled.status, "CANCELED");
+    assert.equal(canceled.operator_paused_at ?? null, null, "a canceled mission never reads as paused");
     assert.equal((await running).mission.status, "CANCELED");
   } finally {
     await runtime?.close();
@@ -302,6 +311,111 @@ test("clear_pin releases a paused mission from a persisted operator pin before i
     const implementers = seen.filter((request) => request.role === "implementer");
     assert.equal(implementers.length, 2);
     assert.deepEqual(implementers[1]!.modelOverride, GLM, "back on the role pin, not the released operator pin");
+  } finally {
+    await runtime?.close();
+    await fixture.cleanup();
+  }
+});
+
+const PAUSED_LINE =
+  /PAUSED by operator at \S+ — automatic repair is off; resume with \/mission resume (MSN-\S+) \(add --model auto to release a model pin\)/;
+
+test("an operator pause is visible on every status surface, survives a restart, and /mission resume clears it", async () => {
+  const fixture = await makeFixtureRepo();
+  let started!: () => void;
+  const workerStarted = new Promise<void>((resolve) => {
+    started = resolve;
+  });
+  const activity: RuntimeMissionActivityEvent[] = [];
+  let runtime: EngineeringRuntime | undefined;
+  try {
+    runtime = await openRuntime(fixture.root, capacityWorker([], started), (event) => activity.push(event));
+    const sessionId = RuntimeSession.current().sessionId;
+    resetSessionModelChoice(sessionId, GLM);
+    onOperatorModelSelect(sessionId, { model: DEEPSEEK, source: "set" });
+    const rt = runtime;
+    const tool = missionToolFor(rt);
+    const ctx = { cwd: fixture.root } as never;
+    const esc = new AbortController();
+    const running = tool.execute(
+      "call-1",
+      { request: "Make add return the sum", mutate: true },
+      esc.signal,
+      undefined,
+      ctx,
+    );
+    await workerStarted;
+    const missionId = rt.missionStore!.listMissions().at(-1)!.mission_id;
+    // Blocked under a running worker: Esc leaves it BLOCKED-like (no pause transition).
+    rt.missionStore!.transitionMission(missionId, "NEEDS_ATTENTION");
+    esc.abort();
+    await running;
+    const text = (result: { content: Array<{ type: string; text?: string }> }) =>
+      result.content.map((part) => part.text ?? "").join("\n");
+
+    // Mission report (the BLOCKED/paused report) and the tool's status action.
+    const report = missionReportLines(rt.missionStore!, missionId).join("\n");
+    assert.match(report, PAUSED_LINE);
+    assert.match(report, new RegExp(`model: gw/${DEEPSEEK.id} \\(operator pin\\)`));
+    const status = text(await tool.execute("call-2", { action: "status", missionId }, undefined, undefined, ctx));
+    assert.match(status, PAUSED_LINE);
+    assert.match(status, /operator pin/);
+
+    // The Engineering panel / footer mission status.
+    const last = activity.filter((event) => event.missionId === missionId).at(-1);
+    assert.ok(last?.operatorPausedAt, "the runtime publishes the pause to the panel");
+    const panel = formatMissionActivity(last!);
+    assert.match(panel.missionStatus.token, /PAUSED/);
+    assert.match(panel.missionStatus.next, /\/mission resume/);
+    assert.match(panel.detail, /operator pin/);
+
+    // After a restart the persisted marker still renders.
+    await rt.close();
+    runtime = await openRuntime(
+      fixture.root,
+      capacityWorker([], () => {}),
+    );
+    assert.match(missionReportLines(runtime.missionStore!, missionId).join("\n"), PAUSED_LINE);
+
+    // /mission resume clears it on every resume path.
+    await runtime.resumeBlockedMission(missionId).catch(() => undefined);
+    assert.equal(runtime.missionStore!.getMission(missionId)?.operator_paused_at ?? null, null);
+    assert.doesNotMatch(missionReportLines(runtime.missionStore!, missionId).join("\n"), PAUSED_LINE);
+  } finally {
+    await runtime?.close();
+    await fixture.cleanup();
+  }
+});
+
+test("/mission resume clears the operator pause of a mission paused to PAUSED_INFRASTRUCTURE", async () => {
+  const fixture = await makeFixtureRepo();
+  let started!: () => void;
+  const workerStarted = new Promise<void>((resolve) => {
+    started = resolve;
+  });
+  let runtime: EngineeringRuntime | undefined;
+  try {
+    runtime = await openRuntime(fixture.root, capacityWorker([], started));
+    const rt = runtime;
+    const tool = missionToolFor(rt);
+    const esc = new AbortController();
+    const running = tool.execute(
+      "call-1",
+      { request: "Make add return the sum", mutate: true },
+      esc.signal,
+      undefined,
+      {
+        cwd: fixture.root,
+      } as never,
+    );
+    await workerStarted;
+    esc.abort();
+    const paused = await running;
+    const missionId = String((paused.details as { missionId?: string }).missionId);
+    assert.ok(rt.missionStore!.getMission(missionId)?.operator_paused_at);
+    assert.match(missionReportLines(rt.missionStore!, missionId).join("\n"), PAUSED_LINE);
+    await rt.resumeBlockedMission(missionId);
+    assert.equal(rt.missionStore!.getMission(missionId)?.operator_paused_at ?? null, null);
   } finally {
     await runtime?.close();
     await fixture.cleanup();

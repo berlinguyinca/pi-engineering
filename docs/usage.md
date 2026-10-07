@@ -175,7 +175,12 @@ operator pin. Only an explicit cancel ends a healthy mission: `/mission cancel
 
 The pause is recorded on the mission the moment Esc lands. Until you resume it,
 nothing automatic resumes it: not the supervisor, not infrastructure
-auto-resume, not repair.
+auto-resume, not repair. The pause shows wherever a mission's state shows:
+mission status, `/mission-status`, the tool's status action, `/engineering-status`
+and the Engineering panel. It reads `PAUSED by operator at <time> — automatic
+repair is off; resume with /mission resume <id> (add --model auto to release a
+model pin)`, next to the mission's operator pin if it has one. It survives a
+restart and clears on `/mission resume` or `/mission cancel`.
 
 A mission that cannot pause stays in the state it is in and is not cancelled;
 the tool reports "interrupt noted". This covers a mission that is

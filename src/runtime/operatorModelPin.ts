@@ -127,6 +127,22 @@ export function describeModelChoice(choice: SessionModelChoice | undefined): str
   return "model: auto (role pins / capability router)";
 }
 
+/**
+ * Status line for a mission the operator paused (Esc). Automatic repair is
+ * off until `/mission resume`, so the mission must never look merely stuck.
+ */
+export function describeOperatorPause(mission: Pick<Mission, "mission_id" | "operator_paused_at">): string | null {
+  if (!mission.operator_paused_at) return null;
+  return `PAUSED by operator at ${mission.operator_paused_at} — automatic repair is off; resume with /mission resume ${mission.mission_id} (add --model auto to release a model pin)`;
+}
+
+/** Operator-control lines for a mission: the pause, then the model pin. */
+export function describeMissionControl(
+  mission: Pick<Mission, "mission_id" | "operator_paused_at" | "operator_model_pin">,
+): string[] {
+  return [describeOperatorPause(mission), describeMissionModel(mission)].filter((line): line is string => !!line);
+}
+
 /** Status line for one mission's persisted pin. */
 export function describeMissionModel(mission: Pick<Mission, "operator_model_pin">): string | null {
   const pin = mission.operator_model_pin;
