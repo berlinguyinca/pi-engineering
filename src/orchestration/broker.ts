@@ -2484,13 +2484,16 @@ export class ExecutionBroker {
               } else if (captured) {
                 artifactsValid = true;
               }
-              const valid =
-                input.deliverables?.includes(claim.deliverable) === true &&
-                snapshot.candidateSha !== null &&
-                claim.candidateSha === snapshot.candidateSha &&
-                claim.evidencePaths.length > 0 &&
-                claim.evidencePaths.every((path) => snapshot.committedChanges.includes(path)) &&
-                artifactsValid;
+              // Which conjunct(s) failed — the rejection finding must name the
+              // specific condition, not just that the claim was rejected.
+              const failReasons: string[] = [];
+              if (input.deliverables?.includes(claim.deliverable) !== true) failReasons.push("deliverable-not-declared");
+              if (snapshot.candidateSha === null) failReasons.push("no-candidate-sha");
+              else if (claim.candidateSha !== snapshot.candidateSha) failReasons.push("sha-mismatch");
+              if (claim.evidencePaths.length === 0) failReasons.push("no-evidence-paths");
+              else if (!claim.evidencePaths.every((path) => snapshot.committedChanges.includes(path))) failReasons.push("paths-not-committed");
+              if (!artifactsValid) failReasons.push("artifacts-invalid");
+              const valid = failReasons.length === 0;
               if (valid) {
                 completedDeliverables.add(claim.deliverable);
                 artifactRefs.push(...(captured?.refs ?? []));
@@ -2506,7 +2509,7 @@ export class ExecutionBroker {
                   category: "checkpoint_progress",
                   file: null,
                   line: null,
-                  summary: `Rejected unauthenticated checkpoint progress for ${claim.deliverable}`,
+                  summary: `Rejected unauthenticated checkpoint progress for ${claim.deliverable}: ${failReasons.join(", ")}`,
                   evidence: `claimed=${claim.candidateSha}; actual=${snapshot.candidateSha ?? "none"}; paths=${claim.evidencePaths.join(",")}; artifacts=${claim.artifactRefs.join(",") || "none"}`,
                   recommended_action:
                     "Commit the declared deliverable, then report the exact current candidate SHA and committed evidence paths.",
@@ -2929,6 +2932,11 @@ export class ExecutionBroker {
                 exit_status: outcome.exitStatus,
                 artifact_refs: outcome.artifactRefs,
                 usage: outcome.usage,
+                // Failure visibility: backend outcomes (integration/validation/review)
+                // carry error + summary; without propagation the store recorded
+                // empty detail and real failures were undiagnosable.
+                ...(outcome.error ? { error: outcome.error } : {}),
+                ...(outcome.summary ? { summary: outcome.summary } : {}),
                 ...(outcome.recoveredMerged?.length ? { recovered_merged: outcome.recoveredMerged } : {}),
                 ...(backend === "review" && input.reviewedRecovered?.length
                   ? { reviewed_recovered: [...input.reviewedRecovered] }

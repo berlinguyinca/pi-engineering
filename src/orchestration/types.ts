@@ -280,6 +280,19 @@ export interface Execution {
   artifact_refs: string[];
   status: ExecutionStatus;
   /**
+   * Failure reason for FAILED executions (runner outcome.error or the thrown
+   * error message). Absent on success and on legacy events. Without this field
+   * backend failures (integration/validation/review) were recorded with empty
+   * detail and were undiagnosable from the store.
+   */
+  error?: string;
+  /**
+   * Short human-readable outcome summary from the runner (e.g. "integrated
+   * <branches> into <branch>; checks: fail"). Additive; absent on legacy
+   * events.
+   */
+  summary?: string;
+  /**
    * Integration executions only: recovered worker commits (from a
    * wall-clock-timed-out execution) that this integration verifiably merged —
    * the exact worker ref is an ancestor of HEAD afterwards. Consumed by the

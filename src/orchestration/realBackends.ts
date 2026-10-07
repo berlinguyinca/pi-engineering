@@ -889,10 +889,20 @@ export function realBackends(opts: RealBackendsOptions) {
           }
           const artifactRefs = result.evidence.flatMap((e) => e.artifacts).filter(Boolean);
           const artifactState = await artifactContentHashes(opts.artifacts, artifactRefs);
+          // Failure visibility: the verifier result names the failed stage (or
+          // that nothing was verifiable); without it the integration failure
+          // record carried only "checks: fail" and the actual cause (e.g. a
+          // broken import in the worktree) was undiagnosable from the store.
+          const checkFailure = result.passed
+            ? undefined
+            : result.noTargets
+              ? "verification failed: no verification targets detected (nothing was actually verified)"
+              : `verification failed at stage: ${result.failedStage ?? "unknown"}`;
           return {
             executionId: "integration",
             exitStatus: result.passed ? "succeeded" : "failed",
             summary: `integrated ${merged.join(", ") || "nothing"}${recoveredNote} into ${target.branch}; checks: ${result.passed ? "pass" : "fail"}`,
+            ...(checkFailure ? { error: checkFailure } : {}),
             artifactRefs,
             artifactHashes: artifactState.hashes,
             usage: {
