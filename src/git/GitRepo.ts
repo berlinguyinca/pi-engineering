@@ -1,4 +1,4 @@
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { access, lstat, mkdir, readFile, readdir, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
@@ -238,6 +238,37 @@ export class GitRepo {
   private requireQuery(result: GitResult, operation: string, args: readonly string[]): GitResult {
     if (result.code !== 0) throw new GitQueryError(operation, args, result.code, result.stderr || result.stdout);
     return result;
+  }
+
+  /**
+   * `git` with a payload on stdin (plumbing commands that read content: hash-object,
+   * mktree, commit-tree). execFile has no `input` option, so this spawns and writes
+   * stdin for real, with a kill timeout and GitResult mapping matching git().
+   */
+  private gitWithStdin(args: string[], input: string, env: NodeJS.ProcessEnv, timeoutMs = 120_000): Promise<GitResult> {
+    return new Promise((done) => {
+      const child = spawn("git", [...this.gitArgs, ...args], { env, timeout: timeoutMs, stdio: "pipe" });
+      const stdout: Buffer[] = [];
+      const stderr: Buffer[] = [];
+      let spawnError: Error | undefined;
+      child.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));
+      child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
+      // A git that exits early (bad args) closes stdin; the exit code reports it.
+      child.stdin.on("error", () => {});
+      child.on("error", (err) => {
+        spawnError = err;
+      });
+      child.on("close", (code, signal) => {
+        const err = Buffer.concat(stderr).toString("utf8").trim();
+        const failure = spawnError?.message ?? (signal ? `killed by ${signal} (timeout ${timeoutMs}ms)` : "");
+        done({
+          stdout: Buffer.concat(stdout).toString("utf8").trim(),
+          stderr: [err, failure].filter(Boolean).join("\n"),
+          code: code ?? 1,
+        });
+      });
+      child.stdin.end(input);
+    });
   }
 
   get root(): string {
@@ -913,6 +944,87 @@ export class GitRepo {
     const args = ["branch", "--show-current"];
     const r = this.requireQuery(await this.git(args), "current branch query", args);
     return r.stdout || null;
+  }
+
+  /**
+   * True when the repository has an `origin` remote — the precondition for
+   * cross-host coordination (lane refs live on the shared origin).
+   */
+  async hasRemoteOrigin(): Promise<boolean> {
+    const result = await this.git(["remote", "get-url", "origin"]);
+    return result.code === 0 && result.stdout.length > 0;
+  }
+
+  /**
+   * Read the content of a lane ref from the shared origin. Returns null when the
+   * ref does not exist. The sha is the remote object id, which doubles as the
+   * compare-and-swap token for casPushRef.
+   */
+  async readRemoteRef(ref: string): Promise<{ sha: string; content: string } | null> {
+    const lsArgs = ["ls-remote", "origin", ref];
+    const listing = this.requireQuery(await this.git(lsArgs), "readRemoteRef", lsArgs);
+    if (listing.stdout.length === 0) return null;
+    const tempRef = `refs/pieng-lane-tmp/${process.pid}-${randomUUID()}`;
+    try {
+      const fetchArgs = ["fetch", "--quiet", "--no-tags", "--no-write-fetch-head", "origin", `+${ref}:${tempRef}`];
+      this.requireQuery(await this.git(fetchArgs), "readRemoteRef", fetchArgs);
+      const shaArgs = ["rev-parse", "--verify", tempRef];
+      const sha = this.requireQuery(await this.git(shaArgs), "readRemoteRef", shaArgs).stdout;
+      const showArgs = ["show", `${tempRef}:lanes.json`];
+      const shown = this.requireQuery(await this.git(showArgs, { preserveStdout: true }), "readRemoteRef", showArgs);
+      return { sha, content: shown.stdout };
+    } finally {
+      await this.git(["update-ref", "-d", tempRef]);
+    }
+  }
+
+  /**
+   * Compare-and-swap a lane ref on the shared origin to a new single-file payload.
+   * The payload is wrapped in an orphan commit (fixed identity — lane refs are
+   * machine metadata, not authorship). `expectedSha` must equal the sha last
+   * observed via readRemoteRef (null = "must still be absent"). A lost race is NOT
+   * an error: the call resolves with ok:false and the current remote sha so the
+   * caller can re-read and retry.
+   */
+  async casPushRef(
+    ref: string,
+    content: string,
+    expectedSha: string | null,
+  ): Promise<{ ok: boolean; remoteSha: string | null }> {
+    const env = {
+      ...process.env,
+      GIT_AUTHOR_NAME: "pi-engineering",
+      GIT_AUTHOR_EMAIL: "lanes@pi-engineering.local",
+      GIT_COMMITTER_NAME: "pi-engineering",
+      GIT_COMMITTER_EMAIL: "lanes@pi-engineering.local",
+    };
+    const blobArgs = ["hash-object", "-w", "--stdin"];
+    const blob = this.requireQuery(await this.gitWithStdin(blobArgs, content, env), "casPushRef", blobArgs);
+    const treeArgs = ["mktree"];
+    const tree = this.requireQuery(
+      await this.gitWithStdin(treeArgs, `100644 blob ${blob.stdout}\tlanes.json\n`, env),
+      "casPushRef",
+      treeArgs,
+    );
+    const commitArgs = ["commit-tree", tree.stdout, "-m", "pi-eng lane index"];
+    const commitSha = this.requireQuery(await this.gitWithStdin(commitArgs, "", env), "casPushRef", commitArgs).stdout;
+    // An empty lease value means "the remote ref must not exist".
+    const pushArgs = [
+      "push",
+      "--quiet",
+      `--force-with-lease=${ref}:${expectedSha ?? ""}`,
+      "origin",
+      `${commitSha}:${ref}`,
+    ];
+    const pushed = await this.git(pushArgs);
+    if (pushed.code === 0) return { ok: true, remoteSha: commitSha };
+    const lsArgs = ["ls-remote", "origin", ref];
+    const current = this.requireQuery(await this.git(lsArgs), "casPushRef", lsArgs);
+    const remoteSha = current.stdout.length > 0 ? (current.stdout.split(/\s+/)[0] ?? null) : null;
+    if (remoteSha === expectedSha) {
+      throw new GitQueryError("casPushRef", pushArgs, pushed.code, pushed.stderr || pushed.stdout);
+    }
+    return { ok: false, remoteSha };
   }
 
   async isClean(): Promise<boolean> {
