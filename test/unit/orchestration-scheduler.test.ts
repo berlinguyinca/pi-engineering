@@ -143,9 +143,15 @@ describe("MissionScheduler (spec 02)", () => {
     });
 
     const running = scheduler.runMission(mission.mission_id);
+    // 1500ms observation window: the assertion is that the mission SETTLES after
+    // the timed-out slot is released (not that it settles within a tight real-time
+    // budget). Under high system load the scheduler's 20ms cancellation ack +
+    // event-loop drain can exceed 150ms, which made this race flake (observation
+    // timeout despite the slot being available). 10x margin keeps the same
+    // semantics robust against event-loop lag.
     const observed = await Promise.race([
       running.then(() => "settled" as const),
-      new Promise<"observation_timeout">((resolve) => setTimeout(() => resolve("observation_timeout"), 150)),
+      new Promise<"observation_timeout">((resolve) => setTimeout(() => resolve("observation_timeout"), 1500)),
     ]);
     release();
     await running;
@@ -406,10 +412,15 @@ describe("MissionScheduler (spec 02)", () => {
   it("holds fenced mission and repository authority for the entire mutating dispatch", async () => {
     const store = MissionStore.open(JsonlEventStore.inMemory());
     const mission = createExecutingMission(store);
+    // 10x margins vs the 60ms agent run below: the test asserts the heartbeat
+    // RENEWS the lease so authority survives the dispatch (semantics: renewal
+    // cadence << lease TTL). With leaseMs: 30 / heartbeatMs: 5, a single
+    // delayed 5ms tick under load let the 30ms lease expire mid-run, flaking
+    // the assertion. 300/50 preserves cadence << TTL with load headroom.
     const ownership = new MissionOwnership(store, {
       ownerId: "scheduler-owner",
-      leaseMs: 30,
-      heartbeatMs: 5,
+      leaseMs: 300,
+      heartbeatMs: 50,
     });
     let identity = await ownership.acquire(mission.mission_id);
     const task = store.createTask({
