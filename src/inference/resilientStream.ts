@@ -885,4 +885,39 @@ export function installResilientRuntime<M, C, O>(
   return "installed";
 }
 
+/**
+ * Unified classification for the INTERACTIVE gateway pump (spec §21/§26,
+ * closes FINDING-XXHroG): the same classifier, retry ladder, penalties,
+ * breakers and telemetry the worker path uses — handed to the pump through
+ * its existing `classifyAttempt` seam (buildClassifyAttempt on
+ * InstallDeps), not a second keyword table.
+ *
+ * One flow per (call, model): the flow is per-model, and the interactive
+ * pump cannot re-resolve the model mid-turn, so fallback is FORCED OFF —
+ * a fallback step would move the flow's model without the request following
+ * it. The wait/fail/capacity decisions, server-timing priority and the
+ * breaker/penalty side effects still apply, which is exactly the unified
+ * verdict the interactive path needs.
+ */
+export function createInteractiveClassifyAttempt(
+  model: ModelRef,
+  deps: Omit<ResilientStreamOptions, "role" | "refOf"> = {},
+): (observed: AttemptObservation<RetryableResult>) => Promise<GatewayWaitSignal | undefined> {
+  const flow = new ResilientAttemptFlow(
+    {
+      ...deps,
+      role: "worker",
+      refOf: () => model,
+      interactive: true,
+      config: {
+        modelFallbackForWorkers: false,
+        modelFallbackInteractive: false,
+        ...deps.config,
+      },
+    },
+    model,
+  );
+  return (observed) => flow.decide(observed);
+}
+
 export type { RetryableEvent, RetryableResult };

@@ -131,6 +131,38 @@ test("install: threads finite attempt and elapsed budgets into the interactive p
   assert.equal(settled.errorMessage, SATURATED);
 });
 
+test("install: per-call unified classifyAttempt is threaded into the pump", async () => {
+  resetGatewayStreamRetry();
+  const fail = { type: "error", error: { stopReason: "error", errorMessage: SATURATED } } as Ev;
+  const h = makeHost(Array.from({ length: 10 }, () => [fail]));
+  const stream = fakeStream();
+  let calls = 0;
+  const models: unknown[] = [];
+  installGatewayStreamRetry(
+    h.host,
+    { provider: "acme", api: "a" },
+    deps(stream, {
+      now: () => 0,
+      buildClassifyAttempt: (model: unknown) => {
+        models.push(model);
+        return (observed: { attempt: number }) => {
+          calls += 1;
+          void observed;
+          // The unified verdict wins over the text-derived wait: non-
+          // retryable settles the turn without a retry.
+          return { retryAfterMs: 1, retryable: false, source: "default" as const, reason: "unified verdict" };
+        };
+      },
+    }),
+  );
+  const handler = h.registered[0]?.config.streamSimple as (m: unknown, c: unknown) => unknown;
+  handler({ provider: "acme", id: "m1" }, {});
+  await stream.settled;
+  assert.equal(calls, 1, "classifier asked for the failed attempt");
+  assert.equal(h.baseCalls, 1, "non-retryable unified verdict: the turn settles, no retry");
+  assert.deepEqual(models, [{ provider: "acme", id: "m1" }], "built per call with the call's model");
+});
+
 test("install: registers the api and a streamSimple handler", () => {
   resetGatewayStreamRetry();
   const h = makeHost([[{ type: "done", message: { stopReason: "stop" } }]]);

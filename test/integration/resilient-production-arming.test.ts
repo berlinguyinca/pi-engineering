@@ -32,6 +32,7 @@ import { resilientServices } from "../../src/inference/resilientInstall.ts";
 import {
   ResilientAttemptFlow,
   type ResilientStreamInstallOptions,
+  createInteractiveClassifyAttempt,
   createResilientStreamSimple,
   installResilientRuntime,
 } from "../../src/inference/resilientStream.ts";
@@ -323,7 +324,78 @@ describe("circuit-breaker gating of fallback selection (spec §13, FINDING-e63OX
   });
 });
 
-// ─── 3. MissionCapacityScheduler (the production scheduler) ─────────────────
+// ─── 3. Interactive path: unified classification via the pump seam ──────
+
+describe("interactive classifyAttempt (spec §21/§26, FINDING-XXHroG)", () => {
+  it("unified verdicts with fallback forced off, even when a registry exists", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "pi-eng-interactive-"));
+    const provider = "inttest";
+    const x: ModelRef = { provider, id: "model-x" };
+    const y: ModelRef = { provider, id: "model-y" };
+    const registry = await makeRegistry(cwd, [rec(x), rec(y)]);
+    const telemetry = new InferenceTelemetry();
+    const events: InferenceTelemetryEvent[] = [];
+    telemetry.on((e) => events.push(e));
+    const t = 1_000_000;
+    const health = new ModelHealthRegistry({ now: () => t });
+    const breakers = new CircuitBreakerRegistry({
+      now: () => t,
+      failureThreshold: 3,
+      windowMs: 60_000,
+      cooldownMs: 60_000,
+    });
+    const classify = createInteractiveClassifyAttempt(x, {
+      env: {},
+      now: () => t,
+      health,
+      breakers,
+      registry,
+      telemetry,
+    });
+    const state = { finished: false, outputCommitted: false };
+    try {
+      // 429: unified rate_limited → a retryable wait (server timing first).
+      const rate = await classify({ attempt: 1, text: "Too Many Requests", status: 429, streamState: state });
+      assert.equal(rate?.retryable, true, "429 is retryable");
+
+      // 404 model_not_found with a registry that DOES contain a comparable
+      // model: the interactive pump cannot switch models mid-turn, so the
+      // unified verdict is refresh-and-fail — retryable false, and NO
+      // fallback selection is ever emitted.
+      const gone = await classify({
+        attempt: 2,
+        text: "model_not_found: inttest/model-x",
+        status: 404,
+        streamState: state,
+      });
+      assert.equal(gone?.retryable, false, "model_not_found without fallback fails fast with the model named");
+      assert.equal(
+        events.filter((e) => e.name === "inference.fallback.selected").length,
+        0,
+        "no model switch mid-turn",
+      );
+
+      // Server timing takes precedence over the local backoff DEFAULTS: the
+      // wait is never shorter than the server's ask (the ladder may only
+      // extend it — server_plus_ladder), and the signal keeps the "body"
+      // source so the pump's escalation leaves the number alone.
+      const hinted = await classify({
+        attempt: 3,
+        text: "Too Many Requests",
+        status: 429,
+        headers: { "retry-after-ms": "30000" },
+        streamState: state,
+      });
+      assert.equal(hinted?.retryable, true);
+      assert.ok((hinted?.retryAfterMs ?? 0) >= 30_000, `server ask is a floor (got ${hinted?.retryAfterMs})`);
+      assert.equal(hinted?.source, "body", "server timing marked so escalation leaves it alone");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+// ─── 4. MissionCapacityScheduler (the production scheduler) ─────────────────
 
 describe("MissionCapacityScheduler (production WAITING_FOR_INFERENCE_CAPACITY)", () => {
   it("capacity query: penalized models and OPEN breakers are excluded", async () => {
@@ -388,7 +460,7 @@ describe("MissionCapacityScheduler (production WAITING_FOR_INFERENCE_CAPACITY)",
   });
 });
 
-// ─── 4. Durable WAITING_FOR_CAPACITY mission state ──────────────────────────
+// ─── 5. Durable WAITING_FOR_CAPACITY mission state ──────────────────────────
 
 function createMission(store: MissionStore, missionId: string, repository = "/tmp/repo") {
   return store.createMission({
