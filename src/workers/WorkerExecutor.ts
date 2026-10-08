@@ -9,6 +9,13 @@ export interface WorkerActivity {
   phase?: "started" | "completed" | "failed" | "canceled";
   stage?: "agent" | "process" | "review" | "integration" | "validation" | "research";
   toolName?: string;
+  /**
+   * For a bash tool event: the build tool the command invokes, as a fixed
+   * label (src/workers/buildActivity.ts BUILD_TOOLS). Never any part of the
+   * command. On the completed/failed event, `elapsedMs` is the command's
+   * wall-clock time.
+   */
+  buildTool?: import("./buildActivity.ts").BuildTool;
   meaningfulProgress: boolean;
   elapsedMs?: number;
   lastActivityMs?: number;

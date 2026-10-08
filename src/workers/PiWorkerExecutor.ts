@@ -72,6 +72,7 @@ import { type ThinkingOffConfig, resolveThinkingOffConfig } from "../request/thi
 import { emitTelemetry } from "../telemetry/sink.ts";
 import type { WorkerExecutor, WorkerRequest, WorkerRun } from "./WorkerExecutor.ts";
 import { activityFromSessionEvent, emitWorkerActivity } from "./activity.ts";
+import { BuildCommandTimer } from "./buildActivity.ts";
 import { checkpointProgressTool } from "./checkpointProgressTool.ts";
 import { registerLocalProviders } from "./localProviders.ts";
 import { WORKER_KICKOFF, buildSystemPrompt, wantsCommitDiscipline } from "./prompts.ts";
@@ -860,8 +861,11 @@ ${recovery.recoveryPrompt}`;
       }
     };
 
+    // Times build commands: their end event carries the build-tool label and
+    // wall-clock time (budget-exhaustion evidence).
+    const buildTimer = new BuildCommandTimer();
     const unsubscribe = session.subscribe((event) => {
-      const activity = activityFromSessionEvent(event);
+      const activity = buildTimer.observe(event, activityFromSessionEvent(event));
       const activityToolName = "toolName" in event ? event.toolName : undefined;
       if (activity && activityToolName !== terminatingName && activityToolName !== checkpointProgressTool.name) {
         emitWorkerActivity(req, activity);

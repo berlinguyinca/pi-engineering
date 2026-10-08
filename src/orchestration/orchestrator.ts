@@ -22,6 +22,7 @@ import type { EventStoreBackend } from "../platform/eventstore/backend.ts";
 import type { GatewayResilienceConfig } from "../resilience/config.ts";
 import type { RecoveryProbe } from "../resilience/probe.ts";
 import type { WorkerActivity } from "../workers/WorkerExecutor.ts";
+import { budgetExhaustedBuildHint } from "../workers/buildActivity.ts";
 import { type BrokerBackends, ExecutionBroker } from "./broker.ts";
 import { CheckpointManager } from "./checkpoints.ts";
 import { CompletionGate } from "./completionGate.ts";
@@ -186,6 +187,9 @@ export interface OrchestrateResult {
 
 type FinalizationResult = Omit<OrchestrateResult, "intent" | "paused">;
 
+/** Executions whose build activity is remembered for the budget-exhausted hint. */
+const MAX_TRACKED_BUILD_EXECUTIONS = 256;
+
 export class Orchestrator {
   readonly store: MissionStore;
   readonly broker: ExecutionBroker;
@@ -202,6 +206,13 @@ export class Orchestrator {
   /** Per-mission progress hooks; missions may overlap on one orchestrator. */
   private readonly progress = new Map<string, (line: string) => void>();
   private readonly observedExecutions = new Set<string>();
+  /**
+   * Build commands each execution's worker ran (fixed tool labels and their
+   * wall-clock time, from its activity events), so a budget-exhausted worker
+   * can say how much of its time went to building. In memory and bounded:
+   * after a restart the hint is simply absent.
+   */
+  private readonly buildActivity = new Map<string, { counts: Map<string, number>; buildMs: number; running: number }>();
   private readonly taskExecutions = new Map<string, string>();
   private readonly workspaceResolver?: WorkspaceManifestResolver;
   private readonly repositoryRegistry?: RepositoryRegistry;
@@ -1076,6 +1087,7 @@ export class Orchestrator {
       });
       if (event.kind === "tool")
         obs?.noteWorkerTool(event.missionId, event.executionId, `${event.toolName}:${event.phase}`);
+      if (event.kind === "tool" && event.buildTool) this.noteBuildCommand(event);
       if ((event.kind === "state" || event.kind === "execution") && event.phase === "completed") {
         obs?.workerCompleted(event.missionId, event.executionId);
         if (event.kind === "execution") {
@@ -1094,6 +1106,27 @@ export class Orchestrator {
       }
     }
     this.report(event.missionId, `[mission ${event.missionId}] ${event.summary}`);
+  }
+
+  private noteBuildCommand(event: WorkerActivity & { executionId: string }): void {
+    let entry = this.buildActivity.get(event.executionId);
+    if (!entry) {
+      if (event.phase !== "started") return;
+      if (this.buildActivity.size >= MAX_TRACKED_BUILD_EXECUTIONS) {
+        const oldest = this.buildActivity.keys().next().value;
+        if (oldest !== undefined) this.buildActivity.delete(oldest);
+      }
+      entry = { counts: new Map(), buildMs: 0, running: 0 };
+      this.buildActivity.set(event.executionId, entry);
+    }
+    if (event.phase === "started") {
+      const tool = event.buildTool!;
+      entry.counts.set(tool, (entry.counts.get(tool) ?? 0) + 1);
+      entry.running++;
+    } else {
+      entry.running = Math.max(0, entry.running - 1);
+      entry.buildMs += event.elapsedMs ?? 0;
+    }
   }
 
   private activityType(event: WorkerActivity): ActivityType {
@@ -1698,7 +1731,48 @@ export class Orchestrator {
             execution?.exit_status === "timeout" && (checkpoint?.remainingDeliverables.length ?? 0) > 0,
         );
       if (timedCheckpoint) {
+        // The classified summary stays fixed: it is part of the failure
+        // fingerprint recovery deduplicates on. The explanation goes to the
+        // reported reason and a finding.
         const summary = "task execution budget exhausted after a durable partial checkpoint";
+        const execution = timedCheckpoint.execution!;
+        const builds = this.buildActivity.get(execution.execution_id);
+        const startedAt = execution.started_at ? Date.parse(execution.started_at) : Number.NaN;
+        const endedAt = execution.ended_at ? Date.parse(execution.ended_at) : this.scheduler.now();
+        const hint = budgetExhaustedBuildHint({
+          buildCommands: builds?.counts,
+          buildMs: builds?.buildMs ?? 0,
+          buildsRunning: builds?.running ?? 0,
+          elapsedMs: Number.isFinite(startedAt) && endedAt > startedAt ? endedAt - startedAt : undefined,
+          committedChanges: timedCheckpoint.checkpoint!.committedChanges,
+          isolatedWorktree: !!(timedCheckpoint.checkpoint!.worktree ?? execution.worktree),
+        });
+        if (
+          hint &&
+          !this.store
+            .listFindings(mission.mission_id)
+            .some((f) => f.category === "execution_budget" && f.task_id === timedCheckpoint.task.task_id)
+        ) {
+          this.store.addFinding({
+            mission_id: mission.mission_id,
+            task_id: timedCheckpoint.task.task_id,
+            severity: "major",
+            category: "execution_budget",
+            file: null,
+            line: null,
+            summary: hint,
+            evidence: JSON.stringify({
+              executionId: execution.execution_id,
+              checkpointId: timedCheckpoint.checkpoint!.checkpointId,
+              buildCommands: Object.fromEntries(builds?.counts ?? []),
+              buildMs: builds?.buildMs ?? 0,
+              buildsRunning: builds?.running ?? 0,
+              committedChanges: timedCheckpoint.checkpoint!.committedChanges.length,
+            }),
+            recommended_action:
+              "Repair the mission (the remaining deliverables become a recovery task), split the task, or give it a larger execution_budget_ms.",
+          });
+        }
         const classification = this.failureClassifier.classify({
           missionId: mission.mission_id,
           taskId: timedCheckpoint.task.task_id,
@@ -1716,7 +1790,7 @@ export class Orchestrator {
           intent,
           verdict: this.gate.evaluate(blocked),
           completed: false,
-          failureReason: summary,
+          failureReason: hint ? `${summary}: ${hint}` : summary,
         };
       }
 

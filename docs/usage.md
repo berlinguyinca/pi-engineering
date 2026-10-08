@@ -46,6 +46,33 @@ The pipeline routes intent, creates a durable **mission**, plans/executes
 workers, runs validation, launches a fresh independent reviewer, and enforces
 the deterministic completion gate — no `/engineer` or `/review` needed.
 
+### When a worker runs out of execution budget
+
+A mutating worker runs in a fresh isolated worktree. It may use up its execution
+budget (`execution_budget_ms`, 30 minutes by default) without committing. If
+its activity shows build commands (cargo, npm, gradle, ...), the mission's
+failure reason and a `major` `execution_budget` finding say how much of the run
+went to building. Two examples:
+
+- "probable cold build in an isolated worktree: the worker spent 20m 0s of the
+  30m 0s run in 12 build command(s) (cargo x12), 1 still running at the
+  deadline, and made no commit"
+- "... builds took the smaller part of the budget, so most of it went to other
+  work (model turns, other commands)"
+
+The runtime records only which build tool a command used and how long it ran,
+never the command itself. The "cold build" wording appears only when builds
+took most of the run.
+
+A fresh worktree has no `target/`. Do not point every worker at one shared
+`CARGO_TARGET_DIR`, for example by exporting it in the shell that starts pi.
+Cargo identifies a workspace crate by its path relative to the workspace root
+and decides freshness by mtime. Two worktrees sharing a target directory
+therefore share artifacts for the repository's own crates. A worktree whose
+sources are older than another worktree's last build reuses that build, so one
+worker's tests run against another worker's code. Node needs no setup: the
+repository's `node_modules` is symlinked into each worktree.
+
 ## Individual commands
 
 | Command        | Effect                                                        |
