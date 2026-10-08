@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -15,13 +15,29 @@ const execFileAsync = promisify(execFile);
 type Command = { handler: (args: string, ctx: unknown) => Promise<void> | void };
 type Handler = (event: unknown, ctx: unknown) => Promise<unknown> | unknown;
 
-function loadHarness(): { commands: Map<string, Command>; handlers: Map<string, Handler[]> } {
+type Tool = {
+  name: string;
+  execute: (
+    id: string,
+    params: Record<string, unknown>,
+    signal: AbortSignal | undefined,
+    onUpdate: undefined,
+    ctx: { cwd: string },
+  ) => Promise<{ content: Array<{ type: string; text: string }>; details: Record<string, unknown> }>;
+};
+
+function loadHarness(): {
+  commands: Map<string, Command>;
+  handlers: Map<string, Handler[]>;
+  tools: Map<string, Tool>;
+} {
   const commands = new Map<string, Command>();
   const handlers = new Map<string, Handler[]>();
+  const tools = new Map<string, Tool>();
   const pi = {
     on: (name: string, handler: Handler) => handlers.set(name, [...(handlers.get(name) ?? []), handler]),
     registerCommand: (name: string, options: Command) => commands.set(name, options),
-    registerTool: () => {},
+    registerTool: (tool: Tool) => tools.set(tool.name, tool),
     registerShortcut: () => {},
     registerFlag: () => {},
     getFlag: () => undefined,
@@ -32,7 +48,7 @@ function loadHarness(): { commands: Map<string, Command>; handlers: Map<string, 
     events: { on: () => {}, emit: () => {} },
   };
   (extension as unknown as (api: unknown) => void)(pi);
-  return { commands, handlers };
+  return { commands, handlers, tools };
 }
 
 function loadCommands(): Map<string, Command> {
@@ -434,4 +450,69 @@ test("persistent mission surfaces always pair a static percentage or zero worker
   assert.match(visible, /next provide new material evidence/i);
   assert.match(visible, /preserved candidate\/ref/i);
   assert.doesNotMatch(visible, /^Agent failed · workers 0 active$/);
+});
+
+test("an orchestrator that failed to initialize says why, in the mission tool and in /mission", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-eng-extension-init-failure-"));
+  try {
+    await execFileAsync("git", ["init", "-q"], { cwd: root });
+    await execFileAsync(
+      "git",
+      ["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-qm", "init"],
+      { cwd: root },
+    );
+    // The live failure: a `.pi-eng/artifacts` root recreated group-writable
+    // (by a `git stash -u` round-trip), which the ArtifactStore refuses.
+    const artifactsRoot = join(root, ".pi-eng", "artifacts");
+    await mkdir(artifactsRoot, { recursive: true });
+    await chmod(artifactsRoot, 0o775);
+
+    const { commands, tools, handlers } = loadHarness();
+    const missionTool = tools.get("mission");
+    assert.ok(missionTool);
+    const result = await missionTool.execute("call-1", { request: "Add a health endpoint" }, undefined, undefined, {
+      cwd: root,
+    });
+    assert.equal(
+      result.content[0]?.text,
+      "Orchestrator not initialized for this directory: ARTIFACT INTEGRITY: artifact root is writable by another user",
+    );
+    assert.deepEqual(result.details.diagnostics, [
+      {
+        code: "orchestrator_init_failed",
+        cwd: root,
+        message: "ARTIFACT INTEGRITY: artifact root is writable by another user",
+      },
+    ]);
+
+    const { ctx, notices } = commandContext(root);
+    await commands.get("mission")!.handler("Add a health endpoint", ctx);
+    assert.deepEqual(notices.at(-1), {
+      text: "Orchestrator not initialized for this directory: ARTIFACT INTEGRITY: artifact root is writable by another user",
+      level: "error",
+    });
+    await commands.get("mission")!.handler("cancel MSN-1", ctx);
+    assert.deepEqual(notices.at(-1), {
+      text: "Orchestrator not initialized for this directory: ARTIFACT INTEGRITY: artifact root is writable by another user",
+      level: "error",
+    });
+
+    // Once the cause is fixed the runtime opens and the tool reaches the orchestrator.
+    await chmod(artifactsRoot, 0o700);
+    const originalOrchestrate = Orchestrator.prototype.orchestrate;
+    Orchestrator.prototype.orchestrate = (async () => {
+      throw new Error("reached the orchestrator");
+    }) as typeof Orchestrator.prototype.orchestrate;
+    try {
+      await assert.rejects(
+        missionTool.execute("call-2", { request: "Add a health endpoint" }, undefined, undefined, { cwd: root }),
+        /reached the orchestrator/,
+      );
+    } finally {
+      Orchestrator.prototype.orchestrate = originalOrchestrate;
+    }
+    for (const handler of handlers.get("session_shutdown") ?? []) await handler({}, ctx);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });

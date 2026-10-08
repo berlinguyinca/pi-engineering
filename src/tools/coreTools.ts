@@ -59,6 +59,13 @@ function awaitingUser(store: Orchestrator["store"], mission: Mission): string | 
   return null;
 }
 
+/** What a tool reports when its runtime service is unavailable for the cwd, with the reason when known. */
+export function notInitializedText(subject: string, reason: string | null | undefined): string {
+  return reason
+    ? `${subject} not initialized for this directory: ${reason}`
+    : `${subject} not initialized for this directory.`;
+}
+
 export function buildCoreTools(
   resolve: (cwd: string) => CoreServices | null | Promise<CoreServices | null>,
   options: {
@@ -67,12 +74,8 @@ export function buildCoreTools(
   } = {},
 ): ToolDefinition[] {
   const servicesFor = (cwd: string): Promise<CoreServices | null> => Promise.resolve(resolve(cwd));
-  const notInitialized = (subject: string, cwd: string): string => {
-    const reason = options.unavailableReason?.(cwd);
-    return reason
-      ? `${subject} not initialized for this directory: ${reason}`
-      : `${subject} not initialized for this directory.`;
-  };
+  const notInitialized = (subject: string, cwd: string): string =>
+    notInitializedText(subject, options.unavailableReason?.(cwd));
   const ledgerRead = defineTool({
     name: "ledger_read",
     label: "Ledger Read",
@@ -364,7 +367,13 @@ export function buildCoreTools(
         content: [{ type: "text" as const, text: body }],
         details,
       });
-      if (!services?.orchestrator) return text(notInitialized("Orchestrator", ctx.cwd));
+      if (!services?.orchestrator) {
+        const reason = options.unavailableReason?.(ctx.cwd);
+        return text(
+          notInitializedText("Orchestrator", reason),
+          reason ? { diagnostics: [{ code: "orchestrator_init_failed", cwd: ctx.cwd, message: reason }] } : {},
+        );
+      }
       const store = services.orchestrator.store as Orchestrator["store"] | undefined;
       const action = (params.action as string | undefined) ?? "run";
       const describe = (m: Mission, extra: string[] = []) =>
