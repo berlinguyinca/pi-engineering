@@ -14,10 +14,10 @@ test("envConfig: absent base URL returns null (backward compatible, nothing enab
 });
 
 test("envConfig: base URL enables an openviking connection with the token", () => {
-  const env = { [E.baseUrl]: "https://viking.metabolomics.us/", [E.token]: "abc123" };
+  const env = { [E.baseUrl]: "https://viking.example.com/", [E.token]: "abc123" };
   const cfg = resolveOpenVikingFromEnv(env);
   assert.ok(cfg);
-  assert.equal(cfg!.baseUrl, "https://viking.metabolomics.us/");
+  assert.equal(cfg!.baseUrl, "https://viking.example.com/");
   assert.equal(cfg!.token, "abc123");
   assert.equal(cfg!.providerTimeoutMs, 10_000);
 
@@ -25,14 +25,14 @@ test("envConfig: base URL enables an openviking connection with the token", () =
   assert.deepEqual(opt, {
     config: {
       enabled: true,
-      durable: { kind: "openviking", baseUrl: "https://viking.metabolomics.us/", token: "abc123" },
+      durable: { kind: "openviking", baseUrl: "https://viking.example.com/", token: "abc123" },
       providerTimeoutMs: 10_000,
     },
   });
 });
 
 test("envConfig: PI_OPENVIKING_ENABLED=0/false forces the connection off", () => {
-  const base = { [E.baseUrl]: "https://viking.metabolomics.us" };
+  const base = { [E.baseUrl]: "https://viking.example.com" };
   assert.equal(resolveOpenVikingFromEnv({ ...base, [E.enabled]: "0" }), null);
   assert.equal(resolveOpenVikingFromEnv({ ...base, [E.enabled]: "false" }), null);
   assert.ok(resolveOpenVikingFromEnv({ ...base, [E.enabled]: "1" }));

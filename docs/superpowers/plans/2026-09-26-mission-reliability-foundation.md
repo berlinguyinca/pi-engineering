@@ -319,7 +319,7 @@
 **Files:**
 
 - Review: all files changed since `origin/main`
-- Verify install target: `/home/wohlgemuth/.pi/agent/git/github.com/berlinguyinca/pi-engineering`
+- Verify install target: `/home/<user>/.pi/agent/git/github.com/berlinguyinca/pi-engineering`
 - Do not modify source solely to manufacture review evidence.
 
 **Interfaces consumed:** Git branch, GitHub CLI/remote workflow already used by the repository, installed Pi extension, local model inventory.
@@ -330,7 +330,7 @@
 - [ ] Fix all blocking/major findings with regression tests, then repeat the review against the new HEAD until blocking/major findings are zero.
 - [ ] Run the full verification matrix again and record exact command summaries plus final commit SHA.
 - [ ] Push `feat/mission-reliability-foundation`, open a PR with spec/test evidence and known Slice 2/3 exclusions, wait for required checks, and merge only after green review/checks.
-- [ ] Reinstall the merged extension into `/home/wohlgemuth/.pi/agent/git/github.com/berlinguyinca/pi-engineering` using the repository's supported install/update path; print that path in the handoff.
+- [ ] Reinstall the merged extension into `/home/<user>/.pi/agent/git/github.com/berlinguyinca/pi-engineering` using the repository's supported install/update path; print that path in the handoff.
 - [ ] Verify the installed code matches the merged SHA, run `omx doctor` only if the extension install surface depends on OMX health, and confirm Pi lists `local/local` while listing no metabolomics model.
 - [ ] Run the dogfood recovery scenario through installed Pi with `local/local`. Capture evidence that progress moves or explains why it waits, the same-model review warning appears, recovery resumes or stops explicitly, and no mission remains nonterminal with zero workers and no next action.
 - [ ] If the live check fails, diagnose and fix on a follow-up branch/PR rather than declaring completion; repeat review, merge, reinstall, and live verification.

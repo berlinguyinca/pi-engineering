@@ -8,7 +8,10 @@
 import type { WorkerResult } from "../src/core/types.ts";
 import { PiWorkerExecutor } from "../src/workers/PiWorkerExecutor.ts";
 
-const repo = "/home/wohlgemuth/IdeaProjects/pi-engineering-runtime";
+import { homedir } from "node:os";
+import { join } from "node:path";
+
+const repo = join(homedir(), "IdeaProjects", "pi-engineering-runtime");
 
 const FIXES = [
   "1. Fail-closed version drift: BlackholeManager.open must disable the manager and record a failure lifecycle event when an installed pi-blackhole version mismatches the pinned 0.5.4 (not silently run an unvalidated provider). Check src/blackhole/BlackholeManager.ts open().",

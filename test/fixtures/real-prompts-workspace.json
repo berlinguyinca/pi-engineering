@@ -156,7 +156,7 @@
   },
   {
     "source": "mission #154",
-    "prompt": "Workspace (existing directory): ${L}. Task: add a self-healing watchdog for the go-* SLURM service jobs on the Hive (UC Davis HPC) cluster. Create a new stateless one-shot watchdog shell script inside the scripts directory, named hive service watchdog, intended for a login1 cron entry every 5 minutes. It checks the same seven required services already enumerated in the existing SLURM verify-services script in that scripts directory (go-prioritize, go-run-orchestrator, go-run-compute-node, go-run-llm-node, go-assistant-worker, go-sync-server, go-up) and resubmits any missing one via that module's own job or schedule script (go-up must keep its SLURM array count).",
+    "prompt": "Workspace (existing directory): ${L}. Task: add a self-healing watchdog for the go-* SLURM service jobs on the HPC cluster. Create a new stateless one-shot watchdog shell script inside the scripts directory, named hpc service watchdog, intended for a login1 cron entry every 5 minutes. It checks the same seven required services already enumerated in the existing SLURM verify-services script in that scripts directory (go-prioritize, go-run-orchestrator, go-run-compute-node, go-run-llm-node, go-assistant-worker, go-sync-server, go-up) and resubmits any missing one via that module's own job or schedule script (go-up must keep its SLURM array count).",
     "expect": ["L"]
   },
   {

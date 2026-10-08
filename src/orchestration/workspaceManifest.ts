@@ -25,7 +25,7 @@ export interface ResolvedWorkspace {
 /**
  * Extract candidate repository names from the request: the tail of every
  * `x/y` reference (e.g. `inferweave/inferweave`,
- * `metabolomics-us/inferweave-gateway`) plus bare path-like tokens (e.g.
+ * `acme/widgets-gateway`) plus bare path-like tokens (e.g.
  * `inferweave-gateway`). URLs are excluded by refusing tokens preceded by a
  * path character. Extraction alone grants nothing: every candidate is still
  * filtered by the immediate-child-git-checkout check in

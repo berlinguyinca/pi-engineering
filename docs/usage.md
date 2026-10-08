@@ -379,8 +379,8 @@ docker compose up -d --build
 Because the service is stateless (all memory lives in the Postgres volume), you
 can later move it to AWS/Fly.io and keep the data. See
 `services/openviking/README.md`. The production deployment runs on the lab's
-whiteale server as an Apptainer container behind an nginx virtual host — see
-`docs/deployments/openviking-whiteale.md`.
+your-host server as an Apptainer container behind an nginx virtual host — see
+`docs/deployments/openviking-deployment.md`.
 
 ### Installing the connection anywhere pi is installed (no code edits)
 
@@ -390,7 +390,7 @@ these once (e.g. in `~/.bashrc`, a systemd unit, or a `.env` the pi process
 loads):
 
 ```sh
-export PI_OPENVIKING_BASE_URL=https://viking.metabolomics.us
+export PI_OPENVIKING_BASE_URL=https://viking.example.com
 # Bearer token for the service — either inline, or from a file (secret hygiene):
 export PI_OPENVIKING_TOKEN=<token>
 # or: export PI_OPENVIKING_TOKEN_FILE=/path/to/token.txt

@@ -8,7 +8,10 @@ import type { WorkerResult } from "../src/core/types.ts";
 import { EngineeringRuntime } from "../src/runtime/EngineeringRuntime.ts";
 import { PiWorkerExecutor } from "../src/workers/PiWorkerExecutor.ts";
 
-const repo = "/home/wohlgemuth/IdeaProjects/pi-engineering-runtime";
+import { homedir } from "node:os";
+import { join } from "node:path";
+
+const repo = join(homedir(), "IdeaProjects", "pi-engineering-runtime");
 
 const REQUIREMENTS = [
   "Standalone Pi extension: MUST work with a normal Pi install in an ordinary git repo.",

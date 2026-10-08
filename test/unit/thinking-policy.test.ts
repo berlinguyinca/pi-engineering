@@ -33,7 +33,7 @@ const METABOLOMICS = {
   id: "qwen3.8-27b-modality-vision-quant-q8_k_xl",
   provider: "metabolomics",
   api: "openai-completions",
-  baseUrl: "https://llm.metabolomics.us/v1",
+  baseUrl: "https://llm.example.com/v1",
   contextWindow: 262_144,
   maxTokens: 32_768,
 };
@@ -69,7 +69,7 @@ test("config: summaries and low-budget turns default on; env can turn each off",
   assert.equal(config.summaries, true);
   assert.equal(config.lowOutputBudget, true);
   assert.equal(config.lowOutputBudgetTokens, 16_384);
-  assert.ok(config.gatewayHosts.includes("llm.metabolomics.us"));
+  assert.ok(config.gatewayHosts.includes("llm.example.com"));
   assert.ok(config.providers.includes("metabolomics"));
 
   const off = resolveThinkingOffConfig({

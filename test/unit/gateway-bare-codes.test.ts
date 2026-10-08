@@ -1,7 +1,7 @@
 /**
  * A pre-dispatch InferWeave refusal flattened to its bare code.
  *
- * The hive gateway sends refusals whose `message` is the stable code itself
+ * The gateway sends refusals whose `message` is the stable code itself
  * (server.rs: `_ => error.code().into()`). Relayed over a link after the head
  * grace, the refusal becomes an SSE error after a 200, and the OpenAI SDK
  * flattens it to that message — so pi-ai's errorMessage is just

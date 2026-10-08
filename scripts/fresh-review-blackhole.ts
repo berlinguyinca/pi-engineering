@@ -9,7 +9,10 @@
 import type { WorkerResult } from "../src/core/types.ts";
 import { PiWorkerExecutor } from "../src/workers/PiWorkerExecutor.ts";
 
-const repo = "/home/wohlgemuth/IdeaProjects/pi-engineering-runtime";
+import { homedir } from "node:os";
+import { join } from "node:path";
+
+const repo = join(homedir(), "IdeaProjects", "pi-engineering-runtime");
 
 const SCOPE = [
   "src/blackhole/config.ts (pinned version 0.5.4, allowlist, backward-compatible disabled default)",

@@ -1,7 +1,7 @@
 /**
  * Reconciling configured models with what a gateway actually serves.
  *
- * The fixtures are real. Measured against `https://llm.metabolomics.us/v1`, a
+ * The fixtures are real. Measured against `https://llm.example.com/v1`, a
  * working `models.json` had `deepseek-v4-flash` configured at 1,048,576 tokens
  * against a real limit of 262,144, `qwen3.8-27b-q4-250k` at 131,072 against
  * 250,112, and no entry at all for `qwen3.8-27b-vision`.
@@ -232,7 +232,7 @@ test("catalog: a fetch sends the key and reads the gateway's list", async () => 
   let seenUrl = "";
   let seenAuth = "";
   const models = await fetchGatewayModels({
-    baseUrl: "https://llm.metabolomics.us/v1/",
+    baseUrl: "https://llm.example.com/v1/",
     apiKey: "secret-key",
     fetchImpl: (async (url: string, init: RequestInit) => {
       seenUrl = String(url);
@@ -241,7 +241,7 @@ test("catalog: a fetch sends the key and reads the gateway's list", async () => 
     }) as unknown as typeof fetch,
   });
 
-  assert.equal(seenUrl, "https://llm.metabolomics.us/v1/models", "a trailing slash must not double up");
+  assert.equal(seenUrl, "https://llm.example.com/v1/models", "a trailing slash must not double up");
   assert.equal(seenAuth, "Bearer secret-key");
   assert.equal(models.length, 5);
 });
@@ -249,7 +249,7 @@ test("catalog: a fetch sends the key and reads the gateway's list", async () => 
 test("catalog: a null Authorization header suppresses the default bearer credential", async () => {
   let seenHeaders: Record<string, string> = {};
   await fetchGatewayModels({
-    baseUrl: "https://llm.metabolomics.us/v1",
+    baseUrl: "https://llm.example.com/v1",
     apiKey: "must-not-leak",
     headers: { Authorization: null },
     fetchImpl: (async (_url: string, init: RequestInit) => {

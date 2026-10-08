@@ -36,7 +36,7 @@ function model(provider: string, baseUrl: string) {
     maxTokens: 32_768,
   };
 }
-const METABOLOMICS = model("metabolomics", "https://llm.metabolomics.us/v1");
+const METABOLOMICS = model("metabolomics", "https://llm.example.com/v1");
 const ELSEWHERE = model("elsewhere", "https://api.example.invalid/v1");
 
 /** A native provider backed by pi-ai's real openai-completions transport. */

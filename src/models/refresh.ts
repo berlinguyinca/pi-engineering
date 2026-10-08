@@ -164,7 +164,7 @@ function supportsThinkingOff(providerId: string, api: string, baseUrl: string): 
     (value === undefined ? fallback : value.split(",")).map((entry) => entry.trim().toLowerCase()).filter(Boolean);
   const providers = configuredList(process.env.PI_THINKING_OFF_PROVIDERS, ["metabolomics"]);
   if (providers.includes(providerId.toLowerCase())) return true;
-  const hosts = configuredList(process.env.PI_THINKING_OFF_GATEWAYS, ["llm.metabolomics.us"]);
+  const hosts = configuredList(process.env.PI_THINKING_OFF_GATEWAYS, ["llm.example.com"]);
   try {
     return hosts.includes(new URL(baseUrl).host.toLowerCase());
   } catch {

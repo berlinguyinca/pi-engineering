@@ -1,22 +1,22 @@
 #!/usr/bin/env bash
-# Deploy OpenViking to whiteale.fiehnlab.ucdavis.edu as an Apptainer container
+# Deploy OpenViking to your-host.example.com as an Apptainer container
 # fronted by an nginx virtual host, with the durable store on the host's
 # PostgreSQL and all credentials in a data-volume secrets folder.
 #
-#   Route 53 (viking.metabolomics.us) -> whiteale (128.120.143.172)
-#     whiteale nginx vhost viking.metabolomics.us -> 127.0.0.1:8090
+#   Route 53 (viking.example.com) -> your-host (<HOST_IP>)
+#     your-host nginx vhost viking.example.com -> 127.0.0.1:8090
 #        Apptainer container: OpenViking (node) over localhost Postgres
 #        data volume: /opt/viking/data/{secrets,postgres}
 #
-# Idempotent. Requires: ssh access to whiteale as $REMOTE_USER, passwordless sudo.
+# Idempotent. Requires: ssh access to your-host as $REMOTE_USER, passwordless sudo.
 #
-# Usage: ./deploy/apptainer/deploy-whiteale.sh
+# Usage: ./deploy/apptainer/deploy-host.sh
 set -euo pipefail
 
-REMOTE_HOST="${REMOTE_HOST:-whiteale.fiehnlab.ucdavis.edu}"
-REMOTE_USER="${REMOTE_USER:-wohlgemuth}"
+REMOTE_HOST="${REMOTE_HOST:-your-host.example.com}"
+REMOTE_USER="${REMOTE_USER:-deploy}"
 KEY="${KEY:-$HOME/.ssh/id_rsa}"
-DOMAIN="${DOMAIN:-viking.metabolomics.us}"
+DOMAIN="${DOMAIN:-viking.example.com}"
 APP_PORT="${APP_PORT:-8090}"
 DATA=/opt/viking/data
 SECRETS="$DATA/secrets/.env"
@@ -29,7 +29,7 @@ R() { ssh -i "$KEY" -o BatchMode=yes -o ConnectTimeout=10 "$REMOTE_USER@$REMOTE_
 say() { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
 
 # ---- 1. push the service source up (private repo; scp the files) ----------
-say "push OpenViking service source to whiteale"
+say "push OpenViking service source to your-host"
 R "sudo mkdir -p $BUILD_DIR && sudo chown $REMOTE_USER $BUILD_DIR"
 scp -q -i "$KEY" -r "$REPO_ROOT/services/openviking/src" \
     "$REPO_ROOT/services/openviking/package.json" \
@@ -138,8 +138,8 @@ say "configure nginx vhost $DOMAIN -> 127.0.0.1:$APP_PORT"
 # Build the config locally (quoted heredoc preserves nginx \$variables), substitute
 # the two values, then scp it up and install. Avoids shell-expansion pitfalls.
 cat > /tmp/viking.conf <<'NGINX'
-# /etc/nginx/conf.d/viking.conf  on whiteale (128.120.143.172)
-# viking.metabolomics.us -> OpenViking Apptainer container on 127.0.0.1:__APP_PORT__.
+# /etc/nginx/conf.d/viking.conf  on your-host (<HOST_IP>)
+# viking.example.com -> OpenViking Apptainer container on 127.0.0.1:__APP_PORT__.
 # Mirrors mcp.conf: ACME on :80, TLS on :443, proxy to the local service.
 
 upstream viking_backend {
@@ -222,9 +222,9 @@ sleep 3
 R "sudo systemctl restart openviking.service && sleep 2 && sudo systemctl is-active openviking.service"
 R "sudo journalctl -u openviking --no-pager -n 20 | tail -12"
 
-say "=== local verification on whiteale ==="
+say "=== local verification on your-host ==="
 R "curl -s -o /dev/null -w '127.0.0.1:$APP_PORT/health -> HTTP %{http_code}\n' http://127.0.0.1:$APP_PORT/health"
 R "curl -s http://127.0.0.1:$APP_PORT/metrics | grep -E 'openviking_up' || true"
 
-say "done. Next: point Route 53 $DOMAIN -> 128.120.143.172"
+say "done. Next: point Route 53 $DOMAIN -> <HOST_IP>"
 echo "  then test: curl https://$DOMAIN/health"

@@ -15,7 +15,7 @@ in-memory for dev/tests).
 | GET    | `/health`             | —                                     | `{ status: "ok" }`             |
 | GET    | `/metrics`            | — (Prometheus text format)            | `openviking_up`, `openviking_memory_records`, `openviking_requests_total` |
 
-`/metrics` is unauthenticated so external monitors (e.g. `status.metabolomics.us`)
+`/metrics` is unauthenticated so external monitors (e.g. `status.example.com`)
 can scrape it. `openviking_up{kind,version,auth}` is 1 when serving,
 `openviking_memory_records` is the number of promoted records, and
 `openviking_requests_total{method,route,status}` counts traffic by route/status.
@@ -56,15 +56,15 @@ blackhole: {
 }
 ```
 
-## Production deployment (whiteale, Apptainer)
+## Production deployment (your-host, Apptainer)
 
-Live at `https://viking.metabolomics.us` (Route 53 → whiteale `128.120.143.172`
+Live at `https://viking.example.com` (Route 53 → your-host `<HOST_IP>`
 → nginx vhost → Apptainer container → host Postgres). See
-`docs/deployments/openviking-whiteale.md` for the architecture, data-volume
+`docs/deployments/openviking-deployment.md` for the architecture, data-volume
 layout (`/opt/viking/data/secrets/.env` holds every credential), how to access
-whiteale, and how `status.metabolomics.us` can monitor it via `/health` +
+your-host, and how `status.example.com` can monitor it via `/health` +
 `/metrics`. Deploy IaC is in `deploy/apptainer/` (`openviking.def` +
-`deploy-whiteale.sh`).
+`deploy-host.sh`).
 
 ## Security notes (tier-1)
 

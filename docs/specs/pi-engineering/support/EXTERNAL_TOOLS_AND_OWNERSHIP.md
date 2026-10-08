@@ -26,7 +26,7 @@ Never silently recreate it in `pi-engineering`.
 | Pi Web | EXTERNAL / UPSTREAM TOOL | Pi Web project/package | configure, launch/connect, extension/plugin/integration if supported, deep links/API adapter | **Pi Web itself, a new Pi Web frontend/backend, a replacement web IDE** |
 | Pi Forge | **OUT OF SCOPE** | none | nothing | do not inspect, install, integrate, configure, vendor, fork, or implement |
 | Plannotator | EXTERNAL / UPSTREAM TOOL | Plannotator project/package | configuration, Docker deployment reference, API adapter, approval-policy integration | implement a replacement plan annotation UI/service |
-| OpenViking | EXTERNAL SERVICE | `viking.metabolomics.us` / OpenViking | client integration, project/session mapping, retrieval/promotion policy, offline outbox | OpenViking server, vector DB, custom shared-memory server |
+| OpenViking | EXTERNAL SERVICE | `viking.example.com` / OpenViking | client integration, project/session mapping, retrieval/promotion policy, offline outbox | OpenViking server, vector DB, custom shared-memory server |
 | Blackhole / pi-blackhole | EXTERNAL / UPSTREAM PACKAGE | pi-blackhole package | pin/configure/integrate/benchmark, promotion bridge | fork/reimplement Blackhole; shared Blackhole server/filesystem |
 | InferWeave | EXTERNAL SYSTEM / PROVIDER | InferWeave repositories/services | provider adapter, capability discovery, session metadata, backpressure handling | GPU scheduler, model placement engine, InferWeave gateway/node runtime |
 | AutoSpec | EXTERNAL SIBLING PROJECT | AutoSpec repository | adapter/integration contracts where local harness must call it | copy AutoSpec into pi-engineering; duplicate its spec/work-item engine |

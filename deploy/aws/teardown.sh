@@ -5,11 +5,11 @@
 # volume (/opt/viking/data) — download it BEFORE tearing down if you want it.
 set -euo pipefail
 REGION="${REGION:-us-west-2}"
-HOSTED_ZONE_ID="${HOSTED_ZONE_ID:-Z2ANBWTR462YC8}"
-DOMAIN="${DOMAIN:-viking.metabolomics.us}"
+HOSTED_ZONE_ID="${HOSTED_ZONE_ID:-ZEXAMPLEHOSTEDZONE}"
+DOMAIN="${DOMAIN:-viking.example.com}"
 ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
 NAME="viking-openviking"
-BUCKET="${BUCKET:-viking-metabolomics-us-$ACCOUNT}"
+BUCKET="${BUCKET:-viking-example-com-$ACCOUNT}"
 
 say(){ printf '\n==> %s\n' "$*"; }
 

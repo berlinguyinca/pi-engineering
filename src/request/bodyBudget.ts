@@ -1,7 +1,7 @@
 /**
  * Request-body budget for the live provider path.
  *
- * The InferWeave gateway on Fry caps a request body at 10 MiB
+ * The InferWeave gateway caps a request body at 10 MiB
  * (inferweave-gateway `maxInferenceBody = 10 << 20`); nginx in front allows
  * more, so the gateway's cap is the one that bites, as a permanent
  * "413 http: request body too large". A vision session with four full-size

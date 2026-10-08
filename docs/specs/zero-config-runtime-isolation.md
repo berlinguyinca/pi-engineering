@@ -7,8 +7,8 @@
 Example:
 
 ```text
-Warning: Engineering runtime did not open for /home/wohlgemuth/IdeaProjects:
-JSONL writer lock for /home/wohlgemuth/IdeaProjects/.pi-eng/orchestration.jsonl is held
+Warning: Engineering runtime did not open for /home/<user>/IdeaProjects:
+JSONL writer lock for /home/<user>/IdeaProjects/.pi-eng/orchestration.jsonl is held
 (owner metadata is missing or unreadable)
 
 Set PI_ENGINEERING_ORCHESTRATION_DIR to a per-worktree directory
@@ -167,13 +167,13 @@ Pi Engineering must support this directly.
 Starting Pi in:
 
 ```text
-/home/wohlgemuth/IdeaProjects
+/home/<user>/IdeaProjects
 ```
 
 must NOT cause all projects underneath it to share:
 
 ```text
-/home/wohlgemuth/IdeaProjects/.pi-eng/orchestration.jsonl
+/home/<user>/IdeaProjects/.pi-eng/orchestration.jsonl
 ```
 
 Instead, Pi Engineering should initially create a session runtime and bind it to a repository/worktree once the active project becomes known.
@@ -831,7 +831,7 @@ Suggested information:
 
 ```text
 Repository: inferweave
-Worktree: /home/wohlgemuth/IdeaProjects/inferweave
+Worktree: /home/<user>/IdeaProjects/inferweave
 Worktree ID: f8a17…
 Session: 31d92…
 Runtime: healthy
@@ -1497,7 +1497,7 @@ This immediately eliminates the current warning/failure mode.
 A user should be able to open arbitrary numbers of Pi sessions from:
 
 ```text
-/home/wohlgemuth/IdeaProjects
+/home/<user>/IdeaProjects
 ```
 
 operate on different repositories and worktrees, occasionally use multiple sessions against the same worktree, kill Pi unexpectedly, reload Pi Engineering, and restart the machine without ever thinking about:

@@ -30,7 +30,7 @@ Cognito, worker prompt or server schema changes are part of this feature.
 ## Live use
 
 Using the operator's already-configured key against
-`https://viking.metabolomics.us`, `/remember` saved a uniquely identified
+`https://viking.example.com`, `/remember` saved a uniquely identified
 temporary note. A fresh interactive-memory controller retrieved it through
 `before_agent_start` and inserted it through `context` before the current user
 request. No automatic transcript write was emitted. The confirmed existing-key

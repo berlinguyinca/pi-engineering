@@ -23,8 +23,8 @@
 routing:
   mode: auto
   roles:
-    # NOTE (rev 3, 2026-10-04): rev 2 pinned text roles to local `beast`
-    # (llama.cpp) and `bender` (ollama), written when the remote metabolomics
+    # NOTE (rev 3, 2026-10-04): rev 2 pinned text roles to local `gpu-host-1`
+    # (llama.cpp) and `gpu-host-2` (ollama), written when the remote metabolomics
     # gateway served only vision models. In a default fresh process those local
     # providers are NOT reachable, so planner/implementer/reviewer degraded to
     # the auto-scored `deepseek_v4-flash-…-mxfp4`, which loops on substantial

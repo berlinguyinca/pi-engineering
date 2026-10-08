@@ -1,8 +1,11 @@
 #!/usr/bin/env node
+import { homedir } from "node:os";
+import { join } from "node:path";
 /** Fresh-context review of the OpenViking auth-diagnostic change. */
 import type { WorkerResult } from "../src/core/types.ts";
 import { PiWorkerExecutor } from "../src/workers/PiWorkerExecutor.ts";
-const repo = "/home/wohlgemuth/IdeaProjects/pi-engineering-runtime";
+
+const repo = join(homedir(), "IdeaProjects", "pi-engineering-runtime");
 const task = `Independently review the OpenViking auth-diagnostic change in pi-engineering-runtime. Read the actual code.
 Review:
 - src/blackhole/durable.ts (warnAuthOnce: warns once per baseUrl+status on non-OK recall/search; recall/search still return [] fail-closed)

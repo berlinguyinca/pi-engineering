@@ -1,14 +1,17 @@
 #!/usr/bin/env node
 /**
  * Independent fresh-context review of the OpenViking "install anywhere" env
- * config + the whiteale Apptainer deployment.
+ * config + the host Apptainer deployment.
  *
  *   node scripts/fresh-review-openviking-env-and-deploy.ts
  */
 import type { WorkerResult } from "../src/core/types.ts";
 import { PiWorkerExecutor } from "../src/workers/PiWorkerExecutor.ts";
 
-const repo = "/home/wohlgemuth/IdeaProjects/pi-engineering-runtime";
+import { homedir } from "node:os";
+import { join } from "node:path";
+
+const repo = join(homedir(), "IdeaProjects", "pi-engineering-runtime");
 
 const task = `Independently review recent OpenViking changes in pi-engineering-runtime. Read the actual code (do not trust this prompt).
 
@@ -17,14 +20,14 @@ Review these files:
 - extensions/index.ts (getRuntimeByCwd wires openVikingBlackholeOption() into EngineeringRuntime.open)
 - src/blackhole/BlackholeManager.ts (buildDurableProvider, hydrate, withTimeout — how the openviking durable provider is used)
 - src/blackhole/durable.ts (OpenVikingProvider HTTP adapter)
-- deploy/apptainer/openviking.def + deploy/apptainer/deploy-whiteale.sh (Apptainer container + whiteale deploy IaC: postgres role/db, data-volume secrets, systemd unit, nginx vhost, certbot)
+- deploy/apptainer/openviking.def + deploy/apptainer/deploy-host.sh (Apptainer container + host deploy IaC: postgres role/db, data-volume secrets, systemd unit, nginx vhost, certbot)
 - services/openviking/src/server.mjs (the /metrics endpoint added for monitoring)
 
 Check specifically:
 1. ENV-CONFIG CORRECTNESS: does openVikingBlackholeOption() produce a valid blackhole option? Is the shape correct for EngineeringRuntime/BlackholeManager (PartialBlackholeConfig with durable {kind:"openviking", baseUrl, token} and providerTimeoutMs)? Any bug in parsing timeout / token-file / enabled=0?
 2. EXTENSION WIRING: does extensions/index.ts correctly pass the blackhole option and NOT break backward-compat when env is absent? Any regression to the existing commands?
 3. SECURITY: is the token handled safely (no logging, no baking into images)? Does the deploy keep secrets out of the SIF and in the data-volume file with 600 perms? Is /metrics (unauthenticated) a leak risk (does it expose the token or sensitive data)?
-4. DEPLOYMENT IAEC: idempotency of deploy-whiteale.sh; does it bake secrets into the container image? Postgres password handling (ALTER ROLE on re-run)? certbot/nginx ordering? Any correctness bug that would break a fresh run vs a re-run?
+4. DEPLOYMENT IAEC: idempotency of deploy-host.sh; does it bake secrets into the container image? Postgres password handling (ALTER ROLE on re-run)? certbot/nginx ordering? Any correctness bug that would break a fresh run vs a re-run?
 5. FAIL-CLOSED: provider outage degrades hydration to empty and never fails a worker; timeout is bounded. Confirm.
 6. Any critical/high bugs, security issues, or contract violations. Also flag medium/low.
 

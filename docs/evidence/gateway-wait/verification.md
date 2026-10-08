@@ -47,7 +47,7 @@ admission controller instead, eventually succeeded.
 
 Phase 1 ran against the operator's own configured provider rather than a
 fixture: provider `metabolomics`, api `openai-completions`, base URL
-`https://llm.metabolomics.us/v1` — the gateway the reported 503s came from.
+`https://llm.example.com/v1` — the gateway the reported 503s came from.
 Installing the wrapper succeeded, and all four models plus their availability
 survived it. That provider takes the extension-config install path, not the
 native-provider path.
@@ -197,7 +197,7 @@ every unrelated module.
 
 `/refresh-models` reads `GET {baseUrl}/models` and reconciles Pi's configured
 catalogue with what the gateway actually serves. Measured live against
-`https://llm.metabolomics.us/v1`, the configured catalogue had drifted:
+`https://llm.example.com/v1`, the configured catalogue had drifted:
 `deepseek-v4-flash` was set to 1,048,576 tokens against a real per-request limit
 of 262,144, `qwen3.8-27b-q4-250k` to 131,072 against 250,112, and
 `qwen3.8-27b-vision` was absent entirely.
