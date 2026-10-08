@@ -149,7 +149,14 @@ export function sanitizeWorkerActivity(value: unknown): WorkerActivity | null {
     if (input.phase === "canceled") {
       return { kind: "state", phase: "canceled", summary: "Worker session canceled", meaningfulProgress: false };
     }
-    const summary = input.summary === "Model response received" ? input.summary : "Worker session started";
+    const summary =
+      input.summary === "Model response received" ||
+      input.summary === STREAMING_SUMMARY ||
+      input.summary === WAITING_FOR_INFERENCE_SUMMARY ||
+      input.summary === AWAITING_MODEL_RESPONSE_SUMMARY ||
+      input.summary === TOOL_PROGRESS_SUMMARY
+        ? input.summary
+        : "Worker session started";
     return {
       kind: "state",
       ...(input.phase ? { phase: input.phase } : {}),
@@ -207,6 +214,56 @@ export function activityFromSessionEvent(event: {
     }
   }
   return null;
+}
+
+const STREAMING_SUMMARY = "Model streaming";
+
+/**
+ * A worker holding for the model gateway (admission, queue, cooldown). It is
+ * liveness, not progress: the owner's inactivity watchdog must never treat a
+ * worker waiting for inference capacity as hung.
+ */
+export const WAITING_FOR_INFERENCE_SUMMARY = "Waiting for inference capacity";
+
+/**
+ * A non-streaming model request still in flight on an open connection: the
+ * answer arrives all at once, so the open request is the sign of life.
+ */
+export const AWAITING_MODEL_RESPONSE_SUMMARY = "Awaiting model response";
+
+/**
+ * A running tool (a long test suite, a build) that keeps producing output. It
+ * is liveness: only a tool silent for the whole inactivity window looks hung.
+ */
+export const TOOL_PROGRESS_SUMMARY = "Tool still producing output";
+
+/**
+ * Streamed tokens are activity: a worker writing a long answer is not idle,
+ * and its heartbeat's "last activity" must not read as minutes of silence.
+ * Token events arrive per delta, so they are reduced to one bounded state
+ * activity per interval. Content is never inspected or copied.
+ */
+export class StreamingActivityThrottle {
+  private lastAt = Number.NEGATIVE_INFINITY;
+  private lastToolAt = Number.NEGATIVE_INFINITY;
+  private readonly intervalMs: number;
+
+  constructor(intervalMs = 30_000) {
+    this.intervalMs = intervalMs;
+  }
+
+  note(event: { type?: string; message?: unknown }, nowMs: number = Date.now()): WorkerActivity | null {
+    if (event.type === "tool_execution_update") {
+      if (nowMs - this.lastToolAt < this.intervalMs) return null;
+      this.lastToolAt = nowMs;
+      return { kind: "state", summary: TOOL_PROGRESS_SUMMARY, meaningfulProgress: false };
+    }
+    if (event.type !== "message_update") return null;
+    if ((event.message as { role?: unknown } | undefined)?.role !== "assistant") return null;
+    if (nowMs - this.lastAt < this.intervalMs) return null;
+    this.lastAt = nowMs;
+    return { kind: "state", summary: STREAMING_SUMMARY, meaningfulProgress: false };
+  }
 }
 
 export function emitWorkerActivity(req: { onActivity?: (event: WorkerActivity) => void }, event: WorkerActivity): void {

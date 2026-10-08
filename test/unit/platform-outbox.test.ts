@@ -59,7 +59,7 @@ describe("MemoryOutbox (OpenViking offline mode)", () => {
     push((v) => `aws ${v}`, fake("AKIA", "IOSFODNN7EXAMPLE"));
     push((v) => `PGPASSWORD=${v} psql`, "s3cr3t");
     push((v) => `slack ${v}`, fake("xox", "b-1234567890-abcdefghij"));
-    push((v) => `clone https://gert:${v}@github.com/acme/alpha.git`, fake("gh", `p_${"S".repeat(20)}`));
+    push((v) => `clone https://user:${v}@github.com/acme/alpha.git`, fake("gh", `p_${"S".repeat(20)}`));
     push(
       (v) => `jwt ${fake("ey", "JhbGciOiJIUzI1NiJ9")}.${fake("ey", "JzdWIiOiIxMjM0NSJ9")}.${v}`,
       "SflKxwRJSMeKKF2QT4fwpMeJf36P",

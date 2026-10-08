@@ -2647,17 +2647,17 @@ describe("ExecutionBroker (spec 03)", () => {
     );
   });
 
-  it("workerTimeoutMs defaults to 30 min and honors the env override", () => {
+  it("workerTimeoutMs is unset (no duration cap) by default and honors the opt-in env override", () => {
     const prev = process.env.PI_ENGINEERING_WORKER_TIMEOUT_MS;
     try {
       delete process.env.PI_ENGINEERING_WORKER_TIMEOUT_MS;
-      assert.equal(workerTimeoutMs(), 30 * 60_000, "default must give workers headroom to commit real work");
+      assert.equal(workerTimeoutMs(), undefined, "no execution has a maximum duration unless the operator sets one");
       process.env.PI_ENGINEERING_WORKER_TIMEOUT_MS = "60000";
       assert.equal(workerTimeoutMs(), 60_000, "env override must win");
       process.env.PI_ENGINEERING_WORKER_TIMEOUT_MS = String(2 ** 40);
       assert.equal(workerTimeoutMs(), 2 ** 31 - 1, "beyond setTimeout's range the timer would fire at once");
       process.env.PI_ENGINEERING_WORKER_TIMEOUT_MS = "not-a-number";
-      assert.equal(workerTimeoutMs(), 30 * 60_000, "invalid env must fall back to default");
+      assert.equal(workerTimeoutMs(), undefined, "invalid env must fall back to no limit");
     } finally {
       if (prev === undefined) delete process.env.PI_ENGINEERING_WORKER_TIMEOUT_MS;
       else process.env.PI_ENGINEERING_WORKER_TIMEOUT_MS = prev;
@@ -3735,4 +3735,107 @@ it("turns a corrupt durable cleanup journal into a structured finding after brok
   } finally {
     await fx.cleanup();
   }
+});
+
+describe("backend failure visibility", () => {
+  it("records outcome error and summary on failed integration executions", async () => {
+    const store = MissionStore.open(JsonlEventStore.inMemory());
+    const m = store.createMission({
+      title: "x",
+      goal: "x",
+      user_request: "x",
+      repository: ".",
+      base_ref: "base-sha",
+      risk_profile: "medium",
+      workflow_class: "engineering_review",
+    });
+    const t = store.createTask({
+      mission_id: m.mission_id,
+      kind: "integration",
+      role: "integrator",
+      objective: "merge",
+    });
+    store.transitionTask(t.task_id, "READY");
+    const broker = new ExecutionBroker({
+      store,
+      git: {} as never,
+      backends: {
+        integration: {
+          runIntegration: async () => ({
+            executionId: "i-fail",
+            exitStatus: "failed",
+            summary: "integrated nothing into main; checks: fail",
+            error: "verification failed at stage: test",
+            artifactRefs: [],
+            usage: {},
+          }),
+        },
+      },
+    });
+    const outcome = await (
+      await broker.execute({
+        taskId: t.task_id,
+        missionId: m.mission_id,
+        kind: "integration",
+        role: "integrator",
+        objective: "merge",
+      })
+    ).result();
+    assert.equal(outcome.exitStatus, "failed");
+    const ex = store.listExecutions(m.mission_id).find((e) => e.task_id === t.task_id);
+    assert.ok(ex, "execution must be recorded");
+    assert.equal(ex?.status, "FAILED");
+    // The failure must be diagnosable from the store: error + summary propagated.
+    assert.equal(ex?.error, "verification failed at stage: test");
+    assert.equal(ex?.summary, "integrated nothing into main; checks: fail");
+  });
+
+  it("leaves error unset on successful executions", async () => {
+    const store = MissionStore.open(JsonlEventStore.inMemory());
+    const m = store.createMission({
+      title: "x",
+      goal: "x",
+      user_request: "x",
+      repository: ".",
+      base_ref: "base-sha",
+      risk_profile: "medium",
+      workflow_class: "engineering_review",
+    });
+    const t = store.createTask({
+      mission_id: m.mission_id,
+      kind: "integration",
+      role: "integrator",
+      objective: "merge",
+    });
+    store.transitionTask(t.task_id, "READY");
+    const broker = new ExecutionBroker({
+      store,
+      git: {} as never,
+      backends: {
+        integration: {
+          runIntegration: async () => ({
+            executionId: "i-ok",
+            exitStatus: "succeeded",
+            summary: "integrated worker/a into main; checks: pass",
+            artifactRefs: [],
+            usage: {},
+          }),
+        },
+      },
+    });
+    await (
+      await broker.execute({
+        taskId: t.task_id,
+        missionId: m.mission_id,
+        kind: "integration",
+        role: "integrator",
+        objective: "merge",
+      })
+    ).result();
+    const ex = store.listExecutions(m.mission_id).find((e) => e.task_id === t.task_id);
+    assert.ok(ex, "execution must be recorded");
+    assert.equal(ex?.status, "SUCCEEDED");
+    assert.equal(ex?.error, undefined);
+    assert.equal(ex?.summary, "integrated worker/a into main; checks: pass");
+  });
 });

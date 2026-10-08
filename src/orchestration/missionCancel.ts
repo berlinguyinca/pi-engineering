@@ -54,6 +54,14 @@ export function transitionMissionToCanceled(store: MissionStore, missionId: stri
   let mission = store.getMission(missionId);
   if (!mission) throw new Error(`unknown mission ${missionId}`);
   if (mission.status === "CANCELED") return mission;
+  // A canceled mission is no longer paused; never report it as waiting.
+  store.clearOperatorPause(missionId);
+  if (mission.status === "PAUSED_INFRASTRUCTURE") {
+    // Interrupted tasks were left resumable; an explicit cancel ends them.
+    for (const task of store.listTasks(missionId)) {
+      if (canTransitionTask(task.status, "CANCELED")) store.transitionTask(task.task_id, "CANCELED");
+    }
+  }
   if (canTransitionMission(mission.status, "CANCELING")) {
     mission = store.transitionMission(missionId, "CANCELING");
   }

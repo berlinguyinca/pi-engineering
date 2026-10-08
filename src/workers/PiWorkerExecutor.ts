@@ -31,12 +31,15 @@ import type { WorkerResult, WorkerRole, WorkerUsage } from "../core/types.ts";
 import type { AdmissionController } from "../gateway/AdmissionController.ts";
 import { type GatewayAdmissionConfig, sharedAdmissionController, sharedGatewayConfig } from "../gateway/config.ts";
 import {
+  type GatewayRetryDecision,
   type GatewayWaitSignal,
+  advisesAlternateModel,
   decideGatewayRetry,
   decideTransientHandover,
   escalateSyntheticWait,
   gatewayFailureMarker,
   gatewayHoldScope,
+  isCapacityExhaustion,
   isTransportDrop,
   parseGatewayWait,
 } from "../gateway/signals.ts";
@@ -70,10 +73,16 @@ import { reviewResultTool } from "../lifecycle/reviewResultTool.ts";
 import { type RequestBodyBudgetConfig, resolveRequestBodyBudgetConfig } from "../request/bodyBudget.ts";
 import { type ThinkingOffConfig, resolveThinkingOffConfig } from "../request/thinkingPolicy.ts";
 import { emitTelemetry } from "../telemetry/sink.ts";
+import { MODEL_SUPERSEDED } from "./WorkerExecutor.ts";
 import type { WorkerExecutor, WorkerRequest, WorkerRun } from "./WorkerExecutor.ts";
-import { activityFromSessionEvent, emitWorkerActivity } from "./activity.ts";
+import {
+  StreamingActivityThrottle,
+  WAITING_FOR_INFERENCE_SUMMARY,
+  activityFromSessionEvent,
+  emitWorkerActivity,
+} from "./activity.ts";
 import { BuildCommandTimer } from "./buildActivity.ts";
-import { checkpointProgressTool } from "./checkpointProgressTool.ts";
+import { CHECKPOINT_PROGRESS_TOOL_NAME, createCheckpointProgressTool } from "./checkpointProgressTool.ts";
 import { registerLocalProviders } from "./localProviders.ts";
 import { WORKER_KICKOFF, buildSystemPrompt, wantsCommitDiscipline } from "./prompts.ts";
 import { guardRuntimeRequestBody } from "./requestBodyGuard.ts";
@@ -178,6 +187,9 @@ export interface PiWorkerExecutorOptions {
  * prompt and tool allowlist, so no prior reasoning is inherited. The worker must
  * finish by calling `worker_result`; usage is captured from assistant messages.
  */
+/** How often a capacity hold checks for an operator model switch. */
+const OPERATOR_SWITCH_POLL_MS = 250;
+
 export class PiWorkerExecutor implements WorkerExecutor {
   private readonly agentDir: string;
   private readonly customTools: ToolDefinition[];
@@ -346,7 +358,7 @@ ${TOOL_TRANSITION_RULE}`;
     const terminating = req.resultTool === "review_result" ? reviewResultTool : workerResultTool;
     const customTools = [
       ...this.customTools,
-      ...(req.deliverables?.length ? [checkpointProgressTool] : []),
+      ...(req.deliverables?.length ? [createCheckpointProgressTool(req.deliverables)] : []),
       terminating,
     ];
     const tools = [...new Set([...req.tools, ...customTools.map((t) => t.name)])];
@@ -374,12 +386,87 @@ ${TOOL_TRANSITION_RULE}`;
     // A flattened refusal's wait is synthesized, so it escalates like the
     // interactive pump's: a flat 5s x maxRetries gave up on a model_activating
     // warm-up that outlasts ~40s.
+    // A mission worker waits for inference capacity as long as the gateway
+    // asks it to: the hold count is not a budget (only cancellation ends it).
+    // Advice to move to another model is the exception — holding forever on a
+    // model the gateway says to leave helps nobody, so that keeps the finite
+    // count and hands the decision back to the mission.
+    const gatewayRetryCeiling = req.unboundedInferenceWait ? Number.POSITIVE_INFINITY : gatewayConfig.maxRetries;
+    // An operator-pinned model is the exception to the exception: the operator
+    // chose it, so only the operator moves the mission off it (with /model,
+    // which ends the wait at the next boundary) — it is waited out.
+    const withinGatewayBudget = (decision: GatewayRetryDecision): GatewayRetryDecision =>
+      decision.action === "wait" &&
+      req.unboundedInferenceWait &&
+      !req.operatorPinned &&
+      advisesAlternateModel(decision.signal) &&
+      gatewayRetries >= gatewayConfig.maxRetries
+        ? { action: "give-up", signal: decision.signal, reason: "retries-exhausted" }
+        : decision;
+    // A mission waiting on an exhausted model says so, once per model, and
+    // offers the way out: an operator switch the mission adopts at once.
+    const capacityNoticed = new Set<string>();
+    const noteCapacityWait = (signal: GatewayWaitSignal): void => {
+      if (!req.unboundedInferenceWait || !isCapacityExhaustion(signal)) return;
+      const key = `${model.provider}/${model.id}`;
+      if (capacityNoticed.has(key)) return;
+      capacityNoticed.add(key);
+      emitTelemetry({
+        level: "warning",
+        text: `model ${key} is out of capacity (${signal.reason ?? signal.code ?? `HTTP ${signal.status ?? 429}`}); the mission keeps waiting — switch with /model to continue on another model`,
+        key: `mission-capacity:${key}`,
+      });
+    };
+    // Asking may persist the mission's adoption of the new pin; a store error
+    // there must not end this run, so it reads as "not switched".
+    const operatorSwitched = (): boolean => {
+      try {
+        return req.modelSuperseded?.() === true;
+      } catch {
+        return false;
+      }
+    };
+    const superseded = (): WorkerRun => ({
+      result: {
+        status: "failed",
+        summary: `The operator chose another model; the ${req.role} attempt on ${model.provider}/${model.id} stopped at an inference boundary.`,
+        claims: [],
+        evidence_refs: [],
+        new_hypotheses: [],
+        proposed_tasks: [],
+        details: { model: { provider: model.provider, id: model.id } },
+        error: MODEL_SUPERSEDED,
+      },
+      usage: null,
+      error: MODEL_SUPERSEDED,
+    });
     const holdForGateway = (signal: GatewayWaitSignal): Promise<number> => {
       const paced = signal.flattened ? escalateSyntheticWait(signal, gatewayRetries, MAX_ESCALATED_WAIT_MS) : signal;
       const scoped = { ...paced, provider: model.provider, model: model.id };
-      return gatewayHoldScope(scoped) === "caller"
-        ? admission.noteCallerWaitAndSleep(scoped)
-        : admission.noteWaitAndSleep(scoped);
+      // Waiting for capacity is liveness: tell the owner, so the wait is
+      // never mistaken for a hung worker.
+      emitWorkerActivity(req, { kind: "state", summary: WAITING_FOR_INFERENCE_SUMMARY, meaningfulProgress: false });
+      // A hold is an inference boundary: an operator model switch ends it at
+      // once (polled), so the mission moves without sitting out the gateway's
+      // whole advertised wait. The next loop pass reports the switch.
+      const hold = new AbortController();
+      const stop = (): void => hold.abort();
+      if (req.signal?.aborted) hold.abort();
+      else req.signal?.addEventListener("abort", stop, { once: true });
+      const poll = req.modelSuperseded
+        ? setInterval(() => {
+            if (operatorSwitched()) hold.abort();
+          }, OPERATOR_SWITCH_POLL_MS)
+        : undefined;
+      poll?.unref?.();
+      const sleeping =
+        gatewayHoldScope(scoped) === "caller"
+          ? admission.noteCallerWaitAndSleep(scoped, { signal: hold.signal })
+          : admission.noteWaitAndSleep(scoped, { signal: hold.signal });
+      return sleeping.finally(() => {
+        if (poll) clearInterval(poll);
+        req.signal?.removeEventListener("abort", stop);
+      });
     };
 
     // Prose-producing roles (reviewers, challenger, scout, summarizer) deliver
@@ -393,6 +480,9 @@ ${TOOL_TRANSITION_RULE}`;
     const guardConfig = guardConfigForRole(req.role, this.guardConfig);
 
     while (true) {
+      // Every pass of this loop starts a new inference request: the boundary
+      // at which an operator's model switch takes over (never mid-stream).
+      if (operatorSwitched()) return superseded();
       // Two retry layers, with a clean ownership split:
       //
       //   * the ADMISSION slot is held across the whole transient retry, because
@@ -404,7 +494,18 @@ ${TOOL_TRANSITION_RULE}`;
       //   * GATEWAY saturation (429 inference_admission) is deliberately NOT a
       //     transient category — see classifyError. It is handled below, where
       //     the gateway's own advertised wait is honoured process-wide.
-      const slot = gatewayConfig.enabled ? await admission.acquire() : null;
+      // Queuing for a slot is waiting for inference capacity: the queue itself
+      // tells the owner, per worker, so the wait is never mistaken for a hang.
+      const slot = gatewayConfig.enabled
+        ? await admission.acquire({
+            onWait: () =>
+              emitWorkerActivity(req, {
+                kind: "state",
+                summary: WAITING_FOR_INFERENCE_SUMMARY,
+                meaningfulProgress: false,
+              }),
+          })
+        : null;
       let transientOutcome: Awaited<
         ReturnType<typeof withTransientRetry<Awaited<ReturnType<typeof this.runSingleAttempt>>>>
       >;
@@ -431,9 +532,10 @@ ${TOOL_TRANSITION_RULE}`;
         // A link cut is NOT handed over: the transient loop above already
         // owned its retries (decideTransientHandover).
         if (gatewayConfig.enabled) {
-          const handover = decideTransientHandover(detail, gatewayRetries, gatewayConfig.maxRetries);
+          const handover = withinGatewayBudget(decideTransientHandover(detail, gatewayRetries, gatewayRetryCeiling));
           if (handover.action === "wait") {
             gatewayRetries++;
+            noteCapacityWait(handover.signal);
             await holdForGateway(handover.signal);
             continue;
           }
@@ -480,7 +582,23 @@ ${TOOL_TRANSITION_RULE}`;
 
       session.dispose();
 
-      if (captured) {
+      // A reviewer's terminating tool is review_result (it is never given
+      // worker_result): a delivered verdict is a completed review.
+      const reviewDelivered = req.resultTool === "review_result" && structured !== undefined && structured !== null;
+      const result: WorkerResult | undefined =
+        captured ??
+        (reviewDelivered
+          ? {
+              status: "completed",
+              summary: String((structured as { summary?: unknown }).summary ?? "").slice(0, 4000) || "Review recorded.",
+              claims: [],
+              evidence_refs: [],
+              new_hypotheses: [],
+              proposed_tasks: [],
+              details: {},
+            }
+          : undefined);
+      if (result) {
         // Success — record recovery outcome if we were in a retry.
         if (attempt > 0) {
           recordRetryOutcome(this.recoveryTelemetry, true, false);
@@ -491,16 +609,17 @@ ${TOOL_TRANSITION_RULE}`;
         }
         if (gatewayConfig.enabled) admission.noteSuccess();
         const usage = this.collectUsage(this.asMessages(session.messages));
-        return { result: captured, usage, toolCalls, structured };
+        return { result, usage, toolCalls, structured };
       }
 
       // Gateway saturation: honour the wait the gateway reported, hold every
       // other model caller in this process behind the same cooldown, and retry
       // the SAME attempt (no recovery-ladder escalation).
       if (gatewayConfig.enabled) {
-        const decision = decideGatewayRetry(assistantError, gatewayRetries, gatewayConfig.maxRetries);
+        const decision = withinGatewayBudget(decideGatewayRetry(assistantError, gatewayRetries, gatewayRetryCeiling));
         if (decision.action === "wait") {
           gatewayRetries++;
+          noteCapacityWait(decision.signal);
           await holdForGateway(decision.signal);
           continue;
         }
@@ -864,13 +983,34 @@ ${recovery.recoveryPrompt}`;
     // Times build commands: their end event carries the build-tool label and
     // wall-clock time (budget-exhaustion evidence).
     const buildTimer = new BuildCommandTimer();
+    const streaming = new StreamingActivityThrottle();
+    // Standalone callers (no owner signal) get an INACTIVITY guard, not a
+    // total-duration one: every session event re-arms it. A long, busy session
+    // is never cut off for being long. It runs only while THIS worker holds an
+    // admission slot (its gateway waits happen between attempts, when no
+    // guard is armed), so another caller queued for capacity elsewhere in the
+    // process must not keep a hung session alive.
+    const inactivityMs = req.timeoutMs ?? 300_000;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const armInactivity = (): void => {
+      if (req.signal) return;
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => {
+        timedOut = true;
+        void session.abort();
+      }, inactivityMs);
+      timer.unref?.();
+    };
     const unsubscribe = session.subscribe((event) => {
+      armInactivity();
+      const streamed = streaming.note(event as { type?: string; message?: unknown });
+      if (streamed) emitWorkerActivity(req, streamed);
       const activity = buildTimer.observe(event, activityFromSessionEvent(event));
       const activityToolName = "toolName" in event ? event.toolName : undefined;
-      if (activity && activityToolName !== terminatingName && activityToolName !== checkpointProgressTool.name) {
+      if (activity && activityToolName !== terminatingName && activityToolName !== CHECKPOINT_PROGRESS_TOOL_NAME) {
         emitWorkerActivity(req, activity);
       }
-      if (event.type === "tool_execution_end" && event.toolName === checkpointProgressTool.name && !event.isError) {
+      if (event.type === "tool_execution_end" && event.toolName === CHECKPOINT_PROGRESS_TOOL_NAME && !event.isError) {
         const details = event.result?.details as { claims?: unknown } | undefined;
         emitWorkerActivity(req, {
           kind: "checkpoint",
@@ -926,31 +1066,31 @@ ${recovery.recoveryPrompt}`;
       }
     });
 
-    // Wall-clock budget.
-    // The owner signal is the sole deadline authority when present (the broker
-    // starts its clock before setup/worktree allocation). Standalone executor
-    // callers without an owner signal retain the local worker timer.
-    const timer = req.signal
-      ? undefined
-      : setTimeout(() => {
-          timedOut = true;
-          void session.abort();
-        }, req.timeoutMs ?? 300_000);
+    // The owner signal is the sole liveness/limit authority when present (the
+    // broker watches activity from before setup/worktree allocation).
+    // Standalone executor callers without an owner signal keep the local
+    // inactivity guard armed above.
+    armInactivity();
     const abortFromOwner = (): void => {
       ownerAborted = true;
       const reason = req.signal?.reason;
-      if (reason instanceof DOMException && reason.name === "TimeoutError") timedOut = true;
+      if (reason instanceof DOMException && (reason.name === "TimeoutError" || reason.name === "InactivityError")) {
+        timedOut = true;
+      }
       void session.abort();
     };
     req.signal?.addEventListener("abort", abortFromOwner, { once: true });
 
     try {
       emitWorkerActivity(req, { kind: "state", summary: "Worker session started", meaningfulProgress: false });
+      // Canceled while queued for a slot: aborting a session that has not
+      // started prompting is a no-op, so never start it.
       if (req.signal?.aborted) abortFromOwner();
-      await session.prompt(req.kickoff ?? WORKER_KICKOFF, {
-        images: req.images?.map((img) => ({ type: "image" as const, data: img.data, mimeType: img.mimeType })),
-        expandPromptTemplates: false,
-      });
+      else
+        await session.prompt(req.kickoff ?? WORKER_KICKOFF, {
+          images: req.images?.map((img) => ({ type: "image" as const, data: img.data, mimeType: img.mimeType })),
+          expandPromptTemplates: false,
+        });
     } catch (err) {
       // Capture the error. An abort triggered by the guard/budget/timeout is
       // EXPECTED (session.abort()) and not a transport failure. A rejection
@@ -1261,7 +1401,7 @@ export function buildCompactedWorkerPrompt(req: WorkerRequest, recoveryPrompt: s
   }
   if (req.deliverables?.length) {
     parts.push(
-      `- Declared checkpoint deliverables: ${req.deliverables.join(", ")}. After a coherent commit, call checkpoint_progress with the exact git rev-parse HEAD and committed evidence paths.`,
+      `- Declared checkpoint deliverables: ${req.deliverables.map((d) => `"${d}"`).join(", ")}. After a coherent commit, call checkpoint_progress claiming the deliverable with the EXACT declared string (no paraphrasing) plus the exact git rev-parse HEAD and committed evidence paths.`,
     );
   }
   parts.push(`- Your final action MUST be calling the worker_result tool.`);
@@ -1272,7 +1412,7 @@ export function buildCompactedWorkerPrompt(req: WorkerRequest, recoveryPrompt: s
 
 export function workerContext(req: WorkerRequest): string | undefined {
   const checkpoint = req.deliverables?.length
-    ? `Declared checkpoint deliverables: ${req.deliverables.join(", ")}. After each coherent commit, run git rev-parse HEAD and call checkpoint_progress with the completed deliverable, that exact candidate SHA, and committed evidence paths.`
+    ? `Declared checkpoint deliverables: ${req.deliverables.map((d) => `"${d}"`).join(", ")}. After each coherent commit, run git rev-parse HEAD and call checkpoint_progress with the completed deliverable (using its EXACT declared string, no paraphrasing), that exact candidate SHA, and committed evidence paths.`
     : undefined;
   if (!req.recovery) return [req.context, checkpoint].filter(Boolean).join("\n\n") || undefined;
   const durable = durableRecoveryContext(req)!;

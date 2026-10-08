@@ -1,7 +1,7 @@
 /**
  * "Error: terminated" — undici closing the connection mid-body.
  *
- * Every observed occurrence (13/13, 2026-09-22..25) coincided with a Fry
+ * Every observed occurrence (13/13, 2026-09-22..25) coincided with a gateway
  * gateway restart whose 75s drain grace cut a long in-flight stream. pi-ai
  * reports it as an assistant message with stopReason "error", errorMessage
  * "terminated", usually no content and 0/0 usage. The operator's Pi retry is

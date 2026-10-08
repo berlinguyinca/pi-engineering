@@ -85,7 +85,7 @@ export function parseGatewayModels(payload: unknown): GatewayModelEntry[] {
 }
 
 export interface FetchCatalogOptions {
-  /** Provider base URL, e.g. `https://llm.metabolomics.us/v1`. */
+  /** Provider base URL, e.g. `https://llm.example.com/v1`. */
   baseUrl: string;
   apiKey?: string;
   headers?: Record<string, string | null>;
@@ -95,7 +95,7 @@ export interface FetchCatalogOptions {
 }
 
 /** The gateway this extension is built around, when nothing else is configured. */
-export const DEFAULT_GATEWAY_BASE_URL = "https://llm.metabolomics.us/v1";
+export const DEFAULT_GATEWAY_BASE_URL = "https://llm.example.com/v1";
 
 export class CatalogFetchError extends Error {
   readonly status: number | undefined;

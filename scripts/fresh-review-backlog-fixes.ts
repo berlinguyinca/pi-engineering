@@ -8,7 +8,10 @@
 import type { WorkerResult } from "../src/core/types.ts";
 import { PiWorkerExecutor } from "../src/workers/PiWorkerExecutor.ts";
 
-const repo = "/home/wohlgemuth/IdeaProjects/pi-engineering-runtime";
+import { homedir } from "node:os";
+import { join } from "node:path";
+
+const repo = join(homedir(), "IdeaProjects", "pi-engineering-runtime");
 
 const PRIOR_FINDINGS = [
   "1. ModelRouter.RouteResult.fallback was never set true (dead field). Fix should set fallback=true when the preferred (first-registered capable) provider is exhausted/ineligible.",

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { lstatSync, rmSync, writeFileSync } from "node:fs";
 import { appendFile, mkdir, mkdtemp, readFile, readdir, stat, writeFile } from "node:fs/promises";
@@ -469,12 +469,9 @@ describe("EventStore backends", () => {
       ownerToken: "valid-owner-token",
       ...incarnation,
     };
+    // Records that still name a LIVE pid fail closed: the pid may be an owner
+    // whose incarnation cannot be verified, so it is never stolen.
     const malformed: Array<[string, Record<string, unknown>]> = [
-      ["numeric-string-pid", { ...valid, pid: String(process.pid) }],
-      ["object-pid", { ...valid, pid: { value: process.pid } }],
-      ["nan-pid", { ...valid, pid: Number.NaN }],
-      ["zero-pid", { ...valid, pid: 0 }],
-      ["fractional-pid", { ...valid, pid: 1.5 }],
       ["empty-host", { ...valid, host: "" }],
       ["empty-token", { ...valid, ownerToken: "" }],
       ["bad-boot-id", { ...valid, bootId: "not-a-boot-uuid" }],
@@ -494,6 +491,75 @@ describe("EventStore backends", () => {
       );
       assert.equal(await readFile(lockPath, "utf8"), bytes, `${label} must be preserved for diagnosis`);
     }
+  });
+
+  it("quarantines owner metadata that names no usable pid and acquires (missing/empty/partial/garbage)", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pie-store-owner-garbage-"));
+    const incarnation = await currentProcessIncarnation();
+    const valid = {
+      pid: process.pid,
+      host: hostname(),
+      openedAt: "2026-01-01T00:00:00.000Z",
+      ownerToken: "valid-owner-token",
+      ...incarnation,
+    };
+    const garbage: Array<[string, string]> = [
+      ["empty", ""],
+      ["partial", `{"pid":${process.pid},"host":"`],
+      ["invalid-json", "not json at all\n"],
+      ["numeric-string-pid", `${JSON.stringify({ ...valid, pid: String(process.pid) })}\n`],
+      ["object-pid", `${JSON.stringify({ ...valid, pid: { value: process.pid } })}\n`],
+      ["zero-pid", `${JSON.stringify({ ...valid, pid: 0 })}\n`],
+      ["fractional-pid", `${JSON.stringify({ ...valid, pid: 1.5 })}\n`],
+    ];
+    for (const [label, bytes] of garbage) {
+      const file = join(dir, `${label}.jsonl`);
+      const lockPath = `${file}.lock`;
+      await writeFile(lockPath, bytes);
+      const quarantined: string[] = [];
+      const lock = await ExclusiveFileLock.acquire(file, {
+        unreadableOwnerGraceMs: 0,
+        onUnreadableOwnerQuarantined: (_path, quarantine) => quarantined.push(quarantine),
+      });
+      try {
+        assert.equal(quarantined.length, 1, `${label} must be quarantined exactly once`);
+        assert.equal(await readFile(quarantined[0]!, "utf8"), bytes, `${label} must be preserved for diagnosis`);
+        assert.equal(lock.owner.pid, process.pid);
+      } finally {
+        lock.release();
+      }
+    }
+
+    // A missing owner (a bare directory left by an older lock layout) is recovered too.
+    const legacyDir = join(dir, "legacy-dir.jsonl");
+    await mkdir(`${legacyDir}.lock`, { recursive: true });
+    const recovered = await ExclusiveFileLock.acquire(legacyDir, { unreadableOwnerGraceMs: 0 });
+    recovered.release();
+  });
+
+  it("waits out the grace period before treating fresh unreadable metadata as corrupt", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pie-store-owner-grace-"));
+    const file = join(dir, "fresh.jsonl");
+    await writeFile(`${file}.lock`, "");
+    const started = Date.now();
+    const lock = await ExclusiveFileLock.acquire(file, { unreadableOwnerGraceMs: 300 });
+    lock.release();
+    assert.ok(Date.now() - started >= 250, "a just-created record may still be filling and is not stolen early");
+  });
+
+  it("reclaims a partial owner record whose pid is provably gone", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pie-store-owner-deadpid-"));
+    const file = join(dir, "dead.jsonl");
+    const child = spawnSync(process.execPath, ["-e", "process.stdout.write(String(process.pid))"], {
+      encoding: "utf8",
+    });
+    const deadPid = Number(child.stdout);
+    await writeFile(
+      `${file}.lock`,
+      `${JSON.stringify({ pid: deadPid, host: hostname(), ownerToken: "old-layout" })}\n`,
+    );
+    const lock = await ExclusiveFileLock.acquire(file);
+    lock.release();
   });
 
   it("release of a recovery claim preserves a same-token replacement inode and aborts", async () => {

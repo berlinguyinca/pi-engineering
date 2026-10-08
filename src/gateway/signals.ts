@@ -39,7 +39,7 @@ export interface GatewayWaitSignal {
    * LINK_CUT_WAIT_MS): honoured exactly, like a body or header wait, but not a
    * body instruction, so it never claims the admission controller's layer.
    */
-  source: "body" | "header" | "default" | "link-cut" | "transport-drop";
+  source: "body" | "header" | "default" | "link-cut" | "transport-drop" | "empty-failure";
   /**
    * A genuine post-200 flattened InferWeave refusal: a bare code (or its
    * readable wording) with no HTTP status. Held by the caller alone, since
@@ -216,6 +216,20 @@ export function isTransportDrop(text: string | undefined): boolean {
 }
 
 /**
+ * Failures that carry no gateway guidance and, before any output, say nothing
+ * about capacity: pi-ai's "Stream ended without finish_reason" (the SSE stream
+ * closed before a token) and the OpenAI SDK's "Request timed out.". Anchored
+ * to the whole text so prose mentioning them is not a match. Replay-safe only
+ * while nothing reached the transcript (the pump enforces that), and retried on
+ * the SHORT budget: unlike a gateway restart, nothing proves they will clear.
+ */
+const EMPTY_FAILURE = /^\s*(?:error:\s*)?(?:stream ended without finish_reason|request timed out)\.?\s*$/i;
+
+export function isEmptyFailure(text: string | undefined): boolean {
+  return !!text && EMPTY_FAILURE.test(text);
+}
+
+/**
  * The interactive pump's wait for a transport drop, or null.
  *
  * Deliberately NOT part of parseGatewayWait: that parser also feeds the worker
@@ -227,6 +241,15 @@ export function isTransportDrop(text: string | undefined): boolean {
  */
 export function transportDropWait(input: GatewayWaitInput): GatewayWaitSignal | null {
   if (input.status !== undefined && (input.status < 200 || input.status >= 300)) return null;
+  if (isEmptyFailure(input.text)) {
+    return {
+      retryAfterMs: TRANSPORT_DROP_WAITS_MS[0]!,
+      retryable: true,
+      source: "empty-failure",
+      reason: /timed out/i.test(input.text ?? "") ? "request_timeout" : "truncated_stream",
+      scope: "request",
+    };
+  }
   if (!isTransportDrop(input.text)) return null;
   return {
     retryAfterMs: TRANSPORT_DROP_WAITS_MS[0]!,
@@ -451,7 +474,7 @@ export function parseGatewayWait(input: GatewayWaitInput): GatewayWaitSignal | n
  * against an outage. Escalate those, capped so recovery stays prompt.
  */
 export function escalateSyntheticWait(signal: GatewayWaitSignal, attempt: number, capMs: number): GatewayWaitSignal {
-  if (signal.source === "transport-drop") {
+  if (signal.source === "transport-drop" || signal.source === "empty-failure") {
     const step = TRANSPORT_DROP_WAITS_MS[Math.min(Math.max(0, attempt - 1), TRANSPORT_DROP_WAITS_MS.length - 1)]!;
     return { ...signal, retryAfterMs: Math.min(capMs, step) };
   }
@@ -471,6 +494,8 @@ export function escalateSyntheticWait(signal: GatewayWaitSignal, attempt: number
  */
 export function isLongWaitTransient(signal: GatewayWaitSignal): boolean {
   if (!signal.retryable) return false;
+  // No evidence either way: keep the short, finite budget.
+  if (signal.source === "empty-failure") return false;
   if (signal.source === "link-cut" || signal.source === "transport-drop" || signal.flattened) return true;
   if (signal.type === "inference_admission" || signal.type === "inferweave_backpressure") return true;
   if (signal.reason) return true;
@@ -500,6 +525,41 @@ export function gatewayFailureMarker(signal: GatewayWaitSignal): string {
   return `gateway:${signal.reason ?? signal.type ?? signal.status ?? "rate-limited"}`;
 }
 
+/** The gateway's own guidance: this model cannot serve now, another may. */
+export function advisesAlternateModel(signal: Pick<GatewayWaitSignal, "actionCode" | "action">): boolean {
+  return signal.actionCode === "IW-ACT-RETRY-ALTERNATE" || signal.action === "retry_alternate";
+}
+
+/** Gateway reasons that mean "this model has no capacity for you right now". */
+const CAPACITY_REASONS = new Set([
+  "queue_timeout",
+  "queue_deadline_exceeded",
+  "queue_limit_reached",
+  "request_not_queueable",
+  "caller_hard_quota",
+  "capacity_exhausted",
+  "capacity_unavailable",
+  "worker_saturated",
+]);
+
+/**
+ * Is this hold capacity exhaustion (a queue deadline, a full queue, no free
+ * worker) rather than a transport problem or a model warming up?
+ */
+export function isCapacityExhaustion(
+  signal: Pick<GatewayWaitSignal, "reason" | "code" | "status" | "source">,
+): boolean {
+  if (signal.source === "link-cut" || signal.source === "transport-drop" || signal.source === "empty-failure") {
+    return false;
+  }
+  for (const value of [signal.reason, signal.code]) {
+    if (value && CAPACITY_REASONS.has(value.toLowerCase())) return true;
+  }
+  return signal.status === 429 && !signal.reason && !signal.code;
+}
+
+export const ALTERNATE_MODEL_ADVICE = "gateway advises an alternate model — switch with /model";
+
 /** One-line human summary for notices and logs. */
 export function describeGatewayWait(signal: GatewayWaitSignal): string {
   const parts = [`${signal.status ?? 429}`];
@@ -507,6 +567,7 @@ export function describeGatewayWait(signal: GatewayWaitSignal): string {
   parts.push(`waiting ${Math.round(signal.retryAfterMs / 100) / 10}s (${signal.source})`);
   if (signal.activeLimit !== undefined) parts.push(`active_limit=${signal.activeLimit}`);
   if (signal.queued !== undefined) parts.push(`queued=${signal.queued}`);
+  if (advisesAlternateModel(signal)) parts.push(ALTERNATE_MODEL_ADVICE);
   return parts.join(" · ");
 }
 

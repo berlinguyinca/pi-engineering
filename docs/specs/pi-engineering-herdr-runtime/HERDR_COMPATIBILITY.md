@@ -11,7 +11,7 @@ $ herdr --version            -> herdr 0.9.1
 $ herdr status
   client:  version 0.9.1, channel stable, protocol 22, endpoint_protocol_generation 1
   server:  status running, version 0.9.1, endpoint_compatible yes, protocol 22 compatible yes
-           socket /home/wohlgemuth/.config/herdr/herdr.sock
+           socket /home/<user>/.config/herdr/herdr.sock
 $ herdr api schema           -> protocol 22, schema_version 1
 ```
 

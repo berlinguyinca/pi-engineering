@@ -38,7 +38,7 @@ function scratch(): { dir: string; path: string; cleanup: () => void } {
 const CONFIG: ModelsConfig = {
   providers: {
     metabolomics: {
-      baseUrl: "https://llm.metabolomics.us/v1",
+      baseUrl: "https://llm.example.com/v1",
       api: "openai-completions",
       apiKey: "sk-super-secret",
       compat: { supportsDeveloperRole: false, supportsReasoningEffort: true },
@@ -77,7 +77,7 @@ test("models config: replacing one provider's models touches nothing else", () =
   const next = withProviderModels(CONFIG, "metabolomics", [{ id: "new-model", contextWindow: 262_144 }]);
 
   assert.equal(next.providers?.metabolomics?.apiKey, "sk-super-secret", "the key must survive a refresh");
-  assert.equal(next.providers?.metabolomics?.baseUrl, "https://llm.metabolomics.us/v1");
+  assert.equal(next.providers?.metabolomics?.baseUrl, "https://llm.example.com/v1");
   assert.deepEqual(next.providers?.metabolomics?.compat, CONFIG.providers?.metabolomics?.compat);
   assert.deepEqual(next.providers?.anthropic, CONFIG.providers?.anthropic, "a sibling provider is not our business");
   assert.deepEqual(next.someFutureKey, CONFIG.someFutureKey, "unknown top-level keys must be carried through");
@@ -189,7 +189,7 @@ test("models config: accessors tolerate a config with nothing in it", () => {
   assert.deepEqual(providerModels({}, "metabolomics"), []);
   assert.deepEqual(providerModels({ providers: { metabolomics: {} } }, "metabolomics"), []);
   assert.equal(providerBaseUrl({}, "metabolomics"), undefined);
-  assert.equal(providerBaseUrl(CONFIG, "metabolomics"), "https://llm.metabolomics.us/v1");
+  assert.equal(providerBaseUrl(CONFIG, "metabolomics"), "https://llm.example.com/v1");
 });
 
 test("models config: a round trip through disk preserves the key and the models", () => {

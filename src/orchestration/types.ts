@@ -121,6 +121,32 @@ export interface Mission {
   blocked_at?: string;
   /** Unique authority token for the current/most recent durable BLOCKED episode. */
   blocked_episode_id?: EntityId;
+  /**
+   * The operator's explicit model choice this mission adopted (Pi `/model`),
+   * honoured by every later worker dispatch over role pins and the router.
+   * Absent/null: automatic routing.
+   */
+  operator_model_pin?: OperatorModelPin | null;
+  /**
+   * When this mission's model choice was last decided (a pin adopted, or the
+   * operator released it). Only a session choice made after this is adopted,
+   * so a released mission is not re-pinned by the same old switch.
+   */
+  operator_model_decided_at?: string | null;
+  /**
+   * Set the instant an operator interrupt (Esc) pauses the mission, before any
+   * other bookkeeping; cleared only when the operator resumes it. While set,
+   * nothing automatic (supervisor, auto-resume, repair) may resume the mission.
+   */
+  operator_paused_at?: string | null;
+}
+
+/** A model the operator chose explicitly for a session's missions. */
+export interface OperatorModelPin {
+  provider: string;
+  id: string;
+  /** When the operator chose it. */
+  set_at: string;
 }
 
 export type TaskKind =
@@ -253,6 +279,19 @@ export interface Execution {
   logs: string[];
   artifact_refs: string[];
   status: ExecutionStatus;
+  /**
+   * Failure reason for FAILED executions (runner outcome.error or the thrown
+   * error message). Absent on success and on legacy events. Without this field
+   * backend failures (integration/validation/review) were recorded with empty
+   * detail and were undiagnosable from the store.
+   */
+  error?: string;
+  /**
+   * Short human-readable outcome summary from the runner (e.g. "integrated
+   * <branches> into <branch>; checks: fail"). Additive; absent on legacy
+   * events.
+   */
+  summary?: string;
   /**
    * Integration executions only: recovered worker commits (from a
    * wall-clock-timed-out execution) that this integration verifiably merged —
@@ -480,7 +519,8 @@ export interface RecoveryDecision {
   expectedMaterialChange: string;
   attempt: number;
   maxAttempts: number;
-  deadline: string;
+  /** Opt-in recovery deadline; null when recovery has no time limit (the default). */
+  deadline: string | null;
   nextActionAt: string;
   status: RecoveryStatus;
   decidedAt: string;

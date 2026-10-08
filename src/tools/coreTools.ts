@@ -5,6 +5,8 @@ import type { ContextBroker } from "../context/ContextBroker.ts";
 import { type Actor, isMachineEvidence } from "../core/types.ts";
 import type { Ledger } from "../ledger/Ledger.ts";
 import type { Orchestrator } from "../orchestration/orchestrator.ts";
+import type { Mission } from "../orchestration/types.ts";
+import { missionReportLines } from "./missionReport.ts";
 
 /** Shared services bound to the current repository's runtime. */
 export interface CoreServices {
@@ -20,6 +22,16 @@ export interface CoreServices {
   /** Authorized repository selected for this tool execution. */
   repoId?: string;
   repositoryRoot?: string;
+  /**
+   * Operator recovery of a durably stopped mission — what `/mission resume`
+   * runs (EngineeringRuntime.resumeBlockedMission). Optional: without it the
+   * mission tool's `resume` action points at the slash command.
+   */
+  resumeMission?: (missionId: string, signal?: AbortSignal) => Promise<Mission>;
+  /** Explicitly cancel a mission (the only thing that terminates a healthy one). */
+  cancelMission?: (missionId: string) => Promise<Mission>;
+  /** Release a mission from its operator model pin (back to automatic routing). */
+  clearMissionModelPin?: (missionId: string) => Promise<Mission>;
 }
 
 /**
@@ -31,10 +43,36 @@ export interface CoreServices {
  * definitions work in the interactive session (resolved by the current cwd) and
  * in worker sessions (bound to the runtime's fixed services).
  */
+/** Why a mission's current stop waits for the user, or null when the runtime may resume it. */
+function awaitingUser(store: Orchestrator["store"], mission: Mission): string | null {
+  if (mission.status === "WAITING_FOR_USER") return "status WAITING_FOR_USER";
+  const generation = store.listMissionResumptions(mission.mission_id).at(-1)?.generation ?? 0;
+  const decision = store
+    .listRecoveryDecisions(mission.mission_id)
+    .filter((candidate) => (candidate.resumptionGeneration ?? 0) === generation)
+    .at(-1);
+  if (!decision) return null;
+  if (decision.action === "WAIT_FOR_REQUIREMENT") return "requirement clarification";
+  const category = store.getFailureClassification(decision.classificationId)?.category;
+  if (category === "AUTHORIZATION_OR_CREDENTIAL") return "authorization or credentials";
+  if (category === "REQUIREMENT_AMBIGUITY") return "requirement clarification";
+  return null;
+}
+
 export function buildCoreTools(
   resolve: (cwd: string) => CoreServices | null | Promise<CoreServices | null>,
+  options: {
+    /** Why services are unavailable for a cwd (the real open failure), surfaced in tool results. */
+    unavailableReason?: (cwd: string) => string | null | undefined;
+  } = {},
 ): ToolDefinition[] {
   const servicesFor = (cwd: string): Promise<CoreServices | null> => Promise.resolve(resolve(cwd));
+  const notInitialized = (subject: string, cwd: string): string => {
+    const reason = options.unavailableReason?.(cwd);
+    return reason
+      ? `${subject} not initialized for this directory: ${reason}`
+      : `${subject} not initialized for this directory.`;
+  };
   const ledgerRead = defineTool({
     name: "ledger_read",
     label: "Ledger Read",
@@ -54,7 +92,7 @@ export function buildCoreTools(
       const services = await servicesFor(ctx.cwd);
       if (!services)
         return {
-          content: [{ type: "text", text: "Engineering runtime not initialized for this directory." }],
+          content: [{ type: "text", text: notInitialized("Engineering runtime", ctx.cwd) }],
           details: {},
         };
       const wi = (params.work_item_id as string | undefined) ?? services.currentWorkItemId();
@@ -132,7 +170,7 @@ export function buildCoreTools(
       const services = await servicesFor(ctx.cwd);
       if (!services)
         return {
-          content: [{ type: "text", text: "Engineering runtime not initialized for this directory." }],
+          content: [{ type: "text", text: notInitialized("Engineering runtime", ctx.cwd) }],
           details: {},
         };
       const ref = params.evidence ? String(params.evidence) : undefined;
@@ -175,7 +213,7 @@ export function buildCoreTools(
       const services = await servicesFor(ctx.cwd);
       if (!services)
         return {
-          content: [{ type: "text", text: "Engineering runtime not initialized for this directory." }],
+          content: [{ type: "text", text: notInitialized("Engineering runtime", ctx.cwd) }],
           details: {},
         };
       const meta = services.artifacts.getByUri(String(params.uri));
@@ -227,7 +265,7 @@ export function buildCoreTools(
       const services = await servicesFor(ctx.cwd);
       if (!services)
         return {
-          content: [{ type: "text", text: "Engineering runtime not initialized for this directory." }],
+          content: [{ type: "text", text: notInitialized("Engineering runtime", ctx.cwd) }],
           details: {},
         };
       if (!services.broker) return { content: [{ type: "text", text: "Not a git repository." }], details: {} };
@@ -253,7 +291,7 @@ export function buildCoreTools(
       const services = await servicesFor(ctx.cwd);
       if (!services)
         return {
-          content: [{ type: "text", text: "Engineering runtime not initialized for this directory." }],
+          content: [{ type: "text", text: notInitialized("Engineering runtime", ctx.cwd) }],
           details: {},
         };
       if (!services.broker) return { content: [{ type: "text", text: "Not a git repository." }], details: {} };
@@ -276,7 +314,7 @@ export function buildCoreTools(
       const services = await servicesFor(ctx.cwd);
       if (!services)
         return {
-          content: [{ type: "text", text: "Engineering runtime not initialized for this directory." }],
+          content: [{ type: "text", text: notInitialized("Engineering runtime", ctx.cwd) }],
           details: {},
         };
       if (!services.broker) return { content: [{ type: "text", text: "Not a git repository." }], details: {} };
@@ -292,9 +330,27 @@ export function buildCoreTools(
     name: "mission",
     label: "Mission",
     description:
-      "Run the orchestration mission pipeline for a normal-language engineering request: route intent, plan, execute workers, validate, fresh-review, and gate completion. Use this for implement/fix/refactor/investigate requests so the engineering workflow runs automatically.",
+      "Run the orchestration mission pipeline for a normal-language engineering request: route intent, plan, execute workers, validate, fresh-review, and gate completion. Use this for implement/fix/refactor/investigate requests so the engineering workflow runs automatically. action=status reports an existing mission; action=resume recovers a stopped/blocked/paused mission (same as /mission resume <id>); a stop that waits for the user is refused. Interrupting a run pauses the mission (resumable); only action=cancel ends it — use cancel only when the user explicitly asks to cancel.",
     parameters: Type.Object({
-      request: Type.String({ description: "The normal-language request (e.g. 'Add a health endpoint')." }),
+      action: Type.Optional(
+        Type.Union(
+          [
+            Type.Literal("run"),
+            Type.Literal("status"),
+            Type.Literal("resume"),
+            Type.Literal("cancel"),
+            Type.Literal("clear_pin"),
+          ],
+          {
+            description:
+              "run (default) starts a mission from `request`; status/resume/cancel/clear_pin act on `missionId`. clear_pin releases the mission from the operator's /model pin (automatic routing).",
+          },
+        ),
+      ),
+      request: Type.Optional(
+        Type.String({ description: "The normal-language request (e.g. 'Add a health endpoint'). Required for run." }),
+      ),
+      missionId: Type.Optional(Type.String({ description: "Mission id for status/resume (e.g. MSN-abc123)." })),
       mutate: Type.Optional(
         Type.Boolean({
           description: "Whether the request mutates repository source (default true for implement/fix).",
@@ -304,12 +360,90 @@ export function buildCoreTools(
     }),
     async execute(_id, params, signal, _onUpdate, ctx) {
       const services = await servicesFor(ctx.cwd);
-      if (!services?.orchestrator)
-        return {
-          content: [{ type: "text", text: "Orchestrator not initialized for this directory." }],
-          details: {},
-        };
-      const request = String(params.request);
+      const text = (body: string, details: Record<string, unknown> = {}) => ({
+        content: [{ type: "text" as const, text: body }],
+        details,
+      });
+      if (!services?.orchestrator) return text(notInitialized("Orchestrator", ctx.cwd));
+      const store = services.orchestrator.store as Orchestrator["store"] | undefined;
+      const action = (params.action as string | undefined) ?? "run";
+      const describe = (m: Mission, extra: string[] = []) =>
+        text(
+          [
+            `Mission ${m.mission_id} [${m.status}] workflow=${m.workflow_class}`,
+            ...extra,
+            ...(store ? missionReportLines(store, m.mission_id) : []),
+          ].join("\n"),
+          {
+            missionId: m.mission_id,
+            status: m.status,
+          },
+        );
+
+      if (action === "clear_pin") {
+        const missionId = String(params.missionId ?? "").trim();
+        if (!missionId) return text("The clear_pin action needs missionId.");
+        const current = store?.getMission(missionId);
+        if (!current) return text(`Unknown mission ${missionId}.`);
+        if (!services.clearMissionModelPin) {
+          return text(
+            `Clearing a pin is not available through the tool in this session. Ask the operator to run /mission resume ${missionId} --model auto.`,
+            { missionId, status: current.status },
+          );
+        }
+        const released = await services.clearMissionModelPin(missionId);
+        return describe(released, [
+          "Operator pin released: the mission uses role pins and the router from its next dispatch.",
+        ]);
+      }
+      if (action === "cancel") {
+        const missionId = String(params.missionId ?? "").trim();
+        if (!missionId) return text("The cancel action needs missionId.");
+        const current = store?.getMission(missionId);
+        if (!current) return text(`Unknown mission ${missionId}.`);
+        if (!services.cancelMission) {
+          return text(
+            `Cancel is not available through the tool in this session. Ask the operator to run /mission cancel ${missionId}.`,
+            {
+              missionId,
+              status: current.status,
+            },
+          );
+        }
+        const canceled = await services.cancelMission(missionId);
+        return describe(canceled, ["Canceled at the operator's request."]);
+      }
+      if (action === "status" || action === "resume") {
+        const missionId = String(params.missionId ?? "").trim();
+        if (!missionId) return text(`The ${action} action needs missionId.`);
+        const current = store?.getMission(missionId);
+        if (!current) return text(`Unknown mission ${missionId}.`);
+        if (action === "status") return describe(current);
+        // Resuming a stop that waits for the user (a requirement question, a
+        // credential the user must fix) is the user's call, not the model's:
+        // the tool refuses and points at the operator command.
+        const awaiting = store ? awaitingUser(store, current) : null;
+        if (awaiting) {
+          return describe(current, [
+            `Resume refused: the mission is waiting for the user (${awaiting}). Ask the user; after they respond they can run /mission resume ${missionId}.`,
+          ]);
+        }
+        if (!services.resumeMission) {
+          return text(
+            `Resume is not available through the tool in this session. Ask the operator to run /mission resume ${missionId}.`,
+            { missionId, status: current.status },
+          );
+        }
+        try {
+          const resumed = await services.resumeMission(missionId, signal);
+          return describe(resumed, ["Resume requested."]);
+        } catch (error) {
+          return describe(current, [`Resume failed: ${error instanceof Error ? error.message : String(error)}`]);
+        }
+      }
+
+      const request = String(params.request ?? "").trim();
+      if (!request) return text("The run action needs a request.");
       const result = await services.orchestrator.orchestrate(request, {
         repository: services.repositoryRoot ?? ctx.cwd,
         // The orchestrator resolves the request's explicit repository before
@@ -319,6 +453,8 @@ export function buildCoreTools(
         constraints: (params.constraints as string[] | undefined) ?? [],
         mutationRequested: params.mutate ?? true,
         signal,
+        // Interrupting the call (Esc) pauses the mission; it never cancels it.
+        interrupt: "pause",
         // Stream every live progress line (phase/task transitions + progress
         // bar) to the operator via the tool update callback instead of blocking
         // silently for the whole mission.
@@ -327,19 +463,30 @@ export function buildCoreTools(
         },
       });
       const m = result.mission;
-      const statusLine = result.paused
-        ? "PAUSED: infrastructure retry window exhausted. Progress is preserved; the mission auto-resumes when the gateway recovers (it is not a failure)."
-        : result.completed
-          ? "Completed: all gates passed."
-          : `Not completed: ${result.failureReason ?? "gates unmet"}.`;
+      const statusLine =
+        result.pausedBy === "operator" && m.status !== "PAUSED_INFRASTRUCTURE"
+          ? `Interrupt noted: the mission was left ${m.status} and was not canceled. /mission resume ${m.mission_id} continues it; /mission cancel ${m.mission_id} ends it.`
+          : result.pausedBy === "operator"
+            ? `PAUSED by interrupt: the mission was not canceled and its progress is preserved. Resume it with /mission resume ${m.mission_id} (or this tool's resume action); /mission cancel ${m.mission_id} ends it.`
+            : result.paused
+              ? "PAUSED: infrastructure retry window exhausted. Progress is preserved; the mission auto-resumes when the gateway recovers (it is not a failure)."
+              : result.completed
+                ? "Completed: all gates passed."
+                : `Not completed: ${result.failureReason ?? "gates unmet"}.`;
       const lines = [
         `Mission ${m.mission_id} [${m.status}] workflow=${m.workflow_class}`,
         `Intent: ${result.intent.intent.join(", ")} | required gates: ${m.required_gates.join(", ") || "none"}`,
         statusLine,
+        ...(!result.completed && !result.paused && store ? missionReportLines(store, m.mission_id) : []),
       ];
       return {
         content: [{ type: "text", text: lines.join("\n") }],
-        details: { missionId: m.mission_id, status: m.status, paused: result.paused ?? false },
+        details: {
+          missionId: m.mission_id,
+          status: m.status,
+          paused: result.paused ?? false,
+          ...(result.pausedBy ? { pausedBy: result.pausedBy } : {}),
+        },
       };
     },
   });

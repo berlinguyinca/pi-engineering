@@ -171,10 +171,14 @@ records that the orchestrator persists and the completion gate blocks on.
 
 ## Storage
 
-Mission/task/execution state is event-sourced into
-`<repoRoot>/.pi-eng/orchestration.jsonl` via the shared `JsonlEventStore`
-backend and replayed on open — execution state survives restart and is
-reconstructable/auditable from events (not stored only in semantic memory).
+Mission/task/execution state is event-sourced into the worktree's orchestration
+namespace under the machine-local state directory
+(`~/.local/state/pi-engineering/worktrees/<worktree-id>/events/<session-id>.jsonl`,
+one stream per session, read merged through `SessionEventStore`) and replayed on
+open — execution state survives restart and is reconstructable/auditable from
+events (not stored only in semantic memory). Use `EngineeringRuntime.orchestrationEvents()`
+rather than reading a particular file. A legacy `.pi-eng/orchestration.jsonl` is
+imported automatically and preserved.
 
 ## Commands
 

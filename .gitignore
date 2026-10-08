@@ -27,4 +27,7 @@ npm-debug.log*
 
 # pi-engineering-runtime durable state
 .pi-eng/
+
+# oh-my-claudecode hook state (written by local agent hooks)
+.omc/
 rr*.ts

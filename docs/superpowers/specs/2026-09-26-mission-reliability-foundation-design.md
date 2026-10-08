@@ -25,8 +25,8 @@ mission always has a durable owner and one understandable next state:
 ## Incident that drives this design
 
 Mission `MSN-qSLaeM` was created while Pi ran at
-`/home/wohlgemuth/IdeaProjects`, but its requested multi-repository workspace
-was `/home/wohlgemuth/Downloads/tern-operations-ui`. The runtime bound Git,
+`/home/<user>/IdeaProjects`, but its requested multi-repository workspace
+was `/home/<user>/Downloads/tern-operations-ui`. The runtime bound Git,
 semantic repository tools, validation, and review to the meta-root. It planned a
 large six-repository mission as one implementation task, the implementer timed
 out, and the reviewer could not inspect the actual repositories or diffs.

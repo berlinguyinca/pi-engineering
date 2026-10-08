@@ -16,6 +16,9 @@ import { CommandVerifier } from "../../src/verify/Verifier.ts";
 import type { WorkerActivity, WorkerExecutor, WorkerRequest } from "../../src/workers/WorkerExecutor.ts";
 import { makeFixtureRepo } from "../fixtures/make-fixture.ts";
 
+const LIMIT_REACHED =
+  "configured task wall-clock limit (limits.max_task_wall_clock_ms) reached after a durable partial checkpoint";
+
 const exec = promisify(execFile);
 
 function ok(req: WorkerRequest) {
@@ -118,7 +121,7 @@ describe("budget-exhausted worker that ran builds", () => {
     const { result, store } = await run(buildingWorker([{ elapsedMs: 450 }, { elapsedMs: 450 }, {}]));
     assert.equal(result.mission.status, "BLOCKED", result.failureReason ?? "");
     const reason = result.failureReason ?? "";
-    assert.match(reason, /^task execution budget exhausted after a durable partial checkpoint: /);
+    assert.ok(reason.startsWith(`${LIMIT_REACHED}: `), reason);
     assert.match(reason, /probable cold build in an isolated worktree/);
     assert.match(reason, /in 3 build command\(s\) \(cargo x3\), 1 still running at the deadline, and made no commit/);
     const finding = store.listFindings(result.mission.mission_id).find((f) => f.category === "execution_budget");
@@ -129,7 +132,7 @@ describe("budget-exhausted worker that ran builds", () => {
     const classification = store
       .listFailureClassifications(result.mission.mission_id)
       .find((c) => c.category === "TASK_BUDGET_EXHAUSTED");
-    assert.equal(classification?.summary, "task execution budget exhausted after a durable partial checkpoint");
+    assert.equal(classification?.summary, LIMIT_REACHED);
   });
 
   it("says the time went elsewhere when builds were short", async () => {
@@ -144,7 +147,7 @@ describe("budget-exhausted worker that ran builds", () => {
   it("keeps the bare reason when the worker ran no builds", async () => {
     const { result, store } = await run(buildingWorker([]));
     assert.equal(result.mission.status, "BLOCKED", result.failureReason ?? "");
-    assert.equal(result.failureReason, "task execution budget exhausted after a durable partial checkpoint");
+    assert.equal(result.failureReason, LIMIT_REACHED);
     assert.equal(
       store.listFindings(result.mission.mission_id).filter((f) => f.category === "execution_budget").length,
       0,

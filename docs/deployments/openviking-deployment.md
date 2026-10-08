@@ -1,23 +1,23 @@
-# OpenViking — Production deployment (whiteale, Apptainer)
+# OpenViking — Production deployment (your-host, Apptainer)
 
 OpenViking is the tier-1 durable-memory endpoint that pi workers talk to. The
 production deployment runs as an **Apptainer (Singularity) container** on the
-lab's whiteale server, fronted by an **nginx virtual host**, and is reachable at:
+lab's your-host server, fronted by an **nginx virtual host**, and is reachable at:
 
-- **`https://viking.metabolomics.us`**
-- Health: `GET https://viking.metabolomics.us/health` (200 ok / 503 degraded)
-- Metrics: `GET https://viking.metabolomics.us/metrics` (Prometheus text format)
+- **`https://viking.example.com`**
+- Health: `GET https://viking.example.com/health` (200 ok / 503 degraded)
+- Metrics: `GET https://viking.example.com/metrics` (Prometheus text format)
 
-DNS for `viking.metabolomics.us` is forwarded via **Route 53** to the whiteale
-server (`128.120.143.172`).
+DNS for `viking.example.com` is forwarded via **Route 53** to the your-host
+server (`<HOST_IP>`).
 
 ## Architecture
 
 ```
-                    Route 53   viking.metabolomics.us  ->  128.120.143.172
+                    Route 53   viking.example.com  ->  <HOST_IP>
                                     (A record, TTL 300)
                                     |
-                        whiteale.fiehnlab.ucdavis.edu  (128.120.143.172, kvm-node-12)
+                        your-host.example.com  (<HOST_IP>, kvm-node-N)
                                     |
                        nginx virtual host (conf.d/viking.conf)
                     :80 ACME challenge  +  :443 TLS (Let's Encrypt, auto-renew)
@@ -34,7 +34,7 @@ server (`128.120.143.172`).
 
 ### The data volume (keys & passwords)
 
-All credentials and durable state for the deployment live on whiteale under the
+All credentials and durable state for the deployment live on your-host under the
 **data volume** `/opt/viking/data`:
 
 ```
@@ -53,7 +53,7 @@ the token + `DATABASE_URL` at runtime without baking secrets into the image.
 > The container is **stateless**. Durable memory lives only in the host's
 > PostgreSQL (`openviking` role/db). Redeploying the container loses nothing.
 
-## Components on whiteale
+## Components on your-host
 
 | Component         | Details                                                        |
 |-------------------|---------------------------------------------------------------|
@@ -61,53 +61,53 @@ the token + `DATABASE_URL` at runtime without baking secrets into the image.
 | Build source      | `/opt/viking/build/` (scp'd service files; repo is private)    |
 | systemd service   | `openviking.service` — `apptainer run --env-file ... openviking.sif`, listens `127.0.0.1:8090`, auto-restart |
 | nginx vhost       | `/etc/nginx/conf.d/viking.conf` (mirrors `mcp.conf`)           |
-| TLS               | Let's Encrypt, `/etc/letsencrypt/live/viking.metabolomics.us`, certbot auto-renew |
+| TLS               | Let's Encrypt, `/etc/letsencrypt/live/viking.example.com`, certbot auto-renew |
 | Postgres          | host Postgres 18, role/db `openviking`, `GRANT ALL ON DATABASE` |
 | Logs              | `journalctl -u openviking`; nginx `viking.{access,error}.log`   |
 
 ## Deploy / update
 
 ```bash
-# from this repo (needs ssh access to whiteale as $REMOTE_USER, passwordless sudo)
-./deploy/apptainer/deploy-whiteale.sh
+# from this repo (needs ssh access to your-host as $REMOTE_USER, passwordless sudo)
+./deploy/apptainer/deploy-host.sh
 ```
 
 Idempotent: re-running skips the SIF build (if present) and existing secrets,
 re-asserts the role/db, reinstalls the systemd unit + nginx vhost (reissuing the
 cert if needed), and restarts. To rebuild the container from new service code,
-remove `/opt/viking/openviking.sif` on whiteale first (or delete it in the script).
+remove `/opt/viking/openviking.sif` on your-host first (or delete it in the script).
 
 ## Pointing pi workers at it
 
 Workers use the `openviking` durable provider with the token from
-`/opt/viking/data/secrets/.env` on whiteale:
+`/opt/viking/data/secrets/.env` on your-host:
 
 ```ts
 durable: {
   kind: "openviking",
-  baseUrl: "https://viking.metabolomics.us",
+  baseUrl: "https://viking.example.com",
   token: "<OPENVIKING_TOKEN>",
   providerTimeoutMs: 10_000,
 }
 ```
 
-## Integrating into status.metabolomics.us
+## Integrating into status.example.com
 
-`status.metabolomics.us` is a separate campus box (`128.120.136.17`) behind an
+`status.example.com` is a separate campus box (`<STATUS_HOST_IP>`) behind an
 oauth2-proxy sign-in page for which no credentials are available from this
 environment, so it cannot be edited directly here. The service is already
 instrumented for tracking there — add two monitors:
 
-1. **HTTP(S) up monitor** → `https://viking.metabolomics.us/health`
+1. **HTTP(S) up monitor** → `https://viking.example.com/health`
    (200 = up; 503 = Postgres unreachable = degraded).
-2. **Metrics scrape** → `https://viking.metabolomics.us/metrics`
+2. **Metrics scrape** → `https://viking.example.com/metrics`
    (`openviking_up{kind,version,auth}`, `openviking_memory_records`,
    `openviking_requests_total{method,route,status}`).
 
 ## Notes
 
-- Port `8090` on whiteale is the container's bind; nginx proxies to
+- Port `8090` on your-host is the container's bind; nginx proxies to
   `127.0.0.1:8090`. The API is Bearer-token protected (`auth=on`), matching the
   box's existing `mcp` service convention of binding the service port openly.
 - The AWS deployment created earlier was decommissioned (all EC2/ALB/EIP/IAM/
-  S3/ACM resources removed). The Route 53 record now points at whiteale.
+  S3/ACM resources removed). The Route 53 record now points at your-host.

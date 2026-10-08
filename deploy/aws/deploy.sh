@@ -4,7 +4,7 @@
 #   EC2 (docker compose, data volume at /opt/viking/data with secrets/)  <- service
 #   ALB + ACM cert  (TLS terminated at the load balancer)                 <- front
 #   Elastic IP      (stable SSH address for the box)                      <- ssh
-#   Route 53 record viking.metabolomics.us -> ALB                        <- DNS
+#   Route 53 record viking.example.com -> ALB                           <- DNS
 #
 # Idempotent: safe to re-run; it finds existing resources by Name tag and only
 # creates what is missing. Requires an authenticated AWS CLI with admin access.
@@ -16,17 +16,17 @@ set -euo pipefail
 
 # ---- configuration (override via env) ------------------------------------
 REGION="${REGION:-us-west-2}"
-HOSTED_ZONE_ID="${HOSTED_ZONE_ID:-Z2ANBWTR462YC8}"   # metabolomics.us
-DOMAIN="${DOMAIN:-viking.metabolomics.us}"
-VPC_ID="${VPC_ID:-vpc-1f8ec666}"
-SUBNET_ID="${SUBNET_ID:-subnet-e382339a}"            # us-west-2a public (EC2)
+HOSTED_ZONE_ID="${HOSTED_ZONE_ID:-ZEXAMPLEHOSTEDZONE}"   # your DNS zone
+DOMAIN="${DOMAIN:-viking.example.com}"
+VPC_ID="${VPC_ID:-vpc-EXAMPLE}"
+SUBNET_ID="${SUBNET_ID:-subnet-EXAMPLE1}"            # us-west-2a public (EC2)
 # ALB requires >=2 public subnets in different AZs.
-SUBNETS="${SUBNETS:-subnet-e382339a subnet-b779a9fc}"  # us-west-2a + us-west-2b
-KEY_NAME="${KEY_NAME:-wohlgemuth}"
+SUBNETS="${SUBNETS:-subnet-EXAMPLE1 subnet-EXAMPLE2}"  # us-west-2a + us-west-2b
+KEY_NAME="${KEY_NAME:-deploy}"
 AMI="${AMI:-ami-04678417fc39d7171}"                  # Ubuntu 24.04 amd64
 INSTANCE_TYPE="${INSTANCE_TYPE:-t3.small}"
 ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
-BUCKET="${BUCKET:-viking-metabolomics-us-$ACCOUNT}"
+BUCKET="${BUCKET:-viking-example-com-$ACCOUNT}"
 NAME="viking-openviking"
 TAG="Name=$NAME"
 

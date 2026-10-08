@@ -40,7 +40,7 @@ describe("ProjectRegistry", () => {
     for (const remote of [
       `ssh://git:${TOKEN}@github.com/acme/alpha.git`,
       "git+ssh://user:pw@github.com/acme/alpha.git",
-      `https://gert:${TOKEN}@github.com/acme/alpha.git`,
+      `https://user:${TOKEN}@github.com/acme/alpha.git`,
       "git@github.com:acme/alpha.git",
     ]) {
       const canonical = normalizeRemote(remote);

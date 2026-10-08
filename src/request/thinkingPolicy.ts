@@ -63,7 +63,7 @@ export const DEFAULT_THINKING_OFF_CONFIG: ThinkingOffConfig = {
   summaries: true,
   lowOutputBudget: true,
   lowOutputBudgetTokens: 16_384,
-  gatewayHosts: ["llm.metabolomics.us"],
+  gatewayHosts: ["llm.example.com"],
   providers: ["metabolomics"],
 };
 

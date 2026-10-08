@@ -44,10 +44,11 @@ describe("long-wait policy: defaults and knobs", () => {
     }
   });
 
-  it("missions keep retrying for 12h with capped backoff, then pause and auto-resume for 24h", () => {
+  it("missions keep retrying for 12h with capped backoff, then pause and auto-resume with no horizon", () => {
     assert.equal(DEFAULT_GATEWAY_RESILIENCE.retry_window_ms, 12 * HOUR);
     assert.equal(DEFAULT_GATEWAY_RESILIENCE.max_backoff_ms, 180_000);
-    assert.equal(DEFAULT_GATEWAY_RESILIENCE.auto_resume_horizon_ms, 24 * HOUR);
+    // Waiting for inference capacity never ends a mission on a clock.
+    assert.equal(DEFAULT_GATEWAY_RESILIENCE.auto_resume_horizon_ms, Number.POSITIVE_INFINITY);
     const cfg = resolveGatewayResilienceConfig({
       PI_GATEWAY_RETRY_WINDOW: "6h",
       PI_GATEWAY_MAX_BACKOFF: "5m",
@@ -557,7 +558,8 @@ describe("long-wait policy: relaunch cost and ceilings", () => {
   it("the default relaunch cap is 100 and configurable", () => {
     assert.equal(DEFAULT_GATEWAY_RESILIENCE.max_relaunches, 100);
     assert.equal(resolveGatewayResilienceConfig({ PI_GATEWAY_MAX_RELAUNCHES: "40" }).max_relaunches, 40);
-    assert.equal(DEFAULT_GATEWAY_RESILIENCE.max_outage_ms, 36 * HOUR);
+    // The total outage ceiling is opt-in: unset by default, set by the operator.
+    assert.equal(DEFAULT_GATEWAY_RESILIENCE.max_outage_ms, undefined);
     assert.equal(resolveGatewayResilienceConfig({ PI_GATEWAY_MAX_OUTAGE: "48h" }).max_outage_ms, 48 * HOUR);
   });
 

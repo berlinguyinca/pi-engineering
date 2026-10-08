@@ -1,25 +1,24 @@
 /**
- * The durable orchestration store — and, with it, the store's single-writer
- * file lock — is what serializes concurrent pi sessions. By default it lives in
- * a FIXED location (`<repoRoot>/.pi-eng/orchestration.jsonl`, the git toplevel
- * of the session's launch directory). When several sessions are launched from a
- * shared parent directory (one per project / branch / worktree) they all resolve
- * to the same store and serialize on one lock, even though they never touch the
- * same files.
+ * Where the orchestration store lives, and why concurrent sessions no longer
+ * contend on it.
  *
- * `PI_ENGINEERING_ORCHESTRATION_DIR` relocates the store (and its lock) to a
- * per-worktree / per-session directory so those sessions run in parallel. These
- * tests pin the location semantics and reproduce + resolve the contention.
+ * The store used to be ONE file (`<repoRoot>/.pi-eng/orchestration.jsonl`)
+ * behind ONE exclusive writer lock, so every session launched from a shared
+ * parent directory serialized on it ("Engineering runtime did not open ... lock
+ * held"). Now each worktree gets a namespace under the machine-local state dir,
+ * keyed by git worktree identity, and each session appends to its own stream.
+ * `PI_ENGINEERING_ORCHESTRATION_DIR` relocates the namespace but keeps
+ * per-session writers.
  */
 import assert from "node:assert/strict";
-import { existsSync } from "node:fs";
-import { mkdtemp, rm } from "node:fs/promises";
+import { existsSync, readdirSync } from "node:fs";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
-import { ExclusiveFileLock } from "../../src/platform/eventstore/fileLock.ts";
-import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 import { EngineeringRuntime } from "../../src/runtime/EngineeringRuntime.ts";
+import { RuntimeSession } from "../../src/runtime/isolation/RuntimeSession.ts";
+import { resolveWorktreeIdentity } from "../../src/runtime/isolation/WorktreeIdentity.ts";
 import { CommandVerifier } from "../../src/verify/Verifier.ts";
 import type { WorkerExecutor } from "../../src/workers/WorkerExecutor.ts";
 import { makeFixtureRepo } from "../fixtures/make-fixture.ts";
@@ -60,28 +59,41 @@ function withEnv(value: string | undefined, fn: () => Promise<void>): Promise<vo
     });
 }
 
-describe("orchestration store location (per-worktree lock)", () => {
+describe("orchestration store location (per-worktree namespace, per-session writers)", () => {
   const cleanupFns: Array<() => Promise<void>> = [];
   after(async () => {
     for (const fn of cleanupFns) await fn().catch(() => undefined);
   });
 
-  it("defaults to <workDir>/orchestration.jsonl when the override is unset", async () => {
+  it("places the namespace under the state dir keyed by worktree identity, with this session's stream", async () => {
     await withEnv(undefined, async () => {
       const fx = await makeFixtureRepo();
       cleanupFns.push(fx.cleanup);
       const rt = await EngineeringRuntime.open({ cwd: fx.root, worker: noopWorker(), verifier: new CommandVerifier() });
       try {
-        const lockAtDefault = join(fx.root, ".pi-eng", "orchestration.jsonl.lock");
-        assert.ok(existsSync(join(fx.root, ".pi-eng")), "workDir .pi-eng is created");
-        assert.ok(existsSync(lockAtDefault), "writer lock lives at the default <workDir> location");
+        const identity = await resolveWorktreeIdentity(fx.root);
+        const binding = rt.runtimeBinding;
+        assert.ok(binding, "runtime exposes its binding");
+        assert.equal(binding.kind, "worktree");
+        assert.equal(binding.identity.worktreeId, identity.worktreeId);
+        assert.ok(binding.runtimeDir?.startsWith(process.env.PI_ENGINEERING_STATE_DIR ?? "<unset>"));
+        assert.ok(existsSync(binding.eventsDir ?? ""), "events dir exists");
+        // Opening may write nothing yet; the first mission event lands in THIS session's stream.
+        await rt.missionStore?.flush();
+        const session = RuntimeSession.current();
+        const streams = readdirSync(binding.eventsDir ?? "");
+        assert.ok(
+          streams.every((name) => name === `${session.sessionId}.jsonl`),
+          `only this session writes: ${streams}`,
+        );
+        assert.ok(!existsSync(join(fx.root, ".pi-eng", "orchestration.jsonl.lock")), "no repository writer lock");
       } finally {
         await rt.close();
       }
     });
   });
 
-  it("relocates the store + lock to PI_ENGINEERING_ORCHESTRATION_DIR when set", async () => {
+  it("relocates the namespace to PI_ENGINEERING_ORCHESTRATION_DIR but keeps per-session writers", async () => {
     const overrideDir = join(await mkdtemp(join(tmpdir(), "pi-orch-override-")), "state");
     cleanupFns.push(() => rm(overrideDir, { recursive: true, force: true }));
     await withEnv(overrideDir, async () => {
@@ -89,41 +101,61 @@ describe("orchestration store location (per-worktree lock)", () => {
       cleanupFns.push(fx.cleanup);
       const rt = await EngineeringRuntime.open({ cwd: fx.root, worker: noopWorker(), verifier: new CommandVerifier() });
       try {
-        assert.ok(
-          existsSync(join(overrideDir, "orchestration.jsonl.lock")),
-          "writer lock is relocated to the override dir",
-        );
-        assert.ok(
-          !existsSync(join(fx.root, ".pi-eng", "orchestration.jsonl.lock")),
-          "no writer lock remains at the fixed default location",
-        );
+        assert.equal(rt.runtimeBinding?.kind, "override");
+        assert.equal(rt.runtimeBinding?.runtimeDir, overrideDir);
+        assert.ok(existsSync(join(overrideDir, "events")), "per-session event streams live in the override");
+        assert.ok(!existsSync(join(overrideDir, "orchestration.jsonl.lock")), "no shared single-writer lock");
       } finally {
         await rt.close();
       }
     });
   });
 
-  it("does not contend when sessions use different orchestration dirs, but does on a shared fixed dir", async () => {
-    const dirA = await mkdtemp(join(tmpdir(), "pi-orch-shared-"));
-    const dirB = await mkdtemp(join(tmpdir(), "pi-orch-isolated-"));
-    cleanupFns.push(() => rm(dirA, { recursive: true, force: true }));
-    cleanupFns.push(() => rm(dirB, { recursive: true, force: true }));
+  it("opens even when a stale legacy writer lock with unreadable owner metadata sits in .pi-eng", async () => {
+    await withEnv(undefined, async () => {
+      const fx = await makeFixtureRepo();
+      cleanupFns.push(fx.cleanup);
+      await mkdir(join(fx.root, ".pi-eng"), { recursive: true });
+      // The exact incident: a lock whose owner metadata is missing/unreadable.
+      await writeFile(join(fx.root, ".pi-eng", "orchestration.jsonl.lock"), "");
+      const rt = await EngineeringRuntime.open({ cwd: fx.root, worker: noopWorker(), verifier: new CommandVerifier() });
+      try {
+        assert.ok(rt.orchestrator, "orchestrator is initialized");
+        assert.ok(rt.missionStore, "mission store is initialized");
+      } finally {
+        await rt.close();
+      }
+    });
+  });
 
-    // Session A holds the single-writer lock on the shared fixed store.
-    const heldByA = await ExclusiveFileLock.acquire(join(dirA, "orchestration.jsonl"));
-    try {
-      // Session B (its own dir, as the override provides) opens without contention.
-      const storeB = await JsonlEventStore.open(join(dirB, "orchestration.jsonl"));
-      storeB.close();
-
-      // A session that would share A's fixed dir is blocked — the incident.
-      await assert.rejects(
-        JsonlEventStore.open(join(dirA, "orchestration.jsonl")),
-        /writer lock .* held/i,
-        "sharing the fixed orchestration store must contend",
-      );
-    } finally {
-      heldByA.release();
-    }
+  it("imports a legacy orchestration.jsonl without modifying it", async () => {
+    await withEnv(undefined, async () => {
+      const fx = await makeFixtureRepo();
+      cleanupFns.push(fx.cleanup);
+      await mkdir(join(fx.root, ".pi-eng"), { recursive: true });
+      const legacy = join(fx.root, ".pi-eng", "orchestration.jsonl");
+      const event = {
+        event_id: "oevt-legacy-1",
+        timestamp: "2026-01-01T00:00:00.000Z",
+        type: "mission.created",
+        project_id: null,
+        run_id: "MSN-legacy",
+        worker_id: null,
+        payload: { mission_id: "MSN-legacy" },
+      };
+      const original = `${JSON.stringify(event)}\n{"event_id":"torn`;
+      await writeFile(legacy, original);
+      const rt = await EngineeringRuntime.open({ cwd: fx.root, worker: noopWorker(), verifier: new CommandVerifier() });
+      try {
+        const eventsDir = rt.runtimeBinding?.eventsDir ?? "";
+        const imported = readdirSync(eventsDir).filter((name) => name.startsWith("legacy-"));
+        assert.equal(imported.length, 1, "one legacy import stream");
+        const lines = (await readFile(join(eventsDir, imported[0]!), "utf8")).trim().split("\n");
+        assert.equal(lines.length, 1, "only the valid event is imported");
+        assert.equal(await readFile(legacy, "utf8"), original, "the legacy file is preserved byte for byte");
+      } finally {
+        await rt.close();
+      }
+    });
   });
 });

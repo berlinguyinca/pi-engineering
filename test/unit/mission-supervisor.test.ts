@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { describe, it } from "node:test";
+import { afterEach, beforeEach, describe, it } from "node:test";
 import { taskCoverageFingerprint } from "../../src/orchestration/evidence.ts";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
 import { MissionObservability } from "../../src/orchestration/observability/MissionObservability.ts";
@@ -48,6 +48,18 @@ function harness(initialNow = Date.parse("2026-09-27T12:00:00.000Z")) {
 }
 
 describe("MissionSupervisor", () => {
+  // MissionSupervisor.start() deliberately unrefs its interval so a background
+  // monitor never keeps a process alive. The interval tests await work that
+  // only that interval performs, so hold the event loop open for each test;
+  // otherwise node:test sees a drained loop and cancels the rest of the suite.
+  let keepAlive: ReturnType<typeof setInterval> | undefined;
+  beforeEach(() => {
+    keepAlive = setInterval(() => {}, 60_000);
+  });
+  afterEach(() => {
+    clearInterval(keepAlive);
+  });
+
   it("schedules durable orphan recovery for zero-worker runnable work", async () => {
     const h = harness();
     const task = h.store.createTask({
@@ -178,18 +190,64 @@ describe("MissionSupervisor", () => {
     assert.ok(status?.decision);
   });
 
-  it("treats heartbeat as liveness while meaningful-progress age drives STALLED recovery", async () => {
+  it("protects fresh-heartbeat workers from STALLED and fences hung workers after the debounce", async () => {
     const start = Date.parse("2026-09-27T12:00:00.000Z");
-    const h = harness(start);
-    h.observability.workerStarted(h.mission.mission_id, "worker-1");
-    h.setNow(start + 6 * 60_000);
-    h.observability.heartbeat(h.mission.mission_id, "worker-1");
+    const setup = () => {
+      const h = harness(start);
+      const task = h.store.createTask({
+        mission_id: h.mission.mission_id,
+        kind: "agent",
+        role: "implementer",
+        objective: "active work",
+      });
+      h.store.transitionTask(task.task_id, "READY");
+      const execution = h.store.createExecution({
+        task_id: task.task_id,
+        backend: "agent",
+        mission_id: h.mission.mission_id,
+      });
+      h.store.transitionTask(task.task_id, "RUNNING", "system", {
+        assigned_execution_id: execution.execution_id,
+      });
+      h.store.setExecutionStatus(execution.execution_id, "RUNNING");
+      h.observability.workerStarted(h.mission.mission_id, "worker-1", {
+        taskId: task.task_id,
+      });
+      return h;
+    };
 
-    const [status] = await h.supervisor.tick();
+    // (a) FRESH-heartbeat protection: worker started at t0, RUNNING execution,
+    // and a fresh heartbeat at t0+6min. Meaningful progress is stale but the
+    // raw-activity heartbeat is live, so the projection is SLOW (never
+    // STALLED), and the RUNNING execution keeps the supervisor from an orphaned
+    // fall-through. One tick must not fence the worker.
+    {
+      const h = setup();
+      h.setNow(start + 6 * 60_000);
+      h.observability.heartbeat(h.mission.mission_id, "worker-1");
 
-    assert.equal(status?.health, "STALLED");
-    assert.equal(status?.lastMeaningfulProgressAt, new Date(start).toISOString());
-    assert.ok(status?.decision, "stalled status must schedule recovery instead of relabeling only");
+      const [status] = await h.supervisor.tick();
+
+      assert.notEqual(status?.health, "STALLED", "a fresh-heartbeat worker must never be fenced");
+      assert.equal(status?.health, "HEALTHY");
+    }
+
+    // (b) HUNG-worker fencing: same setup but no fresh heartbeat — the last
+    // heartbeat is at t0 (stale by t0+6min). The STALLED projection is
+    // debounced: the first tick is not yet STALLED, and the second tick yields
+    // STALLED with a durable recovery decision.
+    {
+      const h = setup();
+      h.setNow(start + 6 * 60_000);
+
+      const [first] = await h.supervisor.tick();
+      assert.notEqual(first?.health, "STALLED", "a single stale projection is debounced");
+
+      const [second] = await h.supervisor.tick();
+      assert.equal(second?.health, "STALLED");
+      assert.equal(second?.lastMeaningfulProgressAt, new Date(start).toISOString());
+      assert.ok(second?.decision, "stalled status must schedule recovery instead of relabeling only");
+    }
   });
 
   it("turns a named wait past its deadline into an actionable stop", async () => {

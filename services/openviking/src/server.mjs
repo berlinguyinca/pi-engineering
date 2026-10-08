@@ -24,7 +24,7 @@ import { MemoryStore } from "./store.mjs";
 
 /**
  * Minimal Prometheus text-format metrics registry (no dependencies).
- * Exposed at GET /metrics so external monitoring (e.g. status.metabolomics.us)
+ * Exposed at GET /metrics so external monitoring (e.g. status.example.com)
  * can track this installation's health and load.
  */
 class Metrics {

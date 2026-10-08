@@ -1,7 +1,7 @@
 /**
  * End-to-end `/refresh-models`: gateway response in, `models.json` out.
  *
- * The fixture is the real drift measured against `https://llm.metabolomics.us/v1`
+ * The fixture is the real drift measured against `https://llm.example.com/v1`
  * — a model configured at 1,048,576 tokens that the gateway caps at 262,144,
  * one at 131,072 that accepts 250,112, and a vision model missing entirely.
  */
@@ -33,7 +33,7 @@ const PAYLOAD = {
 const STARTING_CONFIG = {
   providers: {
     metabolomics: {
-      baseUrl: "https://llm.metabolomics.us/v1",
+      baseUrl: "https://llm.example.com/v1",
       api: "openai-completions",
       apiKey: "sk-super-secret",
       compat: { supportsDeveloperRole: false, supportsReasoningEffort: true },
@@ -128,7 +128,7 @@ test("refresh: the API key and provider settings survive", async () => {
     const provider = read(s.path).providers.metabolomics;
 
     assert.equal(provider.apiKey, "sk-super-secret", "a refresh must never cost the operator their credentials");
-    assert.equal(provider.baseUrl, "https://llm.metabolomics.us/v1");
+    assert.equal(provider.baseUrl, "https://llm.example.com/v1");
     assert.deepEqual(provider.compat, { supportsDeveloperRole: false, supportsReasoningEffort: true });
   } finally {
     s.cleanup();
@@ -381,7 +381,7 @@ test("refresh: a fresh install with no config at all is populated", async () => 
     const result = await refreshProviderModels({
       modelsPath: s.path,
       providerId: "metabolomics",
-      baseUrl: "https://llm.metabolomics.us/v1",
+      baseUrl: "https://llm.example.com/v1",
       apiKey: "k",
       fetchImpl: okFetch,
     });
@@ -406,7 +406,7 @@ test("refresh: the default gateway is used when nothing is configured", async ()
         return { ok: true, status: 200, json: async () => PAYLOAD };
       }) as unknown as typeof fetch,
     });
-    assert.equal(seen, "https://llm.metabolomics.us/v1/models");
+    assert.equal(seen, "https://llm.example.com/v1/models");
   } finally {
     s.cleanup();
   }
@@ -444,7 +444,7 @@ test("refresh: a model the gateway dropped is kept unless pruning is asked for",
   }
 });
 
-test("refresh: verification writes only models that produce a visible completion", async () => {
+test("refresh: verification keeps every model that answers, visible text or not", async () => {
   const s = scratch();
   const requested: string[] = [];
   let inFlight = 0;
@@ -491,10 +491,13 @@ test("refresh: verification writes only models that produce a visible completion
 
     assert.deepEqual(requested.sort(), PAYLOAD.data.map((model) => model.id).sort());
     assert.equal(maxInFlight, 1, "default probing must not create its own capacity contention");
+    // A reasoning model that spends the probe budget thinking (empty content)
+    // is still served: it must never be pruned from the picker for that.
     assert.deepEqual(
-      read(s.path).providers.metabolomics.models.map((model) => model.id),
-      ["deepseek-v4-flash", "qwen3.8-27b-q4-250k"],
-      "advertised-but-failing and empty-answer models must leave the picker",
+      read(s.path)
+        .providers.metabolomics.models.map((model) => model.id)
+        .sort(),
+      PAYLOAD.data.map((model) => model.id).sort(),
     );
   } finally {
     s.cleanup();

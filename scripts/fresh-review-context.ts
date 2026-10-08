@@ -7,7 +7,10 @@ import type { WorkerResult } from "../src/core/types.ts";
  */
 import { PiWorkerExecutor } from "../src/workers/PiWorkerExecutor.ts";
 
-const repo = "/home/wohlgemuth/IdeaProjects/pi-engineering-runtime";
+import { homedir } from "node:os";
+import { join } from "node:path";
+
+const repo = join(homedir(), "IdeaProjects", "pi-engineering-runtime");
 
 const MILESTONE = [
   "rankFiles() must rank repo files by goal relevance (path matches + distinct goal symbols) and be bounded.",

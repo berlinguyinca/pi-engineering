@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { activityFromSessionEvent } from "../../src/workers/activity.ts";
+import {
+  StreamingActivityThrottle,
+  TOOL_PROGRESS_SUMMARY,
+  activityFromSessionEvent,
+  sanitizeWorkerActivity,
+} from "../../src/workers/activity.ts";
 
 test("worker activity exposes bounded tool state without arguments or secrets", () => {
   const event = activityFromSessionEvent({
@@ -33,4 +38,26 @@ test("worker activity rejects a secret-shaped tool name", () => {
   const event = activityFromSessionEvent({ type: "tool_execution_start", toolName: secret });
   assert.equal(event?.toolName, "tool");
   assert.doesNotMatch(JSON.stringify(event), /sk-/);
+});
+
+test("streamed tokens count as worker activity, throttled (session review: streaming read as a stall)", async () => {
+  const { StreamingActivityThrottle } = await import("../../src/workers/activity.ts");
+  const throttle = new StreamingActivityThrottle(30_000);
+  const update = { type: "message_update", message: { role: "assistant", content: "secret tokens" } };
+  const first = throttle.note(update, 1_000);
+  assert.deepEqual(first, { kind: "state", summary: "Model streaming", meaningfulProgress: false });
+  assert.equal(throttle.note(update, 20_000), null, "throttled inside the interval");
+  assert.ok(throttle.note(update, 31_001), "emits again after the interval");
+  assert.equal(throttle.note({ type: "message_update", message: { role: "user" } }, 90_000), null);
+  assert.doesNotMatch(JSON.stringify(first), /secret/, "token content never enters mission activity");
+});
+
+test("a long tool call that keeps producing output is activity, so the hang watchdog never fires on it", () => {
+  const throttle = new StreamingActivityThrottle(30_000);
+  const update = { type: "tool_execution_update", toolName: "bash" };
+  const first = throttle.note(update, 0);
+  assert.equal(first?.summary, TOOL_PROGRESS_SUMMARY);
+  assert.deepEqual(sanitizeWorkerActivity(first), first, "survives the trust boundary unchanged");
+  assert.equal(throttle.note(update, 10_000), null, "throttled within the interval");
+  assert.equal(throttle.note(update, 30_000)?.summary, TOOL_PROGRESS_SUMMARY);
 });

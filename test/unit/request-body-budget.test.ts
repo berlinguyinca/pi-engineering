@@ -1,7 +1,7 @@
 /**
  * The request-body budget on the live provider path.
  *
- * Fry's InferWeave gateway caps a request body at 10 MiB today (32 MiB once it
+ * The InferWeave gateway caps a request body at 10 MiB today (32 MiB once it
  * advertises its cap). A vision session carrying four full-resolution
  * screenshots (~3 MB of base64 each) sent 11.9 MB and died with a permanent
  * "413 request body too large". Nothing on the live path counted bytes.
@@ -578,16 +578,16 @@ test("a 413's stated limit is used only when labelled as the limit", () => {
   assert.equal(limitFromBodyTooLarge("413 http: request body too large"), undefined);
 });
 
-// The Fry gateway's contract (inferweave-gateway #358).
-const FRY_413 =
+// The gateway's contract (inferweave-gateway #358).
+const GATEWAY_413 =
   '413 {"error":{"type":"inferweave_backpressure","code":"request_too_large","message":"request body too large","retryable":false,"action_code":"IW-ACT-REDUCE-INPUT","max_request_bytes":33554432}}';
 
 test("the gateway's JSON 413 is recognised, permanent, and states its cap", () => {
-  assert.equal(limitFromBodyTooLarge(FRY_413), 33_554_432);
+  assert.equal(limitFromBodyTooLarge(GATEWAY_413), 33_554_432);
   assert.equal(limitFromBodyTooLarge('413 {"error":{"code":"request_too_large"}}'), undefined);
   const bare = '413 {"error":{"code":"request_too_large","retryable":false}}';
   assert.ok(describeRequestTooLarge(bare, 10 * 1024 * 1024), "the code alone is enough");
-  for (const text of [FRY_413, bare]) {
+  for (const text of [GATEWAY_413, bare]) {
     assert.equal(classifyError(new Error(text)).retryable, false, text);
     assert.notEqual(parseGatewayWait({ text })?.retryable, true, text);
     assert.equal(classifyInfraError(new Error(text)).category, "INVALID_REQUEST", text);

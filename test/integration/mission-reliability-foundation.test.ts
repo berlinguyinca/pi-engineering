@@ -276,7 +276,10 @@ if (eventMode === "out-of-order") [events[0], events[1]] = [events[1], events[0]
 if (eventMode === "failed-recovery") events[events.length - 1] = event("recovery.failed", { decision: { recoveryId: "RCV-recovery", missionId: eventMission, status: "failed" } });
 if (eventMode === "wrong-recovery") events[events.length - 1] = event("recovery.succeeded", { decision: { recoveryId: "RCV-other", missionId: eventMission, status: "succeeded" } });
 const serializedEvents = events.map((entry) => JSON.stringify(entry)).join("\\n") + "\\n" + (eventMode === "malformed" ? "{not-json\\n" : "");
-await writeFile(join(process.cwd(), ".pi-eng", "orchestration.jsonl"), serializedEvents);
+// Like the real runtime: one per-session stream inside the orchestration namespace.
+const namespaceEvents = join(process.env.PI_ENGINEERING_ORCHESTRATION_DIR ?? join(process.cwd(), ".pi-eng"), "events");
+await mkdir(namespaceEvents, { recursive: true });
+await writeFile(join(namespaceEvents, "fake-session.jsonl"), serializedEvents);
 `,
   );
   await chmod(executable, 0o755);
@@ -691,7 +694,10 @@ describe("mission reliability foundation — synthetic MSN-qSLaeM", () => {
           () => runtime!.missionStore!.assertExecutionAuthoritative(checkpoint.executionId),
           /no longer authoritative|stale execution identity/i,
         );
-        const durableEvents = await readFile(join(metaRoot, "state", "orchestration.jsonl"), "utf8");
+        const durableEvents = runtime
+          .orchestrationEvents()
+          .map((stored) => JSON.stringify(stored))
+          .join("\n");
         assert.match(durableEvents, /"type":"execution\.late_result_rejected"/);
         const repaired = await runtime.orchestrator!.repairBlockedMission(started.mission.mission_id);
         const replacements = runtime

@@ -1,0 +1,182 @@
+[
+  {
+    "source": "mission #4",
+    "prompt": "Implement the attached \"InferWeave Complete System One API and Distributed Runtime Specification\" in the inferweave/inferweave repository (checkout at ${T}). This adds a Jev-compatible POST /v1/systemone inference capability (System One = capability, Jev = external protocol, Laya = first backend) integrated into the existing Rust gateway, protocol/capability registry, Tern scheduler, worker runtime, telemetry, web UI, and Apptainer deployment.",
+    "expect": ["T"]
+  },
+  {
+    "source": "mission #8",
+    "prompt": "In the inferweave repository (${T}, TypeScript backend with src/router.ts, src/capability.ts, src/orchestrator.ts, src/scheduler.ts), design and implement hierarchical model-name aliases with sticky routing, without breaking existing clients. Requirements: (1) A hierarchy of model aliases, e.g. 'qwen' is a prefix node covering 'qwen3.8', which covers 'qwen3.8-27b', 'qwen3.8-28b', etc., down to concrete registered models like 'qwen3.8-27b-q4', 'qwen3.8-27b-q8', 'qwen3.8-28b-q4-vision'.",
+    "expect": ["T"]
+  },
+  {
+    "source": "mission #10",
+    "prompt": "In the inferweave repository at the explicit workspace path \"${T}\" (TypeScript backend; relevant files under the src directory: router.ts, capability.ts, orchestrator.ts, scheduler.ts, index.ts; tests under the test directory; docs under the docs directory), design and implement hierarchical model-name aliases with sticky routing, without breaking existing clients. Requirements: (1) A hierarchy of model aliases, e.g. 'qwen' is a prefix node covering 'qwen3.8', which covers 'qwen3.8-27b' and 'qwen3.8-28b', down to concrete registered models like 'qwen3.8-27b-q4', 'qwen3.8-27b-q8', 'qwen3.8-28b-q4-vision'.",
+    "expect": ["T"]
+  },
+  {
+    "source": "mission #12",
+    "prompt": "In the inferweave repository at the explicit workspace path \"${T}\" (TypeScript; build on the EXISTING committed alias work, do not rewrite it: alias-tree.ts, router.ts StickyRouter, orchestrator.ts, mcp.ts, capability.ts under the src directory; tests under the test directory; docs under docs), implement Phase 2 of the hierarchical model-alias and sticky-routing feature, keeping everything additive and backwards compatible.",
+    "expect": ["T"]
+  },
+  {
+    "source": "mission #16",
+    "prompt": "Fix four non-hermetic unit tests in the pi-engineering repository at ${T}. Work on a NEW branch 'fix/<redacted>' created from the current HEAD (do not include or reference any other pending changes). ROOT CAUSE (already diagnosed — verify it, then fix): in test/unit/mission-ownership.test.ts, the four subtests 'keeps a shared runtime writer lock until the final runtime closes' (~line 281), 'accounts for every concurrent open of the single-flight runtime' (~line 304), 'rolls back the writer reference when runtime initialization fails', and 'keeps close retryable when flushing fails' call EngineeringRuntime.open({ cwd: root, workDir }) and then assert against join(workDir, 'orchestration.jsonl",
+    "expect": ["T"]
+  },
+  {
+    "source": "mission #18",
+    "prompt": "Fix exactly ONE stale unit test in the pi-engineering repository at ${T}, so that the FULL unit suite goes green. Work on a NEW branch 'fix/<redacted>' from the current HEAD (which already includes the hermetic mission-ownership test fix). CONTEXT (fully diagnosed — verify, then apply): src/orchestration/observability/health.ts deriveHealth implements the NEW stall contract (from PR #102): a worker projects 'stalled' ONLY when meaningful progress age exceeds stallAfterMs AND a worker is still running (alive = anyWorkerRunning, i.e. a RUNNING execution) AND the raw-activity heartbeat age ALSO exceeds stallAfterMs.",
+    "expect": ["T"]
+  },
+  {
+    "source": "mission #20",
+    "prompt": "Fix the last pre-existing unit-test cancellations in the pi-engineering repository at ${T}. Work on a NEW branch 'fix/broker-tick-keepalive' from the current HEAD (which already contains the mission-ownership hermeticity fix, the updated stall-semantics subtest, and the supervisor interval keep-alive). FULLY DIAGNOSED (verify, then apply): in the full 'npm test' run, ~55 tests are CANCELLED with 'Promise resolution is still pending but the event loop has already resolved', concentrated in exactly two files: test/unit/orchestration-broker.test.ts and test/unit/<redacted>.test.ts.",
+    "expect": ["T"]
+  },
+  {
+    "source": "mission #22",
+    "prompt": "FIX ONE FILE IN AN EXISTING REPO — do not create any repo, do not scaffold anything else, do not touch the enclosing ${L} meta-root repo or sibling projects. Target: ${T} (git repo, remote origin = private owner/augur, branch main currently at b76a0ba). The only file to modify is .github/workflows/license-scan.yml (plus a small companion config file ONLY if the audit tool you choose requires one). Context: the current workflow is defective in two ways and must be repaired: DEFECT 1 — the step 'uses: actions/licensee@v1' references a GitHub Action that does not exist (verified 404); the job would fail at runtime.",
+    "expect": ["T"]
+  },
+  {
+    "source": "mission #24",
+    "prompt": "Fix three confirmed runtime defects in the pi-engineering repository checked out at ${T} (remote origin = ssh://git@github.com/owner/pi-engineering; current branch feat/<redacted> @ a955e0a, which is 1 commit AHEAD of and 1 commit BEHIND origin/main — first sync by merging origin/main (720640a 'fix(routing): repoint text roles to served example models') into the feature branch; the merge should touch disjoint files). This is a single-repository task scoped entirely to that checkout; do not touch any other repository.",
+    "expect": ["T"]
+  },
+  {
+    "source": "mission #26",
+    "prompt": "Single-defect fix in the pi-engineering repository at ${T} (single-repository task; do not touch any other repository). START from branch fix/runtime-defects at 333f99e (it already contains a verified fix for the candidate-store ENOENT race in src/git/GitRepo.ts plus origin/main synced; do not re-do or alter that work).",
+    "expect": ["T"]
+  },
+  {
+    "source": "mission #28",
+    "prompt": "Fix one defect in the pi-engineering repo at ${T}. Work on a NEW branch 'fix/stall-misclassification' created from the current HEAD. TIME BOX: read only the files named below, implement, add one test file, run the commands listed, commit, push. Do not explore the wider codebase and do not run the full test suite more than once. DEFECT: live workers are killed by false stall classification.",
+    "expect": ["T"]
+  },
+  {
+    "source": "mission #30",
+    "prompt": "DISCOVERY task in the Augur repository at ${T} (private owner/augur, branch main; single-repository task, do not touch any other repository). Product definition: Augur is a 'Lightweight self-hosted prediction-market forecasting, forward-testing, evaluation, and execution platform' — 'Forecast, forward-test, and evaluate prediction markets using statistical models, AI forecasters, and reproducible point-in-time data.' Hard constraints: Augur Core is self-contained (generic prediction-market interfaces, generic forecaster interfaces, paper/shadow execution, evaluation engine, Tern/OpenAI-compatible inference adapters); proprietary integrations (Robinhood, sports-data providers, commercial APIs",
+    "expect": ["T"]
+  },
+  {
+    "source": "mission #34",
+    "prompt": "Implement the \"InferWeave DiffusionRuntime + ComfyUI Runtime + OpenAI Images Compatibility Specification\" in the inferweave/inferweave repository (the Rust workspace at ${T}; System One / Laya RuntimeInstance architecture already exists, e.g. crates/iw-systemone).\n\nThe specification requires: a generic DiffusionRuntime capability/runtime_class=diffusion (NOT a separate diffusion-node architecture; an InferWeave Node hosts RuntimeInstances and diffusion is a runtime capability). First backend ComfyUIRuntime (engine=comfyui).",
+    "expect": ["T"]
+  },
+  {
+    "source": "mission #38",
+    "prompt": "The HerdR Powerpack repo (owner/herdr-powerpack, local checkout at ${T}, main branch already pushed to origin) has had recent commits: a README rewrite (short-and-sweet with mermaid diagrams), a CI workflow with a PATH bugfix, dead-code cleanup, notifications re-enabled, and the persiyanov.reviewr adoption. The user wants this work put through a proper PR flow: open a pull request for the current state, have it independently reviewed against the docs/spec-compliance.md and docs/architecture.md, commit any review fixes, and merge it.",
+    "expect": ["T"]
+  },
+  {
+    "source": "mission #42",
+    "prompt": "Independent code review (no code changes) of AIMS console commit 867bd27 in ${T} — \"M3: one primary action per row/card\" for a vanilla-JS, no-framework, single-file app.js (~4.5k lines, served static).\n\nDESIGN INTENT:\n- Roster rows (/characters): primary = row click (opens detail drawer); secondary actions Watch Live / Map / Stats moved into a ⋯ menu.\n- Requests workbench rows: primary = Inspect button; secondary Watch Live / Open / Map into a ⋯ menu.\n- Character detail drawer: primary = MISSION CONTROL button; secondary WATCH LIVE / SHOW ON MAP / REQUESTS / OPEN PI WEB into a ⋯ menu; Pause AI / Resume AI / Restart Runtime stay visible (AI controls).",
+    "expect": ["T"]
+  },
+  {
+    "source": "mission #46",
+    "prompt": "Harden multi-mission concurrency in the pi-engineering repository checked out at ${T}. Work on a NEW branch 'feat/concurrency-config' created from the TIP of the existing local branch 'fix/<redacted>' (do not include or reference any other pending changes). This is increment 1 of the multi-mission concurrency work: make the global scheduler limits operator-configurable, and make worktree-allocation failures diagnosable. Do NOT redesign the write-domain conflict model and do NOT add per-repo lanes in this increment.",
+    "expect": ["T"]
+  },
+  {
+    "source": "mission #52",
+    "prompt": "CONTINUE the InferForge 1.0 GA build from the current state of ${T}. A prior mission (MSN-VfClcz) already completed Phase 0-2 but was BLOCKED because it scaffolded without implementing, producing no validation or independent-review evidence. Your job is to drive it to a state that actually satisfies the validation and independent-review gates.\n\n== CURRENT STATE (verified — build on this, do not redo) ==\n- Git repo ${T} initialized on branch `main`, remote `origin` = git@github.com:owner/inferforge.git. GitHub repo owner/inferforge exists and is PRIVATE.\n- All 31 specs + 00-MASTER.md + PROMPT.md are installed in docs/specs/. README.md present.",
+    "expect": ["T"]
+  },
+  {
+    "source": "mission #58",
+    "prompt": "Implement M1 (core loop) of the Augur roadmap (docs/roadmap.md) in the repository at ${T} (private owner/augur, branch main). Single-repository task; do not touch any other repository. Scope (roadmap backlog tasks 1-7, 13, 17): (1) Python 3.11+ package scaffold: pyproject.toml (PEP 621), src/augur/ layout, 'augur' console entry point, Makefile with build/test/run targets; (2) core domain model as dataclasses with round-trip serialization: Market, Outcome, Forecast, Position, Execution, Snapshot (point-in-time); (3) MarketDataProvider interface + CsvMarketDataProvider reading data/markets/sample.csv (author a realistic multi-market, multi-snapshot fixture with strict point-in-time timestamps,",
+    "expect": ["T"]
+  },
+  {
+    "source": "mission #62",
+    "prompt": "Build an automated, end-to-end orchestration pipeline in the WeaveForge repo at ${T} that, given a spec, performs the full repo lifecycle and hands off to autospec-run. The pipeline must, in dependency order:\n\n1. READ the canonical spec (from PostgreSQL via the control plane, or from docs/specs/*.md).\n2. RESOLVE the target repositories for the spec (a spec can span several repos — reuse existing services/spec_repos.py <redacted> + detect_new_repos).\n3. For each affected repo:\n   a. If the repo exists on GitHub but has no local checkout -> clone it (use the locally-authorized gh/ssh; gh is authenticated as owner with repo scope).\n   b.",
+    "expect": ["T"]
+  },
+  {
+    "source": "mission #64",
+    "prompt": "Open a pull request for branch feat/<redacted> in the InferWeave/inferweave repo (worktree ${T}, already pushed), review it, and merge it into main.",
+    "expect": ["T"]
+  },
+  {
+    "source": "mission #68",
+    "prompt": "Investigate the WeaveForge project end-to-end (Flask control plane at ${L}, SPA in weaveforge/web/) and fix ALL functionality so it works completely without further issues, ready for real utilization. Concretely: (1) Run the full test suite and get it green, fixing any broken tests or the code they expose. (2) Boot the app and verify every REST endpoint in weaveforge/routes.py, health/readiness/metrics, MCP intake, and all services actually work end-to-end (including a dev-token auth path for local use).",
+    "expect": ["L"]
+  },
+  {
+    "source": "mission #100",
+    "prompt": "Review and push ALL local work in the inferweave repository (${L}).\n\nCONTEXT:\n- The repo is a git repository on branch `master` with 3 local commits ahead of any remote: 7a60855 (InferWeave backend + full test suite), 938b77a (README with reconciliation matrix + Pi-facing API), e9a7f92 (ESLint flat config + lint/check scripts + ledger resolution).\n- Working tree is clean; `npm run check` (build + lint + test) passes (10 files, 55 tests, 0 failures); `npm run demo` exits 0.\n- CRITICAL BLOCKER TO ADDRESS: there is currently NO git remote configured (`git remote -v` is empty) and `master` has no upstream tracking. The work cannot be pushed until a remote exists.",
+    "expect": ["L"]
+  },
+  {
+    "source": "mission #110",
+    "prompt": "Integrate the AIMS \"Life Story\" operator view into the existing Console (console2) as a native tab, and fix the admin-token provisioning so it works without requiring a separate manual token entry on that page.\n\nContext: AIMS repo at ${L}. The Console (console2) is a single-page app at apps/console/public/console2.html + apps/console/public/static/console2/app.js. It already has several tabs (Season/T0 genesis, System1, Observability, etc.) added via a PAGES[\"/route\"] registration pattern in app.js and nav links in console2.html.",
+    "expect": ["L"]
+  },
+  {
+    "source": "mission #122",
+    "prompt": "AIMS V1 Addendum — TINY SLICE (diagnostic, must be small enough to complete in one run): a PURE deterministic module that maps Minecraft damage-reason strings to AIMS normalized death-cause and damage-type enums, plus unit tests. Work in the AIMS repo (root: ${L}). NO wiring, NO persistence, NO UI, NO character behavior — just the pure mapping function + its unit tests. Ship it.\n\nDeliverable:\n1. A new pure module (place it near the existing runtime, e.g.",
+    "expect": ["L"]
+  },
+  {
+    "source": "mission #124",
+    "prompt": "Fix the constant/timed refresh bugs on the AIMS Console so pages no longer randomly or periodically reset and lose the user's current selection (dropdowns, toggles, text inputs, open panels, camera/operator selections, filters).\n\nCONTEXT / WHERE TO LOOK (inspect first, reconcile with real code):\n- The console is a single-page app at apps/console/public/console2.html driven by apps/console/public/static/console2/app.js (and apps/console/public/static/console2/app.css). It is served by apps/api/main.py (custom BaseHTTPRequestHandler), which also exposes an SSE live event stream at /api/live/events and /api/live/snapshot.",
+    "expect": ["L"]
+  },
+  {
+    "source": "mission #126",
+    "prompt": "Review all local work in the AIMS repository and push the committed local work to origin.\n\nCONTEXT / CURRENT STATE (verify, do not assume):\n- Repo: git@github.com:owner/aims.git, branch master, upstream origin/master.\n- master is AHEAD of origin/master by 10 commits (git log origin/master..HEAD): these are the definitive local work to push. They include the observability/flight-recorder implementation, console-v3 work, and two pi-eng orchestration integration commits (fb01673, 41fa6cf).",
+    "expect": ["L"]
+  },
+  {
+    "source": "mission #130",
+    "prompt": "Implement the AIMS Cognitive Learning Layer per the specification package at ${D}/<redacted>.zip, which decomposes into docs/specs/<redacted>/ (00-master-spec.md through 12-implementation-plan.md). The specs define a provider-neutral System1DecisionProvider layer (Laya, Von, Rules baseline providers) sitting between deterministic/reflex controllers and deliberative LLM reasoning, in a cognition hierarchy: reflex/controller -> learned System-1 -> small reasoning model -> large reasoning model -> long-horizon planning.",
+    "expect": ["L"]
+  },
+  {
+    "source": "mission #132",
+    "prompt": "PR, review, and merge the Life Story admin-token UX fix.\n\nCONTEXT: Repo ${L}. The fix is local commit 2be1808 \"fix(console): surface the admin-token requirement on the Life Story view instead of 'could not load'\". It is committed on local master and NOT on origin/master. origin/master is at ba1a724 (contains System-1 PRs #14/#15 and console PR #16).",
+    "expect": ["L"]
+  },
+  {
+    "source": "mission #142",
+    "prompt": "Fix two runtime bugs in the AIMS checkout (RTAC 1.1 autonomous-character runtime) that make characters appear stuck.\n\nBUG 1 — Console shows every character permanently \"waking up\". Root cause: apps/api/main.py `_c2_seed_demo_world()` (around lines 1048-1060) seeds each character's `_c2_activities[cid]` to \"waking up\" as a demo placeholder, and nothing ever updates it with real state. The only live setters are `c2_activity()` / `c2_demo_activity()` (HTTP `/api/demo/activity`), and the mineflayer runtime never calls them. So the Console 2.0 read-model (which renders `character.activity` events and per-character `activity` fields) stays stuck at \"waking up\" forever.",
+    "expect": ["L"]
+  },
+  {
+    "source": "mission #146",
+    "prompt": "Fix a Console refresh regression in the AIMS repo at ${L}. The Scoreboard page now re-renders constantly and slowly (a visible 'refresh bug') after the per-character detail feature was added.\n\nROOT CAUSE (already diagnosed): In apps/console/public/static/console2/app.js, every SSE event of family character.activity / camera.* / alert.raised calls refreshCurrentView(), which for the /scoreboard route re-runs PAGES['/scoreboard'].refresh = scoreboardPage().",
+    "expect": ["L"]
+  },
+  {
+    "source": "mission #150",
+    "prompt": "Implement the approved design at ${L}/docs/superpowers/specs/<redacted>.md (Autonomous Spec Approval). Implement subagent-driven with TDD; update authoritative specs/docs, verify, independently review, fix findings, then merge the PR.",
+    "expect": ["L"]
+  },
+  {
+    "source": "mission #154",
+    "prompt": "Workspace (existing directory): ${L}. Task: add a self-healing watchdog for the go-* SLURM service jobs on the HPC cluster. Create a new stateless one-shot watchdog shell script inside the scripts directory, named hpc service watchdog, intended for a login1 cron entry every 5 minutes. It checks the same seven required services already enumerated in the existing SLURM verify-services script in that scripts directory (go-prioritize, go-run-orchestrator, go-run-compute-node, go-run-llm-node, go-assistant-worker, go-sync-server, go-up) and resubmits any missing one via that module's own job or schedule script (go-up must keep its SLURM array count).",
+    "expect": ["L"]
+  },
+  {
+    "source": "mission #160",
+    "prompt": "Merge the Brownfield Audit & Remediation (BAR) spec pack into the pi-engineering-runtime repository. This is a DOCS-ONLY change; do not implement any source code.\n\nSTEP: The zip archive `<redacted>.zip` is at `${D}`. Unzip it (into a temp dir, e.g. ${D}/scratch) and copy the directory `docs/specs/bar/` from the archive into this repository at `docs/specs/bar/`. The archive's `docs/specs/bar/` contains: MASTER.md, ROADMAP.md, README.md, IMPLEMENT_PROMPT.md, contracts/ (AUDIT_REPORT.md, BASELINE.md, REPAIR_CAMPAIGN.md, REQUIREMENT_RECORD.md), profiles/ (AIMS.md, INFERWEAVE.md, WEAVEFORGE.md), and steps/ (exactly 130 numbered files <redacted>.md through <redacted>.md).",
+    "expect": ["L"]
+  },
+  {
+    "source": "user #162",
+    "prompt": "The spec pack `<redacted>.zip` is in `${D}`.\n\nInspect this repository and its current git status first. Preserve all unrelated existing work.\n\nUnzip the package and copy/merge its `docs/specs/cav/` directory into this repository at `docs/specs/cav/`. Do not blindly overwrite newer project-specific decisions; reconcile them.\n\nThen read, in this order:\n\n1. `docs/specs/cav/MASTER.md`\n2. `docs/specs/cav/ROADMAP.md`\n3. all files under `docs/specs/cav/contracts/`\n4. the first atomic implementation step\n\nImplement the CAV roadmap STRICTLY in numerical order.\n\nDo not jump ahead.\n\nA later phase may begin only after the preceding phase's exit gate has produced real verification evidence.",
+    "expect": ["L"]
+  },
+  {
+    "source": "mission #196",
+    "prompt": "Implement the \"InferWeave Runtime Instances + System One / Laya Complete Implementation Specification\" in inferweave/inferweave. Introduce RuntimeInstance as a first-class schedulable target (Node hosts multiple runtime instances), add the SystemOneRuntime capability-specific interface and LayaRuntime as the first SystemOneRuntime backend, extend node registration/heartbeat to advertise runtimes, refactor scheduler candidate selection from Node to RuntimeInstance, and complete POST /v1/systemone with Jev-compatible choice/score/noul support. Preserve existing OpenAI compatibility and existing node behavior (backward-compatible migration).",
+    "expect": ["L"]
+  },
+  {
+    "source": "mission #198",
+    "prompt": "Implement the InferWeave Production Laya Runtime Backend Specification in inferweave/inferweave: add a real LayaHttpBackend wrapping a locally-supervised laya-serve process, with external-endpoint mode, managed process supervision (health/readiness, restart/backoff, crash recovery), logical-to-physical model mapping, model discovery/preload/lifecycle/cache/revision, CPU+CUDA device support, bounded queue/concurrency, dynamic batching, latency metrics, error/OOM classification and translation, response schema validation, graceful drain, Apptainer config, benchmarks, and deterministic mock tests for every failure path.",
+    "expect": ["L"]
+  }
+]

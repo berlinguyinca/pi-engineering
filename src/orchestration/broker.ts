@@ -22,19 +22,22 @@ import { createHash } from "node:crypto";
 import { isAbsolute } from "node:path";
 import type { ArtifactStore } from "../artifacts/ArtifactStore.ts";
 import { id } from "../core/ids.ts";
+import { sharedAdmissionController } from "../gateway/config.ts";
 import type {
   CandidateLifecycle,
   GitRepo,
   IntegrationRunRecord,
+  NestedRepoPublication,
   PromotionResult,
   WorktreeInfo,
 } from "../git/GitRepo.ts";
 import type { WorkerActivity } from "../workers/WorkerExecutor.ts";
-import { sanitizeWorkerActivity } from "../workers/activity.ts";
+import { WAITING_FOR_INFERENCE_SUMMARY, sanitizeWorkerActivity } from "../workers/activity.ts";
 import type { CheckpointProgressClaim } from "../workers/checkpointProgressTool.ts";
 import type { CheckpointManager, CheckpointSnapshot } from "./checkpoints.ts";
 import { EvidenceUnavailableError, buildCandidateEvidenceIdentity } from "./evidence.ts";
 import type { GateEvidencePublication, LateExecutionEvidence, MissionStore } from "./missionStore.ts";
+import { isNestedPublicationAcceptable } from "./nestedPublicationGate.ts";
 import type { DispatchAuthority } from "./ownership.ts";
 import { replacementRecoveryFingerprint, replacementTaskFingerprintSpec } from "./recovery.ts";
 import type { ExecutionBackend, RecoveredMerge, ReviewEvidence, ValidationEvidence } from "./types.ts";
@@ -350,8 +353,51 @@ export interface BrokerBackends {
 /** Largest delay setTimeout honours (2^31-1 ms, ~24.8 days). */
 const MAX_TIMER_MS = 2 ** 31 - 1;
 
-/** The worker's machine-readable failure marker for a wall-clock timeout. */
+/**
+ * The worker's machine-readable failure marker for a wall-clock timeout. Only
+ * an explicitly configured (opt-in) wall-clock limit produces it.
+ */
 const WALL_CLOCK_TIMEOUT_MARKER = "timeout";
+
+/**
+ * Failure marker for an execution that showed no activity (no tool, model,
+ * checkpoint or inference-wait signal) for the inactivity window: a hung
+ * worker, not a slow one. The scheduler resumes it rather than failing it.
+ */
+export const INACTIVITY_MARKER = "inactivity";
+
+/** Abort reason names, so every settlement path can tell the two apart. */
+const TIMEOUT_ABORT = "TimeoutError";
+const INACTIVITY_ABORT = "InactivityError";
+
+/** Why the broker itself aborted an execution, or null for a caller cancel. */
+function clockAbort(signal: AbortSignal): "timeout" | "inactivity" | null {
+  const reason = signal.reason;
+  if (!(reason instanceof DOMException)) return null;
+  if (reason.name === TIMEOUT_ABORT) return "timeout";
+  if (reason.name === INACTIVITY_ABORT) return "inactivity";
+  return null;
+}
+
+function terminalMarker(reason: "canceled" | "timeout" | "inactivity"): string {
+  return reason === "timeout" ? WALL_CLOCK_TIMEOUT_MARKER : reason === "inactivity" ? INACTIVITY_MARKER : "canceled";
+}
+
+/** Backends whose runners stream worker activity the inactivity watchdog can observe. */
+const ACTIVITY_REPORTING_BACKENDS: ReadonlySet<ExecutionBackend> = new Set(["agent", "research", "review"]);
+
+/** Default inactivity window: one full hour with no sign of life at all. */
+export const DEFAULT_WORKER_INACTIVITY_MS = 60 * 60_000;
+
+/**
+ * True while this process is waiting on the model gateway (an admission hold,
+ * a cooldown, or a queue for a slot). Waiting for inference capacity is not a
+ * stall: a mission waits as long as the gateway asks it to.
+ */
+export function processWaitingForInference(): boolean {
+  const status = sharedAdmissionController().status();
+  return status.waiting > 0 || status.cooldownMs > 0;
+}
 
 function pathAllowed(path: string, domains: string[]): boolean {
   const normalized = canonicalizeWriteDomain(path);
@@ -367,28 +413,50 @@ function pathAllowed(path: string, domains: string[]): boolean {
 }
 
 /**
- * Default execution wall-clock budget in ms. The historical 10-minute default
- * repeatedly aborted fresh-context implementation workers at the boundary
- * before they could commit real work (only a trivial file-copy ever landed in
- * time), which made the mission pipeline unable to integrate anything but
- * trivial changes. 30 minutes gives a worker room to explore the repo,
- * implement, verify, and commit within one bounded run. Overridable via
- * `PI_ENGINEERING_WORKER_TIMEOUT_MS` for the whole pipeline (broker abort
- * timer and worker budget stay in lockstep).
+ * OPT-IN execution wall-clock limit in ms, or undefined (the default): no
+ * execution has a maximum duration. Fixed windows (10, then 30 minutes) killed
+ * healthy workers mid-task far more often than they caught hung ones — a task
+ * that takes eight hours takes eight hours. Hung workers are caught by the
+ * inactivity watchdog instead (`workerInactivityMs`). An operator who really
+ * wants a ceiling sets `PI_ENGINEERING_WORKER_TIMEOUT_MS`.
  */
-export function workerTimeoutMs(): number {
+export function workerTimeoutMs(): number | undefined {
   const env = Number.parseInt(process.env.PI_ENGINEERING_WORKER_TIMEOUT_MS ?? "", 10);
   // setTimeout fires IMMEDIATELY for delays above 2^31-1 ms, which would turn a
   // generous override into an instant abort.
   if (Number.isFinite(env) && env > 0) return Math.min(env, MAX_TIMER_MS);
-  return 30 * 60_000;
+  return undefined;
+}
+
+/**
+ * How long an execution may show no activity at all before it is treated as
+ * hung. Default one hour; `PI_ENGINEERING_WORKER_INACTIVITY_MS` overrides it.
+ */
+export function workerInactivityMs(): number {
+  const env = Number.parseInt(process.env.PI_ENGINEERING_WORKER_INACTIVITY_MS ?? "", 10);
+  if (Number.isFinite(env) && env > 0) return Math.min(env, MAX_TIMER_MS);
+  return DEFAULT_WORKER_INACTIVITY_MS;
 }
 
 export interface BrokerOptions {
   store: MissionStore;
   backends: BrokerBackends;
-  /** Default timeout per execution. */
+  /**
+   * Explicit, opt-in wall-clock limit per execution. Unset (the default) means
+   * no execution has a maximum duration.
+   */
   defaultTimeoutMs?: number;
+  /**
+   * Abort an activity-reporting execution (agent/research/review) after this
+   * long with no worker activity. Time spent waiting for inference capacity
+   * never counts. Default `workerInactivityMs()`.
+   */
+  inactivityTimeoutMs?: number;
+  /**
+   * Extra probe: true keeps every execution's window open. Default none — an
+   * execution is waiting only while its own worker reports it.
+   */
+  inferenceWaiting?: () => boolean;
   /** Git provider used to allocate isolated worktrees for mutating tasks. */
   git?: GitRepo | null;
   /** Base ref (commit) worktrees are created at. Defaults to current HEAD. */
@@ -418,7 +486,9 @@ export interface BrokerOptions {
 export class ExecutionBroker {
   private readonly store: MissionStore;
   private readonly backends: BrokerBackends;
-  private readonly defaultTimeoutMs: number;
+  private readonly defaultTimeoutMs: number | undefined;
+  private readonly inactivityTimeoutMs: number;
+  private readonly inferenceWaiting: () => boolean;
   private readonly git: GitRepo | null;
   private readonly baseRef: string;
   private readonly resolveRepository?: BrokerOptions["resolveRepository"];
@@ -428,6 +498,8 @@ export class ExecutionBroker {
   private readonly artifacts?: BrokerOptions["artifacts"];
   private readonly cancellationAckTimeoutMs: number;
   /** In-flight execution state for cancellation + allocated worktrees. */
+  /** Executions canceled by an operator interrupt (pause): their tasks stay resumable. */
+  private readonly resumableCancels = new Set<string>();
   private readonly active = new Map<
     string,
     {
@@ -475,6 +547,12 @@ export class ExecutionBroker {
     }>
   >();
   private readonly missionRepositories = new Map<string, { repoId?: string; root: string; git: GitRepo }>();
+  /**
+   * ADDITIVE (defect-4): per-mission execution-start baseline of nested
+   * standalone repo HEADs, captured once when the mission's first task
+   * resolves its repository.
+   */
+  private readonly nestedBaselines = new Map<string, Promise<Map<string, string>>>();
   /** Isolated integration candidates. Failed/red/canceled candidates remain inspectable. */
   private readonly missionCandidates = new Map<string, { lifecycle: CandidateLifecycle; git: GitRepo }>();
   /** Commit each mission's worktrees were actually forked from (landing invariant). */
@@ -505,6 +583,14 @@ export class ExecutionBroker {
     this.store = opts.store;
     this.backends = opts.backends;
     this.defaultTimeoutMs = opts.defaultTimeoutMs ?? workerTimeoutMs();
+    this.inactivityTimeoutMs = opts.inactivityTimeoutMs ?? workerInactivityMs();
+    if (!Number.isFinite(this.inactivityTimeoutMs) || this.inactivityTimeoutMs <= 0) {
+      throw new Error("ExecutionBroker inactivityTimeoutMs must be finite and positive");
+    }
+    // Per execution by default: each execution's own "waiting for inference
+    // capacity" activity keeps its window open. A process-wide probe would let
+    // one queued worker hide every other worker hanging.
+    this.inferenceWaiting = opts.inferenceWaiting ?? (() => false);
     this.git = opts.git ?? null;
     this.baseRef = opts.baseRef ?? "";
     this.resolveRepository = opts.resolveRepository;
@@ -935,11 +1021,26 @@ export class ExecutionBroker {
    * rather than poking the store, otherwise the runner keeps going, the worktree
    * leaks, and the eventual result overwrites CANCELED with SUCCEEDED.
    */
-  async cancelExecution(executionId: string, taskId?: string): Promise<boolean> {
+  async cancelExecution(executionId: string, taskId?: string, opts: { resumable?: boolean } = {}): Promise<boolean> {
     const entry = this.active.get(executionId);
     if (!entry) return false;
+    if (opts.resumable) this.resumableCancels.add(executionId);
     entry.abort.abort();
     await this.terminalizeAfterGrace(executionId, "canceled", taskId ?? entry.taskId);
+    // A cancel that lands while a hung (inactive) execution is settling joins
+    // that settlement, which leaves the task RUNNING for a resume. The caller
+    // asked for cancellation, so the task must not be resumed — unless this is
+    // an operator interrupt (pause), whose task must stay resumable.
+    const cancelledTask = taskId ?? entry.taskId;
+    if (this.store.getTask(cancelledTask)?.status === "RUNNING") {
+      if (opts.resumable) {
+        this.store.transitionTask(cancelledTask, "RETRYING", "system", {
+          failure_reason: "interrupted by the operator; resumable",
+        });
+      } else {
+        this.store.transitionTask(cancelledTask, "CANCELED");
+      }
+    }
     return true;
   }
 
@@ -956,19 +1057,14 @@ export class ExecutionBroker {
 
   private terminalizeAfterGrace(
     executionId: string,
-    reason: "canceled" | "timeout",
+    reason: "canceled" | "timeout" | "inactivity",
     taskId: string,
   ): Promise<ExecutionOutcome> {
     const entry = this.active.get(executionId);
     if (!entry) return Promise.resolve(this.terminalizeExecution(executionId, reason, taskId));
     if (entry.terminalPromise) return entry.terminalPromise;
     entry.terminalPromise = (async () => {
-      this.markBranchIntegrationIneligible(
-        executionId,
-        entry.missionId,
-        taskId,
-        reason === "timeout" ? WALL_CLOCK_TIMEOUT_MARKER : "canceled",
-      );
+      this.markBranchIntegrationIneligible(executionId, entry.missionId, taskId, terminalMarker(reason));
       const checkpoint = entry.cancelCheckpoint?.();
       let graceTimer: ReturnType<typeof setTimeout> | undefined;
       let checkpointSettled = true;
@@ -988,7 +1084,7 @@ export class ExecutionBroker {
       } finally {
         if (graceTimer) clearTimeout(graceTimer);
       }
-      if ((reason === "timeout" || !checkpointSettled) && entry.worktree) {
+      if ((reason !== "canceled" || !checkpointSettled) && entry.worktree) {
         this.retainWorktree(entry.missionId, executionId);
       }
       const outcome = this.terminalizeExecution(executionId, reason, taskId);
@@ -1029,25 +1125,46 @@ export class ExecutionBroker {
     return entry.terminalPromise;
   }
 
-  private terminalizeExecution(executionId: string, reason: "canceled" | "timeout", taskId: string): ExecutionOutcome {
+  private terminalizeExecution(
+    executionId: string,
+    reason: "canceled" | "timeout" | "inactivity",
+    taskId: string,
+  ): ExecutionOutcome {
     const existing = this.store.getExecution(executionId);
-    const error = reason === "timeout" ? WALL_CLOCK_TIMEOUT_MARKER : "canceled";
+    const error = terminalMarker(reason);
+    const failed = reason !== "canceled";
     const outcome: ExecutionOutcome = {
       executionId,
       exitStatus: "failed",
       summary:
-        reason === "timeout" ? "Execution exceeded its deadline and cancellation grace" : "Execution was canceled",
+        reason === "timeout"
+          ? "Execution exceeded its configured wall-clock limit and cancellation grace"
+          : reason === "inactivity"
+            ? "Execution showed no activity for the inactivity window (hung worker); its work is preserved for resumption"
+            : "Execution was canceled",
       artifactRefs: [],
       usage: {},
       error,
     };
     if (existing?.status === "RUNNING") {
-      this.store.setExecutionStatus(executionId, reason === "timeout" ? "FAILED" : "CANCELED", {
+      this.store.setExecutionStatus(executionId, failed ? "FAILED" : "CANCELED", {
         exit_status: error,
       });
     }
     const task = this.store.getTask(taskId);
-    if (task?.status === "RUNNING") this.store.transitionTask(taskId, reason === "timeout" ? "FAILED" : "CANCELED");
+    // A hung (inactive) execution leaves its task RUNNING: the scheduler owns
+    // the decision to resume it from its checkpoint instead of failing it.
+    if (task?.status === "RUNNING" && reason !== "inactivity") {
+      if (reason === "canceled" && this.resumableCancels.has(executionId)) {
+        // An operator interrupt (pause): the task stays resumable.
+        this.store.transitionTask(taskId, "RETRYING", "system", {
+          failure_reason: "interrupted by the operator; resumable",
+        });
+      } else {
+        this.store.transitionTask(taskId, failed ? "FAILED" : "CANCELED");
+      }
+    }
+    this.resumableCancels.delete(executionId);
     this.active.delete(executionId);
     return outcome;
   }
@@ -1063,11 +1180,11 @@ export class ExecutionBroker {
   }
 
   /** Cancel the in-flight execution of a task, if any. */
-  async cancelByTask(taskId: string): Promise<boolean> {
+  async cancelByTask(taskId: string, opts: { resumable?: boolean } = {}): Promise<boolean> {
     let canceled = false;
     for (const [executionId, entry] of [...this.active]) {
       if (entry.taskId === taskId) {
-        canceled = (await this.cancelExecution(executionId, taskId)) || canceled;
+        canceled = (await this.cancelExecution(executionId, taskId, opts)) || canceled;
       }
     }
     return canceled;
@@ -1908,6 +2025,10 @@ export class ExecutionBroker {
 
   async hasCandidateForPromotion(missionId: string): Promise<boolean> {
     if (this.missionCandidates.has(missionId)) return true;
+    // ADDITIVE (defect-4): a recorded nested standalone repo publication is
+    // candidate evidence for the mission even without an anchored worktree or
+    // integration task.
+    if (await this.hasAcceptableNestedPublication(missionId)) return true;
     if (!this.resolveRepository) return false;
     const integrationTask = this.store
       .listTasks(missionId)
@@ -1927,6 +2048,91 @@ export class ExecutionBroker {
         record.baseSha === boundBase &&
         ["integrating", "promotion_intent", "promoted"].includes(record.state),
     );
+  }
+
+  /**
+   * ADDITIVE (defect-4): recorded nested standalone repo publications for this
+   * mission that are acceptable candidate evidence (nested HEAD advanced and
+   * the work is on the nested remote, or the repo has no remote) AND whose
+   * nested HEAD still equals the recorded headSha (the validation step's
+   * re-verification). Fail-closed: no git provider, no anchored repo, or any
+   * error yields no evidence.
+   */
+  async nestedPublicationsForMission(missionId: string): Promise<NestedRepoPublication[]> {
+    const repository = this.missionRepositories.get(missionId);
+    const git = repository?.git ?? this.git;
+    if (!git) return [];
+    const repoId = repository?.repoId ?? this.store.getWorkspaceManifest(missionId)?.repositories[0]?.repoId;
+    if (!repoId) return [];
+    try {
+      const inventory = await git.loadNestedRepoPublications(missionId, repoId);
+      const verified: NestedRepoPublication[] = [];
+      for (const record of inventory.records) {
+        if (!isNestedPublicationAcceptable(record)) continue;
+        const { verified: headMatches } = await git.verifyNestedRepoPublication(record);
+        if (headMatches) verified.push(record);
+      }
+      return verified;
+    } catch {
+      return [];
+    }
+  }
+
+  /** ADDITIVE (defect-4): true when the mission has acceptable, re-verified nested publication evidence. */
+  async hasAcceptableNestedPublication(missionId: string): Promise<boolean> {
+    return (await this.nestedPublicationsForMission(missionId)).length > 0;
+  }
+
+  /**
+   * ADDITIVE (defect-4): the review evidence for the mission's nested
+   * publications — the recorded diff stats, so review does not need the nested
+   * worktree. Empty string when there is no nested evidence.
+   */
+  async nestedPublicationReviewDiffs(missionId: string): Promise<string> {
+    const records = await this.nestedPublicationsForMission(missionId);
+    if (records.length === 0) return "";
+    return records
+      .map(
+        (record) =>
+          `=== ${record.nestedPath} (${record.baseSha.slice(0, 7)}..${record.headSha.slice(0, 7)}) ===\n${record.diffStat}`,
+      )
+      .join("\n\n");
+  }
+
+  /**
+   * ADDITIVE (defect-4): memoized per-mission nested HEAD baseline. Captured
+   * at execution start (first task repository resolution) so that
+   * recordNestedPublicationsForMission can detect nested HEAD advancement over
+   * the execution window.
+   */
+  private nestedBaselineFor(missionId: string, git: GitRepo): void {
+    if (!this.nestedBaselines.has(missionId)) {
+      this.nestedBaselines.set(
+        missionId,
+        git.captureNestedRepoHeads().catch(() => new Map<string, string>()),
+      );
+    }
+  }
+
+  /**
+   * ADDITIVE (defect-4): record a durable nested repo publication for every
+   * nested standalone repo whose HEAD advanced between execution start and
+   * now. Called at finalization, before the completion gate evaluates
+   * candidate evidence. Without a captured baseline (e.g. after a process
+   * restart) no records are produced — fail-closed, no false evidence.
+   */
+  async recordNestedPublicationsForMission(missionId: string): Promise<NestedRepoPublication[]> {
+    const repository = this.missionRepositories.get(missionId);
+    const git = repository?.git ?? this.git;
+    if (!git) return [];
+    const repoId = repository?.repoId ?? this.store.getWorkspaceManifest(missionId)?.repositories[0]?.repoId;
+    if (!repoId) return [];
+    try {
+      const baseHeads = (await this.nestedBaselines.get(missionId)) ?? undefined;
+      return await git.recordNestedRepoPublications({ missionId, anchoredRepoId: repoId, baseHeads });
+    } catch {
+      return [];
+    }
   }
 
   private async preserveCandidate(missionId: string, authority?: DispatchAuthority): Promise<void> {
@@ -2061,8 +2267,11 @@ export class ExecutionBroker {
     input.recovery = await this.preliminaryRecoveryContext(input);
     input.authority?.assertAuthoritative();
     const executionStartedAt = Date.now();
-    const executionBudgetMs = input.executionBudgetMs ?? input.timeoutPolicy?.timeoutMs ?? this.defaultTimeoutMs;
-    if (!Number.isFinite(executionBudgetMs) || executionBudgetMs <= 0) {
+    // No budget unless one was explicitly asked for (task-level or the opt-in
+    // broker default): an execution runs as long as it shows activity.
+    const executionBudgetMs: number | undefined =
+      input.executionBudgetMs ?? input.timeoutPolicy?.timeoutMs ?? this.defaultTimeoutMs;
+    if (executionBudgetMs !== undefined && (!Number.isFinite(executionBudgetMs) || executionBudgetMs <= 0)) {
       throw new Error("INVALID_TASK_BUDGET: execution budget must be finite and positive");
     }
     if (
@@ -2071,11 +2280,12 @@ export class ExecutionBroker {
         input.checkpointPolicy.activity_milestone <= 0 ||
         !Number.isFinite(input.checkpointPolicy.before_deadline_ms) ||
         input.checkpointPolicy.before_deadline_ms <= 0 ||
-        input.checkpointPolicy.before_deadline_ms >= executionBudgetMs)
+        (executionBudgetMs !== undefined && input.checkpointPolicy.before_deadline_ms >= executionBudgetMs))
     ) {
       throw new Error("INVALID_CHECKPOINT_POLICY: checkpoint lead must be finite, positive, and below budget");
     }
-    const executionDeadlineAt = executionStartedAt + executionBudgetMs;
+    const executionDeadlineAt = executionBudgetMs === undefined ? undefined : executionStartedAt + executionBudgetMs;
+    const watchInactivity = ACTIVITY_REPORTING_BACKENDS.has(this.backendForKind(input.kind));
     const backend = this.backendForKind(input.kind);
     const checkpointId = input.checkpointId ?? (this.checkpoints && input.repoId ? id("TCP") : undefined);
     const task = this.store.getTask(input.taskId);
@@ -2129,16 +2339,60 @@ export class ExecutionBroker {
             if (terminal?.status === "FAILED" && terminal.exit_status === WALL_CLOCK_TIMEOUT_MARKER) {
               return this.terminalizeExecution(execution.execution_id, "timeout", input.taskId);
             }
+            if (terminal?.status === "FAILED" && terminal.exit_status === INACTIVITY_MARKER) {
+              return this.terminalizeExecution(execution.execution_id, "inactivity", input.taskId);
+            }
             throw new Error("execution aborted before dispatch");
           }
-          const timer = setTimeout(
-            () =>
-              abort.abort(new DOMException(`Execution exceeded its ${executionBudgetMs}ms deadline`, "TimeoutError")),
-            Math.max(0, executionDeadlineAt - Date.now()),
-          );
-          timer.unref?.();
+          // Opt-in only: a configured wall-clock limit.
+          const timer =
+            executionDeadlineAt === undefined
+              ? undefined
+              : setTimeout(
+                  () =>
+                    abort.abort(
+                      new DOMException(`Execution exceeded its configured ${executionBudgetMs}ms limit`, TIMEOUT_ABORT),
+                    ),
+                  Math.max(0, executionDeadlineAt - Date.now()),
+                );
+          // The limit timer and the inactivity watchdog stay referenced: while
+          // an execution is in flight they may be the only thing that will
+          // ever settle it, and an unref'd watchdog lets the event loop drain
+          // with the awaited result still pending. Both are cleared when the
+          // execution settles, so they never outlive it.
           const activityStartedAt = Date.now();
           let lastActivityAt = activityStartedAt;
+          // THIS execution's worker last said it is waiting for inference capacity.
+          let waitingForInference = false;
+          // Hung-worker detection: abort only after a full inactivity window
+          // with no worker activity. Waiting on the model gateway is liveness,
+          // not silence, so it keeps the window open however long it lasts.
+          const inactivityTimer = watchInactivity
+            ? setInterval(
+                () => {
+                  if (abort.signal.aborted) return;
+                  const at = Date.now();
+                  let waiting = waitingForInference;
+                  try {
+                    waiting ||= this.inferenceWaiting();
+                  } catch {
+                    // an injected probe failing never counts as waiting
+                  }
+                  if (waiting) {
+                    lastActivityAt = at;
+                    return;
+                  }
+                  if (at - lastActivityAt < this.inactivityTimeoutMs) return;
+                  abort.abort(
+                    new DOMException(
+                      `Execution showed no activity for ${this.inactivityTimeoutMs}ms (hung worker)`,
+                      INACTIVITY_ABORT,
+                    ),
+                  );
+                },
+                Math.max(5, Math.min(30_000, Math.floor(this.inactivityTimeoutMs / 4))),
+              )
+            : undefined;
           let activitySettled = false;
           let activityTimer: ReturnType<typeof setInterval> | undefined;
           let checkpointTimer: ReturnType<typeof setTimeout> | undefined;
@@ -2230,13 +2484,18 @@ export class ExecutionBroker {
               } else if (captured) {
                 artifactsValid = true;
               }
-              const valid =
-                input.deliverables?.includes(claim.deliverable) === true &&
-                snapshot.candidateSha !== null &&
-                claim.candidateSha === snapshot.candidateSha &&
-                claim.evidencePaths.length > 0 &&
-                claim.evidencePaths.every((path) => snapshot.committedChanges.includes(path)) &&
-                artifactsValid;
+              // Which conjunct(s) failed — the rejection finding must name the
+              // specific condition, not just that the claim was rejected.
+              const failReasons: string[] = [];
+              if (input.deliverables?.includes(claim.deliverable) !== true)
+                failReasons.push("deliverable-not-declared");
+              if (snapshot.candidateSha === null) failReasons.push("no-candidate-sha");
+              else if (claim.candidateSha !== snapshot.candidateSha) failReasons.push("sha-mismatch");
+              if (claim.evidencePaths.length === 0) failReasons.push("no-evidence-paths");
+              else if (!claim.evidencePaths.every((path) => snapshot.committedChanges.includes(path)))
+                failReasons.push("paths-not-committed");
+              if (!artifactsValid) failReasons.push("artifacts-invalid");
+              const valid = failReasons.length === 0;
               if (valid) {
                 completedDeliverables.add(claim.deliverable);
                 artifactRefs.push(...(captured?.refs ?? []));
@@ -2252,7 +2511,7 @@ export class ExecutionBroker {
                   category: "checkpoint_progress",
                   file: null,
                   line: null,
-                  summary: `Rejected unauthenticated checkpoint progress for ${claim.deliverable}`,
+                  summary: `Rejected unauthenticated checkpoint progress for ${claim.deliverable}: ${failReasons.join(", ")}`,
                   evidence: `claimed=${claim.candidateSha}; actual=${snapshot.candidateSha ?? "none"}; paths=${claim.evidencePaths.join(",")}; artifacts=${claim.artifactRefs.join(",") || "none"}`,
                   recommended_action:
                     "Commit the declared deliverable, then report the exact current candidate SHA and committed evidence paths.",
@@ -2321,7 +2580,10 @@ export class ExecutionBroker {
             for (const claim of safe.claims ?? []) {
               checkpointClaims.set(claim.deliverable, claim);
             }
-            if (safe.kind !== "heartbeat") lastActivityAt = Date.now();
+            if (safe.kind !== "heartbeat") {
+              lastActivityAt = Date.now();
+              waitingForInference = safe.summary === WAITING_FOR_INFERENCE_SUMMARY;
+            }
             if (safe.meaningfulProgress && input.checkpointPolicy?.activity_milestone) {
               meaningfulActivity++;
               if (meaningfulActivity % input.checkpointPolicy.activity_milestone === 0) queueCheckpoint();
@@ -2341,7 +2603,7 @@ export class ExecutionBroker {
             if (activitySettled) return;
             if (activityTimer) clearInterval(activityTimer);
             activityTimer = undefined;
-            const timedOut = abort.signal.reason instanceof DOMException && abort.signal.reason.name === "TimeoutError";
+            const timedOut = clockAbort(abort.signal) !== null;
             const safe = sanitizeWorkerActivity({
               kind: "execution",
               phase: timedOut ? "failed" : "canceled",
@@ -2392,7 +2654,19 @@ export class ExecutionBroker {
             repository = await this.repositoryFor(input);
             this.store.assertExecutionAuthoritative(execution.execution_id);
             input.authority?.assertAuthoritative();
-            if (repository) this.missionRepositories.set(input.missionId, repository);
+            if (repository) {
+              this.missionRepositories.set(input.missionId, repository);
+              // ADDITIVE (defect-4): capture the nested standalone repo HEADs
+              // once per mission as the execution-start baseline for
+              // publication detection. Fail-closed: if the provider lacks the
+              // nested API or the scan throws, there is simply no baseline and
+              // no publication records are produced (no false evidence).
+              try {
+                this.nestedBaselineFor(input.missionId, repository.git);
+              } catch {
+                // provider without the nested repo API — no baseline, no records
+              }
+            }
             const repositoryBinding = input.repoId
               ? this.store
                   .getWorkspaceManifest(input.missionId)
@@ -2420,7 +2694,7 @@ export class ExecutionBroker {
             worktree = await this.allocateWorktree(execution.execution_id, input, repository);
             const active = this.active.get(execution.execution_id);
             if (worktree && active) active.worktree = worktree;
-            if (this.checkpoints && checkpointId && input.checkpointPolicy) {
+            if (this.checkpoints && checkpointId && input.checkpointPolicy && executionDeadlineAt !== undefined) {
               checkpointTimer = setTimeout(
                 () => queueCheckpoint(),
                 Math.max(0, executionDeadlineAt - input.checkpointPolicy.before_deadline_ms - Date.now()),
@@ -2456,14 +2730,16 @@ export class ExecutionBroker {
             }
             if (abort.signal.aborted) {
               detachedAfterTerminalAbort = true;
-              const timedOut =
-                abort.signal.reason instanceof DOMException && abort.signal.reason.name === "TimeoutError";
               return this.terminalizeAfterGrace(
                 execution.execution_id,
-                timedOut ? "timeout" : "canceled",
+                clockAbort(abort.signal) ?? "canceled",
                 input.taskId,
               );
             }
+            // The hung-worker window measures the WORKER's silence. Worktree
+            // allocation and checkpoint restore before this point are the
+            // broker's own work, so the window starts when the worker does.
+            lastActivityAt = Date.now();
             writerStarted = true;
             const backendSettlement: Promise<BackendSettlement> = this.dispatch(
               input,
@@ -2493,8 +2769,8 @@ export class ExecutionBroker {
             const first = await Promise.race([backendSettlement, aborted]);
             removeAbortRaceListener();
             if (first.kind === "aborted") {
-              const timedOut =
-                abort.signal.reason instanceof DOMException && abort.signal.reason.name === "TimeoutError";
+              const clock = clockAbort(abort.signal);
+              const timedOut = clock !== null;
               if (worktree && this.store.getExecution(execution.execution_id)?.status === "RUNNING") {
                 const info = this.allocatedWorktrees.get(execution.execution_id);
                 const byBranch =
@@ -2502,7 +2778,8 @@ export class ExecutionBroker {
                   new Map<string, { marker: string; taskId: string; recoverRef?: string }>();
                 if (info) {
                   byBranch.set(info.branch, {
-                    marker: timedOut ? WALL_CLOCK_TIMEOUT_MARKER : "canceled",
+                    marker:
+                      clock === "inactivity" ? INACTIVITY_MARKER : timedOut ? WALL_CLOCK_TIMEOUT_MARKER : "canceled",
                     taskId: input.taskId,
                   });
                   this.failedBranches.set(input.missionId, byBranch);
@@ -2510,14 +2787,19 @@ export class ExecutionBroker {
               }
               const terminalOutcome = await this.terminalizeAfterGrace(
                 execution.execution_id,
-                timedOut ? "timeout" : "canceled",
+                clock ?? "canceled",
                 input.taskId,
               );
               if (timedOut && worktree) retainWorktreeOnCleanup = true;
               detachedAfterTerminalAbort = true;
               cleanupOwnedByCancellation = true;
               void backendSettlement.then((late) =>
-                this.observeLate(execution.execution_id, timedOut ? "hard timeout" : "cancellation", late, input),
+                this.observeLate(
+                  execution.execution_id,
+                  clock === "inactivity" ? "inactivity abort" : timedOut ? "hard timeout" : "cancellation",
+                  late,
+                  input,
+                ),
               );
               emitActivity({
                 kind: "execution",
@@ -2652,6 +2934,11 @@ export class ExecutionBroker {
                 exit_status: outcome.exitStatus,
                 artifact_refs: outcome.artifactRefs,
                 usage: outcome.usage,
+                // Failure visibility: backend outcomes (integration/validation/review)
+                // carry error + summary; without propagation the store recorded
+                // empty detail and real failures were undiagnosable.
+                ...(outcome.error ? { error: outcome.error } : {}),
+                ...(outcome.summary ? { summary: outcome.summary } : {}),
                 ...(outcome.recoveredMerged?.length ? { recovered_merged: outcome.recoveredMerged } : {}),
                 ...(backend === "review" && input.reviewedRecovered?.length
                   ? { reviewed_recovered: [...input.reviewedRecovered] }
@@ -2689,13 +2976,19 @@ export class ExecutionBroker {
                 lateEvidence({ kind: "backend_error", error: err }, input),
               );
             } else if (!this.settledElsewhere(execution.execution_id)) {
-              const timedOut =
-                abort.signal.reason instanceof DOMException && abort.signal.reason.name === "TimeoutError";
-              if (abort.signal.aborted && !timedOut) {
+              const clock = clockAbort(abort.signal);
+              if (abort.signal.aborted && clock === null) {
                 this.store.setExecutionStatus(execution.execution_id, "CANCELED", { exit_status: "canceled" });
               } else {
                 this.store.setExecutionStatus(execution.execution_id, "FAILED", {
-                  exit_status: timedOut ? WALL_CLOCK_TIMEOUT_MARKER : err instanceof Error ? err.message : String(err),
+                  exit_status:
+                    clock === "inactivity"
+                      ? INACTIVITY_MARKER
+                      : clock === "timeout"
+                        ? WALL_CLOCK_TIMEOUT_MARKER
+                        : err instanceof Error
+                          ? err.message
+                          : String(err),
                 });
               }
             }
@@ -2718,7 +3011,8 @@ export class ExecutionBroker {
               await checkpointChain.catch(() => undefined);
             }
             abort.signal.removeEventListener("abort", onAbort);
-            clearTimeout(timer);
+            if (timer) clearTimeout(timer);
+            if (inactivityTimer) clearInterval(inactivityTimer);
             if (!retainWorktreeOnCleanup && !cleanupOwnedByCancellation) {
               await this.releaseWorktree(execution.execution_id, true, input.authority);
             }
@@ -2728,10 +3022,9 @@ export class ExecutionBroker {
         let removeAbortListener = (): void => {};
         const authoritativeAbort = new Promise<ExecutionOutcome>((resolve, reject) => {
           const settle = (): void => {
-            const timedOut = abort.signal.reason instanceof DOMException && abort.signal.reason.name === "TimeoutError";
             void this.terminalizeAfterGrace(
               execution.execution_id,
-              timedOut ? "timeout" : "canceled",
+              clockAbort(abort.signal) ?? "canceled",
               input.taskId,
             ).then(resolve, reject);
           };

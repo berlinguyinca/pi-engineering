@@ -59,6 +59,11 @@ export interface PlanOptions {
    * the tool's own output.
    */
   pruneMissing?: boolean;
+  /**
+   * Configured ids that must survive untouched even when pruning: models the
+   * gateway lists but whose verification was not conclusive this time.
+   */
+  keep?: readonly string[];
   /** Output limit for models being added. Falls back to a sibling's value. */
   defaultMaxTokens?: number;
 }
@@ -169,8 +174,14 @@ export function planCatalogUpdate(
     changes.push({ kind: details.length > 0 ? "update" : "unchanged", id: entry.id, details });
   }
 
+  const keep = new Set(opts.keep ?? []);
   for (const model of existing) {
     if (seen.has(model.id)) continue;
+    if (keep.has(model.id)) {
+      next.push(model);
+      changes.push({ kind: "unchanged", id: model.id, details: ["not verified this time; kept as configured"] });
+      continue;
+    }
     changes.push({
       kind: "missing",
       id: model.id,

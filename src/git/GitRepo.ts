@@ -1,7 +1,8 @@
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
+import type { Dirent } from "node:fs";
 import { access, lstat, mkdir, readFile, readdir, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
-import { basename, join } from "node:path";
+import { basename, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { ExclusiveFileLock } from "../platform/eventstore/fileLock.ts";
 
@@ -238,6 +239,37 @@ export class GitRepo {
   private requireQuery(result: GitResult, operation: string, args: readonly string[]): GitResult {
     if (result.code !== 0) throw new GitQueryError(operation, args, result.code, result.stderr || result.stdout);
     return result;
+  }
+
+  /**
+   * `git` with a payload on stdin (plumbing commands that read content: hash-object,
+   * mktree, commit-tree). execFile has no `input` option, so this spawns and writes
+   * stdin for real, with a kill timeout and GitResult mapping matching git().
+   */
+  private gitWithStdin(args: string[], input: string, env: NodeJS.ProcessEnv, timeoutMs = 120_000): Promise<GitResult> {
+    return new Promise((done) => {
+      const child = spawn("git", [...this.gitArgs, ...args], { env, timeout: timeoutMs, stdio: "pipe" });
+      const stdout: Buffer[] = [];
+      const stderr: Buffer[] = [];
+      let spawnError: Error | undefined;
+      child.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));
+      child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
+      // A git that exits early (bad args) closes stdin; the exit code reports it.
+      child.stdin.on("error", () => {});
+      child.on("error", (err) => {
+        spawnError = err;
+      });
+      child.on("close", (code, signal) => {
+        const err = Buffer.concat(stderr).toString("utf8").trim();
+        const failure = spawnError?.message ?? (signal ? `killed by ${signal} (timeout ${timeoutMs}ms)` : "");
+        done({
+          stdout: Buffer.concat(stdout).toString("utf8").trim(),
+          stderr: [err, failure].filter(Boolean).join("\n"),
+          code: code ?? 1,
+        });
+      });
+      child.stdin.end(input);
+    });
   }
 
   get root(): string {
@@ -503,7 +535,13 @@ export class GitRepo {
     for (const name of await readdir(dir).catch(() => [] as string[])) {
       if (!name.endsWith(".json")) continue;
       try {
-        if (name.startsWith("promotion.") || name.startsWith("run.") || name.startsWith("cleanup.")) continue;
+        if (
+          name.startsWith("promotion.") ||
+          name.startsWith("run.") ||
+          name.startsWith("cleanup.") ||
+          name.startsWith("nestedpub.")
+        )
+          continue;
         const parsed = JSON.parse(await readFile(join(dir, name), "utf8")) as CandidateLifecycle;
         // The expected worktree path below derives from this checkout's root,
         // so it is only meaningful for records this (missionId, repoId) owns.
@@ -957,6 +995,87 @@ export class GitRepo {
     const args = ["branch", "--show-current"];
     const r = this.requireQuery(await this.git(args), "current branch query", args);
     return r.stdout || null;
+  }
+
+  /**
+   * True when the repository has an `origin` remote — the precondition for
+   * cross-host coordination (lane refs live on the shared origin).
+   */
+  async hasRemoteOrigin(): Promise<boolean> {
+    const result = await this.git(["remote", "get-url", "origin"]);
+    return result.code === 0 && result.stdout.length > 0;
+  }
+
+  /**
+   * Read the content of a lane ref from the shared origin. Returns null when the
+   * ref does not exist. The sha is the remote object id, which doubles as the
+   * compare-and-swap token for casPushRef.
+   */
+  async readRemoteRef(ref: string): Promise<{ sha: string; content: string } | null> {
+    const lsArgs = ["ls-remote", "origin", ref];
+    const listing = this.requireQuery(await this.git(lsArgs), "readRemoteRef", lsArgs);
+    if (listing.stdout.length === 0) return null;
+    const tempRef = `refs/pieng-lane-tmp/${process.pid}-${randomUUID()}`;
+    try {
+      const fetchArgs = ["fetch", "--quiet", "--no-tags", "--no-write-fetch-head", "origin", `+${ref}:${tempRef}`];
+      this.requireQuery(await this.git(fetchArgs), "readRemoteRef", fetchArgs);
+      const shaArgs = ["rev-parse", "--verify", tempRef];
+      const sha = this.requireQuery(await this.git(shaArgs), "readRemoteRef", shaArgs).stdout;
+      const showArgs = ["show", `${tempRef}:lanes.json`];
+      const shown = this.requireQuery(await this.git(showArgs, { preserveStdout: true }), "readRemoteRef", showArgs);
+      return { sha, content: shown.stdout };
+    } finally {
+      await this.git(["update-ref", "-d", tempRef]);
+    }
+  }
+
+  /**
+   * Compare-and-swap a lane ref on the shared origin to a new single-file payload.
+   * The payload is wrapped in an orphan commit (fixed identity — lane refs are
+   * machine metadata, not authorship). `expectedSha` must equal the sha last
+   * observed via readRemoteRef (null = "must still be absent"). A lost race is NOT
+   * an error: the call resolves with ok:false and the current remote sha so the
+   * caller can re-read and retry.
+   */
+  async casPushRef(
+    ref: string,
+    content: string,
+    expectedSha: string | null,
+  ): Promise<{ ok: boolean; remoteSha: string | null }> {
+    const env = {
+      ...process.env,
+      GIT_AUTHOR_NAME: "pi-engineering",
+      GIT_AUTHOR_EMAIL: "lanes@pi-engineering.local",
+      GIT_COMMITTER_NAME: "pi-engineering",
+      GIT_COMMITTER_EMAIL: "lanes@pi-engineering.local",
+    };
+    const blobArgs = ["hash-object", "-w", "--stdin"];
+    const blob = this.requireQuery(await this.gitWithStdin(blobArgs, content, env), "casPushRef", blobArgs);
+    const treeArgs = ["mktree"];
+    const tree = this.requireQuery(
+      await this.gitWithStdin(treeArgs, `100644 blob ${blob.stdout}\tlanes.json\n`, env),
+      "casPushRef",
+      treeArgs,
+    );
+    const commitArgs = ["commit-tree", tree.stdout, "-m", "pi-eng lane index"];
+    const commitSha = this.requireQuery(await this.gitWithStdin(commitArgs, "", env), "casPushRef", commitArgs).stdout;
+    // An empty lease value means "the remote ref must not exist".
+    const pushArgs = [
+      "push",
+      "--quiet",
+      `--force-with-lease=${ref}:${expectedSha ?? ""}`,
+      "origin",
+      `${commitSha}:${ref}`,
+    ];
+    const pushed = await this.git(pushArgs);
+    if (pushed.code === 0) return { ok: true, remoteSha: commitSha };
+    const lsArgs = ["ls-remote", "origin", ref];
+    const current = this.requireQuery(await this.git(lsArgs), "casPushRef", lsArgs);
+    const remoteSha = current.stdout.length > 0 ? (current.stdout.split(/\s+/)[0] ?? null) : null;
+    if (remoteSha === expectedSha) {
+      throw new GitQueryError("casPushRef", pushArgs, pushed.code, pushed.stderr || pushed.stdout);
+    }
+    return { ok: false, remoteSha };
   }
 
   async isClean(): Promise<boolean> {
@@ -1888,5 +2007,343 @@ export class GitRepo {
     if (r.code === 0) return true;
     if (r.code === 1) return false;
     throw new GitQueryError("ancestry safety query", args, r.code, r.stderr || r.stdout);
+  } // ─────────────────────────────────────────────────────────────────────────
+  // Nested standalone repository publication (defect-4)
+  //
+  // A mission anchors to the repository it started in, but workers may
+  // legitimately publish work to standalone git repositories nested inside the
+  // anchored working tree (e.g. a private product repo inside a meta-root).
+  // Those nested repos are not candidates of the anchored repo: no worktree,
+  // no branch, no merge. The pipeline observes a nested HEAD advancing over
+  // the execution window and records a durable "nested repo publication" as
+  // candidate evidence in the same candidate store.
+  // ─────────────────────────────────────────────────────────────────────────
+
+  /** Directories that never contain a nested standalone repo worth scanning. */
+  private static readonly NESTED_SCAN_SKIP_DIRS = new Set([
+    ".git",
+    "node_modules",
+    ".venv",
+    "venv",
+    "dist",
+    "build",
+    "target",
+    "vendor",
+    "__pycache__",
+    ".next",
+    ".nuxt",
+    ".cache",
+    ".turbo",
+    ".gradle",
+    "coverage",
+  ]);
+
+  /** Bounded scan depth: nested repos deeper than this are not discovered. */
+  private static readonly NESTED_SCAN_DEFAULT_MAX_DEPTH = 4;
+
+  /** Git command against an arbitrary checkout (nested repo), same error shape as `git`. */
+  private async gitIn(
+    dir: string,
+    args: string[],
+    opts: { timeout?: number; preserveStdout?: boolean } = {},
+  ): Promise<GitResult> {
+    const timeoutMs = opts.timeout ?? 120_000;
+    try {
+      const { stdout, stderr } = await exec("git", ["-C", dir, ...args], {
+        timeout: timeoutMs,
+        maxBuffer: 64 * 1024 * 1024,
+      });
+      return { stdout: opts.preserveStdout ? stdout : stdout.trim(), stderr: stderr.trim(), code: 0 };
+    } catch (err) {
+      const e = err as NodeJS.ErrnoException & { code?: number; stdout?: string; stderr?: string };
+      return {
+        stdout: opts.preserveStdout ? ((e.stdout as string) ?? "") : ((e.stdout as string) ?? "").trim(),
+        stderr: (e.stderr as string) ?? e.message ?? String(e),
+        code: typeof e.code === "number" ? e.code : 1,
+      };
+    }
   }
+
+  private async nestedRepoHead(absolutePath: string): Promise<string | null> {
+    const r = await this.gitIn(absolutePath, ["rev-parse", "HEAD"]);
+    return r.code === 0 && r.stdout ? r.stdout : null;
+  }
+
+  private async nestedRepoBranch(absolutePath: string): Promise<string | null> {
+    const r = await this.gitIn(absolutePath, ["symbolic-ref", "--quiet", "--short", "HEAD"]);
+    return r.code === 0 && r.stdout ? r.stdout : null;
+  }
+
+  /** `origin`, else the first configured remote, else null (no remote). */
+  private async nestedRepoRemoteUrl(absolutePath: string): Promise<string | null> {
+    const origin = await this.gitIn(absolutePath, ["remote", "get-url", "origin"]);
+    if (origin.code === 0 && origin.stdout) return origin.stdout;
+    const remotes = await this.gitIn(absolutePath, ["remote"]);
+    if (remotes.code !== 0 || !remotes.stdout) return null;
+    const first = remotes.stdout
+      .split("\n")
+      .map((name) => name.trim())
+      .find((name) => name.length > 0);
+    if (!first) return null;
+    const url = await this.gitIn(absolutePath, ["remote", "get-url", first]);
+    return url.code === 0 && url.stdout ? url.stdout : null;
+  }
+
+  private async nestedRepoPublishedSha(
+    absolutePath: string,
+    remoteUrl: string,
+    branch: string,
+  ): Promise<string | null> {
+    const r = await this.gitIn(absolutePath, ["ls-remote", remoteUrl, branch], { timeout: 30_000 });
+    if (r.code !== 0) return null;
+    const line = r.stdout
+      .split("\n")
+      .map((entry) => entry.trim())
+      .find((entry) => entry.length > 0);
+    if (!line) return null;
+    const sha = line.split(/\s+/)[0] ?? "";
+    return /^[0-9a-f]{7,40}$/i.test(sha) ? sha : null;
+  }
+
+  private async nestedRepoDiffStat(absolutePath: string, baseSha: string, headSha: string): Promise<string> {
+    const r = await this.gitIn(absolutePath, ["diff", "--stat", `${baseSha}..${headSha}`], { preserveStdout: true });
+    return r.code === 0 ? r.stdout.trim() : "";
+  }
+
+  /**
+   * True when `absolute` is a standalone git repository (has a `.git` file or
+   * dir) that is NOT a worktree of this anchored repo. Worktrees are excluded
+   * via the anchored `git worktree list` and by comparing the candidate's
+   * git-common-dir against the anchored repo's common dir.
+   */
+  private async isNestedStandaloneRepo(
+    absolute: string,
+    anchoredWorktreePaths: ReadonlySet<string>,
+    anchoredCommonDir: string,
+  ): Promise<boolean> {
+    try {
+      const dotGit = await lstat(join(absolute, ".git"));
+      if (!dotGit.isFile() && !dotGit.isDirectory()) return false;
+    } catch {
+      return false;
+    }
+    if (anchoredWorktreePaths.has(resolve(absolute))) return false;
+    const common = await this.gitIn(absolute, ["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+    if (common.code !== 0) return false;
+    return resolve(common.stdout) !== anchoredCommonDir;
+  }
+
+  /**
+   * Discover nested standalone git repositories in the anchored working tree.
+   * Bounded depth; skips `.git` internals, dependency/build dirs; excludes
+   * worktrees of the anchored repo itself.
+   */
+  async discoverNestedRepos(
+    maxDepth: number = GitRepo.NESTED_SCAN_DEFAULT_MAX_DEPTH,
+  ): Promise<Array<{ nestedPath: string; absolutePath: string }>> {
+    const refs: Array<{ nestedPath: string; absolutePath: string }> = [];
+    const worktreePaths = new Set<string>();
+    const listing = await this.git(["worktree", "list", "--porcelain"]);
+    if (listing.code === 0) {
+      for (const line of listing.stdout.split("\n")) {
+        if (line.startsWith("worktree ")) worktreePaths.add(resolve(line.slice("worktree ".length).trim()));
+      }
+    }
+    const anchoredCommonDir = resolve(await this.commonDir());
+    const visit = async (dir: string, rel: string, depth: number): Promise<void> => {
+      const entries: Dirent[] = await readdir(dir, { withFileTypes: true }).catch(() => [] as Dirent[]);
+      for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+        // Directories only: never follow symlinks (bounded, loop-safe scan).
+        if (!entry.isDirectory()) continue;
+        if (GitRepo.NESTED_SCAN_SKIP_DIRS.has(entry.name)) continue;
+        const absolutePath = join(dir, entry.name);
+        const nestedPath = rel ? `${rel}/${entry.name}` : entry.name;
+        if (depth <= maxDepth && (await this.isNestedStandaloneRepo(absolutePath, worktreePaths, anchoredCommonDir))) {
+          refs.push({ nestedPath, absolutePath });
+          continue; // never descend into a discovered nested repo
+        }
+        if (depth < maxDepth) await visit(absolutePath, nestedPath, depth + 1);
+      }
+    };
+    await visit(this.repoRoot, "", 1);
+    refs.sort((a, b) => a.nestedPath.localeCompare(b.nestedPath));
+    return refs;
+  }
+
+  /** Nested HEADs (nestedPath -> sha) for repos with a commit at HEAD. */
+  async captureNestedRepoHeads(maxDepth: number = GitRepo.NESTED_SCAN_DEFAULT_MAX_DEPTH): Promise<Map<string, string>> {
+    const heads = new Map<string, string>();
+    for (const ref of await this.discoverNestedRepos(maxDepth)) {
+      const head = await this.nestedRepoHead(ref.absolutePath);
+      if (head) heads.set(ref.nestedPath, head);
+    }
+    return heads;
+  }
+
+  private nestedPublicationStateName(record: NestedRepoPublication): string {
+    return this.durableIdentityName("nestedpub", [
+      record.missionId,
+      record.anchoredRepoId,
+      record.nestedPath,
+      record.baseSha,
+      record.headSha,
+    ]);
+  }
+
+  /**
+   * Durable nested-repo publication record: unique tmp filename + atomic
+   * rename into the candidate store, same pattern as candidate lifecycles.
+   */
+  async persistNestedRepoPublication(record: NestedRepoPublication): Promise<void> {
+    const dir = await this.candidateStateDir();
+    const target = join(dir, this.nestedPublicationStateName(record));
+    const temporary = `${target}.${process.pid}.${randomUUID()}.tmp`;
+    await writeFile(temporary, JSON.stringify(record), "utf8");
+    await rename(temporary, target);
+  }
+
+  /**
+   * For every nested standalone repo whose HEAD advanced between execution
+   * start (`baseHeads`) and now, record a durable nested repo publication.
+   * Repos without a recorded start baseline, or whose HEAD did not advance,
+   * produce no record.
+   */
+  async recordNestedRepoPublications(options: {
+    missionId: string;
+    anchoredRepoId: string;
+    baseHeads?: ReadonlyMap<string, string> | Record<string, string>;
+    maxDepth?: number;
+  }): Promise<NestedRepoPublication[]> {
+    const baseHeads = new Map<string, string>();
+    const rawBaseHeads = options.baseHeads;
+    if (rawBaseHeads instanceof Map) {
+      for (const [key, value] of rawBaseHeads) baseHeads.set(key, value);
+    } else if (rawBaseHeads) {
+      for (const [key, value] of Object.entries(rawBaseHeads)) baseHeads.set(key, value);
+    }
+    const records: NestedRepoPublication[] = [];
+    for (const ref of await this.discoverNestedRepos(options.maxDepth ?? GitRepo.NESTED_SCAN_DEFAULT_MAX_DEPTH)) {
+      const headSha = await this.nestedRepoHead(ref.absolutePath);
+      if (!headSha) continue;
+      const baseSha = baseHeads.get(ref.nestedPath);
+      if (!baseSha || baseSha === headSha) continue;
+      const remoteUrl = await this.nestedRepoRemoteUrl(ref.absolutePath);
+      let publishedSha: string | null = null;
+      if (remoteUrl) {
+        const branch = await this.nestedRepoBranch(ref.absolutePath);
+        if (branch) publishedSha = await this.nestedRepoPublishedSha(ref.absolutePath, remoteUrl, branch);
+      }
+      records.push({
+        missionId: options.missionId,
+        anchoredRepoId: options.anchoredRepoId,
+        nestedPath: ref.nestedPath,
+        remoteUrl,
+        baseSha,
+        headSha,
+        publishedSha,
+        diffStat: await this.nestedRepoDiffStat(ref.absolutePath, baseSha, headSha),
+        capturedAt: new Date().toISOString(),
+      });
+    }
+    for (const record of records) await this.persistNestedRepoPublication(record);
+    return records;
+  }
+
+  /** Durable nested repo publications for one mission + anchored repo. */
+  async loadNestedRepoPublications(
+    missionId: string,
+    anchoredRepoId: string,
+  ): Promise<DurableRecordInventory<NestedRepoPublication>> {
+    const dir = await this.candidateStateDir(false);
+    const records: NestedRepoPublication[] = [];
+    const diagnostics: Array<{ file: string; reason: string }> = [];
+    for (const name of await readdir(dir).catch(() => [] as string[])) {
+      if (!name.startsWith("nestedpub.") || !name.endsWith(".json")) continue;
+      try {
+        const parsed = JSON.parse(await readFile(join(dir, name), "utf8")) as NestedRepoPublication;
+        const structurallyValid =
+          typeof parsed.missionId === "string" &&
+          parsed.missionId.trim().length > 0 &&
+          typeof parsed.anchoredRepoId === "string" &&
+          parsed.anchoredRepoId.trim().length > 0 &&
+          typeof parsed.nestedPath === "string" &&
+          parsed.nestedPath.trim().length > 0 &&
+          (parsed.remoteUrl === null || typeof parsed.remoteUrl === "string") &&
+          typeof parsed.baseSha === "string" &&
+          parsed.baseSha.trim().length > 0 &&
+          typeof parsed.headSha === "string" &&
+          parsed.headSha.trim().length > 0 &&
+          (parsed.publishedSha === null || typeof parsed.publishedSha === "string") &&
+          typeof parsed.diffStat === "string" &&
+          typeof parsed.capturedAt === "string" &&
+          !Number.isNaN(Date.parse(parsed.capturedAt));
+        if (!structurallyValid) {
+          diagnostics.push({ file: name, reason: "nested publication record has invalid or empty identity fields" });
+          continue;
+        }
+        if (name !== this.nestedPublicationStateName(parsed)) {
+          diagnostics.push({ file: name, reason: "nested publication identity does not match canonical filename" });
+          continue;
+        }
+        if (parsed.missionId === missionId && parsed.anchoredRepoId === anchoredRepoId) records.push(parsed);
+      } catch (error) {
+        diagnostics.push({
+          file: name,
+          reason: `nested publication record is unreadable: ${error instanceof Error ? error.message : String(error)}`,
+        });
+      }
+    }
+    records.sort((a, b) => a.nestedPath.localeCompare(b.nestedPath));
+    return {
+      records: [
+        ...new Map(
+          records.map((record) => [`${record.nestedPath}\0${record.baseSha}\0${record.headSha}`, record]),
+        ).values(),
+      ],
+      diagnostics,
+    };
+  }
+
+  /**
+   * Re-verify that a recorded publication's nested repo HEAD still equals the
+   * recorded headSha (validation gate evidence).
+   */
+  async verifyNestedRepoPublication(
+    record: NestedRepoPublication,
+  ): Promise<{ verified: boolean; headSha: string | null }> {
+    const head = await this.nestedRepoHead(join(this.repoRoot, record.nestedPath));
+    return { verified: head !== null && head === record.headSha, headSha: head };
+  }
+}
+
+/** A standalone git repository nested inside another repository's tree. */
+export interface NestedRepoRef {
+  /** Path relative to the anchored repo root (POSIX separators). */
+  nestedPath: string;
+  absolutePath: string;
+}
+
+/**
+ * Durable record that a mission's worker published work to a nested standalone
+ * repository: the nested HEAD advanced between execution start and end.
+ * Accepted as candidate evidence when `headSha !== baseSha` and the work is on
+ * the nested remote (`publishedSha === headSha`) or the repo has no remote
+ * (`publishedSha === null`).
+ */
+export interface NestedRepoPublication {
+  missionId: string;
+  anchoredRepoId: string;
+  /** Nested repo location relative to the anchored repo root. */
+  nestedPath: string;
+  /** `origin`, else the first configured remote, else null (no remote). */
+  remoteUrl: string | null;
+  /** Nested HEAD at execution start. */
+  baseSha: string;
+  /** Nested HEAD at execution end. */
+  headSha: string;
+  /** `git ls-remote <remote> <branch>`; null when no remote or remote lacks the branch. */
+  publishedSha: string | null;
+  /** `git diff --stat baseSha..headSha` in the nested repo: review evidence without a worktree. */
+  diffStat: string;
+  capturedAt: string;
 }

@@ -230,7 +230,7 @@ export async function ensureMemorySetup(ctx: ExtensionContext, options: MemorySe
       configured ? ["Keep current connection", "Change connection", "Later"] : ["Set up connection", "Later"],
     );
     if (!action || action === "Later") return;
-    let baseUrl = current?.baseUrl ?? "https://viking.metabolomics.us";
+    let baseUrl = current?.baseUrl ?? "https://viking.example.com";
     let token = current?.token;
     let tokenFile = effective.PI_OPENVIKING_TOKEN?.trim() ? undefined : effective.PI_OPENVIKING_TOKEN_FILE;
     if (action !== "Keep current connection") {
