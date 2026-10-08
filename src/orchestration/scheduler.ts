@@ -709,8 +709,6 @@ export class MissionScheduler {
         "AUTHORIZATION_OR_CREDENTIAL",
         "PERSISTENCE_FAILURE",
         "WORKSPACE_SCOPE_MISMATCH",
-        // A stalled reviewer/validator is not a failed review or validation.
-        "WORKER_STALLED",
       ].includes(inferred.category);
     const gateCategory =
       task.kind === "validation"

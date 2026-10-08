@@ -130,8 +130,12 @@ The broker stops a running worker for one of these reasons only:
 
 A stall preserves work exactly like a timeout: `FAILED`, the worktree kept, a
 cancellation checkpoint written, and the branch ineligible for integration.
-The orchestrator classifies it as `WORKER_STALLED` (recovery action
-`FENCE_RECONCILE_AND_RESUME`) and stops the mission at `BLOCKED` before review.
+For an implementer or research task, the orchestrator classifies the stall as
+`WORKER_STALLED` (recovery action `FENCE_RECONCILE_AND_RESUME`). It then stops
+the mission at `BLOCKED` before review. `repairBlockedMission` supersedes the
+stalled task with a fresh replacement, which inherits the original's budget,
+and that replacement carries the mission to completion. A stalled reviewer
+instead goes through finalization's review-repair round (`REVIEW_FAILED`).
 Both `TASK_BUDGET_EXHAUSTED` and the c379a80 build-time hint still apply when a
 budget is configured.
 

@@ -93,12 +93,21 @@ workers:
   from budget exhaustion. The worker's branch and checkpoint are kept, the same
   way a timed-out worker's are. The mission stops at `BLOCKED`, so recovery can
   resume the work in a fresh worker (`FENCE_RECONCILE_AND_RESUME`).
+- **A stalled reviewer** is stopped the same way. The mission then takes the
+  existing review-repair round: the failure is classified `REVIEW_FAILED`, one
+  repair implementer runs, and a fresh review follows. This is what a reviewer
+  that hit the old deadline did too.
 - **The stall check covers agent, review and research workers only.**
   Validation, process and integration report nothing while their commands run.
   Each verification stage has its own command timeout (5 minutes by default,
   `policies.verification.timeout_ms` for lifecycle verification).
 - `routing.roles.<role>.timeout_ms` is **not** a mission worker budget. Mission
   workers never read it; use `workers.execution_budget_ms`.
+
+**Missions planned before this change keep their 30-minute budget.** Their
+tasks stored an explicit `execution_budget_ms: 1800000`, and a recovery
+replacement copies its failed task's budget, because the budget is part of the
+replacement's durable fingerprint. Start a new mission to get the new default.
 
 **The risk of having no budget.** A worker that loops is now stopped only by
 the stall check or by you (aborting the turn that runs the mission cancels

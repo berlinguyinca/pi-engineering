@@ -1821,9 +1821,12 @@ export class Orchestrator {
       // work is preserved like a timed-out worker's; classify it distinctly
       // from budget exhaustion and stop at the repair boundary, so recovery
       // resumes it in a fresh worker instead of reviewing an unfinished change.
+      const superseded = new Set(
+        this.store.listTaskSupersessions(mission.mission_id).map((lineage) => lineage.failedTaskId),
+      );
       const stalledTask = this.store
         .listTasks(mission.mission_id)
-        .filter((task) => task.status === "FAILED" && task.assigned_execution_id)
+        .filter((task) => task.status === "FAILED" && task.assigned_execution_id && !superseded.has(task.task_id))
         .map((task) => ({ task, execution: this.store.getExecution(task.assigned_execution_id!) }))
         .find(({ execution }) => execution?.exit_status === WORKER_STALL_MARKER);
       if (stalledTask) {
@@ -2194,7 +2197,7 @@ export class Orchestrator {
           category: "integration",
           file: null,
           line: null,
-          summary: `FAILED status of task ${taskId} superseded by recovery: its commits were merged after a wall-clock timeout, then validated and reviewed for completeness`,
+          summary: `FAILED status of task ${taskId} superseded by recovery: its work was recovered after the worker was stopped (wall-clock timeout or stall), then validated and reviewed for completeness`,
           evidence: null,
           recommended_action: "None required; recorded so the completion over a failed task is auditable.",
         });
