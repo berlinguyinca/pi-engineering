@@ -5,6 +5,7 @@ import { mkdir, writeFile } from "node:fs/promises";
  *
  *   node scripts/pi-engineering.ts roadmap check [--json] [--no-refresh]
  *   node scripts/pi-engineering.ts roadmap status [--json]
+ *   node scripts/pi-engineering.ts missions list|cancel --store <dir> ...  (legacy orchestration.jsonl only; see docs/orchestration.md)
  *   node scripts/pi-engineering.ts doctor [--repair] [--json] [--cwd <dir>]
  *
  * `roadmap check` exit codes:
@@ -20,6 +21,7 @@ import { generatePlots } from "../src/benchmark/Plots.ts";
 import { BlackholeManager } from "../src/blackhole/BlackholeManager.ts";
 import { blackholeTelemetry, formatBlackholeTelemetry } from "../src/blackhole/telemetry.ts";
 import { Ledger } from "../src/ledger/Ledger.ts";
+import { runMissionsCommand } from "../src/orchestration/missionCancelCli.ts";
 import { defaultCliPaths, runRoadmapCheck, runRoadmapStatus } from "../src/roadmap/cli.ts";
 import { doctorExitCode, formatDoctorReport, runDoctor } from "../src/runtime/isolation/doctor.ts";
 import { runSessionsCommand } from "../src/sessionControl/cli.ts";
@@ -31,6 +33,7 @@ async function main(): Promise<number> {
   const cmd = args[0];
   const rest = args.slice(1);
   if (cmd === "sessions") return runSessionsCommand(rest);
+  if (cmd === "missions") return runMissionsCommand(rest);
   if (cmd === "doctor") return doctorCommand(rest);
   if (cmd === "blackhole") {
     const sub = rest.find((a) => !a.startsWith("--"));
@@ -47,7 +50,7 @@ async function main(): Promise<number> {
   }
   if (cmd !== "roadmap") {
     console.error(
-      "usage: pi-engineering <doctor [--repair] [--json]|roadmap check|roadmap status|blackhole ...|benchmark|cav status|...> [flags]",
+      "usage: pi-engineering <doctor [--repair] [--json]|roadmap check|roadmap status|missions list|missions cancel|blackhole ...|benchmark|cav status|...> [flags]",
     );
     return 2;
   }

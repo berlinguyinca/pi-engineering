@@ -81,6 +81,7 @@ import {
   activityFromSessionEvent,
   emitWorkerActivity,
 } from "./activity.ts";
+import { BuildCommandTimer } from "./buildActivity.ts";
 import { CHECKPOINT_PROGRESS_TOOL_NAME, createCheckpointProgressTool } from "./checkpointProgressTool.ts";
 import { registerLocalProviders } from "./localProviders.ts";
 import { WORKER_KICKOFF, buildSystemPrompt, wantsCommitDiscipline } from "./prompts.ts";
@@ -979,6 +980,9 @@ ${recovery.recoveryPrompt}`;
       }
     };
 
+    // Times build commands: their end event carries the build-tool label and
+    // wall-clock time (budget-exhaustion evidence).
+    const buildTimer = new BuildCommandTimer();
     const streaming = new StreamingActivityThrottle();
     // Standalone callers (no owner signal) get an INACTIVITY guard, not a
     // total-duration one: every session event re-arms it. A long, busy session
@@ -1001,7 +1005,7 @@ ${recovery.recoveryPrompt}`;
       armInactivity();
       const streamed = streaming.note(event as { type?: string; message?: unknown });
       if (streamed) emitWorkerActivity(req, streamed);
-      const activity = activityFromSessionEvent(event);
+      const activity = buildTimer.observe(event, activityFromSessionEvent(event));
       const activityToolName = "toolName" in event ? event.toolName : undefined;
       if (activity && activityToolName !== terminatingName && activityToolName !== CHECKPOINT_PROGRESS_TOOL_NAME) {
         emitWorkerActivity(req, activity);
