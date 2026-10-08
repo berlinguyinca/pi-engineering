@@ -22,8 +22,9 @@ import type { EventStoreBackend } from "../platform/eventstore/backend.ts";
 import type { GatewayResilienceConfig } from "../resilience/config.ts";
 import type { RecoveryProbe } from "../resilience/probe.ts";
 import type { WorkerActivity } from "../workers/WorkerExecutor.ts";
+import { WORKER_MODEL_STREAMING, WORKER_WAITING_FOR_CAPACITY } from "../workers/activity.ts";
 import { budgetExhaustedBuildHint } from "../workers/buildActivity.ts";
-import { type BrokerBackends, ExecutionBroker } from "./broker.ts";
+import { type BrokerBackends, ExecutionBroker, WORKER_STALL_MARKER, resolveWorkerExecutionBudgetMs } from "./broker.ts";
 import { CheckpointManager } from "./checkpoints.ts";
 import { CompletionGate } from "./completionGate.ts";
 import { hashCandidateEvidenceIdentity, normalizeReviewSeverity, taskCoverageFingerprint } from "./evidence.ts";
@@ -154,6 +155,13 @@ export interface OrchestratorOptions {
   /** Bounds planner work before the first executable dispatch. */
   worksetPolicy?: Partial<WorksetPolicy>;
   /**
+   * Worker limits from policy `workers.*` (0 = off). `executionBudgetMs` is the
+   * hard wall-clock cap per worker execution; absent or 0 falls back to
+   * `PI_ENGINEERING_WORKER_TIMEOUT_MS`, else no cap. `stallTimeoutMs` stops a
+   * worker that shows no activity for that long (default 20 minutes).
+   */
+  workerLimits?: { executionBudgetMs?: number; stallTimeoutMs?: number };
+  /**
    * Autonomous spec approval hook (design 2026-09-28). When provided and the
    * routed workflow is a material mutation, the orchestrator runs the durable
    * spec controller to review + approve the exact plan and materializes tasks
@@ -234,7 +242,11 @@ export class Orchestrator {
     this.router = opts.router ?? new IntentRouter();
     this.limits = opts.limits ?? {};
     this.maxRepairRounds = opts.maxRepairRounds ?? 2;
-    this.worksetPolicy = { ...DEFAULT_WORKSET_POLICY, ...opts.worksetPolicy };
+    // No execution budget unless one is configured: a worker still working is
+    // not stopped because wall-clock time passed (the stall check covers a
+    // silent one).
+    const executionBudgetMs = resolveWorkerExecutionBudgetMs(opts.workerLimits?.executionBudgetMs);
+    this.worksetPolicy = { ...DEFAULT_WORKSET_POLICY, maxTaskBudgetMs: executionBudgetMs, ...opts.worksetPolicy };
     this.specApproval = opts.specApproval;
     this.recoveryPlanner = new RecoveryPlanner(opts.recovery);
     const checkpoints = new CheckpointManager({ store: this.store });
@@ -261,6 +273,8 @@ export class Orchestrator {
           }
         : undefined,
       baseRef: opts.baseRef ?? "",
+      defaultTimeoutMs: this.worksetPolicy.maxTaskBudgetMs,
+      ...(opts.workerLimits?.stallTimeoutMs !== undefined ? { stallTimeoutMs: opts.workerLimits.stallTimeoutMs } : {}),
       onActivity: (event) => this.observeWorkerActivity(event),
       checkpoints,
       artifacts: opts.artifacts,
@@ -1058,6 +1072,14 @@ export class Orchestrator {
       executionId: string;
     },
   ): void {
+    // Stall-check liveness signals only: the broker has already seen them, and
+    // repeating them in the activity feed would be noise.
+    if (
+      event.kind === "state" &&
+      (event.summary === WORKER_MODEL_STREAMING || event.summary === WORKER_WAITING_FOR_CAPACITY)
+    ) {
+      return;
+    }
     const obs = this.observability;
     if (!this.observedExecutions.has(event.executionId)) {
       this.observedExecutions.add(event.executionId);
@@ -1527,7 +1549,7 @@ export class Orchestrator {
           task_id: task.task_id ?? id("TSK"),
           acceptance_ids: task.acceptance_ids ? [...task.acceptance_ids] : [],
           deliverables: task.deliverables?.length ? [...task.deliverables] : [task.objective],
-          execution_budget_ms: task.execution_budget_ms ?? this.worksetPolicy.maxTaskBudgetMs,
+          ...this.defaultExecutionBudget(task.execution_budget_ms),
           checkpoint_policy: task.checkpoint_policy ?? {
             activity_milestone: 5,
             before_deadline_ms: 30_000,
@@ -1791,6 +1813,44 @@ export class Orchestrator {
           verdict: this.gate.evaluate(blocked),
           completed: false,
           failureReason: hint ? `${summary}: ${hint}` : summary,
+        };
+      }
+
+      // A worker stopped by the stall check (no activity for
+      // workers.stall_timeout_ms) is not an integration candidate either. Its
+      // work is preserved like a timed-out worker's; classify it distinctly
+      // from budget exhaustion and stop at the repair boundary, so recovery
+      // resumes it in a fresh worker instead of reviewing an unfinished change.
+      const stalledTask = this.store
+        .listTasks(mission.mission_id)
+        .filter((task) => task.status === "FAILED" && task.assigned_execution_id)
+        .map((task) => ({ task, execution: this.store.getExecution(task.assigned_execution_id!) }))
+        .find(({ execution }) => execution?.exit_status === WORKER_STALL_MARKER);
+      if (stalledTask) {
+        const summary = this.broker.stallSummary();
+        const checkpoint = this.store.listTaskCheckpoints(mission.mission_id, stalledTask.task.task_id).at(-1);
+        const classification = this.failureClassifier.classify({
+          missionId: mission.mission_id,
+          taskId: stalledTask.task.task_id,
+          executionId: stalledTask.execution!.execution_id,
+          summary,
+          evidenceRefs: checkpoint ? [checkpoint.checkpointId] : [],
+          category: "WORKER_STALLED",
+          observedAt: new Date(this.scheduler.now()).toISOString(),
+        });
+        if (!this.store.getFailureClassification(classification.classificationId)) {
+          this.store.classifyFailure(classification);
+        }
+        if (canTransitionMission(this.store.getMission(mission.mission_id)!.status, "BLOCKED")) {
+          this.store.transitionMission(mission.mission_id, "BLOCKED");
+        }
+        const blocked = this.store.getMission(mission.mission_id)!;
+        return {
+          mission: blocked,
+          intent,
+          verdict: this.gate.evaluate(blocked),
+          completed: false,
+          failureReason: summary,
         };
       }
 
@@ -2433,10 +2493,19 @@ export class Orchestrator {
         criterion.acceptance_id ? [criterion.acceptance_id] : [],
       ),
       deliverables,
-      execution_budget_ms: this.worksetPolicy.maxTaskBudgetMs,
+      ...this.defaultExecutionBudget(undefined),
       checkpoint_policy: { activity_milestone: 5, before_deadline_ms: 30_000 },
       required_output_artifacts: requiredOutputArtifacts,
     };
+  }
+
+  /**
+   * A task's explicit budget wins; otherwise the configured cap, if any. With
+   * no cap configured the field stays absent: the task has no deadline.
+   */
+  private defaultExecutionBudget(explicit: number | undefined): { execution_budget_ms?: number } {
+    if (explicit !== undefined) return { execution_budget_ms: explicit };
+    return this.worksetPolicy.maxTaskBudgetMs > 0 ? { execution_budget_ms: this.worksetPolicy.maxTaskBudgetMs } : {};
   }
 
   private lastValidationTaskId(missionId: string): string[] {

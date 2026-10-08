@@ -2647,17 +2647,17 @@ describe("ExecutionBroker (spec 03)", () => {
     );
   });
 
-  it("workerTimeoutMs defaults to 30 min and honors the env override", () => {
+  it("workerTimeoutMs defaults to no budget (0) and honors the env override", () => {
     const prev = process.env.PI_ENGINEERING_WORKER_TIMEOUT_MS;
     try {
       delete process.env.PI_ENGINEERING_WORKER_TIMEOUT_MS;
-      assert.equal(workerTimeoutMs(), 30 * 60_000, "default must give workers headroom to commit real work");
+      assert.equal(workerTimeoutMs(), 0, "no default wall-clock budget: a working worker is not stopped by time");
       process.env.PI_ENGINEERING_WORKER_TIMEOUT_MS = "60000";
       assert.equal(workerTimeoutMs(), 60_000, "env override must win");
       process.env.PI_ENGINEERING_WORKER_TIMEOUT_MS = String(2 ** 40);
       assert.equal(workerTimeoutMs(), 2 ** 31 - 1, "beyond setTimeout's range the timer would fire at once");
       process.env.PI_ENGINEERING_WORKER_TIMEOUT_MS = "not-a-number";
-      assert.equal(workerTimeoutMs(), 30 * 60_000, "invalid env must fall back to default");
+      assert.equal(workerTimeoutMs(), 0, "invalid env must fall back to the default (no budget)");
     } finally {
       if (prev === undefined) delete process.env.PI_ENGINEERING_WORKER_TIMEOUT_MS;
       else process.env.PI_ENGINEERING_WORKER_TIMEOUT_MS = prev;

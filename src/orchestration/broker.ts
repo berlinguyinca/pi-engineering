@@ -30,7 +30,7 @@ import type {
   WorktreeInfo,
 } from "../git/GitRepo.ts";
 import type { WorkerActivity } from "../workers/WorkerExecutor.ts";
-import { sanitizeWorkerActivity } from "../workers/activity.ts";
+import { WORKER_SESSION_STARTED, WORKER_WAITING_FOR_CAPACITY, sanitizeWorkerActivity } from "../workers/activity.ts";
 import type { CheckpointProgressClaim } from "../workers/checkpointProgressTool.ts";
 import type { CheckpointManager, CheckpointSnapshot } from "./checkpoints.ts";
 import { EvidenceUnavailableError, buildCandidateEvidenceIdentity } from "./evidence.ts";
@@ -353,6 +353,64 @@ const MAX_TIMER_MS = 2 ** 31 - 1;
 /** The worker's machine-readable failure marker for a wall-clock timeout. */
 const WALL_CLOCK_TIMEOUT_MARKER = "timeout";
 
+/** Failure marker of a worker stopped because it showed no activity (stall check). */
+export const WORKER_STALL_MARKER = "stalled";
+
+/** AbortSignal reason name of a stall stop (a wall-clock deadline uses "TimeoutError"). */
+const WORKER_STALL_ERROR = "WorkerStalledError";
+
+/** Default `workers.stall_timeout_ms`: 20 minutes without any worker activity. */
+export const DEFAULT_WORKER_STALL_TIMEOUT_MS = 20 * 60_000;
+
+/**
+ * Backends whose workers report session activity (model responses, tool
+ * calls). Only these are stall-checked: validation, process and integration
+ * run commands that report nothing while they run, and stay bounded by their
+ * own command timeouts.
+ */
+const STALL_CHECKED_BACKENDS: ReadonlySet<ExecutionBackend> = new Set(["agent", "review", "research"]);
+
+/**
+ * Why an execution's abort signal fired. A deadline and a stall both stop a
+ * worker that may hold partial work, so both preserve it like a timeout; only
+ * a cancellation releases it.
+ */
+type AbortKind = "timeout" | "stalled" | "canceled";
+
+function abortKindOf(signal: AbortSignal): AbortKind {
+  const reason = signal.reason;
+  if (reason instanceof DOMException && reason.name === "TimeoutError") return "timeout";
+  if (reason instanceof DOMException && reason.name === WORKER_STALL_ERROR) return "stalled";
+  return "canceled";
+}
+
+function abortMarker(kind: AbortKind): string {
+  return kind === "timeout" ? WALL_CLOCK_TIMEOUT_MARKER : kind === "stalled" ? WORKER_STALL_MARKER : "canceled";
+}
+
+function abortKindOfMarker(marker: string | null | undefined): AbortKind | null {
+  return marker === WALL_CLOCK_TIMEOUT_MARKER ? "timeout" : marker === WORKER_STALL_MARKER ? "stalled" : null;
+}
+
+/** "20 minutes", "1 minute", or seconds below a minute (tests use short limits). */
+export function formatStallDuration(ms: number): string {
+  if (ms >= 60_000) {
+    const minutes = Math.round(ms / 60_000);
+    return `${minutes} minute${minutes === 1 ? "" : "s"}`;
+  }
+  const seconds = Math.round(ms / 100) / 10;
+  return `${seconds} second${seconds === 1 ? "" : "s"}`;
+}
+
+/**
+ * The stopped worker's summary. Deliberately free of words the failure
+ * classifier reads as a provider fault ("timeout", "gateway", "network") and
+ * distinct from budget exhaustion.
+ */
+export function workerStallSummary(stallTimeoutMs: number): string {
+  return `Worker stalled: no activity for ${formatStallDuration(stallTimeoutMs)} (no model response, no tool call running)`;
+}
+
 function pathAllowed(path: string, domains: string[]): boolean {
   const normalized = canonicalizeWriteDomain(path);
   return domains.some((domain) => {
@@ -367,28 +425,45 @@ function pathAllowed(path: string, domains: string[]): boolean {
 }
 
 /**
- * Default execution wall-clock budget in ms. The historical 10-minute default
- * repeatedly aborted fresh-context implementation workers at the boundary
- * before they could commit real work (only a trivial file-copy ever landed in
- * time), which made the mission pipeline unable to integrate anything but
- * trivial changes. 30 minutes gives a worker room to explore the repo,
- * implement, verify, and commit within one bounded run. Overridable via
- * `PI_ENGINEERING_WORKER_TIMEOUT_MS` for the whole pipeline (broker abort
- * timer and worker budget stay in lockstep).
+ * Default execution wall-clock budget in ms; 0 means none.
+ *
+ * There is no default budget. A fixed one (10, then 30 minutes) stopped
+ * workers that were still making progress with a slow model — a timeout, no
+ * commit, a blocked mission — over and over. A worker is now stopped by the
+ * stall check (no activity for `workers.stall_timeout_ms`) or by the user, not
+ * by elapsed time. `PI_ENGINEERING_WORKER_TIMEOUT_MS` still restores a hard cap
+ * for the whole pipeline when policy `workers.execution_budget_ms` sets none.
  */
 export function workerTimeoutMs(): number {
   const env = Number.parseInt(process.env.PI_ENGINEERING_WORKER_TIMEOUT_MS ?? "", 10);
   // setTimeout fires IMMEDIATELY for delays above 2^31-1 ms, which would turn a
   // generous override into an instant abort.
   if (Number.isFinite(env) && env > 0) return Math.min(env, MAX_TIMER_MS);
-  return 30 * 60_000;
+  return 0;
+}
+
+/**
+ * The hard cap per worker execution: policy `workers.execution_budget_ms` when
+ * positive, else `PI_ENGINEERING_WORKER_TIMEOUT_MS`, else 0 (no cap).
+ */
+export function resolveWorkerExecutionBudgetMs(policyBudgetMs: number | undefined): number {
+  if (typeof policyBudgetMs === "number" && Number.isFinite(policyBudgetMs) && policyBudgetMs > 0) {
+    return Math.min(policyBudgetMs, MAX_TIMER_MS);
+  }
+  return workerTimeoutMs();
 }
 
 export interface BrokerOptions {
   store: MissionStore;
   backends: BrokerBackends;
-  /** Default timeout per execution. */
+  /** Default wall-clock budget per execution; 0 means none (the default). */
   defaultTimeoutMs?: number;
+  /**
+   * Stop an agent/review/research worker after this long with no activity and
+   * no tool call running (policy `workers.stall_timeout_ms`). 0 disables it.
+   * Default 20 minutes.
+   */
+  stallTimeoutMs?: number;
   /** Git provider used to allocate isolated worktrees for mutating tasks. */
   git?: GitRepo | null;
   /** Base ref (commit) worktrees are created at. Defaults to current HEAD. */
@@ -419,6 +494,7 @@ export class ExecutionBroker {
   private readonly store: MissionStore;
   private readonly backends: BrokerBackends;
   private readonly defaultTimeoutMs: number;
+  private readonly stallTimeoutMs: number;
   private readonly git: GitRepo | null;
   private readonly baseRef: string;
   private readonly resolveRepository?: BrokerOptions["resolveRepository"];
@@ -505,6 +581,8 @@ export class ExecutionBroker {
     this.store = opts.store;
     this.backends = opts.backends;
     this.defaultTimeoutMs = opts.defaultTimeoutMs ?? workerTimeoutMs();
+    const stall = opts.stallTimeoutMs ?? DEFAULT_WORKER_STALL_TIMEOUT_MS;
+    this.stallTimeoutMs = Number.isFinite(stall) && stall > 0 ? Math.min(stall, MAX_TIMER_MS) : 0;
     this.git = opts.git ?? null;
     this.baseRef = opts.baseRef ?? "";
     this.resolveRepository = opts.resolveRepository;
@@ -954,21 +1032,17 @@ export class ExecutionBroker {
     await Promise.all(stale.map(([executionId, entry]) => this.cancelExecution(executionId, entry.taskId)));
   }
 
-  private terminalizeAfterGrace(
-    executionId: string,
-    reason: "canceled" | "timeout",
-    taskId: string,
-  ): Promise<ExecutionOutcome> {
+  /** What a worker stopped by this broker's stall check reports. */
+  stallSummary(): string {
+    return workerStallSummary(this.stallTimeoutMs);
+  }
+
+  private terminalizeAfterGrace(executionId: string, reason: AbortKind, taskId: string): Promise<ExecutionOutcome> {
     const entry = this.active.get(executionId);
     if (!entry) return Promise.resolve(this.terminalizeExecution(executionId, reason, taskId));
     if (entry.terminalPromise) return entry.terminalPromise;
     entry.terminalPromise = (async () => {
-      this.markBranchIntegrationIneligible(
-        executionId,
-        entry.missionId,
-        taskId,
-        reason === "timeout" ? WALL_CLOCK_TIMEOUT_MARKER : "canceled",
-      );
+      this.markBranchIntegrationIneligible(executionId, entry.missionId, taskId, abortMarker(reason));
       const checkpoint = entry.cancelCheckpoint?.();
       let graceTimer: ReturnType<typeof setTimeout> | undefined;
       let checkpointSettled = true;
@@ -988,7 +1062,7 @@ export class ExecutionBroker {
       } finally {
         if (graceTimer) clearTimeout(graceTimer);
       }
-      if ((reason === "timeout" || !checkpointSettled) && entry.worktree) {
+      if ((reason !== "canceled" || !checkpointSettled) && entry.worktree) {
         this.retainWorktree(entry.missionId, executionId);
       }
       const outcome = this.terminalizeExecution(executionId, reason, taskId);
@@ -1029,25 +1103,30 @@ export class ExecutionBroker {
     return entry.terminalPromise;
   }
 
-  private terminalizeExecution(executionId: string, reason: "canceled" | "timeout", taskId: string): ExecutionOutcome {
+  private terminalizeExecution(executionId: string, reason: AbortKind, taskId: string): ExecutionOutcome {
     const existing = this.store.getExecution(executionId);
-    const error = reason === "timeout" ? WALL_CLOCK_TIMEOUT_MARKER : "canceled";
+    const error = abortMarker(reason);
+    const failed = reason !== "canceled";
     const outcome: ExecutionOutcome = {
       executionId,
       exitStatus: "failed",
       summary:
-        reason === "timeout" ? "Execution exceeded its deadline and cancellation grace" : "Execution was canceled",
+        reason === "timeout"
+          ? "Execution exceeded its deadline and cancellation grace"
+          : reason === "stalled"
+            ? workerStallSummary(this.stallTimeoutMs)
+            : "Execution was canceled",
       artifactRefs: [],
       usage: {},
       error,
     };
     if (existing?.status === "RUNNING") {
-      this.store.setExecutionStatus(executionId, reason === "timeout" ? "FAILED" : "CANCELED", {
+      this.store.setExecutionStatus(executionId, failed ? "FAILED" : "CANCELED", {
         exit_status: error,
       });
     }
     const task = this.store.getTask(taskId);
-    if (task?.status === "RUNNING") this.store.transitionTask(taskId, reason === "timeout" ? "FAILED" : "CANCELED");
+    if (task?.status === "RUNNING") this.store.transitionTask(taskId, failed ? "FAILED" : "CANCELED");
     this.active.delete(executionId);
     return outcome;
   }
@@ -1129,7 +1208,7 @@ export class ExecutionBroker {
           executionId,
           input.missionId,
           input.taskId,
-          terminal?.exit_status === WALL_CLOCK_TIMEOUT_MARKER ? WALL_CLOCK_TIMEOUT_MARKER : "canceled",
+          abortKindOfMarker(terminal?.exit_status) ? terminal!.exit_status! : "canceled",
         );
         throw error;
       }
@@ -2061,21 +2140,24 @@ export class ExecutionBroker {
     input.recovery = await this.preliminaryRecoveryContext(input);
     input.authority?.assertAuthoritative();
     const executionStartedAt = Date.now();
-    const executionBudgetMs = input.executionBudgetMs ?? input.timeoutPolicy?.timeoutMs ?? this.defaultTimeoutMs;
-    if (!Number.isFinite(executionBudgetMs) || executionBudgetMs <= 0) {
-      throw new Error("INVALID_TASK_BUDGET: execution budget must be finite and positive");
+    // 0 (or nothing configured) means no execution budget: no deadline at all,
+    // never "already expired". An explicit per-task budget wins.
+    const requestedBudgetMs = input.executionBudgetMs ?? input.timeoutPolicy?.timeoutMs ?? this.defaultTimeoutMs;
+    if (!Number.isFinite(requestedBudgetMs) || requestedBudgetMs < 0) {
+      throw new Error("INVALID_TASK_BUDGET: execution budget must be finite and not negative (0 means none)");
     }
+    const executionBudgetMs = requestedBudgetMs > 0 ? Math.min(requestedBudgetMs, MAX_TIMER_MS) : 0;
     if (
       input.checkpointPolicy &&
       (!Number.isInteger(input.checkpointPolicy.activity_milestone) ||
         input.checkpointPolicy.activity_milestone <= 0 ||
         !Number.isFinite(input.checkpointPolicy.before_deadline_ms) ||
         input.checkpointPolicy.before_deadline_ms <= 0 ||
-        input.checkpointPolicy.before_deadline_ms >= executionBudgetMs)
+        (executionBudgetMs > 0 && input.checkpointPolicy.before_deadline_ms >= executionBudgetMs))
     ) {
       throw new Error("INVALID_CHECKPOINT_POLICY: checkpoint lead must be finite, positive, and below budget");
     }
-    const executionDeadlineAt = executionStartedAt + executionBudgetMs;
+    const executionDeadlineAt = executionBudgetMs > 0 ? executionStartedAt + executionBudgetMs : null;
     const backend = this.backendForKind(input.kind);
     const checkpointId = input.checkpointId ?? (this.checkpoints && input.repoId ? id("TCP") : undefined);
     const task = this.store.getTask(input.taskId);
@@ -2126,22 +2208,59 @@ export class ExecutionBroker {
             if (terminal?.status === "CANCELED") {
               return this.terminalizeExecution(execution.execution_id, "canceled", input.taskId);
             }
-            if (terminal?.status === "FAILED" && terminal.exit_status === WALL_CLOCK_TIMEOUT_MARKER) {
-              return this.terminalizeExecution(execution.execution_id, "timeout", input.taskId);
+            const terminalKind = abortKindOfMarker(terminal?.exit_status);
+            if (terminal?.status === "FAILED" && terminalKind) {
+              return this.terminalizeExecution(execution.execution_id, terminalKind, input.taskId);
             }
             throw new Error("execution aborted before dispatch");
           }
-          const timer = setTimeout(
-            () =>
-              abort.abort(new DOMException(`Execution exceeded its ${executionBudgetMs}ms deadline`, "TimeoutError")),
-            Math.max(0, executionDeadlineAt - Date.now()),
-          );
-          timer.unref?.();
+          const timer =
+            executionDeadlineAt === null
+              ? undefined
+              : setTimeout(
+                  () =>
+                    abort.abort(
+                      new DOMException(`Execution exceeded its ${executionBudgetMs}ms deadline`, "TimeoutError"),
+                    ),
+                  Math.max(0, executionDeadlineAt - Date.now()),
+                );
+          timer?.unref?.();
           const activityStartedAt = Date.now();
           let lastActivityAt = activityStartedAt;
           let activitySettled = false;
           let activityTimer: ReturnType<typeof setInterval> | undefined;
           let checkpointTimer: ReturnType<typeof setTimeout> | undefined;
+          // Stall check (policy workers.stall_timeout_ms). Activity is any
+          // non-heartbeat worker event: a model response (or one streaming), a
+          // tool starting or finishing, a checkpoint claim. While a tool call
+          // runs (a 25-minute cargo build) or the worker waits for model
+          // capacity, it is not silent, however long that takes.
+          const stallTimeoutMs = STALL_CHECKED_BACKENDS.has(backend) ? this.stallTimeoutMs : 0;
+          let stallTimer: ReturnType<typeof setTimeout> | undefined;
+          let stallClockFrom = activityStartedAt;
+          let toolsInFlight = 0;
+          let waitingForCapacity = false;
+          const armStallCheck = (delayMs: number): void => {
+            if (stallTimeoutMs <= 0 || activitySettled || abort.signal.aborted) return;
+            stallTimer = setTimeout(
+              () => {
+                stallTimer = undefined;
+                if (activitySettled || abort.signal.aborted) return;
+                if (toolsInFlight > 0 || waitingForCapacity) {
+                  armStallCheck(stallTimeoutMs);
+                  return;
+                }
+                const silentMs = Date.now() - Math.max(lastActivityAt, stallClockFrom);
+                if (silentMs < stallTimeoutMs) {
+                  armStallCheck(stallTimeoutMs - silentMs);
+                  return;
+                }
+                abort.abort(new DOMException(workerStallSummary(stallTimeoutMs), WORKER_STALL_ERROR));
+              },
+              Math.min(MAX_TIMER_MS, Math.max(1, delayMs)),
+            );
+            stallTimer.unref?.();
+          };
           let repository: {
             repoId?: string;
             root: string;
@@ -2322,6 +2441,14 @@ export class ExecutionBroker {
               checkpointClaims.set(claim.deliverable, claim);
             }
             if (safe.kind !== "heartbeat") lastActivityAt = Date.now();
+            if (safe.kind === "tool") {
+              toolsInFlight = safe.phase === "started" ? toolsInFlight + 1 : Math.max(0, toolsInFlight - 1);
+            }
+            if (safe.kind === "state" && safe.summary === WORKER_SESSION_STARTED) {
+              // A fresh session (retry, model takeover) has no call in flight.
+              toolsInFlight = 0;
+            }
+            if (safe.kind !== "heartbeat") waitingForCapacity = safe.summary === WORKER_WAITING_FOR_CAPACITY;
             if (safe.meaningfulProgress && input.checkpointPolicy?.activity_milestone) {
               meaningfulActivity++;
               if (meaningfulActivity % input.checkpointPolicy.activity_milestone === 0) queueCheckpoint();
@@ -2341,10 +2468,11 @@ export class ExecutionBroker {
             if (activitySettled) return;
             if (activityTimer) clearInterval(activityTimer);
             activityTimer = undefined;
-            const timedOut = abort.signal.reason instanceof DOMException && abort.signal.reason.name === "TimeoutError";
+            if (stallTimer) clearTimeout(stallTimer);
+            stallTimer = undefined;
             const safe = sanitizeWorkerActivity({
               kind: "execution",
-              phase: timedOut ? "failed" : "canceled",
+              phase: abortKindOf(abort.signal) === "canceled" ? "canceled" : "failed",
               stage: backend,
               summary: "",
               meaningfulProgress: false,
@@ -2420,7 +2548,9 @@ export class ExecutionBroker {
             worktree = await this.allocateWorktree(execution.execution_id, input, repository);
             const active = this.active.get(execution.execution_id);
             if (worktree && active) active.worktree = worktree;
-            if (this.checkpoints && checkpointId && input.checkpointPolicy) {
+            // Without a deadline there is nothing to checkpoint ahead of; the
+            // activity-milestone and cancellation checkpoints still apply.
+            if (this.checkpoints && checkpointId && input.checkpointPolicy && executionDeadlineAt !== null) {
               checkpointTimer = setTimeout(
                 () => queueCheckpoint(),
                 Math.max(0, executionDeadlineAt - input.checkpointPolicy.before_deadline_ms - Date.now()),
@@ -2456,15 +2586,11 @@ export class ExecutionBroker {
             }
             if (abort.signal.aborted) {
               detachedAfterTerminalAbort = true;
-              const timedOut =
-                abort.signal.reason instanceof DOMException && abort.signal.reason.name === "TimeoutError";
-              return this.terminalizeAfterGrace(
-                execution.execution_id,
-                timedOut ? "timeout" : "canceled",
-                input.taskId,
-              );
+              return this.terminalizeAfterGrace(execution.execution_id, abortKindOf(abort.signal), input.taskId);
             }
             writerStarted = true;
+            stallClockFrom = Date.now();
+            armStallCheck(stallTimeoutMs);
             const backendSettlement: Promise<BackendSettlement> = this.dispatch(
               input,
               backend,
@@ -2493,8 +2619,8 @@ export class ExecutionBroker {
             const first = await Promise.race([backendSettlement, aborted]);
             removeAbortRaceListener();
             if (first.kind === "aborted") {
-              const timedOut =
-                abort.signal.reason instanceof DOMException && abort.signal.reason.name === "TimeoutError";
+              const kind = abortKindOf(abort.signal);
+              const timedOut = kind !== "canceled";
               if (worktree && this.store.getExecution(execution.execution_id)?.status === "RUNNING") {
                 const info = this.allocatedWorktrees.get(execution.execution_id);
                 const byBranch =
@@ -2502,22 +2628,23 @@ export class ExecutionBroker {
                   new Map<string, { marker: string; taskId: string; recoverRef?: string }>();
                 if (info) {
                   byBranch.set(info.branch, {
-                    marker: timedOut ? WALL_CLOCK_TIMEOUT_MARKER : "canceled",
+                    marker: abortMarker(kind),
                     taskId: input.taskId,
                   });
                   this.failedBranches.set(input.missionId, byBranch);
                 }
               }
-              const terminalOutcome = await this.terminalizeAfterGrace(
-                execution.execution_id,
-                timedOut ? "timeout" : "canceled",
-                input.taskId,
-              );
+              const terminalOutcome = await this.terminalizeAfterGrace(execution.execution_id, kind, input.taskId);
               if (timedOut && worktree) retainWorktreeOnCleanup = true;
               detachedAfterTerminalAbort = true;
               cleanupOwnedByCancellation = true;
               void backendSettlement.then((late) =>
-                this.observeLate(execution.execution_id, timedOut ? "hard timeout" : "cancellation", late, input),
+                this.observeLate(
+                  execution.execution_id,
+                  kind === "timeout" ? "hard timeout" : kind === "stalled" ? "stall stop" : "cancellation",
+                  late,
+                  input,
+                ),
               );
               emitActivity({
                 kind: "execution",
@@ -2689,13 +2816,17 @@ export class ExecutionBroker {
                 lateEvidence({ kind: "backend_error", error: err }, input),
               );
             } else if (!this.settledElsewhere(execution.execution_id)) {
-              const timedOut =
-                abort.signal.reason instanceof DOMException && abort.signal.reason.name === "TimeoutError";
-              if (abort.signal.aborted && !timedOut) {
+              const kind = abortKindOf(abort.signal);
+              if (abort.signal.aborted && kind === "canceled") {
                 this.store.setExecutionStatus(execution.execution_id, "CANCELED", { exit_status: "canceled" });
               } else {
                 this.store.setExecutionStatus(execution.execution_id, "FAILED", {
-                  exit_status: timedOut ? WALL_CLOCK_TIMEOUT_MARKER : err instanceof Error ? err.message : String(err),
+                  exit_status:
+                    abort.signal.aborted && kind !== "canceled"
+                      ? abortMarker(kind)
+                      : err instanceof Error
+                        ? err.message
+                        : String(err),
                 });
               }
             }
@@ -2712,13 +2843,14 @@ export class ExecutionBroker {
             activitySettled = true;
             if (activityTimer) clearInterval(activityTimer);
             if (checkpointTimer) clearTimeout(checkpointTimer);
+            if (stallTimer) clearTimeout(stallTimer);
             checkpointScheduling = false;
             if (!detachedAfterTerminalAbort) {
               await cancelCheckpointPromise?.catch(() => undefined);
               await checkpointChain.catch(() => undefined);
             }
             abort.signal.removeEventListener("abort", onAbort);
-            clearTimeout(timer);
+            if (timer) clearTimeout(timer);
             if (!retainWorktreeOnCleanup && !cleanupOwnedByCancellation) {
               await this.releaseWorktree(execution.execution_id, true, input.authority);
             }
@@ -2728,12 +2860,10 @@ export class ExecutionBroker {
         let removeAbortListener = (): void => {};
         const authoritativeAbort = new Promise<ExecutionOutcome>((resolve, reject) => {
           const settle = (): void => {
-            const timedOut = abort.signal.reason instanceof DOMException && abort.signal.reason.name === "TimeoutError";
-            void this.terminalizeAfterGrace(
-              execution.execution_id,
-              timedOut ? "timeout" : "canceled",
-              input.taskId,
-            ).then(resolve, reject);
+            void this.terminalizeAfterGrace(execution.execution_id, abortKindOf(abort.signal), input.taskId).then(
+              resolve,
+              reject,
+            );
           };
           removeAbortListener = () => abort.signal.removeEventListener("abort", settle);
           if (abort.signal.aborted) settle();

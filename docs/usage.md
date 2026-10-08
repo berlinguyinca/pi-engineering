@@ -46,10 +46,79 @@ The pipeline routes intent, creates a durable **mission**, plans/executes
 workers, runs validation, launches a fresh independent reviewer, and enforces
 the deterministic completion gate — no `/engineer` or `/review` needed.
 
-### When a worker runs out of execution budget
+### How long a worker may run
 
-A mutating worker runs in a fresh isolated worktree. It may use up its execution
-budget (`execution_budget_ms`, 30 minutes by default) without committing. If
+A mission worker has **no execution budget by default**. It is not stopped
+because wall-clock time passed while it is still working. A slow model that
+needs an hour and 100 tool calls to finish a task gets that hour. Earlier
+releases gave every task a 30-minute budget. Workers that were still making
+progress hit it, ended with `timeout` and no commit, and blocked the mission
+as `TASK_BUDGET_EXHAUSTED`.
+
+Two policy keys in `~/.pi/agent/engineering.yaml` (global) or
+`<repo>/.pi/engineering.yaml` (repository) control this:
+
+```yaml
+workers:
+  # Hard cap per worker execution, in ms. 0 (default) = no cap.
+  # A positive value (60000..86400000) restores a cap and becomes the
+  # default execution_budget_ms of every planned task.
+  execution_budget_ms: 0
+  # Stop a worker that shows no activity for this long, in ms.
+  # Default 1200000 (20 minutes). 0 disables the check.
+  stall_timeout_ms: 1200000
+```
+
+- **An explicit budget wins.** A task that has its own `execution_budget_ms`,
+  for example in a mission spec, keeps it. With a cap configured, a larger
+  explicit budget is rejected as `TASK_BUDGET_EXCEEDED`, as before.
+- **`PI_ENGINEERING_WORKER_TIMEOUT_MS`** still restores a cap for the whole
+  pipeline, but only when `workers.execution_budget_ms` sets none.
+- **Activity, for the stall check**, is any of: a model response finishing, a
+  model response still streaming (reported at most every 30 s), and a tool call
+  starting or finishing. Heartbeats are not activity. A worker is never
+  "silent":
+  - while a tool call is running, however long it takes (a 25-minute
+    `cargo build` is one start event and one end event);
+  - while it waits for an admission slot or a gateway hold.
+
+  Silence counts from the last activity, or from the end of the last tool
+  call.
+  The admission-retry transport can wait out gateway 429s for up to
+  `inference.retry.admission.max_elapsed_ms` (15 minutes by default) without
+  any event reaching the worker, so keep `stall_timeout_ms` above that value.
+- **A stalled worker** is stopped with `exit_status: stalled`. It is classified
+  `WORKER_STALLED` with the summary "Worker stalled: no activity for 20
+  minutes (no model response, no tool call running)". That summary is distinct
+  from budget exhaustion. The worker's branch and checkpoint are kept, the same
+  way a timed-out worker's are. The mission stops at `BLOCKED`, so recovery can
+  resume the work in a fresh worker (`FENCE_RECONCILE_AND_RESUME`).
+- **The stall check covers agent, review and research workers only.**
+  Validation, process and integration report nothing while their commands run.
+  Each verification stage has its own command timeout (5 minutes by default,
+  `policies.verification.timeout_ms` for lifecycle verification).
+- `routing.roles.<role>.timeout_ms` is **not** a mission worker budget. Mission
+  workers never read it; use `workers.execution_budget_ms`.
+
+**The risk of having no budget.** A worker that loops is now stopped only by
+the stall check or by you (aborting the turn that runs the mission cancels
+it). A loop that keeps calling tools never goes silent, so the stall check does not catch it, and it keeps
+spending tokens. `~/.pi/agent/engineering.yaml` already records one case:
+`deepseek_v4-flash` looped without committing on substantial turns, with
+about 3M input tokens and no code across three missions. The safety net is the
+stall check plus the existing "no commit" handling: when the worker branches
+hold no work, integration produces no change, which is a blocking finding, so
+the mission cannot complete on it. Watch
+long-running missions with `/mission-status`. If you use such a model, set
+`workers.execution_budget_ms`, or pin a better model for the implementer.
+A future option could cap the total number of tool calls a worker may make
+without a commit. It does not exist yet.
+
+### When a worker with a configured budget runs out of it
+
+A mutating worker runs in a fresh isolated worktree. With a configured budget
+(`workers.execution_budget_ms`, or a task's own `execution_budget_ms`), it may
+use the budget up without committing. If
 its activity shows build commands (cargo, npm, gradle, ...), the mission's
 failure reason and a `major` `execution_budget` finding say how much of the run
 went to building. Two examples:

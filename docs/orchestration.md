@@ -103,6 +103,48 @@ non-overlapping parallel mutators therefore edit isolated checkouts.
 Real backends live in `src/orchestration/realBackends.ts`, adapting the
 EXISTING runtime primitives; tests inject deterministic fakes.
 
+### Worker limits: no default budget, a stall check
+
+The broker stops a running worker for one of these reasons only:
+
+- **User abort or cancel.** The execution and task become `CANCELED`.
+- **A configured hard budget.** It comes from policy
+  `workers.execution_budget_ms`, a task's explicit `execution_budget_ms`, or
+  `PI_ENGINEERING_WORKER_TIMEOUT_MS`. The broker aborts with `TimeoutError`,
+  and `exit_status` becomes `timeout`. There is **no default budget**: absent
+  or 0 means no deadline, never "already expired". The planner, the spec
+  approval normalizer and the runtime's default planner no longer invent one.
+  The deadline checkpoint (`checkpoint_policy.before_deadline_ms`) is scheduled
+  only when there is a deadline.
+- **The stall check** (`workers.stall_timeout_ms`, default 20 minutes, 0 = off;
+  agent, review and research backends only). The broker counts every
+  non-heartbeat worker event as activity: a model response, a throttled
+  "Model response streaming", a tool `started`/`completed`/`failed`, a
+  checkpoint claim. It also keeps a count of tool calls in flight. Starting a
+  new session resets that count, so a lost end event cannot switch the check
+  off. "Waiting for model capacity" holds the check until the next event. The
+  broker aborts only when no tool call is running and no event has arrived
+  for the timeout. The abort reason is `WorkerStalledError`, `exit_status` is
+  `stalled`, and the summary reads "Worker stalled: no activity for N
+  minutes ...".
+
+A stall preserves work exactly like a timeout: `FAILED`, the worktree kept, a
+cancellation checkpoint written, and the branch ineligible for integration.
+The orchestrator classifies it as `WORKER_STALLED` (recovery action
+`FENCE_RECONCILE_AND_RESUME`) and stops the mission at `BLOCKED` before review.
+Both `TASK_BUDGET_EXHAUSTED` and the c379a80 build-time hint still apply when a
+budget is configured.
+
+The older stall signals do not stop a live but silent worker:
+
+- The supervisor's observability `stalled` projection fires only when
+  heartbeats stop. The broker emits heartbeats on an interval, so a live but
+  silent worker shows as `slow`.
+- `src/resilience/watchdog.ts` is advisory and not wired into missions.
+
+`lifecycle.budget_ms` bounds the automatic *lifecycle* pass (review fan-out),
+not mission workers.
+
 ## Scheduler
 
 `MissionScheduler.runMission` executes runnable tasks (deps SUCCEEDED, no

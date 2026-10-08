@@ -427,6 +427,8 @@ export type FailureCategory =
   | "WORKSPACE_SCOPE_MISMATCH"
   | "EVIDENCE_UNAVAILABLE"
   | "TASK_BUDGET_EXHAUSTED"
+  /** A worker showed no activity for workers.stall_timeout_ms and was stopped. */
+  | "WORKER_STALLED"
   | "PROVIDER_TRANSIENT"
   | "PROVIDER_PERMANENT"
   | "INVALID_WORKER_OUTPUT"

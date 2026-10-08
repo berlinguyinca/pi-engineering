@@ -156,11 +156,40 @@ export interface LifecycleConfig {
   notify: boolean;
 }
 
+/**
+ * Limits on one mission worker execution (implementer, reviewer, research).
+ *
+ * Both are wall-clock milliseconds; 0 turns the limit off.
+ */
+export interface WorkersConfig {
+  /**
+   * Hard wall-clock cap on one worker execution. 0 (the default) means no cap:
+   * a worker is never stopped only because time passed while it is still
+   * working. A positive value restores a hard cap and becomes the default
+   * `execution_budget_ms` of planned tasks. An explicit per-task
+   * `execution_budget_ms` in a mission spec always wins.
+   */
+  execution_budget_ms: number;
+  /**
+   * Stop a worker that has shown no activity (no model response, nothing
+   * streamed, no tool started or finished) for this long, while no tool call is
+   * running and it is not waiting for model capacity. 0 disables the check.
+   */
+  stall_timeout_ms: number;
+}
+
+/** Upper bound for worker limits: Node's setTimeout fires at once beyond 2^31-1 ms. */
+export const MAX_WORKER_LIMIT_MS = 86_400_000;
+/** Smallest positive worker limit accepted (anything shorter is a typo, not a limit). */
+export const MIN_WORKER_LIMIT_MS = 60_000;
+
 export interface EngineeringPolicy {
   version: number;
   /** Dotted keys from the global layer that repository config cannot weaken. */
   mandatory: string[];
   lifecycle: LifecycleConfig;
+  /** Mission worker limits: by default no wall-clock cap, only a stall check. */
+  workers: WorkersConfig;
   routing: RoutingConfig;
   policies: {
     separation_of_duties: {
@@ -205,6 +234,10 @@ export const DEFAULT_POLICY: EngineeringPolicy = {
     persist_dir: ".pi-eng/lifecycle",
     telemetry: true,
     notify: true,
+  },
+  workers: {
+    execution_budget_ms: 0,
+    stall_timeout_ms: 20 * 60_000,
   },
   routing: {
     mode: "auto",
@@ -394,6 +427,18 @@ export function validatePolicy(policy: EngineeringPolicy): PolicyIssue[] {
     }
   }
 
+  // "0 or a range": NUMBER_RANGE_FIELDS cannot say that a limit may be off.
+  for (const key of ["execution_budget_ms", "stall_timeout_ms"] as const) {
+    const path = `workers.${key}`;
+    const v = getPath(flat, path);
+    const range = `0 (off) or ${MIN_WORKER_LIMIT_MS}..${MAX_WORKER_LIMIT_MS}`;
+    if (typeof v !== "number" || !Number.isInteger(v)) {
+      issues.push({ path, message: `expected a whole number of milliseconds: ${range}`, severity: "error" });
+    } else if (v !== 0 && (v < MIN_WORKER_LIMIT_MS || v > MAX_WORKER_LIMIT_MS)) {
+      issues.push({ path, message: `${v} is outside the allowed values ${range}`, severity: "error" });
+    }
+  }
+
   for (const path of BOOLEAN_FIELDS) {
     if (path === "routing.mode") continue;
     const v = getPath(flat, path);
@@ -563,6 +608,27 @@ export async function loadPolicy(opts: LoadPolicyOptions): Promise<PolicyLoadRes
   const validation = validatePolicy(policy);
   issues.push(...validation);
   return { policy, issues, sources };
+}
+
+/**
+ * The worker limits a mission runtime applies, tolerating a policy object that
+ * predates the `workers` block (each missing or invalid value falls back to
+ * its default rather than to an immediate deadline).
+ */
+export function workerLimitsFromPolicy(policy: Pick<EngineeringPolicy, "workers"> | undefined): {
+  executionBudgetMs: number;
+  stallTimeoutMs: number;
+} {
+  const pick = (value: unknown, fallback: number): number =>
+    typeof value === "number" &&
+    Number.isInteger(value) &&
+    (value === 0 || (value >= MIN_WORKER_LIMIT_MS && value <= MAX_WORKER_LIMIT_MS))
+      ? value
+      : fallback;
+  return {
+    executionBudgetMs: pick(policy?.workers?.execution_budget_ms, DEFAULT_POLICY.workers.execution_budget_ms),
+    stallTimeoutMs: pick(policy?.workers?.stall_timeout_ms, DEFAULT_POLICY.workers.stall_timeout_ms),
+  };
 }
 
 /** Coerce the policy's admission block into a complete, validated config. */

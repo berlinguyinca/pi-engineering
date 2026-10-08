@@ -51,7 +51,8 @@ export interface SpecPlannedTask {
   write_domains: string[];
   acceptance_ids: string[];
   deliverables: string[];
-  execution_budget_ms: number;
+  /** Explicit hard wall-clock budget; absent means the configured default (none unless set). */
+  execution_budget_ms?: number;
   isolation: "none" | "worktree";
 }
 
@@ -357,10 +358,13 @@ export function validatePlannedTasks(
         `task at ordinal ${index} has ${deliverables.length} deliverables (max ${maxDeliverablesPerTask})`,
       );
     }
+    // Only an explicit positive budget is kept. Otherwise none is invented
+    // here: the runtime applies policy workers.execution_budget_ms (default:
+    // no budget).
     const executionBudget =
       Number.isFinite(task.execution_budget_ms) && (task.execution_budget_ms ?? 0) > 0
         ? task.execution_budget_ms!
-        : 30 * 60_000;
+        : undefined;
     const taskId = task.task_id?.trim() || stableTaskId("", "", envelope.repositoryId, index);
     if (seen.has(taskId)) throw new SpecApprovalError("DUPLICATE_TASK_ID", `task ID ${taskId} repeated`);
     seen.add(taskId);
@@ -375,7 +379,7 @@ export function validatePlannedTasks(
       write_domains: writeDomains,
       acceptance_ids: acceptanceIdsForTask,
       deliverables,
-      execution_budget_ms: executionBudget,
+      ...(executionBudget !== undefined ? { execution_budget_ms: executionBudget } : {}),
       isolation: task.isolation ?? (task.mutates_repo ? "worktree" : "none"),
     };
   });

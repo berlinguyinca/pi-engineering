@@ -189,6 +189,42 @@ test("worker: the production checkpoint tool emits candidate-bound progress for 
   );
 });
 
+test("worker: a streaming model response is reported as stall-check activity, at most once per interval", async () => {
+  const streamed: Reply = (res) =>
+    sse(res, [
+      chunk({ role: "assistant", content: "" }),
+      ...Array.from({ length: 20 }, () => chunk({ content: "x" })),
+      chunk(
+        {
+          tool_calls: [
+            {
+              index: 0,
+              id: "call_0",
+              type: "function",
+              function: { name: "worker_result", arguments: JSON.stringify(WORKER_RESULT) },
+            },
+          ],
+        },
+        "tool_calls",
+      ),
+    ]);
+  await withProbe([streamed], async (executor, cwd) => {
+    const activities: Array<{ kind: string; summary: string }> = [];
+    const run = await executor.run({
+      role: "implementer",
+      task: "t",
+      tools: [],
+      cwd,
+      onActivity: (activity) => activities.push(activity),
+      modelOverride: { provider: "probe", id: "probe-model" },
+    });
+    assert.equal(run.result.status, "completed", run.result.summary);
+    const streaming = activities.filter((a) => a.kind === "state" && a.summary === "Model response streaming");
+    assert.equal(streaming.length, 1, "throttled: one report for a burst of deltas");
+    assert.ok(activities.some((a) => a.summary === "Model response received"));
+  });
+});
+
 test("reviewer: a cut AFTER review_result was delivered does not re-run the review", async () => {
   // review_result arrives alongside a non-terminating tool, so the loop takes
   // one more turn — and that turn is cut. The verdict was already delivered, so

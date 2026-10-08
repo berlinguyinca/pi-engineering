@@ -347,6 +347,12 @@ export interface EngineeringRuntimeOptions {
    * review fallback model from its runtime.
    */
   roleRouter?: Pick<RoleRouterAdapter, "route">;
+  /**
+   * Mission worker limits (0 = off). Defaults to policy `workers.*` from the
+   * agent dir and repository `engineering.yaml`: no execution budget, a
+   * 20-minute stall check.
+   */
+  workerLimits?: { executionBudgetMs?: number; stallTimeoutMs?: number };
   /** Override the durable state directory (default: <repoRoot>/.pi-eng). */
   workDir?: string;
   /**
@@ -871,16 +877,29 @@ export class EngineeringRuntime {
             execution_requirements: {},
             acceptance_ids: acceptanceIds,
             deliverables: mutates ? ["implementation", "targeted-tests"] : ["investigation-report"],
-            execution_budget_ms: 30 * 60_000,
+            // No execution_budget_ms: the orchestrator applies policy
+            // workers.execution_budget_ms (default: none).
             checkpoint_policy: { activity_milestone: 5, before_deadline_ms: 30_000 },
             max_attempts: 3,
             failure_policy: "retry",
           },
         ];
       };
+      // A policy that cannot be read must not stop missions: fall back to the
+      // defaults (no execution budget, 20-minute stall check).
+      let workerLimits = opts.workerLimits;
+      if (!workerLimits) {
+        try {
+          const { loadPolicy, workerLimitsFromPolicy } = await import("../lifecycle/policy.ts");
+          workerLimits = workerLimitsFromPolicy((await loadPolicy({ cwd: repoRoot, agentDir: opts.agentDir })).policy);
+        } catch {
+          workerLimits = undefined;
+        }
+      }
       rt.orchestrator = new Orchestrator({
         store: rt.missionStore,
         backends,
+        ...(workerLimits ? { workerLimits } : {}),
         observability: rt.missionObservability,
         planner: opts.orchestrationPlanner ?? defaultPlanner,
         specApproval: opts.orchestrationSpecApproval,

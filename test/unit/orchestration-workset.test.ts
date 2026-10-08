@@ -120,8 +120,30 @@ describe("repository-scoped workset validation", () => {
     );
   });
 
-  it("rejects non-positive/non-finite budgets and non-positive or out-of-budget checkpoint cadence", () => {
-    for (const execution_budget_ms of [0, -1, Number.POSITIVE_INFINITY]) {
+  it("accepts a task with no execution budget (absent or 0) and never caps it by default", () => {
+    for (const execution_budget_ms of [undefined, 0]) {
+      const [validated] = validateWorkset({
+        manifest,
+        acceptanceIds: ["AC-1"],
+        // A lead time that would be "outside" any short budget: with no budget
+        // there is no deadline to checkpoint ahead of.
+        tasks: [
+          task({ execution_budget_ms, checkpoint_policy: { activity_milestone: 2, before_deadline_ms: 30_000_000 } }),
+        ],
+      });
+      assert.equal(validated?.execution_budget_ms, execution_budget_ms);
+    }
+    // The default policy has no cap, so an explicit long budget from a mission spec wins.
+    const [long] = validateWorkset({
+      manifest,
+      acceptanceIds: ["AC-1"],
+      tasks: [task({ execution_budget_ms: 6 * 60 * 60_000 })],
+    });
+    assert.equal(long?.execution_budget_ms, 6 * 60 * 60_000);
+  });
+
+  it("rejects negative/non-finite budgets and non-positive or out-of-budget checkpoint cadence", () => {
+    for (const execution_budget_ms of [-1, Number.POSITIVE_INFINITY, Number.NaN]) {
       expectCode("INVALID_TASK_BUDGET", () =>
         validateWorkset({ manifest, acceptanceIds: ["AC-1"], tasks: [task({ execution_budget_ms })] }),
       );

@@ -71,7 +71,20 @@ import { type RequestBodyBudgetConfig, resolveRequestBodyBudgetConfig } from "..
 import { type ThinkingOffConfig, resolveThinkingOffConfig } from "../request/thinkingPolicy.ts";
 import { emitTelemetry } from "../telemetry/sink.ts";
 import type { WorkerExecutor, WorkerRequest, WorkerRun } from "./WorkerExecutor.ts";
-import { activityFromSessionEvent, emitWorkerActivity } from "./activity.ts";
+import {
+  WORKER_MODEL_STREAMING,
+  WORKER_WAITING_FOR_CAPACITY,
+  activityFromSessionEvent,
+  emitWorkerActivity,
+} from "./activity.ts";
+
+/**
+ * A streaming model response counts as activity for the broker's stall check
+ * (a slow model can stream one long response for many minutes before
+ * `message_end`). Reported at most this often so it does not flood the
+ * activity feed.
+ */
+const MODEL_STREAMING_ACTIVITY_INTERVAL_MS = 30_000;
 import { BuildCommandTimer } from "./buildActivity.ts";
 import { checkpointProgressTool } from "./checkpointProgressTool.ts";
 import { registerLocalProviders } from "./localProviders.ts";
@@ -404,6 +417,10 @@ ${TOOL_TRANSITION_RULE}`;
       //   * GATEWAY saturation (429 inference_admission) is deliberately NOT a
       //     transient category — see classifyError. It is handled below, where
       //     the gateway's own advertised wait is honoured process-wide.
+      // Waiting for a slot is not a stall: say so before a possibly long wait.
+      if (gatewayConfig.enabled) {
+        emitWorkerActivity(req, { kind: "state", summary: WORKER_WAITING_FOR_CAPACITY, meaningfulProgress: false });
+      }
       const slot = gatewayConfig.enabled ? await admission.acquire() : null;
       let transientOutcome: Awaited<
         ReturnType<typeof withTransientRetry<Awaited<ReturnType<typeof this.runSingleAttempt>>>>
@@ -434,6 +451,11 @@ ${TOOL_TRANSITION_RULE}`;
           const handover = decideTransientHandover(detail, gatewayRetries, gatewayConfig.maxRetries);
           if (handover.action === "wait") {
             gatewayRetries++;
+            emitWorkerActivity(req, {
+              kind: "state",
+              summary: WORKER_WAITING_FOR_CAPACITY,
+              meaningfulProgress: false,
+            });
             await holdForGateway(handover.signal);
             continue;
           }
@@ -864,7 +886,16 @@ ${recovery.recoveryPrompt}`;
     // Times build commands: their end event carries the build-tool label and
     // wall-clock time (budget-exhaustion evidence).
     const buildTimer = new BuildCommandTimer();
+    let lastStreamingActivityAt = 0;
     const unsubscribe = session.subscribe((event) => {
+      if (
+        event.type === "message_update" &&
+        (event.message as { role?: unknown } | undefined)?.role === "assistant" &&
+        Date.now() - lastStreamingActivityAt >= MODEL_STREAMING_ACTIVITY_INTERVAL_MS
+      ) {
+        lastStreamingActivityAt = Date.now();
+        emitWorkerActivity(req, { kind: "state", summary: WORKER_MODEL_STREAMING, meaningfulProgress: false });
+      }
       const activity = buildTimer.observe(event, activityFromSessionEvent(event));
       const activityToolName = "toolName" in event ? event.toolName : undefined;
       if (activity && activityToolName !== terminatingName && activityToolName !== checkpointProgressTool.name) {
@@ -930,12 +961,18 @@ ${recovery.recoveryPrompt}`;
     // The owner signal is the sole deadline authority when present (the broker
     // starts its clock before setup/worktree allocation). Standalone executor
     // callers without an owner signal retain the local worker timer.
-    const timer = req.signal
-      ? undefined
-      : setTimeout(() => {
-          timedOut = true;
-          void session.abort();
-        }, req.timeoutMs ?? 300_000);
+    // A standalone timeoutMs of 0 means no local deadline (never "expire now").
+    const localTimeoutMs = req.timeoutMs ?? 300_000;
+    const timer =
+      req.signal || localTimeoutMs <= 0
+        ? undefined
+        : setTimeout(
+            () => {
+              timedOut = true;
+              void session.abort();
+            },
+            Math.min(localTimeoutMs, 2 ** 31 - 1),
+          );
     const abortFromOwner = (): void => {
       ownerAborted = true;
       const reason = req.signal?.reason;

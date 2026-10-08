@@ -575,6 +575,7 @@ export class LifecycleHarness {
     const lines = [
       `Policy sources: ${this.policySources.join(" < ") || "built-in defaults"}`,
       `lifecycle: automatic=${p.lifecycle.automatic} max_rounds=${p.lifecycle.max_remediation_rounds} remediation=${p.lifecycle.remediation} budget_ms=${p.lifecycle.budget_ms} plan_threshold=${p.lifecycle.plan_threshold_risk}`,
+      `workers: execution_budget_ms=${p.workers?.execution_budget_ms || "none"} stall_timeout_ms=${p.workers?.stall_timeout_ms || "off"}`,
       `routing: mode=${p.routing.mode} adopt_session_model=${p.routing.adopt_orchestrator_model} priority=${p.routing.provider_priority.join(",") || "-"} deny=${p.routing.provider_deny.join(",") || "-"}`,
       `review: independent=${p.policies.review.require_independent_review} differs_from_session=${p.policies.review.reviewer_differs_from_session} specialists=${p.policies.review.specialists_enabled} max_blocking=${p.policies.review.max_blocking_findings_to_pass}`,
       `verification: required=${p.policies.verification.require_before_complete} sources=${p.policies.verification.command_sources.join(",")} missing_blocks=${p.policies.verification.missing_required_blocks}`,

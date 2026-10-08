@@ -5,6 +5,20 @@ import type { CheckpointProgressClaim } from "./checkpointProgressTool.ts";
 
 export const MAX_WORKER_ACTIVITY_SUMMARY = 160;
 
+/** State summaries that cross the activity boundary verbatim (stall check inputs). */
+export const WORKER_SESSION_STARTED = "Worker session started";
+export const WORKER_MODEL_RESPONSE = "Model response received";
+/** A model response still streaming: activity for the stall check, emitted at most once per interval. */
+export const WORKER_MODEL_STREAMING = "Model response streaming";
+/** Waiting for an admission slot or a gateway hold: not a stall, however long. */
+export const WORKER_WAITING_FOR_CAPACITY = "Waiting for model capacity";
+
+const PASSTHROUGH_STATE_SUMMARIES = new Set([
+  WORKER_MODEL_RESPONSE,
+  WORKER_MODEL_STREAMING,
+  WORKER_WAITING_FOR_CAPACITY,
+]);
+
 function safeToolName(value: unknown): string {
   if (typeof value !== "string") return "tool";
   const safe = safeText(value, 64).match(/^[A-Za-z0-9_.:-]+/)?.[0] ?? "tool";
@@ -149,7 +163,10 @@ export function sanitizeWorkerActivity(value: unknown): WorkerActivity | null {
     if (input.phase === "canceled") {
       return { kind: "state", phase: "canceled", summary: "Worker session canceled", meaningfulProgress: false };
     }
-    const summary = input.summary === "Model response received" ? input.summary : "Worker session started";
+    const summary =
+      typeof input.summary === "string" && PASSTHROUGH_STATE_SUMMARIES.has(input.summary)
+        ? input.summary
+        : WORKER_SESSION_STARTED;
     return {
       kind: "state",
       ...(input.phase ? { phase: input.phase } : {}),
@@ -203,7 +220,7 @@ export function activityFromSessionEvent(event: {
   if (event.type === "message_end") {
     const role = (event.message as { role?: unknown } | undefined)?.role;
     if (role === "assistant") {
-      return { kind: "state", summary: "Model response received", meaningfulProgress: false };
+      return { kind: "state", summary: WORKER_MODEL_RESPONSE, meaningfulProgress: false };
     }
   }
   return null;

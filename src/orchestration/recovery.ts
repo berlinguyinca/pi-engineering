@@ -38,6 +38,9 @@ const DEFAULT_ACTIONS: Record<FailureCategory, RecoveryAction> = {
   WORKSPACE_SCOPE_MISMATCH: "REBUILD_WORKSPACE_MANIFEST",
   EVIDENCE_UNAVAILABLE: "RECONSTRUCT_EVIDENCE",
   TASK_BUDGET_EXHAUSTED: "CHECKPOINT_SPLIT_AND_REPLACE",
+  // A silent worker is treated like a lost one: fence it, keep its preserved
+  // work and resume from a fresh worker (the checkpoint, if any, is imported).
+  WORKER_STALLED: "FENCE_RECONCILE_AND_RESUME",
   PROVIDER_TRANSIENT: "PROBE_AND_BACKOFF",
   PROVIDER_PERMANENT: "STOP",
   INVALID_WORKER_OUTPUT: "REPAIR_WORKER_OUTPUT",
@@ -231,6 +234,9 @@ export class FailureClassifier {
       }
       return "PROVIDER_PERMANENT";
     }
+    // Before every other text rule: the stall summary must never read as a
+    // provider fault or as budget exhaustion.
+    if (/^stalled:|worker stalled|no activity for/.test(summary)) return "WORKER_STALLED";
     if (/workspace|scope mismatch|role-access|repository mismatch/.test(summary)) return "WORKSPACE_SCOPE_MISMATCH";
     if (/evidence.*(unavailable|missing|inaccessible)|candidate evidence unavailable/.test(summary)) {
       return "EVIDENCE_UNAVAILABLE";
