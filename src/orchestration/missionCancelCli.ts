@@ -7,12 +7,22 @@
  *                   [--yes] [--json]
  *
  * `cancel` is a dry run unless `--yes` is given. The store is opened under its
- * single-writer lock, so this refuses to run while a live `pi` session owns
- * it; no supervisor is started and no Git state is touched.
+ * single-writer lock, so this refuses to run while a live `pi` session of a
+ * version that still writes this store owns it; no supervisor is started and
+ * no Git state is touched.
+ *
+ * Current runtimes no longer write `orchestration.jsonl`: they import it once
+ * into a machine-local runtime namespace (per-session event streams, no
+ * cross-process writer lock) and keep every later mission there. Once a store
+ * has been imported, this command is neither guarded nor effective (missions
+ * created since are not in the file, and the file's lock no longer excludes a
+ * live session), so `cancel` refuses and points at `/mission cancel <id>`.
  */
-import { stat } from "node:fs/promises";
+import { readFile, readdir, realpath, stat } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { JsonlEventStore } from "../platform/eventstore/jsonl.ts";
+import { MIGRATIONS_FILE } from "../runtime/isolation/legacyMigration.ts";
+import { resolveOrchestrationOverride, resolveStateRoot } from "../runtime/isolation/stateDir.ts";
 import { type MissionCancellation, type MissionSelector, cancelStaleMission, listMissions } from "./missionCancel.ts";
 import { MissionStore } from "./missionStore.ts";
 
@@ -20,6 +30,8 @@ export interface MissionsCliOptions {
   write?: (text: string) => void;
   error?: (text: string) => void;
   now?: number;
+  /** Environment used to locate runtime namespaces (defaults to process.env). */
+  env?: NodeJS.ProcessEnv;
 }
 
 const USAGE =
@@ -42,7 +54,43 @@ function values(args: string[], flag: string): string[] {
 async function storeFile(path: string): Promise<string> {
   const absolute = resolve(path);
   const info = await stat(absolute);
-  return info.isDirectory() ? join(absolute, "orchestration.jsonl") : absolute;
+  const file = info.isDirectory() ? join(absolute, "orchestration.jsonl") : absolute;
+  // Opening a missing file would create an empty store and report "no
+  // missions" for a mistyped path; say what is wrong instead.
+  if (!(await stat(file)).isFile()) throw new Error(`${file} is not an orchestration store file`);
+  return file;
+}
+
+/**
+ * The runtime namespace a legacy store was imported into, if any. A namespace
+ * records each imported source path in its migrations file.
+ */
+async function importedInto(storePath: string, env: NodeJS.ProcessEnv): Promise<string | null> {
+  const namespaces: string[] = [];
+  const override = resolveOrchestrationOverride(env);
+  if (override) namespaces.push(override);
+  const worktrees = join(resolveStateRoot(env), "worktrees");
+  try {
+    for (const entry of await readdir(worktrees)) namespaces.push(join(worktrees, entry));
+  } catch {
+    // No runtime state on this machine yet.
+  }
+  // Records are keyed by the path the runtime saw; compare canonical paths.
+  const canonical = (path: string) => realpath(path).catch(() => resolve(path));
+  const target = await canonical(storePath);
+  for (const namespace of namespaces) {
+    let records: unknown;
+    try {
+      records = JSON.parse(await readFile(join(namespace, MIGRATIONS_FILE), "utf8"));
+    } catch {
+      continue; // No (readable) migrations file: nothing was imported there.
+    }
+    if (!records || typeof records !== "object" || Array.isArray(records)) continue;
+    for (const source of Object.keys(records)) {
+      if ((await canonical(source)) === target) return namespace;
+    }
+  }
+  return null;
 }
 
 export async function runMissionsCommand(args: string[], options: MissionsCliOptions = {}): Promise<number> {
@@ -72,6 +120,14 @@ export async function runMissionsCommand(args: string[], options: MissionsCliOpt
   }
   const json = rest.includes("--json");
   const apply = rest.includes("--yes");
+  const imported = await importedInto(storePath, options.env ?? process.env);
+  if (imported && sub === "cancel") {
+    err(
+      `${storePath} is a legacy store that was imported into the runtime namespace ${imported}; missions now live there, so canceling here would neither reach them nor be guarded against a live session. Cancel from a pi session in that repository with /mission cancel <id>.\n`,
+    );
+    return 1;
+  }
+  if (imported) err(`note: ${storePath} is a legacy snapshot imported into ${imported}; it lacks later missions.\n`);
 
   let backend: JsonlEventStore;
   try {

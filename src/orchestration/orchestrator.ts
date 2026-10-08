@@ -588,7 +588,7 @@ export class Orchestrator {
           reason: "gate repair refused: no independently Git-verified current candidate exists for this mission",
           preservedWork,
           attemptedRecoveries: this.store.listRecoveryDecisions(missionId).map((decision) => decision.recoveryId),
-          resumeCondition: `a successful integration must publish Git-verified candidate evidence before gate repair can run; otherwise cancel the mission (pi-engineering missions cancel --store <.pi-eng dir> --mission ${missionId} --yes)`,
+          resumeCondition: `a successful integration must publish Git-verified candidate evidence before gate repair can run; otherwise cancel the mission with /mission cancel ${missionId}`,
         });
         await this.store.flush();
         this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);

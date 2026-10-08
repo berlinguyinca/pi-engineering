@@ -125,10 +125,19 @@ export function cancelStaleMission(
   }
   const now = options.now ?? Date.now();
   const lease = store.getMissionLease(missionId);
-  if (lease && now < Date.parse(lease.renewBy)) {
-    throw new Error(
-      `mission ${missionId} has a live controller lease held by ${lease.ownerId} until ${lease.renewBy}; cancel it from that session`,
-    );
+  if (lease) {
+    const renewBy = Date.parse(lease.renewBy);
+    // An unreadable expiry proves nothing about the owner: fail closed.
+    if (!Number.isFinite(renewBy) || now < renewBy) {
+      throw new Error(
+        `mission ${missionId} has a live controller lease held by ${lease.ownerId} until ${lease.renewBy}; cancel it from that session`,
+      );
+    }
+  }
+  // Refuse before touching anything: a mission the lifecycle cannot cancel
+  // (NEW) must not be left with canceled tasks under a live status.
+  if (!canTransitionMission(mission.status, "CANCELING") && !canTransitionMission(mission.status, "CANCELED")) {
+    throw new Error(`mission ${missionId} cannot transition ${mission.status} -> CANCELED`);
   }
   const canceledExecutions: string[] = [];
   for (const execution of store.listExecutions(missionId)) {

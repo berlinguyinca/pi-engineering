@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
@@ -170,5 +170,105 @@ describe("offline stale-mission cancellation", () => {
       cancelStaleMission(store, "MSN-owned", { now: Date.parse("2026-10-07T00:01:00.000Z") }).status,
       "CANCELED",
     );
+  });
+
+  it("fails closed on a lease whose expiry cannot be read", () => {
+    const store = MissionStore.open(JsonlEventStore.inMemory());
+    createBlocked(store, "MSN-garbled", "repo-x");
+    store.transitionMissionLease("acquired", {
+      missionId: "MSN-garbled",
+      generation: 1,
+      ownerId: "runtime-unknown",
+      acquiredAt: "2026-10-07T00:00:00.000Z",
+      renewBy: "not-a-date",
+      fencingToken: 1,
+    });
+    assert.throws(() => cancelStaleMission(store, "MSN-garbled"), /live controller lease/);
+    assert.equal(store.getMission("MSN-garbled")!.status, "BLOCKED");
+  });
+
+  it("refuses a mission the lifecycle cannot cancel before changing any of its work", () => {
+    const store = MissionStore.open(JsonlEventStore.inMemory());
+    store.createMission({
+      mission_id: "MSN-new",
+      title: "new",
+      goal: "g",
+      user_request: "g",
+      repository: "/repo",
+      base_ref: "base",
+      risk_profile: "medium",
+      workflow_class: "engineering",
+    });
+    const task = store.createTask({
+      task_id: "TSK-new",
+      mission_id: "MSN-new",
+      kind: "agent",
+      role: "implementer",
+      objective: "o",
+    });
+    assert.equal(store.getMission("MSN-new")!.status, "NEW");
+    assert.throws(() => cancelStaleMission(store, "MSN-new"), /cannot transition NEW -> CANCELED/);
+    assert.equal(store.getTask(task.task_id)!.status, task.status, "no task was canceled");
+  });
+
+  it("rejects a store path without an orchestration store instead of creating an empty one", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pi-eng-cancel-empty-"));
+    try {
+      const errors: string[] = [];
+      assert.equal(
+        await runMissionsCommand(["list", "--store", dir], { write: () => {}, error: (text) => errors.push(text) }),
+        2,
+      );
+      assert.match(errors.join(""), /orchestration\.jsonl/);
+      assert.deepEqual(await readdir(dir), [], "nothing was created in the mistyped directory");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("clears an operator pin on cancel, like an in-session cancel", () => {
+    const store = MissionStore.open(JsonlEventStore.inMemory());
+    createBlocked(store, "MSN-pinned", "repo-x");
+    store.markOperatorPause("MSN-pinned");
+    assert.ok(store.getMission("MSN-pinned")!.operator_paused_at);
+    assert.equal(cancelStaleMission(store, "MSN-pinned").status, "CANCELED");
+    assert.ok(!store.getMission("MSN-pinned")!.operator_paused_at, "a canceled mission is never reported as paused");
+  });
+
+  it("refuses to cancel in a legacy store that a current runtime already imported", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pi-eng-cancel-imported-"));
+    try {
+      const file = join(dir, ".pi-eng", "orchestration.jsonl");
+      await mkdir(join(dir, ".pi-eng"));
+      const backend = await JsonlEventStore.open(file);
+      const store = MissionStore.open(backend);
+      createBlocked(store, "MSN-legacy", "repo-x");
+      await store.flush();
+      backend.close();
+      const stateRoot = join(dir, "state");
+      const namespace = join(stateRoot, "worktrees", "wt-1");
+      await mkdir(namespace, { recursive: true });
+      await writeFile(join(namespace, "migrations.json"), JSON.stringify({ [file]: { source: file } }));
+      const env = { PI_ENGINEERING_STATE_DIR: stateRoot };
+
+      const errors: string[] = [];
+      const io = { env, write: () => {}, error: (text: string) => errors.push(text) };
+      const cancel = ["cancel", "--store", join(dir, ".pi-eng"), "--mission", "MSN-legacy", "--yes"];
+      assert.equal(await runMissionsCommand(cancel, io), 1);
+      assert.match(errors.join(""), /imported into the runtime namespace .*\/mission cancel <id>/s);
+
+      const reopenedBackend = await JsonlEventStore.open(file);
+      try {
+        assert.equal(MissionStore.open(reopenedBackend).getMission("MSN-legacy")!.status, "BLOCKED");
+      } finally {
+        reopenedBackend.close();
+      }
+      // Listing the snapshot still works, flagged as such.
+      errors.length = 0;
+      assert.equal(await runMissionsCommand(["list", "--store", join(dir, ".pi-eng")], io), 0);
+      assert.match(errors.join(""), /legacy snapshot/);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });

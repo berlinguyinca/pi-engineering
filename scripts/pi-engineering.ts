@@ -5,7 +5,7 @@ import { mkdir, writeFile } from "node:fs/promises";
  *
  *   node scripts/pi-engineering.ts roadmap check [--json] [--no-refresh]
  *   node scripts/pi-engineering.ts roadmap status [--json]
- *   node scripts/pi-engineering.ts missions list|cancel --store <dir> ...  (offline stale-mission control)
+ *   node scripts/pi-engineering.ts missions list|cancel --store <dir> ...  (legacy orchestration.jsonl only; see docs/orchestration.md)
  *   node scripts/pi-engineering.ts doctor [--repair] [--json] [--cwd <dir>]
  *
  * `roadmap check` exit codes:
