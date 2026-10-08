@@ -31,6 +31,11 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      - name: Install Playwright browser
+        # The CAV (computer-aided verification) suites drive a real headless
+        # Chromium via Playwright; npm ci does not download the browser binary,
+        # so install it here or every browser-backed test fails at launch.
+        run: npx playwright install --with-deps chromium
       - name: Typecheck
         run: npm run typecheck
       - name: Lint
