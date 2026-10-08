@@ -39,6 +39,7 @@ import {
   escalateSyntheticWait,
   gatewayFailureMarker,
   gatewayHoldScope,
+  isAccountWideRefusal,
   isCapacityExhaustion,
   isTransportDrop,
   parseGatewayWait,
@@ -390,6 +391,14 @@ ${TOOL_TRANSITION_RULE}`;
     // Advice to move to another model is the exception — holding forever on a
     // model the gateway says to leave helps nobody, so that keeps the finite
     // count and hands the decision back to the mission.
+    //
+    // A model-scoped capacity hold (this model's queue is full or deadlined, a
+    // comparable deployment has room) is the same kind of exception: waiting
+    // forever on the one saturated model stalls a mission that the router could
+    // move onto a model with free capacity. So after the finite hold count it
+    // hands back too. An account-wide hold (a shared queue, a concurrency
+    // ceiling) still waits out: every model is behind it, so switching would
+    // only spin the same queue.
     const gatewayRetryCeiling = req.unboundedInferenceWait ? Number.POSITIVE_INFINITY : gatewayConfig.maxRetries;
     // An operator-pinned model is the exception to the exception: the operator
     // chose it, so only the operator moves the mission off it (with /model,
@@ -398,8 +407,9 @@ ${TOOL_TRANSITION_RULE}`;
       decision.action === "wait" &&
       req.unboundedInferenceWait &&
       !req.operatorPinned &&
-      advisesAlternateModel(decision.signal) &&
-      gatewayRetries >= gatewayConfig.maxRetries
+      gatewayRetries >= gatewayConfig.maxRetries &&
+      (advisesAlternateModel(decision.signal) ||
+        (isCapacityExhaustion(decision.signal) && !isAccountWideRefusal(decision.signal)))
         ? { action: "give-up", signal: decision.signal, reason: "retries-exhausted" }
         : decision;
     // A mission waiting on an exhausted model says so, once per model, and

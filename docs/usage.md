@@ -188,11 +188,16 @@ the tool reports "interrupt noted". This covers a mission that is
 before any work was planned still cancels, because there is nothing to keep.
 
 When a mission worker's model runs out of capacity (`queue_deadline_exceeded`,
-`queue_timeout`, `CAPACITY_EXHAUSTED`), the mission keeps waiting with no
-deadline. It shows `model X is out of capacity; … switch with /model to
-continue`, so you can move it without cancelling. A switch ends a capacity hold
-within about a quarter of a second, without waiting out the gateway's advertised
-retry time. The next request then goes to the new model.
+`queue_timeout`, `CAPACITY_EXHAUSTED`), the worker first waits out the gateway's
+advertised holds. If the hold is for one model (not the whole account) and the
+router can place the role on a comparable model, the mission switches to it
+automatically after a finite number of holds and carries on; the saturated model
+stays eligible for other work. An account-wide hold (a shared queue, a
+concurrency ceiling) is still waited out, and an operator-pinned model is never
+given up for an alternate. While waiting, the mission shows `model X is out of
+capacity; … switch with /model to continue`, so you can move it without
+cancelling; a switch ends a capacity hold within about a quarter of a second,
+without waiting out the gateway's advertised retry time.
 
 `/refresh-models` probes each model with one minimal request: 64 output tokens, no
 streaming, no tools, no images. A model whose probe gets HTTP 400 is retried

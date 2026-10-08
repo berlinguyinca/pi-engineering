@@ -106,6 +106,18 @@ export type RouteModel = (role: string, opts?: RouteModelOptions) => Promise<Mod
 const MODEL_GONE_MARKERS: ReadonlySet<string> = new Set(["transient:model_unavailable", "unknown-model"]);
 
 /**
+ * Worker failure markers for a model that is temporarily unable to serve:
+ * the gateway reports no capacity free (its `capacity_unavailable` / queue
+ * deadline, which it may tell us to retry on an alternate deployment) or the
+ * provider has no worker/route for this model right now. Unlike
+ * MODEL_GONE_MARKERS this does NOT remove the model from routing for a TTL:
+ * capacity is transient, so other workers and later attempts may still use it.
+ * We move THIS attempt to the next comparable model rather than fail it on a
+ * saturated one.
+ */
+const MODEL_CAPACITY_MARKERS: ReadonlySet<string> = new Set(["transient:server_unavailable"]);
+
+/**
  * An "invalid model name" refusal comes from one route of the gateway (the
  * multimodal one), so it is specific to the request: hand the attempt over,
  * but do not mark the model unavailable for every other worker.
@@ -418,14 +430,23 @@ export function realBackends(opts: RealBackendsOptions) {
         model = route ?? ranOn(run) ?? opts.reviewFallbackModel;
         continue;
       }
-      if (!model || !MODEL_GONE_MARKERS.has(error)) break;
+      if (!model) break;
+      const gone = MODEL_GONE_MARKERS.has(error);
+      const capacity = !gone && MODEL_CAPACITY_MARKERS.has(error);
+      if (!gone && !capacity) break;
       const failed: ModelRef = model;
       const reason = run.result.summary;
-      if (!REQUEST_SPECIFIC_REFUSAL.test(reason)) opts.onModelUnavailable?.(failed, { ...plan.context, reason });
+      // A gone model is gateway-confirmed and leaves routing for a TTL; a
+      // capacity-exhausted one is transient, so it stays eligible everywhere
+      // except this attempt's own walk past the tried set.
+      if (gone && !REQUEST_SPECIFIC_REFUSAL.test(reason))
+        opts.onModelUnavailable?.(failed, { ...plan.context, reason });
       tried.push(failed);
       const next = await plan.next(tried);
       if (!next || tried.some((known) => sameModel(known, next))) break;
-      const notice = `model ${modelKey(failed)} is no longer served — switched ${req.role} to ${modelKey(next)}`;
+      const notice = gone
+        ? `model ${modelKey(failed)} is no longer served — switched ${req.role} to ${modelKey(next)}`
+        : `model ${modelKey(failed)} has no capacity right now — switched ${req.role} to ${modelKey(next)}`;
       switches.push(notice);
       announce(notice);
       plan.onSwitch?.(failed, next);
