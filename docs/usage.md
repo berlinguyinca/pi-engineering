@@ -454,6 +454,21 @@ State lives in `<repoRoot>/.pi-eng/` and is git-ignored:
 .pi-eng/roadmap/evidence.jsonl  regenerated roadmap evidence (bound to commit SHAs)
 ```
 
+The runtime makes it git-ignored itself: on open it writes `.pi-eng/.gitignore`
+(`*`) when none exists, so the directory stays out of `git status`, `git add -A`,
+`git stash -u` and `git clean -fd` even in a repository whose own `.gitignore`
+does not list it. That matters: a `git stash -u` round-trip deletes and
+recreates an unignored `.pi-eng/` with default permissions and new inodes, and
+the artifact store then refuses to open (`ARTIFACT INTEGRITY: artifact root is
+writable by another user` / `artifact lock root identity changed`). If that has
+already happened, move `.pi-eng/artifacts` aside while no session has the store
+open; the runtime recreates it on the next open.
+
+When the runtime cannot open for a directory, the `mission` tool and `/mission`
+(including `/mission cancel`) report why:
+`Orchestrator not initialized for this directory: <reason>`. The tool also
+returns a `details.diagnostics` entry with code `orchestrator_init_failed`.
+
 The ledger is event-sourced and replayed on open, so **no run depends on the
 interactive transcript surviving** — you can close and reopen pi and `/ledger`
 still shows prior work items, candidates, and evidence.

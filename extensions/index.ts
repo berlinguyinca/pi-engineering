@@ -88,7 +88,7 @@ import { FooterController } from "../src/status/footer.ts";
 import { renderStatus } from "../src/status/layout.ts";
 import { type TelemetryNotice, emitTelemetry, setTelemetrySink } from "../src/telemetry/sink.ts";
 import { createRepeatThrottle } from "../src/telemetry/throttle.ts";
-import { type CoreServices, buildCoreTools } from "../src/tools/coreTools.ts";
+import { type CoreServices, buildCoreTools, notInitializedText } from "../src/tools/coreTools.ts";
 import { checkForUpdate, shouldCheck } from "../src/update/selfUpdate.ts";
 import { describeUpdate } from "../src/update/versionCheck.ts";
 import { CommandVerifier } from "../src/verify/Verifier.ts";
@@ -1918,9 +1918,23 @@ ${RECOVERY_PROMPT}`;
         ctx.ui.notify("/mission <normal-language request> | /mission resume <missionId>", "error");
         return;
       }
+      // A runtime that did not open (e.g. an ArtifactStore integrity refusal)
+      // is reported with its reason instead of escaping the handler.
+      const openRuntime = async (): Promise<EngineeringRuntime | null> => {
+        try {
+          return await getRuntime(ctx);
+        } catch (error) {
+          ctx.ui.notify(
+            notInitializedText("Orchestrator", error instanceof Error ? error.message : String(error)),
+            "error",
+          );
+          return null;
+        }
+      };
       const cancel = /^cancel\s+(MSN-\S+)\s*$/i.exec(request);
       if (cancel?.[1]) {
-        const rt = await getRuntime(ctx);
+        const rt = await openRuntime();
+        if (!rt) return;
         try {
           const canceled = await rt.cancelMission(cancel[1]);
           ctx.ui.notify(`Mission ${canceled.mission_id} — ${canceled.title} [${canceled.status}]`, "info");
@@ -1936,9 +1950,10 @@ ${RECOVERY_PROMPT}`;
         ctx.ui.notify("/mission resume <missionId>", "error");
         return;
       }
-      const rt = await getRuntime(ctx);
+      const rt = await openRuntime();
+      if (!rt) return;
       if (!rt.orchestrator) {
-        ctx.ui.notify("Orchestrator not initialized for this directory.", "error");
+        ctx.ui.notify(notInitializedText("Orchestrator", undefined), "error");
         return;
       }
       // The user reached an initialized orchestrator: the mission tool can

@@ -466,6 +466,25 @@ function isLeaseOwnerGone(ownerId: string, session: RuntimeSession): boolean {
 }
 
 /**
+ * Make a runtime state directory invisible to git with a self-ignoring
+ * `.gitignore` (`*`), unless one is already there.
+ *
+ * `.pi-eng/` lives inside the checkout it serves. Untracked and unignored, it
+ * is swept up by `git stash -u`, `git clean -fd` and `git add -A`, which
+ * workers routinely run in-place. A stash round-trip deletes the directory and
+ * recreates it with umask-default modes and new inodes, after which the
+ * ArtifactStore (correctly) refuses to open it and every later runtime open for
+ * that checkout fails. Ignoring the directory keeps git's hands off it.
+ */
+async function ensureStateDirIgnored(dir: string): Promise<void> {
+  try {
+    await writeFile(join(dir, ".gitignore"), "*\n", { flag: "wx" });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+  }
+}
+
+/**
  * The Engineering Runtime facade. Owns the ledger, artifact store, context
  * broker, git provider, verifier, and worker executor for one repository, and
  * exposes the vertical-slice workflows: scout, implement, verify, review,
@@ -795,6 +814,7 @@ export class EngineeringRuntime {
     session: RuntimeSession,
   ): Promise<EngineeringRuntime> {
     await mkdir(workDir, { recursive: true });
+    await ensureStateDirIgnored(workDir);
     const ledger = await Ledger.create(join(workDir, "ledger.jsonl"));
     const artifacts = await ArtifactStore.create(join(workDir, "artifacts"));
     const broker = await ContextBroker.open(repoRoot);
