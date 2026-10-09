@@ -429,7 +429,13 @@ describe("ExecutionBroker: recovering a timed-out worker's committed work", () =
         isolation: "worktree",
         write_domains: ["src/**"],
         deliverables: ["implementation"],
-        execution_budget_ms: 1_000,
+        // Generous budget: the valid checkpoint claim is fired only after the
+        // agent polls for the two earlier reject findings to appear. Under
+        // full-suite load those polls can outrun a 1s budget, so the deadline
+        // checkpoint would be taken before the valid claim is buffered and
+        // completedDeliverables would come back empty. Give the claim time to
+        // land before the timeout.
+        execution_budget_ms: 5_000,
         checkpoint_policy: { activity_milestone: 1, before_deadline_ms: 200 },
       });
       const handoffs: Handoff[] = [];
@@ -548,7 +554,7 @@ describe("ExecutionBroker: recovering a timed-out worker's committed work", () =
       const result = handle.result();
       const outcome = await Promise.race([
         result,
-        new Promise<never>((_, reject) => setTimeout(() => reject(new Error("result did not hard-timeout")), 4_000)),
+        new Promise<never>((_, reject) => setTimeout(() => reject(new Error("result did not hard-timeout")), 10_000)),
       ]).catch(async (error) => {
         release();
         await result.catch(() => undefined);

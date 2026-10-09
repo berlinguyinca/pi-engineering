@@ -1065,7 +1065,11 @@ describe("ExecutionBroker (spec 03)", () => {
         isolation: "worktree",
         write_domains: ["src/**"],
         deliverables: ["implementation"],
-        execution_budget_ms: 200,
+        // Generous budget: the test cancels explicitly and never relies on the
+        // deadline firing. A short budget could fire before the agent attaches
+        // its abort listener under full-suite load, hanging the abort-aware
+        // writer and cascading cancelledByParent into every sibling subtest.
+        execution_budget_ms: 15_000,
         checkpoint_policy: { activity_milestone: 10, before_deadline_ms: 100 },
         mission_generation: 2,
         candidate_generation: 3,
@@ -1087,6 +1091,18 @@ describe("ExecutionBroker (spec 03)", () => {
               assert.ok(worktree);
               await writeFile(join(worktree, "src", "cancelled.ts"), "export const cancelled = true;\n", "utf8");
               dirty();
+              // addEventListener on an already-aborted signal never fires, which
+              // would hang the writer forever; treat an already-aborted signal
+              // as settled so the backend can quiesce.
+              if (signal.aborted) {
+                return {
+                  executionId: "late",
+                  exitStatus: "succeeded",
+                  summary: "late",
+                  artifactRefs: [],
+                  usage: {},
+                };
+              }
               await new Promise<void>((resolve) =>
                 signal.addEventListener("abort", () => resolve(), {
                   once: true,
@@ -1126,14 +1142,21 @@ describe("ExecutionBroker (spec 03)", () => {
       const checkpoint = store.getTaskCheckpoint(execution.checkpoint_id!);
       assert.ok(checkpoint);
       assert.ok(checkpoint.candidateSha, "checkpoint must identify a recoverable commit");
+      // Cancellation (not a premature deadline) must be the terminal cause;
+      // this robustly proves the deadline timer was disabled for the run.
+      assert.equal(execution.status, "CANCELED", "cancellation must win, not a deadline timeout");
       const removedWorktree = checkpoint.worktree!;
-      for (let attempt = 0; attempt < 20; attempt++) {
+      // Worktree removal runs real git subprocesses and is load-sensitive; poll
+      // until it is actually gone (with a generous bound) instead of asserting
+      // within a fixed 200ms window that flakes under full-suite load.
+      const cleanupDeadline = Date.now() + 15_000;
+      while (Date.now() < cleanupDeadline) {
         try {
           await access(removedWorktree);
-          await new Promise((resolve) => setTimeout(resolve, 10));
         } catch {
           break;
         }
+        await new Promise((resolve) => setTimeout(resolve, 50));
       }
       await assert.rejects(access(removedWorktree), "the canceled worktree should be cleaned up");
       const recovered = await exec("git", ["-C", fx.root, "show", `${checkpoint.candidateSha}:src/cancelled.ts`]);

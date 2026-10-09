@@ -38,6 +38,8 @@ export interface InstrumentedRunOptions {
   /** Injectable browser (deterministic in tests). */
   browser?: Browser;
   viewport?: { width: number; height: number };
+  /** Best-effort evidence-capture failures (e.g. screenshot) are surfaced here. */
+  onEvidenceError?: (error: unknown) => void;
 }
 
 /**
@@ -85,7 +87,15 @@ export async function instrumentBrowserRun(opts: InstrumentedRunOptions): Promis
 
     await page.goto(opts.url, { waitUntil: "load", timeout: 30000 });
     await opts.verify(page);
-    await page.screenshot({ path: screenshotPath });
+    // Evidence capture is best-effort: under full-suite load the headless
+    // browser can transiently fail the capture ("Protocol error ... Unable to
+    // capture screenshot"). The page was already verified above; a screenshot
+    // miss must not fail the whole instrumentation run.
+    try {
+      await page.screenshot({ path: screenshotPath });
+    } catch (error) {
+      if (opts.onEvidenceError) opts.onEvidenceError(error);
+    }
 
     await context.tracing.stop({ path: tracePath });
     tracing = false;

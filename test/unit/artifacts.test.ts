@@ -438,7 +438,9 @@ test("pinned category descriptors prevent deterministic read write delete and ve
 
 test(
   "artifact key locks recover killed owners and release only their matching owner token",
-  { timeout: 2_000 },
+  // Real filesystem/journal IO (mkdtemp, lock reaping, artifact recovery);
+  // sibling tests routinely take >2s under full-suite load.
+  { timeout: 20_000 },
   async () => {
     const dir = await mkdtemp(join(tmpdir(), "pi-eng-art-lock-owner-"));
     try {

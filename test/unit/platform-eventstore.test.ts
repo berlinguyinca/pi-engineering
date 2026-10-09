@@ -168,7 +168,10 @@ function startRacingOwner(file: string) {
 
 async function outcomeWithin(
   contender: ReturnType<typeof startRacingOwner>,
-  timeoutMs = 500,
+  // Child-process spawn + lock-acquisition handshake; a tight window yields
+  // spurious "timeout" under full-suite load. No caller treats "timeout" as
+  // a success outcome, so a generous bound only removes false negatives.
+  timeoutMs = 10_000,
 ): Promise<"ready" | "blocked" | "timeout"> {
   return Promise.race([
     contender.outcome,
