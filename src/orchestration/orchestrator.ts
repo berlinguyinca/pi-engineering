@@ -2729,8 +2729,20 @@ export class Orchestrator {
         this.report(missionId, `[mission ${missionId}] ${task.kind}:${task.role} canceled`);
         return false;
       }
-      if (this.store.getTask(taskId)?.status === "RUNNING") this.store.transitionTask(taskId, "FAILED");
-      this.report(missionId, `[mission ${missionId}] ${task.kind}:${task.role} errored`);
+      const errorDetail = err instanceof Error ? err.message : String(err);
+      const currentTask = this.store.getTask(taskId);
+      // A stale execution that errors after a newer dispatch took over the task
+      // must not fail the task its successor is actively settling. Mirrors the
+      // scheduler's terminal-state guard: the losing run reports its own late
+      // execution and lets the authoritative one own the outcome.
+      const superseded =
+        !!handle &&
+        currentTask?.assigned_execution_id != null &&
+        currentTask.assigned_execution_id !== handle.executionId;
+      if (currentTask?.status === "RUNNING" && !superseded) {
+        this.store.transitionTask(taskId, "FAILED", "system", { failure_reason: errorDetail });
+      }
+      this.report(missionId, `[mission ${missionId}] ${task.kind}:${task.role} errored: ${errorDetail}`);
       return false;
     } finally {
       const closeError = await authority?.close();
