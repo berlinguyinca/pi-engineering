@@ -21,7 +21,7 @@
 
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readFile, rm, writeFile } from "node:fs/promises";
+import { readFile, rename, rm, writeFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { promisify } from "node:util";
 import type { WorkerRole } from "../core/types.ts";
@@ -1409,7 +1409,16 @@ export class PlannerWorkerExecutor {
       updated_at: new Date().toISOString(),
     });
     this.persistQueue = this.persistQueue
-      .then(() => writeFile(join(this.opts.stateDir, "state.json"), `${JSON.stringify(snapshot(), null, 2)}\n`))
+      .then(async () => {
+        // Write to a sibling temp file then rename so a crash (e.g. SIGKILL)
+        // mid-persist can never leave state.json truncated: `rename` is atomic,
+        // so resume always reads either the complete previous state or the
+        // complete new one.
+        const target = join(this.opts.stateDir, "state.json");
+        const temporary = join(this.opts.stateDir, `state.json.tmp-${process.pid}`);
+        await writeFile(temporary, `${JSON.stringify(snapshot(), null, 2)}\n`);
+        await rename(temporary, target);
+      })
       .catch(() => undefined);
     return this.persistQueue;
   }
