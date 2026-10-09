@@ -28,6 +28,13 @@ import { makeFixtureRepo } from "../fixtures/make-fixture.ts";
 
 const exec = promisify(execFile);
 
+// A deterministic role router keeps this test hermetic: review evidence records
+// the producing model (model/provider), which must not depend on the operator's
+// installed models on the host (absent in CI).
+const testRoleRouter = {
+  route: async () => ({ provider: "fake", id: "fake-reviewer" }),
+};
+
 /** A fixture whose own test suite PASSES at baseline (see orchestration-runtime). */
 async function greenFixture(): Promise<{ root: string; cleanup: () => Promise<void> }> {
   const fx = await makeFixtureRepo();
@@ -187,6 +194,7 @@ async function openSpecApprovalRuntime(
     cwd: root,
     worker,
     verifier: new (await import("../../src/verify/Verifier.ts")).CommandVerifier(),
+    roleRouter: testRoleRouter,
     orchestrationSpecApproval: async (input: {
       missionId: string;
       protectedInputs: ProtectedUserCriteria;

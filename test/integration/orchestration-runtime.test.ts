@@ -17,6 +17,15 @@ import { EngineeringRuntime } from "../../src/runtime/EngineeringRuntime.ts";
 import type { WorkerExecutor } from "../../src/workers/WorkerExecutor.ts";
 import { makeFixtureRepo } from "../fixtures/make-fixture.ts";
 
+// A deterministic role router keeps these tests hermetic: the review evidence
+// records the model that produced it (model/provider), and that provenance must
+// not depend on the operator's installed models on the host (which are absent in
+// CI). Injecting a router that always returns the same fake reviewer removes the
+// host-model dependency without changing what the tests exercise.
+const testRoleRouter = {
+  route: async () => ({ provider: "fake", id: "fake-reviewer" }),
+};
+
 function acceptanceResults(task: string) {
   return [...task.matchAll(/Acceptance criterion ([^:]+):/g)].map((match) => ({
     acceptanceId: match[1]!,
@@ -86,6 +95,7 @@ async function openRuntime(
     cwd: root,
     worker,
     verifier: new (await import("../../src/verify/Verifier.ts")).CommandVerifier(),
+    roleRouter: testRoleRouter,
   });
 }
 
@@ -213,7 +223,12 @@ describe("orchestration via real EngineeringRuntime (acceptance scenarios)", () 
         return super.detect(cwd);
       }
     }
-    const rt = await EngineeringRuntime.open({ cwd: metaRoot, worker, verifier: new RecordingVerifier() });
+    const rt = await EngineeringRuntime.open({
+      cwd: metaRoot,
+      worker,
+      verifier: new RecordingVerifier(),
+      roleRouter: testRoleRouter,
+    });
     runtimeRef.current = rt;
     const targetGit = await (await import("../../src/git/GitRepo.ts")).GitRepo.open(target.root);
     assert.ok(targetGit);
@@ -338,6 +353,7 @@ describe("orchestration via real EngineeringRuntime (acceptance scenarios)", () 
       cwd: metaRoot,
       worker,
       verifier: new (await import("../../src/verify/Verifier.ts")).CommandVerifier(),
+      roleRouter: testRoleRouter,
     });
 
     const result = await rt.orchestrator!.orchestrate(`Implement only in ${join(target.root, "src")}`, {
@@ -415,6 +431,7 @@ describe("orchestration via real EngineeringRuntime (acceptance scenarios)", () 
       cwd: metaRoot,
       worker,
       verifier: new (await import("../../src/verify/Verifier.ts")).CommandVerifier(),
+      roleRouter: testRoleRouter,
     });
 
     const [a, b] = await Promise.all([
@@ -544,6 +561,7 @@ describe("orchestration via real EngineeringRuntime (acceptance scenarios)", () 
       cwd: metaRoot,
       worker: unavailable,
       verifier: new (await import("../../src/verify/Verifier.ts")).CommandVerifier(),
+      roleRouter: testRoleRouter,
     });
     Object.assign(rt1.resilience, {
       retry_window_ms: 0,
@@ -605,6 +623,7 @@ describe("orchestration via real EngineeringRuntime (acceptance scenarios)", () 
       cwd: metaRoot,
       worker: recovered,
       verifier: new (await import("../../src/verify/Verifier.ts")).CommandVerifier(),
+      roleRouter: testRoleRouter,
     });
     assert.notEqual(rt2, rt1);
     const resumed = await rt2.orchestrator!.resume(paused.mission.mission_id, { force: true });
