@@ -36,6 +36,13 @@ jobs:
         # Chromium via Playwright; npm ci does not download the browser binary,
         # so install it here or every browser-backed test fails at launch.
         run: npx playwright install --with-deps chromium
+      - name: Install verifier test toolchain
+        # The verifier unit test drives a real `make test` target and a real
+        # `pytest` suite; install pytest here (make ships with ubuntu-latest)
+        # so that test is hermetic against the runner.
+        run: python3 -m pip install --quiet pytest
+      - name: Show toolchain
+        run: python3 -m pytest --version && make --version | head -1
       - name: Typecheck
         run: npm run typecheck
       - name: Lint

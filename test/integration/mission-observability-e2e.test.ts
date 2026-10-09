@@ -154,10 +154,16 @@ test("synthetic mission observability E2E scenario", async () => {
   }
   assert.equal(obs.hasLoop(id, "wk-impl"), true, "loop detected by repeated identical reads");
   // The worker stays alive (heartbeats) but produces no meaningful progress for
-  // well past the stall threshold: health becomes STALLED.
+  // well past the stall threshold. With a fresh heartbeat it is at most SLOW
+  // (the worker is clearly still running tools); STALLED requires the worker's
+  // heartbeat to also have gone stale. This matches health.ts (see #102).
   advance(400_000);
   obs.heartbeat(id, "wk-impl");
-  assert.equal(obs.summary(id)!.health, "stalled", "alive worker, no meaningful progress -> STALLED");
+  assert.equal(obs.summary(id)!.health, "slow", "alive worker, no meaningful progress -> SLOW");
+  // Once the worker's heartbeat also goes silent well past the stall threshold
+  // it becomes STALLED.
+  advance(400_000);
+  assert.equal(obs.summary(id)!.health, "stalled", "silent worker, no meaningful progress -> STALLED");
 
   // ── observable recovery (never silent) ──
   const updatesBeforeRecovery = updates.length;

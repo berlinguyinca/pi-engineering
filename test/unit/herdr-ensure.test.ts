@@ -10,7 +10,14 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import type { HerdrAgent, HerdrCli, HerdrStatus } from "../../src/runtime/herdr/HerdrCli.ts";
+import type { HerdrDetection } from "../../src/runtime/herdr/ensureHerdr.ts";
 import { herdrEnsureLocal } from "../../src/runtime/herdr/ensureHerdr.ts";
+
+/** Stub detector that reports the binary present, independent of the host. */
+const binaryPresent: (opts?: { bin?: string }) => Promise<HerdrDetection> = async () => ({
+  binary: true,
+  serverRunning: false,
+});
 
 class StubCli implements HerdrCli {
   statusVal: HerdrStatus = { ok: true, serverVersion: "0.9.1", protocol: 22 };
@@ -42,7 +49,7 @@ class StubCli implements HerdrCli {
 
 test("herdrEnsureLocal reports ok when binary present and server healthy", async () => {
   const cli = new StubCli();
-  const res = await herdrEnsureLocal({ cli });
+  const res = await herdrEnsureLocal({ cli, detect: binaryPresent });
   assert.equal(res.ok, true);
   assert.equal(res.action, "ok");
   assert.equal(res.detection.serverRunning, true);
@@ -58,7 +65,7 @@ test("herdrEnsureLocal flags start-server when binary present but server unreach
   cli.status = async () => {
     throw new Error("socket not found");
   };
-  const res = await herdrEnsureLocal({ cli });
+  const res = await herdrEnsureLocal({ cli, detect: binaryPresent });
   assert.equal(res.ok, false);
   assert.equal(res.action, "start-server");
   assert.match(res.message, /server not reachable|install/i);
@@ -101,7 +108,7 @@ test("herdrEnsureLocal only installs with BOTH installCommand and autoInstall=tr
 test("herdrEnsureLocal enforces minimum protocol", async () => {
   const cli = new StubCli();
   cli.statusVal = { ok: true, serverVersion: "0.9.1", protocol: 12 };
-  const res = await herdrEnsureLocal({ cli, minProtocol: 20 });
+  const res = await herdrEnsureLocal({ cli, minProtocol: 20, detect: binaryPresent });
   assert.equal(res.ok, false);
   assert.match(res.message, /below required minimum/);
 });

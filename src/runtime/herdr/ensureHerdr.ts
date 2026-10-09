@@ -39,6 +39,13 @@ export interface HerdrEnsureLocalOptions {
   cli?: HerdrCli;
   /** Binary name to detect on PATH (default "herdr"). */
   bin?: string;
+  /**
+   * Binary-presence detector (defaults to the real `detectHerdr`, which runs
+   * the binary on PATH). Injectable so callers can supply a stub detection and
+   * keep tests hermetic (independent of whether the `herdr` binary is actually
+   * installed on the host).
+   */
+  detect?: (opts: { bin?: string }) => Promise<HerdrDetection>;
   /** Minimum protocol to accept (capability negotiation). */
   minProtocol?: number;
   /**
@@ -92,6 +99,7 @@ export async function herdrEnsureLocal(opts: HerdrEnsureLocalOptions = {}): Prom
   const { RealHerdrCli } = await import("./HerdrCli.ts");
   const bin = opts.bin ?? "herdr";
   const cli = opts.cli ?? new RealHerdrCli({ bin });
+  const detect = opts.detect ?? detectHerdr;
   const hint =
     opts.installHint ??
     "Herdr is not installed or its server is not running.\n" +
@@ -99,7 +107,7 @@ export async function herdrEnsureLocal(opts: HerdrEnsureLocalOptions = {}): Prom
       "See docs/specs/pi-engineering-herdr-runtime/HERDR_COMPATIBILITY.md (herdr 0.9.1, socket ~/.config/herdr/herdr.sock).";
 
   // 1. Binary presence.
-  const detection0 = await detectHerdr({ bin });
+  const detection0 = await detect({ bin });
   if (!detection0.binary) {
     if (opts.installCommand && opts.autoInstall) {
       try {
@@ -113,7 +121,7 @@ export async function herdrEnsureLocal(opts: HerdrEnsureLocalOptions = {}): Prom
           message: `install command failed: ${err instanceof Error ? err.message : err}\n${hint}`,
         };
       }
-      const after = await detectHerdr({ bin });
+      const after = await detect({ bin });
       if (!after.binary) {
         return {
           ok: false,

@@ -403,6 +403,28 @@ export class MissionScheduler {
     void run.catch(() => undefined);
   }
 
+  /**
+   * True when this task has already reached a terminal state, i.e. a concurrent
+   * run already settled it.
+   *
+   * A watchdog or recovery path can dispatch a duplicate run of a task that is
+   * still settling. If one run succeeds the task while another is processing a
+   * stale failure outcome, the losing run must NOT attempt an illegal
+   * SUCCEEDED -> FAILED / SUCCEEDED -> RETRYING transition (which threw and
+   * escaped as an unhandled rejection, leaving the mission corrupt). Guard every
+   * terminal transition on this so a stale, losing run becomes a no-op.
+   *
+   * Note we guard on TERMINAL states, not on RUNNING/RETRYING: broker.execute()
+   * can throw before the task is ever moved to RUNNING (e.g. a checkpoint
+   * recovery artifact verification mismatch in preliminaryRecoveryContext). In
+   * that case the task is still READY and THIS run must still be allowed to
+   * settle it FAILED — skipping on a non-executing status would strand it READY.
+   */
+  private taskAlreadyTerminal(taskId: string): boolean {
+    const status = this.store.getTask(taskId)?.status;
+    return !!status && ["SUCCEEDED", "FAILED", "CANCELED", "BLOCKED", "SKIPPED"].includes(status);
+  }
+
   private hasConflict(t: OrchestrationTask): boolean {
     if (!t.mutates_repo) return false;
     return [...this.activeTasks.values()].some(
@@ -523,6 +545,7 @@ export class MissionScheduler {
           const ceiling = infraCat ? this.outageCeiling(task, outcome) : null;
           if (ceiling) {
             authority?.assertAuthoritative();
+            if (this.taskAlreadyTerminal(task.task_id)) return;
             this.settleTaskRecoveries(task, "failed");
             this.recordTerminalFailure(task, ceiling, handle.executionId, outcome.error);
             this.store.transitionTask(task.task_id, "FAILED", "system", { failure_reason: ceiling });
@@ -543,12 +566,14 @@ export class MissionScheduler {
               });
               if (recoveryStop) {
                 authority?.assertAuthoritative();
+                if (this.taskAlreadyTerminal(task.task_id)) return;
                 this.settleTaskRecoveries(task, "failed");
                 this.recordTerminalFailure(task, recoveryStop, handle.executionId, outcome.error);
                 this.store.transitionTask(task.task_id, "FAILED", "system", { failure_reason: recoveryStop });
                 return;
               }
               authority?.assertAuthoritative();
+              if (this.taskAlreadyTerminal(task.task_id)) return;
               this.store.transitionTask(task.task_id, "RETRYING", "system", { attempt });
               const waited = await this.abortable(this.sleepFn(res.waitMs), signal);
               if (waited.aborted) {
@@ -585,6 +610,7 @@ export class MissionScheduler {
                 .at(-1)?.candidateSha;
               if (preserved) resumeFromSha = preserved;
               authority?.assertAuthoritative();
+              if (this.taskAlreadyTerminal(task.task_id)) return;
               this.store.transitionTask(task.task_id, "RETRYING", "system", { attempt });
               continue;
             }
@@ -593,6 +619,7 @@ export class MissionScheduler {
           // exhaustion, timeouts, no-result) — exitStatus alone hid the cause.
           const detail = outcome.summary ? `: ${outcome.summary}` : "";
           authority?.assertAuthoritative();
+          if (this.taskAlreadyTerminal(task.task_id)) return;
           this.settleTaskRecoveries(task, "failed");
           this.recordTerminalFailure(
             task,
@@ -661,6 +688,7 @@ export class MissionScheduler {
           });
           if (recoveryStop) {
             authority?.assertAuthoritative();
+            if (this.taskAlreadyTerminal(task.task_id)) return;
             this.settleTaskRecoveries(task, "failed");
             this.recordTerminalFailure(
               task,
@@ -672,10 +700,12 @@ export class MissionScheduler {
             return;
           }
           authority?.assertAuthoritative();
+          if (this.taskAlreadyTerminal(task.task_id)) return;
           this.store.transitionTask(task.task_id, "RETRYING", "system", { attempt });
           continue;
         }
         authority?.assertAuthoritative();
+        if (this.taskAlreadyTerminal(task.task_id)) return;
         this.settleTaskRecoveries(task, "failed");
         this.recordTerminalFailure(
           task,
