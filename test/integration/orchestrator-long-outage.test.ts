@@ -10,7 +10,6 @@ import type { BrokerBackends } from "../../src/orchestration/broker.ts";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
 import { Orchestrator } from "../../src/orchestration/orchestrator.ts";
 import { realBackends } from "../../src/orchestration/realBackends.ts";
-import { UNLISTED_PROBES_BEFORE_VERIFY } from "../../src/orchestration/scheduler.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 import { DEFAULT_GATEWAY_RESILIENCE, type GatewayResilienceConfig } from "../../src/resilience/config.ts";
 import type { ProbeResult } from "../../src/resilience/probe.ts";
@@ -18,6 +17,33 @@ import { UnavailableModels, createRouteModel } from "../../src/runtime/modelRout
 import type { WorkerExecutor, WorkerRun } from "../../src/workers/WorkerExecutor.ts";
 
 const HOUR = 3_600_000;
+
+const completedRun = (summary: string): WorkerRun => ({
+  result: {
+    status: "completed",
+    summary,
+    claims: [],
+    evidence_refs: [],
+    new_hypotheses: [],
+    proposed_tasks: [],
+    details: {},
+  },
+  usage: null,
+});
+
+const failedRun = (summary: string, error: string): WorkerRun => ({
+  result: {
+    status: "failed",
+    summary,
+    error,
+    claims: [],
+    evidence_refs: [],
+    new_hypotheses: [],
+    proposed_tasks: [],
+    details: {},
+  },
+  usage: null,
+});
 
 type AgentOutcome = Awaited<ReturnType<NonNullable<BrokerBackends["agent"]>["runAgent"]>>;
 
@@ -257,35 +283,18 @@ describe("orchestrator: a task that fails terminally inside the resilience windo
 // probe reports it unlisted, a verification attempt hits model_not_found, and
 // the next eligible model takes over in that same attempt, so the mission
 // completes instead of failing or pausing.
-describe("orchestrator: another model takes over when the mission's model leaves the gateway", () => {
-  it("transient outage -> unlisted probes -> model_not_found -> takeover model completes the mission", async () => {
-    const A = { provider: "gw", id: "model-a" };
-    const B = { provider: "gw", id: "model-b" };
+describe("orchestrator: another model takes over when the mission's model cannot serve", () => {
+  const A = { provider: "gw", id: "model-a" };
+  const B = { provider: "gw", id: "model-b" };
+  const takeoverAgent = (failModelA: () => WorkerRun, onActivity: (summary: string) => void) => {
     const unavailable = new UnavailableModels();
     const models: string[] = [];
-    const activity: string[] = [];
     const worker: WorkerExecutor = {
       async run(req) {
         const model = req.modelOverride ? `${req.modelOverride.provider}/${req.modelOverride.id}` : "default";
         models.push(model);
-        const result = (status: "completed" | "failed", summary: string, error?: string): WorkerRun => ({
-          result: {
-            status,
-            summary,
-            claims: [],
-            evidence_refs: [],
-            new_hypotheses: [],
-            proposed_tasks: [],
-            details: {},
-            ...(error ? { error } : {}),
-          },
-          usage: null,
-        });
-        if (model === "gw/model-b") return result("completed", "implemented on model-b");
-        // model-a: first the outage, then the gateway no longer has it.
-        return models.length === 1
-          ? result("failed", "capacity_unavailable", "transient:server_unavailable")
-          : result("failed", 'Worker failed: 404 {"code":"model_not_found"}', "transient:model_unavailable");
+        if (model === "gw/model-b") return completedRun("implemented on model-b");
+        return failModelA();
       },
     };
     const real = realBackends({
@@ -305,39 +314,63 @@ describe("orchestrator: another model takes over when the mission's model leaves
       }),
       onModelUnavailable: (route) => unavailable.mark(route),
     });
-    const h = run(0, {
-      agentBackend: {
-        runAgent: (input) =>
-          real.agent.runAgent({
-            ...input,
-            onActivity: (event) => {
-              activity.push(event.summary);
-              input.onActivity?.(event);
-            },
-          }),
-      },
-      probe: () => ({
-        healthy: false,
-        authoritative: true,
-        model_unlisted: true,
-        model_id: "model-a",
-        reason: "model model-a is not served",
-      }),
-    });
+    return {
+      unavailable,
+      models,
+      runAgent: (input: Parameters<typeof real.agent.runAgent>[0]) =>
+        real.agent.runAgent({
+          ...input,
+          onActivity: (event) => {
+            onActivity(event.summary);
+            input.onActivity?.(event);
+          },
+        }),
+    };
+  };
+
+  it("a model that leaves the gateway (model_not_found) is taken over by the next eligible model", async () => {
+    const activity: string[] = [];
+    const agent = takeoverAgent(
+      () => failedRun('Worker failed: 404 {"code":"model_not_found"}', "transient:model_unavailable"),
+      (summary) => activity.push(summary),
+    );
+    const h = run(0, { agentBackend: { runAgent: agent.runAgent } });
     const result = await h.orchestrator.orchestrate("Add a health endpoint", {
       repository: ".",
       baseRef: "abc",
       mutationRequested: true,
     });
-    assert.deepEqual(models, ["gw/model-a", "gw/model-a", "gw/model-b"]);
+    assert.deepEqual(agent.models, ["gw/model-a", "gw/model-b"]);
     assert.ok(
       activity.includes("model gw/model-a is no longer served — switched implementer to gw/model-b"),
       JSON.stringify(activity),
     );
     assert.equal(result.completed, true, JSON.stringify(result.verdict.reasons));
     assert.equal(h.store.getMission(result.mission.mission_id)!.status, "COMPLETE");
-    assert.deepEqual(unavailable.list(), [A]);
-    // The verification attempt ran after exactly the unlisted-probe threshold.
-    assert.equal(h.statuses.length, UNLISTED_PROBES_BEFORE_VERIFY);
+    // A gone model leaves routing for a TTL.
+    assert.deepEqual(agent.unavailable.list(), [A]);
+  });
+
+  it("a model with no capacity is taken over by the next eligible model and completes", async () => {
+    const activity: string[] = [];
+    const agent = takeoverAgent(
+      () => failedRun("capacity_unavailable", "transient:server_unavailable"),
+      (summary) => activity.push(summary),
+    );
+    const h = run(0, { agentBackend: { runAgent: agent.runAgent } });
+    const result = await h.orchestrator.orchestrate("Add a health endpoint", {
+      repository: ".",
+      baseRef: "abc",
+      mutationRequested: true,
+    });
+    assert.deepEqual(agent.models, ["gw/model-a", "gw/model-b"]);
+    assert.ok(
+      activity.includes("model gw/model-a has no capacity right now — switched implementer to gw/model-b"),
+      JSON.stringify(activity),
+    );
+    assert.equal(result.completed, true, JSON.stringify(result.verdict.reasons));
+    assert.equal(h.store.getMission(result.mission.mission_id)!.status, "COMPLETE");
+    // Capacity exhaustion is transient: the model stays eligible for other work.
+    assert.deepEqual(agent.unavailable.list(), []);
   });
 });

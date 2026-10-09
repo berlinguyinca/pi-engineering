@@ -240,10 +240,67 @@ describe("model takeover: agent workers", () => {
     assert.ok(!activity.some((e) => /switched/.test(e.summary)));
   });
 
-  it("a failure other than model_unavailable is not a takeover", async () => {
-    const failure = workerRun({ status: "failed", summary: "503", error: "transient:server_unavailable" });
+  it("a failure that is neither a gone model nor capacity exhaustion is not a takeover", async () => {
+    const failure = workerRun({
+      status: "failed",
+      summary: "429 caller concurrency ceiling",
+      error: "transient:rate_limit",
+    });
     const h = await harness({ pool: [A, B], gone: [A], failure });
     const outcome = await h.backends.agent.runAgent({ role: "implementer", objective: "x", signal: signal() });
+    assert.equal(outcome.error, "transient:rate_limit");
+    assert.equal(h.seen.length, 1);
+    assert.deepEqual(h.marks, []);
+  });
+
+  it("a model with no capacity is taken over without marking it unavailable", async () => {
+    const failure = workerRun({
+      status: "failed",
+      summary: 'Model gateway refused the request after 8 honoured wait(s): 429: {"code":"capacity_unavailable"}',
+      error: "transient:server_unavailable",
+    });
+    const h = await harness({ pool: [A, B], gone: [A], failure });
+    const activity: WorkerActivity[] = [];
+    const outcome = await h.backends.agent.runAgent({
+      role: "implementer",
+      objective: "x",
+      signal: signal(),
+      onActivity: (e) => activity.push(e),
+    });
+    assert.equal(outcome.exitStatus, "succeeded");
+    assert.deepEqual(h.models(), [modelKey(A), modelKey(B)], "A had no capacity, then B ran");
+    const announce = "model gw/model-a has no capacity right now — switched implementer to gw/model-b";
+    assert.ok(
+      activity.some((e) => e.kind === "state" && e.summary === announce),
+      JSON.stringify(activity),
+    );
+    assert.match(outcome.summary ?? "", new RegExp(announce));
+    assert.deepEqual(h.marks, [], "capacity is transient: never marked unavailable");
+    assert.deepEqual(h.unavailable.list(), []);
+  });
+
+  it("walks past several capacity-exhausted models in one execution", async () => {
+    const failure = workerRun({
+      status: "failed",
+      summary: "503 no worker for model",
+      error: "transient:server_unavailable",
+    });
+    const h = await harness({ pool: [A, B, C], gone: [A, B], failure });
+    const outcome = await h.backends.agent.runAgent({ role: "implementer", objective: "x", signal: signal() });
+    assert.equal(outcome.exitStatus, "succeeded");
+    assert.deepEqual(h.models(), [modelKey(A), modelKey(B), modelKey(C)]);
+    assert.deepEqual(h.unavailable.list(), [], "capacity exhaustion never marks models unavailable");
+  });
+
+  it("with no other eligible model returns the original capacity outcome", async () => {
+    const failure = workerRun({
+      status: "failed",
+      summary: "503 no worker for model",
+      error: "transient:server_unavailable",
+    });
+    const h = await harness({ pool: [A], gone: [A, SESSION], failure });
+    const outcome = await h.backends.agent.runAgent({ role: "implementer", objective: "x", signal: signal() });
+    assert.equal(outcome.exitStatus, "failed");
     assert.equal(outcome.error, "transient:server_unavailable");
     assert.equal(h.seen.length, 1);
     assert.deepEqual(h.marks, []);
