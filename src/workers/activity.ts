@@ -1,5 +1,6 @@
 import { redactSecrets } from "../security/SecurityPolicy.ts";
 import type { WorkerActivity } from "./WorkerExecutor.ts";
+import { buildToolOf, isBuildTool } from "./buildActivity.ts";
 import type { CheckpointProgressClaim } from "./checkpointProgressTool.ts";
 
 export const MAX_WORKER_ACTIVITY_SUMMARY = 160;
@@ -86,7 +87,19 @@ export function sanitizeWorkerActivity(value: unknown): WorkerActivity | null {
     const toolName = safeToolName(input.toolName);
     const verb =
       input.phase === "started" ? "Running tool" : input.phase === "completed" ? "Finished tool" : "Tool failed";
-    return { kind: "tool", phase: input.phase, toolName, summary: `${verb}: ${toolName}`, meaningfulProgress: false };
+    // Only a label from the fixed BUILD_TOOLS set crosses this boundary, and
+    // a build's duration only on its completion.
+    const buildTool = isBuildTool(input.buildTool) ? input.buildTool : undefined;
+    const elapsedMs = buildTool && input.phase !== "started" ? safeDuration(input.elapsedMs) : undefined;
+    return {
+      kind: "tool",
+      phase: input.phase,
+      toolName,
+      summary: `${verb}: ${toolName}`,
+      meaningfulProgress: false,
+      ...(buildTool ? { buildTool } : {}),
+      ...(elapsedMs !== undefined ? { elapsedMs } : {}),
+    };
   }
   if (input.kind === "heartbeat") {
     const elapsedMs = safeDuration(input.elapsedMs);
@@ -156,7 +169,10 @@ export function sanitizeWorkerActivity(value: unknown): WorkerActivity | null {
 
 /**
  * Translate Pi session events into a deliberately small public activity shape.
- * Tool arguments and assistant content are never inspected or copied.
+ * Tool arguments and assistant content are never copied. The one inspection: a
+ * bash command is classified into a fixed build-tool label (cargo, npm, ...),
+ * so a budget-exhausted worker can say how much of its time went to building
+ * (the executor pairs the start with the end event to time it).
  */
 export function activityFromSessionEvent(event: {
   type?: string;
@@ -167,12 +183,15 @@ export function activityFromSessionEvent(event: {
 }): WorkerActivity | null {
   if (event.type === "tool_execution_start") {
     const toolName = safeToolName(event.toolName);
+    const buildTool =
+      toolName === "bash" ? buildToolOf((event.args as { command?: unknown } | undefined)?.command) : undefined;
     return sanitizeWorkerActivity({
       kind: "tool",
       phase: "started",
       toolName,
       summary: `Running tool: ${toolName}`,
       meaningfulProgress: false,
+      ...(buildTool ? { buildTool } : {}),
     });
   }
   if (event.type === "tool_execution_end") {

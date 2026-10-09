@@ -23,6 +23,7 @@ import type { GatewayResilienceConfig } from "../resilience/config.ts";
 import type { RecoveryProbe } from "../resilience/probe.ts";
 import { describeOperatorPause } from "../runtime/operatorModelPin.ts";
 import type { WorkerActivity } from "../workers/WorkerExecutor.ts";
+import { budgetExhaustedBuildHint } from "../workers/buildActivity.ts";
 import { type BrokerBackends, ExecutionBroker } from "./broker.ts";
 import { CheckpointManager } from "./checkpoints.ts";
 import { CompletionGate } from "./completionGate.ts";
@@ -35,6 +36,7 @@ import {
   interruptibleRun,
   isPauseAbort,
 } from "./interrupt.ts";
+import { transitionMissionToCanceled } from "./missionCancel.ts";
 import type { MissionStore } from "./missionStore.ts";
 import type { MissionObservability } from "./observability/MissionObservability.ts";
 import { computeProgress } from "./observability/progress.ts";
@@ -229,6 +231,9 @@ export interface OrchestrateOptions {
   interrupt?: InterruptMode;
 }
 
+/** Executions whose build activity is remembered for the budget-exhausted hint. */
+const MAX_TRACKED_BUILD_EXECUTIONS = 256;
+
 export class Orchestrator {
   readonly store: MissionStore;
   readonly broker: ExecutionBroker;
@@ -245,6 +250,13 @@ export class Orchestrator {
   /** Per-mission progress hooks; missions may overlap on one orchestrator. */
   private readonly progress = new Map<string, (line: string) => void>();
   private readonly observedExecutions = new Set<string>();
+  /**
+   * Build commands each execution's worker ran (fixed tool labels and their
+   * wall-clock time, from its activity events), so a budget-exhausted worker
+   * can say how much of its time went to building. In memory and bounded:
+   * after a restart the hint is simply absent.
+   */
+  private readonly buildActivity = new Map<string, { counts: Map<string, number>; buildMs: number; running: number }>();
   private readonly taskExecutions = new Map<string, string>();
   private readonly workspaceResolver?: WorkspaceManifestResolver;
   private readonly repositoryRegistry?: RepositoryRegistry;
@@ -539,17 +551,44 @@ export class Orchestrator {
         return this.store.getMission(missionId)!;
       }
       if (repairDecision.action === "CREATE_REPAIR_TASKS" && !repairDecision.startingCandidateContent) {
-        if (repairDecision.status === "planned") this.store.transitionRecovery(repairDecision.recoveryId, "failed");
-        this.store.addFinding({
-          mission_id: missionId,
-          task_id: classification.taskId,
-          severity: "blocking",
-          category: "recovery_candidate_baseline",
-          file: null,
-          line: null,
-          summary: "Gate repair requires an independently Git-verified current candidate.",
-          evidence: repairDecision.recoveryId,
-          recommended_action: "Reconstruct the current candidate from Git before dispatching repair work.",
+        // Gate repair without an independently Git-verified candidate baseline
+        // is refused (materiality could not be proven). The refusal is terminal
+        // for this resumption: settle the decision whether it was planned or
+        // already started (a decision left `started` was re-selected above on
+        // every supervisor tick, bypassing the planner's budget and deadline),
+        // record the finding once, and durably stop the mission so neither the
+        // supervisor nor a restart re-enters this branch until the operator acts.
+        if (repairDecision.status === "planned" || repairDecision.status === "started") {
+          this.store.transitionRecovery(repairDecision.recoveryId, "failed");
+        }
+        const recordedBaselineRefusal = this.store
+          .listFindings(missionId)
+          .some(
+            (finding) =>
+              finding.category === "recovery_candidate_baseline" &&
+              finding.status === "open" &&
+              finding.evidence === repairDecision.recoveryId,
+          );
+        if (!recordedBaselineRefusal) {
+          this.store.addFinding({
+            mission_id: missionId,
+            task_id: classification.taskId,
+            severity: "blocking",
+            category: "recovery_candidate_baseline",
+            file: null,
+            line: null,
+            summary: "Gate repair requires an independently Git-verified current candidate.",
+            evidence: repairDecision.recoveryId,
+            recommended_action: "Reconstruct the current candidate from Git before dispatching repair work.",
+          });
+        }
+        const preservedWork = await this.preservedMissionWork(missionId);
+        this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
+        this.store.stopMission(missionId, {
+          reason: "gate repair refused: no independently Git-verified current candidate exists for this mission",
+          preservedWork,
+          attemptedRecoveries: this.store.listRecoveryDecisions(missionId).map((decision) => decision.recoveryId),
+          resumeCondition: `a successful integration must publish Git-verified candidate evidence before gate repair can run; otherwise cancel the mission with /mission cancel ${missionId}`,
         });
         await this.store.flush();
         this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
@@ -1111,6 +1150,7 @@ export class Orchestrator {
       });
       if (event.kind === "tool")
         obs?.noteWorkerTool(event.missionId, event.executionId, `${event.toolName}:${event.phase}`);
+      if (event.kind === "tool" && event.buildTool) this.noteBuildCommand(event);
       if ((event.kind === "state" || event.kind === "execution") && event.phase === "completed") {
         obs?.workerCompleted(event.missionId, event.executionId);
         if (event.kind === "execution") {
@@ -1129,6 +1169,27 @@ export class Orchestrator {
       }
     }
     this.report(event.missionId, `[mission ${event.missionId}] ${event.summary}`);
+  }
+
+  private noteBuildCommand(event: WorkerActivity & { executionId: string }): void {
+    let entry = this.buildActivity.get(event.executionId);
+    if (!entry) {
+      if (event.phase !== "started") return;
+      if (this.buildActivity.size >= MAX_TRACKED_BUILD_EXECUTIONS) {
+        const oldest = this.buildActivity.keys().next().value;
+        if (oldest !== undefined) this.buildActivity.delete(oldest);
+      }
+      entry = { counts: new Map(), buildMs: 0, running: 0 };
+      this.buildActivity.set(event.executionId, entry);
+    }
+    if (event.phase === "started") {
+      const tool = event.buildTool!;
+      entry.counts.set(tool, (entry.counts.get(tool) ?? 0) + 1);
+      entry.running++;
+    } else {
+      entry.running = Math.max(0, entry.running - 1);
+      entry.buildMs += event.elapsedMs ?? 0;
+    }
   }
 
   private activityType(event: WorkerActivity): ActivityType {
@@ -1797,8 +1858,49 @@ export class Orchestrator {
             execution?.exit_status === "timeout" && (checkpoint?.remainingDeliverables.length ?? 0) > 0,
         );
       if (timedCheckpoint) {
+        // The classified summary stays fixed: it is part of the failure
+        // fingerprint recovery deduplicates on. The build explanation goes to
+        // the reported reason and a finding.
         const summary =
           "configured task wall-clock limit (limits.max_task_wall_clock_ms) reached after a durable partial checkpoint";
+        const execution = timedCheckpoint.execution!;
+        const builds = this.buildActivity.get(execution.execution_id);
+        const startedAt = execution.started_at ? Date.parse(execution.started_at) : Number.NaN;
+        const endedAt = execution.ended_at ? Date.parse(execution.ended_at) : this.scheduler.now();
+        const hint = budgetExhaustedBuildHint({
+          buildCommands: builds?.counts,
+          buildMs: builds?.buildMs ?? 0,
+          buildsRunning: builds?.running ?? 0,
+          elapsedMs: Number.isFinite(startedAt) && endedAt > startedAt ? endedAt - startedAt : undefined,
+          committedChanges: timedCheckpoint.checkpoint!.committedChanges,
+          isolatedWorktree: !!(timedCheckpoint.checkpoint!.worktree ?? execution.worktree),
+        });
+        if (
+          hint &&
+          !this.store
+            .listFindings(mission.mission_id)
+            .some((f) => f.category === "execution_budget" && f.task_id === timedCheckpoint.task.task_id)
+        ) {
+          this.store.addFinding({
+            mission_id: mission.mission_id,
+            task_id: timedCheckpoint.task.task_id,
+            severity: "major",
+            category: "execution_budget",
+            file: null,
+            line: null,
+            summary: hint,
+            evidence: JSON.stringify({
+              executionId: execution.execution_id,
+              checkpointId: timedCheckpoint.checkpoint!.checkpointId,
+              buildCommands: Object.fromEntries(builds?.counts ?? []),
+              buildMs: builds?.buildMs ?? 0,
+              buildsRunning: builds?.running ?? 0,
+              committedChanges: timedCheckpoint.checkpoint!.committedChanges.length,
+            }),
+            recommended_action:
+              "Repair the mission (the remaining deliverables become a recovery task), split the task, or raise (or unset) the task wall-clock limit limits.max_task_wall_clock_ms.",
+          });
+        }
         const classification = this.failureClassifier.classify({
           missionId: mission.mission_id,
           taskId: timedCheckpoint.task.task_id,
@@ -1816,7 +1918,7 @@ export class Orchestrator {
           intent,
           verdict: this.gate.evaluate(blocked),
           completed: false,
-          failureReason: summary,
+          failureReason: hint ? `${summary}: ${hint}` : summary,
         };
       }
 
@@ -2836,22 +2938,9 @@ export class Orchestrator {
 
   /** Settle a caller-aborted mission without allowing later gate work to run. */
   private async cancelMission(missionId: string): Promise<Mission> {
-    let mission = this.store.getMission(missionId)!;
-    if (mission.status === "CANCELED") return mission;
-    // A canceled mission is no longer paused; never report it as waiting.
-    this.store.clearOperatorPause(missionId);
-    if (mission.status === "PAUSED_INFRASTRUCTURE") {
-      // Interrupted tasks were left resumable; an explicit cancel ends them.
-      for (const task of this.store.listTasks(missionId)) {
-        if (canTransitionTask(task.status, "CANCELED")) this.store.transitionTask(task.task_id, "CANCELED");
-      }
-    }
-    if (canTransitionMission(mission.status, "CANCELING")) {
-      mission = this.store.transitionMission(missionId, "CANCELING");
-    }
-    if (canTransitionMission(mission.status, "CANCELED")) {
-      mission = this.store.transitionMission(missionId, "CANCELED");
-    }
+    const current = this.store.getMission(missionId)!;
+    if (current.status === "CANCELED") return current;
+    const mission = transitionMissionToCanceled(this.store, missionId);
     await this.cleanupCanceledMission(missionId);
     this.report(missionId, `[mission ${missionId}] canceled by caller`);
     return mission;

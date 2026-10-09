@@ -215,3 +215,40 @@ processes acquire this channel after restarting with the updated extension.
 
 The protocol and trust boundary are defined in
 [`docs/specs/session-control.md`](specs/session-control.md).
+
+## Closing out stale missions
+
+A mission whose controlling `pi` process is gone keeps being reported (and,
+when repairable, repaired) by the supervisor of every later runtime over the
+same namespace. End it from any `pi` session in that repository with
+`/mission cancel <id>`; that is the supported path.
+
+`pi-engineering missions list|cancel --store <repo>/.pi-eng ...` works only on a
+legacy single-writer `orchestration.jsonl` that no current runtime has imported
+yet (that is, a repository only older Pi Engineering versions have used):
+
+```bash
+pi-engineering missions list   --store <repo>/.pi-eng [--repo-id <id>] [--created-after <ISO>] [--all] [--json]
+pi-engineering missions cancel --store <repo>/.pi-eng --repo-id <id> --created-after <ISO>   # dry run
+pi-engineering missions cancel --store <repo>/.pi-eng --mission <id> [--mission <id> ...] --yes
+```
+
+There, `cancel` takes the legacy store's single-writer lock (it refuses while an
+older live session owns the store) and refuses a mission whose controller lease
+is still live or unreadable. It cancels unfinished tasks and executions, fails
+open recovery decisions and moves the mission to `CANCELED` through the normal
+lifecycle transitions. It starts no supervisor and leaves Git alone: candidate
+worktrees and branches stay in place for diagnosis and are listed in the output.
+
+Current runtimes import that file once into a machine-local runtime namespace
+(see [zero-config runtime isolation](specs/zero-config-runtime-isolation.md))
+and keep every later mission there, with no cross-process writer lock. Once a
+store has been imported, `missions cancel` refuses (the file lacks later
+missions, and its lock no longer excludes a live session) and `missions list`
+marks its output as a legacy snapshot.
+
+A gate repair that has no Git-verified current candidate (for example because
+the only integration failed, so no candidate evidence was ever published) is
+refused once, recorded as one `recovery_candidate_baseline` finding, and the
+mission is durably stopped with a `resumeCondition`. It is not retried on every
+supervisor tick.

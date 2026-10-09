@@ -299,6 +299,40 @@ export class GitRepo {
     }
   }
 
+  /**
+   * True when a durable record provably belongs to another (missionId, repoId).
+   *
+   * The state directory lives in the git common dir, which every linked
+   * worktree shares, so a mission sees records written by missions bound to
+   * other checkout roots (each root has its own repoId) and by other missions.
+   * Such records are not the caller's to validate: parts of their canonical
+   * identity (the candidate worktree path) derive from the root that wrote
+   * them, so validating them from another root reports false corruption.
+   *
+   * Attribution is only trusted when the payload hashes to its own filename,
+   * i.e. the record is self-consistent. A record whose payload was altered,
+   * or that is unreadable, has no provable owner and stays subject to the
+   * caller's full fail-closed validation.
+   */
+  private isForeignDurableRecord<T extends { missionId?: unknown; repoId?: unknown }>(
+    parsed: T,
+    file: string,
+    canonicalName: (record: T) => string,
+    missionId: string,
+    repoId: string,
+  ): boolean {
+    if (typeof parsed !== "object" || parsed === null) return false;
+    const owner = parsed as { missionId?: unknown; repoId?: unknown };
+    if (typeof owner.missionId !== "string" || owner.missionId.trim().length === 0) return false;
+    if (typeof owner.repoId !== "string" || owner.repoId.trim().length === 0) return false;
+    if (owner.missionId === missionId && owner.repoId === repoId) return false;
+    try {
+      return file === canonicalName(parsed);
+    } catch {
+      return false;
+    }
+  }
+
   private durableIdentityName(prefix: string, parts: Array<string | number>): string {
     const digest = createHash("sha256").update(JSON.stringify(parts)).digest("hex");
     return `${prefix}.${digest}.json`;
@@ -401,6 +435,9 @@ export class GitRepo {
       if (!name.startsWith("cleanup.") || !name.endsWith(".json")) continue;
       try {
         const parsed = JSON.parse(await readFile(join(dir, name), "utf8")) as PendingBranchCleanup;
+        if (this.isForeignDurableRecord(parsed, name, (r) => this.branchCleanupStateName(r), missionId, repoId)) {
+          continue;
+        }
         const structurallyValid =
           typeof parsed.missionId === "string" &&
           parsed.missionId.trim().length > 0 &&
@@ -506,6 +543,9 @@ export class GitRepo {
         )
           continue;
         const parsed = JSON.parse(await readFile(join(dir, name), "utf8")) as CandidateLifecycle;
+        // The expected worktree path below derives from this checkout's root,
+        // so it is only meaningful for records this (missionId, repoId) owns.
+        if (this.isForeignDurableRecord(parsed, name, (r) => this.candidateStateName(r), missionId, repoId)) continue;
         if (
           typeof parsed.missionId === "string" &&
           parsed.missionId.trim().length > 0 &&
@@ -614,6 +654,9 @@ export class GitRepo {
       if (!name.startsWith("run.") || !name.endsWith(".json")) continue;
       try {
         const parsed = JSON.parse(await readFile(join(dir, name), "utf8")) as IntegrationRunRecord;
+        if (this.isForeignDurableRecord(parsed, name, (r) => this.integrationRunStateName(r), missionId, repoId)) {
+          continue;
+        }
         if (
           typeof parsed.missionId === "string" &&
           parsed.missionId.trim().length > 0 &&
@@ -715,6 +758,7 @@ export class GitRepo {
       if (!name.startsWith("promotion.") || !name.endsWith(".json")) continue;
       try {
         const parsed = JSON.parse(await readFile(join(dir, name), "utf8")) as PromotionLifecycle;
+        if (this.isForeignDurableRecord(parsed, name, (r) => this.promotionStateName(r), missionId, repoId)) continue;
         if (
           typeof parsed.missionId === "string" &&
           parsed.missionId.trim().length > 0 &&
