@@ -87,6 +87,7 @@ import { CHECKPOINT_PROGRESS_TOOL_NAME, createCheckpointProgressTool } from "./c
 import { registerLocalProviders } from "./localProviders.ts";
 import { WORKER_KICKOFF, buildSystemPrompt, wantsCommitDiscipline } from "./prompts.ts";
 import { guardRuntimeRequestBody } from "./requestBodyGuard.ts";
+import { StreamStallWatchdog, isStalledStream } from "./streamStall.ts";
 import { workerResultTool } from "./workerResultTool.ts";
 
 /**
@@ -777,7 +778,9 @@ ${TOOL_TRANSITION_RULE}`;
                 ? "transient:model_unavailable"
                 : isTruncatedStream(lastAssistantError)
                   ? "truncated_after_progress"
-                  : (lastAssistantError ?? "no-result");
+                  : isStalledStream(lastAssistantError)
+                    ? "transient:network"
+                    : (lastAssistantError ?? "no-result");
         return {
           result: {
             status: "failed",
@@ -1011,8 +1014,43 @@ ${recovery.recoveryPrompt}`;
       }, inactivityMs);
       timer.unref?.();
     };
+    // Model-stream stall watchdog (defect C): the inactivity guard above
+    // re-arms on session events, but a gateway that holds the connection open
+    // without sending ANY data produces no events — the awaited model call
+    // hangs forever and the execution zombies (observed 55+ minutes of
+    // reported liveness on a request that would never produce a token). The
+    // watchdog arms for each model turn (prompt start, after every tool) and
+    // resets on every stream event; silence for modelStreamStallMs aborts the
+    // request and surfaces a transient network failure. A long, active stream
+    // never stalls; a tool run pauses the window. 0 disables the watchdog.
+    const stallMs = this.gatewayConfig.modelStreamStallMs;
+    let stalled = false;
+    const stallWatchdog =
+      stallMs > 0
+        ? new StreamStallWatchdog({
+            stallMs,
+            onStall: () => {
+              stalled = true;
+              assistantError ??= `model stream stalled: no data for ${stallMs}ms`;
+              emitWorkerActivity(req, { kind: "state", summary: "Model stream stalled", meaningfulProgress: false });
+              void session.abort();
+            },
+          })
+        : undefined;
+    const armStall = (): void => stallWatchdog?.arm();
+    const disarmStall = (): void => stallWatchdog?.disarm();
     const unsubscribe = session.subscribe((event) => {
       armInactivity();
+      // Stream-stall liveness: stream data resets the window; a running tool
+      // pauses it (the model is waiting on the tool, not stalled); tool
+      // completion re-arms it for the next model turn; an assistant
+      // message_end without a tool ends the turn.
+      if (event.type === "message_update" && (event.message as { role?: unknown } | undefined)?.role === "assistant")
+        armStall();
+      else if (event.type === "tool_execution_start") disarmStall();
+      else if (event.type === "tool_execution_end") armStall();
+      else if (event.type === "message_end" && (event.message as { role?: unknown } | undefined)?.role === "assistant")
+        disarmStall();
       const streamed = streaming.note(event as { type?: string; message?: unknown });
       if (streamed) emitWorkerActivity(req, streamed);
       const activity = buildTimer.observe(event, activityFromSessionEvent(event));
@@ -1093,6 +1131,9 @@ ${recovery.recoveryPrompt}`;
 
     try {
       emitWorkerActivity(req, { kind: "state", summary: "Worker session started", meaningfulProgress: false });
+      // Covers a request that never begins streaming: armed from prompt start
+      // until the first stream event (or the first tool).
+      armStall();
       // Canceled while queued for a slot: aborting a session that has not
       // started prompting is a no-op, so never start it.
       if (req.signal?.aborted) abortFromOwner();
@@ -1106,11 +1147,12 @@ ${recovery.recoveryPrompt}`;
       // EXPECTED (session.abort()) and not a transport failure. A rejection
       // with none of those flags set is a real provider/transport error (503,
       // 429, network, timeout) that the transient-recovery layer retries.
-      if (!guardAborted && !budgetExhausted && !timedOut && !ownerAborted) {
+      if (!guardAborted && !budgetExhausted && !timedOut && !ownerAborted && !stalled) {
         promptError = err;
       }
     } finally {
       if (timer) clearTimeout(timer);
+      disarmStall();
       req.signal?.removeEventListener("abort", abortFromOwner);
       unsubscribe();
       apsDetach?.();
@@ -1174,6 +1216,18 @@ ${recovery.recoveryPrompt}`;
       // A transport drop (undici "terminated": a gateway restart cut the
       // socket) arrives the same way — an assistant-message error, no throw —
       // and is retried under the same no-progress rule, as a network failure.
+      session.dispose();
+      throw new TransientError("network", assistantError!, 1);
+    }
+
+    // Model stream stall with no progress (defect C): the watchdog aborted a
+    // request the gateway held open without data. A fresh session is cheap
+    // here (no tools to re-run), so retry it as a network failure through the
+    // existing transient ladder. A stall AFTER progress settles in the
+    // failure path below as transient:network (isStalledStream) so the
+    // scheduler's time-based resilience window — not an LLM repair task —
+    // owns the wait and the retry.
+    if (stalled && !guardAborted && !budgetExhausted && !timedOut && toolCalls === 0) {
       session.dispose();
       throw new TransientError("network", assistantError!, 1);
     }

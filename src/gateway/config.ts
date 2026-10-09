@@ -36,6 +36,16 @@ export interface GatewayAdmissionConfig {
    * at any time, and the status line shows what we wait for and since when.
    */
   maxElapsedMs: number;
+  /**
+   * Model-stream stall window (defect C): a model request that produces no
+   * stream data (tokens, tool calls, or completion) for this long is treated
+   * as stalled — the in-flight request is aborted and surfaced as a transient
+   * network failure. The window is reset on every stream event and paused
+   * while a tool runs, so long-but-active streams are never stalled and a
+   * five-hour worker with real activity is unaffected. 0 disables the
+   * watchdog.
+   */
+  modelStreamStallMs: number;
   /** Emit one structured telemetry line per admission event. */
   telemetry: boolean;
 }
@@ -49,6 +59,7 @@ export const DEFAULT_GATEWAY_CONFIG: GatewayAdmissionConfig = {
   jitterMs: 250,
   maxRetries: 8,
   maxElapsedMs: 12 * 3_600_000,
+  modelStreamStallMs: 10 * 60_000,
   telemetry: true,
 };
 
@@ -94,6 +105,8 @@ export function parseGatewayElapsedMs(value: string | undefined): number | null 
  *                                  mission scheduler takes over the wait (default: 8)
  *   PI_GATEWAY_MAX_ELAPSED_MS    — ms or duration ("12h"), how long one interactive turn waits
  *                                  out transient infrastructure (default: 12h)
+ *   PI_GATEWAY_STREAM_STALL_MS   — ms or duration ("10m"), no-data window before an in-flight
+ *                                  model request is aborted as stalled; "0" disables (default: 10m)
  *   PI_GATEWAY_TELEMETRY         — "true"/"false" (default true)
  */
 export function resolveGatewayConfig(overrides?: Partial<GatewayAdmissionConfig>): GatewayAdmissionConfig {
@@ -111,6 +124,8 @@ export function resolveGatewayConfig(overrides?: Partial<GatewayAdmissionConfig>
   cfg.maxRetries = Math.max(0, int(env.PI_GATEWAY_MAX_RETRIES, cfg.maxRetries));
   const elapsed = parseGatewayElapsedMs(env.PI_GATEWAY_MAX_ELAPSED_MS);
   if (elapsed !== null) cfg.maxElapsedMs = elapsed;
+  const stall = parseGatewayElapsedMs(env.PI_GATEWAY_STREAM_STALL_MS);
+  if (stall !== null) cfg.modelStreamStallMs = stall;
   cfg.telemetry = bool(env.PI_GATEWAY_TELEMETRY, cfg.telemetry);
 
   if (overrides) Object.assign(cfg, overrides);
@@ -118,8 +133,10 @@ export function resolveGatewayConfig(overrides?: Partial<GatewayAdmissionConfig>
   // budgets silently recreate the unbounded retry loop this config prevents.
   if (!Number.isFinite(cfg.maxRetries)) cfg.maxRetries = DEFAULT_GATEWAY_CONFIG.maxRetries;
   if (!Number.isFinite(cfg.maxElapsedMs)) cfg.maxElapsedMs = DEFAULT_GATEWAY_CONFIG.maxElapsedMs;
+  if (!Number.isFinite(cfg.modelStreamStallMs)) cfg.modelStreamStallMs = DEFAULT_GATEWAY_CONFIG.modelStreamStallMs;
   cfg.maxRetries = Math.max(0, Math.floor(cfg.maxRetries));
   cfg.maxElapsedMs = Math.max(0, cfg.maxElapsedMs);
+  cfg.modelStreamStallMs = Math.max(0, Math.floor(cfg.modelStreamStallMs));
   return cfg;
 }
 
