@@ -609,31 +609,39 @@
   milestone: __global__
   type: dogfood
   status: pass
-  commit: 8e47650956e6d6852dd110048e5ad3edcf73c087
-  generatedAt: 2026-10-09T21:15:10.322Z
+  commit: 2bb48922660895a8df29f798f4cbd29bd7ad3dd4
+  generatedAt: 2026-10-10T00:03:14.124Z
   paths: &a13
     - src/
     - extensions/
     - test/
-  proof: scripts/dogfood-roadmap.ts full roadmap lifecycle (exit 0) + full npm
-    test suite at HEAD
-  summary: "CI-green release gate: fresh-context review + deterministic dogfood at
-    HEAD 8e47650; 0 critical, 0 high"
+  proof: "node --import ./test/support/isolatedState.ts scripts/dogfood-roadmap.ts
+    at 2bb48922660895a8df29f798f4cbd29bd7ad3dd4 exited 0: full roadmap lifecycle
+    (bootstrap, implement, invalidate, reverify, complete) PASS."
+  summary: fresh_review + dogfood re-recorded at
+    2bb48922660895a8df29f798f4cbd29bd7ad3dd4 after test de-flake commit
+    (2bb4892) touched src/ and test/.
 - id: review-ci-green
   milestone: __global__
   type: fresh_review
   status: pass
-  commit: 8e47650956e6d6852dd110048e5ad3edcf73c087
-  generatedAt: 2026-10-09T21:15:10.322Z
+  commit: 2bb48922660895a8df29f798f4cbd29bd7ad3dd4
+  generatedAt: 2026-10-10T00:03:14.124Z
   paths: *a13
-  proof: scripts/fresh-review-pi-engineering.ts (fresh-context
-    architecture-reviewer, qwen3.8-flash_next-mxfp4_fp8_gptq, 1 turn) reviewed
-    excerpts of src/orchestration, src/plannerWorker, src/capability,
-    src/runtime/herdr and test/integration; independently confirmed supersession
-    guard, terminal-state guards, atomic persist, transient capacity,
-    tried-exclusion, hermetic herdr; no critical/high findings
-  summary: "CI-green release gate: fresh-context review + deterministic dogfood at
-    HEAD 8e47650; 0 critical, 0 high"
+  proof: "Genuine fresh-context architecture-reviewer run at
+    2bb48922660895a8df29f798f4cbd29bd7ad3dd4
+    (scripts/fresh-review-pi-engineering.ts, maxContextTokens 80000, bounded
+    code excerpts). Reviewed orchestrator.ts/scheduler.ts (supersession +
+    terminal guards), plannerWorker/executor.ts (atomic persist),
+    realBackends.ts + capability/router.ts + PiWorkerExecutor.ts (capacity
+    transient, operator-pin/account-wide refusal), modelRouting.ts,
+    herdr/ensureHerdr.ts. Result: no critical or high findings; only known
+    medium/low informational items in the owner's orchestration work area
+    (asymmetric superseded guard, strand-READY edge on non-RUNNING throw,
+    swallowed persist errors, empty-model evidence emission)."
+  summary: fresh_review + dogfood re-recorded at
+    2bb48922660895a8df29f798f4cbd29bd7ad3dd4 after test de-flake commit
+    (2bb4892) touched src/ and test/.
   findings:
     critical: 0
     high: 0

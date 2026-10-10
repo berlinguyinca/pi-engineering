@@ -21,9 +21,14 @@ const EXCERPTS: Array<{ file: string; from: number; to: number }> = [
   { file: "src/orchestration/scheduler.ts", from: 420, to: 430 },
   { file: "src/orchestration/scheduler.ts", from: 545, to: 710 },
   { file: "src/plannerWorker/executor.ts", from: 1395, to: 1425 },
+  { file: "src/orchestration/realBackends.ts", from: 100, to: 125 },
+  { file: "src/orchestration/realBackends.ts", from: 350, to: 380 },
+  { file: "src/orchestration/realBackends.ts", from: 430, to: 460 },
   { file: "src/orchestration/realBackends.ts", from: 455, to: 485 },
   { file: "src/orchestration/realBackends.ts", from: 695, to: 770 },
   { file: "src/capability/router.ts", from: 160, to: 195 },
+  { file: "src/runtime/modelRouting.ts", from: 104, to: 140 },
+  { file: "src/workers/PiWorkerExecutor.ts", from: 405, to: 420 },
   { file: "src/runtime/herdr/ensureHerdr.ts", from: 35, to: 50 },
 ];
 
@@ -73,7 +78,10 @@ try {
     tools: [],
     cwd: repo,
     context,
-    maxContextTokens: 30000,
+    // The reviewer produces a prose findings report; a 30k cap is exceeded by
+    // a verbose-but-finished run (4 turns, ~19k output). The model's real
+    // window is far larger, so allow headroom for the report to complete.
+    maxContextTokens: 80_000,
     timeoutMs: 1_800_000,
     // Force the flash_next model that is actually served by the gateway (16
     // slots, warm) rather than the engineering.yaml pin (q4, not deployed) or
