@@ -609,25 +609,25 @@
   milestone: __global__
   type: dogfood
   status: pass
-  commit: 405dd67175c8d80eca8892267bc28693f36889f1
-  generatedAt: 2026-10-10T02:11:26.312Z
+  commit: fc5747f90fe5f9d56c5543f1d228ead1f814bf4d
+  generatedAt: 2026-10-10T02:40:55.155Z
   paths: &a13
     - src/
     - extensions/
     - test/
   proof: "node --import ./test/support/isolatedState.ts scripts/dogfood-roadmap.ts
-    at 405dd67 exited 0: full roadmap lifecycle (bootstrap, implement,
+    at fc5747f exited 0: full roadmap lifecycle (bootstrap, implement,
     invalidate, reverify, complete) PASS."
-  summary: fresh_review + dogfood re-recorded at 405dd67 after the GitRepo
-    worktree-admin serialization fix touched src/ and test/.
+  summary: fresh_review + dogfood re-recorded at fc5747f after the SIGKILL-owner
+    adoption loser-message de-flake touched test/.
 - id: review-ci-green
   milestone: __global__
   type: fresh_review
   status: pass
-  commit: 405dd67175c8d80eca8892267bc28693f36889f1
-  generatedAt: 2026-10-10T02:11:26.312Z
+  commit: fc5747f90fe5f9d56c5543f1d228ead1f814bf4d
+  generatedAt: 2026-10-10T02:40:55.155Z
   paths: *a13
-  proof: "Genuine fresh-context architecture-reviewer run at 405dd67
+  proof: "Genuine fresh-context architecture-reviewer run at fc5747f
     (scripts/fresh-review-pi-engineering.ts, maxContextTokens 80000, bounded
     code excerpts). Reviewed orchestrator.ts/scheduler.ts (supersession +
     terminal guards), plannerWorker/executor.ts (atomic persist), GitRepo
@@ -636,8 +636,8 @@
     modelRouting.ts, herdr/ensureHerdr.ts. Result: no critical or high findings;
     only known medium/low informational items in the owner's orchestration work
     area."
-  summary: fresh_review + dogfood re-recorded at 405dd67 after the GitRepo
-    worktree-admin serialization fix touched src/ and test/.
+  summary: fresh_review + dogfood re-recorded at fc5747f after the SIGKILL-owner
+    adoption loser-message de-flake touched test/.
   findings:
     critical: 0
     high: 0
