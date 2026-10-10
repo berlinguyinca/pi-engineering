@@ -609,39 +609,35 @@
   milestone: __global__
   type: dogfood
   status: pass
-  commit: 2bb48922660895a8df29f798f4cbd29bd7ad3dd4
-  generatedAt: 2026-10-10T00:03:14.124Z
+  commit: fc5747f90fe5f9d56c5543f1d228ead1f814bf4d
+  generatedAt: 2026-10-10T02:40:55.155Z
   paths: &a13
     - src/
     - extensions/
     - test/
   proof: "node --import ./test/support/isolatedState.ts scripts/dogfood-roadmap.ts
-    at 2bb48922660895a8df29f798f4cbd29bd7ad3dd4 exited 0: full roadmap lifecycle
-    (bootstrap, implement, invalidate, reverify, complete) PASS."
-  summary: fresh_review + dogfood re-recorded at
-    2bb48922660895a8df29f798f4cbd29bd7ad3dd4 after test de-flake commit
-    (2bb4892) touched src/ and test/.
+    at fc5747f exited 0: full roadmap lifecycle (bootstrap, implement,
+    invalidate, reverify, complete) PASS."
+  summary: fresh_review + dogfood re-recorded at fc5747f after the SIGKILL-owner
+    adoption loser-message de-flake touched test/.
 - id: review-ci-green
   milestone: __global__
   type: fresh_review
   status: pass
-  commit: 2bb48922660895a8df29f798f4cbd29bd7ad3dd4
-  generatedAt: 2026-10-10T00:03:14.124Z
+  commit: fc5747f90fe5f9d56c5543f1d228ead1f814bf4d
+  generatedAt: 2026-10-10T02:40:55.155Z
   paths: *a13
-  proof: "Genuine fresh-context architecture-reviewer run at
-    2bb48922660895a8df29f798f4cbd29bd7ad3dd4
+  proof: "Genuine fresh-context architecture-reviewer run at fc5747f
     (scripts/fresh-review-pi-engineering.ts, maxContextTokens 80000, bounded
     code excerpts). Reviewed orchestrator.ts/scheduler.ts (supersession +
-    terminal guards), plannerWorker/executor.ts (atomic persist),
-    realBackends.ts + capability/router.ts + PiWorkerExecutor.ts (capacity
-    transient, operator-pin/account-wide refusal), modelRouting.ts,
-    herdr/ensureHerdr.ts. Result: no critical or high findings; only known
-    medium/low informational items in the owner's orchestration work area
-    (asymmetric superseded guard, strand-READY edge on non-RUNNING throw,
-    swallowed persist errors, empty-model evidence emission)."
-  summary: fresh_review + dogfood re-recorded at
-    2bb48922660895a8df29f798f4cbd29bd7ad3dd4 after test de-flake commit
-    (2bb4892) touched src/ and test/.
+    terminal guards), plannerWorker/executor.ts (atomic persist), GitRepo
+    worktree serialization, realBackends.ts + capability/router.ts +
+    PiWorkerExecutor.ts (capacity transient, operator-pin/account-wide refusal),
+    modelRouting.ts, herdr/ensureHerdr.ts. Result: no critical or high findings;
+    only known medium/low informational items in the owner's orchestration work
+    area."
+  summary: fresh_review + dogfood re-recorded at fc5747f after the SIGKILL-owner
+    adoption loser-message de-flake touched test/.
   findings:
     critical: 0
     high: 0

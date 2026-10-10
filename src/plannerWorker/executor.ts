@@ -189,6 +189,15 @@ export async function runVerification(
   }
 }
 
+// Unique, crash-safe sibling temp path for the planner state file. The suffix
+// combines the process pid with a process-global incrementing sequence so two
+// PlannerWorkerExecutor instances sharing one stateDir within the same process
+// never clobber each other's in-progress temp file before its atomic rename.
+let persistTempSeq = 0;
+export function plannerStateTempPath(stateDir: string): string {
+  return join(stateDir, `state.json.tmp-${process.pid}-${persistTempSeq++}`);
+}
+
 export class PlannerWorkerExecutor {
   private readonly opts: PlannerWorkerOptions;
   private readonly ladder: EscalationLadder;
@@ -1415,7 +1424,7 @@ export class PlannerWorkerExecutor {
         // so resume always reads either the complete previous state or the
         // complete new one.
         const target = join(this.opts.stateDir, "state.json");
-        const temporary = join(this.opts.stateDir, `state.json.tmp-${process.pid}`);
+        const temporary = plannerStateTempPath(this.opts.stateDir);
         await writeFile(temporary, `${JSON.stringify(snapshot(), null, 2)}\n`);
         await rename(temporary, target);
       })

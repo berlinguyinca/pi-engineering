@@ -185,7 +185,17 @@ describe("hostile concurrency", { concurrency: false }, () => {
     const adopted = outcomes.filter((outcome) => outcome.ok);
     assert.ok(adopted.length >= 1, "a replacement adopted the dead session's mission");
     for (const outcome of outcomes.filter((entry) => !entry.ok)) {
-      assert.match(String(outcome.error), /custody of another live session/, "losers lose only to a live custodian");
+      // A loser fails because another session holds the mission: either the
+      // custody lock (ownership.ts:78/88) or the mission lease itself
+      // (ownership.ts:114, "owned by <owner> until <renewBy>"). Which one fires
+      // depends on the race ordering between the winner claiming the lock and
+      // the loser reading the lease, so accept both legitimate variants while
+      // still failing on any unexpected error.
+      assert.match(
+        String(outcome.error),
+        /another live session|is owned by \S+ until/,
+        "losers lose only to a live custodian",
+      );
     }
     const generations = adopted.map((outcome) => outcome.adoptedGeneration);
     assert.equal(new Set(generations).size, generations.length, "no two adopters ever held the same lease generation");
