@@ -196,6 +196,55 @@ describe("CompletionGate (spec 07)", () => {
     assert.equal(v.can_complete, false);
   });
 
+  it("names the failed task instead of only blaming the missing candidate", () => {
+    const { store, m } = mission(["validation", "independent_review"]);
+    const t = store.createTask({
+      mission_id: m.mission_id,
+      kind: "agent",
+      role: "implementer",
+      objective: "implement the change",
+    });
+    store.transitionTask(t.task_id, "READY");
+    const execution = store.createExecution({ task_id: t.task_id, backend: "agent", mission_id: m.mission_id });
+    store.transitionTask(t.task_id, "RUNNING", "system", { assigned_execution_id: execution.execution_id });
+    store.setExecutionStatus(execution.execution_id, "FAILED", { exit_status: "connection_error" });
+    store.transitionTask(t.task_id, "FAILED", "system", {
+      failure_reason: "Worker failed after 5 attempt(s): Connection error.",
+    });
+    const gate = new CompletionGate(store);
+    const v = gate.evaluate(store.getMission(m.mission_id)!);
+    assert.equal(v.can_complete, false);
+    for (const reason of v.reasons) {
+      if (!reason.includes("no candidate is recorded")) continue;
+      assert.ok(reason.includes(`task ${t.task_id} (agent:implementer) failed`), reason);
+      assert.match(reason, /Connection error/, reason);
+      return;
+    }
+    assert.fail(`no gate problem named the missing candidate: ${JSON.stringify(v.reasons)}`);
+  });
+
+  it("falls back to the execution outcome when the failed task recorded no reason", () => {
+    const { store, m } = mission(["validation"]);
+    const t = store.createTask({
+      mission_id: m.mission_id,
+      kind: "agent",
+      role: "implementer",
+      objective: "implement the change",
+    });
+    store.transitionTask(t.task_id, "READY");
+    const execution = store.createExecution({ task_id: t.task_id, backend: "agent", mission_id: m.mission_id });
+    store.transitionTask(t.task_id, "RUNNING", "system", { assigned_execution_id: execution.execution_id });
+    store.setExecutionStatus(execution.execution_id, "FAILED", { exit_status: "connection_closed" });
+    store.transitionTask(t.task_id, "FAILED");
+    const gate = new CompletionGate(store);
+    const v = gate.evaluate(store.getMission(m.mission_id)!);
+    assert.ok(
+      v.reasons.some((reason) => reason.includes(`execution ${execution.execution_id} ended connection_closed`)),
+      JSON.stringify(v.reasons),
+    );
+    assert.ok(!v.reasons.some((reason) => reason.includes("no reason recorded")), JSON.stringify(v.reasons));
+  });
+
   it("does not let an unrelated successful implementation supersede a failed implementation", () => {
     const { store, m } = mission([]);
     const failed = store.createTask({

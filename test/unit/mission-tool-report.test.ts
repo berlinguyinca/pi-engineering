@@ -7,6 +7,7 @@ import { test } from "node:test";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 import { buildCoreTools } from "../../src/tools/coreTools.ts";
+import { missionReportLines } from "../../src/tools/missionReport.ts";
 
 function blockedMission() {
   const store = MissionStore.open(JsonlEventStore.inMemory());
@@ -296,4 +297,79 @@ test("mission tool refuses to resume a WAITING_FOR_USER mission (PR #106 review)
   });
   assert.deepEqual(resumed, []);
   assert.match(result.content[0]!.text, /waiting for the user/i);
+});
+
+test("a failed task with no recorded reason is named from its execution outcome, never as 'no reason recorded'", () => {
+  const store = MissionStore.open(JsonlEventStore.inMemory());
+  const mission = store.createMission({
+    title: "Fix the mission",
+    goal: "Fix the mission",
+    user_request: "Fix the mission",
+    repository: ".",
+    base_ref: "base",
+    risk_profile: "low",
+    workflow_class: "engineering",
+  });
+  const failed = store.createTask({
+    mission_id: mission.mission_id,
+    kind: "agent",
+    role: "implementer",
+    objective: "Implement the fix",
+    mutates_repo: true,
+  });
+  const execution = store.createExecution({
+    task_id: failed.task_id,
+    backend: "agent",
+    mission_id: mission.mission_id,
+  });
+  store.transitionTask(failed.task_id, "READY");
+  store.transitionTask(failed.task_id, "RUNNING", "system", { assigned_execution_id: execution.execution_id });
+  store.setExecutionStatus(execution.execution_id, "FAILED", { exit_status: "connection_error" });
+  store.transitionTask(failed.task_id, "FAILED");
+  store.transitionMission(mission.mission_id, "CLASSIFYING");
+  store.transitionMission(mission.mission_id, "BLOCKED");
+
+  const lines = missionReportLines(store, mission.mission_id);
+  assert.ok(
+    lines.some((line) => line.includes(failed.task_id) && line.includes(`execution ${execution.execution_id} ended`)),
+    lines.join("\n"),
+  );
+  assert.ok(!lines.some((line) => line.includes("no reason recorded")), lines.join("\n"));
+
+  // With no execution outcome either, the last failure classification names it.
+  const classified = MissionStore.open(JsonlEventStore.inMemory());
+  const classifiedMission = classified.createMission({
+    title: "Fix the mission",
+    goal: "Fix the mission",
+    user_request: "Fix the mission",
+    repository: ".",
+    base_ref: "base",
+    risk_profile: "low",
+    workflow_class: "engineering",
+  });
+  const deadTask = classified.createTask({
+    mission_id: classifiedMission.mission_id,
+    kind: "agent",
+    role: "implementer",
+    objective: "Implement the fix",
+    mutates_repo: true,
+  });
+  classified.transitionTask(deadTask.task_id, "READY");
+  classified.transitionTask(deadTask.task_id, "FAILED");
+  classified.classifyFailure({
+    classificationId: "FC-connection",
+    missionId: classifiedMission.mission_id,
+    taskId: deadTask.task_id,
+    executionId: null,
+    category: "PROVIDER_TRANSIENT",
+    evidenceRefs: [],
+    fingerprint: "sha256:connection",
+    summary: "Stream ended without finish_reason",
+    classifiedAt: new Date().toISOString(),
+  });
+  const linesWithoutExecution = missionReportLines(classified, classifiedMission.mission_id);
+  assert.ok(
+    linesWithoutExecution.some((line) => line.includes("PROVIDER_TRANSIENT: Stream ended without finish_reason")),
+    linesWithoutExecution.join("\n"),
+  );
 });
