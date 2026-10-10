@@ -23,15 +23,35 @@ import { type RetryWindowState, recordProbe, startRetryWindow, windowOpen } from
 import { type SchedulableTask, Scheduler } from "../sched/Scheduler.ts";
 import { type ExecutionBroker, type ExecutionHandle, type ExecutionRequestInput, INACTIVITY_MARKER } from "./broker.ts";
 import { isPauseAbort } from "./interrupt.ts";
+import {
+  INTEGRATION_DOMAIN,
+  InMemoryLaneCoordinator,
+  LaneBlockedError,
+  type LaneClaim,
+  type LaneCoordinator,
+  LaneIndexCorruptError,
+  type LaneLease,
+  laneDomainOverlap,
+  laneDomainsOf,
+} from "./lanes.ts";
 import type { MissionStore } from "./missionStore.ts";
 import type { DispatchAuthority } from "./ownership.ts";
 import { FailureClassifier, type FailureEvidence, RecoveryPlanner, type RecoveryPlannerOptions } from "./recovery.ts";
 import type { MissionStatus, OrchestrationTask, TaskKind, TaskStatus } from "./types.ts";
-import { canonicalizeWriteDomain } from "./workset.ts";
+
+/**
+ * Lane repo key for a task: its repo_id when bound, else the mission repo.
+ * Shared with the coordinator so both sides address the same lane set.
+ */
+export function laneRepoKey(task: { repo_id?: string }, missionRepository: string): string {
+  return task.repo_id ?? missionRepository;
+}
 
 /** Real clock/sleep for production; tests inject deterministic fakes. */
 const realNow = (): number => Date.now();
 const realSleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+/** How long a cached lane claim view is trusted before a git re-read. */
+const LANE_VIEW_TTL = 1_000;
 /**
  * Consecutive "gateway up, model not listed" probes before one real attempt is
  * let through the probe gate (issue #76).
@@ -92,6 +112,36 @@ export const DEFAULT_LIMITS: SchedulerLimits = {
   maxPerRole: 2,
 };
 
+/**
+ * Resolve the scheduler's concurrency limits from the environment.
+ *
+ * The defaults cap a single host so a handful of missions cannot saturate
+ * the gateway, but an operator running dozens of missions against the same
+ * project must be able to raise the caps per host without a code change.
+ * Invalid values (non-numeric, zero, negative) fall back to the default for
+ * that key only — one bad env var must not zero out or break a limit.
+ */
+export function resolveSchedulerLimits(
+  env: Record<string, string | undefined> = typeof process !== "undefined" ? process.env : {},
+): SchedulerLimits {
+  const limits: SchedulerLimits = { ...DEFAULT_LIMITS };
+  const num = (key: string): number | undefined => {
+    const v = env[key];
+    if (!v) return undefined;
+    const n = Number(v);
+    return Number.isFinite(n) && n > 0 ? Math.floor(n) : undefined;
+  };
+  const maxActive = num("PI_ENGINEERING_MAX_ACTIVE");
+  const maxAgents = num("PI_ENGINEERING_MAX_AGENTS");
+  const maxSubprocesses = num("PI_ENGINEERING_MAX_SUBPROCESSES");
+  const maxPerRole = num("PI_ENGINEERING_MAX_PER_ROLE");
+  if (maxActive != null) limits.maxActive = maxActive;
+  if (maxAgents != null) limits.maxAgents = maxAgents;
+  if (maxSubprocesses != null) limits.maxSubprocesses = maxSubprocesses;
+  if (maxPerRole != null) limits.maxPerRole = maxPerRole;
+  return limits;
+}
+
 export interface ScheduledTaskResult {
   taskId: string;
   status: TaskStatus;
@@ -126,6 +176,13 @@ export interface SchedulerOptions {
   acquireAuthority?: (task: OrchestrationTask) => Promise<DispatchAuthority>;
   /** Mission-wide durable retry/repair ceiling. */
   recovery?: RecoveryPlannerOptions;
+  /**
+   * Cross-mission/host lane coordinator for repo write serialization. Defaults
+   * to a cap-unlimited in-memory coordinator (per-process overlap only).
+   */
+  lanes?: LaneCoordinator;
+  /** Stable identity of this scheduler for lane claims (host/mission owner). */
+  ownerId?: string;
 }
 
 export interface MissionSchedulerStatusNotice {
@@ -161,24 +218,12 @@ export function classifyFailure(
   return { action: task.failure_policy === "block" ? "block" : "retry", reason: msg };
 }
 
-/** Normalize a write domain: strip trailing slash and a trailing `/**` glob. */
-export function normalizeDomain(d: string): string {
-  return canonicalizeWriteDomain(d).replace(/\/\*\*$/, "");
-}
+// normalizeDomain/domainsOverlap live in workset.ts (shared with the lane
+// coordinator, which must not import the scheduler); re-exported here so
+// existing scheduler consumers keep the same import path.
+import { domainsOverlap, normalizeDomain } from "./workset.ts";
 
-/** True when two mutating tasks have overlapping write domains. */
-export function domainsOverlap(a: string[], b: string[]): boolean {
-  for (const rawX of a) {
-    for (const rawY of b) {
-      const x = normalizeDomain(rawX);
-      const y = normalizeDomain(rawY);
-      if (x === "**" || y === "**") return true;
-      if (x === y) return true;
-      if (x.startsWith(`${y}/`) || y.startsWith(`${x}/`)) return true;
-    }
-  }
-  return false;
-}
+export { domainsOverlap, normalizeDomain };
 
 export class MissionScheduler {
   private readonly store: MissionStore;
@@ -224,11 +269,22 @@ export class MissionScheduler {
   private readonly verifyingUnlisted = new Map<string, ProbeResult>();
   /** In-flight runners, retained so mission cancellation can await cleanup. */
   private readonly activeRuns = new Map<string, Set<Promise<void>>>();
+  private readonly lanes: LaneCoordinator;
+  private readonly ownerId: string;
+  /** Cached live lane claims per repo, refreshed at most once per LANE_VIEW_TTL. */
+  private readonly laneView = new Map<string, LaneClaim[]>();
+  private readonly lastLaneViewAt = new Map<string, number>();
+  /** Live lane leases held by tasks, and their next renewal time. */
+  private readonly laneLeases = new Map<string, { lease: LaneLease; nextRenewAt: number }>();
+  private readonly laneRenewInFlight = new Set<string>();
 
   constructor(opts: SchedulerOptions) {
     this.store = opts.store;
     this.broker = opts.broker;
-    this.limits = { ...DEFAULT_LIMITS, ...opts.limits };
+    // Environment-resolved limits are the default so a host running dozens
+    // of missions can raise the caps (PI_ENGINEERING_MAX_*); explicit
+    // opts.limits still win per key.
+    this.limits = { ...resolveSchedulerLimits(), ...opts.limits };
     this.onTaskSettled = opts.onTaskSettled;
     this.onStatus = opts.onStatus;
     // Resolve the time-based resilience config (env-overridable). Resilience is
@@ -245,6 +301,9 @@ export class MissionScheduler {
     this.sleepFn = opts.sleep ?? realSleep;
     this.rand = opts.rand ?? Math.random;
     this.acquireAuthority = opts.acquireAuthority;
+    this.lanes =
+      opts.lanes ?? new InMemoryLaneCoordinator({ config: { backend: "memory", leaseMs: 300_000, maxRepoWriters: 0 } });
+    this.ownerId = opts.ownerId ?? `lane-${Math.random().toString(36).slice(2, 10)}`;
     this.recoveryPlanner = new RecoveryPlanner({
       decisionTtlMs: this.resilience.max_outage_ms,
       ...opts.recovery,
@@ -260,6 +319,7 @@ export class MissionScheduler {
     const tasks = this.store.listTasks(missionId);
     const byId = new Map(tasks.map((t) => [t.task_id, t]));
     const active = [...this.activeTasks.values()];
+    const missionRepository = this.store.getMission(missionId)?.repository ?? "";
     const out: OrchestrationTask[] = [];
     for (const t of tasks) {
       if (t.status !== "PENDING" && t.status !== "READY" && t.status !== "WAITING") continue;
@@ -280,6 +340,7 @@ export class MissionScheduler {
             domainsOverlap(a.write_domains, t.write_domains),
         );
         if (conflict) continue;
+        if (this.laneViewBlocked(t, missionRepository)) continue;
       }
       if (!this.hasCapacity(t)) continue;
       out.push(t);
@@ -336,6 +397,8 @@ export class MissionScheduler {
         if (!mission || mission.status === "CANCELED" || mission.status === "FAILED" || mission.status === "COMPLETE") {
           return;
         }
+        await this.refreshLaneViews(missionId);
+        await this.renewDueLanes();
         const runnable = this.runnable(missionId);
         const terminal = this.store
           .listTasks(missionId)
@@ -353,8 +416,15 @@ export class MissionScheduler {
               .listTasks(missionId)
               .filter((t) => !["SUCCEEDED", "FAILED", "CANCELED", "SKIPPED"].includes(t.status));
             if (blocked.length > 0) {
-              // Deadlock or all deps failed; leave for orchestrator.
-              done = true;
+              // A mutating task waiting on a lane keeps the mission alive: the
+              // conflict may clear as another mission/host renews or releases.
+              // Only a genuine deadlock (no lane dependency) terminates.
+              const missionRepository = this.store.getMission(missionId)?.repository ?? "";
+              const laneWaiting = blocked.some((t) => t.mutates_repo && this.laneViewBlocked(t, missionRepository));
+              if (!laneWaiting) {
+                // Deadlock or all deps failed; leave for orchestrator.
+                done = true;
+              }
             }
           }
           // If active tasks exist, wait for them.
@@ -435,11 +505,160 @@ export class MissionScheduler {
     );
   }
 
+  /**
+   * Refresh cached lane claims for every repo this mission mutates, at most
+   * once per LANE_VIEW_TTL per repo. A transient read failure keeps the stale
+   * view rather than blocking the pass (the durable acquire still enforces).
+   */
+  private async refreshLaneViews(missionId: string): Promise<void> {
+    const mission = this.store.getMission(missionId);
+    if (!mission) return;
+    const repoKeys = new Set<string>();
+    for (const task of this.store.listTasks(missionId)) {
+      if (!task.mutates_repo || task.repo_id === undefined) continue;
+      repoKeys.add(laneRepoKey(task, mission.repository));
+    }
+    const now = this.clockNow();
+    for (const repoKey of repoKeys) {
+      const last = this.lastLaneViewAt.get(repoKey) ?? Number.NEGATIVE_INFINITY;
+      if (now - last < LANE_VIEW_TTL) continue;
+      try {
+        this.laneView.set(repoKey, await this.lanes.listClaims(repoKey));
+        this.lastLaneViewAt.set(repoKey, now);
+      } catch {
+        // Keep the stale view; the durable acquire enforces correctness.
+      }
+    }
+  }
+
+  /** Renew due lane leases (piggybacks the mission pass loop). */
+  private async renewDueLanes(): Promise<void> {
+    const now = this.clockNow();
+    for (const [taskId, entry] of [...this.laneLeases]) {
+      if (entry.nextRenewAt > now || this.laneRenewInFlight.has(taskId)) continue;
+      this.laneRenewInFlight.add(taskId);
+      try {
+        const next = await this.lanes.renew(entry.lease);
+        if (next === null) {
+          // Claim lost (taken over): stop renewing; the owner is gone.
+          this.laneLeases.delete(taskId);
+        } else {
+          this.laneLeases.set(taskId, { lease: next, nextRenewAt: now + this.lanes.leaseMs / 2 });
+        }
+      } catch {
+        // Renewal failure: keep the existing entry and retry next pass.
+      } finally {
+        this.laneRenewInFlight.delete(taskId);
+      }
+    }
+  }
+
+  /**
+   * Cheap pre-check against the cached lane view. Not authoritative — the
+   * durable acquire in runOne is. Own claims (redispatch) never block.
+   */
+  private laneViewBlocked(task: OrchestrationTask, missionRepository: string): boolean {
+    if (!task.mutates_repo) return false;
+    const repoKey = laneRepoKey(task, missionRepository);
+    const claims = this.laneView.get(repoKey) ?? [];
+    const domains = laneDomainsOf(task);
+    const integration = domains.length === 1 && domains[0] === INTEGRATION_DOMAIN;
+    for (const claim of claims) {
+      if (claim.taskId === task.task_id) continue;
+      if (domains.some((d) => laneDomainOverlap(d, claim.domain))) return true;
+    }
+    if (!integration && this.lanes.maxRepoWriters > 0) {
+      const writers = new Set(
+        claims.filter((claim) => claim.domain !== INTEGRATION_DOMAIN).map((claim) => claim.taskId),
+      );
+      if (writers.size >= this.lanes.maxRepoWriters) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Acquire the repo lane for a mutating task. On contention or a corrupt
+   * index the task is left READY to wait (never failed); only unexpected
+   * errors propagate. Returns undefined when the task must wait.
+   */
+  private async tryAcquireLane(task: OrchestrationTask, repoId: string): Promise<LaneLease | undefined> {
+    try {
+      const lease = await this.lanes.acquire({
+        repoId,
+        domains: laneDomainsOf(task),
+        ownerId: this.ownerId,
+        missionId: task.mission_id,
+        taskId: task.task_id,
+      });
+      this.laneLeases.set(task.task_id, { lease, nextRenewAt: this.clockNow() + this.lanes.leaseMs / 2 });
+      this.store.recordLaneEvent("lane.acquired", task.mission_id, {
+        repo_id: repoId,
+        task_id: task.task_id,
+        domains: lease.domains,
+        fence: lease.fence,
+      });
+      return lease;
+    } catch (error) {
+      if (error instanceof LaneBlockedError) {
+        this.store.recordLaneEvent("lane.wait", task.mission_id, {
+          repo_id: repoId,
+          task_id: task.task_id,
+          blocking_claims: error.blockingClaims.map((claim) => ({
+            taskId: claim.taskId,
+            ownerId: claim.ownerId,
+            domain: claim.domain,
+          })),
+        });
+        return undefined;
+      }
+      if (error instanceof LaneIndexCorruptError) {
+        this.store.recordLaneEvent("lane.index_corrupt", task.mission_id, {
+          repo_id: repoId,
+          task_id: task.task_id,
+        });
+        this.store.addFinding({
+          mission_id: task.mission_id,
+          task_id: task.task_id,
+          severity: "blocking",
+          category: "lanes",
+          file: null,
+          line: null,
+          summary: error.message,
+          evidence: null,
+          recommended_action:
+            "Resolve the corrupt lane index (refs/lanes/<repo>) before running more missions on this repo.",
+        });
+        return undefined;
+      }
+      throw error;
+    }
+  }
+
   /** Execute a single task with retry via the broker. */
   private async runOne(task: OrchestrationTask, signal?: AbortSignal): Promise<void> {
+    let lease: LaneLease | undefined;
     try {
+      if (task.mutates_repo) {
+        const mission = this.store.getMission(task.mission_id);
+        const repoId = laneRepoKey(task, mission?.repository ?? "");
+        lease = await this.tryAcquireLane(task, repoId);
+        if (lease === undefined) {
+          // Lane blocked or index corrupt: leave the task READY to wait. The
+          // pass loop re-dispatches it once the conflict clears; never fail a
+          // task purely on lane contention.
+          return;
+        }
+      }
       await this.executeWithRetry(task, signal);
     } finally {
+      if (lease) {
+        this.laneLeases.delete(task.task_id);
+        this.store.recordLaneEvent("lane.released", task.mission_id, {
+          task_id: task.task_id,
+          repo_id: lease.repoId,
+        });
+        await this.lanes.release(lease).catch(() => undefined);
+      }
       // Whatever path ended the task, a terminal task leaves the resilience
       // window (a paused task stays RETRYING and keeps its park).
       const status = this.store.getTask(task.task_id)?.status;

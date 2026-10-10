@@ -7,7 +7,14 @@ import { CheckpointManager } from "../../src/orchestration/checkpoints.ts";
 import { taskCoverageFingerprint } from "../../src/orchestration/evidence.ts";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
 import { MissionOwnership, type OwnershipIdentity } from "../../src/orchestration/ownership.ts";
-import { MissionScheduler, classifyFailure, domainsOverlap } from "../../src/orchestration/scheduler.ts";
+import {
+  DEFAULT_LIMITS,
+  MissionScheduler,
+  type SchedulerLimits,
+  classifyFailure,
+  domainsOverlap,
+  resolveSchedulerLimits,
+} from "../../src/orchestration/scheduler.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 import type { GatewayResilienceConfig } from "../../src/resilience/config.ts";
 import { makeFixtureRepo } from "../fixtures/make-fixture.ts";
@@ -1414,6 +1421,65 @@ describe("failure classifier (spec 02)", () => {
       );
     } finally {
       await fixture.cleanup();
+    }
+  });
+});
+
+describe("scheduler limits configuration", () => {
+  it("keeps the current defaults when no env vars are set", () => {
+    assert.deepEqual(resolveSchedulerLimits({}), DEFAULT_LIMITS);
+  });
+
+  it("resolves operator-configured limits from the environment", () => {
+    const limits = resolveSchedulerLimits({
+      PI_ENGINEERING_MAX_ACTIVE: "12",
+      PI_ENGINEERING_MAX_AGENTS: "6",
+      PI_ENGINEERING_MAX_SUBPROCESSES: "4",
+      PI_ENGINEERING_MAX_PER_ROLE: "3",
+    });
+    assert.deepEqual(limits, { maxActive: 12, maxAgents: 6, maxSubprocesses: 4, maxPerRole: 3 });
+  });
+
+  it("falls back per key on invalid values while valid sibling keys apply", () => {
+    const limits = resolveSchedulerLimits({
+      PI_ENGINEERING_MAX_ACTIVE: "abc",
+      PI_ENGINEERING_MAX_AGENTS: "0",
+      PI_ENGINEERING_MAX_SUBPROCESSES: "-2",
+      PI_ENGINEERING_MAX_PER_ROLE: "3",
+    });
+    assert.equal(limits.maxActive, DEFAULT_LIMITS.maxActive);
+    assert.equal(limits.maxAgents, DEFAULT_LIMITS.maxAgents);
+    assert.equal(limits.maxSubprocesses, DEFAULT_LIMITS.maxSubprocesses);
+    assert.equal(limits.maxPerRole, 3);
+  });
+
+  it("applies env limits to a fresh scheduler, with explicit opts.limits still winning", () => {
+    const keys = [
+      "PI_ENGINEERING_MAX_ACTIVE",
+      "PI_ENGINEERING_MAX_AGENTS",
+      "PI_ENGINEERING_MAX_SUBPROCESSES",
+      "PI_ENGINEERING_MAX_PER_ROLE",
+    ] as const;
+    const saved: Array<[string, string | undefined]> = keys.map((key) => [key, process.env[key]]);
+    process.env.PI_ENGINEERING_MAX_AGENTS = "9";
+    process.env.PI_ENGINEERING_MAX_PER_ROLE = "5";
+    try {
+      const store = MissionStore.open(JsonlEventStore.inMemory());
+      const broker = new ExecutionBroker({ store, backends: {} });
+      const envLimits = (new MissionScheduler({ store, broker }) as unknown as { limits: SchedulerLimits }).limits;
+      assert.equal(envLimits.maxAgents, 9);
+      assert.equal(envLimits.maxPerRole, 5);
+      assert.equal(envLimits.maxActive, DEFAULT_LIMITS.maxActive);
+      const explicitLimits = (
+        new MissionScheduler({ store, broker, limits: { maxAgents: 2 } }) as unknown as { limits: SchedulerLimits }
+      ).limits;
+      assert.equal(explicitLimits.maxAgents, 2, "explicit opts.limits must win over env");
+      assert.equal(explicitLimits.maxPerRole, 5, "env still applies to non-overridden keys");
+    } finally {
+      for (const [key, value] of saved) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
     }
   });
 });

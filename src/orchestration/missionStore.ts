@@ -98,7 +98,12 @@ export type OrchestrationEventType =
   | "spec.review"
   | "spec.approval"
   | "spec.invalidation"
-  | "spec.materialized";
+  | "spec.materialized"
+  | "lane.acquired"
+  | "lane.released"
+  | "lane.wait"
+  | "lane.stale_taken"
+  | "lane.index_corrupt";
 
 const ORCHESTRATION_EVENT_TYPES: ReadonlySet<string> = new Set<OrchestrationEventType>([
   "mission.created",
@@ -153,6 +158,16 @@ const ORCHESTRATION_EVENT_TYPES: ReadonlySet<string> = new Set<OrchestrationEven
   "spec.approval",
   "spec.invalidation",
   "spec.materialized",
+  "lane.acquired",
+  "lane.released",
+  "lane.wait",
+  "lane.stale_taken",
+  "lane.index_corrupt",
+  "lane.acquired",
+  "lane.released",
+  "lane.wait",
+  "lane.stale_taken",
+  "lane.index_corrupt",
 ]);
 
 export interface OrchestrationEvent {
@@ -1632,6 +1647,20 @@ export class MissionStore {
   }
 
   // ── Findings ────────────────────────────────────────────────────────────
+
+  /**
+   * Record a lane coordination event on the mission stream (actor=system).
+   * All lane events are mission-scoped; lane.stale_taken uses the dead
+   * holder's missionId from the claim. Informational — no in-memory state is
+   * rebuilt on replay.
+   */
+  recordLaneEvent(
+    type: "lane.acquired" | "lane.released" | "lane.wait" | "lane.stale_taken" | "lane.index_corrupt",
+    missionId: string,
+    payload: Record<string, unknown>,
+  ): void {
+    this.emit(type, missionId, { actor: "system", ...payload });
+  }
 
   addFinding(finding: Omit<ReviewFinding, "finding_id" | "status" | "created_at">): ReviewFinding {
     const f: ReviewFinding = {
