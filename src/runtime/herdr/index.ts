@@ -2,6 +2,8 @@
 export { HerdrAgentRuntime } from "./HerdrAgentRuntime.ts";
 export type { HerdrAgentRuntimeOptions } from "./HerdrAgentRuntime.ts";
 export { RealHerdrCli, HerdrError } from "./HerdrCli.ts";
+export { ControlPlaneIngest } from "./ControlPlaneIngest.ts";
+export type { ControlPlaneIngestOptions } from "./ControlPlaneIngest.ts";
 export type { HerdrCli, HerdrAgent, HerdrStatus, RealHerdrCliOptions } from "./HerdrCli.ts";
 export { herdrEnsureLocal, detectHerdr } from "./ensureHerdr.ts";
 export type { HerdrEnsureLocalOptions, HerdrEnsureResult, HerdrDetection } from "./ensureHerdr.ts";

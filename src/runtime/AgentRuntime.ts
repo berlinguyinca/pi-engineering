@@ -98,6 +98,8 @@ export type AgentCapability =
 export interface AgentWorkerRequest {
   role: string;
   objective: string;
+  /** Higher-level mission this worker belongs to (control-plane attribution). */
+  missionId?: string;
   /** Requested capabilities; the runtime/InferWeave resolves placement. */
   capabilities?: AgentCapability[];
   /** Isolation requested (worktree vs none). */
@@ -147,6 +149,8 @@ export interface AgentWorker {
   status: AgentStatus;
   role: string;
   objective: string;
+  /** Higher-level mission this worker belongs to (control-plane attribution). */
+  missionId?: string;
   worktree?: string | null;
   model?: string | null;
   created_at: string;
