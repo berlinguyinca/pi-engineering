@@ -23,6 +23,7 @@ import type {
   RuntimeId,
 } from "../AgentRuntime.ts";
 import type { AgentRuntime } from "../AgentRuntime.ts";
+import type { ControlPlaneIngest } from "./ControlPlaneIngest.ts";
 import { type HerdrAgent, type HerdrCli, HerdrError } from "./HerdrCli.ts";
 
 const VERSION = "herdr-0.9.1";
@@ -56,6 +57,12 @@ export interface HerdrAgentRuntimeOptions {
   maxContextTokens?: number;
   /** Agent kind Herdr should start (defaults to the Pi integration kind). */
   agentKind?: string;
+  /**
+   * Optional control-plane emitter (Phase 2). When present, agent/session/
+   * host/mission lifecycle is reported to the Dev Fabric control plane. Off
+   * by default (no emitter = no network).
+   */
+  ingest?: ControlPlaneIngest;
 }
 
 export class HerdrAgentRuntime implements AgentRuntime {
@@ -63,10 +70,13 @@ export class HerdrAgentRuntime implements AgentRuntime {
   private readonly cli: HerdrCli;
   private readonly agentKind: string;
   private readonly records = new Map<RuntimeId, Rec>();
+  private readonly ingest?: ControlPlaneIngest;
 
   constructor(opts: HerdrAgentRuntimeOptions) {
     this.cli = opts.cli;
     this.agentKind = opts.agentKind ?? "pi";
+    this.ingest = opts.ingest;
+    if (this.ingest) void this.ingest.hostRegistered().catch(() => {});
     this.capabilities = {
       name: "herdr",
       version: VERSION,
@@ -103,6 +113,7 @@ export class HerdrAgentRuntime implements AgentRuntime {
       status: "CREATED",
       role: req.role,
       objective: req.objective,
+      missionId: req.missionId,
       worktree: req.worktree ?? null,
       model: req.modelOverride?.id ?? null,
       created_at: now,
@@ -119,6 +130,7 @@ export class HerdrAgentRuntime implements AgentRuntime {
     const rec = this.require(rid);
     await this.provision(rec);
     this.mutate(rec, { status: "READY", currentOperation: "start" });
+    this.emitSession(rec, "session.started", rec.worker.status);
     return rec.worker;
   }
 
@@ -129,6 +141,7 @@ export class HerdrAgentRuntime implements AgentRuntime {
     await this.provision(rec);
     await this.cli.prompt(rec.target, task);
     this.mutate(rec, { status: "WORKING", objective: task, currentOperation: "sendTask", result: null });
+    this.emitSession(rec, "session.updated", "WORKING");
     return rec.worker;
   }
 
@@ -173,6 +186,7 @@ export class HerdrAgentRuntime implements AgentRuntime {
           ? { status: "blocked", summary: "blocked", artifactRefs: [] }
           : { status: "failed", summary: "did not reach a terminal state", artifactRefs: [] };
     this.mutate(rec, { status, currentOperation: "waitFor", result });
+    this.emitSession(rec, "session.updated", status);
     return rec.worker;
   }
 
@@ -184,6 +198,7 @@ export class HerdrAgentRuntime implements AgentRuntime {
       /* best-effort */
     }
     this.mutate(rec, { status: "INTERRUPTED", currentOperation: "interrupt" });
+    this.emitSession(rec, "session.updated", "INTERRUPTED");
     return rec.worker;
   }
 
@@ -196,6 +211,7 @@ export class HerdrAgentRuntime implements AgentRuntime {
       /* best-effort */
     }
     this.mutate(rec, { status: "TERMINATED", currentOperation: "terminate" });
+    this.emitSession(rec, "session.terminated", "TERMINATED");
     return true;
   }
 
@@ -212,6 +228,7 @@ export class HerdrAgentRuntime implements AgentRuntime {
       status = rec.worker.status === "COMPLETED" || rec.worker.status === "TERMINATED" ? rec.worker.status : "LOST";
     }
     this.mutate(rec, { status, currentOperation: "resumeOrReconcile" });
+    this.emitSession(rec, "session.updated", status);
     return rec.worker;
   }
 
@@ -273,5 +290,21 @@ export class HerdrAgentRuntime implements AgentRuntime {
   private mutate(rec: Rec, patch: Partial<AgentWorker>): void {
     rec.worker = { ...rec.worker, ...patch, updated_at: new Date().toISOString() };
     this.records.set(rec.worker.id, rec);
+  }
+
+  /** Fire-and-forget control-plane session event (best-effort, never blocks). */
+  private emitSession(
+    rec: Rec,
+    eventType: "session.started" | "session.updated" | "session.terminated",
+    status: string,
+  ): void {
+    this.ingest
+      ?.session(rec.worker.id, eventType, {
+        missionId: rec.worker.missionId,
+        agentRole: rec.worker.role,
+        model: rec.worker.model ?? undefined,
+        status,
+      })
+      .catch(() => {});
   }
 }

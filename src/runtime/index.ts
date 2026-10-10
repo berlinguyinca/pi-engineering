@@ -11,6 +11,7 @@ export * from "./AgentRuntime.ts";
 export { LegacyAgentRuntime } from "./LegacyAgentRuntime.ts";
 export type { LegacyAgentRuntimeOptions } from "./LegacyAgentRuntime.ts";
 export * from "./herdr/index.ts";
+import type { ControlPlaneIngest } from "./herdr/ControlPlaneIngest.ts";
 
 import type { WorkerExecutor } from "../workers/WorkerExecutor.ts";
 import type { AgentRuntime } from "./AgentRuntime.ts";
@@ -32,6 +33,8 @@ export interface AgentRuntimeSelector {
   herdrMinProtocol?: number;
   /** Agent kind Herdr should start (default "pi"). */
   herdrAgentKind?: string;
+  /** Optional control-plane emitter (Phase 2). Off by default. */
+  herdrIngest?: ControlPlaneIngest;
 }
 
 /**
@@ -50,6 +53,7 @@ export async function createAgentRuntime(sel: AgentRuntimeSelector): Promise<Age
       cli: sel.herdrCli,
       maxContextTokens: sel.maxContextTokens,
       agentKind: sel.herdrAgentKind,
+      ingest: sel.herdrIngest,
     });
   }
   if (!sel.worker) throw new Error("createAgentRuntime requires a worker executor for the legacy runtime");
