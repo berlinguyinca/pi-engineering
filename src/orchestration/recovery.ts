@@ -422,11 +422,12 @@ export class RecoveryPlanner {
     // the next tick, so a capacity park after the deadline carries no deadline:
     // it ends when its condition changes or the operator cancels.
     const parkedDeadline = capacityWait !== undefined && durableDeadline !== undefined && input.now >= durableDeadline;
-    const deadline = durableDeadline === undefined || parkedDeadline ? null : new Date(durableDeadline).toISOString();
+    const durableDeadlineAt = durableDeadline === undefined ? null : new Date(durableDeadline).toISOString();
+    const deadline = parkedDeadline ? null : durableDeadlineAt;
     const budgetReason = missionExhausted
       ? `mission recovery ceiling exhausted (${input.history.length}/${this.missionCeiling})`
       : deadlineExhausted
-        ? `mission recovery deadline exhausted at ${deadline}`
+        ? `mission recovery deadline exhausted at ${durableDeadlineAt}`
         : strategyExhausted
           ? `identical failure fingerprint exhausted its strategy budget (${fingerprintAttempts}/${this.strategyMaxAttempts})`
           : EXPECTED_CHANGE[action];

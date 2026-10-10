@@ -10,10 +10,15 @@ const TERMINAL = new Set(["COMPLETE", "FAILED", "CANCELED"]);
 const TERMINAL_TASK_STATUSES = new Set(["SUCCEEDED", "FAILED", "SKIPPED", "CANCELED"]);
 const WAIT_ACTIONS = new Set(["WAIT_FOR_REQUIREMENT", "PROBE_AND_BACKOFF", "PAUSE_FOR_PERSISTENCE"]);
 
+/**
+ * `PLANNING_EMPTY`: the planner produced no executable work, so only the
+ * operator can say why. `REPAIR_REQUIRED`: every task reached a terminal state
+ * and at least one of them failed, so the work must be requeued, not fenced.
+ */
 export type SupervisorHealth =
   | "HEALTHY"
-  | "ORPHANED" /** The planner produced no executable work: only the operator can say why. */
-  | "PLANNING_EMPTY" /** Every task reached a terminal state with at least one failure. */
+  | "ORPHANED"
+  | "PLANNING_EMPTY"
   | "REPAIR_REQUIRED"
   | "DEADLOCKED"
   | "CONTROLLER_DISCONNECTED"

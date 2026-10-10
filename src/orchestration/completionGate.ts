@@ -332,23 +332,28 @@ export class CompletionGate {
 
     // When no candidate exists it is usually because the work that would have
     // produced it FAILED. Blaming the gate alone hid that: name the first
-    // unresolved failed task and its cause (#112).
-    const unresolvedFailureCause = (() => {
-      const firstFailed = tasks.find(
-        (task) =>
-          task.status === "FAILED" && !validSuperseded.has(task.task_id) && !obsoleteGateAttempts.has(task.task_id),
-      );
-      if (!firstFailed) return "";
-      return `task ${firstFailed.task_id} (${firstFailed.kind}:${firstFailed.role}) failed: ${taskFailureReason(
-        firstFailed,
-        this.store.listExecutions(missionId, firstFailed.task_id),
-        this.store.listFailureClassifications(missionId),
-      )}`;
-    })();
+    // unresolved failed task and its cause (#112). Computed once, and only when
+    // the gate has no candidate at all.
+    const missingCandidateCause =
+      !candidateCurrent && !nestedEvidence && !multiRepoUnsupported
+        ? (() => {
+            const firstFailed = tasks.find(
+              (task) =>
+                task.status === "FAILED" &&
+                !validSuperseded.has(task.task_id) &&
+                !obsoleteGateAttempts.has(task.task_id),
+            );
+            if (!firstFailed) return "";
+            const why = taskFailureReason(
+              firstFailed,
+              this.store.listExecutions(missionId, firstFailed.task_id),
+              this.store.listFailureClassifications(missionId),
+            );
+            return `; task ${firstFailed.task_id} (${firstFailed.kind}:${firstFailed.role}) failed: ${why}`;
+          })()
+        : "";
     const noCandidateProblem = (kind: string): string =>
-      `current ${kind} evidence is unavailable because no candidate is recorded${
-        unresolvedFailureCause ? `; ${unresolvedFailureCause}` : ""
-      }`;
+      `current ${kind} evidence is unavailable because no candidate is recorded${missingCandidateCause}`;
     const reviewProblem = !candidateCurrent
       ? nestedEvidence
         ? undefined
