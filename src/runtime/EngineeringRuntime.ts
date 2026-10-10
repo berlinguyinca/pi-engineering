@@ -37,7 +37,13 @@ import type { OrchestratorOptions, PlanTaskInput } from "../orchestration/orches
 import { MissionOwnership } from "../orchestration/ownership.ts";
 import { missionCustodyKey } from "../orchestration/ownership.ts";
 import { type RouteModel, realBackends } from "../orchestration/realBackends.ts";
-import { FailureClassifier } from "../orchestration/recovery.ts";
+import {
+  DEFAULT_MISSION_RECOVERY_CEILING,
+  DEFAULT_STRATEGY_MAX_ATTEMPTS,
+  FailureClassifier,
+  RecoveryPlanner,
+  type RecoveryPlannerOptions,
+} from "../orchestration/recovery.ts";
 import { RepositoryRegistry } from "../orchestration/repositoryRegistry.ts";
 import { canTransitionMission } from "../orchestration/state.ts";
 import { MissionSupervisor, type SupervisorStatus } from "../orchestration/supervisor.ts";
@@ -46,7 +52,7 @@ import type { Mission, MissionStop } from "../orchestration/types.ts";
 import { WorkspaceManifestResolver } from "../orchestration/workspaceManifest.ts";
 import { tasksConflict, topoSort } from "../plan/taskDag.ts";
 import { redactSecrets } from "../platform/redact.ts";
-import { resolveGatewayResilienceConfig } from "../resilience/config.ts";
+import { type GatewayResilienceConfig, resolveGatewayResilienceConfig } from "../resilience/config.ts";
 import {
   CatalogRecoveryProbe,
   HttpRecoveryProbe,
@@ -221,6 +227,24 @@ function findingsBlock(findings: string[]): string {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * The durable recovery budget, resolved in ONE place from the engineering
+ * policy (#112). The scheduler derived its planner from the resolved gateway
+ * policy while the supervisor ran on built-in defaults, so the two could
+ * disagree about how often one failure may repeat: a saturated gateway produced
+ * two identical fingerprints and the supervisor STOPped the mission the
+ * scheduler was still probing.
+ */
+export function missionRecoveryBudget(resilience: GatewayResilienceConfig): RecoveryPlannerOptions {
+  return {
+    missionCeiling: DEFAULT_MISSION_RECOVERY_CEILING,
+    strategyMaxAttempts: DEFAULT_STRATEGY_MAX_ATTEMPTS,
+    // The same OPT-IN outage ceiling the scheduler applies. Unset by default:
+    // waiting for gateway capacity is bounded by capacity, never by a clock.
+    decisionTtlMs: resilience.max_outage_ms,
+  };
 }
 
 const SUPPORTED_SUPERVISOR_REPAIR_ACTIONS = new Set([
@@ -993,7 +1017,9 @@ export class EngineeringRuntime {
         ];
       };
       const limits = await loadMissionLimits(repoRoot, opts.agentDir);
+      const recoveryBudget = missionRecoveryBudget(rt.resilience);
       rt.orchestrator = new Orchestrator({
+        recovery: recoveryBudget,
         store: rt.missionStore,
         backends,
         worksetPolicy: { maxTaskBudgetMs: limits.max_task_wall_clock_ms },
@@ -1062,6 +1088,9 @@ export class EngineeringRuntime {
       rt.missionSupervisor = new MissionSupervisor({
         store: supervisedStore,
         observability: rt.missionObservability,
+        // The same budget the scheduler plans with: the supervisor and the
+        // scheduler must never disagree about how often one failure repeats.
+        recoveryPlanner: new RecoveryPlanner(recoveryBudget),
         onStatuses: (statuses) => rt.consumeSupervisorStatuses(statuses),
         // Other live sessions in this worktree see the same missions; each
         // mission is supervised only by its custodian, and a dead custodian's

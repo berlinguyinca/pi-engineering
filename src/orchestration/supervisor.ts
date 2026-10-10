@@ -1,16 +1,20 @@
 import { latestTaskCheckpoints } from "./checkpoints.ts";
 import type { MissionStore } from "./missionStore.ts";
 import type { MissionObservability } from "./observability/MissionObservability.ts";
-import { FailureClassifier, RecoveryPlanner } from "./recovery.ts";
+import { FailureClassifier, RecoveryPlanner, taskFailureReason } from "./recovery.ts";
 import { canTransitionMission } from "./state.ts";
 import type { FailureCategory, Mission, OrchestrationTask, RecoveryDecision } from "./types.ts";
 
 const TERMINAL = new Set(["COMPLETE", "FAILED", "CANCELED"]);
+/** Task statuses that occupy no worker and can never become runnable again. */
+const TERMINAL_TASK_STATUSES = new Set(["SUCCEEDED", "FAILED", "SKIPPED", "CANCELED"]);
 const WAIT_ACTIONS = new Set(["WAIT_FOR_REQUIREMENT", "PROBE_AND_BACKOFF", "PAUSE_FOR_PERSISTENCE"]);
 
 export type SupervisorHealth =
   | "HEALTHY"
-  | "ORPHANED"
+  | "ORPHANED" /** The planner produced no executable work: only the operator can say why. */
+  | "PLANNING_EMPTY" /** Every task reached a terminal state with at least one failure. */
+  | "REPAIR_REQUIRED"
   | "DEADLOCKED"
   | "CONTROLLER_DISCONNECTED"
   | "STALLED"
@@ -418,14 +422,41 @@ export class MissionSupervisor {
         task: unresolved,
       };
     }
-    if (!activeExecution) {
+    if (activeExecution) return null;
+    // Nothing is running and nothing is runnable. The CAUSE decides the
+    // recovery; one blanket orphaned-execution STOP used to erase three
+    // different situations, two of which are not orphaned executions (#112).
+    if (tasks.length === 0) {
       return {
-        health: "ORPHANED",
-        category: "ORPHANED_EXECUTION",
-        reason: `Nonterminal mission ${mission.mission_id} has no active worker, runnable task, dependency wait, or named wait`,
+        health: "PLANNING_EMPTY",
+        category: "REQUIREMENT_AMBIGUITY",
+        reason: `Planning produced no tasks for mission ${mission.mission_id}: the operator must confirm or restate what this mission should do`,
       };
     }
-    return null;
+    const failed = tasks.find(
+      (task) => task.status === "FAILED" && !this.store.isTaskSatisfiedBySupersession(task.task_id),
+    );
+    const terminalOnly = tasks.every((task) => TERMINAL_TASK_STATUSES.has(task.status));
+    if (failed && terminalOnly) {
+      // Requeue through the existing supersession/repair machinery: naming the
+      // failed task makes the repair plan create one bounded replacement for it
+      // instead of declaring an ownerless mission and stopping.
+      return {
+        health: "REPAIR_REQUIRED",
+        category: "IMPLEMENTATION_DEFECT",
+        reason: `Task ${failed.task_id} (${failed.kind}:${failed.role}) failed and no task is runnable: ${taskFailureReason(
+          failed,
+          this.store.listExecutions(mission.mission_id, failed.task_id),
+          this.store.listFailureClassifications(mission.mission_id),
+        )}`,
+        task: failed,
+      };
+    }
+    return {
+      health: "ORPHANED",
+      category: "ORPHANED_EXECUTION",
+      reason: `Nonterminal mission ${mission.mission_id} has no active worker, runnable task, dependency wait, or named wait`,
+    };
   }
 
   private status(

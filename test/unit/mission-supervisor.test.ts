@@ -625,4 +625,101 @@ describe("MissionSupervisor", () => {
     await shutdown;
     assert.equal(shutdownSettled, true);
   });
+
+  it("names planning that produced no tasks as an operator question, not an orphan stop", async () => {
+    const h = harness();
+
+    const [status] = await h.supervisor.tick();
+
+    assert.equal(status?.health, "PLANNING_EMPTY");
+    assert.match(status?.reason ?? "", /planning produced no tasks/i);
+    assert.equal(status?.decision?.action, "WAIT_FOR_REQUIREMENT");
+    assert.equal(h.store.listMissionStops(h.mission.mission_id).length, 0, "asking the operator is not a stop");
+    assert.equal(h.store.listFailureClassifications(h.mission.mission_id).at(-1)?.category, "REQUIREMENT_AMBIGUITY");
+  });
+
+  it("requeues the first failed task when every task is terminal", async () => {
+    const h = harness();
+    const failed = h.store.createTask({
+      mission_id: h.mission.mission_id,
+      kind: "agent",
+      role: "implementer",
+      objective: "implement the change",
+      repo_id: "repo-1",
+    });
+    h.store.transitionTask(failed.task_id, "READY");
+    h.store.transitionTask(failed.task_id, "RUNNING");
+    h.store.transitionTask(failed.task_id, "FAILED", "system", {
+      failure_reason: "Worker failed after 5 attempt(s): Connection error.",
+    });
+    const gate = h.store.createTask({
+      mission_id: h.mission.mission_id,
+      kind: "validation",
+      role: "validator",
+      objective: "validate the candidate",
+      depends_on: [failed.task_id],
+      repo_id: "repo-1",
+    });
+    h.store.transitionTask(gate.task_id, "READY");
+    h.store.transitionTask(gate.task_id, "FAILED", "system", { failure_reason: "no candidate to validate" });
+
+    const [status] = await h.supervisor.tick();
+
+    assert.equal(status?.health, "REPAIR_REQUIRED");
+    assert.equal(status?.task, failed.task_id, "the repair names the task to replace, not the mission");
+    assert.equal(status?.decision?.action, "CREATE_REPAIR_TASKS");
+    assert.match(status?.reason ?? "", /Connection error/);
+    assert.equal(h.store.listMissionStops(h.mission.mission_id).length, 0, "a requeue is not a stop");
+    assert.equal(h.store.listFailureClassifications(h.mission.mission_id).at(-1)?.category, "IMPLEMENTATION_DEFECT");
+  });
+
+  it("falls back to the execution outcome when a failed task recorded no reason", async () => {
+    const h = harness();
+    const failed = h.store.createTask({
+      mission_id: h.mission.mission_id,
+      kind: "agent",
+      role: "implementer",
+      objective: "implement the change",
+      repo_id: "repo-1",
+    });
+    h.store.transitionTask(failed.task_id, "READY");
+    const execution = h.store.createExecution({
+      task_id: failed.task_id,
+      backend: "agent",
+      mission_id: h.mission.mission_id,
+    });
+    h.store.transitionTask(failed.task_id, "RUNNING", "system", { assigned_execution_id: execution.execution_id });
+    h.store.setExecutionStatus(execution.execution_id, "FAILED", { exit_status: "connection_closed" });
+    h.store.transitionTask(failed.task_id, "FAILED");
+
+    const [status] = await h.supervisor.tick();
+
+    assert.equal(status?.health, "REPAIR_REQUIRED");
+    assert.match(status?.reason ?? "", new RegExp(`execution ${execution.execution_id} ended connection_closed`));
+    assert.doesNotMatch(status?.reason ?? "", /no reason recorded/);
+  });
+
+  it("keeps fencing a genuinely ownerless running task as an orphaned execution", async () => {
+    const h = harness();
+    const task = h.store.createTask({
+      mission_id: h.mission.mission_id,
+      kind: "agent",
+      role: "implementer",
+      objective: "work with no worker",
+      repo_id: "repo-1",
+    });
+    h.store.transitionTask(task.task_id, "READY");
+    const execution = h.store.createExecution({
+      task_id: task.task_id,
+      backend: "agent",
+      mission_id: h.mission.mission_id,
+    });
+    h.store.transitionTask(task.task_id, "RUNNING", "system", { assigned_execution_id: execution.execution_id });
+    h.store.setExecutionStatus(execution.execution_id, "FAILED", { exit_status: "connection_closed" });
+
+    const [status] = await h.supervisor.tick();
+
+    assert.equal(status?.health, "ORPHANED");
+    assert.equal(status?.decision?.action, "FENCE_RECONCILE_AND_RESUME");
+  });
 });

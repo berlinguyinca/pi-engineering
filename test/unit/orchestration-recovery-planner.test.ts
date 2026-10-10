@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
 import {
+  DEFAULT_MISSION_RECOVERY_CEILING,
+  DEFAULT_STRATEGY_MAX_ATTEMPTS,
   FailureClassifier,
   type FailureEvidence,
   RecoveryPlanner,
@@ -16,6 +18,8 @@ import type {
   WorkspaceManifest,
 } from "../../src/orchestration/types.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
+import { resolveGatewayResilienceConfig } from "../../src/resilience/config.ts";
+import { missionRecoveryBudget } from "../../src/runtime/EngineeringRuntime.ts";
 
 const baseEvidence = (summary: string): FailureEvidence => ({
   missionId: "MSN-recovery",
@@ -337,6 +341,45 @@ describe("RecoveryPlanner", () => {
     assert.equal(replayed.action, "STOP");
     assert.equal(replayed.deadline, "2026-09-27T01:00:00.000Z");
     assert.match(replayed.expectedMaterialChange, /identical failure fingerprint exhausted/i);
+  });
+});
+
+describe("mission recovery budget wiring", () => {
+  it("resolves one budget so the supervisor and the scheduler cannot disagree", () => {
+    const budget = missionRecoveryBudget(resolveGatewayResilienceConfig({}));
+    assert.equal(budget.missionCeiling, DEFAULT_MISSION_RECOVERY_CEILING);
+    assert.equal(budget.strategyMaxAttempts, DEFAULT_STRATEGY_MAX_ATTEMPTS);
+    assert.equal(budget.decisionTtlMs, undefined, "no wall-clock cap unless the policy opts into one");
+    const outage = missionRecoveryBudget(resolveGatewayResilienceConfig({ PI_GATEWAY_MAX_OUTAGE: "30m" }));
+    assert.equal(outage.decisionTtlMs, 30 * 60_000);
+    // Both consumers plan identically from it: the same repeated gateway
+    // failure parks on a probe rather than stopping, wherever it is decided.
+    const classification = new FailureClassifier().classify(baseEvidence("gateway returned 503"));
+    const history = [1, 2].map(
+      (attempt): RecoveryDecision => ({
+        recoveryId: `RCV-outage-${attempt}`,
+        missionId: classification.missionId,
+        classificationId: classification.classificationId,
+        action: "PROBE_AND_BACKOFF",
+        expectedMaterialChange: "observe a healthy provider probe",
+        attempt,
+        maxAttempts: DEFAULT_STRATEGY_MAX_ATTEMPTS,
+        deadline: null,
+        nextActionAt: "2026-09-27T00:00:00.000Z",
+        status: "failed",
+        decidedAt: "2026-09-27T00:00:00.000Z",
+        failureFingerprint: classification.fingerprint,
+      }),
+    );
+    for (const planner of [new RecoveryPlanner(budget), new RecoveryPlanner(budget)]) {
+      const decision = planner.decide({
+        classification,
+        history,
+        now: Date.parse("2026-09-27T00:00:10.000Z"),
+      });
+      assert.equal(decision.action, "PROBE_AND_BACKOFF");
+      assert.equal(decision.maxAttempts, DEFAULT_STRATEGY_MAX_ATTEMPTS);
+    }
   });
 });
 
