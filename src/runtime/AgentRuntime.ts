@@ -126,6 +126,8 @@ export interface AgentWorkerRequest {
   resultTool?: "worker_result" | "review_result";
   /** Opening user message for a fresh session. */
   kickoff?: string;
+  /** pi-engineering mission id this worker belongs to (control-plane ingest). */
+  missionId?: string;
 }
 
 /** Structured, artifact-first worker result (spec 06). */

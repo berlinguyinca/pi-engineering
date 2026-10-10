@@ -24,6 +24,7 @@ import type {
 } from "../AgentRuntime.ts";
 import type { AgentRuntime } from "../AgentRuntime.ts";
 import { type HerdrAgent, type HerdrCli, HerdrError } from "./HerdrCli.ts";
+import type { ControlPlaneIngest } from "./ControlPlaneIngest.ts";
 
 const VERSION = "herdr-0.9.1";
 
@@ -56,16 +57,24 @@ export interface HerdrAgentRuntimeOptions {
   maxContextTokens?: number;
   /** Agent kind Herdr should start (defaults to the Pi integration kind). */
   agentKind?: string;
+  /**
+   * Optional control-plane ingest emitter (Phase 2). Best-effort and
+   * non-blocking; when omitted (or disabled) the runtime emits nothing, so
+   * control-plane reporting is off-by-default.
+   */
+  ingest?: ControlPlaneIngest | null;
 }
 
 export class HerdrAgentRuntime implements AgentRuntime {
   readonly capabilities: AgentCapabilities;
   private readonly cli: HerdrCli;
   private readonly agentKind: string;
+  private readonly ingest: ControlPlaneIngest | null;
   private readonly records = new Map<RuntimeId, Rec>();
 
   constructor(opts: HerdrAgentRuntimeOptions) {
     this.cli = opts.cli;
+    this.ingest = opts.ingest ?? null;
     this.agentKind = opts.agentKind ?? "pi";
     this.capabilities = {
       name: "herdr",
@@ -111,7 +120,10 @@ export class HerdrAgentRuntime implements AgentRuntime {
       result: null,
     };
     // The Herdr target (pane/workspace) is internal and opaque to Pi.
-    this.records.set(worker.id, { worker, request: req, target: worker.id, provisioned: false });
+    const rec: Rec = { worker, request: req, target: worker.id, provisioned: false };
+    this.records.set(worker.id, rec);
+    this.emitSession("created", rec, { role: req.role, isolation: req.isolation ?? null });
+    if (req.missionId) this.ingest?.mission("created", req.missionId, { sessionId: worker.id, role: req.role });
     return worker.id;
   }
 
@@ -119,6 +131,13 @@ export class HerdrAgentRuntime implements AgentRuntime {
     const rec = this.require(rid);
     await this.provision(rec);
     this.mutate(rec, { status: "READY", currentOperation: "start" });
+    this.emitSession("started", rec, { worktree: rec.worker.worktree ?? null });
+    this.ingest?.agent("started", rid, {
+      missionId: rec.request.missionId,
+      sessionId: rid,
+      payload: { worktree: rec.worker.worktree ?? null },
+    });
+    if (rec.request.missionId) this.ingest?.mission("started", rec.request.missionId, { sessionId: rid });
     return rec.worker;
   }
 
@@ -129,6 +148,8 @@ export class HerdrAgentRuntime implements AgentRuntime {
     await this.provision(rec);
     await this.cli.prompt(rec.target, task);
     this.mutate(rec, { status: "WORKING", objective: task, currentOperation: "sendTask", result: null });
+    this.emitSession("working", rec, { objective: task });
+    if (rec.request.missionId) this.ingest?.mission("working", rec.request.missionId, { sessionId: rid });
     return rec.worker;
   }
 
@@ -173,6 +194,10 @@ export class HerdrAgentRuntime implements AgentRuntime {
           ? { status: "blocked", summary: "blocked", artifactRefs: [] }
           : { status: "failed", summary: "did not reach a terminal state", artifactRefs: [] };
     this.mutate(rec, { status, currentOperation: "waitFor", result });
+    this.emitSession(this.waitForAction(status), rec, { status });
+    if (rec.request.missionId) {
+      this.ingest?.mission(this.waitForAction(status), rec.request.missionId, { sessionId: rid, status });
+    }
     return rec.worker;
   }
 
@@ -184,6 +209,8 @@ export class HerdrAgentRuntime implements AgentRuntime {
       /* best-effort */
     }
     this.mutate(rec, { status: "INTERRUPTED", currentOperation: "interrupt" });
+    this.emitSession("interrupted", rec);
+    if (rec.request.missionId) this.ingest?.mission("interrupted", rec.request.missionId, { sessionId: rid });
     return rec.worker;
   }
 
@@ -196,6 +223,12 @@ export class HerdrAgentRuntime implements AgentRuntime {
       /* best-effort */
     }
     this.mutate(rec, { status: "TERMINATED", currentOperation: "terminate" });
+    this.emitSession("terminated", rec);
+    this.ingest?.agent("stopped", rid, {
+      missionId: rec.request.missionId,
+      sessionId: rid,
+    });
+    if (rec.request.missionId) this.ingest?.mission("terminated", rec.request.missionId, { sessionId: rid });
     return true;
   }
 
@@ -212,6 +245,10 @@ export class HerdrAgentRuntime implements AgentRuntime {
       status = rec.worker.status === "COMPLETED" || rec.worker.status === "TERMINATED" ? rec.worker.status : "LOST";
     }
     this.mutate(rec, { status, currentOperation: "resumeOrReconcile" });
+    this.emitSession("reconciled", rec, { status });
+    if (rec.request.missionId) {
+      this.ingest?.mission("reconciled", rec.request.missionId, { sessionId: rid, status });
+    }
     return rec.worker;
   }
 
@@ -224,15 +261,44 @@ export class HerdrAgentRuntime implements AgentRuntime {
   async health(): Promise<AgentHealth> {
     const st = await this.cli.status().catch(() => null);
     const active = [...this.records.values()].filter((r) => r.worker.status === "WORKING").length;
-    return {
+    const health: AgentHealth = {
       runtime: "herdr",
       ok: st?.ok ?? false,
       activeWorkers: active,
       detail: { serverVersion: st?.serverVersion ?? "unreachable", protocol: st?.protocol ?? 0 },
     };
+    this.ingest?.host("heartbeat", {
+      ok: health.ok,
+      activeWorkers: health.activeWorkers,
+      serverVersion: health.detail.serverVersion,
+      protocol: health.detail.protocol,
+    });
+    return health;
   }
 
   // ── internals ──────────────────────────────────────────────────────────────
+
+  /** Emit a session lifecycle event (session = individual agent worker). */
+  private emitSession(action: string, rec: Rec, payload?: Record<string, unknown>): void {
+    this.ingest?.session(action, rec.worker.id, {
+      missionId: rec.request.missionId,
+      payload: { role: rec.worker.role, status: rec.worker.status, ...payload },
+    });
+  }
+
+  /** Map a waitFor terminal status to a control-plane lifecycle action. */
+  private waitForAction(status: AgentStatus): string {
+    switch (status) {
+      case "COMPLETED":
+        return "completed";
+      case "BLOCKED":
+        return "blocked";
+      case "INTERRUPTED":
+        return "interrupted";
+      default:
+        return "failed";
+    }
+  }
 
   private async provision(rec: Rec): Promise<void> {
     if (rec.provisioned) return;
