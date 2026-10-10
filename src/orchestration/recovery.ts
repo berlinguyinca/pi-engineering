@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import type {
+  Execution,
   FailureCategory,
   FailureClassification,
   OrchestrationTask,
@@ -20,6 +21,12 @@ export interface FailureEvidence {
   observedAt?: string;
   category?: FailureCategory;
 }
+
+/** Safety ceiling applied to an identical failure fingerprint by default. */
+export const DEFAULT_STRATEGY_MAX_ATTEMPTS = 8;
+
+/** The mission-wide durable recovery decision ceiling used by default. */
+export const DEFAULT_MISSION_RECOVERY_CEILING = 1_000;
 
 export interface RecoveryPlannerOptions {
   missionCeiling?: number;
@@ -65,6 +72,31 @@ const EXPECTED_CHANGE: Record<RecoveryAction, string> = {
   PAUSE_FOR_PERSISTENCE: "restore durable writes before any further mutation",
   REPAIR_BLOCKED_MISSION: "replace unresolved blocked work through an explicit durable repair plan",
   STOP: "no safe automatic material change is available",
+};
+
+/**
+ * Failures the pipeline can only wait out. Gateway capacity, lost execution
+ * ownership, missing evidence and failed durable writes all become a durable
+ * WAIT/PROBE when the attempt budget runs out: they are never terminal by
+ * COUNT, because on a saturated deployment the identical failure is what
+ * waiting for capacity looks like (issue #112).
+ */
+const CAPACITY_WAIT_ACTIONS: Partial<Record<FailureCategory, RecoveryAction>> = {
+  PROVIDER_TRANSIENT: "PROBE_AND_BACKOFF",
+  PROVIDER_PERMANENT: "PROBE_AND_BACKOFF",
+  ORPHANED_EXECUTION: "PROBE_AND_BACKOFF",
+  EVIDENCE_UNAVAILABLE: "PROBE_AND_BACKOFF",
+  PERSISTENCE_FAILURE: "PAUSE_FOR_PERSISTENCE",
+};
+
+/** Failures no automatic action can resolve: they must ask the operator. */
+const OPERATOR_QUESTIONS: Partial<Record<FailureCategory, string>> = {
+  REQUIREMENT_AMBIGUITY:
+    "operator question: which requirement is authoritative for this mission, and what should it do next?",
+  AUTHORIZATION_OR_CREDENTIAL:
+    "operator question: which credential or authorization must be restored before this mission touches the repository again?",
+  WORKSPACE_SCOPE_MISMATCH:
+    "operator question: which workspace roots and repository roles is this mission authorized to use?",
 };
 
 function hash(value: unknown): string {
@@ -179,6 +211,30 @@ export function replacementRecoveryFingerprint(input: {
   })}`;
 }
 
+/**
+ * Why a task failed, in operator terms. The task's own failure_reason wins;
+ * when none was recorded (the common case in the audited missions) fall back to
+ * the last attempt's execution outcome, then to that task's latest failure
+ * classification. Never returns an empty or placeholder string.
+ */
+export function taskFailureReason(
+  task: Pick<OrchestrationTask, "task_id" | "failure_reason">,
+  executions: ReadonlyArray<Pick<Execution, "execution_id" | "task_id" | "status" | "exit_status">> = [],
+  classifications: ReadonlyArray<Pick<FailureClassification, "taskId" | "category" | "summary">> = [],
+): string {
+  const recorded = task.failure_reason?.trim();
+  if (recorded) return recorded;
+  const attempts = executions.filter((execution) => execution.task_id === task.task_id);
+  const last = [...attempts].reverse().find((execution) => execution.status !== "SUCCEEDED") ?? attempts.at(-1);
+  if (last) {
+    const outcome = [...new Set([last.exit_status?.trim(), last.status].filter((value): value is string => !!value))];
+    return `execution ${last.execution_id} ended ${outcome.join(" ")}`;
+  }
+  const classification = classifications.filter((entry) => entry.taskId === task.task_id).at(-1);
+  if (classification?.summary.trim()) return `${classification.category}: ${classification.summary.trim()}`;
+  return `task ${task.task_id} failed without a recorded reason`;
+}
+
 function normalizedSummary(summary: string): string {
   return summary.trim().toLowerCase().replace(/\s+/g, " ");
 }
@@ -197,9 +253,19 @@ export function failureFingerprint(
   })}`;
 }
 
+/** A lost execution lease: the work is ownerless, whatever the caller believes. */
+const LOST_OWNERSHIP = /no longer authoritative/;
+
 export class FailureClassifier {
   classify(evidence: FailureEvidence): FailureClassification {
-    const category = evidence.category ?? this.inferCategory(evidence);
+    // Ownership loss is never an authorization stop. A caller that supplies a
+    // category (a backend wrapping a fenced execution in its own error) must
+    // not be able to turn "execution EXE-x is no longer authoritative" into an
+    // AUTHORIZATION_OR_CREDENTIAL STOP.
+    const category =
+      evidence.category !== undefined && LOST_OWNERSHIP.test(normalizedSummary(evidence.summary))
+        ? "ORPHANED_EXECUTION"
+        : (evidence.category ?? this.inferCategory(evidence));
     const fingerprint = failureFingerprint({ ...evidence, category });
     return {
       classificationId: `FC-${fingerprint.slice("sha256:".length, "sha256:".length + 20)}`,
@@ -270,12 +336,33 @@ export class FailureClassifier {
     if (/orphan|no owner|stale owner/.test(summary)) return "ORPHANED_EXECUTION";
     if (/deadlock|dependency graph|cyclic dependency/.test(summary)) return "DEADLOCKED_DAG";
     if (/persist|durable write|event store|jsonl/.test(summary)) return "PERSISTENCE_FAILURE";
-    return "PROVIDER_PERMANENT";
+    // Transport-capacity failures carry no status code and no provider word, so
+    // they used to reach the fallback below. They are the most common gateway
+    // saturation signature ("Worker failed after 5 attempt(s): Connection
+    // error.", "Stream ended without finish_reason"), and a capacity failure is
+    // waited out, never stopped (issue #112).
+    if (
+      /connection error|connection closed|stream ended without (?:a )?finish_reason|no worker_result|(?:missing|empty) worker_result/.test(
+        summary,
+      )
+    ) {
+      return "PROVIDER_TRANSIENT";
+    }
+    // Anything unrecognized is assumed recoverable: stopping a mission on an
+    // unknown signature is how capacity blinks killed 259 missions.
+    return "PROVIDER_TRANSIENT";
   }
 }
 
 export class RecoveryPlanner {
   private readonly missionCeiling: number;
+  /**
+   * A SAFETY ceiling on identical-fingerprint attempts, never a terminal
+   * decision by itself: exhausting it parks a failure the pipeline can wait out
+   * on a durable wait/probe, and only asks the operator for a category no
+   * automatic action can resolve. It used to be 2, which turned two identical
+   * gateway-capacity fingerprints into a permanent STOP.
+   */
   private readonly strategyMaxAttempts: number;
   /**
    * OPT-IN recovery deadline. Undefined (the default) means recovery is bounded
@@ -286,8 +373,8 @@ export class RecoveryPlanner {
   private readonly decisionTtlMs: number | undefined;
 
   constructor(options: RecoveryPlannerOptions = {}) {
-    this.missionCeiling = options.missionCeiling ?? 1_000;
-    this.strategyMaxAttempts = options.strategyMaxAttempts ?? 2;
+    this.missionCeiling = options.missionCeiling ?? DEFAULT_MISSION_RECOVERY_CEILING;
+    this.strategyMaxAttempts = options.strategyMaxAttempts ?? DEFAULT_STRATEGY_MAX_ATTEMPTS;
     this.decisionTtlMs = options.decisionTtlMs;
     if (
       this.missionCeiling < 1 ||
@@ -320,22 +407,34 @@ export class RecoveryPlanner {
           : input.now + this.decisionTtlMs;
     const missionExhausted = input.history.length >= this.missionCeiling;
     const deadlineExhausted = durableDeadline !== undefined && input.now >= durableDeadline;
-    // Provider outages already have a durable probe/relaunch/outage budget.
-    // They still consume the mission ceiling, but the generic two-shot schema
-    // repair budget must not truncate a healthy long-outage policy.
-    const strategyExhausted =
-      input.classification.category !== "PROVIDER_TRANSIENT" && fingerprintAttempts >= this.strategyMaxAttempts;
+    const strategyExhausted = fingerprintAttempts >= this.strategyMaxAttempts;
+    const budgetExhausted = missionExhausted || deadlineExhausted || strategyExhausted;
     const defaultAction = RecoveryPlanner.defaultAction(input.classification.category);
-    const action = missionExhausted || deadlineExhausted || strategyExhausted ? "STOP" : defaultAction;
+    // A repeated fingerprint is never terminal by count for a failure the
+    // pipeline can only wait out: the identical fingerprint is what a saturated
+    // gateway looks like while the mission waits for capacity. Those park on a
+    // durable wait/probe (deadline-aware: the wait carries the durable deadline
+    // when the policy configures one) so a later tick resumes them.
+    const capacityWait = CAPACITY_WAIT_ACTIONS[input.classification.category];
+    const action: RecoveryAction = !budgetExhausted ? defaultAction : (capacityWait ?? "STOP");
     const decidedAt = new Date(input.now).toISOString();
-    const deadline = durableDeadline === undefined ? null : new Date(durableDeadline).toISOString();
-    const exhaustedReason = missionExhausted
+    // Parking on an expired deadline would re-diagnose as an expired wait on
+    // the next tick, so a capacity park after the deadline carries no deadline:
+    // it ends when its condition changes or the operator cancels.
+    const parkedDeadline = capacityWait !== undefined && durableDeadline !== undefined && input.now >= durableDeadline;
+    const deadline = durableDeadline === undefined || parkedDeadline ? null : new Date(durableDeadline).toISOString();
+    const budgetReason = missionExhausted
       ? `mission recovery ceiling exhausted (${input.history.length}/${this.missionCeiling})`
       : deadlineExhausted
         ? `mission recovery deadline exhausted at ${deadline}`
         : strategyExhausted
           ? `identical failure fingerprint exhausted its strategy budget (${fingerprintAttempts}/${this.strategyMaxAttempts})`
           : EXPECTED_CHANGE[action];
+    const exhaustedReason = !budgetExhausted
+      ? EXPECTED_CHANGE[action]
+      : capacityWait !== undefined
+        ? `${budgetReason}; the mission parks instead of stopping: ${EXPECTED_CHANGE[capacityWait]}`
+        : (OPERATOR_QUESTIONS[input.classification.category] ?? budgetReason);
     const recoveryHash = hash({
       missionId: input.classification.missionId,
       classificationId: input.classification.classificationId,

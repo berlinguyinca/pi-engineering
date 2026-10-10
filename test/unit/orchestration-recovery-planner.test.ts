@@ -84,6 +84,42 @@ describe("FailureClassifier", () => {
     );
   });
 
+  it("classifies gateway capacity signatures as transient instead of stopping (issue #112)", () => {
+    const classifier = new FailureClassifier();
+    for (const summary of [
+      "Worker failed after 5 attempt(s): Connection error.",
+      "Worker returned no worker_result. Stream ended without finish_reason",
+      "stream ended without a finish_reason",
+      "the transport stream failed: connection closed",
+      // Nothing matches any known signature: an unrecognized failure is waited
+      // out, never stopped.
+      "the worker stopped for a reason this build does not recognize",
+    ]) {
+      assert.equal(classifier.classify(baseEvidence(summary)).category, "PROVIDER_TRANSIENT", summary);
+      assert.equal(RecoveryPlanner.defaultAction("PROVIDER_TRANSIENT"), "PROBE_AND_BACKOFF");
+    }
+  });
+
+  it("never lets a caller-supplied category mask a lost execution lease", () => {
+    const classifier = new FailureClassifier();
+    for (const category of ["AUTHORIZATION_OR_CREDENTIAL", "PROVIDER_PERMANENT", "VALIDATION_FAILED"] as const) {
+      const classification = classifier.classify({
+        ...baseEvidence("backend reported failed: execution EXE-9 is no longer authoritative (CANCELED)"),
+        category,
+      });
+      assert.equal(classification.category, "ORPHANED_EXECUTION", category);
+      assert.equal(RecoveryPlanner.defaultAction(classification.category), "FENCE_RECONCILE_AND_RESUME");
+    }
+    // A real credential failure the caller labeled is still a credential failure.
+    assert.equal(
+      classifier.classify({
+        ...baseEvidence("401 Unauthorized while pushing"),
+        category: "AUTHORIZATION_OR_CREDENTIAL",
+      }).category,
+      "AUTHORIZATION_OR_CREDENTIAL",
+    );
+  });
+
   it("does not read 'authoritative' or 'author' as a credential failure (session review)", () => {
     const classifier = new FailureClassifier();
     for (const summary of [
@@ -193,6 +229,83 @@ describe("RecoveryPlanner", () => {
     assert.equal(stopped.action, "STOP");
     assert.equal(stopped.deadline, second.deadline);
     assert.match(stopped.expectedMaterialChange, /mission recovery ceiling|deadline exhausted/i);
+  });
+
+  it("parks a repeated provider-ish fingerprint instead of stopping (issue #112)", () => {
+    const planner = new RecoveryPlanner({ missionCeiling: 3, strategyMaxAttempts: 2 });
+    const cases: Array<[string, RecoveryAction]> = [
+      ["gateway returned 503", "PROBE_AND_BACKOFF"],
+      ["provider invalid api key", "PROBE_AND_BACKOFF"],
+      ["orphaned execution has no owner", "PROBE_AND_BACKOFF"],
+      ["candidate evidence unavailable", "PROBE_AND_BACKOFF"],
+      ["durable persistence write failed", "PAUSE_FOR_PERSISTENCE"],
+    ];
+    for (const [summary, wait] of cases) {
+      const repeated = new FailureClassifier().classify(baseEvidence(summary));
+      const history = [decision(repeated.fingerprint, 1), decision(repeated.fingerprint, 2)];
+      const parked = planner.decide({
+        classification: repeated,
+        history,
+        now: Date.parse("2026-09-27T00:00:10.000Z"),
+      });
+      assert.equal(parked.action, wait, summary);
+      assert.match(parked.expectedMaterialChange, /parks instead of stopping/i, summary);
+    }
+  });
+
+  it("does not end a mission on the durable outage deadline for a provider-ish failure", () => {
+    const planner = new RecoveryPlanner({ missionCeiling: 1_000, strategyMaxAttempts: 100, decisionTtlMs: 60_000 });
+    const transient = new FailureClassifier().classify(baseEvidence("gateway returned 503"));
+    const history = [decision(transient.fingerprint, 1)];
+    history[0]!.deadline = "2026-09-27T00:00:05.000Z";
+    const parked = planner.decide({
+      classification: transient,
+      history,
+      now: Date.parse("2026-09-27T00:00:10.000Z"),
+    });
+    assert.equal(parked.action, "PROBE_AND_BACKOFF");
+    assert.equal(parked.deadline, null, "a park past its deadline waits on capacity, not on a clock");
+  });
+
+  it("keeps the identical-fingerprint ceiling as a safety net, not a two-shot stop", () => {
+    const planner = new RecoveryPlanner();
+    const history = [decision(classification.fingerprint, 1), decision(classification.fingerprint, 2)];
+    const continuing = planner.decide({
+      classification,
+      history,
+      now: Date.parse("2026-09-27T00:00:10.000Z"),
+    });
+    assert.equal(continuing.action, "CREATE_REPAIR_TASKS");
+    assert.equal(continuing.maxAttempts >= 8, true);
+    const exhausted = planner.decide({
+      classification,
+      history: Array.from({ length: continuing.maxAttempts }, (_, index) =>
+        decision(classification.fingerprint, index + 1),
+      ),
+      now: Date.parse("2026-09-27T00:00:10.000Z"),
+    });
+    assert.equal(exhausted.action, "STOP");
+    assert.match(exhausted.expectedMaterialChange, /identical failure fingerprint exhausted/i);
+  });
+
+  it("turns an exhausted non-automatic failure into an operator question", () => {
+    const planner = new RecoveryPlanner({ missionCeiling: 2, strategyMaxAttempts: 2 });
+    const authorization = new FailureClassifier().classify(baseEvidence("authorization or credential required"));
+    const stopped = planner.decide({
+      classification: authorization,
+      history: [decision(authorization.fingerprint, 1), decision(authorization.fingerprint, 2)],
+      now: Date.parse("2026-09-27T00:00:10.000Z"),
+    });
+    assert.equal(stopped.action, "STOP");
+    assert.match(stopped.expectedMaterialChange, /operator question/i);
+    const ambiguity = new FailureClassifier().classify(baseEvidence("requirement is ambiguous"));
+    const asked = planner.decide({
+      classification: ambiguity,
+      history: [decision(ambiguity.fingerprint, 1), decision(ambiguity.fingerprint, 2)],
+      now: Date.parse("2026-09-27T00:00:10.000Z"),
+    });
+    assert.equal(asked.action, "STOP");
+    assert.match(asked.expectedMaterialChange, /operator question: which requirement/i);
   });
 
   it("replays fingerprint attempts and deadline from the durable store after restart", async () => {
