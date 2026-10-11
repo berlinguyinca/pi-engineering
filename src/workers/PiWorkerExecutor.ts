@@ -428,6 +428,15 @@ export class PiWorkerExecutor implements WorkerExecutor {
       };
     }
 
+    // pi's provider-attribution (isOpenRouterModel) reads `model.baseUrl` and
+    // crashes on undefined. The worker model may arrive without a gateway URL
+    // (only the provider carries it), so attach it before the session's first
+    // provider call to keep attribution off that crash path.
+    if (model && !model.baseUrl) {
+      const providerBaseUrl = (modelRuntime.getProvider(model.provider) as { baseUrl?: string } | undefined)?.baseUrl;
+      if (providerBaseUrl) model = { ...model, baseUrl: providerBaseUrl };
+    }
+
     // Build the base system prompt with the Tool Transition Rule (spec §15).
     // Specialist roles may supply their own prompt wholesale.
     const baseSystemPrompt =
