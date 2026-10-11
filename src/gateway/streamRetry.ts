@@ -137,6 +137,28 @@ export interface GatewayStreamRetryOptions {
   waitingSinceMs?: number;
   /** Status/headers captured for the attempt before the body was flattened. */
   response?: () => Omit<GatewayWaitInput, "text"> | undefined;
+  /**
+   * THE UNIFIED CLASSIFIER SEAM (fault-tolerance spec §7/§21).
+   *
+   * When present, the recovery decision for a failed attempt comes from the
+   * harness's ONE canonical inference-failure classifier (InferWeave metadata
+   * + HTTP status + stream-termination state + network codes) instead of the
+   * text/status parsing below. Returning a signal makes this pump wait that
+   * long and replay; returning `retryable: false` (or undefined with the
+   * parse finding nothing) settles the stream.
+   *
+   * A classifier-supplied wait is honoured EXACTLY: it is the ladder's own
+   * pacing (server `Retry-After` / `retry_after_ms` first, then the retry
+   * policy), so the escalation and interactive-pacing rules below — which can
+   * only ever lengthen a wait derived from text — are not applied on top of it.
+   *
+   * Called for EVERY failed attempt, including one whose output already
+   * reached the sink, so penalties and telemetry see every failure even where
+   * a replay is illegal.
+   */
+  classifyAttempt?: (
+    observed: AttemptObservation<RetryableResult>,
+  ) => GatewayWaitSignal | undefined | Promise<GatewayWaitSignal | undefined>;
   /** Ceiling on a SYNTHESIZED wait. Advertised waits are honoured exactly. */
   maxEscalatedWaitMs?: number;
   /**
@@ -167,6 +189,31 @@ export interface GatewayStreamRetryOptions {
    * before a `.then` on the outcome runs.
    */
   onSettle?(settled: GatewayStreamRetryOutcome["settled"]): void;
+}
+
+/**
+ * Everything the unified classifier needs about one failed attempt.
+ *
+ * The stream-termination state is measured here rather than guessed upstream:
+ * `outputCommitted` is whether assistant output reached the consumer and
+ * `finished` whether a terminal event arrived at all — the two facts that
+ * separate "the model finished" from "the stream was cut after 412 chars".
+ */
+export interface AttemptObservation<R extends RetryableResult> {
+  /** 1-based attempt number within this provider call. */
+  attempt: number;
+  /** Rendered failure text (thrown message, or the result's error message). */
+  text: string;
+  /** HTTP status captured from the response head, when the transport exposed one. */
+  status?: number;
+  /** Response headers captured before the body was flattened. */
+  headers?: Record<string, string>;
+  /** The error the attempt threw, if it threw. */
+  thrown?: unknown;
+  /** The assistant result, when one was produced. */
+  result?: R;
+  /** Termination state of the stream that just ended (spec §3). */
+  streamState: { finished: boolean; outputCommitted: boolean; partialChars?: number };
 }
 
 export interface GatewayStreamRetryOutcome {
@@ -295,11 +342,27 @@ export async function pumpWithGatewayRetry<E extends RetryableEvent, R extends R
     let withheld: E | undefined;
     let result: R | undefined;
     let thrown: unknown;
+    /**
+     * Stream-termination state, measured on the way past (spec §3): did a
+     * terminal event arrive at all, did assistant output reach the consumer,
+     * and how many characters did before the cut. This is what lets the
+     * unified classifier tell "finished" from "cut after 412 chars" without
+     * re-reading a rendered error string.
+     */
+    let outputCommitted = false;
+    let terminalSeen = false;
+    let partialChars = 0;
 
     try {
       const inner = open(attempt);
       for await (const event of inner) {
+        if (event.type === "text_delta" || event.type === "thinking_delta") {
+          const delta = (event as { delta?: unknown }).delta;
+          if (typeof delta === "string") partialChars += delta.length;
+        }
+        if (isAssistantOutputEvent(event.type)) outputCommitted = true;
         if (isTerminal(event.type)) {
+          terminalSeen = true;
           // Terminal events resolve the stream, so they are always the last
           // thing we forward — and a failing one is held until we have decided.
           // Both shapes count: `type: "error"`, and `done` carrying a message
@@ -326,20 +389,48 @@ export async function pumpWithGatewayRetry<E extends RetryableEvent, R extends R
 
     const failure = thrown !== undefined ? errorText(thrown) : (result?.errorMessage ?? "");
     const isAbort = result?.stopReason === "aborted" || opts.signal?.aborted === true;
-    const observed = { ...(opts.response?.() ?? {}), text: failure };
+    const response = opts.response?.();
+    const observed = { ...(response ?? {}), text: failure };
+    const failedAttempt = thrown !== undefined || withheld !== undefined || result?.stopReason === "error";
+    /**
+     * The unified classifier's verdict for this attempt, when a classifier is
+     * installed. Awaited (a fallback selection may consult the capability
+     * router) and asked for EVERY failed attempt — including one whose output
+     * already reached the sink, where a replay is illegal but a penalty, a
+     * breaker trip and the telemetry still belong to the same decision.
+     */
+    const classified =
+      opts.classifyAttempt && failedAttempt && !isAbort
+        ? await opts.classifyAttempt({
+            attempt,
+            text: failure,
+            ...(response?.status !== undefined ? { status: response.status } : {}),
+            ...(response?.headers !== undefined ? { headers: response.headers } : {}),
+            ...(thrown !== undefined ? { thrown } : {}),
+            ...(result !== undefined ? { result } : {}),
+            streamState: { finished: terminalSeen, outputCommitted, ...(partialChars > 0 ? { partialChars } : {}) },
+          })
+        : undefined;
     const guidance = isAbort ? null : parseGatewayWait(observed);
     // A bare transport drop (the gateway restarted under the stream) carries
     // no guidance, but before any visible output it is replay-safe: the
     // caller's own escalating hold, same budget, never after output or abort.
-    const wait = forwarded ? null : (guidance ?? (isAbort ? null : transportDropWait(observed)));
+    const wait = forwarded ? null : (classified ?? guidance ?? (isAbort ? null : transportDropWait(observed)));
     const remainingMs = maxElapsedMs - (now() - startedAt);
-    const escalated = wait ? escalateSyntheticWait(wait, attempt + priorHolds, capMs) : undefined;
+    // A classifier-supplied wait IS the ladder's pacing (server timing first,
+    // then the retry policy): escalating or re-pacing it on top would move a
+    // number the gateway chose. Text-derived waits keep both guards.
+    // Nothing is escalated once output reached the sink: `wait` is null there,
+    // and a decision to replay after committed output would duplicate it.
+    const escalated = wait ? (classified ?? escalateSyntheticWait(wait, attempt + priorHolds, capMs)) : undefined;
     if (escalated && waitingSinceMs === undefined) waitingSinceMs = wallNow();
     const held = escalated
-      ? {
-          ...paceInteractiveWait(escalated, attempt + priorHolds, wallNow() - (waitingSinceMs ?? wallNow()), capMs),
-          waitingSinceMs,
-        }
+      ? classified
+        ? { ...escalated, waitingSinceMs }
+        : {
+            ...paceInteractiveWait(escalated, attempt + priorHolds, wallNow() - (waitingSinceMs ?? wallNow()), capMs),
+            waitingSinceMs,
+          }
       : undefined;
     const longWait = held ? isLongWaitTransient(held) : false;
     const attemptCap = longWait ? maxAttempts : Math.min(maxAttempts, SHORT_TRANSIENT_MAX_ATTEMPTS);

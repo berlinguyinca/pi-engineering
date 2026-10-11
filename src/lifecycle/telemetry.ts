@@ -30,7 +30,8 @@ export type TelemetryEventName =
   | "inference.retry.succeeded"
   | "inference.retry.exhausted"
   | "inference.retry.cancelled"
-  | "inference.fallback.triggered";
+  | "inference.fallback.triggered"
+  | "inference.status";
 
 export interface TelemetryEvent {
   at: string;

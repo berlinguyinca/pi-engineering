@@ -34,6 +34,7 @@ type ModelLike = {
 };
 import type { GatewayWaitInput, GatewayWaitSignal } from "./signals.ts";
 import {
+  type AttemptObservation,
   type AttemptStream,
   type GatewayStreamRetryOptions,
   type RetrySink,
@@ -60,12 +61,12 @@ export interface ProviderHost<M, C, O> {
   getRegisteredNativeProvider?(providerId: string): ProviderLike<M, C, O> | undefined;
 }
 
-interface ProviderResponseLike {
+export interface ProviderResponseLike {
   status: number;
   headers?: Record<string, string>;
 }
 
-interface ProviderResponseOptions<R extends ProviderResponseLike = ProviderResponseLike, M = unknown> {
+export interface ProviderResponseOptions<R extends ProviderResponseLike = ProviderResponseLike, M = unknown> {
   onResponse?: (response: R, model: M) => void | Promise<void>;
 }
 
@@ -145,6 +146,20 @@ export interface InstallDeps<M, O, C = unknown> {
   maxAttempts?: number;
   maxElapsedMs?: number;
   now?: () => number;
+  /**
+   * Per-call unified classifier for the pump (fault-tolerance spec §21/§26,
+   * closes FINDING-XXHroG): asked for EVERY failed attempt; the wait signal
+   * it returns is the pump's ladder pacing (server timing first). Built per
+   * model because the attempt flow is per-model. Omitted, the pump falls
+   * back to its text-derived gateway waits — the pre-arming behaviour.
+   */
+  buildClassifyAttempt?: (
+    model: M,
+  ) =>
+    | ((
+        observed: AttemptObservation<RetryableResult>,
+      ) => GatewayWaitSignal | undefined | Promise<GatewayWaitSignal | undefined>)
+    | undefined;
 }
 
 export type InstallResult =
@@ -263,6 +278,7 @@ export function installGatewayStreamRetry<M, C, O>(
         out.end(aborted);
         return;
       }
+      const classifyAttempt = deps.buildClassifyAttempt?.(model);
       await pumpWithGatewayRetry(
         () => {
           responseCapture = captureGatewayAttemptResponse(
@@ -272,6 +288,7 @@ export function installGatewayStreamRetry<M, C, O>(
         },
         out,
         {
+          ...(classifyAttempt ? { classifyAttempt } : {}),
           hold: (waitSignal, attempt) => {
             consecutiveHolds++;
             waitingSinceMs ??= waitSignal.waitingSinceMs;
