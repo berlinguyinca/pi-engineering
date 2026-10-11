@@ -132,7 +132,7 @@ describe("Integrator stale-base handling (spec 4.4 / R7)", () => {
     });
     const outcome = await integrator.integrate({ objective: "i", baseCommit: "x", handoffs: [handoff] });
     assert.equal(outcome.exitStatus, "succeeded");
-    assert.ok(logs.includes("push-retry " + fx.branch), "push was retried once");
+    assert.ok(logs.includes(`push-retry ${fx.branch}`), "push was retried once");
     const mergeAttempts = logs.filter((l) => l.startsWith("merge")).length;
     assert.ok(mergeAttempts >= 2, `expected at least two merge attempts, got ${mergeAttempts}: ${logs.join(", ")}`);
     const remoteD = await git(fx.origin, "show", `${fx.branch}:src/d.js`).catch(() => "");

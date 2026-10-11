@@ -1480,7 +1480,14 @@ export class GitRepo {
   ): Promise<{ merged: boolean; conflict: boolean; reason: string | null }> {
     const fetchArgs = ["fetch", "--quiet", "--no-tags", "origin", branch];
     this.requireQuery(await this.git(fetchArgs), "mergeOriginBranch", fetchArgs);
-    const r = await this.git(["--no-pager", "merge", "--no-ff", "-m", `integrate origin/${branch}`, `origin/${branch}`]);
+    const r = await this.git([
+      "--no-pager",
+      "merge",
+      "--no-ff",
+      "-m",
+      `integrate origin/${branch}`,
+      `origin/${branch}`,
+    ]);
     if (r.code === 0) return { merged: true, conflict: false, reason: null };
     const conflicted = r.stdout.includes("CONFLICT") || r.stderr.includes("CONFLICT");
     const reason = (r.stderr || r.stdout || "merge failed").split("\n")[0]?.slice(0, 200) ?? "merge failed";
@@ -1503,7 +1510,10 @@ export class GitRepo {
     const args = ["push", `--force-with-lease=${lease}`, "origin", `refs/heads/${branch}`];
     const r = await this.git(args);
     if (r.code === 0) return { ok: true, reason: null };
-    return { ok: false, reason: (r.stderr || r.stdout || "push rejected").split("\n")[0]?.slice(0, 200) ?? "push rejected" };
+    return {
+      ok: false,
+      reason: (r.stderr || r.stdout || "push rejected").split("\n")[0]?.slice(0, 200) ?? "push rejected",
+    };
   }
 
   /** Merge one handoff into an isolated integration candidate, never the incumbent checkout. */
