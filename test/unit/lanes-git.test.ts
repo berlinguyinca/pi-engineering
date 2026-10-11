@@ -47,8 +47,9 @@ async function twoHostFixture(leaseMs = 100, backend: "auto" | "git" = "auto") {
   await git(base, "clone", "-q", origin, "hostB");
   await git(workB, "config", "user.email", "hostB@example.com");
   await git(workB, "config", "user.name", "hostB");
-  const hosts: Record<string, GitRepo> = {};
-  const coordinators: Record<string, GitRefLaneCoordinator> = {};
+  // Both keys are always populated by the loops below before use.
+  const hosts = {} as Record<"hostA" | "hostB", GitRepo>;
+  const coordinators = {} as Record<"hostA" | "hostB", GitRefLaneCoordinator>;
   for (const [name, work] of [
     ["hostA", workA],
     ["hostB", workB],
