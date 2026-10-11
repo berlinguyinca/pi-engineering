@@ -1198,7 +1198,22 @@ export class ExecutionBroker {
   ): Promise<string | null> {
     if (!input.mutatesRepo || input.isolation !== "worktree") return null;
     if (!repository) {
-      throw new Error("Required isolated worktree allocation failed: no git provider is available");
+      // Keep the failing behavior (a mutating task must not run without its
+      // isolated checkout) but name the state that was missing: the generic
+      // message made it impossible to tell a missing workspace-manifest
+      // binding from a missing broker git provider. The "git provider"
+      // wording is preserved — the failure classifier (recordTerminalFailure)
+      // keys off it.
+      const binding = input.repoId
+        ? this.store.getWorkspaceManifest(input.missionId)?.repositories.find((repo) => repo.repoId === input.repoId)
+        : undefined;
+      const detail = [
+        `repoId=${input.repoId ?? "none bound"}`,
+        `manifest binding=${binding ? "present" : "absent"}`,
+        `broker git provider=${this.git ? "present" : "absent"}`,
+        `repository resolver=${this.resolveRepository ? "configured" : "absent"}`,
+      ].join(", ");
+      throw new Error(`Required isolated worktree allocation failed: no git provider is available (${detail})`);
     }
     try {
       // The mission's declared base_ref wins: a mission planned against commit X

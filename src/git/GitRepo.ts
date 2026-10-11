@@ -1457,6 +1457,55 @@ export class GitRepo {
     return { merged: false, conflict: conflicted, reason };
   }
 
+  /**
+   * SHA of a branch head on the shared origin, or null if it does not exist.
+   * The basis for merge-against-current-head (stale-base handling).
+   */
+  async remoteBranchHead(branch: string): Promise<string | null> {
+    const args = ["ls-remote", "origin", `refs/heads/${branch}`];
+    const listing = this.requireQuery(await this.git(args), "remoteBranchHead", args);
+    const line = listing.stdout.trim().split("\n")[0];
+    if (!line) return null;
+    return line.split(/\s+/)[0] || null;
+  }
+
+  /**
+   * Fetch origin's current head of `branch` and merge it into the checkout
+   * (no-ff). Used by the integrator to resolve against current head rather than
+   * a stale base. On conflict the merge is aborted (checkout left immutable).
+   */
+  async mergeOriginBranch(
+    branch: string,
+    guard?: GitMutationGuard,
+  ): Promise<{ merged: boolean; conflict: boolean; reason: string | null }> {
+    const fetchArgs = ["fetch", "--quiet", "--no-tags", "origin", branch];
+    this.requireQuery(await this.git(fetchArgs), "mergeOriginBranch", fetchArgs);
+    const r = await this.git(["--no-pager", "merge", "--no-ff", "-m", `integrate origin/${branch}`, `origin/${branch}`]);
+    if (r.code === 0) return { merged: true, conflict: false, reason: null };
+    const conflicted = r.stdout.includes("CONFLICT") || r.stderr.includes("CONFLICT");
+    const reason = (r.stderr || r.stdout || "merge failed").split("\n")[0]?.slice(0, 200) ?? "merge failed";
+    if (conflicted) {
+      guard?.assertAuthoritative();
+      await this.git(["merge", "--abort"]).catch(() => {});
+    }
+    return { merged: false, conflict: conflicted, reason };
+  }
+
+  /**
+   * Push the local `branch` to origin, guarded against a concurrent advance.
+   * `expectedSha` is the remote head we observed (string) or null to rely on the
+   * freshly-updated remote-tracking ref (retry after a re-merge). A lost race is
+   * NOT an error: resolves ok:false with the git reason so the caller can
+   * refetch/re-merge/retry.
+   */
+  async pushBranch(branch: string, expectedSha: string | null): Promise<{ ok: boolean; reason: string | null }> {
+    const lease = expectedSha === null ? branch : `${branch}:${expectedSha}`;
+    const args = ["push", `--force-with-lease=${lease}`, "origin", `refs/heads/${branch}`];
+    const r = await this.git(args);
+    if (r.code === 0) return { ok: true, reason: null };
+    return { ok: false, reason: (r.stderr || r.stdout || "push rejected").split("\n")[0]?.slice(0, 200) ?? "push rejected" };
+  }
+
   /** Merge one handoff into an isolated integration candidate, never the incumbent checkout. */
   async mergeRefInWorktree(
     candidate: WorktreeInfo,

@@ -367,3 +367,22 @@ export type ValidatableOrchestrationTask = Pick<
   | "deliverables"
   | "execution_budget_ms"
 >;
+
+/** Normalize a write domain: strip trailing slash and a trailing `/**` glob. */
+export function normalizeDomain(d: string): string {
+  return canonicalizeWriteDomain(d).replace(/\/\*\*$/, "");
+}
+
+/** True when two mutating tasks have overlapping write domains. */
+export function domainsOverlap(a: string[], b: string[]): boolean {
+  for (const rawX of a) {
+    for (const rawY of b) {
+      const x = normalizeDomain(rawX);
+      const y = normalizeDomain(rawY);
+      if (x === "**" || y === "**") return true;
+      if (x === y) return true;
+      if (x.startsWith(`${y}/`) || y.startsWith(`${x}/`)) return true;
+    }
+  }
+  return false;
+}

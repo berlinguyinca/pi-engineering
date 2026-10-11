@@ -3862,3 +3862,71 @@ describe("backend failure visibility", () => {
     assert.equal(ex?.summary, "integrated worker/a into main; checks: pass");
   });
 });
+
+describe("worktree allocation diagnostics", () => {
+  it("names the missing provider state when an isolated task has no git provider", async () => {
+    // The old generic message ("no git provider is available") hid which state
+    // was missing, so operators could not tell a missing repository binding
+    // from a missing broker git provider. The allocation must still fail —
+    // with the actual state named.
+    const store = MissionStore.open(JsonlEventStore.inMemory());
+    const mission = store.createMission({
+      title: "no provider",
+      goal: "no provider",
+      user_request: "no provider",
+      repository: process.cwd(),
+      base_ref: "",
+      risk_profile: "low",
+      workflow_class: "engineering",
+    });
+    store.bindWorkspaceManifest({
+      manifestId: "WM-noprov",
+      missionId: mission.mission_id,
+      generation: 1,
+      authorizedRoots: [{ canonicalPath: process.cwd(), source: "launch_cwd", access: "write" }],
+      repositories: [],
+      dependencyEdges: [],
+      hash: "manifest-noprov",
+      createdAt: "2026-09-27T00:00:00.000Z",
+    });
+    const task = store.createTask({
+      mission_id: mission.mission_id,
+      kind: "agent",
+      role: "implementer",
+      objective: "mutate without a provider",
+      mutates_repo: true,
+    });
+    store.transitionTask(task.task_id, "READY");
+    const broker = new ExecutionBroker({
+      store,
+      backends: {
+        agent: {
+          runAgent: async () => {
+            throw new Error("backend must not run: allocation fails first");
+          },
+        },
+      },
+    });
+    const handle = await broker.execute({
+      taskId: task.task_id,
+      missionId: mission.mission_id,
+      kind: "agent",
+      role: "implementer",
+      objective: "mutate without a provider",
+      mutatesRepo: true,
+      isolation: "worktree",
+    });
+    await assert.rejects(
+      () => handle.result(),
+      (error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error);
+        assert.match(message, /no git provider is available/);
+        assert.match(message, /repoId=none bound/);
+        assert.match(message, /manifest binding=absent/);
+        assert.match(message, /broker git provider=absent/);
+        assert.match(message, /repository resolver=absent/);
+        return true;
+      },
+    );
+  });
+});
