@@ -103,6 +103,7 @@ import {
   serverRequestIdFromHeaders,
 } from "./admissionContract.ts";
 import type { AdmissionEvent, AdmissionEventBus, AdmissionEventName } from "./admissionEvents.ts";
+import { currentInferenceInvocation } from "./inferenceContext.ts";
 import { type RetryDelaySource, decideWait, resolveRetryDelay } from "./retryDelay.ts";
 
 /** One provider attempt: the shape of pi-ai's `streamSimple`. */
@@ -575,6 +576,10 @@ export function executeWithAdmissionRetry(
         }
         // Forwarded (non-withheld) error: end `out` so the consumer's iteration
         // and `result()` resolve instead of hanging (mirrors the done case).
+        // Record saturation here too (not only on the withhold/retry path) so the
+        // router keeps its load signal even when admission runs observe-only under
+        // the resilient layer and forwards the rejection instead of retrying it.
+        if (admission) reportSaturation(opts, model, admission);
         const terminal = admission
           ? { ...event.error, errorMessage: augmentInferenceErrorMessage(event.error.errorMessage, admission) }
           : event.error;
@@ -954,16 +959,27 @@ export function createAdmissionStreamSimple(opts: AdmissionTransportOptions): Ad
       // has that shape; the brand is type-only.
       return api.streamSimple(model, context as Parameters<typeof api.streamSimple>[1], options);
     });
-  return (model, context, options) =>
-    executeWithAdmissionRetry(
+  return (model, context, options) => {
+    // When the unified resilient runtime layer is the active retry authority for
+    // this invocation, admission must observe (saturation + gate) but must not
+    // run its own retry loop — otherwise the same rejection is retried twice
+    // (double retry). The resilient layer classifies, waits via the shared
+    // admission gate and retries; admission forwards the terminal error while
+    // still reporting saturation so the router keeps its load signal. The check
+    // is per-invocation, so non-resilient callers (e.g. autoTune, the narrator)
+    // keep full admission retry.
+    const resilientActive = currentInferenceInvocation()?.resilient === true;
+    const effOpts = resilientActive ? { ...opts, config: { ...opts.config, observe_only: true } } : opts;
+    return executeWithAdmissionRetry(
       model,
       context,
       options,
       (attempt, attemptOptions, capture) => {
         const baseFetch: AdmissionFetch = options?.fetch ?? (globalThis.fetch as AdmissionFetch);
-        const fetchImpl = createAdmissionCaptureFetch(capture, baseFetch, opts.config.own_transport_retries);
+        const fetchImpl = createAdmissionCaptureFetch(capture, baseFetch, effOpts.config.own_transport_retries);
         return delegate(model, context, { ...attemptOptions, fetch: fetchImpl });
       },
-      opts,
+      effOpts,
     );
+  };
 }

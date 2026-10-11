@@ -60,7 +60,11 @@ import type { RequiredModelEnvelope } from "./envelope.ts";
 import { envelopeCapabilities, envelopeSatisfied } from "./envelope.ts";
 import type { ClassifiedInferenceFailure, StreamTerminationState } from "./failureClassifier.ts";
 import { classifyInferenceFailure } from "./failureClassifier.ts";
-import type { InferenceInvocation } from "./inferenceContext.ts";
+import {
+  type InferenceInvocation,
+  currentInferenceInvocation,
+  runWithInferenceInvocation,
+} from "./inferenceContext.ts";
 import { metadataFromResponse } from "./inferweaveMetadata.ts";
 import { ModelHealthRegistry } from "./modelHealth.ts";
 import { type ExecutedActionTracker, type RecoveryStep, decideRecoveryStep } from "./recovery.ts";
@@ -771,10 +775,20 @@ export function createResilientStreamSimple<M, C, O>(
             (options ?? {}) as ProviderResponseOptions<ProviderResponseLike, unknown>,
           );
           attemptCapture = capture;
-          return base(
-            sentModel as M,
-            withRetryEvidence(context, attempt > 1 ? flow.evidence() : undefined),
-            capture.options as O,
+          // Mark this invocation as resilient so the admission provider wrapper
+          // (a layer below) observes but does not add a second retry loop — the
+          // unified resilient layer here is the one retry authority. The marker
+          // must cover the provider dispatch, which happens synchronously inside
+          // the runtime's streamSimple call. Preserve any caller invocation
+          // (role/mission/worker identity) already in effect.
+          return runWithInferenceInvocation(
+            { ...(currentInferenceInvocation() ?? {}), resilient: true } as InferenceInvocation,
+            () =>
+              base(
+                sentModel as M,
+                withRetryEvidence(context, attempt > 1 ? flow.evidence() : undefined),
+                capture.options as O,
+              ),
           );
         },
         out,
