@@ -2,7 +2,7 @@ import { execFile, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import type { Dirent } from "node:fs";
 import { access, lstat, mkdir, readFile, readdir, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
-import { basename, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { ExclusiveFileLock } from "../platform/eventstore/fileLock.ts";
 
@@ -1134,6 +1134,9 @@ export class GitRepo {
       // where the runtime was opened.
       const parent = join(this.repoRoot, "..");
       const path = join(parent, `pi-eng-${shortHash(this.repoRoot)}-${branch}`);
+      // Defense in depth: never let stale-cleanup remove the primary checkout or
+      // a path outside this repo's worktree namespace (see assertSafeWorktreePath).
+      this.assertSafeWorktreePath(path);
       await mkdir(parent, { recursive: true }).catch(() => {});
       // Crash recovery: clear any stale worktree or leftover directory at the path.
       guard?.assertAuthoritative();
@@ -1191,6 +1194,26 @@ export class GitRepo {
       await symlink(linkTarget, target);
     } catch (err) {
       void err; // best-effort provisioning; never break worktree creation
+    }
+  }
+
+  /**
+   * Refuse to remove a path that is not one of this repo's own linked
+   * worktrees. Worktrees are SIBLINGS of the repo root named
+   * `pi-eng-<shortHash(repoRoot)>-<branch>`; the primary checkout and any
+   * path outside that namespace must never be removed by worktree cleanup.
+   * Throws so a path-derivation error can never make the orchestrator delete
+   * its own (or another's) primary checkout or `.git`.
+   */
+  private assertSafeWorktreePath(path: string): void {
+    const root = resolve(this.repoRoot);
+    const target = resolve(path);
+    if (target === root) {
+      throw new Error(`refusing to remove the primary checkout: ${target}`);
+    }
+    const prefix = `${join(dirname(root), `pi-eng-${shortHash(root)}`)}-`;
+    if (!target.startsWith(prefix) || target === prefix) {
+      throw new Error(`refusing to remove a path outside the worktree namespace: ${target}`);
     }
   }
 
@@ -1284,20 +1307,24 @@ export class GitRepo {
           const listed = await this.git(["worktree", "list", "--porcelain"], { preserveStdout: true });
           if (listed.code !== 0) throw new Error(`cleanup ownership lookup failed: ${listed.stderr}`);
           const expectedBranch = `refs/heads/${info.branch}`;
-          const exactMapping = listed.stdout
-            .split(/\n\n+/)
-            .some(
-              (entry) =>
-                entry.split("\n").includes(`worktree ${info.path}`) &&
-                entry.split("\n").includes(`branch ${expectedBranch}`),
-            );
-          if (!exactMapping) {
+          const entries = listed.stdout.split(/\n\n+/);
+          const pathEntry = entries.find((entry) => entry.split("\n").includes(`worktree ${info.path}`));
+          if (!pathEntry) {
+            // ORPHANED worktree: the git metadata is gone (e.g. the primary
+            // checkout's `.git/worktrees` was lost). `git worktree list` no
+            // longer sees it, so `git worktree remove` would fail. Recover by
+            // removing the leftover working directory safely, never the primary.
+            this.assertSafeWorktreePath(info.path);
+            guard?.assertAuthoritative();
+            await rm(info.path, { recursive: true, force: true }).catch(() => {});
+          } else if (!pathEntry.split("\n").includes(`branch ${expectedBranch}`)) {
             throw new Error("cleanup ownership does not match an exact repository worktree path and branch mapping");
-          }
-          guard?.assertAuthoritative();
-          const removed = await this.git(["worktree", "remove", "--force", info.path]);
-          if (removed.code !== 0) {
-            throw new Error(`git worktree remove failed for ${info.path}: ${removed.stderr || removed.stdout}`);
+          } else {
+            guard?.assertAuthoritative();
+            const removed = await this.git(["worktree", "remove", "--force", info.path]);
+            if (removed.code !== 0) {
+              throw new Error(`git worktree remove failed for ${info.path}: ${removed.stderr || removed.stdout}`);
+            }
           }
         }
         // Targeted, for the same reason creation is: a global prune here would
