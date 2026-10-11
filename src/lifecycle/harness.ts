@@ -30,6 +30,7 @@ import type { AdmissionInstallReport } from "../inference/admissionInstall.ts";
 import { AdmissionStatusController } from "../inference/admissionStatus.ts";
 import type { AdmissionSaturation } from "../inference/admissionTransport.ts";
 import type { AdmissionBudgetLedger } from "../inference/admissionTransport.ts";
+import { MissionCapacityScheduler } from "../inference/missionCapacityScheduler.ts";
 import { PiWorkerExecutor } from "../workers/PiWorkerExecutor.ts";
 import { LifecycleController } from "./controller.ts";
 import type { ApprovalRequest } from "./controller.ts";
@@ -286,6 +287,17 @@ export class LifecycleHarness {
       policy,
       sessionModel: sessionModelRef,
       overrides: [{ source: "policy.routing.roles", roles: mapRoleOverrides(policy) }],
+    });
+
+    // Production arming (spec §23): the capability pool now exists, so arm
+    // the executor's resilient runtime with capability-based fallback, the
+    // mission capacity park and operator status lines. The install is
+    // idempotent-but-updatable, so this re-arm updates the live runtime.
+    this.executor.rearmResilience({
+      capabilityRegistry: this.registry,
+      roleRouter: this.router,
+      inferenceScheduler: new MissionCapacityScheduler({ registry: () => this.registry }),
+      inferenceStatus: (line) => this.telemetry.emit("inference.status", { line }),
     });
 
     const roles = new PiRoleRunner({

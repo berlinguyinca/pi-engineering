@@ -12,6 +12,7 @@ import {
   resolveTransientRetryConfig,
   withTransientRetry,
 } from "../../src/guard/transient.ts";
+import { classifyInferenceFailure } from "../../src/inference/failureClassifier.ts";
 
 // ─── classifyError ───────────────────────────────────────────────────────────
 
@@ -109,7 +110,9 @@ test("classify: truncated stream (no finish_reason) is retryable", () => {
   const cls = classifyError(new Error("Worker returned no worker_result. Stream ended without finish_reason"));
   assert.equal(cls.category, "network", "a connection truncation, not a server verdict");
   assert.equal(cls.retryable, true);
-  assert.equal(cls.reason, "truncated stream (no finish_reason)");
+  // The unified classifier (incomplete_stream) owns this phrasing now; the
+  // reason carries the canonical class for cross-layer debugging.
+  assert.match(cls.reason ?? "", /incomplete_stream/);
 });
 
 test("classify: numeric status 503 is retryable", () => {
@@ -318,4 +321,43 @@ test("TransientError carries category and attempts", () => {
   assert.equal(e.category, "timeout");
   assert.equal(e.attempts, 2);
   assert.match(e.message, /boom/);
+});
+
+// ─── Cross-layer agreement (fault-tolerance spec: one retryability truth) ───
+// The execution layer (this classifier) and the pump layer (the unified
+// InferenceFailureClass classifier) must agree on what is retryable, and the
+// scheduler bucket (infraCategoryFromWorkerMarker) must be preserved:
+//   rate_limit → RATE_LIMITED, compaction → CONTEXT_RECOVERABLE,
+//   {permanent, model_unavailable, server_error} → failure path,
+//   {server_unavailable, network, timeout} → transient-infrastructure window.
+
+test("classify: agrees with the unified classifier and preserves scheduler buckets", () => {
+  const cases: Array<[unknown, string]> = [
+    [new Error("Worker returned no worker_result. Stream ended without finish_reason"), "network"],
+    [new Error("503 no worker for model"), "server_unavailable"],
+    [{ status: 503, message: "Service Unavailable" }, "server_unavailable"],
+    [{ status: 500, message: "Internal Server Error" }, "server_error"],
+    [{ status: 529, message: "overloaded" }, "rate_limit"],
+    [{ status: 429, message: "Too Many Requests" }, "rate_limit"],
+    [new Error('404: {"code":"model_not_found","message":"model_not_found"}'), "model_unavailable"],
+    [new Error("invalid model name: qwen-typo"), "model_unavailable"],
+    [Object.assign(new Error("invalid model name"), { status: 400 }), "model_unavailable"],
+    [new Error("fetch failed: ECONNRESET"), "network"],
+    [new Error("Request timed out after 30000ms"), "timeout"],
+    [new Error("context overflow: too many tokens"), "compaction"],
+    [{ status: 401, message: "Invalid API key" }, "permanent"],
+    [{ status: 400, message: "messages must not be empty" }, "permanent"],
+  ];
+  for (const [error, expectedCategory] of cases) {
+    const exec = classifyError(error);
+    const unified = classifyInferenceFailure({ error });
+    assert.equal(exec.category, expectedCategory, `category for ${String((error as Error)?.message ?? error)}`);
+    if (unified.class !== "unknown") {
+      assert.equal(
+        exec.retryable,
+        unified.retryable,
+        `retryability agrees with unified ${unified.class} for ${String((error as Error)?.message ?? error)}`,
+      );
+    }
+  }
 });

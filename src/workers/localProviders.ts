@@ -295,6 +295,11 @@ export async function registerLocalProviders(
       models: usable.map((m) => ({
         id: m.id,
         name: m.name ?? m.id,
+        // The gateway URL lives on the provider today, but pi's attribution
+        // header logic (provider-attribution isOpenRouterModel) reads
+        // `model.baseUrl` and crashes on undefined. Carry it on each model so
+        // a worker model call never trips that path.
+        baseUrl: node.baseUrl,
         api: "openai-completions",
         reasoning: m.reasoning ?? false,
         input: m.vision ? (["text", "image"] as ("text" | "image")[]) : (["text"] as ("text" | "image")[]),

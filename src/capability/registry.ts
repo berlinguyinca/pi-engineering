@@ -24,7 +24,9 @@ export interface PenaltyEntry {
   factor: number;
 }
 
-export interface RegistryOptions {
+export const UNAVAILABLE_REASON_PREFIX = "inference-unavailable:";
+
+interface RegistryOptions {
   sources: ModelSource[];
   context: DiscoveryContext;
   /** Persistence path for penalties + last-known inventory ("" disables). */
@@ -47,6 +49,8 @@ interface PersistShape {
   updatedAt: string;
   penalties: PenaltyEntry[];
   inventory: ModelRecord[];
+  /** Temporary inference unavailability (fault-tolerance spec §15). */
+  unavailable?: { ref: ModelRef; until: number; reason: string }[];
 }
 
 export class ModelCapabilityRegistry {
@@ -58,6 +62,8 @@ export class ModelCapabilityRegistry {
 
   private records = new Map<string, ModelRecord>();
   private penalties = new Map<string, PenaltyEntry>();
+  /** Temporary inference-unavailability windows (fault-tolerance spec §15). */
+  private unavailable = new Map<string, { until: number; reason: string }>();
   private lastRefresh = 0;
   private lastSignature = "";
   private refreshPromise: Promise<RefreshResult> | undefined;
@@ -80,6 +86,16 @@ export class ModelCapabilityRegistry {
         const parsed = JSON.parse(await readFile(opts.file, "utf-8")) as PersistShape;
         for (const rec of parsed.inventory ?? []) registry.records.set(modelKey(rec), rec);
         for (const pen of parsed.penalties ?? []) registry.penalties.set(modelKey(pen.ref), pen);
+        const now = Date.now();
+        for (const u of parsed.unavailable ?? []) {
+          if (u.until <= now) continue; // expired while we were down
+          registry.unavailable.set(modelKey(u.ref), { until: u.until, reason: u.reason });
+          const rec = registry.records.get(modelKey(u.ref));
+          if (rec) {
+            rec.available = false;
+            rec.healthReason = `${UNAVAILABLE_REASON_PREFIX}${u.reason}`;
+          }
+        }
         registry.lastSignature = parsed.inventory?.length ? "restored" : "";
       } catch {
         // No usable cache: discovery will repopulate.
@@ -93,6 +109,7 @@ export class ModelCapabilityRegistry {
   }
 
   all(): ModelRecord[] {
+    this.refreshAvailability();
     const now = Date.now();
     return [...this.records.values()].map((rec) => {
       const pen = this.penalties.get(modelKey(rec));
@@ -178,6 +195,66 @@ export class ModelCapabilityRegistry {
     this.persist();
   }
 
+  /**
+   * Mark a model temporarily unselectable until `untilMs` (fault-tolerance
+   * spec §15). The RoleRouter's existing health filter excludes it; on
+   * expiry it automatically becomes eligible again (no permanent pinning).
+   */
+  markUnavailable(ref: ModelRef, untilMs: number, reason: string): void {
+    this.unavailable.set(modelKey(ref), { until: untilMs, reason });
+    const rec = this.records.get(modelKey(ref));
+    if (rec) {
+      rec.available = false;
+      rec.healthReason = `${UNAVAILABLE_REASON_PREFIX}${reason}`;
+    }
+    this.persist();
+  }
+
+  /** Lift a temporary unavailability immediately (e.g. the model served again). */
+  clearUnavailable(ref: ModelRef): void {
+    if (!this.unavailable.delete(modelKey(ref))) return;
+    const rec = this.records.get(modelKey(ref));
+    if (rec) {
+      rec.available = true;
+      if (rec.healthReason?.startsWith(UNAVAILABLE_REASON_PREFIX)) rec.healthReason = undefined;
+    }
+    this.persist();
+  }
+
+  /** The active unavailability window for a model, if any (expired = none). */
+  isUnavailable(ref: ModelRef): { until: number; reason: string } | undefined {
+    const entry = this.unavailable.get(modelKey(ref));
+    if (!entry) return undefined;
+    if (entry.until <= Date.now()) {
+      this.clearUnavailable(ref);
+      return undefined;
+    }
+    return entry;
+  }
+
+  /**
+   * Expire lapsed unavailability windows. Models automatically become
+   * eligible again: no permanent blacklists (fault-tolerance spec §15).
+   * Returns how many windows expired.
+   */
+  refreshAvailability(): number {
+    const now = Date.now();
+    let cleared = 0;
+    for (const [key, entry] of [...this.unavailable]) {
+      if (entry.until <= now) {
+        this.unavailable.delete(key);
+        const rec = this.records.get(key);
+        if (rec) {
+          rec.available = true;
+          if (rec.healthReason?.startsWith(UNAVAILABLE_REASON_PREFIX)) rec.healthReason = undefined;
+        }
+        cleared++;
+      }
+    }
+    if (cleared > 0) this.persist();
+    return cleared;
+  }
+
   activePenalty(ref: ModelRef): PenaltyEntry | undefined {
     const pen = this.penalties.get(modelKey(ref));
     if (!pen) return undefined;
@@ -219,10 +296,17 @@ export class ModelCapabilityRegistry {
     if (!this.file) return;
     const file = this.file;
     const payload: PersistShape = {
-      version: 1,
+      version: 2,
       updatedAt: new Date().toISOString(),
       penalties: [...this.penalties.values()],
       inventory: [...this.records.values()].map((r) => ({ ...r, penalty: 0 })),
+      unavailable: [...this.unavailable].map(([key, entry]) => ({
+        ref: this.records.get(key)
+          ? { provider: this.records.get(key)!.provider, id: this.records.get(key)!.id }
+          : { provider: key.split("/")[0] ?? "", id: key.split("/").slice(1).join("/") },
+        until: entry.until,
+        reason: entry.reason,
+      })),
     };
     const text = JSON.stringify(payload, null, 2);
     const op = this.writeChain.then(async () => {

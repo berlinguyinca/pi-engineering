@@ -65,7 +65,12 @@ async function fixture(): Promise<Fixture> {
 }
 
 /** Create a local handoff branch in the clone and return its WorktreeInfo. */
-async function makeHandoff(fx: Fixture, branch: string, file: string, content: string): Promise<{ worktree: WorktreeInfo }> {
+async function makeHandoff(
+  fx: Fixture,
+  branch: string,
+  file: string,
+  content: string,
+): Promise<{ worktree: WorktreeInfo; summary: string; artifacts: string[] }> {
   const { work } = fx;
   await git(work, "branch", branch, fx.branch);
   await git(work, "checkout", "-q", branch);
@@ -73,7 +78,11 @@ async function makeHandoff(fx: Fixture, branch: string, file: string, content: s
   await git(work, "add", file);
   await git(work, "commit", "-q", "-m", `handoff ${branch}`);
   await git(work, "checkout", "-q", fx.branch);
-  return { worktree: { branch, path: work, name: branch } as WorktreeInfo };
+  return {
+    worktree: { branch, path: work, name: branch } as WorktreeInfo,
+    summary: `handoff ${branch}`,
+    artifacts: [file],
+  };
 }
 
 describe("Integrator stale-base handling (spec 4.4 / R7)", () => {
@@ -123,7 +132,7 @@ describe("Integrator stale-base handling (spec 4.4 / R7)", () => {
     });
     const outcome = await integrator.integrate({ objective: "i", baseCommit: "x", handoffs: [handoff] });
     assert.equal(outcome.exitStatus, "succeeded");
-    assert.ok(logs.includes("push-retry " + fx.branch), "push was retried once");
+    assert.ok(logs.includes(`push-retry ${fx.branch}`), "push was retried once");
     const mergeAttempts = logs.filter((l) => l.startsWith("merge")).length;
     assert.ok(mergeAttempts >= 2, `expected at least two merge attempts, got ${mergeAttempts}: ${logs.join(", ")}`);
     const remoteD = await git(fx.origin, "show", `${fx.branch}:src/d.js`).catch(() => "");

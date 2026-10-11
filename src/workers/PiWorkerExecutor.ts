@@ -26,6 +26,8 @@ import { DEFAULT_ROLLOUT_PHASE, resolveRollout } from "../aps/rollout.ts";
 import { AGENT_LOOP_PREVENTED_EVENT, type AgentProgressSupervisorOptions } from "../aps/supervisor.ts";
 import { type AgentLoopPreventedEvent, DEFAULT_LOOP_PREVENTION } from "../aps/types.ts";
 import { WorkerActivityAdapter } from "../aps/workerActivity.ts";
+import type { ModelCapabilityRegistry } from "../capability/registry.ts";
+import type { RoleRouter } from "../capability/router.ts";
 import { normalizeAgentDir } from "../core/piAgentDir.ts";
 import type { WorkerResult, WorkerRole, WorkerUsage } from "../core/types.ts";
 import type { AdmissionController } from "../gateway/AdmissionController.ts";
@@ -70,6 +72,10 @@ import {
   resolveTransientRetryConfig,
   withTransientRetry,
 } from "../guard/transient.ts";
+import { currentInferenceInvocation, runWithInferenceInvocation } from "../inference/inferenceContext.ts";
+import { ExecutedActionTracker } from "../inference/recovery.ts";
+import { wireResilientModelRuntime } from "../inference/resilientInstall.ts";
+import type { ResilientStreamScheduler } from "../inference/resilientStream.ts";
 import { reviewResultTool } from "../lifecycle/reviewResultTool.ts";
 import { type RequestBodyBudgetConfig, resolveRequestBodyBudgetConfig } from "../request/bodyBudget.ts";
 import { type ThinkingOffConfig, resolveThinkingOffConfig } from "../request/thinkingPolicy.ts";
@@ -159,6 +165,18 @@ export interface PiWorkerExecutorOptions {
    * accept it (src/request/thinkingPolicy.ts). Default: PI_THINKING_OFF_* env.
    */
   thinkingPolicy?: ThinkingOffConfig;
+  /**
+   * Resilient-inference wiring (fault-tolerance spec §21/§23): the capability
+   * registry + RoleRouter arm comparable-model fallback, the scheduler arms the
+   * mission-level WAITING_FOR_INFERENCE_CAPACITY park with automatic resume,
+   * and `inferenceStatus` receives the concise operator-facing status lines.
+   * Omitted, the runtime is still armed with classification, same-model retry
+   * on server timing, penalties and breakers (no fallback pool to select from).
+   */
+  capabilityRegistry?: ModelCapabilityRegistry;
+  roleRouter?: RoleRouter;
+  inferenceScheduler?: ResilientStreamScheduler;
+  inferenceStatus?: (line: string) => void;
   aps?: AgentProgressSupervisorOptions | false;
   /**
    * APS loop PREVENTION (Phase 3, first enforcement): when the supervisor
@@ -219,6 +237,15 @@ export class PiWorkerExecutor implements WorkerExecutor {
   private runtimePromise: Promise<ModelRuntime> | undefined;
   private readonly requestBodyBudget: RequestBodyBudgetConfig;
   private readonly thinkingPolicy: ThinkingOffConfig;
+  /** Resilient-inference seams (capability registry / router / scheduler / status). */
+  // Not readonly: production arming (spec §23) updates these via
+  // rearmResilience() once the capability pool exists.
+  private capabilityRegistry: ModelCapabilityRegistry | undefined;
+  private roleRouter: RoleRouter | undefined;
+  private inferenceScheduler: ResilientStreamScheduler | undefined;
+  private inferenceStatus: ((line: string) => void) | undefined;
+  /** Live tracker per worker run: tool calls already executed (spec §6). */
+  private readonly runActions = new Map<string, ExecutedActionTracker>();
   /** Aggregate recovery telemetry across all worker runs. */
   readonly recoveryTelemetry: RecoveryTelemetry = initialRecoveryTelemetry();
   /** Aggregate transient-error retry telemetry across all worker runs. */
@@ -245,6 +272,68 @@ export class PiWorkerExecutor implements WorkerExecutor {
     this.rollout = resolveRollout(opts.rolloutPhase ?? DEFAULT_ROLLOUT_PHASE);
     this.requestBodyBudget = opts.requestBodyBudget ?? resolveRequestBodyBudgetConfig();
     this.thinkingPolicy = opts.thinkingPolicy ?? resolveThinkingOffConfig();
+    this.capabilityRegistry = opts.capabilityRegistry;
+    this.roleRouter = opts.roleRouter;
+    this.inferenceScheduler = opts.inferenceScheduler;
+    this.inferenceStatus = opts.inferenceStatus;
+  }
+
+  /**
+   * Arm the shared ModelRuntime with the unified resilient layer (spec §21).
+   *
+   * One wrap covers EVERY model invocation of EVERY worker role this executor
+   * runs — planner, scout, implementer, reviewer, specialist reviewer,
+   * challenge, tournament candidate, remediation worker, spec verifier and the
+   * background engineering sessions — because all of them are agent-loop calls
+   * through this runtime. The role/mission/worker identity of each individual
+   * call is resolved from the async invocation context, so concurrent workers
+   * never inherit each other's identity, and no worker implements its own
+   * request-level retry.
+   */
+  private wireResilience(runtime: ModelRuntime): "installed" | "already-installed" | "disabled" {
+    return wireResilientModelRuntime(runtime, {
+      role: "worker",
+      admission: this.admission,
+      ...(this.capabilityRegistry ? { registry: this.capabilityRegistry } : {}),
+      ...(this.roleRouter ? { router: this.roleRouter } : {}),
+      ...(this.inferenceScheduler ? { scheduler: this.inferenceScheduler } : {}),
+      ...(this.inferenceStatus ? { status: this.inferenceStatus } : {}),
+    });
+  }
+
+  /**
+   * Production arming (spec §23): the capability pool (registry + router)
+   * and the mission scheduler are often built AFTER this executor, so the
+   * initial arm at runtime creation carries only what existed at
+   * construction. Call this once the pool is ready: the resilient install
+   * is idempotent but UPDATABLE, so the new registry/router/scheduler/status
+   * take effect on the live runtime without a second wrap — otherwise
+   * selectFallback bails without a registry and the WAITING_FOR_
+   * INFERENCE_CAPACITY park + operator status lines are unreachable in
+   * production.
+   */
+  rearmResilience(patch: {
+    capabilityRegistry?: ModelCapabilityRegistry;
+    roleRouter?: RoleRouter;
+    inferenceScheduler?: ResilientStreamScheduler;
+    inferenceStatus?: (line: string) => void;
+  }): void {
+    if (patch.capabilityRegistry) this.capabilityRegistry = patch.capabilityRegistry;
+    if (patch.roleRouter) this.roleRouter = patch.roleRouter;
+    if (patch.inferenceScheduler) this.inferenceScheduler = patch.inferenceScheduler;
+    if (patch.inferenceStatus) this.inferenceStatus = patch.inferenceStatus;
+    if (!this.runtimePromise) return; // the initial arm will pick the fields up
+    void this.runtimePromise.then((rt) => this.wireResilience(rt)).catch(() => {});
+  }
+
+  /** The idempotency tracker of the run this session belongs to (spec §6). */
+  private trackerFor(req: WorkerRequest): ExecutedActionTracker | undefined {
+    return currentInferenceInvocation()?.actions ?? this.runActions.get(req.sessionId ?? req.role);
+  }
+
+  /** Record an executed tool call; a retry of this request must not repeat it. */
+  private trackAction(req: WorkerRequest, action: { id: string; kind: string; summary: string }): void {
+    this.trackerFor(req)?.record(action);
   }
 
   /** APS observability snapshot (Phase 6) — Grafana-ready metrics. */
@@ -268,6 +357,7 @@ export class PiWorkerExecutor implements WorkerExecutor {
       });
       await registerLocalProviders(rt, { agentDir: this.agentDir }).catch(() => {});
       guardRuntimeRequestBody(rt, this.requestBodyBudget, this.thinkingPolicy);
+      this.wireResilience(rt);
       return rt;
     })();
     return this.runtimePromise;
@@ -283,6 +373,28 @@ export class PiWorkerExecutor implements WorkerExecutor {
   }
 
   async run(req: WorkerRequest): Promise<WorkerRun> {
+    // Every provider call this run makes inherits WHO is calling (role /
+    // mission / worker) and the tracker of the tool calls it already executed,
+    // so the resilient layer can gate fallback by the role's envelope and
+    // inject idempotency evidence into a retried request (spec §6/§23).
+    const actions = new ExecutedActionTracker();
+    this.runActions.set(req.sessionId ?? req.role, actions);
+    try {
+      return await runWithInferenceInvocation(
+        {
+          role: req.role,
+          ...(req.runId ? { missionId: req.runId } : {}),
+          ...(req.sessionId ? { workerId: req.sessionId } : {}),
+          actions,
+        },
+        () => this.runOnce(req),
+      );
+    } finally {
+      this.runActions.delete(req.sessionId ?? req.role);
+    }
+  }
+
+  private async runOnce(req: WorkerRequest): Promise<WorkerRun> {
     const modelRuntime = await this.getModelRuntime();
     let model = this.model;
     // The capability router places a role on a specific provider model. When a
@@ -329,6 +441,15 @@ export class PiWorkerExecutor implements WorkerExecutor {
         usage: null,
         error: "no-model",
       };
+    }
+
+    // pi's provider-attribution (isOpenRouterModel) reads `model.baseUrl` and
+    // crashes on undefined. The worker model may arrive without a gateway URL
+    // (only the provider carries it), so attach it before the session's first
+    // provider call to keep attribution off that crash path.
+    if (model && !model.baseUrl) {
+      const providerBaseUrl = (modelRuntime.getProvider(model.provider) as { baseUrl?: string } | undefined)?.baseUrl;
+      if (providerBaseUrl) model = { ...model, baseUrl: providerBaseUrl };
     }
 
     // Build the base system prompt with the Tool Transition Rule (spec §15).
@@ -523,7 +644,19 @@ ${TOOL_TRANSITION_RULE}`;
       try {
         transientOutcome = await withTransientRetry({
           fn: () =>
-            this.runSingleAttempt(req, model, systemPrompt, modelRuntime, customTools, tools, attempt, guardConfig),
+            this.runSingleAttempt(
+              req,
+              model,
+              // A retry of a generation that already ran tool calls carries the
+              // evidence block: the executed edits/commits are LISTED, never
+              // replayed (spec §6). Nothing is re-executed by the runtime.
+              attempt === 0 ? systemPrompt : withIdempotencyEvidence(systemPrompt, this.trackerFor(req)),
+              modelRuntime,
+              customTools,
+              tools,
+              attempt,
+              guardConfig,
+            ),
           config: this.transientConfig,
           sleep: this.transientSleep,
           rand: this.transientRand,
@@ -1054,6 +1187,18 @@ ${recovery.recoveryPrompt}`;
       const streamed = streaming.note(event as { type?: string; message?: unknown });
       if (streamed) emitWorkerActivity(req, streamed);
       const activity = buildTimer.observe(event, activityFromSessionEvent(event));
+      // Idempotency (spec §6): a tool call that RAN is recorded as executed, so
+      // a retried generation — request-level replay here, or a fresh session
+      // after a transient failure — lists it as already done instead of
+      // repeating the edit, commit, install or shell command.
+      if (event.type === "tool_execution_end") {
+        const id = `${event.toolName}:${toolCalls}:${attempt}`;
+        this.trackAction(req, {
+          id,
+          kind: event.toolName,
+          summary: event.isError ? "attempted and failed — verify before retrying" : "completed successfully",
+        });
+      }
       const activityToolName = "toolName" in event ? event.toolName : undefined;
       if (activity && activityToolName !== terminatingName && activityToolName !== CHECKPOINT_PROGRESS_TOOL_NAME) {
         emitWorkerActivity(req, activity);
@@ -1472,6 +1617,19 @@ export function buildCompactedWorkerPrompt(req: WorkerRequest, recoveryPrompt: s
   parts.push(`- Do not ask questions. Do not emit an assistant answer after calling worker_result.`);
 
   return parts.join("\n");
+}
+
+/**
+ * Append the idempotency notice to a retried generation's prompt (spec §6).
+ *
+ * The notice LISTS the tool calls that already executed and forbids repeating
+ * them; the runtime never replays an action. Idempotent, so a second retry does
+ * not stack a second notice onto the same prompt.
+ */
+export function withIdempotencyEvidence(prompt: string, tracker: ExecutedActionTracker | undefined): string {
+  const evidence = tracker?.evidenceForRetry();
+  if (!evidence || prompt.includes(evidence)) return prompt;
+  return `${prompt}\n\n${evidence}`;
 }
 
 export function workerContext(req: WorkerRequest): string | undefined {
