@@ -33,6 +33,12 @@ export interface InferenceInvocation {
    * the edits/commits of the generation that was cut.
    */
   actions?: ExecutedActionTracker;
+  /**
+   * True when this invocation is being driven by the unified resilient
+   * runtime layer (spec: one canonical retry authority). Admission observes
+   * (saturation + gate) but must not add a second retry loop when set.
+   */
+  resilient?: boolean;
 }
 
 const storage = new AsyncLocalStorage<InferenceInvocation>();
