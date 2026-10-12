@@ -14,7 +14,7 @@
  *                                  [--limit N] [--json] [--quarantine-unreadable]
  */
 import { execFile } from "node:child_process";
-import { readdir, readFile, rename, stat, writeFile } from "node:fs/promises";
+import { readFile, readdir, rename, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -83,7 +83,10 @@ function bump(map: Map<string, number>, key: string): void {
   map.set(key, (map.get(key) ?? 0) + 1);
 }
 
-async function auditRecords(repo: string, quarantine: boolean): Promise<{
+async function auditRecords(
+  repo: string,
+  quarantine: boolean,
+): Promise<{
   dir: string;
   total: number;
   unreadable: string[];
@@ -145,12 +148,16 @@ async function auditRecords(repo: string, quarantine: boolean): Promise<{
         const at = new Date().toISOString().replace(/[:.]/g, "-");
         const target = join(dir, `${name}.stale-${at}`);
         await rename(path, target).catch(() => undefined);
-        await writeFile(`${target}.doctor-note.txt`, `quarantined by mission-doctor: worktree ${recorded} is gone\n`, "utf8");
+        await writeFile(
+          `${target}.doctor-note.txt`,
+          `quarantined by mission-doctor: worktree ${recorded} is gone\n`,
+          "utf8",
+        );
         out.quarantined++;
       }
       continue;
     }
-    if (recorded.startsWith(rootPrefix + "/")) out.thisCheckout++;
+    if (recorded.startsWith(`${rootPrefix}/`)) out.thisCheckout++;
     else out.siblingCheckout++;
   }
   return out;
@@ -220,7 +227,8 @@ async function main(): Promise<number> {
             category?: string;
             summary?: string;
           };
-          if (c.classificationId) classified.set(c.classificationId, { category: c.category ?? "?", summary: c.summary ?? "" });
+          if (c.classificationId)
+            classified.set(c.classificationId, { category: c.category ?? "?", summary: c.summary ?? "" });
         } else if (
           ev.type === "execution.failed" ||
           ev.type === "execution.completed" ||
@@ -236,7 +244,10 @@ async function main(): Promise<number> {
           const d = (payload.decision ?? {}) as { action?: string; classificationId?: string };
           if (d.action === "STOP") {
             const c = classified.get(d.classificationId ?? "");
-            bump(stopReasons, normalize(`${c?.category ?? "?"}: ${c?.summary ?? d.classificationId ?? "?"}`).slice(0, 140));
+            bump(
+              stopReasons,
+              normalize(`${c?.category ?? "?"}: ${c?.summary ?? d.classificationId ?? "?"}`).slice(0, 140),
+            );
           }
         }
       }
@@ -288,16 +299,20 @@ async function main(): Promise<number> {
   );
   console.log(line);
   console.log("How missions ended (worst first):");
-  for (const [reason, count] of ranked(stopReasons).slice(0, args.limit || 12)) console.log(`  ${String(count).padStart(4)}  ${reason}`);
+  for (const [reason, count] of ranked(stopReasons).slice(0, args.limit || 12))
+    console.log(`  ${String(count).padStart(4)}  ${reason}`);
   console.log(line);
   console.log("Failure categories:");
-  for (const [category, count] of ranked(categories).slice(0, args.limit || 12)) console.log(`  ${String(count).padStart(4)}  ${category}`);
+  for (const [category, count] of ranked(categories).slice(0, args.limit || 12))
+    console.log(`  ${String(count).padStart(4)}  ${category}`);
   console.log(line);
   console.log("Execution outcomes:");
-  for (const [outcome, count] of ranked(outcomes).slice(0, args.limit || 12)) console.log(`  ${String(count).padStart(4)}  ${outcome}`);
+  for (const [outcome, count] of ranked(outcomes).slice(0, args.limit || 12))
+    console.log(`  ${String(count).padStart(4)}  ${outcome}`);
   console.log(line);
   console.log("Task failure reasons (top):");
-  for (const [reason, count] of ranked(failures).slice(0, args.limit || 8)) console.log(`  ${String(count).padStart(4)}  ${reason}`);
+  for (const [reason, count] of ranked(failures).slice(0, args.limit || 8))
+    console.log(`  ${String(count).padStart(4)}  ${reason}`);
   console.log(line);
   console.log("Mission time limits in force for this process:");
   console.log(`  max_task_wall_clock_ms:    ${limits.max_task_wall_clock_ms ?? "unset (no cap - correct)"}`);
@@ -322,7 +337,7 @@ async function main(): Promise<number> {
     if (recordAudit.quarantined) console.log(`    quarantined: ${recordAudit.quarantined}`);
     else if (recordAudit.unreadable.length || recordAudit.stalePath.length) {
       console.log(
-        "    These block every resume as \"Corrupt durable ... record\".\n" +
+        '    These block every resume as "Corrupt durable ... record".\n' +
           "    Remedy: re-run with --quarantine-unreadable to move unreadable and\n" +
           "    dangling-worktree records aside (they are renamed, never deleted).",
       );
