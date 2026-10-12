@@ -19,6 +19,18 @@ export interface MissionOwnershipOptions {
    * instead of waiting for the dead owner's lease to expire.
    */
   isOwnerGone?: (ownerId: string) => boolean;
+  /**
+   * How long to WAIT for custody held by another live session before giving up
+   * (default 10 minutes). Contention between concurrent sessions on one machine
+   * is normal, and failing the task on the first failed claim turned ordinary
+   * queueing into a mission-blocking failure. On exhaustion the error names the
+   * holder so the operator can close it or wait, instead of guessing.
+   */
+  custodyWaitMs?: number;
+  /** Interval between custody re-claims while waiting (default 5s). */
+  custodyPollMs?: number;
+  /** Injectable sleep so tests do not wait in real time. */
+  sleep?: (ms: number) => Promise<void>;
 }
 
 export const missionCustodyKey = (missionId: string): string => `mission:${missionId}`;
@@ -49,6 +61,9 @@ export class MissionOwnership {
   private readonly now: () => number;
   private readonly custody: MissionCustody | undefined;
   private readonly isOwnerGone: ((ownerId: string) => boolean) | undefined;
+  private readonly custodyWaitMs: number;
+  private readonly custodyPollMs: number;
+  private readonly sleep: (ms: number) => Promise<void>;
   private readonly missionHolders = new Map<string, number>();
   private readonly repositoryHolders = new Map<string, number>();
 
@@ -67,6 +82,15 @@ export class MissionOwnership {
     this.now = options.now ?? Date.now;
     this.custody = options.custody;
     this.isOwnerGone = options.isOwnerGone;
+    this.custodyWaitMs = options.custodyWaitMs ?? 600_000;
+    this.custodyPollMs = options.custodyPollMs ?? 5_000;
+    if (!Number.isFinite(this.custodyWaitMs) || this.custodyWaitMs < 0) {
+      throw new Error("MissionOwnership custodyWaitMs must be a non-negative number");
+    }
+    if (!Number.isFinite(this.custodyPollMs) || this.custodyPollMs <= 0) {
+      throw new Error("MissionOwnership custodyPollMs must be positive");
+    }
+    this.sleep = options.sleep ?? ((ms) => new Promise<void>((resolve) => setTimeout(resolve, ms).unref?.()));
   }
 
   /** A lease held by another runtime that is provably gone counts as expired. */
@@ -84,9 +108,31 @@ export class MissionOwnership {
   /** Claim custody of a resource and catch up on other sessions' events. */
   private async claimCustody(resource: string, what: string): Promise<void> {
     if (!this.custody) return;
-    const claim = await this.custody.claim(resource);
-    if (!claim.ok) throw new Error(`${what} is in the custody of another live session (${claim.holder})`);
-    this.store.syncExternal();
+    // Contention is queueing, not failure: wait for the other session to release,
+    // then take over. Only an exhausted wait is reported, and it names the holder.
+    // The poll budget is counted as well as timed, so the wait is bounded even
+    // when the injected clock does not advance (tests, frozen timers).
+    const deadline = this.now() + this.custodyWaitMs;
+    const maxPolls = Math.max(1, Math.ceil(this.custodyWaitMs / this.custodyPollMs) + 1);
+    let waitedMs = 0;
+    let holder = "";
+    for (let poll = 0; poll < maxPolls; poll++) {
+      const claim = await this.custody.claim(resource);
+      if (claim.ok) {
+        this.store.syncExternal();
+        return;
+      }
+      holder = claim.holder;
+      if (this.now() >= deadline) break;
+      const pause = Math.min(this.custodyPollMs, Math.max(1, deadline - this.now()));
+      await this.sleep(pause);
+      waitedMs += pause;
+    }
+    throw new Error(
+      `${what} is in the custody of another live session (${holder}). Waited ${Math.round(
+        waitedMs / 1000,
+      )}s for it to release. Close that session (or let it finish) and resume this mission.`,
+    );
   }
 
   private releaseCustody(resource: string): void {

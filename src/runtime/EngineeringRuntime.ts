@@ -1023,6 +1023,10 @@ export class EngineeringRuntime {
         store: rt.missionStore,
         backends,
         worksetPolicy: { maxTaskBudgetMs: limits.max_task_wall_clock_ms },
+        // Re-read `limits` before every mission/resume so an operator edit to
+        // engineering.yaml applies without restarting pi (the caps above are the
+        // snapshot taken at construction).
+        limitsProvider: () => loadMissionLimits(repoRoot, opts.agentDir),
         timeLimits: {
           // The environment override (PI_ENGINEERING_WORKER_INACTIVITY_MS) wins.
           workerInactivityMs: process.env.PI_ENGINEERING_WORKER_INACTIVITY_MS ? undefined : limits.worker_inactivity_ms,
