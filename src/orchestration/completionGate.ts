@@ -2,6 +2,7 @@ import type { NestedRepoPublication } from "../git/GitRepo.ts";
 import { evidenceIdentitiesEqual, hashCandidateEvidenceIdentity, taskCoverageFingerprint } from "./evidence.ts";
 import type { MissionStore } from "./missionStore.ts";
 import { hasAcceptableNestedPublication } from "./nestedPublicationGate.ts";
+import { taskFailureReason } from "./recovery.ts";
 import type { CompletionVerdict, Mission, RequiredGate } from "./types.ts";
 
 export interface GateEvidence {
@@ -329,12 +330,36 @@ export class CompletionGate {
         return `${fenced ? "active" : "active unfenced"} execution ${execution.execution_id} can still mutate candidate state`;
       });
 
+    // When no candidate exists it is usually because the work that would have
+    // produced it FAILED. Blaming the gate alone hid that: name the first
+    // unresolved failed task and its cause (#112). Computed once, and only when
+    // the gate has no candidate at all.
+    const missingCandidateCause =
+      !candidateCurrent && !nestedEvidence && !multiRepoUnsupported
+        ? (() => {
+            const firstFailed = tasks.find(
+              (task) =>
+                task.status === "FAILED" &&
+                !validSuperseded.has(task.task_id) &&
+                !obsoleteGateAttempts.has(task.task_id),
+            );
+            if (!firstFailed) return "";
+            const why = taskFailureReason(
+              firstFailed,
+              this.store.listExecutions(missionId, firstFailed.task_id),
+              this.store.listFailureClassifications(missionId),
+            );
+            return `; task ${firstFailed.task_id} (${firstFailed.kind}:${firstFailed.role}) failed: ${why}`;
+          })()
+        : "";
+    const noCandidateProblem = (kind: string): string =>
+      `current ${kind} evidence is unavailable because no candidate is recorded${missingCandidateCause}`;
     const reviewProblem = !candidateCurrent
       ? nestedEvidence
         ? undefined
         : multiRepoUnsupported
           ? "multi-repository completion requires repository head-vector evidence"
-          : "current review evidence is unavailable because no candidate is recorded"
+          : noCandidateProblem("review")
       : !currentReview
         ? "no current review evidence matches the exact candidate"
         : !currentReview.accessible
@@ -351,7 +376,7 @@ export class CompletionGate {
         ? undefined
         : multiRepoUnsupported
           ? "multi-repository completion requires repository head-vector evidence"
-          : "current validation evidence is unavailable because no candidate is recorded"
+          : noCandidateProblem("validation")
       : !currentValidation
         ? "no current validation evidence matches the exact candidate"
         : !currentValidation.accessible

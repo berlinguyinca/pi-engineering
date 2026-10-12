@@ -18,6 +18,7 @@
 import type { ArtifactStore } from "../artifacts/ArtifactStore.ts";
 import { id } from "../core/ids.ts";
 import { GitRepo } from "../git/GitRepo.ts";
+import type { MissionLimitsConfig } from "../lifecycle/policy.ts";
 import type { EventStoreBackend } from "../platform/eventstore/backend.ts";
 import type { GatewayResilienceConfig } from "../resilience/config.ts";
 import type { RecoveryProbe } from "../resilience/probe.ts";
@@ -175,6 +176,15 @@ export interface OrchestratorOptions {
     inferenceWaiting?: () => boolean;
   };
   /**
+   * Re-reads the operator's mission time limits (engineering.yaml `limits`).
+   * Policy is otherwise snapshotted when the orchestrator is constructed, so
+   * without this an edit to `limits.*` only takes effect after a pi restart —
+   * observed 2026-10-10: a deleted `max_task_wall_clock_ms` kept blocking
+   * missions at exactly its old value for the life of the process. When set, the
+   * orchestrator refreshes the limits before every mission and resume.
+   */
+  limitsProvider?: () => Promise<MissionLimitsConfig>;
+  /**
    * Autonomous spec approval hook (design 2026-09-28). When provided and the
    * routed workflow is a material mutation, the orchestrator runs the durable
    * spec controller to review + approve the exact plan and materializes tasks
@@ -271,7 +281,8 @@ export class Orchestrator {
   private readonly recoveryTaskGenerations = new Map<string, number>();
   private readonly missionRepoIds = new Map<string, string>();
   private readonly worksetPolicy: WorksetPolicy;
-  private readonly maxMissionWallClockMs?: number;
+  private readonly limitsProvider?: () => Promise<MissionLimitsConfig>;
+  private maxMissionWallClockMs?: number;
   private readonly specApproval?: OrchestratorOptions["specApproval"];
   private readonly recoveryPlanner: RecoveryPlanner;
   private readonly failureClassifier = new FailureClassifier();
@@ -285,6 +296,7 @@ export class Orchestrator {
     this.maxRepairRounds = opts.maxRepairRounds ?? 2;
     this.worksetPolicy = { ...DEFAULT_WORKSET_POLICY, ...opts.worksetPolicy };
     this.maxMissionWallClockMs = opts.timeLimits?.maxMissionWallClockMs;
+    this.limitsProvider = opts.limitsProvider;
     this.specApproval = opts.specApproval;
     this.recoveryPlanner = new RecoveryPlanner(opts.recovery);
     const checkpoints = new CheckpointManager({ store: this.store });
@@ -1284,10 +1296,41 @@ export class Orchestrator {
   /**
    * Full automatic engineering workflow from a normal-language request.
    */
+  /**
+   * Refresh the mission time limits from policy so an operator's edit to
+   * `~/.pi/agent/engineering.yaml` (or `.pi/engineering.yaml`) applies to the
+   * next mission without restarting pi. A failing provider is ignored: the
+   * process keeps the limits it started with rather than losing all caps.
+   */
+  async refreshMissionLimits(): Promise<void> {
+    if (!this.limitsProvider) return;
+    try {
+      const limits = await this.limitsProvider();
+      this.worksetPolicy.maxTaskBudgetMs = limits.max_task_wall_clock_ms;
+      this.maxMissionWallClockMs = limits.max_mission_wall_clock_ms;
+      // The environment override owns the hung-worker window when it is set.
+      if (!process.env.PI_ENGINEERING_WORKER_INACTIVITY_MS && Number.isFinite(limits.worker_inactivity_ms)) {
+        this.broker.setInactivityTimeoutMs(limits.worker_inactivity_ms);
+      }
+    } catch {
+      // Keep the limits this process started with.
+    }
+  }
+
+  /** The mission time limits currently in force (for status and diagnostics). */
+  currentTimeLimits(): { maxTaskBudgetMs?: number; maxMissionWallClockMs?: number; workerInactivityMs: number } {
+    return {
+      maxTaskBudgetMs: this.worksetPolicy.maxTaskBudgetMs,
+      maxMissionWallClockMs: this.maxMissionWallClockMs,
+      workerInactivityMs: this.broker.inactivityTimeout,
+    };
+  }
+
   async orchestrate(
     request: string,
     options: OrchestrateOptions = { repository: ".", baseRef: "" },
   ): Promise<OrchestrateResult> {
+    await this.refreshMissionLimits();
     const run = interruptibleRun(options.signal, options.interrupt);
     this.runControllers.set(run.signal, run.controller);
     this.pauseHooks.set(run.controller, run.onPause);
@@ -1963,6 +2006,7 @@ export class Orchestrator {
     missionId: string,
     options?: { force?: boolean; signal?: AbortSignal; interrupt?: InterruptMode },
   ): Promise<Mission> {
+    await this.refreshMissionLimits();
     const run = interruptibleRun(options?.signal, options?.interrupt);
     run.onPause(() => this.store.markOperatorPause(missionId));
     this.liveRuns.set(missionId, run.controller);

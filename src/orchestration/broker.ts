@@ -487,7 +487,7 @@ export class ExecutionBroker {
   private readonly store: MissionStore;
   private readonly backends: BrokerBackends;
   private readonly defaultTimeoutMs: number | undefined;
-  private readonly inactivityTimeoutMs: number;
+  private inactivityTimeoutMs: number;
   private readonly inferenceWaiting: () => boolean;
   private readonly git: GitRepo | null;
   private readonly baseRef: string;
@@ -1021,6 +1021,26 @@ export class ExecutionBroker {
    * rather than poking the store, otherwise the runner keeps going, the worktree
    * leaks, and the eventual result overwrites CANCELED with SUCCEEDED.
    */
+  /**
+   * Apply an operator's hung-worker window at runtime. Engineering policy is
+   * read once when the orchestrator is built, so an edit to
+   * `limits.worker_inactivity_ms` would otherwise need a pi restart; the
+   * orchestrator calls this on each mission start after reloading policy.
+   * An explicit PI_ENGINEERING_WORKER_INACTIVITY_MS still wins (the caller
+   * skips this call when the environment override is set).
+   */
+  setInactivityTimeoutMs(ms: number): void {
+    if (!Number.isFinite(ms) || ms <= 0) {
+      throw new Error("ExecutionBroker inactivityTimeoutMs must be finite and positive");
+    }
+    this.inactivityTimeoutMs = ms;
+  }
+
+  /** The hung-worker window currently in force (diagnostics). */
+  get inactivityTimeout(): number {
+    return this.inactivityTimeoutMs;
+  }
+
   async cancelExecution(executionId: string, taskId?: string, opts: { resumable?: boolean } = {}): Promise<boolean> {
     const entry = this.active.get(executionId);
     if (!entry) return false;

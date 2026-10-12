@@ -7,6 +7,7 @@
 import { formatWaitingFor } from "../gateway/admissionNotice.ts";
 import { latestTaskCheckpoints } from "../orchestration/checkpoints.ts";
 import type { MissionStore } from "../orchestration/missionStore.ts";
+import { taskFailureReason } from "../orchestration/recovery.ts";
 import { describeMissionControl } from "../runtime/operatorModelPin.ts";
 
 const MAX_ITEMS = 5;
@@ -83,7 +84,13 @@ export function missionReportLines(store: MissionStore, missionId: string): stri
   if (failed.length > 0) {
     lines.push(`Failed tasks (${failed.length}):`);
     for (const task of failed.slice(-MAX_ITEMS)) {
-      const reason = (task as { failure_reason?: string | null }).failure_reason ?? "no reason recorded";
+      // Never "no reason recorded": a task that recorded none still has an
+      // execution outcome and a failure classification to name (#112).
+      const reason = taskFailureReason(
+        task,
+        store.listExecutions(missionId),
+        store.listFailureClassifications(missionId),
+      );
       lines.push(`  - ${task.task_id} ${task.kind}:${task.role} "${clip(task.objective, 80)}": ${clip(reason, 200)}`);
     }
   }

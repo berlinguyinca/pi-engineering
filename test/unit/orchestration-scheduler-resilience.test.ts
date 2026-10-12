@@ -562,11 +562,15 @@ describe("MissionScheduler resilience (time-based gateway window)", () => {
       return { store, m, t, scheduler };
     }
 
-    it("recovery STOP on a transient outcome", async () => {
+    // Contract change (issue #112): an exhausted recovery budget is no longer
+    // terminal for a failure the pipeline can only wait out. On a saturated
+    // gateway the identical transient fingerprint IS the wait, so the task stays
+    // retryable and the mission parks on infrastructure instead of failing.
+    it("exhausted recovery budget parks a transient outcome instead of failing it", async () => {
       const h = parked(async () => transientOutcome(), { recovery: { missionCeiling: 1 } });
       await h.scheduler.runMission(h.m.mission_id);
-      assert.equal(h.store.getTask(h.t.task_id)!.status, "FAILED");
-      assert.equal(h.store.getMission(h.m.mission_id)!.status, "EXECUTING");
+      assert.equal(h.store.getTask(h.t.task_id)!.status, "RETRYING");
+      assert.equal(h.store.getMission(h.m.mission_id)!.status, "PAUSED_INFRASTRUCTURE");
     });
 
     it("recovery STOP on a thrown failure after the mission parked", async () => {
