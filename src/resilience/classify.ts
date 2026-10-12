@@ -68,6 +68,15 @@ const CONTEXT_WORDING =
 const MODEL_STATES =
   /(relocat|load|cold[_ -]?start|unload|drain|restart|starting[_ -]?up|no[_ -]?worker|worker[_ -]?(down|restarting)|scheduler|placement|spinning[_ -]?up)/i;
 
+/** Node errno codes that indicate a local storage/disk condition (recoverable). */
+const STORAGE_CODES = new Set(["ENOSPC", "ENOMEM", "EIO", "EFBIG", "EROFS", "EDQUOT"]);
+
+function isStorageError(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const code = (error as { code?: unknown }).code;
+  return typeof code === "string" && STORAGE_CODES.has(code);
+}
+
 function extractStatus(error: unknown): number | null {
   if (error && typeof error === "object") {
     const e = error as {
@@ -240,6 +249,22 @@ export function classifyInfraError(error: unknown): InfraErrorClass {
       scheduler_state: scheduler_state ?? "model_transition",
       request_id,
       reason: "model loading / relocation",
+    };
+  }
+
+  // Local storage / disk errors (ENOSPC 'no space left on device', ENOMEM,
+  // EIO, EFBIG, EROFS, EDQUOT). These are infrastructure failures that become
+  // retryable once the disk recovers; they must NOT fall through to a terminal
+  // FAILED (which is unrecoverable). The supervisor parks and retries within the
+  // window; the write is retried once space frees.
+  if (isStorageError(error) || has("no space left on device", "enospc", "disk full", "storage")) {
+    return {
+      category: "TRANSIENT_INFRASTRUCTURE",
+      retryable: true,
+      retryAfterMs,
+      scheduler_state,
+      request_id,
+      reason: "storage / disk space",
     };
   }
 

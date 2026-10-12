@@ -131,6 +131,15 @@ export interface EngineerReport {
   telemetry: Telemetry;
 }
 
+/** Max in-call snapshot publish retries before surfacing the diagnostic. */
+const SNAPSHOT_PUBLISH_MAX_RETRIES = 4;
+/** Base backoff (ms) between snapshot publish retries; grows linearly (~1s total). */
+const SNAPSHOT_PUBLISH_BACKOFF_MS = 100;
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolveDelay) => setTimeout(resolveDelay, ms));
+}
+
 /** Read-only tool allowlist (scout/reviewer/challenger). */
 const READ_ONLY_TOOLS = ["read", "grep", "find", "ls"];
 /** Implementation tool allowlist. */
@@ -551,6 +560,7 @@ export class EngineeringRuntime {
   private currentPhaseGoal = "";
   private snapshotPublishPending: Promise<MissionSnapshotFile | null> | null = null;
   private snapshotPublishDirty = false;
+  private snapshotPublishRetries = 0;
   /** This runtime's mission-ownership identity (`session-<session-id>-<uuid>`). */
   private ownershipId: string | null = null;
   /** In-process key of the orchestration namespace this runtime shares. */
@@ -621,11 +631,25 @@ export class EngineeringRuntime {
             await unlink(temporary).catch(() => undefined);
             throw error;
           }
+          // A successful publish resets the in-call retry counter so the next
+          // failure starts fresh instead of inheriting an elevated backoff.
+          this.snapshotPublishRetries = 0;
         } catch {
           latest = null;
-          // Leave retry scheduling to a later observability change. Retrying
-          // immediately here would spin on a persistent disk/permission error.
+          // Retry within this call with bounded backoff instead of giving up on
+          // the first error. A transient disk error (e.g. ENOSPC while the disk
+          // is full) self-heals once space frees; only after the in-call retries
+          // are exhausted do we surface the diagnostic and leave retry to a later
+          // observability change. The dirty flag stays set across retries so a
+          // concurrent publish call coalesces into this flight.
+          if (this.snapshotPublishRetries < SNAPSHOT_PUBLISH_MAX_RETRIES) {
+            this.snapshotPublishRetries += 1;
+            this.snapshotPublishDirty = true;
+            await delay(SNAPSHOT_PUBLISH_BACKOFF_MS * this.snapshotPublishRetries);
+            continue;
+          }
           this.snapshotPublishDirty = false;
+          this.snapshotPublishRetries = 0;
           try {
             this.onMissionSnapshotError?.("Mission snapshot publication failed; live mission detail may be stale.");
           } catch {
@@ -1237,9 +1261,21 @@ export class EngineeringRuntime {
     if (!mission) throw new Error(`unknown mission ${missionId}`);
     // The session that resumes a mission is the one whose model choice it follows.
     claimMissionForSession(RuntimeSession.current().sessionId, missionId);
-    if (["COMPLETE", "FAILED", "CANCELED"].includes(mission.status)) {
+    if (["COMPLETE", "CANCELED"].includes(mission.status)) {
       throw new Error(`mission ${missionId} is terminal (${mission.status}) and cannot be resumed`);
     }
+
+    // Reopen a FAILED mission for repair: the repair path recreates replacement
+    // tasks for the failed tasks and re-runs them on the current base.
+    // Transition FAILED -> BLOCKED (which stamps a fresh blocked_episode_id).
+    // Reopened failed missions are re-run from their failed tasks, so the
+    // durable-stop requirement below is bypassed for them.
+    const reopeningFailed = mission.status === "FAILED";
+    if (reopeningFailed) {
+      mission = this.missionStore.transitionMission(missionId, "BLOCKED");
+      await this.missionStore.flush();
+    }
+
     // The operator resumes: automatic recovery may act on it again.
     const wasOperatorPaused = !!mission.operator_paused_at;
     this.missionStore.clearOperatorPause(missionId);
@@ -1254,8 +1290,20 @@ export class EngineeringRuntime {
       await this.missionStore.flush();
       return this.missionStore.getMission(missionId)!;
     }
-    if (!stop) throw new Error(`mission ${missionId} has no current durable stop to resume`);
-    if (stop.reason === OPERATOR_PAUSE_STOP_REASON && mission.status === "PAUSED_INFRASTRUCTURE") {
+    if (!stop && !reopeningFailed) throw new Error(`mission ${missionId} has no current durable stop to resume`);
+    // A reopened failed mission has no durable stop; use a synthetic recovery
+    // source so the post-repair bookkeeping below stays well-formed.
+    const recoverySource: Pick<MissionStop, "attemptedRecoveries" | "preservedWork" | "resumeCondition"> =
+      stop ??
+      ({
+        attemptedRecoveries: [],
+        preservedWork: this.missionStore
+          .listTaskCheckpoints(missionId)
+          .flatMap((checkpoint) => [checkpoint.worktree, checkpoint.branch])
+          .filter((value): value is string => !!value?.trim()),
+        resumeCondition: "operator reopened a failed mission",
+      } as Pick<MissionStop, "attemptedRecoveries" | "preservedWork" | "resumeCondition">);
+    if (stop?.reason === OPERATOR_PAUSE_STOP_REASON && mission.status === "PAUSED_INFRASTRUCTURE") {
       // Paused by an operator interrupt: continue exactly where it stopped. The
       // interrupted tasks were left resumable; another interrupt pauses again.
       this.missionStore.resumeMission(missionId, "operator resumed an interrupted mission");
@@ -1271,14 +1319,18 @@ export class EngineeringRuntime {
     try {
       await this.orchestrator.repairBlockedMission(missionId, run.signal);
     } catch (error) {
-      await this.persistRecoveryStop(missionId, `Manual recovery failed: ${errorMessage(error)}`, stop);
+      await this.persistRecoveryStop(missionId, `Manual recovery failed: ${errorMessage(error)}`, recoverySource);
       throw error;
     } finally {
       run.dispose();
     }
     mission = this.missionStore.getMission(missionId)!;
     if ((mission.status === "BLOCKED" || mission.status === "REPAIRING") && !this.currentMissionStop(missionId)) {
-      await this.persistRecoveryStop(missionId, `Recovery did not produce material progress: ${stop.reason}`, stop);
+      await this.persistRecoveryStop(
+        missionId,
+        `Recovery did not produce material progress: ${recoverySource.resumeCondition}`,
+        recoverySource,
+      );
     }
     return this.missionStore.getMission(missionId)!;
   }

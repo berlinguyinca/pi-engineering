@@ -1185,7 +1185,10 @@ test("runtime diagnoses a failed snapshot write and retries on the next activity
       type: "tool_invocation",
       summary: "First update",
     });
-    for (let i = 0; i < 50 && diagnostics.length === 0; i++) {
+    // The runtime retries transient snapshot writes with bounded backoff before
+    // surfacing the diagnostic, so poll long enough to cover the in-call window
+    // (the directory stays in place until after the diagnostic is asserted).
+    for (let i = 0; i < 300 && diagnostics.length === 0; i++) {
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
     assert.deepEqual(diagnostics, ["Mission snapshot publication failed; live mission detail may be stale."]);
