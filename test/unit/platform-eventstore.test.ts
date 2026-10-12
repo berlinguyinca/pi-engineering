@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { lstatSync, rmSync, writeFileSync } from "node:fs";
-import { appendFile, mkdir, mkdtemp, readFile, readdir, stat, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
@@ -10,7 +10,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { EventStore } from "../../src/ledger/EventStore.ts";
 import { LedgerEventStoreBackend } from "../../src/platform/eventstore/adapters.ts";
 import { ExclusiveFileLock } from "../../src/platform/eventstore/fileLock.ts";
-import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
+import { JsonlEventStore, repairTornTail } from "../../src/platform/eventstore/jsonl.ts";
 
 const evt = (i: number) => ({
   event_id: `evt-${i}`,
@@ -190,6 +190,33 @@ describe("EventStore backends", () => {
       ["evt-1", "evt-2", "evt-3"],
     );
     assert.equal(store.get("evt-2")?.payload.i, 2);
+  });
+
+  it("repairTornTail truncates a torn partial line so a retried append lands cleanly", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pie-store-torn-"));
+    const file = join(dir, "events.jsonl");
+    // Two complete events, then a torn partial line (no trailing newline) — the
+    // shape a write killed by ENOSPC leaves behind.
+    await writeFile(file, `${JSON.stringify(evt(1))}\n${JSON.stringify(evt(2))}\n{"partial"`, "utf-8");
+
+    const complete = await repairTornTail(file);
+    assert.ok(complete, "repair returns the complete prefix");
+    assert.equal(complete!.split("\n").filter((l) => l.trim()).length, 2);
+
+    const repaired = await readFile(file, "utf-8");
+    assert.ok(repaired.endsWith("\n"), "file ends on a clean newline after repair");
+    assert.ok(!repaired.includes("partial"), "the torn fragment is gone from the file");
+    assert.equal(repaired.split("\n").filter((l) => l.trim()).length, 2);
+
+    // A subsequent append must not fuse onto a fragment: it lands as its own line.
+    await writeFile(file, `${repaired}${JSON.stringify(evt(3))}\n`, "utf-8");
+    const lines = (await readFile(file, "utf-8")).split("\n").filter((l) => l.trim());
+    assert.equal(lines.length, 3);
+    for (const line of lines) assert.doesNotThrow(() => JSON.parse(line));
+
+    // Repair is idempotent on a clean tail (returns the full content, no change).
+    assert.equal(await repairTornTail(file), `${repaired}${JSON.stringify(evt(3))}\n`);
+    await rm(dir, { recursive: true, force: true });
   });
 
   it("JsonlEventStore persists to disk and reloads", async () => {

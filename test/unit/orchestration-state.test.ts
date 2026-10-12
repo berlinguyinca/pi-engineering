@@ -78,6 +78,17 @@ describe("orchestration state machines", () => {
     assert.ok(canTransitionMission("STARTING", "EXECUTING"));
   });
 
+  it("a FAILED mission can be reopened for repair (resume-failed) but not completed", () => {
+    // An operator may reopen a failed mission back through the repair path.
+    assert.ok(canTransitionMission("FAILED", "BLOCKED"));
+    assert.ok(canTransitionMission("FAILED", "CANCELED"));
+    // COMPLETE and CANCELED stay fully terminal.
+    assert.equal(canTransitionMission("COMPLETE", "QUEUED"), false);
+    assert.equal(canTransitionMission("COMPLETE", "BLOCKED"), false);
+    assert.equal(canTransitionMission("CANCELED", "QUEUED"), false);
+    assert.equal(canTransitionMission("CANCELED", "BLOCKED"), false);
+  });
+
   it("NEEDS_ATTENTION is for auth/config errors and can be resumed", () => {
     assert.ok(canTransitionMission("EXECUTING", "NEEDS_ATTENTION"));
     assert.ok(canTransitionMission("WAITING_FOR_LLM", "NEEDS_ATTENTION"));

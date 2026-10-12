@@ -278,7 +278,11 @@ const MISSION_TRANSITIONS: Record<MissionStatus, ReadonlyArray<MissionStatus>> =
   BLOCKED: ["REPAIRING", "WAITING_FOR_USER", "CANCELED", "FAILED"],
   CANCELING: ["CANCELED", "BLOCKED", "FAILED"],
   CANCELED: [],
-  FAILED: [],
+  // A failed mission is terminal audit history, but an operator may reopen it
+  // for repair (resume-failed): FAILED -> BLOCKED routes it back through the
+  // repair path, which recreates replacement tasks for the failed tasks and
+  // re-runs them on the current base. COMPLETE and CANCELED stay terminal.
+  FAILED: ["BLOCKED", "CANCELED"],
 };
 
 const TASK_TRANSITIONS: Record<TaskStatus, ReadonlyArray<TaskStatus>> = {

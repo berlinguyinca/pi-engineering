@@ -96,18 +96,12 @@ export class JsonlEventStore implements EventStoreBackend {
   }
 
   private async load(): Promise<void> {
-    let raw: string;
-    try {
-      raw = await readFile(this.file, "utf-8");
-    } catch {
-      return;
-    }
-
     // A tail with no newline is a write that did not finish. It must be removed
     // from the FILE, not merely skipped in memory, or the next append fuses
-    // onto it and takes a committed event down with it.
-    const torn = raw.length > 0 && !raw.endsWith("\n");
-    const complete = torn ? raw.slice(0, raw.lastIndexOf("\n") + 1) : raw;
+    // onto it and takes a committed event down with it. repairTornTail returns
+    // the complete prefix (with any torn tail truncated) to parse.
+    const complete = await repairTornTail(this.file);
+    if (complete === null) return;
 
     for (const line of complete.split("\n")) {
       if (!line.trim()) continue;
@@ -119,14 +113,6 @@ export class JsonlEventStore implements EventStoreBackend {
         // Ignore corrupt lines; keep the rest readable (matches ledger EventStore).
         emitTelemetry({ level: "warning", text: `event store: skipped an unreadable line in ${this.file}` });
       }
-    }
-
-    if (torn) {
-      await truncate(this.file, Buffer.byteLength(complete, "utf-8")).catch(() => undefined);
-      emitTelemetry({
-        level: "warning",
-        text: `event store: repaired a truncated final record in ${this.file} (a write did not complete)`,
-      });
     }
   }
 
@@ -141,7 +127,16 @@ export class JsonlEventStore implements EventStoreBackend {
       .then(async () => {
         if (!this.memoryOnly) {
           await mkdir(dirname(this.file), { recursive: true });
-          await appendFile(this.file, line, "utf-8");
+          try {
+            await appendFile(this.file, line, "utf-8");
+          } catch (error) {
+            // A failed write (ENOSPC/EIO/...) may have left a partial line.
+            // Repair the tail so a retried append lands cleanly instead of
+            // fusing onto the fragment (the failed head stays queued for the
+            // caller's flush() to retry once space frees).
+            await repairTornTail(this.file);
+            throw error;
+          }
         }
         this.events.push(event);
         this.byId.set(event.event_id, event);
@@ -166,7 +161,14 @@ export class JsonlEventStore implements EventStoreBackend {
         if (!condition()) return undefined;
         // The predicate and commit intentionally do not yield. Mission authority
         // changes synchronously, so none can interleave this critical section.
-        if (!this.memoryOnly) appendFileSync(this.file, line, "utf-8");
+        if (!this.memoryOnly) {
+          try {
+            appendFileSync(this.file, line, "utf-8");
+          } catch (error) {
+            await repairTornTail(this.file);
+            throw error;
+          }
+        }
         this.events.push(event);
         this.byId.set(event.event_id, event);
         onCommit?.();
@@ -197,7 +199,12 @@ export class JsonlEventStore implements EventStoreBackend {
       .then(async () => {
         if (!this.memoryOnly) {
           await mkdir(dirname(this.file), { recursive: true });
-          await appendFile(this.file, body, "utf-8");
+          try {
+            await appendFile(this.file, body, "utf-8");
+          } catch (error) {
+            await repairTornTail(this.file);
+            throw error;
+          }
         }
         for (const event of events) {
           this.events.push(event);
@@ -232,6 +239,33 @@ export class JsonlEventStore implements EventStoreBackend {
     this.writerLock = null;
     openFiles.delete(this.file);
   }
+}
+
+/**
+ * Repair a torn tail left by an interrupted write (e.g. ENOSPC mid-append).
+ *
+ * A failed `appendFile` can leave a partial line with no trailing newline.
+ * Appending onto that would FUSE the next event onto the fragment into one
+ * corrupt line, so the next committed event silently vanishes on restart.
+ * `load()` repairs torn tails at startup; callers invoke this IMMEDIATELY after
+ * a failed write so a retried append lands on a clean tail.
+ *
+ * Returns the file's complete prefix (with any torn tail truncated) for the
+ * caller to parse, or `null` when the file is missing/unreadable.
+ */
+export async function repairTornTail(file: string): Promise<string | null> {
+  let raw: string;
+  try {
+    raw = await readFile(file, "utf-8");
+  } catch {
+    // File missing/unreadable (e.g. never created): nothing to repair.
+    return null;
+  }
+  if (raw.length === 0 || raw.endsWith("\n")) return raw;
+  const complete = raw.slice(0, raw.lastIndexOf("\n") + 1);
+  await truncate(file, Buffer.byteLength(complete, "utf-8")).catch(() => undefined);
+  emitTelemetry({ level: "warning", text: `event store: repaired a torn tail in ${file}` });
+  return complete;
 }
 
 /** Rewrite a JSONL store's file atomically. Exported for recovery tooling. */

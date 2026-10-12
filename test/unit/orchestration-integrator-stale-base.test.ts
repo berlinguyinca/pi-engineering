@@ -10,6 +10,15 @@ import { Integrator } from "../../src/orchestration/integrator.ts";
 
 const exec = promisify(execFile);
 const tempDirs: string[] = [];
+
+// The GitHub Actions runner has no global git identity, so commits made in
+// throwaway clones (advanceOrigin) fail with "fatal: empty ident name" even
+// though the primary fixture clone configures one locally. Provide an identity
+// for every git command in this process regardless of repo-level config.
+process.env.GIT_AUTHOR_NAME = "Test";
+process.env.GIT_AUTHOR_EMAIL = "test@e.com";
+process.env.GIT_COMMITTER_NAME = "Test";
+process.env.GIT_COMMITTER_EMAIL = "test@e.com";
 after(async () => {
   for (const dir of tempDirs) await rm(dir, { recursive: true, force: true });
 });

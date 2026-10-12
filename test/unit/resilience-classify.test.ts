@@ -46,6 +46,25 @@ describe("classifyInfraError", () => {
     assert.equal(CATEGORY_TO_STATE.CONTEXT_RECOVERABLE, "RECOVERING_CONTEXT");
   });
 
+  it("classifies ENOSPC / disk-full as transient infrastructure and retryable", () => {
+    const byCode = Object.assign(new Error("write"), { code: "ENOSPC" });
+    const cls = classifyInfraError(byCode);
+    assert.equal(cls.category, "TRANSIENT_INFRASTRUCTURE");
+    assert.equal(cls.retryable, true);
+    assert.equal(cls.reason, "storage / disk space");
+    // Message-based match for a plain Error without an errno code.
+    assert.equal(classifyInfraError(new Error("no space left on device")).category, "TRANSIENT_INFRASTRUCTURE");
+    // Other storage errno codes are treated the same way (recoverable).
+    assert.equal(classifyInfraError(Object.assign(new Error("x"), { code: "ENOMEM" })).retryable, true);
+    assert.equal(
+      classifyInfraError(Object.assign(new Error("x"), { code: "EIO" })).category,
+      "TRANSIENT_INFRASTRUCTURE",
+    );
+    // A storage error must never be treated as a permanent/terminal failure.
+    assert.notEqual(cls.category, "INVALID_REQUEST");
+    assert.notEqual(cls.category, "AUTH_CONFIG");
+  });
+
   it("classifies auth/config errors as needs attention and non-retryable", () => {
     const cls = classifyInfraError(new Error("401 invalid API key"));
     assert.equal(cls.category, "AUTH_CONFIG");
