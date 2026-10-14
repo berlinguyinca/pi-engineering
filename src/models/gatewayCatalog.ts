@@ -33,6 +33,12 @@ export interface GatewayModelEntry {
   slots?: number;
   /** Largest request body the gateway accepts for this model, when advertised. */
   maxRequestBytes?: number;
+  /** True when `id` is a logical route (`x_alias`) rather than a concrete model. */
+  alias?: boolean;
+  /** Concrete model currently backing a route, when advertised. */
+  backingModel?: string;
+  /** Logical routes a concrete model currently serves (`x_aliases`). */
+  aliases?: string[];
 }
 
 function num(value: unknown): number | undefined {
@@ -59,14 +65,31 @@ export function parseGatewayModels(payload: unknown): GatewayModelEntry[] {
   const data = (payload as { data?: unknown })?.data;
   if (!Array.isArray(data)) return [];
   const out: GatewayModelEntry[] = [];
+  const windows = new Map<string, number>();
+  for (const raw of data) {
+    const row = raw as Record<string, unknown> | null;
+    const id = row && typeof row === "object" ? str(row.id) : undefined;
+    const w = row ? (num(row.ctx_per_request) ?? num(row.x_context_window) ?? num(row.context_length)) : undefined;
+    if (id && w !== undefined) windows.set(id, w);
+  }
   for (const raw of data) {
     if (!raw || typeof raw !== "object") continue;
     const row = raw as Record<string, unknown>;
     const id = str(row.id);
     if (!id) continue;
+    const backingModel = str(row.x_backing_model);
+    const alias = row.x_alias === true || backingModel !== undefined;
+    const aliases = Array.isArray(row.x_aliases)
+      ? row.x_aliases.filter((a): a is string => typeof a === "string" && a.length > 0)
+      : [];
     // Per-request first: `ctx_total` is the gateway's aggregate across slots and
     // would over-state what one call may send.
-    const contextWindow = num(row.ctx_per_request) ?? num(row.x_context_window) ?? num(row.context_length);
+    // A route row with no size of its own is bounded by the model behind it.
+    const contextWindow =
+      num(row.ctx_per_request) ??
+      num(row.x_context_window) ??
+      num(row.context_length) ??
+      (backingModel ? windows.get(backingModel) : undefined);
     if (contextWindow === undefined) continue;
     const contextTotal = num(row.ctx_total);
     const state = str(row.x_state) ?? str(row.state);
@@ -79,6 +102,9 @@ export function parseGatewayModels(payload: unknown): GatewayModelEntry[] {
       ...(state ? { state } : {}),
       ...(slots !== undefined ? { slots } : {}),
       ...(maxRequestBytes !== undefined ? { maxRequestBytes } : {}),
+      ...(alias ? { alias } : {}),
+      ...(backingModel ? { backingModel } : {}),
+      ...(aliases.length > 0 ? { aliases } : {}),
     });
   }
   return out.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));

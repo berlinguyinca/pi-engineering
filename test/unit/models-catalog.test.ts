@@ -336,3 +336,24 @@ test("catalog: an added model declares its fabricated cost and name", () => {
   assert.ok(change?.inferred?.includes("cost"));
   assert.ok(change?.inferred?.includes("name"));
 });
+
+test("catalog: route rows keep alias metadata and inherit the backing model's window", () => {
+  const models = parseGatewayModels({
+    data: [
+      { id: "coding-implementation", x_alias: true, x_backing_model: "qwen", x_state: "hot" },
+      { id: "qwen", x_context_window: 8192, x_aliases: ["coding-implementation", ""] },
+      { id: "orphan-route", x_alias: true, x_backing_model: "missing" },
+    ],
+  });
+  const route = models.find((m) => m.id === "coding-implementation");
+  assert.equal(route?.alias, true);
+  assert.equal(route?.backingModel, "qwen");
+  assert.equal(route?.contextWindow, 8192);
+  assert.deepEqual(models.find((m) => m.id === "qwen")?.aliases, ["coding-implementation"]);
+  assert.equal(models.find((m) => m.id === "qwen")?.alias, undefined);
+  // No size anywhere: still not invented.
+  assert.equal(
+    models.find((m) => m.id === "orphan-route"),
+    undefined,
+  );
+});
