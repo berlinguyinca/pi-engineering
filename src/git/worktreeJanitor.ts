@@ -29,6 +29,7 @@ import { readFile, readdir, realpath, rm, stat } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import type { GitRepo } from "./GitRepo.ts";
+import { rustTargetDir } from "./rustBuildCache.ts";
 
 const exec = promisify(execFile);
 
@@ -261,8 +262,12 @@ export async function sweepWorktrees(opts: JanitorOptions): Promise<JanitorRepor
       const isRegistered = wt.head !== null;
       let preservedCommit: string | null = null;
       if (isRegistered) {
+        // Resolved while the worktree is still registered: it needs git.
+        const target = await rustTargetDir(wt.path).catch(() => null);
         preservedCommit = await preserveUncommittedWork(wt.path, wt.branch);
         await exec("git", ["-C", repo.root, "worktree", "remove", "--force", wt.path], { timeout: 300_000 });
+        // The worktree's own cargo target dir is derived output; it goes with it.
+        if (target) await rm(target, { recursive: true, force: true }).catch(() => {});
       } else {
         // Unrecoverable stray: no git metadata, so nothing can be preserved.
         // Only reached once the directory has sat idle past the threshold.

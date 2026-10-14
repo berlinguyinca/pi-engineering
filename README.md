@@ -452,30 +452,34 @@ coalesced rather than issued per token.
 | `PI_STATUS_BAR_GIT_TTL_MS` | `30000` | How long cached git context is trusted |
 
 
-## Shared Rust build cache
+## Rust build cache
 
 Cargo keys its build cache on the checkout directory, so every isolated
-candidate worktree would otherwise rebuild the whole dependency graph and leave
-a multi-gigabyte `target/` behind. The runtime instead points every Rust build
-it runs — verification stages, CAV runs and worker `bash` calls — at one
-machine-wide cache, keyed per repository so linked worktrees share it and
-unrelated projects do not queue on each other's cargo lock:
+candidate worktree would otherwise leave a multi-gigabyte `target/` behind.
+The runtime points every Rust build it runs — verification stages, CAV runs and
+worker `bash` calls — at one machine-wide cache root instead:
 
-    ~/.rust/cache/target/<repo>-<hash>   CARGO_TARGET_DIR (one per repository)
-    ~/.rust/cache/sccache                SCCACHE_DIR, when `sccache` is on PATH
+    ~/.rust/cache/target/<repo>-<hash>/<worktree-hash>   CARGO_TARGET_DIR
+    ~/.rust/cache/sccache                                 SCCACHE_DIR
 
-Concurrent builds against one target directory are safe: cargo serialises them
-with its own file lock. Install `sccache` (`cargo install sccache` or
-`brew install sccache`) and the runtime also sets `RUSTC_WRAPPER` so candidates
-whose dependency sets diverge still share compiled crates. Values already set
-by the operator (`CARGO_TARGET_DIR`, `RUSTC_WRAPPER`, `SCCACHE_DIR`) are never
-overridden. Everything under the cache root is derived output; delete it at any
-time to reclaim space.
+Each worktree gets its own target directory. One target directory shared
+between worktrees is unsafe: cargo identifies a workspace crate by its path
+relative to the workspace root and decides freshness by mtime, so a worktree
+whose sources are older than another worktree's last build reuses that build
+and one worker's tests run against another worker's code. Compiled
+dependencies are shared safely through `sccache` instead: install it
+(`brew install sccache` or `cargo install sccache`) and the runtime sets
+`RUSTC_WRAPPER`, so a second worktree's dependency build is a cache hit rather
+than a recompile. Values the operator already set (`CARGO_TARGET_DIR`,
+`RUSTC_WRAPPER`, `SCCACHE_DIR`) are never overridden. Everything under the
+cache root is derived output: housekeeping removes a worktree's target dir
+with the worktree and expires the rest by age, and you can delete the root at
+any time.
 
 | Variable | Default | Meaning |
 | -------- | ------- | ------- |
 | `PI_RUST_CACHE_DIR` | `~/.rust/cache` | Cache root (`~` is expanded) |
-| `PI_RUST_CACHE` | `1` | `0` disables the shared cache |
+| `PI_RUST_CACHE` | `1` | `0` disables the managed cache |
 | `PI_RUST_CACHE_MAX_AGE_DAYS` | `30` | Target dirs no build touched for this long are removed by housekeeping |
 
 ## Housekeeping
@@ -497,8 +501,8 @@ start, every six hours while a session stays open, and on demand with `/gc`
   worktree's own branch first and the branch is always kept; only the checkout
   on disk goes away. A directory whose git metadata is gone cannot be
   preserved, so it is removed only once idle.
-- Shared Rust target dirs (see above) that no build touched for
-  `PI_RUST_CACHE_MAX_AGE_DAYS` are removed.
+- A reclaimed worktree's cargo target dir goes with it, and target dirs (see
+  above) that no build touched for `PI_RUST_CACHE_MAX_AGE_DAYS` are removed.
 
 | Variable | Default | Meaning |
 | -------- | ------- | ------- |

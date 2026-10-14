@@ -5,6 +5,7 @@ import { basename, dirname, join } from "node:path";
 import { test } from "node:test";
 import { promisify } from "node:util";
 import { GitRepo } from "../../src/git/GitRepo.ts";
+import { rustTargetDir } from "../../src/git/rustBuildCache.ts";
 import {
   describeJanitorReport,
   parseWorktreeOwner,
@@ -69,11 +70,15 @@ test("mission liveness: live keeps, terminal reclaims, unknown defers to idlenes
 
 test("terminal owner: worktree reclaimed, uncommitted work preserved on its branch, branch kept", async () => {
   const fixture = await makeFixtureRepo();
+  const savedRoot = process.env.PI_RUST_CACHE_DIR;
   try {
     const repo = (await GitRepo.open(fixture.root))!;
     const head = await repo.headCommit();
     const branch = "pi-eng-candidate-MSN-done01-repo-1-0-EXC-a";
     const wt = await repo.createWorktree(head, branch);
+    process.env.PI_RUST_CACHE_DIR = join(fixture.root, "rust-cache");
+    const target = (await rustTargetDir(wt.path))!;
+    await mkdir(join(target, "debug"), { recursive: true });
     await writeFile(join(wt.path, "src", "unsaved.js"), "export const unsaved = 1;\n");
     await writeFile(join(wt.path, "src", "add.js"), "export const add = (a, b) => a + b;\n");
 
@@ -99,7 +104,10 @@ test("terminal owner: worktree reclaimed, uncommitted work preserved on its bran
     assert.match(stdout, /unsaved\.js/);
     assert.match(stdout, /add\.js/);
     assert.match(describeJanitorReport(report), /reclaimed 1 abandoned worktree.*1 with uncommitted work/);
+    assert.equal(await exists(target), false, "the worktree's cargo target dir goes with it");
   } finally {
+    if (savedRoot === undefined) delete process.env.PI_RUST_CACHE_DIR;
+    else process.env.PI_RUST_CACHE_DIR = savedRoot;
     await fixture.cleanup();
   }
 });

@@ -1,30 +1,33 @@
 /**
- * Shared Rust build cache for isolated worktrees.
+ * Rust build cache for isolated worktrees.
  *
  * Cargo keys its build cache (`target/`) on the checkout directory, so every
  * candidate worktree the runtime creates (INV-004) rebuilds the full dependency
  * graph from scratch and leaves a multi-gigabyte `target/` behind when the
  * worktree is abandoned. Twelve concurrent candidates on one Rust project
- * meant twelve copies of the same compiled dependencies.
+ * meant twelve copies of the same compiled dependencies and a full disk.
  *
  * This module points every Rust build the runtime spawns (verification stages,
  * CAV runs, and worker `bash` tool calls, which inherit the process env) at ONE
  * machine-wide cache root, `~/.rust/cache` by default:
  *
- *   ~/.rust/cache/target/<repo>-<hash>   CARGO_TARGET_DIR, one per repository
- *   ~/.rust/cache/sccache                 SCCACHE_DIR, when `sccache` is installed
+ *   ~/.rust/cache/target/<repo>-<hash>/<worktree-hash>  CARGO_TARGET_DIR
+ *   ~/.rust/cache/sccache                                SCCACHE_DIR
  *
- * The target directory is keyed on the git COMMON directory, which linked
- * worktrees share with their main checkout, so every candidate of a repository
- * builds into the same cache and compiled dependencies are reused across
- * candidates. Cargo serialises concurrent builds of one target directory with
- * its own file lock, so sharing is safe; it never corrupts. Unrelated
- * repositories get distinct target directories so they do not queue on each
- * other's lock.
+ * Each worktree gets its OWN target directory. Sharing one target directory
+ * between worktrees is not safe: cargo identifies a workspace crate by its
+ * path relative to the workspace root and decides freshness by mtime, so a
+ * worktree whose sources are older than another worktree's last build reuses
+ * that build and one worker's tests run against another worker's code
+ * (measured upstream; see docs/usage.md). What IS shared safely is compiled
+ * dependencies, through `sccache`: when it is on PATH it becomes
+ * `RUSTC_WRAPPER` and every rustc invocation is cached by the hash of its
+ * inputs, so a second worktree's dependency build is a cache hit, not a
+ * recompile. Nothing is installed by this module.
  *
- * When `sccache` is on PATH it is installed as `RUSTC_WRAPPER` so that even
- * candidates whose dependency sets diverge share compiled crates through its
- * content-addressed store. Nothing is installed by this module.
+ * Moving target dirs out of the worktrees keeps them in one place the
+ * housekeeping sweep (`sweepRustCache`) expires by age, and the worktree
+ * janitor removes a worktree's target dir together with the worktree.
  *
  * Operator intent always wins: an explicit `CARGO_TARGET_DIR`, `RUSTC_WRAPPER`
  * or `SCCACHE_DIR` in the environment is left untouched, `PI_RUST_CACHE_DIR`
@@ -93,24 +96,39 @@ export function rustCacheRoot(env: Env = process.env): string {
 }
 
 /**
- * Stable per-repository key derived from the git common directory, which is
- * identical for a main checkout and all of its linked worktrees. A cwd outside
- * any repository maps to one unscoped key so stray builds still share a cache.
+ * Target-dir key for `cwd`: `<repo>-<hash(common dir)>/<hash(worktree root)>`.
+ * The first segment groups every checkout of one repository (the common dir is
+ * identical across linked worktrees); the second keeps each worktree's build
+ * separate, which cargo's path+mtime freshness requires. A cwd outside any
+ * repository maps to one unscoped key.
  */
 export async function rustTargetKey(cwd: string): Promise<string> {
   let commonDir: string;
+  let toplevel: string;
   try {
-    const r = await exec("git", ["-C", cwd, "rev-parse", "--path-format=absolute", "--git-common-dir"], {
-      timeout: 10_000,
-    });
-    commonDir = r.stdout.trim();
+    const r = await exec(
+      "git",
+      ["-C", cwd, "rev-parse", "--path-format=absolute", "--git-common-dir", "--show-toplevel"],
+      { timeout: 10_000 },
+    );
+    [commonDir = "", toplevel = ""] = r.stdout.trim().split(/\r?\n/);
   } catch {
     return UNSCOPED_TARGET_KEY;
   }
-  if (!commonDir) return UNSCOPED_TARGET_KEY;
+  if (!commonDir || !toplevel) return UNSCOPED_TARGET_KEY;
   // `<repo>/.git` for a normal repository; a bare repository is its own common dir.
   const repoDir = basename(commonDir) === ".git" ? dirname(commonDir) : commonDir;
-  return `${sanitizeName(basename(repoDir))}-${shortHash(commonDir)}`;
+  return join(`${sanitizeName(basename(repoDir))}-${shortHash(commonDir)}`, shortHash(toplevel));
+}
+
+/**
+ * The target directory the runtime assigns to builds from `cwd`, or null when
+ * the cache is disabled or the operator set CARGO_TARGET_DIR themselves (that
+ * directory is theirs; the runtime never removes it).
+ */
+export async function rustTargetDir(cwd: string, env: Env = process.env): Promise<string | null> {
+  if (!rustCacheEnabled(env) || env.CARGO_TARGET_DIR?.trim()) return null;
+  return join(rustCacheRoot(env), "target", await rustTargetKey(cwd));
 }
 
 let sccacheLookup: { path: string; found: string | null } | null = null;
@@ -236,10 +254,11 @@ async function targetLastActivity(dir: string): Promise<number> {
 }
 
 /**
- * Remove per-repository target dirs under the shared cache root that no build
- * has touched for `maxAgeMs`. Everything there is derived output, so a wrong
- * guess costs one cold build, never data. Repositories that were deleted or
- * moved leave target dirs behind; this is what collects them.
+ * Remove per-worktree target dirs under the cache root that no build has
+ * touched for `maxAgeMs`, and repository dirs left empty by that. Everything
+ * there is derived output, so a wrong guess costs one cold build, never data.
+ * Worktrees removed outside the janitor, and repositories that were deleted
+ * or moved, leave target dirs behind; this is what collects them.
  */
 export async function sweepRustCache(
   opts: { env?: Env; maxAgeMs?: number; dryRun?: boolean; now?: () => number } = {},
@@ -250,18 +269,25 @@ export async function sweepRustCache(
   const targets = join(rustCacheRoot(env), "target");
   const now = opts.now?.() ?? Date.now();
   const maxAge = opts.maxAgeMs ?? rustCacheMaxAgeMs(env);
-  for (const name of await readdir(targets).catch(() => [] as string[])) {
-    const dir = join(targets, name);
-    const s = await stat(dir).catch(() => null);
-    if (!s?.isDirectory()) continue;
-    const idleMs = now - (await targetLastActivity(dir));
-    const idleDays = Math.round(idleMs / 86_400_000);
-    if (idleMs < maxAge) {
-      report.kept.push({ path: dir, idleDays });
-      continue;
+  for (const repoName of await readdir(targets).catch(() => [] as string[])) {
+    const repoDir = join(targets, repoName);
+    if (!(await stat(repoDir).catch(() => null))?.isDirectory()) continue;
+    const children = await readdir(repoDir).catch(() => [] as string[]);
+    let remaining = children.length;
+    for (const name of children) {
+      const dir = join(repoDir, name);
+      if (!(await stat(dir).catch(() => null))?.isDirectory()) continue;
+      const idleMs = now - (await targetLastActivity(dir));
+      const idleDays = Math.round(idleMs / 86_400_000);
+      if (idleMs < maxAge) {
+        report.kept.push({ path: dir, idleDays });
+        continue;
+      }
+      if (!opts.dryRun) await rm(dir, { recursive: true, force: true });
+      report.removed.push({ path: dir, idleDays });
+      remaining--;
     }
-    if (!opts.dryRun) await rm(dir, { recursive: true, force: true });
-    report.removed.push({ path: dir, idleDays });
+    if (remaining === 0 && !opts.dryRun) await rm(repoDir, { recursive: true, force: true }).catch(() => {});
   }
   return report;
 }

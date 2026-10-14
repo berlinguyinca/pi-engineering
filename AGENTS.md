@@ -131,12 +131,14 @@ Symlink `node_modules` into the new worktree rather than reinstalling. The
 object store is shared, so every commit is visible from every worktree
 immediately.
 
-Rust builds never get a per-worktree `target/`. The runtime exports
-`CARGO_TARGET_DIR` (and `RUSTC_WRAPPER=sccache` when installed) for every
-command it runs so all worktrees of one repository build into the shared
-cache under `~/.rust/cache` (`src/git/rustBuildCache.ts`, README "Shared Rust
-build cache"). Do not add a `.cargo/config.toml` to a worktree to work around
-it; set `PI_RUST_CACHE_DIR` or `CARGO_TARGET_DIR` in the environment instead.
+Rust builds never leave a `target/` inside a worktree. The runtime exports a
+per-worktree `CARGO_TARGET_DIR` under `~/.rust/cache` (and
+`RUSTC_WRAPPER=sccache` when installed, which is what shares compiled
+dependencies safely) for every command it runs (`src/git/rustBuildCache.ts`,
+README "Rust build cache"). Never point several worktrees at ONE target
+directory: cargo's path+mtime freshness lets a worktree reuse another's build
+of the repository's own crates. Set `PI_RUST_CACHE_DIR` or `CARGO_TARGET_DIR`
+in the environment to relocate, not a `.cargo/config.toml` in a worktree.
 
 Worktrees the runtime creates are reclaimed by housekeeping
 (`src/git/worktreeJanitor.ts`, README "Housekeeping") once their mission is

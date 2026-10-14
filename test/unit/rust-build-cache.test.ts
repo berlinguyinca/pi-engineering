@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { test } from "node:test";
 import { promisify } from "node:util";
 import { ArtifactStore } from "../../src/artifacts/ArtifactStore.ts";
@@ -15,6 +15,7 @@ import {
   rustBuildEnv,
   rustCacheEnabled,
   rustCacheRoot,
+  rustTargetDir,
   rustTargetKey,
   withRustBuildEnv,
 } from "../../src/git/rustBuildCache.ts";
@@ -44,7 +45,7 @@ test("PI_RUST_CACHE=0 (and friends) disables the shared cache", async () => {
   assert.deepEqual(await rustBuildEnv(process.cwd(), bareEnv({ PI_RUST_CACHE: "0" })), {});
 });
 
-test("a repository and its linked worktrees share one CARGO_TARGET_DIR; other repos do not", async () => {
+test("each worktree gets its own CARGO_TARGET_DIR under one per-repository dir", async () => {
   resetRustTargetKeys();
   const a = await makeFixtureRepo();
   const b = await makeFixtureRepo();
@@ -60,15 +61,27 @@ test("a repository and its linked worktrees share one CARGO_TARGET_DIR; other re
     const other = await rustBuildEnv(b.root, env);
 
     assert.ok(main.CARGO_TARGET_DIR?.startsWith(`${join("/cache", "target")}/`), main.CARGO_TARGET_DIR);
-    assert.equal(fromWorktree.CARGO_TARGET_DIR, main.CARGO_TARGET_DIR, "worktree must share the main checkout's cache");
-    assert.equal(fromNested.CARGO_TARGET_DIR, main.CARGO_TARGET_DIR, "subdirectory of a worktree shares it too");
-    assert.notEqual(other.CARGO_TARGET_DIR, main.CARGO_TARGET_DIR, "unrelated repositories get their own cache");
+    assert.notEqual(
+      fromWorktree.CARGO_TARGET_DIR,
+      main.CARGO_TARGET_DIR,
+      "a worktree never shares a target dir: cargo's path+mtime freshness would serve another checkout's build",
+    );
+    assert.equal(
+      dirname(fromWorktree.CARGO_TARGET_DIR!),
+      dirname(main.CARGO_TARGET_DIR!),
+      "but it sits under the same per-repository directory",
+    );
+    assert.equal(fromNested.CARGO_TARGET_DIR, fromWorktree.CARGO_TARGET_DIR, "a subdirectory shares its worktree's");
+    assert.notEqual(dirname(other.CARGO_TARGET_DIR!), dirname(main.CARGO_TARGET_DIR!), "unrelated repos differ");
     assert.equal(main.RUSTC_WRAPPER, undefined, "no sccache on an empty PATH");
     assert.equal(main.SCCACHE_DIR, undefined);
 
     const key = await rustTargetKey(a.root);
-    assert.match(key, /^[A-Za-z0-9._-]+-[0-9a-z]+$/);
+    assert.match(key, /^[A-Za-z0-9._-]+-[0-9a-z]+\/[0-9a-z]+$/);
     assert.notEqual(key, UNSCOPED_TARGET_KEY);
+    assert.equal(await rustTargetDir(a.root, env), join("/cache", "target", key));
+    assert.equal(await rustTargetDir(a.root, { ...env, CARGO_TARGET_DIR: "/mine" }), null, "operator dir is theirs");
+    assert.equal(await rustTargetDir(a.root, { ...env, PI_RUST_CACHE: "0" }), null);
   } finally {
     await exec("git", ["-C", a.root, "worktree", "remove", "--force", worktree]).catch(() => {});
     await rm(worktree, { recursive: true, force: true });
@@ -204,8 +217,8 @@ test("sweepRustCache removes target dirs idle past the threshold and keeps activ
   try {
     assert.equal(rustCacheMaxAgeMs({}), 30 * 86_400_000);
     assert.equal(rustCacheMaxAgeMs({ PI_RUST_CACHE_MAX_AGE_DAYS: "7" }), 7 * 86_400_000);
-    const stale = join(root, "target", "old-repo-abc");
-    const active = join(root, "target", "busy-repo-def");
+    const stale = join(root, "target", "old-repo-abc", "wt1");
+    const active = join(root, "target", "busy-repo-def", "wt2");
     await mkdir(join(stale, "debug"), { recursive: true });
     await mkdir(join(active, "debug"), { recursive: true });
     await writeFile(join(stale, "debug", ".cargo-lock"), "");
@@ -232,7 +245,7 @@ test("sweepRustCache removes target dirs idle past the threshold and keeps activ
       [active],
     );
     const { stdout } = await exec("ls", [join(root, "target")]);
-    assert.equal(stdout.trim(), "busy-repo-def");
+    assert.equal(stdout.trim(), "busy-repo-def", "an emptied repository dir is removed too");
     assert.deepEqual(await sweepRustCache({ env: { ...env, PI_RUST_CACHE: "0" } }), {
       removed: [],
       kept: [],
