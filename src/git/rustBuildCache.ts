@@ -33,7 +33,6 @@
 
 import { execFile } from "node:child_process";
 import { constants, accessSync } from "node:fs";
-import { mkdir } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -177,13 +176,12 @@ export async function rustBuildEnv(cwd: string, env: Env = process.env): Promise
 }
 
 /**
- * Merge the shared-cache variables into `env` in place and return it. Creates
- * the cache directories best-effort so the location is discoverable on disk
- * even before the first build; a failure to create them never blocks a build
- * (cargo and sccache create their own directories).
+ * Merge the shared-cache variables into `env` in place and return it. Nothing
+ * is created on disk: cargo and sccache make their own directories on first
+ * use, so a dry run (or the test suite) leaves no trace under the cache root.
  */
 export async function withRustBuildEnv<T extends Env>(env: T, cwd: string): Promise<T> {
-  await applyAdditions(env, await rustBuildEnv(cwd, env));
+  applyAdditions(env, await rustBuildEnv(cwd, env));
   return env;
 }
 
@@ -194,17 +192,12 @@ export async function withRustBuildEnv<T extends Env>(env: T, cwd: string): Prom
  */
 export async function applyRustBuildEnvToProcess(cwd: string): Promise<RustBuildEnv> {
   const additions = await rustBuildEnv(cwd, process.env);
-  await applyAdditions(process.env, additions);
+  applyAdditions(process.env, additions);
   return additions;
 }
 
-async function applyAdditions(env: Env, additions: RustBuildEnv): Promise<void> {
+function applyAdditions(env: Env, additions: RustBuildEnv): void {
   for (const [key, value] of Object.entries(additions)) {
     if (value !== undefined) env[key] = value;
   }
-  await Promise.all(
-    [additions.CARGO_TARGET_DIR, additions.SCCACHE_DIR]
-      .filter((dir): dir is string => Boolean(dir))
-      .map((dir) => mkdir(dir, { recursive: true }).catch(() => {})),
-  );
 }

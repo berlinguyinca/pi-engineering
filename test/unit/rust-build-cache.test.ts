@@ -120,7 +120,7 @@ test("operator-set CARGO_TARGET_DIR, RUSTC_WRAPPER and SCCACHE_DIR are never ove
   }
 });
 
-test("withRustBuildEnv merges in place and creates the cache directories", async () => {
+test("withRustBuildEnv merges in place and touches nothing on disk", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-rust-root-"));
   const dir = await mkdtemp(join(tmpdir(), "pi-rust-cwd-"));
   try {
@@ -128,8 +128,8 @@ test("withRustBuildEnv merges in place and creates the cache directories", async
     const same = await withRustBuildEnv(env, dir);
     assert.equal(same, env);
     assert.equal(env.CARGO_TARGET_DIR, join(root, "target", UNSCOPED_TARGET_KEY));
-    const { stdout } = await exec("ls", [join(root, "target")]);
-    assert.equal(stdout.trim(), UNSCOPED_TARGET_KEY);
+    const { stdout } = await exec("ls", ["-A", root]);
+    assert.equal(stdout.trim(), "", "cargo creates the target dir itself; the runtime leaves no trace");
   } finally {
     await rm(root, { recursive: true, force: true });
     await rm(dir, { recursive: true, force: true });
