@@ -131,6 +131,13 @@ Symlink `node_modules` into the new worktree rather than reinstalling. The
 object store is shared, so every commit is visible from every worktree
 immediately.
 
+Rust builds never get a per-worktree `target/`. The runtime exports
+`CARGO_TARGET_DIR` (and `RUSTC_WRAPPER=sccache` when installed) for every
+command it runs so all worktrees of one repository build into the shared
+cache under `~/.rust/cache` (`src/git/rustBuildCache.ts`, README "Shared Rust
+build cache"). Do not add a `.cargo/config.toml` to a worktree to work around
+it; set `PI_RUST_CACHE_DIR` or `CARGO_TARGET_DIR` in the environment instead.
+
 ### Why this matters more than it sounds
 
 A shared checkout has ONE `HEAD`. When an agent switches branches it does so

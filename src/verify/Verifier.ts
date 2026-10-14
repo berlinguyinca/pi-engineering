@@ -10,6 +10,7 @@ import {
   hashProfile,
   parseFailingTests,
 } from "./failureBaseline.ts";
+import { withRustBuildEnv } from "../git/rustBuildCache.ts";
 
 /**
  * Default hang guard for a verification command: killed only after this long
@@ -539,10 +540,14 @@ async function resolveJsEntry(
  * spawned `node` commands inherit NODE_TEST_CONTEXT and would otherwise behave
  * as test children (reporting over a stale IPC fd) instead of running as real
  * commands — a silent false pass for verification. We never want that inheritance.
+ * Rust stages are pointed at the shared build cache (src/git/rustBuildCache.ts)
+ * so candidate worktrees reuse compiled dependencies instead of each growing
+ * their own `target/`.
  */
 async function cleanEnv(cwd: string): Promise<NodeJS.ProcessEnv> {
   const env = { ...process.env };
   delete env.NODE_TEST_CONTEXT;
+  await withRustBuildEnv(env, cwd);
   const bin = await localBinDir(cwd);
   if (bin) {
     const pathKey = Object.keys(env).find((k) => k.toUpperCase() === "PATH") ?? "PATH";

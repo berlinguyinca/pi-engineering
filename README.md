@@ -452,6 +452,31 @@ coalesced rather than issued per token.
 | `PI_STATUS_BAR_GIT_TTL_MS` | `30000` | How long cached git context is trusted |
 
 
+## Shared Rust build cache
+
+Cargo keys its build cache on the checkout directory, so every isolated
+candidate worktree would otherwise rebuild the whole dependency graph and leave
+a multi-gigabyte `target/` behind. The runtime instead points every Rust build
+it runs — verification stages, CAV runs and worker `bash` calls — at one
+machine-wide cache, keyed per repository so linked worktrees share it and
+unrelated projects do not queue on each other's cargo lock:
+
+    ~/.rust/cache/target/<repo>-<hash>   CARGO_TARGET_DIR (one per repository)
+    ~/.rust/cache/sccache                SCCACHE_DIR, when `sccache` is on PATH
+
+Concurrent builds against one target directory are safe: cargo serialises them
+with its own file lock. Install `sccache` (`cargo install sccache` or
+`brew install sccache`) and the runtime also sets `RUSTC_WRAPPER` so candidates
+whose dependency sets diverge still share compiled crates. Values already set
+by the operator (`CARGO_TARGET_DIR`, `RUSTC_WRAPPER`, `SCCACHE_DIR`) are never
+overridden. Everything under the cache root is derived output; delete it at any
+time to reclaim space.
+
+| Variable | Default | Meaning |
+| -------- | ------- | ------- |
+| `PI_RUST_CACHE_DIR` | `~/.rust/cache` | Cache root (`~` is expanded) |
+| `PI_RUST_CACHE` | `1` | `0` disables the shared cache |
+
 ## Semantic tools
 
 `ledger_read`, `ledger_claim`, `artifact_read`, `repo_search`, `symbol`,

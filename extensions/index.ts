@@ -35,6 +35,7 @@ import {
 } from "../src/gateway/signals.ts";
 import { renderGatewayReport } from "../src/gateway/statusReport.ts";
 import { GitRepo } from "../src/git/GitRepo.ts";
+import { applyRustBuildEnvToProcess } from "../src/git/rustBuildCache.ts";
 import { GenerationGuard } from "../src/guard/GenerationGuard.ts";
 import { RECOVERY_PROMPT, TOOL_TRANSITION_RULE, buildDegenerationEvent } from "../src/guard/RecoveryController.ts";
 import { resolveGuardConfig } from "../src/guard/config.ts";
@@ -629,6 +630,16 @@ export default function (pi: ExtensionAPI) {
   registerInteractiveMemory(pi);
   /** True while our own (opt-in) fallback switches the interactive model. */
   let automaticModelSwitch = false;
+  // Point every Rust build this process (and Pi's `bash` tool, which copies
+  // process.env) spawns at the shared build cache, so candidate worktrees reuse
+  // compiled dependencies instead of each growing a multi-gigabyte `target/`.
+  // Best-effort and never awaited by session start: a cache miss is a slower
+  // build, not a broken session.
+  if (typeof pi.on === "function") {
+    pi.on("session_start", (_event, ctx) => {
+      void applyRustBuildEnvToProcess(ctx.cwd).catch(() => {});
+    });
+  }
   // One control socket per live PI session. The socket answers directly while
   // a mission tool is awaiting a worker; another PI process never opens this
   // session's transcript or writes its event store to ask for status.
