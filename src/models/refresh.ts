@@ -400,6 +400,9 @@ async function planProviderRefresh(config: ModelsConfig, opts: RefreshOptions): 
         `  ${verdict}: ${id} — ${reason} (${configuredIds.has(id) ? "kept as configured" : "not added"})`,
     ),
     ...verified.notes.map(({ id, note }) => `  note: ${id} — ${note}`),
+    ...gateway
+      .filter((model) => model.alias)
+      .map((model) => `  route: ${model.id}${model.backingModel ? ` → ${model.backingModel}` : ""} (gateway alias)`),
     ...planLines,
   ];
   return { plan, gateway, baseUrl, written: false, lines };
