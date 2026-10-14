@@ -476,6 +476,35 @@ time to reclaim space.
 | -------- | ------- | ------- |
 | `PI_RUST_CACHE_DIR` | `~/.rust/cache` | Cache root (`~` is expanded) |
 | `PI_RUST_CACHE` | `1` | `0` disables the shared cache |
+| `PI_RUST_CACHE_MAX_AGE_DAYS` | `30` | Target dirs no build touched for this long are removed by housekeeping |
+
+## Housekeeping
+
+Autonomous runs leave things behind when a process dies: the broker removes
+the candidate worktrees it tracks in memory once a mission reaches cleanup, but
+a crashed session, a killed worker or a mission that never reached a terminal
+state leaves `pi-eng-<hash>-<branch>` checkouts next to the repository, each a
+full working tree plus whatever the worker built. Housekeeping runs at session
+start, every six hours while a session stays open, and on demand with `/gc`
+(`/gc --dry-run` previews):
+
+- Worktrees in the runtime's own namespace (`pi-eng-<hash(repoRoot)>-*`
+  siblings of the repo root, nothing else) are reclaimed when their mission
+  is `COMPLETE`, `CANCELED` or `FAILED`, or when no owner can be found and the
+  checkout has been idle for `PI_WORKTREE_IDLE_HOURS` (default 24). Live
+  missions keep their worktrees.
+- Reclaiming never loses work. Uncommitted changes are committed onto the
+  worktree's own branch first and the branch is always kept; only the checkout
+  on disk goes away. A directory whose git metadata is gone cannot be
+  preserved, so it is removed only once idle.
+- Shared Rust target dirs (see above) that no build touched for
+  `PI_RUST_CACHE_MAX_AGE_DAYS` are removed.
+
+| Variable | Default | Meaning |
+| -------- | ------- | ------- |
+| `PI_HOUSEKEEPING` | `1` | `0` disables automatic housekeeping (`/gc` still works) |
+| `PI_HOUSEKEEPING_INTERVAL_MS` | `21600000` | Interval between sweeps while a session is open; `0` for session start only |
+| `PI_WORKTREE_IDLE_HOURS` | `24` | Idle threshold for worktrees with no known owner |
 
 ## Semantic tools
 

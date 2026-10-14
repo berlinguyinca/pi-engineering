@@ -71,6 +71,7 @@ import { effectiveWorkspace, workspaceForPath } from "../src/runtime/isolation/W
 import { formatDoctorReport, runDoctor } from "../src/runtime/isolation/doctor.ts";
 import { emitRuntimeEvent } from "../src/runtime/isolation/runtimeEvents.ts";
 import { formatRuntimeStatus, runtimeStatus } from "../src/runtime/isolation/status.ts";
+import { describeHousekeeping, runHousekeeping } from "../src/runtime/janitor.ts";
 import {
   clearOperatorModelPin,
   describeMissionControl,
@@ -640,6 +641,50 @@ export default function (pi: ExtensionAPI) {
       void applyRustBuildEnvToProcess(ctx.cwd).catch(() => {});
     });
   }
+  // Housekeeping: reclaim worktrees abandoned by crashed or killed runs and
+  // expire unused Rust target caches. Live missions keep their worktrees, and
+  // uncommitted work is committed to its branch before a checkout goes away,
+  // so this is safe to run at session start and periodically while the
+  // session stays open. Never awaited: a slow sweep must not delay a session.
+  const housekeepingIntervalMs = Number(process.env.PI_HOUSEKEEPING_INTERVAL_MS ?? 6 * 60 * 60 * 1000);
+  const housekeepingEnabled = (process.env.PI_HOUSEKEEPING ?? "1").toLowerCase() !== "0";
+  let housekeepingTimer: NodeJS.Timeout | null = null;
+  const housekeep = async (cwd: string, notify: (text: string, level: "info" | "warning") => void) => {
+    const runtime = await getRuntimeByCwd(cwd).catch(() => null);
+    const result = await runHousekeeping({ cwd, missions: runtime?.missionStore });
+    const lines = describeHousekeeping(result);
+    if (lines.length > 0)
+      notify(`[housekeeping] ${lines.join("\n")}`, result.worktrees?.failed.length ? "warning" : "info");
+  };
+  if (housekeepingEnabled && typeof pi.on === "function") {
+    pi.on("session_start", (_event, ctx) => {
+      const notify = ctx.hasUI ? (text: string, level: "info" | "warning") => ctx.ui.notify(text, level) : () => {};
+      void housekeep(ctx.cwd, notify).catch(() => {});
+      if (housekeepingTimer) clearInterval(housekeepingTimer);
+      if (housekeepingIntervalMs > 0) {
+        housekeepingTimer = setInterval(() => void housekeep(ctx.cwd, notify).catch(() => {}), housekeepingIntervalMs);
+        housekeepingTimer.unref();
+      }
+    });
+    pi.on("session_shutdown", () => {
+      if (housekeepingTimer) clearInterval(housekeepingTimer);
+      housekeepingTimer = null;
+    });
+  }
+  pi.registerCommand("gc", {
+    description: "Reclaim abandoned candidate worktrees and expired Rust build caches (--dry-run to preview).",
+    handler: async (args: string, ctx: ExtensionCommandContext) => {
+      const argv = (args ?? "").trim().split(/\s+/).filter(Boolean);
+      const dryRun = argv.includes("--dry-run");
+      const runtime = await getRuntimeByCwd(ctx.cwd).catch(() => null);
+      const result = await runHousekeeping({ cwd: ctx.cwd, missions: runtime?.missionStore, dryRun });
+      const lines = describeHousekeeping(result, { verbose: true });
+      ctx.ui.notify(
+        lines.length > 0 ? lines.join("\n") : "Nothing to reclaim.",
+        result.worktrees?.failed.length ? "warning" : "info",
+      );
+    },
+  });
   // One control socket per live PI session. The socket answers directly while
   // a mission tool is awaiting a worker; another PI process never opens this
   // session's transcript or writes its event store to ask for status.

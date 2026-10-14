@@ -9,7 +9,7 @@ import { ExclusiveFileLock } from "../platform/eventstore/fileLock.ts";
 const exec = promisify(execFile);
 
 /** Short, stable, filesystem-safe hash of a path for unique worktree dirs. */
-function shortHash(input: string): string {
+export function shortHash(input: string): string {
   let h = 0;
   for (let i = 0; i < input.length; i++) h = (h * 31 + input.charCodeAt(i)) | 0;
   return Math.abs(h).toString(36);
@@ -482,7 +482,43 @@ export class GitRepo {
   }
 
   worktreePath(branch: string): string {
-    return join(this.repoRoot, "..", `pi-eng-${shortHash(this.repoRoot)}-${branch}`);
+    return join(this.repoRoot, "..", `${this.worktreeNamespacePrefix()}${branch}`);
+  }
+
+  /**
+   * Basename prefix shared by every worktree this repository's runtime creates
+   * (`pi-eng-<hash(repoRoot)>-`). Siblings of the repo root carrying it belong
+   * to this runtime and nothing else; the janitor reclaims only inside it.
+   */
+  worktreeNamespacePrefix(): string {
+    return `pi-eng-${shortHash(this.repoRoot)}-`;
+  }
+
+  /** Every linked worktree git knows about, primary checkout excluded. */
+  async listLinkedWorktrees(): Promise<Array<{ path: string; branch: string | null; head: string | null }>> {
+    const listed = await this.git(["worktree", "list", "--porcelain"], { preserveStdout: true });
+    if (listed.code !== 0) throw new Error(`git worktree list failed: ${listed.stderr}`);
+    const out: Array<{ path: string; branch: string | null; head: string | null }> = [];
+    for (const entry of listed.stdout.split(/\n\n+/)) {
+      const lines = entry.split("\n");
+      const path = lines
+        .find((l) => l.startsWith("worktree "))
+        ?.slice("worktree ".length)
+        .trim();
+      if (!path || path === this.repoRoot) continue;
+      const branch =
+        lines
+          .find((l) => l.startsWith("branch "))
+          ?.slice("branch ".length)
+          .trim() ?? null;
+      const head =
+        lines
+          .find((l) => l.startsWith("HEAD "))
+          ?.slice("HEAD ".length)
+          .trim() ?? null;
+      out.push({ path, branch: branch ? branch.replace(/^refs\/heads\//, "") : null, head });
+    }
+    return out;
   }
 
   private candidateId(identity: {

@@ -138,6 +138,13 @@ cache under `~/.rust/cache` (`src/git/rustBuildCache.ts`, README "Shared Rust
 build cache"). Do not add a `.cargo/config.toml` to a worktree to work around
 it; set `PI_RUST_CACHE_DIR` or `CARGO_TARGET_DIR` in the environment instead.
 
+Worktrees the runtime creates are reclaimed by housekeeping
+(`src/git/worktreeJanitor.ts`, README "Housekeeping") once their mission is
+terminal or they sit idle with no owner; uncommitted work is committed to the
+worktree's branch first. Hand-made worktrees like the one above live outside
+the `pi-eng-*` namespace and are never touched, so remove them yourself when
+the branch has merged.
+
 ### Why this matters more than it sounds
 
 A shared checkout has ONE `HEAD`. When an agent switches branches it does so

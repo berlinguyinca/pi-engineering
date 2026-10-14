@@ -196,3 +196,49 @@ test("verification stages run with the shared Rust cache in their environment", 
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("sweepRustCache removes target dirs idle past the threshold and keeps active ones", async () => {
+  const { sweepRustCache, rustCacheMaxAgeMs } = await import("../../src/git/rustBuildCache.ts");
+  const { utimes } = await import("node:fs/promises");
+  const root = await mkdtemp(join(tmpdir(), "pi-rust-sweep-"));
+  try {
+    assert.equal(rustCacheMaxAgeMs({}), 30 * 86_400_000);
+    assert.equal(rustCacheMaxAgeMs({ PI_RUST_CACHE_MAX_AGE_DAYS: "7" }), 7 * 86_400_000);
+    const stale = join(root, "target", "old-repo-abc");
+    const active = join(root, "target", "busy-repo-def");
+    await mkdir(join(stale, "debug"), { recursive: true });
+    await mkdir(join(active, "debug"), { recursive: true });
+    await writeFile(join(stale, "debug", ".cargo-lock"), "");
+    await writeFile(join(active, "debug", ".cargo-lock"), "");
+    const old = new Date(Date.now() - 40 * 86_400_000);
+    for (const p of [stale, join(stale, "debug"), join(stale, "debug", ".cargo-lock")]) await utimes(p, old, old);
+    // The active dir itself is old, but a recent build touched its lock file.
+    await utimes(active, old, old);
+    const env = { HOME: root, PATH: "", PI_RUST_CACHE_DIR: root };
+    const dry = await sweepRustCache({ env, dryRun: true });
+    assert.deepEqual(
+      dry.removed.map((r) => r.path),
+      [stale],
+    );
+    const { stdout: still } = await exec("ls", [join(root, "target")]);
+    assert.match(still, /old-repo-abc/, "dry run removes nothing");
+    const report = await sweepRustCache({ env });
+    assert.deepEqual(
+      report.removed.map((r) => r.path),
+      [stale],
+    );
+    assert.deepEqual(
+      report.kept.map((r) => r.path),
+      [active],
+    );
+    const { stdout } = await exec("ls", [join(root, "target")]);
+    assert.equal(stdout.trim(), "busy-repo-def");
+    assert.deepEqual(await sweepRustCache({ env: { ...env, PI_RUST_CACHE: "0" } }), {
+      removed: [],
+      kept: [],
+      dryRun: false,
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

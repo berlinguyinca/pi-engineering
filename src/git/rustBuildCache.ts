@@ -33,6 +33,7 @@
 
 import { execFile } from "node:child_process";
 import { constants, accessSync } from "node:fs";
+import { readdir, rm, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -200,4 +201,67 @@ function applyAdditions(env: Env, additions: RustBuildEnv): void {
   for (const [key, value] of Object.entries(additions)) {
     if (value !== undefined) env[key] = value;
   }
+}
+
+/** Days a per-repository target dir may go unused before the sweep removes it. */
+export const RUST_CACHE_MAX_AGE_DAYS_ENV = "PI_RUST_CACHE_MAX_AGE_DAYS";
+export const DEFAULT_RUST_CACHE_MAX_AGE_DAYS = 30;
+
+export interface RustCacheSweepReport {
+  removed: Array<{ path: string; idleDays: number }>;
+  kept: Array<{ path: string; idleDays: number }>;
+  dryRun: boolean;
+}
+
+export function rustCacheMaxAgeMs(env: Env = process.env): number {
+  const raw = Number(env[RUST_CACHE_MAX_AGE_DAYS_ENV]);
+  const days = Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_RUST_CACHE_MAX_AGE_DAYS;
+  return days * 24 * 60 * 60 * 1000;
+}
+
+/**
+ * Newest build activity in a cargo target dir. Cargo touches
+ * `<target>/<profile>/.cargo-lock` on every build, so that beats the
+ * directory's own mtime, which only changes when a profile dir is added.
+ */
+async function targetLastActivity(dir: string): Promise<number> {
+  let newest = (await stat(dir).catch(() => null))?.mtimeMs ?? 0;
+  for (const name of await readdir(dir).catch(() => [] as string[])) {
+    for (const probe of [join(dir, name), join(dir, name, ".cargo-lock")]) {
+      const s = await stat(probe).catch(() => null);
+      if (s) newest = Math.max(newest, s.mtimeMs);
+    }
+  }
+  return newest;
+}
+
+/**
+ * Remove per-repository target dirs under the shared cache root that no build
+ * has touched for `maxAgeMs`. Everything there is derived output, so a wrong
+ * guess costs one cold build, never data. Repositories that were deleted or
+ * moved leave target dirs behind; this is what collects them.
+ */
+export async function sweepRustCache(
+  opts: { env?: Env; maxAgeMs?: number; dryRun?: boolean; now?: () => number } = {},
+): Promise<RustCacheSweepReport> {
+  const env = opts.env ?? process.env;
+  const report: RustCacheSweepReport = { removed: [], kept: [], dryRun: Boolean(opts.dryRun) };
+  if (!rustCacheEnabled(env)) return report;
+  const targets = join(rustCacheRoot(env), "target");
+  const now = opts.now?.() ?? Date.now();
+  const maxAge = opts.maxAgeMs ?? rustCacheMaxAgeMs(env);
+  for (const name of await readdir(targets).catch(() => [] as string[])) {
+    const dir = join(targets, name);
+    const s = await stat(dir).catch(() => null);
+    if (!s?.isDirectory()) continue;
+    const idleMs = now - (await targetLastActivity(dir));
+    const idleDays = Math.round(idleMs / 86_400_000);
+    if (idleMs < maxAge) {
+      report.kept.push({ path: dir, idleDays });
+      continue;
+    }
+    if (!opts.dryRun) await rm(dir, { recursive: true, force: true });
+    report.removed.push({ path: dir, idleDays });
+  }
+  return report;
 }
