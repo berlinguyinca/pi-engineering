@@ -1131,7 +1131,8 @@ export class EngineeringRuntime {
         parentSessionId: session.sessionId,
         git: rt.git,
         artifacts: rt.artifacts,
-        baseRef: rt.git ? await rt.git.headCommit() : "",
+        // A repo with no commit yet is a legitimate target: no base until the first commit.
+        baseRef: rt.git ? await rt.git.headCommit().catch(() => "") : "",
         workspaceResolver: new WorkspaceManifestResolver(),
         repositoryRegistry: rt.repositoryRegistry,
         launchCwd: opts.cwd,

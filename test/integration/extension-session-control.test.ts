@@ -156,6 +156,9 @@ test("housekeeping is deferred past session_start and a shutdown cancels it befo
   // (other session-start git use is not housekeeping and may race), so "no git
   // child was started" is observable rather than inferred from handles.
   execFileSync("git", ["init", "-q", root]);
+  execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@x", "commit", "--allow-empty", "-q", "-m", "init"], {
+    cwd: root,
+  });
   const spawnLog = join(root, "git-spawns.log");
   const realGit = execFileSync("which", ["git"], { encoding: "utf8" }).trim();
   await mkdir(join(root, "bin"));
