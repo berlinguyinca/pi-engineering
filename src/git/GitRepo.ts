@@ -2,7 +2,7 @@ import { execFile, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import type { Dirent } from "node:fs";
 import { access, lstat, mkdir, readFile, readdir, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { ExclusiveFileLock } from "../platform/eventstore/fileLock.ts";
 
@@ -179,7 +179,7 @@ export interface PendingBranchCleanup {
 
 export interface PendingBranchCleanupInventory {
   records: PendingBranchCleanup[];
-  diagnostics: Array<{ file: string; reason: string }>;
+  diagnostics: DurableRecordDiagnostic[];
 }
 
 export interface DurableRecordDiagnostic {
@@ -374,17 +374,62 @@ export class GitRepo {
     return createHash("sha256").update(this.repoRoot).digest("hex");
   }
 
-  /** Moves a failing record aside with a reason sidecar; the mission continues. */
-  private async quarantineRecord(dir: string, name: string, reason: string): Promise<string | undefined> {
+  /** True when a parsed payload names exactly this (missionId, repoId). */
+  private namesOwner(parsed: unknown, missionId: string, repoId: string): boolean {
+    if (typeof parsed !== "object" || parsed === null) return false;
+    const owner = parsed as { missionId?: unknown; repoId?: unknown };
+    return owner.missionId === missionId && owner.repoId === repoId;
+  }
+
+  /**
+   * Moves a failing record aside; the sidecar is written only after a successful
+   * rename. "gone" means a concurrent loader already moved or removed it.
+   */
+  private async quarantineRecord(dir: string, name: string, reason: string): Promise<string | "gone" | undefined> {
     try {
       const qdir = join(dir, "quarantine");
       await mkdir(qdir, { recursive: true });
-      await writeFile(join(qdir, `${name}.reason.txt`), `${reason}\n`, "utf8");
       await rename(join(dir, name), join(qdir, name));
-      return `quarantine/${name}`;
-    } catch {
-      return undefined;
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code === "ENOENT" ? "gone" : undefined;
     }
+    await writeFile(join(dir, "quarantine", `${name}.reason.txt`), `${reason}\n`, "utf8").catch(() => {});
+    return `quarantine/${name}`;
+  }
+
+  /** Records a diagnostic, quarantining the file only when it provably belongs to this mission. */
+  private async reportRecord(
+    dir: string,
+    diagnostics: DurableRecordDiagnostic[],
+    name: string,
+    reason: string,
+    owned: boolean,
+    opts: { blocking?: boolean; note?: string } = {},
+  ): Promise<void> {
+    const entry: DurableRecordDiagnostic = { file: name, reason };
+    if (opts.blocking !== undefined) entry.blocking = opts.blocking;
+    if (owned) {
+      const moved = await this.quarantineRecord(dir, name, opts.note ? `${reason}\n${opts.note}` : reason);
+      if (moved === "gone") return;
+      if (moved) entry.quarantinedTo = moved;
+    }
+    diagnostics.push(entry);
+  }
+
+  /** Reads a record for the unreadable path; null when it vanished concurrently. */
+  private async rawRecord(dir: string, name: string): Promise<string | null> {
+    try {
+      return await readFile(join(dir, name), "utf8");
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code === "ENOENT" ? null : "";
+    }
+  }
+
+  /** A path another install could legitimately have written for this candidate branch. */
+  private isPlausibleWorktreePath(path: string, branch: string): boolean {
+    if (!isAbsolute(path)) return false;
+    const escaped = branch.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return new RegExp(`^pi-eng-[0-9a-z]+-${escaped}$`).test(basename(path));
   }
 
   private candidateStateName(record: CandidateRecord): string {
@@ -479,7 +524,7 @@ export class GitRepo {
   async loadPendingBranchCleanupInventory(missionId: string, repoId: string): Promise<PendingBranchCleanupInventory> {
     const dir = await this.candidateStateDir(false);
     const records: PendingBranchCleanup[] = [];
-    const diagnostics: Array<{ file: string; reason: string }> = [];
+    const diagnostics: DurableRecordDiagnostic[] = [];
     for (const name of await readdir(dir).catch(() => [] as string[])) {
       if (!name.startsWith("cleanup.") || !name.endsWith(".json")) continue;
       try {
@@ -503,15 +548,26 @@ export class GitRepo {
           parsed.branch.trim().length > 0 &&
           ["intent", "worktree_removed", "branch_deleted"].includes(parsed.state);
         if (!structurallyValid || name !== this.branchCleanupStateName(parsed)) {
-          diagnostics.push({ file: name, reason: "cleanup journal has invalid identity or phase" });
+          await this.reportRecord(
+            dir,
+            diagnostics,
+            name,
+            "cleanup journal has invalid identity or phase",
+            this.namesOwner(parsed, missionId, repoId),
+          );
         } else if (parsed.missionId === missionId && parsed.repoId === repoId) {
           records.push(parsed);
         }
       } catch (error) {
-        diagnostics.push({
-          file: name,
-          reason: `cleanup journal is unreadable: ${error instanceof Error ? error.message : String(error)}`,
-        });
+        const raw = await this.rawRecord(dir, name);
+        if (raw === null) continue;
+        await this.reportRecord(
+          dir,
+          diagnostics,
+          name,
+          `cleanup journal is unreadable: ${error instanceof Error ? error.message : String(error)}`,
+          raw.includes(JSON.stringify(missionId)),
+        );
       }
     }
     return { records, diagnostics };
@@ -554,7 +610,9 @@ export class GitRepo {
     const dir = await this.candidateStateDir();
     const target = join(dir, this.candidateStateName(record));
     const temporary = `${target}.${process.pid}.${randomUUID()}.tmp`;
-    record.rootHash ??= this.currentRootHash();
+    if (record.rootHash === undefined && record.path === this.worktreePath(record.branch)) {
+      record.rootHash = this.currentRootHash();
+    }
     await writeFile(temporary, JSON.stringify(record), "utf8");
     guard?.assertAuthoritative();
     await rename(temporary, target);
@@ -632,18 +690,40 @@ export class GitRepo {
           const derivedCandidateId = this.candidateId(parsed);
           const canonical = { ...parsed, candidateId: derivedCandidateId };
           const expectedBranch = this.candidateBranch(parsed);
-          // The expected worktree path derives from this checkout's root, so it is
-          // only comparable for records stamped with this very root. Legacy and
-          // other-root records are validated by content integrity alone.
+          // The expected worktree path derives from this checkout's root, so exact
+          // comparison only applies to records stamped with this very root. Other
+          // roots' (and legacy) records must still carry a plausible sibling
+          // worktree path for their branch, since that path is later mounted/removed.
           const pathComparable = parsed.rootHash === this.currentRootHash();
+          const pathValid = pathComparable
+            ? parsed.path === this.worktreePath(expectedBranch)
+            : this.isPlausibleWorktreePath(parsed.path, expectedBranch);
           if (
             parsed.candidateId !== derivedCandidateId ||
             parsed.branch !== expectedBranch ||
-            (pathComparable && parsed.path !== this.worktreePath(expectedBranch)) ||
+            !pathValid ||
             name !== this.candidateStateName(canonical)
           ) {
-            const reason = "candidate identity does not match canonical filename";
-            diagnostics.push({ file: name, reason, quarantinedTo: await this.quarantineRecord(dir, name, reason) });
+            const owned = this.namesOwner(parsed, missionId, repoId);
+            if (owned && pathValid) {
+              // Keep the checkout and branch reachable for cleanup instead of orphaning them.
+              await this.persistPendingBranchCleanup({
+                missionId,
+                repoId,
+                path: parsed.path,
+                branch: expectedBranch,
+                state: "intent",
+                updatedAt: new Date().toISOString(),
+              }).catch(() => {});
+            }
+            await this.reportRecord(
+              dir,
+              diagnostics,
+              name,
+              "candidate identity does not match canonical filename",
+              owned,
+              { note: `worktree path: ${parsed.path}\nbranch: ${parsed.branch}` },
+            );
             continue;
           }
           if (parsed.missionId === missionId && parsed.repoId === repoId) {
@@ -651,19 +731,27 @@ export class GitRepo {
             recordFiles.set(canonical.candidateId, name);
           }
         } else {
-          const reason = "candidate record has invalid or empty identity fields";
-          diagnostics.push({ file: name, reason, quarantinedTo: await this.quarantineRecord(dir, name, reason) });
+          await this.reportRecord(
+            dir,
+            diagnostics,
+            name,
+            "candidate record has invalid or empty identity fields",
+            this.namesOwner(parsed, missionId, repoId),
+            { note: `worktree path: ${String(parsed.path)}\nbranch: ${String(parsed.branch)}` },
+          );
         }
       } catch (error) {
-        const reason = `candidate record is unreadable: ${error instanceof Error ? error.message : String(error)}`;
-        const raw = await readFile(join(dir, name), "utf8").catch(() => "");
-        const blocking = raw.includes(JSON.stringify(missionId));
-        diagnostics.push({
-          file: name,
-          reason,
-          blocking,
-          quarantinedTo: await this.quarantineRecord(dir, name, reason),
-        });
+        const raw = await this.rawRecord(dir, name);
+        if (raw === null) continue;
+        const owned = raw.includes(JSON.stringify(missionId));
+        await this.reportRecord(
+          dir,
+          diagnostics,
+          name,
+          `candidate record is unreadable: ${error instanceof Error ? error.message : String(error)}`,
+          owned,
+          { blocking: owned },
+        );
       }
     }
     const byCandidateId = new Map(records.map((record) => [record.candidateId, record]));
@@ -714,7 +802,7 @@ export class GitRepo {
   ): Promise<DurableRecordInventory<IntegrationRunRecord>> {
     const dir = await this.candidateStateDir(false);
     const records: IntegrationRunRecord[] = [];
-    const diagnostics: Array<{ file: string; reason: string }> = [];
+    const diagnostics: DurableRecordDiagnostic[] = [];
     for (const name of await readdir(dir).catch(() => [] as string[])) {
       if (!name.startsWith("run.") || !name.endsWith(".json")) continue;
       try {
@@ -747,16 +835,33 @@ export class GitRepo {
           Array.isArray(parsed.merges)
         ) {
           if (name !== this.integrationRunStateName(parsed)) {
-            diagnostics.push({ file: name, reason: "integration run identity does not match canonical filename" });
+            await this.reportRecord(
+              dir,
+              diagnostics,
+              name,
+              "integration run identity does not match canonical filename",
+              this.namesOwner(parsed, missionId, repoId),
+            );
           } else if (parsed.missionId === missionId && parsed.repoId === repoId) records.push(parsed);
         } else {
-          diagnostics.push({ file: name, reason: "integration run has invalid or empty identity fields" });
+          await this.reportRecord(
+            dir,
+            diagnostics,
+            name,
+            "integration run has invalid or empty identity fields",
+            this.namesOwner(parsed, missionId, repoId),
+          );
         }
       } catch (error) {
-        diagnostics.push({
-          file: name,
-          reason: `integration run is unreadable: ${error instanceof Error ? error.message : String(error)}`,
-        });
+        const raw = await this.rawRecord(dir, name);
+        if (raw === null) continue;
+        await this.reportRecord(
+          dir,
+          diagnostics,
+          name,
+          `integration run is unreadable: ${error instanceof Error ? error.message : String(error)}`,
+          raw.includes(JSON.stringify(missionId)),
+        );
       }
     }
     records.sort(
@@ -823,7 +928,7 @@ export class GitRepo {
   ): Promise<DurableRecordInventory<PromotionLifecycle>> {
     const dir = await this.candidateStateDir(false);
     const records: PromotionLifecycle[] = [];
-    const diagnostics: Array<{ file: string; reason: string }> = [];
+    const diagnostics: DurableRecordDiagnostic[] = [];
     for (const name of await readdir(dir).catch(() => [] as string[])) {
       if (!name.startsWith("promotion.") || !name.endsWith(".json")) continue;
       try {
@@ -870,22 +975,41 @@ export class GitRepo {
         ) {
           const derivedCandidateId = this.candidateId(parsed);
           if (parsed.candidateId !== derivedCandidateId) {
-            diagnostics.push({ file: name, reason: "promotion candidate identity is not canonical" });
+            await this.reportRecord(
+              dir,
+              diagnostics,
+              name,
+              "promotion candidate identity is not canonical",
+              this.namesOwner(parsed, missionId, repoId),
+            );
           } else if (name !== this.promotionStateName(parsed)) {
-            diagnostics.push({ file: name, reason: "promotion identity does not match canonical filename" });
+            await this.reportRecord(
+              dir,
+              diagnostics,
+              name,
+              "promotion identity does not match canonical filename",
+              this.namesOwner(parsed, missionId, repoId),
+            );
           } else if (parsed.missionId === missionId && parsed.repoId === repoId) records.push(parsed);
         } else {
-          diagnostics.push({
-            file: name,
-            reason:
-              "promotion authority ordering is invalid: candidate repository generation must not exceed origin or reconciliation generation",
-          });
+          await this.reportRecord(
+            dir,
+            diagnostics,
+            name,
+            "promotion authority ordering is invalid: candidate repository generation must not exceed origin or reconciliation generation",
+            this.namesOwner(parsed, missionId, repoId),
+          );
         }
       } catch (error) {
-        diagnostics.push({
-          file: name,
-          reason: `promotion record is unreadable: ${error instanceof Error ? error.message : String(error)}`,
-        });
+        const raw = await this.rawRecord(dir, name);
+        if (raw === null) continue;
+        await this.reportRecord(
+          dir,
+          diagnostics,
+          name,
+          `promotion record is unreadable: ${error instanceof Error ? error.message : String(error)}`,
+          raw.includes(JSON.stringify(missionId)),
+        );
       }
     }
     records.sort(
@@ -936,6 +1060,7 @@ export class GitRepo {
       baseSha,
       seedSha,
       candidateSha: await this.headCommitIn(worktree.path),
+      rootHash: this.currentRootHash(),
       state: "integrating",
       updatedAt: new Date().toISOString(),
     };
@@ -1261,6 +1386,13 @@ export class GitRepo {
    * Throws so a path-derivation error can never make the orchestrator delete
    * its own (or another's) primary checkout or `.git`.
    */
+  private isOwnWorktreePath(path: string): boolean {
+    const root = resolve(this.repoRoot);
+    const target = resolve(path);
+    const prefix = `${join(dirname(root), `pi-eng-${shortHash(root)}`)}-`;
+    return target !== root && target.startsWith(prefix) && target !== prefix;
+  }
+
   private assertSafeWorktreePath(path: string): void {
     const root = resolve(this.repoRoot);
     const target = resolve(path);
@@ -1370,9 +1502,12 @@ export class GitRepo {
             // checkout's `.git/worktrees` was lost). `git worktree list` no
             // longer sees it, so `git worktree remove` would fail. Recover by
             // removing the leftover working directory safely, never the primary.
-            this.assertSafeWorktreePath(info.path);
-            guard?.assertAuthoritative();
-            await rm(info.path, { recursive: true, force: true }).catch(() => {});
+            // A checkout named for another root's namespace is not ours to delete.
+            if (this.isOwnWorktreePath(info.path)) {
+              this.assertSafeWorktreePath(info.path);
+              guard?.assertAuthoritative();
+              await rm(info.path, { recursive: true, force: true }).catch(() => {});
+            }
           } else if (!pathEntry.split("\n").includes(`branch ${expectedBranch}`)) {
             throw new Error("cleanup ownership does not match an exact repository worktree path and branch mapping");
           } else {

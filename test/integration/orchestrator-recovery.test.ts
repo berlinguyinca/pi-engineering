@@ -734,7 +734,7 @@ describe("orchestrator: durable blocked-mission repair", () => {
       assert.deepEqual(h.store.listMissionStops(h.missionId), []);
       assert.ok(h.store.listFindings(h.missionId).every((finding) => finding.severity !== "blocking"));
       assert.ok((await readdir(dir)).includes("candidate.foreign.json"), "foreign records stay in place");
-      assert.ok((await readdir(join(dir, "quarantine"))).includes("candidate.garbage.json"));
+      assert.ok((await readdir(dir)).includes("candidate.garbage.json"), "unattributable files are left alone");
     } finally {
       await fixture.cleanup();
     }

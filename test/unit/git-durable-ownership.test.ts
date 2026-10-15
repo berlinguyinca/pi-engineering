@@ -155,26 +155,22 @@ test("records from a different root or legacy records validate by content integr
     assert.equal((await main.loadCandidateLifecycleInventory("MSN-root", mainRepoId)).records.length, 1);
 
     // Another install wrote the record: different rootHash and a path this root would never derive.
-    const other = { ...stored, rootHash: "0".repeat(64), path: join(main.root, "..", "other-install-path") };
+    const other = { ...stored, rootHash: "0".repeat(64), path: join(main.root, "..", `pi-eng-zz9-${stored.branch}`) };
     const otherName = candidateFileName(other);
     await writeFile(join(stateDir, otherName), JSON.stringify(other));
     // Legacy record: no rootHash at all.
     const { rootHash: _drop, ...legacyBase } = stored;
+    const legacyAttempt = "EXC-legacy";
+    const legacyBranch = `pi-eng-candidate-${[stored.missionId, stored.repoId, stored.missionGeneration, stored.candidateGeneration, legacyAttempt].join("-").replace(/[^a-zA-Z0-9._-]/g, "-")}`;
     const legacy = {
       ...legacyBase,
-      attempt: "EXC-legacy",
-      path: join(main.root, "..", "legacy-path"),
+      attempt: legacyAttempt,
+      branch: legacyBranch,
+      path: join(main.root, "..", `pi-eng-legacy1-${legacyBranch}`),
+      candidateId: [stored.missionId, stored.repoId, "1", "0", legacyAttempt]
+        .map((part) => Buffer.from(part).toString("base64url"))
+        .join("."),
     } as CandidateLifecycle;
-    legacy.candidateId = [
-      legacy.missionId,
-      legacy.repoId,
-      String(legacy.missionGeneration),
-      String(legacy.candidateGeneration),
-      legacy.attempt,
-    ]
-      .map((part) => Buffer.from(part).toString("base64url"))
-      .join(".");
-    legacy.branch = `pi-eng-candidate-${[legacy.missionId, legacy.repoId, legacy.missionGeneration, legacy.candidateGeneration, legacy.attempt].join("-").replace(/[^a-zA-Z0-9._-]/g, "-")}`;
     const legacyName = candidateFileName(legacy);
     await writeFile(join(stateDir, legacyName), JSON.stringify(legacy));
 
@@ -225,7 +221,7 @@ test("a same-root record with a forged path is quarantined with a reason and doe
   }
 });
 
-test("an unparseable record is quarantined; it blocks only when it names this mission", async () => {
+test("an unparseable record is quarantined and blocks only when it names this mission", async () => {
   const env = await mainAndLinkedWorktree();
   try {
     const { linked, linkedRepoId, stateDir } = env;
@@ -235,14 +231,59 @@ test("an unparseable record is quarantined; it blocks only when it names this mi
     let diagnostics = await broker.durableRepositoryDiagnostics(missionId);
     assert.equal(diagnostics.length, 1);
     assert.equal(diagnostics[0]?.blocking, false);
-    assert.equal(diagnostics[0]?.quarantinedTo, "quarantine/candidate.unreadable.json");
-    assert.ok((await readdir(join(stateDir, "quarantine"))).includes("candidate.unreadable.json"));
+    assert.equal(diagnostics[0]?.quarantinedTo, undefined, "an unattributable file is not this mission's to move");
+    assert.ok((await readdir(stateDir)).includes("candidate.unreadable.json"));
 
     await writeFile(join(stateDir, "candidate.mine.json"), `{"missionId":"${missionId}", truncated`);
-    diagnostics = await broker.durableRepositoryDiagnostics(missionId);
+    diagnostics = (await broker.durableRepositoryDiagnostics(missionId)).filter(
+      (d) => d.file === "candidate.mine.json",
+    );
     assert.equal(diagnostics.length, 1);
     assert.equal(diagnostics[0]?.blocking, true);
     assert.ok((await readdir(join(stateDir, "quarantine"))).includes("candidate.mine.json"));
+  } finally {
+    await env.fixture.cleanup();
+  }
+});
+
+test("a forged other-root path is quarantined, and a persist from another root does not re-stamp the record", async () => {
+  const env = await mainAndLinkedWorktree();
+  try {
+    const { main, linked, mainRepoId, linkedRepoId, stateDir } = env;
+    const candidate = await main.createCandidateWorktree(await main.headCommit(), {
+      missionId: "MSN-restamp",
+      repoId: mainRepoId,
+      missionGeneration: 1,
+      candidateGeneration: 0,
+      repositoryGeneration: 1,
+      attempt: "EXC-restamp",
+    });
+    const name = candidateFileName(candidate);
+    const stored = JSON.parse(await readFile(join(stateDir, name), "utf8")) as CandidateLifecycle;
+
+    // Legacy record (no rootHash) written by the main root, adopted and updated from the linked root.
+    const { rootHash: _drop, ...legacy } = stored;
+    await writeFile(join(stateDir, name), JSON.stringify(legacy));
+    const loaded = (await linked.loadCandidateLifecycleInventory("MSN-restamp", mainRepoId)).records;
+    assert.equal(loaded.length, 1);
+    const updated = { ...loaded[0]!, state: "preserved" as const };
+    await linked.persistCandidateLifecycle(updated);
+    assert.equal(updated.rootHash, undefined, "a foreign path must not be stamped with this root");
+    const again = await linked.loadCandidateLifecycleInventory("MSN-restamp", mainRepoId);
+    assert.deepEqual(again.diagnostics, []);
+    assert.equal(again.records.length, 1);
+    assert.ok(!(await readdir(stateDir)).includes("quarantine"));
+
+    // A forged absolute path outside the pi-eng sibling namespace is quarantined.
+    const forged = { ...legacy, rootHash: "1".repeat(64), path: "/etc/forged" } as CandidateLifecycle;
+    const forgedName = candidateFileName(forged);
+    await writeFile(join(stateDir, forgedName), JSON.stringify(forged));
+    const inventory = await main.loadCandidateLifecycleInventory("MSN-restamp", mainRepoId);
+    assert.equal(inventory.diagnostics.length, 1);
+    assert.equal(inventory.diagnostics[0]?.quarantinedTo, `quarantine/${forgedName}`);
+    const reason = await readFile(join(stateDir, "quarantine", `${forgedName}.reason.txt`), "utf8");
+    assert.match(reason, /\/etc\/forged/);
+    assert.equal(linkedRepoId === mainRepoId, false);
   } finally {
     await env.fixture.cleanup();
   }
