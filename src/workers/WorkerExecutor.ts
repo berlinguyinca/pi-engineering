@@ -79,6 +79,8 @@ export interface WorkerRequest {
    * structured review verdict.
    */
   resultTool?: "worker_result" | "review_result";
+  /** Mission this session belongs to; keys the persisted transcript. */
+  missionId?: string;
   /** Run this worker session belongs to (observability ids), when known. */
   runId?: string;
   /** Work item the session is scoped to (observability ids), if any. */

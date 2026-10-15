@@ -78,6 +78,7 @@ import {
 } from "./isolation/orchestrationNamespace.ts";
 import { assessProcess } from "./isolation/processIdentity.ts";
 import { isReloadShutdown } from "./isolation/reloadCustody.ts";
+import { resolveStateRoot, worktreeRuntimeDir } from "./isolation/stateDir.ts";
 import { UnavailableModels, createRouteModel, followUnavailableModels } from "./modelRouting.ts";
 import {
   type PinTransition,
@@ -899,6 +900,9 @@ export class EngineeringRuntime {
     // modified.
     const orchestrationPath = namespaceKey(binding);
     rt.runtimeBinding = binding;
+    if (rt.worker instanceof PiWorkerExecutor && binding.kind !== "memory") {
+      rt.worker.setTranscriptDir(worktreeRuntimeDir(resolveStateRoot(), binding.identity.worktreeId));
+    }
     try {
       let namespace = openedOrchestrationStores.get(orchestrationPath);
       if (!namespace) {
