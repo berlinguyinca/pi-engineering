@@ -307,7 +307,7 @@ is left as it was.
 
 - Caps follow the gateway: when the `/models` catalogue advertises `active_limit` (or `x_active_limit`, else `slots`), the scheduler's per-role and agent caps and the admission controller's concurrency (less `PI_GATEWAY_RESERVED_SLOTS`) use that capacity. The fixed defaults (2 per role, 4 minus 1 reserved) apply only when the catalogue says nothing. `PI_ENGINEERING_MAX_PER_ROLE`, `PI_ENGINEERING_MAX_AGENTS` and `PI_GATEWAY_MAX_CONCURRENCY` always override.
 - A 429 cools down only the model (or route) it named. It parks the whole process only when the gateway says `scope: "global"` or `"caller"`, or when the refusal names no model.
-- A model turn that streams no token for `PI_GATEWAY_STREAM_STALL_MS` (default 5 minutes; `0` disables) ends as a transient stream failure, so resume and retry accounting apply. A slow turn that keeps streaming never stalls. The 60 minute worker-inactivity watchdog remains for long-running tool commands.
+- A model turn that streams no first token for `PI_GATEWAY_FIRST_TOKEN_STALL_MS` (default 15 minutes), or then goes `PI_GATEWAY_STREAM_STALL_MS` (default 5 minutes; `0` disables) between tokens, ends as a transient stream failure, so resume and retry accounting apply. A slow turn that keeps streaming never stalls. The 60 minute worker-inactivity watchdog remains for long-running tool commands.
 - The scheduler pass loop is event-driven: it wakes when a task settles and otherwise ticks once a second.
 
 ## Context budget for mission workers

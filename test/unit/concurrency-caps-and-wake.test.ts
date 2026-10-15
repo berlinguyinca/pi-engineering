@@ -5,11 +5,13 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { AdmissionController } from "../../src/gateway/AdmissionController.ts";
+import { resolveGatewayConfig } from "../../src/gateway/config.ts";
 import { gatewayCapacity, parseGatewayModels } from "../../src/models/gatewayCatalog.ts";
 import { ExecutionBroker } from "../../src/orchestration/broker.ts";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
 import { MissionScheduler, resolveSchedulerLimits } from "../../src/orchestration/scheduler.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
+import { StreamStallWatchdog } from "../../src/workers/streamStall.ts";
 
 const catalogue = parseGatewayModels({
   data: [
@@ -171,5 +173,98 @@ describe("scheduler pass loop is event-driven", () => {
     const scheduler = new MissionScheduler({ store, broker, passTickMs: 50 });
     await scheduler.runMission(m.mission_id);
     assert.equal(store.getTask(t.task_id)?.status, "SUCCEEDED");
+  });
+});
+
+describe("follow-ups", () => {
+  const ok = { executionId: "e", exitStatus: "succeeded" as const, summary: "ok", artifactRefs: [], usage: {} };
+
+  it("caps are keyed by the task's routed model", async () => {
+    const store = MissionStore.open(JsonlEventStore.inMemory());
+    const m = mission(store);
+    for (let i = 0; i < 5; i++) {
+      store.createTask({ mission_id: m.mission_id, kind: "agent", role: "implementer", objective: `t${i}` });
+    }
+    let active = 0;
+    let peak = 0;
+    const broker = new ExecutionBroker({
+      store,
+      backends: {
+        agent: {
+          runAgent: async () => {
+            peak = Math.max(peak, ++active);
+            await new Promise((r) => setTimeout(r, 30));
+            active--;
+            return ok;
+          },
+        },
+      },
+    });
+    const scheduler = new MissionScheduler({
+      store,
+      broker,
+      limits: { maxActive: 10, maxAgents: 10 },
+      gatewayCapacity: (model) => (model === "small" ? 2 : 5),
+      modelForTask: () => "small",
+    });
+    await scheduler.runMission(m.mission_id);
+    assert.equal(peak, 2);
+  });
+
+  it("catalogue capacity never lowers the default ceiling and tolerates active > limit", async () => {
+    const c = new AdmissionController({ maxConcurrency: 4, reservedSlots: 1, jitterMs: 0 });
+    c.applyGatewayCapacity(9);
+    const slots = [];
+    for (let i = 0; i < 6; i++) slots.push(await c.acquire());
+    c.applyGatewayCapacity(1);
+    assert.equal(c.status().baseConcurrency, 3, "floor is the default");
+    let got = false;
+    const pending = c.acquire().then((s) => {
+      got = true;
+      return s;
+    });
+    for (const s of slots.slice(0, 3)) s.release();
+    await new Promise((r) => setTimeout(r, 10));
+    assert.equal(got, false, "3 held, limit 3: still waiting");
+    slots[3]?.release();
+    (await pending).release();
+    assert.equal(got, true);
+  });
+
+  it("first-token window is longer than the between-token window", () => {
+    process.env.PI_GATEWAY_FIRST_TOKEN_STALL_MS = "15m";
+    const set: number[] = [];
+    let fired = 0;
+    const w = new StreamStallWatchdog({
+      stallMs: 300_000,
+      firstTokenMs: 900_000,
+      onStall: () => fired++,
+      setTimer: (_fn, ms) => {
+        set.push(ms);
+        return { clear: () => undefined };
+      },
+    });
+    w.arm();
+    w.token();
+    assert.deepEqual(set, [900_000, 300_000]);
+    assert.equal(resolveGatewayConfig().firstTokenStallMs, 900_000);
+    assert.equal(fired, 0);
+  });
+
+  it("active_limit=1 with an implementer and a dependent reviewer does not deadlock", async () => {
+    const store = MissionStore.open(JsonlEventStore.inMemory());
+    const m = mission(store);
+    const impl = store.createTask({ mission_id: m.mission_id, kind: "agent", role: "implementer", objective: "i" });
+    store.createTask({
+      mission_id: m.mission_id,
+      kind: "agent",
+      role: "reviewer",
+      objective: "r",
+      depends_on: [impl.task_id],
+    });
+    const broker = new ExecutionBroker({ store, backends: { agent: { runAgent: async () => ok } } });
+    const scheduler = new MissionScheduler({ store, broker, gatewayCapacity: () => 1 });
+    await scheduler.runMission(m.mission_id);
+    assert.ok(store.listTasks(m.mission_id).every((t) => t.status === "SUCCEEDED"));
   });
 });

@@ -181,7 +181,9 @@ export interface SchedulerOptions {
    * slots), read on every capacity check. Replaces the default per-role cap;
    * explicit limits and env overrides still win.
    */
-  gatewayCapacity?: () => number | undefined;
+  gatewayCapacity?: (modelId?: string) => number | undefined;
+  /** The model a task is routed to, to key its cap by that model's limit. */
+  modelForTask?: (task: OrchestrationTask) => string | undefined;
   /** Fallback wake interval of the pass loop (default 1000 ms); events wake it sooner. */
   passTickMs?: number;
   /** Called when a task reaches a terminal state. */
@@ -275,7 +277,8 @@ export class MissionScheduler {
   private readonly wakers = new Set<() => void>();
   private wakePending = false;
   private readonly passTickMs: number;
-  private readonly gatewayCapacity: (() => number | undefined) | undefined;
+  private readonly gatewayCapacity: ((modelId?: string) => number | undefined) | undefined;
+  private readonly modelForTask: ((task: OrchestrationTask) => string | undefined) | undefined;
   private readonly perRoleExplicit: boolean;
   private readonly agentsExplicit: boolean;
   /** Mission-level gateway resilience config (time-based window, probes). */
@@ -338,6 +341,7 @@ export class MissionScheduler {
     this.limits = { ...resolveSchedulerLimits(), ...opts.limits };
     this.passTickMs = Math.max(1, opts.passTickMs ?? 1_000);
     this.gatewayCapacity = opts.gatewayCapacity ?? observedGatewayCapacity;
+    this.modelForTask = opts.modelForTask;
     this.perRoleExplicit = opts.limits?.maxPerRole !== undefined || !!process.env.PI_ENGINEERING_MAX_PER_ROLE;
     this.agentsExplicit = opts.limits?.maxAgents !== undefined || !!process.env.PI_ENGINEERING_MAX_AGENTS;
     this.onTaskSettled = opts.onTaskSettled;
@@ -409,7 +413,7 @@ export class MissionScheduler {
   private hasCapacity(t: OrchestrationTask): boolean {
     const kind = t.kind;
     if (this.activeTasks.size >= this.limits.maxActive) return false;
-    const capacity = this.gatewayCapacity?.();
+    const capacity = this.gatewayCapacity?.(this.modelForTask?.(t));
     const maxAgents =
       !this.agentsExplicit && capacity ? Math.max(this.limits.maxAgents, capacity) : this.limits.maxAgents;
     const maxPerRole = !this.perRoleExplicit && capacity ? capacity : this.limits.maxPerRole;
@@ -754,6 +758,7 @@ export class MissionScheduler {
             repo_id: lease.repoId,
           });
           await this.lanes.release(lease).catch(() => undefined);
+          this.wake();
         }
         // Whatever path ended the task, a terminal task leaves the resilience
         // window (a paused task stays RETRYING and keeps its park).
@@ -786,6 +791,7 @@ export class MissionScheduler {
       // wait the probe interval and re-check, without burning a full worker session.
       // On window exhaustion the mission is PAUSED (not FAILED).
       const gate = await this.probeGate(task, signal);
+      this.wake();
       if (gate === "aborted") {
         this.stopTaskOnAbort(task, signal);
         return;

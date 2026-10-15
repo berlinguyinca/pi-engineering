@@ -128,10 +128,21 @@ export function gatewayCapacity(entries: readonly GatewayModelEntry[]): number |
 }
 
 let observedCapacity: number | undefined;
+let observedByModel = new Map<string, number>();
 
-/** Capacity from the most recent catalogue this process fetched (scheduler default). */
-export function observedGatewayCapacity(): number | undefined {
-  return observedCapacity;
+/**
+ * Capacity from the most recent catalogue this process fetched (scheduler
+ * default): the routed model's own limit when known, else the catalogue maximum.
+ */
+export function observedGatewayCapacity(modelId?: string): number | undefined {
+  return (modelId ? observedByModel.get(modelId) : undefined) ?? observedCapacity;
+}
+
+/** Total concurrency across the catalogue's concrete (non-alias) models. */
+export function gatewayCapacityTotal(entries: readonly GatewayModelEntry[]): number | undefined {
+  let total = 0;
+  for (const entry of entries) if (!entry.alias) total += entry.activeLimit ?? entry.slots ?? 0;
+  return total > 0 ? total : undefined;
 }
 
 export interface FetchCatalogOptions {
@@ -196,6 +207,12 @@ export async function fetchGatewayModels(opts: FetchCatalogOptions): Promise<Gat
       throw new CatalogFetchError(`gateway returned no usable models from ${base}/models`, res.status);
     }
     observedCapacity = gatewayCapacity(models);
+    observedByModel = new Map(
+      models.flatMap((m) => {
+        const n = m.activeLimit ?? m.slots;
+        return n !== undefined && n > 0 ? [[m.id, n] as [string, number]] : [];
+      }),
+    );
     return models;
   } catch (err) {
     opts.signal?.throwIfAborted();

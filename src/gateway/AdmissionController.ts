@@ -143,6 +143,7 @@ export class AdmissionController {
 
   /** Ceiling for local concurrency: the configured max, less the reserve. */
   private baseConcurrency: number;
+  private readonly defaultBase: number;
   private readonly fixedConcurrency: boolean;
   private concurrency: number;
   private active = 0;
@@ -168,6 +169,7 @@ export class AdmissionController {
     this.onEvent = opts.onEvent;
     this.fixedConcurrency = opts.fixedConcurrency ?? false;
     this.baseConcurrency = Math.max(this.minConcurrency, this.configuredMax - this.reservedSlots);
+    this.defaultBase = this.baseConcurrency;
     this.concurrency = this.baseConcurrency;
   }
 
@@ -204,7 +206,9 @@ export class AdmissionController {
    */
   applyGatewayCapacity(capacity: number): void {
     if (this.fixedConcurrency || !Number.isFinite(capacity) || capacity < 1) return;
-    const base = Math.max(this.minConcurrency, Math.floor(capacity) - this.reservedSlots);
+    // Catalogue capacity can raise the ceiling, never lower it below the
+    // default; shrinking is the job of explicit config and gateway 429 clamps.
+    const base = Math.max(this.defaultBase, Math.floor(capacity) - this.reservedSlots);
     if (base === this.baseConcurrency) return;
     const grew = base > this.baseConcurrency;
     this.baseConcurrency = base;

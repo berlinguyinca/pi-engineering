@@ -15,7 +15,7 @@ import {
   DEFAULT_GATEWAY_BASE_URL,
   type GatewayModelEntry,
   fetchGatewayModels,
-  gatewayCapacity,
+  gatewayCapacityTotal,
 } from "./gatewayCatalog.ts";
 import {
   type ModelsConfig,
@@ -361,7 +361,7 @@ async function planProviderRefresh(config: ModelsConfig, opts: RefreshOptions): 
       ...(opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}),
     });
   const advertised = await listing();
-  const capacity = gatewayCapacity(advertised);
+  const capacity = gatewayCapacityTotal(advertised);
   if (capacity !== undefined) sharedAdmissionController().applyGatewayCapacity(capacity);
   const reasoningIds = new Set(existing.filter((model) => model.reasoning === true).map((model) => model.id));
 
