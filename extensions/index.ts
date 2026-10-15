@@ -49,6 +49,8 @@ import {
   decideAutoInvoke,
   missionToolReportedUnavailable,
 } from "../src/orchestration/autoInvoke.ts";
+import { MISSION_FLAGS_USAGE, parseMissionFlags } from "../src/orchestration/missionFlags.ts";
+import { assertRootMissionAllowed, chooseMode, readAutospecFlags } from "../src/orchestration/missionMode.ts";
 import {
   buildModelErrorRollups,
   explainMission,
@@ -2079,7 +2081,7 @@ ${RECOVERY_PROMPT}`;
 
   pi.registerCommand("mission", {
     description:
-      "Run an orchestration mission; /mission why <missionId> explains what blocks one; /mission resume <missionId> [--model auto] continues a stopped or paused one (optionally releasing its operator model pin), /mission cancel <missionId> ends one.",
+      "Run an orchestration mission (optional leading --mode/--backend/--budget/--max-workers); /mission why <missionId> explains what blocks one; /mission resume <missionId> [--model auto] continues a stopped or paused one (optionally releasing its operator model pin), /mission cancel <missionId> ends one.",
     handler: async (args, ctx) => {
       const request = args.trim();
       if (!request) {
@@ -2129,6 +2131,42 @@ ${RECOVERY_PROMPT}`;
         ctx.ui.notify("/mission resume <missionId>", "error");
         return;
       }
+      // A new mission (not a resume) must be a root mission, and may carry
+      // leading flags. Both are settled before the runtime opens, so a refusal
+      // or a usage error creates nothing.
+      let newRequest = request;
+      if (!resume) {
+        try {
+          assertRootMissionAllowed(process.env);
+        } catch (error) {
+          ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+          return;
+        }
+        const autospecFlags = readAutospecFlags(process.env);
+        const parsed = parseMissionFlags(request, autospecFlags, {
+          maxWorkersCap: gatewayConfig.maxConcurrency,
+        });
+        if (parsed.error) {
+          ctx.ui.notify(`${parsed.error}\n${MISSION_FLAGS_USAGE}`, "error");
+          return;
+        }
+        newRequest = parsed.rest;
+        for (const warning of parsed.warnings) ctx.ui.notify(warning, "warning");
+        const mode = chooseMode(newRequest, autospecFlags, parsed.mode);
+        const options = [
+          parsed.mode ? `mode=${parsed.mode}` : "",
+          parsed.backend ? `backend=${parsed.backend}` : "",
+          parsed.budgetBytes !== undefined ? `budget=${parsed.budgetBytes}B` : "",
+          parsed.maxWorkers !== undefined ? `max-workers=${parsed.maxWorkers}` : "",
+        ].filter(Boolean);
+        // No autospec adapter executes a mission yet: say so rather than imply it did.
+        if (options.length > 0 || mode !== "local") {
+          ctx.ui.notify(
+            `[mission] options ${options.join(" ") || "(none)"} accepted; execution mode ${mode} runs as the local orchestrator (no autospec backend is wired yet)`,
+            "info",
+          );
+        }
+      }
       const rt = await openRuntime();
       if (!rt) return;
       if (!rt.orchestrator) {
@@ -2163,7 +2201,7 @@ ${RECOVERY_PROMPT}`;
         }
         return;
       }
-      if (await plannerWorker.runIfSelected(request, ctx)) return;
+      if (await plannerWorker.runIfSelected(newRequest, ctx)) return;
       const baseRef = (await rt.git?.headCommit().catch(() => "")) ?? "";
       ctx.ui.notify("Routing intent and running orchestration mission...", "info");
       // Stream live mission/task progress to the operator instead of blocking
@@ -2171,7 +2209,7 @@ ${RECOVERY_PROMPT}`;
       // line, then nothing for 30+ minutes). Each task/phase transition is
       // surfaced as a compact progress line as it happens.
       let lastLine = "";
-      const result = await rt.orchestrator.orchestrate(request, {
+      const result = await rt.orchestrator.orchestrate(newRequest, {
         repository: rt.cwd,
         baseRef,
         mutationRequested: true,
