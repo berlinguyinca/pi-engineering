@@ -238,6 +238,19 @@ waiting in `WAITING_FOR_LLM` and relaunches only on an authoritative healthy
 probe; it is never `BLOCKED` for this. Executions that ran tools count as
 attempts as before.
 
+### Reviewer tools and the candidate guard
+
+The reviewer gets `read`, `bash`, `repo_search` and `symbol` next to the evidence
+tools, and its prompt carries the diff, the validation result and the criteria IDs
+as untrusted data. Because `bash` is not sandboxed, every review attempt is guarded:
+the candidate worktree must still be at the recorded candidate commit with a clean
+tree, no new ignored files, unchanged `git for-each-ref`, and unchanged shared
+`hooks/` and `config`. On a violation the worktree is reset to the candidate
+(`git reset --hard`, `git clean -fd`, new ignored paths removed), the attempt fails as
+invalid output, and the review re-runs; changed refs or hooks are reported but not
+restored. Residual risk, accepted for now: writes outside the worktree and network
+access are not detected, since there is no read-only bash wrapper.
+
 ### Reviewer retries on a dead provider
 
 Gate roles (reviewers and challengers) judge work and have no side effects, so

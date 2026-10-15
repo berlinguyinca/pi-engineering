@@ -2057,7 +2057,7 @@ export function buildCompactedWorkerPrompt(req: WorkerRequest, recoveryPrompt: s
   if (verifiedContext?.trim()) {
     const compactContext = verifiedContext.trim();
     // A reviewer's context is the change it judges; keep far more of it.
-    const limit = req.role === "reviewer" || req.role === "security-review" ? REVIEWER_CONTEXT_CHAR_CAP : 500;
+    const limit = req.role === "reviewer" ? REVIEWER_CONTEXT_CHAR_CAP : 500;
     const sliced = compactContext.length > limit ? `${compactContext.slice(0, limit)}… [truncated]` : compactContext;
     parts.push(`# Context (compacted)`);
     parts.push(sliced);

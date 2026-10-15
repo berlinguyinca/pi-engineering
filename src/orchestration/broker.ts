@@ -321,6 +321,8 @@ export interface ReviewRunner {
     contextRef?: string;
     acceptanceCriteria?: Array<{ acceptanceId: string; criterion: string }>;
     worktree?: string | null;
+    /** The recorded candidate commit: the reviewer's worktree must stay on it. */
+    candidateSha?: string;
     /** Owning mission and task: the reviewer avoids the mission's producing models. */
     missionId?: string;
     taskId?: string;
@@ -3475,6 +3477,9 @@ export class ExecutionBroker {
             contextRef: input.contextRef,
             acceptanceCriteria: input.acceptanceCriteria,
             worktree: candidatePath ?? null,
+            ...(candidatePath
+              ? { candidateSha: this.missionCandidates.get(input.missionId)?.lifecycle.candidateSha }
+              : {}),
             missionId: input.missionId,
             taskId: input.taskId,
             signal,

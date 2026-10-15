@@ -6,7 +6,7 @@
  */
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { type IncomingMessage, type Server, type ServerResponse, createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -30,7 +30,7 @@ const CONTEXT = "## Diff (git diff aaa..bbb)\n+console.log('hello-marker-7731')"
 
 async function review(
   reply: Record<string, unknown>,
-  extra: { worktree?: string; bashFirst?: boolean; command?: string } = {},
+  extra: { worktree?: string; bashFirst?: boolean; command?: string; candidateSha?: string } = {},
 ) {
   const dir = mkdtempSync(join(tmpdir(), "pi-review-ctx-int-"));
   const bodies: string[] = [];
@@ -120,6 +120,7 @@ async function review(
       objective: "review",
       contextRef: CONTEXT,
       worktree: extra.worktree,
+      candidateSha: extra.candidateSha,
       acceptanceCriteria: CRITERIA,
       missionId: "MSN-1",
       signal: new AbortController().signal,
@@ -297,7 +298,10 @@ test("a reviewer that commits or writes through bash is rejected and the candida
     { acceptance_id: "AC-1", status: "passed", detail: "ok" },
     { acceptance_id: "AC-2", status: "passed", detail: "ok" },
   ];
-  const { outcome } = await review({ ...base, acceptance_results: results }, { worktree: repo, bashFirst: true });
+  const { outcome } = await review(
+    { ...base, acceptance_results: results },
+    { worktree: repo, bashFirst: true, candidateSha: head },
+  );
   try {
     assert.equal(outcome.exitStatus, "failed");
     assert.equal(outcome.reviewEvidence?.outputValid, false);
@@ -311,9 +315,8 @@ test("a reviewer that commits or writes through bash is rejected and the candida
       ).category,
       "PROVIDER_TRANSIENT",
     );
-    // The guard reports; it never repairs silently: the mutation is still visible.
-    assert.notEqual(git("status", "--porcelain"), "");
-    assert.equal(git("rev-parse", "HEAD"), head, "the model's commit failed or was not made on a moved HEAD");
+    assert.equal(git("status", "--porcelain"), "", "the worktree is restored to the candidate");
+    assert.equal(git("rev-parse", "HEAD"), head);
   } finally {
     rmSync(repo, { recursive: true, force: true });
   }
@@ -340,12 +343,87 @@ test("a reviewer that commits through bash is rejected too", async () => {
       {
         worktree: repo,
         bashFirst: true,
+        candidateSha: head,
         command: "git -c user.name=x -c user.email=x@x commit -q --allow-empty -m sneaky",
       },
     );
-    assert.notEqual(git("rev-parse", "HEAD"), head, "the reviewer really moved HEAD");
+    assert.match(git("reflog"), /sneaky/, "the reviewer really moved HEAD");
+    assert.equal(git("rev-parse", "HEAD"), head, "and the worktree was put back on the candidate");
     assert.equal(outcome.exitStatus, "failed");
     assert.match(outcome.error ?? "", /reviewer mutated the candidate/);
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+for (const [name, command] of [
+  ["a written file", "echo changed > mutated.txt"],
+  ["a commit", "git -c user.name=x -c user.email=x@x commit -q --allow-empty -m sneaky"],
+] as const) {
+  test(`a retry after a reviewer mutation (${name}) starts from the recorded candidate`, async () => {
+    const repo = mkdtempSync(join(tmpdir(), "pi-review-retry-"));
+    const git = (...args: string[]) =>
+      execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@t", ...args], {
+        cwd: repo,
+        encoding: "utf8",
+      }).trim();
+    git("init", "-q", "-b", "main");
+    writeFileSync(join(repo, "a.txt"), "one\n");
+    git("add", "-A");
+    git("commit", "-qm", "base");
+    const candidate = git("rev-parse", "HEAD");
+    const results = [
+      { acceptance_id: "AC-1", status: "passed", detail: "ok" },
+      { acceptance_id: "AC-2", status: "passed", detail: "ok" },
+    ];
+    try {
+      const first = await review(
+        { ...base, acceptance_results: results },
+        { worktree: repo, bashFirst: true, command, candidateSha: candidate },
+      );
+      assert.equal(first.outcome.exitStatus, "failed");
+      assert.match(first.outcome.error ?? "", /reviewer mutated the candidate/);
+      const second = await review(
+        { ...base, acceptance_results: results },
+        { worktree: repo, candidateSha: candidate },
+      );
+      assert.equal(second.outcome.exitStatus, "succeeded", second.outcome.summary);
+      assert.equal(git("rev-parse", "HEAD"), candidate);
+      assert.equal(git("status", "--porcelain", "--ignored"), "");
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+}
+
+test("changed refs and planted hooks are detected, ignored-file writes are removed", async () => {
+  const repo = mkdtempSync(join(tmpdir(), "pi-review-wide-"));
+  const git = (...args: string[]) =>
+    execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@t", ...args], { cwd: repo, encoding: "utf8" }).trim();
+  git("init", "-q", "-b", "main");
+  writeFileSync(join(repo, ".gitignore"), "ignored.log\n");
+  git("add", "-A");
+  git("commit", "-qm", "base");
+  const candidate = git("rev-parse", "HEAD");
+  const results = [
+    { acceptance_id: "AC-1", status: "passed", detail: "ok" },
+    { acceptance_id: "AC-2", status: "passed", detail: "ok" },
+  ];
+  try {
+    for (const [command, reason, probe] of [
+      ["git branch evil", /git refs changed/, () => git("branch", "--list", "evil")],
+      ["echo x > .git/hooks/pre-commit", /hooks or config/, () => "x"],
+      ["echo x > ignored.log", /ignored files/, () => (existsSync(join(repo, "ignored.log")) ? "present" : "")],
+    ] as const) {
+      const { outcome } = await review(
+        { ...base, acceptance_results: results },
+        { worktree: repo, bashFirst: true, command, candidateSha: candidate },
+      );
+      assert.equal(outcome.exitStatus, "failed", command);
+      assert.match(outcome.error ?? "", reason, command);
+      if (command.includes("ignored.log")) assert.equal(probe(), "", "the new ignored file was removed");
+      else assert.notEqual(probe(), "", "refs and hooks are detected, not restored");
+    }
   } finally {
     rmSync(repo, { recursive: true, force: true });
   }

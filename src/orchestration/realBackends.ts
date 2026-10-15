@@ -12,9 +12,7 @@
  * mission; tests inject deterministic fakes instead.
  */
 
-import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { promisify } from "node:util";
 import type { ArtifactStore } from "../artifacts/ArtifactStore.ts";
 import { modelFamily, sameFamily as sameFamilyId } from "../capability/modelRecord.ts";
 import { type RegistryModel, filterEnabledModels, rankRegistryModels } from "../capability/registryCandidates.ts";
@@ -37,6 +35,7 @@ import {
 } from "./broker.ts";
 import { normalizeReviewSeverity, validateAcceptanceResults } from "./evidence.ts";
 import { INVALID_WORKER_OUTPUT_PREFIX } from "./recovery.ts";
+import { guardReviewWorktree } from "./reviewGuard.ts";
 
 /** What a verification run concluded, in the shape the result cache stores. */
 interface JudgedVerification {
@@ -148,19 +147,6 @@ export const IMPLEMENTER_TOOLS: readonly string[] = [
 
 /** Reviewer tools: the evidence tools, search, and `read`/`bash` to inspect files around the diff. */
 const REVIEWER_TOOLS: string[] = ["ledger_read", "artifact_read", "repo_search", "symbol", "read", "bash"];
-
-const execFileAsync = promisify(execFile);
-
-/** HEAD and `git status --porcelain` of a checkout; null when it is not a git checkout. */
-async function candidateState(cwd: string | undefined): Promise<{ head: string; status: string } | null> {
-  if (!cwd) return null;
-  try {
-    const run = async (args: string[]): Promise<string> => (await execFileAsync("git", args, { cwd })).stdout;
-    return { head: (await run(["rev-parse", "HEAD"])).trim(), status: await run(["status", "--porcelain"]) };
-  } catch {
-    return null;
-  }
-}
 
 /**
  * Criteria have no kind field, so "test-like" is a heuristic over the criterion:
@@ -960,6 +946,8 @@ export function realBackends(opts: RealBackendsOptions) {
         contextRef?: string;
         acceptanceCriteria?: Array<{ acceptanceId: string; criterion: string }>;
         worktree?: string | null;
+        /** The recorded candidate commit the worktree must stay on. */
+        candidateSha?: string;
         missionId?: string;
         taskId?: string;
         signal: AbortSignal;
@@ -1070,15 +1058,16 @@ export function realBackends(opts: RealBackendsOptions) {
         // A reviewer model the gateway no longer serves is handed over too, and
         // every switch says whether the review is still independent.
         // The reviewer has bash: the candidate it judges must come back untouched.
-        const before = await candidateState(req.cwd);
-        const guardRun = before
-          ? async (): Promise<string | undefined> => {
-              const after = await candidateState(req.cwd);
-              return after && (after.head !== before.head || after.status !== before.status)
-                ? "reviewer mutated the candidate (HEAD moved or the working tree changed)"
-                : undefined;
-            }
-          : undefined;
+        const guard = await guardReviewWorktree(req.cwd, input.candidateSha);
+        if (!guard && req.cwd) {
+          input.onActivity?.({
+            kind: "execution",
+            stage: "review",
+            phase: "started",
+            summary: `Warning: ${req.cwd} is not a git checkout; the reviewer mutation guard is skipped.`,
+            meaningfulProgress: false,
+          });
+        }
         const takeover = await runWithModelTakeover(req, input, {
           initial,
           next: pickReviewer,
@@ -1152,7 +1141,7 @@ export function realBackends(opts: RealBackendsOptions) {
         for (const warning of acceptanceWarnings) {
           normalizedFindings.push({ severity: "minor", summary: `acceptance_results: ${warning}`, status: "open" });
         }
-        const mutation = guardRun ? await guardRun() : undefined;
+        const mutation = guard ? await guard.check() : undefined;
         if (mutation) invalidReasons.push(mutation);
         const outputValid = invalidReasons.length === 0;
         const artifactEvidence = await artifactContentHashes(opts.artifacts, outcome.artifactRefs);
