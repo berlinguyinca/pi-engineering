@@ -534,6 +534,8 @@ export interface RecoveryDecision {
   startingCandidateIdentityHash?: string | null;
   /** Git content baseline; metadata/artifact changes do not satisfy mutation recovery. */
   startingCandidateContent?: { candidateSha: string; diffHash: string } | null;
+  /** Concrete operator-facing guidance when recovery must pause for a decision. */
+  operatorGuidance?: string;
 }
 
 export interface EvidenceInvalidation {

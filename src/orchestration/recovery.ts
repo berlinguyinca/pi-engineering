@@ -100,6 +100,31 @@ const OPERATOR_QUESTIONS: Partial<Record<FailureCategory, string>> = {
     "operator question: which workspace roots and repository roles is this mission authorized to use?",
 };
 
+/**
+ * Concrete, actionable operator guidance surfaced when a mission's recovery
+ * budget is exhausted on a failure there is no capacity wait for. Kept separate
+ * from OPERATOR_QUESTIONS so a budget-exhausted decision still reports its
+ * budget reason in expectedMaterialChange (tests and downstream consumers rely
+ * on that) while also carrying actionable next steps for the operator.
+ */
+const ESCALATION_GUIDANCE: Partial<Record<FailureCategory, string>> = {
+  MERGE_CONFLICT:
+    "preserved work conflicts with commits merged upstream. The worker was deliberately based on the mission's original base (not a newer commit) so a real conflict is surfaced rather than masked. Options: (a) rebase the preserved branch onto the current main head and re-integrate, (b) discard the conflicting branch, or (c) raise the recovery budget to retry from the originally bound incumbent base.",
+  VALIDATION_FAILED:
+    "the repository's own checks do not pass on the candidate. Options: (a) let a repair task fix the failing checks, or (b) raise the recovery budget to retry the failing step.",
+  REVIEW_FAILED:
+    "the candidate did not pass review. Options: (a) let a repair task address the review findings, or (b) raise the recovery budget to retry review.",
+  IMPLEMENTATION_DEFECT:
+    "the candidate carries an implementation defect. Options: (a) let a repair task fix it, or (b) raise the recovery budget to retry.",
+  DEADLOCKED_DAG:
+    "the task graph is blocked with no automatic repair. Options: (a) replace the blocked work through an explicit repair plan, or (b) cancel the mission.",
+  TASK_BUDGET_EXHAUSTED:
+    "the task exhausted its attempt budget. Options: (a) split the remaining deliverables into bounded replacement tasks, or (b) raise the task budget.",
+  REQUIREMENT_AMBIGUITY: OPERATOR_QUESTIONS.REQUIREMENT_AMBIGUITY,
+  AUTHORIZATION_OR_CREDENTIAL: OPERATOR_QUESTIONS.AUTHORIZATION_OR_CREDENTIAL,
+  WORKSPACE_SCOPE_MISMATCH: OPERATOR_QUESTIONS.WORKSPACE_SCOPE_MISMATCH,
+};
+
 function hash(value: unknown): string {
   return createHash("sha256").update(JSON.stringify(value)).digest("hex");
 }
@@ -538,6 +563,16 @@ export class RecoveryPlanner {
       : capacityWait !== undefined
         ? `${budgetReason}; the mission parks instead of stopping: ${EXPECTED_CHANGE[capacityWait]}`
         : (OPERATOR_QUESTIONS[input.classification.category] ?? budgetReason);
+    // When automatic recovery is exhausted and there is no capacity wait to
+    // park on, the mission must pause for an operator decision. Surface concrete,
+    // category-specific guidance (instead of a silent STOP) so the operator sees
+    // exactly what happened and which levers are available. This is carried in
+    // operatorGuidance, leaving expectedMaterialChange (the budget reason) intact
+    // for downstream consumers and tests.
+    const operatorGuidance =
+      budgetExhausted && capacityWait === undefined
+        ? (ESCALATION_GUIDANCE[input.classification.category] ?? budgetReason)
+        : undefined;
     const recoveryHash = hash({
       missionId: input.classification.missionId,
       classificationId: input.classification.classificationId,
@@ -560,6 +595,7 @@ export class RecoveryPlanner {
       decidedAt,
       failureFingerprint: fingerprint,
       resumptionGeneration,
+      operatorGuidance,
     };
   }
 }
