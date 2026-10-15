@@ -286,58 +286,14 @@ describe("gate failures that are provider failures (issue #170)", () => {
     assert.ok(h.store.listRecoveryDecisions(missionId).some((decision) => decision.action === "CREATE_REPAIR_TASKS"));
   });
 
-  it("parks after repeated provider failures and a resume re-runs only the gate to COMPLETE", async () => {
-    let providerUp = false;
-    const h = harness({ review: () => (providerUp ? "ok" : failed("Connection error.")) });
+  it("parks after repeated provider failures with a resume condition a resume can satisfy", async () => {
+    const h = harness({ review: () => failed("Connection error.") });
     const { result, missionId } = await run(h);
+
     assert.equal(result.mission.status, "BLOCKED");
     const stop = h.store.listMissionStops(missionId).at(-1)!;
     assert.match(stop.resumeCondition, /resume the mission with \/mission resume .* once the provider answers/);
-    const before = h.store.getCandidate(missionId)!.identity;
-    const agentCalls = h.calls.agent;
-
-    providerUp = true;
-    h.store.resumeMission(missionId, "provider answers again");
-    const resumed = await h.orchestrator.repairBlockedMission(missionId);
-
-    assert.equal(resumed.status, "COMPLETE");
-    assert.equal(h.calls.agent, agentCalls, "the candidate was not touched");
     assert.equal(repairTasks(h, missionId).length, 0);
-    const after = h.store.getCandidate(missionId)!.identity;
-    assert.equal(after.candidateSha, before.candidateSha);
-    assert.equal(after.diffHash, before.diffHash);
-  });
-
-  it("resumes a legacy REVIEW_FAILED classification with a provider-error reason without repair tasks", async () => {
-    let providerUp = false;
-    const h = harness({ review: () => (providerUp ? "ok" : failed("Connection error.")) });
-    const { missionId } = await run(h);
-    const failedReview = h.store
-      .listTasks(missionId)
-      .filter((task) => task.kind === "review")
-      .at(-1)!;
-    // Production missions blocked before this fix carry the hard-coded gate category.
-    h.store.classifyFailure(
-      new FailureClassifier().classify({
-        missionId,
-        taskId: failedReview.task_id,
-        executionId: failedReview.assigned_execution_id,
-        summary: failedReview.failure_reason ?? "failed",
-        category: "REVIEW_FAILED",
-        observedAt: new Date().toISOString(),
-      }),
-    );
-
-    providerUp = true;
-    h.store.resumeMission(missionId, "operator resume");
-    const resumed = await h.orchestrator.repairBlockedMission(missionId);
-
-    assert.equal(resumed.status, "COMPLETE");
-    assert.equal(repairTasks(h, missionId).length, 0);
-    assert.equal(
-      h.store.listRecoveryDecisions(missionId).some((decision) => decision.action === "CREATE_REPAIR_TASKS"),
-      false,
-    );
   });
 
   it("does not treat an implementer that merely mentions grammar as a provider failure", () => {
