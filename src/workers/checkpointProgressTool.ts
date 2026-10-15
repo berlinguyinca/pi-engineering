@@ -6,6 +6,12 @@ export interface CheckpointProgressClaim {
   candidateSha: string;
   evidencePaths: string[];
   artifactRefs: string[];
+  /**
+   * Set by `claim_deliverable`: the worker names only the deliverable, and the
+   * broker binds the claim to the worker branch tip at checkpoint time (sha and
+   * paths come from its own Git snapshot, never from the worker).
+   */
+  tipBound?: boolean;
 }
 
 /** Stable tool name (broker and executor event filters depend on it). */

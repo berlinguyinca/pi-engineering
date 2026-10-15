@@ -303,8 +303,24 @@ describe("realBackends capability routing", () => {
     }
     await backends.research.runAgent({ objective: "scout", signal: new AbortController().signal });
     await backends.review.runReview({ objective: "review", signal: new AbortController().signal });
-    assert.deepEqual(seen[0]?.tools, ["read", "edit", "write", "bash", "repo_search", "tests_for"]);
-    assert.deepEqual(seen[1]?.tools, ["read", "edit", "write", "bash", "repo_search", "tests_for"]);
+    assert.deepEqual(seen[0]?.tools, [
+      "read",
+      "edit",
+      "write",
+      "bash",
+      "repo_search",
+      "tests_for",
+      "claim_deliverable",
+    ]);
+    assert.deepEqual(seen[1]?.tools, [
+      "read",
+      "edit",
+      "write",
+      "bash",
+      "repo_search",
+      "tests_for",
+      "claim_deliverable",
+    ]);
     assert.equal(seen[0]?.tolerantFileTools, true);
     assert.ok(!seen[0]?.tools.includes("checkpoint_progress"));
     assert.deepEqual(seen[2]?.tools, ["ledger_read", "repo_search", "symbol", "tests_for"]);

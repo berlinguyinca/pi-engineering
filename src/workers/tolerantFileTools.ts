@@ -66,11 +66,31 @@ function similarity(a: string, b: string): number {
   return total === 0 ? 0 : (2 * shared) / total;
 }
 
-const numbered = (lines: string[], from: number, count: number): string =>
-  lines
-    .slice(from, from + count)
-    .map((line, index) => `${from + index + 1}\t${line}`)
-    .join("\n");
+const MAX_CANDIDATE_LINES = 20;
+const MAX_LINE_CHARS = 200;
+const MAX_ERROR_CHARS = 4096;
+
+/** Numbered lines from `from` (0-based), capped per candidate; long lines are clipped. */
+const numbered = (lines: string[], from: number, count: number): string => {
+  const shown = Math.min(count, MAX_CANDIDATE_LINES);
+  const out = lines
+    .slice(from, from + shown)
+    .map(
+      (line, index) =>
+        `${from + index + 1}\t${line.length > MAX_LINE_CHARS ? `${line.slice(0, MAX_LINE_CHARS)}...` : line}`,
+    );
+  if (count > shown) out.push(`... (${count - shown} more lines)`);
+  return out.join("\n");
+};
+
+/** A match with two lines of context on each side, so repeated matches can be told apart. */
+const withContext = (lines: string[], start: number, count: number): string => {
+  const from = Math.max(0, start - 2);
+  return numbered(lines, from, Math.min(count, MAX_CANDIDATE_LINES) + (start - from) + 2);
+};
+
+const capped = (message: string): Error =>
+  new Error(message.length > MAX_ERROR_CHARS ? `${message.slice(0, MAX_ERROR_CHARS)}\n... (truncated)` : message);
 
 function trimmedWindows(fileLines: string[], oldKeys: string[]): number[] {
   const starts: number[] = [];
@@ -100,6 +120,28 @@ function closestCandidates(fileLines: string[], oldLines: string[]): string {
         `Closest candidate (lines ${start + 1}-${Math.min(fileLines.length, start + oldLines.length)}):\n${numbered(fileLines, start, oldLines.length)}`,
     )
     .join("\n\n");
+}
+
+/**
+ * Why indentation cannot be mapped safely, or undefined when it can: the same
+ * model-side indent landing on different file indents (a flattened block), or a
+ * window that mixes tab and space indentation.
+ */
+function unsafeIndentation(oldLines: string[], fileWindow: string[]): string | undefined {
+  const seen = new Map<string, string>();
+  let tabs = false;
+  let spaces = false;
+  for (const [i, line] of oldLines.entries()) {
+    if (line.trim().length === 0) continue;
+    const fileIndent = indentOf(fileWindow[i] ?? "");
+    if (fileIndent.includes("\t")) tabs = true;
+    if (fileIndent.includes(" ")) spaces = true;
+    const previous = seen.get(indentOf(line));
+    if (previous !== undefined && previous !== fileIndent)
+      return "the indentation in oldText does not follow the file's nesting";
+    seen.set(indentOf(line), fileIndent);
+  }
+  return tabs && spaces ? "the matched lines mix tab and space indentation" : undefined;
 }
 
 /** Re-indent `newText` from the model's indentation onto the file's, using the matched line pairs. */
@@ -136,8 +178,8 @@ function resolveEdit(content: string, edit: EditPair, index: number, path: strin
         fileLines,
         oldText.split("\n").map((l) => l.trim()),
       ).slice(0, 5);
-      throw new Error(
-        `${label} matches more than one place; add surrounding lines so it is unique.\n${starts.map((s) => numbered(fileLines, s, 1)).join("\n")}`,
+      throw capped(
+        `${label} matches more than one place; add surrounding lines so it is unique.\n${starts.map((s) => withContext(fileLines, s, 1)).join("\n--\n")}`,
       );
     }
   }
@@ -146,7 +188,7 @@ function resolveEdit(content: string, edit: EditPair, index: number, path: strin
   const keys = oldLines.map((line) => line.trim());
   const starts = keys.every((key) => key === "") ? [] : trimmedWindows(fileLines, keys);
   if (starts.length > 1) {
-    throw new Error(
+    throw capped(
       `${label} matches ${starts.length} places once whitespace is ignored; add surrounding lines so it is unique. Candidate lines:\n${starts
         .slice(0, 5)
         .map((s) => numbered(fileLines, s, oldLines.length))
@@ -155,11 +197,17 @@ function resolveEdit(content: string, edit: EditPair, index: number, path: strin
   }
   const start = starts[0];
   if (start === undefined) {
-    throw new Error(
+    throw capped(
       `No unique match for ${label}, even ignoring whitespace. ${closestCandidates(fileLines, oldLines)}\nRe-read the file (read shows line numbers) and copy the text exactly.`,
     );
   }
   const window = fileLines.slice(start, start + oldLines.length);
+  const unsafe = unsafeIndentation(oldLines, window);
+  if (unsafe) {
+    throw capped(
+      `No safe match for ${label}: ${unsafe}, so the replacement cannot be re-indented reliably. Copy the lines exactly, indentation included:\n${numbered(fileLines, start, oldLines.length)}`,
+    );
+  }
   const trailingNewline = oldText.endsWith("\n") && edit.newText.endsWith("\n");
   const newText = reindent(trailingNewline ? edit.newText.slice(0, -1) : edit.newText, oldLines, window);
   return { edit: { oldText: window.join("\n"), newText }, tolerant: true };

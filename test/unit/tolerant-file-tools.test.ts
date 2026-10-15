@@ -70,6 +70,60 @@ describe("tolerant edit", () => {
   });
 });
 
+describe("tolerant edit safety", () => {
+  it("refuses a flattened Python oldText instead of corrupting nesting", async () => {
+    const original = "def f(x):\n    if x:\n        run()\n        stop()\n    return x\n";
+    await writeFile(join(dir, "a.py"), original);
+    await assert.rejects(
+      edit("a.py", [{ oldText: "if x:\nrun()\nstop()", newText: "if x:\nrun()\nstop()\nextra()" }]),
+      (error: Error) => {
+        assert.match(error.message, /No safe match/);
+        assert.match(error.message, /2\t {4}if x:/);
+        return true;
+      },
+    );
+    assert.equal(await readFile(join(dir, "a.py"), "utf8"), original);
+  });
+
+  it("refuses a flattened YAML oldText", async () => {
+    const original = "services:\n  web:\n    image: a\n    ports:\n      - 80\n";
+    await writeFile(join(dir, "a.yml"), original);
+    await assert.rejects(
+      edit("a.yml", [{ oldText: "web:\nimage: a\nports:", newText: "web:\nimage: b\nports:" }]),
+      /No safe match/,
+    );
+    assert.equal(await readFile(join(dir, "a.yml"), "utf8"), original);
+  });
+
+  it("refuses a window that mixes tab and space indentation", async () => {
+    await writeFile(join(dir, "a.ts"), "{\n\tfoo();\n    bar();\n}\n");
+    await assert.rejects(edit("a.ts", [{ oldText: "  foo();\n    bar();", newText: "x" }]), /mix tab and space/);
+  });
+
+  it("caps candidate output at 20 lines per candidate and about 4 KB overall", async () => {
+    const lines = Array.from({ length: 60 }, (_, i) => `line ${i} ${"x".repeat(300)}`);
+    await writeFile(join(dir, "a.ts"), lines.join("\n"));
+    const oldText = lines
+      .slice(0, 50)
+      .map((l) => `${l}!`)
+      .join("\n");
+    await assert.rejects(edit("a.ts", [{ oldText, newText: "y" }]), (error: Error) => {
+      assert.ok(error.message.length <= 4200, `error length ${error.message.length}`);
+      assert.doesNotMatch(error.message, /\n21\t/);
+      return true;
+    });
+  });
+
+  it("shows context around each exact-multiple match", async () => {
+    await writeFile(join(dir, "a.ts"), "a\nb\ntarget\nc\nd\ne\nf\ntarget\ng\n");
+    await assert.rejects(edit("a.ts", [{ oldText: "target", newText: "t" }]), (error: Error) => {
+      assert.match(error.message, /1\ta\n2\tb\n3\ttarget\n4\tc\n5\td/);
+      assert.match(error.message, /6\te\n7\tf\n8\ttarget\n9\tg/);
+      return true;
+    });
+  });
+});
+
 describe("numbered read", () => {
   it("prefixes every line with its 1-based line number", async () => {
     await writeFile(join(dir, "a.ts"), "first\nsecond\nthird");

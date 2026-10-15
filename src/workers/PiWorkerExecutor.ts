@@ -90,6 +90,7 @@ import {
 } from "./activity.ts";
 import { BuildCommandTimer } from "./buildActivity.ts";
 import { CHECKPOINT_PROGRESS_TOOL_NAME, createCheckpointProgressTool } from "./checkpointProgressTool.ts";
+import { CLAIM_DELIVERABLE_TOOL_NAME, createClaimDeliverableTool } from "./claimDeliverableTool.ts";
 import { registerLocalProviders } from "./localProviders.ts";
 import { WORKER_KICKOFF, buildSystemPrompt, wantsCommitDiscipline } from "./prompts.ts";
 import { guardRuntimeRequestBody } from "./requestBodyGuard.ts";
@@ -488,6 +489,7 @@ ${TOOL_TRANSITION_RULE}`;
     const customTools = [
       ...this.customTools,
       ...(req.tolerantFileTools ? [createNumberedReadTool(req.cwd), createTolerantEditTool(req.cwd)] : []),
+      ...(offersClaimDeliverable(req) ? [createClaimDeliverableTool(req.deliverables ?? [])] : []),
       ...(offersCheckpointProgress(req) ? [createCheckpointProgressTool(req.deliverables ?? [])] : []),
       terminating,
     ];
@@ -1210,10 +1212,19 @@ ${recovery.recoveryPrompt}`;
         });
       }
       const activityToolName = "toolName" in event ? event.toolName : undefined;
-      if (activity && activityToolName !== terminatingName && activityToolName !== CHECKPOINT_PROGRESS_TOOL_NAME) {
+      if (
+        activity &&
+        activityToolName !== terminatingName &&
+        activityToolName !== CHECKPOINT_PROGRESS_TOOL_NAME &&
+        activityToolName !== CLAIM_DELIVERABLE_TOOL_NAME
+      ) {
         emitWorkerActivity(req, activity);
       }
-      if (event.type === "tool_execution_end" && event.toolName === CHECKPOINT_PROGRESS_TOOL_NAME && !event.isError) {
+      if (
+        event.type === "tool_execution_end" &&
+        (event.toolName === CHECKPOINT_PROGRESS_TOOL_NAME || event.toolName === CLAIM_DELIVERABLE_TOOL_NAME) &&
+        !event.isError
+      ) {
         const details = event.result?.details as { claims?: unknown } | undefined;
         emitWorkerActivity(req, {
           kind: "checkpoint",
@@ -1623,6 +1634,11 @@ export function buildCompactedWorkerPrompt(req: WorkerRequest, recoveryPrompt: s
       `- Declared checkpoint deliverables: ${(req.deliverables ?? []).map((d) => `"${d}"`).join(", ")}. After a coherent commit, call checkpoint_progress claiming the deliverable with the EXACT declared string (no paraphrasing) plus the exact git rev-parse HEAD and committed evidence paths.`,
     );
   }
+  if (offersClaimDeliverable(req)) {
+    parts.push(
+      `- Declared deliverables: ${(req.deliverables ?? []).map((d) => `"${d}"`).join(", ")}. When one is finished, call claim_deliverable with its name.`,
+    );
+  }
   parts.push(`- Your final action MUST be calling the worker_result tool.`);
   parts.push(`- Do not ask questions. Do not emit an assistant answer after calling worker_result.`);
 
@@ -1646,6 +1662,10 @@ export function withIdempotencyEvidence(prompt: string, tracker: ExecutedActionT
  * `checkpoint_progress` is opt-in by name. Mission workers do not get it: the
  * broker derives checkpoints from the worker branch's commits.
  */
+function offersClaimDeliverable(req: WorkerRequest): boolean {
+  return !!req.deliverables?.length && req.tools.includes(CLAIM_DELIVERABLE_TOOL_NAME);
+}
+
 function offersCheckpointProgress(req: WorkerRequest): boolean {
   return !!req.deliverables?.length && req.tools.includes(CHECKPOINT_PROGRESS_TOOL_NAME);
 }

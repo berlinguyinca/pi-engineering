@@ -107,9 +107,18 @@ export type RouteModel = (role: string, opts?: RouteModelOptions) => Promise<Mod
 /**
  * Mission implementer/repair tools: Pi's file tools (line-numbered `read`,
  * whitespace-tolerant `edit`, `write`) plus search. No ledger/artifact tools and
- * no `checkpoint_progress`: the broker derives checkpoints from the branch.
+ * no `checkpoint_progress`: `claim_deliverable` names only the deliverable and
+ * the broker derives sha and paths from the branch.
  */
-export const IMPLEMENTER_TOOLS: readonly string[] = ["read", "edit", "write", "bash", "repo_search", "tests_for"];
+export const IMPLEMENTER_TOOLS: readonly string[] = [
+  "read",
+  "edit",
+  "write",
+  "bash",
+  "repo_search",
+  "tests_for",
+  "claim_deliverable",
+];
 
 const MODEL_GONE_MARKERS: ReadonlySet<string> = new Set(["transient:model_unavailable", "unknown-model"]);
 

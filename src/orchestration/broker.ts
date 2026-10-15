@@ -2605,7 +2605,22 @@ export class ExecutionBroker {
             assertOrigin();
             const snapshot = await this.checkpointSnapshot(execution.execution_id, input, repository, assertOrigin);
             assertOrigin();
-            for (const claim of checkpointClaims.values()) {
+            for (const rawClaim of checkpointClaims.values()) {
+              // A tip-bound claim (claim_deliverable) names only the deliverable:
+              // sha and paths come from this snapshot. It counts only once the
+              // worker branch holds commits past the base; until then it waits
+              // for a later checkpoint instead of being rejected.
+              if (rawClaim.tipBound && (snapshot.candidateSha === null || snapshot.committedChanges.length === 0)) {
+                continue;
+              }
+              const claim: CheckpointProgressClaim = rawClaim.tipBound
+                ? {
+                    deliverable: rawClaim.deliverable,
+                    candidateSha: snapshot.candidateSha ?? "",
+                    evidencePaths: [...snapshot.committedChanges],
+                    artifactRefs: [],
+                  }
+                : rawClaim;
               const claimIdentity = `${claim.deliverable}:${claim.candidateSha}:${claim.evidencePaths.join(",")}:${claim.artifactRefs.join(",")}`;
               let captured = capturedCheckpointArtifacts.get(claimIdentity);
               let artifactsValid = claim.artifactRefs.length === 0;
@@ -3011,7 +3026,9 @@ export class ExecutionBroker {
               earlyHarvest = await this.harvestWorktree(execution.execution_id, input.authority);
             }
             queueCheckpoint(
-              outcome.exitStatus === "succeeded" ? [...(input.deliverables ?? [])] : [],
+              outcome.exitStatus === "succeeded" && earlyHarvest !== "unverified"
+                ? [...(input.deliverables ?? [])]
+                : [],
               outcome.artifactRefs,
               outcome.artifactRefs.map(artifactHash),
             );

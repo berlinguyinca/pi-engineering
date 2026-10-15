@@ -3220,6 +3220,30 @@ describe("ExecutionBroker (spec 03)", () => {
     }
   });
 
+  it("fails a worker that writes outside its write domain with WORKSPACE_SCOPE_MISMATCH and never harvests the write", async () => {
+    const context = await cancellationCheckpointFixture(async ({ worktree }) => {
+      assert.ok(worktree);
+      await writeFile(join(worktree, "src", "allowed.ts"), "export const allowed = true;\n", "utf8");
+      await writeFile(join(worktree, "excluded.txt"), "outside the write domain\n", "utf8");
+      return { executionId: "e", exitStatus: "succeeded", summary: "wrote", artifactRefs: [], usage: {} };
+    });
+    try {
+      const outcome = await context.handle
+        .result()
+        .catch((error: Error) => ({ exitStatus: "failed", summary: error.message }));
+      assert.equal(outcome.exitStatus, "failed");
+      assert.match(outcome.summary, /WORKSPACE_SCOPE_MISMATCH/);
+      const log = await exec("git", ["-C", context.fx.root, "log", "--all", "--format=%s"]);
+      assert.ok(!log.stdout.includes("orchestration work"), `no harvest commit may exist, got: ${log.stdout}`);
+      const execution = context.store.getExecution(context.handle.executionId)!;
+      const checkpoint = execution.checkpoint_id ? context.store.getTaskCheckpoint(execution.checkpoint_id) : undefined;
+      assert.ok(!checkpoint?.committedChanges.includes("excluded.txt"));
+      assert.deepEqual([...(checkpoint?.completedDeliverables ?? [])], []);
+    } finally {
+      await context.fx.cleanup();
+    }
+  });
+
   it("surfaces an attributable finding when a mutating worker succeeds with no edits to harvest", async () => {
     const fx = await makeFixtureRepo();
     try {

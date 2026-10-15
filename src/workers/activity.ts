@@ -54,6 +54,8 @@ function safeCheckpointClaims(value: unknown): CheckpointProgressClaim[] | undef
           .filter(Boolean)
           .slice(0, 32)
       : [];
+    if (deliverable && claim.tipBound === true)
+      return [{ deliverable, candidateSha: "", evidencePaths: [], artifactRefs: [], tipBound: true }];
     return deliverable && candidateSha && evidencePaths.length > 0
       ? [{ deliverable, candidateSha, evidencePaths, artifactRefs }]
       : [];
