@@ -15,7 +15,7 @@
 import { createHash } from "node:crypto";
 import type { ArtifactStore } from "../artifacts/ArtifactStore.ts";
 import { modelFamily, sameFamily as sameFamilyId } from "../capability/modelRecord.ts";
-import { type RegistryModel, rankRegistryModels } from "../capability/registryCandidates.ts";
+import { type RegistryModel, filterEnabledModels, rankRegistryModels } from "../capability/registryCandidates.ts";
 import { id } from "../core/ids.ts";
 import type { CandidateLifecycle, GitRepo, IntegrationRunRecord } from "../git/GitRepo.ts";
 import type { WorktreeInfo } from "../git/GitRepo.ts";
@@ -70,6 +70,8 @@ export interface RealBackendsOptions {
    * unreachable provider), the role is placed from here.
    */
   registryModels?: () => Promise<readonly RegistryModel[]> | readonly RegistryModel[];
+  /** Pi's `enabledModels` globs: the registry fallback stays inside them while any model matches. */
+  enabledModels?: () => readonly string[] | undefined;
   /**
    * The operator pin a mission dispatches with right now (Pi `/model`),
    * adopting the session's latest choice. A change while a worker is waiting
@@ -370,14 +372,23 @@ export function realBackends(opts: RealBackendsOptions) {
       return undefined;
     }
     const live = models.filter((model) => !opts.isModelUnavailable?.(model));
-    const [best] = rankRegistryModels(live, { exclude, producers, skipProvider: cooling });
+    const patterns = opts.enabledModels?.();
+    const scoped = filterEnabledModels(live, patterns);
+    const rank = (pool: readonly RegistryModel[]) =>
+      rankRegistryModels(pool, { exclude, producers, skipProvider: cooling })[0];
+    let best = rank(scoped);
+    let outside = "";
+    if (!best && scoped.length < live.length) {
+      best = rank(live);
+      outside = `; nothing enabled by ${patterns?.join(", ")} is live`;
+    }
     if (!best) return undefined;
     const coolingProviders = [...new Set(models.map((model) => model.provider))].filter(cooling);
     const why = coolingProviders.length > 0 ? ` (${coolingProviders.join(", ")} on cooldown)` : "";
     return {
       provider: best.provider,
       id: best.id,
-      registryNotice: `${role}: no routing candidate; chose ${modelKey(best)} from the model registry${why}`,
+      registryNotice: `${role}: no routing candidate; chose ${modelKey(best)} from the model registry${why}${outside}`,
     };
   };
   const repository = async (repoId?: string): Promise<{ git: GitRepo | null; cwd: string }> =>

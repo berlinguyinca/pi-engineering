@@ -40,3 +40,24 @@ export function rankRegistryModels(
       tier(a) - tier(b) || (b.contextWindow ?? 0) - (a.contextWindow ?? 0) || modelKey(a).localeCompare(modelKey(b)),
   );
 }
+
+/**
+ * Keep the models Pi's `enabledModels` patterns allow (case-insensitive globs
+ * over `provider/id` or the bare id, an optional `:thinking` suffix ignored).
+ * An absent or empty pattern list allows everything.
+ */
+export function filterEnabledModels<T extends ModelRef>(
+  models: readonly T[],
+  patterns: readonly string[] | undefined,
+): T[] {
+  if (!patterns || patterns.length === 0) return [...models];
+  const matchers = patterns.map((pattern) => {
+    const glob = pattern.replace(/:(off|minimal|low|medium|high|xhigh)$/i, "");
+    const source = glob
+      .split("*")
+      .map((part) => part.replace(/[.+?^${}()|[\]\\]/g, "\\$&"))
+      .join(".*");
+    return new RegExp(`^${source}$`, "i");
+  });
+  return models.filter((model) => matchers.some((re) => re.test(modelKey(model)) || re.test(model.id)));
+}

@@ -109,7 +109,13 @@ const dead: ModelRef = { provider: "beast", id: "qwen3.8-27b-q4" };
 const live: ModelRef = { provider: "hive", id: "glm-5.3-flash" };
 const noPolicy: RouteModel = async () => undefined;
 
-function setup(baseUrls: Record<string, string>, pool: RegistryModel[], routeModel: RouteModel, session = dead) {
+function setup(
+  baseUrls: Record<string, string>,
+  pool: RegistryModel[],
+  routeModel: RouteModel | undefined,
+  session = dead,
+  enabledModels?: string[],
+) {
   const notices: string[] = [];
   const dir = mkdtempSync(join(tmpdir(), "pi-review-registry-"));
   const providers: Record<string, unknown> = {};
@@ -142,6 +148,7 @@ function setup(baseUrls: Record<string, string>, pool: RegistryModel[], routeMod
     routeModel,
     reviewFallbackModel: session,
     registryModels: () => pool,
+    enabledModels: () => enabledModels,
   });
   const review = () =>
     backends.review.runReview({
@@ -274,6 +281,89 @@ test("the registry prefers a family different from the implementer's, then the l
     const outcome = await review();
     assert.equal(outcome.exitStatus, "succeeded", outcome.summary);
     assert.deepEqual(outcome.model, { provider: otherBig.provider, id: otherBig.id });
+  } finally {
+    await close(good);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("the registry fallback stays inside Pi's enabledModels even when an excluded provider is alive", async () => {
+  const good = await listen((_req, res) => reviewReply(res));
+  const url = `http://127.0.0.1:${port(good)}/v1`;
+  const beastBig: RegistryModel = { ...dead, contextWindow: 900_000 };
+  const hiveSmall: RegistryModel = { ...live, contextWindow: 100_000 };
+  const { dir, review } = setup({ beast: url, hive: url }, [beastBig, hiveSmall], noPolicy, dead, ["hive/*"]);
+  try {
+    const outcome = await review();
+    assert.equal(outcome.exitStatus, "succeeded", outcome.summary);
+    assert.deepEqual(outcome.model, live);
+  } finally {
+    await close(good);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("an absent routeModel still places the reviewer on a live registry model", async () => {
+  const deadPort = await closedPort();
+  const good = await listen((_req, res) => reviewReply(res));
+  const { dir, review } = setup(
+    { beast: `http://127.0.0.1:${deadPort}/v1`, hive: `http://127.0.0.1:${port(good)}/v1` },
+    [dead, live],
+    undefined,
+  );
+  try {
+    const outcome = await review();
+    assert.equal(outcome.exitStatus, "succeeded", outcome.summary);
+    assert.deepEqual(outcome.model, live);
+  } finally {
+    await close(good);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("an implementer whose session default is cooling starts on the registry model", async () => {
+  const flaky = await resetting();
+  // The first request is the review that cools beast; the next is the implementer's.
+  let requests = 0;
+  const good = await listen((_req, res) => (requests++ === 0 ? reviewReply(res) : doneReply(res)));
+  const { dir, review, backends } = setup(
+    { beast: `http://127.0.0.1:${port(flaky.server)}/v1`, hive: `http://127.0.0.1:${port(good)}/v1` },
+    [dead, live],
+    noPolicy,
+  );
+  try {
+    assert.equal((await review()).exitStatus, "succeeded");
+    const after = flaky.hits();
+    const run = await backends.agent.runAgent({
+      role: "implementer",
+      objective: "implement",
+      missionId: "MSN-2",
+      signal: new AbortController().signal,
+    });
+    assert.deepEqual(run.model, live);
+    assert.equal(flaky.hits(), after, "the cooling default is not dialled for the implementer");
+  } finally {
+    await close(flaky.server, good);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("an implementer refused by its default provider walks to the registry model", async () => {
+  const deadPort = await closedPort();
+  const good = await listen((_req, res) => doneReply(res));
+  const { dir, backends } = setup(
+    { beast: `http://127.0.0.1:${deadPort}/v1`, hive: `http://127.0.0.1:${port(good)}/v1` },
+    [dead, live],
+    noPolicy,
+  );
+  try {
+    const run = await backends.agent.runAgent({
+      role: "implementer",
+      objective: "implement",
+      missionId: "MSN-3",
+      signal: new AbortController().signal,
+    });
+    assert.deepEqual(run.model, live);
   } finally {
     await close(good);
     rmSync(dir, { recursive: true, force: true });

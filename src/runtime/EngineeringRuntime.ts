@@ -3,6 +3,7 @@ import { mkdir, rename, unlink, writeFile } from "node:fs/promises";
 import { hostname } from "node:os";
 import { join, resolve } from "node:path";
 import type { Model } from "@earendil-works/pi-ai/compat";
+import { SettingsManager, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { ArtifactStore } from "../artifacts/ArtifactStore.ts";
 import { BlackholeManager, type BlackholeManagerOptions } from "../blackhole/BlackholeManager.ts";
 import type { RoleRouterAdapter } from "../capability/adapter.ts";
@@ -1057,6 +1058,13 @@ export class EngineeringRuntime {
                 contextWindow: model.contextWindow,
               }))
             : [],
+        enabledModels: () => {
+          try {
+            return SettingsManager.create(repoRoot, opts.agentDir ?? getAgentDir()).getEnabledModels();
+          } catch {
+            return undefined;
+          }
+        },
         currentOperatorPin,
         repository: async (repoId) => {
           if (repoId) {
