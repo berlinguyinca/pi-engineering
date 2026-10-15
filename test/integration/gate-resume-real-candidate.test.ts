@@ -26,6 +26,14 @@ interface Options {
   unverifiableCandidate?: boolean;
   /** Which gate failed; defaults to validation. */
   gate?: "validation" | "review";
+  /** Validation already SUCCEEDED with Git-verified evidence for the candidate before the stop. */
+  validatedBeforeStop?: boolean;
+  /** A previous process owned the mission (lease generation 1) and stamped its work with that generation. */
+  priorOwner?: boolean;
+  /** The re-run validation fails its tests. */
+  rerunValidationFails?: boolean;
+  /** The re-run review asks for changes with a blocking finding. */
+  rerunReviewRequestsChanges?: boolean;
 }
 
 async function harness(options: Options) {
@@ -74,6 +82,12 @@ async function harness(options: Options) {
   for (const status of ["CLASSIFYING", "PLANNING", "READY", "EXECUTING"] as const) {
     store.transitionMission(missionId, status);
   }
+  if (options.validatedBeforeStop) {
+    store.updateMission(missionId, { required_gates: ["validation", "independent_review"] });
+  }
+  const priorOwnership = options.priorOwner ? new MissionOwnership(store, { ownerId: "prior-process" }) : undefined;
+  const priorLease = await priorOwnership?.acquire(missionId);
+  const gen = priorLease?.generation ?? 0;
   const runTask = (
     taskId: string,
     kind: "integration" | "validation" | "review",
@@ -87,6 +101,7 @@ async function harness(options: Options) {
       role: kind === "integration" ? "integrator" : kind === "review" ? "reviewer" : "validator",
       objective: `${kind} task`,
       repo_id: "repo-gate-resume",
+      mission_generation: gen,
     });
     store.transitionTask(taskId, "READY");
     const execution = store.createExecution({
@@ -95,6 +110,7 @@ async function harness(options: Options) {
       backend: kind,
       repo_id: "repo-gate-resume",
       base_sha: baseSha,
+      mission_generation: gen,
     });
     store.transitionTask(taskId, "RUNNING", "system", { assigned_execution_id: execution.execution_id });
     store.setExecutionStatus(execution.execution_id, "RUNNING");
@@ -109,7 +125,7 @@ async function harness(options: Options) {
     missionId,
     buildCandidateEvidenceIdentity({
       workspaceManifestHash: manifest.hash,
-      missionGeneration: 0,
+      missionGeneration: gen,
       repoId: "repo-gate-resume",
       baseSha,
       candidateSha,
@@ -120,6 +136,26 @@ async function harness(options: Options) {
     "candidate",
     { taskId: "TSK-candidate", executionId: integration.execution_id },
   );
+  if (options.validatedBeforeStop) {
+    const validation = runTask("TSK-validated", "validation", "SUCCEEDED");
+    const candidate = store.getCandidate(missionId)!;
+    store.recordValidationEvidence({
+      evidenceId: "EV-validated",
+      missionId,
+      taskId: "TSK-validated",
+      executionId: validation.execution_id,
+      identity: candidate.identity,
+      identityHash: candidate.identityHash,
+      command: "test",
+      profile: "test",
+      exitCode: 0,
+      testSummary: { passed: 1 },
+      noTargets: false,
+      accessible: true,
+      acceptanceResults: [],
+      recordedAt: new Date().toISOString(),
+    });
+  }
   const failedExecution = runTask("TSK-failed-gate", options.gate ?? "validation", "FAILED", options.failureReason);
   store.classifyFailure(
     new FailureClassifier().classify({
@@ -138,6 +174,7 @@ async function harness(options: Options) {
     attemptedRecoveries: [],
     resumeCondition: "resume once the provider answers",
   });
+  if (priorLease) await priorOwnership!.release(priorLease);
   const registry = new RepositoryRegistry();
   await registry.register(manifest);
   const calls = { validation: 0, review: 0, agent: 0 };
@@ -166,6 +203,7 @@ async function harness(options: Options) {
         validation: {
           runValidation: async () => {
             calls.validation++;
+            if (options.rerunValidationFails) throw new Error("test failed: expected 1 got 2");
             return {
               executionId: "validation",
               exitStatus: "succeeded",
@@ -187,20 +225,27 @@ async function harness(options: Options) {
         review: {
           runReview: async () => {
             calls.review++;
+            const findings = options.rerunReviewRequestsChanges
+              ? [{ summary: "missing edge case", severity: "blocking", status: "open" }]
+              : [];
             return {
               executionId: "review",
               exitStatus: "succeeded",
               summary: "approved",
               artifactRefs: [],
               usage: {},
-              findings: [],
+              findings,
               reviewEvidence: {
                 reviewerSessionId: "review-gate-resume",
                 model: "test",
                 provider: "test",
-                verdict: "approve",
+                verdict: findings.length > 0 ? "request_changes" : "approve",
                 independenceMode: "independent",
-                findings: [],
+                findings: findings.map((finding) => ({
+                  severity: "blocking" as const,
+                  summary: finding.summary,
+                  status: "open" as const,
+                })),
                 outputValid: true,
                 accessible: true,
                 acceptanceResults: [],
@@ -290,6 +335,103 @@ describe("gate resume against a Git-verified candidate (issue #170)", () => {
       assert.equal(h.calls.agent, 0);
       const next = new MissionOwnership(h.store, { ownerId: "next-controller" });
       await assert.doesNotReject(() => next.acquire(h.missionId));
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("re-runs the validation a new generation invalidated, then the review, and completes", async () => {
+    const h = await harness({
+      category: "PROVIDER_TRANSIENT",
+      failureReason: "failed: Connection error.",
+      gate: "review",
+      validatedBeforeStop: true,
+      priorOwner: true,
+    });
+    try {
+      const freshProcess = h.buildOrchestrator(new MissionOwnership(h.store, { ownerId: "fresh-validated" }));
+      h.store.resumeMission(h.missionId, "operator resumed from a new session");
+      const resumed = await freshProcess.repairBlockedMission(h.missionId);
+
+      const stop = h.store.listMissionStops(h.missionId).at(-1);
+      assert.equal(resumed.status, "COMPLETE", JSON.stringify({ ...SIGNALS(h), stop }));
+      assert.equal(h.calls.review, 1);
+      assert.equal(h.calls.validation, 1, "validation evidence invalidated by the new generation re-runs exactly once");
+      assert.equal(h.calls.agent, 0);
+      const lease = h.store.getLatestMissionLease(h.missionId)!;
+      const evidence = h.store.listValidationEvidence(h.missionId).at(-1)!;
+      assert.notEqual(evidence.taskId, "TSK-validated");
+      assert.equal(evidence.identity.missionGeneration, lease.generation);
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("routes a validation failure inside the missing-gate re-run to the normal repair path", async () => {
+    const h = await harness({
+      category: "PROVIDER_TRANSIENT",
+      failureReason: "failed: Connection error.",
+      gate: "review",
+      validatedBeforeStop: true,
+      priorOwner: true,
+      rerunValidationFails: true,
+    });
+    try {
+      const freshProcess = h.buildOrchestrator(new MissionOwnership(h.store, { ownerId: "fresh-red" }));
+      h.store.resumeMission(h.missionId, "operator resumed from a new session");
+      const resumed = await freshProcess.repairBlockedMission(h.missionId);
+
+      assert.notEqual(resumed.status, "COMPLETE");
+      assert.equal(h.calls.review, 0, "no review runs over a red validation");
+      assert.ok(
+        h.store.listTasks(h.missionId).some((task) => task.kind === "validation" && task.status === "FAILED"),
+        "the failed validation is a failed gate",
+      );
+      assert.ok(SIGNALS(h).actions.includes("CREATE_REPAIR_TASKS"), JSON.stringify(SIGNALS(h)));
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("creates repair work when the re-run review requests changes", async () => {
+    const h = await harness({
+      category: "PROVIDER_TRANSIENT",
+      failureReason: "failed: Connection error.",
+      gate: "review",
+      validatedBeforeStop: true,
+      priorOwner: true,
+      rerunReviewRequestsChanges: true,
+    });
+    try {
+      const freshProcess = h.buildOrchestrator(new MissionOwnership(h.store, { ownerId: "fresh-changes" }));
+      h.store.resumeMission(h.missionId, "operator resumed from a new session");
+      const resumed = await freshProcess.repairBlockedMission(h.missionId);
+
+      assert.notEqual(resumed.status, "COMPLETE");
+      assert.ok(SIGNALS(h).actions.includes("CREATE_REPAIR_TASKS"), JSON.stringify(SIGNALS(h)));
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("plans a single PROBE_AND_BACKOFF decision per resumption", async () => {
+    const h = await harness({
+      category: "PROVIDER_TRANSIENT",
+      failureReason: "failed: Connection error.",
+      gate: "review",
+      validatedBeforeStop: true,
+      priorOwner: true,
+    });
+    try {
+      const freshProcess = h.buildOrchestrator(new MissionOwnership(h.store, { ownerId: "fresh-single-probe" }));
+      h.store.resumeMission(h.missionId, "operator resumed from a new session");
+      await freshProcess.repairBlockedMission(h.missionId);
+      const generation = h.store.listMissionResumptions(h.missionId).at(-1)!.generation;
+      const probes = h.store
+        .listRecoveryDecisions(h.missionId)
+        .filter((d) => d.action === "PROBE_AND_BACKOFF" && (d.resumptionGeneration ?? 0) === generation);
+      assert.equal(probes.length, 1, JSON.stringify(probes.map((d) => [d.recoveryId, d.status])));
+      assert.equal(probes[0]!.status, "succeeded");
     } finally {
       await h.cleanup();
     }
