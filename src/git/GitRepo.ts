@@ -1301,6 +1301,17 @@ export class GitRepo {
     return r.stdout || null;
   }
 
+  /**
+   * Newest commit reachable from HEAD but not from `commit` that touches `paths`,
+   * or null when none does. Reachability (not commit date) decides, so a scope
+   * commit on a merged side branch is never masked by an older ancestor.
+   */
+  async lastCommitTouchingSince(commit: string, paths: string[]): Promise<string | null> {
+    const args = ["log", "-1", "--format=%H", `${commit}..HEAD`, "--", ...paths];
+    const r = this.requireQuery(await this.git(args), "scope commits since query", args);
+    return r.stdout || null;
+  }
+
   async headCommit(): Promise<string> {
     const r = await this.git(["rev-parse", "HEAD"]);
     if (r.code !== 0) throw new Error(`git rev-parse HEAD failed: ${r.stderr}`);

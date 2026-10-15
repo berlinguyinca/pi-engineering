@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
@@ -133,5 +133,37 @@ describe("dogfood real mission record", () => {
         return true;
       },
     );
+  });
+
+  it("writes nothing to --out on exit 2 and reports --out / --timeout-ms validation errors", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "dogfood-args-"));
+    try {
+      const out = join(dir, "never.json");
+      const gateway = {
+        ...process.env,
+        PI_DOGFOOD_GATEWAY_BASE_URL: "http://127.0.0.1:1/v1",
+        PI_DOGFOOD_GATEWAY_API_KEY: "k",
+        PI_DOGFOOD_MODEL: "p/m",
+      };
+      const env = { ...process.env };
+      for (const k of ["PI_DOGFOOD_GATEWAY_BASE_URL", "PI_DOGFOOD_GATEWAY_API_KEY", "PI_DOGFOOD_MODEL"]) delete env[k];
+      await assert.rejects(exec("node", [SCRIPT, "--out", out], { env }), (e: { code?: number }) => e.code === 2);
+      await assert.rejects(exec("node", [SCRIPT], { env: gateway }), (e: { code?: number; stderr?: string }) => {
+        assert.equal(e.code, 2);
+        assert.match(e.stderr ?? "", /usage: .*--out/);
+        return true;
+      });
+      await assert.rejects(
+        exec("node", [SCRIPT, "--out", out, "--timeout-ms", "soon"], { env: gateway }),
+        (e: { code?: number; stderr?: string }) => {
+          assert.equal(e.code, 2);
+          assert.match(e.stderr ?? "", /--timeout-ms must be a positive number/);
+          return true;
+        },
+      );
+      await assert.rejects(stat(out), { code: "ENOENT" });
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });

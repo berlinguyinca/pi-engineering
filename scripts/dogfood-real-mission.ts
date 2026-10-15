@@ -68,15 +68,14 @@ const modelId = modelEnv.includes("/") ? modelEnv.slice(modelEnv.indexOf("/") + 
 const stateRoot = await mkdtemp(join(tmpdir(), "pi-dogfood-state-"));
 process.env.PI_ENGINEERING_STATE_DIR = join(stateRoot, "state");
 process.env.PI_ENGINEERING_HOME = join(stateRoot, "home");
-process.env.PI_SELF_UPDATE = "0";
 
 const { EngineeringRuntime } = await import("../src/runtime/EngineeringRuntime.ts");
 const { buildDogfoodRecord, allComplete, summariseMission } = await import("../src/orchestration/dogfoodRecord.ts");
 const { explainMission, formatMissionWhy } = await import("../src/orchestration/missionWhy.ts");
 
-async function write(path: string, contents: string): Promise<void> {
+async function write(path: string, contents: string, mode = 0o644): Promise<void> {
   await mkdir(dirname(path), { recursive: true });
-  await writeFile(path, contents, "utf8");
+  await writeFile(path, contents, { encoding: "utf8", mode });
 }
 
 async function git(cwd: string, ...args: string[]): Promise<string> {
@@ -122,25 +121,63 @@ async function writeAgentDir(): Promise<string> {
         },
       },
     }),
+    0o600,
   );
   await write(
     join(agentDir, "settings.json"),
     JSON.stringify({ defaultProvider: PROVIDER, defaultModel: modelId, enabledModels: [`${PROVIDER}/*`] }),
+    0o600,
   );
   return agentDir;
 }
 
 const agentDir = await writeAgentDir();
+// The key now lives only in the 0600 agent dir; spawned workers inherit
+// process.env, so drop it from there.
+delete process.env.PI_DOGFOOD_GATEWAY_API_KEY;
+
 const mainSha = await git(REPO_ROOT, "rev-parse", "HEAD");
 const summaries: Awaited<ReturnType<typeof summariseMission>>[] = [];
 let failedWhy: string | null = null;
+type Runtime = Awaited<ReturnType<typeof EngineeringRuntime.open>>;
+let liveRuntime: Runtime | null = null;
+let liveRepo: string | null = null;
 
-for (const goal of GOALS) {
-  const repo = await makeFixture();
-  const baseSha = await git(repo, "rev-parse", "HEAD");
-  const started = Date.now();
-  const rt = await EngineeringRuntime.open({ cwd: repo, agentDir });
-  try {
+async function closeRuntime(): Promise<void> {
+  const rt = liveRuntime;
+  liveRuntime = null;
+  if (rt) await rt.close().catch((error) => console.error(`runtime close failed: ${String(error)}`));
+}
+
+async function cleanup(): Promise<void> {
+  await closeRuntime();
+  if (liveRepo) await rm(liveRepo, { recursive: true, force: true });
+  liveRepo = null;
+  await rm(stateRoot, { recursive: true, force: true });
+}
+
+for (const signal of ["SIGTERM", "SIGINT"] as const) {
+  process.once(signal, () => {
+    console.error(`received ${signal}; cleaning up`);
+    void cleanup().finally(() => process.exit(signal === "SIGINT" ? 130 : 143));
+  });
+}
+
+async function writeRecord(): Promise<ReturnType<typeof buildDogfoodRecord>> {
+  const record = buildDogfoodRecord(mainSha, summaries, new Date());
+  await write(resolve(out as string), `${JSON.stringify(record, null, 2)}\n`);
+  return record;
+}
+
+let exitCode = 1;
+try {
+  for (const goal of GOALS) {
+    const repo = await makeFixture();
+    liveRepo = repo;
+    const baseSha = await git(repo, "rev-parse", "HEAD");
+    const started = Date.now();
+    const rt = await EngineeringRuntime.open({ cwd: repo, agentDir });
+    liveRuntime = rt;
     if (!rt.orchestrator || !rt.missionStore) throw new Error("runtime opened without an orchestrator");
     const result = await rt.orchestrator.orchestrate(goal, {
       repository: repo,
@@ -161,20 +198,23 @@ for (const goal of GOALS) {
     console.log(
       `${summary.status} ${missionId} calls=${summary.calls} in=${summary.inputTokens} out=${summary.outputTokens} ${summary.wallMs}ms: ${goal}`,
     );
-    if (summary.status !== "COMPLETE") {
-      failedWhy = formatMissionWhy(explainMission(rt.missionStore, missionId));
-      break;
-    }
-  } finally {
-    await rt.close().catch(() => {});
+    if (summary.status !== "COMPLETE") failedWhy = formatMissionWhy(explainMission(rt.missionStore, missionId));
+    await closeRuntime();
     await rm(repo, { recursive: true, force: true });
+    liveRepo = null;
+    if (failedWhy) break;
   }
+} catch (error) {
+  failedWhy = `dogfood run aborted: ${error instanceof Error ? (error.stack ?? error.message) : String(error)}`;
+} finally {
+  // The record is written on every path, failures included.
+  const record = await writeRecord().catch((error) => {
+    console.error(`could not write ${out}: ${String(error)}`);
+    return null;
+  });
+  if (record && allComplete(record) && summaries.length === GOALS.length) exitCode = 0;
+  await cleanup();
 }
 
-const record = buildDogfoodRecord(mainSha, summaries, new Date());
-await write(resolve(out), `${JSON.stringify(record, null, 2)}\n`);
-await rm(stateRoot, { recursive: true, force: true });
-
-if (allComplete(record) && summaries.length === GOALS.length) process.exit(0);
-console.error(failedWhy ?? "dogfood mission did not complete");
-process.exit(1);
+if (exitCode !== 0) console.error(failedWhy ?? "dogfood mission did not complete");
+process.exit(exitCode);

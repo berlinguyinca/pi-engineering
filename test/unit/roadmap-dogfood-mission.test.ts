@@ -209,3 +209,58 @@ test("dogfood_mission: --structural ignores the demotion rule", async () => {
     await cleanup();
   }
 });
+
+test("dogfood_mission: a scope commit on a merged side branch demotes despite an older-dated ancestor", async () => {
+  const { root, cleanup } = await setup(true);
+  try {
+    const git = (...args: string[]) => exec("git", ["-C", root, ...args]);
+    const base = (await git("rev-parse", "HEAD")).stdout.trim();
+    await git("checkout", "-q", "-b", "side");
+    await mkdir(join(root, "src"), { recursive: true });
+    await writeFile(join(root, "src", "side.js"), "side\n");
+    await git("add", "-A");
+    await exec("git", ["-C", root, "commit", "-q", "-m", "side scope change"], {
+      env: { ...process.env, GIT_COMMITTER_DATE: "2020-01-01T00:00:00Z", GIT_AUTHOR_DATE: "2020-01-01T00:00:00Z" },
+    });
+    await git("checkout", "-q", base);
+    await git("checkout", "-q", "-b", "mainline");
+    await writeFile(join(root, "src", "main.js"), "main\n");
+    const recordSha = await commit(root, "mainline scope change");
+    await writeRecord(root, recordSha, ["COMPLETE"]);
+    await commit(root, "record dogfood");
+    await git("merge", "-q", "--no-ff", "-m", "merge side", "side");
+
+    const engine = await openEngine(root);
+    await putUnit(engine, "M01", ["src/"]);
+    const detail = await engine.evaluate();
+    assert.equal(stateOf(detail, "M01"), "IMPLEMENTED", "the side branch's scope commit is not covered by the record");
+  } finally {
+    await cleanup();
+  }
+});
+
+test("dogfood_mission: a record whose file name or sha does not check out is ignored with a warning", async () => {
+  const { root, cleanup, head } = await setup(true);
+  try {
+    await mkdir(join(root, "docs", "roadmap", "dogfood"), { recursive: true });
+    const body = (sha: string) =>
+      JSON.stringify({
+        kind: "dogfood_mission",
+        sha,
+        missions: [{ status: "COMPLETE" }],
+        ranAt: "2026-10-15T00:00:00Z",
+      });
+    await writeFile(join(root, "docs", "roadmap", "dogfood", "renamed.json"), body(head));
+    const ghost = "0".repeat(40);
+    await writeFile(join(root, "docs", "roadmap", "dogfood", `${ghost}.json`), body(ghost));
+    const engine = await openEngine(root);
+    await putUnit(engine, "M01", ["src/"]);
+    const detail = await engine.evaluate();
+    assert.equal(stateOf(detail, "M01"), "IMPLEMENTED");
+    const blockers = detail.milestones.find((e) => e.milestone.id === "M01")?.blockers.join("\n") ?? "";
+    assert.match(blockers, /renamed\.json: file name does not match/);
+    assert.match(blockers, /does not resolve in this repository/);
+  } finally {
+    await cleanup();
+  }
+});

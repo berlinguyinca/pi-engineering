@@ -112,6 +112,8 @@ export class RoadmapEngine {
   private roadmap!: RoadmapDef;
   private readonly lastDeterministic = new Map<string, boolean>();
   private manual: RoadmapEvidence[] = [];
+  /** Rejected dogfood_mission records; appended to demotion blockers. */
+  readonly dogfoodWarnings: string[] = [];
 
   private constructor(opts: RoadmapEngineOptions) {
     this.repoRoot = opts.repoRoot;
@@ -158,7 +160,7 @@ export class RoadmapEngine {
    * written by scripts/dogfood-real-mission.ts). A record passes only when it has
    * missions and every one reached COMPLETE; it is pinned to the record's `sha`.
    */
-  private loadDogfoodMissionRecords(): RoadmapEvidence[] {
+  private async loadDogfoodMissionRecords(): Promise<RoadmapEvidence[]> {
     const dir = join(dirname(this.manualEvidencePath), "dogfood");
     let names: string[];
     try {
@@ -175,6 +177,16 @@ export class RoadmapEngine {
         continue;
       }
       if (doc.kind !== "dogfood_mission" || typeof doc.sha !== "string" || !doc.sha) continue;
+      // Integrity (honor system, see docs/usage.md): the file must be named for
+      // the SHA it claims and that SHA must exist in this repository.
+      if (name !== `${doc.sha}.json`) {
+        this.dogfoodWarnings.push(`ignored dogfood record ${name}: file name does not match its sha ${doc.sha}`);
+        continue;
+      }
+      if (!(await this.gitRepo.resolveCommit(doc.sha).catch(() => null))) {
+        this.dogfoodWarnings.push(`ignored dogfood record ${name}: sha ${doc.sha} does not resolve in this repository`);
+        continue;
+      }
       const missions = Array.isArray(doc.missions) ? (doc.missions as Array<{ status?: unknown }>) : [];
       const pass = missions.length > 0 && missions.every((m) => m.status === "COMPLETE");
       out.push({
@@ -201,18 +213,22 @@ export class RoadmapEngine {
   private async demoteWithoutRealMission(ev: MilestoneEvaluation): Promise<MilestoneEvaluation> {
     if (ev.state !== "VERIFIED") return ev;
     const scope = watchableScope(ev.milestone.scope.paths);
-    const latest = scope.length ? await this.gitRepo.lastCommitTouching(scope) : null;
     const records = this.manual.filter((r) => r.type === "dogfood_mission" && r.status === "pass");
+    // A record is fresh iff no commit reachable from HEAD but not from the record
+    // touches the milestone's scope.
     for (const r of records) {
-      if (!latest) return ev;
-      if (await this.gitRepo.isAncestor(latest, r.commit).catch(() => false)) return ev;
+      if (scope.length === 0) return ev;
+      const newer = await this.gitRepo.lastCommitTouchingSince(r.commit, scope).catch(() => "<git-error>");
+      if (newer === null) return ev;
     }
+    const latest = scope.length ? await this.gitRepo.lastCommitTouching(scope).catch(() => null) : null;
     return {
       ...ev,
       state: "IMPLEMENTED",
       blockers: [
         ...ev.blockers,
-        `demoted to IMPLEMENTED: no passing dogfood_mission record at or after ${latest ? latest.slice(0, 12) : "HEAD"} (latest change in scope)`,
+        `demoted to IMPLEMENTED: no passing dogfood_mission record covers ${latest ? `the latest change in scope (${latest.slice(0, 12)})` : "this milestone"}`,
+        ...this.dogfoodWarnings,
       ],
     };
   }
@@ -271,7 +287,7 @@ export class RoadmapEngine {
   }
 
   private async loadDogfoodMissions(): Promise<void> {
-    const records = this.loadDogfoodMissionRecords();
+    const records = await this.loadDogfoodMissionRecords();
     this.manual = [...this.manual, ...records];
     for (const rec of records) await this.store.put(rec);
   }

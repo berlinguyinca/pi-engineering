@@ -675,15 +675,26 @@ last one:
 2. Add repository secrets `DOGFOOD_GATEWAY_BASE_URL` and
    `DOGFOOD_GATEWAY_API_KEY`.
 3. Add repository variable `DOGFOOD_MODEL`.
-4. Add repository variable `DOGFOOD_RUNNER_READY=true`.
+4. Optional: add secret `DOGFOOD_PR_TOKEN` (a PAT or GitHub App token) used to
+   push and open the evidence PR. PRs opened with the default `github.token`
+   do not trigger `pull_request` CI, so without it close and reopen the PR to
+   run CI. Either way, enable "Allow GitHub Actions to create and approve pull
+   requests" (Settings > Actions > General).
+5. Add repository variable `DOGFOOD_RUNNER_READY=true`.
 
 Roadmap effect: `release_gate.require.real_mission_dogfood: true` (set in
 `docs/roadmap/roadmap.yaml`) makes `roadmap check` demote a `VERIFIED`
 milestone to `IMPLEMENTED` unless a passing `dogfood_mission` record is pinned
 to a SHA at or after the latest commit touching that milestone's own
 `scope.paths` (per-milestone, not global `src/`). A record passes only when
-every mission in it is `COMPLETE`. `roadmap check --structural` (PR CI) is
-unaffected. Until the runner exists the release gate therefore reports those
+every mission in it is `COMPLETE`. A record is fresh for a
+milestone when no commit reachable from `HEAD` but not from the record's SHA
+touches that milestone's scope (reachability, not commit dates, so merged side
+branches count). Records must be named `<sha>.json` for the `sha` they claim and
+that SHA must exist in the repository; others are ignored and named in the
+demotion blockers. This is an honor system: the record is a committed JSON file
+reviewed in the evidence PR, and nothing cryptographically proves the missions
+ran. `roadmap check --structural` (PR CI) is unaffected. Until the runner exists the release gate therefore reports those
 milestones as `IMPLEMENTED`; run `/mission` on a fixture repo by hand and read
 `missions why` as the interim measure.
 
