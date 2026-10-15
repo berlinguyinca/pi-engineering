@@ -6,21 +6,13 @@ import { GitRepo } from "../../src/git/GitRepo.ts";
 import { ExecutionBroker } from "../../src/orchestration/broker.ts";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
 import { Orchestrator } from "../../src/orchestration/orchestrator.ts";
-import { type DispatchAuthority, MissionOwnership } from "../../src/orchestration/ownership.ts";
+import { MissionOwnership, RepositoryLeasedError } from "../../src/orchestration/ownership.ts";
 import { MissionScheduler } from "../../src/orchestration/scheduler.ts";
-import type { MissionLease, OrchestrationTask } from "../../src/orchestration/types.ts";
+import type { OrchestrationTask } from "../../src/orchestration/types.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 import { makeFixtureRepo } from "../fixtures/make-fixture.ts";
 
 const REPO = "repo-shared";
-
-/** The orchestrator's authority entry points are private; the scheduler reaches them through a closure. */
-interface AuthorityInternals {
-  ownershipByMission: Map<string, MissionLease>;
-  acquireTaskAuthority(task: OrchestrationTask): Promise<DispatchAuthority>;
-  acquireTaskAuthorityWaiting(task: OrchestrationTask, signal?: AbortSignal): Promise<DispatchAuthority>;
-}
-const internals = (orchestrator: Orchestrator) => orchestrator as unknown as AuthorityInternals;
 
 function mission(store: MissionStore, missionId: string) {
   const created = store.createMission({
@@ -63,14 +55,15 @@ function task(
 }
 
 async function harness() {
-  const store = MissionStore.open(JsonlEventStore.inMemory());
+  const backend = JsonlEventStore.inMemory();
+  const store = MissionStore.open(backend);
   const ownership = new MissionOwnership(store, { ownerId: "controller", leaseMs: 60_000 });
   const orchestrator = new Orchestrator({ store, backends: {}, planner: async () => [], ownership });
   for (const id of ["M-1", "M-2"]) {
     mission(store, id);
-    internals(orchestrator).ownershipByMission.set(id, await ownership.acquire(id));
+    await orchestrator.adoptMissionOwnership(id);
   }
-  return { store, ownership, orchestrator };
+  return { store, backend, ownership, orchestrator };
 }
 
 async function until(fn: () => boolean, timeoutMs = 3000): Promise<void> {
@@ -88,8 +81,8 @@ describe("repository lease scope", () => {
     const a = task(store, "M-1", "impl a", "agent", ["a/**"]);
     const b = task(store, "M-2", "impl b", "agent", ["b/**"]);
     const [first, second] = await Promise.all([
-      internals(orchestrator).acquireTaskAuthority(a),
-      internals(orchestrator).acquireTaskAuthority(b),
+      orchestrator.acquireTaskAuthority(a),
+      orchestrator.acquireTaskAuthority(b),
     ]);
     assert.equal(first.repositoryIdentity, undefined);
     assert.equal(second.repositoryIdentity, undefined);
@@ -131,7 +124,7 @@ describe("repository lease scope", () => {
       },
     });
     const acquireAuthority = (t: OrchestrationTask, signal?: AbortSignal) =>
-      internals(orchestrator).acquireTaskAuthorityWaiting(t, signal);
+      orchestrator.acquireTaskAuthorityWaiting(t, signal);
     const missions = ["M-1", "M-2"];
     for (const id of missions) {
       task(store, id, `impl ${id}`, "agent", [`${id}/**`], "worktree");
@@ -148,30 +141,36 @@ describe("repository lease scope", () => {
     assert.equal(windows.get("impl M-1")?.end, 0, "M-1 still executing");
     assert.equal(windows.get("impl M-2")?.end, 0, "M-2 still executing: overlapping windows");
     assert.equal(store.getRepositoryLeaseByRepoId(REPO), undefined, "no repository lease during worker execution");
+    await new Promise((resolve) => setTimeout(resolve, 20));
     for (const id of missions) releases.get(`impl ${id}`)?.();
     await Promise.all(runs);
+    const one = windows.get("impl M-1")!;
+    const two = windows.get("impl M-2")!;
+    assert.ok(two.start < one.end && one.start < two.end, "execution windows overlap by timestamp");
     for (const t of store.listTasks("M-1").concat(store.listTasks("M-2"))) {
       assert.equal(t.status, "SUCCEEDED", t.failure_reason ?? "");
     }
   });
 
   it("makes integration wait, naming the holder, while another mission holds the repository", async () => {
-    const { store, ownership, orchestrator } = await harness();
+    const { store, backend, orchestrator } = await harness();
     const first = task(store, "M-1", "integrate 1", "integration", ["**"]);
     const second = task(store, "M-2", "integrate 2", "integration", ["**"]);
-    const held = await internals(orchestrator).acquireTaskAuthority(first);
+    const held = await orchestrator.acquireTaskAuthority(first);
     assert.equal(held.repositoryIdentity?.missionId, "M-1");
 
     let settled = false;
-    const waiting = internals(orchestrator)
-      .acquireTaskAuthorityWaiting(second)
-      .then((authority) => {
-        settled = true;
-        return authority;
-      });
+    const waiting = orchestrator.acquireTaskAuthorityWaiting(second).then((authority) => {
+      settled = true;
+      return authority;
+    });
     await until(() => store.getRepositoryWait(second.task_id) !== undefined);
     assert.equal(store.getRepositoryWait(second.task_id)?.holderMissionId, "M-1");
-    assert.equal(store.getTask(second.task_id)?.status !== "BLOCKED", true);
+    assert.notEqual(store.getTask(second.task_id)?.status, "BLOCKED");
+    // Durable: another process replaying the same event stream sees the named wait.
+    await store.flush();
+    const other = MissionStore.open(backend);
+    assert.equal(other.listRepositoryWaits("M-2")[0]?.holderMissionId, "M-1");
     await new Promise((resolve) => setTimeout(resolve, 150));
     assert.equal(settled, false, "promotion/integration stays exclusive while M-1 holds the lease");
 
@@ -179,7 +178,61 @@ describe("repository lease scope", () => {
     const acquired = await waiting;
     assert.equal(acquired.repositoryIdentity?.missionId, "M-2");
     assert.equal(store.getRepositoryWait(second.task_id), undefined);
-    assert.equal(ownership instanceof MissionOwnership, true);
     await acquired.close();
+  });
+
+  it("keeps the wait recorded and does not block after the ceiling, using an injected clock", async () => {
+    const { store, orchestrator } = await harness();
+    const first = task(store, "M-1", "integrate 1", "integration", ["**"]);
+    const second = task(store, "M-2", "integrate 2", "integration", ["**"]);
+    const held = await orchestrator.acquireTaskAuthority(first);
+    let at = 0;
+    orchestrator.repositoryWait.now = () => at;
+    orchestrator.repositoryWait.sleep = async (ms) => {
+      at += ms;
+    };
+    orchestrator.repositoryWait.ceilingMs = 600_000;
+    await assert.rejects(() => orchestrator.acquireTaskAuthorityWaiting(second), RepositoryLeasedError);
+    assert.equal(at, 600_000, "waited exactly the ceiling");
+    assert.equal(store.getRepositoryWait(second.task_id)?.holderMissionId, "M-1", "wait stays named");
+    assert.notEqual(store.getTask(second.task_id)?.status, "BLOCKED");
+    await held.close();
+  });
+
+  it("stops waiting when aborted and clears the wait", async () => {
+    const { store, orchestrator } = await harness();
+    const first = task(store, "M-1", "integrate 1", "integration", ["**"]);
+    const second = task(store, "M-2", "integrate 2", "integration", ["**"]);
+    const held = await orchestrator.acquireTaskAuthority(first);
+    const controller = new AbortController();
+    orchestrator.repositoryWait.sleep = async () => controller.abort();
+    await assert.rejects(
+      () => orchestrator.acquireTaskAuthorityWaiting(second, controller.signal),
+      RepositoryLeasedError,
+    );
+    assert.equal(store.getRepositoryWait(second.task_id), undefined);
+    await held.close();
+  });
+
+  it("leaves a scheduled integration task READY (not BLOCKED, no attempt) past the ceiling", async () => {
+    const { store, orchestrator } = await harness();
+    const first = task(store, "M-1", "integrate 1", "integration", ["**"]);
+    const second = task(store, "M-2", "integrate 2", "integration", ["**"]);
+    const held = await orchestrator.acquireTaskAuthority(first);
+    orchestrator.repositoryWait.ceilingMs = 0;
+    const broker = new ExecutionBroker({ store, backends: {} });
+    const controller = new AbortController();
+    const run = new MissionScheduler({
+      store,
+      broker,
+      limits: { maxActive: 1 },
+      acquireAuthority: (t, signal) => orchestrator.acquireTaskAuthorityWaiting(t, signal),
+    }).runMission("M-2", controller.signal);
+    await until(() => store.getRepositoryWait(second.task_id) !== undefined);
+    assert.notEqual(store.getTask(second.task_id)?.status, "BLOCKED");
+    assert.equal(store.getTask(second.task_id)?.attempt, 0);
+    controller.abort();
+    await run.catch(() => undefined);
+    await held.close();
   });
 });

@@ -21,6 +21,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { promisify } from "node:util";
 import { GitRepo } from "../../src/git/GitRepo.ts";
+import { ExclusiveFileLock } from "../../src/platform/eventstore/fileLock.ts";
 
 const exec = promisify(execFile);
 const WIDTH = 8;
@@ -107,6 +108,53 @@ test("worktrees: creation and removal interleaved leave the survivors intact", a
 
     const head = await exec("git", ["-C", keep.path, "rev-parse", "HEAD"]);
     assert.equal(head.stdout.trim(), repo.head, "an untouched worktree must survive a concurrent removal");
+  } finally {
+    repo.cleanup();
+  }
+});
+
+test("worktrees: allocation waits out another process's promotion critical section", async () => {
+  const repo = await scratchRepo();
+  try {
+    const holder = await GitRepo.open(repo.dir);
+    const worker = await GitRepo.open(repo.dir);
+    assert.ok(holder && worker);
+    const common = await holder.commonDir();
+    const promotion = await ExclusiveFileLock.acquire(join(common, "pi-engineering-promotion"));
+    let created = false;
+    const pending = worker.createWorktree(repo.head, "pi-eng-cand-0").then((info) => {
+      created = true;
+      return info;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    assert.equal(created, false, "queued behind the promotion, not failed");
+    promotion.release();
+    const info = await pending;
+    assert.ok(info.path.includes("pi-eng-cand-0"));
+    await worker.removeWorktree(info, { keepBranch: false });
+  } finally {
+    repo.cleanup();
+  }
+});
+
+test("worktrees: the promotion wait is bounded", async () => {
+  const repo = await scratchRepo();
+  try {
+    const holder = await GitRepo.open(repo.dir);
+    const worker = await GitRepo.open(repo.dir);
+    assert.ok(holder && worker);
+    const promotion = await ExclusiveFileLock.acquire(join(await holder.commonDir(), "pi-engineering-promotion"));
+    let at = 0;
+    worker.promotionWait = {
+      ceilingMs: 5_000,
+      pollMs: 50,
+      now: () => at,
+      sleep: async (ms) => {
+        at += ms;
+      },
+    };
+    await assert.rejects(() => worker.createWorktree(repo.head, "pi-eng-cand-1"), /promotion critical section is held/);
+    promotion.release();
   } finally {
     repo.cleanup();
   }

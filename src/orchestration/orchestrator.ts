@@ -337,6 +337,12 @@ export class Orchestrator {
   private readonly repositoryRegistry?: RepositoryRegistry;
   private readonly launchCwd: string;
   private readonly ownership?: MissionOwnership;
+  /** Repository-lease wait policy; the clock and sleep are injectable for tests. */
+  readonly repositoryWait: { ceilingMs: number; now: () => number; sleep: (ms: number) => Promise<void> } = {
+    ceilingMs: REPOSITORY_WAIT_CEILING_MS,
+    now: Date.now,
+    sleep: (ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
+  };
   private readonly ownershipByMission = new Map<string, import("./types.ts").MissionLease>();
   /** Run controllers of missions executing in this process, for an explicit cancel. */
   private readonly liveRuns = new Map<string, AbortController>();
@@ -3477,31 +3483,54 @@ export class Orchestrator {
    * named wait (visible in the mission snapshot) instead of a failure. Backs off
    * up to the same ceiling as cross-session custody waits.
    */
-  private async acquireTaskAuthorityWaiting(task: OrchestrationTask, signal?: AbortSignal): Promise<DispatchAuthority> {
-    const deadline = Date.now() + REPOSITORY_WAIT_CEILING_MS;
+  async acquireTaskAuthorityWaiting(task: OrchestrationTask, signal?: AbortSignal): Promise<DispatchAuthority> {
+    const { ceilingMs, now, sleep } = this.repositoryWait;
+    const deadline = now() + ceilingMs;
     let backoffMs = 50;
     for (;;) {
       try {
         const authority = await this.acquireTaskAuthority(task);
-        this.store.clearRepositoryWait(task.task_id);
+        this.clearRepositoryWait(task);
         return authority;
       } catch (error) {
-        if (!(error instanceof RepositoryLeasedError) || signal?.aborted || Date.now() >= deadline) {
-          this.store.clearRepositoryWait(task.task_id);
+        if (!(error instanceof RepositoryLeasedError) || signal?.aborted) {
+          this.clearRepositoryWait(task);
           throw error;
         }
-        this.store.setRepositoryWait(task.task_id, {
-          repoId: error.repoId,
-          holderMissionId: error.holderMissionId,
-          holderOwnerId: error.holderOwnerId,
-        });
-        await new Promise<void>((resolve) => setTimeout(resolve, backoffMs));
+        if (this.store.getRepositoryWait(task.task_id) === undefined) {
+          this.store.setRepositoryWait(task.task_id, {
+            repoId: error.repoId,
+            holderMissionId: error.holderMissionId,
+            holderOwnerId: error.holderOwnerId,
+          });
+          this.observability?.setWaiting(
+            task.mission_id,
+            "repository_lease",
+            `Waiting for repository ${error.repoId} held by mission ${error.holderMissionId}`,
+          );
+        }
+        // Ceiling: the wait stays recorded (named, durable, resumable); the
+        // caller leaves the task READY rather than failing or blocking it.
+        if (now() >= deadline) throw error;
+        await sleep(Math.min(backoffMs, Math.max(1, deadline - now())));
         backoffMs = Math.min(backoffMs * 2, 2_000);
       }
     }
   }
 
-  private async acquireTaskAuthority(task: OrchestrationTask): Promise<DispatchAuthority> {
+  private clearRepositoryWait(task: OrchestrationTask): void {
+    if (this.store.getRepositoryWait(task.task_id) === undefined) return;
+    this.store.clearRepositoryWait(task.task_id);
+    this.observability?.clearWaiting(task.mission_id);
+  }
+
+  /** Take mission ownership for work scheduled outside orchestrate()/resume (e.g. an external scheduler). */
+  async adoptMissionOwnership(missionId: string): Promise<void> {
+    if (!this.ownership) throw new Error("orchestrator has no ownership provider");
+    this.ownershipByMission.set(missionId, await this.ownership.acquire(missionId));
+  }
+
+  async acquireTaskAuthority(task: OrchestrationTask): Promise<DispatchAuthority> {
     const currentResumptionGeneration = this.store.listMissionResumptions(task.mission_id).at(-1)?.generation ?? 0;
     const lineageDecisions = this.store
       .listTaskSupersessions(task.mission_id)

@@ -45,6 +45,7 @@ import {
   laneDomainsOf,
 } from "./lanes.ts";
 import type { MissionStore } from "./missionStore.ts";
+import { RepositoryLeasedError } from "./ownership.ts";
 import type { DispatchAuthority } from "./ownership.ts";
 import {
   FailureClassifier,
@@ -747,6 +748,14 @@ export class MissionScheduler {
         authority = await this.acquireAuthority?.(this.store.getTask(task.task_id) ?? task, signal);
         if (authority) this.store.assignTaskAuthority(task.task_id, authority.missionIdentity);
       } catch (error) {
+        if (signal?.aborted) {
+          this.stopTaskOnAbort(task, signal);
+          return;
+        }
+        // Another mission holds the repository past the wait ceiling: the task
+        // stays READY with its durable named wait (no attempt consumed, not
+        // BLOCKED) and the pass loop offers it again.
+        if (error instanceof RepositoryLeasedError) return;
         this.store.transitionTask(task.task_id, "BLOCKED", "system", {
           failure_reason: error instanceof Error ? error.message : String(error),
         });
