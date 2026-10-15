@@ -9,7 +9,7 @@ import { ExclusiveFileLock } from "../platform/eventstore/fileLock.ts";
 const exec = promisify(execFile);
 
 /** Short, stable, filesystem-safe hash of a path for unique worktree dirs. */
-function shortHash(input: string): string {
+export function shortHash(input: string): string {
   let h = 0;
   for (let i = 0; i < input.length; i++) h = (h * 31 + input.charCodeAt(i)) | 0;
   return Math.abs(h).toString(36);
@@ -499,7 +499,43 @@ export class GitRepo {
   }
 
   worktreePath(branch: string): string {
-    return join(this.repoRoot, "..", `pi-eng-${shortHash(this.repoRoot)}-${branch}`);
+    return join(this.repoRoot, "..", `${this.worktreeNamespacePrefix()}${branch}`);
+  }
+
+  /**
+   * Basename prefix shared by every worktree this repository's runtime creates
+   * (`pi-eng-<hash(repoRoot)>-`). Siblings of the repo root carrying it belong
+   * to this runtime and nothing else; the janitor reclaims only inside it.
+   */
+  worktreeNamespacePrefix(): string {
+    return `pi-eng-${shortHash(this.repoRoot)}-`;
+  }
+
+  /** Every linked worktree git knows about, primary checkout excluded. */
+  async listLinkedWorktrees(): Promise<Array<{ path: string; branch: string | null; head: string | null }>> {
+    const listed = await this.git(["worktree", "list", "--porcelain"], { preserveStdout: true });
+    if (listed.code !== 0) throw new Error(`git worktree list failed: ${listed.stderr}`);
+    const out: Array<{ path: string; branch: string | null; head: string | null }> = [];
+    for (const entry of listed.stdout.split(/\n\n+/)) {
+      const lines = entry.split("\n");
+      const path = lines
+        .find((l) => l.startsWith("worktree "))
+        ?.slice("worktree ".length)
+        .trim();
+      if (!path || path === this.repoRoot) continue;
+      const branch =
+        lines
+          .find((l) => l.startsWith("branch "))
+          ?.slice("branch ".length)
+          .trim() ?? null;
+      const head =
+        lines
+          .find((l) => l.startsWith("HEAD "))
+          ?.slice("HEAD ".length)
+          .trim() ?? null;
+      out.push({ path, branch: branch ? branch.replace(/^refs\/heads\//, "") : null, head });
+    }
+    return out;
   }
 
   private candidateId(identity: {
@@ -1433,7 +1469,7 @@ export class GitRepo {
     return target !== root && target.startsWith(prefix) && target !== prefix;
   }
 
-  private assertSafeWorktreePath(path: string): void {
+  assertSafeWorktreePath(path: string): void {
     const root = resolve(this.repoRoot);
     const target = resolve(path);
     if (target === root) {
@@ -1471,6 +1507,28 @@ export class GitRepo {
     // `git worktree add` names the administrative directory after the leaf of
     // the worktree path.
     await rm(join(absolute, "worktrees", basename(path)), { recursive: true, force: true }).catch(() => {});
+  }
+
+  /**
+   * Worktree paths that any durable record (candidate lifecycle, cleanup
+   * intent, promotion, run) still names, across all missions. Matches on raw
+   * text so an unreadable or foreign record still protects its worktree.
+   * Quarantined records are scanned too.
+   */
+  async durablyReferencedWorktreePaths(candidates: readonly string[]): Promise<Set<string>> {
+    const base = await this.candidateStateDir(false);
+    const referenced = new Set<string>();
+    // Quarantined records are evidence of a worktree somebody still has to recover.
+    for (const dir of [base, join(base, "quarantine")]) {
+      for (const name of await readdir(dir).catch(() => [] as string[])) {
+        if (!name.endsWith(".json")) continue;
+        const raw = await readFile(join(dir, name), "utf8").catch(() => null);
+        // Unreadable record: cannot prove it names nothing, so protect everything.
+        if (raw === null) return new Set(candidates);
+        for (const path of candidates) if (raw.includes(JSON.stringify(path))) referenced.add(path);
+      }
+    }
+    return referenced;
   }
 
   /** Remove a worktree (cleanup/recovery). Optionally keep the branch for lineage. */

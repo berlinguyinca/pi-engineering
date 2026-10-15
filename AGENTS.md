@@ -131,6 +131,24 @@ Symlink `node_modules` into the new worktree rather than reinstalling. The
 object store is shared, so every commit is visible from every worktree
 immediately.
 
+Rust builds the runtime spawns itself (verification stages, CAV runs, lifecycle
+commands) get a per-worktree `CARGO_TARGET_DIR` under `~/.rust/cache` (mode
+0700) and `RUSTC_WRAPPER=sccache` when installed, only for repos with a
+`Cargo.toml` at the root (`src/git/rustBuildCache.ts`, README "Rust build
+cache"). A worker's own `bash` tool calls get neither: nothing is exported to
+`process.env`, so they build inside the worktree. Never point several
+worktrees at ONE target directory: cargo's path+mtime freshness lets a
+worktree reuse another's build of the repository's own crates. Set
+`PI_RUST_CACHE_DIR` or `CARGO_TARGET_DIR` in the environment to relocate, not a
+`.cargo/config.toml` in a worktree.
+
+Worktrees the runtime creates are reclaimed by housekeeping
+(`src/git/worktreeJanitor.ts`, README "Housekeeping") once their mission is
+durably terminal or they name no owner and sit idle; uncommitted work is committed to the
+worktree's branch first. Hand-made worktrees like the one above live outside
+the `pi-eng-*` namespace and are never touched, so remove them yourself when
+the branch has merged.
+
 ### Why this matters more than it sounds
 
 A shared checkout has ONE `HEAD`. When an agent switches branches it does so

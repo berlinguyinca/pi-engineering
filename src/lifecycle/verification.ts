@@ -13,6 +13,7 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import type { ArtifactStore } from "../artifacts/ArtifactStore.ts";
 import { newArtifactId, newEvidenceId } from "../core/ids.ts";
+import { withRustBuildEnv } from "../git/rustBuildCache.ts";
 import { tokenizeCommand } from "../verify/Verifier.ts";
 import type { EngineeringPolicy } from "./policy.ts";
 import type { CheckKind, CheckOutcome, CheckSpec, GateStatus, VerificationReport } from "./types.ts";
@@ -279,6 +280,7 @@ async function runOne(
   const { command, args } = tokenizeCommand(spec.command);
   const env = { ...process.env };
   delete env.NODE_TEST_CONTEXT;
+  await withRustBuildEnv(env, cwd);
   try {
     const { stdout, stderr } = await exec(command, args, {
       cwd,

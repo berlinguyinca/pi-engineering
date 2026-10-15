@@ -452,6 +452,73 @@ coalesced rather than issued per token.
 | `PI_STATUS_BAR_GIT_TTL_MS` | `30000` | How long cached git context is trusted |
 
 
+## Rust build cache
+
+Cargo keys its build cache on the checkout directory, so every isolated
+candidate worktree would otherwise leave a multi-gigabyte `target/` behind.
+For repositories with a `Cargo.toml` at the root (Node and Python repos are
+untouched), the runtime points the Rust builds it spawns itself — verification
+stages, CAV runs and lifecycle commands — at one machine-wide cache root
+(created mode 0700) instead. The variables are set per spawned command, never
+exported process-wide, so a worker's own `bash` tool calls get neither the
+per-worktree target dir nor sccache and build inside the worktree:
+
+    ~/.rust/cache/target/<repo>-<hash>/<worktree-hash>   CARGO_TARGET_DIR
+    ~/.rust/cache/sccache                                 SCCACHE_DIR
+
+Each worktree gets its own target directory. One target directory shared
+between worktrees is unsafe: cargo identifies a workspace crate by its path
+relative to the workspace root and decides freshness by mtime, so a worktree
+whose sources are older than another worktree's last build reuses that build
+and one worker's tests run against another worker's code. Compiled
+dependencies are shared safely through `sccache` instead: install it
+(`brew install sccache` or `cargo install sccache`) and the runtime sets
+`RUSTC_WRAPPER`, so a second worktree's dependency build is a cache hit rather
+than a recompile. Values the operator already set (`CARGO_TARGET_DIR`,
+`RUSTC_WRAPPER`, `SCCACHE_DIR`) are never overridden. Everything under the
+cache root is derived output: housekeeping removes a worktree's target dir
+with the worktree and expires the rest by age, and you can delete the root at
+any time. Size is bounded by age (`PI_RUST_CACHE_MAX_AGE_DAYS`) and by
+removal with the worktree; there is no byte cap.
+
+| Variable | Default | Meaning |
+| -------- | ------- | ------- |
+| `PI_RUST_CACHE_DIR` | `~/.rust/cache` | Cache root (`~` is expanded) |
+| `PI_RUST_CACHE` | `1` | `0` disables the managed cache |
+| `PI_RUST_CACHE_MAX_AGE_DAYS` | `30` | Target dirs no build touched for this long are removed by housekeeping |
+
+## Housekeeping
+
+Autonomous runs leave things behind when a process dies: the broker removes
+the candidate worktrees it tracks in memory once a mission reaches cleanup, but
+a crashed session, a killed worker or a mission that never reached a terminal
+state leaves `pi-eng-<hash>-<branch>` checkouts next to the repository, each a
+full working tree plus whatever the worker built. Housekeeping runs at session
+start, every six hours while a session stays open, and on demand with `/gc`
+(`/gc --dry-run` previews):
+
+- Worktrees in the runtime's own namespace (`pi-eng-<hash(repoRoot)>-*`
+  siblings of the repo root, nothing else) are reclaimed only when their
+  mission is durably `COMPLETE`, `CANCELED` or `FAILED` (read from the
+  orchestration event log, so missions run by other pi processes count), or
+  when the branch names no owner at all and the checkout has been idle for
+  `PI_WORKTREE_IDLE_HOURS` (default 24). A mission this process cannot prove
+  terminal is kept, as is any worktree a durable candidate, cleanup or
+  quarantined record still names. Nothing younger than
+  `PI_WORKTREE_MIN_AGE_HOURS` (default and minimum 1) is reclaimed.
+- Reclaiming never loses work. Uncommitted changes are committed onto the
+  worktree's own branch first and the branch is always kept; only the checkout
+  on disk goes away. A directory whose git metadata is gone cannot be
+  preserved, so it is removed only once idle.
+- A reclaimed worktree's cargo target dir goes with it, and target dirs (see
+  above) that no build touched for `PI_RUST_CACHE_MAX_AGE_DAYS` are removed.
+
+| Variable | Default | Meaning |
+| -------- | ------- | ------- |
+| `PI_HOUSEKEEPING` | unset | Automatic housekeeping only reports (dry-run) until set to `1`; `0` disables it. `/gc` always acts (`/gc --dry-run` previews) |
+| `PI_HOUSEKEEPING_INTERVAL_MS` | `21600000` | Interval between sweeps while a session is open; `0` for session start only |
+| `PI_WORKTREE_IDLE_HOURS` | `24` | Idle threshold for worktrees with no known owner |
+
 ## Semantic tools
 
 `ledger_read`, `ledger_claim`, `artifact_read`, `repo_search`, `symbol`,

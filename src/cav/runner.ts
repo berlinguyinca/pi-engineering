@@ -10,6 +10,7 @@
  */
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { withRustBuildEnv } from "../git/rustBuildCache.ts";
 import type { CavEvidenceLedger } from "./evidence.ts";
 
 const exec = promisify(execFile);
@@ -52,7 +53,7 @@ export async function runDeterministicTest(
       cwd: opts.cwd,
       timeout: 300_000,
       maxBuffer: 16 * 1024 * 1024,
-      env: { ...process.env, NODE_TEST_CONTEXT: "" },
+      env: await withRustBuildEnv({ ...process.env, NODE_TEST_CONTEXT: "" }, opts.cwd),
     });
     stdout = res.stdout;
     stderr = res.stderr;
