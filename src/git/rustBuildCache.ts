@@ -7,12 +7,20 @@
  * worktree is abandoned. Twelve concurrent candidates on one Rust project
  * meant twelve copies of the same compiled dependencies and a full disk.
  *
- * This module points every Rust build the runtime spawns (verification stages,
- * CAV runs, and worker `bash` tool calls, which inherit the process env) at ONE
- * machine-wide cache root, `~/.rust/cache` by default:
+ * This module points the Rust builds the runtime SPAWNS ITSELF (verification
+ * stages, CAV runs and lifecycle commands) at ONE machine-wide cache root,
+ * `~/.rust/cache` by default (mode 0700):
  *
  *   ~/.rust/cache/target/<repo>-<hash>/<worktree-hash>  CARGO_TARGET_DIR
  *   ~/.rust/cache/sccache                                SCCACHE_DIR
+ *
+ * It applies only to projects with a Cargo.toml at the checkout root. The
+ * variables are computed per spawned command and never exported to
+ * `process.env`: a worker's own `bash` tool calls therefore get neither the
+ * per-worktree target dir nor sccache, and build inside the worktree (the
+ * janitor removes that with the worktree). Size is bounded by age only
+ * (`PI_RUST_CACHE_MAX_AGE_DAYS`, default 30) plus removal with the worktree;
+ * there is no byte cap.
  *
  * Each worktree gets its OWN target directory. Sharing one target directory
  * between worktrees is not safe: cargo identifies a workspace crate by its
@@ -36,7 +44,7 @@
 
 import { execFile } from "node:child_process";
 import { constants, accessSync, existsSync } from "node:fs";
-import { readdir, rm, stat } from "node:fs/promises";
+import { chmod, mkdir, readdir, rm, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -210,28 +218,26 @@ export async function rustBuildEnv(cwd: string, env: Env = process.env): Promise
 }
 
 /**
- * Merge the shared-cache variables into `env` in place and return it. Nothing
- * is created on disk: cargo and sccache make their own directories on first
- * use, so a dry run (or the test suite) leaves no trace under the cache root.
+ * Merge the shared-cache variables into `env` in place and return it. Only the
+ * cache root is guaranteed to exist (mode 0700, so other local users cannot
+ * plant build output in it); cargo and sccache make their own directories
+ * below it on first use. Computed per command, never exported process-wide, so
+ * an sccache removed after startup just drops out of the next command's env.
  */
 export async function withRustBuildEnv<T extends Env>(env: T, cwd: string): Promise<T> {
-  applyAdditions(env, await rustBuildEnv(cwd, env));
+  const additions = await rustBuildEnv(cwd, env);
+  if (Object.keys(additions).length > 0) await ensurePrivateRoot(rustCacheRoot(env));
+  applyAdditions(env, additions);
   return env;
 }
 
-/**
- * Apply the shared cache to this process's own environment so every child the
- * runtime (or Pi's `bash` tool, which copies `process.env`) spawns inherits it.
- * Idempotent; safe to call on every session start. Returns what was added.
- */
-export async function applyRustBuildEnvToProcess(cwd: string): Promise<RustBuildEnv> {
-  const additions = await rustBuildEnv(cwd, process.env);
-  // CARGO_TARGET_DIR is per worktree. Exporting the session checkout's value
-  // here would read as an operator override in every candidate worktree and
-  // make them all share one target dir, so only the dependency cache is global.
-  delete additions.CARGO_TARGET_DIR;
-  applyAdditions(process.env, additions);
-  return additions;
+async function ensurePrivateRoot(root: string): Promise<void> {
+  try {
+    await mkdir(root, { recursive: true, mode: 0o700 });
+    await chmod(root, 0o700);
+  } catch {
+    /* a read-only or foreign root only costs the cache, not the build */
+  }
 }
 
 function applyAdditions(env: Env, additions: RustBuildEnv): void {

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
@@ -8,7 +8,6 @@ import { promisify } from "node:util";
 import { ArtifactStore } from "../../src/artifacts/ArtifactStore.ts";
 import {
   UNSCOPED_TARGET_KEY,
-  applyRustBuildEnvToProcess,
   findSccache,
   resetRustTargetKeys,
   resetSccacheLookup,
@@ -156,51 +155,38 @@ test("withRustBuildEnv merges in place and touches nothing on disk", async () =>
     assert.equal(same, env);
     assert.equal(env.CARGO_TARGET_DIR, join(root, "target", UNSCOPED_TARGET_KEY));
     const { stdout } = await exec("ls", ["-A", root]);
-    assert.equal(stdout.trim(), "", "cargo creates the target dir itself; the runtime leaves no trace");
+    assert.equal(stdout.trim(), "", "cargo creates the target dir itself; the runtime only guarantees the root");
+    assert.equal((await stat(root)).mode & 0o777, 0o700, "cache root is private to the user");
+    const fresh = join(root, "nested", "cache");
+    await withRustBuildEnv(bareEnv({ PI_RUST_CACHE_DIR: fresh }), dir);
+    assert.equal((await stat(fresh)).mode & 0o777, 0o700, "a root the runtime creates is mode 0700");
   } finally {
     await rm(root, { recursive: true, force: true });
     await rm(dir, { recursive: true, force: true });
   }
 });
 
-test("applyRustBuildEnvToProcess exports the cache to process.env for inherited children", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-rust-proc-"));
-  const saved = {
-    PI_RUST_CACHE_DIR: process.env.PI_RUST_CACHE_DIR,
-    CARGO_TARGET_DIR: process.env.CARGO_TARGET_DIR,
-    RUSTC_WRAPPER: process.env.RUSTC_WRAPPER,
-    SCCACHE_DIR: process.env.SCCACHE_DIR,
-  };
+test("nothing is exported process-wide; sccache is looked up per command", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-rust-percmd-"));
+  const bin = join(dir, "bin");
+  await mkdir(bin);
+  await writeFile(join(dir, "Cargo.toml"), '[package]\nname = "fx"\n');
+  await writeFile(join(bin, "sccache"), "#!/bin/sh\nexit 0\n");
+  await chmod(join(bin, "sccache"), 0o755);
   try {
-    delete process.env.CARGO_TARGET_DIR;
-    delete process.env.RUSTC_WRAPPER;
-    delete process.env.SCCACHE_DIR;
-    process.env.PI_RUST_CACHE_DIR = root;
-    await writeFile(join(root, "Cargo.toml"), '[package]\nname = "fx"\n');
-    const fakeBin = join(root, "bin");
-    await mkdir(fakeBin);
-    await writeFile(join(fakeBin, "sccache"), "#!/bin/sh\nexit 0\n");
-    await chmod(join(fakeBin, "sccache"), 0o755);
-    const savedPath = process.env.PATH;
-    process.env.PATH = `${fakeBin}:${savedPath ?? ""}`;
+    const env = bareEnv({ PI_RUST_CACHE_DIR: join(dir, "cache"), PATH: bin });
     resetSccacheLookup();
-    try {
-      const added = await applyRustBuildEnvToProcess(root);
-      assert.equal(added.CARGO_TARGET_DIR, undefined, "target dir is per worktree, never exported process-wide");
-      assert.equal(process.env.CARGO_TARGET_DIR, undefined);
-      assert.equal(process.env.SCCACHE_DIR, join(root, "sccache"));
-      const { stdout } = await exec("sh", ["-c", 'printf %s "$SCCACHE_DIR"']);
-      assert.equal(stdout, join(root, "sccache"), "a child inherits the shared dependency cache");
-    } finally {
-      process.env.PATH = savedPath;
-      resetSccacheLookup();
-    }
+    assert.equal((await rustBuildEnv(dir, env)).RUSTC_WRAPPER, join(bin, "sccache"));
+    // sccache disappears after startup: the next command's env simply omits the wrapper.
+    await rm(join(bin, "sccache"));
+    resetSccacheLookup();
+    const after = await rustBuildEnv(dir, env);
+    assert.equal(after.RUSTC_WRAPPER, undefined);
+    assert.equal(after.SCCACHE_DIR, undefined);
+    assert.ok(after.CARGO_TARGET_DIR);
   } finally {
-    for (const [k, v] of Object.entries(saved)) {
-      if (v === undefined) delete process.env[k];
-      else process.env[k] = v;
-    }
-    await rm(root, { recursive: true, force: true });
+    resetSccacheLookup();
+    await rm(dir, { recursive: true, force: true });
   }
 });
 

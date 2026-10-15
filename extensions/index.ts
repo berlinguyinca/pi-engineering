@@ -35,7 +35,6 @@ import {
 } from "../src/gateway/signals.ts";
 import { renderGatewayReport } from "../src/gateway/statusReport.ts";
 import { GitRepo } from "../src/git/GitRepo.ts";
-import { applyRustBuildEnvToProcess } from "../src/git/rustBuildCache.ts";
 import { GenerationGuard } from "../src/guard/GenerationGuard.ts";
 import { RECOVERY_PROMPT, TOOL_TRANSITION_RULE, buildDegenerationEvent } from "../src/guard/RecoveryController.ts";
 import { resolveGuardConfig } from "../src/guard/config.ts";
@@ -71,7 +70,7 @@ import { effectiveWorkspace, workspaceForPath } from "../src/runtime/isolation/W
 import { formatDoctorReport, runDoctor } from "../src/runtime/isolation/doctor.ts";
 import { emitRuntimeEvent } from "../src/runtime/isolation/runtimeEvents.ts";
 import { formatRuntimeStatus, runtimeStatus } from "../src/runtime/isolation/status.ts";
-import { describeHousekeeping, runHousekeeping } from "../src/runtime/janitor.ts";
+import { describeHousekeeping, housekeepingMode, runHousekeeping } from "../src/runtime/janitor.ts";
 import {
   clearOperatorModelPin,
   describeMissionControl,
@@ -631,27 +630,24 @@ export default function (pi: ExtensionAPI) {
   registerInteractiveMemory(pi);
   /** True while our own (opt-in) fallback switches the interactive model. */
   let automaticModelSwitch = false;
-  // Point every Rust build this process (and Pi's `bash` tool, which copies
-  // process.env) spawns at the shared build cache, so candidate worktrees reuse
-  // compiled dependencies instead of each growing a multi-gigabyte `target/`.
-  // Best-effort and never awaited by session start: a cache miss is a slower
-  // build, not a broken session.
-  if (typeof pi.on === "function") {
-    pi.on("session_start", (_event, ctx) => {
-      void applyRustBuildEnvToProcess(ctx.cwd).catch(() => {});
-    });
-  }
   // Housekeeping: reclaim worktrees abandoned by crashed or killed runs and
   // expire unused Rust target caches. Live missions keep their worktrees, and
   // uncommitted work is committed to its branch before a checkout goes away,
   // so this is safe to run at session start and periodically while the
   // session stays open. Never awaited: a slow sweep must not delay a session.
   const housekeepingIntervalMs = Number(process.env.PI_HOUSEKEEPING_INTERVAL_MS ?? 6 * 60 * 60 * 1000);
-  const housekeepingEnabled = (process.env.PI_HOUSEKEEPING ?? "1").toLowerCase() !== "0";
+  // Report-only until PI_HOUSEKEEPING=1: liveness of missions run by other
+  // processes is not proven in production yet. `/gc` always acts.
+  const hkMode = housekeepingMode(process.env);
+  const housekeepingEnabled = hkMode !== "off";
   let housekeepingTimer: NodeJS.Timeout | null = null;
   const housekeep = async (cwd: string, notify: (text: string, level: "info" | "warning") => void) => {
     const runtime = await getRuntimeByCwd(cwd).catch(() => null);
-    const result = await runHousekeeping({ cwd, missions: runtime?.missionStore });
+    const result = await runHousekeeping({
+      cwd,
+      missions: runtime?.missionStore,
+      dryRun: hkMode !== "on",
+    });
     const lines = describeHousekeeping(result);
     if (lines.length > 0)
       notify(`[housekeeping] ${lines.join("\n")}`, result.worktrees?.failed.length ? "warning" : "info");

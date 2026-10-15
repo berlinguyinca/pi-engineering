@@ -456,8 +456,12 @@ coalesced rather than issued per token.
 
 Cargo keys its build cache on the checkout directory, so every isolated
 candidate worktree would otherwise leave a multi-gigabyte `target/` behind.
-The runtime points every Rust build it runs — verification stages, CAV runs and
-worker `bash` calls — at one machine-wide cache root instead:
+For repositories with a `Cargo.toml` at the root (Node and Python repos are
+untouched), the runtime points the Rust builds it spawns itself — verification
+stages, CAV runs and lifecycle commands — at one machine-wide cache root
+(created mode 0700) instead. The variables are set per spawned command, never
+exported process-wide, so a worker's own `bash` tool calls get neither the
+per-worktree target dir nor sccache and build inside the worktree:
 
     ~/.rust/cache/target/<repo>-<hash>/<worktree-hash>   CARGO_TARGET_DIR
     ~/.rust/cache/sccache                                 SCCACHE_DIR
@@ -474,7 +478,8 @@ than a recompile. Values the operator already set (`CARGO_TARGET_DIR`,
 `RUSTC_WRAPPER`, `SCCACHE_DIR`) are never overridden. Everything under the
 cache root is derived output: housekeeping removes a worktree's target dir
 with the worktree and expires the rest by age, and you can delete the root at
-any time.
+any time. Size is bounded by age (`PI_RUST_CACHE_MAX_AGE_DAYS`) and by
+removal with the worktree; there is no byte cap.
 
 | Variable | Default | Meaning |
 | -------- | ------- | ------- |
@@ -493,10 +498,14 @@ start, every six hours while a session stays open, and on demand with `/gc`
 (`/gc --dry-run` previews):
 
 - Worktrees in the runtime's own namespace (`pi-eng-<hash(repoRoot)>-*`
-  siblings of the repo root, nothing else) are reclaimed when their mission
-  is `COMPLETE`, `CANCELED` or `FAILED`, or when no owner can be found and the
-  checkout has been idle for `PI_WORKTREE_IDLE_HOURS` (default 24). Live
-  missions keep their worktrees.
+  siblings of the repo root, nothing else) are reclaimed only when their
+  mission is durably `COMPLETE`, `CANCELED` or `FAILED` (read from the
+  orchestration event log, so missions run by other pi processes count), or
+  when the branch names no owner at all and the checkout has been idle for
+  `PI_WORKTREE_IDLE_HOURS` (default 24). A mission this process cannot prove
+  terminal is kept, as is any worktree a durable candidate, cleanup or
+  quarantined record still names. Nothing younger than
+  `PI_WORKTREE_MIN_AGE_HOURS` (default and minimum 1) is reclaimed.
 - Reclaiming never loses work. Uncommitted changes are committed onto the
   worktree's own branch first and the branch is always kept; only the checkout
   on disk goes away. A directory whose git metadata is gone cannot be
@@ -506,7 +515,7 @@ start, every six hours while a session stays open, and on demand with `/gc`
 
 | Variable | Default | Meaning |
 | -------- | ------- | ------- |
-| `PI_HOUSEKEEPING` | `1` | `0` disables automatic housekeeping (`/gc` still works) |
+| `PI_HOUSEKEEPING` | unset | Automatic housekeeping only reports (dry-run) until set to `1`; `0` disables it. `/gc` always acts (`/gc --dry-run` previews) |
 | `PI_HOUSEKEEPING_INTERVAL_MS` | `21600000` | Interval between sweeps while a session is open; `0` for session start only |
 | `PI_WORKTREE_IDLE_HOURS` | `24` | Idle threshold for worktrees with no known owner |
 

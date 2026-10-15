@@ -261,6 +261,17 @@ export async function sweepWorktrees(opts: JanitorOptions): Promise<JanitorRepor
       });
       continue;
     }
+    // An owner we cannot prove terminal is presumed alive in another process
+    // (or parked for days waiting on inference): the idle rule is only for
+    // checkouts that name no owner at all.
+    if ((owner.missionId || owner.taskId) && liveness !== "terminal") {
+      report.kept.push({
+        path: wt.path,
+        branch: wt.branch,
+        reason: `owner ${owner.missionId ?? owner.taskId} is not durably terminal`,
+      });
+      continue;
+    }
     const ageMs = now - (await worktreeLastActivity(wt.path));
     if (ageMs < minAge) {
       report.kept.push({

@@ -14,7 +14,12 @@ import {
   worktreeLastActivity,
   worktreeMinAgeMs,
 } from "../../src/git/worktreeJanitor.ts";
-import { describeHousekeeping, missionOwnerLiveness, runHousekeeping } from "../../src/runtime/janitor.ts";
+import {
+  describeHousekeeping,
+  housekeepingMode,
+  missionOwnerLiveness,
+  runHousekeeping,
+} from "../../src/runtime/janitor.ts";
 import { makeFixtureRepo } from "../fixtures/make-fixture.ts";
 
 const exec = promisify(execFile);
@@ -120,8 +125,8 @@ test("live owner is kept; unknown owner is kept while recently active and reclai
     const repo = (await GitRepo.open(fixture.root))!;
     const head = await repo.headCommit();
     const live = await repo.createWorktree(head, "pi-eng-candidate-MSN-live01-repo-1-0-EXC-a");
-    const fresh = await repo.createWorktree(head, "pi-eng-orch-TSK-fresh1");
-    const stale = await repo.createWorktree(head, "pi-eng-orch-TSK-stale1");
+    const fresh = await repo.createWorktree(head, "pi-eng-scratch-fresh1");
+    const stale = await repo.createWorktree(head, "pi-eng-scratch-stale1");
     await ageWorktree(stale.path, 30 * HOUR);
 
     const liveness = (owner: { missionId?: string; taskId?: string }) =>
@@ -145,7 +150,7 @@ test("live owner is kept; unknown owner is kept while recently active and reclai
     assert.equal(await exists(live.path), true);
     assert.equal(await exists(fresh.path), true);
     assert.equal(report.reclaimed[0]!.preservedCommit, null, "clean worktree needs no preserving commit");
-    assert.ok(await repo.resolveCommit("pi-eng-orch-TSK-stale1"), "branch survives");
+    assert.ok(await repo.resolveCommit("pi-eng-scratch-stale1"), "branch survives");
   } finally {
     await fixture.cleanup();
   }
@@ -307,4 +312,75 @@ test("a worktree a durable candidate or cleanup record still references is never
   } finally {
     await fixture.cleanup();
   }
+});
+
+test("a mission known only to another process is kept however long the worktree has been idle", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const repo = (await GitRepo.open(fixture.root))!;
+    const wt = await repo.createWorktree(await repo.headCommit(), "pi-eng-candidate-MSN-other1-repo-1-0-EXC-a");
+    await ageWorktree(wt.path, 100 * HOUR);
+    // This process's store has never heard of MSN-other1 (a second pi process runs it).
+    const mine = { getMission: () => undefined, getTask: () => undefined };
+    const report = await sweepWorktrees({ repo, ownerLiveness: missionOwnerLiveness(mine), maxIdleMs: 24 * HOUR });
+    assert.equal(report.reclaimed.length, 0, JSON.stringify(report));
+    assert.match(report.kept[0]!.reason, /not durably terminal/);
+    assert.equal(await exists(wt.path), true);
+    // Durable facts decide: parked in WAITING_FOR_LLM stays live, COMPLETE is terminal.
+    const parked = missionOwnerLiveness(mine, { "MSN-other1": "WAITING_FOR_LLM" });
+    assert.equal(parked({ missionId: "MSN-other1" }), "live");
+    const done = missionOwnerLiveness(mine, { "MSN-other1": "COMPLETE" });
+    assert.equal(done({ missionId: "MSN-other1" }), "terminal");
+    const reclaimed = await sweepWorktrees({ repo, ownerLiveness: done, maxIdleMs: 24 * HOUR });
+    assert.equal(reclaimed.reclaimed.length, 1);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("a quarantined durable record still protects its worktree", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const repo = (await GitRepo.open(fixture.root))!;
+    const wt = await repo.createWorktree(await repo.headCommit(), "pi-eng-candidate-MSN-quar01-repo-1-0-EXC-a");
+    await ageWorktree(wt.path, 100 * HOUR);
+    const common = (
+      await exec("git", ["-C", fixture.root, "rev-parse", "--path-format=absolute", "--git-common-dir"])
+    ).stdout.trim();
+    const qdir = join(common, "pi-engineering-candidates", "quarantine");
+    await mkdir(qdir, { recursive: true });
+    await writeFile(join(qdir, "candidate.bad.json"), JSON.stringify({ path: wt.path }));
+    assert.deepEqual([...(await repo.durablyReferencedWorktreePaths([wt.path]))], [wt.path]);
+    const report = await sweepWorktrees({ repo, ownerLiveness: () => "terminal", maxIdleMs: 0 });
+    assert.equal(report.reclaimed.length, 0);
+    assert.equal(await exists(wt.path), true);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("a path assertSafeWorktreePath refuses lands in report.failed, untouched", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const repo = (await GitRepo.open(fixture.root))!;
+    // A worktree whose basename is exactly the namespace prefix is not a candidate worktree.
+    const odd = join(dirname(fixture.root), repo.worktreeNamespacePrefix());
+    await exec("git", ["-C", fixture.root, "worktree", "add", "-q", odd, "-b", "pi-eng-candidate-MSN-odd001-x"]);
+    await ageWorktree(odd, 100 * HOUR);
+    const report = await sweepWorktrees({ repo, ownerLiveness: () => "terminal", maxIdleMs: 0 });
+    assert.equal(report.reclaimed.length, 0);
+    assert.equal(report.failed.length, 1, JSON.stringify(report));
+    assert.match(report.failed[0]!.error, /refusing/);
+    assert.equal(await exists(odd), true);
+    await exec("git", ["-C", fixture.root, "worktree", "remove", "--force", odd]).catch(() => {});
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("housekeeping reports only (dry-run) unless PI_HOUSEKEEPING=1", () => {
+  assert.equal(housekeepingMode({}), "dry-run");
+  assert.equal(housekeepingMode({ PI_HOUSEKEEPING: "1" }), "on");
+  assert.equal(housekeepingMode({ PI_HOUSEKEEPING: "0" }), "off");
+  assert.equal(housekeepingMode({ PI_HOUSEKEEPING: "yes" }), "dry-run");
 });

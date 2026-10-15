@@ -1496,17 +1496,20 @@ export class GitRepo {
    * Worktree paths that any durable record (candidate lifecycle, cleanup
    * intent, promotion, run) still names, across all missions. Matches on raw
    * text so an unreadable or foreign record still protects its worktree.
-   * Quarantined records live in a subdirectory and are not scanned.
+   * Quarantined records are scanned too.
    */
   async durablyReferencedWorktreePaths(candidates: readonly string[]): Promise<Set<string>> {
-    const dir = await this.candidateStateDir(false);
+    const base = await this.candidateStateDir(false);
     const referenced = new Set<string>();
-    for (const name of await readdir(dir).catch(() => [] as string[])) {
-      if (!name.endsWith(".json")) continue;
-      const raw = await readFile(join(dir, name), "utf8").catch(() => null);
-      // Unreadable record: cannot prove it names nothing, so protect everything.
-      if (raw === null) return new Set(candidates);
-      for (const path of candidates) if (raw.includes(JSON.stringify(path))) referenced.add(path);
+    // Quarantined records are evidence of a worktree somebody still has to recover.
+    for (const dir of [base, join(base, "quarantine")]) {
+      for (const name of await readdir(dir).catch(() => [] as string[])) {
+        if (!name.endsWith(".json")) continue;
+        const raw = await readFile(join(dir, name), "utf8").catch(() => null);
+        // Unreadable record: cannot prove it names nothing, so protect everything.
+        if (raw === null) return new Set(candidates);
+        for (const path of candidates) if (raw.includes(JSON.stringify(path))) referenced.add(path);
+      }
     }
     return referenced;
   }

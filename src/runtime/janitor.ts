@@ -17,6 +17,7 @@ import {
   sweepWorktrees,
 } from "../git/worktreeJanitor.ts";
 import type { MissionStatus } from "../orchestration/types.ts";
+import { discoverMissionHandover } from "./host/missionHandover.ts";
 
 /** Mission statuses after which a mission never touches its worktrees again. */
 const TERMINAL_MISSION_STATUSES: ReadonlySet<MissionStatus> = new Set<MissionStatus>([
@@ -31,15 +32,31 @@ export interface MissionLookup {
   getTask(taskId: string): { mission_id: string } | undefined;
 }
 
-export function missionOwnerLiveness(store: MissionLookup | null | undefined): (owner: WorktreeOwner) => OwnerLiveness {
+/**
+ * Liveness of a worktree's owning mission. `terminal` only when a source
+ * proves it (this process's store, or the durable event log which also holds
+ * missions run by OTHER pi processes); a mission nobody here knows is
+ * `unknown`, which the janitor treats as keep.
+ */
+export function missionOwnerLiveness(
+  store: MissionLookup | null | undefined,
+  durableStatuses: Readonly<Record<string, string>> = {},
+): (owner: WorktreeOwner) => OwnerLiveness {
   return (owner) => {
-    if (!store) return "unknown";
-    const missionId = owner.missionId ?? (owner.taskId ? store.getTask(owner.taskId)?.mission_id : undefined);
+    const missionId = owner.missionId ?? (owner.taskId ? store?.getTask(owner.taskId)?.mission_id : undefined);
     if (!missionId) return "unknown";
-    const mission = store.getMission(missionId);
-    if (!mission) return "unknown";
-    return TERMINAL_MISSION_STATUSES.has(mission.status) ? "terminal" : "live";
+    const statuses = [store?.getMission(missionId)?.status, durableStatuses[missionId]].filter(
+      (s): s is string => typeof s === "string",
+    );
+    if (statuses.length === 0) return "unknown";
+    return statuses.every((s) => TERMINAL_MISSION_STATUSES.has(s as MissionStatus)) ? "terminal" : "live";
   };
+}
+
+/** `PI_HOUSEKEEPING`: `1` acts, `0` is off, anything else (default) reports only. */
+export function housekeepingMode(env: Record<string, string | undefined> = process.env): "on" | "off" | "dry-run" {
+  const raw = env.PI_HOUSEKEEPING?.trim().toLowerCase();
+  return raw === "1" ? "on" : raw === "0" ? "off" : "dry-run";
 }
 
 export interface HousekeepingResult {
@@ -53,8 +70,14 @@ export async function runHousekeeping(opts: {
   dryRun?: boolean;
 }): Promise<HousekeepingResult> {
   const repo = await GitRepo.open(opts.cwd);
+  // Durable facts include missions run by other pi processes on this worktree.
+  const durable = await discoverMissionHandover(opts.cwd).catch(() => null);
   const worktrees = repo
-    ? await sweepWorktrees({ repo, ownerLiveness: missionOwnerLiveness(opts.missions), dryRun: opts.dryRun })
+    ? await sweepWorktrees({
+        repo,
+        ownerLiveness: missionOwnerLiveness(opts.missions, durable?.statuses),
+        dryRun: opts.dryRun,
+      })
     : null;
   const rustCache = await sweepRustCache({ dryRun: opts.dryRun });
   return { worktrees, rustCache };
