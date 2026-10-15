@@ -144,6 +144,7 @@ async function startSession(
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow,
     maxTokens: 32_768,
+    compat: { supportsReasoningEffort: true },
   });
   runtime.registerProvider("gw", {
     baseUrl,
