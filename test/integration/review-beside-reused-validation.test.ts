@@ -18,15 +18,17 @@ interface Timing {
   validationStart: number;
   validationEnd: number;
   reviewStart: number;
+  reviewContext: string;
 }
 
 /** Scripted backends over real git and the real broker; `emitsReuse` says whether validation reuses. */
-async function harness(opts: { willReuse: boolean; emitsReuse: boolean }) {
+async function harness(opts: { willReuse: boolean; emitsReuse: boolean; invalidReviews?: number }) {
   const fixture = await makeFixtureRepo();
   const git = (await GitRepo.open(fixture.root))!;
   const baseSha = await git.headCommit();
   const timing: Partial<Timing> = {};
   let agent = 0;
+  let reviews = 0;
   const backends: BrokerBackends = {
     agent: {
       runAgent: async ({ worktree }) => {
@@ -95,11 +97,15 @@ async function harness(opts: { willReuse: boolean; emitsReuse: boolean }) {
     },
     review: {
       candidateScoped: true,
-      runReview: async ({ acceptanceCriteria }) => {
+      runReview: async ({ acceptanceCriteria, contextRef }) => {
         timing.reviewStart = Date.now();
+        timing.reviewContext = contextRef ?? "";
+        reviews++;
+        const invalid = reviews <= (opts.invalidReviews ?? 0);
         return {
           executionId: "review",
-          exitStatus: "succeeded",
+          exitStatus: invalid ? "failed" : "succeeded",
+          ...(invalid ? { error: "INVALID_WORKER_OUTPUT: the reviewer's review_result was missing or malformed" } : {}),
           summary: "reviewed",
           artifactRefs: [],
           usage: {},
@@ -111,7 +117,7 @@ async function harness(opts: { willReuse: boolean; emitsReuse: boolean }) {
             verdict: "approve",
             independenceMode: "independent",
             findings: [],
-            outputValid: true,
+            outputValid: !invalid,
             accessible: true,
             acceptanceResults: (acceptanceCriteria ?? []).map((criterion) => ({
               acceptanceId: criterion.acceptanceId,
@@ -154,7 +160,7 @@ async function harness(opts: { willReuse: boolean; emitsReuse: boolean }) {
       baseRef: baseSha,
       mutationRequested: true,
     });
-  return { fixture, store, timing, run };
+  return { fixture, store, timing, run, agentRuns: () => agent, reviewRuns: () => reviews };
 }
 
 describe("review beside a reused validation (#185)", () => {
@@ -167,6 +173,8 @@ describe("review beside a reused validation (#185)", () => {
       assert.ok(h.timing.reviewStart! >= h.timing.validationStart!);
       const review = h.store.listTasks(result.mission.mission_id).find((task) => task.kind === "review")!;
       assert.deepEqual(review.depends_on, []);
+      assert.match(h.timing.reviewContext ?? "", /change-1\.ts/, "the reviewer is handed the integrated diff");
+      assert.match(h.timing.reviewContext ?? "", /validation pending/);
     } finally {
       await h.fixture.cleanup();
     }
@@ -180,6 +188,19 @@ describe("review beside a reused validation (#185)", () => {
       assert.ok(h.timing.reviewStart! >= h.timing.validationEnd!, "review waited for the real validation");
       const review = h.store.listTasks(result.mission.mission_id).find((task) => task.kind === "review")!;
       assert.equal(review.depends_on.length, 1);
+      assert.match(h.timing.reviewContext ?? "", /Validation \(passed\)/);
+    } finally {
+      await h.fixture.cleanup();
+    }
+  });
+
+  it("re-runs a review whose output was unreadable instead of sending the implementer a repair task", async () => {
+    const h = await harness({ willReuse: false, emitsReuse: false, invalidReviews: 1 });
+    try {
+      const result = await h.run();
+      assert.equal(result.mission.status, "COMPLETE");
+      assert.equal(h.reviewRuns(), 2, "the review gate ran again");
+      assert.equal(h.agentRuns(), 1, "no implementer repair ran");
     } finally {
       await h.fixture.cleanup();
     }

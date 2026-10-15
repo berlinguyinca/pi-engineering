@@ -15,6 +15,7 @@ export interface ReviewContextInput {
   candidateSha?: string;
   criteria: Array<{ acceptanceId: string; criterion: string }>;
   validation:
+    | { state: "none" }
     | { state: "pending" }
     | {
         state: "finished";
@@ -58,6 +59,7 @@ async function diffSection(input: ReviewContextInput): Promise<string> {
 }
 
 function validationSection(validation: ReviewContextInput["validation"]): string {
+  if (validation.state === "none") return "## Validation\nNo validation ran before this review.";
   if (validation.state === "pending") return "## Validation\nvalidation pending: its result is not available yet.";
   const stages = validation.stages.map((stage) => `- ${stage.name}: ${stage.passed ? "pass" : "FAIL"}`).join("\n");
   const failing = !validation.passed && validation.failureOutput?.trim();

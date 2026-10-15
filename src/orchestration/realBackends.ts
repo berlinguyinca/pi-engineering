@@ -143,6 +143,28 @@ export const IMPLEMENTER_TOOLS: readonly string[] = [
   "claim_deliverable",
 ];
 
+/** Reviewer tools: the evidence tools, search, and `read`/`bash` to inspect files around the diff. */
+const REVIEWER_TOOLS: string[] = ["ledger_read", "artifact_read", "repo_search", "symbol", "read", "bash"];
+
+/**
+ * Criteria have no kind field, so "test-like" is a text/ID heuristic: the text
+ * starts with "test"/"tests" (optionally "test:"), or the ID contains "test".
+ */
+const TEST_LIKE_CRITERION_TEXT = /^\s*tests?\b/i;
+
+function testCriteriaPassed(
+  criteria: Array<{ acceptanceId: string; criterion: string }>,
+  stageCount: number,
+): Array<{ acceptanceId: string; status: "passed"; detail: string }> {
+  return criteria
+    .filter((c) => TEST_LIKE_CRITERION_TEXT.test(c.criterion) || /test/i.test(c.acceptanceId))
+    .map((c) => ({
+      acceptanceId: c.acceptanceId,
+      status: "passed" as const,
+      detail: `verification run passed (${stageCount} stage${stageCount === 1 ? "" : "s"}, exit 0)`,
+    }));
+}
+
 const MODEL_GONE_MARKERS: ReadonlySet<string> = new Set(["transient:model_unavailable", "unknown-model"]);
 
 /**
@@ -777,6 +799,7 @@ export function realBackends(opts: RealBackendsOptions) {
         /** The commit the candidate was built on; failures already red there are inherited, not introduced. */
         baseSha?: string;
         testRequirement?: string;
+        acceptanceCriteria?: Array<{ acceptanceId: string; criterion: string }>;
         signal: AbortSignal;
         onActivity?: (event: WorkerActivity) => void;
       }): Promise<ExecutionOutcome> {
@@ -871,7 +894,11 @@ export function realBackends(opts: RealBackendsOptions) {
             },
             noTargets: outcome.noTargets,
             accessible: artifactState.allAccessible,
-            acceptanceResults: [],
+            // A suite that ran green proves the criteria that are about tests.
+            acceptanceResults:
+              passed && !outcome.noTargets
+                ? testCriteriaPassed(input.acceptanceCriteria ?? [], outcome.stages.length)
+                : [],
           },
         };
       },
@@ -919,7 +946,7 @@ export function realBackends(opts: RealBackendsOptions) {
             .map((criterion) => `\nAcceptance criterion ${criterion.acceptanceId}: ${criterion.criterion}`)
             .join("")}`,
           context: input.contextRef,
-          tools: ["ledger_read", "artifact_read", "repo_search", "symbol"],
+          tools: REVIEWER_TOOLS,
           cwd: input.worktree ?? bound.cwd,
           // The role's table budget; the executor clamps it to 70% of the
           // routed model's context window (issue #180), so a 32k-slot model is
@@ -1071,14 +1098,15 @@ export function realBackends(opts: RealBackendsOptions) {
             return [];
           }
         });
-        let acceptanceResults: ReturnType<typeof validateAcceptanceResults> = [];
-        try {
-          acceptanceResults = validateAcceptanceResults(
-            structured?.acceptanceResults,
-            (input.acceptanceCriteria ?? []).map((criterion) => criterion.acceptanceId),
-          );
-        } catch {
-          outputValid = false;
+        // Small models mangle IDs; a slip there must not void the whole review.
+        const acceptanceWarnings: string[] = [];
+        const acceptanceResults = validateAcceptanceResults(
+          structured?.acceptanceResults,
+          (input.acceptanceCriteria ?? []).map((criterion) => criterion.acceptanceId),
+          { tolerant: true, warnings: acceptanceWarnings },
+        );
+        for (const warning of acceptanceWarnings) {
+          normalizedFindings.push({ severity: "minor", summary: `acceptance_results: ${warning}`, status: "open" });
         }
         const artifactEvidence = await artifactContentHashes(opts.artifacts, outcome.artifactRefs);
         outcome.reviewEvidence = {
@@ -1093,6 +1121,15 @@ export function realBackends(opts: RealBackendsOptions) {
           acceptanceResults,
         };
         outcome.artifactHashes = artifactEvidence.hashes;
+        // A review whose output could not be read says nothing about the
+        // candidate: fail the attempt as an invalid gate output so the review
+        // re-runs (see classifyGateFailure) instead of spawning implementer repair.
+        if (!outputValid && outcome.exitStatus === "succeeded") {
+          outcome.exitStatus = "failed";
+          outcome.error = "INVALID_WORKER_OUTPUT: the reviewer's review_result was missing or malformed";
+          // Half-parsed findings from unreadable output must not become repair work.
+          outcome.findings = [];
+        }
         return outcome;
       },
     },

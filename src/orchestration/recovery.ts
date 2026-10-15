@@ -323,6 +323,8 @@ export function gateReportedVerdict(
   if (kind === "review") {
     const review = outcome?.reviewEvidence;
     if (review) {
+      // Unreadable reviewer output is not a verdict: the review must re-run.
+      if (!review.outputValid) return false;
       return (
         review.outputValid &&
         review.accessible &&
@@ -379,6 +381,9 @@ export function classifyGateFailure(
     // it); MERGE_CONFLICT (rebuild the candidate) is only for a real conflict.
     const category = kind === "integration" && integrationChecksFailed(outcome) ? "VALIDATION_FAILED" : gateCategory;
     return classifier.classify({ ...evidence, category });
+  }
+  if (kind === "review" && outcome?.reviewEvidence && !outcome.reviewEvidence.outputValid) {
+    return classifier.classify({ ...evidence, category: "PROVIDER_TRANSIENT" });
   }
   const inferred = classifier.classify(evidence);
   return gateCategory && inferred.category === "INVALID_WORKER_OUTPUT"

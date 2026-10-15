@@ -56,6 +56,7 @@ import {
   replacementTaskFingerprintSpec,
 } from "./recovery.ts";
 import type { RepositoryRegistry } from "./repositoryRegistry.ts";
+import { buildReviewContext } from "./reviewContext.ts";
 import { brokerKind } from "./scheduler.ts";
 import { MissionScheduler } from "./scheduler.ts";
 import type { ProtectedUserCriteria, SpecControllerResult, SpecScopeEnvelope } from "./specApproval.ts";
@@ -2992,7 +2993,63 @@ export class Orchestrator {
     this.store.transitionTask(task.task_id, "READY");
     return this.runSingleTask(mission.mission_id, task.task_id, {
       reviewedRecovered: recovered.map((t) => t.task_id),
+      contextRef: await this.reviewContextFor(mission),
       signal,
+    });
+  }
+
+  /** The change under review, the validation result, the implementers' summaries and the criteria IDs. */
+  private async reviewContextFor(mission: Mission): Promise<string> {
+    const missionId = mission.mission_id;
+    const repoId = this.repoIdForMission(missionId);
+    const candidate = repoId ? this.store.getCandidate(missionId, repoId) : undefined;
+    const repoRoot = this.store
+      .getWorkspaceManifest(missionId)
+      ?.repositories.find((r) => r.repoId === repoId)?.canonicalRoot;
+    const validationTask = this.store
+      .listTasks(missionId)
+      .filter((t) => t.kind === "validation")
+      .at(-1);
+    const evidence = candidate
+      ? this.store
+          .listValidationEvidence(missionId)
+          .filter((entry) => entry.identityHash === candidate.identityHash)
+          .at(-1)
+      : undefined;
+    const validationSettled = validationTask?.status === "SUCCEEDED" || validationTask?.status === "FAILED";
+    const stages = (evidence?.testSummary as { stages?: Array<{ name?: unknown; passed?: unknown }> } | undefined)
+      ?.stages;
+    const workerSummaries = this.store
+      .listExecutions(missionId)
+      .filter(
+        (execution) =>
+          execution.backend === "agent" &&
+          execution.status === "SUCCEEDED" &&
+          execution.summary &&
+          this.store.getTask(execution.task_id)?.mutates_repo === true,
+      )
+      .map((execution) => ({ taskId: execution.task_id, summary: execution.summary ?? "" }));
+    return buildReviewContext({
+      repoRoot,
+      baseSha: candidate?.identity.baseSha,
+      candidateSha: candidate?.identity.candidateSha,
+      criteria: mission.acceptance_criteria.flatMap((criterion) =>
+        criterion.acceptance_id ? [{ acceptanceId: criterion.acceptance_id, criterion: criterion.criterion }] : [],
+      ),
+      validation: !validationTask
+        ? { state: "none" }
+        : !validationSettled
+          ? { state: "pending" }
+          : {
+              state: "finished",
+              passed: validationTask.status === "SUCCEEDED",
+              stages: (stages ?? []).map((stage) => ({
+                name: String(stage.name ?? "stage"),
+                passed: stage.passed === true,
+              })),
+              failureOutput: validationTask.failure_reason,
+            },
+      workerSummaries,
     });
   }
 
@@ -3275,7 +3332,7 @@ export class Orchestrator {
   private async runSingleTask(
     missionId: string,
     taskId: string,
-    extra: { reviewedRecovered?: string[]; signal?: AbortSignal } = {},
+    extra: { reviewedRecovered?: string[]; contextRef?: string; signal?: AbortSignal } = {},
   ): Promise<boolean> {
     if (!this.recoveryTaskGenerations.has(taskId)) await this.renewMissionOwnership(missionId);
     let task = this.store.getTask(taskId)!;
@@ -3300,6 +3357,7 @@ export class Orchestrator {
         kind: brokerKind(task.kind),
         role: task.role,
         objective: task.objective,
+        ...(extra.contextRef ? { contextRef: extra.contextRef } : {}),
         mutatesRepo: task.mutates_repo,
         writeDomains: task.write_domains,
         isolation: task.isolation,
