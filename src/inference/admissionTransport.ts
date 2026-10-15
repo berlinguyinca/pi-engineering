@@ -216,6 +216,10 @@ export interface AdmissionAttemptCapture {
 export const LOGICAL_REQUEST_HEADER = "x-pi-logical-request-id";
 /** Header carrying the 1-based attempt number. */
 export const ATTEMPT_HEADER = "x-pi-attempt";
+/** Header carrying the session id so the gateway can route a session stickily (InferWeave spec 60). */
+export const SESSION_HEADER = "x-inferweave-session";
+/** What the gateway accepts as a session id: 1-256 printable ASCII characters, no spaces. */
+const SESSION_ID = /^[\x21-\x7e]{1,256}$/;
 /** Header the transport sets to claim ownership of an admission rejection. */
 export const SHOULD_RETRY_HEADER = "x-should-retry";
 
@@ -242,9 +246,17 @@ export function createAdmissionCaptureFetch(
   capture: AdmissionAttemptCapture,
   baseFetch: AdmissionFetch = globalThis.fetch as AdmissionFetch,
   markNonRetryable = true,
+  sessionId?: string,
 ): AdmissionFetch {
+  const session = sessionId !== undefined && SESSION_ID.test(sessionId) ? sessionId : undefined;
   return async (input, init) => {
-    const response = await baseFetch(input, init);
+    let requestInit = init;
+    if (session !== undefined) {
+      const headers = new Headers(init?.headers);
+      headers.set(SESSION_HEADER, session);
+      requestInit = { ...init, headers };
+    }
+    const response = await baseFetch(input, requestInit);
     if (!mayCarryAdmission(response.status)) return response;
     let text: string;
     try {
@@ -976,7 +988,13 @@ export function createAdmissionStreamSimple(opts: AdmissionTransportOptions): Ad
       options,
       (attempt, attemptOptions, capture) => {
         const baseFetch: AdmissionFetch = options?.fetch ?? (globalThis.fetch as AdmissionFetch);
-        const fetchImpl = createAdmissionCaptureFetch(capture, baseFetch, effOpts.config.own_transport_retries);
+        const scope = typeof opts.scope === "function" ? opts.scope(options?.sessionId) : opts.scope;
+        const fetchImpl = createAdmissionCaptureFetch(
+          capture,
+          baseFetch,
+          effOpts.config.own_transport_retries,
+          scope?.sessionId,
+        );
         return delegate(model, context, { ...attemptOptions, fetch: fetchImpl });
       },
       effOpts,
