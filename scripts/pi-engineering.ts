@@ -3,7 +3,7 @@ import { mkdir, writeFile } from "node:fs/promises";
 /**
  * pi-engineering CLI.
  *
- *   node scripts/pi-engineering.ts roadmap check [--json] [--no-refresh]
+ *   node scripts/pi-engineering.ts roadmap check [--json] [--no-refresh] [--structural]
  *   node scripts/pi-engineering.ts roadmap status [--json]
  *   node scripts/pi-engineering.ts missions list|cancel --store <dir> ...  (legacy orchestration.jsonl only; see docs/orchestration.md)
  *   node scripts/pi-engineering.ts doctor [--repair] [--json] [--cwd <dir>]
@@ -11,7 +11,8 @@ import { mkdir, writeFile } from "node:fs/promises";
  * `roadmap check` exit codes:
  *   0  roadmap 1.0 complete (release gate passes)
  *   1  valid roadmap, not yet complete
- *   2  invalid roadmap definition
+ *   2  invalid roadmap definition (with --structural: definition or manual
+ *      evidence index invalid; no tests run, no freshness computed)
  *   3  infrastructure/check error
  */
 import { resolve } from "node:path";
@@ -22,7 +23,7 @@ import { BlackholeManager } from "../src/blackhole/BlackholeManager.ts";
 import { blackholeTelemetry, formatBlackholeTelemetry } from "../src/blackhole/telemetry.ts";
 import { Ledger } from "../src/ledger/Ledger.ts";
 import { runMissionsCommand } from "../src/orchestration/missionCancelCli.ts";
-import { defaultCliPaths, runRoadmapCheck, runRoadmapStatus } from "../src/roadmap/cli.ts";
+import { defaultCliPaths, runRoadmapCheck, runRoadmapStatus, runRoadmapStructural } from "../src/roadmap/cli.ts";
 import { doctorExitCode, formatDoctorReport, runDoctor } from "../src/runtime/isolation/doctor.ts";
 import { runSessionsCommand } from "../src/sessionControl/cli.ts";
 
@@ -58,6 +59,11 @@ async function main(): Promise<number> {
   const refresh = !rest.includes("--no-refresh");
   const sub = rest.find((a) => !a.startsWith("--"));
   const paths = defaultCliPaths(REPO_ROOT);
+  if (sub === "check" && rest.includes("--structural")) {
+    const { exitCode, text } = await runRoadmapStructural({ ...paths, repoRoot: REPO_ROOT, json, refresh: false });
+    console.log(text);
+    return exitCode;
+  }
   if (sub === "check") {
     const { exitCode, text } = await runRoadmapCheck({ ...paths, repoRoot: REPO_ROOT, json, refresh });
     console.log(text);

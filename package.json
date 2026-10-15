@@ -25,6 +25,7 @@
     "test:dogfood:lifecycle": "node scripts/dogfood-lifecycle.ts",
     "dogfood:mission-recovery": "node scripts/dogfood-mission-recovery.ts --model local/local",
     "roadmap:check": "node scripts/pi-engineering.ts roadmap check",
+    "roadmap:structural": "node scripts/pi-engineering.ts roadmap check --structural",
     "roadmap:status": "node scripts/pi-engineering.ts roadmap status",
     "lint": "biome check .",
     "format": "biome format --write .",
