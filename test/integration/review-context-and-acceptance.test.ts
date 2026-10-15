@@ -444,6 +444,13 @@ test("request_changes with a sloppy findings envelope still keeps its findings f
   });
   assert.equal(outcome.reviewEvidence?.outputValid, false);
   assert.equal(outcome.findings?.length, 1, "the reviewer's own request_changes findings are not discarded");
+  const classification = classifyGateFailure(
+    new FailureClassifier(),
+    "review",
+    { missionId: "M", taskId: "T", summary: outcome.error ?? "" },
+    outcome,
+  );
+  assert.equal(classification.category, "REVIEW_FAILED", "repair, not a duplicate review re-run");
 });
 
 test("request_changes with a blocking finding stays a valid verdict without acceptance_results", async () => {

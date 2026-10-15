@@ -305,6 +305,12 @@ function integrationChecksFailed(outcome: ExecutionOutcome | undefined): boolean
   return outcome.checksFailed === true || /^verification failed at stage:/.test(outcome.error ?? "");
 }
 
+/** A request_changes review whose findings the backend kept on the mission record (never after a mutation or an unreadable approval). */
+function reviewKeptFindings(outcome: ExecutionOutcome | undefined): boolean {
+  const review = outcome?.reviewEvidence;
+  return review?.verdict === "request_changes" && review.findings.length > 0 && (outcome?.findings?.length ?? 0) > 0;
+}
+
 /**
  * Whether a failed gate task actually ran and reported a verdict about the
  * candidate: a review verdict with request_changes or blocking findings, a
@@ -323,7 +329,10 @@ export function gateReportedVerdict(
   if (kind === "review") {
     const review = outcome?.reviewEvidence;
     if (review) {
-      // Unreadable reviewer output is not a verdict: the review must re-run.
+      // A request_changes verdict whose findings were kept is the reviewer's own
+      // statement, even if its envelope was sloppy: those findings drive repair.
+      if (reviewKeptFindings(outcome)) return true;
+      // Otherwise unreadable reviewer output is not a verdict: the review must re-run.
       return (
         review.outputValid &&
         review.accessible &&
@@ -384,7 +393,12 @@ export function classifyGateFailure(
     const category = kind === "integration" && integrationChecksFailed(outcome) ? "VALIDATION_FAILED" : gateCategory;
     return classifier.classify({ ...evidence, category });
   }
-  if (kind === "review" && outcome?.reviewEvidence && !outcome.reviewEvidence.outputValid) {
+  if (
+    kind === "review" &&
+    outcome?.reviewEvidence &&
+    !outcome.reviewEvidence.outputValid &&
+    !reviewKeptFindings(outcome)
+  ) {
     return classifier.classify({ ...evidence, category: "PROVIDER_TRANSIENT" });
   }
   const inferred = classifier.classify(evidence);
