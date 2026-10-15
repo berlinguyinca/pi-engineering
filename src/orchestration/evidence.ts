@@ -69,7 +69,88 @@ export function taskCoverageFingerprint(
   return `sha256:${createHash("sha256").update(JSON.stringify({ deliverables, objective, repoId })).digest("hex")}`;
 }
 
-export function validateAcceptanceResults(raw: unknown, allowedIds: string[]): AcceptanceEvidenceResult[] {
+/** Lowercase and strip non-alphanumerics: "AC-1", "ac_1" and " ac 1 " name the same criterion. */
+function normalizeAcceptanceId(id: string): string {
+  return id.toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+export interface AcceptanceResultOptions {
+  /**
+   * Model-authored results (the reviewer): match IDs by normalised form, keep the
+   * first of duplicates, drop unknown IDs and malformed entries with a warning,
+   * and report every omitted ID as failed. Recorded evidence replay stays strict.
+   */
+  tolerant?: boolean;
+  /** Receives one line per tolerated defect (tolerant mode only). */
+  warnings?: string[];
+  /**
+   * Receives a reason when the results are unusable as a whole (tolerant mode
+   * only): criteria exist but the list is missing, not a list, or empty. The
+   * caller treats that as invalid output, not as every criterion failed.
+   */
+  problems?: string[];
+}
+
+function tolerantAcceptanceResults(
+  raw: unknown,
+  allowedIds: string[],
+  warnings: string[] | undefined,
+  problems: string[] | undefined,
+): AcceptanceEvidenceResult[] {
+  // Normalised forms can collide (AC-10 / AC-1-0): a collided form is ambiguous
+  // and only an exact ID may claim it; a unique form may be matched loosely.
+  const exact = new Set(allowedIds);
+  const byNormalized = new Map<string, string | null>();
+  for (const id of allowedIds) {
+    const key = normalizeAcceptanceId(id);
+    byNormalized.set(key, byNormalized.has(key) && byNormalized.get(key) !== id ? null : id);
+  }
+  const reported = new Map<string, AcceptanceEvidenceResult>();
+  const warn = (message: string): void => {
+    warnings?.push(message);
+  };
+  const entries = Array.isArray(raw) ? raw : [];
+  if (allowedIds.length > 0 && entries.length === 0) {
+    problems?.push(
+      Array.isArray(raw) ? "acceptance_results was empty" : "acceptance_results was missing or not a list",
+    );
+  }
+  for (const entry of entries) {
+    if (!entry || typeof entry !== "object") {
+      warn("dropped a malformed acceptance result");
+      continue;
+    }
+    const value = entry as Partial<AcceptanceEvidenceResult>;
+    const given = typeof value.acceptanceId === "string" ? value.acceptanceId : "";
+    const canonical = exact.has(given.trim())
+      ? given.trim()
+      : (byNormalized.get(normalizeAcceptanceId(given)) ?? undefined);
+    if (!canonical) {
+      warn(`dropped acceptance result for unknown ID "${given}"`);
+      continue;
+    }
+    if (value.status !== "passed" && value.status !== "failed") {
+      warn(`dropped acceptance result for ${canonical}: invalid status`);
+      continue;
+    }
+    if (reported.has(canonical)) {
+      warn(`ignored duplicate acceptance result for ${canonical}`);
+      continue;
+    }
+    const detail = typeof value.detail === "string" && value.detail.trim() ? value.detail.trim() : "no detail given";
+    reported.set(canonical, { acceptanceId: canonical, status: value.status, detail });
+  }
+  return allowedIds.map(
+    (id) => reported.get(id) ?? { acceptanceId: id, status: "failed", detail: "not reported by reviewer" },
+  );
+}
+
+export function validateAcceptanceResults(
+  raw: unknown,
+  allowedIds: string[],
+  options: AcceptanceResultOptions = {},
+): AcceptanceEvidenceResult[] {
+  if (options.tolerant) return tolerantAcceptanceResults(raw, allowedIds, options.warnings, options.problems);
   if (!Array.isArray(raw)) throw new Error("evidence requires explicit acceptance results");
   const allowed = new Set(allowedIds);
   const seen = new Set<string>();

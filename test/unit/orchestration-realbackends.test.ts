@@ -324,7 +324,7 @@ describe("realBackends capability routing", () => {
     assert.equal(seen[0]?.tolerantFileTools, true);
     assert.ok(!seen[0]?.tools.includes("checkpoint_progress"));
     assert.deepEqual(seen[2]?.tools, ["ledger_read", "repo_search", "symbol", "tests_for"]);
-    assert.deepEqual(seen[3]?.tools, ["ledger_read", "artifact_read", "repo_search", "symbol"]);
+    assert.deepEqual(seen[3]?.tools, ["ledger_read", "artifact_read", "repo_search", "symbol", "read", "bash"]);
   });
 
   it("gives the reviewer the same (absent) duration cap and unbounded capacity wait as implementation workers", async () => {

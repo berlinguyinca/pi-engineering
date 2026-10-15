@@ -305,6 +305,12 @@ function integrationChecksFailed(outcome: ExecutionOutcome | undefined): boolean
   return outcome.checksFailed === true || /^verification failed at stage:/.test(outcome.error ?? "");
 }
 
+/** A request_changes review whose findings the backend kept on the mission record (never after a mutation or an unreadable approval). */
+function reviewKeptFindings(outcome: ExecutionOutcome | undefined): boolean {
+  const review = outcome?.reviewEvidence;
+  return review?.verdict === "request_changes" && review.findings.length > 0 && (outcome?.findings?.length ?? 0) > 0;
+}
+
 /**
  * Whether a failed gate task actually ran and reported a verdict about the
  * candidate: a review verdict with request_changes or blocking findings, a
@@ -323,6 +329,10 @@ export function gateReportedVerdict(
   if (kind === "review") {
     const review = outcome?.reviewEvidence;
     if (review) {
+      // A request_changes verdict whose findings were kept is the reviewer's own
+      // statement, even if its envelope was sloppy: those findings drive repair.
+      if (reviewKeptFindings(outcome)) return true;
+      // Otherwise unreadable reviewer output is not a verdict: the review must re-run.
       return (
         review.outputValid &&
         review.accessible &&
@@ -355,6 +365,9 @@ export function gateReportedVerdict(
 export const GATE_TRANSPORT_SIGNATURE =
   /connection error|connection closed|stream ended without (?:a )?finish_reason|model[_ ]superseded|gateway capacity hold|capacity hold:|http 400.*grammar|failed to parse grammar|failed to initialize samplers/i;
 
+/** Prefix of the error a gate backend sets when its model's output could not be read; the gate re-runs. */
+export const INVALID_WORKER_OUTPUT_PREFIX = "INVALID_WORKER_OUTPUT";
+
 const GATE_FAILURE_CATEGORY: Partial<Record<OrchestrationTask["kind"], FailureCategory>> = {
   validation: "VALIDATION_FAILED",
   review: "REVIEW_FAILED",
@@ -379,6 +392,14 @@ export function classifyGateFailure(
     // it); MERGE_CONFLICT (rebuild the candidate) is only for a real conflict.
     const category = kind === "integration" && integrationChecksFailed(outcome) ? "VALIDATION_FAILED" : gateCategory;
     return classifier.classify({ ...evidence, category });
+  }
+  if (
+    kind === "review" &&
+    outcome?.reviewEvidence &&
+    !outcome.reviewEvidence.outputValid &&
+    !reviewKeptFindings(outcome)
+  ) {
+    return classifier.classify({ ...evidence, category: "PROVIDER_TRANSIENT" });
   }
   const inferred = classifier.classify(evidence);
   return gateCategory && inferred.category === "INVALID_WORKER_OUTPUT"

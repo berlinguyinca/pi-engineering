@@ -34,6 +34,8 @@ import {
   workerTimeoutMs,
 } from "./broker.ts";
 import { normalizeReviewSeverity, validateAcceptanceResults } from "./evidence.ts";
+import { INVALID_WORKER_OUTPUT_PREFIX } from "./recovery.ts";
+import { guardReviewWorktree } from "./reviewGuard.ts";
 
 /** What a verification run concluded, in the shape the result cache stores. */
 interface JudgedVerification {
@@ -142,6 +144,45 @@ export const IMPLEMENTER_TOOLS: readonly string[] = [
   "tests_for",
   "claim_deliverable",
 ];
+
+/** Reviewer tools: the evidence tools, search, and `read`/`bash` to inspect files around the diff. */
+const REVIEWER_TOOLS: string[] = ["ledger_read", "artifact_read", "repo_search", "symbol", "read", "bash"];
+
+/**
+ * Criteria have no kind field, so "test-like" is a heuristic over the criterion:
+ * its text starts with the word "test"/"tests" ("Tests must cover ..."), or its
+ * ID has a word-bounded "test" part (TEST-1, AC-TEST-1, ac_tests_2; not
+ * AC-LATEST-1 or AC-CONTEST). The heuristic only selects candidates. The real
+ * guard is the run itself: see `testStageRan`.
+ */
+const TEST_LIKE_CRITERION_TEXT = /^\s*tests?\b/i;
+const TEST_LIKE_CRITERION_ID = /^tests?(?:[-_]|$)|[-_]tests?(?:[-_]|$)/i;
+/** A verifier stage that runs tests: `test`, `test:unit`, `unit-tests`, `spec`, `jest`, `vitest`, `pytest`. */
+const TEST_STAGE_NAME = /(?:^|[-_:.\s])(?:tests?|specs?|jest|vitest|pytest|e2e)(?:$|[-_:.\s])/i;
+
+/** True when at least one passed stage of the run executes tests (typecheck/lint/build do not count). */
+function testStageRan(stages: Array<{ stage: { name: string }; passed: boolean }>): boolean {
+  return stages.some((run) => run.passed && TEST_STAGE_NAME.test(run.stage.name));
+}
+
+export function testCriteriaPassed(
+  criteria: Array<{ acceptanceId: string; criterion: string }>,
+  stages: Array<{ stage: { name: string }; passed: boolean }>,
+  inheritedFailures: readonly unknown[],
+): Array<{ acceptanceId: string; status: "passed"; detail: string }> {
+  if (inheritedFailures.length > 0 || !testStageRan(stages)) return [];
+  const names = stages
+    .filter((run) => run.passed && TEST_STAGE_NAME.test(run.stage.name))
+    .map((run) => run.stage.name)
+    .join(", ");
+  return criteria
+    .filter((c) => TEST_LIKE_CRITERION_TEXT.test(c.criterion) || TEST_LIKE_CRITERION_ID.test(c.acceptanceId))
+    .map((c) => ({
+      acceptanceId: c.acceptanceId,
+      status: "passed" as const,
+      detail: `test stage(s) passed in the verification run: ${names}`,
+    }));
+}
 
 const MODEL_GONE_MARKERS: ReadonlySet<string> = new Set(["transient:model_unavailable", "unknown-model"]);
 
@@ -777,6 +818,7 @@ export function realBackends(opts: RealBackendsOptions) {
         /** The commit the candidate was built on; failures already red there are inherited, not introduced. */
         baseSha?: string;
         testRequirement?: string;
+        acceptanceCriteria?: Array<{ acceptanceId: string; criterion: string }>;
         signal: AbortSignal;
         onActivity?: (event: WorkerActivity) => void;
       }): Promise<ExecutionOutcome> {
@@ -871,7 +913,11 @@ export function realBackends(opts: RealBackendsOptions) {
             },
             noTargets: outcome.noTargets,
             accessible: artifactState.allAccessible,
-            acceptanceResults: [],
+            // A suite that ran green proves the criteria that are about tests.
+            acceptanceResults:
+              passed && !outcome.noTargets
+                ? testCriteriaPassed(input.acceptanceCriteria ?? [], outcome.stages, inheritedFailures)
+                : [],
           },
         };
       },
@@ -900,6 +946,8 @@ export function realBackends(opts: RealBackendsOptions) {
         contextRef?: string;
         acceptanceCriteria?: Array<{ acceptanceId: string; criterion: string }>;
         worktree?: string | null;
+        /** The recorded candidate commit the worktree must stay on. */
+        candidateSha?: string;
         missionId?: string;
         taskId?: string;
         signal: AbortSignal;
@@ -919,7 +967,7 @@ export function realBackends(opts: RealBackendsOptions) {
             .map((criterion) => `\nAcceptance criterion ${criterion.acceptanceId}: ${criterion.criterion}`)
             .join("")}`,
           context: input.contextRef,
-          tools: ["ledger_read", "artifact_read", "repo_search", "symbol"],
+          tools: REVIEWER_TOOLS,
           cwd: input.worktree ?? bound.cwd,
           // The role's table budget; the executor clamps it to 70% of the
           // routed model's context window (issue #180), so a 32k-slot model is
@@ -1009,6 +1057,17 @@ export function realBackends(opts: RealBackendsOptions) {
         if (initialWarning) notify(initialWarning);
         // A reviewer model the gateway no longer serves is handed over too, and
         // every switch says whether the review is still independent.
+        // The reviewer has bash: the candidate it judges must come back untouched.
+        const guard = await guardReviewWorktree(req.cwd, input.candidateSha);
+        if (!guard && req.cwd) {
+          input.onActivity?.({
+            kind: "execution",
+            stage: "review",
+            phase: "started",
+            summary: `Warning: ${req.cwd} is not a git checkout; the reviewer mutation guard is skipped.`,
+            meaningfulProgress: false,
+          });
+        }
         const takeover = await runWithModelTakeover(req, input, {
           initial,
           next: pickReviewer,
@@ -1039,14 +1098,13 @@ export function realBackends(opts: RealBackendsOptions) {
         const raw = structured?.findings;
         outcome.findings = normalizeFindings(raw);
         const verdict = structured?.verdict;
-        let outputValid =
-          (verdict === "approve" || verdict === "request_changes") &&
-          Array.isArray(raw) &&
-          raw.every(validRawReviewFinding) &&
-          Array.isArray(structured?.missingTests) &&
-          structured.missingTests.every(validRawMissingTest) &&
-          Array.isArray(structured?.specGaps) &&
-          structured.specGaps.every(validRawSpecGap);
+        const invalidReasons: string[] = [];
+        if (verdict !== "approve" && verdict !== "request_changes") invalidReasons.push("verdict");
+        if (!Array.isArray(raw) || !raw.every(validRawReviewFinding)) invalidReasons.push("findings");
+        if (!Array.isArray(structured?.missingTests) || !structured.missingTests.every(validRawMissingTest))
+          invalidReasons.push("missing_tests");
+        if (!Array.isArray(structured?.specGaps) || !structured.specGaps.every(validRawSpecGap))
+          invalidReasons.push("spec_gaps");
         outcome.findings.push(
           ...(Array.isArray(structured?.missingTests) ? structured.missingTests : []).map((entry) => {
             const record = entry as Record<string, unknown>;
@@ -1067,19 +1125,36 @@ export function realBackends(opts: RealBackendsOptions) {
               },
             ];
           } catch {
-            outputValid = false;
+            invalidReasons.push("finding severity");
             return [];
           }
         });
-        let acceptanceResults: ReturnType<typeof validateAcceptanceResults> = [];
-        try {
-          acceptanceResults = validateAcceptanceResults(
-            structured?.acceptanceResults,
-            (input.acceptanceCriteria ?? []).map((criterion) => criterion.acceptanceId),
-          );
-        } catch {
-          outputValid = false;
+        // Small models mangle IDs; a slip there must not void the whole review.
+        const acceptanceWarnings: string[] = [];
+        const acceptanceProblems: string[] = [];
+        const acceptanceResults = validateAcceptanceResults(
+          structured?.acceptanceResults,
+          (input.acceptanceCriteria ?? []).map((criterion) => criterion.acceptanceId),
+          { tolerant: true, warnings: acceptanceWarnings, problems: acceptanceProblems },
+        );
+        // An approval with no acceptance evidence is meaningless; a request_changes
+        // verdict stands on its findings and stays valid whatever acceptance_results holds.
+        if (acceptanceProblems.length > 0 && verdict === "approve") invalidReasons.push("acceptance_results");
+        for (const warning of acceptanceWarnings) {
+          normalizedFindings.push({ severity: "minor", summary: `acceptance_results: ${warning}`, status: "open" });
         }
+        const mutation = guard ? await guard.check() : undefined;
+        if (mutation) invalidReasons.push(mutation);
+        if (guard?.removedIgnored.length) {
+          input.onActivity?.({
+            kind: "execution",
+            stage: "review",
+            phase: "started",
+            summary: `Removed ignored files the reviewer's commands wrote: ${guard.removedIgnored.slice(0, 5).join(", ")}`,
+            meaningfulProgress: false,
+          });
+        }
+        const outputValid = invalidReasons.length === 0;
         const artifactEvidence = await artifactContentHashes(opts.artifacts, outcome.artifactRefs);
         outcome.reviewEvidence = {
           reviewerSessionId: req.sessionId ?? reviewerSessionId,
@@ -1093,6 +1168,19 @@ export function realBackends(opts: RealBackendsOptions) {
           acceptanceResults,
         };
         outcome.artifactHashes = artifactEvidence.hashes;
+        // A review whose output could not be read says nothing about the
+        // candidate: fail the attempt as an invalid gate output so the review
+        // re-runs (see classifyGateFailure) instead of spawning implementer repair.
+        if (!outputValid && outcome.exitStatus === "succeeded") {
+          outcome.exitStatus = "failed";
+          outcome.error = `${INVALID_WORKER_OUTPUT_PREFIX}: ${
+            mutation ?? `the reviewer's review_result was missing or malformed (${invalidReasons.join(", ")})`
+          }`;
+          // An unreadable approval says nothing, so its half-parsed findings must not become
+          // repair work. A request_changes verdict is the reviewer's own statement: its
+          // findings stay on the mission record and drive repair even if the envelope was sloppy.
+          if (verdict !== "request_changes" || mutation) outcome.findings = [];
+        }
         return outcome;
       },
     },
