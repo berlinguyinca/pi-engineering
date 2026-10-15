@@ -52,6 +52,8 @@ export interface GatewayAdmissionConfig {
    * watchdog.
    */
   modelStreamStallMs: number;
+  /** Window before the first token of a model turn (default 15m, longer than the between-token window). */
+  firstTokenStallMs: number;
   /** Emit one structured telemetry line per admission event. */
   telemetry: boolean;
 }
@@ -66,7 +68,8 @@ export const DEFAULT_GATEWAY_CONFIG: GatewayAdmissionConfig = {
   jitterMs: 250,
   maxRetries: 8,
   maxElapsedMs: 12 * 3_600_000,
-  modelStreamStallMs: 10 * 60_000,
+  modelStreamStallMs: 5 * 60_000,
+  firstTokenStallMs: 15 * 60_000,
   telemetry: true,
 };
 
@@ -114,8 +117,10 @@ export function parseGatewayElapsedMs(value: string | undefined): number | null 
  *                                  mission scheduler takes over the wait (default: 8)
  *   PI_GATEWAY_MAX_ELAPSED_MS    — ms or duration ("12h"), how long one interactive turn waits
  *                                  out transient infrastructure (default: 12h)
- *   PI_GATEWAY_STREAM_STALL_MS   — ms or duration ("10m"), no-data window before an in-flight
- *                                  model request is aborted as stalled; "0" disables (default: 10m)
+ *   PI_GATEWAY_STREAM_STALL_MS   — ms or duration ("5m"), no-data window before an in-flight
+ *                                  model request is aborted as stalled; "0" disables (default: 5m)
+ *   PI_GATEWAY_FIRST_TOKEN_STALL_MS — ms or duration, window before the first token of a turn
+ *                                  (default: 15m; the between-token window stays PI_GATEWAY_STREAM_STALL_MS)
  *   PI_GATEWAY_TELEMETRY         — "true"/"false" (default true)
  */
 export function resolveGatewayConfig(overrides?: Partial<GatewayAdmissionConfig>): GatewayAdmissionConfig {
@@ -139,6 +144,8 @@ export function resolveGatewayConfig(overrides?: Partial<GatewayAdmissionConfig>
   if (elapsed !== null) cfg.maxElapsedMs = elapsed;
   const stall = parseGatewayElapsedMs(env.PI_GATEWAY_STREAM_STALL_MS);
   if (stall !== null) cfg.modelStreamStallMs = stall;
+  const firstToken = parseGatewayElapsedMs(env.PI_GATEWAY_FIRST_TOKEN_STALL_MS);
+  if (firstToken !== null) cfg.firstTokenStallMs = firstToken;
   cfg.telemetry = bool(env.PI_GATEWAY_TELEMETRY, cfg.telemetry);
 
   if (overrides) Object.assign(cfg, overrides);
@@ -150,6 +157,8 @@ export function resolveGatewayConfig(overrides?: Partial<GatewayAdmissionConfig>
   cfg.maxRetries = Math.max(0, Math.floor(cfg.maxRetries));
   cfg.maxElapsedMs = Math.max(0, cfg.maxElapsedMs);
   cfg.modelStreamStallMs = Math.max(0, Math.floor(cfg.modelStreamStallMs));
+  if (!Number.isFinite(cfg.firstTokenStallMs)) cfg.firstTokenStallMs = DEFAULT_GATEWAY_CONFIG.firstTokenStallMs;
+  cfg.firstTokenStallMs = Math.max(0, Math.floor(cfg.firstTokenStallMs));
   return cfg;
 }
 
@@ -176,6 +185,7 @@ export function sharedAdmissionController(): AdmissionController {
     shared = new AdmissionController({
       maxConcurrency: cfg.maxConcurrency,
       reservedSlots: cfg.reservedSlots,
+      fixedConcurrency: Boolean(process.env.PI_GATEWAY_MAX_CONCURRENCY),
       maxWaitMs: cfg.maxWaitMs,
       jitterMs: cfg.jitterMs,
       ...(cfg.telemetry ? { onEvent: emitAdmissionTelemetry } : {}),

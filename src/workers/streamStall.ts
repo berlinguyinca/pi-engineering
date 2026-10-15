@@ -33,6 +33,12 @@ export function isStalledStream(error: string | undefined): boolean {
 export interface StreamStallWatchdogOptions {
   /** Silence window in ms. Must be > 0 (a watchdog with no window is disabled at the call site). */
   stallMs: number;
+  /**
+   * Longer window before the FIRST token of a model turn (prompt processing
+   * can be slow); `token()` switches to `stallMs` for the gaps between tokens.
+   * Defaults to `stallMs`.
+   */
+  firstTokenMs?: number;
   /** Fired exactly once when the window expires unarmed. */
   onStall: () => void;
   /** Injectable timer for deterministic tests. */
@@ -43,6 +49,7 @@ export interface StreamStallWatchdogOptions {
 
 export class StreamStallWatchdog {
   private readonly stallMs: number;
+  private readonly firstTokenMs: number;
   private readonly onStall: () => void;
   private readonly setTimer: (fn: () => void, ms: number) => { clear: () => void };
   private readonly now: () => number;
@@ -55,6 +62,7 @@ export class StreamStallWatchdog {
       throw new Error(`model stream stall window must be a positive ms value, got ${String(opts.stallMs)}`);
     }
     this.stallMs = opts.stallMs;
+    this.firstTokenMs = Math.max(opts.stallMs, opts.firstTokenMs ?? opts.stallMs);
     this.onStall = opts.onStall;
     this.now = opts.now ?? Date.now;
     this.setTimer =
@@ -68,11 +76,16 @@ export class StreamStallWatchdog {
   }
 
   /** Start or reset the silence window. Idempotent while armed. */
-  arm(): void {
+  arm(ms: number = this.firstTokenMs): void {
     if (this.fired) return;
     this.armedAtMs = this.now();
     this.timer?.clear();
-    this.timer = this.setTimer(() => this.expire(), this.stallMs);
+    this.timer = this.setTimer(() => this.expire(), ms);
+  }
+
+  /** A token arrived: restart with the between-tokens window. */
+  token(): void {
+    this.arm(this.stallMs);
   }
 
   /** Cancel the window (e.g. a tool is running, or the turn ended). */

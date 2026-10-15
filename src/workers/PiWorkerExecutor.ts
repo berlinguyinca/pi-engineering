@@ -1408,6 +1408,7 @@ ${recovery.recoveryPrompt}`;
       stallMs > 0
         ? new StreamStallWatchdog({
             stallMs,
+            firstTokenMs: this.gatewayConfig.firstTokenStallMs,
             onStall: () => {
               stalled = true;
               assistantError ??= `model stream stalled: no data for ${stallMs}ms`;
@@ -1494,7 +1495,7 @@ ${recovery.recoveryPrompt}`;
       // completion re-arms it for the next model turn; an assistant
       // message_end without a tool ends the turn.
       if (event.type === "message_update" && (event.message as { role?: unknown } | undefined)?.role === "assistant")
-        armStall();
+        stallWatchdog?.token();
       else if (event.type === "tool_execution_start") disarmStall();
       else if (event.type === "tool_execution_end") armStall();
       else if (event.type === "message_end" && (event.message as { role?: unknown } | undefined)?.role === "assistant")
