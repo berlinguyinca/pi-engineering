@@ -328,6 +328,7 @@ export interface IntegrationRunner {
     candidateLifecycle?: CandidateLifecycle;
     integrationRun?: IntegrationRunRecord;
     authority?: DispatchAuthority;
+    acceptanceCriteria?: Array<{ acceptanceId: string; criterion: string }>;
     signal: AbortSignal;
   }): Promise<ExecutionOutcome>;
 }
@@ -338,6 +339,7 @@ export interface ValidationRunner {
     repoId?: string;
     objective: string;
     worktree?: string | null;
+    acceptanceCriteria?: Array<{ acceptanceId: string; criterion: string }>;
     signal: AbortSignal;
   }): Promise<ExecutionOutcome>;
 }
@@ -3422,6 +3424,7 @@ export class ExecutionBroker {
             candidateLifecycle: candidate?.lifecycle,
             integrationRun,
             authority: input.authority,
+            acceptanceCriteria: input.acceptanceCriteria,
             signal,
           }),
         );
@@ -3500,6 +3503,7 @@ export class ExecutionBroker {
             repoId: input.repoId,
             objective: input.objective,
             worktree: candidatePath ?? base.worktree,
+            acceptanceCriteria: input.acceptanceCriteria,
             signal,
           }),
         );

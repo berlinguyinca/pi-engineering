@@ -156,7 +156,8 @@ test("scriptless repo without a JS entry is reported as noTargets, not a doomed 
     assert.equal(profile.stages.length, 0, "no doomed node --check stage for a scriptless repo");
     const outcome = await v.run(dir, profile, store);
     assert.equal(outcome.noTargets, true, "no verification targets reported honestly");
-    assert.ok(!outcome.passed, "a run with zero passing stages must not pass");
+    assert.ok(outcome.passed, "nothing ran and nothing failed: pass with a warning, not a futile failure");
+    assert.deepEqual(outcome.warnings, ["no verification targets detected; nothing to run"]);
     assert.equal(outcome.evidence.filter((e) => e.status === "passed").length, 0);
   } finally {
     await rm(dir, { recursive: true, force: true });

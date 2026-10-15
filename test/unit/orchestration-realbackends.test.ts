@@ -619,7 +619,7 @@ describe("realBackends deterministic cancellation", () => {
 });
 
 describe("realBackends validation with no verification targets", () => {
-  it("reports missing evidence (noTargets), not a failed check that would spawn futile repairs", async () => {
+  it("passes with a warning, not a failed check that would spawn futile repairs", async () => {
     const { mkdtemp, rm } = await import("node:fs/promises");
     const { tmpdir } = await import("node:os");
     const { ArtifactStore } = await import("../../src/artifacts/ArtifactStore.ts");
@@ -637,12 +637,9 @@ describe("realBackends validation with no verification targets", () => {
         objective: "check",
         signal: new AbortController().signal,
       });
-      assert.equal(outcome.validationEvidence?.noTargets, true);
-      assert.equal(
-        outcome.exitStatus,
-        "succeeded",
-        "zero checks is missing evidence for the completion gate, not a failed validation task",
-      );
+      assert.equal(outcome.validationEvidence?.noTargets, false);
+      assert.equal(outcome.validationEvidence?.exitCode, 0);
+      assert.equal(outcome.exitStatus, "succeeded", "zero checks is a pass with a warning, not a failed task");
       assert.match(outcome.summary, /no verification targets/i);
     } finally {
       await rm(dir, { recursive: true, force: true });

@@ -19,7 +19,7 @@ import { id } from "../core/ids.ts";
 import type { CandidateLifecycle, GitRepo, IntegrationRunRecord } from "../git/GitRepo.ts";
 import type { WorktreeInfo } from "../git/GitRepo.ts";
 import { type ModelRef, modelKey } from "../lifecycle/types.ts";
-import type { VerificationProvider } from "../verify/Verifier.ts";
+import { NO_TARGETS_WARNING, type VerificationProvider } from "../verify/Verifier.ts";
 import { MODEL_SUPERSEDED } from "../workers/WorkerExecutor.ts";
 import type { WorkerActivity, WorkerExecutor, WorkerRequest, WorkerRun } from "../workers/WorkerExecutor.ts";
 import {
@@ -286,6 +286,23 @@ function outcomeOf(result: Awaited<ReturnType<WorkerExecutor["run"]>>): Executio
   // resilience window instead of immediately failing the task.
   if (!completed) outcome.error = result.result.error ?? result.result.summary;
   return outcome;
+}
+
+/** Matches a criterion that demands tests be written/added (not merely "tests still pass"). */
+const TEST_REQUIRING_CRITERION =
+  /\b(?:add|adds|added|write|writes|written|include|includes|new|targeted|regression|unit|integration|cover|covers|covered)\b[^.\n]*\btests?\b|\btests?\b[^.\n]*\b(?:added|written|included|covering)\b/i;
+
+/**
+ * With no verification targets nothing ran, so the stage passes with a warning
+ * unless an acceptance criterion explicitly requires tests: then the absence
+ * of targets is a failure of that criterion, naming it.
+ */
+function noTargetsTestRequirement(
+  criteria: Array<{ acceptanceId: string; criterion: string }> | undefined,
+): string | undefined {
+  const required = (criteria ?? []).filter((c) => TEST_REQUIRING_CRITERION.test(c.criterion));
+  if (required.length === 0) return undefined;
+  return `acceptance ${required.map((c) => c.acceptanceId).join(", ")} requires tests but no verification targets were detected (no tests were added)`;
 }
 
 export function realBackends(opts: RealBackendsOptions) {
@@ -573,6 +590,7 @@ export function realBackends(opts: RealBackendsOptions) {
         repoId?: string;
         objective: string;
         worktree?: string | null;
+        acceptanceCriteria?: Array<{ acceptanceId: string; criterion: string }>;
         signal: AbortSignal;
         onActivity?: (event: WorkerActivity) => void;
       }): Promise<ExecutionOutcome> {
@@ -583,18 +601,21 @@ export function realBackends(opts: RealBackendsOptions) {
         const outcome = await opts.verifier.run(cwd, profile, opts.artifacts, { signal: input.signal });
         const artifactRefs = outcome.evidence.flatMap((e) => e.artifacts).filter(Boolean);
         const artifactState = await artifactContentHashes(opts.artifacts, artifactRefs);
-        // A repo with no detectable checks produced no evidence; nothing FAILED.
-        // Reporting it as a failed task made the repair loop spawn "Fix the
-        // failing validation step" work no implementer can satisfy. The
-        // noTargets evidence still keeps the completion gate closed.
+        // A repo with no detectable checks: nothing ran, nothing FAILED. It
+        // passes with a warning (a failure would spawn repair work no
+        // implementer can satisfy) unless a criterion requires tests.
+        const testsRequired = outcome.noTargets ? noTargetsTestRequirement(input.acceptanceCriteria) : undefined;
         return {
           executionId: "validation",
-          exitStatus: outcome.passed || outcome.noTargets ? "succeeded" : "failed",
-          summary: outcome.noTargets
-            ? "no verification targets detected — recorded as missing evidence, not a failed check"
-            : outcome.passed
-              ? `validation passed (${outcome.stages.length} stages)`
-              : `validation failed at ${outcome.failedStage ?? "unknown"}`,
+          exitStatus: outcome.passed && !testsRequired ? "succeeded" : "failed",
+          ...(testsRequired ? { error: testsRequired } : {}),
+          summary: testsRequired
+            ? testsRequired
+            : outcome.noTargets
+              ? `validation passed with warning: ${NO_TARGETS_WARNING}`
+              : outcome.passed
+                ? `validation passed (${outcome.stages.length} stages)`
+                : `validation failed at ${outcome.failedStage ?? "unknown"}`,
           artifactRefs,
           artifactHashes: artifactState.hashes,
           usage: { stages: outcome.stages.length },
@@ -603,7 +624,7 @@ export function realBackends(opts: RealBackendsOptions) {
               profile.stages.map((stage) => [stage.command, ...stage.args].join(" ")).join(" && ") || "<no-target>",
             profile: profile.name,
             exitCode:
-              outcome.passed && !outcome.noTargets ? 0 : (outcome.stages.find((stage) => !stage.passed)?.exitCode ?? 1),
+              outcome.passed && !testsRequired ? 0 : (outcome.stages.find((stage) => !stage.passed)?.exitCode ?? 1),
             testSummary: {
               stages: outcome.stages.map((stage) => ({
                 name: stage.stage.name,
@@ -611,8 +632,9 @@ export function realBackends(opts: RealBackendsOptions) {
                 passed: stage.passed,
               })),
               failedStage: outcome.failedStage,
+              warnings: outcome.warnings ?? [],
             },
-            noTargets: outcome.noTargets,
+            noTargets: !!testsRequired,
             accessible: artifactState.allAccessible,
             acceptanceResults: [],
           },
@@ -833,6 +855,7 @@ export function realBackends(opts: RealBackendsOptions) {
         candidateLifecycle?: CandidateLifecycle;
         integrationRun?: IntegrationRunRecord;
         authority?: import("./ownership.ts").DispatchAuthority;
+        acceptanceCriteria?: Array<{ acceptanceId: string; criterion: string }>;
         signal: AbortSignal;
       }): Promise<ExecutionOutcome> {
         input.signal.throwIfAborted();
@@ -944,15 +967,15 @@ export function realBackends(opts: RealBackendsOptions) {
           // that nothing was verifiable); without it the integration failure
           // record carried only "checks: fail" and the actual cause (e.g. a
           // broken import in the worktree) was undiagnosable from the store.
-          const checkFailure = result.passed
-            ? undefined
-            : result.noTargets
-              ? "verification failed: no verification targets detected (nothing was actually verified)"
-              : `verification failed at stage: ${result.failedStage ?? "unknown"}`;
+          const testsRequired = result.noTargets ? noTargetsTestRequirement(input.acceptanceCriteria) : undefined;
+          const checkFailure =
+            testsRequired ??
+            (result.passed ? undefined : `verification failed at stage: ${result.failedStage ?? "unknown"}`);
+          const warningNote = result.warnings?.length ? `; warning: ${result.warnings.join("; ")}` : "";
           return {
             executionId: "integration",
-            exitStatus: result.passed ? "succeeded" : "failed",
-            summary: `integrated ${merged.join(", ") || "nothing"}${recoveredNote} into ${target.branch}; checks: ${result.passed ? "pass" : "fail"}`,
+            exitStatus: checkFailure ? "failed" : "succeeded",
+            summary: `integrated ${merged.join(", ") || "nothing"}${recoveredNote} into ${target.branch}; checks: ${checkFailure ? "fail" : "pass"}${warningNote}`,
             ...(checkFailure ? { error: checkFailure } : {}),
             artifactRefs,
             artifactHashes: artifactState.hashes,
