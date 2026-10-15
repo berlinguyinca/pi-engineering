@@ -210,6 +210,36 @@ test("follow remote: a dirty clone is never pulled over; a local commit ahead of
   assert.equal(git(source, "rev-parse", "HEAD"), localSha, "a diverged clone is never merged or reset");
 });
 
+test("/pie: a runtime command goes through the bridge (gated and tracked), not straight to the handler", async () => {
+  const { pi, host, b } = await setup({ autoReload: false });
+  const bridge = host.bridge as unknown as { runCommand: (n: string, a: string, c: unknown) => Promise<void> };
+  const original = bridge.runCommand;
+  const seen: string[] = [];
+  bridge.runCommand = async (name, args, ctx) => {
+    seen.push(`${name}:${args}`);
+    return original.call(bridge, name, args, ctx);
+  };
+  try {
+    await pi.run("/pie probe x y");
+  } finally {
+    bridge.runCommand = original;
+  }
+  assert.deepEqual(seen, ["probe:x y"]);
+  assert.equal(b.values.at(-1), "cmd:A");
+});
+
+test("auto reload: a commit seen while the mutation lock is held elsewhere is picked up once it is free", async () => {
+  const { host, ext, commit } = await setup();
+  const held = ext.lock.acquire("another-process");
+  const sha = commit("B");
+  await new Promise((r) => setTimeout(r, 200));
+  assert.equal(host.activeGeneration()?.generation, 1, "no reload under a foreign lock");
+  assert.notEqual(ext.sourceWatcher?.current, sha, "the baseline did not advance past the unloaded commit");
+  held.release();
+  await until(() => host.activeGeneration()?.generation === 2, "reload after the lock was released");
+  assert.equal(host.activeGeneration()?.source.commit, sha);
+});
+
 test("auto reload: closing the session disposes the watcher", async () => {
   const { pi, ext } = await setup();
   assert.ok(ext.sourceWatcher?.active);

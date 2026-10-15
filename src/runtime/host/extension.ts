@@ -444,10 +444,14 @@ export class EngineeringHostExtension {
         // Another handover is in flight: leave the baseline and look again.
         if (host.pendingTask()) return false;
         const latest = (host.latestContext() as Ctx | undefined) ?? ctx;
-        notify(latest, `Pi Engineering source moved ${short(previous)} → ${short(next)} — hot-reloading.`);
-        this.telemetry.emit("runtime.reload.started", { from_commit: previous, to_commit: next });
-        await this.reload(latest);
-        return true;
+        // Quiet: a mutation lock held by another process (an update or
+        // retention elsewhere) is not worth a warning every poll. The
+        // baseline then stays put and the commit is picked up next time.
+        // A handover that ran and failed advances it: the operator was told,
+        // and retrying the same commit every 15 s would not change the answer.
+        const started = await this.reload(latest, { quiet: true });
+        if (started) notify(latest, `Pi Engineering source moved ${short(previous)} → ${short(next)} — hot-reloaded.`);
+        return started;
       },
       onError: (error) => {
         this.telemetry.emit("runtime.health.failed", {
@@ -566,12 +570,12 @@ export class EngineeringHostExtension {
   }
 
   /** Take the runtime mutation lock or tell the operator who has it (spec §28). */
-  protected lockFor(operation: string, ctx: Ctx): MutationLockHandle | undefined {
+  protected lockFor(operation: string, ctx: Ctx, quiet = false): MutationLockHandle | undefined {
     try {
       return this.lock.acquire(operation);
     } catch (error) {
       if (error instanceof MutationLockBusyError) {
-        notify(ctx, error.message, "warning");
+        if (!quiet) notify(ctx, error.message, "warning");
         return undefined;
       }
       throw error;
@@ -762,10 +766,12 @@ export class EngineeringHostExtension {
     }
     if (HOST_SUBCOMMANDS.has(sub)) return this.command(trimmed, ctx);
     const generation = host.activeGeneration()?.generation;
-    const forwarded = generation === undefined ? undefined : host.bridge.generationCommand(generation, sub);
-    if (forwarded) {
+    if (generation !== undefined && host.bridge.generationCommand(generation, sub)) {
+      // Through the bridge, exactly like `/<sub>` itself: held while a
+      // handover's gate is closed, and tracked as an operation so a handover
+      // cannot start underneath it.
       host.noteContext(ctx);
-      await forwarded.handler(rest.join(" "), ctx);
+      await host.bridge.runCommand(sub, rest.join(" "), ctx);
       return;
     }
     // Not a command of its own: perhaps a subcommand of the runtime's /engineering.
@@ -780,7 +786,8 @@ export class EngineeringHostExtension {
     const sub = argv[0] ?? "version";
     switch (sub) {
       case "reload":
-        return this.reload(ctx);
+        await this.reload(ctx);
+        return;
       case "update":
         return this.update(argv.slice(1), ctx);
       case "cancel": {
@@ -818,11 +825,17 @@ export class EngineeringHostExtension {
     }
   }
 
-  protected async reload(ctx: Ctx): Promise<void> {
+  /**
+   * `/pie reload`. Resolves true once the handover has BEGUN (it may still be
+   * waiting for a safe point in the background), false when it could not
+   * start: the mutation lock is held elsewhere or a handover is already
+   * running. With `quiet`, those two are silent — the caller retries.
+   */
+  protected async reload(ctx: Ctx, opts: { quiet?: boolean } = {}): Promise<boolean> {
     const host = this.host as RuntimeHost;
     const source = this.reloadSource();
-    const lock = this.lockFor("reload", ctx);
-    if (!lock) return;
+    const lock = this.lockFor("reload", ctx, opts.quiet === true);
+    if (!lock) return false;
     let task: HandoverTask;
     try {
       task = host.begin({
@@ -832,7 +845,10 @@ export class EngineeringHostExtension {
       });
     } catch (error) {
       lock.release();
-      if (error instanceof RuntimeBusyError) return notify(ctx, error.message);
+      if (error instanceof RuntimeBusyError) {
+        if (!opts.quiet) notify(ctx, error.message);
+        return false;
+      }
       throw error;
     }
     void task.promise.finally(() => lock.release());
@@ -841,6 +857,7 @@ export class EngineeringHostExtension {
       formatHandover(r, { from, to: source.version, action: "Reloaded" }),
     );
     if (result) notify(ctx, formatHandover(result, { from, to: source.version, action: "Reloaded" }), level(result));
+    return true;
   }
 
   /**
@@ -875,7 +892,8 @@ export class EngineeringHostExtension {
         return notify(ctx, `Checkout moved ${short(moved.from)} → ${short(moved.to)}; /pie update reloads it.`);
       }
       notify(ctx, `Checkout moved ${short(moved.from)} → ${short(moved.to)} — hot-reloading.`);
-      return this.reload(ctx);
+      await this.reload(ctx);
+      return;
     }
     if (parsed.check) {
       const check = await this.updates.check(parsed.request);

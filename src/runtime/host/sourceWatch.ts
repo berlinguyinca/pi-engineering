@@ -114,7 +114,13 @@ export function gitRunner(root: string, timeoutMs = 30_000): GitRunner {
       execFile(
         "git",
         ["-C", root, ...args],
-        { timeout: timeoutMs, windowsHide: true, maxBuffer: 4 * 1024 * 1024 },
+        {
+          timeout: timeoutMs,
+          windowsHide: true,
+          maxBuffer: 4 * 1024 * 1024,
+          // Never a credential prompt from a timer: fail fast and try next time.
+          env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+        },
         (error, stdout, stderr) => {
           const code = error ? ((error as { code?: unknown }).code as number | undefined) : 0;
           resolve({
