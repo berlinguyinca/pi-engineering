@@ -3589,10 +3589,22 @@ export class Orchestrator {
       lineageDecisions[0]?.resumptionGeneration ??
       (activeRecoveryDecisions.length === 1 ? activeRecoveryDecisions[0]?.resumptionGeneration : undefined);
     const recoveryGeneration = durableRecoveryGeneration ?? this.recoveryTaskGenerations.get(task.task_id);
-    const recoveryKey = recoveryGeneration === undefined ? undefined : `${task.mission_id}:${recoveryGeneration}`;
-    const identity = recoveryKey
+    let recoveryKey = recoveryGeneration === undefined ? undefined : `${task.mission_id}:${recoveryGeneration}`;
+    let identity = recoveryKey
       ? this.recoveryOwnershipByFlight.get(recoveryKey)
       : this.ownershipByMission.get(task.mission_id);
+    if (!identity && recoveryKey === undefined) {
+      // A resume registers its lease only for its own flight. A task with no recovery
+      // lineage (a re-run gate in a process that never held the mission lease) runs
+      // under the lease the current resumption acquired. A lineaged task whose own
+      // generation's lease is gone must not borrow a newer generation's lease.
+      const currentKey = `${task.mission_id}:${currentResumptionGeneration}`;
+      const currentLease = this.recoveryOwnershipByFlight.get(currentKey);
+      if (currentLease) {
+        recoveryKey = currentKey;
+        identity = currentLease;
+      }
+    }
     if (!identity || !this.ownership) throw new Error(`mission ${task.mission_id} has no active ownership`);
     if (task.mutates_repo && !task.repo_id) {
       throw new Error(`mutating task ${task.task_id} has no repository identity`);

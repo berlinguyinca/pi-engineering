@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
+  AfterOutputRetry,
   DEFAULT_AFTER_OUTPUT_SCHEDULE,
   isRetryableTransportFailure,
   longWaitSchedule,
@@ -119,4 +120,31 @@ test("the owed wait is keyed by (provider, model) and never taken by a summariza
   assert.deepEqual(slept, [], "neither consumed the wait");
   assert.equal(await retry.beforeSend(model, undefined, { messages: [] }), "go");
   assert.deepEqual(slept, [1_000], "the continued request took it");
+});
+
+test("a failure before any visible output is not this layer's: an owed wait (AdvisedModelSwitch) survives its settle", async () => {
+  const sleeps: number[] = [];
+  const r = new AfterOutputRetry({ sleep: async (ms: number) => void sleeps.push(ms) });
+  const model = { provider: "p", id: "m" };
+  r.observe(model);
+  r.owe(model, 1234, 1, "gateway capacity", "m is out of capacity");
+  const settle = (r as unknown as { onBeforeSettle: (e: unknown, c: unknown) => unknown }).onBeforeSettle.bind(r);
+  const result = settle(
+    {
+      outcome: "error",
+      entries: [],
+      context: {
+        contextEntries: [
+          {
+            sourceEntry: { id: "a1" },
+            messages: [{ role: "assistant", stopReason: "error", errorMessage: "x", content: [] }],
+          },
+        ],
+      },
+    },
+    { model },
+  );
+  assert.equal(result, undefined);
+  assert.equal(await r.beforeSend(model, undefined), "go");
+  assert.deepEqual(sleeps, [1234], "the owed wait was taken, not erased by the settle");
 });

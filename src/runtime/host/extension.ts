@@ -33,6 +33,14 @@ import { ago, formatHandover, short, waitingText } from "./format.ts";
 import { type HandoverHooks, type HandoverResult, type HandoverTask, RuntimeBusyError, RuntimeHost } from "./host.ts";
 import { type RuntimeSource, snapshotRuntimeSource } from "./loader.ts";
 import { publishRuntimeStatus } from "./runtimeStatus.ts";
+import {
+  DEFAULT_AUTO_RELOAD_INTERVAL_MS,
+  DEFAULT_FOLLOW_REMOTE_INTERVAL_MS,
+  SourceWatcher,
+  followRemote,
+  gitHead,
+  trackedChanges,
+} from "./sourceWatch.ts";
 import { type RuntimeEventFields, RuntimeTelemetry } from "./telemetry.ts";
 
 export const DEFAULT_RUNTIME_ENTRY = "src/runtime/host/runtimeEntry.ts";
@@ -62,6 +70,26 @@ export interface HostExtensionConfig {
   allowDependencyInstall?: boolean;
   /** Check for updates automatically at session start (default true; installation stays opt-in). */
   autoUpdateCheck?: boolean;
+  /**
+   * Hot-reload the runtime by itself when the source checkout's HEAD moves
+   * (a merge landed on the branch Pi loads from). Only for a git checkout
+   * (the package or the dev override); an installed version changes only
+   * through an update, which hands over on its own. Default true in
+   * production (`PI_ENGINEERING_AUTO_RELOAD=0` turns it off).
+   */
+  autoReload?: boolean;
+  /** How often the checkout's HEAD is polled (default 15 s). */
+  autoReloadIntervalMs?: number;
+  /**
+   * Keep a checkout that tracks a remote up to that remote (fetch + strict
+   * fast-forward, never over uncommitted work or a diverged branch), so a
+   * session on another host follows GitHub and hot-reloads. Default on,
+   * like the legacy session-start fast-forward it extends; off with
+   * `PI_ENGINEERING_FOLLOW_REMOTE=0` or `PI_SELF_UPDATE=0|off|check`.
+   */
+  followRemote?: boolean;
+  /** How often the remote is fetched (default 5 min). */
+  followRemoteIntervalMs?: number;
 }
 
 export function resolveHostConfig(env: NodeJS.ProcessEnv = process.env): HostExtensionConfig {
@@ -88,8 +116,20 @@ export function resolveHostConfig(env: NodeJS.ProcessEnv = process.env): HostExt
       : {}),
     allowDependencyInstall: env.PI_ENGINEERING_UPDATE_INSTALL_DEPS !== "0",
     autoUpdateCheck: env.PI_ENGINEERING_UPDATE_CHECK !== "0",
+    autoReload: env.PI_ENGINEERING_AUTO_RELOAD !== "0",
+    ...(Number(env.PI_ENGINEERING_AUTO_RELOAD_INTERVAL_MS) > 0
+      ? { autoReloadIntervalMs: Number(env.PI_ENGINEERING_AUTO_RELOAD_INTERVAL_MS) }
+      : {}),
+    followRemote:
+      env.PI_ENGINEERING_FOLLOW_REMOTE !== "0" && !/^(0|false|off|check)$/i.test((env.PI_SELF_UPDATE ?? "auto").trim()),
+    ...(Number(env.PI_ENGINEERING_FOLLOW_REMOTE_INTERVAL_MS) > 0
+      ? { followRemoteIntervalMs: Number(env.PI_ENGINEERING_FOLLOW_REMOTE_INTERVAL_MS) }
+      : {}),
   };
 }
+
+/** The Host's own `/engineering` (and `/pie`) subcommands; anything else is the runtime's. */
+const HOST_SUBCOMMANDS = new Set(["reload", "update", "rollback", "version", "status", "cancel"]);
 
 /** A runtime directory's declared metadata, or null when absent/malformed. */
 export function readCandidateMeta(dir: string): ReturnType<typeof parseCandidateMetadata> | null {
@@ -258,6 +298,7 @@ export class EngineeringHostExtension {
   async abandon(): Promise<boolean> {
     try {
       if (this.checkTimer) clearTimeout(this.checkTimer);
+      await this.stopSourceWatch();
       this.unpublish();
       await this.host?.shutdown({ type: "session_shutdown", reason: "quit" }, undefined);
       return !this.host?.activeGeneration();
@@ -274,6 +315,16 @@ export class EngineeringHostExtension {
       description:
         "Pi Engineering runtime: reload | update | rollback [--yes] | version | cancel (and runtime subcommands)",
       handler: (args, ctx) => this.command(args, ctx as Ctx),
+    });
+    // `/pie <anything>`: one short name for everything pi-engineering
+    // registers. Host subcommands first (`/pie update`, `/pie reload`), then
+    // any command of the running generation (`/pie mission status` is
+    // `/mission status`), then the runtime's own `/engineering` subcommands.
+    host.bridge.registerHostCommand("pie", {
+      description:
+        "pi-engineering: update | reload | version | rollback | status | cancel, or any pi-engineering command (/pie mission …)",
+      getArgumentCompletions: (prefix: string) => this.pieCompletions(prefix),
+      handler: (args, ctx) => this.pie(args, ctx as Ctx),
     });
     cleanupDeadGenerationDirs(join(this.config.installRoot, "generations"));
     // Before anything loads: finish or undo a transaction a crash interrupted.
@@ -308,6 +359,7 @@ export class EngineeringHostExtension {
   async dispose(): Promise<void> {
     if (this.checkTimer) clearTimeout(this.checkTimer);
     this.checkTimer = undefined;
+    await this.stopSourceWatch();
     this.unpublish();
     // A check in flight writes the preferences file; let it land before the
     // session (and possibly the process) goes away.
@@ -320,6 +372,7 @@ export class EngineeringHostExtension {
    * Installation stays off unless the operator turned `autoInstall` on.
    */
   private onSessionStart(ctx: Ctx): void {
+    this.startSourceWatch(ctx);
     if (this.startupFallback) {
       try {
         ctx.ui?.setStatus?.(
@@ -342,6 +395,104 @@ export class EngineeringHostExtension {
       void this.automaticCheck(ctx);
     }, 0);
     this.checkTimer.unref?.();
+  }
+
+  /** The HEAD watcher behind automatic hot reload (one per session; see sourceWatch.ts). */
+  sourceWatcher: SourceWatcher | undefined;
+
+  /**
+   * Watch the checkout Pi loads from and hand over to it when its HEAD moves.
+   * A "true" hot reload: same process, same conversation, new code — the
+   * `/pie reload` handover, triggered by the merge instead of by hand. The
+   * baseline is the running generation's commit, so a checkout that moved
+   * between process start and this session reloads on the first poll.
+   */
+  private startSourceWatch(ctx: Ctx): void {
+    if (this.sourceWatcher || this.config.autoReload !== true || !this.host) return;
+    const host = this.host;
+    const source = this.reloadSource();
+    // An installed version only changes through an update, which hands over
+    // itself; only a live checkout can move underneath a running Pi.
+    if (source.label.startsWith("installed:") || !existsSync(join(source.root, ".git"))) return;
+    const root = source.root;
+    // A checkout tracking a remote (a session on another host, cloned from
+    // GitHub) is brought up to it first, every followRemoteIntervalMs; a
+    // fast-forward moves HEAD and the poll below turns it into the reload.
+    // Fetch failures are silence (checkForUpdate never throws), and the local
+    // checkout the operator merges into is left alone: ahead of or diverged
+    // from its upstream it is never touched.
+    const followEvery = this.config.followRemoteIntervalMs ?? DEFAULT_FOLLOW_REMOTE_INTERVAL_MS;
+    let lastFollowAt = Number.NEGATIVE_INFINITY;
+    // The commit a dirty-tree warning was given for, so it is said once per
+    // commit rather than every poll until the tree is clean.
+    let dirtyWarnedFor: string | undefined;
+    const fingerprint = async (): Promise<string | null> => {
+      // Not while a handover runs: its snapshot must not see the tree move.
+      if (this.config.followRemote === true && !host.pendingTask() && Date.now() - lastFollowAt >= followEvery) {
+        lastFollowAt = Date.now();
+        const result = await followRemote(root);
+        if (result.applied) {
+          const latest = (host.latestContext() as Ctx | undefined) ?? ctx;
+          notify(
+            latest,
+            `Pi Engineering checkout fast-forwarded to ${short(result.head)} (${result.decision.reason}).`,
+          );
+        }
+      }
+      return gitHead(root);
+    };
+    this.sourceWatcher = new SourceWatcher({
+      intervalMs: this.config.autoReloadIntervalMs ?? DEFAULT_AUTO_RELOAD_INTERVAL_MS,
+      baseline: host.activeGeneration()?.source.commit ?? source.commit ?? null,
+      fingerprint,
+      onChange: async (next, previous) => {
+        // Another handover is in flight, or the session is on its way out:
+        // leave the baseline and look again (never, once disposed).
+        if (host.pendingTask() || !this.sourceWatcher?.active) return false;
+        const latest = (host.latestContext() as Ctx | undefined) ?? ctx;
+        // A handover snapshots the working tree, so a tracked file mid-edit
+        // would run under the new commit's name. Wait for a clean tree (or
+        // an explicit /pie reload, which is the operator's call), telling
+        // them once per commit; the baseline stays put so the commit is
+        // picked up the poll after the tree is clean.
+        const dirty = await trackedChanges(root);
+        if (dirty === null || !this.sourceWatcher?.active) return false;
+        if (dirty.length > 0) {
+          if (dirtyWarnedFor !== next) {
+            dirtyWarnedFor = next;
+            const listed = dirty.slice(0, 3).join(", ") + (dirty.length > 3 ? `, +${dirty.length - 3}` : "");
+            notify(
+              latest,
+              `Pi Engineering source moved to ${short(next)} but ${listed} ${dirty.length === 1 ? "has" : "have"} uncommitted changes — not hot-reloading until the tree is clean (or /pie reload).`,
+              "warning",
+            );
+          }
+          return false;
+        }
+        dirtyWarnedFor = undefined;
+        // Quiet: a mutation lock held by another process (an update or
+        // retention elsewhere) is not worth a warning every poll. The
+        // baseline then stays put and the commit is picked up next time.
+        // A handover that ran and failed advances it: the operator was told,
+        // and retrying the same commit every 15 s would not change the answer.
+        const started = await this.reload(latest, { quiet: true });
+        if (started) notify(latest, `Pi Engineering source moved ${short(previous)} → ${short(next)} — hot-reloaded.`);
+        return started;
+      },
+      onError: (error) => {
+        this.telemetry.emit("runtime.health.failed", {
+          failure_reason: `auto-reload watcher: ${error instanceof Error ? error.message : String(error)}`,
+        });
+      },
+    });
+    this.sourceWatcher.start();
+  }
+
+  /** Resolves once a poll in flight (and its git child) has finished. */
+  private stopSourceWatch(): Promise<void> {
+    const watcher = this.sourceWatcher;
+    this.sourceWatcher = undefined;
+    return watcher?.dispose() ?? Promise.resolve();
   }
 
   async automaticCheck(ctx?: Ctx): Promise<UpdateCheckResult | undefined> {
@@ -447,12 +598,12 @@ export class EngineeringHostExtension {
   }
 
   /** Take the runtime mutation lock or tell the operator who has it (spec §28). */
-  protected lockFor(operation: string, ctx: Ctx): MutationLockHandle | undefined {
+  protected lockFor(operation: string, ctx: Ctx, quiet = false): MutationLockHandle | undefined {
     try {
       return this.lock.acquire(operation);
     } catch (error) {
       if (error instanceof MutationLockBusyError) {
-        notify(ctx, error.message, "warning");
+        if (!quiet) notify(ctx, error.message, "warning");
         return undefined;
       }
       throw error;
@@ -604,6 +755,63 @@ export class EngineeringHostExtension {
     });
   }
 
+  /** Names `/pie <name>` resolves right now: Host subcommands plus the running generation's commands. */
+  pieNames(): string[] {
+    const generation = this.host?.activeGeneration()?.generation;
+    const runtime = generation === undefined ? [] : (this.host?.bridge.generationCommandNames(generation) ?? []);
+    return [
+      ...HOST_SUBCOMMANDS,
+      ...runtime.filter((n) => !HOST_SUBCOMMANDS.has(n) && n !== "pie" && n !== "engineering"),
+    ];
+  }
+
+  private pieCompletions(prefix: string): string[] | null {
+    const head = (prefix ?? "").trimStart();
+    if (/\s/.test(head)) return null;
+    const names = this.pieNames().filter((n) => n.startsWith(head));
+    return names.length > 0 ? names.sort() : null;
+  }
+
+  /**
+   * `/pie <sub> [args]`. Host subcommands and the runtime's `/engineering`
+   * subcommands go through `command`; any other name is a pi-engineering
+   * command of the running generation, called with the rest of the line.
+   */
+  async pie(args: string, ctx: Ctx): Promise<void> {
+    const host = this.host;
+    if (!host) return;
+    const trimmed = (args ?? "").trim();
+    const [sub = "", ...rest] = trimmed.split(/\s+/).filter(Boolean);
+    if (!sub) {
+      return notify(
+        ctx,
+        [
+          "usage: /pie <command> [args]",
+          `runtime: ${[...HOST_SUBCOMMANDS].join(" | ")}`,
+          `commands: ${this.pieNames()
+            .filter((n) => !HOST_SUBCOMMANDS.has(n))
+            .sort()
+            .join(", ")}`,
+        ].join("\n"),
+      );
+    }
+    if (HOST_SUBCOMMANDS.has(sub)) return this.command(trimmed, ctx);
+    // `/pie engineering <x>` is `/engineering <x>` — the Host's own, which
+    // forwards the runtime's subcommands itself.
+    if (sub === "engineering") return this.command(rest.join(" "), ctx);
+    const generation = host.activeGeneration()?.generation;
+    if (generation !== undefined && host.bridge.generationCommand(generation, sub)) {
+      // Through the bridge, exactly like `/<sub>` itself: held while a
+      // handover's gate is closed, and tracked as an operation so a handover
+      // cannot start underneath it.
+      host.noteContext(ctx);
+      await host.bridge.runCommand(sub, rest.join(" "), ctx);
+      return;
+    }
+    // Not a command of its own: perhaps a subcommand of the runtime's /engineering.
+    return this.command(trimmed, ctx);
+  }
+
   async command(args: string, ctx: Ctx): Promise<void> {
     const host = this.host;
     if (!host) return;
@@ -612,7 +820,8 @@ export class EngineeringHostExtension {
     const sub = argv[0] ?? "version";
     switch (sub) {
       case "reload":
-        return this.reload(ctx);
+        await this.reload(ctx);
+        return;
       case "update":
         return this.update(argv.slice(1), ctx);
       case "cancel": {
@@ -650,11 +859,17 @@ export class EngineeringHostExtension {
     }
   }
 
-  protected async reload(ctx: Ctx): Promise<void> {
+  /**
+   * `/pie reload`. Resolves true once the handover has BEGUN (it may still be
+   * waiting for a safe point in the background), false when it could not
+   * start: the mutation lock is held elsewhere or a handover is already
+   * running. With `quiet`, those two are silent — the caller retries.
+   */
+  protected async reload(ctx: Ctx, opts: { quiet?: boolean } = {}): Promise<boolean> {
     const host = this.host as RuntimeHost;
     const source = this.reloadSource();
-    const lock = this.lockFor("reload", ctx);
-    if (!lock) return;
+    const lock = this.lockFor("reload", ctx, opts.quiet === true);
+    if (!lock) return false;
     let task: HandoverTask;
     try {
       task = host.begin({
@@ -664,7 +879,10 @@ export class EngineeringHostExtension {
       });
     } catch (error) {
       lock.release();
-      if (error instanceof RuntimeBusyError) return notify(ctx, error.message);
+      if (error instanceof RuntimeBusyError) {
+        if (!opts.quiet) notify(ctx, error.message);
+        return false;
+      }
       throw error;
     }
     void task.promise.finally(() => lock.release());
@@ -673,6 +891,21 @@ export class EngineeringHostExtension {
       formatHandover(r, { from, to: source.version, action: "Reloaded" }),
     );
     if (result) notify(ctx, formatHandover(result, { from, to: source.version, action: "Reloaded" }), level(result));
+    return true;
+  }
+
+  /**
+   * Running from a checkout whose HEAD is no longer the running generation's
+   * commit: the update the operator wants is a reload of that checkout, not
+   * an install from the remote. Null when the running code is current.
+   */
+  checkoutMoved(): { root: string; from: string | null; to: string } | null {
+    const active = this.host?.activeGeneration();
+    if (!active || active.source.label.startsWith("installed:")) return null;
+    const source = this.reloadSource();
+    if (!existsSync(join(source.root, ".git")) || !source.commit) return null;
+    if (source.commit === active.source.commit) return null;
+    return { root: source.root, from: active.source.commit, to: source.commit };
   }
 
   protected async update(argv: string[], ctx: Ctx): Promise<void> {
@@ -684,9 +917,24 @@ export class EngineeringHostExtension {
         "warning",
       );
     }
+    // The local-checkout workflow: a merge landed on the branch Pi loads
+    // from. That IS the update; hand over to it (the watcher would within
+    // one poll, this does it now) instead of asking the remote.
+    const moved = this.checkoutMoved();
+    const movedLine = moved ? `Checkout moved ${short(moved.from)} → ${short(moved.to)}` : null;
     if (parsed.check) {
+      // --check still asks the remote; a local move is reported alongside.
       const check = await this.updates.check(parsed.request);
-      return notify(ctx, formatCheck(check), check.failure ? "warning" : "info");
+      const lines = [...(movedLine ? [`${movedLine}; /pie update reloads it (remote not consulted then).`] : [])];
+      return notify(ctx, [...lines, formatCheck(check)].join("\n"), check.failure ? "warning" : "info");
+    }
+    if (moved && !parsed.request.commit && !parsed.request.channel) {
+      notify(
+        ctx,
+        `${movedLine} — hot-reloading the local checkout (remote not consulted; --channel/--commit for that).`,
+      );
+      await this.reload(ctx);
+      return;
     }
     const progress: string[] = [];
     const outcome = await this.updates.update(parsed.request, (line) => progress.push(line));

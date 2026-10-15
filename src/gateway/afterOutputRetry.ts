@@ -158,9 +158,26 @@ export function failureKind(text: string): string {
 
 // ─── The retry controller ──────────────────────────────────────────────────
 
-interface ProjectedEntry {
+export interface ProjectedEntry {
   sourceEntry: { id: string };
   messages: AssistantLike[];
+}
+
+/**
+ * The turn's last assistant message, when it failed: the one a settle-boundary
+ * handler may omit from context and replay. A last assistant message that did
+ * not fail means there is nothing to replay.
+ */
+export function lastFailedAssistant(
+  entries: ProjectedEntry[],
+): { entryId: string; message: AssistantLike } | undefined {
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const entry = entries[i];
+    const assistants = (entry?.messages ?? []).filter((m) => m.role === "assistant");
+    const message = assistants[assistants.length - 1];
+    if (message) return isFailedAssistantMessage(message) ? { entryId: entry!.sourceEntry.id, message } : undefined;
+  }
+  return undefined;
 }
 
 interface BeforeSettleEvent {
@@ -221,7 +238,7 @@ export class AfterOutputRetry {
   private attempt = 0;
   private firstFailureAt: number | undefined;
   /** The wait owed before the continued request for a model is sent. */
-  private readonly pending = new Map<string, { delayMs: number; attempt: number; kind: string }>();
+  private readonly pending = new Map<string, { delayMs: number; attempt: number; kind: string; label?: string }>();
   /** Models whose calls pass the gateway wrapper (so a wait can be taken). */
   private readonly paced = new Set<string>();
   private ui: SettleContext["ui"];
@@ -257,9 +274,13 @@ export class AfterOutputRetry {
     this.paced.add(keyOf(model));
   }
 
-  /** Owe a wait before `model`'s next (non-summary) call. */
-  owe(model: ModelKey, delayMs: number, attempt: number, kind: string): void {
-    this.pending.set(keyOf(model), { delayMs, attempt, kind });
+  /**
+   * Owe a wait before `model`'s next (non-summary) call. `label` replaces the
+   * "Answer cut off (kind)" status text for a wait owed for another reason
+   * (a gateway hold the pump gave up, AdvisedModelSwitch).
+   */
+  owe(model: ModelKey, delayMs: number, attempt: number, kind: string, label?: string): void {
+    this.pending.set(keyOf(model), { delayMs, attempt, kind, ...(label ? { label } : {}) });
   }
 
   private onBeforeSettle(event: BeforeSettleEvent, ctx: SettleContext) {
@@ -269,6 +290,11 @@ export class AfterOutputRetry {
       return undefined;
     }
     const failed = this.lastFailed(event.context.contextEntries);
+    // A failure before any visible output is the gateway pump's (or
+    // AdvisedModelSwitch's), never this layer's: it may have just owed a wait
+    // through `owe()` for its own continue, and a reset here would erase it.
+    // Leaving the counters alone is harmless — `agent_settled` clears them.
+    if (failed && !hasVisibleOutput(failed.message)) return undefined;
     if (!failed || !isRetryableTransportFailure(failed.message, ctx.model?.contextWindow ?? 0)) {
       this.reset();
       return undefined;
@@ -317,13 +343,7 @@ export class AfterOutputRetry {
   }
 
   private lastFailed(entries: ProjectedEntry[]): { entryId: string; message: AssistantLike } | undefined {
-    for (let i = entries.length - 1; i >= 0; i--) {
-      const entry = entries[i];
-      const assistants = (entry?.messages ?? []).filter((m) => m.role === "assistant");
-      const message = assistants[assistants.length - 1];
-      if (message) return isFailedAssistantMessage(message) ? { entryId: entry!.sourceEntry.id, message } : undefined;
-    }
-    return undefined;
+    return lastFailedAssistant(entries);
   }
 
   /**
@@ -347,7 +367,7 @@ export class AfterOutputRetry {
     const status = () =>
       this.ui?.setStatus?.(
         STATUS_KEY,
-        `Answer cut off (${pending.kind}) — retrying in ${formatWait(Math.max(0, until - this.now()))} (attempt ${pending.attempt}; Esc to stop)`,
+        `${pending.label ?? `Answer cut off (${pending.kind})`} — retrying in ${formatWait(Math.max(0, until - this.now()))} (attempt ${pending.attempt}; Esc to stop)`,
       );
     const tick = setInterval(() => {
       try {

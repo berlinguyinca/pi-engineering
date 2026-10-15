@@ -15,6 +15,12 @@ export interface GatewayAdmissionConfig {
   enabled: boolean;
   /** Allow model-scoped gateway outages to change the active session model. */
   modelFallbackEnabled: boolean;
+  /**
+   * Act on the gateway's own "retry on an alternate deployment" guidance
+   * (IW-ACT-RETRY-ALTERNATE) by switching the session to a stand-in and
+   * continuing the turn, instead of waiting and printing the advice.
+   */
+  advisedModelSwitch: boolean;
   /** Concurrent model sessions allowed before a gateway says otherwise. */
   maxConcurrency: number;
   /** Slots held back for the operator's own interactive turn. */
@@ -53,6 +59,7 @@ export interface GatewayAdmissionConfig {
 export const DEFAULT_GATEWAY_CONFIG: GatewayAdmissionConfig = {
   enabled: true,
   modelFallbackEnabled: false,
+  advisedModelSwitch: true,
   maxConcurrency: 4,
   reservedSlots: 1,
   maxWaitMs: 300_000,
@@ -97,6 +104,8 @@ export function parseGatewayElapsedMs(value: string | undefined): number | null 
  *   PI_GATEWAY_ADMISSION_ENABLED — "true"/"false" (default true)
  *   PI_GATEWAY_MODEL_FALLBACK_ENABLED — on only for 1/true/yes/on (any case); anything else,
  *                                  including unset or a typo, is off (default false)
+ *   PI_GATEWAY_ADVISED_MODEL_SWITCH — "true"/"false": follow the gateway's IW-ACT-RETRY-ALTERNATE
+ *                                  advice by switching to a stand-in model (default true)
  *   PI_GATEWAY_MAX_CONCURRENCY   — int, concurrent model sessions (default 4)
  *   PI_GATEWAY_RESERVED_SLOTS    — int, slots kept for the interactive turn (default 1)
  *   PI_GATEWAY_MAX_WAIT_MS       — int, cap on one honoured wait (default: none)
@@ -117,6 +126,10 @@ export function resolveGatewayConfig(overrides?: Partial<GatewayAdmissionConfig>
   // Deliberately not `bool(env, cfg.x)`: a safety-sensitive switch has no
   // fallback to inherit — only an explicit affirmative turns it on.
   cfg.modelFallbackEnabled = optIn(env.PI_GATEWAY_MODEL_FALLBACK_ENABLED);
+  // Not an inference of ours but the gateway's explicit instruction, and the
+  // chooser still refuses any stand-in the session would not fit in — so this
+  // one defaults on, with an ordinary off switch.
+  cfg.advisedModelSwitch = bool(env.PI_GATEWAY_ADVISED_MODEL_SWITCH, cfg.advisedModelSwitch);
   cfg.maxConcurrency = Math.max(1, int(env.PI_GATEWAY_MAX_CONCURRENCY, cfg.maxConcurrency));
   cfg.reservedSlots = Math.max(0, int(env.PI_GATEWAY_RESERVED_SLOTS, cfg.reservedSlots));
   cfg.maxWaitMs = Math.max(0, int(env.PI_GATEWAY_MAX_WAIT_MS, cfg.maxWaitMs));

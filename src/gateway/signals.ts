@@ -569,6 +569,17 @@ export function isCapacityExhaustion(
 }
 
 export const ALTERNATE_MODEL_ADVICE = "gateway advises an alternate model — switch with /model";
+/**
+ * The error text of an attempt the pump gave up WITHOUT waiting because a
+ * switch is armed (streamRetry `abandonForAlternate`). Deliberately free of
+ * every token Pi's own retry classifier treats as transient ("429",
+ * "rate limit", "overloaded", "unavailable", "timeout", …): Pi's auto-retry
+ * runs BEFORE the settle boundary that performs the switch, and three retries
+ * of a request the gateway just refused would be exactly the wasted calls the
+ * switch exists to avoid. The settle handler recognises this marker.
+ */
+export const ALTERNATE_MODEL_SWITCHING =
+  "no capacity on this deployment; gateway advises an alternate model — switching automatically if one fits, else switch with /model";
 
 /** One-line human summary for notices and logs. */
 export function describeGatewayWait(signal: GatewayWaitSignal): string {
