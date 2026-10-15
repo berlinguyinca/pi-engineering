@@ -368,19 +368,36 @@ describe("resilience e2e — a gateway outage pauses (not fails) a live mission"
     assert.equal(resumed.status, "CANCELED");
   });
 
-  it("a repository with no checks blocks on missing evidence without futile repair tasks", async () => {
+  it("a docs-only mission in a repository with no checks completes without futile repair tasks", async () => {
+    const h = harness({ failWhileDown: () => false, validationNoTargets: true });
+    const result = await h.orchestrator.orchestrate("Document the health endpoint", {
+      repository: ".",
+      baseRef: "abc",
+      mutationRequested: true,
+      acceptanceCriteria: ["The README documents the endpoint"],
+    });
+    const missionId = result.mission.mission_id;
+    assert.equal(h.store.getMission(missionId)!.status, "COMPLETE", "no-target validation is acceptable here");
+    const repairs = h.store
+      .listTasks(missionId)
+      .filter((task) => task.kind === "agent" && task.objective.startsWith("Fix the failing"));
+    assert.equal(repairs.length, 0);
+    assert.equal(h.calls.validation, 1, "validation is not re-run in futile repair rounds");
+  });
+
+  it("a mission whose criteria require tests cannot complete on no-target validation", async () => {
     const h = harness({ failWhileDown: () => false, validationNoTargets: true });
     const result = await h.orchestrator.orchestrate("Add a health endpoint", {
       repository: ".",
       baseRef: "abc",
       mutationRequested: true,
+      acceptanceCriteria: ["Add unit tests for the endpoint"],
     });
     const missionId = result.mission.mission_id;
-    assert.notEqual(h.store.getMission(missionId)!.status, "COMPLETE", "no-target evidence cannot complete a mutation");
+    assert.notEqual(h.store.getMission(missionId)!.status, "COMPLETE");
     const repairs = h.store
       .listTasks(missionId)
       .filter((task) => task.kind === "agent" && task.objective.startsWith("Fix the failing"));
     assert.equal(repairs.length, 0, "missing verification evidence is not something a repair task can fix");
-    assert.equal(h.calls.validation, 1, "validation is not re-run in futile repair rounds");
   });
 });

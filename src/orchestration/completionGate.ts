@@ -3,6 +3,7 @@ import { evidenceIdentitiesEqual, hashCandidateEvidenceIdentity, taskCoverageFin
 import type { MissionStore } from "./missionStore.ts";
 import { hasAcceptableNestedPublication } from "./nestedPublicationGate.ts";
 import { taskFailureReason } from "./recovery.ts";
+import { noTargetsTestRequirement } from "./testRequirement.ts";
 import type { CompletionVerdict, Mission, RequiredGate } from "./types.ts";
 
 export interface GateEvidence {
@@ -205,8 +206,9 @@ export class CompletionGate {
     const validationOk =
       !!currentValidation &&
       currentValidation.accessible &&
-      !currentValidation.noTargets &&
-      currentValidation.exitCode === 0;
+      (currentValidation.noTargets
+        ? !noTargetsTestRequirement(mission.acceptance_criteria)
+        : currentValidation.exitCode === 0);
     const reviewOk =
       !!currentReview &&
       currentReview.accessible &&
@@ -382,7 +384,7 @@ export class CompletionGate {
         : !currentValidation.accessible
           ? "current validation evidence is inaccessible"
           : currentValidation.noTargets
-            ? "no-target validation cannot satisfy a mutation gate"
+            ? noTargetsTestRequirement(mission.acceptance_criteria)
             : currentValidation.exitCode !== 0
               ? `current validation failed with exit code ${currentValidation.exitCode}`
               : undefined;

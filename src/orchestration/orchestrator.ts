@@ -56,6 +56,7 @@ import { brokerKind } from "./scheduler.ts";
 import { MissionScheduler } from "./scheduler.ts";
 import type { ProtectedUserCriteria, SpecControllerResult, SpecScopeEnvelope } from "./specApproval.ts";
 import { canTransitionMission, canTransitionTask } from "./state.ts";
+import { noTargetsTestRequirement } from "./testRequirement.ts";
 import type {
   AcceptanceCriterion,
   CompletionVerdict,
@@ -2688,6 +2689,7 @@ export class Orchestrator {
               ]
             : [],
         ),
+        testRequirement: noTargetsTestRequirement(this.store.getMission(missionId)?.acceptance_criteria),
         authority,
         ...(extra.reviewedRecovered?.length ? { reviewedRecovered: extra.reviewedRecovered } : {}),
       });
@@ -2827,7 +2829,9 @@ export class Orchestrator {
     );
     const validationOk =
       !requiresValidation ||
-      (!!validation && validation.accessible && !validation.noTargets && validation.exitCode === 0);
+      (!!validation &&
+        validation.accessible &&
+        (validation.noTargets ? !noTargetsTestRequirement(mission.acceptance_criteria) : validation.exitCode === 0));
     const reviewOk =
       !requiresReview ||
       (!!review &&

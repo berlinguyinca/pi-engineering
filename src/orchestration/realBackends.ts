@@ -288,23 +288,6 @@ function outcomeOf(result: Awaited<ReturnType<WorkerExecutor["run"]>>): Executio
   return outcome;
 }
 
-/** Matches a criterion that demands tests be written/added (not merely "tests still pass"). */
-const TEST_REQUIRING_CRITERION =
-  /\b(?:add|adds|added|write|writes|written|include|includes|new|targeted|regression|unit|integration|cover|covers|covered)\b[^.\n]*\btests?\b|\btests?\b[^.\n]*\b(?:added|written|included|covering)\b/i;
-
-/**
- * With no verification targets nothing ran, so the stage passes with a warning
- * unless an acceptance criterion explicitly requires tests: then the absence
- * of targets is a failure of that criterion, naming it.
- */
-function noTargetsTestRequirement(
-  criteria: Array<{ acceptanceId: string; criterion: string }> | undefined,
-): string | undefined {
-  const required = (criteria ?? []).filter((c) => TEST_REQUIRING_CRITERION.test(c.criterion));
-  if (required.length === 0) return undefined;
-  return `acceptance ${required.map((c) => c.acceptanceId).join(", ")} requires tests but no verification targets were detected (no tests were added)`;
-}
-
 export function realBackends(opts: RealBackendsOptions) {
   const repository = async (repoId?: string): Promise<{ git: GitRepo | null; cwd: string }> =>
     (await opts.repository?.(repoId)) ?? { git: opts.git, cwd: opts.cwd };
@@ -590,7 +573,7 @@ export function realBackends(opts: RealBackendsOptions) {
         repoId?: string;
         objective: string;
         worktree?: string | null;
-        acceptanceCriteria?: Array<{ acceptanceId: string; criterion: string }>;
+        testRequirement?: string;
         signal: AbortSignal;
         onActivity?: (event: WorkerActivity) => void;
       }): Promise<ExecutionOutcome> {
@@ -604,7 +587,7 @@ export function realBackends(opts: RealBackendsOptions) {
         // A repo with no detectable checks: nothing ran, nothing FAILED. It
         // passes with a warning (a failure would spawn repair work no
         // implementer can satisfy) unless a criterion requires tests.
-        const testsRequired = outcome.noTargets ? noTargetsTestRequirement(input.acceptanceCriteria) : undefined;
+        const testsRequired = outcome.noTargets ? input.testRequirement : undefined;
         return {
           executionId: "validation",
           exitStatus: outcome.passed && !testsRequired ? "succeeded" : "failed",
@@ -624,7 +607,7 @@ export function realBackends(opts: RealBackendsOptions) {
               profile.stages.map((stage) => [stage.command, ...stage.args].join(" ")).join(" && ") || "<no-target>",
             profile: profile.name,
             exitCode:
-              outcome.passed && !testsRequired ? 0 : (outcome.stages.find((stage) => !stage.passed)?.exitCode ?? 1),
+              outcome.passed && !outcome.noTargets ? 0 : (outcome.stages.find((stage) => !stage.passed)?.exitCode ?? 1),
             testSummary: {
               stages: outcome.stages.map((stage) => ({
                 name: stage.stage.name,
@@ -634,7 +617,7 @@ export function realBackends(opts: RealBackendsOptions) {
               failedStage: outcome.failedStage,
               warnings: outcome.warnings ?? [],
             },
-            noTargets: !!testsRequired,
+            noTargets: outcome.noTargets,
             accessible: artifactState.allAccessible,
             acceptanceResults: [],
           },
@@ -855,7 +838,7 @@ export function realBackends(opts: RealBackendsOptions) {
         candidateLifecycle?: CandidateLifecycle;
         integrationRun?: IntegrationRunRecord;
         authority?: import("./ownership.ts").DispatchAuthority;
-        acceptanceCriteria?: Array<{ acceptanceId: string; criterion: string }>;
+        testRequirement?: string;
         signal: AbortSignal;
       }): Promise<ExecutionOutcome> {
         input.signal.throwIfAborted();
@@ -967,7 +950,7 @@ export function realBackends(opts: RealBackendsOptions) {
           // that nothing was verifiable); without it the integration failure
           // record carried only "checks: fail" and the actual cause (e.g. a
           // broken import in the worktree) was undiagnosable from the store.
-          const testsRequired = result.noTargets ? noTargetsTestRequirement(input.acceptanceCriteria) : undefined;
+          const testsRequired = result.noTargets ? input.testRequirement : undefined;
           const checkFailure =
             testsRequired ??
             (result.passed ? undefined : `verification failed at stage: ${result.failedStage ?? "unknown"}`);
@@ -977,6 +960,8 @@ export function realBackends(opts: RealBackendsOptions) {
             exitStatus: checkFailure ? "failed" : "succeeded",
             summary: `integrated ${merged.join(", ") || "nothing"}${recoveredNote} into ${target.branch}; checks: ${checkFailure ? "fail" : "pass"}${warningNote}`,
             ...(checkFailure ? { error: checkFailure } : {}),
+            noTargets: result.noTargets,
+            warnings: result.warnings ?? [],
             artifactRefs,
             artifactHashes: artifactState.hashes,
             usage: {

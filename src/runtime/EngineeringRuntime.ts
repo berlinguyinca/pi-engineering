@@ -203,7 +203,10 @@ function idCompare(a: string, b: string): number {
 }
 
 /** Compare two tournament survivors under the chosen deterministic strategy. */
-function selectionCompare(a: TournamentEntry, b: TournamentEntry, strategy: TournamentStrategy): number {
+export function selectionCompare(a: TournamentEntry, b: TournamentEntry, strategy: TournamentStrategy): number {
+  // A candidate that ran real checks outranks one with no verification targets
+  // (zero evidence), whatever the strategy.
+  if (a.outcome.noTargets !== b.outcome.noTargets) return a.outcome.noTargets ? 1 : -1;
   const fa = a.candidate.changed_files?.length ?? 0;
   const fb = b.candidate.changed_files?.length ?? 0;
   switch (strategy) {

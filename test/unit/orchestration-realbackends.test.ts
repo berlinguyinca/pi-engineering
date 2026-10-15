@@ -637,8 +637,7 @@ describe("realBackends validation with no verification targets", () => {
         objective: "check",
         signal: new AbortController().signal,
       });
-      assert.equal(outcome.validationEvidence?.noTargets, false);
-      assert.equal(outcome.validationEvidence?.exitCode, 0);
+      assert.equal(outcome.validationEvidence?.noTargets, true, "evidence stays honest about zero targets");
       assert.equal(outcome.exitStatus, "succeeded", "zero checks is a pass with a warning, not a failed task");
       assert.match(outcome.summary, /no verification targets/i);
     } finally {
