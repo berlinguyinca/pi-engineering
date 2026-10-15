@@ -11,6 +11,8 @@
  * the plugin.
  */
 
+import { type CanonicalLifecycleState, LIFECYCLE_SCHEMA_VERSION, toCanonical } from "./canonicalLifecycle.ts";
+import type { CanonicalLifecycle } from "./missionStore.ts";
 import {
   type ModelErrorRollup,
   type TaskUsage,
@@ -18,8 +20,6 @@ import {
   buildModelErrorRollups,
   buildTaskUsage,
 } from "./missionWhy.ts";
-import { type CanonicalLifecycleState, LIFECYCLE_SCHEMA_VERSION, toCanonical } from "./canonicalLifecycle.ts";
-import type { CanonicalLifecycle } from "./missionStore.ts";
 import type { MissionProjection } from "./observability/types.ts";
 import type {
   Execution,
