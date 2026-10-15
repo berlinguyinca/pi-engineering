@@ -341,6 +341,9 @@ release_gate:
     lint: pass
     package_load: pass
     fresh_review: { unresolved_critical: 0, unresolved_high: 0 }
+    # Nightly real-mission dogfood (#226): VERIFIED needs a passing dogfood_mission record
+    # at or after the milestone's latest scope change, else it is demoted to IMPLEMENTED.
+    real_mission_dogfood: true
 
 backlog:
   # B-101..B-104 and B-107..B-113 are IMPLEMENTED as milestones M13-M22 (see above).

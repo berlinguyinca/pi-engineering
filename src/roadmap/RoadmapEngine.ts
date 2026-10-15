@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 /**
  * Roadmap engine facade: load a Roadmap 1.0 definition, generate deterministic
  * evidence, derive milestone states, evaluate the release gate, and produce
@@ -9,7 +9,7 @@ import { readFileSync } from "node:fs";
  * complete.
  */
 import { access } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { parse as parseYaml } from "yaml";
 import { GitRepo } from "../git/GitRepo.ts";
 import { CHECKS, type Check, GENERATED_TYPES, MANUAL_TYPES, requiredTypes, runCheck } from "./checks.ts";
@@ -20,6 +20,7 @@ import { parseRoadmap } from "./schema.ts";
 import type {
   EvidenceType,
   MilestoneDef,
+  MilestoneEvaluation,
   RoadmapCheckResult,
   RoadmapDef,
   RoadmapEvaluation,
@@ -50,6 +51,12 @@ export const ALL_EVIDENCE_TYPES: EvidenceType[] = [...GENERATED_TYPES, ...MANUAL
  * by implementation work.
  */
 const EVIDENCE_INDEX_PATH = "docs/roadmap/evidence.yaml";
+
+/**
+ * Nightly real-mission dogfood records (`<sha>.json`) live beside the index.
+ * Like the index, committing one must not invalidate the scope it lives in.
+ */
+const DOGFOOD_RECORD_DIR = "docs/roadmap/dogfood";
 
 /**
  * Strip the evidence index from an invalidation scope.
@@ -83,7 +90,16 @@ export function watchableScope(paths: string[]): string[] {
     const n = normalized(p);
     return n.length > 0 && index.startsWith(`${n}/`);
   });
-  return coversIndex ? [...kept, `:(exclude)${EVIDENCE_INDEX_PATH}`] : kept;
+  const dir = normalized(DOGFOOD_RECORD_DIR);
+  const coversDir = kept.some((p) => {
+    const n = normalized(p);
+    return n.length > 0 && dir.startsWith(`${n}/`);
+  });
+  return [
+    ...kept,
+    ...(coversIndex ? [`:(exclude)${EVIDENCE_INDEX_PATH}`] : []),
+    ...(coversDir ? [`:(exclude)${DOGFOOD_RECORD_DIR}`] : []),
+  ];
 }
 
 export class RoadmapEngine {
@@ -96,6 +112,8 @@ export class RoadmapEngine {
   private roadmap!: RoadmapDef;
   private readonly lastDeterministic = new Map<string, boolean>();
   private manual: RoadmapEvidence[] = [];
+  /** Rejected dogfood_mission records; appended to demotion blockers. */
+  readonly dogfoodWarnings: string[] = [];
 
   private constructor(opts: RoadmapEngineOptions) {
     this.repoRoot = opts.repoRoot;
@@ -117,6 +135,7 @@ export class RoadmapEngine {
     if (!parsed) throw new RoadmapError("invalid roadmap definition", 2);
     engine.roadmap = parsed;
     await engine.loadManualEvidence();
+    await engine.loadDogfoodMissions();
     return engine;
   }
 
@@ -134,6 +153,84 @@ export class RoadmapEngine {
 
   get definition(): RoadmapDef {
     return this.roadmap;
+  }
+
+  /**
+   * Load nightly `dogfood_mission` records (`docs/roadmap/dogfood/<sha>.json`,
+   * written by scripts/dogfood-real-mission.ts). A record passes only when it has
+   * missions and every one reached COMPLETE; it is pinned to the record's `sha`.
+   */
+  private async loadDogfoodMissionRecords(): Promise<RoadmapEvidence[]> {
+    const dir = join(dirname(this.manualEvidencePath), "dogfood");
+    let names: string[];
+    try {
+      names = readdirSync(dir).filter((n) => n.endsWith(".json"));
+    } catch {
+      return [];
+    }
+    const out: RoadmapEvidence[] = [];
+    for (const name of names) {
+      let doc: { kind?: unknown; sha?: unknown; ranAt?: unknown; missions?: unknown };
+      try {
+        doc = JSON.parse(readFileSync(join(dir, name), "utf-8"));
+      } catch {
+        continue;
+      }
+      if (doc.kind !== "dogfood_mission" || typeof doc.sha !== "string" || !doc.sha) continue;
+      // Integrity (honor system, see docs/usage.md): the file must be named for
+      // the SHA it claims and that SHA must exist in this repository.
+      if (name !== `${doc.sha}.json`) {
+        this.dogfoodWarnings.push(`ignored dogfood record ${name}: file name does not match its sha ${doc.sha}`);
+        continue;
+      }
+      if (!(await this.gitRepo.resolveCommit(doc.sha).catch(() => null))) {
+        this.dogfoodWarnings.push(`ignored dogfood record ${name}: sha ${doc.sha} does not resolve in this repository`);
+        continue;
+      }
+      const missions = Array.isArray(doc.missions) ? (doc.missions as Array<{ status?: unknown }>) : [];
+      const pass = missions.length > 0 && missions.every((m) => m.status === "COMPLETE");
+      out.push({
+        id: `dogfood_mission:${doc.sha}`,
+        milestone: "__global__",
+        type: "dogfood_mission",
+        status: pass ? "pass" : "fail",
+        commit: doc.sha,
+        generatedAt: typeof doc.ranAt === "string" ? doc.ranAt : "",
+        paths: [],
+        proof: `docs/roadmap/dogfood/${name}`,
+        source: "manual",
+        summary: `${missions.length} real mission(s)`,
+      });
+    }
+    return out;
+  }
+
+  /**
+   * Release-gate demotion: a VERIFIED milestone needs a passing `dogfood_mission`
+   * record pinned at or after the latest commit touching its own scope paths.
+   * Otherwise it is IMPLEMENTED (no real-mission evidence for its current code).
+   */
+  private async demoteWithoutRealMission(ev: MilestoneEvaluation): Promise<MilestoneEvaluation> {
+    if (ev.state !== "VERIFIED") return ev;
+    const scope = watchableScope(ev.milestone.scope.paths);
+    const records = this.manual.filter((r) => r.type === "dogfood_mission" && r.status === "pass");
+    // A record is fresh iff no commit reachable from HEAD but not from the record
+    // touches the milestone's scope.
+    for (const r of records) {
+      if (scope.length === 0) return ev;
+      const newer = await this.gitRepo.lastCommitTouchingSince(r.commit, scope).catch(() => "<git-error>");
+      if (newer === null) return ev;
+    }
+    const latest = scope.length ? await this.gitRepo.lastCommitTouching(scope).catch(() => null) : null;
+    return {
+      ...ev,
+      state: "IMPLEMENTED",
+      blockers: [
+        ...ev.blockers,
+        `demoted to IMPLEMENTED: no passing dogfood_mission record covers ${latest ? `the latest change in scope (${latest.slice(0, 12)})` : "this milestone"}`,
+        ...this.dogfoodWarnings,
+      ],
+    };
   }
 
   private async loadManualEvidence(): Promise<void> {
@@ -187,6 +284,12 @@ export class RoadmapEngine {
     }
     this.manual = out;
     for (const rec of out) await this.store.put(rec);
+  }
+
+  private async loadDogfoodMissions(): Promise<void> {
+    const records = await this.loadDogfoodMissionRecords();
+    this.manual = [...this.manual, ...records];
+    for (const rec of records) await this.store.put(rec);
   }
 
   /** Deterministic freshness + implementation checks backed by git + fs. */
@@ -323,7 +426,14 @@ export class RoadmapEngine {
 
   /** Evaluate milestones + release gate from current evidence. */
   async evaluate(): Promise<RoadmapEvaluation> {
-    const evals = await evaluateAll(this.roadmap, this.store, this.freshness(), this.findingsProvider());
+    const demote = this.roadmap.release_gate.require.realMissionDogfood;
+    const evals = await evaluateAll(
+      this.roadmap,
+      this.store,
+      this.freshness(),
+      this.findingsProvider(),
+      demote ? (ev) => this.demoteWithoutRealMission(ev) : undefined,
+    );
     const releaseGate = await evaluateReleaseGate(this.roadmap, evals, this.gateProvider());
     const evaluations = [...evals.values()];
     const complete =

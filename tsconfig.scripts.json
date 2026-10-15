@@ -1,4 +1,9 @@
 {
   "extends": "./tsconfig.json",
-  "include": ["scripts/dogfood-mission-recovery.ts", "scripts/planner-worker-benchmark.ts"]
+  "include": [
+    "scripts/dogfood-mission-recovery.ts",
+    "scripts/dogfood-real-mission.ts",
+    "src/blackhole/pi-blackhole.d.ts",
+    "scripts/planner-worker-benchmark.ts"
+  ]
 }
