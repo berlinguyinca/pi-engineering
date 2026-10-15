@@ -3150,8 +3150,14 @@ export class Orchestrator {
     ) {
       validationAttempted = true;
       reviewAttempted = true;
-      const validating = this.runValidationGate(mission, signal);
-      const reviewing = this.runReviewGate(mission, signal, { concurrentWithValidation: true });
+      // The peek can be stale (the entry may vanish before validation runs): the
+      // review starts beside validation only once validation confirms the reuse,
+      // otherwise it waits for validation like any other review.
+      const reuse = this.broker.watchValidationReuse(mission.mission_id);
+      const validating = this.runValidationGate(mission, signal).finally(() => reuse.settle());
+      const reviewing = reuse.confirmed.then((reused) =>
+        this.runReviewGate(mission, signal, { concurrentWithValidation: reused }),
+      );
       [validationOk, reviewOk] = await Promise.all([validating, reviewing]);
       if (!signal?.aborted) this.store.transitionMission(mission.mission_id, "FINAL_VALIDATION");
       return { validationAttempted, validationOk, reviewAttempted, reviewOk, integrationOk };

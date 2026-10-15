@@ -30,6 +30,7 @@ import {
   type CheckpointRecoveryContext,
   type ExecutionOutcome,
   type IntegrationHandoff,
+  VERIFY_CACHE_NOTICE,
   workerTimeoutMs,
 } from "./broker.ts";
 import { normalizeReviewSeverity, validateAcceptanceResults } from "./evidence.ts";
@@ -823,7 +824,7 @@ export function realBackends(opts: RealBackendsOptions) {
             kind: "execution",
             stage: "validation",
             phase: "started",
-            summary: `verify.cache: validation reused verification run ${verified.runId} for this candidate commit`,
+            summary: `${VERIFY_CACHE_NOTICE} validation reused verification run ${verified.runId} for this candidate commit`,
             meaningfulProgress: false,
           });
         }
