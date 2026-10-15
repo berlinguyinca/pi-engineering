@@ -190,10 +190,12 @@ describe("hostile concurrency", { concurrency: false }, () => {
       // (ownership.ts:114, "owned by <owner> until <renewBy>"). Which one fires
       // depends on the race ordering between the winner claiming the lock and
       // the loser reading the lease, so accept both legitimate variants while
-      // still failing on any unexpected error.
+      // still failing on any unexpected error. Custody contention also queues
+      // (fd5fcf1/#126): a queued contender's wait timer is unref'd, so its child
+      // exits cleanly without ever reporting an adoption - the third variant.
       assert.match(
         String(outcome.error),
-        /another live session|is owned by \S+ until/,
+        /another live session|is owned by \S+ until|exited \(0\) without a report/,
         "losers lose only to a live custodian",
       );
     }
