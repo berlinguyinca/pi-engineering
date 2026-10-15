@@ -341,15 +341,29 @@ export function explainMission(store: MissionStore, missionId: string, options: 
     if (f.category === "stranded_worker_work" && f.status === "open" && f.evidence) stranded.add(f.evidence);
   }
 
-  const zeroTool = /(\d+)\/(\d+) zero-tool-call retries \(([^)]*)\)/.exec(pending?.expectedMaterialChange ?? "");
+  const structured = pending?.zeroToolWait;
+  const zeroTool = structured
+    ? null
+    : /(\d+)\/(\d+) zero-tool-call retries \(([^)]*)\)/.exec(pending?.expectedMaterialChange ?? "");
 
   const remedies: string[] = [];
   const terminal = ["COMPLETE", "FAILED", "CANCELED"].includes(mission.status);
   if (!terminal) {
     const named = [stop?.resumeCondition, pending?.operatorGuidance].filter((t): t is string => Boolean(t));
-    remedies.push(`/mission resume ${missionId}`);
+    const waiting = cooldown && cooldown.remainingMs > 0 ? cooldown : null;
+    if (custody) {
+      remedies.push(
+        `waiting on custody held by ${custody.holder}; the mission continues when that session releases it (close that session if it is idle)`,
+      );
+    } else if (waiting) {
+      remedies.push(
+        `waiting for ${waiting.scope} until ${waiting.nextActionAt} (${duration(waiting.remainingMs)} remaining); after that: /mission resume ${missionId}`,
+      );
+    } else {
+      remedies.push(`/mission resume ${missionId}`);
+    }
     // Releasing a pin helps only when the mission carries one and the stop or decision names it.
-    if (mission.operator_model_pin && named.some((t) => /pin/i.test(t))) {
+    if (!custody && !waiting && mission.operator_model_pin && named.some((t) => /pin/i.test(t))) {
       remedies.push(`/mission resume ${missionId} --model auto`);
     }
     remedies.push(`/mission cancel ${missionId}`);
@@ -375,9 +389,9 @@ export function explainMission(store: MissionStore, missionId: string, options: 
     counters: {
       probeAttempt: pending?.attempt ?? 0,
       probeMax: pending?.maxAttempts ?? 0,
-      zeroToolRetries: zeroTool ? Number(zeroTool[1]) : 0,
-      zeroToolCap: zeroTool ? Number(zeroTool[2]) : 0,
-      zeroToolClass: zeroTool?.[3] ?? null,
+      zeroToolRetries: structured?.retries ?? (zeroTool ? Number(zeroTool[1]) : 0),
+      zeroToolCap: structured?.cap ?? (zeroTool ? Number(zeroTool[2]) : 0),
+      zeroToolClass: structured?.failureClass ?? zeroTool?.[3] ?? null,
     },
     inheritedFailures: [...inherited],
     stranded: [...stranded],

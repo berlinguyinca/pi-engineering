@@ -52,7 +52,8 @@ describe("mission why", () => {
     const why = explainMission(store, missionId);
     assert.equal(why.blocking.taskId, task.task_id);
     assert.match(why.custody?.holder ?? "", /session f4c3cd60 \(pid 2893918\)/);
-    assert.ok(why.remedies.includes(`/mission resume ${missionId}`));
+    assert.ok(!why.remedies.some((r) => r === `/mission resume ${missionId}`), "a custody wait is not resumable");
+    assert.ok(why.remedies.some((r) => /waiting on custody held by session f4c3cd60/.test(r)));
     assert.match(formatMissionWhy(why), /f4c3cd60/);
   });
 
@@ -77,8 +78,8 @@ describe("mission why", () => {
       missionId,
       classificationId: "FC-1",
       action: "PROBE_AND_BACKOFF",
-      expectedMaterialChange:
-        "waiting for provider: 3/5 zero-tool-call retries (connection error); next probe at 2026-10-15T10:01:30.000Z",
+      expectedMaterialChange: "observe a healthy provider probe",
+      zeroToolWait: { retries: 3, cap: 5, failureClass: "connection error" },
       operatorGuidance: "Is the gateway down? Release the pin if so.",
       attempt: 2,
       maxAttempts: 6,
@@ -96,6 +97,10 @@ describe("mission why", () => {
       [2, 6, 3, 5],
     );
     assert.equal(why.counters.zeroToolClass, "connection error");
+    assert.ok(!why.remedies.includes(`/mission resume ${missionId}`), "no bare resume before nextActionAt");
+    assert.ok(why.remedies.some((r) => r.includes(`after that: /mission resume ${missionId}`)));
+    const later = explainMission(store, missionId, { now: now + 120_000 });
+    assert.ok(later.remedies.includes(`/mission resume ${missionId}`), "resume once nextActionAt passed");
     assert.ok(why.remedies.some((r) => r.startsWith("operator question: Is the gateway down")));
     assert.ok(!why.remedies.some((r) => r.includes("--model auto")), "no pin, no --model auto remedy");
     assert.equal(why.modelErrors[0]?.endpoint, "llm.example:8081");
@@ -182,6 +187,30 @@ describe("mission why", () => {
     assert.equal(usage?.streamResumes, 2);
     assert.equal(usage?.thinking, "off");
     assert.equal(usage?.role, "implementer");
+  });
+
+  it("works while another process holds the store lock (read-only replay)", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "why-locked-"));
+    try {
+      const file = join(dir, "orchestration.jsonl");
+      const writer = await JsonlEventStore.open(file);
+      const store = MissionStore.open(writer);
+      const { missionId } = seed(store);
+      await store.flush();
+      let text = "";
+      const code = await runMissionsCommand(["why", "--store", dir, missionId], {
+        write: (t) => {
+          text += t;
+        },
+        error: () => undefined,
+        env: { ...process.env, PI_ENGINEERING_STATE_DIR: dir },
+      });
+      assert.equal(code, 0);
+      assert.match(text, /Mission MSN-why/);
+      writer.close();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 
   it("prints a stable CLI report from a real store file", async () => {

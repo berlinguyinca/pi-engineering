@@ -543,6 +543,10 @@ async function ensureStateDirIgnored(dir: string): Promise<void> {
  * exposes the vertical-slice workflows: scout, implement, verify, review,
  * challenge, and the adaptive `engineer` pipeline.
  */
+function snapshotErrorCode(error: unknown): string {
+  return (error as NodeJS.ErrnoException | undefined)?.code ?? (error instanceof Error ? error.name : "unknown");
+}
+
 function describeSnapshotError(error: unknown): string {
   if (error instanceof Error) {
     const code = (error as NodeJS.ErrnoException).code;
@@ -636,13 +640,16 @@ export class EngineeringRuntime {
   }
 
   /** Record why publication failed on each live mission (deduplicated per message). */
-  private recordSnapshotPublicationFinding(detail: string): void {
-    const summary = `Mission snapshot publication failed: ${detail}`;
+  private recordSnapshotPublicationFinding(code: string, detail: string): void {
+    // One open finding per mission, keyed on category: the detail embeds a
+    // fresh temp path on every attempt, so it lives in evidence, not the
+    // summary, and a repeated failure never adds findings (which would
+    // republish and loop).
     try {
       for (const mission of this.missionStore?.listMissions() ?? []) {
         if (["COMPLETE", "FAILED", "CANCELED"].includes(mission.status)) continue;
         const known = this.missionStore!.listFindings(mission.mission_id).some(
-          (f) => f.category === "snapshot-publication" && f.status === "open" && f.summary === summary,
+          (f) => f.category === "snapshot-publication" && f.status === "open",
         );
         if (known) continue;
         this.missionStore!.addFinding({
@@ -652,8 +659,8 @@ export class EngineeringRuntime {
           category: "snapshot-publication",
           file: null,
           line: null,
-          summary,
-          evidence: null,
+          summary: `Mission snapshot publication failed (${code})`,
+          evidence: detail,
           recommended_action: "Check disk space and permissions of the work directory, then /mission resume.",
         });
       }
@@ -726,7 +733,7 @@ export class EngineeringRuntime {
           this.snapshotPublishDirty = false;
           this.snapshotPublishRetries = 0;
           const detail = describeSnapshotError(lastError);
-          this.recordSnapshotPublicationFinding(detail);
+          this.recordSnapshotPublicationFinding(snapshotErrorCode(lastError), detail);
           try {
             this.onMissionSnapshotError?.(
               `Mission snapshot publication failed (${detail}); live mission detail may be stale.`,

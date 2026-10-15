@@ -538,6 +538,14 @@ export interface RecoveryDecision {
   startingCandidateContent?: { candidateSha: string; diffHash: string } | null;
   /** Concrete operator-facing guidance when recovery must pause for a decision. */
   operatorGuidance?: string;
+  /** Zero-tool-call retry accounting of a provider wait (#197). */
+  zeroToolWait?: ZeroToolWait;
+}
+
+export interface ZeroToolWait {
+  retries: number;
+  cap: number;
+  failureClass: string;
 }
 
 export interface EvidenceInvalidation {

@@ -138,7 +138,8 @@ export async function runMissionsCommand(args: string[], options: MissionsCliOpt
 
   let backend: JsonlEventStore;
   try {
-    backend = await JsonlEventStore.open(storePath);
+    // `why` only reads: it must work while a live session holds the writer lock.
+    backend = await (sub === "why" ? JsonlEventStore.openReadOnly(storePath) : JsonlEventStore.open(storePath));
   } catch (error) {
     err(`cannot open ${storePath}: ${error instanceof Error ? error.message : String(error)}\n`);
     return 3;
