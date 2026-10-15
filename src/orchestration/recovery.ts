@@ -386,7 +386,12 @@ export class FailureClassifier {
     }
     // A restarted model switch, a gateway capacity hold and a grammar rejection
     // are the serving side failing, whatever role's task they interrupted.
-    if (/model[_ ]superseded|capacity hold|grammar/.test(summary)) return "PROVIDER_TRANSIENT";
+    if (
+      /model[_ ]superseded|gateway capacity hold|capacity hold:|http 400.*grammar|failed to parse grammar|failed to initialize samplers/.test(
+        summary,
+      )
+    )
+      return "PROVIDER_TRANSIENT";
     if (/workspace|scope mismatch|role-access|repository mismatch/.test(summary)) return "WORKSPACE_SCOPE_MISMATCH";
     if (/evidence.*(unavailable|missing|inaccessible)|candidate evidence unavailable/.test(summary)) {
       return "EVIDENCE_UNAVAILABLE";

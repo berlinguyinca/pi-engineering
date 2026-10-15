@@ -1393,6 +1393,20 @@ export class MissionScheduler {
   }
 
   /** The resolved mission resilience config. */
+  /**
+   * Pace a gate re-run after a provider failure. The recovery planner's
+   * nextActionAt is "now", so the pacing comes from the scheduler's retry
+   * window: exponential from probe_interval_ms up to max_backoff_ms.
+   */
+  async gateBackoff(attempt: number, signal?: AbortSignal): Promise<void> {
+    const cfg = this.resilience;
+    const wait = Math.min(
+      cfg.max_backoff_ms ?? cfg.probe_interval_ms,
+      cfg.probe_interval_ms * 2 ** Math.min(attempt, 30),
+    );
+    await this.abortable(this.sleepFn(wait), signal);
+  }
+
   get resilienceConfig(): GatewayResilienceConfig {
     return this.resilience;
   }

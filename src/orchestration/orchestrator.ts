@@ -60,6 +60,7 @@ import { canTransitionMission, canTransitionTask } from "./state.ts";
 import type {
   AcceptanceCriterion,
   CompletionVerdict,
+  FailureClassification,
   Mission,
   OrchestrationTask,
   RequiredGate,
@@ -489,8 +490,9 @@ export class Orchestrator {
       await this.store.flush();
       this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
       const classifications = this.store.listFailureClassifications(missionId);
-      const classification = classifications.at(-1);
+      let classification = classifications.at(-1);
       if (!classification) throw new Error(`blocked mission ${missionId} has no durable failure classification`);
+      classification = this.rederiveLegacyGateClassification(classification);
       const resumptionGeneration = this.store.listMissionResumptions(missionId).at(-1)?.generation ?? 0;
       this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
       const recoveryStartRecord = this.store.getCandidate(missionId);
@@ -606,6 +608,30 @@ export class Orchestrator {
         await this.store.flush();
         this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
         return this.store.getMission(missionId)!;
+      }
+      const resumableGate = this.failedGateWithoutVerdict(classification);
+      if (repairDecision.action === "PROBE_AND_BACKOFF" && resumableGate) {
+        // The gate died on a provider failure: re-run only that gate against
+        // the existing candidate instead of parking again.
+        if (this.store.getMission(missionId)!.status === "BLOCKED" && repairDecision.status === "planned") {
+          this.store.transitionMission(missionId, "REPAIRING", "system", {
+            recoveryDecisionId: repairDecision.recoveryId,
+          });
+        } else if (repairDecision.status === "planned") {
+          this.store.transitionRecovery(repairDecision.recoveryId, "started");
+        }
+        await this.store.flush();
+        this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
+        const reran = await this.finalizeMission(missionId, expectedResumptionGeneration, signal, undefined, {
+          gateOnly: true,
+        });
+        this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
+        if (this.store.getRecoveryDecision(repairDecision.recoveryId)?.status === "started") {
+          this.store.transitionRecovery(repairDecision.recoveryId, reran.completed ? "succeeded" : "failed");
+        }
+        await this.store.flush();
+        this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
+        return reran.mission;
       }
       if (repairDecision.action === "PAUSE_FOR_PERSISTENCE" || repairDecision.action === "PROBE_AND_BACKOFF") {
         if (repairDecision.status === "planned") this.store.transitionRecovery(repairDecision.recoveryId, "started");
@@ -2067,6 +2093,7 @@ export class Orchestrator {
     expectedResumptionGeneration: number,
     signal?: AbortSignal,
     requiredCandidateChangeFrom?: string | null,
+    opts: { gateOnly?: boolean } = {},
   ): Promise<FinalizationResult> {
     if (signal?.aborted) return this.canceledFinalization(missionId, signal);
     await this.reconcileCommittedPromotions(missionId);
@@ -2074,7 +2101,11 @@ export class Orchestrator {
     // Post-execution: integrate, validate + review if the mission mutated or
     // requires gates. If integration did not land the change, the mission must
     // not complete — otherwise it reports success over an unchanged repository.
-    let post = await this.postExecution(this.store.getMission(missionId)!, signal);
+    // gateOnly: the candidate is already integrated and only a gate that died on
+    // a provider failure is outstanding; the probe loop below re-runs just that.
+    let post = opts.gateOnly
+      ? { validationAttempted: false, validationOk: true, reviewAttempted: false, reviewOk: true, integrationOk: true }
+      : await this.postExecution(this.store.getMission(missionId)!, signal);
     if (signal?.aborted) return this.canceledFinalization(missionId, signal);
     let integrated = post.integrationOk;
     if (
@@ -2115,14 +2146,18 @@ export class Orchestrator {
       const openBlocking = this.store
         .listFindings(missionId)
         .filter((f) => f.severity === "blocking" && f.status === "open");
-      const failedGates = this.store
-        .listTasks(missionId)
-        .filter(
-          (t) =>
-            (t.kind === "validation" || t.kind === "integration" || t.kind === "review") &&
-            t.status === "FAILED" &&
-            this.broker.hasBackend(t.kind as "validation" | "integration" | "review"),
-        );
+      // A FAILED gate task counts only until a later task of the same kind
+      // succeeded: a stale failure must not trigger another probe or repair.
+      const missionTasks = this.store.listTasks(missionId);
+      const failedGates = missionTasks.filter(
+        (t, index) =>
+          (t.kind === "validation" || t.kind === "integration" || t.kind === "review") &&
+          t.status === "FAILED" &&
+          this.broker.hasBackend(t.kind as "validation" | "integration" | "review") &&
+          !missionTasks.some(
+            (later, laterIndex) => laterIndex > index && later.kind === t.kind && later.status === "SUCCEEDED",
+          ),
+      );
       if (openBlocking.length === 0 && failedGates.length === 0) break;
       repairRounds++;
 
@@ -2131,6 +2166,7 @@ export class Orchestrator {
         .listFailureClassifications(missionId)
         .reverse()
         .find((entry) => entry.taskId === blockerTask?.task_id);
+      if (classification) classification = this.rederiveLegacyGateClassification(classification);
       if (!classification) {
         const unclassified = {
           missionId,
@@ -2185,9 +2221,20 @@ export class Orchestrator {
         (blockerTask.kind === "validation" || blockerTask.kind === "review" || blockerTask.kind === "integration")
       ) {
         repairRounds--;
-        const priorProbes = this.store
-          .listRecoveryDecisions(missionId)
-          .filter((decision) => decision.action === "PROBE_AND_BACKOFF").length;
+        // Count only this resumption's gate probes, so a mission parked at the
+        // cap becomes resumable and unrelated provider waits are not charged.
+        const generation = this.store.listMissionResumptions(missionId).at(-1)?.generation ?? 0;
+        const priorProbes = this.store.listRecoveryDecisions(missionId).filter((decision) => {
+          if (decision.action !== "PROBE_AND_BACKOFF" || (decision.resumptionGeneration ?? 0) !== generation) {
+            return false;
+          }
+          const probedTask = this.store.getTask(
+            this.store.getFailureClassification(decision.classificationId)?.taskId ?? "",
+          );
+          return (
+            probedTask?.kind === "validation" || probedTask?.kind === "review" || probedTask?.kind === "integration"
+          );
+        }).length;
         if (priorProbes >= recoveryChoice.maxAttempts) {
           const parked =
             this.store.getRecoveryDecision(recoveryChoice.recoveryId) ?? this.store.planRecovery(recoveryChoice);
@@ -2196,8 +2243,7 @@ export class Orchestrator {
             reason: `${blockerTask.kind} gate could not run: ${blockerTask.failure_reason ?? classification.summary}`,
             preservedWork: await this.preservedMissionWork(missionId),
             attemptedRecoveries: this.store.listRecoveryDecisions(missionId).map((decision) => decision.recoveryId),
-            resumeCondition:
-              "a healthy provider probe must succeed; the candidate is unchanged and only the gate needs to re-run",
+            resumeCondition: `resume the mission with /mission resume ${missionId} once the provider answers; the candidate is unchanged and only the failed ${blockerTask.kind} gate will re-run`,
           });
           await this.store.flush();
           break;
@@ -2209,6 +2255,8 @@ export class Orchestrator {
         if (this.store.getMission(missionId)!.status !== "REPAIRING") {
           this.store.transitionMission(missionId, "REPAIRING");
         }
+        await this.scheduler.gateBackoff(priorProbes, signal);
+        if (signal?.aborted) return this.canceledFinalization(missionId, signal);
         if (blockerTask.kind === "integration") {
           post = await this.postExecution(this.store.getMission(missionId)!, signal);
           integrated = post.integrationOk;
@@ -2452,6 +2500,49 @@ export class Orchestrator {
       completed: false,
       failureReason: reason,
     };
+  }
+
+  /** The failed gate task behind a classification, when it left no blocking finding. */
+  private failedGateWithoutVerdict(classification: FailureClassification): OrchestrationTask | undefined {
+    const task = classification.taskId ? this.store.getTask(classification.taskId) : undefined;
+    if (!task || task.status !== "FAILED") return undefined;
+    if (task.kind !== "validation" && task.kind !== "review" && task.kind !== "integration") return undefined;
+    const openBlocking = this.store
+      .listFindings(classification.missionId)
+      .some((finding) => finding.severity === "blocking" && finding.status === "open");
+    return openBlocking ? undefined : task;
+  }
+
+  /**
+   * Missions blocked before gate verdicts were distinguished carry a hard-coded
+   * REVIEW_FAILED/VALIDATION_FAILED/MERGE_CONFLICT classification even when the
+   * gate died on a provider error. Re-derive the category from the failed
+   * task's own failure reason so a resume re-runs the gate, not a repair.
+   */
+  private rederiveLegacyGateClassification(classification: FailureClassification): FailureClassification {
+    if (!["REVIEW_FAILED", "VALIDATION_FAILED", "MERGE_CONFLICT"].includes(classification.category)) {
+      return classification;
+    }
+    const task = this.failedGateWithoutVerdict(classification);
+    if (!task || (task.kind !== "validation" && task.kind !== "review" && task.kind !== "integration")) {
+      return classification;
+    }
+    const rederived = classifyGateFailure(this.failureClassifier, task.kind, {
+      missionId: classification.missionId,
+      taskId: task.task_id,
+      executionId: classification.executionId,
+      summary: task.failure_reason ?? classification.summary,
+      evidenceRefs: [],
+      observedAt: new Date(this.scheduler.now()).toISOString(),
+    });
+    if (rederived.category === classification.category) return classification;
+    if (!this.store.getFailureClassification(rederived.classificationId)) {
+      this.store.classifyFailure({
+        ...rederived,
+        blockerEpisodeId: this.store.getMission(classification.missionId)?.blocked_episode_id,
+      });
+    }
+    return rederived;
   }
 
   /**

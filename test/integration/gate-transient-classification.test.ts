@@ -11,6 +11,7 @@ import type { GitRepo } from "../../src/git/GitRepo.ts";
 import type { BrokerBackends, ExecutionOutcome } from "../../src/orchestration/broker.ts";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
 import { Orchestrator } from "../../src/orchestration/orchestrator.ts";
+import { FailureClassifier } from "../../src/orchestration/recovery.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 
 type GateScript = (call: number) => "ok" | ExecutionOutcome;
@@ -185,6 +186,9 @@ describe("gate failures that are provider failures (issue #170)", () => {
       assert.equal(h.calls.agent, 1, "the candidate was not touched");
       assert.equal(repairTasks(h, missionId).length, 0, "no repair tasks");
       assert.equal(result.mission.status, "COMPLETE");
+      const candidate = h.store.getCandidate(missionId)!.identity;
+      assert.equal(candidate.candidateSha, "candidate-test-sha");
+      assert.equal(new Set(h.store.listCandidates(missionId).map((entry) => entry.identity.diffHash)).size, 1);
     });
   }
 
@@ -280,5 +284,70 @@ describe("gate failures that are provider failures (issue #170)", () => {
       "VALIDATION_FAILED",
     );
     assert.ok(h.store.listRecoveryDecisions(missionId).some((decision) => decision.action === "CREATE_REPAIR_TASKS"));
+  });
+
+  it("parks after repeated provider failures and a resume re-runs only the gate to COMPLETE", async () => {
+    let providerUp = false;
+    const h = harness({ review: () => (providerUp ? "ok" : failed("Connection error.")) });
+    const { result, missionId } = await run(h);
+    assert.equal(result.mission.status, "BLOCKED");
+    const stop = h.store.listMissionStops(missionId).at(-1)!;
+    assert.match(stop.resumeCondition, /resume the mission with \/mission resume .* once the provider answers/);
+    const before = h.store.getCandidate(missionId)!.identity;
+    const agentCalls = h.calls.agent;
+
+    providerUp = true;
+    h.store.resumeMission(missionId, "provider answers again");
+    const resumed = await h.orchestrator.repairBlockedMission(missionId);
+
+    assert.equal(resumed.status, "COMPLETE");
+    assert.equal(h.calls.agent, agentCalls, "the candidate was not touched");
+    assert.equal(repairTasks(h, missionId).length, 0);
+    const after = h.store.getCandidate(missionId)!.identity;
+    assert.equal(after.candidateSha, before.candidateSha);
+    assert.equal(after.diffHash, before.diffHash);
+  });
+
+  it("resumes a legacy REVIEW_FAILED classification with a provider-error reason without repair tasks", async () => {
+    let providerUp = false;
+    const h = harness({ review: () => (providerUp ? "ok" : failed("Connection error.")) });
+    const { missionId } = await run(h);
+    const failedReview = h.store
+      .listTasks(missionId)
+      .filter((task) => task.kind === "review")
+      .at(-1)!;
+    // Production missions blocked before this fix carry the hard-coded gate category.
+    h.store.classifyFailure(
+      new FailureClassifier().classify({
+        missionId,
+        taskId: failedReview.task_id,
+        executionId: failedReview.assigned_execution_id,
+        summary: failedReview.failure_reason ?? "failed",
+        category: "REVIEW_FAILED",
+        observedAt: new Date().toISOString(),
+      }),
+    );
+
+    providerUp = true;
+    h.store.resumeMission(missionId, "operator resume");
+    const resumed = await h.orchestrator.repairBlockedMission(missionId);
+
+    assert.equal(resumed.status, "COMPLETE");
+    assert.equal(repairTasks(h, missionId).length, 0);
+    assert.equal(
+      h.store.listRecoveryDecisions(missionId).some((decision) => decision.action === "CREATE_REPAIR_TASKS"),
+      false,
+    );
+  });
+
+  it("does not treat an implementer that merely mentions grammar as a provider failure", () => {
+    const classifier = new FailureClassifier();
+    for (const summary of [
+      "worker emitted garbage: invalid worker output, grammar rules violated",
+      "implementation defect: the expression grammar is wrong",
+    ]) {
+      const category = classifier.classify({ missionId: "MSN-x", summary }).category;
+      assert.ok(["INVALID_WORKER_OUTPUT", "IMPLEMENTATION_DEFECT"].includes(category), `${summary} -> ${category}`);
+    }
   });
 });
