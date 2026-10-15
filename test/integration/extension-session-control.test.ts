@@ -152,15 +152,20 @@ test("housekeeping is deferred past session_start and a shutdown cancels it befo
   process.env.PI_SELF_UPDATE = "0";
   process.env.PI_PANEL_AUTO_OPEN = "0";
   process.env.PI_PANEL_NARRATOR = "0";
-  // A logging wrapper around the real git records every spawn, so "no git
+  // A logging wrapper around the real git records spawns tagged by the sweep
+  // (other session-start git use is not housekeeping and may race), so "no git
   // child was started" is observable rather than inferred from handles.
   execFileSync("git", ["init", "-q", root]);
   const spawnLog = join(root, "git-spawns.log");
   const realGit = execFileSync("which", ["git"], { encoding: "utf8" }).trim();
   await mkdir(join(root, "bin"));
-  await writeFile(join(root, "bin", "git"), `#!/bin/sh\necho "$@" >> '${spawnLog}'\nexec '${realGit}' "$@"\n`, {
-    mode: 0o755,
-  });
+  await writeFile(
+    join(root, "bin", "git"),
+    `#!/bin/sh\n[ -n "$PI_HOUSEKEEPING_SWEEP" ] && echo "sweep $@" >> '${spawnLog}'\nexec '${realGit}' "$@"\n`,
+    {
+      mode: 0o755,
+    },
+  );
   const oldPath = process.env.PATH;
   process.env.PATH = `${join(root, "bin")}:${oldPath}`;
   process.env.PI_HOUSEKEEPING_FIRST_RUN_MS = "60000";
@@ -205,9 +210,9 @@ test("housekeeping is deferred past session_start and a shutdown cancels it befo
     await new Promise((r) => setTimeout(r, 500));
     assert.equal(handles().length, before, "no housekeeping timer or git child pipe remains after shutdown");
     assert.equal(
-      (existsSync(spawnLog) ? readFileSync(spawnLog, "utf8") : "").includes("worktree list"),
+      (existsSync(spawnLog) ? readFileSync(spawnLog, "utf8") : "").includes("sweep "),
       false,
-      "housekeeping started no worktree discovery before or after shutdown",
+      "housekeeping sweep started no worktree discovery before or after shutdown",
     );
   } finally {
     process.env.PATH = oldPath;
