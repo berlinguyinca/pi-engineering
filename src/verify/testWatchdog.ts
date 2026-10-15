@@ -16,10 +16,10 @@ import { readFileSync } from "node:fs";
  * Verifier-spawned process group) happens in `runWithInactivityGuard`, whose
  * 15 minute no-output guard stays as the backstop.
  *
- * `wallMs` (30 min by default here) is a total-duration limit and is applied
- * only when a stage opts in with an explicit value: missions are not bound by
- * fixed wall-clock windows (docs/mission-time-limits.md), so no stage is cut off
- * for running long while it keeps making progress.
+ * There is deliberately no total-duration (wall-clock) limit: missions are not
+ * bound by fixed wall-clock windows (docs/mission-time-limits.md), so a stage is
+ * only ever cut off for going silent, never for running long while it keeps
+ * making progress.
  */
 
 export interface TestWatchdogConfig {
@@ -29,15 +29,12 @@ export interface TestWatchdogConfig {
   investigateMs: number;
   /** Silence after which the stage is `stalled`. */
   stallMs: number;
-  /** Total-duration limit; only enforced when set explicitly on the stage. */
-  wallMs?: number | undefined;
 }
 
 export const DEFAULT_TEST_WATCHDOG: Readonly<TestWatchdogConfig> = {
   warnMs: 120_000,
   investigateMs: 300_000,
   stallMs: 600_000,
-  wallMs: 1_800_000,
 };
 
 /** Per-stage settings: any threshold may be overridden; `sampleMs` is how often the group is sampled. */
@@ -99,11 +96,6 @@ export function classify(state: TestWatchdogState, nowMs: number, cfg: TestWatch
   return "progressing";
 }
 
-/** True only when a wall limit is configured and the stage has run that long. */
-export function isWallExceeded(state: TestWatchdogState, nowMs: number, cfg: TestWatchdogConfig): boolean {
-  return cfg.wallMs !== undefined && nowMs - state.startedAtMs >= cfg.wallMs;
-}
-
 const TEST_EVENT_LINE =
   /^(?:\s*(?:# Subtest:|ok \d+|not ok \d+)|test \S.* \.\.\. \S+|\S+::\S+ (?:PASSED|FAILED|SKIPPED|ERROR)|(?:--- )?(?:PASS|FAIL|RUN)[: ] ?\S+)/;
 
@@ -122,9 +114,7 @@ export function resolveStageWatchdog(stage: {
   if (stage.watchdog === false) return undefined;
   const isTestStage = stage.name === "test" || stage.name.startsWith("test:");
   if (!isTestStage && stage.watchdog === undefined) return undefined;
-  // The default wall limit is NOT inherited: a wall is an explicit opt-in.
-  const { wallMs: _defaultWall, ...thresholds } = DEFAULT_TEST_WATCHDOG;
-  const merged = { ...thresholds, ...stage.watchdog };
+  const merged = { ...DEFAULT_TEST_WATCHDOG, ...stage.watchdog };
   return { ...merged, sampleMs: stage.watchdog?.sampleMs ?? DEFAULT_SAMPLE_MS };
 }
 
