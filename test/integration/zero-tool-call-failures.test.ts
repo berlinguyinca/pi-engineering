@@ -12,6 +12,7 @@ import type { BrokerBackends } from "../../src/orchestration/broker.ts";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
 import { Orchestrator } from "../../src/orchestration/orchestrator.ts";
 import { realBackends } from "../../src/orchestration/realBackends.ts";
+import { MissionSupervisor } from "../../src/orchestration/supervisor.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 import { DEFAULT_GATEWAY_RESILIENCE, type GatewayResilienceConfig } from "../../src/resilience/config.ts";
 import type { ProbeResult } from "../../src/resilience/probe.ts";
@@ -202,6 +203,29 @@ describe("zero-tool-call provider failures are not task attempts", () => {
     assert.equal(h.agentCalls(), 3);
     assert.equal(h.implementer().attempt, 0);
     assert.ok(!h.statuses.includes("BLOCKED"));
+  });
+
+  it("the supervisor snapshot names the zero-tool-call wait, its count, cap, class and next probe", async () => {
+    const controller = new AbortController();
+    let snapshot: Promise<Awaited<ReturnType<MissionSupervisor["tick"]>>> | undefined;
+    const h = harness({
+      agent: () => connectionError(0),
+      probe: () => ({ healthy: true, authoritative: false }),
+      resilience: { ...DEFAULT_GATEWAY_RESILIENCE, max_zero_tool_retries: 5 },
+      onSleep: (_ms, sleeps) => {
+        if (sleeps === 3) {
+          snapshot = new MissionSupervisor({ store: h.store }).tick(h.store.listMissions()[0]!.mission_id);
+          controller.abort();
+        }
+      },
+    });
+    await h.start(controller.signal);
+    const [status] = await snapshot!;
+    assert.match(
+      status!.nextAction,
+      /^waiting for provider: \d+\/5 zero-tool-call retries \(connection error\); next probe at \d{4}-/,
+    );
+    assert.ok(status!.nextActionAt);
   });
 
   it("an implementer that ran tools and then failed still consumes attempts and ends BLOCKED as before", async () => {

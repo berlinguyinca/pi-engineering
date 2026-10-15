@@ -255,7 +255,13 @@ export class MissionSupervisor {
     const diagnosis = this.diagnose(mission);
     if (!diagnosis) {
       this.assertResumptionGeneration(mission.mission_id, expectedResumptionGeneration);
-      return this.status(mission, "HEALTHY", "Mission has current ownership or a named future wait");
+      return this.status(
+        mission,
+        "HEALTHY",
+        "Mission has current ownership or a named future wait",
+        undefined,
+        this.currentWait(mission.mission_id),
+      );
     }
 
     this.assertResumptionGeneration(mission.mission_id, expectedResumptionGeneration);
@@ -324,6 +330,20 @@ export class MissionSupervisor {
           preservedWork: this.preservedWork(mission.mission_id),
         }
       : result;
+  }
+
+  /** The open named wait (probe/backoff, requirement, persistence) of the current resumption, if any. */
+  private currentWait(missionId: string): RecoveryDecision | undefined {
+    const generation = this.store.listMissionResumptions(missionId).at(-1)?.generation ?? 0;
+    return this.store
+      .listRecoveryDecisions(missionId)
+      .filter(
+        (decision) =>
+          (decision.resumptionGeneration ?? 0) === generation &&
+          WAIT_ACTIONS.has(decision.action) &&
+          (decision.status === "planned" || decision.status === "started"),
+      )
+      .at(-1);
   }
 
   private diagnose(mission: Mission): Diagnosis | null {

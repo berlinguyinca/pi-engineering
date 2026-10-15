@@ -194,6 +194,23 @@ A released mission uses role pins and the router until you switch models again.
 Automatic fallback of the interactive model (`PI_GATEWAY_MODEL_FALLBACK_ENABLED`)
 is still off by default, and a switch it makes is not an operator pin.
 
+### Provider failures before any tool call
+
+An implementer execution that fails on the provider (connection error, timeout,
+5xx, a gateway capacity hold or alternate-route retry) before any tool call ran
+has no side effects, so it does not consume a task attempt. The mission parks in
+`WAITING_FOR_LLM`; its `nextAction` reads for example "waiting for provider: 3/20
+zero-tool-call retries (connection error); next probe at ...", and the task
+re-runs when the recovery probe allows. Unless you pinned a model, the next run
+may use another eligible model. A pinned model is waited on rather than
+switched (see "Switching the model a mission uses" above).
+
+`PI_GATEWAY_MAX_ZERO_TOOL_RETRIES` (`max_zero_tool_retries`, default 20) is how
+many such relaunches a task gets at normal pacing. Past it the mission keeps
+waiting in `WAITING_FOR_LLM` and relaunches only on an authoritative healthy
+probe; it is never `BLOCKED` for this. Executions that ran tools count as
+attempts as before.
+
 ### Interrupting and cancelling a mission
 
 Pressing Esc while the `mission` tool or `/mission` runs **pauses** the mission

@@ -283,6 +283,8 @@ export class MissionScheduler {
   private readonly outageStartedAt = new Map<string, number>();
   private readonly relaunches = new Map<string, number>();
   /**
+   * In-memory: resets on controller restart (which leads to CONTROLLER_DISCONNECTED
+   * recovery, not a lost mission).
    * Relaunches per task after executions that failed on the provider before any
    * tool call ran. These are not task attempts and not outage relaunches.
    */
@@ -810,6 +812,7 @@ export class MissionScheduler {
             if (res.paused) return;
             if (res.retry) {
               let waitMs = res.waitMs;
+              let waitReason: string | undefined;
               if (zeroTool) {
                 const retries = (this.zeroToolRetries.get(task.task_id) ?? 0) + 1;
                 this.zeroToolRetries.set(task.task_id, retries);
@@ -828,6 +831,10 @@ export class MissionScheduler {
                     terminal: false,
                   });
                 }
+                const failureClass = /connection error/i.test(outcome.summary ?? "")
+                  ? "connection error"
+                  : (outcome.error ?? "provider failure").replace(/^transient:/, "").replace(/_/g, " ");
+                waitReason = `waiting for provider: ${Math.min(retries, cap)}/${cap} zero-tool-call retries (${failureClass}); next probe at ${new Date(this.clockNow() + waitMs).toISOString()}`;
                 // Not a task attempt: the next run reuses this attempt number.
                 attempt--;
               }
@@ -843,6 +850,7 @@ export class MissionScheduler {
                   observedAt: new Date(this.clockNow()).toISOString(),
                 },
                 this.clockNow() + waitMs,
+                waitReason,
               );
               if (recoveryStop) {
                 authority?.assertAuthoritative();
@@ -1026,6 +1034,7 @@ export class MissionScheduler {
     task: OrchestrationTask,
     evidence: FailureEvidence,
     nextActionAt?: number,
+    waitReason?: string,
   ): Promise<string | null> {
     const classification = this.failureClassifier.classify(evidence);
     if (!this.store.getFailureClassification(classification.classificationId)) {
@@ -1036,6 +1045,7 @@ export class MissionScheduler {
       history: this.store.listRecoveryDecisions(task.mission_id),
       now: this.clockNow(),
       ...(nextActionAt !== undefined ? { nextActionAt } : {}),
+      ...(waitReason !== undefined ? { waitReason } : {}),
       resumptionGeneration: this.store.listMissionResumptions(task.mission_id).at(-1)?.generation ?? 0,
     });
     const persisted = this.store.getRecoveryDecision(decision.recoveryId) ?? this.store.planRecovery(decision);

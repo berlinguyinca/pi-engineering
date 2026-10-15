@@ -41,6 +41,8 @@ export interface RecoveryDecisionInput {
   now: number;
   /** When the planned wait ends (epoch ms); defaults to `now`. */
   nextActionAt?: number;
+  /** Operator-facing reason for a PROBE_AND_BACKOFF wait; replaces the generic expected change. */
+  waitReason?: string;
   resumptionGeneration?: number;
 }
 
@@ -553,7 +555,7 @@ export class RecoveryPlanner {
       missionId: input.classification.missionId,
       classificationId: input.classification.classificationId,
       action,
-      expectedMaterialChange: exhaustedReason,
+      expectedMaterialChange: action === "PROBE_AND_BACKOFF" && input.waitReason ? input.waitReason : exhaustedReason,
       attempt,
       maxAttempts: this.strategyMaxAttempts,
       deadline,
