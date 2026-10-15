@@ -1231,7 +1231,7 @@ describe("orchestrator: durable blocked-mission repair", () => {
       attempt: 1,
       maxAttempts: 2,
       deadline: null,
-      nextActionAt: null,
+      nextActionAt: "2026-09-27T00:00:01.000Z",
       status: "planned",
       decidedAt: "2026-09-27T00:00:01.000Z",
       failureFingerprint: classification.fingerprint,
