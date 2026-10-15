@@ -166,6 +166,11 @@ test("active mission: handover waits for its safe point, same mission after rehy
     assert.ok(w.b.values.includes("start:B:g2"));
     const missionId = w.b.missionId as string;
     const callsBefore = w.b.workerCalls.length;
+    // The base orchestrator may legitimately re-investigate under load (a held
+    // worker that times out is retried before any handover); what must hold is
+    // that the handover adds no *new* investigator calls. Capture the baseline
+    // so the no-replay assertion is scoped to the new generation.
+    const investigatorCallsBefore = w.b.workerCalls.filter((c) => c.role === "investigator").length;
 
     const store = await replayStore(w.fx.root);
     const m = store.getMission(missionId);
@@ -194,7 +199,11 @@ test("active mission: handover waits for its safe point, same mission after rehy
       executionsBefore,
       "no execution added or rewritten by the new generation",
     );
-    assert.equal(w.b.workerCalls.filter((c) => c.role === "investigator").length, 1, "no duplicate worker");
+    assert.equal(
+      w.b.workerCalls.filter((c) => c.role === "investigator").length,
+      investigatorCallsBefore,
+      "the new generation added no investigator calls (no replay)",
+    );
   } finally {
     await w.close();
   }

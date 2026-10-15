@@ -60,7 +60,10 @@ function scripted(req: ChatRequestRecord, inFlight: { now: number; max: number }
     // Solo modes get the whole mission; the planner-model-alone run (B) forgets b.
     const files =
       id === "a" ? [FILES.a] : id === "b" ? [FILES.b] : req.model === "flash-a" ? [FILES.a] : [FILES.a, FILES.b];
-    return { content: JSON.stringify({ status: "completed", summary: "ok", files }), delayMs: 120, track: inFlight };
+    // Long enough (even under full-suite event-loop contention) for mode D's two
+    // implementer workers to overlap so the concurrency assertion observes the
+    // intended parallelism instead of a load-induced serialization artifact.
+    return { content: JSON.stringify({ status: "completed", summary: "ok", files }), delayMs: 600, track: inFlight };
   }
   return { content: JSON.stringify({ status: "pass", issues: [], required_changes: [] }) };
 }

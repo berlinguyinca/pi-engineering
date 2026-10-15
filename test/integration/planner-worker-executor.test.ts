@@ -129,7 +129,11 @@ test("plan -> parallel implement -> review -> integrate, with planner and implem
       const id = taskOf(req);
       inFlight++;
       maxInFlight = Math.max(maxInFlight, inFlight);
-      await new Promise((r) => setTimeout(r, 150));
+      // Long enough (even under full-suite event-loop contention) that a second
+      // independent contract's dispatch reliably reaches this handler while the
+      // first is still in flight, so the concurrency assertion observes the
+      // intended overlap instead of a load-induced serialization artifact.
+      await new Promise((r) => setTimeout(r, 600));
       inFlight--;
       return {
         content: JSON.stringify({
