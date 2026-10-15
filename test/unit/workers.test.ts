@@ -112,8 +112,8 @@ test("compaction truncates ordinary context but preserves the complete durable r
 test("review_result tool is a terminating tool with a machine-checkable verdict", async () => {
   assert.equal(reviewResultTool.name, "review_result");
   const schema = reviewResultTool.parameters as { properties?: Record<string, unknown> };
-  const verdict = schema.properties?.verdict as { anyOf?: Array<{ const?: string }> } | undefined;
-  const allowed = (verdict?.anyOf ?? []).map((v) => v.const).filter(Boolean);
+  const verdict = schema.properties?.verdict as { enum?: string[] } | undefined;
+  const allowed = verdict?.enum ?? [];
   assert.ok(allowed.includes("approve") && allowed.includes("request_changes"));
   assert.ok((schema.properties as Record<string, unknown>).findings, "findings array expected");
 });

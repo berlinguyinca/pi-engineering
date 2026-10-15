@@ -649,3 +649,48 @@ describe("realBackends validation with no verification targets", () => {
     }
   });
 });
+
+describe("reviewer model takeover on an operator switch to the same model", () => {
+  it("keeps the session and does not announce a switch when the next model is the current one", async () => {
+    const { MODEL_SUPERSEDED } = await import("../../src/workers/WorkerExecutor.ts");
+    const model = { provider: "beast", id: "qwen3.8-27b-q4" };
+    const sessions: Array<string | undefined> = [];
+    let calls = 0;
+    const worker = {
+      async run(req: WorkerRequest) {
+        sessions.push(req.sessionId);
+        calls++;
+        const base = { claims: [], evidence_refs: [], new_hypotheses: [], proposed_tasks: [], details: {} };
+        if (calls === 1) {
+          return { result: { ...base, status: "failed", summary: "switched", error: MODEL_SUPERSEDED }, usage: null };
+        }
+        return {
+          result: { ...base, status: "completed", summary: "reviewed" },
+          usage: null,
+          structured: { verdict: "approve", findings: [], missingTests: [], specGaps: [], acceptanceResults: [] },
+        };
+      },
+    } as unknown as WorkerExecutor;
+    const activity: string[] = [];
+    const backends = realBackends({
+      worker,
+      verifier: {} as never,
+      artifacts: { readContentByUri: async () => undefined } as never,
+      git: null,
+      cwd: "/repo",
+      routeModel: async () => model,
+      currentOperatorPin: () => model,
+    });
+    const outcome = await backends.review.runReview({
+      objective: "review",
+      missionId: "MSN-same",
+      signal: new AbortController().signal,
+      onActivity: (event) => activity.push(String(event.summary)),
+    });
+    assert.equal(calls, 2);
+    assert.equal(sessions[0], sessions[1], "the same session continues");
+    assert.ok(!activity.some((line) => /operator switched/.test(line)), "no switch is logged");
+    assert.doesNotMatch(outcome.summary, /operator switched/);
+    assert.equal(outcome.reviewEvidence?.outputValid, true);
+  });
+});
