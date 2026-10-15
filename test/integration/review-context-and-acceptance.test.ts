@@ -435,6 +435,17 @@ test("moving the candidate branch or planting a hook fails the review; ignored o
   }
 });
 
+test("request_changes with a sloppy findings envelope still keeps its findings for repair", async () => {
+  const { outcome } = await review({
+    ...base,
+    verdict: "request_changes",
+    findings: [{ severity: "critical", title: "", detail: "auth bypass" }],
+    acceptance_results: [],
+  });
+  assert.equal(outcome.reviewEvidence?.outputValid, false);
+  assert.equal(outcome.findings?.length, 1, "the reviewer's own request_changes findings are not discarded");
+});
+
 test("request_changes with a blocking finding stays a valid verdict without acceptance_results", async () => {
   const { outcome } = await review({
     ...base,

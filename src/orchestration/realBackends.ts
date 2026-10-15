@@ -1176,8 +1176,10 @@ export function realBackends(opts: RealBackendsOptions) {
           outcome.error = `${INVALID_WORKER_OUTPUT_PREFIX}: ${
             mutation ?? `the reviewer's review_result was missing or malformed (${invalidReasons.join(", ")})`
           }`;
-          // Findings stay on the evidence for diagnostics, but must not become repair work.
-          outcome.findings = [];
+          // An unreadable approval says nothing, so its half-parsed findings must not become
+          // repair work. A request_changes verdict is the reviewer's own statement: its
+          // findings stay on the mission record and drive repair even if the envelope was sloppy.
+          if (verdict !== "request_changes" || mutation) outcome.findings = [];
         }
         return outcome;
       },
