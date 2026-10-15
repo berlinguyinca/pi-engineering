@@ -1,3 +1,4 @@
+import { connect } from "node:net";
 import { join } from "node:path";
 import type { Model } from "@earendil-works/pi-ai/compat";
 import {
@@ -648,21 +649,44 @@ ${TOOL_TRANSITION_RULE}`;
       >;
       try {
         transientOutcome = await withTransientRetry({
-          fn: () =>
-            this.runSingleAttempt(
-              req,
-              model,
-              // A retry of a generation that already ran tool calls carries the
-              // evidence block: the executed edits/commits are LISTED, never
-              // replayed (spec §6). Nothing is re-executed by the runtime.
-              attempt === 0 ? systemPrompt : withIdempotencyEvidence(systemPrompt, this.trackerFor(req)),
-              modelRuntime,
-              customTools,
-              tools,
-              attempt,
-              guardConfig,
-            ),
-          config: this.transientConfig,
+          fn: async () => {
+            try {
+              return await this.runSingleAttempt(
+                req,
+                model,
+                // A retry of a generation that already ran tool calls carries the
+                // evidence block: the executed edits/commits are LISTED, never
+                // replayed (spec §6). Nothing is re-executed by the runtime.
+                attempt === 0 ? systemPrompt : withIdempotencyEvidence(systemPrompt, this.trackerFor(req)),
+                modelRuntime,
+                customTools,
+                tools,
+                attempt,
+                guardConfig,
+              );
+            } catch (error) {
+              // A pinned gate role is waited on, except when its host refuses
+              // connections or does not resolve: that is not retried in-session.
+              if (
+                GATE_ROLES.has(req.role) &&
+                req.operatorPinned &&
+                classifyError(error).category === "network" &&
+                (await connectRefused(model.baseUrl))
+              ) {
+                throw new ConnectRefusedError(error);
+              }
+              throw error;
+            }
+          },
+          // An operator-pinned gate role is waited on, so it keeps the full policy.
+          config:
+            GATE_ROLES.has(req.role) && !req.operatorPinned
+              ? { ...this.transientConfig, maxAttempts: Math.min(this.transientConfig.maxAttempts, gateRetryCap()) }
+              : this.transientConfig,
+          classify: (error) =>
+            error instanceof ConnectRefusedError
+              ? { category: "network", retryable: false, reason: "connection refused" }
+              : classifyError(error),
           sleep: this.transientSleep,
           rand: this.transientRand,
         });
@@ -705,7 +729,15 @@ ${TOOL_TRANSITION_RULE}`;
             proposed_tasks: [],
             // Name the model the attempt ran on: unrouted work runs on the
             // executor default, and a model takeover must mark that model.
-            details: { transient_category: category, attempts, model: { provider: model.provider, id: model.id } },
+            details: {
+              transient_category: category,
+              attempts,
+              model: { provider: model.provider, id: model.id },
+              // The connection itself failed (refused, reset, unresolvable), as
+              // opposed to a stall, a timeout or a server verdict.
+              ...(category === "network" && CONNECT_LEVEL.test(detail) ? { connect_level: true } : {}),
+              ...(te instanceof ConnectRefusedError ? { connect_refused: true } : {}),
+            },
             error: `transient:${category}`,
           },
           usage: null,
@@ -1539,6 +1571,63 @@ const PROSE_ROLES: ReadonlySet<WorkerRole> = new Set<WorkerRole>([
   "scout",
   "summarizer",
 ]);
+
+/**
+ * Gate roles judge work and have no side effects, so a dead route must not be
+ * waited on in-session: after this many transient retries the failure goes to
+ * the backend, which moves the role to another route. Implementers keep the
+ * full transient policy.
+ */
+const GATE_ROLES: ReadonlySet<WorkerRole> = new Set<WorkerRole>([
+  "reviewer",
+  "architecture-reviewer",
+  "security-review",
+  "performance-review",
+  "clean-room-challenger",
+]);
+
+/** In-session transient retries a gate role gets (`PI_GUARD_GATE_TRANSIENT_MAX_ATTEMPTS`, default 2). */
+function gateRetryCap(env: Record<string, string | undefined> = process.env): number {
+  const raw = env.PI_GUARD_GATE_TRANSIENT_MAX_ATTEMPTS;
+  const n = raw ? Number(raw) : Number.NaN;
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 2;
+}
+
+const CONNECT_LEVEL = /connection error|econn(?:refused|reset)|enotfound|eai_again|fetch failed|socket hang up/i;
+
+/** A gate role's attempt failed on a host that refuses connections or does not resolve. */
+class ConnectRefusedError extends Error {
+  constructor(cause: unknown) {
+    super(cause instanceof Error ? cause.message : String(cause), { cause });
+    this.name = "ConnectRefusedError";
+  }
+}
+
+/** True only when a TCP connect to the provider is refused or its host does not resolve. */
+function connectRefused(baseUrl: string | undefined): Promise<boolean> {
+  return new Promise((resolve) => {
+    let url: URL;
+    try {
+      url = new URL(baseUrl ?? "");
+    } catch {
+      resolve(false);
+      return;
+    }
+    const socket = connect({
+      host: url.hostname.replace(/^\[|\]$/g, ""),
+      port: Number(url.port) || (url.protocol === "https:" ? 443 : 80),
+    });
+    const done = (refused: boolean) => {
+      socket.destroy();
+      resolve(refused);
+    };
+    socket.setTimeout(2000, () => done(false));
+    socket.once("connect", () => done(false));
+    socket.once("error", (err: NodeJS.ErrnoException) =>
+      done(err.code === "ECONNREFUSED" || err.code === "ENOTFOUND" || err.code === "EAI_AGAIN"),
+    );
+  });
+}
 
 /**
  * A review must inspect evidence and write concrete findings. It should never
