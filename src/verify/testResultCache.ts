@@ -6,7 +6,7 @@ import { basename, join } from "node:path";
 import { promisify } from "node:util";
 import type { StageRun } from "./Verifier.ts";
 
-const exec = promisify(execFile);
+const run = promisify(execFile);
 
 /**
  * Fingerprinted test result cache (autospec R-WATCH, issue #149).
@@ -99,7 +99,7 @@ export function fingerprint(input: FingerprintInput): string {
 }
 
 async function git(cwd: string, args: string[], env?: NodeJS.ProcessEnv): Promise<string> {
-  const { stdout } = await exec("git", ["-C", cwd, ...args], {
+  const { stdout } = await run("git", ["-C", cwd, ...args], {
     maxBuffer: 64 * 1024 * 1024,
     ...(env ? { env } : {}),
   });
@@ -144,7 +144,7 @@ export async function lockfileHashes(cwd: string): Promise<Record<string, string
 export async function toolchainString(tools: readonly string[]): Promise<string> {
   const lines: string[] = [];
   for (const tool of tools) {
-    const version = await exec(tool, ["--version"], { timeout: 10_000 }).then(
+    const version = await run(tool, ["--version"], { timeout: 10_000 }).then(
       (r) => r.stdout.trim().split("\n")[0] ?? "",
       () => "absent",
     );
