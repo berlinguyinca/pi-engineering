@@ -1,11 +1,8 @@
-import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { resolve } from "node:path";
-import { promisify } from "node:util";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 
-const execFileAsync = promisify(execFile);
 import type { Model } from "@earendil-works/pi-ai/compat";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { resolveMemoryEnvironment } from "../src/blackhole/connectionSetup.ts";
@@ -14,13 +11,16 @@ import { registerInteractiveMemory } from "../src/blackhole/interactiveMemory.ts
 import { registerAutoCompaction } from "../src/compaction/autoTune.ts";
 import { type InferweaveProvider, createInferweaveProvider, inferweaveConfigFromEnv } from "../src/context/provider.ts";
 import { contextReading, planModelSwitch } from "../src/context/usage.ts";
+import { AdvisedModelSwitch } from "../src/gateway/advisedSwitch.ts";
 import { AfterOutputRetry } from "../src/gateway/afterOutputRetry.ts";
 import { sharedAdmissionController, sharedGatewayConfig } from "../src/gateway/config.ts";
 import {
   type FallbackApplyDeps,
   type FallbackContext,
   FallbackCoordinator,
+  type PendingFallback,
   applyPendingFallback,
+  previewFallback,
 } from "../src/gateway/fallbackLifecycle.ts";
 import {
   installGatewayStreamRetry,
@@ -28,6 +28,7 @@ import {
   isGatewayStreamRetryLive,
 } from "../src/gateway/installStreamRetry.ts";
 import {
+  advisesAlternateModel,
   describeGatewayWait,
   gatewayHoldScope,
   isAccountWideRefusal,
@@ -67,9 +68,14 @@ import { PanelRefreshLoop } from "../src/panel/refreshLoop.ts";
 import { registerPlannerWorker } from "../src/plannerWorker/extension.ts";
 import { redactSecrets } from "../src/platform/redact.ts";
 import { resolveRequestBodyBudgetConfig } from "../src/request/bodyBudget.ts";
-import { resolveThinkingOffConfig } from "../src/request/thinkingPolicy.ts";
+import {
+  type ThinkingContext,
+  isSummarizationRequest,
+  resolveThinkingOffConfig,
+} from "../src/request/thinkingPolicy.ts";
 import { RoadmapEngine } from "../src/roadmap/RoadmapEngine.ts";
 import { EngineeringRuntime, type RuntimeMissionActivityEvent } from "../src/runtime/EngineeringRuntime.ts";
+import { gitRunner } from "../src/runtime/host/sourceWatch.ts";
 import { sessionBindingInfo } from "../src/runtime/isolation/RuntimeBinding.ts";
 import { RuntimeSession } from "../src/runtime/isolation/RuntimeSession.ts";
 import { effectiveWorkspace, workspaceForPath } from "../src/runtime/isolation/WorkspaceResolver.ts";
@@ -1006,16 +1012,8 @@ ${RECOVERY_PROMPT}`;
   const extensionRoot = resolve(new URL("..", import.meta.url).pathname);
   let lastUpdateCheckAt: number | undefined;
 
-  const runGit = async (args: string[]) => {
-    const r = await execFileAsync("git", ["-C", extensionRoot, ...args], { timeout: 30_000 }).catch(
-      (err: { code?: number; stdout?: string; stderr?: string; message?: string }) => ({
-        code: typeof err.code === "number" ? err.code : 1,
-        stdout: err.stdout ?? "",
-        stderr: err.stderr ?? err.message ?? "",
-      }),
-    );
-    return { code: (r as { code?: number }).code ?? 0, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
-  };
+  // The same unattended, tty-less runner the auto-reload watcher uses.
+  const runGit = gitRunner(extensionRoot);
 
   const runSelfUpdate = async (apply: boolean) => {
     lastUpdateCheckAt = Date.now();
@@ -1332,7 +1330,13 @@ ${RECOVERY_PROMPT}`;
     // never a Pi context — so an async gateway callback can update it safely
     // even after the session that raised the hold has been replaced or reloaded.
     // Its own default is also off, keeping the safety boundary fail-closed.
-    const fallbackCoordinator = new FallbackCoordinator({ enabled: gatewayConfig.modelFallbackEnabled });
+    // The gateway's explicit IW-ACT-RETRY-ALTERNATE advice is a separate,
+    // default-on trigger (src/gateway/advisedSwitch.ts): an instruction from
+    // the gateway, not an inference of ours.
+    const fallbackCoordinator = new FallbackCoordinator({
+      enabled: gatewayConfig.modelFallbackEnabled,
+      advisedSwitch: gatewayConfig.advisedModelSwitch,
+    });
 
     // Retry a turn whose stream was cut AFTER partial output (link cut,
     // "terminated"): omit the partial answer and continue, with long-wait
@@ -1394,7 +1398,26 @@ ${RECOVERY_PROMPT}`;
               provider: callModel.provider,
               source: info.signal.source,
               accountWide: isAccountWideRefusal(info.signal),
+              advisesAlternate: advisesAlternateModel(info.signal),
+              retryAfterMs: info.signal.retryAfterMs,
             });
+          },
+          // An advised hold with a switch armed is not waited out: the pump
+          // settles with the advice and the settle boundary switches models and
+          // continues the turn on the stand-in (AdvisedModelSwitch below).
+          // The cooldown is still recorded (without sleeping): the model being
+          // left is out of capacity, and workers or parallel sessions on it
+          // must not walk straight back into the refusal this turn is leaving.
+          // Plain data only, for the same lifecycle reason as `onHold`.
+          // Only the agent turn: a summary or compaction call never reaches
+          // the settle boundary, so abandoning it would fail the compaction
+          // with nobody to continue it. Those wait the hold out as before.
+          abandonForAlternate: (info, actualModel, context) => {
+            if (!(fallbackCoordinator.willSwitchOnAdvice && fallbackCoordinator.hasPending)) return false;
+            if (isSummarizationRequest(context as ThinkingContext)) return false;
+            const callModel = actualModel as Model<any>;
+            admission.noteWait({ ...info.signal, provider: callModel.provider, model: callModel.id });
+            return true;
           },
           maxElapsedMs: gatewayConfig.maxElapsedMs,
           // Fit every request body to the gateway's cap (advertised, else
@@ -1437,9 +1460,21 @@ ${RECOVERY_PROMPT}`;
     // `pi.setModel` — all against a currently-valid context. A failure here is
     // caught and logged (by the caller), so a fallback problem degrades the
     // feature rather than terminating Pi.
-    const applyPendingFallbackWithFreshCtx = async (ctx: FallbackContext): Promise<void> => {
-      const pending = fallbackCoordinator.claimPending();
-      if (!pending) return;
+    // Preview, against a FRESH ctx, whether a stand-in exists for the current
+    // model, and record the answer as a plain boolean the hold path may read.
+    // Without a stand-in on record an advised hold is waited out as before —
+    // abandoning it would turn a slow turn into a failed one.
+    const refreshStandIn = async (ctx: FallbackContext): Promise<void> => {
+      let available = false;
+      try {
+        available = await previewFallback(ctx, { excludeIds: fallbackCoordinator.excludedModelIds });
+      } catch {
+        // Treated as "no stand-in": the hold is then waited out, never abandoned.
+      }
+      fallbackCoordinator.noteStandIn(available);
+    };
+
+    const applyClaimedFallback = async (ctx: FallbackContext, pending: PendingFallback) => {
       const result = await applyPendingFallback(
         {
           // Our own fallback switch is not an operator choice: missions must
@@ -1460,10 +1495,49 @@ ${RECOVERY_PROMPT}`;
       );
       // A successful switch means the new model gets a clean ledger; the
       // stand-in's own outage must start its own count, not inherit the one
-      // that triggered this switch. A "stay" keeps the count so the next hold
-      // re-arms the pending flag and the choice is reconsidered.
-      if (result.switched) fallbackCoordinator.onProgress();
+      // that triggered this switch — while the model just left stays excluded
+      // for SWITCHED_FROM_TTL_MS. A "stay" keeps the count so the next hold re-arms
+      // the pending flag and the choice is reconsidered. The preview is redone
+      // for the new model so a second advised hold knows where it could go.
+      // A stay re-previews too: the record that armed this switch was wrong,
+      // and the next advised hold must be waited out rather than abandoned on
+      // the same stale answer.
+      if (result.switched) fallbackCoordinator.onSwitched(result.currentId);
+      await refreshStandIn(ctx);
+      return result;
     };
+
+    const applyPendingFallbackWithFreshCtx = async (ctx: FallbackContext): Promise<void> => {
+      const pending = fallbackCoordinator.claimPending();
+      if (!pending) return;
+      await applyClaimedFallback(ctx, pending);
+    };
+
+    // The mid-turn half of the advised switch: at the settle boundary of a
+    // turn the pump abandoned on IW-ACT-RETRY-ALTERNATE, switch models against
+    // that callback's fresh ctx and continue the turn on the stand-in. Only
+    // registered when the feature is on: with it off, a pending fallback from
+    // the opt-in hold-count path must wait for before_agent_start as before,
+    // not switch mid-turn through this door.
+    if (gatewayConfig.advisedModelSwitch) {
+      new AdvisedModelSwitch({
+        claimPending: () => fallbackCoordinator.claimPending(),
+        apply: applyClaimedFallback,
+        // The wait the pump skipped, taken by the gateway wrapper before the
+        // continued request (the same seam AfterOutputRetry uses).
+        oweWait: (ctx, delayMs, attempt) => {
+          const m = ctx.model;
+          if (!m) return;
+          afterOutputRetry.owe(
+            { provider: m.provider, id: m.id },
+            delayMs,
+            attempt,
+            "gateway capacity",
+            `${m.id} is out of capacity and no other model fits this session`,
+          );
+        },
+      }).register(pi as never);
+    }
 
     // Per (provider, api): `composeModelProvider` only dispatches to our
     // handler when the model's api matches the one registered, so a switch to a
@@ -1476,8 +1550,9 @@ ${RECOVERY_PROMPT}`;
     // land before the first provider call — `before_provider_request` fires
     // from inside the provider's own stream call, which is already too late for
     // that request.
-    pi.on("session_start", (_event, ctx) => {
+    pi.on("session_start", async (_event, ctx) => {
       installStreamRetry(ctx, ctx.model);
+      await refreshStandIn(ctx as FallbackContext);
     });
     pi.on("before_agent_start", async (_event, ctx) => {
       installStreamRetry(ctx, ctx.model);
@@ -1493,13 +1568,22 @@ ${RECOVERY_PROMPT}`;
       } catch (error) {
         console.error("[pi-engineering] fallback application failed", error);
       }
+      // Cheap and local (no readiness probe): the catalogue and the measured
+      // context size, so the hold path knows whether an advised hold is worth
+      // abandoning for a switch.
+      await refreshStandIn(ctx as FallbackContext);
     });
-    pi.on("model_select", (event, ctx) => {
-      // A switch — ours or the operator's — supersedes any stale fallback
-      // intent and the hold ledger; otherwise one model's outage would switch
-      // away from the model the operator just chose.
-      fallbackCoordinator.onModelSelect();
+    pi.on("model_select", async (event, ctx) => {
+      // An operator's switch supersedes any stale fallback intent and the hold
+      // ledger; otherwise one model's outage would switch away from the model
+      // the operator just chose. Our own switch has already been accounted for
+      // (`onSwitched`), and must keep the model it left excluded.
       installStreamRetry(ctx, event.model);
+      // Our own switch previews again itself, after recording the model it
+      // left; previewing here too would run without that exclusion.
+      if (automaticModelSwitch) return;
+      fallbackCoordinator.onModelSelect();
+      await refreshStandIn(ctx as FallbackContext);
     });
 
     // ─── Model fallback when one model has no workers ──────────────────────

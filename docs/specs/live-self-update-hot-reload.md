@@ -455,6 +455,26 @@ Pi Engineering 0.2.0 · 0.2.1 available
 
 Do not automatically install a new runtime unless explicitly configured.
 
+Two automatic actions are distinct from installation and are on by default
+(amended 2026-10-15; see the notes document, "User-visible behaviour"):
+
+```text
+automatic reload of the checkout Pi loads from, when its HEAD moves: enabled
+automatic fast-forward of a checkout that tracks a remote: enabled
+```
+
+Neither installs a version under `versions/`, and both are limited to the
+checkout the operator already chose to run from: the reload loads what is
+committed there (never during a rebase, merge, bisect or on a detached
+HEAD), and the fast-forward moves only a clean branch that is strictly
+behind the upstream it tracks (never a dirty or diverged one). A session on
+another host that runs from a clone of the repository therefore follows that
+repository without an operator present. The validation stage of an
+installed update does not run for either; the handover's own load, health
+and contract checks (and rollback) do. Operators who want remote code to
+pass validation first keep `PI_ENGINEERING_FOLLOW_REMOTE=0` and use
+`/pie update --channel …`.
+
 ---
 
 # 15. Staging
