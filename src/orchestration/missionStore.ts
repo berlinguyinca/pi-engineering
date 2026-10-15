@@ -103,7 +103,16 @@ export type OrchestrationEventType =
   | "lane.released"
   | "lane.wait"
   | "lane.stale_taken"
-  | "lane.index_corrupt";
+  | "lane.index_corrupt"
+  | "repository.wait"
+  | "repository.wait_cleared";
+
+export interface RepositoryWait {
+  missionId: string;
+  repoId: string;
+  holderMissionId: string;
+  holderOwnerId: string;
+}
 
 const ORCHESTRATION_EVENT_TYPES: ReadonlySet<string> = new Set<OrchestrationEventType>([
   "mission.created",
@@ -163,6 +172,8 @@ const ORCHESTRATION_EVENT_TYPES: ReadonlySet<string> = new Set<OrchestrationEven
   "lane.wait",
   "lane.stale_taken",
   "lane.index_corrupt",
+  "repository.wait",
+  "repository.wait_cleared",
   "lane.acquired",
   "lane.released",
   "lane.wait",
@@ -332,6 +343,8 @@ export class MissionStore {
   private readonly backend: EventStoreBackend;
   private readonly missions = new Map<string, Mission>();
   private readonly tasks = new Map<string, OrchestrationTask>();
+  /** Tasks currently waiting for another mission's repository lease (informational, in-memory). */
+  private readonly repositoryWaits = new Map<string, RepositoryWait>();
   private readonly executions = new Map<string, Execution>();
   private readonly findings = new Map<string, ReviewFinding>();
   private readonly workspaceManifests = new Map<string, WorkspaceManifest>();
@@ -604,6 +617,25 @@ export class MissionStore {
         if (f) this.findings.set(f.finding_id, { ...f });
         break;
       }
+      case "repository.wait": {
+        const p = e.payload as {
+          task_id: string;
+          mission_id: string;
+          repoId: string;
+          holderMissionId: string;
+          holderOwnerId: string;
+        };
+        this.repositoryWaits.set(p.task_id, {
+          missionId: p.mission_id,
+          repoId: p.repoId,
+          holderMissionId: p.holderMissionId,
+          holderOwnerId: p.holderOwnerId,
+        });
+        break;
+      }
+      case "repository.wait_cleared":
+        this.repositoryWaits.delete(e.payload.task_id as string);
+        break;
       case "finding.resolved": {
         const fid = e.payload.finding_id as string;
         const f = this.findings.get(fid);
@@ -1667,6 +1699,33 @@ export class MissionStore {
     payload: Record<string, unknown>,
   ): void {
     this.emit(type, missionId, { actor: "system", ...payload });
+  }
+
+  /** Durably record that a task waits for a repository lease held by another mission. */
+  setRepositoryWait(taskId: string, wait: Omit<RepositoryWait, "missionId">): void {
+    const mission = this.tasks.get(taskId)?.mission_id;
+    if (!mission) return;
+    const current = this.repositoryWaits.get(taskId);
+    if (current && current.holderMissionId === wait.holderMissionId && current.repoId === wait.repoId) return;
+    this.apply(
+      this.emit("repository.wait", mission, { actor: "system", task_id: taskId, ...wait, mission_id: mission }),
+    );
+  }
+
+  clearRepositoryWait(taskId: string): void {
+    const current = this.repositoryWaits.get(taskId);
+    if (!current) return;
+    this.apply(this.emit("repository.wait_cleared", current.missionId, { actor: "system", task_id: taskId }));
+  }
+
+  listRepositoryWaits(missionId: string): Array<RepositoryWait & { taskId: string }> {
+    return [...this.repositoryWaits.entries()]
+      .filter(([, wait]) => wait.missionId === missionId)
+      .map(([taskId, wait]) => ({ taskId, ...wait }));
+  }
+
+  getRepositoryWait(taskId: string): RepositoryWait | undefined {
+    return this.repositoryWaits.get(taskId);
   }
 
   addFinding(finding: Omit<ReviewFinding, "finding_id" | "status" | "created_at">): ReviewFinding {

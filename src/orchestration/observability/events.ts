@@ -283,6 +283,8 @@ export function waitingReasonLabel(reason: WaitingReason): string {
       return "rate limit";
     case "model_request":
       return "model request";
+    case "repository_lease":
+      return "repository lease held by another mission";
     default:
       return "other";
   }

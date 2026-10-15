@@ -711,6 +711,14 @@ worktrees:
   a SQLite (WAL) session registry with generation-fenced leases, and one
   orchestration namespace per git worktree (`worktrees/<worktree-id>/`,
   identified by git common dir + worktree root, never by directory name).
+- **Repository lease scope.** Implementer and repair workers run in their own
+  worktrees under lane (write-domain) coordination only, so several missions can
+  work on one repository at once. The exclusive per-repository lease is taken
+  only to integrate into the candidate and to promote into the shared checkout,
+  and is released right after. A lease held by another mission makes the task
+  wait (the mission snapshot's next action names the holder mission) instead of
+  blocking it; cross-session custody waits back off from 250 ms up to the 5 s
+  poll interval within the same 10 minute ceiling.
 - **Per-session writers.** Each session appends only to its own stream
   (`events/<session-id>.jsonl`); readers see one merged history. There is no
   shared writer lock to contend on, so a second session never disables
