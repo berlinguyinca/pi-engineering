@@ -685,21 +685,25 @@ export class MissionScheduler {
       }
       await this.executeWithRetry(task, signal);
     } finally {
-      if (lease) {
-        this.laneLeases.delete(task.task_id);
-        this.store.recordLaneEvent("lane.released", task.mission_id, {
-          task_id: task.task_id,
-          repo_id: lease.repoId,
-        });
-        await this.lanes.release(lease).catch(() => undefined);
+      try {
+        if (lease) {
+          this.laneLeases.delete(task.task_id);
+          this.store.recordLaneEvent("lane.released", task.mission_id, {
+            task_id: task.task_id,
+            repo_id: lease.repoId,
+          });
+          await this.lanes.release(lease).catch(() => undefined);
+        }
+        // Whatever path ended the task, a terminal task leaves the resilience
+        // window (a paused task stays RETRYING and keeps its park).
+        const status = this.store.getTask(task.task_id)?.status;
+        if (status && ["SUCCEEDED", "FAILED", "BLOCKED", "CANCELED", "SKIPPED"].includes(status)) {
+          this.leaveResilienceWindow(task);
+        }
+      } finally {
+        // Always leave activeTasks: runnable() never re-offers an active task.
+        this.release(task);
       }
-      // Whatever path ended the task, a terminal task leaves the resilience
-      // window (a paused task stays RETRYING and keeps its park).
-      const status = this.store.getTask(task.task_id)?.status;
-      if (status && ["SUCCEEDED", "FAILED", "BLOCKED", "CANCELED", "SKIPPED"].includes(status)) {
-        this.leaveResilienceWindow(task);
-      }
-      this.release(task);
       this.onTaskSettled?.(task.mission_id, task.task_id, this.store.getTask(task.task_id)?.status ?? "FAILED");
     }
   }

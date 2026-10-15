@@ -135,6 +135,38 @@ describe("MissionScheduler dispatch", () => {
   });
 });
 
+describe("MissionScheduler cleanup", () => {
+  it("leaves activeTasks even when the lane release throws", async () => {
+    class ThrowingRelease extends InMemoryLaneCoordinator {
+      override release(): Promise<void> {
+        throw new Error("lane release exploded");
+      }
+    }
+    const { store } = newStore();
+    const mission = makeMission(store);
+    bindRepo(store, mission.mission_id);
+    const task = makeTask(store, mission.mission_id, "a", ["src/a"]);
+    const backend = deferredBackend();
+    const broker = new ExecutionBroker({
+      store,
+      resolveRepository: resolveRepository(),
+      backends: { agent: { runAgent: backend.runAgent } },
+    });
+    const lanes = new ThrowingRelease({ config: { leaseMs: 300_000, maxRepoWriters: 4 } });
+    const scheduler = new MissionScheduler({ store, broker, lanes, ownerId: "owner-1" });
+    const running = scheduler.runMission(mission.mission_id);
+    const settled = running.then(
+      () => "ok",
+      (error: Error) => error.message,
+    );
+    await until(() => backend.starts.length === 1);
+    backend.release("a");
+    assert.equal(await settled, "lane release exploded");
+    assert.equal(store.getTask(task.task_id)?.status, "SUCCEEDED");
+    assert.equal((scheduler as unknown as { activeTasks: Map<string, unknown> }).activeTasks.size, 0);
+  });
+});
+
 describe("MissionScheduler lane integration", () => {
   it("serializes overlapping write domains across tasks on the same repo", async () => {
     const { eventStore, store } = newStore();
