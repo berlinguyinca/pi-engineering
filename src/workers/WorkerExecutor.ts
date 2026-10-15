@@ -1,6 +1,7 @@
 import type { WorkerResult, WorkerRole, WorkerUsage } from "../core/types.ts";
 import type { CheckpointRecoveryContext } from "../orchestration/broker.ts";
 import type { CheckpointProgressClaim } from "./checkpointProgressTool.ts";
+import type { ContextBudget } from "./contextBudget.ts";
 
 /** Bounded, operator-safe live state from a worker session. */
 export interface WorkerActivity {
@@ -48,6 +49,8 @@ export interface WorkerRequest {
   unboundedInferenceWait?: boolean;
   /** Hard context-token budget; the session is aborted once exceeded (spec §10.6). */
   maxContextTokens?: number;
+  /** Set by the executor: how `maxContextTokens` was derived from the routed model. */
+  contextBudget?: ContextBudget;
   /** Opening user message for the fresh session (defaults to the generic kickoff). */
   kickoff?: string;
   /**

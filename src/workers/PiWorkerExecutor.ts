@@ -29,6 +29,7 @@ import { type AgentLoopPreventedEvent, DEFAULT_LOOP_PREVENTION } from "../aps/ty
 import { WorkerActivityAdapter } from "../aps/workerActivity.ts";
 import type { ModelCapabilityRegistry } from "../capability/registry.ts";
 import type { RoleRouter } from "../capability/router.ts";
+import { tunedCompactionTokens } from "../compaction/autoTune.ts";
 import { normalizeAgentDir } from "../core/piAgentDir.ts";
 import type { WorkerResult, WorkerRole, WorkerUsage } from "../core/types.ts";
 import type { AdmissionController } from "../gateway/AdmissionController.ts";
@@ -49,7 +50,7 @@ import {
 } from "../gateway/signals.ts";
 import { MAX_ESCALATED_WAIT_MS } from "../gateway/streamRetry.ts";
 import { GenerationGuard, type GuardAbortReason } from "../guard/GenerationGuard.ts";
-import { TOOL_TRANSITION_RULE } from "../guard/RecoveryController.ts";
+import { GUARD_STEER_PROMPT, TOOL_TRANSITION_RULE } from "../guard/RecoveryController.ts";
 import {
   type RecoveryTelemetry,
   buildCompactedContext,
@@ -99,6 +100,13 @@ import {
 import { BuildCommandTimer } from "./buildActivity.ts";
 import { CHECKPOINT_PROGRESS_TOOL_NAME, createCheckpointProgressTool } from "./checkpointProgressTool.ts";
 import { CLAIM_DELIVERABLE_TOOL_NAME, createClaimDeliverableTool } from "./claimDeliverableTool.ts";
+import {
+  type ContextBudget,
+  resolveCompactAt,
+  resolveContextBudget,
+  windowDeclared,
+  workerCompactionSettings,
+} from "./contextBudget.ts";
 import { registerLocalProviders } from "./localProviders.ts";
 import { WORKER_KICKOFF, buildSystemPrompt, wantsCommitDiscipline } from "./prompts.ts";
 import { guardRuntimeRequestBody } from "./requestBodyGuard.ts";
@@ -475,15 +483,41 @@ export class PiWorkerExecutor implements WorkerExecutor {
     }
 
     // Build the base system prompt with the Tool Transition Rule (spec §15).
-    // Specialist roles may supply their own prompt wholesale.
+    // Specialist roles may supply their own prompt wholesale. Prose roles
+    // (reviewers) deliver written findings, so a rule that says "act instead of
+    // narrating" contradicts their role and is left out.
+    const builtPrompt = buildSystemPrompt(req.role, req.task, workerContext(req), {
+      isolatedWorktree: req.isolatedWorktree,
+    });
     const baseSystemPrompt =
       req.systemPromptOverride ??
-      `${buildSystemPrompt(req.role, req.task, workerContext(req), { isolatedWorktree: req.isolatedWorktree })}
+      (PROSE_ROLES.has(req.role) ? builtPrompt : `${builtPrompt}\n\n${TOOL_TRANSITION_RULE}`);
 
-${TOOL_TRANSITION_RULE}`;
-
+    // The budget is the role's, clamped to what the routed model can hold
+    // (issue #180); the run's request carries it and the result records it.
+    const declared = windowDeclared(this.agentDir, model.provider, model.id);
+    const budget = resolveContextBudget(req.role, req.maxContextTokens, model.contextWindow, model.maxTokens, declared);
+    if (budget.warning) {
+      emitTelemetry({
+        level: "warning",
+        text: budget.warning,
+        key: `context-budget-unknown:${model.provider}/${model.id}`,
+      });
+    }
     // Run the worker with the generation guard and recovery ladder.
-    return this.runWithGuard(req, model, baseSystemPrompt, modelRuntime);
+    // max_tokens on the wire must leave the prompt budget its room in the slot.
+    const maxOutputTokens = budget.contextWindow !== undefined ? budget.contextWindow - budget.tokens : undefined;
+    const sized = { ...req, maxContextTokens: budget.tokens, contextBudget: budget };
+    const invocation = currentInferenceInvocation();
+    const run = await (invocation && maxOutputTokens !== undefined
+      ? runWithInferenceInvocation({ ...invocation, maxOutputTokens }, () =>
+          this.runWithGuard(sized, model, baseSystemPrompt, modelRuntime),
+        )
+      : this.runWithGuard(sized, model, baseSystemPrompt, modelRuntime));
+    return {
+      ...run,
+      result: { ...run.result, details: { ...run.result.details, context_budget: budget } },
+    };
   }
 
   /**
@@ -637,6 +671,39 @@ ${TOOL_TRANSITION_RULE}`;
     // strict loop-mitigation defaults.
     const guardConfig = guardConfigForRole(req.role, this.guardConfig);
 
+    // A prompt the model's window cannot hold fails identically on every
+    // replay (issue #180). The first overflow compacts the prompt and retries
+    // the turn once in a fresh session; the second fails with a structured
+    // `context_overflow`, which recovery answers by splitting the task.
+    let overflowCompacted = false;
+    const onContextOverflow = (detail: string, toolCalls: number): WorkerRun | undefined => {
+      if (!overflowCompacted) {
+        overflowCompacted = true;
+        systemPrompt = buildCompactedWorkerPrompt(
+          req,
+          "The previous attempt's prompt exceeded the model's context window. Work in small steps and read only what you need.",
+        );
+        attempt += 1;
+        return undefined;
+      }
+      const summary = `context_overflow: the prompt still exceeds the context window of ${model.provider}/${model.id} after one compaction (budget ${req.maxContextTokens ?? "unset"} tokens): ${detail}`;
+      return {
+        result: {
+          status: "failed",
+          summary,
+          claims: [],
+          evidence_refs: [],
+          new_hypotheses: [],
+          proposed_tasks: [],
+          details: { context_overflow: true, model: { provider: model.provider, id: model.id } },
+          error: "context_overflow",
+        },
+        usage: null,
+        error: "context_overflow",
+        toolCalls: Math.max(toolCalls, this.executedActionCount(req)),
+      };
+    };
+
     while (true) {
       // Every pass of this loop starts a new inference request: the boundary
       // at which an operator's model switch takes over (never mid-stream).
@@ -733,6 +800,12 @@ ${TOOL_TRANSITION_RULE}`;
             await holdForGateway(handover.signal);
             continue;
           }
+        }
+
+        if (transientOutcome.category === "context_overflow") {
+          const overflow = onContextOverflow(detail, 0);
+          if (overflow) return overflow;
+          continue;
         }
 
         // Transient retries were exhausted (or a non-retryable transport error).
@@ -942,6 +1015,21 @@ ${TOOL_TRANSITION_RULE}`;
         };
       }
 
+      if (
+        !guardAborted &&
+        !budgetExhausted &&
+        !timedOut &&
+        lastAssistantError !== undefined &&
+        classifyError(lastAssistantError).category === "context_overflow"
+      ) {
+        const overflow = onContextOverflow(lastAssistantError, toolCalls);
+        if (!overflow) {
+          lastAssistantError = undefined;
+          continue;
+        }
+        return { ...overflow, usage: this.collectUsage(this.asMessages(session.messages)) };
+      }
+
       if (!guardAborted || !this.guardConfig.enabled) {
         // Non-guard failure (timeout, budget, gateway, no-result) — no recovery ladder.
         const gateway = lastAssistantError ? parseGatewayWait({ text: lastAssistantError }) : null;
@@ -1116,8 +1204,19 @@ ${recovery.recoveryPrompt}`;
   }> {
     const resourceLoader = roleResourceLoader(systemPrompt);
     const sessionManager = SessionManager.inMemory(req.cwd);
+    // Mission workers compact at a share of their context budget (default 60%,
+    // PI_WORKER_COMPACT_AT), keeping the autotuned recent window; the summary
+    // call goes through the same thinking-off request policy as every worker
+    // request. Without a known window there is nothing to size against.
+    const compaction = req.contextBudget
+      ? workerCompactionSettings(
+          req.contextBudget,
+          resolveCompactAt(),
+          tunedCompactionTokens(model as { contextWindow?: number; maxTokens?: number })?.keepRecentTokens,
+        )
+      : undefined;
     const settingsManager = SettingsManager.inMemory({
-      compaction: { enabled: false },
+      compaction: compaction ?? { enabled: false },
       retry: { enabled: false }, // We handle retries ourselves via the recovery ladder.
     });
 
@@ -1368,10 +1467,40 @@ ${recovery.recoveryPrompt}`;
       // started prompting is a no-op, so never start it.
       if (req.signal?.aborted) abortFromOwner();
       else
-        await session.prompt(req.kickoff ?? WORKER_KICKOFF, {
-          images: req.images?.map((img) => ({ type: "image" as const, data: img.data, mimeType: img.mimeType })),
-          expandPromptTemplates: false,
+        try {
+          await session.prompt(req.kickoff ?? WORKER_KICKOFF, {
+            images: req.images?.map((img) => ({ type: "image" as const, data: img.data, mimeType: img.mimeType })),
+            expandPromptTemplates: false,
+          });
+        } catch (err) {
+          // A guard abort rejects the prompt; the steer below handles it.
+          if (!guardAborted) throw err;
+        }
+      // First guard trip of the run: steer inside the same session rather than
+      // restarting with the context cut away. A second trip falls through to
+      // the recovery ladder's fresh session.
+      if (
+        attempt === 0 &&
+        guardAborted &&
+        !captured &&
+        structured === undefined &&
+        !budgetExhausted &&
+        !timedOut &&
+        !ownerAborted &&
+        !loopPrevented &&
+        !req.signal?.aborted
+      ) {
+        guardAborted = false;
+        guardReason = undefined;
+        guardDiagnostics = {};
+        guard.reset();
+        emitWorkerActivity(req, {
+          kind: "state",
+          summary: "Guard tripped; steering the session",
+          meaningfulProgress: false,
         });
+        await session.prompt(GUARD_STEER_PROMPT, { expandPromptTemplates: false });
+      }
       // A cut stream after tool calls ran: resume the same session. The
       // executed calls and their results stay in the history; only the failed
       // partial assistant message is dropped (src/inference/streamResume.ts).
@@ -1390,6 +1519,7 @@ ${recovery.recoveryPrompt}`;
           !stalled &&
           !loopPrevented &&
           isCutStreamError(assistantError) &&
+          classifyError(assistantError).category !== "context_overflow" &&
           streamResumes.count < this.streamResumeMax;
         if (!resumable) break;
         const resumeFrom = dropFailedTail(session.agent.state.messages as AssistantLike[]);

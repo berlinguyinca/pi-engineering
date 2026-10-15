@@ -32,7 +32,8 @@ export type TransientErrorCategory =
   | "server_error" // other 5xx — transient upstream failure
   | "network" // ECONNRESET / ECONNREFUSED / fetch failed / DNS
   | "timeout" // wall-clock / provider deadline exceeded
-  | "compaction" // summarization/context-overflow/compaction failure
+  | "compaction" // summarization/compaction failure
+  | "context_overflow" // the prompt exceeds the model's context: NOT retryable (compact once, then fail)
   | "model_unavailable" // model_not_found / invalid model name — one resync retry, never the infra window
   | "permanent"; // NOT retryable — do not auto-retry
 
@@ -125,7 +126,9 @@ function mapUnifiedToTransient(
       // typo never clears (not an infrastructure category).
       return { category: "model_unavailable", retryable: true, retryAfterMs, maxRetries: 1, reason };
     case "context_overflow":
-      return { category: "compaction", retryable: true, retryAfterMs, reason };
+      // The same prompt overflows the same window on every replay; the worker
+      // compacts once itself and then fails with a structured context_overflow.
+      return { category: "context_overflow", retryable: false, reason };
     case "request_too_large":
     case "authentication":
     case "authorization":
@@ -324,10 +327,28 @@ export function classifyError(error: unknown): ErrorClass {
     return { category: "timeout", retryable: true, retryAfterMs, reason: "timeout" };
   }
 
-  // Compaction / context-overflow / summarization failure.
+  // A prompt that does not fit the context window: replaying cannot help. Only
+  // prompt-side wording, only on a 400/413 or a status-less error, and never a
+  // max_tokens complaint (that is configuration) or a 429/503 that merely
+  // mentions context.
   if (
-    has("summariz", "compaction", "compacted", "token cap", "context overflow", "context limit", "incomplete summary")
+    [status, textStatus].every((s) => s == null || s === 400 || s === 413) &&
+    !has("max_tokens", "max_completion_tokens") &&
+    has(
+      "context overflow",
+      "context limit",
+      "context length",
+      "context_length",
+      "maximum context",
+      "exceeds the available context",
+      "prompt is too long",
+    )
   ) {
+    return { category: "context_overflow", retryable: false, reason: "context overflow" };
+  }
+
+  // Compaction / summarization failure.
+  if (has("summariz", "compaction", "compacted", "token cap", "incomplete summary")) {
     return { category: "compaction", retryable: true, retryAfterMs, reason: "compaction / context-overflow" };
   }
 

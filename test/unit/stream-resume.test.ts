@@ -22,6 +22,9 @@ test("isCutStreamError recognises cut streams and not gateway verdicts", () => {
   assert.equal(isCutStreamError("terminated"), true);
   assert.equal(isCutStreamError("429 rate limited"), false);
   assert.equal(isCutStreamError(undefined), false);
+  // A context overflow is a 400 before output: compaction's job, never a resume.
+  assert.equal(isCutStreamError("400 This model's maximum context length is 8192 tokens"), false);
+  assert.equal(isCutStreamError("Prompt is too long: exceeds the context window"), false);
 });
 
 test("resolveStreamResumeMax defaults to 3, accepts 0, ignores junk", () => {

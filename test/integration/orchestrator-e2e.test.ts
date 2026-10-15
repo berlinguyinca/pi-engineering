@@ -669,7 +669,7 @@ describe("mission caller cancellation", () => {
       backends: {
         agent: {
           runAgent: async ({ objective, signal }) => {
-            if (objective.includes("Repair review finding")) {
+            if (objective.startsWith("Repair contract")) {
               repairStarted();
               if (!signal.aborted) {
                 await new Promise<void>((resolve) =>
@@ -729,7 +729,7 @@ describe("mission caller cancellation", () => {
     assert.ok(
       store
         .listTasks(result.mission.mission_id)
-        .some((task) => task.objective.includes("Repair review finding") && task.status === "CANCELED"),
+        .some((task) => task.objective.startsWith("Repair contract") && task.status === "CANCELED"),
     );
   });
 });
@@ -1217,7 +1217,7 @@ describe("acceptance scenario D — reviewer finding blocks completion and creat
     // than merely blocking, and re-reviewed after repairing.
     const tasks = h.store.listTasks(mission.mission_id);
     assert.ok(
-      tasks.some((t) => t.objective.startsWith("Repair review finding")),
+      tasks.some((t) => t.objective.startsWith("Repair contract")),
       `expected a repair task, got ${JSON.stringify(tasks.map((t) => t.objective))}`,
     );
     assert.ok(h.calls.review.length >= 2, `expected a re-review after repair, got ${h.calls.review.length}`);

@@ -276,6 +276,35 @@ and are listed with the gateway's own error text. Only an authentication or
 account-wide refusal stops a provider's refresh. In that case its configuration
 is left as it was.
 
+## Context budget for mission workers
+
+A worker's context budget is the smaller of its role's budget (`ROLE_BUDGETS`,
+`hardMaxTokens`) and 70% of the context window of the model it was routed to, so
+a role is never planned for more context than its model holds: an implementer or
+reviewer on a 32k-slot model gets 22,937 tokens, not 40k/64k. The window comes
+from the model record (`contextWindow` in `models.json`, kept in step with the
+gateway catalogue). If it is unknown, only the role budget applies and a warning
+is shown. The budget is passed to the session as `maxContextTokens` and recorded
+as `details.context_budget` (`tokens`, `roleTokens`, `contextWindow`,
+`limitedBy`) on the worker result.
+
+Mission worker sessions compact at 60% of that budget, keeping the recent window
+the per-model compaction tuning computes (bounded to half the trigger on small
+windows); the summary request is sent thinking-off like every worker request.
+Operator (interactive) sessions are unchanged.
+
+- `PI_WORKER_COMPACT_AT` (default `0.6`): fraction of the budget at which a worker
+  session compacts. Accepts 0.1 to 0.95; anything else falls back to 0.6.
+
+A provider error that says the prompt does not fit the context (HTTP 400
+"context length exceeded", "maximum context length", llama.cpp "exceeds the
+available context size", `context_length_exceeded`) is **not retryable**. The
+worker compacts its prompt once and retries the turn once in a fresh session; if
+that overflows too, the run fails with the structured error `context_overflow`.
+Recovery classifies it as `TASK_BUDGET_EXHAUSTED` and plans
+`CHECKPOINT_SPLIT_AND_REPLACE` (split the task into smaller ones) instead of
+replaying it.
+
 ## Thinking off for mission roles
 
 Mission implementers, reviewers and repair workers send thinking off on every
@@ -365,6 +394,13 @@ the closest candidate lines with line numbers. Implementers have no ledger,
 artifact or `checkpoint_progress` tools: they commit when a step is done, and
 the broker harvests uncommitted work and derives the checkpoint from the branch.
 Scouts and reviewers keep their read-only semantic tools.
+
+## Repair rounds and the degeneration guard
+
+- One repair contract per round: all open blocking findings go to a single repair implementer task whose objective lists every finding (id, severity, file:line, summary, suggestion). Each finding is still resolved or left open individually after the round. The round limit is unchanged (`maxRepairRounds`, default 2).
+- `blocker`, `critical`, `blocking` and `high` findings block completion, except that a `high` `missing_tests` or `spec_gaps` finding is recorded on the mission as non-blocking (`major`, still visible). A `request_changes` verdict with only non-blocking findings still starts a repair round. Each finding is resolved by the next review: one it still reports stays open and is re-sent, without a duplicate row.
+- A failed integration is re-merged onto the current base up to twice before the mission stops; no LLM repair task is created for a merge conflict or infrastructure failure. Gates that ran and failed on the candidate (validation, review, or integration checks classified VALIDATION_FAILED) become a code-repair task.
+- Worker degeneration guard defaults are 2000 narration tokens before the first action and 4000 tokens without progress (`PI_GUARD_MAX_NARRATION_TOKENS`, `PI_GUARD_MAX_REASONING_TOKENS`). The first trip steers inside the same session with a short corrective turn; only a second trip restarts a fresh session. Reviewer sessions no longer receive the Tool Transition Rule.
 
 ## Tool-call guard
 

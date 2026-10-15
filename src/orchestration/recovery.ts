@@ -422,6 +422,9 @@ export class FailureClassifier {
   inferRecognizedCategory(evidence: FailureEvidence): FailureCategory | undefined {
     const summary = normalizedSummary(evidence.summary);
     const providerCode = evidence.providerCode?.trim().toUpperCase();
+    // The worker compacted once and the prompt still overflows the model's
+    // window (issue #180): replaying it never helps; split the task instead.
+    if (/context[_ ]overflow/.test(summary)) return "TASK_BUDGET_EXHAUSTED";
     if (evidence.providerStatus !== undefined) {
       if ([408, 425, 429, 500, 502, 503, 504].includes(evidence.providerStatus)) {
         return "PROVIDER_TRANSIENT";

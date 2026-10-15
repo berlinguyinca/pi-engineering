@@ -311,3 +311,13 @@ export function buildDegenerationEvent(
     timestamp: new Date().toISOString(),
   };
 }
+
+// ─── In-session steering (first guard trip) ──────────────────────────────────
+
+/**
+ * Corrective user turn injected into the SAME session on the first guard trip.
+ * A restart discards the session's context; a short steer keeps it and asks for
+ * the one thing the guard saw missing: an action.
+ */
+export const GUARD_STEER_PROMPT =
+  "Your last turn was stopped because it narrated or repeated itself without taking an action. Do not restate plans. Take the next concrete action with a tool now, or call the result tool if the work is finished.";
