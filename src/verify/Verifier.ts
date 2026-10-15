@@ -3,6 +3,13 @@ import { access, readFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import type { ArtifactStore } from "../artifacts/ArtifactStore.ts";
 import type { Evidence, EvidenceTrust } from "../core/types.ts";
+import {
+  type BaselineVerdict,
+  type FailureBaseline,
+  compareToBaseline,
+  hashProfile,
+  parseFailingTests,
+} from "./failureBaseline.ts";
 
 /**
  * Default hang guard for a verification command: killed only after this long
@@ -251,6 +258,8 @@ export interface StageRun {
   passed: boolean;
   summary: Record<string, unknown>;
   artifactUri: string;
+  /** Failing test names parsed from node:test output, when the stage reported any. */
+  failingTests?: string[];
 }
 
 export interface VerifyOutcome {
@@ -267,6 +276,19 @@ export interface VerifyOutcome {
    * scriptless repo.
    */
   noTargets: boolean;
+  /** Hash of the profile this outcome ran (see failureBaseline.hashProfile). */
+  profileHash?: string;
+  /** Present only when the run was given a failure baseline: introduced failures block, pre-existing ones do not. */
+  baselineVerdict?: BaselineVerdict;
+}
+
+/** Options for a verification run. */
+export interface VerifyRunOptions {
+  signal?: AbortSignal;
+  /** Failures already present at the base; see failureBaseline.captureBaseline. */
+  baseline?: FailureBaseline;
+  /** The base SHA the candidate is bound to. A baseline for any other SHA is stale. */
+  boundBaseSha?: string;
 }
 
 /**
@@ -284,7 +306,7 @@ export interface VerificationProvider {
     cwd: string,
     profile: VerificationProfile,
     artifactStore: ArtifactStore,
-    opts?: { signal?: AbortSignal },
+    opts?: VerifyRunOptions,
   ): Promise<VerifyOutcome>;
 }
 
@@ -628,7 +650,7 @@ export class CommandVerifier implements VerificationProvider {
     cwd: string,
     profile: VerificationProfile,
     store: ArtifactStore,
-    opts?: { signal?: AbortSignal },
+    opts?: VerifyRunOptions,
   ): Promise<VerifyOutcome> {
     const stageRuns: StageRun[] = [];
     const evidence: Evidence[] = [];
@@ -692,7 +714,15 @@ export class CommandVerifier implements VerificationProvider {
         artifacts: [artifactUri],
         trust: "deterministic",
       };
-      stageRuns.push({ stage, exitCode: code, passed, summary, artifactUri });
+      const failingTests = passed ? [] : parseFailingTests(`${stdout}\n${stderr}`, stage.cwd ?? cwd);
+      stageRuns.push({
+        stage,
+        exitCode: code,
+        passed,
+        summary,
+        artifactUri,
+        ...(failingTests.length > 0 ? { failingTests } : {}),
+      });
       evidence.push(ev);
 
       // Stop early on a required hard failure (spec §15.3).
@@ -713,6 +743,15 @@ export class CommandVerifier implements VerificationProvider {
     // actually verified) and NOT a doomed hard-fail. Report it as a distinct
     // honest outcome so callers can decide how to gate (finding FINDING-2CcenM).
     const passed = !noTargets && failedStage === null && stageRuns.length > 0 && stageRuns.some((s) => s.passed);
-    return { passed, stages: stageRuns, evidence, failedStage, noTargets };
+    const outcome: VerifyOutcome = {
+      passed,
+      stages: stageRuns,
+      evidence,
+      failedStage,
+      noTargets,
+      profileHash: hashProfile(profile),
+    };
+    if (opts?.baseline) outcome.baselineVerdict = compareToBaseline(opts.baseline, outcome, opts.boundBaseSha);
+    return outcome;
   }
 }

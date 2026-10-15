@@ -9,7 +9,15 @@ export { ArtifactStore } from "./artifacts/ArtifactStore.ts";
 export { ContextBroker, estimateTokens } from "./context/ContextBroker.ts";
 export { GitRepo } from "./git/GitRepo.ts";
 export { CommandVerifier } from "./verify/Verifier.ts";
-export type { VerificationProvider, VerificationProfile, VerifyOutcome, StageRun } from "./verify/Verifier.ts";
+export type {
+  VerificationProvider,
+  VerificationProfile,
+  VerifyOutcome,
+  VerifyRunOptions,
+  StageRun,
+} from "./verify/Verifier.ts";
+export { captureBaseline, compareToBaseline, failureIds } from "./verify/failureBaseline.ts";
+export type { BaselineVerdict, FailureBaseline } from "./verify/failureBaseline.ts";
 export type { WorkerActivity, WorkerExecutor, WorkerRequest, WorkerRun } from "./workers/WorkerExecutor.ts";
 export { PiWorkerExecutor } from "./workers/PiWorkerExecutor.ts";
 export { FakeWorkerExecutor } from "./workers/FakeWorkerExecutor.ts";
