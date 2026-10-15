@@ -61,6 +61,8 @@ export interface TaskContract {
   /** Contract ids that must have passed before this one runs. */
   depends_on: string[];
   scope: ContractScope;
+  /** Deny globs the parser dropped because they contradicted `scope.allowed`. */
+  ignored_forbidden?: string[];
   /** Checkable acceptance criteria. */
   acceptance: string[];
   /** Deterministic verification commands that must exit 0. */

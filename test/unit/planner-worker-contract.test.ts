@@ -52,6 +52,7 @@ test("parseTaskContract rejects unsafe or unbounded scope globs", () => {
     "/etc/**",
     "../outside/**",
     "**",
+    "**/*",
     "*",
     ".",
     "",

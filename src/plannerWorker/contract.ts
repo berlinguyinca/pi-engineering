@@ -108,9 +108,10 @@ export function parseTaskContract(raw: unknown): ContractParse {
   // ("**/*", "src/**.js" beside allowed "src/calc.js") contradicts it and would
   // leave nothing writable; the explicit allowed list wins. A directory deny
   // ("src/**") is kept: the mission planner falls back on that contradiction.
-  const forbidden = forbiddenListed.filter(
-    (deny) => DIRECTORY_DENY.test(deny) || !allowed.some((grant) => matchesGlob(grant, deny)),
-  );
+  const keepsDeny = (deny: string): boolean =>
+    DIRECTORY_DENY.test(deny) || !allowed.some((grant) => matchesGlob(grant, deny));
+  const forbidden = forbiddenListed.filter(keepsDeny);
+  const ignored_forbidden = forbiddenListed.filter((deny) => !keepsDeny(deny));
 
   const acceptance = stringList(raw.acceptance, `${id}.acceptance`, errors, { required: true });
   const verification = stringList(raw.verification, `${id}.verification`, errors);
@@ -131,6 +132,7 @@ export function parseTaskContract(raw: unknown): ContractParse {
       objective,
       depends_on,
       scope: { allowed, forbidden },
+      ...(ignored_forbidden.length > 0 ? { ignored_forbidden } : {}),
       acceptance,
       verification,
       constraints,

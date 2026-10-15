@@ -7,6 +7,7 @@
  * numbers appear in the published snapshot and in `why`.
  */
 import type { MissionStore } from "./missionStore.ts";
+import { PLANNER_CLARIFICATION_CATEGORY } from "./types.ts";
 import type {
   Execution,
   FailureClassification,
@@ -369,6 +370,11 @@ export function explainMission(store: MissionStore, missionId: string, options: 
     remedies.push(`/mission cancel ${missionId}`);
     if (stop?.resumeCondition) remedies.push(`resume condition: ${stop.resumeCondition}`);
     if (pending?.operatorGuidance) remedies.push(`operator question: ${pending.operatorGuidance}`);
+    const asked = store
+      .listFindings(missionId)
+      .filter((f) => f.category === PLANNER_CLARIFICATION_CATEGORY && f.status === "open")
+      .at(-1)?.evidence;
+    if (asked && !pending?.operatorGuidance?.includes(asked)) remedies.push(`planner question: ${asked}`);
     if (pending && pending.action === "PROBE_AND_BACKOFF") remedies.push(`wait: ${pending.expectedMaterialChange}`);
   }
 

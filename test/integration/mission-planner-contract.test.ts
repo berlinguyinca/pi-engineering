@@ -9,9 +9,12 @@ import { AdmissionController } from "../../src/gateway/AdmissionController.ts";
 import { resolveGatewayConfig } from "../../src/gateway/config.ts";
 import { EngineeringRuntime } from "../../src/index.ts";
 import { planMission, scopeTaskDomains } from "../../src/orchestration/missionPlanner.ts";
+import { explainMission, formatMissionWhy } from "../../src/orchestration/missionWhy.ts";
+import { PLANNER_CLARIFICATION_CATEGORY } from "../../src/orchestration/types.ts";
 import { scopesOverlap } from "../../src/plan/taskDag.ts";
 import { parsePlannerOutput } from "../../src/plannerWorker/contract.ts";
 import { PLANNER_PROMPT } from "../../src/plannerWorker/prompts.ts";
+import { missionReportLines } from "../../src/tools/missionReport.ts";
 import { PiWorkerExecutor } from "../../src/workers/PiWorkerExecutor.ts";
 import { makeFixtureRepo } from "../fixtures/make-fixture.ts";
 
@@ -82,7 +85,7 @@ describe("mission planner contract", () => {
     await rm(agentDir, { recursive: true, force: true });
   });
 
-  async function plan(goal: string, replies: Reply[], manifestRoots?: { writable: string[] }) {
+  async function openPlannerRuntime(replies: Reply[]) {
     const fx = await makeFixtureRepo();
     cleanups.push(fx.cleanup);
     const bodies: Array<Record<string, unknown>> = [];
@@ -161,6 +164,11 @@ describe("mission planner contract", () => {
           : Reflect.get(target, prop),
     });
     const runtime = await EngineeringRuntime.open({ cwd: fx.root, agentDir: dir, worker });
+    return { runtime, fx, bodies };
+  }
+
+  async function plan(goal: string, replies: Reply[], manifestRoots?: { writable: string[] }) {
+    const { runtime, fx, bodies } = await openPlannerRuntime(replies);
     const store = runtime.missionStore!;
     const mission = store.createMission({
       title: "t",
@@ -219,7 +227,12 @@ describe("mission planner contract", () => {
     assert.deepEqual(tasks[0]?.write_domains, ["src/calc.js", "test/calc.test.js"]);
     assert.match(tasks[0]?.objective ?? "", /Acceptance: divide\(a, b\) returns a \/ b/);
     assert.deepEqual(JSON.parse(tasks[0]?.context_ref ?? "{}").verification, ["npm test"]);
-    assert.equal(store.listFindings(mission.mission_id).filter((f) => f.category === "mission_planner").length, 0);
+    // The deny globs that contradicted the allowed scope are noted, not silently lost.
+    const findings = store.listFindings(mission.mission_id).filter((f) => f.category === "mission_planner");
+    assert.equal(findings.length, 1);
+    assert.equal(findings[0]?.severity, "minor");
+    assert.match(findings[0]?.evidence ?? "", /ignored deny globs.*\*\*\/\*/);
+    assert.doesNotMatch(findings[0]?.evidence ?? "", /malformed/);
   });
 
   it("also accepts contracts at the top level, in proposed_tasks, or in a fenced summary block", async () => {
@@ -266,19 +279,97 @@ describe("mission planner contract", () => {
     assert.deepEqual(planned.tasks[0]?.write_domains, ["src/calc.js", "test/calc.test.js"]);
   });
 
-  it("an explicit clarification request yields no tasks and a finding, not a fallback", async () => {
-    const args = {
-      status: "blocked",
-      summary: "Which module should divide live in?",
-      claims: [],
-      evidence_refs: [],
-      new_hypotheses: [],
-      proposed_tasks: [],
-    };
-    const { tasks, store, mission } = await plan(BIG_GOAL, [{ kind: "result", args }]);
+  const blockedArgs = (summary: string, details: Record<string, unknown> = {}) => ({
+    status: "blocked",
+    summary,
+    claims: [],
+    evidence_refs: [],
+    new_hypotheses: [],
+    proposed_tasks: [],
+    details,
+  });
+
+  it("an explicit clarification question yields no tasks and a clarification finding", async () => {
+    const { tasks, store, mission } = await plan(BIG_GOAL, [
+      { kind: "result", args: blockedArgs("Which module should divide live in?") },
+    ]);
     assert.equal(tasks.length, 0);
-    const finding = store.listFindings(mission.mission_id).find((f) => f.category === "mission_planner");
+    const finding = store.listFindings(mission.mission_id).find((f) => f.category === PLANNER_CLARIFICATION_CATEGORY);
     assert.match(finding?.evidence ?? "", /Which module/);
+  });
+
+  it("details.clarification_question is an explicit clarification even without a question mark", async () => {
+    const { tasks, store, mission } = await plan(BIG_GOAL, [
+      { kind: "result", args: blockedArgs("Need input", { clarification_question: "Name the target module" }) },
+    ]);
+    assert.equal(tasks.length, 0);
+    const finding = store.listFindings(mission.mission_id).find((f) => f.category === PLANNER_CLARIFICATION_CATEGORY);
+    assert.equal(finding?.evidence, "Name the target module");
+  });
+
+  it("a blocked planner without a question (a tool failure) still falls back to the single task", async () => {
+    const { tasks, store, mission } = await plan(BIG_GOAL, [
+      { kind: "result", args: blockedArgs("read tool failed: EACCES on src/") },
+    ]);
+    assert.equal(tasks.length, 1);
+    assert.deepEqual(tasks[0]?.write_domains, ["**"]);
+    const findings = store.listFindings(mission.mission_id);
+    assert.equal(findings.filter((f) => f.category === PLANNER_CLARIFICATION_CATEGORY).length, 0);
+    assert.match(findings.find((f) => f.category === "mission_planner")?.evidence ?? "", /malformed/);
+  });
+
+  it("surfaces the planner's question to the operator and waits once", async () => {
+    const question = "Which module should divide live in?";
+    const { runtime, fx } = await openPlannerRuntime([{ kind: "result", args: blockedArgs(question) }]);
+    const store = runtime.missionStore!;
+    const result = await runtime.orchestrator!.orchestrate(BIG_GOAL, {
+      repository: fx.root,
+      baseRef: "",
+      mutationRequested: true,
+    });
+    const missionId = result.mission.mission_id;
+    assert.equal(store.listTasks(missionId).length, 0);
+
+    await runtime.missionSupervisor!.tick(missionId);
+    await runtime.missionSupervisor!.tick(missionId);
+    await runtime.orchestrator!.repairBlockedMission(missionId);
+    await runtime.missionSupervisor!.tick(missionId);
+
+    const waits = store.listRecoveryDecisions(missionId).filter((d) => d.action === "WAIT_FOR_REQUIREMENT");
+    assert.equal(waits.length, 1, "exactly one requirement wait");
+    assert.match(waits[0]?.operatorGuidance ?? "", /Which module should divide live in\?/);
+    assert.equal(store.getMission(missionId)?.status, "WAITING_FOR_USER");
+    assert.equal(store.listMissionStops(missionId).length, 0, "a wait for the operator is not a stop: resumable");
+    assert.match(formatMissionWhy(explainMission(store, missionId)), /Which module should divide live in\?/);
+    assert.match(
+      missionReportLines(store, missionId).join("\n"),
+      /Planner question: Which module should divide live in\?/,
+    );
+  });
+
+  it("keeps the planning flag set until the plan is materialised and clears it when the planner throws", async () => {
+    const fx = await makeFixtureRepo();
+    cleanups.push(fx.cleanup);
+    const dir = await mkdtemp(join(tmpdir(), "pi-planner-flag-"));
+    cleanups.push(() => rm(dir, { recursive: true, force: true }));
+    let observed: boolean | undefined;
+    const ref: { runtime?: EngineeringRuntime } = {};
+    const runtime = await EngineeringRuntime.open({
+      cwd: fx.root,
+      agentDir: dir,
+      orchestrationPlanner: async (mission) => {
+        observed = ref.runtime?.orchestrator?.isPlanning(mission.mission_id);
+        throw new Error("planner exploded");
+      },
+    });
+    ref.runtime = runtime;
+    await assert.rejects(
+      runtime.orchestrator!.orchestrate(BIG_GOAL, { repository: fx.root, baseRef: "", mutationRequested: true }),
+      /planner exploded/,
+    );
+    assert.equal(observed, true, "flag is set while the planner runs");
+    const missionId = runtime.missionStore!.listMissions().at(-1)?.mission_id ?? "";
+    assert.equal(runtime.orchestrator!.isPlanning(missionId), false, "flag is cleared after a planner failure");
   });
 
   it("serializes tasks whose write domains overlap", async () => {
@@ -316,6 +407,8 @@ describe("mission planner contract", () => {
     assert.match(finding.evidence ?? "", /malformed/);
     assert.notEqual(finding.severity, "blocking");
     // Malformed output is not an ambiguous goal: no recovery, no operator wait.
+    // (The supervisor path is covered in mission-supervisor.test.ts: a fallback plan has tasks,
+    // so PLANNING_EMPTY can never fire for it.)
     assert.equal(store.listFailureClassifications(mission.mission_id).length, 0);
     assert.equal(store.listRecoveryDecisions(mission.mission_id).length, 0);
     assert.notEqual(store.getMission(mission.mission_id)?.status, "WAITING_FOR_USER");

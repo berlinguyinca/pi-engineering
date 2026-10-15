@@ -3,7 +3,13 @@ import type { MissionStore } from "./missionStore.ts";
 import type { MissionObservability } from "./observability/MissionObservability.ts";
 import { FailureClassifier, RecoveryPlanner, taskFailureReason } from "./recovery.ts";
 import { canTransitionMission } from "./state.ts";
-import type { FailureCategory, Mission, OrchestrationTask, RecoveryDecision } from "./types.ts";
+import {
+  type FailureCategory,
+  type Mission,
+  type OrchestrationTask,
+  PLANNER_CLARIFICATION_CATEGORY,
+  type RecoveryDecision,
+} from "./types.ts";
 
 const TERMINAL = new Set(["COMPLETE", "FAILED", "CANCELED"]);
 /** Task statuses that occupy no worker and can never become runnable again. */
@@ -88,6 +94,8 @@ interface Diagnosis {
   category: FailureCategory;
   reason: string;
   task?: OrchestrationTask;
+  /** The planner's own question, when it explicitly asked the operator to clarify the goal. */
+  operatorQuestion?: string;
 }
 
 class StaleSupervisorResumptionError extends Error {
@@ -293,13 +301,16 @@ export class MissionSupervisor {
     );
     if (!decision) {
       this.assertResumptionGeneration(mission.mission_id, expectedResumptionGeneration);
+      const decided = this.planner.decide({
+        classification: durableClassification,
+        history,
+        now: this.now(),
+        resumptionGeneration: expectedResumptionGeneration,
+      });
       decision = this.store.planRecovery(
-        this.planner.decide({
-          classification: durableClassification,
-          history,
-          now: this.now(),
-          resumptionGeneration: expectedResumptionGeneration,
-        }),
+        diagnosis.operatorQuestion && decided.action === "WAIT_FOR_REQUIREMENT"
+          ? { ...decided, operatorGuidance: `operator question: ${diagnosis.operatorQuestion}` }
+          : decided,
       );
       if (decision.action === "STOP") {
         this.assertResumptionGeneration(mission.mission_id, expectedResumptionGeneration);
@@ -455,10 +466,15 @@ export class MissionSupervisor {
     if (tasks.length === 0) {
       // The planner is still running: no tasks yet is expected, not an answer.
       if (this.planningInFlight?.(mission.mission_id)) return null;
+      const question = this.store
+        .listFindings(mission.mission_id)
+        .filter((finding) => finding.category === PLANNER_CLARIFICATION_CATEGORY && finding.status === "open")
+        .at(-1)?.evidence;
       return {
         health: "PLANNING_EMPTY",
         category: "REQUIREMENT_AMBIGUITY",
-        reason: `Planning produced no tasks for mission ${mission.mission_id}: the operator must confirm or restate what this mission should do`,
+        reason: `Planning produced no tasks for mission ${mission.mission_id}: the operator must confirm or restate what this mission should do${question ? `. The planner asks: ${question}` : ""}`,
+        ...(question ? { operatorQuestion: question } : {}),
       };
     }
     const failed = tasks.find(

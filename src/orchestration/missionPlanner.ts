@@ -42,6 +42,8 @@ export interface MissionPlanResult {
    * malformed plan never sets this.
    */
   clarification?: string;
+  /** Planner intent the parser could not honour (e.g. contradictory deny globs), for a minor finding. */
+  notes?: string[];
 }
 
 /** What the planner worker returned: its worker_result, or plain model text. */
@@ -74,17 +76,20 @@ function plannerCandidates(output: PlannerRunOutput): unknown[] {
   );
 }
 
-/** A blocked planner that asks a question explicitly reports the goal as ambiguous. */
+/**
+ * The planner explicitly reports the goal as ambiguous: a `clarification_question`
+ * in its details, or a blocked status whose summary is itself a question. A
+ * blocked planner without a question (a tool failure) is not an ambiguous goal.
+ */
 function clarificationOf(output: PlannerRunOutput): string | undefined {
   if (typeof output === "string") return undefined;
   const d = output.details;
   const asked =
-    d && typeof d === "object" && !Array.isArray(d)
-      ? ((d as Record<string, unknown>).clarification_question ?? (d as Record<string, unknown>).question)
-      : undefined;
+    d && typeof d === "object" && !Array.isArray(d) ? (d as Record<string, unknown>).clarification_question : undefined;
   if (typeof asked === "string" && asked.trim()) return asked.trim();
   const status = output.status?.toLowerCase();
-  if ((status === "blocked" || status === "needs_clarification") && output.summary.trim()) return output.summary.trim();
+  const summary = output.summary.trim();
+  if ((status === "blocked" || status === "needs_clarification") && summary.endsWith("?")) return summary;
   return undefined;
 }
 
@@ -244,5 +249,13 @@ export async function planMission(input: MissionPlanInput): Promise<MissionPlanR
     }
     domains.set(c.task_id, kept);
   }
-  return { tasks: toTasks(parsed.plan.contracts, input.acceptanceIds, domains) };
+  const ignored = parsed.plan.contracts.flatMap((c) =>
+    c.ignored_forbidden?.length
+      ? [`${c.task_id}: ignored deny globs that contradict its allowed scope: ${c.ignored_forbidden.join(", ")}`]
+      : [],
+  );
+  return {
+    tasks: toTasks(parsed.plan.contracts, input.acceptanceIds, domains),
+    ...(ignored.length > 0 ? { notes: ignored } : {}),
+  };
 }
