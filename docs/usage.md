@@ -265,6 +265,21 @@ and are listed with the gateway's own error text. Only an authentication or
 account-wide refusal stops a provider's refresh. In that case its configuration
 is left as it was.
 
+## Thinking off for mission roles
+
+Mission implementers, reviewers and repair workers send thinking off on every
+request, whatever the output allowance: `reasoning_effort: "none"` plus
+`chat_template_kwargs.enable_thinking: false`. Hidden reasoning costs 8-13k
+tokens per turn on the gateway models, and a worker makes dozens of turns. The
+one-shot planner and interactive sessions keep their current behaviour. Each
+such request logs `thinking: off (mission role)`.
+
+The policy applies to `openai-completions` models on providers `metabolomics`,
+`beast`, `bender` (`PI_THINKING_OFF_PROVIDERS`) or hosts `llm.example.com`,
+`llm.metabolomics.us`, `127.0.0.1`, `localhost` (`PI_THINKING_OFF_HOSTS`,
+comma-separated; entries match `host:port` or the bare hostname;
+`PI_THINKING_OFF_GATEWAYS` is the older name).
+
 ## Planner/worker execution mode
 
 `/mission` can split a mission across models by cognitive role. A planner turns

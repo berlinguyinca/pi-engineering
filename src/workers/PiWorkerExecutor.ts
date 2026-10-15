@@ -1077,6 +1077,8 @@ ${recovery.recoveryPrompt}`;
       settingsManager,
       tools,
       customTools,
+      // Pi-side level only; the effective switch is the mission-role policy in
+      // src/request/thinkingPolicy.ts (wire fields), keyed on the invocation role.
       thinkingLevel: "off",
     });
 

@@ -36,7 +36,13 @@
  *    allowance below it can be consumed by thinking alone. Default on; a turn
  *    with room keeps thinking, and overriding a reasoning level the user set is
  *    logged.
- * 3. A reply cut at "length" with almost no visible text becomes a clear error
+ * 3. Mission roles (every inference invocation that is not interactive and not
+ *    the one-shot planner): thinking off unconditionally, whatever the output
+ *    allowance. A long-running worker makes ~46 model turns, and 8-13k hidden
+ *    reasoning tokens per turn is minutes of decode that also eats the cap.
+ *    The wire fields are `reasoning_effort: "none"` and
+ *    `chat_template_kwargs.enable_thinking: false` (llama.cpp / vLLM).
+ * 4. A reply cut at "length" with almost no visible text becomes a clear error
  *    instead of a one-word answer — but ONLY when it spent the model's whole
  *    `maxTokens`. A shorter (window-clamped) length stop is exactly what Pi's
  *    own recovery handles (`isRecoverableLength`: output < model.maxTokens →
@@ -44,6 +50,7 @@
  */
 
 import { estimateTokens } from "@earendil-works/pi-coding-agent";
+import { currentInferenceInvocation } from "../inference/inferenceContext.ts";
 import { emitTelemetry } from "../telemetry/sink.ts";
 
 export interface ThinkingOffConfig {
@@ -53,7 +60,7 @@ export interface ThinkingOffConfig {
   lowOutputBudget: boolean;
   /** "Small" output room, in tokens (PI_THINKING_OFF_LOW_BUDGET_TOKENS). */
   lowOutputBudgetTokens: number;
-  /** Gateway hosts known to accept `reasoning_effort: "none"` (PI_THINKING_OFF_GATEWAYS). */
+  /** Gateway hosts known to accept `reasoning_effort: "none"` (PI_THINKING_OFF_HOSTS, alias PI_THINKING_OFF_GATEWAYS). Entries match host:port or bare hostname. */
   gatewayHosts: string[];
   /** Provider ids known to accept it (PI_THINKING_OFF_PROVIDERS). */
   providers: string[];
@@ -63,8 +70,8 @@ export const DEFAULT_THINKING_OFF_CONFIG: ThinkingOffConfig = {
   summaries: true,
   lowOutputBudget: true,
   lowOutputBudgetTokens: 16_384,
-  gatewayHosts: ["llm.example.com"],
-  providers: ["metabolomics"],
+  gatewayHosts: ["llm.example.com", "llm.metabolomics.us", "127.0.0.1", "localhost"],
+  providers: ["metabolomics", "beast", "bender"],
 };
 
 function flag(value: string | undefined, fallback: boolean): boolean {
@@ -87,7 +94,10 @@ export function resolveThinkingOffConfig(env: Record<string, string | undefined>
     lowOutputBudget: flag(env.PI_THINKING_OFF_LOW_BUDGET, DEFAULT_THINKING_OFF_CONFIG.lowOutputBudget),
     lowOutputBudgetTokens:
       Number.isFinite(tokens) && tokens > 0 ? Math.floor(tokens) : DEFAULT_THINKING_OFF_CONFIG.lowOutputBudgetTokens,
-    gatewayHosts: list(env.PI_THINKING_OFF_GATEWAYS, DEFAULT_THINKING_OFF_CONFIG.gatewayHosts),
+    gatewayHosts: list(
+      env.PI_THINKING_OFF_HOSTS ?? env.PI_THINKING_OFF_GATEWAYS,
+      DEFAULT_THINKING_OFF_CONFIG.gatewayHosts,
+    ),
     providers: list(env.PI_THINKING_OFF_PROVIDERS, DEFAULT_THINKING_OFF_CONFIG.providers),
   };
 }
@@ -105,7 +115,11 @@ export function acceptsThinkingOff(model: ThinkingModel, config: ThinkingOffConf
   if (model.api !== "openai-completions") return false;
   if (model.provider && config.providers.includes(model.provider.toLowerCase())) return true;
   try {
-    return model.baseUrl !== undefined && config.gatewayHosts.includes(new URL(model.baseUrl).host.toLowerCase());
+    if (model.baseUrl === undefined) return false;
+    const url = new URL(model.baseUrl);
+    return (
+      config.gatewayHosts.includes(url.host.toLowerCase()) || config.gatewayHosts.includes(url.hostname.toLowerCase())
+    );
   } catch {
     return false;
   }
@@ -161,7 +175,16 @@ function estimateInputTokens(context: ThinkingContext): number {
   return tokens;
 }
 
-export type ThinkingOffReason = "summarization" | "low-output-budget";
+export type ThinkingOffReason = "summarization" | "low-output-budget" | "mission-role";
+
+/** Roles that may keep thinking: the one-shot planner call. */
+const THINKING_ROLES: ReadonlySet<string> = new Set(["planner"]);
+
+/** Is the current inference invocation a mission worker/reviewer/repair call? */
+export function isMissionRoleInvocation(): boolean {
+  const invocation = currentInferenceInvocation();
+  return invocation !== undefined && !invocation.interactive && !THINKING_ROLES.has(invocation.role);
+}
 
 /**
  * @param allowance the provider-clamped output allowance (`max_tokens` from
@@ -174,6 +197,7 @@ export function thinkingOffReason(
   allowance?: number,
 ): ThinkingOffReason | undefined {
   if (!acceptsThinkingOff(model, config)) return undefined;
+  if (isMissionRoleInvocation()) return "mission-role";
   if (config.summaries && isSummarizationRequest(context)) return "summarization";
   if (config.lowOutputBudget) {
     const room = allowance ?? estimatedAllowance(model, context);
@@ -212,12 +236,14 @@ function requestedReasoning(payload: unknown): string | undefined {
  * "minimal", which the qwen models reject with a 502), and a chat template's
  * `enable_thinking` switched off when the payload carries one.
  */
-export function applyThinkingOff(payload: unknown): unknown {
+export function applyThinkingOff(payload: unknown, { forceTemplate = false } = {}): unknown {
   if (!payload || typeof payload !== "object") return payload;
   const next: Record<string, unknown> = { ...(payload as Record<string, unknown>), reasoning_effort: "none" };
   const kwargs = next.chat_template_kwargs;
   if (kwargs && typeof kwargs === "object") {
     next.chat_template_kwargs = { ...(kwargs as Record<string, unknown>), enable_thinking: false };
+  } else if (forceTemplate) {
+    next.chat_template_kwargs = { enable_thinking: false };
   }
   return next;
 }
@@ -290,7 +316,14 @@ export function streamWithThinkingPolicy<
       ...(options ?? {}),
       onPayload: async (payload: unknown, m: unknown) => {
         const reason = thinkingOffReason(model, context, config, payloadAllowance(payload));
-        const edited = reason ? applyThinkingOff(payload) : payload;
+        const edited = reason ? applyThinkingOff(payload, { forceTemplate: reason === "mission-role" }) : payload;
+        if (reason === "mission-role") {
+          emitTelemetry({
+            level: "info",
+            key: "thinking-off:mission-role",
+            text: `thinking: off (mission role) · ${currentInferenceInvocation()?.role ?? "worker"}`,
+          });
+        }
         const requested = requestedReasoning(payload);
         if (reason === "low-output-budget" && requested) {
           emitTelemetry({
