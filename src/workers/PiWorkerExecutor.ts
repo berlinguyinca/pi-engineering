@@ -66,6 +66,7 @@ import {
   type BackoffConfig,
   TransientError,
   type TransientTelemetry,
+  backoffDelayMs,
   classifyError,
   initialTransientTelemetry,
   isTruncatedStream,
@@ -78,6 +79,12 @@ import { currentInferenceInvocation, runWithInferenceInvocation } from "../infer
 import { ExecutedActionTracker } from "../inference/recovery.ts";
 import { wireResilientModelRuntime } from "../inference/resilientInstall.ts";
 import type { ResilientStreamScheduler } from "../inference/resilientStream.ts";
+import {
+  type AssistantLike,
+  dropFailedTail,
+  isCutStreamError,
+  resolveStreamResumeMax,
+} from "../inference/streamResume.ts";
 import { reviewResultTool } from "../lifecycle/reviewResultTool.ts";
 import { type RequestBodyBudgetConfig, resolveRequestBodyBudgetConfig } from "../request/bodyBudget.ts";
 import { type ThinkingOffConfig, resolveThinkingOffConfig } from "../request/thinkingPolicy.ts";
@@ -160,6 +167,11 @@ export interface PiWorkerExecutorOptions {
   /** Injectable RNG for backoff jitter (deterministic in tests). */
   transientRand?: () => number;
   /**
+   * Resumes of a cut stream per execution once tool calls have executed
+   * (default 3, PI_STREAM_RESUME_MAX). 0 disables resuming.
+   */
+  streamResumeMax?: number;
+  /**
    * APS loop-detection for worker sessions (Phase 2, detect-only): tool-call
    * activity is turned into AgentAction records and fed to an
    * AgentProgressSupervisor, which emits `agent.loop_candidate` events.
@@ -234,6 +246,7 @@ export class PiWorkerExecutor implements WorkerExecutor {
   private readonly transientConfig: BackoffConfig;
   private readonly transientSleep: (ms: number) => Promise<void>;
   private readonly transientRand: () => number;
+  private readonly streamResumeMax: number;
   /** APS loop-detection options for worker sessions (`false` disables). */
   private readonly aps: AgentProgressSupervisorOptions | false | undefined;
   /** APS loop-prevention options (`false` disables enforcement). */
@@ -277,6 +290,7 @@ export class PiWorkerExecutor implements WorkerExecutor {
     this.transientConfig = opts.transientConfig ?? resolveTransientRetryConfig();
     this.transientSleep = opts.transientSleep ?? ((ms) => new Promise<void>((r) => setTimeout(r, ms)));
     this.transientRand = opts.transientRand ?? Math.random;
+    this.streamResumeMax = opts.streamResumeMax ?? resolveStreamResumeMax();
     this.aps = opts.aps;
     this.loopPrevention = opts.loopPrevention;
     this.escalation = opts.escalation;
@@ -545,6 +559,8 @@ export class PiWorkerExecutor implements WorkerExecutor {
     const admission = this.admission;
     const gatewayConfig = this.gatewayConfig;
     let gatewayRetries = 0;
+    // Cut-stream resumes spent by this execution (cap: streamResumeMax).
+    const streamResumes = { count: 0 };
     // Scope every hold to the model actually called, then route it the same way
     // the interactive turn does (gatewayHoldScope). Without provider/model a
     // model-scoped signal fell back to the process-wide cooldown, and a link
@@ -734,6 +750,7 @@ export class PiWorkerExecutor implements WorkerExecutor {
                 tools,
                 attempt,
                 guardConfig,
+                streamResumes,
               );
             } catch (error) {
               // A pinned gate role is waited on, except when its host refuses
@@ -867,7 +884,7 @@ export class PiWorkerExecutor implements WorkerExecutor {
           recoveryPending = false;
         }
         if (gatewayConfig.enabled) admission.noteSuccess();
-        const usage = this.collectUsage(this.asMessages(session.messages));
+        const usage = this.collectUsage(this.asMessages(session.messages), streamResumes.count);
         return { result, usage, toolCalls, structured };
       }
 
@@ -974,7 +991,7 @@ export class PiWorkerExecutor implements WorkerExecutor {
           if (this.rollout.observability) this.observability.recordRecoveryOutcome(false);
           recoveryPending = false;
         }
-        const usage = this.collectUsage(this.asMessages(session.messages));
+        const usage = this.collectUsage(this.asMessages(session.messages), streamResumes.count);
         const detail = {
           loop_prevented: true,
           no_progress_turns: noProgressTurns,
@@ -1059,7 +1076,7 @@ export class PiWorkerExecutor implements WorkerExecutor {
                 : {},
             error,
           },
-          usage: this.collectUsage(this.asMessages(session.messages)),
+          usage: this.collectUsage(this.asMessages(session.messages), streamResumes.count),
           error,
           toolCalls: Math.max(toolCalls, this.executedActionCount(req)),
         };
@@ -1169,6 +1186,7 @@ ${recovery.recoveryPrompt}`;
     tools: string[],
     attempt: number,
     guardConfig: GenerationGuardConfig = this.guardConfig,
+    streamResumes: { count: number } = { count: 0 },
   ): Promise<{
     session: { dispose: () => void; messages: readonly unknown[] };
     guardAborted: boolean;
@@ -1426,6 +1444,20 @@ ${recovery.recoveryPrompt}`;
     };
     req.signal?.addEventListener("abort", abortFromOwner, { once: true });
 
+    const scanForTerminatingResult = (): void => {
+      for (const msg of session.messages) {
+        if (msg.role === "toolResult" && msg.toolName === terminatingName && !msg.isError && msg.details) {
+          if (terminatingName === "worker_result") {
+            const d = msg.details as unknown as WorkerResult;
+            if (d?.status) captured = d;
+          } else {
+            structured = msg.details;
+          }
+          break;
+        }
+      }
+    };
+
     try {
       emitWorkerActivity(req, { kind: "state", summary: "Worker session started", meaningfulProgress: false });
       // Covers a request that never begins streaming: armed from prompt start
@@ -1469,6 +1501,39 @@ ${recovery.recoveryPrompt}`;
         });
         await session.prompt(GUARD_STEER_PROMPT, { expandPromptTemplates: false });
       }
+      // A cut stream after tool calls ran: resume the same session. The
+      // executed calls and their results stay in the history; only the failed
+      // partial assistant message is dropped (src/inference/streamResume.ts).
+      for (;;) {
+        // A terminating result already delivered must not be thrown away.
+        scanForTerminatingResult();
+        const resumable =
+          !req.signal?.aborted &&
+          captured === undefined &&
+          structured === undefined &&
+          toolCalls > 0 &&
+          !guardAborted &&
+          !budgetExhausted &&
+          !timedOut &&
+          !ownerAborted &&
+          !stalled &&
+          !loopPrevented &&
+          isCutStreamError(assistantError) &&
+          classifyError(assistantError).category !== "context_overflow" &&
+          streamResumes.count < this.streamResumeMax;
+        if (!resumable) break;
+        const resumeFrom = dropFailedTail(session.agent.state.messages as AssistantLike[]);
+        if (!resumeFrom) break;
+        streamResumes.count++;
+        const delay = backoffDelayMs(streamResumes.count, this.transientConfig, this.transientRand);
+        const summary = `Stream cut after tool calls (${assistantError}); resuming the session in ${Math.round(delay / 1000)}s (resume ${streamResumes.count}/${this.streamResumeMax}) · executed tool calls are kept, not replayed`;
+        emitWorkerActivity(req, { kind: "state", summary, meaningfulProgress: false });
+        emitTelemetry({ level: "info", key: "worker:stream-resume", text: summary });
+        await this.transientSleep(delay);
+        session.agent.state.messages = resumeFrom as typeof session.agent.state.messages;
+        assistantError = undefined;
+        await session.agent.continue();
+      }
     } catch (err) {
       // Capture the error. An abort triggered by the guard/budget/timeout is
       // EXPECTED (session.abort()) and not a transport failure. A rejection
@@ -1504,19 +1569,7 @@ ${recovery.recoveryPrompt}`;
     }
 
     // Fallback: scan messages for the terminating tool result.
-    if (!captured && !guardAborted) {
-      for (const msg of session.messages) {
-        if (msg.role === "toolResult" && msg.toolName === terminatingName && !msg.isError && msg.details) {
-          if (terminatingName === "worker_result") {
-            const d = msg.details as unknown as WorkerResult;
-            if (d?.status) captured = d;
-          } else {
-            structured = msg.details;
-          }
-          break;
-        }
-      }
-    }
+    if (!captured && !guardAborted) scanForTerminatingResult();
 
     // Silent stream death: the provider closed the SSE stream before any
     // finish_reason arrived (observed on the metabolomics gateway under
@@ -1661,7 +1714,7 @@ ${recovery.recoveryPrompt}`;
     }
   }
 
-  private collectUsage(messages: readonly { role: string }[]): WorkerUsage | null {
+  private collectUsage(messages: readonly { role: string }[], streamResumes = 0): WorkerUsage | null {
     let input = 0;
     let output = 0;
     let cacheRead = 0;
@@ -1694,7 +1747,17 @@ ${recovery.recoveryPrompt}`;
       if (m.model) model = m.model;
     }
     if (turns === 0) return null;
-    return { input, output, cacheRead, cacheWrite, cost, contextTokens, turns, model };
+    return {
+      input,
+      output,
+      cacheRead,
+      cacheWrite,
+      cost,
+      contextTokens,
+      turns,
+      model,
+      ...(streamResumes > 0 ? { streamResumes } : {}),
+    };
   }
 }
 

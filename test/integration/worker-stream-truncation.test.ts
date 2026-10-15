@@ -11,13 +11,14 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { type IncomingMessage, type ServerResponse, createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { resolveGatewayConfig } from "../../src/gateway/config.ts";
+import { isResilientRuntime } from "../../src/inference/resilientStream.ts";
 import { ExecutionBroker } from "../../src/orchestration/broker.ts";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
 import { realBackends } from "../../src/orchestration/realBackends.ts";
@@ -77,13 +78,20 @@ const REVIEW_RESULT = {
   findings: [],
   missing_tests: [],
   spec_gaps: [],
+  acceptance_results: [],
 };
 
-async function withProbe(replies: Reply[], body: (executor: PiWorkerExecutor, cwd: string) => Promise<void>) {
+async function withProbe(
+  replies: Reply[],
+  body: (executor: PiWorkerExecutor, cwd: string, bodies: string[]) => Promise<void>,
+) {
   const requests: number[] = [];
+  const bodies: string[] = [];
   const server = createServer((req: IncomingMessage, res: ServerResponse) => {
-    req.resume();
+    const parts: Buffer[] = [];
+    req.on("data", (d: Buffer) => parts.push(d));
     req.on("end", () => {
+      bodies.push(Buffer.concat(parts).toString("utf8"));
       requests.push(requests.length);
       const reply = replies[requests.length - 1];
       if (reply) reply(res);
@@ -115,7 +123,7 @@ async function withProbe(replies: Reply[], body: (executor: PiWorkerExecutor, cw
     transientRand: () => 0,
   });
   try {
-    await body(executor, dir);
+    await body(executor, dir, bodies);
   } finally {
     server.close();
     rmSync(dir, { recursive: true, force: true });
@@ -202,7 +210,7 @@ test("reviewer: a cut AFTER review_result was delivered does not re-run the revi
       truncated,
     ],
     async (executor, cwd) => {
-      await executor.run({
+      const run = await executor.run({
         role: "reviewer",
         task: "review",
         tools: ["read"],
@@ -210,18 +218,29 @@ test("reviewer: a cut AFTER review_result was delivered does not re-run the revi
         resultTool: "review_result",
         modelOverride: { provider: "probe", id: "probe-model" },
       });
+      assert.equal(run.result.status, "completed", run.result.summary);
+      assert.equal((run.structured as { verdict?: string } | undefined)?.verdict, "approve");
     },
   );
   assert.equal(requests, 2, "the delivered verdict must not be thrown away and re-run in a fresh session");
 });
 
-test("worker: a cut AFTER a tool ran is not replayed — the task already has side effects", async () => {
+test("worker: a cut AFTER a tool ran is not replayed in a fresh session (resume disabled)", async () => {
   // Replaying from a fresh session would re-run every tool (bash included)
   // under a brand-new wall-clock budget. Fail with a distinct, non-transient
   // marker instead so the cause is visible and no infra retry kicks in.
   const requests = await withProbe(
     [toolCalls([{ name: "read", args: { path: "note.txt" } }]), truncated],
-    async (executor, cwd) => {
+    async (_executor, cwd) => {
+      // Resuming disabled: the pre-resume settlement.
+      const executor = new PiWorkerExecutor({
+        agentDir: cwd,
+        aps: false,
+        gatewayConfig: resolveGatewayConfig({ enabled: false }),
+        transientSleep: async () => {},
+        transientRand: () => 0,
+        streamResumeMax: 0,
+      });
       const run = await executor.run({
         role: "implementer",
         task: "t",
@@ -235,6 +254,109 @@ test("worker: a cut AFTER a tool ran is not replayed — the task already has si
     },
   );
   assert.equal(requests, 2, "no fresh-session replay after a tool ran");
+});
+
+/** A stream cut mid-message: some text is out, then no finish_reason. */
+const cutMidMessage: Reply = (res) => sse(res, [chunk({ role: "assistant", content: "PARTIAL-DRAFT-TEXT" })]);
+
+const bashMarker = toolCalls([
+  { name: "bash", args: { command: "echo marker-123 >> side-effect.txt; cat side-effect.txt" } },
+]);
+
+const bashRun = (executor: PiWorkerExecutor, cwd: string) =>
+  executor.run({
+    role: "implementer",
+    task: "t",
+    tools: ["bash"],
+    cwd,
+    modelOverride: { provider: "probe", id: "probe-model" },
+  });
+
+/** The resumed request keeps the executed tool call and its result, and drops the partial message. */
+function assertResumedHistory(body: string): void {
+  const messages = (JSON.parse(body) as { messages: Array<Record<string, any>> }).messages;
+  const call = messages.find((m) => m.role === "assistant" && Array.isArray(m.tool_calls));
+  assert.equal(call?.tool_calls[0].id, "call_0");
+  assert.equal(call?.tool_calls[0].function.name, "bash");
+  const result = messages.find((m) => m.role === "tool");
+  assert.equal(result?.tool_call_id, "call_0");
+  assert.match(JSON.stringify(result?.content), /marker-123\\n/);
+  assert.doesNotMatch(body, /PARTIAL-DRAFT-TEXT/);
+  assert.equal(messages.filter((m) => m.role === "assistant").length, 1, "only the executed turn remains");
+}
+
+test("worker: a cut after a tool ran resumes in the same session without replaying the tool", async () => {
+  const requests = await withProbe(
+    [bashMarker, cutMidMessage, toolCalls([{ name: "worker_result", args: WORKER_RESULT }])],
+    async (executor, cwd, bodies) => {
+      const run = await bashRun(executor, cwd);
+      assert.equal(run.result.status, "completed", run.result.summary);
+      assert.equal(run.usage?.streamResumes, 1);
+      assert.equal(
+        readFileSync(join(cwd, "side-effect.txt"), "utf8"),
+        "marker-123\n",
+        "the executed tool must not run again",
+      );
+      assertResumedHistory(bodies[2]!);
+    },
+  );
+  assert.equal(requests, 3, "tool turn, cut turn, resumed turn: one session");
+});
+
+test("worker: resume triggers through the armed resilient stream layer (production path)", async () => {
+  const requests = await withProbe(
+    [bashMarker, cutMidMessage, toolCalls([{ name: "worker_result", args: WORKER_RESULT }])],
+    async (executor, cwd, bodies) => {
+      assert.equal(isResilientRuntime(await executor.getModelRuntime()), true, "resilient layer must be armed");
+      const run = await bashRun(executor, cwd);
+      assert.equal(run.result.status, "completed", run.result.summary);
+      assert.equal(run.usage?.streamResumes, 1);
+      assert.equal(readFileSync(join(cwd, "side-effect.txt"), "utf8"), "marker-123\n");
+      assertResumedHistory(bodies[2]!);
+    },
+  );
+  assert.equal(requests, 3);
+});
+
+test("worker: a connection cut after a tool ran is resumed as well", async () => {
+  await withProbe(
+    [bashMarker, socketCut, toolCalls([{ name: "worker_result", args: WORKER_RESULT }])],
+    async (executor, cwd) => {
+      const run = await bashRun(executor, cwd);
+      assert.equal(run.result.status, "completed", run.result.summary);
+      assert.equal(run.usage?.streamResumes, 1);
+    },
+  );
+});
+
+test("worker: resumes are capped; the next cut settles truncated_after_progress", async () => {
+  const requests = await withProbe(
+    [bashMarker, cutMidMessage, cutMidMessage, cutMidMessage, cutMidMessage],
+    async (executor, cwd) => {
+      const run = await bashRun(executor, cwd);
+      assert.equal(run.result.status, "failed");
+      assert.equal(run.error, "truncated_after_progress");
+      assert.equal(run.usage?.streamResumes, 3);
+    },
+  );
+  assert.equal(requests, 5, "one tool turn, three resumed cuts, the fourth cut settles");
+});
+
+test("worker: the resume cap is configurable", async () => {
+  const requests = await withProbe([bashMarker, cutMidMessage, cutMidMessage], async (_e, cwd) => {
+    const executor = new PiWorkerExecutor({
+      agentDir: cwd,
+      aps: false,
+      gatewayConfig: resolveGatewayConfig({ enabled: false }),
+      transientSleep: async () => {},
+      transientRand: () => 0,
+      streamResumeMax: 1,
+    });
+    const run = await bashRun(executor, cwd);
+    assert.equal(run.error, "truncated_after_progress");
+    assert.equal(run.usage?.streamResumes, 1);
+  });
+  assert.equal(requests, 3);
 });
 
 /** The gateway restarts under the stream: the socket closes mid-body. */

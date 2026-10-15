@@ -48,6 +48,7 @@
 // "@earendil-works/pi-ai/compat" to the host's pi-ai, while a subpath would
 // bind whatever copy happens to be installed next to this package.
 import { isContextOverflow, isRetryableAssistantError } from "@earendil-works/pi-ai/compat";
+import { type AssistantLike, isFailedAssistantMessage } from "../inference/streamResume.ts";
 import { isBodyTooLarge } from "../request/bodyBudget.ts";
 import { isSummarizationRequest } from "../request/thinkingPolicy.ts";
 import { emitTelemetry } from "../telemetry/sink.ts";
@@ -117,13 +118,6 @@ export function resolveAfterOutputSchedule(
 }
 
 // ─── Classification ────────────────────────────────────────────────────────
-
-interface AssistantLike {
-  role?: string;
-  stopReason?: string;
-  errorMessage?: string;
-  content?: unknown;
-}
 
 /**
  * A failed assistant turn worth replaying from the same context: a transport
@@ -327,7 +321,7 @@ export class AfterOutputRetry {
       const entry = entries[i];
       const assistants = (entry?.messages ?? []).filter((m) => m.role === "assistant");
       const message = assistants[assistants.length - 1];
-      if (message) return message.stopReason === "error" ? { entryId: entry!.sourceEntry.id, message } : undefined;
+      if (message) return isFailedAssistantMessage(message) ? { entryId: entry!.sourceEntry.id, message } : undefined;
     }
     return undefined;
   }
