@@ -1137,7 +1137,9 @@ export function realBackends(opts: RealBackendsOptions) {
           (input.acceptanceCriteria ?? []).map((criterion) => criterion.acceptanceId),
           { tolerant: true, warnings: acceptanceWarnings, problems: acceptanceProblems },
         );
-        if (acceptanceProblems.length > 0) invalidReasons.push("acceptance_results");
+        // An approval with no acceptance evidence is meaningless; a request_changes
+        // verdict stands on its findings and stays valid whatever acceptance_results holds.
+        if (acceptanceProblems.length > 0 && verdict === "approve") invalidReasons.push("acceptance_results");
         for (const warning of acceptanceWarnings) {
           normalizedFindings.push({ severity: "minor", summary: `acceptance_results: ${warning}`, status: "open" });
         }

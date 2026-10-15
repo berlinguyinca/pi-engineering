@@ -434,3 +434,30 @@ test("moving the candidate branch or planting a hook fails the review; ignored o
     rmSync(repo, { recursive: true, force: true });
   }
 });
+
+test("request_changes with a blocking finding stays a valid verdict without acceptance_results", async () => {
+  const { outcome } = await review({
+    ...base,
+    verdict: "request_changes",
+    findings: [{ severity: "critical", title: "token not verified", detail: "auth bypass" }],
+    acceptance_results: [],
+  });
+  assert.equal(outcome.exitStatus, "succeeded", outcome.summary);
+  assert.equal(outcome.reviewEvidence?.outputValid, true);
+  assert.equal(outcome.reviewEvidence?.verdict, "request_changes");
+  assert.equal(outcome.findings?.length, 1, "the finding reaches the mission record");
+  assert.deepEqual(
+    outcome.reviewEvidence?.acceptanceResults?.map((r) => [r.acceptanceId, r.status, r.detail]),
+    [
+      ["AC-1", "failed", "not reported by reviewer"],
+      ["AC-2", "failed", "not reported by reviewer"],
+    ],
+  );
+  const classification = classifyGateFailure(
+    new FailureClassifier(),
+    "review",
+    { missionId: "M", taskId: "T", summary: "request_changes" },
+    { ...outcome, exitStatus: "failed" },
+  );
+  assert.equal(classification.category, "REVIEW_FAILED");
+});
