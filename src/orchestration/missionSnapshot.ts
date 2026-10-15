@@ -18,6 +18,8 @@ import {
   buildModelErrorRollups,
   buildTaskUsage,
 } from "./missionWhy.ts";
+import { type CanonicalLifecycleState, LIFECYCLE_SCHEMA_VERSION, toCanonical } from "./canonicalLifecycle.ts";
+import type { CanonicalLifecycle } from "./missionStore.ts";
 import type { MissionProjection } from "./observability/types.ts";
 import type {
   Execution,
@@ -125,6 +127,12 @@ export interface MissionSnapshotMission {
   goal: string;
   workflowClass: string;
   status: string;
+  /**
+   * Additive (contractVersion stays 3): the canonical R-LIFE state and the
+   * projection version that produced it. Older readers ignore both.
+   */
+  canonicalState?: CanonicalLifecycleState;
+  lifecycleSchemaVersion?: number;
   riskProfile: string;
   constraints: string[];
   requiredGates: string[];
@@ -262,6 +270,7 @@ export function buildMissionSnapshot(
     classifications: FailureClassification[];
     verifierStages?: VerifierStageTiming[];
   },
+  lifecycle?: CanonicalLifecycle,
 ): MissionSnapshotMission {
   return {
     id: mission.mission_id,
@@ -270,6 +279,8 @@ export function buildMissionSnapshot(
     goal: mission.goal,
     workflowClass: mission.workflow_class,
     status: mission.status,
+    canonicalState: lifecycle?.canonicalState ?? toCanonical(mission.status),
+    lifecycleSchemaVersion: lifecycle?.lifecycleSchemaVersion ?? LIFECYCLE_SCHEMA_VERSION,
     riskProfile: mission.risk_profile,
     constraints: mission.constraints,
     requiredGates: mission.required_gates,
@@ -371,6 +382,8 @@ export function buildMissionSnapshotFile(
     executions?: Execution[];
     classifications?: FailureClassification[];
     verifierStages?: VerifierStageTiming[];
+    /** The store's recorded lifecycle; absent means derive it from the status. */
+    lifecycle?: CanonicalLifecycle;
   }>,
 ): MissionSnapshotFile {
   return {
@@ -387,6 +400,7 @@ export function buildMissionSnapshotFile(
         m.executions
           ? { executions: m.executions, classifications: m.classifications ?? [], verifierStages: m.verifierStages }
           : undefined,
+        m.lifecycle,
       ),
     ),
   };

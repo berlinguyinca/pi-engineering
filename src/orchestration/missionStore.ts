@@ -12,6 +12,7 @@
 
 import { id } from "../core/ids.ts";
 import type { EventStoreBackend, StoredEvent } from "../platform/eventstore/backend.ts";
+import { type CanonicalLifecycleState, LIFECYCLE_SCHEMA_VERSION, toCanonical } from "./canonicalLifecycle.ts";
 import {
   buildCandidateEvidenceIdentity,
   hashCandidateEvidenceIdentity,
@@ -339,9 +340,27 @@ function fromStored(e: StoredEvent): OrchestrationEvent {
   };
 }
 
+/** A mission's canonical lifecycle state and the projection version that produced it. */
+export interface CanonicalLifecycle {
+  canonicalState: CanonicalLifecycleState;
+  lifecycleSchemaVersion: number;
+}
+
+interface CanonicalLifecycleRecord extends CanonicalLifecycle {
+  /** The `MissionStatus` this record was written for; a later status makes it stale. */
+  status: MissionStatus;
+}
+
 export class MissionStore {
   private readonly backend: EventStoreBackend;
   private readonly missions = new Map<string, Mission>();
+  /**
+   * The canonical lifecycle image recorded by the last transition, with the
+   * status it was recorded for. Rebuilt on replay from the transition event;
+   * a journal written before the field existed leaves no entry and is derived
+   * with `toCanonical` on read, never written back.
+   */
+  private readonly canonicalRecords = new Map<string, CanonicalLifecycleRecord>();
   private readonly tasks = new Map<string, OrchestrationTask>();
   /** Tasks currently waiting for another mission's repository lease (informational, in-memory). */
   private readonly repositoryWaits = new Map<string, RepositoryWait>();
@@ -497,7 +516,10 @@ export class MissionStore {
         const idm = e.payload.mission_id as string;
         const patch = e.payload.patch as Partial<Mission>;
         const m = this.missions.get(idm);
-        if (m && patch) this.missions.set(idm, { ...m, ...patch, updated_at: e.timestamp });
+        if (m && patch) {
+          this.missions.set(idm, { ...m, ...patch, updated_at: e.timestamp });
+          this.recordCanonical(idm, patch.status, e.payload);
+        }
         break;
       }
       case "mission.completed":
@@ -673,11 +695,13 @@ export class MissionStore {
         const missionPatch = e.payload.mission_patch as Partial<Mission> | undefined;
         if (decision && missionPatch) {
           const mission = this.missions.get(decision.missionId);
-          if (mission)
+          if (mission) {
             this.missions.set(decision.missionId, {
               ...mission,
               ...missionPatch,
             });
+            this.recordCanonical(decision.missionId, missionPatch.status, e.payload);
+          }
         }
         break;
       }
@@ -821,6 +845,39 @@ export class MissionStore {
     this.advanceMissionRevision(e.mission_id);
   }
 
+  /** Remember the canonical image a transition event carried, if it carried one. */
+  private recordCanonical(
+    missionId: string,
+    status: MissionStatus | undefined,
+    payload: Record<string, unknown>,
+  ): void {
+    if (!status) return;
+    const canonicalState = payload.canonicalState;
+    const version = payload.lifecycleSchemaVersion;
+    if (typeof canonicalState !== "string" || typeof version !== "number") return;
+    this.canonicalRecords.set(missionId, {
+      status,
+      canonicalState: canonicalState as CanonicalLifecycleState,
+      lifecycleSchemaVersion: version,
+    });
+  }
+
+  /**
+   * The mission's canonical lifecycle state (R-LIFE). The recorded image wins
+   * while it still describes the current status; otherwise (a journal from
+   * before the field, or a status changed by a path that records none) it is
+   * derived from the status. Derived values are never written back.
+   */
+  getCanonicalLifecycle(missionId: string): CanonicalLifecycle | undefined {
+    const mission = this.missions.get(missionId);
+    if (!mission) return undefined;
+    const recorded = this.canonicalRecords.get(missionId);
+    if (recorded && recorded.status === mission.status) {
+      return { canonicalState: recorded.canonicalState, lifecycleSchemaVersion: recorded.lifecycleSchemaVersion };
+    }
+    return { canonicalState: toCanonical(mission.status), lifecycleSchemaVersion: LIFECYCLE_SCHEMA_VERSION };
+  }
+
   private advanceMissionRevision(missionId: string): void {
     const mission = this.missions.get(missionId);
     if (!mission) return;
@@ -924,7 +981,11 @@ export class MissionStore {
       updated_at: now,
       ...(to === "BLOCKED" ? { blocked_at: now, blocked_episode_id: id("BLK") } : {}),
     };
+    // The canonical image rides on the transition event beside the actor and
+    // timestamp; the persisted MissionStatus is unchanged.
+    const lifecycle = { canonicalState: toCanonical(to), lifecycleSchemaVersion: LIFECYCLE_SCHEMA_VERSION };
     this.missions.set(missionId, { ...m, ...patch });
+    this.canonicalRecords.set(missionId, { status: to, ...lifecycle });
     if (repairDecision) {
       const started: RecoveryDecision = {
         ...repairDecision,
@@ -939,11 +1000,12 @@ export class MissionStore {
           decision: started,
           mission_id: missionId,
           mission_patch: patch,
+          ...lifecycle,
         },
         now,
       );
     } else {
-      this.emit("mission.updated", missionId, { actor, mission_id: missionId, patch }, now);
+      this.emit("mission.updated", missionId, { actor, mission_id: missionId, patch, ...lifecycle }, now);
     }
     if (to === "BLOCKED" && this.missions.get(missionId)?.blocked_episode_id) {
       const blockerEpisodeId = this.missions.get(missionId)!.blocked_episode_id!;
