@@ -17,8 +17,11 @@
  */
 
 import { execFile } from "node:child_process";
+import { type GitRunner, type SelfUpdateResult, checkForUpdate } from "../../update/selfUpdate.ts";
 
 export const DEFAULT_AUTO_RELOAD_INTERVAL_MS = 15_000;
+/** How often a tracking checkout is fetched and fast-forwarded (a network call; not every poll). */
+export const DEFAULT_FOLLOW_REMOTE_INTERVAL_MS = 5 * 60_000;
 
 export interface SourceWatchOptions {
   intervalMs: number;
@@ -102,6 +105,37 @@ export class SourceWatcher {
     })();
     return this.polling;
   }
+}
+
+/** A GitRunner (src/update/selfUpdate.ts) over `root`, for the follow-remote step. */
+export function gitRunner(root: string, timeoutMs = 30_000): GitRunner {
+  return (args) =>
+    new Promise((resolve) => {
+      execFile(
+        "git",
+        ["-C", root, ...args],
+        { timeout: timeoutMs, windowsHide: true, maxBuffer: 4 * 1024 * 1024 },
+        (error, stdout, stderr) => {
+          const code = error ? ((error as { code?: unknown }).code as number | undefined) : 0;
+          resolve({
+            code: typeof code === "number" ? code : error ? 1 : 0,
+            stdout: stdout?.toString() ?? "",
+            stderr: stderr?.toString() ?? error?.message ?? "",
+          });
+        },
+      );
+    });
+}
+
+/**
+ * Bring a checkout that tracks a remote (a session on another host, loading
+ * pi-engineering from a clone of the GitHub repository) up to that remote:
+ * fetch, then a strict fast-forward — never over uncommitted work, never
+ * when the branch diverged (`checkForUpdate` owns those rules). A
+ * fast-forward moves HEAD, which the watcher then turns into a hot reload.
+ */
+export function followRemote(root: string): Promise<SelfUpdateResult> {
+  return checkForUpdate({ cwd: root, git: gitRunner(root), apply: true });
 }
 
 /** `git rev-parse HEAD` of `root`, or null when it is not a readable checkout. */

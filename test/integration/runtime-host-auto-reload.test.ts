@@ -130,6 +130,86 @@ test("/pie: Host subcommands, the generation's commands, and `update` on a moved
   assert.ok(ext.pieNames().includes("update"));
 });
 
+/**
+ * A session on another host: pi-engineering is a clone tracking a remote
+ * (`origin`, here a bare repository). A push to that remote must reach the
+ * running session without anyone typing anything on that host.
+ */
+async function setupRemote() {
+  const key = `__rt_follow_${process.pid}_${++seq}`;
+  const b = bag(key);
+  const root = mkdtempSync(join(tmpdir(), "rt-follow-"));
+  const origin = join(root, "origin.git");
+  const author = join(root, "author");
+  const source = join(root, "source");
+  git(root, "init", "-q", "--bare", "-b", "main", origin);
+  writeFixtureRuntime(author, key, { value: "A" });
+  git(author, "init", "-q", "-b", "main");
+  git(author, "add", "-A");
+  git(author, "commit", "-qm", "A");
+  git(author, "remote", "add", "origin", origin);
+  git(author, "push", "-q", "-u", "origin", "main");
+  git(root, "clone", "-q", origin, source);
+  const ext = new EngineeringHostExtension({
+    installRoot: join(root, "install"),
+    packageRoot: source,
+    entry: "runtime.ts",
+    baseline: true,
+    autoUpdateCheck: false,
+    autoReload: true,
+    autoReloadIntervalMs: 25,
+    followRemote: true,
+    followRemoteIntervalMs: 0,
+  });
+  const pi: PiTestSession = await startPiSession({ factories: [(api: never) => ext.install(api)] });
+  cleanups.push(async () => {
+    await pi.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+  const push = (value: string) => {
+    writeFixtureRuntime(author, key, { value });
+    git(author, "add", "-A");
+    git(author, "commit", "-qm", value);
+    git(author, "push", "-q", "origin", "main");
+    return git(author, "rev-parse", "HEAD");
+  };
+  return { key, source, ext, pi, host: ext.host as NonNullable<typeof ext.host>, b, push };
+}
+
+test("follow remote: a push to the tracked remote fast-forwards the clone and hot-reloads the session", async () => {
+  const { pi, host, b, push, source } = await setupRemote();
+  assert.equal(host.activeGeneration()?.generation, 1);
+  await pi.emit({ type: "agent_settled" });
+  assert.equal(b.values.at(-1), "A");
+
+  const sha = push("B");
+  await until(() => host.activeGeneration()?.generation === 2, "handover after the remote moved");
+  assert.equal(host.lastHandover?.ok, true, host.lastHandover?.failure);
+  assert.equal(git(source, "rev-parse", "HEAD"), sha, "the clone was fast-forwarded");
+  assert.equal(host.activeGeneration()?.source.commit, sha);
+  await pi.emit({ type: "agent_settled" });
+  assert.equal(b.values.at(-1), "B");
+});
+
+test("follow remote: a dirty clone is never pulled over; a local commit ahead of the remote is never touched", async () => {
+  const { host, push, source, key } = await setupRemote();
+  // Dirty: an edit in the clone's working tree.
+  writeFixtureRuntime(source, key, { value: "LOCAL-EDIT" });
+  const remoteSha = push("B");
+  await new Promise((r) => setTimeout(r, 200));
+  assert.equal(host.activeGeneration()?.generation, 1, "no handover over uncommitted work");
+  assert.notEqual(git(source, "rev-parse", "HEAD"), remoteSha, "the clone did not move");
+
+  // Ahead (diverged): the operator's own commit in the clone.
+  git(source, "add", "-A");
+  git(source, "commit", "-qm", "local");
+  const localSha = git(source, "rev-parse", "HEAD");
+  await until(() => host.activeGeneration()?.generation === 2, "a local commit still hot-reloads");
+  assert.equal(host.activeGeneration()?.source.commit, localSha);
+  await new Promise((r) => setTimeout(r, 200));
+  assert.equal(git(source, "rev-parse", "HEAD"), localSha, "a diverged clone is never merged or reset");
+});
+
 test("auto reload: closing the session disposes the watcher", async () => {
   const { pi, ext } = await setup();
   assert.ok(ext.sourceWatcher?.active);

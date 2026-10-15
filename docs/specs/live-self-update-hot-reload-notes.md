@@ -112,7 +112,7 @@ the package checkout" means installed updates are not in effect.
 |---|---|
 | `/pie <sub> [args]` | Alias for everything pi-engineering registers: `/pie update`, `/pie reload`, … are the Host subcommands below; any other name is a command of the running generation (`/pie mission status` is `/mission status`); `/pie` alone lists them. |
 | `/engineering reload` | Re-reads the runtime source (the checkout, the dev override, or the installed `current`), imports it as a new generation, and hands over. The same Pi process and conversation continue. |
-| *(automatic)* | When Pi runs from a git checkout, the Host polls its `HEAD` (every 15 s) and performs the same handover by itself when it moves — a merge on the branch Pi loads from hot-reloads every running session. Uncommitted edits never trigger it. `PI_ENGINEERING_AUTO_RELOAD=0` turns it off. |
+| *(automatic)* | When Pi runs from a git checkout, the Host polls its `HEAD` (every 15 s) and performs the same handover by itself when it moves — a merge on the branch Pi loads from hot-reloads every running session. Uncommitted edits never trigger it. A checkout that tracks a remote (a session on another host, cloned from GitHub) is first fetched and fast-forwarded to it every 5 minutes — only when clean and strictly behind — so a push to the branch hot-reloads those sessions too. `PI_ENGINEERING_AUTO_RELOAD=0` turns the reload off, `PI_ENGINEERING_FOLLOW_REMOTE=0` the fetch. |
 | `/engineering update [--check] [--force] [--channel stable\|main] [--commit <sha>] [--verify-full]` | Running from a checkout whose `HEAD` is no longer the running commit: hands over to the checkout (a reload) at once. Otherwise runs CHECK → FETCH → STAGE → VALIDATE → install → handover → COMMIT. `--check` writes nothing except the download cache. |
 | `/engineering rollback [version] [--yes]` | Runs the same journaled handover to a retained version. If the state was migrated past what the target can read, it is restored from that migration's checkpoint. Files under the checkpointed paths written after that update committed would be discarded: the command lists them and changes nothing unless `--yes` is given. |
 | `/engineering version` | Shows version, commit, channel, runtime API, generation, state schema, Pi compatibility, previous version, last update and last reload. |
@@ -138,6 +138,8 @@ unless `autoInstall` is set in `update-preferences.json`.
 | `PI_ENGINEERING_UPDATE_CHECK=0` | Turns the automatic check off. |
 | `PI_ENGINEERING_AUTO_RELOAD=0` | Turns the automatic hot reload on checkout `HEAD` changes off. |
 | `PI_ENGINEERING_AUTO_RELOAD_INTERVAL_MS` | How often the checkout's `HEAD` is polled (default 15000). |
+| `PI_ENGINEERING_FOLLOW_REMOTE=0` | Stop fetching and fast-forwarding a tracking checkout to its remote (also off under `PI_SELF_UPDATE=0`/`check`). Only a clean branch that is strictly behind its upstream is ever moved. |
+| `PI_ENGINEERING_FOLLOW_REMOTE_INTERVAL_MS` | How often the remote is fetched (default 300000). |
 | `PI_ENGINEERING_SAFE_POINT_TIMEOUT_MS` | Upper bound on the wait for a safe point. The default is to wait until cancelled. |
 
 ## Deliberate limits and residual risks

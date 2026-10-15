@@ -278,6 +278,12 @@ never loaded. `/pie update` does the same immediately (and, when the checkout
 has not moved, checks the update remote as before). `PI_ENGINEERING_AUTO_RELOAD=0`
 turns the automatic reload off.
 
+A session on another host, loading pi-engineering from a clone that tracks
+GitHub, follows it too: every 5 minutes the checkout is fetched and
+fast-forwarded (only when clean and strictly behind its upstream; a diverged
+or dirty checkout is never touched), and the new commit hot-reloads the
+session the same way. `PI_ENGINEERING_FOLLOW_REMOTE=0` turns the fetch off.
+
 ### Interrupting and cancelling a mission
 
 Pressing Esc while the `mission` tool or `/mission` runs **pauses** the mission

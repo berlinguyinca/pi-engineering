@@ -33,7 +33,13 @@ import { ago, formatHandover, short, waitingText } from "./format.ts";
 import { type HandoverHooks, type HandoverResult, type HandoverTask, RuntimeBusyError, RuntimeHost } from "./host.ts";
 import { type RuntimeSource, snapshotRuntimeSource } from "./loader.ts";
 import { publishRuntimeStatus } from "./runtimeStatus.ts";
-import { DEFAULT_AUTO_RELOAD_INTERVAL_MS, SourceWatcher, gitHead } from "./sourceWatch.ts";
+import {
+  DEFAULT_AUTO_RELOAD_INTERVAL_MS,
+  DEFAULT_FOLLOW_REMOTE_INTERVAL_MS,
+  SourceWatcher,
+  followRemote,
+  gitHead,
+} from "./sourceWatch.ts";
 import { type RuntimeEventFields, RuntimeTelemetry } from "./telemetry.ts";
 
 export const DEFAULT_RUNTIME_ENTRY = "src/runtime/host/runtimeEntry.ts";
@@ -73,6 +79,16 @@ export interface HostExtensionConfig {
   autoReload?: boolean;
   /** How often the checkout's HEAD is polled (default 15 s). */
   autoReloadIntervalMs?: number;
+  /**
+   * Keep a checkout that tracks a remote up to that remote (fetch + strict
+   * fast-forward, never over uncommitted work or a diverged branch), so a
+   * session on another host follows GitHub and hot-reloads. Default on,
+   * like the legacy session-start fast-forward it extends; off with
+   * `PI_ENGINEERING_FOLLOW_REMOTE=0` or `PI_SELF_UPDATE=0|off|check`.
+   */
+  followRemote?: boolean;
+  /** How often the remote is fetched (default 5 min). */
+  followRemoteIntervalMs?: number;
 }
 
 export function resolveHostConfig(env: NodeJS.ProcessEnv = process.env): HostExtensionConfig {
@@ -102,6 +118,11 @@ export function resolveHostConfig(env: NodeJS.ProcessEnv = process.env): HostExt
     autoReload: env.PI_ENGINEERING_AUTO_RELOAD !== "0",
     ...(Number(env.PI_ENGINEERING_AUTO_RELOAD_INTERVAL_MS) > 0
       ? { autoReloadIntervalMs: Number(env.PI_ENGINEERING_AUTO_RELOAD_INTERVAL_MS) }
+      : {}),
+    followRemote:
+      env.PI_ENGINEERING_FOLLOW_REMOTE !== "0" && !/^(0|false|off|check)$/i.test((env.PI_SELF_UPDATE ?? "auto").trim()),
+    ...(Number(env.PI_ENGINEERING_FOLLOW_REMOTE_INTERVAL_MS) > 0
+      ? { followRemoteIntervalMs: Number(env.PI_ENGINEERING_FOLLOW_REMOTE_INTERVAL_MS) }
       : {}),
   };
 }
@@ -393,10 +414,32 @@ export class EngineeringHostExtension {
     // itself; only a live checkout can move underneath a running Pi.
     if (source.label.startsWith("installed:") || !existsSync(join(source.root, ".git"))) return;
     const root = source.root;
+    // A checkout tracking a remote (a session on another host, cloned from
+    // GitHub) is brought up to it first, every followRemoteIntervalMs; a
+    // fast-forward moves HEAD and the poll below turns it into the reload.
+    // Fetch failures are silence (checkForUpdate never throws), and the local
+    // checkout the operator merges into is left alone: ahead of or diverged
+    // from its upstream it is never touched.
+    const followEvery = this.config.followRemoteIntervalMs ?? DEFAULT_FOLLOW_REMOTE_INTERVAL_MS;
+    let lastFollowAt = Number.NEGATIVE_INFINITY;
+    const fingerprint = async (): Promise<string | null> => {
+      if (this.config.followRemote === true && Date.now() - lastFollowAt >= followEvery) {
+        lastFollowAt = Date.now();
+        const result = await followRemote(root);
+        if (result.applied) {
+          const latest = (host.latestContext() as Ctx | undefined) ?? ctx;
+          notify(
+            latest,
+            `Pi Engineering checkout fast-forwarded to ${short(result.head)} (${result.decision.reason}).`,
+          );
+        }
+      }
+      return gitHead(root);
+    };
     this.sourceWatcher = new SourceWatcher({
       intervalMs: this.config.autoReloadIntervalMs ?? DEFAULT_AUTO_RELOAD_INTERVAL_MS,
       baseline: host.activeGeneration()?.source.commit ?? source.commit ?? null,
-      fingerprint: () => gitHead(root),
+      fingerprint,
       onChange: async (next, previous) => {
         // Another handover is in flight: leave the baseline and look again.
         if (host.pendingTask()) return false;
