@@ -47,8 +47,8 @@ export const DEFAULT_GUARD_CONFIG: GenerationGuardConfig = {
   semanticSimilarityEnabled: false,
   semanticSimilarityThreshold: 0.94,
 
-  maxReasoningTokensWithoutProgress: 1500,
-  maxNarrationTokensBeforeAction: 600,
+  maxReasoningTokensWithoutProgress: 4000,
+  maxNarrationTokensBeforeAction: 2000,
   narrationBudgetEnabled: true,
 
   maxRecoveryAttempts: 3,

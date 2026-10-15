@@ -3653,7 +3653,10 @@ export class ExecutionBroker {
         // Git operations cannot safely straddle a revocable execution-authority
         // await, even after a successful merge.
         assertOrigin();
-        this.deferMissionWorktreeCleanup(input.missionId);
+        // A failed merge keeps its worker branches pending so the orchestrator
+        // can re-run the integration deterministically; they are released (with
+        // their branches preserved) by the mission cleanup if it never lands.
+        if (outcome.exitStatus === "succeeded") this.deferMissionWorktreeCleanup(input.missionId);
         assertOrigin();
         return outcome;
       }

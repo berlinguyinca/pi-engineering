@@ -18,6 +18,7 @@ export type { GuardFeed } from "./streamText.ts";
 export type { GuardDecision, GuardAbortReason, ProgressEventType, GenerationGuardState } from "./GenerationGuard.ts";
 export {
   RECOVERY_PROMPT,
+  GUARD_STEER_PROMPT,
   TOOL_TRANSITION_RULE,
   lowerReasoningEffort,
   reasoningEffortForRecovery,
