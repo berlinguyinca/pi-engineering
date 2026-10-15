@@ -1584,9 +1584,12 @@ export class ExecutionBroker {
         if (lifecycle) this.missionCandidates.set(missionId, { lifecycle, git: repository.git });
       }
       const containedIn = recorded?.identity.candidateSha ?? binding.baseSha;
+      const superseded = new Set(this.store.listTaskSupersessions(missionId).map((lineage) => lineage.failedTaskId));
       for (const task of this.store.listTasks(missionId)) {
         if (task.kind !== "agent" || !task.mutates_repo || task.isolation !== "worktree") continue;
         if (task.repo_id !== binding.repoId) continue;
+        // A branch an earlier recovery deliberately replaced is not pending work.
+        if (superseded.has(task.task_id)) continue;
         const branch = `pi-eng-orch-${task.task_id}`;
         if ((this.missionWorktrees.get(missionId) ?? []).some((worktree) => worktree.branch === branch)) continue;
         try {
@@ -1598,14 +1601,19 @@ export class ExecutionBroker {
         }
         const worktrees = this.missionWorktrees.get(missionId) ?? [];
         worktrees.push({
-          path: repository.git.worktreePath(branch),
+          // The worktree git still knows for the branch; the naming convention
+          // (where createWorktree places it) when none is registered any more.
+          path:
+            (await repository.git.worktreeForBranch(branch).catch(() => null)) ?? repository.git.worktreePath(branch),
           branch,
           git: repository.git,
           repoId: binding.repoId,
           writeDomains: [...task.write_domains],
         });
         this.missionWorktrees.set(missionId, worktrees);
-        if (task.status === "FAILED") {
+        // Anything that did not SUCCEED (failed, canceled, stale RUNNING) is
+        // unfinished work: preserve it, never hand it to integration as clean.
+        if (task.status !== "SUCCEEDED") {
           const executions = this.store.listExecutions(missionId, task.task_id);
           const marker =
             executions.at(-1)?.exit_status === WALL_CLOCK_TIMEOUT_MARKER ? WALL_CLOCK_TIMEOUT_MARKER : "failed";
@@ -1635,7 +1643,8 @@ export class ExecutionBroker {
     stranded: Array<{ branch: string; taskId: string; marker: string; tip: string }>;
   }> {
     const failed = this.failedBranches.get(missionId);
-    const base = this.store.getMission(missionId)?.base_ref?.trim() || this.resolvedBases.get(missionId);
+    const missionBase = this.store.getMission(missionId)?.base_ref?.trim() || this.resolvedBases.get(missionId);
+    const manifest = this.store.getWorkspaceManifest(missionId);
     let eligible = 0;
     const stranded: Array<{ branch: string; taskId: string; marker: string; tip: string }> = [];
     for (const worktree of this.missionWorktrees.get(missionId) ?? []) {
@@ -1644,6 +1653,8 @@ export class ExecutionBroker {
         eligible++;
         continue;
       }
+      // A fresh process has no resolved base: the manifest-bound one is durable.
+      const base = missionBase || manifest?.repositories.find((entry) => entry.repoId === worktree.repoId)?.baseSha;
       if (!base) continue;
       try {
         if (!(await worktree.git.branchAheadOf(base, worktree.branch))) continue;

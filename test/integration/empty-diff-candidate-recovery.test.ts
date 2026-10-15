@@ -7,7 +7,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { writeFile } from "node:fs/promises";
+import { rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import { GitRepo } from "../../src/git/GitRepo.ts";
@@ -161,8 +161,10 @@ async function orchestratorFor(
   registry: RepositoryRegistry,
   calls: Calls,
   modes: AgentMode[],
+  maxRepairRounds?: number,
 ) {
   return new Orchestrator({
+    ...(maxRepairRounds === undefined ? {} : { maxRepairRounds }),
     store,
     repositoryRegistry: registry,
     backends: backendsFor(git, calls, modes),
@@ -248,6 +250,7 @@ describe("never publish an empty-diff candidate over preserved worker work (#173
       kind: "validation",
       category: "VALIDATION_FAILED",
     },
+    unverifiable = false,
   ) {
     const h = await flowHarness(["commit"]);
     const store = h.store;
@@ -329,7 +332,7 @@ describe("never publish an empty-diff candidate over preserved worker work (#173
         repoId: "repo-empty",
         baseSha: h.baseSha,
         candidateSha: h.baseSha,
-        diffHash: EMPTY_DIFF_HASH,
+        diffHash: unverifiable ? `sha256:${"0".repeat(64)}` : EMPTY_DIFF_HASH,
         acceptanceIds: [],
         artifactHashes: [],
       }),
@@ -457,7 +460,7 @@ describe("never publish an empty-diff candidate over preserved worker work (#173
     }
   });
 
-  it("re-runs the gates directly when a fence classification finds no failed task left", async () => {
+  it("never completes a no-change candidate when a fence classification finds no failed task left", async () => {
     const { h, missionId, freshOrchestrator } = await emptyCandidateMission({ kind: "orphan" });
     try {
       const fresh = await freshOrchestrator(["commit"]);
@@ -487,10 +490,12 @@ describe("never publish an empty-diff candidate over preserved worker work (#173
       });
       fresh.store.transitionTask("TSK-earlier-replacement", "READY");
       fresh.store.transitionTask("TSK-earlier-replacement", "CANCELED");
-      await fresh.orchestrator.repairBlockedMission(missionId);
+      const resumed = await fresh.orchestrator.repairBlockedMission(missionId);
       const decision = fresh.store.listRecoveryDecisions(missionId).at(-1)!;
       assert.equal(decision.action, "FENCE_RECONCILE_AND_RESUME");
-      assert.equal(fresh.calls.agent, 0, "no worker ran: only the gates re-ran");
+      assert.equal(fresh.calls.agent, 0, "no worker ran");
+      assert.equal(fresh.calls.validation, 0, "gates are not re-run over a no-change candidate");
+      assert.equal(resumed.status, "BLOCKED");
       assert.notEqual(decision.status, "planned");
     } finally {
       await h.fixture.cleanup();
@@ -540,6 +545,161 @@ describe("never publish an empty-diff candidate over preserved worker work (#173
       assert.ok(fresh.broker.pendingIntegrations(missionId) > 0, "preserved worker branches are pending again");
       const { stranded } = await fresh.broker.strandedWorkerWork(missionId);
       assert.ok(stranded.some((entry) => entry.branch.startsWith("pi-eng-orch-TSK-")));
+    } finally {
+      await h.fixture.cleanup();
+    }
+  });
+
+  it("words the refusal by whether a candidate was recorded but cannot be verified", async () => {
+    const { h, missionId, freshOrchestrator } = await emptyCandidateMission(undefined, true);
+    try {
+      const fresh = await freshOrchestrator(["commit"]);
+      const resumed = await fresh.orchestrator.repairBlockedMission(missionId);
+      assert.equal(resumed.status, "BLOCKED");
+      const stop = fresh.store.listMissionStops(missionId).at(-1)!;
+      assert.match(stop.reason, /recorded candidate .* could not be Git-verified/);
+      assert.doesNotMatch(stop.reason, /no independently Git-verified/);
+      assert.equal(fresh.calls.agent, 0);
+    } finally {
+      await h.fixture.cleanup();
+    }
+  });
+
+  it("still verifies the candidate in the same process after its mounted worktree is removed", async () => {
+    const h = await flowHarness(["commit"], 99);
+    try {
+      const result = await h.orchestrator.orchestrate(`Add a real diff in ${h.fixture.root}`, {
+        repository: h.fixture.root,
+        baseRef: h.baseSha,
+        mutationRequested: true,
+      });
+      const missionId = result.mission.mission_id;
+      const before = await h.orchestrator.broker.verifiedCandidateContent(missionId);
+      assert.ok(before?.hasChanges);
+      const mounted = h.orchestrator.broker.candidateWorktree(missionId);
+      assert.ok(mounted, "the same broker still holds the mounted candidate");
+      await rm(mounted.path, { recursive: true, force: true });
+      const after = await h.orchestrator.broker.verifiedCandidateContent(missionId);
+      assert.ok(after, "a removed worktree does not erase the durable record");
+      assert.equal(after.diffHash, before.diffHash);
+    } finally {
+      await h.fixture.cleanup();
+    }
+  });
+
+  async function stalledDeadWorker() {
+    const h = await flowHarness(["die-after-commit"], 0);
+    const noRepairs = await orchestratorFor(h.store, h.git, h.registry, h.calls, ["die-after-commit"], 0);
+    const result = await noRepairs.orchestrate(`Add the dead-worker module in ${h.fixture.root}`, {
+      repository: h.fixture.root,
+      baseRef: h.baseSha,
+      mutationRequested: true,
+    });
+    const missionId = result.mission.mission_id;
+    await h.store.flush();
+    const freshStore = MissionStore.open(h.backend);
+    const registry = new RepositoryRegistry();
+    await registry.register(freshStore.getWorkspaceManifest(missionId)!);
+    const calls: Calls = { agent: 0, validation: 0, review: 0, agentSawDeadWork: [] };
+    const fresh = await orchestratorFor(freshStore, h.git, registry, calls, ["commit"]);
+    return { h, missionId, freshStore, fresh };
+  }
+
+  it("does not re-file stranded work for a task an earlier recovery superseded", async () => {
+    const { h, missionId, freshStore, fresh } = await stalledDeadWorker();
+    try {
+      const dead = freshStore.listTasks(missionId).find((task) => task.kind === "agent" && task.status === "FAILED")!;
+      freshStore.createTask({
+        task_id: "TSK-replacement",
+        mission_id: missionId,
+        kind: "agent",
+        role: "implementer",
+        objective: dead.objective,
+        repo_id: dead.repo_id,
+        mutates_repo: true,
+        isolation: "worktree",
+        write_domains: dead.write_domains,
+        acceptance_ids: dead.acceptance_ids,
+        deliverables: dead.deliverables,
+      });
+      freshStore.supersedeTask({
+        supersessionId: "SUP-earlier",
+        missionId,
+        failedTaskId: dead.task_id,
+        replacementTaskIds: ["TSK-replacement"],
+        repoId: dead.repo_id ?? "",
+        acceptanceIds: [...(dead.acceptance_ids ?? [])],
+        coverageFingerprint: taskCoverageFingerprint(dead),
+        reason: "earlier recovery",
+        createdAt: "2026-09-27T00:00:02.000Z",
+      });
+      await fresh.broker.rehydrateMission(missionId);
+      assert.equal(fresh.broker.pendingIntegrations(missionId), 0);
+      assert.deepEqual((await fresh.broker.strandedWorkerWork(missionId)).stranded, []);
+    } finally {
+      await h.fixture.cleanup();
+    }
+  });
+
+  it("preserves the branch of a CANCELED task as ineligible, never as clean work", async () => {
+    const { h, missionId, freshStore, fresh } = await stalledDeadWorker();
+    try {
+      const dead = freshStore.listTasks(missionId).find((task) => task.kind === "agent" && task.status === "FAILED")!;
+      const canceled = freshStore.createTask({
+        task_id: "TSK-canceled",
+        mission_id: missionId,
+        kind: "agent",
+        role: "implementer",
+        objective: "canceled worker",
+        repo_id: dead.repo_id,
+        mutates_repo: true,
+        isolation: "worktree",
+        write_domains: dead.write_domains,
+      });
+      freshStore.transitionTask(canceled.task_id, "READY");
+      freshStore.transitionTask(canceled.task_id, "CANCELED");
+      const worktree = await h.git.createWorktree(h.baseSha, "pi-eng-orch-TSK-canceled");
+      await writeFile(join(worktree.path, "src", "canceled.ts"), "export const canceled = true;\n");
+      await h.git.commitAll(worktree.path, "canceled work");
+      await fresh.broker.rehydrateMission(missionId);
+      const { eligible, stranded } = await fresh.broker.strandedWorkerWork(missionId);
+      assert.equal(eligible, 0);
+      assert.ok(stranded.some((entry) => entry.branch === "pi-eng-orch-TSK-canceled"));
+    } finally {
+      await h.fixture.cleanup();
+    }
+  });
+
+  it("tells the re-adopting worker its base is partial, and restarts from base after repeated failed re-adoptions", async () => {
+    const h = await flowHarness(["die-after-commit", "die-after-commit", "die-after-commit", "commit"], 0);
+    try {
+      const orchestrator = await orchestratorFor(
+        h.store,
+        h.git,
+        h.registry,
+        h.calls,
+        ["die-after-commit", "die-after-commit", "die-after-commit", "commit"],
+        5,
+      );
+      const result = await orchestrator.orchestrate(`Add the dead-worker module in ${h.fixture.root}`, {
+        repository: h.fixture.root,
+        baseRef: h.baseSha,
+        mutationRequested: true,
+      });
+      const missionId = result.mission.mission_id;
+      const tasks = h.store.listTasks(missionId);
+      const readopts = tasks.filter((task) => task.objective.startsWith("Re-adopt preserved worker branch:"));
+      assert.ok(readopts.length >= 2, "re-adoption is attempted before it is abandoned");
+      assert.match(readopts[0]!.objective, /partial, unreviewed output from a crashed worker/);
+      assert.match(readopts[0]!.objective, /verify it before building on it/);
+      const fallback = tasks.filter((task) => !task.repair_base_candidate_sha && task.objective.includes("abandoned"));
+      assert.ok(fallback.length >= 1, "once re-adoption keeps failing, repair restarts from the mission base");
+      assert.ok(
+        h.store
+          .listFindings(missionId)
+          .some((finding) => /discarded as a starting point after 2 failed re-adoptions/.test(finding.summary)),
+      );
+      assert.equal(result.mission.status, "COMPLETE", JSON.stringify(result.verdict));
     } finally {
       await h.fixture.cleanup();
     }

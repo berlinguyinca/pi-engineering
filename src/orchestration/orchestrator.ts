@@ -251,6 +251,9 @@ const MAX_TRACKED_BUILD_EXECUTIONS = 256;
 
 /** Finding category for committed worker work that integration refused to merge. */
 const STRANDED_WORKER_WORK = "stranded_worker_work";
+const READOPT_OBJECTIVE_PREFIX = "Re-adopt preserved worker branch:";
+/** Failed re-adoptions of stranded work before the mission restarts it from base. */
+const MAX_READOPTIONS = 2;
 
 /** Content hash of an empty diff: a candidate identical to its base. */
 const EMPTY_DIFF_HASH = `sha256:${createHash("sha256").update("").digest("hex")}`;
@@ -548,7 +551,11 @@ export class Orchestrator {
             candidateSha: verifiedRecoveryStart.candidateSha,
             diffHash: verifiedRecoveryStart.diffHash,
           }
-        : recordedEmptyBaseline;
+        : null;
+      // Only a Git-verified candidate that actually changes the repository may
+      // have its gates re-run alone; a no-change candidate is merely the
+      // material-change baseline for repair work.
+      const gateRerunnable = !!verifiedRecoveryStart?.hasChanges;
       for (const stale of this.store
         .listRecoveryDecisions(missionId)
         .filter((entry) => entry.status === "started" && (entry.resumptionGeneration ?? 0) !== resumptionGeneration)) {
@@ -594,7 +601,7 @@ export class Orchestrator {
         repairDecision = this.store.planRecovery({
           ...choice,
           startingCandidateIdentityHash: recoveryStartCandidate,
-          startingCandidateContent: recoveryStartContent,
+          startingCandidateContent: recoveryStartContent ?? recordedEmptyBaseline,
         });
         await this.store.flush();
         this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
@@ -658,7 +665,7 @@ export class Orchestrator {
         return this.store.getMission(missionId)!;
       }
       const resumableGate = this.failedGateWithoutVerdict(classification);
-      if (repairDecision.action === "PROBE_AND_BACKOFF" && resumableGate && recoveryStartContent) {
+      if (repairDecision.action === "PROBE_AND_BACKOFF" && resumableGate && gateRerunnable) {
         // The gate died on a provider failure: re-run only that gate against
         // the existing candidate instead of parking again.
         if (this.store.getMission(missionId)!.status === "BLOCKED" && repairDecision.status === "planned") {
@@ -810,7 +817,7 @@ export class Orchestrator {
             return false;
         }
       });
-      if (repairDecision.action === "FENCE_RECONCILE_AND_RESUME" && failedTasks.length === 0 && recoveryStartContent) {
+      if (repairDecision.action === "FENCE_RECONCILE_AND_RESUME" && failedTasks.length === 0 && gateRerunnable) {
         // Nothing failed is left to replace: only the gates are outstanding, so
         // re-run them against the existing candidate (the #194 gate path)
         // instead of recording "no material progress".
@@ -2428,15 +2435,43 @@ export class Orchestrator {
         this.store.transitionMission(missionId, "REPAIRING");
       }
       this.phase(this.store.getMission(missionId)!, "repairing");
+      const readoptFailures = this.store
+        .listTasks(missionId)
+        .filter((task) => task.status === "FAILED" && task.objective.startsWith(READOPT_OBJECTIVE_PREFIX)).length;
       const objectives: Array<{ objective: string; findingId?: string; baseSha?: string; adoptedTaskId?: string }> =
         openBlocking.map((f) => {
           const where = f.file ? ` [${f.file}${f.line ? `:${f.line}` : ""}]` : "";
+          if (f.category !== STRANDED_WORKER_WORK || !f.evidence) {
+            return {
+              objective: `Repair review finding (${f.category})${where}: ${f.summary} — recommended: ${f.recommended_action || "n/a"}`,
+              findingId: f.finding_id,
+            };
+          }
+          if (readoptFailures >= MAX_READOPTIONS) {
+            // Re-adopting this work keeps failing: stop building on it. The
+            // branch stays preserved; the replacement redoes the work from base.
+            this.store.resolveFinding(f.finding_id);
+            this.store.addFinding({
+              mission_id: missionId,
+              task_id: f.task_id,
+              severity: "minor",
+              category: STRANDED_WORKER_WORK,
+              file: null,
+              line: null,
+              summary: `Stranded worker work at ${f.evidence} was discarded as a starting point after ${readoptFailures} failed re-adoptions; its branch stays preserved and the work restarts from the mission base`,
+              evidence: f.evidence,
+              recommended_action: "Inspect the preserved branch manually if its commits are still wanted.",
+            });
+            return {
+              objective: `Complete the mission objective from the mission base. An earlier worker's preserved branch (${f.evidence}) was abandoned after ${readoptFailures} failed re-adoptions. Original finding: ${f.summary}`,
+              adoptedTaskId: f.task_id ?? undefined,
+            };
+          }
           return {
-            objective: `Repair review finding (${f.category})${where}: ${f.summary} — recommended: ${f.recommended_action || "n/a"}`,
+            objective: `${READOPT_OBJECTIVE_PREFIX} ${f.summary}. Your starting point is partial, unreviewed output from a crashed worker (commit ${f.evidence}); it may be truncated or wrong, so verify it before building on it and finish the remaining work.`,
             findingId: f.finding_id,
-            ...(f.category === STRANDED_WORKER_WORK && f.evidence
-              ? { baseSha: f.evidence, adoptedTaskId: f.task_id ?? undefined }
-              : {}),
+            baseSha: f.evidence,
+            adoptedTaskId: f.task_id ?? undefined,
           };
         });
       if (objectives.length === 0) {
@@ -2477,25 +2512,41 @@ export class Orchestrator {
         });
         if (signal?.aborted) return this.canceledFinalization(missionId, signal);
         if (repaired && obj.findingId) this.store.resolveFinding(obj.findingId);
-        // The replacement started from the dead worker's committed branch, so it
-        // carries that task's work: the dead task no longer blocks completion.
-        const adopted = obj.adoptedTaskId ? this.store.getTask(obj.adoptedTaskId) : undefined;
-        if (
-          repaired &&
-          adopted?.status === "FAILED" &&
-          !this.store.listTaskSupersessions(missionId).some((entry) => entry.failedTaskId === adopted.task_id)
-        ) {
-          this.store.supersedeTask({
-            supersessionId: `${repair.task_id}-SUP-${adopted.task_id}`,
-            missionId,
-            failedTaskId: adopted.task_id,
-            replacementTaskIds: [repair.task_id],
-            repoId: adopted.repo_id ?? "",
-            acceptanceIds: [...(adopted.acceptance_ids ?? [])],
-            coverageFingerprint: taskCoverageFingerprint(adopted),
-            reason: `re-adopted preserved branch of ${adopted.task_id} at ${obj.baseSha}`,
-            createdAt: new Date(this.scheduler.now()).toISOString(),
-          });
+        // The replacement carries the dead workers' work (re-adopted, or redone
+        // from base after a discard): their FAILED tasks no longer block completion.
+        if (repaired) {
+          const strandedTaskIds = new Set(
+            this.store
+              .listFindings(missionId)
+              .filter((finding) => finding.category === STRANDED_WORKER_WORK && finding.task_id)
+              .map((finding) => finding.task_id as string),
+          );
+          if (obj.adoptedTaskId) strandedTaskIds.add(obj.adoptedTaskId);
+          for (const earlier of this.store.listTasks(missionId)) {
+            if (earlier.objective.startsWith(READOPT_OBJECTIVE_PREFIX)) strandedTaskIds.add(earlier.task_id);
+          }
+          for (const taskId of strandedTaskIds) {
+            const dead = this.store.getTask(taskId);
+            if (
+              !dead ||
+              dead.status !== "FAILED" ||
+              dead.task_id === repair.task_id ||
+              this.store.listTaskSupersessions(missionId).some((entry) => entry.failedTaskId === dead.task_id)
+            ) {
+              continue;
+            }
+            this.store.supersedeTask({
+              supersessionId: `${repair.task_id}-SUP-${dead.task_id}`,
+              missionId,
+              failedTaskId: dead.task_id,
+              replacementTaskIds: [repair.task_id],
+              repoId: dead.repo_id ?? "",
+              acceptanceIds: [...(dead.acceptance_ids ?? [])],
+              coverageFingerprint: taskCoverageFingerprint(dead),
+              reason: `preserved work of ${dead.task_id} carried by ${repair.task_id}`,
+              createdAt: new Date(this.scheduler.now()).toISOString(),
+            });
+          }
         }
       }
       post = await this.postExecution(this.store.getMission(missionId)!, signal);

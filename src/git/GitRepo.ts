@@ -1203,6 +1203,18 @@ export class GitRepo {
     return r.stdout;
   }
 
+  /** Path of the worktree that has `branch` checked out, or null when none does. */
+  async worktreeForBranch(branch: string): Promise<string | null> {
+    const args = ["worktree", "list", "--porcelain"];
+    const r = this.requireQuery(await this.git(args, { preserveStdout: true }), "worktree list query", args);
+    let path: string | null = null;
+    for (const line of r.stdout.split("\n")) {
+      if (line.startsWith("worktree ")) path = line.slice("worktree ".length);
+      else if (line === `branch refs/heads/${branch}` && path) return path;
+    }
+    return null;
+  }
+
   async currentBranch(): Promise<string | null> {
     const args = ["branch", "--show-current"];
     const r = this.requireQuery(await this.git(args), "current branch query", args);
