@@ -324,6 +324,13 @@ can be computed per worker.
   to `<file>.1` (one predecessor kept).
 - `PI_WORKER_TRANSCRIPT_TOOL_CHARS` (default 4000): cap per tool argument/result.
 
+Transcripts are keyed by the mission's state worktree (the orchestrator's identity), then
+by mission id. Redaction is key-aware (password/secret/token/api key/authorization/cookie
+values in JSON and `KEY=value` lines), covers Basic/Bearer headers, URL userinfo and
+sensitive query params, known token prefixes, prose ("password is X") and PEM blocks.
+The per-turn line does not count as worker activity for the inactivity watchdog.
+runtime.jsonl rotation is per process: two processes sharing one file may overwrite `.1`.
+
 The worktree janitor must leave `transcripts/` alone except by age.
 
 `sessions/<id>/runtime.jsonl` is capped: it rotates to `runtime.jsonl.1` at

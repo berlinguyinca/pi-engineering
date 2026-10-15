@@ -25,6 +25,7 @@ import type { GatewayResilienceConfig } from "../resilience/config.ts";
 import type { RecoveryProbe } from "../resilience/probe.ts";
 import { describeOperatorPause } from "../runtime/operatorModelPin.ts";
 import type { WorkerActivity } from "../workers/WorkerExecutor.ts";
+import { TURN_SUMMARY } from "../workers/activity.ts";
 import { budgetExhaustedBuildHint } from "../workers/buildActivity.ts";
 import { type BrokerBackends, ExecutionBroker, type ExecutionOutcome, PARTIAL_PROGRESS_SUMMARY } from "./broker.ts";
 import { CheckpointManager } from "./checkpoints.ts";
@@ -1363,7 +1364,8 @@ export class Orchestrator {
         }
       }
     }
-    this.report(event.missionId, `[mission ${event.missionId}] ${event.summary}`);
+    if (!TURN_SUMMARY.test(event.summary))
+      this.report(event.missionId, `[mission ${event.missionId}] ${event.summary}`);
   }
 
   private noteBuildCommand(event: WorkerActivity & { executionId: string }): void {

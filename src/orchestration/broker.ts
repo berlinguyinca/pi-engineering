@@ -33,7 +33,7 @@ import type {
   WorktreeInfo,
 } from "../git/GitRepo.ts";
 import type { WorkerActivity } from "../workers/WorkerExecutor.ts";
-import { WAITING_FOR_INFERENCE_SUMMARY, sanitizeWorkerActivity } from "../workers/activity.ts";
+import { TURN_SUMMARY, WAITING_FOR_INFERENCE_SUMMARY, sanitizeWorkerActivity } from "../workers/activity.ts";
 import type { CheckpointProgressClaim } from "../workers/checkpointProgressTool.ts";
 import type { CheckpointManager, CheckpointSnapshot } from "./checkpoints.ts";
 import { EvidenceUnavailableError, buildCandidateEvidenceIdentity } from "./evidence.ts";
@@ -2786,7 +2786,9 @@ export class ExecutionBroker {
             for (const claim of safe.claims ?? []) {
               checkpointClaims.set(claim.deliverable, claim);
             }
-            if (safe.kind !== "heartbeat") {
+            // A per-turn summary line is bookkeeping, not progress: it must not
+            // re-arm the inactivity watchdog (tool/stream events already do).
+            if (safe.kind !== "heartbeat" && !TURN_SUMMARY.test(safe.summary)) {
               lastActivityAt = Date.now();
               waitingForInference = safe.summary === WAITING_FOR_INFERENCE_SUMMARY;
             }

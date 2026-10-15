@@ -56,6 +56,8 @@ interface RuntimeEventState {
   /** Suppressed-contention counters per `resource|holder`, and when the last summary went out. */
   contention: Map<string, { resource: unknown; holder_session: unknown; count: number }>;
   lastContentionSummaryMs: number;
+  /** Repeats suppressed since the last summary line. */
+  suppressedSinceSummary: number;
 }
 
 /** runtime.jsonl size cap before it rotates to `.1` (PI_RUNTIME_LOG_MAX_BYTES). */
@@ -82,15 +84,20 @@ function state(): RuntimeEventState {
       listeners: new Set(),
       contention: new Map(),
       lastContentionSummaryMs: Date.now(),
+      suppressedSinceSummary: 0,
     };
     holder[STATE_KEY] = current;
+    const created = current;
+    process.once("exit", () => flushContentionSummary(created));
   }
   return current;
 }
 
 /** Direct structured diagnostics to a session debug log. */
 export function setRuntimeEventLog(file: string | null): void {
-  state().logFile = file;
+  const s = state();
+  if (s.logFile !== file) flushContentionSummary(s);
+  s.logFile = file;
 }
 
 export function onRuntimeEvent(listener: RuntimeEventSink): () => void {
@@ -99,6 +106,11 @@ export function onRuntimeEvent(listener: RuntimeEventSink): () => void {
   return () => s.listeners.delete(listener);
 }
 
+/**
+ * Rotation is per process: two processes sharing one runtime.jsonl can both
+ * rotate and the later rename overwrites `.1` (bounded loss of old diagnostics,
+ * never of the live file). Sessions normally own their own file.
+ */
 function appendLog(file: string, record: RuntimeEvent): void {
   try {
     mkdirSync(dirname(file), { recursive: true });
@@ -120,20 +132,30 @@ function appendLog(file: string, record: RuntimeEvent): void {
  * log reached 440 MB). Log it once per (resource, holder), count the rest, and
  * emit a summary line per interval. Returns the record to log, or null.
  */
+/** Write the contention counters (when repeats were suppressed) to the current log. */
+function flushContentionSummary(s: RuntimeEventState): void {
+  if (s.suppressedSinceSummary === 0 || !s.logFile) return;
+  s.suppressedSinceSummary = 0;
+  s.lastContentionSummaryMs = Date.now();
+  appendLog(s.logFile, {
+    event: "lease.contended_summary",
+    at: new Date().toISOString(),
+    contentions: [...s.contention.values()],
+  });
+}
+
 function throttleContention(s: RuntimeEventState, fields: Record<string, unknown>): RuntimeEvent | null {
   const key = `${String(fields.resource)}|${String(fields.holder_session)}`;
   const entry = s.contention.get(key);
   const now = Date.now();
-  if (entry) entry.count++;
-  else s.contention.set(key, { resource: fields.resource, holder_session: fields.holder_session, count: 1 });
+  if (entry) {
+    entry.count++;
+    s.suppressedSinceSummary++;
+  } else s.contention.set(key, { resource: fields.resource, holder_session: fields.holder_session, count: 1 });
   const due =
     now - s.lastContentionSummaryMs >= envNumber("PI_RUNTIME_CONTENTION_SUMMARY_MS", DEFAULT_CONTENTION_SUMMARY_MS);
   if (due) {
-    s.lastContentionSummaryMs = now;
-    const contentions = [...s.contention.values()];
-    if (s.logFile) {
-      appendLog(s.logFile, { event: "lease.contended_summary", at: new Date().toISOString(), contentions });
-    }
+    flushContentionSummary(s);
   }
   return entry ? null : { event: "lease.contended", at: new Date().toISOString(), ...fields };
 }

@@ -58,7 +58,8 @@ async function withRun(
 ) {
   const saved: Record<string, string | undefined> = {};
   const stateRoot = mkdtempSync(join(tmpdir(), "pi-transcript-state-"));
-  const overrides = { PI_ENGINEERING_STATE_DIR: stateRoot, ...env };
+  const { KICKOFF: _k, TRANSCRIPT_DIR: _t, ...envOnly } = env;
+  const overrides = { PI_ENGINEERING_STATE_DIR: stateRoot, ...envOnly };
   for (const [k, v] of Object.entries(overrides)) {
     saved[k] = process.env[k];
     if (v === undefined) delete process.env[k];
@@ -99,12 +100,14 @@ async function withRun(
   });
   const activities: unknown[] = [];
   try {
+    if (env.TRANSCRIPT_DIR) executor.setTranscriptDir(join(stateRoot, "worktrees", env.TRANSCRIPT_DIR));
     const run = await executor.run({
       role: "implementer",
       task: "t",
       tools: ["read"],
       cwd: dir,
-      runId: "m1",
+      missionId: "m1",
+      ...(env.KICKOFF ? { kickoff: env.KICKOFF } : {}),
       sessionId: "e1",
       onActivity: (a) => activities.push(a),
       modelOverride: { provider: "probe", id: "probe-model" },
@@ -183,5 +186,20 @@ test("transcript: size cap is honoured and rotated", async () => {
 test("transcript: PI_WORKER_TRANSCRIPTS=off writes nothing", async () => {
   await withRun("hello\n", { PI_WORKER_TRANSCRIPTS: "off" }, (file) => {
     assert.equal(file, null);
+  });
+});
+
+test("transcript: user-role kickoff messages are scrubbed and keyed by missionId", async () => {
+  await withRun("x\n", { KICKOFF: "start; my password is correcthorse and DB_PASSWORD=pw12345" }, (file) => {
+    assert.ok(file, "missionId m1 directory, never standalone");
+    const raw = readFileSync(file, "utf8");
+    assert.ok(!raw.includes("correcthorse") && !raw.includes("pw12345"));
+    assert.ok(raw.includes('"role":"user"'));
+  });
+});
+
+test("transcript: PiWorkerExecutor.setTranscriptDir overrides the cwd-derived worktree", async () => {
+  await withRun("x\n", { TRANSCRIPT_DIR: "mission-wt" }, (_file, stateRoot) => {
+    assert.ok(existsSync(join(stateRoot, "worktrees", "mission-wt", "transcripts", "m1", "e1.jsonl")));
   });
 });

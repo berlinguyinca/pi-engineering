@@ -285,6 +285,8 @@ export class PiWorkerExecutor implements WorkerExecutor {
   // rearmResilience() once the capability pool exists.
   private capabilityRegistry: ModelCapabilityRegistry | undefined;
   private roleRouter: RoleRouter | undefined;
+  /** The mission's state worktree dir (<state>/worktrees/<id>); transcripts live under it. */
+  private transcriptDir: string | undefined;
   private inferenceScheduler: ResilientStreamScheduler | undefined;
   private inferenceStatus: ((line: string) => void) | undefined;
   /** Live tracker per worker run: tool calls already executed (spec §6). */
@@ -357,6 +359,11 @@ export class PiWorkerExecutor implements WorkerExecutor {
    * INFERENCE_CAPACITY park + operator status lines are unreachable in
    * production.
    */
+  /** Key persisted transcripts by the orchestrator's state worktree, not the candidate cwd. */
+  setTranscriptDir(dir: string | undefined): void {
+    this.transcriptDir = dir;
+  }
+
   rearmResilience(patch: {
     capabilityRegistry?: ModelCapabilityRegistry;
     roleRouter?: RoleRouter;
@@ -1407,14 +1414,12 @@ ${recovery.recoveryPrompt}`;
     let transcript: TranscriptWriter | undefined;
     if (transcriptsEnabled()) {
       try {
-        const identity = await resolveWorktreeIdentity(req.cwd);
+        const dir =
+          this.transcriptDir ??
+          worktreeRuntimeDir(resolveStateRoot(), (await resolveWorktreeIdentity(req.cwd)).worktreeId);
         const executionId = req.sessionId ?? `${req.role}-${Date.now().toString(36)}-${attempt}`;
         transcript = new TranscriptWriter(
-          transcriptPath(
-            worktreeRuntimeDir(resolveStateRoot(), identity.worktreeId),
-            req.runId ?? "standalone",
-            executionId,
-          ),
+          transcriptPath(dir, req.missionId ?? req.runId ?? "unattributed", executionId),
         );
         transcript.write({ kind: "session", role: req.role, attempt, model: model.id, provider: model.provider });
       } catch {

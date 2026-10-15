@@ -40,15 +40,58 @@ export function transcriptPath(worktreeDir: string, missionId: string, execution
   return join(worktreeDir, "transcripts", segment(missionId), `${segment(executionId)}.jsonl`);
 }
 
-/** Redact secrets and cap the length of any string leaf. */
-function scrub(value: unknown, maxChars: number): unknown {
+const KEYS = "pass(?:word|wd)?|secret|token|api[-_]?key|authorization|cookie|private[-_]?key|credential";
+const SENSITIVE_KEY = new RegExp(KEYS, "i");
+const REDACTED = "[REDACTED]";
+
+const TEXT_RULES: Array<[RegExp, string]> = [
+  // JSON values, plain and escaped inside a string: "password":"x" / \"password\":\"x\"
+  [new RegExp(`("[\\w.-]*(?:${KEYS})[\\w.-]*"\\s*:\\s*)"(?:[^"\\\\]|\\\\.)*"`, "gi"), `$1"${REDACTED}"`],
+  [new RegExp(`(\\\\"[\\w.-]*(?:${KEYS})[\\w.-]*\\\\"\\s*:\\s*\\\\")[^"\\\\]*(\\\\")`, "gi"), `$1${REDACTED}$2`],
+  // Authorization schemes.
+  [/\b(Basic|Bearer)\s+[A-Za-z0-9._~+/=-]{6,}/gi, `$1 ${REDACTED}`],
+  // KEY=value and key: value lines (env dumps, .env files, headers).
+  [
+    new RegExp(
+      `\\b([A-Za-z0-9_.-]*(?:${KEYS})[A-Za-z0-9_.-]*)(\\s*[:=]\\s*)(?:"[^"\\n]*"|'[^'\\n]*'|[^\\s"',;]+)`,
+      "gi",
+    ),
+    `$1$2${REDACTED}`,
+  ],
+  // URL userinfo and sensitive query parameters.
+  [/(\b[a-z][a-z0-9+.-]*:\/\/)[^\s/:@]+:[^\s/@]+@/gi, `$1${REDACTED}@`],
+  [/([?&][^=&\s]*(?:key|token|secret|pass(?:word)?|auth|sig(?:nature)?)[^=&\s]*=)[^&\s"']+/gi, `$1${REDACTED}`],
+  // Known token prefixes.
+  [
+    /\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[abprs]-[A-Za-z0-9-]{10,}|sk-[A-Za-z0-9_-]{10,}|AKIA[0-9A-Z]{16})/g,
+    REDACTED,
+  ],
+  // Prose: "my password is X".
+  [/\b(password|passwd|token|key|secret)\s+(?:is|was)\s+["']?[^\s"',;]+/gi, `$1 is ${REDACTED}`],
+  // Any PEM private key block.
+  [/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, REDACTED],
+];
+
+function scrubText(value: string): string {
+  let text = redactSecrets(value);
+  for (const [re, replacement] of TEXT_RULES) text = text.replace(re, replacement);
+  return text;
+}
+
+/** Redact secrets (key-aware for objects) and cap the length of every string leaf. */
+export function scrubTranscript(value: unknown, maxChars: number): unknown {
   if (typeof value === "string") {
-    const text = redactSecrets(value);
+    const text = scrubText(value);
     return text.length > maxChars ? `${text.slice(0, maxChars)}…[truncated ${text.length - maxChars} chars]` : text;
   }
-  if (Array.isArray(value)) return value.map((v) => scrub(v, maxChars));
+  if (Array.isArray(value)) return value.map((v) => scrubTranscript(v, maxChars));
   if (value && typeof value === "object") {
-    return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, scrub(v, maxChars)]));
+    return Object.fromEntries(
+      Object.entries(value).map(([k, v]) => [
+        k,
+        SENSITIVE_KEY.test(k) && v !== null && v !== undefined ? REDACTED : scrubTranscript(v, maxChars),
+      ]),
+    );
   }
   return value;
 }
@@ -66,7 +109,7 @@ export class TranscriptWriter {
   /** Append one record. Never throws: a transcript must not break the run. */
   write(record: Record<string, unknown>): void {
     try {
-      let line = `${JSON.stringify(scrub({ at: new Date().toISOString(), ...record }, this.maxChars))}\n`;
+      let line = `${JSON.stringify(scrubTranscript({ at: new Date().toISOString(), ...record }, this.maxChars))}\n`;
       if (Buffer.byteLength(line) > this.maxBytes) {
         line = `${JSON.stringify({ at: new Date().toISOString(), kind: record.kind, truncated: true })}\n`;
       }

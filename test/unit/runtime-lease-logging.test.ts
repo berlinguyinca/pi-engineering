@@ -52,3 +52,21 @@ test("runtime.jsonl rotates at the size cap", () => {
     else process.env.PI_RUNTIME_LOG_MAX_BYTES = saved;
   }
 });
+
+test("suppressed contention is summarised when the log is closed", () => {
+  const file = join(mkdtempSync(join(tmpdir(), "pi-runtime-log-")), "runtime.jsonl");
+  const saved = process.env.PI_RUNTIME_CONTENTION_SUMMARY_MS;
+  process.env.PI_RUNTIME_CONTENTION_SUMMARY_MS = "3600000";
+  setRuntimeEventLog(file);
+  try {
+    for (let i = 0; i < 5; i++) emitRuntimeEvent("lease.contended", { resource: "r9", holder_session: "h9" });
+    setRuntimeEventLog(null);
+    const summary = read(file).find((r) => r.event === "lease.contended_summary");
+    assert.ok(summary, "final summary on close");
+    assert.equal(summary.contentions.find((c: any) => c.resource === "r9").count, 5);
+  } finally {
+    setRuntimeEventLog(null);
+    if (saved === undefined) delete process.env.PI_RUNTIME_CONTENTION_SUMMARY_MS;
+    else process.env.PI_RUNTIME_CONTENTION_SUMMARY_MS = saved;
+  }
+});
