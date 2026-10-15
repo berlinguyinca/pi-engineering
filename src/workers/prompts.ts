@@ -62,9 +62,7 @@ export const MUTATING_ROLES: ReadonlySet<WorkerRole> = new Set<WorkerRole>([
 
 const COMMIT_DISCIPLINE = `\
 Commit discipline (isolated worktree):
-- Commit your work on the current branch after EVERY coherent unit of change (a working piece, not the whole task at once). If your task involves an iterate/verify loop, commit after each completed loop iteration.
-- If your session is terminated by the time budget, only your own commits are recovered; uncommitted edits at that point are not merged.
-- Never leave the session with a large uncommitted delta; commit the last coherent state as soon as you have one.
+- Commit when a coherent step is done; uncommitted work is harvested automatically.
 - Only add commits on the current branch: never switch branches, rebase, amend or rewrite commits you did not make, or push.`;
 
 /**

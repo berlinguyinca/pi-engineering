@@ -104,6 +104,13 @@ export type RouteModel = (role: string, opts?: RouteModelOptions) => Promise<Mod
  * model_not_found (`transient:model_unavailable`) or a model pruned from the
  * local model runtime (`unknown-model`). Both hand the attempt to another model.
  */
+/**
+ * Mission implementer/repair tools: Pi's file tools (line-numbered `read`,
+ * whitespace-tolerant `edit`, `write`) plus search. No ledger/artifact tools and
+ * no `checkpoint_progress`: the broker derives checkpoints from the branch.
+ */
+export const IMPLEMENTER_TOOLS: readonly string[] = ["read", "edit", "write", "bash", "repo_search", "tests_for"];
+
 const MODEL_GONE_MARKERS: ReadonlySet<string> = new Set(["transient:model_unavailable", "unknown-model"]);
 
 /**
@@ -557,7 +564,8 @@ export function realBackends(opts: RealBackendsOptions) {
           role: (input.role as WorkerRequest["role"]) ?? "implementer",
           task: input.objective,
           context: input.contextRef,
-          tools: ["ledger_read", "ledger_claim", "artifact_read", "repo_search", "symbol", "tests_for", "bash"],
+          tools: [...IMPLEMENTER_TOOLS],
+          tolerantFileTools: true,
           cwd: input.worktree ?? bound.cwd,
           // No duration cap: the broker owns liveness (activity-based) and any
           // opt-in limit. This only carries an explicit operator override.

@@ -284,6 +284,33 @@ describe("realBackends capability routing", () => {
     assert.ok(activity.some((event) => /current worker model.*reduced independence/i.test(event.summary)));
   });
 
+  it("gives implementers the file tools and search, without ledger/artifact/checkpoint tools; other roles are unchanged", async () => {
+    const seen: WorkerRequest[] = [];
+    const backends = realBackends({
+      worker: capturingWorker(seen),
+      verifier: {} as never,
+      artifacts: {} as never,
+      git: null,
+      cwd: "/repo",
+    });
+    for (const role of ["implementer", "repair"]) {
+      await backends.agent.runAgent({
+        role,
+        objective: "change it",
+        deliverables: ["the change"],
+        signal: new AbortController().signal,
+      });
+    }
+    await backends.research.runAgent({ objective: "scout", signal: new AbortController().signal });
+    await backends.review.runReview({ objective: "review", signal: new AbortController().signal });
+    assert.deepEqual(seen[0]?.tools, ["read", "edit", "write", "bash", "repo_search", "tests_for"]);
+    assert.deepEqual(seen[1]?.tools, ["read", "edit", "write", "bash", "repo_search", "tests_for"]);
+    assert.equal(seen[0]?.tolerantFileTools, true);
+    assert.ok(!seen[0]?.tools.includes("checkpoint_progress"));
+    assert.deepEqual(seen[2]?.tools, ["ledger_read", "repo_search", "symbol", "tests_for"]);
+    assert.deepEqual(seen[3]?.tools, ["ledger_read", "artifact_read", "repo_search", "symbol"]);
+  });
+
   it("gives the reviewer the same (absent) duration cap and unbounded capacity wait as implementation workers", async () => {
     // Without an owner-controlled budget the executor's 5-minute default
     // aborted reviewers mid-analysis; now the broker owns liveness instead.

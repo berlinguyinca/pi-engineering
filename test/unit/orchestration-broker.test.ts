@@ -3192,6 +3192,34 @@ describe("ExecutionBroker (spec 03)", () => {
     }
   });
 
+  it("harvests and checkpoints a succeeded worker that edited files but never committed", async () => {
+    const context = await cancellationCheckpointFixture(async ({ worktree }) => {
+      assert.ok(worktree);
+      await writeFile(join(worktree, "src", "uncommitted.ts"), "export const uncommitted = true;\n", "utf8");
+      return { executionId: "e", exitStatus: "succeeded", summary: "edited only", artifactRefs: [], usage: {} };
+    });
+    try {
+      await context.handle.result();
+      const execution = context.store.getExecution(context.handle.executionId)!;
+      const checkpoint = context.store.getTaskCheckpoint(execution.checkpoint_id!);
+      assert.ok(checkpoint, "a checkpoint must be recorded");
+      assert.notEqual(checkpoint.candidateSha, context.mission.base_ref, "checkpoint must carry the harvested commit");
+      assert.ok(
+        checkpoint.committedChanges.includes("src/uncommitted.ts"),
+        `checkpoint must list the harvested file, got ${checkpoint.committedChanges.join(",")}`,
+      );
+      assert.deepEqual(checkpoint.preservedUncommittedChanges, []);
+      assert.deepEqual([...checkpoint.completedDeliverables], ["implementation"]);
+      const findings = context.store.listFindings(context.mission.mission_id);
+      assert.ok(
+        !findings.some((f) => f.summary.includes("held no committed work")),
+        "an edit-only worker must not be reported as empty",
+      );
+    } finally {
+      await context.fx.cleanup();
+    }
+  });
+
   it("surfaces an attributable finding when a mutating worker succeeds with no edits to harvest", async () => {
     const fx = await makeFixtureRepo();
     try {

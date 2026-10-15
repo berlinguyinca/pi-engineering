@@ -85,17 +85,6 @@ async function checkpointModelProbe(): Promise<{
         });
         return;
       }
-      if (requests === 2) {
-        const candidateSha = body.match(/[0-9a-f]{40}/g)?.at(-1);
-        assert.ok(candidateSha, `bash tool result did not expose a candidate SHA: ${body.slice(-1000)}`);
-        modelTool(res, "checkpoint_progress", {
-          claims: [
-            { deliverable: "one", candidate_sha: candidateSha, evidence_paths: ["src/one.js"] },
-            { deliverable: "two", candidate_sha: candidateSha, evidence_paths: ["src/two.js"] },
-          ],
-        });
-        return;
-      }
       res.writeHead(200, { "content-type": "text/event-stream" });
       res.write(modelChunk({ role: "assistant", content: "waiting past the broker deadline" }));
     });
@@ -479,7 +468,7 @@ async function blockedCheckpointHarness(
 
 describe("mission reliability foundation — synthetic MSN-qSLaeM", () => {
   it(
-    "runs MSN-qSLaeM through the public runtime, times out after 2/3, and repairs only the remainder",
+    "runs MSN-qSLaeM through the public runtime, times out after committing 2/3, and recovers the committed work",
     { timeout: 30_000 },
     async () => {
       const metaRoot = await mkdtemp(join(tmpdir(), "pi-eng-meta-root-"));
@@ -587,8 +576,13 @@ describe("mission reliability foundation — synthetic MSN-qSLaeM", () => {
               };
             }
             assert.ok(request.recovery, "replacement worker receives store-verified checkpoint recovery context");
-            assert.match(request.task, /remaining deliverable three/i);
-            await writeFile(join(request.cwd, "src", "three.js"), "export const three = 3;\n");
+            const remaining = /remaining deliverable (one|two|three)/i.exec(request.task)?.[1]?.toLowerCase();
+            assert.ok(remaining, `replacement names its remaining deliverable: ${request.task}`);
+            const values = { one: 1, two: 2, three: 3 } as const;
+            await writeFile(
+              join(request.cwd, "src", `${remaining}.js`),
+              `export const ${remaining} = ${values[remaining as keyof typeof values]};\n`,
+            );
             return {
               result: {
                 status: "completed",
@@ -689,9 +683,13 @@ describe("mission reliability foundation — synthetic MSN-qSLaeM", () => {
         const checkpoint = runtime
           .missionStore!.listTaskCheckpoints(started.mission.mission_id, original.task_id)
           .at(-1)!;
+        // No worker-reported claims exist any more: the checkpoint is derived from
+        // the worker branch, so it names the committed paths but cannot say which
+        // declared deliverables those commits finish.
+        assert.deepEqual([...checkpoint.committedChanges].sort(), ["src/one.js", "src/two.js"]);
         assert.deepEqual(
           checkpoint.completedDeliverables,
-          ["one", "two"],
+          [],
           JSON.stringify({
             requests: modelProbe.requests(),
             sessions,
@@ -701,8 +699,11 @@ describe("mission reliability foundation — synthetic MSN-qSLaeM", () => {
             checkpoint,
           }),
         );
-        assert.deepEqual(checkpoint.remainingDeliverables, ["three"]);
-        assert.ok(modelProbe.requests() >= 3, "the real Pi executor reached checkpoint_progress before timing out");
+        assert.deepEqual(checkpoint.remainingDeliverables, ["one", "two", "three"]);
+        assert.ok(
+          modelProbe.requests() >= 2,
+          "the real Pi executor committed through bash and then stalled until the deadline",
+        );
         releaseLate();
         // Poll (not a fixed sleep) for the durable late-result-rejection event so
         // a slow CI runner does not flake on a 100ms race: keep sampling the event
@@ -737,7 +738,7 @@ describe("mission reliability foundation — synthetic MSN-qSLaeM", () => {
           .filter((task) => task.objective.startsWith("Recover "));
         assert.deepEqual(
           replacements.map((task) => task.deliverables),
-          [["three"]],
+          [["one"], ["two"], ["three"]],
           JSON.stringify({
             repaired,
             tasks: runtime.missionStore!.listTasks(started.mission.mission_id),

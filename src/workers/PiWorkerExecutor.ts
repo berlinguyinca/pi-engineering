@@ -94,6 +94,7 @@ import { registerLocalProviders } from "./localProviders.ts";
 import { WORKER_KICKOFF, buildSystemPrompt, wantsCommitDiscipline } from "./prompts.ts";
 import { guardRuntimeRequestBody } from "./requestBodyGuard.ts";
 import { StreamStallWatchdog, isStalledStream } from "./streamStall.ts";
+import { createNumberedReadTool, createTolerantEditTool } from "./tolerantFileTools.ts";
 import { workerResultTool } from "./workerResultTool.ts";
 
 /**
@@ -486,7 +487,8 @@ ${TOOL_TRANSITION_RULE}`;
     const terminating = req.resultTool === "review_result" ? reviewResultTool : workerResultTool;
     const customTools = [
       ...this.customTools,
-      ...(req.deliverables?.length ? [createCheckpointProgressTool(req.deliverables)] : []),
+      ...(req.tolerantFileTools ? [createNumberedReadTool(req.cwd), createTolerantEditTool(req.cwd)] : []),
+      ...(offersCheckpointProgress(req) ? [createCheckpointProgressTool(req.deliverables ?? [])] : []),
       terminating,
     ];
     const tools = [...new Set([...req.tools, ...customTools.map((t) => t.name)])];
@@ -1613,12 +1615,12 @@ export function buildCompactedWorkerPrompt(req: WorkerRequest, recoveryPrompt: s
   // the user's own checkout, to commit.
   if (wantsCommitDiscipline(req.role, req)) {
     parts.push(
-      "- Commit your work on the current branch after each coherent change. If your session is terminated by the time budget, only your own commits are recovered; uncommitted edits at that point are not merged. Never switch branches, rebase, amend others' commits, or push.",
+      "- Commit when a coherent step is done; uncommitted work is harvested automatically. Never switch branches, rebase, amend others' commits, or push.",
     );
   }
-  if (req.deliverables?.length) {
+  if (offersCheckpointProgress(req)) {
     parts.push(
-      `- Declared checkpoint deliverables: ${req.deliverables.map((d) => `"${d}"`).join(", ")}. After a coherent commit, call checkpoint_progress claiming the deliverable with the EXACT declared string (no paraphrasing) plus the exact git rev-parse HEAD and committed evidence paths.`,
+      `- Declared checkpoint deliverables: ${(req.deliverables ?? []).map((d) => `"${d}"`).join(", ")}. After a coherent commit, call checkpoint_progress claiming the deliverable with the EXACT declared string (no paraphrasing) plus the exact git rev-parse HEAD and committed evidence paths.`,
     );
   }
   parts.push(`- Your final action MUST be calling the worker_result tool.`);
@@ -1640,9 +1642,17 @@ export function withIdempotencyEvidence(prompt: string, tracker: ExecutedActionT
   return `${prompt}\n\n${evidence}`;
 }
 
+/**
+ * `checkpoint_progress` is opt-in by name. Mission workers do not get it: the
+ * broker derives checkpoints from the worker branch's commits.
+ */
+function offersCheckpointProgress(req: WorkerRequest): boolean {
+  return !!req.deliverables?.length && req.tools.includes(CHECKPOINT_PROGRESS_TOOL_NAME);
+}
+
 export function workerContext(req: WorkerRequest): string | undefined {
-  const checkpoint = req.deliverables?.length
-    ? `Declared checkpoint deliverables: ${req.deliverables.map((d) => `"${d}"`).join(", ")}. After each coherent commit, run git rev-parse HEAD and call checkpoint_progress with the completed deliverable (using its EXACT declared string, no paraphrasing), that exact candidate SHA, and committed evidence paths.`
+  const checkpoint = offersCheckpointProgress(req)
+    ? `Declared checkpoint deliverables: ${(req.deliverables ?? []).map((d) => `"${d}"`).join(", ")}. After each coherent commit, run git rev-parse HEAD and call checkpoint_progress with the completed deliverable (using its EXACT declared string, no paraphrasing), that exact candidate SHA, and committed evidence paths.`
     : undefined;
   if (!req.recovery) return [req.context, checkpoint].filter(Boolean).join("\n\n") || undefined;
   const durable = durableRecoveryContext(req)!;
