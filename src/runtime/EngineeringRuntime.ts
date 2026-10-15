@@ -1047,6 +1047,16 @@ export class EngineeringRuntime {
         onModelServed: (model) => rt.unavailableModels.clear(model),
         isModelUnavailable: (model) => rt.unavailableModels.has(model),
         reviewFallbackModel,
+        // Gate roles routing cannot place (no repo policy, candidates dead) are
+        // placed from the session's model registry.
+        registryModels: async () =>
+          rt.worker instanceof PiWorkerExecutor
+            ? (await (await rt.worker.getModelRuntime()).getAvailable()).map((model) => ({
+                provider: model.provider,
+                id: model.id,
+                contextWindow: model.contextWindow,
+              }))
+            : [],
         currentOperatorPin,
         repository: async (repoId) => {
           if (repoId) {
