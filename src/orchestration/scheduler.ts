@@ -203,6 +203,11 @@ export function classifyFailure(
 ): { action: "retry" | "repair" | "replan" | "block"; reason: string } {
   const msg = err instanceof Error ? err.message : String(err);
   const low = msg.toLowerCase();
+  // A forged or drifted recovery replay is a deterministic integrity failure:
+  // retrying the identical replay can only fail the identical way.
+  if (/replacement replay fingerprint\/full-spec mismatch/.test(low)) {
+    return { action: "block", reason: `recovery integrity: ${msg}` };
+  }
   if (/(transient|timeout|429|rate.?limit|network|econnreset|temporary)/.test(low)) {
     return { action: "retry", reason: `transient: ${msg}` };
   }
@@ -920,7 +925,14 @@ export class MissionScheduler {
           }
           authority?.assertAuthoritative();
           if (this.taskAlreadyTerminal(task.task_id)) return;
-          this.store.transitionTask(task.task_id, "RETRYING", "system", { attempt });
+          // broker.execute() can throw before the task reaches RUNNING; a READY
+          // task is already resumable, and READY -> RETRYING is illegal. The
+          // old unconditional transition threw out of this catch block, so the
+          // pass loop re-dispatched the READY task with a fresh attempt counter
+          // and the retry budget (max_attempts) never applied: a livelock.
+          if (this.store.getTask(task.task_id)?.status !== "READY") {
+            this.store.transitionTask(task.task_id, "RETRYING", "system", { attempt });
+          }
           continue;
         }
         authority?.assertAuthoritative();
