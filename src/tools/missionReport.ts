@@ -8,6 +8,7 @@ import { formatWaitingFor } from "../gateway/admissionNotice.ts";
 import { latestTaskCheckpoints } from "../orchestration/checkpoints.ts";
 import type { MissionStore } from "../orchestration/missionStore.ts";
 import { taskFailureReason } from "../orchestration/recovery.ts";
+import { PLANNER_CLARIFICATION_CATEGORY } from "../orchestration/types.ts";
 import { describeMissionControl } from "../runtime/operatorModelPin.ts";
 
 const MAX_ITEMS = 5;
@@ -108,6 +109,12 @@ export function missionReportLines(store: MissionStore, missionId: string): stri
     lines.push(`Open blocking findings (${blocking.length}):`);
     for (const finding of blocking.slice(-MAX_ITEMS)) lines.push(`  - ${clip(finding.summary, 200)}`);
   }
+
+  const asked = store
+    .listFindings(missionId)
+    .filter((finding) => finding.category === PLANNER_CLARIFICATION_CATEGORY && finding.status === "open")
+    .at(-1);
+  if (asked?.evidence) lines.push(`Planner question: ${clip(asked.evidence, 300)}`);
 
   const resume = `mission tool {action:"resume", missionId:"${missionId}"} (or /mission resume ${missionId})`;
   if (stop) {

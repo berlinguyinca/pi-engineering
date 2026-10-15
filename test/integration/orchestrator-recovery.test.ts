@@ -1214,6 +1214,78 @@ describe("orchestrator: durable blocked-mission repair", () => {
     assert.equal(h.store.listRecoveryDecisions(h.missionId).at(-1)?.action, "WAIT_FOR_REQUIREMENT");
   });
 
+  /** A requirement wait the supervisor planned while the mission was not BLOCKED (no episode id). */
+  function supervisorWait(h: ReturnType<typeof blockedRepairHarness>) {
+    const classification = h.store.listFailureClassifications(h.missionId).at(-1);
+    assert.ok(classification);
+    h.store.transitionMission(h.missionId, "WAITING_FOR_USER");
+    h.store.transitionMission(h.missionId, "PLANNING");
+    const decision = h.store.planRecovery({
+      recoveryId: "RCV-supervisor-wait",
+      missionId: h.missionId,
+      classificationId: classification.classificationId,
+      action: "WAIT_FOR_REQUIREMENT",
+      expectedMaterialChange: "receive clarification",
+      attempt: 1,
+      maxAttempts: 2,
+      deadline: null,
+      nextActionAt: "2026-09-27T00:00:01.000Z",
+      status: "planned",
+      decidedAt: "2026-09-27T00:00:01.000Z",
+      failureFingerprint: classification.fingerprint,
+    });
+    return { decision, classification };
+  }
+
+  const waitsOf = (h: ReturnType<typeof blockedRepairHarness>) =>
+    h.store.listRecoveryDecisions(h.missionId).filter((d) => d.action === "WAIT_FOR_REQUIREMENT");
+
+  it("adopts the supervisor's open requirement wait instead of planning a second one", async () => {
+    const h = blockedRepairHarness({ category: "REQUIREMENT_AMBIGUITY" });
+    supervisorWait(h);
+    h.store.transitionMission(h.missionId, "BLOCKED");
+
+    const waiting = await h.orchestrator.repairBlockedMission(h.missionId);
+
+    assert.equal(waiting.status, "WAITING_FOR_USER");
+    assert.equal(waitsOf(h).length, 1);
+  });
+
+  it("does not adopt a wait that belongs to a different classification", async () => {
+    const h = blockedRepairHarness({ category: "REQUIREMENT_AMBIGUITY" });
+    const { decision } = supervisorWait(h);
+    h.store.classifyFailure({
+      classificationId: "FC-newer",
+      missionId: h.missionId,
+      taskId: null,
+      executionId: null,
+      category: "REQUIREMENT_AMBIGUITY",
+      evidenceRefs: [],
+      fingerprint: "sha256:newer-fingerprint",
+      summary: "a different ambiguity",
+      classifiedAt: "2026-09-27T00:00:02.000Z",
+    });
+    h.store.transitionMission(h.missionId, "BLOCKED");
+
+    await h.orchestrator.repairBlockedMission(h.missionId);
+
+    assert.equal(h.store.getRecoveryDecision(decision.recoveryId)?.status, "planned", "foreign wait left alone");
+    assert.equal(waitsOf(h).length, 2);
+  });
+
+  it("does not adopt a wait from an older resumption generation", async () => {
+    const h = blockedRepairHarness({ category: "REQUIREMENT_AMBIGUITY" });
+    const { decision } = supervisorWait(h);
+    h.store.resumeMission(h.missionId, "operator resumed");
+    h.store.transitionMission(h.missionId, "BLOCKED");
+
+    await h.orchestrator.repairBlockedMission(h.missionId);
+
+    assert.notEqual(h.store.getRecoveryDecision(decision.recoveryId)?.status, "started", "old wait not adopted");
+    const current = waitsOf(h).filter((d) => (d.resumptionGeneration ?? 0) === 1);
+    assert.equal(current.length, 1, "a fresh wait is planned for the new generation");
+  });
+
   it("context overflow before any commit stops with an explicit finding, not a checkpoint-integrity error", async () => {
     const h = blockedRepairHarness({ contextOverflowNoCheckpoint: true });
 

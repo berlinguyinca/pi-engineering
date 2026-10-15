@@ -318,6 +318,7 @@ export class Orchestrator {
   readonly gate: CompletionGate;
   private readonly router: IntentRouter;
   private readonly planner: OrchestratorOptions["planner"];
+  private readonly planning = new Set<string>();
   private readonly deriveAcceptance: OrchestratorOptions["deriveAcceptance"];
   private readonly onPhase: OrchestratorOptions["onPhase"];
   private readonly observability: OrchestratorOptions["observability"];
@@ -630,6 +631,19 @@ export class Orchestrator {
             (entry.resumptionGeneration ?? 0) === resumptionGeneration &&
             (entry.status === "planned" || entry.status === "started"),
         );
+      // The supervisor names a requirement wait before the mission is BLOCKED,
+      // so its decision carries no episode: adopt it rather than plan a second
+      // WAIT_FOR_REQUIREMENT for the same classification and resumption.
+      repairDecision ??= this.store
+        .listRecoveryDecisions(missionId)
+        .filter(
+          (entry) =>
+            entry.action === "WAIT_FOR_REQUIREMENT" &&
+            entry.classificationId === classification.classificationId &&
+            (entry.resumptionGeneration ?? 0) === resumptionGeneration &&
+            (entry.status === "planned" || entry.status === "started"),
+        )
+        .at(-1);
       if (!repairDecision) {
         const history = this.store.listRecoveryDecisions(missionId);
         const choice = this.recoveryPlanner.decide({
@@ -1488,6 +1502,11 @@ export class Orchestrator {
     }
   }
 
+  /** True while the planner is producing this mission's tasks. */
+  isPlanning(missionId: string): boolean {
+    return this.planning.has(missionId);
+  }
+
   /**
    * Full automatic engineering workflow from a normal-language request.
    */
@@ -1868,130 +1887,139 @@ export class Orchestrator {
 
       if (!specApprovalMaterialized) {
         // Plan/decompose into tasks.
-        const planned = await this.planner(this.store.getMission(mission.mission_id)!, risk);
-        const plannedMission = this.store.getMission(mission.mission_id)!;
-        const manifest = this.store.getWorkspaceManifest(mission.mission_id);
-        const acceptanceIds = plannedMission.acceptance_criteria.flatMap((criterion) =>
-          criterion.acceptance_id ? [criterion.acceptance_id] : [],
-        );
-        const normalized = planned.map((task) => ({
-          ...task,
-          task_id: task.task_id ?? id("TSK"),
-          acceptance_ids: task.acceptance_ids ? [...task.acceptance_ids] : [],
-          deliverables: task.deliverables?.length ? [...task.deliverables] : [task.objective],
-          execution_budget_ms: task.execution_budget_ms ?? this.worksetPolicy.maxTaskBudgetMs,
-          checkpoint_policy: task.checkpoint_policy ?? {
-            activity_milestone: 5,
-            before_deadline_ms: 30_000,
-          },
-          required_output_artifacts: [...(task.required_output_artifacts ?? [])],
-        }));
-        let worksetError: WorksetValidationError | undefined;
-        let decomposedPlan: typeof normalized = [];
+        // The planner may be a long LLM call, and its tasks are persisted only
+        // after validation: the supervisor must not read the taskless mission as
+        // "planning produced nothing" until the plan is materialised (or the
+        // planning attempt ends any other way).
+        this.planning.add(mission.mission_id);
         try {
-          decomposedPlan = splitWorksetDeliverables(normalized, this.worksetPolicy.maxDeliverablesPerTask).tasks;
-        } catch (error) {
-          if (error instanceof WorksetValidationError) worksetError = error;
-          else throw error;
-        }
-        const expandedByOriginal = new Map<string, typeof normalized>();
-        if (!worksetError) {
+          const planned = await this.planner(this.store.getMission(mission.mission_id)!, risk);
+          const plannedMission = this.store.getMission(mission.mission_id)!;
+          const manifest = this.store.getWorkspaceManifest(mission.mission_id);
+          const acceptanceIds = plannedMission.acceptance_criteria.flatMap((criterion) =>
+            criterion.acceptance_id ? [criterion.acceptance_id] : [],
+          );
+          const normalized = planned.map((task) => ({
+            ...task,
+            task_id: task.task_id ?? id("TSK"),
+            acceptance_ids: task.acceptance_ids ? [...task.acceptance_ids] : [],
+            deliverables: task.deliverables?.length ? [...task.deliverables] : [task.objective],
+            execution_budget_ms: task.execution_budget_ms ?? this.worksetPolicy.maxTaskBudgetMs,
+            checkpoint_policy: task.checkpoint_policy ?? {
+              activity_milestone: 5,
+              before_deadline_ms: 30_000,
+            },
+            required_output_artifacts: [...(task.required_output_artifacts ?? [])],
+          }));
+          let worksetError: WorksetValidationError | undefined;
+          let decomposedPlan: typeof normalized = [];
           try {
-            for (const task of decomposedPlan) {
-              const repositories =
-                manifest && manifest.repositories.length > 1 && !task.repo_id && task.kind !== "aggregation"
-                  ? manifest.repositories
-                  : [
-                      manifest?.repositories.find(
-                        (repository) =>
-                          repository.repoId === (task.repo_id ?? this.repoIdForMission(mission.mission_id)),
-                      ),
-                    ];
-              const expanded = repositories.map((repository) => {
-                const repoId = repository?.repoId ?? task.repo_id ?? this.repoIdForMission(mission.mission_id);
-                return {
-                  ...task,
-                  task_id: repositories.length > 1 && repoId ? `${task.task_id}@${repoId}` : task.task_id,
-                  ...(repoId ? { repo_id: repoId } : {}),
-                  write_domains:
-                    task.mutates_repo && repository
-                      ? intersectWriteDomains(
-                          task.write_domains.length > 0 ? task.write_domains : ["**"],
-                          repository.writableDomains,
-                        )
-                      : task.write_domains,
-                };
-              });
-              expandedByOriginal.set(task.task_id, expanded);
+            decomposedPlan = splitWorksetDeliverables(normalized, this.worksetPolicy.maxDeliverablesPerTask).tasks;
+          } catch (error) {
+            if (error instanceof WorksetValidationError) worksetError = error;
+            else throw error;
+          }
+          const expandedByOriginal = new Map<string, typeof normalized>();
+          if (!worksetError) {
+            try {
+              for (const task of decomposedPlan) {
+                const repositories =
+                  manifest && manifest.repositories.length > 1 && !task.repo_id && task.kind !== "aggregation"
+                    ? manifest.repositories
+                    : [
+                        manifest?.repositories.find(
+                          (repository) =>
+                            repository.repoId === (task.repo_id ?? this.repoIdForMission(mission.mission_id)),
+                        ),
+                      ];
+                const expanded = repositories.map((repository) => {
+                  const repoId = repository?.repoId ?? task.repo_id ?? this.repoIdForMission(mission.mission_id);
+                  return {
+                    ...task,
+                    task_id: repositories.length > 1 && repoId ? `${task.task_id}@${repoId}` : task.task_id,
+                    ...(repoId ? { repo_id: repoId } : {}),
+                    write_domains:
+                      task.mutates_repo && repository
+                        ? intersectWriteDomains(
+                            task.write_domains.length > 0 ? task.write_domains : ["**"],
+                            repository.writableDomains,
+                          )
+                        : task.write_domains,
+                  };
+                });
+                expandedByOriginal.set(task.task_id, expanded);
+              }
+            } catch (error) {
+              if (error instanceof WorksetValidationError) worksetError = error;
+              else throw error;
             }
-          } catch (error) {
-            if (error instanceof WorksetValidationError) worksetError = error;
-            else throw error;
           }
-        }
-        const expanded = [...expandedByOriginal.values()].flat().map((task) => ({
-          ...task,
-          depends_on: task.depends_on.flatMap((dependency) => {
-            const candidates = expandedByOriginal.get(dependency);
-            if (!candidates) return [dependency];
-            const sameRepository = candidates.find((candidate) => candidate.repo_id === task.repo_id);
-            return sameRepository ? [sameRepository.task_id] : candidates.map((candidate) => candidate.task_id);
-          }),
-        }));
-        let scopedPlan = expanded;
-        if (manifest && !worksetError) {
-          try {
-            scopedPlan = validateWorkset({
-              manifest,
-              acceptanceIds,
-              tasks: scopedPlan,
-              policy: this.worksetPolicy,
-            }) as typeof scopedPlan;
-          } catch (error) {
-            if (error instanceof WorksetValidationError) worksetError = error;
-            else throw error;
+          const expanded = [...expandedByOriginal.values()].flat().map((task) => ({
+            ...task,
+            depends_on: task.depends_on.flatMap((dependency) => {
+              const candidates = expandedByOriginal.get(dependency);
+              if (!candidates) return [dependency];
+              const sameRepository = candidates.find((candidate) => candidate.repo_id === task.repo_id);
+              return sameRepository ? [sameRepository.task_id] : candidates.map((candidate) => candidate.task_id);
+            }),
+          }));
+          let scopedPlan = expanded;
+          if (manifest && !worksetError) {
+            try {
+              scopedPlan = validateWorkset({
+                manifest,
+                acceptanceIds,
+                tasks: scopedPlan,
+                policy: this.worksetPolicy,
+              }) as typeof scopedPlan;
+            } catch (error) {
+              if (error instanceof WorksetValidationError) worksetError = error;
+              else throw error;
+            }
           }
-        }
-        if (scopedPlan.some((task) => task.mutates_repo && task.write_domains.length === 0) || worksetError) {
-          const summary =
-            worksetError?.message ?? "Planner requested mutation outside the workspace manifest's writable domains";
-          const category =
-            worksetError?.code === "TASK_BUDGET_EXCEEDED"
-              ? "TASK_BUDGET_EXHAUSTED"
-              : worksetError?.code === "CYCLIC_DEPENDENCY" || worksetError?.code === "UNKNOWN_DEPENDENCY"
-                ? "DEADLOCKED_DAG"
-                : worksetError?.code === "UNKNOWN_REPOSITORY" ||
-                    worksetError?.code === "MISSING_REPOSITORY_BINDING" ||
-                    worksetError?.code === "WRITE_DOMAIN_OUTSIDE_REPOSITORY" ||
-                    worksetError?.code === "CROSS_REPOSITORY_MUTATION_UNSUPPORTED"
-                  ? "WORKSPACE_SCOPE_MISMATCH"
-                  : "REQUIREMENT_AMBIGUITY";
-          this.store.classifyFailure({
-            classificationId: id("FC"),
-            missionId: mission.mission_id,
-            taskId: null,
-            executionId: null,
-            category,
-            evidenceRefs: [],
-            fingerprint: `workspace-plan:${this.repoIdForMission(mission.mission_id) ?? "none"}`,
-            summary,
-            classifiedAt: new Date().toISOString(),
-          });
-          this.store.transitionMission(mission.mission_id, "BLOCKED");
-          const blocked = this.store.getMission(mission.mission_id)!;
-          return {
-            mission: blocked,
-            intent,
-            verdict: this.gate.evaluate(blocked),
-            completed: false,
-            failureReason: summary,
-          };
-        }
-        for (const t of scopedPlan) {
-          this.store.createTask({
-            mission_id: mission.mission_id,
-            ...t,
-          });
+          if (scopedPlan.some((task) => task.mutates_repo && task.write_domains.length === 0) || worksetError) {
+            const summary =
+              worksetError?.message ?? "Planner requested mutation outside the workspace manifest's writable domains";
+            const category =
+              worksetError?.code === "TASK_BUDGET_EXCEEDED"
+                ? "TASK_BUDGET_EXHAUSTED"
+                : worksetError?.code === "CYCLIC_DEPENDENCY" || worksetError?.code === "UNKNOWN_DEPENDENCY"
+                  ? "DEADLOCKED_DAG"
+                  : worksetError?.code === "UNKNOWN_REPOSITORY" ||
+                      worksetError?.code === "MISSING_REPOSITORY_BINDING" ||
+                      worksetError?.code === "WRITE_DOMAIN_OUTSIDE_REPOSITORY" ||
+                      worksetError?.code === "CROSS_REPOSITORY_MUTATION_UNSUPPORTED"
+                    ? "WORKSPACE_SCOPE_MISMATCH"
+                    : "REQUIREMENT_AMBIGUITY";
+            this.store.classifyFailure({
+              classificationId: id("FC"),
+              missionId: mission.mission_id,
+              taskId: null,
+              executionId: null,
+              category,
+              evidenceRefs: [],
+              fingerprint: `workspace-plan:${this.repoIdForMission(mission.mission_id) ?? "none"}`,
+              summary,
+              classifiedAt: new Date().toISOString(),
+            });
+            this.store.transitionMission(mission.mission_id, "BLOCKED");
+            const blocked = this.store.getMission(mission.mission_id)!;
+            return {
+              mission: blocked,
+              intent,
+              verdict: this.gate.evaluate(blocked),
+              completed: false,
+              failureReason: summary,
+            };
+          }
+          for (const t of scopedPlan) {
+            this.store.createTask({
+              mission_id: mission.mission_id,
+              ...t,
+            });
+          }
+        } finally {
+          this.planning.delete(mission.mission_id);
         }
       }
       this.store.transitionMission(mission.mission_id, "READY");

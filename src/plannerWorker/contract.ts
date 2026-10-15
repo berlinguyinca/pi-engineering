@@ -52,8 +52,11 @@ function stringList(v: unknown, field: string, errors: string[], opts: { require
   return out;
 }
 
+/** A literal path or literal directory glob ("dir/**", "dir/*"): a subtree root, not a wildcard pattern. */
+export const DIRECTORY_DENY = /^[^*?[\]{}]+(\/\*{1,2})?$/;
+
 /** Why a scope glob is unacceptable, or null when it is a bounded relative glob. */
-export function scopeGlobError(glob: string): string | null {
+export function scopeGlobError(glob: string, opts: { deny?: boolean } = {}): string | null {
   if (!glob) return "empty scope glob";
   if (/\s/.test(glob)) return `scope glob "${glob}" contains whitespace`;
   if (glob.includes("\\")) return `scope glob "${glob}" must use forward slashes`;
@@ -63,6 +66,9 @@ export function scopeGlobError(glob: string): string | null {
   if (segments.some((s) => s === ".git")) return `scope glob "${glob}" targets git metadata`;
   // Only *, ** and ? are supported; brace/bracket sets would silently never match.
   if (/[[\]{}]/.test(glob)) return `scope glob "${glob}" uses unsupported {…} or […] syntax`;
+  // A deny glob may start with a wildcard ("**/*.md"): it removes paths, it
+  // does not grant any, so it cannot make the worker's job unbounded.
+  if (opts.deny) return null;
   const first = segments[0] ?? "";
   if (first === "" || first === "." || /[*?[\]{}]/.test(first)) {
     return `scope glob "${glob}" is unbounded (its first path segment must be literal)`;
@@ -89,11 +95,23 @@ export function parseTaskContract(raw: unknown): ContractParse {
   const allowedRaw = isRecord(rawScope) ? rawScope.allowed : rawScope;
   const forbiddenRaw = isRecord(rawScope) ? rawScope.forbidden : undefined;
   const allowed = stringList(allowedRaw, `${id}.scope.allowed`, errors, { required: true });
-  const forbidden = stringList(forbiddenRaw, `${id}.scope.forbidden`, errors);
-  for (const glob of [...allowed, ...forbidden]) {
+  const forbiddenListed = stringList(forbiddenRaw, `${id}.scope.forbidden`, errors);
+  for (const glob of allowed) {
     const why = scopeGlobError(glob);
     if (why) errors.push(`${id}: ${why}`);
   }
+  for (const glob of forbiddenListed) {
+    const why = scopeGlobError(glob, { deny: true });
+    if (why) errors.push(`${id}: ${why}`);
+  }
+  // A wildcard-pattern deny glob that matches the contract's own allowed scope
+  // ("**/*", "src/**.js" beside allowed "src/calc.js") contradicts it and would
+  // leave nothing writable; the explicit allowed list wins. A directory deny
+  // ("src/**") is kept: the mission planner falls back on that contradiction.
+  const keepsDeny = (deny: string): boolean =>
+    DIRECTORY_DENY.test(deny) || !allowed.some((grant) => matchesGlob(grant, deny));
+  const forbidden = forbiddenListed.filter(keepsDeny);
+  const ignored_forbidden = forbiddenListed.filter((deny) => !keepsDeny(deny));
 
   const acceptance = stringList(raw.acceptance, `${id}.acceptance`, errors, { required: true });
   const verification = stringList(raw.verification, `${id}.verification`, errors);
@@ -114,6 +132,7 @@ export function parseTaskContract(raw: unknown): ContractParse {
       objective,
       depends_on,
       scope: { allowed, forbidden },
+      ...(ignored_forbidden.length > 0 ? { ignored_forbidden } : {}),
       acceptance,
       verification,
       constraints,
@@ -275,7 +294,13 @@ export function extractStructured(text: string): unknown {
 export function parsePlannerOutput(input: unknown, opts: { external?: ReadonlySet<string> } = {}): PlanParse {
   const data = typeof input === "string" ? extractStructured(input) : input;
   const root = isRecord(data) && isRecord(data.plan) ? data.plan : data;
-  const rawContracts = Array.isArray(root) ? root : isRecord(root) ? root.contracts : undefined;
+  // The planner worker reports through worker_result, whose role payload is
+  // `details`: the contracts live at details.contracts there.
+  const rawContracts = Array.isArray(root)
+    ? root
+    : isRecord(root)
+      ? (root.contracts ?? (isRecord(root.details) ? root.details.contracts : undefined))
+      : undefined;
   if (!Array.isArray(rawContracts)) return { ok: false, errors: ["planner output has no contracts list"] };
   const errors: string[] = [];
   const contracts: TaskContract[] = [];
