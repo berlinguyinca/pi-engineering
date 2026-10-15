@@ -303,6 +303,34 @@ and are listed with the gateway's own error text. Only an authentication or
 account-wide refusal stops a provider's refresh. In that case its configuration
 is left as it was.
 
+## Worker transcripts and runtime log caps
+
+Every worker session (implementer, reviewer, repair, planner) is persisted as
+JSONL under the runtime state directory, never in the repo or a candidate
+worktree:
+
+    <PI_ENGINEERING_STATE_DIR>/worktrees/<worktree-id>/transcripts/<missionId>/<executionId>.jsonl
+
+Records: session header (role, model), messages (role, model, stop reason,
+tokens, timestamps), tool calls, tool results (truncated, with the error
+category on failure) and a per-turn line (stop reason, tool-error category,
+tokens). Secrets (bearer tokens, `password=`, API keys) are redacted. Each turn
+also emits a `Turn ended: stop=<reason> tool_error=<category>` worker activity,
+persisted as a `mission.obs.worker` event, so stop-reason and tool-error rates
+can be computed per worker.
+
+- `PI_WORKER_TRANSCRIPTS` (`on`|`off`, default `on`).
+- `PI_WORKER_TRANSCRIPT_MAX_BYTES` (default 5 MiB): per-file cap; the file rotates
+  to `<file>.1` (one predecessor kept).
+- `PI_WORKER_TRANSCRIPT_TOOL_CHARS` (default 4000): cap per tool argument/result.
+
+The worktree janitor must leave `transcripts/` alone except by age.
+
+`sessions/<id>/runtime.jsonl` is capped: it rotates to `runtime.jsonl.1` at
+`PI_RUNTIME_LOG_MAX_BYTES` (default 10 MiB). `lease.contended` is logged once per
+(resource, holder); repeats are counted and a `lease.contended_summary` line
+carries the counters every `PI_RUNTIME_CONTENTION_SUMMARY_MS` (default 5 min).
+
 ## Context budget for mission workers
 
 A worker's context budget is the smaller of its role's budget (`ROLE_BUDGETS`,
