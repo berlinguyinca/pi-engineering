@@ -144,6 +144,29 @@ import { createWorkerResultTool } from "./workerResultTool.ts";
  */
 const APS_RECOVERY_MAX_ATTEMPTS = 1;
 
+/**
+ * Consecutive calls to a tool the session does not offer, after which the
+ * attempt is aborted. Such a call returns "Tool X not found" and the model is
+ * asked again; a model that keeps answering with the same unavailable tool
+ * (a reviewer's `review_result` sent to an implementer, say) never ends the
+ * turn. The generic guard reads each call as progress, so the loop needs its
+ * own bound (issue #234; first seen at 9648e15, the in-session nudge).
+ */
+export const MAX_UNKNOWN_TOOL_CALLS = 3;
+
+/** The agent loop's result for a call to a tool the session does not register. */
+function isToolNotFound(result: unknown): boolean {
+  const content = (result as { content?: unknown } | undefined)?.content;
+  if (!Array.isArray(content)) return false;
+  return content.some(
+    (part) =>
+      typeof part === "object" &&
+      part !== null &&
+      (part as { type?: unknown }).type === "text" &&
+      /^Tool \S+ not found$/.test(String((part as { text?: unknown }).text ?? "").trim()),
+  );
+}
+
 /** A minimal resource loader that supplies only the role prompt (context firewall). */
 function roleResourceLoader(systemPrompt: string): ResourceLoader {
   return {
@@ -920,6 +943,7 @@ export class PiWorkerExecutor implements WorkerExecutor {
         assistantError,
         loopPrevented,
         loopPreventedEvent,
+        unknownToolLoop,
       } = transientOutcome.value!;
       if (assistantError) lastAssistantError = assistantError;
 
@@ -953,6 +977,26 @@ export class PiWorkerExecutor implements WorkerExecutor {
         if (gatewayConfig.enabled) admission.noteSuccess();
         const usage = this.collectUsage(this.asMessages(session.messages), streamResumes.count);
         return { result, usage, toolCalls, structured };
+      }
+
+      // The model kept calling a tool this session does not offer: replaying it
+      // in a fresh session would loop the same way, so the run ends here.
+      if (unknownToolLoop !== undefined) {
+        return {
+          result: {
+            status: "failed",
+            summary: `The model kept calling ${unknownToolLoop}, which this ${req.role} session does not offer (${MAX_UNKNOWN_TOOL_CALLS} calls in a row); the attempt was stopped.`,
+            claims: [],
+            evidence_refs: [],
+            new_hypotheses: [],
+            proposed_tasks: [],
+            details: { unknown_tool: unknownToolLoop },
+            error: "unknown_tool_loop",
+          },
+          usage: this.collectUsage(this.asMessages(session.messages), streamResumes.count),
+          error: "unknown_tool_loop",
+          toolCalls,
+        };
       }
 
       // Gateway saturation: honour the wait the gateway reported, hold every
@@ -1260,6 +1304,8 @@ ${recovery.recoveryPrompt}`;
     guardReason?: GuardAbortReason;
     loopPrevented: boolean;
     loopPreventedEvent?: AgentLoopPreventedEvent;
+    /** The tool the model kept calling although the session does not offer it. */
+    unknownToolLoop?: string;
     guardDiagnostics: Record<string, unknown>;
     captured?: WorkerResult;
     structured?: unknown;
@@ -1331,6 +1377,10 @@ ${recovery.recoveryPrompt}`;
     let guardDiagnostics: Record<string, unknown> = {};
     let loopPrevented = false;
     let loopPreventedEvent: AgentLoopPreventedEvent | undefined;
+    // Consecutive calls to a tool this session does not offer (see
+    // MAX_UNKNOWN_TOOL_CALLS). Set once the bound is hit and the attempt aborted.
+    let unknownToolStreak = 0;
+    let unknownToolLoop: string | undefined;
     // Two distinct error channels, both needed: `assistantError` is the
     // assistant MESSAGE's error (stopReason "error" — where a gateway 429 body
     // arrives), `promptError` is a THROWN transport failure.
@@ -1554,6 +1604,17 @@ ${recovery.recoveryPrompt}`;
           }
         }
       }
+      if (event.type === "tool_execution_end") {
+        if (event.isError && isToolNotFound(event.result)) {
+          unknownToolStreak += 1;
+          if (unknownToolStreak >= MAX_UNKNOWN_TOOL_CALLS && unknownToolLoop === undefined) {
+            unknownToolLoop = event.toolName;
+            void session.abort();
+          }
+        } else {
+          unknownToolStreak = 0;
+        }
+      }
       // Count tool executions and feed progress to the guard.
       if (event.type === "tool_execution_start" && event.toolName !== terminatingName) {
         toolCalls++;
@@ -1710,6 +1771,7 @@ ${recovery.recoveryPrompt}`;
         !ownerAborted &&
         !stalled &&
         !loopPrevented &&
+        unknownToolLoop === undefined &&
         assistantError === undefined &&
         !req.signal?.aborted
       ) {
@@ -1722,7 +1784,7 @@ ${recovery.recoveryPrompt}`;
       // EXPECTED (session.abort()) and not a transport failure. A rejection
       // with none of those flags set is a real provider/transport error (503,
       // 429, network, timeout) that the transient-recovery layer retries.
-      if (!guardAborted && !budgetExhausted && !timedOut && !ownerAborted && !stalled) {
+      if (!guardAborted && !budgetExhausted && !timedOut && !ownerAborted && !stalled && !unknownToolLoop) {
         promptError = err;
       }
     } finally {
@@ -1804,6 +1866,7 @@ ${recovery.recoveryPrompt}`;
       guardDiagnostics,
       loopPrevented,
       loopPreventedEvent,
+      unknownToolLoop,
       captured,
       structured,
       toolCalls,

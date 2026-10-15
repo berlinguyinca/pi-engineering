@@ -201,7 +201,10 @@ test("verification stages run with the shared Rust cache in their environment", 
     process.env.PI_RUST_CACHE_DIR = root;
     process.env.PI_TEST_EXPECTED_TARGET = expected;
     delete process.env.CARGO_TARGET_DIR;
-    await mkdir(join(dir, "artifacts"), { recursive: true });
+    // Explicit mode plus chmod: mkdir's mode is masked by the umask, and a
+    // group-writable root is exactly what ArtifactStore refuses.
+    await mkdir(join(dir, "artifacts"), { recursive: true, mode: 0o700 });
+    await chmod(join(dir, "artifacts"), 0o700);
     await writeFile(
       join(dir, "package.json"),
       JSON.stringify({

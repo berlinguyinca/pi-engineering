@@ -2316,6 +2316,7 @@ export class Orchestrator {
         : this.store.listRecoveryDecisions(missionId).filter((decision) => decision.action === "CREATE_REPAIR_TASKS")
             .length;
     let mergeRetries = 0;
+    let gateOnlyMissingRan = false;
     while ((!verdict.can_complete || !integrated) && repairRounds < this.maxRepairRounds) {
       if (signal?.aborted) return this.canceledFinalization(missionId, signal);
       // A reviewer that asked for changes must get a repair round even when it
@@ -2338,7 +2339,31 @@ export class Orchestrator {
             (later, laterIndex) => laterIndex > index && later.kind === t.kind && later.status === "SUCCEEDED",
           ),
       );
-      if (openBlocking.length === 0 && failedGates.length === 0) break;
+      if (openBlocking.length === 0 && failedGates.length === 0) {
+        // A gate-only re-run of an unchanged, integrated candidate has nothing
+        // failed left to re-run, yet a resumption may have invalidated gate
+        // evidence: run each required gate still lacking current evidence
+        // rather than leaving the completion gate unsatisfied.
+        const storedCandidate = this.store.getCandidate(missionId);
+        const verifiedCandidate =
+          opts.gateOnly && storedCandidate ? await this.broker.verifiedCandidateContent(missionId) : null;
+        if (
+          opts.gateOnly &&
+          integrated &&
+          !gateOnlyMissingRan &&
+          verdict.missing_gates.length > 0 &&
+          storedCandidate &&
+          verifiedCandidate?.candidateSha === storedCandidate.identity.candidateSha &&
+          verifiedCandidate.diffHash === storedCandidate.identity.diffHash
+        ) {
+          gateOnlyMissingRan = true;
+          await this.runMissingGates(missionId, verdict.missing_gates, signal);
+          if (signal?.aborted) return this.canceledFinalization(missionId, signal);
+          verdict = this.gate.evaluate(this.store.getMission(missionId)!);
+          continue;
+        }
+        break;
+      }
       repairRounds++;
 
       const blockerTask = failedGates.at(-1);
@@ -2433,7 +2458,22 @@ export class Orchestrator {
         // Count only this resumption's gate probes, so a mission parked at the
         // cap becomes resumable and unrelated provider waits are not charged.
         const generation = this.store.listMissionResumptions(missionId).at(-1)?.generation ?? 0;
+        // repairBlockedMission already planned and started this resumption's
+        // gate probe before handing over (gateOnly): that decision is this
+        // probe, not a prior one, and a second decision must not be planned.
+        const handedOver = opts.gateOnly
+          ? this.store
+              .listRecoveryDecisions(missionId)
+              .find(
+                (decision) =>
+                  decision.action === "PROBE_AND_BACKOFF" &&
+                  decision.status === "started" &&
+                  decision.classificationId === classification.classificationId &&
+                  (decision.resumptionGeneration ?? 0) === generation,
+              )
+          : undefined;
         const priorProbes = this.store.listRecoveryDecisions(missionId).filter((decision) => {
+          if (decision.recoveryId === handedOver?.recoveryId) return false;
           if (decision.action !== "PROBE_AND_BACKOFF" || (decision.resumptionGeneration ?? 0) !== generation) {
             return false;
           }
@@ -2458,7 +2498,9 @@ export class Orchestrator {
           break;
         }
         const probe =
-          this.store.getRecoveryDecision(recoveryChoice.recoveryId) ?? this.store.planRecovery(recoveryChoice);
+          handedOver ??
+          this.store.getRecoveryDecision(recoveryChoice.recoveryId) ??
+          this.store.planRecovery(recoveryChoice);
         if (probe.status === "planned") this.store.transitionRecovery(probe.recoveryId, "started");
         await this.store.flush();
         if (this.store.getMission(missionId)!.status !== "REPAIRING") {
@@ -2482,8 +2524,10 @@ export class Orchestrator {
           }
           if (!signal?.aborted) this.store.transitionMission(missionId, "FINAL_VALIDATION");
         } else {
-          await this.runReviewGate(this.store.getMission(missionId)!, signal);
-          if (!signal?.aborted) this.store.transitionMission(missionId, "FINAL_VALIDATION");
+          // A new mission generation invalidated all gate evidence, so the
+          // failed review is not the only gate lacking current evidence for the
+          // unchanged candidate: run a missing validation first, then the review.
+          await this.runMissingGates(missionId, ["independent_review"], signal);
         }
         if (signal?.aborted) return this.canceledFinalization(missionId, signal);
         verdict = this.gate.evaluate(this.store.getMission(missionId)!);
@@ -2939,6 +2983,35 @@ export class Orchestrator {
         blockerEpisodeId: this.store.getMission(task.mission_id)?.blocked_episode_id,
       });
     }
+  }
+
+  /**
+   * Run, validation first, each gate in `required` that has no current evidence
+   * for the candidate (plus a validation the verdict reports missing), so a
+   * review never runs ahead of the validation it depends on.
+   */
+  private async runMissingGates(missionId: string, required: RequiredGate[], signal?: AbortSignal): Promise<void> {
+    const validationGates: RequiredGate[] = ["validation", "migration_validation", "dependency_validation"];
+    const reviewGates: RequiredGate[] = ["independent_review", "compatibility_review", "security_review"];
+    const missing = () => this.gate.evaluate(this.store.getMission(missionId)!).missing_gates;
+    // FINAL_VALIDATION cannot move to VALIDATING; REPAIRING can.
+    if (this.store.getMission(missionId)!.status !== "REPAIRING") this.store.transitionMission(missionId, "REPAIRING");
+    let validated = true;
+    if (
+      required.some((gate) => validationGates.includes(gate)) ||
+      missing().some((gate) => validationGates.includes(gate))
+    ) {
+      validated = await this.runValidationGate(this.store.getMission(missionId)!, signal);
+    }
+    if (!validated || signal?.aborted) return;
+    // One review run satisfies every review gate (security_review included).
+    if (
+      required.some((gate) => !validationGates.includes(gate)) ||
+      missing().some((gate) => reviewGates.includes(gate))
+    ) {
+      await this.runReviewGate(this.store.getMission(missionId)!, signal);
+    }
+    if (!signal?.aborted) this.store.transitionMission(missionId, "FINAL_VALIDATION");
   }
 
   /** Create and run one validation task over the integrated result. */
