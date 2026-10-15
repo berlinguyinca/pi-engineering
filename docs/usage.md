@@ -263,6 +263,21 @@ was refused is skipped for five minutes. An operator-pinned reviewer is exempt
 from the cap and keeps waiting, unless its host refuses connections or does not
 resolve; then it moves to another model with a notice.
 
+### Updating and hot reload (`/pie`)
+
+`/pie` is the short alias for everything pi-engineering registers: `/pie
+update`, `/pie reload`, `/pie version`, `/pie rollback`, `/pie status`, `/pie
+cancel`, and any pi-engineering command by name (`/pie mission status` is
+`/mission status`; `/pie` alone lists them).
+
+When Pi loads pi-engineering from a git checkout, a commit landing on that
+checkout hot-reloads every running session by itself within about 15 seconds:
+the Host hands over to a new generation at the next safe point and the same
+conversation continues. Nothing has to be restarted. Uncommitted edits are
+never loaded. `/pie update` does the same immediately (and, when the checkout
+has not moved, checks the update remote as before). `PI_ENGINEERING_AUTO_RELOAD=0`
+turns the automatic reload off.
+
 ### Interrupting and cancelling a mission
 
 Pressing Esc while the `mission` tool or `/mission` runs **pauses** the mission
