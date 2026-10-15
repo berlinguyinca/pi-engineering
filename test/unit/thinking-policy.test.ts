@@ -36,7 +36,9 @@ const METABOLOMICS = {
   baseUrl: "https://llm.example.com/v1",
   contextWindow: 262_144,
   maxTokens: 32_768,
+  compat: { supportsReasoningEffort: true },
 };
+const NODE_ONLY = { ...METABOLOMICS, compat: { supportsReasoningEffort: false } };
 const ELSEWHERE = { ...METABOLOMICS, provider: "openai", baseUrl: "https://api.openai.com/v1" };
 
 /** Pi's own summarization request, captured from its real compaction code. */
@@ -214,5 +216,42 @@ test("overriding a reasoning level the user set, for a small allowance, is logge
     assert.deepEqual(notices, []);
   } finally {
     uninstall();
+  }
+});
+
+test("interactive summarization and low-budget turns: no reasoning_effort unless compat grants it", async () => {
+  const sendTo = async (
+    m: { compat?: { supportsReasoningEffort?: boolean } },
+    context: { systemPrompt?: string; messages: unknown[] },
+    max: number,
+  ) => {
+    let sent: Record<string, unknown> | undefined;
+    const base = (_m: unknown, _c: unknown, options?: { onPayload?: (p: unknown, m: unknown) => unknown }) => ({
+      async *[Symbol.asyncIterator]() {},
+      result: async () => {
+        sent = (await options?.onPayload?.({ max_tokens: max }, m)) as never;
+        return { stopReason: "stop" };
+      },
+    });
+    await streamWithThinkingPolicy(base as never, resolveThinkingOffConfig({}))(
+      m,
+      context as never,
+      {} as never,
+    ).result();
+    assert.ok(sent);
+    return sent;
+  };
+  const summary = await piSummarizationContext();
+  const ordinary = { systemPrompt: "You are Pi.", messages: [user("hi")] };
+  for (const [context, max] of [
+    [summary, 13_107],
+    [ordinary, 9_000],
+  ] as const) {
+    const nodeOnly = await sendTo(NODE_ONLY, context, max);
+    assert.deepEqual(nodeOnly.chat_template_kwargs, { enable_thinking: false });
+    assert.equal("reasoning_effort" in nodeOnly && nodeOnly.reasoning_effort !== undefined, false);
+    const granted = await sendTo(METABOLOMICS, context, max);
+    assert.deepEqual(granted.chat_template_kwargs, { enable_thinking: false });
+    assert.equal(granted.reasoning_effort, "none");
   }
 });
