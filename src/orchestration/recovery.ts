@@ -303,6 +303,15 @@ export function gateReportedVerdict(
   return recognized === undefined || !GATE_INFRASTRUCTURE_CATEGORIES.has(recognized);
 }
 
+/**
+ * The transport-level failure texts a legacy gate failure must carry before it
+ * is re-read as a provider failure: connection loss, a cut stream, a model
+ * restart, a gateway capacity hold, or a grammar refusal. Loose words such as
+ * "timeout" or "network" can come from a real review or test output.
+ */
+export const GATE_TRANSPORT_SIGNATURE =
+  /connection error|connection closed|stream ended without (?:a )?finish_reason|model[_ ]superseded|gateway capacity hold|capacity hold:|http 400.*grammar|failed to parse grammar|failed to initialize samplers/i;
+
 const GATE_FAILURE_CATEGORY: Partial<Record<OrchestrationTask["kind"], FailureCategory>> = {
   validation: "VALIDATION_FAILED",
   review: "REVIEW_FAILED",

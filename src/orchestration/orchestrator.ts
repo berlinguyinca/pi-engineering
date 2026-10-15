@@ -46,6 +46,7 @@ import type { DispatchAuthority, MissionOwnership } from "./ownership.ts";
 import { deriveRequiredGates, mutationFactFromChangedFiles } from "./policies.ts";
 import {
   FailureClassifier,
+  GATE_TRANSPORT_SIGNATURE,
   RecoveryPlanner,
   type RecoveryPlannerOptions,
   classifyGateFailure,
@@ -610,7 +611,7 @@ export class Orchestrator {
         return this.store.getMission(missionId)!;
       }
       const resumableGate = this.failedGateWithoutVerdict(classification);
-      if (repairDecision.action === "PROBE_AND_BACKOFF" && resumableGate) {
+      if (repairDecision.action === "PROBE_AND_BACKOFF" && resumableGate && recoveryStartContent) {
         // The gate died on a provider failure: re-run only that gate against
         // the existing candidate instead of parking again.
         if (this.store.getMission(missionId)!.status === "BLOCKED" && repairDecision.status === "planned") {
@@ -2527,12 +2528,18 @@ export class Orchestrator {
     if (!task || (task.kind !== "validation" && task.kind !== "review" && task.kind !== "integration")) {
       return classification;
     }
-    const rederived = classifyGateFailure(this.failureClassifier, task.kind, {
+    const reason = task.failure_reason ?? classification.summary;
+    const reportedVerdict =
+      this.store.listReviewEvidence(classification.missionId).some((evidence) => evidence.taskId === task.task_id) ||
+      this.store.listValidationEvidence(classification.missionId).some((evidence) => evidence.taskId === task.task_id);
+    if (reportedVerdict || !GATE_TRANSPORT_SIGNATURE.test(reason)) return classification;
+    const rederived = this.failureClassifier.classify({
       missionId: classification.missionId,
       taskId: task.task_id,
       executionId: classification.executionId,
-      summary: task.failure_reason ?? classification.summary,
+      summary: reason,
       evidenceRefs: [],
+      category: "PROVIDER_TRANSIENT",
       observedAt: new Date(this.scheduler.now()).toISOString(),
     });
     if (rederived.category === classification.category) return classification;

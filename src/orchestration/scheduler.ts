@@ -1392,7 +1392,6 @@ export class MissionScheduler {
     this.relaunches.delete(task.task_id);
   }
 
-  /** The resolved mission resilience config. */
   /**
    * Pace a gate re-run after a provider failure. The recovery planner's
    * nextActionAt is "now", so the pacing comes from the scheduler's retry
@@ -1407,6 +1406,7 @@ export class MissionScheduler {
     await this.abortable(this.sleepFn(wait), signal);
   }
 
+  /** The resolved mission resilience config. */
   get resilienceConfig(): GatewayResilienceConfig {
     return this.resilience;
   }
