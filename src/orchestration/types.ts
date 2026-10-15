@@ -246,6 +246,8 @@ export interface OrchestrationTask {
   repair_base_candidate_sha?: string;
   /** Immutable full replacement/manifest/checkpoint fingerprint for replay and dispatch. */
   replacement_spec_fingerprint?: string;
+  /** Bounded planner context (relevant files, verification) handed to the worker as contextRef. */
+  context_ref?: string;
 }
 
 /** The complete allow-list of metadata a task lifecycle transition may update. */

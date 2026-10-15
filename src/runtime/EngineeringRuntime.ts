@@ -27,6 +27,7 @@ import { Ledger } from "../ledger/Ledger.ts";
 import { loadMissionLimits } from "../lifecycle/policy.ts";
 import { workflowMutatesRepo } from "../orchestration/intentRouter.ts";
 import { OPERATOR_PAUSE_STOP_REASON, interruptibleRun } from "../orchestration/interrupt.ts";
+import { missionPlannerMode, planMission } from "../orchestration/missionPlanner.ts";
 import {
   MISSION_SNAPSHOT_FILENAME,
   type MissionSnapshotFile,
@@ -563,6 +564,8 @@ export class EngineeringRuntime {
   missionSupervisor: MissionSupervisor | null;
   /** Orchestrator facade (spec 06) — auto-invokes workflows from intent. */
   orchestrator: Orchestrator | null;
+  /** The planner the orchestrator uses to turn a mission into tasks. */
+  missionPlanner: NonNullable<EngineeringRuntimeOptions["orchestrationPlanner"]> | null;
   /**
    * Mission observability service (spec 00 §observability): weighted-DAG
    * progress, health/stall/loop detection, structured events, projection. Lives
@@ -837,6 +840,7 @@ export class EngineeringRuntime {
     this.missionOwnership = null;
     this.missionSupervisor = null;
     this.orchestrator = null;
+    this.missionPlanner = null;
     this.missionObservability = null;
     this.repositoryRegistry = new RepositoryRegistry();
     this.coreTools = [];
@@ -1085,28 +1089,64 @@ export class EngineeringRuntime {
         const acceptanceIds = mission.acceptance_criteria.flatMap((criterion) =>
           criterion.acceptance_id ? [criterion.acceptance_id] : [],
         );
-        return [
-          {
-            kind: "agent",
-            role: mutates ? "implementer" : "investigator",
-            objective: mission.goal,
-            mutates_repo: mutates,
-            write_domains: mutates ? ["**"] : [],
-            isolation: mutates ? "worktree" : "none",
-            depends_on: [],
-            priority: 0,
-            execution_requirements: {},
-            acceptance_ids: acceptanceIds,
-            deliverables: mutates ? ["implementation", "targeted-tests"] : ["investigation-report"],
-            // No execution_budget_ms: a task runs as long as it shows activity
-            // (an opt-in limits.max_task_wall_clock_ms is applied by the
-            // orchestrator when configured).
-            checkpoint_policy: { activity_milestone: 5, before_deadline_ms: 30_000 },
-            max_attempts: 3,
-            failure_policy: "retry",
+        const single = (): PlanTaskInput => ({
+          kind: "agent",
+          role: mutates ? "implementer" : "investigator",
+          objective: mission.goal,
+          mutates_repo: mutates,
+          write_domains: mutates ? ["**"] : [],
+          isolation: mutates ? "worktree" : "none",
+          depends_on: [],
+          priority: 0,
+          execution_requirements: {},
+          acceptance_ids: acceptanceIds,
+          deliverables: mutates ? ["implementation", "targeted-tests"] : ["investigation-report"],
+          // No execution_budget_ms: a task runs as long as it shows activity
+          // (an opt-in limits.max_task_wall_clock_ms is applied by the
+          // orchestrator when configured).
+          checkpoint_policy: { activity_milestone: 5, before_deadline_ms: 30_000 },
+          max_attempts: 3,
+          failure_policy: "retry",
+        });
+        // Non-trivial goals get ONE planner call (PLANNER_PROMPT) on the best
+        // "planner"-routed model so independent work gets real write domains;
+        // a malformed plan falls back to the single task and never blocks.
+        const planned = await planMission({
+          goal: mission.goal,
+          mutates,
+          mode: missionPlannerMode(),
+          acceptanceIds,
+          single,
+          runPlanner: async (task) => {
+            const route = await routeModel?.("planner", { missionId: mission.mission_id }).catch(() => undefined);
+            const run = await rt.worker.run({
+              role: "planner",
+              task,
+              tools: READ_ONLY_TOOLS,
+              cwd: repoRoot,
+              unboundedInferenceWait: true,
+              ...(route ? { modelOverride: { provider: route.provider, id: route.id } } : {}),
+            });
+            if (run.error) throw new Error(run.error);
+            return run.result.summary;
           },
-        ];
+        });
+        if (planned.fallbackReason) {
+          rt.missionStore?.addFinding({
+            mission_id: mission.mission_id,
+            task_id: null,
+            severity: "minor",
+            category: "mission_planner",
+            file: null,
+            line: null,
+            summary: "Mission planner output unusable; ran the goal as a single task.",
+            evidence: planned.fallbackReason.slice(0, 1000),
+            recommended_action: "None required; the mission continues with one task.",
+          });
+        }
+        return planned.tasks;
       };
+      rt.missionPlanner = opts.orchestrationPlanner ?? defaultPlanner;
       const limits = await loadMissionLimits(repoRoot, opts.agentDir);
       const recoveryBudget = missionRecoveryBudget(rt.resilience);
       rt.orchestrator = new Orchestrator({

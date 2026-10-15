@@ -3260,6 +3260,7 @@ export class Orchestrator {
         kind: brokerKind(task.kind),
         role: task.role,
         objective: task.objective,
+        contextRef: task.context_ref,
         mutatesRepo: task.mutates_repo,
         writeDomains: task.write_domains,
         isolation: task.isolation,
