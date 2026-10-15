@@ -2343,7 +2343,18 @@ export class Orchestrator {
         // failed left to re-run, yet a resumption may have invalidated gate
         // evidence: run each required gate still lacking current evidence
         // rather than leaving the completion gate unsatisfied.
-        if (opts.gateOnly && integrated && !gateOnlyMissingRan && verdict.missing_gates.length > 0) {
+        const storedCandidate = this.store.getCandidate(missionId);
+        const verifiedCandidate =
+          opts.gateOnly && storedCandidate ? await this.broker.verifiedCandidateContent(missionId) : null;
+        if (
+          opts.gateOnly &&
+          integrated &&
+          !gateOnlyMissingRan &&
+          verdict.missing_gates.length > 0 &&
+          storedCandidate &&
+          verifiedCandidate?.candidateSha === storedCandidate.identity.candidateSha &&
+          verifiedCandidate.diffHash === storedCandidate.identity.diffHash
+        ) {
           gateOnlyMissingRan = true;
           await this.runMissingGates(missionId, verdict.missing_gates, signal);
           if (signal?.aborted) return this.canceledFinalization(missionId, signal);
@@ -2456,6 +2467,7 @@ export class Orchestrator {
                 (decision) =>
                   decision.action === "PROBE_AND_BACKOFF" &&
                   decision.status === "started" &&
+                  decision.classificationId === classification.classificationId &&
                   (decision.resumptionGeneration ?? 0) === generation,
               )
           : undefined;
@@ -2979,7 +2991,10 @@ export class Orchestrator {
    */
   private async runMissingGates(missionId: string, required: RequiredGate[], signal?: AbortSignal): Promise<void> {
     const validationGates: RequiredGate[] = ["validation", "migration_validation", "dependency_validation"];
+    const reviewGates: RequiredGate[] = ["independent_review", "compatibility_review", "security_review"];
     const missing = () => this.gate.evaluate(this.store.getMission(missionId)!).missing_gates;
+    // FINAL_VALIDATION cannot move to VALIDATING; REPAIRING can.
+    if (this.store.getMission(missionId)!.status !== "REPAIRING") this.store.transitionMission(missionId, "REPAIRING");
     let validated = true;
     if (
       required.some((gate) => validationGates.includes(gate)) ||
@@ -2988,7 +3003,11 @@ export class Orchestrator {
       validated = await this.runValidationGate(this.store.getMission(missionId)!, signal);
     }
     if (!validated || signal?.aborted) return;
-    if (required.some((gate) => !validationGates.includes(gate))) {
+    // One review run satisfies every review gate (security_review included).
+    if (
+      required.some((gate) => !validationGates.includes(gate)) ||
+      missing().some((gate) => reviewGates.includes(gate))
+    ) {
       await this.runReviewGate(this.store.getMission(missionId)!, signal);
     }
     if (!signal?.aborted) this.store.transitionMission(missionId, "FINAL_VALIDATION");
