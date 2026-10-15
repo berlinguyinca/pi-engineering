@@ -18,6 +18,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { resolveGatewayConfig } from "../../src/gateway/config.ts";
+import { isResilientRuntime } from "../../src/inference/resilientStream.ts";
 import { ExecutionBroker } from "../../src/orchestration/broker.ts";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
 import { realBackends } from "../../src/orchestration/realBackends.ts";
@@ -209,7 +210,7 @@ test("reviewer: a cut AFTER review_result was delivered does not re-run the revi
       truncated,
     ],
     async (executor, cwd) => {
-      await executor.run({
+      const run = await executor.run({
         role: "reviewer",
         task: "review",
         tools: ["read"],
@@ -217,6 +218,8 @@ test("reviewer: a cut AFTER review_result was delivered does not re-run the revi
         resultTool: "review_result",
         modelOverride: { provider: "probe", id: "probe-model" },
       });
+      assert.equal(run.result.status, "completed", run.result.summary);
+      assert.equal((run.structured as { verdict?: string } | undefined)?.verdict, "approve");
     },
   );
   assert.equal(requests, 2, "the delivered verdict must not be thrown away and re-run in a fresh session");
@@ -269,6 +272,19 @@ const bashRun = (executor: PiWorkerExecutor, cwd: string) =>
     modelOverride: { provider: "probe", id: "probe-model" },
   });
 
+/** The resumed request keeps the executed tool call and its result, and drops the partial message. */
+function assertResumedHistory(body: string): void {
+  const messages = (JSON.parse(body) as { messages: Array<Record<string, any>> }).messages;
+  const call = messages.find((m) => m.role === "assistant" && Array.isArray(m.tool_calls));
+  assert.equal(call?.tool_calls[0].id, "call_0");
+  assert.equal(call?.tool_calls[0].function.name, "bash");
+  const result = messages.find((m) => m.role === "tool");
+  assert.equal(result?.tool_call_id, "call_0");
+  assert.match(JSON.stringify(result?.content), /marker-123\\n/);
+  assert.doesNotMatch(body, /PARTIAL-DRAFT-TEXT/);
+  assert.equal(messages.filter((m) => m.role === "assistant").length, 1, "only the executed turn remains");
+}
+
 test("worker: a cut after a tool ran resumes in the same session without replaying the tool", async () => {
   const requests = await withProbe(
     [bashMarker, cutMidMessage, toolCalls([{ name: "worker_result", args: WORKER_RESULT }])],
@@ -281,12 +297,25 @@ test("worker: a cut after a tool ran resumes in the same session without replayi
         "marker-123\n",
         "the executed tool must not run again",
       );
-      // The resumed request keeps the executed tool call + result, and drops the partial message.
-      assert.match(bodies[2]!, /marker-123/);
-      assert.doesNotMatch(bodies[2]!, /PARTIAL-DRAFT-TEXT/);
+      assertResumedHistory(bodies[2]!);
     },
   );
   assert.equal(requests, 3, "tool turn, cut turn, resumed turn: one session");
+});
+
+test("worker: resume triggers through the armed resilient stream layer (production path)", async () => {
+  const requests = await withProbe(
+    [bashMarker, cutMidMessage, toolCalls([{ name: "worker_result", args: WORKER_RESULT }])],
+    async (executor, cwd, bodies) => {
+      assert.equal(isResilientRuntime(await executor.getModelRuntime()), true, "resilient layer must be armed");
+      const run = await bashRun(executor, cwd);
+      assert.equal(run.result.status, "completed", run.result.summary);
+      assert.equal(run.usage?.streamResumes, 1);
+      assert.equal(readFileSync(join(cwd, "side-effect.txt"), "utf8"), "marker-123\n");
+      assertResumedHistory(bodies[2]!);
+    },
+  );
+  assert.equal(requests, 3);
 });
 
 test("worker: a connection cut after a tool ran is resumed as well", async () => {
