@@ -83,6 +83,43 @@ test("mission tool resume reaches EngineeringRuntime.resumeBlockedMission instea
       goal: "no durable stop",
       user_request: "no durable stop",
     });
+    // A fresh mission starts WAITING_FOR_USER, which the tool now refuses to
+    // resume (033ec7c). Move it to a non-waiting status so this case still
+    // exercises the "no durable stop" path; the refusal has its own case below.
+    const waiting = runtime.missionStore!.createMission({
+      ...base,
+      title: "waiting for the user",
+      goal: "waits",
+      user_request: "waits",
+    });
+    // The supervisor's open-time tick stops any live mission with no worker, task
+    // or named wait (WAITING_FOR_USER, 033ec7c refuses to resume that). A mission
+    // parked on a provider probe has a named wait and no durable stop.
+    runtime.missionStore!.transitionMission(unstopped.mission_id, "CLASSIFYING");
+    runtime.missionStore!.classifyFailure({
+      classificationId: "FC-probe-wait",
+      missionId: unstopped.mission_id,
+      taskId: null,
+      executionId: null,
+      category: "PROVIDER_TRANSIENT",
+      evidenceRefs: [],
+      fingerprint: "sha256:probe-wait",
+      summary: "provider unavailable; probing",
+      classifiedAt: new Date().toISOString(),
+    });
+    runtime.missionStore!.planRecovery({
+      recoveryId: "RCV-probe-wait",
+      missionId: unstopped.mission_id,
+      classificationId: "FC-probe-wait",
+      action: "PROBE_AND_BACKOFF",
+      expectedMaterialChange: "provider recovers",
+      attempt: 1,
+      maxAttempts: 3,
+      deadline: null,
+      nextActionAt: new Date().toISOString(),
+      status: "planned",
+      decidedAt: new Date().toISOString(),
+    });
     const terminal = runtime.missionStore!.createMission({
       ...base,
       title: "already done",
@@ -109,6 +146,18 @@ test("mission tool resume reaches EngineeringRuntime.resumeBlockedMission instea
     assert.doesNotMatch(unstoppedText, /not available through the tool/, "resume is wired in resolveServices");
     assert.match(unstoppedText, /Resume failed: mission .* has no current durable stop to resume/);
     assert.equal(resumeUnstopped.details.missionId, unstopped.mission_id);
+
+    // The refusal added by 033ec7c: a stop waiting on the user is the user's call.
+    const resumeWaiting = await mission.execute(
+      "call-1b",
+      { action: "resume", missionId: waiting.mission_id },
+      undefined,
+      undefined,
+      ctx,
+    );
+    const waitingText = resumeWaiting.content.map((part) => part.text).join("\n");
+    assert.match(waitingText, /Resume refused: the mission is waiting for the user \(status WAITING_FOR_USER\)/);
+    assert.equal(runtime.missionStore!.listMissionResumptions(waiting.mission_id).length, 0);
 
     const resumeTerminal = await mission.execute(
       "call-2",
