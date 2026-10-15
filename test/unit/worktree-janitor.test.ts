@@ -384,3 +384,24 @@ test("housekeeping reports only (dry-run) unless PI_HOUSEKEEPING=1", () => {
   assert.equal(housekeepingMode({ PI_HOUSEKEEPING: "0" }), "off");
   assert.equal(housekeepingMode({ PI_HOUSEKEEPING: "yes" }), "dry-run");
 });
+
+test("runHousekeeping aborts: a pre-aborted run rejects before touching git, an in-flight one leaves no child handles", async () => {
+  const fixture = await makeFixtureRepo();
+  const handles = () =>
+    process.getActiveResourcesInfo().filter((r) => r === "Timeout" || r === "PipeWrap" || r === "ChildProcess");
+  const before = handles().length;
+  try {
+    const pre = new AbortController();
+    pre.abort();
+    await assert.rejects(runHousekeeping({ cwd: fixture.root, dryRun: true, signal: pre.signal }), /abort/i);
+
+    const live = new AbortController();
+    const run = runHousekeeping({ cwd: fixture.root, dryRun: true, signal: live.signal });
+    live.abort();
+    await assert.rejects(run, /abort/i);
+    await new Promise((r) => setTimeout(r, 100));
+    assert.ok(handles().length <= before, "no git child pipes or kill timers survive an aborted run");
+  } finally {
+    await fixture.cleanup();
+  }
+});
