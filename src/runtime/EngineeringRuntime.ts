@@ -40,6 +40,7 @@ import {
   buildMissionSnapshotFile,
 } from "../orchestration/missionSnapshot.ts";
 import { MissionStore } from "../orchestration/missionStore.ts";
+import { buildVerifierStages } from "../orchestration/missionWhy.ts";
 import { MissionObservability } from "../orchestration/observability/MissionObservability.ts";
 import { Orchestrator } from "../orchestration/orchestrator.ts";
 import type { OrchestratorOptions, PlanTaskInput } from "../orchestration/orchestrator.ts";
@@ -85,6 +86,7 @@ import {
 } from "./isolation/orchestrationNamespace.ts";
 import { assessProcess } from "./isolation/processIdentity.ts";
 import { isReloadShutdown } from "./isolation/reloadCustody.ts";
+import { resolveStateRoot, worktreeRuntimeDir } from "./isolation/stateDir.ts";
 import { UnavailableModels, createRouteModel, followUnavailableModels } from "./modelRouting.ts";
 import {
   type PinTransition,
@@ -563,6 +565,18 @@ async function ensureStateDirIgnored(dir: string): Promise<void> {
  * exposes the vertical-slice workflows: scout, implement, verify, review,
  * challenge, and the adaptive `engineer` pipeline.
  */
+function snapshotErrorCode(error: unknown): string {
+  return (error as NodeJS.ErrnoException | undefined)?.code ?? (error instanceof Error ? error.name : "unknown");
+}
+
+function describeSnapshotError(error: unknown): string {
+  if (error instanceof Error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    return code && !error.message.startsWith(code) ? `${code}: ${error.message}` : error.message;
+  }
+  return String(error);
+}
+
 export class EngineeringRuntime {
   ledger: Ledger;
   artifacts: ArtifactStore;
@@ -649,6 +663,36 @@ export class EngineeringRuntime {
     return run;
   }
 
+  /** Record why publication failed on each live mission (deduplicated per message). */
+  private recordSnapshotPublicationFinding(code: string, detail: string): void {
+    // One open finding per mission, keyed on category: the detail embeds a
+    // fresh temp path on every attempt, so it lives in evidence, not the
+    // summary, and a repeated failure never adds findings (which would
+    // republish and loop).
+    try {
+      for (const mission of this.missionStore?.listMissions() ?? []) {
+        if (["COMPLETE", "FAILED", "CANCELED"].includes(mission.status)) continue;
+        const known = this.missionStore!.listFindings(mission.mission_id).some(
+          (f) => f.category === "snapshot-publication" && f.status === "open",
+        );
+        if (known) continue;
+        this.missionStore!.addFinding({
+          mission_id: mission.mission_id,
+          task_id: null,
+          severity: "minor",
+          category: "snapshot-publication",
+          file: null,
+          line: null,
+          summary: `Mission snapshot publication failed (${code})`,
+          evidence: detail,
+          recommended_action: "Check disk space and permissions of the work directory, then /mission resume.",
+        });
+      }
+    } catch {
+      // The store that failed to publish may fail to record too; the warning still carries the detail.
+    }
+  }
+
   /**
    * Publish the versioned mission snapshot file the PI WEB plugin reads
    * (spec 08). Writes `<workDir>/orchestration-snapshot.json` and returns the
@@ -661,6 +705,7 @@ export class EngineeringRuntime {
     if (this.snapshotPublishPending) return this.snapshotPublishPending;
     this.snapshotPublishPending = (async () => {
       let latest: MissionSnapshotFile | null = null;
+      let lastError: unknown;
       while (this.snapshotPublishDirty) {
         this.snapshotPublishDirty = false;
         try {
@@ -677,6 +722,9 @@ export class EngineeringRuntime {
             observability: this.missionObservability?.projection(m.mission_id) ?? null,
             stop: this.currentMissionStop(m.mission_id),
             spec: this.buildSpecApprovalSnapshot(m.mission_id),
+            executions: this.missionStore!.listExecutions(m.mission_id),
+            classifications: this.missionStore!.listFailureClassifications(m.mission_id),
+            verifierStages: buildVerifierStages(this.missionStore!.listValidationEvidence(m.mission_id)),
           }));
           latest = buildMissionSnapshotFile(missions);
           const path = join(this.workDir, MISSION_SNAPSHOT_FILENAME);
@@ -691,8 +739,9 @@ export class EngineeringRuntime {
           // A successful publish resets the in-call retry counter so the next
           // failure starts fresh instead of inheriting an elevated backoff.
           this.snapshotPublishRetries = 0;
-        } catch {
+        } catch (error) {
           latest = null;
+          lastError = error;
           // Retry within this call with bounded backoff instead of giving up on
           // the first error. A transient disk error (e.g. ENOSPC while the disk
           // is full) self-heals once space frees; only after the in-call retries
@@ -707,8 +756,12 @@ export class EngineeringRuntime {
           }
           this.snapshotPublishDirty = false;
           this.snapshotPublishRetries = 0;
+          const detail = describeSnapshotError(lastError);
+          this.recordSnapshotPublicationFinding(snapshotErrorCode(lastError), detail);
           try {
-            this.onMissionSnapshotError?.("Mission snapshot publication failed; live mission detail may be stale.");
+            this.onMissionSnapshotError?.(
+              `Mission snapshot publication failed (${detail}); live mission detail may be stale.`,
+            );
           } catch {
             // Diagnostics are observers, never participants in execution.
           }
@@ -923,6 +976,9 @@ export class EngineeringRuntime {
     // modified.
     const orchestrationPath = namespaceKey(binding);
     rt.runtimeBinding = binding;
+    if (rt.worker instanceof PiWorkerExecutor && binding.kind !== "memory") {
+      rt.worker.setTranscriptDir(worktreeRuntimeDir(resolveStateRoot(), binding.identity.worktreeId));
+    }
     try {
       let namespace = openedOrchestrationStores.get(orchestrationPath);
       if (!namespace) {

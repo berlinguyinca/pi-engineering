@@ -244,6 +244,7 @@ export type MissionUpdatePatch = Partial<
     | "operator_model_pin"
     | "operator_model_decided_at"
     | "operator_paused_at"
+    | "execution_mode"
   >
 >;
 
@@ -293,6 +294,7 @@ const MISSION_UPDATE_FIELDS = new Set<keyof MissionUpdatePatch>([
   "operator_model_pin",
   "operator_paused_at",
   "operator_model_decided_at",
+  "execution_mode",
 ]);
 const TASK_TRANSITION_METADATA_FIELDS = new Set<keyof TaskTransitionMetadata>([
   "attempt",
@@ -2954,6 +2956,9 @@ function validateMissionUpdatePatch(patch: MissionUpdatePatch): MissionUpdatePat
           operator_model_decided_at:
             patch.operator_model_decided_at === null ? null : String(patch.operator_model_decided_at),
         }
+      : {}),
+    ...(patch.execution_mode !== undefined
+      ? { execution_mode: { mode: String(patch.execution_mode.mode), reason: String(patch.execution_mode.reason) } }
       : {}),
     ...(patch.operator_paused_at !== undefined
       ? { operator_paused_at: patch.operator_paused_at === null ? null : String(patch.operator_paused_at) }

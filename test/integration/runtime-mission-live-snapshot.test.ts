@@ -1191,7 +1191,11 @@ test("runtime diagnoses a failed snapshot write and retries on the next activity
     for (let i = 0; i < 300 && diagnostics.length === 0; i++) {
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
-    assert.deepEqual(diagnostics, ["Mission snapshot publication failed; live mission detail may be stale."]);
+    assert.equal(diagnostics.length, 1);
+    assert.match(
+      diagnostics[0] ?? "",
+      /^Mission snapshot publication failed \(EISDIR.*\); live mission detail may be stale\.$/,
+    );
 
     await rm(path, { recursive: true, force: true });
     runtime.missionObservability!.activity(mission.mission_id, {

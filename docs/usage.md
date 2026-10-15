@@ -307,6 +307,41 @@ is left as it was.
 
 A mission whose goal implies more than one deliverable, names several paths, or runs past 30 words makes ONE planner call (role `planner`, strongest routed model, the planner/worker `PLANNER_PROMPT`) and gets a bounded task DAG: per-task `write_domains`, `relevant_files` and `verification` (handed to each worker as its context). Tasks run in parallel only when their write domains are disjoint; overlapping ones are serialized. Trivial goals keep the single task. A malformed or empty plan falls back to the single task and records a minor `mission_planner` finding. `PI_MISSION_PLANNER=on|off|auto` (default `auto`) forces or disables it. Task domains are pre-validated: absolute, `..`, `.git`, forbidden, read-only and out-of-manifest domains are dropped, and a task left with none falls back to the single task (the finding names the rejected domains). The call is bounded by `PI_MISSION_PLANNER_TIMEOUT_MS` (default 600000); a transient failure is retried once, then falls back with a finding saying transient.
 
+## Worker transcripts and runtime log caps
+
+Every worker session (implementer, reviewer, repair, planner) is persisted as
+JSONL under the runtime state directory, never in the repo or a candidate
+worktree:
+
+    <PI_ENGINEERING_STATE_DIR>/worktrees/<worktree-id>/transcripts/<missionId>/<executionId>.jsonl
+
+Records: session header (role, model), messages (role, model, stop reason,
+tokens, timestamps), tool calls, tool results (truncated, with the error
+category on failure) and a per-turn line (stop reason, tool-error category,
+tokens). Secrets (bearer tokens, `password=`, API keys) are redacted. Each turn
+also emits a `Turn ended: stop=<reason> tool_error=<category>` worker activity,
+persisted as a `mission.obs.worker` event, so stop-reason and tool-error rates
+can be computed per worker.
+
+- `PI_WORKER_TRANSCRIPTS` (`on`|`off`, default `on`).
+- `PI_WORKER_TRANSCRIPT_MAX_BYTES` (default 5 MiB): per-file cap; the file rotates
+  to `<file>.1` (one predecessor kept).
+- `PI_WORKER_TRANSCRIPT_TOOL_CHARS` (default 4000): cap per tool argument/result.
+
+Transcripts are keyed by the mission's state worktree (the orchestrator's identity), then
+by mission id. Redaction is key-aware (password/secret/token/api key/authorization/cookie
+values in JSON and `KEY=value` lines), covers Basic/Bearer headers, URL userinfo and
+sensitive query params, known token prefixes, prose ("password is X") and PEM blocks.
+The per-turn line does not count as worker activity for the inactivity watchdog.
+runtime.jsonl rotation is per process: two processes sharing one file may overwrite `.1`.
+
+The worktree janitor must leave `transcripts/` alone except by age.
+
+`sessions/<id>/runtime.jsonl` is capped: it rotates to `runtime.jsonl.1` at
+`PI_RUNTIME_LOG_MAX_BYTES` (default 10 MiB). `lease.contended` is logged once per
+(resource, holder); repeats are counted and a `lease.contended_summary` line
+carries the counters every `PI_RUNTIME_CONTENTION_SUMMARY_MS` (default 5 min).
+
 ## Context budget for mission workers
 
 A worker's context budget is the smaller of its role's budget (`ROLE_BUDGETS`,
@@ -396,6 +431,7 @@ restart.
 
 | Command        | Effect                                                        |
 | -------------- | ------------------------------------------------------------- |
+| `/mission why <id>` | Explains why a mission is not finishing: blocking task, failure category and reason, who holds the repository lease or custody (session and pid), cooldown scope and `nextActionAt`, retry counters, inherited failures, stranded branches, per-task typed usage (tokens, wall-time split, attempts, stream resumes, thinking), per-model error rollups (429, 404, connect-refused, stream stall, takeover, grammar 400) and the exact remedy command. Offline equivalent: `pi-engineering missions why --store <dir> <id> [--json]`. |
 | `/mission G`   | Orchestration mission pipeline (intent → plan → execute → validate → review → complete). Esc pauses it; `/mission resume <id>` continues it and `/mission cancel <id>` ends it. |
 | `/mission-status` | Show orchestration mission/task/execution status.          |
 | `/engineering-mode [m]` | Show or set the execution mode (`auto`, `planner-worker`, `single`). |
