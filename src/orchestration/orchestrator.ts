@@ -257,6 +257,16 @@ const MAX_READOPTIONS = 2;
 /** Deterministic re-merges of a failed integration before the mission stops. */
 const MAX_DETERMINISTIC_MERGE_RETRIES = 2;
 
+/** Identity of a finding across reviews: the same defect reported again is the same finding. */
+function findingFingerprint(f: {
+  category: string;
+  file: string | null;
+  line: number | null;
+  summary: string;
+}): string {
+  return `${f.category}|${f.file ?? ""}|${f.line ?? ""}|${f.summary.trim().toLowerCase()}`;
+}
+
 /** The single repair contract of a round: every open blocking finding, in one objective. */
 function repairContractObjective(
   findings: ReadonlyArray<{
@@ -300,6 +310,8 @@ export class Orchestrator {
   private readonly parentSessionId: string | null;
   private readonly limits: NonNullable<OrchestratorOptions["limits"]>;
   private readonly maxRepairRounds: number;
+  /** Fingerprints of the findings the latest review of each mission reported. */
+  private readonly lastReviewFingerprints = new Map<string, Set<string>>();
   /** Per-mission progress hooks; missions may overlap on one orchestrator. */
   private readonly progress = new Map<string, (line: string) => void>();
   private readonly observedExecutions = new Set<string>();
@@ -2271,9 +2283,14 @@ export class Orchestrator {
     let mergeRetries = 0;
     while ((!verdict.can_complete || !integrated) && repairRounds < this.maxRepairRounds) {
       if (signal?.aborted) return this.canceledFinalization(missionId, signal);
+      // A reviewer that asked for changes must get a repair round even when it
+      // reported only non-blocking findings: those findings are the changes.
+      const changesRequested = this.store.listReviewEvidence(missionId).at(-1)?.verdict === "request_changes";
       const openBlocking = this.store
         .listFindings(missionId)
-        .filter((f) => f.severity === "blocking" && f.status === "open");
+        .filter(
+          (f) => f.status === "open" && (f.severity === "blocking" || (changesRequested && f.severity === "major")),
+        );
       // A FAILED gate task counts only until a later task of the same kind
       // succeeded: a stale failure must not trigger another probe or repair.
       const missionTasks = this.store.listTasks(missionId);
@@ -2452,7 +2469,17 @@ export class Orchestrator {
           .reverse()
           .find((candidate) => candidate.taskId === gateTask.task_id);
         const category = entry ? this.rederiveLegacyGateClassification(entry).category : undefined;
-        return gateTask.kind !== "integration" && (category === "VALIDATION_FAILED" || category === "REVIEW_FAILED");
+        if (gateTask.kind === "integration") {
+          // A merge that conflicted or never ran is retried deterministically;
+          // an integration that merged and then failed its checks is a defect
+          // of the candidate and gets a repair contract.
+          return (
+            /^failed\b/.test(gateTask.failure_reason ?? "") &&
+            category !== "PROVIDER_TRANSIENT" &&
+            category !== "PROVIDER_PERMANENT"
+          );
+        }
+        return category === "VALIDATION_FAILED" || category === "REVIEW_FAILED";
       });
       if (openBlocking.length === 0 && codeFailedGates.length === 0 && blockerTask) {
         if (blockerTask.kind === "integration" && mergeRetries < MAX_DETERMINISTIC_MERGE_RETRIES) {
@@ -2564,6 +2591,7 @@ export class Orchestrator {
       if (contractFindings.length > 0) {
         objectives.unshift({
           objective: repairContractObjective(contractFindings),
+          baseSha: repairCandidate?.identity.candidateSha,
           findingIds: contractFindings.map((f) => f.finding_id),
         });
       }
@@ -2571,7 +2599,10 @@ export class Orchestrator {
         // Only gates that ran and failed on the candidate become code repair.
         for (const t of codeFailedGates) {
           objectives.push({
-            objective: `Fix the failing ${t.kind} step for this mission (${t.objective}). Make the repository's own checks pass and leave the change ready to integrate.`,
+            objective:
+              t.kind === "integration"
+                ? `Repair the candidate: it merged, but the integration checks ran and failed (${t.failure_reason ?? "no detail"}). Make the repository's own checks pass and leave the change ready to integrate.`
+                : `Fix the failing ${t.kind} step for this mission (${t.objective}). Make the repository's own checks pass and leave the change ready to integrate.`,
           });
         }
       }
@@ -2587,6 +2618,9 @@ export class Orchestrator {
         successfulMutations.length > 0 && successfulMutations.every((task) => task.isolation === "none")
           ? "none"
           : "worktree";
+      // Findings are resolved per finding by the next review, not by the repair
+      // task succeeding: one the reviewer still reports stays open.
+      const pendingResolution: string[] = [];
       for (const obj of objectives) {
         const repair = this.store.createTask({
           mission_id: missionId,
@@ -2605,7 +2639,7 @@ export class Orchestrator {
           signal,
         });
         if (signal?.aborted) return this.canceledFinalization(missionId, signal);
-        if (repaired) for (const findingId of obj.findingIds ?? []) this.store.resolveFinding(findingId);
+        if (repaired) pendingResolution.push(...(obj.findingIds ?? []));
         // The replacement carries the dead workers' work (re-adopted, or redone
         // from base after a discard): their FAILED tasks no longer block completion.
         if (repaired) {
@@ -2646,6 +2680,13 @@ export class Orchestrator {
       post = await this.postExecution(this.store.getMission(missionId)!, signal);
       if (signal?.aborted) return this.canceledFinalization(missionId, signal);
       integrated = post.integrationOk;
+      const stillReported =
+        post.reviewAttempted && post.reviewOk ? this.lastReviewFingerprints.get(missionId) : undefined;
+      for (const findingId of pendingResolution) {
+        const pending = this.store.listFindings(missionId).find((f) => f.finding_id === findingId);
+        if (pending && stillReported?.has(findingFingerprint(pending))) continue;
+        this.store.resolveFinding(findingId);
+      }
       if (post.reviewAttempted && !post.reviewOk) {
         verdict = this.gate.evaluate(this.store.getMission(missionId)!);
         if (this.store.getRecoveryDecision(gateRecovery.recoveryId)?.status === "started") {
@@ -3240,12 +3281,29 @@ export class Orchestrator {
       const outcome = await executionHandle.result().finally(() => extra.signal?.removeEventListener("abort", onAbort));
       authority?.assertAuthoritative();
       // Record reviewer findings so the completion gate can block on them.
+      if (task.kind === "review") this.lastReviewFingerprints.set(missionId, new Set());
       for (const f of outcome.findings ?? []) {
         let severity: ReviewFinding["severity"];
         try {
-          severity = normalizeReviewSeverity(f.severity);
+          severity = normalizeReviewSeverity(f.severity, f.category);
         } catch {
           severity = "blocking";
+        }
+        const reported = {
+          category: (f.category as string) ?? "correctness",
+          file: (f.file as string | null) ?? null,
+          line: (f.line as number | null) ?? null,
+          summary: String(f.summary ?? "review finding"),
+        };
+        const fingerprint = findingFingerprint(reported);
+        if (task.kind === "review") this.lastReviewFingerprints.get(missionId)?.add(fingerprint);
+        // A finding still open from an earlier round is re-confirmed, not duplicated.
+        if (
+          this.store
+            .listFindings(missionId)
+            .some((existing) => existing.status === "open" && findingFingerprint(existing) === fingerprint)
+        ) {
+          continue;
         }
         this.store.addFinding({
           mission_id: missionId,

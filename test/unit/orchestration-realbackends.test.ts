@@ -397,6 +397,40 @@ describe("realBackends capability routing", () => {
     assert.equal(outcome.reviewEvidence?.verdict, "approve");
   });
 
+  it("turns blocking missing tests and spec gaps into blocking review findings", async () => {
+    const worker: WorkerExecutor = {
+      async run() {
+        return {
+          result: { status: "completed", summary: "ok", details: {} },
+          structured: {
+            verdict: "request_changes",
+            findings: [],
+            missingTests: [{ severity: "critical", description: "no regression test" }],
+            specGaps: [
+              { severity: "critical", requirement: "must preserve data", status: "missing", detail: "not met" },
+            ],
+            acceptanceResults: [{ acceptanceId: "AC-1", status: "failed", detail: "gap remains" }],
+          },
+          usage: { model: "reviewer" },
+        } as never;
+      },
+    };
+    const backends = realBackends({
+      worker,
+      verifier: {} as never,
+      artifacts: {} as never,
+      git: null,
+      cwd: "/repo",
+      reviewFallbackModel: { provider: "test", id: "reviewer" },
+    });
+    const outcome = await backends.review.runReview({
+      objective: "review",
+      acceptanceCriteria: [{ acceptanceId: "AC-1", criterion: "works" }],
+      signal: new AbortController().signal,
+    });
+    assert.equal(outcome.reviewEvidence?.outputValid, true);
+    assert.equal(outcome.reviewEvidence?.findings.filter((finding) => finding.severity === "blocking").length, 2);
+  });
   it("blocks only on critical spec gaps; a high missing test is recorded as major", async () => {
     const worker: WorkerExecutor = {
       async run() {

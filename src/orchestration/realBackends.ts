@@ -899,21 +899,21 @@ export function realBackends(opts: RealBackendsOptions) {
           structured.missingTests.every(validRawMissingTest) &&
           Array.isArray(structured?.specGaps) &&
           structured.specGaps.every(validRawSpecGap);
-        const supplemental = [
-          ...(Array.isArray(structured?.missingTests) ? structured.missingTests : []),
-          ...(Array.isArray(structured?.specGaps) ? structured.specGaps : []),
-        ];
         outcome.findings.push(
-          ...supplemental.map((entry) => {
+          ...(Array.isArray(structured?.missingTests) ? structured.missingTests : []).map((entry) => {
             const record = entry as Record<string, unknown>;
-            return { severity: record.severity, summary: record.description ?? record.detail ?? record.requirement };
+            return { severity: record.severity, category: "missing_tests", summary: record.description };
+          }),
+          ...(Array.isArray(structured?.specGaps) ? structured.specGaps : []).map((entry) => {
+            const record = entry as Record<string, unknown>;
+            return { severity: record.severity, category: "spec_gaps", summary: record.detail ?? record.requirement };
           }),
         );
         const normalizedFindings = outcome.findings.flatMap((finding) => {
           try {
             return [
               {
-                severity: normalizeReviewSeverity(finding.severity),
+                severity: normalizeReviewSeverity(finding.severity, finding.category),
                 summary: String(finding.summary ?? "review finding"),
                 status: finding.status === "resolved" ? ("resolved" as const) : ("open" as const),
               },
