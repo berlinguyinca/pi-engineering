@@ -186,6 +186,8 @@ function blockedRepairHarness(
       | "REVIEW_FAILED";
     failedKind?: "agent" | "validation" | "review";
     failOwnershipRelease?: boolean;
+    /** The first turn overflowed the model window: no checkpoint was ever written. */
+    contextOverflowNoCheckpoint?: boolean;
     withOwnership?: boolean;
     ownership?: MissionOwnership;
     git?: GitRepo;
@@ -312,42 +314,45 @@ function blockedRepairHarness(
   store.transitionTask(failed.task_id, "FAILED", "system", {
     failure_reason: "task execution budget exhausted",
   });
-  store.checkpointTask({
-    checkpointId: "CHK-original",
-    executionId: orphanedExecution.execution_id,
-    missionId: mission.mission_id,
-    taskId: failed.task_id,
-    repoId: "repo-repair",
-    baseSha: "base-sha",
-    candidateSha: "candidate-sha",
-    branch: "pi-eng-orch-TSK-original",
-    worktree: "/tmp/preserved-repair",
-    committedChanges: ["one"],
-    preservedUncommittedChanges: [],
-    completedDeliverables: ["one"],
-    remainingDeliverables: ["two", "three"],
-    acceptanceIds: [],
-    validationEvidenceRefs: [],
-    artifactRefs: [],
-    artifactHashes: [],
-    workerId: "worker",
-    sessionId: "session",
-    model: "local/local",
-    sequence: 1,
-    missionGeneration: 0,
-    candidateGeneration: 0,
-    fencingToken: 0,
-    createdAt: "2026-09-27T00:00:00.000Z",
-  });
+  if (!options.contextOverflowNoCheckpoint)
+    store.checkpointTask({
+      checkpointId: "CHK-original",
+      executionId: orphanedExecution.execution_id,
+      missionId: mission.mission_id,
+      taskId: failed.task_id,
+      repoId: "repo-repair",
+      baseSha: "base-sha",
+      candidateSha: "candidate-sha",
+      branch: "pi-eng-orch-TSK-original",
+      worktree: "/tmp/preserved-repair",
+      committedChanges: ["one"],
+      preservedUncommittedChanges: [],
+      completedDeliverables: ["one"],
+      remainingDeliverables: ["two", "three"],
+      acceptanceIds: [],
+      validationEvidenceRefs: [],
+      artifactRefs: [],
+      artifactHashes: [],
+      workerId: "worker",
+      sessionId: "session",
+      model: "local/local",
+      sequence: 1,
+      missionGeneration: 0,
+      candidateGeneration: 0,
+      fencingToken: 0,
+      createdAt: "2026-09-27T00:00:00.000Z",
+    });
   store.classifyFailure({
     classificationId: "FC-budget",
     missionId: mission.mission_id,
     taskId: failed.task_id,
     executionId: orphanedExecution.execution_id,
     category: options.category ?? "TASK_BUDGET_EXHAUSTED",
-    evidenceRefs: ["CHK-original"],
+    evidenceRefs: options.contextOverflowNoCheckpoint ? [] : ["CHK-original"],
     fingerprint: "sha256:budget-fingerprint",
-    summary: "task execution budget exhausted",
+    summary: options.contextOverflowNoCheckpoint
+      ? "context_overflow: the prompt still exceeds the context window after one compaction"
+      : "task execution budget exhausted",
     classifiedAt: "2026-09-27T00:00:00.000Z",
   });
   store.transitionMission(mission.mission_id, "BLOCKED");
@@ -1207,6 +1212,20 @@ describe("orchestrator: durable blocked-mission repair", () => {
       false,
     );
     assert.equal(h.store.listRecoveryDecisions(h.missionId).at(-1)?.action, "WAIT_FOR_REQUIREMENT");
+  });
+
+  it("context overflow before any commit stops with an explicit finding, not a checkpoint-integrity error", async () => {
+    const h = blockedRepairHarness({ contextOverflowNoCheckpoint: true });
+
+    const stopped = await h.orchestrator.repairBlockedMission(h.missionId);
+
+    assert.equal(stopped.status, "BLOCKED");
+    const stop = h.store.listMissionStops(h.missionId).at(-1);
+    assert.match(stop?.reason ?? "", /task prompt exceeds the model window: shrink or split the task spec/);
+    assert.match(stop?.resumeCondition ?? "", /shrunk or split/);
+    const findings = h.store.listFindings(h.missionId);
+    assert.ok(findings.some((f) => f.category === "context_overflow"));
+    assert.ok(findings.every((f) => f.category !== "checkpoint_integrity"));
   });
 
   it("pauses for persistence recovery without dispatching replacement work", async () => {

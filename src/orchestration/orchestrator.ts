@@ -82,6 +82,15 @@ import {
 } from "./workset.ts";
 import { WorkspaceManifestResolver, WorkspaceScopeError, createWorkspaceManifest } from "./workspaceManifest.ts";
 
+const CONTEXT_OVERFLOW_SUMMARY = /context[_ ]overflow/i;
+
+/** The first turn overflowed the model window before anything was committed. */
+class ContextOverflowBeforeCommit extends Error {
+  constructor() {
+    super("task prompt exceeds the model window: shrink or split the task spec");
+  }
+}
+
 /** Effective autonomous-spec-approval policy version bound into every approval. */
 const SPEC_APPROVAL_POLICY_VERSION = "spec-approval-policy-v1";
 
@@ -894,6 +903,9 @@ export class Orchestrator {
           : undefined;
         try {
           if (!checkpoint && repairDecision.action === "CHECKPOINT_SPLIT_AND_REPLACE") {
+            // The first turn already overflowed the model's window: nothing was
+            // committed, so there is no checkpoint to split. Say so plainly.
+            if (CONTEXT_OVERFLOW_SUMMARY.test(classification.summary)) throw new ContextOverflowBeforeCommit();
             throw new Error("checkpoint repair identity/integrity mismatch: durable checkpoint is missing");
           }
           if (!checkpoint) continue;
@@ -904,12 +916,15 @@ export class Orchestrator {
             mission_id: missionId,
             task_id: failed.task_id,
             severity: "blocking",
-            category: "checkpoint_integrity",
+            category: error instanceof ContextOverflowBeforeCommit ? "context_overflow" : "checkpoint_integrity",
             file: checkpoint?.worktree ?? null,
             line: null,
             summary,
             evidence: checkpoint?.checkpointId ?? null,
-            recommended_action: "Reconcile the exact checkpoint origin and preserved work before retrying recovery.",
+            recommended_action:
+              error instanceof ContextOverflowBeforeCommit
+                ? "Shrink the task spec or split the task into smaller tasks, then resume."
+                : "Reconcile the exact checkpoint origin and preserved work before retrying recovery.",
           });
           if (repairDecision.status === "planned") this.store.transitionRecovery(repairDecision.recoveryId, "failed");
           const preservedWork = await this.preservedMissionWork(missionId);
@@ -919,7 +934,9 @@ export class Orchestrator {
             preservedWork,
             attemptedRecoveries: [repairDecision.recoveryId],
             resumeCondition:
-              "a canonical checkpoint with matching execution, generation, repository, and artifacts is required",
+              error instanceof ContextOverflowBeforeCommit
+                ? "the task spec is shrunk or split so its prompt fits the model's context window"
+                : "a canonical checkpoint with matching execution, generation, repository, and artifacts is required",
           });
           await this.store.flush();
           this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);

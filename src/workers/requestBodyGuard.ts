@@ -10,6 +10,7 @@
 
 import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { terminalAssistantMessage } from "../inference/admissionTransport.ts";
+import { currentInferenceInvocation } from "../inference/inferenceContext.ts";
 import { type RequestBodyBudgetConfig, streamWithinRequestBudget } from "../request/bodyBudget.ts";
 import { type ThinkingOffConfig, streamWithThinkingPolicy } from "../request/thinkingPolicy.ts";
 
@@ -28,7 +29,17 @@ export function guardRuntimeRequestBody(
 ): void {
   const target = runtime as ModelRuntime & { [GUARDED]?: boolean };
   if (target[GUARDED]) return;
-  const provider = runtime.streamSimple.bind(runtime);
+  const unclamped = runtime.streamSimple.bind(runtime);
+  // The invocation's output cap keeps prompt budget + max_tokens within the slot.
+  const provider = ((model: { maxTokens?: number }, context: unknown, options?: { maxTokens?: number }) => {
+    const cap = currentInferenceInvocation()?.maxOutputTokens;
+    const wanted = options?.maxTokens ?? model.maxTokens;
+    return (unclamped as (...a: unknown[]) => unknown)(
+      model,
+      context,
+      cap !== undefined && wanted !== undefined && wanted > cap ? { ...options, maxTokens: cap } : options,
+    );
+  }) as unknown as StreamSimple;
   const base = thinking ? streamWithThinkingPolicy(provider as never, thinking) : provider;
   const guarded = streamWithinRequestBudget(base as never, {
     config,

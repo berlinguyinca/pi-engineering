@@ -128,11 +128,12 @@ describe("InferWeave structured error bodies", () => {
     assert.equal(f.canFallback, true);
   });
 
-  it("classifies context_overflow and requests compaction", () => {
+  it("classifies context_overflow as non-retryable: the worker compacts once itself, then fails", () => {
     const md = metadataFromResponse({ status: 400, body: { reason: "context_overflow", message: "prompt too long" } });
     const f = classifyInferenceFailure({ error: new Error("400"), metadata: md });
     assert.equal(f.class, "context_overflow");
-    assert.equal(f.action, "compact_and_retry");
+    assert.equal(f.action, "fail");
+    assert.equal(f.retryable, false);
     assert.equal(f.shouldCompactContext, true);
   });
 
