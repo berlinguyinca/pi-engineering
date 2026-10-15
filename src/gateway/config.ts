@@ -59,7 +59,7 @@ export const DEFAULT_GATEWAY_CONFIG: GatewayAdmissionConfig = {
   jitterMs: 250,
   maxRetries: 8,
   maxElapsedMs: 12 * 3_600_000,
-  modelStreamStallMs: 10 * 60_000,
+  modelStreamStallMs: 5 * 60_000,
   telemetry: true,
 };
 
@@ -105,8 +105,8 @@ export function parseGatewayElapsedMs(value: string | undefined): number | null 
  *                                  mission scheduler takes over the wait (default: 8)
  *   PI_GATEWAY_MAX_ELAPSED_MS    — ms or duration ("12h"), how long one interactive turn waits
  *                                  out transient infrastructure (default: 12h)
- *   PI_GATEWAY_STREAM_STALL_MS   — ms or duration ("10m"), no-data window before an in-flight
- *                                  model request is aborted as stalled; "0" disables (default: 10m)
+ *   PI_GATEWAY_STREAM_STALL_MS   — ms or duration ("5m"), no-data window before an in-flight
+ *                                  model request is aborted as stalled; "0" disables (default: 5m)
  *   PI_GATEWAY_TELEMETRY         — "true"/"false" (default true)
  */
 export function resolveGatewayConfig(overrides?: Partial<GatewayAdmissionConfig>): GatewayAdmissionConfig {
@@ -163,6 +163,7 @@ export function sharedAdmissionController(): AdmissionController {
     shared = new AdmissionController({
       maxConcurrency: cfg.maxConcurrency,
       reservedSlots: cfg.reservedSlots,
+      fixedConcurrency: Boolean(process.env.PI_GATEWAY_MAX_CONCURRENCY),
       maxWaitMs: cfg.maxWaitMs,
       jitterMs: cfg.jitterMs,
       ...(cfg.telemetry ? { onEvent: emitAdmissionTelemetry } : {}),

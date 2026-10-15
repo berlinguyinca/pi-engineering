@@ -179,7 +179,7 @@ test("config: PI_GATEWAY_STREAM_STALL_MS=0 disables the watchdog; garbage falls 
     );
   });
   withEnv("PI_GATEWAY_STREAM_STALL_MS", undefined, () => {
-    assert.equal(resolveGatewayConfig().modelStreamStallMs, 600_000, "default is a 10-minute window");
+    assert.equal(resolveGatewayConfig().modelStreamStallMs, 300_000, "default is a 5-minute window");
   });
 });
 

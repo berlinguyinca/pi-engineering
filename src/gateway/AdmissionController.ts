@@ -33,6 +33,11 @@ export interface AdmissionControllerOptions {
    */
   reservedSlots?: number;
   /**
+   * True when `maxConcurrency` was set explicitly (env override): gateway
+   * catalogue capacity must not replace it.
+   */
+  fixedConcurrency?: boolean;
+  /**
    * Retained for configuration compatibility. The controller never shortens a
    * server minimum; retry-chain elapsed budgets decide whether it can be paid.
    */
@@ -137,7 +142,8 @@ export class AdmissionController {
   private readonly onEvent: ((event: AdmissionEvent) => void) | undefined;
 
   /** Ceiling for local concurrency: the configured max, less the reserve. */
-  private readonly baseConcurrency: number;
+  private baseConcurrency: number;
+  private readonly fixedConcurrency: boolean;
   private concurrency: number;
   private active = 0;
   private waiting = 0;
@@ -160,6 +166,7 @@ export class AdmissionController {
     this.sleep = opts.sleep ?? defaultSleep;
     this.random = opts.random ?? Math.random;
     this.onEvent = opts.onEvent;
+    this.fixedConcurrency = opts.fixedConcurrency ?? false;
     this.baseConcurrency = Math.max(this.minConcurrency, this.configuredMax - this.reservedSlots);
     this.concurrency = this.baseConcurrency;
   }
@@ -189,6 +196,20 @@ export class AdmissionController {
         // Same contract as StatusState: a broken observer is not our problem.
       }
     }
+  }
+
+  /**
+   * Re-derive the concurrency ceiling from the gateway catalogue's capacity
+   * (per-model `active_limit` / slots). A no-op under an explicit override.
+   */
+  applyGatewayCapacity(capacity: number): void {
+    if (this.fixedConcurrency || !Number.isFinite(capacity) || capacity < 1) return;
+    const base = Math.max(this.minConcurrency, Math.floor(capacity) - this.reservedSlots);
+    if (base === this.baseConcurrency) return;
+    const grew = base > this.baseConcurrency;
+    this.baseConcurrency = base;
+    this.concurrency = grew ? Math.max(this.concurrency, base) : Math.min(this.concurrency, base);
+    if (grew) while (this.slotWaiters.length > 0 && this.active < this.effectiveLimit()) this.wakeOne();
   }
 
   status(): AdmissionStatus {
@@ -303,11 +324,14 @@ export class AdmissionController {
 
     const waitMs = signal.retryAfterMs;
     const until = this.now() + waitMs;
-    const modelKey = signal.scope === "model" ? this.modelKey(signal.provider, signal.model) : undefined;
+    // Process-wide only when the gateway says so (scope global/caller) or the
+    // refusal cannot be attributed to a model; otherwise per model.
+    const processWide = signal.scope === "global" || signal.scope === "caller";
+    const modelKey = processWide ? undefined : this.modelKey(signal.provider, signal.model);
     if (modelKey) {
       if (until > (this.modelCooldownUntil.get(modelKey) ?? 0)) this.modelCooldownUntil.set(modelKey, until);
     } else if (until > this.cooldownUntil) {
-      // Missing scope remains the conservative legacy process-wide behavior.
+      // No model identity, or the gateway said global: park everyone.
       this.cooldownUntil = until;
     }
 

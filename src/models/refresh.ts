@@ -8,9 +8,15 @@
  * wiring.
  */
 
+import { sharedAdmissionController } from "../gateway/config.ts";
 import { acceptsThinkingOff, resolveThinkingOffConfig } from "../request/thinkingPolicy.ts";
 import { type CatalogPlan, type ConfiguredModel, describeCatalogPlan, planCatalogUpdate } from "./catalogPlan.ts";
-import { DEFAULT_GATEWAY_BASE_URL, type GatewayModelEntry, fetchGatewayModels } from "./gatewayCatalog.ts";
+import {
+  DEFAULT_GATEWAY_BASE_URL,
+  type GatewayModelEntry,
+  fetchGatewayModels,
+  gatewayCapacity,
+} from "./gatewayCatalog.ts";
 import {
   type ModelsConfig,
   providerBaseUrl,
@@ -355,6 +361,8 @@ async function planProviderRefresh(config: ModelsConfig, opts: RefreshOptions): 
       ...(opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}),
     });
   const advertised = await listing();
+  const capacity = gatewayCapacity(advertised);
+  if (capacity !== undefined) sharedAdmissionController().applyGatewayCapacity(capacity);
   const reasoningIds = new Set(existing.filter((model) => model.reasoning === true).map((model) => model.id));
 
   const canProbe = opts.probeModels && api === "openai-completions";

@@ -14,6 +14,7 @@
  */
 
 import { formatWaitingFor } from "../gateway/admissionNotice.ts";
+import { observedGatewayCapacity } from "../models/gatewayCatalog.ts";
 import { CircuitBreaker } from "../resilience/circuitBreaker.ts";
 import type { InfraErrorCategory } from "../resilience/classify.ts";
 import { CATEGORY_TO_STATE } from "../resilience/classify.ts";
@@ -24,7 +25,6 @@ import {
 } from "../resilience/config.ts";
 import { type ProbeResult, type RecoveryProbe, healthyProbe } from "../resilience/probe.ts";
 import { type RetryWindowState, recordProbe, startRetryWindow, windowOpen } from "../resilience/retryWindow.ts";
-import { type SchedulableTask, Scheduler } from "../sched/Scheduler.ts";
 import {
   type ExecutionBroker,
   type ExecutionHandle,
@@ -143,8 +143,12 @@ export const DEFAULT_LIMITS: SchedulerLimits = {
  */
 export function resolveSchedulerLimits(
   env: Record<string, string | undefined> = typeof process !== "undefined" ? process.env : {},
+  capacity?: number,
 ): SchedulerLimits {
   const limits: SchedulerLimits = { ...DEFAULT_LIMITS };
+  // The gateway's advertised per-model concurrency replaces the fixed
+  // per-role default; an env override below still wins.
+  if (capacity !== undefined && capacity > 0) limits.maxPerRole = Math.floor(capacity);
   const num = (key: string): number | undefined => {
     const v = env[key];
     if (!v) return undefined;
@@ -172,6 +176,14 @@ export interface SchedulerOptions {
   store: MissionStore;
   broker: ExecutionBroker;
   limits?: Partial<SchedulerLimits>;
+  /**
+   * Concurrency the gateway catalogue advertises (per-model `active_limit` /
+   * slots), read on every capacity check. Replaces the default per-role cap;
+   * explicit limits and env overrides still win.
+   */
+  gatewayCapacity?: () => number | undefined;
+  /** Fallback wake interval of the pass loop (default 1000 ms); events wake it sooner. */
+  passTickMs?: number;
   /** Called when a task reaches a terminal state. */
   onTaskSettled?: (missionId: string, taskId: string, status: TaskStatus) => void;
   /** Called whenever execution has no active worker because recovery is waiting or has stopped. */
@@ -260,7 +272,12 @@ export class MissionScheduler {
   private readonly activeTasks = new Map<string, OrchestrationTask>();
   /** Counters for concurrency limits. */
   private counters = { agents: 0, subprocesses: 0, byRole: new Map<string, number>() };
-  private queue: Scheduler;
+  private readonly wakers = new Set<() => void>();
+  private wakePending = false;
+  private readonly passTickMs: number;
+  private readonly gatewayCapacity: (() => number | undefined) | undefined;
+  private readonly perRoleExplicit: boolean;
+  private readonly agentsExplicit: boolean;
   /** Mission-level gateway resilience config (time-based window, probes). */
   private readonly resilience: GatewayResilienceConfig;
   /** Lightweight gateway recovery probe. */
@@ -319,6 +336,10 @@ export class MissionScheduler {
     // of missions can raise the caps (PI_ENGINEERING_MAX_*); explicit
     // opts.limits still win per key.
     this.limits = { ...resolveSchedulerLimits(), ...opts.limits };
+    this.passTickMs = Math.max(1, opts.passTickMs ?? 1_000);
+    this.gatewayCapacity = opts.gatewayCapacity ?? observedGatewayCapacity;
+    this.perRoleExplicit = opts.limits?.maxPerRole !== undefined || !!process.env.PI_ENGINEERING_MAX_PER_ROLE;
+    this.agentsExplicit = opts.limits?.maxAgents !== undefined || !!process.env.PI_ENGINEERING_MAX_AGENTS;
     this.onTaskSettled = opts.onTaskSettled;
     this.onStatus = opts.onStatus;
     // Resolve the time-based resilience config (env-overridable). Resilience is
@@ -342,7 +363,6 @@ export class MissionScheduler {
       decisionTtlMs: this.resilience.max_outage_ms,
       ...opts.recovery,
     });
-    this.queue = new Scheduler({ concurrency: this.limits.maxActive });
   }
 
   /**
@@ -389,11 +409,15 @@ export class MissionScheduler {
   private hasCapacity(t: OrchestrationTask): boolean {
     const kind = t.kind;
     if (this.activeTasks.size >= this.limits.maxActive) return false;
-    if (kind === "agent" && this.counters.agents >= this.limits.maxAgents) return false;
+    const capacity = this.gatewayCapacity?.();
+    const maxAgents =
+      !this.agentsExplicit && capacity ? Math.max(this.limits.maxAgents, capacity) : this.limits.maxAgents;
+    const maxPerRole = !this.perRoleExplicit && capacity ? capacity : this.limits.maxPerRole;
+    if (kind === "agent" && this.counters.agents >= maxAgents) return false;
     if ((kind === "process" || kind === "validation") && this.counters.subprocesses >= this.limits.maxSubprocesses) {
       return false;
     }
-    if ((this.counters.byRole.get(t.role) ?? 0) >= this.limits.maxPerRole) return false;
+    if ((this.counters.byRole.get(t.role) ?? 0) >= maxPerRole) return false;
     return true;
   }
 
@@ -402,6 +426,35 @@ export class MissionScheduler {
     if (t.kind === "agent") this.counters.agents++;
     if (t.kind === "process" || t.kind === "validation") this.counters.subprocesses++;
     this.counters.byRole.set(t.role, (this.counters.byRole.get(t.role) ?? 0) + 1);
+  }
+
+  /**
+   * Sleep until something the pass loop cares about happens (a task settled
+   * or released its lane/slot) or the fallback tick elapses. A wake that
+   * arrives while the loop is mid-pass is remembered, never lost.
+   */
+  private idleUntilWake(): Promise<void> {
+    if (this.wakePending) {
+      this.wakePending = false;
+      return Promise.resolve();
+    }
+    return new Promise<void>((resolve) => {
+      const done = (): void => {
+        clearTimeout(timer);
+        this.wakers.delete(done);
+        resolve();
+      };
+      const timer = setTimeout(done, this.passTickMs);
+      this.wakers.add(done);
+    });
+  }
+
+  private wake(): void {
+    if (this.wakers.size === 0) {
+      this.wakePending = true;
+      return;
+    }
+    for (const w of [...this.wakers]) w();
   }
 
   private release(t: OrchestrationTask): void {
@@ -466,7 +519,11 @@ export class MissionScheduler {
             }
           }
           // If active tasks exist, wait for them.
-          await this.abortable(new Promise<void>((resolve) => setTimeout(resolve, 10)), signal);
+          // Finished: a short drain beat (as before), not the idle wait.
+          await this.abortable(
+            done ? new Promise<void>((resolve) => setTimeout(resolve, 10)) : this.idleUntilWake(),
+            signal,
+          );
           continue;
         }
 
@@ -485,7 +542,7 @@ export class MissionScheduler {
           this.acquire(task);
           this.trackRun(task, signal);
         }
-        await this.abortable(new Promise<void>((resolve) => setTimeout(resolve, 10)), signal);
+        await this.abortable(this.idleUntilWake(), signal);
       }
     } finally {
       signal?.removeEventListener("abort", onAbort);
@@ -709,6 +766,7 @@ export class MissionScheduler {
         this.release(task);
       }
       this.onTaskSettled?.(task.mission_id, task.task_id, this.store.getTask(task.task_id)?.status ?? "FAILED");
+      this.wake();
     }
   }
 
@@ -1606,11 +1664,6 @@ export class MissionScheduler {
     await this.runMission(missionId, signal);
     return this.store.getMission(missionId)?.status ?? "FAILED";
   }
-}
-
-/** Build scheduler tasks for the shared concurrency Scheduler (unused wrapper). */
-export function toSchedulable(t: OrchestrationTask, run: () => Promise<unknown>): SchedulableTask<unknown> {
-  return { id: t.task_id, source: t.mission_id, run };
 }
 
 /** Map a domain task kind to a broker execution kind. */
