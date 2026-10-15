@@ -42,6 +42,8 @@ export interface GateInput {
 }
 
 const BLOCKING_SEVERITIES = new Set(["blocker", "critical", "high"]);
+/** An unverifiable spec gap blocks only at blocker/critical; a high one is recorded. Other gap statuses keep high blocking. */
+const BLOCKING_GAP_SEVERITIES = new Set(["blocker", "critical"]);
 
 /** Categories whose implementation is expected to carry a test change. */
 const TEST_EXPECTED_CATEGORIES = new Set([
@@ -204,7 +206,7 @@ export function evaluateGate(input: GateInput): GateEvaluation {
     );
   } else {
     const gaps = input.specVerification.specGaps.filter(
-      (g) => g.status !== "unverifiable" || BLOCKING_SEVERITIES.has(g.severity),
+      (g) => g.status !== "unverifiable" || BLOCKING_GAP_SEVERITIES.has(g.severity),
     );
     const blocking = gaps.filter((g) => BLOCKING_SEVERITIES.has(g.severity) || g.status === "missing");
     items.push(

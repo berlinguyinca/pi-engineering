@@ -49,7 +49,7 @@ import {
 } from "../gateway/signals.ts";
 import { MAX_ESCALATED_WAIT_MS } from "../gateway/streamRetry.ts";
 import { GenerationGuard, type GuardAbortReason } from "../guard/GenerationGuard.ts";
-import { TOOL_TRANSITION_RULE } from "../guard/RecoveryController.ts";
+import { GUARD_STEER_PROMPT, TOOL_TRANSITION_RULE } from "../guard/RecoveryController.ts";
 import {
   type RecoveryTelemetry,
   buildCompactedContext,
@@ -461,12 +461,15 @@ export class PiWorkerExecutor implements WorkerExecutor {
     }
 
     // Build the base system prompt with the Tool Transition Rule (spec §15).
-    // Specialist roles may supply their own prompt wholesale.
+    // Specialist roles may supply their own prompt wholesale. Prose roles
+    // (reviewers) deliver written findings, so a rule that says "act instead of
+    // narrating" contradicts their role and is left out.
+    const builtPrompt = buildSystemPrompt(req.role, req.task, workerContext(req), {
+      isolatedWorktree: req.isolatedWorktree,
+    });
     const baseSystemPrompt =
       req.systemPromptOverride ??
-      `${buildSystemPrompt(req.role, req.task, workerContext(req), { isolatedWorktree: req.isolatedWorktree })}
-
-${TOOL_TRANSITION_RULE}`;
+      (PROSE_ROLES.has(req.role) ? builtPrompt : `${builtPrompt}\n\n${TOOL_TRANSITION_RULE}`);
 
     // Run the worker with the generation guard and recovery ladder.
     return this.runWithGuard(req, model, baseSystemPrompt, modelRuntime);
@@ -1336,10 +1339,40 @@ ${recovery.recoveryPrompt}`;
       // started prompting is a no-op, so never start it.
       if (req.signal?.aborted) abortFromOwner();
       else
-        await session.prompt(req.kickoff ?? WORKER_KICKOFF, {
-          images: req.images?.map((img) => ({ type: "image" as const, data: img.data, mimeType: img.mimeType })),
-          expandPromptTemplates: false,
+        try {
+          await session.prompt(req.kickoff ?? WORKER_KICKOFF, {
+            images: req.images?.map((img) => ({ type: "image" as const, data: img.data, mimeType: img.mimeType })),
+            expandPromptTemplates: false,
+          });
+        } catch (err) {
+          // A guard abort rejects the prompt; the steer below handles it.
+          if (!guardAborted) throw err;
+        }
+      // First guard trip of the run: steer inside the same session rather than
+      // restarting with the context cut away. A second trip falls through to
+      // the recovery ladder's fresh session.
+      if (
+        attempt === 0 &&
+        guardAborted &&
+        !captured &&
+        structured === undefined &&
+        !budgetExhausted &&
+        !timedOut &&
+        !ownerAborted &&
+        !loopPrevented &&
+        !req.signal?.aborted
+      ) {
+        guardAborted = false;
+        guardReason = undefined;
+        guardDiagnostics = {};
+        guard.reset();
+        emitWorkerActivity(req, {
+          kind: "state",
+          summary: "Guard tripped; steering the session",
+          meaningfulProgress: false,
         });
+        await session.prompt(GUARD_STEER_PROMPT, { expandPromptTemplates: false });
+      }
     } catch (err) {
       // Capture the error. An abort triggered by the guard/budget/timeout is
       // EXPECTED (session.abort()) and not a transport failure. A rejection

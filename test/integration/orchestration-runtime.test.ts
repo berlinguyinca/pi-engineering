@@ -689,9 +689,7 @@ describe("orchestration via real EngineeringRuntime (acceptance scenarios)", () 
       "the blocking finding stays on the record",
     );
     // The orchestrator itself created repair work (not the test).
-    const repairs = store
-      .listTasks(result.mission.mission_id)
-      .filter((t) => t.objective.startsWith("Repair review finding"));
+    const repairs = store.listTasks(result.mission.mission_id).filter((t) => t.objective.startsWith("Repair contract"));
     assert.ok(repairs.length >= 1, "the orchestrator must create repair task(s) from the finding");
     assert.ok(
       repairs.every((t) => t.mutates_repo && t.isolation === "worktree"),
