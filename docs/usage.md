@@ -303,6 +303,10 @@ and are listed with the gateway's own error text. Only an authentication or
 account-wide refusal stops a provider's refresh. In that case its configuration
 is left as it was.
 
+### Mission planning for non-trivial goals
+
+A mission whose goal implies more than one deliverable, names several paths, or runs past 30 words makes ONE planner call (role `planner`, strongest routed model, the planner/worker `PLANNER_PROMPT`) and gets a bounded task DAG: per-task `write_domains`, `relevant_files` and `verification` (handed to each worker as its context). Tasks run in parallel only when their write domains are disjoint; overlapping ones are serialized. Trivial goals keep the single task. A malformed or empty plan falls back to the single task and records a minor `mission_planner` finding. `PI_MISSION_PLANNER=on|off|auto` (default `auto`) forces or disables it. Task domains are pre-validated: absolute, `..`, `.git`, forbidden, read-only and out-of-manifest domains are dropped, and a task left with none falls back to the single task (the finding names the rejected domains). The call is bounded by `PI_MISSION_PLANNER_TIMEOUT_MS` (default 600000); a transient failure is retried once, then falls back with a finding saying transient.
+
 ## Concurrency caps, cooldown scope and stall detection
 
 - Caps follow the gateway: when the `/models` catalogue advertises `active_limit` (or `x_active_limit`, else `slots`), the scheduler's per-role and agent caps and the admission controller's concurrency (less `PI_GATEWAY_RESERVED_SLOTS`) use that capacity. The fixed defaults (2 per role, 4 minus 1 reserved) apply only when the catalogue says nothing. `PI_ENGINEERING_MAX_PER_ROLE`, `PI_ENGINEERING_MAX_AGENTS` and `PI_GATEWAY_MAX_CONCURRENCY` always override.

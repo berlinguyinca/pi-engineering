@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, rename, unlink, writeFile } from "node:fs/promises";
 import { hostname } from "node:os";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, relative, resolve } from "node:path";
 import type { Model } from "@earendil-works/pi-ai/compat";
 import { SettingsManager, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { ArtifactStore } from "../artifacts/ArtifactStore.ts";
@@ -22,11 +22,18 @@ import type {
 } from "../core/types.ts";
 import { ROLE_BUDGETS, isMachineEvidence } from "../core/types.ts";
 import { GitRepo } from "../git/GitRepo.ts";
+import { classifyError } from "../guard/transient.ts";
 import { MissionCapacityScheduler } from "../inference/missionCapacityScheduler.ts";
 import { Ledger } from "../ledger/Ledger.ts";
 import { loadMissionLimits } from "../lifecycle/policy.ts";
 import { workflowMutatesRepo } from "../orchestration/intentRouter.ts";
 import { OPERATOR_PAUSE_STOP_REASON, interruptibleRun } from "../orchestration/interrupt.ts";
+import {
+  PlannerTransientError,
+  missionPlannerMode,
+  planMission,
+  plannerTimeoutMs,
+} from "../orchestration/missionPlanner.ts";
 import {
   MISSION_SNAPSHOT_FILENAME,
   type MissionSnapshotFile,
@@ -488,6 +495,20 @@ export interface EngineeringRuntimeOptions {
  * whose owner is no longer open here (closed, or from before a reload) belongs
  * to no live controller and must not be mistaken for live ownership.
  */
+/** Manifest scope for planner pre-validation: writable domains and read-only prefixes under the repo. */
+function plannerScope(
+  manifest: import("../orchestration/types.ts").WorkspaceManifest | undefined,
+  repoRoot: string,
+): { writableDomains?: string[]; readOnlyPrefixes?: string[] } {
+  if (!manifest) return {};
+  const binding = manifest.repositories.find((r) => r.canonicalRoot === repoRoot) ?? manifest.repositories[0];
+  const readOnlyPrefixes = manifest.authorizedRoots
+    .filter((root) => root.access === "read")
+    .map((root) => relative(repoRoot, root.canonicalPath))
+    .filter((rel) => rel !== "" && !rel.startsWith("..") && !isAbsolute(rel));
+  return { ...(binding ? { writableDomains: binding.writableDomains } : {}), readOnlyPrefixes };
+}
+
 function liveOwnerIds(): Set<string> {
   const key = Symbol.for("pi-engineering.live-mission-owner-ids");
   const holder = globalThis as unknown as Record<symbol, Set<string> | undefined>;
@@ -577,6 +598,8 @@ export class EngineeringRuntime {
   missionSupervisor: MissionSupervisor | null;
   /** Orchestrator facade (spec 06) — auto-invokes workflows from intent. */
   orchestrator: Orchestrator | null;
+  /** The planner the orchestrator uses to turn a mission into tasks. */
+  missionPlanner: NonNullable<EngineeringRuntimeOptions["orchestrationPlanner"]> | null;
   /**
    * Mission observability service (spec 00 §observability): weighted-DAG
    * progress, health/stall/loop detection, structured events, projection. Lives
@@ -890,6 +913,7 @@ export class EngineeringRuntime {
     this.missionOwnership = null;
     this.missionSupervisor = null;
     this.orchestrator = null;
+    this.missionPlanner = null;
     this.missionObservability = null;
     this.repositoryRegistry = new RepositoryRegistry();
     this.coreTools = [];
@@ -1141,28 +1165,84 @@ export class EngineeringRuntime {
         const acceptanceIds = mission.acceptance_criteria.flatMap((criterion) =>
           criterion.acceptance_id ? [criterion.acceptance_id] : [],
         );
-        return [
-          {
-            kind: "agent",
-            role: mutates ? "implementer" : "investigator",
-            objective: mission.goal,
-            mutates_repo: mutates,
-            write_domains: mutates ? ["**"] : [],
-            isolation: mutates ? "worktree" : "none",
-            depends_on: [],
-            priority: 0,
-            execution_requirements: {},
-            acceptance_ids: acceptanceIds,
-            deliverables: mutates ? ["implementation", "targeted-tests"] : ["investigation-report"],
-            // No execution_budget_ms: a task runs as long as it shows activity
-            // (an opt-in limits.max_task_wall_clock_ms is applied by the
-            // orchestrator when configured).
-            checkpoint_policy: { activity_milestone: 5, before_deadline_ms: 30_000 },
-            max_attempts: 3,
-            failure_policy: "retry",
+        const single = (): PlanTaskInput => ({
+          kind: "agent",
+          role: mutates ? "implementer" : "investigator",
+          objective: mission.goal,
+          mutates_repo: mutates,
+          write_domains: mutates ? ["**"] : [],
+          isolation: mutates ? "worktree" : "none",
+          depends_on: [],
+          priority: 0,
+          execution_requirements: {},
+          acceptance_ids: acceptanceIds,
+          deliverables: mutates ? ["implementation", "targeted-tests"] : ["investigation-report"],
+          // No execution_budget_ms: a task runs as long as it shows activity
+          // (an opt-in limits.max_task_wall_clock_ms is applied by the
+          // orchestrator when configured).
+          checkpoint_policy: { activity_milestone: 5, before_deadline_ms: 30_000 },
+          max_attempts: 3,
+          failure_policy: "retry",
+        });
+        // Non-trivial goals get ONE planner call (PLANNER_PROMPT) on the best
+        // "planner"-routed model so independent work gets real write domains;
+        // a malformed plan falls back to the single task and never blocks.
+        const planned = await planMission({
+          goal: mission.goal,
+          mutates,
+          mode: missionPlannerMode(),
+          acceptanceIds,
+          single,
+          ...plannerScope(rt.missionStore?.getWorkspaceManifest(mission.mission_id), repoRoot),
+          runPlanner: async (task) => {
+            const route = await routeModel?.("planner", { missionId: mission.mission_id }).catch(() => undefined);
+            // Bounded: a hard timeout aborts the one call; thinking is allowed
+            // for role "planner" (thinkingPolicy) and the role's token budget applies.
+            const abort = new AbortController();
+            const timer = setTimeout(() => abort.abort(), plannerTimeoutMs());
+            try {
+              const run = await rt.worker.run({
+                role: "planner",
+                task,
+                tools: READ_ONLY_TOOLS,
+                cwd: repoRoot,
+                signal: abort.signal,
+                maxContextTokens: ROLE_BUDGETS.planner.hardMaxTokens,
+                ...(route ? { modelOverride: { provider: route.provider, id: route.id } } : {}),
+              });
+              if (abort.signal.aborted) throw new Error(`planner timed out after ${plannerTimeoutMs()} ms`);
+              if (run.error) {
+                if (run.error.startsWith("transient:") || classifyError(run.error).retryable) {
+                  throw new PlannerTransientError(run.error);
+                }
+                throw new Error(run.error);
+              }
+              return run.result.summary;
+            } catch (error) {
+              if (error instanceof PlannerTransientError || abort.signal.aborted) throw error;
+              if (classifyError(error).retryable) throw new PlannerTransientError(String(error));
+              throw error;
+            } finally {
+              clearTimeout(timer);
+            }
           },
-        ];
+        });
+        if (planned.fallbackReason) {
+          rt.missionStore?.addFinding({
+            mission_id: mission.mission_id,
+            task_id: null,
+            severity: "minor",
+            category: "mission_planner",
+            file: null,
+            line: null,
+            summary: "Mission planner output unusable; ran the goal as a single task.",
+            evidence: planned.fallbackReason.slice(0, 1000),
+            recommended_action: "None required; the mission continues with one task.",
+          });
+        }
+        return planned.tasks;
       };
+      rt.missionPlanner = opts.orchestrationPlanner ?? defaultPlanner;
       const limits = await loadMissionLimits(repoRoot, opts.agentDir);
       const recoveryBudget = missionRecoveryBudget(rt.resilience);
       rt.orchestrator = new Orchestrator({
