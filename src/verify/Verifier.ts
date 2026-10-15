@@ -691,7 +691,7 @@ const NEXTEST_LINE = /^\s*(?:TRY \d+ )?(PASS|FAIL|SKIP|START)\b(?:\s+\[[^\]]*\])
  * indented, so the generic {@link countTestEvents} patterns do not see them.
  */
 export function parseNextestLine(line: string): NextestEvent | null {
-  const m = NEXTEST_LINE.exec(line.replace(ANSI, ""));
+  const m = line.replace(ANSI, "").match(NEXTEST_LINE);
   if (!m) return null;
   const test = (m[2] ?? "").trim();
   if (test.length === 0) return null;

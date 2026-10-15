@@ -581,6 +581,12 @@ When Pi exits — normally or on an uncaught exception — every running
 verification group is killed; a `SIGKILL` of Pi itself cannot run that cleanup,
 so a group can outlive it in that one case.
 
+A `Cargo.toml` repository gets `cargo check --all-targets`, then `cargo nextest
+run` when `cargo nextest --version` succeeds (otherwise `cargo test --lib --bins
+--tests`), then a separate `cargo test --doc` stage, because nextest does not run
+doctests. The test stages run under the progress watchdog; nextest's
+`PASS`/`FAIL`/`SKIP` lines count as test progress.
+
 ### Failures that were already red on the base
 
 Integration and validation judge a candidate by the failures it introduces. When
