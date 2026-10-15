@@ -276,6 +276,8 @@ export interface StageRun {
   passed: boolean;
   summary: Record<string, unknown>;
   artifactUri: string;
+  /** Wall time of this stage's command. */
+  durationMs?: number;
   /** Failing test names parsed from node:test output, when the stage reported any. */
   failingTests?: string[];
 }
@@ -685,6 +687,7 @@ export class CommandVerifier implements VerificationProvider {
     for (const stage of profile.stages) {
       opts?.signal?.throwIfAborted();
       const startedAt = new Date().toISOString();
+      const stageStart = Date.now();
       let stdout = "";
       let stderr = "";
       let code = -1;
@@ -749,6 +752,7 @@ export class CommandVerifier implements VerificationProvider {
         passed,
         summary,
         artifactUri,
+        durationMs: Date.now() - stageStart,
         ...(failingTests.length > 0 ? { failingTests } : {}),
       });
       evidence.push(ev);

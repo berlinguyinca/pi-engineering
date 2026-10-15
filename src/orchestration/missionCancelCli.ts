@@ -25,6 +25,7 @@ import { MIGRATIONS_FILE } from "../runtime/isolation/legacyMigration.ts";
 import { resolveOrchestrationOverride, resolveStateRoot } from "../runtime/isolation/stateDir.ts";
 import { type MissionCancellation, type MissionSelector, cancelStaleMission, listMissions } from "./missionCancel.ts";
 import { MissionStore } from "./missionStore.ts";
+import { explainMission, formatMissionWhy } from "./missionWhy.ts";
 
 export interface MissionsCliOptions {
   write?: (text: string) => void;
@@ -36,6 +37,7 @@ export interface MissionsCliOptions {
 
 const USAGE =
   "usage: pi-engineering missions list --store <dir|orchestration.jsonl> [--repo-id ID] [--created-after ISO] [--all] [--json]\n" +
+  "       pi-engineering missions why --store <dir|orchestration.jsonl> [--json] <missionId>\n" +
   "       pi-engineering missions cancel --store <dir|orchestration.jsonl> (--mission ID ... | --repo-id ID --created-after ISO) [--yes] [--json]\n";
 
 function values(args: string[], flag: string): string[] {
@@ -101,7 +103,7 @@ export async function runMissionsCommand(args: string[], options: MissionsCliOpt
   let selector: MissionSelector;
   let storePath: string;
   try {
-    if (sub !== "list" && sub !== "cancel") throw new Error("unknown subcommand");
+    if (sub !== "list" && sub !== "cancel" && sub !== "why") throw new Error("unknown subcommand");
     const [store] = values(rest, "--store");
     if (!store) throw new Error("--store is required");
     storePath = await storeFile(store);
@@ -119,6 +121,11 @@ export async function runMissionsCommand(args: string[], options: MissionsCliOpt
     return 2;
   }
   const json = rest.includes("--json");
+  const whyId = sub === "why" ? rest.find((a, i) => !a.startsWith("--") && rest[i - 1] !== "--store") : undefined;
+  if (sub === "why" && !whyId) {
+    err(`why requires a mission id\n${USAGE}`);
+    return 2;
+  }
   const apply = rest.includes("--yes");
   const imported = await importedInto(storePath, options.env ?? process.env);
   if (imported && sub === "cancel") {
@@ -131,13 +138,19 @@ export async function runMissionsCommand(args: string[], options: MissionsCliOpt
 
   let backend: JsonlEventStore;
   try {
-    backend = await JsonlEventStore.open(storePath);
+    // `why` only reads: it must work while a live session holds the writer lock.
+    backend = await (sub === "why" ? JsonlEventStore.openReadOnly(storePath) : JsonlEventStore.open(storePath));
   } catch (error) {
     err(`cannot open ${storePath}: ${error instanceof Error ? error.message : String(error)}\n`);
     return 3;
   }
   try {
     const store = MissionStore.open(backend);
+    if (whyId) {
+      const why = explainMission(store, whyId, { now: options.now });
+      out(json ? `${JSON.stringify(why, null, 2)}\n` : formatMissionWhy(why));
+      return 0;
+    }
     const listed = listMissions(store, selector);
     if (sub === "list") {
       out(

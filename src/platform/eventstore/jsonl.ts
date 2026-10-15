@@ -48,6 +48,7 @@ export class JsonlEventStore implements EventStoreBackend {
   private writerLock: ExclusiveFileLock | null = null;
   private pendingAppends = 0;
   private closed = false;
+  private readOnly = false;
 
   private constructor(file: string, memoryOnly: boolean) {
     this.file = file;
@@ -79,6 +80,31 @@ export class JsonlEventStore implements EventStoreBackend {
   }
 
   /** In-memory JSONL-shaped store (no persistence) for tests and ephemeral use. */
+  /**
+   * Replay the file for inspection without the writer lock, torn-tail repair
+   * or stale-lock recovery, so a live session that owns the store does not
+   * block a diagnostic read. A torn final line is skipped, never truncated.
+   * Every append is refused.
+   */
+  static async openReadOnly(file: string): Promise<JsonlEventStore> {
+    const store = new JsonlEventStore(file, false);
+    store.readOnly = true;
+    const text = await readFile(file, "utf-8");
+    const lines = text.split("\n");
+    lines.pop(); // text after the last newline is an unfinished write (or empty)
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      try {
+        const evt = JSON.parse(line) as StoredEvent;
+        store.events.push(evt);
+        store.byId.set(evt.event_id, evt);
+      } catch {
+        // Unreadable lines are skipped, as in load().
+      }
+    }
+    return store;
+  }
+
   static inMemory(): JsonlEventStore {
     return new JsonlEventStore("", true);
   }
@@ -117,6 +143,7 @@ export class JsonlEventStore implements EventStoreBackend {
   }
 
   async append(event: StoredEvent): Promise<StoredEvent> {
+    if (this.readOnly) throw new Error("JsonlEventStore: opened read-only");
     if (this.closed) throw new Error("JsonlEventStore: append after close");
     // Serialised HERE, at append time. Doing it inside the chain let a caller
     // mutate the entity before the bytes were produced, so what history
@@ -152,6 +179,7 @@ export class JsonlEventStore implements EventStoreBackend {
     condition: () => boolean,
     onCommit?: () => void,
   ): Promise<StoredEvent | undefined> {
+    if (this.readOnly) throw new Error("JsonlEventStore: opened read-only");
     if (this.closed) throw new Error("JsonlEventStore: append after close");
     const line = `${JSON.stringify(event)}\n`;
     this.pendingAppends++;
@@ -191,6 +219,7 @@ export class JsonlEventStore implements EventStoreBackend {
    * either lands or it does not.
    */
   async appendAll(events: StoredEvent[]): Promise<void> {
+    if (this.readOnly) throw new Error("JsonlEventStore: opened read-only");
     if (this.closed) throw new Error("JsonlEventStore: appendAll after close");
     if (events.length === 0) return;
     const body = events.map((event) => `${JSON.stringify(event)}\n`).join("");

@@ -139,6 +139,8 @@ export interface Mission {
    * nothing automatic (supervisor, auto-resume, repair) may resume the mission.
    */
   operator_paused_at?: string | null;
+  /** Execution mode chosen at planning time and why (chooseExecutionMode). */
+  execution_mode?: { mode: string; reason: string };
 }
 
 /** A model the operator chose explicitly for a session's missions. */
@@ -536,6 +538,14 @@ export interface RecoveryDecision {
   startingCandidateContent?: { candidateSha: string; diffHash: string } | null;
   /** Concrete operator-facing guidance when recovery must pause for a decision. */
   operatorGuidance?: string;
+  /** Zero-tool-call retry accounting of a provider wait (#197). */
+  zeroToolWait?: ZeroToolWait;
+}
+
+export interface ZeroToolWait {
+  retries: number;
+  cap: number;
+  failureClass: string;
 }
 
 export interface EvidenceInvalidation {

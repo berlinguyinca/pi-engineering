@@ -825,6 +825,7 @@ export function realBackends(opts: RealBackendsOptions) {
                 name: stage.stage.name,
                 exitCode: stage.exitCode,
                 passed: stage.passed,
+                durationMs: stage.durationMs,
               })),
               failedStage: outcome.failedStage,
               warnings,
