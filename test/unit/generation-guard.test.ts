@@ -99,7 +99,7 @@ test("Test 3: Tool call resets the guard — no abort after progress", () => {
 test("Test 4: Long non-repetitive reasoning without progress triggers no_progress", () => {
   const config = { ...DEFAULT_GUARD_CONFIG, maxNarrationTokensBeforeAction: 999999 };
   const guard = new GenerationGuard(config);
-  // Generate > 1500 tokens of unique text (≈6000 chars at 4 chars/token)
+  // Generate > 4000 tokens of unique text (≈16000 chars at 4 chars/token)
   let text = "";
   for (let i = 0; i < 200; i++) {
     text += `The analysis of component number ${i} reveals that the architecture requires further consideration of the design patterns in use. `;
@@ -107,7 +107,7 @@ test("Test 4: Long non-repetitive reasoning without progress triggers no_progres
   const decision = guard.feed(text);
   assert.equal(decision.abort, true);
   assert.equal(decision.reason, "no_progress");
-  assert.ok((decision.diagnostics?.tokens_since_progress as number) > 1500);
+  assert.ok((decision.diagnostics?.tokens_since_progress as number) > 4000);
 });
 
 // ─── Test 5: Fast Tool Transition (spec §23 Test 5) ─────────────────────────
@@ -297,8 +297,8 @@ test("buildDegenerationEvent: produces structured event", () => {
 test("Config: defaults match spec §26", () => {
   assert.equal(DEFAULT_GUARD_CONFIG.repeatedSentenceThreshold, 4);
   assert.equal(DEFAULT_GUARD_CONFIG.repeatedWindowSize, 8);
-  assert.equal(DEFAULT_GUARD_CONFIG.maxReasoningTokensWithoutProgress, 1500);
-  assert.equal(DEFAULT_GUARD_CONFIG.maxNarrationTokensBeforeAction, 600);
+  assert.equal(DEFAULT_GUARD_CONFIG.maxReasoningTokensWithoutProgress, 4000);
+  assert.equal(DEFAULT_GUARD_CONFIG.maxNarrationTokensBeforeAction, 2000);
   assert.equal(DEFAULT_GUARD_CONFIG.maxRecoveryAttempts, 3);
   assert.equal(DEFAULT_GUARD_CONFIG.compactContextOnAttempt, 2);
   assert.equal(DEFAULT_GUARD_CONFIG.fallbackModelOnAttempt, 3);

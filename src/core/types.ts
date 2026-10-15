@@ -263,6 +263,8 @@ export interface WorkerUsage {
   contextTokens: number;
   turns: number;
   model: string;
+  /** Cut streams resumed in the same session after tool calls ran. */
+  streamResumes?: number;
 }
 
 export interface TokenBudget {

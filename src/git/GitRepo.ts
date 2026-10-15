@@ -218,6 +218,9 @@ export class GitRepo {
   // handling.
   private worktreeLock: Promise<void> = Promise.resolve();
 
+  /** Aborting kills in-flight git children started through `git()`. */
+  private signal: AbortSignal | undefined;
+
   private constructor(cwd: string, repoRoot: string) {
     this.cwd = cwd;
     this.repoRoot = repoRoot;
@@ -235,13 +238,17 @@ export class GitRepo {
   }
 
   /** Returns a GitRepo if `cwd` is inside a git work tree, else null. */
-  static async open(cwd: string): Promise<GitRepo | null> {
+  static async open(cwd: string, signal?: AbortSignal): Promise<GitRepo | null> {
     try {
       // Resolve the actual repository toplevel so a caller in a subdirectory
       // (e.g. <repo>/src) still treats the whole repo as its root.
-      const { stdout } = await exec("git", ["-C", cwd, "rev-parse", "--show-toplevel"], { timeout: 120_000 });
+      const { stdout } = await exec("git", ["-C", cwd, "rev-parse", "--show-toplevel"], {
+        timeout: 120_000,
+        signal,
+      });
       if (!stdout.trim()) return null;
       const repo = new GitRepo(cwd, stdout.trim());
+      repo.signal = signal;
       await repo.git(["rev-parse", "--is-inside-work-tree"]);
       return repo;
     } catch {
@@ -249,12 +256,17 @@ export class GitRepo {
     }
   }
 
-  private async git(args: string[], opts: { timeout?: number; preserveStdout?: boolean } = {}): Promise<GitResult> {
+  private async git(
+    args: string[],
+    opts: { timeout?: number; preserveStdout?: boolean; env?: Record<string, string> } = {},
+  ): Promise<GitResult> {
     const timeoutMs = opts.timeout ?? 120_000;
     try {
       const { stdout, stderr } = await exec("git", [...this.gitArgs, ...args], {
+        ...(opts.env ? { env: { ...process.env, ...opts.env } } : {}),
         timeout: timeoutMs,
         maxBuffer: 64 * 1024 * 1024,
+        signal: this.signal,
       });
       return { stdout: opts.preserveStdout ? stdout : stdout.trim(), stderr: stderr.trim(), code: 0 };
     } catch (err) {
@@ -513,7 +525,11 @@ export class GitRepo {
 
   /** Every linked worktree git knows about, primary checkout excluded. */
   async listLinkedWorktrees(): Promise<Array<{ path: string; branch: string | null; head: string | null }>> {
-    const listed = await this.git(["worktree", "list", "--porcelain"], { preserveStdout: true });
+    // Only the janitor sweep lists this way; the tag lets observers (tests) tell it from other git use.
+    const listed = await this.git(["worktree", "list", "--porcelain"], {
+      preserveStdout: true,
+      env: { PI_HOUSEKEEPING_SWEEP: "1" },
+    });
     if (listed.code !== 0) throw new Error(`git worktree list failed: ${listed.stderr}`);
     const out: Array<{ path: string; branch: string | null; head: string | null }> = [];
     for (const entry of listed.stdout.split(/\n\n+/)) {

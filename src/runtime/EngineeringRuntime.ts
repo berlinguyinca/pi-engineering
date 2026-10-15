@@ -3,6 +3,7 @@ import { mkdir, rename, unlink, writeFile } from "node:fs/promises";
 import { hostname } from "node:os";
 import { join, resolve } from "node:path";
 import type { Model } from "@earendil-works/pi-ai/compat";
+import { SettingsManager, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { ArtifactStore } from "../artifacts/ArtifactStore.ts";
 import { BlackholeManager, type BlackholeManagerOptions } from "../blackhole/BlackholeManager.ts";
 import type { RoleRouterAdapter } from "../capability/adapter.ts";
@@ -1047,6 +1048,23 @@ export class EngineeringRuntime {
         onModelServed: (model) => rt.unavailableModels.clear(model),
         isModelUnavailable: (model) => rt.unavailableModels.has(model),
         reviewFallbackModel,
+        // Gate roles routing cannot place (no repo policy, candidates dead) are
+        // placed from the session's model registry.
+        registryModels: async () =>
+          rt.worker instanceof PiWorkerExecutor
+            ? (await (await rt.worker.getModelRuntime()).getAvailable()).map((model) => ({
+                provider: model.provider,
+                id: model.id,
+                contextWindow: model.contextWindow,
+              }))
+            : [],
+        enabledModels: () => {
+          try {
+            return SettingsManager.create(repoRoot, opts.agentDir ?? getAgentDir()).getEnabledModels();
+          } catch {
+            return undefined;
+          }
+        },
         currentOperatorPin,
         repository: async (repoId) => {
           if (repoId) {
@@ -1113,7 +1131,8 @@ export class EngineeringRuntime {
         parentSessionId: session.sessionId,
         git: rt.git,
         artifacts: rt.artifacts,
-        baseRef: rt.git ? await rt.git.headCommit() : "",
+        // A repo with no commit yet is a legitimate target: no base until the first commit.
+        baseRef: rt.git ? await rt.git.headCommit().catch(() => "") : "",
         workspaceResolver: new WorkspaceManifestResolver(),
         repositoryRegistry: rt.repositoryRegistry,
         launchCwd: opts.cwd,

@@ -208,6 +208,10 @@ test("automatic installation only when explicitly configured", async () => {
       mkdirSync(install, { recursive: true });
     },
   });
+  // The session-start check runs in the background; automaticCheck() joins an
+  // in-flight check. Drain it first so it cannot finish after we configure
+  // (and so return its stale "nothing to install" result for our call below).
+  await w.ext.automaticCheck();
   await writePreferences(w.ext.layout.preferencesFile, {
     ...readPreferences(w.ext.layout.preferencesFile),
     autoInstall: true,

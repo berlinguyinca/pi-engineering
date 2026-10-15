@@ -15,7 +15,9 @@
 import { createHash } from "node:crypto";
 import type { ArtifactStore } from "../artifacts/ArtifactStore.ts";
 import { modelFamily, sameFamily as sameFamilyId } from "../capability/modelRecord.ts";
+import { type RegistryModel, filterEnabledModels, rankRegistryModels } from "../capability/registryCandidates.ts";
 import { id } from "../core/ids.ts";
+import { ROLE_BUDGETS } from "../core/types.ts";
 import type { CandidateLifecycle, GitRepo, IntegrationRunRecord } from "../git/GitRepo.ts";
 import type { WorktreeInfo } from "../git/GitRepo.ts";
 import { type ModelRef, modelKey } from "../lifecycle/types.ts";
@@ -64,6 +66,14 @@ export interface RealBackendsOptions {
    */
   reviewFallbackModel?: ModelRef;
   /**
+   * Every model the session registry can serve. When routing offers a gate
+   * role nothing usable (no repo policy, or its candidates are tried or on an
+   * unreachable provider), the role is placed from here.
+   */
+  registryModels?: () => Promise<readonly RegistryModel[]> | readonly RegistryModel[];
+  /** Pi's `enabledModels` globs: the registry fallback stays inside them while any model matches. */
+  enabledModels?: () => readonly string[] | undefined;
+  /**
    * The operator pin a mission dispatches with right now (Pi `/model`),
    * adopting the session's latest choice. A change while a worker is waiting
    * between inference requests re-dispatches it on the new choice.
@@ -82,6 +92,8 @@ export interface ModelRoute extends ModelRef {
   pinRefused?: string;
   /** Operator-visible reason the pin could not place this role. */
   pinNotice?: string;
+  /** Why this role was placed from the model registry instead of by routing. */
+  registryNotice?: string;
 }
 
 export interface RouteModelOptions {
@@ -345,6 +357,49 @@ function outcomeOf(result: Awaited<ReturnType<WorkerExecutor["run"]>>): Executio
 export function realBackends(opts: RealBackendsOptions) {
   /** Providers that refused connections, with the time their cooldown ends. */
   const unreachableProviders = new Map<string, number>();
+  const cooling = (provider: string): boolean => {
+    const until = unreachableProviders.get(provider);
+    if (until === undefined) return false;
+    if (until > Date.now()) return true;
+    unreachableProviders.delete(provider);
+    return false;
+  };
+  /**
+   * Place a role on the best live model of the session registry: not excluded,
+   * not on a provider cooling after refused connections, not recorded
+   * unavailable; different family from the producers first, then larger context.
+   */
+  const registryRoute = async (
+    role: string,
+    exclude: readonly ModelRef[],
+    producers: readonly ModelRef[],
+  ): Promise<ModelRoute | undefined> => {
+    let models: readonly RegistryModel[];
+    try {
+      models = (await opts.registryModels?.()) ?? [];
+    } catch {
+      return undefined;
+    }
+    const live = models.filter((model) => !opts.isModelUnavailable?.(model));
+    const patterns = opts.enabledModels?.();
+    const scoped = filterEnabledModels(live, patterns);
+    const rank = (pool: readonly RegistryModel[]) =>
+      rankRegistryModels(pool, { exclude, producers, skipProvider: cooling })[0];
+    let best = rank(scoped);
+    let outside = "";
+    if (!best && scoped.length < live.length) {
+      best = rank(live);
+      outside = `; nothing enabled by ${patterns?.join(", ")} is live`;
+    }
+    if (!best) return undefined;
+    const coolingProviders = [...new Set(models.map((model) => model.provider))].filter(cooling);
+    const why = coolingProviders.length > 0 ? ` (${coolingProviders.join(", ")} on cooldown)` : "";
+    return {
+      provider: best.provider,
+      id: best.id,
+      registryNotice: `${role}: no routing candidate; chose ${modelKey(best)} from the model registry${why}${outside}`,
+    };
+  };
   const repository = async (repoId?: string): Promise<{ git: GitRepo | null; cwd: string }> =>
     (await opts.repository?.(repoId)) ?? { git: opts.git, cwd: opts.cwd };
   const runWorker = async (
@@ -484,13 +539,17 @@ export function realBackends(opts: RealBackendsOptions) {
     let route = plan.initial;
     if (plan.announceWarnings && route?.warning) announce(route.warning);
     if (route?.pinNotice) announce(route.pinNotice);
+    const switches: string[] = [];
+    if (route?.registryNotice) {
+      switches.push(route.registryNotice);
+      announce(route.registryNotice);
+    }
     arm(req, route, plan.context.missionId);
     let run = await runWorker(req, input);
     // The model the attempt ran on: the route; unrouted, the model the worker
     // names, else the session model (normally the executor's default).
     let model: ModelRef | undefined = route ?? ranOn(run) ?? opts.reviewFallbackModel;
     const tried: ModelRef[] = [];
-    const switches: string[] = [];
     while (!input.signal.aborted) {
       const error = outcomeOf(run).error ?? "";
       if (error === MODEL_SUPERSEDED) {
@@ -565,6 +624,10 @@ export function realBackends(opts: RealBackendsOptions) {
           : `model ${modelKey(failed)} has no capacity right now — switched ${req.role} to ${modelKey(next)}`;
       switches.push(notice);
       announce(notice);
+      if (next.registryNotice) {
+        switches.push(next.registryNotice);
+        announce(next.registryNotice);
+      }
       plan.onSwitch?.(failed, next);
       route = next;
       model = next;
@@ -581,9 +644,21 @@ export function realBackends(opts: RealBackendsOptions) {
   };
   /** Takeover plan for a routed worker role: the next model the router offers. */
   const routedPlan = async (role: string, context: { missionId?: string; taskId?: string }, prefix: string) => ({
-    initial: await opts.routeModel?.(role, { missionId: context.missionId }),
-    next: async (tried: ModelRef[]) =>
-      opts.routeModel?.(role, { exclude: tried, replacement: true, missionId: context.missionId }),
+    // An unrouted role runs on the session default; when that provider is
+    // cooling, the registry places it on a live model instead.
+    initial: await (async () => {
+      const routed = await opts.routeModel?.(role, { missionId: context.missionId });
+      const fallback = opts.reviewFallbackModel;
+      if (routed ? !cooling(routed.provider) : !fallback || !cooling(fallback.provider)) return routed;
+      return (await registryRoute(role, routed ? [routed] : [], [])) ?? routed;
+    })(),
+    next: async (tried: ModelRef[]) => {
+      const routed = await opts.routeModel?.(role, { exclude: tried, replacement: true, missionId: context.missionId });
+      if (routed && !cooling(routed.provider)) return routed;
+      return (await registryRoute(role, routed ? [...tried, routed] : tried, [])) ?? routed;
+    },
+    onProviderUnreachable: (model: ModelRef) =>
+      unreachableProviders.set(model.provider, Date.now() + UNREACHABLE_PROVIDER_COOLDOWN_MS),
     repick: async (tried: ModelRef[]) =>
       opts.routeModel?.(role, { ...(tried.length > 0 ? { exclude: tried } : {}), missionId: context.missionId }),
     freshSessionId: () => id(prefix),
@@ -620,6 +695,9 @@ export function realBackends(opts: RealBackendsOptions) {
           tools: [...IMPLEMENTER_TOOLS],
           tolerantFileTools: true,
           cwd: input.worktree ?? bound.cwd,
+          // Role budget; the executor clamps it to 70% of the routed model's
+          // window and compacts at 60% of the result (issue #180).
+          maxContextTokens: ROLE_BUDGETS[(input.role as WorkerRequest["role"]) ?? "implementer"]?.hardMaxTokens,
           // No duration cap: the broker owns liveness (activity-based) and any
           // opt-in limit. This only carries an explicit operator override.
           timeoutMs: workerTimeoutMs(),
@@ -785,7 +863,10 @@ export function realBackends(opts: RealBackendsOptions) {
           context: input.contextRef,
           tools: ["ledger_read", "artifact_read", "repo_search", "symbol"],
           cwd: input.worktree ?? bound.cwd,
-          maxContextTokens: 64_000,
+          // The role's table budget; the executor clamps it to 70% of the
+          // routed model's context window (issue #180), so a 32k-slot model is
+          // never handed a fixed 64k.
+          maxContextTokens: ROLE_BUDGETS.reviewer.hardMaxTokens,
           // Same as implementation workers: no duration cap (the broker owns
           // liveness), and inference waiting is unbounded. The executor's old
           // 5-minute default aborted reviewers mid-analysis.
@@ -803,13 +884,6 @@ export function realBackends(opts: RealBackendsOptions) {
         const fallback = opts.reviewFallbackModel;
         const independentOfProducers = (model: ModelRef): boolean =>
           modelFamily(model.id) !== undefined && !producers.some((m) => sameFamily(m, model));
-        const cooling = (provider: string): boolean => {
-          const until = unreachableProviders.get(provider);
-          if (until === undefined) return false;
-          if (until > Date.now()) return true;
-          unreachableProviders.delete(provider);
-          return false;
-        };
         const pickReviewer = async (tried: ModelRef[]): Promise<ModelRoute | undefined> => {
           // Prefer a model of a different family on a reachable provider; remember
           // the first sibling of a producer's family (or unknown family), and the
@@ -829,7 +903,11 @@ export function realBackends(opts: RealBackendsOptions) {
             else sibling ??= candidate;
             passedOver.push({ provider: candidate.provider, id: candidate.id });
           }
+          // Routing offered no independent live model: the registry may have one.
+          const registry = await registryRoute(req.role, [...producers, ...tried], producers);
+          if (registry && independentOfProducers(registry)) return registry;
           if (sibling) return sibling;
+          if (registry) return registry;
           if (
             fallback &&
             !tried.some((m) => sameModel(m, fallback)) &&
@@ -911,21 +989,21 @@ export function realBackends(opts: RealBackendsOptions) {
           structured.missingTests.every(validRawMissingTest) &&
           Array.isArray(structured?.specGaps) &&
           structured.specGaps.every(validRawSpecGap);
-        const supplemental = [
-          ...(Array.isArray(structured?.missingTests) ? structured.missingTests : []),
-          ...(Array.isArray(structured?.specGaps) ? structured.specGaps : []),
-        ];
         outcome.findings.push(
-          ...supplemental.map((entry) => {
+          ...(Array.isArray(structured?.missingTests) ? structured.missingTests : []).map((entry) => {
             const record = entry as Record<string, unknown>;
-            return { severity: record.severity, summary: record.description ?? record.detail ?? record.requirement };
+            return { severity: record.severity, category: "missing_tests", summary: record.description };
+          }),
+          ...(Array.isArray(structured?.specGaps) ? structured.specGaps : []).map((entry) => {
+            const record = entry as Record<string, unknown>;
+            return { severity: record.severity, category: "spec_gaps", summary: record.detail ?? record.requirement };
           }),
         );
         const normalizedFindings = outcome.findings.flatMap((finding) => {
           try {
             return [
               {
-                severity: normalizeReviewSeverity(finding.severity),
+                severity: normalizeReviewSeverity(finding.severity, finding.category),
                 summary: String(finding.summary ?? "review finding"),
                 status: finding.status === "resolved" ? ("resolved" as const) : ("open" as const),
               },

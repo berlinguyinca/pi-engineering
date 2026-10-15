@@ -213,7 +213,10 @@ test("implementer: blocked or partial with a reason is accepted without changes"
     async ({ executor, req }) => {
       const run = await executor.run(req());
       assert.equal(run.result.status, "blocked");
-      assert.deepEqual(run.result.details, { done: ["a"], remaining: ["b"], partial: true });
+      assert.deepEqual(
+        { done: run.result.details.done, remaining: run.result.details.remaining, partial: run.result.details.partial },
+        { done: ["a"], remaining: ["b"], partial: true },
+      );
     },
   );
 });
@@ -270,7 +273,10 @@ test("a wall-clock budget injects one wrap-up turn at ~75% and a partial result 
         req({ role: "scout", isolatedWorktree: false, wallClock: { startedAt: clock.now(), budgetMs: 1000 } }),
       );
       assert.equal(run.result.status, "blocked");
-      assert.deepEqual(run.result.details, { done: ["a"], remaining: ["b"], partial: true });
+      assert.deepEqual(
+        { done: run.result.details.done, remaining: run.result.details.remaining, partial: run.result.details.partial },
+        { done: ["a"], remaining: ["b"], partial: true },
+      );
       assert.equal(bodies.length, 2);
       assert.match(bodies[1]!, /You are near the time budget\. Commit what is coherent now, then call worker_result/);
       assert.equal(bodies.filter((b) => b.includes("You are near the time budget.")).length, 1);

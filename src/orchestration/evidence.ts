@@ -84,14 +84,20 @@ export function validateAcceptanceResults(raw: unknown, allowedIds: string[]): A
   });
 }
 
-export function normalizeReviewSeverity(severity: unknown): ReviewFinding["severity"] {
+/** Categories whose "high" findings are recorded but never block completion. */
+const NON_BLOCKING_HIGH_CATEGORIES = new Set(["missing_tests", "spec_gaps"]);
+
+export function normalizeReviewSeverity(severity: unknown, category?: unknown): ReviewFinding["severity"] {
   if (typeof severity !== "string") throw new Error("unsupported review severity: non-string value");
   switch (severity.trim().toLowerCase()) {
     case "blocker":
     case "critical":
-    case "high":
     case "blocking":
       return "blocking";
+    case "high":
+      // A high missing test or spec gap stays visible on the mission but does
+      // not block; any other high finding is a defect and blocks.
+      return typeof category === "string" && NON_BLOCKING_HIGH_CATEGORIES.has(category) ? "major" : "blocking";
     case "medium":
     case "major":
       return "major";
