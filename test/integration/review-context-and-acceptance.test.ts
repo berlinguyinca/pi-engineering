@@ -396,7 +396,7 @@ for (const [name, command] of [
   });
 }
 
-test("changed refs and planted hooks are detected, ignored-file writes are removed", async () => {
+test("moving the candidate branch or planting a hook fails the review; ignored output and other branches do not", async () => {
   const repo = mkdtempSync(join(tmpdir(), "pi-review-wide-"));
   const git = (...args: string[]) =>
     execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@t", ...args], { cwd: repo, encoding: "utf8" }).trim();
@@ -409,20 +409,26 @@ test("changed refs and planted hooks are detected, ignored-file writes are remov
     { acceptance_id: "AC-1", status: "passed", detail: "ok" },
     { acceptance_id: "AC-2", status: "passed", detail: "ok" },
   ];
+  const run = (command: string) =>
+    review(
+      { ...base, acceptance_results: results },
+      { worktree: repo, bashFirst: true, command, candidateSha: candidate },
+    );
   try {
-    for (const [command, reason, probe] of [
-      ["git branch evil", /git refs changed/, () => git("branch", "--list", "evil")],
-      ["echo x > .git/hooks/pre-commit", /hooks or config/, () => "x"],
-      ["echo x > ignored.log", /ignored files/, () => (existsSync(join(repo, "ignored.log")) ? "present" : "")],
+    // A concurrent session in the shared repo: another branch and a remote ref move. Not a violation.
+    const other = await run(
+      "git branch other-mission && git update-ref refs/remotes/origin/main HEAD && echo x > ignored.log",
+    );
+    assert.equal(other.outcome.exitStatus, "succeeded", other.outcome.summary);
+    assert.equal(existsSync(join(repo, "ignored.log")), false, "new ignored output was removed quietly");
+    for (const [command, reason] of [
+      ["git tag evil", /git refs changed/],
+      ["echo x > .git/hooks/pre-commit", /hooks or config/],
+      ["git -c user.name=x -c user.email=x@x commit -q --allow-empty -m s", /HEAD moved/],
     ] as const) {
-      const { outcome } = await review(
-        { ...base, acceptance_results: results },
-        { worktree: repo, bashFirst: true, command, candidateSha: candidate },
-      );
+      const { outcome } = await run(command);
       assert.equal(outcome.exitStatus, "failed", command);
       assert.match(outcome.error ?? "", reason, command);
-      if (command.includes("ignored.log")) assert.equal(probe(), "", "the new ignored file was removed");
-      else assert.notEqual(probe(), "", "refs and hooks are detected, not restored");
     }
   } finally {
     rmSync(repo, { recursive: true, force: true });

@@ -44,13 +44,27 @@ interface Snapshot {
   common: string;
 }
 
+/**
+ * Only refs the reviewer could meaningfully move for THIS candidate are watched:
+ * the worktree's own HEAD symbolic ref and its target branch, and tags. The
+ * common dir is shared with the user's real repository, where other sessions
+ * commit, fetch and create worker/candidate branches all the time, so comparing
+ * every ref (other branches, refs/remotes/*) would fail reviews at random.
+ */
+async function watchedRefs(cwd: string): Promise<string> {
+  const symbolic = (await git(cwd, ["symbolic-ref", "-q", "HEAD"]).catch(() => "")).trim();
+  const own = symbolic ? await git(cwd, ["for-each-ref", symbolic]) : "";
+  const tags = await git(cwd, ["for-each-ref", "refs/tags/"]);
+  return `${symbolic}\n${own}${tags}`;
+}
+
 async function snapshot(cwd: string): Promise<Snapshot> {
   const status = splitStatus(await git(cwd, ["status", "--porcelain", "--ignored"]));
   return {
     head: (await git(cwd, ["rev-parse", "HEAD"])).trim(),
     dirty: status.dirty,
     ignored: status.ignored,
-    refs: await git(cwd, ["for-each-ref"]),
+    refs: await watchedRefs(cwd),
     common: await commonDirHash(cwd),
   };
 }
@@ -67,6 +81,8 @@ async function restore(cwd: string, candidateSha: string, knownIgnored: Set<stri
 export interface ReviewGuard {
   /** Undefined when the candidate is intact; otherwise the reason. The worktree is restored first. */
   check(): Promise<string | undefined>;
+  /** New ignored paths the last check removed quietly (they do not fail the review). */
+  removedIgnored: string[];
 }
 
 /**
@@ -89,7 +105,8 @@ export async function guardReviewWorktree(cwd: string | undefined, candidateSha?
   }
   const expectedHead = candidateSha ?? start.head;
   const expectedDirty = candidateSha ? "" : start.dirty;
-  return {
+  const guard: ReviewGuard = {
+    removedIgnored: [],
     async check() {
       let now: Snapshot;
       try {
@@ -100,12 +117,19 @@ export async function guardReviewWorktree(cwd: string | undefined, candidateSha?
       const reasons: string[] = [];
       if (now.head !== expectedHead) reasons.push("HEAD moved");
       if (now.dirty !== expectedDirty) reasons.push("the working tree changed");
-      if ([...now.ignored].some((path) => !start.ignored.has(path))) reasons.push("ignored files were written");
+      // Test runs legitimately write ignored output (coverage, caches): remove it, never fail for it.
+      const strayIgnored = [...now.ignored].filter((path) => !start.ignored.has(path));
+      guard.removedIgnored = strayIgnored;
       if (now.refs !== start.refs) reasons.push("git refs changed");
       if (now.common !== start.common) reasons.push("shared git hooks or config changed");
-      if (reasons.length === 0) return undefined;
+      if (reasons.length === 0) {
+        for (const path of strayIgnored)
+          await rm(join(cwd, path), { recursive: true, force: true }).catch(() => undefined);
+        return undefined;
+      }
       if (candidateSha) await restore(cwd, candidateSha, start.ignored).catch(() => undefined);
       return `reviewer mutated the candidate (${reasons.join("; ")})`;
     },
   };
+  return guard;
 }

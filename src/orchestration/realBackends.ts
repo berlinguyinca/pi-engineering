@@ -1143,6 +1143,15 @@ export function realBackends(opts: RealBackendsOptions) {
         }
         const mutation = guard ? await guard.check() : undefined;
         if (mutation) invalidReasons.push(mutation);
+        if (guard?.removedIgnored.length) {
+          input.onActivity?.({
+            kind: "execution",
+            stage: "review",
+            phase: "started",
+            summary: `Removed ignored files the reviewer's commands wrote: ${guard.removedIgnored.slice(0, 5).join(", ")}`,
+            meaningfulProgress: false,
+          });
+        }
         const outputValid = invalidReasons.length === 0;
         const artifactEvidence = await artifactContentHashes(opts.artifacts, outcome.artifactRefs);
         outcome.reviewEvidence = {
