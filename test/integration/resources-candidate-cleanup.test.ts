@@ -15,7 +15,7 @@ import { CommandVerifier } from "../../src/verify/Verifier.ts";
 import { FakeWorkerExecutor } from "../../src/workers/FakeWorkerExecutor.ts";
 import { makeFixtureRepo } from "../fixtures/make-fixture.ts";
 
-const exec = promisify(execFile);
+const runFile = promisify(execFile);
 const GOAL = "Implement add(a, b) to return the sum of a and b";
 
 const scout = () => ({
@@ -39,7 +39,7 @@ const nothing = () => ({
 });
 
 async function branches(root: string): Promise<string[]> {
-  const r = await exec("git", ["-C", root, "branch", "--list", "pi-eng-*", "--format=%(refname:short)"]);
+  const r = await runFile("git", ["-C", root, "branch", "--list", "pi-eng-*", "--format=%(refname:short)"]);
   return r.stdout.split("\n").filter(Boolean);
 }
 
@@ -72,7 +72,7 @@ test("a failed removal leaves the record retained and records 1 ledger finding",
       reviewer,
       implementer: async (req) => {
         // Lock only the first candidate's worktree so its removal must fail.
-        if (++calls === 1) await exec("git", ["-C", fixture.root, "worktree", "lock", req.cwd]);
+        if (++calls === 1) await runFile("git", ["-C", fixture.root, "worktree", "lock", req.cwd]);
         return nothing();
       },
     });
@@ -88,7 +88,7 @@ test("a failed removal leaves the record retained and records 1 ledger finding",
     assert.equal(findings.length, 1, findings.map((f) => f.claim).join("\n"));
     assert.equal(findings[0]!.status, "open");
     const unlocked = retained[0]!.locator;
-    await exec("git", ["-C", fixture.root, "worktree", "unlock", unlocked]).catch(() => {});
+    await runFile("git", ["-C", fixture.root, "worktree", "unlock", unlocked]).catch(() => {});
     await rt.close();
   } finally {
     await fixture.cleanup();
@@ -101,7 +101,7 @@ test("a branch absent from the ResourceRegistry survives the rejection path", as
     const worker = new FakeWorkerExecutor({ scout, implementer: nothing, reviewer });
     const rt = await EngineeringRuntime.open({ cwd: fixture.root, worker, verifier: new CommandVerifier() });
     const report = await rt.engineer(GOAL);
-    await exec("git", ["-C", fixture.root, "branch", "pi-eng-foreign-branch"]);
+    await runFile("git", ["-C", fixture.root, "branch", "pi-eng-foreign-branch"]);
     await rt.releaseCandidate({ id: "CAND-unregistered", branch: "pi-eng-foreign-branch" }, report.work_item);
     assert.deepEqual(await branches(fixture.root), ["pi-eng-foreign-branch"]);
     await rt.close();
