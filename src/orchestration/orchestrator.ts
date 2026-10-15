@@ -462,15 +462,21 @@ export class Orchestrator {
           this.store.addFinding({
             mission_id: missionId,
             task_id: null,
-            severity: "blocking",
+            severity: diagnostic.blocking ? "blocking" : "minor",
             category: "persistence",
             file: diagnostic.file || null,
             line: null,
             summary: `Corrupt durable ${diagnostic.recordKind} record for ${diagnostic.repoId}`,
-            evidence: diagnostic.reason,
-            recommended_action: "Repair or quarantine the named durable record before mission recovery.",
+            evidence: diagnostic.quarantinedTo
+              ? `${diagnostic.reason} (quarantined to ${diagnostic.quarantinedTo})`
+              : diagnostic.reason,
+            recommended_action: diagnostic.quarantinedTo
+              ? "None required; the record was quarantined and the mission continues."
+              : "Inspect the named durable record; it does not block this mission.",
           });
         }
+      }
+      if (repositoryDiagnostics.some((diagnostic) => diagnostic.blocking)) {
         this.store.stopMission(missionId, {
           reason: "durable repository recovery records failed canonical identity validation",
           preservedWork: this.store

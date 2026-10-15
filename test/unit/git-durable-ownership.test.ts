@@ -137,7 +137,57 @@ test("records written from the main checkout are not reported as corrupt from a 
   }
 });
 
-test("an owned candidate record with a forged path still blocks a mission launched from a linked worktree", async () => {
+test("records from a different root or legacy records validate by content integrity, not path recomputation", async () => {
+  const env = await mainAndLinkedWorktree();
+  try {
+    const { main, mainRepoId, stateDir } = env;
+    const candidate = await main.createCandidateWorktree(await main.headCommit(), {
+      missionId: "MSN-root",
+      repoId: mainRepoId,
+      missionGeneration: 1,
+      candidateGeneration: 0,
+      repositoryGeneration: 1,
+      attempt: "EXC-root",
+    });
+    const name = candidateFileName(candidate);
+    const stored = JSON.parse(await readFile(join(stateDir, name), "utf8")) as CandidateLifecycle;
+    assert.equal(stored.rootHash, createHash("sha256").update(main.root).digest("hex"));
+    assert.equal((await main.loadCandidateLifecycleInventory("MSN-root", mainRepoId)).records.length, 1);
+
+    // Another install wrote the record: different rootHash and a path this root would never derive.
+    const other = { ...stored, rootHash: "0".repeat(64), path: join(main.root, "..", "other-install-path") };
+    const otherName = candidateFileName(other);
+    await writeFile(join(stateDir, otherName), JSON.stringify(other));
+    // Legacy record: no rootHash at all.
+    const { rootHash: _drop, ...legacyBase } = stored;
+    const legacy = {
+      ...legacyBase,
+      attempt: "EXC-legacy",
+      path: join(main.root, "..", "legacy-path"),
+    } as CandidateLifecycle;
+    legacy.candidateId = [
+      legacy.missionId,
+      legacy.repoId,
+      String(legacy.missionGeneration),
+      String(legacy.candidateGeneration),
+      legacy.attempt,
+    ]
+      .map((part) => Buffer.from(part).toString("base64url"))
+      .join(".");
+    legacy.branch = `pi-eng-candidate-${[legacy.missionId, legacy.repoId, legacy.missionGeneration, legacy.candidateGeneration, legacy.attempt].join("-").replace(/[^a-zA-Z0-9._-]/g, "-")}`;
+    const legacyName = candidateFileName(legacy);
+    await writeFile(join(stateDir, legacyName), JSON.stringify(legacy));
+
+    const inventory = await main.loadCandidateLifecycleInventory("MSN-root", mainRepoId);
+    assert.deepEqual(inventory.diagnostics, []);
+    assert.equal(inventory.records.length, 2, "same candidateId from two writers dedupes; legacy stays distinct");
+    assert.deepEqual((await readdir(stateDir)).includes("quarantine"), false);
+  } finally {
+    await env.fixture.cleanup();
+  }
+});
+
+test("a same-root record with a forged path is quarantined with a reason and does not block", async () => {
   const env = await mainAndLinkedWorktree();
   try {
     const { linked, linkedRepoId, stateDir } = env;
@@ -150,10 +200,9 @@ test("an owned candidate record with a forged path still blocks a mission launch
       repositoryGeneration: 1,
       attempt: "EXC-owned",
     });
-    assert.deepEqual(await broker.durableRepositoryDiagnostics(missionId), []);
-
-    const original = candidateFileName(candidate);
-    const forged = JSON.parse(await readFile(join(stateDir, original), "utf8")) as CandidateLifecycle;
+    const forged = JSON.parse(
+      await readFile(join(stateDir, candidateFileName(candidate)), "utf8"),
+    ) as CandidateLifecycle;
     forged.path = join(env.main.root, "..", "somewhere-else");
     const forgedName = candidateFileName(forged);
     await writeFile(join(stateDir, forgedName), JSON.stringify(forged));
@@ -161,57 +210,39 @@ test("an owned candidate record with a forged path still blocks a mission launch
     const diagnostics = await broker.durableRepositoryDiagnostics(missionId);
     assert.equal(diagnostics.length, 1);
     assert.equal(diagnostics[0]?.file, forgedName);
-    assert.equal(diagnostics[0]?.recordKind, "candidate");
     assert.match(diagnostics[0]?.reason ?? "", /candidate identity does not match/);
+    assert.equal(diagnostics[0]?.quarantinedTo, `quarantine/${forgedName}`);
+    assert.notEqual(diagnostics[0]?.blocking, true);
+    assert.ok(!(await readdir(stateDir)).includes(forgedName));
+    assert.ok((await readdir(join(stateDir, "quarantine"))).includes(forgedName));
+    assert.match(
+      await readFile(join(stateDir, "quarantine", `${forgedName}.reason.txt`), "utf8"),
+      /canonical filename/,
+    );
+    assert.deepEqual(await broker.durableRepositoryDiagnostics(missionId), []);
   } finally {
     await env.fixture.cleanup();
   }
 });
 
-test("a truly corrupt owned record still blocks, and unattributable records fail closed", async () => {
+test("an unparseable record is quarantined; it blocks only when it names this mission", async () => {
   const env = await mainAndLinkedWorktree();
   try {
-    const { main, linked, linkedRepoId, mainRepoId, stateDir } = env;
+    const { linked, linkedRepoId, stateDir } = env;
     const { broker, missionId } = brokerFor(linked, linkedRepoId, linked.root);
-    const candidate = await linked.createCandidateWorktree(await linked.headCommit(), {
-      missionId,
-      repoId: linkedRepoId,
-      missionGeneration: 1,
-      candidateGeneration: 0,
-      repositoryGeneration: 1,
-      attempt: "EXC-corrupt",
-    });
-    const ownName = candidateFileName(candidate);
-    const own = JSON.parse(await readFile(join(stateDir, ownName), "utf8")) as Record<string, unknown>;
-    // Owned payload whose content no longer hashes to its filename.
-    await writeFile(join(stateDir, ownName), JSON.stringify({ ...own, candidateSha: "f".repeat(40) }));
+    await mkdir(stateDir, { recursive: true });
+    await writeFile(join(stateDir, "candidate.unreadable.json"), "{not-json");
     let diagnostics = await broker.durableRepositoryDiagnostics(missionId);
     assert.equal(diagnostics.length, 1);
-    assert.equal(diagnostics[0]?.file, ownName);
+    assert.equal(diagnostics[0]?.blocking, false);
+    assert.equal(diagnostics[0]?.quarantinedTo, "quarantine/candidate.unreadable.json");
+    assert.ok((await readdir(join(stateDir, "quarantine"))).includes("candidate.unreadable.json"));
 
-    // A payload rewritten to claim a foreign owner, but whose filename does not
-    // match that claim, cannot be attributed and must not be silently ignored.
-    await writeFile(
-      join(stateDir, ownName),
-      JSON.stringify({ ...own, missionId: "MSN-someone-else", repoId: mainRepoId }),
-    );
+    await writeFile(join(stateDir, "candidate.mine.json"), `{"missionId":"${missionId}", truncated`);
     diagnostics = await broker.durableRepositoryDiagnostics(missionId);
     assert.equal(diagnostics.length, 1);
-    assert.equal(diagnostics[0]?.file, ownName);
-
-    // An unreadable record has no provable owner either.
-    await writeFile(join(stateDir, ownName), JSON.stringify(own));
-    await writeFile(join(stateDir, "candidate.unreadable.json"), "{not-json");
-    diagnostics = await broker.durableRepositoryDiagnostics(missionId);
-    assert.deepEqual(
-      diagnostics.map((d) => d.file),
-      ["candidate.unreadable.json"],
-    );
-
-    // The owning mission of the main root is likewise still blocked by that file.
-    const mainInventory = await main.loadCandidateLifecycleInventory("MSN-other", mainRepoId);
-    assert.equal(mainInventory.diagnostics.length, 1);
-    assert.ok((await readdir(stateDir)).includes(ownName), "records are never deleted or rewritten by a load");
+    assert.equal(diagnostics[0]?.blocking, true);
+    assert.ok((await readdir(join(stateDir, "quarantine"))).includes("candidate.mine.json"));
   } finally {
     await env.fixture.cleanup();
   }

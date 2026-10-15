@@ -8,7 +8,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import { promisify } from "node:util";
@@ -188,6 +188,7 @@ function blockedRepairHarness(
     failOwnershipRelease?: boolean;
     withOwnership?: boolean;
     ownership?: MissionOwnership;
+    git?: GitRepo;
   } = {},
 ) {
   const backend = JsonlEventStore.inMemory();
@@ -372,7 +373,7 @@ function blockedRepairHarness(
   } as never;
   const orchestrator = new Orchestrator({
     store,
-    git: lifecycleInventoryGit,
+    git: options.git ?? lifecycleInventoryGit,
     backends: {
       agent: {
         runAgent: async (input) => {
@@ -714,6 +715,31 @@ async function realGateRepairHarness(emptyRepair: boolean, race?: "integration" 
 }
 
 describe("orchestrator: durable blocked-mission repair", () => {
+  it("continues past a foreign mismatched record and a quarantined bad record instead of stopping", async () => {
+    const fixture = await makeFixtureRepo();
+    try {
+      const git = (await GitRepo.open(fixture.root))!;
+      const dir = join(await git.commonDir(), "pi-engineering-candidates");
+      await mkdir(dir, { recursive: true });
+      // Foreign mission record whose filename does not match its content.
+      await writeFile(
+        join(dir, "candidate.foreign.json"),
+        JSON.stringify({ missionId: "MSN-someone-else", repoId: "repo-other", path: "/elsewhere" }),
+      );
+      // Unparseable record naming no mission.
+      await writeFile(join(dir, "candidate.garbage.json"), "{not-json");
+      const h = blockedRepairHarness({ git });
+      const repaired = await h.orchestrator.repairBlockedMission(h.missionId);
+      assert.equal(repaired.status, "COMPLETE");
+      assert.deepEqual(h.store.listMissionStops(h.missionId), []);
+      assert.ok(h.store.listFindings(h.missionId).every((finding) => finding.severity !== "blocking"));
+      assert.ok((await readdir(dir)).includes("candidate.foreign.json"), "foreign records stay in place");
+      assert.ok((await readdir(join(dir, "quarantine"))).includes("candidate.garbage.json"));
+    } finally {
+      await fixture.cleanup();
+    }
+  });
+
   it("writes the repair before BLOCKED -> REPAIRING, splits checkpoint remainder, and records supersession", async () => {
     const h = blockedRepairHarness();
     const repaired = await h.orchestrator.repairBlockedMission(h.missionId);

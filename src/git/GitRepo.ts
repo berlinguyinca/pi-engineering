@@ -69,6 +69,8 @@ export interface CandidateRecord {
   path: string;
   baseSha: string;
   candidateSha: string;
+  /** Hash of the canonical repo root which wrote this record; absent on legacy records. */
+  rootHash?: string;
   state: "integrating" | "preserved" | "promotion_intent" | "promoted";
   /** Legacy journals are read for backwards compatibility only. */
   merges?: CandidateMergeLifecycle[];
@@ -180,9 +182,18 @@ export interface PendingBranchCleanupInventory {
   diagnostics: Array<{ file: string; reason: string }>;
 }
 
+export interface DurableRecordDiagnostic {
+  file: string;
+  reason: string;
+  /** Where a failing record was moved (`quarantine/<name>`), when it was quarantined. */
+  quarantinedTo?: string;
+  /** True only for an unreadable record that names this mission; everything else is advisory. */
+  blocking?: boolean;
+}
+
 export interface DurableRecordInventory<T> {
   records: T[];
-  diagnostics: Array<{ file: string; reason: string }>;
+  diagnostics: DurableRecordDiagnostic[];
 }
 
 /**
@@ -329,25 +340,26 @@ export class GitRepo {
    * identity (the candidate worktree path) derive from the root that wrote
    * them, so validating them from another root reports false corruption.
    *
-   * Attribution is only trusted when the payload hashes to its own filename,
-   * i.e. the record is self-consistent. A record whose payload was altered,
-   * or that is unreadable, has no provable owner and stays subject to the
-   * caller's full fail-closed validation.
+   * Candidate records are attributed by a parseable, differing owner alone:
+   * foreign candidates are never a reason to stop or quarantine. The other
+   * journals pass `canonical` and additionally require the payload to hash to
+   * its own filename. Unreadable records name no owner and stay subject to the
+   * caller's validation.
    */
   private isForeignDurableRecord<T extends { missionId?: unknown; repoId?: unknown }>(
     parsed: T,
-    file: string,
-    canonicalName: (record: T) => string,
     missionId: string,
     repoId: string,
+    canonical?: { file: string; name: (record: T) => string },
   ): boolean {
     if (typeof parsed !== "object" || parsed === null) return false;
     const owner = parsed as { missionId?: unknown; repoId?: unknown };
     if (typeof owner.missionId !== "string" || owner.missionId.trim().length === 0) return false;
     if (typeof owner.repoId !== "string" || owner.repoId.trim().length === 0) return false;
     if (owner.missionId === missionId && owner.repoId === repoId) return false;
+    if (!canonical) return true;
     try {
-      return file === canonicalName(parsed);
+      return canonical.file === canonical.name(parsed);
     } catch {
       return false;
     }
@@ -356,6 +368,23 @@ export class GitRepo {
   private durableIdentityName(prefix: string, parts: Array<string | number>): string {
     const digest = createHash("sha256").update(JSON.stringify(parts)).digest("hex");
     return `${prefix}.${digest}.json`;
+  }
+
+  private currentRootHash(): string {
+    return createHash("sha256").update(this.repoRoot).digest("hex");
+  }
+
+  /** Moves a failing record aside with a reason sidecar; the mission continues. */
+  private async quarantineRecord(dir: string, name: string, reason: string): Promise<string | undefined> {
+    try {
+      const qdir = join(dir, "quarantine");
+      await mkdir(qdir, { recursive: true });
+      await writeFile(join(qdir, `${name}.reason.txt`), `${reason}\n`, "utf8");
+      await rename(join(dir, name), join(qdir, name));
+      return `quarantine/${name}`;
+    } catch {
+      return undefined;
+    }
   }
 
   private candidateStateName(record: CandidateRecord): string {
@@ -455,7 +484,12 @@ export class GitRepo {
       if (!name.startsWith("cleanup.") || !name.endsWith(".json")) continue;
       try {
         const parsed = JSON.parse(await readFile(join(dir, name), "utf8")) as PendingBranchCleanup;
-        if (this.isForeignDurableRecord(parsed, name, (r) => this.branchCleanupStateName(r), missionId, repoId)) {
+        if (
+          this.isForeignDurableRecord(parsed, missionId, repoId, {
+            file: name,
+            name: (r) => this.branchCleanupStateName(r),
+          })
+        ) {
           continue;
         }
         const structurallyValid =
@@ -520,6 +554,7 @@ export class GitRepo {
     const dir = await this.candidateStateDir();
     const target = join(dir, this.candidateStateName(record));
     const temporary = `${target}.${process.pid}.${randomUUID()}.tmp`;
+    record.rootHash ??= this.currentRootHash();
     await writeFile(temporary, JSON.stringify(record), "utf8");
     guard?.assertAuthoritative();
     await rename(temporary, target);
@@ -551,7 +586,7 @@ export class GitRepo {
     const dir = await this.candidateStateDir(false);
     const records: CandidateLifecycle[] = [];
     const recordFiles = new Map<string, string>();
-    const diagnostics: Array<{ file: string; reason: string }> = [];
+    const diagnostics: DurableRecordDiagnostic[] = [];
     for (const name of await readdir(dir).catch(() => [] as string[])) {
       if (!name.endsWith(".json")) continue;
       try {
@@ -565,7 +600,7 @@ export class GitRepo {
         const parsed = JSON.parse(await readFile(join(dir, name), "utf8")) as CandidateLifecycle;
         // The expected worktree path below derives from this checkout's root,
         // so it is only meaningful for records this (missionId, repoId) owns.
-        if (this.isForeignDurableRecord(parsed, name, (r) => this.candidateStateName(r), missionId, repoId)) continue;
+        if (this.isForeignDurableRecord(parsed, missionId, repoId)) continue;
         if (
           typeof parsed.missionId === "string" &&
           parsed.missionId.trim().length > 0 &&
@@ -597,14 +632,18 @@ export class GitRepo {
           const derivedCandidateId = this.candidateId(parsed);
           const canonical = { ...parsed, candidateId: derivedCandidateId };
           const expectedBranch = this.candidateBranch(parsed);
-          const expectedPath = this.worktreePath(expectedBranch);
+          // The expected worktree path derives from this checkout's root, so it is
+          // only comparable for records stamped with this very root. Legacy and
+          // other-root records are validated by content integrity alone.
+          const pathComparable = parsed.rootHash === this.currentRootHash();
           if (
             parsed.candidateId !== derivedCandidateId ||
             parsed.branch !== expectedBranch ||
-            parsed.path !== expectedPath ||
+            (pathComparable && parsed.path !== this.worktreePath(expectedBranch)) ||
             name !== this.candidateStateName(canonical)
           ) {
-            diagnostics.push({ file: name, reason: "candidate identity does not match canonical filename" });
+            const reason = "candidate identity does not match canonical filename";
+            diagnostics.push({ file: name, reason, quarantinedTo: await this.quarantineRecord(dir, name, reason) });
             continue;
           }
           if (parsed.missionId === missionId && parsed.repoId === repoId) {
@@ -612,12 +651,18 @@ export class GitRepo {
             recordFiles.set(canonical.candidateId, name);
           }
         } else {
-          diagnostics.push({ file: name, reason: "candidate record has invalid or empty identity fields" });
+          const reason = "candidate record has invalid or empty identity fields";
+          diagnostics.push({ file: name, reason, quarantinedTo: await this.quarantineRecord(dir, name, reason) });
         }
       } catch (error) {
+        const reason = `candidate record is unreadable: ${error instanceof Error ? error.message : String(error)}`;
+        const raw = await readFile(join(dir, name), "utf8").catch(() => "");
+        const blocking = raw.includes(JSON.stringify(missionId));
         diagnostics.push({
           file: name,
-          reason: `candidate record is unreadable: ${error instanceof Error ? error.message : String(error)}`,
+          reason,
+          blocking,
+          quarantinedTo: await this.quarantineRecord(dir, name, reason),
         });
       }
     }
@@ -674,7 +719,12 @@ export class GitRepo {
       if (!name.startsWith("run.") || !name.endsWith(".json")) continue;
       try {
         const parsed = JSON.parse(await readFile(join(dir, name), "utf8")) as IntegrationRunRecord;
-        if (this.isForeignDurableRecord(parsed, name, (r) => this.integrationRunStateName(r), missionId, repoId)) {
+        if (
+          this.isForeignDurableRecord(parsed, missionId, repoId, {
+            file: name,
+            name: (r) => this.integrationRunStateName(r),
+          })
+        ) {
           continue;
         }
         if (
@@ -778,7 +828,13 @@ export class GitRepo {
       if (!name.startsWith("promotion.") || !name.endsWith(".json")) continue;
       try {
         const parsed = JSON.parse(await readFile(join(dir, name), "utf8")) as PromotionLifecycle;
-        if (this.isForeignDurableRecord(parsed, name, (r) => this.promotionStateName(r), missionId, repoId)) continue;
+        if (
+          this.isForeignDurableRecord(parsed, missionId, repoId, {
+            file: name,
+            name: (r) => this.promotionStateName(r),
+          })
+        )
+          continue;
         if (
           typeof parsed.missionId === "string" &&
           parsed.missionId.trim().length > 0 &&

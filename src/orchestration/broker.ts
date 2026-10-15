@@ -182,6 +182,8 @@ export interface DurableRepositoryDiagnostic {
   recordKind: "candidate" | "integration-run" | "promotion" | "cleanup" | "repository";
   file: string;
   reason: string;
+  quarantinedTo?: string;
+  blocking?: boolean;
 }
 
 type BackendSettlement =
