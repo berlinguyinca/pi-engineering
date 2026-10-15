@@ -53,6 +53,22 @@ function isRepositoryIdentity(identity: OwnershipIdentity): identity is Reposito
 }
 
 /** Durable single-controller leases backed exclusively by MissionStore events. */
+const CUSTODY_FIRST_PAUSE_MS = 250;
+
+/** Another mission holds the repository lease: a wait condition, not a failure. */
+export class RepositoryLeasedError extends Error {
+  readonly repoId: string;
+  readonly holderMissionId: string;
+  readonly holderOwnerId: string;
+  constructor(repoId: string, holderMissionId: string, holderOwnerId: string) {
+    super(`repository ${repoId} is leased to mission ${holderMissionId} by ${holderOwnerId}`);
+    this.name = "RepositoryLeasedError";
+    this.repoId = repoId;
+    this.holderMissionId = holderMissionId;
+    this.holderOwnerId = holderOwnerId;
+  }
+}
+
 export class MissionOwnership {
   private readonly store: MissionStore;
   private readonly ownerId: string;
@@ -113,7 +129,12 @@ export class MissionOwnership {
     // The poll budget is counted as well as timed, so the wait is bounded even
     // when the injected clock does not advance (tests, frozen timers).
     const deadline = this.now() + this.custodyWaitMs;
-    const maxPolls = Math.max(1, Math.ceil(this.custodyWaitMs / this.custodyPollMs) + 1);
+    // Backoff, not a fixed cadence: a release is usually quick, so start with
+    // short pauses and grow to the configured poll interval. The ceiling is the
+    // same custodyWaitMs; the poll count bound holds even with a frozen clock.
+    const firstPauseMs = Math.min(CUSTODY_FIRST_PAUSE_MS, this.custodyPollMs);
+    const maxPolls = Math.max(1, Math.ceil(this.custodyWaitMs / firstPauseMs) + 1);
+    let backoffMs = firstPauseMs;
     let waitedMs = 0;
     let holder = "";
     for (let poll = 0; poll < maxPolls; poll++) {
@@ -124,9 +145,10 @@ export class MissionOwnership {
       }
       holder = claim.holder;
       if (this.now() >= deadline) break;
-      const pause = Math.min(this.custodyPollMs, Math.max(1, deadline - this.now()));
+      const pause = Math.min(backoffMs, Math.max(1, deadline - this.now()));
       await this.sleep(pause);
       waitedMs += pause;
+      backoffMs = Math.min(backoffMs * 2, this.custodyPollMs);
     }
     throw new Error(
       `${what} is in the custody of another live session (${holder}). Waited ${Math.round(
@@ -231,7 +253,7 @@ export class MissionOwnership {
     const now = this.now();
     if (current && !this.isExpired(current, now) && !this.heldByGoneOwner(current)) {
       if (current.missionId !== identity.missionId || current.ownerId !== identity.ownerId) {
-        throw new Error(`repository ${repoId} is leased to mission ${current.missionId} by ${current.ownerId}`);
+        throw new RepositoryLeasedError(repoId, current.missionId, current.ownerId);
       }
       const renewed = await this.renewRepository(current);
       const key = this.repositoryEpochKey(renewed);

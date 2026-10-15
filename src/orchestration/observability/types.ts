@@ -40,6 +40,7 @@ export type WaitingReason =
   | "credential"
   | "rate_limit"
   | "model_request"
+  | "repository_lease"
   | "other";
 
 /** Observable activity kinds (spec 02). */

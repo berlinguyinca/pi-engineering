@@ -1250,8 +1250,18 @@ export class MissionObservability {
     const lease = this.store.getMissionLease(missionId);
     const manifest = this.store.getWorkspaceManifest(missionId);
     const classification = this.store.listFailureClassifications(missionId).at(-1);
+    const repositoryWaits = this.store.listRepositoryWaits(missionId);
+    const repositoryWaitText = repositoryWaits.length
+      ? repositoryWaits
+          .map((wait) => `${wait.taskId} waits for repository ${wait.repoId} (held by mission ${wait.holderMissionId})`)
+          .join("; ")
+      : undefined;
     const nextAction =
-      stop?.resumeCondition ?? recovery?.expectedMaterialChange ?? task?.objective ?? "No further action is scheduled";
+      stop?.resumeCondition ??
+      recovery?.expectedMaterialChange ??
+      (repositoryWaitText ? `Waiting: ${repositoryWaitText}` : undefined) ??
+      task?.objective ??
+      "No further action is scheduled";
     return {
       action:
         recovery?.action ??
@@ -1260,7 +1270,11 @@ export class MissionObservability {
         this.store.getMission(missionId)?.status ??
         "UNKNOWN",
       reason:
-        stop?.reason ?? classification?.summary ?? recovery?.expectedMaterialChange ?? `Mission health is ${health}`,
+        stop?.reason ??
+        repositoryWaitText ??
+        classification?.summary ??
+        recovery?.expectedMaterialChange ??
+        `Mission health is ${health}`,
       recovery: {
         attempt: recovery?.attempt ?? 0,
         maxAttempts: recovery?.maxAttempts ?? 0,

@@ -364,6 +364,9 @@ export interface IntegrationRunner {
   }): Promise<ExecutionOutcome>;
 }
 
+/** Prefix of the activity notice a validation emits when it reuses a stored verification result. */
+export const VERIFY_CACHE_NOTICE = "verify.cache:";
+
 export interface ValidationRunner {
   candidateScoped?: boolean;
   runValidation(input: {
@@ -374,7 +377,10 @@ export interface ValidationRunner {
     baseSha?: string;
     testRequirement?: string;
     signal: AbortSignal;
+    onActivity?: (event: WorkerActivity) => void;
   }): Promise<ExecutionOutcome>;
+  /** True when `runValidation` on this candidate would reuse a stored verification result. */
+  willReuse?(input: { repoId?: string; worktree?: string | null; baseSha?: string }): Promise<boolean>;
 }
 
 export interface BrokerBackends {
@@ -593,6 +599,7 @@ export class ExecutionBroker {
    */
   private readonly nestedBaselines = new Map<string, Promise<Map<string, string>>>();
   /** Isolated integration candidates. Failed/red/canceled candidates remain inspectable. */
+  private readonly reuseSignals = new Map<string, (reused: boolean) => void>();
   private readonly missionCandidates = new Map<string, { lifecycle: CandidateLifecycle; git: GitRepo }>();
   /** Commit each mission's worktrees were actually forked from (landing invariant). */
   private readonly resolvedBases = new Map<string, string>();
@@ -3714,9 +3721,47 @@ export class ExecutionBroker {
             ...(candidateLifecycle?.baseSha ? { baseSha: candidateLifecycle.baseSha } : {}),
             testRequirement: input.testRequirement,
             signal,
+            onActivity: (event) => {
+              if (event.summary.startsWith(VERIFY_CACHE_NOTICE)) this.reuseSignals.get(input.missionId)?.(true);
+              onActivity(event);
+            },
           }),
         );
       }
     }
+  }
+
+  /**
+   * Resolves true once the mission's running validation reports that it reused a
+   * stored verification result, false if it settles without doing so (it ran the
+   * suite for real). Lets the orchestrator start the review beside a reused
+   * validation only after the reuse actually happened.
+   */
+  watchValidationReuse(missionId: string): { confirmed: Promise<boolean>; settle(): void } {
+    let resolve: (reused: boolean) => void = () => {};
+    const confirmed = new Promise<boolean>((r) => {
+      resolve = r;
+    });
+    this.reuseSignals.set(missionId, resolve);
+    return {
+      confirmed,
+      settle: () => {
+        resolve(false);
+        this.reuseSignals.delete(missionId);
+      },
+    };
+  }
+
+  /** True when the mission's validation would reuse the integration run's verification result. */
+  async validationWillReuse(missionId: string, repoId: string | undefined): Promise<boolean> {
+    const candidate = this.missionCandidates.get(missionId)?.lifecycle;
+    if (!candidate?.path) return false;
+    return (
+      (await this.backends.validation?.willReuse?.({
+        repoId,
+        worktree: candidate.path,
+        ...(candidate.baseSha ? { baseSha: candidate.baseSha } : {}),
+      })) ?? false
+    );
   }
 }
