@@ -1148,8 +1148,19 @@ describe("orchestrator: durable blocked-mission repair", () => {
       expectedReplacementFingerprints: { [taskId]: "sha256:forged" },
     });
 
-    const repaired = await h.orchestrator.repairBlockedMission(h.missionId);
+    // A forged replay is a deterministic integrity failure: it must terminate
+    // with a rejection, never loop through retries (issue #160).
+    const startedAt = Date.now();
+    let deadline: NodeJS.Timeout | undefined;
+    const repaired = await Promise.race([
+      h.orchestrator.repairBlockedMission(h.missionId),
+      new Promise<never>((_resolve, reject) => {
+        deadline = setTimeout(() => reject(new Error("repairBlockedMission did not terminate within 5s")), 5000);
+      }),
+    ]).finally(() => clearTimeout(deadline));
+    assert.ok(Date.now() - startedAt < 5000);
     assert.equal(repaired.status, "BLOCKED");
+    assert.ok(h.store.listRecoveryDecisions(h.missionId).length <= 4, "recovery decisions must stay bounded");
     assert.ok(
       h.store
         .listFailureClassifications(h.missionId)
