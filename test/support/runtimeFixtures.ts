@@ -154,6 +154,8 @@ export async function createRuntime(ctx: any) {
       ctx.pi.on("session_start", () => b.values.push("session_start:" + VALUE));
       ctx.pi.registerCommand("probe", {
         description: "fixture probe " + VALUE,
+        // Legacy shape (bare strings): the bridge must normalise to items.
+        getArgumentCompletions: (p) => ["verbose", "version"].filter((n) => n.startsWith(p)),
         handler: async () => {
           b.values.push("cmd:" + VALUE);
         },

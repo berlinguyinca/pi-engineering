@@ -14,6 +14,7 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { type ExtensionAPI, VERSION as PI_VERSION } from "@earendil-works/pi-coding-agent";
+import type { AutocompleteItem } from "@earendil-works/pi-tui";
 import { SourceCache, type TrustedSource, type UpdateChannel } from "../../update/gitSource.ts";
 import { InstallLayout } from "../../update/installLayout.ts";
 import { UpdateJournal } from "../../update/journal.ts";
@@ -28,6 +29,7 @@ import { DEFAULT_CHECK_INTERVAL_MS, shouldCheck } from "../../update/selfUpdate.
 import { runActivation } from "../../update/transaction.ts";
 import type { ValidationMode } from "../../update/validate.ts";
 import { readStateSchema } from "../migrations/schema.ts";
+import { toAutocompleteItems } from "./completions.ts";
 import { HOST_SUPPORTED_RUNTIME_APIS, PI_ENGINEERING_RUNTIME_API } from "./contract.ts";
 import { ago, formatHandover, short, waitingText } from "./format.ts";
 import { type HandoverHooks, type HandoverResult, type HandoverTask, RuntimeBusyError, RuntimeHost } from "./host.ts";
@@ -765,11 +767,11 @@ export class EngineeringHostExtension {
     ];
   }
 
-  private pieCompletions(prefix: string): string[] | null {
+  private pieCompletions(prefix: string): AutocompleteItem[] | null {
     const head = (prefix ?? "").trimStart();
     if (/\s/.test(head)) return null;
     const names = this.pieNames().filter((n) => n.startsWith(head));
-    return names.length > 0 ? names.sort() : null;
+    return toAutocompleteItems(names.sort());
   }
 
   /**
