@@ -181,7 +181,7 @@ export function childSignature(members: GroupProcess[]): string {
 function processIoBytes(pid: number): number {
   try {
     const text = readFileSync(`/proc/${pid}/io`, "utf8");
-    const field = (name: string): number => Number(new RegExp(`^${name}: (\\d+)`, "m").exec(text)?.[1] ?? 0);
+    const field = (name: string): number => Number(text.match(new RegExp(`^${name}: (\\d+)`, "m"))?.[1] ?? 0);
     return field("rchar") + field("wchar");
   } catch {
     return 0;
