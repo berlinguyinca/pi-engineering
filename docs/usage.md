@@ -366,6 +366,13 @@ artifact or `checkpoint_progress` tools: they commit when a step is done, and
 the broker harvests uncommitted work and derives the checkpoint from the branch.
 Scouts and reviewers keep their read-only semantic tools.
 
+## Repair rounds and the degeneration guard
+
+- One repair contract per round: all open blocking findings go to a single repair implementer task whose objective lists every finding (id, severity, file:line, summary, suggestion). Each finding is still resolved or left open individually after the round. The round limit is unchanged (`maxRepairRounds`, default 2).
+- Only `blocker`/`critical` (and `blocking`) findings block completion. `high`, `medium` and `major` findings, including `missing_tests` and `spec_gaps`, are recorded on the mission as non-blocking `major` findings.
+- A failed integration is re-merged onto the current base up to twice before the mission stops; no LLM repair task is created for a merge or infrastructure failure. Only gates that ran and failed on the candidate become a code-repair task.
+- Worker degeneration guard defaults are 2000 narration tokens before the first action and 4000 tokens without progress (`PI_GUARD_MAX_NARRATION_TOKENS`, `PI_GUARD_MAX_REASONING_TOKENS`). The first trip steers inside the same session with a short corrective turn; only a second trip restarts a fresh session. Reviewer sessions no longer receive the Tool Transition Rule.
+
 ## Tool-call guard
 
 The extension guards the session's own tool calls (`src/guard/toolCallGuard.ts`,

@@ -397,7 +397,7 @@ describe("realBackends capability routing", () => {
     assert.equal(outcome.reviewEvidence?.verdict, "approve");
   });
 
-  it("turns blocking missing tests and spec gaps into blocking review findings", async () => {
+  it("blocks only on critical spec gaps; a high missing test is recorded as major", async () => {
     const worker: WorkerExecutor = {
       async run() {
         return {
@@ -429,7 +429,9 @@ describe("realBackends capability routing", () => {
       signal: new AbortController().signal,
     });
     assert.equal(outcome.reviewEvidence?.outputValid, true);
-    assert.equal(outcome.reviewEvidence?.findings.filter((finding) => finding.severity === "blocking").length, 2);
+    const findings = outcome.reviewEvidence?.findings ?? [];
+    assert.equal(findings.filter((finding) => finding.severity === "blocking").length, 1);
+    assert.equal(findings.filter((finding) => finding.severity === "major").length, 1);
   });
 });
 

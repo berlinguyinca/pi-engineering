@@ -254,6 +254,27 @@ const STRANDED_WORKER_WORK = "stranded_worker_work";
 const READOPT_OBJECTIVE_PREFIX = "Re-adopt preserved worker branch:";
 /** Failed re-adoptions of stranded work before the mission restarts it from base. */
 const MAX_READOPTIONS = 2;
+/** Deterministic re-merges of a failed integration before the mission stops. */
+const MAX_DETERMINISTIC_MERGE_RETRIES = 2;
+
+/** The single repair contract of a round: every open blocking finding, in one objective. */
+function repairContractObjective(
+  findings: ReadonlyArray<{
+    finding_id: string;
+    severity: string;
+    category: string;
+    file: string | null;
+    line: number | null;
+    summary: string;
+    recommended_action: string;
+  }>,
+): string {
+  const lines = findings.map((f, index) => {
+    const where = f.file ? `${f.file}${f.line ? `:${f.line}` : ""}` : "n/a";
+    return `${index + 1}. [${f.finding_id}] severity=${f.severity} category=${f.category} location=${where}\n   summary: ${f.summary}\n   suggestion: ${f.recommended_action || "n/a"}`;
+  });
+  return `Repair contract: resolve ALL ${findings.length} open blocking finding(s) below in this one session, then leave the change ready to integrate.\n${lines.join("\n")}`;
+}
 
 /** Content hash of an empty diff: a candidate identical to its base. */
 const EMPTY_DIFF_HASH = `sha256:${createHash("sha256").update("").digest("hex")}`;
@@ -2247,6 +2268,7 @@ export class Orchestrator {
         ? this.maxRepairRounds
         : this.store.listRecoveryDecisions(missionId).filter((decision) => decision.action === "CREATE_REPAIR_TASKS")
             .length;
+    let mergeRetries = 0;
     while ((!verdict.can_complete || !integrated) && repairRounds < this.maxRepairRounds) {
       if (signal?.aborted) return this.canceledFinalization(missionId, signal);
       const openBlocking = this.store
@@ -2419,6 +2441,52 @@ export class Orchestrator {
         }
         continue;
       }
+      // A gate that died without judging the candidate (merge failure,
+      // infrastructure) is not a code defect, so no LLM repair task is created
+      // for it. A failed merge is first retried deterministically against the
+      // current base; once that budget is spent the mission stops with the
+      // preserved work named.
+      const codeFailedGates = failedGates.filter((gateTask) => {
+        const entry = this.store
+          .listFailureClassifications(missionId)
+          .reverse()
+          .find((candidate) => candidate.taskId === gateTask.task_id);
+        const category = entry ? this.rederiveLegacyGateClassification(entry).category : undefined;
+        return gateTask.kind !== "integration" && (category === "VALIDATION_FAILED" || category === "REVIEW_FAILED");
+      });
+      if (openBlocking.length === 0 && codeFailedGates.length === 0 && blockerTask) {
+        if (blockerTask.kind === "integration" && mergeRetries < MAX_DETERMINISTIC_MERGE_RETRIES) {
+          mergeRetries++;
+          repairRounds--;
+          if (this.store.getMission(missionId)!.status !== "REPAIRING") {
+            this.store.transitionMission(missionId, "REPAIRING");
+          }
+          this.report(
+            missionId,
+            `[mission ${missionId}] integration failed; retrying the merge onto the current base (${mergeRetries}/${MAX_DETERMINISTIC_MERGE_RETRIES})`,
+          );
+          post = await this.postExecution(this.store.getMission(missionId)!, signal);
+          if (signal?.aborted) return this.canceledFinalization(missionId, signal);
+          integrated = post.integrationOk;
+          verdict = this.gate.evaluate(this.store.getMission(missionId)!);
+          continue;
+        }
+        const stopRecovery =
+          this.store.getRecoveryDecision(recoveryChoice.recoveryId) ?? this.store.planRecovery(recoveryChoice);
+        if (stopRecovery.status === "planned") this.store.transitionRecovery(stopRecovery.recoveryId, "started");
+        this.store.transitionRecovery(stopRecovery.recoveryId, "failed");
+        this.store.stopMission(missionId, {
+          reason: `${blockerTask.kind} gate failed without judging the candidate: ${blockerTask.failure_reason ?? classification.summary}`,
+          preservedWork: await this.preservedMissionWork(missionId),
+          attemptedRecoveries: this.store.listRecoveryDecisions(missionId).map((decision) => decision.recoveryId),
+          resumeCondition:
+            blockerTask.kind === "integration"
+              ? "rebase the preserved branch(es) onto the current base and re-integrate, or explicitly discard them"
+              : `resume the mission once the ${blockerTask.kind} gate can run; the candidate is unchanged`,
+        });
+        await this.store.flush();
+        break;
+      }
       const gateRecovery =
         this.store.getRecoveryDecision(recoveryChoice.recoveryId) ??
         this.store.planRecovery({
@@ -2454,45 +2522,54 @@ export class Orchestrator {
               task.repair_base_candidate_sha === tip &&
               task.objective.startsWith(READOPT_OBJECTIVE_PREFIX),
           ).length;
-      const objectives: Array<{ objective: string; findingId?: string; baseSha?: string; adoptedTaskId?: string }> =
-        openBlocking.map((f) => {
-          const where = f.file ? ` [${f.file}${f.line ? `:${f.line}` : ""}]` : "";
-          if (f.category !== STRANDED_WORKER_WORK || !f.evidence) {
-            return {
-              objective: `Repair review finding (${f.category})${where}: ${f.summary} — recommended: ${f.recommended_action || "n/a"}`,
-              findingId: f.finding_id,
-            };
-          }
-          const readoptFailures = readoptFailuresFor(f.evidence);
-          if (readoptFailures >= MAX_READOPTIONS) {
-            // Re-adopting this work keeps failing: stop building on it. The
-            // branch stays preserved; the replacement redoes the work from base.
-            this.store.resolveFinding(f.finding_id);
-            this.store.addFinding({
-              mission_id: missionId,
-              task_id: f.task_id,
-              severity: "minor",
-              category: STRANDED_WORKER_WORK,
-              file: null,
-              line: null,
-              summary: `Stranded worker work at ${f.evidence} was discarded as a starting point after ${readoptFailures} failed re-adoptions; its branch stays preserved and the work restarts from the mission base`,
-              evidence: f.evidence,
-              recommended_action: "Inspect the preserved branch manually if its commits are still wanted.",
-            });
-            return {
-              objective: `Complete the mission objective from the mission base. An earlier worker's preserved branch (${f.evidence}) was abandoned after ${readoptFailures} failed re-adoptions. Original finding: ${f.summary}`,
-              adoptedTaskId: f.task_id ?? undefined,
-            };
-          }
-          return {
-            objective: `${READOPT_OBJECTIVE_PREFIX} ${f.summary}. Your starting point is partial, unreviewed output from a crashed worker (commit ${f.evidence}); it may be truncated or wrong, so verify it before building on it and finish the remaining work.`,
-            findingId: f.finding_id,
-            baseSha: f.evidence,
+      type RepairObjective = { objective: string; findingIds?: string[]; baseSha?: string; adoptedTaskId?: string };
+      const objectives: RepairObjective[] = [];
+      // Ordinary findings share ONE repair contract per round; stranded work is
+      // the exception because each preserved tip is a different starting point.
+      const contractFindings: typeof openBlocking = [];
+      for (const f of openBlocking) {
+        if (f.category !== STRANDED_WORKER_WORK || !f.evidence) {
+          contractFindings.push(f);
+          continue;
+        }
+        const readoptFailures = readoptFailuresFor(f.evidence);
+        if (readoptFailures >= MAX_READOPTIONS) {
+          // Re-adopting this work keeps failing: stop building on it. The
+          // branch stays preserved; the replacement redoes the work from base.
+          this.store.resolveFinding(f.finding_id);
+          this.store.addFinding({
+            mission_id: missionId,
+            task_id: f.task_id,
+            severity: "minor",
+            category: STRANDED_WORKER_WORK,
+            file: null,
+            line: null,
+            summary: `Stranded worker work at ${f.evidence} was discarded as a starting point after ${readoptFailures} failed re-adoptions; its branch stays preserved and the work restarts from the mission base`,
+            evidence: f.evidence,
+            recommended_action: "Inspect the preserved branch manually if its commits are still wanted.",
+          });
+          objectives.push({
+            objective: `Complete the mission objective from the mission base. An earlier worker's preserved branch (${f.evidence}) was abandoned after ${readoptFailures} failed re-adoptions. Original finding: ${f.summary}`,
             adoptedTaskId: f.task_id ?? undefined,
-          };
+          });
+          continue;
+        }
+        objectives.push({
+          objective: `${READOPT_OBJECTIVE_PREFIX} ${f.summary}. Your starting point is partial, unreviewed output from a crashed worker (commit ${f.evidence}); it may be truncated or wrong, so verify it before building on it and finish the remaining work.`,
+          findingIds: [f.finding_id],
+          baseSha: f.evidence,
+          adoptedTaskId: f.task_id ?? undefined,
         });
+      }
+      if (contractFindings.length > 0) {
+        objectives.unshift({
+          objective: repairContractObjective(contractFindings),
+          findingIds: contractFindings.map((f) => f.finding_id),
+        });
+      }
       if (objectives.length === 0) {
-        for (const t of failedGates) {
+        // Only gates that ran and failed on the candidate become code repair.
+        for (const t of codeFailedGates) {
           objectives.push({
             objective: `Fix the failing ${t.kind} step for this mission (${t.objective}). Make the repository's own checks pass and leave the change ready to integrate.`,
           });
@@ -2528,7 +2605,7 @@ export class Orchestrator {
           signal,
         });
         if (signal?.aborted) return this.canceledFinalization(missionId, signal);
-        if (repaired && obj.findingId) this.store.resolveFinding(obj.findingId);
+        if (repaired) for (const findingId of obj.findingIds ?? []) this.store.resolveFinding(findingId);
         // The replacement carries the dead workers' work (re-adopted, or redone
         // from base after a discard): their FAILED tasks no longer block completion.
         if (repaired) {

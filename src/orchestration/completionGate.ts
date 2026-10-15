@@ -259,7 +259,7 @@ export class CompletionGate {
     const validSuperseded = new Set<string>();
     const obsoleteGateAttempts = new Set<string>();
     const markProvablyEarlierFailedAttempts = (
-      kind: "validation" | "review",
+      kind: "validation" | "review" | "integration",
       currentExecutionId: string | undefined,
     ): void => {
       if (!currentExecutionId) return;
@@ -278,6 +278,9 @@ export class CompletionGate {
         }
       }
     };
+    // A merge that failed and was re-run deterministically is superseded by the
+    // integration that produced the current candidate.
+    if (candidateCurrent && candidate) markProvablyEarlierFailedAttempts("integration", candidate.executionId);
     if (validationOk) markProvablyEarlierFailedAttempts("validation", currentValidation?.executionId);
     if (reviewOk) markProvablyEarlierFailedAttempts("review", currentReview?.executionId);
     const supersessionProblems: string[] = [];

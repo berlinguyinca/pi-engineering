@@ -1216,9 +1216,9 @@ describe("revision-bound completion evidence", () => {
 
 describe("strict reviewer evidence", () => {
   it("normalizes only the specified severities", () => {
-    for (const severity of ["blocker", "critical", "high"] as const)
+    for (const severity of ["blocker", "critical"] as const)
       assert.equal(normalizeReviewSeverity(severity), "blocking");
-    assert.equal(normalizeReviewSeverity("medium"), "major");
+    for (const severity of ["high", "medium"] as const) assert.equal(normalizeReviewSeverity(severity), "major");
     for (const severity of ["low", "info"] as const) assert.equal(normalizeReviewSeverity(severity), "minor");
     assert.throws(() => normalizeReviewSeverity("warning"), /unsupported review severity/i);
   });

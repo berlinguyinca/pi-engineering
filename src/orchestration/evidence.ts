@@ -89,9 +89,10 @@ export function normalizeReviewSeverity(severity: unknown): ReviewFinding["sever
   switch (severity.trim().toLowerCase()) {
     case "blocker":
     case "critical":
-    case "high":
     case "blocking":
       return "blocking";
+    // "high" is recorded and visible but does not block: only blocker/critical do.
+    case "high":
     case "medium":
     case "major":
       return "major";
