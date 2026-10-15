@@ -57,6 +57,7 @@ async function cancellationCheckpointFixture(
   runAgent: NonNullable<BrokerBackends["agent"]>["runAgent"],
   cancellationAckTimeoutMs = 5_000,
   checkpoints?: CheckpointManager,
+  deliverables: string[] = ["implementation"],
 ) {
   const fx = await makeFixtureRepo();
   const git = await GitRepo.open(fx.root);
@@ -98,7 +99,7 @@ async function cancellationCheckpointFixture(
     mutates_repo: true,
     isolation: "worktree",
     write_domains: ["src/**"],
-    deliverables: ["implementation"],
+    deliverables,
     execution_budget_ms: 10_000,
     checkpoint_policy: { activity_milestone: 10, before_deadline_ms: 1_000 },
   });
@@ -3190,6 +3191,81 @@ describe("ExecutionBroker (spec 03)", () => {
     } finally {
       await fx.cleanup();
     }
+  });
+
+  describe("tip-bound deliverable claims", () => {
+    type Step = { commit: string } | { claim: string[] };
+    async function failedWorkerCheckpoint(deliverables: string[], steps: Step[]) {
+      const context = await cancellationCheckpointFixture(
+        async ({ worktree, onActivity }) => {
+          assert.ok(worktree);
+          for (const step of steps) {
+            if ("commit" in step) {
+              await writeFile(join(worktree, step.commit), `export const x = "${step.commit}";\n`, "utf8");
+              await exec("git", ["-C", worktree, "add", "-A"]);
+              await exec("git", [
+                "-C",
+                worktree,
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "-m",
+                step.commit,
+              ]);
+            } else {
+              for (const deliverable of step.claim) {
+                onActivity?.({
+                  kind: "checkpoint",
+                  summary: "claim",
+                  meaningfulProgress: true,
+                  claims: [{ deliverable, candidateSha: "", evidencePaths: [], artifactRefs: [], tipBound: true }],
+                });
+              }
+            }
+          }
+          return { executionId: "e", exitStatus: "failed", summary: "stopped", artifactRefs: [], usage: {} };
+        },
+        5_000,
+        undefined,
+        deliverables,
+      );
+      try {
+        await context.handle.result().catch(() => undefined);
+        const execution = context.store.getExecution(context.handle.executionId)!;
+        return context.store.getTaskCheckpoint(execution.checkpoint_id!)!;
+      } finally {
+        await context.fx.cleanup();
+      }
+    }
+
+    it("does not accept a claim for a deliverable when only another deliverable's path is committed", async () => {
+      const checkpoint = await failedWorkerCheckpoint(
+        ["one", "two"],
+        [{ commit: "src/one.ts" }, { claim: ["one", "two"] }],
+      );
+      assert.deepEqual([...checkpoint.completedDeliverables], ["one"]);
+      assert.deepEqual([...checkpoint.remainingDeliverables], ["two"]);
+    });
+
+    it("accepts the claim once a second commit adds a new path", async () => {
+      const checkpoint = await failedWorkerCheckpoint(
+        ["one", "two"],
+        [{ commit: "src/one.ts" }, { claim: ["one"] }, { commit: "src/two.ts" }, { claim: ["two"] }],
+      );
+      assert.deepEqual([...checkpoint.completedDeliverables].sort(), ["one", "two"]);
+    });
+
+    it("accepts only as many bulk-claimed deliverables as there are new committed paths", async () => {
+      const checkpoint = await failedWorkerCheckpoint(
+        ["one", "two", "three"],
+        [{ commit: "src/one.ts" }, { claim: ["one", "two", "three"] }],
+      );
+      assert.deepEqual([...checkpoint.completedDeliverables], ["one"]);
+      assert.deepEqual([...checkpoint.remainingDeliverables], ["two", "three"]);
+    });
   });
 
   it("harvests and checkpoints a succeeded worker that edited files but never committed", async () => {

@@ -41,7 +41,10 @@ export function createClaimDeliverableTool(declaredDeliverables: readonly string
         } else unknown.push(name);
       }
       const lines: string[] = [];
-      if (accepted.length > 0) lines.push(`Recorded ${accepted.map((c) => `"${c.deliverable}"`).join(", ")}.`);
+      if (accepted.length > 0)
+        lines.push(
+          `Recorded ${accepted.map((c) => `"${c.deliverable}"`).join(", ")}. The broker accepts each only once your branch has a committed file no earlier claim used.`,
+        );
       if (unknown.length > 0)
         lines.push(
           `NOT declared: ${unknown.map((n) => `"${n}"`).join(", ")}. Declared deliverables: ${declared.map((d) => `"${d}"`).join(", ")}.`,

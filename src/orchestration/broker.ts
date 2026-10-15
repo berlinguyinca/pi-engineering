@@ -2560,6 +2560,10 @@ export class ExecutionBroker {
           } | null = null;
           let meaningfulActivity = 0;
           const completedDeliverables = new Set<string>();
+          // Tip-bound claims: the committed path attributed to each accepted
+          // deliverable. A path backs one deliverable only, so a claim needs a
+          // committed path no earlier claim already used.
+          const tipBoundEvidence = new Map<string, string>();
           const checkpointClaims = new Map<string, CheckpointProgressClaim>();
           const capturedCheckpointArtifacts = new Map<string, { refs: string[]; hashes: string[] }>();
           const rejectedCheckpointClaims = new Set<string>();
@@ -2608,19 +2612,27 @@ export class ExecutionBroker {
             for (const rawClaim of checkpointClaims.values()) {
               // A tip-bound claim (claim_deliverable) names only the deliverable:
               // sha and paths come from this snapshot. It counts only once the
-              // worker branch holds commits past the base; until then it waits
-              // for a later checkpoint instead of being rejected.
-              if (rawClaim.tipBound && (snapshot.candidateSha === null || snapshot.committedChanges.length === 0)) {
-                continue;
+              // worker branch holds a committed path no earlier claim used; until
+              // then it waits for a later checkpoint instead of being rejected.
+              let tipEvidence: string | undefined;
+              if (rawClaim.tipBound) {
+                tipEvidence =
+                  tipBoundEvidence.get(rawClaim.deliverable) ??
+                  (snapshot.candidateSha === null
+                    ? undefined
+                    : snapshot.committedChanges.find((path) => ![...tipBoundEvidence.values()].includes(path)));
+                if (tipEvidence === undefined) continue;
+                tipBoundEvidence.set(rawClaim.deliverable, tipEvidence);
               }
-              const claim: CheckpointProgressClaim = rawClaim.tipBound
-                ? {
-                    deliverable: rawClaim.deliverable,
-                    candidateSha: snapshot.candidateSha ?? "",
-                    evidencePaths: [...snapshot.committedChanges],
-                    artifactRefs: [],
-                  }
-                : rawClaim;
+              const claim: CheckpointProgressClaim =
+                rawClaim.tipBound && tipEvidence !== undefined
+                  ? {
+                      deliverable: rawClaim.deliverable,
+                      candidateSha: snapshot.candidateSha ?? "",
+                      evidencePaths: [tipEvidence],
+                      artifactRefs: [],
+                    }
+                  : rawClaim;
               const claimIdentity = `${claim.deliverable}:${claim.candidateSha}:${claim.evidencePaths.join(",")}:${claim.artifactRefs.join(",")}`;
               let captured = capturedCheckpointArtifacts.get(claimIdentity);
               let artifactsValid = claim.artifactRefs.length === 0;
