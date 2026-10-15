@@ -4,7 +4,13 @@
   "description": "Autonomous engineering runtime for the pi coding agent: Engineering Ledger, fresh-context workers, isolated candidates, deterministic verification, and independent review.",
   "license": "MIT",
   "type": "module",
-  "keywords": ["pi-package", "engineering", "orchestration", "ledger", "agent"],
+  "keywords": [
+    "pi-package",
+    "engineering",
+    "orchestration",
+    "ledger",
+    "agent"
+  ],
   "exports": {
     ".": "./src/index.ts"
   },
@@ -12,16 +18,16 @@
     "typecheck": "npm run typecheck:core && npm run typecheck:scripts",
     "typecheck:core": "tsc --noEmit",
     "typecheck:scripts": "tsc --noEmit -p tsconfig.scripts.json",
-    "test": "node --test --test-force-exit --import ./test/support/isolatedState.ts \"test/unit/**/*.test.ts\" \"test/integration/**/*.test.ts\"",
-    "test:unit": "node --test --test-force-exit --import ./test/support/isolatedState.ts \"test/unit/**/*.test.ts\"",
-    "test:integration": "node --test --test-force-exit --import ./test/support/isolatedState.ts \"test/integration/**/*.test.ts\"",
-    "test:mission-reliability": "node --test --test-force-exit --import ./test/support/isolatedState.ts test/integration/mission-reliability-foundation.test.ts",
+    "test": "node --test --test-concurrency=4 --test-force-exit --import ./test/support/isolatedState.ts \"test/unit/**/*.test.ts\" \"test/integration/**/*.test.ts\"",
+    "test:unit": "node --test --test-concurrency=4 --test-force-exit --import ./test/support/isolatedState.ts \"test/unit/**/*.test.ts\"",
+    "test:integration": "node --test --test-concurrency=4 --test-force-exit --import ./test/support/isolatedState.ts \"test/integration/**/*.test.ts\"",
+    "test:mission-reliability": "node --test --test-concurrency=4 --test-force-exit --import ./test/support/isolatedState.ts test/integration/mission-reliability-foundation.test.ts",
     "test:e2e": "node scripts/smoke-commands.ts && node scripts/smoke-load.ts",
     "bench:planner-worker": "node scripts/planner-worker-benchmark.ts",
-    "test:platform": "node --test --test-force-exit --import ./test/support/isolatedState.ts \"test/unit/platform-*.test.ts\" \"test/integration/platform-*.test.ts\"",
+    "test:platform": "node --test --test-concurrency=4 --test-force-exit --import ./test/support/isolatedState.ts \"test/unit/platform-*.test.ts\" \"test/integration/platform-*.test.ts\"",
     "platform:e2e": "node --experimental-strip-types scripts/platform-e2e.ts",
     "platform:serve": "node --experimental-strip-types scripts/control-server.ts",
-    "test:roadmap": "node --test --test-force-exit --import ./test/support/isolatedState.ts \"test/unit/roadmap*.test.ts\" \"test/integration/roadmap*.test.ts\"",
+    "test:roadmap": "node --test --test-concurrency=4 --test-force-exit --import ./test/support/isolatedState.ts \"test/unit/roadmap*.test.ts\" \"test/integration/roadmap*.test.ts\"",
     "test:dogfood:lifecycle": "node scripts/dogfood-lifecycle.ts",
     "dogfood:mission-recovery": "node scripts/dogfood-mission-recovery.ts --model local/local",
     "roadmap:check": "node scripts/pi-engineering.ts roadmap check",
@@ -53,7 +59,9 @@
     "typescript": "^5.6.0"
   },
   "pi": {
-    "extensions": ["./src/runtime/host/entry.ts"]
+    "extensions": [
+      "./src/runtime/host/entry.ts"
+    ]
   },
   "piEngineering": {
     "runtimeApi": 1,

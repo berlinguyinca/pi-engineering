@@ -106,6 +106,31 @@ async function replayStore(repo: string): Promise<MissionStore> {
   return MissionStore.open(backend);
 }
 
+/**
+ * After a handover the new generation rehydrates the durable mission store
+ * asynchronously; under a loaded run it may not have flushed the mission yet.
+ * Poll the replayed store until the mission is durably present (or a bounded
+ * deadline) instead of reading once, so the test reflects the settled state.
+ */
+async function waitForReplayedMission(
+  repo: string,
+  missionId: string,
+  timeoutMs = 10_000,
+): Promise<MissionStore> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try {
+      const store = await replayStore(repo);
+      if (store.getMission(missionId)) return store;
+    } catch {
+      // A partially-written event file can throw transiently during a handover;
+      // retry until it settles.
+    }
+    if (Date.now() > deadline) return replayStore(repo);
+    await new Promise((r) => setTimeout(r, 50));
+  }
+}
+
 async function setup(name: string) {
   const gw = gateway();
   await new Promise<void>((r) => gw.server.listen(0, "127.0.0.1", r));
@@ -172,7 +197,7 @@ test("active mission: handover waits for its safe point, same mission after rehy
     // so the no-replay assertion is scoped to the new generation.
     const investigatorCallsBefore = w.b.workerCalls.filter((c) => c.role === "investigator").length;
 
-    const store = await replayStore(w.fx.root);
+    const store = await waitForReplayedMission(w.fx.root, missionId);
     const m = store.getMission(missionId);
     assert.ok(m, "same mission id after the new generation rehydrated");
     const diagnostics = () =>
