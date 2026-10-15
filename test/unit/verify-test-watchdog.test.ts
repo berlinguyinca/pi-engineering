@@ -13,7 +13,6 @@ import {
   classify,
   countTestEvents,
   initialWatchdogState,
-  isWallExceeded,
   observe,
   resolveStageWatchdog,
 } from "../../src/verify/testWatchdog.ts";
@@ -27,13 +26,13 @@ const sample = (over: Partial<ProgressSample> = {}): ProgressSample => ({
 });
 
 describe("test watchdog: pure classification", () => {
-  it("defaults are 2, 5 and 10 minutes with a 30 minute wall", () => {
+  it("defaults are 2, 5 and 10 minutes and there is no wall-clock limit", () => {
     assert.deepEqual(DEFAULT_TEST_WATCHDOG, {
       warnMs: 120_000,
       investigateMs: 300_000,
       stallMs: 600_000,
-      wallMs: 1_800_000,
     });
+    assert.equal("wallMs" in DEFAULT_TEST_WATCHDOG, false);
   });
 
   it("a sample with CPU growth only and no output for 600000 ms classifies stalled", () => {
@@ -80,13 +79,6 @@ describe("test watchdog: pure classification", () => {
     const base = observe(initialWatchdogState(0), sample({ ioBytes: 100 }), 0);
     const lower = observe(base, sample({ ioBytes: 5 }), 1_000);
     assert.equal(lower.lastProgressAtMs, 0);
-  });
-
-  it("the wall limit applies only when one is configured", () => {
-    const state = initialWatchdogState(0);
-    assert.equal(isWallExceeded(state, 1_800_000, DEFAULT_TEST_WATCHDOG), true);
-    assert.equal(isWallExceeded(state, 1_799_999, DEFAULT_TEST_WATCHDOG), false);
-    assert.equal(isWallExceeded(state, 9e12, { ...DEFAULT_TEST_WATCHDOG, wallMs: undefined }), false);
   });
 
   it("counts test start and finish lines from node:test, cargo and pytest style output", () => {
@@ -174,10 +166,15 @@ describe("test watchdog: real child processes under short thresholds", () => {
     assert.equal(res.code, 0);
   });
 
-  it("an explicit wall limit ends a chatty stage that is making progress", async () => {
-    const res = await run("setInterval(() => console.log('x'), 50)", { ...SHORT, wallMs: 700 });
-    assert.equal(res.hung, true);
-    assert.equal(res.stalled?.level, "wall");
+  it("a chatty stage that keeps making progress is never cut off for running long", async () => {
+    // No wall-clock limit exists: a stage that logs every 50 ms for well over the
+    // stall threshold must finish on its own.
+    const res = await run(
+      "let n = 0; const t = setInterval(() => { console.log('x'); if (++n === 30) { clearInterval(t); } }, 50)",
+      SHORT,
+    );
+    assert.equal(res.stalled, undefined);
+    assert.equal(res.code, 0);
   });
 });
 
@@ -212,14 +209,14 @@ describe("test watchdog: Verifier stage wiring", () => {
     }
   });
 
-  it("gives test stages the default thresholds, no wall, and leaves other stages alone", () => {
+  it("gives test stages the default thresholds and leaves other stages alone", () => {
     const test = resolveStageWatchdog({ name: "test" });
     assert.deepEqual(test, { warnMs: 120_000, investigateMs: 300_000, stallMs: 600_000, sampleMs: 5_000 });
     assert.ok(resolveStageWatchdog({ name: "test:full" }));
     assert.equal(resolveStageWatchdog({ name: "build" }), undefined);
     assert.equal(resolveStageWatchdog({ name: "typecheck" }), undefined);
     assert.equal(resolveStageWatchdog({ name: "test", watchdog: false }), undefined);
-    assert.equal(resolveStageWatchdog({ name: "test", watchdog: { wallMs: 5 } })?.wallMs, 5);
+    assert.equal("wallMs" in (resolveStageWatchdog({ name: "test" }) ?? {}), false);
     assert.equal(resolveStageWatchdog({ name: "build", watchdog: { stallMs: 7 } })?.stallMs, 7);
   });
 });

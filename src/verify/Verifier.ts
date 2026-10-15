@@ -23,7 +23,6 @@ import {
   classify,
   countTestEvents,
   initialWatchdogState,
-  isWallExceeded,
   listProcessGroup,
   observe,
   resolveStageWatchdog,
@@ -131,7 +130,7 @@ function reapLeftovers(pgid: number): number {
 
 /** Why and how the progress watchdog ended a stage. */
 export interface StageStall {
-  level: "stalled" | "wall";
+  level: "stalled";
   /** Milliseconds without progress when it fired. */
   silentMs: number;
   /** Process tree and output tail captured BEFORE the signal. */
@@ -245,7 +244,6 @@ export function runWithInactivityGuard(
         warnMs: opts.watchdog.warnMs ?? DEFAULT_TEST_WATCHDOG.warnMs,
         investigateMs: opts.watchdog.investigateMs ?? DEFAULT_TEST_WATCHDOG.investigateMs,
         stallMs: opts.watchdog.stallMs ?? DEFAULT_TEST_WATCHDOG.stallMs,
-        wallMs: opts.watchdog.wallMs,
         sampleMs: opts.watchdog.sampleMs ?? DEFAULT_SAMPLE_MS,
       };
       let state = initialWatchdogState(Date.now());
@@ -258,16 +256,13 @@ export function runWithInactivityGuard(
         const silentMs = now - state.lastProgressAtMs;
         stalled = { level, silentMs, evidence };
         hung = true;
-        stderr += `\n[pi-engineering] killed: test stage ${
-          level === "wall" ? `exceeded its ${cfg.wallMs}ms wall limit` : `stalled, no progress for ${silentMs}ms`
-        } (last progress: ${state.lastProgressKind ?? "none"})\n${JSON.stringify(evidence)}\n`;
+        stderr += `\n[pi-engineering] killed: test stage stalled, no progress for ${silentMs}ms (last progress: ${state.lastProgressKind ?? "none"})\n${JSON.stringify(evidence)}\n`;
         killTree();
       };
       sampler = setInterval(() => {
         if (settled || stalled) return;
         const now = Date.now();
         state = observe(state, sampleGroup(groupPid, outputBytes, testEvents), now);
-        if (isWallExceeded(state, now, cfg)) return end("wall", now);
         const level = classify(state, now, cfg);
         if (level === "stalled") return end("stalled", now);
         if (level !== announced) {
@@ -348,8 +343,8 @@ export interface VerifyStage {
   timeoutMs?: number;
   /**
    * Progress watchdog (#146). Test stages (`test`, `test:*`) get the defaults;
-   * `false` turns it off; an object overrides thresholds. `wallMs` is a total
-   * limit and applies only when given here.
+   * `false` turns it off; an object overrides thresholds. There is no
+   * total-duration limit: a stage that keeps making progress is never cut off.
    */
   watchdog?: false | WatchdogSettings;
 }
