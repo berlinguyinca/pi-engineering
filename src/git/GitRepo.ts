@@ -218,6 +218,9 @@ export class GitRepo {
   // handling.
   private worktreeLock: Promise<void> = Promise.resolve();
 
+  /** Aborting kills in-flight git children started through `git()`. */
+  private signal: AbortSignal | undefined;
+
   private constructor(cwd: string, repoRoot: string) {
     this.cwd = cwd;
     this.repoRoot = repoRoot;
@@ -235,13 +238,17 @@ export class GitRepo {
   }
 
   /** Returns a GitRepo if `cwd` is inside a git work tree, else null. */
-  static async open(cwd: string): Promise<GitRepo | null> {
+  static async open(cwd: string, signal?: AbortSignal): Promise<GitRepo | null> {
     try {
       // Resolve the actual repository toplevel so a caller in a subdirectory
       // (e.g. <repo>/src) still treats the whole repo as its root.
-      const { stdout } = await exec("git", ["-C", cwd, "rev-parse", "--show-toplevel"], { timeout: 120_000 });
+      const { stdout } = await exec("git", ["-C", cwd, "rev-parse", "--show-toplevel"], {
+        timeout: 120_000,
+        signal,
+      });
       if (!stdout.trim()) return null;
       const repo = new GitRepo(cwd, stdout.trim());
+      repo.signal = signal;
       await repo.git(["rev-parse", "--is-inside-work-tree"]);
       return repo;
     } catch {
@@ -255,6 +262,7 @@ export class GitRepo {
       const { stdout, stderr } = await exec("git", [...this.gitArgs, ...args], {
         timeout: timeoutMs,
         maxBuffer: 64 * 1024 * 1024,
+        signal: this.signal,
       });
       return { stdout: opts.preserveStdout ? stdout : stdout.trim(), stderr: stderr.trim(), code: 0 };
     } catch (err) {
