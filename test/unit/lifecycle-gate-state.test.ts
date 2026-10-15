@@ -348,3 +348,30 @@ test("telemetry summaries counts across events", () => {
   assert.equal(metrics.failedInvocations, 1);
   assert.ok(metrics.totalCostUsd > 0);
 });
+
+function specGate(status: "missing" | "partial" | "divergent" | "unverifiable", severity: "high" | "critical") {
+  const gate = evaluateGate(
+    gateDefaults({
+      reviews: [review("reviewer", "approve")],
+      verification: verification("passed"),
+      finalVerification: verification("passed"),
+      implementerModel: "alpha/impl",
+      testFilesChanged: 1,
+      specVerification: {
+        ...review("spec", "approve"),
+        specGaps: [{ requirement: "R1", status, detail: "d", severity }],
+      },
+    }),
+  );
+  return gate.items.find((i) => i.key === "spec_verification_pass")!.status;
+}
+
+test("spec gate: a high divergent or partial gap blocks", () => {
+  assert.equal(specGate("divergent", "high"), "failed");
+  assert.equal(specGate("partial", "high"), "failed");
+});
+
+test("spec gate: a high unverifiable gap does not block, a critical one does", () => {
+  assert.equal(specGate("unverifiable", "high"), "passed");
+  assert.equal(specGate("unverifiable", "critical"), "failed");
+});
