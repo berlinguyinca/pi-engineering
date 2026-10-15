@@ -6,7 +6,7 @@
  * in-memory ring for status/doctor views. Nothing here reaches the normal UI:
  * recovery is routine, and routine recovery must not produce warnings.
  */
-import { appendFileSync, mkdirSync } from "node:fs";
+import { appendFileSync, mkdirSync, renameSync, statSync } from "node:fs";
 import { dirname } from "node:path";
 import { emitTelemetry } from "../../telemetry/sink.ts";
 
@@ -29,6 +29,7 @@ export type RuntimeEventName =
   | "lease.expired"
   | "lease.reclaimed"
   | "lease.contended"
+  | "lease.contended_summary"
   | "event_stream.recovered"
   | "event_stream.corruption_detected"
   | "migration.completed"
@@ -52,6 +53,23 @@ interface RuntimeEventState {
   ring: RuntimeEvent[];
   logFile: string | null;
   listeners: Set<RuntimeEventSink>;
+  /** Suppressed-contention counters per `resource|holder`, and when the last summary went out. */
+  contention: Map<string, { resource: unknown; holder_session: unknown; count: number }>;
+  lastContentionSummaryMs: number;
+  /** Repeats suppressed since the last summary line. */
+  suppressedSinceSummary: number;
+}
+
+/** runtime.jsonl size cap before it rotates to `.1` (PI_RUNTIME_LOG_MAX_BYTES). */
+const DEFAULT_LOG_MAX_BYTES = 10 * 1024 * 1024;
+/** How often suppressed lease contention is summarised (PI_RUNTIME_CONTENTION_SUMMARY_MS). */
+const DEFAULT_CONTENTION_SUMMARY_MS = 5 * 60_000;
+
+function envNumber(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : fallback;
 }
 
 const STATE_KEY = Symbol.for("pi-engineering.runtime-events");
@@ -60,15 +78,26 @@ function state(): RuntimeEventState {
   const holder = globalThis as unknown as Record<symbol, RuntimeEventState | undefined>;
   let current = holder[STATE_KEY];
   if (!current) {
-    current = { ring: [], logFile: null, listeners: new Set() };
+    current = {
+      ring: [],
+      logFile: null,
+      listeners: new Set(),
+      contention: new Map(),
+      lastContentionSummaryMs: Date.now(),
+      suppressedSinceSummary: 0,
+    };
     holder[STATE_KEY] = current;
+    const created = current;
+    process.once("exit", () => flushContentionSummary(created));
   }
   return current;
 }
 
 /** Direct structured diagnostics to a session debug log. */
 export function setRuntimeEventLog(file: string | null): void {
-  state().logFile = file;
+  const s = state();
+  if (s.logFile !== file) flushContentionSummary(s);
+  s.logFile = file;
 }
 
 export function onRuntimeEvent(listener: RuntimeEventSink): () => void {
@@ -77,18 +106,71 @@ export function onRuntimeEvent(listener: RuntimeEventSink): () => void {
   return () => s.listeners.delete(listener);
 }
 
+/**
+ * Rotation is per process: two processes sharing one runtime.jsonl can both
+ * rotate and the later rename overwrites `.1` (bounded loss of old diagnostics,
+ * never of the live file). Sessions normally own their own file.
+ */
+function appendLog(file: string, record: RuntimeEvent): void {
+  try {
+    mkdirSync(dirname(file), { recursive: true });
+    const line = `${JSON.stringify(record)}\n`;
+    const max = envNumber("PI_RUNTIME_LOG_MAX_BYTES", DEFAULT_LOG_MAX_BYTES);
+    try {
+      if (statSync(file).size + line.length > max) renameSync(file, `${file}.1`);
+    } catch {
+      // No file yet.
+    }
+    appendFileSync(file, line, "utf8");
+  } catch {
+    // Diagnostics are observers; a full disk must not break the runtime.
+  }
+}
+
+/**
+ * Lease contention repeats every heartbeat for as long as a holder lives (one
+ * log reached 440 MB). Log it once per (resource, holder), count the rest, and
+ * emit a summary line per interval. Returns the record to log, or null.
+ */
+/** Write the contention counters (when repeats were suppressed) to the current log. */
+function flushContentionSummary(s: RuntimeEventState): void {
+  if (s.suppressedSinceSummary === 0 || !s.logFile) return;
+  s.suppressedSinceSummary = 0;
+  s.lastContentionSummaryMs = Date.now();
+  appendLog(s.logFile, {
+    event: "lease.contended_summary",
+    at: new Date().toISOString(),
+    contentions: [...s.contention.values()],
+  });
+}
+
+function throttleContention(s: RuntimeEventState, fields: Record<string, unknown>): RuntimeEvent | null {
+  const key = `${String(fields.resource)}|${String(fields.holder_session)}`;
+  const entry = s.contention.get(key);
+  const now = Date.now();
+  if (entry) {
+    entry.count++;
+    s.suppressedSinceSummary++;
+  } else s.contention.set(key, { resource: fields.resource, holder_session: fields.holder_session, count: 1 });
+  const due =
+    now - s.lastContentionSummaryMs >= envNumber("PI_RUNTIME_CONTENTION_SUMMARY_MS", DEFAULT_CONTENTION_SUMMARY_MS);
+  if (due) {
+    flushContentionSummary(s);
+  }
+  return entry ? null : { event: "lease.contended", at: new Date().toISOString(), ...fields };
+}
+
 export function emitRuntimeEvent(event: RuntimeEventName, fields: Record<string, unknown> = {}): RuntimeEvent {
-  const record: RuntimeEvent = { event, at: new Date().toISOString(), ...fields };
   const s = state();
+  if (event === "lease.contended") {
+    const first = throttleContention(s, fields);
+    if (!first) return { event, at: new Date().toISOString(), ...fields };
+  }
+  const record: RuntimeEvent = { event, at: new Date().toISOString(), ...fields };
   s.ring.push(record);
   if (s.ring.length > RING_LIMIT) s.ring.splice(0, s.ring.length - RING_LIMIT);
   if (s.logFile && event !== "session.heartbeat") {
-    try {
-      mkdirSync(dirname(s.logFile), { recursive: true });
-      appendFileSync(s.logFile, `${JSON.stringify(record)}\n`, "utf8");
-    } catch {
-      // Diagnostics are observers; a full disk must not break the runtime.
-    }
+    appendLog(s.logFile, record);
   }
   // Debug view: opt in to see every runtime decision on the Pi surface.
   if (process.env.PI_ENGINEERING_DEBUG_RUNTIME === "1" && event !== "session.heartbeat") {

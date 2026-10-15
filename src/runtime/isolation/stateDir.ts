@@ -17,6 +17,8 @@
  *       recovery/                      quarantined evidence (never deleted)
  *   <root>/sessions/<session-id>/      session scope (unbound / fallback)
  *       runtime.jsonl                  structured runtime diagnostics
+ *   <root>/worktrees/<worktree-id>/transcripts/<mission>/<execution>.jsonl
+ *                                      persisted worker transcripts (age-pruned only)
  */
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";

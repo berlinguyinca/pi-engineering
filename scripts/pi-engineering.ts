@@ -5,7 +5,7 @@ import { mkdir, writeFile } from "node:fs/promises";
  *
  *   node scripts/pi-engineering.ts roadmap check [--json] [--no-refresh] [--structural]
  *   node scripts/pi-engineering.ts roadmap status [--json]
- *   node scripts/pi-engineering.ts missions list|cancel --store <dir> ...  (legacy orchestration.jsonl only; see docs/orchestration.md)
+ *   node scripts/pi-engineering.ts missions list|why|cancel --store <dir> ...  (legacy orchestration.jsonl only; see docs/orchestration.md)
  *   node scripts/pi-engineering.ts doctor [--repair] [--json] [--cwd <dir>]
  *
  * `roadmap check` exit codes:
@@ -51,7 +51,7 @@ async function main(): Promise<number> {
   }
   if (cmd !== "roadmap") {
     console.error(
-      "usage: pi-engineering <doctor [--repair] [--json]|roadmap check|roadmap status|missions list|missions cancel|blackhole ...|benchmark|cav status|...> [flags]",
+      "usage: pi-engineering <doctor [--repair] [--json]|roadmap check|roadmap status|missions list|missions why|missions cancel|blackhole ...|benchmark|cav status|...> [flags]",
     );
     return 2;
   }

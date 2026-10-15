@@ -9,6 +9,7 @@ import type {
   RecoveryDecision,
   TaskCheckpoint,
   WorkspaceManifest,
+  ZeroToolWait,
 } from "./types.ts";
 
 export interface FailureEvidence {
@@ -43,6 +44,8 @@ export interface RecoveryDecisionInput {
   nextActionAt?: number;
   /** Operator-facing reason for a PROBE_AND_BACKOFF wait; replaces the generic expected change. */
   waitReason?: string;
+  /** Structured counters behind `waitReason` for a zero-tool-call provider wait. */
+  zeroToolWait?: ZeroToolWait;
   resumptionGeneration?: number;
 }
 
@@ -617,6 +620,7 @@ export class RecoveryPlanner {
       failureFingerprint: fingerprint,
       resumptionGeneration,
       operatorGuidance,
+      ...(action === "PROBE_AND_BACKOFF" && input.zeroToolWait ? { zeroToolWait: input.zeroToolWait } : {}),
     };
   }
 }

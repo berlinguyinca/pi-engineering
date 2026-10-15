@@ -688,6 +688,7 @@ export function realBackends(opts: RealBackendsOptions) {
         const bound = await repository(input.repoId);
         const req: WorkerRequest = {
           role: (input.role as WorkerRequest["role"]) ?? "implementer",
+          missionId: input.missionId,
           baseRef: input.baseRef,
           wallClock: input.wallClock,
           task: input.objective,
@@ -741,6 +742,7 @@ export function realBackends(opts: RealBackendsOptions) {
         const bound = await repository(input.repoId);
         const req: WorkerRequest = {
           role: "scout",
+          missionId: input.missionId,
           task: input.objective,
           context: input.contextRef,
           tools: ["ledger_read", "repo_search", "symbol", "tests_for"],
@@ -823,6 +825,7 @@ export function realBackends(opts: RealBackendsOptions) {
                 name: stage.stage.name,
                 exitCode: stage.exitCode,
                 passed: stage.passed,
+                durationMs: stage.durationMs,
               })),
               failedStage: outcome.failedStage,
               warnings,
@@ -857,6 +860,7 @@ export function realBackends(opts: RealBackendsOptions) {
         const reviewerSessionId = id("RVS");
         const req: WorkerRequest = {
           role: "reviewer",
+          missionId: input.missionId,
           task: `${input.objective}${(input.acceptanceCriteria ?? [])
             .map((criterion) => `\nAcceptance criterion ${criterion.acceptanceId}: ${criterion.criterion}`)
             .join("")}`,

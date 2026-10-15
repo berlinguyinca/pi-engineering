@@ -54,6 +54,8 @@ export interface PlannerWorkerIntegration {
   runIfSelected(request: string, ctx: ExtensionCommandContext): Promise<boolean>;
   /** Resume an interrupted planner-worker mission (`PW-…`); false when it is not one. */
   resumeIfOwned(missionId: string, ctx: ExtensionCommandContext): Promise<boolean>;
+  /** The mode decision of the latest `runIfSelected` call (for the mission record). */
+  lastDecision(): { mode: string; reason: string } | null;
 }
 
 /**
@@ -208,15 +210,19 @@ export function registerPlannerWorker(
     return { resolver, conn };
   }
 
+  let decided: { mode: string; reason: string } | null = null;
+
   /** Decide whether planner-worker runs; null keeps the existing /mission flow. */
   async function select(request: string, ctx: ExtensionCommandContext) {
     const host = await deps.host(ctx);
     const config = await loadPlannerWorkerConfig(host.repoRoot);
     const requested = await effectiveMode(host.repoRoot, config);
+    decided = { mode: "single", reason: "mode is single" };
     if (requested === "single") return null;
     const built = await resolverFor(ctx, host.repoRoot, config);
     if (!built) return null;
     const decision = await chooseExecutionMode(requested, request, built.resolver);
+    decided = decision;
     if (decision.mode === "single") return null;
     return { host, config, ...built, reason: decision.reason };
   }
@@ -281,8 +287,10 @@ export function registerPlannerWorker(
   }
 
   return {
+    lastDecision: () => decided,
     async runIfSelected(request, ctx) {
       // Any failure while deciding falls back to the existing orchestrator.
+      decided = null;
       const selected = await select(request, ctx).catch(() => null);
       if (!selected) return false;
       ctx.ui.notify(`engineering mode: planner-worker (${selected.reason})`, "info");

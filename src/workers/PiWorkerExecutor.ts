@@ -89,6 +89,8 @@ import {
 import { reviewResultTool } from "../lifecycle/reviewResultTool.ts";
 import { type RequestBodyBudgetConfig, resolveRequestBodyBudgetConfig } from "../request/bodyBudget.ts";
 import { type ThinkingOffConfig, resolveThinkingOffConfig } from "../request/thinkingPolicy.ts";
+import { resolveWorktreeIdentity } from "../runtime/isolation/WorktreeIdentity.ts";
+import { resolveStateRoot, worktreeRuntimeDir } from "../runtime/isolation/stateDir.ts";
 import { emitTelemetry } from "../telemetry/sink.ts";
 import { MODEL_SUPERSEDED } from "./WorkerExecutor.ts";
 import type { WorkerExecutor, WorkerRequest, WorkerRun } from "./WorkerExecutor.ts";
@@ -113,6 +115,7 @@ import { MUTATING_ROLES, WORKER_KICKOFF, buildSystemPrompt, wantsCommitDisciplin
 import { guardRuntimeRequestBody } from "./requestBodyGuard.ts";
 import { StreamStallWatchdog, isStalledStream } from "./streamStall.ts";
 import { createNumberedReadTool, createTolerantEditTool } from "./tolerantFileTools.ts";
+import { TranscriptWriter, transcriptPath, transcriptsEnabled } from "./transcriptStore.ts";
 import {
   DEFAULT_BUDGET_NOTICE_EVERY,
   NUDGE_MESSAGE,
@@ -282,6 +285,8 @@ export class PiWorkerExecutor implements WorkerExecutor {
   // rearmResilience() once the capability pool exists.
   private capabilityRegistry: ModelCapabilityRegistry | undefined;
   private roleRouter: RoleRouter | undefined;
+  /** The mission's state worktree dir (<state>/worktrees/<id>); transcripts live under it. */
+  private transcriptDir: string | undefined;
   private inferenceScheduler: ResilientStreamScheduler | undefined;
   private inferenceStatus: ((line: string) => void) | undefined;
   /** Live tracker per worker run: tool calls already executed (spec §6). */
@@ -354,6 +359,11 @@ export class PiWorkerExecutor implements WorkerExecutor {
    * INFERENCE_CAPACITY park + operator status lines are unreachable in
    * production.
    */
+  /** Key persisted transcripts by the orchestrator's state worktree, not the candidate cwd. */
+  setTranscriptDir(dir: string | undefined): void {
+    this.transcriptDir = dir;
+  }
+
   rearmResilience(patch: {
     capabilityRegistry?: ModelCapabilityRegistry;
     roleRouter?: RoleRouter;
@@ -1401,8 +1411,77 @@ ${recovery.recoveryPrompt}`;
         : undefined;
     const armStall = (): void => stallWatchdog?.arm();
     const disarmStall = (): void => stallWatchdog?.disarm();
+    // Persisted transcript (state dir, never the repo/candidate worktree).
+    let transcript: TranscriptWriter | undefined;
+    if (transcriptsEnabled()) {
+      try {
+        const dir =
+          this.transcriptDir ??
+          worktreeRuntimeDir(resolveStateRoot(), (await resolveWorktreeIdentity(req.cwd)).worktreeId);
+        const executionId = req.sessionId ?? `${req.role}-${Date.now().toString(36)}-${attempt}`;
+        transcript = new TranscriptWriter(
+          transcriptPath(dir, req.missionId ?? req.runId ?? "unattributed", executionId),
+        );
+        transcript.write({ kind: "session", role: req.role, attempt, model: model.id, provider: model.provider });
+      } catch {
+        transcript = undefined;
+      }
+    }
+    let turnToolErrors: string[] = [];
     const unsubscribe = session.subscribe((event) => {
       armInactivity();
+      if (transcript) {
+        const t = event as unknown as Record<string, any>;
+        if (t.type === "message_end" && t.message?.role !== "toolResult") {
+          const m = t.message;
+          const content = Array.isArray(m.content)
+            ? m.content.filter((b: { type?: string }) => b?.type !== "thinking")
+            : m.content;
+          transcript.write({
+            kind: "message",
+            role: m.role,
+            model: m.model,
+            stopReason: m.stopReason,
+            usage: m.usage
+              ? { input: m.usage.input, output: m.usage.output, totalTokens: m.usage.totalTokens }
+              : undefined,
+            errorMessage: m.errorMessage,
+            content,
+          });
+        } else if (t.type === "tool_execution_start") {
+          transcript.write({ kind: "tool_call", tool: t.toolName, id: t.toolCallId, args: t.args });
+        } else if (t.type === "tool_execution_end") {
+          const text = Array.isArray(t.result?.content)
+            ? t.result.content.map((b: { text?: string }) => b?.text ?? "").join("")
+            : JSON.stringify(t.result ?? null);
+          const category = t.isError ? classifyError(text).category : undefined;
+          if (category) turnToolErrors.push(category);
+          transcript.write({
+            kind: "tool",
+            tool: t.toolName,
+            id: t.toolCallId,
+            result: text,
+            isError: Boolean(t.isError),
+            errorCategory: category,
+          });
+        } else if (t.type === "turn_end") {
+          const m = t.message ?? {};
+          const toolErrorCategory = turnToolErrors[0] ?? "none";
+          turnToolErrors = [];
+          transcript.write({
+            kind: "turn",
+            model: m.model,
+            stopReason: m.stopReason,
+            toolErrorCategory,
+            tokens: m.usage?.totalTokens,
+          });
+          emitWorkerActivity(req, {
+            kind: "state",
+            summary: `Turn ended: stop=${m.stopReason ?? "unknown"} tool_error=${toolErrorCategory}`,
+            meaningfulProgress: false,
+          });
+        }
+      }
       // Stream-stall liveness: stream data resets the window; a running tool
       // pauses it (the model is waiting on the tool, not stalled); tool
       // completion re-arms it for the next model turn; an assistant

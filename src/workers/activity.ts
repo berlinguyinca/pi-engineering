@@ -5,6 +5,9 @@ import type { CheckpointProgressClaim } from "./checkpointProgressTool.ts";
 
 export const MAX_WORKER_ACTIVITY_SUMMARY = 160;
 
+/** Per-turn summary (mission.obs.worker): fixed shape, so the metrics are computable from events. */
+export const TURN_SUMMARY = /^Turn ended: stop=[a-zA-Z_]{1,32} tool_error=[a-z_]{1,32}$/;
+
 function safeToolName(value: unknown): string {
   if (typeof value !== "string") return "tool";
   const safe = safeText(value, 64).match(/^[A-Za-z0-9_.:-]+/)?.[0] ?? "tool";
@@ -156,7 +159,8 @@ export function sanitizeWorkerActivity(value: unknown): WorkerActivity | null {
       input.summary === STREAMING_SUMMARY ||
       input.summary === WAITING_FOR_INFERENCE_SUMMARY ||
       input.summary === AWAITING_MODEL_RESPONSE_SUMMARY ||
-      input.summary === TOOL_PROGRESS_SUMMARY
+      input.summary === TOOL_PROGRESS_SUMMARY ||
+      (typeof input.summary === "string" && TURN_SUMMARY.test(input.summary))
         ? input.summary
         : "Worker session started";
     return {

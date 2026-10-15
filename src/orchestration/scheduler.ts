@@ -53,7 +53,7 @@ import {
   type RecoveryPlannerOptions,
   classifyGateFailure,
 } from "./recovery.ts";
-import type { MissionStatus, OrchestrationTask, TaskKind, TaskStatus } from "./types.ts";
+import type { MissionStatus, OrchestrationTask, TaskKind, TaskStatus, ZeroToolWait } from "./types.ts";
 
 /**
  * Lane repo key for a task: its repo_id when bound, else the mission repo.
@@ -889,6 +889,7 @@ export class MissionScheduler {
             if (res.retry) {
               let waitMs = res.waitMs;
               let waitReason: string | undefined;
+              let zeroToolWait: ZeroToolWait | undefined;
               if (zeroTool) {
                 const retries = (this.zeroToolRetries.get(task.task_id) ?? 0) + 1;
                 this.zeroToolRetries.set(task.task_id, retries);
@@ -911,6 +912,7 @@ export class MissionScheduler {
                   ? "connection error"
                   : (outcome.error ?? "provider failure").replace(/^transient:/, "").replace(/_/g, " ");
                 waitReason = `waiting for provider: ${Math.min(retries, cap)}/${cap} zero-tool-call retries (${failureClass}); next probe at ${new Date(this.clockNow() + waitMs).toISOString()}`;
+                zeroToolWait = { retries: Math.min(retries, cap), cap, failureClass };
                 // Not a task attempt: the next run reuses this attempt number.
                 attempt--;
               }
@@ -927,6 +929,7 @@ export class MissionScheduler {
                 },
                 this.clockNow() + waitMs,
                 waitReason,
+                zeroToolWait,
               );
               if (recoveryStop) {
                 authority?.assertAuthoritative();
@@ -1111,6 +1114,7 @@ export class MissionScheduler {
     evidence: FailureEvidence,
     nextActionAt?: number,
     waitReason?: string,
+    zeroToolWait?: ZeroToolWait,
   ): Promise<string | null> {
     const classification = this.failureClassifier.classify(evidence);
     if (!this.store.getFailureClassification(classification.classificationId)) {
@@ -1122,6 +1126,7 @@ export class MissionScheduler {
       now: this.clockNow(),
       ...(nextActionAt !== undefined ? { nextActionAt } : {}),
       ...(waitReason !== undefined ? { waitReason } : {}),
+      ...(zeroToolWait !== undefined ? { zeroToolWait } : {}),
       resumptionGeneration: this.store.listMissionResumptions(task.mission_id).at(-1)?.generation ?? 0,
     });
     const persisted = this.store.getRecoveryDecision(decision.recoveryId) ?? this.store.planRecovery(decision);

@@ -11,8 +11,22 @@
  * the plugin.
  */
 
+import {
+  type ModelErrorRollup,
+  type TaskUsage,
+  type VerifierStageTiming,
+  buildModelErrorRollups,
+  buildTaskUsage,
+} from "./missionWhy.ts";
 import type { MissionProjection } from "./observability/types.ts";
-import type { Mission, MissionStop, OrchestrationTask, ReviewFinding } from "./types.ts";
+import type {
+  Execution,
+  FailureClassification,
+  Mission,
+  MissionStop,
+  OrchestrationTask,
+  ReviewFinding,
+} from "./types.ts";
 
 export const MISSION_SNAPSHOT_CONTRACT_VERSION = 3;
 export const MISSION_SNAPSHOT_FILENAME = "orchestration-snapshot.json";
@@ -121,6 +135,10 @@ export interface MissionSnapshotMission {
   stop?: Pick<MissionStop, "reason" | "attemptedRecoveries" | "preservedWork" | "resumeCondition" | "stoppedAt">;
   /** Additive v2 — absent for legacy publishers / pre-observability missions. */
   observability?: MissionObservabilitySnapshot;
+  /** Additive model error rollups per model/endpoint. */
+  modelErrors?: ModelErrorRollup[];
+  /** Additive verifier stage timings; `reused` is read defensively (#185). */
+  verifierStages?: VerifierStageTiming[];
   /** Additive autonomous-spec-approval projection; absent when no spec work exists. */
   specApproval?: MissionSpecApprovalSnapshot;
 }
@@ -134,6 +152,8 @@ export interface MissionSnapshotTask {
   mutatesRepo: boolean;
   isolation: string;
   dependsOn: string[];
+  /** Additive typed accounting; absent when the publisher had no executions. */
+  usage?: TaskUsage;
   /** Additive v3 — absent for tasks replayed from pre-reliability events. */
   reliability?: {
     repoId?: string;
@@ -237,6 +257,11 @@ export function buildMissionSnapshot(
   observability?: MissionProjection | null,
   stop?: MissionStop | null,
   spec?: MissionSpecInput | null,
+  accounting?: {
+    executions: Execution[];
+    classifications: FailureClassification[];
+    verifierStages?: VerifierStageTiming[];
+  },
 ): MissionSnapshotMission {
   return {
     id: mission.mission_id,
@@ -262,6 +287,14 @@ export function buildMissionSnapshot(
       mutatesRepo: t.mutates_repo,
       isolation: t.isolation,
       dependsOn: t.depends_on,
+      ...(accounting
+        ? {
+            usage: buildTaskUsage(
+              t,
+              accounting.executions.filter((e) => e.task_id === t.task_id),
+            ),
+          }
+        : {}),
       ...(t.repo_id !== undefined ||
       t.acceptance_ids !== undefined ||
       t.candidate_generation !== undefined ||
@@ -286,6 +319,12 @@ export function buildMissionSnapshot(
       taskId: f.task_id,
       repaired: f.status === "resolved",
     })),
+    ...(accounting
+      ? {
+          modelErrors: buildModelErrorRollups(accounting.executions, accounting.classifications),
+          verifierStages: accounting.verifierStages ?? [],
+        }
+      : {}),
     ...(observability ? { observability: toObservabilitySnapshot(observability) } : {}),
     ...(spec
       ? {
@@ -329,13 +368,26 @@ export function buildMissionSnapshotFile(
     observability?: MissionProjection | null;
     stop?: MissionStop | null;
     spec?: MissionSpecInput | null;
+    executions?: Execution[];
+    classifications?: FailureClassification[];
+    verifierStages?: VerifierStageTiming[];
   }>,
 ): MissionSnapshotFile {
   return {
     contractVersion: MISSION_SNAPSHOT_CONTRACT_VERSION,
     generatedAt: new Date().toISOString(),
     missions: missions.map((m) =>
-      buildMissionSnapshot(m.mission, m.tasks, m.findings, m.observability, m.stop, m.spec),
+      buildMissionSnapshot(
+        m.mission,
+        m.tasks,
+        m.findings,
+        m.observability,
+        m.stop,
+        m.spec,
+        m.executions
+          ? { executions: m.executions, classifications: m.classifications ?? [], verifierStages: m.verifierStages }
+          : undefined,
+      ),
     ),
   };
 }
