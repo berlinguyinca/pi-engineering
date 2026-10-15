@@ -18,6 +18,13 @@ test("reviewer must be distinct from the implementer model", () => {
   assert.equal(assertReviewerDistinct("deepseek-v4-flash", "deepseek-v4-flash"), false);
 });
 
+test("reviewer must be a different model FAMILY, not merely a different id (#152)", () => {
+  assert.equal(assertReviewerDistinct("qwen3.8-27b", "qwen3.8-flash-next"), false);
+  assert.equal(assertReviewerDistinct("deepseek-v4-flash", "deepseek-v4-pro"), false);
+  assert.equal(assertReviewerDistinct("deepseek-v4-flash", "qwen3.8-27b"), true);
+  assert.equal(assertReviewerDistinct("qwen3.8-27b", ""), false, "an unknown family is never independent");
+});
+
 test("vision role must use a vision-capable model", () => {
   assert.equal(assertVisionCapable("vision", "qwen3.8-27b-vision"), true);
   assert.equal(assertVisionCapable("vision", "qwen3.8-27b"), false);

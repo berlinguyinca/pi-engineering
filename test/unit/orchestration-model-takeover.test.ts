@@ -499,13 +499,27 @@ describe("model takeover: reviewer", () => {
   });
 
   it("the reviewer avoids the implementer's takeover model when a distinct one exists", async () => {
-    const h = await harness({ pool: [A, B, Z], gone: [A] });
+    // model-a and model-b are one family ("model"); the reviewer must come from another (#152).
+    const OTHER_FAMILY: ModelRef = { provider: "gw", id: "zeta-model" };
+    const h = await harness({ pool: [A, B, OTHER_FAMILY], gone: [A] });
     // The implementer takes over from A onto B, which also ranks first for review.
     await h.backends.agent.runAgent({ role: "implementer", objective: "x", missionId: "MSN-2", signal: signal() });
     assert.equal(h.models().at(-1), modelKey(B));
     const outcome = await h.backends.review.runReview({ objective: "review", missionId: "MSN-2", signal: signal() });
-    assert.equal(h.models().at(-1), modelKey(Z), "the review runs on a model distinct from the implementer's");
+    assert.equal(
+      h.models().at(-1),
+      modelKey(OTHER_FAMILY),
+      "the review runs on a model of a different family than the implementer's",
+    );
     assert.equal(outcome.reviewEvidence?.independenceMode, "independent");
+  });
+
+  it("a sibling of the implementer's family is a last resort and is recorded as reduced independence", async () => {
+    const h = await harness({ pool: [A, B], gone: [A] });
+    await h.backends.agent.runAgent({ role: "implementer", objective: "x", missionId: "MSN-3", signal: signal() });
+    assert.equal(h.models().at(-1), modelKey(B));
+    const outcome = await h.backends.review.runReview({ objective: "review", missionId: "MSN-3", signal: signal() });
+    assert.equal(outcome.reviewEvidence?.independenceMode, "same_model_reduced");
   });
 });
 

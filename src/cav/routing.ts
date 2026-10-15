@@ -8,6 +8,8 @@
  * so review is genuinely independent, and vision review uses a vision-capable
  * model. This helper returns the model override for a role.
  */
+import { sameFamily } from "../capability/modelRecord.ts";
+
 export type CavRole = "implementer" | "reviewer" | "planner" | "vision";
 
 export interface CavRoute {
@@ -34,9 +36,13 @@ export function routeRole(role: CavRole, overrides: Partial<Record<CavRole, stri
   return overrideId ? { ...base, id: overrideId, reason: `${base.reason} (overridden to ${overrideId})` } : base;
 }
 
-/** Distinctness check: the reviewer must not be the implementer model. */
+/**
+ * Distinctness check: the reviewer must not share the implementer's model
+ * FAMILY (two ids of one family are one author for review purposes). A family
+ * that cannot be established is never distinct.
+ */
 export function assertReviewerDistinct(implementerId: string, reviewerId: string): boolean {
-  return implementerId !== reviewerId;
+  return !sameFamily(implementerId, reviewerId);
 }
 
 /** Vision review must use a vision-capable model. */

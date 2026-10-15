@@ -64,6 +64,29 @@ export function detectFamily(id: string): string | undefined {
   return head || undefined;
 }
 
+/**
+ * The family of a model id as a reviewer-independence check needs it: an
+ * endpoint or alias prefix (`metabolomics/qwen3.8-27b`,
+ * `openrouter/anthropic/claude-sonnet-5-5`) must not hide a shared family, so
+ * only the final path segment is classified. `undefined` means the family
+ * cannot be established.
+ */
+export function modelFamily(id: string): string | undefined {
+  const name = id.slice(id.lastIndexOf("/") + 1);
+  return detectFamily(name);
+}
+
+/**
+ * True when two model ids belong to one family. A family that cannot be
+ * established on either side counts as the same family: independence is never
+ * assumed for a model we cannot place.
+ */
+export function sameFamily(a: string, b: string): boolean {
+  const left = modelFamily(a);
+  const right = modelFamily(b);
+  return left === undefined || right === undefined || left === right;
+}
+
 /** Curated traits derived from naming + pricing conventions. Explicitly tagged `curated`. */
 export function curatedTags(rec: {
   id: string;

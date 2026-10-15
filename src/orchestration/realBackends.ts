@@ -14,6 +14,7 @@
 
 import { createHash } from "node:crypto";
 import type { ArtifactStore } from "../artifacts/ArtifactStore.ts";
+import { modelFamily, sameFamily as sameFamilyId } from "../capability/modelRecord.ts";
 import { id } from "../core/ids.ts";
 import type { CandidateLifecycle, GitRepo, IntegrationRunRecord } from "../git/GitRepo.ts";
 import type { WorktreeInfo } from "../git/GitRepo.ts";
@@ -125,6 +126,16 @@ const MODEL_CAPACITY_MARKERS: ReadonlySet<string> = new Set(["transient:server_u
 const REQUEST_SPECIFIC_REFUSAL = /invalid model name/i;
 
 const sameModel = (a: ModelRef, b: ModelRef): boolean => modelKey(a) === modelKey(b);
+
+/**
+ * Reviewer independence is a property of the model FAMILY: two ids of one
+ * family are one author. A model whose family cannot be established counts as
+ * the same family, so it is never recorded as independent.
+ */
+const sameFamily = (a: ModelRef, b: ModelRef): boolean => sameFamilyId(a.id, b.id);
+
+/** Upper bound on routed candidates examined while looking for a different family. */
+const MAX_FAMILY_PROBES = 16;
 
 /** Missions whose producing models are remembered for reviewer separation. */
 export const MAX_TRACKED_MISSIONS = 256;
@@ -652,12 +663,24 @@ export function realBackends(opts: RealBackendsOptions) {
         // only when nothing else is left, a producing model (reduced).
         const producers = producedBy.get(input.missionId ?? "") ?? [];
         const fallback = opts.reviewFallbackModel;
+        const independentOfProducers = (model: ModelRef): boolean =>
+          modelFamily(model.id) !== undefined && !producers.some((m) => sameFamily(m, model));
         const pickReviewer = async (tried: ModelRef[]): Promise<ModelRoute | undefined> => {
-          const distinct = await opts.routeModel?.(req.role, {
-            exclude: [...producers, ...tried],
-            missionId: input.missionId,
-          });
-          if (distinct) return distinct;
+          // Prefer a model of a different family; remember the first sibling of a
+          // producer's family (or unknown family) in case nothing better exists.
+          const passedOver: ModelRef[] = [];
+          let sibling: ModelRoute | undefined;
+          for (let probe = 0; probe < MAX_FAMILY_PROBES; probe++) {
+            const candidate = await opts.routeModel?.(req.role, {
+              exclude: [...producers, ...tried, ...passedOver],
+              missionId: input.missionId,
+            });
+            if (!candidate) break;
+            if (independentOfProducers(candidate)) return candidate;
+            sibling ??= candidate;
+            passedOver.push({ provider: candidate.provider, id: candidate.id });
+          }
+          if (sibling) return sibling;
           if (fallback && !tried.some((m) => sameModel(m, fallback)) && !opts.isModelUnavailable?.(fallback)) {
             return { ...fallback, warning: reducedIndependence(fallback, "no distinct reviewer model is available") };
           }
@@ -665,11 +688,18 @@ export function realBackends(opts: RealBackendsOptions) {
             ? opts.routeModel?.(req.role, { exclude: tried, missionId: input.missionId })
             : undefined;
         };
-        const reviewWarning = (route: ModelRoute): string | undefined =>
-          route.warning ??
-          (producers.some((m) => sameModel(m, route))
-            ? reducedIndependence(route, "the only reviewer model left produced this work")
-            : undefined);
+        const reviewWarning = (route: ModelRoute): string | undefined => {
+          if (route.warning) return route.warning;
+          if (producers.some((m) => sameModel(m, route))) {
+            return reducedIndependence(route, "the only reviewer model left produced this work");
+          }
+          if (modelFamily(route.id) === undefined) {
+            return reducedIndependence(route, "the reviewer model's family cannot be established");
+          }
+          return producers.some((m) => sameFamily(m, route))
+            ? reducedIndependence(route, "the only reviewer models left share a model family with this work's producer")
+            : undefined;
+        };
         const notify = (summary: string): void => {
           input.onActivity?.({
             kind: "execution",
