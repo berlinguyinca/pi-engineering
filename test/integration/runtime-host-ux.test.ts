@@ -52,9 +52,19 @@ async function world(opts: { autoUpdateCheck?: boolean; beforeStart?: (w: { inst
   const pi: PiTestSession = await startPiSession({ factories: [(api: never) => ext.install(api)], cwd });
   cleanups.push(() => pi.close());
   const host = ext.host as NonNullable<typeof ext.host>;
-  const settle = async () => {
-    b.values.length = 0;
-    await pi.emit({ type: "agent_settled" });
+  const settle = async (expected?: string) => {
+    // A single agent_settled emit can race a handover: after an update, the new
+    // generation's agent_settled handler may not be registered yet, so one emit
+    // reads the stale value. Poll (briefly) until the expected value appears
+    // (or, without an expectation, the first observed value), so the assertion
+    // reflects the settled state instead of the transient one.
+    for (let i = 0; i < 400; i++) {
+      b.values.length = 0;
+      await pi.emit({ type: "agent_settled" });
+      const v = b.values.at(-1);
+      if (expected === undefined || v === expected) return v;
+      await new Promise((r) => setTimeout(r, 25));
+    }
     return b.values.at(-1);
   };
   const run = async (cmd: string) => {
@@ -77,7 +87,7 @@ test("/engineering version and the panel show version, generation, schema, compa
     stateSchema: { minReadable: 7, maxReadable: 7, writes: 7 },
   });
   await w.run("/engineering update");
-  assert.equal(await w.settle(), "C");
+  assert.equal(await w.settle("C"), "C");
   const text = w.ext.versionText();
   assert.match(text, /Version:\s+0\.2\.2/);
   assert.match(text, new RegExp(`Commit:\\s+${v1.slice(0, 7)}`));
@@ -125,14 +135,14 @@ test("/engineering rollback: previous version, named version, migration undone f
     migration: { from: 7, to: 8, behaviour: "ok" },
   });
   await w.run("/engineering update");
-  assert.equal(await w.settle(), "C");
+  assert.equal(await w.settle("C"), "C");
   assert.equal(readStateSchema(w.state), 8);
   const vB = w.ext.layout.readPointer("previous") as string;
   const vC = w.ext.layout.readPointer("current") as string;
 
   await w.run("/engineering rollback");
   assert.equal(w.host.lastHandover?.ok, true, w.host.lastHandover?.failure);
-  assert.equal(await w.settle(), "B");
+  assert.equal(await w.settle("B"), "B");
   assert.equal(w.ext.layout.readPointer("current"), vB);
   assert.equal(w.ext.layout.readPointer("previous"), vC);
   assert.equal(readStateSchema(w.state), 7, "pre-migration state restored for the older runtime");
@@ -143,7 +153,7 @@ test("/engineering rollback: previous version, named version, migration undone f
   assert.equal(started?.rollback_version, "0.2.1");
 
   await w.run("/engineering rollback 0.9.9");
-  assert.equal(await w.settle(), "B", "an unknown version is refused; nothing changes");
+  assert.equal(await w.settle("B"), "B", "an unknown version is refused; nothing changes");
   assert.equal(w.ext.layout.readPointer("current"), vB);
 });
 
@@ -197,7 +207,7 @@ test("automatic update check: on by default, reports availability, installs noth
   assert.equal(readPreferences(w.ext.layout.preferencesFile).lastAvailable?.version, "0.2.1");
   assert.ok(runtimeStatusLines().includes("Status        available"));
   assert.equal(w.ext.layout.readPointer("current"), null, "automatic installation is disabled by default");
-  assert.equal(await w.settle(), "A");
+  assert.equal(await w.settle("A"), "A");
   assert.ok(w.ext.telemetry.recent(100).some((e) => e.event === "runtime.update.available"));
 });
 
@@ -218,6 +228,6 @@ test("automatic installation only when explicitly configured", async () => {
   });
   w.repo.publish({ version: "0.2.1", value: "B", stateSchema: { minReadable: 7, maxReadable: 7, writes: 7 } });
   await w.ext.automaticCheck();
-  assert.equal(await w.settle(), "B");
+  assert.equal(await w.settle("B"), "B");
   assert.ok(existsSync(w.ext.layout.readPointer("current") as string));
 });
