@@ -44,7 +44,7 @@ import type { MissionStore } from "./missionStore.ts";
 import type { MissionObservability } from "./observability/MissionObservability.ts";
 import { computeProgress } from "./observability/progress.ts";
 import type { ActivityType, WaitingReason } from "./observability/types.ts";
-import type { DispatchAuthority, MissionOwnership } from "./ownership.ts";
+import { type DispatchAuthority, type MissionOwnership, RepositoryLeasedError } from "./ownership.ts";
 import { deriveRequiredGates, mutationFactFromChangedFiles } from "./policies.ts";
 import {
   FailureClassifier,
@@ -260,6 +260,7 @@ export interface OrchestrateOptions {
 
 /** Executions whose build activity is remembered for the budget-exhausted hint. */
 const MAX_TRACKED_BUILD_EXECUTIONS = 256;
+const REPOSITORY_WAIT_CEILING_MS = 600_000;
 
 /** Finding category for committed worker work that integration refused to merge. */
 const STRANDED_WORKER_WORK = "stranded_worker_work";
@@ -339,6 +340,12 @@ export class Orchestrator {
   private readonly repositoryRegistry?: RepositoryRegistry;
   private readonly launchCwd: string;
   private readonly ownership?: MissionOwnership;
+  /** Repository-lease wait policy; the clock and sleep are injectable for tests. */
+  readonly repositoryWait: { ceilingMs: number; now: () => number; sleep: (ms: number) => Promise<void> } = {
+    ceilingMs: REPOSITORY_WAIT_CEILING_MS,
+    now: Date.now,
+    sleep: (ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
+  };
   private readonly ownershipByMission = new Map<string, import("./types.ts").MissionLease>();
   /** Run controllers of missions executing in this process, for an explicit cancel. */
   private readonly liveRuns = new Map<string, AbortController>();
@@ -410,7 +417,7 @@ export class Orchestrator {
       now: opts.now,
       sleep: opts.sleep,
       rand: opts.rand,
-      acquireAuthority: this.ownership ? (task) => this.acquireTaskAuthority(task) : undefined,
+      acquireAuthority: this.ownership ? (task, signal) => this.acquireTaskAuthorityWaiting(task, signal) : undefined,
       recovery: opts.recovery,
       onStatus: (notice) => {
         const obs = this.observability;
@@ -2741,7 +2748,7 @@ export class Orchestrator {
         // deterministic harnesses while still using the guarded Git primitive.
         integrated = await this.broker.promoteCandidate(missionId);
       } else {
-        const promotionAuthority = await this.acquireTaskAuthority(integrationTask);
+        const promotionAuthority = await this.acquireTaskAuthorityWaiting(integrationTask);
         try {
           promotionAuthority.assertAuthoritative();
           integrated = await this.broker.promoteCandidate(missionId, promotionAuthority);
@@ -2951,7 +2958,11 @@ export class Orchestrator {
   }
 
   /** Create and run one fresh independent review task over the integrated result. */
-  private async runReviewGate(mission: Mission, signal?: AbortSignal): Promise<boolean> {
+  private async runReviewGate(
+    mission: Mission,
+    signal?: AbortSignal,
+    opts: { concurrentWithValidation?: boolean } = {},
+  ): Promise<boolean> {
     this.store.transitionMission(mission.mission_id, "REVIEWING");
     const gates = new Set<RequiredGate>(mission.required_gates);
     const role = gates.has("security_review") ? "security-review" : "reviewer";
@@ -2974,7 +2985,7 @@ export class Orchestrator {
       objective: `Fresh independent review of the integrated change. Mission: ${mission.goal}${recoveryNote}`,
       mutates_repo: false,
       isolation: "none",
-      depends_on: this.lastValidationTaskId(mission.mission_id),
+      depends_on: opts.concurrentWithValidation ? [] : this.lastValidationTaskId(mission.mission_id),
       repo_id: this.repoIdForMission(mission.mission_id),
       ...this.boundedTaskFields(mission.mission_id, ["independent-review"], []),
     });
@@ -3135,7 +3146,36 @@ export class Orchestrator {
       });
     }
 
-    if (gates.has("validation") || anyMutation) {
+    const needsValidation = gates.has("validation") || anyMutation;
+    const needsReview =
+      gates.has("independent_review") ||
+      gates.has("security_review") ||
+      gates.has("compatibility_review") ||
+      anyMutation;
+    // A validation that only reuses the integration run's verification result
+    // finishes at once and produces nothing the review needs: run them together.
+    // A validation that really runs the suite keeps the review waiting on it.
+    if (
+      needsValidation &&
+      needsReview &&
+      (await this.broker.validationWillReuse(mission.mission_id, this.repoIdForMission(mission.mission_id)))
+    ) {
+      validationAttempted = true;
+      reviewAttempted = true;
+      // The peek can be stale (the entry may vanish before validation runs): the
+      // review starts beside validation only once validation confirms the reuse,
+      // otherwise it waits for validation like any other review.
+      const reuse = this.broker.watchValidationReuse(mission.mission_id);
+      const validating = this.runValidationGate(mission, signal).finally(() => reuse.settle());
+      const reviewing = reuse.confirmed.then((reused) =>
+        this.runReviewGate(mission, signal, { concurrentWithValidation: reused }),
+      );
+      [validationOk, reviewOk] = await Promise.all([validating, reviewing]);
+      if (!signal?.aborted) this.store.transitionMission(mission.mission_id, "FINAL_VALIDATION");
+      return { validationAttempted, validationOk, reviewAttempted, reviewOk, integrationOk };
+    }
+
+    if (needsValidation) {
       validationAttempted = true;
       validationOk = await this.runValidationGate(mission, signal);
       if (signal?.aborted) {
@@ -3158,12 +3198,7 @@ export class Orchestrator {
       }
     }
 
-    if (
-      gates.has("independent_review") ||
-      gates.has("security_review") ||
-      gates.has("compatibility_review") ||
-      anyMutation
-    ) {
+    if (needsReview) {
       reviewAttempted = true;
       reviewOk = await this.runReviewGate(mission, signal);
       if (signal?.aborted) {
@@ -3244,7 +3279,7 @@ export class Orchestrator {
   ): Promise<boolean> {
     if (!this.recoveryTaskGenerations.has(taskId)) await this.renewMissionOwnership(missionId);
     let task = this.store.getTask(taskId)!;
-    const authority = this.ownership ? await this.acquireTaskAuthority(task) : undefined;
+    const authority = this.ownership ? await this.acquireTaskAuthorityWaiting(task, extra.signal) : undefined;
     if (authority) task = this.store.assignTaskAuthority(taskId, authority.missionIdentity);
     authority?.assertAuthoritative();
     this.store.transitionTask(taskId, "RUNNING");
@@ -3476,7 +3511,59 @@ export class Orchestrator {
     this.ownershipByMission.set(missionId, await this.ownership.renew(identity));
   }
 
-  private async acquireTaskAuthority(task: OrchestrationTask): Promise<DispatchAuthority> {
+  /**
+   * acquireTaskAuthority that treats a repository leased to another mission as a
+   * named wait (visible in the mission snapshot) instead of a failure. Backs off
+   * up to the same ceiling as cross-session custody waits.
+   */
+  async acquireTaskAuthorityWaiting(task: OrchestrationTask, signal?: AbortSignal): Promise<DispatchAuthority> {
+    const { ceilingMs, now, sleep } = this.repositoryWait;
+    const deadline = now() + ceilingMs;
+    let backoffMs = 50;
+    for (;;) {
+      try {
+        const authority = await this.acquireTaskAuthority(task);
+        this.clearRepositoryWait(task);
+        return authority;
+      } catch (error) {
+        if (!(error instanceof RepositoryLeasedError) || signal?.aborted) {
+          this.clearRepositoryWait(task);
+          throw error;
+        }
+        if (this.store.getRepositoryWait(task.task_id) === undefined) {
+          this.store.setRepositoryWait(task.task_id, {
+            repoId: error.repoId,
+            holderMissionId: error.holderMissionId,
+            holderOwnerId: error.holderOwnerId,
+          });
+          this.observability?.setWaiting(
+            task.mission_id,
+            "repository_lease",
+            `Waiting for repository ${error.repoId} held by mission ${error.holderMissionId}`,
+          );
+        }
+        // Ceiling: the wait stays recorded (named, durable, resumable); the
+        // caller leaves the task READY rather than failing or blocking it.
+        if (now() >= deadline) throw error;
+        await sleep(Math.min(backoffMs, Math.max(1, deadline - now())));
+        backoffMs = Math.min(backoffMs * 2, 2_000);
+      }
+    }
+  }
+
+  private clearRepositoryWait(task: OrchestrationTask): void {
+    if (this.store.getRepositoryWait(task.task_id) === undefined) return;
+    this.store.clearRepositoryWait(task.task_id);
+    this.observability?.clearWaiting(task.mission_id);
+  }
+
+  /** Take mission ownership for work scheduled outside orchestrate()/resume (e.g. an external scheduler). */
+  async adoptMissionOwnership(missionId: string): Promise<void> {
+    if (!this.ownership) throw new Error("orchestrator has no ownership provider");
+    this.ownershipByMission.set(missionId, await this.ownership.acquire(missionId));
+  }
+
+  async acquireTaskAuthority(task: OrchestrationTask): Promise<DispatchAuthority> {
     const currentResumptionGeneration = this.store.listMissionResumptions(task.mission_id).at(-1)?.generation ?? 0;
     const lineageDecisions = this.store
       .listTaskSupersessions(task.mission_id)
@@ -3509,7 +3596,11 @@ export class Orchestrator {
     if (task.mutates_repo && !task.repo_id) {
       throw new Error(`mutating task ${task.task_id} has no repository identity`);
     }
-    const held = await this.ownership.maintain(identity, task.mutates_repo ? task.repo_id : undefined);
+    // Workers run in their own worktrees under lane coordination only. The
+    // exclusive repository lease guards integration into the candidate and
+    // promotion into the shared checkout, so only the integration task takes it.
+    const takesRepositoryLease = task.mutates_repo && task.kind === "integration";
+    const held = await this.ownership.maintain(identity, takesRepositoryLease ? task.repo_id : undefined);
     return {
       get missionIdentity() {
         return held.missionIdentity;

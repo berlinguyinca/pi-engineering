@@ -360,6 +360,55 @@ export class GitRepo {
   }
 
   /**
+   * How worktree admin waits for another process's promotion critical section.
+   * Promotion is short and lives in the shared checkout; a worker allocating a
+   * worktree queues behind it instead of failing and burning an attempt.
+   */
+  promotionWait: { ceilingMs: number; pollMs: number; now: () => number; sleep: (ms: number) => Promise<void> } = {
+    ceilingMs: 600_000,
+    pollMs: 50,
+    now: Date.now,
+    sleep: (ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
+  };
+
+  /**
+   * Run worktree admin (add / branch create / reconcile / cleanup) under a short
+   * per-repo cross-process file lock, first waiting out any promotion critical
+   * section. Bounded by the promotion-wait ceiling and abortable through the
+   * guard (lost authority throws out of the wait).
+   */
+  private async withWorktreeSection<T>(guard: GitMutationGuard | undefined, fn: () => Promise<T>): Promise<T> {
+    const { ceilingMs, pollMs, now, sleep } = this.promotionWait;
+    const deadline = now() + ceilingMs;
+    const lockFile = join(await this.commonDir(), "pi-engineering-worktree");
+    let backoff = pollMs;
+    for (let polls = 0; ; polls++) {
+      guard?.assertAuthoritative();
+      let lock: ExclusiveFileLock | undefined;
+      let failure: unknown;
+      try {
+        await this.assertPromotionUnlocked();
+        lock = await ExclusiveFileLock.acquire(lockFile);
+      } catch (error) {
+        failure = error;
+      }
+      if (lock) {
+        try {
+          return await fn();
+        } finally {
+          lock.release();
+        }
+      }
+      const unrelated = (failure as NodeJS.ErrnoException | undefined)?.code;
+      if (now() >= deadline || polls >= Math.ceil(ceilingMs / pollMs) + 1 || (unrelated && unrelated !== "ENOENT")) {
+        throw failure;
+      }
+      await sleep(Math.min(backoff, Math.max(1, deadline - now())));
+      backoff = Math.min(backoff * 2, 1_000);
+    }
+  }
+
+  /**
    * True when a durable record provably belongs to another (missionId, repoId).
    *
    * The state directory lives in the git common dir, which every linked
@@ -1188,14 +1237,15 @@ export class GitRepo {
     const mountedHead = await this.headCommitIn(record.path).catch(() => null);
     if (mountedHead === record.candidateSha) return { path: record.path, branch: record.branch };
     if (mountedHead !== null) return null;
-    await this.assertPromotionUnlocked();
-    guard?.assertAuthoritative();
-    const add = await this.git(["worktree", "add", record.path, record.branch]);
-    if (add.code !== 0) return null;
-    guard?.assertAuthoritative();
-    return (await this.headCommitIn(record.path)) === record.candidateSha
-      ? { path: record.path, branch: record.branch }
-      : null;
+    return this.withWorktreeSection(guard, async () => {
+      guard?.assertAuthoritative();
+      const add = await this.git(["worktree", "add", record.path, record.branch]);
+      if (add.code !== 0) return null;
+      guard?.assertAuthoritative();
+      return (await this.headCommitIn(record.path)) === record.candidateSha
+        ? { path: record.path, branch: record.branch }
+        : null;
+    });
   }
 
   async beginCandidateCheck(
@@ -1398,34 +1448,35 @@ export class GitRepo {
    * removed first (crash recovery).
    */
   async createWorktree(baseCommit: string, branch: string, guard?: GitMutationGuard): Promise<WorktreeInfo> {
-    return this.serialize(async () => {
-      await this.assertPromotionUnlocked();
-      // Place the worktree as a SIBLING of the repo root (outside the working
-      // tree). Deriving the path from `this.cwd` would, when the runtime is
-      // opened from a subdirectory, drop the worktree INSIDE the repo (visible
-      // as an untracked dir in the main tree). repoRoot is stable regardless of
-      // where the runtime was opened.
-      const parent = join(this.repoRoot, "..");
-      const path = join(parent, `pi-eng-${shortHash(this.repoRoot)}-${branch}`);
-      // Defense in depth: never let stale-cleanup remove the primary checkout or
-      // a path outside this repo's worktree namespace (see assertSafeWorktreePath).
-      this.assertSafeWorktreePath(path);
-      await mkdir(parent, { recursive: true }).catch(() => {});
-      // Crash recovery: clear any stale worktree or leftover directory at the path.
-      guard?.assertAuthoritative();
-      await this.git(["worktree", "remove", "--force", path]).catch(() => {});
-      guard?.assertAuthoritative();
-      await this.git(["branch", "-D", branch]).catch(() => {});
-      guard?.assertAuthoritative();
-      await this.forgetWorktreeAdmin(path);
-      guard?.assertAuthoritative();
-      await rm(path, { recursive: true, force: true }).catch(() => {});
-      guard?.assertAuthoritative();
-      const add = await this.git(["worktree", "add", path, "-b", branch, baseCommit]);
-      if (add.code !== 0) throw new Error(`git worktree add failed: ${add.stderr}`);
-      await this.linkSharedNodeModules(path);
-      return { path, branch };
-    });
+    return this.serialize(() =>
+      this.withWorktreeSection(guard, async () => {
+        // Place the worktree as a SIBLING of the repo root (outside the working
+        // tree). Deriving the path from `this.cwd` would, when the runtime is
+        // opened from a subdirectory, drop the worktree INSIDE the repo (visible
+        // as an untracked dir in the main tree). repoRoot is stable regardless of
+        // where the runtime was opened.
+        const parent = join(this.repoRoot, "..");
+        const path = join(parent, `pi-eng-${shortHash(this.repoRoot)}-${branch}`);
+        // Defense in depth: never let stale-cleanup remove the primary checkout or
+        // a path outside this repo's worktree namespace (see assertSafeWorktreePath).
+        this.assertSafeWorktreePath(path);
+        await mkdir(parent, { recursive: true }).catch(() => {});
+        // Crash recovery: clear any stale worktree or leftover directory at the path.
+        guard?.assertAuthoritative();
+        await this.git(["worktree", "remove", "--force", path]).catch(() => {});
+        guard?.assertAuthoritative();
+        await this.git(["branch", "-D", branch]).catch(() => {});
+        guard?.assertAuthoritative();
+        await this.forgetWorktreeAdmin(path);
+        guard?.assertAuthoritative();
+        await rm(path, { recursive: true, force: true }).catch(() => {});
+        guard?.assertAuthoritative();
+        const add = await this.git(["worktree", "add", path, "-b", branch, baseCommit]);
+        if (add.code !== 0) throw new Error(`git worktree add failed: ${add.stderr}`);
+        await this.linkSharedNodeModules(path);
+        return { path, branch };
+      }),
+    );
   }
 
   /**
@@ -1554,123 +1605,124 @@ export class GitRepo {
     guard?: GitMutationGuard,
     hooks: WorktreeRemovalHooks = {},
   ): Promise<void> {
-    return this.serialize(async () => {
-      await this.assertPromotionUnlocked();
-      let pending: PendingBranchCleanup | undefined;
-      if (!opts.keepBranch && opts.cleanupIdentity) {
-        const inventory = await this.loadPendingBranchCleanupInventory(
-          opts.cleanupIdentity.missionId,
-          opts.cleanupIdentity.repoId,
-        );
-        if (inventory.diagnostics.length > 0) {
-          throw new Error(
-            `cleanup journal identity is corrupt; refusing Git mutation: ${inventory.diagnostics
-              .map((diagnostic) => `${diagnostic.file}: ${diagnostic.reason}`)
-              .join("; ")}`,
+    return this.serialize(() =>
+      this.withWorktreeSection(guard, async () => {
+        let pending: PendingBranchCleanup | undefined;
+        if (!opts.keepBranch && opts.cleanupIdentity) {
+          const inventory = await this.loadPendingBranchCleanupInventory(
+            opts.cleanupIdentity.missionId,
+            opts.cleanupIdentity.repoId,
           );
+          if (inventory.diagnostics.length > 0) {
+            throw new Error(
+              `cleanup journal identity is corrupt; refusing Git mutation: ${inventory.diagnostics
+                .map((diagnostic) => `${diagnostic.file}: ${diagnostic.reason}`)
+                .join("; ")}`,
+            );
+          }
+          pending = inventory.records.find((record) => record.branch === info.branch && record.path === info.path);
+          const expectedJournal = join(
+            await this.candidateStateDir(false),
+            this.branchCleanupStateName({ ...opts.cleanupIdentity, path: info.path, branch: info.branch }),
+          );
+          if (!pending) {
+            try {
+              await access(expectedJournal);
+              throw new Error("cleanup journal canonical filename does not match its payload identity");
+            } catch (error) {
+              if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+            }
+          }
+          if (inventory.records.length > 0 && !pending) {
+            throw new Error("cleanup ownership does not match the requested repository worktree path and branch");
+          }
+          if (!pending) {
+            pending = {
+              ...opts.cleanupIdentity,
+              path: info.path,
+              branch: info.branch,
+              state: "intent",
+              updatedAt: new Date().toISOString(),
+            };
+            await this.persistPendingBranchCleanup(pending, guard);
+            await hooks.afterIntent?.();
+          }
         }
-        pending = inventory.records.find((record) => record.branch === info.branch && record.path === info.path);
-        const expectedJournal = join(
-          await this.candidateStateDir(false),
-          this.branchCleanupStateName({ ...opts.cleanupIdentity, path: info.path, branch: info.branch }),
-        );
-        if (!pending) {
+        if (!pending || pending.state === "intent") {
+          let worktreeExists = true;
           try {
-            await access(expectedJournal);
-            throw new Error("cleanup journal canonical filename does not match its payload identity");
+            await access(info.path);
           } catch (error) {
-            if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+            if ((error as NodeJS.ErrnoException).code === "ENOENT") worktreeExists = false;
+            else throw error;
           }
-        }
-        if (inventory.records.length > 0 && !pending) {
-          throw new Error("cleanup ownership does not match the requested repository worktree path and branch");
-        }
-        if (!pending) {
-          pending = {
-            ...opts.cleanupIdentity,
-            path: info.path,
-            branch: info.branch,
-            state: "intent",
-            updatedAt: new Date().toISOString(),
-          };
-          await this.persistPendingBranchCleanup(pending, guard);
-          await hooks.afterIntent?.();
-        }
-      }
-      if (!pending || pending.state === "intent") {
-        let worktreeExists = true;
-        try {
-          await access(info.path);
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code === "ENOENT") worktreeExists = false;
-          else throw error;
-        }
-        if (worktreeExists) {
-          const listed = await this.git(["worktree", "list", "--porcelain"], { preserveStdout: true });
-          if (listed.code !== 0) throw new Error(`cleanup ownership lookup failed: ${listed.stderr}`);
-          const expectedBranch = `refs/heads/${info.branch}`;
-          const entries = listed.stdout.split(/\n\n+/);
-          const pathEntry = entries.find((entry) => entry.split("\n").includes(`worktree ${info.path}`));
-          if (!pathEntry) {
-            // ORPHANED worktree: the git metadata is gone (e.g. the primary
-            // checkout's `.git/worktrees` was lost). `git worktree list` no
-            // longer sees it, so `git worktree remove` would fail. Recover by
-            // removing the leftover working directory safely, never the primary.
-            // Pending-cleanup recovery only: a worktree-shaped checkout of another
-            // root is not ours to delete, so skip it. Anything else still throws.
-            if (
-              !(
-                opts.cleanupIdentity &&
-                !this.isOwnWorktreePath(info.path) &&
-                this.hasWorktreeShape(info.path, info.branch)
-              )
-            ) {
-              this.assertSafeWorktreePath(info.path);
+          if (worktreeExists) {
+            const listed = await this.git(["worktree", "list", "--porcelain"], { preserveStdout: true });
+            if (listed.code !== 0) throw new Error(`cleanup ownership lookup failed: ${listed.stderr}`);
+            const expectedBranch = `refs/heads/${info.branch}`;
+            const entries = listed.stdout.split(/\n\n+/);
+            const pathEntry = entries.find((entry) => entry.split("\n").includes(`worktree ${info.path}`));
+            if (!pathEntry) {
+              // ORPHANED worktree: the git metadata is gone (e.g. the primary
+              // checkout's `.git/worktrees` was lost). `git worktree list` no
+              // longer sees it, so `git worktree remove` would fail. Recover by
+              // removing the leftover working directory safely, never the primary.
+              // Pending-cleanup recovery only: a worktree-shaped checkout of another
+              // root is not ours to delete, so skip it. Anything else still throws.
+              if (
+                !(
+                  opts.cleanupIdentity &&
+                  !this.isOwnWorktreePath(info.path) &&
+                  this.hasWorktreeShape(info.path, info.branch)
+                )
+              ) {
+                this.assertSafeWorktreePath(info.path);
+                guard?.assertAuthoritative();
+                await rm(info.path, { recursive: true, force: true }).catch(() => {});
+              }
+            } else if (!pathEntry.split("\n").includes(`branch ${expectedBranch}`)) {
+              throw new Error("cleanup ownership does not match an exact repository worktree path and branch mapping");
+            } else {
               guard?.assertAuthoritative();
-              await rm(info.path, { recursive: true, force: true }).catch(() => {});
-            }
-          } else if (!pathEntry.split("\n").includes(`branch ${expectedBranch}`)) {
-            throw new Error("cleanup ownership does not match an exact repository worktree path and branch mapping");
-          } else {
-            guard?.assertAuthoritative();
-            const removed = await this.git(["worktree", "remove", "--force", info.path]);
-            if (removed.code !== 0) {
-              throw new Error(`git worktree remove failed for ${info.path}: ${removed.stderr || removed.stdout}`);
+              const removed = await this.git(["worktree", "remove", "--force", info.path]);
+              if (removed.code !== 0) {
+                throw new Error(`git worktree remove failed for ${info.path}: ${removed.stderr || removed.stdout}`);
+              }
             }
           }
-        }
-        // Targeted, for the same reason creation is: a global prune here would
-        // be able to delete a concurrently-created sibling's administration.
-        guard?.assertAuthoritative();
-        await this.forgetWorktreeAdmin(info.path);
-        if (pending) {
-          pending = { ...pending, state: "worktree_removed", updatedAt: new Date().toISOString() };
-          await this.persistPendingBranchCleanup(pending, guard);
-          await hooks.afterWorktreeRemoved?.();
-        }
-      }
-      if (!opts.keepBranch && (!pending || pending.state === "worktree_removed")) {
-        const branchExists = (await this.resolveCommit(info.branch)) !== null;
-        if (branchExists) {
+          // Targeted, for the same reason creation is: a global prune here would
+          // be able to delete a concurrently-created sibling's administration.
           guard?.assertAuthoritative();
-          const deleted = hooks.deleteBranch
-            ? await hooks.deleteBranch()
-            : await this.git(["branch", "-D", info.branch]);
-          if (deleted.code !== 0) {
-            throw new Error(`git branch delete failed for ${info.branch}: ${deleted.stderr || deleted.stdout}`);
+          await this.forgetWorktreeAdmin(info.path);
+          if (pending) {
+            pending = { ...pending, state: "worktree_removed", updatedAt: new Date().toISOString() };
+            await this.persistPendingBranchCleanup(pending, guard);
+            await hooks.afterWorktreeRemoved?.();
           }
         }
-        if (pending) {
-          pending = { ...pending, state: "branch_deleted", updatedAt: new Date().toISOString() };
-          await this.persistPendingBranchCleanup(pending, guard);
-          await hooks.afterBranchDeleted?.();
+        if (!opts.keepBranch && (!pending || pending.state === "worktree_removed")) {
+          const branchExists = (await this.resolveCommit(info.branch)) !== null;
+          if (branchExists) {
+            guard?.assertAuthoritative();
+            const deleted = hooks.deleteBranch
+              ? await hooks.deleteBranch()
+              : await this.git(["branch", "-D", info.branch]);
+            if (deleted.code !== 0) {
+              throw new Error(`git branch delete failed for ${info.branch}: ${deleted.stderr || deleted.stdout}`);
+            }
+          }
+          if (pending) {
+            pending = { ...pending, state: "branch_deleted", updatedAt: new Date().toISOString() };
+            await this.persistPendingBranchCleanup(pending, guard);
+            await hooks.afterBranchDeleted?.();
+          }
         }
-      }
-      if (pending?.state === "branch_deleted") {
-        guard?.assertAuthoritative();
-        await rm(join(await this.candidateStateDir(), this.branchCleanupStateName(pending)), { force: true });
-      }
-    });
+        if (pending?.state === "branch_deleted") {
+          guard?.assertAuthoritative();
+          await rm(join(await this.candidateStateDir(), this.branchCleanupStateName(pending)), { force: true });
+        }
+      }),
+    );
   }
 
   /**

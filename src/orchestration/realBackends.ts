@@ -21,17 +21,27 @@ import { ROLE_BUDGETS } from "../core/types.ts";
 import type { CandidateLifecycle, GitRepo, IntegrationRunRecord } from "../git/GitRepo.ts";
 import type { WorktreeInfo } from "../git/GitRepo.ts";
 import { type ModelRef, modelKey } from "../lifecycle/types.ts";
-import { NO_TARGETS_WARNING, type VerificationProvider } from "../verify/Verifier.ts";
+import { NO_TARGETS_WARNING, type VerificationProvider, type VerifyOutcome } from "../verify/Verifier.ts";
 import { subtractBaselineFailures } from "../verify/baselineSubtraction.ts";
+import { hasCachedVerification, verifyOnce } from "../verify/resultCache.ts";
 import { MODEL_SUPERSEDED } from "../workers/WorkerExecutor.ts";
 import type { WorkerActivity, WorkerExecutor, WorkerRequest, WorkerRun } from "../workers/WorkerExecutor.ts";
 import {
   type CheckpointRecoveryContext,
   type ExecutionOutcome,
   type IntegrationHandoff,
+  VERIFY_CACHE_NOTICE,
   workerTimeoutMs,
 } from "./broker.ts";
 import { normalizeReviewSeverity, validateAcceptanceResults } from "./evidence.ts";
+
+/** What a verification run concluded, in the shape the result cache stores. */
+interface JudgedVerification {
+  passed: boolean;
+  outcome: VerifyOutcome;
+  warnings: string[];
+  inheritedFailures: string[];
+}
 
 export interface RealBackendsOptions {
   worker: WorkerExecutor;
@@ -775,24 +785,51 @@ export function realBackends(opts: RealBackendsOptions) {
         const cwd = input.worktree ?? repo.cwd;
         const profile = await opts.verifier.detect(cwd);
         input.signal.throwIfAborted();
-        const firstOutcome = await opts.verifier.run(cwd, profile, opts.artifacts, { signal: input.signal });
-        const judged = repo.git
-          ? await subtractBaselineFailures({
-              git: repo.git,
-              verifier: opts.verifier,
-              artifacts: opts.artifacts,
-              baseSha: input.baseSha,
-              cwd,
-              profile,
-              outcome: firstOutcome,
-              signal: input.signal,
-            })
-          : undefined;
-        // The judged outcome: the candidate's re-run when it had stopped at an inherited failure.
-        const outcome = judged?.outcome ?? firstOutcome;
-        const passed = judged ? judged.passed : outcome.passed;
-        const warnings = [...(outcome.warnings ?? []), ...(judged?.warnings ?? [])];
-        const inheritedFailures = judged?.inheritedFailures ?? [];
+        const run = async (): Promise<{ value: JudgedVerification; passed: boolean }> => {
+          const firstOutcome = await opts.verifier.run(cwd, profile, opts.artifacts, { signal: input.signal });
+          const judged = repo.git
+            ? await subtractBaselineFailures({
+                git: repo.git,
+                verifier: opts.verifier,
+                artifacts: opts.artifacts,
+                baseSha: input.baseSha,
+                cwd,
+                profile,
+                outcome: firstOutcome,
+                signal: input.signal,
+              })
+            : undefined;
+          // The judged outcome: the candidate's re-run when it had stopped at an inherited failure.
+          const outcome = judged?.outcome ?? firstOutcome;
+          const passed = judged ? judged.passed : outcome.passed;
+          return {
+            passed,
+            value: {
+              passed,
+              outcome,
+              warnings: [...(outcome.warnings ?? []), ...(judged?.warnings ?? [])],
+              inheritedFailures: judged?.inheritedFailures ?? [],
+            },
+          };
+        };
+        // The suite ran at integration on this very commit: reuse that result.
+        const verified = repo.git
+          ? await verifyOnce(
+              { cwd, commonDir: await repo.git.commonDir(), profile, baseSha: input.baseSha },
+              run,
+              input.signal,
+            )
+          : { value: (await run()).value, runId: "", reused: false };
+        const { outcome, passed, warnings, inheritedFailures } = verified.value;
+        if (verified.reused) {
+          input.onActivity?.({
+            kind: "execution",
+            stage: "validation",
+            phase: "started",
+            summary: `${VERIFY_CACHE_NOTICE} validation reused verification run ${verified.runId} for this candidate commit`,
+            meaningfulProgress: false,
+          });
+        }
         const artifactRefs = outcome.evidence.flatMap((e) => e.artifacts).filter(Boolean);
         const artifactState = await artifactContentHashes(opts.artifacts, artifactRefs);
         // A repo with no detectable checks: nothing ran, nothing FAILED. It
@@ -821,6 +858,7 @@ export function realBackends(opts: RealBackendsOptions) {
             profile: profile.name,
             exitCode: passed && !outcome.noTargets ? 0 : (outcome.stages.find((stage) => !stage.passed)?.exitCode ?? 1),
             testSummary: {
+              ...(verified.reused ? { reused: true, originalRunId: verified.runId } : {}),
               stages: outcome.stages.map((stage) => ({
                 name: stage.stage.name,
                 exitCode: stage.exitCode,
@@ -836,6 +874,22 @@ export function realBackends(opts: RealBackendsOptions) {
             acceptanceResults: [],
           },
         };
+      },
+      /** True when `runValidation` would reuse a stored integration result (review may then run alongside it). */
+      async willReuse(input: { repoId?: string; worktree?: string | null; baseSha?: string }): Promise<boolean> {
+        const repo = await repository(input.repoId);
+        if (!repo.git || !input.worktree) return false;
+        try {
+          const profile = await opts.verifier.detect(input.worktree);
+          return await hasCachedVerification({
+            cwd: input.worktree,
+            commonDir: await repo.git.commonDir(),
+            profile,
+            baseSha: input.baseSha,
+          });
+        } catch {
+          return false;
+        }
       },
     },
     review: {
@@ -1171,21 +1225,41 @@ export function realBackends(opts: RealBackendsOptions) {
           }
           const checks = await opts.verifier.detect(candidateCwd);
           input.signal.throwIfAborted();
-          const firstResult = await opts.verifier.run(candidateCwd, checks, opts.artifacts, { signal: input.signal });
-          // Failures already red on the base commit are inherited, not introduced.
-          const judged = await subtractBaselineFailures({
-            git: repo.git,
-            verifier: opts.verifier,
-            artifacts: opts.artifacts,
-            baseSha: input.candidateLifecycle?.baseSha ?? (input.candidate ? undefined : base),
-            cwd: candidateCwd,
-            profile: checks,
-            outcome: firstResult,
-            signal: input.signal,
-          });
-          const result = judged.outcome;
-          const checksPassed = judged.passed;
-          const warnings = [...(result.warnings ?? []), ...judged.warnings];
+          const git = repo.git;
+          const integrationBase = input.candidateLifecycle?.baseSha ?? (input.candidate ? undefined : base);
+          const verified = await verifyOnce(
+            { cwd: candidateCwd, commonDir: await git.commonDir(), profile: checks, baseSha: integrationBase },
+            async () => {
+              const firstResult = await opts.verifier.run(candidateCwd, checks, opts.artifacts, {
+                signal: input.signal,
+              });
+              // Failures already red on the base commit are inherited, not introduced.
+              const judged = await subtractBaselineFailures({
+                git,
+                verifier: opts.verifier,
+                artifacts: opts.artifacts,
+                baseSha: integrationBase,
+                cwd: candidateCwd,
+                profile: checks,
+                outcome: firstResult,
+                signal: input.signal,
+              });
+              return {
+                passed: judged.passed,
+                value: {
+                  passed: judged.passed,
+                  outcome: judged.outcome,
+                  warnings: [...(judged.outcome.warnings ?? []), ...judged.warnings],
+                  inheritedFailures: judged.inheritedFailures,
+                },
+              };
+            },
+            input.signal,
+          );
+          const result = verified.value.outcome;
+          const checksPassed = verified.value.passed;
+          const warnings = verified.value.warnings;
+          const judged = { inheritedFailures: verified.value.inheritedFailures };
           if (input.candidateLifecycle) {
             await repo.git.completeCandidateCheck(
               input.candidateLifecycle,

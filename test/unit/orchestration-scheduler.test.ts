@@ -699,10 +699,15 @@ describe("MissionScheduler (spec 02)", () => {
 
     const firstRun = firstScheduler.runMission(firstMission.mission_id);
     await firstDispatched;
-    await secondScheduler.runMission(secondMission.mission_id);
+    // A repository leased to another mission is a wait, not a BLOCKED failure:
+    // the second task keeps being offered, never runs while the lease is held.
+    const secondAbort = new AbortController();
+    const secondRun = secondScheduler.runMission(secondMission.mission_id, secondAbort.signal);
+    await new Promise((resolve) => setTimeout(resolve, 150));
     assert.equal(secondCalls, 0);
-    assert.equal(store.getTask(secondTask.task_id)?.status, "BLOCKED");
-    assert.match(store.getTask(secondTask.task_id)?.failure_reason ?? "", /repo-shared.*mission/i);
+    assert.notEqual(store.getTask(secondTask.task_id)?.status, "BLOCKED");
+    secondAbort.abort();
+    await secondRun.catch(() => undefined);
 
     releaseFirst();
     await firstRun;

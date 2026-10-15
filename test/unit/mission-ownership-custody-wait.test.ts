@@ -75,6 +75,16 @@ function harness(freeAfter: number, custodyWaitMs = 30_000, missionId = "MSN-con
 }
 
 describe("custody contention waits instead of failing", () => {
+  it("backs off from short pauses to the poll interval within the same ceiling", async () => {
+    const h = harness(4);
+    await h.ownership.acquire(h.missionId, { resumptionGeneration: 0 });
+    // 250 + 500 + 1000 + 2000 ms: an early release is noticed within a quarter second, not 5 s.
+    assert.equal(h.clk.elapsed(), 3_750);
+    const never = harness(Number.POSITIVE_INFINITY, 30_000);
+    await assert.rejects(() => never.ownership.acquire(never.missionId, { resumptionGeneration: 0 }), /custody/);
+    assert.equal(never.clk.elapsed(), 30_000, "the ceiling is unchanged");
+  });
+
   it("takes the mission once the other session releases", async () => {
     const h = harness(3);
     const lease = await h.ownership.acquire(h.missionId, { resumptionGeneration: 0 });
