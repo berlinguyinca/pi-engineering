@@ -4,6 +4,7 @@ import { basename, join } from "node:path";
 import type { ArtifactStore } from "../artifacts/ArtifactStore.ts";
 import type { Evidence, EvidenceTrust } from "../core/types.ts";
 import { withRustBuildEnv } from "../git/rustBuildCache.ts";
+import { type MissionBuildOptions, admitMissionBuild } from "../resources/buildBudget.ts";
 import {
   type BaselineVerdict,
   type FailureBaseline,
@@ -401,6 +402,10 @@ export interface VerifyRunOptions {
   baseline?: FailureBaseline;
   /** The base SHA the candidate is bound to. A baseline for any other SHA is stale. */
   boundBaseSha?: string;
+  /** Mission this run belongs to; with {@link build} its Rust stages get a per-mission `CARGO_TARGET_DIR`. */
+  missionId?: string;
+  /** Build directory and disk admission for the mission (see src/resources/buildBudget.ts). */
+  build?: MissionBuildOptions;
   /** Run every stage even after a required stage fails (a baseline must see the whole profile). */
   exhaustive?: boolean;
   /** Keep going after a required failure in these stages (their failure is inherited from the base). */
@@ -656,10 +661,12 @@ async function resolveJsEntry(
  * so candidate worktrees reuse compiled dependencies instead of each growing
  * their own `target/`.
  */
-async function cleanEnv(cwd: string): Promise<NodeJS.ProcessEnv> {
+async function cleanEnv(cwd: string, extra: Record<string, string> = {}): Promise<NodeJS.ProcessEnv> {
   const env = { ...process.env };
   delete env.NODE_TEST_CONTEXT;
   await withRustBuildEnv(env, cwd);
+  // The mission's own target dir (issue #144) replaces the shared per-worktree one.
+  Object.assign(env, extra);
   const bin = await localBinDir(cwd);
   if (bin) {
     const pathKey = Object.keys(env).find((k) => k.toUpperCase() === "PATH") ?? "PATH";
@@ -783,13 +790,21 @@ export class CommandVerifier implements VerificationProvider {
       let stdout = "";
       let stderr = "";
       let code = -1;
-      const res = await runWithInactivityGuard(stage.command, stage.args, {
-        cwd: stage.cwd ?? cwd,
-        inactivityMs: stage.timeoutMs ?? DEFAULT_STAGE_INACTIVITY_MS,
-        ...(resolveStageWatchdog(stage) ? { watchdog: resolveStageWatchdog(stage) } : {}),
-        env: await cleanEnv(stage.cwd ?? cwd),
-        ...(opts?.signal ? { signal: opts.signal } : {}),
-      });
+      // Per-mission build dir and disk admission (R-BUILD): a stage that would
+      // start a build on a full disk fails before it runs.
+      const admission =
+        opts?.missionId && opts.build
+          ? await admitMissionBuild(stage.cwd ?? cwd, opts.missionId, opts.build)
+          : { env: {} as Record<string, string> };
+      const res = admission.refused
+        ? { code: 1, stdout: "", stderr: admission.refused, hung: false, leftoverProcesses: 0, spawnFailed: true }
+        : await runWithInactivityGuard(stage.command, stage.args, {
+            cwd: stage.cwd ?? cwd,
+            inactivityMs: stage.timeoutMs ?? DEFAULT_STAGE_INACTIVITY_MS,
+            ...(resolveStageWatchdog(stage) ? { watchdog: resolveStageWatchdog(stage) } : {}),
+            env: await cleanEnv(stage.cwd ?? cwd, admission.env),
+            ...(opts?.signal ? { signal: opts.signal } : {}),
+          });
       stdout = res.stdout;
       stderr = res.stderr;
       code = res.hung && res.code === 0 ? 1 : res.code;
@@ -816,6 +831,9 @@ export class CommandVerifier implements VerificationProvider {
         stderrBytes: Buffer.byteLength(stderr),
         // The command died of the environment (hang guard, spawn error), not of its own verdict.
         ...(res.hung || res.spawnFailed ? { infrastructureFailure: true } : {}),
+        ...(admission.pressure && admission.pressure.level !== "ok"
+          ? { buildPressure: admission.pressure.level, buildPressureReason: admission.pressure.reason }
+          : {}),
         ...(res.stalled
           ? { stalled: res.stalled.level, stallSilentMs: res.stalled.silentMs, stallEvidence: res.stalled.evidence }
           : {}),

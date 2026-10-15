@@ -30,6 +30,7 @@ export type EvidenceType =
   | "package_load"
   | "roadmap_test"
   | "dogfood"
+  | "dogfood_mission"
   | "fresh_review"
   | "test";
 
@@ -73,6 +74,11 @@ export interface ReleaseGateRequire {
   packageLoad: "pass";
   /** Fresh-context review gate. */
   freshReview: { unresolvedCritical: number; unresolvedHigh: number };
+  /**
+   * When true, a VERIFIED milestone with no passing `dogfood_mission` record
+   * pinned at or after its latest scope change is demoted to IMPLEMENTED.
+   */
+  realMissionDogfood?: boolean;
 }
 
 export interface ReleaseGateDef {

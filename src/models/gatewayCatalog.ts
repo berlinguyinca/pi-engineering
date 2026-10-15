@@ -41,6 +41,12 @@ export interface GatewayModelEntry {
   backingModel?: string;
   /** Logical routes a concrete model currently serves (`x_aliases`). */
   aliases?: string[];
+  /** Capabilities the gateway advertises for the model (`x_capabilities` / `capabilities`). */
+  capabilities?: string[];
+  /** Model family (`x_family`); independent reviewers must differ in family. */
+  family?: string;
+  /** Whether the model supports tool calling (`x_tools`); undefined when not advertised. */
+  tools?: boolean;
 }
 
 function num(value: unknown): number | undefined {
@@ -54,6 +60,10 @@ function num(value: unknown): number | undefined {
 
 function str(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function strs(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((v): v is string => typeof v === "string" && v.length > 0) : [];
 }
 
 /**
@@ -98,6 +108,10 @@ export function parseGatewayModels(payload: unknown): GatewayModelEntry[] {
     const slots = typeof row.slots === "number" && Number.isFinite(row.slots) ? row.slots : undefined;
     const activeLimit = num(row.x_active_limit) ?? num(row.active_limit);
     const maxRequestBytes = num(row.x_max_request_bytes) ?? num(row.max_request_bytes);
+    // Routing facts are kept exactly as advertised: absent stays undefined, never a guess.
+    const capabilities = strs(row.x_capabilities ?? row.capabilities);
+    const family = str(row.x_family);
+    const tools = typeof row.x_tools === "boolean" ? row.x_tools : undefined;
     out.push({
       id,
       contextWindow,
@@ -109,6 +123,9 @@ export function parseGatewayModels(payload: unknown): GatewayModelEntry[] {
       ...(alias ? { alias } : {}),
       ...(backingModel ? { backingModel } : {}),
       ...(aliases.length > 0 ? { aliases } : {}),
+      ...(capabilities.length > 0 ? { capabilities } : {}),
+      ...(family ? { family } : {}),
+      ...(tools !== undefined ? { tools } : {}),
     });
   }
   return out.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
