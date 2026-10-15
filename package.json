@@ -4,13 +4,7 @@
   "description": "Autonomous engineering runtime for the pi coding agent: Engineering Ledger, fresh-context workers, isolated candidates, deterministic verification, and independent review.",
   "license": "MIT",
   "type": "module",
-  "keywords": [
-    "pi-package",
-    "engineering",
-    "orchestration",
-    "ledger",
-    "agent"
-  ],
+  "keywords": ["pi-package", "engineering", "orchestration", "ledger", "agent"],
   "exports": {
     ".": "./src/index.ts"
   },
@@ -59,9 +53,7 @@
     "typescript": "^5.6.0"
   },
   "pi": {
-    "extensions": [
-      "./src/runtime/host/entry.ts"
-    ]
+    "extensions": ["./src/runtime/host/entry.ts"]
   },
   "piEngineering": {
     "runtimeApi": 1,

@@ -112,11 +112,7 @@ async function replayStore(repo: string): Promise<MissionStore> {
  * Poll the replayed store until the mission is durably present (or a bounded
  * deadline) instead of reading once, so the test reflects the settled state.
  */
-async function waitForReplayedMission(
-  repo: string,
-  missionId: string,
-  timeoutMs = 10_000,
-): Promise<MissionStore> {
+async function waitForReplayedMission(repo: string, missionId: string, timeoutMs = 10_000): Promise<MissionStore> {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     try {
