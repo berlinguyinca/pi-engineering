@@ -42,8 +42,22 @@ export interface AutoSpecHandle {
 
 export type AutoSpecRunState = "queued" | "running" | "succeeded" | "failed" | "cancelled";
 
+/** One verification stage as AutoSpec reports it. The output is what makes it evidence; an exit code alone is not. */
+export interface AutoSpecStageReport {
+  readonly name: string;
+  readonly command: string;
+  readonly exitCode: number;
+  /** The stage's captured output. Empty or absent output is not evidence. */
+  readonly output: string;
+  readonly durationMs?: number;
+}
+
 export interface AutoSpecObservation {
   readonly state: AutoSpecRunState;
+  /** A short account of the run, when AutoSpec gives one. */
+  readonly summary?: string;
+  /** For a verification run: the stages it ran. */
+  readonly stages?: readonly AutoSpecStageReport[];
   /** RFC 3339 time of AutoSpec's last sign of progress; absent before any. */
   readonly lastProgressAt?: string;
   /** Increases with every observable change; a reader ignores a lower one than it has seen. */
