@@ -2094,6 +2094,7 @@ ${RECOVERY_PROMPT}`;
         signal: ctx.signal,
         // Esc pauses the mission (resumable); only /mission cancel ends it.
         interrupt: "pause",
+        ...(plannerWorker.lastDecision() ? { executionMode: plannerWorker.lastDecision()! } : {}),
         onProgress: (line) => {
           // De-duplicate the trailing completion lines (phase transitions and
           // task settlements can fire within the same tick).

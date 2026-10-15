@@ -579,3 +579,18 @@ describe("leftover background processes after verification (PR #106 re-review)",
     });
   }
 });
+
+test("verifier stage results carry a measured durationMs", async () => {
+  const dir = await makeProject({
+    "package.json": JSON.stringify({ scripts: { test: 'node -e "setTimeout(() => process.exit(0), 150)"' } }),
+  });
+  try {
+    const store = await ArtifactStore.create(join(dir, "artifacts"));
+    const v = new CommandVerifier();
+    const outcome = await v.run(dir, await v.detect(dir), store);
+    const stage = outcome.stages[0];
+    assert.ok((stage?.durationMs ?? 0) >= 100, `durationMs=${stage?.durationMs}`);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});

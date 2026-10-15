@@ -693,7 +693,7 @@ export class EngineeringRuntime {
             spec: this.buildSpecApprovalSnapshot(m.mission_id),
             executions: this.missionStore!.listExecutions(m.mission_id),
             classifications: this.missionStore!.listFailureClassifications(m.mission_id),
-            verifierStages: buildVerifierStages(this.missionStore!, m.mission_id),
+            verifierStages: buildVerifierStages(this.missionStore!.listValidationEvidence(m.mission_id)),
           }));
           latest = buildMissionSnapshotFile(missions);
           const path = join(this.workDir, MISSION_SNAPSHOT_FILENAME);

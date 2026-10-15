@@ -7,7 +7,13 @@
  * numbers appear in the published snapshot and in `why`.
  */
 import type { MissionStore } from "./missionStore.ts";
-import type { Execution, FailureClassification, OrchestrationTask, RecoveryDecision } from "./types.ts";
+import type {
+  Execution,
+  FailureClassification,
+  OrchestrationTask,
+  RecoveryDecision,
+  ValidationEvidence,
+} from "./types.ts";
 
 /** Wall time of one task, split by where it was spent. */
 export interface TaskWallTime {
@@ -29,9 +35,8 @@ export interface TaskUsage {
   wall: TaskWallTime;
   attempts: number;
   streamResumes: number;
+  /** Thinking policy for the task (thinkingPolicy.ts: mission roles run off; the planner may think). */
   thinking: "off" | "on";
-  /** Zero-tool/probe retries (#197); 0 until the runtime records them. */
-  probeRetries: number;
 }
 
 export type ModelErrorKind = "429" | "404" | "connect-refused" | "stream-stall" | "takeover" | "grammar-400";
@@ -82,7 +87,13 @@ export interface MissionWhy {
     nextActionAt: string;
     remainingMs: number;
   } | null;
-  counters: { probeRetries: number; zeroToolRetries: number };
+  counters: {
+    probeAttempt: number;
+    probeMax: number;
+    zeroToolRetries: number;
+    zeroToolCap: number;
+    zeroToolClass: string | null;
+  };
   inheritedFailures: string[];
   stranded: string[];
   executionMode: ExecutionModeRecord | null;
@@ -107,16 +118,14 @@ export function buildTaskUsage(task: OrchestrationTask, executions: Execution[])
   let prompt = 0;
   let completion = 0;
   let resumes = 0;
-  let probes = 0;
   const wall: TaskWallTime = { totalMs: 0, queuedMs: 0, admittedMs: 0, inferenceMs: 0, toolsMs: 0, verifierMs: 0 };
-  let thinking: "off" | "on" = "off";
+  let thinking: "off" | "on" = task.role === "planner" ? "on" : "off";
   let model: string | null = null;
   for (const ex of executions) {
     const u = ex.usage ?? {};
     prompt += num(u.input) || num(u.promptTokens);
     completion += num(u.output) || num(u.completionTokens);
     resumes += num(u.streamResumes);
-    probes += num(u.probeRetries) + num(u.zeroToolRetries);
     const total = ms(ex.started_at, ex.ended_at);
     const queued = num(u.queuedMs);
     const admitted = num(u.admittedMs);
@@ -131,7 +140,14 @@ export function buildTaskUsage(task: OrchestrationTask, executions: Execution[])
     wall.toolsMs += tools;
     wall.verifierMs += verifier;
     wall.inferenceMs += inference;
-    if (ex.thinking_level && ex.thinking_level !== "off") thinking = "on";
+    const declared = u.thinking ?? ex.thinking_level;
+    if (
+      declared === true ||
+      declared === "on" ||
+      (typeof declared === "string" && !["off", "false"].includes(declared))
+    ) {
+      thinking = "on";
+    }
     if (ex.model) model = ex.model;
   }
   return {
@@ -144,7 +160,6 @@ export function buildTaskUsage(task: OrchestrationTask, executions: Execution[])
     attempts: task.attempt,
     streamResumes: resumes,
     thinking,
-    probeRetries: probes,
   };
 }
 
@@ -197,10 +212,12 @@ export function buildModelErrorRollups(
  * Verifier stage timings from validation evidence, read defensively:
  * `durationMs` / `reused` are optional (#185 adds `reused`).
  */
-export function buildVerifierStages(store: MissionStore, missionId: string): VerifierStageTiming[] {
+type EvidenceSummaries = ReadonlyArray<Pick<ValidationEvidence, "testSummary">>;
+
+export function buildVerifierStages(evidenceList: EvidenceSummaries): VerifierStageTiming[] {
   const out: VerifierStageTiming[] = [];
-  for (const evidence of store.listValidationEvidence(missionId)) {
-    const summary = (evidence as unknown as { testSummary?: { stages?: unknown } }).testSummary;
+  for (const evidence of evidenceList) {
+    const summary = evidence.testSummary as { stages?: unknown } | undefined;
     const stages = Array.isArray(summary?.stages) ? (summary.stages as Array<Record<string, unknown>>) : [];
     for (const stage of stages) {
       out.push({
@@ -214,8 +231,17 @@ export function buildVerifierStages(store: MissionStore, missionId: string): Ver
   return out;
 }
 
+/** Failures that also fail on the candidate's base commit (baseline subtraction). */
+export function inheritedFailuresOf(evidenceList: EvidenceSummaries): string[] {
+  const out = new Set<string>();
+  for (const evidence of evidenceList) {
+    const list = (evidence.testSummary as { inheritedFailures?: unknown } | undefined)?.inheritedFailures;
+    if (Array.isArray(list)) for (const f of list) out.add(String(f));
+  }
+  return [...out];
+}
+
 const CUSTODY = /custody of another live session \(((?:[^()]|\([^)]*\))*)\)/i;
-const BRANCH = /\b(?:pi-eng\/[\w./-]+|candidate\/[\w./-]+|worker\/[\w./-]+)/g;
 
 export interface ExplainOptions {
   now?: number;
@@ -305,26 +331,31 @@ export function explainMission(store: MissionStore, missionId: string, options: 
     row.completionTokens += u.completionTokens;
   }
 
-  const inherited = new Set<string>();
+  const inherited = new Set<string>(inheritedFailuresOf(store.listValidationEvidence(missionId)));
   for (const ex of executions) {
     const list = (ex as unknown as { inheritedFailures?: unknown }).inheritedFailures ?? ex.usage?.inheritedFailures;
     if (Array.isArray(list)) for (const f of list) inherited.add(String(f));
   }
   const stranded = new Set<string>(stop?.preservedWork ?? []);
-  for (const text of texts) for (const branch of text.match(BRANCH) ?? []) stranded.add(branch);
+  for (const f of store.listFindings(missionId)) {
+    if (f.category === "stranded_worker_work" && f.status === "open" && f.evidence) stranded.add(f.evidence);
+  }
+
+  const zeroTool = /(\d+)\/(\d+) zero-tool-call retries \(([^)]*)\)/.exec(pending?.expectedMaterialChange ?? "");
 
   const remedies: string[] = [];
   const terminal = ["COMPLETE", "FAILED", "CANCELED"].includes(mission.status);
   if (!terminal) {
+    const named = [stop?.resumeCondition, pending?.operatorGuidance].filter((t): t is string => Boolean(t));
     remedies.push(`/mission resume ${missionId}`);
-    if (
-      /pin|model|404|429|grammar/i.test(`${reason ?? ""} ${classification?.category ?? ""}`) ||
-      classification?.category === "PROVIDER_PERMANENT"
-    ) {
+    // Releasing a pin helps only when the mission carries one and the stop or decision names it.
+    if (mission.operator_model_pin && named.some((t) => /pin/i.test(t))) {
       remedies.push(`/mission resume ${missionId} --model auto`);
     }
     remedies.push(`/mission cancel ${missionId}`);
+    if (stop?.resumeCondition) remedies.push(`resume condition: ${stop.resumeCondition}`);
     if (pending?.operatorGuidance) remedies.push(`operator question: ${pending.operatorGuidance}`);
+    if (pending && pending.action === "PROBE_AND_BACKOFF") remedies.push(`wait: ${pending.expectedMaterialChange}`);
   }
 
   return {
@@ -342,12 +373,15 @@ export function explainMission(store: MissionStore, missionId: string, options: 
     custody,
     cooldown,
     counters: {
-      probeRetries: usage.reduce((n, u) => n + u.probeRetries, 0),
-      zeroToolRetries: executions.reduce((n, e) => n + num(e.usage?.zeroToolRetries), 0),
+      probeAttempt: pending?.attempt ?? 0,
+      probeMax: pending?.maxAttempts ?? 0,
+      zeroToolRetries: zeroTool ? Number(zeroTool[1]) : 0,
+      zeroToolCap: zeroTool ? Number(zeroTool[2]) : 0,
+      zeroToolClass: zeroTool?.[3] ?? null,
     },
     inheritedFailures: [...inherited],
     stranded: [...stranded],
-    executionMode: options.executionMode ?? null,
+    executionMode: options.executionMode ?? mission.execution_mode ?? null,
     usage,
     usageByRole,
     modelErrors: buildModelErrorRollups(executions, classifications),
@@ -390,7 +424,10 @@ export function formatMissionWhy(why: MissionWhy): string {
       `Cooldown: ${c.scope} ${c.action} attempt ${c.attempt}/${c.maxAttempts}, nextActionAt ${c.nextActionAt} (${duration(c.remainingMs)} remaining)`,
     );
   }
-  lines.push(`Retries: probe=${why.counters.probeRetries} zero-tool=${why.counters.zeroToolRetries}`);
+  const c = why.counters;
+  lines.push(
+    `Retries: probe ${c.probeAttempt}/${c.probeMax}, zero-tool ${c.zeroToolRetries}/${c.zeroToolCap}${c.zeroToolClass ? ` (${c.zeroToolClass})` : ""}`,
+  );
   if (why.inheritedFailures.length) lines.push(`Inherited failures: ${why.inheritedFailures.join(", ")}`);
   if (why.stranded.length) lines.push(`Stranded work: ${why.stranded.join(", ")}`);
   lines.push(

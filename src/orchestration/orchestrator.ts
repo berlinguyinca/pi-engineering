@@ -253,6 +253,8 @@ export interface OrchestrateOptions {
    * `/mission resume <id>`; only `Orchestrator.cancel` then terminates it.
    */
   interrupt?: InterruptMode;
+  /** Execution mode decision recorded on the mission at creation. */
+  executionMode?: { mode: string; reason: string };
 }
 
 /** Executions whose build activity is remembered for the budget-exhausted hint. */
@@ -1612,6 +1614,7 @@ export class Orchestrator {
       workflow_class: intent.suggested_workflow,
       parent_session_id: this.parentSessionId,
     });
+    if (opts.executionMode) this.store.updateMission(mission.mission_id, { execution_mode: opts.executionMode });
     const expectedResumptionGeneration = this.store.listMissionResumptions(mission.mission_id).at(-1)?.generation ?? 0;
     const liveRun = opts.signal ? this.runControllers.get(opts.signal) : undefined;
     if (liveRun) {

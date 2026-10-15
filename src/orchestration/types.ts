@@ -139,6 +139,8 @@ export interface Mission {
    * nothing automatic (supervisor, auto-resume, repair) may resume the mission.
    */
   operator_paused_at?: string | null;
+  /** Execution mode chosen at planning time and why (chooseExecutionMode). */
+  execution_mode?: { mode: string; reason: string };
 }
 
 /** A model the operator chose explicitly for a session's missions. */

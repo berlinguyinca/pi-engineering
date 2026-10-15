@@ -6,7 +6,12 @@ import { describe, it } from "node:test";
 import { runMissionsCommand } from "../../src/orchestration/missionCancelCli.ts";
 import { buildMissionSnapshotFile } from "../../src/orchestration/missionSnapshot.ts";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
-import { explainMission, formatMissionWhy } from "../../src/orchestration/missionWhy.ts";
+import {
+  buildVerifierStages,
+  explainMission,
+  formatMissionWhy,
+  inheritedFailuresOf,
+} from "../../src/orchestration/missionWhy.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 
 function seed(store: MissionStore, missionId = "MSN-why") {
@@ -72,7 +77,9 @@ describe("mission why", () => {
       missionId,
       classificationId: "FC-1",
       action: "PROBE_AND_BACKOFF",
-      expectedMaterialChange: "provider answers",
+      expectedMaterialChange:
+        "waiting for provider: 3/5 zero-tool-call retries (connection error); next probe at 2026-10-15T10:01:30.000Z",
+      operatorGuidance: "Is the gateway down? Release the pin if so.",
       attempt: 2,
       maxAttempts: 6,
       deadline: null,
@@ -84,7 +91,13 @@ describe("mission why", () => {
     assert.equal(why.cooldown?.scope, "PROVIDER_TRANSIENT");
     assert.equal(why.cooldown?.remainingMs, 90_000);
     assert.equal(why.cooldown?.nextActionAt, new Date(now + 90_000).toISOString());
-    assert.equal(why.counters.probeRetries, 0);
+    assert.deepEqual(
+      [why.counters.probeAttempt, why.counters.probeMax, why.counters.zeroToolRetries, why.counters.zeroToolCap],
+      [2, 6, 3, 5],
+    );
+    assert.equal(why.counters.zeroToolClass, "connection error");
+    assert.ok(why.remedies.some((r) => r.startsWith("operator question: Is the gateway down")));
+    assert.ok(!why.remedies.some((r) => r.includes("--model auto")), "no pin, no --model auto remedy");
     assert.equal(why.modelErrors[0]?.endpoint, "llm.example:8081");
     assert.equal(why.modelErrors[0]?.counts["429"], 1);
     assert.match(formatMissionWhy(why), /1m30s remaining/);
@@ -94,13 +107,54 @@ describe("mission why", () => {
     const store = MissionStore.open(JsonlEventStore.inMemory());
     const { missionId, task } = seed(store);
     failTask(store, task.task_id, "worker stopped");
-    store.stopMission(missionId, {
-      reason: "blocked",
-      preservedWork: ["pi-eng/task-abc"],
-      attemptedRecoveries: [],
-      resumeCondition: "operator",
+    store.addFinding({
+      mission_id: missionId,
+      task_id: task.task_id,
+      severity: "blocking",
+      category: "stranded_worker_work",
+      file: null,
+      line: null,
+      summary: "Worker committed work that integration refused",
+      evidence: "pi-eng/task-abc",
+      recommended_action: "re-adopt",
     });
     assert.deepEqual(explainMission(store, missionId).stranded, ["pi-eng/task-abc"]);
+  });
+
+  it("reads inherited failures and verifier stage timings from evidence summaries", () => {
+    const evidence = [
+      {
+        testSummary: {
+          stages: [{ name: "test", durationMs: 1200, reused: true }, { name: "lint" }],
+          inheritedFailures: ["test/a.test.ts"],
+        },
+      },
+    ];
+    assert.deepEqual(inheritedFailuresOf(evidence), ["test/a.test.ts"]);
+    assert.deepEqual(buildVerifierStages(evidence), [
+      { name: "test", durationMs: 1200, reused: true },
+      { name: "lint", durationMs: null, reused: null },
+    ]);
+  });
+
+  it("shows the persisted execution mode and reason, and releases a pin only when named", () => {
+    const store = MissionStore.open(JsonlEventStore.inMemory());
+    const { missionId } = seed(store);
+    store.updateMission(missionId, {
+      execution_mode: { mode: "single", reason: "auto: question or trivial edit" },
+      operator_model_pin: { provider: "p", id: "m", set_at: new Date().toISOString() },
+    });
+    const why = explainMission(store, missionId);
+    assert.deepEqual(why.executionMode, { mode: "single", reason: "auto: question or trivial edit" });
+    assert.match(formatMissionWhy(why), /Execution mode: single \(auto: question or trivial edit\)/);
+    assert.ok(!why.remedies.some((r) => r.includes("--model auto")));
+    store.stopMission(missionId, {
+      reason: "pinned model unreachable",
+      preservedWork: [],
+      attemptedRecoveries: [],
+      resumeCondition: "release the operator pin with --model auto or restore the pinned model",
+    });
+    assert.ok(explainMission(store, missionId).remedies.includes(`/mission resume ${missionId} --model auto`));
   });
 
   it("types usage and round-trips it through the snapshot", () => {
@@ -148,6 +202,18 @@ describe("mission why", () => {
         env: { ...process.env, PI_ENGINEERING_STATE_DIR: dir },
       });
       assert.equal(code, 0);
+      let jsonText = "";
+      await runMissionsCommand(["why", "--store", dir, "--json", missionId], {
+        write: (t) => {
+          jsonText += t;
+        },
+        error: () => undefined,
+        env: { ...process.env, PI_ENGINEERING_STATE_DIR: dir },
+      });
+      const parsed = JSON.parse(jsonText) as { missionId: string; blocking: { reason: string }; remedies: string[] };
+      assert.equal(parsed.missionId, missionId);
+      assert.equal(parsed.blocking.reason, "boom");
+      assert.deepEqual(parsed.remedies, [`/mission resume ${missionId}`, `/mission cancel ${missionId}`]);
       const normalized = text.replace(/TSK-\w+/g, "TSK-x");
       assert.equal(
         normalized,
@@ -155,7 +221,7 @@ describe("mission why", () => {
           "Mission MSN-why [NEW] why mission",
           "Blocking task: TSK-x [FAILED] do the thing",
           "Failure: unclassified - boom",
-          "Retries: probe=0 zero-tool=0",
+          "Retries: probe 0/0, zero-tool 0/0",
           "Execution mode: not recorded",
           "Usage:",
           "  TSK-x implementer prompt=0 completion=0 attempts=0 resumes=0 thinking=off wall=0s (queued 0s, admitted 0s, inference 0s, tools 0s, verifier 0s)",
