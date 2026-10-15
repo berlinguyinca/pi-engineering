@@ -244,6 +244,7 @@ export function parseRoadmap(
         unresolvedCritical: Number(frRaw.unresolved_critical ?? 0),
         unresolvedHigh: Number(frRaw.unresolved_high ?? 0),
       },
+      realMissionDogfood: requireRaw.real_mission_dogfood === true,
     },
   };
   for (const k of ["unit", "integration"] as const) {

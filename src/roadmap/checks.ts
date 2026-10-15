@@ -62,7 +62,7 @@ export const GENERATED_TYPES: EvidenceType[] = [
 ];
 
 /** Types that must come from recorded/manual evidence (model-dependent). */
-export const MANUAL_TYPES: EvidenceType[] = ["dogfood", "fresh_review"];
+export const MANUAL_TYPES: EvidenceType[] = ["dogfood", "dogfood_mission", "fresh_review"];
 
 export interface RunResult {
   status: "pass" | "fail" | "error";

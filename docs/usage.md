@@ -641,6 +641,63 @@ definition lives in `docs/roadmap/roadmap.yaml`; model-dependent evidence is
 recorded by `node scripts/record-roadmap-evidence.ts --critical 0 --high 0`
 into `docs/roadmap/evidence.yaml`.
 
+### Nightly real-mission dogfood
+
+Unit tests and the deterministic `scripts/dogfood-*.ts` runs never drive a real
+`/mission` through the gateway, so they cannot show that missions complete.
+`scripts/dogfood-real-mission.ts` does: it runs two real missions through
+`EngineeringRuntime` (a docs-only README change, then `multiply(a, b)` with a
+test), each on a fresh green fixture repo with isolated
+`PI_ENGINEERING_STATE_DIR`/`PI_ENGINEERING_HOME`, and writes
+`{kind: "dogfood_mission", sha, missions: [{goal, missionId, status,
+candidateSha, wallMs, calls, inputTokens, outputTokens, model}], ranAt}`. Token
+and call figures come from the same mission-store extraction as
+`pi-engineering missions why --json`. It exits 0 only when both missions reach
+`COMPLETE` within `--timeout-ms` (default 30 minutes each); otherwise it exits 1
+and prints the `missions why` text of the failed mission. It exits 2 without the
+gateway environment:
+
+```bash
+PI_DOGFOOD_GATEWAY_BASE_URL=https://gateway.example/v1 \
+PI_DOGFOOD_GATEWAY_API_KEY=... \
+PI_DOGFOOD_MODEL=metabolomics/qwen3.8-27b-modality-text-quant-mxfp4 \
+  node scripts/dogfood-real-mission.ts --out dogfood/$(git rev-parse HEAD).json
+```
+
+`.github/workflows/nightly-dogfood.yml` runs it at 03:00 UTC (and on manual
+dispatch) on a self-hosted runner, uploads the record as an artifact, and on
+success opens a PR (never pushes to main) adding it as
+`docs/roadmap/dogfood/<sha>.json`. Operator steps; nothing is queued until the
+last one:
+
+1. Register a runner that can reach the gateway with labels `self-hosted` and
+   `inferweave`.
+2. Add repository secrets `DOGFOOD_GATEWAY_BASE_URL` and
+   `DOGFOOD_GATEWAY_API_KEY`.
+3. Add repository variable `DOGFOOD_MODEL`.
+4. Optional: add secret `DOGFOOD_PR_TOKEN` (a PAT or GitHub App token) used to
+   push and open the evidence PR. PRs opened with the default `github.token`
+   do not trigger `pull_request` CI, so without it close and reopen the PR to
+   run CI. Either way, enable "Allow GitHub Actions to create and approve pull
+   requests" (Settings > Actions > General).
+5. Add repository variable `DOGFOOD_RUNNER_READY=true`.
+
+Roadmap effect: `release_gate.require.real_mission_dogfood: true` (set in
+`docs/roadmap/roadmap.yaml`) makes `roadmap check` demote a `VERIFIED`
+milestone to `IMPLEMENTED` unless a passing `dogfood_mission` record is pinned
+to a SHA at or after the latest commit touching that milestone's own
+`scope.paths` (per-milestone, not global `src/`). A record passes only when
+every mission in it is `COMPLETE`. A record is fresh for a
+milestone when no commit reachable from `HEAD` but not from the record's SHA
+touches that milestone's scope (reachability, not commit dates, so merged side
+branches count). Records must be named `<sha>.json` for the `sha` they claim and
+that SHA must exist in the repository; others are ignored and named in the
+demotion blockers. This is an honor system: the record is a committed JSON file
+reviewed in the evidence PR, and nothing cryptographically proves the missions
+ran. `roadmap check --structural` (PR CI) is unaffected. Until the runner exists the release gate therefore reports those
+milestones as `IMPLEMENTED`; run `/mission` on a fixture repo by hand and read
+`missions why` as the interim measure.
+
 ## Optional Blackhole session memory
 
 `pi-blackhole` is an **optional** per-session memory/context provider, pinned to
