@@ -9,7 +9,7 @@ import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import { GitRepo } from "../../src/git/GitRepo.ts";
-import { buildCandidateEvidenceIdentity } from "../../src/orchestration/evidence.ts";
+import { buildCandidateEvidenceIdentity, taskCoverageFingerprint } from "../../src/orchestration/evidence.ts";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
 import { Orchestrator } from "../../src/orchestration/orchestrator.ts";
 import { MissionOwnership } from "../../src/orchestration/ownership.ts";
@@ -24,6 +24,8 @@ interface Options {
   failureReason: string;
   /** Record the candidate with a diff hash the repository cannot verify. */
   unverifiableCandidate?: boolean;
+  /** Which gate failed; defaults to validation. */
+  gate?: "validation" | "review";
 }
 
 async function harness(options: Options) {
@@ -74,7 +76,7 @@ async function harness(options: Options) {
   }
   const runTask = (
     taskId: string,
-    kind: "integration" | "validation",
+    kind: "integration" | "validation" | "review",
     terminal: "SUCCEEDED" | "FAILED",
     reason?: string,
   ) => {
@@ -82,7 +84,7 @@ async function harness(options: Options) {
       task_id: taskId,
       mission_id: missionId,
       kind,
-      role: kind === "integration" ? "integrator" : "validator",
+      role: kind === "integration" ? "integrator" : kind === "review" ? "reviewer" : "validator",
       objective: `${kind} task`,
       repo_id: "repo-gate-resume",
     });
@@ -118,7 +120,7 @@ async function harness(options: Options) {
     "candidate",
     { taskId: "TSK-candidate", executionId: integration.execution_id },
   );
-  const failedExecution = runTask("TSK-failed-gate", "validation", "FAILED", options.failureReason);
+  const failedExecution = runTask("TSK-failed-gate", options.gate ?? "validation", "FAILED", options.failureReason);
   store.classifyFailure(
     new FailureClassifier().classify({
       missionId,
@@ -140,11 +142,11 @@ async function harness(options: Options) {
   await registry.register(manifest);
   const calls = { validation: 0, review: 0, agent: 0 };
   /** A fresh orchestrator over the same store: the in-memory ownership maps start empty, as in a new process. */
-  const buildOrchestrator = (ownerId?: string) =>
+  const buildOrchestrator = (ownership?: MissionOwnership) =>
     new Orchestrator({
       store,
       repositoryRegistry: registry,
-      ownership: ownerId ? new MissionOwnership(store, { ownerId }) : undefined,
+      ownership,
       backends: {
         agent: {
           runAgent: async () => {
@@ -259,7 +261,7 @@ describe("gate resume against a Git-verified candidate (issue #170)", () => {
   it("re-runs the failed gate under the lease a fresh process acquired on resume", async () => {
     const h = await harness({ category: "PROVIDER_TRANSIENT", failureReason: "failed: Connection error." });
     try {
-      const freshProcess = h.buildOrchestrator("fresh-process-controller");
+      const freshProcess = h.buildOrchestrator(new MissionOwnership(h.store, { ownerId: "fresh-process-controller" }));
       h.store.resumeMission(h.missionId, "operator resumed from a new session");
       const resumed = await freshProcess.repairBlockedMission(h.missionId);
 
@@ -270,6 +272,112 @@ describe("gate resume against a Git-verified candidate (issue #170)", () => {
     } finally {
       await h.cleanup();
     }
+  });
+
+  it("re-runs a failed review gate under the lease a fresh process acquired, then releases the lease", async () => {
+    const h = await harness({
+      category: "PROVIDER_TRANSIENT",
+      failureReason: "failed: Connection error.",
+      gate: "review",
+    });
+    try {
+      const freshProcess = h.buildOrchestrator(new MissionOwnership(h.store, { ownerId: "review-controller" }));
+      h.store.resumeMission(h.missionId, "operator resumed from a new session");
+      const resumed = await freshProcess.repairBlockedMission(h.missionId);
+
+      assert.equal(resumed.status, "COMPLETE", JSON.stringify(SIGNALS(h)));
+      assert.equal(h.calls.review, 1);
+      assert.equal(h.calls.agent, 0);
+      const next = new MissionOwnership(h.store, { ownerId: "next-controller" });
+      await assert.doesNotReject(() => next.acquire(h.missionId));
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  describe("fallback to the current resumption lease", () => {
+    type FlightHolder = { recoveryOwnershipByFlight: Map<string, unknown> };
+    const withFlightLease = async (h: Awaited<ReturnType<typeof harness>>, ownerId: string, now?: () => number) => {
+      h.store.resumeMission(h.missionId, "operator resume");
+      const ownership = new MissionOwnership(h.store, { ownerId, leaseMs: 1_000, now });
+      const orchestrator = h.buildOrchestrator(ownership);
+      const generation = h.store.listMissionResumptions(h.missionId).at(-1)!.generation;
+      const lease = await ownership.acquire(h.missionId, { resumptionGeneration: generation });
+      (orchestrator as unknown as FlightHolder).recoveryOwnershipByFlight.set(`${h.missionId}:${generation}`, lease);
+      return { orchestrator, generation };
+    };
+    const plainTask = (h: Awaited<ReturnType<typeof harness>>, id: string, fingerprint?: string) => {
+      h.store.createTask({
+        task_id: id,
+        mission_id: h.missionId,
+        kind: "validation",
+        role: "validator",
+        objective: "plain gate task",
+        replacement_spec_fingerprint: fingerprint,
+        repo_id: "repo-gate-resume",
+      });
+      return h.store.getTask(id)!;
+    };
+
+    it("gives a task with no recovery lineage the current resumption lease", async () => {
+      const h = await harness({ category: "PROVIDER_TRANSIENT", failureReason: "failed: Connection error." });
+      try {
+        const { orchestrator } = await withFlightLease(h, "current-owner");
+        const authority = await orchestrator.acquireTaskAuthority(plainTask(h, "TSK-plain"));
+        assert.doesNotThrow(() => authority.assertAuthoritative());
+        await authority.close();
+      } finally {
+        await h.cleanup();
+      }
+    });
+
+    it("refuses a task whose lineage generation lost its lease instead of lending it the newer one", async () => {
+      const h = await harness({ category: "PROVIDER_TRANSIENT", failureReason: "failed: Connection error." });
+      try {
+        const classification = h.store.listFailureClassifications(h.missionId).at(-1)!;
+        const failed = h.store.getTask("TSK-failed-gate")!;
+        const replacement = plainTask(h, "TSK-lineaged", "fp-lineaged");
+        const decision = h.store.planRecovery({
+          recoveryId: "RCV-old-generation",
+          missionId: h.missionId,
+          classificationId: classification.classificationId,
+          action: "PROBE_AND_BACKOFF",
+          expectedMaterialChange: "probe",
+        } as unknown as Parameters<typeof h.store.planRecovery>[0]);
+        h.store.supersedeTask({
+          supersessionId: "SUP-old-generation",
+          missionId: h.missionId,
+          failedTaskId: failed.task_id,
+          replacementTaskIds: [replacement.task_id],
+          repoId: "repo-gate-resume",
+          acceptanceIds: [],
+          coverageFingerprint: taskCoverageFingerprint(failed),
+          reason: "old generation lineage",
+          createdAt: "2026-09-27T00:00:02.000Z",
+          recoveryDecisionId: decision.recoveryId,
+          expectedReplacementFingerprints: { [replacement.task_id]: "fp-lineaged" },
+        });
+        const { orchestrator } = await withFlightLease(h, "newer-owner");
+        await assert.rejects(() => orchestrator.acquireTaskAuthority(replacement), /has no active ownership/);
+      } finally {
+        await h.cleanup();
+      }
+    });
+
+    it("does not let a fenced owner obtain authority through the fallback", async () => {
+      const h = await harness({ category: "PROVIDER_TRANSIENT", failureReason: "failed: Connection error." });
+      try {
+        let clock = Date.parse("2026-09-27T00:00:10.000Z");
+        const now = () => clock;
+        const { orchestrator, generation } = await withFlightLease(h, "fenced-owner", now);
+        clock += 60_000;
+        const usurper = new MissionOwnership(h.store, { ownerId: "usurper", leaseMs: 1_000, now });
+        await usurper.acquire(h.missionId, { resumptionGeneration: generation });
+        await assert.rejects(() => orchestrator.acquireTaskAuthority(plainTask(h, "TSK-fenced")));
+      } finally {
+        await h.cleanup();
+      }
+    });
   });
 
   it("re-derives a legacy REVIEW_FAILED row whose reason is a transport failure", async () => {

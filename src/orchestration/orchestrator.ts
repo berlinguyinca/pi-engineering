@@ -3593,10 +3593,11 @@ export class Orchestrator {
     let identity = recoveryKey
       ? this.recoveryOwnershipByFlight.get(recoveryKey)
       : this.ownershipByMission.get(task.mission_id);
-    if (!identity) {
-      // A resume registers its lease only for its own flight. Work that carries no
-      // recovery lineage (a re-run gate, or any task in a process that never held the
-      // mission lease) runs under the lease the current resumption acquired.
+    if (!identity && recoveryKey === undefined) {
+      // A resume registers its lease only for its own flight. A task with no recovery
+      // lineage (a re-run gate in a process that never held the mission lease) runs
+      // under the lease the current resumption acquired. A lineaged task whose own
+      // generation's lease is gone must not borrow a newer generation's lease.
       const currentKey = `${task.mission_id}:${currentResumptionGeneration}`;
       const currentLease = this.recoveryOwnershipByFlight.get(currentKey);
       if (currentLease) {
