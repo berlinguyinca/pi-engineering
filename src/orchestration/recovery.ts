@@ -603,3 +603,19 @@ export class RecoveryPlanner {
     };
   }
 }
+
+/**
+ * What a finished recovery attempt actually did: the action that ran, how it
+ * settled, and the gate's current verdict. Reports the live outcome rather than
+ * the previous stop's resume condition.
+ */
+export function describeRecoveryOutcome(
+  decision: Pick<RecoveryDecision, "action" | "status"> | undefined,
+  verdict: { can_complete: boolean; reasons: string[] },
+): string {
+  const ran = decision ? `${decision.action} ${decision.status}` : "no recovery action was started";
+  const gate = verdict.can_complete
+    ? "gate can complete"
+    : `gate blocked: ${verdict.reasons.join("; ") || "no reason reported"}`;
+  return `${ran}; ${gate}`;
+}

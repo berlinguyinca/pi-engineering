@@ -85,7 +85,11 @@ export class CompletionGate {
       ...(evidence.acceptanceProblems ?? []),
     );
 
+    const emptyCandidateProblem = this.emptyCandidateProblem(mission.mission_id);
+    if (emptyCandidateProblem) reasons.push(emptyCandidateProblem);
+
     const structuralProblems =
+      (emptyCandidateProblem ? 1 : 0) +
       (evidence.terminalTaskProblems?.length ?? 0) +
       (evidence.supersessionProblems?.length ?? 0) +
       (evidence.activeExecutionProblems?.length ?? 0) +
@@ -103,6 +107,20 @@ export class CompletionGate {
       running_tasks: running.length,
       superseded_by_recovery: evidence.recoveredTasks,
     };
+  }
+
+  /** A mission that mutates the repository cannot complete on a candidate identical to its base. */
+  private emptyCandidateProblem(missionId: string): string | undefined {
+    const manifest = this.store.getWorkspaceManifest(missionId);
+    if ((manifest?.repositories.length ?? 0) !== 1) return undefined;
+    const candidate = this.store.getCandidate(missionId, manifest?.repositories[0]?.repoId);
+    if (!candidate || candidate.identity.candidateSha !== candidate.identity.baseSha) return undefined;
+    const mutates = this.store
+      .listTasks(missionId)
+      .some((task) => task.mutates_repo && task.repo_id === candidate.identity.repoId);
+    return mutates
+      ? "the current candidate is identical to its base (empty diff): a mutating mission cannot complete on it"
+      : undefined;
   }
 
   gather(missionId: string): GateEvidence {

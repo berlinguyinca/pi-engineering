@@ -19,6 +19,7 @@
  */
 
 import { createHash } from "node:crypto";
+import { existsSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import type { ArtifactStore } from "../artifacts/ArtifactStore.ts";
 import { id } from "../core/ids.ts";
@@ -1564,9 +1565,112 @@ export class ExecutionBroker {
     return !!this.backends[key];
   }
 
+  /**
+   * Rebuild the in-memory candidate and worker-branch state of a mission from
+   * Git and the mission store, so a process that did not run the mission
+   * answers `pendingIntegrations` and `verifiedCandidateContent` like the one
+   * that did. Only state Git can still prove is restored: a candidate whose
+   * lifecycle record and worktree exist, and worker branches that carry
+   * commits past base that no candidate contains.
+   */
+  async rehydrateMission(missionId: string): Promise<void> {
+    const manifest = this.store.getWorkspaceManifest(missionId);
+    if (!manifest || !this.resolveRepository) return;
+    for (const binding of manifest.repositories) {
+      const repository = await this.resolveRepository(binding.repoId, [], missionId);
+      const recorded = this.store.getCandidate(missionId, binding.repoId);
+      if (recorded && !this.missionCandidates.has(missionId)) {
+        const lifecycles = await repository.git.loadCandidateLifecycles(missionId, binding.repoId);
+        const lifecycle = lifecycles.find(
+          (record) =>
+            record.candidateSha === recorded.identity.candidateSha &&
+            ["integrating", "preserved", "promotion_intent"].includes(record.state) &&
+            existsSync(record.path),
+        );
+        if (lifecycle) this.missionCandidates.set(missionId, { lifecycle, git: repository.git });
+      }
+      const containedIn = recorded?.identity.candidateSha ?? binding.baseSha;
+      const superseded = new Set(this.store.listTaskSupersessions(missionId).map((lineage) => lineage.failedTaskId));
+      for (const task of this.store.listTasks(missionId)) {
+        if (task.kind !== "agent" || !task.mutates_repo || task.isolation !== "worktree") continue;
+        if (task.repo_id !== binding.repoId) continue;
+        // A branch an earlier recovery deliberately replaced is not pending work.
+        if (superseded.has(task.task_id)) continue;
+        const branch = `pi-eng-orch-${task.task_id}`;
+        if ((this.missionWorktrees.get(missionId) ?? []).some((worktree) => worktree.branch === branch)) continue;
+        try {
+          const tip = await repository.git.resolveCommit(branch);
+          if (!tip || !(await repository.git.branchAheadOf(binding.baseSha, branch))) continue;
+          if (await repository.git.isAncestor(tip, containedIn)) continue;
+        } catch {
+          continue;
+        }
+        const worktrees = this.missionWorktrees.get(missionId) ?? [];
+        worktrees.push({
+          // The worktree git still knows for the branch; the naming convention
+          // (where createWorktree places it) when none is registered any more.
+          path:
+            (await repository.git.worktreeForBranch(branch).catch(() => null)) ?? repository.git.worktreePath(branch),
+          branch,
+          git: repository.git,
+          repoId: binding.repoId,
+          writeDomains: [...task.write_domains],
+        });
+        this.missionWorktrees.set(missionId, worktrees);
+        // Anything that did not SUCCEED (failed, canceled, stale RUNNING) is
+        // unfinished work: preserve it, never hand it to integration as clean.
+        if (task.status !== "SUCCEEDED") {
+          const executions = this.store.listExecutions(missionId, task.task_id);
+          const marker =
+            executions.at(-1)?.exit_status === WALL_CLOCK_TIMEOUT_MARKER ? WALL_CLOCK_TIMEOUT_MARKER : "failed";
+          const failed =
+            this.failedBranches.get(missionId) ??
+            new Map<string, { marker: string; taskId: string; recoverRef?: string }>();
+          failed.set(branch, { marker, taskId: task.task_id });
+          this.failedBranches.set(missionId, failed);
+        }
+      }
+    }
+  }
+
   /** Branches allocated for a mission that still await an integration merge. */
   pendingIntegrations(missionId: string): number {
     return (this.missionWorktrees.get(missionId) ?? []).length;
+  }
+
+  /**
+   * Worker work that integration will not merge. `eligible` counts the branches
+   * integration would hand off (clean branches and wall-clock-recoverable ones);
+   * `stranded` lists integration-ineligible branches that still carry commits
+   * past the mission base, with the exact tip a later worker can re-adopt.
+   */
+  async strandedWorkerWork(missionId: string): Promise<{
+    eligible: number;
+    stranded: Array<{ branch: string; taskId: string; marker: string; tip: string }>;
+  }> {
+    const failed = this.failedBranches.get(missionId);
+    const missionBase = this.store.getMission(missionId)?.base_ref?.trim() || this.resolvedBases.get(missionId);
+    const manifest = this.store.getWorkspaceManifest(missionId);
+    let eligible = 0;
+    const stranded: Array<{ branch: string; taskId: string; marker: string; tip: string }> = [];
+    for (const worktree of this.missionWorktrees.get(missionId) ?? []) {
+      const failure = failed?.get(worktree.branch);
+      if (!failure || (failure.marker === WALL_CLOCK_TIMEOUT_MARKER && failure.recoverRef)) {
+        eligible++;
+        continue;
+      }
+      // A fresh process has no resolved base: the manifest-bound one is durable.
+      const base = missionBase || manifest?.repositories.find((entry) => entry.repoId === worktree.repoId)?.baseSha;
+      if (!base) continue;
+      try {
+        if (!(await worktree.git.branchAheadOf(base, worktree.branch))) continue;
+        const tip = await worktree.git.resolveCommit(worktree.branch);
+        if (tip) stranded.push({ branch: worktree.branch, taskId: failure.taskId, marker: failure.marker, tip });
+      } catch {
+        // An unanswerable Git query is not proof of preserved work; integration proceeds as before.
+      }
+    }
+    return { eligible, stranded };
   }
 
   /**
@@ -1613,9 +1717,10 @@ export class ExecutionBroker {
     if (!binding) return null;
     const repository = await this.resolveRepository(binding.repoId, [], missionId);
     const target = this.missionCandidates.get(missionId);
-    const candidateSha = target
-      ? await target.git.headCommitIn(target.lifecycle.path)
-      : await repository.git.resolveCommit(candidate.identity.candidateSha);
+    // The mounted candidate worktree is preferred, but a worktree removed after
+    // a failed gate must not erase a durable record Git can still verify.
+    const mounted = target ? await target.git.headCommitIn(target.lifecycle.path).catch(() => null) : null;
+    const candidateSha = mounted ?? (await repository.git.resolveCommit(candidate.identity.candidateSha));
     if (candidateSha !== candidate.identity.candidateSha) return null;
     const diff = await repository.git.captureDiff(binding.baseSha, candidateSha);
     const diffHash = artifactHash(diff);

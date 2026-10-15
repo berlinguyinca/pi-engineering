@@ -481,7 +481,7 @@ export class GitRepo {
     return `pi-eng-candidate-${suffix}`;
   }
 
-  private worktreePath(branch: string): string {
+  worktreePath(branch: string): string {
     return join(this.repoRoot, "..", `pi-eng-${shortHash(this.repoRoot)}-${branch}`);
   }
 
@@ -1201,6 +1201,18 @@ export class GitRepo {
     const r = await this.git(["-C", path, "rev-parse", "HEAD"]);
     if (r.code !== 0) throw new Error(`git rev-parse HEAD in ${path} failed: ${r.stderr}`);
     return r.stdout;
+  }
+
+  /** Path of the worktree that has `branch` checked out, or null when none does. */
+  async worktreeForBranch(branch: string): Promise<string | null> {
+    const args = ["worktree", "list", "--porcelain"];
+    const r = this.requireQuery(await this.git(args, { preserveStdout: true }), "worktree list query", args);
+    let path: string | null = null;
+    for (const line of r.stdout.split("\n")) {
+      if (line.startsWith("worktree ")) path = line.slice("worktree ".length);
+      else if (line === `branch refs/heads/${branch}` && path) return path;
+    }
+    return null;
   }
 
   async currentBranch(): Promise<string | null> {
