@@ -26,7 +26,7 @@ import type { RecoveryProbe } from "../resilience/probe.ts";
 import { describeOperatorPause } from "../runtime/operatorModelPin.ts";
 import type { WorkerActivity } from "../workers/WorkerExecutor.ts";
 import { budgetExhaustedBuildHint } from "../workers/buildActivity.ts";
-import { type BrokerBackends, ExecutionBroker, type ExecutionOutcome } from "./broker.ts";
+import { type BrokerBackends, ExecutionBroker, type ExecutionOutcome, PARTIAL_PROGRESS_SUMMARY } from "./broker.ts";
 import { CheckpointManager } from "./checkpoints.ts";
 import { CompletionGate } from "./completionGate.ts";
 import { hashCandidateEvidenceIdentity, normalizeReviewSeverity, taskCoverageFingerprint } from "./evidence.ts";
@@ -2087,9 +2087,14 @@ export class Orchestrator {
         // The classified summary stays fixed: it is part of the failure
         // fingerprint recovery deduplicates on. The build explanation goes to
         // the reported reason and a finding.
-        const summary =
-          "configured task wall-clock limit (limits.max_task_wall_clock_ms) reached after a durable partial checkpoint";
         const execution = timedCheckpoint.execution!;
+        // A worker-initiated partial is not a budget expiry: word it for what
+        // happened. Both strings are fixed per task (they feed the failure
+        // fingerprint), the partial one naming the checkpoint's own lists.
+        const workerPartial = execution.summary === PARTIAL_PROGRESS_SUMMARY;
+        const summary = workerPartial
+          ? `worker reported partial progress: done [${timedCheckpoint.checkpoint!.completedDeliverables.join(", ")}], remaining [${timedCheckpoint.checkpoint!.remainingDeliverables.join(", ")}]`
+          : "configured task wall-clock limit (limits.max_task_wall_clock_ms) reached after a durable partial checkpoint";
         const builds = this.buildActivity.get(execution.execution_id);
         const startedAt = execution.started_at ? Date.parse(execution.started_at) : Number.NaN;
         const endedAt = execution.ended_at ? Date.parse(execution.ended_at) : this.scheduler.now();

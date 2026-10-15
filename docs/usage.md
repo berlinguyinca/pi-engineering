@@ -46,6 +46,33 @@ The pipeline routes intent, creates a durable **mission**, plans/executes
 workers, runs validation, launches a fresh independent reviewer, and enforces
 the deterministic completion gate — no `/engineer` or `/review` needed.
 
+### worker_result guard, nudge and wrap-up
+
+- **No-change guard.** A mutating worker (implementer, debugger, test-generator,
+  clean-room-challenger) in a mission worktree cannot report `completed` over an
+  untouched worktree: `worker_result` returns an error ("no changes vs base:
+  commit your work or report blocked/partial with a reason") and the session
+  keeps going. Only tracked changes and commits past the worktree's actual fork
+  base (the mission base, or a repair/recovery candidate tip) count; untracked
+  files alone do not. `blocked`, `partial` and `failed` reports are accepted as
+  given. A `partial` report (`details.done` lists finished deliverables) is a
+  resumable checkpoint: the broker keeps its commits, checkpoints the done
+  deliverables, settles the execution like a wall-clock timeout and recovery
+  re-plans only the remaining deliverables, with no retry attempt spent.
+  Read-only roles are unaffected.
+- **In-session nudge.** If a session ends without calling `worker_result`, the
+  worker (or reviewer, with `review_result`) gets exactly one more turn in the
+  same session ("Call worker_result now ..."). It counts as the same attempt; if it is ignored the run settles as the
+  usual no-result failure.
+- **Wrap-up.** When a task has an opt-in wall-clock budget
+  (`limits.max_task_wall_clock_ms` or a task's `execution_budget_ms`), the worker
+  gets one wrap-up turn at 75% of it so a timeout leaves a resumable partial
+  result, and every 20th `bash` / `claim_deliverable` result carries a
+  "Time budget: ... elapsed, ... remaining." line (override the interval with
+  `PI_ENGINEERING_BUDGET_NOTICE_EVERY`). Standalone runs without an owner signal
+  that set `timeoutMs` explicitly get a silence wrap-up turn after 75% of it.
+  With no budget and no explicit `timeoutMs` (the default) nothing is injected.
+
 ### When a worker reaches a configured wall-clock limit
 
 A mutating worker runs in a fresh isolated worktree. A task has no wall-clock

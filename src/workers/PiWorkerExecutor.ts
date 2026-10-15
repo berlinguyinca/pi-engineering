@@ -8,6 +8,7 @@ import {
   SettingsManager,
   type ToolDefinition,
   createAgentSession,
+  createBashToolDefinition,
   createExtensionRuntime,
 } from "@earendil-works/pi-coding-agent";
 import {
@@ -108,11 +109,23 @@ import {
   workerCompactionSettings,
 } from "./contextBudget.ts";
 import { registerLocalProviders } from "./localProviders.ts";
-import { WORKER_KICKOFF, buildSystemPrompt, wantsCommitDiscipline } from "./prompts.ts";
+import { MUTATING_ROLES, WORKER_KICKOFF, buildSystemPrompt, wantsCommitDiscipline } from "./prompts.ts";
 import { guardRuntimeRequestBody } from "./requestBodyGuard.ts";
 import { StreamStallWatchdog, isStalledStream } from "./streamStall.ts";
 import { createNumberedReadTool, createTolerantEditTool } from "./tolerantFileTools.ts";
-import { workerResultTool } from "./workerResultTool.ts";
+import {
+  DEFAULT_BUDGET_NOTICE_EVERY,
+  NUDGE_MESSAGE,
+  REVIEW_NUDGE_MESSAGE,
+  SILENCE_WRAP_UP_MESSAGE,
+  WRAP_UP_FRACTION,
+  WRAP_UP_MESSAGE,
+  type WorkerClock,
+  budgetLine,
+  realClock,
+  withBudgetNotice,
+} from "./wallClockBudget.ts";
+import { createWorkerResultTool } from "./workerResultTool.ts";
 
 /**
  * Maximum APS loop-recovery attempts (Phase 4). Bounded to one: after a
@@ -166,6 +179,8 @@ export interface PiWorkerExecutorOptions {
   transientSleep?: (ms: number) => Promise<void>;
   /** Injectable RNG for backoff jitter (deterministic in tests). */
   transientRand?: () => number;
+  /** Timer seam for the wrap-up and silence timers (tests drive it without real sleeps). */
+  clock?: WorkerClock;
   /**
    * Resumes of a cut stream per execution once tool calls have executed
    * (default 3, PI_STREAM_RESUME_MAX). 0 disables resuming.
@@ -246,6 +261,7 @@ export class PiWorkerExecutor implements WorkerExecutor {
   private readonly transientConfig: BackoffConfig;
   private readonly transientSleep: (ms: number) => Promise<void>;
   private readonly transientRand: () => number;
+  private readonly clock: WorkerClock;
   private readonly streamResumeMax: number;
   /** APS loop-detection options for worker sessions (`false` disables). */
   private readonly aps: AgentProgressSupervisorOptions | false | undefined;
@@ -290,6 +306,7 @@ export class PiWorkerExecutor implements WorkerExecutor {
     this.transientConfig = opts.transientConfig ?? resolveTransientRetryConfig();
     this.transientSleep = opts.transientSleep ?? ((ms) => new Promise<void>((r) => setTimeout(r, ms)));
     this.transientRand = opts.transientRand ?? Math.random;
+    this.clock = opts.clock ?? realClock;
     this.streamResumeMax = opts.streamResumeMax ?? resolveStreamResumeMax();
     this.aps = opts.aps;
     this.loopPrevention = opts.loopPrevention;
@@ -534,11 +551,37 @@ export class PiWorkerExecutor implements WorkerExecutor {
     initialPrompt: string,
     modelRuntime: ModelRuntime,
   ): Promise<WorkerRun> {
-    const terminating = req.resultTool === "review_result" ? reviewResultTool : workerResultTool;
+    // A mutating role with a known base may not report `completed` over an
+    // untouched worktree (the tool answers isError and the session continues).
+    const terminating =
+      req.resultTool === "review_result"
+        ? reviewResultTool
+        : createWorkerResultTool(
+            req.baseRef && MUTATING_ROLES.has(req.role) ? { cwd: req.cwd, baseRef: req.baseRef } : undefined,
+          );
+    // Budgeted runs show elapsed/remaining time in bash and claim_deliverable
+    // results every N of those calls (a no-op without a wall-clock budget).
+    const noticeEvery = Math.max(
+      1,
+      req.budgetNoticeEveryToolCalls ??
+        (Number.parseInt(process.env.PI_ENGINEERING_BUDGET_NOTICE_EVERY ?? "", 10) || DEFAULT_BUDGET_NOTICE_EVERY),
+    );
+    let noticeCalls = 0;
+    const budgetNotice = (tool: ToolDefinition): ToolDefinition =>
+      req.wallClock
+        ? withBudgetNotice(tool, () =>
+            ++noticeCalls % noticeEvery === 0 ? budgetLine(req.wallClock!, this.clock.now()) : undefined,
+          )
+        : tool;
     const customTools = [
       ...this.customTools,
       ...(req.tolerantFileTools ? [createNumberedReadTool(req.cwd), createTolerantEditTool(req.cwd)] : []),
-      ...(offersClaimDeliverable(req) ? [createClaimDeliverableTool(req.deliverables ?? [])] : []),
+      ...(req.wallClock && req.tools.includes("bash")
+        ? [budgetNotice(createBashToolDefinition(req.cwd) as unknown as ToolDefinition)]
+        : []),
+      ...(offersClaimDeliverable(req)
+        ? [budgetNotice(createClaimDeliverableTool(req.deliverables ?? []) as unknown as ToolDefinition)]
+        : []),
       ...(offersCheckpointProgress(req) ? [createCheckpointProgressTool(req.deliverables ?? [])] : []),
       terminating,
     ];
@@ -1299,9 +1342,33 @@ ${recovery.recoveryPrompt}`;
     // process must not keep a hung session alive.
     const inactivityMs = req.timeoutMs ?? 300_000;
     let timer: ReturnType<typeof setTimeout> | undefined;
+    // Wrap-up: one user turn near the end of an opt-in wall-clock budget, or
+    // when a standalone run has been silent for 75% of its inactivity window,
+    // so a timeout yields a resumable partial result. No budget, no injection.
+    let wrapUpTimer: unknown;
+    let wrappedUp = false;
+    const injectWrapUp = (message: string): void => {
+      if (wrappedUp || captured) return;
+      wrappedUp = true;
+      session.steer(message).catch(() => {});
+    };
+    if (req.wallClock) {
+      const at = req.wallClock.startedAt + req.wallClock.budgetMs * WRAP_UP_FRACTION;
+      wrapUpTimer = this.clock.setTimeout(() => injectWrapUp(WRAP_UP_MESSAGE), Math.max(0, at - this.clock.now()));
+    }
+    let silenceTimer: unknown;
     const armInactivity = (): void => {
       if (req.signal) return;
       if (timer) clearTimeout(timer);
+      if (silenceTimer) this.clock.clearTimeout(silenceTimer);
+      // Only an explicitly configured inactivity window earns a silence
+      // wrap-up; the 300s fallback never injects anything.
+      if (req.timeoutMs !== undefined) {
+        silenceTimer = this.clock.setTimeout(
+          () => injectWrapUp(SILENCE_WRAP_UP_MESSAGE),
+          req.timeoutMs * WRAP_UP_FRACTION,
+        );
+      }
       timer = setTimeout(() => {
         timedOut = true;
         void session.abort();
@@ -1534,6 +1601,28 @@ ${recovery.recoveryPrompt}`;
         assistantError = undefined;
         await session.agent.continue();
       }
+      // Order matters: guard steer, then stream resume, then (only on a clean
+      // end) the nudge. A cut stream or overflow leaves assistantError set, so
+      // the nudge never fires on the same turn as a resume or overflow retry.
+      // The session ended cleanly without the terminating call: one nudge in
+      // the SAME session (its prefix is cached, so this is cheap), counted as
+      // the same attempt. Ignored, it settles as the usual no-result failure.
+      if (
+        captured === undefined &&
+        structured === undefined &&
+        !guardAborted &&
+        !budgetExhausted &&
+        !timedOut &&
+        !ownerAborted &&
+        !stalled &&
+        !loopPrevented &&
+        assistantError === undefined &&
+        !req.signal?.aborted
+      ) {
+        await session.prompt(terminatingName === "worker_result" ? NUDGE_MESSAGE : REVIEW_NUDGE_MESSAGE, {
+          expandPromptTemplates: false,
+        });
+      }
     } catch (err) {
       // Capture the error. An abort triggered by the guard/budget/timeout is
       // EXPECTED (session.abort()) and not a transport failure. A rejection
@@ -1544,6 +1633,8 @@ ${recovery.recoveryPrompt}`;
       }
     } finally {
       if (timer) clearTimeout(timer);
+      if (silenceTimer) this.clock.clearTimeout(silenceTimer);
+      if (wrapUpTimer) this.clock.clearTimeout(wrapUpTimer);
       disarmStall();
       req.signal?.removeEventListener("abort", abortFromOwner);
       unsubscribe();

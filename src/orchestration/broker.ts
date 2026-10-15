@@ -138,6 +138,13 @@ export interface ExecutionOutcome {
    */
   error?: string;
   /**
+   * The worker stopped on purpose with part of its deliverables done (a
+   * `partial` worker_result). The broker harvests and checkpoints its commits
+   * with these deliverables completed, and settles the execution like a
+   * wall-clock timeout so recovery re-plans only the remainder.
+   */
+  partial?: { done: string[] };
+  /**
    * Tool calls the worker session executed before it ended. Zero means the
    * execution had no side effects, so a provider failure is safe to re-run
    * without consuming a task attempt. Undefined: the backend does not know.
@@ -268,6 +275,10 @@ export interface AgentRunner {
     modelRequirements?: Record<string, unknown>;
     recovery?: CheckpointRecoveryContext;
     deliverables?: readonly string[];
+    /** Commit the worker's worktree started from (arms the worker_result no-change guard). */
+    baseRef?: string;
+    /** The execution's opt-in wall-clock budget, when one applies. */
+    wallClock?: { startedAt: number; budgetMs: number };
     /** Owning mission and task, for model bookkeeping and operator logs. */
     missionId?: string;
     taskId?: string;
@@ -382,6 +393,8 @@ const MAX_TIMER_MS = 2 ** 31 - 1;
  * an explicitly configured (opt-in) wall-clock limit produces it.
  */
 const WALL_CLOCK_TIMEOUT_MARKER = "timeout";
+/** Stored execution summary of a deliberate `partial` worker report (the orchestrator words its recovery on it). */
+export const PARTIAL_PROGRESS_SUMMARY = "worker reported partial progress";
 
 /**
  * Failure marker for an execution that showed no activity (no tool, model,
@@ -546,6 +559,8 @@ export class ExecutionBroker {
       git: GitRepo;
       repoId?: string;
       writeDomains: string[];
+      /** The commit this worktree was actually forked from (the mission base, or a repair/recovery candidate tip). */
+      forkBase: string;
     }
   >();
   /** Mission-scoped worktrees awaiting integration (merged+cleaned by the integrator). */
@@ -1288,6 +1303,7 @@ export class ExecutionBroker {
         git: repository.git,
         repoId: repository.repoId,
         writeDomains: [...(input.writeDomains ?? [])],
+        forkBase: base,
       };
       this.allocatedWorktrees.set(executionId, info);
       // A retried task re-creates its branch (same name): replace, never
@@ -2939,6 +2955,9 @@ export class ExecutionBroker {
               worktree,
               emitActivity,
               repository,
+              executionBudgetMs === undefined
+                ? undefined
+                : { startedAt: executionStartedAt, budgetMs: executionBudgetMs },
             )
               .then((outcome) => ({ kind: "backend_result" as const, outcome }))
               .catch((error: unknown) => ({
@@ -3008,6 +3027,20 @@ export class ExecutionBroker {
               throw first.error;
             }
             let outcome = first.outcome;
+            // A deliberate partial report is a resumable checkpoint, not a plain
+            // failure: same end state as a wall-clock timeout (commits recovered,
+            // checkpoint-split recovery), with the worker's own done list.
+            let partialDone: string[] = [];
+            if (outcome.partial && outcome.exitStatus !== "succeeded" && input.mutatesRepo && worktree) {
+              const declared = new Set(input.deliverables ?? []);
+              partialDone = outcome.partial.done.filter((name) => declared.has(name));
+              outcome = {
+                ...outcome,
+                exitStatus: WALL_CLOCK_TIMEOUT_MARKER,
+                error: WALL_CLOCK_TIMEOUT_MARKER,
+                summary: PARTIAL_PROGRESS_SUMMARY,
+              };
+            }
             const escaped = await this.outOfScopeWorktreePaths(execution.execution_id, input);
             input.authority?.assertAuthoritative();
             this.store.assertExecutionAuthoritative(execution.execution_id);
@@ -3046,7 +3079,7 @@ export class ExecutionBroker {
             queueCheckpoint(
               outcome.exitStatus === "succeeded" && earlyHarvest !== "unverified"
                 ? [...(input.deliverables ?? [])]
-                : [],
+                : partialDone,
               outcome.artifactRefs,
               outcome.artifactRefs.map(artifactHash),
             );
@@ -3286,6 +3319,7 @@ export class ExecutionBroker {
     worktree: string | null,
     onActivity: (event: WorkerActivity) => void,
     repository: { repoId?: string; root: string; git: GitRepo } | null,
+    wallClock?: { startedAt: number; budgetMs: number },
   ): Promise<ExecutionOutcome> {
     if (
       input.repoId &&
@@ -3395,6 +3429,8 @@ export class ExecutionBroker {
             modelRequirements: input.modelRequirements,
             recovery,
             deliverables: input.deliverables,
+            baseRef: this.allocatedWorktrees.get(executionId)?.forkBase,
+            wallClock,
             missionId: input.missionId,
             taskId: input.taskId,
             signal,
