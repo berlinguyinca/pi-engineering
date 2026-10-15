@@ -40,8 +40,10 @@ export function transcriptPath(worktreeDir: string, missionId: string, execution
   return join(worktreeDir, "transcripts", segment(missionId), `${segment(executionId)}.jsonl`);
 }
 
-const KEYS = "pass(?:word|wd)?|secret|token|api[-_]?key|authorization|cookie|private[-_]?key|credential";
-const SENSITIVE_KEY = new RegExp(KEYS, "i");
+const KEYS = "pass(?:word|wd)?|secret|token|api[-_]?key|authorization|cookie|private[-_]?key|credential|_key";
+const SENSITIVE = new RegExp(KEYS, "i");
+/** Token COUNTS (totalTokens, max_tokens) are measurements, not secrets. */
+const isSensitiveKey = (key: string): boolean => SENSITIVE.test(key) && !/tokens$/i.test(key);
 const REDACTED = "[REDACTED]";
 
 const TEXT_RULES: Array<[RegExp, string]> = [
@@ -53,7 +55,7 @@ const TEXT_RULES: Array<[RegExp, string]> = [
   // KEY=value and key: value lines (env dumps, .env files, headers).
   [
     new RegExp(
-      `\\b([A-Za-z0-9_.-]*(?:${KEYS})[A-Za-z0-9_.-]*)(\\s*[:=]\\s*)(?:"[^"\\n]*"|'[^'\\n]*'|[^\\s"',;]+)`,
+      `\\b([A-Za-z0-9_.-]*(?:${KEYS})[A-Za-z0-9_.-]*)(?<!tokens)(\\s*[:=]\\s*)(?:"[^"\\n]*"|'[^'\\n]*'|[^\\s"',;]+)`,
       "gi",
     ),
     `$1$2${REDACTED}`,
@@ -68,6 +70,9 @@ const TEXT_RULES: Array<[RegExp, string]> = [
   ],
   // Prose: "my password is X".
   [/\b(password|passwd|token|key|secret)\s+(?:is|was)\s+["']?[^\s"',;]+/gi, `$1 is ${REDACTED}`],
+  // CLI forms: --password X, password X, curl -u user:pass.
+  [/(--?(?:pass(?:word|wd)?|token|secret|api-key)|\bpassword)[ =]+(?!(?:is|was)\b|\[REDACTED)\S+/gi, `$1 ${REDACTED}`],
+  [/(\bcurl\b[^\n|;&]*?\s(?:-u|--user)[ =]+)\S+/gi, `$1${REDACTED}`],
   // Any PEM private key block.
   [/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, REDACTED],
 ];
@@ -89,7 +94,7 @@ export function scrubTranscript(value: unknown, maxChars: number): unknown {
     return Object.fromEntries(
       Object.entries(value).map(([k, v]) => [
         k,
-        SENSITIVE_KEY.test(k) && v !== null && v !== undefined ? REDACTED : scrubTranscript(v, maxChars),
+        isSensitiveKey(k) && v !== null && v !== undefined ? REDACTED : scrubTranscript(v, maxChars),
       ]),
     );
   }
