@@ -252,7 +252,8 @@ export function createAdmissionCaptureFetch(
   return async (input, init) => {
     let requestInit = init;
     if (session !== undefined) {
-      const headers = new Headers(init?.headers);
+      // An init.headers replaces a Request's own headers, so start from them.
+      const headers = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined));
       headers.set(SESSION_HEADER, session);
       requestInit = { ...init, headers };
     }
