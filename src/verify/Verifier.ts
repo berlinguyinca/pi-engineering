@@ -252,6 +252,9 @@ export interface VerificationProfile {
   stages: VerifyStage[];
 }
 
+/** Warning reported when target detection finds nothing to run. */
+export const NO_TARGETS_WARNING = "no verification targets detected; nothing to run";
+
 export interface StageRun {
   stage: VerifyStage;
   exitCode: number;
@@ -269,13 +272,13 @@ export interface VerifyOutcome {
   failedStage: string | null;
   /**
    * True when the repo declared no verification targets at all (no scripts and
-   * no resolvable JS entry file). This is NOT a pass: it means nothing was
-   * actually verified, so the completion gate must not treat it as passing
-   * evidence. It exists so the verifier can report an honest, distinct outcome
-   * instead of a doomed `node --check index.js` stage that hard-fails every
-   * scriptless repo.
+   * no resolvable JS entry file). The run passes with a warning (nothing ran,
+   * so nothing failed); `noTargets` lets callers that require tests (an
+   * acceptance criterion demanding them) still reject the absence.
    */
   noTargets: boolean;
+  /** Non-blocking notes, e.g. that no verification targets were detected. */
+  warnings?: string[];
   /** Hash of the profile this outcome ran (see failureBaseline.hashProfile). */
   profileHash?: string;
   /** Present only when the run was given a failure baseline: introduced failures block, pre-existing ones do not. */
@@ -739,16 +742,16 @@ export class CommandVerifier implements VerificationProvider {
     // honest: passed=true implies at least one deterministic stage actually
     // succeeded.
     const noTargets = stageRuns.length === 0;
-    // A repo with no declared verification targets is NOT a pass (nothing was
-    // actually verified) and NOT a doomed hard-fail. Report it as a distinct
-    // honest outcome so callers can decide how to gate (finding FINDING-2CcenM).
-    const passed = !noTargets && failedStage === null && stageRuns.length > 0 && stageRuns.some((s) => s.passed);
+    // No targets: nothing ran, nothing failed. Pass with a warning instead of a
+    // futile failure that spawns repair rounds no worker can satisfy.
+    const passed = noTargets || (failedStage === null && stageRuns.some((s) => s.passed));
     const outcome: VerifyOutcome = {
       passed,
       stages: stageRuns,
       evidence,
       failedStage,
       noTargets,
+      warnings: noTargets ? [NO_TARGETS_WARNING] : [],
       profileHash: hashProfile(profile),
     };
     if (opts?.baseline) outcome.baselineVerdict = compareToBaseline(opts.baseline, outcome, opts.boundBaseSha);

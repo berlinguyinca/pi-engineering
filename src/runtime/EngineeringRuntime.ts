@@ -203,7 +203,10 @@ function idCompare(a: string, b: string): number {
 }
 
 /** Compare two tournament survivors under the chosen deterministic strategy. */
-function selectionCompare(a: TournamentEntry, b: TournamentEntry, strategy: TournamentStrategy): number {
+export function selectionCompare(a: TournamentEntry, b: TournamentEntry, strategy: TournamentStrategy): number {
+  // A candidate that ran real checks outranks one with no verification targets
+  // (zero evidence), whatever the strategy.
+  if (a.outcome.noTargets !== b.outcome.noTargets) return a.outcome.noTargets ? 1 : -1;
   const fa = a.candidate.changed_files?.length ?? 0;
   const fb = b.candidate.changed_files?.length ?? 0;
   switch (strategy) {
@@ -219,6 +222,11 @@ function selectionCompare(a: TournamentEntry, b: TournamentEntry, strategy: Tour
       if (fa !== fb) return fa - fb;
       return idCompare(a.candidate.id, b.candidate.id);
   }
+}
+
+/** The challenger may only reorder finalists that are comparable: a real-check lead is never displaced by a no-targets runner-up. */
+export function challengerMayDisplace(lead: TournamentEntry, runner: TournamentEntry): boolean {
+  return lead.outcome.noTargets === runner.outcome.noTargets;
 }
 
 function materialFindings(ledger: Ledger, candidateId: string | null): string[] {
@@ -2310,6 +2318,7 @@ Return details.winner_candidate_id set to "${a.id}" or "${b.id}" for your pick.`
 
     // Phase B: deterministic winner selection among verified survivors. Only
     // candidates with a completed independent review are eligible to win.
+    // A lone no-targets candidate is promotable by design: work with no checks is acceptable when no criterion requires tests.
     const survivors = entries.filter((e) => e.outcome.passed && e.reviewCompleted);
     if (survivors.length === 0) {
       // No eligible winner. Candidates that passed verification but whose review
@@ -2343,7 +2352,12 @@ Return details.winner_candidate_id set to "${a.id}" or "${b.id}" for your pick.`
     // Optional clean-room challenger pass across the top finalists (spec §12.2,
     // §19.3). The challenger independently inspects the leading finalists' diffs
     // and may promote the runner-up if the leader's approach is judged worse.
-    if (challengeFinalists && survivors.length >= 2 && (risk === "high" || risk === "critical")) {
+    if (
+      challengeFinalists &&
+      survivors.length >= 2 &&
+      (risk === "high" || risk === "critical") &&
+      challengerMayDisplace(survivors[0]!, survivors[1]!)
+    ) {
       const lead = survivors[0]!;
       const runner = survivors[1]!;
       const verdict = await this.challengeFinalists(wi, goal, lead.candidate, runner.candidate);

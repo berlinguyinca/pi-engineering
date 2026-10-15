@@ -449,9 +449,14 @@ describe("CompletionGate (spec 07)", () => {
 });
 
 describe("revision-bound completion evidence", () => {
-  function currentEvidenceMission(olderGateKind?: "validation" | "review", eventStore?: EventStoreBackend) {
+  function currentEvidenceMission(
+    olderGateKind?: "validation" | "review",
+    eventStore?: EventStoreBackend,
+    criterionText = "current candidate is verified",
+    noTargets = false,
+  ) {
     const { store, m, backend } = mission(["validation", "independent_review"], "medium", eventStore);
-    const acceptance = store.addAcceptanceCriterion(m.mission_id, "current candidate is verified", undefined, "AC-1");
+    const acceptance = store.addAcceptanceCriterion(m.mission_id, criterionText, undefined, "AC-1");
     const olderGate = olderGateKind
       ? store.createTask({
           mission_id: m.mission_id,
@@ -503,9 +508,11 @@ describe("revision-bound completion evidence", () => {
       identityHash: hashCandidateEvidenceIdentity(identity),
       command: "npm test",
       profile: "default",
-      exitCode: 0,
-      testSummary: { passed: 42, failed: 0 },
-      noTargets: false,
+      exitCode: noTargets ? 1 : 0,
+      testSummary: noTargets
+        ? { stages: [], warnings: ["no verification targets detected; nothing to run"] }
+        : { passed: 42, failed: 0 },
+      noTargets,
       accessible: true,
       acceptanceResults: [],
       recordedAt: new Date().toISOString(),
@@ -1095,27 +1102,20 @@ describe("revision-bound completion evidence", () => {
     });
   }
 
-  it("rejects no-target validation", () => {
-    const { store, mission } = currentEvidenceMission();
-    const evidence = store.listValidationEvidence(mission.mission_id)[0]!;
-    const rerun = successfulEvidenceExecution(store, mission.mission_id, "validation", "repo-1", "base-a");
-    store.invalidateEvidence({
-      invalidationId: "EI-old-validation",
-      missionId: mission.mission_id,
-      identity: evidence.identity,
-      reason: "validation rerun",
-      invalidatedAt: new Date().toISOString(),
-    });
-    store.recordValidationEvidence({
-      ...evidence,
-      evidenceId: "VE-no-target",
-      taskId: rerun.taskId,
-      executionId: rerun.executionId,
-      noTargets: true,
-    });
-    const verdict = new CompletionGate(store).evaluate(store.getMission(mission.mission_id)!);
+  function withNoTargetValidation(criterionText?: string) {
+    const { store, mission } = currentEvidenceMission(undefined, undefined, criterionText, true);
+    return new CompletionGate(store).evaluate(store.getMission(mission.mission_id)!);
+  }
+
+  it("accepts no-target validation when no acceptance criterion requires tests", () => {
+    const verdict = withNoTargetValidation();
+    assert.equal(verdict.can_complete, true, JSON.stringify(verdict.reasons));
+  });
+
+  it("rejects no-target validation when an acceptance criterion requires tests", () => {
+    const verdict = withNoTargetValidation("Add unit tests for the parser");
     assert.equal(verdict.can_complete, false);
-    assert.match(verdict.reasons.join("; "), /no-target|validation/i);
+    assert.match(verdict.reasons.join("; "), /AC-1 requires tests/);
   });
 
   for (const status of ["pending", "failed"] as const) {

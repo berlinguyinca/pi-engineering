@@ -72,6 +72,8 @@ export interface ExecutionRequestInput {
   /** Verified current candidate used as the base for fresh gate-repair work. */
   candidateBaseSha?: string;
   acceptanceCriteria?: Array<{ acceptanceId: string; criterion: string }>;
+  /** Failure message when no verification targets exist but criteria (with or without ids) require tests. */
+  testRequirement?: string;
   /** Renewable fencing held by the caller for the complete dispatch. */
   authority?: DispatchAuthority;
 }
@@ -115,6 +117,10 @@ export interface ExecutionOutcome {
   executionId: string;
   exitStatus: string;
   summary: string;
+  /** Integration only: the verifier found no verification targets (nothing ran). */
+  noTargets?: boolean;
+  /** Non-blocking verifier warnings (e.g. no verification targets detected). */
+  warnings?: string[];
   artifactRefs: string[];
   usage: Record<string, unknown>;
   findings?: Array<Record<string, unknown>>;
@@ -328,6 +334,8 @@ export interface IntegrationRunner {
     candidateLifecycle?: CandidateLifecycle;
     integrationRun?: IntegrationRunRecord;
     authority?: DispatchAuthority;
+    /** Set when acceptance criteria require tests: no verification targets then fails. */
+    testRequirement?: string;
     signal: AbortSignal;
   }): Promise<ExecutionOutcome>;
 }
@@ -338,6 +346,7 @@ export interface ValidationRunner {
     repoId?: string;
     objective: string;
     worktree?: string | null;
+    testRequirement?: string;
     signal: AbortSignal;
   }): Promise<ExecutionOutcome>;
 }
@@ -3422,6 +3431,7 @@ export class ExecutionBroker {
             candidateLifecycle: candidate?.lifecycle,
             integrationRun,
             authority: input.authority,
+            testRequirement: input.testRequirement,
             signal,
           }),
         );
@@ -3500,6 +3510,7 @@ export class ExecutionBroker {
             repoId: input.repoId,
             objective: input.objective,
             worktree: candidatePath ?? base.worktree,
+            testRequirement: input.testRequirement,
             signal,
           }),
         );
