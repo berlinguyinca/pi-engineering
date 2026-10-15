@@ -8,6 +8,7 @@ import {
   SettingsManager,
   type ToolDefinition,
   createAgentSession,
+  createBashToolDefinition,
   createExtensionRuntime,
 } from "@earendil-works/pi-coding-agent";
 import {
@@ -93,11 +94,19 @@ import { BuildCommandTimer } from "./buildActivity.ts";
 import { CHECKPOINT_PROGRESS_TOOL_NAME, createCheckpointProgressTool } from "./checkpointProgressTool.ts";
 import { CLAIM_DELIVERABLE_TOOL_NAME, createClaimDeliverableTool } from "./claimDeliverableTool.ts";
 import { registerLocalProviders } from "./localProviders.ts";
-import { WORKER_KICKOFF, buildSystemPrompt, wantsCommitDiscipline } from "./prompts.ts";
+import { MUTATING_ROLES, WORKER_KICKOFF, buildSystemPrompt, wantsCommitDiscipline } from "./prompts.ts";
 import { guardRuntimeRequestBody } from "./requestBodyGuard.ts";
 import { StreamStallWatchdog, isStalledStream } from "./streamStall.ts";
 import { createNumberedReadTool, createTolerantEditTool } from "./tolerantFileTools.ts";
-import { workerResultTool } from "./workerResultTool.ts";
+import {
+  DEFAULT_BUDGET_NOTICE_EVERY,
+  NUDGE_MESSAGE,
+  WRAP_UP_FRACTION,
+  WRAP_UP_MESSAGE,
+  budgetLine,
+  withBudgetNotice,
+} from "./wallClockBudget.ts";
+import { createWorkerResultTool } from "./workerResultTool.ts";
 
 /**
  * Maximum APS loop-recovery attempts (Phase 4). Bounded to one: after a
@@ -486,11 +495,37 @@ ${TOOL_TRANSITION_RULE}`;
     initialPrompt: string,
     modelRuntime: ModelRuntime,
   ): Promise<WorkerRun> {
-    const terminating = req.resultTool === "review_result" ? reviewResultTool : workerResultTool;
+    // A mutating role with a known base may not report `completed` over an
+    // untouched worktree (the tool answers isError and the session continues).
+    const terminating =
+      req.resultTool === "review_result"
+        ? reviewResultTool
+        : createWorkerResultTool(
+            req.baseRef && MUTATING_ROLES.has(req.role) ? { cwd: req.cwd, baseRef: req.baseRef } : undefined,
+          );
+    // Budgeted runs show elapsed/remaining time in bash and claim_deliverable
+    // results every N of those calls (a no-op without a wall-clock budget).
+    const noticeEvery = Math.max(
+      1,
+      req.budgetNoticeEveryToolCalls ??
+        (Number.parseInt(process.env.PI_ENGINEERING_BUDGET_NOTICE_EVERY ?? "", 10) || DEFAULT_BUDGET_NOTICE_EVERY),
+    );
+    let noticeCalls = 0;
+    const budgetNotice = (tool: ToolDefinition): ToolDefinition =>
+      req.wallClock
+        ? withBudgetNotice(tool, () =>
+            ++noticeCalls % noticeEvery === 0 ? budgetLine(req.wallClock!, Date.now()) : undefined,
+          )
+        : tool;
     const customTools = [
       ...this.customTools,
       ...(req.tolerantFileTools ? [createNumberedReadTool(req.cwd), createTolerantEditTool(req.cwd)] : []),
-      ...(offersClaimDeliverable(req) ? [createClaimDeliverableTool(req.deliverables ?? [])] : []),
+      ...(req.wallClock && req.tools.includes("bash")
+        ? [budgetNotice(createBashToolDefinition(req.cwd) as unknown as ToolDefinition)]
+        : []),
+      ...(offersClaimDeliverable(req)
+        ? [budgetNotice(createClaimDeliverableTool(req.deliverables ?? []) as unknown as ToolDefinition)]
+        : []),
       ...(offersCheckpointProgress(req) ? [createCheckpointProgressTool(req.deliverables ?? [])] : []),
       terminating,
     ];
@@ -1182,9 +1217,28 @@ ${recovery.recoveryPrompt}`;
     // process must not keep a hung session alive.
     const inactivityMs = req.timeoutMs ?? 300_000;
     let timer: ReturnType<typeof setTimeout> | undefined;
+    // Wrap-up: one user turn near the end of an opt-in wall-clock budget, or
+    // when a standalone run has been silent for 75% of its inactivity window,
+    // so a timeout yields a resumable partial result. No budget, no injection.
+    let wrapUpTimer: ReturnType<typeof setTimeout> | undefined;
+    let wrappedUp = false;
+    const injectWrapUp = (): void => {
+      if (wrappedUp || captured) return;
+      wrappedUp = true;
+      session.steer(WRAP_UP_MESSAGE).catch(() => {});
+    };
+    if (req.wallClock) {
+      const at = req.wallClock.startedAt + req.wallClock.budgetMs * WRAP_UP_FRACTION;
+      wrapUpTimer = setTimeout(injectWrapUp, Math.max(0, at - Date.now()));
+      wrapUpTimer.unref?.();
+    }
+    let silenceTimer: ReturnType<typeof setTimeout> | undefined;
     const armInactivity = (): void => {
       if (req.signal) return;
       if (timer) clearTimeout(timer);
+      if (silenceTimer) clearTimeout(silenceTimer);
+      silenceTimer = setTimeout(injectWrapUp, inactivityMs * WRAP_UP_FRACTION);
+      silenceTimer.unref?.();
       timer = setTimeout(() => {
         timedOut = true;
         void session.abort();
@@ -1340,6 +1394,23 @@ ${recovery.recoveryPrompt}`;
           images: req.images?.map((img) => ({ type: "image" as const, data: img.data, mimeType: img.mimeType })),
           expandPromptTemplates: false,
         });
+      // The session ended cleanly without the terminating call: one nudge in
+      // the SAME session (its prefix is cached, so this is cheap), counted as
+      // the same attempt. Ignored, it settles as the usual no-result failure.
+      if (
+        captured === undefined &&
+        terminatingName === "worker_result" &&
+        !guardAborted &&
+        !budgetExhausted &&
+        !timedOut &&
+        !ownerAborted &&
+        !stalled &&
+        !loopPrevented &&
+        assistantError === undefined &&
+        !req.signal?.aborted
+      ) {
+        await session.prompt(NUDGE_MESSAGE, { expandPromptTemplates: false });
+      }
     } catch (err) {
       // Capture the error. An abort triggered by the guard/budget/timeout is
       // EXPECTED (session.abort()) and not a transport failure. A rejection
@@ -1350,6 +1421,8 @@ ${recovery.recoveryPrompt}`;
       }
     } finally {
       if (timer) clearTimeout(timer);
+      if (silenceTimer) clearTimeout(silenceTimer);
+      if (wrapUpTimer) clearTimeout(wrapUpTimer);
       disarmStall();
       req.signal?.removeEventListener("abort", abortFromOwner);
       unsubscribe();

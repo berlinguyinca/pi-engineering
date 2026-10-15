@@ -595,6 +595,8 @@ export function realBackends(opts: RealBackendsOptions) {
         modelRequirements?: Record<string, unknown>;
         recovery?: CheckpointRecoveryContext;
         deliverables?: readonly string[];
+        baseRef?: string;
+        wallClock?: { startedAt: number; budgetMs: number };
         missionId?: string;
         taskId?: string;
         signal: AbortSignal;
@@ -603,6 +605,8 @@ export function realBackends(opts: RealBackendsOptions) {
         const bound = await repository(input.repoId);
         const req: WorkerRequest = {
           role: (input.role as WorkerRequest["role"]) ?? "implementer",
+          baseRef: input.baseRef,
+          wallClock: input.wallClock,
           task: input.objective,
           context: input.contextRef,
           tools: [...IMPLEMENTER_TOOLS],

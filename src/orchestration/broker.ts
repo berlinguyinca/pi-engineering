@@ -268,6 +268,10 @@ export interface AgentRunner {
     modelRequirements?: Record<string, unknown>;
     recovery?: CheckpointRecoveryContext;
     deliverables?: readonly string[];
+    /** Commit the worker's worktree started from (arms the worker_result no-change guard). */
+    baseRef?: string;
+    /** The execution's opt-in wall-clock budget, when one applies. */
+    wallClock?: { startedAt: number; budgetMs: number };
     /** Owning mission and task, for model bookkeeping and operator logs. */
     missionId?: string;
     taskId?: string;
@@ -2939,6 +2943,9 @@ export class ExecutionBroker {
               worktree,
               emitActivity,
               repository,
+              executionBudgetMs === undefined
+                ? undefined
+                : { startedAt: executionStartedAt, budgetMs: executionBudgetMs },
             )
               .then((outcome) => ({ kind: "backend_result" as const, outcome }))
               .catch((error: unknown) => ({
@@ -3286,6 +3293,7 @@ export class ExecutionBroker {
     worktree: string | null,
     onActivity: (event: WorkerActivity) => void,
     repository: { repoId?: string; root: string; git: GitRepo } | null,
+    wallClock?: { startedAt: number; budgetMs: number },
   ): Promise<ExecutionOutcome> {
     if (
       input.repoId &&
@@ -3395,6 +3403,8 @@ export class ExecutionBroker {
             modelRequirements: input.modelRequirements,
             recovery,
             deliverables: input.deliverables,
+            baseRef: this.store.getExecution(executionId)?.base_sha ?? undefined,
+            wallClock,
             missionId: input.missionId,
             taskId: input.taskId,
             signal,

@@ -97,6 +97,20 @@ export interface WorkerRequest {
   tolerantFileTools?: boolean;
   /** Broker-declared deliverables eligible for candidate-bound checkpoint progress. */
   deliverables?: readonly string[];
+  /**
+   * The commit the worker's worktree started from. With a mutating role it
+   * arms the worker_result no-change guard (a `completed` report needs commits
+   * past this base or a dirty tree).
+   */
+  baseRef?: string;
+  /**
+   * An opt-in wall-clock budget for this execution (limits.max_task_wall_clock_ms
+   * or a task's execution_budget_ms). At ~75% of it the worker gets one wrap-up
+   * turn. Absent: no wrap-up is injected.
+   */
+  wallClock?: { startedAt: number; budgetMs: number };
+  /** Show the elapsed/remaining budget in bash and claim_deliverable results every N tool calls (default 20). */
+  budgetNoticeEveryToolCalls?: number;
   /** Live bounded activity; never includes prompts, model text, tool arguments, or secrets. */
   onActivity?: (event: WorkerActivity) => void;
   /** Abort the active model session when the owning execution is canceled. */

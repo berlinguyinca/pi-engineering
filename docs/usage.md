@@ -46,6 +46,28 @@ The pipeline routes intent, creates a durable **mission**, plans/executes
 workers, runs validation, launches a fresh independent reviewer, and enforces
 the deterministic completion gate — no `/engineer` or `/review` needed.
 
+### worker_result guard, nudge and wrap-up
+
+- **No-change guard.** A mutating worker (implementer, debugger, test-generator,
+  clean-room-challenger) in a mission worktree cannot report `completed` over an
+  untouched worktree: `worker_result` returns an error ("no changes vs base:
+  commit your work or report blocked/partial with a reason") and the session
+  keeps going. `blocked`, `partial` (recorded as a `blocked` result with
+  `details.partial: true`) and `failed` reports are accepted as given.
+  Read-only roles are unaffected.
+- **In-session nudge.** If a session ends without calling `worker_result`, the
+  worker gets exactly one more turn in the same session ("Call worker_result now
+  ..."). It counts as the same attempt; if it is ignored the run settles as the
+  usual no-result failure.
+- **Wrap-up.** When a task has an opt-in wall-clock budget
+  (`limits.max_task_wall_clock_ms` or a task's `execution_budget_ms`), the worker
+  gets one wrap-up turn at 75% of it so a timeout leaves a resumable partial
+  result, and every 20th `bash` / `claim_deliverable` result carries a
+  "Time budget: ... elapsed, ... remaining." line (override the interval with
+  `PI_ENGINEERING_BUDGET_NOTICE_EVERY`). Standalone runs without an owner signal
+  get the same wrap-up turn after 75% of `timeoutMs` of silence. With no budget
+  configured (the default) nothing is injected.
+
 ### When a worker reaches a configured wall-clock limit
 
 A mutating worker runs in a fresh isolated worktree. A task has no wall-clock
