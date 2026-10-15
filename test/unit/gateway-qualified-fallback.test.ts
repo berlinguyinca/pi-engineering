@@ -13,7 +13,6 @@ import {
   type FallbackCandidate,
   MAX_BLOCKED_WAIT_MS,
   chooseFallbackModel,
-  cooldownUntilFor,
   isQualified,
   jitteredRetryAfterMs,
 } from "../../src/gateway/fallback.ts";
@@ -106,7 +105,7 @@ test("hysteresis: a model just left is not re-selected on the next decision", ()
   const first = choose({ available: [CURRENT, GOOD] });
   assert.equal(first.action === "switch" && first.model.id, "good-model");
   // The session moved to good-model; current-model is the one just left.
-  const cooldown = { "current-model": cooldownUntilFor(NOW, 60_000, () => 0) };
+  const cooldown = { "current-model": NOW + 60_000 };
   const back = chooseFallbackModel({
     current: GOOD,
     available: [CURRENT, GOOD],

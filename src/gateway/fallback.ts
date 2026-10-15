@@ -98,15 +98,6 @@ export function jitteredRetryAfterMs(
   return Math.max(1, Math.min(maxMs, Math.round(base * (1 + RETRY_JITTER * spread))));
 }
 
-/** When a model just left (or refused) becomes eligible again: now plus the jittered wait. */
-export function cooldownUntilFor(
-  nowMs: number,
-  retryAfterMs: number | undefined,
-  random: () => number = Math.random,
-): number {
-  return nowMs + jitteredRetryAfterMs(retryAfterMs, random);
-}
-
 /**
  * Is this model reported as able to serve right now?
  *
