@@ -12,6 +12,7 @@ import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { DEFAULT_GATEWAY_MAX_ELAPSED_MS } from "../gateway/streamRetry.ts";
 import { parseAdmissionPayload } from "../inference/admissionContract.ts";
+import { toGatewayCapabilities } from "../inference/inferweaveCapabilities.ts";
 
 /** A model or logical route as the gateway advertises it on `GET /models`. */
 export interface CatalogModel {
@@ -245,6 +246,8 @@ export interface InFlightKeepalive {
 }
 
 const DEFAULT_KEEPALIVE_INTERVAL_MS = 30_000;
+/** A header-safe session id: printable ASCII, no control characters, at most 256. */
+const SESSION_ID = /^[\x21-\x7e]{1,256}$/;
 
 /** One non-streaming chat completion. */
 export async function chatCompletion(
@@ -254,14 +257,29 @@ export async function chatCompletion(
     system: string;
     user: string;
     capability?: CapabilityRequest;
+    /** Stable mission or session id; sent as `x-inferweave-session` for sticky routing. */
+    sessionId?: string;
     signal?: AbortSignal;
     alive?: InFlightKeepalive;
   },
 ): Promise<ChatOutcome> {
   const started = Date.now();
   const extra: Record<string, string> = {};
-  if (req.capability?.capabilities?.length) extra["x-inferweave-capabilities"] = req.capability.capabilities.join(",");
-  if (req.capability?.minimumContext) extra["x-inferweave-min-context"] = String(req.capability.minimumContext);
+  let minimumContext = req.capability?.minimumContext;
+  if (req.capability?.capabilities?.length) {
+    // Required capabilities are translated to the gateway vocabulary or the
+    // request throws before anything is sent (R-MODEL: no silent downgrade).
+    const translated = toGatewayCapabilities(req.capability.capabilities, []);
+    if (translated.required.length > 0) extra["x-inferweave-capabilities"] = translated.required.join(",");
+    if (translated.minContextTokens) minimumContext = Math.max(minimumContext ?? 0, translated.minContextTokens);
+  }
+  if (minimumContext) extra["x-inferweave-min-context"] = String(minimumContext);
+  if (req.sessionId !== undefined) {
+    if (!SESSION_ID.test(req.sessionId)) {
+      throw new Error("x-inferweave-session: sessionId must be 1-256 printable ASCII characters");
+    }
+    extra["x-inferweave-session"] = req.sessionId;
+  }
   if (req.capability?.preferredFamily) extra["x-inferweave-prefer-family"] = req.capability.preferredFamily;
   try {
     const res = await postNoTimeouts(`${base(conn)}/chat/completions`, {
