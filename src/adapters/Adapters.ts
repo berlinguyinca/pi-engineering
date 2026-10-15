@@ -9,12 +9,91 @@
  * offload cross-session reasoning — but the runtime is fully standalone without
  * any of them.
  */
+/**
+ * Who is asking. `fencingToken` is the mission lease's token
+ * (`MissionLease.fencingToken`, src/orchestration/ownership.ts): it only grows,
+ * so a call from a superseded owner carries a lower one and is refused.
+ */
+export interface AutoSpecOwner {
+  readonly ownerId: string;
+  readonly fencingToken: number;
+}
+
+/** One unit of work Pi hands to AutoSpec. Pi owns the mission; AutoSpec only executes. */
+export interface AutoSpecSubmission {
+  readonly missionId: string;
+  readonly taskId: string;
+  /** What to do, in the words the task was given. */
+  readonly request: string;
+  /** The commit the work starts from. */
+  readonly baseSha: string;
+  readonly owner: AutoSpecOwner;
+  /** Redelivering the same key must return the same handle, not start a second run. */
+  readonly idempotencyKey: string;
+}
+
+export interface AutoSpecHandle {
+  /** AutoSpec's id for the run; pass it to `observe` and `cancel`. */
+  readonly externalId: string;
+  readonly accepted: boolean;
+  /** Why the submission was not accepted (for example a stale fencing token). */
+  readonly reason?: string;
+}
+
+export type AutoSpecRunState = "queued" | "running" | "succeeded" | "failed" | "cancelled";
+
+export interface AutoSpecObservation {
+  readonly state: AutoSpecRunState;
+  /** RFC 3339 time of AutoSpec's last sign of progress; absent before any. */
+  readonly lastProgressAt?: string;
+  /** Increases with every observable change; a reader ignores a lower one than it has seen. */
+  readonly sequence: number;
+}
+
+export interface AutoSpecCancelResult {
+  readonly cancelled: boolean;
+  /** The caller's fencing token is behind the run's owner: nothing was cancelled. */
+  readonly stale: boolean;
+}
+
+/** Thrown by `observe` when the caller's fencing token is behind the run's owner. */
+export class StaleFencingTokenError extends Error {
+  readonly externalId: string;
+  readonly caller: AutoSpecOwner;
+  readonly holder: AutoSpecOwner;
+  constructor(externalId: string, caller: AutoSpecOwner, holder: AutoSpecOwner) {
+    super(
+      `stale fencing token for ${externalId}: ${caller.ownerId}@${caller.fencingToken} is behind ${holder.ownerId}@${holder.fencingToken}`,
+    );
+    this.name = "StaleFencingTokenError";
+    this.externalId = externalId;
+    this.caller = caller;
+    this.holder = holder;
+  }
+}
+
+/**
+ * The one rule every implementation applies: a caller is stale when its token
+ * is lower than the holder's, or equal but from a different owner (two owners
+ * must never share a token). A higher token is a newer owner taking over.
+ */
+export function isStaleAutoSpecOwner(holder: AutoSpecOwner, caller: AutoSpecOwner): boolean {
+  if (caller.fencingToken !== holder.fencingToken) return caller.fencingToken < holder.fencingToken;
+  return caller.ownerId !== holder.ownerId;
+}
+
+/**
+ * Pi dispatches to AutoSpec; AutoSpec never owns the mission. Every call
+ * carries the owner and its fencing token, and an implementation MUST refuse
+ * (`accepted: false`, `stale: true`, or `StaleFencingTokenError`) one whose
+ * token is stale per `isStaleAutoSpecOwner`. Core never imports an
+ * implementation; it is installed through `AdapterRegistry`.
+ */
 export interface AutoSpecAdapter {
   readonly name: "autospec";
-  /** Produce a design spec for a goal (returns null if the system is absent). */
-  designSpec(goal: string): Promise<string | null>;
-  /** Split a spec into linked implementation issues. */
-  splitSpec(specPath: string): Promise<Array<{ title: string; body: string }>>;
+  submit(submission: AutoSpecSubmission): Promise<AutoSpecHandle>;
+  observe(externalId: string, owner: AutoSpecOwner): Promise<AutoSpecObservation>;
+  cancel(externalId: string, owner: AutoSpecOwner, reason: string): Promise<AutoSpecCancelResult>;
 }
 
 export interface InferWeaveAdapter {

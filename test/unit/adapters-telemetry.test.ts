@@ -14,8 +14,9 @@ test("adapters: optional adapters can be installed without touching core", async
   const reg = new AdapterRegistry({
     autospec: {
       name: "autospec",
-      designSpec: async () => "# Spec\nimplement isEven",
-      splitSpec: async () => [{ title: "T1", body: "b" }],
+      submit: async () => ({ externalId: "run-1", accepted: true }),
+      observe: async () => ({ state: "running", sequence: 1 }),
+      cancel: async () => ({ cancelled: true, stale: false }),
     },
     inferweave: {
       name: "inferweave",
@@ -24,8 +25,16 @@ test("adapters: optional adapters can be installed without touching core", async
     },
   });
   assert.equal(reg.hasAdapters, true);
-  const spec = await reg.autospecAdapter!.designSpec("isEven");
-  assert.match(spec ?? "", /isEven/);
+  const owner = { ownerId: "pi", fencingToken: 1 };
+  const handle = await reg.autospecAdapter!.submit({
+    missionId: "MSN-1",
+    taskId: "T1",
+    request: "implement isEven",
+    baseSha: "abc123",
+    owner,
+    idempotencyKey: "k",
+  });
+  assert.equal(handle.externalId, "run-1");
   assert.equal(await reg.inferweaveAdapter!.retrieve("x"), "knowledge");
 });
 
