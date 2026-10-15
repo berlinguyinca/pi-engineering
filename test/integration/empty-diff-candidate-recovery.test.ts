@@ -12,6 +12,7 @@ import { join } from "node:path";
 import { describe, it } from "node:test";
 import { GitRepo } from "../../src/git/GitRepo.ts";
 import type { BrokerBackends } from "../../src/orchestration/broker.ts";
+import { CompletionGate } from "../../src/orchestration/completionGate.ts";
 import { buildCandidateEvidenceIdentity, taskCoverageFingerprint } from "../../src/orchestration/evidence.ts";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
 import { Orchestrator } from "../../src/orchestration/orchestrator.ts";
@@ -22,7 +23,7 @@ import { makeFixtureRepo } from "../fixtures/make-fixture.ts";
 
 const EMPTY_DIFF_HASH = `sha256:${createHash("sha256").update("").digest("hex")}`;
 
-type AgentMode = "die-after-commit" | "commit" | "nothing";
+type AgentMode = "die-after-commit" | "die-quietly" | "commit" | "nothing";
 
 interface Calls {
   agent: number;
@@ -47,6 +48,15 @@ function backendsFor(git: GitRepo, calls: Calls, modes: AgentMode[]): BrokerBack
           await git.commitAll(worktree, "work committed before the worker died");
           return {
             executionId: "agent-dead",
+            exitStatus: "failed",
+            summary: "Worker failed: no worker_result",
+            artifactRefs: [],
+            usage: {},
+          };
+        }
+        if (mode === "die-quietly") {
+          return {
+            executionId: "agent-quiet",
             exitStatus: "failed",
             summary: "Worker failed: no worker_result",
             artifactRefs: [],
@@ -162,17 +172,18 @@ async function orchestratorFor(
   calls: Calls,
   modes: AgentMode[],
   maxRepairRounds?: number,
+  taskCount = 1,
 ) {
   return new Orchestrator({
     ...(maxRepairRounds === undefined ? {} : { maxRepairRounds }),
     store,
     repositoryRegistry: registry,
     backends: backendsFor(git, calls, modes),
-    planner: async (mission) => [
-      {
+    planner: async (mission) =>
+      Array.from({ length: taskCount }, (_unused, index) => ({
         kind: "agent" as const,
         role: "implementer",
-        objective: "Add the dead-worker module",
+        objective: index === 0 ? "Add the dead-worker module" : `Add the dead-worker module ${index + 1}`,
         mutates_repo: true,
         write_domains: ["src/**"],
         isolation: "worktree" as const,
@@ -184,8 +195,7 @@ async function orchestratorFor(
         ),
         max_attempts: 1,
         failure_policy: "block" as const,
-      },
-    ],
+      })),
     recovery: { missionCeiling: 20, strategyMaxAttempts: 5 },
   });
 }
@@ -671,14 +681,14 @@ describe("never publish an empty-diff candidate over preserved worker work (#173
   });
 
   it("tells the re-adopting worker its base is partial, and restarts from base after repeated failed re-adoptions", async () => {
-    const h = await flowHarness(["die-after-commit", "die-after-commit", "die-after-commit", "commit"], 0);
+    const h = await flowHarness(["die-after-commit", "die-quietly", "die-quietly", "commit"], 0);
     try {
       const orchestrator = await orchestratorFor(
         h.store,
         h.git,
         h.registry,
         h.calls,
-        ["die-after-commit", "die-after-commit", "die-after-commit", "commit"],
+        ["die-after-commit", "die-quietly", "die-quietly", "commit"],
         5,
       );
       const result = await orchestrator.orchestrate(`Add the dead-worker module in ${h.fixture.root}`, {
@@ -703,5 +713,125 @@ describe("never publish an empty-diff candidate over preserved worker work (#173
     } finally {
       await h.fixture.cleanup();
     }
+  });
+
+  it("gives each distinct stranded tip its own two re-adoptions", async () => {
+    const h = await flowHarness(["die-after-commit"], 0);
+    try {
+      const orchestrator = await orchestratorFor(
+        h.store,
+        h.git,
+        h.registry,
+        h.calls,
+        ["die-after-commit", "die-after-commit", "die-quietly"],
+        5,
+        2,
+      );
+      const result = await orchestrator.orchestrate(`Add two dead-worker modules in ${h.fixture.root}`, {
+        repository: h.fixture.root,
+        baseRef: h.baseSha,
+        mutationRequested: true,
+      });
+      const readopts = h.store
+        .listTasks(result.mission.mission_id)
+        .filter((task) => task.objective.startsWith("Re-adopt preserved worker branch:"));
+      const perTip = new Map<string, number>();
+      for (const task of readopts) {
+        const tip = task.repair_base_candidate_sha!;
+        perTip.set(tip, (perTip.get(tip) ?? 0) + 1);
+      }
+      assert.equal(perTip.size, 2, "two distinct stranded tips");
+      assert.deepEqual([...perTip.values()], [2, 2]);
+    } finally {
+      await h.fixture.cleanup();
+    }
+  });
+
+  describe("completion gate: empty candidate only blocks a mutating mission", () => {
+    function missionWithBaseCandidate(mutates: boolean, kind: "agent" | "research") {
+      const store = MissionStore.open(JsonlEventStore.inMemory());
+      const mission = store.createMission({
+        mission_id: "MSN-readonly",
+        title: "analysis",
+        goal: "analysis",
+        user_request: "analyse",
+        repository: "/repo",
+        base_ref: "b".repeat(40),
+        risk_profile: "low",
+        workflow_class: "engineering",
+      });
+      const manifest = {
+        manifestId: "WM-readonly",
+        missionId: mission.mission_id,
+        generation: 1,
+        authorizedRoots: [{ canonicalPath: "/repo", source: "existing_manifest" as const, access: "write" as const }],
+        repositories: [
+          {
+            repoId: "repo-ro",
+            canonicalRoot: "/repo",
+            baseRef: "b".repeat(40),
+            baseSha: "b".repeat(40),
+            writableDomains: ["**"],
+          },
+        ],
+        dependencyEdges: [],
+        hash: "manifest-readonly",
+        createdAt: "2026-09-27T00:00:00.000Z",
+      };
+      store.bindWorkspaceManifest(manifest);
+      store.createTask({
+        task_id: "TSK-ro",
+        mission_id: mission.mission_id,
+        kind,
+        role: "analyst",
+        objective: "analyse",
+        repo_id: "repo-ro",
+        mutates_repo: mutates,
+      });
+      store.transitionTask("TSK-ro", "READY");
+      const execution = store.createExecution({
+        task_id: "TSK-ro",
+        mission_id: mission.mission_id,
+        backend: "agent",
+        repo_id: "repo-ro",
+        base_sha: "b".repeat(40),
+      });
+      store.transitionTask("TSK-ro", "RUNNING", "system", { assigned_execution_id: execution.execution_id });
+      store.setExecutionStatus(execution.execution_id, "RUNNING");
+      store.setExecutionStatus(execution.execution_id, "SUCCEEDED", { exit_status: "succeeded" });
+      store.transitionTask("TSK-ro", "SUCCEEDED");
+      store.recordCandidate(
+        mission.mission_id,
+        buildCandidateEvidenceIdentity({
+          workspaceManifestHash: manifest.hash,
+          missionGeneration: 0,
+          repoId: "repo-ro",
+          baseSha: "b".repeat(40),
+          candidateSha: "b".repeat(40),
+          diffHash: EMPTY_DIFF_HASH,
+          acceptanceIds: [],
+          artifactHashes: [],
+        }),
+        "base candidate",
+        { taskId: "TSK-ro", executionId: execution.execution_id },
+      );
+      return { store, mission };
+    }
+    const reasonsFor = (mutates: boolean, kind: "agent" | "research") => {
+      const { store, mission } = missionWithBaseCandidate(mutates, kind);
+      return new CompletionGate(store).evaluate(store.getMission(mission.mission_id)!).reasons;
+    };
+
+    it("does not block a read-only analysis mission", () => {
+      assert.ok(!reasonsFor(false, "research").some((reason) => /identical to its base/.test(reason)));
+    });
+
+    it("does not block a no-target docs-style mission with no mutating task", () => {
+      assert.ok(!reasonsFor(false, "agent").some((reason) => /identical to its base/.test(reason)));
+    });
+
+    it("does block a mutating mission (control)", () => {
+      assert.ok(reasonsFor(true, "agent").some((reason) => /identical to its base/.test(reason)));
+    });
   });
 });

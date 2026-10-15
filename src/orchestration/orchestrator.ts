@@ -2435,9 +2435,17 @@ export class Orchestrator {
         this.store.transitionMission(missionId, "REPAIRING");
       }
       this.phase(this.store.getMission(missionId)!, "repairing");
-      const readoptFailures = this.store
-        .listTasks(missionId)
-        .filter((task) => task.status === "FAILED" && task.objective.startsWith(READOPT_OBJECTIVE_PREFIX)).length;
+      // Failed re-adoptions are counted per stranded tip, so a different tip
+      // gets its own attempts.
+      const readoptFailuresFor = (tip: string): number =>
+        this.store
+          .listTasks(missionId)
+          .filter(
+            (task) =>
+              task.status === "FAILED" &&
+              task.repair_base_candidate_sha === tip &&
+              task.objective.startsWith(READOPT_OBJECTIVE_PREFIX),
+          ).length;
       const objectives: Array<{ objective: string; findingId?: string; baseSha?: string; adoptedTaskId?: string }> =
         openBlocking.map((f) => {
           const where = f.file ? ` [${f.file}${f.line ? `:${f.line}` : ""}]` : "";
@@ -2447,6 +2455,7 @@ export class Orchestrator {
               findingId: f.finding_id,
             };
           }
+          const readoptFailures = readoptFailuresFor(f.evidence);
           if (readoptFailures >= MAX_READOPTIONS) {
             // Re-adopting this work keeps failing: stop building on it. The
             // branch stays preserved; the replacement redoes the work from base.
