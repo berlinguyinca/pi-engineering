@@ -116,15 +116,22 @@ const MODEL_GONE_MARKERS: ReadonlySet<string> = new Set(["transient:model_unavai
  * We move THIS attempt to the next comparable model rather than fail it on a
  * saturated one.
  */
+const MODEL_CAPACITY_MARKERS: ReadonlySet<string> = new Set(["transient:server_unavailable"]);
+
 /**
  * A server that cannot compile the request's tool schema into a sampling
  * grammar (llama.cpp: "Failed to initialize samplers: failed to parse grammar")
  * refuses it with a 400 on every attempt. That is a property of the route, not
  * a defect in the work: it is never retried there and hands over to the next.
  */
-const PROVIDER_REQUEST_REFUSAL = /grammar|sampler|json.?schema/i;
+/** Provider-side failures a reviewer fails over on: an unreachable host, a 5xx, a timeout. */
+const PROVIDER_FAULT_MARKERS: ReadonlySet<string> = new Set([
+  "transient:network",
+  "transient:server_error",
+  "transient:timeout",
+]);
 
-const MODEL_CAPACITY_MARKERS: ReadonlySet<string> = new Set(["transient:server_unavailable"]);
+const PROVIDER_REQUEST_REFUSAL = /failed to parse grammar|failed to initialize samplers/i;
 
 /**
  * An "invalid model name" refusal comes from one route of the gateway (the
@@ -471,7 +478,7 @@ export function realBackends(opts: RealBackendsOptions) {
         !gone &&
         !capacity &&
         plan.failoverOnProviderError === true &&
-        (error.startsWith("transient:") || PROVIDER_REQUEST_REFUSAL.test(run.result.summary));
+        (PROVIDER_FAULT_MARKERS.has(error) || PROVIDER_REQUEST_REFUSAL.test(run.result.summary));
       if (!gone && !capacity && !providerFault) break;
       const failed: ModelRef = model;
       const reason = run.result.summary;

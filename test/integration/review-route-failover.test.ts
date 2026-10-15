@@ -152,9 +152,59 @@ test("an unreachable preferred route fails over to the next eligible route", asy
   try {
     assert.equal(outcome.exitStatus, "succeeded", outcome.summary);
     assert.equal(outcome.reviewEvidence?.model, next.id);
+    assert.equal(outcome.reviewEvidence?.outputValid, true);
   } finally {
     good.closeAllConnections();
     good.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+const refuse = (message: string) => (_req: IncomingMessage, res: ServerResponse) => {
+  res.writeHead(400, { "content-type": "application/json" });
+  res.end(JSON.stringify({ error: { code: 400, message, type: "invalid_request_error" } }));
+};
+
+test("a non-grammar HTTP 400 is not failed over and the review fails as a provider error", async () => {
+  const bad = await listen(refuse("unsupported parameter: logit_bias"));
+  let secondHits = 0;
+  const good = await listen((_req, res) => {
+    secondHits++;
+    reviewReply(res);
+  });
+  const { outcome, dir } = await reviewOver(
+    { beast: `http://127.0.0.1:${port(bad)}/v1`, hive: `http://127.0.0.1:${port(good)}/v1` },
+    [preferred, next],
+  );
+  try {
+    assert.notEqual(outcome.exitStatus, "succeeded");
+    assert.equal(secondHits, 0, "the second route must not be asked");
+    assert.match(outcome.summary, /unsupported parameter|400/i);
+  } finally {
+    for (const s of [bad, good]) {
+      s.closeAllConnections();
+      s.close();
+    }
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("when every route refuses the grammar the run fails cleanly, naming the refusal", async () => {
+  const msg = "Failed to initialize samplers: failed to parse grammar";
+  const a = await listen(refuse(msg));
+  const b = await listen(refuse(msg));
+  const { outcome, dir } = await reviewOver(
+    { beast: `http://127.0.0.1:${port(a)}/v1`, hive: `http://127.0.0.1:${port(b)}/v1` },
+    [preferred, next],
+  );
+  try {
+    assert.notEqual(outcome.exitStatus, "succeeded");
+    assert.match(outcome.summary, /failed to parse grammar/i);
+  } finally {
+    for (const s of [a, b]) {
+      s.closeAllConnections();
+      s.close();
+    }
     rmSync(dir, { recursive: true, force: true });
   }
 });
