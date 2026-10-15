@@ -153,6 +153,7 @@ async function harness(opts: { willReuse: boolean; emitsReuse: boolean; invalidR
       },
     ],
     recovery: { missionCeiling: 20, strategyMaxAttempts: 5 },
+    sleep: async () => undefined,
   });
   const run = () =>
     orchestrator.orchestrate(`Add the change module in ${fixture.root}`, {
@@ -201,6 +202,20 @@ describe("review beside a reused validation (#185)", () => {
       assert.equal(result.mission.status, "COMPLETE");
       assert.equal(h.reviewRuns(), 2, "the review gate ran again");
       assert.equal(h.agentRuns(), 1, "no implementer repair ran");
+    } finally {
+      await h.fixture.cleanup();
+    }
+  });
+
+  it("stops, resumable, when the review output stays unreadable past the recovery budget", async () => {
+    const h = await harness({ willReuse: false, emitsReuse: false, invalidReviews: 1000 });
+    try {
+      const result = await h.run();
+      assert.notEqual(result.mission.status, "COMPLETE");
+      assert.equal(h.agentRuns(), 1, "no implementer repair ran");
+      assert.ok(h.reviewRuns() >= 2 && h.reviewRuns() <= 7, `bounded re-runs, got ${h.reviewRuns()}`);
+      const stop = h.store.getMission(result.mission.mission_id)!;
+      assert.ok(["BLOCKED", "PAUSED", "STOPPED"].includes(stop.status), stop.status);
     } finally {
       await h.fixture.cleanup();
     }

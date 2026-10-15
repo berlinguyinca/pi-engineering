@@ -111,7 +111,13 @@ import {
   workerCompactionSettings,
 } from "./contextBudget.ts";
 import { registerLocalProviders } from "./localProviders.ts";
-import { MUTATING_ROLES, WORKER_KICKOFF, buildSystemPrompt, wantsCommitDiscipline } from "./prompts.ts";
+import {
+  MUTATING_ROLES,
+  REVIEWER_CONTEXT_CHAR_CAP,
+  WORKER_KICKOFF,
+  buildSystemPrompt,
+  wantsCommitDiscipline,
+} from "./prompts.ts";
 import { guardRuntimeRequestBody } from "./requestBodyGuard.ts";
 import { StreamStallWatchdog, isStalledStream } from "./streamStall.ts";
 import { createNumberedReadTool, createTolerantEditTool } from "./tolerantFileTools.ts";
@@ -2050,7 +2056,9 @@ export function buildCompactedWorkerPrompt(req: WorkerRequest, recoveryPrompt: s
   const verifiedContext = req.context;
   if (verifiedContext?.trim()) {
     const compactContext = verifiedContext.trim();
-    const sliced = compactContext.length > 500 ? `${compactContext.slice(0, 500)}… [truncated]` : compactContext;
+    // A reviewer's context is the change it judges; keep far more of it.
+    const limit = req.role === "reviewer" || req.role === "security-review" ? REVIEWER_CONTEXT_CHAR_CAP : 500;
+    const sliced = compactContext.length > limit ? `${compactContext.slice(0, limit)}… [truncated]` : compactContext;
     parts.push(`# Context (compacted)`);
     parts.push(sliced);
     parts.push("");

@@ -5,6 +5,7 @@
  * servers stand in for the model route; a real verifier runs the suite.
  */
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { type IncomingMessage, type Server, type ServerResponse, createServer } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -15,7 +16,7 @@ import { ArtifactStore } from "../../src/artifacts/ArtifactStore.ts";
 import { AdmissionController } from "../../src/gateway/AdmissionController.ts";
 import { resolveGatewayConfig } from "../../src/gateway/config.ts";
 import type { ModelRef } from "../../src/lifecycle/types.ts";
-import { realBackends } from "../../src/orchestration/realBackends.ts";
+import { realBackends, testCriteriaPassed } from "../../src/orchestration/realBackends.ts";
 import { FailureClassifier, classifyGateFailure } from "../../src/orchestration/recovery.ts";
 import { CommandVerifier } from "../../src/verify/Verifier.ts";
 import { PiWorkerExecutor } from "../../src/workers/PiWorkerExecutor.ts";
@@ -27,7 +28,10 @@ const CRITERIA = [
 ];
 const CONTEXT = "## Diff (git diff aaa..bbb)\n+console.log('hello-marker-7731')";
 
-async function review(reply: Record<string, unknown>) {
+async function review(
+  reply: Record<string, unknown>,
+  extra: { worktree?: string; bashFirst?: boolean; command?: string } = {},
+) {
   const dir = mkdtempSync(join(tmpdir(), "pi-review-ctx-int-"));
   const bodies: string[] = [];
   const server: Server = createServer((req: IncomingMessage, res: ServerResponse) => {
@@ -37,6 +41,30 @@ async function review(reply: Record<string, unknown>) {
     });
     req.on("end", () => {
       bodies.push(body);
+      if (extra.bashFirst && !body.includes('"role":"tool"')) {
+        const frame = (delta: Record<string, unknown>, finish: string | null = null) =>
+          `data: ${JSON.stringify({ id: "c", object: "chat.completion.chunk", created: 0, model: "m", choices: [{ index: 0, delta, finish_reason: finish }] })}\n\n`;
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.write(
+          frame({
+            role: "assistant",
+            tool_calls: [
+              {
+                index: 0,
+                id: "call_bash",
+                type: "function",
+                function: {
+                  name: "bash",
+                  arguments: JSON.stringify({ command: extra.command ?? "echo changed > mutated.txt" }),
+                },
+              },
+            ],
+          }),
+        );
+        res.write(frame({}, "tool_calls"));
+        res.end("data: [DONE]\n\n");
+        return;
+      }
       const frame = (delta: Record<string, unknown>, finish: string | null = null) =>
         `data: ${JSON.stringify({ id: "c", object: "chat.completion.chunk", created: 0, model: "m", choices: [{ index: 0, delta, finish_reason: finish }] })}\n\n`;
       res.writeHead(200, { "content-type": "text/event-stream" });
@@ -91,6 +119,7 @@ async function review(reply: Record<string, unknown>) {
     const outcome = await backends.review.runReview({
       objective: "review",
       contextRef: CONTEXT,
+      worktree: extra.worktree,
       acceptanceCriteria: CRITERIA,
       missionId: "MSN-1",
       signal: new AbortController().signal,
@@ -106,7 +135,13 @@ async function review(reply: Record<string, unknown>) {
 const base = { verdict: "approve", summary: "fine", findings: [], missing_tests: [], spec_gaps: [] };
 
 test("the reviewer's prompt carries the change context and it can read files and run bash", async () => {
-  const { outcome, bodies } = await review({ ...base, acceptance_results: [] });
+  const { outcome, bodies } = await review({
+    ...base,
+    acceptance_results: [
+      { acceptance_id: "AC-1", status: "passed", detail: "ok" },
+      { acceptance_id: "AC-2", status: "passed", detail: "ok" },
+    ],
+  });
   assert.equal(outcome.exitStatus, "succeeded", outcome.summary);
   const request = bodies[0] ?? "";
   assert.match(request, /hello-marker-7731/);
@@ -179,5 +214,139 @@ test("a green validation passes test-like criteria and leaves the rest to the re
     );
   } finally {
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("an empty acceptance_results list is invalid output, not every criterion failed", async () => {
+  const { outcome } = await review({ ...base, acceptance_results: [] });
+  assert.equal(outcome.exitStatus, "failed");
+  assert.equal(outcome.reviewEvidence?.outputValid, false);
+  assert.match(outcome.error ?? "", /^INVALID_WORKER_OUTPUT: .*acceptance_results/);
+});
+
+test("acceptance warnings are minor open findings that never block", async () => {
+  const { outcome } = await review({
+    ...base,
+    acceptance_results: [
+      { acceptance_id: "AC-1", status: "passed", detail: "ok" },
+      { acceptance_id: "AC-9", status: "passed", detail: "invented" },
+    ],
+  });
+  const warning = outcome.reviewEvidence?.findings.filter((f) => /AC-9/.test(f.summary)) ?? [];
+  assert.equal(warning.length, 1);
+  assert.equal(warning[0]?.severity, "minor");
+  assert.equal(outcome.reviewEvidence?.findings.filter((f) => f.severity === "blocking").length, 0);
+  assert.deepEqual(outcome.findings, [], "warnings never reach the mission's findings, so they spawn no repair");
+});
+
+test("validation stage names decide whether a green run proves test criteria", () => {
+  const criteria = [
+    { acceptanceId: "AC-LATEST-1", criterion: "page loads" },
+    { acceptanceId: "AC-CONTEST", criterion: "page loads" },
+    { acceptanceId: "AC-TEST-2", criterion: "page loads" },
+    { acceptanceId: "AC-3", criterion: "Tests must cover the greeting" },
+    { acceptanceId: "AC-4", criterion: "greeting is printed" },
+  ];
+  const run = (name: string, passed = true) => ({ stage: { name }, passed });
+  assert.deepEqual(
+    testCriteriaPassed(criteria, [run("typecheck"), run("test")], []).map((r) => r.acceptanceId),
+    ["AC-TEST-2", "AC-3"],
+  );
+  assert.deepEqual(testCriteriaPassed(criteria, [run("typecheck"), run("lint")], []), [], "no test stage ran");
+  assert.deepEqual(testCriteriaPassed(criteria, [run("test", false)], []), [], "the test stage failed");
+  assert.deepEqual(testCriteriaPassed(criteria, [run("test")], ["suite was red at base"]), [], "inherited failures");
+  assert.equal(testCriteriaPassed(criteria, [run("test:unit")], [])[0]?.detail.includes("exit 0"), false);
+});
+
+test("a lint-only profile does not pass test criteria even when green", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-validation-lint-"));
+  try {
+    writeFileSync(
+      join(dir, "package.json"),
+      JSON.stringify({ name: "t", version: "1.0.0", scripts: { lint: 'node -e "process.exit(0)"' } }),
+    );
+    const backends = realBackends({
+      worker: {} as never,
+      verifier: new CommandVerifier(),
+      artifacts: await ArtifactStore.create(join(dir, ".artifacts")),
+      git: null,
+      cwd: dir,
+    });
+    const outcome = await backends.validation.runValidation({
+      objective: "validate",
+      acceptanceCriteria: CRITERIA,
+      signal: new AbortController().signal,
+    });
+    assert.equal(outcome.exitStatus, "succeeded", outcome.summary);
+    assert.deepEqual(outcome.validationEvidence?.acceptanceResults, []);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a reviewer that commits or writes through bash is rejected and the candidate is unchanged", async () => {
+  const repo = mkdtempSync(join(tmpdir(), "pi-review-mutate-"));
+  const git = (...args: string[]) =>
+    execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@t", ...args], { cwd: repo, encoding: "utf8" }).trim();
+  git("init", "-q", "-b", "main");
+  writeFileSync(join(repo, "a.txt"), "one\n");
+  git("add", "-A");
+  git("commit", "-qm", "base");
+  const head = git("rev-parse", "HEAD");
+  const results = [
+    { acceptance_id: "AC-1", status: "passed", detail: "ok" },
+    { acceptance_id: "AC-2", status: "passed", detail: "ok" },
+  ];
+  const { outcome } = await review({ ...base, acceptance_results: results }, { worktree: repo, bashFirst: true });
+  try {
+    assert.equal(outcome.exitStatus, "failed");
+    assert.equal(outcome.reviewEvidence?.outputValid, false);
+    assert.match(outcome.error ?? "", /^INVALID_WORKER_OUTPUT: reviewer mutated the candidate/);
+    assert.equal(
+      classifyGateFailure(
+        new FailureClassifier(),
+        "review",
+        { missionId: "M", taskId: "T", summary: outcome.error ?? "" },
+        outcome,
+      ).category,
+      "PROVIDER_TRANSIENT",
+    );
+    // The guard reports; it never repairs silently: the mutation is still visible.
+    assert.notEqual(git("status", "--porcelain"), "");
+    assert.equal(git("rev-parse", "HEAD"), head, "the model's commit failed or was not made on a moved HEAD");
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("a reviewer that commits through bash is rejected too", async () => {
+  const repo = mkdtempSync(join(tmpdir(), "pi-review-commit-"));
+  const git = (...args: string[]) =>
+    execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@t", ...args], { cwd: repo, encoding: "utf8" }).trim();
+  git("init", "-q", "-b", "main");
+  writeFileSync(join(repo, "a.txt"), "one\n");
+  git("add", "-A");
+  git("commit", "-qm", "base");
+  const head = git("rev-parse", "HEAD");
+  try {
+    const { outcome } = await review(
+      {
+        ...base,
+        acceptance_results: [
+          { acceptance_id: "AC-1", status: "passed", detail: "ok" },
+          { acceptance_id: "AC-2", status: "passed", detail: "ok" },
+        ],
+      },
+      {
+        worktree: repo,
+        bashFirst: true,
+        command: "git -c user.name=x -c user.email=x@x commit -q --allow-empty -m sneaky",
+      },
+    );
+    assert.notEqual(git("rev-parse", "HEAD"), head, "the reviewer really moved HEAD");
+    assert.equal(outcome.exitStatus, "failed");
+    assert.match(outcome.error ?? "", /reviewer mutated the candidate/);
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
   }
 });

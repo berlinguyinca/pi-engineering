@@ -83,20 +83,38 @@ export interface AcceptanceResultOptions {
   tolerant?: boolean;
   /** Receives one line per tolerated defect (tolerant mode only). */
   warnings?: string[];
+  /**
+   * Receives a reason when the results are unusable as a whole (tolerant mode
+   * only): criteria exist but the list is missing, not a list, or empty. The
+   * caller treats that as invalid output, not as every criterion failed.
+   */
+  problems?: string[];
 }
 
 function tolerantAcceptanceResults(
   raw: unknown,
   allowedIds: string[],
   warnings: string[] | undefined,
+  problems: string[] | undefined,
 ): AcceptanceEvidenceResult[] {
-  const byNormalized = new Map(allowedIds.map((id) => [normalizeAcceptanceId(id), id]));
+  // Normalised forms can collide (AC-10 / AC-1-0): a collided form is ambiguous
+  // and only an exact ID may claim it; a unique form may be matched loosely.
+  const exact = new Set(allowedIds);
+  const byNormalized = new Map<string, string | null>();
+  for (const id of allowedIds) {
+    const key = normalizeAcceptanceId(id);
+    byNormalized.set(key, byNormalized.has(key) && byNormalized.get(key) !== id ? null : id);
+  }
   const reported = new Map<string, AcceptanceEvidenceResult>();
   const warn = (message: string): void => {
     warnings?.push(message);
   };
   const entries = Array.isArray(raw) ? raw : [];
-  if (!Array.isArray(raw)) warn("acceptance_results was not a list; every criterion counts as not reported");
+  if (allowedIds.length > 0 && entries.length === 0) {
+    problems?.push(
+      Array.isArray(raw) ? "acceptance_results was empty" : "acceptance_results was missing or not a list",
+    );
+  }
   for (const entry of entries) {
     if (!entry || typeof entry !== "object") {
       warn("dropped a malformed acceptance result");
@@ -104,7 +122,9 @@ function tolerantAcceptanceResults(
     }
     const value = entry as Partial<AcceptanceEvidenceResult>;
     const given = typeof value.acceptanceId === "string" ? value.acceptanceId : "";
-    const canonical = byNormalized.get(normalizeAcceptanceId(given));
+    const canonical = exact.has(given.trim())
+      ? given.trim()
+      : (byNormalized.get(normalizeAcceptanceId(given)) ?? undefined);
     if (!canonical) {
       warn(`dropped acceptance result for unknown ID "${given}"`);
       continue;
@@ -130,7 +150,7 @@ export function validateAcceptanceResults(
   allowedIds: string[],
   options: AcceptanceResultOptions = {},
 ): AcceptanceEvidenceResult[] {
-  if (options.tolerant) return tolerantAcceptanceResults(raw, allowedIds, options.warnings);
+  if (options.tolerant) return tolerantAcceptanceResults(raw, allowedIds, options.warnings, options.problems);
   if (!Array.isArray(raw)) throw new Error("evidence requires explicit acceptance results");
   const allowed = new Set(allowedIds);
   const seen = new Set<string>();

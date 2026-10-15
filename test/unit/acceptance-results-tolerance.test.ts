@@ -60,10 +60,42 @@ test("tolerant mode keeps the first duplicate, drops unknown IDs with a warning,
   assert.match(warnings.join("\n"), /duplicate/i);
 });
 
-test("tolerant mode treats a missing array as all-omitted and drops malformed entries", () => {
+test("tolerant mode reports a missing, non-list or empty list as a problem, not as failed criteria", () => {
+  for (const raw of [undefined, "nope", []]) {
+    const problems: string[] = [];
+    validateAcceptanceResults(raw, ["AC-1"], { tolerant: true, problems });
+    assert.equal(problems.length, 1, JSON.stringify(raw));
+  }
+  const none: string[] = [];
+  validateAcceptanceResults([], [], { tolerant: true, problems: none });
+  assert.deepEqual(none, [], "no criteria, nothing to report");
+});
+
+test("colliding normalised IDs need an exact match; unique forms match loosely", () => {
   const warnings: string[] = [];
-  const results = validateAcceptanceResults(undefined, ["AC-1"], { tolerant: true, warnings });
-  assert.deepEqual(results, [{ acceptanceId: "AC-1", status: "failed", detail: "not reported by reviewer" }]);
+  const results = validateAcceptanceResults(
+    [
+      { acceptanceId: "AC-10", status: "passed", detail: "ten" },
+      { acceptanceId: "AC-1-0", status: "failed", detail: "one-zero" },
+      { acceptanceId: "ac10", status: "passed", detail: "ambiguous" },
+      { acceptanceId: "r 3", status: "passed", detail: "unique" },
+    ],
+    ["AC-10", "AC-1-0", "R-3"],
+    { tolerant: true, warnings },
+  );
+  assert.deepEqual(
+    results.map((r) => [r.acceptanceId, r.status, r.detail]),
+    [
+      ["AC-10", "passed", "ten"],
+      ["AC-1-0", "failed", "one-zero"],
+      ["R-3", "passed", "unique"],
+    ],
+  );
+  assert.match(warnings.join("\n"), /ac10/);
+});
+
+test("tolerant mode drops malformed entries", () => {
+  const warnings: string[] = [];
   const dropped = validateAcceptanceResults([null, { acceptanceId: "AC-1", status: "maybe", detail: "x" }], ["AC-1"], {
     tolerant: true,
     warnings,

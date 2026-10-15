@@ -324,7 +324,6 @@ export function gateReportedVerdict(
     const review = outcome?.reviewEvidence;
     if (review) {
       // Unreadable reviewer output is not a verdict: the review must re-run.
-      if (!review.outputValid) return false;
       return (
         review.outputValid &&
         review.accessible &&
@@ -356,6 +355,9 @@ export function gateReportedVerdict(
  */
 export const GATE_TRANSPORT_SIGNATURE =
   /connection error|connection closed|stream ended without (?:a )?finish_reason|model[_ ]superseded|gateway capacity hold|capacity hold:|http 400.*grammar|failed to parse grammar|failed to initialize samplers/i;
+
+/** Prefix of the error a gate backend sets when its model's output could not be read; the gate re-runs. */
+export const INVALID_WORKER_OUTPUT_PREFIX = "INVALID_WORKER_OUTPUT";
 
 const GATE_FAILURE_CATEGORY: Partial<Record<OrchestrationTask["kind"], FailureCategory>> = {
   validation: "VALIDATION_FAILED",
