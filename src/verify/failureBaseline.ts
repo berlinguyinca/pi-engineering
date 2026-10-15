@@ -11,6 +11,13 @@ const execFileAsync = promisify(execFile);
  * R-DELIVER, §7 item 7), so a change is judged by the failures it INTRODUCES
  * instead of by a suite that was red before it started.
  *
+ * Matching rule: a failure is identified per test name (`test:<stage> » <name>`)
+ * when the stage output yields node:test TAP/spec names, otherwise per stage
+ * (`stage:<name>`). Limits: a bare test name is not qualified by its file, so two
+ * files reporting the same name collide (a new failure under an already-failing
+ * name is forgiven); a stage that fails with a different exit code, or hangs,
+ * is never forgiven.
+ *
  * A baseline names its inputs (§8): the exact base SHA and the profile it ran.
  * It is only ever compared against a candidate bound to that same SHA.
  */
@@ -24,6 +31,10 @@ export interface FailureBaseline {
   /** Ids that failed in some but not all confirming runs. Never forgiven. */
   flaky: string[];
   capturedAt: string;
+  /** Stages the baseline profile ran (it runs every stage, even after a failure). */
+  stagesRun?: string[];
+  /** Exit code of each failing stage, when it was the same in every confirming run. */
+  exitCodes?: Record<string, number>;
 }
 
 export interface BaselineVerdict {
@@ -149,14 +160,39 @@ export async function captureBaseline(
     throw new Error(`captureBaseline: ${cwd} has uncommitted changes; a baseline must describe ${head} exactly`);
   }
   const perRun: Array<Set<string>> = [];
+  const outcomes: VerifyOutcome[] = [];
   for (let attempt = 0; attempt < runs; attempt++) {
-    const outcome = await provider.run(cwd, profile, store, options.signal ? { signal: options.signal } : undefined);
+    // Exhaustive: a stage after the first failure must not stay unknown.
+    const outcome = await provider.run(cwd, profile, store, {
+      exhaustive: true,
+      ...(options.signal ? { signal: options.signal } : {}),
+    });
+    // A run that died of the environment describes the machine, not the commit.
+    if (outcome.stages.some((run) => run.summary.infrastructureFailure === true)) {
+      throw new Error("captureBaseline: a stage failed for an infrastructure reason (hang or spawn failure)");
+    }
     perRun.push(new Set(failureIds(outcome)));
+    outcomes.push(outcome);
   }
   const everFailed = new Set(perRun.flatMap((ids) => [...ids]));
   const failures = [...everFailed].filter((id) => perRun.every((ids) => ids.has(id))).sort();
   const flaky = [...everFailed].filter((id) => !perRun.every((ids) => ids.has(id))).sort();
-  return { baseSha: head, profileHash: hashProfile(profile), failures, flaky, capturedAt: new Date().toISOString() };
+  const stagesRun = [...new Set(outcomes.flatMap((o) => o.stages.map((run) => run.stage.name)))];
+  const exitCodes: Record<string, number> = {};
+  for (const run of outcomes[0]?.stages ?? []) {
+    if (run.passed) continue;
+    const codes = outcomes.map((o) => o.stages.find((r) => r.stage.name === run.stage.name)?.exitCode);
+    if (codes.every((code) => code === run.exitCode)) exitCodes[run.stage.name] = run.exitCode;
+  }
+  return {
+    baseSha: head,
+    profileHash: hashProfile(profile),
+    failures,
+    flaky,
+    capturedAt: new Date().toISOString(),
+    stagesRun,
+    exitCodes,
+  };
 }
 
 /**
@@ -185,9 +221,21 @@ export function compareToBaseline(
   if (outcome.profileHash !== undefined && outcome.profileHash !== baseline.profileHash) {
     return stale("captured for a different verification profile");
   }
+  // A failing stage that died differently than it did on the base (other exit
+  // code, hang, forced exit) is a new failure even when its names match.
+  const changedStages = new Set(
+    outcome.stages
+      .filter((run) => {
+        if (run.passed) return false;
+        const baseCode = baseline.exitCodes?.[run.stage.name];
+        return run.summary.infrastructureFailure === true || (baseCode !== undefined && baseCode !== run.exitCode);
+      })
+      .map((run) => run.stage.name),
+  );
   const known = new Set(baseline.failures);
-  const preExisting = current.filter((id) => known.has(id));
-  const introduced = current.filter((id) => !known.has(id));
+  const inherits = (id: string): boolean => known.has(id) && !changedStages.has(stageOf(id));
+  const preExisting = current.filter(inherits);
+  const introduced = current.filter((id) => !inherits(id));
   const ranStages = new Set(outcome.stages.map((run) => run.stage.name));
   const now = new Set(current);
   const fixed = baseline.failures.filter((id) => ranStages.has(stageOf(id)) && !now.has(id));

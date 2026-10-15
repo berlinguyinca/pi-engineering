@@ -137,7 +137,14 @@ export function runWithInactivityGuard(
   command: string,
   args: string[],
   opts: { cwd: string; env?: NodeJS.ProcessEnv; signal?: AbortSignal; inactivityMs: number },
-): Promise<{ code: number; stdout: string; stderr: string; hung: boolean; leftoverProcesses: number }> {
+): Promise<{
+  code: number;
+  stdout: string;
+  stderr: string;
+  hung: boolean;
+  leftoverProcesses: number;
+  spawnFailed?: boolean;
+}> {
   return new Promise((resolve, reject) => {
     if (opts.signal?.aborted) {
       reject(Object.assign(new Error("The operation was aborted"), { name: "AbortError" }));
@@ -216,7 +223,14 @@ export function runWithInactivityGuard(
     });
     child.on("error", (error) =>
       finish(() =>
-        resolve({ code: 1, stdout, stderr: `${stderr}${error.message}`, hung: false, leftoverProcesses: 0 }),
+        resolve({
+          code: 1,
+          stdout,
+          stderr: `${stderr}${error.message}`,
+          hung: false,
+          leftoverProcesses: 0,
+          spawnFailed: true,
+        }),
       ),
     );
     child.on("close", (code) =>
@@ -292,6 +306,10 @@ export interface VerifyRunOptions {
   baseline?: FailureBaseline;
   /** The base SHA the candidate is bound to. A baseline for any other SHA is stale. */
   boundBaseSha?: string;
+  /** Run every stage even after a required stage fails (a baseline must see the whole profile). */
+  exhaustive?: boolean;
+  /** Keep going after a required failure in these stages (their failure is inherited from the base). */
+  continueThrough?: ReadonlySet<string>;
 }
 
 /**
@@ -695,6 +713,8 @@ export class CommandVerifier implements VerificationProvider {
         exitCode: code,
         stdoutBytes: Buffer.byteLength(stdout),
         stderrBytes: Buffer.byteLength(stderr),
+        // The command died of the environment (hang guard, spawn error), not of its own verdict.
+        ...(res.hung || res.spawnFailed ? { infrastructureFailure: true } : {}),
         ...(leftoverProcesses > 0
           ? {
               leftoverProcesses,
@@ -730,8 +750,8 @@ export class CommandVerifier implements VerificationProvider {
 
       // Stop early on a required hard failure (spec §15.3).
       if (!passed && stage.required) {
-        failedStage = stage.name;
-        break;
+        failedStage ??= stage.name;
+        if (!opts?.exhaustive && !opts?.continueThrough?.has(stage.name)) break;
       }
     }
 

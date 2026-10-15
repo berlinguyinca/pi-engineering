@@ -385,6 +385,32 @@ When Pi exits — normally or on an uncaught exception — every running
 verification group is killed; a `SIGKILL` of Pi itself cannot run that cleanup,
 so a group can outlive it in that one case.
 
+### Failures that were already red on the base
+
+Integration and validation judge a candidate by the failures it introduces. When
+a candidate's checks fail, the same profile is run once on the commit the
+candidate was built on (a temporary worktree, never the shared checkout) and
+the result is cached per (base SHA, profile hash) under the repository's
+`pi-engineering-baselines` git directory, so it runs once per base, not once per
+round. A failure is identified per test name (`test:<stage> » <name>`) when the
+stage output yields node:test TAP/spec names, otherwise per stage
+(`stage:<name>`, the command exited non-zero). A candidate whose failing ids
+all also fail on the base passes with a warning and structured
+`inheritedFailures`; any other failing id is new and fails the run. Flaky base
+failures are never forgiven: the base is run `PI_ENGINEERING_BASELINE_RUNS`
+times (default 2) through every stage, and a failure must occur in all of them.
+A failing stage must also end as it did on the base (same exit code, not hung),
+and a run that failed with no identifiable failure blocks. A bare test name is
+not qualified by its file, so the same name failing in two files collides. The
+base run is bounded by `PI_ENGINEERING_BASELINE_TIMEOUT_MS` (default 20
+minutes); a timed-out or environment-failed run is not cached. A candidate that
+stopped at an inherited failing stage is re-run through its later stages before
+it is judged. If the baseline cannot be computed (base commit
+unavailable, different profile, uncommitted changes) the run is judged without
+one and says so in its warnings. An integration run whose checks ran and failed
+is classified `VALIDATION_FAILED` (a code repair); `MERGE_CONFLICT` is reserved
+for an actual merge conflict.
+
 ## Verifiable roadmap completion
 
 `node scripts/pi-engineering.ts roadmap check` (or `npm run roadmap:check`)

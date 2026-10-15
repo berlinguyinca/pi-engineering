@@ -152,12 +152,16 @@ describe("a repository with no verification targets", () => {
     try {
       await writeFile(
         join(root, "package.json"),
-        JSON.stringify({ name: "x", private: true, scripts: { test: 'node -e "process.exit(1)"' } }),
+        JSON.stringify({ name: "x", private: true, scripts: { test: 'node -e "process.exit(0)"' } }),
       );
       git(root, "add", "-A");
-      git(root, "commit", "-q", "-m", "failing suite");
+      git(root, "commit", "-q", "-m", "passing suite");
       git(root, "checkout", "-q", "-b", "worker-change");
-      await writeFile(join(root, "NOTES.md"), "n\n");
+      // The worker breaks the suite: a failure the base did not have still fails.
+      await writeFile(
+        join(root, "package.json"),
+        JSON.stringify({ name: "x", private: true, scripts: { test: 'node -e "process.exit(1)"' } }),
+      );
       git(root, "add", "-A");
       git(root, "commit", "-q", "-m", "notes");
       git(root, "checkout", "-q", "main");
@@ -176,6 +180,7 @@ describe("a repository with no verification targets", () => {
       assert.equal(integration.exitStatus, "failed");
       assert.match(integration.error ?? "", /verification failed at stage/);
       assert.equal(integration.noTargets, false);
+      git(root, "checkout", "-q", "worker-change");
       const validation = await backends.validation.runValidation({
         objective: "validate",
         signal: new AbortController().signal,
