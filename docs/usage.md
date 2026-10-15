@@ -437,8 +437,11 @@ request, whatever the output allowance: `chat_template_kwargs.enable_thinking: f
 only for models with `compat.supportsReasoningEffort`; the InferWeave node
 rejects unknown top-level fields). Hidden reasoning costs 8-13k
 tokens per turn on the gateway models, and a worker makes dozens of turns. The
-one-shot planner and interactive sessions keep their current behaviour. Each
-such request logs `thinking: off (mission role)`.
+one-shot planner keeps thinking on. Interactive sessions keep thinking on for
+ordinary turns; their compaction/summarisation turns and low-output-budget turns
+use the same thinking-off payload as mission roles (`chat_template_kwargs` always,
+`reasoning_effort` only with `compat.supportsReasoningEffort`). Each mission-role
+request logs `thinking: off (mission role)`.
 
 The policy applies to `openai-completions` models on providers `metabolomics`,
 `beast`, `bender` (`PI_THINKING_OFF_PROVIDERS`) or hosts `llm.example.com`,
