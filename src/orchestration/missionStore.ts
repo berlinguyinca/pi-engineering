@@ -105,6 +105,12 @@ export type OrchestrationEventType =
   | "lane.stale_taken"
   | "lane.index_corrupt";
 
+export interface RepositoryWait {
+  repoId: string;
+  holderMissionId: string;
+  holderOwnerId: string;
+}
+
 const ORCHESTRATION_EVENT_TYPES: ReadonlySet<string> = new Set<OrchestrationEventType>([
   "mission.created",
   "mission.updated",
@@ -330,6 +336,8 @@ export class MissionStore {
   private readonly backend: EventStoreBackend;
   private readonly missions = new Map<string, Mission>();
   private readonly tasks = new Map<string, OrchestrationTask>();
+  /** Tasks currently waiting for another mission's repository lease (informational, in-memory). */
+  private readonly repositoryWaits = new Map<string, RepositoryWait>();
   private readonly executions = new Map<string, Execution>();
   private readonly findings = new Map<string, ReviewFinding>();
   private readonly workspaceManifests = new Map<string, WorkspaceManifest>();
@@ -1665,6 +1673,19 @@ export class MissionStore {
     payload: Record<string, unknown>,
   ): void {
     this.emit(type, missionId, { actor: "system", ...payload });
+  }
+
+  /** Record that a task waits for a repository lease held by another mission. */
+  setRepositoryWait(taskId: string, wait: RepositoryWait): void {
+    this.repositoryWaits.set(taskId, wait);
+  }
+
+  clearRepositoryWait(taskId: string): void {
+    this.repositoryWaits.delete(taskId);
+  }
+
+  getRepositoryWait(taskId: string): RepositoryWait | undefined {
+    return this.repositoryWaits.get(taskId);
   }
 
   addFinding(finding: Omit<ReviewFinding, "finding_id" | "status" | "created_at">): ReviewFinding {

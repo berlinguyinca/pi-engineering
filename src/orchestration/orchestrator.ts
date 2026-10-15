@@ -43,7 +43,7 @@ import type { MissionStore } from "./missionStore.ts";
 import type { MissionObservability } from "./observability/MissionObservability.ts";
 import { computeProgress } from "./observability/progress.ts";
 import type { ActivityType, WaitingReason } from "./observability/types.ts";
-import type { DispatchAuthority, MissionOwnership } from "./ownership.ts";
+import { type DispatchAuthority, type MissionOwnership, RepositoryLeasedError } from "./ownership.ts";
 import { deriveRequiredGates, mutationFactFromChangedFiles } from "./policies.ts";
 import {
   FailureClassifier,
@@ -257,6 +257,7 @@ export interface OrchestrateOptions {
 
 /** Executions whose build activity is remembered for the budget-exhausted hint. */
 const MAX_TRACKED_BUILD_EXECUTIONS = 256;
+const REPOSITORY_WAIT_CEILING_MS = 600_000;
 
 /** Finding category for committed worker work that integration refused to merge. */
 const STRANDED_WORKER_WORK = "stranded_worker_work";
@@ -407,7 +408,7 @@ export class Orchestrator {
       now: opts.now,
       sleep: opts.sleep,
       rand: opts.rand,
-      acquireAuthority: this.ownership ? (task) => this.acquireTaskAuthority(task) : undefined,
+      acquireAuthority: this.ownership ? (task, signal) => this.acquireTaskAuthorityWaiting(task, signal) : undefined,
       recovery: opts.recovery,
       onStatus: (notice) => {
         const obs = this.observability;
@@ -2736,7 +2737,7 @@ export class Orchestrator {
         // deterministic harnesses while still using the guarded Git primitive.
         integrated = await this.broker.promoteCandidate(missionId);
       } else {
-        const promotionAuthority = await this.acquireTaskAuthority(integrationTask);
+        const promotionAuthority = await this.acquireTaskAuthorityWaiting(integrationTask);
         try {
           promotionAuthority.assertAuthoritative();
           integrated = await this.broker.promoteCandidate(missionId, promotionAuthority);
@@ -3239,7 +3240,7 @@ export class Orchestrator {
   ): Promise<boolean> {
     if (!this.recoveryTaskGenerations.has(taskId)) await this.renewMissionOwnership(missionId);
     let task = this.store.getTask(taskId)!;
-    const authority = this.ownership ? await this.acquireTaskAuthority(task) : undefined;
+    const authority = this.ownership ? await this.acquireTaskAuthorityWaiting(task, extra.signal) : undefined;
     if (authority) task = this.store.assignTaskAuthority(taskId, authority.missionIdentity);
     authority?.assertAuthoritative();
     this.store.transitionTask(taskId, "RUNNING");
@@ -3471,6 +3472,35 @@ export class Orchestrator {
     this.ownershipByMission.set(missionId, await this.ownership.renew(identity));
   }
 
+  /**
+   * acquireTaskAuthority that treats a repository leased to another mission as a
+   * named wait (visible in the mission snapshot) instead of a failure. Backs off
+   * up to the same ceiling as cross-session custody waits.
+   */
+  private async acquireTaskAuthorityWaiting(task: OrchestrationTask, signal?: AbortSignal): Promise<DispatchAuthority> {
+    const deadline = Date.now() + REPOSITORY_WAIT_CEILING_MS;
+    let backoffMs = 50;
+    for (;;) {
+      try {
+        const authority = await this.acquireTaskAuthority(task);
+        this.store.clearRepositoryWait(task.task_id);
+        return authority;
+      } catch (error) {
+        if (!(error instanceof RepositoryLeasedError) || signal?.aborted || Date.now() >= deadline) {
+          this.store.clearRepositoryWait(task.task_id);
+          throw error;
+        }
+        this.store.setRepositoryWait(task.task_id, {
+          repoId: error.repoId,
+          holderMissionId: error.holderMissionId,
+          holderOwnerId: error.holderOwnerId,
+        });
+        await new Promise<void>((resolve) => setTimeout(resolve, backoffMs));
+        backoffMs = Math.min(backoffMs * 2, 2_000);
+      }
+    }
+  }
+
   private async acquireTaskAuthority(task: OrchestrationTask): Promise<DispatchAuthority> {
     const currentResumptionGeneration = this.store.listMissionResumptions(task.mission_id).at(-1)?.generation ?? 0;
     const lineageDecisions = this.store
@@ -3504,7 +3534,11 @@ export class Orchestrator {
     if (task.mutates_repo && !task.repo_id) {
       throw new Error(`mutating task ${task.task_id} has no repository identity`);
     }
-    const held = await this.ownership.maintain(identity, task.mutates_repo ? task.repo_id : undefined);
+    // Workers run in their own worktrees under lane coordination only. The
+    // exclusive repository lease guards integration into the candidate and
+    // promotion into the shared checkout, so only the integration task takes it.
+    const takesRepositoryLease = task.mutates_repo && task.kind === "integration";
+    const held = await this.ownership.maintain(identity, takesRepositoryLease ? task.repo_id : undefined);
     return {
       get missionIdentity() {
         return held.missionIdentity;

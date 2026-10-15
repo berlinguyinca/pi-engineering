@@ -1250,8 +1250,18 @@ export class MissionObservability {
     const lease = this.store.getMissionLease(missionId);
     const manifest = this.store.getWorkspaceManifest(missionId);
     const classification = this.store.listFailureClassifications(missionId).at(-1);
+    const repositoryWait = this.store
+      .listTasks(missionId)
+      .map((candidate) => this.store.getRepositoryWait(candidate.task_id))
+      .find((wait) => wait !== undefined);
     const nextAction =
-      stop?.resumeCondition ?? recovery?.expectedMaterialChange ?? task?.objective ?? "No further action is scheduled";
+      stop?.resumeCondition ??
+      recovery?.expectedMaterialChange ??
+      (repositoryWait
+        ? `Waiting for repository ${repositoryWait.repoId} (held by mission ${repositoryWait.holderMissionId})`
+        : undefined) ??
+      task?.objective ??
+      "No further action is scheduled";
     return {
       action:
         recovery?.action ??

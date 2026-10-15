@@ -193,7 +193,7 @@ export interface SchedulerOptions {
   /** Injectable RNG (default Math.random) for probe jitter. */
   rand?: () => number;
   /** Acquires renewable mission/repository fencing immediately before each dispatch. */
-  acquireAuthority?: (task: OrchestrationTask) => Promise<DispatchAuthority>;
+  acquireAuthority?: (task: OrchestrationTask, signal?: AbortSignal) => Promise<DispatchAuthority>;
   /** Mission-wide durable retry/repair ceiling. */
   recovery?: RecoveryPlannerOptions;
   /**
@@ -744,7 +744,7 @@ export class MissionScheduler {
 
       let authority: DispatchAuthority | undefined;
       try {
-        authority = await this.acquireAuthority?.(this.store.getTask(task.task_id) ?? task);
+        authority = await this.acquireAuthority?.(this.store.getTask(task.task_id) ?? task, signal);
         if (authority) this.store.assignTaskAuthority(task.task_id, authority.missionIdentity);
       } catch (error) {
         this.store.transitionTask(task.task_id, "BLOCKED", "system", {
