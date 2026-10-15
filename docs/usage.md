@@ -541,6 +541,27 @@ one and says so in its warnings. An integration run whose checks ran and failed
 is classified `VALIDATION_FAILED` (a code repair); `MERGE_CONFLICT` is reserved
 for an actual merge conflict.
 
+### Verification result reuse
+
+The full suite runs once per candidate commit. Integration stores its passing
+result under `<git-common-dir>/pi-engineering-verify/`, keyed by the candidate
+SHA, the verification profile hash and (when a failure baseline applies) the
+base SHA; validation of the unchanged candidate reuses it instead of running the
+suite again. The validation evidence then carries `testSummary.reused: true` and
+`originalRunId`, a `verify.cache` activity notice is emitted, and the evidence
+stays bound to the exact candidate. An entry is never reused when the candidate
+SHA, base SHA, diff hash (an unset base is the explicit `no-base`), stage list
+or profile differ, when the environment fingerprint differs (node/npm/cargo/python
+versions resolved on PATH, `CI`, `NODE_ENV`, lockfile hashes, and the mtime of
+`node_modules`/`target`), or when the checkout has any tracked modification or
+untracked non-ignored file; failed results are never cached. Residual limit:
+ignored files outside those dependency directories are not seen. Entries older
+than 7 days or beyond 200 are pruned on write, with stale `.tmp`/`.lock` files.
+Concurrent processes asking for the same key compute it once (cross-process
+lock). When validation is a reuse, the review runs alongside it instead of
+waiting, starting only once validation has confirmed the reuse; if the entry
+vanished and validation really runs, the review waits for it. A finer per-test result cache is tracked separately (#149).
+
 ## Verifiable roadmap completion
 
 `node scripts/pi-engineering.ts roadmap check` (or `npm run roadmap:check`)

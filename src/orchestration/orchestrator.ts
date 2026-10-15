@@ -2951,7 +2951,11 @@ export class Orchestrator {
   }
 
   /** Create and run one fresh independent review task over the integrated result. */
-  private async runReviewGate(mission: Mission, signal?: AbortSignal): Promise<boolean> {
+  private async runReviewGate(
+    mission: Mission,
+    signal?: AbortSignal,
+    opts: { concurrentWithValidation?: boolean } = {},
+  ): Promise<boolean> {
     this.store.transitionMission(mission.mission_id, "REVIEWING");
     const gates = new Set<RequiredGate>(mission.required_gates);
     const role = gates.has("security_review") ? "security-review" : "reviewer";
@@ -2974,7 +2978,7 @@ export class Orchestrator {
       objective: `Fresh independent review of the integrated change. Mission: ${mission.goal}${recoveryNote}`,
       mutates_repo: false,
       isolation: "none",
-      depends_on: this.lastValidationTaskId(mission.mission_id),
+      depends_on: opts.concurrentWithValidation ? [] : this.lastValidationTaskId(mission.mission_id),
       repo_id: this.repoIdForMission(mission.mission_id),
       ...this.boundedTaskFields(mission.mission_id, ["independent-review"], []),
     });
@@ -3135,7 +3139,36 @@ export class Orchestrator {
       });
     }
 
-    if (gates.has("validation") || anyMutation) {
+    const needsValidation = gates.has("validation") || anyMutation;
+    const needsReview =
+      gates.has("independent_review") ||
+      gates.has("security_review") ||
+      gates.has("compatibility_review") ||
+      anyMutation;
+    // A validation that only reuses the integration run's verification result
+    // finishes at once and produces nothing the review needs: run them together.
+    // A validation that really runs the suite keeps the review waiting on it.
+    if (
+      needsValidation &&
+      needsReview &&
+      (await this.broker.validationWillReuse(mission.mission_id, this.repoIdForMission(mission.mission_id)))
+    ) {
+      validationAttempted = true;
+      reviewAttempted = true;
+      // The peek can be stale (the entry may vanish before validation runs): the
+      // review starts beside validation only once validation confirms the reuse,
+      // otherwise it waits for validation like any other review.
+      const reuse = this.broker.watchValidationReuse(mission.mission_id);
+      const validating = this.runValidationGate(mission, signal).finally(() => reuse.settle());
+      const reviewing = reuse.confirmed.then((reused) =>
+        this.runReviewGate(mission, signal, { concurrentWithValidation: reused }),
+      );
+      [validationOk, reviewOk] = await Promise.all([validating, reviewing]);
+      if (!signal?.aborted) this.store.transitionMission(mission.mission_id, "FINAL_VALIDATION");
+      return { validationAttempted, validationOk, reviewAttempted, reviewOk, integrationOk };
+    }
+
+    if (needsValidation) {
       validationAttempted = true;
       validationOk = await this.runValidationGate(mission, signal);
       if (signal?.aborted) {
@@ -3158,12 +3191,7 @@ export class Orchestrator {
       }
     }
 
-    if (
-      gates.has("independent_review") ||
-      gates.has("security_review") ||
-      gates.has("compatibility_review") ||
-      anyMutation
-    ) {
+    if (needsReview) {
       reviewAttempted = true;
       reviewOk = await this.runReviewGate(mission, signal);
       if (signal?.aborted) {
