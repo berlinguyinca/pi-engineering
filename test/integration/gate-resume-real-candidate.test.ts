@@ -12,6 +12,7 @@ import { GitRepo } from "../../src/git/GitRepo.ts";
 import { buildCandidateEvidenceIdentity } from "../../src/orchestration/evidence.ts";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
 import { Orchestrator } from "../../src/orchestration/orchestrator.ts";
+import { MissionOwnership } from "../../src/orchestration/ownership.ts";
 import { FailureClassifier } from "../../src/orchestration/recovery.ts";
 import { RepositoryRegistry } from "../../src/orchestration/repositoryRegistry.ts";
 import type { FailureCategory } from "../../src/orchestration/types.ts";
@@ -138,79 +139,84 @@ async function harness(options: Options) {
   const registry = new RepositoryRegistry();
   await registry.register(manifest);
   const calls = { validation: 0, review: 0, agent: 0 };
-  const orchestrator = new Orchestrator({
-    store,
-    repositoryRegistry: registry,
-    backends: {
-      agent: {
-        runAgent: async () => {
-          calls.agent++;
-          return { executionId: "agent", exitStatus: "succeeded", summary: "x", artifactRefs: [], usage: {} };
+  /** A fresh orchestrator over the same store: the in-memory ownership maps start empty, as in a new process. */
+  const buildOrchestrator = (ownerId?: string) =>
+    new Orchestrator({
+      store,
+      repositoryRegistry: registry,
+      ownership: ownerId ? new MissionOwnership(store, { ownerId }) : undefined,
+      backends: {
+        agent: {
+          runAgent: async () => {
+            calls.agent++;
+            return { executionId: "agent", exitStatus: "succeeded", summary: "x", artifactRefs: [], usage: {} };
+          },
         },
-      },
-      integration: {
-        runIntegration: async () => ({
-          executionId: "integration",
-          exitStatus: "succeeded",
-          summary: "integrated",
-          artifactRefs: [],
-          usage: {},
-        }),
-      },
-      validation: {
-        runValidation: async () => {
-          calls.validation++;
-          return {
-            executionId: "validation",
+        integration: {
+          runIntegration: async () => ({
+            executionId: "integration",
             exitStatus: "succeeded",
-            summary: "valid",
+            summary: "integrated",
             artifactRefs: [],
             usage: {},
-            validationEvidence: {
-              command: "test",
-              profile: "test",
-              exitCode: 0,
-              testSummary: { passed: 1 },
-              noTargets: false,
-              accessible: true,
-              acceptanceResults: [],
-            },
-          };
+          }),
         },
-      },
-      review: {
-        runReview: async () => {
-          calls.review++;
-          return {
-            executionId: "review",
-            exitStatus: "succeeded",
-            summary: "approved",
-            artifactRefs: [],
-            usage: {},
-            findings: [],
-            reviewEvidence: {
-              reviewerSessionId: "review-gate-resume",
-              model: "test",
-              provider: "test",
-              verdict: "approve",
-              independenceMode: "independent",
+        validation: {
+          runValidation: async () => {
+            calls.validation++;
+            return {
+              executionId: "validation",
+              exitStatus: "succeeded",
+              summary: "valid",
+              artifactRefs: [],
+              usage: {},
+              validationEvidence: {
+                command: "test",
+                profile: "test",
+                exitCode: 0,
+                testSummary: { passed: 1 },
+                noTargets: false,
+                accessible: true,
+                acceptanceResults: [],
+              },
+            };
+          },
+        },
+        review: {
+          runReview: async () => {
+            calls.review++;
+            return {
+              executionId: "review",
+              exitStatus: "succeeded",
+              summary: "approved",
+              artifactRefs: [],
+              usage: {},
               findings: [],
-              outputValid: true,
-              accessible: true,
-              acceptanceResults: [],
-            },
-          };
+              reviewEvidence: {
+                reviewerSessionId: "review-gate-resume",
+                model: "test",
+                provider: "test",
+                verdict: "approve",
+                independenceMode: "independent",
+                findings: [],
+                outputValid: true,
+                accessible: true,
+                acceptanceResults: [],
+              },
+            };
+          },
         },
       },
-    },
-    planner: async () => [],
-    now: () => Date.parse("2026-09-27T00:00:10.000Z"),
-    sleep: async () => undefined,
-  });
+      planner: async () => [],
+      now: () => Date.parse("2026-09-27T00:00:10.000Z"),
+      sleep: async () => undefined,
+    });
+  const orchestrator = buildOrchestrator();
   return {
     store,
     missionId,
     orchestrator,
+    buildOrchestrator,
     calls,
     candidateSha,
     cleanup: async () => {
@@ -245,6 +251,22 @@ describe("gate resume against a Git-verified candidate (issue #170)", () => {
         integrationsBefore,
         "the candidate was not re-integrated",
       );
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("re-runs the failed gate under the lease a fresh process acquired on resume", async () => {
+    const h = await harness({ category: "PROVIDER_TRANSIENT", failureReason: "failed: Connection error." });
+    try {
+      const freshProcess = h.buildOrchestrator("fresh-process-controller");
+      h.store.resumeMission(h.missionId, "operator resumed from a new session");
+      const resumed = await freshProcess.repairBlockedMission(h.missionId);
+
+      const signals = SIGNALS(h);
+      assert.equal(resumed.status, "COMPLETE", JSON.stringify(signals));
+      assert.equal(h.calls.validation, 1);
+      assert.equal(h.calls.agent, 0);
     } finally {
       await h.cleanup();
     }
