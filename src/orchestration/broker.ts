@@ -374,7 +374,10 @@ export interface ValidationRunner {
     baseSha?: string;
     testRequirement?: string;
     signal: AbortSignal;
+    onActivity?: (event: WorkerActivity) => void;
   }): Promise<ExecutionOutcome>;
+  /** True when `runValidation` on this candidate would reuse a stored verification result. */
+  willReuse?(input: { repoId?: string; worktree?: string | null; baseSha?: string }): Promise<boolean>;
 }
 
 export interface BrokerBackends {
@@ -3712,9 +3715,23 @@ export class ExecutionBroker {
             ...(candidateLifecycle?.baseSha ? { baseSha: candidateLifecycle.baseSha } : {}),
             testRequirement: input.testRequirement,
             signal,
+            onActivity,
           }),
         );
       }
     }
+  }
+
+  /** True when the mission's validation would reuse the integration run's verification result. */
+  async validationWillReuse(missionId: string, repoId: string | undefined): Promise<boolean> {
+    const candidate = this.missionCandidates.get(missionId)?.lifecycle;
+    if (!candidate?.path) return false;
+    return (
+      (await this.backends.validation?.willReuse?.({
+        repoId,
+        worktree: candidate.path,
+        ...(candidate.baseSha ? { baseSha: candidate.baseSha } : {}),
+      })) ?? false
+    );
   }
 }

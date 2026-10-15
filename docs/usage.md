@@ -505,6 +505,22 @@ one and says so in its warnings. An integration run whose checks ran and failed
 is classified `VALIDATION_FAILED` (a code repair); `MERGE_CONFLICT` is reserved
 for an actual merge conflict.
 
+### Verification result reuse
+
+The full suite runs once per candidate commit. Integration stores its passing
+result under `<git-common-dir>/pi-engineering-verify/`, keyed by the candidate
+SHA, the verification profile hash and (when a failure baseline applies) the
+base SHA; validation of the unchanged candidate reuses it instead of running the
+suite again. The validation evidence then carries `testSummary.reused: true` and
+`originalRunId`, a `verify.cache` activity notice is emitted, and the evidence
+stays bound to the exact candidate. An entry is never reused when the candidate
+SHA, stage list, profile, or environment fingerprint (node version, platform,
+commands) differ, or when the checkout has tracked modifications; failed
+results are never cached. Concurrent processes asking for the same key compute
+it once (cross-process lock). When validation is a reuse, the review runs
+alongside it instead of waiting; when validation really runs, review still
+waits. A finer per-test result cache is tracked separately (#149).
+
 ## Verifiable roadmap completion
 
 `node scripts/pi-engineering.ts roadmap check` (or `npm run roadmap:check`)
