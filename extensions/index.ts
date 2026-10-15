@@ -1,11 +1,8 @@
-import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { resolve } from "node:path";
-import { promisify } from "node:util";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 
-const execFileAsync = promisify(execFile);
 import type { Model } from "@earendil-works/pi-ai/compat";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { resolveMemoryEnvironment } from "../src/blackhole/connectionSetup.ts";
@@ -71,10 +68,14 @@ import { PanelRefreshLoop } from "../src/panel/refreshLoop.ts";
 import { registerPlannerWorker } from "../src/plannerWorker/extension.ts";
 import { redactSecrets } from "../src/platform/redact.ts";
 import { resolveRequestBodyBudgetConfig } from "../src/request/bodyBudget.ts";
-import { resolveThinkingOffConfig } from "../src/request/thinkingPolicy.ts";
+import {
+  type ThinkingContext,
+  isSummarizationRequest,
+  resolveThinkingOffConfig,
+} from "../src/request/thinkingPolicy.ts";
 import { RoadmapEngine } from "../src/roadmap/RoadmapEngine.ts";
 import { EngineeringRuntime, type RuntimeMissionActivityEvent } from "../src/runtime/EngineeringRuntime.ts";
-import { unattendedGitEnv } from "../src/runtime/host/sourceWatch.ts";
+import { gitRunner } from "../src/runtime/host/sourceWatch.ts";
 import { sessionBindingInfo } from "../src/runtime/isolation/RuntimeBinding.ts";
 import { RuntimeSession } from "../src/runtime/isolation/RuntimeSession.ts";
 import { effectiveWorkspace, workspaceForPath } from "../src/runtime/isolation/WorkspaceResolver.ts";
@@ -1011,17 +1012,8 @@ ${RECOVERY_PROMPT}`;
   const extensionRoot = resolve(new URL("..", import.meta.url).pathname);
   let lastUpdateCheckAt: number | undefined;
 
-  const runGit = async (args: string[]) => {
-    const r = await execFileAsync("git", ["-C", extensionRoot, ...args], {
-      timeout: 30_000,
-      env: unattendedGitEnv(),
-    }).catch((err: { code?: number; stdout?: string; stderr?: string; message?: string }) => ({
-      code: typeof err.code === "number" ? err.code : 1,
-      stdout: err.stdout ?? "",
-      stderr: err.stderr ?? err.message ?? "",
-    }));
-    return { code: (r as { code?: number }).code ?? 0, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
-  };
+  // The same unattended, tty-less runner the auto-reload watcher uses.
+  const runGit = gitRunner(extensionRoot);
 
   const runSelfUpdate = async (apply: boolean) => {
     lastUpdateCheckAt = Date.now();
@@ -1417,8 +1409,12 @@ ${RECOVERY_PROMPT}`;
           // left is out of capacity, and workers or parallel sessions on it
           // must not walk straight back into the refusal this turn is leaving.
           // Plain data only, for the same lifecycle reason as `onHold`.
-          abandonForAlternate: (info, actualModel) => {
+          // Only the agent turn: a summary or compaction call never reaches
+          // the settle boundary, so abandoning it would fail the compaction
+          // with nobody to continue it. Those wait the hold out as before.
+          abandonForAlternate: (info, actualModel, context) => {
             if (!(fallbackCoordinator.willSwitchOnAdvice && fallbackCoordinator.hasPending)) return false;
+            if (isSummarizationRequest(context as ThinkingContext)) return false;
             const callModel = actualModel as Model<any>;
             admission.noteWait({ ...info.signal, provider: callModel.provider, model: callModel.id });
             return true;

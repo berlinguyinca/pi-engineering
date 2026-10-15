@@ -120,6 +120,7 @@ export interface InstallDeps<M, O, C = unknown> {
   abandonForAlternate?: (
     info: Parameters<NonNullable<GatewayStreamRetryOptions["abandonForAlternate"]>>[0],
     model: M,
+    context: C,
   ) => boolean;
   /**
    * Called when a stream first produces output. Exposed so a caller keeping its
@@ -311,7 +312,7 @@ export function installGatewayStreamRetry<M, C, O>(
           },
           ...(deps.onHold ? { onHold: (info) => deps.onHold?.(info, model) } : {}),
           ...(deps.abandonForAlternate
-            ? { abandonForAlternate: (info) => deps.abandonForAlternate?.(info, model) === true }
+            ? { abandonForAlternate: (info) => deps.abandonForAlternate?.(info, model, context) === true }
             : {}),
           ...(signal ? { signal } : {}),
           ...(deps.maxEscalatedWaitMs != null ? { maxEscalatedWaitMs: deps.maxEscalatedWaitMs } : {}),

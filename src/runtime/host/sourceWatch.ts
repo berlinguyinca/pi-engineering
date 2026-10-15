@@ -7,16 +7,18 @@
  * rev-parse HEAD` answers exactly, and a half-edited working tree must NOT
  * trigger a reload — it would load code nobody has finished writing. An
  * uncommitted edit therefore changes nothing here; commit it (or merge it)
- * and the next poll picks it up.
+ * and the next poll picks it up. And because a handover snapshots the
+ * working tree, not the commit, a HEAD move while tracked files are edited
+ * is NOT acted on either (`trackedChanges`): the owner waits until the tree
+ * is clean, so a half-edited file never rides along under a merge's SHA.
  *
  * The watcher is a timer and nothing else (spec §4 leak list): `dispose()`
- * clears it, the timer is unref'd so it never keeps the process alive, and a
- * poll that is still running when the watcher is disposed finishes quietly.
- * What to DO on a change is the owner's (`onChange`): the watcher only knows
- * fingerprints.
+ * clears it and resolves once a poll in flight has finished, the timer is
+ * unref'd so it never keeps the process alive. What to DO on a change is the
+ * owner's (`onChange`): the watcher only knows fingerprints.
  */
 
-import { execFile } from "node:child_process";
+import { execFile, execFileSync, spawn } from "node:child_process";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { type GitRunner, type SelfUpdateResult, checkForUpdate } from "../../update/selfUpdate.ts";
@@ -70,10 +72,17 @@ export class SourceWatcher {
     this.schedule();
   }
 
-  dispose(): void {
+  /**
+   * Stop polling. Resolves once a poll in flight (and the git child it may
+   * be running) has finished, so an owner tearing down the checkout — a test
+   * deleting it, a session closing — does not race a fetch still writing
+   * into `.git`.
+   */
+  dispose(): Promise<void> {
     this.disposed = true;
     if (this.timer) clearTimeout(this.timer);
     this.timer = undefined;
+    return this.polling ?? Promise.resolve();
   }
 
   private schedule(): void {
@@ -116,17 +125,52 @@ export class SourceWatcher {
  * The environment for git run from a timer, where nobody can answer a
  * prompt. `git_terminal_prompt` opens /dev/tty directly, whatever stdio is,
  * so it is switched off; askpass is pointed at `true` (empty answer, fast
- * failure); ssh runs in batch mode so a passphrase or an unknown host key
- * fails at once. The operator's own GIT_SSH_COMMAND, when set, is kept.
+ * failure); optional locks are off so a background `status` never takes
+ * `.git/index.lock` from under the operator's own `git add`.
+ *
+ * ssh runs in batch mode (a passphrase or an unknown host key fails at once)
+ * ONLY when nothing of the operator's would be displaced by it:
+ * `GIT_SSH_COMMAND` wins over both `GIT_SSH` and `core.sshCommand` in git, so
+ * when either is set (`sshConfigured` covers the config key, which this
+ * function cannot read on its own) the operator's command is kept as is and
+ * the runner's detached, tty-less child is what stops a prompt from hanging.
  */
-export function unattendedGitEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+export function unattendedGitEnv(base: NodeJS.ProcessEnv = process.env, sshConfigured = false): NodeJS.ProcessEnv {
+  const sshOverride = !base.GIT_SSH_COMMAND && !base.GIT_SSH && !sshConfigured;
   return {
     ...base,
     GIT_TERMINAL_PROMPT: "0",
     GIT_ASKPASS: "true",
     SSH_ASKPASS: "",
-    ...(base.GIT_SSH_COMMAND ? {} : { GIT_SSH_COMMAND: "ssh -oBatchMode=yes" }),
+    GIT_OPTIONAL_LOCKS: "0",
+    ...(sshOverride ? { GIT_SSH_COMMAND: "ssh -oBatchMode=yes" } : {}),
   };
+}
+
+const sshConfiguredByRoot = new Map<string, boolean>();
+
+/**
+ * Has the operator configured `core.sshCommand` for `root` (or globally)?
+ * Read once per checkout: it is configuration, not state that moves.
+ */
+export function sshCommandConfigured(root: string): boolean {
+  const known = sshConfiguredByRoot.get(root);
+  if (known !== undefined) return known;
+  let configured = false;
+  try {
+    const out = execFileSync("git", ["-C", root, "config", "--get", "core.sshCommand"], {
+      timeout: 5_000,
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "ignore"],
+      env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+    });
+    configured = out.toString().trim().length > 0;
+  } catch {
+    // Exit 1 means "not set"; anything else is treated the same way.
+    configured = false;
+  }
+  sshConfiguredByRoot.set(root, configured);
+  return configured;
 }
 
 /**
@@ -171,29 +215,56 @@ function resolveGitDir(root: string): string | null {
   }
 }
 
-/** A GitRunner (src/update/selfUpdate.ts) over `root`, for the follow-remote step. */
+/**
+ * A GitRunner (src/update/selfUpdate.ts) over `root`, for the follow-remote
+ * step and the legacy session-start update. The child runs in its own
+ * session (`detached`), so it has no controlling terminal: neither git nor
+ * ssh can open /dev/tty to ask anything, whatever the operator's ssh
+ * configuration is. stdin is closed for the same reason.
+ */
 export function gitRunner(root: string, timeoutMs = 30_000): GitRunner {
   return (args) =>
     new Promise((resolve) => {
-      execFile(
-        "git",
-        ["-C", root, ...args],
-        {
+      let child: ReturnType<typeof spawn>;
+      try {
+        child = spawn("git", ["-C", root, ...args], {
           timeout: timeoutMs,
           windowsHide: true,
-          maxBuffer: 4 * 1024 * 1024,
-          env: unattendedGitEnv(),
-        },
-        (error, stdout, stderr) => {
-          const code = error ? ((error as { code?: unknown }).code as number | undefined) : 0;
-          resolve({
-            code: typeof code === "number" ? code : error ? 1 : 0,
-            stdout: stdout?.toString() ?? "",
-            stderr: stderr?.toString() ?? error?.message ?? "",
-          });
-        },
-      );
+          detached: true,
+          stdio: ["ignore", "pipe", "pipe"],
+          env: unattendedGitEnv(process.env, sshCommandConfigured(root)),
+        });
+      } catch (error) {
+        return resolve({ code: 1, stdout: "", stderr: error instanceof Error ? error.message : String(error) });
+      }
+      const out: Buffer[] = [];
+      const err: Buffer[] = [];
+      child.stdout?.on("data", (chunk: Buffer) => out.push(chunk));
+      child.stderr?.on("data", (chunk: Buffer) => err.push(chunk));
+      let settled = false;
+      const finish = (code: number, extra?: string) => {
+        if (settled) return;
+        settled = true;
+        const stderr = Buffer.concat(err).toString();
+        resolve({ code, stdout: Buffer.concat(out).toString(), stderr: stderr || extra || "" });
+      };
+      child.on("error", (error) => finish(1, error.message));
+      child.on("close", (code, signal) => finish(code ?? (signal ? 1 : 0), signal ? `git killed by ${signal}` : ""));
     });
+}
+
+/**
+ * Tracked files with uncommitted changes in `root` (staged or not), or null
+ * when git cannot answer. Untracked files are not listed: they are not part
+ * of what a merge would have touched, and a snapshot of them is harmless.
+ */
+export async function trackedChanges(root: string, timeoutMs = 10_000): Promise<string[] | null> {
+  const r = await gitRunner(root, timeoutMs)(["status", "--porcelain", "--untracked-files=no"]);
+  if (r.code !== 0) return null;
+  return r.stdout
+    .split("\n")
+    .filter((line) => line.length > 3)
+    .map((line) => line.slice(3).trim());
 }
 
 /**

@@ -13,6 +13,7 @@ import {
   SourceWatcher,
   gitHead,
   gitOperationInProgress,
+  trackedChanges,
   unattendedGitEnv,
 } from "../../src/runtime/host/sourceWatch.ts";
 
@@ -168,10 +169,69 @@ test("gitOperationInProgress: a rebase marker or a detached HEAD suspends pollin
   }
 });
 
-test("unattendedGitEnv: no terminal, askpass or ssh prompt can block a timer; a custom ssh command is kept", () => {
+test("unattendedGitEnv: no terminal, askpass, ssh prompt or optional lock; the operator's ssh setup is never displaced", () => {
   const env = unattendedGitEnv({ PATH: "/bin" });
   assert.equal(env.GIT_TERMINAL_PROMPT, "0");
   assert.equal(env.GIT_ASKPASS, "true");
+  assert.equal(env.GIT_OPTIONAL_LOCKS, "0");
   assert.equal(env.GIT_SSH_COMMAND, "ssh -oBatchMode=yes");
+  // GIT_SSH_COMMAND outranks GIT_SSH and core.sshCommand in git, so it is set
+  // only when none of them is: a work identity configured any of those ways
+  // must keep working for the background fetch.
   assert.equal(unattendedGitEnv({ GIT_SSH_COMMAND: "ssh -i key" }).GIT_SSH_COMMAND, "ssh -i key");
+  assert.equal(unattendedGitEnv({ GIT_SSH: "/usr/local/bin/myssh" }).GIT_SSH_COMMAND, undefined);
+  assert.equal(unattendedGitEnv({ PATH: "/bin" }, true).GIT_SSH_COMMAND, undefined);
+});
+
+test("trackedChanges: edited tracked files, staged or not; untracked files and a clean tree are nothing", async () => {
+  const root = mkdtempSync(join(tmpdir(), "rt-dirty-"));
+  try {
+    const git = (...args: string[]) =>
+      execFileSync("git", ["-C", root, "-c", "user.name=t", "-c", "user.email=t", ...args], { stdio: "pipe" })
+        .toString()
+        .trim();
+    git("init", "-q", "-b", "main");
+    writeFileSync(join(root, "a.txt"), "1\n");
+    writeFileSync(join(root, "b.txt"), "1\n");
+    git("add", "-A");
+    git("commit", "-qm", "one");
+    assert.deepEqual(await trackedChanges(root), []);
+    writeFileSync(join(root, "scratch.txt"), "x\n");
+    assert.deepEqual(await trackedChanges(root), [], "an untracked file is not a half-edit of the code");
+    writeFileSync(join(root, "a.txt"), "2\n");
+    assert.deepEqual(await trackedChanges(root), ["a.txt"]);
+    git("add", "a.txt");
+    writeFileSync(join(root, "b.txt"), "2\n");
+    assert.deepEqual((await trackedChanges(root))?.sort(), ["a.txt", "b.txt"], "staged and unstaged alike");
+    git("commit", "-qam", "two");
+    assert.deepEqual(await trackedChanges(root), []);
+    assert.equal(await trackedChanges(join(root, "nope")), null, "not a checkout: null, never a guess");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("dispose() resolves only once a poll in flight has finished", async () => {
+  let release: () => void = () => {};
+  const w = new SourceWatcher({
+    intervalMs: 1_000_000,
+    baseline: "a",
+    fingerprint: () =>
+      new Promise<string>((r) => {
+        release = () => r("a");
+      }),
+    onChange: () => true,
+  });
+  const poll = w.poll();
+  let disposed = false;
+  const disposal = w.dispose().then(() => {
+    disposed = true;
+  });
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(disposed, false, "the git child is still running");
+  release();
+  await poll;
+  await disposal;
+  assert.equal(disposed, true);
+  assert.equal(w.active, false);
 });

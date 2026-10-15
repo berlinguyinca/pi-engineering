@@ -9,7 +9,7 @@
 
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, test } from "node:test";
@@ -246,4 +246,27 @@ test("auto reload: closing the session disposes the watcher", async () => {
   await pi.close();
   cleanups.pop();
   assert.equal(ext.sourceWatcher, undefined);
+});
+
+test("auto reload: a commit does not reload while a tracked file is mid-edit; it does once the tree is clean", async () => {
+  const { pi, host, b, source, ext, commit } = await setup();
+  assert.equal(host.activeGeneration()?.generation, 1);
+  // A tracked file the operator is still editing (unrelated to the commit):
+  // the handover would copy it, so the commit must wait.
+  const draft = join(source, "package.json");
+  const pristine = readFileSync(draft, "utf8");
+  writeFileSync(draft, `${pristine}\n`);
+  const sha = commit("B");
+  // `commit` adds everything, so put the half-edit back on top of the commit.
+  writeFileSync(draft, `${pristine}\n\n`);
+  assert.deepEqual(git(source, "status", "--porcelain", "-uno").split("\n").filter(Boolean).length, 1);
+  await new Promise((r) => setTimeout(r, 150));
+  assert.equal(host.activeGeneration()?.generation, 1, "no handover over a half-edited tracked file");
+  assert.notEqual(ext.sourceWatcher?.current, sha, "the baseline waits with it");
+
+  git(source, "checkout", "--", "package.json");
+  await until(() => host.activeGeneration()?.generation === 2, "handover once the tree is clean");
+  assert.equal(host.activeGeneration()?.source.commit, git(source, "rev-parse", "HEAD"));
+  await pi.emit({ type: "agent_settled" });
+  assert.equal(b.values.at(-1), "B");
 });

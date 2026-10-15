@@ -274,7 +274,11 @@ When Pi loads pi-engineering from a git checkout, a commit landing on that
 checkout hot-reloads every running session by itself within about 15 seconds:
 the Host hands over to a new generation at the next safe point and the same
 conversation continues. Nothing has to be restarted. Uncommitted edits are
-never loaded. `/pie update` does the same immediately (and, when the checkout
+never loaded: while a tracked file has uncommitted changes, a new commit is
+not reloaded either (the handover would copy the half-edit); you are told
+once, and the reload happens as soon as the tree is clean, or at once with
+`/pie reload`. Summary and compaction calls, which have no turn to continue,
+wait out a gateway hold instead of switching models. `/pie update` does the same immediately (and, when the checkout
 has not moved, checks the update remote as before). `PI_ENGINEERING_AUTO_RELOAD=0`
 turns the automatic reload off.
 

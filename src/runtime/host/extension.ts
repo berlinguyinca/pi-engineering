@@ -39,6 +39,7 @@ import {
   SourceWatcher,
   followRemote,
   gitHead,
+  trackedChanges,
 } from "./sourceWatch.ts";
 import { type RuntimeEventFields, RuntimeTelemetry } from "./telemetry.ts";
 
@@ -297,7 +298,7 @@ export class EngineeringHostExtension {
   async abandon(): Promise<boolean> {
     try {
       if (this.checkTimer) clearTimeout(this.checkTimer);
-      this.stopSourceWatch();
+      await this.stopSourceWatch();
       this.unpublish();
       await this.host?.shutdown({ type: "session_shutdown", reason: "quit" }, undefined);
       return !this.host?.activeGeneration();
@@ -358,7 +359,7 @@ export class EngineeringHostExtension {
   async dispose(): Promise<void> {
     if (this.checkTimer) clearTimeout(this.checkTimer);
     this.checkTimer = undefined;
-    this.stopSourceWatch();
+    await this.stopSourceWatch();
     this.unpublish();
     // A check in flight writes the preferences file; let it land before the
     // session (and possibly the process) goes away.
@@ -422,6 +423,9 @@ export class EngineeringHostExtension {
     // from its upstream it is never touched.
     const followEvery = this.config.followRemoteIntervalMs ?? DEFAULT_FOLLOW_REMOTE_INTERVAL_MS;
     let lastFollowAt = Number.NEGATIVE_INFINITY;
+    // The commit a dirty-tree warning was given for, so it is said once per
+    // commit rather than every poll until the tree is clean.
+    let dirtyWarnedFor: string | undefined;
     const fingerprint = async (): Promise<string | null> => {
       // Not while a handover runs: its snapshot must not see the tree move.
       if (this.config.followRemote === true && !host.pendingTask() && Date.now() - lastFollowAt >= followEvery) {
@@ -446,6 +450,26 @@ export class EngineeringHostExtension {
         // leave the baseline and look again (never, once disposed).
         if (host.pendingTask() || !this.sourceWatcher?.active) return false;
         const latest = (host.latestContext() as Ctx | undefined) ?? ctx;
+        // A handover snapshots the working tree, so a tracked file mid-edit
+        // would run under the new commit's name. Wait for a clean tree (or
+        // an explicit /pie reload, which is the operator's call), telling
+        // them once per commit; the baseline stays put so the commit is
+        // picked up the poll after the tree is clean.
+        const dirty = await trackedChanges(root);
+        if (dirty === null || !this.sourceWatcher?.active) return false;
+        if (dirty.length > 0) {
+          if (dirtyWarnedFor !== next) {
+            dirtyWarnedFor = next;
+            const listed = dirty.slice(0, 3).join(", ") + (dirty.length > 3 ? `, +${dirty.length - 3}` : "");
+            notify(
+              latest,
+              `Pi Engineering source moved to ${short(next)} but ${listed} ${dirty.length === 1 ? "has" : "have"} uncommitted changes — not hot-reloading until the tree is clean (or /pie reload).`,
+              "warning",
+            );
+          }
+          return false;
+        }
+        dirtyWarnedFor = undefined;
         // Quiet: a mutation lock held by another process (an update or
         // retention elsewhere) is not worth a warning every poll. The
         // baseline then stays put and the commit is picked up next time.
@@ -464,9 +488,11 @@ export class EngineeringHostExtension {
     this.sourceWatcher.start();
   }
 
-  private stopSourceWatch(): void {
-    this.sourceWatcher?.dispose();
+  /** Resolves once a poll in flight (and its git child) has finished. */
+  private stopSourceWatch(): Promise<void> {
+    const watcher = this.sourceWatcher;
     this.sourceWatcher = undefined;
+    return watcher?.dispose() ?? Promise.resolve();
   }
 
   async automaticCheck(ctx?: Ctx): Promise<UpdateCheckResult | undefined> {
