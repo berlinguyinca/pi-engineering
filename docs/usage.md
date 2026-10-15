@@ -211,6 +211,17 @@ waiting in `WAITING_FOR_LLM` and relaunches only on an authoritative healthy
 probe; it is never `BLOCKED` for this. Executions that ran tools count as
 attempts as before.
 
+### Reviewer retries on a dead provider
+
+Gate roles (reviewers and challengers) judge work and have no side effects, so
+they do not wait out a dead route in-session. Next to the worker-wide
+`PI_GUARD_TRANSIENT_*` variables, `PI_GUARD_GATE_TRANSIENT_MAX_ATTEMPTS`
+(default 2) caps the transient retries a gate role spends on one model; after
+that the review moves to the next eligible model, and a provider whose connection
+was refused is skipped for five minutes. An operator-pinned reviewer is exempt
+from the cap and keeps waiting, unless its host refuses connections or does not
+resolve; then it moves to another model with a notice.
+
 ### Interrupting and cancelling a mission
 
 Pressing Esc while the `mission` tool or `/mission` runs **pauses** the mission

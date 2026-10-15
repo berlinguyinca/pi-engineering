@@ -171,7 +171,13 @@ function ranOn(run: WorkerRun): ModelRef | undefined {
 
 /** Attach the model an attempt ran on to its outcome. */
 function withModel(outcome: ExecutionOutcome, model: ModelRef | undefined): ExecutionOutcome {
-  return model ? { ...outcome, model: { provider: model.provider, id: model.id } } : outcome;
+  if (!model) return outcome;
+  const unnamed = !outcome.usage?.model || outcome.usage.model === "unknown";
+  return {
+    ...outcome,
+    model: { provider: model.provider, id: model.id },
+    ...(unnamed ? { usage: { ...outcome.usage, model: modelKey(model) } } : {}),
+  };
 }
 
 const reducedIndependence = (model: ModelRef, why: string): string =>
@@ -495,7 +501,15 @@ export function realBackends(opts: RealBackendsOptions) {
       if (!model && !(plan.failoverOnProviderError === true && PROVIDER_FAULT_MARKERS.has(error))) break;
       const gone = MODEL_GONE_MARKERS.has(error);
       const noToolCalls = plan.failoverWhenNoToolCalls === true && run.toolCalls === 0;
-      const pinnedWait = noToolCalls && req.operatorPinned === true;
+      // An operator-pinned reviewer is waited on, not abandoned, unless its host
+      // is confirmed dead (connection refused / unresolvable, zero output).
+      const pinnedGateFault =
+        plan.failoverOnProviderError === true &&
+        req.operatorPinned === true &&
+        PROVIDER_FAULT_MARKERS.has(error) &&
+        !PROVIDER_REQUEST_REFUSAL.test(run.result.summary) &&
+        run.result.details?.connect_refused !== true;
+      const pinnedWait = (noToolCalls && req.operatorPinned === true) || pinnedGateFault;
       const capacity = !gone && !pinnedWait && MODEL_CAPACITY_MARKERS.has(error);
       const providerFault =
         !gone &&
@@ -506,8 +520,9 @@ export function realBackends(opts: RealBackendsOptions) {
           (noToolCalls && PROVIDER_FAULT_MARKERS.has(error)));
       if (!gone && !capacity && !providerFault) break;
       const failed: ModelRef = model ?? UNNAMED_MODEL;
-      if (providerFault && model && error === "transient:network" && run.toolCalls === 0) {
-        plan.onProviderUnreachable?.(model);
+      if (providerFault && error === "transient:network" && run.toolCalls === 0 && run.result.details?.connect_level) {
+        const attempted = model ?? opts.reviewFallbackModel;
+        if (attempted) plan.onProviderUnreachable?.(attempted);
       }
       const reason = run.result.summary;
       // A gone model is gateway-confirmed and leaves routing for a TTL; a
@@ -736,7 +751,13 @@ export function realBackends(opts: RealBackendsOptions) {
         const fallback = opts.reviewFallbackModel;
         const independentOfProducers = (model: ModelRef): boolean =>
           modelFamily(model.id) !== undefined && !producers.some((m) => sameFamily(m, model));
-        const cooling = (provider: string): boolean => (unreachableProviders.get(provider) ?? 0) > Date.now();
+        const cooling = (provider: string): boolean => {
+          const until = unreachableProviders.get(provider);
+          if (until === undefined) return false;
+          if (until > Date.now()) return true;
+          unreachableProviders.delete(provider);
+          return false;
+        };
         const pickReviewer = async (tried: ModelRef[]): Promise<ModelRoute | undefined> => {
           // Prefer a model of a different family on a reachable provider; remember
           // the first sibling of a producer's family (or unknown family), and the
@@ -816,6 +837,7 @@ export function realBackends(opts: RealBackendsOptions) {
             ),
         });
         const run = takeover.run;
+        if (takeover.model && run.result.status === "completed") unreachableProviders.delete(takeover.model.provider);
         // Independence is judged on the model that actually reviewed.
         const modelRoute = takeover.route;
         const independent = !!modelRoute && !reviewWarning(modelRoute);

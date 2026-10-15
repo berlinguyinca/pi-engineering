@@ -38,11 +38,15 @@ function listen(handler: (req: IncomingMessage, res: ServerResponse) => void): P
 const port = (server: Server): number => (server.address() as AddressInfo).port;
 
 /** A server that accepts the connection and drops it: a dead upstream that counts its visitors. */
-function resetting(): Promise<{ server: Server; hits: () => number }> {
+function resetting(answerAt = Number.POSITIVE_INFINITY): Promise<{ server: Server; hits: () => number }> {
   let hits = 0;
-  const server = createServer();
+  const server = createServer((req, res) => {
+    req.resume();
+    req.on("end", () => reviewReply(res));
+  });
   server.on("connection", (socket) => {
     hits++;
+    if (hits >= answerAt) return;
     socket.on("error", () => {});
     socket.destroy();
   });
@@ -88,6 +92,7 @@ const dead: ModelRef = { provider: "beast", id: "qwen3.8-27b-q4-lane2" };
 const live: ModelRef = { provider: "hive", id: "glm-5.3-flash" };
 
 function setup(baseUrls: Record<string, string>, pool: ModelRef[], routeModel: RouteModel) {
+  const notices: string[] = [];
   const dir = mkdtempSync(join(tmpdir(), "pi-review-dead-"));
   const providers: Record<string, unknown> = {};
   for (const [name, baseUrl] of Object.entries(baseUrls)) {
@@ -120,8 +125,13 @@ function setup(baseUrls: Record<string, string>, pool: ModelRef[], routeModel: R
     routeModel,
   });
   const review = () =>
-    backends.review.runReview({ objective: "review", missionId: "MSN-1", signal: new AbortController().signal });
-  return { dir, review };
+    backends.review.runReview({
+      objective: "review",
+      missionId: "MSN-1",
+      signal: new AbortController().signal,
+      onActivity: (event) => notices.push(event.summary ?? ""),
+    });
+  return { dir, review, notices };
 }
 
 const poolRoute =
@@ -237,6 +247,67 @@ test("a provider that refused connections is skipped by the next review while it
     assert.equal(second.exitStatus, "succeeded", second.summary);
     assert.equal(flaky.hits(), after, "the cooling provider is not dialled again");
   } finally {
+    await close(flaky.server, good);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+const pinned =
+  (model: ModelRef): RouteModel =>
+  async (_role, query) =>
+    (query?.exclude ?? []).some((skip) => modelKey(skip) === modelKey(model)) ? live : { ...model, operatorPin: true };
+
+test("an operator-pinned reviewer keeps waiting on a slow route and succeeds on the pinned model", async () => {
+  const slow = await resetting(5);
+  const { dir, review } = setup({ beast: `http://127.0.0.1:${port(slow.server)}/v1` }, [dead], pinned(dead));
+  try {
+    const outcome = await review();
+    assert.equal(outcome.exitStatus, "succeeded", outcome.summary);
+    assert.equal(outcome.reviewEvidence?.model, dead.id);
+    assert.equal(slow.hits(), 5);
+  } finally {
+    await close(slow.server);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("an operator-pinned reviewer on a closed port fails over with a notice", async () => {
+  const deadPort = await closedPort();
+  const good = await listen((_req, res) => reviewReply(res));
+  const { dir, review, notices } = setup(
+    { beast: `http://127.0.0.1:${deadPort}/v1`, hive: `http://127.0.0.1:${port(good)}/v1` },
+    [dead, live],
+    pinned(dead),
+  );
+  try {
+    const outcome = await review();
+    assert.equal(outcome.exitStatus, "succeeded", outcome.summary);
+    assert.equal(outcome.reviewEvidence?.model, live.id);
+    assert.ok(
+      notices.some((n) => /switched reviewer to hive\/glm/.test(n)),
+      notices.join(" | "),
+    );
+  } finally {
+    await close(good);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("the gate retry cap is configurable through PI_GUARD_GATE_TRANSIENT_MAX_ATTEMPTS", async () => {
+  const flaky = await resetting();
+  const good = await listen((_req, res) => reviewReply(res));
+  process.env.PI_GUARD_GATE_TRANSIENT_MAX_ATTEMPTS = "0";
+  const { dir, review } = setup(
+    { beast: `http://127.0.0.1:${port(flaky.server)}/v1`, hive: `http://127.0.0.1:${port(good)}/v1` },
+    [dead, live],
+    poolRoute([dead, live]),
+  );
+  try {
+    const outcome = await review();
+    assert.equal(outcome.exitStatus, "succeeded", outcome.summary);
+    assert.equal(flaky.hits(), 1, "a cap of zero retries dials the dead route once");
+  } finally {
+    Reflect.deleteProperty(process.env, "PI_GUARD_GATE_TRANSIENT_MAX_ATTEMPTS");
     await close(flaky.server, good);
     rmSync(dir, { recursive: true, force: true });
   }
