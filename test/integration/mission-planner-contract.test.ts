@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { type IncomingMessage, type Server, type ServerResponse, createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -8,7 +8,7 @@ import { after, before, describe, it } from "node:test";
 import { AdmissionController } from "../../src/gateway/AdmissionController.ts";
 import { resolveGatewayConfig } from "../../src/gateway/config.ts";
 import { EngineeringRuntime } from "../../src/index.ts";
-import { scopeTaskDomains } from "../../src/orchestration/missionPlanner.ts";
+import { planMission, scopeTaskDomains } from "../../src/orchestration/missionPlanner.ts";
 import { scopesOverlap } from "../../src/plan/taskDag.ts";
 import { parsePlannerOutput } from "../../src/plannerWorker/contract.ts";
 import { PLANNER_PROMPT } from "../../src/plannerWorker/prompts.ts";
@@ -49,7 +49,11 @@ const PLAN = JSON.stringify({
 const BIG_GOAL =
   "Add a REST endpoint under src/api for exporting reports, build a settings page under src/ui to trigger the export, and document both features in docs/usage.md with examples and migration notes for existing users.";
 
-type Reply = { kind: "text"; text: string } | { kind: "http500" } | { kind: "hang" };
+type Reply =
+  | { kind: "text"; text: string }
+  | { kind: "result"; args: Record<string, unknown> }
+  | { kind: "http500" }
+  | { kind: "hang" };
 
 function frame(delta: Record<string, unknown>, finish: string | null = null): string {
   return `data: ${JSON.stringify({ id: "c", object: "chat.completion.chunk", created: 0, model: "m", choices: [{ index: 0, delta, finish_reason: finish }] })}\n\n`;
@@ -93,14 +97,17 @@ describe("mission planner contract", () => {
         return;
       }
       res.writeHead(200, { "content-type": "text/event-stream" });
-      const args = {
-        status: "completed",
-        summary: reply.text,
-        claims: [],
-        evidence_refs: [],
-        new_hypotheses: [],
-        proposed_tasks: [],
-      };
+      const args =
+        reply.kind === "result"
+          ? reply.args
+          : {
+              status: "completed",
+              summary: reply.text,
+              claims: [],
+              evidence_refs: [],
+              new_hypotheses: [],
+              proposed_tasks: [],
+            };
       res.write(
         frame({
           role: "assistant",
@@ -193,6 +200,87 @@ describe("mission planner contract", () => {
     }
   });
 
+  /** The worker_result the planner really produced live (MSN-0wDA7O). */
+  async function liveWorkerResult(): Promise<Record<string, unknown>> {
+    const lines = (await readFile(new URL("../fixtures/planner-transcript-MSN-0wDA7O.jsonl", import.meta.url), "utf8"))
+      .split("\n")
+      .filter(Boolean)
+      .map((l) => JSON.parse(l) as { kind?: string; tool?: string; args?: Record<string, unknown> });
+    const call = lines.find((l) => l.kind === "tool_call" && l.tool === "worker_result");
+    assert.ok(call?.args);
+    return call.args;
+  }
+
+  it("takes the contracts the planner worker puts in worker_result.details", async () => {
+    const args = await liveWorkerResult();
+    const { tasks, store, mission } = await plan(BIG_GOAL, [{ kind: "result", args }]);
+    assert.equal(tasks.length, 1);
+    assert.equal(tasks[0]?.task_id, "a-1");
+    assert.deepEqual(tasks[0]?.write_domains, ["src/calc.js", "test/calc.test.js"]);
+    assert.match(tasks[0]?.objective ?? "", /Acceptance: divide\(a, b\) returns a \/ b/);
+    assert.deepEqual(JSON.parse(tasks[0]?.context_ref ?? "{}").verification, ["npm test"]);
+    assert.equal(store.listFindings(mission.mission_id).filter((f) => f.category === "mission_planner").length, 0);
+  });
+
+  it("also accepts contracts at the top level, in proposed_tasks, or in a fenced summary block", async () => {
+    const live = await liveWorkerResult();
+    const contracts = (live.details as { contracts: unknown[] }).contracts;
+    const variants: Array<Record<string, unknown>> = [
+      // proposed_tasks entries are capped at 1000 chars by the tool: a compact contract fits.
+      {
+        ...live,
+        details: {},
+        proposed_tasks: [
+          JSON.stringify({
+            task_id: "a-1",
+            objective: "Add divide",
+            scope: { allowed: ["src/calc.js", "test/calc.test.js"] },
+            acceptance: ["divide works"],
+            verification: ["npm test"],
+          }),
+        ],
+      },
+      { ...live, details: {}, summary: `Plan:\n\`\`\`json\n${JSON.stringify({ contracts })}\n\`\`\`` },
+    ];
+    for (const args of variants) {
+      const { tasks } = await plan(BIG_GOAL, [{ kind: "result", args }]);
+      assert.equal(tasks.length, 1);
+      assert.deepEqual(tasks[0]?.write_domains, ["src/calc.js", "test/calc.test.js"]);
+    }
+  });
+
+  it("planMission reads top-level contracts on the planner result", async () => {
+    const live = await liveWorkerResult();
+    const contracts = (live.details as { contracts: unknown[] }).contracts;
+    const planned = await planMission({
+      goal: BIG_GOAL,
+      mutates: true,
+      mode: "on",
+      acceptanceIds: [],
+      single: () => {
+        throw new Error("must not fall back");
+      },
+      runPlanner: async () => ({ summary: "plan", details: {}, ...{ contracts } }),
+    });
+    assert.equal(planned.tasks.length, 1);
+    assert.deepEqual(planned.tasks[0]?.write_domains, ["src/calc.js", "test/calc.test.js"]);
+  });
+
+  it("an explicit clarification request yields no tasks and a finding, not a fallback", async () => {
+    const args = {
+      status: "blocked",
+      summary: "Which module should divide live in?",
+      claims: [],
+      evidence_refs: [],
+      new_hypotheses: [],
+      proposed_tasks: [],
+    };
+    const { tasks, store, mission } = await plan(BIG_GOAL, [{ kind: "result", args }]);
+    assert.equal(tasks.length, 0);
+    const finding = store.listFindings(mission.mission_id).find((f) => f.category === "mission_planner");
+    assert.match(finding?.evidence ?? "", /Which module/);
+  });
+
   it("serializes tasks whose write domains overlap", async () => {
     const overlapping = JSON.stringify({
       contracts: [
@@ -227,6 +315,10 @@ describe("mission planner contract", () => {
     assert.ok(finding);
     assert.match(finding.evidence ?? "", /malformed/);
     assert.notEqual(finding.severity, "blocking");
+    // Malformed output is not an ambiguous goal: no recovery, no operator wait.
+    assert.equal(store.listFailureClassifications(mission.mission_id).length, 0);
+    assert.equal(store.listRecoveryDecisions(mission.mission_id).length, 0);
+    assert.notEqual(store.getMission(mission.mission_id)?.status, "WAITING_FOR_USER");
   });
 
   it("a plan whose domains escape the workspace falls back naming the rejected domains", async () => {

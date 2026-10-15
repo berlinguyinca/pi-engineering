@@ -5,7 +5,7 @@
  * the single-task path; a malformed plan never blocks a mission.
  */
 
-import { extractStructured, parsePlannerOutput, scopeConflict } from "../plannerWorker/contract.ts";
+import { DIRECTORY_DENY, extractStructured, parsePlannerOutput, scopeConflict } from "../plannerWorker/contract.ts";
 import { PLANNER_PROMPT } from "../plannerWorker/prompts.ts";
 import type { TaskContract } from "../plannerWorker/types.ts";
 import { type PlanTaskInput, intersectWriteDomains } from "./orchestrator.ts";
@@ -36,6 +36,56 @@ export interface MissionPlanResult {
   tasks: PlanTaskInput[];
   /** Why the single-task fallback was used for a planner that was attempted. */
   fallbackReason?: string;
+  /**
+   * The planner explicitly reported the goal as ambiguous (blocked, with a
+   * question). Only then are `tasks` empty so the operator is asked; a
+   * malformed plan never sets this.
+   */
+  clarification?: string;
+}
+
+/** What the planner worker returned: its worker_result, or plain model text. */
+export type PlannerRunOutput =
+  | string
+  | {
+      status?: string;
+      summary: string;
+      details?: unknown;
+      proposed_tasks?: readonly unknown[];
+    };
+
+/** Every place the planner worker may have put its contract plan, best first. */
+function plannerCandidates(output: PlannerRunOutput): unknown[] {
+  if (typeof output === "string") return [output];
+  const proposed = (output.proposed_tasks ?? []).map((t) => (typeof t === "string" ? extractStructured(t) : t));
+  return [
+    output.details,
+    // Top-level `contracts` on the result itself.
+    { contracts: (output as { contracts?: unknown }).contracts },
+    ...(proposed.length > 0 ? [{ contracts: proposed }] : []),
+    // Fenced / raw JSON in the summary, the pre-contract way.
+    output.summary,
+  ].filter(
+    (c) =>
+      c !== undefined &&
+      c !== null &&
+      c !== "" &&
+      !(typeof c === "object" && "contracts" in c && (c as { contracts?: unknown }).contracts === undefined),
+  );
+}
+
+/** A blocked planner that asks a question explicitly reports the goal as ambiguous. */
+function clarificationOf(output: PlannerRunOutput): string | undefined {
+  if (typeof output === "string") return undefined;
+  const d = output.details;
+  const asked =
+    d && typeof d === "object" && !Array.isArray(d)
+      ? ((d as Record<string, unknown>).clarification_question ?? (d as Record<string, unknown>).question)
+      : undefined;
+  if (typeof asked === "string" && asked.trim()) return asked.trim();
+  const status = output.status?.toLowerCase();
+  if ((status === "blocked" || status === "needs_clarification") && output.summary.trim()) return output.summary.trim();
+  return undefined;
 }
 
 /** The planner call failed in a way worth one retry (gateway/network), not a bad plan. */
@@ -67,7 +117,9 @@ export function scopeTaskDomains(
 ): { kept: string[]; rejected: string[] } {
   const rejected: string[] = [];
   let kept: string[] = [];
-  const forbidden = c.scope.forbidden.map(prefixOf);
+  // Only a literal path or a literal directory glob ("dir/**", "dir/*") bars a
+  // whole subtree; a suffix pattern ("src/**.js") is not a directory root.
+  const forbidden = c.scope.forbidden.filter((g) => DIRECTORY_DENY.test(g)).map(prefixOf);
   const readOnly = (opts.readOnlyPrefixes ?? []).map(prefixOf);
   for (const glob of c.scope.allowed) {
     const prefix = prefixOf(glob);
@@ -94,8 +146,8 @@ export interface MissionPlanInput {
   goal: string;
   mutates: boolean;
   mode: MissionPlannerMode;
-  /** The ONE planner LLM call; returns the model's text. */
-  runPlanner: (task: string) => Promise<string>;
+  /** The ONE planner LLM call; returns the worker result (or the model's text). */
+  runPlanner: (task: string) => Promise<PlannerRunOutput>;
   single: () => PlanTaskInput;
   acceptanceIds: string[];
 }
@@ -152,10 +204,10 @@ export async function planMission(input: MissionPlanInput): Promise<MissionPlanR
   const attempt = input.mode === "on" || (input.mode === "auto" && isNonTrivialGoal(input.goal));
   if (!attempt || !input.mutates) return { tasks: [input.single()] };
   const fallback = (reason: string): MissionPlanResult => ({ tasks: [input.single()], fallbackReason: reason });
-  let text = "";
+  let output: PlannerRunOutput = "";
   for (let attemptNo = 0; ; attemptNo++) {
     try {
-      text = await input.runPlanner(plannerTask(input.goal));
+      output = await input.runPlanner(plannerTask(input.goal));
       break;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -165,11 +217,24 @@ export async function planMission(input: MissionPlanInput): Promise<MissionPlanR
       );
     }
   }
-  const parsed =
-    extractStructured(text) === undefined
-      ? ({ ok: false, errors: ["no structured plan in planner output"] } as const)
-      : parsePlannerOutput(text);
-  if (!parsed.ok) return fallback(`malformed plan: ${parsed.errors.slice(0, 3).join("; ")}`);
+  let parsed: Extract<ReturnType<typeof parsePlannerOutput>, { ok: true }> | undefined;
+  const errors: string[] = [];
+  for (const candidate of plannerCandidates(output)) {
+    if (typeof candidate === "string" && extractStructured(candidate) === undefined) continue;
+    const attempt = parsePlannerOutput(candidate);
+    if (attempt.ok) {
+      parsed = attempt;
+      break;
+    }
+    errors.push(...attempt.errors);
+  }
+  if (!parsed) {
+    const asked = clarificationOf(output);
+    if (asked) return { tasks: [], clarification: asked };
+    return fallback(
+      `malformed plan: ${(errors.length > 0 ? errors : ["no structured plan in planner output"]).slice(0, 3).join("; ")}`,
+    );
+  }
   if (parsed.plan.contracts.length === 0) return fallback("planner returned no contracts");
   const domains = new Map<string, string[]>();
   for (const c of parsed.plan.contracts) {

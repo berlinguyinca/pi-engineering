@@ -318,6 +318,7 @@ export class Orchestrator {
   readonly gate: CompletionGate;
   private readonly router: IntentRouter;
   private readonly planner: OrchestratorOptions["planner"];
+  private readonly planning = new Set<string>();
   private readonly deriveAcceptance: OrchestratorOptions["deriveAcceptance"];
   private readonly onPhase: OrchestratorOptions["onPhase"];
   private readonly observability: OrchestratorOptions["observability"];
@@ -627,6 +628,18 @@ export class Orchestrator {
         .find(
           (entry) =>
             entry.blockedEpisodeId === blockedEpisodeId &&
+            (entry.resumptionGeneration ?? 0) === resumptionGeneration &&
+            (entry.status === "planned" || entry.status === "started"),
+        );
+      // The supervisor names a requirement wait before the mission is BLOCKED,
+      // so its decision carries no episode: adopt it rather than plan a second
+      // WAIT_FOR_REQUIREMENT for the same classification and resumption.
+      repairDecision ??= this.store
+        .listRecoveryDecisions(missionId)
+        .find(
+          (entry) =>
+            entry.action === "WAIT_FOR_REQUIREMENT" &&
+            entry.classificationId === classification.classificationId &&
             (entry.resumptionGeneration ?? 0) === resumptionGeneration &&
             (entry.status === "planned" || entry.status === "started"),
         );
@@ -1497,6 +1510,11 @@ export class Orchestrator {
    * next mission without restarting pi. A failing provider is ignored: the
    * process keeps the limits it started with rather than losing all caps.
    */
+  /** True while the planner is producing this mission's tasks. */
+  isPlanning(missionId: string): boolean {
+    return this.planning.has(missionId);
+  }
+
   async refreshMissionLimits(): Promise<void> {
     if (!this.limitsProvider) return;
     try {
@@ -1868,7 +1886,15 @@ export class Orchestrator {
 
       if (!specApprovalMaterialized) {
         // Plan/decompose into tasks.
-        const planned = await this.planner(this.store.getMission(mission.mission_id)!, risk);
+        // The planner may be a long LLM call; the supervisor must not read the
+        // taskless mission as "planning produced nothing" while it runs.
+        this.planning.add(mission.mission_id);
+        let planned: PlanTaskInput[];
+        try {
+          planned = await this.planner(this.store.getMission(mission.mission_id)!, risk);
+        } finally {
+          this.planning.delete(mission.mission_id);
+        }
         const plannedMission = this.store.getMission(mission.mission_id)!;
         const manifest = this.store.getWorkspaceManifest(mission.mission_id);
         const acceptanceIds = plannedMission.acceptance_criteria.flatMap((criterion) =>

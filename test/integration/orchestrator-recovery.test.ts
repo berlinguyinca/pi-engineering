@@ -1214,6 +1214,35 @@ describe("orchestrator: durable blocked-mission repair", () => {
     assert.equal(h.store.listRecoveryDecisions(h.missionId).at(-1)?.action, "WAIT_FOR_REQUIREMENT");
   });
 
+  it("adopts the supervisor's open requirement wait instead of planning a second one", async () => {
+    const h = blockedRepairHarness({ category: "REQUIREMENT_AMBIGUITY" });
+    const classification = h.store.listFailureClassifications(h.missionId).at(-1);
+    assert.ok(classification);
+    // The supervisor names the wait while the mission is not BLOCKED, so the
+    // decision carries no episode id; the mission blocks afterwards.
+    h.store.transitionMission(h.missionId, "WAITING_FOR_USER");
+    h.store.transitionMission(h.missionId, "PLANNING");
+    h.store.planRecovery({
+      recoveryId: "RCV-supervisor-wait",
+      missionId: h.missionId,
+      classificationId: classification.classificationId,
+      action: "WAIT_FOR_REQUIREMENT",
+      expectedMaterialChange: "receive clarification",
+      attempt: 1,
+      maxAttempts: 2,
+      status: "planned",
+      decidedAt: "2026-09-27T00:00:01.000Z",
+      failureFingerprint: classification.fingerprint,
+    });
+    h.store.transitionMission(h.missionId, "BLOCKED");
+
+    const waiting = await h.orchestrator.repairBlockedMission(h.missionId);
+
+    assert.equal(waiting.status, "WAITING_FOR_USER");
+    const waits = h.store.listRecoveryDecisions(h.missionId).filter((d) => d.action === "WAIT_FOR_REQUIREMENT");
+    assert.equal(waits.length, 1);
+  });
+
   it("context overflow before any commit stops with an explicit finding, not a checkpoint-integrity error", async () => {
     const h = blockedRepairHarness({ contextOverflowNoCheckpoint: true });
 

@@ -66,6 +66,8 @@ export interface MissionSupervisorOptions {
    * one mission; only its custodian reconciles it. Defaults to every mission.
    */
   admit?: (mission: Mission) => boolean | Promise<boolean>;
+  /** Whether the planner is running for a mission right now (no tasks yet is then expected). */
+  planningInFlight?: (missionId: string) => boolean;
 }
 
 export interface SupervisorDiagnostic {
@@ -107,6 +109,7 @@ export class MissionSupervisor {
   private readonly onStatuses?: (statuses: SupervisorStatus[]) => void | Promise<void>;
   private readonly beforeTick?: () => void | Promise<void>;
   private readonly admit?: (mission: Mission) => boolean | Promise<boolean>;
+  private readonly planningInFlight?: (missionId: string) => boolean;
   private readonly supervisorDiagnostics: SupervisorDiagnostic[] = [];
   private timer?: ReturnType<typeof setInterval>;
   private readonly missionTicks = new Map<string, Promise<SupervisorStatus>>();
@@ -125,6 +128,7 @@ export class MissionSupervisor {
     this.onStatuses = options.onStatuses;
     this.beforeTick = options.beforeTick;
     this.admit = options.admit;
+    this.planningInFlight = options.planningInFlight;
     if (!Number.isFinite(this.intervalMs) || this.intervalMs <= 0) {
       throw new Error("MissionSupervisor intervalMs must be positive");
     }
@@ -449,6 +453,8 @@ export class MissionSupervisor {
     // recovery; one blanket orphaned-execution STOP used to erase three
     // different situations, two of which are not orphaned executions (#112).
     if (tasks.length === 0) {
+      // The planner is still running: no tasks yet is expected, not an answer.
+      if (this.planningInFlight?.(mission.mission_id)) return null;
       return {
         health: "PLANNING_EMPTY",
         category: "REQUIREMENT_AMBIGUITY",
