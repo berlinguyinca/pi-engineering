@@ -759,7 +759,6 @@ export class MissionScheduler {
             repo_id: lease.repoId,
           });
           await this.lanes.release(lease).catch(() => undefined);
-          this.wake();
         }
         // Whatever path ended the task, a terminal task leaves the resilience
         // window (a paused task stays RETRYING and keeps its park).
@@ -771,8 +770,13 @@ export class MissionScheduler {
         // Always leave activeTasks: runnable() never re-offers an active task.
         this.release(task);
       }
-      this.onTaskSettled?.(task.mission_id, task.task_id, this.store.getTask(task.task_id)?.status ?? "FAILED");
-      this.wake();
+      const settledStatus = this.store.getTask(task.task_id)?.status;
+      this.onTaskSettled?.(task.mission_id, task.task_id, settledStatus ?? "FAILED");
+      // A task parked READY (lane conflict or a repository_lease wait) is not
+      // settled: waking the pass loop would re-offer it at once and spin. It is
+      // re-offered on the fallback tick. Any other settlement wakes the loop, which
+      // also covers the lane/slot this run just released.
+      if (settledStatus !== "READY") this.wake();
     }
   }
 
