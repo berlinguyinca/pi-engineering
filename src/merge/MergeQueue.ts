@@ -66,8 +66,17 @@ export interface GitPrimitives {
   currentBranch(): Promise<string>;
   branchExists(name: string): Promise<boolean>;
   rebaseOnto(branch: string, onto: string): Promise<RebaseResult>;
-  /** Merge `branch` into `target` (the current branch when omitted). */
-  mergeBranch(branch: string, target?: string): Promise<{ merged: boolean; conflict: boolean; reason: string | null }>;
+  /**
+   * Merge `branch` into `target` (the current branch when omitted). A fenced
+   * entry passes the head SHA it validated as `expectedHeadSha`; a primitive that
+   * can should merge exactly that commit (or refuse if the branch no longer
+   * points at it), so a late push can never ride in on the fence.
+   */
+  mergeBranch(
+    branch: string,
+    target?: string,
+    expectedHeadSha?: string,
+  ): Promise<{ merged: boolean; conflict: boolean; reason: string | null }>;
   /** The commit at `ref` (HEAD when omitted). */
   headCommit(ref?: string): Promise<string>;
   /** Run an integration gate (e.g. verify) before promoting to main. */
@@ -190,7 +199,7 @@ export class MergeQueue {
       break;
     }
     this.onState?.(entry, "MERGING");
-    const merge = await this.git.mergeBranch(entry.branch, entry.target);
+    const merge = await this.git.mergeBranch(entry.branch, entry.target, head);
     if (!merge.merged) {
       return {
         level: "main",

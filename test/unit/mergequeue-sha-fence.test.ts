@@ -65,11 +65,12 @@ async function fixture() {
         await g("checkout", "-q", "main");
       }
     },
-    mergeBranch: async (branch, target) => {
+    mergeBranch: async (branch, target, expectedHeadSha) => {
       calls.push(`merge:${branch}`);
       await g("checkout", "-q", target ?? "main");
       try {
-        await g("merge", "--no-ff", "-q", "-m", `merge ${branch}`, branch);
+        // Merge exactly the commit the fence validated.
+        await g("merge", "--no-ff", "-q", "-m", `merge ${branch}`, expectedHeadSha ?? branch);
         return { merged: true, conflict: false, reason: null };
       } catch (error) {
         await g("merge", "--abort").catch(() => {});
@@ -138,6 +139,30 @@ test("a moved target tip makes enqueue rebase onto it and rerun the gate with a 
       { kind: "verify", sha: newTip },
     ]);
     assert.ok(f.calls.includes("rebase:feat/b"));
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("the merge is told the exact head SHA the fence validated", async () => {
+  const f = await fixture();
+  try {
+    const head = await f.commitOn("feat/x", "x.txt", "x\n", true);
+    const base = await f.g("rev-parse", "main");
+    let told: string | undefined;
+    const git = f.prims({
+      mergeBranch: async (_b, _t, expected) => {
+        told = expected;
+        return { merged: true, conflict: false, reason: null };
+      },
+    });
+    await new MergeQueue({ git }).enqueue({
+      branch: "feat/x",
+      target: "main",
+      reviewedHeadSha: head,
+      boundBaseSha: base,
+    });
+    assert.equal(told, head);
   } finally {
     await f.cleanup();
   }
