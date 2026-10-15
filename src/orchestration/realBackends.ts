@@ -116,6 +116,14 @@ const MODEL_GONE_MARKERS: ReadonlySet<string> = new Set(["transient:model_unavai
  * We move THIS attempt to the next comparable model rather than fail it on a
  * saturated one.
  */
+/**
+ * A server that cannot compile the request's tool schema into a sampling
+ * grammar (llama.cpp: "Failed to initialize samplers: failed to parse grammar")
+ * refuses it with a 400 on every attempt. That is a property of the route, not
+ * a defect in the work: it is never retried there and hands over to the next.
+ */
+const PROVIDER_REQUEST_REFUSAL = /grammar|sampler|json.?schema/i;
+
 const MODEL_CAPACITY_MARKERS: ReadonlySet<string> = new Set(["transient:server_unavailable"]);
 
 /**
@@ -401,6 +409,12 @@ export function realBackends(opts: RealBackendsOptions) {
       onSwitch?: (from: ModelRef, to: ModelRoute) => void;
       /** Announce a route's own warning (e.g. a pin the role could not use). */
       announceWarnings?: boolean;
+      /**
+       * Hand the attempt to the next route when the provider fails it (an
+       * unreachable host, a 5xx, or a 400 whose grammar/sampler/schema the
+       * server cannot compile) instead of failing the task on that route.
+       */
+      failoverOnProviderError?: boolean;
     },
   ): Promise<{ run: Awaited<ReturnType<WorkerExecutor["run"]>>; route: ModelRoute | undefined; model?: ModelRef }> => {
     const announce = (summary: string): void => {
@@ -424,6 +438,15 @@ export function realBackends(opts: RealBackendsOptions) {
       const error = outcomeOf(run).error ?? "";
       if (error === MODEL_SUPERSEDED) {
         const next = await plan.repick(tried);
+        // The operator's choice resolves to the model already running: nothing
+        // changes, so keep the session and carry on — no restart, no switch.
+        if (next && route && modelKey(next) === modelKey(route)) {
+          route = next;
+          arm(req, route, plan.context.missionId, pinKeyOf(plan.context.missionId));
+          run = await runWorker(req, input);
+          model = route;
+          continue;
+        }
         const notice = `operator switched models — ${req.role} moves from ${model ? modelKey(model) : "the default model"} to ${next ? modelKey(next) : "automatic routing"} at this inference boundary`;
         switches.push(notice);
         announce(notice);
@@ -444,7 +467,12 @@ export function realBackends(opts: RealBackendsOptions) {
       if (!model) break;
       const gone = MODEL_GONE_MARKERS.has(error);
       const capacity = !gone && MODEL_CAPACITY_MARKERS.has(error);
-      if (!gone && !capacity) break;
+      const providerFault =
+        !gone &&
+        !capacity &&
+        plan.failoverOnProviderError === true &&
+        (error.startsWith("transient:") || PROVIDER_REQUEST_REFUSAL.test(run.result.summary));
+      if (!gone && !capacity && !providerFault) break;
       const failed: ModelRef = model;
       const reason = run.result.summary;
       // A gone model is gateway-confirmed and leaves routing for a TTL; a
@@ -455,9 +483,11 @@ export function realBackends(opts: RealBackendsOptions) {
       tried.push(failed);
       const next = await plan.next(tried);
       if (!next || tried.some((known) => sameModel(known, next))) break;
-      const notice = gone
-        ? `model ${modelKey(failed)} is no longer served — switched ${req.role} to ${modelKey(next)}`
-        : `model ${modelKey(failed)} has no capacity right now — switched ${req.role} to ${modelKey(next)}`;
+      const notice = providerFault
+        ? `model ${modelKey(failed)} failed the request (${reason.slice(0, 200)}) — switched ${req.role} to ${modelKey(next)}`
+        : gone
+          ? `model ${modelKey(failed)} is no longer served — switched ${req.role} to ${modelKey(next)}`
+          : `model ${modelKey(failed)} has no capacity right now — switched ${req.role} to ${modelKey(next)}`;
       switches.push(notice);
       announce(notice);
       plan.onSwitch?.(failed, next);
@@ -721,6 +751,7 @@ export function realBackends(opts: RealBackendsOptions) {
           next: pickReviewer,
           repick: pickReviewer,
           freshSessionId: () => id("RVS"),
+          failoverOnProviderError: true,
           context: { missionId: input.missionId, taskId: input.taskId },
           onSwitch: (_from, to) =>
             notify(
@@ -749,8 +780,7 @@ export function realBackends(opts: RealBackendsOptions) {
           Array.isArray(structured?.missingTests) &&
           structured.missingTests.every(validRawMissingTest) &&
           Array.isArray(structured?.specGaps) &&
-          structured.specGaps.every(validRawSpecGap) &&
-          !!modelRoute;
+          structured.specGaps.every(validRawSpecGap);
         const supplemental = [
           ...(Array.isArray(structured?.missingTests) ? structured.missingTests : []),
           ...(Array.isArray(structured?.specGaps) ? structured.specGaps : []),

@@ -12,40 +12,43 @@ import type { FindingSeverity, ReviewFinding, ReviewReport, SpecGap, WorkCategor
 
 const SEVERITIES = ["blocker", "critical", "high", "medium", "low", "info"] as const;
 
+/**
+ * llama.cpp compiles the tool schema into a GBNF grammar and rejects the whole
+ * request ("Failed to initialize samplers: failed to parse grammar") for what
+ * it cannot express. The schema below is therefore deliberately flat: plain
+ * string enums (no anyOf/const), no length/count/range bounds, no pattern or
+ * format, few optional properties. The bounds live in `execute`, which caps
+ * every field, so the harness stays protected without the grammar paying for it.
+ */
+const stringEnum = <T extends string>(values: readonly T[]) => Type.Unsafe<T>({ type: "string", enum: [...values] });
+
+const severitySchema = stringEnum(SEVERITIES);
+
 const findingSchema = Type.Object({
-  severity: Type.Union(SEVERITIES.map((s) => Type.Literal(s))),
-  title: Type.String({ maxLength: 300 }),
-  detail: Type.String({ maxLength: 3000 }),
-  file: Type.Optional(Type.String({ maxLength: 500 })),
+  severity: severitySchema,
+  title: Type.String(),
+  detail: Type.String(),
+  file: Type.Optional(Type.String()),
   line: Type.Optional(Type.Number()),
-  end_line: Type.Optional(Type.Number()),
-  confidence: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
-  suggestion: Type.Optional(Type.String({ maxLength: 2000 })),
-  categories: Type.Optional(Type.Array(Type.String({ maxLength: 60 }), { maxItems: 8 })),
+  suggestion: Type.Optional(Type.String()),
 });
 
 const missingTestSchema = Type.Object({
-  description: Type.String({ maxLength: 1000 }),
-  file: Type.Optional(Type.String({ maxLength: 500 })),
-  severity: Type.Union(SEVERITIES.map((s) => Type.Literal(s))),
+  description: Type.String(),
+  severity: severitySchema,
 });
 
 const specGapSchema = Type.Object({
-  requirement: Type.String({ maxLength: 1000 }),
-  status: Type.Union([
-    Type.Literal("missing"),
-    Type.Literal("partial"),
-    Type.Literal("divergent"),
-    Type.Literal("unverifiable"),
-  ]),
-  detail: Type.String({ maxLength: 2000 }),
-  severity: Type.Union(SEVERITIES.map((s) => Type.Literal(s))),
+  requirement: Type.String(),
+  status: stringEnum(["missing", "partial", "divergent", "unverifiable"] as const),
+  detail: Type.String(),
+  severity: severitySchema,
 });
 
 const acceptanceResultSchema = Type.Object({
-  acceptance_id: Type.String({ minLength: 1, maxLength: 200 }),
-  status: Type.Union([Type.Literal("passed"), Type.Literal("failed")]),
-  detail: Type.String({ minLength: 1, maxLength: 2000 }),
+  acceptance_id: Type.String(),
+  status: stringEnum(["passed", "failed"] as const),
+  detail: Type.String(),
 });
 
 export const reviewResultTool = defineTool({
@@ -60,13 +63,13 @@ export const reviewResultTool = defineTool({
     "Use severity blocker or critical only for breakage, security, data loss, or a spec requirement that is unmet.",
   ],
   parameters: Type.Object({
-    verdict: Type.Union([Type.Literal("approve"), Type.Literal("request_changes")]),
-    summary: Type.String({ maxLength: 4000 }),
-    confidence: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
-    findings: Type.Array(findingSchema, { maxItems: 40 }),
-    missing_tests: Type.Array(missingTestSchema, { maxItems: 20 }),
-    spec_gaps: Type.Array(specGapSchema, { maxItems: 20 }),
-    acceptance_results: Type.Array(acceptanceResultSchema, { maxItems: 100 }),
+    verdict: stringEnum(["approve", "request_changes"] as const),
+    summary: Type.String(),
+    confidence: Type.Optional(Type.Number()),
+    findings: Type.Array(findingSchema),
+    missing_tests: Type.Array(missingTestSchema),
+    spec_gaps: Type.Array(specGapSchema),
+    acceptance_results: Type.Array(acceptanceResultSchema),
   }),
 
   async execute(_toolCallId, params) {
@@ -84,16 +87,14 @@ export const reviewResultTool = defineTool({
       severity: (SEVERITIES as readonly string[]).includes(f.severity) ? (f.severity as FindingSeverity) : "medium",
       file: f.file ? cap(f.file, 500) : undefined,
       line: typeof f.line === "number" ? f.line : undefined,
-      endLine: typeof f.end_line === "number" ? f.end_line : undefined,
       title: cap(f.title, 300),
       detail: cap(f.detail, 3000),
-      confidence: typeof f.confidence === "number" ? Math.max(0, Math.min(1, f.confidence)) : 0.6,
+      confidence: 0.6,
       suggestion: f.suggestion ? cap(f.suggestion, 2000) : undefined,
-      categories: (f.categories ?? []).map((c) => cap(c, 60) as WorkCategory),
+      categories: [] as WorkCategory[],
     }));
     const missingTests = (params.missing_tests ?? []).slice(0, 20).map((m) => ({
       description: cap(m.description, 1000),
-      file: m.file ? cap(m.file, 500) : undefined,
       severity: (SEVERITIES as readonly string[]).includes(m.severity) ? m.severity : "medium",
     }));
     const specGaps: SpecGap[] = (params.spec_gaps ?? []).slice(0, 20).map((g) => ({
@@ -102,6 +103,7 @@ export const reviewResultTool = defineTool({
       detail: cap(g.detail, 2000),
       severity: (SEVERITIES as readonly string[]).includes(g.severity) ? g.severity : "medium",
     }));
+    const summary = cap(params.summary, 4000);
     const verdict = params.verdict === "approve" ? "approve" : "request_changes";
     return {
       content: [{ type: "text" as const, text: `Review recorded: ${verdict} (${findings.length} findings)` }],
@@ -110,13 +112,13 @@ export const reviewResultTool = defineTool({
         findings,
         missingTests,
         specGaps,
-        acceptanceResults: (params.acceptance_results ?? []).map((result) => ({
+        acceptanceResults: (params.acceptance_results ?? []).slice(0, 100).map((result) => ({
           acceptanceId: cap(result.acceptance_id, 200),
           status: result.status,
           detail: cap(result.detail, 2000),
         })),
-        confidence: params.confidence,
-        summary: params.summary,
+        confidence: typeof params.confidence === "number" ? Math.max(0, Math.min(1, params.confidence)) : undefined,
+        summary,
       },
       terminate: true,
     };
