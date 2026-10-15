@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { access, readFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import type { ArtifactStore } from "../artifacts/ArtifactStore.ts";
@@ -226,7 +226,7 @@ export function runWithInactivityGuard(
       outputBytes += chunk.length;
       if (!opts.watchdog) return;
       const text = chunk.toString("utf8");
-      testEvents += countTestEvents(text);
+      testEvents += countTestEvents(text) + countNextestEvents(text);
       recent = (recent + text).slice(-WATCHDOG_RECENT_BYTES);
     };
     child.stdout.on("data", (chunk: Buffer) => {
@@ -522,7 +522,7 @@ function makefileHasTarget(makefile: string, target: string): boolean {
  * ecosystem is detected from its own manifest, so a Rust/Go/Python/Make repo
  * gets real evidence instead of a zero-check run.
  */
-async function nonNodeStages(cwd: string): Promise<VerifyStage[]> {
+async function nonNodeStages(cwd: string, hasNextest: () => Promise<boolean>): Promise<VerifyStage[]> {
   const stages: VerifyStage[] = [];
   const stage = (name: string, command: string, args: string[]): VerifyStage => ({
     name,
@@ -532,8 +532,7 @@ async function nonNodeStages(cwd: string): Promise<VerifyStage[]> {
     timeoutMs: DEFAULT_STAGE_INACTIVITY_MS,
   });
   if (await exists(join(cwd, "Cargo.toml"))) {
-    stages.push(stage("typecheck", "cargo", ["check", "--all-targets"]));
-    stages.push(stage("test", "cargo", ["test"]));
+    stages.push(...rustProfile(await hasNextest()).stages);
   }
   if (await exists(join(cwd, "go.mod"))) {
     stages.push(stage("build", "go", ["build", "./..."]));
@@ -671,6 +670,80 @@ async function cleanEnv(cwd: string, extra: Record<string, string> = {}): Promis
   return env;
 }
 
+// --- Rust: cargo-nextest (autospec R-WATCH, issue #148) ----------------------
+
+/** One test start/finish reported by `cargo nextest run`. */
+export interface NextestEvent {
+  kind: "start" | "finish";
+  /** Set for finish events. */
+  status?: "pass" | "fail" | "skip";
+  /** `<binary> <test path>` as nextest prints it. */
+  test: string;
+}
+
+// biome-ignore lint/suspicious/noControlCharactersInRegex: strips ANSI colour codes
+const ANSI = /\u001b\[[0-9;]*m/g;
+const NEXTEST_LINE = /^\s*(?:TRY \d+ )?(PASS|FAIL|SKIP|START)\b(?:\s+\[[^\]]*\])?\s*(.*)$/;
+
+/**
+ * A test start/finish line of `cargo nextest run`, or null for anything else
+ * (headers, SLOW notices, the summary, compiler output). Nextest's lines are
+ * indented, so the generic {@link countTestEvents} patterns do not see them.
+ */
+export function parseNextestLine(line: string): NextestEvent | null {
+  const m = line.replace(ANSI, "").match(NEXTEST_LINE);
+  if (!m) return null;
+  const test = (m[2] ?? "").trim();
+  if (test.length === 0) return null;
+  if (m[1] === "START") return { kind: "start", test };
+  return { kind: "finish", status: m[1] === "PASS" ? "pass" : m[1] === "FAIL" ? "fail" : "skip", test };
+}
+
+/** Nextest test events in a chunk of output: the watchdog's `test_event` progress. */
+export function countNextestEvents(chunk: string): number {
+  let count = 0;
+  for (const line of chunk.split("\n")) if (parseNextestLine(line)) count++;
+  return count;
+}
+
+/**
+ * The Rust verification stages. With nextest: `cargo nextest run` plus an
+ * explicit `cargo test --doc` (nextest does not run doctests). Without it,
+ * `cargo test` over the lib, bins and integration tests plus the same doctest
+ * stage, so doctests run exactly once either way. Both test stages run under
+ * the progress watchdog.
+ */
+export function rustProfile(hasNextest: boolean): VerificationProfile {
+  const stage = (name: string, args: string[], watchdog?: WatchdogSettings): VerifyStage => ({
+    name,
+    command: "cargo",
+    args,
+    required: true,
+    timeoutMs: DEFAULT_STAGE_INACTIVITY_MS,
+    ...(watchdog ? { watchdog } : {}),
+  });
+  return {
+    name: hasNextest ? "rust-nextest" : "rust",
+    stages: [
+      stage("typecheck", ["check", "--all-targets"]),
+      hasNextest ? stage("nextest", ["nextest", "run"], {}) : stage("test", ["test", "--lib", "--bins", "--tests"], {}),
+      stage("doctest", ["test", "--doc"], {}),
+    ],
+  };
+}
+
+/** True when `cargo nextest --version` exits 0 in `cwd`. */
+export function probeNextest(cwd: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    execFile("cargo", ["nextest", "--version"], { cwd, timeout: 15_000 }, (error) => resolve(error === null));
+  });
+}
+
+export interface CommandVerifierOptions {
+  /** Whether cargo-nextest is installed; injectable for tests. */
+  probeNextest?: (cwd: string) => Promise<boolean>;
+}
+
 /** Deterministic verifier that runs detected shell commands. */
 export class CommandVerifier implements VerificationProvider {
   /**
@@ -680,6 +753,11 @@ export class CommandVerifier implements VerificationProvider {
    * parse + profile build (stage/tool selection) are skipped on cache hits.
    */
   private readonly profileCache = new Map<string, VerificationProfile>();
+  private readonly probeNextest: (cwd: string) => Promise<boolean>;
+
+  constructor(opts: CommandVerifierOptions = {}) {
+    this.probeNextest = opts.probeNextest ?? probeNextest;
+  }
 
   private async cacheKey(
     cwd: string,
@@ -741,7 +819,7 @@ export class CommandVerifier implements VerificationProvider {
     // npm scripts win whenever they declare a typecheck/test/build. Otherwise
     // (no package.json, or one carrying only lint/format/dev scripts in a
     // mixed repository) the root's own ecosystem manifests decide.
-    if (stages.length === 0) stages.push(...(await nonNodeStages(cwd)));
+    if (stages.length === 0) stages.push(...(await nonNodeStages(cwd, () => this.probeNextest(cwd))));
     if (full) {
       // Broader suite: lint + an explicit full-test script, when declared.
       // Both are required so /verify full cannot report PASSED while the
