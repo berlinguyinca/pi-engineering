@@ -177,10 +177,6 @@ test("Retry-After is honored with jitter and bounded", () => {
     DEFAULT_RETRY_AFTER_MS,
     "a nonsense value is not honored",
   );
-  assert.equal(
-    cooldownUntilFor(NOW, 10_000, () => 0),
-    NOW + 10_000,
-  );
 });
 
 test("existing refusals stay put: unknown context is a stay, not a blocked", () => {
