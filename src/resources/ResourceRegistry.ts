@@ -271,6 +271,22 @@ export class ResourceRegistry {
     });
   }
 
+  /**
+   * Every readable record on this registry, oldest first. For housekeeping that
+   * has no single owner (the pressure GC); unreadable files are skipped here and
+   * are {@link reconcile}'s to quarantine.
+   */
+  async listAll(): Promise<ResourceRecord[]> {
+    return this.locked(async () => {
+      const all: ResourceRecord[] = [];
+      for (const name of await this.recordFiles()) {
+        const record = await this.readFile(name);
+        if (record && record !== "gone") all.push(record);
+      }
+      return all.sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
+    });
+  }
+
   // --- storage -------------------------------------------------------------
 
   private async recordFiles(): Promise<string[]> {
