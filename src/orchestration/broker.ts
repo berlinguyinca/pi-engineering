@@ -393,6 +393,8 @@ const MAX_TIMER_MS = 2 ** 31 - 1;
  * an explicitly configured (opt-in) wall-clock limit produces it.
  */
 const WALL_CLOCK_TIMEOUT_MARKER = "timeout";
+/** Stored execution summary of a deliberate `partial` worker report (the orchestrator words its recovery on it). */
+export const PARTIAL_PROGRESS_SUMMARY = "worker reported partial progress";
 
 /**
  * Failure marker for an execution that showed no activity (no tool, model,
@@ -3032,7 +3034,12 @@ export class ExecutionBroker {
             if (outcome.partial && outcome.exitStatus !== "succeeded" && input.mutatesRepo && worktree) {
               const declared = new Set(input.deliverables ?? []);
               partialDone = outcome.partial.done.filter((name) => declared.has(name));
-              outcome = { ...outcome, exitStatus: WALL_CLOCK_TIMEOUT_MARKER, error: WALL_CLOCK_TIMEOUT_MARKER };
+              outcome = {
+                ...outcome,
+                exitStatus: WALL_CLOCK_TIMEOUT_MARKER,
+                error: WALL_CLOCK_TIMEOUT_MARKER,
+                summary: PARTIAL_PROGRESS_SUMMARY,
+              };
             }
             const escaped = await this.outOfScopeWorktreePaths(execution.execution_id, input);
             input.authority?.assertAuthoritative();

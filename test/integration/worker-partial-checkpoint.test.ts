@@ -14,7 +14,16 @@ import { Orchestrator } from "../../src/orchestration/orchestrator.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 import { makeFixtureRepo } from "../fixtures/make-fixture.ts";
 
-test("a partial worker report checkpoints the done deliverable and recovery re-plans only the rest", async () => {
+for (const scenario of [
+  { name: "one of two deliverables done", done: ["one"], remaining: ["two"] },
+  { name: "zero deliverables done", done: [] as string[], remaining: ["one", "two"] },
+]) {
+  test(`a partial worker report (${scenario.name}) is a resumable checkpoint`, async () => {
+    await partialScenario(scenario.done, scenario.remaining);
+  });
+}
+
+async function partialScenario(done: string[], remaining: string[]): Promise<void> {
   const fx = await makeFixtureRepo();
   try {
     const git = (await GitRepo.open(fx.root))!;
@@ -34,7 +43,7 @@ test("a partial worker report checkpoints the done deliverable and recovery re-p
                 exitStatus: "failed",
                 summary: "ran out of time",
                 error: "ran out of time",
-                partial: { done: ["one"] },
+                partial: { done },
                 artifactRefs: [],
                 usage: {},
               }
@@ -80,17 +89,23 @@ test("a partial worker report checkpoints the done deliverable and recovery re-p
     const execution = store.listExecutions(missionId).find((e) => e.task_id === original.task_id)!;
     assert.equal(execution.exit_status, "timeout");
     const checkpoint = store.getTaskCheckpoint(execution.checkpoint_id!);
-    assert.deepEqual(checkpoint?.completedDeliverables, ["one"]);
-    assert.deepEqual(checkpoint?.remainingDeliverables, ["two"]);
+    assert.deepEqual(checkpoint?.completedDeliverables, done);
+    assert.deepEqual(checkpoint?.remainingDeliverables, remaining);
+    assert.equal(
+      result.failureReason,
+      `worker reported partial progress: done [${done.join(", ")}], remaining [${remaining.join(", ")}]`,
+    );
+    assert.doesNotMatch(result.failureReason ?? "", /wall-clock/);
+    assert.ok(await git.resolveCommit(`pi-eng-orch-${original.task_id}`), "committed work is preserved on its branch");
     assert.equal(objectives.length, 1, "no retry attempt was spent on the partial report");
 
     await orchestrator.repairBlockedMission(missionId);
     const replacements = store.listTasks(missionId).filter((t) => t.task_id !== original.task_id && t.kind === "agent");
     assert.deepEqual(
-      replacements.map((t) => t.deliverables),
-      [["two"]],
+      replacements.map((t) => t.deliverables?.slice().sort()).sort(),
+      remaining.map((d) => [d]),
     );
   } finally {
     await fx.cleanup();
   }
-});
+}
