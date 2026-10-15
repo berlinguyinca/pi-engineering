@@ -17,7 +17,11 @@ import { formatWaitingFor } from "../gateway/admissionNotice.ts";
 import { CircuitBreaker } from "../resilience/circuitBreaker.ts";
 import type { InfraErrorCategory } from "../resilience/classify.ts";
 import { CATEGORY_TO_STATE } from "../resilience/classify.ts";
-import { type GatewayResilienceConfig, resolveGatewayResilienceConfig } from "../resilience/config.ts";
+import {
+  DEFAULT_GATEWAY_RESILIENCE,
+  type GatewayResilienceConfig,
+  resolveGatewayResilienceConfig,
+} from "../resilience/config.ts";
 import { type ProbeResult, type RecoveryProbe, healthyProbe } from "../resilience/probe.ts";
 import { type RetryWindowState, recordProbe, startRetryWindow, windowOpen } from "../resilience/retryWindow.ts";
 import { type SchedulableTask, Scheduler } from "../sched/Scheduler.ts";
@@ -278,6 +282,13 @@ export class MissionScheduler {
    */
   private readonly outageStartedAt = new Map<string, number>();
   private readonly relaunches = new Map<string, number>();
+  /**
+   * Relaunches per task after executions that failed on the provider before any
+   * tool call ran. These are not task attempts and not outage relaunches.
+   */
+  private readonly zeroToolRetries = new Map<string, number>();
+  /** Tasks past the zero-tool retry cap: relaunch only on an authoritative healthy probe. */
+  private readonly zeroToolHeld = new Set<string>();
   /** Per-task circuit breaker (prevents a request storm during recovery). */
   private readonly breakers = new Map<string, CircuitBreaker>();
   /** Consecutive "model not listed" probe answers per task (see probeGate). */
@@ -697,7 +708,6 @@ export class MissionScheduler {
         this.stopTaskOnAbort(task, signal);
         return;
       }
-      attempt++;
       // Resilience probe gate: when a time-based retry window is active for this
       // task (a prior transient infrastructure failure), start a fresh worker
       // attempt ONLY once the recovery probe reports the gateway healthy; otherwise
@@ -710,6 +720,8 @@ export class MissionScheduler {
       }
       if (gate === "paused") return;
       if (gate === "wait") continue;
+      // Only a run that really launches is an attempt: probe waits are not.
+      attempt++;
       // Consume the unlisted answer that let this attempt through (if any) now,
       // so an attempt that never produces an outcome cannot leave it behind
       // for a later, ordinary transient to report.
@@ -778,7 +790,13 @@ export class MissionScheduler {
           // non-throwing failures keep the existing behaviour.
           const infraCat = infraCategoryFromWorkerMarker(outcome.error);
           if (infraCat && verifying) this.reportUnlistedModel(task, verifying, outcome);
-          const ceiling = infraCat ? this.outageCeiling(task, outcome) : null;
+          // An implementer execution that failed on the provider before any tool
+          // ran left no side effects: it is not a task attempt, and the
+          // outage relaunch/duration ceilings (which end in FAILED -> BLOCKED)
+          // do not apply to it. It is bounded by the zero-tool retry cap
+          // (which holds the mission in WAITING_FOR_LLM) and the retry window.
+          const zeroTool = infraCat !== null && task.kind === "agent" && outcome.toolCalls === 0;
+          const ceiling = infraCat && !zeroTool ? this.outageCeiling(task, outcome) : null;
           if (ceiling) {
             authority?.assertAuthoritative();
             if (this.taskAlreadyTerminal(task.task_id)) return;
@@ -791,15 +809,41 @@ export class MissionScheduler {
             const res = this.resilienceGate(task, infraCat);
             if (res.paused) return;
             if (res.retry) {
-              const recoveryStop = await this.authorizeRetry(task, {
-                missionId: task.mission_id,
-                taskId: task.task_id,
-                executionId: handle.executionId,
-                summary: outcome.summary ?? outcome.error ?? "provider transient failure",
-                evidenceRefs: outcome.artifactRefs,
-                category: "PROVIDER_TRANSIENT",
-                observedAt: new Date(this.clockNow()).toISOString(),
-              });
+              let waitMs = res.waitMs;
+              if (zeroTool) {
+                const retries = (this.zeroToolRetries.get(task.task_id) ?? 0) + 1;
+                this.zeroToolRetries.set(task.task_id, retries);
+                const cap = this.resilience.max_zero_tool_retries ?? DEFAULT_GATEWAY_RESILIENCE.max_zero_tool_retries!;
+                if (retries > cap) {
+                  this.zeroToolHeld.add(task.task_id);
+                  waitMs = Math.max(waitMs, this.resilience.max_backoff_ms ?? this.resilience.probe_interval_ms);
+                  this.onStatus?.({
+                    missionId: task.mission_id,
+                    taskId: task.task_id,
+                    status: "WAITING_FOR_LLM",
+                    action: "retrying",
+                    reason: `${retries - 1} executions failed on the provider before any tool call; waiting for a healthy gateway probe`,
+                    attempt: task.attempt,
+                    nextActionAt: this.clockNow() + waitMs,
+                    terminal: false,
+                  });
+                }
+                // Not a task attempt: the next run reuses this attempt number.
+                attempt--;
+              }
+              const recoveryStop = await this.authorizeRetry(
+                task,
+                {
+                  missionId: task.mission_id,
+                  taskId: task.task_id,
+                  executionId: handle.executionId,
+                  summary: outcome.summary ?? outcome.error ?? "provider transient failure",
+                  evidenceRefs: outcome.artifactRefs,
+                  category: "PROVIDER_TRANSIENT",
+                  observedAt: new Date(this.clockNow()).toISOString(),
+                },
+                this.clockNow() + waitMs,
+              );
               if (recoveryStop) {
                 authority?.assertAuthoritative();
                 if (this.taskAlreadyTerminal(task.task_id)) return;
@@ -811,7 +855,7 @@ export class MissionScheduler {
               authority?.assertAuthoritative();
               if (this.taskAlreadyTerminal(task.task_id)) return;
               this.store.transitionTask(task.task_id, "RETRYING", "system", { attempt });
-              const waited = await this.abortable(this.sleepFn(res.waitMs), signal);
+              const waited = await this.abortable(this.sleepFn(waitMs), signal);
               if (waited.aborted) {
                 this.stopTaskOnAbort(task, signal);
                 return;
@@ -978,7 +1022,11 @@ export class MissionScheduler {
     }
   }
 
-  private async authorizeRetry(task: OrchestrationTask, evidence: FailureEvidence): Promise<string | null> {
+  private async authorizeRetry(
+    task: OrchestrationTask,
+    evidence: FailureEvidence,
+    nextActionAt?: number,
+  ): Promise<string | null> {
     const classification = this.failureClassifier.classify(evidence);
     if (!this.store.getFailureClassification(classification.classificationId)) {
       this.store.classifyFailure(classification);
@@ -987,6 +1035,7 @@ export class MissionScheduler {
       classification,
       history: this.store.listRecoveryDecisions(task.mission_id),
       now: this.clockNow(),
+      ...(nextActionAt !== undefined ? { nextActionAt } : {}),
       resumptionGeneration: this.store.listMissionResumptions(task.mission_id).at(-1)?.generation ?? 0,
     });
     const persisted = this.store.getRecoveryDecision(decision.recoveryId) ?? this.store.planRecovery(decision);
@@ -1090,7 +1139,8 @@ export class MissionScheduler {
     const probed = await this.abortable(this.probe.probe(), signal);
     if (probed.aborted) return "aborted";
     const result = probed.value;
-    if (result.healthy) {
+    // Past the zero-tool retry cap only an authoritative answer releases the task.
+    if (result.healthy && !(result.authoritative === false && this.zeroToolHeld.has(task.task_id))) {
       this.unlistedProbes.delete(task.task_id);
       return "proceed";
     }
@@ -1390,6 +1440,8 @@ export class MissionScheduler {
   private forgetOutage(task: OrchestrationTask): void {
     this.outageStartedAt.delete(task.task_id);
     this.relaunches.delete(task.task_id);
+    this.zeroToolRetries.delete(task.task_id);
+    this.zeroToolHeld.delete(task.task_id);
   }
 
   /**

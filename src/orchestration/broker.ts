@@ -133,6 +133,12 @@ export interface ExecutionOutcome {
    */
   error?: string;
   /**
+   * Tool calls the worker session executed before it ended. Zero means the
+   * execution had no side effects, so a provider failure is safe to re-run
+   * without consuming a task attempt. Undefined: the backend does not know.
+   */
+  toolCalls?: number;
+  /**
    * Integration only: recovered worker commits this integration verifiably
    * merged (set by the broker, not the runner). Persisted on the execution as
    * `recovered_merged` for the completion gate.

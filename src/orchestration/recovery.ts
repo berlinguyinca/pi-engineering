@@ -39,6 +39,8 @@ export interface RecoveryDecisionInput {
   classification: FailureClassification;
   history: RecoveryDecision[];
   now: number;
+  /** When the planned wait ends (epoch ms); defaults to `now`. */
+  nextActionAt?: number;
   resumptionGeneration?: number;
 }
 
@@ -555,7 +557,7 @@ export class RecoveryPlanner {
       attempt,
       maxAttempts: this.strategyMaxAttempts,
       deadline,
-      nextActionAt: decidedAt,
+      nextActionAt: new Date(input.nextActionAt ?? input.now).toISOString(),
       status: "planned",
       decidedAt,
       failureFingerprint: fingerprint,

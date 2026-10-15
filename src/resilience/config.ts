@@ -8,6 +8,8 @@
  *   PI_GATEWAY_RETRY_WINDOW     total wall-clock retry budget (ms or "12h"; default 12h)
  *   PI_GATEWAY_MAX_BACKOFF      cap between worker relaunches (ms or "3m"; default 3m)
  *   PI_GATEWAY_MAX_RELAUNCHES   worker relaunches per task through one outage (default 100)
+ *   PI_GATEWAY_MAX_ZERO_TOOL_RETRIES  relaunches of a task that failed on the provider with
+ *                               no tool call run before it holds in WAITING_FOR_LLM (default 20)
  *   PI_GATEWAY_MAX_OUTAGE       OPT-IN total ceiling across pause + resume, then FAIL
  *                               (default: none — a mission waits for capacity)
  *   PI_GATEWAY_AUTO_RESUME_HORIZON  how long a paused mission watches the recovery
@@ -49,6 +51,14 @@ export interface GatewayResilienceConfig {
    */
   max_relaunches?: number;
   /**
+   * Relaunches of one task whose executions failed on the provider before any
+   * tool call ran. Those executions have no side effects and are not task
+   * attempts; past this many the scheduler stops relaunching on its own pacing
+   * and holds the mission in WAITING_FOR_LLM, relaunching only once the
+   * recovery probe answers authoritatively healthy. Default 20.
+   */
+  max_zero_tool_retries?: number;
+  /**
    * OPT-IN total ceiling on one outage for a task, across pause and
    * auto-resume. Past it the task FAILS with a clear reason. Default unset:
    * an outage is waited out however long it lasts.
@@ -77,6 +87,7 @@ export const DEFAULT_GATEWAY_RESILIENCE: GatewayResilienceConfig = {
   max_backoff_ms: 180_000,
   auto_resume_horizon_ms: Number.POSITIVE_INFINITY,
   max_relaunches: 100,
+  max_zero_tool_retries: 20,
   probe_interval_ms: 10_000,
   request_timeout_ms: 120_000,
   connect_timeout_ms: 10_000,
@@ -118,6 +129,7 @@ export function resolveGatewayResilienceConfig(
   const maxBackoff = dur("PI_GATEWAY_MAX_BACKOFF");
   const autoResumeHorizon = dur("PI_GATEWAY_AUTO_RESUME_HORIZON");
   const maxRelaunches = num("PI_GATEWAY_MAX_RELAUNCHES");
+  const maxZeroToolRetries = num("PI_GATEWAY_MAX_ZERO_TOOL_RETRIES");
   const maxOutage = dur("PI_GATEWAY_MAX_OUTAGE");
   const probe = num("PI_GATEWAY_PROBE_INTERVAL");
   const requestTimeout = num("PI_GATEWAY_REQUEST_TIMEOUT");
@@ -132,6 +144,7 @@ export function resolveGatewayResilienceConfig(
   if (maxBackoff != null) cfg.max_backoff_ms = maxBackoff;
   if (autoResumeHorizon != null) cfg.auto_resume_horizon_ms = autoResumeHorizon;
   if (maxRelaunches != null) cfg.max_relaunches = Math.floor(maxRelaunches);
+  if (maxZeroToolRetries != null) cfg.max_zero_tool_retries = Math.floor(maxZeroToolRetries);
   if (maxOutage != null) cfg.max_outage_ms = maxOutage;
   if (probe != null) cfg.probe_interval_ms = probe;
   if (requestTimeout != null) cfg.request_timeout_ms = requestTimeout;
