@@ -422,6 +422,24 @@ on by default):
 
 `PI_TOOL_CALL_GUARD=0` turns the guard off.
 
+## Resuming a worker after a cut stream
+
+When a worker's model stream is cut ("Stream ended without finish_reason", a
+dropped connection, a link cut) AFTER tool calls ran, the session is kept. The
+failed partial assistant message is dropped from the agent's history
+(`session.agent.state.messages`), every executed tool call and its result stays,
+and the turn is re-issued with `session.agent.continue()` on the same model
+after the usual transient backoff. Nothing is replayed, so side effects run once.
+The same history edit backs the interactive `afterOutputRetry` extension
+(`src/inference/streamResume.ts`).
+
+- At most `PI_STREAM_RESUME_MAX` resumes per execution (default 3; 0 disables).
+  The next cut settles as `truncated_after_progress` as before.
+- Each resume is a status notice and an activity event, and the execution's
+  usage carries `streamResumes`.
+- A cut before any tool call is unchanged: the attempt is retried in a fresh
+  session without consuming an attempt.
+
 ## Verification commands
 
 `/verify` and the mission validators run the repository's own checks. npm
