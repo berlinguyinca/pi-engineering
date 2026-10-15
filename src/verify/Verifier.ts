@@ -1,4 +1,4 @@
-import { execFileSync, spawn } from "node:child_process";
+import { spawn } from "node:child_process";
 import { access, readFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import type { ArtifactStore } from "../artifacts/ArtifactStore.ts";
@@ -11,6 +11,23 @@ import {
   hashProfile,
   parseFailingTests,
 } from "./failureBaseline.ts";
+import {
+  DEFAULT_SAMPLE_MS,
+  DEFAULT_TEST_WATCHDOG,
+  type StallEvidence,
+  type TestWatchdogConfig,
+  type WatchdogLevel,
+  type WatchdogSettings,
+  captureEvidenceSync,
+  classify,
+  countTestEvents,
+  initialWatchdogState,
+  isWallExceeded,
+  listProcessGroup,
+  observe,
+  resolveStageWatchdog,
+  sampleGroup,
+} from "./testWatchdog.ts";
 
 /**
  * Default hang guard for a verification command: killed only after this long
@@ -62,21 +79,9 @@ interface GroupMember {
  * Null when `ps` is unavailable.
  */
 function processGroupMembers(pgid: number): GroupMember[] | null {
-  try {
-    const listing = execFileSync("ps", ["-A", "-o", "pid=,pgid=,stat=,lstart="], {
-      encoding: "utf8",
-      env: { ...process.env, LC_ALL: "C" },
-    });
-    const members: GroupMember[] = [];
-    for (const line of listing.split("\n")) {
-      const [pid, group, stat, ...started] = line.trim().split(/\s+/);
-      if (Number(group) !== pgid || stat?.startsWith("Z")) continue;
-      members.push({ pid: Number(pid), started: started.join(" ") });
-    }
-    return members;
-  } catch {
-    return null;
-  }
+  const members = listProcessGroup(pgid);
+  if (members === null) return null;
+  return members.filter((m) => !m.state.startsWith("Z")).map((m) => ({ pid: m.pid, started: m.started }));
 }
 
 /**
@@ -123,6 +128,17 @@ function reapLeftovers(pgid: number): number {
   return members?.length ?? 1;
 }
 
+/** Why and how the progress watchdog ended a stage. */
+export interface StageStall {
+  level: "stalled" | "wall";
+  /** Milliseconds without progress when it fired. */
+  silentMs: number;
+  /** Process tree and output tail captured BEFORE the signal. */
+  evidence: StallEvidence;
+}
+
+const WATCHDOG_RECENT_BYTES = 32 * 1024;
+
 /**
  * Run a command with an INACTIVITY guard instead of a total-duration timeout:
  * every chunk of stdout/stderr re-arms it, so only a silent (hung) command is
@@ -137,7 +153,14 @@ function reapLeftovers(pgid: number): number {
 export function runWithInactivityGuard(
   command: string,
   args: string[],
-  opts: { cwd: string; env?: NodeJS.ProcessEnv; signal?: AbortSignal; inactivityMs: number },
+  opts: {
+    cwd: string;
+    env?: NodeJS.ProcessEnv;
+    signal?: AbortSignal;
+    inactivityMs: number;
+    /** Progress watchdog (#146): classifies the stage by real progress, not just output. */
+    watchdog?: WatchdogSettings;
+  },
 ): Promise<{
   code: number;
   stdout: string;
@@ -145,6 +168,8 @@ export function runWithInactivityGuard(
   hung: boolean;
   leftoverProcesses: number;
   spawnFailed?: boolean;
+  /** Set when the progress watchdog (not the no-output guard) ended the command. */
+  stalled?: StageStall;
 }> {
   return new Promise((resolve, reject) => {
     if (opts.signal?.aborted) {
@@ -159,6 +184,11 @@ export function runWithInactivityGuard(
     /** A process the command left behind kept stdout/stderr open after it exited. */
     let pipesHeld = false;
     let pipeGrace: ReturnType<typeof setTimeout> | undefined;
+    let stalled: StageStall | undefined;
+    let outputBytes = 0;
+    let testEvents = 0;
+    let recent = "";
+    let sampler: ReturnType<typeof setInterval> | undefined;
     // Own process group, so a kill reaches grandchildren (npm -> node) that
     // would otherwise hold the output pipes open forever.
     const child = spawn(command, args, {
@@ -192,20 +222,69 @@ export function runWithInactivityGuard(
     opts.signal?.addEventListener("abort", onAbort, { once: true });
     const append = (current: string, chunk: Buffer): string =>
       current.length >= MAX_STAGE_OUTPUT_BYTES ? current : current + chunk.toString("utf8");
+    const noteOutput = (chunk: Buffer): void => {
+      outputBytes += chunk.length;
+      if (!opts.watchdog) return;
+      const text = chunk.toString("utf8");
+      testEvents += countTestEvents(text);
+      recent = (recent + text).slice(-WATCHDOG_RECENT_BYTES);
+    };
     child.stdout.on("data", (chunk: Buffer) => {
       stdout = append(stdout, chunk);
+      noteOutput(chunk);
       arm();
     });
     child.stderr.on("data", (chunk: Buffer) => {
       stderr = append(stderr, chunk);
+      noteOutput(chunk);
       arm();
     });
+    if (opts.watchdog && groupPid) {
+      const cfg: TestWatchdogConfig & { sampleMs: number } = {
+        warnMs: opts.watchdog.warnMs ?? DEFAULT_TEST_WATCHDOG.warnMs,
+        investigateMs: opts.watchdog.investigateMs ?? DEFAULT_TEST_WATCHDOG.investigateMs,
+        stallMs: opts.watchdog.stallMs ?? DEFAULT_TEST_WATCHDOG.stallMs,
+        wallMs: opts.watchdog.wallMs,
+        sampleMs: opts.watchdog.sampleMs ?? DEFAULT_SAMPLE_MS,
+      };
+      let state = initialWatchdogState(Date.now());
+      state = observe(state, sampleGroup(groupPid, 0, 0), Date.now());
+      let announced: WatchdogLevel = "progressing";
+      const end = (level: StageStall["level"], now: number): void => {
+        if (stalled) return;
+        // Evidence first, then the signal: the tree must still be alive to be captured.
+        const evidence = captureEvidenceSync(groupPid, recent);
+        const silentMs = now - state.lastProgressAtMs;
+        stalled = { level, silentMs, evidence };
+        hung = true;
+        stderr += `\n[pi-engineering] killed: test stage ${
+          level === "wall" ? `exceeded its ${cfg.wallMs}ms wall limit` : `stalled, no progress for ${silentMs}ms`
+        } (last progress: ${state.lastProgressKind ?? "none"})\n${JSON.stringify(evidence)}\n`;
+        killTree();
+      };
+      sampler = setInterval(() => {
+        if (settled || stalled) return;
+        const now = Date.now();
+        state = observe(state, sampleGroup(groupPid, outputBytes, testEvents), now);
+        if (isWallExceeded(state, now, cfg)) return end("wall", now);
+        const level = classify(state, now, cfg);
+        if (level === "stalled") return end("stalled", now);
+        if (level !== announced) {
+          announced = level;
+          if (level !== "progressing") {
+            stderr += `\n[pi-engineering] test stage ${level}: no progress for ${now - state.lastProgressAtMs}ms\n`;
+          }
+        }
+      }, cfg.sampleMs);
+      sampler.unref();
+    }
     const finish = (fn: () => void): void => {
       if (settled) return;
       settled = true;
       if (groupPid) liveProcessGroups.delete(groupPid);
       if (timer) clearTimeout(timer);
       if (pipeGrace) clearTimeout(pipeGrace);
+      if (sampler) clearInterval(sampler);
       opts.signal?.removeEventListener("abort", onAbort);
       fn();
     };
@@ -242,7 +321,14 @@ export function runWithInactivityGuard(
           return;
         }
         const exitCode = typeof code === "number" ? code : 1;
-        resolve({ code: pipesHeld && exitCode === 0 ? 1 : exitCode, stdout, stderr, hung, leftoverProcesses });
+        resolve({
+          code: pipesHeld && exitCode === 0 ? 1 : exitCode,
+          stdout,
+          stderr,
+          hung,
+          leftoverProcesses,
+          ...(stalled ? { stalled } : {}),
+        });
       }),
     );
     arm();
@@ -259,6 +345,12 @@ export interface VerifyStage {
   cwd?: string;
   /** Hang guard: kill the command after this long with no output (not a total-duration limit). */
   timeoutMs?: number;
+  /**
+   * Progress watchdog (#146). Test stages (`test`, `test:*`) get the defaults;
+   * `false` turns it off; an object overrides thresholds. `wallMs` is a total
+   * limit and applies only when given here.
+   */
+  watchdog?: false | WatchdogSettings;
 }
 
 /** Detected build/test/typecheck commands for a repository (spec §15.2). */
@@ -694,6 +786,7 @@ export class CommandVerifier implements VerificationProvider {
       const res = await runWithInactivityGuard(stage.command, stage.args, {
         cwd: stage.cwd ?? cwd,
         inactivityMs: stage.timeoutMs ?? DEFAULT_STAGE_INACTIVITY_MS,
+        ...(resolveStageWatchdog(stage) ? { watchdog: resolveStageWatchdog(stage) } : {}),
         env: await cleanEnv(stage.cwd ?? cwd),
         ...(opts?.signal ? { signal: opts.signal } : {}),
       });
@@ -723,6 +816,9 @@ export class CommandVerifier implements VerificationProvider {
         stderrBytes: Buffer.byteLength(stderr),
         // The command died of the environment (hang guard, spawn error), not of its own verdict.
         ...(res.hung || res.spawnFailed ? { infrastructureFailure: true } : {}),
+        ...(res.stalled
+          ? { stalled: res.stalled.level, stallSilentMs: res.stalled.silentMs, stallEvidence: res.stalled.evidence }
+          : {}),
         ...(leftoverProcesses > 0
           ? {
               leftoverProcesses,
