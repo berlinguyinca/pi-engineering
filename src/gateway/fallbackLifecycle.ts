@@ -23,7 +23,7 @@
 
 import type { Model } from "@earendil-works/pi-ai/compat";
 import type { ModelHealthProvider } from "../models/health.ts";
-import { type FallbackCandidate, type FallbackNeed, chooseFallbackModel } from "./fallback.ts";
+import { type FallbackCandidate, chooseFallbackModel } from "./fallback.ts";
 import type { GatewayWaitSignal } from "./signals.ts";
 
 /** Consecutive gateway holds before a stand-in is considered. */
@@ -394,7 +394,6 @@ async function chooseFallback(
   deps: Pick<FallbackApplyDeps, "healthFor" | "log" | "now" | "random">,
   ctx: FallbackContext,
   pending: Pick<PendingFallback, "sourceModelId" | "excludeIds" | "cooldownUntil" | "retryAfterMs">,
-  need?: FallbackNeed,
 ): Promise<FallbackChoice> {
   const current = ctx.model;
   if (!current) return { action: "stay", skipped: "no-current-model" };
@@ -428,7 +427,6 @@ async function chooseFallback(
     ...(pending.cooldownUntil ? { cooldownUntil: pending.cooldownUntil } : {}),
     ...(pending.retryAfterMs !== undefined ? { retryAfterMs: pending.retryAfterMs } : {}),
     ...(deps.random ? { random: deps.random } : {}),
-    ...(need ? { need } : {}),
   });
   if (decision.action === "blocked") {
     deps.log?.(`[gateway-fallback] blocked current=${current.id} (${decision.reason})`);
