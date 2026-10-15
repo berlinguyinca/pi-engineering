@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -133,6 +135,83 @@ test("extension publishes one live session, tool progress, UI-only note and life
       PI_PANEL_AUTO_OPEN: old.panel,
       PI_PANEL_NARRATOR: old.narrator,
     })) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("housekeeping is deferred past session_start and a shutdown cancels it before any git child starts", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-eng-housekeeping-dispose-"));
+  const keys = ["PI_ENGINEERING_CONTROL_DIR", "PI_SELF_UPDATE", "PI_PANEL_AUTO_OPEN", "PI_PANEL_NARRATOR"] as const;
+  const old = Object.fromEntries(
+    [...keys, "PI_HOUSEKEEPING_FIRST_RUN_MS", "PI_HOUSEKEEPING_INTERVAL_MS"].map((k) => [k, process.env[k]]),
+  );
+  process.env.PI_ENGINEERING_CONTROL_DIR = join(root, "control");
+  process.env.PI_SELF_UPDATE = "0";
+  process.env.PI_PANEL_AUTO_OPEN = "0";
+  process.env.PI_PANEL_NARRATOR = "0";
+  // A logging wrapper around the real git records every spawn, so "no git
+  // child was started" is observable rather than inferred from handles.
+  execFileSync("git", ["init", "-q", root]);
+  const spawnLog = join(root, "git-spawns.log");
+  const realGit = execFileSync("which", ["git"], { encoding: "utf8" }).trim();
+  await mkdir(join(root, "bin"));
+  await writeFile(join(root, "bin", "git"), `#!/bin/sh\necho "$@" >> '${spawnLog}'\nexec '${realGit}' "$@"\n`, {
+    mode: 0o755,
+  });
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${join(root, "bin")}:${oldPath}`;
+  process.env.PI_HOUSEKEEPING_FIRST_RUN_MS = "150";
+  process.env.PI_HOUSEKEEPING_INTERVAL_MS = "150";
+  const handlers = new Map<string, Handler[]>();
+  const pi = {
+    on: (name: string, handler: Handler) => handlers.set(name, [...(handlers.get(name) ?? []), handler]),
+    registerCommand: () => {},
+    registerTool: () => {},
+    registerShortcut: () => {},
+    registerFlag: () => {},
+    getFlag: () => undefined,
+    registerMessageRenderer: () => {},
+    registerMarkdownTransformer: () => {},
+    registerEntryRenderer: () => {},
+    setModel: async () => false,
+    events: { on: () => {}, emit: () => {} },
+  };
+  const ctx = {
+    cwd: root,
+    mode: "tui",
+    hasUI: true,
+    sessionManager: { getSessionId: () => "hk-session" },
+    getContextUsage: () => undefined,
+    isIdle: () => true,
+    ui: {
+      notify: () => {},
+      custom: () => ({ close: () => {} }),
+      setStatus: () => {},
+      setFooter: () => {},
+      onTerminalInput: () => () => {},
+    },
+  };
+  const handles = () =>
+    process.getActiveResourcesInfo().filter((r) => r === "Timeout" || r === "PipeWrap" || r === "ChildProcess");
+  try {
+    extension(pi as never);
+    const before = handles().length;
+    for (const handler of handlers.get("session_start") ?? []) await handler({}, ctx);
+    for (const handler of handlers.get("session_shutdown") ?? []) await handler({}, ctx);
+    // Past both the first-run delay and several intervals: nothing may fire.
+    await new Promise((r) => setTimeout(r, 500));
+    assert.equal(handles().length, before, "no housekeeping timer or git child pipe remains after shutdown");
+    assert.equal(
+      (existsSync(spawnLog) ? readFileSync(spawnLog, "utf8") : "").includes("worktree list"),
+      false,
+      "housekeeping started no worktree discovery before or after shutdown",
+    );
+  } finally {
+    process.env.PATH = oldPath;
+    for (const [key, value] of Object.entries(old)) {
       if (value === undefined) delete process.env[key];
       else process.env[key] = value;
     }
