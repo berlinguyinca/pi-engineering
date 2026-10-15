@@ -635,18 +635,21 @@ export function realBackends(opts: RealBackendsOptions) {
         const cwd = input.worktree ?? repo.cwd;
         const profile = await opts.verifier.detect(cwd);
         input.signal.throwIfAborted();
-        const outcome = await opts.verifier.run(cwd, profile, opts.artifacts, { signal: input.signal });
+        const firstOutcome = await opts.verifier.run(cwd, profile, opts.artifacts, { signal: input.signal });
         const judged = repo.git
           ? await subtractBaselineFailures({
               git: repo.git,
               verifier: opts.verifier,
               artifacts: opts.artifacts,
               baseSha: input.baseSha,
+              cwd,
               profile,
-              outcome,
+              outcome: firstOutcome,
               signal: input.signal,
             })
           : undefined;
+        // The judged outcome: the candidate's re-run when it had stopped at an inherited failure.
+        const outcome = judged?.outcome ?? firstOutcome;
         const passed = judged ? judged.passed : outcome.passed;
         const warnings = [...(outcome.warnings ?? []), ...(judged?.warnings ?? [])];
         const inheritedFailures = judged?.inheritedFailures ?? [];
@@ -1004,17 +1007,19 @@ export function realBackends(opts: RealBackendsOptions) {
           }
           const checks = await opts.verifier.detect(candidateCwd);
           input.signal.throwIfAborted();
-          const result = await opts.verifier.run(candidateCwd, checks, opts.artifacts, { signal: input.signal });
+          const firstResult = await opts.verifier.run(candidateCwd, checks, opts.artifacts, { signal: input.signal });
           // Failures already red on the base commit are inherited, not introduced.
           const judged = await subtractBaselineFailures({
             git: repo.git,
             verifier: opts.verifier,
             artifacts: opts.artifacts,
             baseSha: input.candidateLifecycle?.baseSha ?? (input.candidate ? undefined : base),
+            cwd: candidateCwd,
             profile: checks,
-            outcome: result,
+            outcome: firstResult,
             signal: input.signal,
           });
+          const result = judged.outcome;
           const checksPassed = judged.passed;
           const warnings = [...(result.warnings ?? []), ...judged.warnings];
           if (input.candidateLifecycle) {

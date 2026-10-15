@@ -1731,6 +1731,8 @@ describe("ExecutionBroker (spec 03)", () => {
             runValidation: async (input) => {
               validatedPath = input.worktree ?? null;
               assert.equal(await git.headCommitIn(input.worktree!), candidate.candidateSha);
+              // The candidate lifecycle's base SHA reaches the runner for the failure baseline.
+              assert.equal(input.baseSha, base);
               return {
                 executionId: "validation",
                 exitStatus: "succeeded",

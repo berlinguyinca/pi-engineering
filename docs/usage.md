@@ -370,7 +370,15 @@ stage output yields node:test TAP/spec names, otherwise per stage
 (`stage:<name>`, the command exited non-zero). A candidate whose failing ids
 all also fail on the base passes with a warning and structured
 `inheritedFailures`; any other failing id is new and fails the run. Flaky base
-failures are never forgiven. If the baseline cannot be computed (base commit
+failures are never forgiven: the base is run `PI_ENGINEERING_BASELINE_RUNS`
+times (default 2) through every stage, and a failure must occur in all of them.
+A failing stage must also end as it did on the base (same exit code, not hung),
+and a run that failed with no identifiable failure blocks. A bare test name is
+not qualified by its file, so the same name failing in two files collides. The
+base run is bounded by `PI_ENGINEERING_BASELINE_TIMEOUT_MS` (default 20
+minutes); a timed-out or environment-failed run is not cached. A candidate that
+stopped at an inherited failing stage is re-run through its later stages before
+it is judged. If the baseline cannot be computed (base commit
 unavailable, different profile, uncommitted changes) the run is judged without
 one and says so in its warnings. An integration run whose checks ran and failed
 is classified `VALIDATION_FAILED` (a code repair); `MERGE_CONFLICT` is reserved

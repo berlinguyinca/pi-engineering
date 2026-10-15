@@ -66,7 +66,11 @@ interface Fixture {
   cleanup(): Promise<void>;
 }
 
-async function fixture(files: Record<string, string>, testScript = "node --test"): Promise<Fixture> {
+async function fixture(
+  files: Record<string, string>,
+  testScript = "node --test",
+  extraScripts: Record<string, string> = {},
+): Promise<Fixture> {
   const parent = await mkdtemp(join(tmpdir(), "pi-eng-wire-"));
   const root = join(parent, "repo");
   await mkdir(root);
@@ -75,7 +79,10 @@ async function fixture(files: Record<string, string>, testScript = "node --test"
     await mkdir(dirname(join(root, path)), { recursive: true });
     await writeFile(join(root, path), content);
   };
-  await write("package.json", JSON.stringify({ name: "wire", private: true, scripts: { test: testScript } }));
+  await write(
+    "package.json",
+    JSON.stringify({ name: "wire", private: true, scripts: { ...extraScripts, test: testScript } }),
+  );
   for (const [path, content] of Object.entries(files)) await write(path, content);
   sh(root, "add", "-A");
   sh(root, "commit", "-q", "-m", "base");
@@ -187,12 +194,13 @@ describe("failure baseline wired into integration and validation (#200)", () => 
     try {
       const good = await fx.branch("good", { "src/x.js": "export const x = 1;\n" });
       await integrate(fx, [good]);
-      assert.equal(fx.verifier.baseRuns, 1);
+      // Two confirming runs (flaky detection) happen once; later rounds reuse them.
+      assert.equal(fx.verifier.baseRuns, 2);
       await validate(fx, good);
       const repair = await fx.branch("repair", { "src/y.js": "export const y = 1;\n" });
       await integrate(fx, [good, repair]);
       await validate(fx, repair);
-      assert.equal(fx.verifier.baseRuns, 1, "the baseline is computed once per base SHA");
+      assert.equal(fx.verifier.baseRuns, 2, "the baseline is computed once per base SHA");
       const cacheDir = join(await fx.git.commonDir(), "pi-engineering-baselines");
       assert.equal(readdirSync(cacheDir).filter((f) => f.endsWith(".json")).length, 1);
       assert.equal(
@@ -247,6 +255,124 @@ describe("failure baseline wired into integration and validation (#200)", () => 
         );
         assert.equal(out.inheritedFailures, undefined);
         assert.equal(existsSync(wt.path), true);
+      } finally {
+        await fx.git.removeWorktree(wt).catch(() => {});
+      }
+    } finally {
+      await fx.cleanup();
+    }
+  });
+});
+
+describe("baseline subtraction hardening (#200 review)", () => {
+  it("a candidate stopped at an inherited typecheck failure still has its later stages judged", async () => {
+    const fx = await fixture({ "test/ok.test.js": passing("stays green") }, "node --test", {
+      typecheck: 'node -e "process.exit(1)"',
+    });
+    try {
+      const bad = await fx.branch("bad", { "test/new.test.js": failing("new failure") });
+      const failed = await integrate(fx, [bad]);
+      assert.equal(failed.exitStatus, "failed", failed.summary);
+      assert.ok(!failed.inheritedFailures?.some((id) => /new failure/.test(id)));
+      const good = await fx.branch("good", { "test/more.test.js": passing("more green") });
+      const passed = await integrate(fx, [good]);
+      assert.equal(passed.exitStatus, "succeeded", passed.summary);
+      assert.deepEqual(passed.inheritedFailures, ["stage:typecheck"]);
+    } finally {
+      await fx.cleanup();
+    }
+  });
+
+  it("a test failing in only one of two base runs is flaky and never forgiven", async () => {
+    const counter = join(tmpdir(), `pi-eng-flaky-${process.pid}-${Date.now().toString(36)}`);
+    const flaky = `import test from "node:test";\nimport assert from "node:assert/strict";\nimport { existsSync, readFileSync, writeFileSync } from "node:fs";\nconst file = ${JSON.stringify(counter)};\nconst n = existsSync(file) ? Number(readFileSync(file, "utf8")) : 0;\nwriteFileSync(file, String(n + 1));\ntest("flaky one", () => assert.ok(n >= 2));\n`;
+    const fx = await fixture({ "test/flaky.test.js": flaky });
+    try {
+      const good = await fx.branch("good", { "src/x.js": "export const x = 1;\n" });
+      const out = await integrate(fx, [good]);
+      assert.equal(out.exitStatus, "failed", out.summary);
+      assert.equal(out.inheritedFailures, undefined);
+    } finally {
+      await rm(counter, { force: true });
+      await fx.cleanup();
+    }
+  });
+
+  it("a stage that fails for a different reason than on the base is not forgiven", async () => {
+    const fx = await fixture({ "check.js": "process.exit(3);\n" }, "node check.js");
+    try {
+      const worse = await fx.branch("worse", { "check.js": "process.exit(9);\n" });
+      const out = await integrate(fx, [worse]);
+      assert.equal(out.exitStatus, "failed", out.summary);
+      const same = await fx.branch("same", { "src/x.js": "export const x = 1;\n" });
+      assert.equal((await integrate(fx, [same])).exitStatus, "succeeded");
+    } finally {
+      await fx.cleanup();
+    }
+  });
+
+  it("a base run that outlives the baseline timeout falls back with a warning and is not cached", async () => {
+    const previous = process.env.PI_ENGINEERING_BASELINE_TIMEOUT_MS;
+    process.env.PI_ENGINEERING_BASELINE_TIMEOUT_MS = "1500";
+    const fx = await fixture(
+      {
+        "hang.flag": "1\n",
+        "check.js":
+          'import { existsSync } from "node:fs";\nif (existsSync("hang.flag")) setTimeout(() => {}, 60000); else process.exit(1);\n',
+      },
+      "node check.js",
+    );
+    try {
+      const broken = await fx.branch("broken", { "src/x.js": "export const x = 1;\n" });
+      sh(fx.root, "checkout", "-q", "broken");
+      sh(fx.root, "rm", "-q", "hang.flag");
+      sh(fx.root, "commit", "-q", "-m", "drop flag");
+      sh(fx.root, "checkout", "-q", "main");
+      const out = await integrate(fx, [broken]);
+      assert.equal(out.exitStatus, "failed", out.summary);
+      assert.ok(
+        out.warnings?.some((w) => /failure baseline unavailable.*timed out/i.test(w)),
+        String(out.warnings),
+      );
+      const cacheDir = join(await fx.git.commonDir(), "pi-engineering-baselines");
+      assert.ok(!existsSync(cacheDir) || readdirSync(cacheDir).length === 0);
+    } finally {
+      if (previous === undefined) process.env.PI_ENGINEERING_BASELINE_TIMEOUT_MS = undefined as never;
+      else process.env.PI_ENGINEERING_BASELINE_TIMEOUT_MS = previous;
+      if (previous === undefined) delete process.env.PI_ENGINEERING_BASELINE_TIMEOUT_MS;
+      await fx.cleanup();
+    }
+  });
+
+  it("a profile bound to the candidate checkout falls back without creating a base worktree", async () => {
+    const fx = await fixture({ "index.js": "export const ok = 1;\n" }, "echo no test specified");
+    try {
+      await writeFile(
+        join(fx.root, "package.json"),
+        JSON.stringify({ name: "scriptless", private: true, type: "module" }),
+      );
+      sh(fx.root, "add", "-A");
+      sh(fx.root, "commit", "-q", "-m", "scriptless");
+      const base = sh(fx.root, "rev-parse", "HEAD");
+      sh(fx.root, "checkout", "-q", "-b", "broken");
+      await writeFile(join(fx.root, "index.js"), "export const = ;\n");
+      sh(fx.root, "commit", "-qam", "break syntax");
+      sh(fx.root, "checkout", "-q", "main");
+      const wt = await fx.git.createWorktree(base, `cand-scriptless-${Date.now().toString(36)}`);
+      try {
+        sh(wt.path, "merge", "-q", "--no-edit", "broken");
+        const out = await fx.backends.validation.runValidation({
+          objective: "validate",
+          worktree: wt.path,
+          baseSha: base,
+          signal: new AbortController().signal,
+        });
+        assert.equal(out.exitStatus, "failed");
+        assert.ok(
+          out.warnings?.some((w) => /bound to the candidate checkout/.test(w)),
+          String(out.warnings),
+        );
+        assert.equal(fx.verifier.baseRuns, 0);
       } finally {
         await fx.git.removeWorktree(wt).catch(() => {});
       }
