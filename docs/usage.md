@@ -358,6 +358,24 @@ When Pi exits — normally or on an uncaught exception — every running
 verification group is killed; a `SIGKILL` of Pi itself cannot run that cleanup,
 so a group can outlive it in that one case.
 
+### Failures that were already red on the base
+
+Integration and validation judge a candidate by the failures it introduces. When
+a candidate's checks fail, the same profile is run once on the commit the
+candidate was built on (a temporary worktree, never the shared checkout) and
+the result is cached per (base SHA, profile hash) under the repository's
+`pi-engineering-baselines` git directory, so it runs once per base, not once per
+round. A failure is identified per test name (`test:<stage> » <name>`) when the
+stage output yields node:test TAP/spec names, otherwise per stage
+(`stage:<name>`, the command exited non-zero). A candidate whose failing ids
+all also fail on the base passes with a warning and structured
+`inheritedFailures`; any other failing id is new and fails the run. Flaky base
+failures are never forgiven. If the baseline cannot be computed (base commit
+unavailable, different profile, uncommitted changes) the run is judged without
+one and says so in its warnings. An integration run whose checks ran and failed
+is classified `VALIDATION_FAILED` (a code repair); `MERGE_CONFLICT` is reserved
+for an actual merge conflict.
+
 ## Verifiable roadmap completion
 
 `node scripts/pi-engineering.ts roadmap check` (or `npm run roadmap:check`)

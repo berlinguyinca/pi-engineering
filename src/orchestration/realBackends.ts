@@ -20,6 +20,7 @@ import type { CandidateLifecycle, GitRepo, IntegrationRunRecord } from "../git/G
 import type { WorktreeInfo } from "../git/GitRepo.ts";
 import { type ModelRef, modelKey } from "../lifecycle/types.ts";
 import { NO_TARGETS_WARNING, type VerificationProvider } from "../verify/Verifier.ts";
+import { subtractBaselineFailures } from "../verify/baselineSubtraction.ts";
 import { MODEL_SUPERSEDED } from "../workers/WorkerExecutor.ts";
 import type { WorkerActivity, WorkerExecutor, WorkerRequest, WorkerRun } from "../workers/WorkerExecutor.ts";
 import {
@@ -623,15 +624,32 @@ export function realBackends(opts: RealBackendsOptions) {
         repoId?: string;
         objective: string;
         worktree?: string | null;
+        /** The commit the candidate was built on; failures already red there are inherited, not introduced. */
+        baseSha?: string;
         testRequirement?: string;
         signal: AbortSignal;
         onActivity?: (event: WorkerActivity) => void;
       }): Promise<ExecutionOutcome> {
         input.signal.throwIfAborted();
-        const cwd = input.worktree ?? (await repository(input.repoId)).cwd;
+        const repo = await repository(input.repoId);
+        const cwd = input.worktree ?? repo.cwd;
         const profile = await opts.verifier.detect(cwd);
         input.signal.throwIfAborted();
         const outcome = await opts.verifier.run(cwd, profile, opts.artifacts, { signal: input.signal });
+        const judged = repo.git
+          ? await subtractBaselineFailures({
+              git: repo.git,
+              verifier: opts.verifier,
+              artifacts: opts.artifacts,
+              baseSha: input.baseSha,
+              profile,
+              outcome,
+              signal: input.signal,
+            })
+          : undefined;
+        const passed = judged ? judged.passed : outcome.passed;
+        const warnings = [...(outcome.warnings ?? []), ...(judged?.warnings ?? [])];
+        const inheritedFailures = judged?.inheritedFailures ?? [];
         const artifactRefs = outcome.evidence.flatMap((e) => e.artifacts).filter(Boolean);
         const artifactState = await artifactContentHashes(opts.artifacts, artifactRefs);
         // A repo with no detectable checks: nothing ran, nothing FAILED. It
@@ -640,15 +658,17 @@ export function realBackends(opts: RealBackendsOptions) {
         const testsRequired = outcome.noTargets ? input.testRequirement : undefined;
         return {
           executionId: "validation",
-          exitStatus: outcome.passed && !testsRequired ? "succeeded" : "failed",
+          exitStatus: passed && !testsRequired ? "succeeded" : "failed",
           ...(testsRequired ? { error: testsRequired } : {}),
           summary: testsRequired
             ? testsRequired
             : outcome.noTargets
               ? `validation passed with warning: ${NO_TARGETS_WARNING}`
-              : outcome.passed
-                ? `validation passed (${outcome.stages.length} stages)`
+              : passed
+                ? `validation passed (${outcome.stages.length} stages)${inheritedFailures.length ? `; warning: ${warnings.join("; ")}` : ""}`
                 : `validation failed at ${outcome.failedStage ?? "unknown"}`,
+          warnings,
+          ...(inheritedFailures.length ? { inheritedFailures } : {}),
           artifactRefs,
           artifactHashes: artifactState.hashes,
           usage: { stages: outcome.stages.length },
@@ -656,8 +676,7 @@ export function realBackends(opts: RealBackendsOptions) {
             command:
               profile.stages.map((stage) => [stage.command, ...stage.args].join(" ")).join(" && ") || "<no-target>",
             profile: profile.name,
-            exitCode:
-              outcome.passed && !outcome.noTargets ? 0 : (outcome.stages.find((stage) => !stage.passed)?.exitCode ?? 1),
+            exitCode: passed && !outcome.noTargets ? 0 : (outcome.stages.find((stage) => !stage.passed)?.exitCode ?? 1),
             testSummary: {
               stages: outcome.stages.map((stage) => ({
                 name: stage.stage.name,
@@ -665,7 +684,8 @@ export function realBackends(opts: RealBackendsOptions) {
                 passed: stage.passed,
               })),
               failedStage: outcome.failedStage,
-              warnings: outcome.warnings ?? [],
+              warnings,
+              ...(inheritedFailures.length ? { inheritedFailures } : {}),
             },
             noTargets: outcome.noTargets,
             accessible: artifactState.allAccessible,
@@ -985,11 +1005,23 @@ export function realBackends(opts: RealBackendsOptions) {
           const checks = await opts.verifier.detect(candidateCwd);
           input.signal.throwIfAborted();
           const result = await opts.verifier.run(candidateCwd, checks, opts.artifacts, { signal: input.signal });
+          // Failures already red on the base commit are inherited, not introduced.
+          const judged = await subtractBaselineFailures({
+            git: repo.git,
+            verifier: opts.verifier,
+            artifacts: opts.artifacts,
+            baseSha: input.candidateLifecycle?.baseSha ?? (input.candidate ? undefined : base),
+            profile: checks,
+            outcome: result,
+            signal: input.signal,
+          });
+          const checksPassed = judged.passed;
+          const warnings = [...(result.warnings ?? []), ...judged.warnings];
           if (input.candidateLifecycle) {
             await repo.git.completeCandidateCheck(
               input.candidateLifecycle,
               "integration-verifier",
-              result.passed,
+              checksPassed,
               input.authority,
               input.integrationRun,
             );
@@ -1003,15 +1035,18 @@ export function realBackends(opts: RealBackendsOptions) {
           const testsRequired = result.noTargets ? input.testRequirement : undefined;
           const checkFailure =
             testsRequired ??
-            (result.passed ? undefined : `verification failed at stage: ${result.failedStage ?? "unknown"}`);
-          const warningNote = result.warnings?.length ? `; warning: ${result.warnings.join("; ")}` : "";
+            (checksPassed ? undefined : `verification failed at stage: ${result.failedStage ?? "unknown"}`);
+          const warningNote = warnings.length ? `; warning: ${warnings.join("; ")}` : "";
           return {
             executionId: "integration",
             exitStatus: checkFailure ? "failed" : "succeeded",
             summary: `integrated ${merged.join(", ") || "nothing"}${recoveredNote} into ${target.branch}; checks: ${checkFailure ? "fail" : "pass"}${warningNote}`,
             ...(checkFailure ? { error: checkFailure } : {}),
             noTargets: result.noTargets,
-            warnings: result.warnings ?? [],
+            warnings,
+            ...(judged.inheritedFailures.length ? { inheritedFailures: judged.inheritedFailures } : {}),
+            // The verifier ran stages and they failed: a code defect, not a merge conflict.
+            ...(checkFailure && !testsRequired && !result.noTargets ? { checksFailed: true } : {}),
             artifactRefs,
             artifactHashes: artifactState.hashes,
             usage: {

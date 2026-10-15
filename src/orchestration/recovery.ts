@@ -293,6 +293,16 @@ const GATE_INFRASTRUCTURE_CATEGORIES: ReadonlySet<FailureCategory> = new Set([
 ]);
 
 /**
+ * An integration run whose verification stages ran and failed (no conflict).
+ * The structured flag decides; the runner's own failure text is the fallback
+ * for an outcome that lost the flag in persistence.
+ */
+function integrationChecksFailed(outcome: ExecutionOutcome | undefined): boolean {
+  if (!outcome || outcome.exitStatus === "conflict") return false;
+  return outcome.checksFailed === true || /^verification failed at stage:/.test(outcome.error ?? "");
+}
+
+/**
  * Whether a failed gate task actually ran and reported a verdict about the
  * candidate: a review verdict with request_changes or blocking findings, a
  * validation run whose checks exited non-zero, or a real merge conflict.
@@ -321,6 +331,7 @@ export function gateReportedVerdict(
     const validation = outcome?.validationEvidence;
     if (validation) return validation.accessible && !validation.noTargets && validation.exitCode !== 0;
   } else if (kind === "integration") {
+    if (integrationChecksFailed(outcome)) return true;
     if (outcome?.exitStatus === "conflict" || /conflict/i.test(evidence.summary)) return true;
   }
   // Judge the backend's own words, not a "backend reported ..." wrapper.
@@ -361,7 +372,10 @@ export function classifyGateFailure(
 ): FailureClassification {
   const gateCategory = GATE_FAILURE_CATEGORY[kind];
   if (gateCategory && gateReportedVerdict(classifier, kind, evidence, outcome)) {
-    return classifier.classify({ ...evidence, category: gateCategory });
+    // Integration checks that ran and failed are a defect in the code (repair
+    // it); MERGE_CONFLICT (rebuild the candidate) is only for a real conflict.
+    const category = kind === "integration" && integrationChecksFailed(outcome) ? "VALIDATION_FAILED" : gateCategory;
+    return classifier.classify({ ...evidence, category });
   }
   const inferred = classifier.classify(evidence);
   return gateCategory && inferred.category === "INVALID_WORKER_OUTPUT"

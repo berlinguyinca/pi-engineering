@@ -122,6 +122,10 @@ export interface ExecutionOutcome {
   noTargets?: boolean;
   /** Non-blocking verifier warnings (e.g. no verification targets detected). */
   warnings?: string[];
+  /** Failure ids that also fail on the candidate's base commit and were not charged to the candidate. */
+  inheritedFailures?: string[];
+  /** Integration only: verification stages ran and failed (a code defect, not a merge conflict). */
+  checksFailed?: boolean;
   artifactRefs: string[];
   usage: Record<string, unknown>;
   findings?: Array<Record<string, unknown>>;
@@ -355,6 +359,8 @@ export interface ValidationRunner {
     repoId?: string;
     objective: string;
     worktree?: string | null;
+    /** The commit the candidate was built on; failures already red there are inherited. */
+    baseSha?: string;
     testRequirement?: string;
     signal: AbortSignal;
   }): Promise<ExecutionOutcome>;
@@ -3614,7 +3620,8 @@ export class ExecutionBroker {
       case "validation": {
         const runner = this.backends.validation;
         if (!runner) throw new Error("no validation backend registered");
-        const candidatePath = this.missionCandidates.get(input.missionId)?.lifecycle.path;
+        const candidateLifecycle = this.missionCandidates.get(input.missionId)?.lifecycle;
+        const candidatePath = candidateLifecycle?.path;
         if (input.repoId && runner.candidateScoped === true && !candidatePath) {
           throw new Error("CANDIDATE_UNAVAILABLE: validation cannot fall back to the incumbent checkout");
         }
@@ -3623,6 +3630,7 @@ export class ExecutionBroker {
             repoId: input.repoId,
             objective: input.objective,
             worktree: candidatePath ?? base.worktree,
+            ...(candidateLifecycle?.baseSha ? { baseSha: candidateLifecycle.baseSha } : {}),
             testRequirement: input.testRequirement,
             signal,
           }),
