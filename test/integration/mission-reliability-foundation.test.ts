@@ -86,14 +86,7 @@ async function checkpointModelProbe(): Promise<{
         return;
       }
       if (requests === 2) {
-        const candidateSha = body.match(/[0-9a-f]{40}/g)?.at(-1);
-        assert.ok(candidateSha, `bash tool result did not expose a candidate SHA: ${body.slice(-1000)}`);
-        modelTool(res, "checkpoint_progress", {
-          claims: [
-            { deliverable: "one", candidate_sha: candidateSha, evidence_paths: ["src/one.js"] },
-            { deliverable: "two", candidate_sha: candidateSha, evidence_paths: ["src/two.js"] },
-          ],
-        });
+        modelTool(res, "claim_deliverable", { deliverables: [" ONE ", "two"] });
         return;
       }
       res.writeHead(200, { "content-type": "text/event-stream" });
@@ -588,6 +581,7 @@ describe("mission reliability foundation — synthetic MSN-qSLaeM", () => {
             }
             assert.ok(request.recovery, "replacement worker receives store-verified checkpoint recovery context");
             assert.match(request.task, /remaining deliverable three/i);
+            assert.match(request.task, /src\/one\.js/, "replacement is told what the branch already holds");
             await writeFile(join(request.cwd, "src", "three.js"), "export const three = 3;\n");
             return {
               result: {
@@ -702,7 +696,7 @@ describe("mission reliability foundation — synthetic MSN-qSLaeM", () => {
           }),
         );
         assert.deepEqual(checkpoint.remainingDeliverables, ["three"]);
-        assert.ok(modelProbe.requests() >= 3, "the real Pi executor reached checkpoint_progress before timing out");
+        assert.ok(modelProbe.requests() >= 3, "the real Pi executor reached claim_deliverable before timing out");
         releaseLate();
         // Poll (not a fixed sleep) for the durable late-result-rejection event so
         // a slow CI runner does not flake on a 100ms race: keep sampling the event

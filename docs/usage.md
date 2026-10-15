@@ -353,6 +353,19 @@ restart.
 | `/roadmap-status` | Show derived Roadmap 1.0 completion status for this repository. |
 | `/engineering admission` | Show a live InferWeave admission-retry summary (retries, waited time, reasons, saturation). |
 
+## Mission worker tools
+
+Mission implementer and repair workers get `read`, `edit`, `write`, `bash`,
+`repo_search` and `tests_for`. `read` prefixes every line with its line number.
+`edit` first tries Pi's exact match; if that misses, it retries with
+whitespace-normalised matching (trailing whitespace, indentation width, CRLF)
+and applies the edit when exactly one place matches, re-indenting the
+replacement to the file. When nothing or several places match, the error quotes
+the closest candidate lines with line numbers. Implementers have no ledger,
+artifact or `checkpoint_progress` tools: they commit when a step is done, and
+the broker harvests uncommitted work and derives the checkpoint from the branch.
+Scouts and reviewers keep their read-only semantic tools.
+
 ## Tool-call guard
 
 The extension guards the session's own tool calls (`src/guard/toolCallGuard.ts`,

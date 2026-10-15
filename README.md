@@ -540,10 +540,12 @@ an actionable stopped mission under the same ID: it fences stale ownership,
 reconciles side effects, preserves completed checkpoint work, and schedules
 only the remaining deliverables. A late old-worker result is retained as audit
 evidence and cannot change task, candidate, gate, or repository state.
-Checkpoint completion is accepted only through the production
-`checkpoint_progress` tool: each declared deliverable must name the exact
-current candidate SHA and committed evidence paths present in the broker's own
-Git snapshot. Any artifact URI is resolved through the runtime artifact store;
+Mission workers do not report checkpoints: the broker derives them from the
+worker branch (it harvests uncommitted edits into a commit before the final
+checkpoint), so the candidate SHA and committed paths always come from the
+broker's own Git snapshot. A `checkpoint_progress` claim, when a caller still
+offers that tool, must name the exact current candidate SHA and committed
+evidence paths present in that snapshot. Any artifact URI is resolved through the runtime artifact store;
 missing, unreadable, or invented references reject the claim, while accepted
 references are copied to unique checkpoint-owned, content-addressed URIs with
 one aligned SHA-256 content hash each. Equal-content claims remain distinct.

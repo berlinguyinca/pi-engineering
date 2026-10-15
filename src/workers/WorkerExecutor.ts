@@ -90,6 +90,11 @@ export interface WorkerRequest {
   isolatedWorktree?: boolean;
   /** Store-verified immutable checkpoint context for a fresh recovery worker. */
   recovery?: Readonly<CheckpointRecoveryContext>;
+  /**
+   * Replace the built-in `read`/`edit` with the line-numbered `read` and the
+   * whitespace-tolerant `edit` (mission workers; see tolerantFileTools.ts).
+   */
+  tolerantFileTools?: boolean;
   /** Broker-declared deliverables eligible for candidate-bound checkpoint progress. */
   deliverables?: readonly string[];
   /** Live bounded activity; never includes prompts, model text, tool arguments, or secrets. */

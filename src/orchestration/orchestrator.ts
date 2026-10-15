@@ -258,6 +258,14 @@ const MAX_READOPTIONS = 2;
 /** Content hash of an empty diff: a candidate identical to its base. */
 const EMPTY_DIFF_HASH = `sha256:${createHash("sha256").update("").digest("hex")}`;
 
+/** Tell a replacement worker what the failed attempt's branch already holds, so it finishes only what is missing. */
+function committedNote(checkpoint: { committedChanges: readonly string[] } | undefined): string {
+  const paths = checkpoint?.committedChanges ?? [];
+  if (paths.length === 0) return "";
+  const shown = paths.slice(0, 20).join(", ");
+  return `. The failed attempt's branch already committed: ${shown}${paths.length > 20 ? `, and ${paths.length - 20} more` : ""}. Inspect the branch and finish only what is missing.`;
+}
+
 export class Orchestrator {
   readonly store: MissionStore;
   readonly broker: ExecutionBroker;
@@ -919,7 +927,7 @@ export class Orchestrator {
             role,
             objective: createsRepair
               ? `Repair the repository defect exposed by ${failed.kind}: ${failed.objective}. Then leave the candidate ready for fresh gates.`
-              : `Recover ${failed.objective}: complete remaining deliverable ${deliverable}`,
+              : `Recover ${failed.objective}: complete remaining deliverable ${deliverable}${committedNote(checkpoint)}`,
             depends_on: [...failed.depends_on],
             priority: failed.priority,
             mutates_repo: mutatesRepo,

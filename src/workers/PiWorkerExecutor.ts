@@ -91,10 +91,12 @@ import {
 } from "./activity.ts";
 import { BuildCommandTimer } from "./buildActivity.ts";
 import { CHECKPOINT_PROGRESS_TOOL_NAME, createCheckpointProgressTool } from "./checkpointProgressTool.ts";
+import { CLAIM_DELIVERABLE_TOOL_NAME, createClaimDeliverableTool } from "./claimDeliverableTool.ts";
 import { registerLocalProviders } from "./localProviders.ts";
 import { WORKER_KICKOFF, buildSystemPrompt, wantsCommitDiscipline } from "./prompts.ts";
 import { guardRuntimeRequestBody } from "./requestBodyGuard.ts";
 import { StreamStallWatchdog, isStalledStream } from "./streamStall.ts";
+import { createNumberedReadTool, createTolerantEditTool } from "./tolerantFileTools.ts";
 import { workerResultTool } from "./workerResultTool.ts";
 
 /**
@@ -487,7 +489,9 @@ ${TOOL_TRANSITION_RULE}`;
     const terminating = req.resultTool === "review_result" ? reviewResultTool : workerResultTool;
     const customTools = [
       ...this.customTools,
-      ...(req.deliverables?.length ? [createCheckpointProgressTool(req.deliverables)] : []),
+      ...(req.tolerantFileTools ? [createNumberedReadTool(req.cwd), createTolerantEditTool(req.cwd)] : []),
+      ...(offersClaimDeliverable(req) ? [createClaimDeliverableTool(req.deliverables ?? [])] : []),
+      ...(offersCheckpointProgress(req) ? [createCheckpointProgressTool(req.deliverables ?? [])] : []),
       terminating,
     ];
     const tools = [...new Set([...req.tools, ...customTools.map((t) => t.name)])];
@@ -1240,10 +1244,19 @@ ${recovery.recoveryPrompt}`;
         });
       }
       const activityToolName = "toolName" in event ? event.toolName : undefined;
-      if (activity && activityToolName !== terminatingName && activityToolName !== CHECKPOINT_PROGRESS_TOOL_NAME) {
+      if (
+        activity &&
+        activityToolName !== terminatingName &&
+        activityToolName !== CHECKPOINT_PROGRESS_TOOL_NAME &&
+        activityToolName !== CLAIM_DELIVERABLE_TOOL_NAME
+      ) {
         emitWorkerActivity(req, activity);
       }
-      if (event.type === "tool_execution_end" && event.toolName === CHECKPOINT_PROGRESS_TOOL_NAME && !event.isError) {
+      if (
+        event.type === "tool_execution_end" &&
+        (event.toolName === CHECKPOINT_PROGRESS_TOOL_NAME || event.toolName === CLAIM_DELIVERABLE_TOOL_NAME) &&
+        !event.isError
+      ) {
         const details = event.result?.details as { claims?: unknown } | undefined;
         emitWorkerActivity(req, {
           kind: "checkpoint",
@@ -1702,12 +1715,17 @@ export function buildCompactedWorkerPrompt(req: WorkerRequest, recoveryPrompt: s
   // the user's own checkout, to commit.
   if (wantsCommitDiscipline(req.role, req)) {
     parts.push(
-      "- Commit your work on the current branch after each coherent change. If your session is terminated by the time budget, only your own commits are recovered; uncommitted edits at that point are not merged. Never switch branches, rebase, amend others' commits, or push.",
+      "- Commit when a coherent step is done; uncommitted work is harvested automatically. Never switch branches, rebase, amend others' commits, or push.",
     );
   }
-  if (req.deliverables?.length) {
+  if (offersCheckpointProgress(req)) {
     parts.push(
-      `- Declared checkpoint deliverables: ${req.deliverables.map((d) => `"${d}"`).join(", ")}. After a coherent commit, call checkpoint_progress claiming the deliverable with the EXACT declared string (no paraphrasing) plus the exact git rev-parse HEAD and committed evidence paths.`,
+      `- Declared checkpoint deliverables: ${(req.deliverables ?? []).map((d) => `"${d}"`).join(", ")}. After a coherent commit, call checkpoint_progress claiming the deliverable with the EXACT declared string (no paraphrasing) plus the exact git rev-parse HEAD and committed evidence paths.`,
+    );
+  }
+  if (offersClaimDeliverable(req)) {
+    parts.push(
+      `- Declared deliverables: ${(req.deliverables ?? []).map((d) => `"${d}"`).join(", ")}. When one is finished, call claim_deliverable with its name.`,
     );
   }
   parts.push(`- Your final action MUST be calling the worker_result tool.`);
@@ -1729,9 +1747,21 @@ export function withIdempotencyEvidence(prompt: string, tracker: ExecutedActionT
   return `${prompt}\n\n${evidence}`;
 }
 
+/**
+ * `checkpoint_progress` is opt-in by name. Mission workers do not get it: the
+ * broker derives checkpoints from the worker branch's commits.
+ */
+function offersClaimDeliverable(req: WorkerRequest): boolean {
+  return !!req.deliverables?.length && req.tools.includes(CLAIM_DELIVERABLE_TOOL_NAME);
+}
+
+function offersCheckpointProgress(req: WorkerRequest): boolean {
+  return !!req.deliverables?.length && req.tools.includes(CHECKPOINT_PROGRESS_TOOL_NAME);
+}
+
 export function workerContext(req: WorkerRequest): string | undefined {
-  const checkpoint = req.deliverables?.length
-    ? `Declared checkpoint deliverables: ${req.deliverables.map((d) => `"${d}"`).join(", ")}. After each coherent commit, run git rev-parse HEAD and call checkpoint_progress with the completed deliverable (using its EXACT declared string, no paraphrasing), that exact candidate SHA, and committed evidence paths.`
+  const checkpoint = offersCheckpointProgress(req)
+    ? `Declared checkpoint deliverables: ${(req.deliverables ?? []).map((d) => `"${d}"`).join(", ")}. After each coherent commit, run git rev-parse HEAD and call checkpoint_progress with the completed deliverable (using its EXACT declared string, no paraphrasing), that exact candidate SHA, and committed evidence paths.`
     : undefined;
   if (!req.recovery) return [req.context, checkpoint].filter(Boolean).join("\n\n") || undefined;
   const durable = durableRecoveryContext(req)!;

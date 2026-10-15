@@ -57,6 +57,7 @@ async function cancellationCheckpointFixture(
   runAgent: NonNullable<BrokerBackends["agent"]>["runAgent"],
   cancellationAckTimeoutMs = 5_000,
   checkpoints?: CheckpointManager,
+  deliverables: string[] = ["implementation"],
 ) {
   const fx = await makeFixtureRepo();
   const git = await GitRepo.open(fx.root);
@@ -98,7 +99,7 @@ async function cancellationCheckpointFixture(
     mutates_repo: true,
     isolation: "worktree",
     write_domains: ["src/**"],
-    deliverables: ["implementation"],
+    deliverables,
     execution_budget_ms: 10_000,
     checkpoint_policy: { activity_milestone: 10, before_deadline_ms: 1_000 },
   });
@@ -3191,6 +3192,133 @@ describe("ExecutionBroker (spec 03)", () => {
       assert.deepEqual(seenHandoffs, []);
     } finally {
       await fx.cleanup();
+    }
+  });
+
+  describe("tip-bound deliverable claims", () => {
+    type Step = { commit: string } | { claim: string[] };
+    async function failedWorkerCheckpoint(deliverables: string[], steps: Step[]) {
+      const context = await cancellationCheckpointFixture(
+        async ({ worktree, onActivity }) => {
+          assert.ok(worktree);
+          for (const step of steps) {
+            if ("commit" in step) {
+              await writeFile(join(worktree, step.commit), `export const x = "${step.commit}";\n`, "utf8");
+              await exec("git", ["-C", worktree, "add", "-A"]);
+              await exec("git", [
+                "-C",
+                worktree,
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "-m",
+                step.commit,
+              ]);
+            } else {
+              for (const deliverable of step.claim) {
+                onActivity?.({
+                  kind: "checkpoint",
+                  summary: "claim",
+                  meaningfulProgress: true,
+                  claims: [{ deliverable, candidateSha: "", evidencePaths: [], artifactRefs: [], tipBound: true }],
+                });
+              }
+            }
+          }
+          return { executionId: "e", exitStatus: "failed", summary: "stopped", artifactRefs: [], usage: {} };
+        },
+        5_000,
+        undefined,
+        deliverables,
+      );
+      try {
+        await context.handle.result().catch(() => undefined);
+        const execution = context.store.getExecution(context.handle.executionId)!;
+        return context.store.getTaskCheckpoint(execution.checkpoint_id!)!;
+      } finally {
+        await context.fx.cleanup();
+      }
+    }
+
+    it("does not accept a claim for a deliverable when only another deliverable's path is committed", async () => {
+      const checkpoint = await failedWorkerCheckpoint(
+        ["one", "two"],
+        [{ commit: "src/one.ts" }, { claim: ["one", "two"] }],
+      );
+      assert.deepEqual([...checkpoint.completedDeliverables], ["one"]);
+      assert.deepEqual([...checkpoint.remainingDeliverables], ["two"]);
+    });
+
+    it("accepts the claim once a second commit adds a new path", async () => {
+      const checkpoint = await failedWorkerCheckpoint(
+        ["one", "two"],
+        [{ commit: "src/one.ts" }, { claim: ["one"] }, { commit: "src/two.ts" }, { claim: ["two"] }],
+      );
+      assert.deepEqual([...checkpoint.completedDeliverables].sort(), ["one", "two"]);
+    });
+
+    it("accepts only as many bulk-claimed deliverables as there are new committed paths", async () => {
+      const checkpoint = await failedWorkerCheckpoint(
+        ["one", "two", "three"],
+        [{ commit: "src/one.ts" }, { claim: ["one", "two", "three"] }],
+      );
+      assert.deepEqual([...checkpoint.completedDeliverables], ["one"]);
+      assert.deepEqual([...checkpoint.remainingDeliverables], ["two", "three"]);
+    });
+  });
+
+  it("harvests and checkpoints a succeeded worker that edited files but never committed", async () => {
+    const context = await cancellationCheckpointFixture(async ({ worktree }) => {
+      assert.ok(worktree);
+      await writeFile(join(worktree, "src", "uncommitted.ts"), "export const uncommitted = true;\n", "utf8");
+      return { executionId: "e", exitStatus: "succeeded", summary: "edited only", artifactRefs: [], usage: {} };
+    });
+    try {
+      await context.handle.result();
+      const execution = context.store.getExecution(context.handle.executionId)!;
+      const checkpoint = context.store.getTaskCheckpoint(execution.checkpoint_id!);
+      assert.ok(checkpoint, "a checkpoint must be recorded");
+      assert.notEqual(checkpoint.candidateSha, context.mission.base_ref, "checkpoint must carry the harvested commit");
+      assert.ok(
+        checkpoint.committedChanges.includes("src/uncommitted.ts"),
+        `checkpoint must list the harvested file, got ${checkpoint.committedChanges.join(",")}`,
+      );
+      assert.deepEqual(checkpoint.preservedUncommittedChanges, []);
+      assert.deepEqual([...checkpoint.completedDeliverables], ["implementation"]);
+      const findings = context.store.listFindings(context.mission.mission_id);
+      assert.ok(
+        !findings.some((f) => f.summary.includes("held no committed work")),
+        "an edit-only worker must not be reported as empty",
+      );
+    } finally {
+      await context.fx.cleanup();
+    }
+  });
+
+  it("fails a worker that writes outside its write domain with WORKSPACE_SCOPE_MISMATCH and never harvests the write", async () => {
+    const context = await cancellationCheckpointFixture(async ({ worktree }) => {
+      assert.ok(worktree);
+      await writeFile(join(worktree, "src", "allowed.ts"), "export const allowed = true;\n", "utf8");
+      await writeFile(join(worktree, "excluded.txt"), "outside the write domain\n", "utf8");
+      return { executionId: "e", exitStatus: "succeeded", summary: "wrote", artifactRefs: [], usage: {} };
+    });
+    try {
+      const outcome = await context.handle
+        .result()
+        .catch((error: Error) => ({ exitStatus: "failed", summary: error.message }));
+      assert.equal(outcome.exitStatus, "failed");
+      assert.match(outcome.summary, /WORKSPACE_SCOPE_MISMATCH/);
+      const log = await exec("git", ["-C", context.fx.root, "log", "--all", "--format=%s"]);
+      assert.ok(!log.stdout.includes("orchestration work"), `no harvest commit may exist, got: ${log.stdout}`);
+      const execution = context.store.getExecution(context.handle.executionId)!;
+      const checkpoint = execution.checkpoint_id ? context.store.getTaskCheckpoint(execution.checkpoint_id) : undefined;
+      assert.ok(!checkpoint?.committedChanges.includes("excluded.txt"));
+      assert.deepEqual([...(checkpoint?.completedDeliverables ?? [])], []);
+    } finally {
+      await context.fx.cleanup();
     }
   });
 

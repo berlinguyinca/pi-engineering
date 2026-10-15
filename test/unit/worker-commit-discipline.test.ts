@@ -18,15 +18,11 @@ const MUTATING = ["implementer", "debugger", "test-generator", "clean-room-chall
 const ISOLATED = { isolatedWorktree: true };
 
 describe("commit discipline in the system prompt", () => {
-  it("mutating roles in an isolated worktree are told to commit after every coherent unit", () => {
+  it("mutating roles in an isolated worktree are told to commit when a coherent step is done", () => {
     for (const role of MUTATING) {
       const prompt = buildSystemPrompt(role, "change the widget", undefined, ISOLATED);
       assert.match(prompt, /Commit discipline/, role);
-      assert.match(
-        prompt,
-        /If your session is terminated by the time budget, only your own commits are recovered; uncommitted edits at that point are not merged\./,
-        role,
-      );
+      assert.match(prompt, /Commit when a coherent step is done; uncommitted work is harvested automatically\./, role);
       for (const forbidden of [/never switch branches/i, /rebase/i, /amend/i, /push/i]) {
         assert.match(prompt, forbidden, `${role}: ${forbidden}`);
       }
@@ -59,12 +55,15 @@ describe("commit discipline in the compacted (recovery) prompt", () => {
   });
 
   it("carries the rule for a mutating role in an isolated worktree", () => {
-    assert.match(buildCompactedWorkerPrompt(req("implementer", true), null), /[Cc]ommit your work/);
+    assert.match(buildCompactedWorkerPrompt(req("implementer", true), null), /[Cc]ommit when a coherent step is done/);
   });
 
   it("omits it for a reviewer, and for a mutating role outside an isolated worktree", () => {
-    assert.doesNotMatch(buildCompactedWorkerPrompt(req("reviewer", true), null), /[Cc]ommit your work/);
-    assert.doesNotMatch(buildCompactedWorkerPrompt(req("implementer"), null), /[Cc]ommit your work/);
+    assert.doesNotMatch(
+      buildCompactedWorkerPrompt(req("reviewer", true), null),
+      /[Cc]ommit when a coherent step is done/,
+    );
+    assert.doesNotMatch(buildCompactedWorkerPrompt(req("implementer"), null), /[Cc]ommit when a coherent step is done/);
   });
 });
 

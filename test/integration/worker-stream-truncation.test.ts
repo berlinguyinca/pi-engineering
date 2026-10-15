@@ -163,7 +163,7 @@ test("worker: the production checkpoint tool emits candidate-bound progress for 
       const run = await executor.run({
         role: "implementer",
         task: "implement and test",
-        tools: [],
+        tools: ["checkpoint_progress"],
         cwd,
         deliverables: ["implementation", "tests", "docs"],
         isolatedWorktree: true,

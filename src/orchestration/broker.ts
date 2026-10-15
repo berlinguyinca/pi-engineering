@@ -2566,6 +2566,10 @@ export class ExecutionBroker {
           } | null = null;
           let meaningfulActivity = 0;
           const completedDeliverables = new Set<string>();
+          // Tip-bound claims: the committed path attributed to each accepted
+          // deliverable. A path backs one deliverable only, so a claim needs a
+          // committed path no earlier claim already used.
+          const tipBoundEvidence = new Map<string, string>();
           const checkpointClaims = new Map<string, CheckpointProgressClaim>();
           const capturedCheckpointArtifacts = new Map<string, { refs: string[]; hashes: string[] }>();
           const rejectedCheckpointClaims = new Set<string>();
@@ -2611,7 +2615,30 @@ export class ExecutionBroker {
             assertOrigin();
             const snapshot = await this.checkpointSnapshot(execution.execution_id, input, repository, assertOrigin);
             assertOrigin();
-            for (const claim of checkpointClaims.values()) {
+            for (const rawClaim of checkpointClaims.values()) {
+              // A tip-bound claim (claim_deliverable) names only the deliverable:
+              // sha and paths come from this snapshot. It counts only once the
+              // worker branch holds a committed path no earlier claim used; until
+              // then it waits for a later checkpoint instead of being rejected.
+              let tipEvidence: string | undefined;
+              if (rawClaim.tipBound) {
+                tipEvidence =
+                  tipBoundEvidence.get(rawClaim.deliverable) ??
+                  (snapshot.candidateSha === null
+                    ? undefined
+                    : snapshot.committedChanges.find((path) => ![...tipBoundEvidence.values()].includes(path)));
+                if (tipEvidence === undefined) continue;
+                tipBoundEvidence.set(rawClaim.deliverable, tipEvidence);
+              }
+              const claim: CheckpointProgressClaim =
+                rawClaim.tipBound && tipEvidence !== undefined
+                  ? {
+                      deliverable: rawClaim.deliverable,
+                      candidateSha: snapshot.candidateSha ?? "",
+                      evidencePaths: [tipEvidence],
+                      artifactRefs: [],
+                    }
+                  : rawClaim;
               const claimIdentity = `${claim.deliverable}:${claim.candidateSha}:${claim.evidencePaths.join(",")}:${claim.artifactRefs.join(",")}`;
               let captured = capturedCheckpointArtifacts.get(claimIdentity);
               let artifactsValid = claim.artifactRefs.length === 0;
@@ -3005,8 +3032,21 @@ export class ExecutionBroker {
                 };
               }
             }
+            // A worker that edits files and never commits is harvested BEFORE
+            // the final checkpoint, so the checkpoint names the harvested commit
+            // and its paths instead of a stale pre-harvest HEAD with the work
+            // listed as uncommitted. Checkpoints are derived from the branch,
+            // not from worker-reported claims.
+            let earlyHarvest: Awaited<ReturnType<typeof this.harvestWorktree>> | undefined;
+            if (outcome.exitStatus === "succeeded" && input.mutatesRepo && worktree && escaped.length === 0) {
+              input.authority?.assertAuthoritative();
+              this.store.assertExecutionAuthoritative(execution.execution_id);
+              earlyHarvest = await this.harvestWorktree(execution.execution_id, input.authority);
+            }
             queueCheckpoint(
-              outcome.exitStatus === "succeeded" ? [...(input.deliverables ?? [])] : [],
+              outcome.exitStatus === "succeeded" && earlyHarvest !== "unverified"
+                ? [...(input.deliverables ?? [])]
+                : [],
               outcome.artifactRefs,
               outcome.artifactRefs.map(artifactHash),
             );
@@ -3030,7 +3070,7 @@ export class ExecutionBroker {
                 failed && outcome.error === WALL_CLOCK_TIMEOUT_MARKER && info
                   ? await this.workerCommittedTip(execution.execution_id, input.missionId, worktree)
                   : undefined;
-              const harvest = await this.harvestWorktree(execution.execution_id, input.authority);
+              const harvest = earlyHarvest ?? (await this.harvestWorktree(execution.execution_id, input.authority));
               if (harvest === "unverified") {
                 this.markBranchIntegrationIneligible(
                   execution.execution_id,
