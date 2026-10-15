@@ -267,6 +267,23 @@ export class GitRepo {
     }
   }
 
+  private identityFallback: Promise<string[]> | undefined;
+
+  /**
+   * `-c` options giving merge commits an identity ONLY when git has none
+   * configured (CI runners, fresh containers); a configured identity is kept.
+   */
+  private fallbackIdentityArgs(): Promise<string[]> {
+    this.identityFallback ??= (async () => {
+      const name = await this.git(["config", "--get", "user.name"]);
+      const email = await this.git(["config", "--get", "user.email"]);
+      return name.code === 0 && name.stdout && email.code === 0 && email.stdout
+        ? []
+        : ["-c", "user.name=pi-engineering", "-c", "user.email=lanes@pi-engineering.local"];
+    })();
+    return this.identityFallback;
+  }
+
   private requireQuery(result: GitResult, operation: string, args: readonly string[]): GitResult {
     if (result.code !== 0) throw new GitQueryError(operation, args, result.code, result.stderr || result.stdout);
     return result;
@@ -1666,7 +1683,15 @@ export class GitRepo {
   ): Promise<{ merged: boolean; conflict: boolean; reason: string | null }> {
     await this.assertPromotionUnlocked();
     guard?.assertAuthoritative();
-    const r = await this.git(["--no-pager", "merge", "--no-ff", "-m", `promote ${branch}`, branch]);
+    const r = await this.git([
+      ...(await this.fallbackIdentityArgs()),
+      "--no-pager",
+      "merge",
+      "--no-ff",
+      "-m",
+      `promote ${branch}`,
+      branch,
+    ]);
     if (r.code === 0) return { merged: true, conflict: false, reason: null };
     const conflicted = r.stdout.includes("CONFLICT") || r.stderr.includes("CONFLICT");
     const reason = (r.stderr || r.stdout || "merge failed").split("\n")[0]?.slice(0, 200) ?? "merge failed";
@@ -1702,6 +1727,7 @@ export class GitRepo {
     const fetchArgs = ["fetch", "--quiet", "--no-tags", "origin", branch];
     this.requireQuery(await this.git(fetchArgs), "mergeOriginBranch", fetchArgs);
     const r = await this.git([
+      ...(await this.fallbackIdentityArgs()),
       "--no-pager",
       "merge",
       "--no-ff",
@@ -1865,6 +1891,7 @@ export class GitRepo {
     }
     guard?.assertAuthoritative();
     const r = await this.git([
+      ...(await this.fallbackIdentityArgs()),
       "-C",
       candidate.path,
       "--no-pager",
