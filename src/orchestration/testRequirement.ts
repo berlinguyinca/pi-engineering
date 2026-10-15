@@ -7,11 +7,12 @@ export interface CriterionText {
 /** A creation verb within a few words of "test(s)": the criterion demands tests be written. */
 const CREATES_TESTS =
   /\b(?:add|adds|write|writes|create|creates|include|includes|introduce|introduces)\b(?:\W+\w+){0,4}?\W+tests?\b/i;
-/** Wording that talks about tests passing/existing rather than being created. */
-const ABOUT_EXISTING_TESTS = /\b(?:pass|passes|passing|green|succeed|succeeds|still|existing)\b/i;
+/** Passive or noun-led forms: "Tests are added for X", "New tests cover X". */
+const TESTS_ARE_CREATED =
+  /\btests?\b\W+(?:\w+\W+){0,2}?(?:added|written|included|created)\b|\bnew\b(?:\W+\w+){0,2}?\W+tests?\b\W+(?:cover|covers|verify|verifies|exercise|exercises)\b/i;
 
 export function criterionRequiresTests(criterion: string): boolean {
-  return CREATES_TESTS.test(criterion) && !ABOUT_EXISTING_TESTS.test(criterion);
+  return CREATES_TESTS.test(criterion) || TESTS_ARE_CREATED.test(criterion);
 }
 
 /**

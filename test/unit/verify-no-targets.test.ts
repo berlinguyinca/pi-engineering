@@ -8,7 +8,7 @@ import { ArtifactStore } from "../../src/artifacts/ArtifactStore.ts";
 import { GitRepo } from "../../src/git/GitRepo.ts";
 import { realBackends } from "../../src/orchestration/realBackends.ts";
 import { noTargetsTestRequirement } from "../../src/orchestration/testRequirement.ts";
-import { type TournamentEntry, selectionCompare } from "../../src/runtime/EngineeringRuntime.ts";
+import { type TournamentEntry, challengerMayDisplace, selectionCompare } from "../../src/runtime/EngineeringRuntime.ts";
 import { CommandVerifier, NO_TARGETS_WARNING } from "../../src/verify/Verifier.ts";
 import type { WorkerExecutor } from "../../src/workers/WorkerExecutor.ts";
 
@@ -200,7 +200,14 @@ describe("test-requirement detection", () => {
   ]) {
     it(`does not require tests: ${criterion}`, () => assert.equal(requires(criterion), false));
   }
-  for (const criterion of ["Add unit tests for X", "write regression tests", "Create targeted tests for the loader"]) {
+  for (const criterion of [
+    "Add unit tests for X",
+    "write regression tests",
+    "Create targeted tests for the loader",
+    "Add tests that still pass on CI",
+    "Tests are added for X",
+    "New tests cover X",
+  ]) {
     it(`requires tests: ${criterion}`, () => assert.equal(requires(criterion), true));
   }
 });
@@ -222,4 +229,11 @@ describe("tournament selection with zero-evidence candidates", () => {
       assert.equal(sorted[0], real);
     });
   }
+
+  it("a real-check lead is never displaced by a no-targets runner-up", () => {
+    assert.equal(challengerMayDisplace(entry("A", false, 1), entry("B", true, 1)), false);
+    assert.equal(challengerMayDisplace(entry("A", true, 1), entry("B", false, 1)), false);
+    assert.equal(challengerMayDisplace(entry("A", false, 1), entry("B", false, 1)), true);
+    assert.equal(challengerMayDisplace(entry("A", true, 1), entry("B", true, 1)), true);
+  });
 });
