@@ -180,7 +180,9 @@ test("worker: the guarded runtime sends thinking off for summarization too", asy
     const runtime = await executor.getModelRuntime();
     runtime.registerNativeProvider(realProvider(METABOLOMICS) as never);
     const payload = await summarizationPayload(runtime, METABOLOMICS);
-    assert.equal(payload.reasoning_effort, "none");
+    // A worker-runtime call is a mission-role call: thinking off via the chat
+    // template (reasoning_effort only for models that support it).
+    assert.deepEqual(payload.chat_template_kwargs, { enable_thinking: false });
   });
 });
 

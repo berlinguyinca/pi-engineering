@@ -40,8 +40,10 @@
  *    the one-shot planner): thinking off unconditionally, whatever the output
  *    allowance. A long-running worker makes ~46 model turns, and 8-13k hidden
  *    reasoning tokens per turn is minutes of decode that also eats the cap.
- *    The wire fields are `reasoning_effort: "none"` and
- *    `chat_template_kwargs.enable_thinking: false` (llama.cpp / vLLM).
+ *    The wire field is always `chat_template_kwargs.enable_thinking: false`
+ *    (the InferWeave node allowlists exactly that and rejects unknown top-level
+ *    fields with "unsupported request field"); `reasoning_effort: "none"` is
+ *    added only for models whose `compat.supportsReasoningEffort` is true.
  * 4. A reply cut at "length" with almost no visible text becomes a clear error
  *    instead of a one-word answer — but ONLY when it spent the model's whole
  *    `maxTokens`. A shorter (window-clamped) length stop is exactly what Pi's
@@ -108,6 +110,7 @@ export interface ThinkingModel {
   baseUrl?: string;
   contextWindow?: number;
   maxTokens?: number;
+  compat?: { supportsReasoningEffort?: boolean };
 }
 
 /** Is `model` served by a gateway known to accept `reasoning_effort: "none"`? */
@@ -180,7 +183,12 @@ export type ThinkingOffReason = "summarization" | "low-output-budget" | "mission
 /** Roles that may keep thinking: the one-shot planner call. */
 const THINKING_ROLES: ReadonlySet<string> = new Set(["planner"]);
 
-/** Is the current inference invocation a mission worker/reviewer/repair call? */
+/**
+ * Is the current inference invocation a mission worker/reviewer/repair call?
+ * An invocation without an explicit role is installed with the default role
+ * "worker" (PiWorkerExecutor's resilience layer), so it counts as a mission
+ * role. Interactive sessions run with no invocation at all, or `interactive`.
+ */
 export function isMissionRoleInvocation(): boolean {
   const invocation = currentInferenceInvocation();
   return invocation !== undefined && !invocation.interactive && !THINKING_ROLES.has(invocation.role);
@@ -236,9 +244,11 @@ function requestedReasoning(payload: unknown): string | undefined {
  * "minimal", which the qwen models reject with a 502), and a chat template's
  * `enable_thinking` switched off when the payload carries one.
  */
-export function applyThinkingOff(payload: unknown, { forceTemplate = false } = {}): unknown {
+export function applyThinkingOff(payload: unknown, { forceTemplate = false, reasoningEffort = true } = {}): unknown {
   if (!payload || typeof payload !== "object") return payload;
-  const next: Record<string, unknown> = { ...(payload as Record<string, unknown>), reasoning_effort: "none" };
+  const next: Record<string, unknown> = { ...(payload as Record<string, unknown>) };
+  if (reasoningEffort) next.reasoning_effort = "none";
+  else next.reasoning_effort = undefined; // JSON.stringify drops it: the key is absent on the wire
   const kwargs = next.chat_template_kwargs;
   if (kwargs && typeof kwargs === "object") {
     next.chat_template_kwargs = { ...(kwargs as Record<string, unknown>), enable_thinking: false };
@@ -316,7 +326,14 @@ export function streamWithThinkingPolicy<
       ...(options ?? {}),
       onPayload: async (payload: unknown, m: unknown) => {
         const reason = thinkingOffReason(model, context, config, payloadAllowance(payload));
-        const edited = reason ? applyThinkingOff(payload, { forceTemplate: reason === "mission-role" }) : payload;
+        const edited = reason
+          ? reason === "mission-role"
+            ? applyThinkingOff(payload, {
+                forceTemplate: true,
+                reasoningEffort: model.compat?.supportsReasoningEffort === true,
+              })
+            : applyThinkingOff(payload)
+          : payload;
         if (reason === "mission-role") {
           emitTelemetry({
             level: "info",

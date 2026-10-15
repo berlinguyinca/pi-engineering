@@ -268,8 +268,9 @@ is left as it was.
 ## Thinking off for mission roles
 
 Mission implementers, reviewers and repair workers send thinking off on every
-request, whatever the output allowance: `reasoning_effort: "none"` plus
-`chat_template_kwargs.enable_thinking: false`. Hidden reasoning costs 8-13k
+request, whatever the output allowance: `chat_template_kwargs.enable_thinking: false` (plus `reasoning_effort: "none"`
+only for models with `compat.supportsReasoningEffort`; the InferWeave node
+rejects unknown top-level fields). Hidden reasoning costs 8-13k
 tokens per turn on the gateway models, and a worker makes dozens of turns. The
 one-shot planner and interactive sessions keep their current behaviour. Each
 such request logs `thinking: off (mission role)`.
