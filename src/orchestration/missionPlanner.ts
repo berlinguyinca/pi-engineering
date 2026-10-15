@@ -8,7 +8,7 @@
 import { extractStructured, parsePlannerOutput, scopeConflict } from "../plannerWorker/contract.ts";
 import { PLANNER_PROMPT } from "../plannerWorker/prompts.ts";
 import type { TaskContract } from "../plannerWorker/types.ts";
-import type { PlanTaskInput } from "./orchestrator.ts";
+import { type PlanTaskInput, intersectWriteDomains } from "./orchestrator.ts";
 
 export type MissionPlannerMode = "on" | "off" | "auto";
 
@@ -38,7 +38,59 @@ export interface MissionPlanResult {
   fallbackReason?: string;
 }
 
+/** The planner call failed in a way worth one retry (gateway/network), not a bad plan. */
+export class PlannerTransientError extends Error {}
+
+export const DEFAULT_PLANNER_TIMEOUT_MS = 600_000;
+
+/** PI_MISSION_PLANNER_TIMEOUT_MS bounds the one planner call (default 10 minutes). */
+export function plannerTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
+  const n = Number(env.PI_MISSION_PLANNER_TIMEOUT_MS);
+  return Number.isFinite(n) && n >= 1 ? Math.floor(n) : DEFAULT_PLANNER_TIMEOUT_MS;
+}
+
+const prefixOf = (glob: string): string =>
+  glob
+    .replace(/^\.\//, "")
+    .replace(/\/?\*\*.*$/, "")
+    .replace(/\/$/, "");
+const under = (path: string, root: string): boolean => root === "" || path === root || path.startsWith(`${root}/`);
+
+/**
+ * Write domains a task may keep: bounded repository-relative globs, minus the
+ * contract's forbidden globs and read-only roots, inside the manifest's
+ * writable domains. Returns the kept domains and what was rejected.
+ */
+export function scopeTaskDomains(
+  c: TaskContract,
+  opts: { writableDomains?: string[]; readOnlyPrefixes?: string[] },
+): { kept: string[]; rejected: string[] } {
+  const rejected: string[] = [];
+  let kept: string[] = [];
+  const forbidden = c.scope.forbidden.map(prefixOf);
+  const readOnly = (opts.readOnlyPrefixes ?? []).map(prefixOf);
+  for (const glob of c.scope.allowed) {
+    const prefix = prefixOf(glob);
+    const escapes = glob.startsWith("/") || /^[A-Za-z]:/.test(glob) || prefix.split("/").includes("..");
+    const barred = [...forbidden, ...readOnly].some((root) => root !== "" && under(prefix, root));
+    if (escapes || barred || prefix === ".git" || prefix.startsWith(".git/")) rejected.push(glob);
+    else kept.push(glob);
+  }
+  if (opts.writableDomains) {
+    const inside = intersectWriteDomains(kept, opts.writableDomains);
+    for (const glob of kept)
+      if (!inside.some((d) => under(prefixOf(d), prefixOf(glob)) || under(prefixOf(glob), prefixOf(d))))
+        rejected.push(glob);
+    kept = inside;
+  }
+  return { kept, rejected };
+}
+
 export interface MissionPlanInput {
+  /** Manifest writable domains for the repository, when a manifest exists. */
+  writableDomains?: string[];
+  /** Repository-relative prefixes of read-only / excluded roots. */
+  readOnlyPrefixes?: string[];
   goal: string;
   mutates: boolean;
   mode: MissionPlannerMode;
@@ -54,9 +106,14 @@ function contextRef(c: TaskContract): string {
   return JSON.stringify({ relevant_files: c.relevant_files, verification: c.verification, constraints: c.constraints });
 }
 
-function toTasks(contracts: TaskContract[], acceptanceIds: string[]): PlanTaskInput[] {
+function toTasks(contracts: TaskContract[], acceptanceIds: string[], domains: Map<string, string[]>): PlanTaskInput[] {
   // Overlapping write domains never run in parallel: serialize the later one
   // behind the earlier unless an ordering already exists.
+  const conflicts = (a: TaskContract, b: TaskContract): boolean =>
+    scopeConflict(
+      { ...a, scope: { ...a.scope, allowed: domains.get(a.task_id) ?? a.scope.allowed } },
+      { ...b, scope: { ...b.scope, allowed: domains.get(b.task_id) ?? b.scope.allowed } },
+    );
   const deps = new Map(contracts.map((c) => [c.task_id, new Set(c.depends_on)]));
   const reaches = (from: string, to: string, seen = new Set<string>()): boolean => {
     if (from === to) return true;
@@ -66,7 +123,7 @@ function toTasks(contracts: TaskContract[], acceptanceIds: string[]): PlanTaskIn
   };
   contracts.forEach((b, j) => {
     for (const a of contracts.slice(0, j)) {
-      if (scopeConflict(a, b) && !reaches(b.task_id, a.task_id) && !reaches(a.task_id, b.task_id)) {
+      if (conflicts(a, b) && !reaches(b.task_id, a.task_id) && !reaches(a.task_id, b.task_id)) {
         deps.get(b.task_id)?.add(a.task_id);
       }
     }
@@ -77,7 +134,7 @@ function toTasks(contracts: TaskContract[], acceptanceIds: string[]): PlanTaskIn
     role: "implementer",
     objective: [c.objective, ...c.acceptance.map((a) => `Acceptance: ${a}`)].join("\n"),
     mutates_repo: true,
-    write_domains: [...c.scope.allowed],
+    write_domains: domains.get(c.task_id) ?? [...c.scope.allowed],
     isolation: "worktree",
     depends_on: [...(deps.get(c.task_id) ?? [])],
     priority: 0,
@@ -94,21 +151,33 @@ function toTasks(contracts: TaskContract[], acceptanceIds: string[]): PlanTaskIn
 export async function planMission(input: MissionPlanInput): Promise<MissionPlanResult> {
   const attempt = input.mode === "on" || (input.mode === "auto" && isNonTrivialGoal(input.goal));
   if (!attempt || !input.mutates) return { tasks: [input.single()] };
-  let parsed: ReturnType<typeof parsePlannerOutput>;
-  try {
-    const text = await input.runPlanner(plannerTask(input.goal));
-    parsed =
-      extractStructured(text) === undefined
-        ? { ok: false, errors: ["no structured plan in planner output"] }
-        : parsePlannerOutput(text);
-  } catch (error) {
-    return {
-      tasks: [input.single()],
-      fallbackReason: `planner call failed: ${error instanceof Error ? error.message : String(error)}`,
-    };
+  const fallback = (reason: string): MissionPlanResult => ({ tasks: [input.single()], fallbackReason: reason });
+  let text = "";
+  for (let attemptNo = 0; ; attemptNo++) {
+    try {
+      text = await input.runPlanner(plannerTask(input.goal));
+      break;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (error instanceof PlannerTransientError && attemptNo === 0) continue;
+      return fallback(
+        `${error instanceof PlannerTransientError ? "transient planner failure after one retry" : "planner call failed"}: ${message}`,
+      );
+    }
   }
-  if (!parsed.ok) return { tasks: [input.single()], fallbackReason: parsed.errors.slice(0, 3).join("; ") };
-  if (parsed.plan.contracts.length === 0)
-    return { tasks: [input.single()], fallbackReason: "planner returned no contracts" };
-  return { tasks: toTasks(parsed.plan.contracts, input.acceptanceIds) };
+  const parsed =
+    extractStructured(text) === undefined
+      ? ({ ok: false, errors: ["no structured plan in planner output"] } as const)
+      : parsePlannerOutput(text);
+  if (!parsed.ok) return fallback(`malformed plan: ${parsed.errors.slice(0, 3).join("; ")}`);
+  if (parsed.plan.contracts.length === 0) return fallback("planner returned no contracts");
+  const domains = new Map<string, string[]>();
+  for (const c of parsed.plan.contracts) {
+    const { kept, rejected } = scopeTaskDomains(c, input);
+    if (kept.length === 0) {
+      return fallback(`task ${c.task_id} has no writable domain; rejected: ${rejected.join(", ") || "(none)"}`);
+    }
+    domains.set(c.task_id, kept);
+  }
+  return { tasks: toTasks(parsed.plan.contracts, input.acceptanceIds, domains) };
 }

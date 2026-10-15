@@ -305,7 +305,7 @@ is left as it was.
 
 ### Mission planning for non-trivial goals
 
-A mission whose goal implies more than one deliverable, names several paths, or runs past 30 words makes ONE planner call (role `planner`, strongest routed model, the planner/worker `PLANNER_PROMPT`) and gets a bounded task DAG: per-task `write_domains`, `relevant_files` and `verification` (handed to each worker as its context). Tasks run in parallel only when their write domains are disjoint; overlapping ones are serialized. Trivial goals keep the single task. A malformed or empty plan falls back to the single task and records a minor `mission_planner` finding. `PI_MISSION_PLANNER=on|off|auto` (default `auto`) forces or disables it.
+A mission whose goal implies more than one deliverable, names several paths, or runs past 30 words makes ONE planner call (role `planner`, strongest routed model, the planner/worker `PLANNER_PROMPT`) and gets a bounded task DAG: per-task `write_domains`, `relevant_files` and `verification` (handed to each worker as its context). Tasks run in parallel only when their write domains are disjoint; overlapping ones are serialized. Trivial goals keep the single task. A malformed or empty plan falls back to the single task and records a minor `mission_planner` finding. `PI_MISSION_PLANNER=on|off|auto` (default `auto`) forces or disables it. Task domains are pre-validated: absolute, `..`, `.git`, forbidden, read-only and out-of-manifest domains are dropped, and a task left with none falls back to the single task (the finding names the rejected domains). The call is bounded by `PI_MISSION_PLANNER_TIMEOUT_MS` (default 600000); a transient failure is retried once, then falls back with a finding saying transient.
 
 ## Context budget for mission workers
 

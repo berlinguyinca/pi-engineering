@@ -1,13 +1,18 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { type IncomingMessage, type Server, type ServerResponse, createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
+import { AdmissionController } from "../../src/gateway/AdmissionController.ts";
+import { resolveGatewayConfig } from "../../src/gateway/config.ts";
 import { EngineeringRuntime } from "../../src/index.ts";
+import { scopeTaskDomains } from "../../src/orchestration/missionPlanner.ts";
 import { scopesOverlap } from "../../src/plan/taskDag.ts";
+import { parsePlannerOutput } from "../../src/plannerWorker/contract.ts";
 import { PLANNER_PROMPT } from "../../src/plannerWorker/prompts.ts";
-import { FakeWorkerExecutor } from "../../src/workers/FakeWorkerExecutor.ts";
-import type { WorkerRequest } from "../../src/workers/WorkerExecutor.ts";
+import { PiWorkerExecutor } from "../../src/workers/PiWorkerExecutor.ts";
 import { makeFixtureRepo } from "../fixtures/make-fixture.ts";
 
 const PLAN = JSON.stringify({
@@ -44,31 +49,113 @@ const PLAN = JSON.stringify({
 const BIG_GOAL =
   "Add a REST endpoint under src/api for exporting reports, build a settings page under src/ui to trigger the export, and document both features in docs/usage.md with examples and migration notes for existing users.";
 
+type Reply = { kind: "text"; text: string } | { kind: "http500" } | { kind: "hang" };
+
+function frame(delta: Record<string, unknown>, finish: string | null = null): string {
+  return `data: ${JSON.stringify({ id: "c", object: "chat.completion.chunk", created: 0, model: "m", choices: [{ index: 0, delta, finish_reason: finish }] })}\n\n`;
+}
+
+function listen(handler: (req: IncomingMessage, res: ServerResponse, body: string) => void): Promise<Server> {
+  const server = createServer((req, res) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (c) => chunks.push(Buffer.from(c)));
+    req.on("end", () => handler(req, res, Buffer.concat(chunks).toString("utf8")));
+  });
+  return new Promise((resolve) => server.listen(0, "127.0.0.1", () => resolve(server)));
+}
+
 describe("mission planner contract", () => {
   const cleanups: Array<() => Promise<void>> = [];
   let agentDir = "";
-  const saved = process.env.PI_MISSION_PLANNER;
   before(async () => {
+    process.env.PI_MISSION_PLANNER_TIMEOUT_MS = "30000";
     agentDir = await mkdtemp(join(tmpdir(), "pi-eng-agentdir-"));
   });
   after(async () => {
-    if (saved === undefined) process.env.PI_MISSION_PLANNER = undefined;
+    delete process.env.PI_MISSION_PLANNER;
+    delete process.env.PI_MISSION_PLANNER_TIMEOUT_MS;
     for (const c of cleanups) await c().catch(() => {});
     await rm(agentDir, { recursive: true, force: true });
   });
 
-  async function plan(goal: string, plannerReply: string | undefined) {
+  async function plan(goal: string, replies: Reply[], manifestRoots?: { writable: string[] }) {
     const fx = await makeFixtureRepo();
     cleanups.push(fx.cleanup);
-    const calls: WorkerRequest[] = [];
-    const worker = new FakeWorkerExecutor({
-      planner: (req) => {
-        calls.push(req);
-        return { summary: plannerReply ?? "" };
-      },
+    const bodies: Array<Record<string, unknown>> = [];
+    let n = 0;
+    const server = await listen((_req, res, body) => {
+      bodies.push(JSON.parse(body) as Record<string, unknown>);
+      const reply = replies[Math.min(n++, replies.length - 1)] as Reply;
+      if (reply.kind === "hang") return;
+      if (reply.kind === "http500") {
+        res.writeHead(503, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: { message: "service unavailable" } }));
+        return;
+      }
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      const args = {
+        status: "completed",
+        summary: reply.text,
+        claims: [],
+        evidence_refs: [],
+        new_hypotheses: [],
+        proposed_tasks: [],
+      };
+      res.write(
+        frame({
+          role: "assistant",
+          tool_calls: [
+            {
+              index: 0,
+              id: "c0",
+              type: "function",
+              function: { name: "worker_result", arguments: JSON.stringify(args) },
+            },
+          ],
+        }),
+      );
+      res.write(frame({}, "tool_calls"));
+      res.end("data: [DONE]\n\n");
     });
-    const runtime = await EngineeringRuntime.open({ cwd: fx.root, agentDir, worker });
-    const mission = runtime.missionStore!.createMission({
+    cleanups.push(async () => {
+      server.closeAllConnections();
+      server.close();
+    });
+    const dir = await mkdtemp(join(tmpdir(), "pi-planner-models-"));
+    cleanups.push(() => rm(dir, { recursive: true, force: true }));
+    await writeFile(
+      join(dir, "models.json"),
+      JSON.stringify({
+        providers: {
+          local: {
+            baseUrl: `http://127.0.0.1:${(server.address() as AddressInfo).port}/v1`,
+            api: "openai-completions",
+            apiKey: "k",
+            models: [{ id: "m", contextWindow: 100_000, maxTokens: 4096, reasoning: false }],
+          },
+        },
+      }),
+    );
+    await writeFile(join(dir, "settings.json"), JSON.stringify({ defaultProvider: "local", defaultModel: "m" }));
+    const real = new PiWorkerExecutor({
+      agentDir: dir,
+      aps: false,
+      gatewayConfig: resolveGatewayConfig({ enabled: true, maxRetries: 0, jitterMs: 0 }),
+      admission: new AdmissionController({ maxConcurrency: 2, jitterMs: 0 }),
+      transientSleep: async () => {},
+      transientRand: () => 0,
+    });
+    // Real executor; only the model placement (routing is not configured here) is supplied.
+    const worker = new Proxy(real, {
+      get: (target, prop) =>
+        prop === "run"
+          ? (req: Parameters<PiWorkerExecutor["run"]>[0]) =>
+              target.run({ ...req, modelOverride: { provider: "local", id: "m" } })
+          : Reflect.get(target, prop),
+    });
+    const runtime = await EngineeringRuntime.open({ cwd: fx.root, agentDir: dir, worker });
+    const store = runtime.missionStore!;
+    const mission = store.createMission({
       title: "t",
       goal,
       user_request: goal,
@@ -77,15 +164,22 @@ describe("mission planner contract", () => {
       risk_profile: {} as never,
       workflow_class: "engineering",
     });
-    const tasks = await runtime.missionPlanner!(runtime.missionStore!.getMission(mission.mission_id)!, {} as never);
-    return { tasks, calls, runtime, mission };
+    void manifestRoots;
+    const tasks = await runtime.missionPlanner!(store.getMission(mission.mission_id)!, {} as never);
+    return { tasks, bodies, store, mission };
   }
 
-  it("non-trivial goal yields a DAG with disjoint parallel domains and contextRef", async () => {
-    const { tasks, calls } = await plan(BIG_GOAL, PLAN);
-    assert.equal(calls.length, 1);
-    assert.equal(calls[0]?.role, "planner");
-    assert.ok(calls[0]?.task.includes(PLANNER_PROMPT));
+  const planReply = (text: string): Reply[] => [{ kind: "text", text }];
+
+  it("non-trivial goal yields a DAG with disjoint parallel domains, contextRef and a thinking-allowed planner request", async () => {
+    const { tasks, bodies } = await plan(BIG_GOAL, planReply(PLAN));
+    assert.equal(bodies.length, 1);
+    assert.equal(
+      (bodies[0]?.chat_template_kwargs as Record<string, unknown> | undefined)?.enable_thinking,
+      undefined,
+      "planner keeps thinking (#201)",
+    );
+    assert.match(JSON.stringify(bodies[0]?.messages), /PLANNER of an engineering mission/);
     assert.equal(tasks.length, 3);
     const [api, ui, docs] = tasks;
     assert.deepEqual(api?.write_domains, ["src/api/**"]);
@@ -112,38 +206,116 @@ describe("mission planner contract", () => {
         },
       ],
     });
-    const { tasks } = await plan(BIG_GOAL, overlapping);
+    const { tasks } = await plan(BIG_GOAL, planReply(overlapping));
     assert.equal(tasks.length, 2);
     assert.equal(tasks[1]?.depends_on.length, 1);
   });
 
   it("trivial goal keeps the single task without a planner call", async () => {
-    const { tasks, calls } = await plan("Fix the typo in README", PLAN);
-    assert.equal(calls.length, 0);
+    const { tasks, bodies } = await plan("Fix the typo in README", planReply(PLAN));
+    assert.equal(bodies.length, 0);
     assert.equal(tasks.length, 1);
     assert.deepEqual(tasks[0]?.write_domains, ["**"]);
   });
 
   it("malformed plan falls back to one task and records a finding", async () => {
-    const { tasks, calls, runtime, mission } = await plan(BIG_GOAL, "I could not produce JSON, sorry");
-    assert.equal(calls.length, 1);
+    const { tasks, bodies, store, mission } = await plan(BIG_GOAL, planReply("I could not produce JSON, sorry"));
+    assert.equal(bodies.length, 1);
     assert.equal(tasks.length, 1);
     assert.deepEqual(tasks[0]?.write_domains, ["**"]);
-    const finding = runtime
-      .missionStore!.listFindings(mission.mission_id)
-      .find((f) => f.category === "mission_planner");
-    assert.ok(finding, "fallback is recorded as a finding");
+    const finding = store.listFindings(mission.mission_id).find((f) => f.category === "mission_planner");
+    assert.ok(finding);
+    assert.match(finding.evidence ?? "", /malformed/);
     assert.notEqual(finding.severity, "blocking");
+  });
+
+  it("a plan whose domains escape the workspace falls back naming the rejected domains", async () => {
+    for (const bad of ["/etc/**", "../sibling/**", ".git/**"]) {
+      const escaping = JSON.stringify({
+        contracts: [
+          { task_id: "a", objective: "x", scope: { allowed: [bad] }, acceptance: ["x"], verification: ["true"] },
+        ],
+      });
+      const { tasks, store, mission } = await plan(BIG_GOAL, planReply(escaping));
+      assert.deepEqual(tasks[0]?.write_domains, ["**"], bad);
+      const finding = store.listFindings(mission.mission_id).find((f) => f.category === "mission_planner");
+      assert.ok(finding, bad);
+      assert.match(finding.evidence ?? "", /rejected|scope glob|repository-relative/);
+    }
+  });
+
+  it("a plan that only writes its own forbidden path falls back", async () => {
+    const self = JSON.stringify({
+      contracts: [
+        {
+          task_id: "a",
+          objective: "x",
+          scope: { allowed: ["src/api/**"], forbidden: ["src/**"] },
+          acceptance: ["x"],
+          verification: ["true"],
+        },
+      ],
+    });
+    const { tasks } = await plan(BIG_GOAL, planReply(self));
+    assert.deepEqual(tasks[0]?.write_domains, ["**"]);
+  });
+
+  it("a transient planner failure is retried once, then falls back saying transient", async () => {
+    const { tasks, bodies, store, mission } = await plan(BIG_GOAL, [{ kind: "http500" }]);
+    assert.equal(tasks.length, 1);
+    assert.ok(bodies.length >= 2, "retried");
+    const finding = store.listFindings(mission.mission_id).find((f) => f.category === "mission_planner");
+    assert.match(finding?.evidence ?? "", /transient/);
+  });
+
+  it("a transient failure then a good plan recovers", async () => {
+    const { tasks } = await plan(BIG_GOAL, [{ kind: "http500" }, { kind: "text", text: PLAN }]);
+    assert.equal(tasks.length, 3);
+  });
+
+  it("a hung planner is aborted by the timeout and falls back", async () => {
+    process.env.PI_MISSION_PLANNER_TIMEOUT_MS = "1500";
+    try {
+      const { tasks, store, mission } = await plan(BIG_GOAL, [{ kind: "hang" }]);
+      assert.equal(tasks.length, 1);
+      assert.ok(store.listFindings(mission.mission_id).some((f) => f.category === "mission_planner"));
+    } finally {
+      delete process.env.PI_MISSION_PLANNER_TIMEOUT_MS;
+    }
   });
 
   it("PI_MISSION_PLANNER=off never calls the planner", async () => {
     process.env.PI_MISSION_PLANNER = "off";
     try {
-      const { tasks, calls } = await plan(BIG_GOAL, PLAN);
-      assert.equal(calls.length, 0);
+      const { tasks, bodies } = await plan(BIG_GOAL, planReply(PLAN));
+      assert.equal(bodies.length, 0);
       assert.equal(tasks.length, 1);
     } finally {
-      process.env.PI_MISSION_PLANNER = undefined;
+      delete process.env.PI_MISSION_PLANNER;
     }
+  });
+
+  it("scopeTaskDomains drops read-only roots and domains outside the manifest's writable domains", () => {
+    const parsed = parsePlannerOutput(
+      JSON.stringify({
+        contracts: [
+          {
+            task_id: "a",
+            objective: "x",
+            scope: { allowed: ["src/**", "vendor/**", "other/**"], forbidden: ["src/gen/**"] },
+            acceptance: ["x"],
+            verification: ["true"],
+          },
+        ],
+      }),
+    );
+    assert.ok(parsed.ok);
+    const contract = parsed.plan.contracts[0]!;
+    const { kept, rejected } = scopeTaskDomains(contract, {
+      writableDomains: ["src/**", "vendor/**"],
+      readOnlyPrefixes: ["vendor"],
+    });
+    assert.deepEqual(kept, ["src/**"]);
+    assert.deepEqual(rejected.sort(), ["other/**", "vendor/**"]);
   });
 });
