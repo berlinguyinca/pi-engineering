@@ -87,6 +87,7 @@ import {
   resolveStreamResumeMax,
 } from "../inference/streamResume.ts";
 import { reviewResultTool } from "../lifecycle/reviewResultTool.ts";
+import { missionDepthSpawnHook } from "../orchestration/missionMode.ts";
 import { type RequestBodyBudgetConfig, resolveRequestBodyBudgetConfig } from "../request/bodyBudget.ts";
 import { type ThinkingOffConfig, resolveThinkingOffConfig } from "../request/thinkingPolicy.ts";
 import { resolveWorktreeIdentity } from "../runtime/isolation/WorktreeIdentity.ts";
@@ -586,8 +587,15 @@ export class PiWorkerExecutor implements WorkerExecutor {
     const customTools = [
       ...this.customTools,
       ...(req.tolerantFileTools ? [createNumberedReadTool(req.cwd), createTolerantEditTool(req.cwd)] : []),
-      ...(req.wallClock && req.tools.includes("bash")
-        ? [budgetNotice(createBashToolDefinition(req.cwd) as unknown as ToolDefinition)]
+      // Every worker bash command runs one mission-depth deeper (recursion
+      // guard). The built-in tool is replaced by one with the same name; the
+      // budget notice wraps it only for budgeted runs.
+      ...(req.tools.includes("bash")
+        ? [
+            budgetNotice(
+              createBashToolDefinition(req.cwd, { spawnHook: missionDepthSpawnHook }) as unknown as ToolDefinition,
+            ),
+          ]
         : []),
       ...(offersClaimDeliverable(req)
         ? [budgetNotice(createClaimDeliverableTool(req.deliverables ?? []) as unknown as ToolDefinition)]

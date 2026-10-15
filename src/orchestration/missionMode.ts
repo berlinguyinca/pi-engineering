@@ -86,3 +86,56 @@ export function chooseBackend(
   if (mode !== "autospec" || !flags.enabled || !flags.managedEnabled) return "pi-local";
   return requested ?? "autospec-managed";
 }
+
+// ── Recursion guard ─────────────────────────────────────────────────────────
+
+/** Env var carrying how many mission workers deep this process is. Unset means a root process. */
+export const MISSION_DEPTH_ENV = "PI_MISSION_DEPTH";
+
+/**
+ * How many mission workers deep this process is. Unset is 0 (a root). The value
+ * must be a plain non-negative integer; anything else, including a count too
+ * large to be a safe integer, counts as 1, so a corrupted guard refuses a new
+ * root mission instead of waving it through.
+ */
+export function missionDepth(env: FlagEnv): number {
+  const raw = env[MISSION_DEPTH_ENV];
+  if (raw === undefined) return 0;
+  const text = raw.trim();
+  if (!/^\d+$/.test(text)) return 1;
+  const depth = Number(text);
+  return Number.isSafeInteger(depth) ? depth : 1;
+}
+
+/** Refuse to start a root mission from inside a mission worker. Nested missions are not allowed. */
+export function assertRootMissionAllowed(env: FlagEnv): void {
+  const depth = missionDepth(env);
+  if (depth > 0) {
+    throw new Error(
+      `refusing to start a mission: ${MISSION_DEPTH_ENV} is ${depth}, so this process is already inside a mission worker and nested missions are not allowed (a root mission needs ${MISSION_DEPTH_ENV} unset or 0)`,
+    );
+  }
+}
+
+/** The env a worker's subprocess gets: the parent's, with the depth one deeper. Does not mutate `env`. */
+export function childEnv(env: FlagEnv): Record<string, string> {
+  const child: Record<string, string> = {};
+  for (const [key, value] of Object.entries(env)) {
+    if (value !== undefined) child[key] = value;
+  }
+  child[MISSION_DEPTH_ENV] = String(missionDepth(env) + 1);
+  return child;
+}
+
+/**
+ * A bash spawn hook (the SDK's `BashSpawnHook`, declared structurally so this
+ * module stays free of the SDK) that gives every command a worker runs the
+ * deeper depth. The depth is read from the process env as well as the spawn
+ * env, so it holds whichever of the two carries it.
+ */
+export function missionDepthSpawnHook<C extends { env: NodeJS.ProcessEnv }>(context: C): C {
+  // Only the depth is added: the SDK strips session variables from the spawn
+  // env on purpose, so the process env must not be merged back in wholesale.
+  const depth = missionDepth({ ...process.env, ...context.env });
+  return { ...context, env: { ...context.env, [MISSION_DEPTH_ENV]: String(depth + 1) } };
+}
