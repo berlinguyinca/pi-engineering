@@ -8,6 +8,7 @@
  * wiring.
  */
 
+import { acceptsThinkingOff, resolveThinkingOffConfig } from "../request/thinkingPolicy.ts";
 import { type CatalogPlan, type ConfiguredModel, describeCatalogPlan, planCatalogUpdate } from "./catalogPlan.ts";
 import { DEFAULT_GATEWAY_BASE_URL, type GatewayModelEntry, fetchGatewayModels } from "./gatewayCatalog.ts";
 import {
@@ -159,17 +160,7 @@ function describeRefusal(status: number, code: string, text: string): string {
 }
 
 function supportsThinkingOff(providerId: string, api: string, baseUrl: string): boolean {
-  if (api !== "openai-completions") return false;
-  const configuredList = (value: string | undefined, fallback: string[]): string[] =>
-    (value === undefined ? fallback : value.split(",")).map((entry) => entry.trim().toLowerCase()).filter(Boolean);
-  const providers = configuredList(process.env.PI_THINKING_OFF_PROVIDERS, ["metabolomics"]);
-  if (providers.includes(providerId.toLowerCase())) return true;
-  const hosts = configuredList(process.env.PI_THINKING_OFF_GATEWAYS, ["llm.example.com"]);
-  try {
-    return hosts.includes(new URL(baseUrl).host.toLowerCase());
-  } catch {
-    return false;
-  }
+  return acceptsThinkingOff({ api, provider: providerId, baseUrl }, resolveThinkingOffConfig());
 }
 
 /**
