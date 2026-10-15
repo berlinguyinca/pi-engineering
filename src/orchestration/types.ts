@@ -654,3 +654,6 @@ export interface CompletionVerdict {
    */
   superseded_by_recovery?: string[];
 }
+
+/** Finding category for a planner that explicitly asked the operator to clarify the goal. */
+export const PLANNER_CLARIFICATION_CATEGORY = "mission_planner_clarification";

@@ -59,7 +59,7 @@ import { RepositoryRegistry } from "../orchestration/repositoryRegistry.ts";
 import { canTransitionMission } from "../orchestration/state.ts";
 import { MissionSupervisor, type SupervisorStatus } from "../orchestration/supervisor.ts";
 import { SupervisorRepairBackoff } from "../orchestration/supervisorBackoff.ts";
-import type { Mission, MissionStop } from "../orchestration/types.ts";
+import { type Mission, type MissionStop, PLANNER_CLARIFICATION_CATEGORY } from "../orchestration/types.ts";
 import { WorkspaceManifestResolver } from "../orchestration/workspaceManifest.ts";
 import { tasksConflict, topoSort } from "../plan/taskDag.ts";
 import { redactSecrets } from "../platform/redact.ts";
@@ -1218,7 +1218,7 @@ export class EngineeringRuntime {
                 }
                 throw new Error(run.error);
               }
-              return run.result.summary;
+              return run.result;
             } catch (error) {
               if (error instanceof PlannerTransientError || abort.signal.aborted) throw error;
               if (classifyError(error).retryable) throw new PlannerTransientError(String(error));
@@ -1239,6 +1239,32 @@ export class EngineeringRuntime {
             summary: "Mission planner output unusable; ran the goal as a single task.",
             evidence: planned.fallbackReason.slice(0, 1000),
             recommended_action: "None required; the mission continues with one task.",
+          });
+        }
+        if (planned.notes?.length) {
+          rt.missionStore?.addFinding({
+            mission_id: mission.mission_id,
+            task_id: null,
+            severity: "minor",
+            category: "mission_planner",
+            file: null,
+            line: null,
+            summary: "Mission planner intent was only partly honoured.",
+            evidence: planned.notes.join("; ").slice(0, 1000),
+            recommended_action: "None required; the allowed scope was kept.",
+          });
+        }
+        if (planned.clarification) {
+          rt.missionStore?.addFinding({
+            mission_id: mission.mission_id,
+            task_id: null,
+            severity: "minor",
+            category: PLANNER_CLARIFICATION_CATEGORY,
+            file: null,
+            line: null,
+            summary: "Mission planner needs clarification of the goal.",
+            evidence: planned.clarification.slice(0, 1000),
+            recommended_action: "Confirm or restate what this mission should do.",
           });
         }
         return planned.tasks;
@@ -1325,6 +1351,7 @@ export class EngineeringRuntime {
         // scheduler must never disagree about how often one failure repeats.
         recoveryPlanner: new RecoveryPlanner(recoveryBudget),
         onStatuses: (statuses) => rt.consumeSupervisorStatuses(statuses),
+        planningInFlight: (missionId) => rt.orchestrator?.isPlanning(missionId) ?? false,
         // Other live sessions in this worktree see the same missions; each
         // mission is supervised only by its custodian, and a dead custodian's
         // missions are adopted automatically.

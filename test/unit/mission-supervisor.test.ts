@@ -7,7 +7,7 @@ import { MissionOwnership } from "../../src/orchestration/ownership.ts";
 import { MissionSupervisor } from "../../src/orchestration/supervisor.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 
-function harness(initialNow = Date.parse("2026-09-27T12:00:00.000Z")) {
+function harness(initialNow = Date.parse("2026-09-27T12:00:00.000Z"), planningInFlight?: () => boolean) {
   let currentNow = initialNow;
   const backend = JsonlEventStore.inMemory();
   const store = MissionStore.open(backend);
@@ -34,6 +34,7 @@ function harness(initialNow = Date.parse("2026-09-27T12:00:00.000Z")) {
     store,
     observability,
     now: () => currentNow,
+    planningInFlight,
   });
   return {
     backend,
@@ -624,6 +625,34 @@ describe("MissionSupervisor", () => {
     await tick;
     await shutdown;
     assert.equal(shutdownSettled, true);
+  });
+
+  it("does not call a taskless mission empty while its planner is still running", async () => {
+    let planning = true;
+    const h = harness(undefined, () => planning);
+
+    const [during] = await h.supervisor.tick();
+
+    assert.equal(during?.health, "HEALTHY");
+    assert.equal(h.store.listFailureClassifications(h.mission.mission_id).length, 0);
+    assert.equal(h.store.listRecoveryDecisions(h.mission.mission_id).length, 0);
+
+    planning = false;
+    const [after] = await h.supervisor.tick();
+    assert.equal(after?.health, "PLANNING_EMPTY");
+  });
+
+  it("plans WAIT_FOR_REQUIREMENT once per episode across repeated ticks", async () => {
+    const h = harness();
+
+    await h.supervisor.tick();
+    await h.supervisor.tick();
+    await Promise.all([h.supervisor.tick(), h.supervisor.tick()]);
+
+    const waits = h.store
+      .listRecoveryDecisions(h.mission.mission_id)
+      .filter((d) => d.action === "WAIT_FOR_REQUIREMENT");
+    assert.equal(waits.length, 1);
   });
 
   it("names planning that produced no tasks as an operator question, not an orphan stop", async () => {

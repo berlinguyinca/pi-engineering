@@ -52,7 +52,11 @@ function awaitingUser(store: Orchestrator["store"], mission: Mission): string | 
     .filter((candidate) => (candidate.resumptionGeneration ?? 0) === generation)
     .at(-1);
   if (!decision) return null;
-  if (decision.action === "WAIT_FOR_REQUIREMENT") return "requirement clarification";
+  if (decision.action === "WAIT_FOR_REQUIREMENT") {
+    return decision.operatorGuidance
+      ? `requirement clarification, ${decision.operatorGuidance}`
+      : "requirement clarification";
+  }
   const category = store.getFailureClassification(decision.classificationId)?.category;
   if (category === "AUTHORIZATION_OR_CREDENTIAL") return "authorization or credentials";
   if (category === "REQUIREMENT_AMBIGUITY") return "requirement clarification";
