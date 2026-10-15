@@ -1,0 +1,83 @@
+# Nightly real-mission dogfood (issue #226).
+#
+# Runs two REAL missions (a docs-only change and a one-function change with a
+# test) through EngineeringRuntime against the real InferWeave gateway, on a
+# fresh green fixture repo each, and records the outcome as roadmap evidence
+# (`dogfood_mission`, docs/roadmap/dogfood/<sha>.json). `roadmap check` (the
+# release gate, not --structural) demotes any VERIFIED milestone without such a
+# record at or after its latest scope change to IMPLEMENTED.
+#
+# Nothing queues until an operator opts in. Operator steps:
+#   1. Register a self-hosted runner that can reach the gateway, with the labels
+#      `self-hosted` and `inferweave` (Settings > Actions > Runners).
+#   2. Add repository secrets DOGFOOD_GATEWAY_BASE_URL (OpenAI-compatible URL
+#      ending in /v1) and DOGFOOD_GATEWAY_API_KEY.
+#   3. Add repository variable DOGFOOD_MODEL (e.g.
+#      metabolomics/qwen3.8-27b-modality-text-quant-mxfp4).
+#   4. Add repository variable DOGFOOD_RUNNER_READY=true. Until it is set the job
+#      is skipped; unset or set it to anything else to pause the nightly run.
+# On success the job opens a PR with the record (it never pushes to main). See
+# docs/usage.md "Nightly real-mission dogfood".
+
+name: Nightly dogfood
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: nightly-dogfood
+  cancel-in-progress: false
+
+jobs:
+  dogfood:
+    if: vars.DOGFOOD_RUNNER_READY == 'true'
+    runs-on: [self-hosted, inferweave]
+    # Two missions at 30 minutes each, plus install and PR overhead.
+    timeout-minutes: 90
+    env:
+      PI_DOGFOOD_GATEWAY_BASE_URL: ${{ secrets.DOGFOOD_GATEWAY_BASE_URL }}
+      PI_DOGFOOD_GATEWAY_API_KEY: ${{ secrets.DOGFOOD_GATEWAY_API_KEY }}
+      PI_DOGFOOD_MODEL: ${{ vars.DOGFOOD_MODEL }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Run real missions
+        run: node scripts/dogfood-real-mission.ts --out "dogfood/${GITHUB_SHA}.json" --timeout-ms 1800000
+      - name: Upload record
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dogfood-mission-${{ github.sha }}
+          path: dogfood/${{ github.sha }}.json
+          if-no-files-found: ignore
+      - name: Open a PR with the roadmap evidence record
+        # Reached only when both missions reached COMPLETE (the script exits 0).
+        run: |
+          set -euo pipefail
+          short="${GITHUB_SHA::12}"
+          branch="dogfood/${short}"
+          mkdir -p docs/roadmap/dogfood
+          cp "dogfood/${GITHUB_SHA}.json" "docs/roadmap/dogfood/${GITHUB_SHA}.json"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "${branch}"
+          git add "docs/roadmap/dogfood/${GITHUB_SHA}.json"
+          git commit -m "chore(roadmap): dogfood_mission evidence for ${short}"
+          git push origin "${branch}"
+          gh pr create --base main --head "${branch}" \
+            --title "chore(roadmap): dogfood_mission evidence for ${short}" \
+            --body "Nightly real-mission dogfood: both missions reached COMPLETE at ${GITHUB_SHA}. Record: docs/roadmap/dogfood/${GITHUB_SHA}.json (run ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})."

@@ -1294,6 +1294,13 @@ export class GitRepo {
     await this.persistCandidateLifecycle(lifecycle, guard);
   }
 
+  /** Most recent commit reachable from HEAD that touched `paths`, or null when none did. */
+  async lastCommitTouching(paths: string[]): Promise<string | null> {
+    const args = ["log", "-1", "--format=%H", "--", ...paths];
+    const r = this.requireQuery(await this.git(args), "last commit touching paths query", args);
+    return r.stdout || null;
+  }
+
   async headCommit(): Promise<string> {
     const r = await this.git(["rev-parse", "HEAD"]);
     if (r.code !== 0) throw new Error(`git rev-parse HEAD failed: ${r.stderr}`);
