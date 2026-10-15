@@ -163,7 +163,7 @@ test("housekeeping is deferred past session_start and a shutdown cancels it befo
   });
   const oldPath = process.env.PATH;
   process.env.PATH = `${join(root, "bin")}:${oldPath}`;
-  process.env.PI_HOUSEKEEPING_FIRST_RUN_MS = "150";
+  process.env.PI_HOUSEKEEPING_FIRST_RUN_MS = "60000";
   process.env.PI_HOUSEKEEPING_INTERVAL_MS = "150";
   const handlers = new Map<string, Handler[]>();
   const pi = {
