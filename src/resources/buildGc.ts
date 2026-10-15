@@ -74,7 +74,7 @@ export async function safeRemove(locator: string, root: string): Promise<void> {
   const target = join(parentReal, basename(abs));
   const inside = (path: string): boolean => {
     const rel = relative(rootReal, path);
-    return rel !== "" && rel !== ".." && !rel.startsWith(`..${"/"}`) && !isAbsolute(rel);
+    return rel !== "" && rel !== ".." && !rel.startsWith("../") && !isAbsolute(rel);
   };
   if (relative(rootReal, target) === "") throw new Error(`refusing to remove the registered root ${rootReal} itself`);
   if (!inside(target)) throw new Error(`locator ${locator} resolves outside the registered root ${rootReal}`);
