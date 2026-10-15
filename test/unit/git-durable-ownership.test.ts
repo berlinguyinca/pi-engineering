@@ -284,6 +284,18 @@ test("a forged other-root path is quarantined, and a persist from another root d
     const reason = await readFile(join(stateDir, "quarantine", `${forgedName}.reason.txt`), "utf8");
     assert.match(reason, /\/etc\/forged/);
     assert.equal(linkedRepoId === mainRepoId, false);
+
+    // Worktree-shaped name, but not beside this repo and not listed by git.
+    const elsewhere = {
+      ...legacy,
+      rootHash: "2".repeat(64),
+      path: `/tmp/x/pi-eng-abc-${stored.branch}`,
+    } as CandidateLifecycle;
+    const elsewhereName = candidateFileName(elsewhere);
+    await writeFile(join(stateDir, elsewhereName), JSON.stringify(elsewhere));
+    const second = await main.loadCandidateLifecycleInventory("MSN-restamp", mainRepoId);
+    assert.equal(second.diagnostics.length, 1);
+    assert.equal(second.diagnostics[0]?.quarantinedTo, `quarantine/${elsewhereName}`);
   } finally {
     await env.fixture.cleanup();
   }

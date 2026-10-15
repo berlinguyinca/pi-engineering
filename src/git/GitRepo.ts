@@ -425,11 +425,22 @@ export class GitRepo {
     }
   }
 
-  /** A path another install could legitimately have written for this candidate branch. */
-  private isPlausibleWorktreePath(path: string, branch: string): boolean {
-    if (!isAbsolute(path)) return false;
+  /** True when the basename has the `pi-eng-<base36>-<branch>` worktree shape. */
+  private hasWorktreeShape(path: string, branch: string): boolean {
     const escaped = branch.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     return new RegExp(`^pi-eng-[0-9a-z]+-${escaped}$`).test(basename(path));
+  }
+
+  /**
+   * A path another install could legitimately have written for this candidate
+   * branch: worktree-shaped, absolute, and either beside this repo or a
+   * worktree git itself lists.
+   */
+  private async isPlausibleWorktreePath(path: string, branch: string): Promise<boolean> {
+    if (!isAbsolute(path) || !this.hasWorktreeShape(path, branch)) return false;
+    if (dirname(path) === dirname(this.repoRoot)) return true;
+    const listed = await this.git(["worktree", "list", "--porcelain"], { preserveStdout: true });
+    return listed.code === 0 && listed.stdout.split("\n").includes(`worktree ${path}`);
   }
 
   private candidateStateName(record: CandidateRecord): string {
@@ -697,7 +708,7 @@ export class GitRepo {
           const pathComparable = parsed.rootHash === this.currentRootHash();
           const pathValid = pathComparable
             ? parsed.path === this.worktreePath(expectedBranch)
-            : this.isPlausibleWorktreePath(parsed.path, expectedBranch);
+            : await this.isPlausibleWorktreePath(parsed.path, expectedBranch);
           if (
             parsed.candidateId !== derivedCandidateId ||
             parsed.branch !== expectedBranch ||
@@ -705,7 +716,7 @@ export class GitRepo {
             name !== this.candidateStateName(canonical)
           ) {
             const owned = this.namesOwner(parsed, missionId, repoId);
-            if (owned && pathValid) {
+            if (owned && pathValid && this.isOwnWorktreePath(parsed.path)) {
               // Keep the checkout and branch reachable for cleanup instead of orphaning them.
               await this.persistPendingBranchCleanup({
                 missionId,
@@ -1502,8 +1513,15 @@ export class GitRepo {
             // checkout's `.git/worktrees` was lost). `git worktree list` no
             // longer sees it, so `git worktree remove` would fail. Recover by
             // removing the leftover working directory safely, never the primary.
-            // A checkout named for another root's namespace is not ours to delete.
-            if (this.isOwnWorktreePath(info.path)) {
+            // Pending-cleanup recovery only: a worktree-shaped checkout of another
+            // root is not ours to delete, so skip it. Anything else still throws.
+            if (
+              !(
+                opts.cleanupIdentity &&
+                !this.isOwnWorktreePath(info.path) &&
+                this.hasWorktreeShape(info.path, info.branch)
+              )
+            ) {
               this.assertSafeWorktreePath(info.path);
               guard?.assertAuthoritative();
               await rm(info.path, { recursive: true, force: true }).catch(() => {});
