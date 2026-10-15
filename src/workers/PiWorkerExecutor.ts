@@ -331,6 +331,11 @@ export class PiWorkerExecutor implements WorkerExecutor {
     return currentInferenceInvocation()?.actions ?? this.runActions.get(req.sessionId ?? req.role);
   }
 
+  /** Tool actions this run executed across all its attempts. */
+  private executedActionCount(req: WorkerRequest): number {
+    return this.trackerFor(req)?.list().length ?? 0;
+  }
+
   /** Record an executed tool call; a retry of this request must not repeat it. */
   private trackAction(req: WorkerRequest, action: { id: string; kind: string; summary: string }): void {
     this.trackerFor(req)?.record(action);
@@ -705,6 +710,7 @@ ${TOOL_TRANSITION_RULE}`;
           },
           usage: null,
           error: `transient:${category}`,
+          toolCalls: this.executedActionCount(req),
         };
       }
 
@@ -931,7 +937,7 @@ ${TOOL_TRANSITION_RULE}`;
           },
           usage: this.collectUsage(this.asMessages(session.messages)),
           error,
-          toolCalls,
+          toolCalls: Math.max(toolCalls, this.executedActionCount(req)),
         };
       }
 

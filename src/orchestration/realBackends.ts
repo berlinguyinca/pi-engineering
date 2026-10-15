@@ -300,6 +300,7 @@ function outcomeOf(result: Awaited<ReturnType<WorkerExecutor["run"]>>): Executio
   // failure and route a transient infrastructure failure into the time-based
   // resilience window instead of immediately failing the task.
   if (!completed) outcome.error = result.result.error ?? result.result.summary;
+  if (result.toolCalls !== undefined) outcome.toolCalls = result.toolCalls;
   return outcome;
 }
 
@@ -422,6 +423,13 @@ export function realBackends(opts: RealBackendsOptions) {
        * server cannot compile) instead of failing the task on that route.
        */
       failoverOnProviderError?: boolean;
+      /**
+       * Implementer work: an attempt that failed on the provider before any
+       * tool call ran has no side effects, so it moves to another eligible
+       * model, unless the operator pinned this one (the pin is then waited
+       * on by the scheduler, not abandoned).
+       */
+      failoverWhenNoToolCalls?: boolean;
     },
   ): Promise<{ run: Awaited<ReturnType<WorkerExecutor["run"]>>; route: ModelRoute | undefined; model?: ModelRef }> => {
     const announce = (summary: string): void => {
@@ -473,12 +481,16 @@ export function realBackends(opts: RealBackendsOptions) {
       }
       if (!model) break;
       const gone = MODEL_GONE_MARKERS.has(error);
-      const capacity = !gone && MODEL_CAPACITY_MARKERS.has(error);
+      const noToolCalls = plan.failoverWhenNoToolCalls === true && run.toolCalls === 0;
+      const pinnedWait = noToolCalls && req.operatorPinned === true;
+      const capacity = !gone && !pinnedWait && MODEL_CAPACITY_MARKERS.has(error);
       const providerFault =
         !gone &&
         !capacity &&
-        plan.failoverOnProviderError === true &&
-        (PROVIDER_FAULT_MARKERS.has(error) || PROVIDER_REQUEST_REFUSAL.test(run.result.summary));
+        !pinnedWait &&
+        ((plan.failoverOnProviderError === true &&
+          (PROVIDER_FAULT_MARKERS.has(error) || PROVIDER_REQUEST_REFUSAL.test(run.result.summary))) ||
+          (noToolCalls && PROVIDER_FAULT_MARKERS.has(error)));
       if (!gone && !capacity && !providerFault) break;
       const failed: ModelRef = model;
       const reason = run.result.summary;
@@ -521,6 +533,7 @@ export function realBackends(opts: RealBackendsOptions) {
     freshSessionId: () => id(prefix),
     context,
     announceWarnings: true,
+    failoverWhenNoToolCalls: role === "implementer",
   });
   return {
     agent: {

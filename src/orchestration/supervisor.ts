@@ -255,7 +255,10 @@ export class MissionSupervisor {
     const diagnosis = this.diagnose(mission);
     if (!diagnosis) {
       this.assertResumptionGeneration(mission.mission_id, expectedResumptionGeneration);
-      return this.status(mission, "HEALTHY", "Mission has current ownership or a named future wait");
+      const wait = this.currentWait(mission.mission_id);
+      const healthy = this.status(mission, "HEALTHY", "Mission has current ownership or a named future wait");
+      // The open wait is shown to the operator, never handed to the runtime as a decision to act on.
+      return wait ? { ...healthy, nextAction: wait.expectedMaterialChange, nextActionAt: wait.nextActionAt } : healthy;
     }
 
     this.assertResumptionGeneration(mission.mission_id, expectedResumptionGeneration);
@@ -324,6 +327,20 @@ export class MissionSupervisor {
           preservedWork: this.preservedWork(mission.mission_id),
         }
       : result;
+  }
+
+  /** The open named wait (probe/backoff, requirement, persistence) of the current resumption, if any. */
+  private currentWait(missionId: string): RecoveryDecision | undefined {
+    const generation = this.store.listMissionResumptions(missionId).at(-1)?.generation ?? 0;
+    return this.store
+      .listRecoveryDecisions(missionId)
+      .filter(
+        (decision) =>
+          (decision.resumptionGeneration ?? 0) === generation &&
+          WAIT_ACTIONS.has(decision.action) &&
+          (decision.status === "planned" || decision.status === "started"),
+      )
+      .at(-1);
   }
 
   private diagnose(mission: Mission): Diagnosis | null {
