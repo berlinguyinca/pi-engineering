@@ -23,6 +23,12 @@ import { type GatewayModelEntry, fetchGatewayModels } from "./gatewayCatalog.ts"
 export interface ModelHealth {
   state?: string;
   slots?: number;
+  /** Capabilities the catalogue advertises (`x_capabilities`); absent when not advertised. */
+  capabilities?: string[];
+  /** Tool-calling support (`x_tools`); absent when not advertised. */
+  tools?: boolean;
+  /** True for a logical route rather than a concrete model. */
+  alias?: boolean;
 }
 
 export interface HealthProviderOptions {
@@ -113,5 +119,8 @@ function healthOf(entry: GatewayModelEntry): ModelHealth {
   return {
     ...(entry.state !== undefined ? { state: entry.state } : {}),
     ...(entry.slots !== undefined ? { slots: entry.slots } : {}),
+    ...(entry.capabilities !== undefined ? { capabilities: entry.capabilities } : {}),
+    ...(entry.tools !== undefined ? { tools: entry.tools } : {}),
+    ...(entry.alias === true ? { alias: true } : {}),
   };
 }

@@ -19,6 +19,8 @@
  * context, and decides when to ask.
  */
 
+import { DEFAULT_EXCLUDE } from "../cav/routing.ts";
+
 /** The model facts this decision needs. Mirrors pi's `Model` fields. */
 export interface FallbackCandidate {
   id: string;
@@ -36,6 +38,73 @@ export interface FallbackCandidate {
   state?: string;
   /** Concurrent requests the gateway will serve for this model, when known. */
   slots?: number;
+  /** Capabilities the gateway advertises for the model; undefined when not advertised. */
+  capabilities?: readonly string[];
+  /** Tool-calling support as advertised (`x_tools`); undefined when not advertised. */
+  tools?: boolean;
+  /** A logical route rather than a concrete model; never a stand-in. */
+  alias?: boolean;
+}
+
+/**
+ * What a stand-in must offer beyond fitting the session. The effective
+ * requirement is never lower than the current model's own advertised
+ * capabilities and tool support (the quality floor): `need` can only raise it.
+ */
+export interface FallbackNeed {
+  capabilities?: readonly string[];
+  /** The request uses tools, so a stand-in must support them. */
+  tools?: boolean;
+}
+
+/** Upper bound on any BLOCKED wait (routing-decision contract: waits bounded by 300000 ms). */
+export const MAX_BLOCKED_WAIT_MS = 300_000;
+
+/** Used when the gateway declared no usable Retry-After. */
+export const DEFAULT_RETRY_AFTER_MS = 10_000;
+
+/** Largest fraction of the declared Retry-After added as jitter. */
+const RETRY_JITTER = 0.25;
+
+/**
+ * Qualified = holds every required capability and, when tools are needed,
+ * advertises tool support; never a route alias. Anything the catalogue did not
+ * advertise does not qualify: an unknown capability is not a held one.
+ */
+export function isQualified(candidate: FallbackCandidate, need: FallbackNeed): boolean {
+  if (candidate.alias === true) return false;
+  const held = candidate.capabilities ?? [];
+  if (!(need.capabilities ?? []).every((capability) => held.includes(capability))) return false;
+  if (need.tools === true && candidate.tools !== true) return false;
+  return true;
+}
+
+/**
+ * The gateway's Retry-After with jitter on top: never earlier than asked (an
+ * early retry is the load the gateway is shedding), spread over up to 25 % so
+ * clients do not return together, and never beyond `maxMs`. A missing or
+ * nonsensical value falls back to {@link DEFAULT_RETRY_AFTER_MS}.
+ */
+export function jitteredRetryAfterMs(
+  retryAfterMs: number | undefined,
+  random: () => number = Math.random,
+  maxMs: number = MAX_BLOCKED_WAIT_MS,
+): number {
+  const base =
+    retryAfterMs !== undefined && Number.isFinite(retryAfterMs) && retryAfterMs > 0
+      ? retryAfterMs
+      : DEFAULT_RETRY_AFTER_MS;
+  const spread = Math.min(1, Math.max(0, random()));
+  return Math.max(1, Math.min(maxMs, Math.round(base * (1 + RETRY_JITTER * spread))));
+}
+
+/** When a model just left (or refused) becomes eligible again: now plus the jittered wait. */
+export function cooldownUntilFor(
+  nowMs: number,
+  retryAfterMs: number | undefined,
+  random: () => number = Math.random,
+): number {
+  return nowMs + jitteredRetryAfterMs(retryAfterMs, random);
 }
 
 /**
@@ -75,11 +144,33 @@ export interface FallbackInput {
    * message). Defaults to `DEFAULT_HEADROOM_TOKENS`.
    */
   headroomTokens?: number;
+  /** Requirements raised above the current model's own floor. */
+  need?: FallbackNeed;
+  /**
+   * Model id to the epoch ms until which it must not be chosen (hysteresis: a
+   * model just left, or one that refused, is not re-selected immediately).
+   */
+  cooldownUntil?: Readonly<Record<string, number>>;
+  /** The clock for `cooldownUntil`; defaults to `Date.now()`. */
+  nowMs?: number;
+  /** Ids never chosen. Defaults to the routing exclusion list (deepseek-v4.1-flash until InferWeave #538). */
+  exclude?: readonly string[];
+  /** Longest a BLOCKED decision may ask to wait; clamped to {@link MAX_BLOCKED_WAIT_MS}. */
+  maxWaitMs?: number;
+  /** The gateway's declared delay on the hold, honored with jitter. */
+  retryAfterMs?: number;
+  /** Jitter source in [0, 1]; injectable for tests. */
+  random?: () => number;
 }
 
 export type FallbackDecision =
   | { action: "switch"; model: FallbackCandidate; reason: string }
-  | { action: "stay"; reason: string };
+  | { action: "stay"; reason: string }
+  /**
+   * Nothing eligible: an explicit, bounded result, never an open-ended retry.
+   * `retryAfterMs` is when to look again, `maxWaitMs` the longest to keep waiting.
+   */
+  | { action: "blocked"; reason: string; maxWaitMs: number; retryAfterMs: number };
 
 /** Slack kept free on top of a candidate's own maximum output. */
 export const DEFAULT_HEADROOM_TOKENS = 8_192;
@@ -141,7 +232,33 @@ export function chooseFallbackModel(input: FallbackInput): FallbackDecision {
     };
   }
 
-  const ranked = [...viable].sort((a, b) => {
+  // Eligibility (autospec R-MODEL, issue #158): the current model's capabilities
+  // and tool support are a floor that `need` may only raise; an excluded model,
+  // a route alias and a model still cooling down are never chosen.
+  const nowMs = input.nowMs ?? Date.now();
+  const excluded = new Set(input.exclude ?? DEFAULT_EXCLUDE);
+  const floor: FallbackNeed = {
+    capabilities: [...new Set([...(current.capabilities ?? []), ...(input.need?.capabilities ?? [])])],
+    tools: input.need?.tools === true || current.tools === true,
+  };
+  const cooling = (m: FallbackCandidate): boolean => (input.cooldownUntil?.[m.id] ?? 0) > nowMs;
+  const eligible = viable.filter((m) => !excluded.has(m.id) && !cooling(m) && isQualified(m, floor));
+  if (eligible.length === 0) {
+    const maxWaitMs = Math.max(1, Math.min(input.maxWaitMs ?? MAX_BLOCKED_WAIT_MS, MAX_BLOCKED_WAIT_MS));
+    const why = [
+      `${viable.filter((m) => excluded.has(m.id)).length} excluded`,
+      `${viable.filter((m) => !excluded.has(m.id) && cooling(m)).length} cooling down`,
+      `${viable.filter((m) => !excluded.has(m.id) && !cooling(m) && !isQualified(m, floor)).length} below the quality floor`,
+    ].join(", ");
+    return {
+      action: "blocked",
+      reason: `no qualified model (${why}) — waiting at most ${maxWaitMs} ms`,
+      maxWaitMs,
+      retryAfterMs: jitteredRetryAfterMs(input.retryAfterMs, input.random, maxWaitMs),
+    };
+  }
+
+  const ranked = [...eligible].sort((a, b) => {
     // Readiness outranks head-room. We are here because one model had no
     // workers; moving to another that also has none buys nothing, however much
     // context it could theoretically hold.
