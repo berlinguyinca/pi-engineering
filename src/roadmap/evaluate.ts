@@ -201,6 +201,8 @@ export async function evaluateAll(
   store: RoadmapEvidenceStore,
   freshness: EvidenceFreshness,
   findingsProvider: (milestoneId: string) => Promise<FindingsBudget>,
+  /** Optional post-derivation adjustment (e.g. demotion); downstream milestones see its result. */
+  adjust?: (evaluation: MilestoneEvaluation) => Promise<MilestoneEvaluation>,
 ): Promise<Map<string, MilestoneEvaluation>> {
   const byId = new Map(roadmap.milestones.map((m) => [m.id, m]));
   const result = new Map<string, MilestoneEvaluation>();
@@ -220,7 +222,8 @@ export async function evaluateAll(
   for (const m of order) {
     const findings = await findingsProvider(m.id);
     const depStates = new Map([...result].map(([k, v]) => [k, v.state]));
-    result.set(m.id, await evaluateMilestone(m, store, freshness, depStates, findings));
+    const evaluation = await evaluateMilestone(m, store, freshness, depStates, findings);
+    result.set(m.id, adjust ? await adjust(evaluation) : evaluation);
   }
   return result;
 }
