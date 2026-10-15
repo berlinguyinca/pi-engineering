@@ -14,6 +14,8 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { AutocompleteItem } from "@earendil-works/pi-tui";
+import { toAutocompleteItems } from "./completions.ts";
 import { StaleGenerationError } from "./contract.ts";
 
 type Handler = (event: unknown, ctx: unknown) => unknown;
@@ -213,10 +215,10 @@ export class PiBridge {
       this.commandForwarders.add(name);
       this.pi.registerCommand(name, {
         description: options.description,
-        getArgumentCompletions: (prefix: string) => {
+        getArgumentCompletions: async (prefix: string): Promise<AutocompleteItem[] | null> => {
           const gen = this.target.dispatchGeneration();
           if (typeof gen !== "number") return null;
-          return (this.tables.get(gen)?.commands.get(name)?.getArgumentCompletions?.(prefix) ?? null) as never;
+          return toAutocompleteItems(await this.tables.get(gen)?.commands.get(name)?.getArgumentCompletions?.(prefix));
         },
         handler: (args: string, ctx: unknown) => this.runCommand(name, args, ctx),
       } as never);
