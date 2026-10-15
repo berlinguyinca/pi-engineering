@@ -94,6 +94,47 @@ function newStore() {
   return { eventStore, store: MissionStore.open(eventStore) };
 }
 
+describe("MissionScheduler dispatch", () => {
+  it("never dispatches a non-mutating task twice while its first dispatch is still starting", async () => {
+    const { store } = newStore();
+    const mission = makeMission(store);
+    bindRepo(store, mission.mission_id);
+    const task = store.createTask({
+      mission_id: mission.mission_id,
+      kind: "agent",
+      role: "investigator",
+      objective: "look",
+      repo_id: "repo-1",
+      mutates_repo: false,
+      write_domains: [],
+      isolation: "none",
+      execution_budget_ms: 60_000,
+      max_attempts: 3,
+    });
+    const backend = deferredBackend();
+    const broker = new ExecutionBroker({
+      store,
+      resolveRepository: resolveRepository(),
+      backends: { agent: { runAgent: backend.runAgent } },
+    });
+    // A slow start: the task stays READY for many pass ticks before the broker runs it.
+    const execute = broker.execute.bind(broker);
+    broker.execute = async (input) => {
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      return execute(input);
+    };
+    const scheduler = new MissionScheduler({ store, broker, limits: { maxActive: 2, maxAgents: 2 } });
+    const running = scheduler.runMission(mission.mission_id);
+    await until(() => backend.starts.length === 1);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    backend.release("look");
+    await running;
+    assert.deepEqual(backend.starts, ["look"], "one dispatch, one worker");
+    assert.equal(store.getTask(task.task_id)?.status, "SUCCEEDED");
+    assert.equal(store.listExecutions(mission.mission_id).length, 1);
+  });
+});
+
 describe("MissionScheduler lane integration", () => {
   it("serializes overlapping write domains across tasks on the same repo", async () => {
     const { eventStore, store } = newStore();

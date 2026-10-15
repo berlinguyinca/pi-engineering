@@ -353,6 +353,10 @@ export class MissionScheduler {
     const out: OrchestrationTask[] = [];
     for (const t of tasks) {
       if (t.status !== "PENDING" && t.status !== "READY" && t.status !== "WAITING") continue;
+      // A dispatched task stays READY until the broker marks it RUNNING. Under
+      // load that window outlasts a pass tick, and a second dispatch would run
+      // the same task concurrently (duplicate worker, illegal RETRYING->RETRYING).
+      if (this.activeTasks.has(t.task_id)) continue;
       if (t.status === "WAITING") {
         // Approvals etc. handled by caller; treat as not runnable here.
         continue;
