@@ -17,7 +17,7 @@ import { AdmissionController } from "../../src/gateway/AdmissionController.ts";
 import { resolveGatewayConfig } from "../../src/gateway/config.ts";
 import { type ModelRef, modelKey } from "../../src/lifecycle/types.ts";
 import { type RouteModel, realBackends } from "../../src/orchestration/realBackends.ts";
-import { PiWorkerExecutor } from "../../src/workers/PiWorkerExecutor.ts";
+import { MAX_UNKNOWN_TOOL_CALLS, PiWorkerExecutor } from "../../src/workers/PiWorkerExecutor.ts";
 
 const REVIEW = {
   verdict: "approve",
@@ -278,6 +278,11 @@ test("the registry prefers a family different from the implementer's, then the l
       missionId: "MSN-1",
       signal: new AbortController().signal,
     });
+    // The implementer's nudge is answered with a review_result call, a tool its
+    // session does not offer. That must end the attempt after a few calls, not
+    // run for ever (issue #234): one request to end the turn, one for the
+    // nudge, then at most MAX_UNKNOWN_TOOL_CALLS - 1 more.
+    assert.ok(requests <= 2 + MAX_UNKNOWN_TOOL_CALLS, `the implementer made ${requests} requests`);
     const outcome = await review();
     assert.equal(outcome.exitStatus, "succeeded", outcome.summary);
     assert.deepEqual(outcome.model, { provider: otherBig.provider, id: otherBig.id });
