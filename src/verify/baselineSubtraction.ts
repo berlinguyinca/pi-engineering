@@ -2,6 +2,7 @@ import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { ArtifactStore } from "../artifacts/ArtifactStore.ts";
 import type { GitRepo } from "../git/GitRepo.ts";
+import { ExclusiveFileLock } from "../platform/eventstore/fileLock.ts";
 import type { VerificationProfile, VerificationProvider, VerifyOutcome } from "./Verifier.ts";
 import {
   type FailureBaseline,
@@ -32,7 +33,8 @@ import {
  *
  * The base is verified once per (base SHA, profile hash): in a temporary
  * worktree of the base commit (never the shared checkout), cached on disk under
- * the repository's git common dir, and shared in-process while running. The run
+ * the repository's git common dir, and serialized by a lock file next to the cache entry (a second caller, in this
+ * process or another, waits and reads the cached result). The run
  * is bounded (PI_ENGINEERING_BASELINE_TIMEOUT_MS, default 20 min) and repeated
  * PI_ENGINEERING_BASELINE_RUNS times (default 2) to expose flaky failures; a
  * run that timed out or died of the environment is never cached.
@@ -71,8 +73,6 @@ function positiveInt(raw: string | undefined, fallback: number): number {
   const n = Number(raw);
   return Number.isInteger(n) && n > 0 ? n : fallback;
 }
-
-const inFlight = new Map<string, Promise<FailureBaseline>>();
 
 function isBaseline(value: unknown, baseSha: string, profileHash: string): value is FailureBaseline {
   const v = value as Partial<FailureBaseline> | null;
@@ -136,12 +136,39 @@ async function baselineFor(
     .then((text) => JSON.parse(text) as unknown)
     .catch(() => undefined);
   if (isBaseline(cached, baseSha, profileHash)) return cached;
-  let pending = inFlight.get(file);
-  if (!pending) {
-    pending = computeBaseline(input, baseSha, profile, file, notes).finally(() => inFlight.delete(file));
-    inFlight.set(file, pending);
+  // The lock file serializes every contender, in this process or another one on
+  // the same repository: the stable base worktree name must have one user, and
+  // a second contender reads the first one's cached result instead.
+  const lock = await acquireBaselineLock(`${file}.lock`);
+  try {
+    const raced = await readFile(file, "utf8")
+      .then((text) => JSON.parse(text) as unknown)
+      .catch(() => undefined);
+    if (isBaseline(raced, baseSha, profileHash)) return raced;
+    return await computeBaseline(input, baseSha, profile, file, notes);
+  } finally {
+    lock.release();
   }
-  return pending;
+}
+
+/**
+ * Wait for the baseline lock. A dead owner is taken over by the lock itself; a
+ * live owner is waited for up to the baseline timeout plus a margin, after
+ * which the caller falls back to judging without a baseline.
+ */
+async function acquireBaselineLock(path: string): Promise<ExclusiveFileLock> {
+  const timeoutMs = positiveInt(process.env.PI_ENGINEERING_BASELINE_TIMEOUT_MS, DEFAULT_BASELINE_TIMEOUT_MS);
+  const deadline = Date.now() + timeoutMs + 30_000;
+  await mkdir(join(path, ".."), { recursive: true });
+  for (;;) {
+    try {
+      return await ExclusiveFileLock.acquire(path);
+    } catch (error) {
+      if (!/is held|is claimed/.test(error instanceof Error ? error.message : "")) throw error;
+      if (Date.now() >= deadline) throw new Error("timed out waiting for another process's baseline run");
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
+  }
 }
 
 function stageName(id: string): string {

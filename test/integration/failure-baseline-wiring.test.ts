@@ -380,4 +380,28 @@ describe("baseline subtraction hardening (#200 review)", () => {
       await fx.cleanup();
     }
   });
+
+  it("two concurrent callers on one repo (separate GitRepo instances) verify the base exactly once", async () => {
+    const fx = await fixture(RED);
+    try {
+      const good = await fx.branch("good", { "src/x.js": "export const x = 1;\n" });
+      const second = await GitRepo.open(fx.root);
+      assert.ok(second);
+      const artifacts = await ArtifactStore.create(join(fx.root, "..", "artifacts-2"));
+      const other = realBackends({ worker: {} as never, verifier: fx.verifier, artifacts, git: second, cwd: fx.root });
+      const call = (backends: ReturnType<typeof realBackends>) =>
+        backends.integration.runIntegration({
+          objective: "integrate",
+          handoffs: [{ worktree: { path: fx.root, branch: good }, summary: "", artifacts: [] }],
+          signal: new AbortController().signal,
+        });
+      const [a, b] = await Promise.all([call(fx.backends), call(other)]);
+      assert.equal(a.exitStatus, "succeeded", a.summary);
+      assert.equal(b.exitStatus, "succeeded", b.summary);
+      assert.deepEqual(a.inheritedFailures, b.inheritedFailures);
+      assert.equal(fx.verifier.baseRuns, 2, "one baseline (2 confirming runs) for both callers");
+    } finally {
+      await fx.cleanup();
+    }
+  });
 });
