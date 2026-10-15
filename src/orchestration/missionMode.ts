@@ -134,5 +134,8 @@ export function childEnv(env: FlagEnv): Record<string, string> {
  * env, so it holds whichever of the two carries it.
  */
 export function missionDepthSpawnHook<C extends { env: NodeJS.ProcessEnv }>(context: C): C {
-  return { ...context, env: { ...context.env, ...childEnv({ ...process.env, ...context.env }) } };
+  // Only the depth is added: the SDK strips session variables from the spawn
+  // env on purpose, so the process env must not be merged back in wholesale.
+  const depth = missionDepth({ ...process.env, ...context.env });
+  return { ...context, env: { ...context.env, [MISSION_DEPTH_ENV]: String(depth + 1) } };
 }

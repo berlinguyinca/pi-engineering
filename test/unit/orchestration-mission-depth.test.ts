@@ -190,3 +190,18 @@ describe("a real PiWorkerExecutor session", () => {
     }
   });
 });
+
+describe("missionDepthSpawnHook", () => {
+  it("adds only the depth: it does not merge the process env back into the spawn env", () => {
+    const saved = process.env.PI_SESSION_ID;
+    process.env.PI_SESSION_ID = "leaked-from-process-env";
+    try {
+      const out = missionDepthSpawnHook({ command: "true", cwd: "/", env: { PATH: "/bin" } });
+      assert.deepEqual(out.env, { PATH: "/bin", PI_MISSION_DEPTH: "1" });
+      assert.equal(out.command, "true");
+    } finally {
+      if (saved === undefined) delete process.env.PI_SESSION_ID;
+      else process.env.PI_SESSION_ID = saved;
+    }
+  });
+});
