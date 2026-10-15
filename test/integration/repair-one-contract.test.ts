@@ -65,6 +65,7 @@ async function harness(script: Script) {
           return {
             executionId: "integration",
             exitStatus: script.integrationFailure ?? "conflict",
+            ...(script.integrationFailure === "failed" ? { checksFailed: true } : {}),
             summary:
               script.integrationFailure === "failed"
                 ? "integrated pi-eng-orch; checks: typecheck failed"

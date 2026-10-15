@@ -2469,17 +2469,9 @@ export class Orchestrator {
           .reverse()
           .find((candidate) => candidate.taskId === gateTask.task_id);
         const category = entry ? this.rederiveLegacyGateClassification(entry).category : undefined;
-        if (gateTask.kind === "integration") {
-          // A merge that conflicted or never ran is retried deterministically;
-          // an integration that merged and then failed its checks is a defect
-          // of the candidate and gets a repair contract.
-          return (
-            /^failed\b/.test(gateTask.failure_reason ?? "") &&
-            category !== "PROVIDER_TRANSIENT" &&
-            category !== "PROVIDER_PERMANENT"
-          );
-        }
-        return category === "VALIDATION_FAILED" || category === "REVIEW_FAILED";
+        // Classification decides: integration checks that ran and failed carry
+        // VALIDATION_FAILED; a conflict or a merge that never ran does not.
+        return category === "VALIDATION_FAILED" || (gateTask.kind !== "integration" && category === "REVIEW_FAILED");
       });
       if (openBlocking.length === 0 && codeFailedGates.length === 0 && blockerTask) {
         if (blockerTask.kind === "integration" && mergeRetries < MAX_DETERMINISTIC_MERGE_RETRIES) {
