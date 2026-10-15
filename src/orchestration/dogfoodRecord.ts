@@ -15,7 +15,7 @@ export interface DogfoodMissionSummary {
   status: string;
   candidateSha: string | null;
   wallMs: number;
-  /** Agent executions (one worker model session each). */
+  /** Model-backed executions (agent, review, research): one worker model session each. */
   calls: number;
   inputTokens: number;
   outputTokens: number;
@@ -33,7 +33,7 @@ export interface DogfoodMissionRecord {
 export function summariseMission(
   store: MissionStore,
   missionId: string,
-  meta: { goal: string; wallMs: number; fallbackCandidateSha?: string | null },
+  meta: { goal: string; wallMs: number; fallbackCandidateSha?: string | null; fallbackModel?: string | null },
 ): DogfoodMissionSummary {
   const mission = store.getMission(missionId);
   if (!mission) throw new Error(`unknown mission ${missionId}`);
@@ -46,12 +46,14 @@ export function summariseMission(
     outputTokens += u.completionTokens;
     if (u.model) models.set(u.model, (models.get(u.model) ?? 0) + u.promptTokens + u.completionTokens);
   }
-  const calls = store.listExecutions(missionId).filter((e) => e.backend === "agent").length;
+  const calls = store
+    .listExecutions(missionId)
+    .filter((e) => e.backend === "agent" || e.backend === "review" || e.backend === "research").length;
   const candidate = store
     .listCandidates(missionId)
     .sort((a, b) => a.recordedAt.localeCompare(b.recordedAt))
     .at(-1);
-  const model = [...models.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? null;
+  const model = [...models.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? meta.fallbackModel ?? null;
   return {
     goal: meta.goal,
     missionId,

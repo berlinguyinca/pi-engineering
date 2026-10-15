@@ -28,6 +28,7 @@ function seed(store: MissionStore, missionId: string) {
   const usage = [
     { backend: "agent" as const, model: "dogfood/qwen", usage: { input: 1000, output: 200 } },
     { backend: "agent" as const, model: "dogfood/qwen", usage: { promptTokens: 500, completionTokens: 50 } },
+    { backend: "review" as const, model: null, usage: { input: 10, output: 5 } },
     { backend: "validation" as const, model: null, usage: {} },
   ];
   for (const u of usage) {
@@ -64,9 +65,9 @@ describe("dogfood real mission record", () => {
       });
       assert.equal(summary.missionId, "MSN-d1");
       assert.equal(summary.goal, "add multiply");
-      assert.equal(summary.calls, 2, "only agent executions are model calls");
-      assert.equal(summary.inputTokens, 1500);
-      assert.equal(summary.outputTokens, 250);
+      assert.equal(summary.calls, 3, "agent + review executions are model calls; validation is not");
+      assert.equal(summary.inputTokens, 1510);
+      assert.equal(summary.outputTokens, 255);
       assert.equal(summary.model, "dogfood/qwen");
       assert.equal(summary.wallMs, 4321);
       assert.equal(summary.candidateSha, "abc123", "falls back when the store holds no candidate");

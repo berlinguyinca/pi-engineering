@@ -155,6 +155,7 @@ for (const goal of GOALS) {
       goal,
       wallMs: Date.now() - started,
       fallbackCandidateSha: headNow !== baseSha ? headNow : null,
+      fallbackModel: modelEnv,
     });
     summaries.push(summary);
     console.log(
