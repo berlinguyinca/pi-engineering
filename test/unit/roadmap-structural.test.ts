@@ -96,3 +96,20 @@ test("structural: manual record of a generated type exits 2", async () => {
   const r = await run(roadmap(), "- id: u\n  type: unit\n  status: pass\n  commit: a\n  generatedAt: t\n  proof: p\n");
   assert.equal(r.exitCode, 2);
 });
+
+test("structural: fresh_review record without findings exits 2", async () => {
+  const rec = "- id: review-1\n  type: fresh_review\n  status: pass\n  commit: abc\n  generatedAt: t\n  proof: p\n";
+  const r = await run(roadmap(", { type: fresh_review, id: review-1 }"), rec);
+  assert.equal(r.exitCode, 2);
+  assert.match(r.text, /findings/);
+});
+
+test("structural: missing evidence.yaml exits 2", async () => {
+  const r = await run(roadmap(), null);
+  assert.equal(r.exitCode, 2);
+});
+
+test("structural: evidence.yaml that is not a list exits 2", async () => {
+  const r = await run(roadmap(), "key: value\n");
+  assert.equal(r.exitCode, 2);
+});
