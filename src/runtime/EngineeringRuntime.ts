@@ -70,6 +70,7 @@ import {
   type RecoveryProbe,
   resolveCatalogProbeTarget,
 } from "../resilience/probe.ts";
+import { ResourceRegistry } from "../resources/ResourceRegistry.ts";
 import { Scheduler } from "../sched/Scheduler.ts";
 import { emitTelemetry } from "../telemetry/sink.ts";
 import { buildCoreTools } from "../tools/coreTools.ts";
@@ -238,6 +239,11 @@ export function selectionCompare(a: TournamentEntry, b: TournamentEntry, strateg
 /** The challenger may only reorder finalists that are comparable: a real-check lead is never displaced by a no-targets runner-up. */
 export function challengerMayDisplace(lead: TournamentEntry, runner: TournamentEntry): boolean {
   return lead.outcome.noTargets === runner.outcome.noTargets;
+}
+
+/** Registry id of the worktree + branch pair a candidate owns. */
+function candidateResourceId(branch: string): string {
+  return `candidate-worktree:${branch}`;
 }
 
 function materialFindings(ledger: Ledger, candidateId: string | null): string[] {
@@ -579,6 +585,11 @@ function describeSnapshotError(error: unknown): string {
 
 export class EngineeringRuntime {
   ledger: Ledger;
+  /**
+   * Owned-resource journal for candidate worktrees and branches (issue #143).
+   * Rooted in the runtime state dir; assigned by open().
+   */
+  resourceRegistry: ResourceRegistry;
   artifacts: ArtifactStore;
   broker: ContextBroker | null;
   git: GitRepo | null;
@@ -907,6 +918,7 @@ export class EngineeringRuntime {
     };
     // Assigned by open().
     this.ledger = undefined as unknown as Ledger;
+    this.resourceRegistry = undefined as unknown as ResourceRegistry;
     this.artifacts = undefined as unknown as ArtifactStore;
     this.broker = null;
     this.git = null;
@@ -965,6 +977,7 @@ export class EngineeringRuntime {
     const broker = await ContextBroker.open(repoRoot);
     const rt = new EngineeringRuntime(opts);
     rt.ledger = ledger;
+    rt.resourceRegistry = new ResourceRegistry(workDir, hostname());
     rt.artifacts = artifacts;
     rt.broker = broker;
     rt.git = git;
@@ -1999,6 +2012,54 @@ Use repo_search, symbol, ledger_read, and artifact_read. Do not edit files.`;
     return waves;
   }
 
+  /**
+   * Releases a candidate's worktree and branch through the ResourceRegistry
+   * (issue #143). Only registry-owned resources are touched: a branch nobody
+   * registered is left alone. A failed removal is never swallowed: the record is
+   * kept `retained` with the reason, and a ledger finding makes it visible.
+   */
+  async releaseCandidate(candidate: Pick<Candidate, "id" | "branch">, wi: WorkItem): Promise<void> {
+    if (!this.git || !candidate.branch) return;
+    const id = candidateResourceId(candidate.branch);
+    const owner = { missionId: wi.id, executionId: candidate.branch };
+    let begun: Awaited<ReturnType<ResourceRegistry["beginRelease"]>>;
+    try {
+      begun = await this.resourceRegistry.beginRelease(id, owner, () => false);
+    } catch (error) {
+      await this.recordCleanupFinding(candidate, wi, id, error);
+      return;
+    }
+    if (begun.status !== "ok" || begun.record.state === "released") return;
+    try {
+      await this.git.removeWorktree({ path: begun.record.locator, branch: candidate.branch });
+      await this.resourceRegistry.completeRelease(id);
+    } catch (error) {
+      await this.resourceRegistry
+        .markRetained(id, error instanceof Error ? error.message : String(error))
+        .catch(() => {});
+      await this.recordCleanupFinding(candidate, wi, id, error);
+    }
+  }
+
+  private async recordCleanupFinding(
+    candidate: Pick<Candidate, "id" | "branch">,
+    wi: WorkItem,
+    resourceId: string,
+    error: unknown,
+  ): Promise<void> {
+    const reason = error instanceof Error ? error.message : String(error);
+    await this.ledger
+      .recordEntity(
+        "finding",
+        `candidate cleanup failed for ${candidate.branch}: ${reason}; the worktree/branch stays registered as ${resourceId}`,
+        "open",
+        this.actor(newRunId(), "reviewer"),
+        wi.id,
+        { severity: "medium", candidateId: candidate.id },
+      )
+      .catch(() => {});
+  }
+
   private async createCandidateWorktree(
     wi: WorkItem,
     parentId: string | null,
@@ -2026,6 +2087,16 @@ Use repo_search, symbol, ledger_read, and artifact_read. Do not edit files.`;
     // Worktree creation is safe to run concurrently (each leg gets its own branch
     // + worktree); only the promotion merge into the shared main branch must be
     // serialized (see withGitLock around mergeBranch).
+    // Ownership is recorded BEFORE the worktree and branch exist, so a crash
+    // mid-creation never leaves something cleanup has to guess about.
+    await this.resourceRegistry.register({
+      id: candidateResourceId(branch),
+      kind: "worktree",
+      ownerMissionId: wi.id,
+      ownerExecutionId: branch,
+      locator: this.git.worktreePath(branch),
+      lease: `session:${RuntimeSession.current().sessionId}`,
+    });
     const wt = await this.git.createWorktree(baseCommit, branch);
     const runId = newRunId();
     const candidate = await this.ledger.createCandidate(
@@ -2345,7 +2416,7 @@ Return details.winner_candidate_id set to "${a.id}" or "${b.id}" for your pick.`
           `verification failed: ${outcome.failedStage}`,
           this.actor(newRunId(), "reviewer"),
         );
-        await this.git?.deleteBranch(candidate.branch).catch(() => {});
+        await this.releaseCandidate(candidate, wi);
         return {
           entry: { candidate, outcome, findings: [], reviewCompleted: false, winner: false },
           evidenceIds,
@@ -2398,10 +2469,7 @@ Return details.winner_candidate_id set to "${a.id}" or "${b.id}" for your pick.`
         );
       }
       await this.ledger.rejectCandidate(candidate.id, wi.id, `candidate leg failed: ${msg}`, actor).catch(() => {});
-      if (branch && this.git) await this.git.deleteBranch(branch).catch(() => {});
-      if (worktreePath && branch && this.git) {
-        await this.git.removeWorktree({ path: worktreePath, branch }).catch(() => {});
-      }
+      await this.releaseCandidate(candidate, wi);
       await this.ledger
         .recordEntity("finding", `tournament candidate leg failed: ${msg}`, "open", actor, wi.id, {
           severity: "critical",
@@ -2521,7 +2589,7 @@ Return details.winner_candidate_id set to "${a.id}" or "${b.id}" for your pick.`
           `review did not complete`,
           this.actor(newRunId(), "reviewer"),
         );
-        await this.git?.deleteBranch(e.candidate.branch).catch(() => {});
+        await this.releaseCandidate(e.candidate, wi);
       }
       await this.ledger.updateWorkItem(wi.id, { status: "FAILED" }, actor);
       return {
@@ -2571,7 +2639,7 @@ Return details.winner_candidate_id set to "${a.id}" or "${b.id}" for your pick.`
         `review did not complete`,
         this.actor(newRunId(), "reviewer"),
       );
-      await this.git?.deleteBranch(e.candidate.branch).catch(() => {});
+      await this.releaseCandidate(e.candidate, wi);
     }
     const winner = survivors[0]!;
     winner.winner = true;
@@ -2584,7 +2652,7 @@ Return details.winner_candidate_id set to "${a.id}" or "${b.id}" for your pick.`
         `lost tournament to ${winner.candidate.id}`,
         this.actor(newRunId(), "reviewer"),
       );
-      await this.git?.deleteBranch(e.candidate.branch).catch(() => {});
+      await this.releaseCandidate(e.candidate, wi);
     }
 
     // Phase C: promote the winner via controlled merge. Serialized against other
@@ -2598,7 +2666,7 @@ Return details.winner_candidate_id set to "${a.id}" or "${b.id}" for your pick.`
       await this.ledger.promoteCandidate(winner.candidate.id, wi.id, this.actor(newRunId(), "reviewer"));
       incumbent = winner.candidate;
       outcome = "promoted";
-      await this.git?.deleteBranch(winner.candidate.branch).catch(() => {});
+      await this.releaseCandidate(winner.candidate, wi);
     } else {
       await this.ledger.rejectCandidate(
         winner.candidate.id,
@@ -2606,7 +2674,7 @@ Return details.winner_candidate_id set to "${a.id}" or "${b.id}" for your pick.`
         merge.conflict ? `merge conflict with incumbent` : `merge failed: ${merge.reason ?? "unknown"}`,
         this.actor(newRunId(), "reviewer"),
       );
-      await this.git?.deleteBranch(winner.candidate.branch).catch(() => {});
+      await this.releaseCandidate(winner.candidate, wi);
     }
 
     await this.ledger.updateWorkItem(wi.id, { status: incumbent ? "COMPLETED" : "FAILED" }, actor);
@@ -3069,7 +3137,7 @@ Risk level: ${risk}. Make the smallest coherent change. Use the provided context
           `verification failed: ${outcome.failedStage}`,
           this.actor(newRunId(), "reviewer"),
         );
-        await this.git?.deleteBranch(candidate.branch).catch(() => {});
+        await this.releaseCandidate(candidate, wi);
         // Child candidate on next round, with the failing evidence as feedback.
         feedback = `${diffBlock(candidate.diff)}\nVerification failed at stage '${outcome.failedStage}' (exit ${outcome.stages.find((s) => !s.passed)?.exitCode ?? "?"}). Fix it.`;
         parentId = candidate.id;
@@ -3097,7 +3165,7 @@ Risk level: ${risk}. Make the smallest coherent change. Use the provided context
         if (merge.merged) {
           await this.ledger.promoteCandidate(candidate.id, wi.id, this.actor(newRunId(), "reviewer"));
           incumbent = candidate;
-          await this.git?.deleteBranch(candidate.branch).catch(() => {});
+          await this.releaseCandidate(candidate, wi);
           break;
         }
         // Merge conflict: keep the incumbent immutable, treat as unresolved.
@@ -3107,7 +3175,7 @@ Risk level: ${risk}. Make the smallest coherent change. Use the provided context
           merge.conflict ? `merge conflict with incumbent` : `merge failed: ${merge.reason ?? "unknown"}`,
           this.actor(newRunId(), "reviewer"),
         );
-        await this.git?.deleteBranch(candidate.branch).catch(() => {});
+        await this.releaseCandidate(candidate, wi);
         if (round === maxRounds - 1) break;
         parentId = candidate.id;
         continue;
@@ -3115,7 +3183,7 @@ Risk level: ${risk}. Make the smallest coherent change. Use the provided context
       // Never promote with open material findings OR when the independent
       // review could not complete: reject this candidate and start a fix round;
       // if rounds are exhausted, fail the work item.
-      await this.git?.deleteBranch(candidate.branch).catch(() => {});
+      await this.releaseCandidate(candidate, wi);
       const reviewBlocked = !reviewCompleted;
       if (reviewBlocked) {
         // Record a blocking finding so the failure is visible in the ledger and
