@@ -48,6 +48,12 @@ import {
   decideAutoInvoke,
   missionToolReportedUnavailable,
 } from "../src/orchestration/autoInvoke.ts";
+import {
+  buildModelErrorRollups,
+  explainMission,
+  formatMissionWhy,
+  formatModelErrors,
+} from "../src/orchestration/missionWhy.ts";
 import { PanelController } from "../src/panel/PanelController.ts";
 import { PanelState } from "../src/panel/PanelState.ts";
 import { readCommitContent, readDiffContent, readFileContent } from "../src/panel/content.ts";
@@ -1973,7 +1979,15 @@ ${RECOVERY_PROMPT}`;
         missionControlLines: () =>
           (rt.missionStore?.listMissions() ?? [])
             .filter((m) => !["COMPLETE", "FAILED", "CANCELED"].includes(m.status))
-            .flatMap((m) => describeMissionControl(m).map((line) => `${m.mission_id} [${m.status}] ${line}`)),
+            .flatMap((m) => [
+              ...describeMissionControl(m).map((line) => `${m.mission_id} [${m.status}] ${line}`),
+              ...formatModelErrors(
+                buildModelErrorRollups(
+                  rt.missionStore?.listExecutions(m.mission_id) ?? [],
+                  rt.missionStore?.listFailureClassifications(m.mission_id) ?? [],
+                ),
+              ).map((line) => `${m.mission_id} model errors:${line}`),
+            ]),
       };
     },
     sessionGuardActive: inferweave !== null,
@@ -1981,7 +1995,7 @@ ${RECOVERY_PROMPT}`;
 
   pi.registerCommand("mission", {
     description:
-      "Run an orchestration mission; /mission resume <missionId> [--model auto] continues a stopped or paused one (optionally releasing its operator model pin), /mission cancel <missionId> ends one.",
+      "Run an orchestration mission; /mission why <missionId> explains what blocks one; /mission resume <missionId> [--model auto] continues a stopped or paused one (optionally releasing its operator model pin), /mission cancel <missionId> ends one.",
     handler: async (args, ctx) => {
       const request = args.trim();
       if (!request) {
@@ -2008,6 +2022,17 @@ ${RECOVERY_PROMPT}`;
         try {
           const canceled = await rt.cancelMission(cancel[1]);
           ctx.ui.notify(`Mission ${canceled.mission_id} — ${canceled.title} [${canceled.status}]`, "info");
+        } catch (error) {
+          ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+        }
+        return;
+      }
+      const why = /^why\s+(\S+)\s*$/i.exec(request);
+      if (why?.[1]) {
+        const rt = await openRuntime();
+        if (!rt?.missionStore) return;
+        try {
+          ctx.ui.notify(formatMissionWhy(explainMission(rt.missionStore, why[1])), "info");
         } catch (error) {
           ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
         }
