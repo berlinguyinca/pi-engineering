@@ -60,11 +60,14 @@ interface StateFile {
   quarantine?: QuarantineRecord;
 }
 
-/** A verification outcome that depends on a quarantined test. */
-export type QuarantinedOutcome = VerifyOutcome & {
-  status: "blocked";
+/**
+ * A verification outcome as quarantine judges it: unchanged, or `blocked` with
+ * the quarantined test ids it depends on. `passed` is false whenever it is blocked.
+ */
+export type QuarantineVerdict = VerifyOutcome & {
+  status?: "blocked";
   /** The quarantined test ids the outcome depends on. */
-  quarantined: string[];
+  quarantined?: string[];
 };
 
 const LOCK_WAIT_MS = 30_000;
@@ -174,7 +177,7 @@ export class TestQuarantine {
    * An outcome that depends on a quarantined test is `blocked` and not passed,
    * whatever the stages reported. Any other outcome is returned unchanged.
    */
-  async applyToOutcome(outcome: VerifyOutcome): Promise<VerifyOutcome | QuarantinedOutcome> {
+  async applyToOutcome(outcome: VerifyOutcome): Promise<QuarantineVerdict> {
     const quarantined: string[] = [];
     for (const id of testIdsOf(outcome)) if (await this.isQuarantined(id)) quarantined.push(id);
     if (quarantined.length === 0) return outcome;
